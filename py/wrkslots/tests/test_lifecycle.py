@@ -22908,8 +22908,13 @@ def test_retire_pending_stops_when_a_storage_drift_left_registry_state(
         emit: bool = True,
     ) -> int:
         if args.slot == "slot01":
+            record = wrkslots._find_record(
+                wrkslots._load_active(config, require_repository=False), "slot01"
+            )
             partial.write_text("partial\n", encoding="utf-8")
-            raise wrkslots._TargetStorageDrift("injected target storage drift")
+            raise wrkslots._TargetStorageDrift(
+                "injected target storage drift", record=record
+            )
         return original_remove(
             args,
             private_cleanup=private_cleanup,
@@ -22931,6 +22936,162 @@ def test_retire_pending_stops_when_a_storage_drift_left_registry_state(
     assert payload["deferred"][0]["reason"] == (
         "batch stopped after an indeterminate retirement outcome"
     )
+
+
+def _assert_retire_pending_stopped_at_slot01(
+    payload: Mapping[str, object], reason: str
+) -> None:
+    assert payload["removed"] == []
+    rows = payload["could_not_determine"]
+    assert isinstance(rows, list) and len(rows) == 1
+    [row] = rows
+    assert isinstance(row, dict)
+    assert row["slot"] == "slot01"
+    assert row["recovery_required"] is True
+    assert reason in row["reason"]
+    assert "the batch continued" not in row["reason"]
+    deferred = payload["deferred"]
+    assert isinstance(deferred, list)
+    assert [item["slot"] for item in deferred] == ["slot02"]
+    assert deferred[0]["reason"] == (
+        "batch stopped after an indeterminate retirement outcome"
+    )
+
+
+def test_retire_pending_stops_at_a_storage_drift_found_after_a_change(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Drift that removal finds once it has written the registry stops the batch.
+
+    The registration inside slot01 appears after removal's first storage
+    check passed; its next check, at the destructive boundary, follows the
+    ``checkout-evidence-refreshed`` write of the active state, so the
+    attempt cannot be shown to have changed nothing.
+    """
+
+    project, repository, _remote = _queue_two_finished_slots_with_dead_owners(
+        tmp_path, monkeypatch
+    )
+    nested = checkout(project, slot="slot01") / "ignored" / "nested"
+    original = wrkslots._reclaim_preconditions
+
+    def register_after_the_first_check(
+        config: wrkslots.Config,
+        record: wrkslots.ActiveRecord,
+        vcs: wrkslots._GitVcs,
+        finish_context: wrkslots._FinishContext,
+    ) -> tuple[Path, tuple[wrkslots.Checkout, ...]]:
+        found = original(config, record, vcs, finish_context)
+        if record.slot == "slot01" and not nested.exists():
+            git(repository, "worktree", "add", "-b", "nested", str(nested))
+        return found
+
+    monkeypatch.setattr(
+        wrkslots, "_reclaim_preconditions", register_after_the_first_check
+    )
+
+    code = _retire_two(project)
+
+    assert code == 3
+    payload = json.loads(capsys.readouterr().out)
+    _assert_retire_pending_stopped_at_slot01(payload, str(nested))
+    assert nested.is_dir()
+
+
+def test_retire_pending_stops_when_a_drifted_row_changed_before_its_confirmation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The row must be exactly as the refused removal read it, not only the same generation."""
+
+    project, repository, _remote = _queue_two_finished_slots_with_dead_owners(
+        tmp_path, monkeypatch
+    )
+    nested = checkout(project, slot="slot01") / "ignored" / "nested"
+    git(repository, "worktree", "add", "-b", "nested", str(nested))
+    config = wrkslots._load_config(str(project), "testhost")
+    original_remove = wrkslots._cmd_remove
+
+    def drift_then_row_change(
+        args: argparse.Namespace,
+        *,
+        private_cleanup: wrkslots._PrivateCleanupContext | None = None,
+        validation_removal_proof: wrkslots._ValidationRemovalProof | None = None,
+        emit: bool = True,
+    ) -> int:
+        try:
+            return original_remove(
+                args,
+                private_cleanup=private_cleanup,
+                validation_removal_proof=validation_removal_proof,
+                emit=emit,
+            )
+        except wrkslots._TargetStorageDrift:
+            state = wrkslots._load_active(config, require_repository=False)
+            record = wrkslots._find_record(state, args.slot)
+            wrkslots._write_active_state(
+                config,
+                wrkslots._replace_record(
+                    state, replace(record, purpose="changed after the refusal")
+                ),
+                action="test-row-changed",
+                slot=args.slot,
+                require_repository=False,
+            )
+            raise
+
+    monkeypatch.setattr(wrkslots, "_cmd_remove", drift_then_row_change)
+
+    code = _retire_two(project)
+
+    assert code == 3
+    payload = json.loads(capsys.readouterr().out)
+    _assert_retire_pending_stopped_at_slot01(
+        payload, "no longer finds its exact active row after its storage refusal"
+    )
+
+
+def test_retire_pending_reports_its_batch_when_a_drift_confirmation_refuses(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Any refusal while confirming a drifted target stops the batch with its report.
+
+    slot01 is removed first; slot02's own storage drifts, and the
+    confirmation then refuses as a configuration revalidation would.  The
+    report still names slot01's removal.
+    """
+
+    project, repository, _remote = _queue_two_finished_slots_with_dead_owners(
+        tmp_path, monkeypatch
+    )
+    nested = checkout(project, slot="slot02") / "ignored" / "nested"
+    git(repository, "worktree", "add", "-b", "nested", str(nested))
+
+    def refuse(*_args: object, **_kwargs: object) -> None:
+        raise wrkslots.Refusal("injected configuration refusal")
+
+    monkeypatch.setattr(
+        wrkslots, "_confirm_unchanged_after_target_storage_drift", refuse
+    )
+
+    code = _retire_two(project)
+
+    assert code == 3
+    payload = json.loads(capsys.readouterr().out)
+    assert [row["slot"] for row in payload["removed"]] == ["slot01"]
+    [row] = payload["could_not_determine"]
+    assert row["slot"] == "slot02"
+    assert row["recovery_required"] is True
+    assert str(nested) in row["reason"]
+    assert "injected configuration refusal" in row["reason"]
+    assert "the batch continued" not in row["reason"]
+    assert payload["recovery_required"] is True
+    assert nested.is_dir()
 
 
 def test_finish_still_refuses_a_legacy_flat_handoff(tmp_path: Path) -> None:
@@ -33417,10 +33578,12 @@ def test_remove_rechecks_exact_target_extra_registration_at_delete_boundary(
         config: wrkslots.Config,
         states: list[wrkslots.ActiveState],
         record: wrkslots.ActiveRecord,
+        *,
+        before_any_change: bool = False,
     ) -> None:
         nonlocal calls
         calls += 1
-        original_check(config, states, record)
+        original_check(config, states, record, before_any_change=before_any_change)
         if calls == 1:
             git(repository, "worktree", "add", "-b", "extra/boundary", str(extra), "main")
             shutil.rmtree(extra)
@@ -33505,10 +33668,12 @@ def test_remove_rechecks_cross_repository_registration_at_delete_boundary(
         config: wrkslots.Config,
         states: Sequence[wrkslots.ActiveState],
         record: wrkslots.ActiveRecord,
+        *,
+        before_any_change: bool = False,
     ) -> None:
         nonlocal calls
         calls += 1
-        original_check(config, states, record)
+        original_check(config, states, record, before_any_change=before_any_change)
         if calls == 1:
             git(
                 other,

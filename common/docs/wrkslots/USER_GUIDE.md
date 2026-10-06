@@ -436,7 +436,9 @@ below one that is missing, not a directory, a symlink loop or too long. One judg
 and `readlink`), and take 20 seconds; past any of these bounds it refuses, so the row is
 unverifiable. The time bound is checked throughout, including every 4,096 characters that the shell
 word reader reads (about every 8 milliseconds on devbig014) and each property and path answered from
-what the judgement has already read. Because every value is read to the end of its element, a search
+what the judgement has already read, and once more as the judgement ends, so that a row identity
+read or a property scan that ran past the bound gives no answer. Because every value is read to the
+end of its element, a search
 list's characters grow with the square of its length: a 130,001-character `NAME=/a:/b:...` list of
 10,000 entries refuses, while the 77 active units on devbig014, with 155,976 characters of
 properties, read about 8.5 million characters, a quarter of the bound, and made about 4,950 lookups
@@ -468,9 +470,15 @@ has just written its handle as it finishes is judged, not refused. A handle that
 or went between the reads before and after that wait is `alive` as well. A handle that both reads
 find alike while either finds it that recent (the clock stands still or went back, or the change
 time is more than a quarter second ahead of it and is not waited for) is `alive` too, and so is one
-that both reads find alike while this host's realtime clock fell more than half a second against its
-monotonic clock between them: after a step back into a handle's timestamp tick, a run that registers
-again alike leaves both reads equal. Last, the
+that both reads find alike while this host's realtime clock may have fallen more than half a second
+against its monotonic clock between them: after a step back into a handle's timestamp tick, a run
+that registers again alike leaves both reads equal. Each read of the handles reads both clocks
+before its first handle and after its last, so a step while the handles are read counts too, and a
+change time is recent against the earlier of its two realtime readings. Each reading takes the
+realtime clock between two readings of the monotonic clock, up to three times, and keeps the most
+narrowly bracketed: a scheduling pause between the reads widens the reading instead of moving it,
+and a pause in every try that widens it past half a second reads as a step. A step back undone by
+a step forward before the clocks are next read does not show. Last, the
 current members of every control group named after a handle's unit, and of its
 descendants, are read from the cgroup v2 hierarchy below the user service manager; a member there is
 `alive`. A host without a cgroup v2 hierarchy at `/sys/fs/cgroup`, whose cgroup v2 mount there shows
@@ -591,11 +599,13 @@ race retains the slot in the queue. Successful archived removal clears its sidec
 Attempt events rotate blocked entries behind never-attempted and less-recently-attempted entries, so
 one retained slot cannot starve the rest of a bounded queue. Lock contention is deferred; corrupt,
 partial, or indeterminate state stops the batch and requires recovery instead of being mislabeled as
-retained. A defect in one item's own storage that removal finds before it changes the slot, such as
-an active row whose slot directory is gone or a Git worktree registered inside the slot, is reported
-as could-not-determine with recovery required. The batch then goes on to its next item, but only
-after it reads the registry again under the lock and finds no partial update, no mutation journal,
-and the item's row unchanged.
+retained. A defect in one item's own storage that removal finds in its first check, before it
+changes the slot, such as an active row whose slot directory is gone or a Git worktree registered
+inside the slot, is reported as could-not-determine with recovery required. The batch then goes on
+to its next item, but only after it reads the registry again under the lock and finds no partial
+update, no mutation journal, and the item's row exactly as that check read it; any refusal while it
+does so stops the batch, which still reports what it did. The same defect found at a later step of
+removal, after it has written the registry, stops the batch.
 Sidecar cleanup atomically renames the exact inode into content-addressed retired control
 storage and never unlinks that retired pathname, so a same-UID replacement cannot be mistaken for
 the acknowledged artifact. A direct-child checkout handoff is likewise moved by no-replace into an

@@ -1244,6 +1244,79 @@ def test_judging_rows_against_no_units_checks_the_time_bound(
         )
 
 
+def test_judging_rows_refuses_when_the_last_row_identity_outruns_the_bound(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A row identity read that crosses the time bound gives no answer.
+
+    The clock is simulated: the bound has not passed when the identity
+    read starts, and reading it takes 25 seconds, past the 20-second bound
+    of one judgement.  With no unit to compare, nothing after the read
+    would check the bound again.
+    """
+
+    project, tree = _prepare(tmp_path, monkeypatch, agent_liveness="dead")
+    config = wrkslots._load_config(str(project), "testhost")
+    rows = [(record, (tree,)) for record in wrkslots._load_active(config).slots]
+    real_monotonic = time.monotonic
+    elapsed = [0.0]
+    real_identity = wrkslots._row_path_identity
+
+    def slow_identity(path: Path) -> wrkslots._RowPathIdentity:
+        elapsed[0] += 25.0
+        return real_identity(path)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(time, "monotonic", lambda: real_monotonic() + elapsed[0])
+        patch.setattr(wrkslots, "_row_path_identity", slow_identity)
+        with pytest.raises(wrkslots.Refusal, match="20-second bound of one judgement"):
+            wrkslots._assert_absent_validate_systemd_unrelated(rows, {}, (), snapshot=())
+    assert elapsed[0] == 25.0
+
+
+def test_judging_rows_refuses_when_the_last_property_scan_outruns_the_bound(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A unit whose last property is scanned past the time bound names no row only within it.
+
+    The clock is simulated.  The active unit's last property is empty, as
+    an earlier one was, so its candidate paths come from the judgement's
+    memo without another bound check; the scan of that property for the
+    row's spellings is where the time passes.  The judgement is first run
+    once to count its scans, then again with the last scan taking 25
+    seconds.
+    """
+
+    project, tree = _prepare(tmp_path, monkeypatch, agent_liveness="dead")
+    config = wrkslots._load_config(str(project), "testhost")
+    rows = [(record, (tree,)) for record in wrkslots._load_active(config).slots]
+    unit = _unit(Id="other.service", ActiveState="active", Description="")
+    real_monotonic = time.monotonic
+    elapsed = [0.0]
+    real_mentions = wrkslots._property_mentions
+    scans = [0]
+    slow_scan = [0]
+
+    def mentions(value: str, spelling: str) -> tuple[bool, tuple[str, ...]]:
+        scans[0] += 1
+        if scans[0] == slow_scan[0]:
+            elapsed[0] += 25.0
+        return real_mentions(value, spelling)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(time, "monotonic", lambda: real_monotonic() + elapsed[0])
+        patch.setattr(wrkslots, "_property_mentions", mentions)
+        wrkslots._assert_absent_validate_systemd_unrelated(rows, {}, (), snapshot=(unit,))
+        assert list(unit.values())[-1] == "" and elapsed[0] == 0.0
+        slow_scan[0] = scans[0]
+        scans[0] = 0
+        with pytest.raises(wrkslots.Refusal, match="20-second bound of one judgement"):
+            wrkslots._assert_absent_validate_systemd_unrelated(
+                rows, {}, (), snapshot=(unit,)
+            )
+    assert elapsed[0] == 25.0 and scans[0] == slow_scan[0]
+
+
 def test_an_option_value_longer_than_one_system_call_path_is_read_whole(
     tmp_path: Path,
 ) -> None:
@@ -2395,37 +2468,75 @@ def test_a_handle_still_inside_its_timestamp_window_is_alive(
         assert elapsed < 2.0, elapsed
 
 
+@dataclass
+class _CensusPhase:
+    """Which retained handle census is running, counted from 1 (0 before
+    the first), and whether it has begun reading a handle file."""
+
+    census: int = 0
+    read: bool = False
+
+
+def _track_census_phase(monkeypatch: pytest.MonkeyPatch) -> _CensusPhase:
+    """Count the handle censuses and note each one's first handle read."""
+
+    phase = _CensusPhase()
+    census = wrkslots._retained_handles_for_absent_rows
+    read = wrkslots._read_regular_file_identity
+
+    def counted(
+        config: wrkslots.Config,
+        rows: Sequence[tuple[wrkslots.ActiveRecord, tuple[Path, ...]]],
+    ) -> Mapping[str, tuple[wrkslots._RetainedValidationHandle, ...]]:
+        phase.census += 1
+        phase.read = False
+        return census(config, rows)
+
+    def reading(
+        path: Path, label: str, limit: int
+    ) -> tuple[bytes, wrkslots._RegularFileIdentity]:
+        if label == "retained validation handle":
+            phase.read = True
+        return read(path, label, limit)
+
+    monkeypatch.setattr(wrkslots, "_retained_handles_for_absent_rows", counted)
+    monkeypatch.setattr(wrkslots, "_read_regular_file_identity", reading)
+    return phase
+
+
 def _judge_with_census_clocks(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
-    readings: Sequence[tuple[int, int]],
+    readings: Sequence[tuple[tuple[int, int], tuple[int, int]]],
 ) -> tuple[str, str]:
-    """Judge one row whose unchanged handle each census reads at a given clock.
+    """Judge one row whose unchanged handle each census reads at given clocks.
 
     ``readings`` holds, for each handle census in turn, this host's realtime
-    and monotonic clocks as offsets in nanoseconds from the handle's change
-    time and from an arbitrary start.  The handle is never written again,
-    and the unit is absent from every enumeration, so only what the clocks
-    say about a rewrite alike can keep the run alive.
+    and monotonic clocks before the census reads its handle file and from
+    that read on, as offsets in nanoseconds from the handle's change time
+    and from an arbitrary start.  The handle is never written again, and
+    the unit is absent from every enumeration, so only what the clocks say
+    about a rewrite alike can keep the run alive.
     """
 
     project, tree = _prepare(tmp_path, monkeypatch, agent_liveness="dead")
     handle = _write_run_handle(project, tree / "before")
     change = handle.stat().st_ctime_ns
-    censuses = 0
+    phase = _track_census_phase(monkeypatch)
 
-    def realtime() -> int:
-        return change + readings[min(censuses, len(readings) - 1)][0]
+    def clocks() -> tuple[int, int]:
+        census = readings[min(max(phase.census, 1), len(readings)) - 1]
+        return census[1] if phase.read else census[0]
 
-    def monotonic() -> int:
-        # The census reads the realtime clock first, then this one.
-        nonlocal censuses
-        value = 10**15 + readings[min(censuses, len(readings) - 1)][1]
-        censuses += 1
-        return value
-
-    monkeypatch.setattr(wrkslots, "_retained_handle_clock_ns", realtime, raising=False)
-    monkeypatch.setattr(wrkslots, "_retained_handle_monotonic_ns", monotonic, raising=False)
+    monkeypatch.setattr(
+        wrkslots, "_retained_handle_clock_ns", lambda: change + clocks()[0], raising=False
+    )
+    monkeypatch.setattr(
+        wrkslots,
+        "_retained_handle_monotonic_ns",
+        lambda: 10**15 + clocks()[1],
+        raising=False,
+    )
     monkeypatch.setattr(wrkslots, "_user_systemd_snapshot", lambda: ())
     config = wrkslots._load_config(str(project), "testhost")
     states = wrkslots._validation_run_liveness_states(
@@ -2441,21 +2552,37 @@ _SECOND = 1_000_000_000
     ("readings", "change"),
     [
         pytest.param(
-            ((5 * _SECOND, 0), (_SECOND // 5, _SECOND)),
+            (((5 * _SECOND, 0),) * 2, ((_SECOND // 5, _SECOND),) * 2),
             "may have been rewritten alike within one file timestamp tick",
             id="back-into-the-window",
         ),
         pytest.param(
-            ((10 * _SECOND, 0), (7 * _SECOND, _SECOND)),
+            (((10 * _SECOND, 0),) * 2, ((7 * _SECOND, _SECOND),) * 2),
             "may have been rewritten alike while this host's realtime clock stepped back",
             id="back-short-of-the-window",
+        ),
+        pytest.param(
+            (
+                ((10 * _SECOND, 0),) * 2,
+                ((11 * _SECOND, _SECOND), (_SECOND // 5, _SECOND + _SECOND // 10)),
+            ),
+            "may have been rewritten alike within one file timestamp tick",
+            id="back-into-the-window-during-the-later-census",
+        ),
+        pytest.param(
+            (
+                ((10 * _SECOND, 0),) * 2,
+                ((11 * _SECOND, _SECOND), (8 * _SECOND, _SECOND + _SECOND // 10)),
+            ),
+            "may have been rewritten alike while this host's realtime clock stepped back",
+            id="back-short-of-the-window-during-the-later-census",
         ),
     ],
 )
 def test_an_equal_handle_read_across_a_realtime_clock_step_back_is_alive(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
-    readings: Sequence[tuple[int, int]],
+    readings: Sequence[tuple[tuple[int, int], tuple[int, int]]],
     change: str,
 ) -> None:
     """A handle the earlier read found old is not trusted after the clock goes back.
@@ -2468,6 +2595,9 @@ def test_an_equal_handle_read_across_a_realtime_clock_step_back_is_alive(
     ``back-short-of-the-window`` steps it three seconds back while one
     second passes, so neither read finds the handle recent, and only the
     fall of the realtime clock against the monotonic clock shows the step.
+    The ``during-the-later-census`` cases step the clock after the later
+    census has read the clocks and before it reads the handle, so only the
+    clocks read after its last handle show the step.
     """
 
     state, message = _judge_with_census_clocks(tmp_path, monkeypatch, readings)
@@ -2480,9 +2610,14 @@ def test_an_equal_handle_read_across_a_realtime_clock_step_back_is_alive(
 @pytest.mark.parametrize(
     "readings",
     [
-        pytest.param(((10 * _SECOND, 0), (11 * _SECOND, _SECOND)), id="steady"),
         pytest.param(
-            ((10 * _SECOND, 0), (10 * _SECOND + _SECOND // 10, _SECOND // 2)),
+            (((10 * _SECOND, 0),) * 2, ((11 * _SECOND, _SECOND),) * 2), id="steady"
+        ),
+        pytest.param(
+            (
+                ((10 * _SECOND, 0),) * 2,
+                ((10 * _SECOND + _SECOND // 10, _SECOND // 2),) * 2,
+            ),
             id="back-less-than-the-step-bound",
         ),
     ],
@@ -2490,7 +2625,7 @@ def test_an_equal_handle_read_across_a_realtime_clock_step_back_is_alive(
 def test_an_equal_old_handle_read_without_a_clock_step_back_is_not_alive(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
-    readings: Sequence[tuple[int, int]],
+    readings: Sequence[tuple[tuple[int, int], tuple[int, int]]],
 ) -> None:
     """Equal old reads with the clocks moving together leave the run over.
 
@@ -2502,6 +2637,62 @@ def test_an_equal_old_handle_read_without_a_clock_step_back_is_not_alive(
     state, message = _judge_with_census_clocks(tmp_path, monkeypatch, readings)
 
     assert state == "dead", message
+
+
+@pytest.mark.parametrize(
+    ("pauses", "expected"),
+    [
+        pytest.param("first", "dead", id="once"),
+        pytest.param("every", "alive", id="in-every-try"),
+    ],
+)
+def test_a_pause_between_clock_readings_is_not_a_step_unless_it_persists(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, pauses: str, expected: str
+) -> None:
+    """A scheduling pause between the two clocks' reads widens, not moves, a reading.
+
+    Both clocks advance together on one simulated timeline, one microsecond
+    per read.  In each census after the first, the process pauses for 0.6
+    seconds just after reading the realtime clock: ``once`` pauses after
+    the first such read only, so a second try reads both clocks within the
+    bracket and the old handle reads as over; ``in-every-try`` pauses after
+    every one, so no reading is bracketed more narrowly than the pause and
+    the step it cannot rule out keeps the run alive.
+    """
+
+    project, tree = _prepare(tmp_path, monkeypatch, agent_liveness="dead")
+    handle = _write_run_handle(project, tree / "before")
+    change = handle.stat().st_ctime_ns
+    phase = _track_census_phase(monkeypatch)
+    timeline = [0]
+    paused: set[int] = set()
+
+    def tick() -> int:
+        timeline[0] += 1_000
+        return timeline[0]
+
+    def realtime() -> int:
+        value = change + 10 * _SECOND + tick()
+        if phase.census >= 2 and (pauses == "every" or phase.census not in paused):
+            paused.add(phase.census)
+            timeline[0] += 6 * _SECOND // 10
+        return value
+
+    monkeypatch.setattr(wrkslots, "_retained_handle_clock_ns", realtime, raising=False)
+    monkeypatch.setattr(
+        wrkslots, "_retained_handle_monotonic_ns", lambda: 10**15 + tick(), raising=False
+    )
+    monkeypatch.setattr(wrkslots, "_user_systemd_snapshot", lambda: ())
+    config = wrkslots._load_config(str(project), "testhost")
+    states = wrkslots._validation_run_liveness_states(
+        config, wrkslots._load_active(config).slots
+    )
+
+    state, message = states[("testhost", "slot01", 1)]
+    assert phase.census >= 2
+    assert state == expected, message
+    if expected == "alive":
+        assert "realtime clock stepped back while the host evidence was read" in message
 
 
 @pytest.mark.parametrize("change", sorted(_HANDLE_CHANGES))
@@ -2521,16 +2712,16 @@ def test_a_handle_that_changes_while_its_window_is_waited_out_is_alive(
     project, tree = _prepare(tmp_path, monkeypatch, agent_liveness="dead")
     handle = _write_run_handle(project, tree / "before")
     start = handle.stat().st_ctime_ns
+    phase = _track_census_phase(monkeypatch)
     # The first census and the settle step read the handle's change time;
     # both later censuses read three seconds past this host's clock, so the
     # handle as the wait left it is not recent however long setup took.
     # The monotonic clock keeps pace.
-    realtimes = iter((start, start))
-    monotonics = iter((0, 3 * _SECOND, 3 * _SECOND + _SECOND // 10))
+    monotonics = (0, 3 * _SECOND, 3 * _SECOND + _SECOND // 10)
     waits: list[float] = []
 
     def realtime() -> int:
-        return next(realtimes, time.time_ns() + 3 * _SECOND)
+        return start if phase.census <= 1 else time.time_ns() + 3 * _SECOND
 
     def wait(seconds: float) -> None:
         waits.append(seconds)
@@ -2540,7 +2731,7 @@ def test_a_handle_that_changes_while_its_window_is_waited_out_is_alive(
     monkeypatch.setattr(
         wrkslots,
         "_retained_handle_monotonic_ns",
-        lambda: 10**15 + next(monotonics),
+        lambda: 10**15 + monotonics[min(max(phase.census, 1), 3) - 1],
         raising=False,
     )
     monkeypatch.setattr(time, "sleep", wait)

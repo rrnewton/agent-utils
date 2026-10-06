@@ -629,6 +629,14 @@ _RETAINED_HANDLE_SETTLE_SLACK_NS = 250_000_000
 # both clocks alike; only a step (or an inserted leap second) moves one
 # against the other.
 _RETAINED_HANDLE_CLOCK_STEP_NS = 500_000_000
+# How many times one reading of this host's clocks is tried, and how
+# narrowly its realtime reading must be bracketed by two monotonic readings
+# to be kept without another try (``_retained_handle_clocks``).  A reading
+# that a scheduling pause in every try widens past the step bound can read
+# as a step, which keeps a run alive rather than clearing its row.  A step
+# back undone by a step forward between two readings does not show.
+_RETAINED_HANDLE_CLOCK_TRIES = 3
+_RETAINED_HANDLE_CLOCK_BRACKET_NS = 1_000_000
 # The bound on one /proc/<pid>/mountinfo read, sized from measurement. On
 # 2026-10-04, at load average about 150, the largest of 4,118 readable tables
 # on a production host was 143,648 bytes (976 mounts), so 4 MiB is about 29
@@ -819,14 +827,22 @@ class StateError(Refusal):
 
 
 class _TargetStorageDrift(StateError):
-    """Physical or Git drift of one target row's own storage.
+    """Physical or Git drift of one target row's own storage, found by
+    ``remove`` before its first change to the slot.
 
     The registry as a whole validated; only the target's slot directory,
     checkout or a Git registration inside the target slot disagrees with its
-    row.  A retirement batch reports the target as needing recovery and goes
-    on with its other candidates once the registry shows the attempt changed
-    nothing.
+    row.  ``record`` is the row as that check read it.  A retirement batch
+    reports the target as needing recovery and goes on with its other
+    candidates once the registry shows the attempt changed nothing.  The
+    same drift found at any later step is a plain ``StateError``.
     """
+
+    def __init__(
+        self, message: str, *, record: ActiveRecord, remedy: str | None = None
+    ) -> None:
+        super().__init__(message, remedy=remedy)
+        self.record = record
 
 
 class _LockBusy(Refusal):
@@ -1231,15 +1247,20 @@ class _RetainedValidationHandle:
     # same handle only when all of them match.
     file_generation: tuple[int, int, int, str, int, int] | None = None
     # Whether the change time was within ``_RETAINED_HANDLE_STABLE_NS`` of
-    # the start of the census that read it, so that a later equal read does
-    # not rule out a rewrite (``_settle_retained_handles``, ``_run_evidence``).
-    # Not part of the identity.
+    # the earlier of the realtime readings that the census that read it took
+    # before its first handle and after its last, so that a later equal read
+    # does not rule out a rewrite (``_settle_retained_handles``,
+    # ``_run_evidence``).  Not part of the identity.
     recent: bool = dataclasses.field(default=False, compare=False)
-    # This host's realtime clock less its monotonic clock, in nanoseconds,
-    # when the census that read it began; a fall between two reads is a
-    # step back of the realtime clock (``_retained_handle_changes``).  Not
-    # part of the identity.
-    clock_offset_ns: int | None = dataclasses.field(default=None, compare=False)
+    # The lowest and highest values of this host's realtime clock less its
+    # monotonic clock, in nanoseconds, that the census that read it found,
+    # reading both clocks before its first handle and after its last; a
+    # fall between two reads is a step back of the realtime clock
+    # (``_retained_handle_clocks``, ``_retained_handle_changes``).  Not part
+    # of the identity.
+    clock_offsets_ns: tuple[int, int] | None = dataclasses.field(
+        default=None, compare=False
+    )
 
 
 @dataclasses.dataclass(frozen=True)
@@ -9649,12 +9670,31 @@ def _assert_record_registered(
             raise Refusal(f"Git does not list {path} as a worktree of {repository}")
 
 
+def _target_storage_refusal(
+    message: str,
+    remedy: str | None,
+    record: ActiveRecord,
+    *,
+    before_any_change: bool,
+) -> StateError:
+    if before_any_change:
+        return _TargetStorageDrift(message, record=record, remedy=remedy)
+    return StateError(message, remedy=remedy)
+
+
 def _assert_target_record_storage_consistent(
     config: Config,
     states: Sequence[ActiveState],
     record: ActiveRecord,
+    *,
+    before_any_change: bool = False,
 ) -> None:
-    """Refuse physical or Git drift attributable to one requested record."""
+    """Refuse physical or Git drift attributable to one requested record.
+
+    ``before_any_change`` marks the check that ``remove`` makes before its
+    first change to the slot; only that check reports the drift as
+    ``_TargetStorageDrift``.
+    """
 
     authoritative_state = next(
         (
@@ -9678,14 +9718,23 @@ def _assert_target_record_storage_consistent(
             and finding.slot_type == record.slot_type
             and finding.machine in {None, record.machine}
         ):
-            raise _TargetStorageDrift(finding.detail, remedy=finding.remedy)
-    _assert_no_cross_repository_target_registrations(config, states, record)
+            raise _target_storage_refusal(
+                finding.detail,
+                finding.remedy,
+                record,
+                before_any_change=before_any_change,
+            )
+    _assert_no_cross_repository_target_registrations(
+        config, states, record, before_any_change=before_any_change
+    )
 
 
 def _assert_no_cross_repository_target_registrations(
     config: Config,
     states: Sequence[ActiveState],
     record: ActiveRecord,
+    *,
+    before_any_change: bool = False,
 ) -> None:
     """Reject any available repository registration entering the target slot."""
 
@@ -9726,13 +9775,15 @@ def _assert_no_cross_repository_target_registrations(
                 continue
             if expected_common_by_path.get(registered) == common:
                 continue
-            raise _TargetStorageDrift(
+            raise _target_storage_refusal(
                 f"source repository {repository} (Git common directory {common}) "
                 f"registers unexpected path {registered} inside target slot "
                 f"{record.slot}",
-                remedy="inspect every recorded repository's 'git worktree list "
+                "inspect every recorded repository's 'git worktree list "
                 "--porcelain' output and remove the unexpected target-slot "
                 "registration before retrying removal",
+                record,
+                before_any_change=before_any_change,
             )
 
 
@@ -16983,9 +17034,10 @@ def _retained_handle_changes(
     equal handle may still have been rewritten alike: with ``window``, when
     either read found it within ``_RETAINED_HANDLE_STABLE_NS`` of its change
     time (the later read finds that only if the realtime clock went back),
-    and always when the realtime clock fell more than
+    and always when the realtime clock may have fallen more than
     ``_RETAINED_HANDLE_CLOCK_STEP_NS`` against the monotonic clock between
-    the two reads.  ``during`` says when, and ends each description.
+    the two reads (``_realtime_clock_stepped_back``).  ``during`` says
+    when, and ends each description.
     """
 
     first = {handle.path: handle for handle in before}
@@ -17022,13 +17074,20 @@ def _retained_handle_changes(
 def _realtime_clock_stepped_back(
     before: _RetainedValidationHandle, after: _RetainedValidationHandle
 ) -> bool:
-    """Whether the realtime clock fell against the monotonic clock between
-    the censuses that read ``before`` and ``after``."""
+    """Whether the realtime clock may have fallen against the monotonic clock
+    between the censuses that read ``before`` and ``after``.
+
+    The highest offset the earlier census found is compared with the lowest
+    the later one found, so a step during either census, before or after
+    its handle reads, counts, and so does a reading that a pause left too
+    loosely bounded to rule one out.
+    """
 
     return (
-        before.clock_offset_ns is not None
-        and after.clock_offset_ns is not None
-        and before.clock_offset_ns - after.clock_offset_ns > _RETAINED_HANDLE_CLOCK_STEP_NS
+        before.clock_offsets_ns is not None
+        and after.clock_offsets_ns is not None
+        and before.clock_offsets_ns[1] - after.clock_offsets_ns[0]
+        > _RETAINED_HANDLE_CLOCK_STEP_NS
     )
 
 
@@ -23954,6 +24013,7 @@ def _retirement_outcome_after_refusal(
 def _confirm_unchanged_after_target_storage_drift(
     config: Config,
     candidate: _RetirementCandidate,
+    drift: _TargetStorageDrift,
     deadline: float,
 ) -> None:
     """Confirm that a removal refused for its target's own storage changed nothing.
@@ -23961,8 +24021,9 @@ def _confirm_unchanged_after_target_storage_drift(
     ``remove`` checks the target's storage before its first change to the
     slot; only the queue's attempt event precedes that check.  Under the
     mutation locks again, the registry must show no partial update and no
-    mutation journal, and must still hold the candidate's exact row.
-    Anything else, including a lock that cannot be taken, raises StateError.
+    mutation journal, and must still hold the row exactly as that check read
+    it (``drift.record``), every field alike.  Anything else, including a
+    lock that cannot be taken, raises StateError.
     """
 
     try:
@@ -23991,7 +24052,11 @@ def _confirm_unchanged_after_target_storage_drift(
                 ),
                 None,
             )
-            if current is None or current.generation != candidate.generation:
+            if (
+                current is None
+                or current.generation != candidate.generation
+                or _record_to_obj(current) != _record_to_obj(drift.record)
+            ):
                 raise StateError(
                     f"retirement attempt for {candidate.slot} no longer finds its "
                     "exact active row after its storage refusal"
@@ -24051,9 +24116,12 @@ def _cmd_retire_pending(args: argparse.Namespace) -> int:
             reason = str(exc) + (f"; remedy: {exc.remedy}" if exc.remedy else "")
             try:
                 _confirm_unchanged_after_target_storage_drift(
-                    config, candidate, deadline
+                    config, candidate, exc, deadline
                 )
-            except StateError as state_error:
+            except Refusal as state_error:
+                # Any refusal here, including one revalidating the
+                # configuration, leaves the attempt unconfirmed: the batch
+                # stops and still reports what it did.
                 could_not_determine.append(
                     {
                         **identity,
@@ -32031,7 +32099,9 @@ def _cmd_remove(
                 private_cleanup.target.original_mode,
                 private_cleanup.target.identity,
             )
-        _assert_target_record_storage_consistent(config, states, record)
+        _assert_target_record_storage_consistent(
+            config, states, record, before_any_change=True
+        )
         _assert_remove_processes(coordinator, runner, handoff_writer, proof_fd)
         if args.validate_complete and record.slot_type != "validate":
             raise Refusal(
@@ -44157,6 +44227,36 @@ def _retained_handle_monotonic_ns() -> int:
     return time.monotonic_ns()
 
 
+def _retained_handle_clocks() -> tuple[int, int, int]:
+    """This host's realtime clock, and the bounds of its offset from the monotonic clock.
+
+    The realtime clock is read between two readings of the monotonic clock,
+    so its offset from the monotonic clock at that moment is no lower than
+    the realtime reading less the later monotonic reading and no higher
+    than it less the earlier one.  A pause between the reads widens these
+    bounds instead of moving them.  The clocks are read up to
+    ``_RETAINED_HANDLE_CLOCK_TRIES`` times, stopping at a reading bracketed
+    within ``_RETAINED_HANDLE_CLOCK_BRACKET_NS``, and the most narrowly
+    bracketed reading is kept: its realtime value, lowest offset and
+    highest offset, in nanoseconds.
+    """
+
+    def reading() -> tuple[int, int, int]:
+        before = _retained_handle_monotonic_ns()
+        realtime = _retained_handle_clock_ns()
+        after = _retained_handle_monotonic_ns()
+        return realtime, realtime - after, realtime - before
+
+    best = reading()
+    for _ in range(_RETAINED_HANDLE_CLOCK_TRIES - 1):
+        if best[2] - best[1] <= _RETAINED_HANDLE_CLOCK_BRACKET_NS:
+            break
+        candidate = reading()
+        if candidate[2] - candidate[1] < best[2] - best[1]:
+            best = candidate
+    return best
+
+
 def _retained_handles_for_absent_rows(
     config: Config, rows: Sequence[tuple[ActiveRecord, tuple[Path, ...]]]
 ) -> Mapping[str, tuple[_RetainedValidationHandle, ...]]:
@@ -44186,9 +44286,21 @@ def _retained_handles_for_absent_rows(
     total_bytes = 0
     if time.monotonic() >= deadline:
         raise Refusal("retained validation handle census exceeded its time bound")
-    started_ns = _retained_handle_clock_ns()
-    stable_before_ns = started_ns - _RETAINED_HANDLE_STABLE_NS
-    clock_offset_ns = started_ns - _retained_handle_monotonic_ns()
+    # The clocks are read before the first handle and after the last, so a
+    # step of the realtime clock while the handles are read shows in the
+    # offsets the handles carry (``_realtime_clock_stepped_back``).
+    started = _retained_handle_clocks()
+    found: list[
+        tuple[
+            set[str],
+            Path,
+            str,
+            int | None,
+            int | None,
+            str | None,
+            tuple[int, int, int, str, int, int],
+        ]
+    ] = []
     if handles.is_dir():
         try:
             with os.scandir(handles) as entries:
@@ -44319,6 +44431,14 @@ def _retained_handles_for_absent_rows(
             boot_id = _as_str(identity["boot_id"], f"{path}.process_identity.boot_id")
             if not boot_id:
                 raise Refusal(f"retained validation handle {path} has an empty boot identity")
+        found.append((related, path, unit, pid, start_ticks, boot_id, file_generation))
+    finished = _retained_handle_clocks()
+    # A change time within the window of the earlier of the two realtime
+    # readings is recent, so a step back during the census makes more
+    # handles recent, not fewer.
+    stable_before_ns = min(started[0], finished[0]) - _RETAINED_HANDLE_STABLE_NS
+    clock_offsets_ns = (min(started[1], finished[1]), max(started[2], finished[2]))
+    for related, path, unit, pid, start_ticks, boot_id, file_generation in found:
         handle = _RetainedValidationHandle(
             path,
             unit,
@@ -44326,8 +44446,8 @@ def _retained_handles_for_absent_rows(
             start_ticks,
             boot_id,
             file_generation,
-            recent=after.st_ctime_ns > stable_before_ns,
-            clock_offset_ns=clock_offset_ns,
+            recent=file_generation[5] > stable_before_ns,
+            clock_offsets_ns=clock_offsets_ns,
         )
         for slot in related:
             matched[slot].append(handle)
@@ -47726,6 +47846,13 @@ class _UnitPathResolver:
         self._budget.spend()
         return _row_path_identity(path)
 
+    def check_bound(self) -> None:
+        """Refuse once the time bound has passed, so that an answer read
+        from work that outran it, such as a row identity read or a property
+        scan that crossed it, is not given."""
+
+        self._budget.spend()
+
     def _kind(self, path: str) -> str:
         try:
             return self._kinds[path]
@@ -48299,6 +48426,9 @@ def _assert_absent_validate_systemd_unrelated(
                     f"user-systemd unit {unit['Id']} names validation row "
                     f"{record.slot} path {target.path}"
                 )
+    # The last row identity read or property answer may itself have run past
+    # the bound; a unit naming no row is an answer only within it.
+    resolver.check_bound()
 
 
 def _assert_absent_validate_owners_dead(records: Sequence[ActiveRecord]) -> None:
