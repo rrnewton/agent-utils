@@ -39,9 +39,15 @@
 //! A paginated call prints one block per page, so [`Scanner::new`] reads every block: a block
 //! counts once its blank CR LF line arrives, provided every header line in it ended in CR LF;
 //! a block interrupted by a line of another shape (a body printed by `--jq`, with plain LF line
-//! ends) is dropped. When the output ends inside a block that already holds a CR LF header
-//! line, [`Scanner::end_of_stdout`] commits it, so a cut-short response keeps its
-//! `Retry-After`.
+//! ends) is dropped. When the output ends inside a block that began on the first stdout line or
+//! already holds a CR LF header line, [`Scanner::end_of_stdout`] commits it.
+//!
+//! The output can end anywhere, even inside a line: gh can be killed partway, and when delivery
+//! to the caller's terminal or pipe fails the reader stops after the chunk it holds, which a
+//! terminal can cut at any byte. So in a 403 or 429 block cut short by the end of the output, the wait is known only
+//! from a `Retry-After` line that arrived whole. Without one, the cooldown has no end time
+//! ([`Scanner::cut_header_block`]): the `Retry-After` may be in the part that never arrived, or
+//! be the cut line itself (`Retry-After: 17` of `Retry-After: 172800`).
 
 use crate::config::Config;
 
@@ -137,6 +143,14 @@ pub struct Scanner {
     /// A `Retry-After` value on stderr ran up to the point where the caller stopped reading
     /// stderr ([`Scanner::stderr_cut_off`]), so the rest of its digits are lost.
     pub cut_retry_after: bool,
+    /// The end of stdout ([`Scanner::end_of_stdout`]) came inside a response header block
+    /// before the wait it asked for was read whole: a 403 or 429 block with no whole
+    /// `Retry-After` line yet, or a `Retry-After` line whose line end never arrived. The wait is
+    /// not known.
+    pub cut_header_block: bool,
+    /// The line being read is the last stdout line, and its line end never arrived, so bytes of
+    /// it may be missing.
+    cut_line: bool,
     /// Partial stdout line carried between [`Scanner::feed_headers`] calls.
     line: Vec<u8>,
     /// The current stdout line is longer than [`MAX_HEADER_LINE`] and is being skipped.
@@ -169,6 +183,11 @@ struct HeaderBlock {
     /// The block began on the first stdout line, where gh's own output starts, so no body text
     /// can have come before it.
     first_line: bool,
+    /// A `Retry-After` line of this block arrived whole, with its line end.
+    retry_after_whole: bool,
+    /// The end of the output cut this block short before the wait it asked for was read whole
+    /// (see [`Scanner::cut_header_block`]).
+    wait_cut: bool,
 }
 
 /// The cooldown a scan calls for.
@@ -420,42 +439,61 @@ impl Scanner {
         self.skipped_cr = false;
     }
 
-    /// The stdout output has ended (or will no longer be read). A block it interrupted is
-    /// committed when its headers were verified: always for the first block of a
-    /// single-response call, and otherwise once it holds at least one CR LF header line.
+    /// The stdout output has ended (or will no longer be read). A block it interrupted, before
+    /// its blank CR LF line, is committed when its headers were verified: always for the first
+    /// block of a single-response call, and in a paginated call when it began on the first
+    /// stdout line (gh's own first block, which no body text can come before) or already holds
+    /// a CR LF header line.
+    ///
+    /// The output can stop anywhere, not only at a line end: gh can be killed partway, and when
+    /// delivery to the terminal or pipe fails, the reader stops after the chunk it holds, which
+    /// a terminal may have cut inside a line (a 4,095-byte read ending `Retry-After: 17` of
+    /// `Retry-After: 172800`). So in a 403 or 429 block committed here, a wait is known only
+    /// from a `Retry-After` line that arrived whole, with its line end. Without one, the
+    /// `Retry-After` may be in the part that never arrived, and the block gives a cooldown with
+    /// no end time ([`Scanner::cut_header_block`]), never the floor a shorter read would give.
     ///
     /// An unterminated last line is handled by mode. In a single-response call the open block
-    /// is gh's own (it began on the first stdout line), so the last line is read as a header
-    /// line whether or not its CR LF arrived: `HTTP/2.0 429 ...` alone, or a final
-    /// `Retry-After: 3600`, still counts. A line that is not a header ends the block, which
-    /// keeps what it already reported. In a paginated call the line may be body text, so it is
-    /// ignored rather than allowed to spoil the block, with one exception: a header-shaped
-    /// over-long line of a 403 or 429 block that began on the first stdout line (see the module
-    /// docs). Its line end never arrived, and the `Retry-After` it may hold cannot be read, so the
-    /// block is committed and the cooldown has no end time. Nothing can come before gh's own
-    /// first block, so that block is not body text. A later block with no CR LF header line yet
-    /// may be body text (a `--jq` page body cut short), so it is dropped there, and the cooldown
-    /// is whatever stderr gives (900 s for an `HTTP 429`).
+    /// is gh's own, so the last line is read: a line ending in CR lost only its LF and is read
+    /// whole; any other is read as a cut line, where `HTTP/2.0 429 ...` still opens the block
+    /// and a `Retry-After` value is not trusted (in any block it makes the wait unknown). A line
+    /// that is not a header ends the block. In a paginated call the line may be body text, so
+    /// it is ignored, unless it is the first stdout line: that is gh's status line, read as in
+    /// a single-response call. A later paginated block with no CR LF header line yet may be
+    /// body text (a `--jq` page body cut short), so it is dropped, and the cooldown is whatever
+    /// stderr gives (900 s for an `HTTP 429`). Output cut before a status code arrived gives no
+    /// stdout signal at all, and the call is judged by stderr alone, as one without
+    /// `--include` is.
     pub fn end_of_stdout(&mut self) {
-        if self.single_response && !self.closed && !self.skipping && !self.line.is_empty() {
+        let gh_own_line = self.single_response || !self.started;
+        if gh_own_line && !self.closed && !self.skipping && !self.line.is_empty() {
             let mut line = std::mem::take(&mut self.line);
-            if line.last() != Some(&b'\r') {
+            let whole = line.last() == Some(&b'\r');
+            if !whole {
                 line.push(b'\r');
             }
+            self.cut_line = !whole;
             self.header_line(&line);
+            self.cut_line = false;
         }
         self.line.clear();
         self.skipping = false;
-        let cut_in_long_header = std::mem::take(&mut self.skipping_header);
+        self.skipping_header = false;
         if let Some(block) = self.pending.take() {
-            if self.single_response
-                || block.crlf_headers > 0
-                || (cut_in_long_header && block.first_line)
-            {
-                self.commit(&block);
+            if self.single_response || block.crlf_headers > 0 || block.first_line {
+                self.commit_cut_short(block);
             }
         }
         self.closed = true;
+    }
+
+    /// Record a block that the end of the output cut short, before its blank CR LF line: a 403
+    /// or 429 block with no whole `Retry-After` line makes the wait unknown.
+    fn commit_cut_short(&mut self, mut block: HeaderBlock) {
+        if can_ask_for_a_wait(block.status) && !block.retry_after_whole {
+            block.wait_cut = true;
+        }
+        self.commit(&block);
     }
 
     /// The current block ended without its blank CR LF line. In single-response mode the
@@ -463,7 +501,12 @@ impl Scanner {
     /// otherwise it may have been body text and is dropped.
     fn end_block(&mut self, confirmed: bool) {
         if let Some(block) = self.pending.take() {
-            if confirmed || self.single_response {
+            if !confirmed && self.cut_line {
+                // Ended by a last line cut short: the end of the output ended the block.
+                if self.single_response {
+                    self.commit_cut_short(block);
+                }
+            } else if confirmed || self.single_response {
                 self.commit(&block);
             }
         }
@@ -481,7 +524,9 @@ impl Scanner {
         let line = strip_ansi(raw);
         let line = line.trim_ascii();
         if line.is_empty() {
-            self.end_block(crlf);
+            // A cut last line is never the blank line: what is left of it may be the start of
+            // a header line (a colour escape cut before the name, say).
+            self.end_block(crlf && !self.cut_line);
             return;
         }
         let lower = line.to_ascii_lowercase();
@@ -519,7 +564,10 @@ impl Scanner {
             .and_then(|v| v.parse::<f64>().ok())
             .filter(|n| n.is_finite() && *n >= 0.0);
         match (name, number) {
+            // Its line end never arrived, so digits may be missing: the wait is not known.
+            (b"retry-after", _) if self.cut_line => block.wait_cut = true,
             (b"retry-after", _) => {
+                block.retry_after_whole = true;
                 if let Some(n) = text.and_then(retry_after_secs) {
                     block.retry_after = Some(block.retry_after.map_or(n, |old| old.max(n)));
                 }
@@ -541,6 +589,7 @@ impl Scanner {
         }
         self.remaining_zero |= block.remaining_zero;
         self.overlong_header |= block.overlong;
+        self.cut_header_block |= block.wait_cut;
     }
 
     /// A value that changes whenever the pushback signals seen so far change (a new pattern, or
@@ -585,6 +634,9 @@ impl Scanner {
         if self.cut_retry_after {
             out.push("Retry-After cut off");
         }
+        if self.cut_header_block {
+            out.push("header block cut off");
+        }
         out
     }
 
@@ -593,11 +645,16 @@ impl Scanner {
     /// `plain_403_cooldown_secs` for an HTTP 403 with no rate-limit signal. A `Retry-After`
     /// longer than [`MAX_RETRY_AFTER_SECS`], or one that could not be read (an over-long header
     /// line in a 403 or 429 response, a stderr value longer than the bytes kept between chunks,
-    /// or a stderr value that runs up to where reading stopped), gives a cooldown with no end
-    /// time ([`NO_END`]), never a shorter one.
+    /// a stderr value that runs up to where reading stopped, or a stdout header block that the
+    /// end of the output cut short before its `Retry-After` was read whole), gives a cooldown
+    /// with no end time ([`NO_END`]), never a shorter one.
     pub fn verdict(&self, cfg: &Config) -> Option<Pushback> {
         let reason = self.matched().join(", ");
-        if self.overlong_header || self.unread_retry_after || self.cut_retry_after {
+        if self.overlong_header
+            || self.unread_retry_after
+            || self.cut_retry_after
+            || self.cut_header_block
+        {
             let why = if self.overlong_header {
                 format!(
                     "a header line of a 403 or 429 response is longer than the \
@@ -608,9 +665,13 @@ impl Scanner {
                     "a Retry-After value on stderr runs on past the {OVERLAP} bytes gh-paced \
                      keeps"
                 )
-            } else {
+            } else if self.cut_retry_after {
                 "a Retry-After value on stderr runs up to the point where gh-paced stopped \
                  reading stderr"
+                    .to_string()
+            } else {
+                "the output ended inside a response header block before its Retry-After was \
+                 read whole"
                     .to_string()
             };
             return Some(Pushback {
@@ -880,6 +941,8 @@ mod tests {
         assert_eq!(s.verdict(&cfg).expect("pushback").cooldown_secs, 3600.0);
         let s = single(&["HTTP/2.0 429 Too Many Requests\n"]);
         assert!(s.http_429, "{s:?}");
+        // With no Retry-After line read whole, the wait it asked for is not known.
+        assert!(s.verdict(&cfg).expect("pushback").has_no_end(), "{s:?}");
         // Ended by a line of another shape, it keeps what it reported, and nothing later counts.
         let s = single(&[
             "HTTP/2.0 429 Too Many\nRetry-After: 1200\r\nodd line\n",
@@ -1100,10 +1163,106 @@ mod tests {
         // So may one in any block other than a 403 or 429.
         let text = format!("HTTP/2.0 200 OK\nX-Long: {filler}");
         assert!(headers(&[&text]).verdict(&cfg).is_none());
-        // A short unterminated last line is still ignored by the paginated reader (the rule
-        // before this change, unchanged by it).
+        // A short unterminated last line in gh's own first block, cut inside its Retry-After
+        // value: the digits after the cut are lost, so the wait is not known. (At `65829cb0`
+        // the paginated reader dropped this block at the end of the output, and the call got
+        // only what stderr gives: 900 s for an `HTTP 429`.)
         let s = headers(&["HTTP/2.0 429 Too Many Requests\r\nRetry-After: 17"]);
-        assert!(s.verdict(&cfg).is_none(), "{s:?}");
+        assert!(s.cut_header_block, "{s:?}");
+        assert!(s.verdict(&cfg).expect("pushback").has_no_end(), "{s:?}");
+    }
+
+    /// The output can stop at any byte, not only at a line end: gh can be killed partway, and
+    /// when delivery to the consumer fails the reader stops after the chunk it holds, which a
+    /// terminal may have cut anywhere (round 11 observed 4,095-byte reads ending
+    /// `Retry-After: 17` of `Retry-After: 172800`). Cut at every byte of a 429 or 403 response,
+    /// plain and with coloured header names, with and without `--paginate`, the verdict is the
+    /// two-day wait once the `Retry-After` line has arrived whole, and before that a cooldown
+    /// with no end time: never the 900 s floor and never the value read up to the cut. Before
+    /// the status code arrives stdout gives no signal, and stderr alone decides.
+    #[test]
+    fn output_cut_anywhere_in_a_header_block_never_shortens_a_wait() {
+        let cfg = Config::default();
+        for status in ["429 Too Many Requests", "403 Forbidden"] {
+            for colour in [false, true] {
+                let name = |n: &str| {
+                    if colour {
+                        format!("\u{1b}[1;34m{n}\u{1b}[m")
+                    } else {
+                        n.to_string()
+                    }
+                };
+                let head = format!(
+                    "HTTP/2.0 {status}\n{}: {}\r\n{}: 172800",
+                    name("A-Pad"),
+                    "x".repeat(40),
+                    name("Retry-After")
+                );
+                let text = format!("{head}\r\n{}: 0\r\n\r\n{{}}", name("X-Ratelimit-Remaining"));
+                for single_mode in [true, false] {
+                    // The Retry-After line is whole once its CR LF has arrived; a single
+                    // response also reads a last line that ends in CR as whole.
+                    let whole_from = head.len() + if single_mode { 1 } else { 2 };
+                    for k in 0..=text.len() {
+                        let cut = &text[..k];
+                        let s = if single_mode {
+                            single(&[cut])
+                        } else {
+                            headers(&[cut])
+                        };
+                        let v = s.verdict(&cfg);
+                        let at = format!("{status} colour={colour} single={single_mode} {cut:?}");
+                        if k < "HTTP/2.0 429".len() {
+                            assert!(v.is_none(), "{at}: {s:?}");
+                        } else if k < whole_from {
+                            assert!(v.expect("pushback").has_no_end(), "{at}: {s:?}");
+                        } else {
+                            let v = v.expect("pushback");
+                            assert_eq!(v.cooldown_secs, 172_800.0, "{at}: {s:?}");
+                        }
+                    }
+                }
+            }
+        }
+        // Round 11's terminal read: 4,095 bytes ending in `Retry-After: 17`.
+        let text = format!(
+            "HTTP/2.0 429 Too Many Requests\nA-Pad: {}\r\nRetry-After: 172800\r\n",
+            "x".repeat(4040)
+        );
+        let cut = &text[..4095];
+        assert!(cut.ends_with("Retry-After: 17"), "{cut:?}");
+        for s in [single(&[cut]), headers(&[cut])] {
+            assert_eq!(s.retry_after, None, "{s:?}");
+            let v = s.verdict(&cfg).expect("pushback");
+            assert!(v.has_no_end(), "{s:?}");
+            assert!(v.reason.contains("header block cut off"), "{}", v.reason);
+        }
+    }
+
+    /// A later page's block in a paginated call, cut at every byte. Once it holds a CR LF header
+    /// line it is gh's header format: before its `Retry-After` line is whole the cooldown has no
+    /// end time, then it is the two-day wait. Cut in its status line or first header line, it
+    /// may be a `--jq` page body cut short, so it is dropped (the trade-off accepted after round
+    /// 10: stdout gives no signal, and stderr alone decides, 900 s for an `HTTP 429`).
+    #[test]
+    fn a_later_page_cut_short_never_shortens_a_known_wait() {
+        let cfg = Config::default();
+        let first = "HTTP/2.0 200 OK\nX-Ratelimit-Remaining: 10\r\n\r\n[]\n";
+        let pad_line = "HTTP/2.0 429 Too Many Requests\nA-Pad: xx\r\n";
+        let page = format!("{pad_line}Retry-After: 172800\r\n\r\n[]\n");
+        let whole_from = page.find("172800").unwrap() + "172800\r\n".len();
+        for k in 0..=page.len() {
+            let text = format!("{first}{}", &page[..k]);
+            let s = headers(&[&text]);
+            let v = s.verdict(&cfg);
+            if k < pad_line.len() {
+                assert!(v.is_none(), "{text:?}: {s:?}");
+            } else if k < whole_from {
+                assert!(v.expect("pushback").has_no_end(), "{text:?}: {s:?}");
+            } else {
+                assert_eq!(v.expect("pushback").cooldown_secs, 172_800.0, "{text:?}");
+            }
+        }
     }
 
     /// When a caller stops reading stderr partway (the rate-limit refresh keeps only its first
@@ -1227,26 +1386,43 @@ mod tests {
     }
 
     /// A single-response call's header block is gh's own, so a last line whose LF never
-    /// arrived is still read: a final `Retry-After` sets the cooldown, and a status line alone
-    /// still reports the 429.
+    /// arrived is still read. One ending in CR lost only its LF, so a final `Retry-After` there
+    /// sets the cooldown. Any other may have lost bytes (`Retry-After: 3600` may be the start of
+    /// `Retry-After: 360000`): a 403 or 429 block with no whole `Retry-After` line gives a
+    /// cooldown with no end time, and a status line alone still reports the 429.
     #[test]
     fn single_response_reads_an_unterminated_last_line() {
         let cfg = Config::default();
-        let s = single(&["HTTP/2.0 429 Too Many Requests\nRetry-After: 3600"]);
+        let s = single(&["HTTP/2.0 429 Too Many Requests\nRetry-After: 3600\r"]);
         assert_eq!(s.retry_after, Some(3600.0), "{s:?}");
         assert_eq!(s.verdict(&cfg).expect("pushback").cooldown_secs, 3600.0);
+        let s = single(&["HTTP/2.0 429 Too Many Requests\nRetry-After: 3600"]);
+        assert!(s.http_429 && s.cut_header_block, "{s:?}");
+        assert!(s.verdict(&cfg).expect("pushback").has_no_end(), "{s:?}");
         let s = single(&["HTTP/2.0 429 Too Many Requests"]);
-        assert!(s.http_429, "{s:?}");
-        assert_eq!(s.verdict(&cfg).expect("pushback").cooldown_secs, 900.0);
+        assert!(s.http_429 && s.cut_header_block, "{s:?}");
+        assert!(s.verdict(&cfg).expect("pushback").has_no_end(), "{s:?}");
         let s = single(&["HTTP/2.0 403 Forbidden\nX-Ratelimit-Remaining: 0"]);
         assert!(s.remaining_zero, "{s:?}");
+        assert!(s.verdict(&cfg).expect("pushback").has_no_end(), "{s:?}");
+        // A cut Retry-After line is not trusted in any block.
+        let s = single(&["HTTP/2.0 200 OK\nRetry-After: 17"]);
+        assert!(s.verdict(&cfg).expect("pushback").has_no_end(), "{s:?}");
+        // A block of another status, cut anywhere else, asks for no wait.
+        for text in [
+            "HTTP/2.0 200 OK",
+            "HTTP/2.0 200 OK\nX-Ratelimit-Remaining: 10\r\nX-Rat",
+        ] {
+            assert!(single(&[text]).verdict(&cfg).is_none(), "{text:?}");
+        }
         // Body text after the block is never read, terminated or not.
         let s = single(&["HTTP/2.0 200 OK\nX-Ratelimit-Remaining: 10\r\n\r\nRetry-After: 99999"]);
         assert!(s.verdict(&cfg).is_none(), "{s:?}");
         // Nor is a body that came first.
         let s = single(&["[]\nHTTP/2.0 429 Too Many Requests"]);
         assert!(s.verdict(&cfg).is_none(), "{s:?}");
-        // The paginated reader still ignores an unterminated last line (it may be body text).
+        // The paginated reader still ignores an unterminated last line after the first (it may
+        // be body text).
         let s = headers(&["[]\nHTTP/2.0 429 Too Many Requests"]);
         assert!(s.verdict(&cfg).is_none(), "{s:?}");
     }
