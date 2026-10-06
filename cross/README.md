@@ -85,13 +85,16 @@ an array of strings whose first element names a file inside the case directory.
 Without `--goal-command-json`, an edition runs the goal command stored in the
 agent record, so the same rule applies to every `goal_command` and
 `native_command` field in the `.json` files of each registry the invocation
-can read: each `--registry` or `--state` value, otherwise both defaults
-(`.agentctl` and `.herdr-agents`). Each registry, and everything under it with
-symbolic links followed, must also stay inside the case directory. The fixture
-Herdr applies the rule to the custom harness program it runs for `pane run`,
-recording a refusal in the same log, and the editions get an empty standard
-input, so a request read from it (by `agentctl mcp`) cannot name a goal command
-the harness has not checked.
+can read: each `--registry` or `--state` value, and both defaults (`.agentctl`
+and `.herdr-agents`) always, since a token after a `--` that only looks like
+the option leaves the default in effect. Each registry is read under both
+readings of `..`, and it and everything under it, with symbolic links
+followed, must stay inside the case directory; a directory that cannot be
+listed is refused, because an edition may still open a record in it by name.
+The fixture Herdr applies the rule to the custom harness program it runs for
+`pane run`, recording a refusal in the same log, and the editions get an empty
+standard input, so a request read from it (by `agentctl mcp`) cannot name a
+goal command the harness has not checked.
 
 The harness also asks each implementation for its embedded user guide and
 checks that the page is complete and does not mention the sibling language or

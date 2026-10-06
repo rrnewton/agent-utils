@@ -1078,6 +1078,11 @@ _GOAL_WORKER = ("goal", "worker", "--herdr-bin", "<HERDR>")
     # With no registry option, an edition reads its default under the working directory.
     (".agentctl/worker/agent.json", f'{{"goal_command": {_OUTSIDE_CODEX}}}', _GOAL_WORKER),
     (".herdr-agents/worker/agent.json", f'{{"goal_command": {_OUTSIDE_CODEX}}}', _GOAL_WORKER),
+    # After a `--` these are goal text, so the default registry is still the one read.
+    (".agentctl/worker/agent.json", f'{{"goal_command": {_OUTSIDE_CODEX}}}',
+     (*_GOAL_WORKER, "--", "--registry=<ROOT>/safe")),
+    (".herdr-agents/worker/agent.json", f'{{"goal_command": {_OUTSIDE_CODEX}}}',
+     (*_GOAL_WORKER, "--", "--state", "<ROOT>/safe")),
     # A registry outside the case directory could store anything.
     ("unused.txt", "", (*_GOAL_WORKER, "--registry", "<ROOT>/../registry")),
 ))
@@ -1296,3 +1301,64 @@ def test_no_edition_inherits_the_callers_standard_input(
         harness.close()
 
     assert inputs == [subprocess.DEVNULL] * 3
+
+
+@pytest.mark.parametrize("seeded", ("registry", "nested/registry"))
+def test_a_registry_is_read_under_both_readings_of_dotdot(tmp_path: Path, seeded: str) -> None:
+    """`./link/../registry` is `nested/registry` to the kernel and `registry` once `..` is removed.
+
+    The Python edition removes `..` first (os.path.abspath in ManagedAgents), so the guard must
+    read both directories, each of which is inside the case.
+    """
+    herdr_agent = _cross_module("herdr_agent_differential")
+    edition, started = _recording_edition(tmp_path)
+    harness = herdr_agent.Harness(tmp_path / "cross", edition, edition)
+    try:
+        case = harness.case("dotdot-registry")
+        for root in (case.python_root, case.rust_root):
+            (root / "nested" / "deeper").mkdir(parents=True)
+            (root / "link").symlink_to("nested/deeper")
+            for directory in ("registry", "nested/registry"):
+                (root / directory).mkdir(parents=True)
+        _seed(case, f"{seeded}/worker/agent.json", f'{{"goal_command": {_OUTSIDE_CODEX}}}')
+        python, rust = harness.invoke(case, (*_GOAL_WORKER, "--registry", "./link/../registry"))
+    finally:
+        harness.close()
+
+    assert not started.exists()
+    assert python == rust
+    assert python.returncode == 127
+    assert "stores the goal command" in python.stderr
+    calls = harness.host_cli_calls()
+    assert len(calls) == 2
+    assert all('"program": "goal-command"' in call for call in calls)
+
+
+def test_a_registry_directory_that_cannot_be_listed_is_never_started(tmp_path: Path) -> None:
+    """An edition opens `<registry>/<name>/agent.json` by name, which needs no listing.
+
+    A walk that cannot list `worker` (search permission only) would otherwise skip the record.
+    """
+    herdr_agent = _cross_module("herdr_agent_differential")
+    edition, started = _recording_edition(tmp_path)
+    harness = herdr_agent.Harness(tmp_path / "cross", edition, edition)
+    case = harness.case("unlistable-registry")
+    workers = [root / "registry" / "worker" for root in (case.python_root, case.rust_root)]
+    try:
+        _seed(case, "registry/worker/agent.json", f'{{"goal_command": {_OUTSIDE_CODEX}}}')
+        for worker in workers:
+            worker.chmod(0o100)
+        python, rust = harness.invoke(case, (*_GOAL_WORKER, "--registry", "<ROOT>/registry"))
+    finally:
+        for worker in workers:
+            worker.chmod(0o700)
+        harness.close()
+
+    assert not started.exists()
+    assert python == rust
+    assert python.returncode == 127
+    if os.geteuid() != 0:  # root lists the directory anyway, and then reads the command
+        assert "could not be read completely" in python.stderr
+    calls = harness.host_cli_calls()
+    assert len(calls) == 2
+    assert all('"program": "goal-command"' in call for call in calls)

@@ -606,13 +606,19 @@ def stored_goal_command_refusal(root: Path, arguments: Sequence[str]) -> str | N
 
     Without `--goal-command-json` an edition runs the command stored in the agent record, so a
     seeded record is as much an input as the command line. Every registry the invocation could
-    read (each value of a REGISTRY_OPTIONS option anywhere, else both defaults) must stay inside
-    the case directory, every directory and record file under it as well, symbolic links followed,
-    and every stored command must be null, empty, or run a file inside the case directory.
+    read must stay inside the case directory: each value of a REGISTRY_OPTIONS option anywhere,
+    and both defaults always, because a token that only looks like the option (text after a `--`)
+    leaves the default in effect. Each is read under both readings of `..` (see
+    _names_case_file): `./link/../registry` is one directory to the kernel and another to an
+    edition that removes `..` first. Every directory and record file under it must stay inside
+    too, symbolic links followed; a directory that cannot be listed is refused, since an edition
+    may still open a record in it by name. Every stored command must be null, empty, or run a file
+    inside the case directory.
     """
     registries = [
-        value for option in REGISTRY_OPTIONS for value in _option_values(arguments, option)
-    ] or list(DEFAULT_REGISTRIES)
+        *(value for option in REGISTRY_OPTIONS for value in _option_values(arguments, option)),
+        *DEFAULT_REGISTRIES,
+    ]
     for registry in registries:
         if not _inside_case(root, registry):
             return (
@@ -622,34 +628,48 @@ def stored_goal_command_refusal(root: Path, arguments: Sequence[str]) -> str | N
     real_root = os.path.realpath(root)
     visited: set[str] = set()
     for registry in registries:
-        start = registry if os.path.isabs(registry) else os.path.join(real_root, registry)
-        for directory, subdirectories, files in os.walk(start, followlinks=True):
-            if os.path.realpath(directory) in visited:
-                subdirectories.clear()  # a link back to a directory already read
-                continue
-            visited.add(os.path.realpath(directory))
-            for path in (directory, *(os.path.join(directory, name) for name in files)):
-                if not _inside_case(root, path):
-                    return (
-                        f"registry {registry!r} links to {os.path.realpath(path)!r} outside the "
-                        "case directory, so the goal commands stored there cannot be checked"
-                    )
-            for name in files:
-                record = os.path.join(directory, name)
-                # Records are `agent.json` in both editions; a FIFO or a dangling link is no record.
-                if not name.endswith(".json") or not os.path.isfile(record):
+        joined = registry if os.path.isabs(registry) else os.path.join(real_root, registry)
+        for start in dict.fromkeys((joined, os.path.normpath(joined))):
+            errors: list[OSError] = []
+            for directory, subdirectories, files in os.walk(
+                start, onerror=errors.append, followlinks=True
+            ):
+                if os.path.realpath(directory) in visited:
+                    subdirectories.clear()  # a link back to a directory already read
                     continue
-                try:
-                    with open(record, "rb") as stream:
-                        document = stream.read()
-                except OSError:
-                    continue  # unreadable to the editions too: they run as the same user
-                for command in _stored_goal_commands(document):
-                    if command is not None and not _runs_case_fixture(root, command):
+                visited.add(os.path.realpath(directory))
+                for path in (directory, *(os.path.join(directory, name) for name in files)):
+                    if not _inside_case(root, path):
                         return (
-                            f"{record!r} stores the goal command {command!r}, which does not "
-                            "run a fixture inside the case directory"
+                            f"registry {registry!r} links to {os.path.realpath(path)!r} outside "
+                            "the case directory, so the goal commands stored there cannot be "
+                            "checked"
                         )
+                for name in files:
+                    record = os.path.join(directory, name)
+                    # Records are `agent.json` in both editions; a FIFO or a dangling link is no
+                    # record.
+                    if not name.endswith(".json") or not os.path.isfile(record):
+                        continue
+                    try:
+                        with open(record, "rb") as stream:
+                            document = stream.read()
+                    except OSError:
+                        continue  # unreadable to the editions too: they run as the same user
+                    for command in _stored_goal_commands(document):
+                        if command is not None and not _runs_case_fixture(root, command):
+                            return (
+                                f"{record!r} stores the goal command {command!r}, which does not "
+                                "run a fixture inside the case directory"
+                            )
+            for error in errors:
+                # A registry that does not exist yet stores nothing; any other failure to list a
+                # directory leaves records in it unread.
+                if not (isinstance(error, FileNotFoundError) and error.filename == start):
+                    return (
+                        f"registry {registry!r} could not be read completely ({error}), so the "
+                        "goal commands stored there cannot be checked"
+                    )
     return None
 
 
