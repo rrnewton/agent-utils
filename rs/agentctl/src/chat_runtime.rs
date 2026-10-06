@@ -161,6 +161,10 @@ const _: () =
 // outbound send path are failing: see `ProviderHealthRecord`.
 const PROVIDER_HEALTH_SCHEMA: &str = "agentctl-chat-provider-health/v1";
 pub(crate) const PROVIDER_HEALTH_FILE: &str = "provider-health.json";
+// The schema of `delivery-alarm-sources.json`, the value of each record behind
+// `delivery-alarm.json` as `chat run` last read it: see `AlarmSources`.
+const ALARM_SOURCES_SCHEMA: &str = "agentctl-chat-delivery-alarm-sources/v1";
+const ALARM_SOURCES_FILE: &str = "delivery-alarm-sources.json";
 const MAX_PROVIDER_ERROR_BYTES: usize = 2_000;
 const MAX_PROVIDER_ERROR_CLASS_BYTES: usize = 200;
 // Room for the largest record: two paths, each with an error and its class, which JSON may spell
@@ -2262,13 +2266,32 @@ pub(crate) struct ProviderDown {
     pub(crate) send_path_down: Option<PathFailure>,
 }
 
-/// What `delivery-alarm.json` last recorded for the records a scan reads: see
-/// [`BridgeState::persisted_alarm_parts`].
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub(crate) struct PersistedAlarmParts {
-    pub(crate) lost: LostReceiptReactions,
-    pub(crate) refused: RefusedReceiptReactions,
-    pub(crate) provider: ProviderDown,
+/// The value of each record behind `delivery-alarm.json` as `chat run` last read it, saved as
+/// `delivery-alarm-sources.json` in the state directory. A field is present once the record has
+/// been read, and keeps that value until a later read replaces it; an absent field means the
+/// value is unknown. A delivery scan that cannot read a record reports this value for it, which
+/// survives a restart and a failed write of `delivery-alarm.json`; with no value it names the
+/// record as unreadable instead of reporting it clear.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct AlarmSources {
+    schema: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) lost: Option<LostReceiptReactions>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) refused: Option<RefusedReceiptReactions>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) provider: Option<ProviderDown>,
+}
+
+impl AlarmSources {
+    /// No record read yet.
+    pub(crate) fn unknown() -> Self {
+        Self {
+            schema: ALARM_SOURCES_SCHEMA.to_owned(),
+            ..Self::default()
+        }
+    }
 }
 
 /// The class [`PathFailure::last_error_class`] records for a subscription failure `error`.
@@ -5497,34 +5520,23 @@ impl BridgeState {
         )
     }
 
-    /// What `delivery-alarm.json` last recorded for the lost and refused ✅ reactions and the
-    /// provider paths, or `None` when the file is missing or cannot be read. A scan falls back on
-    /// it for a record it cannot read when it has read no value of its own yet, as after a
-    /// restart, so the alarm does not drop what it last reported.
-    pub(crate) fn persisted_alarm_parts(&self) -> Option<PersistedAlarmParts> {
-        let document: Value = read_document(&self.root.join(DELIVERY_ALARM_FILE), 1 << 20).ok()?;
-        fn part<T: for<'de> Deserialize<'de>>(document: &Value, name: &str) -> Option<Option<T>> {
-            match document.get(name) {
-                None | Some(Value::Null) => Some(None),
-                Some(value) => serde_json::from_value(value.clone()).ok().map(Some),
-            }
-        }
-        let provider = ProviderDown {
-            subscription_down: part::<PathFailure>(&document, "subscription_down")?,
-            send_path_down: part::<PathFailure>(&document, "send_path_down")?,
-        };
-        if [&provider.subscription_down, &provider.send_path_down]
-            .into_iter()
+    /// `delivery-alarm-sources.json`, or `None` when it is missing, cannot be read or is not a
+    /// valid record of this schema: see [`AlarmSources`].
+    pub(crate) fn read_alarm_sources(&self) -> Option<AlarmSources> {
+        let sources: AlarmSources =
+            read_document(&self.root.join(ALARM_SOURCES_FILE), 1 << 20).ok()?;
+        let failures_valid = sources
+            .provider
+            .iter()
+            .flat_map(|provider| [&provider.subscription_down, &provider.send_path_down])
             .flatten()
-            .any(|failure| !failure.valid())
-        {
-            return None;
-        }
-        Some(PersistedAlarmParts {
-            lost: part(&document, "receipt_reactions_lost")?.unwrap_or_default(),
-            refused: part(&document, "receipt_reactions_refused")?.unwrap_or_default(),
-            provider,
-        })
+            .all(PathFailure::valid);
+        (sources.schema == ALARM_SOURCES_SCHEMA && failures_valid).then_some(sources)
+    }
+
+    /// Replace `delivery-alarm-sources.json` with `sources`.
+    pub(crate) fn write_alarm_sources(&self, sources: &AlarmSources) -> Result<()> {
+        write_document(&self.root.join(ALARM_SOURCES_FILE), sources)
     }
 
     /// Read `provider-health.json`, if a provider path has failed. The caller holds the state

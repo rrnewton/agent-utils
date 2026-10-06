@@ -4274,14 +4274,6 @@ impl NoteLog {
 /// say pending or submitting. Last, it reads again the reply route of each request whose prompt
 /// it recorded as typed, as the loop does after a pass for the requests the pass handled:
 /// recording a prompt typed can retire its request, which ends the route.
-/// The value of each record behind `delivery-alarm.json` as a [`DeliveryWatch`] last read it.
-#[derive(Default)]
-struct KnownAlarmParts {
-    lost: Option<chat_runtime::LostReceiptReactions>,
-    refused: Option<chat_runtime::RefusedReceiptReactions>,
-    provider: Option<chat_runtime::ProviderDown>,
-}
-
 struct DeliveryWatch {
     timing: DeliveryTiming,
     next_scan: Instant,
@@ -4298,9 +4290,13 @@ struct DeliveryWatch {
         chat_runtime::ProviderDown,
         Vec<&'static str>,
     )>,
-    // The value each record last had when a scan read it, whatever became of the write. A record
-    // that a scan cannot read keeps this value; see `DeliveryWatch::scan`.
-    known: KnownAlarmParts,
+    // The value each record behind the alarm last had when read, whatever became of the alarm's
+    // write: loaded from `delivery-alarm-sources.json` at the first scan, so it survives a restart,
+    // and saved there when it changes. A record that a scan cannot read keeps this value; see
+    // `DeliveryWatch::scan`.
+    known: Option<chat_runtime::AlarmSources>,
+    // The sources last saved, so the file is written only when they change.
+    known_saved: Option<chat_runtime::AlarmSources>,
     // The requests whose prompts a scan recorded as typed and whose reply routes no read has
     // given since, because each read failed. Each scan reads them again.
     unrouted: BTreeSet<String>,
@@ -4322,7 +4318,8 @@ impl DeliveryWatch {
             retry_keys: Vec::new(),
             log: StallLog::default(),
             written: None,
-            known: KnownAlarmParts::default(),
+            known: None,
+            known_saved: None,
             unrouted: BTreeSet::new(),
             failing: false,
             lookup_failing: false,
@@ -4468,74 +4465,71 @@ impl DeliveryWatch {
             .collect();
         let alarm = DeliveryAlarm::new(&entries, now_millis, self.timing.stall_after);
         // Each record is read on its own, so one that cannot be read does not hold back the
-        // others, and the problem is reported. A record that cannot be read keeps the value this
-        // watch last read for it; with none yet, as after a restart, the value the alarm file
-        // already holds; and with neither, it is named in `unreadable_records` rather than shown
-        // as clear.
-        let mut persisted: Option<Option<chat_runtime::PersistedAlarmParts>> = None;
-        let mut persisted_parts = || {
-            persisted
-                .get_or_insert_with(|| state.persisted_alarm_parts())
-                .clone()
-        };
+        // others, and the problem is reported. A record that cannot be read keeps the value last
+        // read for it, by this watch or, before a restart, by the one before (see
+        // `chat_runtime::AlarmSources`); with no such value it is named in `unreadable_records`
+        // rather than shown as clear.
+        let known = self.known.get_or_insert_with(|| {
+            state
+                .read_alarm_sources()
+                .unwrap_or_else(chat_runtime::AlarmSources::unknown)
+        });
         let mut unreadable: Vec<&'static str> = Vec::new();
         let lost = match state.lost_receipt_reactions() {
             Ok(lost) => {
-                self.known.lost = Some(lost.clone());
+                known.lost = Some(lost.clone());
                 lost
             }
             Err(error) => {
                 problem.get_or_insert_with(|| {
                     format!("the lost receipt reactions could not be read: {error}")
                 });
-                self.known
-                    .lost
-                    .clone()
-                    .or_else(|| persisted_parts().map(|parts| parts.lost))
-                    .unwrap_or_else(|| {
-                        unreadable.push(chat_runtime::RECEIPT_REACTION_LOSS_FILE);
-                        chat_runtime::LostReceiptReactions::default()
-                    })
+                known.lost.clone().unwrap_or_else(|| {
+                    unreadable.push(chat_runtime::RECEIPT_REACTION_LOSS_FILE);
+                    chat_runtime::LostReceiptReactions::default()
+                })
             }
         };
         let refused = match state.refused_receipt_reactions() {
             Ok(refused) => {
-                self.known.refused = Some(refused.clone());
+                known.refused = Some(refused.clone());
                 refused
             }
             Err(error) => {
                 problem.get_or_insert_with(|| {
                     format!("the refused receipt reactions could not be read: {error}")
                 });
-                self.known
-                    .refused
-                    .clone()
-                    .or_else(|| persisted_parts().map(|parts| parts.refused))
-                    .unwrap_or_else(|| {
-                        unreadable.push(chat_runtime::RECEIPT_REACTION_REFUSAL_FILE);
-                        chat_runtime::RefusedReceiptReactions::default()
-                    })
+                known.refused.clone().unwrap_or_else(|| {
+                    unreadable.push(chat_runtime::RECEIPT_REACTION_REFUSAL_FILE);
+                    chat_runtime::RefusedReceiptReactions::default()
+                })
             }
         };
         let provider = match state.provider_down() {
             Ok(provider) => {
-                self.known.provider = Some(provider.clone());
+                known.provider = Some(provider.clone());
                 provider
             }
             Err(error) => {
                 problem.get_or_insert_with(|| {
                     format!("the provider health record could not be read: {error}")
                 });
-                self.known
-                    .provider
-                    .clone()
-                    .or_else(|| persisted_parts().map(|parts| parts.provider))
-                    .unwrap_or_else(|| {
-                        unreadable.push(chat_runtime::PROVIDER_HEALTH_FILE);
-                        chat_runtime::ProviderDown::default()
-                    })
+                known.provider.clone().unwrap_or_else(|| {
+                    unreadable.push(chat_runtime::PROVIDER_HEALTH_FILE);
+                    chat_runtime::ProviderDown::default()
+                })
             }
         };
+        if self.known_saved.as_ref() != Some(&*known) {
+            match state.write_alarm_sources(known) {
+                Ok(()) => self.known_saved = Some(known.clone()),
+                Err(error) => {
+                    problem.get_or_insert_with(|| {
+                        format!("delivery-alarm-sources.json could not be written: {error}")
+                    });
+                }
+            }
+        }
         let alarm = (alarm, lost, refused, provider, unreadable);
         if self.written.as_ref() != Some(&alarm) {
             self.written = None;
@@ -6306,6 +6300,135 @@ printf '{"version":1,"id":"%s","action":"ensure_reaction","ok":true,"receipt":{"
             serde_json::json!(["provider-health.json"])
         );
         assert!(alarm.get("subscription_down").is_none());
+    }
+
+    /// Write `contents` to `name` in `root` as a private file, as the bridge writes its records.
+    fn write_private(root: &Path, name: &str, contents: &str) {
+        fs::write(root.join(name), contents).expect("write a record");
+        fs::set_permissions(
+            root.join(name),
+            <fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o600),
+        )
+        .expect("make the record private");
+    }
+
+    #[test]
+    fn records_with_no_value_stay_unreadable_across_scans_and_a_restart() {
+        let (state, _key, root) = state_with_request();
+        for name in [
+            "receipt-reactions-lost.json",
+            "receipt-reactions-refused.json",
+            "provider-health.json",
+        ] {
+            write_private(&root, name, "not json");
+        }
+        let expected = serde_json::json!([
+            "receipt-reactions-lost.json",
+            "receipt-reactions-refused.json",
+            "provider-health.json"
+        ]);
+        let mut routes = RouteCache::new(Vec::new());
+        let mut watch = DeliveryWatch::new(DeliveryTiming::default());
+        watch.scan(&state, &RecordingDelivery::default(), &mut routes);
+        let first = read_alarm_at(&root);
+        watch.scan(&state, &RecordingDelivery::default(), &mut routes);
+        let second = read_alarm_at(&root);
+        DeliveryWatch::new(DeliveryTiming::default()).scan(
+            &state,
+            &RecordingDelivery::default(),
+            &mut routes,
+        );
+        let restarted = read_alarm_at(&root);
+        fs::remove_dir_all(root).expect("cleanup");
+        assert_eq!(first["unreadable_records"], expected);
+        assert_eq!(second["unreadable_records"], expected);
+        assert_eq!(restarted["unreadable_records"], expected);
+    }
+
+    #[test]
+    fn a_value_recovered_after_a_restart_survives_a_later_failed_write() {
+        let (state, key, root) = state_with_request();
+        write_private(
+            &root,
+            "receipt-reactions-lost.json",
+            &format!(
+                "{{\"schema\":\"agentctl-chat-receipt-reactions-lost/v1\",\"lost\":3,\
+                 \"oldest_lost_key\":\"{key}\",\"oldest_lost_at_millis\":1,\
+                 \"newest_lost_at_millis\":2,\"episode_open\":false}}"
+            ),
+        );
+        for error in ["delivery channel closed", "control child closed stdout"] {
+            state
+                .note_subscription_down(error)
+                .expect("record the subscription failing");
+        }
+        let mut routes = RouteCache::new(Vec::new());
+        DeliveryWatch::new(DeliveryTiming::default()).scan(
+            &state,
+            &RecordingDelivery::default(),
+            &mut routes,
+        );
+        // Restart with both records gone bad: the new watch recovers their values.
+        write_private(&root, "provider-health.json", "not json");
+        write_private(&root, "receipt-reactions-lost.json", "not json");
+        let mut watch = DeliveryWatch::new(DeliveryTiming::default());
+        watch.scan(&state, &RecordingDelivery::default(), &mut routes);
+        let recovered = read_alarm_at(&root);
+        // A refusal changes the alarm while a directory blocks its path, so that write fails.
+        write_private(
+            &root,
+            "receipt-reactions-refused.json",
+            &format!(
+                "{{\"schema\":\"agentctl-chat-receipt-reactions-refused/v1\",\"refused\":1,\
+                 \"oldest_refused_key\":\"{key}\",\"newest_refused_at_millis\":3,\
+                 \"last_detail\":\"refused\"}}"
+            ),
+        );
+        fs::remove_file(root.join("delivery-alarm.json")).expect("remove alarm");
+        fs::create_dir(root.join("delivery-alarm.json")).expect("block the alarm path");
+        watch.scan(&state, &RecordingDelivery::default(), &mut routes);
+        fs::remove_dir(root.join("delivery-alarm.json")).expect("unblock the alarm path");
+        watch.scan(&state, &RecordingDelivery::default(), &mut routes);
+        let after = read_alarm_at(&root);
+        fs::remove_dir_all(root).expect("cleanup");
+        assert_eq!(recovered["subscription_down"]["failures"], 2);
+        assert_eq!(recovered["receipt_reactions_lost"]["count"], 3);
+        assert_eq!(after["subscription_down"], recovered["subscription_down"]);
+        assert_eq!(
+            after["receipt_reactions_lost"],
+            recovered["receipt_reactions_lost"]
+        );
+        assert_eq!(after["receipt_reactions_refused"]["count"], 1);
+        assert!(after.get("unreadable_records").is_none());
+    }
+
+    #[test]
+    fn an_invalid_or_older_alarm_file_is_not_taken_as_clear() {
+        for (case, alarm) in [
+            ("null", "null"),
+            (
+                "older build",
+                "{\"schema\":\"agentctl-chat-delivery-alarm/v1\",\"stall_after_seconds\":120,\
+                 \"stalled\":[]}",
+            ),
+        ] {
+            let (state, _key, root) = state_with_request();
+            write_private(&root, "delivery-alarm.json", alarm);
+            write_private(&root, "provider-health.json", "not json");
+            let mut routes = RouteCache::new(Vec::new());
+            DeliveryWatch::new(DeliveryTiming::default()).scan(
+                &state,
+                &RecordingDelivery::default(),
+                &mut routes,
+            );
+            let written = read_alarm_at(&root);
+            fs::remove_dir_all(root).expect("cleanup");
+            assert_eq!(
+                written["unreadable_records"],
+                serde_json::json!(["provider-health.json"]),
+                "{case}"
+            );
+        }
     }
 
     #[test]
