@@ -17172,10 +17172,15 @@ def _settle_retained_handles(
     and ``_RETAINED_HANDLE_SETTLE_SLACK_NS``; a change time further ahead
     of this host's clock is not waited for, and the handles read again are
     still recent.  The wait does not show that a registration it saw has
-    ended: a handle rewritten alike within its timestamp tick during the
-    wait reads as before, so a writer that queues its unit only after the
-    wait is covered by the rule for handle writers in ``_run_evidence``,
-    not by the wait.
+    ended.  The reads before and after it compare each handle's device,
+    inode, size, bytes, and modification and change times, so a rewrite
+    during the wait that moves any of them is a change, as a rewrite after
+    a read is where file timestamps are fine-grained once read.  A handle
+    rewritten alike within its timestamp tick during the wait still reads
+    as before, and one rewritten just before the first read leaves nothing
+    to compare, so a writer that queues its unit only after the wait is
+    covered by the rule for handle writers in ``_run_evidence``, not by the
+    wait.
     """
 
     changes = [

@@ -2791,6 +2791,13 @@ def _change_run_handle(handle: Path, tree: Path, change: str) -> None:
         value = json.loads(handle.read_text(encoding="utf-8"))
         value["checkout"] = str(tree / "after")
         handle.write_text(json.dumps(value), encoding="utf-8")
+    elif change == "rewritten-alike":
+        # The same bytes written again in place with a later modification
+        # time, as a filesystem whose timestamps are fine-grained once read
+        # records a rewrite made after a read: only the file's times differ.
+        before = handle.stat()
+        handle.write_bytes(handle.read_bytes())
+        os.utime(handle, ns=(before.st_atime_ns, before.st_mtime_ns + 1))
     elif change == "replaced":
         fresh = handle.with_name(handle.name + ".new")
         fresh.write_bytes(handle.read_bytes())
@@ -2801,6 +2808,7 @@ def _change_run_handle(handle: Path, tree: Path, change: str) -> None:
 
 _HANDLE_CHANGES = {
     "rewritten": "changed",
+    "rewritten-alike": "changed",
     "replaced": "changed",
     "removed": "disappeared or stopped naming the row",
 }
@@ -2813,8 +2821,10 @@ def test_a_handle_that_changes_during_the_evidence_reads_is_alive(
     """A handle rewritten, replaced or removed while the host is read is a run event.
 
     The handle names the row before and after (``rewritten`` moves its
-    checkout within the row; ``replaced`` puts a byte-identical file in its
-    place), so the projected fields the two reads find can be equal.  The
+    checkout within the row; ``rewritten-alike`` writes the same bytes in
+    place with a later modification time; ``replaced`` puts a byte-identical
+    file in its place), so the projected fields the two reads find can be
+    equal.  The
     unit is absent from both user-systemd enumerations and every process
     table: a run registered again then is queued only after them.
     """
