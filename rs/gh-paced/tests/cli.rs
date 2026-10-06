@@ -1489,6 +1489,93 @@ fn a_terminal_gone_mid_retry_after_never_shortens_the_wait() {
     assert_cut_delivery_starts_a_no_end_cooldown("cut-tty", true);
 }
 
+/// The user guide's command in "Ending a cooldown by hand", run as printed with only the example
+/// state path replaced, ends a cooldown with no end time: `status` then shows no cooldown and the
+/// next paced call runs, while the rest of the state file and the audit log are left as they
+/// were. A command that cleared only one of the two copies would leave every call refused.
+#[test]
+fn the_guides_command_ends_a_cooldown_with_no_end_time() {
+    let section = gh_paced::USER_GUIDE
+        .split_once("\n### Ending a cooldown by hand\n")
+        .expect("the guide has the section")
+        .1;
+    let block = section
+        .split_once("\n```sh\n")
+        .expect("the section has a shell block")
+        .1
+        .split_once("\n```\n")
+        .expect("the block ends")
+        .0;
+    let (first, rest) = block.split_once('\n').expect("more than one line");
+    assert!(first.starts_with("state="), "{first}");
+
+    let sb = Sandbox::new("clear-cooldown", FAST);
+    let read = |name: &str| -> serde_json::Value {
+        serde_json::from_str(&std::fs::read_to_string(sb.path(name)).unwrap()).unwrap()
+    };
+    let out = "HTTP/2.0 403 Forbidden\r\nRetry-After: 40000000\r\n\r\n{}";
+    let o = sb.run(
+        &["api", "-i", "repos/o/r"],
+        &[("FAKE_GH_STDOUT", out), ("FAKE_GH_EXIT", "1")],
+    );
+    assert!(
+        stderr(&o).contains("the cooldown has no end time"),
+        "{}",
+        stderr(&o)
+    );
+    let o = sb.run(&["api", "repos/o/r"], &[]);
+    assert_eq!(o.status.code(), Some(75), "{}", stderr(&o));
+    assert_eq!(
+        read("state/test.cooldown")["until"].as_f64(),
+        Some(f64::MAX)
+    );
+    let before = read("state/test.json");
+    assert_eq!(before["cooldown"]["until"].as_f64(), Some(f64::MAX));
+    let audit = std::fs::read(sb.path("state/test.audit.jsonl")).unwrap();
+
+    let script = format!("state='{}'\n{rest}\n", sb.path("state/test.json").display());
+    let o = Command::new("/bin/sh")
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .args(["-c", &script])
+        .output()
+        .unwrap();
+    assert!(o.status.success(), "{}", stderr(&o));
+
+    assert!(!sb.path("state/test.cooldown").exists());
+    assert!(!sb.path("state/test.json.clearing").exists());
+    let after = read("state/test.json");
+    assert!(after["cooldown"].is_null(), "{after}");
+    let without_cooldown = |mut v: serde_json::Value| {
+        v.as_object_mut().unwrap().remove("cooldown");
+        v
+    };
+    assert_eq!(without_cooldown(after), without_cooldown(before));
+    let mode = std::fs::metadata(sb.path("state/test.json"))
+        .unwrap()
+        .permissions()
+        .mode();
+    assert_eq!(mode & 0o777, 0o600);
+    assert_eq!(
+        std::fs::read(sb.path("state/test.audit.jsonl")).unwrap(),
+        audit
+    );
+
+    let o = Command::new(BIN)
+        .env_clear()
+        .env("HOME", sb.path("home"))
+        .env("GH_PACED_STATE_DIR", sb.path("state"))
+        .env("GH_PACED_CONFIG", sb.path("config.json"))
+        .args(["status", "--account", "test"])
+        .output()
+        .unwrap();
+    assert_eq!(o.status.code(), Some(0), "{}", stderr(&o));
+    assert!(stdout(&o).contains("  cooldown: none\n"), "{}", stdout(&o));
+    let o = sb.run(&["api", "repos/o/r"], &[]);
+    assert_eq!(o.status.code(), Some(0), "{}", stderr(&o));
+    assert_eq!(sb.starts().len(), 2, "{:?}", sb.log());
+}
+
 /// `gh api --include --paginate --jq` output that ends inside a later page's body: a
 /// status-shaped line, then a long `X-Long: ...` line whose end never arrives, with no CR LF header
 /// line before it. That may be body text cut short, so no cooldown starts and the next call runs.
