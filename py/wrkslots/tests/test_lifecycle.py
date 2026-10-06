@@ -22357,9 +22357,22 @@ def test_retire_pending_defers_superseded_candidate_inside_remove_lock(
     assert checkout(project).is_dir()
 
 
+@pytest.mark.parametrize("interruption", ("crash", "failure"))
 def test_retirement_attempt_event_is_crash_safe_and_rotates_queue(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    interruption: str,
 ) -> None:
+    """The attempt event survives an interruption right after it is written.
+
+    ``crash`` stands for a process death, which no ordinary handler
+    catches, so it escapes retire-pending.  ``failure`` is an ordinary
+    exception, which retire-pending reports as could-not-determine with
+    recovery required.  Either way both slots stay active, the attempt is
+    recorded once, and the queue rotates past the attempted slot.
+    """
+
     project, _repository, _remote = make_project(tmp_path)
     assert create(project).returncode == 0
     assert create(
@@ -22377,28 +22390,46 @@ def test_retirement_attempt_event_is_crash_safe_and_rotates_queue(
             str(os.getpid()),
         ).returncode == 0
 
-    class Interrupted(RuntimeError):
+    class Crashed(BaseException):
+        pass
+
+    class Failed(RuntimeError):
         pass
 
     def interrupt(point: str) -> None:
         if point == "after-retirement-attempt":
-            raise Interrupted
+            if interruption == "crash":
+                raise Crashed
+            raise Failed("injected failure after the attempt event")
 
     monkeypatch.setattr(wrkslots, "_interrupt_for_test", interrupt)
-    with pytest.raises(Interrupted):
-        wrkslots.main(
-            [
-                "--project-root",
-                str(project),
-                "retire-pending",
-                "--limit",
-                "1",
-                "--coordinator-pid",
-                str(os.getpid()),
-                "--format",
-                "json",
-            ]
-        )
+    argv = [
+        "--project-root",
+        str(project),
+        "retire-pending",
+        "--limit",
+        "1",
+        "--coordinator-pid",
+        str(os.getpid()),
+        "--format",
+        "json",
+    ]
+    if interruption == "crash":
+        with pytest.raises(Crashed):
+            wrkslots.main(argv)
+    else:
+        assert wrkslots.main(argv) == 3
+        report = json.loads(capsys.readouterr().out)
+        assert report["removed"] == []
+        assert report["retained"] == []
+        assert report["recovery_required"] is True
+        [row] = report["could_not_determine"]
+        assert row["slot"] == "slot01"
+        assert row["recovery_required"] is True
+        assert row["reason"] == "Failed: injected failure after the attempt event"
+        assert [(item["slot"], item["reason"]) for item in report["deferred"]] == [
+            ("slot02", "batch limit")
+        ]
 
     config = wrkslots._load_config(str(project), "testhost")
     assert {record.slot for record in wrkslots._load_active(config).slots} == {
