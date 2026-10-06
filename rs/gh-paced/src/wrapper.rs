@@ -600,6 +600,7 @@ impl Wrapper<'_> {
             keep_fds,
             scan_stdout: !local && c.api.as_ref().is_some_and(|a| a.include),
             on_pushback,
+            hook_wait_secs: self.cfg.lock_wait_secs,
             drain,
         };
         match self.runner.run(inv, &mut scanner) {
@@ -787,6 +788,7 @@ impl Wrapper<'_> {
                 keep_fds: Vec::new(),
                 scan_stdout: false,
                 on_pushback: None,
+                hook_wait_secs: 0.0,
                 drain: None,
             },
             self.cfg.rate_limit_timeout_secs,

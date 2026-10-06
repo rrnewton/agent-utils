@@ -82,6 +82,13 @@ if [ -n "${FAKE_GH_STDOUT_STEPS:-}" ]; then
 fi
 if [ -n "${FAKE_GH_STDOUT_BYTES:-}" ]; then head -c "$FAKE_GH_STDOUT_BYTES" /dev/zero | tr '\0' x; echo; fi
 if [ -n "${FAKE_GH_STDOUT:-}" ]; then printf '%s\n' "$FAKE_GH_STDOUT"; fi
+if [ -n "${FAKE_GH_HOLD_OUT:-}" ]; then
+  # Leave a helper that keeps gh's stdout after gh exits and writes a header-shaped line to it
+  # (X-Held: N, CR LF) every 0.4 s, FAKE_GH_HOLD_OUT lines in all.
+  ( i=1; while [ "$i" -le "$FAKE_GH_HOLD_OUT" ]; do
+      sleep 0.4; printf 'X-Held: %s\r\n' "$i"; i=$((i + 1))
+    done ) </dev/null 2>/dev/null &
+fi
 if [ -n "${FAKE_GH_STDERR:-}" ]; then printf '%s\n' "$FAKE_GH_STDERR" >&2; fi
 if [ -n "${FAKE_GH_STDERR_BYTES:-}" ]; then head -c "$FAKE_GH_STDERR_BYTES" /dev/zero | tr '\0' y >&2; echo >&2; fi
 echo "$(date +%s.%N) end $*" >> "$log"
@@ -1492,7 +1499,10 @@ fn a_terminal_gone_mid_retry_after_never_shortens_the_wait() {
 /// The user guide's command in "Ending a cooldown by hand", run as printed with only the example
 /// state path replaced, ends a cooldown with no end time: `status` then shows no cooldown and the
 /// next paced call runs, while the rest of the state file and the audit log are left as they
-/// were. A command that cleared only one of the two copies would leave every call refused.
+/// were. A command that cleared only one of the two copies would leave every call refused. It is
+/// run under `umask 0777` with a read-only `test.json.clearing` (the temporary file of an earlier
+/// version of the command) in the way: the state file still ends up mode 0600, and the command
+/// leaves no file of its own behind.
 #[test]
 fn the_guides_command_ends_a_cooldown_with_no_end_time() {
     let section = gh_paced::USER_GUIDE
@@ -1532,8 +1542,24 @@ fn the_guides_command_ends_a_cooldown_with_no_end_time() {
     let before = read("state/test.json");
     assert_eq!(before["cooldown"]["until"].as_f64(), Some(f64::MAX));
     let audit = std::fs::read(sb.path("state/test.audit.jsonl")).unwrap();
+    let stale = sb.path("state/test.json.clearing");
+    std::fs::write(&stale, "stale").unwrap();
+    std::fs::set_permissions(&stale, std::fs::Permissions::from_mode(0o400)).unwrap();
+    let names = || {
+        let mut v: Vec<String> = std::fs::read_dir(sb.path("state"))
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        v.sort();
+        v
+    };
+    let mut expected = names();
+    expected.retain(|n| n != "test.cooldown");
 
-    let script = format!("state='{}'\n{rest}\n", sb.path("state/test.json").display());
+    let script = format!(
+        "umask 0777\nstate='{}'\n{rest}\n",
+        sb.path("state/test.json").display()
+    );
     let o = Command::new("/bin/sh")
         .env_clear()
         .env("PATH", "/usr/bin:/bin")
@@ -1543,7 +1569,8 @@ fn the_guides_command_ends_a_cooldown_with_no_end_time() {
     assert!(o.status.success(), "{}", stderr(&o));
 
     assert!(!sb.path("state/test.cooldown").exists());
-    assert!(!sb.path("state/test.json.clearing").exists());
+    assert_eq!(names(), expected);
+    assert_eq!(std::fs::read_to_string(&stale).unwrap(), "stale");
     let after = read("state/test.json");
     assert!(after["cooldown"].is_null(), "{after}");
     let without_cooldown = |mut v: serde_json::Value| {
@@ -1867,6 +1894,159 @@ fn late_signal_ends_gh_paced_while_the_consumer_is_stalled() {
     let (status, secs) = ended.expect("gh-paced was still waiting for its consumer 8 s after TERM");
     assert!(secs < 5.0, "gh-paced took {secs} s to die");
     assert_eq!(status.signal(), Some(libc::SIGTERM), "{}", stderr(&o));
+}
+
+/// Both records of the cooldown, `test.json` and `test.cooldown`, end two days after `before`,
+/// and gh-paced's own pushback banner gives the two days as the cooldown it recorded. The banner
+/// comes from what gh-paced scanned before it died, while a reader's hook can still write the
+/// state file just before the process ends, so only the banner shows that gh-paced itself saw
+/// the wait. A copy of the scanner without it would print a shorter pause, or the two days with
+/// "an existing longer cooldown stays" (the reader having recorded them first).
+fn assert_two_day_cooldown(sb: &Sandbox, before: f64, err: &str) {
+    let line = err
+        .lines()
+        .find(|l| l.contains("is paused for "))
+        .unwrap_or_else(|| panic!("no pause in the banner:\n{err}"));
+    let secs: u64 = line
+        .split("is paused for ")
+        .nth(1)
+        .and_then(|rest| rest.split(' ').next())
+        .and_then(|n| n.parse().ok())
+        .unwrap_or_else(|| panic!("unreadable pause: {line}\n{err}"));
+    assert!(
+        (172_790..172_900).contains(&secs),
+        "the banner gives {secs} s:\n{err}"
+    );
+    assert!(
+        !err.contains("an existing longer cooldown stays"),
+        "gh-paced recorded a shorter cooldown than the reader's:\n{err}"
+    );
+    for (file, key) in [
+        ("state/test.json", Some("cooldown")),
+        ("state/test.cooldown", None),
+    ] {
+        let text =
+            std::fs::read_to_string(sb.path(file)).unwrap_or_else(|e| panic!("{file}: {e}\n{err}"));
+        let v: serde_json::Value = serde_json::from_str(&text).unwrap();
+        let cd = key.map_or(&v, |k| &v[k]);
+        let until = cd["until"]
+            .as_f64()
+            .unwrap_or_else(|| panic!("{file}: {v}\n{err}"));
+        assert!(
+            until - before >= 172_790.0 && until - before < 172_900.0,
+            "{file}: cooldown {} s\n{err}",
+            until - before
+        );
+    }
+}
+
+/// A late signal keeps the wait from a header block gh-paced has already read. gh printed a 429
+/// block with a whole two-day `Retry-After` line and no blank line, then exited, leaving a
+/// helper that holds gh's stdout and keeps writing header lines to it, so gh-paced is still
+/// reading stdout, with the block still open, when TERM arrives 1 s later. gh-paced dies by the
+/// signal and the cooldown is the two days. Before round 12 it took the scanner without feeding
+/// it the end of stdout, so the open block was never committed and no cooldown started.
+#[test]
+fn a_late_signal_keeps_the_wait_from_a_header_block_already_read() {
+    let sb = Sandbox::new("late-open-block", FAST);
+    let child = sb
+        .cmd(&["api", "-i", "repos/o/r"])
+        .env(
+            "FAKE_GH_STDOUT",
+            "HTTP/2.0 429 Too Many Requests\r\nRetry-After: 172800\r",
+        )
+        .env("FAKE_GH_EXIT", "1")
+        .env("FAKE_GH_HOLD_OUT", "10")
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    wait_for_log(&sb, "end api -i repos/o/r");
+    // Let gh exit and be reaped, so the signal is not forwarded to it. gh-paced goes on reading
+    // stdout for up to 5 s after the exit while the helper writes.
+    std::thread::sleep(std::time::Duration::from_secs(1));
+    let before = epoch_now();
+    // SAFETY: signalling our own child, which has not been reaped.
+    unsafe {
+        libc::kill(child.id() as i32, libc::SIGTERM);
+    }
+    let o = child.wait_with_output().unwrap();
+    let err = stderr(&o);
+    assert_eq!(o.status.signal(), Some(libc::SIGTERM), "{err}");
+    assert!(
+        err.contains("signal 15 arrived while its output was still being delivered"),
+        "the signal did not arrive while gh-paced was still reading: {err}"
+    );
+    assert_two_day_cooldown(&sb, before, &err);
+}
+
+/// After a late signal gh-paced still scans output gh wrote that it had not read. The test holds
+/// the account lock, so the stdout reader, recording the cooldown of gh's first page (a 429 with
+/// `Retry-After: 60`, so 900 s), waits for the lock while gh writes a second page (a 429 with a
+/// two-day `Retry-After`) and exits. TERM arrives, the test lets the lock go 0.1 s later, and the
+/// cooldown is the two days. Before round 12 the reader stopped without reading the second page,
+/// and the cooldown was 900 s.
+#[test]
+fn a_late_signal_scans_output_gh_wrote_but_gh_paced_had_not_read() {
+    assert_late_signal_scans_the_unread_page("late-unread", 100);
+}
+
+/// As above, but the test keeps the lock for 2.5 s after TERM, longer than the 1 s gh-paced
+/// waits for the readers beyond the lock's own wait. gh-paced waits for the reader to get the
+/// lock, record its cooldown and scan the second page, and the cooldown is the two days. With a
+/// fixed 1 s wait gh-paced took the scanner without the second page.
+#[test]
+fn a_late_signal_waits_for_a_reader_held_up_by_the_state_lock() {
+    assert_late_signal_scans_the_unread_page("late-unread-held", 2500);
+}
+
+/// The two tests above: gh writes two 429 pages while the stdout reader waits for the account
+/// lock, which the test holds until `hold_ms` after it sends TERM.
+fn assert_late_signal_scans_the_unread_page(name: &str, hold_ms: u64) {
+    use std::os::fd::AsRawFd;
+    let sb = Sandbox::new(name, FAST);
+    let steps = [
+        "HTTP/2.0 429 Too Many Requests\r\nRetry-After: 60\r\n\r\n{}\n",
+        "HTTP/2.0 429 Too Many Requests\r\nRetry-After: 172800\r\n\r\n{}\n",
+    ]
+    .join("\u{1f}");
+    let child = sb
+        .cmd(&["api", "-i", "--paginate", "repos/o/r"])
+        .env("FAKE_GH_SLEEP", "1")
+        .env("FAKE_GH_STDOUT_STEPS", &steps)
+        .env("FAKE_GH_EXIT", "1")
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    wait_for_log(&sb, "start api");
+    let held = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(sb.path("state/test.lock"))
+        .unwrap();
+    // SAFETY: flock on a descriptor this test owns.
+    assert_eq!(unsafe { libc::flock(held.as_raw_fd(), libc::LOCK_EX) }, 0);
+    wait_for_log(&sb, "end api");
+    // Let gh exit and be reaped, so the signal is not forwarded to it.
+    std::thread::sleep(std::time::Duration::from_secs(1));
+    let before = epoch_now();
+    // SAFETY: signalling our own child, which has not been reaped.
+    unsafe {
+        libc::kill(child.id() as i32, libc::SIGTERM);
+    }
+    std::thread::sleep(std::time::Duration::from_millis(hold_ms));
+    drop(held);
+    let o = child.wait_with_output().unwrap();
+    let err = stderr(&o);
+    assert_eq!(o.status.signal(), Some(libc::SIGTERM), "{err}");
+    assert!(
+        err.contains("signal 15 arrived while its output was still being delivered"),
+        "the signal did not arrive while gh-paced was still reading: {err}"
+    );
+    assert_two_day_cooldown(&sb, before, &err);
 }
 
 /// A terminal's INT (Ctrl-C) goes to the whole foreground process group, gh included, so

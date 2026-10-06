@@ -1165,9 +1165,18 @@ wait; a second line cut later does not change it.
 | blocker (unsafe, older): a terminal read cut inside `Retry-After: 172800`, then delivery failure, stored 900 s | a cut 403 or 429 block without a whole `Retry-After` line has no end time; a cut `Retry-After` line is never trusted | `pushback::output_cut_anywhere_in_a_header_block_never_shortens_a_wait` (every byte cut, 403 and 429, plain and coloured, both modes, and the reviewer's exact 4,095-byte read; on `65829cb0` the first failure is a lone `HTTP/2.0 429` giving 900 s), `pushback::a_later_page_cut_short_never_shortens_a_known_wait`, `cli::a_consumer_gone_mid_retry_after_never_shortens_the_wait` (the reader of a pipe gone; on `65829cb0`: paused for 900 s), `cli::a_terminal_gone_mid_retry_after_never_shortens_the_wait` (stdout a terminal whose controlling side closes after `Retry-After: 17` arrives; on `65829cb0`: paused for 1,728 s, the digits held when delivery failed) |
 | minor: round 10's history said `8d9f492c` gave the late-colon line no end time, and called all five round-10 findings new | `2ffcbaa1` gave it no end time; the boundary-wording minor dates from `2ffcbaa1` | none (text) |
 
-The two CLI tests drive the cut through gh-paced itself: the fake gh writes the
-response in three steps a second apart (`FAKE_GH_STDOUT_STEPS`), and the test
-closes the reading side once `Retry-After: 17` has arrived. Each asserts the
+The two CLI tests drive the cut through gh-paced itself. The fake gh writes the
+response in three steps a second apart (`FAKE_GH_STDOUT_STEPS`): `...Retry-After: 17`,
+then `28`, then `00` and the rest. The two interleavings differ:
+
+- Pipe test: the test closes the pipe's reading side before it starts
+  gh-paced, so delivering the first step fails and gh-paced stops reading after
+  the chunk it holds, which ends `Retry-After: 17`.
+- Terminal test: the test reads the terminal until `Retry-After: 17` has
+  arrived and then closes the controlling side, so delivery fails on the second
+  step and the cut is at `Retry-After: 1728`.
+
+Each asserts the
 banner (`the cooldown has no end time`, `before its Retry-After was read
 whole`), `cooldown.until` equal to `f64::MAX` in the saved state, exit 75 on
 the next call, and that the fake gh ran once.
@@ -1215,7 +1224,9 @@ leaves behind. The user guide's pushback section now ends with "Ending a
 cooldown by hand". The command takes `flock` on `<account>.lock`, the lock every
 gh-paced process takes, around a short `python3` step. That step removes
 `<account>.cooldown`, then writes `<account>.json` back with
-`"cooldown": null` through a 0600 temporary file and a rename. The section
+`"cooldown": null` through a temporary file and a rename (round 12 found
+that this step could leave an unreadable state file; see "Round 12 and what
+changed"). The section
 lists what is left: the buckets, hourly windows, in-flight writes and audit log
 as they were, and no cooldown record until the next pushback. It also says what
 not to do: clear one copy only, delete the state file, or clear while the call
@@ -1233,6 +1244,118 @@ guide's block: without its `s["cooldown"] = None` line the test fails at the
 null-entry assertion; without its `os.remove` it fails at the assertion that
 `<account>.cooldown` is gone. The test needs `flock` (util-linux) and
 `python3` on `/usr/bin:/bin`.
+
+## Round 12 and what changed
+
+Round 12 reviewed `3d12eec3..3472af43` (the round-11 fixes and the clearing
+procedure, after the rebase) and asked for changes: two blockers and two
+minors.
+
+| Round-12 finding | Now | Test (fails before) |
+| --- | --- | --- |
+| blocker (unsafe, older; present at `0db8f2a6`): after a late signal gh-paced took the scanner without feeding it the end of stdout, so an open 403 or 429 block whose whole `Retry-After: 172800` line had been read was never committed, and the cooldown was nothing or the 900 s that stderr gave | each reader first scans what it can read at once and feeds the end of its stream; gh-paced waits for the readers up to `lock_wait_secs` plus 1 s, then also feeds the end of stdout to its copy of the scanner | `cli::a_late_signal_keeps_the_wait_from_a_header_block_already_read` (on the old runner: no cooldown, 8 runs of 8), `cli::a_late_signal_scans_output_gh_wrote_but_gh_paced_had_not_read` and `cli::a_late_signal_waits_for_a_reader_held_up_by_the_state_lock` (without the reading step, or without the wait: both fail, 3 runs of 3; with a fixed 1 s wait the second fails, 5 runs of 5) |
+| blocker (new in `3472af43`): the guide's clearing command opened its temporary file with mode 0600 through `os.open`, so under `umask 0777` the state file became mode 000, and a stale read-only `.clearing` file stopped the command | the command writes to a fresh `mkstemp` file in the state directory and sets mode 0600 on it with `fchmod` before the rename, and removes it if a step fails | `cli::the_guides_command_ends_a_cooldown_with_no_end_time`, extended (on the old command: `PermissionError` on the stale file; with the stale file gone and the umask kept: the test cannot read the state file) |
+| minor: the guide said the refresh after a cooldown happens at most once every 60 s | "at most one every `rate_limit_min_refresh_secs`, 60 s by default" | none (text) |
+| minor: this note said both cut-output CLI tests close the reading side after `Retry-After: 17` arrives | the two interleavings are described separately under "Round 11 and what changed" | none (text) |
+
+**The late-signal fix has three parts.** A late signal is an INT, TERM, HUP or
+QUIT that arrives after gh has exited, while gh-paced is still delivering gh's
+output. gh-paced then abandons delivery, does not join the reader threads (one
+may be stuck behind a consumer, or waiting for the state file's lock to record
+a cooldown), copies the scanner, records the cooldown from the copy, prints
+the banner, and dies by the signal.
+
+1. Scanning output not yet read. Since gh has exited, what is still in its pipe
+   is output gh already wrote, at most one pipe's capacity (64 KiB by default
+   on x86-64; gh-paced does not resize its pipes, and 1 MiB is the default
+   limit on resizing by an unprivileged process). On its next poll each reader
+   now reads what it can without waiting, up to `LATE_SCAN_BYTES` (1 MiB),
+   scans it, delivers none of it, feeds the end of its stream to the scanner
+   (which commits an open block as output cut short), sets its new `scanned`
+   flag, and stops. Before, the reader stopped without reading, so a 429 page
+   that gh wrote while the reader was busy was lost.
+2. The wait. gh-paced waits for every reader's `scanned` flag before it copies
+   the scanner, up to `lock_wait_secs` plus `LATE_SCAN_WAIT_SECS` (1 s). A
+   reader can be held up only by its hook, which waits up to `lock_wait_secs`
+   for the state file's lock, and by its 100 ms poll; reading is bounded by
+   the 1 MiB. The new field `Invocation::hook_wait_secs` carries
+   `lock_wait_secs` to the runner (0 for the rate-limit refresh, which has no
+   hook). When the lock is free the readers finish within about 100 ms, so
+   gh-paced still dies promptly; when it is contended, gh-paced would wait for
+   the same lock to record the cooldown anyway. The first version of this fix
+   waited a fixed 1 s; a reader that was still waiting for the lock after
+   that was left out of gh-paced's copy, so gh-paced recorded 900 s while the
+   reader's own hook recorded the two days only if it won the race against
+   the process ending.
+3. End of stdout on the copy. After copying the scanner, gh-paced feeds it the
+   end of stdout when stdout is teed, in case the stdout reader did not finish
+   within the wait (if it did, the second end of stdout changes nothing:
+   `end_of_stdout` is idempotent). With the wait in place no test reaches this
+   step: removing it leaves all five late-signal tests passing, 3 runs of 3.
+   It is kept as the fallback for a reader that never finishes (for example
+   one that panicked).
+
+The tests check what gh-paced itself recorded, not only the state file. A
+reader's hook can write the two-day cooldown to the state file just before the
+process ends, so the state file alone passes by luck: a fixed 1 s wait passed
+4 runs of 5 on it. The shared helper `assert_two_day_cooldown` therefore also
+requires gh-paced's PUSHBACK banner to give a pause between 172,790 s and
+172,900 s and not to say "an existing longer cooldown stays". The banner comes
+from gh-paced's copy of the scanner; when the copy lacks the second page and
+the reader recorded first, it reads "paused for 172800 s ... (an existing
+longer cooldown stays)", which is what the fixed-1-s build printed. With the
+fix, gh-paced reads the clock after taking the lock, so a reader's record
+already in the state file always ends before gh-paced's own.
+
+The fake gh gained `FAKE_GH_HOLD_OUT=<n>`: a helper process that keeps gh's
+stdout open after gh exits and writes `X-Held: <i>` CR LF to it every 0.4 s,
+`n` times. That keeps gh-paced reading stdout, with the block open, when the
+test sends TERM 1 s after gh's exit. The two unread-page tests hold the
+account lock from gh's start, so the stdout reader is in its hook (recording
+the first page's 900 s) when gh writes the second page and exits; they let the
+lock go 0.1 s and 2.5 s after TERM.
+
+**The clearing command.** Besides `mkstemp` and `fchmod`, nothing else in
+the procedure changed: `flock` on `<account>.lock`, remove
+`<account>.cooldown`, write `"cooldown": null`, rename. The temporary file is
+now named `.<account>.json.clearing-<random>`, exists only until the rename,
+and is removed if any step fails. The test runs the guide's block under
+`umask 0777`, with a read-only `test.json.clearing` (the old command's file
+name) in the state directory. It asserts what it asserted before, plus: the
+state file is mode 0600, the stale file is untouched, and the state directory
+afterwards lists exactly what it listed before minus `test.cooldown`, so the
+command leaves no file of its own.
+
+**Fail-before evidence** (on devbig014, in `ignored/coordw-ghpaced-r5/`,
+directories `r14-failbefore/` and `r15-failbefore/`; each build used the new
+tests):
+
+- `runner.rs` of `3472af43`: the first test failed 8 runs of 8 with
+  `"cooldown": null` in the state file.
+- The fixed runner without the reading step: both unread-page tests failed,
+  3 runs of 3 (with the state-file check alone the 0.1 s test failed 5 runs of
+  5 with a 900 s cooldown).
+- The fixed runner with no wait at all: both unread-page tests failed, 3 runs
+  of 3. (With the state-file check alone and the 0.1 s test only, this passed
+  3 runs of 3; that is what made the banner check necessary.)
+- The fixed runner with a fixed 1 s wait: the 2.5 s test failed 5 runs of 5
+  on the banner check (on the state-file check alone it failed 1 run of 5,
+  with 902 s).
+- The fixed runner without the end of stdout on the copy: all five late-signal
+  tests passed, 3 runs of 3 (see part 3).
+- The guide's old block with the stale file present: `PermissionError` on
+  `test.json.clearing`. The old block under `umask 0777` alone: the test's next
+  read of the state file failed with `EACCES`.
+
+**Test changes in this round.** Three new CLI tests and the extended clearing
+test, all described above. No existing assertion was removed or loosened. The
+clearing test's assertion that `test.json.clearing` is absent afterwards was
+replaced by the stricter directory-listing assertion, because the test now
+creates a stale file with that name on purpose and requires the command to
+leave it alone. The three new tests share the helper
+`assert_two_day_cooldown`, which checks the banner as above and that both
+records of the cooldown (`test.json` and `test.cooldown`) end between
+172,790 s and 172,900 s after the signal.
 
 ## Test changes worth a reviewer's attention
 
@@ -1444,3 +1567,19 @@ pagination and limit costs, watch loops, alias inspection), adds one test
   - without `--paginate`, a `Retry-After` line cut in a 200 block.
 - A `Retry-After` above 365 days stops paced calls for the account on the host
   until a person clears the cooldown (see round 7).
+- After a late signal (see "Round 12 and what changed"), gh-paced waits for
+  its readers at most `lock_wait_secs` plus 1 s. A reader that has not
+  finished by then (it would have to be stuck outside its hook, or have
+  panicked) has the output it has not read left out of what gh-paced records.
+  Each reader scans at most 1 MiB of unread output, only what can be read
+  without waiting: all that gh wrote unless its pipe was resized beyond that,
+  but not everything a process gh left behind may still write. While the lock
+  is contended, gh-paced can take up to that bound, plus its own wait for the
+  lock, to die after a late signal. No test reaches the fallback that feeds
+  the end of stdout to gh-paced's copy.
+- A late signal commits a 403 or 429 header block still open on stdout as
+  output cut short, so a block without a whole `Retry-After` line by then gives
+  a cooldown with no end time. gh's own output is all scanned first (see the
+  item above), so this needs a block that gh itself left unfinished, one that
+  a process gh left behind is still writing, or a reader that did not finish
+  within the wait. This is the fail-safe direction, like the items above.
