@@ -22764,13 +22764,14 @@ def test_retire_pending_json_preserves_success_before_partial_state(
 
 
 def _queue_two_finished_slots_with_dead_owners(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *, count: int = 2
 ) -> tuple[Path, Path, Path]:
     project, repository, remote = make_project(tmp_path)
     for slot, agent, branch in (
         ("slot01", "codex-1", "codex/one"),
         ("slot02", "codex-2", "codex/two"),
-    ):
+        ("slot03", "codex-3", "codex/three"),
+    )[:count]:
         assert create(project, slot=slot, agent=agent, branch=branch).returncode == 0
         commit_task(repository, checkout(project, slot=slot), branch)
         source = tmp_path / f"{slot}.md"
@@ -22946,8 +22947,11 @@ def test_retire_pending_stops_when_a_storage_drift_left_registry_state(
         "remove-RecursionError",
         "remove-RuntimeError",
         "remove-symlink-loop",
+        "remove-StopIteration",
+        "remove-MemoryError",
         "classification-Refusal",
         "classification-OSError",
+        "classification-StopIteration",
     ),
 )
 def test_retire_pending_reports_its_batch_when_a_later_attempt_fails(
@@ -22986,6 +22990,8 @@ def test_retire_pending_reports_its_batch_when_a_later_attempt_fails(
         "ValueError": ValueError("injected decode failure"),
         "RecursionError": RecursionError("injected nesting failure"),
         "RuntimeError": RuntimeError("injected runtime failure"),
+        "StopIteration": StopIteration("injected exhausted lookup"),
+        "MemoryError": MemoryError("injected allocation failure"),
         "Refusal": wrkslots.Refusal("injected classification refusal"),
     }
     original_remove = wrkslots._cmd_remove
@@ -23038,6 +23044,80 @@ def test_retire_pending_reports_its_batch_when_a_later_attempt_fails(
         assert row["reason"] == (
             str(errors[kind]) if kind == "Refusal" else f"{kind}: {errors[kind]}"
         )
+
+
+def test_retire_pending_reports_its_batch_when_the_machine_state_disappears(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A machine missing when a refusal is classified stops the batch with its report.
+
+    slot01 is removed.  slot02's removal deletes the machine's ACTIVE,
+    ARCHIVED and EVENTS paths and refuses, so the real classifier finds no
+    registry state for the machine.  The report keeps slot01's removal,
+    stops at slot02, which needs recovery, and defers slot03.
+    """
+
+    project, _repository, _remote = _queue_two_finished_slots_with_dead_owners(
+        tmp_path, monkeypatch, count=3
+    )
+    config = wrkslots._load_config(str(project), "testhost")
+    original_remove = wrkslots._cmd_remove
+    attempted: list[str] = []
+
+    def remove(
+        args: argparse.Namespace,
+        *,
+        private_cleanup: wrkslots._PrivateCleanupContext | None = None,
+        validation_removal_proof: wrkslots._ValidationRemovalProof | None = None,
+        emit: bool = True,
+    ) -> int:
+        attempted.append(args.slot)
+        if args.slot == "slot02":
+            wrkslots._active_path(config).unlink()
+            wrkslots._archive_path(config).unlink()
+            shutil.rmtree(wrkslots._event_directory(config))
+            raise wrkslots.Refusal("injected removal refusal")
+        return original_remove(
+            args,
+            private_cleanup=private_cleanup,
+            validation_removal_proof=validation_removal_proof,
+            emit=emit,
+        )
+
+    monkeypatch.setattr(wrkslots, "_cmd_remove", remove)
+    code = wrkslots.main(
+        [
+            "--project-root",
+            str(project),
+            "retire-pending",
+            "--limit",
+            "3",
+            "--coordinator-pid",
+            str(os.getpid()),
+            "--format",
+            "json",
+        ]
+    )
+
+    assert attempted == ["slot01", "slot02"]
+    assert code == 3
+    payload = json.loads(capsys.readouterr().out)
+    assert [row["slot"] for row in payload["removed"]] == ["slot01"]
+    assert payload["retained"] == []
+    assert payload["recovery_required"] is True
+    [row] = payload["could_not_determine"]
+    assert row["slot"] == "slot02"
+    assert row["recovery_required"] is True
+    assert row["reason"] == (
+        "retire-pending outcome=could-not-determine recovery_required=true: "
+        "retirement attempt for slot02 found no registry state for machine testhost"
+    )
+    assert [item["slot"] for item in payload["deferred"]] == ["slot03"]
+    assert payload["deferred"][0]["reason"] == (
+        "batch stopped after an indeterminate retirement outcome"
+    )
 
 
 def _assert_retire_pending_stopped_at_slot01(

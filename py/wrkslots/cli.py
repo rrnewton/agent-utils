@@ -24031,8 +24031,13 @@ def _retirement_outcome_after_refusal(
                 config, require_repository=False
             )
             state = next(
-                item for item in states if item.machine == candidate.machine
+                (item for item in states if item.machine == candidate.machine), None
             )
+            if state is None:
+                raise StateError(
+                    f"retirement attempt for {candidate.slot} found no registry "
+                    f"state for machine {candidate.machine}"
+                )
             current = next(
                 (item for item in state.slots if item.slot == candidate.slot), None
             )
@@ -24161,10 +24166,11 @@ def _confirm_unchanged_after_target_storage_drift(
 def _retirement_failure_reason(exc: BaseException) -> str:
     """A refusal's own text, or another failure's type and text.
 
-    ``retire-pending`` catches OSError, ValueError and RuntimeError (which
-    includes Refusal) where an attempt's outcome is decided, so that one
-    failing attempt stops the batch without losing the report of the
-    attempts before it.
+    ``retire-pending`` catches every Exception where an attempt's outcome is
+    decided, so that one failing attempt stops the batch without losing the
+    report of the attempts before it.  Each such failure is reported as
+    could-not-determine with recovery required, never as removed or
+    retained.
     """
 
     return str(exc) if isinstance(exc, Refusal) else f"{type(exc).__name__}: {exc}"
@@ -24220,7 +24226,7 @@ def _cmd_retire_pending(args: argparse.Namespace) -> int:
                 _confirm_unchanged_after_target_storage_drift(
                     config, candidate, exc, deadline
                 )
-            except (OSError, ValueError, RuntimeError) as state_error:
+            except Exception as state_error:
                 # Any refusal or failure here, including one revalidating
                 # the configuration, leaves the attempt unconfirmed: the
                 # batch stops and still reports what it did.
@@ -24261,7 +24267,7 @@ def _cmd_retire_pending(args: argparse.Namespace) -> int:
                 outcome, reason = _retirement_outcome_after_refusal(
                     config, candidate, exc, deadline
                 )
-            except (OSError, ValueError, RuntimeError) as state_error:
+            except Exception as state_error:
                 # Any refusal or failure while classifying the attempt
                 # leaves it unclassified: the batch stops and still reports
                 # what it did.
@@ -24285,10 +24291,11 @@ def _cmd_retire_pending(args: argparse.Namespace) -> int:
             destination.append(
                 {**identity, "outcome": outcome, "reason": reason}
             )
-        except (OSError, ValueError, RuntimeError) as exc:
+        except Exception as exc:
             # The removal stopped at an unknown point, as for a StateError.
-            # RuntimeError includes RecursionError and the error that
-            # Path.resolve raises for a symlink loop before Python 3.13.
+            # This includes RecursionError, the RuntimeError that
+            # Path.resolve raises for a symlink loop before Python 3.13,
+            # StopIteration and MemoryError.
             could_not_determine.append(
                 {
                     **identity,
@@ -31774,8 +31781,13 @@ def _begin_finish(
         config, require_repository=False
     )
     boundary_state = next(
-        item for item in boundary_states if item.machine == config.machine
+        (item for item in boundary_states if item.machine == config.machine), None
     )
+    if boundary_state is None:
+        raise StateError(
+            f"slot {final_record.slot} lost its machine {config.machine} from the "
+            "registry before its destructive boundary"
+        )
     boundary_record = _find_record(boundary_state, final_record.slot)
     if _record_to_obj(boundary_record) != _record_to_obj(final_record):
         raise StateError(
