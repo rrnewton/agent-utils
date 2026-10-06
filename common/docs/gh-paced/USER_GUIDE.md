@@ -342,12 +342,14 @@ reads is still found. It looks for:
   never shortened: it starts a cooldown with no end time, every paced call is
   refused (exit 75) with a message saying so, and the cooldown ends only when a
   person removes `<account>.cooldown` and the `cooldown` entry of
-  `<account>.json` from the state directory. A value whose digits run on past
-  the 4 KiB kept between reads cannot be read whole, and is treated the same
-  way. So is one that starts its line (after blanks, or after the `<` marker of
-  gh's debug output) and runs up to the end of the first 1 MiB of stderr, which
-  is all that the rate-limit refresh (`gh api rate_limit`, run by gh-paced
-  itself) keeps; the refresh prints a warning when it cut either stream there.
+  `<account>.json` from the state directory (see
+  [Ending a cooldown by hand](#ending-a-cooldown-by-hand)). A value whose
+  digits run on past the 4 KiB kept between reads cannot be read whole, and is
+  treated the same way. So is one that starts its line (after blanks, or after
+  the `<` marker of gh's debug output) and runs up to the end of the first
+  1 MiB of stderr, which is all that the rate-limit refresh (`gh api
+  rate_limit`, run by gh-paced itself) keeps; the refresh prints a warning when
+  it cut either stream there.
   The same words in the middle of a line of prose, cut there, are not a header
   and start no such cooldown.
 
@@ -415,8 +417,8 @@ blank line. stdout itself is passed on unchanged.
   leaves nothing on stdout to read, so stderr decides, as for a call without
   `-i`. So `gh api -i ... | head -n1` on a 403 or 429 can start a cooldown
   with no end time, even for a 403 that was only a permission error. Once you
-  know it was not a limit, end it as above, by removing `<account>.cooldown`
-  and the `cooldown` entry of `<account>.json`.
+  know it was not a limit, end it as described in
+  [Ending a cooldown by hand](#ending-a-cooldown-by-hand).
 
 Any limit signal (one of the phrases, HTTP 429, a `Retry-After` value, or
 `X-RateLimit-Remaining: 0`) starts a **cooldown** of the larger of `Retry-After`
@@ -433,7 +435,8 @@ has been passed on. Pushback that a `gh-paced --drain` process reads from
 stderr after gh-paced has exited (see
 [What passes through unchanged](#what-passes-through-unchanged)) records the
 same cooldown and prints a one-line `GH-PACED PUSHBACK` message, but it is not
-written to the audit log.
+written to the audit log. A cooldown with no end time ends only when a person
+ends it; see [Ending a cooldown by hand](#ending-a-cooldown-by-hand).
 
 The banner looks like this:
 
@@ -448,6 +451,71 @@ GH-PACED ********************************************************************
 Apart from `--include` header blocks, gh-paced does not scan stdout. Error text
 from GitHub arrives on stderr, and stdout often carries the caller's data
 (`--json` output, `gh api` responses) that may legitimately contain these words.
+
+### Ending a cooldown by hand
+
+A cooldown with an end time ends by itself; wait for it. A cooldown with no end
+time (a `Retry-After` over 365 days, or a wait gh-paced could not read whole)
+lasts until a person ends it. End it only after checking with GitHub that the
+account is no longer limited, or once you know the refusal was not a limit (a
+403 for a missing permission, for example).
+
+The cooldown is kept twice in the state directory: in `<account>.cooldown` and
+in the `cooldown` entry of `<account>.json`. Every load takes the later of the
+two, so both must be cleared. `gh-paced status --account NAME`, run with the
+same `GH_PACED_STATE_DIR`, `XDG_STATE_HOME` and `HOME` as your gh shim, prints
+the state file's path on its `state file:` line, and the refusal message names
+both files. Set `state` to that path and run this. It holds the account's lock
+(`<account>.lock`, the lock every gh-paced process takes) while it removes
+`<account>.cooldown` and sets the entry to `null`, so no paced call reads or
+rewrites the state halfway through:
+
+```sh
+state="$HOME/.local/state/gh-paced/octocat.json"
+flock -w 30 "${state%.json}.lock" python3 - "$state" <<'EOF'
+import json, os, sys
+state = sys.argv[1]
+try:
+    os.remove(state[:-len(".json")] + ".cooldown")
+except FileNotFoundError:
+    pass
+with open(state) as f:
+    s = json.load(f)
+s["cooldown"] = None
+tmp = state + ".clearing"
+fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+with os.fdopen(fd, "w") as f:
+    json.dump(s, f, indent=2)
+os.replace(tmp, state)
+EOF
+```
+
+If `flock` gives up after 30 s, a gh-paced process is holding the lock; run the
+command again. Then run `gh-paced status --account NAME` again: it prints
+`cooldown: none`, and paced calls are no longer refused for the cooldown. What
+the command leaves behind:
+
+- No `<account>.cooldown` file (the next pushback writes a new one), and
+  `"cooldown": null` in `<account>.json`. The `.clearing` file exists only until
+  the rename.
+- Everything else in `<account>.json` as it was: the buckets and hourly windows
+  (the calls of the last hour still count), the in-flight writes, and the
+  refresh bookkeeping. The cached `GET /rate_limit` numbers were normally
+  dropped when the call that met the pushback finished, so the next refresh
+  fetches new ones (see
+  [Account-wide feedback](#account-wide-feedback-get-rate_limit); at most one
+  every 60 s).
+- The audit log as it was, with its `pushback` and `refuse` records. The
+  clearing is not recorded: gh-paced does not see it.
+
+Do not remove only one of the two: removing `<account>.cooldown` alone leaves
+the entry in force, and clearing the entry alone brings the cooldown back from
+`<account>.cooldown` at the next load. Do not delete `<account>.json` instead:
+with no state file the next call starts from full buckets and forgets the calls
+of the last hour. A call that met the pushback and is still running records
+the cooldown again when it finishes, and a `gh-paced --drain` process still
+copying a call's stderr records one again if it reads another limit signal, so
+clear the cooldown after that call has exited, and check `status` afterwards.
 
 ## The write content guard
 

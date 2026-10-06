@@ -1198,6 +1198,42 @@ longer or unending cooldown in place of a shorter one), except where noted:
   line keeps its `http_429` assertion and adds no end time.
 - New: the two unit tests and two CLI tests in the table.
 
+## After round 11: the rebase and ending a cooldown by hand
+
+**Rebase.** Before round 12 the series was rebased onto agent-utils main
+`dceb432245cf1ce0277f68497aa36a5d9a389a27`, 3 commits past `6b891cc1`. It
+applied without conflicts, and the 17 files the series touches are
+byte-identical before and after. The SHAs in the round sections above are the
+pre-rebase commits, kept on the local branch
+`coord/gh-paced-pre-rebase-3fc9a6f3` on devbig014. Titles map one to one; the
+last two are `3d12eec3` (was `65829cb0`, the head round 11 reviewed) and
+`acc64154` (was `3fc9a6f3`, the round-11 fixes).
+
+**Ending a cooldown by hand.** The coordinator asked for the operator's
+procedure for a cooldown with no end time: the exact command, and what it
+leaves behind. The user guide's pushback section now ends with "Ending a
+cooldown by hand". The command takes `flock` on `<account>.lock`, the lock every
+gh-paced process takes, around a short `python3` step. That step removes
+`<account>.cooldown`, then writes `<account>.json` back with
+`"cooldown": null` through a 0600 temporary file and a rename. The section
+lists what is left: the buckets, hourly windows, in-flight writes and audit log
+as they were, and no cooldown record until the next pushback. It also says what
+not to do: clear one copy only, delete the state file, or clear while the call
+that met the pushback still runs. There is no `gh-paced` subcommand for this;
+none was asked for. The three places in the guide that said "removes
+`<account>.cooldown` and the `cooldown` entry" now link to the section.
+
+New CLI test `the_guides_command_ends_a_cooldown_with_no_end_time` takes the
+block from the embedded guide, replaces only its `state=` line, and runs it with
+`/bin/sh` against a real no-end cooldown (a 403 with `Retry-After: 40000000`,
+refused with exit 75 before). Afterwards `status` prints `cooldown: none`, the
+next call runs, the state file equals the old one apart from the entry and has
+mode 0600, and the audit log is byte-identical. Fail-before, by editing the
+guide's block: without its `s["cooldown"] = None` line the test fails at the
+null-entry assertion; without its `os.remove` it fails at the assertion that
+`<account>.cooldown` is gone. The test needs `flock` (util-linux) and
+`python3` on `/usr/bin:/bin`.
+
 ## Test changes worth a reviewer's attention
 
 Round 1 changed these existing tests. Every change makes the test stricter or
@@ -1394,7 +1430,8 @@ pagination and limit costs, watch loops, alias inspection), adds one test
   "Round 11 and what changed".
 - Cooldowns with no end time that the cut-output rule can start without a
   limit (the fail-safe direction; each stops paced calls on the host until a
-  person clears the cooldown):
+  person clears the cooldown, as the user guide's "Ending a cooldown by hand"
+  describes):
   - `gh api -i ... | head -n1`, or any consumer or terminal that goes away, or
     a kill, cutting a 403 or 429 block before a whole `Retry-After` line,
     including a 403 that was only a permission error, which would otherwise get
