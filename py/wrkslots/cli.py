@@ -24158,6 +24158,12 @@ def _confirm_unchanged_after_target_storage_drift(
         ) from exc
 
 
+def _retirement_failure_reason(exc: BaseException) -> str:
+    """A refusal's own text, or another failure's type and text."""
+
+    return str(exc) if isinstance(exc, Refusal) else f"{type(exc).__name__}: {exc}"
+
+
 def _cmd_retire_pending(args: argparse.Namespace) -> int:
     if args.limit <= 0 or args.limit > RETIRE_PENDING_LIMIT:
         raise Refusal(
@@ -24249,12 +24255,15 @@ def _cmd_retire_pending(args: argparse.Namespace) -> int:
                 outcome, reason = _retirement_outcome_after_refusal(
                     config, candidate, exc, deadline
                 )
-            except StateError as state_error:
+            except (Refusal, OSError, ValueError, RecursionError) as state_error:
+                # Any refusal or read failure while classifying the attempt
+                # leaves it unclassified: the batch stops and still reports
+                # what it did.
                 could_not_determine.append(
                     {
                         **identity,
                         "outcome": "could-not-determine",
-                        "reason": str(state_error),
+                        "reason": _retirement_failure_reason(state_error),
                         "recovery_required": True,
                     }
                 )
@@ -24270,6 +24279,18 @@ def _cmd_retire_pending(args: argparse.Namespace) -> int:
             destination.append(
                 {**identity, "outcome": outcome, "reason": reason}
             )
+        except (OSError, ValueError, RecursionError) as exc:
+            # The removal stopped at an unknown point, as for a StateError.
+            could_not_determine.append(
+                {
+                    **identity,
+                    "outcome": "could-not-determine",
+                    "reason": _retirement_failure_reason(exc),
+                    "recovery_required": True,
+                }
+            )
+            stopped_at = index
+            break
         else:
             removed.append(
                 {

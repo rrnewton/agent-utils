@@ -22938,6 +22938,82 @@ def test_retire_pending_stops_when_a_storage_drift_left_registry_state(
     )
 
 
+@pytest.mark.parametrize(
+    "failure",
+    (
+        "remove-OSError",
+        "remove-ValueError",
+        "remove-RecursionError",
+        "classification-Refusal",
+        "classification-OSError",
+    ),
+)
+def test_retire_pending_reports_its_batch_when_a_later_attempt_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    failure: str,
+) -> None:
+    """A failure after the first candidate still prints the batch report.
+
+    The first candidate is removed.  The second candidate's removal raises
+    a read failure, or it refuses and classifying that refusal fails.  The
+    report keeps the first removal and stops at the second, which needs
+    recovery.
+    """
+
+    project, _repository, _remote = _queue_two_finished_slots_with_dead_owners(
+        tmp_path, monkeypatch
+    )
+    stage, kind = failure.split("-")
+    errors: dict[str, BaseException] = {
+        "OSError": OSError(5, "injected read failure"),
+        "ValueError": ValueError("injected decode failure"),
+        "RecursionError": RecursionError("injected nesting failure"),
+        "Refusal": wrkslots.Refusal("injected classification refusal"),
+    }
+    original_remove = wrkslots._cmd_remove
+
+    def remove(
+        args: argparse.Namespace,
+        *,
+        private_cleanup: wrkslots._PrivateCleanupContext | None = None,
+        validation_removal_proof: wrkslots._ValidationRemovalProof | None = None,
+        emit: bool = True,
+    ) -> int:
+        if args.slot == "slot02":
+            if stage == "remove":
+                raise errors[kind]
+            raise wrkslots.Refusal("injected removal refusal")
+        return original_remove(
+            args,
+            private_cleanup=private_cleanup,
+            validation_removal_proof=validation_removal_proof,
+            emit=emit,
+        )
+
+    def classify(*_args: object) -> tuple[str, str]:
+        raise errors[kind]
+
+    monkeypatch.setattr(wrkslots, "_cmd_remove", remove)
+    if stage == "classification":
+        monkeypatch.setattr(wrkslots, "_retirement_outcome_after_refusal", classify)
+    code = _retire_two(project)
+
+    assert code == 3
+    payload = json.loads(capsys.readouterr().out)
+    assert [row["slot"] for row in payload["removed"]] == ["slot01"]
+    assert payload["retained"] == []
+    assert payload["deferred"] == []
+    assert payload["recovery_required"] is True
+    [row] = payload["could_not_determine"]
+    assert row["slot"] == "slot02"
+    assert row["recovery_required"] is True
+    assert row["reason"] == (
+        str(errors[kind]) if kind == "Refusal" else f"{kind}: {errors[kind]}"
+    )
+
+
 def _assert_retire_pending_stopped_at_slot01(
     payload: Mapping[str, object], reason: str
 ) -> None:
