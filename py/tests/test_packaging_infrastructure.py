@@ -843,9 +843,11 @@ def test_wrkslots_lifecycle_partitions_are_disjoint_and_complete() -> None:
     # cases) are mapped.
     # The two strict-replay stranding tests (a repository relocated twice, and
     # an archived slot's deleted repository) are mapped.
-    assert len(all_tests) == 1848
+    # The 25 validation-run liveness tests of the wrkslots liveness series
+    # (merged at 8648bab6) are mapped.
+    assert len(all_tests) == 1873
     assert len(ordinary) == 290
-    assert len(mapped) == 1558
+    assert len(mapped) == 1583
     assert {
         node.split("::", 1)[1].split("[", 1)[0] for node in ordinary
     } == {
