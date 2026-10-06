@@ -16738,7 +16738,8 @@ def _assert_host_process_view() -> None:
     are rewritten relative to another root; procfs mounted with ``hidepid``
     hides processes; and a mount over ``/proc/<pid>``, or a path inside it,
     replaces that process's entries with another file system's.  Any of
-    them makes an absent run look ``dead``.
+    them makes an absent run look ``dead``.  A mount there that a later
+    mount over ``/proc`` hides replaces nothing that path lookup reaches.
     """
 
     for name, initial in _INITIAL_NAMESPACE_INODES:
@@ -16769,8 +16770,11 @@ def _assert_host_process_view() -> None:
             f"/proc is mounted with {hidden[-1]}, so its process table need not show "
             "the recorded runs"
         )
-    for entry in _read_self_mount_entries():
-        if _PROC_PROCESS_MOUNT.fullmatch(str(entry.point)):
+    entries = _read_self_mount_entries()
+    for entry in entries:
+        if _PROC_PROCESS_MOUNT.fullmatch(str(entry.point)) and _mount_is_visible(
+            entries, entry
+        ):
             raise Refusal(
                 f"a {entry.fstype} mount at {entry.point} masks that process's "
                 "entries in /proc, so its process table need not show the recorded runs"

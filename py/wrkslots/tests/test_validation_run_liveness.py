@@ -1257,6 +1257,14 @@ _HOST_MOUNTS = (
         ),
         ("3 2 0:3 / /proc rw - tmpfs tmpfs rw\n", "no process filesystem is mounted at /proc"),
         ("3 2 0:3 / /proc/sys/fs/binfmt_misc rw - binfmt_misc binfmt_misc rw\n", None),
+        (
+            "3 2 0:3 / /proc/4242 rw - tmpfs tmpfs rw\n4 2 0:4 / /proc rw - proc proc rw\n",
+            None,
+        ),
+        (
+            "3 2 0:4 / /proc rw - proc proc rw\n4 3 0:3 / /proc/4242 rw - tmpfs tmpfs rw\n",
+            "tmpfs mount at /proc/4242 masks",
+        ),
     ],
 )
 def test_a_mount_over_a_process_directory_in_proc_restricts_the_view(
@@ -1266,7 +1274,10 @@ def test_a_mount_over_a_process_directory_in_proc_restricts_the_view(
 
     The process table then need not show that run, so the view is
     restricted; a mount stacked over ``/proc`` itself hides the process
-    filesystem.  A mount elsewhere below ``/proc`` hides no process.
+    filesystem.  A mount elsewhere below ``/proc`` hides no process, and
+    neither does a mount over ``/proc/<pid>`` that a process filesystem
+    mounted later over ``/proc`` hides; a mount over ``/proc/<pid>`` of that
+    later process filesystem still does.
     """
 
     table = tmp_path / "mountinfo"

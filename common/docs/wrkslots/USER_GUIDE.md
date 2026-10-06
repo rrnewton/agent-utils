@@ -387,7 +387,8 @@ validation slots. `audit`, `remove` (including `--validate-complete` and `remove
   row is judged by its lease, as in `recover-absent-validate-rows`), or this process's view of the
   host is restricted: it is not in the host's initial PID or cgroup namespace, the mount visible at
   `/proc` is not the process filesystem of its PID namespace, `/proc` is mounted with `hidepid`, or
-  a mount covers a process's directory `/proc/<pid>` or a path inside it. In any of those a
+  a mount that path lookup reaches covers a process's directory `/proc/<pid>` or a path inside it
+  (one that a later mount over `/proc` hides covers nothing). In any of those a
   host run can be missing from the process table, so an empty table is no evidence. All of this evidence is local to the host, so a host without a reachable user service manager cannot prove a
   validation slot free.
 
