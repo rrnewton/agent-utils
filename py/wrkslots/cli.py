@@ -607,6 +607,19 @@ HISTORICAL_PURPOSE_NOT_RECORDED = "no purpose recorded in worktree-state.json"
 _RETAINED_HANDLE_COUNT_LIMIT = 4096
 _RETAINED_HANDLE_BYTES_LIMIT = 64 * 1024 * 1024
 _RETAINED_HANDLE_CENSUS_SECONDS = 30.0
+# A retained handle whose change time is this close to the start of the
+# census that read it can be rewritten, bytes, size and times alike, within
+# the same file timestamp tick before the census reads it again, so two
+# equal reads do not show that nothing re-registered it.  A rewrite later
+# than this moves the change time.  The window is the event memo's
+# (``_EVENT_MEMO_STABLE_NS``), with its assumption that the kernel stamps
+# change times from this host's realtime clock; some filesystems keep only
+# whole seconds.
+_RETAINED_HANDLE_STABLE_NS = 2_000_000_000
+# How far past the window a recent handle's change time may lie and still be
+# waited for (``_settle_retained_handles``).  A change time further ahead
+# than this is not waited for, and the handle stays recent.
+_RETAINED_HANDLE_SETTLE_SLACK_NS = 250_000_000
 # The bound on one /proc/<pid>/mountinfo read, sized from measurement. On
 # 2026-10-04, at load average about 150, the largest of 4,118 readable tables
 # on a production host was 143,648 bytes (976 mounts), so 4 MiB is about 29
@@ -1197,6 +1210,11 @@ class _RetainedValidationHandle:
     # and modification and change times.  Two reads of one handle are the
     # same handle only when all of them match.
     file_generation: tuple[int, int, int, str, int, int] | None = None
+    # Whether the change time was within ``_RETAINED_HANDLE_STABLE_NS`` of
+    # the start of the census that read it, so that a later equal read does
+    # not rule out a rewrite (``_settle_retained_handles``, ``_run_evidence``).
+    # Not part of the identity.
+    recent: bool = dataclasses.field(default=False, compare=False)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -16849,9 +16867,11 @@ class _RunEvidence:
     units: tuple[Mapping[str, str], ...]
     bindings: Mapping[str, tuple[_RetainedValidationHandle, ...]]
     members: Mapping[str, int]
-    # Handles whose two reads, before and after the host evidence, differ:
-    # each with how it changed ("appeared", "changed", or "disappeared or
-    # stopped naming the row").
+    # Handles whose two reads, before and after the host evidence, differ,
+    # or whose first read was too recent for an equal second read to rule
+    # out a rewrite: each with how it changed ("appeared", "changed",
+    # "disappeared or stopped naming the row", or "may have been rewritten
+    # alike within one file timestamp tick").
     late: Mapping[str, tuple[tuple[_RetainedValidationHandle, str], ...]]
 
 
@@ -16870,7 +16890,12 @@ def _run_evidence(
     first read missed, or one rewritten, replaced or removed since it, so
     the handles from both reads are judged and every difference between
     the two reads, down to the handle file's bytes and times, is recorded
-    in ``late``.  The
+    in ``late``.  A rewrite with the same bytes in the same file timestamp
+    tick leaves every recorded field alike, so when a handle of the first
+    read changed within ``_RETAINED_HANDLE_STABLE_NS`` of it, the window is
+    waited out and the handles are read again before the host evidence
+    (``_settle_retained_handles``); a handle that is still that recent and
+    that both reads find alike is recorded in ``late`` too.  The
     current members of their units' control groups are read last (see
     ``_retained_unit_cgroup_members``).  ``first`` is a handle read the
     caller has already made and judged.  Every caller that judges rows from
@@ -16881,11 +16906,18 @@ def _run_evidence(
 
     if first is None:
         first = _retained_handles_for_absent_rows(config, rows)
+    earlier = first
+    if _settle_retained_handles(first):
+        first = _retained_handles_for_absent_rows(config, rows)
     processes, units = host()
     later = _retained_handles_for_absent_rows(config, rows)
     bindings = {
-        slot: tuple(dict.fromkeys((*first.get(slot, ()), *later.get(slot, ()))))
-        for slot in {*first, *later}
+        slot: tuple(
+            dict.fromkeys(
+                (*earlier.get(slot, ()), *first.get(slot, ()), *later.get(slot, ()))
+            )
+        )
+        for slot in {*earlier, *first, *later}
     }
     members = _retained_unit_cgroup_members(
         {handle.unit for handles in bindings.values() for handle in handles}
@@ -16899,6 +16931,13 @@ def _run_evidence(
             for path, handle in after.items()
             if before.get(path) != handle
         ) + tuple(
+            (
+                handle,
+                "may have been rewritten alike within one file timestamp tick",
+            )
+            for path, handle in after.items()
+            if before.get(path) == handle and before[path].recent
+        ) + tuple(
             (handle, "disappeared or stopped naming the row")
             for path, handle in before.items()
             if path not in after
@@ -16906,6 +16945,34 @@ def _run_evidence(
         if changes:
             late[slot] = changes
     return _RunEvidence(processes, units, bindings, members, late)
+
+
+def _settle_retained_handles(
+    handles: Mapping[str, tuple[_RetainedValidationHandle, ...]],
+) -> bool:
+    """Wait until no handle in ``handles`` changed within the window.
+
+    Return whether any handle was recent, so that the caller reads the
+    handles again.  A validation run rewrites its handle when it finishes,
+    just before its row is removed, so a recent handle is the common case
+    and not a refusal.  The wait is at most ``_RETAINED_HANDLE_STABLE_NS``
+    and ``_RETAINED_HANDLE_SETTLE_SLACK_NS``; a change time further ahead
+    of this host's clock is not waited for, and the handles read again are
+    still recent.
+    """
+
+    changes = [
+        handle.file_generation[5]
+        for values in handles.values()
+        for handle in values
+        if handle.recent and handle.file_generation is not None
+    ]
+    if not changes:
+        return False
+    wait_ns = max(changes) + _RETAINED_HANDLE_STABLE_NS - _retained_handle_clock_ns()
+    if 0 < wait_ns <= _RETAINED_HANDLE_STABLE_NS + _RETAINED_HANDLE_SETTLE_SLACK_NS:
+        time.sleep(wait_ns / 1_000_000_000 + 0.01)
+    return True
 
 
 def _judge_run_evidence(
@@ -43914,6 +43981,10 @@ def _retained_handle_path(config: Config, value: str, label: str) -> str:
     return value if os.path.isabs(value) else os.path.join(str(config.root), value)
 
 
+def _retained_handle_clock_ns() -> int:
+    return time.time_ns()
+
+
 def _retained_handles_for_absent_rows(
     config: Config, rows: Sequence[tuple[ActiveRecord, tuple[Path, ...]]]
 ) -> Mapping[str, tuple[_RetainedValidationHandle, ...]]:
@@ -43934,6 +44005,7 @@ def _retained_handles_for_absent_rows(
     handle_paths: list[Path] = []
     total_bytes = 0
     deadline = time.monotonic() + _RETAINED_HANDLE_CENSUS_SECONDS
+    stable_before_ns = _retained_handle_clock_ns() - _RETAINED_HANDLE_STABLE_NS
     if handles.is_dir():
         try:
             with os.scandir(handles) as entries:
@@ -44065,7 +44137,13 @@ def _retained_handles_for_absent_rows(
             if not boot_id:
                 raise Refusal(f"retained validation handle {path} has an empty boot identity")
         handle = _RetainedValidationHandle(
-            path, unit, pid, start_ticks, boot_id, file_generation
+            path,
+            unit,
+            pid,
+            start_ticks,
+            boot_id,
+            file_generation,
+            recent=after.st_ctime_ns > stable_before_ns,
         )
         for slot in related:
             matched[slot].append(handle)

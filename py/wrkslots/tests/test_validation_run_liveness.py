@@ -1782,6 +1782,77 @@ def test_a_handle_that_changes_during_the_evidence_reads_is_alive(
     assert states[("testhost", "slot01", 1)][0] == "dead", states
 
 
+def test_a_recently_changed_handle_is_read_again_after_its_timestamp_window(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A run that has just rewritten its handle is judged from a later read.
+
+    A rewrite with the same bytes within one file timestamp tick of the
+    write before it leaves the device, inode, size, bytes and times alike,
+    so two equal reads within the window of the handle's change time do not
+    show that no run registered again between them.  The units are read
+    only once the change time is two seconds old, and the finished run then
+    reads as over.  This uses this host's clock and the file's real times.
+    """
+
+    project, tree = _prepare(tmp_path, monkeypatch, agent_liveness="dead")
+    handle = _write_run_handle(project, tree / "before")
+    ages: list[int] = []
+
+    def units() -> tuple[Mapping[str, str], ...]:
+        ages.append(time.time_ns() - handle.stat().st_ctime_ns)
+        return ()
+
+    monkeypatch.setattr(wrkslots, "_user_systemd_snapshot", units)
+    config = wrkslots._load_config(str(project), "testhost")
+    states = wrkslots._validation_run_liveness_states(
+        config, wrkslots._load_active(config).slots
+    )
+
+    assert states[("testhost", "slot01", 1)][0] == "dead", states
+    assert ages and min(ages) > 2_000_000_000, ages
+
+
+@pytest.mark.parametrize("clock", ["stopped", "behind"])
+def test_a_handle_still_inside_its_timestamp_window_is_alive(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, clock: str
+) -> None:
+    """Two equal reads of a handle that is still that recent are not trusted.
+
+    ``stopped`` holds the clock at the handle's change time, so the window
+    never passes however long the wait; ``behind`` puts the change time ten
+    seconds ahead of the clock, which is not waited for.  Either way a
+    rewrite alike between the reads would not show, and the unit is absent
+    from both user-systemd enumerations, so the run may have been queued
+    after them.
+    """
+
+    project, tree = _prepare(tmp_path, monkeypatch, agent_liveness="dead")
+    handle = _write_run_handle(project, tree / "before")
+    change = handle.stat().st_ctime_ns
+    offset = 0 if clock == "stopped" else -10_000_000_000
+    monkeypatch.setattr(
+        wrkslots, "_retained_handle_clock_ns", lambda: change + offset, raising=False
+    )
+    monkeypatch.setattr(wrkslots, "_user_systemd_snapshot", lambda: ())
+    config = wrkslots._load_config(str(project), "testhost")
+    started = time.monotonic()
+    states = wrkslots._validation_run_liveness_states(
+        config, wrkslots._load_active(config).slots
+    )
+    elapsed = time.monotonic() - started
+
+    state, message = states[("testhost", "slot01", 1)]
+    assert state == "alive", message
+    assert (
+        "for row slot01 may have been rewritten alike within one file timestamp "
+        "tick while the host evidence" in message
+    )
+    assert f"its unit {RUN_UNIT} may have been queued" in message
+    if clock == "behind":
+        assert elapsed < 2.0, elapsed
+
+
 def test_a_retained_unit_cgroup_member_missing_from_every_table_is_alive(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
