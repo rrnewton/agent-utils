@@ -37,7 +37,11 @@
 //! gh-paced. What was scanned before that point still counts. An INT,
 //! TERM, HUP or QUIT that arrives after gh has exited, sent by a process or typed at the
 //! terminal, abandons whatever is still undelivered and is reported in [`Ran::late_signal`], so gh-paced can die by it after its bookkeeping
-//! rather than wait indefinitely on a consumer that has stopped reading. The writers write to
+//! rather than wait indefinitely on a consumer that has stopped reading. Each reader then
+//! scans what it can read from gh's stream at once, up to [`LATE_SCAN_BYTES`], without
+//! delivering it, and stops; gh-paced gives the readers up to [`LATE_SCAN_WAIT_SECS`] for this
+//! and then feeds the end of stdout to the scanner whether or not its reader got there, so a
+//! header block already read counts as one the output cut short. The writers write to
 //! descriptors 1 and 2 directly, without the standard library's stream locks, so a writer stuck
 //! on a consumer that stopped reading cannot hold up gh-paced's own messages (see
 //! [`write_stderr_bounded`]).
@@ -82,6 +86,14 @@ pub const TEE_AFTER_EXIT_SECS: f64 = 5.0;
 
 /// After gh exits, a tee stops reading after this many more bytes.
 pub const TEE_AFTER_EXIT_BYTES: usize = 64 << 20;
+
+/// After a late signal, each tee's reader scans up to this many bytes that it can read from gh's
+/// stream at once, delivering none of them, before it stops.
+pub const LATE_SCAN_BYTES: usize = 1 << 20;
+
+/// After a late signal, how long gh-paced waits for each tee's reader to finish scanning before
+/// taking the scanner.
+pub const LATE_SCAN_WAIT_SECS: f64 = 1.0;
 
 /// Called from a tee's reader thread with a copy of the scanner whenever its pushback signals
 /// change, so a cooldown can be recorded before gh's output has been delivered.
@@ -391,6 +403,8 @@ struct TeeQueue {
     closed: bool,
     /// Our stream refused a write; later bytes are discarded.
     broken: bool,
+    /// Delivery was abandoned by a late signal (see [`Tee::abandon_late`]).
+    late: bool,
 }
 
 /// State shared by one tee's reader, its writer, and the thread waiting for gh.
@@ -400,6 +414,9 @@ struct Tee {
     changed: Condvar,
     /// gh has exited.
     child_exited: AtomicBool,
+    /// The reader has stopped and fed the end of its stream to the scanner, so everything it
+    /// read has been scanned.
+    scanned: AtomicBool,
 }
 
 impl Tee {
@@ -435,6 +452,13 @@ impl Tee {
     fn child_exited(&self) {
         self.child_exited.store(true, Ordering::SeqCst);
         self.changed.notify_all();
+    }
+
+    /// Stop delivering after a late signal: as [`Tee::abandon`], but the reader first scans what
+    /// it can read from gh's stream at once (gh has exited, so that is output gh already wrote).
+    fn abandon_late(&self) {
+        self.lock().late = true;
+        self.abandon();
     }
 
     /// Stop delivering: discard what is queued and anything read later.
@@ -502,7 +526,20 @@ fn scan_and_publish(
     hook: Option<&PushbackHook>,
     published: &mut String,
 ) {
-    let changed = match scanner.lock() {
+    let changed = scan(scanner, which, chunk, hook.is_some(), published);
+    publish(hook, changed);
+}
+
+/// Feed `chunk` (or, with `None`, the end of the stream) to the scanner. Returns a copy of the
+/// scanner for the hook when there is one and the scanner's signals differ from `published`.
+fn scan(
+    scanner: &Mutex<Scanner>,
+    which: Stream,
+    chunk: Option<&[u8]>,
+    hooked: bool,
+    published: &mut String,
+) -> Option<Scanner> {
+    match scanner.lock() {
         Ok(mut s) => {
             match (which, chunk) {
                 (Stream::Err, Some(c)) => s.feed(c),
@@ -511,7 +548,7 @@ fn scan_and_publish(
                 (Stream::Out, None) => s.end_of_stdout(),
             }
             let key = s.signal_key();
-            if hook.is_some() && !s.matched().is_empty() && key != *published {
+            if hooked && !s.matched().is_empty() && key != *published {
                 *published = key;
                 Some(s.clone())
             } else {
@@ -519,9 +556,13 @@ fn scan_and_publish(
             }
         }
         Err(_) => None,
-    };
-    // Called with the scanner unlocked: recording the cooldown takes the state file's lock.
-    if let (Some(h), Some(snapshot)) = (hook, changed) {
+    }
+}
+
+/// Call the hook with `snapshot`, a copy taken by [`scan`]. Called with the scanner unlocked:
+/// recording the cooldown takes the state file's lock.
+fn publish(hook: Option<&PushbackHook>, snapshot: Option<Scanner>) {
+    if let (Some(h), Some(snapshot)) = (hook, snapshot) {
         (h.0)(&snapshot);
     }
 }
@@ -547,10 +588,18 @@ fn tee_reader(
     let mut after_exit = 0usize;
     let mut held = false;
     loop {
-        if tee.lock().broken {
-            // The consumer went away, or a late signal abandoned delivery: stop reading so the
-            // read end closes and gh's next write to this stream fails, as it would have
-            // written to the consumer directly.
+        let (broken, late) = {
+            let q = tee.lock();
+            (q.broken, q.late)
+        };
+        if broken {
+            // The consumer went away: stop reading so the read end closes and gh's next write to
+            // this stream fails, as it would have written to the consumer directly. After a late
+            // signal gh has exited, so what the stream holds is output gh already wrote: scan
+            // what can be read at once first, delivering none of it.
+            if late {
+                scan_ready(&mut src, which, &scanner, &mut buf);
+            }
             break;
         }
         if exited_at.is_none() && tee.child_exited.load(Ordering::SeqCst) {
@@ -590,9 +639,29 @@ fn tee_reader(
             Err(_) => break,
         }
     }
-    scan_and_publish(&scanner, which, None, hook.as_ref(), &mut published);
+    let changed = scan(&scanner, which, None, hook.is_some(), &mut published);
+    tee.scanned.store(true, Ordering::SeqCst);
+    publish(hook.as_ref(), changed);
     tee.close();
     held.then_some(src)
+}
+
+/// Feed the scanner what `src` holds that can be read without waiting, up to
+/// [`LATE_SCAN_BYTES`]. The hook is called once, at the end of the stream.
+fn scan_ready(src: &mut File, which: Stream, scanner: &Mutex<Scanner>, buf: &mut [u8]) {
+    let fd = src.as_raw_fd();
+    let mut total = 0usize;
+    while total < LATE_SCAN_BYTES && readable(fd, 0) {
+        match src.read(buf) {
+            Ok(0) => break,
+            Ok(n) => {
+                total += n;
+                let _ = scan(scanner, which, Some(&buf[..n]), false, &mut String::new());
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(_) => break,
+        }
+    }
 }
 
 /// Copy the queue to our stream until the reader has stopped and the queue is empty. A write
@@ -893,13 +962,14 @@ impl Runner for RealRunner {
             let sig = LATE_SIGNAL.load(Ordering::SeqCst);
             if sig != 0 {
                 for (_, (tee, _, _)) in &tees {
-                    tee.abandon();
+                    tee.abandon_late();
                 }
                 break Some(sig);
             }
             std::thread::sleep(Duration::from_millis(20));
         };
         let mut cut_off = false;
+        let teed_stdout = tees.iter().any(|(which, _)| *which == Stream::Out);
         if late_signal.is_none() {
             for (which, (_, reader, writer)) in tees {
                 let held = reader.join().ok().flatten();
@@ -909,9 +979,28 @@ impl Runner for RealRunner {
                     cut_off |= !hand_off(src, which, inv.drain.as_ref());
                 }
             }
+        } else {
+            // The readers are not joined: one may be waiting for the state file's lock to record
+            // a cooldown. Each stops at its next poll now that delivery is abandoned; give it a
+            // moment to scan the chunk it holds, what it can read at once, and the end of its
+            // stream.
+            let until = Instant::now() + Duration::from_secs_f64(LATE_SCAN_WAIT_SECS);
+            while Instant::now() < until
+                && !tees
+                    .iter()
+                    .all(|(_, (tee, _, _))| tee.scanned.load(Ordering::SeqCst))
+            {
+                std::thread::sleep(Duration::from_millis(5));
+            }
         }
         if let Ok(s) = shared.lock() {
             *scanner = s.clone();
+        }
+        if late_signal.is_some() && teed_stdout {
+            // If the stdout reader has not got there yet, the end of stdout is fed here, so a
+            // header block already read still counts, as one the output cut short (a second
+            // end of stdout changes nothing).
+            scanner.end_of_stdout();
         }
         status.map(|(s, deadline_hit)| Ran {
             exit: decode(s),
