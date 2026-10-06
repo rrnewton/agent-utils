@@ -24159,7 +24159,13 @@ def _confirm_unchanged_after_target_storage_drift(
 
 
 def _retirement_failure_reason(exc: BaseException) -> str:
-    """A refusal's own text, or another failure's type and text."""
+    """A refusal's own text, or another failure's type and text.
+
+    ``retire-pending`` catches OSError, ValueError and RuntimeError (which
+    includes Refusal) where an attempt's outcome is decided, so that one
+    failing attempt stops the batch without losing the report of the
+    attempts before it.
+    """
 
     return str(exc) if isinstance(exc, Refusal) else f"{type(exc).__name__}: {exc}"
 
@@ -24214,15 +24220,15 @@ def _cmd_retire_pending(args: argparse.Namespace) -> int:
                 _confirm_unchanged_after_target_storage_drift(
                     config, candidate, exc, deadline
                 )
-            except Refusal as state_error:
-                # Any refusal here, including one revalidating the
-                # configuration, leaves the attempt unconfirmed: the batch
-                # stops and still reports what it did.
+            except (OSError, ValueError, RuntimeError) as state_error:
+                # Any refusal or failure here, including one revalidating
+                # the configuration, leaves the attempt unconfirmed: the
+                # batch stops and still reports what it did.
                 could_not_determine.append(
                     {
                         **identity,
                         "outcome": "could-not-determine",
-                        "reason": f"{reason}; {state_error}",
+                        "reason": f"{reason}; {_retirement_failure_reason(state_error)}",
                         "recovery_required": True,
                     }
                 )
@@ -24255,8 +24261,8 @@ def _cmd_retire_pending(args: argparse.Namespace) -> int:
                 outcome, reason = _retirement_outcome_after_refusal(
                     config, candidate, exc, deadline
                 )
-            except (Refusal, OSError, ValueError, RecursionError) as state_error:
-                # Any refusal or read failure while classifying the attempt
+            except (OSError, ValueError, RuntimeError) as state_error:
+                # Any refusal or failure while classifying the attempt
                 # leaves it unclassified: the batch stops and still reports
                 # what it did.
                 could_not_determine.append(
@@ -24279,8 +24285,10 @@ def _cmd_retire_pending(args: argparse.Namespace) -> int:
             destination.append(
                 {**identity, "outcome": outcome, "reason": reason}
             )
-        except (OSError, ValueError, RecursionError) as exc:
+        except (OSError, ValueError, RuntimeError) as exc:
             # The removal stopped at an unknown point, as for a StateError.
+            # RuntimeError includes RecursionError and the error that
+            # Path.resolve raises for a symlink loop before Python 3.13.
             could_not_determine.append(
                 {
                     **identity,

@@ -22944,6 +22944,8 @@ def test_retire_pending_stops_when_a_storage_drift_left_registry_state(
         "remove-OSError",
         "remove-ValueError",
         "remove-RecursionError",
+        "remove-RuntimeError",
+        "remove-symlink-loop",
         "classification-Refusal",
         "classification-OSError",
     ),
@@ -22959,20 +22961,35 @@ def test_retire_pending_reports_its_batch_when_a_later_attempt_fails(
     The first candidate is removed.  The second candidate's removal raises
     a read failure, or it refuses and classifying that refusal fails.  The
     report keeps the first removal and stops at the second, which needs
-    recovery.
+    recovery.  ``symlink-loop`` makes the second slot's ``HANDOFF.md`` a
+    link to itself only after the first removal, so the removal's own
+    resolution of that path fails, as it does before Python 3.13.
     """
 
+    stage, kind = failure.split("-", 1)
+    if kind == "symlink-loop":
+        probe = tmp_path / "loop-probe"
+        probe.symlink_to(probe)
+        try:
+            probe.resolve(strict=False)
+        except RuntimeError:
+            pass
+        else:
+            pytest.skip("this Python resolves a symlink loop without raising")
+        probe.unlink()
     project, _repository, _remote = _queue_two_finished_slots_with_dead_owners(
         tmp_path, monkeypatch
     )
-    stage, kind = failure.split("-")
+    config = wrkslots._load_config(str(project), "testhost")
     errors: dict[str, BaseException] = {
         "OSError": OSError(5, "injected read failure"),
         "ValueError": ValueError("injected decode failure"),
         "RecursionError": RecursionError("injected nesting failure"),
+        "RuntimeError": RuntimeError("injected runtime failure"),
         "Refusal": wrkslots.Refusal("injected classification refusal"),
     }
     original_remove = wrkslots._cmd_remove
+    attempted: list[str] = []
 
     def remove(
         args: argparse.Namespace,
@@ -22981,7 +22998,12 @@ def test_retire_pending_reports_its_batch_when_a_later_attempt_fails(
         validation_removal_proof: wrkslots._ValidationRemovalProof | None = None,
         emit: bool = True,
     ) -> int:
-        if args.slot == "slot02":
+        attempted.append(args.slot)
+        if args.slot == "slot02" and kind == "symlink-loop":
+            loop = wrkslots._slot_directory(config, "slot02", "agent") / "HANDOFF.md"
+            assert not loop.exists() and not loop.is_symlink()
+            loop.symlink_to(loop)
+        elif args.slot == "slot02":
             if stage == "remove":
                 raise errors[kind]
             raise wrkslots.Refusal("injected removal refusal")
@@ -23000,6 +23022,7 @@ def test_retire_pending_reports_its_batch_when_a_later_attempt_fails(
         monkeypatch.setattr(wrkslots, "_retirement_outcome_after_refusal", classify)
     code = _retire_two(project)
 
+    assert attempted == ["slot01", "slot02"]
     assert code == 3
     payload = json.loads(capsys.readouterr().out)
     assert [row["slot"] for row in payload["removed"]] == ["slot01"]
@@ -23009,9 +23032,12 @@ def test_retire_pending_reports_its_batch_when_a_later_attempt_fails(
     [row] = payload["could_not_determine"]
     assert row["slot"] == "slot02"
     assert row["recovery_required"] is True
-    assert row["reason"] == (
-        str(errors[kind]) if kind == "Refusal" else f"{kind}: {errors[kind]}"
-    )
+    if kind == "symlink-loop":
+        assert row["reason"].startswith("RuntimeError: Symlink loop from "), row
+    else:
+        assert row["reason"] == (
+            str(errors[kind]) if kind == "Refusal" else f"{kind}: {errors[kind]}"
+        )
 
 
 def _assert_retire_pending_stopped_at_slot01(
