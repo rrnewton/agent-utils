@@ -2259,6 +2259,7 @@ impl PathFailure {
 /// The paths that are down, as `chat status` and `delivery-alarm.json` report them: those whose
 /// failure [`PathFailure::alarming`] says to report.
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct ProviderDown {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) subscription_down: Option<PathFailure>,

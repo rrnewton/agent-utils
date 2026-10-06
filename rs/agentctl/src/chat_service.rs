@@ -4295,7 +4295,8 @@ struct DeliveryWatch {
     // and saved there when it changes. A record that a scan cannot read keeps this value; see
     // `DeliveryWatch::scan`.
     known: Option<chat_runtime::AlarmSources>,
-    // The sources last saved, so the file is written only when they change.
+    // The sources last saved, so the file is written only when they change. `None` until a save
+    // works, and again from the start of each save until it works.
     known_saved: Option<chat_runtime::AlarmSources>,
     // The requests whose prompts a scan recorded as typed and whose reply routes no read has
     // given since, because each read failed. Each scan reads them again.
@@ -4521,6 +4522,9 @@ impl DeliveryWatch {
             }
         };
         if self.known_saved.as_ref() != Some(&*known) {
+            // As for the alarm: a failed save can have replaced the file before it failed, so
+            // the next scan saves again whatever the sources are then.
+            self.known_saved = None;
             match state.write_alarm_sources(known) {
                 Ok(()) => self.known_saved = Some(known.clone()),
                 Err(error) => {
@@ -6429,6 +6433,70 @@ printf '{"version":1,"id":"%s","action":"ensure_reaction","ok":true,"receipt":{"
                 "{case}"
             );
         }
+    }
+
+    #[test]
+    fn a_failed_sources_save_is_saved_again_when_the_sources_return_to_their_old_value() {
+        let (state, _key, root) = state_with_request();
+        for error in ["delivery channel closed", "control child closed stdout"] {
+            state
+                .note_subscription_down(error)
+                .expect("record the subscription failing");
+        }
+        let mut routes = RouteCache::new(Vec::new());
+        let mut watch = DeliveryWatch::new(DeliveryTiming::default());
+        watch.scan(&state, &RecordingDelivery::default(), &mut routes);
+        let down = read_alarm_at(&root);
+        let failing = fs::read_to_string(root.join("provider-health.json")).expect("record");
+        // The subscription recovers while a directory blocks the sources path, so that save fails.
+        fs::remove_file(root.join("delivery-alarm-sources.json")).expect("remove sources");
+        fs::create_dir(root.join("delivery-alarm-sources.json")).expect("block the sources path");
+        state
+            .note_subscription_up()
+            .expect("record the subscription working");
+        watch.scan(&state, &RecordingDelivery::default(), &mut routes);
+        fs::remove_dir(root.join("delivery-alarm-sources.json")).expect("unblock");
+        // The record returns to exactly what the first scan saved.
+        write_private(&root, "provider-health.json", &failing);
+        watch.scan(&state, &RecordingDelivery::default(), &mut routes);
+        // After a restart with the record unreadable, the saved value is reported.
+        write_private(&root, "provider-health.json", "not json");
+        DeliveryWatch::new(DeliveryTiming::default()).scan(
+            &state,
+            &RecordingDelivery::default(),
+            &mut routes,
+        );
+        let restarted = read_alarm_at(&root);
+        fs::remove_dir_all(root).expect("cleanup");
+        assert_eq!(down["subscription_down"]["failures"], 2);
+        assert_eq!(restarted["subscription_down"], down["subscription_down"]);
+        assert!(restarted.get("unreadable_records").is_none());
+    }
+
+    #[test]
+    fn a_sources_record_with_an_unknown_provider_field_is_not_trusted() {
+        let (state, _key, root) = state_with_request();
+        write_private(
+            &root,
+            "delivery-alarm-sources.json",
+            "{\"schema\":\"agentctl-chat-delivery-alarm-sources/v1\",\"provider\":\
+             {\"subscription\":{\"down_since_millis\":1,\"failures\":2,\
+             \"last_failure_at_millis\":2,\"last_error_class\":\"closed\",\
+             \"last_error\":\"closed\"}}}",
+        );
+        write_private(&root, "provider-health.json", "not json");
+        let mut routes = RouteCache::new(Vec::new());
+        DeliveryWatch::new(DeliveryTiming::default()).scan(
+            &state,
+            &RecordingDelivery::default(),
+            &mut routes,
+        );
+        let alarm = read_alarm_at(&root);
+        fs::remove_dir_all(root).expect("cleanup");
+        assert_eq!(
+            alarm["unreadable_records"],
+            serde_json::json!(["provider-health.json"])
+        );
     }
 
     #[test]
