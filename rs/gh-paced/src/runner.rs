@@ -22,8 +22,13 @@
 //! applying back-pressure (all gh wrote is then at most a pipe's worth, already in the kernel)
 //! and stops at end of file, or once the stream has been silent for [`TEE_IDLE_SECS`] (a
 //! descendant holds it open), or [`TEE_AFTER_EXIT_SECS`] after gh exited, or after
-//! [`TEE_AFTER_EXIT_BYTES`] more bytes (a descendant keeps writing). The writer is then waited
-//! for without a time limit, so every byte read reaches the consumer however slowly it reads.
+//! [`TEE_AFTER_EXIT_BYTES`] more bytes (a descendant keeps writing). Silence is measured from
+//! the reader's last read, so a reader held up in the pushback hook (waiting for the state
+//! file's lock) can reach a cutoff with gh's own output still unread; before it stops at one it
+//! therefore reads, scans and queues what can be read at once, up to [`READY_SCAN_BYTES`] (at
+//! least what a pipe holds by default, so all gh wrote unless the pipe was resized). The writer
+//! is then waited for without a time limit, so every byte read reaches the consumer however
+//! slowly it reads.
 //! A stream that a descendant still holds when the reader stops is not closed: once the writer
 //! has delivered everything read so far, the still-open stream is handed to a separate drainer
 //! process ([`Invocation::drain`], `gh-paced --drain`), which copies the rest to the same
@@ -38,7 +43,7 @@
 //! TERM, HUP or QUIT that arrives after gh has exited, sent by a process or typed at the
 //! terminal, abandons whatever is still undelivered and is reported in [`Ran::late_signal`], so gh-paced can die by it after its bookkeeping
 //! rather than wait indefinitely on a consumer that has stopped reading. Each reader then
-//! scans what it can read from gh's stream at once, up to [`LATE_SCAN_BYTES`], without
+//! scans what it can read from gh's stream at once, up to [`READY_SCAN_BYTES`], without
 //! delivering it, and stops. gh has exited, so its pipe holds at most one pipe's capacity,
 //! which the byte bound covers unless the pipe was resized (64 KiB by default on x86-64;
 //! 1 MiB is also the default limit on resizing by an unprivileged process). gh-paced waits for the readers up to [`LATE_SCAN_WAIT_SECS`] longer than
@@ -90,9 +95,10 @@ pub const TEE_AFTER_EXIT_SECS: f64 = 5.0;
 /// After gh exits, a tee stops reading after this many more bytes.
 pub const TEE_AFTER_EXIT_BYTES: usize = 64 << 20;
 
-/// After a late signal, each tee's reader scans up to this many bytes that it can read from gh's
-/// stream at once, delivering none of them, before it stops.
-pub const LATE_SCAN_BYTES: usize = 1 << 20;
+/// Before a tee's reader stops at a cutoff after gh's exit, it reads, scans and queues up to this
+/// many bytes that it can read from gh's stream at once; after a late signal it scans up to this
+/// many, delivering none of them.
+pub const READY_SCAN_BYTES: usize = 1 << 20;
 
 /// After a late signal, how long gh-paced waits for each tee's reader to finish scanning before
 /// taking the scanner, beyond [`Invocation::hook_wait_secs`].
@@ -605,7 +611,7 @@ fn tee_reader(
             // signal gh has exited, so what the stream holds is output gh already wrote: scan
             // what can be read at once first, delivering none of it.
             if late {
-                scan_ready(&mut src, which, &scanner, &mut buf);
+                take_ready(&mut src, which, &scanner, None, &mut buf);
             }
             break;
         }
@@ -619,6 +625,10 @@ fn tee_reader(
                 || now.duration_since(at).as_secs_f64() >= TEE_AFTER_EXIT_SECS
                 || after_exit >= TEE_AFTER_EXIT_BYTES
             {
+                // The time since the last read includes any wait in the hook, so gh's own output
+                // may still be unread: take what can be read at once before the rest goes to a
+                // drainer, which does not scan stdout (or, after a late signal, is dropped).
+                take_ready(&mut src, which, &scanner, Some(&tee), &mut buf);
                 held = true;
                 break;
             }
@@ -654,16 +664,27 @@ fn tee_reader(
 }
 
 /// Feed the scanner what `src` holds that can be read without waiting, up to
-/// [`LATE_SCAN_BYTES`]. The hook is called once, at the end of the stream.
-fn scan_ready(src: &mut File, which: Stream, scanner: &Mutex<Scanner>, buf: &mut [u8]) {
+/// [`READY_SCAN_BYTES`], and queue it on `deliver` if given. The hook is not called here: the
+/// reader feeds the end of the stream next, which calls it once if the signals changed.
+fn take_ready(
+    src: &mut File,
+    which: Stream,
+    scanner: &Mutex<Scanner>,
+    deliver: Option<&Tee>,
+    buf: &mut [u8],
+) {
     let fd = src.as_raw_fd();
     let mut total = 0usize;
-    while total < LATE_SCAN_BYTES && readable(fd, 0) {
-        match src.read(buf) {
+    while total < READY_SCAN_BYTES && readable(fd, 0) {
+        let room = buf.len().min(READY_SCAN_BYTES - total);
+        match src.read(&mut buf[..room]) {
             Ok(0) => break,
             Ok(n) => {
                 total += n;
                 let _ = scan(scanner, which, Some(&buf[..n]), false, &mut String::new());
+                if let Some(tee) = deliver {
+                    tee.push(buf[..n].to_vec());
+                }
             }
             Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
             Err(_) => break,
@@ -726,7 +747,8 @@ fn hand_off(src: File, which: Stream, drain: Option<&DrainCommand>) -> bool {
 /// a write fails because the consumer went away. Closing standard input on the way out makes
 /// the descendant's next write fail just as it would have writing to the consumer directly.
 /// stderr is fed to the pushback scanner before each chunk is written, calling `hook` when its
-/// signals change; stdout is copied unscanned, since after gh's exit it holds no HTTP headers.
+/// signals change; stdout is copied unscanned: the reader has already taken what gh wrote (see
+/// [`take_ready`]), and a descendant writes no HTTP headers.
 pub fn drain(which: Stream, hook: Option<&PushbackHook>) -> i32 {
     let scanner = Mutex::new(Scanner::new());
     let mut published = String::new();
