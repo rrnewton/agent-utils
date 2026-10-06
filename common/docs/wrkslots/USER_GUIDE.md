@@ -479,16 +479,33 @@ reading took. Each reading takes the realtime clock between two readings of the 
 which bounds the clocks' offset at that moment; a scheduling pause between the reads widens the
 bounds instead of moving them. A step is assumed when the bounds of the four readings that the two
 reads take span more than half a second, so a fall within either read (before or after its handles)
-or between them counts. A step forward counts too, and so do pauses between the clock reads that
-together widen the bounds past half a second; each keeps the run `alive`. A step back does not show
-if it is undone before a realtime read sees it. Last, the current members of every control group
-named after a handle's unit,
+or between them counts. A step forward or a suspend (the monotonic clock stops while the host
+sleeps) counts too, and so do pauses between the clock reads that together widen the bounds past
+half a second; each keeps the run `alive`. A step back does not show if it is undone, or undone to
+within half a second, before a realtime read sees it. Last, the current members of every control
+group named after a handle's unit,
 and of its descendants, are read from the cgroup v2 hierarchy below the user service manager; a
 member there is `alive`. A host without a cgroup v2 hierarchy at `/sys/fs/cgroup`, whose cgroup v2
 mount there shows only a subtree of the hierarchy (control groups outside it would read as empty),
 with a visible mount below `/sys/fs/cgroup` (a file system over a control group, or a file over its
 `cgroup.procs`, replaces what the hierarchy shows there), whose user service manager's control group
 is not visible there, or with an unreadable member list is `unverifiable`.
+
+These reads find a run from the moment its unit is active or queued, or while the process
+generation its handle records runs. They cannot tell a run whose handle is written before its unit
+is queued from a run that finished: both leave a handle that every read finds alike, with
+no unit, process or member, and waiting longer does not tell them apart. The wait above does not
+either: a handle rewritten alike within its timestamp tick during the wait reads as before. A
+`dead` answer therefore relies on a rule for whatever writes a retained run handle: after each
+write, including one that leaves the bytes alike, the run must be visible to this evidence (its
+unit active or queued, or the process generation that the handle records in `process_identity`,
+its `pid`, `start_ticks` and `boot_id`, running) before the write's change time is two seconds old
+by this host's clock, which can be one second after the write where file times keep whole seconds.
+A launcher meets the rule when it queues the unit before it writes the handle, when it writes the
+handle from inside a unit that is already active or queued and is the handle's unit or names the
+checkout, or when the handle records a process that runs until the unit is queued. A launcher that
+writes the handle and only then queues the unit, with no such process recorded, can have its row
+judged `dead` when the queueing takes longer than that.
 
 `recover-absent-validate-rows` and `recover-absent-agent-rows` read this evidence through the same
 code and in the same order, and refuse wherever the answer above would be `alive` or `unverifiable`:

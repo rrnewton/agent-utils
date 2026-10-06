@@ -626,13 +626,14 @@ _RETAINED_HANDLE_SETTLE_SLACK_NS = 250_000_000
 # back in the timestamp tick of a change time the earlier read found at
 # least ``_RETAINED_HANDLE_STABLE_NS`` old: a step back of more than one
 # second where file times keep whole seconds.  Frequency correction moves
-# both clocks alike; only a step (or an inserted leap second) moves one
-# against the other.  The bound applies to the spread of every offset the
-# two censuses found (``_realtime_clock_stepped_back``), so a step forward,
-# or scheduling pauses between the clock reads that together widen that
-# spread past it, also read as a step; that keeps a run alive rather than
-# clearing its row.  A step back does not show if it is undone before a
-# realtime read sees it.
+# both clocks alike; a step, an inserted leap second, or a suspend (the
+# monotonic clock stops while the host sleeps) moves one against the other.
+# The bound applies to the spread of every offset the two censuses found
+# (``_realtime_clock_stepped_back``), so a step forward, a suspend, or
+# scheduling pauses between the clock reads that together widen that spread
+# past it, also read as a step; that keeps a run alive rather than clearing
+# its row.  A step back does not show if it is undone, or undone to within
+# the bound, before a realtime read sees it.
 _RETAINED_HANDLE_CLOCK_STEP_NS = 500_000_000
 # The bound on one /proc/<pid>/mountinfo read, sized from measurement. On
 # 2026-10-04, at load average about 150, the largest of 4,118 readable tables
@@ -16977,6 +16978,15 @@ def _run_evidence(
     runs reads its evidence here and judges it with ``_judge_run_evidence``:
     the validation-run authority, ``recover-absent-validate-rows`` and
     ``recover-absent-agent-rows``.
+
+    No read here tells a run whose handle is written before its unit is
+    queued from a run that finished: both leave a handle that every read
+    finds alike, with no unit, process or member, and waiting longer does
+    not tell them apart.  A dead answer therefore relies on whatever writes
+    a handle making its run visible here (its unit active or queued, or the
+    process generation the handle records running) before the change time
+    of any write is ``_RETAINED_HANDLE_STABLE_NS`` old.  The user guide
+    states that rule for handle writers.
     """
 
     if first is None:
@@ -17102,7 +17112,11 @@ def _settle_retained_handles(
     and not a refusal.  The wait is at most ``_RETAINED_HANDLE_STABLE_NS``
     and ``_RETAINED_HANDLE_SETTLE_SLACK_NS``; a change time further ahead
     of this host's clock is not waited for, and the handles read again are
-    still recent.
+    still recent.  The wait does not show that a registration it saw has
+    ended: a handle rewritten alike within its timestamp tick during the
+    wait reads as before, so a writer that queues its unit only after the
+    wait is covered by the rule for handle writers in ``_run_evidence``,
+    not by the wait.
     """
 
     changes = [
