@@ -1770,46 +1770,28 @@ fn a_watch_without_the_opt_in_is_refused_before_gh_runs() {
 }
 
 /// gh expands an ordinary alias inside its own process, so the stdin that an alias's
-/// `--input -` sends, or a body file named inside the alias, never reaches a second gh-paced.
-/// gh-paced expands the alias from gh's configuration file and inspects those bodies too.
+/// `--input -` sends, or a body file named inside the alias, would never reach a second
+/// gh-paced. gh-paced expands the alias from gh's configuration file and runs gh with the
+/// expansion, so those bodies are inspected (and body files snapshotted) like typed ones.
 #[test]
 fn an_alias_expansion_has_its_body_inspected() {
     let sb = Sandbox::new("alias-body", FAST);
     let big = sb.path("big.md");
     std::fs::write(&big, "word ".repeat(3000)).unwrap();
-    std::fs::create_dir_all(sb.path("home/.config/gh")).unwrap();
-    std::fs::write(
-        sb.path("home/.config/gh/config.yml"),
-        format!(
-            "version: 1\naliases:\n    upload: api -X POST repos/o/r/issues/$1/comments --input -\n    post: issue comment $1 --body-file {}\n",
-            big.display()
+    let small = sb.path("small.md");
+    std::fs::write(&small, "a short note\n").unwrap();
+    write_gh_config(
+        &sb,
+        &format!(
+            "version: 1\naliases:\n    upload: api -X POST repos/o/r/issues/$1/comments --input -\n    post: issue comment $1 --body-file {}\n    note: issue comment $1 --body-file {}\n",
+            big.display(),
+            small.display()
         ),
-    )
-    .unwrap();
+    );
     let got = sb.path("stdin.out");
-    let got_s = got.display().to_string();
-    let run = |args: &[&str], input: &[u8]| -> Output {
-        let mut child = sb
-            .cmd(args)
-            .env("FAKE_GH_STDIN_FILE", &got_s)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .unwrap();
-        let mut stdin = child.stdin.take().unwrap();
-        let input = input.to_vec();
-        // gh-paced stops reading at the limit, so this write may fail with EPIPE.
-        let writer = std::thread::spawn(move || {
-            let _ = stdin.write_all(&input);
-        });
-        let o = child.wait_with_output().unwrap();
-        writer.join().unwrap();
-        o
-    };
     // 12 KB of JSON on stdin, over the 8 KiB limit.
     let oversized = format!("{{\"body\":\"{}\"}}", "word ".repeat(2400));
-    let o = run(&["upload", "7"], oversized.as_bytes());
+    let o = run_with_stdin(&sb, &got, &["upload", "7"], oversized.as_bytes());
     assert_eq!(o.status.code(), Some(65), "{}", stderr(&o));
     assert!(
         stderr(&o).contains("GH-PACED REFUSED [test]"),
@@ -1817,18 +1799,147 @@ fn an_alias_expansion_has_its_body_inspected() {
         stderr(&o)
     );
     // A 15 KB body file named inside the alias.
-    let o = run(&["post", "7"], b"");
+    let o = run_with_stdin(&sb, &got, &["post", "7"], b"");
     assert_eq!(o.status.code(), Some(65), "{}", stderr(&o));
-    assert!(stderr(&o).contains("alias expansion"), "{}", stderr(&o));
+    assert!(
+        stderr(&o).contains("content guard: write body is 15000 bytes"),
+        "{}",
+        stderr(&o)
+    );
+    // The refusal names the alias it expanded.
+    assert!(stderr(&o).contains("gh alias `post`"), "{}", stderr(&o));
     assert!(sb.starts().is_empty(), "gh ran: {:?}", sb.starts());
-    // A small body passes and reaches gh byte for byte.
+    // A small body passes and reaches gh byte for byte; gh is given the expansion, not the
+    // alias name, so it cannot expand the alias differently.
     let body = b"{\"body\":\"a short prose note\"}\n";
-    let o = run(&["upload", "7"], body);
+    let o = run_with_stdin(&sb, &got, &["upload", "7"], body);
     assert_eq!(o.status.code(), Some(0), "{}", stderr(&o));
     assert_eq!(std::fs::read(&got).unwrap(), body);
     let starts = sb.starts();
     assert_eq!(starts.len(), 1, "{starts:?}");
-    assert_eq!(starts[0].1, "upload 7");
+    assert_eq!(
+        starts[0].1,
+        "api -X POST repos/o/r/issues/7/comments --input -"
+    );
+    // A body file named inside an alias is snapshotted like a typed one: gh reads the copy.
+    let o = run_with_stdin(&sb, &got, &["note", "7"], b"");
+    assert_eq!(o.status.code(), Some(0), "{}", stderr(&o));
+    let starts = sb.starts();
+    assert_eq!(starts.len(), 2, "{starts:?}");
+    assert!(
+        starts[1].1.starts_with("issue comment 7 --body-file "),
+        "{starts:?}"
+    );
+    assert!(
+        !starts[1].1.contains(&small.display().to_string()),
+        "gh read the original file, not the snapshot: {starts:?}"
+    );
+}
+
+fn write_gh_config(sb: &Sandbox, text: &str) {
+    std::fs::create_dir_all(sb.path("home/.config/gh")).unwrap();
+    std::fs::write(sb.path("home/.config/gh/config.yml"), text).unwrap();
+}
+
+/// Run `gh-paced -- args` with `input` on stdin; the fake gh copies its stdin to `got`.
+fn run_with_stdin(sb: &Sandbox, got: &std::path::Path, args: &[&str], input: &[u8]) -> Output {
+    let mut child = sb
+        .cmd(args)
+        .env("FAKE_GH_STDIN_FILE", got)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let input = input.to_vec();
+    // gh-paced stops reading at the limit, so this write may fail with EPIPE.
+    let writer = std::thread::spawn(move || {
+        let _ = stdin.write_all(&input);
+    });
+    let o = child.wait_with_output().unwrap();
+    writer.join().unwrap();
+    o
+}
+
+/// An alias that expands to a watch loop is held to the watch gate: before, gh received the
+/// alias name and polled with nothing counting the requests.
+#[test]
+fn an_alias_to_a_watch_loop_is_refused_like_the_watch() {
+    let sb = Sandbox::new("alias-watch", FAST);
+    write_gh_config(
+        &sb,
+        "aliases:\n  w: run watch 99 --interval 30\n  cw: pr checks 5 --watch\n",
+    );
+    for alias in ["w", "cw"] {
+        let o = sb.run(&[alias], &[]);
+        assert_eq!(o.status.code(), Some(64), "{}", stderr(&o));
+        assert!(
+            stderr(&o).contains("GH_PACED_ALLOW_WATCH=1"),
+            "{}",
+            stderr(&o)
+        );
+        assert!(
+            stderr(&o).contains(&format!("gh alias `{alias}`")),
+            "{}",
+            stderr(&o)
+        );
+    }
+    assert!(sb.starts().is_empty(), "gh ran: {:?}", sb.starts());
+    // With the gate open, gh runs the expanded watch, never the alias name.
+    let o = sb.run(&["w"], &[("GH_PACED_ALLOW_WATCH", "1")]);
+    assert_eq!(o.status.code(), Some(0), "{}", stderr(&o));
+    let starts = sb.starts();
+    assert_eq!(starts.len(), 1, "{starts:?}");
+    assert!(starts[0].1.starts_with("run watch 99"), "{starts:?}");
+}
+
+/// Aliases written as a YAML flow mapping, and aliases reached after a flag that cobra skips
+/// (`issue -R o/r upload`), are found the way gh finds them.
+#[test]
+fn flow_mapping_aliases_and_aliases_after_flags_are_found() {
+    let sb = Sandbox::new("alias-flow", FAST);
+    write_gh_config(
+        &sb,
+        "aliases: {up: 'api -X POST repos/o/r/issues/1/comments --input -',\n  issue upload: issue comment 7 --body-file -}\n",
+    );
+    let got = sb.path("stdin.out");
+    let oversized = format!("{{\"body\":\"{}\"}}", "word ".repeat(2400));
+    for args in [&["up"][..], &["issue", "-R", "o/r", "upload"][..]] {
+        let o = run_with_stdin(&sb, &got, args, oversized.as_bytes());
+        assert_eq!(o.status.code(), Some(65), "{args:?}: {}", stderr(&o));
+    }
+    assert!(sb.starts().is_empty(), "gh ran: {:?}", sb.starts());
+    let o = run_with_stdin(&sb, &got, &["issue", "-R", "o/r", "upload"], b"short\n");
+    assert_eq!(o.status.code(), Some(0), "{}", stderr(&o));
+    assert_eq!(std::fs::read(&got).unwrap(), b"short\n");
+    let starts = sb.starts();
+    assert_eq!(starts.len(), 1, "{starts:?}");
+    assert_eq!(starts[0].1, "issue comment 7 --body-file - -R o/r");
+}
+
+/// When gh's configuration cannot be read, a word that could name an alias is refused with the
+/// configuration exit status, and built-in commands still run.
+#[test]
+fn an_unreadable_gh_configuration_refuses_only_possible_aliases() {
+    let sb = Sandbox::new("alias-unreadable", FAST);
+    write_gh_config(&sb, "aliases:\n  up: !!str api -X POST x --input -\n");
+    let o = sb.run(&["up"], &[]);
+    assert_eq!(o.status.code(), Some(78), "{}", stderr(&o));
+    assert!(
+        stderr(&o).contains("gh's configuration cannot be read"),
+        "{}",
+        stderr(&o)
+    );
+    assert!(sb.starts().is_empty(), "gh ran: {:?}", sb.starts());
+    let o = sb.run(&["pr", "view", "1"], &[]);
+    assert_eq!(o.status.code(), Some(0), "{}", stderr(&o));
+    assert_eq!(sb.starts().len(), 1, "{:?}", sb.starts());
+    // An ambiguous position (a flag of unknown arity before the alias name) is refused too.
+    write_gh_config(&sb, "aliases:\n  issue up: issue comment 7 --body-file -\n");
+    let o = sb.run(&["issue", "--flag", "up", "x"], &[]);
+    assert_eq!(o.status.code(), Some(64), "{}", stderr(&o));
+    assert_eq!(sb.starts().len(), 1, "{:?}", sb.starts());
 }
 
 /// An editor script at a path with a space in it, so the quoting gh-paced adds is exercised. It
