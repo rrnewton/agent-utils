@@ -12,7 +12,9 @@ use crate::config::{ClassLimits, Config};
 use crate::guard::{self, Verdict};
 use crate::pushback::{Pushback, Scanner};
 use crate::ratelimit;
-use crate::runner::{write_stderr_bounded, Exit, Invocation, PushbackHook, Ran, Runner};
+use crate::runner::{
+    write_stderr_bounded, DrainCommand, Exit, Invocation, PushbackHook, Ran, Runner,
+};
 use crate::snapshot;
 use crate::state::{self, Cooldown, Holder, Lease, Paths, State};
 use crate::timefmt::human;
@@ -28,6 +30,11 @@ pub const EXIT_REFUSED: i32 = 75;
 pub const EXIT_CONTENT: i32 = 65;
 /// Exit status for a usage error or a refused command shape (fast watch).
 pub const EXIT_USAGE: i32 = 64;
+
+/// The argument that runs gh-paced as a drainer: `gh-paced --drain ACCOUNT COMMAND STREAM`
+/// (see [`crate::runner::drain`]). COMMAND is the call's command for pushback cooldowns; empty
+/// for a LOCAL call, whose output records no pushback.
+pub const DRAIN_FLAG: &str = "--drain";
 /// Exit status for an internal error (state cannot be locked, read or written).
 pub const EXIT_INTERNAL: i32 = 70;
 /// Exit status when the real gh cannot be run.
@@ -74,6 +81,11 @@ pub struct Wrapper<'a> {
     pub echo: bool,
     /// Every message printed (for tests and for the caller).
     pub messages: Vec<String>,
+    /// Construct with 0. How many of [`Wrapper::messages`] have been written to stderr.
+    /// Messages are queued while the account lock may be held and written only at points where
+    /// it is not (before a sleep, before gh starts, at the end), so a consumer that has stopped
+    /// reading stderr stalls this invocation alone and never the account's other gh calls.
+    pub printed: usize,
     /// gh-paced's stdin is a terminal.
     pub stdin_is_tty: bool,
     /// Reads stdin when the content guard must inspect it.
@@ -98,6 +110,17 @@ pub struct Wrapper<'a> {
     pub start_ticks: u64,
     /// This invocation's random identifier.
     pub nonce: String,
+    /// gh's own command aliases (`alias::load`), so the content guard can inspect the body an
+    /// ordinary alias expansion sends. Empty when gh's configuration has none.
+    pub gh_aliases: Vec<(String, String)>,
+    /// Variables that make gh open its editor through `gh-paced --edit-guard`
+    /// (`editor::guard_env`), added to the environment of every WRITE call while the content
+    /// guard is on, so text gh composes in an editor is checked too. Empty: no editor guard.
+    pub editor_guard_env: Vec<(String, String)>,
+    /// gh-paced's own executable, run as `gh-paced --drain` to keep delivering a stream that a
+    /// process gh started still holds after gh exits (see the runner module). `None`: such a
+    /// stream is closed after the runner's cutoffs, and a warning says later output was lost.
+    pub self_exe: Option<std::path::PathBuf>,
     /// Construct with `None`. Set once a signal arrives while gh's output is still being
     /// delivered: messages are then written to stderr only until this instant, each write given
     /// up when it would wait past it, so a consumer that has stopped reading cannot keep
@@ -148,11 +171,12 @@ struct Admitted {
 /// records the same cooldown in the state file afterwards. True when the record was written.
 pub fn publish_cooldown(
     paths: &Paths,
+    lock_wait_secs: f64,
     now: f64,
     pb: &Pushback,
     command: &str,
 ) -> Result<bool, String> {
-    let _guard = state::lock(paths)?;
+    let _guard = state::lock_within(paths, lock_wait_secs)?;
     let cd = Cooldown {
         until: now + pb.cooldown_secs,
         set_at: now,
@@ -213,18 +237,32 @@ fn paced_api(class: Class) -> bool {
 }
 
 impl Wrapper<'_> {
+    /// Queue one message. [`Wrapper::flush`] writes it to stderr.
     fn emit(&mut self, line: String) {
+        self.messages.push(line);
+    }
+
+    /// Write the queued messages to stderr. Call only where the account lock is not held.
+    fn flush(&mut self) {
+        if self.printed >= self.messages.len() {
+            return;
+        }
         if self.echo {
+            let mut text = String::new();
+            for line in &self.messages[self.printed..] {
+                text.push_str(line);
+                text.push('\n');
+            }
             match self.stderr_deadline {
                 None => {
-                    let _ = writeln!(std::io::stderr(), "{line}");
+                    let _ = std::io::stderr().write_all(text.as_bytes());
                 }
                 Some(deadline) => {
-                    write_stderr_bounded(format!("{line}\n").into_bytes(), deadline);
+                    write_stderr_bounded(text.into_bytes(), deadline);
                 }
             }
         }
-        self.messages.push(line);
+        self.printed = self.messages.len();
     }
 
     fn loud(&mut self, kind: &str, text: &str) {
@@ -285,7 +323,7 @@ impl Wrapper<'_> {
     /// Lock, read the clock, load and reap (removing dead holders' lease files). The time is
     /// read after the lock is held, so it is never older than the state it is applied to.
     fn open_state(&mut self) -> Result<(state::LockGuard, State, f64), String> {
-        let guard = state::lock(&self.paths)?;
+        let guard = state::lock_within(&self.paths, self.cfg.lock_wait_secs)?;
         let now = self.clock.now();
         let cfg = self.cfg.clone();
         let loaded = state::load(&self.paths, now, &|t| recovery_state(&cfg, t));
@@ -324,6 +362,12 @@ impl Wrapper<'_> {
 
     /// Run one gh command line (without the program name).
     pub fn run(&mut self, args: &[String]) -> Outcome {
+        let outcome = self.run_inner(args);
+        self.flush();
+        outcome
+    }
+
+    fn run_inner(&mut self, args: &[String]) -> Outcome {
         let c0 = classify(args, &self.cfg);
         if c0.class == Class::Local {
             return self.spawn(args, None, &c0, Vec::new()).0;
@@ -364,7 +408,7 @@ impl Wrapper<'_> {
             }
             return Outcome::Exit(EXIT_USAGE);
         }
-        let stdin = match self.content_guard(&c, rest, &summary) {
+        let stdin = match self.content_guard(&c, args, rest, &summary) {
             Ok(s) => s,
             Err(code) => return Outcome::Exit(code),
         };
@@ -420,7 +464,7 @@ impl Wrapper<'_> {
     }
 
     fn audit_locked(&mut self, r: &Record) -> Result<(), String> {
-        let _guard = state::lock(&self.paths)?;
+        let _guard = state::lock_within(&self.paths, self.cfg.lock_wait_secs)?;
         self.write_audit(r);
         Ok(())
     }
@@ -432,6 +476,8 @@ impl Wrapper<'_> {
         c: &Classification,
         keep_fds: Vec<RawFd>,
     ) -> (Outcome, Scanner, Option<Ran>) {
+        // Every warning before gh's own output, and never from under the lock.
+        self.flush();
         // One response (no --paginate): only the header block on its first stdout line is read.
         let mut scanner = if c.api.as_ref().is_some_and(|a| a.include && !a.paginate) {
             Scanner::single_response()
@@ -439,7 +485,10 @@ impl Wrapper<'_> {
             Scanner::new()
         };
         let local = c.class == Class::Local;
-        let env = if local { Vec::new() } else { self.child_env() };
+        let mut env = if local { Vec::new() } else { self.child_env() };
+        if c.class == Class::Write && !self.cfg.allow_large_body {
+            env.extend(self.editor_guard_env.iter().cloned());
+        }
         let real_gh = self.real_gh.clone();
         let on_pushback = if local {
             None
@@ -448,10 +497,30 @@ impl Wrapper<'_> {
             Some(PushbackHook(Arc::new(move |s: &Scanner| {
                 if let Some(pb) = s.verdict(&cfg) {
                     // Errors surface later: finish() records the same cooldown and reports them.
-                    let _ = publish_cooldown(&paths, RealClock.now(), &pb, &command);
+                    let _ = publish_cooldown(
+                        &paths,
+                        cfg.lock_wait_secs,
+                        RealClock.now(),
+                        &pb,
+                        &command,
+                    );
                 }
             })))
         };
+        // The drainer records pushback in what it delivers against this call's command; a
+        // LOCAL call records none, as here.
+        let drain = self.self_exe.clone().map(|program| DrainCommand {
+            program,
+            args: vec![
+                DRAIN_FLAG.to_string(),
+                self.paths.account.clone(),
+                if local {
+                    String::new()
+                } else {
+                    c.command.clone()
+                },
+            ],
+        });
         let inv = Invocation {
             program: &real_gh,
             args,
@@ -461,14 +530,29 @@ impl Wrapper<'_> {
             keep_fds,
             scan_stdout: !local && c.api.as_ref().is_some_and(|a| a.include),
             on_pushback,
+            drain,
         };
         match self.runner.run(inv, &mut scanner) {
             Ok(ran) => {
+                if ran.cut_off {
+                    self.loud(
+                        "WARNING",
+                        "a process gh started was still holding gh's output when gh-paced \
+                         stopped reading it, and no drainer could take it over: anything it \
+                         wrote afterwards was lost",
+                    );
+                }
+                if ran.late_signal.is_some() {
+                    // The caller asked gh-paced to stop while gh's output was still being
+                    // delivered, so stderr may be a stalled consumer. Every later message
+                    // (warnings, the PUSHBACK banner, the exit line) gets a bounded write,
+                    // however gh itself ended.
+                    self.stderr_deadline =
+                        Some(Instant::now() + Duration::from_secs_f64(LATE_SIGNAL_STDERR_SECS));
+                }
                 let outcome = match (ran.exit, ran.late_signal) {
                     (Exit::Signal(s), _) => Outcome::Signal(s),
                     (Exit::Code(n), Some(sig)) => {
-                        self.stderr_deadline =
-                            Some(Instant::now() + Duration::from_secs_f64(LATE_SIGNAL_STDERR_SECS));
                         self.loud(
                             "WARNING",
                             &format!(
@@ -512,6 +596,7 @@ impl Wrapper<'_> {
     fn content_guard(
         &mut self,
         c: &Classification,
+        args: &[String],
         rest: &[String],
         summary: &str,
     ) -> Result<Option<Vec<u8>>, i32> {
@@ -537,8 +622,35 @@ impl Wrapper<'_> {
             return Err(EXIT_CONTENT);
         }
         let sources = guard::body_sources(c, rest, self.stdin_is_tty);
+        // gh expands an ordinary alias inside its own process, so the body its expansion sends
+        // (`--input -`, a body file named in the alias) never reaches a second gh-paced. The
+        // expansion is checked on its own, so arguments that appear in both are not counted
+        // twice towards the size limit.
+        let mut expansion = Vec::new();
+        if c.opaque {
+            if let crate::alias::Resolution::Expanded(expanded) =
+                crate::alias::resolve(args, &self.gh_aliases)
+            {
+                match guard::expansion_sources(&expanded, &self.cfg, self.stdin_is_tty) {
+                    Ok(s) => expansion = s,
+                    Err(why) => {
+                        let reason = format!(
+                            "{why}, after this guard would have run, so the body cannot be \
+                             inspected; pass it with --body or --body-file instead"
+                        );
+                        self.refuse_content(c, summary, &reason);
+                        return Err(EXIT_CONTENT);
+                    }
+                }
+            }
+        }
         let mut stdin_buf = None;
-        if sources.iter().any(guard::BodySource::is_stdin) {
+        if sources
+            .iter()
+            .chain(&expansion)
+            .any(guard::BodySource::is_stdin)
+        {
+            self.flush();
             match (self.stdin_reader)(self.cfg.max_body_bytes + 1) {
                 Ok(buf) => stdin_buf = Some(buf),
                 Err(e) => {
@@ -550,13 +662,21 @@ impl Wrapper<'_> {
                 }
             }
         }
-        match guard::evaluate(&sources, &self.cfg, stdin_buf.as_deref()) {
-            Verdict::Allow { .. } => Ok(stdin_buf),
-            Verdict::Refuse(reason) => {
+        for (set, from_alias) in [(&sources, false), (&expansion, true)] {
+            if let Verdict::Refuse(mut reason) =
+                guard::evaluate(set, &self.cfg, stdin_buf.as_deref())
+            {
+                if from_alias {
+                    // The caller passed no body, so say where gh would have read it from.
+                    let flags: Vec<&str> = set.iter().map(|s| s.flag.as_str()).collect();
+                    reason.push_str("; gh would read it from ");
+                    reason.push_str(&flags.join(", "));
+                }
                 self.refuse_content(c, summary, &reason);
-                Err(EXIT_CONTENT)
+                return Err(EXIT_CONTENT);
             }
         }
+        Ok(stdin_buf)
     }
 
     /// Decide, under the lock, whether this pass refreshes the account-wide snapshot. A refresh
@@ -618,6 +738,7 @@ impl Wrapper<'_> {
 
     /// Run the claimed refresh (outside the lock), then record its result under the lock.
     fn run_refresh(&mut self) -> Result<(), String> {
+        self.flush();
         let args = vec!["api".to_string(), "rate_limit".to_string()];
         let real_gh = self.real_gh.clone();
         let result = self.runner.capture(
@@ -630,6 +751,7 @@ impl Wrapper<'_> {
                 keep_fds: Vec::new(),
                 scan_stdout: false,
                 on_pushback: None,
+                drain: None,
             },
             self.cfg.rate_limit_timeout_secs,
         );
@@ -653,6 +775,7 @@ impl Wrapper<'_> {
             api: None,
             rest_start: 1,
             deadline_secs: None,
+            opaque: false,
         };
         let mut r = self.record("refresh", &rc_class, "api rate_limit");
         match result {
@@ -827,6 +950,51 @@ impl Wrapper<'_> {
                     self.loud("WARNING", &text);
                 }
                 halve_noted = true;
+            }
+            // One gh call makes all the requests its cost stands for back to back (pages of a
+            // list, --paginate), and gh-paced cannot space out requests inside one gh call. A
+            // cost above the burst would therefore exceed the burst however long the call
+            // waited, so it is refused. A watch is the exception: its requests are spread over
+            // its poll interval, it is admitted on a full bucket, and the rest of its cost is
+            // charged as debt that later calls repay.
+            if c.deadline_secs.is_none() && f64::from(c.cost) > limits.burst + crate::budget::EPS {
+                if let Err(e) = state::save(&self.paths, &st) {
+                    drop(guard);
+                    self.internal_error("cannot save pacing state", &e);
+                    return Err(EXIT_INTERNAL);
+                }
+                let text = format!(
+                    "`{}` costs {} {} tokens, more than the {} burst of {}{}: one gh call makes \
+                     those requests back to back, and gh-paced cannot space them out",
+                    c.command,
+                    c.cost,
+                    class.name(),
+                    class.name(),
+                    fmt_num(limits.burst),
+                    if halve {
+                        " (halved because the account-wide budget is low)"
+                    } else {
+                        ""
+                    }
+                );
+                self.banner(
+                    "REFUSED",
+                    &[
+                        text.clone(),
+                        format!(
+                            "lower --limit, drop --paginate, split the work into smaller calls, \
+                             or raise the {} burst in the config file",
+                            class.name()
+                        ),
+                        format!("not running `{}` (exit {EXIT_REFUSED})", c.command),
+                    ],
+                );
+                let mut r = self.record("refuse", c, summary);
+                r.rc = Some(EXIT_REFUSED);
+                r.waited_secs = waited;
+                r.detail = text;
+                self.write_audit(&r);
+                return Err(EXIT_REFUSED);
             }
             if let Some(cd) = &st.cooldown {
                 if cd.until > now {
@@ -1047,6 +1215,7 @@ impl Wrapper<'_> {
             r.detail = w.text.clone();
             self.write_audit(&r);
             drop(guard);
+            self.flush();
             self.clock.sleep(w.secs);
             waited += w.secs;
         }
@@ -1098,8 +1267,8 @@ impl Wrapper<'_> {
             .filter(|_| ran.is_some_and(|r| r.deadline_hit))
         {
             let text = format!(
-                "`{}` ran past its {} s budget (its cost of {} tokens covers that many polls at \
-                 the interval given) and was stopped",
+                "`{}` ran past its {} s budget (its cost of {} tokens is estimated to cover \
+                 that many polls at the interval given) and was stopped",
                 c.command,
                 limit.ceil() as i64,
                 c.cost

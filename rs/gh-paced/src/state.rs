@@ -240,8 +240,21 @@ pub struct LockGuard {
     _file: File,
 }
 
-/// Take the account's exclusive lock, blocking until it is free.
+/// How long [`lock`] waits for another process to release the account's lock, seconds. A
+/// holder keeps the lock only for bookkeeping, which takes milliseconds: gh-paced never holds
+/// it while gh runs, while it sleeps, or while it writes to stderr. A wait this long means the
+/// holder is stopped or stuck, and failing (exit 70) is better than hanging every gh call
+/// behind it. `GH_PACED_LOCK_WAIT` and the `lock_wait_secs` setting override it.
+pub const LOCK_WAIT_SECS: f64 = 30.0;
+
+/// Take the account's exclusive lock, waiting at most [`LOCK_WAIT_SECS`] for it.
 pub fn lock(paths: &Paths) -> Result<LockGuard, String> {
+    lock_within(paths, LOCK_WAIT_SECS)
+}
+
+/// Take the account's exclusive lock, waiting at most `wait_secs` for another process to
+/// release it, and fail with an error naming the lock file after that.
+pub fn lock_within(paths: &Paths, wait_secs: f64) -> Result<LockGuard, String> {
     ensure_dir(&paths.dir)?;
     let file = OpenOptions::new()
         .read(true)
@@ -251,15 +264,35 @@ pub fn lock(paths: &Paths) -> Result<LockGuard, String> {
         .mode(0o600)
         .open(paths.lock())
         .map_err(|e| format!("cannot open lock file {}: {e}", paths.lock().display()))?;
+    let wait = if wait_secs.is_finite() {
+        wait_secs.max(0.0)
+    } else {
+        LOCK_WAIT_SECS
+    };
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs_f64(wait);
+    let mut pause = std::time::Duration::from_millis(1);
     loop {
         // SAFETY: flock on a valid, owned file descriptor.
-        let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
+        let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
         if rc == 0 {
             break;
         }
         let err = std::io::Error::last_os_error();
-        if err.kind() != std::io::ErrorKind::Interrupted {
-            return Err(format!("cannot lock {}: {err}", paths.lock().display()));
+        match err.raw_os_error() {
+            Some(libc::EINTR) => continue,
+            Some(libc::EWOULDBLOCK) => {
+                let left = deadline.saturating_duration_since(std::time::Instant::now());
+                if left.is_zero() {
+                    return Err(format!(
+                        "{} is still held by another gh-paced process after {wait} s; that \
+                         process is stopped or stuck (GH_PACED_LOCK_WAIT sets this bound)",
+                        paths.lock().display()
+                    ));
+                }
+                std::thread::sleep(pause.min(left));
+                pause = (pause * 2).min(std::time::Duration::from_millis(50));
+            }
+            _ => return Err(format!("cannot lock {}: {err}", paths.lock().display())),
         }
     }
     Ok(LockGuard { _file: file })

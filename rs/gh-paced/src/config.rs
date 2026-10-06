@@ -42,6 +42,9 @@ pub struct Config {
     pub min_watch_interval_secs: f64,
     /// Longest total time one invocation may sleep before it is refused (exit 75), in seconds.
     pub max_wait_secs: f64,
+    /// Longest wait for another gh-paced process to release the account's state lock before
+    /// failing with exit 70, in seconds (see `state::LOCK_WAIT_SECS`).
+    pub lock_wait_secs: f64,
     /// Cooldown after GitHub reports a rate limit, abuse detection, or HTTP 429, in seconds.
     pub cooldown_secs: f64,
     /// Cooldown after a plain HTTP 403 with no rate-limit wording, in seconds.
@@ -68,6 +71,10 @@ pub struct Config {
     pub allow_large_body: bool,
     /// `GH_PACED_ALLOW_FAST_WATCH=1`: allow watch intervals shorter than the minimum.
     pub allow_fast_watch: bool,
+    /// `GH_PACED_ALLOW_WATCH=1`: run watch loops (`gh pr checks --watch`, `gh run watch`) on an
+    /// estimated charge. Without it they are refused, because gh-paced cannot count the requests
+    /// a watch makes.
+    pub allow_watch: bool,
 }
 
 impl Default for Config {
@@ -98,6 +105,7 @@ impl Default for Config {
             watch_cost: 20,
             min_watch_interval_secs: 30.0,
             max_wait_secs: 900.0,
+            lock_wait_secs: crate::state::LOCK_WAIT_SECS,
             cooldown_secs: 900.0,
             plain_403_cooldown_secs: 900.0,
             rate_limit_refresh_secs: 300.0,
@@ -111,6 +119,7 @@ impl Default for Config {
             display_tz: DisplayTz::UsEastern,
             allow_large_body: false,
             allow_fast_watch: false,
+            allow_watch: false,
         }
     }
 }
@@ -222,6 +231,7 @@ struct FileConfig {
     watch_cost: Option<u32>,
     min_watch_interval_secs: Option<f64>,
     max_wait_secs: Option<f64>,
+    lock_wait_secs: Option<f64>,
     cooldown_secs: Option<f64>,
     plain_403_cooldown_secs: Option<f64>,
     rate_limit_refresh_secs: Option<f64>,
@@ -379,6 +389,9 @@ impl FileConfig {
         }
         if let Some(v) = self.max_wait_secs {
             c.max_wait_secs = finite_at_least("max_wait_secs", v, 0.0)?;
+        }
+        if let Some(v) = self.lock_wait_secs {
+            c.lock_wait_secs = finite_in("lock_wait_secs", v, 0.1, 3600.0)?;
         }
         if let Some(v) = self.cooldown_secs {
             c.cooldown_secs = finite_at_least("cooldown_secs", v, floors::MIN_COOLDOWN_SECS)?;
@@ -542,6 +555,14 @@ fn apply_env(
     if let Some(v) = env_number(env, "GH_PACED_MAX_WAIT")? {
         c.max_wait_secs = v;
     }
+    if let Some(v) = env_number(env, "GH_PACED_LOCK_WAIT")? {
+        if !(0.1..=3600.0).contains(&v) {
+            return Err(format!(
+                "GH_PACED_LOCK_WAIT={v} must be in 0.1..=3600 seconds"
+            ));
+        }
+        c.lock_wait_secs = v;
+    }
     match env("GH_PACED_DISPLAY_TZ").as_deref().map(str::trim) {
         None | Some("") => {}
         Some("US-Eastern") => c.display_tz = DisplayTz::UsEastern,
@@ -554,6 +575,7 @@ fn apply_env(
     }
     c.allow_large_body = env_flag(env, "GH_PACED_ALLOW_LARGE_BODY")?;
     c.allow_fast_watch = env_flag(env, "GH_PACED_ALLOW_FAST_WATCH")?;
+    c.allow_watch = env_flag(env, "GH_PACED_ALLOW_WATCH")?;
     Ok(())
 }
 

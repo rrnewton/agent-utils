@@ -84,7 +84,15 @@ pub struct Classification {
     /// Wall-clock bound for a polling command (watch loops). The wrapper kills the child when it
     /// runs this long, so a loop can never poll beyond the tokens it was charged.
     pub deadline_secs: Option<f64>,
+    /// The command line is not a complete built-in command: an alias, an extension, a
+    /// passthrough command (`extension exec`, `copilot`), an unknown subcommand beneath a group
+    /// (`issue publish`), or an unrecognised flag before the command was complete. Every later
+    /// argument is opaque: inspected as possible body text and redacted in the audit.
+    pub opaque: bool,
 }
+
+/// READ tokens charged for `gh status`: the default READ burst, the most one call may cost.
+pub const STATUS_COST: u32 = 10;
 
 const LOCAL_FAMILIES: &[&str] = &[
     "completion",
@@ -178,28 +186,453 @@ fn is_flag(token: &str) -> bool {
     token.len() > 1 && token.starts_with('-')
 }
 
+/// How a node of gh's command tree treats the word that follows it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NodeKind {
+    /// A command group such as `pr` or `repo autolink`: not runnable. A word that is not one of
+    /// its subcommands names a user alias, because gh adds an alias such as `issue publish` as a
+    /// child of the group it extends (or it names a gh command this table does not know).
+    Group,
+    /// A runnable command: a word after it is an argument.
+    Leaf,
+    /// A runnable command that also has subcommands (`codespace ports`): a known subcommand
+    /// descends, any other word is an argument of the command itself.
+    RunnableGroup,
+    /// A help topic such as `environment`: not runnable and without subcommands, so a word after
+    /// it can only name an alias.
+    Topic,
+    /// A command that turns flag parsing off and hands every later argument to another program
+    /// (`extension exec`, `copilot`). Its arguments are opaque, like an alias's.
+    Passthrough,
+}
+
+/// One command in gh's command tree.
+struct Node {
+    name: &'static str,
+    aliases: &'static [&'static str],
+    kind: NodeKind,
+    children: &'static [Node],
+}
+
+const fn node(
+    name: &'static str,
+    aliases: &'static [&'static str],
+    kind: NodeKind,
+    children: &'static [Node],
+) -> Node {
+    Node {
+        name,
+        aliases,
+        kind,
+        children,
+    }
+}
+
+const fn leaf(name: &'static str) -> Node {
+    node(name, &[], NodeKind::Leaf, &[])
+}
+
+/// A runnable command with cobra aliases, such as `list` (`ls`).
+const fn leaf_a(name: &'static str, aliases: &'static [&'static str]) -> Node {
+    node(name, aliases, NodeKind::Leaf, &[])
+}
+
+const fn group(
+    name: &'static str,
+    aliases: &'static [&'static str],
+    children: &'static [Node],
+) -> Node {
+    node(name, aliases, NodeKind::Group, children)
+}
+
+const fn topic(name: &'static str, aliases: &'static [&'static str]) -> Node {
+    node(name, aliases, NodeKind::Topic, &[])
+}
+
+const LS: &[&str] = &["ls"];
+const NEW: &[&str] = &["new"];
+
+/// gh 2.97.0's built-in command tree, with cobra's own aliases (`ls`, `co`, `new`, `cs`, ...).
+/// Taken from `gh help reference` and gh's hidden commands. A command that is missing here is
+/// treated as opaque (WRITE, every argument inspected and redacted), so an omission costs a
+/// token, never protection; but a group listed as a runnable command would let an alias beneath
+/// it pass as that command's argument, so every command with subcommands is a group.
+const ROOT: &[Node] = &[
+    group(
+        "agent-task",
+        &["agent-tasks", "agent", "agents"],
+        &[leaf("create"), leaf("list"), leaf("view")],
+    ),
+    group(
+        "alias",
+        &[],
+        &[
+            leaf("delete"),
+            leaf("import"),
+            leaf_a("list", LS),
+            leaf("set"),
+        ],
+    ),
+    leaf("api"),
+    group(
+        "attestation",
+        &["at"],
+        &[leaf("download"), leaf("trusted-root"), leaf("verify")],
+    ),
+    group(
+        "auth",
+        &[],
+        &[
+            leaf("login"),
+            leaf("logout"),
+            leaf("refresh"),
+            leaf("setup-git"),
+            leaf("status"),
+            leaf("switch"),
+            leaf("token"),
+            leaf("git-credential"),
+        ],
+    ),
+    leaf("browse"),
+    group("cache", &[], &[leaf("delete"), leaf_a("list", LS)]),
+    group(
+        "codespace",
+        &["cs"],
+        &[
+            leaf("code"),
+            leaf("cp"),
+            leaf("create"),
+            leaf("delete"),
+            leaf("edit"),
+            leaf("jupyter"),
+            leaf_a("list", LS),
+            leaf("logs"),
+            node(
+                "ports",
+                &[],
+                NodeKind::RunnableGroup,
+                &[leaf("forward"), leaf("visibility")],
+            ),
+            leaf("rebuild"),
+            leaf("ssh"),
+            leaf("stop"),
+            leaf("view"),
+        ],
+    ),
+    leaf("completion"),
+    group(
+        "config",
+        &[],
+        &[
+            leaf("clear-cache"),
+            leaf("get"),
+            leaf_a("list", LS),
+            leaf("set"),
+        ],
+    ),
+    node("copilot", &[], NodeKind::Passthrough, &[]),
+    group(
+        "discussion",
+        &[],
+        &[
+            leaf("comment"),
+            leaf("create"),
+            leaf("edit"),
+            leaf_a("list", LS),
+            leaf("view"),
+        ],
+    ),
+    group(
+        "extension",
+        &["extensions", "ext"],
+        &[
+            leaf("browse"),
+            leaf("create"),
+            node("exec", &[], NodeKind::Passthrough, &[]),
+            leaf("install"),
+            leaf_a("list", LS),
+            leaf_a("remove", &["uninstall"]),
+            leaf("search"),
+            leaf("upgrade"),
+        ],
+    ),
+    group(
+        "gist",
+        &[],
+        &[
+            leaf("clone"),
+            leaf_a("create", NEW),
+            leaf("delete"),
+            leaf("edit"),
+            leaf_a("list", LS),
+            leaf("rename"),
+            leaf("view"),
+        ],
+    ),
+    group(
+        "gpg-key",
+        &[],
+        &[leaf("add"), leaf("delete"), leaf_a("list", LS)],
+    ),
+    group(
+        "issue",
+        &[],
+        &[
+            leaf("close"),
+            leaf("comment"),
+            leaf_a("create", NEW),
+            leaf("delete"),
+            leaf("develop"),
+            leaf("edit"),
+            leaf_a("list", LS),
+            leaf("lock"),
+            leaf("pin"),
+            leaf("reopen"),
+            leaf("status"),
+            leaf("transfer"),
+            leaf("unlock"),
+            leaf("unpin"),
+            leaf("view"),
+        ],
+    ),
+    group(
+        "label",
+        &[],
+        &[
+            leaf("clone"),
+            leaf("create"),
+            leaf("delete"),
+            leaf("edit"),
+            leaf_a("list", LS),
+        ],
+    ),
+    leaf("licenses"),
+    group("org", &[], &[leaf_a("list", LS)]),
+    group(
+        "pr",
+        &[],
+        &[
+            leaf_a("checkout", &["co"]),
+            leaf("checks"),
+            leaf("close"),
+            leaf("comment"),
+            leaf_a("create", NEW),
+            leaf("diff"),
+            leaf("edit"),
+            leaf_a("list", LS),
+            leaf("lock"),
+            leaf("merge"),
+            leaf("ready"),
+            leaf("reopen"),
+            leaf("revert"),
+            leaf("review"),
+            leaf("status"),
+            leaf("unlock"),
+            leaf("update-branch"),
+            leaf("view"),
+        ],
+    ),
+    group("preview", &[], &[leaf("prompter")]),
+    group(
+        "project",
+        &[],
+        &[
+            leaf("close"),
+            leaf("copy"),
+            leaf("create"),
+            leaf("delete"),
+            leaf("edit"),
+            leaf("field-create"),
+            leaf("field-delete"),
+            leaf("field-list"),
+            leaf("item-add"),
+            leaf("item-archive"),
+            leaf("item-create"),
+            leaf("item-delete"),
+            leaf("item-edit"),
+            leaf("item-list"),
+            leaf("link"),
+            leaf_a("list", LS),
+            leaf("mark-template"),
+            leaf("unlink"),
+            leaf("view"),
+        ],
+    ),
+    group(
+        "release",
+        &[],
+        &[
+            leaf_a("create", NEW),
+            leaf("delete"),
+            leaf("delete-asset"),
+            leaf("download"),
+            leaf("edit"),
+            leaf_a("list", LS),
+            leaf("upload"),
+            leaf("verify"),
+            leaf("verify-asset"),
+            leaf("view"),
+        ],
+    ),
+    group(
+        "repo",
+        &[],
+        &[
+            leaf("archive"),
+            group(
+                "autolink",
+                &[],
+                &[
+                    leaf_a("create", NEW),
+                    leaf("delete"),
+                    leaf_a("list", LS),
+                    leaf("view"),
+                ],
+            ),
+            leaf("clone"),
+            leaf_a("create", NEW),
+            leaf("delete"),
+            group(
+                "deploy-key",
+                &[],
+                &[leaf("add"), leaf("delete"), leaf_a("list", LS)],
+            ),
+            leaf("edit"),
+            leaf("fork"),
+            group("gitignore", &[], &[leaf_a("list", LS), leaf("view")]),
+            group("license", &[], &[leaf_a("list", LS), leaf("view")]),
+            leaf_a("list", LS),
+            leaf("read-dir"),
+            leaf("read-file"),
+            leaf("rename"),
+            leaf("set-default"),
+            leaf("sync"),
+            leaf("unarchive"),
+            leaf("view"),
+        ],
+    ),
+    group(
+        "ruleset",
+        &["rs"],
+        &[leaf("check"), leaf_a("list", LS), leaf("view")],
+    ),
+    group(
+        "run",
+        &[],
+        &[
+            leaf("cancel"),
+            leaf("delete"),
+            leaf("download"),
+            leaf_a("list", LS),
+            leaf("rerun"),
+            leaf("view"),
+            leaf("watch"),
+        ],
+    ),
+    group(
+        "search",
+        &[],
+        &[
+            leaf("code"),
+            leaf("commits"),
+            leaf("issues"),
+            leaf("prs"),
+            leaf("repos"),
+        ],
+    ),
+    group(
+        "secret",
+        &[],
+        &[
+            leaf_a("delete", &["remove"]),
+            leaf_a("list", LS),
+            leaf("set"),
+        ],
+    ),
+    group(
+        "skill",
+        &["skills"],
+        &[
+            leaf_a("install", &["add"]),
+            leaf_a("list", LS),
+            leaf_a("preview", &["show"]),
+            leaf("publish"),
+            leaf("search"),
+            leaf("update"),
+        ],
+    ),
+    group(
+        "ssh-key",
+        &[],
+        &[leaf("add"), leaf("delete"), leaf_a("list", LS)],
+    ),
+    leaf("status"),
+    group(
+        "variable",
+        &[],
+        &[
+            leaf_a("delete", &["remove"]),
+            leaf("get"),
+            leaf_a("list", LS),
+            leaf("set"),
+        ],
+    ),
+    group(
+        "workflow",
+        &[],
+        &[
+            leaf("disable"),
+            leaf("enable"),
+            leaf_a("list", LS),
+            leaf("run"),
+            leaf("view"),
+        ],
+    ),
+    // Hidden runnable commands.
+    leaf("credits"),
+    leaf("version"),
+    leaf("help"),
+    // Help topics.
+    topic("accessibility", &["a11y"]),
+    topic("actions", &[]),
+    topic("environment", &[]),
+    topic("exit-codes", &[]),
+    topic("formatting", &[]),
+    topic("mintty", &[]),
+    topic("reference", &[]),
+];
+
+/// The command words at the front of a `gh` argument vector, found by walking [`ROOT`].
 struct Lead {
+    /// Canonical command words (`pr checkout` for `pr co`), plus the operation word of
+    /// `auth git-credential`. An alias or extension name is not included (see `opaque_word`).
     words: Vec<String>,
+    /// Index in the argument vector where the arguments after the command begin. For an alias
+    /// or extension, that is just after its name.
     rest: usize,
-    /// Index just after the first command word (where an alias's or extension's own arguments
-    /// begin).
-    after_first: usize,
+    /// The first flag the walk did not recognise, when it stopped there.
     unknown_flag: Option<String>,
+    /// The command line is not a complete built-in command whose flags gh-paced models: an
+    /// alias or extension name, a passthrough command, or an unrecognised flag before the
+    /// command was complete. Its arguments are opaque.
+    opaque: bool,
+    /// The word that named an alias, extension or unknown command.
+    opaque_word: Option<String>,
+    /// The walk ended on a command group without choosing a subcommand (gh prints help).
+    bare_group: bool,
 }
 
-fn wants_third_word(words: &[String]) -> bool {
-    matches!(
-        (words[0].as_str(), words[1].as_str()),
-        ("auth", "git-credential") | ("repo", "autolink") | ("repo", "deploy-key")
-    )
-}
-
-/// Collect the command words (`pr comment`, `auth git-credential get`) and where the rest starts.
+/// Walk gh's command tree the way cobra's `Find` does, skipping the flags gh-paced knows can
+/// appear before the command words (`-R/--repo VALUE`, `--help`, `-h`, `--version`).
 fn lead(args: &[String]) -> Lead {
     let mut words: Vec<String> = Vec::new();
+    let mut children: &[Node] = ROOT;
+    // The root behaves as a group: an unknown first word is an alias or an extension.
+    let mut kind = NodeKind::Group;
     let mut i = 0;
     let mut unknown_flag = None;
-    let mut after_first = None;
+    let mut opaque = false;
+    let mut opaque_word = None;
     while i < args.len() {
         let t = args[i].as_str();
         if is_flag(t) {
@@ -215,30 +648,57 @@ fn lead(args: &[String]) -> Lead {
                 i += 1;
                 continue;
             }
-            unknown_flag = Some(t.to_string());
+            if kind != NodeKind::RunnableGroup {
+                // Before the command is complete, an unknown flag may take the next word as its
+                // value, so what follows cannot be read as command words.
+                unknown_flag = Some(t.to_string());
+                opaque = true;
+            }
             break;
         }
-        words.push(t.to_string());
-        i += 1;
-        if words.len() == 1 {
-            after_first = Some(i);
-        }
-        if words.len() == 1 && NO_SUB_FAMILIES.contains(&words[0].as_str()) {
-            break;
-        }
-        if words.len() == 2 && !wants_third_word(&words) {
-            break;
-        }
-        if words.len() == 3 {
-            break;
+        match children
+            .iter()
+            .find(|n| n.name == t || n.aliases.contains(&t))
+        {
+            Some(n) => {
+                words.push(n.name.to_string());
+                i += 1;
+                kind = n.kind;
+                children = n.children;
+                match n.kind {
+                    NodeKind::Passthrough => {
+                        opaque = true;
+                        break;
+                    }
+                    NodeKind::Leaf => {
+                        if words == ["auth", "git-credential"] {
+                            if let Some(op) = args.get(i).filter(|w| !is_flag(w)) {
+                                words.push(op.clone());
+                                i += 1;
+                            }
+                        }
+                        break;
+                    }
+                    NodeKind::Group | NodeKind::RunnableGroup | NodeKind::Topic => {}
+                }
+            }
+            None if kind == NodeKind::RunnableGroup => break,
+            None => {
+                opaque = true;
+                opaque_word = Some(t.to_string());
+                i += 1;
+                break;
+            }
         }
     }
     let rest = i.min(args.len());
     Lead {
+        bare_group: !opaque && kind == NodeKind::Group && !words.is_empty() && rest == args.len(),
         words,
         rest,
-        after_first: after_first.unwrap_or(rest),
         unknown_flag,
+        opaque,
+        opaque_word,
     }
 }
 
@@ -267,15 +727,17 @@ fn is_help_request(args: &[String]) -> bool {
 /// `--label -dL --limit 1000`, gh reads `-dL` as the label, and gh-paced records both `--limit`
 /// (from `-dL`) and `1000`. A wrong guess can only add a candidate, never hide one; callers
 /// choose the most conservative candidate.
+///
+/// For the same reason a `--` does not stop the scan. gh reads `--` as the end of the flags
+/// only when no flag before it takes it as a value: in `pr list --label -- --limit 1000`, `--`
+/// is the label and gh fetches 1000 items. Values after a real `--` are positional arguments,
+/// so reading them can only add a candidate.
 fn flag_values<'a>(rest: &'a [String], short: Option<char>, long: &str) -> Vec<&'a str> {
     let long_eq = format!("{long}=");
     let mut out = Vec::new();
     let mut i = 0;
     while i < rest.len() {
         let t = rest[i].as_str();
-        if t == "--" {
-            break;
-        }
         if t == long {
             if let Some(v) = rest.get(i + 1) {
                 out.push(v.as_str());
@@ -335,15 +797,22 @@ fn short_group_value(group: &str, target: char) -> GroupValue<'_> {
     GroupValue::Absent
 }
 
-/// Whether a boolean long flag (`--watch`, `--watch=false`) is on, as gh would read it: the last
-/// occurrence wins. A value gh cannot parse as a boolean counts as on (gh exits with an error,
-/// so charging for it costs nothing real).
+/// Whether a boolean long flag (`--watch`, `--watch=false`) may be on, as gh would read it: the
+/// last occurrence wins. A value gh cannot parse as a boolean counts as on (gh exits with an
+/// error, so charging for it costs nothing real).
+///
+/// Each `--` is either the end of the flags or the value of the flag before it, and gh-paced
+/// does not know which flags take a value. So the flag counts as on when it is on just before
+/// any `--` (that `--` ended the flags) or at the end (every `--` was a value).
 fn bool_flag_set(rest: &[String], long: &str) -> bool {
     let long_eq = format!("{long}=");
     let mut on = false;
     for t in rest {
         if t == "--" {
-            break;
+            if on {
+                return true;
+            }
+            continue;
         }
         if t == long {
             on = true;
@@ -417,25 +886,77 @@ fn local(family: &str, sub: Option<String>, command: String, reason: &str) -> Cl
         api: None,
         rest_start: 0,
         deadline_secs: None,
+        opaque: false,
     }
 }
 
 /// Classify a `gh` argument vector (without the `gh` program name).
 pub fn classify(args: &[String], cfg: &Config) -> Classification {
-    let mut c = classify_inner(args, cfg);
+    let lead = lead(args);
+    let mut c = classify_inner(args, &lead, cfg);
+    // For an alias or extension, everything after its name is its own argument list, which may
+    // carry body text, so none of it is treated as a command word.
     c.rest_start = if c.class == Class::Local {
         args.len()
-    } else if is_unknown_command(&c) {
-        // An alias or extension: everything after its name is its own argument list, which may
-        // carry body text, so none of it is treated as a command word.
-        lead(args).after_first
     } else {
-        lead(args).rest
+        lead.rest
     };
     c
 }
 
-fn classify_inner(args: &[String], cfg: &Config) -> Classification {
+/// The verdict for a command line that is not a complete built-in command (see
+/// [`Lead::opaque`]): WRITE, with every later argument opaque.
+fn opaque_command(lead: &Lead) -> Classification {
+    let path = lead.words.join(" ");
+    let mut c = match (&lead.opaque_word, lead.words.first()) {
+        (Some(word), None) => fail_safe(
+            word,
+            None,
+            word.clone(),
+            "unknown command (alias, extension, or new gh command)",
+        ),
+        (Some(word), Some(family)) => {
+            let mut sub: Vec<&str> = lead.words[1..].iter().map(String::as_str).collect();
+            sub.push(word);
+            fail_safe(
+                family,
+                Some(sub.join(" ")),
+                format!("{path} {word}"),
+                &format!(
+                    "`{word}` is not a subcommand of `gh {path}`, so it names an alias (gh adds an alias such as `issue publish` beneath the group it extends) or a gh command this wrapper does not know"
+                ),
+            )
+        }
+        (None, _) if lead.unknown_flag.is_some() => fail_safe(
+            lead.words.first().map_or("", String::as_str),
+            lead.words.get(1).cloned(),
+            if path.is_empty() {
+                "gh".into()
+            } else {
+                path.clone()
+            },
+            &format!(
+                "unrecognised flag {} before the {}",
+                lead.unknown_flag.as_deref().map_or("?".into(), flag_name),
+                if lead.words.is_empty() {
+                    "command"
+                } else {
+                    "subcommand"
+                }
+            ),
+        ),
+        (None, _) => fail_safe(
+            lead.words.first().map_or("", String::as_str),
+            lead.words.get(1).cloned(),
+            path.clone(),
+            "hands every later argument to another program, which may write",
+        ),
+    };
+    c.opaque = true;
+    c
+}
+
+fn classify_inner(args: &[String], lead: &Lead, cfg: &Config) -> Classification {
     if args.is_empty() {
         return local("", None, "gh".into(), "bare gh prints help");
     }
@@ -447,42 +968,35 @@ fn classify_inner(args: &[String], cfg: &Config) -> Classification {
             "prints the local version",
         );
     }
-    if is_help_request(args) {
-        let words: Vec<&str> = args
-            .iter()
-            .take_while(|t| !is_flag(t))
-            .map(String::as_str)
-            .collect();
-        let family = words.first().copied().unwrap_or("");
-        // Only gh's own commands are known to print help for `--help`. An alias or an extension
-        // receives the argument and may do anything with it (an alias ending in `-b` turns it
-        // into a comment body), so those stay WRITE. `gh extension exec` is gh's own command but
-        // turns flag parsing off and hands every later argument, `--help` included, to the
-        // extension, so it stays WRITE too.
-        let runs_extension = family == "extension" && words.get(1).copied() == Some("exec");
-        if is_known_family(family) && !runs_extension {
-            return local(
-                family,
-                None,
-                format!("{} --help", words.join(" ")).trim().to_string(),
-                "help output is local",
-            );
-        }
+    // Checked before help and before the local families: `gh issue publish --help`,
+    // `gh config publish` and `gh --help publish` run a user alias named `publish`, which receives
+    // `--help` as an argument and may do anything with it (an alias ending in `-b` turns it into a
+    // comment body). `gh extension exec` and `gh copilot` hand `--help` to another program.
+    if lead.opaque {
+        return opaque_command(lead);
     }
-    let lead = lead(args);
-    let rest = &args[lead.rest..];
     let words = &lead.words;
-    let Some(family) = words.first().map(String::as_str) else {
-        return fail_safe(
-            "",
+    if is_help_request(args) {
+        // The whole command path is one of gh's own commands, which print help for `--help`.
+        return local(
+            words.first().map_or("", String::as_str),
             None,
-            "gh".into(),
-            &format!(
-                "unrecognised flag {} before the command",
-                lead.unknown_flag.as_deref().map_or("?".into(), flag_name)
-            ),
+            format!("{} --help", words.join(" ")).trim().to_string(),
+            "help output is local",
         );
+    }
+    let rest = &args[lead.rest..];
+    let Some(family) = words.first().map(String::as_str) else {
+        return fail_safe("", None, "gh".into(), "no command");
     };
+    if lead.bare_group {
+        return local(
+            family,
+            None,
+            words.join(" "),
+            "a command group without a subcommand prints help",
+        );
+    }
     if LOCAL_FAMILIES.contains(&family) {
         return local(
             family,
@@ -515,28 +1029,26 @@ fn classify_inner(args: &[String], cfg: &Config) -> Classification {
         );
     }
     if family == "status" {
+        // Its searches are GraphQL `search` queries, which draw on the GraphQL points that READ
+        // tracks (as `gh api graphql` and `pr list --search` do), not on the REST search limit;
+        // its other requests are REST reads (notifications, events), more when there are many
+        // notifications. Charged the whole default READ burst, the most one call may cost.
         return paced(
-            Class::Search,
-            3,
+            Class::Read,
+            STATUS_COST,
             family,
             None,
             "status".into(),
-            "gh status runs several search and GraphQL queries (charged 3 search tokens)",
+            "gh status makes several GraphQL and REST read requests (charged the 10-token read burst)",
         );
     }
     let Some(raw_sub) = words.get(1).map(String::as_str) else {
-        if let Some(flag) = &lead.unknown_flag {
-            return fail_safe(
-                family,
-                None,
-                family.to_string(),
-                &format!(
-                    "unrecognised flag {} before the subcommand",
-                    flag_name(flag)
-                ),
-            );
-        }
-        return fail_safe(family, None, family.to_string(), "unknown command");
+        return fail_safe(
+            family,
+            None,
+            family.to_string(),
+            "command that may contact GitHub",
+        );
     };
     let sub = normalize_sub(raw_sub);
     let command = format!("{family} {sub}");
@@ -622,31 +1134,26 @@ fn classify_inner(args: &[String], cfg: &Config) -> Classification {
         apply_watch(&mut c, rest, cfg);
         return c;
     }
-    let known_family = !read_subs(family).is_empty() || family == "auth";
-    if known_family {
-        return fail_safe(
-            family,
-            sub_owned,
-            command,
-            "subcommand that may create or change content",
-        );
-    }
-    // The second word of an alias or extension is an argument of unknown meaning (it may be a
-    // comment body or a token), so it is kept out of the command description and the audit.
+    // Every path that reaches here is one of gh's own commands (an alias or an extension was
+    // handled by `opaque_command`).
     fail_safe(
         family,
-        None,
-        family.to_string(),
-        "unknown command (alias, extension, or new gh command)",
+        sub_owned,
+        words.join(" "),
+        "subcommand that may create or change content",
     )
 }
 
-/// True when `c` is an alias, an extension, or a gh command this classifier does not know. The
-/// audit then records flag names only and replaces every other argument with `<arg>`.
+/// True when the arguments of `c` must be treated as opaque: `c` is an alias, an extension, a
+/// passthrough or unknown command ([`Classification::opaque`]), or one of gh's own commands in a
+/// family whose flags this classifier does not model (`discussion`, `skill`, `codespace`, ...).
+/// Every argument is then inspected as possible body text, gh's last-wins rule is not applied,
+/// and the audit records flag names only, replacing every other argument with `<arg>`.
 pub fn is_unknown_command(c: &Classification) -> bool {
-    c.class != Class::Local
-        && c.family != "api"
-        && (c.family.is_empty() || !is_known_family(&c.family))
+    c.opaque
+        || (c.class != Class::Local
+            && c.family != "api"
+            && (c.family.is_empty() || !is_known_family(&c.family)))
 }
 
 fn paced(
@@ -669,6 +1176,7 @@ fn paced(
         api: None,
         rest_start: 0,
         deadline_secs: None,
+        opaque: false,
     }
 }
 
@@ -723,6 +1231,10 @@ fn apply_limit_cost(c: &mut Classification, rest: &[String]) {
 /// A run with more than 100 jobs, or with several jobs that fail during the watch, can make more
 /// requests than it paid for before the deadline stops it. The deadline still bounds the run's
 /// wall time, and the interval floor bounds its request rate.
+///
+/// Because gh-paced cannot count those requests, a watch is refused unless
+/// `GH_PACED_ALLOW_WATCH=1` accepts the estimate. Polling with repeated plain calls instead
+/// (`gh pr checks`, `gh run view`) is paced call by call.
 fn apply_watch(c: &mut Classification, rest: &[String], cfg: &Config) {
     let (is_watch, default_interval, startup, requests_per_poll) =
         match (c.family.as_str(), c.sub.as_deref()) {
@@ -765,6 +1277,17 @@ fn apply_watch(c: &mut Classification, rest: &[String], cfg: &Config) {
             c.command, cfg.min_watch_interval_secs, cfg.min_watch_interval_secs
         ));
     }
+    if !cfg.allow_watch {
+        let mut text = format!(
+            "{} polls GitHub inside one gh call, and gh-paced cannot count the requests each poll makes (more than 100 jobs or checks, or failing jobs, add requests), so it cannot hold the call to what it charged. Poll with repeated plain calls instead, each of which is paced: run `gh pr checks <pr>` or `gh run view <run>` about once a minute in a loop. Or set GH_PACED_ALLOW_WATCH=1 to accept the estimated charge of {} read tokens and the {deadline} s deadline",
+            c.command, c.cost
+        );
+        if let Some(other) = c.refusal.take() {
+            text.push_str("; also, ");
+            text.push_str(&other);
+        }
+        c.refusal = Some(text);
+    }
 }
 
 /// Normalise an API endpoint: drop scheme and host, the leading slash, and the query string.
@@ -791,11 +1314,11 @@ pub struct ApiArgs {
     pub typed_fields: Vec<String>,
     /// `--input FILE` (`-` = stdin).
     pub input: Option<String>,
-    /// `--paginate`.
+    /// `--paginate`, as gh resolves it (`--paginate=false` and a later false value turn it off).
     pub paginate: bool,
-    /// `--slurp`.
+    /// `--slurp`, resolved the same way.
     pub slurp: bool,
-    /// `-i/--include`.
+    /// `-i/--include`, resolved the same way (`-i=false` is off).
     pub include: bool,
     /// Positional arguments; the first is the endpoint.
     pub positionals: Vec<String>,
@@ -858,10 +1381,15 @@ pub fn parse_api(rest: &[String]) -> ApiArgs {
                 };
                 api_store(&mut a, name, value);
             } else if API_BOOL_LONG.contains(&name) {
+                // pflag: `--flag` is true, `--flag=VALUE` is VALUE, and the last one wins. A
+                // value gh cannot read as a boolean counts as true (gh rejects it anyway).
+                let on = inline
+                    .as_deref()
+                    .is_none_or(|v| crate::guard::parse_go_bool(v) != Some(false));
                 match name {
-                    "paginate" => a.paginate = true,
-                    "slurp" => a.slurp = true,
-                    "include" => a.include = true,
+                    "paginate" => a.paginate = on,
+                    "slurp" => a.slurp = on,
+                    "include" => a.include = on,
                     _ => {}
                 }
             } else if a.unknown.is_none() {
@@ -886,8 +1414,18 @@ pub fn parse_api(rest: &[String]) -> ApiArgs {
                     api_store(&mut a, &c.to_string(), value);
                     break;
                 } else if API_BOOL_SHORT.contains(&c) {
+                    // pflag gives a boolean shorthand followed by `=` the rest of the token as
+                    // its value (`-i=false`); otherwise the shorthand is true.
+                    let inline: Option<String> =
+                        (chars.get(j + 1) == Some(&'=')).then(|| chars[j + 2..].iter().collect());
+                    let on = inline
+                        .as_deref()
+                        .is_none_or(|v| crate::guard::parse_go_bool(v) != Some(false));
                     if c == 'i' {
-                        a.include = true;
+                        a.include = on;
+                    }
+                    if inline.is_some() {
+                        break;
                     }
                     j += 1;
                 } else {
@@ -1113,6 +1651,16 @@ mod tests {
         classify(&args, &Config::default())
     }
 
+    /// `cls` with watches allowed (`GH_PACED_ALLOW_WATCH=1`), so the interval checks show.
+    fn clsw(line: &str) -> Classification {
+        let args: Vec<String> = line.split_whitespace().map(str::to_string).collect();
+        let cfg = Config {
+            allow_watch: true,
+            ..Config::default()
+        };
+        classify(&args, &cfg)
+    }
+
     fn class_of(line: &str) -> Class {
         cls(line).class
     }
@@ -1170,6 +1718,70 @@ mod tests {
         // gh's own extension subcommands still print help locally.
         assert_eq!(class_of("extension list --help"), Class::Local);
         assert_eq!(class_of("extension --help"), Class::Local);
+    }
+
+    #[test]
+    fn compound_aliases_and_passthrough_commands_are_opaque() {
+        // gh adds a user alias such as `issue publish` as a child of the group it extends, so a
+        // word that is not one of the group's subcommands runs an alias, which receives `--help`
+        // as an argument. cobra strips flags while it looks for the command, so `gh --help
+        // publish` and `gh pr --help publish` run the aliases `publish` and `pr publish`.
+        for line in [
+            "issue publish --help",
+            "issue publish -h",
+            "issue -R o/r publish --help",
+            "pr --help publish",
+            "--help publish",
+            "config publish x",
+            "config publish --help",
+            "alias publish",
+            "environment publish",
+            "mintty publish --help",
+            "repo autolink publish --help",
+            "extension exec my-ext --help",
+            "ext exec my-ext",
+            "copilot --help",
+        ] {
+            let c = cls(line);
+            assert_eq!(c.class, Class::Write, "{line:?}");
+            assert!(c.opaque, "{line:?}");
+            assert!(is_unknown_command(&c), "{line:?}");
+        }
+        let c = cls("issue publish BODY words");
+        assert_eq!(c.command, "issue publish");
+        assert_eq!(c.rest_start, 2);
+        let c = cls("extension exec my-ext --body=x");
+        assert_eq!(c.command, "extension exec");
+        assert_eq!(c.rest_start, 2);
+        // gh's own commands are unchanged.
+        for line in [
+            "issue --help",
+            "issue list --help",
+            "config get editor",
+            "config --help",
+            "alias set co x",
+            "environment",
+            "pr",
+            "repo autolink",
+            "pr -R o/r",
+        ] {
+            let c = cls(line);
+            assert_eq!(c.class, Class::Local, "{line:?}");
+            assert!(!c.opaque, "{line:?}");
+        }
+        // A runnable command's argument is not an alias, even beneath a runnable group.
+        let c = cls("codespace ports 8080");
+        assert!(!c.opaque);
+        assert_eq!(
+            cls("codespace ports forward 1:2").command,
+            "codespace ports forward"
+        );
+        assert!(!cls("pr view publish").opaque);
+        // cobra's own aliases resolve to the command they name.
+        assert_eq!(class_of("cs list"), Class::Read);
+        assert_eq!(cls("rs view 1").command, "ruleset view");
+        assert_eq!(cls("issue ls").command, "issue list");
+        assert!(!cls("secret remove NAME").opaque);
     }
 
     #[test]
@@ -1246,11 +1858,14 @@ mod tests {
             "api search/issues?q=foo",
             "api -X GET search/code -f q=bar",
             "extension search thing",
-            "status",
         ] {
             assert_eq!(class_of(line), Class::Search, "{line:?}");
         }
-        assert_eq!(cls("status").cost, 3);
+        // `gh status` searches through GraphQL, like `gh api graphql`, so it is READ; it was
+        // SEARCH/3, which the burst rule (cost above the SEARCH burst of 2) refused outright.
+        let status = cls("status");
+        assert_eq!((status.class, status.cost), (Class::Read, STATUS_COST));
+        assert!(STATUS_COST as f64 <= Config::default().read.burst);
     }
 
     #[test]
@@ -1408,14 +2023,14 @@ mod tests {
         assert_eq!(cls("pr list --limit 1 --limit 1000").cost, 10);
         assert_eq!(cls("pr list --limit 1000 --limit 1").cost, 10);
         assert_eq!(cls("pr list -L 1 --limit=1000").cost, 10);
-        assert!(cls("run watch 1 --interval 30 --interval 1")
+        assert!(clsw("run watch 1 --interval 30 --interval 1")
             .refusal
             .is_some());
-        assert!(cls("run watch 1 -i 1 --interval 30").refusal.is_some());
-        assert!(cls("pr checks 1 --watch --interval 60 -i 2")
+        assert!(clsw("run watch 1 -i 1 --interval 30").refusal.is_some());
+        assert!(clsw("pr checks 1 --watch --interval 60 -i 2")
             .refusal
             .is_some());
-        assert!(cls("run watch 1 -i 30 --interval 45").refusal.is_none());
+        assert!(clsw("run watch 1 -i 30 --interval 45").refusal.is_none());
     }
 
     /// gh sleeps `interval` seconds and honours the last value; zero or a negative value means
@@ -1435,12 +2050,13 @@ mod tests {
             "pr checks 1 --watch --interval 60 --interval -1",
             "pr checks 1 --watch -i -1",
         ] {
-            let c = cls(line);
+            let c = clsw(line);
             assert!(c.refusal.is_some(), "{line:?} must be refused");
         }
         // The fast-watch override allows a short interval, never a non-positive one.
         let cfg = Config {
             allow_fast_watch: true,
+            allow_watch: true,
             ..Config::default()
         };
         let argv = |line: &str| -> Vec<String> { line.split(' ').map(String::from).collect() };
@@ -1461,8 +2077,8 @@ mod tests {
         assert_eq!(cls("pr list -dL 1000").cost, 10);
         assert_eq!(cls("run list -aL1000").cost, 10);
         assert_eq!(cls("run list -aL=1000").cost, 10);
-        assert!(cls("pr checks 1 --watch -i 60 -wi1").refusal.is_some());
-        assert!(cls("run watch 1 --interval 60 -xi -1").refusal.is_some());
+        assert!(clsw("pr checks 1 --watch -i 60 -wi1").refusal.is_some());
+        assert!(clsw("run watch 1 --interval 60 -xi -1").refusal.is_some());
         // `-R` takes the rest of the token as the repository, so `L` there is not a flag.
         assert_eq!(cls("pr list -RL1000/x").cost, 1);
         // `=` gives the rest of the token to the letter before it.
@@ -1514,21 +2130,21 @@ mod tests {
 
     #[test]
     fn watch_loops_are_charged_and_fast_ones_refused() {
-        let c = cls("pr checks 12 --watch");
+        let c = clsw("pr checks 12 --watch");
         assert_eq!(c.cost, 20);
         assert!(c.refusal.is_some(), "default 10 s interval is too fast");
-        let c = cls("pr checks 12 --watch --interval 60");
+        let c = clsw("pr checks 12 --watch --interval 60");
         assert!(c.refusal.is_none());
         assert_eq!(c.cost, 20);
-        let c = cls("run watch 99");
+        let c = clsw("run watch 99");
         assert!(c.refusal.is_some(), "default 3 s interval is too fast");
-        let c = cls("run watch 99 -i 30");
+        let c = clsw("run watch 99 -i 30");
         assert!(c.refusal.is_none());
         // 20 tokens: 2 for startup, then 4 polls of 4 requests each, 30 s apart: 120 s.
         assert_eq!(c.deadline_secs, Some(120.0));
         // 20 tokens: 2 for startup, then 9 polls of 2 requests each, 30 s apart: 270 s.
         assert_eq!(
-            cls("pr checks 12 --watch --interval 30").deadline_secs,
+            clsw("pr checks 12 --watch --interval 30").deadline_secs,
             Some(270.0)
         );
         let c = cls("pr checks 12");
@@ -1550,7 +2166,7 @@ mod tests {
             "pr checks 12 --watch=true",
             "pr checks 12 --watch=maybe",
         ] {
-            let c = cls(line);
+            let c = clsw(line);
             assert_eq!(c.cost, 20, "{line:?}");
             assert!(
                 c.refusal.is_some(),
@@ -1560,6 +2176,7 @@ mod tests {
         assert_eq!(cls("pr view 12").deadline_secs, None);
         let cfg = Config {
             allow_fast_watch: true,
+            allow_watch: true,
             ..Config::default()
         };
         let args: Vec<String> = ["run", "watch", "1"]
@@ -1651,5 +2268,92 @@ mod tests {
         assert!(contains_word("mutation{x}", "mutation"));
         assert!(!contains_word("query { mutations }", "mutation"));
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// gh-paced cannot count the requests a watch makes, so a watch is refused unless
+    /// `GH_PACED_ALLOW_WATCH=1` accepts the estimate. The charge and deadline are still worked
+    /// out so the refusal can name them; a plain `pr checks` is untouched.
+    #[test]
+    fn watches_need_an_explicit_opt_in() {
+        for line in [
+            "pr checks 12 --watch --interval 60",
+            "run watch 99 -i 30",
+            "run watch 99",
+        ] {
+            let c = cls(line);
+            let refusal = c.refusal.as_deref().unwrap_or_default();
+            assert!(
+                refusal.contains("GH_PACED_ALLOW_WATCH=1"),
+                "{line:?}: {refusal}"
+            );
+            assert!(
+                refusal.contains("cannot count the requests"),
+                "{line:?}: {refusal}"
+            );
+            assert_eq!(c.cost, 20, "{line:?}");
+            assert!(c.deadline_secs.is_some(), "{line:?}");
+            assert!(clsw(&format!("{line} -i 30")).refusal.is_none(), "{line:?}");
+        }
+        // A too-fast interval is reported alongside, so one retry fixes both.
+        let refusal = cls("run watch 99").refusal.unwrap();
+        assert!(
+            refusal.contains("faster than the 30 s minimum"),
+            "{refusal}"
+        );
+        let c = cls("pr checks 12");
+        assert_eq!((c.cost, c.deadline_secs, c.refusal), (1, None, None));
+    }
+
+    /// A `--` can be another flag's value (`--label --`), and gh then reads the flags after it.
+    /// gh-paced does not know which flags take a value, so it reads past every `--`.
+    #[test]
+    fn a_double_dash_flag_value_does_not_hide_later_flags() {
+        assert_eq!(cls("pr list --label -- --limit 1000").cost, 10);
+        assert_eq!(cls("pr list --search -- -L1000").cost, 10);
+        assert_eq!(cls("issue list --label -- --limit=250").cost, 3);
+        // `--repo --` takes the `--`, so `--watch` after it is a real flag.
+        let c = cls("pr checks 12 --repo -- --watch --interval 60");
+        assert_eq!(c.cost, 20);
+        assert!(c.deadline_secs.is_some());
+        // A watch that is on before a `--` stays on whatever follows, since that `--` may end
+        // the flags.
+        let c = cls("pr checks 12 --watch --interval 60 -- --watch=false");
+        assert!(c.deadline_secs.is_some());
+        // Off everywhere is still off.
+        let c = cls("pr checks 12 -- --watch=false");
+        assert_eq!((c.cost, c.deadline_secs), (1, None));
+    }
+
+    /// pflag resolves `--paginate=false`, `--include=false` and `-i=false` to false, and the
+    /// last occurrence wins.
+    #[test]
+    fn api_booleans_honour_explicit_false_values() {
+        let args = |line: &str| -> Vec<String> { line.split(' ').map(String::from).collect() };
+        for line in [
+            "api --paginate=false repos/o/r/issues",
+            "api --paginate --paginate=false repos/o/r/issues",
+            "api --paginate=0 --slurp=false repos/o/r/issues",
+        ] {
+            let c = cls(line);
+            assert_eq!((c.class, c.cost), (Class::Read, 1), "{line:?}");
+        }
+        assert_eq!(
+            cls("api --paginate=false --paginate repos/o/r/issues").cost,
+            10
+        );
+        assert_eq!(cls("api --paginate=maybe repos/o/r/issues").cost, 10);
+        assert!(!parse_api(&args("--include=false repos/o/r")).include);
+        assert!(!parse_api(&args("--include --include=false repos/o/r")).include);
+        assert!(parse_api(&args("--include=false --include repos/o/r")).include);
+        let a = parse_api(&args("-i=false repos/o/r"));
+        assert!(!a.include);
+        assert_eq!(a.unknown, None);
+        assert_eq!(a.positionals, ["repos/o/r"]);
+        let c = cls("api -i=false repos/o/r");
+        assert_eq!((c.class, c.cost), (Class::Read, 1));
+        assert!(parse_api(&args("-i=true repos/o/r")).include);
+        assert!(parse_api(&args("-i repos/o/r")).include);
+        // `-hi=false`: help, then include false.
+        assert!(!parse_api(&args("-hi=false repos/o/r")).include);
     }
 }
