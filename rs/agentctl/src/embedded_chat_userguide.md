@@ -1240,8 +1240,11 @@ keep, such as one with a line break, leaves the operation unresolved and is a
 failure of class `provider_receipt_invalid`. A send the helper refuses as not
 applied and not retryable answers that one operation and changes neither. A
 record that cannot be read does not stop a scan from keeping the others in
-`delivery-alarm.json` current: it keeps the value last written for it, and
-the service logs the problem. For a failing path the record
+`delivery-alarm.json` current, and the service logs the problem. The record
+keeps the value the service last read for it; when it has read none yet, as
+after a restart, the value `delivery-alarm.json` already holds; and when
+there is neither, the file lists it in `unreadable_records`, by file name,
+instead of reporting it clear. For a failing path the record
 holds `down_since_millis`, when its first failure in a row happened;
 `failures`, how many in a row; `last_failure_at_millis`; `last_error_class`,
 the helper's failure code for a send, such as `provider_authorization`, or for

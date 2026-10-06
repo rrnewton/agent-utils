@@ -146,12 +146,12 @@ const MAX_RECEIPT_REACTION_ERROR_BYTES: usize = 2_000;
 // The schema of `receipt-reactions-lost.json`, which counts the ✅ reactions lost because
 // `MAX_RECEIPT_REACTIONS` were already waiting: see `ReceiptReactionLoss`.
 const RECEIPT_REACTION_LOSS_SCHEMA: &str = "agentctl-chat-receipt-reactions-lost/v1";
-const RECEIPT_REACTION_LOSS_FILE: &str = "receipt-reactions-lost.json";
+pub(crate) const RECEIPT_REACTION_LOSS_FILE: &str = "receipt-reactions-lost.json";
 const MAX_RECEIPT_REACTION_LOSS_BYTES: usize = 4 * 1_024;
 // The schema of `receipt-reactions-refused.json`, which counts the ✅ reactions the outbound helper
 // refused as not applied and not retryable: see `ReceiptReactionRefusal`.
 const RECEIPT_REACTION_REFUSAL_SCHEMA: &str = "agentctl-chat-receipt-reactions-refused/v1";
-const RECEIPT_REACTION_REFUSAL_FILE: &str = "receipt-reactions-refused.json";
+pub(crate) const RECEIPT_REACTION_REFUSAL_FILE: &str = "receipt-reactions-refused.json";
 // Room for the largest refusal record: JSON spells a control character in six bytes, so the
 // saved reason may take six times its own size.
 const MAX_RECEIPT_REACTION_REFUSAL_BYTES: usize = 64 * 1_024;
@@ -160,7 +160,7 @@ const _: () =
 // The schema of `provider-health.json`, which records whether the provider subscription and the
 // outbound send path are failing: see `ProviderHealthRecord`.
 const PROVIDER_HEALTH_SCHEMA: &str = "agentctl-chat-provider-health/v1";
-const PROVIDER_HEALTH_FILE: &str = "provider-health.json";
+pub(crate) const PROVIDER_HEALTH_FILE: &str = "provider-health.json";
 const MAX_PROVIDER_ERROR_BYTES: usize = 2_000;
 const MAX_PROVIDER_ERROR_CLASS_BYTES: usize = 200;
 // Room for the largest record: two paths, each with an error and its class, which JSON may spell
@@ -2254,12 +2254,21 @@ impl PathFailure {
 
 /// The paths that are down, as `chat status` and `delivery-alarm.json` report them: those whose
 /// failure [`PathFailure::alarming`] says to report.
-#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub(crate) struct ProviderDown {
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) subscription_down: Option<PathFailure>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) send_path_down: Option<PathFailure>,
+}
+
+/// What `delivery-alarm.json` last recorded for the records a scan reads: see
+/// [`BridgeState::persisted_alarm_parts`].
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub(crate) struct PersistedAlarmParts {
+    pub(crate) lost: LostReceiptReactions,
+    pub(crate) refused: RefusedReceiptReactions,
+    pub(crate) provider: ProviderDown,
 }
 
 /// The class [`PathFailure::last_error_class`] records for a subscription failure `error`.
@@ -2324,6 +2333,9 @@ struct DeliveryAlarmDocument<'a> {
     receipt_reactions_refused: Option<&'a RefusedReceiptReactions>,
     #[serde(flatten)]
     provider: &'a ProviderDown,
+    /// The records this scan could not read and had no earlier value for.
+    #[serde(skip_serializing_if = "<[&str]>::is_empty")]
+    unreadable_records: &'a [&'a str],
 }
 
 /// A ✅ receipt reaction that a request earned and that is not on its message yet, saved as
@@ -5462,14 +5474,16 @@ impl BridgeState {
     }
 
     /// Replace `delivery-alarm.json` in the state directory with `alarm`, `lost` once any ✅
-    /// receipt reaction was lost, `refused` once the outbound helper refused any, and each
-    /// provider path that `provider` reports down.
+    /// receipt reaction was lost, `refused` once the outbound helper refused any, each
+    /// provider path that `provider` reports down, and the names of the records in `unreadable`
+    /// that could not be read and had no earlier value.
     pub(crate) fn write_delivery_alarm(
         &self,
         alarm: &DeliveryAlarm,
         lost: &LostReceiptReactions,
         refused: &RefusedReceiptReactions,
         provider: &ProviderDown,
+        unreadable: &[&str],
     ) -> Result<()> {
         write_document(
             &self.root.join(DELIVERY_ALARM_FILE),
@@ -5478,8 +5492,39 @@ impl BridgeState {
                 receipt_reactions_lost: (lost.count > 0).then_some(lost),
                 receipt_reactions_refused: (refused.count > 0).then_some(refused),
                 provider,
+                unreadable_records: unreadable,
             },
         )
+    }
+
+    /// What `delivery-alarm.json` last recorded for the lost and refused ✅ reactions and the
+    /// provider paths, or `None` when the file is missing or cannot be read. A scan falls back on
+    /// it for a record it cannot read when it has read no value of its own yet, as after a
+    /// restart, so the alarm does not drop what it last reported.
+    pub(crate) fn persisted_alarm_parts(&self) -> Option<PersistedAlarmParts> {
+        let document: Value = read_document(&self.root.join(DELIVERY_ALARM_FILE), 1 << 20).ok()?;
+        fn part<T: for<'de> Deserialize<'de>>(document: &Value, name: &str) -> Option<Option<T>> {
+            match document.get(name) {
+                None | Some(Value::Null) => Some(None),
+                Some(value) => serde_json::from_value(value.clone()).ok().map(Some),
+            }
+        }
+        let provider = ProviderDown {
+            subscription_down: part::<PathFailure>(&document, "subscription_down")?,
+            send_path_down: part::<PathFailure>(&document, "send_path_down")?,
+        };
+        if [&provider.subscription_down, &provider.send_path_down]
+            .into_iter()
+            .flatten()
+            .any(|failure| !failure.valid())
+        {
+            return None;
+        }
+        Some(PersistedAlarmParts {
+            lost: part(&document, "receipt_reactions_lost")?.unwrap_or_default(),
+            refused: part(&document, "receipt_reactions_refused")?.unwrap_or_default(),
+            provider,
+        })
     }
 
     /// Read `provider-health.json`, if a provider path has failed. The caller holds the state
