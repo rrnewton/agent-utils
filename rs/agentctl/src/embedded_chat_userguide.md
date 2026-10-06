@@ -1235,8 +1235,13 @@ subscription fails each time a provider generation ends, including a stream
 the provider closes, and works again once a generation subscribes. The send
 path fails each time the outbound helper fails a reply, an acknowledgement or
 a ✅ in a way that can be retried or whose outcome is unknown, and works again
-once one is sent; a send the helper refuses as not applied and not retryable
-answers that one operation and changes neither. For a failing path the record
+once one is sent and its provider ID kept. A provider ID the bridge cannot
+keep, such as one with a line break, leaves the operation unresolved and is a
+failure of class `provider_receipt_invalid`. A send the helper refuses as not
+applied and not retryable answers that one operation and changes neither. A
+record that cannot be read does not stop a scan from keeping the others in
+`delivery-alarm.json` current: it keeps the value last written for it, and
+the service logs the problem. For a failing path the record
 holds `down_since_millis`, when its first failure in a row happened;
 `failures`, how many in a row; `last_failure_at_millis`; `last_error_class`,
 the helper's failure code for a send, such as `provider_authorization`, or for

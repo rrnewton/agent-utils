@@ -2983,7 +2983,11 @@ fn run_provider_worker(
     let mut backoff = ProviderBackoff::new();
     while !stop.is_stopped() {
         let started = now();
-        let ended = match generation() {
+        let result = generation();
+        // How long the generation lasted decides the backoff, so it is read before recording
+        // the failure, which may wait on the state lock.
+        let lasted = now().saturating_duration_since(started);
+        let ended = match result {
             Ok(()) if stop.is_stopped() => break,
             Ok(()) => "stream ended".to_owned(),
             Err(ProviderGenerationError::Cancelled) if stop.is_stopped() => break,
@@ -3012,7 +3016,7 @@ fn run_provider_worker(
             break;
         }
         ended_with(&ended);
-        let delay = backoff.wait_after(now().saturating_duration_since(started));
+        let delay = backoff.wait_after(lasted);
         log(format_args!(
             "agentctl: chat provider: {ended}; reconnecting in {}s",
             delay.as_secs()
@@ -4450,13 +4454,19 @@ impl DeliveryWatch {
             .map(|entry| entry.key.clone())
             .collect();
         let alarm = DeliveryAlarm::new(&entries, now_millis, self.timing.stall_after);
+        // Each record is read on its own, so one that cannot be read does not hold back the
+        // others: it keeps the value last written for it, and the problem is reported.
+        let previous = self.written.clone();
         let lost = match state.lost_receipt_reactions() {
             Ok(lost) => lost,
             Err(error) => {
                 problem.get_or_insert_with(|| {
                     format!("the lost receipt reactions could not be read: {error}")
                 });
-                return (typed, problem);
+                previous
+                    .as_ref()
+                    .map(|written| written.1.clone())
+                    .unwrap_or_default()
             }
         };
         let refused = match state.refused_receipt_reactions() {
@@ -4465,7 +4475,10 @@ impl DeliveryWatch {
                 problem.get_or_insert_with(|| {
                     format!("the refused receipt reactions could not be read: {error}")
                 });
-                return (typed, problem);
+                previous
+                    .as_ref()
+                    .map(|written| written.2.clone())
+                    .unwrap_or_default()
             }
         };
         let provider = match state.provider_down() {
@@ -4474,7 +4487,10 @@ impl DeliveryWatch {
                 problem.get_or_insert_with(|| {
                     format!("the provider health record could not be read: {error}")
                 });
-                return (typed, problem);
+                previous
+                    .as_ref()
+                    .map(|written| written.3.clone())
+                    .unwrap_or_default()
             }
         };
         let alarm = (alarm, lost, refused, provider);
@@ -6117,6 +6133,85 @@ printf '{"version":1,"id":"%s","action":"ensure_reaction","ok":true,"receipt":{"
         assert!(before.subscription_down.is_some());
         assert_eq!(after, chat_runtime::ProviderDown::default());
         assert!(status["provider_health"]["subscription"].is_null());
+    }
+
+    #[test]
+    fn a_record_that_cannot_be_read_does_not_freeze_the_provider_alarm() {
+        let (state, _key, root) = state_with_request();
+        let read_alarm = || -> Value {
+            serde_json::from_slice(&fs::read(root.join("delivery-alarm.json")).expect("alarm"))
+                .expect("alarm JSON")
+        };
+        let mut watch = DeliveryWatch::new(DeliveryTiming::default());
+        let mut routes = RouteCache::new(Vec::new());
+        watch.scan(&state, &RecordingDelivery::default(), &mut routes);
+        assert!(read_alarm().get("subscription_down").is_none());
+        // An unrelated record goes bad; then the subscription drops and its reconnect fails.
+        fs::write(root.join("receipt-reactions-lost.json"), b"not json").expect("corrupt");
+        for error in ["delivery channel closed", "control child closed stdout"] {
+            state
+                .note_subscription_down(error)
+                .expect("record the subscription failing");
+        }
+        watch.scan(&state, &RecordingDelivery::default(), &mut routes);
+        let down = read_alarm();
+        state
+            .note_subscription_up()
+            .expect("what a generation that subscribes records");
+        watch.scan(&state, &RecordingDelivery::default(), &mut routes);
+        let recovered = read_alarm();
+        fs::remove_dir_all(root).expect("cleanup");
+        assert_eq!(down["subscription_down"]["failures"], 2);
+        assert!(recovered.get("subscription_down").is_none());
+    }
+
+    #[test]
+    fn a_slow_health_record_does_not_make_a_failed_generation_look_healthy() {
+        let output_wake: SharedWake = Arc::new(Mutex::new(None));
+        let stop = Arc::new(StopState::default());
+        let (sender, _receiver) = mpsc::sync_channel::<ProviderNotice>(PROVIDER_NOTICE_CAPACITY);
+        let (record, recorded) = mpsc::channel::<Duration>();
+        let worker = spawn_provider_worker(
+            Arc::clone(&stop),
+            sender,
+            Arc::clone(&output_wake),
+            move |stop, notices, output_wake| {
+                let clock = Cell::new(Instant::now());
+                let waited = Cell::new(0);
+                run_provider_worker(
+                    || {
+                        Err(ProviderGenerationError::Retryable(
+                            "failed at once".to_owned(),
+                        ))
+                    },
+                    || clock.get(),
+                    &|_| {},
+                    // Saving the failure waits as long as a healthy generation lasts.
+                    &|_| clock.set(clock.get() + PROVIDER_RETRY_MAX),
+                    |delay| {
+                        record.send(delay).expect("record a wait");
+                        waited.set(waited.get() + 1);
+                        if waited.get() == 2 {
+                            stop.stop();
+                        }
+                    },
+                    stop,
+                    notices,
+                    output_wake,
+                );
+            },
+        )
+        .expect("spawn provider worker");
+        join_worker_until(
+            worker,
+            "chat provider",
+            Instant::now() + Duration::from_secs(30),
+        )
+        .expect("the worker ends once the service stops");
+        assert_eq!(
+            recorded.try_iter().collect::<Vec<_>>(),
+            [Duration::from_secs(1), Duration::from_secs(2)]
+        );
     }
 
     #[test]

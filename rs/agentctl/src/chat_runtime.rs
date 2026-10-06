@@ -2595,6 +2595,13 @@ impl OutboundFailure {
             retryable,
         }
     }
+
+    /// A send whose provider answered with an ID the bridge cannot keep. The operation stays
+    /// unresolved and is tried again, so for the send path's health it is a failure whose outcome
+    /// is unknown.
+    fn unusable_receipt(detail: impl Into<String>) -> Self {
+        Self::unknown("provider_receipt_invalid", detail, true)
+    }
 }
 
 impl fmt::Display for OutboundFailure {
@@ -5970,18 +5977,28 @@ impl BridgeState {
             emoji: &snapshot.emoji,
             request_id: &snapshot.request_id,
         });
-        // Bookkeeping only, as in `publish_one`. A provider that answered, even with a reaction ID
-        // that cannot be kept, shows the send path works.
-        let _ = self.note_send_outcome(ensured.as_ref().map(|_| ()));
+        // The health notes are bookkeeping only, as in `publish_one`, and judge the attempt as
+        // the record does: a receipt that cannot be kept is a failure, not a working send.
         let outcome = match ensured {
-            Ok(receipt) => validate_single_line(
+            Ok(receipt) => match validate_single_line(
                 &receipt.reaction_id,
                 "provider reaction id",
                 chat_subscription::MAX_RESOURCE_ID_BYTES,
-            )
-            .map(|()| receipt)
-            .map_err(|error| error.to_string()),
+            ) {
+                Ok(()) => {
+                    let _ = self.note_send_outcome(Ok(()));
+                    Ok(receipt)
+                }
+                Err(error) => {
+                    let detail = error.to_string();
+                    let _ = self.note_send_outcome(Err(&OutboundFailure::unusable_receipt(
+                        detail.as_str(),
+                    )));
+                    Err(detail)
+                }
+            },
             Err(error) => {
+                let _ = self.note_send_outcome(Err(&error));
                 refused = error.outcome == OutboundOutcome::NotApplied && !error.retryable;
                 Err(error.to_string())
             }
@@ -8110,11 +8127,16 @@ stay held until an operator repairs or deletes it, and deleting it releases ever
                 )));
             }
         };
-        validate_single_line(
+        if let Err(error) = validate_single_line(
             &receipt.reaction_id,
             "provider reaction id",
             chat_subscription::MAX_RESOURCE_ID_BYTES,
-        )?;
+        ) {
+            // Bookkeeping only, as in `publish_one`: the acknowledgement is still unresolved.
+            let _ =
+                self.note_send_outcome(Err(&OutboundFailure::unusable_receipt(error.to_string())));
+            return Err(error);
+        }
 
         let state_lock =
             agent::open_private_lock(&self.root.join(".state.lock"), "chat state lock")?;
@@ -8565,11 +8587,16 @@ stay held until an operator repairs or deletes it, and deleting it releases ever
         let provider_message_id = sent.map_err(|error| {
             ChatRuntimeError::invalid(format!("outbound chat send failed: {error}"))
         })?;
-        validate_single_line(
+        if let Err(error) = validate_single_line(
             &provider_message_id,
             "provider reply message id",
             chat_subscription::MAX_RESOURCE_ID_BYTES,
-        )?;
+        ) {
+            // The reply is still unsent, so its send failed.
+            let _ =
+                self.note_send_outcome(Err(&OutboundFailure::unusable_receipt(error.to_string())));
+            return Err(error);
+        }
 
         let state_lock =
             agent::open_private_lock(&self.root.join(".state.lock"), "chat state lock")?;
@@ -27754,6 +27781,122 @@ a fence ```sh here, ~~~~ there, and one ``\u{200b}` hidden"
         assert_eq!(reported.failures, 2);
         assert_eq!(reported.last_error_class, "provider_authorization");
         assert_eq!(reported_after_send, ProviderDown::default());
+    }
+
+    /// A provider reaction ID the bridge cannot keep: it decodes, then fails validation.
+    fn unusable_reaction() -> ReactionReceipt {
+        ReactionReceipt {
+            reaction_id: "spaces/space/messages/message/reactions/\nrobot".to_owned(),
+            already_present: false,
+        }
+    }
+
+    fn uncertain_failure() -> OutboundFailure {
+        OutboundFailure {
+            code: "provider_timeout".to_owned(),
+            detail: "provider command exceeded its deadline".to_owned(),
+            outcome: OutboundOutcome::Unknown,
+            retryable: false,
+        }
+    }
+
+    #[test]
+    fn a_check_mark_receipt_that_cannot_be_kept_does_not_end_a_send_failure() {
+        let (root, state, keys) = saved_receipt_reactions("provider-unusable-check-mark", 1);
+        let mut acks = ScriptedReactions(VecDeque::from([
+            Err(authorization_failure()),
+            Err(authorization_failure()),
+        ]));
+        assert!(state.ensure_ack(&keys[0], &mut acks).is_err());
+        assert!(state.ensure_ack(&keys[0], &mut acks).is_err());
+        let mut check_marks = ScriptedReactions(VecDeque::from([Ok(unusable_reaction())]));
+        assert!(state
+            .ensure_receipt_reaction(&keys[0], &mut check_marks)
+            .is_err());
+        let down = state.provider_down().expect("provider down");
+        let waiting = state.status().expect("status")["receipt_reactions"].clone();
+        fs::remove_dir_all(root).expect("cleanup");
+        // The check mark is still waiting and failing, so the path has not worked.
+        assert_eq!(waiting["waiting"], 1);
+        assert_eq!(waiting["failing"], 1);
+        let reported = down.send_path_down.expect("the send path is still down");
+        assert_eq!(reported.failures, 3);
+        assert_eq!(reported.last_error_class, "provider_receipt_invalid");
+    }
+
+    #[test]
+    fn acknowledgement_receipts_that_cannot_be_kept_report_the_send_path_down() {
+        let (root, state, keys) = saved_receipt_reactions("provider-unusable-ack", 1);
+        let mut acks = ScriptedReactions(VecDeque::from([
+            Ok(unusable_reaction()),
+            Ok(unusable_reaction()),
+        ]));
+        assert!(state.ensure_ack(&keys[0], &mut acks).is_err());
+        assert!(state.ensure_ack(&keys[0], &mut acks).is_err());
+        let down = state.provider_down().expect("provider down");
+        fs::remove_dir_all(root).expect("cleanup");
+        let reported = down.send_path_down.expect("the send path is reported down");
+        assert_eq!(reported.failures, 2);
+        assert_eq!(reported.last_error_class, "provider_receipt_invalid");
+    }
+
+    #[test]
+    fn reply_receipts_that_cannot_be_kept_report_the_send_path_down() {
+        let (root, state, keys) = saved_receipt_reactions("provider-unusable-reply", 1);
+        let key = &keys[0];
+        let route = state
+            .next_reply_route(key)
+            .expect("route")
+            .expect("open route");
+        state
+            .capture_replies(
+                key,
+                &format!(
+                    "<CHAT_REPLY_{}>\nheld reply\n</CHAT_REPLY_{}>",
+                    route.identifier, route.identifier
+                ),
+            )
+            .expect("capture reply");
+        let mut replies = ScriptedReplies(VecDeque::from([
+            Ok("spaces/space/messages/\nreply".to_owned()),
+            Ok("spaces/space/messages/\nreply".to_owned()),
+        ]));
+        assert!(state.publish_one(key, &mut replies).is_err());
+        assert!(state.publish_one(key, &mut replies).is_err());
+        let down = state.provider_down().expect("provider down");
+        fs::remove_dir_all(root).expect("cleanup");
+        let reported = down.send_path_down.expect("the send path is reported down");
+        assert_eq!(reported.failures, 2);
+        assert_eq!(reported.last_error_class, "provider_receipt_invalid");
+    }
+
+    #[test]
+    fn check_marks_that_fail_retryably_or_uncertainly_report_the_send_path_down_until_one_lands() {
+        let (root, state, keys) = saved_receipt_reactions("provider-check-mark-path", 1);
+        let mut check_marks = ScriptedReactions(VecDeque::from([
+            Err(authorization_failure()),
+            Err(uncertain_failure()),
+            Ok(reaction_added()),
+        ]));
+        assert!(state
+            .ensure_receipt_reaction(&keys[0], &mut check_marks)
+            .is_err());
+        let after_one = state.provider_down().expect("provider down");
+        assert!(state
+            .ensure_receipt_reaction(&keys[0], &mut check_marks)
+            .is_err());
+        let down = state.provider_down().expect("provider down");
+        state
+            .ensure_receipt_reaction(&keys[0], &mut check_marks)
+            .expect("the third check mark lands")
+            .expect("a check mark was waiting");
+        let recovered = state.provider_down().expect("provider down");
+        fs::remove_dir_all(root).expect("cleanup");
+        assert_eq!(after_one, ProviderDown::default());
+        let reported = down.send_path_down.expect("the send path is reported down");
+        assert_eq!(reported.failures, 2);
+        assert_eq!(reported.last_error_class, "provider_timeout");
+        assert_eq!(recovered, ProviderDown::default());
     }
 
     #[test]
