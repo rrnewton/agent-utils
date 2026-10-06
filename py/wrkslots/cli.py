@@ -41538,9 +41538,11 @@ def _assert_absent_agent_module_salvage_intact(
                 ):
                     check_pushed_refs(isolated, object_env, authority.url, pushed_refs, label)
             if local is not None:
+                # mypy does not carry the narrowing above into a default value.
+                remote_path: Path = local
 
                 def recheck_pushed(
-                    local: Path = local,
+                    local: Path = remote_path,
                     url: str = authority.url,
                     refs: Sequence[tuple[str, str]] = pushed_refs,
                     label: str = label,
