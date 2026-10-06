@@ -16657,24 +16657,16 @@ def _namespace_inode(name: str) -> int:
 
 
 def _proc_superblock_options() -> tuple[str, ...]:
-    """Return the superblock options of the procfs mounted at ``/proc``."""
+    """Return the superblock options of the procfs visible at ``/proc``."""
 
-    try:
-        lines = Path("/proc/self/mountinfo").read_text(encoding="utf-8").splitlines()
-    except (OSError, UnicodeError) as exc:
-        raise Refusal(f"cannot read this process's mount table: {exc}") from exc
-    options: tuple[str, ...] | None = None
-    for line in lines:
-        fields = line.split(" ")
-        if len(fields) < 5 or fields[4] != "/proc" or " - " not in line:
-            continue
-        tail = line.split(" - ", 1)[1].split(" ")
-        if len(tail) >= 3 and tail[0] == "proc":
-            # A later mount at the same point hides an earlier one.
-            options = tuple(tail[2].split(","))
-    if options is None:
+    entry = _visible_mount(_read_self_mount_entries(), Path("/proc"))
+    if entry is None or entry.point != Path("/proc") or entry.fstype != "proc":
         raise Refusal("no process filesystem is mounted at /proc")
-    return options
+    return tuple(os.fsdecode(_mountinfo_unescape(entry.options)).split(","))
+
+
+# A mount point at or below one process's directory in /proc.
+_PROC_PROCESS_MOUNT = re.compile(r"/proc/[0-9]+(?:/.*)?", re.DOTALL)
 
 
 def _assert_host_process_view() -> None:
@@ -16683,9 +16675,10 @@ def _assert_host_process_view() -> None:
     Matching machine and boot identities do not show that this process can
     see a host run.  In a child PID namespace the run and its children are
     absent from /proc; in a child cgroup namespace their control-group paths
-    are rewritten relative to another root; and procfs mounted with
-    ``hidepid`` hides processes.  Any of them makes an absent run look
-    ``dead``.
+    are rewritten relative to another root; procfs mounted with ``hidepid``
+    hides processes; and a mount over ``/proc/<pid>``, or a path inside it,
+    replaces that process's entries with another file system's.  Any of
+    them makes an absent run look ``dead``.
     """
 
     for name, initial in _INITIAL_NAMESPACE_INODES:
@@ -16716,6 +16709,12 @@ def _assert_host_process_view() -> None:
             f"/proc is mounted with {hidden[-1]}, so its process table need not show "
             "the recorded runs"
         )
+    for entry in _read_self_mount_entries():
+        if _PROC_PROCESS_MOUNT.fullmatch(str(entry.point)):
+            raise Refusal(
+                f"a {entry.fstype} mount at {entry.point} masks that process's "
+                "entries in /proc, so its process table need not show the recorded runs"
+            )
 
 
 def _validation_run_host_evidence() -> tuple[

@@ -1203,6 +1203,49 @@ def test_a_restricted_process_view_is_unverifiable_not_dead(
     assert detail in message
 
 
+_HOST_MOUNTS = (
+    "1 0 0:1 / / rw - ext4 /dev/root rw\n"
+    "2 1 0:2 / /proc rw,nosuid - proc proc rw\n"
+)
+
+
+@pytest.mark.parametrize(
+    ("mount", "detail"),
+    [
+        ("3 2 0:3 / /proc/4242 rw - tmpfs tmpfs rw\n", "tmpfs mount at /proc/4242 masks"),
+        ("3 2 0:3 / /proc/4242/fd rw - tmpfs tmpfs rw\n", "mount at /proc/4242/fd masks"),
+        (
+            "3 2 0:3 / /proc/77/with\\040space rw - tmpfs tmpfs rw\n",
+            "mount at /proc/77/with space masks",
+        ),
+        ("3 2 0:3 / /proc rw - tmpfs tmpfs rw\n", "no process filesystem is mounted at /proc"),
+        ("3 2 0:3 / /proc/sys/fs/binfmt_misc rw - binfmt_misc binfmt_misc rw\n", None),
+    ],
+)
+def test_a_mount_over_a_process_directory_in_proc_restricts_the_view(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mount: str, detail: str | None
+) -> None:
+    """A mount over ``/proc/<pid>`` replaces that process's entries.
+
+    The process table then need not show that run, so the view is
+    restricted; a mount stacked over ``/proc`` itself hides the process
+    filesystem.  A mount elsewhere below ``/proc`` hides no process.
+    """
+
+    table = tmp_path / "mountinfo"
+    table.write_text(_HOST_MOUNTS + mount, encoding="utf-8")
+    monkeypatch.setattr(wrkslots, "_SELF_MOUNTINFO", table)
+    initial = dict(wrkslots._INITIAL_NAMESPACE_INODES)
+    monkeypatch.setattr(wrkslots, "_namespace_inode", lambda name: initial[name])
+
+    if detail is None:
+        wrkslots._assert_host_process_view()
+        return
+    with pytest.raises(wrkslots.Refusal) as refused:
+        wrkslots._assert_host_process_view()
+    assert detail in str(refused.value)
+
+
 def test_this_host_process_view_is_the_host_view() -> None:
     """The suite runs on the host, so the real view passes the proof."""
 
