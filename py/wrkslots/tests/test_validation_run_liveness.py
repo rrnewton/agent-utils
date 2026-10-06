@@ -1361,6 +1361,25 @@ def test_a_run_registered_during_the_evidence_reads_is_alive(
     assert f"retained validation unit {RUN_UNIT} may still use row slot01" in message
 
 
+def test_a_handle_registered_after_the_first_enumeration_is_alive(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A handle the later read found is a run the unit states cannot cover.
+
+    The handle is written during the second user-systemd enumeration, and
+    its unit is absent from both: it is queued only after them, and its job
+    has not started, so no table, unit state or control group shows it.
+    """
+
+    state, message = _judge_with_unit_enumerations(
+        tmp_path, monkeypatch, ((), ()), register_during=1
+    )
+
+    assert state == "alive", message
+    assert "for row slot01 appeared while the host evidence was read" in message
+    assert f"its unit {RUN_UNIT} may have been queued" in message
+
+
 def test_a_retained_unit_cgroup_member_missing_from_every_table_is_alive(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

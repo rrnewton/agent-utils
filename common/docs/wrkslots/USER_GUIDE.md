@@ -411,7 +411,10 @@ a run that starts during it can be absent from both tables while the first enume
 unit inactive. The user-systemd units are therefore enumerated again after the later table, and a
 retained run unit that is active or queued in either enumeration is `alive`.
 The retained run handles are read again after both enumerations, and a handle found by either read
-is judged. Last, the current members of every control group named after a handle's unit, and of its
+is judged. A handle that only the later read finds was written after both enumerations had begun, so
+their unit states do not cover its run: its unit can be queued after them with its job still waiting to
+start, showing no state, process or member. Such a handle is `alive`, and a rerun reads it before
+the units. Last, the current members of every control group named after a handle's unit, and of its
 descendants, are read from the cgroup v2 hierarchy below the user service manager; a member there is
 `alive`, and a host without a cgroup v2 hierarchy at `/sys/fs/cgroup` or with an unreadable member
 list is `unverifiable`.

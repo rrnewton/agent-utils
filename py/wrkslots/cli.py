@@ -16755,6 +16755,8 @@ class _RunEvidence:
     units: tuple[Mapping[str, str], ...]
     bindings: Mapping[str, tuple[_RetainedValidationHandle, ...]]
     members: Mapping[str, int]
+    # Handles that only the read after the host evidence found.
+    late: Mapping[str, tuple[_RetainedValidationHandle, ...]]
 
 
 def _run_evidence(
@@ -16773,8 +16775,9 @@ def _run_evidence(
     current members of their units' control groups are read last (see
     ``_retained_unit_cgroup_members``).  ``first`` is a handle read the
     caller has already made and judged.  Every caller that judges rows from
-    runs reads its evidence here: the validation-run authority,
-    ``recover-absent-validate-rows`` and ``recover-absent-agent-rows``.
+    runs reads its evidence here and judges it with ``_judge_run_evidence``:
+    the validation-run authority, ``recover-absent-validate-rows`` and
+    ``recover-absent-agent-rows``.
     """
 
     if first is None:
@@ -16788,7 +16791,54 @@ def _run_evidence(
     members = _retained_unit_cgroup_members(
         {handle.unit for handles in bindings.values() for handle in handles}
     )
-    return _RunEvidence(processes, units, bindings, members)
+    late = {
+        slot: tuple(handle for handle in handles if handle not in first.get(slot, ()))
+        for slot, handles in later.items()
+    }
+    return _RunEvidence(
+        processes,
+        units,
+        bindings,
+        members,
+        {slot: handles for slot, handles in late.items() if handles},
+    )
+
+
+def _judge_run_evidence(
+    rows: Sequence[tuple[ActiveRecord, tuple[Path, ...]]],
+    evidence: _RunEvidence,
+    *,
+    resolver: _UnitPathResolver | None = None,
+) -> None:
+    """Refuse when ``evidence`` shows that a run may still use one of ``rows``.
+
+    Each retained handle's process generation, unit states and control-group
+    members are judged, and every active or queued unit is compared with the
+    rows' paths.  A handle that only the later read found was written after
+    both user-systemd enumerations had begun, so their unit states do not
+    cover its run: a unit queued after the second enumeration, whose job has
+    not started, shows no state, process or member.  Such a handle is a run
+    that may still use the row.  Rerunning reads it before the units.
+    """
+
+    slots = {record.slot for record, _paths in rows}
+    bindings = {slot: evidence.bindings.get(slot, ()) for slot in slots}
+    _assert_retained_handle_processes_dead(bindings)
+    _assert_absent_validate_systemd_unrelated(
+        rows,
+        bindings,
+        evidence.processes,
+        snapshot=evidence.units,
+        resolver=resolver,
+        members=evidence.members,
+    )
+    for slot in sorted(slots):
+        for handle in evidence.late.get(slot, ()):
+            raise _ValidationRunMayUseRow(
+                f"retained validation handle {handle.path} for row {slot} appeared while "
+                "the host evidence was read, so its unit "
+                f"{handle.unit} may have been queued after the user-systemd enumerations"
+            )
 
 
 def _validation_run_row_paths(
@@ -16927,17 +16977,8 @@ def _validation_run_liveness_states(
     for row in rows:
         record = row[0]
         key = (record.machine, record.slot, record.generation)
-        handles = {record.slot: evidence.bindings.get(record.slot, ())}
         try:
-            _assert_retained_handle_processes_dead(handles)
-            _assert_absent_validate_systemd_unrelated(
-                (row,),
-                handles,
-                evidence.processes,
-                snapshot=evidence.units,
-                resolver=resolver,
-                members=evidence.members,
-            )
+            _judge_run_evidence((row,), evidence, resolver=resolver)
         except _ValidationRunMayUseRow as exc:
             result[key] = (
                 "alive",
@@ -16957,7 +16998,8 @@ def _validation_run_liveness_states(
             continue
         result[key] = (
             "dead",
-            f"{len(handles[record.slot])} retained run handle(s) name this row, each "
+            f"{len(evidence.bindings.get(record.slot, ()))} retained run handle(s) "
+            "name this row, each "
             "with a dead process generation and an inactive, unqueued unit with no "
             "live process; no active or queued user-systemd unit names its paths",
         )
@@ -40785,14 +40827,7 @@ def _assert_absent_agent_liveness(
                     f"live process {process.pid} remains in recorded owner cgroup "
                     f"{record.owner.cgroup_path} for agent row {record.slot}"
                 )
-    _assert_retained_handle_processes_dead(evidence.bindings)
-    _assert_absent_validate_systemd_unrelated(
-        rows,
-        evidence.bindings,
-        evidence.processes,
-        snapshot=evidence.units,
-        members=evidence.members,
-    )
+    _judge_run_evidence(rows, evidence)
 
 
 def _absent_agent_rescue_ref(
@@ -47358,14 +47393,7 @@ def _assert_absent_validate_rows_safe(config: Config, records: Sequence[ActiveRe
         ),
         first=bindings,
     )
-    _assert_retained_handle_processes_dead(evidence.bindings)
-    _assert_absent_validate_systemd_unrelated(
-        rows,
-        evidence.bindings,
-        evidence.processes,
-        snapshot=evidence.units,
-        members=evidence.members,
-    )
+    _judge_run_evidence(rows, evidence)
 
 
 def _absent_validate_archive_entry(
