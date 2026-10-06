@@ -297,6 +297,11 @@ const GENERIC: Table = Table {
 };
 
 fn table_for(c: &Classification) -> &'static Table {
+    if c.opaque {
+        // An alias beneath a group (`issue publish`) or a passthrough command: the family's own
+        // flag table says nothing about these arguments.
+        return &GENERIC;
+    }
     match (c.family.as_str(), c.sub.as_deref()) {
         ("api", _) => &API,
         ("workflow", Some("run")) => &WORKFLOW_RUN,
@@ -434,6 +439,34 @@ pub fn body_sources(c: &Classification, rest: &[String], stdin_is_tty: bool) -> 
     } else {
         effective(all)
     }
+}
+
+/// The body sources of an ordinary alias's expansion, which gh builds and sends inside its own
+/// process: the expanded command line is classified and scanned as if it had been typed. File
+/// paths there come from the alias, not from gh-paced's arguments, so they are read and
+/// inspected but not snapshotted. `Err` when the expansion composes its body after the guard
+/// runs (see [`uninspectable`]).
+pub fn expansion_sources(
+    expanded: &[String],
+    cfg: &Config,
+    stdin_is_tty: bool,
+) -> Result<Vec<BodySource>, String> {
+    let c = crate::classify::classify(expanded, cfg);
+    if c.class != crate::classify::Class::Write {
+        return Ok(Vec::new());
+    }
+    let rest = &expanded[c.rest_start.min(expanded.len())..];
+    if let Some(why) = uninspectable(&c, rest, stdin_is_tty) {
+        return Err(format!("the alias expands to `{}`: {why}", c.command));
+    }
+    Ok(body_sources(&c, rest, stdin_is_tty)
+        .into_iter()
+        .map(|mut s| {
+            s.location = None;
+            s.flag = format!("{} (from the alias expansion `{}`)", s.flag, c.command);
+            s
+        })
+        .collect())
 }
 
 /// Every file gh may read while running this command, including overridden occurrences (gh
@@ -833,9 +866,13 @@ pub fn uninspectable(c: &Classification, rest: &[String], stdin_is_tty: bool) ->
             if on(&["editor", "-e"]) {
                 return Some(format!("{cmd} --editor composes the body in an editor"));
             }
-            if stdin_is_tty && !body_flag && !web && !set(&["recover"]) {
+            // An interactive `issue create` takes its body only from the editor, which the
+            // editor guard checks (see `crate::editor`). An interactive `pr create` offers a
+            // body composed from the branch's commit messages and submits it without opening
+            // the editor when the author just presses Enter, so that body is never seen.
+            if c.family == "pr" && stdin_is_tty && !body_flag && !web && !set(&["recover"]) {
                 return Some(format!(
-                    "{cmd} without --body or --body-file prompts for the body interactively"
+                    "{cmd} without --body or --body-file prompts for the body and offers one composed from commit messages, which gh can submit without opening the editor"
                 ));
             }
         }
@@ -870,17 +907,8 @@ pub fn uninspectable(c: &Classification, rest: &[String], stdin_is_tty: bool) ->
                 ));
             }
         }
-        ("pr", Some("merge")) => {
-            let method = set(&["merge", "-m"])
-                || set(&["squash", "-s"])
-                || set(&["rebase", "-r"])
-                || set(&["disable-auto"]);
-            if stdin_is_tty && !method {
-                return Some(format!(
-                    "{cmd} without --merge, --squash or --rebase prompts interactively and may open an editor for the commit body"
-                ));
-            }
-        }
+        // An interactive `pr merge` asks for the method and may open the editor for the merge
+        // commit message; the editor guard checks that text (see `crate::editor`).
         ("release", Some("create")) => {
             let notes = set(&["notes"]) || set(&["notes-file"]) || set(&["generate-notes"]);
             if stdin_is_tty && !notes {
@@ -916,7 +944,7 @@ fn is_b64(b: u8) -> bool {
 
 /// Length of the longest base64-looking content in `text`.
 ///
-/// Three shapes count, whatever characters of the alphabet they use (a hex dump, a lower-case-only
+/// Four shapes count, whatever characters of the alphabet they use (a hex dump, a lower-case-only
 /// encoding and a ruler all count, so nothing long slips through as a "word"):
 ///
 /// - one unbroken run of base64-alphabet characters;
@@ -926,8 +954,16 @@ fn is_b64(b: u8) -> bool {
 ///   each line, or set `GH_PACED_ALLOW_LARGE_BODY=1`;
 /// - a block of consecutive base64-alphabet lines of any width that all have the same width,
 ///   except that the last may be shorter. This is the shape of an encoding wrapped at a fixed
-///   column, however narrow, so wrapping at 16 or 8 columns does not hide one. Lines of
-///   differing width (a list of identifiers, one per line) do not form this kind of block.
+///   column, however narrow, so wrapping at 16 or 8 columns does not hide one;
+/// - a block of consecutive base64-alphabet lines of at least 4 characters, of any widths, each
+///   holding both upper- and lower-case letters. Standard base64 mixes the cases on nearly every
+///   line, so an encoding wrapped at varying narrow widths (16, then 12, then 16) forms this
+///   block. A list of lower-case identifiers or hex hashes, one per line, does not; a list of
+///   mixed-case names one per line does, once it passes the limit.
+///
+/// These are heuristics against an accidental upload, not a proof: an encoding broken up by
+/// spaces or punctuation, or one wrapped at varying widths under 4 columns or below 20 columns
+/// without mixed case (base32, hex), is not seen.
 pub fn longest_base64_run(text: &[u8]) -> usize {
     let mut best = 0;
     let mut run = 0;
@@ -940,6 +976,8 @@ pub fn longest_base64_run(text: &[u8]) -> usize {
         }
     }
     let mut block = 0;
+    // Mixed-case block of any widths: its total length.
+    let mut mixed = 0;
     // Equal-width block: its line width (0 when no block is open) and its total length.
     let mut width = 0;
     let mut even = 0;
@@ -951,6 +989,16 @@ pub fn longest_base64_run(text: &[u8]) -> usize {
         } else {
             best = best.max(block);
             block = 0;
+        }
+        if encoded
+            && trimmed.len() >= 4
+            && trimmed.iter().any(u8::is_ascii_uppercase)
+            && trimmed.iter().any(u8::is_ascii_lowercase)
+        {
+            mixed += trimmed.len();
+        } else {
+            best = best.max(mixed);
+            mixed = 0;
         }
         let len = trimmed.len();
         if !encoded {
@@ -1019,6 +1067,18 @@ fn read_capped(path: &str, limit: usize) -> Result<(Vec<u8>, u64), String> {
         .map_err(|e| format!("cannot read body file {path}: {e}"))?;
     let full = size.max(buf.len() as u64);
     Ok((buf, full))
+}
+
+/// Check a file gh composed in an editor (see [`crate::editor`]) against the write-body limits.
+pub fn check_composed_file(path: &str, cfg: &Config) -> Verdict {
+    let source = BodySource {
+        flag: "the text saved in the editor".to_string(),
+        kind: SourceKind::File(path.to_string()),
+        json: false,
+        location: None,
+        key: None,
+    };
+    evaluate(&[source], cfg, None)
 }
 
 /// Inspect every body source. `stdin` holds the buffered stdin when a source reads it (the
@@ -1378,14 +1438,12 @@ mod tests {
         }
         let prompts: &[&[&str]] = &[
             &["pr", "create", "-t", "title"],
-            &["issue", "create"],
+            &["pr", "create"],
             &["pr", "comment", "1"],
             &["issue", "comment", "1", "--edit-last"],
             &["pr", "review", "1"],
             &["pr", "edit", "1"],
             &["issue", "edit", "1", "-R", "o/r"],
-            &["pr", "merge", "1"],
-            &["pr", "merge", "1", "--auto", "-d"],
             &["release", "create", "v1"],
             &["release", "create", "v1", "-t", "title"],
         ];
@@ -1395,6 +1453,19 @@ mod tests {
                 refused(line, false).is_none(),
                 "refused without a tty: {line:?}"
             );
+        }
+        // These prompt on a terminal too, but the only text they compose comes from the
+        // editor, which gh opens through the editor guard (`crate::editor`; tested end to end in
+        // tests/cli.rs), so they run.
+        let editor_guarded: &[&[&str]] = &[
+            &["issue", "create"],
+            &["issue", "create", "-t", "title"],
+            &["pr", "merge", "1"],
+            &["pr", "merge", "1", "--auto", "-d"],
+        ];
+        for line in editor_guarded {
+            assert!(refused(line, true).is_none(), "refused (tty): {line:?}");
+            assert!(refused(line, false).is_none(), "refused: {line:?}");
         }
         let fine: &[&[&str]] = &[
             &["pr", "create", "-t", "x", "-b", "y"],
@@ -1440,8 +1511,10 @@ mod tests {
             &["pr", "comment", "1", "--delete-last=f"],
             &["pr", "review", "1", "--approve=false"],
             &["pr", "review", "1", "-a=0"],
-            &["pr", "merge", "1", "--squash=false"],
-            &["pr", "merge", "1", "-s=F"],
+            // (`pr merge` has no prompt rule any more: the editor guard checks its commit
+            // message. These keep the `--flag=false` and `-x=F` spellings covered.)
+            &["pr", "review", "1", "--comment=false"],
+            &["pr", "review", "1", "-c=F"],
             &["pr", "edit", "1", "--web=false"],
             &["release", "create", "v1", "--generate-notes=false"],
             // A value gh cannot parse never earns an exemption.
@@ -1576,6 +1649,39 @@ mod tests {
             evaluate(&s, &Config::default(), None),
             Verdict::Allow { .. }
         ));
+    }
+
+    #[test]
+    fn opaque_commands_beneath_known_families_are_inspected_and_redacted() {
+        let big = "word ".repeat(2000);
+        let body = format!("--body={big}");
+        // `extension exec` and an alias beneath a group (`issue publish`) hand every argument to
+        // code gh-paced cannot see, so gh's last-wins rule does not apply to them either.
+        for line in [
+            &["extension", "exec", "my-ext", body.as_str(), "--body=small"][..],
+            &["issue", "publish", body.as_str(), "--body=small"],
+            &["issue", "publish", "-b", big.as_str(), "-b", "small"],
+            &["issue", "publish", big.as_str()],
+            &["config", "publish", big.as_str()],
+        ] {
+            let s = sources(line);
+            assert!(
+                matches!(
+                    evaluate(&s, &Config::default(), None),
+                    Verdict::Refuse(ref m) if m.contains("over the 8192-byte limit")
+                ),
+                "{line:?}: {s:?}"
+            );
+        }
+        // Positional text is redacted in the audit, not copied into it.
+        assert_eq!(
+            redacted(&["extension", "exec", "my-ext", "BODY_CANARY", "--token=T"]),
+            argv(&["extension", "exec", "<arg>", "<arg>", "--token"])
+        );
+        assert_eq!(
+            redacted(&["issue", "publish", "BODY_CANARY", "-b", "SECRET"]),
+            argv(&["issue", "publish", "<arg>", "-b", "<arg>"])
+        );
     }
 
     fn redacted(line: &[&str]) -> Vec<String> {
@@ -1753,6 +1859,39 @@ mod tests {
             |n: u64| -> String { (0..n).map(|i| format!("{}\n", 1000 + i * 7)).collect() };
         assert_eq!(longest_base64_run(numbers(250).as_bytes()), 1000);
         assert_eq!(longest_base64_run(numbers(251).as_bytes()), 1004);
+    }
+
+    /// Canonical base64 wrapped at alternating narrow widths (16, 12, 16, ...) is one encoded
+    /// block, not a list of short identifiers, and the guard refuses it.
+    #[test]
+    fn varying_narrow_wrapping_is_detected() {
+        let enc = "YWJj".repeat(300);
+        for eol in ["\n", "\r\n"] {
+            let mut wrapped = String::new();
+            let mut rest = enc.as_str();
+            let mut wide = true;
+            while !rest.is_empty() {
+                let (line, tail) = rest.split_at(rest.len().min(if wide { 16 } else { 12 }));
+                wrapped.push_str(line);
+                wrapped.push_str(eol);
+                rest = tail;
+                wide = !wide;
+            }
+            assert_eq!(longest_base64_run(wrapped.as_bytes()), 1200, "{eol:?}");
+            let body = vec![src("-b", inline(&wrapped), false)];
+            assert!(
+                matches!(evaluate(&body, &Config::default(), None), Verdict::Refuse(m) if m.contains("base64")),
+                "{eol:?}"
+            );
+        }
+        // Lower-case words and identifiers of varying widths, one per line, are not a block.
+        let words: String = (0..300)
+            .map(|i| format!("{}\n", ["alpha", "beta_2", "gamma-ray", "delta"][i % 4]))
+            .collect();
+        assert!(longest_base64_run(words.as_bytes()) < 20, "{words}");
+        // Mixed-case prose keeps its spaces, so it is not a block either.
+        let prose: String = (0..300).map(|_| "Fix The Thing\n").collect();
+        assert!(longest_base64_run(prose.as_bytes()) < 20);
     }
 
     #[test]

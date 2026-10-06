@@ -28,9 +28,23 @@ per-account budgets shared by every process on the host through a locked state
 file, and delayed with a loud stderr warning when a budget is exhausted. It
 also watches GitHub's own account-wide numbers (GET /rate_limit), backs off
 for at least 15 minutes after any rate-limit, abuse or HTTP 403 response, and
-refuses oversized or base64-laden write bodies and bodies gh would compose
-itself (editor, template, --fill, prompt). Body files are copied privately so
-gh sends exactly what was checked. It never reads, prints or stores a token.
+refuses oversized or base64-laden write bodies. It checks bodies given as
+arguments, files or stdin, bodies inside gh's own alias expansions, and text
+typed in the editor gh opens for a write (gh's editor is pointed at
+`gh-paced --edit-guard`, which runs your editor and then checks the file).
+Body files are copied privately so gh sends exactly what was checked; bodies
+gh would compose without an editor (`pr create` prompts, --fill, templates)
+are refused.
+
+gh's output passes through unchanged, including anything gh prints that
+contains a credential (`gh auth token`, `gh auth status --show-token`, the git
+credential helper). stderr, and stdout for `gh api --include`, are scanned for
+GitHub's refusals as they stream. The audit log records a short summary of
+each call (class, cost, command, and arguments with inline bodies replaced by
+their sizes and header values redacted); it holds no request bodies and no
+environment. Output that a process started by gh writes after gh exits is
+delivered by a separate `gh-paced --drain` process, so gh-paced exits when gh
+does. `--edit-guard` and `--drain` are run by gh and gh-paced themselves.
 
 USAGE
   gh-paced [--account NAME] [--real-gh PATH] -- <gh arguments...>
@@ -62,23 +76,35 @@ DEFAULT BUDGETS (per host, per account; four hosts assumed)
   GIT_CREDENTIAL   1 per 10 s, burst 1, 120/hour
   LOCAL            unpaced, unaudited (help, completion, config, alias, ...)
   Unknown commands (aliases, extensions) are WRITE, even with --help.
-  `gh api --paginate` costs 10 tokens, for writes too. Watch loops cost 20, an
-  estimate of their requests, and are stopped (exit 75) once they outlast the
+  `gh api --paginate` costs 10 tokens, for writes too. A call costing more
+  than its class's burst (for example a SEARCH --paginate, or a --limit that
+  needs more pages than the burst) is refused at once (exit 75): one gh call
+  makes its requests back to back. A cost above the hourly cap is refused too.
+  Watch loops (`gh pr checks --watch`, `gh run watch`) are refused (exit 64)
+  unless GH_PACED_ALLOW_WATCH=1: gh-paced cannot count a poll's requests. With
+  it they cost 20, an estimate, and are stopped (exit 75) once they outlast the
   polls that estimate allows; a large or failing run can make more requests.
-  A cost above the class's hourly cap is refused at once (exit 75).
 
 ENVIRONMENT
   GH_PACED_ACCOUNT           default for --account
   GH_PACED_REAL_GH           default for --real-gh
   GH_PACED_MAX_WAIT          longest total sleep before refusing, seconds
                              (default 900); a longer wait exits 75
+  GH_PACED_LOCK_WAIT         longest wait for the state lock, seconds
+                             (default 30, 0.1 to 3600); then exit 70
   GH_PACED_{READ,SEARCH,WRITE,GIT}_{PER_MINUTE,BURST,PER_HOUR}
                              tighten a budget (a looser value is ignored with
                              a warning)
   GH_PACED_PAGINATE_COST     raise the --paginate cost (lower is ignored)
   GH_PACED_DISPLAY_TZ        US-Eastern (default) or UTC for printed times
   GH_PACED_ALLOW_LARGE_BODY  1 = skip the write content guard for this call
+  GH_PACED_ALLOW_WATCH       1 = run watch loops at their estimated charge
   GH_PACED_ALLOW_FAST_WATCH  1 = allow watch intervals under 30 s
+  GH_PACED_EDITOR            set by gh-paced for gh's editor guard: the
+                             editor you would have had (GH_EDITOR, gh's
+                             `editor` setting, GIT_EDITOR, VISUAL, EDITOR,
+                             nano); refused editor text is kept in the state
+                             directory as ACCOUNT.refused-edit.*.md
   GH_PACED_STATE_DIR         state directory (default
                              $XDG_STATE_HOME/gh-paced or ~/.local/state/gh-paced)
   GH_PACED_CONFIG            config file (default
@@ -87,14 +113,18 @@ ENVIRONMENT
 
 EXIT STATUS
   gh's own status (or gh-paced dies by the same signal), except:
-  75  refused: the wait would exceed GH_PACED_MAX_WAIT, the cost can never fit
-      the hourly cap, a watch outlasted the polls its cost allows, or nesting
-      too deep
+  75  refused: the wait would exceed GH_PACED_MAX_WAIT, the cost is above the
+      class's burst or can never fit the hourly cap, a watch outlasted the
+      polls its cost allows, or nesting too deep
   65  refused by the write content guard (body > 8 KiB, base64 run > 1000, a
-      body gh composes itself, or a body file that cannot be copied)
-  64  usage error, or a refused command shape (a watch interval under 30 s,
-      or one that is not a plain positive whole number of seconds)
-  70  internal error: pacing state cannot be locked, read or written
+      body gh composes itself, or a body file that cannot be copied). Text
+      refused in the editor makes the editor fail, so gh itself exits non-zero
+      (gh reports its own status, usually 1) and sends nothing.
+  64  usage error, or a refused command shape (a watch without
+      GH_PACED_ALLOW_WATCH=1, a watch interval under 30 s, or one that is not
+      a plain positive whole number of seconds)
+  70  internal error: pacing state cannot be read or written, or its lock was
+      not obtained within GH_PACED_LOCK_WAIT
   78  configuration error
   127 the real gh cannot be found or run
 
@@ -337,6 +367,7 @@ fn run_paced(account: Option<String>, real_gh: Option<String>, gh_args: Vec<Stri
         real_gh,
         echo: true,
         messages: Vec::new(),
+        printed: 0,
         stdin_is_tty: stdin_is_tty(),
         stdin_reader: Box::new(read_stdin_capped),
         chain,
@@ -346,12 +377,77 @@ fn run_paced(account: Option<String>, real_gh: Option<String>, gh_args: Vec<Stri
         pid,
         start_ticks: state::process_start_ticks(pid).unwrap_or(0),
         nonce: state::new_nonce(now),
+        gh_aliases: crate::alias::load(&env_var),
+        editor_guard_env: crate::editor::guard_env(&env_var, self_exe.as_deref(), &account),
+        self_exe,
         stderr_deadline: None,
     };
     match w.run(&gh_args) {
         Outcome::Exit(code) => code,
         Outcome::Signal(sig) => die_by_signal(sig),
     }
+}
+
+/// `gh-paced --drain ACCOUNT COMMAND STREAM`, started by gh-paced itself (see
+/// [`crate::runner::drain`]). Pushback in what it delivers is recorded as a cooldown for
+/// ACCOUNT and COMMAND, unless COMMAND is empty or the configuration or state directory cannot
+/// be read; the bytes are delivered either way. Configuration warnings were already printed by
+/// the gh-paced that started it, so they are not repeated into the stream.
+fn run_drain(args: &[String]) -> i32 {
+    use crate::clock::Clock;
+    let (Some(account), Some(command), Some(which)) = (
+        args.first(),
+        args.get(1),
+        args.get(2)
+            .and_then(|s| crate::runner::Stream::from_name(s)),
+    ) else {
+        loud_error(&format!(
+            "{} is started by gh-paced itself: gh-paced {} ACCOUNT COMMAND err|out",
+            crate::wrapper::DRAIN_FLAG,
+            crate::wrapper::DRAIN_FLAG
+        ));
+        return EXIT_USAGE;
+    };
+    let mut hook = None;
+    if !command.is_empty() && state::valid_account(account) {
+        let path = config_path(&env_var);
+        let (path, explicit) = match &path {
+            Some((p, e)) => (Some(p.as_path()), *e),
+            None => (None, false),
+        };
+        if let (Ok((cfg, _)), Ok(dir)) = (
+            Config::load(path, explicit, &env_var),
+            state::state_dir(&env_var),
+        ) {
+            let paths = Paths::new(dir, account);
+            let (account, command) = (account.clone(), command.clone());
+            hook = Some(crate::runner::PushbackHook(std::sync::Arc::new(
+                move |s: &crate::pushback::Scanner| {
+                    let Some(pb) = s.verdict(&cfg) else {
+                        return;
+                    };
+                    let recorded = crate::wrapper::publish_cooldown(
+                        &paths,
+                        cfg.lock_wait_secs,
+                        RealClock.now(),
+                        &pb,
+                        &command,
+                    );
+                    let what = match recorded {
+                        Ok(_) => format!("cooldown of {:.0} s recorded", pb.cooldown_secs),
+                        Err(e) => format!("the cooldown could not be recorded: {e}"),
+                    };
+                    let line = format!(
+                        "GH-PACED PUSHBACK [{account}] {} in output written after gh exited \
+                         (`{command}`): {what}. Never switch accounts to get around it.\n",
+                        pb.reason
+                    );
+                    crate::runner::write_fd_all(2, line.as_bytes());
+                },
+            )));
+        }
+    }
+    crate::runner::drain(which, hook.as_ref())
 }
 
 fn run_status(args: &[String]) -> i32 {
@@ -525,6 +621,14 @@ pub fn main(args: impl Iterator<Item = OsString>) -> i32 {
             return 0;
         }
         Some("status") => return run_status(&args[1..]),
+        Some(crate::editor::EDIT_GUARD_FLAG) => {
+            let cfg = match load_config() {
+                Ok(c) => c,
+                Err(code) => return code,
+            };
+            return crate::editor::run_guard(&args[1..], &env_var, &cfg);
+        }
+        Some(crate::wrapper::DRAIN_FLAG) => return run_drain(&args[1..]),
         Some("classify") => return run_classify(&args[1..]),
         _ => {}
     }

@@ -216,9 +216,22 @@ impl Scanner {
 
     /// The stdout output has ended (or will no longer be read). A block it interrupted is
     /// committed when its headers were verified: always for the first block of a
-    /// single-response call, and otherwise once it holds at least one CR LF header line. An
-    /// unterminated last line is ignored rather than allowed to spoil the block.
+    /// single-response call, and otherwise once it holds at least one CR LF header line.
+    ///
+    /// An unterminated last line is handled by mode. In a single-response call the open block
+    /// is gh's own (it began on the first stdout line), so the last line is read as a header
+    /// line whether or not its CR LF arrived: `HTTP/2.0 429 ...` alone, or a final
+    /// `Retry-After: 3600`, still counts. A line that is not a header ends the block, which
+    /// keeps what it already reported. In a paginated call the line may be body text, so it is
+    /// ignored rather than allowed to spoil the block.
     pub fn end_of_stdout(&mut self) {
+        if self.single_response && !self.closed && !self.skipping && !self.line.is_empty() {
+            let mut line = std::mem::take(&mut self.line);
+            if line.last() != Some(&b'\r') {
+                line.push(b'\r');
+            }
+            self.header_line(&line);
+        }
         self.line.clear();
         self.skipping = false;
         if let Some(block) = self.pending.take() {
@@ -583,5 +596,30 @@ mod tests {
         assert!(s.rate_limit);
         let s = scan(&["HTTP 4", "29"]);
         assert!(s.http_429);
+    }
+
+    /// A single-response call's header block is gh's own, so a last line whose LF never
+    /// arrived is still read: a final `Retry-After` sets the cooldown, and a status line alone
+    /// still reports the 429.
+    #[test]
+    fn single_response_reads_an_unterminated_last_line() {
+        let cfg = Config::default();
+        let s = single(&["HTTP/2.0 429 Too Many Requests\nRetry-After: 3600"]);
+        assert_eq!(s.retry_after, Some(3600.0), "{s:?}");
+        assert_eq!(s.verdict(&cfg).expect("pushback").cooldown_secs, 3600.0);
+        let s = single(&["HTTP/2.0 429 Too Many Requests"]);
+        assert!(s.http_429, "{s:?}");
+        assert_eq!(s.verdict(&cfg).expect("pushback").cooldown_secs, 900.0);
+        let s = single(&["HTTP/2.0 403 Forbidden\nX-Ratelimit-Remaining: 0"]);
+        assert!(s.remaining_zero, "{s:?}");
+        // Body text after the block is never read, terminated or not.
+        let s = single(&["HTTP/2.0 200 OK\nX-Ratelimit-Remaining: 10\r\n\r\nRetry-After: 99999"]);
+        assert!(s.verdict(&cfg).is_none(), "{s:?}");
+        // Nor is a body that came first.
+        let s = single(&["[]\nHTTP/2.0 429 Too Many Requests"]);
+        assert!(s.verdict(&cfg).is_none(), "{s:?}");
+        // The paginated reader still ignores an unterminated last line (it may be body text).
+        let s = headers(&["[]\nHTTP/2.0 429 Too Many Requests"]);
+        assert!(s.verdict(&cfg).is_none(), "{s:?}");
     }
 }

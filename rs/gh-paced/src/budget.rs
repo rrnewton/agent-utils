@@ -2,9 +2,10 @@
 //!
 //! A call of cost `c` is admitted when the bucket holds at least `min(c, burst)` tokens AND the
 //! last 3600 s of admitted cost plus `c` stays within the hourly cap. Admission subtracts the full
-//! cost, so the level may go negative: an expensive call (a paginated read) is let through but
-//! the calls after it wait until the debt is repaid. The bucket refills at `per_minute / 60`
-//! tokens per second up to `burst`.
+//! cost, so the level may go negative: the calls after an expensive call wait until the debt is
+//! repaid. The wrapper refuses any call costing more than the burst except a watch loop, whose
+//! requests are spread over its poll interval, so only a watch goes into debt. The bucket
+//! refills at `per_minute / 60` tokens per second up to `burst`.
 
 use crate::config::ClassLimits;
 use serde::{Deserialize, Serialize};

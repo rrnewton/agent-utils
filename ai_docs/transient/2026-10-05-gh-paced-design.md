@@ -69,14 +69,18 @@ network:
 
 | Class | Examples | Cost |
 | --- | --- | --- |
-| LOCAL | `--help` after a known gh command, `version`, `completion`, `config get`, `auth git-credential store/erase` | not paced, not audited |
-| READ | `pr view`, `issue list`, `run view`, `api` GET, GraphQL `query` | 1; `--paginate` 10; `--limit N` ceil(N/100) |
-| SEARCH | `search ...`, `api search/...`, `extension search`, `status` | 1 (`status` 3) |
-| WRITE | `pr create`, `issue comment`, `api -X POST`, GraphQL `mutation`, anything unknown (even with `--help`) | 1; `--paginate` 10 |
+| LOCAL | `--help` after a known gh command, `version`, `completion`, gh's own `config` and `alias` subcommands, `auth git-credential store/erase` | not paced, not audited |
+| READ | `pr view`, `issue list`, `run view`, `api` GET, GraphQL `query`, `status` | 1; `--paginate` 10; `--limit N` ceil(N/100); `status` 10 |
+| SEARCH | `search ...`, `api search/...`, `extension search` | 1 |
+| WRITE | `pr create`, `issue comment`, `api -X POST`, GraphQL `mutation`, anything unknown (even with `--help`), an alias beneath a group (`issue publish`), `extension exec`, `copilot` | 1; `--paginate` 10 |
+
+A call costing more than its class's burst is refused before gh runs (exit 75),
+except a watch, because one gh call makes its requests back to back.
 | GIT_CREDENTIAL | `auth git-credential get` | 1 |
 
 Unknown commands, aliases, extensions and unreadable GraphQL queries are WRITE.
-`pr checks --watch` and `run watch` cost 20 READ tokens. Every `--interval`
+`pr checks --watch` and `run watch` are refused (exit 64) unless
+`GH_PACED_ALLOW_WATCH=1` is set; with it they cost 20 READ tokens. Every `--interval`
 value must be a plain positive whole number of seconds, at least 30, or the call
 is refused (exit 64). A watch is stopped (TERM, then KILL 5 s later; exit 75)
 at `floor((cost - 2) / requests per poll) x interval` seconds: 2 tokens pay for
@@ -406,11 +410,14 @@ primary allowance in that hour.
    `run watch` poll was too few.)
 7. **`--limit N` costs ceil(N/100) tokens** on list and search commands, the
    number of 100-item pages it may fetch.
-8. **`gh status` is SEARCH with cost 3.** It runs several search and GraphQL
-   queries.
+8. **`gh status` is READ with cost 10.** It makes several GraphQL and REST
+   read requests; its GraphQL search draws on GraphQL points, not the REST
+   search limit. (It was SEARCH with cost 3 until round 4's burst refusal made
+   it unrunnable at the SEARCH burst of 2; see round 4.)
 9. **Environment variables only tighten** a budget; a looser value is ignored
-   with a warning. `GH_PACED_MAX_WAIT` is the exception: it sets how long the
-   caller will wait, not how fast GitHub is called. Config-file values are
+   with a warning. `GH_PACED_MAX_WAIT` and `GH_PACED_LOCK_WAIT` are the
+   exceptions: they set how long the caller will wait, not how fast GitHub is
+   called. Config-file values are
    clamped to GitHub's documented ceilings.
 10. **stderr goes through a pseudo-terminal when it is a terminal**, so gh keeps
     its interactive behaviour while gh-paced scans the stream.
@@ -671,6 +678,13 @@ new test copied in) and passes after it.
 | Cut-off header block loses `Retry-After` | fixed: without `--paginate` the first block counts however it ends; with `--paginate` a block holding at least one CRLF header line counts at the end of the output | `pushback` unit tests (`single_response_reads_only_the_first_block`, the cut-short case) |
 | CRLF body starts an unneeded cooldown (minor) | fixed without `--paginate` (only the first block is read); still possible with `--paginate`, where page boundaries look the same | `cli::include_body_with_crlf_headers_starts_no_cooldown` |
 
+Correction after round 4: three of the "fixed" labels above were overstated.
+The cut-off header fix still dropped a last status or header line that the
+stream ended without a line ending; the late-signal fix still let the final
+messages block when gh itself had died by a signal; and the under-20-column
+base64 fix covered one fixed width only, so alternating 16- and 12-column
+wrapping still hid an encoding. Round 4 found all three; each is fixed below.
+
 Remaining caveats, in the guide: a signal sent while gh runs goes to gh, so if
 gh exits with the consumer stalled gh-paced waits for a second signal; a signal
 in the milliseconds between gh's exit and gh-paced noticing it has no effect;
@@ -683,6 +697,51 @@ tests, all passing: 76 library, 24 CLI and 14 replay, in 12.6 s of wall time,
 passing: 77 library, 28 CLI and 14 replay, in 12.5 s of wall time. The five new
 tests are `pushback::single_response_reads_only_the_first_block` and the four
 `cli` tests named in the table above.
+
+## Round 4 and what changed before landing
+
+Round 4 reviewed `b7f65483` (rebased onto agent-utils main `abc75c70`) and
+returned CHANGES REQUESTED: 1 blocker, 13 majors and 1 minor. Its goalpost
+assessment found no weakened assertion; it rejected the requirement-level
+exemptions the earlier commit had documented instead of fixing (burst debt,
+watch estimates, descendant cutoffs, varying-width base64). The landing commit
+fixes every finding except one half of a major, which stays a documented gap.
+Each fix has a test that fails on the code before the fix (an export of
+`b7f65483`, or the tree just before that fix, with the new test copied in) and
+passes after it.
+
+| Round-4 finding | Now | Test that fails before the fix |
+| --- | --- | --- |
+| blocker: an alias beneath a group (`issue publish --help`) was LOCAL, so its body escaped | an unknown word beneath one of gh's groups, `extension exec` and `copilot` are opaque WRITE, `--help` included, with every argument inspected and redacted | `classify::compound_aliases_and_passthrough_commands_are_opaque`, `guard::opaque_commands_beneath_known_families_are_inspected_and_redacted` |
+| major: a cost above the burst was admitted on a full bucket | refused before gh runs (exit 75) unless it is a watch; the halved burst applies when the account-wide budget is low | `cli::a_call_costing_more_than_the_burst_is_refused_before_gh_runs` |
+| major: a `--` taken as a flag value hid later cost flags; `--label -L50001` charged 501 | half fixed: classification reads past every `--`. Kept: a value shaped like `-L<n>` is still read as a limit and refused, since gh-paced does not model which flags take values; the guide gives the `--label=-L50001` workaround | `classify::a_double_dash_flag_value_does_not_hide_later_flags` |
+| major: opaque commands beneath known families were scanned with the family's flag table | they use the generic table (every argument is body text, no last-wins) and the audit keeps flag names only | `guard::opaque_commands_beneath_known_families_are_inspected_and_redacted` |
+| major: an alias expansion's `--input -` body was never seen | gh's `config.yml` aliases are expanded as gh does and the expansion's body sources are checked, stdin included | `cli::an_alias_expansion_has_its_body_inspected`, `alias` unit tests |
+| major: base64 wrapped at varying narrow widths was missed | a block of lines of 4 or more characters that each mix upper and lower case counts together | `guard::varying_narrow_wrapping_is_detected` |
+| major: a last status or header line without a line ending was dropped | single-response mode reads an unterminated last line | `pushback::single_response_reads_an_unterminated_last_line` |
+| major: a late signal still blocked when gh had died by a signal | every message after a late signal has the 2 s stderr deadline, however gh ended | `cli::late_signal_after_gh_died_by_a_signal_still_bounds_the_pushback_banner` |
+| major: a stalled stderr consumer held the account lock | messages decided under the lock are queued and printed after it is released; the lock wait is bounded by `GH_PACED_LOCK_WAIT` (default 30 s, then exit 70) | `cli::a_stalled_stderr_consumer_never_holds_the_account_lock`, `cli::a_lock_held_too_long_fails_instead_of_hanging` |
+| major: a consumer that went away was hidden from gh | the copy stops and gh's end is closed, so gh's next write gets EPIPE/SIGPIPE as without gh-paced | `cli::a_consumer_that_goes_away_is_passed_on_to_gh` |
+| major: interactive `issue create` and `pr merge` were refused | allowed; gh's editor is pointed at `gh-paced --edit-guard`, which runs the user's editor and checks the saved text | `cli::interactive_issue_create_and_pr_merge_run_on_a_terminal`, `cli::text_written_in_the_editor_is_checked` |
+| major: watch requests were unbounded by their charge | watches are refused (exit 64) unless `GH_PACED_ALLOW_WATCH=1`; the refusal points at polling with plain paced calls | `cli::a_watch_without_the_opt_in_is_refused_before_gh_runs`, `classify::watches_need_an_explicit_opt_in` |
+| major: descendant cutoffs discarded later output and pushback | a stream still open after the cutoffs is handed to a `gh-paced --drain` process that copies it to EOF and scans stderr for pushback, recording the cooldown | `cli::late_output_after_a_quiet_spell_is_delivered_and_scanned`, `cli::late_output_past_the_elapsed_cutoff_is_delivered` |
+| major: `--paginate=false` and `--include=false` were read as true | API booleans follow pflag's value parsing and last-wins | `classify::api_booleans_honour_explicit_false_values` |
+| minor: help said gh-paced never reads or prints a token | help rewritten to say that output, including credentials gh prints, passes through, and what the audit holds | none (text only) |
+
+Found while fixing these, not by the review: the burst refusal made `gh status`
+(SEARCH, cost 3, burst 2) exit 75 on every call. It is now READ with cost 10,
+the READ burst (`cli::gh_status_runs_at_the_default_budgets`, which exits 75
+before the fix).
+
+Gaps kept, each stated in the guide's Limitations: the `-L<n>` flag-value case
+above; extensions that call the API through a library; the base64 shapes'
+blind spots; aliases charged one WRITE token whatever they expand to, with no
+extra charge for a `--paginate` inside; prompt-typed titles and template
+defaults the editor guard never sees; the write slot held while the user edits;
+watch estimates under the opt-in; `gh status` request counts growing with
+notifications; and the drainer's limits (a phrase split across the handoff, no
+stdout scan after it, no audit record, interleaving with gh-paced's final
+messages, and lost output with a warning when the drainer cannot start).
 
 ## Test changes worth a reviewer's attention
 
@@ -767,6 +826,33 @@ expectation that follows a fix:
   paginated call can print, and a single-response call now ignores it. Every
   byte is still asserted to arrive.
 
+The landing commit after round 4 changes these existing tests:
+
+- `classify::search_commands`: `status` moved from SEARCH cost 3 to READ cost
+  10, and the test asserts that 10 fits the default READ burst.
+- `guard::uninspectable_forms_are_refused` and
+  `guard::uninspectable_reads_boolean_values`: interactive `issue create` and
+  `pr merge` moved from the refused list to the allowed list, because round 4
+  required them to run; the editor guard tests above cover their text.
+- The watch-loop unit tests run with `GH_PACED_ALLOW_WATCH=1` in their config
+  (`clsw`); their assertions are unchanged.
+- `cli::watch_past_its_deadline_is_stopped` and
+  `cli::watch_that_ignores_term_is_killed` set `GH_PACED_ALLOW_WATCH=1`, and
+  the fake gh's `FAKE_GH_SLEEP` sleep now sends its own stdout and stderr to
+  `/dev/null`. The timing ranges (1.9 to 7.5 s, 6.9 to 20 s) are unchanged.
+  Why: both tests time `Command::output()`, which returns when the caller's
+  stderr reaches end of file. The deadline kills the fake gh, a shell, and
+  leaves its `sleep` running as an orphan that held gh's stderr. Before the
+  drainer, gh-paced closed that stream at the 2 s silence cutoff. With the
+  drainer it is relayed until the orphan exits, as plain gh would leave it,
+  so the tests measured the sleep (8.06 s and 30.09 s) instead of the
+  deadline. The real gh is one process and leaves no such orphan. A
+  descendant that holds stderr after a deadline goes through the same
+  drainer path the late-output tests cover; no test now combines a deadline
+  with such a descendant.
+- `tests/replay.rs` sets the two new `Ran` and wrapper fields (`cut_off: false`,
+  `self_exe: None`); no assertion changed.
+
 The follow-up commit after round 3 removes or loosens no assertion. It adds
 assertions to five existing tests (help detection, grouped shorthands,
 pagination and limit costs, watch loops, alias inspection), adds one test
@@ -779,12 +865,14 @@ pagination and limit costs, watch loops, alias inspection), adds one test
   account need a tighter config file.
 - Classification works from command lines, not HTTP requests.
 - Pushback detection depends on gh's error wording.
-- The watch per-poll figures are estimates from gh's code paths, not
-  measurements. A `run watch` on a run with more than 100 jobs, or with several
+- Watches need `GH_PACED_ALLOW_WATCH=1`. The per-poll figures are estimates
+  from gh's code paths, not measurements. A `run watch` on a run with more than 100 jobs, or with several
   jobs that fail during the watch, can make more requests than it paid for
   before the deadline stops it; the deadline still bounds its wall time and the
   30 s floor its rate.
-- Output a process gh started writes after the post-exit cutoffs is lost.
+- Output a process gh started writes after the post-exit cutoffs goes to a
+  drainer, which has the limits listed under round 4.
+- A flag value shaped like `-L<n>` is read as a limit (see round 4).
 - With `--paginate`, a page body containing a CRLF header block can start an
   unneeded cooldown.
 - No crash-injection test for quarantine (see round 3).

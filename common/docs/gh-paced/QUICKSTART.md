@@ -14,9 +14,13 @@ budget is used up, printing a loud warning line on stderr. It also:
   stops as the remaining allowance shrinks;
 - pauses every call for 15 minutes after any rate-limit, abuse or HTTP 403
   response;
-- refuses write bodies larger than 8 KiB or containing long base64 runs, and
-  writes whose body gh would compose later (an editor, a template, `--fill`, an
-  interactive prompt): pass `--body` or `--body-file` instead.
+- refuses write bodies larger than 8 KiB or containing long base64 runs,
+  whether they come from an argument, a file, stdin, one of gh's aliases, or
+  the editor gh opens (gh-paced points gh's editor at a guard that checks the
+  saved text);
+- refuses writes whose body gh would compose from something it reads later
+  (a template, `--fill`, the commit-message default of an interactive
+  `pr create`): pass `--body` or `--body-file` instead.
 
 Every process on the host shares the budgets through one locked state file. The
 command's own output, exit status, stdin and terminal pass through unchanged.
@@ -70,7 +74,12 @@ stay well under GitHub's documented limits:
 | GIT_CREDENTIAL | 1 per 10 s, 120/hour |
 
 Anything gh-paced does not recognise is charged as a WRITE. A wait longer than
-`GH_PACED_MAX_WAIT` (default 900 s) is refused with exit status 75.
+`GH_PACED_MAX_WAIT` (default 900 s) is refused with exit status 75, and so is a
+single call costing more than its class's burst (a paginated write or search,
+or a list `--limit` above 1,000 items), since one gh call makes those requests back
+to back. Watch loops (`gh pr checks --watch`, `gh run watch`) are refused with
+exit status 64 unless `GH_PACED_ALLOW_WATCH=1` is set; poll with repeated plain
+calls instead.
 
 Run `gh-paced userguide` for the full reference: the classes, the citations
 behind each budget, the configuration options, and every message.

@@ -23,8 +23,18 @@
 //! and stops at end of file, or once the stream has been silent for [`TEE_IDLE_SECS`] (a
 //! descendant holds it open), or [`TEE_AFTER_EXIT_SECS`] after gh exited, or after
 //! [`TEE_AFTER_EXIT_BYTES`] more bytes (a descendant keeps writing). The writer is then waited
-//! for without a time limit, so every byte read reaches the consumer however slowly it reads;
-//! if the consumer goes away (EPIPE), the rest is discarded and reading carries on. An INT,
+//! for without a time limit, so every byte read reaches the consumer however slowly it reads.
+//! A stream that a descendant still holds when the reader stops is not closed: once the writer
+//! has delivered everything read so far, the still-open stream is handed to a separate drainer
+//! process ([`Invocation::drain`], `gh-paced --drain`), which copies the rest to the same
+//! consumer until the last writer closes it or the consumer goes away, scanning stderr for
+//! pushback as it goes. gh-paced itself then finishes and exits without waiting for the
+//! descendant, as gh would have, and nothing the descendant writes is lost.
+//! If the consumer goes away (a write fails, as with EPIPE after `| head -n1` exits), the rest
+//! is discarded and the reader stops and closes its end, so gh's next write to that stream
+//! fails (EPIPE, and SIGPIPE by default; EIO through a pseudo-terminal) just as it would have
+//! writing to the consumer directly, instead of gh writing on, and perhaps paginating on, into
+//! gh-paced. What was scanned before that point still counts. An INT,
 //! TERM, HUP or QUIT that arrives after gh has exited, sent by a process or typed at the
 //! terminal, abandons whatever is still undelivered and is reported in [`Ran::late_signal`], so gh-paced can die by it after its bookkeeping
 //! rather than wait indefinitely on a consumer that has stopped reading. The writers write to
@@ -84,6 +94,18 @@ impl fmt::Debug for PushbackHook {
     }
 }
 
+/// The command that continues delivering a stream gh-paced stops reading while a process gh
+/// started still holds it (see the module documentation). The stream becomes the command's
+/// standard input; `err` or `out` is appended to [`DrainCommand::args`] to say which of
+/// gh-paced's streams it copies to.
+#[derive(Debug, Clone)]
+pub struct DrainCommand {
+    /// Program to run (gh-paced's own executable).
+    pub program: std::path::PathBuf,
+    /// Arguments before the stream name.
+    pub args: Vec<String>,
+}
+
 /// One child process to run.
 #[derive(Debug, Clone)]
 pub struct Invocation<'a> {
@@ -105,6 +127,10 @@ pub struct Invocation<'a> {
     pub scan_stdout: bool,
     /// Called as soon as the scanner's pushback signals change (see [`PushbackHook`]).
     pub on_pushback: Option<PushbackHook>,
+    /// Hands a stream still held by a descendant after gh exits to a drainer process. `None`:
+    /// such a stream is closed when the reader stops, and later output to it is lost
+    /// ([`Ran::cut_off`]).
+    pub drain: Option<DrainCommand>,
 }
 
 /// How an interactive run ended.
@@ -117,6 +143,10 @@ pub struct Ran {
     /// A user-sent signal that arrived after gh exited, while its output was still being
     /// delivered; the undelivered rest was abandoned.
     pub late_signal: Option<i32>,
+    /// A process gh started still held one of the teed streams when gh-paced stopped reading
+    /// it, and no drainer could take the stream over, so anything that process wrote to it
+    /// afterwards was lost.
+    pub cut_off: bool,
 }
 
 /// Output of a captured (non-interactive) run.
@@ -310,12 +340,38 @@ fn decode(status: std::process::ExitStatus) -> Exit {
 }
 
 /// Which of our streams a tee copies to, and how the scanner reads it.
-#[derive(Clone, Copy)]
-enum Stream {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Stream {
     /// stderr: scanned for gh's error messages.
     Err,
     /// stdout of `gh api --include`: scanned for the status line and headers.
     Out,
+}
+
+impl Stream {
+    /// The name the drainer takes on its command line.
+    pub fn name(self) -> &'static str {
+        match self {
+            Stream::Err => "err",
+            Stream::Out => "out",
+        }
+    }
+
+    /// The stream named `name` on the drainer's command line.
+    pub fn from_name(name: &str) -> Option<Self> {
+        match name {
+            "err" => Some(Stream::Err),
+            "out" => Some(Stream::Out),
+            _ => None,
+        }
+    }
+
+    fn fd(self) -> RawFd {
+        match self {
+            Stream::Err => 2,
+            Stream::Out => 1,
+        }
+    }
 }
 
 /// The queue between a tee's reader and writer.
@@ -464,21 +520,31 @@ fn scan_and_publish(
 
 /// Read `src` until it ends (EIO from a pty master counts as the end), feeding the scanner
 /// (and calling the pushback hook) before queueing each chunk, and stopping early after gh's
-/// exit as described in the module documentation.
+/// exit, or as soon as delivery is abandoned, as described in the module documentation.
+/// Returns `src` when it stopped at one of the after-exit cutoffs, so the stream, which a
+/// descendant may still write to, can be handed to a drainer; otherwise it drops `src`, which
+/// closes gh-paced's end of gh's stream.
 fn tee_reader(
     mut src: File,
     which: Stream,
     scanner: Arc<Mutex<Scanner>>,
     tee: Arc<Tee>,
     hook: Option<PushbackHook>,
-) {
+) -> Option<File> {
     let fd = src.as_raw_fd();
     let mut buf = vec![0u8; 64 * 1024];
     let mut published = String::new();
     let mut last_data = Instant::now();
     let mut exited_at: Option<Instant> = None;
     let mut after_exit = 0usize;
+    let mut held = false;
     loop {
+        if tee.lock().broken {
+            // The consumer went away, or a late signal abandoned delivery: stop reading so the
+            // read end closes and gh's next write to this stream fails, as it would have
+            // written to the consumer directly.
+            break;
+        }
         if exited_at.is_none() && tee.child_exited.load(Ordering::SeqCst) {
             exited_at = Some(Instant::now());
             last_data = Instant::now();
@@ -489,6 +555,7 @@ fn tee_reader(
                 || now.duration_since(at).as_secs_f64() >= TEE_AFTER_EXIT_SECS
                 || after_exit >= TEE_AFTER_EXIT_BYTES
             {
+                held = true;
                 break;
             }
         }
@@ -517,10 +584,12 @@ fn tee_reader(
     }
     scan_and_publish(&scanner, which, None, hook.as_ref(), &mut published);
     tee.close();
+    held.then_some(src)
 }
 
 /// Copy the queue to our stream until the reader has stopped and the queue is empty. A write
-/// error (the consumer went away) marks the queue broken and discards the rest.
+/// error (the consumer went away) marks the queue broken and discards the rest, and the reader
+/// then stops and closes gh's stream (see [`tee_reader`]).
 fn tee_writer(which: Stream, tee: Arc<Tee>) {
     loop {
         let chunk = {
@@ -543,14 +612,62 @@ fn tee_writer(which: Stream, tee: Arc<Tee>) {
         let Some(chunk) = chunk else {
             return;
         };
-        let fd = match which {
-            Stream::Err => 2,
-            Stream::Out => 1,
-        };
-        if !write_fd_all(fd, &chunk) {
+        if !write_fd_all(which.fd(), &chunk) {
             tee.abandon();
         }
     }
+}
+
+/// Start the drainer on `src`, a stream a descendant of gh still holds. The drainer gets the
+/// stream as its standard input and gh-paced's own standard output and error; nothing else
+/// gh-paced holds is inherited (every other descriptor is close-on-exec, the write lease and
+/// snapshot lock included). gh-paced does not wait for it. False when there is no drainer or it
+/// could not be started; the stream is then closed.
+fn hand_off(src: File, which: Stream, drain: Option<&DrainCommand>) -> bool {
+    let Some(d) = drain else {
+        return false;
+    };
+    Command::new(&d.program)
+        .args(&d.args)
+        .arg(which.name())
+        .stdin(Stdio::from(src))
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .is_ok()
+}
+
+/// The drainer (`gh-paced --drain ... STREAM`): copy standard input to `which` (descriptor 2
+/// or 1) until the last writer closes it (end of file, or EIO from a pseudo-terminal master) or
+/// a write fails because the consumer went away. Closing standard input on the way out makes
+/// the descendant's next write fail just as it would have writing to the consumer directly.
+/// stderr is fed to the pushback scanner before each chunk is written, calling `hook` when its
+/// signals change; stdout is copied unscanned, since after gh's exit it holds no HTTP headers.
+pub fn drain(which: Stream, hook: Option<&PushbackHook>) -> i32 {
+    let scanner = Mutex::new(Scanner::new());
+    let mut published = String::new();
+    let mut buf = vec![0u8; 64 * 1024];
+    loop {
+        // SAFETY: reading into a valid buffer of the given length from descriptor 0.
+        let n = unsafe { libc::read(0, buf.as_mut_ptr().cast(), buf.len()) };
+        let n = match usize::try_from(n) {
+            Ok(0) => break,
+            Ok(n) => n,
+            Err(_) => {
+                if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
+                    continue;
+                }
+                break;
+            }
+        };
+        if which == Stream::Err {
+            scan_and_publish(&scanner, which, Some(&buf[..n]), hook, &mut published);
+        }
+        if !write_fd_all(which.fd(), &buf[..n]) {
+            break;
+        }
+    }
+    0
 }
 
 /// A child stream gh-paced reads: the child's end goes into the Command, the reader is kept.
@@ -745,7 +862,7 @@ impl Runner for RealRunner {
                 let reader = std::thread::spawn(move || tee_reader(src, which, s, t, hook));
                 let t = Arc::clone(&tee);
                 let writer = std::thread::spawn(move || tee_writer(which, t));
-                tees.push((tee, reader, writer));
+                tees.push((which, (tee, reader, writer)));
             }
         }
         feed_stdin(&mut child, inv.stdin);
@@ -755,29 +872,34 @@ impl Runner for RealRunner {
         // Every reader stops on its own once gh has exited (see the module documentation); every
         // writer then delivers what was read, however long the consumer takes, unless a user
         // signal says to stop.
-        for (tee, _, _) in &tees {
+        for (_, (tee, _, _)) in &tees {
             tee.child_exited();
         }
         let late_signal = loop {
             if tees
                 .iter()
-                .all(|(_, r, w)| r.is_finished() && w.is_finished())
+                .all(|(_, (_, r, w))| r.is_finished() && w.is_finished())
             {
                 break None;
             }
             let sig = LATE_SIGNAL.load(Ordering::SeqCst);
             if sig != 0 {
-                for (tee, _, _) in &tees {
+                for (_, (tee, _, _)) in &tees {
                     tee.abandon();
                 }
                 break Some(sig);
             }
             std::thread::sleep(Duration::from_millis(20));
         };
+        let mut cut_off = false;
         if late_signal.is_none() {
-            for (_, reader, writer) in tees {
-                let _ = reader.join();
+            for (which, (_, reader, writer)) in tees {
+                let held = reader.join().ok().flatten();
                 let _ = writer.join();
+                // The writer has delivered everything read, so the drainer continues in order.
+                if let Some(src) = held {
+                    cut_off |= !hand_off(src, which, inv.drain.as_ref());
+                }
             }
         }
         if let Ok(s) = shared.lock() {
@@ -787,6 +909,7 @@ impl Runner for RealRunner {
             exit: decode(s),
             deadline_hit,
             late_signal,
+            cut_off,
         })
     }
 

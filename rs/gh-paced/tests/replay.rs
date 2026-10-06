@@ -104,6 +104,7 @@ impl Runner for FakeGh<'_> {
             exit: Exit::Code(0),
             deadline_hit: false,
             late_signal: None,
+            cut_off: false,
         })
     }
 
@@ -167,6 +168,7 @@ fn gh(
         real_gh: PathBuf::from("/fake/gh"),
         echo: false,
         messages: Vec::new(),
+        printed: 0,
         stdin_is_tty: true,
         stdin_reader: Box::new(|_| Ok(Vec::new())),
         chain: Vec::new(),
@@ -176,6 +178,9 @@ fn gh(
         pid: 4242,
         start_ticks: 1,
         nonce: format!("{:016x}", NONCE.fetch_add(1, Ordering::SeqCst)),
+        gh_aliases: Vec::new(),
+        editor_guard_env: Vec::new(),
+        self_exe: None,
         stderr_deadline: None,
     };
     let outcome = w.run(args);
@@ -976,6 +981,7 @@ fn in_flight_wait_warns_on_every_poll() {
         real_gh: PathBuf::from("/fake/gh"),
         echo: false,
         messages: Vec::new(),
+        printed: 0,
         stdin_is_tty: true,
         stdin_reader: Box::new(|_| Ok(Vec::new())),
         chain: Vec::new(),
@@ -985,6 +991,9 @@ fn in_flight_wait_warns_on_every_poll() {
         pid: 4242,
         start_ticks: 1,
         nonce: format!("{:016x}", NONCE.fetch_add(1, Ordering::SeqCst)),
+        gh_aliases: Vec::new(),
+        editor_guard_env: Vec::new(),
+        self_exe: None,
         stderr_deadline: None,
     };
     let outcome = w.run(&strings(&["issue", "comment", "1", "--body", "short note"]));
