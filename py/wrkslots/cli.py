@@ -620,6 +620,15 @@ _RETAINED_HANDLE_STABLE_NS = 2_000_000_000
 # waited for (``_settle_retained_handles``).  A change time further ahead
 # than this is not waited for, and the handle stays recent.
 _RETAINED_HANDLE_SETTLE_SLACK_NS = 250_000_000
+# How far this host's realtime clock may fall against its monotonic clock
+# between two handle reads before an equal handle in both is not trusted
+# (``_retained_handle_changes``).  A rewrite alike needs the realtime clock
+# back in the timestamp tick of a change time the earlier read found at
+# least ``_RETAINED_HANDLE_STABLE_NS`` old: a step back of more than one
+# second where file times keep whole seconds.  Frequency correction moves
+# both clocks alike; only a step (or an inserted leap second) moves one
+# against the other.
+_RETAINED_HANDLE_CLOCK_STEP_NS = 500_000_000
 # The bound on one /proc/<pid>/mountinfo read, sized from measurement. On
 # 2026-10-04, at load average about 150, the largest of 4,118 readable tables
 # on a production host was 143,648 bytes (976 mounts), so 4 MiB is about 29
@@ -1215,6 +1224,11 @@ class _RetainedValidationHandle:
     # not rule out a rewrite (``_settle_retained_handles``, ``_run_evidence``).
     # Not part of the identity.
     recent: bool = dataclasses.field(default=False, compare=False)
+    # This host's realtime clock less its monotonic clock, in nanoseconds,
+    # when the census that read it began; a fall between two reads is a
+    # step back of the realtime clock (``_retained_handle_changes``).  Not
+    # part of the identity.
+    clock_offset_ns: int | None = dataclasses.field(default=None, compare=False)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -16868,10 +16882,9 @@ class _RunEvidence:
     bindings: Mapping[str, tuple[_RetainedValidationHandle, ...]]
     members: Mapping[str, int]
     # Handles whose two reads, before and after the host evidence, differ,
-    # or whose first read was too recent for an equal second read to rule
-    # out a rewrite: each with how it changed ("appeared", "changed",
-    # "disappeared or stopped naming the row", or "may have been rewritten
-    # alike within one file timestamp tick").
+    # or are equal where that does not rule out a rewrite, and handles that
+    # changed while a recent handle's timestamp window was waited out: each
+    # with how and when it changed (``_retained_handle_changes``).
     late: Mapping[str, tuple[tuple[_RetainedValidationHandle, str], ...]]
 
 
@@ -16894,8 +16907,11 @@ def _run_evidence(
     tick leaves every recorded field alike, so when a handle of the first
     read changed within ``_RETAINED_HANDLE_STABLE_NS`` of it, the window is
     waited out and the handles are read again before the host evidence
-    (``_settle_retained_handles``); a handle that is still that recent and
-    that both reads find alike is recorded in ``late`` too.  The
+    (``_settle_retained_handles``), and a difference between the reads
+    before and after the wait is recorded in ``late`` as well.  A handle
+    that both reads find alike while either finds it that recent, or
+    across a step back of this host's realtime clock, is recorded in
+    ``late`` too (``_retained_handle_changes``).  The
     current members of their units' control groups are read last (see
     ``_retained_unit_cgroup_members``).  ``first`` is a handle read the
     caller has already made and judged.  Every caller that judges rows from
@@ -16923,28 +16939,86 @@ def _run_evidence(
         {handle.unit for handles in bindings.values() for handle in handles}
     )
     late: dict[str, tuple[tuple[_RetainedValidationHandle, str], ...]] = {}
-    for slot in {*first, *later}:
-        before = {handle.path: handle for handle in first.get(slot, ())}
-        after = {handle.path: handle for handle in later.get(slot, ())}
-        changes = tuple(
-            (handle, "appeared" if path not in before else "changed")
-            for path, handle in after.items()
-            if before.get(path) != handle
-        ) + tuple(
-            (
-                handle,
-                "may have been rewritten alike within one file timestamp tick",
-            )
-            for path, handle in after.items()
-            if before.get(path) == handle and before[path].recent
-        ) + tuple(
-            (handle, "disappeared or stopped naming the row")
-            for path, handle in before.items()
-            if path not in after
+    for slot in {*earlier, *first, *later}:
+        changes = _retained_handle_changes(
+            first.get(slot, ()),
+            later.get(slot, ()),
+            window=True,
+            during="while the host evidence was read",
         )
+        if earlier is not first:
+            changes += _retained_handle_changes(
+                earlier.get(slot, ()),
+                first.get(slot, ()),
+                window=False,
+                during="while their timestamp window was waited out",
+            )
         if changes:
             late[slot] = changes
     return _RunEvidence(processes, units, bindings, members, late)
+
+
+def _retained_handle_changes(
+    before: Sequence[_RetainedValidationHandle],
+    after: Sequence[_RetainedValidationHandle],
+    *,
+    window: bool,
+    during: str,
+) -> tuple[tuple[_RetainedValidationHandle, str], ...]:
+    """Every difference between two reads of one row's handles, as ``late`` holds it.
+
+    A handle only ``after`` holds appeared, one that differs changed, and
+    one only ``before`` holds disappeared or stopped naming the row.  An
+    equal handle may still have been rewritten alike: with ``window``, when
+    either read found it within ``_RETAINED_HANDLE_STABLE_NS`` of its change
+    time (the later read finds that only if the realtime clock went back),
+    and always when the realtime clock fell more than
+    ``_RETAINED_HANDLE_CLOCK_STEP_NS`` against the monotonic clock between
+    the two reads.  ``during`` says when, and ends each description.
+    """
+
+    first = {handle.path: handle for handle in before}
+    second = {handle.path: handle for handle in after}
+    changes: list[tuple[_RetainedValidationHandle, str]] = []
+    changes.extend(
+        (handle, "appeared" if path not in first else "changed")
+        for path, handle in second.items()
+        if first.get(path) != handle
+    )
+    if window:
+        changes.extend(
+            (handle, "may have been rewritten alike within one file timestamp tick")
+            for path, handle in second.items()
+            if first.get(path) == handle and (first[path].recent or handle.recent)
+        )
+    changes.extend(
+        (
+            handle,
+            "may have been rewritten alike while this host's realtime clock stepped back",
+        )
+        for path, handle in second.items()
+        if first.get(path) == handle
+        and _realtime_clock_stepped_back(first[path], handle)
+    )
+    changes.extend(
+        (handle, "disappeared or stopped naming the row")
+        for path, handle in first.items()
+        if path not in second
+    )
+    return tuple((handle, f"{change} {during}") for handle, change in changes)
+
+
+def _realtime_clock_stepped_back(
+    before: _RetainedValidationHandle, after: _RetainedValidationHandle
+) -> bool:
+    """Whether the realtime clock fell against the monotonic clock between
+    the censuses that read ``before`` and ``after``."""
+
+    return (
+        before.clock_offset_ns is not None
+        and after.clock_offset_ns is not None
+        and before.clock_offset_ns - after.clock_offset_ns > _RETAINED_HANDLE_CLOCK_STEP_NS
+    )
 
 
 def _settle_retained_handles(
@@ -17007,9 +17081,9 @@ def _judge_run_evidence(
     for slot in sorted(slots):
         for handle, change in evidence.late.get(slot, ()):
             raise _ValidationRunMayUseRow(
-                f"retained validation handle {handle.path} for row {slot} {change} while "
-                "the host evidence was read, so its unit "
-                f"{handle.unit} may have been queued after the user-systemd enumerations"
+                f"retained validation handle {handle.path} for row {slot} {change}, "
+                f"so its unit {handle.unit} may have been queued after the user-systemd "
+                "enumerations"
             )
 
 
@@ -43985,6 +44059,10 @@ def _retained_handle_clock_ns() -> int:
     return time.time_ns()
 
 
+def _retained_handle_monotonic_ns() -> int:
+    return time.monotonic_ns()
+
+
 def _retained_handles_for_absent_rows(
     config: Config, rows: Sequence[tuple[ActiveRecord, tuple[Path, ...]]]
 ) -> Mapping[str, tuple[_RetainedValidationHandle, ...]]:
@@ -43996,17 +44074,17 @@ def _retained_handles_for_absent_rows(
     # normalized and symlink-resolved spelling and by file identity, so a
     # symlink to the slot or a directory below it names the row too.
     deadline = time.monotonic() + _RETAINED_HANDLE_CENSUS_SECONDS
-    targets = [
-        (record.slot, _row_path_identity(target)) for record, paths in rows for target in paths
-    ]
-    # The census's own deadline bounds its path matching, in place of the
-    # judgement's.
+    # The census's own deadline bounds its path matching, and the reading
+    # of the rows' identities, in place of the judgement's.
     resolver = _UnitPathResolver(
         _UnitResolutionBudget.start(
             deadline=deadline,
             expired="retained validation handle census exceeded its time bound",
         )
     )
+    targets = [
+        (record.slot, resolver.row(target)) for record, paths in rows for target in paths
+    ]
     matched: dict[str, list[_RetainedValidationHandle]] = {
         record.slot: [] for record, _paths in rows
     }
@@ -44014,7 +44092,9 @@ def _retained_handles_for_absent_rows(
     total_bytes = 0
     if time.monotonic() >= deadline:
         raise Refusal("retained validation handle census exceeded its time bound")
-    stable_before_ns = _retained_handle_clock_ns() - _RETAINED_HANDLE_STABLE_NS
+    started_ns = _retained_handle_clock_ns()
+    stable_before_ns = started_ns - _RETAINED_HANDLE_STABLE_NS
+    clock_offset_ns = started_ns - _retained_handle_monotonic_ns()
     if handles.is_dir():
         try:
             with os.scandir(handles) as entries:
@@ -44153,6 +44233,7 @@ def _retained_handles_for_absent_rows(
             boot_id,
             file_generation,
             recent=after.st_ctime_ns > stable_before_ns,
+            clock_offset_ns=clock_offset_ns,
         )
         for slot in related:
             matched[slot].append(handle)
@@ -47389,6 +47470,11 @@ _UNIT_VALUE_STARTS = re.compile(r"=|[\s\x00\"'`:,;&|()<>{}$](?=[/~])")
 _UNIT_SHELL_TEXT = re.compile(r"[\s\"'\\;&|()<>]")
 # How many times a shell word is read again as shell text.
 _UNIT_SHELL_NESTING = 3
+# How many characters the shell-word reader reads between checks of the
+# judgement's time bound (``_BudgetedText``).  Both of its readings
+# together read about 540,000 characters a second on devbig014
+# (2026-10-05), so a check falls about every 8 milliseconds.
+_UNIT_SHELL_CHECK_CHARACTERS = 4096
 # The work one judgement may spend reading the words of the user-systemd
 # units and retained run handles and resolving them as paths
 # (``_UnitResolutionBudget``): characters of words, readings and candidate
@@ -47540,12 +47626,19 @@ class _UnitPathResolver:
         self._kinds: dict[str, str] = {}
         self._targets: dict[str, str] = {}
 
+    def row(self, path: Path) -> _RowPathIdentity:
+        """``_row_path_identity(path)``, once the time bound is checked."""
+
+        self._budget.spend()
+        return _row_path_identity(path)
+
     def _kind(self, path: str) -> str:
         try:
             return self._kinds[path]
         except KeyError:
             pass
-        self._budget.spend(lookups=1)
+        # The memo keeps the path, so its characters are charged too.
+        self._budget.spend(characters=len(path), lookups=1)
         try:
             metadata = os.lstat(path)
         except OSError as exc:
@@ -47565,7 +47658,7 @@ class _UnitPathResolver:
             return self._targets[path]
         except KeyError:
             pass
-        self._budget.spend(lookups=1)
+        self._budget.spend(characters=len(path), lookups=1)
         try:
             target = os.readlink(path)
         except OSError as exc:
@@ -47573,6 +47666,7 @@ class _UnitPathResolver:
                 "a path that a user-systemd unit or retained run handle names "
                 f"cannot be resolved: {exc}"
             ) from exc
+        self._budget.spend(characters=len(target))
         self._targets[path] = target
         return target
 
@@ -47589,11 +47683,23 @@ class _UnitPathResolver:
         and ``realpath`` reads a failed lookup as a plain name.  The
         lookups and link targets are memoized for the judgement.  A link
         target that cannot be read, a path that cannot be looked up at all,
-        or more than ``_REALPATH_LINK_NESTING`` nested links refuses.
+        or more than ``_REALPATH_LINK_NESTING`` nested links refuses.  So
+        does a path holding a NUL or a character the file-system encoding
+        cannot encode, wherever it stands, as ``realpath`` raises for one
+        when it looks up the component holding it.
         """
 
         if not path.startswith("/"):
             raise Refusal(f"cannot resolve relative path {path!r}")
+        try:
+            if "\0" in path:
+                raise ValueError("embedded null byte")
+            os.fsencode(path)
+        except ValueError as exc:
+            raise Refusal(
+                "a path that a user-systemd unit or retained run handle names "
+                f"cannot be resolved: {exc}"
+            ) from exc
         try:
             components, _prefixes, _end = self._join_real([], [], None, path, {}, 0)
         except _SymlinkLoop as loop:
@@ -47652,6 +47758,8 @@ class _UnitPathResolver:
             if end is not None:
                 components.append(name)
                 continue
+            # A memoized lookup is free, so the time bound is checked here.
+            self._budget.spend()
             joined = (prefixes[-1] if prefixes else "") + "/" + name
             kind = self._kind(joined)
             if kind != "link":
@@ -47664,6 +47772,7 @@ class _UnitPathResolver:
                 known = seen[joined]
                 if known is None:
                     raise _SymlinkLoop(os.path.join(joined, text[position:]))
+                self._budget.spend(characters=len(known[0]) + len(known[1]))
                 components, prefixes, end = list(known[0]), list(known[1]), known[2]
                 continue
             seen[joined] = None
@@ -47673,6 +47782,8 @@ class _UnitPathResolver:
                 )
             except _SymlinkLoop as loop:
                 raise _SymlinkLoop(os.path.join(loop.path, text[position:])) from None
+            # The copies are charged as one character per part.
+            self._budget.spend(characters=len(components) + len(prefixes))
             seen[joined] = (tuple(components), tuple(prefixes), end)
         return components, prefixes, end
 
@@ -47684,7 +47795,7 @@ class _UnitPathResolver:
             return self._files[path]
         except KeyError:
             pass
-        self._budget.spend(lookups=1)
+        self._budget.spend(characters=len(path), lookups=1)
         answer: tuple[tuple[int, int] | None, bool]
         try:
             metadata = os.stat(path)
@@ -47736,6 +47847,8 @@ class _UnitPathResolver:
                 self._realpath(spelling) for spelling in dict.fromkeys((joined, lexical))
             )
         )
+        # A symlink's target can make a resolution longer than its text.
+        self._budget.spend(characters=sum(len(spelling) for spelling in resolved))
         files: set[tuple[int, int]] = set()
         for current in resolved:
             files.update(self._ancestor_files(current))
@@ -47756,6 +47869,9 @@ class _UnitPathResolver:
 
         base = _unit_working_directory(unit)
         for value in unit.values():
+            # A property read for an earlier row costs nothing again, so
+            # the time bound is checked for each.
+            self._budget.spend()
             for spelling in row.spellings:
                 mentioned, paths = _property_mentions(value, spelling)
                 if mentioned or any(self.path_names(path, row) for path in paths):
@@ -47796,6 +47912,7 @@ class _UnitPathResolver:
         is the row's own file.
         """
 
+        self._budget.spend()
         spellings, files = self._resolve(joined)
         if row.file is not None and row.file in files:
             return True
@@ -47806,19 +47923,57 @@ class _UnitPathResolver:
         )
 
 
-def _shell_words(text: str) -> tuple[str, ...]:
+class _BudgetedText:
+    """Text that ``shlex`` reads, checking a judgement's time bound as it goes.
+
+    ``shlex`` reads its input one character at a time, and a single word
+    can be as long as the whole text, so the bound is checked every
+    ``_UNIT_SHELL_CHECK_CHARACTERS`` characters read rather than between
+    words.
+    """
+
+    def __init__(self, text: str, budget: _UnitResolutionBudget) -> None:
+        self._text = text
+        self._position = 0
+        self._budget = budget
+        self._unchecked = 0
+
+    def _advance(self, end: int) -> str:
+        start = self._position
+        self._position = end
+        self._unchecked += end - start
+        if self._unchecked >= _UNIT_SHELL_CHECK_CHARACTERS:
+            self._unchecked = 0
+            self._budget.spend()
+        return self._text[start:end]
+
+    def read(self, size: int = -1) -> str:
+        end = len(self._text) if size < 0 else min(len(self._text), self._position + size)
+        return self._advance(end)
+
+    def readline(self) -> str:
+        end = self._text.find("\n", self._position)
+        return self._advance(len(self._text) if end < 0 else end + 1)
+
+
+def _shell_words(text: str, budget: _UnitResolutionBudget) -> tuple[str, ...]:
     """The shell words of ``text``, read plainly and with control operators.
 
     Plain reading joins an operator written against a word to it
     (``'/x/y z';`` is the word ``/x/y z;``); the second reading makes
     ``;``, ``&&``, ``|`` and the other control operators words of their
     own.  Text that does not parse, such as an unclosed quote, keeps the
-    words read before the error.
+    words read before the error.  ``budget``'s time bound is checked as
+    the text is read (``_BudgetedText``).
     """
 
     words: list[str] = []
     for operators in (False, True):
-        lexer = shlex.shlex(text, posix=True, punctuation_chars=operators)
+        lexer = shlex.shlex(
+            _BudgetedText(text, budget),  # type: ignore[arg-type]
+            posix=True,
+            punctuation_chars=operators,
+        )
         lexer.whitespace_split = True
         lexer.commenters = ""
         try:
@@ -47862,7 +48017,7 @@ def _unit_property_words(value: str, budget: _UnitResolutionBudget) -> tuple[str
                 dict.fromkeys(
                     word
                     for text in level
-                    for word in _shell_words(text)
+                    for word in _shell_words(text, budget)
                     if word != text
                 )
             )
@@ -47947,10 +48102,14 @@ def _spelling_is_within(path: str, root: str) -> bool:
 
 
 def _unit_working_directory(unit: Mapping[str, str]) -> str:
-    """The directory a unit's relative paths are resolved against."""
+    """The directory a unit's relative paths are resolved against.
+
+    The property is the manager's own string, read over D-Bus, so
+    whitespace in it is part of the directory's name and is kept.
+    """
 
     home = os.path.expanduser("~")
-    raw = unit.get("WorkingDirectory", "").strip().lstrip(_UNIT_PATH_PREFIXES)
+    raw = unit.get("WorkingDirectory", "").lstrip(_UNIT_PATH_PREFIXES)
     if raw in {"", "~"}:
         return home
     if raw.startswith("~/"):
@@ -48034,9 +48193,7 @@ def _assert_absent_validate_systemd_unrelated(
                     )
     if resolver is None:
         resolver = _UnitPathResolver()
-    targets = tuple(
-        (record, _row_path_identity(path)) for record, paths in rows for path in paths
-    )
+    targets = tuple((record, resolver.row(path)) for record, paths in rows for path in paths)
     for unit in snapshot:
         active = unit["ActiveState"] not in {"inactive", "failed"}
         queued = unit["PendingJob"] == "yes"

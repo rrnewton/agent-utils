@@ -409,7 +409,9 @@ spellings (below) are also found as text anywhere in a property string, when the
 one of those characters and end it or precede `/` or one of those characters, so a row path is found
 whole even where it contains a newline or ends just before a `:`. One followed by a path that leaves
 it through `..` before the next of those characters (`<row>/../slot02`) is resolved as that whole
-path instead, so it names the row only when a symlink leads back inside. Every reading only adds
+path instead, so it names the row only when a symlink leads back inside; a quoted spelling that
+such a path follows outside the quotes (`cd '<row>'/../slot02`) is not joined with it, and names the
+row, refusing falsely. Every reading only adds
 words, so a path that contains one of these characters can name a row it is not inside
 (`slot01:other` names `slot01`) and refuse falsely, but no reading hides a row path's own spelling.
 A symlink to a row whose own name contains one of these characters can still go unmatched by the
@@ -432,10 +434,13 @@ symlinks followed inside each other, refuses. Its ancestors are looked up from `
 below one that is missing, not a directory, a symlink loop or too long. One judgement may read
 33,554,432 characters of words and the paths made from them, make 262,144 lookups (`lstat`, `stat`
 and `readlink`), and take 20 seconds; past any of these bounds it refuses, so the row is
-unverifiable. Because every value is read to the end of its element, a search list's characters
-grow with the square of its length: a 130,001-character `NAME=/a:/b:...` list of 10,000 entries
-refuses, while all of the active units on devbig014 read about 2.9 million characters and made
-about 4,800 lookups in 0.2 seconds (2026-10-05). This rule is shared with
+unverifiable. The time bound is checked throughout, including every 4,096 characters that the shell
+word reader reads (about every 8 milliseconds on devbig014) and each property and path answered from
+what the judgement has already read. Because every value is read to the end of its element, a search
+list's characters grow with the square of its length: a 130,001-character `NAME=/a:/b:...` list of
+10,000 entries refuses, while the 77 active units on devbig014, with 155,976 characters of
+properties, read about 8.5 million characters, a quarter of the bound, and made about 4,950 lookups
+in 0.4 seconds (2026-10-06). This rule is shared with
 `recover-absent-validate-rows`, and with a retained run handle's checkout, which the handle census
 matches with the rows within its 30-second time bound; that bound starts before the rows' own paths
 are read, and also bounds the matching in place of the 20 seconds.
@@ -459,9 +464,13 @@ process or member. Such a handle is `alive`, and a rerun reads it before the uni
 rewritten with the same bytes within one file timestamp tick keeps all of those, so when a handle
 of the first read changed within the last two seconds (by this host's clock, which the kernel uses
 for file times), that is waited out and the handles are read again before the units: a run that
-has just written its handle as it finishes is judged, not refused. A handle that both reads find
-alike while it is still that recent (the clock stands still, or the change time is more than two
-and a quarter seconds ahead of it and is not waited for) is `alive` too. Last, the
+has just written its handle as it finishes is judged, not refused. A handle that appeared, changed
+or went between the reads before and after that wait is `alive` as well. A handle that both reads
+find alike while either finds it that recent (the clock stands still or went back, or the change
+time is more than a quarter second ahead of it and is not waited for) is `alive` too, and so is one
+that both reads find alike while this host's realtime clock fell more than half a second against its
+monotonic clock between them: after a step back into a handle's timestamp tick, a run that registers
+again alike leaves both reads equal. Last, the
 current members of every control group named after a handle's unit, and of its
 descendants, are read from the cgroup v2 hierarchy below the user service manager; a member there is
 `alive`. A host without a cgroup v2 hierarchy at `/sys/fs/cgroup`, whose cgroup v2 mount there shows

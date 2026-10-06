@@ -706,6 +706,32 @@ def test_a_relative_path_holding_a_newline_is_one_argument(tmp_path: Path) -> No
     assert not names(WorkingDirectory=base, ExecStart="make\0-C\0with\nnewline/slot010")
 
 
+@pytest.mark.parametrize("trailing", ["\n", " ", "\t"], ids=["newline", "space", "tab"])
+def test_a_working_directory_ending_in_whitespace_keeps_it(
+    tmp_path: Path, trailing: str
+) -> None:
+    """Whitespace that ends ``WorkingDirectory`` is part of the directory's name.
+
+    The manager reports the property as its own string, so a relative
+    argument is resolved against the directory with the whitespace, and
+    removing it would resolve the argument below another directory.
+    """
+
+    base = tmp_path / f"base{trailing}"
+    row = base / "slot01"
+    row.mkdir(parents=True)
+    (tmp_path / "base" / "slot01").mkdir(parents=True)
+
+    def names(**unit: str) -> bool:
+        return wrkslots._UnitPathResolver().names(unit, wrkslots._row_path_identity(row))
+
+    assert names(WorkingDirectory=str(base), ExecStart="/bin/tool\0--checkout=slot01/product")
+    assert names(WorkingDirectory=str(base), ExecStart="make\0-C\0slot01")
+    assert not names(
+        WorkingDirectory=str(tmp_path / "base"), ExecStart="/bin/tool\0--checkout=slot01/product"
+    )
+
+
 def test_user_systemd_string_arrays_separate_elements_with_nul(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1047,6 +1073,22 @@ def test_resolving_refuses_what_realpath_cannot_answer(
         wrkslots._UnitPathResolver()._realpath(f"{tmp_path}/link/x")
 
 
+@pytest.mark.parametrize("name", ["\0slot01", "\ud800slot01"], ids=["nul", "unencodable"])
+@pytest.mark.parametrize("parent", ["", "absent-parent/"], ids=["present", "missing"])
+def test_resolving_refuses_a_path_that_realpath_cannot_look_up(
+    tmp_path: Path, name: str, parent: str
+) -> None:
+    """A name holding a NUL, or a character the file-system encoding cannot
+    encode, refuses as ``realpath`` raises for it, below a missing parent
+    too, where no lookup reaches it."""
+
+    path = f"{tmp_path}/{parent}{name}"
+    with pytest.raises(ValueError):
+        os.path.realpath(path)
+    with pytest.raises(wrkslots.Refusal, match="cannot be resolved"):
+        wrkslots._UnitPathResolver()._realpath(path)
+
+
 def test_one_resolver_reads_each_unit_property_once_for_every_row(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1141,6 +1183,67 @@ def test_the_retained_handle_census_bound_covers_the_row_identities(
     assert elapsed[0] > wrkslots._RETAINED_HANDLE_CENSUS_SECONDS
 
 
+def test_the_retained_handle_census_checks_its_bound_before_each_row_identity(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The census stops at the first row identity read after its bound passed.
+
+    The clock is simulated: reading the first of the row's three paths
+    takes longer than the whole bound, and the other two are not read.
+    """
+
+    project, tree = _prepare(tmp_path, monkeypatch, agent_liveness="dead")
+    _write_run_handle(project, tree)
+    (tree / "product").mkdir()
+    (tree / "build").mkdir()
+    config = wrkslots._load_config(str(project), "testhost")
+    rows = [
+        (record, (tree, tree / "product", tree / "build"))
+        for record in wrkslots._load_active(config).slots
+    ]
+    real_monotonic = time.monotonic
+    elapsed = [0.0]
+    read: list[Path] = []
+    real_identity = wrkslots._row_path_identity
+
+    def slow_identity(path: Path) -> wrkslots._RowPathIdentity:
+        read.append(path)
+        elapsed[0] += wrkslots._RETAINED_HANDLE_CENSUS_SECONDS + 60.0
+        return real_identity(path)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(time, "monotonic", lambda: real_monotonic() + elapsed[0])
+        patch.setattr(wrkslots, "_row_path_identity", slow_identity)
+        with pytest.raises(
+            wrkslots.Refusal, match="retained validation handle census exceeded its time bound"
+        ):
+            wrkslots._retained_handles_for_absent_rows(config, rows)
+    assert read == [tree]
+
+
+def test_judging_rows_against_no_units_checks_the_time_bound(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Reading the rows' identities for a judgement checks its time bound.
+
+    With no unit to compare, nothing else would: a judgement whose bound has
+    passed refuses instead of clearing the row.
+    """
+
+    project, tree = _prepare(tmp_path, monkeypatch, agent_liveness="dead")
+    config = wrkslots._load_config(str(project), "testhost")
+    rows = [(record, (tree,)) for record in wrkslots._load_active(config).slots]
+    resolver = wrkslots._UnitPathResolver(
+        wrkslots._UnitResolutionBudget.start(
+            deadline=time.monotonic() - 1.0, expired="the test's bound passed"
+        )
+    )
+    with pytest.raises(wrkslots.Refusal, match="the test's bound passed"):
+        wrkslots._assert_absent_validate_systemd_unrelated(
+            rows, {}, (), snapshot=(), resolver=resolver
+        )
+
+
 def test_an_option_value_longer_than_one_system_call_path_is_read_whole(
     tmp_path: Path,
 ) -> None:
@@ -1207,6 +1310,51 @@ def test_a_judgement_refuses_once_its_path_lookups_or_time_exceed_their_bounds(
     monkeypatch.setattr(wrkslots, "_UNIT_RESOLUTION_SECONDS", 0.0)
     with pytest.raises(wrkslots.Refusal, match="0-second bound of one judgement"):
         wrkslots._UnitPathResolver().names(unit, row)
+
+
+def test_reading_one_long_shell_word_stops_at_the_time_bound() -> None:
+    """The time bound is checked while one shell word is read, not only
+    between words.
+
+    The quoted 2,000,000-character word holds a space, so it is one shell
+    word and is read again as shell text; ``shlex`` takes seconds over a
+    word that long.  The bound here is a fifth of a second.
+    """
+
+    value = "'" + "a" * 2_000_000 + " b'"
+    started = time.monotonic()
+    budget = wrkslots._UnitResolutionBudget.start(
+        deadline=started + 0.2, expired="the test's bound passed"
+    )
+    with pytest.raises(wrkslots.Refusal, match="the test's bound passed"):
+        wrkslots._unit_property_words(value, budget)
+    assert time.monotonic() - started < 1.0
+
+
+def test_a_judgement_past_its_time_bound_refuses_from_its_memos(tmp_path: Path) -> None:
+    """Answers memoized for one row are not returned once the bound has passed.
+
+    The first row warms the resolver's memos of the unit's words and paths,
+    so asking about the second row reads and looks up nothing new; only
+    checking the time bound for each property and each path stops it.
+    """
+
+    rows = []
+    for name in ("slot01", "slot02", "other"):
+        (tmp_path / name).mkdir()
+        rows.append(wrkslots._row_path_identity(tmp_path / name))
+    joined = f"{tmp_path}/other/build"
+    unit = _unit(ExecStart=f"/bin/tool\0--checkout={joined}")
+    budget = wrkslots._UnitResolutionBudget.start(expired="the test's bound passed")
+    resolver = wrkslots._UnitPathResolver(budget)
+    assert not resolver.names(unit, rows[0])
+    assert not resolver.path_names(joined, rows[0])
+
+    budget.deadline = time.monotonic() - 1.0
+    with pytest.raises(wrkslots.Refusal, match="the test's bound passed"):
+        resolver.names(unit, rows[1])
+    with pytest.raises(wrkslots.Refusal, match="the test's bound passed"):
+        resolver.path_names(joined, rows[1])
 
 
 def test_a_unit_too_long_to_read_leaves_its_row_unverifiable(
@@ -2245,6 +2393,171 @@ def test_a_handle_still_inside_its_timestamp_window_is_alive(
     assert f"its unit {RUN_UNIT} may have been queued" in message
     if clock == "behind":
         assert elapsed < 2.0, elapsed
+
+
+def _judge_with_census_clocks(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    readings: Sequence[tuple[int, int]],
+) -> tuple[str, str]:
+    """Judge one row whose unchanged handle each census reads at a given clock.
+
+    ``readings`` holds, for each handle census in turn, this host's realtime
+    and monotonic clocks as offsets in nanoseconds from the handle's change
+    time and from an arbitrary start.  The handle is never written again,
+    and the unit is absent from every enumeration, so only what the clocks
+    say about a rewrite alike can keep the run alive.
+    """
+
+    project, tree = _prepare(tmp_path, monkeypatch, agent_liveness="dead")
+    handle = _write_run_handle(project, tree / "before")
+    change = handle.stat().st_ctime_ns
+    censuses = 0
+
+    def realtime() -> int:
+        return change + readings[min(censuses, len(readings) - 1)][0]
+
+    def monotonic() -> int:
+        # The census reads the realtime clock first, then this one.
+        nonlocal censuses
+        value = 10**15 + readings[min(censuses, len(readings) - 1)][1]
+        censuses += 1
+        return value
+
+    monkeypatch.setattr(wrkslots, "_retained_handle_clock_ns", realtime, raising=False)
+    monkeypatch.setattr(wrkslots, "_retained_handle_monotonic_ns", monotonic, raising=False)
+    monkeypatch.setattr(wrkslots, "_user_systemd_snapshot", lambda: ())
+    config = wrkslots._load_config(str(project), "testhost")
+    states = wrkslots._validation_run_liveness_states(
+        config, wrkslots._load_active(config).slots
+    )
+    return states[("testhost", "slot01", 1)]
+
+
+_SECOND = 1_000_000_000
+
+
+@pytest.mark.parametrize(
+    ("readings", "change"),
+    [
+        pytest.param(
+            ((5 * _SECOND, 0), (_SECOND // 5, _SECOND)),
+            "may have been rewritten alike within one file timestamp tick",
+            id="back-into-the-window",
+        ),
+        pytest.param(
+            ((10 * _SECOND, 0), (7 * _SECOND, _SECOND)),
+            "may have been rewritten alike while this host's realtime clock stepped back",
+            id="back-short-of-the-window",
+        ),
+    ],
+)
+def test_an_equal_handle_read_across_a_realtime_clock_step_back_is_alive(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    readings: Sequence[tuple[int, int]],
+    change: str,
+) -> None:
+    """A handle the earlier read found old is not trusted after the clock goes back.
+
+    Where file times keep whole seconds, a run that registers again, alike,
+    after the realtime clock stepped back into its handle's timestamp tick
+    leaves both reads equal.  ``back-into-the-window`` steps the clock from
+    five seconds after the change time to a fifth of a second after it, so
+    the later read finds the handle recent although the earlier one did not;
+    ``back-short-of-the-window`` steps it three seconds back while one
+    second passes, so neither read finds the handle recent, and only the
+    fall of the realtime clock against the monotonic clock shows the step.
+    """
+
+    state, message = _judge_with_census_clocks(tmp_path, monkeypatch, readings)
+
+    assert state == "alive", message
+    assert f"for row slot01 {change} while the host evidence was read" in message
+    assert f"its unit {RUN_UNIT} may have been queued" in message
+
+
+@pytest.mark.parametrize(
+    "readings",
+    [
+        pytest.param(((10 * _SECOND, 0), (11 * _SECOND, _SECOND)), id="steady"),
+        pytest.param(
+            ((10 * _SECOND, 0), (10 * _SECOND + _SECOND // 10, _SECOND // 2)),
+            id="back-less-than-the-step-bound",
+        ),
+    ],
+)
+def test_an_equal_old_handle_read_without_a_clock_step_back_is_not_alive(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    readings: Sequence[tuple[int, int]],
+) -> None:
+    """Equal old reads with the clocks moving together leave the run over.
+
+    ``back-less-than-the-step-bound`` lets the realtime clock fall 0.4
+    seconds against the monotonic clock, under the half-second bound and
+    short of what a rewrite alike of a handle two seconds old needs.
+    """
+
+    state, message = _judge_with_census_clocks(tmp_path, monkeypatch, readings)
+
+    assert state == "dead", message
+
+
+@pytest.mark.parametrize("change", sorted(_HANDLE_CHANGES))
+def test_a_handle_that_changes_while_its_window_is_waited_out_is_alive(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, change: str
+) -> None:
+    """A handle rewritten, replaced or removed during the settle wait is a run event.
+
+    The first read finds the handle recent, so the window is waited out and
+    the handles read again; the run registers again (or its handle goes)
+    during that wait.  The reads after the wait agree with each other and
+    find nothing recent, so only the difference from the read before the
+    wait shows the event.  The unit is absent from both user-systemd
+    enumerations and every process table.
+    """
+
+    project, tree = _prepare(tmp_path, monkeypatch, agent_liveness="dead")
+    handle = _write_run_handle(project, tree / "before")
+    start = handle.stat().st_ctime_ns
+    # The first census and the settle step read the handle's change time;
+    # both later censuses read three seconds past this host's clock, so the
+    # handle as the wait left it is not recent however long setup took.
+    # The monotonic clock keeps pace.
+    realtimes = iter((start, start))
+    monotonics = iter((0, 3 * _SECOND, 3 * _SECOND + _SECOND // 10))
+    waits: list[float] = []
+
+    def realtime() -> int:
+        return next(realtimes, time.time_ns() + 3 * _SECOND)
+
+    def wait(seconds: float) -> None:
+        waits.append(seconds)
+        _change_run_handle(handle, tree, change)
+
+    monkeypatch.setattr(wrkslots, "_retained_handle_clock_ns", realtime, raising=False)
+    monkeypatch.setattr(
+        wrkslots,
+        "_retained_handle_monotonic_ns",
+        lambda: 10**15 + next(monotonics),
+        raising=False,
+    )
+    monkeypatch.setattr(time, "sleep", wait)
+    monkeypatch.setattr(wrkslots, "_user_systemd_snapshot", lambda: ())
+    config = wrkslots._load_config(str(project), "testhost")
+    states = wrkslots._validation_run_liveness_states(
+        config, wrkslots._load_active(config).slots
+    )
+
+    assert len(waits) == 1 and 2.0 < waits[0] < 2.3, waits
+    state, message = states[("testhost", "slot01", 1)]
+    assert state == "alive", message
+    assert (
+        f"for row slot01 {_HANDLE_CHANGES[change]} while their timestamp window "
+        "was waited out" in message
+    )
+    assert f"its unit {RUN_UNIT} may have been queued" in message
 
 
 def test_a_retained_unit_cgroup_member_missing_from_every_table_is_alive(
