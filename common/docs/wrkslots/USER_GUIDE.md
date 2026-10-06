@@ -381,7 +381,7 @@ validation slots. `audit`, `remove` (including `--validate-complete` and `remove
   run finish or stop its unit;
 - `unverifiable`: a handle, the process table, user-systemd state, the boot id, or a recorded run
   process's generation cannot be read completely (unreadable evidence shows no run, so it is not
-  reported `alive`), a handle repeats a JSON field (a repeated field has no single meaning, and keeping the last value
+  reported `alive`), a handle file changes or is replaced while one read reads it, a handle repeats a JSON field (a repeated field has no single meaning, and keeping the last value
   could hide a live process or move the handle off its row), the row is registered on another
   machine, or its coordinator lease or owner names another stable host identity (an ownerless
   row is judged by its lease, as in `recover-absent-validate-rows`), or this process's view of the
@@ -422,10 +422,13 @@ a run that starts during it can be absent from both tables while the first enume
 unit inactive. The user-systemd units are therefore enumerated again after the later table, and a
 retained run unit that is active or queued in either enumeration is `alive`.
 The retained run handles are read again after both enumerations, and a handle found by either read
-is judged. A handle that only the later read finds was written after both enumerations had begun, so
-their unit states do not cover its run: its unit can be queued after them with its job still waiting to
-start, showing no state, process or member. Such a handle is `alive`, and a rerun reads it before
-the units. Last, the current members of every control group named after a handle's unit, and of its
+is judged. A handle that only the later read finds, one whose file differs between the two reads
+(its bytes, device, inode, size, or modification or change time, so a handle rewritten in place or
+replaced by an identical file counts), and one that the later read no longer finds naming the row
+were written or removed after both enumerations had begun, so their unit states do not cover its
+run: its unit can be queued after them with its job still waiting to start, showing no state,
+process or member. Such a handle is `alive`, and a rerun reads it before the units. Last, the
+current members of every control group named after a handle's unit, and of its
 descendants, are read from the cgroup v2 hierarchy below the user service manager; a member there is
 `alive`. A host without a cgroup v2 hierarchy at `/sys/fs/cgroup`, whose cgroup v2 mount there shows
 only a subtree of the hierarchy (control groups outside it would read as empty), whose user service

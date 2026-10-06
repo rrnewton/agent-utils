@@ -1193,6 +1193,10 @@ class _RetainedValidationHandle:
     pid: int | None
     start_ticks: int | None
     boot_id: str | None
+    # The handle file as read: device, inode, size, SHA-256 of its bytes,
+    # and modification and change times.  Two reads of one handle are the
+    # same handle only when all of them match.
+    file_generation: tuple[int, int, int, str, int, int] | None = None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -16785,8 +16789,10 @@ class _RunEvidence:
     units: tuple[Mapping[str, str], ...]
     bindings: Mapping[str, tuple[_RetainedValidationHandle, ...]]
     members: Mapping[str, int]
-    # Handles that only the read after the host evidence found.
-    late: Mapping[str, tuple[_RetainedValidationHandle, ...]]
+    # Handles whose two reads, before and after the host evidence, differ:
+    # each with how it changed ("appeared", "changed", or "disappeared or
+    # stopped naming the row").
+    late: Mapping[str, tuple[tuple[_RetainedValidationHandle, str], ...]]
 
 
 def _run_evidence(
@@ -16801,7 +16807,10 @@ def _run_evidence(
     """Read the retained run handles, the host, the handles again, then cgroups.
 
     A run registered while the host evidence was read has a handle that the
-    first read missed, so the handles from both reads are judged.  The
+    first read missed, or one rewritten, replaced or removed since it, so
+    the handles from both reads are judged and every difference between
+    the two reads, down to the handle file's bytes and times, is recorded
+    in ``late``.  The
     current members of their units' control groups are read last (see
     ``_retained_unit_cgroup_members``).  ``first`` is a handle read the
     caller has already made and judged.  Every caller that judges rows from
@@ -16821,17 +16830,22 @@ def _run_evidence(
     members = _retained_unit_cgroup_members(
         {handle.unit for handles in bindings.values() for handle in handles}
     )
-    late = {
-        slot: tuple(handle for handle in handles if handle not in first.get(slot, ()))
-        for slot, handles in later.items()
-    }
-    return _RunEvidence(
-        processes,
-        units,
-        bindings,
-        members,
-        {slot: handles for slot, handles in late.items() if handles},
-    )
+    late: dict[str, tuple[tuple[_RetainedValidationHandle, str], ...]] = {}
+    for slot in {*first, *later}:
+        before = {handle.path: handle for handle in first.get(slot, ())}
+        after = {handle.path: handle for handle in later.get(slot, ())}
+        changes = tuple(
+            (handle, "appeared" if path not in before else "changed")
+            for path, handle in after.items()
+            if before.get(path) != handle
+        ) + tuple(
+            (handle, "disappeared or stopped naming the row")
+            for path, handle in before.items()
+            if path not in after
+        )
+        if changes:
+            late[slot] = changes
+    return _RunEvidence(processes, units, bindings, members, late)
 
 
 def _judge_run_evidence(
@@ -16844,11 +16858,12 @@ def _judge_run_evidence(
 
     Each retained handle's process generation, unit states and control-group
     members are judged, and every active or queued unit is compared with the
-    rows' paths.  A handle that only the later read found was written after
-    both user-systemd enumerations had begun, so their unit states do not
-    cover its run: a unit queued after the second enumeration, whose job has
-    not started, shows no state, process or member.  Such a handle is a run
-    that may still use the row.  Rerunning reads it before the units.
+    rows' paths.  A handle that the later read found new or changed, or
+    that it no longer found, was written or removed after both user-systemd
+    enumerations had begun, so their unit states do not cover its run: a
+    unit queued after the second enumeration, whose job has not started,
+    shows no state, process or member.  Such a handle is a run that may
+    still use the row.  Rerunning reads it before the units.
     """
 
     slots = {record.slot for record, _paths in rows}
@@ -16863,9 +16878,9 @@ def _judge_run_evidence(
         members=evidence.members,
     )
     for slot in sorted(slots):
-        for handle in evidence.late.get(slot, ()):
+        for handle, change in evidence.late.get(slot, ()):
             raise _ValidationRunMayUseRow(
-                f"retained validation handle {handle.path} for row {slot} appeared while "
+                f"retained validation handle {handle.path} for row {slot} {change} while "
                 "the host evidence was read, so its unit "
                 f"{handle.unit} may have been queued after the user-systemd enumerations"
             )
@@ -43902,8 +43917,23 @@ def _retained_handles_for_absent_rows(
     total_bytes = 0
     for path in handle_paths:
         try:
-            contents = _read_bounded_regular_file(
+            contents, read = _read_regular_file_identity(
                 path, "retained validation handle", _RETAINED_HANDLE_BYTES_LIMIT
+            )
+            # The times come from the path after the read, so a rewrite
+            # that leaves the bytes, inode and size alike still differs.
+            after = path.stat(follow_symlinks=False)
+            if (after.st_dev, after.st_ino) != (read.device, read.inode):
+                raise Refusal(
+                    f"retained validation handle was replaced while it was read: {path}"
+                )
+            file_generation = (
+                read.device,
+                read.inode,
+                read.size,
+                read.sha256,
+                after.st_mtime_ns,
+                after.st_ctime_ns,
             )
             total_bytes += len(contents)
             if total_bytes > _RETAINED_HANDLE_BYTES_LIMIT:
@@ -43969,7 +43999,9 @@ def _retained_handles_for_absent_rows(
             boot_id = _as_str(identity["boot_id"], f"{path}.process_identity.boot_id")
             if not boot_id:
                 raise Refusal(f"retained validation handle {path} has an empty boot identity")
-        handle = _RetainedValidationHandle(path, unit, pid, start_ticks, boot_id)
+        handle = _RetainedValidationHandle(
+            path, unit, pid, start_ticks, boot_id, file_generation
+        )
         for slot in related:
             matched[slot].append(handle)
     return {slot: tuple(values) for slot, values in matched.items()}

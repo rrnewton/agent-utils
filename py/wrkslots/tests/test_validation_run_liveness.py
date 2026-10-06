@@ -1517,6 +1517,69 @@ def test_a_handle_registered_after_the_first_enumeration_is_alive(
     assert f"its unit {RUN_UNIT} may have been queued" in message
 
 
+def _change_run_handle(handle: Path, tree: Path, change: str) -> None:
+    """Rewrite, replace or remove a run handle as a launcher registering again would."""
+
+    if change == "rewritten":
+        value = json.loads(handle.read_text(encoding="utf-8"))
+        value["checkout"] = str(tree / "after")
+        handle.write_text(json.dumps(value), encoding="utf-8")
+    elif change == "replaced":
+        fresh = handle.with_name(handle.name + ".new")
+        fresh.write_bytes(handle.read_bytes())
+        os.replace(fresh, handle)
+    else:
+        handle.unlink()
+
+
+_HANDLE_CHANGES = {
+    "rewritten": "changed",
+    "replaced": "changed",
+    "removed": "disappeared or stopped naming the row",
+}
+
+
+@pytest.mark.parametrize("change", sorted(_HANDLE_CHANGES))
+def test_a_handle_that_changes_during_the_evidence_reads_is_alive(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, change: str
+) -> None:
+    """A handle rewritten, replaced or removed while the host is read is a run event.
+
+    The handle names the row before and after (``rewritten`` moves its
+    checkout within the row; ``replaced`` puts a byte-identical file in its
+    place), so the projected fields the two reads find can be equal.  The
+    unit is absent from both user-systemd enumerations and every process
+    table: a run registered again then is queued only after them.
+    """
+
+    project, tree = _prepare(tmp_path, monkeypatch, agent_liveness="dead")
+    handle = _write_run_handle(project, tree / "before")
+    calls = 0
+
+    def units() -> tuple[Mapping[str, str], ...]:
+        nonlocal calls
+        if calls == 1:
+            _change_run_handle(handle, tree, change)
+        calls += 1
+        return ()
+
+    monkeypatch.setattr(wrkslots, "_user_systemd_snapshot", units)
+    config = wrkslots._load_config(str(project), "testhost")
+    states = wrkslots._validation_run_liveness_states(
+        config, wrkslots._load_active(config).slots
+    )
+
+    state, message = states[("testhost", "slot01", 1)]
+    assert state == "alive", message
+    assert f"for row slot01 {_HANDLE_CHANGES[change]} while the host evidence" in message
+    assert f"its unit {RUN_UNIT} may have been queued" in message
+    # With the handle left as it is, the same evidence reads the run as over.
+    states = wrkslots._validation_run_liveness_states(
+        config, wrkslots._load_active(config).slots
+    )
+    assert states[("testhost", "slot01", 1)][0] == "dead", states
+
+
 def test_a_retained_unit_cgroup_member_missing_from_every_table_is_alive(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1704,7 +1767,37 @@ def _one_member(units: AbstractSet[str], *, root: Path | None = None) -> Mapping
     return dict.fromkeys(units, 1)
 
 
-@pytest.mark.parametrize("evidence", ["restricted-view", "cgroup-member"])
+_RECOVERY_EVIDENCE = ["restricted-view", "cgroup-member", "rewritten-handle"]
+
+
+def _late_recovery_evidence(
+    project: Path, tree: Path, monkeypatch: pytest.MonkeyPatch, evidence: str
+) -> str:
+    """Make the host evidence restricted or late; return the expected refusal."""
+
+    if evidence == "restricted-view":
+        _restrict_pid_namespace(monkeypatch)
+        return "not in the host's initial pid namespace"
+    if evidence == "cgroup-member":
+        monkeypatch.setattr(wrkslots, "_retained_unit_cgroup_members", _one_member)
+        return f"retained validation unit {RUN_UNIT} control group now holds 1"
+    handle = project / "ignored" / "validate" / "runs" / (
+        RUN_UNIT.removesuffix(".service") + ".json"
+    )
+    calls = 0
+
+    def units() -> tuple[Mapping[str, str], ...]:
+        nonlocal calls
+        if calls == 0:
+            _change_run_handle(handle, tree, "rewritten")
+        calls += 1
+        return (_unit(),)
+
+    monkeypatch.setattr(wrkslots, "_user_systemd_snapshot", units)
+    return "changed while the host evidence was read"
+
+
+@pytest.mark.parametrize("evidence", _RECOVERY_EVIDENCE)
 def test_absent_validate_row_recovery_reads_the_same_late_evidence(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1716,16 +1809,18 @@ def test_absent_validate_row_recovery_reads_the_same_late_evidence(
     In a child PID namespace a run is missing from the process table, and a
     run's child can be missing from every table but still in its control
     group.  Either way the empty tables are no evidence that the row is free.
+    A run handle rewritten while the host is read is a run registered again,
+    whose unit may be queued after the enumerations.
     """
 
     project, repository, _remote = make_project(tmp_path)
     project, input_path = _prepare_absent_validate_recovery(project, repository, monkeypatch)
-    if evidence == "restricted-view":
-        _restrict_pid_namespace(monkeypatch)
-        expected = "not in the host's initial pid namespace"
-    else:
-        monkeypatch.setattr(wrkslots, "_retained_unit_cgroup_members", _one_member)
-        expected = f"retained validation unit {RUN_UNIT} control group now holds 1"
+    config = wrkslots._load_config(str(project), "testhost")
+    record = next(
+        record for record in wrkslots._load_active(config).slots if record.slot == "gone"
+    )
+    tree = wrkslots._stored_path(config, record.checkouts[0].path, "checkout")
+    expected = _late_recovery_evidence(project, tree, monkeypatch, evidence)
 
     assert run_absent_validate_recovery(project, input_path, apply=False) == 3
     assert expected in capsys.readouterr().err
@@ -1745,7 +1840,7 @@ def _prepare_absent_validate_recovery_host(
     monkeypatch.setattr(wrkslots, "_retained_unit_cgroup_members", _no_members)
 
 
-@pytest.mark.parametrize("evidence", ["restricted-view", "cgroup-member"])
+@pytest.mark.parametrize("evidence", _RECOVERY_EVIDENCE)
 def test_absent_agent_row_recovery_reads_the_same_late_evidence(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1761,16 +1856,10 @@ def test_absent_agent_row_recovery_reads_the_same_late_evidence(
     project, repository, _remote = make_project(tmp_path)
     record = prepare_absent_agent_row(project, repository)
     config = wrkslots._load_config(str(project), "testhost")
-    _write_run_handle(
-        project, wrkslots._stored_path(config, record.checkouts[0].path, "checkout")
-    )
+    tree = wrkslots._stored_path(config, record.checkouts[0].path, "checkout")
+    _write_run_handle(project, tree)
     _prepare_absent_validate_recovery_host(project, monkeypatch)
-    if evidence == "restricted-view":
-        _restrict_pid_namespace(monkeypatch)
-        expected = "not in the host's initial pid namespace"
-    else:
-        monkeypatch.setattr(wrkslots, "_retained_unit_cgroup_members", _one_member)
-        expected = f"retained validation unit {RUN_UNIT} control group now holds 1"
+    expected = _late_recovery_evidence(project, tree, monkeypatch, evidence)
 
     assert run_absent_agent_recovery(project, record, apply=False) == 3
     assert expected in capsys.readouterr().err
