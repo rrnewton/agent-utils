@@ -120,7 +120,8 @@ Ask as one or two batches:
    you are running in, for both). For each, does the owner want a specific model, reasoning
    effort, or harness flags? These become agentctl **launch profiles**, which are owner policy:
    write exactly what the owner says, and never invent flags, models, or permission settings.
-   Propose profile names such as `worker` and `reviewer`.
+   Always write a `coordinator` profile (setup launches the coordinator with it in phase 7), plus
+   profiles for subagents such as `worker` and `reviewer`.
 5. **Herdr workspace** for the project's agents. Default: `<repo>-agents`.
 6. **How many slots** may be active at once. Default: 4; suggest more only for a large machine.
 7. **Slot storage.** Default: disk images when passwordless sudo or `fuse2fs` is available (each
@@ -247,6 +248,7 @@ the project's remote; without it, salvaged work stays on this machine.
   "schema": "agentctl-profiles/v1",
   "workspace": "<workspace label>",
   "profiles": {
+    "coordinator": {"harness": "claude", "mode": "interactive"},
     "worker": {"harness": "claude", "mode": "interactive"}
   }
 }
@@ -352,17 +354,29 @@ prompt was delivered. Expect these on the way, and handle them as described:
 Tell the owner, briefly:
 
 - what was installed and configured, and what was deferred (the chat bridge, if so);
-- how to start the coordinator: in Herdr, open a tab in `$H` and run the coordinator harness there
-  (or `agentctl chat launch --config chat.json --harness <harness>` when chat is configured). It
-  reads `AGENTS.md` and the coordinator skill on its own;
+- where the coordinator is: you start it in the step below, so they can switch to it in Herdr
+  (workspace `<repo>-agents`, tab `coordinator`) or run `agentctl attach coordinator` from `$H`;
 - which optional tools exist and that any of them can be added by asking ("set up tick-hub for an
   hourly status report");
 - that the harness `AGENTS.md` "Project rules" section is theirs to fill, directly or by asking.
 
-If you are yourself going to continue as the coordinator, restart in `$H` first: your session
-started in the checkout, which is now `$H/$PRIMARY`. (If agentctl launched you, its record names
-the old working directory, so `agentctl stop` refuses your pane; exit the session normally
-instead.)
+Then, with the owner's yes, **start the coordinator as a registered agentctl session**:
+
+```sh
+"$H/agent-utils/bin/agentctl" start coordinator --cwd "$H" --profile coordinator \
+  --brief "You are the coordinator for this harness. Read AGENTS.md and the agent-utils-coordinator skill, then tell the owner you are ready."
+```
+
+Run it from `$H` so agentctl uses the harness registry. Registration is what makes the coordinator
+addressable: tick-hub deliveries, other agents, and the owner's scripts reach it with
+`agentctl send coordinator`, and `agentctl status coordinator` finds it. A coordinator the owner
+starts by hand in some terminal is not registered, so nothing can deliver to it. (With chat
+configured, start it instead with `agentctl chat launch --config chat.json --harness <harness>`
+from a Herdr shell tab in `$H`, in the project's workspace; the bridge owns that pane.)
+
+Do not continue as the coordinator yourself: your session started in the checkout, which is now
+`$H/$PRIMARY`. Once the coordinator is up, end this session. (If agentctl launched you, its record
+names the old working directory, so `agentctl stop` refuses your pane; exit normally instead.)
 
 ## Add a tool later
 
@@ -376,11 +390,17 @@ link to `.agents/skills/` if it has one, and commit the harness. For each tool, 
   project's command tabs do not compete with other projects for the shared workspace's
   `max_panes` cap (`herdr-run status` shows the cap). Note in `AGENTS.md` which commands agents
   should run through it.
-- **tick-hub**: write the reminders and checks to `$H/ops.yaml` (`tick-hub quickstart` shows the
-  format). A user systemd timer or cron entry runs `tick-hub tick --config ops.yaml --flush` from
-  `$H`; tick-hub only prints `ACTION:`/`HEALTH:` lines, so the timer's command delivers them to the
-  coordinator, for example by writing the output to a file and running
-  `agentctl send <coordinator> --file <that file>` when it contains an `ACTION:` line.
+- **tick-hub**: tick-hub only evaluates reminders and prints `ACTION:`/`HEALTH:` lines; delivery
+  to the coordinator is a small script. Start from `agent-utils/skills/agent-utils-setup/templates/
+  tick-hub/`: copy `tick-deliver` to `$H/bin/`, `ops.yaml` to `$H/` (edit the reminders with the
+  owner; `tick-hub quickstart` shows the format, and `tick-hub tick --config ops.yaml` previews a
+  tick without changing state), and the `.service` and `.timer` files to
+  `~/.config/systemd/user/<repo>-tick-hub.{service,timer}` with the placeholders filled (keep a
+  tracked copy under `$H/systemd/`). Then `systemctl --user daemon-reload` and
+  `systemctl --user enable --now <repo>-tick-hub.timer`. `tick-deliver` sends the tick's output to
+  the registered `coordinator` session with `agentctl send`; a message that has to wait because
+  the coordinator is busy stays queued and goes out on the next tick. Add `.tick-hub/` to the
+  harness `.gitignore`.
 - **dagrun**: it runs a DAG file owned by the primary repository (often `validation.dag.yaml`).
   Use `dagrun quickstart` to write one with the owner; it needs a user systemd manager and cgroup
   v2 for its resource limits.

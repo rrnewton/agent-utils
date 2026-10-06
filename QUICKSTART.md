@@ -79,7 +79,7 @@ for each. Answering "defaults" accepts them all. The run answered:
 | 1 | Name of the primary checkout folder | `foobar/` (the repository name) | default |
 | 2 | Track the harness in its own Git repository? | yes, local only | default |
 | 3 | Where agent-utils comes from | clone it into the harness | default |
-| 4 | Harnesses and launch profiles | `worker` and `reviewer`, both on the current harness, nothing pinned | `worker` on Claude, `reviewer` on Codex |
+| 4 | Harnesses and launch profiles | `coordinator`, `worker`, and `reviewer`, all on the current harness, nothing pinned | `worker` on Claude, `reviewer` on Codex |
 | 5 | Herdr workspace for the agents | `foobar-agents` | default |
 | 6 | Maximum active slots | 4 | default |
 | 7 | Slot storage | sparse disk images (sudo or `fuse2fs` available) | default |
@@ -119,7 +119,7 @@ After approval it:
   bin/agent-liveness                tells wrkslots whether a slot's agent has stopped
   .agents/skills/                   agent-utils-coordinator, agent-utils-setup, agentctl,
   .claude/skills -> ../.agents/skills   wrkslots, herdr-run
-  .agentctl/profiles.json           worker (claude), reviewer (codex); private, untracked
+  .agentctl/profiles.json           coordinator and worker (claude), reviewer (codex); private
   .wrkslots.yml                     slot policy, commented key by key
   .herdr-run.yaml                   allowlist: git, gh
 ```
@@ -151,17 +151,22 @@ The agent offered one throwaway round trip through the whole delegation path, an
 4. The setup agent read the handoff, stopped the subagent, and removed the slot. wrkslots
    reported zero active slots and a consistent registry.
 
-## 8. Start the coordinator and give it work
+## 8. The coordinator, and its first task
 
-Open a new Herdr tab in the harness root and start your agent there:
+Setup ends by starting the coordinator as a registered agentctl session named `coordinator`, with
+the `coordinator` launch profile, in the project's Herdr workspace:
 
 ```sh
 cd ~/work/util-suite-test/foobar
-claude
+agent-utils/bin/agentctl start coordinator --cwd . --profile coordinator --brief "..."
 ```
 
-It reads `AGENTS.md` and the coordinator skill by itself. Use a new session rather than the setup
-session: that one started in the old checkout path, which is now `foobar/foobar/`.
+Switch to it in Herdr (workspace `foobar-agents`, tab `coordinator`), or run
+`agent-utils/bin/agentctl attach coordinator` from the harness. It reads `AGENTS.md` and the
+coordinator skill by itself. Registration matters: it is how timers, scripts, and other agents
+reach the coordinator (`agentctl send coordinator`). (This step was added after the recorded
+run, which ended by telling the owner to start the coordinator by hand; it was then tested on the
+same harness.)
 
 In the test, the coordinator was asked:
 
@@ -177,11 +182,15 @@ whether to delete it.
 
 ## 9. Later
 
-Change the setup by asking the coordinator, for example:
+Change the setup by asking the coordinator. In the test, the coordinator was asked to set up
+tick-hub for an hourly status reminder. From the setup skill's templates it wrote `ops.yaml` and
+`bin/tick-deliver`, installed a user systemd timer that runs one tick every 15 minutes, and
+triggered it once. The reminder arrived in its own queue through `agentctl send coordinator`,
+and it answered with a status summary. It then recorded tick-hub in `AGENTS.md` and committed
+the harness. Other requests work the same way:
 
 - "Connect this to Google Chat." (It needs a space ID, your user ID, and an OAuth token or a
   command that prints one; `agentctl chat quickstart` lists the details.)
-- "Set up tick-hub to send you an hourly status reminder."
 - "Turn on the file-system sandbox for subagents."
 - "Add dagrun for our test suite."
 - "Update agent-utils."
