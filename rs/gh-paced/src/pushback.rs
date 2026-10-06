@@ -17,6 +17,15 @@
 //! commits what it reported, and nothing after it is read, so body text can never start a
 //! cooldown, whatever its line ends.
 //!
+//! A header line longer than [`MAX_HEADER_LINE`] is not kept, so a `Retry-After` in it cannot be
+//! read (and for a call without `--paginate` the line also ends the block). In a 403 or 429 block
+//! such a line therefore starts a cooldown with no end time ([`NO_END`]) instead of the shorter
+//! one the rest of the block would give; in any other block it ends the block. A status line that
+//! long (HTTP/1.1 lets the server choose the reason phrase) still opens its block, read from its
+//! first [`MAX_HEADER_LINE`] bytes. On stderr, a `Retry-After` value that runs on past the
+//! [`OVERLAP`] bytes kept between chunks, so that its digits can no longer be read whole, also
+//! gives a cooldown with no end time.
+//!
 //! A paginated call prints one block per page, so [`Scanner::new`] reads every block: a block
 //! counts once its blank CR LF line arrives, provided every header line in it ended in CR LF;
 //! a block interrupted by a line of another shape (a body printed by `--jq`, with plain LF line
@@ -26,10 +35,17 @@
 
 use crate::config::Config;
 
-const OVERLAP: usize = 4096;
+/// Bytes of stderr kept between chunks, so a phrase split across two reads is still found.
+pub const OVERLAP: usize = 4096;
 
-/// Longest stdout line kept while looking for header lines; longer lines are body text.
-const MAX_HEADER_LINE: usize = 8192;
+/// Longest stdout line kept while looking for header lines. A longer line is not kept: in a
+/// 403 or 429 block it gives a cooldown with no end time (module docs).
+pub const MAX_HEADER_LINE: usize = 8192;
+
+/// Whether a response with this status is one GitHub sends `Retry-After` with: 403 and 429.
+fn can_ask_for_a_wait(status: u16) -> bool {
+    matches!(status, 403 | 429)
+}
 
 /// Longest `Retry-After` gh-paced counts down, seconds (365 days). Any value up to this is
 /// honoured in full. A longer one, including one too long to represent, is never shortened to
@@ -76,10 +92,21 @@ pub struct Scanner {
     pub retry_after: Option<f64>,
     /// A response header block reported `X-RateLimit-Remaining: 0`.
     pub remaining_zero: bool,
+    /// A 403 or 429 response block held a header line longer than [`MAX_HEADER_LINE`], so the
+    /// wait it asked for is not known.
+    pub overlong_header: bool,
+    /// A `Retry-After` value on stderr ran on past the bytes kept between chunks, so it could not
+    /// be read whole.
+    pub unread_retry_after: bool,
     /// Partial stdout line carried between [`Scanner::feed_headers`] calls.
     line: Vec<u8>,
     /// The current stdout line is longer than [`MAX_HEADER_LINE`] and is being skipped.
     skipping: bool,
+    /// The last byte of the line being skipped was a CR.
+    skipped_cr: bool,
+    /// The line being skipped is a header line of the pending block of a paginated call, whose
+    /// line end decides whether the block is still gh's header format.
+    skipping_header: bool,
     /// The stdout header block being read, not yet confirmed by its blank CR LF line.
     pending: Option<HeaderBlock>,
     /// Only the first stdout block is a response header block (see [`Scanner::single_response`]).
@@ -98,6 +125,8 @@ struct HeaderBlock {
     remaining_zero: bool,
     /// Header lines read that ended in CR LF, as gh writes them.
     crlf_headers: u32,
+    /// A header line longer than [`MAX_HEADER_LINE`] was seen in this 403 or 429 block.
+    overlong: bool,
 }
 
 /// The cooldown a scan calls for.
@@ -217,12 +246,22 @@ impl Scanner {
             }
         }
         for at in find_all(&text, b"retry-after:") {
-            let digits: String = text[at + 12..]
+            let value = &text[at + 12..];
+            let blanks = value
                 .iter()
-                .skip_while(|b| **b == b' ' || **b == b'\t')
+                .take_while(|b| **b == b' ' || **b == b'\t')
+                .count();
+            let len = value[blanks..]
+                .iter()
                 .take_while(|b| b.is_ascii_digit())
-                .map(|b| *b as char)
-                .collect();
+                .count();
+            // A value still running at the end of what is held is read again with the next
+            // chunk, while its name is within the OVERLAP bytes kept. Past that, the rest of the
+            // number would arrive without its name, so the wait it asks for is not known.
+            if blanks + len == value.len() && text.len() - at > OVERLAP {
+                self.unread_retry_after = true;
+            }
+            let digits = String::from_utf8_lossy(&value[blanks..blanks + len]);
             if let Some(n) = retry_after_secs(&digits) {
                 self.retry_after = Some(self.retry_after.map_or(n, |old| old.max(n)));
             }
@@ -238,23 +277,78 @@ impl Scanner {
                 return;
             }
             if b == b'\n' {
-                if !self.skipping {
+                if self.skipping {
+                    self.end_overlong_line();
+                } else {
                     let line = std::mem::take(&mut self.line);
                     self.header_line(&line);
                 }
                 self.line.clear();
                 self.skipping = false;
-            } else if !self.skipping {
-                if self.line.len() >= MAX_HEADER_LINE {
-                    self.line.clear();
-                    self.skipping = true;
-                    self.started = true;
-                    self.end_block(false);
-                } else {
-                    self.line.push(b);
-                }
+            } else if self.skipping {
+                self.skipped_cr = b == b'\r';
+            } else if self.line.len() >= MAX_HEADER_LINE {
+                self.skipping = true;
+                self.skipped_cr = b == b'\r';
+                self.start_overlong_line();
+                self.line.clear();
+            } else {
+                self.line.push(b);
             }
         }
+    }
+
+    /// The current stdout line has just passed [`MAX_HEADER_LINE`]; `self.line` holds its first
+    /// [`MAX_HEADER_LINE`] bytes. The rest of the line is skipped.
+    fn start_overlong_line(&mut self) {
+        let first = !self.started;
+        self.started = true;
+        let prefix = strip_ansi(&self.line);
+        let lower = prefix.trim_ascii_start().to_ascii_lowercase();
+        if let Some(status) = http_status(&lower) {
+            // A status line with a long reason phrase opens its block as a short one does; the
+            // reason phrase holds no header, so nothing in the block is lost.
+            if self.single_response && !first {
+                self.end_block(false);
+                return;
+            }
+            self.pending = Some(HeaderBlock {
+                status,
+                ..HeaderBlock::default()
+            });
+            return;
+        }
+        match self.pending.as_mut() {
+            Some(block) if can_ask_for_a_wait(block.status) => {
+                // The line, or one after it, may hold the Retry-After: the wait is not known.
+                block.overlong = true;
+                if self.single_response {
+                    // gh's own block: commit it now; nothing after it can shorten the cooldown.
+                    self.end_block(false);
+                } else {
+                    // A paginated block counts only in gh's header format: decided at the CR LF.
+                    self.skipping_header = true;
+                }
+            }
+            // Any other block ends here, as before.
+            _ => self.end_block(false),
+        }
+    }
+
+    /// The LF of a skipped over-long line has arrived.
+    fn end_overlong_line(&mut self) {
+        if std::mem::take(&mut self.skipping_header) {
+            if self.skipped_cr {
+                if let Some(block) = self.pending.as_mut() {
+                    block.crlf_headers += 1;
+                }
+            } else {
+                // Not gh's header format: the block was body text and is dropped, as for a
+                // short line.
+                self.end_block(false);
+            }
+        }
+        self.skipped_cr = false;
     }
 
     /// The stdout output has ended (or will no longer be read). A block it interrupted is
@@ -277,6 +371,7 @@ impl Scanner {
         }
         self.line.clear();
         self.skipping = false;
+        self.skipping_header = false;
         if let Some(block) = self.pending.take() {
             if self.single_response || block.crlf_headers > 0 {
                 self.commit(&block);
@@ -366,6 +461,7 @@ impl Scanner {
             self.retry_after = Some(self.retry_after.map_or(n, |old| old.max(n)));
         }
         self.remaining_zero |= block.remaining_zero;
+        self.overlong_header |= block.overlong;
     }
 
     /// A value that changes whenever the pushback signals seen so far change (a new pattern, or
@@ -401,15 +497,43 @@ impl Scanner {
         if self.remaining_zero {
             out.push("X-RateLimit-Remaining: 0");
         }
+        if self.overlong_header {
+            out.push("over-long header line");
+        }
+        if self.unread_retry_after {
+            out.push("unreadable Retry-After");
+        }
         out
     }
 
     /// The cooldown this output calls for, if any: `max(Retry-After, cooldown_secs)` for a
     /// rate-limit signal (wording, HTTP 429, `Retry-After`, or `X-RateLimit-Remaining: 0`),
     /// `plain_403_cooldown_secs` for an HTTP 403 with no rate-limit signal. A `Retry-After`
-    /// longer than [`MAX_RETRY_AFTER_SECS`] gives a cooldown with no end time ([`NO_END`]),
-    /// never a shorter one.
+    /// longer than [`MAX_RETRY_AFTER_SECS`], or one that could not be read (an over-long header
+    /// line in a 403 or 429 response, or a stderr value cut off), gives a cooldown with no
+    /// end time ([`NO_END`]), never a shorter one.
     pub fn verdict(&self, cfg: &Config) -> Option<Pushback> {
+        let reason = self.matched().join(", ");
+        if self.overlong_header || self.unread_retry_after {
+            let why = if self.overlong_header {
+                format!(
+                    "a header line of a 403 or 429 response is longer than the \
+                     {MAX_HEADER_LINE} bytes gh-paced reads"
+                )
+            } else {
+                format!(
+                    "a Retry-After value on stderr runs on past the {OVERLAP} bytes gh-paced \
+                     keeps"
+                )
+            };
+            return Some(Pushback {
+                cooldown_secs: NO_END,
+                reason: format!(
+                    "{reason}; {why}, so the wait GitHub asked for is not known and this \
+                     cooldown has no end time"
+                ),
+            });
+        }
         let limit_signal = self.secondary
             || self.rate_limit
             || self.http_429
@@ -417,7 +541,6 @@ impl Scanner {
             || self.too_quickly
             || self.retry_after.is_some()
             || self.remaining_zero;
-        let reason = self.matched().join(", ");
         if limit_signal {
             let secs = self.retry_after.unwrap_or(0.0).max(cfg.cooldown_secs);
             if secs > MAX_RETRY_AFTER_SECS {
@@ -677,10 +800,113 @@ mod tests {
         ]);
         assert_eq!(s.verdict(&cfg).expect("pushback").cooldown_secs, 1200.0);
         assert!(!s.http_403 && !s.remaining_zero, "{s:?}");
-        // Ended by an over-long line, likewise.
+        // Ended by an over-long line, nothing later counts; the Retry-After that line may hold
+        // is not known, so the cooldown has no end time.
         let long = format!("HTTP/2.0 429 Too Many\r\n{}\r\n{fake}", "x".repeat(10_000));
         let s = single(&[&long]);
         assert!(s.http_429 && !s.http_403, "{s:?}");
+        assert!(s.verdict(&cfg).expect("pushback").has_no_end(), "{s:?}");
+    }
+
+    /// An over-long header line in a 403 or 429 response never shortens the wait the server
+    /// asked for: the `Retry-After` it may hold cannot be read, so the cooldown has no end time,
+    /// with and without `--paginate`, and whether the long line is the `Retry-After` itself (two
+    /// days behind 9,000 leading zeros) or comes before a valid one.
+    #[test]
+    fn an_overlong_header_line_never_shortens_a_wait() {
+        let cfg = Config::default();
+        let zeros = "0".repeat(9000);
+        let filler = "x".repeat(9000);
+        for status in ["429 Too Many Requests", "403 Forbidden"] {
+            let padded = format!("HTTP/2.0 {status}\nRetry-After: {zeros}172800\r\n\r\n[]\n");
+            let before =
+                format!("HTTP/2.0 {status}\nX-Long: {filler}\r\nRetry-After: 172800\r\n\r\n[]\n");
+            for text in [&padded, &before] {
+                // Split into 1000-byte chunks as well as whole.
+                let chunks: Vec<&str> = text
+                    .as_bytes()
+                    .chunks(1000)
+                    .map(|c| std::str::from_utf8(c).expect("ascii"))
+                    .collect();
+                for s in [
+                    single(&[text]),
+                    headers(&[text]),
+                    single(&chunks),
+                    headers(&chunks),
+                ] {
+                    assert!(s.overlong_header, "{status}: {s:?}");
+                    let v = s.verdict(&cfg).expect("pushback");
+                    assert!(v.has_no_end(), "{status}: {v:?}");
+                    assert_eq!(v.cooldown_secs, NO_END);
+                    assert!(v.reason.contains("no end time"), "{}", v.reason);
+                    assert!(v.reason.contains("8192 bytes"), "{}", v.reason);
+                    assert!(s.matched().contains(&"over-long header line"), "{s:?}");
+                }
+            }
+        }
+        // A Retry-After line that fits (8,192 bytes with its CR) is read in full; one byte more
+        // and it cannot be.
+        let line = |zeros: usize| format!("Retry-After: {}172800\r", "0".repeat(zeros));
+        assert_eq!(line(8172).len(), 8192);
+        for (line, no_end) in [(line(8172), false), (line(8173), true)] {
+            let text = format!("HTTP/2.0 429 Too Many Requests\n{line}\n\r\n");
+            for s in [single(&[&text]), headers(&[&text])] {
+                let v = s.verdict(&cfg).expect("pushback");
+                assert_eq!(v.has_no_end(), no_end, "{} bytes: {v:?}", line.len());
+                if !no_end {
+                    assert_eq!(v.cooldown_secs, 172_800.0);
+                }
+            }
+        }
+        // A long status line (HTTP/1.1 lets the server choose the reason phrase) holds no
+        // header: its block is still read, and its Retry-After is honoured exactly.
+        let text = format!("HTTP/1.1 429 {filler}\nRetry-After: 172800\r\n\r\n[]\n");
+        for s in [single(&[&text]), headers(&[&text])] {
+            assert!(s.http_429 && !s.overlong_header, "{s:?}");
+            let v = s.verdict(&cfg).expect("pushback");
+            assert_eq!(v.cooldown_secs, 172_800.0, "{v:?}");
+        }
+        // Any other status: an over-long line ends the block, which starts no cooldown.
+        let text = format!("HTTP/2.0 200 OK\nX-Long: {filler}\r\nRetry-After: 172800\r\n\r\n");
+        for s in [single(&[&text]), headers(&[&text])] {
+            assert!(s.verdict(&cfg).is_none(), "{s:?}");
+        }
+        // Body text of a paginated call that looks like a 429 block, with an over-long line
+        // that does not end in CR LF, is not a header block.
+        let text = format!("[]\nHTTP/2.0 429 Too Many Requests\n{filler}\nRetry-After: 1\r\n");
+        assert!(headers(&[&text]).verdict(&cfg).is_none());
+        // Body text after a complete block is never read as part of it.
+        let text = format!("HTTP/2.0 429 Too Many Requests\nRetry-After: 1200\r\n\r\n{filler}\n");
+        for s in [single(&[&text]), headers(&[&text])] {
+            assert_eq!(s.verdict(&cfg).expect("pushback").cooldown_secs, 1200.0);
+        }
+    }
+
+    /// On stderr a `Retry-After` value is read whole while its name is within the bytes kept
+    /// between chunks. A value that runs on past them (two days behind 9,000 leading zeros,
+    /// arriving in 1000-byte reads) cannot be, so the cooldown has no end time.
+    #[test]
+    fn an_unreadable_stderr_retry_after_never_shortens_a_wait() {
+        let cfg = Config::default();
+        let text = format!("HTTP 429\nRetry-After: {}172800\n", "0".repeat(9000));
+        let s = scan(&[&text]);
+        assert!(!s.unread_retry_after, "{s:?}");
+        assert_eq!(s.verdict(&cfg).expect("pushback").cooldown_secs, 172_800.0);
+        let chunks: Vec<&str> = text
+            .as_bytes()
+            .chunks(1000)
+            .map(|c| std::str::from_utf8(c).expect("ascii"))
+            .collect();
+        let s = scan(&chunks);
+        assert!(s.unread_retry_after, "{s:?}");
+        let v = s.verdict(&cfg).expect("pushback");
+        assert!(v.has_no_end(), "{v:?}");
+        assert!(v.reason.contains("no end time"), "{}", v.reason);
+        assert!(s.matched().contains(&"unreadable Retry-After"), "{s:?}");
+        // A short value split across two reads is still read whole.
+        let s = scan(&["HTTP 429\nRetry-After: 17", "2800\n"]);
+        assert!(!s.unread_retry_after, "{s:?}");
+        assert_eq!(s.verdict(&cfg).expect("pushback").cooldown_secs, 172_800.0);
     }
 
     #[test]

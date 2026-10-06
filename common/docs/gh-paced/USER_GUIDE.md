@@ -342,7 +342,9 @@ reads is still found. It looks for:
   never shortened: it starts a cooldown with no end time, every paced call is
   refused (exit 75) with a message saying so, and the cooldown ends only when a
   person removes `<account>.cooldown` and the `cooldown` entry of
-  `<account>.json` from the state directory.
+  `<account>.json` from the state directory. A value whose digits run on past
+  the 4 KiB kept between reads cannot be read whole, and is treated the same
+  way.
 
 For `gh api -i/--include`, gh prints the HTTP status line and response headers
 on **stdout** instead. For that form only, gh-paced also reads stdout as it
@@ -367,6 +369,13 @@ blank line. stdout itself is passed on unchanged.
   that exact shape with CRLF line endings is read as one more header block and
   can start a cooldown that was not needed. gh-paced cannot tell such a body
   from a real page boundary, so this errs on the safe side.
+- **Over-long lines.** A stdout line longer than 8,192 bytes is not kept. In a
+  403 or 429 block, such a line (a `Retry-After` with thousands of leading
+  zeros, or any other header that long) means the wait GitHub asked for cannot
+  be read, so it starts a cooldown with no end time, as for a `Retry-After`
+  over 365 days above, never a shorter one. In any other block it ends the
+  block. A status line that long (HTTP/1.1 lets the server choose its reason
+  phrase) still opens its block.
 
 Any limit signal (one of the phrases, HTTP 429, a `Retry-After` value, or
 `X-RateLimit-Remaining: 0`) starts a **cooldown** of the larger of `Retry-After`
@@ -463,12 +472,18 @@ Base64-looking content is either of:
   columns does not hide one either. Lines of differing widths, such as a list
   of test names one per line, do not form this kind of block;
 - a block of consecutive base64-alphabet lines, each at least 4 characters and
-  each holding both upper- and lower-case letters, of any widths, counted
-  together. Standard base64 mixes the cases on nearly every line, so an
-  encoding wrapped at varying narrow widths (16, then 12, then 16) forms this
-  block. A list of lower-case identifiers or hex hashes one per line does not.
-  A list of mixed-case names one per line (`CamelCaseTestName`) does, once it
-  passes the limit.
+  each holding at least one upper-case letter or made of one repeated
+  character, of any widths, counted together. Standard base64 has an
+  upper-case letter on nearly every line (and the encoding of zero bytes is
+  all `A`), so an encoding wrapped at varying narrow widths (16, then 12, then
+  16) forms this block, and so does a run of `/` (bytes 0xFF). A list of
+  lower-case identifiers or hex hashes one per line does not. A list of
+  mixed-case or upper-case names one per line (`CamelCaseTestName`) does,
+  once it passes the limit. A line with no upper-case letter (and not made of
+  one repeated character) ends this block, so text in only lower-case letters
+  and digits (lower-case base32 or hex, or base64 that happens to have no
+  upper-case letter, such as `abcd` repeated) wrapped at varying widths under
+  20 columns is not counted by any of these shapes.
 
 Lists can match these shapes too. Bare commit SHAs one per line are refused at
 26 or more full 40-character SHAs, or 143 or more 7-character short SHAs; a
@@ -599,11 +614,16 @@ gh's order: `GH_EDITOR`, the `editor` key of gh's `config.yml`, `GIT_EDITOR`,
 `VISUAL`, `EDITOR`, then `nano`. When gh opens an editor, it runs the guard,
 which runs your editor on the same file, waits for it, and then checks the
 saved text with the same size and base64 limits as any other body. The size
-limit is one allowance for the whole call: gh-paced passes the number of body
-bytes the command line already used (for example a `--title`) to the guard in
-`GH_PACED_BODY_BYTES_USED`, and the editor text is checked against what is left.
-A value there that is not a byte count is refused (exit 78). If the text passes,
-gh carries on as usual. If it fails, the guard prints a `GH-PACED REFUSED`
+limit is shared with the command line: gh-paced passes the number of body bytes
+the arguments, files and stdin already used (for example a `--title`) to the
+guard in `GH_PACED_BODY_BYTES_USED`, and the text saved in the editor (every
+file gh opens in that editor run, together) is checked against what is left.
+It is not one allowance for everything the call sends: a title or other answer
+gh prompts for on the terminal is not counted, and if gh opens the editor more
+than once in one call, each opening is checked against what the command line
+left, not against what an earlier opening used. A value in
+`GH_PACED_BODY_BYTES_USED` that is not a byte count is refused (exit 78). If
+the text passes, gh carries on as usual. If it fails, the guard prints a `GH-PACED REFUSED`
 banner, keeps a private copy of the text in the state directory as
 `<account>.refused-edit.<nanoseconds>.md` (gh deletes its own file; at most the
 first 1 MiB is kept, and the banner says when the rest was not copied), and

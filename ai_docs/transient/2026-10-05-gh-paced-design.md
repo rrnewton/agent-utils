@@ -954,6 +954,49 @@ Left open by the round-8 scope (coordinator decision): the binary-extension
 over-refusal, the U+2028 refusal of gh-written configurations, and the F5 and
 F6 remainders (all listed under Open items).
 
+## Round 8 and what changed
+
+Round 8 reviewed `62ae6a0c` and returned CHANGES REQUESTED: 1 blocker and 3
+minors (all wording). The blocker is older (unchanged since `0042a521`). The
+coordinator approved a narrow round 9: the blocker in its fail-closed form,
+and the wording.
+
+| Round-8 finding | Now | Test (fails on `62ae6a0c`) |
+| --- | --- | --- |
+| blocker: a header line of 8,192 bytes or more was dropped, so `Retry-After: ` followed by 9,000 zeros and `172800` (two days) left the 429 without its wait and recorded the 900 s floor; an over-long unrelated header before a valid `Retry-After: 172800` did the same. With `--paginate` the block was dropped and no cooldown started at all | a header line that reaches 8,192 bytes inside a 403 or 429 block starts a cooldown with no end time (`f64::MAX`), the same state as a `Retry-After` over 365 days; the banner and the refusal name `<account>.cooldown` and the `cooldown` entry of `<account>.json`. gh-paced does not try to parse the long value. A status line that long (a long HTTP/1.1 reason phrase) still opens its block. On stderr, a `Retry-After` whose digits run past the 4,096 bytes kept between reads does the same | `cli::a_retry_after_with_leading_zeros_never_shortens_a_wait`, `cli::an_overlong_header_before_retry_after_never_shortens_a_wait` (each in both modes; on `62ae6a0c` the first mode run, without `--paginate`, records 900 s, and with `--paginate` first no cooldown is recorded), `pushback::an_overlong_header_line_never_shortens_a_wait`, `pushback::an_unreadable_stderr_retry_after_never_shortens_a_wait` |
+| minor: "gh never sees the alias name" (help text, quick start) is wrong for a shell alias, which is passed to gh by name | both say it holds for ordinary aliases, and that a shell alias is passed by name, charged one WRITE, and what its shell command sends is checked only if the `gh` it runs is gh-paced | none (text) |
+| minor: the user guide's "one allowance for the whole call" | the guide says the editor text shares the allowance with the arguments, files and stdin, and that a prompted title, and a second editor opening in the same call, are not counted together | none (text) |
+| minor: the user guide's varying-width base64 rule said "both upper- and lower-case letters" | the guide states the rule the code applies (an upper-case letter, or one repeated character, on each line) and its limit: lower-case-only text wrapped at varying widths under 20 columns is not counted | none (text) |
+
+**Rules of the over-long-line check.** The rule follows the coordinator's
+fail-closed form. Without `--paginate`, the long line in a 403 or 429 block
+commits the block and ends reading, as any line of another shape does there;
+the cooldown has no end time whatever came before. With `--paginate`, reading
+continues, and the block counts only if the long line ends in CR LF (as every
+header gh writes does). A long line ending in a bare LF is body text and drops
+the block, as a short one does. In any other block (a 200, say), a long line
+ends the block, as before. 503 is not included: GitHub sends `Retry-After`
+with 403 and 429, the coordinator's rule names those two, and a 503 never
+started a cooldown by itself. A 503 whose `Retry-After` is readable still
+starts one, through the existing "any `Retry-After`" rule, so a 503 whose
+`Retry-After` sits in an over-long line is the one remaining case where a
+server wait is not honoured (listed under Open items).
+
+**The stderr rule.** The stderr scan keeps the last 4,096 bytes between reads,
+and a `Retry-After` value still running at the end of what is held is read
+again with the next read while its name is within those bytes. Past that, the
+remaining digits would arrive without the name. The scan now marks that case,
+and the verdict gives a cooldown with no end time. One read that holds the
+whole value is parsed in full (9,000 zeros then `172800` read as 172,800 s).
+
+Test changes in this commit:
+
+- `pushback::single_response_reads_only_the_first_block`: the over-long-line
+  case keeps its assertion (the 429 is read and nothing after the long line
+  is) and adds one: the verdict now has no end time.
+
+No other existing assertion changed.
+
 ## Test changes worth a reviewer's attention
 
 Round 1 changed these existing tests. Every change makes the test stricter or
@@ -1099,11 +1142,13 @@ pagination and limit costs, watch loops, alias inspection), adds one test
   inside a quoted alias, is unreadable to gh-paced, so every command is refused
   (exit 78) until it is rewritten.
 - F5 remainder: a title gh prompts for on a terminal is not counted with the
-  editor body, so the two can exceed `max_body_bytes` together. The user
-  guide's "one allowance for the whole call" overstates this.
+  editor body, so the two can exceed `max_body_bytes` together, and a second
+  editor opening in one call is checked against what the command line left,
+  not against the first opening. The user guide says so (round 8).
 - F6 remainder: lower-case standard base64 wrapped at varying widths (for
   example `abcd` repeated, at alternating 16 and 12 columns) passes the
-  varying-width rule. The user guide still describes the earlier mixed-case
-  rule.
+  varying-width rule. The user guide states the rule and this limit (round 8).
+- A 503 whose `Retry-After` is in a header line of 8,192 bytes or more starts
+  no cooldown; the over-long-line rule covers 403 and 429 only (round 8).
 - A `Retry-After` above 365 days stops paced calls for the account on the host
   until a person clears the cooldown (see round 7).
