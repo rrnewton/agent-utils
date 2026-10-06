@@ -173,7 +173,12 @@ Runs nothing and touches no state or network. Classification depends only on
 the arguments, the configuration (for --paginate and watch costs) and gh's own
 aliases (read from gh's config.yml), which are expanded first, as a real run
 expands them; the expansion is shown on an `alias:` line (an `alias` key with
---json), and a command line a real run would refuse is shown as REFUSED.
+--json). REFUSED shows only the refusals decided from the command line, the
+configuration and gh's aliases: a watch without GH_PACED_ALLOW_WATCH=1, an
+unreadable or too-short --interval on a watch, and an alias gh-paced cannot
+resolve. A real run can still refuse what classify accepts: a body the content
+guard rejects (exit 65), a cost larger than the bucket or a wait beyond
+GH_PACED_MAX_WAIT (exit 75), and an unreadable gh config.yml (exit 78).
 
 EXAMPLES
   gh-paced classify -- pr comment 5 --body hi
@@ -182,6 +187,12 @@ EXAMPLES
 
 fn env_var(name: &str) -> Option<String> {
     std::env::var(name).ok()
+}
+
+/// The variable as the operating system gives it, including a value that is not UTF-8 (which
+/// [`env_var`] reports as unset).
+fn env_os(name: &str) -> Option<std::ffi::OsString> {
+    std::env::var_os(name)
 }
 
 fn loud_error(text: &str) {
@@ -382,8 +393,9 @@ fn run_paced(account: Option<String>, real_gh: Option<String>, gh_args: Vec<Stri
         pid,
         start_ticks: state::process_start_ticks(pid).unwrap_or(0),
         nonce: state::new_nonce(now),
-        gh_aliases: crate::alias::GhAliases::load(&env_var),
+        gh_aliases: crate::alias::GhAliases::load_checked(&env_var, &env_os),
         alias_note: None,
+        body_bytes_used: 0,
         editor_guard_env: crate::editor::guard_env(&env_var, self_exe.as_deref(), &account),
         self_exe,
         stderr_deadline: None,
@@ -576,7 +588,7 @@ fn run_classify(args: &[String]) -> i32 {
     let mut gh_args = args[i + 1..].to_vec();
     let mut alias_note = None;
     let mut alias_refusal = None;
-    match crate::alias::GhAliases::load(&env_var).resolve(&gh_args) {
+    match crate::alias::GhAliases::load_checked(&env_var, &env_os).resolve(&gh_args) {
         crate::alias::Resolution::NotAlias => {}
         crate::alias::Resolution::Expanded { argv, chain } => {
             alias_note = Some(format!(
