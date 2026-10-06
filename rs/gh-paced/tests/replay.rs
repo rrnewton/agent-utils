@@ -133,6 +133,8 @@ impl Runner for FakeGh<'_> {
             stdout: body.into_bytes(),
             stderr: Vec::new(),
             timed_out: false,
+            stdout_cut: false,
+            stderr_cut: false,
         })
     }
 }
