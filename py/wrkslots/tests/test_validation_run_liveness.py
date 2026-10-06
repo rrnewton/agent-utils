@@ -1964,6 +1964,88 @@ def test_a_hidden_mount_below_the_cgroup_hierarchy_is_not_read_as_a_cover(
     wrkslots._assert_whole_cgroup2_hierarchy(Path("/sys/fs/cgroup"))
 
 
+@pytest.mark.parametrize(
+    ("table", "check"),
+    [
+        (
+            "2 1 0:2 / /proc rw - proc proc rw\n"
+            "3 2 0:3 / /proc/4242 rw - tmpfs tmpfs rw\n"
+            "4 2 0:2 / /proc rw - proc proc rw\n",
+            "process-view",
+        ),
+        (
+            "2 1 0:2 / /sys/fs/cgroup rw - cgroup2 cgroup2 rw\n"
+            "3 2 0:3 / /sys/fs/cgroup/user.slice rw - tmpfs tmpfs rw\n"
+            "4 2 0:2 / /sys/fs/cgroup rw - cgroup2 cgroup2 rw\n",
+            "cgroup-hierarchy",
+        ),
+    ],
+)
+def test_a_hidden_mount_is_not_a_cover_where_the_root_is_not_a_mount_point(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, table: str, check: str
+) -> None:
+    """A process whose root is not a mount point sees no mount at "/", and
+    the mounts on the unlisted mount above the table are where lookup
+    starts.  Mount 4, stacked over the same point later, hides mount 3, so
+    neither proof reads mount 3 as a cover; without mount 4 both refuse.
+    """
+
+    path = tmp_path / "mountinfo"
+    monkeypatch.setattr(wrkslots, "_SELF_MOUNTINFO", path)
+    initial = dict(wrkslots._INITIAL_NAMESPACE_INODES)
+    monkeypatch.setattr(wrkslots, "_namespace_inode", lambda name: initial[name])
+
+    def prove() -> None:
+        if check == "process-view":
+            wrkslots._assert_host_process_view()
+        else:
+            wrkslots._assert_whole_cgroup2_hierarchy(Path("/sys/fs/cgroup"))
+
+    covered = "".join(table.splitlines(keepends=True)[:2])
+    path.write_text(covered, encoding="utf-8")
+    with pytest.raises(wrkslots.Refusal, match="masks|covers part"):
+        prove()
+    path.write_text(table, encoding="utf-8")
+    prove()
+    entries = wrkslots._mount_entries(table.encode(), "table")
+    hidden = wrkslots._visible_mount(entries, entries[1].point)
+    assert hidden is not None and hidden.mount_id == 4
+
+
+@pytest.mark.parametrize("check", ["process-view", "cgroup-hierarchy"])
+def test_finding_the_visible_mounts_of_a_large_table_is_linear(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, check: str
+) -> None:
+    """3,000 mounts below /proc or /sys/fs/cgroup, all hidden by a later
+    mount stacked over that point, are checked in one pass over the table.
+
+    Finding each entry's visible mount anew rebuilt the whole mount graph
+    per entry, so this table (about 160 KB, inside the 4 MiB bound) took
+    31 seconds; the bound here leaves room for a loaded host.
+    """
+
+    point = "/proc" if check == "process-view" else "/sys/fs/cgroup"
+    fstype = "proc" if check == "process-view" else "cgroup2"
+    lines = ["1 0 0:1 / / rw - ext4 /dev/root rw\n", f"2 1 0:2 / {point} rw - {fstype} x rw\n"]
+    lines.extend(
+        f"{10 + index} 2 0:3 / {point}/{100000 + index} rw - tmpfs tmpfs rw\n"
+        for index in range(3_000)
+    )
+    lines.append(f"9999 2 0:2 / {point} rw - {fstype} x rw\n")
+    path = tmp_path / "mountinfo"
+    path.write_text("".join(lines), encoding="utf-8")
+    monkeypatch.setattr(wrkslots, "_SELF_MOUNTINFO", path)
+    initial = dict(wrkslots._INITIAL_NAMESPACE_INODES)
+    monkeypatch.setattr(wrkslots, "_namespace_inode", lambda name: initial[name])
+
+    started = time.monotonic()
+    if check == "process-view":
+        wrkslots._assert_host_process_view()
+    else:
+        wrkslots._assert_whole_cgroup2_hierarchy(Path(point))
+    assert time.monotonic() - started < 5.0
+
+
 def test_this_host_counts_the_member_of_this_process_unit() -> None:
     """The real read finds this test process in its own unit's control group.
 

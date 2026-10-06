@@ -11526,48 +11526,92 @@ def _procfs_points(entries: Sequence[_MountEntry]) -> tuple[Path, ...]:
     return tuple(entry.point for entry in entries if entry.fstype == "proc")
 
 
-def _visible_mount(entries: Sequence[_MountEntry], path: Path) -> _MountEntry | None:
-    """Return the mount of ``entries`` that holds the absolute, resolved ``path``, or None.
+class _MountLookup:
+    """Which mount of one mount table path lookup reaches at each path.
 
-    Path lookup starts at the mount at "/" and, at each leading part of
-    ``path``, moves to a mount on the current one at that point, as many
-    times as mounts are stacked there. Following mounts by parent, rather
-    than taking the deepest mount point, sees that a mount made over a
-    directory above an earlier mount hides that one. A table naming no
-    mount at "/" whose parent it does not list, as a process whose root is
-    not a mount point sees, gives the last mount at the deepest mount point
-    holding ``path`` instead; None when there is none.
+    Path lookup starts above every mount whose parent the table does not
+    list (or that is its own parent): the mount at "/" of a process whose
+    root is a mount point, or, for a process whose root is not one, each
+    mount on the unlisted mount that holds that root.  At each leading part
+    of a path it moves to the last mount listed on the current one at that
+    point, as many times as mounts are stacked there.  Following mounts by
+    parent, rather than taking the deepest mount point, sees that a mount
+    made over a directory above an earlier mount hides that one.
+
+    Each path is a node of a tree of path components, and the mount reached
+    at each node is kept, so finding the mount of every entry of a table
+    costs one step per path component and per stacked mount, however many
+    entries share a prefix.
     """
 
-    known = {entry.mount_id for entry in entries}
-    children: dict[int, list[_MountEntry]] = {}
-    current: _MountEntry | None = None
-    for entry in entries:
-        children.setdefault(entry.parent_id, []).append(entry)
-        if entry.point == Path("/") and (
-            entry.parent_id not in known or entry.parent_id == entry.mount_id
-        ):
-            current = entry
-    if current is None:
-        deepest: _MountEntry | None = None
+    def __init__(self, entries: Sequence[_MountEntry]) -> None:
+        self._entries = tuple(entries)
+        known = {entry.mount_id for entry in entries}
+        self._nodes: dict[tuple[int, str], int] = {}
+        # Mounts listed on each mount (None: on the unlisted mount above
+        # the table) at each path node, in table order.
+        self._on: dict[tuple[int | None, int], list[_MountEntry]] = {}
+        # The mount reached after each path node; None is the unlisted one.
+        self._reached: dict[int, _MountEntry | None] = {}
         for entry in entries:
-            if _path_is_within(path, entry.point) and (
-                deepest is None or len(entry.point.parts) >= len(deepest.point.parts)
-            ):
-                deepest = entry
-        return deepest
-    for count in range(1, len(path.parts) + 1):
-        prefix = Path(*path.parts[:count])
+            parent = (
+                None
+                if entry.parent_id not in known or entry.parent_id == entry.mount_id
+                else entry.parent_id
+            )
+            self._on.setdefault((parent, self._chain(entry.point)[-1]), []).append(entry)
+
+    def _chain(self, path: Path) -> list[int]:
+        chain = [0]
+        for name in path.parts[1:]:
+            chain.append(self._nodes.setdefault((chain[-1], name), len(self._nodes) + 1))
+        return chain
+
+    def _stacked(self, current: _MountEntry | None, node: int) -> _MountEntry | None:
+        visited: set[int] = set()
         while True:
+            owner = None if current is None else current.mount_id
             above = [
-                entry
-                for entry in children.get(current.mount_id, ())
-                if entry.point == prefix and entry.mount_id != current.mount_id
+                entry for entry in self._on.get((owner, node), ()) if entry.mount_id != owner
             ]
             if not above:
-                break
+                return current
             current = above[-1]
-    return current
+            if current.mount_id in visited:
+                raise Refusal("the mount table stacks mounts on each other in a cycle")
+            visited.add(current.mount_id)
+
+    def reach(self, path: Path) -> _MountEntry | None:
+        """The mount holding absolute, resolved ``path``, or None when no
+        listed mount holds it."""
+
+        if not path.is_absolute():
+            raise Refusal(f"cannot find the mount holding relative path {path}")
+        chain = self._chain(path)
+        start = len(chain)
+        while start and chain[start - 1] not in self._reached:
+            start -= 1
+        current = self._reached[chain[start - 1]] if start else None
+        for node in chain[start:]:
+            current = self._stacked(current, node)
+            self._reached[node] = current
+        return current
+
+    def shows(self, entry: _MountEntry) -> bool:
+        """Whether ``entry`` is the mount path lookup reaches at its point.
+
+        A mount made later over its point, or over a directory above it,
+        hides it.
+        """
+
+        return self.reach(entry.point) is entry
+
+
+def _visible_mount(entries: Sequence[_MountEntry], path: Path) -> _MountEntry | None:
+    """Return the mount of ``entries`` that holds the absolute, resolved
+    ``path``, or None (see ``_MountLookup``)."""
+
+    return _MountLookup(entries).reach(path)
 
 
 def _process_dependent_prefix(
@@ -16596,15 +16640,6 @@ def _user_manager_cgroup(root: Path) -> Path:
     return root / "user.slice" / f"user-{os.getuid()}.slice" / manager
 
 
-def _mount_is_visible(entries: Sequence[_MountEntry], entry: _MountEntry) -> bool:
-    """Whether ``entry`` is the mount that path lookup reaches at its point.
-
-    A mount made later over its point, or over a directory above it, hides it.
-    """
-
-    return _visible_mount(entries, entry.point) is entry
-
-
 def _assert_whole_cgroup2_hierarchy(root: Path) -> None:
     """Refuse unless the mounts visible at and below ``root`` show the whole
     cgroup v2 tree.
@@ -16619,7 +16654,8 @@ def _assert_whole_cgroup2_hierarchy(root: Path) -> None:
     """
 
     entries = _read_self_mount_entries()
-    entry = _visible_mount(entries, root)
+    lookup = _MountLookup(entries)
+    entry = lookup.reach(root)
     if entry is None or entry.point != root or entry.fstype != "cgroup2":
         raise Refusal(f"no cgroup v2 hierarchy is mounted at {root}")
     if entry.root != b"/":
@@ -16629,11 +16665,7 @@ def _assert_whole_cgroup2_hierarchy(root: Path) -> None:
             "retained run unit's control group can be outside it"
         )
     for below in entries:
-        if (
-            below.point != root
-            and _path_is_within(below.point, root)
-            and _mount_is_visible(entries, below)
-        ):
+        if below.point != root and _path_is_within(below.point, root) and lookup.shows(below):
             raise Refusal(
                 f"a {below.fstype} mount at {below.point} covers part of the cgroup v2 "
                 "hierarchy, so a retained run unit's control-group members can read empty"
@@ -16771,10 +16803,9 @@ def _assert_host_process_view() -> None:
             "the recorded runs"
         )
     entries = _read_self_mount_entries()
+    lookup = _MountLookup(entries)
     for entry in entries:
-        if _PROC_PROCESS_MOUNT.fullmatch(str(entry.point)) and _mount_is_visible(
-            entries, entry
-        ):
+        if _PROC_PROCESS_MOUNT.fullmatch(str(entry.point)) and lookup.shows(entry):
             raise Refusal(
                 f"a {entry.fstype} mount at {entry.point} masks that process's "
                 "entries in /proc, so its process table need not show the recorded runs"
