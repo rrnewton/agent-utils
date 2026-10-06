@@ -69,6 +69,17 @@ if [ -n "${FAKE_GH_LATE_ERR:-}" ]; then
     echo "$(date +%s.%N) helper-end" >> "$log" ) </dev/null >/dev/null &
 fi
 if [ -n "${FAKE_GH_STDOUT_HEAD:-}" ]; then printf '%s' "$FAKE_GH_STDOUT_HEAD"; fi
+if [ -n "${FAKE_GH_STDOUT_STEPS:-}" ]; then
+  # Write each part (separated by the unit separator, 0x1f) with no line end after it, logging
+  # "step N" after part N and pausing a second before the next, as gh writing in pieces would.
+  rest="$FAKE_GH_STDOUT_STEPS"; i=0
+  while :; do
+    part="${rest%%$'\037'*}"; printf '%s' "$part"; i=$((i + 1))
+    echo "$(date +%s.%N) step $i" >> "$log"
+    [ "$part" = "$rest" ] && break
+    rest="${rest#*$'\037'}"; sleep 1
+  done
+fi
 if [ -n "${FAKE_GH_STDOUT_BYTES:-}" ]; then head -c "$FAKE_GH_STDOUT_BYTES" /dev/zero | tr '\0' x; echo; fi
 if [ -n "${FAKE_GH_STDOUT:-}" ]; then printf '%s\n' "$FAKE_GH_STDOUT"; fi
 if [ -n "${FAKE_GH_STDERR:-}" ]; then printf '%s\n' "$FAKE_GH_STDERR" >&2; fi
@@ -1353,6 +1364,129 @@ fn a_long_line_after_a_retry_after_never_drops_the_wait() {
     assert_overlong_header_starts_a_no_end_cooldown("late-colon", "FAKE_GH_STDOUT", &late);
     let missing = format!("HTTP/2.0 403 Forbidden\r\nRetry-After: 172800\r\n{filler}\r\n\r\n{{}}");
     assert_overlong_header_starts_a_no_end_cooldown("no-colon", "FAKE_GH_STDOUT", &missing);
+}
+
+/// Run `gh api --include`, with and without `--paginate`, whose fake gh writes a 429 response
+/// in three writes a second apart, `...Retry-After: 17`, then `28`, then `00` and the rest, while
+/// delivery to the consumer fails: through a pipe whose reader is already gone (`| head -c0`), or
+/// to a terminal whose master side closes after the first write has reached it. gh-paced stops
+/// reading after the chunk it holds, with the `Retry-After: 172800` line unfinished. The wait is
+/// not known, so the cooldown must have no end time, never 900 s or the value read up to the cut,
+/// and the next paced call is refused without running gh.
+fn assert_cut_delivery_starts_a_no_end_cooldown(name: &str, terminal: bool) {
+    let steps = [
+        "HTTP/2.0 429 Too Many Requests\nA-Pad: x\r\nRetry-After: 17",
+        "28",
+        "00\r\n\r\n{}\n",
+    ]
+    .join("\u{1f}");
+    for (mode, args) in [
+        ("single", &["api", "-i", "repos/o/r"][..]),
+        ("paginate", &["api", "-i", "--paginate", "repos/o/r"][..]),
+    ] {
+        let sb = Sandbox::new(&format!("{name}-{mode}"), FAST);
+        let mut cmd = sb.cmd(args);
+        cmd.env("FAKE_GH_STDOUT_STEPS", &steps)
+            .env("FAKE_GH_EXIT", "1")
+            .stderr(Stdio::piped());
+        let master = if terminal {
+            // SAFETY: standard pty allocation; both sides are owned by Files and closed on drop.
+            let (master, slave) = unsafe {
+                let fd = libc::posix_openpt(libc::O_RDWR | libc::O_NOCTTY | libc::O_CLOEXEC);
+                assert!(fd >= 0, "posix_openpt failed");
+                assert_eq!(libc::grantpt(fd), 0);
+                assert_eq!(libc::unlockpt(fd), 0);
+                let mut name = [0 as libc::c_char; 128];
+                assert_eq!(libc::ptsname_r(fd, name.as_mut_ptr(), name.len()), 0);
+                let slave = libc::open(
+                    name.as_ptr(),
+                    libc::O_RDWR | libc::O_NOCTTY | libc::O_CLOEXEC,
+                );
+                assert!(slave >= 0, "opening the pty slave failed");
+                (
+                    <std::fs::File as std::os::fd::FromRawFd>::from_raw_fd(fd),
+                    <std::fs::File as std::os::fd::FromRawFd>::from_raw_fd(slave),
+                )
+            };
+            cmd.stdout(Stdio::from(slave));
+            Some(master)
+        } else {
+            let mut fds = [0 as libc::c_int; 2];
+            // SAFETY: pipe2 fills two new descriptors, each then owned by a File.
+            let (reader, writer) = unsafe {
+                assert_eq!(libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC), 0);
+                (
+                    <std::fs::File as std::os::fd::FromRawFd>::from_raw_fd(fds[0]),
+                    <std::fs::File as std::os::fd::FromRawFd>::from_raw_fd(fds[1]),
+                )
+            };
+            drop(reader);
+            cmd.stdout(Stdio::from(writer));
+            None
+        };
+        let child = cmd.spawn().unwrap();
+        drop(cmd);
+        if let Some(mut master) = master {
+            // The first write reaches the terminal; then the terminal goes away.
+            let mut seen = Vec::new();
+            let begun = Instant::now();
+            while !String::from_utf8_lossy(&seen).contains("Retry-After: 17") {
+                assert!(
+                    begun.elapsed().as_secs_f64() < 15.0,
+                    "{mode}: the first write never reached the terminal: {seen:?}"
+                );
+                let mut pfd = libc::pollfd {
+                    fd: std::os::fd::AsRawFd::as_raw_fd(&master),
+                    events: libc::POLLIN,
+                    revents: 0,
+                };
+                // SAFETY: poll on one descriptor owned by `master`.
+                if unsafe { libc::poll(&mut pfd, 1, 100) } > 0 {
+                    let mut buf = [0u8; 4096];
+                    let n = std::io::Read::read(&mut master, &mut buf).unwrap();
+                    seen.extend_from_slice(&buf[..n]);
+                }
+            }
+            drop(master);
+        }
+        let o = child.wait_with_output().unwrap();
+        let err = stderr(&o);
+        assert!(
+            err.contains("refused from now on: the cooldown has no end time"),
+            "{mode}: {err}"
+        );
+        assert!(
+            err.contains("before its Retry-After was read whole"),
+            "{mode}: {err}"
+        );
+        let state: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(sb.path("state/test.json")).unwrap())
+                .unwrap();
+        assert_eq!(
+            state["cooldown"]["until"].as_f64(),
+            Some(f64::MAX),
+            "{mode}: {state}"
+        );
+        let o = sb.run(&["api", "repos/o/r"], &[]);
+        assert_eq!(o.status.code(), Some(75), "{mode}: {}", stderr(&o));
+        assert_eq!(sb.starts().len(), 1, "{mode}: gh ran: {:?}", sb.starts());
+    }
+}
+
+/// Delivery to a consumer that has gone away (a pipe with no reader) fails on the first write,
+/// with gh's `Retry-After: 172800` line cut at `Retry-After: 17`: the cooldown has no end time.
+/// (At `65829cb0` the cut value or the bare 429 gave the 900 s floor.)
+#[test]
+fn a_consumer_gone_mid_retry_after_never_shortens_the_wait() {
+    assert_cut_delivery_starts_a_no_end_cooldown("cut-pipe", false);
+}
+
+/// Delivery to a terminal that goes away after gh's first write reached it fails on the second,
+/// with gh's `Retry-After: 172800` line cut at `Retry-After: 1728`: the cooldown has no end time.
+/// (At `65829cb0` the cut value or the bare 429 gave a cooldown of 1,728 s or 900 s.)
+#[test]
+fn a_terminal_gone_mid_retry_after_never_shortens_the_wait() {
+    assert_cut_delivery_starts_a_no_end_cooldown("cut-tty", true);
 }
 
 /// `gh api --include --paginate --jq` output that ends inside a later page's body: a
