@@ -56,6 +56,11 @@ pytestmark = pytest.mark.validation_run_evidence
 
 RUN_UNIT = "validate-run-0001.service"
 
+# Linux's PATH_MAX: the longest path, with its terminating NUL, that one
+# system call accepts.  Unit words are read past it; these tests use it as
+# the length a word must exceed to show that.
+PATH_MAX = 4096
+
 
 def _unit(**overrides: str) -> dict[str, str]:
     value = {
@@ -844,10 +849,10 @@ def test_resolving_a_long_path_looks_up_a_bounded_part_of_it(
         named = resolver.path_names(deep, identity)
 
     assert not named
-    assert len(lookups) <= wrkslots._PATH_MAX // 2 + 2, len(lookups)
-    assert lookups and max(map(len, lookups)) < wrkslots._PATH_MAX
+    assert len(lookups) <= PATH_MAX // 2 + 2, len(lookups)
+    assert lookups and max(map(len, lookups)) < PATH_MAX
     assert not resolutions
-    assert sum(map(len, resolver._files)) < 2 * wrkslots._PATH_MAX
+    assert sum(map(len, resolver._files)) < 2 * PATH_MAX
 
 
 def test_a_long_path_still_names_its_row(
@@ -987,7 +992,7 @@ def test_a_long_path_through_a_symlink_parent_names_its_row(tmp_path: Path) -> N
     identity = wrkslots._row_path_identity(row)
     path = "/" + "../" * 1400 + f"{str(tmp_path)[1:]}/link/.."
 
-    assert len(path) > wrkslots._PATH_MAX
+    assert len(path) > PATH_MAX
     assert os.path.realpath(path) == os.path.realpath(row)
     assert wrkslots._UnitPathResolver().path_names(path, identity)
     assert wrkslots._UnitPathResolver().names(
@@ -1055,9 +1060,9 @@ def test_one_resolver_reads_each_unit_property_once_for_every_row(
     parsed: list[str] = []
     real_words = wrkslots._unit_property_words
 
-    def words(value: str) -> tuple[str, ...]:
+    def words(value: str, budget: wrkslots._UnitResolutionBudget) -> tuple[str, ...]:
         parsed.append(value)
-        return real_words(value)
+        return real_words(value, budget)
 
     monkeypatch.setattr(wrkslots, "_unit_property_words", words)
     resolver = wrkslots._UnitPathResolver()
@@ -1102,6 +1107,121 @@ def test_the_retained_handle_census_bounds_its_path_matching_by_time(
         ):
             wrkslots._retained_handles_for_absent_rows(config, rows)
     assert elapsed[0] > wrkslots._RETAINED_HANDLE_CENSUS_SECONDS
+
+
+def test_the_retained_handle_census_bound_covers_the_row_identities(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The census's time bound starts before it reads the rows' identities.
+
+    The clock is simulated: reading the row's identity takes longer than
+    the whole bound, and the census refuses instead of starting its bound
+    afterwards.
+    """
+
+    project, tree = _prepare(tmp_path, monkeypatch, agent_liveness="dead")
+    _write_run_handle(project, tree)
+    config = wrkslots._load_config(str(project), "testhost")
+    rows = [(record, (tree,)) for record in wrkslots._load_active(config).slots]
+    real_monotonic = time.monotonic
+    elapsed = [0.0]
+    real_identity = wrkslots._row_path_identity
+
+    def slow_identity(path: Path) -> wrkslots._RowPathIdentity:
+        elapsed[0] += wrkslots._RETAINED_HANDLE_CENSUS_SECONDS + 60.0
+        return real_identity(path)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(time, "monotonic", lambda: real_monotonic() + elapsed[0])
+        patch.setattr(wrkslots, "_row_path_identity", slow_identity)
+        with pytest.raises(
+            wrkslots.Refusal, match="retained validation handle census exceeded its time bound"
+        ):
+            wrkslots._retained_handles_for_absent_rows(config, rows)
+    assert elapsed[0] > wrkslots._RETAINED_HANDLE_CENSUS_SECONDS
+
+
+def test_an_option_value_longer_than_one_system_call_path_is_read_whole(
+    tmp_path: Path,
+) -> None:
+    """A value after ``=`` is a candidate path however long it is.
+
+    ``/a/..`` repeated 1,000 times before the row makes the value longer
+    than 4,096 characters, and the ``:`` in the row's path splits every
+    shorter reading apart; only the whole value names the row.
+    """
+
+    row = tmp_path / "with:colon" / "slot01"
+    row.mkdir(parents=True)
+    (row.parent / "slot02").mkdir()
+
+    def names(**unit: str) -> bool:
+        return wrkslots._UnitPathResolver().names(unit, wrkslots._row_path_identity(row))
+
+    steps = "/a/.." * 1000
+    assert names(ExecStart=f"tool\0--checkout={steps}{row}/product")
+    assert names(Environment=f"CHECKOUT={steps}{row}")
+    assert not names(ExecStart=f"tool\0--checkout={steps}{row.parent}/slot02")
+
+
+def test_a_judgement_refuses_once_its_unit_words_exceed_their_bound(
+    tmp_path: Path,
+) -> None:
+    """Reading every value of a long search list costs characters with the
+    square of its length, so a 130,001-character property refuses.
+
+    Each ``:`` that a ``/`` follows starts a value running to the end of
+    the property; read whole, the 10,000 values of this one hold about
+    650 million characters.
+    """
+
+    (tmp_path / "slot01").mkdir()
+    row = wrkslots._row_path_identity(tmp_path / "slot01")
+    value = "X=" + ":".join(f"/no_{i:08d}" for i in range(10000))
+    started = time.monotonic()
+    with pytest.raises(wrkslots.Refusal, match="character bound of one judgement"):
+        wrkslots._UnitPathResolver().names(_unit(Environment=value), row)
+    assert time.monotonic() - started < wrkslots._UNIT_RESOLUTION_SECONDS
+
+
+def test_a_judgement_refuses_once_its_path_lookups_or_time_exceed_their_bounds(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Each ``lstat``, ``stat`` and ``readlink`` is counted, and the
+    judgement's time bound is checked as the work is charged."""
+
+    (tmp_path / "slot01").mkdir()
+    row = wrkslots._row_path_identity(tmp_path / "slot01")
+    paths = []
+    for index in range(40):
+        (tmp_path / f"other{index:02d}").mkdir()
+        paths.append(str(tmp_path / f"other{index:02d}" / "build"))
+    unit = _unit(ExecStart="\0".join(("/bin/tool", *paths)))
+    assert not wrkslots._UnitPathResolver().names(unit, row)
+
+    monkeypatch.setattr(wrkslots, "_UNIT_RESOLUTION_LOOKUP_LIMIT", 40)
+    with pytest.raises(wrkslots.Refusal, match="40-lookup bound of one judgement"):
+        wrkslots._UnitPathResolver().names(unit, row)
+
+    monkeypatch.setattr(wrkslots, "_UNIT_RESOLUTION_LOOKUP_LIMIT", 1_000_000)
+    monkeypatch.setattr(wrkslots, "_UNIT_RESOLUTION_SECONDS", 0.0)
+    with pytest.raises(wrkslots.Refusal, match="0-second bound of one judgement"):
+        wrkslots._UnitPathResolver().names(unit, row)
+
+
+def test_a_unit_too_long_to_read_leaves_its_row_unverifiable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A judgement that runs out of its word budget cannot clear the row."""
+
+    value = "X=" + ":".join(f"/no_{i:08d}" for i in range(10000))
+    state, message = _judge_with_unit_enumerations(
+        tmp_path,
+        monkeypatch,
+        [[_unit(), _unit(Id="other.service", ActiveState="active", Environment=value)]],
+    )
+    assert state == "unverifiable"
+    assert "character bound of one judgement" in message
 
 
 UNREADABLE_PID = 4_000_017

@@ -402,15 +402,15 @@ whitespace or an operator is read again as shell text, up to three times
 the characters `=`, `:`, `,`, `;`, `&`, `|`, `(`, `)`, `<`, `>`, `{`, `}` and `$`, and split again
 at the same characters except whitespace, so a row path containing a space is still one word in
 `--checkout=<path>` or `cd '<path>'`. The rest of each element and shell word from just after every
-`=`, and after every one of those characters that `/` or `~` follows, is a word too (cut to 4,096
-characters, the longest path a system call accepts), so `--checkout=<path>` and `NAME=<path>` keep a
-path that contains `:` or a quote. A leading `-`, `!`, `@` or `+` is also tried without it. The row
-path's own spellings (below) are also found as text anywhere in a property string, when they begin
-it or follow one of those characters and end it or precede `/` or one of those characters, so a row
-path is found whole even where it contains a newline or ends just before a `:`. One followed by a
-path that leaves it through `..` before the next of those characters (`<row>/../slot02`) is resolved
-as that whole path instead, so it names the row only when a symlink leads back inside. Every reading
-only adds words, so a path that contains one of these characters can name a row it is not inside
+`=`, and after every one of those characters that `/` or `~` follows, to the end of the element
+however long it is, is a word too, so `--checkout=<path>` and `NAME=<path>` keep a path that
+contains `:` or a quote. A leading `-`, `!`, `@` or `+` is also tried without it. The row path's own
+spellings (below) are also found as text anywhere in a property string, when they begin it or follow
+one of those characters and end it or precede `/` or one of those characters, so a row path is found
+whole even where it contains a newline or ends just before a `:`. One followed by a path that leaves
+it through `..` before the next of those characters (`<row>/../slot02`) is resolved as that whole
+path instead, so it names the row only when a symlink leads back inside. Every reading only adds
+words, so a path that contains one of these characters can name a row it is not inside
 (`slot01:other` names `slot01`) and refuse falsely, but no reading hides a row path's own spelling.
 A symlink to a row whose own name contains one of these characters can still go unmatched by the
 symlink's spelling when another of them follows it in the same shell word (`PATH=<symlink>:/bin`),
@@ -429,9 +429,16 @@ resolved as Python's `os.path.realpath` resolves them, however long the word is,
 component below one that is missing, not a directory, a symlink loop, too long or unsearchable is
 looked up, since every such lookup fails; a link target that cannot be read, or more than 40
 symlinks followed inside each other, refuses. Its ancestors are looked up from `/` down, stopping
-below one that is missing, not a directory, a symlink loop or too long. This rule is
-shared with `recover-absent-validate-rows`, and with a retained run handle's checkout, which the
-handle census matches with the rows within its 30-second time bound.
+below one that is missing, not a directory, a symlink loop or too long. One judgement may read
+33,554,432 characters of words and the paths made from them, make 262,144 lookups (`lstat`, `stat`
+and `readlink`), and take 20 seconds; past any of these bounds it refuses, so the row is
+unverifiable. Because every value is read to the end of its element, a search list's characters
+grow with the square of its length: a 130,001-character `NAME=/a:/b:...` list of 10,000 entries
+refuses, while all of the active units on devbig014 read about 2.9 million characters and made
+about 4,800 lookups in 0.2 seconds (2026-10-05). This rule is shared with
+`recover-absent-validate-rows`, and with a retained run handle's checkout, which the handle census
+matches with the rows within its 30-second time bound; that bound starts before the rows' own paths
+are read, and also bounds the matching in place of the 20 seconds.
 
 The process table is read both before and after the user-systemd enumeration, which takes about a
 second and a half on a busy host. A run that starts and finishes during the enumeration leaves its

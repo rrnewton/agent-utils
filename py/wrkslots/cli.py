@@ -43995,16 +43995,25 @@ def _retained_handles_for_absent_rows(
     # the row's paths or inside one, compared as unit words are: by
     # normalized and symlink-resolved spelling and by file identity, so a
     # symlink to the slot or a directory below it names the row too.
+    deadline = time.monotonic() + _RETAINED_HANDLE_CENSUS_SECONDS
     targets = [
         (record.slot, _row_path_identity(target)) for record, paths in rows for target in paths
     ]
-    resolver = _UnitPathResolver()
+    # The census's own deadline bounds its path matching, in place of the
+    # judgement's.
+    resolver = _UnitPathResolver(
+        _UnitResolutionBudget.start(
+            deadline=deadline,
+            expired="retained validation handle census exceeded its time bound",
+        )
+    )
     matched: dict[str, list[_RetainedValidationHandle]] = {
         record.slot: [] for record, _paths in rows
     }
     handle_paths: list[Path] = []
     total_bytes = 0
-    deadline = time.monotonic() + _RETAINED_HANDLE_CENSUS_SECONDS
+    if time.monotonic() >= deadline:
+        raise Refusal("retained validation handle census exceeded its time bound")
     stable_before_ns = _retained_handle_clock_ns() - _RETAINED_HANDLE_STABLE_NS
     if handles.is_dir():
         try:
@@ -44099,9 +44108,9 @@ def _retained_handles_for_absent_rows(
             related.update(
                 slot for slot, identity in targets if resolver.path_names(target, identity)
             )
-            # Each resolution is bounded (``_UnitPathResolver``), so checking
-            # after each field keeps the census within one field's work of
-            # its bound.
+            # The resolver's budget ends at the census deadline, and is
+            # charged as it resolves, so one field's resolution cannot run
+            # far past it.
             if time.monotonic() >= deadline:
                 raise Refusal("retained validation handle census exceeded its time bound")
         if not related:
@@ -47380,11 +47389,16 @@ _UNIT_VALUE_STARTS = re.compile(r"=|[\s\x00\"'`:,;&|()<>{}$](?=[/~])")
 _UNIT_SHELL_TEXT = re.compile(r"[\s\"'\\;&|()<>]")
 # How many times a shell word is read again as shell text.
 _UNIT_SHELL_NESTING = 3
-# Linux's PATH_MAX: the longest path, with its terminating NUL, that one
-# system call accepts.  A value read from just after a separator is cut to
-# this length, which keeps every path a call could use and bounds the
-# candidates a long property yields.
-_PATH_MAX = 4096
+# The work one judgement may spend reading the words of the user-systemd
+# units and retained run handles and resolving them as paths
+# (``_UnitResolutionBudget``): characters of words, readings and candidate
+# paths produced, file lookups (``lstat``, ``stat`` and ``readlink``), and
+# seconds.  Every reading of a property string is kept whole, so the
+# characters grow with the square of a long property's length; a judgement
+# that would exceed a bound refuses instead of reading on.
+_UNIT_RESOLUTION_CHARACTER_LIMIT = 32 * 1024 * 1024
+_UNIT_RESOLUTION_LOOKUP_LIMIT = 262_144
+_UNIT_RESOLUTION_SECONDS = 20.0
 # Prefixes systemd and unit files put before a path to change how it is used
 # (``-/path`` and ``!/path`` mean the path may be missing).
 _UNIT_PATH_PREFIXES = "-!@+"
@@ -47436,6 +47450,58 @@ _LSTAT_ENDS_BELOW = _LOOKUP_ENDS_BELOW | {errno.EACCES}
 _REALPATH_LINK_NESTING = 40
 
 
+@dataclasses.dataclass
+class _UnitResolutionBudget:
+    """What is left of one judgement's unit-word and path-resolution work.
+
+    ``characters`` and ``lookups`` count down as words are read and paths
+    looked up; ``deadline`` is a ``time.monotonic`` time, and ``expired``
+    the refusal once it passes.  Spending past any of them refuses, so a
+    long or crafted property string costs a bounded amount of work and
+    answers as unverifiable.
+    """
+
+    characters: int
+    lookups: int
+    deadline: float
+    expired: str
+
+    @classmethod
+    def start(
+        cls, *, deadline: float | None = None, expired: str | None = None
+    ) -> _UnitResolutionBudget:
+        """A full budget, ending ``_UNIT_RESOLUTION_SECONDS`` from now or at
+        a caller's own ``deadline`` with its own ``expired`` refusal."""
+
+        return cls(
+            _UNIT_RESOLUTION_CHARACTER_LIMIT,
+            _UNIT_RESOLUTION_LOOKUP_LIMIT,
+            time.monotonic() + _UNIT_RESOLUTION_SECONDS if deadline is None else deadline,
+            (
+                "reading the words of the user-systemd units and retained run handles "
+                f"exceeds the {_UNIT_RESOLUTION_SECONDS:g}-second bound of one judgement"
+            )
+            if expired is None
+            else expired,
+        )
+
+    def spend(self, *, characters: int = 0, lookups: int = 0) -> None:
+        self.characters -= characters
+        self.lookups -= lookups
+        if self.characters < 0:
+            raise Refusal(
+                "the words of the user-systemd units and retained run handles exceed "
+                f"the {_UNIT_RESOLUTION_CHARACTER_LIMIT:,}-character bound of one judgement"
+            )
+        if self.lookups < 0:
+            raise Refusal(
+                "resolving the paths of the user-systemd units and retained run handles "
+                f"exceeds the {_UNIT_RESOLUTION_LOOKUP_LIMIT:,}-lookup bound of one judgement"
+            )
+        if time.monotonic() >= self.deadline:
+            raise Refusal(self.expired)
+
+
 class _SymlinkLoop(Exception):
     """A symlink met again while it is being resolved; ``path`` is the
     unresolved text ``os.path.realpath`` returns for it."""
@@ -47452,7 +47518,9 @@ class _UnitPathResolver:
     candidate paths, the resolution of each path, and the identity of each
     file it stats, so several rows can be compared with one unit
     enumeration without repeating the parsing or the file-system reads.  It
-    must not outlive the judgement, because the files change.
+    must not outlive the judgement, because the files change.  Its work is
+    bounded by ``budget`` (``_UnitResolutionBudget``), which a caller may
+    share with a wider bound such as the handle census deadline.
 
     A path is resolved exactly as ``os.path.realpath`` resolves it
     (``_realpath``), without looking up a component below one whose lookup
@@ -47461,7 +47529,8 @@ class _UnitPathResolver:
     kept.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, budget: _UnitResolutionBudget | None = None) -> None:
+        self._budget = _UnitResolutionBudget.start() if budget is None else budget
         self._candidates: dict[tuple[str, str], tuple[str, ...]] = {}
         self._words: dict[str, tuple[tuple[str, ...], frozenset[tuple[int, int]]]] = {}
         self._files: dict[str, tuple[tuple[int, int] | None, bool]] = {}
@@ -47476,6 +47545,7 @@ class _UnitPathResolver:
             return self._kinds[path]
         except KeyError:
             pass
+        self._budget.spend(lookups=1)
         try:
             metadata = os.lstat(path)
         except OSError as exc:
@@ -47495,6 +47565,7 @@ class _UnitPathResolver:
             return self._targets[path]
         except KeyError:
             pass
+        self._budget.spend(lookups=1)
         try:
             target = os.readlink(path)
         except OSError as exc:
@@ -47613,6 +47684,7 @@ class _UnitPathResolver:
             return self._files[path]
         except KeyError:
             pass
+        self._budget.spend(lookups=1)
         answer: tuple[tuple[int, int] | None, bool]
         try:
             metadata = os.stat(path)
@@ -47655,6 +47727,9 @@ class _UnitPathResolver:
             return self._words[joined]
         except KeyError:
             pass
+        # The text is walked for its lexical spelling, its resolution as
+        # written and the resolution of its lexical spelling.
+        self._budget.spend(characters=3 * len(joined))
         lexical = os.path.normpath(joined)
         resolved = tuple(
             dict.fromkeys(
@@ -47699,12 +47774,13 @@ class _UnitPathResolver:
         except KeyError:
             pass
         paths: list[str] = []
-        for word in _unit_property_words(value):
+        for word in _unit_property_words(value, self._budget):
             for candidate in dict.fromkeys((word, word.lstrip(_UNIT_PATH_PREFIXES))):
                 if not candidate:
                     continue
                 if candidate == "~" or candidate.startswith("~/"):
                     candidate = os.path.expanduser(candidate)
+                self._budget.spend(characters=len(base) + len(candidate))
                 paths.append(
                     candidate if candidate.startswith("/") else os.path.join(base, candidate)
                 )
@@ -47753,7 +47829,7 @@ def _shell_words(text: str) -> tuple[str, ...]:
     return tuple(dict.fromkeys(words))
 
 
-def _unit_property_words(value: str) -> tuple[str, ...]:
+def _unit_property_words(value: str, budget: _UnitResolutionBudget) -> tuple[str, ...]:
     """Every candidate path in one unit property string.
 
     The elements are the NUL-separated strings of an array property (see
@@ -47764,19 +47840,24 @@ def _unit_property_words(value: str) -> tuple[str, ...]:
     split by every separator and by every separator except whitespace,
     and as the rest of each from just after every ``=``, and every
     separator that ``/`` or ``~`` follows, so ``--checkout=<path>`` and
-    ``NAME=<path>`` keep a path that holds a separator.  Each such rest is
-    cut to ``_PATH_MAX`` characters.
+    ``NAME=<path>`` keep a path that holds a separator.  Each rest runs to
+    the end of the element, however long; ``budget`` is charged for every
+    character read and produced before the work is done.
     """
 
     pieces = value.split(_UNIT_PROPERTY_ELEMENT_SEPARATOR)
     elements = dict.fromkeys(
         (*pieces, *(line for piece in pieces if "\n" in piece for line in piece.split("\n")))
     )
+    budget.spend(characters=2 * len(value))
     words: list[str] = []
     for element in elements:
         readings = [element]
         level: tuple[str, ...] = (element,)
         for _ in range(_UNIT_SHELL_NESTING):
+            # Each text is read by two lexers, and each yields words no
+            # longer than the text.
+            budget.spend(characters=4 * sum(len(text) for text in level))
             level = tuple(
                 dict.fromkeys(
                     word
@@ -47790,13 +47871,14 @@ def _unit_property_words(value: str) -> tuple[str, ...]:
             if not level:
                 break
         for reading in dict.fromkeys(readings):
+            # The reading and its two splits.
+            budget.spend(characters=3 * len(reading))
             words.append(reading)
             words.extend(_UNIT_EVIDENCE_SEPARATORS.split(reading))
             words.extend(_UNIT_ARGUMENT_SEPARATORS.split(reading))
-            words.extend(
-                reading[match.end() : match.end() + _PATH_MAX]
-                for match in _UNIT_VALUE_STARTS.finditer(reading)
-            )
+            for match in _UNIT_VALUE_STARTS.finditer(reading):
+                budget.spend(characters=len(reading) - match.end())
+                words.append(reading[match.end() :])
     return tuple(dict.fromkeys(words))
 
 
