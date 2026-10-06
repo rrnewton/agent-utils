@@ -1408,8 +1408,10 @@ released; the test asserts death by TERM, the late-signal message, and the
 two-day cooldown.
 
 **Fail-before evidence** (devbig014, `ignored/coordw-ghpaced-r5/`, logs
-`r17-before-fix.log` and `r17-failbefore/`; each build used the new tests and
-ran the 8 late-signal and stopped-reader CLI tests):
+`r17-before-fix.log` and `r17-failbefore/`; each build used the new tests.
+`r17-before-fix.log` ran 5 CLI tests selected by name, both new tests among
+them; each `r17-failbefore/` build ran the 8 late-signal and stopped-reader
+CLI tests):
 
 - `runner.rs` of `61f8ab4e`: both new tests failed with "the banner gives
   1200 s".
@@ -1430,6 +1432,75 @@ ran the 8 late-signal and stopped-reader CLI tests):
 replaces their `FAKE_GH_SLEEP=1`. The round-12 description above ("hold the
 account lock from gh's start") is now exact: gh writes nothing before the test
 holds the lock. No assertion was removed or loosened.
+
+## Round 14 and what changed
+
+Round 14 reviewed `61f8ab4e..50ebf880` (the round-13 fixes) and asked for
+changes: one high and four minors. As the coordinator directed for this
+round, only the high is fixed in code; three minors are recorded under "Open
+items", and the fourth, a false sentence in this note, is corrected.
+
+| Round-14 finding | Now | Test (fails before) |
+| --- | --- | --- |
+| high (a hang, neither shortens nor lengthens a wait; older than this series, reused by round 13): a read after a poll that reported the stream readable could wait indefinitely | the reader reads gh's stream non-blocking (`ReadEnd`); a read that finds nothing returns at once | `runner::tests::a_read_after_a_stale_hang_up_report_does_not_wait`: failed with `Err(Timeout)` when the flag is not set |
+| minor: the lock handshake does not force an unread second page | not changed; see "Open items" | none |
+| minor: the "more than 6 s after gh's exit" assertion is checked after the test's own 6.5 s sleep | not changed; see "Open items" | none |
+| minor: the module documentation says the hook is called before the chunk that changed the signals is queued, which the stop-time read does not do | not changed; see "Open items" | none |
+| minor: the round-13 evidence said every build ran 8 tests | corrected in "Round 13 and what changed" | none (text) |
+
+**The race.** The reader's `readable` is a `poll` for input that counts any
+event, and a pseudo-terminal master reports a hang-up when the last slave
+descriptor closes. A process gh left behind can close its slave descriptor,
+so the master reports the hang-up, and open `/dev/pts/N` again before the
+reader's read. The read then finds nothing and, blocking, waits for that
+process's next write. Round 14 reproduced the sequence with system calls:
+poll returned 16 (the hang-up), opening the slave again removed it, and the
+read returned only after a write 0.35 s later. The reader's main loop has
+polled and then read this way since the tee was written; round 13's
+stop-time read did the same at the cutoff. A reader stuck there reaches no
+cutoff, so gh-paced's finish and the drainer handoff stall; after a late
+signal, gh-paced uses its bounded fallback while the reader stays stuck.
+
+**The fix.** The reader holds gh's stream as a `ReadEnd`, which sets
+`O_NONBLOCK` on it while the reader holds it. `ReadEnd::read_chunk` retries
+`EINTR` and returns `Chunk::NotReady` for `EAGAIN`; end of file, `EIO` (a
+master whose slave is closed) and other errors are `Chunk::End`, as before.
+In the main loop `NotReady` goes back to the cutoff checks and the 100 ms
+poll; in `take_ready` it ends the stop-time read. gh-paced creates both kinds
+of stream itself (the pipe read end through `Command`, the master with
+`O_CLOEXEC`), so no other process shares the open file description whose
+flag changes. A stream handed to the drainer gets its flags back first
+(`ReadEnd::into_blocking`): the drainer copies with blocking reads until the
+last writer closes the stream, and with `O_NONBLOCK` left set its first read
+in a pause would fail with `EAGAIN` and end the copy. So the stop-time read
+now waits for nothing: a process that keeps writing holds the reader for at
+most the time to read and scan `READY_SCAN_BYTES` (1 MiB), and a silent one
+not at all.
+
+**Tests and fail-before evidence** (devbig014,
+`ignored/coordw-ghpaced-r5/r19-failbefore/`: `summary.txt`, the runners
+`runner.good.rs`, `runner.noblock.rs`, `runner.noblockback.rs`, and one log
+per run). These are the first unit tests in `runner.rs`.
+
+- `a_read_after_a_stale_hang_up_report_does_not_wait` opens a
+  pseudo-terminal, closes the slave, checks that the master polls readable,
+  opens the slave path again with `O_NOCTTY`, checks that it no longer does,
+  and reads in a thread. It expects `NotReady` within 2 s; otherwise it writes
+  one byte to the slave to free the read, then fails. With `O_NONBLOCK` not
+  set (`noblock`, the blocking read of `50ebf880`): failed with
+  `Err(Timeout)`.
+- `a_stream_handed_on_reads_blocking_again` checks that `O_NONBLOCK` is set
+  while the reader holds the stream and that the flags are as before after
+  `into_blocking`. With the restore removed (`noblockback`): failed, flags
+  34818 (`O_NONBLOCK` still set) against 32770. The same runner also failed
+  the two drainer CLI tests, `late_output_after_a_quiet_spell_is_delivered_and_scanned`
+  ("line 1" never arrived) and `late_output_past_the_elapsed_cutoff_is_delivered`
+  ("line 12" never arrived). `noblock` failed this test too.
+- The fixed runner: the 2 unit tests and 12 CLI tests selected by name
+  (late-signal, stopped-reader, late-output and background-helper tests) all
+  passed, 3 runs of 3, 8.6 s to 9.6 s each.
+
+No test was changed and no assertion was removed or loosened.
 
 ## Test changes worth a reviewer's attention
 
@@ -1660,3 +1731,24 @@ pagination and limit costs, watch loops, alias inspection), adds one test
   item above), so this needs a block that gh itself left unfinished, one that
   a process gh left behind is still writing, or a reader that did not finish
   within the wait. This is the fail-safe direction, like the items above.
+- Round-14 minors, not changed (see "Round 14 and what changed"):
+  - the tests that hold the account lock fix when the reader takes the lock,
+    not how far gh has written by then. A stdout reader delayed until both
+    small pages are written scans both in one read before its hook, so
+    `a_late_signal_scans_output_gh_wrote_but_gh_paced_had_not_read` and
+    `a_late_signal_waits_for_a_reader_held_up_by_the_state_lock` could then
+    pass without the late read; and if the first hook of the two round-13
+    tests starts long enough after gh's exit, the second can take the
+    released lock before the 2 s cutoff, so they could pass without the read
+    at the cutoff. Each mutant run so far failed as expected; an
+    acknowledgement from the reader would make that independent of
+    scheduling;
+  - in `assert_stopped_reader_scans_what_gh_wrote`, the check that gh-paced
+    ran more than 6 s after gh's exit comes after the test's own 6.5 s
+    sleep, so a gh-paced that had already exited passes it. The cooldown and
+    delivery checks are unaffected;
+  - the `runner.rs` module documentation says the reader calls the pushback
+    hook before queueing the chunk that changed the signals. The stop-time
+    read at a cutoff queues what it reads first and the reader calls the hook
+    once afterwards, so that output can reach the consumer before its
+    cooldown is recorded.
