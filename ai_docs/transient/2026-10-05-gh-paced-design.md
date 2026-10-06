@@ -1269,7 +1269,8 @@ the banner, and dies by the signal.
    is output gh already wrote, at most one pipe's capacity (64 KiB by default
    on x86-64; gh-paced does not resize its pipes, and 1 MiB is the default
    limit on resizing by an unprivileged process). On its next poll each reader
-   now reads what it can without waiting, up to `LATE_SCAN_BYTES` (1 MiB),
+   now reads what it can without waiting, up to `LATE_SCAN_BYTES` (1 MiB;
+   renamed `READY_SCAN_BYTES` in round 13, when the cutoffs began to use it),
    scans it, delivers none of it, feeds the end of its stream to the scanner
    (which commits an open block as output cut short), sets its new `scanned`
    flag, and stops. Before, the reader stopped without reading, so a 429 page
@@ -1356,6 +1357,79 @@ leave it alone. The three new tests share the helper
 `assert_two_day_cooldown`, which checks the banner as above and that both
 records of the cooldown (`test.json` and `test.cooldown`) end between
 172,790 s and 172,900 s after the signal.
+
+## Round 13 and what changed
+
+Round 13 reviewed `3d12eec3..61f8ab4e` (the round-12 fixes) and asked for
+changes: one blocker and three minors.
+
+| Round-13 finding | Now | Test (fails before) |
+| --- | --- | --- |
+| blocker (shortens a wait; older than this series): a reader that had stopped at an after-exit cutoff left gh's own output unread, and that output was then either handed to the drainer, which does not scan stdout, or, after a late signal, dropped. A third 429 page with `Retry-After: 172800` was lost and the cooldown was the 1,200 s of the second page | before a reader stops at a cutoff it reads, scans and queues for delivery whatever can be read at once, up to `READY_SCAN_BYTES` (1 MiB) | `cli::a_reader_stopped_after_gh_exits_still_scans_what_gh_wrote` (no signal) and `cli::a_late_signal_after_a_reader_stopped_keeps_what_gh_wrote` (TERM 1 s after the lock is released): both failed on `61f8ab4e` with "the banner gives 1200 s" |
+| minor: the two unread-page tests of round 12 relied on taking the lock during the fake gh's 1 s sleep, so they could pass without the reading step | the fake gh's new `FAKE_GH_GO=<path>` makes it wait (up to 30 s) for that file before writing; the tests create it only after they hold the lock | the same two tests with the late reading step removed: both fail, 1 run of 1 (900 s) |
+| minor: the guide said the clearing command's temporary file is "removed if the command fails" | the guide says it is removed when a step fails with a Python error, and that a kill before the rename can leave it behind, with `<account>.json` unchanged; gh-paced ignores it, and it is safe to delete | none (text) |
+| minor: the 1 MiB bound could be overshot by up to 64 KiB, because each read asked for the whole buffer | each read asks for at most what is left of the 1 MiB | none (the overshoot changed no wait) |
+
+**Why the cutoff was reachable with gh's output unread.** The after-exit
+cutoffs (2 s of silence, 5 s after gh's exit, 64 MiB) are measured from the
+reader's last read. A reader that records a cooldown calls its hook, which
+waits up to `lock_wait_secs` for the state file's lock. Time spent there
+counts as silence, so the next loop can take the 2 s cutoff (or the 5 s one)
+without having read what gh wrote while the hook waited. Before this round the
+reader then fed the end of the stream to its scanner and returned the stream,
+and main handed it to `gh-paced --drain`, which copies stdout unscanned. The
+round-13 review traced this for the late-signal path; the same test without a
+signal shows it on the ordinary path too, where it is older than this series:
+the drainer has never scanned stdout.
+
+**The fix.** `take_ready` (it replaces round 12's `scan_ready`) reads while
+the stream is readable without waiting, at most `READY_SCAN_BYTES` in all,
+scans each read, and, at a cutoff, queues it for delivery like any other read.
+The late path calls it without delivery, as before. Since gh has exited by the
+time either path runs, what is still in its pipe is output gh already wrote:
+at most one pipe's capacity (64 KiB by default), or a terminal's buffer. So
+the drainer is now left only with what a process gh left behind writes after
+the cutoff, which is what the user guide's limits already described.
+
+**The new tests.** Both use `--include --paginate` with stdout on a
+pseudo-terminal, `lock_wait_secs` 3, and the account lock held from before gh
+starts (the `FAKE_GH_GO` handshake). The fake gh writes a 200 page with a
+100 KiB body, then 429 pages with `Retry-After` 60, 1200 and 172800, separated
+by 5 KiB of body, and exits 1. The reader's hook for the first 429 waits 3 s;
+gh exits during it; the reader reads the 1200 page, waits 3 s in its hook
+again, and then takes the cutoff with the 172800 page unread. The test
+releases the lock 6.5 s after gh's exit. Without a signal the terminal is
+read throughout; the test asserts exit status 1, that gh-paced ran more than
+6 s after gh's exit, the two-day cooldown through `assert_two_day_cooldown`,
+and that the terminal received all three `Retry-After` lines in order and all
+110 body lines, which catches a fix that scans but does not deliver. With the
+signal the terminal is never read and TERM arrives 1 s after the lock is
+released; the test asserts death by TERM, the late-signal message, and the
+two-day cooldown.
+
+**Fail-before evidence** (devbig014, `ignored/coordw-ghpaced-r5/`, logs
+`r17-before-fix.log` and `r17-failbefore/`; each build used the new tests and
+ran the 8 late-signal and stopped-reader CLI tests):
+
+- `runner.rs` of `61f8ab4e`: both new tests failed with "the banner gives
+  1200 s".
+- The fixed runner without the read at the cutoff: the same two failed, with
+  "the banner gives 1200 s".
+- The fixed runner without the late read: `a_late_signal_scans_output_gh_wrote_but_gh_paced_had_not_read`
+  and `a_late_signal_waits_for_a_reader_held_up_by_the_state_lock` failed
+  with "the banner gives 900 s"; the two new tests passed, because the read
+  at the cutoff already covers them.
+- The fixed runner reading at the cutoff without delivering: the scanner had
+  the two days, but `a_reader_stopped_after_gh_exits_still_scans_what_gh_wrote`
+  failed on the delivered `Retry-After` values, `["60", "1200"]`.
+- The fixed runner: all 8 passed, 3 runs of 3 (8.6 s to 9.4 s each).
+
+**Test changes in this round.** Two new CLI tests, the helper
+`assert_stopped_reader_scans_what_gh_wrote` they share, the fake gh's
+`FAKE_GH_GO`, and the handshake in the two round-12 unread-page tests, which
+replaces their `FAKE_GH_SLEEP=1`. The round-12 description above ("hold the
+account lock from gh's start") is now exact: gh writes nothing before the test
+holds the lock. No assertion was removed or loosened.
 
 ## Test changes worth a reviewer's attention
 
@@ -1571,9 +1645,12 @@ pagination and limit costs, watch loops, alias inspection), adds one test
   its readers at most `lock_wait_secs` plus 1 s. A reader that has not
   finished by then (it would have to be stuck outside its hook, or have
   panicked) has the output it has not read left out of what gh-paced records.
-  Each reader scans at most 1 MiB of unread output, only what can be read
-  without waiting: all that gh wrote unless its pipe was resized beyond that,
-  but not everything a process gh left behind may still write. While the lock
+  A reader that stops, whether at a late signal or at an after-exit cutoff
+  (since round 13), first scans at most 1 MiB of unread output, only what can
+  be read without waiting: all that gh wrote unless its pipe was resized
+  beyond that, but not everything a process gh left behind may still write;
+  after a cutoff, that later output goes to the drainer, which does not scan
+  stdout. While the lock
   is contended, gh-paced can take up to that bound, plus its own wait for the
   lock, to die after a late signal. No test reaches the fallback that feeds
   the end of stdout to gh-paced's copy.

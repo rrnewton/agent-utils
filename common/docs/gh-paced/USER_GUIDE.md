@@ -78,7 +78,11 @@ setting (`!gh auth git-credential`) goes through the same wrapper. That means
 - **Output written after gh exits.** gh can leave a background process holding
   a copied stream open. After gh exits, gh-paced keeps reading until end of
   file, 2 s of silence, 5 s after the exit, or 64 MiB more, whichever comes
-  first. If the stream is still open then, gh-paced does not close it: it
+  first. The silence is counted from gh-paced's last read, so time it spends
+  waiting for the state file's lock to record a cooldown counts too; before it
+  stops at one of these limits it therefore reads, scans and delivers whatever
+  can be read at once, up to 1 MiB, which is normally all that gh itself wrote
+  before it exited. If the stream is still open then, gh-paced does not close it: it
   starts a copy of itself, `gh-paced --drain`, hands it the stream, and exits
   with gh's status at once. The drainer copies the rest of the stream to the
   same place until the last writer closes it or the consumer goes away, and
@@ -511,8 +515,12 @@ the command leaves behind:
 - No `<account>.cooldown` file (the next pushback writes a new one), and
   `"cooldown": null` in `<account>.json`, readable and writable by you alone
   (mode 0600) whatever your umask. The new content is written to a fresh
-  `.<account>.json.clearing-` file beside it, which exists only until the
-  rename and is removed if the command fails.
+  `.<account>.json.clearing-<random>` file beside it and renamed over
+  `<account>.json` at the end. If a step fails with a Python error, the
+  command removes that file and `<account>.json` is unchanged. If the command
+  is killed (TERM, KILL, or a closed terminal) before the rename, the file can
+  be left behind with `<account>.json` unchanged; gh-paced ignores such a file,
+  and it is safe to delete.
 - Everything else in `<account>.json` as it was: the buckets and hourly windows
   (the calls of the last hour still count), the in-flight writes, and the
   refresh bookkeeping. The cached `GET /rate_limit` numbers were normally
@@ -1090,7 +1098,9 @@ and none of it is fixed by configuration.
   - starts a fresh pushback scanner, so a phrase split exactly across the
     handoff can be missed;
   - scans stderr only, so `--include` headers on stdout after the handoff are
-    not read;
+    not read (gh-paced reads what can be read at once, up to 1 MiB, before it
+    hands stdout over, so this concerns what a process gh left behind writes
+    later);
   - records a cooldown but writes no audit record;
   - writes alongside gh-paced's own final messages, which can interleave with
     the drained output.
