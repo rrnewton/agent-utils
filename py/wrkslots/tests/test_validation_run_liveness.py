@@ -545,6 +545,35 @@ def test_unit_words_name_a_row_by_path_identity(tmp_path: Path) -> None:
     )
 
 
+def test_a_parent_step_after_a_symlink_leaves_the_symlink_target(tmp_path: Path) -> None:
+    """``link/..`` is the parent of the link's target, as the kernel reads it.
+
+    Lexical normalization would drop the symlink with the ``..`` and read
+    the link's own directory instead.
+    """
+
+    row = tmp_path / "project" / "worktrees" / "validate" / "slot01"
+    (row / "product" / "build").mkdir(parents=True)
+    inside = tmp_path / "inside"
+    inside.symlink_to(row / "product")
+    deep = tmp_path / "deep"
+    deep.symlink_to(row / "product" / "build")
+    alias = tmp_path / "alias"
+    alias.symlink_to(row)
+
+    def names(**unit: str) -> bool:
+        return wrkslots._UnitPathResolver().names(unit, wrkslots._row_path_identity(row))
+
+    assert names(ExecStart=f"{inside}/..")
+    assert names(ExecStart=f"make -C {deep}/../..")
+    assert names(WorkingDirectory=str(deep), ExecStart="git\n-C\n../..\nstatus")
+    # The parent of the row itself is not inside the row.
+    assert not names(ExecStart=f"{alias}/..")
+    # A row recorded through a symlink and ``..`` is the directory it reaches.
+    stepped = wrkslots._row_path_identity(inside / "..")
+    assert wrkslots._UnitPathResolver().names({"ExecStart": f"{row}/out"}, stepped)
+
+
 UNREADABLE_PID = 4_000_017
 
 

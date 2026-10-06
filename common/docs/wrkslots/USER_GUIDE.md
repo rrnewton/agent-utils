@@ -393,11 +393,13 @@ inside it. Words are separated by whitespace, quotes, and the characters `=`, `:
 `|`, `(`, `)`, `<`, `>`, `{`, `}` and `$`; a leading `-`, `!`, `@` or `+` is also tried without it.
 A relative word is resolved against the unit's working directory (the home directory when it has
 none), and `~` is the home directory. Each word is then compared as a whole path: its normalized
-spelling and its symlink-resolved spelling against the row path's recorded and symlink-resolved
-spellings, by complete path components, and, where the path exists, the word and each of its
-existing ancestors by device and inode against the row path itself. A unit naming
-`slot01/./product`, `--checkout=slot01//product`, a symlink to `slot01`, or `worktrees/validate/slot01`
-with the project root as its working directory therefore names `slot01`; one naming `slot010`,
+spelling, its symlink-resolved spelling as written (a `..` after a symlink leaves the symlink's
+target, as the kernel reads it) and the symlink-resolved spelling of its normalized form, against
+the row path's spellings formed the same way, by complete path components, and, where the path
+exists, the word and each of its existing ancestors by device and inode against the row path
+itself. A unit naming `slot01/./product`, `--checkout=slot01//product`, a symlink to `slot01`,
+`<symlink to slot01/product>/..`, or `worktrees/validate/slot01` with the project root as its
+working directory therefore names `slot01`; one naming `slot010`,
 `slot01+other` or `/other/<project>/worktrees/validate/slot01` does not. This rule is shared with
 `recover-absent-validate-rows`.
 

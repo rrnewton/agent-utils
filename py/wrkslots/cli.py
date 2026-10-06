@@ -47141,18 +47141,26 @@ class _RowPathIdentity:
 
 
 def _row_path_identity(path: Path) -> _RowPathIdentity:
-    """Return the lexical and symlink-resolved spelling of a row path and,
-    when it exists, its device and inode."""
+    """Return the lexical and symlink-resolved spellings of a row path and,
+    when it exists, its device and inode.
 
-    lexical = os.path.normpath(str(path))
+    The path is resolved as written, so a ``..`` after a symlink leaves the
+    symlink's target as the kernel does; its lexically normalized spelling
+    is resolved too.
+    """
+
+    raw = str(path)
+    lexical = os.path.normpath(raw)
     try:
-        metadata = os.stat(lexical)
+        metadata = os.stat(raw)
     except (OSError, ValueError):
         file = None
     else:
         file = (metadata.st_dev, metadata.st_ino)
     return _RowPathIdentity(
-        path, tuple(dict.fromkeys((lexical, os.path.realpath(lexical)))), file
+        path,
+        tuple(dict.fromkeys((lexical, os.path.realpath(raw), os.path.realpath(lexical)))),
+        file,
     )
 
 
@@ -47184,7 +47192,14 @@ class _UnitPathResolver:
         return identity
 
     def _resolve(self, joined: str) -> tuple[tuple[str, ...], frozenset[tuple[int, int]]]:
-        """Return a path's spellings and the files of it and its ancestors."""
+        """Return a path's spellings and the files of it and its ancestors.
+
+        The path is resolved as written, as the kernel resolves it: a
+        ``..`` after a symlink leaves the symlink's target, which lexical
+        normalization would remove along with the symlink.  The lexically
+        normalized spelling, and its resolution, are kept as well, so a
+        word names a row under either reading.
+        """
 
         try:
             return self._words[joined]
@@ -47192,22 +47207,24 @@ class _UnitPathResolver:
             pass
         lexical = os.path.normpath(joined)
         try:
-            resolved = os.path.realpath(lexical)
+            resolved = tuple(
+                dict.fromkeys((os.path.realpath(joined), os.path.realpath(lexical)))
+            )
         except ValueError as exc:
             raise Refusal(
                 f"a user-systemd property word cannot be resolved as a path: {exc}"
             ) from exc
         files: set[tuple[int, int]] = set()
-        current = resolved
-        while True:
-            identity = self._file(current)
-            if identity is not None:
-                files.add(identity)
-            parent = os.path.dirname(current)
-            if parent == current:
-                break
-            current = parent
-        answer = (tuple(dict.fromkeys((lexical, resolved))), frozenset(files))
+        for current in resolved:
+            while True:
+                identity = self._file(current)
+                if identity is not None:
+                    files.add(identity)
+                parent = os.path.dirname(current)
+                if parent == current:
+                    break
+                current = parent
+        answer = (tuple(dict.fromkeys((lexical, *resolved))), frozenset(files))
         self._words[joined] = answer
         return answer
 
