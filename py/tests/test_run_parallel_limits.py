@@ -6,6 +6,8 @@ import argparse
 import dataclasses
 import os
 import shlex
+import time
+from collections.abc import Callable
 from pathlib import Path
 
 import pytest
@@ -1234,7 +1236,7 @@ def test_scope_reexec_requests_and_carries_exact_max_cpus(
         captured.extend(argv)
         raise OSError("planted exec stop")
 
-    monkeypatch.setattr(cgroup, "systemd_scope_available", lambda: True)
+    monkeypatch.setattr(cgroup, "systemd_scope_available", lambda naming: True)
     monkeypatch.setattr(cgroup, "ensure_aggregate_slice", lambda naming: False)
     monkeypatch.setattr(os, "execvp", fake_execvp)
     # Exercise a fresh outer re-exec even when this test shard is itself delegated.
@@ -1262,3 +1264,142 @@ def test_scope_limit_audit_requires_exact_cpu_max(
     assert cgroup.verify_scope_limits(104857600, 2)
     (tmp_path / "cpu.max").write_text("300000 100000")
     assert not cgroup.verify_scope_limits(104857600, 2)
+
+
+def _scripted_probe(results: list[str | None]) -> tuple[list[int], Callable[[int], str | None]]:
+    attempts: list[int] = []
+
+    def probe(attempt: int) -> str | None:
+        attempts.append(attempt)
+        return results[len(attempts) - 1]
+
+    return attempts, probe
+
+
+def test_scope_probe_refused_once_is_retried_after_the_backoff() -> None:
+    attempts, probe = _scripted_probe(["refused", None])
+    start = time.monotonic()
+    assert cgroup.probe_with_one_retry(probe, 0.5)
+    assert time.monotonic() - start >= 0.5
+    assert attempts == [1, 2]
+
+
+def test_scope_probe_refused_twice_fails_closed_without_a_third_try() -> None:
+    attempts, probe = _scripted_probe(["refused", "refused", None])
+    start = time.monotonic()
+    assert not cgroup.probe_with_one_retry(probe, 0.5)
+    waited = time.monotonic() - start
+    # One pause, between the attempts; none after the last.
+    assert 0.5 <= waited < 1.0
+    assert attempts == [1, 2]
+
+
+def test_scope_probe_that_passes_runs_once_without_waiting() -> None:
+    attempts, probe = _scripted_probe([None])
+    start = time.monotonic()
+    # A long backoff costs nothing when nothing waits, and leaves wide slack for a slow host.
+    assert cgroup.probe_with_one_retry(probe, 30.0)
+    assert time.monotonic() - start < 30.0
+    assert attempts == [1]
+
+
+def test_scope_probe_failures_are_logged_with_their_reason(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _attempts, probe = _scripted_probe(["first reason", "second reason"])
+    naming = dataclasses.replace(cgroup.DEFAULT_NAMING, log_prefix="[probe-test]")
+    assert not cgroup.probe_with_one_retry(probe, 0.0, naming)
+    err = capsys.readouterr().err
+    assert "[probe-test] `systemd-run --user --scope` probe attempt 1 of 2 failed: first reason" in err
+    assert "[probe-test] `systemd-run --user --scope` probe attempt 2 of 2 failed: second reason" in err
+
+
+def _install_fake_systemd_run(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, script: str
+) -> Path:
+    """Put an executable ``systemd-run`` first on PATH and clear the cached probe answer."""
+    fake = tmp_path / "systemd-run"
+    fake.write_text(script)
+    fake.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{tmp_path}{os.pathsep}{os.environ['PATH']}")
+    monkeypatch.setattr(cgroup, "_SCOPE_PROBE", None)
+    monkeypatch.setattr(cgroup, "SCOPE_PROBE_RETRY_BACKOFF_S", 0.0)
+    return fake
+
+
+def test_scope_probe_against_a_refusing_systemd_run_tries_two_unit_names(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    calls = tmp_path / "systemd-run.calls"
+    _install_fake_systemd_run(
+        monkeypatch,
+        tmp_path,
+        "#!/bin/sh\n"
+        f"printf '%s\\n' \"$*\" >> {shlex.quote(str(calls))}\n"
+        "echo 'fake refusal: no user bus here' >&2\n"
+        "exit 1\n",
+    )
+    naming = dataclasses.replace(cgroup.DEFAULT_NAMING, log_prefix="[probe-e2e]")
+    assert not cgroup.systemd_scope_available(naming)
+    lines = calls.read_text().splitlines()
+    assert len(lines) == 2
+    assert f"--unit=dagrun-probe-{os.getpid()}-1" in lines[0].split()
+    assert f"--unit=dagrun-probe-{os.getpid()}-2" in lines[1].split()
+    err = capsys.readouterr().err
+    for attempt in (1, 2):
+        assert (
+            f"[probe-e2e] `systemd-run --user --scope` probe attempt {attempt} of 2 failed: "
+            "exit status 1; "
+            "stderr: 'fake refusal: no user bus here'"
+        ) in err
+    # The answer is cached: a second ask does not probe again.
+    assert not cgroup.systemd_scope_available(naming)
+    assert len(calls.read_text().splitlines()) == 2
+
+
+@pytest.mark.parametrize(
+    ("script", "reason"),
+    [
+        pytest.param(
+            # Stopped, not exited, until the timeout kills it.
+            "#!/bin/sh\necho 'partial stderr before hang' >&2\nkill -STOP $$\n",
+            "timed out after 1 s; stderr: 'partial stderr before hang'",
+            id="hangs",
+        ),
+        pytest.param(
+            "#!/nonexistent/interpreter\n",
+            "cannot launch systemd-run: ",
+            id="cannot-launch",
+        ),
+        pytest.param(
+            "#!/bin/sh\necho 'about to die' >&2\nkill -TERM $$\n",
+            "signal 15; stderr: 'about to die'",
+            id="killed-by-signal",
+        ),
+    ],
+)
+def test_scope_probe_that_cannot_succeed_fails_closed_with_its_reason(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    script: str,
+    reason: str,
+) -> None:
+    _install_fake_systemd_run(monkeypatch, tmp_path, script)
+    # The fake alone on PATH: subprocess keeps searching PATH past a candidate it cannot execute,
+    # and would otherwise launch the host's real systemd-run.
+    monkeypatch.setenv("PATH", str(tmp_path))
+    monkeypatch.setattr(cgroup, "_SCOPE_PROBE_TIMEOUT_S", 1)
+    assert not cgroup.systemd_scope_available()
+    err = capsys.readouterr().err
+    for attempt in (1, 2):
+        assert f"probe attempt {attempt} of 2 failed: {reason}" in err
+
+
+def test_scope_probe_without_systemd_run_says_so(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setenv("PATH", str(tmp_path))
+    monkeypatch.setattr(cgroup, "_SCOPE_PROBE", None)
+    assert not cgroup.systemd_scope_available()
+    assert "probe not attempted: systemd-run is not on PATH" in capsys.readouterr().err

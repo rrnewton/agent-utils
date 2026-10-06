@@ -708,24 +708,75 @@ def ensure_aggregate_slice(
 
 _SCOPE_PROBE: bool | None = None
 
+#: Pause before the one retry of a refused scope probe.
+SCOPE_PROBE_RETRY_BACKOFF_S = 1.0
+_SCOPE_PROBE_TIMEOUT_S = 8
 
-def systemd_scope_available() -> bool:
+
+def systemd_scope_available(naming: ScopeNaming = DEFAULT_NAMING) -> bool:
     """True iff ``systemd-run --user --scope`` actually works here (cached)."""
     global _SCOPE_PROBE
     if _SCOPE_PROBE is None:
         if not shutil.which("systemd-run"):
+            sys.stderr.write(
+                f"{naming.log_prefix} `systemd-run --user --scope` probe not attempted: "
+                "systemd-run is not on PATH\n"
+            )
             _SCOPE_PROBE = False
         else:
-            try:
-                r = subprocess.run(
-                    ["systemd-run", "--user", "--scope", "--quiet",
-                     f"--unit=dagrun-probe-{os.getpid()}", "true"],
-                    capture_output=True, timeout=8,
-                )
-                _SCOPE_PROBE = r.returncode == 0
-            except (subprocess.TimeoutExpired, OSError):
-                _SCOPE_PROBE = False
+            _SCOPE_PROBE = probe_with_one_retry(
+                _run_scope_probe, SCOPE_PROBE_RETRY_BACKOFF_S, naming
+            )
     return _SCOPE_PROBE
+
+
+def _run_scope_probe(attempt: int) -> str | None:
+    """One ``systemd-run --user --scope true``. None when it worked; otherwise why it failed,
+    with the probe's stderr, which is the only record of why systemd refused."""
+    # A unit name per attempt, so a retry never collides with what its first attempt left.
+    try:
+        r = subprocess.run(
+            ["systemd-run", "--user", "--scope", "--quiet",
+             f"--unit=dagrun-probe-{os.getpid()}-{attempt}", "true"],
+            capture_output=True, timeout=_SCOPE_PROBE_TIMEOUT_S,
+        )
+    except subprocess.TimeoutExpired as expired:
+        # Whatever systemd-run printed before it hung is still the best record of why.
+        return f"timed out after {_SCOPE_PROBE_TIMEOUT_S} s; stderr: {_stderr_text(expired.stderr)!r}"
+    except OSError as error:
+        return f"cannot launch systemd-run: {error}"
+    if r.returncode == 0:
+        return None
+    status = f"signal {-r.returncode}" if r.returncode < 0 else f"exit status {r.returncode}"
+    return f"{status}; stderr: {_stderr_text(r.stderr)!r}"
+
+
+def _stderr_text(raw: bytes | str | None) -> str:
+    if raw is None:
+        return ""
+    text = raw.decode(errors="replace") if isinstance(raw, bytes) else raw
+    return text.strip()
+
+
+def probe_with_one_retry(
+    probe: Callable[[int], str | None], backoff_s: float, naming: ScopeNaming = DEFAULT_NAMING
+) -> bool:
+    """Run ``probe``, and once more after ``backoff_s`` if it fails. Seen twice in about six weeks
+    on a shared host: the user manager refused one probe within a second while the same
+    environment set up scopes before and after it, and with nothing retried a whole validation
+    failed closed. A second refusal still fails closed. Every failure goes to stderr with its
+    cause."""
+    for attempt in (1, 2):
+        why = probe(attempt)
+        if why is None:
+            return True
+        sys.stderr.write(
+            f"{naming.log_prefix} `systemd-run --user --scope` probe attempt {attempt} of 2 "
+            f"failed: {why}\n"
+        )
+        if attempt == 1:
+            time.sleep(backoff_s)
+    return False
 
 
 # --------------------------------------------------------------------------- #
@@ -1302,7 +1353,7 @@ def reexec_in_scope(
             "refusing an unbounded scope.\n"
         )
         return False
-    if not systemd_scope_available():
+    if not systemd_scope_available(naming):
         sys.stderr.write(f"{naming.log_prefix} ERROR: systemd --user scope is unavailable; "
                          "refusing advisory-only containment.\n")
         return False
