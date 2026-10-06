@@ -15,9 +15,12 @@ budget is used up, printing a loud warning line on stderr. It also:
 - pauses every call for 15 minutes after any rate-limit, abuse or HTTP 403
   response;
 - refuses write bodies larger than 8 KiB or containing long base64 runs,
-  whether they come from an argument, a file, stdin, one of gh's aliases
-  (which gh-paced expands itself, so gh never sees the alias name, as long as
-  gh's `config.yml` is not rewritten while the call runs), or
+  whether they come from an argument, a file, stdin, one of gh's ordinary
+  aliases (which gh-paced expands itself, so gh never sees the alias name, as
+  long as gh's `config.yml` is not rewritten while the call runs; a shell
+  alias, `!...`, is passed to gh by name, only its arguments are checked, and
+  what its shell command sends is checked only if the `gh` it runs is
+  gh-paced), or
   the editor gh opens (gh-paced points gh's editor at a guard that checks the
   saved text);
 - refuses writes whose body gh would compose from something it reads later

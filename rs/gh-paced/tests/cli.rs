@@ -1161,6 +1161,73 @@ fn a_long_retry_after_is_never_shortened() {
     );
 }
 
+/// Run one `gh api --include` call whose fake output holds an over-long header line in a 429 or
+/// 403 response, and check that it starts a cooldown with no end time, never a shorter one: the
+/// banner names the two things a person removes to end it, both files record no end, and the
+/// next paced call is refused without running gh.
+fn assert_overlong_header_starts_a_no_end_cooldown(name: &str, out: &str) {
+    let state = |sb: &Sandbox, name: &str| -> serde_json::Value {
+        serde_json::from_str(&std::fs::read_to_string(sb.path(name)).unwrap()).unwrap()
+    };
+    for (mode, args) in [
+        ("single", &["api", "-i", "repos/o/r"][..]),
+        ("paginate", &["api", "-i", "--paginate", "repos/o/r"][..]),
+    ] {
+        let sb = Sandbox::new(&format!("{name}-{mode}"), FAST);
+        let o = sb.run(args, &[("FAKE_GH_STDOUT", out), ("FAKE_GH_EXIT", "1")]);
+        let err = stderr(&o);
+        assert_eq!(o.status.code(), Some(1), "{mode}: {err}");
+        assert!(
+            err.contains("refused from now on: the cooldown has no end time"),
+            "{mode}: {err}"
+        );
+        assert!(err.contains("longer than the 8192 bytes"), "{mode}: {err}");
+        for file in ["state/test.cooldown", "state/test.json"] {
+            let path = sb.path(file).display().to_string();
+            assert!(err.contains(&path), "{mode}: {path} not named: {err}");
+        }
+        let until = state(&sb, "state/test.json")["cooldown"]["until"].as_f64();
+        assert_eq!(
+            until,
+            Some(f64::MAX),
+            "{mode}: the cooldown never ends by itself"
+        );
+        let until = state(&sb, "state/test.cooldown")["until"].as_f64();
+        assert_eq!(until, Some(f64::MAX), "{mode}");
+        let o = sb.run(&["api", "repos/o/r"], &[]);
+        assert_eq!(o.status.code(), Some(75), "{mode}: {}", stderr(&o));
+        assert!(
+            stderr(&o).contains("the cooldown has no end time"),
+            "{mode}: {}",
+            stderr(&o)
+        );
+        assert_eq!(sb.starts().len(), 1, "{mode}: gh ran: {:?}", sb.starts());
+    }
+}
+
+/// A `Retry-After` of two days written behind 9,000 leading zeros is longer than the 8,192-byte
+/// header line gh-paced reads. With and without `--paginate` it starts a cooldown with no end
+/// time, never the 900 s floor and never no cooldown at all.
+#[test]
+fn a_retry_after_with_leading_zeros_never_shortens_a_wait() {
+    let out = format!(
+        "HTTP/2.0 429 Too Many Requests\r\nRetry-After: {}172800\r\n\r\n{{}}",
+        "0".repeat(9000)
+    );
+    assert_overlong_header_starts_a_no_end_cooldown("retry-after-zeros", &out);
+}
+
+/// An over-long header line before a valid two-day `Retry-After` in a 403 response: the wait
+/// cannot be trusted to have been read, so the cooldown has no end time.
+#[test]
+fn an_overlong_header_before_retry_after_never_shortens_a_wait() {
+    let out = format!(
+        "HTTP/2.0 403 Forbidden\r\nX-Long: {}\r\nRetry-After: 172800\r\n\r\n{{}}",
+        "x".repeat(9000)
+    );
+    assert_overlong_header_starts_a_no_end_cooldown("overlong-header", &out);
+}
+
 /// A consumer that reads gh's output late loses none of it. The fake gh writes its output and exits
 /// at once while the consumer has not read a byte; it starts reading 4 s later, long after gh has
 /// gone. 120 KiB is more than one 64 KiB pipe holds, so part of it is still inside gh-paced when gh
