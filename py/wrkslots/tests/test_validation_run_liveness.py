@@ -19,6 +19,7 @@ import dataclasses
 import json
 import os
 import subprocess
+import sys
 import uuid
 from collections.abc import Iterator, Mapping, Sequence, Set as AbstractSet
 from dataclasses import dataclass
@@ -789,9 +790,53 @@ class _RealHost:
         )
 
 
+def _cgroup_filesystem_type(mount_point: str) -> str | None:
+    """The type of the filesystem this process sees mounted at ``mount_point``."""
+
+    found = None
+    for line in Path("/proc/self/mountinfo").read_text(encoding="utf-8").splitlines():
+        fields = line.split(" ")
+        if len(fields) > 4 and fields[4] == mount_point and " - " in line:
+            # A later mount at the same point hides an earlier one.
+            found = line.split(" - ", 1)[1].split(" ")[0]
+    return found
+
+
+def _require_cgroup2_host() -> None:
+    """Skip, saying why, where the real control-group read cannot succeed.
+
+    The validation-run authority reads retained units' control-group members
+    from the cgroup v2 hierarchy at /sys/fs/cgroup and refuses without one,
+    which is the behaviour these host tests would then observe instead.
+    """
+
+    kind = _cgroup_filesystem_type("/sys/fs/cgroup")
+    if kind != "cgroup2":
+        pytest.skip(
+            "this host has no cgroup v2 hierarchy at /sys/fs/cgroup (filesystem "
+            f"type {kind or 'none'}), so the real retained-unit control-group read "
+            "refuses there"
+        )
+
+
+@pytest.mark.parametrize("kind", ["cgroup", "tmpfs", None])
+def test_a_host_without_cgroup2_skips_the_real_host_tests_with_a_reason(
+    monkeypatch: pytest.MonkeyPatch, kind: str | None
+) -> None:
+    """A cgroup v1 or absent hierarchy is a stated skip, never a failure or a pass."""
+
+    module = sys.modules[__name__]
+    monkeypatch.setattr(module, "_cgroup_filesystem_type", lambda _mount_point: kind)
+    with pytest.raises(pytest.skip.Exception) as skipped:
+        _require_cgroup2_host()
+    assert "no cgroup v2 hierarchy at /sys/fs/cgroup" in str(skipped.value)
+    assert f"filesystem type {kind or 'none'}" in str(skipped.value)
+
+
 def _prepare_real_host(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> _RealHost:
     """One validation row whose recorded owner has exited, on the real host."""
 
+    _require_cgroup2_host()
     project, _repository, _remote = make_project(tmp_path)
     slot_path = prepare_dead_validate_slots(project, ("slot01",))["slot01"]
     tree = checkout(project, slot="slot01", slot_type="validate")
@@ -1370,6 +1415,7 @@ def test_retained_unit_cgroup_members_counts_the_unit_and_its_descendants(
 def test_this_host_user_manager_cgroup_is_read() -> None:
     """On this host the reader finds the manager and a fresh unit is empty."""
 
+    _require_cgroup2_host()
     unit = f"wrkslots-test-{uuid.uuid4().hex}.service"
     assert wrkslots._retained_unit_cgroup_members({unit}) == {unit: 0}
     assert wrkslots._user_manager_cgroup(Path("/sys/fs/cgroup")).name == (
