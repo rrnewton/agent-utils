@@ -149,17 +149,24 @@ pub struct Ran {
     pub cut_off: bool,
 }
 
+/// Most bytes of each stream a captured run keeps ([`Runner::capture`]): 1 MiB.
+pub const MAX_CAPTURE_BYTES: usize = 1 << 20;
+
 /// Output of a captured (non-interactive) run.
 #[derive(Debug, Clone)]
 pub struct Captured {
     /// How the child ended (`Signal(9)` after a timeout kill).
     pub exit: Exit,
-    /// Everything it wrote to stdout.
+    /// What it wrote to stdout, up to [`MAX_CAPTURE_BYTES`].
     pub stdout: Vec<u8>,
-    /// Everything it wrote to stderr.
+    /// What it wrote to stderr, up to [`MAX_CAPTURE_BYTES`].
     pub stderr: Vec<u8>,
     /// The child was killed because it ran past the timeout.
     pub timed_out: bool,
+    /// It wrote more than [`MAX_CAPTURE_BYTES`] to stdout; `stdout` holds only the first part.
+    pub stdout_cut: bool,
+    /// It wrote more than [`MAX_CAPTURE_BYTES`] to stderr; `stderr` holds only the first part.
+    pub stderr_cut: bool,
 }
 
 /// Something that can run gh. Tests substitute a fake.
@@ -167,7 +174,8 @@ pub trait Runner: Send + Sync {
     /// Run interactively: stdout inherited (or teed, see [`Invocation::scan_stdout`]), stderr
     /// streamed to our stderr and fed to `scanner`.
     fn run(&self, inv: Invocation<'_>, scanner: &mut Scanner) -> Result<Ran, String>;
-    /// Run with stdout and stderr captured, killing the child after `timeout_secs`.
+    /// Run with stdout and stderr captured, killing the child after `timeout_secs`. Each stream
+    /// keeps its first [`MAX_CAPTURE_BYTES`], and reports whether more followed.
     fn capture(&self, inv: Invocation<'_>, timeout_secs: f64) -> Result<Captured, String>;
 }
 
@@ -923,20 +931,18 @@ impl Runner for RealRunner {
             .map_err(|e| format!("cannot run {}: {e}", inv.program.display()))?;
         let mut out = child.stdout.take();
         let mut err = child.stderr.take();
-        let out_t = std::thread::spawn(move || {
+        // One byte past the limit is read, so a stream that had more is known to be cut.
+        fn read_capped(stream: Option<&mut impl Read>) -> (Vec<u8>, bool) {
             let mut v = Vec::new();
-            if let Some(o) = out.as_mut() {
-                let _ = o.take(1 << 20).read_to_end(&mut v);
+            if let Some(s) = stream {
+                let _ = s.take(MAX_CAPTURE_BYTES as u64 + 1).read_to_end(&mut v);
             }
-            v
-        });
-        let err_t = std::thread::spawn(move || {
-            let mut v = Vec::new();
-            if let Some(e) = err.as_mut() {
-                let _ = e.take(1 << 20).read_to_end(&mut v);
-            }
-            v
-        });
+            let cut = v.len() > MAX_CAPTURE_BYTES;
+            v.truncate(MAX_CAPTURE_BYTES);
+            (v, cut)
+        }
+        let out_t = std::thread::spawn(move || read_capped(out.as_mut()));
+        let err_t = std::thread::spawn(move || read_capped(err.as_mut()));
         let deadline = Instant::now() + Duration::from_secs_f64(timeout_secs.max(0.1));
         let mut timed_out = false;
         let status = loop {
@@ -953,13 +959,15 @@ impl Runner for RealRunner {
                 Err(e) => return Err(format!("waiting for {}: {e}", inv.program.display())),
             }
         };
-        let stdout = out_t.join().unwrap_or_default();
-        let stderr = err_t.join().unwrap_or_default();
+        let (stdout, stdout_cut) = out_t.join().unwrap_or_default();
+        let (stderr, stderr_cut) = err_t.join().unwrap_or_default();
         Ok(Captured {
             exit: decode(status),
             stdout,
             stderr,
             timed_out,
+            stdout_cut,
+            stderr_cut,
         })
     }
 }

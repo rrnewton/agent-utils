@@ -20,6 +20,7 @@ const FAKE_GH: &str = r#"#!/bin/bash
 log="${FAKE_GH_LOG:?}"
 if [ "$1 $2" = "api rate_limit" ] && [ $# -eq 2 ]; then
   echo "$(date +%s.%N) rate_limit" >> "$log"
+  if [ -n "${FAKE_GH_RATE_STDERR_FILE:-}" ]; then cat "$FAKE_GH_RATE_STDERR_FILE" >&2; fi
   if [ -n "${FAKE_GH_RATE_JSON:-}" ]; then printf '%s\n' "$FAKE_GH_RATE_JSON"; else
     r=$(( $(date +%s) + 3000 ))
     printf '{"resources":{"core":{"limit":5000,"used":10,"remaining":4990,"reset":%s},"graphql":{"limit":5000,"used":0,"remaining":5000,"reset":%s},"search":{"limit":30,"used":0,"remaining":30,"reset":%s}}}\n' "$r" "$r" "$r"
@@ -1161,11 +1162,12 @@ fn a_long_retry_after_is_never_shortened() {
     );
 }
 
-/// Run one `gh api --include` call whose fake output holds an over-long header line in a 429 or
-/// 403 response, and check that it starts a cooldown with no end time, never a shorter one: the
-/// banner names the two things a person removes to end it, both files record no end, and the
-/// next paced call is refused without running gh.
-fn assert_overlong_header_starts_a_no_end_cooldown(name: &str, out: &str) {
+/// Run one `gh api --include` call whose fake output (written through the fake gh's variable
+/// `var`) holds an over-long header line in a 429 or 403 response, and check that it starts a
+/// cooldown with no end time, never a shorter one: the banner names the two things a person
+/// removes to end it, both files record no end, and the next paced call is refused without
+/// running gh.
+fn assert_overlong_header_starts_a_no_end_cooldown(name: &str, var: &str, out: &str) {
     let state = |sb: &Sandbox, name: &str| -> serde_json::Value {
         serde_json::from_str(&std::fs::read_to_string(sb.path(name)).unwrap()).unwrap()
     };
@@ -1174,7 +1176,7 @@ fn assert_overlong_header_starts_a_no_end_cooldown(name: &str, out: &str) {
         ("paginate", &["api", "-i", "--paginate", "repos/o/r"][..]),
     ] {
         let sb = Sandbox::new(&format!("{name}-{mode}"), FAST);
-        let o = sb.run(args, &[("FAKE_GH_STDOUT", out), ("FAKE_GH_EXIT", "1")]);
+        let o = sb.run(args, &[(var, out), ("FAKE_GH_EXIT", "1")]);
         let err = stderr(&o);
         assert_eq!(o.status.code(), Some(1), "{mode}: {err}");
         assert!(
@@ -1214,7 +1216,7 @@ fn a_retry_after_with_leading_zeros_never_shortens_a_wait() {
         "HTTP/2.0 429 Too Many Requests\r\nRetry-After: {}172800\r\n\r\n{{}}",
         "0".repeat(9000)
     );
-    assert_overlong_header_starts_a_no_end_cooldown("retry-after-zeros", &out);
+    assert_overlong_header_starts_a_no_end_cooldown("retry-after-zeros", "FAKE_GH_STDOUT", &out);
 }
 
 /// An over-long header line before a valid two-day `Retry-After` in a 403 response: the wait
@@ -1225,7 +1227,117 @@ fn an_overlong_header_before_retry_after_never_shortens_a_wait() {
         "HTTP/2.0 403 Forbidden\r\nX-Long: {}\r\nRetry-After: 172800\r\n\r\n{{}}",
         "x".repeat(9000)
     );
-    assert_overlong_header_starts_a_no_end_cooldown("overlong-header", &out);
+    assert_overlong_header_starts_a_no_end_cooldown("overlong-header", "FAKE_GH_STDOUT", &out);
+}
+
+/// Output that ends inside an over-long `Retry-After` line, before its line end arrives (gh
+/// stopped mid-write): the wait is not known, so with and without `--paginate` the cooldown has
+/// no end time. (Before, the paginated call dropped the block and recorded no cooldown at all.)
+#[test]
+fn output_cut_inside_an_overlong_header_never_shortens_a_wait() {
+    let out = format!(
+        "HTTP/2.0 429 Too Many Requests\r\nRetry-After: {}172800",
+        "0".repeat(9000)
+    );
+    // FAKE_GH_STDOUT_HEAD is written with no line end after it.
+    assert_overlong_header_starts_a_no_end_cooldown("cut-overlong", "FAKE_GH_STDOUT_HEAD", &out);
+}
+
+/// `gh api --include --paginate --jq` prints each page's header block, then the page's body
+/// through jq. A body holding a status-shaped line, then an over-long line that ends in CR LF but
+/// has no colon (a header line needs one), is body text: no cooldown starts and the next call
+/// runs. (Round 9 read the long line as a header and started a cooldown with no end time.)
+#[test]
+fn a_colon_free_long_body_line_starts_no_cooldown() {
+    let sb = Sandbox::new("jq-long-body", FAST);
+    let response = format!(
+        "HTTP/2.0 200 OK\nX-Ratelimit-Remaining: 4000\r\n\r\nHTTP/2.0 429 Too Many Requests\n{}\r\n\r\n",
+        "x".repeat(9000)
+    );
+    let o = sb.run(
+        &["api", "-i", "--paginate", "--jq", ".[]", "repos/o/r"],
+        &[("FAKE_GH_STDOUT", &response)],
+    );
+    let err = stderr(&o);
+    assert!(
+        !sb.path("state/test.cooldown").exists(),
+        "a cooldown record was written: {err}"
+    );
+    assert_eq!(o.status.code(), Some(0), "{err}");
+    assert!(
+        stdout(&o) == format!("{response}\n"),
+        "stdout passes through"
+    );
+    assert!(!err.contains("PUSHBACK"), "{err}");
+    let state: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(sb.path("state/test.json")).unwrap())
+            .unwrap();
+    assert!(state["cooldown"].is_null(), "{state}");
+    let o = sb.run(&["api", "repos/o/r"], &[]);
+    assert_eq!(o.status.code(), Some(0), "{}", stderr(&o));
+    assert_eq!(sb.starts().len(), 2, "{:?}", sb.starts());
+}
+
+/// The rate-limit refresh keeps the first 1 MiB of gh's stderr. A two-day `Retry-After` cut off
+/// at that limit after its first digit must not be read as 1 s, which gave the 900 s floor: the
+/// cut is reported, and the cooldown has no end time.
+#[test]
+fn a_retry_after_cut_by_the_capture_limit_never_shortens_a_wait() {
+    let state = |sb: &Sandbox, name: &str| -> serde_json::Value {
+        serde_json::from_str(&std::fs::read_to_string(sb.path(name)).unwrap()).unwrap()
+    };
+    let sb = Sandbox::new("refresh-cut", FAST);
+    let tail = "\nHTTP 429\nRetry-After: 1";
+    let mut text = "y".repeat((1 << 20) - tail.len());
+    text.push_str(tail);
+    assert_eq!(text.len(), 1 << 20, "the cut falls after the first digit");
+    text.push_str("72800\n");
+    let file = sb.path("rate-stderr");
+    std::fs::write(&file, &text).unwrap();
+    let before = epoch_now();
+    // A paced read is due a refresh first (there is no snapshot yet). GH_PACED_MAX_WAIT keeps a
+    // finite cooldown from holding the call.
+    let o = sb.run(
+        &["pr", "view", "1"],
+        &[
+            ("FAKE_GH_RATE_STDERR_FILE", file.to_str().unwrap()),
+            ("GH_PACED_MAX_WAIT", "5"),
+        ],
+    );
+    let err = stderr(&o);
+    let until = state(&sb, "state/test.json")["cooldown"]["until"]
+        .as_f64()
+        .unwrap_or_else(|| panic!("no cooldown: {err}"));
+    assert_eq!(
+        until,
+        f64::MAX,
+        "cooldown of {} s, not one with no end time: {err}",
+        until - before
+    );
+    let until = state(&sb, "state/test.cooldown")["until"].as_f64();
+    assert_eq!(until, Some(f64::MAX));
+    assert!(
+        err.contains(
+            "rate-limit refresh: gh's stderr ran past the 1048576 bytes gh-paced reads and was \
+             cut off there"
+        ),
+        "{err}"
+    );
+    assert!(err.contains("stopped reading stderr"), "{err}");
+    assert!(err.contains("the cooldown has no end time"), "{err}");
+    assert_eq!(o.status.code(), Some(75), "{err}");
+    assert!(sb.starts().is_empty(), "gh ran: {:?}", sb.starts());
+    // The audit record of the refresh names the pushback and the cut.
+    let audit = std::fs::read_to_string(sb.path("state/test.audit.jsonl")).unwrap();
+    let refresh = audit
+        .lines()
+        .find(|l| l.contains("\"refresh\""))
+        .unwrap_or_else(|| panic!("no refresh record: {audit}"));
+    assert!(refresh.contains("Retry-After cut off"), "{refresh}");
+    assert!(
+        refresh.contains("stderr ran past the 1048576 bytes"),
+        "{refresh}"
+    );
 }
 
 /// A consumer that reads gh's output late loses none of it. The fake gh writes its output and exits

@@ -344,7 +344,9 @@ reads is still found. It looks for:
   person removes `<account>.cooldown` and the `cooldown` entry of
   `<account>.json` from the state directory. A value whose digits run on past
   the 4 KiB kept between reads cannot be read whole, and is treated the same
-  way.
+  way. So is one that runs up to the end of the first 1 MiB of stderr, which is
+  all that the rate-limit refresh (`gh api rate_limit`, run by gh-paced itself)
+  keeps; the refresh prints a warning when it cut either stream there.
 
 For `gh api -i/--include`, gh prints the HTTP status line and response headers
 on **stdout** instead. For that form only, gh-paced also reads stdout as it
@@ -375,7 +377,12 @@ blank line. stdout itself is passed on unchanged.
   be read, so it starts a cooldown with no end time, as for a `Retry-After`
   over 365 days above, never a shorter one. In any other block it ends the
   block. A status line that long (HTTP/1.1 lets the server choose its reason
-  phrase) still opens its block.
+  phrase) still opens its block. With `--paginate` the long line counts as a
+  header line only in the shape a short one needs: a colon in its first 8,192
+  bytes and a CRLF ending. A long line without a colon is body text and drops
+  the block. If the output ends inside a long line that has the colon, before
+  its line ending arrives (gh stopped mid-write), the block still counts, with
+  no end time.
 
 Any limit signal (one of the phrases, HTTP 429, a `Retry-After` value, or
 `X-RateLimit-Remaining: 0`) starts a **cooldown** of the larger of `Retry-After`
@@ -479,11 +486,12 @@ Base64-looking content is either of:
   16) forms this block, and so does a run of `/` (bytes 0xFF). A list of
   lower-case identifiers or hex hashes one per line does not. A list of
   mixed-case or upper-case names one per line (`CamelCaseTestName`) does,
-  once it passes the limit. A line with no upper-case letter (and not made of
-  one repeated character) ends this block, so text in only lower-case letters
-  and digits (lower-case base32 or hex, or base64 that happens to have no
-  upper-case letter, such as `abcd` repeated) wrapped at varying widths under
-  20 columns is not counted by any of these shapes.
+  once it passes the limit. A line that has no upper-case letter and is not
+  made of one repeated character ends this block. So an encoding wrapped at
+  varying widths under 20 columns whose lines lack an upper-case letter
+  (lower-case base32 or hex, or base64 that happens to have none, such as
+  `abcd` repeated) is not counted by any of these shapes. Lines that are each
+  one repeated character (`aaaa`), and upper-case base32 or hex, are counted.
 
 Lists can match these shapes too. Bare commit SHAs one per line are refused at
 26 or more full 40-character SHAs, or 143 or more 7-character short SHAs; a
@@ -493,8 +501,9 @@ column of 4-digit numbers one per line is refused at 251 lines; 59 or more
 
 These shapes are a guard against an accidental upload, not a proof. An encoding
 broken up by spaces or punctuation is not seen, and neither is one wrapped at
-varying widths in lines of under 4 characters, or a single-case encoding
-(base32, hex) wrapped at varying widths under 20 columns.
+varying widths in lines of under 4 characters, or one wrapped at varying widths
+under 20 columns whose lines lack an upper-case letter (lower-case base32 or
+hex, say), unless each such line is one repeated character.
 
 The refusal names every reason that applies. Files are read only up to the
 limit plus one byte, so a very large file is reported as "at least" that size:
@@ -948,9 +957,10 @@ and none of it is fixed by configuration.
   separately. A refusal is not in the audit log; it shows there only as gh's
   non-zero exit.
 - **Encoding detection works by shape.** An encoding broken up by spaces or
-  punctuation, one wrapped at varying widths in lines under 4 characters, or a
-  single-case encoding (base32, hex) wrapped at varying widths under 20 columns
-  is not seen. A long list of equal-width tokens, or of mixed-case names, one
+  punctuation, one wrapped at varying widths in lines under 4 characters, or
+  one wrapped at varying widths under 20 columns whose lines lack an upper-case
+  letter (lower-case base32 or hex, say; a line of one repeated character
+  still counts) is not seen. A long list of equal-width tokens, or of mixed-case names, one
   per line can be refused (see [the write content guard](#the-write-content-guard)).
 - **Pushback detection depends on gh's error text.** gh-paced recognises the
   phrases GitHub and gh use today. A change in that wording could hide a
