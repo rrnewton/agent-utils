@@ -70,7 +70,10 @@ terminator does not count), unless its command is one that never contacts Herdr
 (`capabilities`, `profiles`, `quickstart`, `skill`, `userguide`, or help and
 version output). It records the refusal for `harness/no-host-cli` instead.
 Every other command, including a deliberately invalid one, passes
-`--herdr-bin <HERDR>`. `agentctl chat` is refused even then, apart from its
+`--herdr-bin <HERDR>`. Any `--herdr-bin` that names a file outside the case
+directory refuses the invocation, even after a `--`: after a `--` at the start
+of the command line, the Python subcommand parser reads the remaining tokens as
+options again. `agentctl chat` is refused even with the fixture, apart from its
 help, because the Python edition's Chat bridge ignores `--herdr-bin` and always
 runs the installed Herdr.
 

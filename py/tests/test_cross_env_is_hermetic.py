@@ -475,6 +475,9 @@ def _recording_edition(tmp_path: Path) -> tuple[list[str], Path]:
     ("--", "start", "worker"),
     ("--", "start", "--help"),
     ("start", "--", "--help"),
+    # After a root-level `--`, the Python subcommand parser reads options again.
+    ("--herdr-bin", "<HERDR>", "--", "start", "worker", "--herdr-bin", "herdr"),
+    ("--herdr-bin", "<HERDR>", "--", "start", "worker", "--herdr-bin=/usr/local/bin/herdr"),
     # The last --herdr-bin wins in both parsers.
     ("start", "worker", "--herdr-bin", "<HERDR>", "--herdr-bin", "herdr"),
     # The Python Chat bridge builds a default client, so naming the fixture cannot redirect it.
@@ -685,6 +688,9 @@ _PARSER_PROBES: tuple[tuple[str, ...], ...] = (
     ("start", "--help"),
     ("start", "worker", "--herdr-bin", "<HERDR>", "--herdr-bin", "herdr"),
     ("start", "worker", "--herdr-bin", "herdr", "--herdr-bin", "<HERDR>"),
+    ("--herdr-bin", "<HERDR>", "--", "start", "worker", "--herdr-bin", "herdr"),
+    ("--herdr-bin", "<HERDR>", "--", "start", "worker", "--herdr-bin=/usr/local/bin/herdr"),
+    ("--herdr-bin", "<HERDR>", "--", "start", "worker"),
     ("--pane", "w1:p1", "status"),
     ("status", "--pane", "w1:p1", "--herdr-bin", "<HERDR>"),
     ("--queue", "<ROOT>/queue", "userguide"),
@@ -770,6 +776,7 @@ def test_an_invocation_the_guard_admits_never_selects_an_installed_herdr(
     ("agentctl", ("send", "worker", "--", "--herdr-bin=<HERDR>")),
     ("agentctl", ("--", "start", "worker")),
     ("agentctl", ("start", "--", "--help")),
+    ("agentctl", ("--herdr-bin", "<HERDR>", "--", "start", "worker", "--herdr-bin", "herdr")),
     ("herdr-agent", ("send", "--pane", "w1:p1", "--", "--herdr-bin=<HERDR>")),
     ("herdr-agent", ("--", "start", "--help")),
     ("herdr-agent", ("--pane", "w1:p1", "status")),
@@ -792,6 +799,54 @@ def test_the_parser_probes_include_invocations_that_select_the_installed_herdr(
     assert arguments in _PARSER_PROBES
     assert _parsed_herdr(parse, expanded) == ("herdr", False)
     assert herdr_agent.herdr_refusal(root, expanded) is not None
+
+
+class _ClientConstructed(Exception):
+    """Raised in place of a production Herdr client, so the command stops before any Herdr use."""
+
+
+@pytest.mark.parametrize("suffix", (("--herdr-bin", "herdr"), ("--herdr-bin=/usr/local/bin/herdr",)))
+def test_a_root_terminator_does_not_hide_a_subcommand_herdr_from_the_guard(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, suffix: tuple[str, ...]
+) -> None:
+    """`--herdr-bin FIXTURE -- start worker --herdr-bin herdr` reaches the client as `herdr`.
+
+    The CLI runs for real up to the point where it constructs its HerdrClient, which is replaced
+    by a recorder that raises. Process creation is blocked as well, so nothing can execute.
+    """
+    import contextlib
+    import io
+    import subprocess
+
+    herdr_agent = _cross_module("herdr_agent_differential")
+    from agentctl import cli as agentctl_cli
+
+    root = tmp_path / "case"
+    root.mkdir()
+    fixture = root / "fake-herdr"
+    _executable_file(fixture)
+    constructed: list[str] = []
+
+    def recording_client(*, herdr_bin: str = "herdr", **_: object) -> object:
+        constructed.append(herdr_bin)
+        raise _ClientConstructed
+
+    def no_process(*_: object, **__: object) -> object:
+        raise AssertionError("the CLI tried to start a process")
+
+    monkeypatch.setattr(agentctl_cli, "HerdrClient", recording_client)
+    monkeypatch.setattr(subprocess, "Popen", no_process)
+    arguments = [
+        "--registry", str(root / "registry"), "--herdr-bin", str(fixture),
+        "--", "start", "worker", *suffix,
+    ]
+    with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+        with contextlib.suppress(_ClientConstructed):
+            agentctl_cli.main(arguments)
+
+    assert constructed == [suffix[-1].removeprefix("--herdr-bin=")]
+    assert not herdr_agent._names_case_file(root, constructed[0])
+    assert herdr_agent.herdr_refusal(root, arguments) is not None
 
 
 def test_the_chat_bridge_ignores_a_fixture_herdr_the_guard_would_otherwise_see(

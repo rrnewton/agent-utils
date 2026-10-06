@@ -508,17 +508,23 @@ def herdr_refusal(root: Path, arguments: Sequence[str]) -> str | None:
     """Say why an invocation could run a Herdr outside the case directory, or None if it cannot.
 
     The check is deliberately conservative: it may refuse an invocation that would not have
-    contacted Herdr, never the reverse. Tokens after a `--` terminator are positional text, so
-    a `--herdr-bin` there names nothing, and a help flag there asks for nothing.
+    contacted Herdr, never the reverse. Tokens after the first `--` may be positional text, so a
+    `--herdr-bin` there never admits an invocation, and a help flag there asks for nothing. They
+    are not always text, though: after a root-level `--`, the Python subcommand parser reads its
+    remaining tokens as options again. So a `--herdr-bin` anywhere that names something outside
+    the case directory refuses the invocation.
     """
     options_end = arguments.index("--") if "--" in arguments else len(arguments)
-    options = arguments[:options_end]
-    named = [
-        options[index + 1] for index, value in enumerate(options[:-1]) if value == "--herdr-bin"
-    ] + [value.split("=", 1)[1] for value in options if value.startswith("--herdr-bin=")]
-    outside = [value for value in named if not _names_case_file(root, value)]
+
+    def named_in(tokens: Sequence[str]) -> list[str]:
+        return [
+            tokens[index + 1] for index, value in enumerate(tokens[:-1]) if value == "--herdr-bin"
+        ] + [value.split("=", 1)[1] for value in tokens if value.startswith("--herdr-bin=")]
+
+    outside = [value for value in named_in(arguments) if not _names_case_file(root, value)]
     if outside:
         return f"--herdr-bin {outside[0]!r} is not a fixture inside the case directory"
+    named = named_in(arguments[:options_end])
     index = 0
     while index < len(arguments):
         if index == options_end:
