@@ -362,13 +362,16 @@ blank line. stdout itself is passed on unchanged.
   it is the first thing on stdout. gh-paced reads that first block and nothing
   after it, so a response body cannot start a cooldown, whatever it contains.
   The block counts even if it is cut off before its blank line (the stream
-  ended, or a line of another shape followed), so a cut-off block keeps its
-  `Retry-After`, and so does a last header line that the stream ends without a
-  line ending.
+  ended, or a line of another shape followed); see "Output cut short" below for
+  what a block cut by the end of stdout keeps.
 - **`--paginate`.** gh prints one header block per page, each after the
   previous page's body, so gh-paced reads every block it finds in the shape
   above. A block counts when its CRLF blank line arrives, or when the output
-  ends after at least one of its CRLF header lines. Body lines that merely look
+  ends after at least one of its CRLF header lines, or when the output ends
+  inside a block that began on the first stdout line. A later page's block that
+  the output cuts before its first CRLF header line is complete may be a
+  `--jq` page body cut short, so it does not count, and the cooldown is
+  whatever stderr gives (900 s for an `HTTP 429`). Body lines that merely look
   like a status line and headers, such as lines printed through `--jq`, end in
   a bare LF and are not treated as a header. A page body that itself contains
   that exact shape with CRLF line endings is read as one more header block and
@@ -394,6 +397,26 @@ blank line. stdout itself is passed on unchanged.
   cut inside its first header line may be a `--jq` page body cut short, so it
   does not count, and the cooldown is whatever stderr gives (900 s for an
   `HTTP 429`).
+- **Output cut short.** stdout can stop at any byte. gh can be killed, and when
+  the terminal or the program reading stdout goes away, gh-paced stops reading
+  after the chunk it holds; a terminal can hand over a chunk that ends in the
+  middle of a header line, even when gh wrote that line in one piece. So a
+  header line that the output ends without its line ending is not trusted:
+  `Retry-After: 17` may be the start of `Retry-After: 172800`. If the output
+  ends inside a 403 or 429 block that counts (see above) before a whole
+  `Retry-After` line (one with its line ending) arrived, the wait GitHub asked
+  for is not known, and the cooldown has no end time, as for a `Retry-After`
+  over 365 days above, never a shorter one. With one response, a cut
+  `Retry-After` line in a block of any other status does the same; with
+  `--paginate`, a cut last line that is not the first line of stdout is not
+  read. A `Retry-After` line that arrived whole is kept
+  even when the block is cut later. With one response, a last line that ends
+  in CR is whole: only its LF is missing. A cut before the status code arrives
+  leaves nothing on stdout to read, so stderr decides, as for a call without
+  `-i`. So `gh api -i ... | head -n1` on a 403 or 429 can start a cooldown
+  with no end time, even for a 403 that was only a permission error. Once you
+  know it was not a limit, end it as above, by removing `<account>.cooldown`
+  and the `cooldown` entry of `<account>.json`.
 
 Any limit signal (one of the phrases, HTTP 429, a `Retry-After` value, or
 `X-RateLimit-Remaining: 0`) starts a **cooldown** of the larger of `Retry-After`
