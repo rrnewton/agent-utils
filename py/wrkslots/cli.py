@@ -16596,16 +16596,30 @@ def _user_manager_cgroup(root: Path) -> Path:
     return root / "user.slice" / f"user-{os.getuid()}.slice" / manager
 
 
+def _mount_is_visible(entries: Sequence[_MountEntry], entry: _MountEntry) -> bool:
+    """Whether ``entry`` is the mount that path lookup reaches at its point.
+
+    A mount made later over its point, or over a directory above it, hides it.
+    """
+
+    return _visible_mount(entries, entry.point) is entry
+
+
 def _assert_whole_cgroup2_hierarchy(root: Path) -> None:
-    """Refuse unless the mount visible at ``root`` is the whole cgroup v2 tree.
+    """Refuse unless the mounts visible at and below ``root`` show the whole
+    cgroup v2 tree.
 
     A cgroup v2 mount can show a subtree (its mount-table root is then that
     subtree's path), in which control groups outside it are missing rather
-    than empty.  The caller has proved this process is in the initial
-    cgroup namespace, where mount roots are paths from the hierarchy root.
+    than empty.  A visible mount below ``root`` (a file system over a
+    control group, or a file bind-mounted over its ``cgroup.procs``)
+    replaces what the hierarchy shows there, so a member list can read
+    empty.  The caller has proved this process is in the initial cgroup
+    namespace, where mount roots are paths from the hierarchy root.
     """
 
-    entry = _visible_mount(_read_self_mount_entries(), root)
+    entries = _read_self_mount_entries()
+    entry = _visible_mount(entries, root)
     if entry is None or entry.point != root or entry.fstype != "cgroup2":
         raise Refusal(f"no cgroup v2 hierarchy is mounted at {root}")
     if entry.root != b"/":
@@ -16614,6 +16628,16 @@ def _assert_whole_cgroup2_hierarchy(root: Path) -> None:
             f"the cgroup v2 mount at {root} shows only {shown} of the hierarchy, so a "
             "retained run unit's control group can be outside it"
         )
+    for below in entries:
+        if (
+            below.point != root
+            and _path_is_within(below.point, root)
+            and _mount_is_visible(entries, below)
+        ):
+            raise Refusal(
+                f"a {below.fstype} mount at {below.point} covers part of the cgroup v2 "
+                "hierarchy, so a retained run unit's control-group members can read empty"
+            )
 
 
 def _retained_unit_cgroup_members(
@@ -16633,8 +16657,9 @@ def _retained_unit_cgroup_members(
     A count of zero is evidence only where the whole hierarchy is visible,
     so with the default ``root`` the mount at ``/sys/fs/cgroup`` must be
     cgroup v2 with the hierarchy's root as its own (a mount of a subtree
-    would hide every unit outside it), and the user manager's control group
-    must be visible under ``root``; either missing refuses.
+    would hide every unit outside it), no visible mount may lie below it,
+    and the user manager's control group must be visible under ``root``;
+    any of them missing refuses.
     """
 
     if not units:

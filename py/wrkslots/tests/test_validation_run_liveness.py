@@ -1731,6 +1731,74 @@ def test_a_partial_cgroup_mount_refuses_the_member_read(
     assert detail in str(refused.value)
 
 
+_CGROUP_HIERARCHY = "2 1 0:2 / /sys/fs/cgroup rw - cgroup2 cgroup2 rw\n"
+_RUN_UNIT_CGROUP = (
+    f"/sys/fs/cgroup/user.slice/user-{os.getuid()}.slice/user@{os.getuid()}.service"
+    f"/app.slice/{RUN_UNIT}"
+)
+
+
+@pytest.mark.parametrize(
+    ("mount", "point"),
+    [
+        (
+            "3 2 0:3 / /sys/fs/cgroup/user.slice rw - tmpfs tmpfs rw\n",
+            "/sys/fs/cgroup/user.slice",
+        ),
+        (
+            f"3 2 0:3 /empty {_RUN_UNIT_CGROUP}/cgroup.procs rw - tmpfs tmpfs rw\n",
+            f"{_RUN_UNIT_CGROUP}/cgroup.procs",
+        ),
+    ],
+    ids=["file-system-over-a-slice", "file-over-a-member-list"],
+)
+def test_a_visible_mount_below_the_cgroup_hierarchy_refuses_the_member_read(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mount: str, point: str
+) -> None:
+    """A mount below /sys/fs/cgroup replaces the control groups it covers.
+
+    The hierarchy-root proof passes for both tables: the mount at
+    /sys/fs/cgroup is the whole cgroup v2 tree.  A file system over a slice
+    shows none of its control groups, and an empty file bind-mounted over a
+    unit's ``cgroup.procs`` lists no member, so the unit would read empty.
+    """
+
+    table = tmp_path / "mountinfo"
+    table.write_text(
+        "1 0 0:1 / / rw - ext4 /dev/root rw\n" + _CGROUP_HIERARCHY + mount, encoding="utf-8"
+    )
+    monkeypatch.setattr(wrkslots, "_SELF_MOUNTINFO", table)
+
+    with pytest.raises(wrkslots.Refusal) as refused:
+        wrkslots._retained_unit_cgroup_members({RUN_UNIT})
+    assert f"a tmpfs mount at {point} covers part of the cgroup v2 hierarchy" in str(
+        refused.value
+    )
+
+
+def test_a_hidden_mount_below_the_cgroup_hierarchy_is_not_read_as_a_cover(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A mount that a later whole-hierarchy mount at /sys/fs/cgroup hides
+    covers nothing that path lookup reaches, so the hierarchy is whole."""
+
+    covered = (
+        "1 0 0:1 / / rw - ext4 /dev/root rw\n"
+        + _CGROUP_HIERARCHY
+        + "3 2 0:3 / /sys/fs/cgroup/user.slice rw - tmpfs tmpfs rw\n"
+    )
+    table = tmp_path / "mountinfo"
+    monkeypatch.setattr(wrkslots, "_SELF_MOUNTINFO", table)
+    table.write_text(covered, encoding="utf-8")
+    with pytest.raises(wrkslots.Refusal, match="covers part of the cgroup v2 hierarchy"):
+        wrkslots._assert_whole_cgroup2_hierarchy(Path("/sys/fs/cgroup"))
+
+    table.write_text(
+        covered + "4 2 0:2 / /sys/fs/cgroup rw - cgroup2 cgroup2 rw\n", encoding="utf-8"
+    )
+    wrkslots._assert_whole_cgroup2_hierarchy(Path("/sys/fs/cgroup"))
+
+
 def test_this_host_counts_the_member_of_this_process_unit() -> None:
     """The real read finds this test process in its own unit's control group.
 
