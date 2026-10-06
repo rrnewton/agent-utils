@@ -982,22 +982,62 @@ pub fn aggregate_slice_cpu_jobs() -> i64 {
     aggregate_slice_max_cpus()
 }
 
+/// Pause between a failed scope probe and its one retry.
+const SCOPE_PROBE_RETRY_BACKOFF: Duration = Duration::from_secs(1);
+
 /// True iff `systemd-run --user --scope` actually works here (cached).
 fn systemd_scope_available() -> bool {
     static PROBE: OnceLock<bool> = OnceLock::new();
-    *PROBE.get_or_init(|| {
-        Command::new("systemd-run")
-            .args([
-                "--user",
-                "--scope",
-                "--quiet",
-                &format!("--unit=dagrun-probe-{}", std::process::id()),
-                "true",
-            ])
-            .output()
-            .map(|o| o.status.success())
-            .unwrap_or(false)
-    })
+    *PROBE.get_or_init(|| probe_with_one_retry(run_scope_probe, SCOPE_PROBE_RETRY_BACKOFF))
+}
+
+/// One `systemd-run --user --scope true`. The error names the exit status and carries the
+/// probe's stderr, which is the only record of why systemd refused.
+fn run_scope_probe(attempt: u32) -> Result<(), String> {
+    // A unit name per attempt, so a retry never collides with what its first attempt left.
+    let output = Command::new("systemd-run")
+        .args([
+            "--user",
+            "--scope",
+            "--quiet",
+            &format!("--unit=dagrun-probe-{}-{attempt}", std::process::id()),
+            "true",
+        ])
+        .output()
+        .map_err(|error| format!("cannot launch systemd-run: {error}"))?;
+    if output.status.success() {
+        return Ok(());
+    }
+    Err(describe_probe_failure(output.status, &output.stderr))
+}
+
+fn describe_probe_failure(status: std::process::ExitStatus, stderr: &[u8]) -> String {
+    format!(
+        "{status}; stderr: {:?}",
+        String::from_utf8_lossy(stderr).trim()
+    )
+}
+
+/// Run `probe`, and once more after `backoff` if it fails. Seen twice in about six weeks on a
+/// shared host: the user manager refused one probe within a second while the same environment
+/// set up scopes before and after it, and with nothing retried a whole validation failed closed.
+/// A second refusal still fails closed. Every failure goes to stderr with its cause.
+fn probe_with_one_retry(probe: impl Fn(u32) -> Result<(), String>, backoff: Duration) -> bool {
+    for attempt in 1..=2 {
+        match probe(attempt) {
+            Ok(()) => return true,
+            Err(why) => {
+                eprintln!(
+                    "{LOG_PREFIX} `systemd-run --user --scope` probe attempt {attempt} of 2 \
+                     failed: {why}"
+                );
+                if attempt == 1 {
+                    thread::sleep(backoff);
+                }
+            }
+        }
+    }
+    false
 }
 
 /// Create/refresh the shared aggregate slice with a `CPUQuota` bounding the SUM of CPU across
@@ -3337,6 +3377,87 @@ mod tests {
         assert!(!skipped.attempted());
         assert!(unavail.attempted());
         assert!(execfail.attempted());
+    }
+
+    #[test]
+    fn a_refused_scope_probe_is_retried_once_after_the_backoff() {
+        use std::cell::RefCell;
+        let backoff = Duration::from_millis(50);
+        let calls = RefCell::new(Vec::new());
+        let start = Instant::now();
+        let ok = probe_with_one_retry(
+            |attempt| {
+                calls.borrow_mut().push(attempt);
+                if attempt == 1 {
+                    Err("transient".into())
+                } else {
+                    Ok(())
+                }
+            },
+            backoff,
+        );
+        assert!(ok, "a refusal followed by a success is available");
+        assert_eq!(*calls.borrow(), vec![1, 2]);
+        assert!(
+            start.elapsed() >= backoff,
+            "the retry waited {:?}",
+            start.elapsed()
+        );
+    }
+
+    #[test]
+    fn a_scope_probe_refused_twice_fails_closed_without_a_third_try() {
+        use std::cell::RefCell;
+        let backoff = Duration::from_millis(500);
+        let calls = RefCell::new(Vec::new());
+        let start = Instant::now();
+        let ok = probe_with_one_retry(
+            |attempt| {
+                calls.borrow_mut().push(attempt);
+                Err("refused".into())
+            },
+            backoff,
+        );
+        assert!(!ok);
+        assert_eq!(*calls.borrow(), vec![1, 2]);
+        // One pause between the two attempts, and none after the last: failing closed is not
+        // delayed further.
+        let waited = start.elapsed();
+        assert!(
+            waited >= backoff && waited < 2 * backoff,
+            "two refusals waited {waited:?}, expected one {backoff:?} pause"
+        );
+    }
+
+    #[test]
+    fn a_passing_scope_probe_runs_once_and_does_not_wait() {
+        use std::cell::RefCell;
+        let calls = RefCell::new(Vec::new());
+        let start = Instant::now();
+        let ok = probe_with_one_retry(
+            |attempt| {
+                calls.borrow_mut().push(attempt);
+                Ok(())
+            },
+            Duration::from_secs(30),
+        );
+        assert!(ok);
+        assert_eq!(*calls.borrow(), vec![1]);
+        assert!(start.elapsed() < Duration::from_secs(30));
+    }
+
+    #[test]
+    fn a_scope_probe_failure_keeps_the_exit_status_and_stderr() {
+        use std::os::unix::process::ExitStatusExt;
+        let why = describe_probe_failure(
+            std::process::ExitStatus::from_raw(1 << 8),
+            b"Failed to connect to bus: Resource temporarily unavailable\n",
+        );
+        assert!(why.contains("exit status: 1"), "{why}");
+        assert!(
+            why.contains("Failed to connect to bus: Resource temporarily unavailable"),
+            "{why}"
+        );
     }
 
     #[test]

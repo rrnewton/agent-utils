@@ -180,7 +180,17 @@ fn a_forced_attempt_that_fails_reports_a_probe_failure_not_a_skip() {
     let shim_dir = fx.dir.join("bin");
     std::fs::create_dir_all(&shim_dir).unwrap();
     let systemd_run = shim_dir.join("systemd-run");
-    std::fs::write(&systemd_run, "#!/bin/sh\nexit 1\n").unwrap();
+    // It records each call's arguments and refuses with a recognisable reason, so the test can
+    // see that the reason reaches the log and how many probes were made, under which unit names.
+    let calls = fx.dir.join("systemd-run.calls");
+    std::fs::write(
+        &systemd_run,
+        format!(
+            "#!/bin/sh\necho \"$*\" >> '{}'\necho 'fake refusal: no user bus here' >&2\nexit 1\n",
+            calls.display()
+        ),
+    )
+    .unwrap();
     std::fs::set_permissions(&systemd_run, std::fs::Permissions::from_mode(0o755)).unwrap();
     let path = format!(
         "{}:{}",
@@ -213,6 +223,31 @@ fn a_forced_attempt_that_fails_reports_a_probe_failure_not_a_skip() {
         !r.text.contains("SKIPPED BY POLICY"),
         "forcing the attempt must actually lift the skip:\n{}",
         r.text
+    );
+    // A refusal is retried exactly once, and each attempt's reason reaches the log.
+    for attempt in 1..=2 {
+        assert!(
+            r.text.lines().any(|line| {
+                line.contains(&format!("probe attempt {attempt} of 2 failed"))
+                    && line.contains("fake refusal: no user bus here")
+            }),
+            "attempt {attempt} must be logged with systemd-run's own stderr:\n{}",
+            r.text
+        );
+    }
+    let calls = std::fs::read_to_string(&calls).unwrap_or_default();
+    let units: Vec<&str> = calls
+        .split_whitespace()
+        .filter(|arg| arg.starts_with("--unit=dagrun-probe-"))
+        .collect();
+    assert_eq!(
+        units.len(),
+        2,
+        "a refused probe is tried twice, never more:\n{calls}"
+    );
+    assert!(
+        units[0].ends_with("-1") && units[1].ends_with("-2"),
+        "each attempt uses its own unit name:\n{calls}"
     );
 }
 
