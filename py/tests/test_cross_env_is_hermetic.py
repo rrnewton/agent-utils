@@ -16,6 +16,7 @@ single place every child environment is built.
 
 from __future__ import annotations
 
+import importlib
 import importlib.util
 import os
 import sys
@@ -297,3 +298,148 @@ def test_only_exact_transient_user_bus_refusals_are_retryable() -> None:
     assert not differential._transient_user_bus_refusal(
         outcome(0, "", "Failed to connect to user scope bus: Connection refused")
     )
+
+
+# --- Host command-line tools -------------------------------------------------------------------
+#
+# The agentctl and herdr-agent differentials run both editions with the developer's PATH. A case
+# that lets an edition fall back to a tool on PATH, such as the default native goal transport
+# `codex app-server proxy`, compares two runs of the host's real tool. Codex prints a
+# per-process path, so the two runs differ and `make validate` went red on a machine with Codex
+# installed while passing on one without it. The harness puts a guard ahead of PATH and reports
+# every call that reaches it. These tests put an ambient tool that prints its own process ID
+# first on the caller's PATH, which is the shape that diverged.
+
+
+def _cross_module(name: str) -> ModuleType:
+    cross = str(REPO_ROOT / "cross")
+    if cross not in sys.path:
+        sys.path.insert(0, cross)
+    return importlib.import_module(name)
+
+
+def _ambient_tool(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, program: str
+) -> Path:
+    """Put a host tool whose output depends on its process ID first on PATH."""
+    directory = tmp_path / "ambient-bin"
+    directory.mkdir(exist_ok=True)
+    ran = tmp_path / f"ambient-{program}-ran"
+    tool = directory / program
+    tool.write_text(
+        f"#!{sys.executable}\n"
+        "import os, sys\n"
+        f"with open({str(ran)!r}, 'a', encoding='utf-8') as stream:\n"
+        "    stream.write(f'{os.getpid()}\\n')\n"
+        "print(f'host state at /tmp/ambient/{os.getpid()}/arcrc', file=sys.stderr)\n"
+        "raise SystemExit(1)\n",
+        encoding="utf-8",
+    )
+    tool.chmod(0o700)
+    monkeypatch.setenv("PATH", f"{directory}{os.pathsep}{os.environ.get('PATH', '')}")
+    return ran
+
+
+def _python_agentctl() -> list[str]:
+    return [sys.executable, "-m", "agentctl"]
+
+
+@pytest.mark.parametrize(
+    "program", _cross_module("herdr_agent_differential").HOST_CLI_GUARDED
+)
+def test_an_edition_that_reaches_a_host_cli_is_refused_rather_than_compared(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, program: str
+) -> None:
+    herdr_agent = _cross_module("herdr_agent_differential")
+    ran = _ambient_tool(tmp_path, monkeypatch, program)
+    # Each "edition" runs the named tool from PATH exactly as a default transport would.
+    edition = [
+        sys.executable, "-c",
+        "import subprocess, sys; "
+        "done = subprocess.run([sys.argv[1], 'probe'], capture_output=True, text=True); "
+        "print(done.returncode, done.stderr, end='')",
+    ]
+    harness = herdr_agent.Harness(tmp_path / "cross", edition, edition)
+    try:
+        case = harness.case("reaches-host-cli")
+        python, rust = harness.invoke(case, (program,))
+        report = herdr_agent.Report()
+        harness.require_no_host_cli(report)
+    finally:
+        harness.close()
+
+    # The ambient tool never ran, so its process ID cannot make the editions differ ...
+    assert not ran.exists()
+    assert python == rust
+    assert python.stdout.startswith("127 cross harness host CLI guard")
+    # ... and the call is a named failure, not a silent agreement.
+    calls = harness.host_cli_calls()
+    assert [call.split(": ", 1)[0] for call in calls] == [
+        "001-reaches-host-cli/python/project", "001-reaches-host-cli/rust/project",
+    ]
+    assert all(f'"program": "{program}", "argv": ["probe"]' in call for call in calls)
+    assert report.checks == 1
+    assert len(report.failures) == 1
+    assert report.failures[0].startswith("harness/no-host-cli: 2 call(s)")
+
+
+def test_the_hostile_path_fixture_keeps_the_guard_first(tmp_path: Path) -> None:
+    herdr_agent = _cross_module("herdr_agent_differential")
+    edition = [sys.executable, "-c", "import os; print(os.environ['PATH'], end='')"]
+    harness = herdr_agent.Harness(tmp_path / "cross", edition, edition)
+    try:
+        case = harness.case("hostile", {"hostile_path": True})
+        python, _ = harness.invoke(case, ())
+    finally:
+        harness.close()
+    assert python.stdout == os.pathsep.join(
+        ("<ROOT>/" + herdr_agent.HOST_CLI_GUARD_DIRECTORY, "<ROOT>/hostile-bin")
+    )
+
+
+def test_the_unfixed_retirement_goal_query_reached_the_host_codex(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The case as it stood: a goal query with no goal command uses `codex` from PATH."""
+    agentctl = _cross_module("agentctl_differential")
+    ran = _ambient_tool(tmp_path, monkeypatch, "codex")
+    harness = agentctl.Harness(tmp_path / "cross", _python_agentctl(), _python_agentctl())
+    try:
+        case = harness.case("unfixed-goal-query")
+        common = ("--herdr-bin", "<HERDR>", "--registry", "<ROOT>/registry")
+        started = harness.invoke(case, (
+            "start", "worker", "--cwd", "<ROOT>", "--workspace-id", "w1", *common,
+        ))
+        assert [outcome.returncode for outcome in started] == [0, 0], started
+        harness.invoke(case, ("goal", "worker", *common))
+        report = agentctl.Report()
+        harness.require_no_host_cli(report)
+    finally:
+        harness.close()
+
+    assert not ran.exists()
+    calls = harness.host_cli_calls()
+    assert len(calls) == 2
+    assert all('"program": "codex", "argv": ["app-server", "proxy"]' in call for call in calls)
+    assert [failure.split(":", 1)[0] for failure in report.failures] == ["harness/no-host-cli"]
+
+
+def test_the_retirement_goal_query_uses_the_fixture_transport(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The shipped case agrees with a PID-printing `codex` first on PATH and never runs it."""
+    agentctl = _cross_module("agentctl_differential")
+    ran = _ambient_tool(tmp_path, monkeypatch, "codex")
+    harness = agentctl.Harness(tmp_path / "cross", _python_agentctl(), _python_agentctl())
+    try:
+        report = agentctl.Report()
+        agentctl._workspace_retirement(harness, report)
+        harness.require_no_host_cli(report)
+    finally:
+        harness.close()
+
+    assert not ran.exists()
+    assert harness.host_cli_calls() == []
+    assert report.failures == []
+    # start, status, attach, goal-query, goal-query-native, wait, stop, and the guard.
+    assert report.checks == 8

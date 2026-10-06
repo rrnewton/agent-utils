@@ -49,6 +49,14 @@ checked structurally instead. Concurrent scheduler traces can complete in a
 different order, so the harness compares their deterministic final outcome and
 report rather than timing-dependent progress lines.
 
+The `herdr-agent` and `agentctl` harnesses run every edition with a guard
+directory first on `PATH`. It holds a failing stub for each host tool an edition
+could reach by a bare name: `agentcloudctl`, `agy`, `claude`, `codex`, `gh`,
+`herdr`, `muse`, `opencode`, `tmux`, and `wrkslots`. A stub records its call,
+and the check `harness/no-host-cli` fails when any call was recorded, so a case
+must hand both editions a fixture (`--herdr-bin`, `--goal-command-json`) rather
+than compare two runs of whatever the developer's machine has installed.
+
 The harness also asks each implementation for its embedded user guide and
 checks that the page is complete and does not mention the sibling language or
 package manager. Artifact-level wheel and crate checks live in

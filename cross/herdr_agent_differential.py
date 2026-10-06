@@ -421,6 +421,33 @@ with log.open("a", encoding="utf-8") as stream:
 print(json.dumps({"installed": {"id": name}}))
 '''
 
+# Host command-line tools an edition can reach by a bare name on PATH, for example the default
+# native goal transport `codex app-server proxy` or the default `--herdr-bin herdr`. A case that
+# reaches one depends on the developer's machine: the real tool's output differs between the two
+# runs (per-process paths) and can read or change live state of the owner's own agents. Every
+# edition therefore runs with a guard directory first on PATH holding one stub per name. A stub
+# records its call and fails; the harness reports every recorded call as a failure, so a case
+# must hand both editions a fixture explicitly instead of passing on whatever the host has.
+HOST_CLI_GUARDED = (
+    "agentcloudctl", "agy", "claude", "codex", "gh", "herdr", "muse", "opencode", "tmux", "wrkslots",
+)
+HOST_CLI_GUARD_DIRECTORY = "host-cli-guard"
+HOST_CLI_GUARD_LOG = "host-cli-guard.jsonl"
+_HOST_CLI_GUARD = r'''import json, os, pathlib, sys
+stub = pathlib.Path(__file__)
+log = stub.resolve().parent.parent / "host-cli-guard.jsonl"
+with log.open("a", encoding="utf-8") as stream:
+    stream.write(json.dumps({"program": stub.name, "argv": sys.argv[1:], "cwd": os.getcwd()}) + "\n")
+print(f"cross harness host CLI guard: refused to run the host {stub.name}", file=sys.stderr)
+raise SystemExit(127)
+'''
+
+
+def guarded_path(root: Path, path: str | None) -> str:
+    """Put one case root's host CLI guard ahead of every other PATH entry."""
+    guard = str(root / HOST_CLI_GUARD_DIRECTORY)
+    return guard if not path else guard + os.pathsep + path
+
 
 class Harness:
     """Create paired fixtures and invoke both implementations."""
@@ -430,6 +457,7 @@ class Harness:
         self.python = tuple(python)
         self.rust = tuple(rust)
         self.serial = 0
+        self.case_roots: list[Path] = []
         shell = os.path.realpath("/bin/bash")
         self.fixture_shell = subprocess.Popen(
             [shell, "--noprofile", "--norc"],
@@ -491,7 +519,34 @@ class Harness:
             (root / "state.json").write_text(
                 json.dumps(initial, sort_keys=True), encoding="utf-8"
             )
+            guard = root / HOST_CLI_GUARD_DIRECTORY
+            guard.mkdir(mode=0o700)
+            for program in HOST_CLI_GUARDED:
+                stub = guard / program
+                stub.write_text(f"#!{sys.executable}\n{_HOST_CLI_GUARD}", encoding="utf-8")
+                stub.chmod(0o700)
+            self.case_roots.append(root)
         return PairCase(python_root, rust_root)
+
+    def host_cli_calls(self) -> list[str]:
+        """Describe every host CLI guard call recorded in any case root so far."""
+        calls: list[str] = []
+        for root in self.case_roots:
+            log = root / HOST_CLI_GUARD_LOG
+            if not log.exists():
+                continue
+            case = root.relative_to(self.root)
+            for line in log.read_text(encoding="utf-8").splitlines():
+                calls.append(f"{case}: {line}")
+        return calls
+
+    def require_no_host_cli(self, report: Report) -> None:
+        """Fail the report when any edition, in any case, reached a guarded host CLI."""
+        calls = self.host_cli_calls()
+        report.require(
+            "harness/no-host-cli", not calls,
+            f"{len(calls)} call(s) reached a host CLI instead of a fixture: {calls!r}",
+        )
 
     def invoke(self, case: PairCase, arguments: Sequence[str]) -> tuple[Outcome, Outcome]:
         return (
@@ -516,8 +571,11 @@ class Harness:
                 root / "skill-homes" / harness_name.lower()
             )
         fixture_state = _state(root)
-        if fixture_state.get("hostile_path"):
-            environment["PATH"] = str(root / "hostile-bin")
+        environment["PATH"] = guarded_path(
+            root,
+            str(root / "hostile-bin") if fixture_state.get("hostile_path")
+            else environment.get("PATH"),
+        )
         environment["AGENTCTL_MUSE_BIN"] = (
             str(root / "missing-muse")
             if fixture_state.get("missing_custom_executable")
@@ -1015,6 +1073,7 @@ def _cross_process_serialization(harness: Harness, report: Report) -> None:
         environment.update(
             {"LANG": "C.UTF-8", "LC_ALL": "C.UTF-8", "NO_COLOR": "1", "TMPDIR": str(tmpdir)}
         )
+        environment["PATH"] = guarded_path(root, environment.get("PATH"))
         return subprocess.Popen(
             [*command, *expanded],
             cwd=root,
@@ -1337,6 +1396,7 @@ def build_report(python_command: Sequence[str], rust_command: Sequence[str]) -> 
             _cross_process_serialization(harness, report)
             _invalid_cli(harness, report)
             _managed_lifecycle(harness, report)
+            harness.require_no_host_cli(report)
         finally:
             harness.close()
     return report

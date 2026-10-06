@@ -813,6 +813,53 @@ def _profile_refusals(harness: Harness, report: Report) -> None:
     ), "profile discovery executed Git from caller PATH")
 
 
+def _workspace_retirement(harness: Harness, report: Report) -> None:
+    """A record started before its project gained a mismatched workspace key stays manageable.
+
+    The goal query names the fixture's goal transport. Without it both editions fall back to the
+    default ``codex app-server proxy`` on PATH, which is the developer's real Codex CLI.
+    """
+    retirement = harness.case("primary-workspace-retirement")
+    for root in (retirement.python_root, retirement.rust_root):
+        subprocess.run(["/usr/bin/git", "init", "-q", str(root)], check=True)
+        (root / ".gitignore").write_text(".agentctl/\n", encoding="utf-8")
+        (root / ".agentctl").mkdir(mode=0o700)
+    common = ("--herdr-bin", "<HERDR>", "--registry", "<ROOT>/.agentctl")
+    _pair(harness, report, retirement, "primary/workspace/retirement/start", (
+        "start", "worker", "--cwd", "<ROOT>", "--workspace-id", "w1", *common,
+    ))
+    for root in (retirement.python_root, retirement.rust_root):
+        config = root / ".agentctl/profiles.json"
+        config.write_text(json.dumps({
+            "schema": "agentctl-profiles/v1",
+            "profiles": {"broken": {"harness": "codex"}},
+            "workspace": "required-label",
+        }), encoding="utf-8")
+        config.chmod(0o600)
+    _pair(harness, report, retirement, "primary/workspace/retirement/status", (
+        "status", "worker", *common,
+    ))
+    _pair(harness, report, retirement, "primary/workspace/retirement/attach", (
+        "attach", "worker", *common,
+    ))
+    python, _ = _pair(harness, report, retirement, "primary/workspace/retirement/goal-query", (
+        "goal", "worker", *_GOAL_COMMAND, *common,
+    ))
+    goal = _json(python)
+    report.require(
+        "primary/workspace/retirement/goal-query-native",
+        isinstance(goal, dict) and goal.get("source") == "native"
+        and goal.get("native_status") == "absent" and "native_error" not in goal,
+        f"the goal query did not reach the fixture's native goal transport: {goal!r}",
+    )
+    _pair(harness, report, retirement, "primary/workspace/retirement/wait", (
+        "wait", "worker", "--timeout", "0", *common,
+    ))
+    _pair(harness, report, retirement, "primary/workspace/retirement/stop", (
+        "stop", "worker", *common,
+    ))
+
+
 def _workspace_policy(harness: Harness, report: Report) -> None:
     """Pin the paired CLI surface for the optional project workspace key."""
     base = {"schema": "agentctl-profiles/v1", "profiles": {
@@ -900,38 +947,7 @@ def _workspace_policy(harness: Harness, report: Report) -> None:
         f"workspace mismatch diverged or allocated a record: {outcomes!r}",
     )
 
-    retirement = harness.case("primary-workspace-retirement")
-    for root in (retirement.python_root, retirement.rust_root):
-        subprocess.run(["/usr/bin/git", "init", "-q", str(root)], check=True)
-        (root / ".gitignore").write_text(".agentctl/\n", encoding="utf-8")
-        (root / ".agentctl").mkdir(mode=0o700)
-    common = ("--herdr-bin", "<HERDR>", "--registry", "<ROOT>/.agentctl")
-    _pair(harness, report, retirement, "primary/workspace/retirement/start", (
-        "start", "worker", "--cwd", "<ROOT>", "--workspace-id", "w1", *common,
-    ))
-    for root in (retirement.python_root, retirement.rust_root):
-        config = root / ".agentctl/profiles.json"
-        config.write_text(json.dumps({
-            "schema": "agentctl-profiles/v1",
-            "profiles": {"broken": {"harness": "codex"}},
-            "workspace": "required-label",
-        }), encoding="utf-8")
-        config.chmod(0o600)
-    _pair(harness, report, retirement, "primary/workspace/retirement/status", (
-        "status", "worker", *common,
-    ))
-    _pair(harness, report, retirement, "primary/workspace/retirement/attach", (
-        "attach", "worker", *common,
-    ))
-    _pair(harness, report, retirement, "primary/workspace/retirement/goal-query", (
-        "goal", "worker", *common,
-    ))
-    _pair(harness, report, retirement, "primary/workspace/retirement/wait", (
-        "wait", "worker", "--timeout", "0", *common,
-    ))
-    _pair(harness, report, retirement, "primary/workspace/retirement/stop", (
-        "stop", "worker", *common,
-    ))
+    _workspace_retirement(harness, report)
 
     move = harness.case("primary-workspace-move")
     for root in (move.python_root, move.rust_root):
@@ -1916,6 +1932,7 @@ def build_report(python_command: Sequence[str], rust_command: Sequence[str]) -> 
             _managed_dead_recovery(harness, report)
             _adoption(harness, report)
             _invalid_cli(harness, report)
+            harness.require_no_host_cli(report)
         finally:
             harness.close()
     return report
