@@ -434,8 +434,13 @@ print(json.dumps({"installed": {"id": name}}))
 # `herdr` from fixed install locations (/usr/local/bin, /usr/bin, and bin directories under the
 # account database's home directory). `herdr_refusal` therefore refuses, before spawning, every
 # invocation that could reach Herdr without naming one inside the case directory.
+#
+# A stub cannot catch an executable named by an explicit path either. `host_cli_refusal` also
+# refuses, before spawning, every invocation that names an executable outside the case directory
+# through an option (see EXECUTABLE_OPTIONS and GOAL_COMMAND_OPTION).
 HOST_CLI_GUARDED = (
-    "agentcloudctl", "agy", "claude", "codex", "gh", "herdr", "muse", "opencode", "tmux", "wrkslots",
+    "agentcloudctl", "agentterm", "agy", "claude", "codex", "gh", "herdr", "muse", "opencode",
+    "tmux", "wrkslots",
 )
 HOST_CLI_GUARD_DIRECTORY = "host-cli-guard"
 HOST_CLI_GUARD_LOG = "host-cli-guard.jsonl"
@@ -480,13 +485,22 @@ HERDR_FREE_COMMANDS = frozenset((
     "capabilities", "profiles", "quickstart", "skill", "userguide",
 ))
 _GLOBAL_VALUE_OPTIONS = ("--registry", "--state", "--herdr-bin")
+# Options whose value an edition executes, with the program each one names. The Rust edition
+# alone has `--agentcloudctl-bin` and `--agentterm-bin`: the Python edition rejects them as
+# unknown, but the Rust edition may already have run the program by then.
+EXECUTABLE_OPTIONS = {
+    "--herdr-bin": "herdr", "--agentcloudctl-bin": "agentcloudctl", "--agentterm-bin": "agentterm",
+}
+# The native goal transport: a JSON array that an edition runs as an argv, its first element
+# unresolved and so never looked up on PATH when it contains a `/`.
+GOAL_COMMAND_OPTION = "--goal-command-json"
 # Commands that ignore `--herdr-bin`: the Python `agentctl chat` builds a default HerdrClient,
 # which runs the installed Herdr, so naming the fixture cannot redirect it.
 HERDR_BIN_IGNORED_COMMANDS = frozenset(("chat",))
 
 
 def _names_case_file(root: Path, value: str) -> bool:
-    """Whether a `--herdr-bin` value is a file inside the case directory, not an installed name.
+    """Whether an executable value is a file inside the case directory, not an installed name.
 
     The editions resolve a relative value against their working directory, the case root, whose
     os.getcwd() is its physical path. They canonicalize it in two different ways. The kernel and
@@ -504,27 +518,62 @@ def _names_case_file(root: Path, value: str) -> bool:
     return all(os.path.commonpath((reading, real_root)) == real_root for reading in readings)
 
 
-def herdr_refusal(root: Path, arguments: Sequence[str]) -> str | None:
-    """Say why an invocation could run a Herdr outside the case directory, or None if it cannot.
+def _option_values(tokens: Sequence[str], option: str) -> list[str]:
+    """Every value given to a long option, in its spaced and in its `=` form."""
+    return [
+        tokens[index + 1] for index, value in enumerate(tokens[:-1]) if value == option
+    ] + [value.split("=", 1)[1] for value in tokens if value.startswith(f"{option}=")]
 
-    The check is deliberately conservative: it may refuse an invocation that would not have
-    contacted Herdr, never the reverse. Tokens after the first `--` may be positional text, so a
-    `--herdr-bin` there never admits an invocation, and a help flag there asks for nothing. They
-    are not always text, though: after a root-level `--`, the Python subcommand parser reads its
-    remaining tokens as options again. So a `--herdr-bin` anywhere that names something outside
-    the case directory refuses the invocation.
+
+def _goal_command_refusal(root: Path, value: str) -> str | None:
+    """Say why a `--goal-command-json` value could run a program outside the case directory."""
+    try:
+        command: object = json.loads(value)
+    except ValueError:
+        return f"{GOAL_COMMAND_OPTION} {value!r} is not JSON, so its program cannot be checked"
+    if command == []:
+        return None  # both editions reject an empty command before running anything
+    if (
+        isinstance(command, list)
+        and all(isinstance(word, str) for word in command)
+        and _names_case_file(root, command[0])
+    ):
+        return None
+    return f"{GOAL_COMMAND_OPTION} {value!r} does not run a fixture inside the case directory"
+
+
+def host_cli_refusal(root: Path, arguments: Sequence[str]) -> tuple[str, str] | None:
+    """Name the host program an invocation could run, and why, or return None if it cannot.
+
+    Two kinds of reach are refused before either edition starts. An option that names an
+    executable (EXECUTABLE_OPTIONS, GOAL_COMMAND_OPTION) must name a file inside the case
+    directory wherever it appears, before or after a `--`: after a root-level `--`, the Python
+    subcommand parser reads its remaining tokens as options again, so a later token is not always
+    text. Then `herdr_refusal` refuses an invocation that would run the installed Herdr by default.
+    The check is deliberately conservative: it may refuse an invocation that would not have run
+    the program, never the reverse.
+    """
+    for option, program in EXECUTABLE_OPTIONS.items():
+        for value in _option_values(arguments, option):
+            if not _names_case_file(root, value):
+                return program, f"{option} {value!r} is not a fixture inside the case directory"
+    for value in _option_values(arguments, GOAL_COMMAND_OPTION):
+        reason = _goal_command_refusal(root, value)
+        if reason is not None:
+            return "goal-command", reason
+    reason = herdr_refusal(root, arguments)
+    return None if reason is None else ("herdr", reason)
+
+
+def herdr_refusal(root: Path, arguments: Sequence[str]) -> str | None:
+    """Say why an invocation would run the installed Herdr by default, or None if it would not.
+
+    Call it through `host_cli_refusal`, which first refuses every `--herdr-bin` that names
+    something outside the case directory. Tokens after the first `--` may be positional text, so
+    a `--herdr-bin` there never admits an invocation, and a help flag there asks for nothing.
     """
     options_end = arguments.index("--") if "--" in arguments else len(arguments)
-
-    def named_in(tokens: Sequence[str]) -> list[str]:
-        return [
-            tokens[index + 1] for index, value in enumerate(tokens[:-1]) if value == "--herdr-bin"
-        ] + [value.split("=", 1)[1] for value in tokens if value.startswith("--herdr-bin=")]
-
-    outside = [value for value in named_in(arguments) if not _names_case_file(root, value)]
-    if outside:
-        return f"--herdr-bin {outside[0]!r} is not a fixture inside the case directory"
-    named = named_in(arguments[:options_end])
+    named = _option_values(arguments[:options_end], "--herdr-bin")
     index = 0
     while index < len(arguments):
         if index == options_end:
@@ -645,14 +694,16 @@ class Harness:
         return calls
 
     @staticmethod
-    def refuse_unfixtured_herdr(root: Path, argv: Sequence[str]) -> str | None:
-        """Record and return the refusal for an invocation that could reach the host's Herdr."""
-        reason = herdr_refusal(root, argv)
-        if reason is not None:
-            with (root / HOST_CLI_GUARD_LOG).open("a", encoding="utf-8") as stream:
-                stream.write(json.dumps({
-                    "program": "herdr", "argv": list(argv), "cwd": str(root), "refused": reason,
-                }) + "\n")
+    def refuse_host_cli(root: Path, argv: Sequence[str]) -> str | None:
+        """Record and return the refusal for an invocation that could reach a host program."""
+        refusal = host_cli_refusal(root, argv)
+        if refusal is None:
+            return None
+        program, reason = refusal
+        with (root / HOST_CLI_GUARD_LOG).open("a", encoding="utf-8") as stream:
+            stream.write(json.dumps({
+                "program": program, "argv": list(argv), "cwd": str(root), "refused": reason,
+            }) + "\n")
         return reason
 
     def require_no_host_cli(self, report: Report) -> None:
@@ -676,7 +727,7 @@ class Harness:
             value.replace("<ROOT>", str(root)).replace("<HERDR>", str(root / "fake-herdr"))
             for value in arguments
         ]
-        refusal = self.refuse_unfixtured_herdr(root, expanded)
+        refusal = self.refuse_host_cli(root, expanded)
         if refusal is not None:
             return _normalize(Outcome(
                 127, "", f"cross harness host CLI guard: refused to run the editions: {refusal}\n",
@@ -1186,7 +1237,7 @@ def _cross_process_serialization(harness: Harness, report: Report) -> None:
             value.replace("<ROOT>", str(root)).replace("<HERDR>", str(root / "fake-herdr"))
             for value in arguments
         ]
-        refusal = Harness.refuse_unfixtured_herdr(root, expanded)
+        refusal = Harness.refuse_host_cli(root, expanded)
         if refusal is not None:
             raise RuntimeError(f"cross harness host CLI guard: {refusal}")
         environment = without_ambient_executables(dict(os.environ))

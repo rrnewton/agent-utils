@@ -527,6 +527,11 @@ def test_an_invocation_that_could_reach_the_installed_herdr_is_never_started(
     ("--herdr-bin", "<HERDR>", "start", "worker"),
     ("send", "worker", "--herdr-bin", "<HERDR>", "--", "--text-that-looks-like-an-option"),
     ("chat", "--help"),
+    ("goal", "worker", "--herdr-bin", "<HERDR>", "--goal-command-json", '["<HERDR>","goal-rpc"]'),
+    ("goal", "worker", "--goal-command-json=[\"./fake-herdr\"]", "--herdr-bin", "<HERDR>"),
+    ("goal", "worker", "--goal-command-json", "[]", "--herdr-bin", "<HERDR>"),
+    ("--herdr-bin", "<HERDR>", "--agentcloudctl-bin", "<HERDR>", "--agentterm-bin=./fake-herdr",
+     "status", "worker"),
 ))
 def test_herdr_free_commands_and_fixture_herdr_invocations_still_run(
     tmp_path: Path, arguments: tuple[str, ...]
@@ -543,6 +548,98 @@ def test_herdr_free_commands_and_fixture_herdr_invocations_still_run(
     assert (python.returncode, rust.returncode) == (0, 0)
     assert started.read_text(encoding="utf-8") == "started\n" * 2
     assert harness.host_cli_calls() == []
+
+
+@pytest.mark.parametrize(("arguments", "program"), (
+    (("goal", "worker", "--herdr-bin", "<HERDR>",
+      "--goal-command-json", '["/usr/local/bin/codex","app-server","proxy"]'), "goal-command"),
+    (("start", "worker", "--herdr-bin", "<HERDR>",
+      "--goal-command-json", '["/usr/local/bin/codex","app-server","proxy"]'), "goal-command"),
+    (("goal", "worker", "--herdr-bin", "<HERDR>",
+      '--goal-command-json=["codex","app-server","proxy"]'), "goal-command"),
+    (("goal", "worker", "--herdr-bin", "<HERDR>",
+      "--goal-command-json", '["<ROOT>/../outside/codex"]'), "goal-command"),
+    (("goal", "worker", "--herdr-bin", "<HERDR>", "--goal-command-json", "not json"),
+     "goal-command"),
+    # The herdr-agent Python edition turns each element into a string with str().
+    (("goal", "worker", "--herdr-bin", "<HERDR>", "--goal-command-json", "[1]"), "goal-command"),
+    (("--herdr-bin", "<HERDR>", "--", "goal", "worker",
+      "--goal-command-json", '["/usr/local/bin/codex"]'), "goal-command"),
+    (("--herdr-bin", "<HERDR>", "--agentcloudctl-bin", "/usr/local/bin/agentcloudctl",
+      "status", "worker"), "agentcloudctl"),
+    (("--herdr-bin", "<HERDR>", "status", "worker", "--agentterm-bin=agentterm"), "agentterm"),
+))
+def test_an_option_that_names_an_outside_executable_is_never_started(
+    tmp_path: Path, arguments: tuple[str, ...], program: str
+) -> None:
+    """A PATH stub cannot catch a program named by an explicit path, so the harness refuses it."""
+    herdr_agent = _cross_module("herdr_agent_differential")
+    edition, started = _recording_edition(tmp_path)
+    harness = herdr_agent.Harness(tmp_path / "cross", edition, edition)
+    try:
+        case = harness.case("outside-executable")
+        python, rust = harness.invoke(case, arguments)
+        report = herdr_agent.Report()
+        harness.require_no_host_cli(report)
+    finally:
+        harness.close()
+
+    assert not started.exists()
+    assert python == rust
+    assert python.returncode == 127
+    assert python.stderr.startswith("cross harness host CLI guard: refused to run the editions")
+    calls = harness.host_cli_calls()
+    assert len(calls) == 2
+    assert all(f'"program": "{program}"' in call and '"refused": ' in call for call in calls)
+    assert [failure.split(":", 1)[0] for failure in report.failures] == ["harness/no-host-cli"]
+
+
+class _TransportStarted(Exception):
+    """Raised in place of starting the native goal transport."""
+
+
+def test_the_goal_transport_runs_an_explicit_path_as_given_and_the_guard_refuses_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The premise behind refusing an outside `--goal-command-json`, through production code.
+
+    The agentctl parser and its JSON decoding hand the command to the goal transport, which
+    passes it to process creation unchanged: an absolute path is executed directly, never looked
+    up on PATH where a stub could catch it. Process creation is replaced by a recorder that
+    raises, so nothing runs.
+    """
+    import subprocess
+
+    herdr_agent = _cross_module("herdr_agent_differential")
+    from agentctl import cli as agentctl_cli
+    from agentctl import codex_goal
+
+    root = tmp_path / "case"
+    root.mkdir()
+    fixture = root / "fake-herdr"
+    _executable_file(fixture)
+    outside = os.path.join(str(tmp_path), "outside", "codex")
+    value = f'["{outside}","app-server","proxy"]'
+    started: list[list[str]] = []
+
+    def recording_popen(argv: list[str], **_: object) -> object:
+        started.append(list(argv))
+        raise _TransportStarted
+
+    monkeypatch.setattr(subprocess, "Popen", recording_popen)
+    namespace = agentctl_cli.parser().parse_args(["goal", "worker", "--goal-command-json", value])
+    command = agentctl_cli._goal_command(namespace)
+    with pytest.raises(_TransportStarted):
+        codex_goal.get_goal("thread-1", command)
+
+    assert started == [[outside, "app-server", "proxy"]]
+    arguments = ["goal", "worker", "--herdr-bin", str(fixture), "--goal-command-json", value]
+    refusal = herdr_agent.host_cli_refusal(root, arguments)
+    assert refusal is not None and refusal[0] == "goal-command"
+    fixture_value = f'["{fixture}","goal-rpc"]'
+    assert herdr_agent.host_cli_refusal(
+        root, ["goal", "worker", "--herdr-bin", str(fixture), "--goal-command-json", fixture_value]
+    ) is None
 
 
 @pytest.mark.parametrize("link", ("linked-herdr", "linked-directory/herdr"))
@@ -750,7 +847,7 @@ def test_an_invocation_the_guard_admits_never_selects_an_installed_herdr(
         value.replace("<ROOT>", str(root)).replace("<HERDR>", str(root / "fake-herdr"))
         for value in arguments
     ]
-    refusal = herdr_agent.herdr_refusal(root, expanded)
+    refusal = herdr_agent.host_cli_refusal(root, expanded)
     parsers = {
         "agentctl": agentctl_cli.parser().parse_args,
         "herdr-agent": legacy_cli._parser().parse_intermixed_args,
@@ -798,7 +895,7 @@ def test_the_parser_probes_include_invocations_that_select_the_installed_herdr(
     )
     assert arguments in _PARSER_PROBES
     assert _parsed_herdr(parse, expanded) == ("herdr", False)
-    assert herdr_agent.herdr_refusal(root, expanded) is not None
+    assert herdr_agent.host_cli_refusal(root, expanded) is not None
 
 
 class _ClientConstructed(Exception):
@@ -846,7 +943,7 @@ def test_a_root_terminator_does_not_hide_a_subcommand_herdr_from_the_guard(
 
     assert constructed == [suffix[-1].removeprefix("--herdr-bin=")]
     assert not herdr_agent._names_case_file(root, constructed[0])
-    assert herdr_agent.herdr_refusal(root, arguments) is not None
+    assert herdr_agent.host_cli_refusal(root, arguments) is not None
 
 
 def test_the_chat_bridge_ignores_a_fixture_herdr_the_guard_would_otherwise_see(
@@ -880,7 +977,7 @@ def test_the_chat_bridge_ignores_a_fixture_herdr_the_guard_would_otherwise_see(
 
     assert agentctl_cli.main(arguments) == 0
     assert launched == [(fixture,)]
-    assert herdr_agent.herdr_refusal(root, arguments) is not None
+    assert herdr_agent.host_cli_refusal(root, arguments) is not None
 
 
 def test_the_unfixed_retirement_goal_query_reached_the_host_codex(

@@ -51,8 +51,8 @@ report rather than timing-dependent progress lines.
 
 The `herdr-agent` and `agentctl` harnesses run every edition with a guard
 directory first on `PATH`. It holds a failing stub for each host tool an edition
-could reach by a bare name: `agentcloudctl`, `agy`, `claude`, `codex`, `gh`,
-`herdr`, `muse`, `opencode`, `tmux`, and `wrkslots`. A stub records its call,
+could reach by a bare name: `agentcloudctl`, `agentterm`, `agy`, `claude`,
+`codex`, `gh`, `herdr`, `muse`, `opencode`, `tmux`, and `wrkslots`. A stub records its call,
 and the check `harness/no-host-cli` fails when any call was recorded, so a case
 must hand both editions a fixture (`--goal-command-json`, for example) rather
 than compare two runs of whatever the developer's machine has installed. The
@@ -76,6 +76,12 @@ of the command line, the Python subcommand parser reads the remaining tokens as
 options again. `agentctl chat` is refused even with the fixture, apart from its
 help, because the Python edition's Chat bridge ignores `--herdr-bin` and always
 runs the installed Herdr.
+
+A stub cannot catch a program named by an explicit path either, so the same
+refusal applies, wherever the option appears, to an `--agentcloudctl-bin` or
+`--agentterm-bin` (Rust edition only) that names a file outside the case
+directory, and to a `--goal-command-json` unless it is `[]` or an array of
+strings whose first element names a file inside the case directory.
 
 The harness also asks each implementation for its embedded user guide and
 checks that the page is complete and does not mention the sibling language or
