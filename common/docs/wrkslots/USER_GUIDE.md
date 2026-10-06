@@ -442,7 +442,13 @@ is judged. A handle that only the later read finds, one whose file differs betwe
 replaced by an identical file counts), and one that the later read no longer finds naming the row
 were written or removed after both enumerations had begun, so their unit states do not cover its
 run: its unit can be queued after them with its job still waiting to start, showing no state,
-process or member. Such a handle is `alive`, and a rerun reads it before the units. Last, the
+process or member. Such a handle is `alive`, and a rerun reads it before the units. A handle
+rewritten with the same bytes within one file timestamp tick keeps all of those, so when a handle
+of the first read changed within the last two seconds (by this host's clock, which the kernel uses
+for file times), that is waited out and the handles are read again before the units: a run that
+has just written its handle as it finishes is judged, not refused. A handle that both reads find
+alike while it is still that recent (the clock stands still, or the change time is more than two
+and a quarter seconds ahead of it and is not waited for) is `alive` too. Last, the
 current members of every control group named after a handle's unit, and of its
 descendants, are read from the cgroup v2 hierarchy below the user service manager; a member there is
 `alive`. A host without a cgroup v2 hierarchy at `/sys/fs/cgroup`, whose cgroup v2 mount there shows
