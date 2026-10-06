@@ -25,6 +25,9 @@ from types import ModuleType
 
 import pytest
 
+from agentctl import agent as agentctl_agent
+from agentctl.client import HerdrClient
+
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
 
@@ -340,8 +343,38 @@ def _ambient_tool(
     return ran
 
 
-def _python_agentctl() -> list[str]:
-    return [sys.executable, "-m", "agentctl"]
+
+
+# The Python edition with the host-wide target locks moved to private files. A fresh interpreter
+# does not inherit conftest's in-process patch, and `start` would otherwise wait on the account's
+# real lock files, which live agents hold. The locks are still real flocks.
+_PRIVATE_LOCK_AGENTCTL = """import os, sys
+from agentctl import agent
+roots = tuple(os.path.join(sys.argv[1], part) for part in ("account", "legacy"))
+def private_lock_paths(name):
+    lock_name = agent._target_lock_name(name)
+    return os.path.join(roots[0], lock_name), os.path.join(roots[1], lock_name)
+agent._target_lock_paths = private_lock_paths
+sys.argv = ["agentctl", *sys.argv[2:]]
+from agentctl.cli import main
+raise SystemExit(main())
+"""
+
+
+def _python_agentctl(lock_root: Path) -> list[str]:
+    for part in ("account", "legacy"):
+        (lock_root / part).mkdir(parents=True, mode=0o700, exist_ok=True)
+    lock_root.chmod(0o700)
+    # A just-recorded refresh of the legacy lock files, so a lock lookup does not scan.
+    (lock_root / "account" / agentctl_agent._LEGACY_REFRESH_MARKER).touch(mode=0o600)
+    return [sys.executable, "-c", _PRIVATE_LOCK_AGENTCTL, str(lock_root)]
+
+
+def _private_locks_taken(lock_root: Path) -> list[str]:
+    return sorted(
+        path.name for path in (lock_root / "account").iterdir()
+        if path.name != agentctl_agent._LEGACY_REFRESH_MARKER
+    )
 
 
 @pytest.mark.parametrize(
@@ -362,7 +395,7 @@ def test_an_edition_that_reaches_a_host_cli_is_refused_rather_than_compared(
     harness = herdr_agent.Harness(tmp_path / "cross", edition, edition)
     try:
         case = harness.case("reaches-host-cli")
-        python, rust = harness.invoke(case, (program,))
+        python, rust = harness.invoke(case, (program, *herdr_agent.FIXTURE_HERDR))
         report = herdr_agent.Report()
         harness.require_no_host_cli(report)
     finally:
@@ -397,13 +430,112 @@ def test_the_hostile_path_fixture_keeps_the_guard_first(tmp_path: Path) -> None:
     )
 
 
+def test_the_production_client_ignores_path_for_the_default_herdr(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Why the harness refuses instead of stubbing Herdr: a PATH stub is never consulted."""
+    _ambient_tool(tmp_path, monkeypatch, "herdr")
+    home = tmp_path / "home"
+    (home / "bin").mkdir(parents=True)
+    installed = home / "bin" / "herdr"
+    installed.write_text("#!/bin/sh\nexit 1\n", encoding="utf-8")
+    installed.chmod(0o700)
+    monkeypatch.setattr(HerdrClient, "_account_home", staticmethod(lambda: str(home)))
+
+    resolved = HerdrClient()._executable()
+
+    on_this_host = {
+        os.path.realpath(path) for path in ("/usr/local/bin/herdr", "/usr/bin/herdr")
+        if os.path.isfile(path) and os.access(path, os.X_OK)
+    }
+    assert resolved in on_this_host | {str(installed)}
+    assert resolved != str(tmp_path / "ambient-bin" / "herdr")
+
+
+def _recording_edition(tmp_path: Path) -> tuple[list[str], Path]:
+    started = tmp_path / "edition-started"
+    edition = [
+        sys.executable, "-c",
+        f"open({str(started)!r}, 'a', encoding='utf-8').write('started\\n')",
+    ]
+    return edition, started
+
+
+@pytest.mark.parametrize("arguments", (
+    ("start", "worker"),
+    ("unknown",),
+    ("status", "--pane", "--help"),
+    ("--registry", "<ROOT>/registry", "send", "worker", "text"),
+    ("start", "worker", "--herdr-bin", "herdr"),
+    ("start", "worker", "--herdr-bin=/usr/local/bin/herdr"),
+    ("start", "worker", "--herdr-bin", "<ROOT>/../outside/herdr"),
+))
+def test_an_invocation_that_could_reach_the_installed_herdr_is_never_started(
+    tmp_path: Path, arguments: tuple[str, ...]
+) -> None:
+    herdr_agent = _cross_module("herdr_agent_differential")
+    edition, started = _recording_edition(tmp_path)
+    harness = herdr_agent.Harness(tmp_path / "cross", edition, edition)
+    try:
+        case = harness.case("installed-herdr")
+        python, rust = harness.invoke(case, arguments)
+        report = herdr_agent.Report()
+        harness.require_no_host_cli(report)
+    finally:
+        harness.close()
+
+    assert not started.exists()
+    assert python == rust
+    assert python.returncode == 127
+    assert python.stderr.startswith("cross harness host CLI guard: refused to run the editions")
+    calls = harness.host_cli_calls()
+    assert len(calls) == 2
+    assert all('"program": "herdr"' in call and '"refused": ' in call for call in calls)
+    assert [failure.split(":", 1)[0] for failure in report.failures] == ["harness/no-host-cli"]
+
+
+@pytest.mark.parametrize("arguments", (
+    (),
+    ("--help",),
+    ("--version",),
+    ("--userguide", "unknown"),
+    ("userguide",),
+    ("quickstart",),
+    ("capabilities",),
+    ("profiles", "--cwd", "<ROOT>"),
+    ("skill", "install", "--harness", "codex"),
+    ("stop", "--help"),
+    ("--registry", "--help"),
+    ("start", "worker", "--herdr-bin", "<HERDR>"),
+    ("start", "worker", "--herdr-bin=<HERDR>"),
+    ("start", "worker", "--herdr-bin", "./fake-herdr"),
+))
+def test_herdr_free_commands_and_fixture_herdr_invocations_still_run(
+    tmp_path: Path, arguments: tuple[str, ...]
+) -> None:
+    herdr_agent = _cross_module("herdr_agent_differential")
+    edition, started = _recording_edition(tmp_path)
+    harness = herdr_agent.Harness(tmp_path / "cross", edition, edition)
+    try:
+        case = harness.case("fixture-herdr")
+        python, rust = harness.invoke(case, arguments)
+    finally:
+        harness.close()
+
+    assert (python.returncode, rust.returncode) == (0, 0)
+    assert started.read_text(encoding="utf-8") == "started\n" * 2
+    assert harness.host_cli_calls() == []
+
+
 def test_the_unfixed_retirement_goal_query_reached_the_host_codex(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """The case as it stood: a goal query with no goal command uses `codex` from PATH."""
     agentctl = _cross_module("agentctl_differential")
     ran = _ambient_tool(tmp_path, monkeypatch, "codex")
-    harness = agentctl.Harness(tmp_path / "cross", _python_agentctl(), _python_agentctl())
+    lock_root = tmp_path / "target-locks"
+    edition = _python_agentctl(lock_root)
+    harness = agentctl.Harness(tmp_path / "cross", edition, edition)
     try:
         case = harness.case("unfixed-goal-query")
         common = ("--herdr-bin", "<HERDR>", "--registry", "<ROOT>/registry")
@@ -418,6 +550,8 @@ def test_the_unfixed_retirement_goal_query_reached_the_host_codex(
         harness.close()
 
     assert not ran.exists()
+    # `start` held its target lock in the private root, not the account's.
+    assert _private_locks_taken(lock_root)
     calls = harness.host_cli_calls()
     assert len(calls) == 2
     assert all('"program": "codex", "argv": ["app-server", "proxy"]' in call for call in calls)
@@ -430,7 +564,9 @@ def test_the_retirement_goal_query_uses_the_fixture_transport(
     """The shipped case agrees with a PID-printing `codex` first on PATH and never runs it."""
     agentctl = _cross_module("agentctl_differential")
     ran = _ambient_tool(tmp_path, monkeypatch, "codex")
-    harness = agentctl.Harness(tmp_path / "cross", _python_agentctl(), _python_agentctl())
+    lock_root = tmp_path / "target-locks"
+    edition = _python_agentctl(lock_root)
+    harness = agentctl.Harness(tmp_path / "cross", edition, edition)
     try:
         report = agentctl.Report()
         agentctl._workspace_retirement(harness, report)
@@ -439,6 +575,7 @@ def test_the_retirement_goal_query_uses_the_fixture_transport(
         harness.close()
 
     assert not ran.exists()
+    assert _private_locks_taken(lock_root)
     assert harness.host_cli_calls() == []
     assert report.failures == []
     # start, status, attach, goal-query, goal-query-native, wait, stop, and the guard.

@@ -422,12 +422,17 @@ print(json.dumps({"installed": {"id": name}}))
 '''
 
 # Host command-line tools an edition can reach by a bare name on PATH, for example the default
-# native goal transport `codex app-server proxy` or the default `--herdr-bin herdr`. A case that
-# reaches one depends on the developer's machine: the real tool's output differs between the two
-# runs (per-process paths) and can read or change live state of the owner's own agents. Every
-# edition therefore runs with a guard directory first on PATH holding one stub per name. A stub
-# records its call and fails; the harness reports every recorded call as a failure, so a case
-# must hand both editions a fixture explicitly instead of passing on whatever the host has.
+# native goal transport `codex app-server proxy`. A case that reaches one depends on the
+# developer's machine: the real tool's output differs between the two runs (per-process paths)
+# and can read or change live state of the owner's own agents. Every edition therefore runs with
+# a guard directory first on PATH holding one stub per name. A stub records its call and fails;
+# the harness reports every recorded call as a failure, so a case must hand both editions a
+# fixture explicitly instead of passing on whatever the host has.
+#
+# Herdr is the exception a PATH stub cannot catch: with no `--herdr-bin`, both editions run
+# `herdr` from fixed install locations (/usr/local/bin, /usr/bin, and bin directories under the
+# account database's home directory) and ignore PATH. `herdr_refusal` therefore refuses, before
+# spawning, every invocation that could reach Herdr without naming one inside the case directory.
 HOST_CLI_GUARDED = (
     "agentcloudctl", "agy", "claude", "codex", "gh", "herdr", "muse", "opencode", "tmux", "wrkslots",
 )
@@ -447,6 +452,52 @@ def guarded_path(root: Path, path: str | None) -> str:
     """Put one case root's host CLI guard ahead of every other PATH entry."""
     guard = str(root / HOST_CLI_GUARD_DIRECTORY)
     return guard if not path else guard + os.pathsep + path
+
+
+FIXTURE_HERDR = ("--herdr-bin", "<HERDR>")
+# Commands that print text or read local configuration and never construct a Herdr client. Any
+# other command, including an unknown one, must name the fixture Herdr.
+HERDR_FREE_COMMANDS = frozenset((
+    "--help", "-h", "--version", "-V", "--userguide",
+    "capabilities", "profiles", "quickstart", "skill", "userguide",
+))
+_GLOBAL_VALUE_OPTIONS = ("--registry", "--state", "--herdr-bin")
+
+
+def _names_case_file(root: Path, value: str) -> bool:
+    """Whether a `--herdr-bin` value is a path inside the case directory, not an installed name."""
+    if os.sep not in value:
+        return False
+    resolved = os.path.normpath(os.path.join(root, value))
+    return os.path.commonpath((resolved, str(root))) == str(root)
+
+
+def herdr_refusal(root: Path, arguments: Sequence[str]) -> str | None:
+    """Say why an invocation could run a Herdr outside the case directory, or None if it cannot."""
+    named = [
+        arguments[index + 1] for index, value in enumerate(arguments[:-1]) if value == "--herdr-bin"
+    ] + [value.split("=", 1)[1] for value in arguments if value.startswith("--herdr-bin=")]
+    outside = [value for value in named if not _names_case_file(root, value)]
+    if outside:
+        return f"--herdr-bin {outside[0]!r} is not a fixture inside the case directory"
+    if named:
+        return None
+    index = 0
+    while index < len(arguments):
+        if arguments[index] in _GLOBAL_VALUE_OPTIONS:
+            index += 2
+        elif arguments[index].startswith(tuple(f"{option}=" for option in _GLOBAL_VALUE_OPTIONS)):
+            index += 1
+        else:
+            break
+    if index >= len(arguments) or arguments[index] in HERDR_FREE_COMMANDS:
+        return None
+    if index + 1 < len(arguments) and arguments[index + 1] in ("--help", "-h"):
+        return None
+    return (
+        f"{arguments[index]!r} has no --herdr-bin, so the editions would run the Herdr installed "
+        "on this host"
+    )
 
 
 class Harness:
@@ -540,6 +591,17 @@ class Harness:
                 calls.append(f"{case}: {line}")
         return calls
 
+    @staticmethod
+    def refuse_unfixtured_herdr(root: Path, argv: Sequence[str]) -> str | None:
+        """Record and return the refusal for an invocation that could reach the host's Herdr."""
+        reason = herdr_refusal(root, argv)
+        if reason is not None:
+            with (root / HOST_CLI_GUARD_LOG).open("a", encoding="utf-8") as stream:
+                stream.write(json.dumps({
+                    "program": "herdr", "argv": list(argv), "cwd": str(root), "refused": reason,
+                }) + "\n")
+        return reason
+
     def require_no_host_cli(self, report: Report) -> None:
         """Fail the report when any edition, in any case, reached a guarded host CLI."""
         calls = self.host_cli_calls()
@@ -561,6 +623,11 @@ class Harness:
             value.replace("<ROOT>", str(root)).replace("<HERDR>", str(root / "fake-herdr"))
             for value in arguments
         ]
+        refusal = self.refuse_unfixtured_herdr(root, expanded)
+        if refusal is not None:
+            return _normalize(Outcome(
+                127, "", f"cross harness host CLI guard: refused to run the editions: {refusal}\n",
+            ), root)
         environment = dict(os.environ)
         existing = environment.get("PYTHONPATH", "")
         local = str(REPO_ROOT / "py")
@@ -1066,6 +1133,9 @@ def _cross_process_serialization(harness: Harness, report: Report) -> None:
             value.replace("<ROOT>", str(root)).replace("<HERDR>", str(root / "fake-herdr"))
             for value in arguments
         ]
+        refusal = Harness.refuse_unfixtured_herdr(root, expanded)
+        if refusal is not None:
+            raise RuntimeError(f"cross harness host CLI guard: {refusal}")
         environment = dict(os.environ)
         existing = environment.get("PYTHONPATH", "")
         local = str(REPO_ROOT / "py")
@@ -1142,21 +1212,21 @@ def _cross_process_serialization(harness: Harness, report: Report) -> None:
 def _invalid_cli(harness: Harness, report: Report) -> None:
     case = harness.case("invalid-cli")
     for label, arguments, expected_code in (
-        ("unknown-command", ("unknown",), 2),
-        ("nan-timeout", ("status", "--ready-timeout", "nan"), 2),
+        ("unknown-command", ("unknown", *FIXTURE_HERDR), 2),
+        ("nan-timeout", ("status", "--ready-timeout", "nan", *FIXTURE_HERDR), 2),
         ("missing-message", ("send", "--herdr-bin", "<HERDR>", "--pane", "w1:p1"), 2),
-        ("abbreviated-option", ("status", "--pan", "w1:p1"), 2),
+        ("abbreviated-option", ("status", "--pan", "w1:p1", *FIXTURE_HERDR), 2),
         ("extra-userguide-positionals", ("userguide", "one", "two"), 2),
         ("userguide-invalid-command", ("--userguide", "unknown"), 2),
-        ("option-value-stolen-by-help", ("status", "--pane", "--help"), 2),
-        ("option-value-stolen-by-version", ("status", "--pane", "--version"), 2),
-        ("option-value-stolen-by-option", ("status", "--pane", "--queue", "state"), 2),
-        ("attempts-over-bound", ("status", "--max-attempts", "1000001"), 2),
-        ("attempts-underscore", ("status", "--max-attempts", "1_0"), 2),
-        ("attempts-unicode", ("status", "--max-attempts", "١٢"), 2),
-        ("lines-over-bound", ("read", "--lines", "1000001"), 2),
-        ("timeout-underscore", ("status", "--ready-timeout", "1_0"), 2),
-        ("timeout-unicode", ("status", "--ready-timeout", "١.0"), 2),
+        ("option-value-stolen-by-help", ("status", "--pane", "--help", *FIXTURE_HERDR), 2),
+        ("option-value-stolen-by-version", ("status", "--pane", "--version", *FIXTURE_HERDR), 2),
+        ("option-value-stolen-by-option", ("status", "--pane", "--queue", "state", *FIXTURE_HERDR), 2),
+        ("attempts-over-bound", ("status", "--max-attempts", "1000001", *FIXTURE_HERDR), 2),
+        ("attempts-underscore", ("status", "--max-attempts", "1_0", *FIXTURE_HERDR), 2),
+        ("attempts-unicode", ("status", "--max-attempts", "١٢", *FIXTURE_HERDR), 2),
+        ("lines-over-bound", ("read", "--lines", "1000001", *FIXTURE_HERDR), 2),
+        ("timeout-underscore", ("status", "--ready-timeout", "1_0", *FIXTURE_HERDR), 2),
+        ("timeout-unicode", ("status", "--ready-timeout", "١.0", *FIXTURE_HERDR), 2),
     ):
         python, rust = harness.invoke(case, arguments)
         report.require(
@@ -1167,7 +1237,7 @@ def _invalid_cli(harness: Harness, report: Report) -> None:
             f"invalid invocation was not a clean usage error: python={python!r} rust={rust!r}",
         )
 
-    python, rust = harness.invoke(case, ("status", "--pane", ""))
+    python, rust = harness.invoke(case, ("status", "--pane", "", *FIXTURE_HERDR))
     expected = "target needs --pane or a stable session value"
     report.require(
         "cli/empty-exact-pane",

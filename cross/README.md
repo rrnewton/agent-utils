@@ -54,8 +54,17 @@ directory first on `PATH`. It holds a failing stub for each host tool an edition
 could reach by a bare name: `agentcloudctl`, `agy`, `claude`, `codex`, `gh`,
 `herdr`, `muse`, `opencode`, `tmux`, and `wrkslots`. A stub records its call,
 and the check `harness/no-host-cli` fails when any call was recorded, so a case
-must hand both editions a fixture (`--herdr-bin`, `--goal-command-json`) rather
+must hand both editions a fixture (`--goal-command-json`, for example) rather
 than compare two runs of whatever the developer's machine has installed.
+
+Herdr is not looked up on `PATH`: without `--herdr-bin`, both editions run the
+`herdr` installed in a fixed location such as `~/bin`, which a stub cannot
+shadow. The harness therefore does not start the editions at all for an
+invocation that names no Herdr inside the case directory, unless its command is
+one that never contacts Herdr (`capabilities`, `profiles`, `quickstart`,
+`skill`, `userguide`, or help and version output). It records the refusal for
+`harness/no-host-cli` instead. Every other command, including a deliberately
+invalid one, passes `--herdr-bin <HERDR>`.
 
 The harness also asks each implementation for its embedded user guide and
 checks that the page is complete and does not mention the sibling language or

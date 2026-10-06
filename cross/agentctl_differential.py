@@ -20,7 +20,9 @@ import time
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 
-from herdr_agent_differential import Harness, Outcome, PairCase, Report, _queue_snapshot, _state
+from herdr_agent_differential import (
+    FIXTURE_HERDR, Harness, Outcome, PairCase, Report, _queue_snapshot, _state,
+)
 
 _COMMON = ("--herdr-bin", "<HERDR>", "--registry", "<ROOT>/registry")
 _GOAL_COMMAND = ("--goal-command-json", '["<HERDR>","goal-rpc"]')
@@ -730,12 +732,14 @@ def _profile_refusals(harness: Harness, report: Report) -> None:
         config.chmod(0o600)
     outcomes = harness.invoke(overlap, (
         "start", "worker", "--cwd", "<ROOT>", "--profile", "worker", "--model", "override",
+        *FIXTURE_HERDR,
     ))
     report.require("primary/profile/refusal/precedence",
                    all(outcome.returncode == 2 for outcome in outcomes),
                    f"profile precedence was ambiguous: {outcomes!r}")
     outcomes = harness.invoke(overlap, (
         "start", "worker", "--cwd", "<ROOT>", "--profile", "worker", "--resume", "session-1",
+        *FIXTURE_HERDR,
     ))
     report.require("primary/profile/refusal/resume-precedence",
                    all(outcome.returncode == 2 for outcome in outcomes),
@@ -1876,33 +1880,35 @@ def _adoption(harness: Harness, report: Report) -> None:
 def _invalid_cli(harness: Harness, report: Report) -> None:
     case = harness.case("primary-invalid-cli")
     for label, arguments in (
-        ("unknown", ("unknown",)), ("missing-name", ("status",)),
-        ("missing-message", ("send", "worker")), ("empty-message", ("send", "worker", "")),
-        ("blank-message", ("send", "worker", " \n\t")), ("empty-goal", ("goal", "worker", "")),
-        ("abbreviation", ("start", "worker", "--work", "w1")),
-        ("nonfinite", ("send", "worker", "text", "--ready-timeout", "nan")),
-        ("zero-working", ("send", "worker", "text", "--working-timeout", "0")),
-        ("zero-startup", ("start", "worker", "--startup-timeout", "0")),
-        ("environment-missing-equals", ("start", "worker", "--env", "MISSING_EQUALS")),
-        ("environment-empty-name", ("start", "worker", "--env", "=value")),
-        ("environment-invalid-name", ("start", "worker", "--env", "BAD-NAME=value")),
-        ("zero-lines", ("read", "worker", "--lines", "0")),
-        ("underscore-count", ("read", "worker", "--lines", "1_0")),
-        ("unicode-time", ("wait", "worker", "--timeout", "١.0")),
-        ("prompt-conflict", ("send", "worker", "text", "--file", "file.txt")),
-        ("bad-goal-command", ("goal", "worker", "--goal-command-json", "[]")),
+        ("unknown", ("unknown", *FIXTURE_HERDR)), ("missing-name", ("status", *FIXTURE_HERDR)),
+        ("missing-message", ("send", "worker", *FIXTURE_HERDR)),
+        ("empty-message", ("send", "worker", "", *FIXTURE_HERDR)),
+        ("blank-message", ("send", "worker", " \n\t", *FIXTURE_HERDR)),
+        ("empty-goal", ("goal", "worker", "", *FIXTURE_HERDR)),
+        ("abbreviation", ("start", "worker", "--work", "w1", *FIXTURE_HERDR)),
+        ("nonfinite", ("send", "worker", "text", "--ready-timeout", "nan", *FIXTURE_HERDR)),
+        ("zero-working", ("send", "worker", "text", "--working-timeout", "0", *FIXTURE_HERDR)),
+        ("zero-startup", ("start", "worker", "--startup-timeout", "0", *FIXTURE_HERDR)),
+        ("environment-missing-equals", ("start", "worker", "--env", "MISSING_EQUALS", *FIXTURE_HERDR)),
+        ("environment-empty-name", ("start", "worker", "--env", "=value", *FIXTURE_HERDR)),
+        ("environment-invalid-name", ("start", "worker", "--env", "BAD-NAME=value", *FIXTURE_HERDR)),
+        ("zero-lines", ("read", "worker", "--lines", "0", *FIXTURE_HERDR)),
+        ("underscore-count", ("read", "worker", "--lines", "1_0", *FIXTURE_HERDR)),
+        ("unicode-time", ("wait", "worker", "--timeout", "١.0", *FIXTURE_HERDR)),
+        ("prompt-conflict", ("send", "worker", "text", "--file", "file.txt", *FIXTURE_HERDR)),
+        ("bad-goal-command", ("goal", "worker", "--goal-command-json", "[]", *FIXTURE_HERDR)),
         ("missing-global-value", ("--registry", "--help")),
-        ("wrong-command-option", ("status", "worker", "--brief", "text")),
+        ("wrong-command-option", ("status", "worker", "--brief", "text", *FIXTURE_HERDR)),
         ("legacy-recovery-missing-token", (
             "stop", "worker", "--recover-legacy-adoption",
-            "--expected-record-sha256", "0" * 64,
+            "--expected-record-sha256", "0" * 64, *FIXTURE_HERDR,
         )),
         ("legacy-recovery-missing-hash", (
             "stop", "worker", "--recover-legacy-adoption",
-            "--expected-token", "generation",
+            "--expected-token", "generation", *FIXTURE_HERDR,
         )),
         ("legacy-hash-without-recovery", (
-            "stop", "worker", "--expected-record-sha256", "0" * 64,
+            "stop", "worker", "--expected-record-sha256", "0" * 64, *FIXTURE_HERDR,
         )),
     ):
         outcomes = harness.invoke(case, arguments)
