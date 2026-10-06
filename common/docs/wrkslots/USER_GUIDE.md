@@ -369,11 +369,11 @@ validation slots. `audit`, `remove` (including `--validate-complete` and `remove
 `recover-absent-validate-rows` (see "Recover registered validation rows with absent storage"):
 
 - `dead`: every retained run handle under `ignored/validate/runs/` whose checkout names the slot
-  directory or a recorded checkout path (its `checkout` or `source_checkout` is one of those paths or
-  a path inside one, compared as a unit word is below, so a symlink to the slot or a directory inside
-  it names the slot too) has a dead process generation (when it records one) and an
-  inactive, unqueued service unit with no live process in its control group, and no active or
-  queued user-systemd unit names those paths. Removal renames the slot directory to
+  directory or a recorded checkout path (its `checkout` or `source_checkout` is one of those paths
+  or a path inside one, compared as a unit word is below, so a symlink to the slot or a directory
+  inside it names the slot too) has a dead process generation (when it records one) and an inactive,
+  unqueued service unit with no live process in its control group, and no active or queued
+  user-systemd unit names those paths. Removal renames the slot directory to
   `.<slot>.fenced.<generation>.<hex>` before deleting it, so the same paths inside every such fence
   on disk, and inside the fence an interrupted removal's finish journal names, count as the row's
   paths too;
@@ -381,16 +381,17 @@ validation slots. `audit`, `remove` (including `--validate-complete` and `remove
   run finish or stop its unit;
 - `unverifiable`: a handle, the process table, user-systemd state, the boot id, or a recorded run
   process's generation cannot be read completely (unreadable evidence shows no run, so it is not
-  reported `alive`), a handle file changes or is replaced while one read reads it, a handle repeats a JSON field (a repeated field has no single meaning, and keeping the last value
-  could hide a live process or move the handle off its row), the row is registered on another
-  machine, or its coordinator lease or owner names another stable host identity (an ownerless
-  row is judged by its lease, as in `recover-absent-validate-rows`), or this process's view of the
-  host is restricted: it is not in the host's initial PID or cgroup namespace, the mount visible at
-  `/proc` is not the process filesystem of its PID namespace, `/proc` is mounted with `hidepid`, or
-  a mount that path lookup reaches covers a process's directory `/proc/<pid>` or a path inside it
-  (one that a later mount over `/proc` hides covers nothing). In any of those a
-  host run can be missing from the process table, so an empty table is no evidence. All of this evidence is local to the host, so a host without a reachable user service manager cannot prove a
-  validation slot free.
+  reported `alive`), a handle file changes or is replaced while one read reads it, a handle repeats
+  a JSON field (a repeated field has no single meaning, and keeping the last value could hide a live
+  process or move the handle off its row), the row is registered on another machine, or its
+  coordinator lease or owner names another stable host identity (an ownerless row is judged by its
+  lease, as in `recover-absent-validate-rows`), or this process's view of the host is restricted: it
+  is not in the host's initial PID or cgroup namespace, the mount visible at `/proc` is not the
+  process filesystem of its PID namespace, `/proc` is mounted with `hidepid`, or a mount that path
+  lookup reaches covers a process's directory `/proc/<pid>` or a path inside it (one that a later
+  mount over `/proc` hides covers nothing). In any of those a host run can be missing from the
+  process table, so an empty table is no evidence. All of this evidence is local to the host, so a
+  host without a reachable user service manager cannot prove a validation slot free.
 
 A unit names a row path when one of the words of its property strings is that path or a path inside
 it. Each element of a property (one command-line argument, environment assignment or path), each
@@ -452,49 +453,49 @@ second and a half on a busy host. A run that starts and finishes during the enum
 unit inactive and unqueued and may leave a child in the unit's control group; only the later table
 shows that child, so the later table is the one judged. A process generation present in both tables
 keeps the control group it had in the earlier one, and a generation present only in the earlier
-table has exited. The later table is itself read one process at a time after its list of PIDs, so
-a run that starts during it can be absent from both tables while the first enumeration reads its
-unit inactive. The user-systemd units are therefore enumerated again after the later table, and a
-retained run unit that is active or queued in either enumeration is `alive`.
-The retained run handles are read again after both enumerations, and a handle found by either read
-is judged. A handle that only the later read finds, one whose file differs between the two reads
-(its bytes, device, inode, size, or modification or change time, so a handle rewritten in place or
-replaced by an identical file counts), and one that the later read no longer finds naming the row
-were written or removed after both enumerations had begun, so their unit states do not cover its
-run: its unit can be queued after them with its job still waiting to start, showing no state,
-process or member. Such a handle is `alive`, and a rerun reads it before the units. A handle
-rewritten with the same bytes within one file timestamp tick keeps all of those, so when a handle
-of the first read changed within the last two seconds (by this host's clock, which the kernel uses
-for file times), that is waited out and the handles are read again before the units: a run that
-has just written its handle as it finishes is judged, not refused. A handle that appeared, changed
-or went between the reads before and after that wait is `alive` as well. A handle that both reads
-find alike while either finds it that recent (the clock stands still or went back, or the change
-time is more than a quarter second ahead of it and is not waited for) is `alive` too, and so is one
-that both reads find alike while this host's realtime clock may have fallen more than half a second
-against its monotonic clock between them: after a step back into a handle's timestamp tick, a run
-that registers again alike leaves both reads equal. Each read of the handles reads both clocks
-before its first handle and after its last, so a step while the handles are read counts too, and a
-change time is recent against the earlier of its two realtime readings. Each reading takes the
-realtime clock between two readings of the monotonic clock, up to three times, and keeps the most
-narrowly bracketed: a scheduling pause between the reads widens the reading instead of moving it,
-and a pause in every try that widens it past half a second reads as a step. A step back undone by
-a step forward before the clocks are next read does not show. Last, the
-current members of every control group named after a handle's unit, and of its
-descendants, are read from the cgroup v2 hierarchy below the user service manager; a member there is
-`alive`. A host without a cgroup v2 hierarchy at `/sys/fs/cgroup`, whose cgroup v2 mount there shows
-only a subtree of the hierarchy (control groups outside it would read as empty), with a visible mount
-below `/sys/fs/cgroup` (a file system over a control group, or a file over its `cgroup.procs`, replaces
-what the hierarchy shows there), whose user service manager's control group is not visible there, or
-with an unreadable member list is `unverifiable`.
+table has exited. The later table is itself read one process at a time after its list of PIDs, so a
+run that starts during it can be absent from both tables while the first enumeration reads its unit
+inactive. The user-systemd units are therefore enumerated again after the later table, and a
+retained run unit that is active or queued in either enumeration is `alive`. The retained run
+handles are read again after both enumerations, and a handle found by either read is judged. A
+handle that only the later read finds, one whose file differs between the two reads (its bytes,
+device, inode, size, or modification or change time, so a handle rewritten in place or replaced by
+an identical file counts), and one that the later read no longer finds naming the row were written
+or removed after both enumerations had begun, so their unit states do not cover its run: its unit
+can be queued after them with its job still waiting to start, showing no state, process or member.
+Such a handle is `alive`, and a rerun reads it before the units. A handle rewritten with the same
+bytes within one file timestamp tick keeps all of those, so when a handle of the first read changed
+within the last two seconds (by this host's clock, which the kernel uses for file times), that is
+waited out and the handles are read again before the units: a run that has just written its handle
+as it finishes is judged, not refused. A handle that appeared, changed or went between the reads
+before and after that wait is `alive` as well. A handle that both reads find alike while either
+finds it that recent (the clock stands still or went back, or the change time is more than a quarter
+second ahead of it and is not waited for) is `alive` too, and so is one that both reads find alike
+while this host's realtime clock may have fallen more than half a second against its monotonic clock
+between them: after a step back into a handle's timestamp tick, a run that registers again alike
+leaves both reads equal. Each read of the handles reads both clocks before its first handle and
+after its last, so a step while the handles are read counts too, and a change time is recent against
+the earliest realtime value either reading took. Each reading takes the realtime clock between two
+readings of the monotonic clock, up to three times, and keeps the most narrowly bracketed try: a
+scheduling pause between the reads widens a try instead of moving it, and a pause in every try that
+widens it past half a second reads as a step. Tries that disagree by more than their brackets saw a
+step between them, and the reading then keeps the bounds of them all. A step back does not show if
+it is undone before a realtime read sees it, or if only a try bracketed wider than the step sees it
+before a narrower try. Last, the current members of every control group named after a handle's unit,
+and of its descendants, are read from the cgroup v2 hierarchy below the user service manager; a
+member there is `alive`. A host without a cgroup v2 hierarchy at `/sys/fs/cgroup`, whose cgroup v2
+mount there shows only a subtree of the hierarchy (control groups outside it would read as empty),
+with a visible mount below `/sys/fs/cgroup` (a file system over a control group, or a file over its
+`cgroup.procs`, replaces what the hierarchy shows there), whose user service manager's control group
+is not visible there, or with an unreadable member list is `unverifiable`.
 
 `recover-absent-validate-rows` and `recover-absent-agent-rows` read this evidence through the same
-code and in the same order, and refuse wherever the answer above would be `alive` or
-`unverifiable`: each first requires the unrestricted host view described above, reads the retained
-run handles before and after the process tables and units, and reads the handles' control-group
-members last. A validation run can use an agent checkout too, so `recover-absent-agent-rows` judges
-every retained run handle whose checkout names the agent row's paths and, like
-`recover-absent-validate-rows`, refuses when any handle under `ignored/validate/runs/` cannot be read
-or parsed.
+code and in the same order, and refuse wherever the answer above would be `alive` or `unverifiable`:
+each first requires the unrestricted host view described above, reads the retained run handles
+before and after the process tables and units, and reads the handles' control-group members last. A
+validation run can use an agent checkout too, so `recover-absent-agent-rows` judges every retained
+run handle whose checkout names the agent row's paths and, like `recover-absent-validate-rows`,
+refuses when any handle under `ignored/validate/runs/` cannot be read or parsed.
 
 Audit reports the number of validation rows it judged this way as the liveness phase's
 `validation_run_subjects`. A batch removal reads this evidence once while sealing and once more per
@@ -604,8 +605,9 @@ changes the slot, such as an active row whose slot directory is gone or a Git wo
 inside the slot, is reported as could-not-determine with recovery required. The batch then goes on
 to its next item, but only after it reads the registry again under the lock and finds no partial
 update, no mutation journal, and the item's row exactly as that check read it; any refusal while it
-does so stops the batch, which still reports what it did. The same defect found at a later step of
-removal, after it has written the registry, stops the batch.
+does so, including a registry file it cannot read or decode, stops the batch, which still reports
+what it did. The same defect found at a later step of removal, after it has written the registry,
+stops the batch.
 Sidecar cleanup atomically renames the exact inode into content-addressed retired control
 storage and never unlinks that retired pathname, so a same-UID replacement cannot be mistaken for
 the acknowledged artifact. A direct-child checkout handoff is likewise moved by no-replace into an

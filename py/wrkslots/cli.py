@@ -633,8 +633,11 @@ _RETAINED_HANDLE_CLOCK_STEP_NS = 500_000_000
 # narrowly its realtime reading must be bracketed by two monotonic readings
 # to be kept without another try (``_retained_handle_clocks``).  A reading
 # that a scheduling pause in every try widens past the step bound can read
-# as a step, which keeps a run alive rather than clearing its row.  A step
-# back undone by a step forward between two readings does not show.
+# as a step, which keeps a run alive rather than clearing its row.  Tries
+# whose offset bounds share no value saw a step between them, and the
+# reading keeps the bounds of them all.  A step back does not show if it is
+# undone before a realtime read sees it, or if only a try bracketed wider
+# than the step sees it before a narrower try.
 _RETAINED_HANDLE_CLOCK_TRIES = 3
 _RETAINED_HANDLE_CLOCK_BRACKET_NS = 1_000_000
 # The bound on one /proc/<pid>/mountinfo read, sized from measurement. On
@@ -1247,9 +1250,9 @@ class _RetainedValidationHandle:
     # same handle only when all of them match.
     file_generation: tuple[int, int, int, str, int, int] | None = None
     # Whether the change time was within ``_RETAINED_HANDLE_STABLE_NS`` of
-    # the earlier of the realtime readings that the census that read it took
-    # before its first handle and after its last, so that a later equal read
-    # does not rule out a rewrite (``_settle_retained_handles``,
+    # the earliest realtime value that the census that read it took, reading
+    # the clocks before its first handle and after its last, so that a later
+    # equal read does not rule out a rewrite (``_settle_retained_handles``,
     # ``_run_evidence``).  Not part of the identity.
     recent: bool = dataclasses.field(default=False, compare=False)
     # The lowest and highest values of this host's realtime clock less its
@@ -24023,7 +24026,8 @@ def _confirm_unchanged_after_target_storage_drift(
     mutation locks again, the registry must show no partial update and no
     mutation journal, and must still hold the row exactly as that check read
     it (``drift.record``), every field alike.  Anything else, including a
-    lock that cannot be taken, raises StateError.
+    lock that cannot be taken or a registry file that cannot be read or
+    decoded, raises StateError.
     """
 
     try:
@@ -24065,6 +24069,12 @@ def _confirm_unchanged_after_target_storage_drift(
         raise StateError(
             f"retirement attempt for {candidate.slot} could not be confirmed "
             f"unchanged after its storage refusal: {exc}"
+        ) from exc
+    except (OSError, ValueError) as exc:
+        raise StateError(
+            f"retirement attempt for {candidate.slot} could not be confirmed "
+            f"unchanged after its storage refusal: cannot read the registry: "
+            f"{type(exc).__name__}: {exc}"
         ) from exc
 
 
@@ -44235,10 +44245,13 @@ def _retained_handle_clocks() -> tuple[int, int, int]:
     the realtime reading less the later monotonic reading and no higher
     than it less the earlier one.  A pause between the reads widens these
     bounds instead of moving them.  The clocks are read up to
-    ``_RETAINED_HANDLE_CLOCK_TRIES`` times, stopping at a reading bracketed
-    within ``_RETAINED_HANDLE_CLOCK_BRACKET_NS``, and the most narrowly
-    bracketed reading is kept: its realtime value, lowest offset and
-    highest offset, in nanoseconds.
+    ``_RETAINED_HANDLE_CLOCK_TRIES`` times, stopping at a try bracketed
+    within ``_RETAINED_HANDLE_CLOCK_BRACKET_NS``.  Tries whose bounds share
+    no value saw the realtime clock step between them, so the bounds of
+    them all are kept: the lowest and the highest offset any try found.
+    Otherwise the bounds of the most narrowly bracketed try are kept.  The
+    realtime value returned is the earliest any try read.  All three are in
+    nanoseconds.
     """
 
     def reading() -> tuple[int, int, int]:
@@ -44247,14 +44260,22 @@ def _retained_handle_clocks() -> tuple[int, int, int]:
         after = _retained_handle_monotonic_ns()
         return realtime, realtime - after, realtime - before
 
-    best = reading()
-    for _ in range(_RETAINED_HANDLE_CLOCK_TRIES - 1):
-        if best[2] - best[1] <= _RETAINED_HANDLE_CLOCK_BRACKET_NS:
-            break
-        candidate = reading()
-        if candidate[2] - candidate[1] < best[2] - best[1]:
-            best = candidate
-    return best
+    tries = [reading()]
+    while (
+        len(tries) < _RETAINED_HANDLE_CLOCK_TRIES
+        and min(high - low for _realtime, low, high in tries)
+        > _RETAINED_HANDLE_CLOCK_BRACKET_NS
+    ):
+        tries.append(reading())
+    earliest = min(realtime for realtime, _low, _high in tries)
+    lowest = min(low for _realtime, low, _high in tries)
+    highest = max(high for _realtime, _low, high in tries)
+    if max(low for _realtime, low, _high in tries) > min(
+        high for _realtime, _low, high in tries
+    ):
+        return earliest, lowest, highest
+    narrowest = min(tries, key=lambda item: item[2] - item[1])
+    return earliest, narrowest[1], narrowest[2]
 
 
 def _retained_handles_for_absent_rows(
@@ -44433,8 +44454,8 @@ def _retained_handles_for_absent_rows(
                 raise Refusal(f"retained validation handle {path} has an empty boot identity")
         found.append((related, path, unit, pid, start_ticks, boot_id, file_generation))
     finished = _retained_handle_clocks()
-    # A change time within the window of the earlier of the two realtime
-    # readings is recent, so a step back during the census makes more
+    # A change time within the window of the earliest realtime value either
+    # reading took is recent, so a step back during the census makes more
     # handles recent, not fewer.
     stable_before_ns = min(started[0], finished[0]) - _RETAINED_HANDLE_STABLE_NS
     clock_offsets_ns = (min(started[1], finished[1]), max(started[2], finished[2]))

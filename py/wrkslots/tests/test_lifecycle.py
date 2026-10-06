@@ -23094,6 +23094,85 @@ def test_retire_pending_reports_its_batch_when_a_drift_confirmation_refuses(
     assert nested.is_dir()
 
 
+@pytest.mark.parametrize(
+    ("fault", "error"),
+    [
+        pytest.param("undecodable-event", "UnicodeDecodeError", id="undecodable-event"),
+        pytest.param("unreadable-event-log", "PermissionError", id="unreadable-event-log"),
+    ],
+)
+def test_retire_pending_reports_its_batch_when_a_drift_confirmation_cannot_read(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    fault: str,
+    error: str,
+) -> None:
+    """A registry the confirmation cannot read or decode stops the batch with its report.
+
+    slot01 is removed first; slot02's own storage drifts, and before the
+    confirmation reads the registry again its event log gains the next event
+    file holding bytes that are not UTF-8 (``undecodable-event``), or loses
+    its read permission (``unreadable-event-log``).  Neither error is a
+    refusal of its own, and the report must still name slot01's removal.
+    """
+
+    if fault == "unreadable-event-log" and os.geteuid() == 0:
+        pytest.skip("root reads a directory whatever its permission bits, so it is not unreadable")
+    project, repository, _remote = _queue_two_finished_slots_with_dead_owners(
+        tmp_path, monkeypatch
+    )
+    nested = checkout(project, slot="slot02") / "ignored" / "nested"
+    git(repository, "worktree", "add", "-b", "nested", str(nested))
+    config = wrkslots._load_config(str(project), "testhost")
+    events = wrkslots._event_directory(config)
+    original_remove = wrkslots._cmd_remove
+    injected: list[str] = []
+
+    def drift_then_fault(
+        args: argparse.Namespace,
+        *,
+        private_cleanup: wrkslots._PrivateCleanupContext | None = None,
+        validation_removal_proof: wrkslots._ValidationRemovalProof | None = None,
+        emit: bool = True,
+    ) -> int:
+        try:
+            return original_remove(
+                args,
+                private_cleanup=private_cleanup,
+                validation_removal_proof=validation_removal_proof,
+                emit=emit,
+            )
+        except wrkslots._TargetStorageDrift:
+            if args.slot == "slot02":
+                if fault == "undecodable-event":
+                    sequence = len(wrkslots._event_file_names(events)) + 1
+                    (events / f"{sequence:020d}.json").write_bytes(b'{"schema": "\xff\xfe"}\n')
+                else:
+                    events.chmod(0)
+                injected.append(args.slot)
+            raise
+
+    monkeypatch.setattr(wrkslots, "_cmd_remove", drift_then_fault)
+    try:
+        code = _retire_two(project)
+    finally:
+        events.chmod(0o755)
+
+    assert injected == ["slot02"]
+    assert code == 3
+    payload = json.loads(capsys.readouterr().out)
+    assert [row["slot"] for row in payload["removed"]] == ["slot01"]
+    [row] = payload["could_not_determine"]
+    assert row["slot"] == "slot02"
+    assert row["recovery_required"] is True
+    assert str(nested) in row["reason"]
+    assert f"cannot read the registry: {error}" in row["reason"]
+    assert "the batch continued" not in row["reason"]
+    assert payload["recovery_required"] is True
+    assert nested.is_dir()
+
+
 def test_finish_still_refuses_a_legacy_flat_handoff(tmp_path: Path) -> None:
     project, repository, _remote = make_project(
         tmp_path, worktrees_directory="worktrees/slots", layout="flat"

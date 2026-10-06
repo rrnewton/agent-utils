@@ -2695,6 +2695,130 @@ def test_a_pause_between_clock_readings_is_not_a_step_unless_it_persists(
         assert "realtime clock stepped back while the host evidence was read" in message
 
 
+@pytest.mark.parametrize(
+    ("monotonic", "realtime", "expected"),
+    [
+        pytest.param(
+            (0, 2), (5,), (5, 3, 5), id="bracketed-at-once"
+        ),
+        pytest.param(
+            (0, 600_000_000, 600_000_100, 600_000_102),
+            (10_000_000_000, 10_600_000_101),
+            (10_000_000_000, 9_999_999_999, 10_000_000_001),
+            id="paused-then-bracketed",
+        ),
+        pytest.param(
+            (0, 600_000_000, 600_000_100, 600_000_102),
+            (100_000_000, 10_600_000_101),
+            (100_000_000, -500_000_000, 10_000_000_001),
+            id="stepped-between-tries",
+        ),
+        pytest.param(
+            (0, 10_000_000, 20_000_000, 25_000_000, 30_000_000, 33_000_000),
+            (1_005_000_000, 1_022_000_000, 1_031_000_000),
+            (1_005_000_000, 998_000_000, 1_001_000_000),
+            id="paused-in-every-try",
+        ),
+    ],
+)
+def test_one_clock_reading_keeps_every_step_its_tries_saw(
+    monkeypatch: pytest.MonkeyPatch,
+    monotonic: tuple[int, ...],
+    realtime: tuple[int, ...],
+    expected: tuple[int, int, int],
+) -> None:
+    """A narrower try replaces a wider one's bounds only when the two agree.
+
+    Each try reads the realtime clock between two reads of the monotonic
+    clock.  ``bracketed-at-once`` is within the bracket, so one try is
+    taken.  ``paused-then-bracketed`` pauses 0.6 seconds in its first try,
+    whose bounds contain the second's, so the narrower bounds are kept.
+    ``stepped-between-tries`` reads the realtime clock ten seconds behind in
+    its first try: the tries' bounds share no value, so both are kept and
+    the step shows.  ``paused-in-every-try`` takes all three tries and keeps
+    the narrowest.  The realtime value is always the earliest read.
+    """
+
+    monotonic_reads = iter(monotonic)
+    realtime_reads = iter(realtime)
+    monkeypatch.setattr(
+        wrkslots, "_retained_handle_monotonic_ns", lambda: next(monotonic_reads)
+    )
+    monkeypatch.setattr(wrkslots, "_retained_handle_clock_ns", lambda: next(realtime_reads))
+
+    assert wrkslots._retained_handle_clocks() == expected
+    assert next(monotonic_reads, None) is None
+    assert next(realtime_reads, None) is None
+
+
+@pytest.mark.parametrize(
+    ("back_to", "change"),
+    [
+        pytest.param(
+            _SECOND // 5,
+            "may have been rewritten alike within one file timestamp tick",
+            id="back-into-the-window",
+        ),
+        pytest.param(
+            2 * _SECOND + _SECOND // 5,
+            "may have been rewritten alike while this host's realtime clock stepped back",
+            id="back-short-of-the-window",
+        ),
+    ],
+)
+def test_a_step_back_seen_by_a_wide_try_and_undone_before_a_narrow_one_is_alive(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, back_to: int, change: str
+) -> None:
+    """A step back that one try read is kept when a later, narrower try misses it.
+
+    Both clocks advance together on one simulated timeline, one microsecond
+    per read, with the realtime clock ten seconds after the handle's change
+    time.  When the later census first reads the realtime clock, the clock
+    has stepped back to ``back_to`` after the change time, as if the run
+    registered again alike there; the process then pauses for 0.6 seconds,
+    the step is undone, and the next try is bracketed within a microsecond.
+    ``back-into-the-window`` lands in the handle's timestamp window, so the
+    earliest realtime value read finds the handle recent;
+    ``back-short-of-the-window`` lands just outside it, so only the bounds
+    of the try that saw the step show that the clock fell.
+    """
+
+    project, tree = _prepare(tmp_path, monkeypatch, agent_liveness="dead")
+    handle = _write_run_handle(project, tree / "before")
+    stamp = handle.stat().st_ctime_ns
+    phase = _track_census_phase(monkeypatch)
+    timeline = [0]
+    stepped: list[int] = []
+
+    def tick() -> int:
+        timeline[0] += 1_000
+        return timeline[0]
+
+    def realtime() -> int:
+        if phase.census >= 2 and not stepped:
+            stepped.append(phase.census)
+            value = stamp + back_to + tick()
+            timeline[0] += 6 * _SECOND // 10
+            return value
+        return stamp + 10 * _SECOND + tick()
+
+    monkeypatch.setattr(wrkslots, "_retained_handle_clock_ns", realtime, raising=False)
+    monkeypatch.setattr(
+        wrkslots, "_retained_handle_monotonic_ns", lambda: 10**15 + tick(), raising=False
+    )
+    monkeypatch.setattr(wrkslots, "_user_systemd_snapshot", lambda: ())
+    config = wrkslots._load_config(str(project), "testhost")
+    states = wrkslots._validation_run_liveness_states(
+        config, wrkslots._load_active(config).slots
+    )
+
+    state, message = states[("testhost", "slot01", 1)]
+    assert stepped == [2]
+    assert state == "alive", message
+    assert f"for row slot01 {change} while the host evidence was read" in message
+    assert f"its unit {RUN_UNIT} may have been queued" in message
+
+
 @pytest.mark.parametrize("change", sorted(_HANDLE_CHANGES))
 def test_a_handle_that_changes_while_its_window_is_waited_out_is_alive(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, change: str
