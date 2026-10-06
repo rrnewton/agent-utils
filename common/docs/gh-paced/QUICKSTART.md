@@ -15,7 +15,8 @@ budget is used up, printing a loud warning line on stderr. It also:
 - pauses every call for 15 minutes after any rate-limit, abuse or HTTP 403
   response;
 - refuses write bodies larger than 8 KiB or containing long base64 runs,
-  whether they come from an argument, a file, stdin, one of gh's aliases, or
+  whether they come from an argument, a file, stdin, one of gh's aliases
+  (which gh-paced expands itself, so gh runs exactly what was checked), or
   the editor gh opens (gh-paced points gh's editor at a guard that checks the
   saved text);
 - refuses writes whose body gh would compose from something it reads later

@@ -28,9 +28,10 @@ per-account budgets shared by every process on the host through a locked state
 file, and delayed with a loud stderr warning when a budget is exhausted. It
 also watches GitHub's own account-wide numbers (GET /rate_limit), backs off
 for at least 15 minutes after any rate-limit, abuse or HTTP 403 response, and
-refuses oversized or base64-laden write bodies. It checks bodies given as
-arguments, files or stdin, bodies inside gh's own alias expansions, and text
-typed in the editor gh opens for a write (gh's editor is pointed at
+refuses oversized or base64-laden write bodies. It expands gh's own aliases
+itself and runs gh with the expansion, so the command checked is the command
+gh runs. It checks bodies given as arguments, files or stdin, and text typed
+in the editor gh opens for a write (gh's editor is pointed at
 `gh-paced --edit-guard`, which runs your editor and then checks the file).
 Body files are copied privately so gh sends exactly what was checked; bodies
 gh would compose without an editor (`pr create` prompts, --fill, templates)
@@ -75,7 +76,8 @@ DEFAULT BUDGETS (per host, per account; four hosts assumed)
   WRITE            1 per 30 s, burst 1, 30/hour, 1 in flight
   GIT_CREDENTIAL   1 per 10 s, burst 1, 120/hour
   LOCAL            unpaced, unaudited (help, completion, config, alias, ...)
-  Unknown commands (aliases, extensions) are WRITE, even with --help.
+  gh's aliases are expanded first and paced as the command they name.
+  Unknown commands (extensions) are WRITE, even with --help.
   `gh api --paginate` costs 10 tokens, for writes too. A call costing more
   than its class's burst (for example a SEARCH --paginate, or a --limit that
   needs more pages than the burst) is refused at once (exit 75): one gh call
@@ -168,7 +170,10 @@ OPTIONS
   --json  Print JSON (class, cost, command, reason, warnings, refusal).
 
 Runs nothing and touches no state or network. Classification depends only on
-the arguments and the configuration (for --paginate and watch costs).
+the arguments, the configuration (for --paginate and watch costs) and gh's own
+aliases (read from gh's config.yml), which are expanded first, as a real run
+expands them; the expansion is shown on an `alias:` line (an `alias` key with
+--json), and a command line a real run would refuse is shown as REFUSED.
 
 EXAMPLES
   gh-paced classify -- pr comment 5 --body hi
@@ -377,7 +382,8 @@ fn run_paced(account: Option<String>, real_gh: Option<String>, gh_args: Vec<Stri
         pid,
         start_ticks: state::process_start_ticks(pid).unwrap_or(0),
         nonce: state::new_nonce(now),
-        gh_aliases: crate::alias::load(&env_var),
+        gh_aliases: crate::alias::GhAliases::load(&env_var),
+        alias_note: None,
         editor_guard_env: crate::editor::guard_env(&env_var, self_exe.as_deref(), &account),
         self_exe,
         stderr_deadline: None,
@@ -567,8 +573,32 @@ fn run_classify(args: &[String]) -> i32 {
         Ok(c) => c,
         Err(code) => return code,
     };
-    let gh_args = &args[i + 1..];
-    let c = classify(gh_args, &cfg);
+    let mut gh_args = args[i + 1..].to_vec();
+    let mut alias_note = None;
+    let mut alias_refusal = None;
+    match crate::alias::GhAliases::load(&env_var).resolve(&gh_args) {
+        crate::alias::Resolution::NotAlias => {}
+        crate::alias::Resolution::Expanded { argv, chain } => {
+            alias_note = Some(format!(
+                "`{}` -> `{}`",
+                chain.join("` -> `"),
+                argv.join(" ")
+            ));
+            gh_args = argv;
+        }
+        crate::alias::Resolution::Shell { argv, chain } => {
+            alias_note = Some(format!(
+                "shell alias `{}`, which gh runs with `sh -c`",
+                chain.join("` -> `")
+            ));
+            gh_args = argv;
+        }
+        crate::alias::Resolution::Refused { reason, .. } => alias_refusal = Some(reason),
+    }
+    let mut c = classify(&gh_args, &cfg);
+    if let Some(r) = alias_refusal {
+        c.refusal = Some(r);
+    }
     if json {
         let v = serde_json::json!({
             "class": c.class.name(),
@@ -577,6 +607,7 @@ fn run_classify(args: &[String]) -> i32 {
             "reason": c.reason,
             "warnings": c.warnings,
             "refusal": c.refusal,
+            "alias": alias_note,
         });
         println!("{}", serde_json::to_string_pretty(&v).unwrap_or_default());
     } else {
@@ -584,6 +615,9 @@ fn run_classify(args: &[String]) -> i32 {
         println!("cost:    {}", c.cost);
         println!("command: {}", c.command);
         println!("reason:  {}", c.reason);
+        if let Some(a) = &alias_note {
+            println!("alias:   {a}");
+        }
         for w in &c.warnings {
             println!("warning: {w}");
         }

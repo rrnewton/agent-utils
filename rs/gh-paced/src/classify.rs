@@ -702,6 +702,22 @@ fn lead(args: &[String]) -> Lead {
     }
 }
 
+/// The built-in command named `word` beneath the built-in command path `path` (canonical names,
+/// empty for the root), as cobra's `findNext` matches it (name or cobra alias, exact case).
+/// Returns its canonical name and whether gh can add a user alias beneath it: only commands
+/// that are not runnable (a group or a help topic) take aliases. `None`: `path` is not a
+/// built-in path, or `word` is not one of its built-in children.
+pub fn builtin_child(path: &[&str], word: &str) -> Option<(&'static str, bool)> {
+    let mut children: &[Node] = ROOT;
+    for p in path {
+        children = children.iter().find(|n| n.name == *p)?.children;
+    }
+    children
+        .iter()
+        .find(|n| n.name == word || n.aliases.contains(&word))
+        .map(|n| (n.name, matches!(n.kind, NodeKind::Group | NodeKind::Topic)))
+}
+
 /// `--help` as the first flag, or `-h` as the last token, after nothing but bare words.
 fn is_help_request(args: &[String]) -> bool {
     match args.iter().position(|t| is_flag(t)) {
