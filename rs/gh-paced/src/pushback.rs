@@ -31,18 +31,29 @@ const OVERLAP: usize = 4096;
 /// Longest stdout line kept while looking for header lines; longer lines are body text.
 const MAX_HEADER_LINE: usize = 8192;
 
-/// Largest `Retry-After` honoured, seconds (1 day). A larger value, including one too long to
-/// represent, is read as this, so the cooldown it starts stays long but finite.
-pub const MAX_RETRY_AFTER_SECS: f64 = 86_400.0;
+/// Longest `Retry-After` gh-paced counts down, seconds (365 days). Any value up to this is
+/// honoured in full. A longer one, including one too long to represent, is never shortened to
+/// fit: it starts a cooldown with no end time ([`NO_END`]), and every paced call is refused until
+/// a person removes that cooldown from the state files.
+pub const MAX_RETRY_AFTER_SECS: f64 = 31_536_000.0;
 
-/// A `Retry-After` value in seconds: `None` unless it is a non-negative number, and at most
-/// [`MAX_RETRY_AFTER_SECS`].
+/// The cooldown length, and the cooldown end time (`until`), of a cooldown with no end time.
+/// Adding it to any clock reading gives the same value, so such a cooldown never expires.
+pub const NO_END: f64 = f64::MAX;
+
+/// Whether a cooldown ending at `until` has no end time (see [`NO_END`]).
+pub fn has_no_end(until: f64) -> bool {
+    until >= NO_END
+}
+
+/// A `Retry-After` value in seconds: `None` unless it is a non-negative number. A number too
+/// large to represent reads as infinity, which [`Scanner::verdict`] turns into [`NO_END`].
 fn retry_after_secs(text: &str) -> Option<f64> {
     let n = text.parse::<f64>().ok()?;
     if n.is_nan() || n < 0.0 {
         return None;
     }
-    Some(n.min(MAX_RETRY_AFTER_SECS))
+    Some(n)
 }
 
 /// What the scanner saw.
@@ -92,10 +103,28 @@ struct HeaderBlock {
 /// The cooldown a scan calls for.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Pushback {
-    /// Seconds to pause every paced call for this account on this host.
+    /// Seconds to pause every paced call for this account on this host; [`NO_END`] when GitHub
+    /// asked for longer than [`MAX_RETRY_AFTER_SECS`].
     pub cooldown_secs: f64,
     /// Matched pattern names, comma separated.
     pub reason: String,
+}
+
+impl Pushback {
+    /// When the cooldown ends, for a pushback seen at `now`: [`NO_END`] for a cooldown with no
+    /// end time.
+    pub fn until(&self, now: f64) -> f64 {
+        if has_no_end(self.cooldown_secs) {
+            NO_END
+        } else {
+            now + self.cooldown_secs
+        }
+    }
+
+    /// Whether this cooldown has no end time.
+    pub fn has_no_end(&self) -> bool {
+        has_no_end(self.cooldown_secs)
+    }
 }
 
 fn find_all(hay: &[u8], needle: &[u8]) -> Vec<usize> {
@@ -377,7 +406,9 @@ impl Scanner {
 
     /// The cooldown this output calls for, if any: `max(Retry-After, cooldown_secs)` for a
     /// rate-limit signal (wording, HTTP 429, `Retry-After`, or `X-RateLimit-Remaining: 0`),
-    /// `plain_403_cooldown_secs` for an HTTP 403 with no rate-limit signal.
+    /// `plain_403_cooldown_secs` for an HTTP 403 with no rate-limit signal. A `Retry-After`
+    /// longer than [`MAX_RETRY_AFTER_SECS`] gives a cooldown with no end time ([`NO_END`]),
+    /// never a shorter one.
     pub fn verdict(&self, cfg: &Config) -> Option<Pushback> {
         let limit_signal = self.secondary
             || self.rate_limit
@@ -389,6 +420,16 @@ impl Scanner {
         let reason = self.matched().join(", ");
         if limit_signal {
             let secs = self.retry_after.unwrap_or(0.0).max(cfg.cooldown_secs);
+            if secs > MAX_RETRY_AFTER_SECS {
+                return Some(Pushback {
+                    cooldown_secs: NO_END,
+                    reason: format!(
+                        "{reason}; Retry-After is longer than the {} s (365 days) gh-paced \
+                         counts down, so this cooldown has no end time",
+                        MAX_RETRY_AFTER_SECS as u64
+                    ),
+                });
+            }
             return Some(Pushback {
                 cooldown_secs: secs,
                 reason,
@@ -443,24 +484,40 @@ mod tests {
         assert_eq!(s.verdict(&cfg).expect("pushback").cooldown_secs, 900.0);
     }
 
-    /// A `Retry-After` too large to represent (400 nines parse to infinity) is capped at one
-    /// day, on stderr and in headers, so the cooldown stays long and the state stays finite.
+    /// A long `Retry-After` is never shortened. Up to 365 days it is honoured in full (two days
+    /// once read as one day); a longer one, or one too large to represent (400 nines parse to
+    /// infinity), gives a cooldown with no end time, on stderr and in headers.
     #[test]
-    fn a_huge_retry_after_is_capped_not_infinite() {
+    fn a_long_retry_after_is_never_shortened() {
         let cfg = Config::default();
-        let nines = "9".repeat(400);
-        let s = scan(&[&format!("HTTP 429\nRetry-After: {nines}\n")]);
-        assert_eq!(s.retry_after, Some(MAX_RETRY_AFTER_SECS));
+        let s = headers(&["HTTP/2.0 429 Too Many Requests\r\nRetry-After: 172800\r\n\r\n"]);
+        assert_eq!(s.retry_after, Some(172_800.0));
+        let v = s.verdict(&cfg).expect("pushback");
+        assert_eq!(v.cooldown_secs, 172_800.0);
+        assert!(!v.has_no_end());
+        assert_eq!(v.until(1000.0), 1000.0 + 172_800.0);
+        let s = scan(&["HTTP 429\nRetry-After: 31536000\n"]);
         assert_eq!(
             s.verdict(&cfg).expect("pushback").cooldown_secs,
             MAX_RETRY_AFTER_SECS
         );
-        let s = headers(&[&format!(
-            "HTTP/2.0 429 Too Many Requests\r\nRetry-After: {nines}\r\n\r\n"
-        )]);
-        assert_eq!(s.retry_after, Some(MAX_RETRY_AFTER_SECS));
-        let s = headers(&["HTTP/2.0 429 Too Many Requests\r\nRetry-After: 1e400\r\n\r\n"]);
-        assert_eq!(s.retry_after, Some(MAX_RETRY_AFTER_SECS));
+        let nines = "9".repeat(400);
+        for s in [
+            scan(&["HTTP 429\nRetry-After: 31536001\n"]),
+            scan(&[&format!("HTTP 429\nRetry-After: {nines}\n")]),
+            headers(&[&format!(
+                "HTTP/2.0 429 Too Many Requests\r\nRetry-After: {nines}\r\n\r\n"
+            )]),
+            headers(&["HTTP/2.0 429 Too Many Requests\r\nRetry-After: 1e400\r\n\r\n"]),
+        ] {
+            let v = s.verdict(&cfg).expect("pushback");
+            assert!(v.has_no_end(), "{s:?}");
+            assert_eq!(v.cooldown_secs, NO_END);
+            assert!(v.reason.contains("no end time"), "{}", v.reason);
+            // The end time is the same, finite value whenever the pushback is seen.
+            assert_eq!(v.until(1_791_126_252.0), NO_END);
+            assert!(has_no_end(v.until(0.0)) && v.until(0.0).is_finite());
+        }
         // An ordinary value is unchanged.
         let s = scan(&["HTTP 429\nRetry-After: 3600\n"]);
         assert_eq!(s.retry_after, Some(3600.0));

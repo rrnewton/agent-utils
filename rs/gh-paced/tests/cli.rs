@@ -1083,6 +1083,84 @@ fn include_headers_on_stdout_set_the_cooldown() {
     );
 }
 
+/// A long `Retry-After` is never shortened: two days are recorded as two days (one day before),
+/// and a wait longer than gh-paced counts down (365 days) starts a cooldown with no end time,
+/// which refuses every later paced call with a clear message instead of ending early.
+#[test]
+fn a_long_retry_after_is_never_shortened() {
+    let state = |sb: &Sandbox, name: &str| -> serde_json::Value {
+        serde_json::from_str(&std::fs::read_to_string(sb.path(name)).unwrap()).unwrap()
+    };
+    let sb = Sandbox::new("retry-after-long", FAST);
+    let before = epoch_now();
+    let two_days = "HTTP/2.0 429 Too Many Requests\r\nRetry-After: 172800\r\n\r\n{}";
+    let o = sb.run(
+        &["api", "-i", "repos/o/r"],
+        &[("FAKE_GH_STDOUT", two_days), ("FAKE_GH_EXIT", "1")],
+    );
+    assert_eq!(o.status.code(), Some(1), "{}", stderr(&o));
+    let until = state(&sb, "state/test.json")["cooldown"]["until"]
+        .as_f64()
+        .unwrap();
+    assert!(
+        until - before >= 172_799.0 && until - before < 172_900.0,
+        "cooldown {} s",
+        until - before
+    );
+    let o = sb.run(&["api", "repos/o/r"], &[]);
+    assert_eq!(o.status.code(), Some(75), "{}", stderr(&o));
+    assert_eq!(sb.starts().len(), 1, "{:?}", sb.starts());
+
+    let sb = Sandbox::new("retry-after-no-end", FAST);
+    let never = "HTTP/2.0 429 Too Many Requests\r\nRetry-After: 99999999999\r\n\r\n{}";
+    let o = sb.run(
+        &["api", "-i", "repos/o/r"],
+        &[("FAKE_GH_STDOUT", never), ("FAKE_GH_EXIT", "1")],
+    );
+    assert_eq!(o.status.code(), Some(1), "{}", stderr(&o));
+    assert!(
+        stderr(&o).contains("refused from now on: the cooldown has no end time"),
+        "{}",
+        stderr(&o)
+    );
+    let until = state(&sb, "state/test.json")["cooldown"]["until"].as_f64();
+    assert_eq!(until, Some(f64::MAX), "the cooldown never ends by itself");
+    let until = state(&sb, "state/test.cooldown")["until"].as_f64();
+    assert_eq!(until, Some(f64::MAX));
+    let o = sb.run(&["api", "repos/o/r"], &[]);
+    assert_eq!(o.status.code(), Some(75), "{}", stderr(&o));
+    assert!(
+        stderr(&o).contains("the cooldown has no end time"),
+        "{}",
+        stderr(&o)
+    );
+    assert_eq!(sb.starts().len(), 1, "gh ran: {:?}", sb.starts());
+    let status = |json: bool| {
+        let mut c = Command::new(BIN);
+        c.env_clear()
+            .env("HOME", sb.path("home"))
+            .env("GH_PACED_STATE_DIR", sb.path("state"))
+            .env("GH_PACED_CONFIG", sb.path("config.json"))
+            .args(["status", "--account", "test"]);
+        if json {
+            c.arg("--json");
+        }
+        c.output().unwrap()
+    };
+    let o = status(true);
+    assert_eq!(o.status.code(), Some(0), "{}", stderr(&o));
+    let v: serde_json::Value = serde_json::from_slice(&o.stdout).unwrap();
+    assert!(v["cooldown"]["remaining_secs"].is_null(), "{v}");
+    assert_eq!(v["cooldown"]["until"], "no end time", "{v}");
+    let o = status(false);
+    assert_eq!(o.status.code(), Some(0), "{}", stderr(&o));
+    assert!(
+        stdout(&o).contains("COOLDOWN: no end time"),
+        "{}",
+        stdout(&o)
+    );
+}
+
 /// A consumer that reads gh's output late loses none of it. The fake gh writes its output and exits
 /// at once while the consumer has not read a byte; it starts reading 4 s later, long after gh has
 /// gone. 120 KiB is more than one 64 KiB pipe holds, so part of it is still inside gh-paced when gh
@@ -1918,21 +1996,24 @@ fn flow_mapping_aliases_and_aliases_after_flags_are_found() {
     assert_eq!(starts[0].1, "issue comment 7 --body-file - -R o/r");
 }
 
-/// When gh's configuration cannot be read, a word that could name an alias is refused with the
-/// configuration exit status, and built-in commands still run.
+/// When gh's configuration cannot be read, every command is refused with the configuration exit
+/// status, gh's own commands included: any word may be an alias in that file. Before, built-in
+/// commands ran. A line that names no command still runs.
 #[test]
-fn an_unreadable_gh_configuration_refuses_only_possible_aliases() {
+fn an_unreadable_gh_configuration_refuses_every_command() {
     let sb = Sandbox::new("alias-unreadable", FAST);
     write_gh_config(&sb, "aliases:\n  up: !!str api -X POST x --input -\n");
-    let o = sb.run(&["up"], &[]);
-    assert_eq!(o.status.code(), Some(78), "{}", stderr(&o));
-    assert!(
-        stderr(&o).contains("gh's configuration cannot be read"),
-        "{}",
-        stderr(&o)
-    );
+    for args in [&["up"][..], &["pr", "view", "1"][..]] {
+        let o = sb.run(args, &[]);
+        assert_eq!(o.status.code(), Some(78), "{args:?}: {}", stderr(&o));
+        assert!(
+            stderr(&o).contains("gh's configuration cannot be read"),
+            "{args:?}: {}",
+            stderr(&o)
+        );
+    }
     assert!(sb.starts().is_empty(), "gh ran: {:?}", sb.starts());
-    let o = sb.run(&["pr", "view", "1"], &[]);
+    let o = sb.run(&["--version"], &[]);
     assert_eq!(o.status.code(), Some(0), "{}", stderr(&o));
     assert_eq!(sb.starts().len(), 1, "{:?}", sb.starts());
     // An ambiguous position (a flag of unknown arity before the alias name) is refused too.
@@ -1940,6 +2021,85 @@ fn an_unreadable_gh_configuration_refuses_only_possible_aliases() {
     let o = sb.run(&["issue", "--flag", "up", "x"], &[]);
     assert_eq!(o.status.code(), Some(64), "{}", stderr(&o));
     assert_eq!(sb.starts().len(), 1, "{:?}", sb.starts());
+}
+
+/// gh adds its `help` command after the aliases, so an alias named `help` can run in its place.
+/// Before, when the configuration could not be read (a `!!str` tag, a NEL inside a quoted
+/// expansion, a `GH_CONFIG_DIR` that is not UTF-8), gh-paced took `gh help` for gh's own
+/// command and ran it without admission, and gh ran the watch loop.
+#[test]
+fn a_help_alias_in_an_unreadable_configuration_is_refused() {
+    use std::os::unix::ffi::OsStrExt;
+    let sb = Sandbox::new("alias-help", FAST);
+    for text in [
+        "aliases:\n  help: !!str 'run watch 99 --interval 1'\n",
+        "aliases:\n  help: \"run\u{85}    watch 99 --interval 1\"\n",
+    ] {
+        write_gh_config(&sb, text);
+        for args in [&["help"][..], &["help", "x"][..]] {
+            let o = sb.run(args, &[]);
+            assert_eq!(
+                o.status.code(),
+                Some(78),
+                "{text:?} {args:?}: {}",
+                stderr(&o)
+            );
+            assert!(
+                stderr(&o).contains("gh's configuration cannot be read"),
+                "{text:?} {args:?}: {}",
+                stderr(&o)
+            );
+        }
+    }
+    let dir = sb.path("").join(std::ffi::OsStr::from_bytes(b"cfg-\xff"));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("config.yml"),
+        "aliases:\n  help: run watch 99 --interval 1\n",
+    )
+    .unwrap();
+    let o = sb
+        .cmd(&["help"])
+        .env("GH_CONFIG_DIR", &dir)
+        .output()
+        .unwrap();
+    assert_eq!(o.status.code(), Some(78), "{}", stderr(&o));
+    assert!(sb.starts().is_empty(), "gh ran: {:?}", sb.starts());
+}
+
+/// A regular file in gh's extensions directory makes gh register no extensions, so an alias named
+/// after an installed extension runs. Before, when the configuration could not be read, gh-paced
+/// dropped what it knew about that and ran `gh myext` as the extension, and gh ran the watch.
+#[test]
+fn an_extension_name_in_an_unreadable_configuration_is_refused() {
+    let sb = Sandbox::new("alias-ext-unreadable", FAST);
+    let cfg = sb.path("cfg");
+    let exts = sb.path("data/gh/extensions");
+    std::fs::create_dir_all(&cfg).unwrap();
+    std::fs::create_dir_all(exts.join("gh-myext")).unwrap();
+    std::fs::write(exts.join("gh-bad"), "").unwrap();
+    std::fs::write(
+        cfg.join("config.yml"),
+        "aliases:\n  myext: !!str 'run watch 99 --interval 1'\n",
+    )
+    .unwrap();
+    let data = sb.path("data");
+    let env = [
+        ("GH_CONFIG_DIR", cfg.to_str().unwrap()),
+        ("XDG_DATA_HOME", data.to_str().unwrap()),
+    ];
+    let o = sb.run(&["myext"], &env);
+    assert_eq!(o.status.code(), Some(78), "{}", stderr(&o));
+    assert!(
+        stderr(&o).contains("gh's configuration cannot be read"),
+        "{}",
+        stderr(&o)
+    );
+    // Without the stray file gh registers the extension, but the file still cannot be read.
+    std::fs::remove_file(exts.join("gh-bad")).unwrap();
+    let o = sb.run(&["myext"], &env);
+    assert_eq!(o.status.code(), Some(78), "{}", stderr(&o));
+    assert!(sb.starts().is_empty(), "gh ran: {:?}", sb.starts());
 }
 
 /// gh names an alias command after the first space-separated word of its last name word, so
@@ -2019,9 +2179,10 @@ fn a_configuration_with_line_breaks_gh_reads_differently_is_refused() {
 }
 
 /// `GH_CONFIG_DIR` holding bytes that are not UTF-8 is still where gh reads its aliases; before,
-/// gh-paced took it as unset, read `$HOME/.config/gh` instead and passed the alias through.
+/// gh-paced took it as unset, read `$HOME/.config/gh` instead and passed the alias through. Every
+/// command is refused, as for any configuration that cannot be read.
 #[test]
-fn a_gh_config_dir_that_is_not_utf8_refuses_possible_aliases() {
+fn a_gh_config_dir_that_is_not_utf8_refuses_every_command() {
     use std::os::unix::ffi::OsStrExt;
     let sb = Sandbox::new("alias-nonutf8", FAST);
     let dir = sb.path("").join(std::ffi::OsStr::from_bytes(b"cfg-\xff"));
@@ -2040,8 +2201,8 @@ fn a_gh_config_dir_that_is_not_utf8_refuses_possible_aliases() {
         .env("GH_CONFIG_DIR", &dir)
         .output()
         .unwrap();
-    assert_eq!(o.status.code(), Some(0), "{}", stderr(&o));
-    assert_eq!(sb.starts().len(), 1, "{:?}", sb.starts());
+    assert_eq!(o.status.code(), Some(78), "{}", stderr(&o));
+    assert!(sb.starts().is_empty(), "gh ran: {:?}", sb.starts());
 }
 
 /// An installed extension runs instead of an alias of the same name, as in gh; before, gh-paced

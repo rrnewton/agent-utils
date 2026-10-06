@@ -4,8 +4,11 @@
 //! `upload: api -X POST repos/o/r/issues/$1/comments --input -`, `gh upload 7` sends stdin as a
 //! request body, and with `w: run watch 99`, `gh w` polls. gh-paced therefore resolves the alias
 //! the way gh does and runs gh with the expanded command line. Classification, pacing, the watch
-//! gate, the content guard and the file snapshots all apply to the command gh actually runs, and
-//! gh never sees the alias name, so it cannot expand it differently.
+//! gate, the content guard and the file snapshots all apply to that expanded command line, and gh
+//! never sees the alias name. gh still reads its configuration again when it starts, so the
+//! command checked is the command gh runs only while that configuration stays as gh-paced read
+//! it; a configuration rewritten during the call is outside what gh-paced guards against (see
+//! the design note).
 //!
 //! A shell alias (`!...`) is passed on as an opaque WRITE: gh runs it with `sh -c`, and a `gh` that
 //! the shell command runs is a new gh-paced invocation when gh-paced is installed in front of `gh`
@@ -13,7 +16,8 @@
 //!
 //! The lookup must never miss an alias that gh would find, because gh would then expand it
 //! unchecked. When gh-paced cannot tell, it refuses instead of guessing: gh's configuration file
-//! cannot be read or uses YAML this reader does not handle, two aliases share a name, where the
+//! cannot be read or uses YAML this reader does not handle (every command line that names a
+//! command is refused then, gh's own commands included), two aliases share a name, where the
 //! alias name sits depends on how gh parses a flag, an alias shares its name with an extension,
 //! or aliases nest more than [`MAX_ALIAS_DEPTH`] deep.
 
@@ -115,8 +119,10 @@ fn list_extensions(dir: &Path) -> Option<Extensions> {
         };
         let simple = match entry.file_type() {
             Ok(t) if t.is_symlink() => true,
-            // gh reads a directory whose `manifest.yml` it can stat as a binary extension, and
-            // fails its whole listing if that file does not parse.
+            // A directory with a `manifest.yml` is a binary extension. gh-paced does not model
+            // whether gh can load it, so it counts it as uncertain. That over-refuses: such a
+            // directory can make gh-paced refuse an alias that gh would in fact shadow with the
+            // extension. This is a documented open item, not a pacing bypass.
             Ok(t) if t.is_dir() => std::fs::metadata(entry.path().join("manifest.yml")).is_err(),
             _ => false,
         };
@@ -176,7 +182,8 @@ pub struct GhAliases {
     /// Parent words of alias names that are not built-in gh commands this table knows: a command
     /// line reaching one of these words is refused, since gh may know the command.
     unplaced: Vec<(String, String)>,
-    /// Why gh's configuration cannot be read; any word that could name an alias is refused then.
+    /// Why gh's configuration cannot be read. Every command word is refused then: any of them,
+    /// gh's own commands, extensions and `help` included, can be an alias in that file.
     unreadable: Option<String>,
     /// The installed extensions, or `None` when they cannot be listed.
     extensions: Option<Vec<String>>,
@@ -320,9 +327,10 @@ impl GhAliases {
         });
         match parsed {
             Ok(pairs) => GhAliases::place(pairs, listed),
+            // Nothing else is consulted when the file cannot be read (see `walk`), so neither the
+            // extension list nor whether gh registers it is kept.
             Err(why) => GhAliases {
                 unreadable: Some(why),
-                extensions: listed.map(|e| e.words),
                 ..GhAliases::default()
             },
         }
@@ -331,7 +339,7 @@ impl GhAliases {
     /// [`GhAliases::load`], after checking that none of the variables gh finds its files through
     /// (`raw`, the environment as the operating system gives it) holds bytes that are not UTF-8.
     /// gh would use such a value as a path; gh-paced cannot, so it treats the configuration as
-    /// unreadable (refusing any word that could name an alias) instead of as unset.
+    /// unreadable (refusing every command word, as for any unreadable file) instead of as unset.
     pub fn load_checked(
         env: &dyn Fn(&str) -> Option<String>,
         raw: &dyn Fn(&str) -> Option<std::ffi::OsString>,
@@ -584,6 +592,24 @@ impl GhAliases {
                 continue;
             };
             let w = tokens[i].as_str();
+            if let Some(why) = &self.unreadable {
+                // Any word can be an alias in a file gh-paced cannot read: gh adds `help` and its
+                // completion commands after the aliases, an alias whose name is quoted to include
+                // a space (`'pr x'`) adds a second command named `pr`, and an alias named after
+                // an extension runs whenever gh registers no extensions. So not even gh's own
+                // commands or the installed extensions are known to run as themselves.
+                push(
+                    Hit::Doubt {
+                        reason: format!(
+                            "gh's configuration cannot be read ({why}), so whether `{w}` runs as \
+                             itself or as an alias of that name is not known"
+                        ),
+                        config: true,
+                    },
+                    out,
+                );
+                continue;
+            }
             let here: Vec<usize> = (0..self.entries.len())
                 .filter(|&k| self.entries[k].parent == path && self.entries[k].word == w)
                 .collect();
@@ -662,19 +688,6 @@ impl GhAliases {
                              would sit beneath it if gh knows it"
                         ),
                         config: false,
-                    },
-                    out,
-                );
-                continue;
-            }
-            if let Some(why) = &self.unreadable {
-                push(
-                    Hit::Doubt {
-                        reason: format!(
-                            "gh's configuration cannot be read ({why}), so whether `{w}` is an \
-                             alias is not known"
-                        ),
-                        config: true,
                     },
                     out,
                 );
@@ -1950,8 +1963,8 @@ http_unix_socket:
         }
     }
 
-    /// A lookup variable that is not UTF-8 is a path gh uses and gh-paced cannot: possible
-    /// aliases are refused as unreadable configuration, never resolved as if it were unset.
+    /// A lookup variable that is not UTF-8 is a path gh uses and gh-paced cannot: every command
+    /// is refused as unreadable configuration, never resolved as if it were unset.
     #[test]
     fn a_lookup_variable_that_is_not_utf8_makes_the_configuration_unreadable() {
         use std::os::unix::ffi::OsStrExt;
@@ -1966,11 +1979,13 @@ http_unix_socket:
             };
             let a = GhAliases::load_checked(&env, &raw);
             assert!(a.unreadable().is_some_and(|w| w.contains(bad)), "{bad}");
-            assert!(matches!(
-                a.resolve(&argv("up")),
-                Resolution::Refused { config: true, .. }
-            ));
-            assert_eq!(a.resolve(&argv("pr view 1")), Resolution::NotAlias);
+            for line in ["up", "pr view 1", "help"] {
+                assert!(matches!(
+                    a.resolve(&argv(line)),
+                    Resolution::Refused { config: true, .. }
+                ));
+            }
+            assert_eq!(a.resolve(&argv("--version")), Resolution::NotAlias);
         }
         let env = |k: &str| (k == "HOME").then(|| "/nonexistent-gh-paced".to_string());
         let raw = |k: &str| env(k).map(Into::into);
@@ -2155,24 +2170,40 @@ http_unix_socket:
         assert_eq!(odd.resolve(&argv("pr view 1")), Resolution::NotAlias);
     }
 
+    /// With a configuration gh-paced cannot read, every command word is refused: gh's own
+    /// commands (one renamed alias can add a second `pr`), `help` (added after the aliases) and
+    /// an installed extension (an alias of its name runs when gh registers no extensions) may all
+    /// be aliases there. A line without a command word still runs.
     #[test]
-    fn an_unreadable_configuration_refuses_only_possible_aliases() {
+    fn an_unreadable_configuration_refuses_every_command() {
         let a = GhAliases {
             unreadable: Some("bad YAML".to_string()),
             extensions: Some(vec!["myext".to_string()]),
             ..GhAliases::default()
         };
-        assert_eq!(a.resolve(&argv("pr view 1")), Resolution::NotAlias);
-        assert_eq!(a.resolve(&argv("api repos/o/r")), Resolution::NotAlias);
-        assert_eq!(a.resolve(&argv("myext x")), Resolution::NotAlias);
-        assert!(matches!(
-            a.resolve(&argv("upload")),
-            Resolution::Refused { config: true, .. }
-        ));
-        assert!(matches!(
-            a.resolve(&argv("issue upload")),
-            Resolution::Refused { config: true, .. }
-        ));
+        for line in [
+            "pr view 1",
+            "api repos/o/r",
+            "myext x",
+            "help",
+            "help run",
+            "__complete pr",
+            "auth git-credential get",
+            "-R o/r pr view 1",
+            "upload",
+            "issue upload",
+        ] {
+            assert!(
+                matches!(
+                    a.resolve(&argv(line)),
+                    Resolution::Refused { config: true, .. }
+                ),
+                "{line}"
+            );
+        }
+        for line in ["", "--version", "--help"] {
+            assert_eq!(a.resolve(&argv(line)), Resolution::NotAlias, "{line:?}");
+        }
     }
 
     #[test]
@@ -2259,11 +2290,13 @@ http_unix_socket:
         .unwrap();
         let a = GhAliases::load(&env);
         assert!(a.unreadable().is_some());
-        assert!(matches!(
-            a.resolve(&argv("up")),
-            Resolution::Refused { config: true, .. }
-        ));
-        assert_eq!(a.resolve(&argv("myext")), Resolution::NotAlias);
+        // Unreadable: even the registered extension may be an alias gh runs instead.
+        for line in ["up", "myext", "pr view 1"] {
+            assert!(matches!(
+                a.resolve(&argv(line)),
+                Resolution::Refused { config: true, .. }
+            ));
+        }
         std::fs::write(dir.join("cfg/config.yml"), b"aliases:\n  up: \xff\n").unwrap();
         assert!(GhAliases::load(&env).unreadable().is_some());
         let _ = std::fs::remove_dir_all(&dir);
