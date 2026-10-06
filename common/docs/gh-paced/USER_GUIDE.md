@@ -129,8 +129,9 @@ gh-paced's own exit statuses are listed under [Exit status](#exit-status).
 Each call gets exactly one class. Each class except LOCAL has its own token
 bucket and hourly window. `gh-paced classify -- <args>` prints the class, the
 cost, and the reason for any command line, without running it. It shows the
-refusals decided from the command line alone; a real run can still refuse for
-the body, the budget or the wait.
+refusals decided from the command line, the configuration and gh's aliases
+(every command, when gh's `config.yml` cannot be read); a real run can still
+refuse for the body, the budget or the wait.
 
 | Class | Covers | Cost |
 | --- | --- | --- |
@@ -336,8 +337,12 @@ reads is still found. It looks for:
 - `secondary rate limit`, `rate limit` (including `API rate limit exceeded`),
   `HTTP 429`, the word `abuse`, `submitted too quickly`;
 - `HTTP 403` with none of the above;
-- a `Retry-After: N` value (the largest one seen, counted as at most 86,400 s,
-  so an absurd value still pauses the account for a day instead of forever).
+- a `Retry-After: N` value (the largest one seen). It is honoured in full up
+  to 31,536,000 s (365 days). A longer value, or one too long to represent, is
+  never shortened: it starts a cooldown with no end time, every paced call is
+  refused (exit 75) with a message saying so, and the cooldown ends only when a
+  person removes `<account>.cooldown` and the `cooldown` entry of
+  `<account>.json` from the state directory.
 
 For `gh api -i/--include`, gh prints the HTTP status line and response headers
 on **stdout** instead. For that form only, gh-paced also reads stdout as it
@@ -527,9 +532,14 @@ guessing:
   in the indentation, a key set twice, a byte order mark after the first
   character, the NEL, LS or PS line separators, control characters, a `---`
   or `...` document marker after the first setting), or one of `GH_CONFIG_DIR`,
-  `XDG_CONFIG_HOME`, `XDG_DATA_HOME` and `HOME` is not UTF-8: any word that
-  could name an alias is refused with exit 78; gh's own commands and installed
-  extensions still run;
+  `XDG_CONFIG_HOME`, `XDG_DATA_HOME` and `HOME` is not UTF-8: every command
+  line that names a command is refused with exit 78, gh's own commands and
+  installed extensions included, because any of them can be an alias in that
+  file (gh adds `help` after the aliases, a quoted name such as `"'pr x'"`
+  gives gh a second `pr`, and an alias named like an extension runs when gh
+  registers no extensions). Only a line naming no command, such as
+  `gh --version`, still runs. That includes `gh auth git-credential`, so git
+  cannot use gh as its credential helper until the file or variable is fixed;
 - the position of the alias name depends on whether an unfamiliar flag before
   it takes a value (`gh issue --some-flag publish`): exit 64; put the alias
   name right after the command words;
@@ -852,7 +862,7 @@ other process is stuck.
 | 65 | refused by the write content guard: body too large, base64-looking content (in an argument, a file, stdin, or one of gh's alias expansions), a body gh would compose itself, or a body file that cannot be copied for inspection. Text refused by the editor guard makes the editor fail instead, so gh exits with its own status (usually 1) and sends nothing |
 | 64 | usage error, or a refused command shape (a watch without `GH_PACED_ALLOW_WATCH=1`, a watch interval under 30 s, or one that is not a positive whole number, or one of gh's aliases gh-paced cannot resolve for certain; see [gh's own aliases](#ghs-own-aliases)) |
 | 70 | internal error: the pacing state cannot be read or written, or its lock was not obtained within `GH_PACED_LOCK_WAIT` |
-| 78 | configuration error, `--real-gh` resolves to gh-paced, or gh's `config.yml` cannot be read and the command line may name one of gh's aliases |
+| 78 | configuration error, `--real-gh` resolves to gh-paced, or gh's `config.yml` cannot be read and the command line names a command |
 | 127 | the real gh cannot be found or run |
 
 A caller that sees 75 should not retry immediately. The message says when the
