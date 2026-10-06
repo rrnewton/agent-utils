@@ -1345,6 +1345,7 @@ def test_scope_probe_against_a_refusing_systemd_run_tries_two_unit_names(
     assert len(lines) == 2
     assert f"--unit=dagrun-probe-{os.getpid()}-1" in lines[0].split()
     assert f"--unit=dagrun-probe-{os.getpid()}-2" in lines[1].split()
+    assert all("--collect" in line.split() for line in lines)
     err = capsys.readouterr().err
     for attempt in (1, 2):
         assert (

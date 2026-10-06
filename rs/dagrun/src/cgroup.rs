@@ -991,24 +991,84 @@ fn systemd_scope_available() -> bool {
     *PROBE.get_or_init(|| probe_with_one_retry(run_scope_probe, SCOPE_PROBE_RETRY_BACKOFF))
 }
 
+/// Longest one scope probe may take. `systemd-run` waits on the user manager, and a manager that
+/// never answers would otherwise hang the run before its first step.
+const SCOPE_PROBE_TIMEOUT: Duration = Duration::from_secs(8);
+
+/// How long to keep collecting a finished probe's stderr. A descendant can hold the pipe open
+/// after `systemd-run` itself has exited.
+const SCOPE_PROBE_STDERR_GRACE: Duration = Duration::from_secs(1);
+
 /// One `systemd-run --user --scope true`. The error names the exit status and carries the
 /// probe's stderr, which is the only record of why systemd refused.
 fn run_scope_probe(attempt: u32) -> Result<(), String> {
-    // A unit name per attempt, so a retry never collides with what its first attempt left.
-    let output = Command::new("systemd-run")
-        .args([
-            "--user",
-            "--scope",
-            "--quiet",
-            &format!("--unit=dagrun-probe-{}-{attempt}", std::process::id()),
-            "true",
-        ])
-        .output()
+    let mut probe = Command::new("systemd-run");
+    probe.args([
+        "--user",
+        "--scope",
+        "--quiet",
+        // A probe unit that fails is unloaded at once instead of staying listed as failed.
+        "--collect",
+        // A unit name per attempt, so a retry never collides with what its first attempt left.
+        &format!("--unit=dagrun-probe-{}-{attempt}", std::process::id()),
+        "true",
+    ]);
+    run_probe_bounded(probe, SCOPE_PROBE_TIMEOUT)
+}
+
+/// Run `probe` to completion, or kill it once `timeout` has passed. Either way the error keeps
+/// whatever stderr the probe wrote, including the partial stderr of one that hung.
+fn run_probe_bounded(mut probe: Command, timeout: Duration) -> Result<(), String> {
+    use std::io::Read;
+    use std::process::Stdio;
+    use std::sync::mpsc;
+
+    let mut child = probe
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
         .map_err(|error| format!("cannot launch systemd-run: {error}"))?;
-    if output.status.success() {
-        return Ok(());
+    // Read stderr on its own thread, in chunks, so a full pipe cannot stall the child and the
+    // output of a child that never exits is still available.
+    let mut pipe = child.stderr.take().expect("stderr is piped");
+    let (chunks, received) = mpsc::channel::<Vec<u8>>();
+    thread::spawn(move || {
+        let mut buf = [0u8; 4096];
+        while let Ok(n @ 1..) = pipe.read(&mut buf) {
+            if chunks.send(buf[..n].to_vec()).is_err() {
+                break;
+            }
+        }
+    });
+    let deadline = Instant::now() + timeout;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break Ok(status),
+            Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(20)),
+            Ok(None) => break Err(format!("timed out after {timeout:?}")),
+            Err(error) => break Err(format!("cannot wait for systemd-run: {error}")),
+        }
+    };
+    if status.is_err() {
+        let _ = child.kill();
+        let _ = child.wait();
     }
-    Err(describe_probe_failure(output.status, &output.stderr))
+    let mut stderr = Vec::new();
+    let grace_ends = Instant::now() + SCOPE_PROBE_STDERR_GRACE;
+    while let Ok(chunk) =
+        received.recv_timeout(grace_ends.saturating_duration_since(Instant::now()))
+    {
+        stderr.extend(chunk);
+    }
+    match status {
+        Ok(status) if status.success() => Ok(()),
+        Ok(status) => Err(describe_probe_failure(status, &stderr)),
+        Err(why) => Err(format!(
+            "{why}; stderr: {:?}",
+            String::from_utf8_lossy(&stderr).trim()
+        )),
+    }
 }
 
 fn describe_probe_failure(status: std::process::ExitStatus, stderr: &[u8]) -> String {
@@ -3444,6 +3504,68 @@ mod tests {
         assert!(ok);
         assert_eq!(*calls.borrow(), vec![1]);
         assert!(start.elapsed() < Duration::from_secs(30));
+    }
+
+    fn sh(script: &str) -> Command {
+        let mut command = Command::new("/bin/sh");
+        command.args(["-c", script]);
+        command
+    }
+
+    #[test]
+    fn a_hung_scope_probe_is_killed_at_the_timeout_and_keeps_its_partial_stderr() {
+        let timeout = Duration::from_millis(300);
+        let start = Instant::now();
+        let why = run_probe_bounded(sh("echo 'waiting on the bus' >&2; kill -STOP $$"), timeout)
+            .expect_err("a probe that never exits is a failure");
+        let took = start.elapsed();
+        assert!(why.contains("timed out after 300ms"), "{why}");
+        assert!(why.contains("waiting on the bus"), "{why}");
+        assert!(
+            took >= timeout && took < timeout + SCOPE_PROBE_STDERR_GRACE,
+            "the hung probe took {took:?}"
+        );
+    }
+
+    #[test]
+    fn a_scope_probe_that_exits_reports_its_status_and_stderr() {
+        let why = run_probe_bounded(
+            sh("echo 'Failed to connect to bus' >&2; exit 1"),
+            Duration::from_secs(30),
+        )
+        .expect_err("exit 1 is a failure");
+        assert!(why.contains("exit status: 1"), "{why}");
+        assert!(why.contains("Failed to connect to bus"), "{why}");
+        assert!(run_probe_bounded(sh("exit 0"), Duration::from_secs(30)).is_ok());
+    }
+
+    #[test]
+    fn a_descendant_holding_stderr_does_not_stall_a_finished_probe() {
+        let start = Instant::now();
+        let why = run_probe_bounded(
+            sh("echo refused >&2; sleep 30 & exit 1"),
+            Duration::from_secs(30),
+        )
+        .expect_err("exit 1 is a failure");
+        assert!(
+            why.contains("exit status: 1") && why.contains("refused"),
+            "{why}"
+        );
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "waited {:?} on a pipe the probe no longer owns",
+            start.elapsed()
+        );
+    }
+
+    #[test]
+    fn a_scope_probe_that_cannot_launch_says_so() {
+        let why = run_probe_bounded(
+            Command::new("/nonexistent/systemd-run"),
+            Duration::from_secs(30),
+        )
+        .expect_err("a missing binary is a failure");
+        assert!(why.starts_with("cannot launch systemd-run: "), "{why}");
     }
 
     #[test]

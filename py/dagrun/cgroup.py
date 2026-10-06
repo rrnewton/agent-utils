@@ -733,10 +733,11 @@ def systemd_scope_available(naming: ScopeNaming = DEFAULT_NAMING) -> bool:
 def _run_scope_probe(attempt: int) -> str | None:
     """One ``systemd-run --user --scope true``. None when it worked; otherwise why it failed,
     with the probe's stderr, which is the only record of why systemd refused."""
-    # A unit name per attempt, so a retry never collides with what its first attempt left.
+    # A unit name per attempt, so a retry never collides with what its first attempt left, and
+    # --collect, so a probe unit that fails is unloaded at once instead of staying listed as failed.
     try:
         r = subprocess.run(
-            ["systemd-run", "--user", "--scope", "--quiet",
+            ["systemd-run", "--user", "--scope", "--collect", "--quiet",
              f"--unit=dagrun-probe-{os.getpid()}-{attempt}", "true"],
             capture_output=True, timeout=_SCOPE_PROBE_TIMEOUT_S,
         )

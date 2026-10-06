@@ -249,6 +249,12 @@ fn a_forced_attempt_that_fails_reports_a_probe_failure_not_a_skip() {
         units[0].ends_with("-1") && units[1].ends_with("-2"),
         "each attempt uses its own unit name:\n{calls}"
     );
+    assert!(
+        calls
+            .lines()
+            .all(|call| call.split_whitespace().any(|arg| arg == "--collect")),
+        "each probe asks systemd to unload its unit even if it fails:\n{calls}"
+    );
 }
 
 /// C (control): `--allow-cgroup-failure` is unaffected — the sanctioned opt-out still runs unboxed.
