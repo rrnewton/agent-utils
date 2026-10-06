@@ -50085,7 +50085,11 @@ def _cmd_recover(
                             "a private validation seal must be recovered before the "
                             f"unrelated mutation for slot {selected_slot!r}"
                         )
-                    _assert_caller_process(coordinator, "coordinator")
+                    # ci-hub/bin/wrkslots always runs 'recover' in a host
+                    # service that does not descend from the coordinator, so
+                    # check the same handoff every other recovery checks.
+                    # Without a handoff this is still direct ancestry.
+                    _assert_recovery_processes(coordinator, processes)
                     _recover_validate_batch_seal_journal(
                         config,
                         recovery_kind=_ValidateBatchSealRecoveryKind.SEAL_ONLY,

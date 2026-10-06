@@ -5,6 +5,8 @@ from __future__ import annotations
 import dataclasses
 import json
 import os
+import stat
+import subprocess
 from collections.abc import Sequence
 from pathlib import Path
 
@@ -21,8 +23,11 @@ from wrkslots.tests.test_lifecycle import (
     raw_command_with_census_authority_stub,
     remove_completed_validation,
     run_absent_validate_recovery,
+    set_host_context_handoff,
     set_liveness,
+    start_host_context_coordinator,
     stub_validate_batch_censuses,
+    terminate_process,
     write_absent_validate_input,
 )
 
@@ -341,3 +346,112 @@ def test_seal_whose_target_was_reaped_does_not_deadlock_absent_row_recovery(
     rows = write_absent_validate_input(project, [record])
     assert run_absent_validate_recovery(project, rows, apply=True) == 0, capsys.readouterr().err
     assert active_slots(project) == []
+
+
+@pytest.mark.parametrize("handoff", ("valid", "unrelated-writer"))
+@pytest.mark.parametrize("target", ("absent", "present"))
+def test_host_context_recover_retires_a_seal_from_a_coordinator_outside_its_ancestry(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    target: str,
+    handoff: str,
+) -> None:
+    """'recover' of a seal-only journal must accept the host-context handoff.
+
+    Host state, 2026-10-06: the validation checkout cleanup worker's
+    'remove-validate-batch' left a validation-batch seal journal, and every
+    later 'validate-run' admission refused until 'wrkslots recover' retired
+    it.  ci-hub/bin/wrkslots always runs 'recover' in a host-context service
+    that does not descend from the requesting coordinator; it passes the
+    coordinator's PID and generation plus a proof pipe whose writer descends
+    from that coordinator.  Every other 'recover' path checks that handoff,
+    but the seal-only branch checked direct ancestry, so through the wrapper
+    it always refused with "coordinator PID N is not in the invoking process
+    ancestry" and the seal could never be recovered.  A handoff whose writer
+    does not descend from the coordinator must still refuse and leave the
+    seal byte for byte.
+    """
+
+    project, repository, _remote = make_project(tmp_path)
+    made = create(project, slot="target", slot_type="validate", branch=None)
+    assert made.returncode == 0, made.stderr
+    mark_owner_dead(project)
+    set_liveness(project, "dead")
+    config = wrkslots._load_config(str(project), "testhost")
+    stub_validate_batch_censuses(monkeypatch)
+    monkeypatch.setattr(wrkslots, "_assert_slot_unused", lambda *_a, **_k: None)
+    seal = wrkslots._validate_batch_seal_journal_path(config)
+    slot_path = wrkslots._slot_directory(config, "target", "validate")
+    original_mode = stat.S_IMODE(slot_path.stat().st_mode)
+
+    crashed = raw_command_with_census_authority_stub(
+        project,
+        *_remove_command(),
+        env={"WRKSLOTS_TEST_INTERRUPT": "after-validate-batch-seal-target"},
+    )
+    assert crashed.returncode == 86, crashed.stderr
+    assert seal.exists()
+    assert stat.S_IMODE(slot_path.stat().st_mode) == 0o700
+    if target == "absent":
+        record = wrkslots._find_record(wrkslots._load_active(config), "target")
+        make_validate_row_absent(project, repository, record)
+        assert not slot_path.exists()
+    # The production seal named the cleanup worker's coordinator, which had
+    # exited before anyone ran 'recover'.
+    journal = json.loads(seal.read_text(encoding="utf-8"))
+    sealer = wrkslots._read_process_identity(os.getpid())
+    journal["actor"] = wrkslots._identity_to_obj(
+        dataclasses.replace(sealer, pid=2_147_483_647)
+    )
+    seal.write_text(json.dumps(journal, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    sealed = seal.read_bytes()
+
+    coordinator, proof_fd = start_host_context_coordinator()
+    unrelated: subprocess.Popen[str] | None = None
+    try:
+        identity = wrkslots._read_process_identity(coordinator.pid)
+        # As in the host service, the requesting coordinator is not an
+        # ancestor of the process that runs 'recover'.
+        with pytest.raises(wrkslots.Refusal, match="not in the invoking process ancestry"):
+            wrkslots._assert_caller_process(identity, "coordinator")
+        if handoff == "unrelated-writer":
+            unrelated = subprocess.Popen(["sleep", "60"], text=True)
+            identity = wrkslots._read_process_identity(unrelated.pid)
+        set_host_context_handoff(monkeypatch, identity, proof_fd)
+        capsys.readouterr()
+
+        result = wrkslots.main(
+            [
+                "--project-root",
+                str(project),
+                "recover",
+                "--coordinator-authorized",
+                "--coordinator-pid",
+                str(identity.pid),
+            ]
+        )
+        captured = capsys.readouterr()
+    finally:
+        terminate_process(coordinator)
+        if unrelated is not None:
+            terminate_process(unrelated)
+        os.close(proof_fd)
+
+    assert [row.slot for row in wrkslots._load_active(config).slots] == ["target"]
+    if handoff == "unrelated-writer":
+        assert result == 3, captured.err
+        assert "no live writer descended from the coordinator" in captured.err
+        assert seal.read_bytes() == sealed
+        if target == "present":
+            assert stat.S_IMODE(slot_path.stat().st_mode) == 0o700
+        return
+    assert result == 0, captured.err
+    assert "not in the invoking process ancestry" not in captured.err
+    assert not seal.exists()
+    if target == "absent":
+        assert "sealed target target was already absent" in captured.out
+        assert not slot_path.exists()
+    else:
+        assert "recovered validation-batch seals: restored=1 resolved=1" in captured.out
+        assert stat.S_IMODE(slot_path.stat().st_mode) == original_mode
