@@ -822,10 +822,12 @@ def test_an_ambient_executable_override_is_not_inherited(
 _SYSTEM_GIT = "/usr/bin/git"
 _CHECK_IGNORE = ("check-ignore", "--quiet", "--", ".agentctl/profiles.toml")
 # The Git variables every edition gets besides GIT_CEILING_DIRECTORIES: no system or global
-# configuration, and core.fsmonitor turned off at command scope, above the repository's own.
+# configuration, no fetching of promised objects, and core.fsmonitor turned off at command
+# scope, above the repository's own.
 _CASE_GIT = {
     "GIT_CONFIG_NOSYSTEM": "1",
     "GIT_CONFIG_GLOBAL": os.devnull,
+    "GIT_NO_LAZY_FETCH": "1",
     "GIT_CONFIG_COUNT": "1",
     "GIT_CONFIG_KEY_0": "core.fsmonitor",
     "GIT_CONFIG_VALUE_0": "false",
@@ -993,7 +995,36 @@ def _hostile_template(tmp_path: Path, helper: Path) -> Path:
     return template
 
 
-@pytest.mark.parametrize("route", ("local", "include", "template"))
+def _promise_a_missing_gitignore(root: Path, helper: Path, environment: dict[str, str]) -> None:
+    """Index a skip-worktree `.gitignore` whose blob only a promisor remote can supply.
+
+    Git reads a skip-worktree `.gitignore` from the index, so check-ignore needs the blob and
+    fetches it from the remote, whose upload-pack program is `helper`. The profile directory is
+    ignored through info/exclude instead, so check-ignore's answer does not depend on the fetch.
+    """
+    import subprocess
+
+    def git(*arguments: str, data: bytes = b"") -> str:
+        done = subprocess.run([_SYSTEM_GIT, "-C", str(root), *arguments], check=True,
+                              env=environment, input=data, capture_output=True)
+        return done.stdout.decode("utf-8").strip()
+
+    blob = git("hash-object", "--stdin", data=b".agentctl/\n")
+    git("update-index", "--add", "--cacheinfo", f"100644,{blob},.gitignore")
+    git("update-index", "--skip-worktree", ".gitignore")
+    for key, value in (
+        ("core.repositoryformatversion", "1"),
+        ("extensions.partialClone", "origin"),
+        ("remote.origin.url", str(root.parent / "no-remote")),
+        ("remote.origin.promisor", "true"),
+        ("remote.origin.uploadpack", str(helper)),
+    ):
+        git("config", key, value)
+    (root / ".git" / "info").mkdir(exist_ok=True)
+    (root / ".git" / "info" / "exclude").write_text(".agentctl/\n", encoding="utf-8")
+
+
+@pytest.mark.parametrize("route", ("local", "include", "template", "lazy-fetch"))
 def test_an_edition_runs_no_git_helper_that_the_case_repository_configures(
     tmp_path: Path, route: str
 ) -> None:
@@ -1001,7 +1032,8 @@ def test_an_edition_runs_no_git_helper_that_the_case_repository_configures(
 
     The repository exists before the editions start, as in every corpus case, and check-ignore
     with no configuration but that repository's must first run the helper. `template` is a
-    repository whose `git init` copied a template's config file.
+    repository whose `git init` copied a template's config file; `lazy-fetch` is a partial
+    clone whose index names a `.gitignore` blob that is missing.
     """
     import json
     import subprocess
@@ -1032,7 +1064,10 @@ def test_an_edition_runs_no_git_helper_that_the_case_repository_configures(
             if route == "include":
                 with (root / ".git" / "config").open("a", encoding="utf-8") as configuration:
                     configuration.write(f"[include]\n\tpath = {included}\n")
-            (root / ".gitignore").write_text(".agentctl/\n", encoding="utf-8")
+            if route == "lazy-fetch":
+                _promise_a_missing_gitignore(root, helper, clean)
+            else:
+                (root / ".gitignore").write_text(".agentctl/\n", encoding="utf-8")
             subprocess.run([_SYSTEM_GIT, "-C", str(root), *_CHECK_IGNORE], env=clean,
                            stdin=subprocess.DEVNULL, capture_output=True, check=False)
             assert marker.exists(), f"the {route} configuration does not run the helper"
@@ -1090,6 +1125,20 @@ def test_a_case_repository_takes_nothing_from_a_template_the_caller_names(
     assert "fsmonitor" not in (fixture / ".git" / "config").read_text(encoding="utf-8")
     exclude = fixture / ".git" / "info" / "exclude"
     assert not exclude.exists() or "template-marker" not in exclude.read_text(encoding="utf-8")
+
+
+def test_a_case_cannot_empty_the_editions_git_variables(tmp_path: Path) -> None:
+    """`empty_environment` is applied after with_case_git, so it may not name a Git variable."""
+    herdr_agent = _cross_module("herdr_agent_differential")
+    edition, ran = _recording_edition(tmp_path)
+    harness = herdr_agent.Harness(tmp_path / "cross", edition, edition)
+    try:
+        case = harness.case("empty-git", {"empty_environment": ["GIT_NO_LAZY_FETCH"]})
+        with pytest.raises(TypeError, match="Git variables"):
+            harness.invoke(case, ("status", *herdr_agent.FIXTURE_HERDR))
+    finally:
+        harness.close()
+    assert not ran.exists()
 
 
 def test_the_cross_harness_runs_git_only_to_create_a_case_repository() -> None:

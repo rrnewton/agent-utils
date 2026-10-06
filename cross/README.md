@@ -66,9 +66,12 @@ system or global Git configuration (`GIT_CONFIG_NOSYSTEM=1`,
 `GIT_CONFIG_GLOBAL=/dev/null`), and finds no repository above the case directory
 (`GIT_CEILING_DIRECTORIES`). The case repository's own configuration is still
 read, so `core.fsmonitor=false` is given at command scope (`GIT_CONFIG_COUNT`),
-which overrides it. The harness creates each case repository with that same
-environment (`init_case_repository`), so a template directory the caller names
-(`GIT_TEMPLATE_DIR`, `init.templateDir`) is not copied into it.
+which overrides it, and `GIT_NO_LAZY_FETCH=1` stops Git fetching an object that a
+promisor remote should supply, which would run the remote's transport program. A
+case's `empty_environment` may not name a `GIT_*` variable. The harness creates
+each case repository with that same environment (`init_case_repository`), so a
+template directory the caller names (`GIT_TEMPLATE_DIR`, `init.templateDir`) is
+not copied into it.
 
 Without `--herdr-bin`, the Rust edition looks `herdr` up on `PATH` and meets the
 stub, but the Python edition runs the `herdr` installed in a fixed location such

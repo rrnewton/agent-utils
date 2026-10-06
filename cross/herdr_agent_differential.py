@@ -518,13 +518,16 @@ def with_case_git(environment: dict[str, str], root: Path) -> dict[str, str]:
     and GIT_CONFIG_GLOBAL replaces it too), and repository discovery stops at the case directory,
     so a repository that encloses the harness directory is not read either. The repository's own
     configuration is still read, along with anything it includes, so GIT_COMMAND_CONFIGURATION
-    is given last, at command scope, where it overrides every file.
+    is given last, at command scope, where it overrides every file. And Git fetches no object
+    that a promisor remote should supply: the fetch would run the remote's transport program,
+    such as remote.<name>.uploadpack, and reading a skip-worktree `.gitignore` can start one.
     """
     for variable in [name for name in environment if name.startswith("GIT_")]:
         del environment[variable]
     environment["GIT_CONFIG_NOSYSTEM"] = "1"
     environment["GIT_CONFIG_GLOBAL"] = os.devnull
     environment["GIT_CEILING_DIRECTORIES"] = os.path.dirname(os.path.realpath(root))
+    environment["GIT_NO_LAZY_FETCH"] = "1"
     environment["GIT_CONFIG_COUNT"] = str(len(GIT_COMMAND_CONFIGURATION))
     for index, (key, value) in enumerate(GIT_COMMAND_CONFIGURATION):
         environment[f"GIT_CONFIG_KEY_{index}"] = key
@@ -986,6 +989,9 @@ class Harness:
             not isinstance(variable, str) for variable in empty_environment
         ):
             raise TypeError("empty_environment fixture must contain strings")
+        if any(variable.startswith("GIT_") for variable in empty_environment):
+            # An empty value would undo with_case_git: GIT_NO_LAZY_FETCH= turns fetching back on.
+            raise TypeError("empty_environment fixture may not change the editions' Git variables")
         for variable in empty_environment:
             environment[variable] = ""
         try:
