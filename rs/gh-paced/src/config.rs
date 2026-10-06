@@ -280,6 +280,12 @@ pub mod floors {
     pub const MAX_REFRESH_SECS: f64 = 300.0;
     /// Most admitted calls between refreshes (the requested 50).
     pub const MAX_REFRESH_CALLS: u32 = 50;
+    /// Longest configurable duration (cooldowns, `max_wait_secs`, `GH_PACED_MAX_WAIT`), seconds:
+    /// 7 days. A longer value is a configuration error, so every deadline computed from one
+    /// stays representable.
+    pub const MAX_DURATION_SECS: f64 = 604_800.0;
+    /// Longest `rate_limit_timeout_secs`, seconds.
+    pub const MAX_RATE_LIMIT_TIMEOUT_SECS: f64 = 3600.0;
 }
 
 fn clamp_class(class: Class, limits: &mut ClassLimits, warnings: &mut Vec<String>) {
@@ -385,20 +391,30 @@ impl FileConfig {
             c.watch_cost = v.max(1);
         }
         if let Some(v) = self.min_watch_interval_secs {
-            c.min_watch_interval_secs = finite_at_least("min_watch_interval_secs", v, 0.0)?;
+            c.min_watch_interval_secs =
+                finite_in("min_watch_interval_secs", v, 0.0, floors::MAX_DURATION_SECS)?;
         }
         if let Some(v) = self.max_wait_secs {
-            c.max_wait_secs = finite_at_least("max_wait_secs", v, 0.0)?;
+            c.max_wait_secs = finite_in("max_wait_secs", v, 0.0, floors::MAX_DURATION_SECS)?;
         }
         if let Some(v) = self.lock_wait_secs {
             c.lock_wait_secs = finite_in("lock_wait_secs", v, 0.1, 3600.0)?;
         }
         if let Some(v) = self.cooldown_secs {
-            c.cooldown_secs = finite_at_least("cooldown_secs", v, floors::MIN_COOLDOWN_SECS)?;
+            c.cooldown_secs = finite_in(
+                "cooldown_secs",
+                v,
+                floors::MIN_COOLDOWN_SECS,
+                floors::MAX_DURATION_SECS,
+            )?;
         }
         if let Some(v) = self.plain_403_cooldown_secs {
-            c.plain_403_cooldown_secs =
-                finite_at_least("plain_403_cooldown_secs", v, floors::MIN_COOLDOWN_SECS)?;
+            c.plain_403_cooldown_secs = finite_in(
+                "plain_403_cooldown_secs",
+                v,
+                floors::MIN_COOLDOWN_SECS,
+                floors::MAX_DURATION_SECS,
+            )?;
         }
         if let Some(v) = self.rate_limit_refresh_secs {
             c.rate_limit_refresh_secs =
@@ -418,7 +434,12 @@ impl FileConfig {
                 finite_in("rate_limit_min_refresh_secs", v, 10.0, 300.0)?;
         }
         if let Some(v) = self.rate_limit_timeout_secs {
-            c.rate_limit_timeout_secs = finite_at_least("rate_limit_timeout_secs", v, 1.0)?;
+            c.rate_limit_timeout_secs = finite_in(
+                "rate_limit_timeout_secs",
+                v,
+                1.0,
+                floors::MAX_RATE_LIMIT_TIMEOUT_SECS,
+            )?;
         }
         if let Some(v) = self.block_below_fraction {
             c.block_below_fraction =
@@ -553,6 +574,12 @@ fn apply_env(
         }
     }
     if let Some(v) = env_number(env, "GH_PACED_MAX_WAIT")? {
+        if v > floors::MAX_DURATION_SECS {
+            return Err(format!(
+                "GH_PACED_MAX_WAIT={v} must be at most {} seconds",
+                floors::MAX_DURATION_SECS
+            ));
+        }
         c.max_wait_secs = v;
     }
     if let Some(v) = env_number(env, "GH_PACED_LOCK_WAIT")? {
@@ -715,5 +742,46 @@ mod tests {
             assert!(load(stricter).is_ok(), "rejected {stricter}");
         }
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A duration too long to turn into a deadline is a configuration error, never a panic
+    /// later (a 1e308 refresh timeout used to panic in `Duration::from_secs_f64`).
+    #[test]
+    fn durations_must_be_representable() {
+        let dir = std::env::temp_dir().join(format!("gh-paced-durations-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("c.json");
+        let env = env_of(&[]);
+        let load = |json: &str| {
+            std::fs::write(&path, json).unwrap();
+            Config::load(Some(&path), true, &env)
+        };
+        for key in [
+            "cooldown_secs",
+            "plain_403_cooldown_secs",
+            "rate_limit_timeout_secs",
+            "max_wait_secs",
+            "min_watch_interval_secs",
+        ] {
+            for value in ["1e308", "604801"] {
+                let json = format!("{{\"{key}\": {value}}}");
+                assert!(load(&json).is_err(), "accepted {json}");
+            }
+        }
+        assert!(load(r#"{"rate_limit_timeout_secs": 3601}"#).is_err());
+        for ok in [
+            r#"{"cooldown_secs": 604800}"#,
+            r#"{"max_wait_secs": 604800}"#,
+            r#"{"rate_limit_timeout_secs": 3600}"#,
+        ] {
+            assert!(load(ok).is_ok(), "rejected {ok}");
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+        for v in ["1e308", "604801"] {
+            let env = env_of(&[("GH_PACED_MAX_WAIT", v)]);
+            assert!(Config::load(None, false, &env).is_err(), "accepted {v}");
+        }
+        let env = env_of(&[("GH_PACED_MAX_WAIT", "604800")]);
+        assert!(Config::load(None, false, &env).is_ok());
     }
 }

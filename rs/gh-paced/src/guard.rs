@@ -618,7 +618,11 @@ fn scan(c: &Classification, rest: &[String], stdin_is_tty: bool) -> Scan {
                 if *kind == Kind::JsonStdin {
                     let value = inline.map_or(Some(true), parse_go_bool);
                     flags.push((name.to_string(), value));
-                    if value != Some(false) {
+                    if value == Some(false) {
+                        // The last occurrence wins, as in pflag: a later `--json=false` means
+                        // gh never reads stdin, so an earlier `--json`'s source is dropped.
+                        out.retain(|s| s.key.as_deref() != Some(name));
+                    } else {
                         push_source(&mut out, rest, name, *kind, "", at);
                     }
                     continue;
@@ -928,14 +932,17 @@ fn is_b64(b: u8) -> bool {
 ///   except that the last may be shorter. This is the shape of an encoding wrapped at a fixed
 ///   column, however narrow, so wrapping at 16 or 8 columns does not hide one;
 /// - a block of consecutive base64-alphabet lines of at least 4 characters, of any widths, each
-///   holding both upper- and lower-case letters. Standard base64 mixes the cases on nearly every
-///   line, so an encoding wrapped at varying narrow widths (16, then 12, then 16) forms this
-///   block. A list of lower-case identifiers or hex hashes, one per line, does not; a list of
-///   mixed-case names one per line does, once it passes the limit.
+///   holding an upper-case letter or made of one repeated character. Standard base64 has an
+///   upper-case letter on nearly every line (it mixes the cases for most data, and the
+///   encoding of zero bytes is all `A`), so an encoding wrapped at varying narrow widths (16,
+///   then 12, then 16) forms this block, and so does a run of `/` (bytes 0xFF). A list of
+///   lower-case identifiers or hex hashes, one per line, does not; a list of mixed-case or
+///   upper-case names one per line does, once it passes the limit.
 ///
 /// These are heuristics against an accidental upload, not a proof: an encoding broken up by
-/// spaces or punctuation, or one wrapped at varying widths under 4 columns or below 20 columns
-/// without mixed case (base32, hex), is not seen.
+/// spaces or punctuation, or one wrapped at varying widths under 4 columns, or below 20
+/// columns with no upper-case letter on some line (base32 and hex in lower case, URL-safe
+/// base64 of unusual data), is not seen.
 pub fn longest_base64_run(text: &[u8]) -> usize {
     let mut best = 0;
     let mut run = 0;
@@ -948,8 +955,9 @@ pub fn longest_base64_run(text: &[u8]) -> usize {
         }
     }
     let mut block = 0;
-    // Mixed-case block of any widths: its total length.
-    let mut mixed = 0;
+    // Block of any widths whose lines each hold an upper-case letter or repeat one character:
+    // its total length.
+    let mut cased = 0;
     // Equal-width block: its line width (0 when no block is open) and its total length.
     let mut width = 0;
     let mut even = 0;
@@ -964,13 +972,13 @@ pub fn longest_base64_run(text: &[u8]) -> usize {
         }
         if encoded
             && trimmed.len() >= 4
-            && trimmed.iter().any(u8::is_ascii_uppercase)
-            && trimmed.iter().any(u8::is_ascii_lowercase)
+            && (trimmed.iter().any(u8::is_ascii_uppercase)
+                || trimmed.iter().all(|&b| b == trimmed[0]))
         {
-            mixed += trimmed.len();
+            cased += trimmed.len();
         } else {
-            best = best.max(mixed);
-            mixed = 0;
+            best = best.max(cased);
+            cased = 0;
         }
         let len = trimmed.len();
         if !encoded {
@@ -1041,23 +1049,40 @@ fn read_capped(path: &str, limit: usize) -> Result<(Vec<u8>, u64), String> {
     Ok((buf, full))
 }
 
-/// Check a file gh composed in an editor (see [`crate::editor`]) against the write-body limits.
-pub fn check_composed_file(path: &str, cfg: &Config) -> Verdict {
-    let source = BodySource {
-        flag: "the text saved in the editor".to_string(),
-        kind: SourceKind::File(path.to_string()),
-        json: false,
-        location: None,
-        key: None,
-    };
-    evaluate(&[source], cfg, None)
+/// Check the files gh composed in one editor session (see [`crate::editor`]) against the
+/// write-body limits. `prior` is the body size the same gh call already gave on its command line
+/// (the wrapper's [`Verdict::Allow`] total), so the editor text and the arguments share one
+/// `max_body_bytes` allowance instead of getting one each.
+pub fn check_composed_files(paths: &[String], cfg: &Config, prior: u64) -> Verdict {
+    let sources: Vec<BodySource> = paths
+        .iter()
+        .map(|path| BodySource {
+            flag: "the text saved in the editor".to_string(),
+            kind: SourceKind::File(path.clone()),
+            json: false,
+            location: None,
+            key: None,
+        })
+        .collect();
+    evaluate_after(&sources, cfg, None, prior)
 }
 
 /// Inspect every body source. `stdin` holds the buffered stdin when a source reads it (the
 /// wrapper buffers at most `max_body_bytes + 1` bytes; a longer stdin is refused before this).
 pub fn evaluate(sources: &[BodySource], cfg: &Config, stdin: Option<&[u8]>) -> Verdict {
+    evaluate_after(sources, cfg, stdin, 0)
+}
+
+/// [`evaluate`], with `prior` bytes of the size limit already used by an earlier check of the
+/// same gh call.
+fn evaluate_after(
+    sources: &[BodySource],
+    cfg: &Config,
+    stdin: Option<&[u8]>,
+    prior: u64,
+) -> Verdict {
     let limit = cfg.max_body_bytes;
-    let mut total: u64 = 0;
+    let mut total: u64 = prior;
     // (flag, inspected bytes, parse as JSON, the source was longer than what was read)
     let mut texts: Vec<(String, Vec<u8>, bool, bool)> = Vec::new();
     for s in sources {
@@ -1077,15 +1102,20 @@ pub fn evaluate(sources: &[BodySource], cfg: &Config, stdin: Option<&[u8]>) -> V
                 }
             },
         };
-        total += size;
+        total = total.saturating_add(size);
         let truncated = size > bytes.len() as u64;
         texts.push((s.flag.clone(), bytes, s.json, truncated));
     }
     // Report every reason, not just the first, so the author sees all that must change.
     let mut reasons = Vec::new();
     if total > limit as u64 {
+        let earlier = if prior > 0 {
+            format!(" (including {prior} bytes given on the command line)")
+        } else {
+            String::new()
+        };
         reasons.push(format!(
-            "write body is {total} bytes across {} source(s), over the {limit}-byte limit",
+            "write body is {total} bytes across {} source(s){earlier}, over the {limit}-byte limit",
             sources.len()
         ));
     }
@@ -1159,6 +1189,28 @@ mod tests {
                 A[((x >> 16) % 64) as usize] as char
             })
             .collect()
+    }
+
+    /// `workflow run --json` reads its inputs from stdin; the last `--json` occurrence
+    /// decides, so a later `--json=false` leaves no stdin source (gh never reads stdin).
+    #[test]
+    fn a_later_false_json_flag_drops_the_stdin_source() {
+        let wf = |extra: &[&str]| {
+            let mut line = vec!["workflow", "run", "build.yml"];
+            line.extend_from_slice(extra);
+            kinds(&line)
+        };
+        assert_eq!(wf(&["--json"]), vec![SourceKind::Stdin]);
+        assert_eq!(wf(&["--json=false"]), Vec::<SourceKind>::new());
+        assert_eq!(
+            wf(&["--json", "--json=false", "-f", "foo=bar"]),
+            vec![inline("bar")]
+        );
+        assert_eq!(wf(&["--json=false", "--json"]), vec![SourceKind::Stdin]);
+        assert_eq!(
+            wf(&["--json", "--json=0", "--json=true"]),
+            vec![SourceKind::Stdin]
+        );
     }
 
     #[test]
@@ -1856,6 +1908,24 @@ mod tests {
                 "{eol:?}"
             );
         }
+        // Single-case standard base64 wrapped the same way: 900 zero bytes are 1,200 `A`s, 900
+        // 0xFF bytes 1,200 `/`s, and mostly-zero data is upper case with a few digits.
+        let zeros = "A".repeat(1200);
+        let ones = "/".repeat(1200);
+        let sparse = "AAAAAAAAAAAAAAE0".repeat(75);
+        for enc in [&zeros, &ones, &sparse] {
+            let mut wrapped = String::new();
+            let mut rest = enc.as_str();
+            let mut wide = true;
+            while !rest.is_empty() {
+                let (line, tail) = rest.split_at(rest.len().min(if wide { 16 } else { 12 }));
+                wrapped.push_str(line);
+                wrapped.push('\n');
+                rest = tail;
+                wide = !wide;
+            }
+            assert_eq!(longest_base64_run(wrapped.as_bytes()), 1200, "{enc}");
+        }
         // Lower-case words and identifiers of varying widths, one per line, are not a block.
         let words: String = (0..300)
             .map(|i| format!("{}\n", ["alpha", "beta_2", "gamma-ray", "delta"][i % 4]))
@@ -1864,6 +1934,40 @@ mod tests {
         // Mixed-case prose keeps its spaces, so it is not a block either.
         let prose: String = (0..300).map(|_| "Fix The Thing\n").collect();
         assert!(longest_base64_run(prose.as_bytes()) < 20);
+    }
+
+    #[test]
+    fn editor_text_shares_the_allowance_with_the_arguments() {
+        let dir = std::env::temp_dir().join(format!("gh-paced-composed-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("body.md");
+        std::fs::write(&file, "word ".repeat(1638)).unwrap();
+        let paths = vec![file.display().to_string()];
+        let cfg = Config::default();
+        // 8,190 bytes pass on their own, but not after a 200-byte title.
+        assert_eq!(
+            check_composed_files(&paths, &cfg, 0),
+            Verdict::Allow { bytes: 8190 }
+        );
+        match check_composed_files(&paths, &cfg, 200) {
+            Verdict::Refuse(r) => assert!(
+                r.contains("write body is 8390 bytes across 1 source(s) (including 200 bytes given on the command line)"),
+                "{r}"
+            ),
+            v => panic!("{v:?}"),
+        }
+        // Two files from one session are counted together.
+        let two = vec![paths[0].clone(), paths[0].clone()];
+        assert!(matches!(
+            check_composed_files(&two, &cfg, 0),
+            Verdict::Refuse(_)
+        ));
+        // A nonsense prior saturates rather than overflowing, and refuses.
+        assert!(matches!(
+            check_composed_files(&paths, &cfg, u64::MAX),
+            Verdict::Refuse(_)
+        ));
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
