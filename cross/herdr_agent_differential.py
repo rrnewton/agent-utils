@@ -429,10 +429,11 @@ print(json.dumps({"installed": {"id": name}}))
 # the harness reports every recorded call as a failure, so a case must hand both editions a
 # fixture explicitly instead of passing on whatever the host has.
 #
-# Herdr is the exception a PATH stub cannot catch: with no `--herdr-bin`, both editions run
+# Herdr is the exception a PATH stub cannot fully catch. With no `--herdr-bin`, the Rust edition
+# searches PATH for `herdr` (and meets the stub), but the Python edition ignores PATH and runs
 # `herdr` from fixed install locations (/usr/local/bin, /usr/bin, and bin directories under the
-# account database's home directory) and ignore PATH. `herdr_refusal` therefore refuses, before
-# spawning, every invocation that could reach Herdr without naming one inside the case directory.
+# account database's home directory). `herdr_refusal` therefore refuses, before spawning, every
+# invocation that could reach Herdr without naming one inside the case directory.
 HOST_CLI_GUARDED = (
     "agentcloudctl", "agy", "claude", "codex", "gh", "herdr", "muse", "opencode", "tmux", "wrkslots",
 )
@@ -454,6 +455,23 @@ def guarded_path(root: Path, path: str | None) -> str:
     return guard if not path else guard + os.pathsep + path
 
 
+# Environment variables that name a host executable outright (the Python edition's headless
+# runner reads them in agentctl/foreign/lib.py, wrkslots discovery in agentctl/subagents.py). An
+# absolute path in one would bypass the stubs above, so no edition inherits them from the caller:
+# an edition that then looks the tool up by its bare name meets the stub and is reported.
+AMBIENT_EXECUTABLE_OVERRIDES = {
+    "AGENTCTL_WRKSLOTS_BIN": "wrkslots", "AGY_BIN": "agy", "CODEX_BIN": "codex",
+    "HERDR_BIN": "herdr", "MUSE_BIN": "muse",
+}
+
+
+def without_ambient_executables(environment: dict[str, str]) -> dict[str, str]:
+    """Drop every caller-supplied host executable override from an edition's environment."""
+    for variable in AMBIENT_EXECUTABLE_OVERRIDES:
+        environment.pop(variable, None)
+    return environment
+
+
 FIXTURE_HERDR = ("--herdr-bin", "<HERDR>")
 # Commands that print text or read local configuration and never construct a Herdr client. Any
 # other command, including an unknown one, must name the fixture Herdr.
@@ -462,37 +480,61 @@ HERDR_FREE_COMMANDS = frozenset((
     "capabilities", "profiles", "quickstart", "skill", "userguide",
 ))
 _GLOBAL_VALUE_OPTIONS = ("--registry", "--state", "--herdr-bin")
+# Commands that ignore `--herdr-bin`: the Python `agentctl chat` builds a default HerdrClient,
+# which runs the installed Herdr, so naming the fixture cannot redirect it.
+HERDR_BIN_IGNORED_COMMANDS = frozenset(("chat",))
 
 
 def _names_case_file(root: Path, value: str) -> bool:
-    """Whether a `--herdr-bin` value is a path inside the case directory, not an installed name."""
+    """Whether a `--herdr-bin` value is a file inside the case directory, not an installed name.
+
+    Both editions canonicalize the path they run, so symbolic links are resolved here too, against
+    the editions' working directory (the case root): a link inside the case that points outside
+    it names the outside file.
+    """
     if os.sep not in value:
         return False
-    resolved = os.path.normpath(os.path.join(root, value))
-    return os.path.commonpath((resolved, str(root))) == str(root)
+    real_root = os.path.realpath(root)
+    resolved = os.path.realpath(os.path.join(root, value))
+    return os.path.commonpath((resolved, real_root)) == real_root
 
 
 def herdr_refusal(root: Path, arguments: Sequence[str]) -> str | None:
-    """Say why an invocation could run a Herdr outside the case directory, or None if it cannot."""
+    """Say why an invocation could run a Herdr outside the case directory, or None if it cannot.
+
+    The check is deliberately conservative: it may refuse an invocation that would not have
+    contacted Herdr, never the reverse. Tokens after a `--` terminator are positional text, so
+    a `--herdr-bin` there names nothing, and a help flag there asks for nothing.
+    """
+    options_end = arguments.index("--") if "--" in arguments else len(arguments)
+    options = arguments[:options_end]
     named = [
-        arguments[index + 1] for index, value in enumerate(arguments[:-1]) if value == "--herdr-bin"
-    ] + [value.split("=", 1)[1] for value in arguments if value.startswith("--herdr-bin=")]
+        options[index + 1] for index, value in enumerate(options[:-1]) if value == "--herdr-bin"
+    ] + [value.split("=", 1)[1] for value in options if value.startswith("--herdr-bin=")]
     outside = [value for value in named if not _names_case_file(root, value)]
     if outside:
         return f"--herdr-bin {outside[0]!r} is not a fixture inside the case directory"
-    if named:
-        return None
     index = 0
     while index < len(arguments):
-        if arguments[index] in _GLOBAL_VALUE_OPTIONS:
+        if index == options_end:
+            index += 1
+        elif index < options_end and arguments[index] in _GLOBAL_VALUE_OPTIONS:
             index += 2
-        elif arguments[index].startswith(tuple(f"{option}=" for option in _GLOBAL_VALUE_OPTIONS)):
+        elif index < options_end and arguments[index].startswith(
+            tuple(f"{option}=" for option in _GLOBAL_VALUE_OPTIONS)
+        ):
             index += 1
         else:
             break
-    if index >= len(arguments) or arguments[index] in HERDR_FREE_COMMANDS:
+    if index >= len(arguments):
         return None
-    if index + 1 < len(arguments) and arguments[index + 1] in ("--help", "-h"):
+    if index < options_end and arguments[index] in HERDR_FREE_COMMANDS:
+        return None
+    if index + 1 < options_end and arguments[index + 1] in ("--help", "-h"):
+        return None
+    if arguments[index] in HERDR_BIN_IGNORED_COMMANDS:
+        return f"{arguments[index]!r} ignores --herdr-bin and runs the Herdr installed on this host"
+    if named:
         return None
     return (
         f"{arguments[index]!r} has no --herdr-bin, so the editions would run the Herdr installed "
@@ -628,7 +670,7 @@ class Harness:
             return _normalize(Outcome(
                 127, "", f"cross harness host CLI guard: refused to run the editions: {refusal}\n",
             ), root)
-        environment = dict(os.environ)
+        environment = without_ambient_executables(dict(os.environ))
         existing = environment.get("PYTHONPATH", "")
         local = str(REPO_ROOT / "py")
         environment["PYTHONPATH"] = local if not existing else local + os.pathsep + existing
@@ -1136,7 +1178,7 @@ def _cross_process_serialization(harness: Harness, report: Report) -> None:
         refusal = Harness.refuse_unfixtured_herdr(root, expanded)
         if refusal is not None:
             raise RuntimeError(f"cross harness host CLI guard: {refusal}")
-        environment = dict(os.environ)
+        environment = without_ambient_executables(dict(os.environ))
         existing = environment.get("PYTHONPATH", "")
         local = str(REPO_ROOT / "py")
         environment["PYTHONPATH"] = local if not existing else local + os.pathsep + existing
