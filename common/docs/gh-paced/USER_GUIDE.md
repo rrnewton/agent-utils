@@ -344,9 +344,12 @@ reads is still found. It looks for:
   person removes `<account>.cooldown` and the `cooldown` entry of
   `<account>.json` from the state directory. A value whose digits run on past
   the 4 KiB kept between reads cannot be read whole, and is treated the same
-  way. So is one that runs up to the end of the first 1 MiB of stderr, which is
-  all that the rate-limit refresh (`gh api rate_limit`, run by gh-paced itself)
-  keeps; the refresh prints a warning when it cut either stream there.
+  way. So is one that starts its line (after blanks, or after the `<` marker of
+  gh's debug output) and runs up to the end of the first 1 MiB of stderr, which
+  is all that the rate-limit refresh (`gh api rate_limit`, run by gh-paced
+  itself) keeps; the refresh prints a warning when it cut either stream there.
+  The same words in the middle of a line of prose, cut there, are not a header
+  and start no such cooldown.
 
 For `gh api -i/--include`, gh prints the HTTP status line and response headers
 on **stdout** instead. For that form only, gh-paced also reads stdout as it
@@ -371,18 +374,26 @@ blank line. stdout itself is passed on unchanged.
   that exact shape with CRLF line endings is read as one more header block and
   can start a cooldown that was not needed. gh-paced cannot tell such a body
   from a real page boundary, so this errs on the safe side.
-- **Over-long lines.** A stdout line longer than 8,192 bytes is not kept. In a
+- **Over-long lines.** A stdout line of more than 8,192 bytes before its line
+  end is not kept. In a
   403 or 429 block, such a line (a `Retry-After` with thousands of leading
   zeros, or any other header that long) means the wait GitHub asked for cannot
   be read, so it starts a cooldown with no end time, as for a `Retry-After`
   over 365 days above, never a shorter one. In any other block it ends the
   block. A status line that long (HTTP/1.1 lets the server choose its reason
-  phrase) still opens its block. With `--paginate` the long line counts as a
-  header line only in the shape a short one needs: a colon in its first 8,192
-  bytes and a CRLF ending. A long line without a colon is body text and drops
-  the block. If the output ends inside a long line that has the colon, before
-  its line ending arrives (gh stopped mid-write), the block still counts, with
-  no end time.
+  phrase) still opens its block. With `--paginate` a long line needs a CRLF
+  ending to count. Before the block's first CRLF header line it also needs the
+  shape a short header line has: a colon in its first 8,192 bytes. A long line
+  there without one is body text and drops the block. After a CRLF header line,
+  a long line counts whether or not its colon is in the bytes kept, so a
+  `Retry-After` already read is never dropped. If the output ends inside such a
+  long line of a 403 or 429 block (one with the colon, or one after a CRLF
+  header line), before its line ending arrives (gh stopped mid-write), the
+  block still counts, with no end time, when it began on the first stdout line
+  or already holds a CRLF header line. A later page's block
+  cut inside its first header line may be a `--jq` page body cut short, so it
+  does not count, and the cooldown is whatever stderr gives (900 s for an
+  `HTTP 429`).
 
 Any limit signal (one of the phrases, HTTP 429, a `Retry-After` value, or
 `X-RateLimit-Remaining: 0`) starts a **cooldown** of the larger of `Retry-After`

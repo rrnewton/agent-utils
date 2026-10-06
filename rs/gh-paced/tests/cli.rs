@@ -1340,6 +1340,104 @@ fn a_retry_after_cut_by_the_capture_limit_never_shortens_a_wait() {
     );
 }
 
+/// After a CR LF header line, an over-long line in a 429 or 403 block never drops the block.
+/// Round 10 dropped it when the long line's colon came after the 8,192 bytes kept, and lost the
+/// two-day `Retry-After` already read: with `--paginate` no cooldown started. With the colon late
+/// or missing, with and without `--paginate`, the cooldown has no end time.
+#[test]
+fn a_long_line_after_a_retry_after_never_drops_the_wait() {
+    let filler = "X".repeat(9000);
+    let late = format!(
+        "HTTP/2.0 429 Too Many Requests\r\nRetry-After: 172800\r\n{filler}: value\r\n\r\n{{}}"
+    );
+    assert_overlong_header_starts_a_no_end_cooldown("late-colon", "FAKE_GH_STDOUT", &late);
+    let missing = format!("HTTP/2.0 403 Forbidden\r\nRetry-After: 172800\r\n{filler}\r\n\r\n{{}}");
+    assert_overlong_header_starts_a_no_end_cooldown("no-colon", "FAKE_GH_STDOUT", &missing);
+}
+
+/// `gh api --include --paginate --jq` output that ends inside a later page's body: a
+/// status-shaped line, then a long `X-Long: ...` line whose end never arrives, with no CR LF header
+/// line before it. That may be body text cut short, so no cooldown starts and the next call runs.
+/// (Round 10 committed such a block at the end of the output and started a cooldown with no end
+/// time.)
+#[test]
+fn a_page_body_cut_inside_a_long_line_starts_no_cooldown() {
+    let sb = Sandbox::new("jq-cut-body", FAST);
+    let response = format!(
+        "HTTP/2.0 200 OK\nX-Ratelimit-Remaining: 4000\r\n\r\nHTTP/2.0 429 Too Many Requests\nX-Long: {}",
+        "x".repeat(9000)
+    );
+    // FAKE_GH_STDOUT_HEAD is written with no line end after it.
+    let o = sb.run(
+        &["api", "-i", "--paginate", "--jq", ".body", "repos/o/r"],
+        &[("FAKE_GH_STDOUT_HEAD", &response)],
+    );
+    let err = stderr(&o);
+    assert!(
+        !sb.path("state/test.cooldown").exists(),
+        "a cooldown record was written: {err}"
+    );
+    assert_eq!(o.status.code(), Some(0), "{err}");
+    assert!(stdout(&o) == response, "stdout passes through");
+    assert!(!err.contains("PUSHBACK"), "{err}");
+    let state: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(sb.path("state/test.json")).unwrap())
+            .unwrap();
+    assert!(state["cooldown"].is_null(), "{state}");
+    let o = sb.run(&["api", "repos/o/r"], &[]);
+    assert_eq!(o.status.code(), Some(0), "{}", stderr(&o));
+    assert_eq!(sb.starts().len(), 2, "{:?}", sb.starts());
+}
+
+/// The rate-limit refresh's stderr cut off by the 1 MiB capture limit just after the words
+/// `retry-after:` in the middle of a line of prose. They are not a header, so no cooldown starts
+/// and the requested call runs; the cut is still reported. (Round 10 matched the words anywhere
+/// and started a cooldown with no end time.)
+#[test]
+fn a_capture_cut_after_prose_starts_no_cooldown() {
+    let sb = Sandbox::new("refresh-cut-prose", FAST);
+    let tail = "\nDocumentation example retry-after: ";
+    let mut text = "y".repeat((1 << 20) - tail.len());
+    text.push_str(tail);
+    assert_eq!(text.len(), 1 << 20, "the cut falls just after the words");
+    text.push_str("not a response header\n");
+    let file = sb.path("rate-stderr");
+    std::fs::write(&file, &text).unwrap();
+    // A paced read is due a refresh first (there is no snapshot yet).
+    let o = sb.run(
+        &["pr", "view", "1"],
+        &[("FAKE_GH_RATE_STDERR_FILE", file.to_str().unwrap())],
+    );
+    let err = stderr(&o);
+    assert_eq!(o.status.code(), Some(0), "{err}");
+    assert_eq!(sb.starts().len(), 1, "gh did not run: {err}");
+    assert!(
+        !sb.path("state/test.cooldown").exists(),
+        "a cooldown record was written: {err}"
+    );
+    let state: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(sb.path("state/test.json")).unwrap())
+            .unwrap();
+    assert!(state["cooldown"].is_null(), "{state}");
+    assert!(
+        err.contains(
+            "rate-limit refresh: gh's stderr ran past the 1048576 bytes gh-paced reads and was \
+             cut off there"
+        ),
+        "{err}"
+    );
+    let audit = std::fs::read_to_string(sb.path("state/test.audit.jsonl")).unwrap();
+    let refresh = audit
+        .lines()
+        .find(|l| l.contains("\"refresh\""))
+        .unwrap_or_else(|| panic!("no refresh record: {audit}"));
+    assert!(!refresh.contains("Retry-After cut off"), "{refresh}");
+    assert!(
+        refresh.contains("stderr ran past the 1048576 bytes"),
+        "{refresh}"
+    );
+}
+
 /// A consumer that reads gh's output late loses none of it. The fake gh writes its output and exits
 /// at once while the consumer has not read a byte; it starts reading 4 s later, long after gh has
 /// gone. 120 KiB is more than one 64 KiB pipe holds, so part of it is still inside gh-paced when gh

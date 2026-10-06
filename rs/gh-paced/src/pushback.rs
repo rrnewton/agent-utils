@@ -21,16 +21,19 @@
 //! read (and for a call without `--paginate` the line also ends the block). In a 403 or 429 block
 //! such a line therefore starts a cooldown with no end time ([`NO_END`]) instead of the shorter
 //! one the rest of the block would give; in any other block it ends the block. In a paginated
-//! call the long line must have the shape a short header line needs: a colon in its first
-//! [`MAX_HEADER_LINE`] bytes, and a CR LF end. A line without the colon is body text (printed by
-//! `--jq`, say) and drops the block; output that ends inside a long line that has the colon,
-//! before its line end arrives, commits the block, since nothing shows that it was body text. A
-//! status line that long (HTTP/1.1 lets the server choose the reason phrase) still opens its
-//! block, read from its first [`MAX_HEADER_LINE`] bytes.
+//! call a long line must end in CR LF to count, and one that comes before the block's first
+//! CR LF header line must also have the colon a short header line needs, in its first
+//! [`MAX_HEADER_LINE`] bytes: without it the line is body text (printed by `--jq`, say) and drops
+//! the block. After a CR LF header line, a long line counts whether or not its colon is in the
+//! bytes kept. Output that ends inside a long header line, before its line end arrives, commits
+//! the block when the block began on the first stdout line (gh's own first block, which no body
+//! text can come before) or already holds a CR LF header line. A status line that long (HTTP/1.1
+//! lets the server choose the reason phrase) still opens its block, read from its first
+//! [`MAX_HEADER_LINE`] bytes.
 //!
 //! On stderr, a `Retry-After` value that runs on past the [`OVERLAP`] bytes kept between chunks,
 //! so that its digits can no longer be read whole, also gives a cooldown with no end time. So
-//! does one that runs up to the point where a caller stopped reading stderr
+//! does one that starts its line and runs up to the point where a caller stopped reading stderr
 //! ([`Scanner::stderr_cut_off`]): the digits after the cut are lost.
 //!
 //! A paginated call prints one block per page, so [`Scanner::new`] reads every block: a block
@@ -94,6 +97,17 @@ fn retry_after_extent(value: &[u8]) -> (usize, usize) {
     (blanks, len)
 }
 
+/// Whether the text at `at` starts its line: between it and the line end before it (or the start
+/// of `text`) there are only blanks, or gh's debug `<` marker and blanks.
+fn starts_its_line(text: &[u8], at: usize) -> bool {
+    let line_start = text[..at]
+        .iter()
+        .rposition(|b| *b == b'\n' || *b == b'\r')
+        .map_or(0, |i| i + 1);
+    let before = text[line_start..at].trim_ascii();
+    before.is_empty() || before == b"<"
+}
+
 /// What the scanner saw.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Scanner {
@@ -152,6 +166,9 @@ struct HeaderBlock {
     crlf_headers: u32,
     /// A header line longer than [`MAX_HEADER_LINE`] was seen in this 403 or 429 block.
     overlong: bool,
+    /// The block began on the first stdout line, where gh's own output starts, so no body text
+    /// can have come before it.
+    first_line: bool,
 }
 
 /// The cooldown a scan calls for.
@@ -292,10 +309,16 @@ impl Scanner {
     /// so whatever followed is lost. A `Retry-After` value that runs up to the cut, including a
     /// name with no digits yet, may have had more digits, so the wait it asked for is not known:
     /// it gives a cooldown with no end time ([`Scanner::verdict`]), never the shorter value read.
-    /// (A value whose name is further back than the [`OVERLAP`] bytes kept was already marked
-    /// unreadable by [`Scanner::feed`].)
+    /// Only a `retry-after:` that starts its line counts here (after blanks, or after gh's debug
+    /// `<` marker and blanks, as in `< Retry-After: 60`): the words in the middle of a line of
+    /// prose are not a header, and a cut after them must not stop every paced call. (A value
+    /// whose name is further back than the [`OVERLAP`] bytes kept was already marked unreadable
+    /// by [`Scanner::feed`].)
     pub fn stderr_cut_off(&mut self) {
         for at in find_all(&self.carry, b"retry-after:") {
+            if !starts_its_line(&self.carry, at) {
+                continue;
+            }
             let value = &self.carry[at + 12..];
             let (blanks, len) = retry_after_extent(value);
             if blanks + len == value.len() {
@@ -348,17 +371,24 @@ impl Scanner {
             }
             self.pending = Some(HeaderBlock {
                 status,
+                first_line: first,
                 ..HeaderBlock::default()
             });
             return;
         }
-        // In a paginated call a long line is a header line only in the shape a short one needs:
-        // the colon after the header name is in the bytes kept. A line without one is body text
-        // (`--jq` output that happens to follow a status-shaped line) and drops the block, as a
-        // short line without a colon does.
-        let header_shaped = self.single_response || lower.contains(&b':');
+        // In a paginated call, a long line that comes before the block's first CR LF header line
+        // is a header line only in the shape a short one needs: the colon after the header name
+        // is in the bytes kept. A line without one there is body text (`--jq` output that happens
+        // to follow a status-shaped line) and drops the block, as a short line without a colon
+        // does. Once the block holds a CR LF header line it is in gh's header format, and a long
+        // line in it, with or without a colon in the bytes kept, may hold or hide the wait.
+        let single = self.single_response;
+        let colon = lower.contains(&b':');
         match self.pending.as_mut() {
-            Some(block) if can_ask_for_a_wait(block.status) && header_shaped => {
+            Some(block)
+                if can_ask_for_a_wait(block.status)
+                    && (single || colon || block.crlf_headers > 0) =>
+            {
                 // The line, or one after it, may hold the Retry-After: the wait is not known.
                 block.overlong = true;
                 if self.single_response {
@@ -400,9 +430,12 @@ impl Scanner {
     /// `Retry-After: 3600`, still counts. A line that is not a header ends the block, which
     /// keeps what it already reported. In a paginated call the line may be body text, so it is
     /// ignored rather than allowed to spoil the block, with one exception: a header-shaped
-    /// over-long line of a 403 or 429 block (see the module docs). Its line end, which would show
-    /// whether it was body text, never arrived, and the `Retry-After` it may hold cannot be read,
-    /// so the block is committed and the cooldown has no end time.
+    /// over-long line of a 403 or 429 block that began on the first stdout line (see the module
+    /// docs). Its line end never arrived, and the `Retry-After` it may hold cannot be read, so the
+    /// block is committed and the cooldown has no end time. Nothing can come before gh's own
+    /// first block, so that block is not body text. A later block with no CR LF header line yet
+    /// may be body text (a `--jq` page body cut short), so it is dropped there, and the cooldown
+    /// is whatever stderr gives (900 s for an `HTTP 429`).
     pub fn end_of_stdout(&mut self) {
         if self.single_response && !self.closed && !self.skipping && !self.line.is_empty() {
             let mut line = std::mem::take(&mut self.line);
@@ -415,7 +448,10 @@ impl Scanner {
         self.skipping = false;
         let cut_in_long_header = std::mem::take(&mut self.skipping_header);
         if let Some(block) = self.pending.take() {
-            if self.single_response || block.crlf_headers > 0 || cut_in_long_header {
+            if self.single_response
+                || block.crlf_headers > 0
+                || (cut_in_long_header && block.first_line)
+            {
                 self.commit(&block);
             }
         }
@@ -458,6 +494,7 @@ impl Scanner {
             // A new block starts; an unconfirmed earlier one is dropped.
             self.pending = Some(HeaderBlock {
                 status,
+                first_line: first,
                 ..HeaderBlock::default()
             });
             return;
@@ -952,7 +989,8 @@ mod tests {
         let healthy = "HTTP/2.0 200 OK\nX-Ratelimit-Remaining: 4000\r\n\r\n";
         for status in ["429 Too Many Requests", "403 Forbidden"] {
             let body = format!("HTTP/2.0 {status}\n{filler}\r\n\r\n");
-            // The colon of a header line must be in the bytes kept: one later is not.
+            // Before the block's first CR LF header line, the colon of a header line must be in
+            // the bytes kept: one later is not.
             let late_colon = format!("HTTP/2.0 {status}\n{filler}: 1\r\nRetry-After: 1\r\n\r\n");
             for text in [format!("{healthy}{body}"), body.clone(), late_colon] {
                 for s in [headers(&[&text]), headers(&chunks_of(&text))] {
@@ -972,11 +1010,44 @@ mod tests {
         }
     }
 
+    /// Once a paginated block holds a CR LF header line it is in gh's header format, so a later
+    /// over-long line in it never drops the block, with its colon after the bytes kept or with no
+    /// colon at all: the cooldown has no end time, as in round 9. (Round 10 applied the colon rule
+    /// here too, dropped the block, and lost the two-day `Retry-After` it had already read: no
+    /// cooldown at all, or 900 s from stderr.)
+    #[test]
+    fn a_long_line_after_a_header_line_never_drops_a_wait() {
+        let cfg = Config::default();
+        let filler = "X".repeat(9000);
+        let healthy = "HTTP/2.0 200 OK\nX-Ratelimit-Remaining: 4000\r\n\r\n";
+        for status in ["429 Too Many Requests", "403 Forbidden"] {
+            let late_colon =
+                format!("HTTP/2.0 {status}\nRetry-After: 172800\r\n{filler}: value\r\n\r\n[]\n");
+            let no_colon =
+                format!("HTTP/2.0 {status}\nRetry-After: 172800\r\n{filler}\r\n\r\n[]\n");
+            for text in [
+                late_colon.clone(),
+                no_colon.clone(),
+                format!("{healthy}{late_colon}"),
+                format!("{healthy}{no_colon}"),
+            ] {
+                for s in [headers(&[&text]), headers(&chunks_of(&text))] {
+                    assert!(s.overlong_header, "{status}: {s:?}");
+                    let v = s.verdict(&cfg).expect("pushback");
+                    assert!(v.has_no_end(), "{status}: {v:?}");
+                    assert!(v.reason.contains("8192 bytes"), "{}", v.reason);
+                }
+            }
+        }
+    }
+
     /// A paginated call's output that ends inside an over-long header line of a 403 or 429
     /// block, before the line's end arrives (gh stopped mid-write), gives the same verdict as an
-    /// over-long line that did end: the `Retry-After` cannot be read, so the cooldown has no end
-    /// time. (Before, the block had no complete CR LF header line, so the end of the output
-    /// dropped it and no cooldown started.)
+    /// over-long line that did end, when the block is gh's first one or already holds a CR LF
+    /// header line: the `Retry-After` cannot be read, so the cooldown has no end time. (Before
+    /// round 10, a block with no complete CR LF header line was dropped at the end of the output
+    /// and no cooldown started.) A later page's block cut inside its first header line may be a
+    /// `--jq` body cut short, so since the fixes after round 10 it is dropped.
     #[test]
     fn output_cut_inside_a_long_header_never_shortens_a_wait() {
         let cfg = Config::default();
@@ -988,6 +1059,9 @@ mod tests {
             let before = format!("HTTP/2.0 {status}\nX-Long: {filler}");
             let with_cr = format!("HTTP/2.0 {status}\nRetry-After: {zeros}172800\r");
             let after_page = format!("{healthy}{padded}");
+            let after_page_before = format!("{healthy}{before}");
+            let after_header =
+                format!("{healthy}HTTP/2.0 {status}\nX-A: b\r\nRetry-After: {zeros}172800");
             let mut cases = Vec::new();
             for text in [&padded, &before, &with_cr] {
                 cases.extend([
@@ -997,13 +1071,27 @@ mod tests {
                     single(&chunks_of(text)),
                 ]);
             }
-            // A later page's block (only a paginated call reads one).
-            cases.extend([headers(&[&after_page]), headers(&chunks_of(&after_page))]);
+            // A later page's block that already holds a CR LF header line (only a paginated call
+            // reads a later block).
+            cases.extend([
+                headers(&[&after_header]),
+                headers(&chunks_of(&after_header)),
+            ]);
             for s in cases {
                 assert!(s.overlong_header, "{status}: {s:?}");
                 let v = s.verdict(&cfg).expect("pushback");
                 assert!(v.has_no_end(), "{status}: {v:?}");
                 assert!(v.reason.contains("8192 bytes"), "{}", v.reason);
+            }
+            // A later page's block cut inside its first header line, with no CR LF header line
+            // yet, may be a `--jq` page body cut short (`X-Long: ` and 9,000 bytes of body text):
+            // it is dropped, and starts no cooldown. The cost, accepted after round 10: a real 429
+            // on a later page cut there gets only what stderr gives (900 s for an `HTTP 429`).
+            for text in [&after_page, &after_page_before] {
+                for s in [headers(&[text]), headers(&chunks_of(text))] {
+                    assert!(!s.overlong_header, "{status}: {s:?}");
+                    assert!(s.verdict(&cfg).is_none(), "{status}: {s:?}");
+                }
             }
         }
         // A cut long line with no colon, after a status-shaped line, may be body text.
@@ -1057,6 +1145,47 @@ mod tests {
         let s = cut(&format!("HTTP 429\n{}", "y".repeat(5000)));
         assert!(!s.cut_retry_after, "{s:?}");
         assert_eq!(s.verdict(&cfg).expect("pushback").cooldown_secs, 900.0);
+    }
+
+    /// Only a `retry-after:` that starts its line (after blanks, or after gh's debug `<` marker
+    /// and blanks) can be a header cut off by a capture limit. The words in the middle of a line
+    /// of prose, with the cut just after them, are not, and start no cooldown with no end time.
+    /// (Round 10 matched them anywhere: this stderr stopped every paced call.)
+    #[test]
+    fn a_cut_after_retry_after_in_prose_is_not_a_header() {
+        let cfg = Config::default();
+        let cut = |text: &str| {
+            let mut s = scan(&[text]);
+            s.stderr_cut_off();
+            s
+        };
+        let s = cut("y\nDocumentation example retry-after: ");
+        assert!(!s.cut_retry_after, "{s:?}");
+        assert!(s.verdict(&cfg).is_none(), "{s:?}");
+        let far_back = format!("{}retry-after: 1", "z".repeat(5000));
+        for text in [
+            "y\nsee Retry-After: 1",
+            "y\nx<Retry-After: 1",
+            far_back.as_str(),
+        ] {
+            let s = cut(text);
+            assert!(!s.cut_retry_after, "{text:?}: {s:?}");
+            // The digits are still read as a Retry-After (as before), but not as a cut one.
+            let v = s.verdict(&cfg).expect("pushback");
+            assert!(!v.has_no_end(), "{text:?}: {v:?}");
+        }
+        // A header at the start of its line, in each form gh writes, still counts.
+        for text in [
+            "HTTP 429\n< Retry-After: 1",
+            "HTTP 429\n  Retry-After: 1",
+            "HTTP 429\n<\tretry-after: ",
+            "HTTP 429\r\nRetry-After: 1",
+            "Retry-After: 1",
+        ] {
+            let s = cut(text);
+            assert!(s.cut_retry_after, "{text:?}: {s:?}");
+            assert!(s.verdict(&cfg).expect("pushback").has_no_end(), "{text:?}");
+        }
     }
 
     /// On stderr a `Retry-After` value is read whole while its name is within the bytes kept
