@@ -16,6 +16,7 @@ use crate::pushback::{has_no_end, Pushback, Scanner};
 use crate::ratelimit;
 use crate::runner::{
     write_stderr_bounded, DrainCommand, Exit, Invocation, PushbackHook, Ran, Runner,
+    MAX_CAPTURE_BYTES,
 };
 use crate::snapshot;
 use crate::state::{self, Cooldown, Holder, Lease, Paths, State};
@@ -817,6 +818,24 @@ impl Wrapper<'_> {
             Ok(cap) => {
                 let mut sc = Scanner::new();
                 sc.feed(&cap.stderr);
+                if cap.stderr_cut {
+                    // A Retry-After running up to the cut may have had more digits.
+                    sc.stderr_cut_off();
+                }
+                let cut: Vec<&str> = [(cap.stdout_cut, "stdout"), (cap.stderr_cut, "stderr")]
+                    .into_iter()
+                    .filter_map(|(cut, name)| cut.then_some(name))
+                    .collect();
+                let cut_note = (!cut.is_empty()).then(|| {
+                    format!(
+                        "gh's {} ran past the {MAX_CAPTURE_BYTES} bytes gh-paced reads and was \
+                         cut off there",
+                        cut.join(" and ")
+                    )
+                });
+                if let Some(note) = &cut_note {
+                    self.loud("WARNING", &format!("rate-limit refresh: {note}"));
+                }
                 if let Some(pb) = sc.verdict(&self.cfg) {
                     self.apply_pushback(&mut st, &pb, "api GET rate_limit (gh-paced refresh)", now);
                     r.detail = format!("pushback: {}", pb.reason);
@@ -857,6 +876,13 @@ impl Wrapper<'_> {
                         "WARNING",
                         &format!("rate-limit refresh failed ({why}); pacing on local budgets only"),
                     );
+                }
+                if let Some(note) = cut_note {
+                    r.detail = if r.detail.is_empty() {
+                        note
+                    } else {
+                        format!("{}; {note}", r.detail)
+                    };
                 }
             }
             Err(e) => {
