@@ -545,6 +545,16 @@ cache globs. It removes those regenerable directories, not a checkout or slot, a
 not require the slot owner or registered liveness source to be dead. A hold still protects the
 selected slot and reports `HELD` without deleting its caches.
 
+A name is not enough to make a directory a cache, so `clean-caches` deletes less than its globs
+select. Selection itself, with every refusal it raises, is unchanged and is shared with slot
+retirement. Of the selected directories, `clean-caches` keeps any that lies inside a package Cargo
+unpacked: the directory, or one above it in the checkout, holds Cargo's `.cargo-ok`. A crate can
+carry a source directory named `target`, and deleting it leaves Cargo unwilling to unpack the crate
+again. It also keeps a directory that only a glob with a wildcard (`*`, `?`, `[`, or `**`)
+selected, unless a build tool marked it as a cache: a `CACHEDIR.TAG` with the standard signature,
+or Cargo's `.rustc_info.json`. A glob without wildcards names one path and keeps its plain meaning.
+JSON rows list each kept directory and its reason under `skipped`.
+
 With neither selector, the command is a read-only report over all visible registered, journaled, and
 unregistered slots. `--only SLOT` is a destructive selector even though it does not use `--yes`; it
 may be repeated, emits rows only for the named slots, and refuses if any name cannot be attributed.

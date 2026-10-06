@@ -30755,6 +30755,121 @@ def test_clean_caches_can_reclaim_an_explicit_unregistered_flat_slot(
     assert (tree / "seed.txt").is_file()
 
 
+def test_clean_caches_keeps_cargo_package_sources_and_unmarked_wildcard_matches(
+    tmp_path: Path,
+) -> None:
+    """A directory's name alone does not make it a cache.
+
+    On 2026-10-06 `clean-caches --only` with the glob `ignored/**/target`
+    deleted the `src/target` source module of eleven unpacked `cc` crates in
+    a slot-local Cargo home, and left each crate's `.cargo-ok` marker, so Cargo
+    would not unpack them again.
+    """
+    project, _repository, _remote = make_project(
+        tmp_path, cache_globs=("target", "ignored/**/target")
+    )
+    assert create(project).returncode == 0
+    tree = checkout(project)
+    tag = "Signature: 8a477f597d28d172789f06886806bc55\n"
+
+    def package(root: Path) -> Path:
+        root.mkdir(parents=True)
+        (root / ".cargo-ok").write_text('{"v":1}', encoding="utf-8")
+        return root
+
+    home = tree / "ignored" / "hermetic" / "split" / "cargo"
+    index = home / "registry" / "src" / "index.crates.io-0000"
+    module = package(index / "cc-1.4.0") / "src" / "target" / "apple.rs"
+    module.parent.mkdir(parents=True)
+    module.write_text("// cc source\n", encoding="utf-8")
+    # Marked directories inside unpacked packages are still package source.
+    shipped = package(index / "odd-0.1.0") / "target"
+    shipped.mkdir()
+    (shipped / "CACHEDIR.TAG").write_text(tag, encoding="utf-8")
+    checked_out = package(home / "git" / "checkouts" / "dep-0000" / "abc1234") / "target"
+    checked_out.mkdir()
+    (checked_out / ".rustc_info.json").write_text("{}", encoding="utf-8")
+    # The marker is found whatever the directories above it are called.
+    renamed = package(tree / "ignored" / "registry-storage" / "src" / "idx" / "b-1.0.0")
+    (renamed / "target").mkdir()
+    (renamed / "target" / "CACHEDIR.TAG").write_text(tag, encoding="utf-8")
+    # Not built by Cargo, and found only by a wildcard.
+    fixture = tree / "ignored" / "fixture" / "target" / "expected.txt"
+    fixture.parent.mkdir(parents=True)
+    fixture.write_text("fixture\n", encoding="utf-8")
+    # Built by Cargo: one tagged, one that another tool created first.
+    tagged = tree / "ignored" / "hermetic" / "split" / "target"
+    (tagged / "debug").mkdir(parents=True)
+    (tagged / "CACHEDIR.TAG").write_text(tag, encoding="utf-8")
+    (tagged / "debug" / "artifact").write_bytes(b"regenerable")
+    untagged = tree / "ignored" / "lc" / "build" / "target"
+    (untagged / "debug").mkdir(parents=True)
+    (untagged / ".rustc_info.json").write_text("{}", encoding="utf-8")
+    (untagged / "debug" / "artifact").write_bytes(b"regenerable")
+    # A glob without wildcards names the checkout's build directory exactly.
+    (tree / "target" / "debug").mkdir(parents=True)
+    (tree / "target" / "debug" / "artifact").write_bytes(b"regenerable")
+
+    report = command(project, "clean-caches", "--format", "json")
+    cleaned = command(project, "clean-caches", "--only", "slot01", "--format", "json")
+
+    assert report.returncode == 0, report.stderr
+    (reported,) = json.loads(report.stdout)["slots"]
+    assert cleaned.returncode == 0, cleaned.stderr
+    (row,) = json.loads(cleaned.stdout)["slots"]
+    assert row["action"] == "REMOVED"
+    removed = sorted(str(path) for path in (tree / "target", tagged, untagged))
+    assert sorted(reported["paths"]) == removed
+    assert sorted(row["paths"]) == removed
+    package_reason = "inside an unpacked Cargo package (.cargo-ok)"
+    wildcard_reason = "matched by a wildcard glob, and no build tool marked it as a cache"
+    expected_skips = sorted(
+        [
+            {"path": str(module.parent), "reason": package_reason},
+            {"path": str(shipped), "reason": package_reason},
+            {"path": str(checked_out), "reason": package_reason},
+            {"path": str(renamed / "target"), "reason": package_reason},
+            {"path": str(fixture.parent), "reason": wildcard_reason},
+        ],
+        key=lambda skip: skip["path"],
+    )
+    assert sorted(reported["skipped"], key=lambda skip: skip["path"]) == expected_skips
+    assert sorted(row["skipped"], key=lambda skip: skip["path"]) == expected_skips
+    assert not (tree / "target").exists()
+    assert not tagged.exists()
+    assert not untagged.exists()
+    assert module.read_text(encoding="utf-8") == "// cc source\n"
+    assert (shipped / "CACHEDIR.TAG").is_file()
+    assert (checked_out / ".rustc_info.json").is_file()
+    assert (renamed / "target" / "CACHEDIR.TAG").is_file()
+    assert fixture.read_text(encoding="utf-8") == "fixture\n"
+
+
+def test_clean_caches_still_refuses_nested_git_under_an_unmarked_match(
+    tmp_path: Path,
+) -> None:
+    """Skipping a match does not skip the refusals that selection raises."""
+    project, _repository, _remote = make_project(
+        tmp_path, cache_globs=("ignored/**/target",)
+    )
+    assert create(project).returncode == 0
+    tree = checkout(project)
+    outer = tree / "ignored" / "outer" / "target"
+    nested = outer / "dependency"
+    nested.mkdir(parents=True)
+    git(nested, "init", "-q")
+    inner = outer / "inner" / "target"
+    inner.mkdir(parents=True)
+    (inner / ".rustc_info.json").write_text("{}", encoding="utf-8")
+
+    refused = command(project, "clean-caches", "--only", "slot01", "--format", "json")
+
+    assert refused.returncode == 3, refused.stderr
+    assert "nested Git metadata" in refused.stderr
+    assert (nested / ".git").is_dir()
+    assert (inner / ".rustc_info.json").is_file()
+
+
 def test_clean_caches_removes_read_only_directories_inside_a_cache(
     tmp_path: Path,
 ) -> None:

@@ -28305,6 +28305,97 @@ def _cache_slot_holds(
     return holds
 
 
+_CACHEDIR_TAG_SIGNATURE = b"Signature: 8a477f597d28d172789f06886806bc55"
+"""The first bytes of a ``CACHEDIR.TAG`` file (https://bford.info/cachedir/)."""
+
+
+def _is_regular_file(path: Path) -> bool:
+    try:
+        return stat.S_ISREG(os.lstat(path).st_mode)
+    except OSError:
+        return False
+
+
+def _has_build_cache_marker(path: Path) -> bool:
+    """Whether a tool has marked ``path`` as its build cache.
+
+    A ``CACHEDIR.TAG`` with the standard signature marks a cache for any
+    tool. Cargo writes one only when it creates a build directory itself, so
+    a build directory that another tool created first never receives one;
+    Cargo writes ``.rustc_info.json`` to its build directory on every run, and
+    that file marks such a directory too.
+    """
+
+    if _is_regular_file(path / ".rustc_info.json"):
+        return True
+    tag = path / "CACHEDIR.TAG"
+    if not _is_regular_file(tag):
+        return False
+    try:
+        with open(tag, "rb") as handle:
+            return handle.read(len(_CACHEDIR_TAG_SIGNATURE)) == _CACHEDIR_TAG_SIGNATURE
+    except OSError:
+        return False
+
+
+def _cache_is_within_unpacked_cargo_package(cache: CacheDirectory) -> bool:
+    """Whether ``cache`` lies inside source that Cargo unpacked.
+
+    Cargo writes ``.cargo-ok`` at the root of every crate it unpacks into a
+    Cargo home's ``registry/src`` and every Git dependency it checks out into
+    ``git/checkouts``, and it does not unpack that package again while the
+    file exists. Deleting a directory inside such a package, such as the
+    ``cc`` crate's ``src/target`` source module, therefore leaves a package
+    that Cargo neither repairs nor reports. The file is found whatever the
+    directories above it are called.
+    """
+
+    path = cache.path
+    while True:
+        if _is_regular_file(path / ".cargo-ok"):
+            return True
+        if path == cache.checkout_root or path.parent == path:
+            return False
+        path = path.parent
+
+
+def _cache_glob_names_path_literally(config: Config, cache: CacheDirectory) -> bool:
+    """Whether a cache glob without wildcards names ``cache`` exactly."""
+
+    relative = cache.path.relative_to(cache.checkout_root).as_posix()
+    patterns = (
+        *config.cache_globs,
+        *(pattern for _name, group in config.repo_cache_globs for pattern in group),
+    )
+    return any(
+        _glob_parts_are_literal(_glob_pattern_parts(pattern))
+        and _glob_matches_path(pattern, relative)
+        for pattern in patterns
+    )
+
+
+def _clean_caches_skip_reason(config: Config, cache: CacheDirectory) -> str | None:
+    """Why ``clean-caches`` keeps a directory its cache globs selected, if it does.
+
+    Selection, with every refusal it raises, is shared with retirement and
+    is unchanged; this only narrows what ``clean-caches`` deletes. A glob
+    with a wildcard finds directories by name, and a name is not evidence of
+    a cache: a crate's ``src/target`` module, a test fixture, or a directory
+    of worktrees can carry it. Such a match is deleted only when a build
+    tool has marked it. A glob without wildcards names one path the project
+    configured, and keeps its plain meaning. Nothing inside an unpacked
+    Cargo package is deleted.
+    """
+
+    if _cache_is_within_unpacked_cargo_package(cache):
+        return "inside an unpacked Cargo package (.cargo-ok)"
+    if not _cache_glob_names_path_literally(config, cache) and not _has_build_cache_marker(
+        cache.path
+    ):
+        return "matched by a wildcard glob, and no build tool marked it as a cache"
+    return None
+
+
 def _cmd_clean_caches(args: argparse.Namespace) -> int:
     config = _load_config(args.project_root, args.machine)
     if not config.cache_globs and not config.repo_cache_globs:
@@ -28376,6 +28467,7 @@ def _cmd_clean_caches(args: argparse.Namespace) -> int:
                 "cache_bytes": 0,
                 "action": "BLOCKED",
                 "paths": [],
+                "skipped": [],
                 "hold_reason": None,
                 "registered": False,
                 "state": "unregistered",
@@ -28402,22 +28494,35 @@ def _cmd_clean_caches(args: argparse.Namespace) -> int:
                 if cache_slot.state == "unregistered" and config.repo_cache_globs
                 else None
             )
+            skipped: list[dict[str, str]] = []
             if hold is not None:
                 directories = ()
                 cache_bytes = 0
                 action = "HELD"
             else:
                 try:
-                    directories = _cache_slot_directories(config, cache_slot)
-                    cache_bytes = sum(
-                        _allocated_cache_bytes(config, cache) for cache in directories
+                    measured = tuple(
+                        (cache, _allocated_cache_bytes(config, cache))
+                        for cache in _cache_slot_directories(config, cache_slot)
                     )
+                    # Every selected directory was measured, so its refusals
+                    # (nested Git metadata, for one) have already applied.
+                    kept: list[tuple[CacheDirectory, int]] = []
+                    for cache, size in measured:
+                        reason = _clean_caches_skip_reason(config, cache)
+                        if reason is None:
+                            kept.append((cache, size))
+                        else:
+                            skipped.append({"path": str(cache.path), "reason": reason})
+                    directories = tuple(cache for cache, _size in kept)
+                    cache_bytes = sum(size for _cache, size in kept)
                 except (Refusal, OSError) as exc:
                     if slot in selected:
                         raise Refusal(
                             f"cannot clean selected slot {slot}: {exc}"
                         ) from exc
                     directories = ()
+                    skipped = []
                     cache_bytes = 0
                     cache_error = str(exc)
                     action = "BLOCKED"
@@ -28434,6 +28539,7 @@ def _cmd_clean_caches(args: argparse.Namespace) -> int:
                     "cache_bytes": cache_bytes,
                     "action": action,
                     "paths": [str(cache.path) for cache in directories],
+                    "skipped": skipped,
                     "hold_reason": None if hold is None else hold["reason"],
                     "registered": cache_slot.state == "active",
                     "state": cache_slot.state,
