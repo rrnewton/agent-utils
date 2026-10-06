@@ -1,15 +1,80 @@
 # agent-utils
 
-A collection of small, standalone command-line tools for build orchestration
-and repository automation. Every established tool has an independently
-installable distribution. Paired tools share their core command contracts;
-installation-specific extensions are identified explicitly below.
+A suite of command-line tools for running a team of coding agents on one
+project: a coordinator agent that the owner talks to, subagents that each work
+in their own isolated checkout, and the plumbing that keeps their work
+visible, recoverable, and landed. Every tool also stands alone and has an
+independently installable distribution.
 
-The implementations are intentionally independent. Shared fixtures,
-differential tests, isolated package checks, and adversarial reviews catch
-schema, CLI, output, error, and state-transition drift.
+**To adopt the suite for a project**, open your coding agent in the project's
+Git checkout and tell it:
 
-## Paired tools
+> Adopt agent-utils for this project, following
+> `skills/agent-utils-setup/SKILL.md` from https://github.com/rrnewton/agent-utils.
+
+The agent walks you through a short guided setup: it detects what it can,
+installs missing dependencies with your agreement, and asks only what it cannot
+know. [QUICKSTART.md](QUICKSTART.md) shows a complete example on a one-commit
+repository.
+
+## The suite
+
+```text
+  owner ── chat (agentctl chat) ──┐      ┌── voice and phone (vibe-talk)
+                                  ▼      ▼
+                       ┌─────────────────────────────┐    timer ── tick-hub
+                       │ coordinator agent           │◄── agentctl send ──┘
+                       │ harness root, own Herdr tab │
+                       └──────────────┬──────────────┘
+                      agentctl start / send / read / stop
+             ┌────────────────────────┼────────────────────────┐
+             ▼                        ▼                        ▼
+       subagent (Claude)       subagent (Codex)        subagent (Muse)      each a real TUI
+       worktrees/slots/s1      worktrees/slots/s2      worktrees/slots/s3   in its own Herdr
+             └─────── wrkslots slots: branches of the primary checkout ───────┘   tab
+                                      │
+             validate (dagrun)  ·  reach the network (herdr-run)  ·  pace gh (gh-paced)
+                                      ▼
+                             the project's remote
+```
+
+A project that adopts the suite gets a **harness**: a directory holding the
+project's primary checkout, a `worktrees/` directory of agent slots, an
+`agent-utils/` checkout, and an `AGENTS.md` that makes the agent started there
+the coordinator. The coordinator follows the
+[`agent-utils-coordinator`](skills/agent-utils-coordinator/SKILL.md) skill:
+it turns the owner's goals into tasks, gives each task a fresh slot and a
+subagent, checks what the subagents claim, lands what is good under the
+project's own rules, and reports substance back to the owner.
+
+| Layer | Tool | Status | What it does |
+|---|---|---|---|
+| Terminals | [Herdr](https://github.com/herdrdev/herdr) | external dependency | A persistent terminal server. Every agent runs as its native TUI in a Herdr tab, so a person can attach to any of them and take over. |
+| Sessions | `agentctl` | core | Starts, messages, reads, and stops named agents across harnesses (Claude, Codex, Muse, and agentcloud workers), with durable prompt delivery and owner-controlled launch profiles. One interface for the owner and the coordinator alike. |
+| Workspaces | `wrkslots` | core | Gives each agent its own Git worktree slot on its own branch, records ownership and handoffs, salvages unpushed work, and removes a slot only after proving nothing uses it. Each slot gets systemd resource limits, optionally lives in its own sparse disk image, and can be boxed into a file-system view where only the slot is writable. |
+| Owner channel | `agentctl chat` | core | Bridges a chat space to the coordinator. Google Chat works today through the polling transport; other providers plug in through the subscription-plugin protocol, for which no provider ships yet. |
+| Voice | `vibe-talk` | optional | A deployable service that gives chat-bridged sessions a phone and voice front end. |
+| Recurring work | `tick-hub` | optional | One scheduled tick evaluates many recurring duties, each on its own cadence, and prints `ACTION:`/`HEALTH:` lines. A timer delivers them to the coordinator with `agentctl send`, the same queue the owner's messages use. |
+| Sandbox escape | `herdr-run` | optional | Runs an allowlisted command, such as `git push`, in a visible Herdr pane outside whatever confines the agent, and keeps an audit record of every run. |
+| Local CI | `dagrun` | optional | Runs a project's validation as a dependency graph under CPU, memory, and named-resource limits, with cgroup containment. `cpuset-alloc` and `parallel-experiment-runner` build on it. |
+| Retrospective | `wrkviz` | optional | Builds a zoomable timeline of what the coordinator and its subagents did, from their transcripts, across agents and teams. |
+| GitHub hygiene | `gh-paced` | optional | Paces `gh` calls against per-account budgets so many agents sharing one GitHub account stay inside GitHub's limits and do not get the account suspended. |
+| Landing | `pr-landing-planner` | experimental | Produces an advisory, conflict- and CI-aware plan for landing a queue of pull requests. |
+
+The core tools are always set up; the optional ones are offered during setup
+and can be added later by asking the coordinator. Each tool has a skill under
+[`skills/`](skills/README.md), plus `quickstart`, `--help`, and `userguide`
+commands that stay authoritative for its usage.
+
+## Implementations
+
+Paired tools share their core command contracts; installation-specific
+extensions are identified explicitly below. The implementations are
+intentionally independent. Shared fixtures, differential tests, isolated
+package checks, and adversarial reviews catch schema, CLI, output, error, and
+state-transition drift.
+
+### Paired tools
 
 | Command | Purpose | Python distribution | Rust crate |
 |---|---|---|---|
@@ -24,17 +89,21 @@ Each distribution is independently installable and documented. Its README and
 embedded user guide describe only that edition, so package-index users do not
 need this source tree or knowledge of the sibling implementation.
 
-## Python-only tools
+### Python-only tools
 
 | Command | Purpose | Python distribution |
 |---|---|---|
 | `wrkviz` | Build durable, zoomable local timelines from coordinator and subagent transcripts. | `wrkviz` |
 | `parallel-experiment-runner` | Run boxed, resource-bounded concurrent seed sweeps through `dagrun`. | `parallel-experiment-runner` |
+| `wrkslots` | Provision, box, hand off, and safely reclaim isolated Git worktree slots, one per agent. | `wrkslots` |
 | `agentctl` extensions | Headless workers in Herdr or tmux, the legacy polling Chat transport and launcher, and an MCP interface over the same sessions. | Included in `agentctl` |
 
 These tools are independently installable and follow the same package
 documentation and artifact checks. They are explicit exceptions to the
 two-language implementation and behavioral-differential contract.
+
+`gh-paced` is the one Rust-only tool. It is built from `rs/gh-paced` and ships
+in no package index; see its [quickstart](common/docs/gh-paced/QUICKSTART.md).
 
 ## Persistent coding agents
 
@@ -73,7 +142,7 @@ vibe-talk/         a deployable service, outside the workspaces (see below)
 py/                independently publishable Python distributions
 rs/                independently publishable Rust crates
 scripts/           documentation, package, and dependency contract checks
-skills/            thin agent-facing command discovery files
+skills/            agent-facing skills: suite setup, the coordinator, and one per tool
 ```
 
 Several tools use a shared documentation renderer that combines:

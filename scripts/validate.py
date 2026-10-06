@@ -228,6 +228,7 @@ PREFIX_RULES: tuple[tuple[str, frozenset[str]], ...] = (
     ("Makefile", frozenset(GROUPS)),
     ("setup", frozenset(GROUPS)),
     ("README.md", frozenset()),
+    ("QUICKSTART.md", frozenset()),
     ("scripts/README.md", frozenset()),
     ("cross/README.md", frozenset()),
     ("AGENTS.md", frozenset()),
