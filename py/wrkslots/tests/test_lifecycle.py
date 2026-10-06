@@ -22763,6 +22763,176 @@ def test_retire_pending_json_preserves_success_before_partial_state(
     ]
 
 
+def _queue_two_finished_slots_with_dead_owners(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> tuple[Path, Path, Path]:
+    project, repository, remote = make_project(tmp_path)
+    for slot, agent, branch in (
+        ("slot01", "codex-1", "codex/one"),
+        ("slot02", "codex-2", "codex/two"),
+    ):
+        assert create(project, slot=slot, agent=agent, branch=branch).returncode == 0
+        commit_task(repository, checkout(project, slot=slot), branch)
+        source = tmp_path / f"{slot}.md"
+        source.write_text(f"retire {slot}\n", encoding="utf-8")
+        assert raw_command(
+            project,
+            "write-handoff",
+            slot,
+            "--agent",
+            agent,
+            "--owner-pid",
+            str(os.getpid()),
+            "--expected-generation",
+            "1",
+            "--from-file",
+            str(source),
+        ).returncode == 0
+        assert finish(project, slot=slot, agent=agent).returncode == 0
+        assert raw_command(
+            project,
+            "read-handoff",
+            slot,
+            "--coordinator-pid",
+            str(os.getpid()),
+        ).returncode == 0
+        mark_owner_dead(project, slot=slot)
+    set_liveness(project, "dead")
+    monkeypatch.setattr(wrkslots, "_assert_slot_unused", lambda *_args, **_kwargs: None)
+    return project, repository, remote
+
+
+def _retire_two(project: Path) -> int:
+    return wrkslots.main(
+        [
+            "--project-root",
+            str(project),
+            "retire-pending",
+            "--limit",
+            "2",
+            "--coordinator-pid",
+            str(os.getpid()),
+            "--format",
+            "json",
+        ]
+    )
+
+
+@pytest.mark.parametrize(
+    "drift",
+    ("own-repository-registration", "other-repository-registration", "missing-directory"),
+)
+def test_retire_pending_continues_past_one_targets_own_storage_drift(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    drift: str,
+) -> None:
+    """A slot whose own storage disagrees with its row does not stop the batch.
+
+    Two of these drifts were seen on a shared host: a worktree of another
+    row's repository registered inside the slot, and a row whose slot
+    directory is gone.  The removal refuses each before it changes the slot,
+    so the target is reported as needing recovery, left exactly as it was,
+    and the next candidate is still attempted.
+    """
+
+    project, repository, remote = _queue_two_finished_slots_with_dead_owners(
+        tmp_path, monkeypatch
+    )
+    first_slot = checkout(project, slot="slot01").parent
+    nested = checkout(project, slot="slot01") / "ignored" / "nested"
+    registrar = repository
+    if drift == "other-repository-registration":
+        registrar = project / "repo-other"
+        git(project, "clone", str(remote), str(registrar))
+        assert create(
+            project,
+            slot="other",
+            agent="other",
+            branch="other/task",
+            repository_name="repo-other",
+        ).returncode == 0
+    if drift == "missing-directory":
+        shutil.rmtree(first_slot)
+        expected = ["no slot directory"]
+    else:
+        git(registrar, "worktree", "add", "-b", "nested", str(nested))
+        expected = ["registers", str(nested)]
+        if drift == "other-repository-registration":
+            expected.append("unexpected path")
+
+    code = _retire_two(project)
+
+    assert code == 3
+    payload = json.loads(capsys.readouterr().out)
+    assert [row["slot"] for row in payload["removed"]] == ["slot02"]
+    assert payload["retained"] == []
+    assert payload["deferred"] == []
+    assert payload["recovery_required"] is True
+    [row] = payload["could_not_determine"]
+    assert row["slot"] == "slot01"
+    assert row["recovery_required"] is True
+    for text in expected:
+        assert text in row["reason"]
+    assert "the slot is unchanged, so the batch continued" in row["reason"]
+    config = wrkslots._load_config(str(project), "testhost")
+    state = wrkslots._load_active(config, require_repository=False)
+    remaining = {(item.slot, item.generation) for item in state.slots}
+    assert ("slot01", 1) in remaining
+    assert all(slot != "slot02" for slot, _generation in remaining)
+    if drift != "missing-directory":
+        assert nested.is_dir()
+        assert str(nested) in git(registrar, "worktree", "list").stdout
+
+
+def test_retire_pending_stops_when_a_storage_drift_left_registry_state(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The batch goes on after a storage drift only if the registry is untouched."""
+
+    project, _repository, _remote = _queue_two_finished_slots_with_dead_owners(
+        tmp_path, monkeypatch
+    )
+    config = wrkslots._load_config(str(project), "testhost")
+    partial = config.control / "ACTIVE.testhost.json.tmp.injected"
+    original_remove = wrkslots._cmd_remove
+
+    def drift_then_partial(
+        args: argparse.Namespace,
+        *,
+        private_cleanup: wrkslots._PrivateCleanupContext | None = None,
+        validation_removal_proof: wrkslots._ValidationRemovalProof | None = None,
+        emit: bool = True,
+    ) -> int:
+        if args.slot == "slot01":
+            partial.write_text("partial\n", encoding="utf-8")
+            raise wrkslots._TargetStorageDrift("injected target storage drift")
+        return original_remove(
+            args,
+            private_cleanup=private_cleanup,
+            validation_removal_proof=validation_removal_proof,
+            emit=emit,
+        )
+
+    monkeypatch.setattr(wrkslots, "_cmd_remove", drift_then_partial)
+    code = _retire_two(project)
+
+    assert code == 3
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["removed"] == []
+    [row] = payload["could_not_determine"]
+    assert row["slot"] == "slot01"
+    assert row["reason"].startswith("injected target storage drift; ")
+    assert str(partial) in row["reason"]
+    assert [item["slot"] for item in payload["deferred"]] == ["slot02"]
+    assert payload["deferred"][0]["reason"] == (
+        "batch stopped after an indeterminate retirement outcome"
+    )
+
+
 def test_finish_still_refuses_a_legacy_flat_handoff(tmp_path: Path) -> None:
     project, repository, _remote = make_project(
         tmp_path, worktrees_directory="worktrees/slots", layout="flat"

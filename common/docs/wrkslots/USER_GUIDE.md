@@ -591,7 +591,12 @@ race retains the slot in the queue. Successful archived removal clears its sidec
 Attempt events rotate blocked entries behind never-attempted and less-recently-attempted entries, so
 one retained slot cannot starve the rest of a bounded queue. Lock contention is deferred; corrupt,
 partial, or indeterminate state stops the batch and requires recovery instead of being mislabeled as
-retained. Sidecar cleanup atomically renames the exact inode into content-addressed retired control
+retained. A defect in one item's own storage that removal finds before it changes the slot, such as
+an active row whose slot directory is gone or a Git worktree registered inside the slot, is reported
+as could-not-determine with recovery required. The batch then goes on to its next item, but only
+after it reads the registry again under the lock and finds no partial update, no mutation journal,
+and the item's row unchanged.
+Sidecar cleanup atomically renames the exact inode into content-addressed retired control
 storage and never unlinks that retired pathname, so a same-UID replacement cannot be mistaken for
 the acknowledged artifact. A direct-child checkout handoff is likewise moved by no-replace into an
 identity-bound retired path before its fenced slot is removed; pathname recreation preserves both

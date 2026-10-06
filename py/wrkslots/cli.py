@@ -818,6 +818,17 @@ class StateError(Refusal):
     """A corrupt, partial, or incompatible state refusal."""
 
 
+class _TargetStorageDrift(StateError):
+    """Physical or Git drift of one target row's own storage.
+
+    The registry as a whole validated; only the target's slot directory,
+    checkout or a Git registration inside the target slot disagrees with its
+    row.  A retirement batch reports the target as needing recovery and goes
+    on with its other candidates once the registry shows the attempt changed
+    nothing.
+    """
+
+
 class _LockBusy(Refusal):
     """A bounded lock wait elapsed without acquiring the requested lock."""
 
@@ -9667,7 +9678,7 @@ def _assert_target_record_storage_consistent(
             and finding.slot_type == record.slot_type
             and finding.machine in {None, record.machine}
         ):
-            raise StateError(finding.detail, remedy=finding.remedy)
+            raise _TargetStorageDrift(finding.detail, remedy=finding.remedy)
     _assert_no_cross_repository_target_registrations(config, states, record)
 
 
@@ -9715,7 +9726,7 @@ def _assert_no_cross_repository_target_registrations(
                 continue
             if expected_common_by_path.get(registered) == common:
                 continue
-            raise StateError(
+            raise _TargetStorageDrift(
                 f"source repository {repository} (Git common directory {common}) "
                 f"registers unexpected path {registered} inside target slot "
                 f"{record.slot}",
@@ -23940,6 +23951,58 @@ def _retirement_outcome_after_refusal(
         ) from exc
 
 
+def _confirm_unchanged_after_target_storage_drift(
+    config: Config,
+    candidate: _RetirementCandidate,
+    deadline: float,
+) -> None:
+    """Confirm that a removal refused for its target's own storage changed nothing.
+
+    ``remove`` checks the target's storage before its first change to the
+    slot; only the queue's attempt event precedes that check.  Under the
+    mutation locks again, the registry must show no partial update and no
+    mutation journal, and must still hold the candidate's exact row.
+    Anything else, including a lock that cannot be taken, raises StateError.
+    """
+
+    try:
+        with _mutation_locks(
+            config,
+            _remaining_lock_wait(deadline),
+            deadline=deadline,
+        ):
+            _refuse_partial_state(config)
+            journals = _outstanding_journals(config)
+            if journals:
+                raise StateError(
+                    f"retirement attempt for {candidate.slot} left mutation journal "
+                    f"{journals[0]}; run recover before classifying its outcome"
+                )
+            states, _archives = _validate_global_state(
+                config, require_repository=False
+            )
+            current = next(
+                (
+                    record
+                    for state in states
+                    if state.machine == candidate.machine
+                    for record in state.slots
+                    if record.slot == candidate.slot
+                ),
+                None,
+            )
+            if current is None or current.generation != candidate.generation:
+                raise StateError(
+                    f"retirement attempt for {candidate.slot} no longer finds its "
+                    "exact active row after its storage refusal"
+                )
+    except _LockBusy as exc:
+        raise StateError(
+            f"retirement attempt for {candidate.slot} could not be confirmed "
+            f"unchanged after its storage refusal: {exc}"
+        ) from exc
+
+
 def _cmd_retire_pending(args: argparse.Namespace) -> int:
     if args.limit <= 0 or args.limit > RETIRE_PENDING_LIMIT:
         raise Refusal(
@@ -23981,6 +24044,37 @@ def _cmd_retire_pending(args: argparse.Namespace) -> int:
         remove_args = argparse.Namespace(**remove_values)
         try:
             _cmd_remove(remove_args, emit=False)
+        except _TargetStorageDrift as exc:
+            # One target's own storage is broken; the registry is not. The
+            # target needs recovery, and the batch goes on only when the
+            # registry shows that this attempt changed nothing.
+            reason = str(exc) + (f"; remedy: {exc.remedy}" if exc.remedy else "")
+            try:
+                _confirm_unchanged_after_target_storage_drift(
+                    config, candidate, deadline
+                )
+            except StateError as state_error:
+                could_not_determine.append(
+                    {
+                        **identity,
+                        "outcome": "could-not-determine",
+                        "reason": f"{reason}; {state_error}",
+                        "recovery_required": True,
+                    }
+                )
+                stopped_at = index
+                break
+            could_not_determine.append(
+                {
+                    **identity,
+                    "outcome": "could-not-determine",
+                    "reason": (
+                        f"{reason}; the slot is unchanged, so the batch "
+                        "continued with its next candidate"
+                    ),
+                    "recovery_required": True,
+                }
+            )
         except StateError as exc:
             could_not_determine.append(
                 {
