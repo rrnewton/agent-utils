@@ -17148,12 +17148,15 @@ def _judge_run_evidence(
     enumerations had begun, so their unit states do not cover its run: a
     unit queued after the second enumeration, whose job has not started,
     shows no state, process or member.  Such a handle is a run that may
-    still use the row.  Rerunning reads it before the units.
+    still use the row.  Rerunning reads it before the units.  A handle's
+    recorded process generation that the later process table holds is a
+    run too, even when it has exited since: it may have queued its unit
+    after the second enumeration (``_assert_retained_handle_processes_dead``).
     """
 
     slots = {record.slot for record, _paths in rows}
     bindings = {slot: evidence.bindings.get(slot, ()) for slot in slots}
-    _assert_retained_handle_processes_dead(bindings)
+    _assert_retained_handle_processes_dead(bindings, evidence.processes)
     _assert_absent_validate_systemd_unrelated(
         rows,
         bindings,
@@ -17329,9 +17332,10 @@ def _validation_run_liveness_states(
         result[key] = (
             "dead",
             f"{len(evidence.bindings.get(record.slot, ()))} retained run handle(s) "
-            "name this row, each "
-            "with a dead process generation and an inactive, unqueued unit with no "
-            "live process; no active or queued user-systemd unit names its paths",
+            "name this row, each with an inactive, unqueued unit with no live "
+            "process and any recorded process generation dead and absent from the "
+            "later process table; no active or queued user-systemd unit names its "
+            "paths",
         )
     return result
 
@@ -48352,8 +48356,24 @@ def _unit_working_directory(unit: Mapping[str, str]) -> str:
 
 def _assert_retained_handle_processes_dead(
     bindings: Mapping[str, tuple[_RetainedValidationHandle, ...]],
+    processes: Sequence[_AbsentProcessObservation] = (),
 ) -> None:
+    """Refuse when a handle's recorded process generation runs, or ran
+    during the host evidence that ``processes`` holds.
+
+    The direct check reads each current-boot generation now.  It alone does
+    not cover a process that hands its run to a unit: a process that queues
+    its unit after the second user-systemd enumeration and then exits reads
+    dead here while no enumeration shows the unit.  Such a process was alive
+    when the later process table read it, because a unit it queued before
+    that read shows in the second enumeration unless its run has ended.  A
+    recorded generation that ``processes`` holds (the later table of
+    ``_processes_around_unit_enumeration``) is therefore a run that may
+    still use the row, as is one that runs now.
+    """
+
     current_boot = _boot_id(Path("/proc"))
+    observed = {(process.pid, process.start_ticks) for process in processes}
     for slot, handles in bindings.items():
         for handle in handles:
             if handle.pid is None:
@@ -48365,6 +48385,12 @@ def _assert_retained_handle_processes_dead(
                 raise _ValidationRunMayUseRow(
                     f"retained validation handle {handle.path} has live exact process "
                     f"generation {handle.pid} for row {slot}"
+                )
+            if (handle.pid, handle.start_ticks) in observed:
+                raise _ValidationRunMayUseRow(
+                    f"retained validation handle {handle.path} records process "
+                    f"generation {handle.pid}, which the process table read after the "
+                    f"first user-systemd enumeration showed running, for row {slot}"
                 )
 
 

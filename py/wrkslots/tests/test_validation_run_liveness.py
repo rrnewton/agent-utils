@@ -1664,6 +1664,182 @@ def test_absent_row_recovery_sees_a_run_child_that_appears_during_the_unit_enume
     assert f"retained validation unit {RUN_UNIT} still has a live cgroup process" in error
 
 
+# A launcher whose handle records its own process generation hands the run to
+# a unit: the process queues the unit and then exits.  The control group named
+# below holds the launcher, not the run's unit.
+LAUNCHER_CGROUP = "/user.slice/app.slice/launcher.scope"
+
+
+@dataclass(frozen=True)
+class _Handoff:
+    child: subprocess.Popen[bytes]
+    observation: wrkslots._AbsentProcessObservation
+    # How many user-systemd enumerations have run.
+    enumerations: list[int]
+
+
+@contextlib.contextmanager
+def _handoff_process(
+    monkeypatch: pytest.MonkeyPatch, project: Path, tree: Path, *, exits_during: int
+) -> Iterator[_Handoff]:
+    """Record a live child in the run's handle; it exits during an enumeration.
+
+    The child is in every process table read while it runs.  It exits, and
+    is reaped, during enumeration ``exits_during`` (0 is the first), and
+    the run's unit is in neither enumeration: it is queued after them, as
+    the child's last act.
+    """
+
+    child = subprocess.Popen(
+        ["sleep", "300"],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    try:
+        pid_dir = Path("/proc") / str(child.pid)
+        start_ticks = wrkslots._process_start_ticks(pid_dir)
+        namespace = wrkslots._mount_namespace(pid_dir)
+        assert start_ticks is not None and namespace is not None
+        _write_run_handle(
+            project,
+            tree,
+            process_identity={
+                "pid": child.pid,
+                "start_ticks": start_ticks,
+                "boot_id": wrkslots._boot_id(Path("/proc")),
+            },
+        )
+        observation = wrkslots._AbsentProcessObservation(
+            pid=child.pid,
+            start_ticks=start_ticks,
+            cgroup_path=LAUNCHER_CGROUP,
+            mount_namespace=namespace,
+        )
+        enumerations = [0]
+
+        def units() -> tuple[Mapping[str, str], ...]:
+            if enumerations[0] == exits_during:
+                child.kill()
+                child.wait()
+            enumerations[0] += 1
+            return ()
+
+        def processes(**_kwargs: object) -> tuple[wrkslots._AbsentProcessObservation, ...]:
+            return (observation,) if child.poll() is None else ()
+
+        monkeypatch.setattr(wrkslots, "_user_systemd_snapshot", units)
+        monkeypatch.setattr(wrkslots, "_absent_validate_process_snapshot", processes)
+        yield _Handoff(child, observation, enumerations)
+    finally:
+        if child.poll() is None:
+            child.kill()
+        child.wait()
+
+
+def _handoff_message(handoff: _Handoff, slot: str) -> str:
+    return (
+        f"records process generation {handoff.child.pid}, which the process table "
+        "read after the first user-systemd enumeration showed running, for row "
+        f"{slot}"
+    )
+
+
+def test_a_run_process_that_hands_off_to_its_unit_after_the_enumerations_is_alive(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The recorded process ran through both enumerations, then exited.
+
+    It queued its unit after the second enumeration, so no enumeration shows
+    the unit, and by the judgment its generation is dead.  The later process
+    table read it running, after the first enumeration: a unit it had queued
+    before that read would show in the second enumeration, so it may have
+    queued its unit only after them.
+    """
+
+    project, tree = _prepare(tmp_path, monkeypatch, agent_liveness="dead")
+    config = wrkslots._load_config(str(project), "testhost")
+    with _handoff_process(monkeypatch, project, tree, exits_during=1) as handoff:
+        states = wrkslots._validation_run_liveness_states(
+            config, wrkslots._load_active(config).slots
+        )
+        assert handoff.enumerations == [2]
+        assert handoff.child.poll() is not None
+
+    assert len(states) == 1
+    state, message = next(iter(states.values()))
+    assert state == "alive", message
+    assert _handoff_message(handoff, "slot01") in message
+
+
+def test_a_run_process_that_exits_before_the_later_table_is_not_alive(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A recorded process that the later table did not read is no run.
+
+    It exited during the first enumeration.  A unit it queued before
+    exiting was queued before the second enumeration, which shows none.
+    """
+
+    project, tree = _prepare(tmp_path, monkeypatch, agent_liveness="dead")
+    config = wrkslots._load_config(str(project), "testhost")
+    with _handoff_process(monkeypatch, project, tree, exits_during=0) as handoff:
+        states = wrkslots._validation_run_liveness_states(
+            config, wrkslots._load_active(config).slots
+        )
+        assert handoff.enumerations == [2]
+
+    assert len(states) == 1
+    state, message = next(iter(states.values()))
+    assert state == "dead", message
+
+
+def test_absent_agent_row_recovery_sees_a_run_process_hand_off_to_its_unit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """recover-absent-agent-rows judges the handoff through the same code."""
+
+    project, repository, _remote = make_project(tmp_path)
+    record = prepare_absent_agent_row(project, repository)
+    config = wrkslots._load_config(str(project), "testhost")
+    tree = wrkslots._stored_path(config, record.checkouts[0].path, "checkout")
+    _prepare_absent_validate_recovery_host(project, monkeypatch)
+    with _handoff_process(monkeypatch, project, tree, exits_during=1) as handoff:
+        assert run_absent_agent_recovery(project, record, apply=False) == 3
+        assert handoff.enumerations == [2]
+        assert handoff.child.poll() is not None
+
+    assert _handoff_message(handoff, record.slot) in capsys.readouterr().err
+
+
+def test_absent_validate_row_recovery_refuses_the_handoff_before_its_host_reads(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """recover-absent-validate-rows reads the recorded generation first.
+
+    Its direct check runs before the host evidence, while the process still
+    runs, so it refuses before any enumeration.
+    """
+
+    project, repository, _remote = make_project(tmp_path)
+    project, input_path = _prepare_absent_validate_recovery(project, repository, monkeypatch)
+    config = wrkslots._load_config(str(project), "testhost")
+    record = next(
+        record for record in wrkslots._load_active(config).slots if record.slot == "gone"
+    )
+    tree = wrkslots._stored_path(config, record.checkouts[0].path, "checkout")
+    with _handoff_process(monkeypatch, project, tree, exits_during=1) as handoff:
+        assert run_absent_validate_recovery(project, input_path, apply=False) == 3
+        assert handoff.enumerations == [0]
+
+    error = capsys.readouterr().err
+    assert f"has live exact process generation {handoff.child.pid} for row gone" in error
+
+
 # The tests below leave the host-evidence seam in place: the retained handles,
 # this host's real process table (read on both sides of the unit enumeration)
 # and the boot id are all read for real, and the run's process is a real child.
