@@ -392,27 +392,29 @@ validation slots. `audit`, `remove` (including `--validate-complete` and `remove
   host run can be missing from the process table, so an empty table is no evidence. All of this evidence is local to the host, so a host without a reachable user service manager cannot prove a
   validation slot free.
 
-A unit names a row path when one of the words of its property strings is that path or a path
-inside it. Each element of a property (one command-line argument, environment assignment or path),
-each line of an element, and a property string as a whole are words, and so are their shell words,
-read once as the shell splits words and once with the control operators `;`, `&&`, `|` and the
-others as words of their own (so `cd '<path>'; make` holds `<path>`). A shell word that holds
-quotes, whitespace or an operator is read again as shell text, up to three times
-(`bash -c "cd '<path>' && make"`). Each of those is also split into words at whitespace, quotes, and the characters `=`, `:`, `,`, `;`, `&`, `|`,
-`(`, `)`, `<`, `>`, `{`, `}` and `$`, and split again at the same characters except whitespace, so
-a row path containing a space is still one word in `--checkout=<path>` or `cd '<path>'`. The rest
-of each element and shell word from just after every `=`, and after every one of those characters
-that `/` or `~` follows, is a word too (cut to 4,096 characters, the longest path a system call
-accepts), so `--checkout=<path>` and `NAME=<path>` keep a path that contains `:` or a quote. A
-leading `-`, `!`, `@` or `+` is also tried without it. The row path's own spellings (below) are
-also found as text anywhere in a property string, when they begin it or follow one of those
-characters and end it or precede `/` or one of those characters, so a row path is found whole even
-where it contains a newline or ends just before a `:`. Every reading only adds words, so a path that
-contains one of these characters can name a row it is not inside (`slot01:other` names `slot01`)
-and refuse falsely, but no reading hides a row path's own spelling. A symlink to a row whose own
-name contains one of these characters can still go unmatched by the symlink's spelling when another
-of them follows it in the same shell word (`PATH=<symlink>:/bin`), and a path the shell computes
-from a variable, a glob or a command substitution is not read.
+A unit names a row path when one of the words of its property strings is that path or a path inside
+it. Each element of a property (one command-line argument, environment assignment or path), each
+line of an element, and a property string as a whole are words, and so are their shell words, read
+once as the shell splits words and once with the control operators `;`, `&&`, `|` and the others as
+words of their own (so `cd '<path>'; make` holds `<path>`). A shell word that holds quotes,
+whitespace or an operator is read again as shell text, up to three times
+(`bash -c "cd '<path>' && make"`). Each of those is also split into words at whitespace, quotes, and
+the characters `=`, `:`, `,`, `;`, `&`, `|`, `(`, `)`, `<`, `>`, `{`, `}` and `$`, and split again
+at the same characters except whitespace, so a row path containing a space is still one word in
+`--checkout=<path>` or `cd '<path>'`. The rest of each element and shell word from just after every
+`=`, and after every one of those characters that `/` or `~` follows, is a word too (cut to 4,096
+characters, the longest path a system call accepts), so `--checkout=<path>` and `NAME=<path>` keep a
+path that contains `:` or a quote. A leading `-`, `!`, `@` or `+` is also tried without it. The row
+path's own spellings (below) are also found as text anywhere in a property string, when they begin
+it or follow one of those characters and end it or precede `/` or one of those characters, so a row
+path is found whole even where it contains a newline or ends just before a `:`. One followed by a
+path that leaves it through `..` before the next of those characters (`<row>/../slot02`) is resolved
+as that whole path instead, so it names the row only when a symlink leads back inside. Every reading
+only adds words, so a path that contains one of these characters can name a row it is not inside
+(`slot01:other` names `slot01`) and refuse falsely, but no reading hides a row path's own spelling.
+A symlink to a row whose own name contains one of these characters can still go unmatched by the
+symlink's spelling when another of them follows it in the same shell word (`PATH=<symlink>:/bin`),
+and a path the shell computes from a variable, a glob or a command substitution is not read.
 A relative word is resolved against the unit's working directory (the home directory when it has
 none), and `~` is the home directory. Each word is then compared as a whole path: its normalized
 spelling, its symlink-resolved spelling as written (a `..` after a symlink leaves the symlink's

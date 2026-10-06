@@ -772,6 +772,38 @@ def test_a_quoted_shell_word_before_a_control_operator_is_one_path(tmp_path: Pat
     assert not names(ExecStart=f"/bin/sh\0-c\0bash -c \"cd '{other}/product'; make\"")
 
 
+def test_a_row_spelling_followed_by_a_parent_step_out_of_it_is_resolved(
+    tmp_path: Path,
+) -> None:
+    """``<row>/../slot02`` is the sibling, not a path inside the row.
+
+    The row's spelling found as text counts as naming the row only when
+    what follows it up to the next separator stays below it; a ``..``
+    that leaves it makes the whole spelling a path to resolve, so a
+    symlink inside the row still counts where it leads.
+    """
+
+    row = tmp_path / "project" / "worktrees" / "validate" / "slot01"
+    (row / "product" / "build").mkdir(parents=True)
+    (row.parent / "slot02").mkdir()
+    (row / "deep").symlink_to(row / "product" / "build")
+    spaced = tmp_path / "with space" / "slot01"
+    spaced.mkdir(parents=True)
+    (spaced.parent / "slot02").mkdir()
+
+    def names(target: Path, **unit: str) -> bool:
+        return wrkslots._UnitPathResolver().names(unit, wrkslots._row_path_identity(target))
+
+    assert not names(row, ExecStart=f"{row}/../slot02")
+    assert not names(row, ExecStart=f"make\0-C\0{row}/../slot02/build")
+    assert not names(row, Environment=f"PATH=/bin:{row}/../slot02:/usr/bin")
+    assert not names(spaced, ExecStart=f"/bin/sh\0-c\0cd '{spaced}/../slot02' && make")
+    assert names(row, ExecStart=f"{row}/../slot01/product")
+    assert names(row, ExecStart=f"{row}/product/../build")
+    assert names(row, ExecStart=f"{row}/deep/../..")
+    assert names(spaced, ExecStart=f"/bin/sh\0-c\0cd '{spaced}/../slot01' && make")
+
+
 def test_resolving_a_long_path_looks_up_a_bounded_part_of_it(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

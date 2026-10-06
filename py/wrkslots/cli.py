@@ -47681,8 +47681,10 @@ class _UnitPathResolver:
 
         base = _unit_working_directory(unit)
         for value in unit.values():
-            if any(_property_mentions(value, spelling) for spelling in row.spellings):
-                return True
+            for spelling in row.spellings:
+                mentioned, paths = _property_mentions(value, spelling)
+                if mentioned or any(self.path_names(path, row) for path in paths):
+                    return True
             for joined in self._value_paths(base, value):
                 if self.path_names(joined, row):
                     return True
@@ -47798,16 +47800,24 @@ def _unit_property_words(value: str) -> tuple[str, ...]:
     return tuple(dict.fromkeys(words))
 
 
-def _property_mentions(value: str, spelling: str) -> bool:
-    """Whether a unit property string holds a row path spelling as a path.
+def _property_mentions(value: str, spelling: str) -> tuple[bool, tuple[str, ...]]:
+    """Where a unit property string holds a row path spelling as a path.
 
     The spelling must begin the string or follow a separator (through any
     of the prefixes ``_UNIT_PATH_PREFIXES``), and end the string or precede
     ``/`` or a separator.  Found as text, a row path holding a separator,
     a newline or a quote is whole wherever it stands, as an option value,
     an assignment, a search-list entry or a quoted shell word.
+
+    Returns whether an occurrence names the row by itself, and the paths
+    the caller resolves instead.  An occurrence followed by ``/`` names the
+    row when the rest of its path, up to the next separator, stays below
+    it lexically; one whose rest leaves it through ``..``
+    (``<row>/../slot02``) is returned with that rest as a path to resolve,
+    since a symlink before the ``..`` can still lead back inside.
     """
 
+    paths: list[str] = []
     start = value.find(spelling)
     while start >= 0:
         end = start + len(spelling)
@@ -47823,9 +47833,29 @@ def _property_mentions(value: str, spelling: str) -> bool:
             or _UNIT_EVIDENCE_SEPARATORS.fullmatch(value[end]) is not None
         )
         if opens and closes:
-            return True
+            stop = _UNIT_EVIDENCE_SEPARATORS.search(value, end)
+            rest = value[end : len(value) if stop is None else stop.start()]
+            if _path_rest_stays_below(rest):
+                return True, ()
+            paths.append(value[start : end + len(rest)])
         start = value.find(spelling, start + 1)
-    return False
+    return False, tuple(dict.fromkeys(paths))
+
+
+def _path_rest_stays_below(rest: str) -> bool:
+    """Whether path text ``rest`` after a directory stays below it lexically."""
+
+    depth = 0
+    for part in rest.split("/"):
+        if part in {"", "."}:
+            continue
+        if part != "..":
+            depth += 1
+        elif depth:
+            depth -= 1
+        else:
+            return False
+    return True
 
 
 def _spelling_is_within(path: str, root: str) -> bool:
