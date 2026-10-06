@@ -1225,3 +1225,132 @@ def test_a_unit_naming_a_fenced_checkout_on_disk_is_alive(
     state, message = states[("testhost", "slot01", 1)]
     assert state == "alive", message
     assert "user-systemd unit queued-run.service names validation row slot01" in message
+
+
+def _judge_with_unit_enumerations(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    enumerations: Sequence[Sequence[Mapping[str, str]]],
+    *,
+    register_during: int | None = None,
+) -> tuple[str, str]:
+    """Judge one row whose user-systemd units change between enumerations.
+
+    The process tables are empty throughout: the run's processes started
+    after each table's PID list.  With ``register_during`` set, the run's
+    handle is written during that enumeration instead of beforehand.
+    """
+
+    project, tree = _prepare(tmp_path, monkeypatch, agent_liveness="dead")
+    if register_during is None:
+        _write_run_handle(project, tree)
+    calls = 0
+
+    def units() -> tuple[Mapping[str, str], ...]:
+        nonlocal calls
+        if calls == register_during:
+            _write_run_handle(project, tree)
+        value = tuple(enumerations[min(calls, len(enumerations) - 1)])
+        calls += 1
+        return value
+
+    monkeypatch.setattr(wrkslots, "_user_systemd_snapshot", units)
+    config = wrkslots._load_config(str(project), "testhost")
+    states = wrkslots._validation_run_liveness_states(
+        config, wrkslots._load_active(config).slots
+    )
+    assert len(states) == 1
+    return next(iter(states.values()))
+
+
+def test_a_run_that_starts_during_the_later_process_table_is_alive(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The first enumeration predates the run; the second sees it running."""
+
+    state, message = _judge_with_unit_enumerations(
+        tmp_path,
+        monkeypatch,
+        ((_unit(),), (_unit(ActiveState="active", SubState="running"),)),
+    )
+
+    assert state == "alive", message
+    assert f"retained validation unit {RUN_UNIT} may still use row slot01" in message
+
+
+def test_a_run_registered_during_the_evidence_reads_is_alive(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A handle written after the first handle read is still judged."""
+
+    state, message = _judge_with_unit_enumerations(
+        tmp_path,
+        monkeypatch,
+        ((_unit(ActiveState="active", SubState="running"),),),
+        register_during=0,
+    )
+
+    assert state == "alive", message
+    assert f"retained validation unit {RUN_UNIT} may still use row slot01" in message
+
+
+def test_a_retained_unit_cgroup_member_missing_from_every_table_is_alive(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The run started and finished between reads and left a child behind.
+
+    Both enumerations read the unit inactive and unqueued, and neither
+    process table holds the child; only its control group does.
+    """
+
+    read: list[set[str]] = []
+
+    def members(units: set[str], *, root: Path | None = None) -> Mapping[str, int]:
+        read.append(set(units))
+        return {name: 1 for name in units}
+
+    monkeypatch.setattr(wrkslots, "_retained_unit_cgroup_members", members, raising=False)
+    state, message = _judge_with_unit_enumerations(
+        tmp_path, monkeypatch, ((_unit(),), (_unit(),))
+    )
+
+    assert state == "alive", message
+    assert f"retained validation unit {RUN_UNIT} control group now holds 1" in message
+    assert read == [{RUN_UNIT}]
+
+
+def test_retained_unit_cgroup_members_counts_the_unit_and_its_descendants(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "cgroup"
+    root.mkdir()
+    (root / "cgroup.controllers").write_text("cpu memory\n")
+    manager = root / "user.slice" / f"user-{os.getuid()}.slice" / f"user@{os.getuid()}.service"
+    run = manager / "app.slice" / RUN_UNIT
+    (run / "payload").mkdir(parents=True)
+    (run / "cgroup.procs").write_text("101\n102\n")
+    (run / "payload" / "cgroup.procs").write_text("103\n")
+    other = manager / "app.slice" / "other.service"
+    other.mkdir()
+    (other / "cgroup.procs").write_text("201\n")
+    absent = "validate-run-0002.service"
+    monkeypatch.setattr(wrkslots, "_user_manager_cgroup", lambda _root: manager)
+
+    assert wrkslots._retained_unit_cgroup_members({RUN_UNIT, absent}, root=root) == {
+        RUN_UNIT: 3,
+        absent: 0,
+    }
+    (root / "cgroup.controllers").unlink()
+    with pytest.raises(wrkslots.Refusal, match="no cgroup v2 hierarchy"):
+        wrkslots._retained_unit_cgroup_members({RUN_UNIT}, root=root)
+    assert wrkslots._retained_unit_cgroup_members(set(), root=root) == {}
+
+
+def test_this_host_user_manager_cgroup_is_read() -> None:
+    """On this host the reader finds the manager and a fresh unit is empty."""
+
+    unit = f"wrkslots-test-{uuid.uuid4().hex}.service"
+    assert wrkslots._retained_unit_cgroup_members({unit}) == {unit: 0}
+    assert wrkslots._user_manager_cgroup(Path("/sys/fs/cgroup")).name == (
+        f"user@{os.getuid()}.service"
+    )

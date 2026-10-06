@@ -16542,10 +16542,19 @@ def _processes_around_unit_enumeration(
     still attributed to the run.  A generation only in ``before`` has exited
     and is dropped.  Both reads refuse rather than return a partial
     population.
+
+    The later table is itself read one PID at a time, after its PID list.  A
+    run that starts after that list leaves no process in it while the first
+    enumeration still reads its unit inactive and unqueued.  The units are
+    therefore enumerated again after the later table, and both enumerations
+    are returned: a unit active or queued in either one is evidence of a
+    run.  Control-group members that the later table missed are read
+    separately by ``_retained_unit_cgroup_members``.
     """
 
     units = _user_systemd_snapshot()
     after = _absent_validate_process_snapshot()
+    refreshed = _user_systemd_snapshot()
     current = set(after)
     live = {(process.pid, process.start_ticks) for process in after}
     moved = tuple(
@@ -16553,7 +16562,85 @@ def _processes_around_unit_enumeration(
         for process in before
         if (process.pid, process.start_ticks) in live and process not in current
     )
-    return (*after, *moved), units
+    return (*after, *moved), (*refreshed, *units)
+
+
+_CGROUP_ROOT = Path("/sys/fs/cgroup")
+_RETAINED_CGROUP_DIRECTORY_LIMIT = 65536
+
+
+def _user_manager_cgroup(root: Path) -> Path:
+    """Return this user's systemd manager control group under ``root``.
+
+    The manager's units, including validation runs, are its descendants.
+    This process's own control group names the manager when it runs under
+    it; otherwise the conventional ``user.slice`` location is used.
+    """
+
+    manager = f"user@{os.getuid()}.service"
+    try:
+        lines = Path("/proc/self/cgroup").read_text(encoding="utf-8").splitlines()
+    except OSError as exc:
+        raise Refusal(f"this process's control group is unreadable: {exc}") from exc
+    for line in lines:
+        hierarchy, _controllers, path = line.split(":", 2)
+        if hierarchy != "0":
+            continue
+        parts = Path(path).parts[1:]
+        if manager in parts:
+            return root.joinpath(*parts[: parts.index(manager) + 1])
+    return root / "user.slice" / f"user-{os.getuid()}.slice" / manager
+
+
+def _retained_unit_cgroup_members(
+    units: AbstractSet[str], *, root: Path | None = None
+) -> Mapping[str, int]:
+    """Count the processes now in each retained run unit's control group.
+
+    The process tables name a process only if it existed when its PID was
+    listed.  A run that started after that, and whose unit finished before
+    the second enumeration, can leave a child in its control group that no
+    table holds.  This reads ``cgroup.procs`` of every control group named
+    after one of ``units``, and of its descendants, below the user manager,
+    after both enumerations.  A control group that disappears meanwhile has
+    no member.  No cgroup v2 hierarchy, an unreadable directory or member
+    list, or a hierarchy beyond the census bound refuses.
+    """
+
+    if not units:
+        return {}
+    root = _CGROUP_ROOT if root is None else root
+    if not (root / "cgroup.controllers").is_file():
+        raise Refusal(f"no cgroup v2 hierarchy is mounted at {root}")
+    manager = _user_manager_cgroup(root)
+    members = dict.fromkeys(units, 0)
+    if not manager.is_dir():
+        return members
+
+    def unreadable(exc: OSError) -> None:
+        if not isinstance(exc, FileNotFoundError):
+            raise Refusal(f"user-manager control group is unreadable: {exc}") from exc
+
+    visited = 0
+    for directory, _children, _files in os.walk(manager, onerror=unreadable):
+        visited += 1
+        if visited > _RETAINED_CGROUP_DIRECTORY_LIMIT:
+            raise Refusal("user-manager control groups exceed the census bound")
+        named = [
+            part for part in Path(directory).relative_to(manager).parts if part in members
+        ]
+        if not named:
+            continue
+        try:
+            procs = (Path(directory) / "cgroup.procs").read_text(encoding="ascii")
+        except FileNotFoundError:
+            continue
+        except (OSError, UnicodeDecodeError) as exc:
+            raise Refusal(f"control group {directory} member list is unreadable: {exc}") from exc
+        count = sum(1 for line in procs.splitlines() if line.strip())
+        for name in named:
+            members[name] += count
+    return members
 
 
 # The kernel's fixed inode numbers for its initial PID and cgroup namespaces
@@ -16769,8 +16856,19 @@ def _validation_run_liveness_states(
             (record, _validation_run_row_paths(config, record, fenced_slots))
             for record in local
         )
-        bindings = _retained_handles_for_absent_rows(config, rows)
+        first = _retained_handles_for_absent_rows(config, rows)
         processes, snapshot = _validation_run_host_evidence()
+        # A run registered while the host evidence was read has a handle that
+        # the first read missed; judge the handles from both reads, and read
+        # their control groups' current members last.
+        later = _retained_handles_for_absent_rows(config, rows)
+        bindings = {
+            slot: tuple(dict.fromkeys((*first.get(slot, ()), *later.get(slot, ()))))
+            for slot in {*first, *later}
+        }
+        members = _retained_unit_cgroup_members(
+            {handle.unit for handles in bindings.values() for handle in handles}
+        )
     except Refusal as exc:
         detail = _liveness_batch_diagnostic(
             f"validation-run evidence is unverifiable: {exc}"
@@ -16788,7 +16886,12 @@ def _validation_run_liveness_states(
         try:
             _assert_retained_handle_processes_dead(handles)
             _assert_absent_validate_systemd_unrelated(
-                (row,), handles, processes, snapshot=snapshot, resolver=resolver
+                (row,),
+                handles,
+                processes,
+                snapshot=snapshot,
+                resolver=resolver,
+                members=members,
             )
         except _ValidationRunMayUseRow as exc:
             result[key] = (
@@ -47096,18 +47199,24 @@ def _assert_absent_validate_systemd_unrelated(
     *,
     snapshot: Sequence[Mapping[str, str]] | None = None,
     resolver: _UnitPathResolver | None = None,
+    members: Mapping[str, int] | None = None,
 ) -> None:
     """Refuse when a retained run unit or any active user unit may use a row.
 
     ``snapshot`` lets one caller judge several rows against a single
-    user-systemd enumeration; when absent, this reads a fresh one.
-    ``resolver`` lets the same caller share the path resolution of that
-    enumeration's words across rows.
+    user-systemd enumeration; when absent, this reads a fresh one.  It may
+    hold one unit more than once, from successive enumerations, and every
+    entry is judged.  ``resolver`` lets the same caller share the path
+    resolution of that enumeration's words across rows.  ``members`` counts
+    the processes found in each retained unit's control group by a later
+    read (``_retained_unit_cgroup_members``).
     """
 
     if snapshot is None:
         snapshot = _user_systemd_snapshot()
-    by_name = {unit["Id"]: unit for unit in snapshot}
+    by_name: dict[str, list[Mapping[str, str]]] = {}
+    for unit in snapshot:
+        by_name.setdefault(unit["Id"], []).append(unit)
     for slot, handles in bindings.items():
         for handle in handles:
             if any(
@@ -47117,23 +47226,28 @@ def _assert_absent_validate_systemd_unrelated(
                     f"retained validation unit {handle.unit} still has a live cgroup "
                     f"process for row {slot}"
                 )
-            unit = by_name.get(handle.unit)
-            if unit is None:
-                continue
-            active = unit["ActiveState"] not in {"inactive", "failed"}
-            queued = unit["PendingJob"] == "yes"
-            if active or queued:
+            count = 0 if members is None else members.get(handle.unit, 0)
+            if count:
                 raise _ValidationRunMayUseRow(
-                    f"retained validation unit {handle.unit} may still use row {slot}"
+                    f"retained validation unit {handle.unit} control group now holds "
+                    f"{count} process(es) for row {slot}"
                 )
-            control_group = unit["ControlGroup"].rstrip("/") or "/"
-            if control_group != "/" and any(
-                _cgroup_matches(control_group, process.cgroup_path) for process in processes
-            ):
-                raise _ValidationRunMayUseRow(
-                    f"retained validation unit {handle.unit} still has a live process "
-                    f"for row {slot}"
-                )
+            for unit in by_name.get(handle.unit, ()):
+                active = unit["ActiveState"] not in {"inactive", "failed"}
+                queued = unit["PendingJob"] == "yes"
+                if active or queued:
+                    raise _ValidationRunMayUseRow(
+                        f"retained validation unit {handle.unit} may still use row {slot}"
+                    )
+                control_group = unit["ControlGroup"].rstrip("/") or "/"
+                if control_group != "/" and any(
+                    _cgroup_matches(control_group, process.cgroup_path)
+                    for process in processes
+                ):
+                    raise _ValidationRunMayUseRow(
+                        f"retained validation unit {handle.unit} still has a live "
+                        f"process for row {slot}"
+                    )
     if resolver is None:
         resolver = _UnitPathResolver()
     targets = tuple(

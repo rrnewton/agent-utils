@@ -28,7 +28,7 @@ def idle_validation_run_host(
     """Give each in-process test a host on which no validation run exists.
 
     A validation row's liveness is answered from this host's live processes
-    and user-systemd units.  Lifecycle shards run in user namespaces and on
+    and user-systemd units and from its control groups.  Lifecycle shards run in user namespaces and on
     hosts with no user bus, where that evidence is unreadable, and on a busy
     host the real unit population changes under the enumeration.  Neither is
     what those tests examine.  Tests that examine the evidence itself carry
@@ -39,6 +39,10 @@ def idle_validation_run_host(
     if request.node.get_closest_marker("validation_run_evidence") is not None:
         return
     from wrkslots import cli
-    from wrkslots.tests.idle_validation_host import no_validation_runs
+    from wrkslots.tests.idle_validation_host import (
+        no_retained_cgroup_members,
+        no_validation_runs,
+    )
 
     monkeypatch.setattr(cli, "_validation_run_host_evidence", no_validation_runs)
+    monkeypatch.setattr(cli, "_retained_unit_cgroup_members", no_retained_cgroup_members)

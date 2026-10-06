@@ -406,8 +406,16 @@ second and a half on a busy host. A run that starts and finishes during the enum
 unit inactive and unqueued and may leave a child in the unit's control group; only the later table
 shows that child, so the later table is the one judged. A process generation present in both tables
 keeps the control group it had in the earlier one, and a generation present only in the earlier
-table has exited. `recover-absent-validate-rows` and `recover-absent-agent-rows` read the process
-table the same way.
+table has exited. The later table is itself read one process at a time after its list of PIDs, so
+a run that starts during it can be absent from both tables while the first enumeration reads its
+unit inactive. The user-systemd units are therefore enumerated again after the later table, and a
+retained run unit that is active or queued in either enumeration is `alive`.
+`recover-absent-validate-rows` and `recover-absent-agent-rows` read the process table and the units
+the same way. For the liveness answer, the retained run handles are read again after both
+enumerations, and a handle found by either read is judged. Last, the current members of every
+control group named after a handle's unit, and of its descendants, are read from the cgroup v2
+hierarchy below the user service manager; a member there is `alive`, and a host without a cgroup v2
+hierarchy at `/sys/fs/cgroup` or with an unreadable member list is `unverifiable`.
 
 Audit reports the number of validation rows it judged this way as the liveness phase's
 `validation_run_subjects`. A batch removal reads this evidence once while sealing and once more per

@@ -1,7 +1,7 @@
 """Run the wrkslots command on a host where no validation run exists.
 
 A validation row's liveness is answered from this host's live processes and
-user-systemd units.  Lifecycle shards run in user namespaces and on hosts with
+user-systemd units and from its control groups.  Lifecycle shards run in user namespaces and on hosts with
 no user bus, where that evidence is unreadable, and on a busy host the real
 unit population changes under the enumeration.  Neither is what the lifecycle
 tests examine, so they run against a host with no validation run: in process
@@ -13,7 +13,8 @@ Retained run handles are project files and are still read for real.
 from __future__ import annotations
 
 import sys
-from collections.abc import Mapping
+from collections.abc import Mapping, Set as AbstractSet
+from pathlib import Path
 
 from wrkslots import cli
 
@@ -26,8 +27,17 @@ def no_validation_runs() -> tuple[
     return (), ()
 
 
+def no_retained_cgroup_members(
+    units: AbstractSet[str], *, root: Path | None = None
+) -> Mapping[str, int]:
+    """No retained run unit has a control-group member."""
+
+    return dict.fromkeys(units, 0)
+
+
 def main() -> int:
     cli._validation_run_host_evidence = no_validation_runs
+    cli._retained_unit_cgroup_members = no_retained_cgroup_members
     return cli.main(sys.argv[1:])
 
 
