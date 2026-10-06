@@ -1020,21 +1020,26 @@ fails: a short CR LF line without a colon drops a paginated block. Applying
 the same test to the kept 8,192 bytes of a long line makes the two agree, so
 a long line counts exactly when a short line of that shape would. It is not
 applied without `--paginate`, where the first block is gh's own and no body
-text can reach it.
+text can reach it. (Narrowed after round 10: the colon test now applies only
+before the block's first CR LF header line; see "Round 10 and what changed".)
 
 **Why commit at the end of the output.** A paginated reader ignores an
 unterminated last line because it may be body text. A long line of a 403 or
 429 block that already passed the colon test, and whose end never arrived, has
 nothing left that could show it to be body text, and the wait it may hold
 cannot be read. Committing the block is the fail-closed choice. A short
-unterminated line is still ignored, as before.
+unterminated line is still ignored, as before. (Narrowed after round 10: only
+for a block that began on the first stdout line or already holds a CR LF
+header line; see "Round 10 and what changed".)
 
 **What a cut does not cover.** `stderr_cut_off` looks only at what is held:
 a `Retry-After:` name whose value runs to the cut. If the cut falls before the
 name, or inside it (`Retry-Af`), the value is never seen, and the cooldown is
 whatever the rest of stderr gives (900 s for an `HTTP 429`). The warning still
-says that the stream was cut. A cut stdout makes the snapshot unparseable, and
-the refresh warns as before, now also naming the cut.
+says that the stream was cut. A cut stdout can make the snapshot unparseable, and
+the refresh then warns as before, now also naming the cut. (Wording corrected
+after round 10: valid snapshot JSON followed by more than 1 MiB of blanks still
+parses.)
 
 Test changes in this commit:
 
@@ -1046,6 +1051,62 @@ Test changes in this commit:
   stderr when it is set.
 
 No existing assertion changed.
+
+## Round 10 and what changed
+
+Round 10 reviewed `8d9f492c` and returned CHANGES REQUESTED: 3 blockers and 2
+minors, all new in `8d9f492c`. One blocker drops a server wait already read
+(the unsafe direction); two start a false cooldown with no end time on body
+text or prose (the fail-safe direction, which still stops every paced call
+until a person clears it). The coordinator approved the fixes below, including
+the trade-off in the second row.
+
+| Round-10 finding | Now | Test (fails on `8d9f492c`) |
+| --- | --- | --- |
+| blocker (unsafe): with `--paginate`, `HTTP/2.0 429 ...` LF, `Retry-After: 172800` CR LF, then 9,000 `X` and `: value` CR LF: the colon after the bytes kept dropped the block and its two-day wait, so no cooldown started (or 900 s from stderr). `8d9f492c` gave this no end time | the colon test applies only while the block has no CR LF header line yet. After one, an over-long line, with its colon late or with none, keeps the result `2ffcbaa1` gave: a cooldown with no end time. The Open item that dated the loss to round 9 now names the commit and the narrower scope | `cli::a_long_line_after_a_retry_after_never_drops_the_wait` (both modes; on `8d9f492c` the mode without `--paginate` passes and the paginated one records no cooldown), `pushback::a_long_line_after_a_header_line_never_drops_a_wait` |
+| blocker (fail-safe): with `--paginate --jq .body`, a healthy page, then body text `HTTP/2.0 429 ...` LF and `X-Long: ` with 9,000 `x` and no line end: the end of the output committed it, and every later call was refused | at the end of the output, a block cut inside an over-long header line is committed only if it began on the first stdout line or already holds a CR LF header line. Nothing can come before gh's own first block; a later block with no CR LF header line may be a page body cut short | `cli::a_page_body_cut_inside_a_long_line_starts_no_cooldown` (on `8d9f492c`: a cooldown with no end time), `pushback::output_cut_inside_a_long_header_never_shortens_a_wait` |
+| blocker (fail-safe): refresh stderr of 1,048,540 `y`, then LF and `Documentation example retry-after: ` reaching the 1 MiB cut: the words in prose matched, and the refresh recorded a cooldown with no end time | `Scanner::stderr_cut_off` counts a `retry-after:` only at the start of its line: what comes before it on its line, trimmed of blanks, is empty or gh's debug marker `<`. `Scanner::feed` is unchanged: it still reads such digits anywhere, as before | `cli::a_capture_cut_after_prose_starts_no_cooldown` (on `8d9f492c`: exit 75 and a cooldown with no end time), `pushback::a_cut_after_retry_after_in_prose_is_not_a_header` |
+| minor: "A cut stdout makes the snapshot unparseable" overclaims | "can make", in place | none (text) |
+| minor: the Open items said "8,192 bytes or more"; a line of exactly 8,192 bytes, CR included, is read whole | "more than 8,192 bytes before the line end", in place | none (text; `pushback::an_overlong_header_line_never_shortens_a_wait` holds the boundary) |
+
+**The trade-off in the second row.** A real 429 or 403 on a later page whose
+output is cut inside its first header line, an over-long one, is dropped like
+the body text it cannot be told apart from. Its cooldown is the one stderr
+gives: 900 s for an `HTTP 429`, or the plain-403 cooldown, not one with no end
+time. That needs gh's output to stop in the middle of a header line of more
+than 8,192 bytes on a page after the first. The first page, and any block that
+already holds a CR LF header line, keep the no-end result.
+
+**Why the first CR LF header line.** Before it, a status-shaped line and a long
+line may be `--jq` body text, and the colon test is what tells them apart, as
+it does for a short line. After it, the block is in gh's header format (status
+line, then `Name: value` CR LF), and a `Retry-After` may already have been read,
+so dropping the block would lose a wait. A later long line keeps the block and
+gives no end time, as in `2ffcbaa1`.
+
+**Why the start of a line.** gh puts response headers on stderr only in its
+debug output (`GH_DEBUG=api`), one to a line after a `<` marker, as in
+`< Retry-After: 60`. A `retry-after:`
+later in a line is prose, and a cut after it says nothing about a wait.
+`Scanner::feed` is not restricted: a whole `retry-after: 60` anywhere still
+lengthens the cooldown, which is the fail-safe direction.
+
+Test changes in this commit:
+
+- `pushback::output_cut_inside_a_long_header_never_shortens_a_wait`: the
+  later-page case (`after_page`: a healthy page, then a 429 or 403 block cut
+  inside `Retry-After: ` and 9,000 zeros) asserted a cooldown with no end time
+  and now asserts no cooldown. **This is the one weakened assertion**, and it is
+  the trade-off above. A new case `after_header` (the same block with
+  `X-A: b` CR LF before the cut line) takes over the no-end assertion for a
+  later page, and `after_page_before` (cut inside `X-Long: `) joins the
+  no-cooldown side.
+- `pushback::a_colon_free_long_line_is_not_a_paginated_header`: one comment
+  now says the colon rule holds before the block's first CR LF header line; its
+  assertions are unchanged.
+- New: `pushback::a_long_line_after_a_header_line_never_drops_a_wait`,
+  `pushback::a_cut_after_retry_after_in_prose_is_not_a_header`, and the three
+  CLI tests in the table.
 
 ## Test changes worth a reviewer's attention
 
@@ -1200,11 +1261,20 @@ pagination and limit costs, watch loops, alias inspection), adds one test
   varying-width rule. The user guide states the rule and this limit (round 8;
   wording corrected after round 9).
 - Server waits that can still go unhonoured or be shortened:
-  - a 503 whose `Retry-After` is in a header line of 8,192 bytes or more starts
-    no cooldown; the over-long-line rule covers 403 and 429 only (round 8);
-  - with `--paginate`, a 403 or 429 header whose name alone is longer than
-    8,192 bytes has no colon in the bytes kept, so it drops the block like body
-    text, and a `Retry-After` after it is lost (round 9);
+  - a 503 whose `Retry-After` is in a header line of more than 8,192 bytes
+    before the line end starts no cooldown; the over-long-line rule covers 403
+    and 429 only (round 8; boundary wording corrected after round 10);
+  - with `--paginate`, when the first header line of a 403 or 429 block (the
+    line after its status line) has a name longer than 8,192 bytes, no colon is
+    in the bytes kept, so the line drops the block like body text, and a
+    `Retry-After` after it is lost. This came with the colon rule in `8d9f492c`
+    (the fixes after round 9, reviewed in round 10); since the fixes after
+    round 10 it applies only before the block's first CR LF header line;
+  - with `--paginate`, a later page's 403 or 429 block whose output ends inside
+    its first header line, an over-long one, with no CR LF header line before
+    it, is dropped as a `--jq` body cut short would be, so the cooldown is the
+    one stderr gives (900 s for an `HTTP 429`), not one with no end time. This
+    is the trade-off accepted after round 10 (see "Round 10 and what changed");
   - with `--paginate`, output that ends inside a short last header line of a
     block with no complete CR LF header line yet (`HTTP/2.0 429 ...` LF, then
     `Retry-After: 172800` with no line end) is ignored, as body text would be;
@@ -1212,5 +1282,14 @@ pagination and limit costs, watch loops, alias inspection), adds one test
   - the rate-limit refresh keeps 1 MiB of stderr; a `Retry-After` whose name
     falls after the cut, or is cut inside the name, is not seen, so the
     cooldown is the one the rest of stderr gives. The cut is reported (round 9).
+    Since the fixes after round 10 a cut counts only for a `retry-after:` at
+    the start of its line, after blanks or gh's debug `<` marker; the same words
+    later in a line, cut in their value, read as the digits held;
+  - without `--paginate`, output that ends inside the digits of a short
+    `Retry-After` value (`Retry-After: 17` with no line end) reads the digits
+    that arrived, and with `--paginate` such a line is ignored (the item above).
+    gh writes each header line with one write of under 4,096 bytes, which a
+    pipe delivers whole, so this needs gh's output cut inside a write. The rule
+    predates round 8.
 - A `Retry-After` above 365 days stops paced calls for the account on the host
   until a person clears the cooldown (see round 7).
