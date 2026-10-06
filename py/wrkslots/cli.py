@@ -633,11 +633,13 @@ _RETAINED_HANDLE_CLOCK_STEP_NS = 500_000_000
 # narrowly its realtime reading must be bracketed by two monotonic readings
 # to be kept without another try (``_retained_handle_clocks``).  A reading
 # that a scheduling pause in every try widens past the step bound can read
-# as a step, which keeps a run alive rather than clearing its row.  Tries
-# whose offset bounds share no value saw a step between them, and the
-# reading keeps the bounds of them all.  A step back does not show if it is
-# undone before a realtime read sees it, or if only a try bracketed wider
-# than the step sees it before a narrower try.
+# as a step, which keeps a run alive rather than clearing its row.  The
+# reading keeps the bounds of a try bracketed that narrowly only when they
+# share a value with every earlier try's; otherwise, and when no try is that
+# narrow, it keeps the bounds of them all.  A step back does not show if it
+# is undone before a realtime read sees it, or if it is undone before the
+# narrow try and the try that saw it paused, between its first monotonic
+# read and its realtime read, for at least the step less the bracket.
 _RETAINED_HANDLE_CLOCK_TRIES = 3
 _RETAINED_HANDLE_CLOCK_BRACKET_NS = 1_000_000
 # The bound on one /proc/<pid>/mountinfo read, sized from measurement. On
@@ -24027,7 +24029,8 @@ def _confirm_unchanged_after_target_storage_drift(
     mutation journal, and must still hold the row exactly as that check read
     it (``drift.record``), every field alike.  Anything else, including a
     lock that cannot be taken or a registry file that cannot be read or
-    decoded, raises StateError.
+    decoded (bytes that are not UTF-8, or JSON nested too deeply to
+    decode), raises StateError.
     """
 
     try:
@@ -24070,7 +24073,7 @@ def _confirm_unchanged_after_target_storage_drift(
             f"retirement attempt for {candidate.slot} could not be confirmed "
             f"unchanged after its storage refusal: {exc}"
         ) from exc
-    except (OSError, ValueError) as exc:
+    except (OSError, ValueError, RecursionError) as exc:
         raise StateError(
             f"retirement attempt for {candidate.slot} could not be confirmed "
             f"unchanged after its storage refusal: cannot read the registry: "
@@ -44246,12 +44249,13 @@ def _retained_handle_clocks() -> tuple[int, int, int]:
     than it less the earlier one.  A pause between the reads widens these
     bounds instead of moving them.  The clocks are read up to
     ``_RETAINED_HANDLE_CLOCK_TRIES`` times, stopping at a try bracketed
-    within ``_RETAINED_HANDLE_CLOCK_BRACKET_NS``.  Tries whose bounds share
-    no value saw the realtime clock step between them, so the bounds of
-    them all are kept: the lowest and the highest offset any try found.
-    Otherwise the bounds of the most narrowly bracketed try are kept.  The
-    realtime value returned is the earliest any try read.  All three are in
-    nanoseconds.
+    within ``_RETAINED_HANDLE_CLOCK_BRACKET_NS``.  That try's bounds are
+    kept when they share a value with every earlier try's.  Otherwise the
+    bounds of them all are kept, the lowest and the highest offset any try
+    found: tries whose bounds share no value saw the realtime clock step
+    between them, and when no try is that narrow, the narrowest of wide
+    tries that overlap can miss a step a wider one saw.  The realtime value
+    returned is the earliest any try read.  All three are in nanoseconds.
     """
 
     def reading() -> tuple[int, int, int]:
@@ -44268,14 +44272,16 @@ def _retained_handle_clocks() -> tuple[int, int, int]:
     ):
         tries.append(reading())
     earliest = min(realtime for realtime, _low, _high in tries)
-    lowest = min(low for _realtime, low, _high in tries)
-    highest = max(high for _realtime, _low, high in tries)
-    if max(low for _realtime, low, _high in tries) > min(
-        high for _realtime, _low, high in tries
-    ):
-        return earliest, lowest, highest
     narrowest = min(tries, key=lambda item: item[2] - item[1])
-    return earliest, narrowest[1], narrowest[2]
+    if narrowest[2] - narrowest[1] <= _RETAINED_HANDLE_CLOCK_BRACKET_NS and max(
+        low for _realtime, low, _high in tries
+    ) <= min(high for _realtime, _low, high in tries):
+        return earliest, narrowest[1], narrowest[2]
+    return (
+        earliest,
+        min(low for _realtime, low, _high in tries),
+        max(high for _realtime, _low, high in tries),
+    )
 
 
 def _retained_handles_for_absent_rows(

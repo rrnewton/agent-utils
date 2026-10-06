@@ -476,12 +476,15 @@ between them: after a step back into a handle's timestamp tick, a run that regis
 leaves both reads equal. Each read of the handles reads both clocks before its first handle and
 after its last, so a step while the handles are read counts too, and a change time is recent against
 the earliest realtime value either reading took. Each reading takes the realtime clock between two
-readings of the monotonic clock, up to three times, and keeps the most narrowly bracketed try: a
-scheduling pause between the reads widens a try instead of moving it, and a pause in every try that
-widens it past half a second reads as a step. Tries that disagree by more than their brackets saw a
-step between them, and the reading then keeps the bounds of them all. A step back does not show if
-it is undone before a realtime read sees it, or if only a try bracketed wider than the step sees it
-before a narrower try. Last, the current members of every control group named after a handle's unit,
+readings of the monotonic clock, up to three times, stopping at a try bracketed within a
+millisecond. It keeps that try's bounds when they agree with every earlier try's: a scheduling pause
+between the reads widens a try instead of moving it. Otherwise it keeps the bounds of them all:
+tries that disagree by more than their brackets saw a step between them, and when no try is that
+narrow, the narrowest of wide tries that overlap can miss a step a wider one saw. A pause in every
+try that widens them past half a second therefore reads as a step. A step back does not show if it
+is undone before a realtime read sees it, or if it is undone before the narrow try and the try that
+saw it paused, between its first two reads, for at least the step less a millisecond. Last, the
+current members of every control group named after a handle's unit,
 and of its descendants, are read from the cgroup v2 hierarchy below the user service manager; a
 member there is `alive`. A host without a cgroup v2 hierarchy at `/sys/fs/cgroup`, whose cgroup v2
 mount there shows only a subtree of the hierarchy (control groups outside it would read as empty),

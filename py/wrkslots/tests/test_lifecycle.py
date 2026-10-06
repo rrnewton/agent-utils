@@ -23099,6 +23099,7 @@ def test_retire_pending_reports_its_batch_when_a_drift_confirmation_refuses(
     [
         pytest.param("undecodable-event", "UnicodeDecodeError", id="undecodable-event"),
         pytest.param("unreadable-event-log", "PermissionError", id="unreadable-event-log"),
+        pytest.param("deeply-nested-event", "RecursionError", id="deeply-nested-event"),
     ],
 )
 def test_retire_pending_reports_its_batch_when_a_drift_confirmation_cannot_read(
@@ -23112,8 +23113,9 @@ def test_retire_pending_reports_its_batch_when_a_drift_confirmation_cannot_read(
 
     slot01 is removed first; slot02's own storage drifts, and before the
     confirmation reads the registry again its event log gains the next event
-    file holding bytes that are not UTF-8 (``undecodable-event``), or loses
-    its read permission (``unreadable-event-log``).  Neither error is a
+    file holding bytes that are not UTF-8 (``undecodable-event``) or JSON
+    nested ten thousand arrays deep (``deeply-nested-event``), or loses its
+    read permission (``unreadable-event-log``).  None of these errors is a
     refusal of its own, and the report must still name slot01's removal.
     """
 
@@ -23145,9 +23147,14 @@ def test_retire_pending_reports_its_batch_when_a_drift_confirmation_cannot_read(
             )
         except wrkslots._TargetStorageDrift:
             if args.slot == "slot02":
+                sequence = len(wrkslots._event_file_names(events)) + 1
                 if fault == "undecodable-event":
-                    sequence = len(wrkslots._event_file_names(events)) + 1
                     (events / f"{sequence:020d}.json").write_bytes(b'{"schema": "\xff\xfe"}\n')
+                elif fault == "deeply-nested-event":
+                    nesting = b"[" * 10_000 + b"0" + b"]" * 10_000
+                    (events / f"{sequence:020d}.json").write_bytes(
+                        b'{"schema": ' + nesting + b"}\n"
+                    )
                 else:
                     events.chmod(0)
                 injected.append(args.slot)
