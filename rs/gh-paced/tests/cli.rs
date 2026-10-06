@@ -53,6 +53,11 @@ fi
 # gh is one process, so nothing it leaves behind holds its streams: the sleep, orphaned when a
 # deadline stops this script, must not either.
 if [ -n "${FAKE_GH_SLEEP:-}" ]; then sleep "$FAKE_GH_SLEEP" >/dev/null 2>&1; fi
+# Write nothing until the file FAKE_GH_GO exists (at most 30 s), so a test can set something up
+# first, such as holding the account lock.
+if [ -n "${FAKE_GH_GO:-}" ]; then
+  i=0; while [ ! -e "$FAKE_GH_GO" ] && [ "$i" -lt 600 ]; do sleep 0.05; i=$((i + 1)); done
+fi
 # Write to descriptor N without end, dying by SIGPIPE once the reader goes away (as gh would).
 if [ -n "${FAKE_GH_FOREVER:-}" ]; then exec yes forever >&"$FAKE_GH_FOREVER"; fi
 if [ -n "${FAKE_GH_BG:-}" ]; then
@@ -2001,9 +2006,9 @@ fn a_late_signal_waits_for_a_reader_held_up_by_the_state_lock() {
 }
 
 /// The two tests above: gh writes two 429 pages while the stdout reader waits for the account
-/// lock, which the test holds until `hold_ms` after it sends TERM.
+/// lock, which the test holds until `hold_ms` after it sends TERM. gh writes nothing until the
+/// test holds the lock, so the reader's hook for the first page always waits.
 fn assert_late_signal_scans_the_unread_page(name: &str, hold_ms: u64) {
-    use std::os::fd::AsRawFd;
     let sb = Sandbox::new(name, FAST);
     let steps = [
         "HTTP/2.0 429 Too Many Requests\r\nRetry-After: 60\r\n\r\n{}\n",
@@ -2012,7 +2017,7 @@ fn assert_late_signal_scans_the_unread_page(name: &str, hold_ms: u64) {
     .join("\u{1f}");
     let child = sb
         .cmd(&["api", "-i", "--paginate", "repos/o/r"])
-        .env("FAKE_GH_SLEEP", "1")
+        .env("FAKE_GH_GO", sb.path("go"))
         .env("FAKE_GH_STDOUT_STEPS", &steps)
         .env("FAKE_GH_EXIT", "1")
         .stdout(Stdio::null())
@@ -2020,15 +2025,8 @@ fn assert_late_signal_scans_the_unread_page(name: &str, hold_ms: u64) {
         .spawn()
         .unwrap();
     wait_for_log(&sb, "start api");
-    let held = std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .open(sb.path("state/test.lock"))
-        .unwrap();
-    // SAFETY: flock on a descriptor this test owns.
-    assert_eq!(unsafe { libc::flock(held.as_raw_fd(), libc::LOCK_EX) }, 0);
+    let held = hold_account_lock(&sb);
+    std::fs::write(sb.path("go"), "").unwrap();
     wait_for_log(&sb, "end api");
     // Let gh exit and be reaped, so the signal is not forwarded to it.
     std::thread::sleep(std::time::Duration::from_secs(1));
@@ -2047,6 +2045,135 @@ fn assert_late_signal_scans_the_unread_page(name: &str, hold_ms: u64) {
         "the signal did not arrive while gh-paced was still reading: {err}"
     );
     assert_two_day_cooldown(&sb, before, &err);
+}
+
+/// Take the account lock, as another gh-paced process recording a cooldown would hold it.
+fn hold_account_lock(sb: &Sandbox) -> std::fs::File {
+    use std::os::fd::AsRawFd;
+    let held = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(sb.path("state/test.lock"))
+        .unwrap();
+    // SAFETY: flock on a descriptor this test owns.
+    assert_eq!(unsafe { libc::flock(held.as_raw_fd(), libc::LOCK_EX) }, 0);
+    held
+}
+
+/// gh's stdout, a terminal, for the two tests below: a healthy first page with a 100 KiB body,
+/// then three 429 pages (`Retry-After` 60, 1200 and 172800 s) with 5 KiB of body between them,
+/// more than one read from a terminal returns (4,095 bytes), so each is read separately.
+fn three_429_pages() -> String {
+    let line = format!("{}\n", "x".repeat(1023));
+    let page = |wait: u32| format!("HTTP/2.0 429 Too Many Requests\r\nRetry-After: {wait}\r\n\r\n");
+    format!(
+        "HTTP/2.0 200 OK\r\nX-Ratelimit-Remaining: 4000\r\n\r\n{}{}{}{}{}{}{{}}\n",
+        line.repeat(100),
+        page(60),
+        line.repeat(5),
+        page(1200),
+        line.repeat(5),
+        page(172_800),
+    )
+}
+
+/// The account lock is held and `lock_wait_secs` is 3, so each time the stdout reader records a
+/// cooldown its hook waits 3 s and gives up. gh writes its pages and exits during the hook for the
+/// first 429; the reader then sees the exit, reads the second 429 and waits 3 s again, by which
+/// time the stream has been silent for more than 2 s as far as the reader knows and it stops
+/// reading, with the third page, gh's own output, still unread. The test lets the lock go 6.5 s
+/// after gh's exit. With `late`, the terminal is never read, so gh-paced is still delivering when
+/// TERM arrives 7.5 s after gh's exit. Either way the cooldown must be the two days of the third
+/// page; before round 13 it was the 1,200 s of the second, because a reader stopped at a cutoff
+/// handed the rest of stdout to a drainer that does not scan it, or, after a late signal, dropped
+/// it.
+fn assert_stopped_reader_scans_what_gh_wrote(name: &str, late: bool) {
+    let config = FAST.replacen('{', r#"{"lock_wait_secs": 3, "#, 1);
+    let sb = Sandbox::new(name, &config);
+    let (master, slave) = pty_pair();
+    let child = sb
+        .cmd(&["api", "-i", "--paginate", "repos/o/r"])
+        .env("FAKE_GH_GO", sb.path("go"))
+        .env("FAKE_GH_STDOUT_HEAD", three_429_pages())
+        .env("FAKE_GH_EXIT", "1")
+        .stdout(Stdio::from(slave))
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    wait_for_log(&sb, "start api");
+    let held = hold_account_lock(&sb);
+    std::fs::write(sb.path("go"), "").unwrap();
+    // A consumer that keeps reading, or (late) one that has stopped but is still there.
+    let (stalled, reader) = if late {
+        (Some(master), None)
+    } else {
+        let mut master = master;
+        let reader = std::thread::spawn(move || {
+            let mut seen = Vec::new();
+            let mut buf = [0u8; 4096];
+            while let Ok(n @ 1..) = std::io::Read::read(&mut master, &mut buf) {
+                seen.extend_from_slice(&buf[..n]);
+            }
+            String::from_utf8_lossy(&seen).into_owned()
+        });
+        (None, Some(reader))
+    };
+    wait_for_log(&sb, "end api");
+    let exited = Instant::now();
+    std::thread::sleep(std::time::Duration::from_millis(6500));
+    drop(held);
+    let before = epoch_now();
+    if late {
+        std::thread::sleep(std::time::Duration::from_millis(1000));
+        // SAFETY: signalling our own child, which has not been reaped.
+        unsafe {
+            libc::kill(child.id() as i32, libc::SIGTERM);
+        }
+    }
+    let o = child.wait_with_output().unwrap();
+    let err = stderr(&o);
+    if late {
+        assert_eq!(o.status.signal(), Some(libc::SIGTERM), "{err}");
+        assert!(
+            err.contains("signal 15 arrived while its output was still being delivered"),
+            "the signal did not arrive while gh-paced was still delivering: {err}"
+        );
+    } else {
+        assert_eq!(o.status.code(), Some(1), "{err}");
+    }
+    assert!(
+        exited.elapsed().as_secs_f64() > 6.0,
+        "gh-paced finished before the lock was let go: {err}"
+    );
+    assert_two_day_cooldown(&sb, before, &err);
+    if let Some(reader) = reader {
+        // What the reader took before it stopped was delivered too, in order.
+        let seen = reader.join().unwrap();
+        let waits: Vec<&str> = seen
+            .split("Retry-After: ")
+            .skip(1)
+            .map(|rest| rest.split(['\r', '\n']).next().unwrap_or(""))
+            .collect();
+        assert_eq!(waits, ["60", "1200", "172800"], "{err}");
+        assert_eq!(seen.matches(&"x".repeat(1023)).count(), 110, "{err}");
+    }
+    drop(stalled);
+}
+
+/// A reader that stopped at a cutoff after gh exited, with gh's last page unread, still scans
+/// that page before handing the stream on (see `assert_stopped_reader_scans_what_gh_wrote`).
+#[test]
+fn a_reader_stopped_after_gh_exits_still_scans_what_gh_wrote() {
+    assert_stopped_reader_scans_what_gh_wrote("stopped-reader", false);
+}
+
+/// As above, with a late signal after the reader stopped: gh-paced takes the scanner with the
+/// last page in it.
+#[test]
+fn a_late_signal_after_a_reader_stopped_keeps_what_gh_wrote() {
+    assert_stopped_reader_scans_what_gh_wrote("stopped-reader-late", true);
 }
 
 /// A terminal's INT (Ctrl-C) goes to the whole foreground process group, gh included, so
