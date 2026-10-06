@@ -64,7 +64,11 @@ as `core.fsmonitor`, by absolute path. So an edition inherits no `GIT_*`
 variable (`GIT_CONFIG_COUNT`, `GIT_CONFIG_PARAMETERS` and the rest), reads no
 system or global Git configuration (`GIT_CONFIG_NOSYSTEM=1`,
 `GIT_CONFIG_GLOBAL=/dev/null`), and finds no repository above the case directory
-(`GIT_CEILING_DIRECTORIES`).
+(`GIT_CEILING_DIRECTORIES`). The case repository's own configuration is still
+read, so `core.fsmonitor=false` is given at command scope (`GIT_CONFIG_COUNT`),
+which overrides it. The harness creates each case repository with that same
+environment (`init_case_repository`), so a template directory the caller names
+(`GIT_TEMPLATE_DIR`, `init.templateDir`) is not copied into it.
 
 Without `--herdr-bin`, the Rust edition looks `herdr` up on `PATH` and meets the
 stub, but the Python edition runs the `herdr` installed in a fixed location such

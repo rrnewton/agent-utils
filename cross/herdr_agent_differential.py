@@ -500,6 +500,12 @@ def without_ambient_executables(environment: dict[str, str]) -> dict[str, str]:
     return environment
 
 
+# The Git both editions run, and the configuration that overrides whatever a repository sets:
+# check-ignore reads the index, and reading the index runs the core.fsmonitor helper.
+SYSTEM_GIT = "/usr/bin/git"
+GIT_COMMAND_CONFIGURATION = (("core.fsmonitor", "false"),)
+
+
 def with_case_git(environment: dict[str, str], root: Path) -> dict[str, str]:
     """Give an edition's Git no configuration but the case's own repository.
 
@@ -510,14 +516,35 @@ def with_case_git(environment: dict[str, str], root: Path) -> dict[str, str]:
     GIT_CONFIG_PARAMETERS, add configuration; GIT_DIR and its relatives move the repository),
     the system and global configuration files are not read (the XDG one is already the case's,
     and GIT_CONFIG_GLOBAL replaces it too), and repository discovery stops at the case directory,
-    so a repository that encloses the harness directory is not read either.
+    so a repository that encloses the harness directory is not read either. The repository's own
+    configuration is still read, along with anything it includes, so GIT_COMMAND_CONFIGURATION
+    is given last, at command scope, where it overrides every file.
     """
     for variable in [name for name in environment if name.startswith("GIT_")]:
         del environment[variable]
     environment["GIT_CONFIG_NOSYSTEM"] = "1"
     environment["GIT_CONFIG_GLOBAL"] = os.devnull
     environment["GIT_CEILING_DIRECTORIES"] = os.path.dirname(os.path.realpath(root))
+    environment["GIT_CONFIG_COUNT"] = str(len(GIT_COMMAND_CONFIGURATION))
+    for index, (key, value) in enumerate(GIT_COMMAND_CONFIGURATION):
+        environment[f"GIT_CONFIG_KEY_{index}"] = key
+        environment[f"GIT_CONFIG_VALUE_{index}"] = value
     return environment
+
+
+def init_case_repository(root: Path) -> None:
+    """Create the repository that a case's editions run Git in, from Git's built-in template.
+
+    `git init` copies a template directory into the new `.git`, including any `config` file
+    there, and the caller chooses that directory with GIT_TEMPLATE_DIR or init.templateDir. So
+    the harness creates every case repository with the Git environment the editions get.
+    """
+    subprocess.run(
+        [SYSTEM_GIT, "init", "-q", str(root)],
+        check=True,
+        stdin=subprocess.DEVNULL,
+        env=with_case_git(dict(os.environ), root),
+    )
 
 
 FIXTURE_HERDR = ("--herdr-bin", "<HERDR>")

@@ -22,6 +22,7 @@ from pathlib import Path
 
 from herdr_agent_differential import (
     FIXTURE_HERDR, Harness, Outcome, PairCase, Report, _queue_snapshot, _state,
+    init_case_repository,
 )
 
 _COMMON = ("--herdr-bin", "<HERDR>", "--registry", "<ROOT>/registry")
@@ -320,7 +321,7 @@ def _profiles(harness: Harness, report: Report) -> None:
     for profile in ("astra-ultra", "sol", "watermelon", "muse-literal", "codex-safe-config"):
         case = harness.case(f"primary-profile-{profile}")
         for root in (case.python_root, case.rust_root):
-            subprocess.run(["git", "init", "-q", str(root)], check=True)
+            init_case_repository(root)
             (root / ".gitignore").write_text(".agentctl/\n", encoding="utf-8")
             directory = root / ".agentctl"
             directory.mkdir(mode=0o700)
@@ -698,7 +699,7 @@ def _profile_refusals(harness: Harness, report: Report) -> None:
     for label in ("nonignored", "permissions", "symlink", "unknown-field"):
         case = harness.case(f"primary-profile-refusal-{label}")
         for root in (case.python_root, case.rust_root):
-            subprocess.run(["git", "init", "-q", str(root)], check=True)
+            init_case_repository(root)
             if label != "nonignored":
                 (root / ".gitignore").write_text(".agentctl/\n", encoding="utf-8")
             directory = root / ".agentctl"
@@ -723,7 +724,7 @@ def _profile_refusals(harness: Harness, report: Report) -> None:
 
     overlap = harness.case("primary-profile-refusal-overlap")
     for root in (overlap.python_root, overlap.rust_root):
-        subprocess.run(["git", "init", "-q", str(root)], check=True)
+        init_case_repository(root)
         (root / ".gitignore").write_text(".agentctl/\n", encoding="utf-8")
         directory = root / ".agentctl"
         directory.mkdir(mode=0o700)
@@ -793,7 +794,7 @@ def _profile_refusals(harness: Harness, report: Report) -> None:
 
     hostile_path = harness.case("primary-profile-hostile-path", {"hostile_path": True})
     for root in (hostile_path.python_root, hostile_path.rust_root):
-        subprocess.run(["/usr/bin/git", "init", "-q", str(root)], check=True)
+        init_case_repository(root)
         (root / ".gitignore").write_text(".agentctl/\n", encoding="utf-8")
         directory = root / ".agentctl"
         directory.mkdir(mode=0o700)
@@ -825,7 +826,7 @@ def _workspace_retirement(harness: Harness, report: Report) -> None:
     """
     retirement = harness.case("primary-workspace-retirement")
     for root in (retirement.python_root, retirement.rust_root):
-        subprocess.run(["/usr/bin/git", "init", "-q", str(root)], check=True)
+        init_case_repository(root)
         (root / ".gitignore").write_text(".agentctl/\n", encoding="utf-8")
         (root / ".agentctl").mkdir(mode=0o700)
     common = ("--herdr-bin", "<HERDR>", "--registry", "<ROOT>/.agentctl")
@@ -877,7 +878,7 @@ def _workspace_policy(harness: Harness, report: Report) -> None:
     for label, document in documents.items():
         case = harness.case(f"primary-workspace-{label}")
         for root in (case.python_root, case.rust_root):
-            subprocess.run(["/usr/bin/git", "init", "-q", str(root)], check=True)
+            init_case_repository(root)
             (root / ".gitignore").write_text(".agentctl/\n", encoding="utf-8")
             directory = root / ".agentctl"
             directory.mkdir(mode=0o700)
@@ -891,7 +892,7 @@ def _workspace_policy(harness: Harness, report: Report) -> None:
 
     malformed = harness.case("primary-workspace-malformed-unrelated-profile")
     for root in (malformed.python_root, malformed.rust_root):
-        subprocess.run(["/usr/bin/git", "init", "-q", str(root)], check=True)
+        init_case_repository(root)
         (root / ".gitignore").write_text(".agentctl/\n", encoding="utf-8")
         directory = root / ".agentctl"
         directory.mkdir(mode=0o700)
@@ -907,7 +908,7 @@ def _workspace_policy(harness: Harness, report: Report) -> None:
 
     duplicate_workspace = harness.case("primary-workspace-duplicate-key")
     for root in (duplicate_workspace.python_root, duplicate_workspace.rust_root):
-        subprocess.run(["/usr/bin/git", "init", "-q", str(root)], check=True)
+        init_case_repository(root)
         (root / ".gitignore").write_text(".agentctl/\n", encoding="utf-8")
         directory = root / ".agentctl"
         directory.mkdir(mode=0o700)
@@ -927,7 +928,7 @@ def _workspace_policy(harness: Harness, report: Report) -> None:
 
     mismatch = harness.case("primary-workspace-explicit-mismatch")
     for root in (mismatch.python_root, mismatch.rust_root):
-        subprocess.run(["/usr/bin/git", "init", "-q", str(root)], check=True)
+        init_case_repository(root)
         (root / ".gitignore").write_text(".agentctl/\n", encoding="utf-8")
         directory = root / ".agentctl"
         directory.mkdir(mode=0o700)
@@ -955,7 +956,7 @@ def _workspace_policy(harness: Harness, report: Report) -> None:
 
     move = harness.case("primary-workspace-move")
     for root in (move.python_root, move.rust_root):
-        subprocess.run(["/usr/bin/git", "init", "-q", str(root)], check=True)
+        init_case_repository(root)
         (root / ".gitignore").write_text(".agentctl/\n", encoding="utf-8")
         (root / ".agentctl").mkdir(mode=0o700)
     move_common = ("--herdr-bin", "<HERDR>", "--registry", "<ROOT>/.agentctl")
@@ -1057,7 +1058,7 @@ def _workspace_policy(harness: Harness, report: Report) -> None:
     for label, content in strict_documents.items():
         case = harness.case(f"primary-profile-strict-{label}")
         for root in (case.python_root, case.rust_root):
-            subprocess.run(["git", "init", "-q", str(root)], check=True)
+            init_case_repository(root)
             (root / ".gitignore").write_text(".agentctl/\n", encoding="utf-8")
             directory = root / ".agentctl"
             directory.mkdir(mode=0o700)

@@ -821,6 +821,15 @@ def test_an_ambient_executable_override_is_not_inherited(
 # The Git both editions run (agentctl/profiles.py, profiles.rs) and the call they make with it.
 _SYSTEM_GIT = "/usr/bin/git"
 _CHECK_IGNORE = ("check-ignore", "--quiet", "--", ".agentctl/profiles.toml")
+# The Git variables every edition gets besides GIT_CEILING_DIRECTORIES: no system or global
+# configuration, and core.fsmonitor turned off at command scope, above the repository's own.
+_CASE_GIT = {
+    "GIT_CONFIG_NOSYSTEM": "1",
+    "GIT_CONFIG_GLOBAL": os.devnull,
+    "GIT_CONFIG_COUNT": "1",
+    "GIT_CONFIG_KEY_0": "core.fsmonitor",
+    "GIT_CONFIG_VALUE_0": "false",
+}
 # An "edition" that runs Git as both editions do, in its own repository when given `init`, and
 # reports the check-ignore status and the Git variables it was given.
 _GIT_PROBE_EDITION = (
@@ -924,7 +933,7 @@ def test_an_edition_runs_git_with_no_configuration_but_the_case_repository(
     assert json.loads(python.stdout) == {
         # 128: with no repository of its own, the case is not inside any repository.
         "check_ignore": 0 if init else 128,
-        "git": {"GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": os.devnull},
+        "git": _CASE_GIT,
         "ceiling_is_parent": True,
     }
     assert harness.host_cli_calls() == []
@@ -961,10 +970,155 @@ def test_the_serialization_editions_run_git_with_no_configuration_but_the_case_r
     [(environment, directory)] = launched
     assert isinstance(environment, dict) and isinstance(directory, Path)
     assert {key: value for key, value in environment.items() if key.startswith("GIT_")} == {
-        "GIT_CONFIG_NOSYSTEM": "1",
-        "GIT_CONFIG_GLOBAL": os.devnull,
+        **_CASE_GIT,
         "GIT_CEILING_DIRECTORIES": os.path.dirname(os.path.realpath(directory)),
     }
+
+
+def _recording_helper(tmp_path: Path) -> tuple[Path, Path]:
+    """A helper program that records each run in a marker file, and that marker."""
+    marker = tmp_path / "helper-ran"
+    helper = tmp_path / "fsmonitor-helper"
+    helper.write_text(f"#!/bin/sh\necho \"$@\" >> {marker}\nexit 1\n", encoding="utf-8")
+    helper.chmod(0o700)
+    return helper, marker
+
+
+def _hostile_template(tmp_path: Path, helper: Path) -> Path:
+    """A Git template directory whose config file names the helper, and with an exclude file."""
+    template = tmp_path / "template"
+    (template / "info").mkdir(parents=True)
+    (template / "config").write_text(f"[core]\n\tfsmonitor = {helper}\n", encoding="utf-8")
+    (template / "info" / "exclude").write_text("template-marker\n", encoding="utf-8")
+    return template
+
+
+@pytest.mark.parametrize("route", ("local", "include", "template"))
+def test_an_edition_runs_no_git_helper_that_the_case_repository_configures(
+    tmp_path: Path, route: str
+) -> None:
+    """Both editions read the case repository's configuration, so it may not run a helper either.
+
+    The repository exists before the editions start, as in every corpus case, and check-ignore
+    with no configuration but that repository's must first run the helper. `template` is a
+    repository whose `git init` copied a template's config file.
+    """
+    import json
+    import subprocess
+
+    if not os.access(_SYSTEM_GIT, os.X_OK):
+        pytest.skip(f"{_SYSTEM_GIT}, which both editions run, is not installed")
+    herdr_agent = _cross_module("herdr_agent_differential")
+    helper, marker = _recording_helper(tmp_path)
+    template = _hostile_template(tmp_path, helper)
+    included = tmp_path / "included-config"
+    included.write_text(f"[core]\n\tfsmonitor = {helper}\n", encoding="utf-8")
+    clean = {key: value for key, value in os.environ.items() if not key.startswith("GIT_")}
+    clean.update({"GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": os.devnull})
+    edition = [sys.executable, "-c", _GIT_PROBE_EDITION]
+    harness = herdr_agent.Harness(tmp_path / "cross", edition, edition)
+    try:
+        case = harness.case(f"git-repository-{route}")
+        for root in (case.python_root, case.rust_root):
+            if route == "template":
+                subprocess.run([_SYSTEM_GIT, "init", "-q", str(root)], check=True,
+                               env={**clean, "GIT_TEMPLATE_DIR": str(template)},
+                               stdin=subprocess.DEVNULL)
+            else:
+                herdr_agent.init_case_repository(root)
+            if route == "local":
+                subprocess.run([_SYSTEM_GIT, "-C", str(root), "config", "core.fsmonitor",
+                                str(helper)], check=True, env=clean, stdin=subprocess.DEVNULL)
+            if route == "include":
+                with (root / ".git" / "config").open("a", encoding="utf-8") as configuration:
+                    configuration.write(f"[include]\n\tpath = {included}\n")
+            (root / ".gitignore").write_text(".agentctl/\n", encoding="utf-8")
+            subprocess.run([_SYSTEM_GIT, "-C", str(root), *_CHECK_IGNORE], env=clean,
+                           stdin=subprocess.DEVNULL, capture_output=True, check=False)
+            assert marker.exists(), f"the {route} configuration does not run the helper"
+            marker.unlink()
+        python, rust = harness.invoke(
+            case, ("git-probe", "no-init", *herdr_agent.FIXTURE_HERDR)
+        )
+    finally:
+        harness.close()
+
+    assert not marker.exists()
+    assert python == rust
+    assert python.returncode == 0, python.stderr
+    assert json.loads(python.stdout) == {
+        "check_ignore": 0, "git": _CASE_GIT, "ceiling_is_parent": True,
+    }
+    assert harness.host_cli_calls() == []
+
+
+@pytest.mark.parametrize("source", ("template-dir", "environment", "home"))
+def test_a_case_repository_takes_nothing_from_a_template_the_caller_names(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, source: str
+) -> None:
+    """`git init` copies the caller's template directory, config file and all, into `.git`."""
+    import subprocess
+
+    if not os.access(_SYSTEM_GIT, os.X_OK):
+        pytest.skip(f"{_SYSTEM_GIT}, which both editions run, is not installed")
+    herdr_agent = _cross_module("herdr_agent_differential")
+    helper, _ = _recording_helper(tmp_path)
+    template = _hostile_template(tmp_path, helper)
+    configuration: dict[str, str]
+    if source == "template-dir":
+        configuration = {"GIT_TEMPLATE_DIR": str(template)}
+    elif source == "environment":
+        configuration = {"GIT_CONFIG_COUNT": "1", "GIT_CONFIG_KEY_0": "init.templateDir",
+                         "GIT_CONFIG_VALUE_0": str(template)}
+    else:
+        home = tmp_path / "home"
+        home.mkdir()
+        (home / ".gitconfig").write_text(f"[init]\n\ttemplateDir = {template}\n",
+                                         encoding="utf-8")
+        configuration = {"HOME": str(home)}
+    caller = {key: value for key, value in os.environ.items() if not key.startswith("GIT_")}
+    control = tmp_path / "control"
+    subprocess.run([_SYSTEM_GIT, "init", "-q", str(control)], check=True,
+                   env={**caller, **configuration}, stdin=subprocess.DEVNULL)
+    assert str(helper) in (control / ".git" / "config").read_text(encoding="utf-8")
+    assert "template-marker" in (control / ".git" / "info" / "exclude").read_text(encoding="utf-8")
+
+    for variable, value in configuration.items():
+        monkeypatch.setenv(variable, value)
+    fixture = tmp_path / "fixture"
+    herdr_agent.init_case_repository(fixture)
+    assert "fsmonitor" not in (fixture / ".git" / "config").read_text(encoding="utf-8")
+    exclude = fixture / ".git" / "info" / "exclude"
+    assert not exclude.exists() or "template-marker" not in exclude.read_text(encoding="utf-8")
+
+
+def test_the_cross_harness_runs_git_only_to_create_a_case_repository() -> None:
+    """A fixture `git init` with the caller's environment would take the caller's template."""
+    import ast
+
+    def runs_git(argument: ast.expr) -> bool:
+        """Whether a call's first argument is an argument vector that starts Git."""
+        if not (isinstance(argument, (ast.List, ast.Tuple)) and argument.elts):
+            return False
+        first = argument.elts[0]
+        if isinstance(first, ast.Constant) and isinstance(first.value, str):
+            return os.path.basename(first.value) == "git"
+        if isinstance(first, ast.Name):
+            return first.id.endswith("SYSTEM_GIT")
+        return isinstance(first, ast.Attribute) and first.attr.endswith("SYSTEM_GIT")
+
+    found: list[tuple[str, str]] = []
+    for path in sorted((REPO_ROOT / "cross").glob("*.py")):
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        functions = [node for node in ast.walk(tree)
+                     if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))]
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Call) and node.args and runs_git(node.args[0]):
+                enclosing = [function for function in functions
+                             if function.lineno <= node.lineno <= (function.end_lineno or 0)]
+                innermost = max(enclosing, key=lambda function: function.lineno, default=None)
+                found.append((path.name, innermost.name if innermost else "<module>"))
+    assert found == [("herdr_agent_differential.py", "init_case_repository")]
 
 
 # Invocations whose refusal is checked against what the Python parsers actually select.
