@@ -677,6 +677,101 @@ def test_a_row_path_holding_separators_is_one_option_or_assignment_value(
     )
 
 
+def test_a_relative_path_holding_a_newline_is_one_argument(tmp_path: Path) -> None:
+    """A relative argument holding a newline is one path below the working directory.
+
+    The row's own spelling is absolute, so it is not found as text; the
+    element has to be read whole.  ``_user_systemd_properties`` separates
+    the elements of an array property with a NUL character, which no D-Bus
+    string holds, and a property string is also read whole.
+    """
+
+    row = tmp_path / "with\nnewline" / "slot01"
+    row.mkdir(parents=True)
+    (tmp_path / "with\nnewline" / "slot010").mkdir()
+
+    def names(**unit: str) -> bool:
+        return wrkslots._UnitPathResolver().names(unit, wrkslots._row_path_identity(row))
+
+    base = str(tmp_path)
+    assert names(WorkingDirectory=base, ExecStart="tool\0--checkout=with\nnewline/slot01/product")
+    assert names(WorkingDirectory=base, ExecStart="make\0-C\0with\nnewline/slot01")
+    assert names(WorkingDirectory=base, ExecStart="tool\n--checkout=with\nnewline/slot01/product")
+    assert not names(WorkingDirectory=base, ExecStart="tool\0--checkout=with\nnewline/slot010")
+    assert not names(WorkingDirectory=base, ExecStart="make\0-C\0with\nnewline/slot010")
+
+
+def test_user_systemd_string_arrays_separate_elements_with_nul(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Each string of an array property is one NUL-separated element.
+
+    A newline can be part of an argument, so it cannot also mark where one
+    argument ends; D-Bus strings never hold a NUL character.
+    """
+
+    replies = (
+        {"type": "a(sasbttttuii)", "data": [
+            ["/bin/tool", ["tool", "--checkout=with\nnewline/slot01"], False,
+             0, 0, 0, 0, 0, 0, 0],
+        ]},
+        {"type": "as", "data": ["A=1", "B=two\nlines"]},
+        {"type": "s", "data": "one\nstring"},
+    )
+    monkeypatch.setattr(
+        wrkslots,
+        "_run_user_busctl",
+        lambda *_args, **_kwargs: b"".join(
+            (json.dumps(reply) + "\n").encode("utf-8") for reply in replies
+        ),
+    )
+    budget = wrkslots._ReadOnlyCommandBudget.start(
+        timeout_seconds=30, stdout_limit=1024 * 1024, stderr_limit=64 * 1024
+    )
+    values = wrkslots._user_systemd_properties(
+        "/org/freedesktop/systemd1/unit/unit_2eservice",
+        "org.freedesktop.systemd1.Service",
+        (("ExecStart", "a(sasbttttuii)"), ("Environment", "as"), ("WorkingDirectory", "s")),
+        budget,
+    )
+    assert values == {
+        "ExecStart": "/bin/tool\0tool\0--checkout=with\nnewline/slot01",
+        "Environment": "A=1\0B=two\nlines",
+        "WorkingDirectory": "one\nstring",
+    }
+
+
+def test_a_quoted_shell_word_before_a_control_operator_is_one_path(tmp_path: Path) -> None:
+    """A quoted path written just before ``;`` or ``&&`` is one shell word.
+
+    Plain shell-word splitting joins the operator to the word
+    (``'/x/alias: link';`` reads as ``/x/alias: link;``), and the
+    separators inside the symlink's name split it apart.  A word is also
+    read with shell control operators as words of their own, and a shell
+    word that holds shell text (``bash -c "..."``) is read again.
+    """
+
+    row = tmp_path / "project" / "worktrees" / "validate" / "slot01"
+    row.mkdir(parents=True)
+    alias = tmp_path / "alias: link"
+    alias.symlink_to(row)
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    other = tmp_path / "other: link"
+    other.symlink_to(elsewhere)
+
+    def names(**unit: str) -> bool:
+        return wrkslots._UnitPathResolver().names(unit, wrkslots._row_path_identity(row))
+
+    assert names(ExecStart=f"/bin/sh\0-c\0cd '{alias}'; make")
+    assert names(ExecStart=f"/bin/sh\n-c\ncd '{alias}'; make")
+    assert names(ExecStart=f"/bin/sh\0-c\0cd '{alias}/product'&&make")
+    assert names(ExecStart=f"/bin/sh\0-c\0bash -c \"cd '{alias}/product'; make\"")
+    assert names(ExecStart=f"/bin/sh -c \"bash -c \\\"cd '{alias}'|| exit\\\"\"")
+    assert not names(ExecStart=f"/bin/sh\0-c\0cd '{other}'; make")
+    assert not names(ExecStart=f"/bin/sh\0-c\0bash -c \"cd '{other}/product'; make\"")
+
+
 def test_resolving_a_long_path_looks_up_a_bounded_part_of_it(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

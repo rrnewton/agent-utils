@@ -46989,6 +46989,14 @@ def _user_busctl_typed_value(signature: str, value: object, label: str) -> objec
     raise AssertionError(f"unsupported user-systemd D-Bus signature {signature}")
 
 
+# Separates the strings of an array property (``ExecStart`` arguments,
+# ``Environment`` assignments, ``ReadWritePaths`` entries) in the one string
+# ``_user_systemd_properties`` returns for it.  An argument can hold a
+# newline, so a newline cannot also mark where one ends; a D-Bus string
+# never holds a NUL character.
+_UNIT_PROPERTY_ELEMENT_SEPARATOR = "\0"
+
+
 def _user_busctl_string_evidence(value: object) -> tuple[str, ...]:
     if isinstance(value, str):
         return (value,)
@@ -47033,7 +47041,9 @@ def _user_systemd_properties(
         elif isinstance(value, int):
             result[name] = str(value)
         else:
-            result[name] = "\n".join(_user_busctl_string_evidence(value))
+            result[name] = _UNIT_PROPERTY_ELEMENT_SEPARATOR.join(
+                _user_busctl_string_evidence(value)
+            )
     return result
 
 
@@ -47346,21 +47356,30 @@ def _user_systemd_snapshot() -> tuple[Mapping[str, str], ...]:
 #
 # A path may itself contain any of these characters, so splitting alone
 # would lose a path with a space in it.  Each element of a property (one
-# argv element, environment assignment or path; ``_user_systemd_properties``
-# puts each on its own line) is therefore also judged whole, as its shell
-# words, split by these characters other than whitespace, and from just
-# after each ``=``, and each separator a ``/`` or ``~`` follows, to its end,
-# so an option or assignment value holding a separator is whole.  A row
-# path's own spellings are also found as text anywhere in a property
+# argv element, environment assignment or path, which
+# ``_user_systemd_properties`` separates with
+# ``_UNIT_PROPERTY_ELEMENT_SEPARATOR``), each line of an element, and a
+# property string as a whole are therefore also judged whole, as their
+# shell words, split by these characters other than whitespace, and from
+# just after each ``=``, and each separator a ``/`` or ``~`` follows, to
+# the end, so an option or assignment value holding a separator is whole.
+# A row path's own spellings are also found as text anywhere in a property
 # (``_property_mentions``), which keeps a row path whole even where it
 # holds a newline or ends just before a separator.  Every reading only
 # adds candidate paths, so a reading that splits a path apart can refuse a
 # row falsely (``slot01:other`` names ``slot01``) but cannot hide one;
 # ``:``, ``,`` and ``;`` delimit real paths in search lists, bind
 # specifications (``SRC:DST``) and shell commands, so they stay separators.
-_UNIT_EVIDENCE_SEPARATORS = re.compile(r"[\s\"'`=:,;&|()<>{}$]+")
-_UNIT_ARGUMENT_SEPARATORS = re.compile(r"[\"'`=:,;&|()<>{}$]+")
-_UNIT_VALUE_STARTS = re.compile(r"=|[\s\"'`:,;&|()<>{}$](?=[/~])")
+# The element separator, NUL, is a separator too; no path holds it.
+_UNIT_EVIDENCE_SEPARATORS = re.compile(r"[\s\x00\"'`=:,;&|()<>{}$]+")
+_UNIT_ARGUMENT_SEPARATORS = re.compile(r"[\x00\"'`=:,;&|()<>{}$]+")
+_UNIT_VALUE_STARTS = re.compile(r"=|[\s\x00\"'`:,;&|()<>{}$](?=[/~])")
+# Characters that make a shell word worth reading again as shell text: a
+# word holding whitespace, a quote, a backslash or a control operator came
+# from a quoted command (``bash -c "cd '/x/y z' && make"``).
+_UNIT_SHELL_TEXT = re.compile(r"[\s\"'\\;&|()<>]")
+# How many times a shell word is read again as shell text.
+_UNIT_SHELL_NESTING = 3
 # Linux's PATH_MAX: the longest path, with its terminating NUL, that one
 # system call accepts.  A value read from just after a separator is cut to
 # this length, which keeps every path a call could use and bounds the
@@ -47709,26 +47728,66 @@ class _UnitPathResolver:
         )
 
 
-def _unit_property_words(value: str) -> tuple[str, ...]:
-    """Every candidate path in one unit property string.
+def _shell_words(text: str) -> tuple[str, ...]:
+    """The shell words of ``text``, read plainly and with control operators.
 
-    Each line is one element (see ``_UNIT_EVIDENCE_SEPARATORS``).  An
-    element is judged whole, as each of its shell words (when it parses as
-    shell text), as the pieces of each of those split by every separator
-    and by every separator except whitespace, and as the rest of each from
-    just after every ``=``, and every separator that ``/`` or ``~``
-    follows, so ``--checkout=<path>`` and ``NAME=<path>`` keep a path that
-    holds a separator.  Each such rest is cut to ``_PATH_MAX`` characters.
+    Plain reading joins an operator written against a word to it
+    (``'/x/y z';`` is the word ``/x/y z;``); the second reading makes
+    ``;``, ``&&``, ``|`` and the other control operators words of their
+    own.  Text that does not parse, such as an unclosed quote, keeps the
+    words read before the error.
     """
 
     words: list[str] = []
-    for element in value.split("\n"):
-        readings = [element]
+    for operators in (False, True):
+        lexer = shlex.shlex(text, posix=True, punctuation_chars=operators)
+        lexer.whitespace_split = True
+        lexer.commenters = ""
         try:
-            readings.extend(shlex.split(element, posix=True))
+            for word in lexer:
+                words.append(word)
         except ValueError:
             pass
-        for reading in readings:
+    return tuple(dict.fromkeys(words))
+
+
+def _unit_property_words(value: str) -> tuple[str, ...]:
+    """Every candidate path in one unit property string.
+
+    The elements are the NUL-separated strings of an array property (see
+    ``_UNIT_PROPERTY_ELEMENT_SEPARATOR``), each line of one, and a string
+    without a NUL as a whole.  An element is judged whole, as each of its
+    shell words, read again as shell text up to ``_UNIT_SHELL_NESTING``
+    times when a word holds shell text, as the pieces of each of those
+    split by every separator and by every separator except whitespace,
+    and as the rest of each from just after every ``=``, and every
+    separator that ``/`` or ``~`` follows, so ``--checkout=<path>`` and
+    ``NAME=<path>`` keep a path that holds a separator.  Each such rest is
+    cut to ``_PATH_MAX`` characters.
+    """
+
+    pieces = value.split(_UNIT_PROPERTY_ELEMENT_SEPARATOR)
+    elements = dict.fromkeys(
+        (*pieces, *(line for piece in pieces if "\n" in piece for line in piece.split("\n")))
+    )
+    words: list[str] = []
+    for element in elements:
+        readings = [element]
+        level: tuple[str, ...] = (element,)
+        for _ in range(_UNIT_SHELL_NESTING):
+            level = tuple(
+                dict.fromkeys(
+                    word
+                    for text in level
+                    for word in _shell_words(text)
+                    if word != text
+                )
+            )
+            readings.extend(level)
+            level = tuple(word for word in level if _UNIT_SHELL_TEXT.search(word))
+            if not level:
+                break
+        for reading in dict.fromkeys(readings):
             words.append(reading)
             words.extend(_UNIT_EVIDENCE_SEPARATORS.split(reading))
             words.extend(_UNIT_ARGUMENT_SEPARATORS.split(reading))

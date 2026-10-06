@@ -393,9 +393,12 @@ validation slots. `audit`, `remove` (including `--validate-complete` and `remove
   validation slot free.
 
 A unit names a row path when one of the words of its property strings is that path or a path
-inside it. Each element of a property (one command-line argument, environment assignment or path)
-is a word as a whole, and so is each of its shell words when it parses as shell text. Each of those
-is also split into words at whitespace, quotes, and the characters `=`, `:`, `,`, `;`, `&`, `|`,
+inside it. Each element of a property (one command-line argument, environment assignment or path),
+each line of an element, and a property string as a whole are words, and so are their shell words,
+read once as the shell splits words and once with the control operators `;`, `&&`, `|` and the
+others as words of their own (so `cd '<path>'; make` holds `<path>`). A shell word that holds
+quotes, whitespace or an operator is read again as shell text, up to three times
+(`bash -c "cd '<path>' && make"`). Each of those is also split into words at whitespace, quotes, and the characters `=`, `:`, `,`, `;`, `&`, `|`,
 `(`, `)`, `<`, `>`, `{`, `}` and `$`, and split again at the same characters except whitespace, so
 a row path containing a space is still one word in `--checkout=<path>` or `cd '<path>'`. The rest
 of each element and shell word from just after every `=`, and after every one of those characters
@@ -407,8 +410,9 @@ characters and end it or precede `/` or one of those characters, so a row path i
 where it contains a newline or ends just before a `:`. Every reading only adds words, so a path that
 contains one of these characters can name a row it is not inside (`slot01:other` names `slot01`)
 and refuse falsely, but no reading hides a row path's own spelling. A symlink to a row whose own
-name contains one of these characters, written immediately before another of them, can still go
-unmatched by the symlink's spelling.
+name contains one of these characters can still go unmatched by the symlink's spelling when another
+of them follows it in the same shell word (`PATH=<symlink>:/bin`), and a path the shell computes
+from a variable, a glob or a command substitution is not read.
 A relative word is resolved against the unit's working directory (the home directory when it has
 none), and `~` is the home directory. Each word is then compared as a whole path: its normalized
 spelling, its symlink-resolved spelling as written (a `..` after a symlink leaves the symlink's
