@@ -16946,6 +16946,12 @@ class _RunEvidence:
     # changed while a recent handle's timestamp window was waited out: each
     # with how and when it changed (``_retained_handle_changes``).
     late: Mapping[str, tuple[tuple[_RetainedValidationHandle, str], ...]]
+    # The process generations the handles record, read just before the host
+    # evidence (``_recorded_generations_before``): those that ran, and those
+    # whose reading refused, with the refusal.  Keyed by boot id, PID and
+    # start ticks.
+    running: frozenset[tuple[str, int, int]]
+    unreadable: Mapping[tuple[str, int, int], str]
 
 
 def _run_evidence(
@@ -16971,7 +16977,10 @@ def _run_evidence(
     before and after the wait is recorded in ``late`` as well.  A handle
     that both reads find alike while either finds it that recent, or
     across a step back of this host's realtime clock, is recorded in
-    ``late`` too (``_retained_handle_changes``).  The
+    ``late`` too (``_retained_handle_changes``).  Between the last handle
+    read before the host evidence and that evidence, the process generation
+    each of those handles records is read directly
+    (``_recorded_generations_before``).  The
     current members of their units' control groups are read last (see
     ``_retained_unit_cgroup_members``).  ``first`` is a handle read the
     caller has already made and judged.  Every caller that judges rows from
@@ -16983,10 +16992,12 @@ def _run_evidence(
     queued from a run that finished: both leave a handle that every read
     finds alike, with no unit, process or member, and waiting longer does
     not tell them apart.  A dead answer therefore relies on whatever writes
-    a handle making its run visible here (its unit active or queued, or the
-    process generation the handle records running) before the change time
-    of any write is ``_RETAINED_HANDLE_STABLE_NS`` old.  The user guide
-    states that rule for handle writers.
+    a handle making its run visible here (its unit active or queued, another
+    active or queued unit that names the checkout, or the process
+    generation the handle records running) before the change time of any
+    write is ``_RETAINED_HANDLE_STABLE_NS`` old, and keeping it visible
+    without a break until its own unit is queued.  The user guide states
+    that rule for handle writers.
     """
 
     if first is None:
@@ -16994,6 +17005,7 @@ def _run_evidence(
     earlier = first
     if _settle_retained_handles(first):
         first = _retained_handles_for_absent_rows(config, rows)
+    running, unreadable = _recorded_generations_before(first)
     processes, units = host()
     later = _retained_handles_for_absent_rows(config, rows)
     bindings = {
@@ -17024,7 +17036,54 @@ def _run_evidence(
             )
         if changes:
             late[slot] = changes
-    return _RunEvidence(processes, units, bindings, members, late)
+    return _RunEvidence(processes, units, bindings, members, late, running, unreadable)
+
+
+def _recorded_generations_before(
+    bindings: Mapping[str, tuple[_RetainedValidationHandle, ...]],
+) -> tuple[frozenset[tuple[str, int, int]], dict[tuple[str, int, int], str]]:
+    """Read each current-boot process generation that ``bindings`` record.
+
+    ``_run_evidence`` reads them after its last handle read before the host
+    evidence and just before that evidence.  A recorded generation that runs
+    then may queue its unit at any later time, after the second user-systemd
+    enumeration included, and exit before the judgment reads it again.  The
+    process tables need not show it while it runs: they list thread groups
+    and skip terminal ones, so a recorded thread ID, or a thread group
+    leader that has exited while another thread of its group runs, is in
+    neither.  Its own ``/proc`` entry is read here instead, which shows
+    both.  A recorded generation that does not run then cannot act after
+    it, so a unit it queued was queued before both enumerations.
+
+    Returns the generations that ran and, for each whose generation or boot
+    could not be read, the refusal, so that one unreadable handle refuses
+    only the rows it names.
+    """
+
+    running: set[tuple[str, int, int]] = set()
+    unreadable: dict[tuple[str, int, int], str] = {}
+    current_boot: str | None = None
+    for handles in bindings.values():
+        for handle in handles:
+            if handle.pid is None:
+                continue
+            assert handle.start_ticks is not None and handle.boot_id is not None
+            generation = (handle.boot_id, handle.pid, handle.start_ticks)
+            if generation in running or generation in unreadable:
+                continue
+            try:
+                if current_boot is None:
+                    current_boot = _boot_id(Path("/proc"))
+                if handle.boot_id != current_boot:
+                    continue
+                if (
+                    _process_start_ticks(Path("/proc") / str(handle.pid))
+                    == handle.start_ticks
+                ):
+                    running.add(generation)
+            except Refusal as exc:
+                unreadable[generation] = str(exc)
+    return frozenset(running), unreadable
 
 
 def _retained_handle_changes(
@@ -17149,14 +17208,14 @@ def _judge_run_evidence(
     unit queued after the second enumeration, whose job has not started,
     shows no state, process or member.  Such a handle is a run that may
     still use the row.  Rerunning reads it before the units.  A handle's
-    recorded process generation that the later process table holds is a
+    recorded process generation that ran just before the host evidence is a
     run too, even when it has exited since: it may have queued its unit
     after the second enumeration (``_assert_retained_handle_processes_dead``).
     """
 
     slots = {record.slot for record, _paths in rows}
     bindings = {slot: evidence.bindings.get(slot, ()) for slot in slots}
-    _assert_retained_handle_processes_dead(bindings, evidence.processes)
+    _assert_retained_handle_processes_dead(bindings, evidence.running, evidence.unreadable)
     _assert_absent_validate_systemd_unrelated(
         rows,
         bindings,
@@ -17333,8 +17392,8 @@ def _validation_run_liveness_states(
             "dead",
             f"{len(evidence.bindings.get(record.slot, ()))} retained run handle(s) "
             "name this row, each with an inactive, unqueued unit with no live "
-            "process and any recorded process generation dead and absent from the "
-            "later process table; no active or queued user-systemd unit names its "
+            "process and any recorded process generation dead since before the host "
+            "evidence was read; no active or queued user-systemd unit names its "
             "paths",
         )
     return result
@@ -47685,7 +47744,9 @@ def _user_systemd_snapshot() -> tuple[Mapping[str, str], ...]:
 # the end, so an option or assignment value holding a separator is whole.
 # A row path's own spellings are also found as text anywhere in a property
 # (``_property_mentions``), which keeps a row path whole even where it
-# holds a newline or ends just before a separator.  Every reading only
+# holds a newline or ends just before a separator, and counts a path that
+# goes on from it, even back out through ``..``, since that path needs the
+# row to resolve.  Every reading only
 # adds candidate paths, so a reading that splits a path apart can refuse a
 # row falsely (``slot01:other`` names ``slot01``) but cannot hide one;
 # ``:``, ``,`` and ``;`` delimit real paths in search lists, bind
@@ -47827,6 +47888,23 @@ class _SymlinkLoop(Exception):
         self.path = path
 
 
+@dataclasses.dataclass
+class _Traversal:
+    """What one path resolution passes through on its way.
+
+    ``paths`` holds the deepest spelling looked up before each ``..`` steps
+    back out of it and the path of each symlink followed; every other part
+    looked up is a prefix of one of those or of the resolution itself, so
+    a row that any looked-up part lies in contains one of them.  ``files``
+    holds the device and inode of every part looked up that is not a
+    symlink.  The kernel needs each of them to exist for the path to
+    resolve, so a unit that names a path through a row depends on the row.
+    """
+
+    paths: dict[str, None] = dataclasses.field(default_factory=dict)
+    files: set[tuple[int, int]] = dataclasses.field(default_factory=set)
+
+
 class _UnitPathResolver:
     """Resolve the words of user-systemd units to path identities.
 
@@ -47842,7 +47920,8 @@ class _UnitPathResolver:
     (``_realpath``), without looking up a component below one whose lookup
     failed in a way every path below shares, and its ancestors are statted
     from ``/`` down with the same stop, so only ancestors that exist are
-    kept.
+    kept.  What the resolution looks up on the way is kept with it
+    (``_Traversal``).
     """
 
     def __init__(self, budget: _UnitResolutionBudget | None = None) -> None:
@@ -47852,8 +47931,9 @@ class _UnitPathResolver:
         self._files: dict[str, tuple[tuple[int, int] | None, bool]] = {}
         # What ``lstat`` found at each path: "link", "directory" (or a
         # failure that a path below need not share), or "end" (a
-        # non-directory, or a failure every path below shares).
-        self._kinds: dict[str, str] = {}
+        # non-directory, or a failure every path below shares), and the
+        # device and inode of a file that is not a symlink.
+        self._kinds: dict[str, tuple[str, tuple[int, int] | None]] = {}
         self._targets: dict[str, str] = {}
 
     def row(self, path: Path) -> _RowPathIdentity:
@@ -47869,13 +47949,14 @@ class _UnitPathResolver:
 
         self._budget.spend()
 
-    def _kind(self, path: str) -> str:
+    def _kind(self, path: str) -> tuple[str, tuple[int, int] | None]:
         try:
             return self._kinds[path]
         except KeyError:
             pass
         # The memo keeps the path, so its characters are charged too.
         self._budget.spend(characters=len(path), lookups=1)
+        identity: tuple[int, int] | None = None
         try:
             metadata = os.lstat(path)
         except OSError as exc:
@@ -47883,12 +47964,11 @@ class _UnitPathResolver:
         else:
             if stat.S_ISLNK(metadata.st_mode):
                 kind = "link"
-            elif stat.S_ISDIR(metadata.st_mode):
-                kind = "directory"
             else:
-                kind = "end"
-        self._kinds[path] = kind
-        return kind
+                kind = "directory" if stat.S_ISDIR(metadata.st_mode) else "end"
+                identity = (metadata.st_dev, metadata.st_ino)
+        self._kinds[path] = (kind, identity)
+        return kind, identity
 
     def _target(self, path: str) -> str:
         try:
@@ -47907,7 +47987,7 @@ class _UnitPathResolver:
         self._targets[path] = target
         return target
 
-    def _realpath(self, path: str) -> str:
+    def _realpath(self, path: str, traversal: _Traversal | None = None) -> str:
         """``os.path.realpath(path)`` of absolute ``path``.
 
         This is the walk of Python 3.12's ``posixpath.realpath``, which
@@ -47924,6 +48004,9 @@ class _UnitPathResolver:
         does a path holding a NUL or a character the file-system encoding
         cannot encode, wherever it stands, as ``realpath`` raises for one
         when it looks up the component holding it.
+
+        ``traversal``, when given, gathers what the walk passes through on
+        the way (``_Traversal``).
         """
 
         if not path.startswith("/"):
@@ -47938,7 +48021,9 @@ class _UnitPathResolver:
                 f"cannot be resolved: {exc}"
             ) from exc
         try:
-            components, _prefixes, _end = self._join_real([], [], None, path, {}, 0)
+            components, _prefixes, _end = self._join_real(
+                [], [], None, path, {}, 0, traversal
+            )
         except _SymlinkLoop as loop:
             return os.path.normpath(loop.path)
         except ValueError as exc:
@@ -47956,6 +48041,7 @@ class _UnitPathResolver:
         text: str,
         seen: dict[str, tuple[tuple[str, ...], tuple[str, ...], int | None] | None],
         nesting: int,
+        traversal: _Traversal | None = None,
     ) -> tuple[list[str], list[str], int | None]:
         """Append ``text`` to the resolved path ``components``.
 
@@ -47963,7 +48049,9 @@ class _UnitPathResolver:
         ``components`` down to ``end``, the length at which a lookup ended
         every lookup below it (None when none has).  ``seen`` maps each
         symlink met in this resolution to what it resolved to, or to None
-        while it is being resolved, as ``realpath``'s own memo does.
+        while it is being resolved, as ``realpath``'s own memo does; a
+        symlink met again was walked, and its walk recorded in
+        ``traversal``, earlier in the same resolution.
         """
 
         if nesting > _REALPATH_LINK_NESTING:
@@ -47986,6 +48074,10 @@ class _UnitPathResolver:
                 continue
             if name == "..":
                 if components:
+                    if traversal is not None and prefixes:
+                        # The deepest part looked up is left here, so it
+                        # is kept; every part above it is a prefix of it.
+                        self._record(traversal, prefixes[-1])
                     components.pop()
                     if len(prefixes) > len(components):
                         prefixes.pop()
@@ -47998,13 +48090,18 @@ class _UnitPathResolver:
             # A memoized lookup is free, so the time bound is checked here.
             self._budget.spend()
             joined = (prefixes[-1] if prefixes else "") + "/" + name
-            kind = self._kind(joined)
+            kind, identity = self._kind(joined)
+            if traversal is not None and identity is not None:
+                traversal.files.add(identity)
             if kind != "link":
                 components.append(name)
                 prefixes.append(joined)
                 if kind == "end":
                     end = len(components)
                 continue
+            if traversal is not None:
+                # The symlink's own path is left for its target.
+                self._record(traversal, joined)
             if joined in seen:
                 known = seen[joined]
                 if known is None:
@@ -48023,6 +48120,14 @@ class _UnitPathResolver:
             self._budget.spend(characters=len(components) + len(prefixes))
             seen[joined] = (tuple(components), tuple(prefixes), end)
         return components, prefixes, end
+
+    def _record(self, traversal: _Traversal, path: str) -> None:
+        """Keep ``path`` among the paths of ``traversal``, charging its
+        characters the first time, since the answer keeps it."""
+
+        if path not in traversal.paths:
+            self._budget.spend(characters=len(path))
+            traversal.paths[path] = None
 
     def _file(self, path: str) -> tuple[tuple[int, int] | None, bool]:
         """The identity of the file at ``path``, or None, and whether a path
@@ -48069,6 +48174,11 @@ class _UnitPathResolver:
         normalization would remove along with the symlink.  The lexically
         normalized spelling, and its resolution, are kept as well, so a
         word names a row under either reading.
+
+        The paths and files the resolutions pass through on the way are
+        kept too (``_Traversal``): the kernel needs every part it looks up
+        to exist, so ``<row>/../slot02`` depends on the row even though it
+        ends outside it.
         """
 
         try:
@@ -48079,17 +48189,22 @@ class _UnitPathResolver:
         # written and the resolution of its lexical spelling.
         self._budget.spend(characters=3 * len(joined))
         lexical = os.path.normpath(joined)
+        traversal = _Traversal()
         resolved = tuple(
             dict.fromkeys(
-                self._realpath(spelling) for spelling in dict.fromkeys((joined, lexical))
+                self._realpath(spelling, traversal)
+                for spelling in dict.fromkeys((joined, lexical))
             )
         )
         # A symlink's target can make a resolution longer than its text.
         self._budget.spend(characters=sum(len(spelling) for spelling in resolved))
-        files: set[tuple[int, int]] = set()
+        files: set[tuple[int, int]] = set(traversal.files)
         for current in resolved:
             files.update(self._ancestor_files(current))
-        answer = (tuple(dict.fromkeys((lexical, *resolved))), frozenset(files))
+        answer = (
+            tuple(dict.fromkeys((lexical, *resolved, *traversal.paths))),
+            frozenset(files),
+        )
         self._words[joined] = answer
         return answer
 
@@ -48098,10 +48213,12 @@ class _UnitPathResolver:
 
         Relative words are resolved against the unit's working directory,
         which for a user unit without one is the user's home directory.  A
-        word names the row when its lexical or symlink-resolved spelling is
-        a row spelling or lies under one by whole path components, or when
-        it or an existing ancestor is the row's own file (a bind mount or
-        hard-linked directory reaches it under another name).
+        word names the row when its lexical or symlink-resolved spelling,
+        or a path its resolution passes through, is a row spelling or lies
+        under one by whole path components, or when it, an existing
+        ancestor or a file its resolution passes through is the row's own
+        file (a bind mount or hard-linked directory reaches it under
+        another name).
         """
 
         base = _unit_working_directory(unit)
@@ -48109,10 +48226,8 @@ class _UnitPathResolver:
             # A property read for an earlier row costs nothing again, so
             # the time bound is checked for each.
             self._budget.spend()
-            for spelling in row.spellings:
-                mentioned, paths = _property_mentions(value, spelling)
-                if mentioned or any(self.path_names(path, row) for path in paths):
-                    return True
+            if any(_property_mentions(value, spelling) for spelling in row.spellings):
+                return True
             for joined in self._value_paths(base, value):
                 if self.path_names(joined, row):
                     return True
@@ -48144,9 +48259,10 @@ class _UnitPathResolver:
     def path_names(self, joined: str, row: _RowPathIdentity) -> bool:
         """Whether absolute path ``joined`` is ``row`` or a path inside it.
 
-        Its lexical or symlink-resolved spelling is a row spelling or lies
-        under one by whole path components, or it or an existing ancestor
-        is the row's own file.
+        Its lexical or symlink-resolved spelling, or a path its resolution
+        passes through, is a row spelling or lies under one by whole path
+        components, or it, an existing ancestor or a file its resolution
+        passes through is the row's own file.
         """
 
         self._budget.spend()
@@ -48274,24 +48390,19 @@ def _unit_property_words(value: str, budget: _UnitResolutionBudget) -> tuple[str
     return tuple(dict.fromkeys(words))
 
 
-def _property_mentions(value: str, spelling: str) -> tuple[bool, tuple[str, ...]]:
-    """Where a unit property string holds a row path spelling as a path.
+def _property_mentions(value: str, spelling: str) -> bool:
+    """Whether a unit property string holds a row path spelling as a path.
 
     The spelling must begin the string or follow a separator (through any
     of the prefixes ``_UNIT_PATH_PREFIXES``), and end the string or precede
     ``/`` or a separator.  Found as text, a row path holding a separator,
     a newline or a quote is whole wherever it stands, as an option value,
-    an assignment, a search-list entry or a quoted shell word.
-
-    Returns whether an occurrence names the row by itself, and the paths
-    the caller resolves instead.  An occurrence followed by ``/`` names the
-    row when the rest of its path, up to the next separator, stays below
-    it lexically; one whose rest leaves it through ``..``
-    (``<row>/../slot02``) is returned with that rest as a path to resolve,
-    since a symlink before the ``..`` can still lead back inside.
+    an assignment, a search-list entry or a quoted shell word.  A path that
+    goes on from it, even one that leaves it again through ``..``
+    (``<row>/../slot02``), names the row: the kernel looks the row up on
+    the way, so the path stops resolving once the row is gone.
     """
 
-    paths: list[str] = []
     start = value.find(spelling)
     while start >= 0:
         end = start + len(spelling)
@@ -48307,29 +48418,9 @@ def _property_mentions(value: str, spelling: str) -> tuple[bool, tuple[str, ...]
             or _UNIT_EVIDENCE_SEPARATORS.fullmatch(value[end]) is not None
         )
         if opens and closes:
-            stop = _UNIT_EVIDENCE_SEPARATORS.search(value, end)
-            rest = value[end : len(value) if stop is None else stop.start()]
-            if _path_rest_stays_below(rest):
-                return True, ()
-            paths.append(value[start : end + len(rest)])
+            return True
         start = value.find(spelling, start + 1)
-    return False, tuple(dict.fromkeys(paths))
-
-
-def _path_rest_stays_below(rest: str) -> bool:
-    """Whether path text ``rest`` after a directory stays below it lexically."""
-
-    depth = 0
-    for part in rest.split("/"):
-        if part in {"", "."}:
-            continue
-        if part != "..":
-            depth += 1
-        elif depth:
-            depth -= 1
-        else:
-            return False
-    return True
+    return False
 
 
 def _spelling_is_within(path: str, root: str) -> bool:
@@ -48356,41 +48447,63 @@ def _unit_working_directory(unit: Mapping[str, str]) -> str:
 
 def _assert_retained_handle_processes_dead(
     bindings: Mapping[str, tuple[_RetainedValidationHandle, ...]],
-    processes: Sequence[_AbsentProcessObservation] = (),
+    running: AbstractSet[tuple[str, int, int]] = frozenset(),
+    unreadable: Mapping[tuple[str, int, int], str] | None = None,
 ) -> None:
     """Refuse when a handle's recorded process generation runs, or ran
-    during the host evidence that ``processes`` holds.
+    just before the host evidence.
 
     The direct check reads each current-boot generation now.  It alone does
     not cover a process that hands its run to a unit: a process that queues
     its unit after the second user-systemd enumeration and then exits reads
-    dead here while no enumeration shows the unit.  Such a process was alive
-    when the later process table read it, because a unit it queued before
-    that read shows in the second enumeration unless its run has ended.  A
-    recorded generation that ``processes`` holds (the later table of
-    ``_processes_around_unit_enumeration``) is therefore a run that may
-    still use the row, as is one that runs now.
+    dead here while no enumeration shows the unit.  ``running`` holds the
+    generations that ``_recorded_generations_before`` read running just
+    before the host evidence, and each is a run that may still use the row,
+    as is one that runs now.  ``unreadable`` holds the generations that
+    could not be read then, which refuse as unverifiable: reading one dead
+    now does not show that it was dead then.  A generation read running
+    refuses first, as a run, for every handle of the rows, and is named
+    live when it still runs.
     """
 
+    for slot, handles in bindings.items():
+        for handle in handles:
+            if (handle.boot_id, handle.pid, handle.start_ticks) not in running:
+                continue
+            try:
+                live = (
+                    _process_start_ticks(Path("/proc") / str(handle.pid))
+                    == handle.start_ticks
+                )
+            except Refusal:
+                live = False
+            if live:
+                raise _ValidationRunMayUseRow(
+                    f"retained validation handle {handle.path} has live exact process "
+                    f"generation {handle.pid} for row {slot}"
+                )
+            raise _ValidationRunMayUseRow(
+                f"retained validation handle {handle.path} records process "
+                f"generation {handle.pid}, which ran just before the host evidence "
+                f"was read, for row {slot}"
+            )
     current_boot = _boot_id(Path("/proc"))
-    observed = {(process.pid, process.start_ticks) for process in processes}
     for slot, handles in bindings.items():
         for handle in handles:
             if handle.pid is None:
                 continue
             assert handle.start_ticks is not None and handle.boot_id is not None
+            refusal = (unreadable or {}).get(
+                (handle.boot_id, handle.pid, handle.start_ticks)
+            )
+            if refusal is not None:
+                raise Refusal(refusal)
             if handle.boot_id != current_boot:
                 continue
             if _process_start_ticks(Path("/proc") / str(handle.pid)) == handle.start_ticks:
                 raise _ValidationRunMayUseRow(
                     f"retained validation handle {handle.path} has live exact process "
                     f"generation {handle.pid} for row {slot}"
-                )
-            if (handle.pid, handle.start_ticks) in observed:
-                raise _ValidationRunMayUseRow(
-                    f"retained validation handle {handle.path} records process "
-                    f"generation {handle.pid}, which the process table read after the "
-                    f"first user-systemd enumeration showed running, for row {slot}"
                 )
 
 

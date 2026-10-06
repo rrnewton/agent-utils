@@ -372,8 +372,8 @@ validation slots. `audit`, `remove` (including `--validate-complete` and `remove
   directory or a recorded checkout path (its `checkout` or `source_checkout` is one of those paths
   or a path inside one, compared as a unit word is below, so a symlink to the slot or a directory
   inside it names the slot too) has an inactive, unqueued service unit with no live process in its
-  control group and, when it records a process generation, one that is dead and that the process
-  table read after the first user-systemd enumeration did not show, and no active or queued
+  control group and, when it records a process generation, one that did not run when it was read
+  just before the process tables and units and does not run at the end, and no active or queued
   user-systemd unit names those paths. Removal renames the slot directory to
   `.<slot>.fenced.<generation>.<hex>` before deleting it, so the same paths inside every such fence
   on disk, and inside the fence an interrupted removal's finish journal names, count as the row's
@@ -409,12 +409,10 @@ however long it is, is a word too, so `--checkout=<path>` and `NAME=<path>` keep
 contains `:` or a quote. A leading `-`, `!`, `@` or `+` is also tried without it. The row path's own
 spellings (below) are also found as text anywhere in a property string, when they begin it or follow
 one of those characters and end it or precede `/` or one of those characters, so a row path is found
-whole even where it contains a newline or ends just before a `:`. One followed by a path that leaves
-it through `..` before the next of those characters (`<row>/../slot02`) is resolved as that whole
-path instead, so it names the row only when a symlink leads back inside; a quoted spelling that
-such a path follows outside the quotes (`cd '<row>'/../slot02`) is not joined with it, and names the
-row, refusing falsely. Every reading only adds
-words, so a path that contains one of these characters can name a row it is not inside
+whole even where it contains a newline or ends just before a `:`. A path that goes on from one
+names the row even where it leaves the row again through `..` (`<row>/../slot02`), since the kernel
+looks the row up on the way and the path stops resolving once the row is gone. Every reading only
+adds words, so a path that contains one of these characters can name a row it is not inside
 (`slot01:other` names `slot01`) and refuse falsely, but no reading hides a row path's own spelling.
 A symlink to a row whose own name contains one of these characters can still go unmatched by the
 symlink's spelling when another of them follows it in the same shell word (`PATH=<symlink>:/bin`),
@@ -425,11 +423,15 @@ spelling, its symlink-resolved spelling as written (a `..` after a symlink leave
 target, as the kernel reads it) and the symlink-resolved spelling of its normalized form, against
 the row path's spellings formed the same way, by complete path components, and, where the path
 exists, the word and each of its existing ancestors by device and inode against the row path
-itself. A unit naming `slot01/./product`, `--checkout=slot01//product`, a symlink to `slot01`,
-`<symlink to slot01/product>/..`, or `worktrees/validate/slot01` with the project root as its
-working directory therefore names `slot01`; one naming `slot010`,
-`slot01+other` or `/other/<project>/worktrees/validate/slot01` does not. A word's symlinks are
-resolved as Python's `os.path.realpath` resolves them, however long the word is, except that no
+itself. Each path and file that a resolution looks up on the way counts as well, as the kernel needs
+every component of a path to exist: a word whose resolution passes through the row names it even
+where it ends outside the row (`worktrees/validate/slot01/../slot02` with the project root as its
+working directory, or `<symlink to slot01>/..`). A unit naming `slot01/./product`,
+`--checkout=slot01//product`, a symlink to `slot01`, `<symlink to slot01/product>/..`, or
+`worktrees/validate/slot01` with the project root as its working directory therefore names `slot01`;
+one naming `slot010`, `slot01+other` or `/other/<project>/worktrees/validate/slot01` does not.
+A word's symlinks are resolved as Python's `os.path.realpath` resolves them, however long the word
+is, except that no
 component below one that is missing, not a directory, a symlink loop, too long or unsearchable is
 looked up, since every such lookup fails; a link target that cannot be read, or more than 40
 symlinks followed inside each other, refuses. Its ancestors are looked up from `/` down, stopping
@@ -483,8 +485,14 @@ reads take span more than half a second, so a fall within either read (before or
 or between them counts. A step forward or a suspend (the monotonic clock stops while the host
 sleeps) counts too, and so do pauses between the clock reads that together widen the bounds past
 half a second; each keeps the run `alive`. A step back does not show if it is undone, or undone to
-within half a second, before a realtime read sees it. Last, the current members of every control
-group named after a handle's unit,
+within half a second, before a realtime read sees it. After the last read of the handles before the
+process tables, and just before those tables, the process generation that each handle records is
+read from its own entry under `/proc`. The process tables list thread groups and skip terminal
+ones, so they show neither a recorded thread ID nor a thread group leader that has exited while
+another thread of its group runs; that entry shows both. A recorded generation that runs then is
+`alive` even when it exits before the end, since it may queue its unit after the second
+enumeration; one that does not run then cannot act later. Last, the current members of every
+control group named after a handle's unit,
 and of its descendants, are read from the cgroup v2 hierarchy below the user service manager; a
 member there is `alive`. A host without a cgroup v2 hierarchy at `/sys/fs/cgroup`, whose cgroup v2
 mount there shows only a subtree of the hierarchy (control groups outside it would read as empty),
@@ -502,11 +510,14 @@ write, including one that leaves the bytes alike, the run must be visible to thi
 unit active or queued, or the process generation that the handle records in `process_identity`,
 its `pid`, `start_ticks` and `boot_id`, running) before the write's change time is two seconds old
 by this host's clock, which can be one second after the write where file times keep whole seconds.
-A launcher meets the rule when it queues the unit before it writes the handle, when it writes the
-handle from inside a unit that is already active or queued and is the handle's unit or names the
-checkout, or when the handle records a process that runs until the unit is queued. A launcher that
-writes the handle and only then queues the unit, with no such process recorded, can have its row
-judged `dead` when the queueing takes longer than that.
+A launcher meets the rule when it queues the unit before it writes the handle; when it writes the
+handle from inside the handle's own unit, or from inside another unit that names the checkout and
+stays active or queued without a break until the handle's unit is queued; or when the handle records
+a process generation that runs until the unit is queued. Visibility must not lapse in between: a
+unit that names the checkout, writes the handle, hands the queueing to another process and ends
+before the handle's unit is queued leaves a moment with no unit, process or member, and a judgement
+then can answer `dead`. A launcher that writes the handle and only then queues the unit, with no
+such process recorded, can have its row judged `dead` when the queueing takes longer than that.
 
 `recover-absent-validate-rows` and `recover-absent-agent-rows` read this evidence through the same
 code and in the same order, and refuse wherever the answer above would be `alive` or `unverifiable`:

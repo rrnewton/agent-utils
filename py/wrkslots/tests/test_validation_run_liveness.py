@@ -615,8 +615,12 @@ def test_a_parent_step_after_a_symlink_leaves_the_symlink_target(tmp_path: Path)
     assert names(ExecStart=f"{inside}/..")
     assert names(ExecStart=f"make -C {deep}/../..")
     assert names(WorkingDirectory=str(deep), ExecStart="git\n-C\n../..\nstatus")
-    # The parent of the row itself is not inside the row.
-    assert not names(ExecStart=f"{alias}/..")
+    # The parent of the row, reached through a symlink to the row, is
+    # reached through the row: it stops resolving once the row is gone.
+    assert names(ExecStart=f"{alias}/..")
+    # The parent reached without passing through the row is outside it.
+    (row.parent / "slot02").mkdir()
+    assert not names(ExecStart=f"{row.parent}/slot02/..")
     # A row recorded through a symlink and ``..`` is the directory it reaches.
     stepped = wrkslots._row_path_identity(inside / "..")
     assert wrkslots._UnitPathResolver().names({"ExecStart": f"{row}/out"}, stepped)
@@ -803,15 +807,18 @@ def test_a_quoted_shell_word_before_a_control_operator_is_one_path(tmp_path: Pat
     assert not names(ExecStart=f"/bin/sh\0-c\0bash -c \"cd '{other}/product'; make\"")
 
 
-def test_a_row_spelling_followed_by_a_parent_step_out_of_it_is_resolved(
+def test_a_path_that_passes_through_the_row_names_it(
     tmp_path: Path,
 ) -> None:
-    """``<row>/../slot02`` is the sibling, not a path inside the row.
+    """``<row>/../slot02`` ends at the sibling but passes through the row.
 
-    The row's spelling found as text counts as naming the row only when
-    what follows it up to the next separator stays below it; a ``..``
-    that leaves it makes the whole spelling a path to resolve, so a
-    symlink inside the row still counts where it leads.
+    The kernel looks up every component of a path, so ``cd
+    <row>/../slot02`` fails once the row is removed: the unit depends on
+    the row.  The row's spelling found as text names the row whatever
+    follows it, and a word resolved against the working directory names
+    it when its resolution passes through the row.  A path that only
+    reaches the row's parent or a sibling, without passing through the
+    row, does not name it.
     """
 
     row = tmp_path / "project" / "worktrees" / "validate" / "slot01"
@@ -825,10 +832,19 @@ def test_a_row_spelling_followed_by_a_parent_step_out_of_it_is_resolved(
     def names(target: Path, **unit: str) -> bool:
         return wrkslots._UnitPathResolver().names(unit, wrkslots._row_path_identity(target))
 
-    assert not names(row, ExecStart=f"{row}/../slot02")
-    assert not names(row, ExecStart=f"make\0-C\0{row}/../slot02/build")
-    assert not names(row, Environment=f"PATH=/bin:{row}/../slot02:/usr/bin")
-    assert not names(spaced, ExecStart=f"/bin/sh\0-c\0cd '{spaced}/../slot02' && make")
+    project = tmp_path / "project"
+    assert names(row, ExecStart=f"{row}/../slot02")
+    assert names(row, ExecStart=f"make\0-C\0{row}/../slot02/build")
+    assert names(row, Environment=f"PATH=/bin:{row}/../slot02:/usr/bin")
+    assert names(spaced, ExecStart=f"/bin/sh\0-c\0cd '{spaced}/../slot02' && make")
+    relative = "worktrees/validate/slot01/../slot02"
+    assert names(row, WorkingDirectory=str(project), ExecStart=f"make\0-C\0{relative}")
+    assert names(row, WorkingDirectory=str(project), ExecStart=f"cd {relative} && make")
+    assert not names(row, ExecStart=f"{row.parent}/slot02")
+    assert not names(
+        row, WorkingDirectory=str(project), ExecStart="worktrees/validate/slot02/../slot01x"
+    )
+    assert not names(row, WorkingDirectory=str(project), ExecStart="worktrees/validate/slot02")
     assert names(row, ExecStart=f"{row}/../slot01/product")
     assert names(row, ExecStart=f"{row}/product/../build")
     assert names(row, ExecStart=f"{row}/deep/../..")
@@ -1024,8 +1040,12 @@ def test_a_long_path_through_a_symlink_parent_names_its_row(tmp_path: Path) -> N
     assert wrkslots._UnitPathResolver().names(
         {"ExecStart": f"tool\n--checkout={path}/product"}, identity
     )
-    assert not wrkslots._UnitPathResolver().path_names(
+    # Stepping on out of the row still passes through it on the way.
+    assert wrkslots._UnitPathResolver().path_names(
         "/" + "../" * 1400 + f"{str(tmp_path)[1:]}/link/../../other", identity
+    )
+    assert not wrkslots._UnitPathResolver().path_names(
+        "/" + "../" * 1400 + f"{str(tmp_path)[1:]}/other", identity
     )
 
 
@@ -1297,7 +1317,7 @@ def test_judging_rows_refuses_when_the_last_property_scan_outruns_the_bound(
     scans = [0]
     slow_scan = [0]
 
-    def mentions(value: str, spelling: str) -> tuple[bool, tuple[str, ...]]:
+    def mentions(value: str, spelling: str) -> bool:
         scans[0] += 1
         if scans[0] == slow_scan[0]:
             elapsed[0] += 25.0
@@ -1685,9 +1705,9 @@ def _handoff_process(
     """Record a live child in the run's handle; it exits during an enumeration.
 
     The child is in every process table read while it runs.  It exits, and
-    is reaped, during enumeration ``exits_during`` (0 is the first), and
-    the run's unit is in neither enumeration: it is queued after them, as
-    the child's last act.
+    is reaped, during enumeration ``exits_during`` (0 is the first; a
+    test passing -1 ends it itself), and the run's unit is in neither
+    enumeration: it is queued after them, as the child's last act.
     """
 
     child = subprocess.Popen(
@@ -1737,11 +1757,10 @@ def _handoff_process(
         child.wait()
 
 
-def _handoff_message(handoff: _Handoff, slot: str) -> str:
+def _handoff_message(pid: int, slot: str) -> str:
     return (
-        f"records process generation {handoff.child.pid}, which the process table "
-        "read after the first user-systemd enumeration showed running, for row "
-        f"{slot}"
+        f"records process generation {pid}, which ran just before the host evidence "
+        f"was read, for row {slot}"
     )
 
 
@@ -1751,10 +1770,9 @@ def test_a_run_process_that_hands_off_to_its_unit_after_the_enumerations_is_aliv
     """The recorded process ran through both enumerations, then exited.
 
     It queued its unit after the second enumeration, so no enumeration shows
-    the unit, and by the judgment its generation is dead.  The later process
-    table read it running, after the first enumeration: a unit it had queued
-    before that read would show in the second enumeration, so it may have
-    queued its unit only after them.
+    the unit, and by the judgment its generation is dead.  Its generation
+    was read running just before the host evidence, and nothing read after
+    that shows when it queued its unit, so its run is kept.
     """
 
     project, tree = _prepare(tmp_path, monkeypatch, agent_liveness="dead")
@@ -1769,16 +1787,18 @@ def test_a_run_process_that_hands_off_to_its_unit_after_the_enumerations_is_aliv
     assert len(states) == 1
     state, message = next(iter(states.values()))
     assert state == "alive", message
-    assert _handoff_message(handoff, "slot01") in message
+    assert _handoff_message(handoff.child.pid, "slot01") in message
 
 
-def test_a_run_process_that_exits_before_the_later_table_is_not_alive(
+def test_a_run_process_that_exits_during_the_first_enumeration_is_alive(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A recorded process that the later table did not read is no run.
+    """A recorded generation read running before the host evidence is a run.
 
-    It exited during the first enumeration.  A unit it queued before
-    exiting was queued before the second enumeration, which shows none.
+    It exits during the first enumeration, before the later process table.
+    Its generation is read once, just before the host evidence, and only a
+    generation that does not run then is known to have queued no unit
+    since, so this one is kept too.
     """
 
     project, tree = _prepare(tmp_path, monkeypatch, agent_liveness="dead")
@@ -1791,7 +1811,192 @@ def test_a_run_process_that_exits_before_the_later_table_is_not_alive(
 
     assert len(states) == 1
     state, message = next(iter(states.values()))
+    assert state == "alive", message
+    assert _handoff_message(handoff.child.pid, "slot01") in message
+
+
+def test_a_run_process_that_exits_before_the_host_evidence_is_not_alive(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A recorded process that exited before its generation was read is no run.
+
+    It exits after the handles are read and before its generation is read,
+    so a unit it queued was queued before both enumerations, which show
+    none.
+    """
+
+    project, tree = _prepare(tmp_path, monkeypatch, agent_liveness="dead")
+    config = wrkslots._load_config(str(project), "testhost")
+    real_settle = wrkslots._settle_retained_handles
+    with _handoff_process(monkeypatch, project, tree, exits_during=-1) as handoff:
+
+        def settle(
+            handles: Mapping[str, tuple[wrkslots._RetainedValidationHandle, ...]],
+        ) -> bool:
+            handoff.child.kill()
+            handoff.child.wait()
+            return real_settle(handles)
+
+        monkeypatch.setattr(wrkslots, "_settle_retained_handles", settle)
+        states = wrkslots._validation_run_liveness_states(
+            config, wrkslots._load_active(config).slots
+        )
+        assert handoff.enumerations == [2]
+
+    assert len(states) == 1
+    state, message = next(iter(states.values()))
     assert state == "dead", message
+
+
+# The process table reader itself; ``_prepare`` replaces the module's.
+_REAL_PROCESS_SNAPSHOT = wrkslots._absent_validate_process_snapshot
+
+# The raw ``exit`` system call ends only the calling thread.
+_SYS_EXIT = {"x86_64": 60, "aarch64": 93}
+
+# A child with a second thread, which sleeps; the child prints that
+# thread's ID.  With an exit number, the thread group leader then ends
+# itself by the raw ``exit`` system call and stays a zombie while the
+# other thread runs; without one, it waits for the thread.
+_THREADED_CHILD = """
+import ctypes, sys, threading, time
+thread = threading.Thread(target=time.sleep, args=(300,), daemon=True)
+thread.start()
+sys.stdout.write(f"{thread.native_id}\\n")
+sys.stdout.flush()
+if len(sys.argv) > 1:
+    ctypes.CDLL(None).syscall(int(sys.argv[1]), 0)
+thread.join()
+"""
+
+
+@dataclass(frozen=True)
+class _ThreadedHandoff:
+    child: subprocess.Popen[bytes]
+    recorded: int
+    start_ticks: int
+    # Every process table the judgment read, and how many user-systemd
+    # enumerations have run.
+    tables: list[tuple[wrkslots._AbsentProcessObservation, ...]]
+    enumerations: list[int]
+
+
+@contextlib.contextmanager
+def _threaded_handoff(
+    monkeypatch: pytest.MonkeyPatch,
+    project: Path,
+    tree: Path,
+    proc_root: Path,
+    *,
+    leader_exits: bool,
+) -> Iterator[_ThreadedHandoff]:
+    """Record a generation that the process tables do not show; it exits during
+    the second enumeration.
+
+    The handle records the thread group leader after it has exited while
+    its other thread runs (``leader_exits``), or the other thread's ID.
+    The process tables are the real reader over ``proc_root``, which holds
+    only the child's thread group, as ``/proc`` lists it.  The run's unit
+    is in neither enumeration: it is queued after them, as the child's last
+    act.
+    """
+
+    arguments = [sys.executable, "-c", _THREADED_CHILD]
+    if leader_exits:
+        number = _SYS_EXIT.get(os.uname().machine)
+        if number is None:
+            pytest.skip(f"no raw exit system call number for {os.uname().machine}")
+        arguments.append(str(number))
+    child = subprocess.Popen(
+        arguments, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL
+    )
+    try:
+        assert child.stdout is not None
+        thread = int(child.stdout.readline())
+        recorded = child.pid if leader_exits else thread
+        if leader_exits:
+            status = Path("/proc") / str(child.pid) / "status"
+            deadline = time.monotonic() + 10
+            while "\nState:\tZ" not in status.read_text(encoding="utf-8"):
+                assert time.monotonic() < deadline, "the thread group leader did not exit"
+                time.sleep(0.01)
+        start_ticks = wrkslots._process_start_ticks(Path("/proc") / str(recorded))
+        assert start_ticks is not None
+        _write_run_handle(
+            project,
+            tree,
+            process_identity={
+                "pid": recorded,
+                "start_ticks": start_ticks,
+                "boot_id": wrkslots._boot_id(Path("/proc")),
+            },
+        )
+        (proc_root / str(child.pid)).symlink_to(Path("/proc") / str(child.pid))
+        tables: list[tuple[wrkslots._AbsentProcessObservation, ...]] = []
+        enumerations = [0]
+
+        def units() -> tuple[Mapping[str, str], ...]:
+            if enumerations[0] == 1:
+                child.kill()
+                child.wait()
+            enumerations[0] += 1
+            return ()
+
+        def processes(
+            **kwargs: bool,
+        ) -> tuple[wrkslots._AbsentProcessObservation, ...]:
+            table = _REAL_PROCESS_SNAPSHOT(proc_root, **kwargs)
+            tables.append(table)
+            return table
+
+        monkeypatch.setattr(wrkslots, "_user_systemd_snapshot", units)
+        monkeypatch.setattr(wrkslots, "_absent_validate_process_snapshot", processes)
+        yield _ThreadedHandoff(child, recorded, start_ticks, tables, enumerations)
+    finally:
+        if child.poll() is None:
+            child.kill()
+        child.wait()
+
+
+@pytest.mark.parametrize("leader_exits", [True, False], ids=["exited-leader", "thread-id"])
+def test_a_recorded_generation_that_the_process_tables_omit_is_read_directly(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, leader_exits: bool
+) -> None:
+    """A run process the tables cannot show still hands off to its unit.
+
+    The tables list thread groups and skip terminal ones.  A thread group
+    leader that has exited while another of its threads runs is terminal,
+    and a thread ID is not a group, so neither table shows the recorded
+    generation while the child runs.  The child queues its unit after the
+    second enumeration and exits; the generation read just before the host
+    evidence keeps its run.
+    """
+
+    project, tree = _prepare(tmp_path, monkeypatch, agent_liveness="dead")
+    config = wrkslots._load_config(str(project), "testhost")
+    proc_root = tmp_path / "proc"
+    proc_root.mkdir()
+    with _threaded_handoff(
+        monkeypatch, project, tree, proc_root, leader_exits=leader_exits
+    ) as handoff:
+        states = wrkslots._validation_run_liveness_states(
+            config, wrkslots._load_active(config).slots
+        )
+        assert handoff.enumerations == [2]
+        assert handoff.child.poll() is not None
+
+    # The process tables read while the child ran omit the recorded generation.
+    assert len(handoff.tables) == 2
+    for table in handoff.tables:
+        assert (handoff.recorded, handoff.start_ticks) not in {
+            (process.pid, process.start_ticks) for process in table
+        }
+    shown = [] if leader_exits else [handoff.child.pid]
+    assert [[process.pid for process in table] for table in handoff.tables] == [shown, shown]
+    assert len(states) == 1
+    state, message = next(iter(states.values()))
+    assert state == "alive", message
+    assert _handoff_message(handoff.recorded, "slot01") in message
 
 
 def test_absent_agent_row_recovery_sees_a_run_process_hand_off_to_its_unit(
@@ -1811,7 +2016,7 @@ def test_absent_agent_row_recovery_sees_a_run_process_hand_off_to_its_unit(
         assert handoff.enumerations == [2]
         assert handoff.child.poll() is not None
 
-    assert _handoff_message(handoff, record.slot) in capsys.readouterr().err
+    assert _handoff_message(handoff.child.pid, record.slot) in capsys.readouterr().err
 
 
 def test_absent_validate_row_recovery_refuses_the_handoff_before_its_host_reads(
