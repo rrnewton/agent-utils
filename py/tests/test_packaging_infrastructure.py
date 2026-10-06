@@ -841,9 +841,11 @@ def test_wrkslots_lifecycle_partitions_are_disjoint_and_complete() -> None:
     # The two image-backed remove-agent-batch use-check tests are ordinary.
     # The three relocate-repository tests (one success case and two refusal
     # cases) are mapped.
-    assert len(all_tests) == 1846
+    # The two strict-replay stranding tests (a repository relocated twice, and
+    # an archived slot's deleted repository) are mapped.
+    assert len(all_tests) == 1848
     assert len(ordinary) == 290
-    assert len(mapped) == 1556
+    assert len(mapped) == 1558
     assert {
         node.split("::", 1)[1].split("[", 1)[0] for node in ordinary
     } == {

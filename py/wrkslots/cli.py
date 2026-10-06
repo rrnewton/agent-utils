@@ -6578,6 +6578,11 @@ def _resume_replay(
     configuration except for _assert_record_paths, which also inspects the
     filesystem.  The prefix is identified by its hash-chain tip, and that check
     is rerun for the prefix's records before the fold is trusted.
+
+    Every replayed record gets the reference-only check, with or without
+    require_repository; the existence check that require_repository adds is
+    applied by _states_from_events to the records that are still active once
+    the whole log is folded, on a resumed replay exactly as on a cold one.
     """
 
     cached = _ACTIVE_EVENT_MEMO[-1].replays.get(key) if _ACTIVE_EVENT_MEMO else None
@@ -6586,20 +6591,16 @@ def _resume_replay(
     count, tip, fold = cached
     if count > len(events) or events[count - 1].get("sha256") != tip:
         return 0, _ReplayFold()
-    if key[2]:
-        for record in fold.path_checks.values():
-            _assert_record_paths(config, record, require_repository=True)
-    else:
-        # Without require_repository, _assert_record_paths is lexical except for
-        # _stored_repository_reference, whose result depends only on the
-        # repository string.  Recheck each distinct repository in log order so
-        # a failure is the one a full replay would reach first.
-        for repository in dict.fromkeys(
-            checkout.repository
-            for record in fold.path_checks.values()
-            for checkout in record.checkouts
-        ):
-            _stored_repository_reference(config, repository)
+    # The reference-only _assert_record_paths is lexical except for
+    # _stored_repository_reference, whose result depends only on the
+    # repository string.  Recheck each distinct repository in log order so a
+    # failure is the one a full replay would reach first.
+    for repository in dict.fromkeys(
+        checkout.repository
+        for record in fold.path_checks.values()
+        for checkout in record.checkouts
+    ):
+        _stored_repository_reference(config, repository)
     return count, fold.copy()
 
 
@@ -6648,21 +6649,16 @@ def _states_from_events(
         if kind == "state-imported":
             if active_revision is not None or archive_revision is not None:
                 raise StateError("append-only event log imports state more than once")
-            if require_repository:
-                active = _active_from_obj(
-                    config,
-                    payload.get("active"),
-                    machine,
-                    "append-only imported active state",
-                )
-            else:
-                active = _active_from_obj(
-                    config,
-                    payload.get("active"),
-                    machine,
-                    "append-only imported active state",
-                    require_repository=False,
-                )
+            # Reference-only, like every replayed record: an imported row that a
+            # later event replaces or removes is history, and the rows still
+            # active after the fold get the existence check below.
+            active = _active_from_obj(
+                config,
+                payload.get("active"),
+                machine,
+                "append-only imported active state",
+                require_repository=False,
+            )
             archive = _archive_from_obj(
                 config,
                 payload.get("archive"),
@@ -6787,9 +6783,7 @@ def _states_from_events(
                     )
                 path_key = _record_path_check_key(record)
                 if path_key not in path_checks:
-                    _assert_record_paths(
-                        config, record, require_repository=require_repository
-                    )
+                    _assert_record_paths(config, record, require_repository=False)
                     path_checks[path_key] = record
                 if current is not None and current.slot_type == "agent" and current.import_source is None:
                     active_agents.pop(current.agent, None)
@@ -6911,6 +6905,16 @@ def _states_from_events(
             archive_revision = revision
     if active_revision is None or archive_revision is None:
         raise StateError("append-only event log has no complete imported state")
+    if require_repository:
+        # Only the derived rows must name storage that exists now.  A record a
+        # later event superseded, such as the row a repository-relocated event
+        # rewrote or the row of a slot since archived, names where a
+        # repository WAS; requiring that path today strands the whole registry
+        # once the old directory is gone, which relocate-repository explicitly
+        # allows.  Checked before the fold is remembered, so a refused replay
+        # leaves the memo as it was.
+        for record in active_records.values():
+            _assert_record_paths(config, record, require_repository=True)
     _remember_replay(
         memo_key,
         events,

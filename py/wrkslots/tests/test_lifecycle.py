@@ -26467,6 +26467,151 @@ def test_relocate_repository_refuses_a_path_that_is_not_the_same_repository(
         assert active(project) == before
 
 
+def strict_replay_commands(project: Path) -> list[subprocess.CompletedProcess[str]]:
+    """Run commands that replay the event log requiring every row's repository."""
+
+    return [
+        command(
+            project,
+            "classify-create-journals",
+            "probe01",
+            "--slot-type",
+            "validate",
+            "--agent",
+            "codex-probe",
+        ),
+        command(
+            project,
+            "heartbeat",
+            "slot01",
+            "--agent",
+            "codex-1",
+            "--owner-pid",
+            str(os.getpid()),
+            "--expected-generation",
+            "1",
+        ),
+    ]
+
+
+def test_a_repository_relocated_twice_does_not_strand_strict_replay(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A row that relocate-repository superseded may name a directory now gone.
+
+    Measured 2026-10-05: ../agent-utils was relocated to
+    ../agent-utils-registry-anchor and then to ../agent-utils/agent-utils,
+    and the anchor directory was deleted.  No active row named the anchor, yet
+    every command that replays the log requiring repositories (create, so
+    every validate admission, heartbeat, release, classify-create-journals)
+    refused because the superseded rows in the history still named it.
+    """
+
+    monkeypatch.setattr(wrkslots, "_short_hostname", lambda: "testhost")
+    project, _unused_repository, remote = make_project(tmp_path)
+    sibling = tmp_path / "sibling"
+    subprocess.run(
+        ["git", "clone", str(remote), str(sibling)],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    made = create(
+        project, slot="slot01", branch="codex/slot01", repository_name="../sibling"
+    )
+    assert made.returncode == 0, made.stderr
+    worktree = checkout(project, "slot01")
+
+    def move(source: Path, destination: Path) -> None:
+        source.rename(destination)
+        git(destination, "worktree", "repair", str(worktree))
+
+    def relocate_from(source: str, target: str) -> None:
+        relocated = wrkslots.main(
+            [
+                "--project-root",
+                str(project),
+                "relocate-repository",
+                source,
+                target,
+                "--apply",
+                "--coordinator-authorized",
+                "--coordinator-pid",
+                str(os.getpid()),
+            ]
+        )
+        assert relocated == 0, capsys.readouterr().err
+
+    anchor = tmp_path / "anchor"
+    move(sibling, anchor)
+    # ../sibling stays a plain directory, as ../agent-utils did once it became
+    # the wrkslots project that holds the checkout.
+    sibling.mkdir()
+    relocate_from("../sibling", "../anchor")
+    final = sibling / "inner"
+    move(anchor, final)
+    relocate_from("../anchor", "../sibling/inner")
+    assert not anchor.exists()
+    repositories = []
+    for row in active_slots(project):
+        assert isinstance(row, dict)
+        repositories.append(row["checkouts"][0]["repository"])
+    assert repositories == ["../sibling/inner"]
+
+    for completed in strict_replay_commands(project):
+        assert completed.returncode == 0, completed.stderr
+    added = create(project, slot="slot02", agent="codex-2", branch="codex/slot02")
+    assert added.returncode == 0, added.stderr
+
+    # The requirement is kept for the rows that are still active.
+    final.rename(tmp_path / "parked")
+    for completed in strict_replay_commands(project):
+        assert completed.returncode == 3, completed.stdout
+        assert (
+            "source repository '../sibling/inner' does not exist or cannot be resolved"
+            in completed.stderr
+        )
+
+
+def test_an_archived_slots_deleted_repository_does_not_strand_strict_replay(
+    tmp_path: Path,
+) -> None:
+    """Deleting a repository that only archived slots used leaves the registry usable."""
+
+    project, _repository, remote = make_project(tmp_path)
+    sibling = tmp_path / "sibling"
+    subprocess.run(
+        ["git", "clone", str(remote), str(sibling)],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    git(sibling, "config", "gc.autoDetach", "false")
+    git(sibling, "config", "maintenance.autoDetach", "false")
+    made = create(project, branch="codex/task", repository_name="../sibling")
+    assert made.returncode == 0, made.stderr
+    commit_task(sibling, checkout(project), "codex/task")
+    completed = finish(project)
+    assert completed.returncode == 0, completed.stderr
+    mark_owner_dead(project)
+    set_liveness(project, "dead")
+    removed = remove(project)
+    assert removed.returncode == 0, removed.stderr
+    assert active_slots(project) == []
+
+    shutil.rmtree(sibling)
+    added = create(project, slot="slot02", agent="codex-2", branch="codex/slot02")
+
+    assert added.returncode == 0, added.stderr
+    slots = []
+    for row in active_slots(project):
+        assert isinstance(row, dict)
+        slots.append(row["slot"])
+    assert slots == ["slot02"]
+
+
 def test_status_reports_git_registration_without_an_active_row(
     tmp_path: Path,
 ) -> None:
@@ -42708,12 +42853,19 @@ def test_absent_validate_recovery_parses_event_history_in_bounded_passes_at_127_
         return original_archive_from_obj(cfg, value, selected, label)
 
     def counted_active_from_obj(
-        cfg: wrkslots.Config, value: object, selected: str, label: str
+        cfg: wrkslots.Config,
+        value: object,
+        selected: str,
+        label: str,
+        *,
+        require_repository: bool = True,
     ) -> wrkslots.ActiveState:
         nonlocal active_rows_parsed
         raw = wrkslots._as_mapping(value, "counted active")
         active_rows_parsed += len(wrkslots._as_list(raw["slots"], "counted slots"))
-        return original_active_from_obj(cfg, value, selected, label)
+        return original_active_from_obj(
+            cfg, value, selected, label, require_repository=require_repository
+        )
 
     monkeypatch.setattr(wrkslots, "_archive_from_obj", counted_archive_from_obj)
     monkeypatch.setattr(wrkslots, "_active_from_obj", counted_active_from_obj)
