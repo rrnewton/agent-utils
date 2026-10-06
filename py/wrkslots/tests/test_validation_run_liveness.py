@@ -851,6 +851,75 @@ def test_a_path_that_passes_through_the_row_names_it(
     assert names(spaced, ExecStart=f"/bin/sh\0-c\0cd '{spaced}/../slot01' && make")
 
 
+def test_a_parent_step_inside_a_symlink_target_names_the_row(tmp_path: Path) -> None:
+    """A symlink whose target passes through the row makes every path
+    through the symlink depend on the row.
+
+    ``alias -> <row>/../slot02`` ends at the sibling, but the kernel looks
+    the row up each time it follows ``alias``, so ``alias/product`` stops
+    resolving once the row is gone.  The target is relative or absolute,
+    is reached through a chain of symlinks or below another symlink's
+    target, and is met twice in one path; each still names the row, for a
+    unit word and for a run handle's checkout alike.
+    """
+
+    row = tmp_path / "project" / "worktrees" / "validate" / "slot01"
+    row.mkdir(parents=True)
+    (row.parent / "slot02" / "product").mkdir(parents=True)
+    relative = tmp_path / "relative"
+    relative.symlink_to("project/worktrees/validate/slot01/../slot02")
+    absolute = tmp_path / "absolute"
+    absolute.symlink_to(f"{row}/../slot02")
+    chain = tmp_path / "chain"
+    chain.symlink_to("relative")
+    below = tmp_path / "below"
+    below.symlink_to(f"{relative}/product")
+    clean = tmp_path / "clean"
+    clean.symlink_to(row.parent / "slot02")
+    identity = wrkslots._row_path_identity(row)
+
+    def names(**unit: str) -> bool:
+        return wrkslots._UnitPathResolver().names(unit, identity)
+
+    for word in (
+        f"{relative}/product",
+        f"{absolute}/product",
+        f"{chain}/product",
+        str(below),
+        f"{absolute}/../../../../absolute/product",
+    ):
+        assert names(ExecStart=word), word
+        assert wrkslots._UnitPathResolver().path_names(word, identity), word
+    assert names(WorkingDirectory=str(tmp_path), ExecStart="make\0-C\0chain/product")
+    assert not names(ExecStart=f"{clean}/product")
+    assert not wrkslots._UnitPathResolver().path_names(f"{clean}/product", identity)
+
+
+def test_completed_validation_removal_refuses_a_queued_unit_through_a_symlink_via_the_row(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A queued job whose command runs through ``alias -> <row>/../other``
+    still needs the row, so the row is not removed."""
+
+    project, tree = _prepare(tmp_path, monkeypatch, agent_liveness="dead")
+    slot_directory = _slot_directory(project)
+    (slot_directory.parent / "other" / "product").mkdir(parents=True)
+    alias = tmp_path / "alias"
+    alias.symlink_to(f"{slot_directory}/../other")
+    queued = _unit(Id="queued-run.service", PendingJob="yes", ExecStart=f"{alias}/product")
+    monkeypatch.setattr(wrkslots, "_user_systemd_snapshot", lambda: (queued,))
+
+    removed = _remove_completed(project)
+
+    error = capsys.readouterr().err
+    assert removed != 0
+    assert "validation-run authority reports the run may still use slot slot01" in error
+    assert "user-systemd unit queued-run.service names validation row slot01" in error
+    _assert_retained(project, tree)
+
+
 def test_resolving_a_long_path_looks_up_a_bounded_part_of_it(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

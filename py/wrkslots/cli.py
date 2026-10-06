@@ -48112,7 +48112,13 @@ class _UnitPathResolver:
             seen[joined] = None
             try:
                 components, prefixes, end = self._join_real(
-                    components, prefixes, end, self._target(joined), seen, nesting + 1
+                    components,
+                    prefixes,
+                    end,
+                    self._target(joined),
+                    seen,
+                    nesting + 1,
+                    traversal,
                 )
             except _SymlinkLoop as loop:
                 raise _SymlinkLoop(os.path.join(loop.path, text[position:])) from None
