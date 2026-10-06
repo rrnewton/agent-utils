@@ -500,6 +500,26 @@ def without_ambient_executables(environment: dict[str, str]) -> dict[str, str]:
     return environment
 
 
+def with_case_git(environment: dict[str, str], root: Path) -> dict[str, str]:
+    """Give an edition's Git no configuration but the case's own repository.
+
+    Both editions run the system Git (`git check-ignore` in agentctl/profiles.py and
+    profiles.rs), and Git runs helper programs that its configuration names, such as
+    core.fsmonitor, by absolute path where no PATH stub sees them. So no `GIT_*` variable is
+    inherited (GIT_CONFIG_COUNT with GIT_CONFIG_KEY_n/GIT_CONFIG_VALUE_n, and
+    GIT_CONFIG_PARAMETERS, add configuration; GIT_DIR and its relatives move the repository),
+    the system and global configuration files are not read (the XDG one is already the case's,
+    and GIT_CONFIG_GLOBAL replaces it too), and repository discovery stops at the case directory,
+    so a repository that encloses the harness directory is not read either.
+    """
+    for variable in [name for name in environment if name.startswith("GIT_")]:
+        del environment[variable]
+    environment["GIT_CONFIG_NOSYSTEM"] = "1"
+    environment["GIT_CONFIG_GLOBAL"] = os.devnull
+    environment["GIT_CEILING_DIRECTORIES"] = os.path.dirname(os.path.realpath(root))
+    return environment
+
+
 FIXTURE_HERDR = ("--herdr-bin", "<HERDR>")
 # Commands that print text or read local configuration and never construct a Herdr client. Any
 # other command, including an unknown one, must name the fixture Herdr.
@@ -911,7 +931,7 @@ class Harness:
             return _normalize(Outcome(
                 127, "", f"cross harness host CLI guard: refused to run the editions: {refusal}\n",
             ), root)
-        environment = without_ambient_executables(dict(os.environ))
+        environment = with_case_git(without_ambient_executables(dict(os.environ)), root)
         existing = environment.get("PYTHONPATH", "")
         local = str(REPO_ROOT / "py")
         environment["PYTHONPATH"] = local if not existing else local + os.pathsep + existing
@@ -1422,7 +1442,7 @@ def _cross_process_serialization(harness: Harness, report: Report) -> None:
         refusal = Harness.refuse_host_cli(root, expanded)
         if refusal is not None:
             raise RuntimeError(f"cross harness host CLI guard: {refusal}")
-        environment = without_ambient_executables(dict(os.environ))
+        environment = with_case_git(without_ambient_executables(dict(os.environ)), root)
         existing = environment.get("PYTHONPATH", "")
         local = str(REPO_ROOT / "py")
         environment["PYTHONPATH"] = local if not existing else local + os.pathsep + existing

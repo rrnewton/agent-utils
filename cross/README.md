@@ -58,7 +58,13 @@ must hand both editions a fixture (`--goal-command-json`, for example) rather
 than compare two runs of whatever the developer's machine has installed. The
 editions also do not inherit the caller's `AGENTCTL_WRKSLOTS_BIN`, `AGY_BIN`,
 `CODEX_BIN`, `HERDR_BIN`, or `MUSE_BIN`, whose absolute paths would bypass the
-stubs.
+stubs. Both editions run the system Git (`git check-ignore` for profile
+configuration), and Git runs helper programs that its configuration names, such
+as `core.fsmonitor`, by absolute path. So an edition inherits no `GIT_*`
+variable (`GIT_CONFIG_COUNT`, `GIT_CONFIG_PARAMETERS` and the rest), reads no
+system or global Git configuration (`GIT_CONFIG_NOSYSTEM=1`,
+`GIT_CONFIG_GLOBAL=/dev/null`), and finds no repository above the case directory
+(`GIT_CEILING_DIRECTORIES`).
 
 Without `--herdr-bin`, the Rust edition looks `herdr` up on `PATH` and meets the
 stub, but the Python edition runs the `herdr` installed in a fixed location such

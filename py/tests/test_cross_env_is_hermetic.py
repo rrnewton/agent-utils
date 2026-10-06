@@ -818,6 +818,155 @@ def test_an_ambient_executable_override_is_not_inherited(
     assert [failure.split(":", 1)[0] for failure in report.failures] == ["harness/no-host-cli"]
 
 
+# The Git both editions run (agentctl/profiles.py, profiles.rs) and the call they make with it.
+_SYSTEM_GIT = "/usr/bin/git"
+_CHECK_IGNORE = ("check-ignore", "--quiet", "--", ".agentctl/profiles.toml")
+# An "edition" that runs Git as both editions do, in its own repository when given `init`, and
+# reports the check-ignore status and the Git variables it was given.
+_GIT_PROBE_EDITION = (
+    "import json, os, subprocess, sys; "
+    f"git = {_SYSTEM_GIT!r}; "
+    "init = 'init' in sys.argv; "
+    "init and subprocess.run([git, 'init', '-q', '.'], check=True, stdin=subprocess.DEVNULL); "
+    "init and open('.gitignore', 'w', encoding='utf-8').write('.agentctl/\\n'); "
+    f"done = subprocess.run([git, '-C', os.getcwd(), *{_CHECK_IGNORE!r}], "
+    "stdin=subprocess.DEVNULL, capture_output=True); "
+    "seen = {key: value for key, value in os.environ.items() if key.startswith('GIT_')}; "
+    "ceiling = seen.pop('GIT_CEILING_DIRECTORIES', None); "
+    "print(json.dumps({'check_ignore': done.returncode, 'git': seen, "
+    "'ceiling_is_parent': ceiling == os.path.dirname(os.path.realpath(os.getcwd()))}))"
+)
+
+
+def _hostile_git_configuration(tmp_path: Path, source: str, helper: Path) -> dict[str, str]:
+    """Configure core.fsmonitor to run `helper` through one configuration source."""
+    if source == "environment":
+        return {"GIT_CONFIG_COUNT": "1", "GIT_CONFIG_KEY_0": "core.fsmonitor",
+                "GIT_CONFIG_VALUE_0": str(helper)}
+    if source == "parameters":
+        return {"GIT_CONFIG_PARAMETERS": f"'core.fsmonitor'='{helper}'"}
+    if source == "home":
+        home = tmp_path / "home"
+        home.mkdir()
+        (home / ".gitconfig").write_text(f"[core]\n\tfsmonitor = {helper}\n", encoding="utf-8")
+        return {"HOME": str(home)}
+    raise AssertionError(source)
+
+
+def _git_runs_the_helper(
+    directory: Path, configuration: dict[str, str], marker: Path, init: bool
+) -> bool:
+    """Whether check-ignore in `directory` runs the helper, given the caller's configuration."""
+    import subprocess
+
+    environment = {key: value for key, value in os.environ.items() if not key.startswith("GIT_")}
+    environment.update(configuration)
+    directory.mkdir()
+    if init:
+        subprocess.run([_SYSTEM_GIT, "init", "-q", str(directory)], check=True, env=environment,
+                       stdin=subprocess.DEVNULL)
+        (directory / ".gitignore").write_text(".agentctl/\n", encoding="utf-8")
+    marker.unlink(missing_ok=True)
+    subprocess.run([_SYSTEM_GIT, "-C", str(directory), *_CHECK_IGNORE], env=environment,
+                   stdin=subprocess.DEVNULL, capture_output=True, check=False)
+    ran = marker.exists()
+    marker.unlink(missing_ok=True)
+    return ran
+
+
+@pytest.mark.parametrize("source", ("environment", "parameters", "home", "enclosing"))
+def test_an_edition_runs_git_with_no_configuration_but_the_case_repository(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, source: str
+) -> None:
+    """Git runs a helper its configuration names, by absolute path where no PATH stub sees it.
+
+    Each source first proves, outside the harness, that check-ignore runs the helper it
+    configures; then neither edition may. `enclosing` is a repository around the harness
+    directory, which Git would discover from a case that has no repository of its own.
+    """
+    import json
+    import subprocess
+
+    if not os.access(_SYSTEM_GIT, os.X_OK):
+        pytest.skip(f"{_SYSTEM_GIT}, which both editions run, is not installed")
+    herdr_agent = _cross_module("herdr_agent_differential")
+    marker = tmp_path / "helper-ran"
+    helper = tmp_path / "fsmonitor-helper"
+    helper.write_text(f"#!/bin/sh\necho \"$@\" >> {marker}\nexit 1\n", encoding="utf-8")
+    helper.chmod(0o700)
+    init = source != "enclosing"
+    if init:
+        configuration = _hostile_git_configuration(tmp_path, source, helper)
+    else:
+        clean = {key: value for key, value in os.environ.items() if not key.startswith("GIT_")}
+        subprocess.run([_SYSTEM_GIT, "init", "-q", str(tmp_path)], check=True, env=clean,
+                       stdin=subprocess.DEVNULL)
+        subprocess.run([_SYSTEM_GIT, "-C", str(tmp_path), "config", "core.fsmonitor", str(helper)],
+                       check=True, env=clean, stdin=subprocess.DEVNULL)
+        configuration = {}
+    assert _git_runs_the_helper(tmp_path / "control", configuration, marker, init)
+
+    for variable, value in configuration.items():
+        monkeypatch.setenv(variable, value)
+    edition = [sys.executable, "-c", _GIT_PROBE_EDITION]
+    harness = herdr_agent.Harness(tmp_path / "cross", edition, edition)
+    try:
+        case = harness.case("git-configuration")
+        python, rust = harness.invoke(
+            case, ("git-probe", "init" if init else "no-init", *herdr_agent.FIXTURE_HERDR)
+        )
+    finally:
+        harness.close()
+
+    assert not marker.exists()
+    assert python == rust
+    assert python.returncode == 0, python.stderr
+    assert json.loads(python.stdout) == {
+        # 128: with no repository of its own, the case is not inside any repository.
+        "check_ignore": 0 if init else 128,
+        "git": {"GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": os.devnull},
+        "ceiling_is_parent": True,
+    }
+    assert harness.host_cli_calls() == []
+
+
+def test_the_serialization_editions_run_git_with_no_configuration_but_the_case_repository(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The cross-process lock check launches its editions itself, so it must set Git up too."""
+    import subprocess
+
+    herdr_agent = _cross_module("herdr_agent_differential")
+    edition, _ = _recording_edition(tmp_path)
+    harness = herdr_agent.Harness(tmp_path / "cross", edition, edition)
+    launched: list[tuple[object, object]] = []
+
+    class _Launched(Exception):
+        pass
+
+    def recording_popen(*_: object, **kwargs: object) -> object:
+        launched.append((kwargs.get("env"), kwargs.get("cwd")))
+        raise _Launched
+
+    try:
+        monkeypatch.setenv("GIT_CONFIG_PARAMETERS", f"'core.fsmonitor'='{tmp_path / 'helper'}'")
+        monkeypatch.setenv("GIT_DIR", str(tmp_path / "elsewhere"))
+        monkeypatch.setattr(subprocess, "Popen", recording_popen)
+        with pytest.raises(_Launched):
+            herdr_agent._cross_process_serialization(harness, herdr_agent.Report())
+    finally:
+        monkeypatch.undo()
+        harness.close()
+
+    [(environment, directory)] = launched
+    assert isinstance(environment, dict) and isinstance(directory, Path)
+    assert {key: value for key, value in environment.items() if key.startswith("GIT_")} == {
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_CONFIG_GLOBAL": os.devnull,
+        "GIT_CEILING_DIRECTORIES": os.path.dirname(os.path.realpath(directory)),
+    }
+
+
 # Invocations whose refusal is checked against what the Python parsers actually select.
 _PARSER_PROBES: tuple[tuple[str, ...], ...] = (
     ("start", "worker"),
