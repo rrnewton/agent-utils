@@ -771,7 +771,9 @@ Doubt refuses. The YAML reader is a subset of libyaml: any construct it does
 not handle (tags, anchors, a key spanning lines, a file over 1 MiB, invalid
 UTF-8) makes the whole file unreadable, and then any command whose first word
 could be an alias is refused with exit 78; commands whose first word is one of
-gh's built-in commands still run. A loop, nesting deeper than 5, or a command
+gh's built-in commands still run. (Round 7 showed that built-in words can be
+aliases too in a file gh-paced cannot read; every command is now refused then,
+see round 7.) A loop, nesting deeper than 5, or a command
 word gh-paced cannot place with certainty is refused (exit 64). A wrong guess
 in the other direction (reading a name as an alias that gh would not) changes
 only what runs, and that is what was classified.
@@ -779,7 +781,7 @@ only what runs, and that is what was classified.
 | Round-5 finding | Now | Test that fails before the fix |
 | --- | --- | --- |
 | blocker: an alias to a watch (`w: run watch 99`) bypassed the watch opt-in | the expansion is classified, so it is refused (exit 64) without `GH_PACED_ALLOW_WATCH=1`, and with it gh receives `run watch 99 ...` | `cli::an_alias_to_a_watch_loop_is_refused_like_the_watch` |
-| major: valid YAML (flow mappings) and aliases after flags (`issue -R o/r upload`) hid write bodies | flow mappings, block scalars and quoted folding are read; the command word is found past flags; unreadable YAML refuses possible aliases | `cli::flow_mapping_aliases_and_aliases_after_flags_are_found`, `cli::an_unreadable_gh_configuration_refuses_only_possible_aliases`, `alias` unit tests |
+| major: valid YAML (flow mappings) and aliases after flags (`issue -R o/r upload`) hid write bodies | flow mappings, block scalars and quoted folding are read; the command word is found past flags; unreadable YAML refuses possible aliases | `cli::flow_mapping_aliases_and_aliases_after_flags_are_found`, `cli::an_unreadable_gh_configuration_refuses_only_possible_aliases` (renamed in round 7, see there), `alias` unit tests |
 | major: an alias's body file could change after the check | gh receives the expansion with the body file replaced by its snapshot, like a typed command | `cli::an_alias_expansion_has_its_body_inspected` (rewritten, below) |
 
 The other 16 majors are not fixed in this commit and stay open: pagination
@@ -824,7 +826,7 @@ rule: where gh-paced cannot be sure what gh reads, it refuses.
 | --- | --- | --- |
 | blocker: a `config.yml` with NEL (U+0085) line breaks or a second byte order mark was read as one line by gh-paced and as several by gh, so gh could run an alias gh-paced never saw | gh-paced refuses to read any configuration holding NEL, LS (U+2028), PS (U+2029), a byte order mark after the first character, a control character, U+FFFE/U+FFFF, or a `---`/`...` document marker after the first setting: possible aliases exit 78 | `cli::a_configuration_with_line_breaks_gh_reads_differently_is_refused` |
 | blocker: a quoted alias name with a space in its last word (`"issue 'publish hidden'"`) runs in gh as `gh issue publish`, because cobra names a command by its `Use` up to the first space | the name is placed under its first word, as cobra does; if gh also has a command of that word (a built-in or an extension), which one cobra finds first is not known, so it is refused (exit 64); a name with an empty first word is ignored, as gh cannot invoke it | `cli::an_alias_name_with_a_space_runs_as_its_first_word`, `alias::an_alias_word_with_a_space_runs_as_its_first_word` |
-| blocker: a `GH_CONFIG_DIR` that is not UTF-8 was treated as unset, so gh-paced read `~/.config/gh` while gh read the other directory | a non-UTF-8 `GH_CONFIG_DIR`, `XDG_CONFIG_HOME`, `XDG_DATA_HOME` or `HOME` makes the configuration unreadable: possible aliases exit 78 | `cli::a_gh_config_dir_that_is_not_utf8_refuses_possible_aliases`, `alias::a_lookup_variable_that_is_not_utf8_makes_the_configuration_unreadable` |
+| blocker: a `GH_CONFIG_DIR` that is not UTF-8 was treated as unset, so gh-paced read `~/.config/gh` while gh read the other directory | a non-UTF-8 `GH_CONFIG_DIR`, `XDG_CONFIG_HOME`, `XDG_DATA_HOME` or `HOME` makes the configuration unreadable: possible aliases exit 78 | `cli::a_gh_config_dir_that_is_not_utf8_refuses_possible_aliases` (renamed in round 7, see there), `alias::a_lookup_variable_that_is_not_utf8_makes_the_configuration_unreadable` |
 | blocker: gh reads `config.yml` again after admission, so a file rewritten while the call waits can make gh run something else, expanded aliases included | out of scope, by coordinator decision (below); no code change | none |
 | major: plain YAML scalars starting with `-`, `?` or `:` followed by a non-blank (`-x: issue list`) were unreadable, so valid gh configurations refused | read as libyaml reads them in block context | `cli::aliases_starting_with_dash_question_or_colon_are_read`, `alias::reads_plain_scalars_starting_with_dash_question_or_colon` |
 | major: an alias named like an installed extension was refused, while gh runs the extension | the extension runs (not treated as an alias) when gh-paced is sure gh registers its extensions; gh registers none when one entry of the extensions directory fails to load, so this needs every `gh-*` entry to be a symbolic link or a directory without `manifest.yml`; otherwise the alias is still refused (exit 64) | `cli::an_extension_runs_instead_of_an_alias_of_its_name`, `alias::an_extension_runs_instead_of_an_alias_of_its_name` |
@@ -841,14 +843,18 @@ gh-paced passed through, or a changed shell alias. gh-paced paces well-meaning
 agents; a process rewriting gh's configuration under a waiting call is not in
 its threat model, and gh-paced makes no guarantee about it.
 
-The same commit fixes five round-5 majors (finding numbers from the round-5
-report):
+The same commit addresses five round-5 majors (finding numbers from the
+round-5 report). Round 7 found that three of them are fixed only in part:
+F5 (a title gh prompts for is still outside the shared allowance), F6
+(lower-case standard base64 still escapes the varying-width rule) and F14
+(the `Retry-After` cap shortened a valid server wait; round 7 below replaces
+it). F16 and F18 are fixed.
 
 | Round-5 finding | Now | Test |
 | --- | --- | --- |
-| F5: the editor reset the size allowance, so a call could send 8 KiB on its command line and 8 KiB more from the editor | the wrapper passes the bytes the arguments used (`GH_PACED_BODY_BYTES_USED`) to the editor shim, and all files saved in one editor session are checked together against one `max_body_bytes` | `guard::editor_text_shares_the_allowance_with_the_arguments`, `cli::text_written_in_the_editor_is_checked` (extended) |
-| F6: single-case base64 (1,200 `A`s) wrapped at varying widths passed | a line counts toward the varying-width block when it holds an upper-case letter or repeats one character | `guard::varying_narrow_wrapping_is_detected` (extended) |
-| F14: a duration of 1e308 in the config panicked | `cooldown_secs`, `plain_403_cooldown_secs`, `max_wait_secs`, `min_watch_interval_secs` and `GH_PACED_MAX_WAIT` must be at most 604,800 s (7 days), the rate-limit refresh timeout at most 3,600 s, and a `Retry-After` is capped at 86,400 s | `config::durations_must_be_representable`, `pushback::a_huge_retry_after_is_capped_not_infinite` |
+| F5 (partial): the editor reset the size allowance, so a call could send 8 KiB on its command line and 8 KiB more from the editor | the wrapper passes the bytes the arguments used (`GH_PACED_BODY_BYTES_USED`) to the editor shim, and all files saved in one editor session are checked together against one `max_body_bytes` | `guard::editor_text_shares_the_allowance_with_the_arguments`, `cli::text_written_in_the_editor_is_checked` (extended) |
+| F6 (partial): single-case base64 (1,200 `A`s) wrapped at varying widths passed | a line counts toward the varying-width block when it holds an upper-case letter or repeats one character | `guard::varying_narrow_wrapping_is_detected` (extended) |
+| F14 (partial): a duration of 1e308 in the config panicked | `cooldown_secs`, `plain_403_cooldown_secs`, `max_wait_secs`, `min_watch_interval_secs` and `GH_PACED_MAX_WAIT` must be at most 604,800 s (7 days), the rate-limit refresh timeout at most 3,600 s, and a `Retry-After` is capped at 86,400 s (that cap is replaced in round 7) | `config::durations_must_be_representable`, `pushback::a_huge_retry_after_is_capped_not_infinite` |
 | F16: `workflow run --json --json=false` kept a stdin source | the last `--json` occurrence decides | `guard::a_later_false_json_flag_drops_the_stdin_source` |
 | F18: the copy kept of a refused edit had no size bound | at most 1 MiB is kept, and the refusal says the rest was not copied | `editor::refused_text_is_kept_up_to_a_bound` |
 
@@ -879,6 +885,74 @@ snapshot; F12 wall-clock steps refilling budgets; F13 `GH_PACED_MAX_WAIT`
 counting requested sleeps rather than elapsed waiting; F15 `--label -L50001`
 charged as a limit; F17 `--editor` forms refused; F19 terminal window size not
 passed on.
+
+## Round 7 and what changed
+
+Round 7 reviewed `0042a521` and returned CHANGES REQUESTED: 2 blockers and 5
+majors. The coordinator approved a narrow round 8 scope: the two blockers, the
+`Retry-After` major, and wording. Both blockers let a command run without
+pacing; the `Retry-After` cap let calls through before the server's wait ended.
+
+| Round-7 finding | Now | Test (fails on `0042a521`) |
+| --- | --- | --- |
+| blocker: with an unreadable `config.yml`, `gh help` ran free, but gh adds its `help` command after the aliases, so an alias named `help` (`help: !!str 'run watch 99 --interval 1'`) ran a watch loop with no admission | when gh's configuration cannot be read, every command word is refused (exit 78), gh's own commands, `help`, `__complete` and extensions included; only a line naming no command (`gh`, `gh --version`, `gh --help`) runs | `cli::a_help_alias_in_an_unreadable_configuration_is_refused`, `alias::an_unreadable_configuration_refuses_every_command` |
+| blocker: when the configuration could not be read, the "gh registers its extensions" certainty was lost and an extension name ran free, but gh registers no extensions when one entry (such as a stray regular file) fails, and then an alias of that name runs | same rule: no command word runs when the configuration cannot be read, so the extensions directory is not consulted then | `cli::an_extension_name_in_an_unreadable_configuration_is_refused` |
+| major: the 86,400 s `Retry-After` cap shortened a valid two-day wait | a `Retry-After` is honoured in full up to 31,536,000 s (365 days); a longer or unrepresentable value starts a cooldown with no end time (`until` is the largest finite double, `f64::MAX`), so every paced call is refused (exit 75) and the message, the banner and `status` say a person must remove `<account>.cooldown` and the `cooldown` entry of `<account>.json` | `pushback::a_long_retry_after_is_never_shortened`, `cli::a_long_retry_after_is_never_shortened` |
+| minor: four statements that the command checked is the command gh runs, the `classify --help` list for exit 78, and the user guide's unreadable-configuration bullet | each now says gh reads `config.yml` again and a rewrite during the call is not guarded against; `classify --help` lists exit 78 for every command under an unreadable configuration; the guide states the refuse-every-command rule | none (text) |
+
+**Why every command, not a list of risky words.** gh-paced cannot know what an
+unreadable file holds. In gh 2.97, cobra adds `help`, `__complete` and
+`__completeNoDesc` after the aliases, so an alias can take those names; an
+alias name quoted to include a space (`'pr x'`) adds a second command named
+`pr`, which can shadow the built-in; and an extension name runs as an alias
+whenever gh registers no extensions. Any command word can therefore run as an
+alias. **Cost:** while `config.yml` (or a lookup variable) is unreadable,
+`gh auth git-credential` is refused too, so git cannot use gh as its credential
+helper, and so is `gh alias delete`, which could have repaired the file. The
+refusal names the file, so the fix is to correct it or the variable.
+
+**Why no end time, not a cap.** The coordinator ruled that a server-requested
+wait is never shortened, and a cap that sleeps less would shorten it. A wait
+past `GH_PACED_MAX_WAIT` already refuses rather than sleeps, so a cooldown
+with no end refuses every paced call. Unpaced commands (help, `--version`)
+still run. 365 days is far past any wait GitHub sends, so a value above it is
+treated as a malformed or hostile header that only a person should clear. The
+value round-trips through the JSON state files (the CLI test reads `f64::MAX`
+back from both `<account>.json` and `<account>.cooldown`), `status` shows `no end time` and a null
+`remaining_secs`, and time formatting shows `a time too far off to show`
+instead of a garbage date.
+
+Test changes in this commit, each stricter than before:
+
+- `alias::an_unreadable_configuration_refuses_only_possible_aliases` became
+  `an_unreadable_configuration_refuses_every_command`. `pr view 1`, `api` and
+  `myext x` were `NotAlias` and are now refused (config); `upload` and
+  `issue upload` stay refused; `help`, `help run`, `__complete pr`,
+  `auth git-credential get` and `-R o/r pr view 1` are added as refused; `""`,
+  `--version` and `--help` are asserted to still run.
+- `alias::a_lookup_variable_that_is_not_utf8_makes_the_configuration_unreadable`:
+  `pr view 1` was `NotAlias` and is now refused; `help` is added as refused
+  and `--version` as running.
+- `alias::loads_aliases_and_extensions_from_disk` (unreadable part): `myext`
+  was `NotAlias` and is now refused; `pr view 1` is added as refused.
+- `cli::an_unreadable_gh_configuration_refuses_only_possible_aliases` became
+  `an_unreadable_gh_configuration_refuses_every_command`: `pr view 1` exited 0
+  and started gh; it now exits 78 with the same stderr check as `up`, and gh
+  never starts. The case that still runs is `--version` (exit 0, one start).
+  The ambiguous-flag case is unchanged.
+- `cli::a_gh_config_dir_that_is_not_utf8_refuses_possible_aliases` became
+  `a_gh_config_dir_that_is_not_utf8_refuses_every_command`: the passed-through
+  command exited 0 with one gh start; it now exits 78 and gh never starts.
+- `pushback::a_huge_retry_after_is_capped_not_infinite` became
+  `a_long_retry_after_is_never_shortened`: 400 nines and `1e400` asserted the
+  86,400 s cap and now assert a cooldown with no end time; 172,800 s and
+  31,536,000 s are added and asserted to be kept exactly.
+
+No other existing assertion changed.
+
+Left open by the round-8 scope (coordinator decision): the binary-extension
+over-refusal, the U+2028 refusal of gh-written configurations, and the F5 and
+F6 remainders (all listed under Open items).
 
 ## Test changes worth a reviewer's attention
 
@@ -1016,3 +1090,20 @@ pagination and limit costs, watch loops, alias inspection), adds one test
 - 11 round-5 majors are open (listed at the end of round 6).
 - gh reads its configuration again when it runs; a change while a call waits
   is out of scope (see round 6).
+- A binary extension (a `gh-<name>` directory with `manifest.yml`) makes
+  gh-paced unsure that gh registers extensions, so an alias with the name of
+  any installed extension is refused (exit 64) although gh runs the extension.
+  gh 2.97 only stats that manifest when it registers extensions. This
+  over-refuses; it does not bypass pacing.
+- A `config.yml` holding U+2028 or U+2029, which gh's own YAML writer can emit
+  inside a quoted alias, is unreadable to gh-paced, so every command is refused
+  (exit 78) until it is rewritten.
+- F5 remainder: a title gh prompts for on a terminal is not counted with the
+  editor body, so the two can exceed `max_body_bytes` together. The user
+  guide's "one allowance for the whole call" overstates this.
+- F6 remainder: lower-case standard base64 wrapped at varying widths (for
+  example `abcd` repeated, at alternating 16 and 12 columns) passes the
+  varying-width rule. The user guide still describes the earlier mixed-case
+  rule.
+- A `Retry-After` above 365 days stops paced calls for the account on the host
+  until a person clears the cooldown (see round 7).

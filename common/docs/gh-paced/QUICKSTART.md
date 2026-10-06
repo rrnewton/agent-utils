@@ -16,7 +16,8 @@ budget is used up, printing a loud warning line on stderr. It also:
   response;
 - refuses write bodies larger than 8 KiB or containing long base64 runs,
   whether they come from an argument, a file, stdin, one of gh's aliases
-  (which gh-paced expands itself, so gh runs exactly what was checked), or
+  (which gh-paced expands itself, so gh never sees the alias name, as long as
+  gh's `config.yml` is not rewritten while the call runs), or
   the editor gh opens (gh-paced points gh's editor at a guard that checks the
   saved text);
 - refuses writes whose body gh would compose from something it reads later

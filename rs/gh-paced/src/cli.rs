@@ -29,8 +29,11 @@ file, and delayed with a loud stderr warning when a budget is exhausted. It
 also watches GitHub's own account-wide numbers (GET /rate_limit), backs off
 for at least 15 minutes after any rate-limit, abuse or HTTP 403 response, and
 refuses oversized or base64-laden write bodies. It expands gh's own aliases
-itself and runs gh with the expansion, so the command checked is the command
-gh runs. It checks bodies given as arguments, files or stdin, and text typed
+itself and runs gh with the expansion, so gh never sees the alias name; gh
+still reads its config.yml again when it starts, and a config.yml rewritten
+during the call is not guarded against. When config.yml cannot be read, every
+command is refused (exit 78). It checks bodies given as arguments, files or
+stdin, and text typed
 in the editor gh opens for a write (gh's editor is pointed at
 `gh-paced --edit-guard`, which runs your editor and then checks the file).
 Body files are copied privately so gh sends exactly what was checked; bodies
@@ -175,10 +178,11 @@ aliases (read from gh's config.yml), which are expanded first, as a real run
 expands them; the expansion is shown on an `alias:` line (an `alias` key with
 --json). REFUSED shows only the refusals decided from the command line, the
 configuration and gh's aliases: a watch without GH_PACED_ALLOW_WATCH=1, an
-unreadable or too-short --interval on a watch, and an alias gh-paced cannot
-resolve. A real run can still refuse what classify accepts: a body the content
-guard rejects (exit 65), a cost larger than the bucket or a wait beyond
-GH_PACED_MAX_WAIT (exit 75), and an unreadable gh config.yml (exit 78).
+unreadable or too-short --interval on a watch, an alias gh-paced cannot
+resolve, and every command when gh's config.yml cannot be read (a real run
+refuses that with exit 78). A real run can still refuse what classify accepts:
+a body the content guard rejects (exit 65), and a cost larger than the bucket
+or a wait beyond GH_PACED_MAX_WAIT (exit 75).
 
 EXAMPLES
   gh-paced classify -- pr comment 5 --body hi
@@ -452,6 +456,9 @@ fn run_drain(args: &[String]) -> i32 {
                         &command,
                     );
                     let what = match recorded {
+                        Ok(_) if pb.has_no_end() => {
+                            "cooldown with no end time recorded".to_string()
+                        }
                         Ok(_) => format!("cooldown of {:.0} s recorded", pb.cooldown_secs),
                         Err(e) => format!("the cooldown could not be recorded: {e}"),
                     };

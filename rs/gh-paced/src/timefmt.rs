@@ -95,6 +95,10 @@ const MONTHS: [&str; 12] = [
 
 /// Format `at` for a human, prefixing the date when it falls on a different local day than `now`.
 pub fn human(at: f64, now: f64, tz: DisplayTz) -> String {
+    // Past 9999-12-31 the calendar arithmetic below could overflow; no such time is shown.
+    if !at.is_finite() || at.abs() > 253_402_300_799.0 {
+        return "a time too far off to show".to_string();
+    }
     let at_s = at.round() as i64;
     let now_s = now.round() as i64;
     match tz {

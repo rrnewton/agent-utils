@@ -12,7 +12,7 @@ use crate::cli::EXIT_CONFIG;
 use crate::clock::{Clock, RealClock};
 use crate::config::{ClassLimits, Config};
 use crate::guard::{self, Verdict};
-use crate::pushback::{Pushback, Scanner};
+use crate::pushback::{has_no_end, Pushback, Scanner};
 use crate::ratelimit;
 use crate::runner::{
     write_stderr_bounded, DrainCommand, Exit, Invocation, PushbackHook, Ran, Runner,
@@ -187,7 +187,7 @@ pub fn publish_cooldown(
 ) -> Result<bool, String> {
     let _guard = state::lock_within(paths, lock_wait_secs)?;
     let cd = Cooldown {
-        until: now + pb.cooldown_secs,
+        until: pb.until(now),
         set_at: now,
         reason: pb.reason.clone(),
         command: command.to_string(),
@@ -382,8 +382,10 @@ impl Wrapper<'_> {
     }
 
     fn run_inner(&mut self, args: &[String]) -> Outcome {
-        // Resolve gh's own aliases first, and hand gh the expanded command line, so gh runs
-        // exactly the command that is classified, snapshotted and guarded below.
+        // Resolve gh's own aliases first, and hand gh the expanded command line, so the command
+        // classified, snapshotted and guarded below is the one gh runs, provided gh's
+        // configuration is not rewritten before gh reads it again (outside the threat model).
+        // A configuration gh-paced cannot read refuses every command here (exit 78).
         let (args, via) = match self.gh_aliases.resolve(args) {
             Resolution::NotAlias => (args.to_vec(), None),
             Resolution::Expanded { argv, chain } => {
@@ -872,7 +874,7 @@ impl Wrapper<'_> {
     }
 
     fn apply_pushback(&mut self, st: &mut State, pb: &Pushback, command: &str, now: f64) {
-        let until = now + pb.cooldown_secs;
+        let until = pb.until(now);
         let extended = match &st.cooldown {
             Some(cd) if cd.until >= until => false,
             _ => {
@@ -897,16 +899,28 @@ impl Wrapper<'_> {
             }
         }
         let effective = st.cooldown.as_ref().map(|c| c.until).unwrap_or(until);
+        let pause =
+            if has_no_end(effective) {
+                format!(
+                "every paced gh call for this account on this host is refused from now on: the \
+                 cooldown has no end time. It ends only when a person removes {} and the \
+                 `cooldown` entry of {}, after checking with GitHub",
+                self.paths.cooldown().display(),
+                self.paths.state().display()
+            )
+            } else {
+                format!(
+                "every paced gh call for this account on this host is paused for {} s, until {}{}",
+                (effective - now).ceil() as i64,
+                self.when(effective),
+                if extended { "" } else { " (an existing longer cooldown stays)" }
+            )
+            };
         self.banner(
             "PUSHBACK",
             &[
                 format!("GitHub refused or throttled `{command}`: {}", pb.reason),
-                format!(
-                    "every paced gh call for this account on this host is paused for {} s, until {}{}",
-                    (effective - now).ceil() as i64,
-                    self.when(effective),
-                    if extended { "" } else { " (an existing longer cooldown stays)" }
-                ),
+                pause,
                 "STOP making GitHub calls and tell your coordinator. Do not retry in a loop. \
                  Never switch accounts to continue."
                     .to_string(),
@@ -1209,14 +1223,24 @@ impl Wrapper<'_> {
                         self.when(until)
                     )
                 };
+                let limit = if !w.kind.polled() && has_no_end(until) {
+                    format!(
+                        "the cooldown has no end time: every paced call is refused until a \
+                         person removes {} and the `cooldown` entry of {}",
+                        self.paths.cooldown().display(),
+                        self.paths.state().display()
+                    )
+                } else {
+                    format!(
+                        "{wait_text}, beyond GH_PACED_MAX_WAIT={} s",
+                        fmt_num(max_wait)
+                    )
+                };
                 self.banner(
                     "REFUSED",
                     &[
                         w.text.clone(),
-                        format!(
-                            "{wait_text}, beyond GH_PACED_MAX_WAIT={} s",
-                            fmt_num(max_wait)
-                        ),
+                        limit,
                         format!("not running `{}` (exit {EXIT_REFUSED})", c.command),
                     ],
                 );

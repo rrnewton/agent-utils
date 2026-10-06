@@ -8,6 +8,7 @@ use crate::audit;
 use crate::budget::{halved, Bucket};
 use crate::classify::Class;
 use crate::config::Config;
+use crate::pushback::has_no_end;
 use crate::state::{self, Paths, State};
 use crate::timefmt::human;
 use serde_json::{json, Value};
@@ -59,9 +60,14 @@ pub fn report(paths: &Paths, cfg: &Config, now: f64) -> Result<Value, String> {
         })
         .collect();
     let cooldown = st.cooldown.as_ref().filter(|c| c.until > now).map(|c| {
+        let no_end = has_no_end(c.until);
         json!({
-            "remaining_secs": (c.until - now).ceil(),
-            "until": human(c.until, now, cfg.display_tz),
+            "remaining_secs": if no_end { Value::Null } else { json!((c.until - now).ceil()) },
+            "until": if no_end {
+                "no end time".to_string()
+            } else {
+                human(c.until, now, cfg.display_tz)
+            },
             "reason": c.reason,
             "command": c.command,
         })
@@ -109,7 +115,18 @@ pub fn render(v: &Value) -> String {
         s(&v["account"])
     ));
     out.push_str(&format!("  state file: {}\n", s(&v["state_file"])));
-    if let Some(cd) = v["cooldown"].as_object() {
+    if let Some(cd) = v["cooldown"]
+        .as_object()
+        .filter(|cd| cd["remaining_secs"].is_null())
+    {
+        out.push_str(&format!(
+            "  COOLDOWN: no end time, after {} on `{}`; every paced call is refused until a \
+             person removes the `.cooldown` file beside the state file and the state file's \
+             `cooldown` entry\n",
+            s(&cd["reason"]),
+            s(&cd["command"])
+        ));
+    } else if let Some(cd) = v["cooldown"].as_object() {
         out.push_str(&format!(
             "  COOLDOWN: {} s left (until {}) after {} on `{}`\n",
             cd["remaining_secs"],
