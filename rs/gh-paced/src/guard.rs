@@ -441,34 +441,6 @@ pub fn body_sources(c: &Classification, rest: &[String], stdin_is_tty: bool) -> 
     }
 }
 
-/// The body sources of an ordinary alias's expansion, which gh builds and sends inside its own
-/// process: the expanded command line is classified and scanned as if it had been typed. File
-/// paths there come from the alias, not from gh-paced's arguments, so they are read and
-/// inspected but not snapshotted. `Err` when the expansion composes its body after the guard
-/// runs (see [`uninspectable`]).
-pub fn expansion_sources(
-    expanded: &[String],
-    cfg: &Config,
-    stdin_is_tty: bool,
-) -> Result<Vec<BodySource>, String> {
-    let c = crate::classify::classify(expanded, cfg);
-    if c.class != crate::classify::Class::Write {
-        return Ok(Vec::new());
-    }
-    let rest = &expanded[c.rest_start.min(expanded.len())..];
-    if let Some(why) = uninspectable(&c, rest, stdin_is_tty) {
-        return Err(format!("the alias expands to `{}`: {why}", c.command));
-    }
-    Ok(body_sources(&c, rest, stdin_is_tty)
-        .into_iter()
-        .map(|mut s| {
-            s.location = None;
-            s.flag = format!("{} (from the alias expansion `{}`)", s.flag, c.command);
-            s
-        })
-        .collect())
-}
-
 /// Every file gh may read while running this command, including overridden occurrences (gh
 /// reads some of those too). These are the files the wrapper snapshots.
 pub fn file_sources(c: &Classification, rest: &[String]) -> Vec<BodySource> {

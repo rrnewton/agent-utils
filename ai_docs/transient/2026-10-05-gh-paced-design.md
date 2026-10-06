@@ -72,13 +72,16 @@ network:
 | LOCAL | `--help` after a known gh command, `version`, `completion`, gh's own `config` and `alias` subcommands, `auth git-credential store/erase` | not paced, not audited |
 | READ | `pr view`, `issue list`, `run view`, `api` GET, GraphQL `query`, `status` | 1; `--paginate` 10; `--limit N` ceil(N/100); `status` 10 |
 | SEARCH | `search ...`, `api search/...`, `extension search` | 1 |
-| WRITE | `pr create`, `issue comment`, `api -X POST`, GraphQL `mutation`, anything unknown (even with `--help`), an alias beneath a group (`issue publish`), `extension exec`, `copilot` | 1; `--paginate` 10 |
+| WRITE | `pr create`, `issue comment`, `api -X POST`, GraphQL `mutation`, anything unknown (even with `--help`), an unknown word beneath a group, `extension exec`, `copilot` | 1; `--paginate` 10 |
+| GIT_CREDENTIAL | `auth git-credential get` | 1 |
 
 A call costing more than its class's burst is refused before gh runs (exit 75),
 except a watch, because one gh call makes its requests back to back.
-| GIT_CREDENTIAL | `auth git-credential get` | 1 |
 
-Unknown commands, aliases, extensions and unreadable GraphQL queries are WRITE.
+gh's own aliases are expanded first, the way gh 2.97 expands them, and the
+expansion is what is classified, guarded and passed to gh (see round 5).
+Unknown commands, extensions, `!` shell aliases and unreadable GraphQL queries
+are WRITE.
 `pr checks --watch` and `run watch` are refused (exit 64) unless
 `GH_PACED_ALLOW_WATCH=1` is set; with it they cost 20 READ tokens. Every `--interval`
 value must be a plain positive whole number of seconds, at least 30, or the call
@@ -706,6 +709,8 @@ assessment found no weakened assertion; it rejected the requirement-level
 exemptions the earlier commit had documented instead of fixing (burst debt,
 watch estimates, descendant cutoffs, varying-width base64). The landing commit
 fixes every finding except one half of a major, which stays a documented gap.
+(Round 5 disagreed: it judged findings 5, 6, 11, 12 and 13 only partly fixed.
+See round 5.)
 Each fix has a test that fails on the code before the fix (an export of
 `b7f65483`, or the tree just before that fix, with the new test copied in) and
 passes after it.
@@ -736,12 +741,78 @@ before the fix).
 Gaps kept, each stated in the guide's Limitations: the `-L<n>` flag-value case
 above; extensions that call the API through a library; the base64 shapes'
 blind spots; aliases charged one WRITE token whatever they expand to, with no
-extra charge for a `--paginate` inside; prompt-typed titles and template
+extra charge for a `--paginate` inside (fixed in round 5); prompt-typed titles and template
 defaults the editor guard never sees; the write slot held while the user edits;
 watch estimates under the opt-in; `gh status` request counts growing with
 notifications; and the drainer's limits (a phrase split across the handoff, no
 stdout scan after it, no audit record, interleaving with gh-paced's final
 messages, and lost output with a warning when the drainer cannot start).
+
+## Round 5 and what changed
+
+Round 5 reviewed `0db8f2a6` and returned CHANGES REQUESTED: 1 blocker and 18
+majors. Three of them (the blocker and two majors) came from one cause:
+gh-paced classified and guarded the command line the caller typed, while gh
+ran whatever its alias expanded to. They are fixed by changing the design, not
+by patching each case.
+
+**gh-paced now resolves gh's aliases itself and runs gh with the expansion.**
+It reads gh's `config.yml` (`GH_CONFIG_DIR`, else `$XDG_CONFIG_HOME/gh`, else
+`~/.config/gh`), finds the command word the way cobra does (skipping flags and
+the values they consume), applies gh 2.97's rules for which names can be
+aliases (not a built-in command, extensions win over aliases, `co` defaults to
+`pr checkout` when no alias is set), and expands nested aliases up to 5 deep.
+The fully expanded argv is what is classified, snapshotted, guarded, audited
+and passed to gh, so gh never re-reads an alias body that gh-paced did not
+see. A `!` shell alias is passed to gh as typed and stays opaque WRITE, with
+every argument inspected, because gh runs it with `sh -c`.
+
+Doubt refuses. The YAML reader is a subset of libyaml: any construct it does
+not handle (tags, anchors, a key spanning lines, a file over 1 MiB, invalid
+UTF-8) makes the whole file unreadable, and then any command whose first word
+could be an alias is refused with exit 78; commands whose first word is one of
+gh's built-in commands still run. A loop, nesting deeper than 5, or a command
+word gh-paced cannot place with certainty is refused (exit 64). A wrong guess
+in the other direction (reading a name as an alias that gh would not) changes
+only what runs, and that is what was classified.
+
+| Round-5 finding | Now | Test that fails before the fix |
+| --- | --- | --- |
+| blocker: an alias to a watch (`w: run watch 99`) bypassed the watch opt-in | the expansion is classified, so it is refused (exit 64) without `GH_PACED_ALLOW_WATCH=1`, and with it gh receives `run watch 99 ...` | `cli::an_alias_to_a_watch_loop_is_refused_like_the_watch` |
+| major: valid YAML (flow mappings) and aliases after flags (`issue -R o/r upload`) hid write bodies | flow mappings, block scalars and quoted folding are read; the command word is found past flags; unreadable YAML refuses possible aliases | `cli::flow_mapping_aliases_and_aliases_after_flags_are_found`, `cli::an_unreadable_gh_configuration_refuses_only_possible_aliases`, `alias` unit tests |
+| major: an alias's body file could change after the check | gh receives the expansion with the body file replaced by its snapshot, like a typed command | `cli::an_alias_expansion_has_its_body_inspected` (rewritten, below) |
+
+The other 16 majors are not fixed in this commit and stay open: pagination
+whose real request count exceeds its charge; the editor resetting the size
+allowance; single-case base64 such as 1,200 `A`s wrapped at varying widths; a
+lock timeout dropping an observed cooldown; drainers inheriting descriptors;
+the drainer losing a pushback phrase split across the handoff; unbounded pipe
+readers in the rate-limit refresh; a failed refresh keeping a stale healthy
+snapshot; wall-clock steps refilling budgets; `GH_PACED_MAX_WAIT` counting
+requested sleeps rather than elapsed waiting; a 1e308 duration in the config
+panicking; `--label -L50001` charged as a limit; `--json --json=false`
+leaving a stdin source; `--editor` forms refused; a refused edit copied
+without a size bound; and terminal window size not passed on.
+
+Test changes: `cli::an_alias_expansion_has_its_body_inspected` was rewritten.
+It used to assert that gh-paced checked the expansion's body while gh received
+the alias name. It now asserts what gh receives: the expanded argv
+(`api -X POST repos/o/r/issues/7/comments --input -`), and for a `--body-file`
+alias, a snapshot path instead of the original file. Its refusals are kept
+(oversized stdin and a 15,000-byte file both exit 65, the second with
+`content guard: write body is 15000 bytes`). The guard's separate
+alias-expansion path (`expansion_sources`) is removed, since the expansion is
+now the command line. The five round-4 `alias` unit tests are kept, with
+two expectations changed to follow gh: an empty `config.yml` now yields gh's
+default alias `co: pr checkout` (go-gh's fallback when no alias is set)
+instead of none, and an alias loop is now refused instead of expanding until
+the depth limit. The other changes in them are the new return types. No other
+existing assertion changed.
+
+New residual risk: gh reads `config.yml` again when it runs. An expanded alias
+is unaffected, since gh receives built-in commands only, but a shell alias
+(passed by name) or a command gh-paced found not to be an alias can mean
+something else if the file changes in between.
 
 ## Test changes worth a reviewer's attention
 
@@ -876,3 +947,5 @@ pagination and limit costs, watch loops, alias inspection), adds one test
 - With `--paginate`, a page body containing a CRLF header block can start an
   unneeded cooldown.
 - No crash-injection test for quarantine (see round 3).
+- The 16 round-5 majors listed under round 5 are open.
+- gh re-reads its aliases when it runs (see round 5).

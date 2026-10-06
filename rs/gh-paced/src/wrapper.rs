@@ -4,9 +4,11 @@
 //! Every decision is made while holding the account lock and against a time read after the lock
 //! was taken, so a process that waited for the lock cannot charge a slot in the past.
 
+use crate::alias::Resolution;
 use crate::audit::{self, Record};
 use crate::budget::{halved, Bucket};
 use crate::classify::{classify, Class, Classification};
+use crate::cli::EXIT_CONFIG;
 use crate::clock::{Clock, RealClock};
 use crate::config::{ClassLimits, Config};
 use crate::guard::{self, Verdict};
@@ -110,9 +112,12 @@ pub struct Wrapper<'a> {
     pub start_ticks: u64,
     /// This invocation's random identifier.
     pub nonce: String,
-    /// gh's own command aliases (`alias::load`), so the content guard can inspect the body an
-    /// ordinary alias expansion sends. Empty when gh's configuration has none.
-    pub gh_aliases: Vec<(String, String)>,
+    /// gh's own command aliases (`alias::GhAliases::load`). A command line that invokes one is
+    /// expanded before anything else looks at it, and gh is given the expansion.
+    pub gh_aliases: crate::alias::GhAliases,
+    /// The gh alias this invocation expanded, named on every refusal banner (set by
+    /// [`Wrapper::run`]; `None` to start).
+    pub alias_note: Option<String>,
     /// Variables that make gh open its editor through `gh-paced --edit-guard`
     /// (`editor::guard_env`), added to the environment of every WRITE call while the content
     /// guard is on, so text gh composes in an editor is checked too. Empty: no editor guard.
@@ -276,6 +281,11 @@ impl Wrapper<'_> {
         for l in lines {
             self.loud(kind, l);
         }
+        if kind == "REFUSED" {
+            if let Some(note) = self.alias_note.clone() {
+                self.loud(kind, &note);
+            }
+        }
         self.emit(rule);
     }
 
@@ -368,7 +378,56 @@ impl Wrapper<'_> {
     }
 
     fn run_inner(&mut self, args: &[String]) -> Outcome {
-        let c0 = classify(args, &self.cfg);
+        // Resolve gh's own aliases first, and hand gh the expanded command line, so gh runs
+        // exactly the command that is classified, snapshotted and guarded below.
+        let (args, via) = match self.gh_aliases.resolve(args) {
+            Resolution::NotAlias => (args.to_vec(), None),
+            Resolution::Expanded { argv, chain } => {
+                let note = format!(
+                    "gh alias `{}` -> `{}`",
+                    chain.join("` -> `"),
+                    argv.join(" ")
+                );
+                (argv, Some(note))
+            }
+            Resolution::Shell { argv, chain } => {
+                let note = format!(
+                    "gh shell alias `{}`, which gh runs with `sh -c`",
+                    chain.join("` -> `")
+                );
+                (argv, Some(note))
+            }
+            Resolution::Refused { reason, config } => {
+                let code = if config { EXIT_CONFIG } else { EXIT_USAGE };
+                let c = classify(args, &self.cfg);
+                self.banner(
+                    "REFUSED",
+                    &[
+                        reason.clone(),
+                        format!("not running `{}` (exit {code})", args.join(" ")),
+                    ],
+                );
+                let split = c.rest_start.min(args.len());
+                let mut shown: Vec<String> = args[..split].to_vec();
+                shown.extend(guard::redact(&c, &args[split..]));
+                let mut r = self.record("refuse", &c, &audit::summarize(&shown));
+                r.rc = Some(code);
+                r.detail = format!("gh alias: {reason}");
+                if let Err(e) = self.audit_locked(&r) {
+                    return self.internal_error("cannot record refusal", &e);
+                }
+                return Outcome::Exit(code);
+            }
+        };
+        self.alias_note = via.clone();
+        let args = args.as_slice();
+        let annotate = |mut c: Classification| {
+            if let Some(v) = &via {
+                c.reason = format!("{} ({v})", c.reason);
+            }
+            c
+        };
+        let c0 = annotate(classify(args, &self.cfg));
         if c0.class == Class::Local {
             return self.spawn(args, None, &c0, Vec::new()).0;
         }
@@ -384,7 +443,7 @@ impl Wrapper<'_> {
             Err(code) => return Outcome::Exit(code),
         };
         let args = args.as_slice();
-        let c = classify(args, &self.cfg);
+        let c = annotate(classify(args, &self.cfg));
         if c.class == Class::Local {
             return self.spawn(args, None, &c, Vec::new()).0;
         }
@@ -408,7 +467,7 @@ impl Wrapper<'_> {
             }
             return Outcome::Exit(EXIT_USAGE);
         }
-        let stdin = match self.content_guard(&c, args, rest, &summary) {
+        let stdin = match self.content_guard(&c, rest, &summary) {
             Ok(s) => s,
             Err(code) => return Outcome::Exit(code),
         };
@@ -596,7 +655,6 @@ impl Wrapper<'_> {
     fn content_guard(
         &mut self,
         c: &Classification,
-        args: &[String],
         rest: &[String],
         summary: &str,
     ) -> Result<Option<Vec<u8>>, i32> {
@@ -622,34 +680,8 @@ impl Wrapper<'_> {
             return Err(EXIT_CONTENT);
         }
         let sources = guard::body_sources(c, rest, self.stdin_is_tty);
-        // gh expands an ordinary alias inside its own process, so the body its expansion sends
-        // (`--input -`, a body file named in the alias) never reaches a second gh-paced. The
-        // expansion is checked on its own, so arguments that appear in both are not counted
-        // twice towards the size limit.
-        let mut expansion = Vec::new();
-        if c.opaque {
-            if let crate::alias::Resolution::Expanded(expanded) =
-                crate::alias::resolve(args, &self.gh_aliases)
-            {
-                match guard::expansion_sources(&expanded, &self.cfg, self.stdin_is_tty) {
-                    Ok(s) => expansion = s,
-                    Err(why) => {
-                        let reason = format!(
-                            "{why}, after this guard would have run, so the body cannot be \
-                             inspected; pass it with --body or --body-file instead"
-                        );
-                        self.refuse_content(c, summary, &reason);
-                        return Err(EXIT_CONTENT);
-                    }
-                }
-            }
-        }
         let mut stdin_buf = None;
-        if sources
-            .iter()
-            .chain(&expansion)
-            .any(guard::BodySource::is_stdin)
-        {
+        if sources.iter().any(guard::BodySource::is_stdin) {
             self.flush();
             match (self.stdin_reader)(self.cfg.max_body_bytes + 1) {
                 Ok(buf) => stdin_buf = Some(buf),
@@ -662,19 +694,10 @@ impl Wrapper<'_> {
                 }
             }
         }
-        for (set, from_alias) in [(&sources, false), (&expansion, true)] {
-            if let Verdict::Refuse(mut reason) =
-                guard::evaluate(set, &self.cfg, stdin_buf.as_deref())
-            {
-                if from_alias {
-                    // The caller passed no body, so say where gh would have read it from.
-                    let flags: Vec<&str> = set.iter().map(|s| s.flag.as_str()).collect();
-                    reason.push_str("; gh would read it from ");
-                    reason.push_str(&flags.join(", "));
-                }
-                self.refuse_content(c, summary, &reason);
-                return Err(EXIT_CONTENT);
-            }
+        if let Verdict::Refuse(reason) = guard::evaluate(&sources, &self.cfg, stdin_buf.as_deref())
+        {
+            self.refuse_content(c, summary, &reason);
+            return Err(EXIT_CONTENT);
         }
         Ok(stdin_buf)
     }

@@ -38,8 +38,9 @@ share an account each take a fixed share of GitHub's documented limits, and the
 account-wide `GET /rate_limit` numbers cover what local accounting cannot see.
 
 **Unknown means expensive.** A wrapper sees command lines, not HTTP requests.
-Aliases, extensions and new `gh` subcommands are therefore charged as writes
-until they are classified explicitly.
+Extensions, shell aliases and new `gh` subcommands are therefore charged as
+writes until they are classified explicitly; gh's ordinary aliases are expanded
+by the wrapper and charged as what they expand to.
 
 **A refusal says what to do next.** Every refusal names the budget, the time of
 the next slot, and the exit status, so the caller can decide whether to wait or

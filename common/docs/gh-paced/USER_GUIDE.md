@@ -410,21 +410,17 @@ Before running a WRITE, gh-paced reads every body source:
   and every string inside it is also scanned after JSON decoding, so a `body`
   field is caught however it is escaped;
 - `gh workflow run -f/-F` and `--json` (stdin);
-- for an alias, extension or unknown command (including an alias beneath one
-  of gh's groups, such as `issue publish`, and `extension exec` and `copilot`,
-  which hand their arguments to another program), every argument, flag-shaped
-  or not (`--payload=<text>`, `--repo <text>`, `-- <text>`), and every
-  occurrence of a repeated flag rather than only the last, because its
-  expansion may pass any of them to a body flag;
-- for one of gh's own aliases (the `aliases:` section of gh's `config.yml`,
-  found the way gh finds it: `$GH_CONFIG_DIR`, `$XDG_CONFIG_HOME/gh`, or
-  `~/.config/gh`), the body sources of the expansion as well, because gh
-  expands an alias inside its own process and sends what the expansion names
-  (`--input -`, a body file written into the alias) without running gh again.
-  The expansion is worked out the way gh does it (`$1`-style placeholders,
-  leftover arguments appended, up to 5 aliases deep) and checked as if it had
-  been typed; a refusal says the body came from the alias expansion. An
-  expansion that composes its body later (see the next subsection) is refused;
+- for a command gh-paced cannot see into (an extension, a shell alias, an
+  unknown command, a word beneath one of gh's groups that is not one of gh's
+  commands, and `extension exec` and `copilot`, which hand their arguments to
+  another program), every argument, flag-shaped or not (`--payload=<text>`,
+  `--repo <text>`, `-- <text>`), and every occurrence of a repeated flag
+  rather than only the last, because that program may pass any of them to a
+  body flag;
+- for one of gh's own aliases, whatever its expansion sends: gh-paced expands
+  the alias itself and runs gh with the expansion (see
+  [gh's own aliases](#ghs-own-aliases)), so the expansion is checked, and its
+  body files snapshotted, exactly as if it had been typed;
 - text typed in the editor gh opens for a write (see
   [Text written in gh's editor](#text-written-in-ghs-editor));
 - for any other write, `--body`, `--body-file` and `--input`.
@@ -490,6 +486,48 @@ GH-PACED REFUSED [octocat] GitHub text is for short human notes. Keep evidence o
 base64 checks, and the refusals in the next subsection; the 64 MiB snapshot cap
 still applies). Use it only for genuinely human-written long text, such as a
 long design comment, and never for encoded or machine-generated payloads.
+
+### gh's own aliases
+
+gh expands an ordinary alias (the `aliases:` section of gh's `config.yml`)
+inside its own process: with `upload: api -X POST repos/o/r/issues/$1/comments
+--input -`, `gh upload 7` sends stdin as a comment, and with `w: run watch 99`,
+`gh w` is a watch loop. So gh-paced reads gh's aliases the way gh does, expands
+the alias (`$1`-style placeholders, leftover arguments appended, aliases of
+aliases followed up to 5 deep), and runs gh with the expanded command line.
+Classification, budgets, the watch rules, the content guard and the snapshots
+all apply to the expansion, and gh never sees the alias name, so it cannot
+expand it differently. `gh-paced classify` shows the expansion on an `alias:`
+line.
+
+gh's configuration file is found the way gh finds it: `$GH_CONFIG_DIR`,
+`$XDG_CONFIG_HOME/gh`, or `$HOME/.config/gh` (a path relative to the working
+directory when `HOME` is empty). A missing or empty file means gh's single
+default alias, `co: pr checkout`. An alias name is placed the way gh adds it:
+beneath gh's own groups only (`issue publish`, `cs mine` beneath `codespace`),
+never in place of one of gh's commands, and it is found after flags gh skips
+while looking for a command (`gh issue -R o/r publish`).
+
+A shell alias (`!...`) is passed to gh by name and charged one WRITE token; gh
+runs it with `sh -c`, and any `gh` it runs is paced only if that `gh` resolves
+to gh-paced (see [Limitations](#limitations)).
+
+When gh-paced cannot be sure which command gh would run, it refuses instead of
+guessing:
+
+- gh's `config.yml` cannot be read, is larger than 1 MiB, or uses YAML that
+  gh-paced does not read (tags, anchors, merge keys, nested collections, tabs
+  in the indentation, a key set twice): any word that could name an alias is
+  refused with exit 78; gh's own commands and installed extensions still run;
+- the position of the alias name depends on whether an unfamiliar flag before
+  it takes a value (`gh issue --some-flag publish`): exit 64; put the alias
+  name right after the command words;
+- two aliases with the same name and different expansions, an alias named like
+  an installed extension (or any root alias when the extensions directory
+  cannot be listed), an alias named `help`, an alias beneath a word gh-paced
+  does not know as one of gh's commands, aliases nested more than 5 deep or in
+  a loop, or an expansion gh would reject for these arguments (a `$2` with one
+  argument, an open quote): exit 64.
 
 ### Bodies gh composes itself
 
@@ -781,9 +819,9 @@ other process is stuck.
 | gh's own | the call ran; gh-paced returns gh's status, or dies by gh's signal |
 | 75 | refused: the wait would exceed `GH_PACED_MAX_WAIT`, the cost is above the class's burst (not for a watch) or can never fit under the hourly cap, a watch ran past the deadline its cost paid for, or gh-paced is nested too deep |
 | 65 | refused by the write content guard: body too large, base64-looking content (in an argument, a file, stdin, or one of gh's alias expansions), a body gh would compose itself, or a body file that cannot be copied for inspection. Text refused by the editor guard makes the editor fail instead, so gh exits with its own status (usually 1) and sends nothing |
-| 64 | usage error, or a refused command shape (a watch without `GH_PACED_ALLOW_WATCH=1`, a watch interval under 30 s, or one that is not a positive whole number) |
+| 64 | usage error, or a refused command shape (a watch without `GH_PACED_ALLOW_WATCH=1`, a watch interval under 30 s, or one that is not a positive whole number, or one of gh's aliases gh-paced cannot resolve for certain; see [gh's own aliases](#ghs-own-aliases)) |
 | 70 | internal error: the pacing state cannot be read or written, or its lock was not obtained within `GH_PACED_LOCK_WAIT` |
-| 78 | configuration error, or `--real-gh` resolves to gh-paced |
+| 78 | configuration error, `--real-gh` resolves to gh-paced, or gh's `config.yml` cannot be read and the command line may name one of gh's aliases |
 | 127 | the real gh cannot be found or run |
 
 A caller that sees 75 should not retry immediately. The message says when the
@@ -805,9 +843,9 @@ and none of it is fixed by configuration.
   extension's own call is charged one WRITE token and its requests are not
   seen. A shell alias (`!...` in gh's config) is covered only where the `gh`
   it runs resolves to gh-paced.
-- **Classification works from the command line.** Unknown commands, aliases
-  and extensions are charged one WRITE token whatever they do; a `--paginate`
-  inside an alias's expansion is not charged extra. A GraphQL request whose
+- **Classification works from the command line.** Unknown commands, shell
+  aliases and extensions are charged one WRITE token whatever they do (gh's
+  ordinary aliases are expanded first and charged as their expansion). A GraphQL request whose
   query cannot be read is charged as WRITE. `gh status` is charged 10 READ
   tokens, though the number of requests it makes grows with the number of
   notifications.
@@ -834,10 +872,12 @@ and none of it is fixed by configuration.
     interactive `issue create` title or a `pr merge` commit subject (short
     single-line fields), or a template default submitted without opening the
     editor;
-  - text written in a browser after "Continue in browser" or `--web`;
-  - an alias file's contents changing between the check and gh's read: body
-    files named on the command line are snapshotted, but files named inside an
-    alias's expansion are only read and checked.
+  - text written in a browser after "Continue in browser" or `--web`.
+- **gh reads its aliases again.** gh-paced reads gh's `config.yml` once, before
+  the call. If the file changes before gh reads it, gh may see an alias
+  gh-paced did not (gh is given the expanded command line, so an alias
+  gh-paced expanded is not affected, but a shell alias, which gh is given by
+  name, is).
 - **The editor guard has side effects of its own.** The write slot stays taken
   while you edit, so other writes on the host wait (and are refused after
   `GH_PACED_MAX_WAIT`). Any reads gh makes between prompts are not charged
