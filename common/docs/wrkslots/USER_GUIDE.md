@@ -371,7 +371,10 @@ validation slots. `audit`, `remove` (including `--validate-complete` and `remove
 - `dead`: every retained run handle under `ignored/validate/runs/` whose checkout names the slot
   directory or a recorded checkout path has a dead process generation (when it records one) and an
   inactive, unqueued service unit with no live process in its control group, and no active or
-  queued user-systemd unit names those paths;
+  queued user-systemd unit names those paths. Removal renames the slot directory to
+  `.<slot>.fenced.<generation>.<hex>` before deleting it, so the same paths inside every such fence
+  on disk, and inside the fence an interrupted removal's finish journal names, count as the row's
+  paths too;
 - `alive`: any of that evidence shows the run may still use the checkout; the remedy is to let the
   run finish or stop its unit;
 - `unverifiable`: a handle, the process table, user-systemd state, the boot id, or a recorded run

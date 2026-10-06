@@ -1112,3 +1112,116 @@ def test_completed_validation_removal_ignores_a_unit_naming_a_longer_path(
     assert removed == 0, capsys.readouterr().err
     assert not tree.exists()
     assert active_slots(project) == []
+
+
+class _Interrupted(RuntimeError):
+    pass
+
+
+def _interrupt_once_at(monkeypatch: pytest.MonkeyPatch, boundary: str) -> None:
+    def interrupt(point: str) -> None:
+        if point == boundary:
+            monkeypatch.setattr(wrkslots, "_interrupt_for_test", lambda _point: None)
+            raise _Interrupted(point)
+
+    monkeypatch.setattr(wrkslots, "_interrupt_for_test", interrupt)
+
+
+@pytest.mark.parametrize("evidence", ["queued-unit", "run-handle"])
+def test_finish_recovery_judges_the_fenced_checkout(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    evidence: str,
+) -> None:
+    """Finish recovery moves the checkout to ``.slot01.fenced.1.<hex>`` and
+    deletes it there.
+
+    The interrupted removal's finish journal names the fence before the
+    slot is renamed.  A queued job or a run handle naming the fenced
+    checkout will use the files recovery is about to delete, although
+    neither names the recorded path.
+    """
+
+    project, tree = _prepare(tmp_path, monkeypatch, agent_liveness="dead")
+    slot_path = _slot_directory(project)
+    _interrupt_once_at(monkeypatch, "after-finish-journal")
+    with pytest.raises(_Interrupted):
+        _remove_completed(project)
+    config = wrkslots._load_config(str(project), "testhost")
+    journal_paths = [
+        path
+        for path in (
+            wrkslots._journal_path(config),
+            wrkslots._finish_journal_path(config, "slot01"),
+        )
+        if path.exists()
+    ]
+    assert len(journal_paths) == 1, journal_paths
+    journal = json.loads(journal_paths[0].read_text(encoding="utf-8"))
+    assert journal["kind"] == "finish"
+    fenced_slot = project / journal["fenced"]
+    assert fenced_slot.name.startswith(".slot01.fenced.1.")
+    assert not fenced_slot.exists()
+    fenced_tree = fenced_slot / tree.relative_to(slot_path)
+    if evidence == "queued-unit":
+        unit = _unit(
+            Id="queued-run.service",
+            PendingJob="yes",
+            ExecStart=f"/usr/bin/make\n-C\n{fenced_tree}",
+        )
+        expected = "user-systemd unit queued-run.service names validation row slot01"
+    else:
+        _write_run_handle(project, fenced_tree)
+        unit = _unit(ActiveState="active", SubState="running")
+        expected = f"retained validation unit {RUN_UNIT} may still use row slot01"
+    monkeypatch.setattr(wrkslots, "_user_systemd_snapshot", lambda: (unit,))
+    recover = [
+        "--project-root",
+        str(project),
+        "recover",
+        "--coordinator-pid",
+        str(os.getpid()),
+    ]
+
+    assert wrkslots.main(recover) == 3
+    error = capsys.readouterr().err
+    assert "validation-run authority reports the run may still use slot slot01" in error
+    assert expected in error
+    assert tree.is_dir()
+    assert len(active_slots(project)) == 1
+
+    monkeypatch.setattr(wrkslots, "_user_systemd_snapshot", lambda: ())
+    assert wrkslots.main(recover) == 0, capsys.readouterr().err
+    assert not fenced_slot.exists()
+    assert not slot_path.exists()
+    assert active_slots(project) == []
+
+
+def test_a_unit_naming_a_fenced_checkout_on_disk_is_alive(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A slot already renamed to its fence is judged at the fenced path.
+
+    Every ``.slot01.fenced.1.*`` sibling on disk is a place the row's files
+    may be, whichever operation renamed it there.
+    """
+
+    project, tree = _prepare(tmp_path, monkeypatch, agent_liveness="dead")
+    slot_path = _slot_directory(project)
+    fenced_slot = slot_path.parent / f".slot01.fenced.1.{uuid.uuid4().hex}"
+    slot_path.rename(fenced_slot)
+    fenced_tree = fenced_slot / tree.relative_to(slot_path)
+    queued = _unit(
+        Id="queued-run.service", PendingJob="yes", ExecStart=f"make\n-C\n{fenced_tree}"
+    )
+    monkeypatch.setattr(wrkslots, "_user_systemd_snapshot", lambda: (queued,))
+    config = wrkslots._load_config(str(project), "testhost")
+
+    states = wrkslots._validation_run_liveness_states(
+        config, wrkslots._load_active(config).slots
+    )
+
+    state, message = states[("testhost", "slot01", 1)]
+    assert state == "alive", message
+    assert "user-systemd unit queued-run.service names validation row slot01" in message

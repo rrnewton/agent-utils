@@ -16647,8 +16647,56 @@ def _validation_run_host_evidence() -> tuple[
     return _processes_around_unit_enumeration(_absent_validate_process_snapshot())
 
 
+def _validation_run_row_paths(
+    config: Config,
+    record: ActiveRecord,
+    fenced_slots: Mapping[tuple[str, str, int], Path] | None = None,
+) -> tuple[Path, ...]:
+    """Return a validation row's recorded paths and their fenced counterparts.
+
+    Removal renames the slot directory to ``.<slot>.fenced.<generation>.<hex>``
+    beside it before deleting it, so finish recovery and a deferred private
+    completion judge a row whose checkout is no longer at its recorded path.
+    A queued job or run handle naming the fenced checkout uses the same
+    files.  Every such sibling present on disk is included, and so is the
+    fence a finish journal names (``fenced_slots``), which may not exist yet.
+    """
+
+    paths = _absent_validate_row_paths(config, record)
+    slot_path = _slot_directory(config, record.slot, record.slot_type).absolute()
+    prefix = f".{record.slot}.fenced.{record.generation}."
+    fences: set[Path] = set()
+    named = None if fenced_slots is None else fenced_slots.get(
+        (record.machine, record.slot, record.generation)
+    )
+    if named is not None:
+        fences.add(named.absolute())
+    try:
+        with os.scandir(slot_path.parent) as entries:
+            fences.update(
+                slot_path.parent / entry.name
+                for entry in entries
+                if entry.name.startswith(prefix)
+            )
+    except FileNotFoundError:
+        pass
+    except OSError as exc:
+        raise Refusal(
+            f"cannot enumerate fenced paths of validation row {record.slot}: {exc}"
+        ) from exc
+    fenced: list[Path] = []
+    for fence in sorted(fences):
+        for path in paths:
+            if path == slot_path or slot_path in path.parents:
+                fenced.append(fence / path.relative_to(slot_path))
+    return tuple(dict.fromkeys((*paths, *fenced)))
+
+
 def _validation_run_liveness_states(
-    config: Config, records: Sequence[ActiveRecord]
+    config: Config,
+    records: Sequence[ActiveRecord],
+    *,
+    fenced_slots: Mapping[tuple[str, str, int], Path] | None = None,
 ) -> dict[tuple[str, str, int], tuple[str, str]]:
     """Answer the liveness question for validation rows from their runs.
 
@@ -16662,8 +16710,9 @@ def _validation_run_liveness_states(
 
     The run is the authority instead, exactly as for
     ``recover-absent-validate-rows``.  A row is ``dead`` only when every
-    retained run handle that names its slot or checkout path has a dead exact
-    process generation and an inactive, unqueued service unit with no live
+    retained run handle that names its slot or checkout path, recorded or
+    fenced (see ``_validation_run_row_paths``), has a dead exact process
+    generation and an inactive, unqueued service unit with no live
     process in its control group, and no active or queued user-systemd unit
     names those paths.  Positive evidence of a run is ``alive``.  Unreadable
     handle, process or user-systemd evidence, a row registered on another
@@ -16717,7 +16766,8 @@ def _validation_run_liveness_states(
         return result
     try:
         rows = tuple(
-            (record, _absent_validate_row_paths(config, record)) for record in local
+            (record, _validation_run_row_paths(config, record, fenced_slots))
+            for record in local
         )
         bindings = _retained_handles_for_absent_rows(config, rows)
         processes, snapshot = _validation_run_host_evidence()
@@ -16784,11 +16834,13 @@ def _assert_owner_liveness(
     record: ActiveRecord,
     *,
     known: Mapping[tuple[str, str, int], tuple[str, str]] | None = None,
+    fenced_slot: Path | None = None,
 ) -> None:
     """Require the row's liveness authority to report its owner dead.
 
     ``known`` carries validation-run answers that the caller already read
     under the same mutation lock, so a batch reads host evidence once.
+    ``fenced_slot`` is the fence a finish journal names for this row.
     """
 
     if record.slot_type != "validate":
@@ -16799,7 +16851,11 @@ def _assert_owner_liveness(
     state, detail = (
         answered
         if answered is not None
-        else _validation_run_liveness_states(config, (record,))[key]
+        else _validation_run_liveness_states(
+            config,
+            (record,),
+            fenced_slots=None if fenced_slot is None else {key: fenced_slot},
+        )[key]
     )
     if state == "dead":
         return
@@ -31152,7 +31208,15 @@ def _complete_prepared_private_finish(
         if handoff_writer is None:
             _assert_caller_process(coordinator, "validate owner")
     else:
-        _assert_owner_liveness(config, current)
+        _assert_owner_liveness(
+            config,
+            current,
+            fenced_slot=(
+                _finish_fenced_slot(config, current, raw)
+                if current.slot_type == "validate"
+                else None
+            ),
+        )
     if (
         owner_state != "dead"
         and not live_validate_owner
@@ -35551,7 +35615,15 @@ def _recover_finish(
     if live_validate_owner:
         _assert_recovery_processes(coordinator, processes, "validate owner")
     elif owner_consent is None and owner_release is None:
-        _assert_owner_liveness(config, current)
+        _assert_owner_liveness(
+            config,
+            current,
+            fenced_slot=(
+                _finish_fenced_slot(config, record, raw)
+                if current.slot_type == "validate"
+                else None
+            ),
+        )
     if not expired and not validate_complete and owner_release is None:
         raise Refusal(
             f"slot {current.slot} time-to-live is no longer expired after renewal; "
