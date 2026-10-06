@@ -36,6 +36,9 @@ const DEFAULT_ALIASES: &[(&str, &str)] = &[("co", "pr checkout")];
 /// may not be the command that runs.
 const LATE_ROOT_COMMANDS: &[&str] = &["help", "__complete", "__completeNoDesc"];
 
+/// The variables gh finds its configuration file and extensions directory through.
+const LOOKUP_VARS: [&str; 4] = ["GH_CONFIG_DIR", "XDG_CONFIG_HOME", "XDG_DATA_HOME", "HOME"];
+
 /// gh's configuration file: `$GH_CONFIG_DIR/config.yml`, else
 /// `$XDG_CONFIG_HOME/gh/config.yml`, else `$HOME/.config/gh/config.yml`, as gh looks it up. With
 /// `HOME` unset or empty, gh uses `.config/gh/config.yml` relative to the working directory, and
@@ -68,25 +71,59 @@ fn home(env: &dyn Fn(&str) -> Option<String>) -> PathBuf {
     PathBuf::from(env("HOME").unwrap_or_default())
 }
 
-/// The names of the installed extensions (`gh-<name>` entries of [`extensions_dir`]), or `None`
-/// when the directory exists but cannot be listed.
-fn list_extensions(dir: &Path) -> Option<Vec<String>> {
+/// The installed extensions as gh-paced reads [`extensions_dir`].
+#[derive(Debug, Clone, Default)]
+pub struct Extensions {
+    /// The command word of each `gh-<name>` entry: `<name>` up to its first space, as cobra
+    /// names a command (`<name>` itself when it has no space).
+    pub words: Vec<String>,
+    /// Whether gh certainly registers every one of them. gh lists its extensions all at once and
+    /// registers none when one entry cannot be read; gh-paced only checks the entries that cannot
+    /// fail that way (a directory without a `manifest.yml`, or a symbolic link), so a regular
+    /// file, a binary extension's directory or any other entry makes this `false`.
+    pub certain: bool,
+}
+
+/// The installed extensions (`gh-<name>` entries of [`extensions_dir`]), or `None` when the
+/// directory exists but cannot be listed.
+fn list_extensions(dir: &Path) -> Option<Extensions> {
     let entries = match std::fs::read_dir(dir) {
         Ok(e) => e,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Some(Vec::new()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Some(Extensions {
+                words: Vec::new(),
+                certain: true,
+            })
+        }
         Err(_) => return None,
     };
-    let mut out = Vec::new();
+    let mut out = Extensions {
+        words: Vec::new(),
+        certain: true,
+    };
     for entry in entries {
-        let name = entry.ok()?.file_name();
-        match name.to_str() {
-            Some(n) => {
-                if let Some(ext) = n.strip_prefix("gh-") {
-                    out.push(ext.to_string());
-                }
+        let entry = entry.ok()?;
+        let name = entry.file_name();
+        let Some(n) = name.to_str() else {
+            if name.as_encoded_bytes().starts_with(b"gh-") {
+                return None;
             }
-            None if name.as_encoded_bytes().starts_with(b"gh-") => return None,
-            None => {}
+            continue;
+        };
+        let Some(ext) = n.strip_prefix("gh-") else {
+            continue;
+        };
+        let simple = match entry.file_type() {
+            Ok(t) if t.is_symlink() => true,
+            // gh reads a directory whose `manifest.yml` it can stat as a binary extension, and
+            // fails its whole listing if that file does not parse.
+            Ok(t) if t.is_dir() => std::fs::metadata(entry.path().join("manifest.yml")).is_err(),
+            _ => false,
+        };
+        out.certain &= simple;
+        let word = ext.split(' ').next().unwrap_or_default();
+        if !word.is_empty() {
+            out.words.push(word.to_string());
         }
     }
     Some(out)
@@ -275,27 +312,62 @@ enum Hit {
 impl GhAliases {
     /// gh's aliases from its configuration file and extensions directory, found through `env`.
     pub fn load(env: &dyn Fn(&str) -> Option<String>) -> GhAliases {
-        let extensions = list_extensions(&extensions_dir(env));
+        let listed = list_extensions(&extensions_dir(env));
         let path = config_file(env).unwrap_or_default();
         let parsed = read_config(&path).and_then(|text| match text {
             None => Ok(default_pairs()),
             Some(t) => parse_aliases(&t).map_err(|e| format!("{}: {e}", path.display())),
         });
         match parsed {
-            Ok(pairs) => GhAliases::from_pairs(pairs, extensions),
+            Ok(pairs) => GhAliases::place(pairs, listed),
             Err(why) => GhAliases {
                 unreadable: Some(why),
-                extensions,
+                extensions: listed.map(|e| e.words),
                 ..GhAliases::default()
             },
         }
     }
 
+    /// [`GhAliases::load`], after checking that none of the variables gh finds its files through
+    /// (`raw`, the environment as the operating system gives it) holds bytes that are not UTF-8.
+    /// gh would use such a value as a path; gh-paced cannot, so it treats the configuration as
+    /// unreadable (refusing any word that could name an alias) instead of as unset.
+    pub fn load_checked(
+        env: &dyn Fn(&str) -> Option<String>,
+        raw: &dyn Fn(&str) -> Option<std::ffi::OsString>,
+    ) -> GhAliases {
+        for k in LOOKUP_VARS {
+            if raw(k).is_some_and(|v| v.to_str().is_none()) {
+                return GhAliases {
+                    unreadable: Some(format!(
+                        "`{k}` is not UTF-8, so gh-paced cannot tell which files gh reads"
+                    )),
+                    extensions: None,
+                    ..GhAliases::default()
+                };
+            }
+        }
+        GhAliases::load(env)
+    }
+
     /// Place `(name, expansion)` pairs read from a configuration file the way gh adds them to its
-    /// command tree. `extensions` is the list of installed extensions, or `None` when it is not
-    /// known. A name gh rejects is dropped; a name gh-paced cannot be sure about is kept and
-    /// refused when used.
+    /// command tree. `extensions` is the command words of the installed extensions, all certainly
+    /// registered by gh, or `None` when they are not known. A name gh rejects is dropped; a name
+    /// gh-paced cannot be sure about is kept and refused when used.
     pub fn from_pairs(pairs: Vec<(String, String)>, extensions: Option<Vec<String>>) -> GhAliases {
+        GhAliases::place(
+            pairs,
+            extensions.map(|words| Extensions {
+                words,
+                certain: true,
+            }),
+        )
+    }
+
+    /// [`GhAliases::from_pairs`] with extensions that gh may not register (see [`Extensions`]).
+    fn place(pairs: Vec<(String, String)>, listed: Option<Extensions>) -> GhAliases {
+        let certain = listed.as_ref().is_some_and(|e| e.certain);
+        let extensions = listed.map(|e| e.words);
         let mut entries = Vec::new();
         let mut unplaced = Vec::new();
         'pairs: for (name, expansion) in pairs {
@@ -304,7 +376,16 @@ impl GhAliases {
                 // cobra never takes such a word as a command, so gh can never run the alias.
                 continue;
             }
-            let (word, parents) = words.split_last().expect("non-empty");
+            let (full, parents) = words.split_last().expect("non-empty");
+            // gh names the alias command after its last word, and cobra takes a command's name
+            // from its usage text up to the first space: `issue 'publish now'` runs as
+            // `gh issue publish`.
+            let word = full.split(' ').next().unwrap_or_default().to_string();
+            if word.is_empty() {
+                // cobra skips an empty word during lookup, so gh can never run the alias.
+                continue;
+            }
+            let renamed = word != *full;
             let mut parent: Vec<&'static str> = Vec::new();
             for p in parents {
                 match builtin_child(&parent, p) {
@@ -320,15 +401,22 @@ impl GhAliases {
                     }
                 }
             }
+            let clash = format!(
+                "the name `{full}` makes gh add a second command named `{word}`, and which of \
+                 the two cobra finds first is not known"
+            );
             let mut doubt = None;
             if parent.is_empty() && LATE_ROOT_COMMANDS.contains(&word.as_str()) {
                 doubt = Some(format!(
                     "cobra adds its own `{word}` command after gh loads aliases, so which of the \
                      two runs is not known"
                 ));
-            } else if builtin_child(&parent, word).is_some() {
-                // A built-in command of that name wins; gh does not add the alias.
-                continue;
+            } else if builtin_child(&parent, &word).is_some() {
+                if !renamed {
+                    // A built-in command of that name wins; gh does not add the alias.
+                    continue;
+                }
+                doubt = Some(clash);
             } else if parent.is_empty() {
                 match &extensions {
                     None => {
@@ -338,11 +426,21 @@ impl GhAliases {
                                 .to_string(),
                         )
                     }
-                    Some(e) if e.contains(word) => {
-                        doubt = Some(format!(
-                            "an extension is also named `{word}`, and which of the two gh runs \
-                             depends on details gh-paced does not check"
-                        ))
+                    Some(e) if e.contains(&word) => {
+                        if certain && !renamed {
+                            // gh registers the extension first and then rejects an alias whose
+                            // name finds a runnable command: the extension runs.
+                            continue;
+                        }
+                        doubt = Some(if renamed {
+                            clash
+                        } else {
+                            format!(
+                                "an extension is also named `{word}`, and gh registers no \
+                                 extension at all when one entry of its extensions directory \
+                                 cannot be read, which gh-paced does not check"
+                            )
+                        });
                     }
                     Some(_) => {}
                 }
@@ -350,7 +448,7 @@ impl GhAliases {
             entries.push(Alias {
                 name,
                 parent,
-                word: word.clone(),
+                word,
                 expansion,
                 doubt,
             });
@@ -416,14 +514,16 @@ impl GhAliases {
             match expand(&alias.expansion, &rest) {
                 Some(next) => current = next,
                 None => {
+                    // The expansion is not repeated here: it can hold the text of a body,
+                    // and this reason is written to the audit log.
                     return Resolution::Refused {
                         reason: format!(
-                            "gh would refuse the alias `{}` (`{}`) with these arguments: a `$N` \
-                             has no argument, or a quote is left open",
-                            alias.name, alias.expansion
+                            "gh would refuse the alias `{}` with these arguments: a `$N` in its \
+                             expansion has no argument, or a quote is left open",
+                            alias.name
                         ),
                         config: false,
-                    }
+                    };
                 }
             }
         }
@@ -681,6 +781,13 @@ impl<'a> Yaml<'a> {
 /// settings but no `aliases`. `Err` when the file uses YAML this reader does not handle.
 pub fn parse_aliases(text: &str) -> Result<Vec<(String, String)>, String> {
     let text = text.strip_prefix('\u{feff}').unwrap_or(text);
+    if let Some((i, c)) = text.char_indices().find(|&(_, c)| refused_char(c)) {
+        return Err(format!(
+            "line {}: the character U+{:04X}, which gh-paced does not read",
+            text[..i].matches('\n').count() + 1,
+            c as u32
+        ));
+    }
     let normalized;
     let text = if text.contains('\r') {
         normalized = text.replace("\r\n", "\n");
@@ -712,6 +819,11 @@ pub fn parse_aliases(text: &str) -> Result<Vec<(String, String)>, String> {
             continue;
         }
         started = true;
+        if (line.starts_with("---") || line.starts_with("..."))
+            && matches!(line.as_bytes().get(3), None | Some(b' ' | b'\t'))
+        {
+            return Err(at("a document marker after the first setting"));
+        }
         let (key, rest) = block_key(&y, line)?;
         if !keys.insert(key.clone()) {
             return Err(at(&format!("`{key}` is set twice")));
@@ -735,6 +847,18 @@ pub fn parse_aliases(text: &str) -> Result<Vec<(String, String)>, String> {
     })
 }
 
+/// A character this reader refuses rather than guess how gh's YAML library reads it: a byte
+/// order mark after the first one (libyaml skips one at the start of any line), NEL, LS and PS
+/// (line breaks to libyaml, ordinary characters to a line splitter), and the control characters
+/// and non-characters libyaml rejects.
+fn refused_char(c: char) -> bool {
+    matches!(
+        c,
+        '\u{feff}' | '\u{85}' | '\u{2028}' | '\u{2029}' | '\u{7f}' | '\u{fffe}' | '\u{ffff}'
+    ) || (c < ' ' && !matches!(c, '\t' | '\n' | '\r'))
+        || ('\u{80}'..='\u{9f}').contains(&c)
+}
+
 fn blank_or_comment(line: &str) -> bool {
     let t = line.trim_start_matches([' ', '\t']);
     t.is_empty() || t.starts_with('#')
@@ -749,9 +873,20 @@ fn tab_in_indent(line: &str) -> bool {
     line[..line.len() - line.trim_start_matches([' ', '\t']).len()].contains('\t')
 }
 
-/// Characters that cannot start a plain YAML scalar or key.
+/// Characters that cannot start a plain YAML scalar or key, except as [`plain_start`] allows.
 fn indicator(c: u8) -> bool {
     b"-?:,[]{}#&*!|>'\"%@`".contains(&c)
+}
+
+/// Whether a plain scalar starts at `b` (text up to the end of its line) in block context, as
+/// libyaml decides: a character that is not an indicator, or `-`, `?` or `:` followed by a
+/// character other than a space or tab (`-R`, `?x`, `:x`; `- x` is a sequence entry).
+fn plain_start(b: &[u8]) -> bool {
+    match b {
+        [] => false,
+        [b'-' | b'?' | b':', rest @ ..] => !matches!(rest.first(), None | Some(b' ' | b'\t')),
+        [c, ..] => !indicator(*c),
+    }
 }
 
 /// Split a block-mapping line into its key and the text after `:`.
@@ -773,7 +908,7 @@ fn block_key<'a>(y: &Yaml<'a>, line: &'a str) -> Result<(String, &'a str), Strin
             }
             Ok((key, rest))
         }
-        Some(&c) if indicator(c) => Err(y.at(
+        Some(&c) if !plain_start(b) => Err(y.at(
             p,
             &format!(
                 "`{}` at the start of an entry, which gh-paced does not read",
@@ -935,7 +1070,7 @@ fn block_value(y: &Yaml, k: usize, n: usize, rest: &str) -> Result<(String, usiz
         let body = line.trim_start_matches(' ');
         return match body.as_bytes()[0] {
             b'"' | b'\'' => quoted_value(y, y.off(body)),
-            c if indicator(c) => Err(format!(
+            _ if !plain_start(body.as_bytes()) => Err(format!(
                 "line {}: a nested collection or tagged value, which gh-paced does not read",
                 j + 1
             )),
@@ -945,7 +1080,7 @@ fn block_value(y: &Yaml, k: usize, n: usize, rest: &str) -> Result<(String, usiz
     match v.as_bytes()[0] {
         b'|' | b'>' => block_scalar(y, k, n, v),
         b'"' | b'\'' => quoted_value(y, y.off(v)),
-        c if indicator(c) => Err(format!(
+        c if !plain_start(v.as_bytes()) => Err(format!(
             "line {}: a value starting with `{}`, which gh-paced does not read",
             k + 1,
             c as char
@@ -1705,9 +1840,143 @@ http_unix_socket:
             "aliases: {\nco: a}\n",
             "aliases: {a\n  b: c}\n",
             "aliases: {'a\n  b': c}\n",
+            // Characters libyaml reads differently from a line splitter, or rejects.
+            "aliases:\n  co: pr checkout\u{85}  w: run watch 9\n",
+            "aliases:\n  co: pr checkout\u{2028}  w: run watch 9\n",
+            "aliases:\n  co: pr checkout\u{2029}  w: run watch 9\n",
+            "\u{feff}\u{feff}aliases:\n  co: pr checkout\n",
+            "aliases:\n\u{feff}  co: pr checkout\n",
+            "aliases:\n  co: pr\u{1}checkout\n",
+            "aliases:\n  co: pr\u{7f}checkout\n",
+            "aliases:\n  co: pr\u{9b}checkout\n",
+            "aliases:\n  co: pr\u{fffe}checkout\n",
+            // A sequence entry, a lone `-`, and document markers after the first setting.
+            "aliases:\n  - co\n",
+            "aliases:\n  co: - a\n",
+            "aliases:\n  co: -\n",
+            "aliases:\n  co:\n    - a\n",
+            "aliases:\n  co: a\n... x: y\n",
+            "aliases:\n  co: a\n--- # c\nx: y\n",
         ] {
             assert!(parse_aliases(text).is_err(), "{text:?} should be an error");
         }
+    }
+
+    /// libyaml starts a plain scalar at `-`, `?` or `:` followed by a character other than a
+    /// space or tab, in block context; gh's configuration reader takes such keys and values.
+    #[test]
+    fn reads_plain_scalars_starting_with_dash_question_or_colon() {
+        let text = "aliases:\n  pv: -R o/r pr view\n  ?review: pr list\n  :review: issue list\n  \
+                    w:\n    -R o/r\n    run watch\n  q: ?x\n  c: :x\n";
+        assert_eq!(
+            parse_aliases(text).unwrap(),
+            pairs(&[
+                ("pv", "-R o/r pr view"),
+                ("?review", "pr list"),
+                (":review", "issue list"),
+                ("w", "-R o/r run watch"),
+                ("q", "?x"),
+                ("c", ":x"),
+            ])
+        );
+        // A single leading byte order mark and a tab are still read.
+        assert_eq!(
+            parse_aliases("\u{feff}aliases:\n  co: pr\tcheckout\n").unwrap(),
+            pairs(&[("co", "pr\tcheckout")])
+        );
+    }
+
+    /// cobra names a command after its usage text up to the first space, so gh runs the alias
+    /// `issue 'publish hidden'` as `gh issue publish`.
+    #[test]
+    fn an_alias_word_with_a_space_runs_as_its_first_word() {
+        let a = aliases(&[
+            ("a", "issue publish"),
+            ("issue 'publish hidden'", "run watch 99 --interval 1"),
+        ]);
+        assert_eq!(
+            expanded(a.resolve(&argv("a"))),
+            argv("run watch 99 --interval 1")
+        );
+        assert_eq!(
+            expanded(a.resolve(&argv("issue publish"))),
+            argv("run watch 99 --interval 1")
+        );
+        assert_eq!(a.resolve(&argv("issue list")), Resolution::NotAlias);
+        // The first word is a built-in command's or cobra's own: which one runs is not known.
+        let clash = aliases(&[("issue 'view all'", "issue list"), ("'help me'", "pr list")]);
+        assert!(refused(&clash.resolve(&argv("issue view 1"))));
+        assert!(refused(&clash.resolve(&argv("help"))));
+        // An empty first word: cobra never takes it as a command, so the alias never runs.
+        let empty = aliases(&[("issue ' x'", "run watch 9")]);
+        assert!(empty.is_empty());
+        assert_eq!(empty.resolve(&argv("issue x")), Resolution::NotAlias);
+    }
+
+    /// gh registers extensions before aliases and rejects an alias whose name finds a runnable
+    /// command, so an installed extension runs instead of an alias of the same name; when gh may
+    /// register no extension at all, which one runs is not known.
+    #[test]
+    fn an_extension_runs_instead_of_an_alias_of_its_name() {
+        let listed = |name: &str, certain| {
+            GhAliases::place(
+                pairs(&[(name, "pr list")]),
+                Some(Extensions {
+                    words: vec!["myext".to_string()],
+                    certain,
+                }),
+            )
+        };
+        let sure = listed("myext", true);
+        assert!(sure.is_empty());
+        assert_eq!(sure.resolve(&argv("myext x")), Resolution::NotAlias);
+        assert!(refused(&listed("myext", false).resolve(&argv("myext x"))));
+        // `'myext now'` adds a second command named `myext`, beside the extension.
+        assert!(refused(
+            &listed("'myext now'", true).resolve(&argv("myext x"))
+        ));
+    }
+
+    #[test]
+    fn a_refusal_does_not_repeat_the_expansion() {
+        let a = aliases(&[("post", "issue comment $1 --body CANARY_PRIVATE_BODY")]);
+        match a.resolve(&argv("post")) {
+            Resolution::Refused { reason, config } => {
+                assert!(!config);
+                assert!(reason.contains("`post`"), "{reason}");
+                assert!(!reason.contains("CANARY_PRIVATE_BODY"), "{reason}");
+            }
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+    }
+
+    /// A lookup variable that is not UTF-8 is a path gh uses and gh-paced cannot: possible
+    /// aliases are refused as unreadable configuration, never resolved as if it were unset.
+    #[test]
+    fn a_lookup_variable_that_is_not_utf8_makes_the_configuration_unreadable() {
+        use std::os::unix::ffi::OsStrExt;
+        for bad in LOOKUP_VARS {
+            let env = |k: &str| (k == "HOME").then(|| "/nonexistent-gh-paced".to_string());
+            let raw = |k: &str| {
+                if k == bad {
+                    Some(std::ffi::OsStr::from_bytes(b"/x\xff").to_os_string())
+                } else {
+                    env(k).map(Into::into)
+                }
+            };
+            let a = GhAliases::load_checked(&env, &raw);
+            assert!(a.unreadable().is_some_and(|w| w.contains(bad)), "{bad}");
+            assert!(matches!(
+                a.resolve(&argv("up")),
+                Resolution::Refused { config: true, .. }
+            ));
+            assert_eq!(a.resolve(&argv("pr view 1")), Resolution::NotAlias);
+        }
+        let env = |k: &str| (k == "HOME").then(|| "/nonexistent-gh-paced".to_string());
+        let raw = |k: &str| env(k).map(Into::into);
+        let a = GhAliases::load_checked(&env, &raw);
+        assert!(a.unreadable().is_none());
+        assert_eq!(expanded(a.resolve(&argv("co 3"))), argv("pr checkout 3"));
     }
 
     #[test]
@@ -1864,10 +2133,14 @@ http_unix_socket:
         // Two names that gh splits to the same command word.
         let a = aliases(&[("co", "pr checkout"), ("'co'", "issue list")]);
         assert!(refused(&a.resolve(&argv("co 1"))));
-        // An alias named like an extension, or when extensions cannot be listed.
-        let ext = GhAliases::from_pairs(
+        // An alias named like an extension gh may not register, or when extensions cannot be
+        // listed.
+        let ext = GhAliases::place(
             pairs(&[("up", "pr list"), ("issue up", "issue list")]),
-            Some(vec!["up".to_string()]),
+            Some(Extensions {
+                words: vec!["up".to_string()],
+                certain: false,
+            }),
         );
         assert!(refused(&ext.resolve(&argv("up"))));
         assert_eq!(expanded(ext.resolve(&argv("issue up"))), argv("issue list"));
@@ -1962,9 +2235,23 @@ http_unix_socket:
         .unwrap();
         let a = GhAliases::load(&env);
         assert!(a.unreadable().is_none());
-        assert!(refused(&a.resolve(&argv("myext"))));
+        // A directory extension: gh registers it, and it runs instead of the alias.
+        assert_eq!(a.resolve(&argv("myext")), Resolution::NotAlias);
         assert_eq!(expanded(a.resolve(&argv("up"))), argv("pr list"));
         assert_eq!(a.resolve(&argv("co 3")), Resolution::NotAlias);
+        // A binary extension's manifest, or a regular file, can make gh register none.
+        let manifest = dir.join("data/gh/extensions/gh-bin/manifest.yml");
+        std::fs::create_dir_all(manifest.parent().unwrap()).unwrap();
+        std::fs::write(&manifest, "owner: o\n").unwrap();
+        assert!(refused(&GhAliases::load(&env).resolve(&argv("myext"))));
+        std::fs::remove_file(&manifest).unwrap();
+        assert_eq!(
+            GhAliases::load(&env).resolve(&argv("myext")),
+            Resolution::NotAlias
+        );
+        std::fs::write(dir.join("data/gh/extensions/gh-file"), "").unwrap();
+        assert!(refused(&GhAliases::load(&env).resolve(&argv("myext"))));
+        std::fs::remove_file(dir.join("data/gh/extensions/gh-file")).unwrap();
         std::fs::write(
             dir.join("cfg/config.yml"),
             "aliases:\n  up: !!str pr list\n",

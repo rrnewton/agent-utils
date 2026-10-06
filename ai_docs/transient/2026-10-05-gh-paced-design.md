@@ -763,8 +763,8 @@ the values they consume), applies gh 2.97's rules for which names can be
 aliases (not a built-in command, extensions win over aliases, `co` defaults to
 `pr checkout` when no alias is set), and expands nested aliases up to 5 deep.
 The fully expanded argv is what is classified, snapshotted, guarded, audited
-and passed to gh, so gh never re-reads an alias body that gh-paced did not
-see. A `!` shell alias is passed to gh as typed and stays opaque WRITE, with
+and passed to gh (gh still reads its configuration again when it runs; round 6
+declares a change in between out of scope, see below). A `!` shell alias is passed to gh as typed and stays opaque WRITE, with
 every argument inspected, because gh runs it with `sh -c`.
 
 Doubt refuses. The YAML reader is a subset of libyaml: any construct it does
@@ -809,10 +809,76 @@ instead of none, and an alias loop is now refused instead of expanding until
 the depth limit. The other changes in them are the new return types. No other
 existing assertion changed.
 
-New residual risk: gh reads `config.yml` again when it runs. An expanded alias
-is unaffected, since gh receives built-in commands only, but a shell alias
-(passed by name) or a command gh-paced found not to be an alias can mean
-something else if the file changes in between.
+gh reads `config.yml` and its extensions directory again when it runs. Round 6
+showed that this matters for expanded aliases too, and the coordinator
+declared it out of scope; see round 6.
+
+## Round 6 and what changed
+
+Round 6 reviewed `24f7842b` and returned CHANGES REQUESTED: 4 blockers, 3
+majors and 1 minor. Three blockers and all three majors were places where
+gh-paced read gh's aliases differently from gh. The fix follows the round-5
+rule: where gh-paced cannot be sure what gh reads, it refuses.
+
+| Round-6 finding | Now | Test (the CLI tests fail on `24f7842b`'s `alias.rs`) |
+| --- | --- | --- |
+| blocker: a `config.yml` with NEL (U+0085) line breaks or a second byte order mark was read as one line by gh-paced and as several by gh, so gh could run an alias gh-paced never saw | gh-paced refuses to read any configuration holding NEL, LS (U+2028), PS (U+2029), a byte order mark after the first character, a control character, U+FFFE/U+FFFF, or a `---`/`...` document marker after the first setting: possible aliases exit 78 | `cli::a_configuration_with_line_breaks_gh_reads_differently_is_refused` |
+| blocker: a quoted alias name with a space in its last word (`"issue 'publish hidden'"`) runs in gh as `gh issue publish`, because cobra names a command by its `Use` up to the first space | the name is placed under its first word, as cobra does; if gh also has a command of that word (a built-in or an extension), which one cobra finds first is not known, so it is refused (exit 64); a name with an empty first word is ignored, as gh cannot invoke it | `cli::an_alias_name_with_a_space_runs_as_its_first_word`, `alias::an_alias_word_with_a_space_runs_as_its_first_word` |
+| blocker: a `GH_CONFIG_DIR` that is not UTF-8 was treated as unset, so gh-paced read `~/.config/gh` while gh read the other directory | a non-UTF-8 `GH_CONFIG_DIR`, `XDG_CONFIG_HOME`, `XDG_DATA_HOME` or `HOME` makes the configuration unreadable: possible aliases exit 78 | `cli::a_gh_config_dir_that_is_not_utf8_refuses_possible_aliases`, `alias::a_lookup_variable_that_is_not_utf8_makes_the_configuration_unreadable` |
+| blocker: gh reads `config.yml` again after admission, so a file rewritten while the call waits can make gh run something else, expanded aliases included | out of scope, by coordinator decision (below); no code change | none |
+| major: plain YAML scalars starting with `-`, `?` or `:` followed by a non-blank (`-x: issue list`) were unreadable, so valid gh configurations refused | read as libyaml reads them in block context | `cli::aliases_starting_with_dash_question_or_colon_are_read`, `alias::reads_plain_scalars_starting_with_dash_question_or_colon` |
+| major: an alias named like an installed extension was refused, while gh runs the extension | the extension runs (not treated as an alias) when gh-paced is sure gh registers its extensions; gh registers none when one entry of the extensions directory fails to load, so this needs every `gh-*` entry to be a symbolic link or a directory without `manifest.yml`; otherwise the alias is still refused (exit 64) | `cli::an_extension_runs_instead_of_an_alias_of_its_name`, `alias::an_extension_runs_instead_of_an_alias_of_its_name` |
+| major: an alias gh would reject for its arguments was refused with a reason quoting the expansion, which can hold a body, into stderr and the audit log | the reason names the alias only | `cli::a_refused_alias_keeps_its_expansion_out_of_the_records`, `alias::a_refusal_does_not_repeat_the_expansion` |
+| minor: `classify --help` said every refusal a real run makes is shown; the user guide still said ordinary aliases get opaque redaction | the help names the refusals classify computes and those only a real run makes (content 65, budget and wait 75, unreadable configuration 78); the guide says an expanded alias is recorded with its expansion's redactions | none (text) |
+
+**Out of scope: gh reading its configuration again.** gh-paced reads gh's
+`config.yml` and extensions directory once, before admission. gh reads both
+again when it runs. Anything that changes them in between, such as a process
+rewriting `~/.config/gh` while a call waits for a slot, can make gh run a
+command other than the one gh-paced classified and guarded: a different
+expansion of a name gh-paced expanded, an alias that shadows a command
+gh-paced passed through, or a changed shell alias. gh-paced paces well-meaning
+agents; a process rewriting gh's configuration under a waiting call is not in
+its threat model, and gh-paced makes no guarantee about it.
+
+The same commit fixes five round-5 majors (finding numbers from the round-5
+report):
+
+| Round-5 finding | Now | Test |
+| --- | --- | --- |
+| F5: the editor reset the size allowance, so a call could send 8 KiB on its command line and 8 KiB more from the editor | the wrapper passes the bytes the arguments used (`GH_PACED_BODY_BYTES_USED`) to the editor shim, and all files saved in one editor session are checked together against one `max_body_bytes` | `guard::editor_text_shares_the_allowance_with_the_arguments`, `cli::text_written_in_the_editor_is_checked` (extended) |
+| F6: single-case base64 (1,200 `A`s) wrapped at varying widths passed | a line counts toward the varying-width block when it holds an upper-case letter or repeats one character | `guard::varying_narrow_wrapping_is_detected` (extended) |
+| F14: a duration of 1e308 in the config panicked | `cooldown_secs`, `plain_403_cooldown_secs`, `max_wait_secs`, `min_watch_interval_secs` and `GH_PACED_MAX_WAIT` must be at most 604,800 s (7 days), the rate-limit refresh timeout at most 3,600 s, and a `Retry-After` is capped at 86,400 s | `config::durations_must_be_representable`, `pushback::a_huge_retry_after_is_capped_not_infinite` |
+| F16: `workflow run --json --json=false` kept a stdin source | the last `--json` occurrence decides | `guard::a_later_false_json_flag_drops_the_stdin_source` |
+| F18: the copy kept of a refused edit had no size bound | at most 1 MiB is kept, and the refusal says the rest was not copied | `editor::refused_text_is_kept_up_to_a_bound` |
+
+Test changes in this commit:
+
+- `cli::text_written_in_the_editor_is_checked`: the expected refusal for a
+  20,000-byte edit is now `write body is 20005 bytes across 1 source(s)
+  (including 5 bytes given on the command line)`, because the 5-byte title now
+  counts (F5). The test also gains the shared-allowance cases.
+- `alias::uncertain_names_are_refused`: the extension case is built with
+  `certain: false`, the case where gh may register no extension, so its
+  refusal is still asserted; a `certain: true` extension now runs instead.
+- `alias::loads_aliases_and_extensions_from_disk`: `myext`, a directory
+  extension without `manifest.yml`, is now not an alias (gh runs the
+  extension) instead of refused. The test adds the cases that keep it refused:
+  a binary extension's `manifest.yml`, and a regular file, among the entries.
+- `tests/replay.rs`: the two hand-built wrapper options gain
+  `body_bytes_used: 0`; no assertion changed.
+
+No other existing assertion changed.
+
+Still open from round 5 (11 majors, finding numbers from the round-5 report):
+F2 pagination whose real request count exceeds its charge; F7 a lock timeout
+dropping an observed cooldown; F8 drainers inheriting descriptors; F9 the
+drainer losing a pushback phrase split across the handoff; F10 unbounded pipe
+readers in the rate-limit refresh; F11 a failed refresh keeping a stale healthy
+snapshot; F12 wall-clock steps refilling budgets; F13 `GH_PACED_MAX_WAIT`
+counting requested sleeps rather than elapsed waiting; F15 `--label -L50001`
+charged as a limit; F17 `--editor` forms refused; F19 terminal window size not
+passed on.
 
 ## Test changes worth a reviewer's attention
 
@@ -947,5 +1013,6 @@ pagination and limit costs, watch loops, alias inspection), adds one test
 - With `--paginate`, a page body containing a CRLF header block can start an
   unneeded cooldown.
 - No crash-injection test for quarantine (see round 3).
-- The 16 round-5 majors listed under round 5 are open.
-- gh re-reads its aliases when it runs (see round 5).
+- 11 round-5 majors are open (listed at the end of round 6).
+- gh reads its configuration again when it runs; a change while a call waits
+  is out of scope (see round 6).

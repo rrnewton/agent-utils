@@ -1942,6 +1942,150 @@ fn an_unreadable_gh_configuration_refuses_only_possible_aliases() {
     assert_eq!(sb.starts().len(), 1, "{:?}", sb.starts());
 }
 
+/// gh names an alias command after the first space-separated word of its last name word, so
+/// `"issue 'publish hidden'"` runs as `gh issue publish`. Before, gh-paced looked for the whole
+/// word, passed `issue publish` (and an alias expanding to it) to gh unexpanded, and gh ran an
+/// unchecked watch loop.
+#[test]
+fn an_alias_name_with_a_space_runs_as_its_first_word() {
+    let sb = Sandbox::new("alias-space", FAST);
+    write_gh_config(
+        &sb,
+        "aliases:\n  a: issue publish\n  \"issue 'publish hidden'\": run watch 99 --interval 1\n",
+    );
+    for args in [&["a"][..], &["issue", "publish"][..]] {
+        let o = sb.run(args, &[]);
+        assert_eq!(o.status.code(), Some(64), "{args:?}: {}", stderr(&o));
+        assert!(
+            stderr(&o).contains("GH_PACED_ALLOW_WATCH=1"),
+            "{args:?}: {}",
+            stderr(&o)
+        );
+    }
+    assert!(sb.starts().is_empty(), "gh ran: {:?}", sb.starts());
+    // A first word that is also a built-in command's: which of the two gh runs is not known.
+    write_gh_config(&sb, "aliases:\n  \"issue 'view all'\": issue list\n");
+    let o = sb.run(&["issue", "view", "1"], &[]);
+    assert_eq!(o.status.code(), Some(64), "{}", stderr(&o));
+    assert!(sb.starts().is_empty(), "gh ran: {:?}", sb.starts());
+}
+
+/// YAML keys and values may start with `-`, `?` or `:` when a non-blank character follows, as
+/// gh's YAML library reads them; before, gh-paced refused the whole file (exit 78).
+#[test]
+fn aliases_starting_with_dash_question_or_colon_are_read() {
+    let sb = Sandbox::new("alias-indicator", FAST);
+    write_gh_config(
+        &sb,
+        "aliases:\n  pv: -R o/r pr view\n  ?w: run watch 99\n  :w: run watch 98\n",
+    );
+    let o = sb.run(&["pv", "1"], &[]);
+    assert_eq!(o.status.code(), Some(0), "{}", stderr(&o));
+    let starts = sb.starts();
+    assert_eq!(starts.len(), 1, "{starts:?}");
+    assert_eq!(starts[0].1, "-R o/r pr view 1");
+    for alias in ["?w", ":w"] {
+        let o = sb.run(&[alias], &[]);
+        assert_eq!(o.status.code(), Some(64), "{alias}: {}", stderr(&o));
+        assert!(
+            stderr(&o).contains("GH_PACED_ALLOW_WATCH=1"),
+            "{alias}: {}",
+            stderr(&o)
+        );
+    }
+    assert_eq!(sb.starts().len(), 1, "{:?}", sb.starts());
+}
+
+/// libyaml reads NEL as a line break and skips a byte order mark at the start of any line, so
+/// gh can see an alias that a line-by-line reader misses. Such a file is refused, not guessed.
+#[test]
+fn a_configuration_with_line_breaks_gh_reads_differently_is_refused() {
+    let sb = Sandbox::new("alias-nel", FAST);
+    for text in [
+        "aliases:\n  w: \"run\u{85}    watch 99 --interval 1\"\n",
+        "aliases:\n  co: pr checkout\u{85}  w: run watch 99\n",
+        "\u{feff}\u{feff}aliases:\n  w: run watch 99\n",
+    ] {
+        write_gh_config(&sb, text);
+        let o = sb.run(&["w"], &[]);
+        assert_eq!(o.status.code(), Some(78), "{text:?}: {}", stderr(&o));
+        assert!(
+            stderr(&o).contains("gh's configuration cannot be read"),
+            "{text:?}: {}",
+            stderr(&o)
+        );
+    }
+    assert!(sb.starts().is_empty(), "gh ran: {:?}", sb.starts());
+}
+
+/// `GH_CONFIG_DIR` holding bytes that are not UTF-8 is still where gh reads its aliases; before,
+/// gh-paced took it as unset, read `$HOME/.config/gh` instead and passed the alias through.
+#[test]
+fn a_gh_config_dir_that_is_not_utf8_refuses_possible_aliases() {
+    use std::os::unix::ffi::OsStrExt;
+    let sb = Sandbox::new("alias-nonutf8", FAST);
+    let dir = sb.path("").join(std::ffi::OsStr::from_bytes(b"cfg-\xff"));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("config.yml"), "aliases:\n  up: run watch 99\n").unwrap();
+    let o = sb.cmd(&["up"]).env("GH_CONFIG_DIR", &dir).output().unwrap();
+    assert_eq!(o.status.code(), Some(78), "{}", stderr(&o));
+    assert!(
+        stderr(&o).contains("`GH_CONFIG_DIR` is not UTF-8"),
+        "{}",
+        stderr(&o)
+    );
+    assert!(sb.starts().is_empty(), "gh ran: {:?}", sb.starts());
+    let o = sb
+        .cmd(&["pr", "view", "1"])
+        .env("GH_CONFIG_DIR", &dir)
+        .output()
+        .unwrap();
+    assert_eq!(o.status.code(), Some(0), "{}", stderr(&o));
+    assert_eq!(sb.starts().len(), 1, "{:?}", sb.starts());
+}
+
+/// An installed extension runs instead of an alias of the same name, as in gh; before, gh-paced
+/// refused the call (exit 64). An entry that can make gh register no extension keeps it refused.
+#[test]
+fn an_extension_runs_instead_of_an_alias_of_its_name() {
+    let sb = Sandbox::new("alias-ext", FAST);
+    let exts = sb.path("home/.local/share/gh/extensions");
+    std::fs::create_dir_all(exts.join("gh-myext")).unwrap();
+    write_gh_config(&sb, "aliases:\n  myext: run watch 99\n");
+    let o = sb.run(&["myext", "x"], &[]);
+    assert_eq!(o.status.code(), Some(0), "{}", stderr(&o));
+    let starts = sb.starts();
+    assert_eq!(starts.len(), 1, "{starts:?}");
+    assert_eq!(starts[0].1, "myext x");
+    std::fs::write(exts.join("gh-other"), "").unwrap();
+    let o = sb.run(&["myext", "x"], &[]);
+    assert_eq!(o.status.code(), Some(64), "{}", stderr(&o));
+    assert_eq!(sb.starts().len(), 1, "{:?}", sb.starts());
+}
+
+/// A refused alias's expansion can hold a body; the refusal names the alias and keeps the
+/// expansion out of the audit log and the banner.
+#[test]
+fn a_refused_alias_keeps_its_expansion_out_of_the_records() {
+    let sb = Sandbox::new("alias-leak", FAST);
+    write_gh_config(
+        &sb,
+        "aliases:\n  post: issue comment $1 --body CANARY_PRIVATE_BODY\n",
+    );
+    let o = sb.run(&["post"], &[]);
+    assert_eq!(o.status.code(), Some(64), "{}", stderr(&o));
+    assert!(stderr(&o).contains("the alias `post`"), "{}", stderr(&o));
+    assert!(
+        !stderr(&o).contains("CANARY_PRIVATE_BODY"),
+        "{}",
+        stderr(&o)
+    );
+    let audit = std::fs::read_to_string(sb.path("state/test.audit.jsonl")).unwrap();
+    assert!(audit.contains("gh alias:"), "{audit}");
+    assert!(!audit.contains("CANARY_PRIVATE_BODY"), "{audit}");
+    assert!(sb.starts().is_empty(), "gh ran: {:?}", sb.starts());
+}
+
 /// An editor script at a path with a space in it, so the quoting gh-paced adds is exercised. It
 /// checks its own argument and replaces the file gh gave it with `$FAKE_EDITOR_TEXT`.
 fn fake_editor(sb: &Sandbox) -> String {
@@ -1989,7 +2133,10 @@ fn text_written_in_the_editor_is_checked() {
     let err = stderr(&o);
     assert_eq!(o.status.code(), Some(1), "{err}");
     assert!(
-        err.contains("GH-PACED REFUSED [test] content guard: write body is 20000 bytes"),
+        err.contains(
+            "GH-PACED REFUSED [test] content guard: write body is 20005 bytes across 1 \
+             source(s) (including 5 bytes given on the command line)"
+        ),
         "{err}"
     );
     assert!(
@@ -2032,6 +2179,49 @@ fn text_written_in_the_editor_is_checked() {
         .collect();
     assert_eq!(edited.len(), 1, "{edited:?}");
     assert_eq!(edited[0].2, note.len().to_string());
+    // The editor text and the arguments share one allowance. An 8,000-byte body passes after a
+    // 5-byte title, but a 200-byte title on the same call pushes the total over 8,192.
+    let body = "word ".repeat(1600);
+    let o = run(&["issue", "create", "-t", "title"], &body, &[]);
+    assert_eq!(o.status.code(), Some(0), "{}", stderr(&o));
+    let title = "word ".repeat(40);
+    let o = run(&["issue", "create", "-t", &title], &body, &[]);
+    let err = stderr(&o);
+    assert_eq!(o.status.code(), Some(1), "{err}");
+    assert!(
+        err.contains(
+            "write body is 8200 bytes across 1 source(s) (including 200 bytes given on the \
+             command line), over the 8192-byte limit"
+        ),
+        "{err}"
+    );
+    // The wrapper sets the allowance variable for its child itself, replacing a caller's value.
+    let o = run(
+        &["issue", "create", "-t", "title"],
+        note,
+        &[("GH_PACED_BODY_BYTES_USED", "lots")],
+    );
+    assert_eq!(o.status.code(), Some(0), "{}", stderr(&o));
+    // The guard itself refuses a value that is not a byte count rather than counting it as 0.
+    std::fs::write(&edit_file, note).unwrap();
+    let o = Command::new(BIN)
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .env("HOME", sb.path("home"))
+        .env("GH_PACED_STATE_DIR", sb.path("state"))
+        .env("GH_PACED_CONFIG", sb.path("config.json"))
+        .env("GH_PACED_EDITOR", "true")
+        .env("GH_PACED_BODY_BYTES_USED", "lots")
+        .args(["--edit-guard", "test", edit_file.as_str()])
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert_eq!(o.status.code(), Some(78), "{}", stderr(&o));
+    assert!(
+        stderr(&o).contains("GH_PACED_BODY_BYTES_USED=\"lots\" is not a byte count"),
+        "{}",
+        stderr(&o)
+    );
     // A GH_EDITOR the caller set is the editor the guard runs.
     let o = run(
         &["issue", "create", "-t", "title"],

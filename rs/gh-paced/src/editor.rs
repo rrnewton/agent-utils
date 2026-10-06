@@ -20,6 +20,12 @@ pub const EDIT_GUARD_FLAG: &str = "--edit-guard";
 /// Environment variable carrying the editor the user would have had without gh-paced.
 pub const ORIGINAL_EDITOR_VAR: &str = "GH_PACED_EDITOR";
 
+/// Environment variable carrying the body bytes the gh call already gave on its command line
+/// (set by the wrapper for every WRITE call), so the editor text is checked against what is
+/// left of the same `max_body_bytes` allowance. Unset counts as 0; a value that is not a byte
+/// count refuses the text.
+pub const PRIOR_BYTES_VAR: &str = "GH_PACED_BODY_BYTES_USED";
+
 /// The editor gh would use, in gh's order: `GH_EDITOR`, the `editor` key of gh's
 /// configuration file, `GIT_EDITOR`, `VISUAL`, `EDITOR`, then `nano`.
 pub fn gh_editor(env: &dyn Fn(&str) -> Option<String>) -> String {
@@ -108,6 +114,24 @@ fn keep_copy(env: &dyn Fn(&str) -> Option<String>, account: &str, text: &[u8]) -
     Some(path.display().to_string())
 }
 
+/// Most bytes of refused editor text kept in the state directory (1 MiB). The guard reads at
+/// most this much more than the content limit, however large the saved file is.
+pub const MAX_KEPT_EDIT_BYTES: u64 = 1 << 20;
+
+/// Read at most [`MAX_KEPT_EDIT_BYTES`] of `path`; the flag is true when the file is longer.
+fn kept_text(path: &str) -> Option<(Vec<u8>, bool)> {
+    use std::io::Read;
+    let mut text = Vec::new();
+    std::fs::File::open(path)
+        .ok()?
+        .take(MAX_KEPT_EDIT_BYTES + 1)
+        .read_to_end(&mut text)
+        .ok()?;
+    let longer = text.len() as u64 > MAX_KEPT_EDIT_BYTES;
+    text.truncate(MAX_KEPT_EDIT_BYTES as usize);
+    Some((text, longer))
+}
+
 /// `gh-paced --edit-guard ACCOUNT FILE...`: run the original editor on the files gh passed, then
 /// check what was saved. Returns the exit status for gh: the editor's own failure, 65 when the
 /// text is refused, 0 when gh may use it.
@@ -134,6 +158,22 @@ pub fn run_guard(args: &[String], env: &dyn Fn(&str) -> Option<String>, cfg: &Co
             );
             return crate::cli::EXIT_CONFIG;
         }
+    };
+    let prior = match env(PRIOR_BYTES_VAR) {
+        None => 0,
+        Some(v) => match v.trim().parse::<u64>() {
+            Ok(n) => n,
+            Err(_) => {
+                refuse(
+                    account,
+                    &[format!(
+                        "{PRIOR_BYTES_VAR}={v:?} is not a byte count, so the editor text cannot \
+                         be checked against what is left of the write limit"
+                    )],
+                );
+                return crate::cli::EXIT_CONFIG;
+            }
+        },
     };
     if words.iter().any(|w| w == EDIT_GUARD_FLAG) {
         refuse(
@@ -162,32 +202,33 @@ pub fn run_guard(args: &[String], env: &dyn Fn(&str) -> Option<String>, cfg: &Co
     if cfg.allow_large_body {
         return 0;
     }
+    let Verdict::Refuse(reason) = guard::check_composed_files(files, cfg, prior) else {
+        return 0;
+    };
+    let mut lines = vec![
+        format!("content guard: {reason}"),
+        format!(
+            "the text saved in the editor was not used, and gh stops here (exit {})",
+            crate::wrapper::EXIT_CONTENT
+        ),
+    ];
     for f in files {
-        if let Verdict::Refuse(reason) = guard::check_composed_file(f, cfg) {
-            let mut lines = vec![
-                format!("content guard: {reason}"),
-                format!(
-                    "the text saved in the editor was not used, and gh stops here (exit {})",
-                    crate::wrapper::EXIT_CONTENT
-                ),
-            ];
-            match std::fs::read(f)
-                .ok()
-                .and_then(|t| keep_copy(env, account, &t))
-            {
-                Some(p) => lines.push(format!("your text is kept in {p}")),
-                None => lines.push("your text could not be kept: gh deletes its file".to_string()),
-            }
-            lines.push(
-                "GitHub text is for short human notes. Keep evidence on the host and post a \
-                 pointer (path + sha256, a tracked file, or a commit)."
-                    .to_string(),
-            );
-            refuse(account, &lines);
-            return crate::wrapper::EXIT_CONTENT;
+        match kept_text(f).and_then(|(t, longer)| Some((keep_copy(env, account, &t)?, longer))) {
+            Some((p, false)) => lines.push(format!("your text is kept in {p}")),
+            Some((p, true)) => lines.push(format!(
+                "the first {MAX_KEPT_EDIT_BYTES} bytes of your text are kept in {p}; the rest \
+                 was not copied, and gh deletes its file"
+            )),
+            None => lines.push("your text could not be kept: gh deletes its file".to_string()),
         }
     }
-    0
+    lines.push(
+        "GitHub text is for short human notes. Keep evidence on the host and post a pointer \
+         (path + sha256, a tracked file, or a commit)."
+            .to_string(),
+    );
+    refuse(account, &lines);
+    crate::wrapper::EXIT_CONTENT
 }
 
 #[cfg(test)]
@@ -201,6 +242,33 @@ mod tests {
             .map(|(k, v)| (k.to_string(), v.to_string()))
             .collect();
         move |k: &str| m.get(k).cloned()
+    }
+
+    /// Refused text is copied with a bound: a huge saved file is never read whole.
+    #[test]
+    fn refused_text_is_kept_up_to_a_bound() {
+        let dir = std::env::temp_dir().join(format!("gh-paced-kept-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let small = dir.join("small.md");
+        std::fs::write(&small, b"short note\n").unwrap();
+        assert_eq!(
+            kept_text(small.to_str().unwrap()),
+            Some((b"short note\n".to_vec(), false))
+        );
+        let big = dir.join("big.md");
+        let f = std::fs::File::create(&big).unwrap();
+        // A sparse 4 GiB file: reading it whole would take 4 GiB of memory.
+        f.set_len(4 << 30).unwrap();
+        let (text, longer) = kept_text(big.to_str().unwrap()).unwrap();
+        assert_eq!(text.len() as u64, MAX_KEPT_EDIT_BYTES);
+        assert!(longer);
+        let exact = dir.join("exact.md");
+        std::fs::write(&exact, vec![b'x'; MAX_KEPT_EDIT_BYTES as usize]).unwrap();
+        let (text, longer) = kept_text(exact.to_str().unwrap()).unwrap();
+        assert_eq!(text.len() as u64, MAX_KEPT_EDIT_BYTES);
+        assert!(!longer);
+        assert_eq!(kept_text(dir.join("missing").to_str().unwrap()), None);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

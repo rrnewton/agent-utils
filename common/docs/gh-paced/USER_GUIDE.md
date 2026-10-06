@@ -128,7 +128,9 @@ gh-paced's own exit statuses are listed under [Exit status](#exit-status).
 
 Each call gets exactly one class. Each class except LOCAL has its own token
 bucket and hourly window. `gh-paced classify -- <args>` prints the class, the
-cost, and the reason for any command line, without running it.
+cost, and the reason for any command line, without running it. It shows the
+refusals decided from the command line alone; a real run can still refuse for
+the body, the budget or the wait.
 
 | Class | Covers | Cost |
 | --- | --- | --- |
@@ -136,7 +138,7 @@ cost, and the reason for any command line, without running it.
 | READ | `gh api` with GET, HEAD or OPTIONS; `gh api graphql` whose query has no `mutation`; `pr view/list/status/checks/diff/checkout`; `issue view/list/status`; `run view/list/download/watch` (a watch needs `GH_PACED_ALLOW_WATCH=1`, see below); `workflow view/list`; `repo view/list/clone/set-default/gitignore/license`; `release view/list/download/verify`; the `list` and `view` forms of `label`, `gist`, `secret`, `variable`, `cache`, `ssh-key`, `gpg-key`, `org`, `project`, `ruleset`, `codespace`, `extension`; `auth status`; `browse`; `credits` | 1 |
 | READ | `gh status` (it makes several GraphQL and REST read requests, more as notifications grow) | 10, the default READ burst |
 | SEARCH | `gh search ...`, `gh extension search`, `gh api search/...` | 1 |
-| WRITE | `gh api` with POST, PATCH, PUT or DELETE; `gh api` with any `-f`, `-F`, `--raw-field`, `--field` or `--input` and no explicit `-X GET` (gh sends those as POST); a GraphQL mutation, or a GraphQL request that cannot be inspected (a query on stdin, `--input -`, a nested `query[...]` field); `pr create/comment/edit/merge/close/reopen/review/ready`; `issue create/comment/edit/close/reopen/delete/transfer/lock`; `label`, `release`, `gist`, `secret`, `variable` changes; `workflow run`; `run rerun/cancel`; `repo create/edit/delete/fork`; **every command gh-paced does not recognise** (aliases, including an alias beneath one of gh's groups such as `issue publish`, extensions, new gh subcommands), and the commands that hand their arguments to another program (`extension exec`, `copilot`), even with `--help`, because an alias or extension may turn that argument into anything | 1 |
+| WRITE | `gh api` with POST, PATCH, PUT or DELETE; `gh api` with any `-f`, `-F`, `--raw-field`, `--field` or `--input` and no explicit `-X GET` (gh sends those as POST); a GraphQL mutation, or a GraphQL request that cannot be inspected (a query on stdin, `--input -`, a nested `query[...]` field); `pr create/comment/edit/merge/close/reopen/review/ready`; `issue create/comment/edit/close/reopen/delete/transfer/lock`; `label`, `release`, `gist`, `secret`, `variable` changes; `workflow run`; `run rerun/cancel`; `repo create/edit/delete/fork`; **every command gh-paced does not recognise** (shell aliases, including one beneath one of gh's groups such as `issue publish`, extensions, new gh subcommands; an ordinary alias takes the class of its expansion), and the commands that hand their arguments to another program (`extension exec`, `copilot`), even with `--help`, because an alias or extension may turn that argument into anything | 1 |
 | GIT_CREDENTIAL | `gh auth git-credential get`, which git calls before each network operation | 1 |
 
 For a GraphQL call, every document gh might send is inspected: each `-f/-F
@@ -334,7 +336,8 @@ reads is still found. It looks for:
 - `secondary rate limit`, `rate limit` (including `API rate limit exceeded`),
   `HTTP 429`, the word `abuse`, `submitted too quickly`;
 - `HTTP 403` with none of the above;
-- a `Retry-After: N` value (the largest one seen).
+- a `Retry-After: N` value (the largest one seen, counted as at most 86,400 s,
+  so an absurd value still pauses the account for a day instead of forever).
 
 For `gh api -i/--include`, gh prints the HTTP status line and response headers
 on **stdout** instead. For that form only, gh-paced also reads stdout as it
@@ -496,9 +499,10 @@ inside its own process: with `upload: api -X POST repos/o/r/issues/$1/comments
 the alias (`$1`-style placeholders, leftover arguments appended, aliases of
 aliases followed up to 5 deep), and runs gh with the expanded command line.
 Classification, budgets, the watch rules, the content guard and the snapshots
-all apply to the expansion, and gh never sees the alias name, so it cannot
-expand it differently. `gh-paced classify` shows the expansion on an `alias:`
-line.
+all apply to the expansion, and gh is given the expanded command line instead
+of the alias name. `gh-paced classify` shows the expansion on an `alias:`
+line. gh reads its configuration again when it runs; see
+[Limitations](#limitations) for what that leaves open.
 
 gh's configuration file is found the way gh finds it: `$GH_CONFIG_DIR`,
 `$XDG_CONFIG_HOME/gh`, or `$HOME/.config/gh` (a path relative to the working
@@ -506,7 +510,10 @@ directory when `HOME` is empty). A missing or empty file means gh's single
 default alias, `co: pr checkout`. An alias name is placed the way gh adds it:
 beneath gh's own groups only (`issue publish`, `cs mine` beneath `codespace`),
 never in place of one of gh's commands, and it is found after flags gh skips
-while looking for a command (`gh issue -R o/r publish`).
+while looking for a command (`gh issue -R o/r publish`). A quoted last word
+with a space in it is invoked by its first word, as gh names the command
+(`"issue 'publish now'"` runs as `gh issue publish`). An installed extension
+wins over a root alias of the same name, as in gh: the extension runs.
 
 A shell alias (`!...`) is passed to gh by name and charged one WRITE token; gh
 runs it with `sh -c`, and any `gh` it runs is paced only if that `gh` resolves
@@ -517,17 +524,27 @@ guessing:
 
 - gh's `config.yml` cannot be read, is larger than 1 MiB, or uses YAML that
   gh-paced does not read (tags, anchors, merge keys, nested collections, tabs
-  in the indentation, a key set twice): any word that could name an alias is
-  refused with exit 78; gh's own commands and installed extensions still run;
+  in the indentation, a key set twice, a byte order mark after the first
+  character, the NEL, LS or PS line separators, control characters, a `---`
+  or `...` document marker after the first setting), or one of `GH_CONFIG_DIR`,
+  `XDG_CONFIG_HOME`, `XDG_DATA_HOME` and `HOME` is not UTF-8: any word that
+  could name an alias is refused with exit 78; gh's own commands and installed
+  extensions still run;
 - the position of the alias name depends on whether an unfamiliar flag before
   it takes a value (`gh issue --some-flag publish`): exit 64; put the alias
   name right after the command words;
-- two aliases with the same name and different expansions, an alias named like
-  an installed extension (or any root alias when the extensions directory
-  cannot be listed), an alias named `help`, an alias beneath a word gh-paced
-  does not know as one of gh's commands, aliases nested more than 5 deep or in
-  a loop, or an expansion gh would reject for these arguments (a `$2` with one
-  argument, an open quote): exit 64.
+- two aliases with the same name and different expansions, an alias whose
+  name gives gh a second command of the same name (`"issue 'view all'"`
+  beside `gh issue view`, or `"'myext now'"` beside an extension `myext`), an
+  alias named like an installed extension that gh might not register (gh
+  registers no extension when one entry of its extensions directory cannot be
+  read; gh-paced is sure only when every `gh-*` entry is a directory without a
+  `manifest.yml` or a symbolic link), any root alias when the extensions
+  directory cannot be listed, an alias named `help`, an alias beneath a word
+  gh-paced does not know as one of gh's commands, aliases nested more than 5
+  deep or in a loop, or an expansion gh would reject for these arguments (a
+  `$2` with one argument, an open quote): exit 64. The refusal names the alias
+  but not its expansion, which can hold a body.
 
 ### Bodies gh composes itself
 
@@ -571,11 +588,16 @@ would otherwise have had in `GH_PACED_EDITOR`. That is gh's own choice, in
 gh's order: `GH_EDITOR`, the `editor` key of gh's `config.yml`, `GIT_EDITOR`,
 `VISUAL`, `EDITOR`, then `nano`. When gh opens an editor, it runs the guard,
 which runs your editor on the same file, waits for it, and then checks the
-saved text with the same size and base64 limits as any other body. If the text
-passes, gh carries on as usual. If it fails, the guard prints a `GH-PACED
-REFUSED` banner, keeps a private copy of the text in the state directory as
-`<account>.refused-edit.<nanoseconds>.md` (gh deletes its own file), and exits
-65. gh then abandons the command, sends nothing, and exits with its own status
+saved text with the same size and base64 limits as any other body. The size
+limit is one allowance for the whole call: gh-paced passes the number of body
+bytes the command line already used (for example a `--title`) to the guard in
+`GH_PACED_BODY_BYTES_USED`, and the editor text is checked against what is left.
+A value there that is not a byte count is refused (exit 78). If the text passes,
+gh carries on as usual. If it fails, the guard prints a `GH-PACED REFUSED`
+banner, keeps a private copy of the text in the state directory as
+`<account>.refused-edit.<nanoseconds>.md` (gh deletes its own file; at most the
+first 1 MiB is kept, and the banner says when the rest was not copied), and
+exits 65. gh then abandons the command, sends nothing, and exits with its own status
 (usually 1), not 65.
 
 A gh-paced started inside another one's gh keeps the outer guard rather than
@@ -663,6 +685,12 @@ Settings come from three layers, applied in order:
    `GH_PACED_LOCK_WAIT`, which accept any value in their range because they
    decide how long a caller is willing to wait, not how fast GitHub is called.
 
+Every duration must be a finite number of seconds no longer than 7 days
+(604,800 s): `cooldown_secs`, `plain_403_cooldown_secs`, `max_wait_secs`,
+`min_watch_interval_secs` and `GH_PACED_MAX_WAIT`. `rate_limit_timeout_secs` is
+at most 3,600 s. A longer value is a configuration error (exit 78), so no
+deadline computed from it can overflow.
+
 Config file keys, with defaults:
 
 ```json
@@ -722,7 +750,7 @@ Environment variables:
 | --- | --- |
 | `GH_PACED_ACCOUNT` | default for `--account` |
 | `GH_PACED_REAL_GH` | default for `--real-gh` |
-| `GH_PACED_MAX_WAIT` | longest total sleep before refusing, seconds (default 900) |
+| `GH_PACED_MAX_WAIT` | longest total sleep before refusing, seconds (default 900, at most 604,800); a larger value is an error (exit 78) |
 | `GH_PACED_LOCK_WAIT` | longest wait for the state lock, seconds (default 30, 0.1 to 3,600); then exit 70 |
 | `GH_PACED_{READ,SEARCH,WRITE,GIT}_{PER_MINUTE,BURST,PER_HOUR}` | tighten one budget |
 | `GH_PACED_PAGINATE_COST` | raise the `--paginate` cost |
@@ -767,7 +795,8 @@ account:
   behind by a killed wrapper does not linger; any other `snap-*` directory is
   removed once it is a day old.
 - `<account>.refused-edit.<nanoseconds>.md` is a copy of text the editor guard
-  refused (see [Text written in gh's editor](#text-written-in-ghs-editor)).
+  refused, at most its first 1 MiB (see
+  [Text written in gh's editor](#text-written-in-ghs-editor)).
   gh-paced never removes these; delete them when you have recovered the text.
 
 The state file is replaced atomically (written to a temporary file, then
@@ -792,10 +821,12 @@ class, cost, command, a redacted argument summary, exit status, seconds waited,
 and a short detail. In the argument summary, inline bodies are replaced by
 `<N bytes>`, header values are redacted, and a `gh api` endpoint loses its host,
 user name and password, query string and fragment (a query string can carry an
-`access_token`). For an alias, extension or unknown command, only flag names are
-kept and every other argument becomes `<arg>`, and the same holds for an alias
-beneath one of gh's groups (`issue publish <arg>`), for `extension exec` and
-`copilot`, and for a family whose flags gh-paced does not model; an
+`access_token`). One of gh's ordinary aliases is recorded as its expansion,
+with the expanded command's redactions. For a shell alias, an extension, an
+unknown command, or an alias gh-paced refused to resolve, only flag names are
+kept and every other argument becomes `<arg>`, and the same holds for such an
+alias beneath one of gh's groups (`issue publish <arg>`), for `extension exec`
+and `copilot`, and for a family whose flags gh-paced does not model; an
 unrecognised flag of a known command keeps its name and loses its value
 (`--token=X` becomes `--token`).
 A `gh api` call carrying a flag gh-paced does not recognise is recorded as
@@ -873,11 +904,14 @@ and none of it is fixed by configuration.
     single-line fields), or a template default submitted without opening the
     editor;
   - text written in a browser after "Continue in browser" or `--web`.
-- **gh reads its aliases again.** gh-paced reads gh's `config.yml` once, before
-  the call. If the file changes before gh reads it, gh may see an alias
-  gh-paced did not (gh is given the expanded command line, so an alias
-  gh-paced expanded is not affected, but a shell alias, which gh is given by
-  name, is).
+- **gh reads its configuration again.** gh-paced reads gh's `config.yml` and
+  extensions directory once, before admission, and gh reads both again when
+  it runs. If either changes in between (for example, something rewrites
+  `~/.config/gh` while the call waits for a slot), gh can run a command other
+  than the one gh-paced classified, whether the call was an expanded alias, a
+  shell alias or a plain command. That is outside what gh-paced defends
+  against: it paces well-meaning agents, and does not guard against a process
+  changing gh's configuration underneath a waiting call.
 - **The editor guard has side effects of its own.** The write slot stays taken
   while you edit, so other writes on the host wait (and are refused after
   `GH_PACED_MAX_WAIT`). Any reads gh makes between prompts are not charged
