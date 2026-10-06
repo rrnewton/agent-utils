@@ -47203,13 +47203,24 @@ def _user_systemd_snapshot() -> tuple[Mapping[str, str], ...]:
 # would lose a path with a space in it.  Each element of a property (one
 # argv element, environment assignment or path; ``_user_systemd_properties``
 # puts each on its own line) is therefore also judged whole, as its shell
-# words, and split by these characters other than whitespace.  Every
-# reading only adds candidate paths, so a reading that splits a path apart
-# can refuse a row falsely (``slot01:other`` names ``slot01``) but cannot
-# hide one; ``:``, ``,`` and ``;`` delimit real paths in search lists, bind
+# words, split by these characters other than whitespace, and from just
+# after each ``=``, and each separator a ``/`` or ``~`` follows, to its end,
+# so an option or assignment value holding a separator is whole.  A row
+# path's own spellings are also found as text anywhere in a property
+# (``_property_mentions``), which keeps a row path whole even where it
+# holds a newline or ends just before a separator.  Every reading only
+# adds candidate paths, so a reading that splits a path apart can refuse a
+# row falsely (``slot01:other`` names ``slot01``) but cannot hide one;
+# ``:``, ``,`` and ``;`` delimit real paths in search lists, bind
 # specifications (``SRC:DST``) and shell commands, so they stay separators.
 _UNIT_EVIDENCE_SEPARATORS = re.compile(r"[\s\"'`=:,;&|()<>{}$]+")
 _UNIT_ARGUMENT_SEPARATORS = re.compile(r"[\"'`=:,;&|()<>{}$]+")
+_UNIT_VALUE_STARTS = re.compile(r"=|[\s\"'`:,;&|()<>{}$](?=[/~])")
+# Linux's PATH_MAX: the longest path, with its terminating NUL, that one
+# system call accepts.  A value read from just after a separator is cut to
+# this length, which keeps every path a call could use and bounds the
+# candidates a long property yields.
+_PATH_MAX = 4096
 # Prefixes systemd and unit files put before a path to change how it is used
 # (``-/path`` and ``!/path`` mean the path may be missing).
 _UNIT_PATH_PREFIXES = "-!@+"
@@ -47326,6 +47337,8 @@ class _UnitPathResolver:
 
         base = _unit_working_directory(unit)
         for value in unit.values():
+            if any(_property_mentions(value, spelling) for spelling in row.spellings):
+                return True
             for word in _unit_property_words(value):
                 for candidate in dict.fromkeys((word, word.lstrip(_UNIT_PATH_PREFIXES))):
                     if not candidate:
@@ -47364,8 +47377,11 @@ def _unit_property_words(value: str) -> tuple[str, ...]:
 
     Each line is one element (see ``_UNIT_EVIDENCE_SEPARATORS``).  An
     element is judged whole, as each of its shell words (when it parses as
-    shell text), and as the pieces of each of those split by every
-    separator and by every separator except whitespace.
+    shell text), as the pieces of each of those split by every separator
+    and by every separator except whitespace, and as the rest of each from
+    just after every ``=``, and every separator that ``/`` or ``~``
+    follows, so ``--checkout=<path>`` and ``NAME=<path>`` keep a path that
+    holds a separator.  Each such rest is cut to ``_PATH_MAX`` characters.
     """
 
     words: list[str] = []
@@ -47379,7 +47395,41 @@ def _unit_property_words(value: str) -> tuple[str, ...]:
             words.append(reading)
             words.extend(_UNIT_EVIDENCE_SEPARATORS.split(reading))
             words.extend(_UNIT_ARGUMENT_SEPARATORS.split(reading))
+            words.extend(
+                reading[match.end() : match.end() + _PATH_MAX]
+                for match in _UNIT_VALUE_STARTS.finditer(reading)
+            )
     return tuple(dict.fromkeys(words))
+
+
+def _property_mentions(value: str, spelling: str) -> bool:
+    """Whether a unit property string holds a row path spelling as a path.
+
+    The spelling must begin the string or follow a separator (through any
+    of the prefixes ``_UNIT_PATH_PREFIXES``), and end the string or precede
+    ``/`` or a separator.  Found as text, a row path holding a separator,
+    a newline or a quote is whole wherever it stands, as an option value,
+    an assignment, a search-list entry or a quoted shell word.
+    """
+
+    start = value.find(spelling)
+    while start >= 0:
+        end = start + len(spelling)
+        lead = start
+        while lead and value[lead - 1] in _UNIT_PATH_PREFIXES:
+            lead -= 1
+        opens = (
+            lead == 0 or _UNIT_EVIDENCE_SEPARATORS.fullmatch(value[lead - 1]) is not None
+        )
+        closes = (
+            end == len(value)
+            or value[end] == "/"
+            or _UNIT_EVIDENCE_SEPARATORS.fullmatch(value[end]) is not None
+        )
+        if opens and closes:
+            return True
+        start = value.find(spelling, start + 1)
+    return False
 
 
 def _spelling_is_within(path: str, root: str) -> bool:

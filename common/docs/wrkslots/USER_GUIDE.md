@@ -396,10 +396,18 @@ inside it. Each element of a property (one command-line argument, environment as
 is a word as a whole, and so is each of its shell words when it parses as shell text. Each of those
 is also split into words at whitespace, quotes, and the characters `=`, `:`, `,`, `;`, `&`, `|`,
 `(`, `)`, `<`, `>`, `{`, `}` and `$`, and split again at the same characters except whitespace, so
-a row path containing a space is still one word in `--checkout=<path>` or `cd '<path>'`. A leading
-`-`, `!`, `@` or `+` is also tried without it. Every reading only adds words, so a path that
+a row path containing a space is still one word in `--checkout=<path>` or `cd '<path>'`. The rest
+of each element and shell word from just after every `=`, and after every one of those characters
+that `/` or `~` follows, is a word too (cut to 4,096 characters, the longest path a system call
+accepts), so `--checkout=<path>` and `NAME=<path>` keep a path that contains `:` or a quote. A
+leading `-`, `!`, `@` or `+` is also tried without it. The row path's own spellings (below) are
+also found as text anywhere in a property string, when they begin it or follow one of those
+characters and end it or precede `/` or one of those characters, so a row path is found whole even
+where it contains a newline or ends just before a `:`. Every reading only adds words, so a path that
 contains one of these characters can name a row it is not inside (`slot01:other` names `slot01`)
-and refuse falsely, but no reading hides a row path.
+and refuse falsely, but no reading hides a row path's own spelling. A symlink to a row whose own
+name contains one of these characters, written immediately before another of them, can still go
+unmatched by the symlink's spelling.
 A relative word is resolved against the unit's working directory (the home directory when it has
 none), and `~` is the home directory. Each word is then compared as a whole path: its normalized
 spelling, its symlink-resolved spelling as written (a `..` after a symlink leaves the symlink's

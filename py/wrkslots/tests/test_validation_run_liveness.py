@@ -639,6 +639,43 @@ def test_a_row_path_with_a_space_is_one_argument(tmp_path: Path) -> None:
     assert not names(ExecStart=f"/bin/sh\n-c\ncd '{row}0' && make")
 
 
+def test_a_row_path_holding_separators_is_one_option_or_assignment_value(
+    tmp_path: Path,
+) -> None:
+    """A row path holding ``:`` and a space is whole in an option or assignment.
+
+    Splitting at separators breaks it apart, so the value after ``=`` (or
+    after a separator that ``/`` follows) is a candidate as a whole, and
+    the row's own spellings are found as text wherever they stand.
+    """
+
+    row = tmp_path / "with: space" / "project" / "worktrees" / "validate" / "slot01"
+    row.mkdir(parents=True)
+    alias = tmp_path / "alias: link"
+    alias.symlink_to(row)
+
+    def names(**unit: str) -> bool:
+        return wrkslots._UnitPathResolver().names(unit, wrkslots._row_path_identity(row))
+
+    assert names(ExecStart=f"tool\n--checkout={row}")
+    assert names(Environment=f"CHECKOUT={row}")
+    assert names(ExecStart=f"/bin/sh\n-c\nmake --checkout='{row}/product'")
+    assert names(Environment=f"PATH=/usr/bin:{row}:/bin")
+    assert names(ExecStart=f"tool\n--checkout={alias}/product")
+    assert names(Environment=f"SEARCH=/usr/lib;{alias}/lib")
+    assert not names(ExecStart=f"tool\n--checkout={row}0")
+    assert not names(Environment=f"CHECKOUT=/other{row}")
+    assert not names(Environment=f"CHECKOUT={row}+other")
+
+    # A row path holding a newline spans two lines of the property, and so
+    # two elements, but is still found whole.
+    broken = tmp_path / "with\nnewline" / "slot01"
+    broken.mkdir(parents=True)
+    assert wrkslots._UnitPathResolver().names(
+        {"ExecStart": f"make\n-C\n{broken}/product"}, wrkslots._row_path_identity(broken)
+    )
+
+
 UNREADABLE_PID = 4_000_017
 
 
