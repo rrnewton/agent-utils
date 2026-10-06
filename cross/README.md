@@ -64,8 +64,9 @@ Without `--herdr-bin`, the Rust edition looks `herdr` up on `PATH` and meets the
 stub, but the Python edition runs the `herdr` installed in a fixed location such
 as `~/bin`, which a stub cannot shadow. The harness therefore does not start the
 editions at all for an invocation that names no Herdr file inside the case
-directory (symbolic links resolved; a `--herdr-bin` after a `--` terminator does
-not count), unless its command is one that never contacts Herdr
+directory (symbolic links resolved, with `..` read both as the kernel and the
+Rust client read it and as the Python client does; a `--herdr-bin` after a `--`
+terminator does not count), unless its command is one that never contacts Herdr
 (`capabilities`, `profiles`, `quickstart`, `skill`, `userguide`, or help and
 version output). It records the refusal for `harness/no-host-cli` instead.
 Every other command, including a deliberately invalid one, passes

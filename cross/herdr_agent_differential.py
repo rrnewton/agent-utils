@@ -488,15 +488,20 @@ HERDR_BIN_IGNORED_COMMANDS = frozenset(("chat",))
 def _names_case_file(root: Path, value: str) -> bool:
     """Whether a `--herdr-bin` value is a file inside the case directory, not an installed name.
 
-    Both editions canonicalize the path they run, so symbolic links are resolved here too, against
-    the editions' working directory (the case root): a link inside the case that points outside
-    it names the outside file.
+    The editions resolve a relative value against their working directory, the case root, whose
+    os.getcwd() is its physical path. They canonicalize it in two different ways. The kernel and
+    the Rust client follow each symbolic link before a later `..` (os.path.realpath). The Python
+    client first removes `..` lexically (os.path.abspath, in client._validated_executable) and
+    only then follows links. Given `link -> nested/deeper`, `./link/../herdr` is `nested/herdr`
+    to the first and `./herdr` to the second. A value counts only if both readings stay inside
+    the case directory.
     """
     if os.sep not in value:
         return False
     real_root = os.path.realpath(root)
-    resolved = os.path.realpath(os.path.join(root, value))
-    return os.path.commonpath((resolved, real_root)) == real_root
+    joined = value if os.path.isabs(value) else os.path.join(real_root, value)
+    readings = (os.path.realpath(joined), os.path.realpath(os.path.normpath(joined)))
+    return all(os.path.commonpath((reading, real_root)) == real_root for reading in readings)
 
 
 def herdr_refusal(root: Path, arguments: Sequence[str]) -> str | None:

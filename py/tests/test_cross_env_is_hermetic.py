@@ -569,6 +569,66 @@ def test_a_case_symlink_to_an_outside_herdr_is_never_started(tmp_path: Path, lin
     assert len(harness.host_cli_calls()) == 4
 
 
+def _executable_file(path: Path) -> None:
+    path.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    path.chmod(0o700)
+
+
+@pytest.mark.parametrize("layout", ("python-escapes", "kernel-escapes"))
+def test_a_symlink_before_dotdot_must_stay_inside_under_both_readings(
+    tmp_path: Path, layout: str
+) -> None:
+    """`link/../herdr`: the Python client drops `..` before following links, the kernel after.
+
+    Each layout keeps one reading inside the case and sends the other outside, so the guard must
+    check both. The Python reading is taken from the production resolver, which only inspects
+    the file; nothing is executed.
+    """
+    herdr_agent = _cross_module("herdr_agent_differential")
+    from agentctl import client as agentctl_client
+
+    outside = tmp_path / "outside"
+    (outside / "deeper").mkdir(parents=True)
+    _executable_file(outside / "herdr")
+    edition, started = _recording_edition(tmp_path)
+    harness = herdr_agent.Harness(tmp_path / "cross", edition, edition)
+    try:
+        case = harness.case("dotdot-herdr")
+        for root in (case.python_root, case.rust_root):
+            (root / "nested" / "deeper").mkdir(parents=True)
+            _executable_file(root / "nested" / "herdr")
+            if layout == "python-escapes":
+                (root / "link").symlink_to(root / "nested" / "deeper", target_is_directory=True)
+                (root / "herdr").symlink_to(outside / "herdr")
+            else:
+                (root / "link").symlink_to(outside / "deeper", target_is_directory=True)
+                _executable_file(root / "herdr")
+        root = case.python_root
+        python_reading = agentctl_client._validated_executable(
+            str(root / "link" / ".." / "herdr"), "Herdr"
+        )
+        kernel_reading = os.path.realpath(root / "link" / ".." / "herdr")
+        python, rust = harness.invoke(
+            case, ("start", "worker", "--herdr-bin", "<ROOT>/link/../herdr")
+        )
+        relative, _ = harness.invoke(case, ("start", "worker", "--herdr-bin", "./link/../herdr"))
+    finally:
+        harness.close()
+
+    inside = os.path.realpath(root / "nested" / "herdr")
+    escaped = os.path.realpath(outside / "herdr")
+    if layout == "python-escapes":
+        assert (python_reading, kernel_reading) == (escaped, inside)
+    else:
+        assert (python_reading, kernel_reading) == (os.path.realpath(root / "herdr"), escaped)
+    assert not started.exists()
+    assert python == rust
+    assert python.returncode == relative.returncode == 127
+    assert "is not a fixture inside the case directory" in python.stderr
+    assert "is not a fixture inside the case directory" in relative.stderr
+    assert len(harness.host_cli_calls()) == 4
+
+
 @pytest.mark.parametrize(
     "variable", sorted(_cross_module("herdr_agent_differential").AMBIENT_EXECUTABLE_OVERRIDES)
 )
@@ -696,7 +756,11 @@ def test_an_invocation_the_guard_admits_never_selects_an_installed_herdr(
         herdr, free = parsed
         if free:
             continue
-        installed = herdr is None or not herdr_agent._names_case_file(root, herdr)
+        # Judged independently of the guard, the way client._validated_executable resolves it.
+        real_root = os.path.realpath(root)
+        installed = herdr is None or os.sep not in herdr or os.path.commonpath(
+            (os.path.realpath(os.path.abspath(herdr)), real_root)
+        ) != real_root
         assert not (installed and refusal is None), (
             f"{name} would run {herdr!r} for {arguments!r}, and the guard admitted it"
         )
