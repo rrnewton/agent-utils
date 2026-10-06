@@ -43996,6 +43996,11 @@ def _retained_handles_for_absent_rows(
             related.update(
                 slot for slot, identity in targets if resolver.path_names(target, identity)
             )
+            # Each resolution is bounded (``_UnitPathResolver``), so checking
+            # after each field keeps the census within one field's work of
+            # its bound.
+            if time.monotonic() >= deadline:
+                raise Refusal("retained validation handle census exceeded its time bound")
         if not related:
             continue
         unit = value.get("unit")
@@ -44033,6 +44038,8 @@ def _retained_handles_for_absent_rows(
         )
         for slot in related:
             matched[slot].append(handle)
+    if time.monotonic() >= deadline:
+        raise Refusal("retained validation handle census exceeded its time bound")
     return {slot: tuple(values) for slot, values in matched.items()}
 
 
@@ -47288,32 +47295,88 @@ def _row_path_identity(path: Path) -> _RowPathIdentity:
     )
 
 
+# A stat failure that every path below the failing one shares: the path is
+# missing, a non-directory, a symlink loop, or too long for a system call.
+_LOOKUP_ENDS_BELOW = frozenset({errno.ENOENT, errno.ENOTDIR, errno.ELOOP, errno.ENAMETOOLONG})
+
+
+def _bounded_realpath(path: str) -> str:
+    """``os.path.realpath`` of absolute ``path``, looking up only what one
+    system call could.
+
+    No system call accepts a path of ``_PATH_MAX`` characters or more, so a
+    longer path is resolved through its components up to the last ``/``
+    within its first ``_PATH_MAX`` characters, and the rest is appended and
+    normalized lexically, as ``realpath`` treats components that do not
+    resolve.  The lookups are then at most ``_PATH_MAX // 2`` however long
+    the path is.
+    """
+
+    if len(path) < _PATH_MAX:
+        return os.path.realpath(path)
+    cut = path.rfind("/", 0, _PATH_MAX)
+    if cut < 0:
+        return os.path.normpath(path)
+    head = os.path.realpath(path[:cut] or "/")
+    return os.path.normpath(f"{head.rstrip('/')}/{path[cut:].lstrip('/')}")
+
+
 class _UnitPathResolver:
     """Resolve the words of user-systemd units to path identities.
 
-    One resolver serves one judgement: it memoizes the resolution of each
-    word and the identity of each file it stats, so several rows can be
-    compared with one unit enumeration without repeating the file-system
-    reads.  It must not outlive the judgement, because the files change.
+    One resolver serves one judgement: it memoizes each property string's
+    candidate paths, the resolution of each path, and the identity of each
+    file it stats, so several rows can be compared with one unit
+    enumeration without repeating the parsing or the file-system reads.  It
+    must not outlive the judgement, because the files change.
+
+    The work for one path is bounded however long the path is: it is
+    resolved through at most ``_PATH_MAX`` characters
+    (``_bounded_realpath``), and its ancestors are statted from ``/`` down,
+    stopping where a lookup fails in a way every path below shares, so only
+    ancestors that exist, each shorter than ``_PATH_MAX``, are kept.
     """
 
     def __init__(self) -> None:
+        self._candidates: dict[tuple[str, str], tuple[str, ...]] = {}
         self._words: dict[str, tuple[tuple[str, ...], frozenset[tuple[int, int]]]] = {}
-        self._files: dict[str, tuple[int, int] | None] = {}
+        self._files: dict[str, tuple[tuple[int, int] | None, bool]] = {}
 
-    def _file(self, path: str) -> tuple[int, int] | None:
+    def _file(self, path: str) -> tuple[tuple[int, int] | None, bool]:
+        """The identity of the file at ``path``, or None, and whether a path
+        below it can still be looked up."""
+
         try:
             return self._files[path]
         except KeyError:
             pass
+        answer: tuple[tuple[int, int] | None, bool]
         try:
             metadata = os.stat(path)
-        except (OSError, ValueError):
-            identity = None
+        except ValueError:
+            answer = (None, False)
+        except OSError as exc:
+            answer = (None, exc.errno not in _LOOKUP_ENDS_BELOW)
         else:
-            identity = (metadata.st_dev, metadata.st_ino)
-        self._files[path] = identity
-        return identity
+            answer = ((metadata.st_dev, metadata.st_ino), True)
+        self._files[path] = answer
+        return answer
+
+    def _ancestor_files(self, path: str) -> set[tuple[int, int]]:
+        """The files of absolute ``path`` and of each of its ancestors that
+        exist, statted from ``/`` down."""
+
+        files: set[tuple[int, int]] = set()
+        end = 0
+        while True:
+            identity, below = self._file(path[:end] or "/")
+            if identity is not None:
+                files.add(identity)
+            if not below or end >= len(path):
+                return files
+            end = path.find("/", end + 1)
+            if end < 0:
+                end = len(path)
 
     def _resolve(self, joined: str) -> tuple[tuple[str, ...], frozenset[tuple[int, int]]]:
         """Return a path's spellings and the files of it and its ancestors.
@@ -47332,7 +47395,9 @@ class _UnitPathResolver:
         lexical = os.path.normpath(joined)
         try:
             resolved = tuple(
-                dict.fromkeys((os.path.realpath(joined), os.path.realpath(lexical)))
+                dict.fromkeys(
+                    _bounded_realpath(spelling) for spelling in dict.fromkeys((joined, lexical))
+                )
             )
         except ValueError as exc:
             raise Refusal(
@@ -47341,14 +47406,7 @@ class _UnitPathResolver:
             ) from exc
         files: set[tuple[int, int]] = set()
         for current in resolved:
-            while True:
-                identity = self._file(current)
-                if identity is not None:
-                    files.add(identity)
-                parent = os.path.dirname(current)
-                if parent == current:
-                    break
-                current = parent
+            files.update(self._ancestor_files(current))
         answer = (tuple(dict.fromkeys((lexical, *resolved))), frozenset(files))
         self._words[joined] = answer
         return answer
@@ -47368,20 +47426,32 @@ class _UnitPathResolver:
         for value in unit.values():
             if any(_property_mentions(value, spelling) for spelling in row.spellings):
                 return True
-            for word in _unit_property_words(value):
-                for candidate in dict.fromkeys((word, word.lstrip(_UNIT_PATH_PREFIXES))):
-                    if not candidate:
-                        continue
-                    if candidate == "~" or candidate.startswith("~/"):
-                        candidate = os.path.expanduser(candidate)
-                    joined = (
-                        candidate
-                        if candidate.startswith("/")
-                        else os.path.join(base, candidate)
-                    )
-                    if self.path_names(joined, row):
-                        return True
+            for joined in self._value_paths(base, value):
+                if self.path_names(joined, row):
+                    return True
         return False
+
+    def _value_paths(self, base: str, value: str) -> tuple[str, ...]:
+        """The absolute candidate paths of one property string, read once."""
+
+        key = (base, value)
+        try:
+            return self._candidates[key]
+        except KeyError:
+            pass
+        paths: list[str] = []
+        for word in _unit_property_words(value):
+            for candidate in dict.fromkeys((word, word.lstrip(_UNIT_PATH_PREFIXES))):
+                if not candidate:
+                    continue
+                if candidate == "~" or candidate.startswith("~/"):
+                    candidate = os.path.expanduser(candidate)
+                paths.append(
+                    candidate if candidate.startswith("/") else os.path.join(base, candidate)
+                )
+        answer = tuple(dict.fromkeys(paths))
+        self._candidates[key] = answer
+        return answer
 
     def path_names(self, joined: str, row: _RowPathIdentity) -> bool:
         """Whether absolute path ``joined`` is ``row`` or a path inside it.

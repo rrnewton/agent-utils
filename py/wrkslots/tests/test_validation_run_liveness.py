@@ -20,6 +20,7 @@ import json
 import os
 import subprocess
 import sys
+import time
 import uuid
 from collections.abc import Iterator, Mapping, Sequence, Set as AbstractSet
 from dataclasses import dataclass
@@ -674,6 +675,159 @@ def test_a_row_path_holding_separators_is_one_option_or_assignment_value(
     assert wrkslots._UnitPathResolver().names(
         {"ExecStart": f"make\n-C\n{broken}/product"}, wrkslots._row_path_identity(broken)
     )
+
+
+def test_resolving_a_long_path_looks_up_a_bounded_part_of_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A path longer than any system call accepts costs a bounded number of
+    lookups, and the resolver keeps only the ancestors that exist.
+
+    The path lies below a directory that does not exist, so no lookup below
+    that directory can succeed; resolving all of its 3,002 components, and
+    keeping each of their ancestor spellings, is work that grows with the
+    square of its length.
+    """
+
+    row = tmp_path / "row"
+    row.mkdir()
+    identity = wrkslots._row_path_identity(row)
+    deep = f"/nonexistent-{uuid.uuid4().hex}/" + "a/" * 3000 + "end"
+    lookups: list[str] = []
+    resolutions: list[str] = []
+    real_stat, real_lstat, real_realpath = os.stat, os.lstat, os.path.realpath
+
+    def counted_stat(path: str) -> os.stat_result:
+        lookups.append(path)
+        return real_stat(path)
+
+    def counted_lstat(path: str) -> os.stat_result:
+        lookups.append(path)
+        return real_lstat(path)
+
+    def counted_realpath(path: str) -> str:
+        resolutions.append(path)
+        return real_realpath(path)
+
+    resolver = wrkslots._UnitPathResolver()
+    with monkeypatch.context() as patch:
+        patch.setattr(os, "stat", counted_stat)
+        patch.setattr(os, "lstat", counted_lstat)
+        patch.setattr(os.path, "realpath", counted_realpath)
+        named = resolver.path_names(deep, identity)
+
+    assert not named
+    assert len(lookups) <= wrkslots._PATH_MAX // 2 + 2, len(lookups)
+    assert resolutions and max(map(len, resolutions)) < wrkslots._PATH_MAX
+    assert sum(map(len, resolver._files)) < 2 * wrkslots._PATH_MAX
+
+
+def test_a_long_path_still_names_its_row(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Bounding the lookups keeps every reading that names a row.
+
+    A long path inside the row, inside it through a symlink, or back at it
+    after as many ``..`` steps as it has components names the row; one
+    beside the row does not.  A lookup that fails for one directory only
+    (here, permission to stat it) does not end the ancestor walk, so the
+    row's own file is still found below it.
+    """
+
+    row = tmp_path / "row"
+    row.mkdir()
+    alias = tmp_path / "alias"
+    alias.symlink_to(row)
+    tail = "a/" * 3000 + "end"
+    identity = wrkslots._row_path_identity(row)
+    resolver = wrkslots._UnitPathResolver()
+
+    assert resolver.path_names(f"{row}/{tail}", identity)
+    assert resolver.path_names(f"{alias}/{tail}", identity)
+    assert resolver.path_names(f"{alias}/{tail}/" + "../" * 3001, identity)
+    assert resolver.path_names(f"/{tail}/" + "../" * 3001 + str(alias)[1:], identity)
+    assert not resolver.path_names(f"{tmp_path}/other/{tail}", identity)
+    assert wrkslots._UnitPathResolver().names(
+        {"ExecStart": f"tool\n--checkout={alias}/{tail}"}, identity
+    )
+
+    by_file = wrkslots._RowPathIdentity(row, ("/elsewhere",), identity.file)
+    parent = os.path.realpath(tmp_path)
+    denied: list[str] = []
+    real_stat = os.stat
+
+    def stat(path: str) -> os.stat_result:
+        if path == parent:
+            denied.append(path)
+            raise PermissionError(13, "Permission denied", path)
+        return real_stat(path)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(os, "stat", stat)
+        assert wrkslots._UnitPathResolver().path_names(f"{row}/product", by_file)
+    assert denied == [parent]
+
+
+def test_one_resolver_reads_each_unit_property_once_for_every_row(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Several rows judged against one unit share the parsing of its strings."""
+
+    rows = []
+    for name in ("slot01", "slot02", "slot03"):
+        (tmp_path / name).mkdir()
+        rows.append(wrkslots._row_path_identity(tmp_path / name))
+    unit = _unit(ExecStart="/bin/tool\n--checkout=/srv/other", Environment="HOME=/home/x")
+    parsed: list[str] = []
+    real_words = wrkslots._unit_property_words
+
+    def words(value: str) -> tuple[str, ...]:
+        parsed.append(value)
+        return real_words(value)
+
+    monkeypatch.setattr(wrkslots, "_unit_property_words", words)
+    resolver = wrkslots._UnitPathResolver()
+
+    assert not any(resolver.names(unit, row) for row in rows)
+    assert sorted(parsed) == sorted(set(unit.values()))
+
+
+def test_the_retained_handle_census_bounds_its_path_matching_by_time(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Matching a handle's paths with the rows counts against the census's
+    time bound, and the census refuses once that bound has passed.
+
+    The clock is simulated: matching the one handle's checkout takes longer
+    than the whole bound, after its read was already checked.
+    """
+
+    project, tree = _prepare(tmp_path, monkeypatch, agent_liveness="dead")
+    _write_run_handle(project, tree)
+    config = wrkslots._load_config(str(project), "testhost")
+    rows = [(record, (tree,)) for record in wrkslots._load_active(config).slots]
+    assert [handle.unit for handle in wrkslots._retained_handles_for_absent_rows(
+        config, rows
+    )["slot01"]] == [RUN_UNIT]
+
+    real_monotonic = time.monotonic
+    elapsed = [0.0]
+    real_path_names = wrkslots._UnitPathResolver.path_names
+
+    def slow_path_names(
+        self: wrkslots._UnitPathResolver, joined: str, row: wrkslots._RowPathIdentity
+    ) -> bool:
+        elapsed[0] += wrkslots._RETAINED_HANDLE_CENSUS_SECONDS + 60.0
+        return real_path_names(self, joined, row)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(time, "monotonic", lambda: real_monotonic() + elapsed[0])
+        patch.setattr(wrkslots._UnitPathResolver, "path_names", slow_path_names)
+        with pytest.raises(
+            wrkslots.Refusal, match="retained validation handle census exceeded its time bound"
+        ):
+            wrkslots._retained_handles_for_absent_rows(config, rows)
+    assert elapsed[0] > wrkslots._RETAINED_HANDLE_CENSUS_SECONDS
 
 
 UNREADABLE_PID = 4_000_017

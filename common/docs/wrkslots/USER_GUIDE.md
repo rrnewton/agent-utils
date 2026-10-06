@@ -418,8 +418,13 @@ exists, the word and each of its existing ancestors by device and inode against 
 itself. A unit naming `slot01/./product`, `--checkout=slot01//product`, a symlink to `slot01`,
 `<symlink to slot01/product>/..`, or `worktrees/validate/slot01` with the project root as its
 working directory therefore names `slot01`; one naming `slot010`,
-`slot01+other` or `/other/<project>/worktrees/validate/slot01` does not. This rule is shared with
-`recover-absent-validate-rows`.
+`slot01+other` or `/other/<project>/worktrees/validate/slot01` does not. The lookups for one word
+are bounded however long it is: a word of 4,096 characters or more, which no system call accepts,
+has its symlinks resolved only within its first 4,096 characters, and the rest of it is normalized
+as text, so a symlink beyond them is read as a plain name; and its ancestors are looked up from `/`
+down, stopping below one that is missing, not a directory, a symlink loop or too long. This rule is
+shared with `recover-absent-validate-rows`, and with a retained run handle's checkout, which the
+handle census matches with the rows within its 30-second time bound.
 
 The process table is read both before and after the user-systemd enumeration, which takes about a
 second and a half on a busy host. A run that starts and finishes during the enumeration leaves its
