@@ -452,6 +452,13 @@ def test_the_production_client_ignores_path_for_the_default_herdr(
     assert resolved != str(tmp_path / "ambient-bin" / "herdr")
 
 
+# A goal command that names a file inside the case directory and still runs a host program.
+_RUNTIME_EXECS_CODEX = (
+    '["<ROOT>/fake-muse-runtime","-c",'
+    '"import os; os.execv(\'/usr/local/bin/codex\', [\'codex\', \'app-server\'])"]'
+)
+
+
 def _recording_edition(tmp_path: Path) -> tuple[list[str], Path]:
     started = tmp_path / "edition-started"
     edition = [
@@ -484,6 +491,17 @@ def _recording_edition(tmp_path: Path) -> tuple[list[str], Path]:
     ("chat", "launch", "--config", "<ROOT>/chat.json", "--harness-arg", "--herdr-bin=<HERDR> x"),
     ("chat", "init", "--config", "<ROOT>/chat.json", "--herdr-bin", "<HERDR>"),
     ("--herdr-bin", "<HERDR>", "chat", "status"),
+    # Rust globals the Python edition lacks still precede the command, so this is Chat to Rust,
+    # whose `chat publish` runs the outbound command stored in the bridge state.
+    ("--from-session=fixture", "chat", "publish", "--herdr-bin", "<HERDR>"),
+    ("--from-session", "fixture", "chat", "status", "--herdr-bin", "<HERDR>"),
+    ("--agentcloud-url", "ws://fixture", "chat", "status", "--herdr-bin", "<HERDR>"),
+    ("--agentcloud-url=ws://fixture", "chat", "status", "--herdr-bin", "<HERDR>"),
+    ("--agentcloudctl-bin", "<HERDR>", "chat", "status", "--herdr-bin", "<HERDR>"),
+    ("--agentterm-bin=<HERDR>", "--herdr-bin", "<HERDR>", "chat", "status"),
+    # An option the guard does not know hides where the command starts.
+    ("--not-a-global", "chat", "status", "--herdr-bin", "<HERDR>"),
+    ("--not-a-global=x", "--herdr-bin", "<HERDR>", "chat", "status"),
 ))
 def test_an_invocation_that_could_reach_the_installed_herdr_is_never_started(
     tmp_path: Path, arguments: tuple[str, ...]
@@ -528,8 +546,15 @@ def test_an_invocation_that_could_reach_the_installed_herdr_is_never_started(
     ("send", "worker", "--herdr-bin", "<HERDR>", "--", "--text-that-looks-like-an-option"),
     ("chat", "--help"),
     ("goal", "worker", "--herdr-bin", "<HERDR>", "--goal-command-json", '["<HERDR>","goal-rpc"]'),
-    ("goal", "worker", "--goal-command-json=[\"./fake-herdr\"]", "--herdr-bin", "<HERDR>"),
+    ("goal", "worker", "--goal-command-json=[\"./fake-herdr\",\"goal-rpc\"]", "--herdr-bin",
+     "<HERDR>"),
     ("goal", "worker", "--goal-command-json", "[]", "--herdr-bin", "<HERDR>"),
+    # The value of a global is not the command, even when it is a command's name.
+    ("--from-session", "chat", "--herdr-bin", "<HERDR>", "status", "worker"),
+    ("--agentcloud-url=ws://fixture", "--herdr-bin", "<HERDR>", "status", "worker"),
+    # A Herdr-free command after a global, spaced or `=`, needs no --herdr-bin.
+    ("--registry", "<ROOT>/registry", "quickstart"),
+    ("--registry=<ROOT>/registry", "quickstart"),
     ("--herdr-bin", "<HERDR>", "--agentcloudctl-bin", "<HERDR>", "--agentterm-bin=./fake-herdr",
      "status", "worker"),
     ("--herdr-bin", "<HERDR>", "inbox", "watch", "--to", "coord", "--once",
@@ -568,6 +593,20 @@ def test_herdr_free_commands_and_fixture_herdr_invocations_still_run(
      "goal-command"),
     # The herdr-agent Python edition turns each element into a string with str().
     (("goal", "worker", "--herdr-bin", "<HERDR>", "--goal-command-json", "[1]"), "goal-command"),
+    # A file inside the case is not enough: `fake-muse-runtime` is a copy of the interpreter.
+    (("goal", "worker", "--herdr-bin", "<HERDR>", "--goal-command-json", _RUNTIME_EXECS_CODEX),
+     "goal-command"),
+    (("goal", "worker", "--herdr-bin", "<HERDR>",
+      '--goal-command-json=["./fake-muse-skills","goal-rpc"]'), "goal-command"),
+    # The fixture itself, in any mode but the goal transport.
+    (("goal", "worker", "--herdr-bin", "<HERDR>", "--goal-command-json", '["<HERDR>"]'),
+     "goal-command"),
+    (("goal", "worker", "--goal-command-json=[\"./fake-herdr\"]", "--herdr-bin", "<HERDR>"),
+     "goal-command"),
+    (("goal", "worker", "--herdr-bin", "<HERDR>",
+      "--goal-command-json", '["<HERDR>","goal-rpc","extra"]'), "goal-command"),
+    (("goal", "worker", "--herdr-bin", "<HERDR>",
+      "--goal-command-json", '["<HERDR>","pane","run","w1:p1","x"]'), "goal-command"),
     (("--herdr-bin", "<HERDR>", "--", "goal", "worker",
       "--goal-command-json", '["/usr/local/bin/codex"]'), "goal-command"),
     (("--herdr-bin", "<HERDR>", "--agentcloudctl-bin", "/usr/local/bin/agentcloudctl",
@@ -1073,7 +1112,7 @@ _GOAL_WORKER = ("goal", "worker", "--herdr-bin", "<HERDR>")
      (*_GOAL_WORKER, "--registry", "<ROOT>/registry")),
     # The guard reads every duplicate, whichever one an edition keeps.
     ("registry/worker/agent.json",
-     f'{{"goal_command": {_OUTSIDE_CODEX}, "goal_command": ["<ROOT>/fake-herdr"]}}',
+     f'{{"goal_command": {_OUTSIDE_CODEX}, "goal_command": ["<ROOT>/fake-herdr", "goal-rpc"]}}',
      (*_GOAL_WORKER, "--registry", "<ROOT>/registry")),
     # With no registry option, an edition reads its default under the working directory.
     (".agentctl/worker/agent.json", f'{{"goal_command": {_OUTSIDE_CODEX}}}', _GOAL_WORKER),
@@ -1085,6 +1124,14 @@ _GOAL_WORKER = ("goal", "worker", "--herdr-bin", "<HERDR>")
      (*_GOAL_WORKER, "--", "--state", "<ROOT>/safe")),
     # A registry outside the case directory could store anything.
     ("unused.txt", "", (*_GOAL_WORKER, "--registry", "<ROOT>/../registry")),
+    # A stored command must be the fixture goal transport, not just a file inside the case.
+    ("registry/worker/agent.json", f'{{"goal_command": {_RUNTIME_EXECS_CODEX}}}',
+     (*_GOAL_WORKER, "--registry", "<ROOT>/registry")),
+    ("registry/worker/agent.json",
+     f'{{"goal": {{"native_command": {_RUNTIME_EXECS_CODEX.replace("<ROOT>/", "./")}}}}}',
+     (*_GOAL_WORKER, "--registry", "<ROOT>/registry")),
+    ("registry/worker/agent.json", '{"goal_command": ["<ROOT>/fake-herdr", "pane", "list"]}',
+     (*_GOAL_WORKER, "--registry", "<ROOT>/registry")),
 ))
 def test_a_stored_goal_command_that_could_run_a_host_program_is_never_started(
     tmp_path: Path, relative: str, text: str, arguments: tuple[str, ...]
@@ -1164,6 +1211,144 @@ def test_a_stored_fixture_goal_command_still_runs(tmp_path: Path, text: str) -> 
     assert harness.host_cli_calls() == []
 
 
+def test_the_interpreter_copy_in_every_case_runs_the_program_its_arguments_name(
+    tmp_path: Path,
+) -> None:
+    """Why a goal command must be the fixture transport, not merely a file inside the case."""
+    import subprocess
+
+    herdr_agent = _cross_module("herdr_agent_differential")
+    harness = herdr_agent.Harness(tmp_path / "cross", ["true"], ["true"])
+    try:
+        case = harness.case("interpreter-copy")
+    finally:
+        harness.close()
+    root = case.python_root
+    runtime = root / "fake-muse-runtime"
+    marker = tmp_path / "chosen-program-ran"
+    completed = subprocess.run(
+        [str(runtime), "-c", f"open({str(marker)!r}, 'w', encoding='utf-8').write('ran')"],
+        stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=60, check=False,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert marker.read_text(encoding="utf-8") == "ran"
+    assert herdr_agent._names_case_file(root, str(runtime))
+    value = _RUNTIME_EXECS_CODEX.replace("<ROOT>", str(root))
+    refusal = herdr_agent.host_cli_refusal(
+        root, ["goal", "worker", "--herdr-bin", str(root / "fake-herdr"), "--goal-command-json", value]
+    )
+    assert refusal is not None and refusal[0] == "goal-command"
+
+
+@pytest.mark.parametrize(("target", "admitted"), (("fake-herdr", True), ("fake-muse-runtime", False)))
+def test_a_goal_transport_link_counts_only_when_it_reaches_the_fixture(
+    tmp_path: Path, target: str, admitted: bool
+) -> None:
+    herdr_agent = _cross_module("herdr_agent_differential")
+    edition, started = _recording_edition(tmp_path)
+    harness = herdr_agent.Harness(tmp_path / "cross", edition, edition)
+    try:
+        case = harness.case("linked-goal-transport")
+        for root in (case.python_root, case.rust_root):
+            (root / "linked-transport").symlink_to(root / target)
+        explicit = harness.invoke(case, (
+            *_GOAL_WORKER, "--goal-command-json", '["<ROOT>/linked-transport","goal-rpc"]',
+        ))
+        _seed(case, "registry/worker/agent.json",
+              '{"goal_command": ["./linked-transport", "goal-rpc"]}')
+        stored = harness.invoke(case, (*_GOAL_WORKER, "--registry", "<ROOT>/registry"))
+    finally:
+        harness.close()
+
+    for python, rust in (explicit, stored):
+        assert python == rust
+        assert python.returncode == (0 if admitted else 127)
+    if admitted:
+        assert started.read_text(encoding="utf-8") == "started\n" * 4
+        assert harness.host_cli_calls() == []
+    else:
+        assert not started.exists()
+        assert len(harness.host_cli_calls()) == 4
+
+
+@pytest.mark.parametrize("reaches_fixture", ("kernel", "python"))
+def test_a_goal_transport_must_be_the_fixture_under_both_readings(
+    tmp_path: Path, reaches_fixture: str
+) -> None:
+    """`./link/../transport` is `sub/transport` to the kernel and `./transport` to Python.
+
+    One of the two is a link to the fixture and the other a link to the interpreter copy, both
+    inside the case directory, so only the rule that both readings reach the fixture refuses it.
+    """
+    herdr_agent = _cross_module("herdr_agent_differential")
+    edition, started = _recording_edition(tmp_path)
+    harness = herdr_agent.Harness(tmp_path / "cross", edition, edition)
+    kernel, python_reading = (
+        ("fake-herdr", "fake-muse-runtime") if reaches_fixture == "kernel"
+        else ("fake-muse-runtime", "fake-herdr")
+    )
+    try:
+        case = harness.case("goal-transport-dotdot")
+        for root in (case.python_root, case.rust_root):
+            (root / "sub" / "inner").mkdir(parents=True)
+            (root / "link").symlink_to(root / "sub" / "inner")
+            (root / "sub" / "transport").symlink_to(root / kernel)
+            (root / "transport").symlink_to(root / python_reading)
+        python, rust = harness.invoke(case, (
+            *_GOAL_WORKER, "--goal-command-json", '["./link/../transport","goal-rpc"]',
+        ))
+    finally:
+        harness.close()
+
+    assert not started.exists()
+    assert python == rust
+    assert python.returncode == 127
+    assert "is not the case's fixture goal transport" in python.stderr
+    assert len(harness.host_cli_calls()) == 2
+
+
+def test_the_guard_knows_every_option_either_agentctl_edition_accepts_before_the_command() -> None:
+    """A global the guard did not know would hide the command (`--from-session=ID chat ...`).
+
+    The Python root parser is read directly. The Rust parser is the clap `struct Cli` in
+    rs/agentctl/src/cli.rs, read from source because these tests do not build the Rust edition;
+    clap adds `--help`, `-h`, `--version` and `-V` itself.
+    """
+    import argparse
+    import re
+
+    herdr_agent = _cross_module("herdr_agent_differential")
+    from agentctl import cli as agentctl_cli
+
+    values: dict[str, set[str]] = {"python": set(), "rust": set()}
+    flags: dict[str, set[str]] = {"python": set(), "rust": {"--help", "-h", "--version", "-V"}}
+    for action in agentctl_cli.parser()._actions:
+        if isinstance(action, argparse._SubParsersAction) or not action.option_strings:
+            continue
+        (flags if action.nargs == 0 else values)["python"].update(action.option_strings)
+    source = (REPO_ROOT / "rs" / "agentctl" / "src" / "cli.rs").read_text(encoding="utf-8")
+    block = source.split("\nstruct Cli {\n", 1)[1].split("\n}\n", 1)[0]
+    for match in re.finditer(
+        r"#\[arg\((?P<attributes>[^\]]*?)\)\]\s*(?P<field>\w+):\s*(?P<type>[^,\n]+),", block
+    ):
+        attributes = match["attributes"]
+        assert re.search(r"\blong\b", attributes), match.group(0)
+        assert not re.search(r"\bshort\b|\baliases\b|long\s*=", attributes), match.group(0)
+        names = {"--" + match["field"].replace("_", "-")} | {
+            f"--{alias}"
+            for alias in re.findall(r'\b(?:visible_)?alias\s*=\s*"([^"]+)"', attributes)
+        }
+        (flags if match["type"].strip() == "bool" else values)["rust"].update(names)
+
+    assert {"--registry", "--state", "--herdr-bin"} <= values["python"]
+    assert {"--state", "--agentcloud-url", "--from-session", "--agentterm-bin"} <= values["rust"]
+    assert "--userguide" in flags["python"] & flags["rust"]
+    known = set(herdr_agent._GLOBAL_VALUE_OPTIONS)
+    assert values["python"] | values["rust"] == known
+    assert flags["python"] | flags["rust"] <= herdr_agent.HERDR_FREE_COMMANDS
+
+
 def test_a_stored_goal_command_reaches_the_transport_as_given_and_the_guard_refuses_it(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1220,7 +1405,12 @@ def test_a_stored_goal_command_reaches_the_transport_as_given_and_the_guard_refu
 def test_the_fixture_herdr_runs_no_custom_program_from_outside_the_case(
     tmp_path: Path, program: str
 ) -> None:
-    """A goal command the guard admits can still ask the fixture to run a program for it."""
+    """The fixture Herdr refuses to start a program from outside the case directory.
+
+    An edition starts a custom harness through `pane run` on the Herdr it was given, so the program
+    named there is an input the pre-spawn guard does not see. A goal command could once ask the
+    fixture for it too; only the `goal-rpc` mode is admitted now.
+    """
     import json
     import signal
     import subprocess
@@ -1235,10 +1425,9 @@ def test_the_fixture_herdr_runs_no_custom_program_from_outside_the_case(
         fixture = str(root / "fake-herdr")
         launch = f"{program.replace('<ROOT>', str(root))} --custom-harness"
         goal_command = json.dumps([fixture, "pane", "run", "w1:p1", launch])
-        # The command line names a fixture, so the pre-spawn guard admits it ...
         assert herdr_agent.host_cli_refusal(
             root, ["goal", "worker", "--herdr-bin", fixture, "--goal-command-json", goal_command]
-        ) is None
+        ) is not None
         refused = subprocess.run(
             [fixture, "pane", "run", "w1:p1", launch], cwd=root, stdin=subprocess.DEVNULL,
             capture_output=True, text=True, check=False, timeout=30,
@@ -1255,7 +1444,7 @@ def test_the_fixture_herdr_runs_no_custom_program_from_outside_the_case(
     finally:
         harness.close()
 
-    # ... and the fixture refuses the program and records it, as a stub would.
+    # The fixture refuses the program and records it, as a stub would.
     assert refused.returncode == 127, refused.stderr
     assert "refused to run" in refused.stderr
     calls = harness.host_cli_calls()

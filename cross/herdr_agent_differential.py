@@ -507,7 +507,14 @@ HERDR_FREE_COMMANDS = frozenset((
     "--help", "-h", "--version", "-V", "--userguide",
     "capabilities", "profiles", "quickstart", "skill", "userguide",
 ))
-_GLOBAL_VALUE_OPTIONS = ("--registry", "--state", "--herdr-bin")
+# Every option that either agentctl edition accepts before the command and that takes a value: the
+# Python root parser's three, and the Rust clap globals (rs/agentctl/src/cli.rs, `struct Cli`),
+# which add the agentcloud ones. A test reads both parsers so that a new one cannot hide the
+# command from herdr_refusal. Their other options before the command are in HERDR_FREE_COMMANDS.
+_GLOBAL_VALUE_OPTIONS = (
+    "--registry", "--state", "--herdr-bin", "--agentcloudctl-bin", "--agentterm-bin",
+    "--agentcloud-url", "--from-session",
+)
 # Options whose value an edition executes, with the program each one names. The Rust edition
 # alone has `--agentcloudctl-bin`, `--agentterm-bin` and the `inbox watch` option `--claude-bin`
 # (which runs `claude agents --json`): the Python edition rejects them as unknown, but the Rust
@@ -519,6 +526,14 @@ EXECUTABLE_OPTIONS = {
 # The native goal transport: a JSON array that an edition runs as an argv, its first element
 # unresolved and so never looked up on PATH when it contains a `/`.
 GOAL_COMMAND_OPTION = "--goal-command-json"
+# The only goal transport an edition may run, explicit or stored: the case's fake Herdr in the
+# mode that answers goal requests on its standard input (`["<HERDR>", "goal-rpc"]`).
+GOAL_TRANSPORT_FIXTURE = "fake-herdr"
+GOAL_TRANSPORT_ARGUMENTS = ("goal-rpc",)
+GOAL_TRANSPORT_DESCRIPTION = (
+    f"the case's fixture goal transport (./{GOAL_TRANSPORT_FIXTURE} "
+    f"{' '.join(GOAL_TRANSPORT_ARGUMENTS)})"
+)
 # The registry directory option (`--state` is its alias in both agentctl editions) and each
 # edition's default, relative to the working directory: `.agentctl` for agentctl and
 # `.herdr-agents` for the herdr-agent compatibility command.
@@ -567,20 +582,36 @@ def _goal_command_refusal(root: Path, value: str) -> str | None:
         command: object = json.loads(value)
     except ValueError:
         return f"{GOAL_COMMAND_OPTION} {value!r} is not JSON, so its program cannot be checked"
-    if _runs_case_fixture(root, command):
+    if _runs_goal_fixture(root, command):
         return None
-    return f"{GOAL_COMMAND_OPTION} {value!r} does not run a fixture inside the case directory"
+    return f"{GOAL_COMMAND_OPTION} {value!r} is not {GOAL_TRANSPORT_DESCRIPTION}"
 
 
-def _runs_case_fixture(root: Path, command: object) -> bool:
-    """Whether a decoded goal command is empty or runs a file inside the case directory."""
+def _runs_goal_fixture(root: Path, command: object) -> bool:
+    """Whether a decoded goal command is empty or is exactly the case's fixture goal transport.
+
+    Naming some file inside the case directory is not enough: every case also holds
+    `fake-muse-runtime`, a copy of the Python interpreter, which runs whatever program its
+    arguments give it. So the program must be GOAL_TRANSPORT_FIXTURE under both readings of `..`
+    (see _names_case_file), reached directly or through links inside the case, and the arguments
+    must be exactly GOAL_TRANSPORT_ARGUMENTS, the mode in which it answers requests on its
+    standard input and starts no process.
+    """
     if command == []:
         return True  # both editions reject an empty command before running anything
-    return (
+    if not (
         isinstance(command, list)
         and all(isinstance(word, str) for word in command)
+        and tuple(command[1:]) == GOAL_TRANSPORT_ARGUMENTS
         and _names_case_file(root, command[0])
-    )
+    ):
+        return False
+    real_root = os.path.realpath(root)
+    fixture = os.path.join(real_root, GOAL_TRANSPORT_FIXTURE)
+    program: str = command[0]
+    joined = program if os.path.isabs(program) else os.path.join(real_root, program)
+    readings = (os.path.realpath(joined), os.path.realpath(os.path.normpath(joined)))
+    return all(reading == fixture for reading in readings)
 
 
 def _stored_goal_commands(document: bytes) -> list[object]:
@@ -612,8 +643,8 @@ def stored_goal_command_refusal(root: Path, arguments: Sequence[str]) -> str | N
     _names_case_file): `./link/../registry` is one directory to the kernel and another to an
     edition that removes `..` first. Every directory and record file under it must stay inside
     too, symbolic links followed; a directory that cannot be listed is refused, since an edition
-    may still open a record in it by name. Every stored command must be null, empty, or run a file
-    inside the case directory.
+    may still open a record in it by name. Every stored command must be null, empty, or the case's
+    fixture goal transport (_runs_goal_fixture).
     """
     registries = [
         *(value for option in REGISTRY_OPTIONS for value in _option_values(arguments, option)),
@@ -657,10 +688,10 @@ def stored_goal_command_refusal(root: Path, arguments: Sequence[str]) -> str | N
                     except OSError:
                         continue  # unreadable to the editions too: they run as the same user
                     for command in _stored_goal_commands(document):
-                        if command is not None and not _runs_case_fixture(root, command):
+                        if command is not None and not _runs_goal_fixture(root, command):
                             return (
-                                f"{record!r} stores the goal command {command!r}, which does not "
-                                "run a fixture inside the case directory"
+                                f"{record!r} stores the goal command {command!r}, which is not "
+                                f"{GOAL_TRANSPORT_DESCRIPTION}"
                             )
             for error in errors:
                 # A registry that does not exist yet stores nothing; any other failure to list a
@@ -705,7 +736,10 @@ def herdr_refusal(root: Path, arguments: Sequence[str]) -> str | None:
 
     Call it through `host_cli_refusal`, which first refuses every `--herdr-bin` that names
     something outside the case directory. Tokens after the first `--` may be positional text, so
-    a `--herdr-bin` there never admits an invocation, and a help flag there asks for nothing.
+    a `--herdr-bin` there never admits an invocation, and a help flag there asks for nothing. The
+    command is the first token after the global options (_GLOBAL_VALUE_OPTIONS, spaced or `=`);
+    the Rust edition accepts more of them than the Python one, so `--from-session=ID chat` is a
+    Chat command to it.
     """
     options_end = arguments.index("--") if "--" in arguments else len(arguments)
     named = _option_values(arguments[:options_end], "--herdr-bin")
@@ -725,6 +759,16 @@ def herdr_refusal(root: Path, arguments: Sequence[str]) -> str | None:
         return None
     if index < options_end and arguments[index] in HERDR_FREE_COMMANDS:
         return None
+    if index < options_end and arguments[index].startswith("-"):
+        # An option that is not a global of either agentctl edition, so where the command starts
+        # is unknown: a command that ignores --herdr-bin may follow it.
+        for later in arguments[index + 1:]:
+            if later in HERDR_BIN_IGNORED_COMMANDS:
+                return (
+                    f"{later!r} follows the unrecognized option {arguments[index]!r}, so it may "
+                    "be the command, which ignores --herdr-bin and runs the Herdr installed on "
+                    "this host"
+                )
     if index + 1 < options_end and arguments[index + 1] in ("--help", "-h"):
         return None
     if arguments[index] in HERDR_BIN_IGNORED_COMMANDS:

@@ -75,13 +75,22 @@ directory refuses the invocation, even after a `--`: after a `--` at the start
 of the command line, the Python subcommand parser reads the remaining tokens as
 options again. `agentctl chat` is refused even with the fixture, apart from its
 help, because the Python edition's Chat bridge ignores `--herdr-bin` and always
-runs the installed Herdr.
+runs the installed Herdr. The command is found after every option either edition
+accepts before it, spaced or with `=`, including the Rust-only `--agentcloudctl-bin`,
+`--agentterm-bin`, `--agentcloud-url` and `--from-session`, so
+`--from-session=ID chat publish` is refused too; a test reads both parsers to keep
+that list complete. After any other option, a `chat` anywhere later refuses the
+invocation, since where the command starts is then unknown.
 
 A stub cannot catch a program named by an explicit path either, so the same
 refusal applies, wherever the option appears, to an `--agentcloudctl-bin`,
 `--agentterm-bin` or `--claude-bin` (Rust edition only) that names a file
 outside the case directory, and to a `--goal-command-json` unless it is `[]` or
-an array of strings whose first element names a file inside the case directory.
+exactly the fixture goal transport, `["<HERDR>","goal-rpc"]`: its program must be
+the case's `fake-herdr` under both readings of `..` (a link to it counts), and its
+only argument `goal-rpc`, the mode that answers requests on standard input and
+starts nothing. Naming any file inside the case is not enough, because every case
+also holds `fake-muse-runtime`, a copy of the Python interpreter.
 Without `--goal-command-json`, an edition runs the goal command stored in the
 agent record, so the same rule applies to every `goal_command` and
 `native_command` field in the `.json` files of each registry the invocation
