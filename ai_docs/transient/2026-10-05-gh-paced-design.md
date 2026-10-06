@@ -1752,3 +1752,12 @@ pagination and limit costs, watch loops, alias inspection), adds one test
     read at a cutoff queues what it reads first and the reader calls the hook
     once afterwards, so that output can reach the consumer before its
     cooldown is recorded.
+- Round-15 minor, not changed (review of `4a8d48c0..95c11a27`, approved):
+  the reader's non-blocking reads depend on `F_GETFL` and `F_SETFL`
+  succeeding when it takes gh's stream. If either fails, `ReadEnd` keeps
+  blocking reads, so the stale-poll hang of round 14 is possible again; if
+  restoring the flags fails before a handoff, the drainer's first read in a
+  pause fails with `EAGAIN` and ends the copy. Neither error is checked or
+  reported, and the `runner.rs` module documentation states the non-blocking
+  reads without this condition. No failure of these calls is known for the
+  pipe read end and pseudo-terminal master that gh-paced creates itself.
