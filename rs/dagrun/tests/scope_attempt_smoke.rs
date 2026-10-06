@@ -257,6 +257,101 @@ fn a_forced_attempt_that_fails_reports_a_probe_failure_not_a_skip() {
     );
 }
 
+/// B2: a probe whose `systemd-run` never answers is killed at its timeout, attempt by attempt.
+///
+/// The fake writes a recognisable line to stderr and then stops itself, which is how a call blocked
+/// on an unresponsive user bus looks from outside. Two attempts of 8 seconds plus the 1-second
+/// backoff make about 17 seconds; the case gives the binary 60 before it kills it and fails, so a
+/// probe that waits without a bound fails here instead of hanging the suite.
+#[test]
+fn a_probe_that_never_answers_is_killed_at_its_timeout() {
+    let fx = Fixture::new("forced_hang");
+    let shim_dir = fx.dir.join("bin");
+    std::fs::create_dir_all(&shim_dir).unwrap();
+    let systemd_run = shim_dir.join("systemd-run");
+    let calls = fx.dir.join("systemd-run.calls");
+    std::fs::write(
+        &systemd_run,
+        format!(
+            "#!/bin/sh\necho \"$$ $*\" >> '{}'\necho 'fake: bus not answering' >&2\nkill -STOP $$\n",
+            calls.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&systemd_run, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let path = format!(
+        "{}:{}",
+        shim_dir.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let mut cmd = runner_command();
+    cmd.args(["run", "--dag", fx.dag().to_str().unwrap(), "--no-profile"])
+        .env("DAGRUN_NO_STEP_LOGS", "1")
+        .env("CI", "1")
+        .env("DAGRUN_FORCE_SCOPE_ATTEMPT", "1")
+        .env("PATH", &path)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    let started = std::time::Instant::now();
+    let mut child = cmd.spawn().expect("failed to spawn the built binary");
+    let limit = std::time::Duration::from_secs(60);
+    let exited = loop {
+        if child.try_wait().unwrap().is_some() {
+            break true;
+        }
+        if started.elapsed() >= limit {
+            let _ = child.kill();
+            break false;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    };
+    let took = started.elapsed();
+    // A fake the binary failed to kill is still stopped and may hold the
+    // inherited output pipes open, so kill it before reading to EOF. Only a
+    // stopped process is killed: a pid the binary already reaped may be reused.
+    let calls = std::fs::read_to_string(&calls).unwrap_or_default();
+    for pid in calls
+        .lines()
+        .filter_map(|line| line.split_whitespace().next())
+    {
+        let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).unwrap_or_default();
+        let state = stat.rsplit_once(") ").map(|(_, rest)| rest.chars().next());
+        if state == Some(Some('T')) {
+            let _ = Command::new("kill").args(["-KILL", pid]).status();
+        }
+    }
+    let out = child.wait_with_output().unwrap();
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    assert!(
+        exited,
+        "the probe must not wait on systemd-run without a bound; killed after {took:?}:\n{text}"
+    );
+    assert_eq!(
+        out.status.code(),
+        Some(3),
+        "a scope that never answers still refuses:\n{text}"
+    );
+    for attempt in 1..=2 {
+        assert!(
+            text.lines().any(|line| {
+                line.contains(&format!("probe attempt {attempt} of 2 failed"))
+                    && line.contains("timed out after 8s")
+                    && line.contains("fake: bus not answering")
+            }),
+            "attempt {attempt} must report its timeout and the stderr written before it:\n{text}"
+        );
+    }
+    assert!(
+        took >= std::time::Duration::from_secs(16) && took < std::time::Duration::from_secs(40),
+        "two 8-second attempts and a 1-second backoff, not {took:?}:\n{text}"
+    );
+}
+
 /// C (control): `--allow-cgroup-failure` is unaffected — the sanctioned opt-out still runs unboxed.
 ///
 /// This is the path every consuming CI lane actually takes, and it short-circuits ahead of the scope
