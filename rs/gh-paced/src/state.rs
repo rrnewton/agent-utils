@@ -388,6 +388,17 @@ fn merge_recovery(state: &mut State, recovery: State) {
     }
 }
 
+/// Lengthen the cooldown record to `cd` unless it already runs at least as long, without
+/// touching the state file (the next [`load`] merges the record in). True when it was written.
+/// An unreadable record is left for [`load`] to recover from and reported as an error. Call only
+/// while holding [`lock`].
+pub fn extend_cooldown(paths: &Paths, cd: &Cooldown) -> Result<bool, String> {
+    if read_cooldown(paths)?.is_some_and(|old| old.until >= cd.until) {
+        return Ok(false);
+    }
+    save_cooldown(paths, cd).map(|()| true)
+}
+
 /// Write the cooldown record atomically. Call only while holding [`lock`].
 pub fn save_cooldown(paths: &Paths, cd: &Cooldown) -> Result<(), String> {
     let text = serde_json::to_vec_pretty(cd).map_err(|e| format!("cannot encode cooldown: {e}"))?;

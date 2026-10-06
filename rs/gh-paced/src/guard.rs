@@ -916,14 +916,18 @@ fn is_b64(b: u8) -> bool {
 
 /// Length of the longest base64-looking content in `text`.
 ///
-/// Two shapes count, whatever characters of the alphabet they use (a hex dump, a lower-case-only
+/// Three shapes count, whatever characters of the alphabet they use (a hex dump, a lower-case-only
 /// encoding and a ruler all count, so nothing long slips through as a "word"):
 ///
 /// - one unbroken run of base64-alphabet characters;
 /// - a block of consecutive lines, each at least 20 characters and made only of base64-alphabet
-///   characters, taken together. A list of bare commit SHAs, one per line, is such a block: 25
+///   characters, taken together. A list of bare commit SHAs, one per line, is such a block: 26
 ///   or more of them exceed the default 1,000-character limit. Write them with some prose on
-///   each line, or set `GH_PACED_ALLOW_LARGE_BODY=1`.
+///   each line, or set `GH_PACED_ALLOW_LARGE_BODY=1`;
+/// - a block of consecutive base64-alphabet lines of any width that all have the same width,
+///   except that the last may be shorter. This is the shape of an encoding wrapped at a fixed
+///   column, however narrow, so wrapping at 16 or 8 columns does not hide one. Lines of
+///   differing width (a list of identifiers, one per line) do not form this kind of block.
 pub fn longest_base64_run(text: &[u8]) -> usize {
     let mut best = 0;
     let mut run = 0;
@@ -936,16 +940,38 @@ pub fn longest_base64_run(text: &[u8]) -> usize {
         }
     }
     let mut block = 0;
+    // Equal-width block: its line width (0 when no block is open) and its total length.
+    let mut width = 0;
+    let mut even = 0;
     for line in text.split(|&b| b == b'\n').chain(std::iter::once(&b""[..])) {
         let trimmed = trim_ascii(line);
-        if trimmed.len() >= 20 && trimmed.iter().all(|&b| is_b64(b)) {
+        let encoded = !trimmed.is_empty() && trimmed.iter().all(|&b| is_b64(b));
+        if encoded && trimmed.len() >= 20 {
             block += trimmed.len();
         } else {
             best = best.max(block);
             block = 0;
         }
+        let len = trimmed.len();
+        if !encoded {
+            best = best.max(even);
+            width = 0;
+            even = 0;
+        } else if width == len {
+            even += len;
+        } else if width > len {
+            // A shorter line is the last line of a wrapped encoding: it ends the block. It may
+            // also be the first line of the next one.
+            best = best.max(even + len);
+            width = len;
+            even = len;
+        } else {
+            best = best.max(even);
+            width = len;
+            even = len;
+        }
     }
-    best
+    best.max(even)
 }
 
 fn trim_ascii(line: &[u8]) -> &[u8] {
@@ -1691,9 +1717,42 @@ mod tests {
             .map(|i| format!("{:040x} fix the thing\n", 0x1234_5678_9abc_u64 * (i + 1)))
             .collect();
         assert_eq!(longest_base64_run(log.as_bytes()), 40);
-        // Short lines (under 20 characters) do not join a block.
+        // Short lines of one width are an encoding wrapped at a narrow column: they form a block
+        // (this was 10 before the equal-width rule; the guard now refuses it).
         let short: String = (0..200).map(|_| "abcdefghij\n").collect();
-        assert_eq!(longest_base64_run(short.as_bytes()), 10);
+        assert_eq!(longest_base64_run(short.as_bytes()), 2000);
+        // Canonical base64 wrapped at 16 and at 8 columns, with a shorter last line, counts in full.
+        for cols in [16, 8] {
+            let enc = format!("{}YWI=", "YWJj".repeat(300));
+            let wrapped: String = enc
+                .as_bytes()
+                .chunks(cols)
+                .map(|c| format!("{}\r\n", String::from_utf8_lossy(c)))
+                .collect();
+            assert_eq!(
+                longest_base64_run(wrapped.as_bytes()),
+                1204,
+                "{cols} columns"
+            );
+        }
+        // A list of identifiers of differing widths, one per line, is not an encoding.
+        let names: String = (0..200)
+            .map(|i| format!("test_case_{}\n", "x".repeat(i % 7)))
+            .collect();
+        assert!(longest_base64_run(names.as_bytes()) < 100, "{names}");
+        // The list sizes the user guide quotes: 7-character short SHAs and 4-digit numbers, one
+        // per line, cross the default 1,000 at 143 and at 251 lines.
+        let shas = |n: u64| -> String {
+            (0..n)
+                .map(|i| format!("{:07x}\n", 0xa1_b2c3 + i * 977))
+                .collect()
+        };
+        assert_eq!(longest_base64_run(shas(142).as_bytes()), 994);
+        assert_eq!(longest_base64_run(shas(143).as_bytes()), 1001);
+        let numbers =
+            |n: u64| -> String { (0..n).map(|i| format!("{}\n", 1000 + i * 7)).collect() };
+        assert_eq!(longest_base64_run(numbers(250).as_bytes()), 1000);
+        assert_eq!(longest_base64_run(numbers(251).as_bytes()), 1004);
     }
 
     #[test]

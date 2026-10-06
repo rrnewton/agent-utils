@@ -7,17 +7,20 @@
 use crate::audit::{self, Record};
 use crate::budget::{halved, Bucket};
 use crate::classify::{classify, Class, Classification};
-use crate::clock::Clock;
+use crate::clock::{Clock, RealClock};
 use crate::config::{ClassLimits, Config};
 use crate::guard::{self, Verdict};
 use crate::pushback::{Pushback, Scanner};
 use crate::ratelimit;
-use crate::runner::{Exit, Invocation, Ran, Runner};
+use crate::runner::{write_stderr_bounded, Exit, Invocation, PushbackHook, Ran, Runner};
 use crate::snapshot;
 use crate::state::{self, Cooldown, Holder, Lease, Paths, State};
 use crate::timefmt::human;
+use std::io::Write;
 use std::os::fd::RawFd;
 use std::path::PathBuf;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 /// Exit status when a budget, cooldown or recursion limit refuses the call.
 pub const EXIT_REFUSED: i32 = 75;
@@ -33,6 +36,9 @@ pub const EXIT_NO_GH: i32 = 127;
 /// How often a WRITE waiting for another in-flight WRITE re-checks, seconds. Every re-check
 /// prints a warning and writes a `throttle` audit record.
 pub const IN_FLIGHT_POLL_SECS: f64 = 5.0;
+/// After a signal arrives while gh's output is still being delivered, how long gh-paced's own
+/// messages may take to reach stderr before the rest are dropped (they stay in the audit log).
+pub const LATE_SIGNAL_STDERR_SECS: f64 = 2.0;
 /// How often a call waiting for another process's rate-limit refresh re-checks, seconds.
 pub const REFRESH_POLL_SECS: f64 = 1.0;
 /// The `command` recorded on the pause set by [`recovery_state`].
@@ -92,6 +98,11 @@ pub struct Wrapper<'a> {
     pub start_ticks: u64,
     /// This invocation's random identifier.
     pub nonce: String,
+    /// Construct with `None`. Set once a signal arrives while gh's output is still being
+    /// delivered: messages are then written to stderr only until this instant, each write given
+    /// up when it would wait past it, so a consumer that has stopped reading cannot keep
+    /// gh-paced from dying by the signal.
+    pub stderr_deadline: Option<Instant>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -129,6 +140,26 @@ enum RefreshStep {
 struct Admitted {
     waited: f64,
     lease: Option<Lease>,
+}
+
+/// Record the cooldown `pb` calls for in the account's cooldown record, unless a longer one is
+/// already recorded, as soon as gh's output shows the pushback. Prints nothing: it runs on a
+/// reader thread while gh's output streams, and [`Wrapper::finish`] prints the banner and
+/// records the same cooldown in the state file afterwards. True when the record was written.
+pub fn publish_cooldown(
+    paths: &Paths,
+    now: f64,
+    pb: &Pushback,
+    command: &str,
+) -> Result<bool, String> {
+    let _guard = state::lock(paths)?;
+    let cd = Cooldown {
+        until: now + pb.cooldown_secs,
+        set_at: now,
+        reason: pb.reason.clone(),
+        command: command.to_string(),
+    };
+    state::extend_cooldown(paths, &cd)
 }
 
 /// State used in place of an unusable state file: every class blocked for the next hour
@@ -184,7 +215,14 @@ fn paced_api(class: Class) -> bool {
 impl Wrapper<'_> {
     fn emit(&mut self, line: String) {
         if self.echo {
-            eprintln!("{line}");
+            match self.stderr_deadline {
+                None => {
+                    let _ = writeln!(std::io::stderr(), "{line}");
+                }
+                Some(deadline) => {
+                    write_stderr_bounded(format!("{line}\n").into_bytes(), deadline);
+                }
+            }
         }
         self.messages.push(line);
     }
@@ -394,10 +432,26 @@ impl Wrapper<'_> {
         c: &Classification,
         keep_fds: Vec<RawFd>,
     ) -> (Outcome, Scanner, Option<Ran>) {
-        let mut scanner = Scanner::new();
+        // One response (no --paginate): only the header block on its first stdout line is read.
+        let mut scanner = if c.api.as_ref().is_some_and(|a| a.include && !a.paginate) {
+            Scanner::single_response()
+        } else {
+            Scanner::new()
+        };
         let local = c.class == Class::Local;
         let env = if local { Vec::new() } else { self.child_env() };
         let real_gh = self.real_gh.clone();
+        let on_pushback = if local {
+            None
+        } else {
+            let (paths, cfg, command) = (self.paths.clone(), self.cfg.clone(), c.command.clone());
+            Some(PushbackHook(Arc::new(move |s: &Scanner| {
+                if let Some(pb) = s.verdict(&cfg) {
+                    // Errors surface later: finish() records the same cooldown and reports them.
+                    let _ = publish_cooldown(&paths, RealClock.now(), &pb, &command);
+                }
+            })))
+        };
         let inv = Invocation {
             program: &real_gh,
             args,
@@ -406,12 +460,15 @@ impl Wrapper<'_> {
             deadline_secs: if local { None } else { c.deadline_secs },
             keep_fds,
             scan_stdout: !local && c.api.as_ref().is_some_and(|a| a.include),
+            on_pushback,
         };
         match self.runner.run(inv, &mut scanner) {
             Ok(ran) => {
                 let outcome = match (ran.exit, ran.late_signal) {
                     (Exit::Signal(s), _) => Outcome::Signal(s),
                     (Exit::Code(n), Some(sig)) => {
+                        self.stderr_deadline =
+                            Some(Instant::now() + Duration::from_secs_f64(LATE_SIGNAL_STDERR_SECS));
                         self.loud(
                             "WARNING",
                             &format!(
@@ -572,6 +629,7 @@ impl Wrapper<'_> {
                 deadline_secs: None,
                 keep_fds: Vec::new(),
                 scan_stdout: false,
+                on_pushback: None,
             },
             self.cfg.rate_limit_timeout_secs,
         );

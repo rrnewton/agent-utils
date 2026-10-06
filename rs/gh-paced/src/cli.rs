@@ -346,6 +346,7 @@ fn run_paced(account: Option<String>, real_gh: Option<String>, gh_args: Vec<Stri
         pid,
         start_ticks: state::process_start_ticks(pid).unwrap_or(0),
         nonce: state::new_nonce(now),
+        stderr_deadline: None,
     };
     match w.run(&gh_args) {
         Outcome::Exit(code) => code,

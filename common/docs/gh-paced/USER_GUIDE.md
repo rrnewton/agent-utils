@@ -70,13 +70,19 @@ setting (`!gh auth git-credential`) goes through the same wrapper. That means
   consumer reads; gh feels the same back-pressure it would without gh-paced
   once 8 MiB is queued. After gh exits, gh-paced keeps reading until end of
   file, 2 s of silence, 5 s after the exit, or 64 MiB more, whichever comes
-  first, because a background process gh started may hold the stream open. If
-  you send INT, TERM, HUP or QUIT after gh has exited, the output not yet
-  delivered is dropped with a warning and gh-paced dies by that signal. A
-  write gh-paced has already started cannot be interrupted, so if the program
-  reading its stdout or stderr has stopped reading, the warning and the exit
-  wait until that program reads again or closes the stream. KILL still ends
-  gh-paced at once.
+  first, because a background process gh started may hold the stream open.
+  Anything that process writes after that is lost (see
+  [Limitations](#limitations)).
+- **A signal after gh has exited** (INT, TERM, HUP or QUIT, sent to gh-paced
+  or typed at its terminal, while gh-paced is still delivering gh's output)
+  drops the output not yet delivered, and gh-paced dies by that signal
+  promptly, even when the program reading its stdout or stderr has stopped
+  reading. Its warning is printed only if stderr accepts it within 2 s. A
+  signal while gh is still running goes to gh instead (see the exit status
+  below); if gh then exits while the reader is stalled, gh-paced goes on
+  waiting for the reader, and a second signal ends it. A signal that arrives
+  within a few milliseconds of gh's exit, before gh-paced has noticed the exit,
+  has no effect; send it again. KILL ends gh-paced at once.
 - **stdin** and the controlling terminal are inherited. The one exception: a
   write whose body arrives on stdin (`--body-file -`, `--input -`, `-F body=@-`)
   is read first so the content guard can check it, then replayed to gh byte for
@@ -280,18 +286,25 @@ reads is still found. It looks for:
 For `gh api -i/--include`, gh prints the HTTP status line and response headers
 on **stdout** instead. For that form only, gh-paced also reads stdout as it
 passes through, looking only inside header blocks: a 403 or 429 status,
-`Retry-After`, and `X-RateLimit-Remaining: 0`. A header block is recognised
-only in the shape gh prints it: an `HTTP/<version> <status>` line, header lines
-ending in CRLF, and a CRLF blank line, and it is acted on only when that blank
-line arrives. Body lines that merely look like a status line and headers, such
-as lines printed through `--jq`, end in a bare LF and are not treated as a
-header. Two cases remain. A body that itself contains that exact shape with
-CRLF line endings is read as one more header block and can start a cooldown
-that was not needed; this errs on the safe side. A genuine header block cut off
-before its blank line is not acted on: gh's own error text on stderr (for
-example `HTTP 429`) usually still starts the 900 s cooldown, but a longer
-`Retry-After` in the cut-off block is lost. stdout itself is passed on
-unchanged.
+`Retry-After`, and `X-RateLimit-Remaining: 0`. gh prints a header block as an
+`HTTP/<version> <status>` line, then header lines ending in CRLF, then a CRLF
+blank line. stdout itself is passed on unchanged.
+
+- **One response (no `--paginate`).** gh prints exactly one header block, and
+  it is the first thing on stdout. gh-paced reads that first block and nothing
+  after it, so a response body cannot start a cooldown, whatever it contains.
+  The block counts even if it is cut off before its blank line (the stream
+  ended, or a line of another shape followed), so a cut-off block keeps its
+  `Retry-After`.
+- **`--paginate`.** gh prints one header block per page, each after the
+  previous page's body, so gh-paced reads every block it finds in the shape
+  above. A block counts when its CRLF blank line arrives, or when the output
+  ends after at least one of its CRLF header lines. Body lines that merely look
+  like a status line and headers, such as lines printed through `--jq`, end in
+  a bare LF and are not treated as a header. A page body that itself contains
+  that exact shape with CRLF line endings is read as one more header block and
+  can start a cooldown that was not needed. gh-paced cannot tell such a body
+  from a real page boundary, so this errs on the safe side.
 
 Any limit signal (one of the phrases, HTTP 429, a `Retry-After` value, or
 `X-RateLimit-Remaining: 0`) starts a **cooldown** of the larger of `Retry-After`
@@ -300,10 +313,11 @@ and 900 s (`cooldown_secs`). A plain `HTTP 403` starts a cooldown of
 GitHub does not always say that a 403 is a rate limit, so every 403 is treated
 as one. During a cooldown, every paced call for that account on that host waits
 or is refused. A new cooldown only ever extends an existing one. gh's own output
-and exit status still pass through. The cooldown is recorded once gh-paced has
-delivered all of gh's output, so if the program reading that output stops
-reading, recording waits too, and other calls on the host go ahead meanwhile
-without the pause.
+and exit status still pass through. The cooldown is recorded as soon as the
+signal is read from gh's output, before that output is passed on, so other
+calls on the host pause at once even if the program reading this call's output
+is slow or has stopped reading. The banner below is printed after gh's output
+has been passed on.
 
 The banner looks like this:
 
@@ -367,12 +381,17 @@ Base64-looking content is either of:
   as a "word";
 - a block of consecutive lines, each at least 20 characters and made only of
   base64-alphabet characters, counted together, whatever they contain. The
-  usual 64- and 76-column wrapping therefore does not hide an encoding. Lines
-  shorter than 20 characters are not joined, so an encoding wrapped at fewer
-  than 20 columns escapes this check. A list of bare commit SHAs, one
-  per line, is such a block too: 26 or more 40-character SHAs exceed 1,000. Put
-  a word on each line (`<sha> fix the parser`), or point at a commit range,
-  instead.
+  usual 64- and 76-column wrapping therefore does not hide an encoding;
+- a block of consecutive base64-alphabet lines of any width that all have the
+  same width, except that the last may be shorter, counted together. This is
+  the shape of an encoding wrapped at a fixed column, so wrapping at 16 or 8
+  columns does not hide one either. Lines of differing widths, such as a list
+  of test names one per line, do not form this kind of block.
+
+Lists can match these shapes too. Bare commit SHAs one per line are refused at
+26 or more full 40-character SHAs, or 143 or more 7-character short SHAs; a
+column of 4-digit numbers one per line is refused at 251 lines. Put a word on
+each line (`<sha> fix the parser`), or point at a commit range, instead.
 
 The refusal names every reason that applies. Files are read only up to the
 limit plus one byte, so a very large file is reported as "at least" that size:
@@ -650,26 +669,29 @@ next slot opens.
   GraphQL request whose query cannot be read is charged as WRITE.
 - **The in-flight slot is held by a lock on a file.** Deleting a lease file by
   hand frees the slot early; see [Waiting and refusing](#waiting-and-refusing).
-- **Watch charges are estimates.** The requests per poll are worked out from
-  what gh fetches, not measured. A `gh run watch` on a run with more than 100
-  jobs, or with several jobs that fail during the watch, can make more requests
-  than it paid for before its deadline; the deadline still bounds how long it
-  runs and the 30 s floor how often it polls.
+- **Watch charges are estimates.** gh-paced sees a watch's command line and
+  output, not the HTTP requests gh makes on each poll, so it cannot count them;
+  the requests per poll are worked out from what gh fetches. A `gh run watch`
+  on a run with more than 100 jobs, or with several jobs that fail during the
+  watch, can make more requests than it paid for before its deadline; the
+  deadline still bounds how long it runs and the 30 s floor how often it polls.
 - **Pushback detection depends on gh's error text.** gh-paced recognises the
   phrases GitHub and gh use today. A change in that wording could hide a
   pushback, but GitHub's account-wide counters (above) still apply.
-- **Delivering gh's output comes first.** A detected pushback is recorded, and
-  a late signal acted on, only after gh-paced finishes writing gh's output. A
-  program that stops reading that output delays both; see
-  [pushback](#github-pushback-and-the-cooldown) and
-  [What passes through unchanged](#what-passes-through-unchanged).
-- **Output written long after gh exits can be lost.** gh-paced stops reading a
+- **A signal can arrive too early or too late to end gh-paced at once.** A
+  signal sent while gh runs goes to gh; if gh exits but the program reading
+  the output has stopped reading, gh-paced keeps waiting until a second signal.
+  A signal in the few milliseconds between gh's exit and gh-paced noticing it
+  is lost. See [What passes through unchanged](#what-passes-through-unchanged).
+- **Output written long after gh exits is lost.** gh-paced stops reading a
   stream 2 s after it goes quiet, 5 s after gh exits, or after 64 MiB more. A
-  background process gh started that writes later loses that output, and any
-  pushback text in it is not seen.
-- **Header and encoding detection work by shape.** A response body containing
-  a CRLF header block can start an unneeded cooldown, a header block cut off
-  before its blank line loses its `Retry-After`, and base64 wrapped at fewer
-  than 20 columns is not detected (see
+  background process gh started that writes later loses that output (it gets
+  a write error, or SIGPIPE), and any pushback text in it is not seen. gh-paced
+  cannot know whether such a process will write again: waiting for the stream
+  to close would hold gh's exit status until, for example, a browser that
+  `--web` opened is closed.
+- **Header and encoding detection work by shape.** With `--paginate`, a page
+  body containing a CRLF header block can start an unneeded cooldown. The
+  content guard can refuse a long list of equal-width tokens one per line (see
   [pushback](#github-pushback-and-the-cooldown) and
   [the write content guard](#the-write-content-guard)).
