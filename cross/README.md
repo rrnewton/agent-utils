@@ -78,10 +78,20 @@ help, because the Python edition's Chat bridge ignores `--herdr-bin` and always
 runs the installed Herdr.
 
 A stub cannot catch a program named by an explicit path either, so the same
-refusal applies, wherever the option appears, to an `--agentcloudctl-bin` or
-`--agentterm-bin` (Rust edition only) that names a file outside the case
-directory, and to a `--goal-command-json` unless it is `[]` or an array of
-strings whose first element names a file inside the case directory.
+refusal applies, wherever the option appears, to an `--agentcloudctl-bin`,
+`--agentterm-bin` or `--claude-bin` (Rust edition only) that names a file
+outside the case directory, and to a `--goal-command-json` unless it is `[]` or
+an array of strings whose first element names a file inside the case directory.
+Without `--goal-command-json`, an edition runs the goal command stored in the
+agent record, so the same rule applies to every `goal_command` and
+`native_command` field in the `.json` files of each registry the invocation
+can read: each `--registry` or `--state` value, otherwise both defaults
+(`.agentctl` and `.herdr-agents`). Each registry, and everything under it with
+symbolic links followed, must also stay inside the case directory. The fixture
+Herdr applies the rule to the custom harness program it runs for `pane run`,
+recording a refusal in the same log, and the editions get an empty standard
+input, so a request read from it (by `agentctl mcp`) cannot name a goal command
+the harness has not checked.
 
 The harness also asks each implementation for its embedded user guide and
 checks that the page is complete and does not mention the sibling language or

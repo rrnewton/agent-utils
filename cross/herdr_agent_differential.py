@@ -106,6 +106,15 @@ def save():
 def envelope(result):
     print(json.dumps({"result": result}, sort_keys=True))
 
+def outside_case(program):
+    # A bare name would be looked up on PATH; a path must stay inside this case directory both
+    # with links followed before `..` (the kernel) and with `..` removed first.
+    if os.sep not in program:
+        return True
+    joined = os.path.join(os.getcwd(), program)
+    readings = (os.path.realpath(joined), os.path.realpath(os.path.normpath(joined)))
+    return any(os.path.commonpath((reading, root)) != root for reading in readings)
+
 def verified_composer():
     # Claude and Codex panes render a composer that clients stage text into and submit from.
     return not state.get("custom_harness") and state.get("harness", "codex") in ("claude", "codex")
@@ -257,6 +266,17 @@ elif args[:2] == ["pane", "run"]:
     parsed = shlex.split(args[3])
     state["launch_arguments"] = parsed[1:]
     state["custom_harness"] = True
+    if parsed and outside_case(parsed[0]):
+        # The harness's rule for a program an edition runs, applied to the one this fixture runs.
+        with open(os.path.join(root, "host-cli-guard.jsonl"), "a", encoding="utf-8") as stream:
+            stream.write(json.dumps({
+                "program": parsed[0], "argv": args, "cwd": os.getcwd(),
+                "refused": "the fixture Herdr runs only a program inside its case directory",
+            }) + "\n")
+        print("cross harness host CLI guard: the fixture Herdr refused to run "
+              f"{parsed[0]!r}, which is not inside the case directory", file=sys.stderr)
+        save()
+        raise SystemExit(127)
     child_command = (["/bin/sleep", "60"] if state.get("wrong_custom_process_identity")
                      else [parsed[0], "-c", "import time; time.sleep(60)"])
     child = subprocess.Popen(
@@ -437,7 +457,10 @@ print(json.dumps({"installed": {"id": name}}))
 #
 # A stub cannot catch an executable named by an explicit path either. `host_cli_refusal` also
 # refuses, before spawning, every invocation that names an executable outside the case directory
-# through an option (see EXECUTABLE_OPTIONS and GOAL_COMMAND_OPTION).
+# through an option (see EXECUTABLE_OPTIONS and GOAL_COMMAND_OPTION) or through a goal command
+# stored in the registry it reads (see STORED_GOAL_COMMAND_KEYS). The fixture Herdr applies the
+# same rule to the custom harness program it runs for `pane run`, and the editions get an empty
+# standard input, so a request read from it (the `agentctl mcp` server's) cannot name one either.
 HOST_CLI_GUARDED = (
     "agentcloudctl", "agentterm", "agy", "claude", "codex", "gh", "herdr", "muse", "opencode",
     "tmux", "wrkslots",
@@ -486,14 +509,24 @@ HERDR_FREE_COMMANDS = frozenset((
 ))
 _GLOBAL_VALUE_OPTIONS = ("--registry", "--state", "--herdr-bin")
 # Options whose value an edition executes, with the program each one names. The Rust edition
-# alone has `--agentcloudctl-bin` and `--agentterm-bin`: the Python edition rejects them as
-# unknown, but the Rust edition may already have run the program by then.
+# alone has `--agentcloudctl-bin`, `--agentterm-bin` and the `inbox watch` option `--claude-bin`
+# (which runs `claude agents --json`): the Python edition rejects them as unknown, but the Rust
+# edition may already have run the program by then.
 EXECUTABLE_OPTIONS = {
     "--herdr-bin": "herdr", "--agentcloudctl-bin": "agentcloudctl", "--agentterm-bin": "agentterm",
+    "--claude-bin": "claude",
 }
 # The native goal transport: a JSON array that an edition runs as an argv, its first element
 # unresolved and so never looked up on PATH when it contains a `/`.
 GOAL_COMMAND_OPTION = "--goal-command-json"
+# The registry directory option (`--state` is its alias in both agentctl editions) and each
+# edition's default, relative to the working directory: `.agentctl` for agentctl and
+# `.herdr-agents` for the herdr-agent compatibility command.
+REGISTRY_OPTIONS = ("--registry", "--state")
+DEFAULT_REGISTRIES = (".agentctl", ".herdr-agents")
+# Record fields that hold a goal transport the editions run when the command line names none:
+# `goal_command` in a flat record, `native_command` under `goal` in nested storage.
+STORED_GOAL_COMMAND_KEYS = frozenset(("goal_command", "native_command"))
 # Commands that ignore `--herdr-bin`: the Python `agentctl chat` builds a default HerdrClient,
 # which runs the installed Herdr, so naming the fixture cannot redirect it.
 HERDR_BIN_IGNORED_COMMANDS = frozenset(("chat",))
@@ -510,8 +543,11 @@ def _names_case_file(root: Path, value: str) -> bool:
     to the first and `./herdr` to the second. A value counts only if both readings stay inside
     the case directory.
     """
-    if os.sep not in value:
-        return False
+    return os.sep in value and _inside_case(root, value)
+
+
+def _inside_case(root: Path, value: str) -> bool:
+    """Whether a path, relative to the case root, stays inside it under both readings of `..`."""
     real_root = os.path.realpath(root)
     joined = value if os.path.isabs(value) else os.path.join(real_root, value)
     readings = (os.path.realpath(joined), os.path.realpath(os.path.normpath(joined)))
@@ -531,27 +567,103 @@ def _goal_command_refusal(root: Path, value: str) -> str | None:
         command: object = json.loads(value)
     except ValueError:
         return f"{GOAL_COMMAND_OPTION} {value!r} is not JSON, so its program cannot be checked"
+    if _runs_case_fixture(root, command):
+        return None
+    return f"{GOAL_COMMAND_OPTION} {value!r} does not run a fixture inside the case directory"
+
+
+def _runs_case_fixture(root: Path, command: object) -> bool:
+    """Whether a decoded goal command is empty or runs a file inside the case directory."""
     if command == []:
-        return None  # both editions reject an empty command before running anything
-    if (
+        return True  # both editions reject an empty command before running anything
+    return (
         isinstance(command, list)
         and all(isinstance(word, str) for word in command)
         and _names_case_file(root, command[0])
-    ):
-        return None
-    return f"{GOAL_COMMAND_OPTION} {value!r} does not run a fixture inside the case directory"
+    )
+
+
+def _stored_goal_commands(document: bytes) -> list[object]:
+    """Every value of a STORED_GOAL_COMMAND_KEYS field at any depth, duplicate keys included."""
+    found: list[object] = []
+
+    def pairs(items: list[tuple[str, object]]) -> dict[str, object]:
+        found.extend(value for key, value in items if key in STORED_GOAL_COMMAND_KEYS)
+        return dict(items)
+
+    try:
+        json.loads(document, object_pairs_hook=pairs)
+    except ValueError:
+        # Not JSON to this parser, so not to the Python edition, which reads records with the same
+        # parser, or to the Rust edition, whose parser accepts less: neither can run a command
+        # from it.
+        return []
+    return found
+
+
+def stored_goal_command_refusal(root: Path, arguments: Sequence[str]) -> str | None:
+    """Say why a goal command stored in the registry an invocation reads could run a host program.
+
+    Without `--goal-command-json` an edition runs the command stored in the agent record, so a
+    seeded record is as much an input as the command line. Every registry the invocation could
+    read (each value of a REGISTRY_OPTIONS option anywhere, else both defaults) must stay inside
+    the case directory, every directory and record file under it as well, symbolic links followed,
+    and every stored command must be null, empty, or run a file inside the case directory.
+    """
+    registries = [
+        value for option in REGISTRY_OPTIONS for value in _option_values(arguments, option)
+    ] or list(DEFAULT_REGISTRIES)
+    for registry in registries:
+        if not _inside_case(root, registry):
+            return (
+                f"registry {registry!r} is outside the case directory, so the goal commands "
+                "stored there cannot be checked"
+            )
+    real_root = os.path.realpath(root)
+    visited: set[str] = set()
+    for registry in registries:
+        start = registry if os.path.isabs(registry) else os.path.join(real_root, registry)
+        for directory, subdirectories, files in os.walk(start, followlinks=True):
+            if os.path.realpath(directory) in visited:
+                subdirectories.clear()  # a link back to a directory already read
+                continue
+            visited.add(os.path.realpath(directory))
+            for path in (directory, *(os.path.join(directory, name) for name in files)):
+                if not _inside_case(root, path):
+                    return (
+                        f"registry {registry!r} links to {os.path.realpath(path)!r} outside the "
+                        "case directory, so the goal commands stored there cannot be checked"
+                    )
+            for name in files:
+                record = os.path.join(directory, name)
+                # Records are `agent.json` in both editions; a FIFO or a dangling link is no record.
+                if not name.endswith(".json") or not os.path.isfile(record):
+                    continue
+                try:
+                    with open(record, "rb") as stream:
+                        document = stream.read()
+                except OSError:
+                    continue  # unreadable to the editions too: they run as the same user
+                for command in _stored_goal_commands(document):
+                    if command is not None and not _runs_case_fixture(root, command):
+                        return (
+                            f"{record!r} stores the goal command {command!r}, which does not "
+                            "run a fixture inside the case directory"
+                        )
+    return None
 
 
 def host_cli_refusal(root: Path, arguments: Sequence[str]) -> tuple[str, str] | None:
     """Name the host program an invocation could run, and why, or return None if it cannot.
 
-    Two kinds of reach are refused before either edition starts. An option that names an
+    Three kinds of reach are refused before either edition starts. An option that names an
     executable (EXECUTABLE_OPTIONS, GOAL_COMMAND_OPTION) must name a file inside the case
     directory wherever it appears, before or after a `--`: after a root-level `--`, the Python
     subcommand parser reads its remaining tokens as options again, so a later token is not always
-    text. Then `herdr_refusal` refuses an invocation that would run the installed Herdr by default.
-    The check is deliberately conservative: it may refuse an invocation that would not have run
-    the program, never the reverse.
+    text. A goal command stored in the registry must too (`stored_goal_command_refusal`). Then
+    `herdr_refusal` refuses an invocation that would run the installed Herdr by default. The
+    check is deliberately conservative: it may refuse an invocation that would not have run the
+    program, never the reverse.
     """
     for option, program in EXECUTABLE_OPTIONS.items():
         for value in _option_values(arguments, option):
@@ -561,6 +673,9 @@ def host_cli_refusal(root: Path, arguments: Sequence[str]) -> tuple[str, str] | 
         reason = _goal_command_refusal(root, value)
         if reason is not None:
             return "goal-command", reason
+    reason = stored_goal_command_refusal(root, arguments)
+    if reason is not None:
+        return "goal-command", reason
     reason = herdr_refusal(root, arguments)
     return None if reason is None else ("herdr", reason)
 
@@ -767,6 +882,9 @@ class Harness:
                 [*command, *expanded],
                 cwd=root,
                 env=environment,
+                # Not the caller's: the `agentctl mcp` server would read requests from it, and a
+                # request can name a goal command after the guard has checked the command line.
+                stdin=subprocess.DEVNULL,
                 capture_output=True,
                 text=True,
                 encoding="utf-8",
@@ -1252,6 +1370,7 @@ def _cross_process_serialization(harness: Harness, report: Report) -> None:
             [*command, *expanded],
             cwd=root,
             env=environment,
+            stdin=subprocess.DEVNULL,  # as in Harness._invoke_one
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
