@@ -164,6 +164,36 @@ def test_init_writes_the_full_sandbox_section_only_for_new_projects(tmp_path: Pa
     assert payload["sandbox"] == sandbox.default_config_obj()
 
 
+
+def test_init_sandbox_isolation_sets_the_new_projects_box(tmp_path: Path) -> None:
+    project = tmp_path / "project"
+    project.mkdir()
+    liveness = project / "liveness.py"
+    liveness.write_text("#!/bin/sh\nexit 2\n", encoding="utf-8")
+    liveness.chmod(0o755)
+    environment = {
+        **os.environ,
+        "PYTHONPATH": str(Path(__file__).resolve().parents[2]),
+        "WRKSLOTS_INIT_REPRESENTATION": "worktree",
+    }
+
+    def init(*extra: str) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            [sys.executable, "-m", "wrkslots", "--machine", "testhost", "init", str(project),
+             "--liveness-command", "liveness.py", *extra],
+            cwd=project, capture_output=True, text=True, timeout=120, env=environment, check=False,
+        )
+
+    first = init("--sandbox-isolation", "cgroup")
+    assert first.returncode == 0, first.stderr
+    section = cli._read_config(project / ".wrkslots.yml")["sandbox"]
+    assert isinstance(section, dict)
+    assert section == {**sandbox.default_config_obj(), "isolation": "cgroup"}
+    assert init("--sandbox-isolation", "cgroup").returncode == 0
+    changed = init("--sandbox-isolation", "root")
+    assert changed.returncode != 0
+    assert "already has different configuration" in changed.stderr
+
 def test_expand_path_knows_only_home_and_user() -> None:
     home, user = "/h/u", "u"
     assert sandbox.expand_path("~", home, user) == "/h/u"

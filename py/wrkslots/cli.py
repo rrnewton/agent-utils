@@ -19957,6 +19957,9 @@ def _cmd_init(args: argparse.Namespace) -> int:
     config_path = root / CONFIG_NAME
     representation, image_section = _init_representation(args, config_path)
     sandbox_section = _init_sandbox_section(config_path)
+    if args.sandbox_isolation is not None:
+        sandbox_section = dict(sandbox_section or sandbox.default_config_obj())
+        sandbox_section["isolation"] = args.sandbox_isolation
     salvage_push_remotes = _init_salvage_push_remotes(args, config_path)
     payload = _config_payload(
         worktrees_relative,
@@ -48721,6 +48724,19 @@ usage or audit gate unknown, 3 fail-closed refusal.
         help=(
             "how slot images are mounted: kernel (sudo -n mount -o loop), fuse (fuse2fs, no "
             "privilege), or auto (kernel when sudo -n works, else fuse; default)"
+        ),
+    )
+    init.add_argument(
+        "--sandbox-isolation",
+        choices=sandbox.ISOLATIONS,
+        default=None,
+        help=(
+            "configuration.sandbox.isolation for boxed commands and agents: userns (limits plus "
+            "a confined file-system view in an unprivileged user namespace; the default for a "
+            "new project), root (the same view built through sudo -n, for harness launchers "
+            "that need a setuid step), or cgroup (per-slot limits only, no file-system view). "
+            "To change it later, edit sandbox.isolation in the configuration; rerunning init "
+            "with a different value refuses like any other configuration change"
         ),
     )
     init.add_argument("--disk-advisory-gib", type=int)

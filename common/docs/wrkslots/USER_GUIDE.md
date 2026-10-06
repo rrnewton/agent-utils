@@ -1479,7 +1479,8 @@ The box stops accidents, not a process that sets out to leave it:
 ### Configuring the box
 
 `init` writes the full `sandbox` section, every default spelled out, into a new project's
-configuration. An existing project keeps what it has; `wrkslots sandbox write-defaults` adds every
+configuration; `init --sandbox-isolation userns|root|cgroup` chooses its `isolation` at the same
+time. An existing project keeps what it has; `wrkslots sandbox write-defaults` adds every
 missing key (and missing `limits` key) without changing present keys or anything else.
 `wrkslots sandbox show-config` prints the effective settings as JSON. Unknown keys are refused.
 

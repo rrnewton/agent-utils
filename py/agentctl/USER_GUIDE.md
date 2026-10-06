@@ -467,6 +467,16 @@ agentctl send reviewer --file /tmp/follow-up.txt --ready-timeout 0
 agentctl drain reviewer --ready-timeout 0
 ```
 
+`agentctl wait NAME` returns when the agent is ready for input again, which for
+an interactive agent means its current turn has ended. Read the result with
+`agentctl read`; readiness says nothing about whether a longer goal is done.
+Some harnesses confirm a prompt by the screen alone: the prompt has left the
+composer before the agent visibly starts working. So for 10 seconds after the
+newest confirmed delivery, `wait` does not accept an idle state until it has
+seen the agent busy. A `wait` started right after `send` therefore waits for
+that turn instead of returning at once, and a short timeout in that window
+reports that the agent has not been seen working yet.
+
 Interactive timeout arguments accept finite seconds no greater than 31,536,000
 (one year). Readiness waits may be zero; working confirmation must be positive.
 The startup deadline must be positive and at most 300 seconds. The count options

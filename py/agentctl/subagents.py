@@ -207,6 +207,31 @@ def environment_entries(values: Sequence[str]) -> tuple[str, ...]:
     return tuple(entries)
 
 
+#: Seconds after the newest confirmed prompt delivery during which an idle agent counts as ready
+#: only once `wait` has seen it busy. A delivery is confirmed when the prompt has left the composer,
+#: which can precede the harness visibly starting its turn.
+DELIVERY_SETTLE_SECONDS = 10.0
+
+
+def _latest_confirmed_delivery(queue: Path) -> float | None:
+    """Return the newest `confirmed_at` among processed queue entries, or None."""
+    latest: float | None = None
+    try:
+        entries = list((queue / "processed").iterdir())
+    except OSError:
+        return None
+    for entry in entries:
+        if entry.suffix != ".json":
+            continue
+        try:
+            document = json.loads(entry.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        value = document.get("confirmed_at") if isinstance(document, dict) else None
+        if isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value):
+            latest = float(value) if latest is None else max(latest, float(value))
+    return latest
+
 @dataclass
 class AgentRecord:
     """Versioned launch identity for managed interactive agents."""
@@ -2348,27 +2373,45 @@ class ManagedAgents:
         self, name: str, *, timeout: float = 900.0,
         sleep: Callable[[float], None] = time.sleep,
         monotonic: Callable[[], float] = time.monotonic,
+        wall: Callable[[], float] = time.time,
         expected_token: str | None = None,
     ) -> dict[str, object]:
         """Wait for idle/done, fail visibly on blocked/unknown identity or a deadline.
 
         This is readiness, not task completion: an active native goal may continue
         after a turn. Callers should inspect the conversation and goal separately.
+
+        A screen-verified delivery proves the prompt left the composer, but the
+        terminal server can report the agent idle until the harness visibly starts
+        the turn. So an idle state within DELIVERY_SETTLE_SECONDS of the newest
+        confirmed delivery counts only after this wait has seen the agent busy.
         """
         if not math.isfinite(timeout) or not 0 <= timeout <= 31_536_000:
             raise AgentDeliveryError("wait timeout must be finite and between 0 and 31536000 seconds")
         token = self._load_expected(name, expected_token).token
+        delivered_at = _latest_confirmed_delivery(Path(self._queue(name)))
+        seen_busy = False
         deadline = monotonic() + timeout
         while True:
             with self._lock(name):
                 record = self._load_expected(name, token)
                 info = self._checked(record)
+                if info.status in ("working", "starting"):
+                    seen_busy = True
                 if info.status in ("idle", "done"):
-                    return self._status_record(record)
-                if info.status not in ("working", "starting", "unknown"):
+                    if (seen_busy or delivered_at is None
+                            or wall() - delivered_at >= DELIVERY_SETTLE_SECONDS):
+                        return self._status_record(record)
+                elif info.status not in ("working", "starting", "unknown"):
                     raise AgentDeliveryError(f"agent {name!r} requires attention (state {info.status!r}); read its pane")
             remaining = deadline - monotonic()
             if remaining <= 0:
+                if info.status in ("idle", "done"):
+                    raise AgentDeliveryError(
+                        f"timed out waiting for agent {name!r}: it reads {info.status!r}, but a prompt "
+                        f"was delivered {max(0.0, wall() - cast(float, delivered_at)):.1f}s ago and the "
+                        f"agent has not been seen working since"
+                    )
                 raise AgentDeliveryError(f"timed out waiting for agent {name!r} (state {info.status!r})")
             sleep(min(0.25, remaining))
 

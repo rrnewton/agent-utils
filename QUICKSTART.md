@@ -40,6 +40,11 @@ In Herdr, open a tab in the checkout, start your agent (`claude`, `codex`, or `m
 > Adopt agent-utils for this project, following `skills/agent-utils-setup/SKILL.md` from
 > https://github.com/rrnewton/agent-utils.
 
+That sentence is the whole entry point. The agent reads the skill from GitHub, and later clones
+agent-utils into the harness it builds (or adds it as a submodule, if you prefer), so every
+project carries its own copy of the tools and skills. (The recorded run pointed the agent at a
+local agent-utils checkout instead of the URL; everything else was the same.)
+
 ## 3. What it detects
 
 The agent looks before it asks. In the run, it reported the project (`foobar`, clean, on `main`,

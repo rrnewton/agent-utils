@@ -5,6 +5,7 @@ import json
 import hashlib
 import os
 import threading
+import time
 from dataclasses import replace
 from pathlib import Path
 from typing import cast
@@ -79,7 +80,11 @@ def test_adopted_agent_supports_named_operations_and_preserves_native_identity(
     sessions.send_session("foreign", "follow up")
     assert fake.submitted == ["follow up"]
     assert sessions.read_session("foreign") == "human and coordinator transcript\n"
-    assert sessions.wait("foreign", timeout=0)["agent_status"] == "idle"
+    # Just after a confirmed delivery, an idle pane is not yet readiness.
+    with pytest.raises(AgentDeliveryError, match="has not been seen working"):
+        sessions.wait("foreign", timeout=0)
+    later = time.time() + subagents_module.DELIVERY_SETTLE_SECONDS + 1
+    assert sessions.wait("foreign", timeout=0, wall=lambda: later)["agent_status"] == "idle"
     assert sessions.goal("foreign", "finish adopted work")["native_status"] == "active"
     assert sessions.bind_session("foreign", "native-session")["source"] == "explicit"
     assert fake.submitted[-1] == "/goal finish adopted work"

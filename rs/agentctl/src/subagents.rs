@@ -4403,6 +4403,21 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
 
     /// Wait for readiness, which is separate from completion of the agent's goal.
     pub fn wait(&self, agent_name: &str, timeout: Duration) -> Result<Value> {
+        self.wait_at(agent_name, timeout, &unix_seconds)
+    }
+
+    /// Wait for readiness, reading wall-clock seconds from `wall`.
+    ///
+    /// A screen-verified delivery proves the prompt left the composer, but the terminal server can
+    /// report the agent idle until the harness visibly starts the turn. So an idle state within
+    /// `DELIVERY_SETTLE_SECONDS` of the newest confirmed delivery counts only after this wait has
+    /// seen the agent busy.
+    fn wait_at(
+        &self,
+        agent_name: &str,
+        timeout: Duration,
+        wall: &dyn Fn() -> f64,
+    ) -> Result<Value> {
         if timeout > Duration::from_secs(31_536_000) {
             return Err(fail(
                 "wait timeout must be finite and between 0 and 31536000 seconds",
@@ -4413,6 +4428,8 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
             return self.cloud_wait(agent_name, timeout);
         }
         let token = initial.token;
+        let delivered_at = latest_confirmed_delivery(&self.queue(agent_name)?);
+        let mut seen_busy = false;
         let start = Instant::now();
         loop {
             let lock = self.lock(agent_name)?;
@@ -4423,16 +4440,31 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
                 )));
             }
             let info = self.checked(&record)?;
-            if matches!(info.status.as_str(), "idle" | "done") {
-                return self.status_record(&record);
+            let idle = matches!(info.status.as_str(), "idle" | "done");
+            if matches!(info.status.as_str(), "working" | "starting") {
+                seen_busy = true;
             }
-            if !matches!(info.status.as_str(), "working" | "starting" | "unknown") {
+            if idle {
+                let settled = delivered_at
+                    .is_none_or(|delivered| wall() - delivered >= DELIVERY_SETTLE_SECONDS);
+                if seen_busy || settled {
+                    return self.status_record(&record);
+                }
+            } else if !matches!(info.status.as_str(), "working" | "starting" | "unknown") {
                 return Err(fail(format!(
                     "agent {agent_name:?} requires attention (state {:?}); read its pane",
                     info.status
                 )));
             }
             if start.elapsed() >= timeout {
+                if idle {
+                    let ago = (wall() - delivered_at.unwrap_or_default()).max(0.0);
+                    return Err(fail(format!(
+                        "timed out waiting for agent {agent_name:?}: it reads {:?}, but a prompt was \
+                         delivered {ago:.1}s ago and the agent has not been seen working since",
+                        info.status
+                    )));
+                }
                 return Err(fail(format!(
                     "timed out waiting for agent {agent_name:?} (state {:?})",
                     info.status
@@ -5916,6 +5948,42 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
             json!({"name":agent_name,"archive":destination,"pane_closed":!owned.is_empty(),"tab_closed":tab_closed}),
         )
     }
+}
+
+/// Seconds after the newest confirmed prompt delivery during which an idle agent counts as ready
+/// only once `wait` has seen it busy. A delivery is confirmed when the prompt has left the composer,
+/// which can precede the harness visibly starting its turn.
+pub const DELIVERY_SETTLE_SECONDS: f64 = 10.0;
+
+fn unix_seconds() -> f64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs_f64()
+}
+
+/// Return the newest `confirmed_at` among processed queue entries, if any.
+fn latest_confirmed_delivery(queue: &Path) -> Option<f64> {
+    let entries = fs::read_dir(queue.join("processed")).ok()?;
+    let mut latest: Option<f64> = None;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|value| value.to_str()) != Some("json") {
+            continue;
+        }
+        let Ok(text) = fs::read_to_string(&path) else {
+            continue;
+        };
+        let Ok(document) = serde_json::from_str::<Value>(&text) else {
+            continue;
+        };
+        if let Some(value) = document.get("confirmed_at").and_then(Value::as_f64) {
+            if value.is_finite() {
+                latest = Some(latest.map_or(value, |current| current.max(value)));
+            }
+        }
+    }
+    latest
 }
 
 #[cfg(test)]
@@ -8039,8 +8107,17 @@ pub(crate) mod tests {
             .send("foreign", "follow up", DrainOptions::default())
             .unwrap();
         assert_eq!(manager.read("foreign", 10).unwrap(), "visible output");
+        // Just after a confirmed delivery, an idle pane is not yet readiness.
+        let early = manager
+            .wait("foreign", Duration::from_secs(0))
+            .unwrap_err()
+            .to_string();
+        assert!(early.contains("has not been seen working"), "{early}");
+        let later = || unix_seconds() + DELIVERY_SETTLE_SECONDS + 1.0;
         assert_eq!(
-            manager.wait("foreign", Duration::from_secs(0)).unwrap()["agent_status"],
+            manager
+                .wait_at("foreign", Duration::from_secs(0), &later)
+                .unwrap()["agent_status"],
             "idle"
         );
         assert_eq!(

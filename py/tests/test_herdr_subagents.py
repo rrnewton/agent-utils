@@ -1452,6 +1452,35 @@ def test_wait_reports_readiness_and_blocked_prompt(tmp_path: Path, monkeypatch: 
         manager.wait("worker")
 
 
+
+def test_wait_does_not_take_idle_just_after_a_delivery_as_readiness(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    manager, fake = setup(tmp_path, monkeypatch)
+    manager.start("worker", cwd=str(tmp_path))
+    manager.send("worker", "do the task")
+    processed = list((manager.registry / "worker" / "queue" / "processed").glob("*.json"))
+    delivered_at = float(json.loads(processed[0].read_text())["confirmed_at"])
+    # The prompt left the composer, but the terminal server still reads idle.
+    with pytest.raises(AgentDeliveryError, match="has not been seen working"):
+        manager.wait("worker", timeout=0, wall=lambda: delivered_at + 1)
+    # Once this wait sees the turn start, the next idle is readiness.
+    states = iter(("idle", "working", "idle"))
+    clock = [0.0]
+
+    def step(seconds: float) -> None:
+        clock[0] += seconds
+        fake.infos["w1:p1"] = replace(fake.infos["w1:p1"], status=next(states))
+
+    fake.infos["w1:p1"] = replace(fake.infos["w1:p1"], status="idle")
+    result = manager.wait(
+        "worker", timeout=5, sleep=step, monotonic=lambda: clock[0], wall=lambda: delivered_at + 1
+    )
+    assert result["agent_status"] == "idle"
+    assert clock[0] > 0
+    # Long after the delivery, idle is readiness even if this wait never saw the turn.
+    assert manager.wait("worker", timeout=0, wall=lambda: delivered_at + 60)["agent_status"] == "idle"
+
 def test_private_state_and_malformed_record_are_rejected(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     manager, _fake = setup(tmp_path, monkeypatch)
     manager.start("worker", cwd=str(tmp_path))

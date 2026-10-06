@@ -19,7 +19,10 @@ You are guiding the owner through setup. This is a conversation, not a script:
 
 Throughout, `AU_SRC` is the agent-utils source the owner pointed you at (a local path or a Git
 URL; the public repository is `https://github.com/rrnewton/agent-utils`), `CHECKOUT` is the
-absolute path of the project checkout you were started in, and `H` is the harness root.
+absolute path of the project checkout you were started in, and `H` is the harness root. If the
+owner gave only the URL, read this skill from the repository first: fetch the raw file, or clone
+the repository to a temporary directory outside the checkout, which can then serve as `AU_SRC`.
+The real copy is cloned into the harness in step 5.2.
 
 ## What setup produces
 
@@ -103,7 +106,9 @@ Show the tree from "What setup produces" with the real names filled in, then ask
 2. **Track the harness in its own Git repository?** Default: yes, local only.
 3. **Where agent-utils comes from.** Default: clone `AU_SRC` into `H/agent-utils`. If `AU_SRC` is
    a local checkout, clone from it and then point `origin` at the public URL (or the owner's fork).
-   Alternative: use an existing checkout by path or symlink, which shares its updates.
+   Alternatives: add it as a Git submodule of the harness repository at `agent-utils/`, which
+   records the exact agent-utils commit in the harness history; or use an existing checkout by
+   symlink, which shares its updates.
 
 The harness root is `CHECKOUT` itself unless the owner wants a different directory.
 
@@ -191,6 +196,11 @@ ln -s common/bin "$H/agent-utils/bin"     # agent-utils ignores this path
 "$H/agent-utils/bin/agentctl" --version
 ```
 
+For the submodule choice, run `git -C "$H" submodule add <URL> agent-utils` after 5.3 instead of
+the clone, leave `/agent-utils/` out of `.gitignore`, create the same `bin` link, and commit the
+submodule with the harness in 5.10. Updating agent-utils is then a submodule update plus a
+harness commit.
+
 **5.3 Harness repository.** If chosen: `git init "$H"` and write `$H/.gitignore`:
 
 ```gitignore
@@ -215,12 +225,14 @@ cp "$H/agent-utils/py/wrkslots/examples/agentctl_liveness_probe.py" "$H/bin/agen
 chmod +x "$H/bin/agent-liveness"
 "$H/agent-utils/bin/wrkslots" init "$H" --worktrees-dir worktrees/slots --layout flat \
   --liveness-command bin/agent-liveness --max-active-slots N \
-  --slot-representation image|worktree [--cache-glob GLOB ...]
+  --slot-representation image|worktree --sandbox-isolation cgroup|userns|root \
+  [--cache-glob GLOB ...]
 ```
 
-Then set the sandbox mode: edit the `isolation:` line under `sandbox:` in `$H/.wrkslots.yml` to
-`cgroup` (sandbox off) or `userns`/`root` (sandbox on). Check with
-`"$H/worktrees/wrkslots" sandbox show-config` run from `$H`.
+`--sandbox-isolation cgroup` means sandbox off; `userns` or `root` means sandbox on. Check with
+`"$H/worktrees/wrkslots" sandbox show-config` run from `$H`. With the sandbox on, a slot is
+reclaimed only after its time-to-live (`--heartbeat-ttl-seconds`, default one hour) has passed
+since it was created; suggest a shorter value, such as 900, if the owner wants slots back sooner.
 
 When wrkslots removes a slot that still holds unpublished commits, it salvages them: to the
 remote when that remote is listed with `--salvage-push-remote URL`, otherwise into a verified
