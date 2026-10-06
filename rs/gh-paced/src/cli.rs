@@ -28,14 +28,16 @@ per-account budgets shared by every process on the host through a locked state
 file, and delayed with a loud stderr warning when a budget is exhausted. It
 also watches GitHub's own account-wide numbers (GET /rate_limit), backs off
 for at least 15 minutes after any rate-limit, abuse or HTTP 403 response, and
-refuses oversized or base64-laden write bodies. It expands gh's own aliases
-itself and runs gh with the expansion, so gh never sees the alias name; gh
-still reads its config.yml again when it starts, and a config.yml rewritten
-during the call is not guarded against. When config.yml cannot be read, every
-command is refused (exit 78). It checks bodies given as arguments, files or
-stdin, and text typed
-in the editor gh opens for a write (gh's editor is pointed at
-`gh-paced --edit-guard`, which runs your editor and then checks the file).
+refuses oversized or base64-laden write bodies. It expands gh's ordinary
+aliases itself and runs gh with the expansion, so gh never sees an ordinary
+alias's name; a shell alias (`!...`) is passed to gh by name and charged one
+WRITE, and what its shell command sends is paced only if the gh it runs is
+gh-paced. gh still reads its config.yml again when it starts, and a config.yml
+rewritten during the call is not guarded against. When config.yml cannot be
+read, every command is refused (exit 78). It checks bodies given as arguments,
+files or stdin, and text typed in the editor gh opens for a write (gh's
+editor is pointed at `gh-paced --edit-guard`, which runs your editor and then
+checks the file).
 Body files are copied privately so gh sends exactly what was checked; bodies
 gh would compose without an editor (`pr create` prompts, --fill, templates)
 are refused.
