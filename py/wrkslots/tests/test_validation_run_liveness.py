@@ -718,7 +718,8 @@ def test_resolving_a_long_path_looks_up_a_bounded_part_of_it(
 
     assert not named
     assert len(lookups) <= wrkslots._PATH_MAX // 2 + 2, len(lookups)
-    assert resolutions and max(map(len, resolutions)) < wrkslots._PATH_MAX
+    assert lookups and max(map(len, lookups)) < wrkslots._PATH_MAX
+    assert not resolutions
     assert sum(map(len, resolver._files)) < 2 * wrkslots._PATH_MAX
 
 
@@ -766,6 +767,152 @@ def test_a_long_path_still_names_its_row(
         patch.setattr(os, "stat", stat)
         assert wrkslots._UnitPathResolver().path_names(f"{row}/product", by_file)
     assert denied == [parent]
+
+
+def _realpath_tree(root: Path) -> list[str]:
+    """Build a tree of directories, files and symlinks; return its names."""
+
+    (root / "a" / "b" / "c").mkdir(parents=True)
+    (root / "f").write_text("file")
+    (root / "a" / "file").write_text("file")
+    links = {
+        "rel": "a/b",
+        "abs": str(root / "a"),
+        "chain1": "chain2",
+        "chain2": "chain3",
+        "chain3": "a",
+        "dangling": "missing/x",
+        "loop1": "loop2",
+        "loop2": "loop1",
+        "self": "self",
+        "up": "..",
+        "dot": ".",
+        "deep": "a/b/c/../../..",
+        "filelink": "f",
+        "slashed": "a/b/",
+        "doubled": "/" + str(root / "a") + "//b",
+        "a/b/back": "../../rel/..",
+        "a/b/c/home": "../../../abs/b",
+        "a/inner": "../loop1/x",
+        "a/escape": "../" * 12 + str(root)[1:] + "/a",
+    }
+    for name, target in links.items():
+        (root / name).symlink_to(target)
+    return [
+        "a", "b", "c", "f", "file", "missing", *(Path(name).name for name in links),
+    ]
+
+
+def test_resolving_a_path_matches_realpath_exactly(tmp_path: Path) -> None:
+    """The resolver's walk gives ``os.path.realpath``'s answer for any path.
+
+    Random absolute paths over a tree of relative, absolute, chained,
+    dangling, looping and parent symlinks, files, missing names, ``.``,
+    ``..``, empty components, names longer than 255 bytes and paths longer
+    than 4,096 characters are resolved by a fresh resolver and by one shared
+    across all of them, whose memoized lookups must not change an answer.
+    Truncating a long path to its first 4,096 characters changed answers:
+    ``"/tmp/../" * 600 + "bin/.."`` resolved to ``/`` while ``realpath``
+    follows ``/bin``.
+    """
+
+    import random
+
+    root = tmp_path / "tree"
+    root.mkdir()
+    names = _realpath_tree(root)
+    tokens = [*names, *names, ".", "..", "..", "", "x" * 300, "../" * 40]
+    generator = random.Random(20261005)
+    shared = wrkslots._UnitPathResolver()
+    paths = [
+        "/tmp/../" * 600 + "bin/..",
+        f"{root}/" + "../" * 600 + "bin/..",
+        f"{root}/loop1/" + "a/" * 2100,
+        f"{root}/a/inner///c",
+        f"{root}/self//..",
+    ]
+    for _ in range(4000):
+        count = generator.randint(1, 40)
+        if generator.random() < 0.05:
+            count = generator.randint(200, 700)
+        start = generator.choice([str(root), str(root), "/", "//", str(root) + "//"])
+        paths.append(
+            start + "/" + "/".join(generator.choice(tokens) for _ in range(count))
+        )
+    for path in paths:
+        expected = os.path.realpath(path)
+        assert wrkslots._UnitPathResolver()._realpath(path) == expected, path[:200]
+        assert shared._realpath(path) == expected, path[:200]
+
+
+def test_a_long_path_through_a_symlink_parent_names_its_row(tmp_path: Path) -> None:
+    """A ``..`` after a symlink far beyond 4,096 characters still leaves its target.
+
+    ``link`` points at ``row/sub``, so ``link/..`` is ``row`` to the kernel
+    and to ``realpath``.  Resolving only the first 4,096 characters and
+    normalizing the rest as text removed ``link`` with its ``..`` and read
+    the path as the row's parent.
+    """
+
+    row = tmp_path / "row"
+    (row / "sub").mkdir(parents=True)
+    (tmp_path / "link").symlink_to(row / "sub")
+    identity = wrkslots._row_path_identity(row)
+    path = "/" + "../" * 1400 + f"{str(tmp_path)[1:]}/link/.."
+
+    assert len(path) > wrkslots._PATH_MAX
+    assert os.path.realpath(path) == os.path.realpath(row)
+    assert wrkslots._UnitPathResolver().path_names(path, identity)
+    assert wrkslots._UnitPathResolver().names(
+        {"ExecStart": f"tool\n--checkout={path}/product"}, identity
+    )
+    assert not wrkslots._UnitPathResolver().path_names(
+        "/" + "../" * 1400 + f"{str(tmp_path)[1:]}/link/../../other", identity
+    )
+
+
+def test_resolving_a_long_path_below_a_missing_name_is_linear(tmp_path: Path) -> None:
+    """No component below one that cannot be looked up is looked up.
+
+    ``realpath`` looks up each of the 60,000 components below the missing
+    name, each lookup longer than the one before; the walk looks up one.
+    """
+
+    row = tmp_path / "row"
+    row.mkdir()
+    deep = f"{tmp_path}/missing/" + "a/" * 60_000 + "../" * 60_001 + "row"
+    resolver = wrkslots._UnitPathResolver()
+    started = time.monotonic()
+    resolved = resolver._realpath(deep)
+    elapsed = time.monotonic() - started
+
+    assert resolved == os.path.realpath(row)
+    assert len(resolver._kinds) <= len(Path(tmp_path).parts) + 3, len(resolver._kinds)
+    assert elapsed < 2.0, elapsed
+
+
+def test_resolving_refuses_what_realpath_cannot_answer(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An unreadable link target or too many nested links refuses."""
+
+    previous = "target"
+    (tmp_path / "target").mkdir()
+    for index in range(wrkslots._REALPATH_LINK_NESTING + 2):
+        name = f"nest{index}"
+        (tmp_path / name).symlink_to(f"{previous}/.")
+        previous = name
+    with pytest.raises(wrkslots.Refusal, match="nests more than"):
+        wrkslots._UnitPathResolver()._realpath(f"{tmp_path}/{previous}")
+
+    (tmp_path / "link").symlink_to("target")
+
+    def unreadable(path: str) -> str:
+        raise PermissionError(13, "Permission denied", path)
+
+    monkeypatch.setattr(os, "readlink", unreadable)
+    with pytest.raises(wrkslots.Refusal, match="cannot be resolved"):
+        wrkslots._UnitPathResolver()._realpath(f"{tmp_path}/link/x")
 
 
 def test_one_resolver_reads_each_unit_property_once_for_every_row(

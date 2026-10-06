@@ -47409,25 +47409,21 @@ def _row_path_identity(path: Path) -> _RowPathIdentity:
 _LOOKUP_ENDS_BELOW = frozenset({errno.ENOENT, errno.ENOTDIR, errno.ELOOP, errno.ENAMETOOLONG})
 
 
-def _bounded_realpath(path: str) -> str:
-    """``os.path.realpath`` of absolute ``path``, looking up only what one
-    system call could.
+# An ``lstat`` failure that every path below the failing one shares, as for
+# ``_LOOKUP_ENDS_BELOW``, or no permission to search a directory above it.
+_LSTAT_ENDS_BELOW = _LOOKUP_ENDS_BELOW | {errno.EACCES}
+# How many symbolic links one resolution may follow inside each other.  The
+# kernel follows 40; a deeper nesting is refused rather than resolved.
+_REALPATH_LINK_NESTING = 40
 
-    No system call accepts a path of ``_PATH_MAX`` characters or more, so a
-    longer path is resolved through its components up to the last ``/``
-    within its first ``_PATH_MAX`` characters, and the rest is appended and
-    normalized lexically, as ``realpath`` treats components that do not
-    resolve.  The lookups are then at most ``_PATH_MAX // 2`` however long
-    the path is.
-    """
 
-    if len(path) < _PATH_MAX:
-        return os.path.realpath(path)
-    cut = path.rfind("/", 0, _PATH_MAX)
-    if cut < 0:
-        return os.path.normpath(path)
-    head = os.path.realpath(path[:cut] or "/")
-    return os.path.normpath(f"{head.rstrip('/')}/{path[cut:].lstrip('/')}")
+class _SymlinkLoop(Exception):
+    """A symlink met again while it is being resolved; ``path`` is the
+    unresolved text ``os.path.realpath`` returns for it."""
+
+    def __init__(self, path: str) -> None:
+        super().__init__(path)
+        self.path = path
 
 
 class _UnitPathResolver:
@@ -47439,17 +47435,156 @@ class _UnitPathResolver:
     enumeration without repeating the parsing or the file-system reads.  It
     must not outlive the judgement, because the files change.
 
-    The work for one path is bounded however long the path is: it is
-    resolved through at most ``_PATH_MAX`` characters
-    (``_bounded_realpath``), and its ancestors are statted from ``/`` down,
-    stopping where a lookup fails in a way every path below shares, so only
-    ancestors that exist, each shorter than ``_PATH_MAX``, are kept.
+    A path is resolved exactly as ``os.path.realpath`` resolves it
+    (``_realpath``), without looking up a component below one whose lookup
+    failed in a way every path below shares, and its ancestors are statted
+    from ``/`` down with the same stop, so only ancestors that exist are
+    kept.
     """
 
     def __init__(self) -> None:
         self._candidates: dict[tuple[str, str], tuple[str, ...]] = {}
         self._words: dict[str, tuple[tuple[str, ...], frozenset[tuple[int, int]]]] = {}
         self._files: dict[str, tuple[tuple[int, int] | None, bool]] = {}
+        # What ``lstat`` found at each path: "link", "directory" (or a
+        # failure that a path below need not share), or "end" (a
+        # non-directory, or a failure every path below shares).
+        self._kinds: dict[str, str] = {}
+        self._targets: dict[str, str] = {}
+
+    def _kind(self, path: str) -> str:
+        try:
+            return self._kinds[path]
+        except KeyError:
+            pass
+        try:
+            metadata = os.lstat(path)
+        except OSError as exc:
+            kind = "end" if exc.errno in _LSTAT_ENDS_BELOW else "directory"
+        else:
+            if stat.S_ISLNK(metadata.st_mode):
+                kind = "link"
+            elif stat.S_ISDIR(metadata.st_mode):
+                kind = "directory"
+            else:
+                kind = "end"
+        self._kinds[path] = kind
+        return kind
+
+    def _target(self, path: str) -> str:
+        try:
+            return self._targets[path]
+        except KeyError:
+            pass
+        try:
+            target = os.readlink(path)
+        except OSError as exc:
+            raise Refusal(
+                "a path that a user-systemd unit or retained run handle names "
+                f"cannot be resolved: {exc}"
+            ) from exc
+        self._targets[path] = target
+        return target
+
+    def _realpath(self, path: str) -> str:
+        """``os.path.realpath(path)`` of absolute ``path``.
+
+        This is the walk of Python 3.12's ``posixpath.realpath``, which
+        looks up each component as it is appended, follows symlinks, steps
+        back over ``..`` by text and gives up on a symlink loop.  It keeps
+        the path as components and walks the text by index, so neither a
+        long path nor many ``..`` steps make it quadratic, and it does not
+        look up a component below one that is missing, not a directory, a
+        symlink loop, too long, or unsearchable: every such lookup fails,
+        and ``realpath`` reads a failed lookup as a plain name.  The
+        lookups and link targets are memoized for the judgement.  A link
+        target that cannot be read, a path that cannot be looked up at all,
+        or more than ``_REALPATH_LINK_NESTING`` nested links refuses.
+        """
+
+        if not path.startswith("/"):
+            raise Refusal(f"cannot resolve relative path {path!r}")
+        try:
+            components, _prefixes, _end = self._join_real([], [], None, path, {}, 0)
+        except _SymlinkLoop as loop:
+            return os.path.normpath(loop.path)
+        except ValueError as exc:
+            raise Refusal(
+                "a path that a user-systemd unit or retained run handle names "
+                f"cannot be resolved: {exc}"
+            ) from exc
+        return "/" + "/".join(components)
+
+    def _join_real(
+        self,
+        components: list[str],
+        prefixes: list[str],
+        end: int | None,
+        text: str,
+        seen: dict[str, tuple[tuple[str, ...], tuple[str, ...], int | None] | None],
+        nesting: int,
+    ) -> tuple[list[str], list[str], int | None]:
+        """Append ``text`` to the resolved path ``components``.
+
+        ``prefixes`` holds the spelling of each leading part of
+        ``components`` down to ``end``, the length at which a lookup ended
+        every lookup below it (None when none has).  ``seen`` maps each
+        symlink met in this resolution to what it resolved to, or to None
+        while it is being resolved, as ``realpath``'s own memo does.
+        """
+
+        if nesting > _REALPATH_LINK_NESTING:
+            raise Refusal(
+                "a path that a user-systemd unit or retained run handle names "
+                f"nests more than {_REALPATH_LINK_NESTING} symbolic links"
+            )
+        position = 0
+        if text.startswith("/"):
+            components, prefixes, end = [], [], None
+            position = 1
+        length = len(text)
+        while position < length:
+            stop = text.find("/", position)
+            if stop < 0:
+                stop = length
+            name = text[position:stop]
+            position = stop + 1
+            if not name or name == ".":
+                continue
+            if name == "..":
+                if components:
+                    components.pop()
+                    if len(prefixes) > len(components):
+                        prefixes.pop()
+                    if end is not None and len(components) < end:
+                        end = None
+                continue
+            if end is not None:
+                components.append(name)
+                continue
+            joined = (prefixes[-1] if prefixes else "") + "/" + name
+            kind = self._kind(joined)
+            if kind != "link":
+                components.append(name)
+                prefixes.append(joined)
+                if kind == "end":
+                    end = len(components)
+                continue
+            if joined in seen:
+                known = seen[joined]
+                if known is None:
+                    raise _SymlinkLoop(os.path.join(joined, text[position:]))
+                components, prefixes, end = list(known[0]), list(known[1]), known[2]
+                continue
+            seen[joined] = None
+            try:
+                components, prefixes, end = self._join_real(
+                    components, prefixes, end, self._target(joined), seen, nesting + 1
+                )
+            except _SymlinkLoop as loop:
+                raise _SymlinkLoop(os.path.join(loop.path, text[position:])) from None
+            seen[joined] = (tuple(components), tuple(prefixes), end)
+        return components, prefixes, end
 
     def _file(self, path: str) -> tuple[tuple[int, int] | None, bool]:
         """The identity of the file at ``path``, or None, and whether a path
@@ -47502,17 +47637,11 @@ class _UnitPathResolver:
         except KeyError:
             pass
         lexical = os.path.normpath(joined)
-        try:
-            resolved = tuple(
-                dict.fromkeys(
-                    _bounded_realpath(spelling) for spelling in dict.fromkeys((joined, lexical))
-                )
+        resolved = tuple(
+            dict.fromkeys(
+                self._realpath(spelling) for spelling in dict.fromkeys((joined, lexical))
             )
-        except ValueError as exc:
-            raise Refusal(
-                "a path that a user-systemd unit or retained run handle names "
-                f"cannot be resolved: {exc}"
-            ) from exc
+        )
         files: set[tuple[int, int]] = set()
         for current in resolved:
             files.update(self._ancestor_files(current))
