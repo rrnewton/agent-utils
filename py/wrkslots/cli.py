@@ -16730,8 +16730,65 @@ def _validation_run_host_evidence() -> tuple[
     of the user-systemd enumeration; see ``_processes_around_unit_enumeration``.
     """
 
+    return _host_evidence_around(_absent_validate_process_snapshot)
+
+
+def _host_evidence_around(
+    before: Callable[[], Sequence[_AbsentProcessObservation]],
+) -> tuple[tuple[_AbsentProcessObservation, ...], tuple[Mapping[str, str], ...]]:
+    """Prove a host process view, then read processes around the units.
+
+    ``before`` reads the first process table; recovery passes its path
+    census, which reads one.  Shared by the validation-run authority and by
+    ``recover-absent-validate-rows`` and ``recover-absent-agent-rows``.
+    """
+
     _assert_host_process_view()
-    return _processes_around_unit_enumeration(_absent_validate_process_snapshot())
+    return _processes_around_unit_enumeration(before())
+
+
+@dataclasses.dataclass(frozen=True)
+class _RunEvidence:
+    """Host and run evidence for absent or completed rows, read in order."""
+
+    processes: tuple[_AbsentProcessObservation, ...]
+    units: tuple[Mapping[str, str], ...]
+    bindings: Mapping[str, tuple[_RetainedValidationHandle, ...]]
+    members: Mapping[str, int]
+
+
+def _run_evidence(
+    config: Config,
+    rows: Sequence[tuple[ActiveRecord, tuple[Path, ...]]],
+    host: Callable[
+        [], tuple[tuple[_AbsentProcessObservation, ...], tuple[Mapping[str, str], ...]]
+    ],
+    *,
+    first: Mapping[str, tuple[_RetainedValidationHandle, ...]] | None = None,
+) -> _RunEvidence:
+    """Read the retained run handles, the host, the handles again, then cgroups.
+
+    A run registered while the host evidence was read has a handle that the
+    first read missed, so the handles from both reads are judged.  The
+    current members of their units' control groups are read last (see
+    ``_retained_unit_cgroup_members``).  ``first`` is a handle read the
+    caller has already made and judged.  Every caller that judges rows from
+    runs reads its evidence here: the validation-run authority,
+    ``recover-absent-validate-rows`` and ``recover-absent-agent-rows``.
+    """
+
+    if first is None:
+        first = _retained_handles_for_absent_rows(config, rows)
+    processes, units = host()
+    later = _retained_handles_for_absent_rows(config, rows)
+    bindings = {
+        slot: tuple(dict.fromkeys((*first.get(slot, ()), *later.get(slot, ()))))
+        for slot in {*first, *later}
+    }
+    members = _retained_unit_cgroup_members(
+        {handle.unit for handles in bindings.values() for handle in handles}
+    )
+    return _RunEvidence(processes, units, bindings, members)
 
 
 def _validation_run_row_paths(
@@ -16856,19 +16913,7 @@ def _validation_run_liveness_states(
             (record, _validation_run_row_paths(config, record, fenced_slots))
             for record in local
         )
-        first = _retained_handles_for_absent_rows(config, rows)
-        processes, snapshot = _validation_run_host_evidence()
-        # A run registered while the host evidence was read has a handle that
-        # the first read missed; judge the handles from both reads, and read
-        # their control groups' current members last.
-        later = _retained_handles_for_absent_rows(config, rows)
-        bindings = {
-            slot: tuple(dict.fromkeys((*first.get(slot, ()), *later.get(slot, ()))))
-            for slot in {*first, *later}
-        }
-        members = _retained_unit_cgroup_members(
-            {handle.unit for handles in bindings.values() for handle in handles}
-        )
+        evidence = _run_evidence(config, rows, _validation_run_host_evidence)
     except Refusal as exc:
         detail = _liveness_batch_diagnostic(
             f"validation-run evidence is unverifiable: {exc}"
@@ -16882,16 +16927,16 @@ def _validation_run_liveness_states(
     for row in rows:
         record = row[0]
         key = (record.machine, record.slot, record.generation)
-        handles = {record.slot: bindings.get(record.slot, ())}
+        handles = {record.slot: evidence.bindings.get(record.slot, ())}
         try:
             _assert_retained_handle_processes_dead(handles)
             _assert_absent_validate_systemd_unrelated(
                 (row,),
                 handles,
-                processes,
-                snapshot=snapshot,
+                evidence.processes,
+                snapshot=evidence.units,
                 resolver=resolver,
-                members=members,
+                members=evidence.members,
             )
         except _ValidationRunMayUseRow as exc:
             result[key] = (
@@ -40722,20 +40767,31 @@ def _assert_absent_agent_liveness(
                 f"recorded owner for agent row {record.slot} is {owner_state}: {detail}"
             )
     rows = ((record, tuple(paths)),)
-    processes, units = _processes_around_unit_enumeration(
-        _assert_absent_validate_processes_unrelated(rows)
+    # A validation run may use an agent checkout too, so retained run handles
+    # naming its paths are judged as for a validation row.
+    evidence = _run_evidence(
+        config,
+        rows,
+        lambda: _host_evidence_around(
+            lambda: _assert_absent_validate_processes_unrelated(rows)
+        ),
     )
     # The refusal directly above already required a proven-dead owner, so this
     # comparison could only ever have fired on a process that is not the owner.
     if _owner_cgroup_is_evidence(record) and record.owner is not None:
-        for process in processes:
+        for process in evidence.processes:
             if _cgroup_matches(record.owner.cgroup_path, process.cgroup_path):
                 raise Refusal(
                     f"live process {process.pid} remains in recorded owner cgroup "
                     f"{record.owner.cgroup_path} for agent row {record.slot}"
                 )
+    _assert_retained_handle_processes_dead(evidence.bindings)
     _assert_absent_validate_systemd_unrelated(
-        rows, {record.slot: ()}, processes, snapshot=units
+        rows,
+        evidence.bindings,
+        evidence.processes,
+        snapshot=evidence.units,
+        members=evidence.members,
     )
 
 
@@ -47294,10 +47350,22 @@ def _assert_absent_validate_rows_safe(config: Config, records: Sequence[ActiveRe
     _assert_absent_validate_owners_dead(records)
     bindings = _retained_handles_for_absent_rows(config, rows)
     _assert_retained_handle_processes_dead(bindings)
-    processes, units = _processes_around_unit_enumeration(
-        _assert_absent_validate_processes_unrelated(rows)
+    evidence = _run_evidence(
+        config,
+        rows,
+        lambda: _host_evidence_around(
+            lambda: _assert_absent_validate_processes_unrelated(rows)
+        ),
+        first=bindings,
     )
-    _assert_absent_validate_systemd_unrelated(rows, bindings, processes, snapshot=units)
+    _assert_retained_handle_processes_dead(evidence.bindings)
+    _assert_absent_validate_systemd_unrelated(
+        rows,
+        evidence.bindings,
+        evidence.processes,
+        snapshot=evidence.units,
+        members=evidence.members,
+    )
 
 
 def _absent_validate_archive_entry(

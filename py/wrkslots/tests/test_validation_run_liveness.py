@@ -20,9 +20,10 @@ import json
 import os
 import subprocess
 import uuid
-from collections.abc import Iterator, Mapping, Sequence
+from collections.abc import Iterator, Mapping, Sequence, Set as AbstractSet
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Protocol
 
 import pytest
 
@@ -36,8 +37,10 @@ from wrkslots.tests.test_lifecycle import (
     interrupt_validate_batch,
     make_project,
     mark_owner_dead,
+    prepare_absent_agent_row,
     prepare_absent_validate_row,
     prepare_dead_validate_slots,
+    run_absent_agent_recovery,
     run_absent_validate_recovery,
     set_liveness,
     stub_validate_batch_censuses,
@@ -97,7 +100,22 @@ def _prepare(
         "_absent_validate_process_snapshot",
         lambda **_kwargs: tuple(processes),
     )
+    # The supplied host's retained units have no control-group members; a
+    # test that examines members supplies them itself.
+    monkeypatch.setattr(wrkslots, "_retained_unit_cgroup_members", _no_members)
     return project, checkout(project, slot_type="validate")
+
+
+class _MemberReader(Protocol):
+    def __call__(
+        self, units: AbstractSet[str], *, root: Path | None = None
+    ) -> Mapping[str, int]: ...
+
+
+def _no_members(
+    units: AbstractSet[str], *, root: Path | None = None
+) -> Mapping[str, int]:
+    return dict.fromkeys(units, 0)
 
 
 def _write_run_handle(
@@ -1233,15 +1251,19 @@ def _judge_with_unit_enumerations(
     enumerations: Sequence[Sequence[Mapping[str, str]]],
     *,
     register_during: int | None = None,
+    members: _MemberReader | None = None,
 ) -> tuple[str, str]:
     """Judge one row whose user-systemd units change between enumerations.
 
     The process tables are empty throughout: the run's processes started
     after each table's PID list.  With ``register_during`` set, the run's
     handle is written during that enumeration instead of beforehand.
+    ``members`` replaces the retained-unit control-group read.
     """
 
     project, tree = _prepare(tmp_path, monkeypatch, agent_liveness="dead")
+    if members is not None:
+        monkeypatch.setattr(wrkslots, "_retained_unit_cgroup_members", members)
     if register_during is None:
         _write_run_handle(project, tree)
     calls = 0
@@ -1305,13 +1327,12 @@ def test_a_retained_unit_cgroup_member_missing_from_every_table_is_alive(
 
     read: list[set[str]] = []
 
-    def members(units: set[str], *, root: Path | None = None) -> Mapping[str, int]:
+    def members(units: AbstractSet[str], *, root: Path | None = None) -> Mapping[str, int]:
         read.append(set(units))
         return {name: 1 for name in units}
 
-    monkeypatch.setattr(wrkslots, "_retained_unit_cgroup_members", members, raising=False)
     state, message = _judge_with_unit_enumerations(
-        tmp_path, monkeypatch, ((_unit(),), (_unit(),))
+        tmp_path, monkeypatch, ((_unit(),), (_unit(),)), members=members
     )
 
     assert state == "alive", message
@@ -1354,3 +1375,169 @@ def test_this_host_user_manager_cgroup_is_read() -> None:
     assert wrkslots._user_manager_cgroup(Path("/sys/fs/cgroup")).name == (
         f"user@{os.getuid()}.service"
     )
+
+
+def _restrict_pid_namespace(monkeypatch: pytest.MonkeyPatch) -> None:
+    """This process is in a child PID namespace."""
+
+    real = wrkslots._namespace_inode
+    monkeypatch.setattr(
+        wrkslots,
+        "_namespace_inode",
+        lambda name: 4_026_532_999 if name == "pid" else real(name),
+    )
+
+
+def _prepare_absent_validate_recovery(
+    project: Path, repository: Path, monkeypatch: pytest.MonkeyPatch
+) -> tuple[Path, Path]:
+    """One absent validation row with a retained run handle, and its input."""
+
+    record = prepare_absent_validate_row(project, repository, slot="gone", agent="validate-a")
+    config = wrkslots._load_config(str(project), "testhost")
+    _write_run_handle(
+        project, wrkslots._stored_path(config, record.checkouts[0].path, "checkout")
+    )
+    input_path = write_absent_validate_input(project, [record])
+    allow_test_host_for_absent_validate_recovery(project, monkeypatch)
+    monkeypatch.setattr(wrkslots, "_user_systemd_snapshot", lambda: (_unit(),))
+    monkeypatch.setattr(wrkslots, "_retained_unit_cgroup_members", _no_members)
+    return project, input_path
+
+
+def _one_member(units: AbstractSet[str], *, root: Path | None = None) -> Mapping[str, int]:
+    return dict.fromkeys(units, 1)
+
+
+@pytest.mark.parametrize("evidence", ["restricted-view", "cgroup-member"])
+def test_absent_validate_row_recovery_reads_the_same_late_evidence(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    evidence: str,
+) -> None:
+    """recover-absent-validate-rows proves the host view and reads members.
+
+    In a child PID namespace a run is missing from the process table, and a
+    run's child can be missing from every table but still in its control
+    group.  Either way the empty tables are no evidence that the row is free.
+    """
+
+    project, repository, _remote = make_project(tmp_path)
+    project, input_path = _prepare_absent_validate_recovery(project, repository, monkeypatch)
+    if evidence == "restricted-view":
+        _restrict_pid_namespace(monkeypatch)
+        expected = "not in the host's initial pid namespace"
+    else:
+        monkeypatch.setattr(wrkslots, "_retained_unit_cgroup_members", _one_member)
+        expected = f"retained validation unit {RUN_UNIT} control group now holds 1"
+
+    assert run_absent_validate_recovery(project, input_path, apply=False) == 3
+    assert expected in capsys.readouterr().err
+
+    monkeypatch.undo()
+    _prepare_absent_validate_recovery_host(project, monkeypatch)
+    assert run_absent_validate_recovery(project, input_path, apply=False) == 0, (
+        capsys.readouterr().err
+    )
+
+
+def _prepare_absent_validate_recovery_host(
+    project: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    allow_test_host_for_absent_validate_recovery(project, monkeypatch)
+    monkeypatch.setattr(wrkslots, "_user_systemd_snapshot", lambda: (_unit(),))
+    monkeypatch.setattr(wrkslots, "_retained_unit_cgroup_members", _no_members)
+
+
+@pytest.mark.parametrize("evidence", ["restricted-view", "cgroup-member"])
+def test_absent_agent_row_recovery_reads_the_same_late_evidence(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    evidence: str,
+) -> None:
+    """recover-absent-agent-row reads the evidence through the same helper.
+
+    A validation run may use an agent checkout as well, so a retained run
+    handle naming the agent row's checkout is judged as for a validation row.
+    """
+
+    project, repository, _remote = make_project(tmp_path)
+    record = prepare_absent_agent_row(project, repository)
+    config = wrkslots._load_config(str(project), "testhost")
+    _write_run_handle(
+        project, wrkslots._stored_path(config, record.checkouts[0].path, "checkout")
+    )
+    _prepare_absent_validate_recovery_host(project, monkeypatch)
+    if evidence == "restricted-view":
+        _restrict_pid_namespace(monkeypatch)
+        expected = "not in the host's initial pid namespace"
+    else:
+        monkeypatch.setattr(wrkslots, "_retained_unit_cgroup_members", _one_member)
+        expected = f"retained validation unit {RUN_UNIT} control group now holds 1"
+
+    assert run_absent_agent_recovery(project, record, apply=False) == 3
+    assert expected in capsys.readouterr().err
+
+    monkeypatch.undo()
+    _prepare_absent_validate_recovery_host(project, monkeypatch)
+    assert run_absent_agent_recovery(project, record, apply=False) == 0, (
+        capsys.readouterr().err
+    )
+
+
+def test_deferred_batch_completion_judges_the_fenced_checkout(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A batch completes each removal after a census outside the locks.
+
+    ``remove-validate-batch`` fences the slot to ``.slot01.fenced.1.<hex>``,
+    takes a fresh census of the fence outside the mutation locks, and then
+    completes the removal under them (``_complete_prepared_private_finish``).
+    A job queued against the fenced checkout in that gap names no recorded
+    path, and the completion deletes the files it will use.
+    """
+
+    project, _repository, _remote = make_project(tmp_path)
+    slot_path = prepare_dead_validate_slots(project, ("slot01",))["slot01"]
+    tree = checkout(project, slot="slot01", slot_type="validate")
+    stub_validate_batch_censuses(monkeypatch)
+    monkeypatch.setattr(wrkslots, "_assert_slot_unused", lambda *_a, **_k: None)
+    monkeypatch.setattr(wrkslots, "_absent_validate_process_snapshot", lambda **_k: ())
+    monkeypatch.setattr(wrkslots, "_retained_unit_cgroup_members", _no_members, raising=False)
+    boundaries: list[str] = []
+    monkeypatch.setattr(wrkslots, "_interrupt_for_test", boundaries.append)
+    queue = True
+
+    def units() -> tuple[Mapping[str, str], ...]:
+        fences = sorted(slot_path.parent.glob(".slot01.fenced.1.*"))
+        if not queue or "after-validate-batch-fresh-census" not in boundaries:
+            return ()
+        assert len(fences) == 1, fences
+        fenced_tree = fences[0] / tree.relative_to(slot_path)
+        return (
+            _unit(
+                Id="queued-run.service",
+                PendingJob="yes",
+                ExecStart=f"/usr/bin/make\n-C\n{fenced_tree}",
+            ),
+        )
+
+    monkeypatch.setattr(wrkslots, "_user_systemd_snapshot", units)
+
+    assert _remove_batch(project) == 1
+    output = capsys.readouterr().out
+    assert "after-validate-batch-fresh-census" in boundaries
+    assert "RETAINED: slot01" in output
+    assert "user-systemd unit queued-run.service names validation row slot01" in output
+    _assert_retained(project, tree)
+
+    queue = False
+    boundaries.clear()
+    assert _remove_batch(project) == 0, capsys.readouterr()
+    assert "after-validate-batch-fresh-census" in boundaries
+    assert not slot_path.exists()
+    assert active_slots(project) == []

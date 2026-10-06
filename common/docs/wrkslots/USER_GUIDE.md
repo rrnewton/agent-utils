@@ -410,12 +410,20 @@ table has exited. The later table is itself read one process at a time after its
 a run that starts during it can be absent from both tables while the first enumeration reads its
 unit inactive. The user-systemd units are therefore enumerated again after the later table, and a
 retained run unit that is active or queued in either enumeration is `alive`.
-`recover-absent-validate-rows` and `recover-absent-agent-rows` read the process table and the units
-the same way. For the liveness answer, the retained run handles are read again after both
-enumerations, and a handle found by either read is judged. Last, the current members of every
-control group named after a handle's unit, and of its descendants, are read from the cgroup v2
-hierarchy below the user service manager; a member there is `alive`, and a host without a cgroup v2
-hierarchy at `/sys/fs/cgroup` or with an unreadable member list is `unverifiable`.
+The retained run handles are read again after both enumerations, and a handle found by either read
+is judged. Last, the current members of every control group named after a handle's unit, and of its
+descendants, are read from the cgroup v2 hierarchy below the user service manager; a member there is
+`alive`, and a host without a cgroup v2 hierarchy at `/sys/fs/cgroup` or with an unreadable member
+list is `unverifiable`.
+
+`recover-absent-validate-rows` and `recover-absent-agent-rows` read this evidence through the same
+code and in the same order, and refuse wherever the answer above would be `alive` or
+`unverifiable`: each first requires the unrestricted host view described above, reads the retained
+run handles before and after the process tables and units, and reads the handles' control-group
+members last. A validation run can use an agent checkout too, so `recover-absent-agent-rows` judges
+every retained run handle whose checkout names the agent row's paths and, like
+`recover-absent-validate-rows`, refuses when any handle under `ignored/validate/runs/` cannot be read
+or parsed.
 
 Audit reports the number of validation rows it judged this way as the liveness phase's
 `validation_run_subjects`. A batch removal reads this evidence once while sealing and once more per

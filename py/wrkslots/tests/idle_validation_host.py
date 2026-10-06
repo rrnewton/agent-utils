@@ -35,9 +35,18 @@ def no_retained_cgroup_members(
     return dict.fromkeys(units, 0)
 
 
+def whole_host_process_view() -> None:
+    """Take this process's view of processes as the whole host's.
+
+    Lifecycle shards run in their own PID namespace, where the real check
+    refuses every recovery before reaching the behaviour under test.
+    """
+
+
 def main() -> int:
     cli._validation_run_host_evidence = no_validation_runs
     cli._retained_unit_cgroup_members = no_retained_cgroup_members
+    cli._assert_host_process_view = whole_host_process_view
     return cli.main(sys.argv[1:])
 
 

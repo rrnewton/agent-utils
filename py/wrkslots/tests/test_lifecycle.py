@@ -963,6 +963,7 @@ cli._frozen_validation_authority_commit = test_frozen_authority
 cli._OWNERLESS_VALIDATION_EXCLUSION_ROOTS = (Path('/tmp'),)
 cli._validation_run_host_evidence = lambda: ((), ())
 cli._retained_unit_cgroup_members = lambda units, root=None: dict.fromkeys(units, 0)
+cli._assert_host_process_view = lambda: None
 raise SystemExit(cli.main(sys.argv[1:]))
 """
     argv = [
