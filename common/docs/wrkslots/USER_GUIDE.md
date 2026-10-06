@@ -439,14 +439,14 @@ below one that is missing, not a directory, a symlink loop or too long. One judg
 33,554,432 characters of words and the paths made from them, make 262,144 lookups (`lstat`, `stat`
 and `readlink`), and take 20 seconds; past any of these bounds it refuses, so the row is
 unverifiable. The time bound is checked throughout, including every 4,096 characters that the shell
-word reader reads (about every 8 milliseconds on devbig014) and each property and path answered from
-what the judgement has already read, and once more as the judgement ends, so that a row identity
-read or a property scan that ran past the bound gives no answer. Because every value is read to the
-end of its element, a search
+word reader reads (about every 8 milliseconds on the measurement host) and each property and path
+answered from what the judgement has already read, and once more as the judgement ends, so that a
+row identity read or a property scan that ran past the bound gives no answer. Because every value
+is read to the end of its element, a search
 list's characters grow with the square of its length: a 130,001-character `NAME=/a:/b:...` list of
-10,000 entries refuses, while the 77 active units on devbig014, with 155,976 characters of
-properties, read about 8.5 million characters, a quarter of the bound, and made about 4,950 lookups
-in 0.4 seconds (2026-10-06). This rule is shared with
+10,000 entries refuses, while the 77 active units on the measurement host, with 155,976 characters
+of properties, read about 8.5 million characters, a quarter of the bound, and made about 4,950
+lookups in 0.4 seconds (2026-10-06). This rule is shared with
 `recover-absent-validate-rows`, and with a retained run handle's checkout, which the handle census
 matches with the rows within its 30-second time bound; that bound starts before the rows' own paths
 are read, and also bounds the matching in place of the 20 seconds.

@@ -47763,7 +47763,7 @@ _UNIT_SHELL_TEXT = re.compile(r"[\s\"'\\;&|()<>]")
 _UNIT_SHELL_NESTING = 3
 # How many characters the shell-word reader reads between checks of the
 # judgement's time bound (``_BudgetedText``).  Both of its readings
-# together read about 540,000 characters a second on devbig014
+# together read about 540,000 characters a second on the measurement host
 # (2026-10-05), so a check falls about every 8 milliseconds.
 _UNIT_SHELL_CHECK_CHARACTERS = 4096
 # The work one judgement may spend reading the words of the user-systemd
