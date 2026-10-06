@@ -24,13 +24,21 @@
 //! descendant holds it open), or [`TEE_AFTER_EXIT_SECS`] after gh exited, or after
 //! [`TEE_AFTER_EXIT_BYTES`] more bytes (a descendant keeps writing). The writer is then waited
 //! for without a time limit, so every byte read reaches the consumer however slowly it reads;
-//! if the consumer goes away (EPIPE), the rest is discarded and reading carries on. A user-sent
-//! INT, TERM, HUP or QUIT that arrives after gh has exited abandons whatever is still undelivered
-//! and is reported in [`Ran::late_signal`], so gh-paced can die by it after its bookkeeping
-//! rather than wait indefinitely on a consumer that has stopped reading.
+//! if the consumer goes away (EPIPE), the rest is discarded and reading carries on. An INT,
+//! TERM, HUP or QUIT that arrives after gh has exited, sent by a process or typed at the
+//! terminal, abandons whatever is still undelivered and is reported in [`Ran::late_signal`], so gh-paced can die by it after its bookkeeping
+//! rather than wait indefinitely on a consumer that has stopped reading. The writers write to
+//! descriptors 1 and 2 directly, without the standard library's stream locks, so a writer stuck
+//! on a consumer that stopped reading cannot hold up gh-paced's own messages (see
+//! [`write_stderr_bounded`]).
+//!
+//! The reader calls [`Invocation::on_pushback`] whenever the scanner's pushback signals change,
+//! before queueing the chunk that changed them, so the cooldown is recorded while gh's output may
+//! still be waiting for the consumer, not only after it has all been delivered.
 
 use crate::pushback::Scanner;
 use std::collections::VecDeque;
+use std::fmt;
 use std::fs::File;
 use std::io::{Read, Write};
 use std::os::fd::{AsRawFd, FromRawFd, RawFd};
@@ -65,6 +73,17 @@ pub const TEE_AFTER_EXIT_SECS: f64 = 5.0;
 /// After gh exits, a tee stops reading after this many more bytes.
 pub const TEE_AFTER_EXIT_BYTES: usize = 64 << 20;
 
+/// Called from a tee's reader thread with a copy of the scanner whenever its pushback signals
+/// change, so a cooldown can be recorded before gh's output has been delivered.
+#[derive(Clone)]
+pub struct PushbackHook(pub Arc<dyn Fn(&Scanner) + Send + Sync>);
+
+impl fmt::Debug for PushbackHook {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("PushbackHook")
+    }
+}
+
 /// One child process to run.
 #[derive(Debug, Clone)]
 pub struct Invocation<'a> {
@@ -84,6 +103,8 @@ pub struct Invocation<'a> {
     pub keep_fds: Vec<RawFd>,
     /// Tee stdout through gh-paced and feed it to [`Scanner::feed_headers`].
     pub scan_stdout: bool,
+    /// Called as soon as the scanner's pushback signals change (see [`PushbackHook`]).
+    pub on_pushback: Option<PushbackHook>,
 }
 
 /// How an interactive run ended.
@@ -138,22 +159,22 @@ extern "C" fn forward_signal(
 ) {
     // Only signals sent by a process (kill, sigqueue, tgkill: si_code <= 0) are forwarded.
     // Terminal-generated signals (si_code SI_KERNEL) already went to the whole foreground
-    // process group, child included.
+    // process group, child included. With no child running, every signal, whoever sent it, is
+    // for gh-paced itself: a terminal's INT after gh has exited must end gh-paced just as it
+    // would have ended gh.
     // SAFETY: the kernel passes a valid siginfo_t to an SA_SIGINFO handler.
     let code = if info.is_null() {
         0
     } else {
         unsafe { (*info).si_code }
     };
-    if code <= 0 {
-        let pid = CHILD_PID.load(Ordering::SeqCst);
-        if pid > 0 {
-            // SAFETY: kill is async-signal-safe.
-            unsafe {
-                libc::kill(pid, sig);
-            }
-        } else {
-            LATE_SIGNAL.store(sig, Ordering::SeqCst);
+    let pid = CHILD_PID.load(Ordering::SeqCst);
+    if pid <= 0 {
+        LATE_SIGNAL.store(sig, Ordering::SeqCst);
+    } else if code <= 0 {
+        // SAFETY: kill is async-signal-safe.
+        unsafe {
+            libc::kill(pid, sig);
         }
     }
 }
@@ -375,12 +396,85 @@ fn readable(fd: RawFd, ms: i32) -> bool {
     n > 0
 }
 
+/// Write all of `bytes` to `fd` with plain `write` calls, retrying on EINTR. False on any
+/// other error (EPIPE when the consumer has gone). Takes no lock, so it never waits for another
+/// thread's write; it can still block while the consumer is not reading.
+pub fn write_fd_all(fd: RawFd, mut bytes: &[u8]) -> bool {
+    while !bytes.is_empty() {
+        // SAFETY: writing from a valid slice to a descriptor; the length is the slice's.
+        let n = unsafe { libc::write(fd, bytes.as_ptr().cast(), bytes.len()) };
+        if n < 0 {
+            if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            return false;
+        }
+        bytes = &bytes[usize::try_from(n).unwrap_or(0)..];
+    }
+    true
+}
+
+/// Write `bytes` to stderr, giving up at `deadline`. The write runs on its own thread, which is
+/// left behind when the deadline passes (the process is about to exit), so a consumer that has
+/// stopped reading cannot hold the caller past the deadline. True when the bytes were written.
+pub fn write_stderr_bounded(bytes: Vec<u8>, deadline: Instant) -> bool {
+    let left = deadline.saturating_duration_since(Instant::now());
+    if left.is_zero() {
+        return false;
+    }
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(write_fd_all(2, &bytes));
+    });
+    matches!(rx.recv_timeout(left), Ok(true))
+}
+
+/// Feed `chunk` (or, with `None`, the end of the stream) to the scanner, then call the hook with
+/// a copy of the scanner if its signals differ from `published`.
+fn scan_and_publish(
+    scanner: &Mutex<Scanner>,
+    which: Stream,
+    chunk: Option<&[u8]>,
+    hook: Option<&PushbackHook>,
+    published: &mut String,
+) {
+    let changed = match scanner.lock() {
+        Ok(mut s) => {
+            match (which, chunk) {
+                (Stream::Err, Some(c)) => s.feed(c),
+                (Stream::Out, Some(c)) => s.feed_headers(c),
+                (Stream::Err, None) => {}
+                (Stream::Out, None) => s.end_of_stdout(),
+            }
+            let key = s.signal_key();
+            if hook.is_some() && !s.matched().is_empty() && key != *published {
+                *published = key;
+                Some(s.clone())
+            } else {
+                None
+            }
+        }
+        Err(_) => None,
+    };
+    // Called with the scanner unlocked: recording the cooldown takes the state file's lock.
+    if let (Some(h), Some(snapshot)) = (hook, changed) {
+        (h.0)(&snapshot);
+    }
+}
+
 /// Read `src` until it ends (EIO from a pty master counts as the end), feeding the scanner
-/// before queueing each chunk, and stopping early after gh's exit as described in the module
-/// documentation.
-fn tee_reader(mut src: File, which: Stream, scanner: Arc<Mutex<Scanner>>, tee: Arc<Tee>) {
+/// (and calling the pushback hook) before queueing each chunk, and stopping early after gh's
+/// exit as described in the module documentation.
+fn tee_reader(
+    mut src: File,
+    which: Stream,
+    scanner: Arc<Mutex<Scanner>>,
+    tee: Arc<Tee>,
+    hook: Option<PushbackHook>,
+) {
     let fd = src.as_raw_fd();
     let mut buf = vec![0u8; 64 * 1024];
+    let mut published = String::new();
     let mut last_data = Instant::now();
     let mut exited_at: Option<Instant> = None;
     let mut after_exit = 0usize;
@@ -408,18 +502,20 @@ fn tee_reader(mut src: File, which: Stream, scanner: Arc<Mutex<Scanner>>, tee: A
                 if exited_at.is_some() {
                     after_exit += n;
                 }
-                if let Ok(mut s) = scanner.lock() {
-                    match which {
-                        Stream::Err => s.feed(&buf[..n]),
-                        Stream::Out => s.feed_headers(&buf[..n]),
-                    }
-                }
+                scan_and_publish(
+                    &scanner,
+                    which,
+                    Some(&buf[..n]),
+                    hook.as_ref(),
+                    &mut published,
+                );
                 tee.push(buf[..n].to_vec());
             }
             Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
             Err(_) => break,
         }
     }
+    scan_and_publish(&scanner, which, None, hook.as_ref(), &mut published);
     tee.close();
 }
 
@@ -447,17 +543,11 @@ fn tee_writer(which: Stream, tee: Arc<Tee>) {
         let Some(chunk) = chunk else {
             return;
         };
-        let written = match which {
-            Stream::Err => {
-                let mut e = std::io::stderr();
-                e.write_all(&chunk).and_then(|()| e.flush())
-            }
-            Stream::Out => {
-                let mut o = std::io::stdout();
-                o.write_all(&chunk).and_then(|()| o.flush())
-            }
+        let fd = match which {
+            Stream::Err => 2,
+            Stream::Out => 1,
         };
-        if written.is_err() {
+        if !write_fd_all(fd, &chunk) {
             tee.abandon();
         }
     }
@@ -651,7 +741,8 @@ impl Runner for RealRunner {
             if let Some(src) = src {
                 let tee = Arc::new(Tee::default());
                 let (s, t) = (Arc::clone(&shared), Arc::clone(&tee));
-                let reader = std::thread::spawn(move || tee_reader(src, which, s, t));
+                let hook = inv.on_pushback.clone();
+                let reader = std::thread::spawn(move || tee_reader(src, which, s, t, hook));
                 let t = Arc::clone(&tee);
                 let writer = std::thread::spawn(move || tee_writer(which, t));
                 tees.push((tee, reader, writer));

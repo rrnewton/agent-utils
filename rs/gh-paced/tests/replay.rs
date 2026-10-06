@@ -176,6 +176,7 @@ fn gh(
         pid: 4242,
         start_ticks: 1,
         nonce: format!("{:016x}", NONCE.fetch_add(1, Ordering::SeqCst)),
+        stderr_deadline: None,
     };
     let outcome = w.run(args);
     (outcome, w.messages)
@@ -984,6 +985,7 @@ fn in_flight_wait_warns_on_every_poll() {
         pid: 4242,
         start_ticks: 1,
         nonce: format!("{:016x}", NONCE.fetch_add(1, Ordering::SeqCst)),
+        stderr_deadline: None,
     };
     let outcome = w.run(&strings(&["issue", "comment", "1", "--body", "short note"]));
     assert_eq!(outcome, Outcome::Exit(0), "{:?}", w.messages);
