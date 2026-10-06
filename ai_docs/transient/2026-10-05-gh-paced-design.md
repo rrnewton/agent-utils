@@ -58,9 +58,11 @@ stdout and stderr pass through; if stderr is a terminal the child gets a
 pseudo-terminal for stderr, so gh still sees a TTY while gh-paced scans it.
 A teed stream (stderr, and stdout for `api --include`) is scanned before it is
 queued for the consumer, and every byte read is delivered however slowly the
-consumer reads; only a user's INT, TERM, HUP or QUIT after gh has exited
-abandons undelivered output, with a warning, and gh-paced then dies by that
-signal.
+consumer reads; only an INT, TERM, HUP or QUIT after gh has exited (sent, or
+typed at the terminal) abandons undelivered output, and gh-paced then dies by
+that signal within about 2 s even if the consumer has stopped reading. A
+pushback signal is recorded as soon as the reader sees it, before the chunk
+that carried it is queued.
 
 **Classification.** Each command line is classified without touching the
 network:
@@ -131,7 +133,9 @@ blocks are also read (status 403/429, `Retry-After`, `X-RateLimit-Remaining:
 0`). A header block is acted on only in the shape gh prints it: a status line,
 header lines ending in CRLF, and a CRLF blank line; a response body that merely
 looks like headers (printed through `--jq`, say, with plain LF line ends) is
-never matched. Any of them starts a cooldown of
+never matched. Without `--paginate` only the first stdout block is read (gh
+prints exactly one, first), so no body can start a cooldown; with `--paginate`
+every block is read. Any of them starts a cooldown of
 max(Retry-After, 900 s), printed as a banner, and discards the snapshot. A plain
 403 also gets 900 s, and neither cooldown can be configured lower.
 
@@ -370,7 +374,10 @@ primary allowance in that hour.
    A header block counts only in the shape gh prints it: header lines and the
    closing blank line end in CRLF, while jq output uses LF. (Round 2 found that a
    `--jq .body` output holding a status line and `Retry-After: 99999` started a
-   false cooldown.)
+   false cooldown.) Without `--paginate` only the first block is read, and a
+   block cut off by the end of the output still counts. (Round 3 found that a
+   body with CRLF header lines started a false cooldown, and that a cut-off
+   block lost its `Retry-After`.)
 2. **GraphQL is classified by its query.** `api graphql` with a readable
    `query` is READ; a `mutation`, or a query that cannot be read (from a file
    gh-paced cannot open, say), is WRITE. Treating every GraphQL call as WRITE
@@ -647,9 +654,35 @@ Limitations. Line numbers refer to `670eed40`.
 - No test injects a crash between quarantine and the recovery save (round 2,
   row 10); that path was checked by tracing the operations only.
 
-After the follow-up commit `cargo test -p gh-paced` runs 114 tests, all
-passing: 76 library, 24 CLI and 14 replay. The run takes 12.6 s of wall time,
-9.2 s of it the CLI tests.
+## Round-3 known gaps: what changed before round 4
+
+The commit for round 4 fixes four of the six documented-gap majors and the
+CRLF-body minor, and keeps two majors as documented gaps. Each fix has a test
+that fails on the code before the fix (`6a37760b`, run from an export with the
+new test copied in) and passes after it.
+
+| Round-3 gap | Now | Test that fails before the fix |
+| --- | --- | --- |
+| Watch charges are estimates | kept: gh-paced sees the command line and output, not the requests gh makes per poll; only GitHub can count them. The guide says so | none |
+| Pushback recorded only after delivery | fixed: the reader calls a hook as soon as the scanner's signals change, before queueing the chunk; the hook extends the `<account>.cooldown` sidecar under the state lock, and every load takes the later of the sidecar and the state file | `cli::pushback_is_recorded_before_output_is_delivered` (stderr text with 1 MiB unread after it; `--include` header with 1 MiB body unread) |
+| Late signal waits for a blocked write | fixed: the tee writers use `write(2)` on descriptors 1 and 2 directly, without the standard library's stream locks, and after a late signal gh-paced's own messages get a 2 s deadline. A terminal's INT after gh exits now also ends gh-paced (it used to be ignored, being terminal-generated) | `cli::late_signal_ends_gh_paced_while_the_consumer_is_stalled`, `cli::terminal_interrupt_after_gh_exits_ends_gh_paced` |
+| Post-exit cutoffs lose a descendant's later output | kept: gh-paced cannot know whether a process gh started will write again, and waiting for end of file would hold gh's exit status until, for example, a `--web` browser closes. Relaying it would need a drainer process that outlives gh-paced, which is not a small change | none |
+| Base64 wrapped under 20 columns | fixed: consecutive base64-alphabet lines of one width (the last may be shorter) form a block at any width | `guard::base64_detection` (16- and 8-column wrapping) |
+| Cut-off header block loses `Retry-After` | fixed: without `--paginate` the first block counts however it ends; with `--paginate` a block holding at least one CRLF header line counts at the end of the output | `pushback` unit tests (`single_response_reads_only_the_first_block`, the cut-short case) |
+| CRLF body starts an unneeded cooldown (minor) | fixed without `--paginate` (only the first block is read); still possible with `--paginate`, where page boundaries look the same | `cli::include_body_with_crlf_headers_starts_no_cooldown` |
+
+Remaining caveats, in the guide: a signal sent while gh runs goes to gh, so if
+gh exits with the consumer stalled gh-paced waits for a second signal; a signal
+in the milliseconds between gh's exit and gh-paced noticing it has no effect;
+the equal-width rule also refuses long lists of equal-width tokens (143 or
+more 7-character short SHAs, or 251 or more 4-digit numbers, one per line).
+
+After the follow-up commit (`6a37760b`) `cargo test -p gh-paced` ran 114
+tests, all passing: 76 library, 24 CLI and 14 replay, in 12.6 s of wall time,
+9.2 s of it the CLI tests. After the commit for round 4 it runs 119 tests, all
+passing: 77 library, 28 CLI and 14 replay, in 12.5 s of wall time. The five new
+tests are `pushback::single_response_reads_only_the_first_block` and the four
+`cli` tests named in the table above.
 
 ## Test changes worth a reviewer's attention
 
@@ -721,6 +754,19 @@ Round 2 changed these existing tests:
   `snapshot::sweep_removes_only_old_snapshot_directories` became
   `sweep_removes_only_abandoned_snapshot_directories`, following the new rules.
 
+The commit for round 4 changes three existing tests, each to a stricter
+expectation that follows a fix:
+
+- `guard::base64_detection`: 200 lines of `abcdefghij` counted 10 and now count
+  2,000 (the equal-width rule refuses them).
+- `pushback`: a header block cut off before its blank line gave no cooldown and
+  now gives its `Retry-After` (3,600 s), also when cut inside its next header
+  line.
+- `cli::slow_consumer_receives_every_byte` now runs `api --include --paginate`
+  (it ran `api --include`): its header block follows 1 MiB of body, which only a
+  paginated call can print, and a single-response call now ignores it. Every
+  byte is still asserted to arrive.
+
 The follow-up commit after round 3 removes or loosens no assertion. It adds
 assertions to five existing tests (help detection, grouped shorthands,
 pagination and limit costs, watch loops, alias inspection), adds one test
@@ -738,7 +784,7 @@ pagination and limit costs, watch loops, alias inspection), adds one test
   jobs that fail during the watch, can make more requests than it paid for
   before the deadline stops it; the deadline still bounds its wall time and the
   30 s floor its rate.
-- The other round-3 known gaps: pushback recorded only after output delivery,
-  a late signal waiting for a blocked write, post-exit output cutoffs, base64
-  wrapped under 20 columns, interrupted header blocks, CRLF bodies, and no
-  crash-injection test for quarantine (see round 3).
+- Output a process gh started writes after the post-exit cutoffs is lost.
+- With `--paginate`, a page body containing a CRLF header block can start an
+  unneeded cooldown.
+- No crash-injection test for quarantine (see round 3).

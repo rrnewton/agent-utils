@@ -41,9 +41,11 @@ if [ -n "${FAKE_GH_BG:-}" ]; then
   # Leave a background helper running past gh's exit, holding every inherited descriptor.
   ( sleep "$FAKE_GH_BG"; echo "$(date +%s.%N) bg-end $*" >> "$log" ) >/dev/null 2>&1 &
 fi
+if [ -n "${FAKE_GH_STDOUT_HEAD:-}" ]; then printf '%s' "$FAKE_GH_STDOUT_HEAD"; fi
 if [ -n "${FAKE_GH_STDOUT_BYTES:-}" ]; then head -c "$FAKE_GH_STDOUT_BYTES" /dev/zero | tr '\0' x; echo; fi
 if [ -n "${FAKE_GH_STDOUT:-}" ]; then printf '%s\n' "$FAKE_GH_STDOUT"; fi
 if [ -n "${FAKE_GH_STDERR:-}" ]; then printf '%s\n' "$FAKE_GH_STDERR" >&2; fi
+if [ -n "${FAKE_GH_STDERR_BYTES:-}" ]; then head -c "$FAKE_GH_STDERR_BYTES" /dev/zero | tr '\0' y >&2; echo >&2; fi
 echo "$(date +%s.%N) end $*" >> "$log"
 if [ -n "${FAKE_GH_SIGNAL:-}" ]; then kill -s "$FAKE_GH_SIGNAL" $$; sleep 5; fi
 exit "${FAKE_GH_EXIT:-0}"
@@ -1051,7 +1053,9 @@ fn include_headers_on_stdout_set_the_cooldown() {
 /// gone. 120 KiB is more than one 64 KiB pipe holds, so part of it is still inside gh-paced when gh
 /// exits; 2 MiB is absorbed by the forwarding queue; 10 MiB is past the queue bound, so gh itself
 /// is held back until the consumer reads. Each case ends with a header block, which must still be
-/// seen behind the unread output and must set the cooldown.
+/// seen behind the unread output and must set the cooldown. A header block after other output is
+/// a later page's, so these calls use `--paginate`; without it only a block on gh's first stdout
+/// line is read (see `include_body_with_crlf_headers_starts_no_cooldown`).
 #[test]
 fn slow_consumer_receives_every_byte() {
     let header = "HTTP/2.0 429 Too Many Requests\r\nRetry-After: 1200\r\n\r\n";
@@ -1060,7 +1064,7 @@ fn slow_consumer_receives_every_byte() {
         .map(|n: usize| {
             let sb = Sandbox::new(&format!("slow-{n}"), FAST);
             let child = sb
-                .cmd(&["api", "--include", "repos/o/r"])
+                .cmd(&["api", "--include", "--paginate", "repos/o/r"])
                 .env("FAKE_GH_STDOUT_BYTES", n.to_string())
                 .env("FAKE_GH_STDOUT", header)
                 .env("FAKE_GH_EXIT", "1")
@@ -1094,6 +1098,227 @@ fn slow_consumer_receives_every_byte() {
             "{n} bytes: no cooldown: {state}"
         );
     }
+}
+
+/// Seconds since the epoch.
+fn epoch_now() -> f64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs_f64()
+}
+
+/// Wait for the cooldown record while `child`'s consumer reads nothing, then drain it. Returns
+/// the record's `until` (if it appeared within 15 s), whether gh-paced was still running when it
+/// appeared, and the drained output.
+fn cooldown_before_delivery(
+    sb: &Sandbox,
+    mut child: std::process::Child,
+) -> (Option<f64>, bool, Output) {
+    let begun = Instant::now();
+    let mut until = None;
+    while begun.elapsed().as_secs_f64() < 15.0 {
+        if let Ok(text) = std::fs::read_to_string(sb.path("state/test.cooldown")) {
+            let v: serde_json::Value = serde_json::from_str(&text).unwrap();
+            until = v["until"].as_f64();
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    let running = child.try_wait().unwrap().is_none();
+    (until, running, child.wait_with_output().unwrap())
+}
+
+/// GitHub pushback is recorded as soon as gh-paced reads it, while gh's output is still waiting
+/// for a consumer that has read nothing (1 MiB, far more than a pipe holds, so gh-paced cannot
+/// finish delivering it). Other gh-paced processes therefore pause at once, not only after the
+/// consumer catches up. Covers a stderr message and a single response's `--include` headers.
+#[test]
+fn pushback_is_recorded_before_output_is_delivered() {
+    let n: usize = 1 << 20;
+    let sb = Sandbox::new("early-stderr", FAST);
+    let before = epoch_now();
+    let child = sb
+        .cmd(&["pr", "view", "5"])
+        .env(
+            "FAKE_GH_STDERR",
+            "HTTP 403: You have exceeded a secondary rate limit",
+        )
+        .env("FAKE_GH_STDERR_BYTES", n.to_string())
+        .env("FAKE_GH_EXIT", "1")
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let (until, running, o) = cooldown_before_delivery(&sb, child);
+    let until = until.expect("no cooldown record while stderr was undelivered");
+    assert!(running, "gh-paced had already finished delivering");
+    assert!(
+        until - before >= 899.0 && until - before < 1000.0,
+        "cooldown {} s",
+        until - before
+    );
+    assert_eq!(o.status.code(), Some(1), "{}", stderr(&o));
+    assert!(
+        stderr(&o).contains(&format!("\n{}\n", "y".repeat(n))),
+        "every byte delivered"
+    );
+    assert!(
+        stderr(&o).contains("GH-PACED PUSHBACK [test]"),
+        "the banner still prints"
+    );
+
+    let sb = Sandbox::new("early-include", FAST);
+    let header = "HTTP/2.0 429 Too Many Requests\nRetry-After: 1200\r\n\r\n";
+    let before = epoch_now();
+    let child = sb
+        .cmd(&["api", "--include", "repos/o/r"])
+        .env("FAKE_GH_STDOUT_HEAD", header)
+        .env("FAKE_GH_STDOUT_BYTES", n.to_string())
+        .env("FAKE_GH_EXIT", "1")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let (until, running, o) = cooldown_before_delivery(&sb, child);
+    let until = until.expect("no cooldown record while stdout was undelivered");
+    assert!(running, "gh-paced had already finished delivering");
+    assert!(
+        until - before >= 1199.0 && until - before < 1300.0,
+        "cooldown {} s",
+        until - before
+    );
+    assert_eq!(o.status.code(), Some(1), "{}", stderr(&o));
+    assert!(
+        o.stdout == format!("{header}{}\n", "x".repeat(n)).as_bytes(),
+        "stdout differs"
+    );
+    assert!(
+        stderr(&o).contains("GH-PACED PUSHBACK [test]"),
+        "{}",
+        stderr(&o)
+    );
+}
+
+/// Without `--paginate`, gh prints one response, so only the header block on its first stdout
+/// line is read. A body that holds a CR LF status line and headers after a healthy block (a
+/// string with embedded CR LF, printed by --jq or --template) starts no cooldown.
+#[test]
+fn include_body_with_crlf_headers_starts_no_cooldown() {
+    let sb = Sandbox::new("include-crlf-body", FAST);
+    let response = "HTTP/2.0 200 OK\nX-Ratelimit-Remaining: 4000\r\n\r\nHTTP/2.0 403 Forbidden\nRetry-After: 99999\r\nX-Ratelimit-Remaining: 0\r\n\r\n";
+    let o = sb.run(&["api", "-i", "repos/o/r"], &[("FAKE_GH_STDOUT", response)]);
+    assert_eq!(o.status.code(), Some(0), "{}", stderr(&o));
+    assert_eq!(stdout(&o), format!("{response}\n"), "stdout passes through");
+    assert!(!stderr(&o).contains("PUSHBACK"), "{}", stderr(&o));
+    assert!(
+        !sb.path("state/test.cooldown").exists(),
+        "a cooldown record was written"
+    );
+    let state: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(sb.path("state/test.json")).unwrap())
+            .unwrap();
+    assert!(state["cooldown"].is_null(), "{state}");
+}
+
+/// A signal that arrives after gh has exited, while gh's output is stuck behind a consumer that
+/// has stopped reading, ends gh-paced by that signal within a few seconds. gh-paced's own
+/// warning is given up to 2 s to reach stderr and is then dropped; it does not wait for the
+/// consumer to read again.
+#[test]
+fn late_signal_ends_gh_paced_while_the_consumer_is_stalled() {
+    let sb = Sandbox::new("late-stall", FAST);
+    let mut child = sb
+        .cmd(&["pr", "view", "5"])
+        .env("FAKE_GH_STDERR_BYTES", (1usize << 20).to_string())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    wait_for_log(&sb, "end pr view 5");
+    // Let gh exit and be reaped, so the signal is not forwarded to it.
+    std::thread::sleep(std::time::Duration::from_secs(1));
+    // SAFETY: signalling our own child, which has not been reaped.
+    unsafe {
+        libc::kill(child.id() as i32, libc::SIGTERM);
+    }
+    let sent = Instant::now();
+    let mut ended = None;
+    while sent.elapsed().as_secs_f64() < 8.0 {
+        if let Some(status) = child.try_wait().unwrap() {
+            ended = Some((status, sent.elapsed().as_secs_f64()));
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    // Drain stderr so a stuck gh-paced cannot outlive the test.
+    let o = child.wait_with_output().unwrap();
+    let (status, secs) = ended.expect("gh-paced was still waiting for its consumer 8 s after TERM");
+    assert!(secs < 5.0, "gh-paced took {secs} s to die");
+    assert_eq!(status.signal(), Some(libc::SIGTERM), "{}", stderr(&o));
+}
+
+/// A terminal's INT (Ctrl-C) goes to the whole foreground process group, gh included, so
+/// gh-paced does not forward it. Once gh has exited, it is for gh-paced alone: it ends gh-paced
+/// by SIGINT within a few seconds, even while gh's output is stuck behind a consumer that has
+/// stopped reading, just as it would have ended gh writing to that consumer.
+#[test]
+fn terminal_interrupt_after_gh_exits_ends_gh_paced() {
+    let sb = Sandbox::new("late-tty", FAST);
+    // A pseudo-terminal that becomes gh-paced's controlling terminal, in a session of its own.
+    // SAFETY: standard pty allocation; the master is owned by a File and closed on drop.
+    let (mut master, slave_name) = unsafe {
+        let fd = libc::posix_openpt(libc::O_RDWR | libc::O_NOCTTY | libc::O_CLOEXEC);
+        assert!(fd >= 0, "posix_openpt failed");
+        assert_eq!(libc::grantpt(fd), 0);
+        assert_eq!(libc::unlockpt(fd), 0);
+        let mut name = [0 as libc::c_char; 128];
+        assert_eq!(libc::ptsname_r(fd, name.as_mut_ptr(), name.len()), 0);
+        let name = std::ffi::CStr::from_ptr(name.as_ptr()).to_owned();
+        (
+            <std::fs::File as std::os::fd::FromRawFd>::from_raw_fd(fd),
+            name,
+        )
+    };
+    let mut cmd = sb.cmd(&["pr", "view", "5"]);
+    cmd.env("FAKE_GH_STDERR_BYTES", (1usize << 20).to_string())
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped());
+    // SAFETY: setsid and open are async-signal-safe; the name was copied before the fork.
+    unsafe {
+        cmd.pre_exec(move || {
+            if libc::setsid() < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            // A session leader without a terminal acquires the first terminal it opens
+            // without O_NOCTTY; its process group becomes the terminal's foreground group.
+            if libc::open(slave_name.as_ptr(), libc::O_RDWR | libc::O_CLOEXEC) < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let mut child = cmd.spawn().unwrap();
+    wait_for_log(&sb, "end pr view 5");
+    // Let gh exit and be reaped, so gh-paced is the only process left in the group.
+    std::thread::sleep(std::time::Duration::from_secs(1));
+    master.write_all(b"\x03").unwrap();
+    let sent = Instant::now();
+    let mut ended = None;
+    while sent.elapsed().as_secs_f64() < 8.0 {
+        if let Some(status) = child.try_wait().unwrap() {
+            ended = Some((status, sent.elapsed().as_secs_f64()));
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    // Drain stderr so a stuck gh-paced cannot outlive the test.
+    let o = child.wait_with_output().unwrap();
+    let (status, secs) =
+        ended.expect("gh-paced was still waiting for its consumer 8 s after the terminal's INT");
+    assert!(secs < 5.0, "gh-paced took {secs} s to die");
+    assert_eq!(status.signal(), Some(libc::SIGINT), "{}", stderr(&o));
 }
 
 /// Snapshot directories in the state directory, by name.
