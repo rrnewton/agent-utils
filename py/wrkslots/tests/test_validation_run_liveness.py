@@ -476,36 +476,54 @@ def test_completed_validation_removal_ignores_an_active_unit_naming_a_sibling_ro
     assert active_slots(project) == []
 
 
-def test_unit_path_evidence_keeps_each_normalization_stage(tmp_path: Path) -> None:
-    """One property string can hold several paths and other words.
+def test_unit_words_name_a_row_by_path_identity(tmp_path: Path) -> None:
+    """A unit names a row when one of its words is the row's path or inside it.
 
-    The ``x/..`` later in this shell command would remove the tail of the row
-    path if only the fully reduced text were compared; the stage after the
-    first ``..`` step still shows the row path whole.
+    Words are compared as whole paths: lexically normalized, symlink
+    resolved, relative ones resolved against the unit's working directory,
+    and by file identity where the path exists.  A longer path that merely
+    contains the row's text is a different path.
     """
 
-    row = "/project/worktrees/validate/slot01"
-    command = "cd /project/worktrees/tmp/../validate/slot01 && ls build/../out"
-    evidence = wrkslots._lexical_path_evidence(command)
-    assert wrkslots._evidence_names_path(evidence, row)
-    assert not wrkslots._evidence_names_path(
-        wrkslots._lexical_path_evidence("/project/worktrees/validate/slot010"), row
-    )
-    assert wrkslots._evidence_names_path(
-        wrkslots._lexical_path_evidence(f"PATH=/usr/bin:{row}:/bin"), row
-    )
+    project = tmp_path / "project"
+    row = project / "worktrees" / "validate" / "slot01"
+    row.mkdir(parents=True)
+    (project / "worktrees" / "validate" / "slot010").mkdir()
+    alias = tmp_path / "alias"
+    alias.symlink_to(row)
+    outer = tmp_path / "outer"
+    outer.symlink_to(project)
 
-    steps = "/a/.." * (wrkslots._PARENT_DIRECTORY_STEPS_LIMIT + 1)
-    with pytest.raises(wrkslots.Refusal, match="parent-directory steps"):
-        wrkslots._lexical_path_evidence(f"{steps}{row}")
+    def names(**unit: str) -> bool:
+        return wrkslots._UnitPathResolver().names(unit, wrkslots._row_path_identity(row))
 
+    # One shell command holds several paths; a later ``x/..`` step does not
+    # hide the row path that an earlier word names.
+    assert names(ExecStart=f"cd {project}/worktrees/tmp/../validate/slot01 && ls build/../out")
+    assert names(Environment=f"PATH=/usr/bin:{row}:/bin")
+    assert names(ExecStart=f"--checkout={row}//product")
+    # A symlink to the row, or to one of its ancestors, is the row.
+    assert names(ExecStart=f"{alias}/product")
+    assert names(ExecStart=f"{outer}/worktrees/validate/slot01")
+    # A relative word is resolved against the unit's working directory.
+    assert names(WorkingDirectory=str(project), ExecStart="git\n-C\nworktrees/validate/slot01")
+    assert names(WorkingDirectory=f"!{row}/build", ExecStart="make\n..")
+    assert names(WorkingDirectory=f"!{row}")
+    # A longer path containing the row's text is another path.
+    assert not names(ExecStart=f"/other{row}")
+    assert not names(ExecStart=f"{row}+other")
+    assert not names(ExecStart=f"{row}0")
+    assert not names(WorkingDirectory=str(project), ExecStart="worktrees/validate/slot010")
+
+    # A row spelled through a symlink matches its resolved spelling.
     real = tmp_path / "real"
     (real / "worktrees").mkdir(parents=True)
     link = tmp_path / "link"
     link.symlink_to(real)
-    spellings = wrkslots._row_path_spellings(link / "worktrees" / "validate" / "slot01")
-    resolved = wrkslots._lexical_path_evidence(f"{real}/worktrees/validate/slot01")
-    assert any(wrkslots._evidence_names_path(resolved, spelling) for spelling in spellings)
+    linked = wrkslots._row_path_identity(link / "worktrees" / "validate" / "slot01")
+    assert wrkslots._UnitPathResolver().names(
+        {"ExecStart": f"{real}/worktrees/validate/slot01"}, linked
+    )
 
 
 UNREADABLE_PID = 4_000_017
@@ -1032,3 +1050,65 @@ def test_this_host_process_view_is_the_host_view() -> None:
     """The suite runs on the host, so the real view passes the proof."""
 
     wrkslots._assert_host_process_view()
+
+
+@pytest.mark.parametrize("form", ["symlink", "relative"])
+def test_completed_validation_removal_refuses_a_queued_unit_naming_the_row_by_identity(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    form: str,
+) -> None:
+    """A queued job names the row through a symlink or a relative path.
+
+    Neither spelling contains the row's text, and the job has not started,
+    so no process or path census can show it later.
+    """
+
+    project, tree = _prepare(tmp_path, monkeypatch, agent_liveness="dead")
+    slot_directory = _slot_directory(project)
+    if form == "symlink":
+        alias = tmp_path / "checkout-alias"
+        alias.symlink_to(slot_directory)
+        evidence = {"ExecStart": f"/usr/bin/make\n-C\n{alias}/product"}
+    else:
+        evidence = {
+            "WorkingDirectory": str(slot_directory.parent.parent),
+            "ExecStart": f"git\n-C\n{slot_directory.parent.name}/{slot_directory.name}",
+        }
+    queued = _unit(Id="queued-run.service", PendingJob="yes", **evidence)
+    monkeypatch.setattr(wrkslots, "_user_systemd_snapshot", lambda: (queued,))
+
+    removed = _remove_completed(project)
+
+    error = capsys.readouterr().err
+    assert removed != 0
+    assert "user-systemd unit queued-run.service names validation row slot01" in error
+    _assert_retained(project, tree)
+
+
+@pytest.mark.parametrize("form", ["/other{row}", "{row}+other"])
+def test_completed_validation_removal_ignores_a_unit_naming_a_longer_path(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    form: str,
+) -> None:
+    """A path that contains the row's text is not the row's path."""
+
+    project, tree = _prepare(tmp_path, monkeypatch, agent_liveness="dead")
+    other = form.format(row=_slot_directory(project))
+    running = _unit(
+        Id="other-run.service",
+        ActiveState="active",
+        SubState="running",
+        ExecStart=f"/usr/bin/env\n--checkout={other}",
+        Environment=f"RUN_ROOT={other}",
+    )
+    monkeypatch.setattr(wrkslots, "_user_systemd_snapshot", lambda: (running,))
+
+    removed = _remove_completed(project)
+
+    assert removed == 0, capsys.readouterr().err
+    assert not tree.exists()
+    assert active_slots(project) == []

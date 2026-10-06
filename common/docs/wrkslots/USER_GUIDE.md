@@ -385,11 +385,17 @@ validation slots. `audit`, `remove` (including `--validate-complete` and `remove
   host run can be missing from the process table, so an empty table is no evidence. All of this evidence is local to the host, so a host without a reachable user service manager cannot prove a
   validation slot free.
 
-A unit names a row path when any of its property strings contains the path, in its recorded or
-symlink-resolved spelling, either as read or after removing repeated slashes and `.` and `x/..`
-steps, followed by `/`, the end of the string, or a character other than a letter, digit, `.`, `_`
-or `-`. A unit naming `slot01/product`, `slot01/./product` or `--checkout=slot01:` therefore names
-`slot01`, and one naming its sibling `slot010` does not. This rule is shared with
+A unit names a row path when one of the words of its property strings is that path or a path
+inside it. Words are separated by whitespace, quotes, and the characters `=`, `:`, `,`, `;`, `&`,
+`|`, `(`, `)`, `<`, `>`, `{`, `}` and `$`; a leading `-`, `!`, `@` or `+` is also tried without it.
+A relative word is resolved against the unit's working directory (the home directory when it has
+none), and `~` is the home directory. Each word is then compared as a whole path: its normalized
+spelling and its symlink-resolved spelling against the row path's recorded and symlink-resolved
+spellings, by complete path components, and, where the path exists, the word and each of its
+existing ancestors by device and inode against the row path itself. A unit naming
+`slot01/./product`, `--checkout=slot01//product`, a symlink to `slot01`, or `worktrees/validate/slot01`
+with the project root as its working directory therefore names `slot01`; one naming `slot010`,
+`slot01+other` or `/other/<project>/worktrees/validate/slot01` does not. This rule is shared with
 `recover-absent-validate-rows`.
 
 The process table is read both before and after the user-systemd enumeration, which takes about a

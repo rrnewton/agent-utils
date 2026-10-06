@@ -16730,6 +16730,7 @@ def _validation_run_liveness_states(
             for record in local
         )
         return result
+    resolver = _UnitPathResolver()
     for row in rows:
         record = row[0]
         key = (record.machine, record.slot, record.generation)
@@ -16737,7 +16738,7 @@ def _validation_run_liveness_states(
         try:
             _assert_retained_handle_processes_dead(handles)
             _assert_absent_validate_systemd_unrelated(
-                (row,), handles, processes, snapshot=snapshot
+                (row,), handles, processes, snapshot=snapshot, resolver=resolver
             )
         except _ValidationRunMayUseRow as exc:
             result[key] = (
@@ -46851,75 +46852,151 @@ def _user_systemd_snapshot() -> tuple[Mapping[str, str], ...]:
     raise AssertionError("bounded user-systemd retry loop did not return or refuse")
 
 
-# Characters that can continue the last component of a path name.  A row path
-# followed by one of them is the beginning of a sibling's name (``slot010``
-# beside ``slot01``).  Followed by anything else -- ``/``, the end of the text,
-# ``:``, ``=``, whitespace or a quote -- it names the row path or a path inside
-# it.  Treating every other character as a boundary errs toward "names".
-_PATH_NAME_CONTINUATION = frozenset(
-    "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-"
-)
-_REPEATED_SLASHES = re.compile(r"/{2,}")
-_CURRENT_DIRECTORY_STEP = re.compile(r"/\.(?=/|$)")
-_PARENT_DIRECTORY_STEP = re.compile(r"/(?!\.\.(?:/|$))[^/]+/\.\.(?=/|$)")
-_PARENT_DIRECTORY_STEPS_LIMIT = 64
+# Characters that separate the words of a unit property string.  Whitespace
+# and quotes end shell words; ``=``, ``:`` and ``,`` separate an option or
+# variable name from its value and the entries of a search list
+# (``--checkout=PATH``, ``PATH=/a:/b``); ``;``, ``&``, ``|``, parentheses,
+# redirections, braces and ``$`` delimit shell commands.  Every other
+# character, including ``+``, ``.``, ``-``, ``_``, ``@`` and ``~``, is part
+# of a path name, so ``slot01+other`` is one path and not ``slot01``.
+_UNIT_EVIDENCE_SEPARATORS = re.compile(r"[\s\"'`=:,;&|()<>{}$]+")
+# Prefixes systemd and unit files put before a path to change how it is used
+# (``-/path`` and ``!/path`` mean the path may be missing).
+_UNIT_PATH_PREFIXES = "-!@+"
 
 
-def _row_path_spellings(path: Path) -> tuple[str, ...]:
-    """Return the lexical and the symlink-resolved spelling of one row path."""
+@dataclasses.dataclass(frozen=True)
+class _RowPathIdentity:
+    """One validation-row path, as the strings and file it is."""
+
+    path: Path
+    spellings: tuple[str, ...]
+    file: tuple[int, int] | None
+
+
+def _row_path_identity(path: Path) -> _RowPathIdentity:
+    """Return the lexical and symlink-resolved spelling of a row path and,
+    when it exists, its device and inode."""
 
     lexical = os.path.normpath(str(path))
-    return tuple(dict.fromkeys((lexical, os.path.realpath(lexical))))
+    try:
+        metadata = os.stat(lexical)
+    except (OSError, ValueError):
+        file = None
+    else:
+        file = (metadata.st_dev, metadata.st_ino)
+    return _RowPathIdentity(
+        path, tuple(dict.fromkeys((lexical, os.path.realpath(lexical)))), file
+    )
 
 
-@functools.lru_cache(maxsize=4096)
-def _lexical_path_evidence(value: str) -> str:
-    """Return one unit property value with its paths in every lexical spelling.
+class _UnitPathResolver:
+    """Resolve the words of user-systemd units to path identities.
 
-    A unit can name a row through a different spelling of the same path:
-    ``/project/./worktrees/validate/slot01``, ``//`` or ``x/../``.  Each
-    newline-separated string of the value is kept as read, with repeated
-    slashes and ``.`` steps removed, and after each single ``seg/..`` step is
-    removed, leftmost first.  Every stage is kept rather than only the last:
-    a property string can hold several paths and other words, and a later
-    ``..`` may remove the tail of an earlier path that the previous stage
-    still shows whole.  Keeping more spellings can only add matches.
-
-    More than 64 ``..`` steps in one string is refused rather than compared,
-    which bounds the work a hostile unit can cause.
+    One resolver serves one judgement: it memoizes the resolution of each
+    word and the identity of each file it stats, so several rows can be
+    compared with one unit enumeration without repeating the file-system
+    reads.  It must not outlive the judgement, because the files change.
     """
 
-    forms: list[str] = []
-    for element in value.split("\n"):
-        forms.append(element)
-        current = _CURRENT_DIRECTORY_STEP.sub("", _REPEATED_SLASHES.sub("/", element))
-        forms.append(current)
-        for _step in range(_PARENT_DIRECTORY_STEPS_LIMIT):
-            popped = _PARENT_DIRECTORY_STEP.sub("", current, count=1)
-            if popped == current:
-                break
-            forms.append(popped)
-            current = popped
+    def __init__(self) -> None:
+        self._words: dict[str, tuple[tuple[str, ...], frozenset[tuple[int, int]]]] = {}
+        self._files: dict[str, tuple[int, int] | None] = {}
+
+    def _file(self, path: str) -> tuple[int, int] | None:
+        try:
+            return self._files[path]
+        except KeyError:
+            pass
+        try:
+            metadata = os.stat(path)
+        except (OSError, ValueError):
+            identity = None
         else:
-            if _PARENT_DIRECTORY_STEP.search(current) is not None:
-                raise Refusal(
-                    "a user-systemd property string has more than "
-                    f"{_PARENT_DIRECTORY_STEPS_LIMIT} parent-directory steps, so its "
-                    "paths cannot be compared with validation rows"
-                )
-    return "\n".join(dict.fromkeys(forms))
+            identity = (metadata.st_dev, metadata.st_ino)
+        self._files[path] = identity
+        return identity
+
+    def _resolve(self, joined: str) -> tuple[tuple[str, ...], frozenset[tuple[int, int]]]:
+        """Return a path's spellings and the files of it and its ancestors."""
+
+        try:
+            return self._words[joined]
+        except KeyError:
+            pass
+        lexical = os.path.normpath(joined)
+        try:
+            resolved = os.path.realpath(lexical)
+        except ValueError as exc:
+            raise Refusal(
+                f"a user-systemd property word cannot be resolved as a path: {exc}"
+            ) from exc
+        files: set[tuple[int, int]] = set()
+        current = resolved
+        while True:
+            identity = self._file(current)
+            if identity is not None:
+                files.add(identity)
+            parent = os.path.dirname(current)
+            if parent == current:
+                break
+            current = parent
+        answer = (tuple(dict.fromkeys((lexical, resolved))), frozenset(files))
+        self._words[joined] = answer
+        return answer
+
+    def names(self, unit: Mapping[str, str], row: _RowPathIdentity) -> bool:
+        """Whether any word of ``unit`` is ``row`` or a path inside it.
+
+        Relative words are resolved against the unit's working directory,
+        which for a user unit without one is the user's home directory.  A
+        word names the row when its lexical or symlink-resolved spelling is
+        a row spelling or lies under one by whole path components, or when
+        it or an existing ancestor is the row's own file (a bind mount or
+        hard-linked directory reaches it under another name).
+        """
+
+        base = _unit_working_directory(unit)
+        for value in unit.values():
+            for word in _UNIT_EVIDENCE_SEPARATORS.split(value):
+                for candidate in dict.fromkeys((word, word.lstrip(_UNIT_PATH_PREFIXES))):
+                    if not candidate:
+                        continue
+                    if candidate == "~" or candidate.startswith("~/"):
+                        candidate = os.path.expanduser(candidate)
+                    joined = (
+                        candidate
+                        if candidate.startswith("/")
+                        else os.path.join(base, candidate)
+                    )
+                    spellings, files = self._resolve(joined)
+                    if row.file is not None and row.file in files:
+                        return True
+                    if any(
+                        _spelling_is_within(spelling, root)
+                        for spelling in spellings
+                        for root in row.spellings
+                    ):
+                        return True
+        return False
 
 
-def _evidence_names_path(evidence: str, spelling: str) -> bool:
-    """Whether ``evidence`` names the path ``spelling`` or a path inside it."""
+def _spelling_is_within(path: str, root: str) -> bool:
+    """Whether normalized ``path`` is ``root`` or under it by components."""
 
-    start = evidence.find(spelling)
-    while start >= 0:
-        end = start + len(spelling)
-        if end == len(evidence) or evidence[end] not in _PATH_NAME_CONTINUATION:
-            return True
-        start = evidence.find(spelling, start + 1)
-    return False
+    return path == root or path.startswith(root.rstrip("/") + "/")
+
+
+def _unit_working_directory(unit: Mapping[str, str]) -> str:
+    """The directory a unit's relative paths are resolved against."""
+
+    home = os.path.expanduser("~")
+    raw = unit.get("WorkingDirectory", "").strip().lstrip(_UNIT_PATH_PREFIXES)
+    if raw in {"", "~"}:
+        return home
+    if raw.startswith("~/"):
+        return os.path.join(home, raw[2:])
+    return raw if raw.startswith("/") else os.path.join(home, raw)
 
 
 def _assert_retained_handle_processes_dead(
@@ -46946,11 +47023,14 @@ def _assert_absent_validate_systemd_unrelated(
     processes: Sequence[_AbsentProcessObservation],
     *,
     snapshot: Sequence[Mapping[str, str]] | None = None,
+    resolver: _UnitPathResolver | None = None,
 ) -> None:
     """Refuse when a retained run unit or any active user unit may use a row.
 
     ``snapshot`` lets one caller judge several rows against a single
     user-systemd enumeration; when absent, this reads a fresh one.
+    ``resolver`` lets the same caller share the path resolution of that
+    enumeration's words across rows.
     """
 
     if snapshot is None:
@@ -46982,20 +47062,21 @@ def _assert_absent_validate_systemd_unrelated(
                     f"retained validation unit {handle.unit} still has a live process "
                     f"for row {slot}"
                 )
+    if resolver is None:
+        resolver = _UnitPathResolver()
     targets = tuple(
-        (record, path, _row_path_spellings(path)) for record, paths in rows for path in paths
+        (record, _row_path_identity(path)) for record, paths in rows for path in paths
     )
     for unit in snapshot:
         active = unit["ActiveState"] not in {"inactive", "failed"}
         queued = unit["PendingJob"] == "yes"
         if not active and not queued:
             continue
-        observed = "\n".join(_lexical_path_evidence(value) for value in unit.values())
-        for record, path, spellings in targets:
-            if any(_evidence_names_path(observed, spelling) for spelling in spellings):
+        for record, target in targets:
+            if resolver.names(unit, target):
                 raise _ValidationRunMayUseRow(
                     f"user-systemd unit {unit['Id']} names validation row "
-                    f"{record.slot} path {path}"
+                    f"{record.slot} path {target.path}"
                 )
 
 
