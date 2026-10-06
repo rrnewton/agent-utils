@@ -31,6 +31,20 @@ const OVERLAP: usize = 4096;
 /// Longest stdout line kept while looking for header lines; longer lines are body text.
 const MAX_HEADER_LINE: usize = 8192;
 
+/// Largest `Retry-After` honoured, seconds (1 day). A larger value, including one too long to
+/// represent, is read as this, so the cooldown it starts stays long but finite.
+pub const MAX_RETRY_AFTER_SECS: f64 = 86_400.0;
+
+/// A `Retry-After` value in seconds: `None` unless it is a non-negative number, and at most
+/// [`MAX_RETRY_AFTER_SECS`].
+fn retry_after_secs(text: &str) -> Option<f64> {
+    let n = text.parse::<f64>().ok()?;
+    if n.is_nan() || n < 0.0 {
+        return None;
+    }
+    Some(n.min(MAX_RETRY_AFTER_SECS))
+}
+
 /// What the scanner saw.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Scanner {
@@ -180,7 +194,7 @@ impl Scanner {
                 .take_while(|b| b.is_ascii_digit())
                 .map(|b| *b as char)
                 .collect();
-            if let Ok(n) = digits.parse::<f64>() {
+            if let Some(n) = retry_after_secs(&digits) {
                 self.retry_after = Some(self.retry_after.map_or(n, |old| old.max(n)));
             }
         }
@@ -297,13 +311,15 @@ impl Scanner {
         block.crlf_headers += 1;
         let name = lower[..colon].trim_ascii();
         let value = lower[colon + 1..].trim_ascii();
-        let number = std::str::from_utf8(value)
-            .ok()
+        let text = std::str::from_utf8(value).ok();
+        let number = text
             .and_then(|v| v.parse::<f64>().ok())
             .filter(|n| n.is_finite() && *n >= 0.0);
         match (name, number) {
-            (b"retry-after", Some(n)) => {
-                block.retry_after = Some(block.retry_after.map_or(n, |old| old.max(n)));
+            (b"retry-after", _) => {
+                if let Some(n) = text.and_then(retry_after_secs) {
+                    block.retry_after = Some(block.retry_after.map_or(n, |old| old.max(n)));
+                }
             }
             (b"x-ratelimit-remaining", Some(0.0)) => block.remaining_zero = true,
             _ => {}
@@ -425,6 +441,29 @@ mod tests {
         assert_eq!(s.verdict(&cfg).expect("pushback").cooldown_secs, 3600.0);
         let s = scan(&["HTTP 429\nretry-after:\t60\n"]);
         assert_eq!(s.verdict(&cfg).expect("pushback").cooldown_secs, 900.0);
+    }
+
+    /// A `Retry-After` too large to represent (400 nines parse to infinity) is capped at one
+    /// day, on stderr and in headers, so the cooldown stays long and the state stays finite.
+    #[test]
+    fn a_huge_retry_after_is_capped_not_infinite() {
+        let cfg = Config::default();
+        let nines = "9".repeat(400);
+        let s = scan(&[&format!("HTTP 429\nRetry-After: {nines}\n")]);
+        assert_eq!(s.retry_after, Some(MAX_RETRY_AFTER_SECS));
+        assert_eq!(
+            s.verdict(&cfg).expect("pushback").cooldown_secs,
+            MAX_RETRY_AFTER_SECS
+        );
+        let s = headers(&[&format!(
+            "HTTP/2.0 429 Too Many Requests\r\nRetry-After: {nines}\r\n\r\n"
+        )]);
+        assert_eq!(s.retry_after, Some(MAX_RETRY_AFTER_SECS));
+        let s = headers(&["HTTP/2.0 429 Too Many Requests\r\nRetry-After: 1e400\r\n\r\n"]);
+        assert_eq!(s.retry_after, Some(MAX_RETRY_AFTER_SECS));
+        // An ordinary value is unchanged.
+        let s = scan(&["HTTP 429\nRetry-After: 3600\n"]);
+        assert_eq!(s.retry_after, Some(3600.0));
     }
 
     #[test]

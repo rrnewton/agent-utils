@@ -122,6 +122,10 @@ pub struct Wrapper<'a> {
     /// (`editor::guard_env`), added to the environment of every WRITE call while the content
     /// guard is on, so text gh composes in an editor is checked too. Empty: no editor guard.
     pub editor_guard_env: Vec<(String, String)>,
+    /// Body bytes the content guard admitted from this call's arguments and stdin (set by the
+    /// content guard; 0 to start), passed to the editor guard as
+    /// [`crate::editor::PRIOR_BYTES_VAR`] so both share one size allowance.
+    pub body_bytes_used: u64,
     /// gh-paced's own executable, run as `gh-paced --drain` to keep delivering a stream that a
     /// process gh started still holds after gh exits (see the runner module). `None`: such a
     /// stream is closed after the runner's cutoffs, and a warning says later output was lost.
@@ -547,6 +551,10 @@ impl Wrapper<'_> {
         let mut env = if local { Vec::new() } else { self.child_env() };
         if c.class == Class::Write && !self.cfg.allow_large_body {
             env.extend(self.editor_guard_env.iter().cloned());
+            env.push((
+                crate::editor::PRIOR_BYTES_VAR.to_string(),
+                self.body_bytes_used.to_string(),
+            ));
         }
         let real_gh = self.real_gh.clone();
         let on_pushback = if local {
@@ -694,10 +702,12 @@ impl Wrapper<'_> {
                 }
             }
         }
-        if let Verdict::Refuse(reason) = guard::evaluate(&sources, &self.cfg, stdin_buf.as_deref())
-        {
-            self.refuse_content(c, summary, &reason);
-            return Err(EXIT_CONTENT);
+        match guard::evaluate(&sources, &self.cfg, stdin_buf.as_deref()) {
+            Verdict::Refuse(reason) => {
+                self.refuse_content(c, summary, &reason);
+                return Err(EXIT_CONTENT);
+            }
+            Verdict::Allow { bytes } => self.body_bytes_used = bytes as u64,
         }
         Ok(stdin_buf)
     }
