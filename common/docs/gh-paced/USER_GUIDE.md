@@ -92,10 +92,18 @@ setting (`!gh auth git-credential`) goes through the same wrapper. That means
   or typed at its terminal, while gh-paced is still delivering gh's output)
   drops the output not yet delivered, nothing is handed to a drainer, and
   gh-paced dies by that signal promptly, even when the program reading its
-  stdout or stderr has stopped reading. Every message it prints after that
-  (warnings, a PUSHBACK banner), however gh itself ended, is printed only if
-  stderr accepts it within 2 s. A
-  signal while gh is still running goes to gh instead (see the exit status
+  stdout or stderr has stopped reading. Pushback already read still counts.
+  What gh wrote that gh-paced has not read yet is scanned for pushback but not
+  delivered: whatever can be read at once, up to 1 MiB of each stream, at
+  least what a pipe holds by default, so normally all that gh itself wrote
+  before it exited.
+  gh-paced waits for this normally well under a second, and at most
+  `lock_wait_secs` plus 1 s, because a reader may first be waiting for the
+  state file's lock. A header block on stdout that the signal cuts off counts
+  as output cut short (see **Output cut short** below). Every
+  message it prints after that (warnings, a PUSHBACK banner), however gh
+  itself ended, is printed only if stderr accepts it within 2 s. A signal
+  while gh is still running goes to gh instead (see the exit status
   below); if gh then exits while the reader is stalled, gh-paced goes on
   waiting for the reader, and a second signal ends it. A signal that arrives
   within a few milliseconds of gh's exit, before gh-paced has noticed the exit,
@@ -473,7 +481,7 @@ rewrites the state halfway through:
 ```sh
 state="$HOME/.local/state/gh-paced/octocat.json"
 flock -w 30 "${state%.json}.lock" python3 - "$state" <<'EOF'
-import json, os, sys
+import json, os, sys, tempfile
 state = sys.argv[1]
 try:
     os.remove(state[:-len(".json")] + ".cooldown")
@@ -482,11 +490,16 @@ except FileNotFoundError:
 with open(state) as f:
     s = json.load(f)
 s["cooldown"] = None
-tmp = state + ".clearing"
-fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-with os.fdopen(fd, "w") as f:
-    json.dump(s, f, indent=2)
-os.replace(tmp, state)
+d, name = os.path.split(state)
+fd, tmp = tempfile.mkstemp(dir=d, prefix="." + name + ".clearing-")
+try:
+    os.fchmod(fd, 0o600)
+    with os.fdopen(fd, "w") as f:
+        json.dump(s, f, indent=2)
+    os.replace(tmp, state)
+except BaseException:
+    os.unlink(tmp)
+    raise
 EOF
 ```
 
@@ -496,15 +509,17 @@ command again. Then run `gh-paced status --account NAME` again: it prints
 the command leaves behind:
 
 - No `<account>.cooldown` file (the next pushback writes a new one), and
-  `"cooldown": null` in `<account>.json`. The `.clearing` file exists only until
-  the rename.
+  `"cooldown": null` in `<account>.json`, readable and writable by you alone
+  (mode 0600) whatever your umask. The new content is written to a fresh
+  `.<account>.json.clearing-` file beside it, which exists only until the
+  rename and is removed if the command fails.
 - Everything else in `<account>.json` as it was: the buckets and hourly windows
   (the calls of the last hour still count), the in-flight writes, and the
   refresh bookkeeping. The cached `GET /rate_limit` numbers were normally
   dropped when the call that met the pushback finished, so the next refresh
   fetches new ones (see
   [Account-wide feedback](#account-wide-feedback-get-rate_limit); at most one
-  every 60 s).
+  every `rate_limit_min_refresh_secs`, 60 s by default).
 - The audit log as it was, with its `pushback` and `refuse` records. The
   clearing is not recorded: gh-paced does not see it.
 
