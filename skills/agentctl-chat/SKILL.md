@@ -15,7 +15,10 @@ send time. The Python edition (`py/bin/agentctl chat`) words its prompts
 differently, has no `sent` or `thread` command (it has `chat context --state`)
 and adds no send-time line or delivery ✅; follow its own `--help` and the
 instructions in the prompt it types. When a prompt prints a command, run it as
-printed: it names the service's own executable, so it is the right edition.
+printed: it normally starts with the absolute path of the service's own
+executable, so it is the right edition. A `chat thread` command that starts
+with plain `agentctl` (printed when that executable's file is gone) needs the
+compiled edition to be the `agentctl` on `PATH`.
 
 For the compiled bridge, use the installed command as the authority:
 
