@@ -1456,6 +1456,139 @@ fn credential_get_admissible_only_past_its_bound_is_refused() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// A credential call sleeps only for what is left of its bound when the sleep begins, read
+/// again just before it: here the bound passes after the call decided to sleep 9.4 s for its
+/// token and before the sleep began (as on a stalled or suspended host, while it saved its state
+/// and wrote its warning and audit record). It does not sleep at all and is refused (exit 75,
+/// quit=1, gh not run, nothing charged), although its token is there by then.
+#[test]
+fn credential_get_does_not_sleep_once_its_bound_has_passed() {
+    let dir = scratch("cred-sleep-bound-passed");
+    let clock = FakeClock::new(T0);
+    let fake = FakeGh::new(&clock);
+    let cfg = Config {
+        git_credential_max_wait_secs: 10.0,
+        ..Config::default()
+    };
+    let (outcome, _, _) = gh_on(&clock, &fake, &dir, &cfg, &credential_get());
+    assert_eq!(outcome, Outcome::Exit(0));
+    // Monotonic readings 1-3 are the call's start, its lock wait (the lock is free) and its
+    // stay when it decides to sleep; reading 4 is the one just before the sleep.
+    let stepping = StepClock {
+        at: 4,
+        jump: 11.0,
+        ..StepClock::new(&clock)
+    };
+    let (outcome, messages, quit) = gh_on(&stepping, &fake, &dir, &cfg, &credential_get());
+    assert_eq!(outcome, Outcome::Exit(EXIT_REFUSED), "{messages:?}");
+    assert!(quit, "git is told to quit");
+    assert!(clock.sleeps().is_empty(), "slept: {:?}", clock.sleeps());
+    assert_eq!(fake.runs().len(), 1, "gh did not run");
+    let text = messages.join("\n");
+    assert!(text.contains("; sleeping 10 s (next slot "), "{text}");
+    assert!(
+        text.contains(
+            "`auth git-credential get` became admissible 11 s after it started, beyond \
+             GH_PACED_GIT_MAX_WAIT=10 s"
+        ),
+        "{text}"
+    );
+    // Its token was not charged: the next call runs at once.
+    let (outcome, messages, quit) = gh_on(&clock, &fake, &dir, &cfg, &credential_get());
+    assert_eq!(outcome, Outcome::Exit(0), "{messages:?}");
+    assert!(!quit);
+    assert!(clock.sleeps().is_empty(), "{:?}", clock.sleeps());
+    assert_eq!(fake.runs().len(), 2);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A clock on a [`FakeClock`] that models a machine suspended for `suspend` seconds during
+/// every sleep: an ordinary sleep, timed like `std::thread::sleep` on `CLOCK_MONOTONIC`, which
+/// stops during the suspend, ends that much later; a sleep on the monotonic clock, timed on
+/// `CLOCK_BOOTTIME`, which keeps counting, ends on time. It records which kind each sleep was.
+struct SuspendClock<'a> {
+    inner: &'a FakeClock,
+    suspend: f64,
+    sleeps: Mutex<Vec<(&'static str, f64)>>,
+}
+
+impl<'a> SuspendClock<'a> {
+    fn new(inner: &'a FakeClock, suspend: f64) -> Self {
+        Self {
+            inner,
+            suspend,
+            sleeps: Mutex::new(Vec::new()),
+        }
+    }
+
+    fn sleeps(&self) -> Vec<(&'static str, f64)> {
+        self.sleeps.lock().unwrap().clone()
+    }
+}
+
+impl Clock for SuspendClock<'_> {
+    fn now(&self) -> f64 {
+        self.inner.now()
+    }
+
+    fn sleep(&self, secs: f64) {
+        self.sleeps.lock().unwrap().push(("sleep", secs));
+        self.inner
+            .advance_to(self.inner.now() + secs.max(0.0) + self.suspend);
+    }
+
+    fn sleep_monotonic(&self, secs: f64) {
+        self.sleeps.lock().unwrap().push(("sleep_monotonic", secs));
+        self.inner.advance_to(self.inner.now() + secs.max(0.0));
+    }
+}
+
+/// A credential call sleeps on the clock its bound is measured on, so a suspend during the
+/// sleep does not carry it past the bound: with the machine suspended for 11 s during its 9.4 s
+/// wait for its token, the wait still ends inside the 10 s bound and the call runs. Other
+/// classes sleep as before: READs waiting for their budget use the ordinary sleep.
+#[test]
+fn credential_get_sleeps_on_the_monotonic_clock() {
+    let dir = scratch("cred-sleep-suspend");
+    let clock = FakeClock::new(T0);
+    let fake = FakeGh::new(&clock);
+    let cfg = Config {
+        git_credential_max_wait_secs: 10.0,
+        ..Config::default()
+    };
+    let (outcome, _, _) = gh_on(&clock, &fake, &dir, &cfg, &credential_get());
+    assert_eq!(outcome, Outcome::Exit(0));
+    let suspended = SuspendClock::new(&clock, 11.0);
+    let (outcome, messages, quit) = gh_on(&suspended, &fake, &dir, &cfg, &credential_get());
+    assert_eq!(outcome, Outcome::Exit(0), "{messages:?}");
+    assert!(!quit);
+    assert_eq!(fake.runs().len(), 2, "gh ran");
+    let sleeps = suspended.sleeps();
+    assert_eq!(sleeps.len(), 1, "{sleeps:?}");
+    assert_eq!(sleeps[0].0, "sleep_monotonic", "{sleeps:?}");
+    assert!((9.0..=10.0).contains(&sleeps[0].1), "{sleeps:?}");
+    // READs at 1 per minute wait for their budget with the ordinary sleep, suspend and all.
+    let slow = Config {
+        read: ClassLimits {
+            per_minute: 1.0,
+            burst: 1.0,
+            per_hour: 120,
+        },
+        ..Config::default()
+    };
+    let suspended = SuspendClock::new(&clock, 11.0);
+    for i in 0..2 {
+        let (outcome, messages, _) = gh_on(&suspended, &fake, &dir, &slow, &get_args(i));
+        assert_eq!(outcome, Outcome::Exit(0), "{messages:?}");
+    }
+    let sleeps = suspended.sleeps();
+    assert!(
+        !sleeps.is_empty() && sleeps.iter().all(|(kind, _)| *kind == "sleep"),
+        "{sleeps:?}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// Real time a deadline may be overrun by, in the tests that measure one: the time to notice
 /// that it has passed and return, not a wait.
 const SLACK: f64 = 0.25;

@@ -1068,6 +1068,9 @@ impl Wrapper<'_> {
         let mut waited = 0.0;
         // Whether any pass found the state lock held by another process and waited for it.
         let mut lock_waited = false;
+        // Whether any pass decided to sleep for a budget (even if, for a GIT_CREDENTIAL call,
+        // its bound passed before the sleep began, so that it did not sleep).
+        let mut throttled = false;
         let mut halve_noted = false;
         loop {
             let (guard, mut st, now, contended) = match self.open_state() {
@@ -1279,14 +1282,13 @@ impl Wrapper<'_> {
                 .max_by(|a, b| a.secs.total_cmp(&b.secs))
                 .cloned();
             let Some(w) = worst else {
-                if class == Class::GitCredential
-                    && (waited > 0.0 || lock_waited)
-                    && stayed > max_wait
+                if class == Class::GitCredential && (throttled || lock_waited) && stayed > max_wait
                 {
-                    // It became admissible only after the bound had passed: a late wake-up, or
-                    // the state lock taken just at or after the bound. A call that has waited
-                    // for nothing is admitted however long its own work took, so a bound of 0
-                    // still runs a call whose token is there and whose lock is free.
+                    // It became admissible only after the bound had passed: a late wake-up, a
+                    // bound that passed before a sleep began, or the state lock taken just at
+                    // or after the bound. A call that has waited for nothing is admitted
+                    // however long its own work took, so a bound of 0 still runs a call whose
+                    // token is there and whose lock is free.
                     if let Err(e) = state::save(&self.paths, &st) {
                         drop(guard);
                         self.internal_error("cannot save pacing state", &e);
@@ -1453,8 +1455,21 @@ impl Wrapper<'_> {
             self.write_audit(&r);
             drop(guard);
             self.flush();
-            self.clock.sleep(w.secs);
-            waited += w.secs;
+            throttled = true;
+            if class == Class::GitCredential {
+                // Saving the state, the audit record and stderr since `stayed` was read may
+                // have used up some of the bound (a stall, a suspend), so sleep only for what is
+                // left of it, and on the clock the bound is measured on, so that a suspend
+                // during the sleep counts too. A call whose bound has passed does not sleep, and
+                // the next pass refuses it.
+                let left = started + max_wait - self.clock.monotonic();
+                let secs = w.secs.min(left.max(0.0));
+                self.clock.sleep_monotonic(secs);
+                waited += secs;
+            } else {
+                self.clock.sleep(w.secs);
+                waited += w.secs;
+            }
         }
     }
 
