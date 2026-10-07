@@ -2795,6 +2795,15 @@ const TUNING_BANDS = {
     "the whole record in UTF-16 units. A remembered thread carries its root message, so under " +
     "twenty thousand a few long roots push every other channel's choice out; past two hundred " +
     "thousand a record of choices rivals the message snapshot for the quota"],
+  // `#211 link-filter`. How far the Links filter reads one `[` before deciding it opens no link.
+  LINK_NAME_MAX: [100, 2000,
+    "the longest Markdown link name read. Under about a hundred characters a real name, a page's " +
+    "whole title, falls back to its bare address; past a couple of thousand, a message of brackets " +
+    "that never close is read that far once per bracket, on the page's one thread, at every redraw"],
+  LINK_TARGET_MAX: [2048, 16384,
+    "the longest Markdown link target read. Under about two thousand characters a real address " +
+    "with a long query is not read as the link it is; past sixteen thousand, a message of '[a](' " +
+    "that never closes is read that far once per bracket"],
   HOLD_MS: [250, 1500,
     "how long a finger rests before the row shows who sent it and when. Below about a quarter of " +
     "a second an ordinary tap becomes a hold and the message stops folding; past a second and a " +
@@ -6091,19 +6100,28 @@ test("the glass, its field and its count are declared on the floating line, not 
   assert.match(float, /right:\s*calc\(var\(--float-edge\) \+ env\(safe-area-inset-right\)\)/);
 });
 
-test("the glass is DRAWN the pill's size and HIT at 44px", () => {
-  // Mobile guidance on both platforms asks for a 44px target; the owner asked for a SMALL floating
-  // icon that matches the pill. Both, by drawing the disc at the pill's height and putting the rest
-  // of the target in an invisible pseudo-element, which a browser hit-tests as part of its button.
+test("the glass is DRAWN larger than the pill, with a larger glyph, and HIT at 48px", () => {
+  // `#197 floating-search` drew the glass the pill's height — 26px — so the two read as one band.
+  // The owner, on his phone (`#211 link-filter`): "our search button in the upper right corner is
+  // very small. Let's make it a little bigger and therefore the bar that it pops up bigger too." So
+  // the disc is a number of its own now, well over the pill's height, its glyph is a third larger,
+  // and the invisible square around it that takes the tap is 48px.
   const root = cssBlock(":root");
-  assert.match(
-    root,
-    /--search-disc:\s*var\(--freshness-box\)/,
-    "the disc is not the pill's height"
-  );
-  const hit = /--search-hit:\s*([\d.]+)rem/.exec(root);
-  assert.ok(hit, "the glass declares no hit size");
-  assert.ok(Number(hit[1]) * 16 >= 44, `the glass is hit at ${Number(hit[1]) * 16}px, under 44px`);
+  const rem = (name, block = root) => {
+    const found = new RegExp(`${name}:\\s*([\\d.]+)rem`).exec(block);
+    assert.ok(found, `${name} is not declared in rem`);
+    return Number(found[1]) * 16;
+  };
+  const disc = rem("--search-disc");
+  assert.ok(disc >= 36, `the glass is drawn ${disc}px across; at 26px the owner called it very small`);
+  // The pill's own box, from its tokens: 2 * 0.25rem of padding, a 1rem line, and its 2px border.
+  const pill = 2 * rem("--freshness-pad") + rem("--freshness-line") + 2;
+  assert.ok(disc >= pill + 8, `the glass (${disc}px) is not visibly larger than the pill (${pill}px)`);
+  const glyph = /width:\s*([\d.]+)rem/.exec(cssBlock("#search-toggle .icon"));
+  assert.ok(glyph && Number(glyph[1]) * 16 >= 20, "the glass's glyph is no larger than it was");
+  const hit = rem("--search-hit");
+  assert.ok(hit >= 48, `the glass is hit at ${hit}px, under 48px`);
+  assert.ok(hit > disc, "the target is no larger than what is drawn");
   const glass = cssBlock("#search-toggle");
   assert.match(glass, /width:\s*var\(--search-disc\)/);
   assert.match(glass, /height:\s*var\(--search-disc\)/);
@@ -6130,6 +6148,25 @@ test("the glass is DRAWN the pill's size and HIT at 44px", () => {
   assert.match(
     cssBlock("#search-float"),
     /right:\s*calc\(var\(--float-edge\) \+ env\(safe-area-inset-right\)\)/
+  );
+  // The bar it opens is bigger to match: as tall as the glass's target, so that target, and the
+  // filters' squares, are inside it; a larger field; and the line placed low enough that the bar,
+  // centred on it, still starts inside the list.
+  const bar = rem("--search-bar");
+  assert.ok(bar >= hit, `the open bar (${bar}px) is shorter than the glass's target (${hit}px)`);
+  assert.ok(rem("--toggle-hit") >= 44 && rem("--toggle-hit") <= bar, "a filter's square is under 44px or taller than the bar");
+  const size = /font-size:\s*(\d+)px/.exec(cssBlock(".search-field"));
+  assert.ok(size && Number(size[1]) >= 17, "the field's text is no larger than it was");
+  assert.match(
+    root,
+    /--freshness-top:\s*calc\(var\(--search-bar\) \/ 2 \+ 0\.1rem - var\(--freshness-box\) \/ 2\)/,
+    "the line is not placed by the bar, so the larger bar hangs over what is above the list"
+  );
+  // ...and the head of the list makes room for whichever of the pill and the glass reaches lower.
+  assert.match(
+    cssBlock("#pane-discord[data-freshness]"),
+    /padding-top:\s*calc\(var\(--float-line\) \+ max\(var\(--freshness-box\), var\(--search-disc\)\) \/ 2\)/,
+    "the room at the head of the list is the pill's alone, so the larger glass sits on the first row"
   );
 });
 
@@ -26372,11 +26409,13 @@ test("the Pinned filter sits right beside the glass, only while the bar is open,
     assert.ok(svgOf("pinned-filter").includes(attribute) && svgOf("search-toggle").includes(attribute),
       `the pin icon does not share ${attribute} with the glass`);
   }
-  // A whole 44px target, kept out of the glass's own square.
+  // A whole 44px target, kept out of the glass's own square — since `#211 link-filter` by a margin
+  // on the glass, which holds for whichever filter stands beside it.
   const target = cssBlock("#pinned-filter");
-  assert.match(target, /width: var\(--search-hit\)/);
-  assert.match(target, /height: var\(--search-hit\)/);
-  assert.match(target, /margin-right: max\(0px, calc\(var\(--search-hit\) - var\(--search-disc\) - var\(--float-edge\)/);
+  assert.match(target, /width: var\(--toggle-hit\)/);
+  assert.match(target, /height: var\(--toggle-hit\)/);
+  assert.match(cssBlock("#screen-main[data-searching] #search-toggle"),
+    /margin-left: max\(0px, calc\(var\(--search-hit\) - var\(--search-disc\) - var\(--float-edge\)/);
 
   const page = newPage();
   await signIn(page);
@@ -26599,4 +26638,398 @@ test("pinning a combined row pins every message in it, and unpinning takes every
   assert.deepStrictEqual(page.pinCalls.slice(2).map((call) => `${call.method} ${call.id}`),
     ["DELETE 8000000000000000300", "DELETE 8000000000000000301"]);
   assert.equal(page.pinned.size, 0);
+});
+
+// --- the links in what is loaded ------------------------------------------------------------------
+//
+// `#211 link-filter`. The owner, on his phone: "I want another little icon next to it with a
+// hyperlink symbol which filters just for hyperlinks ... filter down to only the messages containing
+// hyperlinks and then filter the string of the message text for only the hyperlinks themselves
+// formatted one per line and turn it into real clickable hyperlinks so that clicking them opens it
+// in a new tab." And: "if we find markdown formatted hyperlinks that are complete and correct, then
+// let's format those properly as a real hyperlink using the name given in markdown rather than the
+// raw URL." What is pinned down here: the toggle and where it lives, which addresses are read out of
+// a message and what each is called, the view that shows them, how it combines with the search text
+// and with Pinned, what it says when it has nothing to show, and that a tap on a link opens the link
+// and does nothing else to the row.
+
+const rowLinkList = (li) => li.children.find((node) => node.className === "row-links");
+const linksOf = (li) => li.descendants().filter((node) => node.className === "row-link");
+/** Each link a row shows, as [what it says, where it goes]. */
+const linkPairs = (li) => linksOf(li).map((a) => [a.textContent, a.getAttribute("href")]);
+
+/** Open the search bar if it is shut, and turn the Links filter on. */
+async function showLinks(page) {
+  if (page.el("search-field").hidden) await page.el("search-toggle").click();
+  await page.el("links-filter").click();
+  await page.settle();
+}
+
+/** The channel rows the filters are letting through, by the text of their first message. */
+const linkRowTexts = (page, id = "discord-log") =>
+  unfiltered(page, id).map((li) => li.messages.map((m) => m.content).join(" / "));
+
+test("the Links filter sits right beside Pinned, only while the bar is open, and says what it does", async () => {
+  // Markup: field, count, Links, Pinned, the glass — Links IMMEDIATELY before Pinned.
+  assertMarkupContains("search-float", "links-filter");
+  const bar = HTML_CODE.slice(HTML_CODE.indexOf('id="search-float"'));
+  const at = (id) => bar.indexOf(`id="${id}"`);
+  assert.ok(at("search-count") < at("links-filter") && at("links-filter") < at("pinned-filter"),
+    "the Links filter is not between the count and Pinned");
+  assert.equal(bar.slice(bar.indexOf("</button>", at("links-filter")) + "</button>".length, at("pinned-filter")).trim(),
+    "<button", "something stands between Links and Pinned");
+  // An icon in the house style, the same stroke, cap and join as the pin and the glass.
+  const svgOf = (id) => {
+    const from = bar.indexOf("<svg", at(id));
+    return bar.slice(from, bar.indexOf(">", from));
+  };
+  for (const attribute of ['class="icon"', 'stroke-width="1.9"', 'stroke-linecap="round"', 'aria-hidden="true"']) {
+    assert.ok(svgOf("links-filter").includes(attribute), `the link icon does not share ${attribute} with the pin`);
+  }
+  const markup = bar.slice(at("links-filter"), bar.indexOf(">", at("links-filter")));
+  assert.match(markup, /aria-label="Show only links"/);
+  assert.match(markup, /aria-pressed="false"/);
+  assert.match(markup, /class="icon-button"/);
+  // The same square as Pinned, sized and drawn by the same rules.
+  for (const selector of ["#links-filter", "#links-filter::before", "#links-filter .icon"]) {
+    assert.deepStrictEqual(cssRules(CSS, selector), cssRules(CSS, selector.replace("links", "pinned")).slice(0, 1),
+      `${selector} is not drawn by the rule that draws Pinned`);
+  }
+  assert.match(cssBlock("#links-filter"), /width: var\(--toggle-hit\)/);
+  assert.match(cssBlock("#links-filter[aria-pressed=\"true\"]"), /color: var\(--accent\)/, "Links on does not say so");
+
+  const page = newPage();
+  await signIn(page);
+  await showDiscord(page, backlog(2));
+  const filter = page.el("links-filter");
+  assert.equal(filter.hidden, true, "the filter is offered before the search bar is open");
+  await page.el("search-toggle").click();
+  assert.equal(filter.hidden, false, "the open bar has no Links filter");
+  assert.equal(page.el("pinned-filter").hidden, false);
+  await filter.click();
+  await page.settle();
+  assert.equal(filter.getAttribute("aria-pressed"), "true", "the filter does not say it is on");
+  // Over the call view too — it filters what the search filters — where Pinned is not offered.
+  await page.el("view-switch").click();
+  await page.settle();
+  assert.equal(filter.hidden, false, "the Links filter is not offered over the call view");
+  assert.equal(page.el("pinned-filter").hidden, true);
+  assert.equal(filter.getAttribute("aria-pressed"), "true", "switching views turned the filter off");
+  await page.el("view-switch").click();
+  await page.settle();
+
+  // Closing the bar turns it off with the text, and so does Escape: no filter is ever left in force
+  // behind a control that is not on screen.
+  await page.el("search-toggle").click();
+  await page.settle();
+  assert.equal(filter.getAttribute("aria-pressed"), "false", "the filter outlived the bar");
+  assert.equal(filter.hidden, true);
+  await showLinks(page);
+  assert.equal(filter.getAttribute("aria-pressed"), "true");
+  await page.el("search-field").dispatch("keydown", { key: "Escape" });
+  await page.settle();
+  assert.equal(filter.getAttribute("aria-pressed"), "false", "Escape left the filter on");
+  assert.equal(unfiltered(page, "discord-log").length, 2, "a row stayed hidden after the filter went");
+});
+
+test("every form of link is found, named as written or by its address, and only http(s) becomes one", async () => {
+  const page = newPage();
+  await signIn(page);
+  const cases = [
+    ["markdown", "the [Docs](https://example.com/docs) for it", [["Docs", "https://example.com/docs"]]],
+    ["angle with a name", "plan: <https://example.org/plan|the plan>", [["the plan", "https://example.org/plan"]]],
+    ["angle", "plan: <https://example.org/bare>", [["https://example.org/bare", "https://example.org/bare"]]],
+    ["bare, full stop after", "see https://example.com/c.", [["https://example.com/c", "https://example.com/c"]]],
+    ["trailing punctuation and quotes",
+      "(https://example.com/d), and 'https://example.com/e'! Or https://example.com/f? \"https://example.com/g\";",
+      [["https://example.com/d", "https://example.com/d"], ["https://example.com/e", "https://example.com/e"],
+        ["https://example.com/f", "https://example.com/f"], ["https://example.com/g", "https://example.com/g"]]],
+    ["parentheses that pair are the address's",
+      "https://en.wikipedia.org/wiki/Mercury_(planet) and [Venus](https://en.wikipedia.org/wiki/Venus_(planet))",
+      [["https://en.wikipedia.org/wiki/Mercury_(planet)", "https://en.wikipedia.org/wiki/Mercury_(planet)"],
+        ["Venus", "https://en.wikipedia.org/wiki/Venus_(planet)"]]],
+    ["a query and a fragment", "https://example.com/s?q=a&b=c#top,",
+      [["https://example.com/s?q=a&b=c#top", "https://example.com/s?q=a&b=c#top"]]],
+    ["a title after the address", "[Guide](https://example.com/guide \"the guide\")", [["Guide", "https://example.com/guide"]]],
+    ["the same address twice, named the second time",
+      "https://example.com/h, again https://example.com/h and [the same page](https://example.com/h) then https://example.org/i",
+      [["the same page", "https://example.com/h"], ["https://example.org/i", "https://example.org/i"]]],
+    ["an unclosed name", "[Docs(https://example.com/m1)", [["https://example.com/m1", "https://example.com/m1"]]],
+    ["an empty name", "[](https://example.com/m2)", [["https://example.com/m2", "https://example.com/m2"]]],
+    ["an unclosed target", "[Docs](https://example.com/m3", [["https://example.com/m3", "https://example.com/m3"]]],
+    ["no opening bracket", "Docs](https://example.com/m4)", [["https://example.com/m4", "https://example.com/m4"]]],
+    ["a space before the target", "[Docs] (https://example.com/m5)", [["https://example.com/m5", "https://example.com/m5"]]],
+    ["a script target hiding an address", "[x](javascript:alert(1)//https://example.com/n)",
+      [["https://example.com/n", "https://example.com/n"]]],
+  ];
+  const none = [
+    "[run](javascript:alert(1)) and [data](data:text/html,<b>x</b>) and [ftp](ftp://example.com/x)",
+    "javascript:alert(2) data:text/html,x www.example.com/x mailto:someone@example.com",
+    "xhttps://example.com/glued <mailto:someone@example.com|mail> http:// and https://",
+  ];
+  const messages = [
+    ...cases.map(([, content], i) => message({ id: `81000000000000000${String(i).padStart(2, "0")}`, content })),
+    ...none.map((content, i) => message({ id: `82000000000000000${String(i).padStart(2, "0")}`, content })),
+  ];
+  const rows = await showDiscord(page, messages);
+  await showLinks(page);
+  for (const [i, [name, , expected]] of cases.entries()) {
+    assert.deepStrictEqual(linkPairs(rows[i]), expected, `${name}: ${cases[i][1]}`);
+    for (const anchor of linksOf(rows[i])) {
+      assert.equal(anchor.tagName, "a", `${name}: a link that is not a real link`);
+      assert.equal(anchor.getAttribute("target"), "_blank", `${name}: a link that does not open a new tab`);
+      assert.equal(anchor.getAttribute("rel"), "noopener noreferrer", `${name}: the new tab can reach back into this one`);
+      assert.equal(anchor.getAttribute("title"), anchor.getAttribute("href"), `${name}: the address is not in the title`);
+      assert.match(anchor.getAttribute("href"), /^https?:\/\//);
+    }
+  }
+  for (const [i, content] of none.entries()) {
+    const li = rows[cases.length + i];
+    assert.deepStrictEqual(linkPairs(li), [], `a link was made out of: ${content}`);
+    assert.equal(li.hasClass("search-hidden"), true, `a row with no http(s) link is shown: ${content}`);
+  }
+  // Nothing anywhere on the page became an href that is not http(s).
+  for (const node of page.el("discord-log").descendants()) {
+    const href = node.getAttribute("href");
+    if (href !== null) assert.match(href, /^https?:\/\//, `an href of ${href}`);
+  }
+});
+
+test("the Links view shows only the rows that hold a link, each with ONLY its links, one per line", async () => {
+  const page = newPage();
+  await signIn(page);
+  const rows = await showDiscord(page, [
+    message({ id: "8300000000000000001", author: "alice", author_is_bot: false, content: "no links here at all" }),
+    message({ id: "8300000000000000002", content: "the build log is at https://example.com/log/7 and the diff at [the diff](https://example.org/d/7). Thoughts?" }),
+    message({ id: "8300000000000000003", content: "another message without a link" }),
+    message({ id: "8300000000000000004", content: "<https://example.com/dash|dashboard>" }),
+  ]);
+  assert.equal(page.el("search-count").textContent, "", "a count stands with no filter on");
+  await showLinks(page);
+  assert.deepStrictEqual(unfiltered(page, "discord-log").map((li) => li.getAttribute("data-id")),
+    ["8300000000000000002", "8300000000000000004"], "the rows without a link are still shown");
+  assert.equal(page.el("search-count").textContent, "2 of 4 loaded", "the count does not say what the filter left");
+  const row = rows[1];
+  assert.equal(row.getAttribute("data-links-view"), "true", "the row does not say it is showing its links");
+  // ONLY the links: the list of them stands right after the text, which the stylesheet hides, and
+  // holds the links and nothing else, one element per link.
+  const list = rowLinkList(row);
+  assert.ok(list, "the row grew no list of links");
+  const kids = row.children.map((node) => node.className.split(" ")[0]);
+  assert.equal(kids[kids.indexOf("body") + 1], "row-links", "the links are not where the text was");
+  assert.deepStrictEqual(list.children.map((node) => node.className), ["row-link", "row-link"]);
+  assert.deepStrictEqual(linkPairs(row), [["https://example.com/log/7", "https://example.com/log/7"],
+    ["the diff", "https://example.org/d/7"]]);
+  assert.equal(list.text(), "https://example.com/log/7the diff", "the list holds more than the links");
+  for (const selector of ['.messages li[data-links-view="true"] > .body', '.messages li[data-links-view="true"] > .summary',
+    '.messages li[data-links-view="true"] .fold']) {
+    assert.match(cssBlock(selector), /display:\s*none !important/, `${selector} is still drawn beside the links`);
+  }
+  // One per line, and an address too long for the screen is cut short rather than wrapped or run
+  // off the side; the href is whole regardless.
+  assert.match(cssBlock(".row-links"), /flex-direction:\s*column/);
+  const link = cssBlock(".row-link");
+  assert.match(link, /display:\s*block/);
+  assert.match(link, /text-overflow:\s*ellipsis/);
+  assert.match(link, /white-space:\s*nowrap/);
+  assert.match(link, /min-height:\s*2\.75rem/, "a link is not a target a thumb can hit on its own");
+  // The row keeps who wrote it and when, so the reader knows where each link came from.
+  const meta = row.children.find((node) => node.className === "meta");
+  assert.ok(meta && meta.text().includes("ci-bot") && /\d{1,2}:\d{2}/.test(meta.text()), "the row lost its author or its time");
+
+  // Off, every row is back as it was, with no links left in it.
+  await page.el("links-filter").click();
+  await page.settle();
+  assert.equal(unfiltered(page, "discord-log").length, 4);
+  for (const li of rows) {
+    assert.equal(li.getAttribute("data-links-view"), null, "a row still says it is showing its links");
+    assert.equal(rowLinkList(li), undefined, "a row kept its list of links after the filter went");
+  }
+  assert.equal(page.el("search-count").textContent, "");
+});
+
+test("a combined row shows the links of every message in it, once each", async () => {
+  const page = newPage();
+  await signIn(page);
+  const rows = await showDiscord(page, [
+    message({ id: "8400000000000000001", content: "first half, see https://example.com/one and", timestamp: "2026-08-19T04:31:00.000Z" }),
+    message({ id: "8400000000000000002", content: "the second half: [two](https://example.com/two), https://example.com/one", timestamp: "2026-08-19T04:31:01.000Z" }),
+  ]);
+  assert.equal(rows.length, 1, "the fixture did not produce one combined row");
+  await showLinks(page);
+  assert.deepStrictEqual(linkPairs(rows[0]), [["https://example.com/one", "https://example.com/one"],
+    ["two", "https://example.com/two"]], "a combined row did not show both halves' links, once each");
+  assert.equal(page.el("search-count").textContent, "1 of 1 loaded");
+});
+
+test("Links is ANDed with the search text and with Pinned, and the count speaks for all of them", async () => {
+  const page = newPage();
+  const messages = [
+    message({ id: "8500000000000000001", content: "deploy notes: https://example.com/deploy" }),
+    message({ id: "8500000000000000002", content: "lunch menu https://example.org/menu" }),
+    message({ id: "8500000000000000003", content: "deploy finished, no link" }),
+    message({ id: "8500000000000000004", content: "an old pinned link https://example.com/pinned" }),
+  ];
+  page.pinned.set(messages[3].id, storedPin(messages[3], 1));
+  page.pinned.set(messages[2].id, storedPin(messages[2], 2));
+  page.servePinsRevision = true;
+  page.pinsRevision = 2;
+  await signIn(page);
+  await showDiscord(page, messages);
+  await showLinks(page);
+  assert.equal(page.el("search-count").textContent, "3 of 4 loaded");
+  // The text narrows the rows with links to the ones about the deploy — matched against the
+  // message, not against its address.
+  await page.el("search-field").setValue("deploy");
+  assert.deepStrictEqual(linkRowTexts(page), ["deploy notes: https://example.com/deploy"],
+    "the search text and Links are not both required");
+  assert.equal(page.el("search-count").textContent, "1 of 4 loaded");
+  await page.el("search-field").setValue("finished");
+  assert.deepStrictEqual(linkRowTexts(page), [], "a row with no link matched the search and was shown");
+  assert.equal(page.el("search-empty").hidden, false);
+  assert.equal(page.el("search-empty").textContent, "None of the loaded messages with a link match that search.");
+  await page.el("search-field").setValue("");
+
+  // Pinned and Links: the pins that hold a link.
+  await page.el("pinned-filter").click();
+  await page.settle();
+  await page.settle();
+  assert.deepStrictEqual(linkRowTexts(page, "pinned-log"), ["an old pinned link https://example.com/pinned"],
+    "Pinned and Links are not both required");
+  assert.equal(page.el("search-count").textContent, "1 of 2 pinned");
+  assert.deepStrictEqual(linkPairs(unfiltered(page, "pinned-log")[0]),
+    [["https://example.com/pinned", "https://example.com/pinned"]]);
+  // ...and when none of the pins holds one, it says that, not that there are no pins.
+  await tapPin(page, page.el("pinned-log").children.find((li) => li.getAttribute("data-id") === messages[3].id));
+  assert.equal(page.el("search-count").textContent, "0 of 1 pinned");
+  assert.equal(page.el("search-empty").hidden, false);
+  assert.equal(page.el("search-empty").textContent, "None of this channel's pinned messages has a link.");
+
+  // Closing the bar takes both filters off and puts every row back.
+  await page.el("search-toggle").click();
+  await page.settle();
+  assert.equal(page.el("links-filter").getAttribute("aria-pressed"), "false");
+  assert.equal(page.el("pinned-filter").getAttribute("aria-pressed"), "false");
+  assert.equal(unfiltered(page, "discord-log").length, 4, "a filter outlived the bar");
+  assert.equal(page.el("search-empty").hidden, true);
+});
+
+test("an empty Links view says why, in words that say the list is only what is loaded", async () => {
+  const page = newPage();
+  await signIn(page);
+  await showDiscord(page, backlog(3));
+  await showLinks(page);
+  assert.deepStrictEqual(unfiltered(page, "discord-log"), []);
+  assert.equal(page.el("search-count").textContent, "0 of 3 loaded");
+  assert.equal(page.el("search-empty").hidden, false, "a blank list and no word about why");
+  assert.equal(page.el("search-empty").textContent, "No links in the messages loaded so far.");
+  // A link arriving in a re-read is drawn as a link, and the sentence goes.
+  page.messages = [...backlog(3), message({ id: "8600000000000000001", content: "new: https://example.com/new" })];
+  await reReadChannel(page);
+  await page.settle();
+  assert.deepStrictEqual(linkRowTexts(page), ["new: https://example.com/new"], "a redrawn list came back unfiltered");
+  assert.deepStrictEqual(linkPairs(unfiltered(page, "discord-log")[0]), [["https://example.com/new", "https://example.com/new"]]);
+  assert.equal(page.el("search-empty").hidden, true, "the empty sentence stayed over a link");
+
+  // Over a list that was empty to begin with, the pane says why in its own words, as it does for a search.
+  const empty = newPage();
+  await signIn(empty);
+  await empty.settle();
+  await showLinks(empty);
+  assert.equal(empty.el("search-empty").hidden, true, "the filter took the blame for an empty page");
+  assert.equal(empty.el("empty-state").hidden, false);
+});
+
+test("over the call view Links reads the turns, and a turn arriving under it arrives filtered", async () => {
+  const page = newPage();
+  await signIn(page);
+  await startTalking(page);
+  assistantSays(page, "the runbook is at https://example.com/runbook.");
+  assistantSays(page, "nothing to click in this one");
+  await page.settle();
+  await showLinks(page);
+  assert.deepStrictEqual(unfiltered(page, "transcript").map((li) => linkPairs(li)),
+    [[["https://example.com/runbook", "https://example.com/runbook"]]]);
+  assert.equal(page.el("search-count").textContent, "1 of 2 loaded");
+  assistantSays(page, "and the dashboard: [dashboard](https://example.org/dash)");
+  assistantSays(page, "still nothing to click");
+  await page.settle();
+  assert.deepStrictEqual(unfiltered(page, "transcript").map((li) => linkPairs(li)), [
+    [["https://example.com/runbook", "https://example.com/runbook"]],
+    [["dashboard", "https://example.org/dash"]],
+  ], "a turn arrived unfiltered, or without its link drawn");
+});
+
+test("a tap on a link opens it and does nothing else: no fold, no read aloud, no hold", async () => {
+  const page = newPage();
+  await signIn(page);
+  const long = `${"words ".repeat(80)}https://example.com/long-read`;
+  const rows = await inReadingMode(page, [
+    message({ id: "8700000000000000001", content: long }),
+    message({ id: "8700000000000000002", content: "short, with https://example.com/short" }),
+  ]);
+  await showLinks(page);
+  const li = rows[0];
+  const anchor = linksOf(li)[0];
+  assert.ok(anchor, "the fixture drew no link to tap");
+  const folded = li.getAttribute("data-collapsed");
+  // The browser hands the row the click, with the link as its target.
+  await li.dispatch("click", { target: anchor });
+  await page.settle();
+  assert.deepEqual(readAloudMessages(page), [], "a tap on a link started reading the message aloud");
+  assert.equal(li.getAttribute("data-collapsed"), folded, "a tap on a link folded the row");
+  await rows[1].dispatch("click", { target: linksOf(rows[1])[0] });
+  await page.settle();
+  assert.deepEqual(readAloudMessages(page), [], "a tap on a short row's link read it aloud");
+  // A press that starts on a link is the phone's own long press; the row's details do not open.
+  await li.dispatch("pointerdown", { pointerId: 1, pointerType: "touch", clientX: 10, clientY: 10, target: anchor });
+  assert.equal(page.expireTimers(HOLD_MS), 0, "a press on a link armed the row's details");
+  await li.dispatch("pointerup", { pointerId: 1, pointerType: "touch", clientX: 10, clientY: 10, target: anchor });
+  // Elsewhere on the row a hold still shows the details, and a tap in reading mode still reads it.
+  const meta = li.children.find((node) => node.className === "meta");
+  await li.dispatch("pointerdown", { pointerId: 2, pointerType: "touch", clientX: 10, clientY: 10, target: meta });
+  assert.equal(page.expireTimers(HOLD_MS), 1, "a press on the row's meta line no longer holds");
+  await page.settle();
+  await li.dispatch("click", { target: meta });
+  await page.settle();
+  await li.dispatch("click", { target: meta });
+  await page.settle();
+  assert.deepEqual(readAloudMessages(page), ["8700000000000000001"], "the row itself can no longer be read aloud");
+});
+
+test("under Links a tap on the row folds nothing, and the fold chips and summaries stand aside", async () => {
+  const page = newPage();
+  await signIn(page);
+  const rows = await showDiscord(page, [
+    message({ id: "8800000000000000001", content: `${"x".repeat(400)} https://example.com/x` }),
+  ]);
+  assert.equal(page.el("expand-all").hidden, false, "the fixture has nothing to expand");
+  await showLinks(page);
+  assert.equal(page.el("expand-all").hidden, true, "Expand all offers to open text that is not on screen");
+  assert.equal(page.el("collapse-all").hidden, true);
+  const li = rows[0];
+  const folded = li.getAttribute("data-collapsed");
+  await li.dispatch("click", { target: li.children.find((node) => node.className === "meta") });
+  assert.equal(li.getAttribute("data-collapsed"), folded, "a tap folded text the row is not showing");
+  await page.el("links-filter").click();
+  await page.settle();
+  assert.equal(page.el("expand-all").hidden, false, "the fold chips did not come back with the text");
+});
+
+test("turning Links on puts the reader at the newest link, and off puts them back where they were", async () => {
+  const page = newPage();
+  await signIn(page);
+  const area = page.el("scroll-area");
+  await showDiscord(page, Array.from({ length: 12 }, (_unused, i) =>
+    message({ id: String(i + 1), content: i % 3 === 0 ? `${longMessage(`m${i}`)} https://example.com/${i}` : longMessage(`m${i}`) })));
+  area.scrollTop = 0;
+  await page.el("search-toggle").click();
+  await page.settle();
+  const top = area.scrollTop;
+  await page.el("links-filter").click();
+  await page.settle();
+  assert.ok(area.scrollHeight - area.scrollTop - area.clientHeight <= 24, "the reader was not put at the newest link");
+  await page.el("links-filter").click();
+  await page.settle();
+  assert.equal(area.scrollTop, top, "turning the filter off lost the reader's place");
 });

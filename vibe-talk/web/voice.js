@@ -1247,7 +1247,9 @@ function renderSummaries() {
  * `scrollHeight` is the whole history behind it.
  */
 function summaryTargets() {
-  if (!summaryMode || currentView !== "discord") {
+  // `#211 link-filter`. A summary stands in for a row's text, and under the Links filter that text
+  // is not on screen: a summary asked for there is one paid for and never seen.
+  if (!summaryMode || currentView !== "discord" || (searchOpen && linksOnly)) {
     return [];
   }
   // A server that has said it has no summariser will say it again for every row, and each of
@@ -1574,8 +1576,13 @@ function renderJumpNewest() {
   }
 }
 
-/** The folds in the list actually on screen. Collapse all acts on what you are looking at. */
+/**
+ * The folds in the list actually on screen. Collapse all acts on what you are looking at — and
+ * while the Links filter is on, no row's text is on screen to fold, so there are none
+ * (`#211 link-filter`): Expand all and Collapse all would change only what cannot be seen.
+ */
 function visibleFolds() {
+  if (searchOpen && linksOnly) return [];
   const list = visibleList();
   return liveFolds().filter((entry) => entry.li.parentNode === list);
 }
@@ -1753,24 +1760,38 @@ function searchScope() {
  * its own scattered set of them is a filter that misses the one somebody adds next, and the
  * failure mode — a row arriving unfiltered into a filtered list — reads as a search that quietly
  * stopped working.
+ *
+ * `#211 link-filter` hangs the Links filter off the same pass, for the same reason: a row a poll
+ * redrew, or a turn that just arrived, gets its links drawn here or not at all. It is one more
+ * condition on every row, so the filters in force are ANDed — the search text, Links, and the
+ * Pinned list the rows came from — and the count speaks for what is left after all of them.
  */
 function applySearch() {
   const terms = searchOpen ? searchTerms(searchQuery) : [];
+  const links = searchOpen && linksOnly;
   const scope = searchScope();
   let matched = 0;
   let loaded = 0;
+  let linked = 0;
   for (const id of SEARCH_LISTS) {
     const list = el(id);
     const counts = scope.includes(id);
     for (const row of list.children) {
       const text = row.getAttribute("data-search");
+      // How many links the row is showing in place of its text: none unless the filter is on, and
+      // never on a row that is not a message.
+      const shown = links && text !== null ? showRowLinks(row) : takeDownRowLinks(row);
       // A row with nothing declared is not a message — a seam, a date rule, the notice at the head
       // of the channel. It goes away while a filter is on, because it explains a neighbour that is
       // no longer beside it, and it is never counted either way.
-      const hit = terms.length === 0 || (text !== null && terms.every((term) => text.includes(term)));
+      const said = terms.length === 0 || (text !== null && terms.every((term) => text.includes(term)));
+      const hit = said && (!links || shown > 0);
       setClassWord(row, "search-hidden", !hit);
       if (counts && text !== null) {
         loaded += 1;
+        if (shown > 0) {
+          linked += 1;
+        }
         if (hit) {
           matched += 1;
         }
@@ -1781,19 +1802,27 @@ function applySearch() {
   // and the count says so even before anything is typed: the filter is in force, and the bar is
   // where it says what it is doing.
   if (pinnedOnly && currentView === "discord") {
-    el("search-count").textContent = terms.length === 0 ? `${loaded} pinned` : `${matched} of ${loaded} pinned`;
-    const sentence = pinnedEmptySentence(loaded, matched, terms.length > 0);
+    el("search-count").textContent =
+      terms.length === 0 && !links ? `${loaded} pinned` : `${matched} of ${loaded} pinned`;
+    const sentence = pinnedEmptySentence(loaded, matched, terms.length > 0, links ? linked : null);
     el("search-empty").textContent = sentence;
     el("search-empty").hidden = sentence === "";
     return;
   }
   // "of N loaded", never "of N". The denominator is what this page has, not what the server has,
-  // and after `#128 transcript-history` those are routinely different numbers.
-  el("search-count").textContent = terms.length === 0 ? "" : `${matched} of ${loaded} loaded`;
+  // and after `#128 transcript-history` those are routinely different numbers. Links is a filter
+  // in force with nothing typed, so it is counted with nothing typed, as Pinned is.
+  el("search-count").textContent = terms.length === 0 && !links ? "" : `${matched} of ${loaded} loaded`;
   // Nothing matched is a RESULT, and it has to be stated where the messages were. Every row is
   // still in the list, so neither pane's own empty state fires, and without this the reader gets
   // a blank screen whose only explanation is a 0.75rem count at the far end of the search bar.
   // Not raised over a list that was empty to begin with: there the pane already says why.
+  if (links) {
+    const sentence = linksEmptySentence(loaded, linked, matched);
+    el("search-empty").textContent = sentence;
+    el("search-empty").hidden = sentence === "";
+    return;
+  }
   el("search-empty").textContent = SEARCH_EMPTY_LOADED;
   el("search-empty").hidden = terms.length === 0 || matched > 0 || loaded === 0;
 }
@@ -1803,12 +1832,40 @@ function applySearch() {
  * pin-message`. An empty list here is never left blank: a channel with no pins, a list that could
  * not be read, one still on its way, and a search that matches none of the pins are four different
  * answers, and a reader shown nothing would take any of them for the page having broken.
+ *
+ * `linked` is how many of the pins hold a link while the Links filter is on, and null while it is
+ * off. `#211 link-filter`: "none of the pins has a link" and "none of the pins with a link matches
+ * what you typed" are two more answers, and neither is "no pins".
  */
-function pinnedEmptySentence(loaded, matched, searching) {
-  if (loaded > 0) return searching && matched === 0 ? "None of this channel's pinned messages match that search." : "";
+function pinnedEmptySentence(loaded, matched, searching, linked = null) {
+  if (loaded > 0) {
+    if (linked === 0) return "None of this channel's pinned messages has a link.";
+    if (matched > 0 || !searching) return "";
+    return linked === null
+      ? "None of this channel's pinned messages match that search."
+      : "None of this channel's pinned messages with a link match that search.";
+  }
   if (pinsProblem) return `This channel's pinned messages could not be loaded: ${pinsProblem}`;
   if (pinsRevision === null || pinsChannel !== currentChannelId()) return "Loading this channel's pinned messages…";
   return "No pinned messages in this channel yet — pin one from its ⋯ menu.";
+}
+
+/**
+ * What the Links filter says where its rows would be, or "" when its rows say it. `#211
+ * link-filter`. "loaded" for the reason the count says it: what is on screen is a bounded suffix
+ * of a longer record, and "nobody posted a link" is a claim this page cannot make.
+ */
+function linksEmptySentence(loaded, linked, matched) {
+  // The Threads list is a list of THREADS. Its rows have no text of their own to hold a link, so an
+  // empty list there is not "no links" — it is the wrong list to look in, and the reader is told
+  // where the links are.
+  if (currentView === "discord" && channelView === "threads") {
+    return "This is a list of threads, and links are in their messages — open a thread to see its links.";
+  }
+  // An empty list explains itself in the pane's own words.
+  if (loaded === 0) return "";
+  if (linked === 0) return "No links in the messages loaded so far.";
+  return matched === 0 ? "None of the loaded messages with a link match that search." : "";
 }
 
 /**
@@ -1825,8 +1882,16 @@ function setSearchOpen(open) {
     el("search-field").value = "";
     // `#206 pin-message`. The Pinned filter lives in this bar, and goes with it for the reason the
     // query does: a filter left on behind a control that is no longer on screen is the state this
-    // feature must never be in.
-    setPinnedOnly(false);
+    // feature must never be in. `#211 link-filter`: so does Links. The one turned on LAST goes
+    // first, so each puts the reader back where they were when it came on, in the list as it was
+    // then — the other filter still in the state it was in at that moment.
+    if (placeBeforePinned && placeBeforePinned.links) {
+      setPinnedOnly(false);
+      setLinksOnly(false);
+    } else {
+      setLinksOnly(false);
+      setPinnedOnly(false);
+    }
   }
   el("search-toggle").setAttribute("aria-pressed", open ? "true" : "false");
   // `#197 floating-search`. The open bar floats over the top of the list, and web/voice.css keys
@@ -1844,6 +1909,340 @@ function setSearchOpen(open) {
   if (open) {
     el("search-field").focus();
   }
+}
+
+// --- the links in what is on screen -------------------------------------------------------------
+//
+// `#211 link-filter`. The owner, on his phone: "I want another little icon next to it with a
+// hyperlink symbol which filters just for hyperlinks. What I mean by that is filter down to only the
+// messages containing hyperlinks and then filter the string of the message text for only the
+// hyperlinks themselves formatted one per line and turn it into real clickable hyperlinks so that
+// clicking them opens it in a new tab." And forty seconds later: "if we find markdown formatted
+// hyperlinks that are complete and correct, then let's format those properly as a real hyperlink
+// using the name given in markdown rather than the raw URL."
+//
+// WHICH MESSAGES: the ones the search searches. Links is a filter in the search bar, beside the
+// search text, so it reads the same lists — the messages loaded in the view on screen, call or
+// channel, Main or All or a thread, with the rows Hide read leaves out already gone — and it is
+// ANDed with the text and with Pinned. A reader who types "deploy" with Links on is asking for the
+// links in the messages about the deploy, which is why the text is matched against the message and
+// not against its addresses. Nothing is fetched: a link in a message not loaded yet is not here,
+// and the count and the empty sentence say "loaded" so that is never read as "nobody posted one".
+//
+// WHAT IS A LINK: an http or https address, and nothing else ever becomes an href — `javascript:`
+// and `data:` run code, and a scheme-less string resolves against this origin. Three forms are
+// read, as people and chat services write them: a Markdown link `[name](https://…)`, the angle
+// brackets chat services send, `<https://…>` and `<https://…|name>`, and a bare address. A Markdown
+// link that is complete and well formed shows its NAME. One that is not — brackets that do not
+// pair, an empty name, a target that is not http(s) — is not read as a link at all, and an address
+// written inside it is then found as a bare one: the reader gets the address, and never a name that
+// might not belong to it.
+//
+// The rows are the page's own rows, not a second list drawn beside them: each keeps its author, its
+// time and its controls, and shows its links where its text was (web/voice.css hides the text by
+// `data-links-view`). So every act on a row still works on it, and a row a poll redraws is redrawn
+// filtered by the pass that draws everything else, `applySearch`.
+
+/** Whether the Links filter is on. Only while the search bar is open: closing it turns this off. */
+let linksOnly = false;
+
+/** Where the list was when the filter came on, so turning it off puts the reader back. */
+let placeBeforeLinks = null;
+
+/**
+ * An address a link may be written to: http or https, and a host with a letter or digit in it. The
+ * test is on the text itself, which is exactly what the href is set to — never a parsed and
+ * re-serialised copy, which could point somewhere the words on the screen do not say.
+ */
+const HTTP_ADDRESS = /^https?:\/\/[^\s/?#\\]*[\p{L}\p{N}]/iu;
+
+/**
+ * A bare address, from its scheme to the first character no address contains as written: a space,
+ * an angle bracket, a double quote, a backtick or a bar (which ends one inside `<…|name>`).
+ */
+const BARE_ADDRESS = /https?:\/\/[^\s<>"`|]+/iuy;
+
+/** `<https://…>` and `<https://…|name>`, the forms chat services send a link in. */
+const ANGLE_LINK = /<(https?:\/\/[^\s<>|]+)(?:\|([^<>\n]*))?>/iuy;
+
+/** What may not come straight before a bare address: `xhttps://…` is not an address anyone wrote. */
+const WORD_BEFORE = /[\p{L}\p{N}]/u;
+
+/**
+ * Characters that end a sentence around an address rather than the address itself, as GitHub's
+ * own autolinking reads them, plus the quotes and the ellipsis a sentence closes with.
+ */
+const TRAILING = new Set([".", ",", ";", ":", "!", "?", "'", "\"", "*", "_", "~", "’", "”", "…"]);
+
+/**
+ * The longest Markdown name, and the longest target, read before deciding a bracket opens no link.
+ * Bounded for the reason `INLINE` is: every `[` asks for its closing `]`, and a long line of
+ * brackets that never close would otherwise be read to its end once per bracket.
+ */
+const LINK_NAME_MAX = 500;
+const LINK_TARGET_MAX = 4096;
+
+const occurrences = (text, character) => text.split(character).length - 1;
+
+/**
+ * A bare address with what follows it in the sentence taken off: trailing punctuation, and a
+ * closing parenthesis or bracket that has no partner inside the address — `(see https://x.org)` —
+ * while one that does is kept, as in `https://en.wikipedia.org/wiki/Mercury_(planet)`.
+ */
+function trimAddress(candidate) {
+  let address = candidate;
+  for (;;) {
+    const last = address[address.length - 1];
+    if (TRAILING.has(last) ||
+        (last === ")" && occurrences(address, "(") < occurrences(address, ")")) ||
+        (last === "]" && occurrences(address, "[") < occurrences(address, "]"))) {
+      address = address.slice(0, -1);
+    } else {
+      return address;
+    }
+  }
+}
+
+/**
+ * The Markdown link whose `[` is at `start`, complete and well formed, as `{href, name, end}`, or
+ * null. The name may hold brackets that pair, as CommonMark's may, and is on one line; the target
+ * may hold parentheses that pair and be followed by a quoted title. An empty name is returned as
+ * one, and the caller shows the address instead. A target that is not http(s) is no link.
+ */
+function markdownLinkAt(text, start) {
+  let depth = 0;
+  let close = start;
+  for (; close < text.length && close - start <= LINK_NAME_MAX; close += 1) {
+    const character = text[close];
+    if (character === "\n") return null;
+    if (character === "\\") {
+      close += 1;
+    } else if (character === "[") {
+      depth += 1;
+    } else if (character === "]") {
+      depth -= 1;
+      if (depth === 0) break;
+    }
+  }
+  if (depth !== 0 || text[close] !== "]" || text[close + 1] !== "(") return null;
+  const name = text.slice(start + 1, close).replace(/\s+/g, " ").trim();
+  let at = close + 2;
+  const skipBlanks = () => {
+    while (text[at] === " " || text[at] === "\t") at += 1;
+  };
+  skipBlanks();
+  let href = "";
+  if (text[at] === "<") {
+    const shut = text.indexOf(">", at);
+    if (shut < 0 || shut - at > LINK_TARGET_MAX) return null;
+    href = text.slice(at + 1, shut);
+    at = shut + 1;
+  } else {
+    const from = at;
+    let parens = 0;
+    for (; at < text.length && at - from <= LINK_TARGET_MAX; at += 1) {
+      const character = text[at];
+      if (/\s/.test(character)) break;
+      if (character === "(") {
+        parens += 1;
+      } else if (character === ")") {
+        if (parens === 0) break;
+        parens -= 1;
+      }
+    }
+    href = text.slice(from, at);
+  }
+  skipBlanks();
+  const titleEnds = { "\"": "\"", "'": "'", "(": ")" }[text[at]];
+  if (titleEnds) {
+    const shut = text.indexOf(titleEnds, at + 1);
+    if (shut < 0 || text.slice(at, shut).includes("\n")) return null;
+    at = shut + 1;
+    skipBlanks();
+  }
+  if (text[at] !== ")" || /\s/.test(href) || !HTTP_ADDRESS.test(href)) return null;
+  return { href, name, end: at + 1 };
+}
+
+/** The `<https://…>` or `<https://…|name>` link at `start`, as `{href, name, end}`, or null. */
+function angleLinkAt(text, start) {
+  ANGLE_LINK.lastIndex = start;
+  const match = ANGLE_LINK.exec(text);
+  if (!match || !HTTP_ADDRESS.test(match[1])) return null;
+  return { href: match[1], name: (match[2] || "").trim(), end: start + match[0].length };
+}
+
+/** The bare address starting at `start`, as `{href, name, end}` with no name, or null. */
+function bareLinkAt(text, start) {
+  if (start > 0 && WORD_BEFORE.test(text[start - 1])) return null;
+  BARE_ADDRESS.lastIndex = start;
+  const match = BARE_ADDRESS.exec(text);
+  if (!match) return null;
+  const href = trimAddress(match[0]);
+  if (!HTTP_ADDRESS.test(href)) return null;
+  return { href, name: "", end: start + href.length };
+}
+
+/**
+ * Every link in one message's text, in the order it is written, as `{href, name}`: the name a
+ * Markdown or angle-bracket link gives it, and otherwise the address itself.
+ *
+ * Scanned rather than matched by one pattern: which form a `[` or a `<` opens is decided where it
+ * stands, and only where it opens none is the text inside it read for a bare address.
+ */
+function linksIn(text) {
+  const source = String(text === null || text === undefined ? "" : text);
+  const links = [];
+  let at = 0;
+  while (at < source.length) {
+    const character = source[at];
+    const found = character === "[" ? markdownLinkAt(source, at)
+      : character === "<" ? angleLinkAt(source, at)
+        : character === "h" || character === "H" ? bareLinkAt(source, at)
+          : null;
+    if (found) {
+      links.push({ href: found.href, name: found.name || found.href });
+      at = found.end;
+    } else {
+      at += 1;
+    }
+  }
+  return links;
+}
+
+/** The texts a row's links are read from: every message a channel row stands for, or a turn's. */
+function rowLinkSources(row) {
+  if (row.messages) {
+    return row.messages.map((m) => String(m.content === null || m.content === undefined ? "" : m.content));
+  }
+  return typeof row.linkText === "string" ? [row.linkText] : [];
+}
+
+/**
+ * Every link a row holds, ONCE, in the order first written: an address repeated within a message,
+ * or across the messages a combined row stands for, is one line. Its place is where it first
+ * appears, and its name is the first NAME it is given: a bare address followed later by the same
+ * address as a Markdown link reads as the link's name.
+ */
+function rowLinks(row) {
+  const byAddress = new Map();
+  for (const link of rowLinkSources(row).flatMap(linksIn)) {
+    const held = byAddress.get(link.href);
+    if (!held) {
+      byAddress.set(link.href, { ...link });
+    } else if (held.name === held.href) {
+      held.name = link.name;
+    }
+  }
+  return [...byAddress.values()];
+}
+
+/**
+ * The links themselves, one per line, each a real link that opens in a new tab. The address goes
+ * in the title as well, so a named link, or one cut short to fit the screen, still says where it
+ * goes when a pointer rests on it — and a long press, on a phone, shows the address it opens.
+ *
+ * Built as the rest of the row is, with `textContent`: a name is channel data, and so is an
+ * address. The only sink that is not plain text is the href, and nothing reaches it that
+ * `HTTP_ADDRESS` has not passed.
+ */
+function linkList(links) {
+  const list = document.createElement("div");
+  list.className = "row-links";
+  for (const link of links) {
+    const anchor = document.createElement("a");
+    anchor.className = "row-link";
+    anchor.textContent = link.name;
+    anchor.setAttribute("href", link.href);
+    anchor.setAttribute("target", "_blank");
+    anchor.setAttribute("rel", "noopener noreferrer");
+    anchor.setAttribute("title", link.href);
+    list.append(anchor);
+  }
+  return list;
+}
+
+/**
+ * Put a row's links straight after its text, which web/voice.css hides while they are shown. The
+ * text is `.body` on a turn and a channel row, and `.msg-text` on a message still being sent.
+ */
+function placeAfterBody(row, node) {
+  const kids = [...row.children];
+  const body = kids.find((kid) =>
+    String(kid.className || "").split(/\s+/).some((word) => word === "body" || word === "msg-text"));
+  if (!body) {
+    row.append(node);
+    return;
+  }
+  row.replaceChildren(...kids.flatMap((kid) => (kid === body ? [kid, node] : [kid])));
+}
+
+/**
+ * Show a row's links in place of its text, and answer how many there are. Built once per row and
+ * text, and kept on the row while the filter stays on: `applySearch` asks on every redraw and every
+ * keystroke, and the answer only changes when the row does.
+ */
+function showRowLinks(row) {
+  const key = rowLinkSources(row).join("\u0000");
+  let drawn = row.linkView;
+  if (!drawn || drawn.key !== key) {
+    if (drawn && drawn.node && drawn.node.parentNode === row) row.removeChild(drawn.node);
+    const links = rowLinks(row);
+    drawn = { key, count: links.length, node: links.length > 0 ? linkList(links) : null };
+    row.linkView = drawn;
+  }
+  if (drawn.node && drawn.node.parentNode !== row) placeAfterBody(row, drawn.node);
+  if (drawn.count > 0) row.setAttribute("data-links-view", "true");
+  else row.removeAttribute("data-links-view");
+  return drawn.count;
+}
+
+/** Give a row its text back. Answers 0, the links it now shows. */
+function takeDownRowLinks(row) {
+  if (row.linkView) {
+    if (row.linkView.node && row.linkView.node.parentNode === row) row.removeChild(row.linkView.node);
+    row.linkView = null;
+  }
+  if (row.hasAttribute("data-links-view")) row.removeAttribute("data-links-view");
+  return 0;
+}
+
+/** Whether a row is showing its links in place of its text. */
+const showingLinks = (row) => row.getAttribute("data-links-view") === "true";
+
+/** Which list the reader is in, so a place kept in one is never restored in another. */
+const filterPlace = () =>
+  [currentView, currentChannelId(), channelView, selectedThreadId || ""].join("\u0000");
+
+/**
+ * Turn the Links filter on or off. On, the reader is put at the newest of what is left, as a list
+ * opens at its newest; off, the list comes back where the reader left it — when it is the same list
+ * as it was then, with Pinned as it was. Otherwise that offset is a place in some other list, and
+ * the newest line is where a list opens.
+ */
+function setLinksOnly(on) {
+  if (on === linksOnly) return;
+  const area = el("scroll-area");
+  if (on) {
+    placeBeforeLinks = {
+      top: area.scrollTop, newest: atBottom(area), pinned: pinnedOnly, list: filterPlace(),
+    };
+  }
+  linksOnly = on;
+  el("links-filter").setAttribute("aria-pressed", on ? "true" : "false");
+  // The rows' links drawn, or taken down, BEFORE the reader is placed: placing measures them.
+  renderScrollTools();
+  if (on) {
+    scrollToNewest();
+  } else if (placeBeforeLinks) {
+    const place = placeBeforeLinks;
+    placeBeforeLinks = null;
+    if (place.newest || place.pinned !== pinnedOnly || place.list !== filterPlace()) scrollToNewest();
+    else area.scrollTop = place.top;
+  }
+  renderScrollTools();
+  // Off, the rows' text is back on screen, and summary mode asks about what is in view.
+  requestVisibleSummaries();
 }
 
 /**
@@ -1882,6 +2281,9 @@ function turnNode(who, text, atMs) {
   // Who said it as well as what was said: on the transcript "assistant" is a real thing to look
   // for, and it is the word printed on the row.
   searchable(li, who, text);
+  // `#211 link-filter`. What the Links filter reads this turn's links from: its words as said,
+  // before anything was made of them for the screen.
+  li.linkText = String(text === null || text === undefined ? "" : text);
   return li;
 }
 
@@ -3842,6 +4244,9 @@ function renderControlBar() {
   // `#206 pin-message`. Beside the glass while the bar is open, and over the channel only: a pin is
   // a channel message, and the call's transcript has none to filter to.
   el("pinned-filter").hidden = el("search-field").hidden || currentView !== "discord";
+  // `#211 link-filter`. Beside Pinned while the bar is open, and over the call view as well: it
+  // filters what the search filters, and a turn can hold a link as a channel message can.
+  el("links-filter").hidden = el("search-field").hidden;
   // The bar used to yield the header row to an open search field when the reader had moved it up
   // there, because the two were sharing one 375px row. The field is not in that row any more, so
   // the bar stays where the reader put it, searching or not.
@@ -8325,6 +8730,8 @@ function renderOutgoingMessages() {
     // message you sent is a message you look for, and it is sitting in the same list as the ones
     // you received.
     searchable(row, "You", text);
+    // `#211 link-filter`. A message you sent can hold a link like any other.
+    row.linkText = String(text);
     rows.push(row);
   }
   if (retired) persistOutgoingMessages();
@@ -11174,6 +11581,14 @@ function tapRow(li, fold) {
     if (target && typeof target.closest === "function" && target.closest("button, a, input")) {
       return;
     }
+    // `#211 link-filter`. Nor one on the Links view's links, or between them: that is where the
+    // reader opens a link, and a tap there that also folded the row or started reading it aloud
+    // would be two acts for one touch. Walked by hand, as the reply arrow is, so it holds for any
+    // element rather than only for one that has `closest`.
+    const links = showingLinks(li) ? childByClass(li, "row-links") : null;
+    if (links && target && nodeWithin(links, target)) {
+      return;
+    }
     const selection = typeof getSelection === "function" ? getSelection() : null;
     if (selection && String(selection) !== "") {
       return;
@@ -11188,7 +11603,9 @@ function tapRow(li, fold) {
     // A SHORT message has no fold control, and that is fine: it is already whole. The handler is
     // still attached to every row, because reading mode has to reach a short message too — gating
     // this on foldability made the shortest messages the only ones that could not be read aloud.
-    if (fold) {
+    // Nor while the row shows its links in place of its text (`#211 link-filter`): the text is not
+    // on screen to be folded, and a fold changed out of sight would surprise the reader later.
+    if (fold && !showingLinks(li)) {
       fold.click();
     }
   });
@@ -11251,6 +11668,13 @@ function swipeable(li, messages) {
     // PRESS AND HOLD, on the same pointer stream as the swipe so the two cannot both fire. The
     // row prints neither the author nor the message id any more; this is where they went.
     cancelHold();
+    // `#211 link-filter`. Not on a link in the Links view, where a long press is the phone's own:
+    // it shows the address and offers to open or copy it, and the details sheet opening under that
+    // as well would be two answers to one finger. A swipe that starts there is still a swipe.
+    const links = showingLinks(li) ? childByClass(li, "row-links") : null;
+    if (links && nodeWithin(links, event.target)) {
+      return;
+    }
     holdTimer = setTimeout(() => {
       holdTimer = null;
       reset();
@@ -13572,7 +13996,9 @@ function syncPinnedList() {
 function setPinnedOnly(on) {
   if (on === pinnedOnly) return;
   const area = el("scroll-area");
-  if (on) placeBeforePinned = { top: area.scrollTop, newest: atBottom(area) };
+  // `#211 link-filter`. With whether Links was on, because the offset is a place in the list as it
+  // was then: with Links turned on or off since, it is a place in another list.
+  if (on) placeBeforePinned = { top: area.scrollTop, newest: atBottom(area), links: linksOnly };
   pinnedOnly = on;
   el("pinned-filter").setAttribute("aria-pressed", on ? "true" : "false");
   if (on) el("pane-discord").setAttribute("data-pinned-only", "");
@@ -13580,11 +14006,14 @@ function setPinnedOnly(on) {
   renderChannelNavigation();
   renderOlderControl();
   renderChannelRows();
+  // The list's filters applied BEFORE the reader is placed — Links draws each row's links, which
+  // changes its height — so the place is measured on the list as it will be shown.
+  renderScrollTools();
   if (on) {
     ensurePins();
     scrollToNewest();
   } else if (placeBeforePinned) {
-    if (placeBeforePinned.newest) scrollToNewest();
+    if (placeBeforePinned.newest || placeBeforePinned.links !== linksOnly) scrollToNewest();
     else area.scrollTop = placeBeforePinned.top;
     placeBeforePinned = null;
   }
@@ -16999,6 +17428,8 @@ el("jump-newest").addEventListener("click", scrollToNewest);
 el("search-toggle").addEventListener("click", () => setSearchOpen(!searchOpen));
 // `#206 pin-message`. A toggle, like the glass beside it.
 el("pinned-filter").addEventListener("click", () => setPinnedOnly(!pinnedOnly));
+// `#211 link-filter`. The same, for links.
+el("links-filter").addEventListener("click", () => setLinksOnly(!linksOnly));
 el("search-field").addEventListener("input", () => {
   searchQuery = el("search-field").value;
   renderScrollTools();

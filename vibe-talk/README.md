@@ -2653,10 +2653,13 @@ are one switch apart and a filter that came off when you looked at the other lis
 than none.
 
 The glass **costs no row** (`#197 floating-search`). It sits on the same line as the freshness pill
-("Live · updated 07:23"), drawn the pill's height and hit at 44px, so the header stays off the main
-screen whenever it has nothing else to carry. Tapped, it grows along that line into a bar across
-the top of the list — field, count, and the glass again to close it — which is also the one place
-an on-screen keyboard never covers. The pill steps aside while the bar is open, and the list makes
+("Live · updated 07:23"), so the header stays off the main screen whenever it has nothing else to
+carry. It was drawn the pill's height until the owner called it very small (`#211 link-filter`): it
+is a 36px disc now, hit at 48px, and the bar it opens is 48px tall with a 17px field. Tapped, it
+grows along that line into a bar across the top of the list — field, count, the Links and Pinned
+filters, and the glass again to close it — which is also the one place an on-screen keyboard never
+covers. With both filters on a 360px phone the count takes two short lines, "2 of 13" over
+"loaded", so the field keeps 140px. The pill steps aside while the bar is open, and the list makes
 room for the bar at its head so the first match is never underneath it. A reader who moved the
 control bar to the top keeps it there while searching: the field no longer shares that row.
 
@@ -2680,6 +2683,33 @@ that borrowed it would put archived rows back on screen when the search was clea
 Rules the page drew itself — the seam between two calls, the date rules — **go away with the rows
 they were explaining**. A seam says the agent below it never heard the words above it, and left
 standing over a filtered list it says that about two rows that are no longer adjacent.
+
+### Only the links
+
+`#211 link-filter`. The chain-link button in the open search bar, immediately left of Pinned, turns
+on the **Links** filter: the list keeps only the messages that hold a link, and each of those shows
+**its links and nothing else**, one per line, under its author and time. Every one is a real link
+that opens in a new tab; an address longer than the screen is cut short with an ellipsis while the
+link itself stays whole, and a long press shows where it goes. A tap on a link opens it and does
+nothing else to the row — no fold, no read-aloud in reading mode, no details sheet.
+
+It reads **what the search reads**: the messages loaded in the view on screen — the channel in
+Main, All or a thread, with whatever Hide read leaves out already gone, or the voice transcript —
+and nothing is fetched, so the count says "1 of 13 loaded" for the reason the search's does.
+Every filter in force has to hold: typed text narrows the rows with links to the ones whose message
+matches it, and with Pinned on as well it is the pins that hold a link. When nothing is left the
+list says which answer it is: no links in what is loaded, none of the pins has a link, or none of
+the messages with a link matches the search. Closing the search bar turns it off, as it does
+Pinned.
+
+Only **http and https** addresses become links; `javascript:`, `data:` and anything without a scheme
+never do. Three forms are read: a bare address, with the sentence's punctuation after it left off
+and a closing parenthesis kept only when it pairs with one inside the address; the angle brackets
+chat services send, `<https://…>` and `<https://…|name>`; and a Markdown link,
+`[name](https://…)`. A Markdown or angle-bracket link shows its **name**. A Markdown link that is not
+complete and well formed — brackets that do not pair, an empty name, a target that is not http(s) —
+shows the address written inside it, if there is one, and never a name. An address that appears
+twice in a message, or in the messages one combined row stands for, is one line.
 
 ### Choosing a thread sits beside choosing the channel
 

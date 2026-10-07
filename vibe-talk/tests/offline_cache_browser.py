@@ -45,8 +45,10 @@ composer's text box or its Send button (`#194 thread-picker-polish`).
 
 The search glass floats on the pill's line rather than costing a header row (`#197
 floating-search`): on the main screen no header strip stands above the list, on the call view and
-the channel alike; wherever the pill is measured the glass is centred on its line, drawn its height,
-over the list and clear of it, and a 44px square around the disc presses it. A real tap below the
+the channel alike; wherever the pill is measured the glass is centred on its line, over the list and
+clear of it and of the head of the list, drawn larger than the pill and at least 36px across since
+the owner called the pill-sized glass very small (`#211 link-filter`), and a square around the disc
+presses it. A real tap below the
 disc opens the search as a bar across the top of the list — no wider than the list, not hanging
 over what is above it, the pill given way and the head of the list clear of it — the bar filters,
 and the glass folds it back with #scroll-area unmoved. Settings still has its title bar and a way
@@ -61,10 +63,18 @@ row as a "Pinned" chip whose words read against it, and a gold edge; the ⋯ men
 an unpinned one open as Copy text, Pin, and the two that mark read under a hairline and a caption —
 for a provider that can move its own read marker, whose menu is the widest — every item at least
 44px tall, on the screen, and answering a tap at its centre; Pin shows at once and reaches the
-server; and the open search bar carries the Pinned filter immediately left of the glass — a 44px
-target every point of which presses it, clear of the glass's own square and of a field still 150px
-wide beside the count — whose tap shows the pins, clear of the bar, and which the glass takes away
-with the bar.
+server; and the open search bar carries the Pinned filter immediately left of the glass, with Links
+immediately left of it — each a 44px target every point of which presses it, clear of the other, of
+the glass's own square and of a field still 140px wide beside the count — whose tap shows the pins,
+clear of the bar, and which the glass takes away with the bar.
+
+Then, in the dark theme, a reader looks for links (`#211 link-filter`): with the bar open, Links and
+Pinned measure as above, and a real tap on Links leaves only the rows that hold a link, each showing
+its links where its text was, under its author and time — one per line, each a real link opening a
+new tab, at least 44px tall, a Markdown or chat-service link by its name, and an address longer than
+the row cut short on screen with its href whole. A real tap on a link opens a new tab at that address
+without navigating the app, folding the row or opening its details; the glass takes Links away with
+the bar; and over the call view, which has no pins, Links stands beside the glass on its own.
 
 And where a phone reader's own settings wrap a row's meta line — the page zoomed to a 313px
 viewport, or the root font at 115%, 130% and 150% — every row's ⋯ menu, and the pinned row's in the
@@ -122,6 +132,9 @@ EPOCH = datetime(2026, 1, 5, 9, 0, tzinfo=timezone.utc)
 # `#36 thread-view-phone-overflow`: wider than a phone as words, and unbreakable at its tail.
 LONG_TOKEN = "0f1e2d3c-4b5a-6978-8796-a5b4c3d2e1f0-0f1e2d3c4b5a69788796a5b4c3d2e1f0"
 LONG_TITLE = f"Overnight coordinator for the release lane #link {LONG_TOKEN}"
+# `#211 link-filter`. The smallest the search glass may be drawn. It was the freshness pill's height,
+# 26px, until the owner called it "very small" on his phone.
+GLASS_MIN_PX = 36
 Json = dict[str, object]
 
 
@@ -302,6 +315,34 @@ class ReplyApi(FakeApi):
         return {**super().timeline(query), "dismissed": [ARCHIVED_REPLY]}
 
 
+# `#211 link-filter`. Where the Links walk's links go. Answered by the browser context itself, so a
+# tapped link opens a real tab without anything leaving this machine.
+LINK_HOSTS = ("https://example.com/**", "https://example.org/**")
+LONG_ADDRESS = "https://example.com/reports/" + "nightly-integration-shard-" * 6 + "summary.html"
+
+
+class LinkApi(FakeApi):
+    """`#211 link-filter`: messages with links in every form the Links view reads, and some without.
+
+    200 is long enough to fold and holds a bare address and a Markdown link; 201 holds none; 202 is a
+    chat service's `<address|name>`; 203 is an address longer than any phone is wide; 204 holds none.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        filler = ("The integration shard was retried twice overnight and the artifact upload waited on "
+                  "the cache to warm before it went through. ") * 2
+        self.messages = [
+            said(0, f"{filler}The build log is at https://example.com/build/7, and the change itself is "
+                    "[the diff](https://example.org/diff/7)."),
+            said(1, "Nothing to open in this one."),
+            said(2, "Dashboard: <https://example.com/dash|the dashboard>", "human"),
+            said(3, f"Full report: {LONG_ADDRESS}"),
+            said(4, "Also nothing to open here.", "me"),
+        ]
+        self.threads = []
+
+
 def handler_for(api: FakeApi) -> type[BaseHTTPRequestHandler]:
     class Handler(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
@@ -449,7 +490,8 @@ PLACE_JS = """async (where) => {
 # fits on its one line, and sits over the list; `area` is #scroll-area's box and `bare` the same box without the pill.
 # Scrolling to the top is free only because FakeApi answers has_more: False; with more history it
 # would page older rows in and spend a read the "one newest-page read" check counts.
-GEOMETRY_JS = """() => {
+GEOMETRY_JS = """() => {""" + f"""
+    const GLASS_MIN_PX = {GLASS_MIN_PX};""" + """
     const area = document.getElementById('scroll-area');
     area.scrollTop = 0;
     const shown = (e) => Boolean(e) && !e.hidden && e.getClientRects().length > 0;
@@ -464,12 +506,19 @@ GEOMETRY_JS = """() => {
         const g = box(glass), found = [], mid = (r) => (r.top + r.bottom) / 2;
         const off = mid(g) - mid(p);
         if (Math.abs(off) > 1.5) found.push(`${layout}: the glass is centred ${off.toFixed(1)}px off the pill's line`);
-        if (Math.abs(g.height - p.height) > 1) found.push(`${layout}: the glass is ${g.height}px beside a ${p.height}px pill`);
+        // `#211 link-filter`: drawn larger than the pill since the owner called the pill-sized one
+        // "very small", and still a disc.
+        if (g.height < GLASS_MIN_PX || g.height < p.height + 8 || Math.abs(g.width - g.height) > 0.5) {
+            found.push(`${layout}: the glass is ${g.width}x${g.height}px beside a ${p.height}px pill`);
+        }
         if (meets(p, g)) found.push(`${layout}: the glass overlaps the pill "${pill.textContent}"`);
         if (g.top < list.top || g.left < list.left || g.right > list.right) found.push(`${layout}: the glass is not over the list`);
-        // The 44px target: beside and below the disc, outside it but inside the square, is the glass.
+        // ...and clear of the head of the list, which makes room for it as it does for the pill.
+        const head = [...document.querySelectorAll('#pane-discord .seam, #discord-log > li')].find(shown);
+        if (head && box(head).top < g.bottom - 0.5) found.push(`${layout}: the glass reaches ${(g.bottom - box(head).top).toFixed(1)}px over the head of the list`);
+        // The 48px target: beside and below the disc, outside it but inside the square, is the glass.
         const cx = (g.left + g.right) / 2, cy = mid(g);
-        for (const [dx, dy] of [[-20, 0], [20, 0], [0, 20]]) {
+        for (const [dx, dy] of [[-22, 0], [20, 0], [0, 22]]) {
             const hit = document.elementFromPoint(cx + dx, cy + dy);
             if (!hit || !glass.contains(hit)) {
                 const what = hit ? (hit.id ? `#${hit.id}` : hit.tagName.toLowerCase()) : 'nothing';
@@ -591,7 +640,8 @@ COMPOSER_JS = """async () => {
 
 # `#197 floating-search`. Shared by the checks below: is an element really laid out, its box, and
 # whether two boxes meet.
-FLOAT_HELPERS_JS = """
+FLOAT_HELPERS_JS = f"""
+    const GLASS_MIN_PX = {GLASS_MIN_PX};""" + """
     const shown = (e) => Boolean(e) && !e.hidden && e.getClientRects().length > 0;
     const box = (e) => e.getBoundingClientRect();
     const meets = (a, b) => a.top < b.bottom && b.top < a.bottom && a.left < b.right && b.left < a.right;
@@ -611,6 +661,7 @@ GLASS_ALONE_JS = """() => {""" + FLOAT_HELPERS_JS + """
     const line = box(document.getElementById('channel-freshness-anchor'));
     const off = (g.top + g.bottom) / 2 - line.top;
     if (Math.abs(off) > 1) problems.push(`the glass is centred ${off.toFixed(1)}px off the pill's line`);
+    if (g.height < GLASS_MIN_PX) problems.push(`the glass is ${g.height}px across, the size the owner called very small`);
     if (g.top < list.top || g.right > list.right) problems.push('the glass is not over the list');
     // The line is the list's width on a phone and the reading column's on a desk.
     if (line.right - g.right > 24) problems.push(`the glass is ${Math.round(line.right - g.right)}px from the corner`);
@@ -618,7 +669,7 @@ GLASS_ALONE_JS = """() => {""" + FLOAT_HELPERS_JS + """
 }"""
 
 # The search open over the channel: a bar across the top of the list, no wider than it and not
-# hanging over whatever is above it, with the field focused and wide enough to read, the pill given
+# hanging over whatever is above it, with the field focused and 140px wide or more, the pill given
 # way, and the first thing the list shows clear of the bar. `query`, when given, has just been typed;
 # `rows` is what is left on screen and `count` what the bar says about it.
 SEARCH_OPEN_JS = """(query) => {""" + FLOAT_HELPERS_JS + """
@@ -632,7 +683,8 @@ SEARCH_OPEN_JS = """(query) => {""" + FLOAT_HELPERS_JS + """
     const list = box(area), b = box(bar), f = box(field), g = box(glass);
     if (b.top < list.top - 0.5) problems.push(`the bar hangs ${(list.top - b.top).toFixed(1)}px over what is above the list`);
     if (b.left < list.left - 0.5 || b.right > list.right + 0.5) problems.push('the bar is wider than the list');
-    if (f.width < 150) problems.push(`the field is ${Math.round(f.width)}px wide`);
+    // 140 since `#211 link-filter` put Links beside Pinned on the same line.
+    if (f.width < 140) problems.push(`the field is ${Math.round(f.width)}px wide`);
     if (f.left < b.left || g.right > b.right + 0.5 || g.top < b.top - 0.5 || g.bottom > b.bottom + 0.5) {
         problems.push('the glass or the field is outside the bar');
     }
@@ -804,35 +856,84 @@ REPLY_ROW_JS = """(id) => {""" + FLOAT_HELPERS_JS + """
             chip: shown(chip) ? [box(chip).left + box(chip).width / 2, box(chip).top + box(chip).height / 2] : null};
 }"""
 
-# `#206 pin-message`. The open search bar with the Pinned filter in it: immediately left of the glass
-# and on its line, a whole 44px box every point of which presses the filter, meeting neither the
-# glass nor the field, the glass's own centre still the glass, and the field still 150px wide.
-PIN_BAR_JS = """() => {""" + FLOAT_HELPERS_JS + """
+# `#206 pin-message` and `#211 link-filter`. The open search bar with its filters in it: Links, then
+# Pinned where the view has pins, then the glass, each immediately beside the next and on the glass's
+# line, each a whole 44px box every point of which presses it, meeting neither its neighbours, the
+# glass nor the field. The glass's own centre is still the glass, and so is the strip of its 48px
+# target just left of its disc, which no filter's box may cover. The field is still 140px wide with
+# both filters and the count beside it. `pinned` says whether Pinned should be on the bar.
+FILTER_BAR_JS = """(pinned) => {""" + FLOAT_HELPERS_JS + """
     const problems = [];
+    const mid = (r) => (r.top + r.bottom) / 2;
     const bar = document.getElementById('search-float'), field = document.getElementById('search-field');
-    const filter = document.getElementById('pinned-filter'), glass = document.getElementById('search-toggle');
-    if (!shown(filter)) return {problems: ['the Pinned filter is not on the open bar'], field: 0};
-    const f = box(filter), g = box(glass), b = box(bar), fl = box(field);
-    if (f.width < 43.5 || f.height < 43.5) problems.push(`the filter's target is ${f.width.toFixed(1)}x${f.height.toFixed(1)}px`);
-    if (meets(f, g)) problems.push('the filter overlaps the glass');
-    if (meets(f, fl)) problems.push('the filter overlaps the field');
-    const gap = g.left - f.right;
-    if (gap < 0 || gap > 20) problems.push(`the filter is ${gap.toFixed(1)}px from the glass, not beside it`);
-    if (Math.abs((f.top + f.bottom) / 2 - (g.top + g.bottom) / 2) > 1.5) problems.push("the filter is off the glass's line");
-    if (f.left < b.left - 0.5 || f.right > b.right + 0.5) problems.push('the filter is outside the bar');
-    if (fl.width < 150) problems.push(`the field is ${Math.round(fl.width)}px wide beside the filter`);
-    // Every point of the square that is ON the screen: at the very top of the list the line sits
-    // so near the edge that the square's top couple of pixels are past it, as the glass's are.
-    for (const fx of [0.04, 0.5, 0.96]) {
-        for (const fy of [0.04, 0.5, 0.96]) {
-            const y = Math.max(f.top + f.height * fy, 1);
-            const hit = document.elementFromPoint(f.left + f.width * fx, y);
-            if (!hit || !filter.contains(hit)) problems.push(`a tap at (${fx}, ${fy}) of the filter's box lands on ${name(hit)}`);
-        }
+    const glass = document.getElementById('search-toggle');
+    const filters = ['links-filter', 'pinned-filter'].map((id) => document.getElementById(id)).filter(shown);
+    const wanted = pinned ? 'links-filter pinned-filter' : 'links-filter';
+    if (filters.map((f) => f.id).join(' ') !== wanted) {
+        return {problems: [`the open bar holds ${filters.map(name).join(', ') || 'no filter'}, not ${wanted}`], field: 0};
     }
-    const centre = document.elementFromPoint((g.left + g.right) / 2, (g.top + g.bottom) / 2);
-    if (!centre || !glass.contains(centre)) problems.push(`the glass's centre lands on ${name(centre)}`);
+    const g = box(glass), b = box(bar), fl = box(field);
+    filters.forEach((filter, i) => {
+        const f = box(filter), label = name(filter);
+        if (f.width < 43.5 || f.height < 43.5) problems.push(`${label}'s target is ${f.width.toFixed(1)}x${f.height.toFixed(1)}px`);
+        if (meets(f, g)) problems.push(`${label} overlaps the glass`);
+        if (meets(f, fl)) problems.push(`${label} overlaps the field`);
+        const next = i + 1 < filters.length ? box(filters[i + 1]) : g;
+        const gap = next.left - f.right;
+        if (gap < -0.5 || gap > 20) problems.push(`${label} is ${gap.toFixed(1)}px from what follows it, not beside it`);
+        if (Math.abs(mid(f) - mid(g)) > 1.5) problems.push(`${label} is off the glass's line`);
+        if (f.left < b.left - 0.5 || f.right > b.right + 0.5) problems.push(`${label} is outside the bar`);
+        // Every point of the square that is ON the screen.
+        for (const fx of [0.04, 0.5, 0.96]) {
+            for (const fy of [0.04, 0.5, 0.96]) {
+                const y = Math.max(f.top + f.height * fy, 1);
+                const hit = document.elementFromPoint(f.left + f.width * fx, y);
+                if (!hit || !filter.contains(hit)) problems.push(`a tap at (${fx}, ${fy}) of ${label}'s box lands on ${name(hit)}`);
+            }
+        }
+    });
+    if (fl.width < 140) problems.push(`the field is ${Math.round(fl.width)}px wide beside the filters`);
+    for (const [x, why] of [[(g.left + g.right) / 2, 'centre'], [g.left - 2, 'target just left of its disc']]) {
+        const hit = document.elementFromPoint(x, mid(g));
+        if (!hit || !glass.contains(hit)) problems.push(`the glass's ${why} lands on ${name(hit)}`);
+    }
     return {problems, field: fl.width};
+}"""
+
+# `#211 link-filter`. The Links view as it is drawn, the list scrolled to its top: which rows are on
+# screen, and for each the links it shows as [text, href, target, rel]. `problems` is empty when every
+# shown row has a list of links standing where its text was, the text itself not drawn, each link
+# on a line of its own inside the row and at least 44px tall, a link too long for the row cut short
+# with an ellipsis rather than wrapped or run off it, and the open bar covering none of the first row.
+LINK_VIEW_JS = """() => {""" + FLOAT_HELPERS_JS + """
+    const area = document.getElementById('scroll-area');
+    area.scrollTop = 0;
+    const problems = [];
+    const rows = [...document.querySelectorAll('#discord-log > li[data-id]')].filter(shown);
+    const bar = box(document.getElementById('search-float'));
+    if (rows.length && box(rows[0]).top < bar.bottom - 0.5) problems.push(`the open bar covers ${(bar.bottom - box(rows[0]).top).toFixed(1)}px of the first row`);
+    const shownRows = rows.map((row) => {
+        const id = row.getAttribute('data-id'), r = box(row);
+        const list = row.querySelector(':scope > .row-links');
+        if (!shown(list)) problems.push(`row ${id} shows no links`);
+        const text = row.querySelector(':scope > .body');
+        if (shown(text)) problems.push(`row ${id} still draws its text beside its links`);
+        if (!shown(row.querySelector(':scope > .meta'))) problems.push(`row ${id} lost its author and time`);
+        let above = list ? box(list).top - 0.5 : 0;
+        const links = [...row.querySelectorAll('.row-links > a')].map((a) => {
+            const l = box(a);
+            if (l.top < above) problems.push(`row ${id}: "${a.textContent}" is not on a line of its own`);
+            above = l.bottom - 0.5;
+            if (l.height < 43.5) problems.push(`row ${id}: "${a.textContent}" is ${l.height.toFixed(1)}px tall`);
+            if (l.left < r.left || l.right > r.right + 0.5) problems.push(`row ${id}: "${a.textContent}" runs out of its row`);
+            const style = getComputedStyle(a);
+            if (a.scrollWidth > a.clientWidth + 1 && style.textOverflow !== 'ellipsis') problems.push(`row ${id}: a long link is not ellipsised`);
+            return [a.textContent, a.getAttribute('href'), a.getAttribute('target'), a.getAttribute('rel'),
+                    a.scrollWidth > a.clientWidth + 1];
+        });
+        return [id, links];
+    });
+    return {problems, rows: shownRows};
 }"""
 
 # A row's open ⋯ menu: Copy text, Pin, then the read group under a hairline and a caption — two
@@ -1038,6 +1139,13 @@ def main() -> int:
                   " two-item read group at full size and on the screen, Pin shown at once and stored, and"
                   " the Pinned filter beside the glass with a 44px target clear of the glass and the field,"
                   " showing the pins and folded away with the bar")
+            links_walk(playwright.chromium, args, label, width, height, mobile)
+            print(f"{label} at {width}x{height}: the search glass at least {GLASS_MIN_PX}px across; Links and"
+                  " Pinned beside it on its line, each a 44px target clear of the field and the glass, the"
+                  " field at least 140px wide beside a count; Links showing only the rows with links, each"
+                  " link real, on its own line and a 44px target, a long one ellipsised; a real"
+                  f" {'tap' if mobile else 'click'} on a link opening a new tab without folding its row; Links"
+                  " folded away with the bar, and alone beside the glass over the call view")
             browser_version = walk(playwright.chromium, args, label, width, height, mobile)
             print(f"{browser_version} {label} at {width}x{height}: All by default, a reload reopened on the"
                   " channel, its view and the reader's message, snapshot drawn before the network,"
@@ -2026,12 +2134,12 @@ def pin_walk(chromium: BrowserType, args: argparse.Namespace, label: str, width:
             # The Pinned filter on the open bar, before and after the count takes its room.
             tap("#search-toggle")
             until("() => !document.getElementById('pinned-filter').hidden", "the open bar has no Pinned filter")
-            bare = page.evaluate(PIN_BAR_JS)
-            check(not bare["problems"], f"{label}, the Pinned filter on the open bar: {bare['problems']}")
+            bare = page.evaluate(FILTER_BAR_JS, True)
+            check(not bare["problems"], f"{label}, the filters on the open bar: {bare['problems']}")
             page.fill("#search-field", "a")
-            counted = page.evaluate(PIN_BAR_JS)
+            counted = page.evaluate(FILTER_BAR_JS, True)
             shot("3-filter-beside-glass")
-            check(not counted["problems"], f"{label}, the Pinned filter beside a count: {counted['problems']}")
+            check(not counted["problems"], f"{label}, the filters beside a count: {counted['problems']}")
             page.fill("#search-field", "")
 
             # Its tap shows the pins, and none of them is under the bar.
@@ -2056,6 +2164,155 @@ def pin_walk(chromium: BrowserType, args: argparse.Namespace, label: str, width:
                   f"{label}: the filter still says it is on")
             check(ids("discord-log") == ["200", "201", "202"], f"{label}: the channel came back as {ids('discord-log')}")
             check(not errors, f"{label}, pins: the page threw: {errors}")
+            context.close()
+    finally:
+        api.stopping.set()
+        server.shutdown()
+        server.server_close()
+        thread.join()
+
+
+def links_walk(chromium: BrowserType, args: argparse.Namespace, label: str, width: int, height: int,
+               mobile: bool) -> None:
+    """`#211 link-filter`, in the dark theme the owner reads in, against a fresh fake API.
+
+    The glass larger than it was; the open bar holding Links and Pinned beside the glass, each a 44px
+    target clear of the field and the glass, with the field still 140px wide; Links showing only the
+    rows with links, each link real and on its own line; a real tap on a link opening a new tab
+    without folding its row; and, over the call view, Links beside the glass on its own.
+    """
+    api = LinkApi()
+    server = ThreadingHTTPServer(("127.0.0.1", 0), handler_for(api))
+    server.daemon_threads = True
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        with tempfile.TemporaryDirectory(prefix="vibe-talk-chrome-links-") as profile:
+            context = chromium.launch_persistent_context(
+                profile, headless=True, executable_path=args.browser_executable,
+                viewport={"width": width, "height": height}, device_scale_factor=2.625 if mobile else 1,
+                is_mobile=mobile, has_touch=mobile, color_scheme="dark",
+            )
+            opened: list[str] = []
+
+            def answer(route: Route) -> None:
+                opened.append(route.request.url)
+                route.fulfill(status=200, content_type="text/html", body="<title>opened</title>opened")
+
+            for pattern in LINK_HOSTS:
+                context.route(pattern, answer)
+            page = context.pages[0]
+            errors: list[str] = []
+            page.on("pageerror", lambda error: errors.append(str(error)))
+
+            def shot(name: str) -> None:
+                if args.screenshots:
+                    page.screenshot(path=str(args.screenshots / f"{label}-links-{name}.png"))
+
+            def point(selector: str) -> tuple[float, float]:
+                found = page.evaluate(f"() => {{ const b = document.querySelector({json.dumps(selector)})"
+                                      ".getBoundingClientRect(); return [b.left + b.width / 2, b.top + b.height / 2]; }")
+                return float(found[0]), float(found[1])
+
+            def tap(selector: str) -> None:
+                x, y = point(selector)
+                if mobile:
+                    page.touchscreen.tap(x, y)
+                else:
+                    page.mouse.click(x, y)
+
+            def until(script: str, why: str) -> None:
+                deadline = time.monotonic() + 10
+                while time.monotonic() < deadline and not page.evaluate(script):
+                    page.wait_for_timeout(50)
+                check(bool(page.evaluate(script)), f"{label}: {why}")
+
+            page.goto(f"http://127.0.0.1:{server.server_port}/voice", wait_until="load")
+            page.fill("#api-token", TOKEN)
+            page.click("#save-token")
+            page.wait_for_selector("#search-toggle", state="visible", timeout=10_000)
+            page.click("#view-switch")
+            until("() => document.querySelectorAll('#discord-log > li[data-id]').length === 5", "the channel did not open")
+            glass = page.evaluate("() => { const b = document.getElementById('search-toggle').getBoundingClientRect();"
+                                  " return [b.width, b.height]; }")
+            check(float(glass[0]) >= GLASS_MIN_PX and float(glass[1]) >= GLASS_MIN_PX,
+                  f"{label}: the glass is drawn {glass[0]}x{glass[1]}px, under {GLASS_MIN_PX}px")
+            shot("1-glass")
+
+            # The open bar: Links, then Pinned, then the glass; then the same with a count beside them.
+            tap("#search-toggle")
+            until("() => !document.getElementById('links-filter').hidden", "the open bar has no Links filter")
+            bare = page.evaluate(FILTER_BAR_JS, True)
+            check(not bare["problems"], f"{label}, the filters on the open bar: {bare['problems']}")
+            page.fill("#search-field", "a")
+            counted = page.evaluate(FILTER_BAR_JS, True)
+            shot("2-bar-with-count")
+            check(not counted["problems"], f"{label}, the filters beside a count: {counted['problems']}")
+            page.fill("#search-field", "")
+
+            # A real tap on Links: only the rows with links, each showing only its links.
+            folded = page.evaluate("() => document.querySelector('#discord-log > li[data-id=\"200\"]')"
+                                   ".getAttribute('data-collapsed')")
+            check(folded == "true", f"{label}: the long message did not arrive folded ({folded!r})")
+            tap("#links-filter")
+            until("() => document.getElementById('links-filter').getAttribute('aria-pressed') === 'true'",
+                  "a tap on Links did not turn it on")
+            until("() => document.querySelectorAll('#discord-log > li[data-links-view=\"true\"]').length === 3",
+                  "the rows with links did not show their links")
+            view = page.evaluate(LINK_VIEW_JS)
+            shot("3-links-shown")
+            check(not view["problems"], f"{label}, the Links view: {view['problems']}")
+            rows = {row_id: links for row_id, links in view["rows"]}
+            check(sorted(rows) == ["200", "202", "203"], f"{label}: the Links view shows rows {sorted(rows)}")
+            check([link[:2] for link in rows["200"]] == [["https://example.com/build/7", "https://example.com/build/7"],
+                                                         ["the diff", "https://example.org/diff/7"]],
+                  f"{label}: row 200 shows {rows['200']}")
+            check([link[:2] for link in rows["202"]] == [["the dashboard", "https://example.com/dash"]],
+                  f"{label}: row 202 shows {rows['202']}")
+            check(rows["203"][0][1] == LONG_ADDRESS and bool(rows["203"][0][4]),
+                  f"{label}: the long address is not whole in its href and cut short on screen: {rows['203']}")
+            for links in rows.values():
+                for link in links:
+                    check(link[2] == "_blank" and link[3] == "noopener noreferrer",
+                          f"{label}: {link[0]} does not open in a new tab on its own: {link}")
+
+            # A real tap on a link opens it in a new tab, and the row it is in does not fold.
+            anchor = '#discord-log > li[data-id="200"] .row-link[href="https://example.org/diff/7"]'
+            x, y = point(anchor)
+            hit = page.evaluate(f"() => document.elementFromPoint({x}, {y}) === document.querySelector({json.dumps(anchor)})")
+            check(bool(hit), f"{label}: something covers the link to be tapped")
+            with context.expect_page(timeout=10_000) as tab:
+                tap(anchor)
+            opened_page = tab.value
+            opened_page.wait_for_load_state()
+            check(opened_page.url == "https://example.org/diff/7", f"{label}: the tap opened {opened_page.url}")
+            check(page.url.endswith("/voice"), f"{label}: the tap navigated the app itself to {page.url}")
+            opened_page.close()
+            after = page.evaluate("() => { const row = document.querySelector('#discord-log > li[data-id=\"200\"]');"
+                                  " return [row.getAttribute('data-collapsed'), row.getAttribute('data-links-view'),"
+                                  " Boolean(row.querySelector('.msg-details'))]; }")
+            shot("4-link-tapped")
+            check(after[0] == folded and after[1] == "true" and not after[2],
+                  f"{label}: the tap on a link also did something to its row: {after}")
+
+            # The glass folds the bar, and Links with it.
+            tap("#search-toggle")
+            until("() => document.getElementById('links-filter').hidden", "folding the bar left Links on screen")
+            check(page.evaluate("() => document.getElementById('links-filter').getAttribute('aria-pressed')") == "false",
+                  f"{label}: Links still says it is on")
+            until("() => !document.querySelector('#discord-log li.search-hidden, #discord-log .row-links')",
+                  "folding the bar left the Links view up")
+
+            # Over the call view there are no pins: Links stands beside the glass on its own.
+            page.click("#view-switch")
+            page.wait_for_selector("#pane-voice", state="visible", timeout=5_000)
+            tap("#search-toggle")
+            until("() => !document.getElementById('links-filter').hidden", "the call view's bar has no Links filter")
+            alone = page.evaluate(FILTER_BAR_JS, False)
+            shot("5-call-view-bar")
+            check(not alone["problems"], f"{label}, the call view's bar: {alone['problems']}")
+            check(not errors, f"{label}, links: the page threw: {errors}")
+            check(opened == ["https://example.org/diff/7"], f"{label}: the walk opened {opened}")
             context.close()
     finally:
         api.stopping.set()

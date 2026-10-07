@@ -1950,10 +1950,11 @@ def _act_message_search(driver: Driver) -> None:
 
     Driven over the CHANNEL rather than the transcript because that is where the layout risk is:
     the seeded backlog is long-winded on purpose, so the list really has rows to remove, and the
-    bar floating over the top of the list (`#197 floating-search`) really has a field, a count and
-    a glass competing for a 375px band. Whether those three fit — or whether a long query pushes
-    the glass off the edge — is a flex question only a layout engine answers, and it is the reason
-    `.search-field` carries `min-width: 0` at all.
+    bar floating over the top of the list (`#197 floating-search`) really has a field, a count, the
+    Links and Pinned filters (`#211 link-filter`, `#206 pin-message`) and a glass competing for a
+    375px band. Whether those fit — or whether a long query pushes the glass off the edge — is a
+    flex question only a layout engine answers, and it is the reason `.search-field` carries
+    `min-width: 0` at all.
 
     A QUOTED phrase, because that is the clause of the request that is invisible in any other
     frame: the seeded messages say "runner" several times over and "mac runner" exactly once, so
@@ -1969,6 +1970,35 @@ def _act_message_search(driver: Driver) -> None:
     driver.page.fill("#search-field", '"mac runner"')
     driver.page.wait_for_function(
         "() => (window.__text('search-count') || '').length > 0", timeout=5_000
+    )
+    driver.settle(300)
+
+
+def _act_links_filter(driver: Driver) -> None:
+    """`#211 link-filter`: the Links filter on over the channel, each row's links one per line.
+
+    The seeded backlog holds no links, so one message with two arrives on the stream first, in the
+    two forms whose drawing only a browser can judge: a Markdown link, which shows its NAME, and a
+    bare address longer than a phone is wide, which is cut short on screen with its href whole.
+    Then the bar opens and Links is turned on by a real click, beside Pinned and the glass.
+    """
+    _act_open_channel(driver)
+    driver.js(
+        "window.__channelSays('9990000000000000211', 'claude-integ', "
+        "'the change is [the diff](https://example.com/diff/42) and the full log is at "
+        "https://example.com/logs/nightly-integration-shard-nightly-integration-shard-"
+        "nightly-integration-shard/summary.html')"
+    )
+    driver.page.wait_for_function(
+        "() => document.querySelector('#discord-log li[data-id=\"9990000000000000211\"]') !== null",
+        timeout=10_000,
+    )
+    driver.click("search-toggle")
+    driver.page.wait_for_function("() => window.__visible('links-filter')", timeout=5_000)
+    driver.click("links-filter")
+    driver.page.wait_for_function(
+        "() => document.querySelector('#discord-log li[data-links-view=\"true\"]') !== null",
+        timeout=5_000,
     )
     driver.settle(300)
 
@@ -3457,18 +3487,66 @@ SCENES: tuple[Scene, ...] = (
                 # `min-width: 0` for exactly this, because a flex item's default minimum is its
                 # content width and a long query would otherwise shove the glass off a 375px
                 # screen. The header is not up at all: opening the search costs no row either.
-                "field, count and glass are one row, in that order, on the bar over the list",
+                "field, count, Links, Pinned and glass are one row, in that order, on the bar over "
+                "the list",
                 "(() => { const f = document.getElementById('search-field').getBoundingClientRect(); "
                 "const c = document.getElementById('search-count').getBoundingClientRect(); "
+                "const l = document.getElementById('links-filter').getBoundingClientRect(); "
+                "const p = document.getElementById('pinned-filter').getBoundingClientRect(); "
                 "const g = document.getElementById('search-toggle').getBoundingClientRect(); "
                 "const bar = document.getElementById('search-float').getBoundingClientRect(); "
                 "const s = document.getElementById('scroll-area').getBoundingClientRect(); "
-                "return f.width > 80 && c.width > 0 && g.width > 0 "
-                "&& f.right <= c.left + 1 && c.right <= g.left + 1 && g.right <= bar.right + 1 "
+                "return f.width > 80 && c.width > 0 && g.width > 0 && l.width >= 44 && p.width >= 44 "
+                "&& f.right <= c.left + 1 && c.right <= l.left + 1 && l.right <= p.left + 1 "
+                "&& p.right <= g.left + 1 && g.right <= bar.right + 1 "
                 "&& bar.top >= s.top - 1 && bar.right <= s.right + 1 "
                 "&& !window.__visible('topbar') "
                 "&& f.top < c.bottom && c.top < f.bottom "
                 "&& f.top < g.bottom && g.top < f.bottom; })()",
+            ),
+        ),
+    ),
+    Scene(
+        name="37-links-filter",
+        what="the Links filter on over the channel: only the rows with links, each its links alone",
+        act=_act_links_filter,
+        expect=(
+            ("the Discord pane is up", "window.__visible('pane-discord')"),
+            (
+                # The toggle the owner asked for, where he asked for it: on, and immediately beside
+                # Pinned, which is immediately beside the glass, all on the one bar.
+                "Links reads as on, immediately left of Pinned, which is left of the glass",
+                "(() => { const l = document.getElementById('links-filter'); "
+                "const a = l.getBoundingClientRect(); "
+                "const p = document.getElementById('pinned-filter').getBoundingClientRect(); "
+                "const g = document.getElementById('search-toggle').getBoundingClientRect(); "
+                "return l.getAttribute('aria-pressed') === 'true' && a.width >= 44 "
+                "&& a.right <= p.left + 1 && p.left - a.right < 20 && p.right <= g.left + 1 "
+                "&& Math.abs((a.top + a.bottom) / 2 - (g.top + g.bottom) / 2) < 2; })()",
+            ),
+            (
+                # THE rendering claim. The page suite asserts the attribute and the rule that hides
+                # the text by it; whether the text is really gone from the pixels, past the fold's
+                # own display and the summary's, is a layout fact only a browser sees.
+                "only rows with links are drawn, and each draws its links instead of its text",
+                "(() => { const rows = [...document.querySelectorAll('#discord-log > li[data-id]')]"
+                ".filter((r) => r.offsetParent !== null); "
+                "return rows.length > 0 && rows.every((r) => r.getAttribute('data-links-view') === "
+                "'true' && r.querySelector(':scope > .body').offsetParent === null "
+                "&& r.querySelector('.row-links > a') !== null); })()",
+            ),
+            (
+                "the Markdown link shows its name, and opens in a new tab",
+                "[...document.querySelectorAll('.row-links > a')].some((a) => "
+                "a.textContent === 'the diff' && a.getAttribute('href') === "
+                "'https://example.com/diff/42' && a.target === '_blank')",
+            ),
+            (
+                "the long address is cut short on screen, inside the screen, with its href whole",
+                "(() => { const a = [...document.querySelectorAll('.row-links > a')]"
+                ".find((n) => n.href.endsWith('/summary.html')); "
+                "return Boolean(a) && a.scrollWidth > a.clientWidth "
+                "&& a.getBoundingClientRect().right <= document.documentElement.clientWidth; })()",
             ),
         ),
     ),
@@ -4076,6 +4154,15 @@ def check_state_controls() -> list[str]:
         #   `getBoundingClientRect` — field, count and glass fit one row on a 375px phone. That is
         #     the only part of this feature no page suite can reach.
         "35-message-search": ("search-hidden", "mac runner", "getBoundingClientRect"),
+        # `#211 link-filter`. Pinned to THREE things, each separately deletable and each satisfied
+        # on its own by a filter that does not work:
+        #   `data-links-view` — every row on screen is showing its links and not its text. Pinned
+        #     to the toggle alone it would be green with the stylesheet rule deleted, which is a
+        #     list that says "links only" over the messages' whole text.
+        #   `the diff`        — a Markdown link shows its NAME, the owner's second request.
+        #   `scrollWidth`     — a long address is cut short inside the screen rather than run
+        #     off it, which no page suite can measure.
+        "37-links-filter": ("data-links-view", "the diff", "scrollWidth"),
         # `#49 cached-summaries`, the other half. Pinned to THREE independent things, because each
         # is separately deletable and each on its own is satisfiable by a defect:
         #   `backgroundColor` — the row is really drawn differently. Pinning this state to

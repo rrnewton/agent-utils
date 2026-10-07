@@ -83,8 +83,12 @@
      unit that says so. Overwritten per reader; see `applyReadingWidth`. */
   --reading-width: 72ch;
   /* `#32 freshness-pill-overlap`. The saved-messages pill's box, in the tokens its reservation at
-     the head of #pane-discord is computed from, so that the two cannot drift apart. */
-  --freshness-top: 0.4rem;
+     the head of #pane-discord is computed from, so that the two cannot drift apart.
+
+     `#211 link-filter`. Its TOP is no longer a number of its own: it is wherever the pill's middle
+     has to be for the open search bar, centred on the same line, to start just inside the list —
+     the bar is the tallest thing on that line now. */
+  --freshness-top: calc(var(--search-bar) / 2 + 0.1rem - var(--freshness-box) / 2);
   --freshness-pad: 0.25rem;
   --freshness-line: 1rem;
   /* `#197 floating-search`. The pill's whole height (the 2px is its border), and the line through
@@ -92,14 +96,22 @@
      restated, so the glass follows the pill wherever the pill is moved. */
   --freshness-box: calc(2 * var(--freshness-pad) + var(--freshness-line) + 2px);
   --float-line: calc(var(--freshness-top) + var(--freshness-box) / 2);
-  /* The glass is DRAWN the pill's height, so the two read as one band, and it is HIT at 44px, the
-     touch target both platforms' guidelines ask for. The difference is an invisible margin around
-     the disc (`#search-toggle::after`), not a bigger disc. */
-  --search-disc: var(--freshness-box);
-  --search-hit: 2.75rem;
-  /* The open bar: tall enough for a 16px field, short enough that, centred on the same line, it
-     still starts inside the list rather than over whatever is above it. */
-  --search-bar: 2.4rem;
+  /* The glass was DRAWN the pill's height until `#211 link-filter`, when the owner, on his phone,
+     called it "very small": a 26px disc holding a 15px glyph. It is a 36px disc now with a glyph
+     a third larger, and HIT at 48px. The hit is still an invisible margin around the disc
+     (`#search-toggle::after`), so the disc can stay the size that reads as a quiet control beside
+     the pill rather than a button the size of the toggles in the dock. */
+  --search-disc: 2.25rem;
+  --search-hit: 3rem;
+  /* The square each filter toggle in the open bar is hit by, and draws a disc the glass's size
+     inside: 44px, the touch target both platforms' guidelines ask for, and no more, because two
+     of them and the glass share a 360px line with the field. */
+  --toggle-hit: 2.75rem;
+  /* The open bar: as tall as the glass's target, so everything on it is inside it, and tall enough
+     for a 17px field. Centred on the line, it starts just inside the list (see --freshness-top). */
+  --search-bar: 3rem;
+  /* The space between the things on the open bar. */
+  --bar-gap: 0.2rem;
   /* How far the floating line keeps from the list's edges, and the space between pill and glass.
      Small on purpose: on a 360px phone the longest thing the pill says and the glass only just
      share the line, and every pixel spent here comes off the end of that sentence. */
@@ -280,28 +292,41 @@ body {
 /* Elastic, so the field takes the bar when it opens. `min-width: 0` because a flex item's default
    minimum is its content width, and without it a long query pushes the glass off the edge of a
    375px phone instead of scrolling inside the field. `align-self: stretch` so its height is the
-   bar's, whatever the font's line height makes of 16px. */
+   bar's, whatever the font's line height makes of its type. */
 .search-field {
   flex: 1 1 auto;
   align-self: stretch;
   min-width: 0;
-  padding: 0.25rem 0.6rem;
+  padding: 0.25rem 0.75rem;
   background: var(--bg);
   border: 1px solid var(--edge);
   border-radius: 999px;
   color: var(--ink);
   font: inherit;
-  /* 16px, not a rem, and the same rule #compose-text states: iOS Safari zooms the whole frame when
-     an input smaller than that takes focus, and this page is a fixed 100dvh grid that cannot
-     scroll back. A search field is a field you focus every single time you use it. */
-  font-size: 16px;
+  /* In px, not a rem, and never under 16px — the rule #compose-text states: iOS Safari zooms the
+     whole frame when an input smaller than that takes focus, and this page is a fixed 100dvh grid
+     that cannot scroll back. A search field is a field you focus every single time you use it.
+     17px since `#211 link-filter`, which made the bar it sits in larger. */
+  font-size: 17px;
+  /* A placeholder longer than a narrow field ends in an ellipsis rather than mid-letter. */
+  text-overflow: ellipsis;
 }
 
+/* `#211 link-filter`. TWO short lines, the numbers over the word: "12 of 140" above "loaded". Two
+   filters and the glass now share a 360px line with the field, and the count on one line took 96px
+   of it, which left the field under 110. The words stay whole, because "of N loaded" is the point
+   of the count (see `applySearch`), and a short one — "3 pinned" — still sits on one line. The
+   cap holds "88 of 888" on its first line in a font with wide digits, so a count wraps between
+   its numbers and its word; only a three-digit numerator takes a third line, which the bar has
+   the height for. */
 .search-count {
   flex: 0 0 auto;
+  max-width: 8.25ch;
   color: var(--muted);
-  font-size: 0.75rem;
-  white-space: nowrap;
+  font-size: 0.7rem;
+  font-variant-numeric: tabular-nums;
+  line-height: 1.15;
+  text-align: center;
 }
 
 /* The statement a reader gets instead of a blank list. Centred and given room, because it is the
@@ -326,6 +351,51 @@ body {
  * these rows, and a filter that loses to the thing it is filtering is not a filter. */
 .search-hidden {
   display: none !important;
+}
+
+/* `#211 link-filter`. A row under the Links filter shows its links IN PLACE of its text: the text,
+ * the summary that stands in for it, and the fold that opens it all go, and the row keeps its
+ * author, its time and its controls, so the reader knows where each link came from and can still
+ * act on the message. By the row's own attribute rather than a class on the list, because it is
+ * the row that knows whether it has links to show — one without any is not on screen at all.
+ *
+ * `!important` for the reason `.search-hidden` has it: the fold and the summary set their own
+ * `display`, and the text must not come back because a later rule was more specific. */
+.messages li[data-links-view="true"] > .body,
+.messages li[data-links-view="true"] > .msg-text,
+.messages li[data-links-view="true"] > .summary,
+.messages li[data-links-view="true"] .fold {
+  display: none !important;
+}
+
+/* One link per line, each the width of the row and tall enough to be a target on its own: these
+   are the things the reader came here to tap, several to a row, one above another. */
+.row-links {
+  display: flex;
+  flex-direction: column;
+  font-size: calc(0.88rem * var(--msg-scale));
+}
+
+/* An address is one unbroken word, often longer than a phone is wide: it is cut short with an
+   ellipsis rather than wrapped across lines or run off the side of the row. The href stays whole,
+   and the title says where it goes. */
+.row-link {
+  display: block;
+  min-width: 0;
+  min-height: 2.75rem;
+  padding: 0.75rem 0;
+  overflow: hidden;
+  color: var(--accent);
+  line-height: 1.4;
+  text-decoration: underline;
+  text-underline-offset: 0.15em;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  touch-action: manipulation;
+}
+
+.row-link + .row-link {
+  border-top: 1px solid var(--edge);
 }
 
 /* The view switch: ONE control with two positions, carrying the word for the position it is in.
@@ -2259,7 +2329,10 @@ body {
   color: var(--muted);
   border: 1px solid var(--edge);
   border-radius: 999px;
-  font-size: 0.78rem;
+  /* 0.75rem, down from 0.78rem when `#211 link-filter` made the glass beside it 10px wider: the
+     longest thing it says, "Refresh failed · showing messages from 09:28", needed 309px of the 303px
+     a 360px phone then left it, and the time at its end is the part the ellipsis would take. */
+  font-size: 0.75rem;
   text-align: center;
   box-shadow: 0 1px 6px rgb(0 0 0 / 35%);
   pointer-events: none;
@@ -2273,16 +2346,20 @@ body {
 }
 
 /* The pill's bottom edge, measured from the scroller's top; #scroll-area's own top padding is then
-   the gap between it and the header. The 2px is the pill's border. */
+   the gap between it and the header. The 2px is the pill's border.
+
+   `#211 link-filter`. Or the glass's bottom edge, which is lower now that the glass is the larger
+   of the two things centred on the line: the room is made for whichever reaches further, so the
+   head of the list is clear of both. */
 #pane-discord[data-freshness] {
-  padding-top: calc(var(--freshness-top) + 2 * var(--freshness-pad) + var(--freshness-line) + 2px);
+  padding-top: calc(var(--float-line) + max(var(--freshness-box), var(--search-disc)) / 2);
 }
 
-/* `#197 floating-search`. The glass: a disc the pill's height at the right-hand end of the line,
-   in the pill's own panel, edge and shadow, so the two read as one band and neither as the louder.
-   Positioned rather than a flex item so that it stays in the corner when the pill is not on the
-   line (the call view has none) and so that, open, it can take the whole line without the pill's
-   arithmetic having a say. `translateY(-50%)` centres it on the line at whatever height it is. */
+/* `#197 floating-search`. The glass: a disc at the right-hand end of the line, in the pill's own
+   panel, edge and shadow, so the two read as one band and neither as the louder. Positioned rather
+   than a flex item so that it stays in the corner when the pill is not on the line (the call view
+   has none) and so that, open, it can take the whole line without the pill's arithmetic having a
+   say. `translateY(-50%)` centres it on the line at whatever height it is. */
 #search-float {
   position: absolute;
   top: 0;
@@ -2290,7 +2367,7 @@ body {
   transform: translateY(-50%);
   display: flex;
   align-items: center;
-  gap: 0.4rem;
+  gap: var(--bar-gap);
 }
 
 #search-toggle {
@@ -2303,22 +2380,23 @@ body {
   box-shadow: 0 1px 6px rgb(0 0 0 / 35%);
 }
 
+/* `#211 link-filter`: 1.3rem, up from 0.95rem — the glyph is most of what made it look small. */
 #search-toggle .icon {
-  width: 0.95rem;
-  height: 0.95rem;
+  width: 1.3rem;
+  height: 1.3rem;
 }
 
-/* The 44px target, drawn as nothing. A pseudo-element is part of its button for hit-testing, so a
-   tap anywhere in this square presses the glass while the disc stays the pill's size. Its box is
+/* The 48px target, drawn as nothing. A pseudo-element is part of its button for hit-testing, so a
+   tap anywhere in this square presses the glass while the disc stays its own size. Its box is
    measured from the button's padding box, hence the border's 1px on every side.
 
    Centred on the disc vertically, but NOT sideways: the disc sits --float-edge from the list's
    right edge, which is less than half the difference, so the square reaches exactly to that edge
    and makes up the rest on the left. Centred, it stuck a pixel out of the viewport, and a page one
    pixel wider than the phone is the overflow `#36 thread-view-phone-overflow` exists to forbid. It
-   reaches a few px over the pill's end, which takes no taps (`pointer-events: none`), and a few px
-   above the list's top edge, which is padding on whatever row is there — never the thread
-   heading's Back button. */
+   reaches a few px over the pill's end, which takes no taps (`pointer-events: none`), and a
+   couple of px into the room the list makes at its head, never the thread heading's Back button:
+   since `#211 link-filter` the line sits low enough that the square starts inside the list. */
 #search-toggle::after {
   content: "";
   position: absolute;
@@ -2328,33 +2406,40 @@ body {
     calc(var(--search-disc) + var(--float-edge) - var(--search-hit) - 1px);
 }
 
-/* `#206 pin-message`. The Pinned filter, immediately left of the glass inside the open bar. Its
-   whole 44px SQUARE is the target — no rounded corners to fall off — and what is drawn inside it
-   is the glass's own disc size, so the two read as a pair on the line. The margin on its right
-   keeps that square out of the glass's (`#search-toggle::after` reaches this far left of the
-   disc), so neither steals the other's taps; the field gives up the width, and keeps well over the
-   150px it needs at 360px. */
+/* `#206 pin-message` and `#211 link-filter`. The two filters on the open bar, Links then Pinned,
+   immediately left of the glass. Each one's whole 44px SQUARE is the target — no rounded corners to
+   fall off — and what is drawn inside it is the glass's own disc size, so the three read as a set
+   on the line. The squares abut: the discs drawn inside them are what the eye separates, and the
+   width the gap would have cost is the field's. */
+#links-filter,
 #pinned-filter {
   position: relative;
-  width: var(--search-hit);
-  height: var(--search-hit);
-  margin-right: max(0px, calc(var(--search-hit) - var(--search-disc) - var(--float-edge) + 1px - 0.4rem));
+  width: var(--toggle-hit);
+  height: var(--toggle-hit);
   border-radius: 0;
   color: var(--muted);
 }
 
+/* On the filter that only ever shows with Links before it, so the squares abut where both are up
+   and nothing changes over the call, where Links stands beside the glass alone. */
+#pinned-filter {
+  margin-left: calc(-1 * var(--bar-gap));
+}
+
+#links-filter::before,
 #pinned-filter::before {
   content: "";
   position: absolute;
-  inset: calc((var(--search-hit) - var(--search-disc)) / 2);
+  inset: calc((var(--toggle-hit) - var(--search-disc)) / 2);
   border-radius: 999px;
   pointer-events: none;
 }
 
+#links-filter .icon,
 #pinned-filter .icon {
   position: relative;
-  width: 1.05rem;
-  height: 1.05rem;
+  width: 1.3rem;
+  height: 1.3rem;
 }
 
 /* ON says so twice, from the one attribute that says it to a screen reader: the pin fills in and
@@ -2372,17 +2457,36 @@ body {
   fill: currentColor;
 }
 
+/* `#211 link-filter`. Links ON in the accent, the colour every other pressed toggle here wears and
+   the colour its links are drawn in; gold is the pin's alone. */
+#links-filter[aria-pressed="true"] {
+  color: var(--accent);
+}
+
+#links-filter[aria-pressed="true"]::before {
+  background: color-mix(in srgb, var(--accent) 18%, transparent);
+  box-shadow: inset 0 0 0 1px var(--accent);
+}
+
 /* OPEN: the glass grows along the line into a bar across the top of the list, and the pill has
    given way to it (`renderChannelFreshness`). The bar is a panel of its own, because the count is
    small grey type and would otherwise be printed straight onto whatever message is underneath. */
 #screen-main[data-searching] #search-float {
   left: calc(var(--float-edge) + env(safe-area-inset-left));
   height: var(--search-bar);
-  padding: 0.2rem 0.35rem 0.2rem 0.2rem;
+  /* Less on the right, where the open glass has shed its disc and its icon has air of its own. */
+  padding: 0.2rem 0.1rem 0.2rem 0.2rem;
   background: var(--panel);
   border: 1px solid var(--edge);
   border-radius: 999px;
   box-shadow: 0 1px 6px rgb(0 0 0 / 35%);
+}
+
+/* Whichever filter is beside the glass — Pinned over the channel, Links over the call, which has
+   no pins — keeps its square out of the glass's (`#search-toggle::after` reaches this far left of
+   the disc), so neither steals the other's taps. On the glass, so it holds for either. */
+#screen-main[data-searching] #search-toggle {
+  margin-left: max(0px, calc(var(--search-hit) - var(--search-disc) - var(--float-edge) + 1px - var(--bar-gap)));
 }
 
 /* Pressed is the open state, and it has to be legible at a glance — the field beside it is the

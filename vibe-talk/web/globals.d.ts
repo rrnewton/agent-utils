@@ -12,4 +12,9 @@ interface HTMLLIElement {
    * one. Set by voice.js when it draws the row.
    */
   messages?: VibeTalk.Message[];
+  /**
+   * `#211 link-filter`. The text the Links filter reads a row's links from, on a row that does not
+   * stand for channel messages: a voice turn, or a message still being sent.
+   */
+  linkText?: string;
 }
