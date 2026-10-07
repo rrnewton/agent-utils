@@ -28,6 +28,7 @@ from agentctl.errors import (
     AgentPossiblySubmitted,
     HerdrUnavailable,
 )
+from agentctl.prompt_time import retime as _retime_prompt
 from agentctl.submission import PromptNotStaged, SubmissionReceipt
 
 __all__ = [
@@ -1719,6 +1720,12 @@ def _queue_order(path: str, max_artifact_bytes: int | None) -> tuple[bool, float
     return (True, seconds, path)
 
 
+def _typed_text(document: dict[str, object]) -> str:
+    """The text a drain types: the stored text, except that a chat request prompt the Rust bridge
+    queued with its message's create time gets its opening decided now (see prompt_time)."""
+    return _retime_prompt(str(document["text"]), document.get("sent_at"), document.get("opening"))
+
+
 def _delivery_attempts(document: dict[str, object], path: str) -> int:
     """Read the current or legacy attempt count as one strict unsigned 64-bit integer."""
 
@@ -1932,7 +1939,7 @@ def _drain(
                 try:
                     try:
                         _deliver_one(
-                            client, info, str(document["text"]), working_timeout=working_timeout,
+                            client, info, _typed_text(document), working_timeout=working_timeout,
                         )
                     except _NotStaged as exc:
                         # Nothing reached the composer: undo the at-most-once barrier so the
