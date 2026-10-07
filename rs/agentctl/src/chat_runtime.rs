@@ -6437,9 +6437,15 @@ impl BridgeState {
     pub fn prompt(&self, key: &str, screen: &str) -> Result<String> {
         let record = self.read_request(key)?;
         let context = self.prompt_context(&record.message);
+        // The first line opens with the message's own create time, and with how much later it is
+        // typed when that is late: see `prompt_time`.
+        let sent = crate::prompt_time::opening(
+            &record.message.created_at,
+            crate::prompt_time::now_millis(),
+        );
         if !self.config.outbound_enabled {
             return Ok(format!(
-                "The user's request arrived through your configured inbound-only chat bridge.\n\
+                "{sent}The user's request arrived through your configured inbound-only chat bridge.\n\
 {context}\n\
 {}\n\n\
 Complete this request using your normal instructions and tools. Outbound chat is disabled for this bridge; do not emit CHAT_REPLY fences.",
@@ -6469,7 +6475,7 @@ call between them.",
             ),
         };
         let mut prompt = format!(
-            "The user's request arrived through the configured chat bridge.\n\
+            "{sent}The user's request arrived through the configured chat bridge.\n\
 {context}\n\
 {}\n\n\
 Complete this request using your normal instructions and tools. You may send one or multiple replies, including progress updates. \
@@ -25316,6 +25322,57 @@ recent or unresolved reply reservations (limit 8 per 60 s)"
     }
 
     #[test]
+    fn a_prompt_opens_with_the_messages_send_time_and_how_late_it_is() {
+        let root = temporary("prompt-send-time");
+        let state = BridgeState::initialize(&root, config()).expect("initialize state");
+        let admission = state
+            .admit_batch(&delivery(1, "cursor-1", "receipt-1"))
+            .expect("admit request");
+        let key = &admission.new_request_keys[0];
+        // The message was created at 2026-09-21T12:00:00Z, 8:00 AM EDT.
+        crate::prompt_time::test_clock::set(1_789_992_030_000, -4 * 3_600, "EDT");
+        let prompt = state.prompt(key, "").expect("render prompt");
+        assert_eq!(
+            prompt.lines().next(),
+            Some("Sent 2026.09.21:08:00 EDT. The user's request arrived through the configured chat bridge."),
+            "{prompt}"
+        );
+        // The same request typed 1 h 12 min after it was written, as after a bridge outage.
+        crate::prompt_time::test_clock::set(1_789_996_320_000, -4 * 3_600, "EDT");
+        let prompt = state.prompt(key, "").expect("render late prompt");
+        assert_eq!(
+            prompt.lines().next(),
+            Some(
+                "Sent 2026.09.21:08:00 EDT, delivered 1 h 12 min later. \
+The user's request arrived through the configured chat bridge."
+            ),
+            "{prompt}"
+        );
+        fs::remove_dir_all(root).expect("cleanup");
+
+        let root = temporary("prompt-send-time-inbound-only");
+        let mut configuration = config();
+        configuration.outbound_enabled = false;
+        configuration.ack_reaction = None;
+        let state = BridgeState::initialize(&root, configuration).expect("initialize state");
+        let admission = state
+            .admit_batch(&delivery(1, "cursor-1", "receipt-1"))
+            .expect("admit request");
+        let prompt = state
+            .prompt(&admission.new_request_keys[0], "")
+            .expect("render inbound-only prompt");
+        assert_eq!(
+            prompt.lines().next(),
+            Some(
+                "Sent 2026.09.21:08:00 EDT, delivered 1 h 12 min later. \
+The user's request arrived through your configured inbound-only chat bridge."
+            ),
+            "{prompt}"
+        );
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
     fn inbound_only_mode_disables_reaction_work_and_reply_fences() {
         let root = temporary("inbound-only");
         let mut configuration = config();
@@ -25448,6 +25505,8 @@ Thread: spaces/example/threads/one (this message starts a new thread)\n\nrun the
             ))
             .expect("admit quoting reply");
         let key = &admission.new_request_keys[0];
+        // Typed 30 seconds after the message's create time, 2026-09-29T18:00:00Z.
+        crate::prompt_time::test_clock::set(1_790_704_830_000, -4 * 3_600, "EDT");
         let prompt = state.prompt(key, "").expect("render prompt");
         let root_word = shell_word(root.to_str().expect("UTF-8 root")).expect("printable root");
         let program = shell_word(
@@ -25460,7 +25519,7 @@ Thread: spaces/example/threads/one (this message starts a new thread)\n\nrun the
         // The count is of the provider's text, before the escape and CRLF are replaced.
         let characters = quoted_text.chars().count();
         let context = format!(
-            "The user's request arrived through the configured chat bridge.\n\
+            "Sent 2026.09.29:14:00 EDT. The user's request arrived through the configured chat bridge.\n\
 Source: spaces/example/messages/quoting\n\
 Sender: users/owner\n\
 Thread: spaces/example/threads/one (a reply in an existing thread)\n\
