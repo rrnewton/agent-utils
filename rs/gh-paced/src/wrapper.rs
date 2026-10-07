@@ -382,30 +382,54 @@ impl Wrapper<'_> {
     /// The second value names that bound when it is the shorter one.
     fn lock_wait(&self) -> (f64, Option<String>) {
         let full = self.cfg.lock_wait_secs;
-        let Some(started) = self.credential_started else {
+        let Some(left) = self.credential_left() else {
             return (full, None);
         };
-        let (bound, var) = self.cfg.max_wait(Class::GitCredential);
-        let left = (started + bound - self.clock.monotonic()).max(0.0);
+        let left = left.max(0.0);
         if left >= full {
             return (full, None);
         }
-        let note = format!(
+        (left, Some(self.credential_lock_note(left)))
+    }
+
+    /// Seconds left of a GIT_CREDENTIAL call's wait bound by the monotonic clock (0 or less once
+    /// it has passed), or `None` for any other call.
+    fn credential_left(&self) -> Option<f64> {
+        let started = self.credential_started?;
+        let (bound, _) = self.cfg.max_wait(Class::GitCredential);
+        Some(started + bound - self.clock.monotonic())
+    }
+
+    fn credential_lock_note(&self, left: f64) -> String {
+        let (bound, var) = self.cfg.max_wait(Class::GitCredential);
+        format!(
             "a GIT_CREDENTIAL call waits for it only within its {var}={} s bound, which had {} s \
              left",
             fmt_num(bound),
             fmt_num(left)
-        );
-        (left, Some(note))
+        )
     }
 
     /// Take the state lock within [`Self::lock_wait`]. The second value says whether another
     /// process held it at the first try, so that this one waited for it.
+    ///
+    /// A GIT_CREDENTIAL call also stops waiting as soon as its bound passes, checked against the
+    /// clock on every try: `lock_wait` turns the bound into a number of seconds before the lock
+    /// is first tried, and time that passes after that (a stall, a suspend) would otherwise
+    /// be added to the bound.
     fn lock(&self) -> Result<(state::LockGuard, bool), String> {
         let (wait, note) = self.lock_wait();
-        state::lock_within_noting(&self.paths, wait).map_err(|e| match note {
-            Some(n) => format!("{e}; {n}"),
-            None => e,
+        let left = || self.credential_left().unwrap_or(f64::INFINITY);
+        state::lock_within_noting_until(&self.paths, wait, &left).map_err(|e| {
+            let note = note.or_else(|| {
+                self.credential_left()
+                    .filter(|left| *left <= 0.0)
+                    .map(|_| self.credential_lock_note(0.0))
+            });
+            match note {
+                Some(n) => format!("{e}; {n}"),
+                None => e,
+            }
         })
     }
 

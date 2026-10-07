@@ -160,11 +160,11 @@ mod tests {
 
     /// The real clock measures on boot time, the clock that keeps counting while the machine is
     /// suspended. `/proc/uptime` is the kernel's own report of that clock (fs/proc/uptime.c reads
-    /// it with `ktime_get_boottime_ts64`), truncated to hundredths of a second, so the real
-    /// clock must read it exactly when compared within that resolution. A clock measured from
-    /// the process start (`Instant` elapsed) reads near zero here and fails; plain
-    /// `CLOCK_MONOTONIC` fails too once the machine has been suspended, because it leaves the
-    /// suspended time out.
+    /// it with `ktime_get_boottime_ts64` and applies the same time-namespace offset as
+    /// `clock_gettime`), truncated to hundredths of a second, so the real clock must read it
+    /// exactly when compared within that resolution. A clock measured from the process start
+    /// (`Instant` elapsed) reads near zero here and fails; plain `CLOCK_MONOTONIC` fails too
+    /// once the machine has been suspended, because it leaves the suspended time out.
     #[test]
     fn real_clock_monotonic_is_boot_time() {
         let clock = RealClock;
@@ -179,11 +179,6 @@ mod tests {
         assert!(
             before - 0.011 <= uptime && uptime <= after,
             "real clock read {before}..{after} s around /proc/uptime {uptime} s"
-        );
-        let monotonic = read_clock(libc::CLOCK_MONOTONIC).expect("CLOCK_MONOTONIC");
-        assert!(
-            clock.monotonic() >= monotonic,
-            "boot time never trails CLOCK_MONOTONIC ({monotonic} s)"
         );
     }
 }

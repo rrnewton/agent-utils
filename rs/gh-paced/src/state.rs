@@ -261,6 +261,17 @@ pub fn lock_within(paths: &Paths, wait_secs: f64) -> Result<LockGuard, String> {
 /// [`lock_within`], also returning whether another process held the lock at the first try, so
 /// that this one waited for it (however briefly).
 pub fn lock_within_noting(paths: &Paths, wait_secs: f64) -> Result<(LockGuard, bool), String> {
+    lock_within_noting_until(paths, wait_secs, &|| f64::INFINITY)
+}
+
+/// [`lock_within_noting`], also giving up once `left`, asked after every failed try, returns
+/// no more than 0 seconds. A caller whose own deadline was fixed before this function started
+/// passes it here, so that time passing in between (a stall, a suspend) still counts against it.
+pub fn lock_within_noting_until(
+    paths: &Paths,
+    wait_secs: f64,
+    left: &dyn Fn() -> f64,
+) -> Result<(LockGuard, bool), String> {
     ensure_dir(&paths.dir)?;
     let file = OpenOptions::new()
         .read(true)
@@ -290,7 +301,7 @@ pub fn lock_within_noting(paths: &Paths, wait_secs: f64) -> Result<(LockGuard, b
             Some(libc::EINTR) => continue,
             Some(libc::EWOULDBLOCK) => {
                 contended = true;
-                let left = deadline - crate::clock::boottime();
+                let left = (deadline - crate::clock::boottime()).min(left());
                 if left <= 0.0 {
                     return Err(format!(
                         "{} is still held by another gh-paced process after {wait} s; that \
