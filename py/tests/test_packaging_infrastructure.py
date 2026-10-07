@@ -845,9 +845,12 @@ def test_wrkslots_lifecycle_partitions_are_disjoint_and_complete() -> None:
     # an archived slot's deleted repository) are mapped.
     # The 25 validation-run liveness tests of the wrkslots liveness series
     # (merged at 8648bab6) are mapped.
-    assert len(all_tests) == 1873
+    # The two clean-caches tests of 96d9f268 (unpacked Cargo package sources and
+    # unmarked wildcard matches are kept; a nested Git repository under an
+    # unmarked match is still refused) are mapped.
+    assert len(all_tests) == 1875
     assert len(ordinary) == 290
-    assert len(mapped) == 1583
+    assert len(mapped) == 1585
     assert {
         node.split("::", 1)[1].split("[", 1)[0] for node in ordinary
     } == {
