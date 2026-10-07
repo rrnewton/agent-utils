@@ -10,6 +10,7 @@ pub mod chat_service;
 pub mod cli;
 pub mod client;
 pub mod codex_goal;
+pub(crate) mod credentials;
 pub mod error;
 pub(crate) mod inbox;
 pub mod legacy_cli;

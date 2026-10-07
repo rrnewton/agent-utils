@@ -998,6 +998,24 @@ PINS: tuple[Pin, ...] = (
         ),
     ),
     Pin(
+        "chat-credential-expiry-warning-hours",
+        "how long before a credential's notAfter `delivery-alarm.json` lists it, in hours",
+        code=(
+            Site(
+                "rs/agentctl/src/credentials.rs",
+                r"(?m)^pub\(crate\) const CREDENTIAL_EXPIRY_WARNING: Duration = Duration::from_secs\((?P<value>[\d_]+) \* 60 \* 60\);$",
+                "the Rust warning lead, in hours",
+            ),
+        ),
+        docs=(
+            Site(
+                "rs/agentctl/src/embedded_chat_userguide.md",
+                r"within\s+(?P<value>[A-Za-z\d,]+)\s+hours\s+of\s+its\s+notAfter\s+is\s+listed",
+                "the warning lead the chat guide states",
+            ),
+        ),
+    ),
+    Pin(
         "chat-provider-down-after-failures",
         "how many failures in a row put a provider path in `delivery-alarm.json` as down",
         code=(

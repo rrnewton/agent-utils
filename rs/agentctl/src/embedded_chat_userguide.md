@@ -1259,6 +1259,29 @@ failure and a retry, `delivery-alarm.json` holds it as `subscription_down` or
 routine reconnect, where the provider closes a stream and the next generation
 subscribes at once, is one failure and is never reported there.
 
+A deployment can point the plugin and the outbound helper at credential
+files, such as a TLS client certificate and key, through the variables in
+`subscription_environment` and `outbound_command.environment`. `run` checks
+each such file that it can see: every variable whose value is an absolute
+path. For each one it records whether the file exists and can be read and,
+when the file holds a PEM certificate, that certificate's notAfter. It reads
+a file only to find a `CERTIFICATE` block and reports nothing from it but the
+notAfter; a private key is not parsed. `run` logs each file once at startup,
+and `chat status` reports them all in `credentials`, each with its
+`variable`, `state` (`present`, `missing`, `unreadable` or `not_a_file`),
+`not_after_millis`, and `problem`. The path itself is never reported, here
+or in the log: the bridge keeps the values of the plugin and helper
+environment out of its state, status and log. A file that is missing,
+unreadable, expired, or within 24 hours of its notAfter is listed in
+`credential_problems` in `delivery-alarm.json` and in `chat status`'s
+`delivery_alarm`, even while the provider still works, so the problem shows
+a day before the outage. When a subscription or send failure happens while a
+file is missing, unreadable or expired, `last_error_class` names that file,
+as in `credential file missing: SOME_TLS_CERT_PATH` or
+`credential expired 12 h ago: SOME_TLS_CERT_PATH`, and the provider's own
+message stays in `last_error`. Renewing a credential is the deployment's
+job, described in its plugin's documentation; agentctl only reports it.
+
 `chat status` reports the same list in `delivery_alarm`, as
 `stall_after_seconds` and `stalled`, computed from the request records at the
 time of the call; each of its entries also carries `age_seconds`, the whole

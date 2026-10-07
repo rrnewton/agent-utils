@@ -942,6 +942,11 @@ pub fn run_with_settings<A: ManagedApi + ?Sized>(
     } else {
         None
     };
+    log_credential_files(
+        &state.credential_files(),
+        chat_runtime::unix_millis(),
+        &|line| service_log(line),
+    );
     let (notices, notice_receiver) = mpsc::sync_channel(PROVIDER_NOTICE_CAPACITY);
     let provider = match spawn_provider(
         state.clone(),
@@ -2893,6 +2898,30 @@ impl Drop for ProviderCancellationRegistration {
     }
 }
 
+/// Log, once at startup, each credential file the plugin and helper environment names: its
+/// notAfter when it is fine, or its problem.
+fn log_credential_files(
+    files: &[crate::credentials::CredentialFile],
+    now_millis: u64,
+    log: &dyn Fn(fmt::Arguments<'_>),
+) {
+    for file in files {
+        match file.describe(now_millis) {
+            Some(problem) => log(format_args!(
+                "agentctl: chat provider credential: {problem}"
+            )),
+            None => log(format_args!(
+                "agentctl: chat provider credential: {} is {}{}",
+                file.variable,
+                file.state,
+                file.not_after_millis
+                    .map(|millis| format!(", notAfter {millis} ms after the Unix epoch"))
+                    .unwrap_or_default()
+            )),
+        }
+    }
+}
+
 fn spawn_provider(
     state: BridgeState,
     stop: Arc<StopState>,
@@ -4274,6 +4303,18 @@ impl NoteLog {
 /// say pending or submitting. Last, it reads again the reply route of each request whose prompt
 /// it recorded as typed, as the loop does after a pass for the requests the pass handled:
 /// recording a prompt typed can retire its request, which ends the route.
+/// What a [`DeliveryWatch`] last wrote to `delivery-alarm.json`: the stalled requests, the lost
+/// and refused ✅ reactions, the provider paths that are down, the records it could not read,
+/// and the credential problems.
+type WrittenAlarm = (
+    DeliveryAlarm,
+    chat_runtime::LostReceiptReactions,
+    chat_runtime::RefusedReceiptReactions,
+    chat_runtime::ProviderDown,
+    Vec<&'static str>,
+    Vec<crate::credentials::CredentialProblem>,
+);
+
 struct DeliveryWatch {
     timing: DeliveryTiming,
     next_scan: Instant,
@@ -4283,13 +4324,7 @@ struct DeliveryWatch {
     // The alarm last written, so the file is written only when the list changes. `None` until a
     // write succeeds, and again from the start of each write until it succeeds: a failed write
     // can have replaced the file before it failed, so the next scan writes it again.
-    written: Option<(
-        DeliveryAlarm,
-        chat_runtime::LostReceiptReactions,
-        chat_runtime::RefusedReceiptReactions,
-        chat_runtime::ProviderDown,
-        Vec<&'static str>,
-    )>,
+    written: Option<WrittenAlarm>,
     // The value each record behind the alarm last had when read, whatever became of the alarm's
     // write: loaded from `delivery-alarm-sources.json` at the first scan, so it survives a restart,
     // and saved there when it changes. A record that a scan cannot read keeps this value; see
@@ -4534,10 +4569,15 @@ impl DeliveryWatch {
                 }
             }
         }
-        let alarm = (alarm, lost, refused, provider, unreadable);
+        // The credential files are read each scan, so a certificate that is about to expire is
+        // reported a day before the outage; see `crate::credentials`.
+        let credentials = crate::credentials::problems(&state.credential_files(), now_millis);
+        let alarm = (alarm, lost, refused, provider, unreadable, credentials);
         if self.written.as_ref() != Some(&alarm) {
             self.written = None;
-            match state.write_delivery_alarm(&alarm.0, &alarm.1, &alarm.2, &alarm.3, &alarm.4) {
+            match state
+                .write_delivery_alarm(&alarm.0, &alarm.1, &alarm.2, &alarm.3, &alarm.4, &alarm.5)
+            {
                 Ok(()) => self.written = Some(alarm),
                 Err(error) => {
                     problem.get_or_insert_with(|| {
@@ -6496,6 +6536,75 @@ printf '{"version":1,"id":"%s","action":"ensure_reaction","ok":true,"receipt":{"
         assert_eq!(
             alarm["unreadable_records"],
             serde_json::json!(["provider-health.json"])
+        );
+    }
+
+    #[test]
+    fn credential_files_reach_the_delivery_alarm_and_the_startup_log() {
+        let root = std::env::temp_dir().join(format!(
+            "agentctl-chat-service-{}-{}",
+            std::process::id(),
+            NEXT_STATE.fetch_add(1, AtomicOrdering::Relaxed)
+        ));
+        fs::create_dir(&root).expect("create fixture root");
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).expect("private fixture");
+        let state = BridgeState::initialize(
+            &root,
+            BridgeConfiguration {
+                subscription_plugin: "fixture".to_owned(),
+                subscription_environment: vec!["AGENTCTL_TEST_CERT_PATH".to_owned()],
+                channel_ids: vec!["spaces/example".to_owned()],
+                allowed_senders: vec!["users/owner".to_owned()],
+                agent_name: "coordinator".to_owned(),
+                agent_label: "coordinator".to_owned(),
+                outbound_enabled: true,
+                ack_reaction: Some("🤖".to_owned()),
+                backend_configuration: None,
+                outbound_command: None,
+            },
+        )
+        .expect("initialize state");
+        let missing = root.join("gone.pem");
+        crate::credentials::test_environment::set("AGENTCTL_TEST_CERT_PATH", Some(&missing));
+        let mut routes = RouteCache::new(Vec::new());
+        DeliveryWatch::new(DeliveryTiming::default()).scan(
+            &state,
+            &RecordingDelivery::default(),
+            &mut routes,
+        );
+        let alarm = read_alarm_at(&root);
+        let lines = Mutex::new(Vec::new());
+        let now = chat_runtime::unix_millis();
+        let record = |line: fmt::Arguments<'_>| lines.lock().expect("lines").push(line.to_string());
+        log_credential_files(&state.credential_files(), now, &record);
+        let certificate = root.join("cert.pem");
+        fs::write(
+            &certificate,
+            crate::credentials::fixtures::GENERALIZED_TIME_CERTIFICATE,
+        )
+        .expect("write certificate");
+        crate::credentials::test_environment::set("AGENTCTL_TEST_CERT_PATH", Some(&certificate));
+        log_credential_files(&state.credential_files(), now, &record);
+        fs::remove_dir_all(&root).expect("cleanup");
+        assert_eq!(
+            alarm["credential_problems"],
+            serde_json::json!([{
+                "variable": "AGENTCTL_TEST_CERT_PATH",
+                "problem": "missing",
+            }])
+        );
+        assert_eq!(
+            *lines.lock().expect("lines"),
+            [
+                "agentctl: chat provider credential: credential file missing: \
+                 AGENTCTL_TEST_CERT_PATH"
+                    .to_owned(),
+                format!(
+                    "agentctl: chat provider credential: AGENTCTL_TEST_CERT_PATH is present, \
+                     notAfter {} ms after the Unix epoch",
+                    crate::credentials::fixtures::GENERALIZED_TIME_NOT_AFTER * 1_000
+                ),
+            ]
         );
     }
 

@@ -2360,6 +2360,9 @@ struct DeliveryAlarmDocument<'a> {
     /// The records this scan could not read and had no earlier value for.
     #[serde(skip_serializing_if = "<[&str]>::is_empty")]
     unreadable_records: &'a [&'a str],
+    /// Credential files that are missing, unreadable, expired or about to expire.
+    #[serde(skip_serializing_if = "<[_]>::is_empty")]
+    credential_problems: &'a [crate::credentials::CredentialProblem],
 }
 
 /// A ✅ receipt reaction that a request earned and that is not on its message yet, saved as
@@ -5420,6 +5423,7 @@ impl BridgeState {
             acknowledgements.insert(ack_key.to_owned(), Value::from(ack_count.saturating_add(1)));
         }
         let provider_health = self.read_provider_health()?;
+        let credential_files = self.credential_files();
         let provider_down = self.provider_down_locked()?;
         Ok(serde_json::json!({
             "subscription_plugin": self.config.subscription_plugin,
@@ -5463,6 +5467,15 @@ impl BridgeState {
                 "typed_not_replied": not_replied,
                 "replied": replied,
             },
+            "credentials": credential_files
+                .iter()
+                .map(|file| serde_json::json!({
+                    "variable": file.variable,
+                    "state": file.state,
+                    "not_after_millis": file.not_after_millis,
+                    "problem": file.describe(now_millis),
+                }))
+                .collect::<Vec<_>>(),
             "provider_health": {
                 "subscription": provider_health.subscription,
                 "sends": provider_health.sends,
@@ -5475,6 +5488,8 @@ impl BridgeState {
                 "receipt_reactions_refused": self.refused_receipt_reactions_locked()?,
                 "subscription_down": provider_down.subscription_down,
                 "send_path_down": provider_down.send_path_down,
+                "credential_problems": crate::credentials::problems(&credential_files, now_millis),
+                "credential_warning_seconds": crate::credentials::CREDENTIAL_EXPIRY_WARNING.as_secs(),
             },
             "requests": requests,
             "reply_breaker": self.reply_breaker_status(),
@@ -5508,6 +5523,7 @@ impl BridgeState {
         refused: &RefusedReceiptReactions,
         provider: &ProviderDown,
         unreadable: &[&str],
+        credential_problems: &[crate::credentials::CredentialProblem],
     ) -> Result<()> {
         write_document(
             &self.root.join(DELIVERY_ALARM_FILE),
@@ -5517,6 +5533,7 @@ impl BridgeState {
                 receipt_reactions_refused: (refused.count > 0).then_some(refused),
                 provider,
                 unreadable_records: unreadable,
+                credential_problems,
             },
         )
     }
@@ -5594,6 +5611,27 @@ impl BridgeState {
         write_document(&self.root.join(PROVIDER_HEALTH_FILE), &record)
     }
 
+    /// The credential files named by the plugin and outbound helper environment, as this process
+    /// sees them now: see [`crate::credentials`].
+    pub(crate) fn credential_files(&self) -> Vec<crate::credentials::CredentialFile> {
+        let outbound = self
+            .config
+            .outbound_command
+            .iter()
+            .flat_map(|command| command.environment.iter());
+        crate::credentials::inspect(
+            self.config.subscription_environment.iter().chain(outbound),
+            crate::credentials::process_environment,
+        )
+    }
+
+    /// A credential problem that explains a provider failure at `now_millis`, if any, as the class
+    /// a failure is recorded under instead of the provider's own message.
+    fn credential_failure_explanation(&self, now_millis: u64) -> Option<String> {
+        crate::credentials::failure_explanation(&self.credential_files(), now_millis)
+            .map(|line| bounded_detail(&line, MAX_PROVIDER_ERROR_CLASS_BYTES))
+    }
+
     /// Record that a provider generation ended without subscribing, or that a subscribed one
     /// ended, with `error` saying why. The subscription stays failing until a generation
     /// subscribes: see [`Self::note_subscription_up`].
@@ -5603,7 +5641,8 @@ impl BridgeState {
             record.subscription = Some(next_failure(
                 record.subscription.take(),
                 now,
-                subscription_error_class(error),
+                self.credential_failure_explanation(now)
+                    .unwrap_or_else(|| subscription_error_class(error)),
                 error,
             ));
         })
@@ -5635,7 +5674,9 @@ impl BridgeState {
                     record.sends = Some(next_failure(
                         record.sends.take(),
                         now,
-                        bounded_detail(&failure.code, MAX_PROVIDER_ERROR_CLASS_BYTES),
+                        self.credential_failure_explanation(now).unwrap_or_else(|| {
+                            bounded_detail(&failure.code, MAX_PROVIDER_ERROR_CLASS_BYTES)
+                        }),
                         &failure.to_string(),
                     ));
                 })
@@ -27955,6 +27996,134 @@ a fence ```sh here, ~~~~ there, and one ``\u{200b}` hidden"
         assert_eq!(reported.failures, 2);
         assert_eq!(reported.last_error_class, "provider_timeout");
         assert_eq!(recovered, ProviderDown::default());
+    }
+
+    /// A state whose plugin environment names a credential file through
+    /// AGENTCTL_TEST_CERT_PATH, set on this thread to `path`.
+    fn state_with_credential(name: &str, path: &Path) -> (PathBuf, BridgeState) {
+        let root = temporary(name);
+        let mut configuration = config();
+        configuration.subscription_environment = vec!["AGENTCTL_TEST_CERT_PATH".to_owned()];
+        let state = BridgeState::initialize(&root, configuration).expect("initialize");
+        crate::credentials::test_environment::set("AGENTCTL_TEST_CERT_PATH", Some(path));
+        (root, state)
+    }
+
+    #[test]
+    fn a_missing_credential_file_names_the_subscription_failure() {
+        let directory = temporary("credential-missing-dir");
+        let missing = directory.join("gone.pem");
+        let (root, state) = state_with_credential("credential-missing", &missing);
+        for error in [
+            "subscription backend failed: example_backend: delivery channel closed",
+            "subscription backend failed: example_backend: token call failed before the fence",
+        ] {
+            state
+                .note_subscription_down(error)
+                .expect("record the subscription failing");
+        }
+        let down = state.provider_down().expect("provider down");
+        let status = state.status().expect("status");
+        fs::remove_dir_all(root).expect("cleanup");
+        fs::remove_dir_all(directory).expect("cleanup");
+        let reported = down
+            .subscription_down
+            .expect("the subscription is reported down");
+        assert_eq!(
+            reported.last_error_class,
+            "credential file missing: AGENTCTL_TEST_CERT_PATH"
+        );
+        assert!(reported
+            .last_error
+            .contains("token call failed before the fence"));
+        assert_eq!(status["credentials"][0]["state"], "missing");
+        assert_eq!(
+            status["credentials"][0]["problem"],
+            "credential file missing: AGENTCTL_TEST_CERT_PATH"
+        );
+        // The variable's value, the path, stays out of the status like every plugin
+        // environment value.
+        let rendered = serde_json::to_string(&status).expect("status JSON");
+        assert!(!rendered.contains(&missing.display().to_string()));
+        assert_eq!(
+            status["delivery_alarm"]["credential_problems"][0]["problem"],
+            "missing"
+        );
+        assert_eq!(
+            status["delivery_alarm"]["credential_warning_seconds"],
+            crate::credentials::CREDENTIAL_EXPIRY_WARNING.as_secs()
+        );
+    }
+
+    #[test]
+    fn an_expired_credential_names_the_send_failure() {
+        let directory = temporary("credential-expired-dir");
+        let certificate = directory.join("cert.pem");
+        fs::write(
+            &certificate,
+            crate::credentials::fixtures::UTC_TIME_CERTIFICATE,
+        )
+        .expect("write certificate");
+        let (root, state) = state_with_credential("credential-expired", &certificate);
+        for _ in 0..2 {
+            state
+                .note_send_outcome(Err(&authorization_failure()))
+                .expect("record a send failure");
+        }
+        let down = state.provider_down().expect("provider down");
+        let status = state.status().expect("status");
+        fs::remove_dir_all(root).expect("cleanup");
+        fs::remove_dir_all(directory).expect("cleanup");
+        let reported = down.send_path_down.expect("the send path is reported down");
+        // The fixture expired on 2026-10-05; the age in hours depends on today's date.
+        assert!(
+            reported.last_error_class.starts_with("credential expired ")
+                && reported
+                    .last_error_class
+                    .ends_with(" h ago: AGENTCTL_TEST_CERT_PATH"),
+            "{}",
+            reported.last_error_class
+        );
+        assert!(reported.last_error.contains("provider_authorization"));
+        assert_eq!(status["credentials"][0]["state"], "present");
+        assert_eq!(
+            status["credentials"][0]["not_after_millis"],
+            crate::credentials::fixtures::UTC_TIME_NOT_AFTER * 1_000
+        );
+        assert_eq!(
+            status["delivery_alarm"]["credential_problems"][0]["problem"],
+            "expired"
+        );
+    }
+
+    #[test]
+    fn a_valid_credential_leaves_the_provider_error_class_alone() {
+        let directory = temporary("credential-valid-dir");
+        let certificate = directory.join("cert.pem");
+        fs::write(
+            &certificate,
+            crate::credentials::fixtures::GENERALIZED_TIME_CERTIFICATE,
+        )
+        .expect("write certificate");
+        let (root, state) = state_with_credential("credential-valid", &certificate);
+        for _ in 0..2 {
+            state
+                .note_send_outcome(Err(&authorization_failure()))
+                .expect("record a send failure");
+        }
+        let down = state.provider_down().expect("provider down");
+        let status = state.status().expect("status");
+        fs::remove_dir_all(root).expect("cleanup");
+        fs::remove_dir_all(directory).expect("cleanup");
+        assert_eq!(
+            down.send_path_down.expect("down").last_error_class,
+            "provider_authorization"
+        );
+        assert_eq!(status["credentials"][0]["problem"], Value::Null);
+        assert_eq!(
+            status["delivery_alarm"]["credential_problems"],
+            serde_json::json!([])
+        );
     }
 
     #[test]
