@@ -531,12 +531,15 @@ mod tests {
     #[test]
     fn a_deferred_prompt_is_queued_printable_and_retimed_when_typed() {
         test_clock::set(at(MORNING + 30), EDT, "EDT");
-        let marked = deferred("2026-10-07T12:45:00Z", "The user's request arrived.");
+        let marked = deferred(
+            "2026-10-07T12:45:00Z",
+            "The user wants the lock released before starting a task.",
+        );
         let queued = queue_deferred(&marked, now_millis()).expect("deferred prompt");
         assert_eq!(
             queued,
             QueuedOpening {
-                text: "Sent 2026.10.07:08:45 EDT. The user's request arrived.".to_owned(),
+                text: "Sent 2026.10.07:08:45 EDT. The user wants the lock released before starting a task.".to_owned(),
                 sent_at: "2026-10-07T12:45:00Z".to_owned(),
                 opening: "Sent 2026.10.07:08:45 EDT. ".to_owned(),
             }
@@ -551,7 +554,7 @@ mod tests {
                 at(MORNING + 72 * 60)
             ),
             Some(
-                "Sent 2026.10.07:08:45 EDT, delivered 1 h 12 min later. The user's request arrived."
+                "Sent 2026.10.07:08:45 EDT, delivered 1 h 12 min later. The user wants the lock released before starting a task."
                     .to_owned()
             )
         );
@@ -562,7 +565,9 @@ mod tests {
             None
         );
         // A record that does not fit its text leaves the text as stored, never cut: an opening
-        // the text does not begin with, one that is not an opening, an unreadable create time.
+        // the text does not begin with (this stale one is longer than the real opening and ends
+        // inside the request, where cutting by length alone would lose its start), one that is
+        // not an opening, an unreadable create time.
         let stale = "Sent 2026.10.07:08:45 EDT, delivered 1 h 12 min later. ";
         assert_eq!(
             retime(&queued.text, &queued.sent_at, stale, at(MORNING)),

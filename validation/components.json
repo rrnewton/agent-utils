@@ -46,6 +46,7 @@
         "py/tests/test_agentctl_client_launch.py",
         "py/tests/test_agentctl_lifecycle.py",
         "py/tests/test_agentctl_mcp.py",
+        "py/tests/test_agentctl_prompt_time.py",
         "py/tests/test_agentctl_sessions.py",
         "py/tests/test_agentctl_skill_install.py",
         "py/tests/test_agentctl_submission.py",

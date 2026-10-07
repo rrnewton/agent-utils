@@ -49,6 +49,9 @@ def test_rfc3339_reads_utc_fractions_offsets_and_leap_seconds() -> None:
     "", "2026-10-07", "2026-10-07 12:45:00Z", "2026-10-07T12:45:00", "2026-10-07T12:45:00.Z",
     "2026-13-07T12:45:00Z", "2025-02-29T12:45:00Z", "2026-10-07T24:00:00Z",
     "2026-10-07T12:45:00+0400", "2026-10-07T12:45:00+24:00", "2026-10-07T12:45:00Zjunk",
+    # Digits other than ASCII ones, in the fields, the fraction and the offset.
+    "\uff12\uff10\uff12\uff16-10-07T12:45:00Z", "2026-10-07T12:45:00.\u0660Z",
+    "2026-10-07T12:45:00.5\u0661Z", "2026-10-07T12:45:00+0\u0664:00",
 ])
 def test_rfc3339_rejects_what_the_subscription_crate_rejects(value: str) -> None:
     assert prompt_time.rfc3339_instant(value) is None
@@ -68,13 +71,43 @@ def test_the_opening_matches_the_rust_drain() -> None:
     assert prompt_time.opening("yesterday", at(MORNING)) == ""
 
 
+def test_the_stamp_uses_calendar_arithmetic_under_a_leap_second_zone(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("TZ", "right/UTC")
+    time.tzset()
+    assert prompt_time.opening("2017-01-01T00:00:00Z", at(1_483_228_800)) == "Sent 2017.01.01:00:00 UTC. "
+
+
+def test_a_clock_the_rust_drain_reads_in_milliseconds_is_read_the_same_way() -> None:
+    # 119.9995 seconds after creation at millisecond resolution, 120.0000 at nanosecond.
+    queued = "Sent 2026.10.07:08:45 EDT. Request."
+    recorded = "Sent 2026.10.07:08:45 EDT. "
+    sent_at = "2026-10-07T12:45:00.0005Z"
+    assert prompt_time.retime(queued, sent_at, recorded, at(MORNING + 120, 500_000)) == queued
+    assert (prompt_time.retime(queued, sent_at, recorded, at(MORNING + 120, 1_000_000))
+            == "Sent 2026.10.07:08:45 EDT, delivered 2 min later. Request.")
+
+
+def test_retime_never_raises_once_the_prompt_is_in_flight(monkeypatch: pytest.MonkeyPatch) -> None:
+    def broken(_seconds: float | None = None) -> time.struct_time:
+        raise OverflowError("timestamp out of range for platform time_t")
+
+    monkeypatch.setattr(time, "localtime", broken)
+    queued = "Sent 2026.10.07:08:45 EDT. Request."
+    retimed = prompt_time.retime(queued, "2026-10-07T12:45:00Z", "Sent 2026.10.07:08:45 EDT. ", at(MORNING))
+    assert retimed == "Sent 2026.10.07:12:45 UTC. Request."
+
+
 def test_retime_replaces_only_the_exact_recorded_opening() -> None:
     queued = "Sent 2026.10.07:08:45 EDT. The user's request arrived."
     recorded = "Sent 2026.10.07:08:45 EDT. "
     assert (prompt_time.retime(queued, "2026-10-07T12:45:00Z", recorded, at(MORNING + 72 * 60))
             == "Sent 2026.10.07:08:45 EDT, delivered 1 h 12 min later. The user's request arrived.")
-    # A record that does not fit leaves the text as stored, never cut.
+    # A record that does not fit leaves the text as stored, never cut. The stale opening is
+    # longer than the real one and ends inside the request's text, where cutting by its length
+    # alone would lose the start of the request.
+    long_request = "Sent 2026.10.07:08:45 EDT. The user wants the lock released before starting a task."
     stale = "Sent 2026.10.07:08:45 EDT, delivered 1 h 12 min later. "
+    assert prompt_time.retime(long_request, "2026-10-07T12:45:00Z", stale, at(MORNING)) == long_request
     for sent_at, opening in [("2026-10-07T12:45:00Z", stale), ("2026-10-07T12:45:00Z", ""),
                              ("2026-10-07T12:45:00Z", "Sent"), ("soon", recorded),
                              (None, recorded), ("2026-10-07T12:45:00Z", None)]:
@@ -124,7 +157,7 @@ def test_a_prompt_the_rust_bridge_queued_is_retimed_when_python_types_it(
         "opening": "Sent 2026.10.07:08:45 EDT. ",
     })
     path.write_text(json.dumps(document))
-    monkeypatch.setattr(prompt_time.time, "time_ns", lambda: at(MORNING + 72 * 60))
+    monkeypatch.setattr(time, "time_ns", lambda: at(MORNING + 72 * 60))
     pane = _Pane()
     target = Target(pane_id="w1:p1", session_agent="codex", session_value="session-1",
                     expected_agent="codex", expected_workspace="acme", expected_cwd="/work")
