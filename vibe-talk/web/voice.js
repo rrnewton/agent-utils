@@ -79,7 +79,7 @@ const ACTIVE_CHANNEL_KEY = "vibe-talk.voice.active-channel";
  *   | "help-link-identities"
  *   | "help-link-live-messages" | "help-link-mark-own" | "help-link-microphone"
  *   | "help-link-reading-width" | "help-link-resuming" | "help-link-speech-prep"
- *   | "help-link-storage" | "jump-marker" | "jump-newest" | "load-older" | "load-older-turns"
+ *   | "help-link-storage" | "jump-marker" | "jump-newest" | "links-filter" | "load-older" | "load-older-turns"
  *   | "open-add-channel" | "open-browse-channels" | "open-help" | "open-settings"
  *   | "pinned-filter" | "post-confirm-cancel" | "post-confirm-send" | "prompts-open" | "read-aloud" | "read-new" | "read-speed" | "remove-channel"
  *   | "rename-channel" | "reply-cancel" | "reply-context-more" | "reply-send" | "save-alias"
