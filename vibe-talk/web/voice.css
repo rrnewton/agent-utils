@@ -100,22 +100,34 @@
      called it "very small": a 26px disc holding a 15px glyph. It is a 36px disc now with a glyph
      a third larger, and HIT at 48px. The hit is still an invisible margin around the disc
      (`#search-toggle::after`), so the disc can stay the size that reads as a quiet control beside
-     the pill rather than a button the size of the toggles in the dock. */
-  --search-disc: 2.25rem;
-  --search-hit: 3rem;
+     the pill rather than a button the size of the toggles in the dock.
+
+     The glass, the filters beside it, their glyphs and the space between them are in PX, not rem,
+     as a phone sizes its buttons in dp and its text in sp: a reader who asks for larger type is
+     asking for larger words, not larger buttons. In rem every one of them grew with the root font
+     and took the width from the field, the one thing on the bar that is text: with Links on, a
+     360px phone at 150% type left the field's text no room at all, and at 130% five letters. */
+  --search-disc: 36px;
+  --search-hit: 48px;
   /* The square each filter toggle in the open bar is hit by, and draws a disc the glass's size
      inside: 44px, the touch target both platforms' guidelines ask for, and no more, because two
      of them and the glass share a 360px line with the field. */
-  --toggle-hit: 2.75rem;
+  --toggle-hit: 44px;
   /* The open bar: as tall as the glass's target, so everything on it is inside it, and tall enough
-     for a 17px field. Centred on the line, it starts just inside the list (see --freshness-top). */
-  --search-bar: 3rem;
+     for a 17px field. Centred on the line, it starts just inside the list (see --freshness-top).
+     Still 3rem where that is taller: the count beside the field is type, and grows with it. */
+  --search-bar: max(var(--search-hit), 3rem);
   /* The space between the things on the open bar. */
-  --bar-gap: 0.2rem;
+  --bar-gap: 3px;
   /* How far the floating line keeps from the list's edges, and the space between pill and glass.
      Small on purpose: on a 360px phone the longest thing the pill says and the glass only just
-     share the line, and every pixel spent here comes off the end of that sentence. */
-  --float-edge: 0.5rem;
+     share the line, and every pixel spent here comes off the end of that sentence.
+
+     The edge in px with the glass (`#211 link-filter`): the glass's 48px target reaches the list's
+     edge across it and makes up the rest on the left of the disc (`#search-toggle::after`), so an
+     edge that grew with the font, against a target that does not, left no target left of the disc
+     at 150% type, where the filter beside it is. */
+  --float-edge: 8px;
   --float-gap: 0.3rem;
   /* `#206 pin-message`. A pinned row's chip and edge. GOLD, because nothing else here is: the
      reading row is `--warn` orange, the kept place and pressed toggles are `--accent` blue, and the
@@ -297,7 +309,8 @@ body {
   flex: 1 1 auto;
   align-self: stretch;
   min-width: 0;
-  padding: 0.25rem 0.75rem;
+  /* In px, as its type is: a rem inset grew with the reader's font around text that does not. */
+  padding: 4px 12px;
   background: var(--bg);
   border: 1px solid var(--edge);
   border-radius: 999px;
@@ -2380,10 +2393,11 @@ body {
   box-shadow: 0 1px 6px rgb(0 0 0 / 35%);
 }
 
-/* `#211 link-filter`: 1.3rem, up from 0.95rem — the glyph is most of what made it look small. */
+/* `#211 link-filter`: 21px, up from 0.95rem — the glyph is most of what made it look small. In px
+   with the disc around it (see --search-disc). */
 #search-toggle .icon {
-  width: 1.3rem;
-  height: 1.3rem;
+  width: 21px;
+  height: 21px;
 }
 
 /* The 48px target, drawn as nothing. A pseudo-element is part of its button for hit-testing, so a
@@ -2438,8 +2452,8 @@ body {
 #links-filter .icon,
 #pinned-filter .icon {
   position: relative;
-  width: 1.3rem;
-  height: 1.3rem;
+  width: 21px;
+  height: 21px;
 }
 
 /* ON says so twice, from the one attribute that says it to a screen reader: the pin fills in and
@@ -2474,8 +2488,9 @@ body {
 #screen-main[data-searching] #search-float {
   left: calc(var(--float-edge) + env(safe-area-inset-left));
   height: var(--search-bar);
-  /* Less on the right, where the open glass has shed its disc and its icon has air of its own. */
-  padding: 0.2rem 0.1rem 0.2rem 0.2rem;
+  /* Less on the right, where the open glass has shed its disc and its icon has air of its own. In
+     px with the controls it holds (see --search-disc). */
+  padding: 3px 2px 3px 3px;
   background: var(--panel);
   border: 1px solid var(--edge);
   border-radius: 999px;

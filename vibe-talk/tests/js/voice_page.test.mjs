@@ -6105,21 +6105,27 @@ test("the glass is DRAWN larger than the pill, with a larger glyph, and HIT at 4
   // The owner, on his phone (`#211 link-filter`): "our search button in the upper right corner is
   // very small. Let's make it a little bigger and therefore the bar that it pops up bigger too." So
   // the disc is a number of its own now, well over the pill's height, its glyph is a third larger,
-  // and the invisible square around it that takes the tap is 48px.
+  // and the invisible square around it that takes the tap is 48px. In px, all of it (see the test
+  // after this one); the pill is type, in rem, measured here at the default 16px.
   const root = cssBlock(":root");
   const rem = (name, block = root) => {
     const found = new RegExp(`${name}:\\s*([\\d.]+)rem`).exec(block);
     assert.ok(found, `${name} is not declared in rem`);
     return Number(found[1]) * 16;
   };
-  const disc = rem("--search-disc");
+  const px = (name, block = root) => {
+    const found = new RegExp(`${name}:\\s*([\\d.]+)px`).exec(block);
+    assert.ok(found, `${name} is not declared in px`);
+    return Number(found[1]);
+  };
+  const disc = px("--search-disc");
   assert.ok(disc >= 36, `the glass is drawn ${disc}px across; at 26px the owner called it very small`);
   // The pill's own box, from its tokens: 2 * 0.25rem of padding, a 1rem line, and its 2px border.
   const pill = 2 * rem("--freshness-pad") + rem("--freshness-line") + 2;
   assert.ok(disc >= pill + 8, `the glass (${disc}px) is not visibly larger than the pill (${pill}px)`);
-  const glyph = /width:\s*([\d.]+)rem/.exec(cssBlock("#search-toggle .icon"));
-  assert.ok(glyph && Number(glyph[1]) * 16 >= 20, "the glass's glyph is no larger than it was");
-  const hit = rem("--search-hit");
+  const glyph = px("width", cssBlock("#search-toggle .icon"));
+  assert.ok(glyph >= 20, "the glass's glyph is no larger than it was");
+  const hit = px("--search-hit");
   assert.ok(hit >= 48, `the glass is hit at ${hit}px, under 48px`);
   assert.ok(hit > disc, "the target is no larger than what is drawn");
   const glass = cssBlock("#search-toggle");
@@ -6152,9 +6158,10 @@ test("the glass is DRAWN larger than the pill, with a larger glyph, and HIT at 4
   // The bar it opens is bigger to match: as tall as the glass's target, so that target, and the
   // filters' squares, are inside it; a larger field; and the line placed low enough that the bar,
   // centred on it, still starts inside the list.
-  const bar = rem("--search-bar");
-  assert.ok(bar >= hit, `the open bar (${bar}px) is shorter than the glass's target (${hit}px)`);
-  assert.ok(rem("--toggle-hit") >= 44 && rem("--toggle-hit") <= bar, "a filter's square is under 44px or taller than the bar");
+  assert.match(root, /--search-bar:\s*max\(var\(--search-hit\), 3rem\);/,
+    "the open bar is not at least as tall as the glass's target, and as the count's type");
+  const bar = Math.max(hit, 48);
+  assert.ok(px("--toggle-hit") >= 44 && px("--toggle-hit") <= bar, "a filter's square is under 44px or taller than the bar");
   const size = /font-size:\s*(\d+)px/.exec(cssBlock(".search-field"));
   assert.ok(size && Number(size[1]) >= 17, "the field's text is no larger than it was");
   assert.match(
@@ -6168,6 +6175,37 @@ test("the glass is DRAWN larger than the pill, with a larger glyph, and HIT at 4
     /padding-top:\s*calc\(var\(--float-line\) \+ max\(var\(--freshness-box\), var\(--search-disc\)\) \/ 2\)/,
     "the room at the head of the list is the pill's alone, so the larger glass sits on the first row"
   );
+});
+
+test("the bar's buttons stay their size under a larger font, so the field keeps room for what is typed", () => {
+  // `#211 link-filter`, from review. The glass, its target, the filter squares, their glyphs, the
+  // space between them and the field's own inset were all in rem, so a reader's larger system font
+  // (the suite stands it in by the root font, as `MENU_SCALES` in tests/offline_cache_browser.py
+  // does) grew every one of them, and every pixel they grew came off the field, the only thing on
+  // the bar that is text. With Links on — which puts the count up with nothing typed — a 360px
+  // phone at 150% type left the field 38px wide, its text area none at all; at 130%, 79px. A phone
+  // sizes its buttons in dp and its type in sp: larger type asks for larger words, not larger
+  // buttons. tests/offline_cache_browser.py measures the field at those sizes in Chromium.
+  const root = cssBlock(":root");
+  // --float-edge too: the glass's target reaches the list's edge across it, and makes up the rest of
+  // its 48px on the left of the disc, where the filter beside it is.
+  for (const token of ["--search-disc", "--search-hit", "--toggle-hit", "--bar-gap", "--float-edge"]) {
+    assert.match(root, new RegExp(`${token}:\\s*[\\d.]+px;`), `${token} grows with the reader's font`);
+  }
+  for (const selector of ["#search-toggle .icon", "#links-filter .icon", "#pinned-filter .icon"]) {
+    const block = cssBlock(selector);
+    assert.match(block, /width:\s*\d+px/, `${selector} grows with the reader's font`);
+    assert.match(block, /height:\s*\d+px/, `${selector} grows with the reader's font`);
+  }
+  // The field's inset follows its type, which is px for iOS's sake (see `.search-field`).
+  assert.match(cssBlock(".search-field"), /padding:\s*\d+px \d+px;/, "the field's inset grows around text that does not");
+  assert.match(cssBlock("#screen-main[data-searching] #search-float"), /padding:\s*\d+px \d+px \d+px \d+px;/,
+    "the open bar's inset grows with the reader's font");
+  // ...and nothing on the bar is sized by another rem in their place.
+  for (const selector of ["#search-toggle", "#links-filter", "#pinned-filter", "#screen-main[data-searching] #search-toggle"]) {
+    assert.doesNotMatch(cssBlock(selector), /(width|height|margin[\w-]*|inset):[^;]*\drem/,
+      `${selector} is sized in rem`);
+  }
 });
 
 test("with no header on screen, the body applies the top safe-area inset itself", () => {
@@ -26793,6 +26831,42 @@ test("every form of link is found, named as written or by its address, and only 
     const href = node.getAttribute("href");
     if (href !== null) assert.match(href, /^https?:\/\//, `an href of ${href}`);
   }
+});
+
+test("reading the links out of a message takes time that grows with its length, not with its square", async () => {
+  // `#211 link-filter`, from review. Taking a bare address's unpaired closers off its end counted
+  // the brackets of the whole address again for each one taken, and a bare address runs to the end
+  // of its message: one address followed by 40,000 `)` — the longest message Slack allows, and
+  // anyone in the channel can post it — took 15s in Node, on the page's one thread, and again on
+  // every redraw of the row while Links is on. Two scans read a long way for an address that was
+  // never going to pass: a run of `https:///` was read to its end once per repeat (1.9s), and a run
+  // of `[a](` read the longest target for every bracket (0.6s). And a Markdown target that does start
+  // as an address is read a character at a time, up to LINK_TARGET_MAX for every bracket (0.2s).
+  const page = newPage();
+  await signIn(page);
+  const contents = [
+    `see https://example.com/paren${")".repeat(40000)}`,
+    `see https://example.org/square${"]".repeat(40000)}`,
+    `see https://example.com/(both)${"(".repeat(100)}${")".repeat(39900)}`,
+    "https:///".repeat(4444),
+    "[a](".repeat(10000),
+    "[a](https://example.com/(<".repeat(1500),
+  ];
+  const rows = await showDiscord(page, contents.map((content, i) => message({ id: String(9100 + i), content })));
+  const started = performance.now();
+  await showLinks(page);
+  const took = performance.now() - started;
+  // Still read right, at the edge of each: the closers with no partner go, the ones with one stay.
+  assert.deepStrictEqual(linkPairs(rows[0]).map(([, href]) => href), ["https://example.com/paren"]);
+  assert.deepStrictEqual(linkPairs(rows[1]).map(([, href]) => href), ["https://example.org/square"]);
+  assert.deepStrictEqual(linkPairs(rows[2]).map(([, href]) => href),
+    [`https://example.com/(both)${"(".repeat(100)}${")".repeat(100)}`]);
+  assert.deepStrictEqual(linkPairs(rows[3]), [], "an address with no host became a link");
+  assert.deepStrictEqual(linkPairs(rows[4]), [], "a bracket with no address became a link");
+  assert.deepStrictEqual(linkPairs(rows[5]).map(([, href]) => href), ["https://example.com/("]);
+  // Generous, because this host may be loaded: all six take tens of milliseconds here, and the
+  // first one alone took fifteen seconds.
+  assert.ok(took < 1500, `reading the links out of six 40,000-character messages took ${Math.round(took)}ms`);
 });
 
 test("the Links view shows only the rows that hold a link, each with ONLY its links, one per line", async () => {

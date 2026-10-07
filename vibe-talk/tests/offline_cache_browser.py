@@ -80,7 +80,10 @@ And where a phone reader's own settings wrap a row's meta line — the page zoom
 viewport, or the root font at 115%, 130% and 150% — every row's ⋯ menu, and the pinned row's in the
 Pinned filter, opens wholly on the screen with every item a thumb can reach, in both provider shapes,
 and that row's Unpin is tapped for real. A menu hung from the "⋯" opened off the left of the screen
-wherever the "⋯" wrapped to the start of a line.
+wherever the "⋯" wrapped to the start of a line. Under the same settings, at 360px and 412px, the open
+search bar with Links on and its count up keeps the glass full size and each filter a 44px target, and
+its field still leaves room for a query's text, which buttons that grew with the font took away; the
+Links view under it shows each link on its own 44px line, clear of the bar.
 
 Then, in a second fresh profile at each size, a channel whose foot holds five replies to messages
 above them (`#204 reply-arrow`): from the owner, the agent and a third party, and between them in
@@ -117,7 +120,7 @@ from typing import TYPE_CHECKING
 from urllib.parse import parse_qs, unquote, urlsplit
 
 if TYPE_CHECKING:
-    from playwright.sync_api import BrowserType, FloatRect, Route
+    from playwright.sync_api import BrowserType, FloatRect, Page, Route
 
 
 WEB_ROOT = Path(__file__).resolve().parents[1] / "web"
@@ -135,6 +138,11 @@ LONG_TITLE = f"Overnight coordinator for the release lane #link {LONG_TOKEN}"
 # `#211 link-filter`. The smallest the search glass may be drawn. It was the freshness pill's height,
 # 26px, until the owner called it "very small" on his phone.
 GLASS_MIN_PX = 36
+# `#211 link-filter`, from review. The least room the search field may leave for its TEXT — inside its
+# own padding — on the open bar with both filters and a count beside it: seven characters of its 17px
+# type, about 8.5px each, a word or two of a query. Measured where a reader's own settings narrow the
+# line (`BAR_SCALES`), where buttons sized in rem once left it none at all.
+FIELD_TEXT_MIN_PX = 60
 Json = dict[str, object]
 
 
@@ -860,9 +868,12 @@ REPLY_ROW_JS = """(id) => {""" + FLOAT_HELPERS_JS + """
 # Pinned where the view has pins, then the glass, each immediately beside the next and on the glass's
 # line, each a whole 44px box every point of which presses it, meeting neither its neighbours, the
 # glass nor the field. The glass's own centre is still the glass, and so is the strip of its 48px
-# target just left of its disc, which no filter's box may cover. The field is still 140px wide with
-# both filters and the count beside it. `pinned` says whether Pinned should be on the bar.
-FILTER_BAR_JS = """(pinned) => {""" + FLOAT_HELPERS_JS + """
+# target just left of its disc, which no filter's box may cover. The field is still `fieldMin` px wide
+# with both filters and the count beside it — 140 at the ordinary type size — and whatever the size,
+# leaves FIELD_TEXT_MIN_PX inside its padding for what is typed. `pinned` says whether Pinned should be
+# on the bar.
+FILTER_BAR_JS = """({pinned, fieldMin}) => {""" + FLOAT_HELPERS_JS + f"""
+    const FIELD_TEXT_MIN_PX = {FIELD_TEXT_MIN_PX};""" + """
     const problems = [];
     const mid = (r) => (r.top + r.bottom) / 2;
     const bar = document.getElementById('search-float'), field = document.getElementById('search-field');
@@ -870,7 +881,7 @@ FILTER_BAR_JS = """(pinned) => {""" + FLOAT_HELPERS_JS + """
     const filters = ['links-filter', 'pinned-filter'].map((id) => document.getElementById(id)).filter(shown);
     const wanted = pinned ? 'links-filter pinned-filter' : 'links-filter';
     if (filters.map((f) => f.id).join(' ') !== wanted) {
-        return {problems: [`the open bar holds ${filters.map(name).join(', ') || 'no filter'}, not ${wanted}`], field: 0};
+        return {problems: [`the open bar holds ${filters.map(name).join(', ') || 'no filter'}, not ${wanted}`], field: 0, text: 0};
     }
     const g = box(glass), b = box(bar), fl = box(field);
     filters.forEach((filter, i) => {
@@ -892,12 +903,15 @@ FILTER_BAR_JS = """(pinned) => {""" + FLOAT_HELPERS_JS + """
             }
         }
     });
-    if (fl.width < 140) problems.push(`the field is ${Math.round(fl.width)}px wide beside the filters`);
+    if (fl.width < fieldMin) problems.push(`the field is ${Math.round(fl.width)}px wide beside the filters`);
+    const inside = getComputedStyle(field);
+    const text = field.clientWidth - parseFloat(inside.paddingLeft) - parseFloat(inside.paddingRight);
+    if (text < FIELD_TEXT_MIN_PX) problems.push(`the field leaves ${text.toFixed(1)}px for its text beside the filters`);
     for (const [x, why] of [[(g.left + g.right) / 2, 'centre'], [g.left - 2, 'target just left of its disc']]) {
         const hit = document.elementFromPoint(x, mid(g));
         if (!hit || !glass.contains(hit)) problems.push(`the glass's ${why} lands on ${name(hit)}`);
     }
-    return {problems, field: fl.width};
+    return {problems, field: fl.width, text};
 }"""
 
 # `#211 link-filter`. The Links view as it is drawn, the list scrolled to its top: which rows are on
@@ -1118,6 +1132,23 @@ PROFILES = (("phone", 412, 915, True), ("phone-360", 360, 800, True), ("desktop"
 MENU_SCALES = (("zoom-313", 313, 680, 100), ("font-115", 360, 800, 115), ("font-130", 412, 915, 130),
                ("font-150", 360, 800, 150))
 
+# `#211 link-filter`, from review. The same settings on the open search bar, with Links on and so its
+# count up: at 360px, where the field is narrowest, at every type size, and at 130% on 412px too. The
+# glass and the filters were sized in rem, so the larger font grew them and the field gave up the width
+# — none left for its text at 150%. They are px now, and the field keeps the rest.
+BAR_SCALES = (("zoom-313", 313, 680, 100), ("font-115", 360, 800, 115), ("font-130", 360, 800, 130),
+              ("font-130-412", 412, 915, 130), ("font-150", 360, 800, 150))
+
+
+def larger_root_font(page: Page, root_percent: int) -> None:
+    """Stand in for a phone reader's larger system font: every rem on the page follows the root's."""
+    if root_percent != 100:
+        page.add_init_script(
+            "document.addEventListener('DOMContentLoaded', () => {"
+            " const larger = document.createElement('style');"
+            f" larger.textContent = 'html {{ font-size: {root_percent}% !important; }}';"
+            " document.head.append(larger); });")
+
 
 def main() -> int:
     args = arguments()
@@ -1174,6 +1205,12 @@ def main() -> int:
             print(f"{label} at {width}x{height}, root font {root_percent}%: every row's ⋯ menu, the pinned"
                   " row's in the Pinned filter too, on the screen with full-size items a tap reaches, in"
                   " both provider shapes, and Unpin tapped for real")
+        for label, width, height, root_percent in BAR_SCALES:
+            text = links_bar_walk(playwright.chromium, args, label, width, height, root_percent)
+            print(f"{label} at {width}x{height}, root font {root_percent}%: the open bar with Links on and its"
+                  f" count up — the glass at least {GLASS_MIN_PX}px, Links and Pinned 44px targets beside it,"
+                  f" the field leaving {text:.0f}px for its text (at least {FIELD_TEXT_MIN_PX}) — and every"
+                  " link on its own 44px line, clear of the bar")
     return 0
 
 
@@ -1975,12 +2012,7 @@ def menu_walk(chromium: BrowserType, args: argparse.Namespace, label: str, width
                     is_mobile=True, has_touch=True, color_scheme="dark",
                 )
                 page = context.pages[0]
-                if root_percent != 100:
-                    page.add_init_script(
-                        "document.addEventListener('DOMContentLoaded', () => {"
-                        " const larger = document.createElement('style');"
-                        f" larger.textContent = 'html {{ font-size: {root_percent}% !important; }}';"
-                        " document.head.append(larger); });")
+                larger_root_font(page, root_percent)
                 errors: list[str] = []
                 page.on("pageerror", lambda error: errors.append(str(error)))
 
@@ -2134,10 +2166,10 @@ def pin_walk(chromium: BrowserType, args: argparse.Namespace, label: str, width:
             # The Pinned filter on the open bar, before and after the count takes its room.
             tap("#search-toggle")
             until("() => !document.getElementById('pinned-filter').hidden", "the open bar has no Pinned filter")
-            bare = page.evaluate(FILTER_BAR_JS, True)
+            bare = page.evaluate(FILTER_BAR_JS, {"pinned": True, "fieldMin": 140})
             check(not bare["problems"], f"{label}, the filters on the open bar: {bare['problems']}")
             page.fill("#search-field", "a")
-            counted = page.evaluate(FILTER_BAR_JS, True)
+            counted = page.evaluate(FILTER_BAR_JS, {"pinned": True, "fieldMin": 140})
             shot("3-filter-beside-glass")
             check(not counted["problems"], f"{label}, the filters beside a count: {counted['problems']}")
             page.fill("#search-field", "")
@@ -2242,10 +2274,10 @@ def links_walk(chromium: BrowserType, args: argparse.Namespace, label: str, widt
             # The open bar: Links, then Pinned, then the glass; then the same with a count beside them.
             tap("#search-toggle")
             until("() => !document.getElementById('links-filter').hidden", "the open bar has no Links filter")
-            bare = page.evaluate(FILTER_BAR_JS, True)
+            bare = page.evaluate(FILTER_BAR_JS, {"pinned": True, "fieldMin": 140})
             check(not bare["problems"], f"{label}, the filters on the open bar: {bare['problems']}")
             page.fill("#search-field", "a")
-            counted = page.evaluate(FILTER_BAR_JS, True)
+            counted = page.evaluate(FILTER_BAR_JS, {"pinned": True, "fieldMin": 140})
             shot("2-bar-with-count")
             check(not counted["problems"], f"{label}, the filters beside a count: {counted['problems']}")
             page.fill("#search-field", "")
@@ -2308,12 +2340,89 @@ def links_walk(chromium: BrowserType, args: argparse.Namespace, label: str, widt
             page.wait_for_selector("#pane-voice", state="visible", timeout=5_000)
             tap("#search-toggle")
             until("() => !document.getElementById('links-filter').hidden", "the call view's bar has no Links filter")
-            alone = page.evaluate(FILTER_BAR_JS, False)
+            alone = page.evaluate(FILTER_BAR_JS, {"pinned": False, "fieldMin": 140})
             shot("5-call-view-bar")
             check(not alone["problems"], f"{label}, the call view's bar: {alone['problems']}")
             check(not errors, f"{label}, links: the page threw: {errors}")
             check(opened == ["https://example.org/diff/7"], f"{label}: the walk opened {opened}")
             context.close()
+    finally:
+        api.stopping.set()
+        server.shutdown()
+        server.server_close()
+        thread.join()
+
+
+def links_bar_walk(chromium: BrowserType, args: argparse.Namespace, label: str, width: int, height: int,
+                   root_percent: int) -> float:
+    """`#211 link-filter`: the open bar with Links on, where a reader's own settings narrow the line.
+
+    A phone in the dark theme at one of `BAR_SCALES`. A real tap opens the bar and another turns Links
+    on, which puts the count up with nothing typed, so the bar holds everything it ever holds: the
+    field, the count, Links, Pinned and the glass. The glass is still its full size, each filter a 44px
+    target clear of its neighbours, and the field still leaves room for a query's text; the Links view
+    under the bar shows each link on its own 44px line, none of it under the bar. Answers the room the
+    field leaves for its text.
+    """
+    api = LinkApi()
+    server = ThreadingHTTPServer(("127.0.0.1", 0), handler_for(api))
+    server.daemon_threads = True
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    shape = f"{label}, the open bar"
+    try:
+        with tempfile.TemporaryDirectory(prefix="vibe-talk-chrome-bar-") as profile:
+            context = chromium.launch_persistent_context(
+                profile, headless=True, executable_path=args.browser_executable,
+                viewport={"width": width, "height": height}, device_scale_factor=2.625,
+                is_mobile=True, has_touch=True, color_scheme="dark",
+            )
+            page = context.pages[0]
+            larger_root_font(page, root_percent)
+            errors: list[str] = []
+            page.on("pageerror", lambda error: errors.append(str(error)))
+
+            def until(script: str, why: str) -> None:
+                deadline = time.monotonic() + 10
+                while time.monotonic() < deadline and not page.evaluate(script):
+                    page.wait_for_timeout(50)
+                check(bool(page.evaluate(script)), f"{shape}: {why}")
+
+            def tap(selector: str) -> None:
+                found = page.evaluate(f"() => {{ const b = document.querySelector({json.dumps(selector)})"
+                                      ".getBoundingClientRect(); return [b.left + b.width / 2, b.top + b.height / 2]; }")
+                page.touchscreen.tap(float(found[0]), float(found[1]))
+
+            page.goto(f"http://127.0.0.1:{server.server_port}/voice", wait_until="load")
+            page.fill("#api-token", TOKEN)
+            page.click("#save-token")
+            page.wait_for_selector("#search-toggle", state="visible", timeout=10_000)
+            page.click("#view-switch")
+            until("() => document.querySelectorAll('#discord-log > li[data-id]').length === 5", "the channel did not open")
+            tap("#search-toggle")
+            until("() => !document.getElementById('links-filter').hidden", "the open bar has no Links filter")
+            tap("#links-filter")
+            until("() => document.getElementById('links-filter').getAttribute('aria-pressed') === 'true'",
+                  "a tap on Links did not turn it on")
+            until("() => document.querySelectorAll('#discord-log > li[data-links-view=\"true\"]').length === 3",
+                  "the rows with links did not show their links")
+            until("() => document.getElementById('search-count').textContent === '3 of 5 loaded'",
+                  "the count is not up beside the field")
+            glass = page.evaluate("() => { const b = document.getElementById('search-toggle').getBoundingClientRect();"
+                                  " return [b.width, b.height]; }")
+            check(float(glass[0]) >= GLASS_MIN_PX and float(glass[1]) >= GLASS_MIN_PX,
+                  f"{shape}: the glass is {glass[0]}x{glass[1]}px, under {GLASS_MIN_PX}px")
+            bar = page.evaluate(FILTER_BAR_JS, {"pinned": True, "fieldMin": 0})
+            view = page.evaluate(LINK_VIEW_JS)
+            if args.screenshots:
+                page.screenshot(path=str(args.screenshots / f"{label}-bar-links-on.png"))
+            check(not bar["problems"], f"{shape}, with Links on: {bar['problems']}")
+            check(not view["problems"], f"{shape}, the Links view under it: {view['problems']}")
+            shown = sorted(str(row[0]) for row in view["rows"])
+            check(shown == ["200", "202", "203"], f"{shape}: the Links view shows rows {shown}")
+            check(not errors, f"{shape}: the page threw: {errors}")
+            context.close()
+            return float(bar["text"])
     finally:
         api.stopping.set()
         server.shutdown()

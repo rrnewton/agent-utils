@@ -1957,6 +1957,23 @@ let placeBeforeLinks = null;
 const HTTP_ADDRESS = /^https?:\/\/[^\s/?#\\]*[\p{L}\p{N}]/iu;
 
 /**
+ * The same test where an address would START, asked before it is read any further. It changes no
+ * answer — whatever passes `HTTP_ADDRESS` passed this at its start — but a bare address and a
+ * Markdown target are both read to their ends before that test, and one that was never going to
+ * pass was read that far for nothing: a message of `https:///` repeated was read to its end once
+ * per repeat (1.9s for 40,000 characters, its brackets counted each time), and one of `[a](`
+ * repeated read LINK_TARGET_MAX characters for every bracket (0.6s). Asked first, each costs only
+ * its own host.
+ */
+const HTTP_ADDRESS_AT = /https?:\/\/[^\s/?#\\]*[\p{L}\p{N}]/iuy;
+
+/** Whether `text` holds an address that could pass `HTTP_ADDRESS` starting at `at`. */
+function addressStartsAt(text, at) {
+  HTTP_ADDRESS_AT.lastIndex = at;
+  return HTTP_ADDRESS_AT.test(text);
+}
+
+/**
  * A bare address, from its scheme to the first character no address contains as written: a space,
  * an angle bracket, a double quote, a backtick or a bar (which ends one inside `<…|name>`).
  */
@@ -1982,23 +1999,39 @@ const TRAILING = new Set([".", ",", ";", ":", "!", "?", "'", "\"", "*", "_", "~"
 const LINK_NAME_MAX = 500;
 const LINK_TARGET_MAX = 4096;
 
-const occurrences = (text, character) => text.split(character).length - 1;
-
 /**
  * A bare address with what follows it in the sentence taken off: trailing punctuation, and a
  * closing parenthesis or bracket that has no partner inside the address — `(see https://x.org)` —
  * while one that does is kept, as in `https://en.wikipedia.org/wiki/Mercury_(planet)`.
+ *
+ * THE BRACKETS ARE COUNTED ONCE, and the counts kept as characters come off the end. Counting the
+ * whole address again for every character taken off read a run of closers once per closer, and a
+ * bare address runs to the end of its message: one address followed by 40,000 `)` — the longest
+ * message Slack allows — took 15s in Node, on the page's one thread, and again on every redraw of
+ * the row while Links is on. Counted once, it takes a few milliseconds.
  */
 function trimAddress(candidate) {
-  let address = candidate;
+  let [opens, closes, squareOpens, squareCloses] = [0, 0, 0, 0];
+  for (let i = 0; i < candidate.length; i += 1) {
+    const character = candidate[i];
+    if (character === "(") opens += 1;
+    else if (character === ")") closes += 1;
+    else if (character === "[") squareOpens += 1;
+    else if (character === "]") squareCloses += 1;
+  }
+  let end = candidate.length;
   for (;;) {
-    const last = address[address.length - 1];
-    if (TRAILING.has(last) ||
-        (last === ")" && occurrences(address, "(") < occurrences(address, ")")) ||
-        (last === "]" && occurrences(address, "[") < occurrences(address, "]"))) {
-      address = address.slice(0, -1);
+    const last = candidate[end - 1];
+    if (TRAILING.has(last)) {
+      end -= 1;
+    } else if (last === ")" && opens < closes) {
+      closes -= 1;
+      end -= 1;
+    } else if (last === "]" && squareOpens < squareCloses) {
+      squareCloses -= 1;
+      end -= 1;
     } else {
-      return address;
+      return candidate.slice(0, end);
     }
   }
 }
@@ -2031,6 +2064,7 @@ function markdownLinkAt(text, start) {
     while (text[at] === " " || text[at] === "\t") at += 1;
   };
   skipBlanks();
+  if (!addressStartsAt(text, text[at] === "<" ? at + 1 : at)) return null;
   let href = "";
   if (text[at] === "<") {
     const shut = text.indexOf(">", at);
@@ -2041,8 +2075,12 @@ function markdownLinkAt(text, start) {
     const from = at;
     let parens = 0;
     for (; at < text.length && at - from <= LINK_TARGET_MAX; at += 1) {
+      // A space by `\s`, the ASCII ones answered without the pattern: a message of
+      // `[a](https://a/(<` repeated reads LINK_TARGET_MAX characters for every bracket, and asking
+      // the pattern of every one of them made 40,000 characters take 180ms rather than tens.
+      const code = text.charCodeAt(at);
+      if (code === 32 || (code >= 9 && code <= 13) || (code > 127 && /\s/.test(text[at]))) break;
       const character = text[at];
-      if (/\s/.test(character)) break;
       if (character === "(") {
         parens += 1;
       } else if (character === ")") {
@@ -2075,6 +2113,7 @@ function angleLinkAt(text, start) {
 /** The bare address starting at `start`, as `{href, name, end}` with no name, or null. */
 function bareLinkAt(text, start) {
   if (start > 0 && WORD_BEFORE.test(text[start - 1])) return null;
+  if (!addressStartsAt(text, start)) return null;
   BARE_ADDRESS.lastIndex = start;
   const match = BARE_ADDRESS.exec(text);
   if (!match) return null;

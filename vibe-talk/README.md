@@ -2659,9 +2659,12 @@ is a 36px disc now, hit at 48px, and the bar it opens is 48px tall with a 17px f
 grows along that line into a bar across the top of the list — field, count, the Links and Pinned
 filters, and the glass again to close it — which is also the one place an on-screen keyboard never
 covers. With both filters on a 360px phone the count takes two short lines, "2 of 13" over
-"loaded", so the field keeps 140px. The pill steps aside while the bar is open, and the list makes
-room for the bar at its head so the first match is never underneath it. A reader who moved the
-control bar to the top keeps it there while searching: the field no longer shares that row.
+"loaded", so the field keeps 140px. The glass and the filters keep those sizes under a larger
+system font, the way a phone's own buttons do: the text on the bar grows, and the buttons do not
+take the field's room for it, so at 150% type the field still shows what is typed. The pill steps
+aside while the bar is open, and the list makes room for the bar at its head so the first match is
+never underneath it. A reader who moved the control bar to the top keeps it there while searching:
+the field no longer shares that row.
 
 **Every term has to match**, and matching is substring rather than whole-word: a second word is
 typed to narrow, and "runner" has to find "runners". **Double quotes group words into one term**,
