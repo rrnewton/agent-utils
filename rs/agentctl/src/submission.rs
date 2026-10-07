@@ -852,11 +852,13 @@ pub fn submit_verified(
                                 break;
                             }
                         }
-                        if runtime.cancelled() {
-                            break;
-                        }
+                        // A wait that has run its course is complete even if a stop arrives with
+                        // its last read; only a stop before that cuts it short.
                         if runtime.monotonic() >= grace_deadline {
                             receipt.settled = clear;
+                            break;
+                        }
+                        if runtime.cancelled() {
                             break;
                         }
                         runtime.sleep(POLL);
@@ -2363,6 +2365,27 @@ mod tests {
             &runtime,
         ));
         assert!(!held.printed && !held.settled, "{held:?}");
+    }
+
+    #[test]
+    fn a_stop_arriving_with_the_last_read_of_a_complete_wait_still_settles() {
+        // Weak evidence at 100 ms; the wait's last read at 2,100 ms comes with a stop.
+        let busy = claude_screen(&["• earlier"], "", BUSY_STATUS);
+        let staged = claude_screen(&["• earlier"], "run the tests", BUSY_STATUS);
+        let frames = Frames::new(busy.clone(), staged, vec![busy]);
+        let runtime = StoppingClock {
+            clock: Clock::default(),
+            stop_after: POLL + PRINT_GRACE,
+        };
+        let held = receipt(submit_verified(
+            &frames,
+            "w1:p1",
+            "claude",
+            "run the tests",
+            SubmitTimeouts::default(),
+            &runtime,
+        ));
+        assert!(!held.printed && held.settled, "{held:?}");
     }
 
     #[test]
