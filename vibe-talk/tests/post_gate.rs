@@ -744,6 +744,7 @@ async fn the_read_scope_tool_list_is_unchanged() {
     assert_eq!(
         names,
         [
+            "recent_activity",
             "list_channels",
             "digest_channel",
             "read_page",

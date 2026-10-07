@@ -309,7 +309,7 @@ Two things are worth knowing before you begin, because they shape everything els
 | Web app: text tab, digest, find-a-message, local speech | **works** |
 | Device speech for the message view's Read control | **prototype.** Uses browser-reported local voices without ElevenLabs credentials. Playback, cancellation, and failures have automated browser coverage; physical-phone audio and background playback remain device checks. |
 | Main, All, a selected thread from the bar's picker, and bottom composer | **works.** Native thread endpoints have loopback HTTP tests; a compatible Google Chat bridge has been exercised with real read-only traffic. Browser interaction and layout were checked at two phone sizes. Posting tests use local fakes. |
-| **MCP over Streamable HTTP at `/mcp`** | **works.** Bearer-authenticated, stateless, seven tools, tested end to end. Never yet driven by a real ElevenLabs agent. |
+| **MCP over Streamable HTTP at `/mcp`** | **works.** Bearer-authenticated, stateless, eight tools, tested end to end. Never yet driven by a real ElevenLabs agent. |
 | ElevenLabs voice agent | **reachable, and currently NOT invoking tools.** A real agent has now been driven headlessly (`scripts/run.sh --smoke-agent`): the signed URL mints, the conversation opens, the agent answers — and it calls no tool, saying its tools "appear to be out of date". In the same conversation ElevenLabs reports our MCP server connected with all five tools visible, so the fault is in the agent's own configuration rather than in this server. |
 | **Signed conversation URLs at `/api/v1/signed-url`** | **works against a fake, unverified against live ElevenLabs.** Mints a short-lived signed URL for an agent that has "Enable Authentication" turned on, and `/voice` is a dependency-free page that uses one. Tested end to end against an in-memory ElevenLabs that refuses a wrong key and an unknown agent, and against a loopback HTTP server that proves the account key travels in a header. |
 | Slow path (ask a coding agent for detail) | **seam only.** The route exists and answers HTTP 501 with an explanation. |
@@ -1562,6 +1562,7 @@ own adapter-only token; every other route uses the read/write tokens described a
 |---|---|---|---|
 | GET | `/healthz` | none | liveness |
 | GET | `/api/v1/channels` | read | configured channels |
+| GET | `/api/v1/activity?hours=&per_channel_limit=` | read | every listed channel's last few hours in one read, the newest message named: the route behind `recent_activity` — see "The eight tools" |
 | POST | `/api/v1/channels` | **write** | direct mode: `{id,label,writable}`; managed mode: `{source,label}` — validate and add a tracked channel |
 | GET | `/api/v1/channel-directory?q=&limit=&cursor=` | **write** | managed mode: one page of the channels the bridge can see, each marked `tracked` when already a channel here |
 | DELETE | `/api/v1/channels/{id}` | **write** | take a channel off the list: one added in the app is forgotten (managed mode also unregisters it upstream); one from the configuration file is hidden — see "Taking a channel off the list" |
@@ -1580,9 +1581,9 @@ own adapter-only token; every other route uses the read/write tokens described a
 | GET | `/api/v1/channels/{id}/messages/{message_id}` | read | one message in full |
 | GET | `/api/v1/channels/{id}/digest?limit=&width=` | read | one speakable line per message |
 | GET | `/api/v1/channels/{id}/messages/{message_id}/summary` | read | one message summarised, from cache when it can be |
-| GET | `/api/v1/channels/{id}/page?limit=&before=&since=&until=` | read | **one step of a walk**, saying that it is one |
+| GET | `/api/v1/channels/{id}/page?limit=&before=&since=&until=&hours=` | read | **one step of a walk**, saying that it is one |
 | GET | `/api/v1/channels/{id}/timeline?view=&thread_id=&limit=&before=&after=` | read | main channel, thread list, flattened history, or one thread; opaque backward cursor, or `after=` for what changed since a newest read: `400 cursor_mismatch` for a cursor from another channel, view or thread, `410 cursor_expired` for one the backend can no longer continue — read the newest page again (`#203 incremental-refresh`) |
-| GET | `/api/v1/channels/{id}/count?since=&cap=` | read | a bounded, honest count |
+| GET | `/api/v1/channels/{id}/count?since=&hours=&cap=` | read | a bounded, honest count |
 | POST | `/api/v1/channels/{id}/resolve` | read | **semantic random access** |
 | POST | `/api/v1/channels/{id}/reply` | **write** | `{text, thread_id?, reply_to?, idempotency_key?}` — post to the channel or selected thread; quoting a message is optional. A split post that fails part-way answers `207` with `{posted, unsent, retryable, resumable}`; `idempotency_key` (1–64 of `A-Z a-z 0-9 - _`) names the post across attempts, and where client-config reports `idempotent_posts_supported` the same key and text are posted at most once (`#195 send-resilience`). `unsent` is the request's own text when nothing posted; `resumable` says whether sending `unsent` again repeats the failed part under the same words and key, which a split code block can prevent |
 | POST | `/api/v1/channels/{id}/ask` | **write** | slow path — answers 501 in v0 |
@@ -1643,7 +1644,11 @@ they are included, because addressing another coding agent is a legitimate reply
 **A page says that it is a page.** `GET .../page` answers with `returned`, `has_more`, and —
 when there is more — `next_before` or `next_since`, whichever continues the walk it was asked
 for. Two modes, and they cannot be mixed: `before=<id>` steps backwards from a cursor, and
-`since=`/`until=` (ISO-8601, start inclusive, end exclusive) jumps to a period. A page tops out at
+`since=`/`until=` (ISO-8601, start inclusive, end exclusive) jumps to a period. `hours=` (1 to 168)
+is the second mode with its start computed on this server's clock — from that many hours ago to
+now — so a caller asked about "the last day" need not learn the time first; it stands alone, and
+`invalid_range` answers it combined with any of the other three. `count` takes it too, instead of
+`since=`. A page tops out at
 99 rather than 100 on purpose: the server fetches one more than it returns and drops it, which is
 the only way to answer "is there more?" exactly instead of guessing from a full window.
 
@@ -3434,20 +3439,36 @@ JSON-RPC batches are refused with `-32600`. The 2025-06-18 revision removed them
 half-succeeded batch has no coherent HTTP status — which is not a property a write-capable
 endpoint should have.
 
-### The seven tools
+### The eight tools
 
 | Tool | Scope | Approval intent | What it does |
 |---|---|---|---|
+| `recent_activity` | read | automatic | Catches up on every listed channel in one call, with no required argument: the newest message's channel and time first, then each channel's most recent lines inside the window (`hours`, default 24, at most 168) with an honest count. Listed first. |
 | `list_channels` | read | automatic | Names the configured channels and which are postable. |
 | `digest_channel` | read | automatic | One speakable line per recent message. |
-| `read_page` | read | automatic | One step of a walk: a page that says it is a page, plus the cursor for the next one. |
-| `count_messages` | read | automatic | How many, up to a cost ceiling — "at least N" when the ceiling stops it. |
+| `read_page` | read | automatic | One step of a walk: a page that says it is a page, plus the cursor for the next one. `hours` reads from that many hours ago to now. |
+| `count_messages` | read | automatic | How many, up to a cost ceiling — "at least N" when the ceiling stops it. `hours` counts from that many hours ago. |
 | `find_message` | read | automatic | Describe a message in your own words, get it back in full. |
 | `read_message` | read | automatic | One known message by id. |
 | `post_reply` | **write** | **requires approval** | *Proposes* a post as the bot. Nothing is sent until the owner confirms it outside the model's tools. |
 
-They are deliberately thin. With a real model in the loop the model should compose, not consume
-pre-chewed operations, so there is no "summarize and reply" tool and no batching helper.
+They are deliberately thin, with one exception. With a real model in the loop the model should
+compose, not consume pre-chewed operations, so there is no "summarize and reply" tool. The
+exception is `recent_activity` (`#190 voice-agent-tools`), and the reason is what composition
+costs a VOICE agent: every tool call is another round of the speech model, and a runtime that
+speaks a filler line while a tool runs may give up after a round or two that held nothing but
+filler — and the listener then hears a canned "something went wrong". The requests that went that
+way were the open-ended ones: "what happened in the last day" was a channel list, a clock lookup
+and one read per channel. `recent_activity` answers it in one call with no required argument,
+and `hours` on `read_page` and `count_messages` removes the clock lookup from the precise reads.
+Each channel is still one ordinary fetch with the same noise rules and spoken times; the answer
+is capped at about 8 KB, dropping the oldest lines first and saying so, and one channel that
+cannot be read is named as such rather than failing the rest.
+
+**No model-facing text calls this server a "bridge"** — not a tool description, not the
+initialize instructions, not the channel listing. A speech runtime may have a filler call of its
+own by that name, and text that also called the chat server a bridge blurred the two. That was
+never shown to cause a failure, but it costs nothing to avoid, and `tests/mcp.rs` pins it.
 
 `ask_agent` — the slow-path seam that answers HTTP 501 — is **not** offered over MCP, and cannot
 be called by name either. A tool whose only possible outcome is an apology spends a model's turn

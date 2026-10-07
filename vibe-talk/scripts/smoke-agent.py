@@ -40,9 +40,10 @@ Audio frames are simply ignored.
 THE TWO ASSERTIONS
 ==================
 
-1. THE MECHANISM (primary). A tool line -- digest_channel, read_message or find_message -- must
-   appear in this server's access log during the run. This is the direct check for the failure
-   above, and it does not depend on interpreting a word of the agent's prose. It is also
+1. THE MECHANISM (primary). A tool line -- recent_activity, digest_channel, read_message or
+   find_message -- must appear in this server's access log during the run. This is the direct
+   check for the failure above, and it does not depend on interpreting a word of the agent's
+   prose. It is also
    unforgeable from our side: access::tool_call fires ONLY on the MCP path (src/mcp/protocol.rs),
    so nothing this script does over the REST API can plant one.
 
@@ -185,7 +186,7 @@ EXIT_REPLAY_CONTROL_LEAKED = 22
 #: The read tools whose appearance in the access log proves the agent really reached this server.
 #: post_reply is deliberately NOT here: this test never asks for a post, so a post_reply line would
 #: be a finding, not a pass.
-READ_TOOLS = ("digest_channel", "read_message", "find_message")
+READ_TOOLS = ("recent_activity", "digest_channel", "read_message", "find_message")
 
 
 class SmokeFailure(Exception):

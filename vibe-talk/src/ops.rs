@@ -52,6 +52,18 @@ pub enum OpError {
          start time and an optional end time, but not both"
     )]
     InvalidRange,
+    /// A relative window (`hours`) that is not a whole number of hours inside the allowed range.
+    /// `#190 voice-agent-tools`.
+    #[error("hours must be a whole number from 1 to {MAX_WINDOW_HOURS}")]
+    InvalidHours,
+    /// A relative window given together with an absolute one. `hours` already says where the span
+    /// starts, so combining it with `since`, `until` or `before` would leave the caller unable to
+    /// know which of the two it got.
+    #[error(
+        "give hours on its own: it already says where the span starts, so it cannot be combined \
+         with since, until or before"
+    )]
+    HoursWithSpan,
     /// Some parts of a split message reached the chat provider and the rest did not.
     ///
     /// A distinct variant rather than a plain [`ChatError`], because the two call for opposite things
@@ -97,7 +109,8 @@ impl OpError {
             Self::EmptyQuery => "empty_query",
             Self::ChannelNotWritable => "channel_not_writable",
             Self::InvalidCursor => "invalid_cursor",
-            Self::InvalidRange => "invalid_range",
+            Self::InvalidRange | Self::HoursWithSpan => "invalid_range",
+            Self::InvalidHours => "invalid_hours",
             Self::CursorMismatch => "cursor_mismatch",
             Self::PartiallyPosted { .. } => "partially_posted",
             Self::Chat(error) if matches!(error.cause(), ChatError::Refused(_)) => "refused",
@@ -550,6 +563,216 @@ pub async fn digest(
     })
 }
 
+/// How far back [`activity`] reads when the caller does not say: one day.
+pub const DEFAULT_ACTIVITY_HOURS: u64 = 24;
+
+/// How many of each channel's most recent lines [`activity`] carries when the caller does not say.
+pub const DEFAULT_ACTIVITY_LINES: u16 = 8;
+
+/// The most lines per channel [`activity`] will carry, whatever the caller asks for.
+pub const MAX_ACTIVITY_LINES: u16 = 30;
+
+/// How many channels [`activity`] reads at once. Four, like the thread fan-outs: enough that three
+/// channels cost one round trip, few enough that a long list does not burst the provider's limit.
+const ACTIVITY_CONCURRENCY: usize = 4;
+
+/// What [`activity`] should cover. Every field but the clock is optional.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ActivityRequest {
+    /// Hours back from `now_ms`. Absent means [`DEFAULT_ACTIVITY_HOURS`]; outside
+    /// `1..=MAX_WINDOW_HOURS` it is CLAMPED, and [`Activity::asked_hours`] says so.
+    pub hours: Option<u64>,
+    /// Lines per channel. Absent means [`DEFAULT_ACTIVITY_LINES`]; clamped to
+    /// `1..=MAX_ACTIVITY_LINES`.
+    pub per_channel_limit: Option<u16>,
+    /// The clock the window is resolved against: [`now_ms`] in production, a fixed instant in a
+    /// test.
+    pub now_ms: i64,
+}
+
+/// Every listed channel's recent activity, read in one call. `#190 voice-agent-tools`.
+#[derive(Debug)]
+pub struct Activity {
+    /// The window actually read, in hours.
+    pub hours: u64,
+    /// What the caller asked for, when that was outside `1..=MAX_WINDOW_HOURS` and so was clamped
+    /// to [`Activity::hours`]. Said rather than silently corrected.
+    pub asked_hours: Option<u64>,
+    /// The clock reading the window was resolved against.
+    pub now_ms: i64,
+    /// Where the window starts: `now_ms` minus `hours`. Inclusive.
+    pub since_ms: i64,
+    /// Lines per channel, after clamping.
+    pub per_channel_limit: u16,
+    /// One entry per listed channel, in list order, each read or not on its own.
+    pub channels: Vec<ChannelActivity>,
+}
+
+/// One channel's part of an [`Activity`].
+#[derive(Debug)]
+pub struct ChannelActivity {
+    /// The channel, wearing the operator's own name.
+    pub channel: ChannelInfo,
+    /// What was read, or why it could not be. One channel failing does not fail the others.
+    pub read: Result<WindowActivity, OpError>,
+}
+
+/// What one channel holds inside an activity window.
+#[derive(Clone, Debug)]
+pub struct WindowActivity {
+    /// The most recent lines inside the window, at most the request's per-channel limit, OLDEST
+    /// FIRST like every digest. Placeholders excluded.
+    pub entries: Vec<DigestEntry>,
+    /// Messages inside the window that are not placeholders — the number to say aloud.
+    pub counted: usize,
+    /// Whether `counted` is the window's whole count. False means the read stopped before it
+    /// reached the start of the window, so `counted` is a LOWER BOUND, exactly as a capped
+    /// `count_messages` is.
+    pub complete: bool,
+    /// Placeholders inside the window that the owner's noise rules call read. `#196
+    /// auto-read-noise`.
+    pub noise: usize,
+    /// The newest message this read saw that is not a placeholder, inside the window or not, so
+    /// "what was the last thing said, and where?" has an answer even after a quiet day.
+    pub newest: Option<Newest>,
+}
+
+/// A channel's newest message and the instant it was created.
+#[derive(Clone, Debug)]
+pub struct Newest {
+    /// When it was created, in milliseconds since the Unix epoch, from its id where possible.
+    pub at_ms: i64,
+    /// The message, as a digest line.
+    pub entry: DigestEntry,
+}
+
+impl Activity {
+    /// The newest message any channel holds, as far as these reads saw, and its channel.
+    ///
+    /// A tie goes to the channel listed first, so the answer does not depend on read order.
+    #[must_use]
+    pub fn newest(&self) -> Option<(&ChannelInfo, &Newest)> {
+        self.channels
+            .iter()
+            .filter_map(|c| {
+                let read = c.read.as_ref().ok()?;
+                read.newest.as_ref().map(|newest| (&c.channel, newest))
+            })
+            .reduce(|best, next| {
+                if next.1.at_ms > best.1.at_ms {
+                    next
+                } else {
+                    best
+                }
+            })
+    }
+
+    /// Whether an instant falls inside this window.
+    #[must_use]
+    pub fn covers(&self, at_ms: i64) -> bool {
+        at_ms >= self.since_ms
+    }
+}
+
+/// Catch up on every listed channel in one call. Read scope. `#190 voice-agent-tools`.
+///
+/// **Why a batching operation exists at all.** The tools were thin on purpose, so a model composes
+/// rather than consumes pre-chewed answers. But a voice agent pays for composition in ROUNDS — each
+/// tool call is a turn of the speech model, and a runtime that speaks a filler line while a tool
+/// runs gives up after a round or two with nothing but filler in it. "What happened in the last
+/// day?" across three channels was list, clock, then one read per channel: up to five rounds, any
+/// of which could be the one that fails. This answers it in one, with no required argument.
+///
+/// Each channel is one fetch of its most recent messages — the same fetch, noise marks and
+/// spoken times every other read gets — filtered to the window. Channels are read concurrently
+/// and fail independently.
+///
+/// # Errors
+///
+/// The first channel's error when EVERY channel failed, since an answer made only of failures is
+/// a failure. An empty list is not an error: there is simply nothing to report.
+pub async fn activity(state: &AppState, request: ActivityRequest) -> Result<Activity, OpError> {
+    use futures_util::{stream, StreamExt as _};
+
+    let asked = request.hours.unwrap_or(DEFAULT_ACTIVITY_HOURS);
+    let hours = asked.clamp(1, MAX_WINDOW_HOURS);
+    let since_ms = hours_before(hours, request.now_ms)?;
+    let lines = request
+        .per_channel_limit
+        .unwrap_or(DEFAULT_ACTIVITY_LINES)
+        .clamp(1, MAX_ACTIVITY_LINES);
+    // One fetch per channel: as deep as a default read goes, and always deep enough to say whether
+    // there is more than the lines shown. `messages` clamps it to the configured ceiling.
+    let scan = state.config.chat.default_fetch_limit.max(lines + 1);
+    let channels = channels(state).await;
+    let mut reads: Vec<ChannelActivity> = stream::iter(channels)
+        .map(|channel| async move {
+            let read = window_activity(state, channel.id.as_str(), scan, lines, since_ms).await;
+            ChannelActivity { channel, read }
+        })
+        .buffered(ACTIVITY_CONCURRENCY)
+        .collect()
+        .await;
+    if !reads.is_empty() && reads.iter().all(|c| c.read.is_err()) {
+        // Every read failed, so this returns the first channel's reason.
+        reads.swap_remove(0).read?;
+    }
+    Ok(Activity {
+        hours,
+        asked_hours: (asked != hours).then_some(asked),
+        now_ms: request.now_ms,
+        since_ms,
+        per_channel_limit: lines,
+        channels: reads,
+    })
+}
+
+/// One channel's part of [`activity`].
+async fn window_activity(
+    state: &AppState,
+    channel_id: &str,
+    scan: u16,
+    lines: u16,
+    since_ms: i64,
+) -> Result<WindowActivity, OpError> {
+    let window = messages(state, channel_id, Some(scan)).await?;
+    // The count is exact only when the read reached past the start of the window: either the
+    // channel ran out, or its oldest fetched message is already older than the window. Otherwise
+    // there may be more inside the window than this one fetch reached.
+    let complete = window.is_whole_channel()
+        || window
+            .messages
+            .first()
+            .and_then(message_ms)
+            .is_some_and(|ms| ms < since_ms);
+    let newest = window
+        .messages
+        .iter()
+        .rev()
+        .find(|m| !m.noise)
+        .and_then(|m| {
+            message_ms(m).map(|at_ms| Newest {
+                at_ms,
+                entry: summary::digest_entry(m, DEFAULT_SUMMARY_CHARS),
+            })
+        });
+    // A message whose time cannot be read is kept, as a time-range page keeps it: dropping it
+    // would make the channel sound quieter than it is.
+    let (noise, kept): (Vec<Message>, Vec<Message>) = window
+        .messages
+        .into_iter()
+        .filter(|m| message_ms(m).is_none_or(|ms| ms >= since_ms))
+        .partition(|m| m.noise);
+    let skip = kept.len().saturating_sub(usize::from(lines));
+    Ok(WindowActivity {
+        entries: summary::digest(&kept[skip..], DEFAULT_SUMMARY_CHARS),
+        counted: kept.len(),
+        complete,
+        noise: noise.len(),
+        newest,
+    })
+}
+
 /// The largest page this server will hand back in one step.
 ///
 /// One less than Discord's own ceiling, and that is the whole point: the page is fetched with
@@ -573,6 +796,38 @@ pub struct PageRequest<'a> {
     pub since: Option<&'a str>,
     /// End of a time span, EXCLUSIVE, as an ISO-8601 instant. Requires `since`.
     pub until: Option<&'a str>,
+    /// A span that starts this many hours before now, on this server's clock, and runs to now.
+    /// Stands alone: refused with any of the three above. `#190 voice-agent-tools`.
+    pub hours: Option<u64>,
+}
+
+/// The longest relative window any tool reads, in hours: one week.
+pub const MAX_WINDOW_HOURS: u64 = 168;
+
+/// Milliseconds per hour, for turning a relative window into an instant.
+const HOUR_MS: i64 = 3_600_000;
+
+/// This server's clock, in milliseconds since the Unix epoch.
+///
+/// The one reading a relative window is resolved against. `#190 voice-agent-tools`: a caller that
+/// wants "the last 24 hours" should not have to learn the time first and do date arithmetic — at
+/// the speed of a voice turn, every extra round is another chance to fail.
+#[must_use]
+pub fn now_ms() -> i64 {
+    jiff::Timestamp::now().as_millisecond()
+}
+
+/// The instant `hours` before `now_ms`, for a span that runs to now.
+///
+/// # Errors
+///
+/// [`OpError::InvalidHours`] outside `1..=MAX_WINDOW_HOURS`.
+pub fn hours_before(hours: u64, now_ms: i64) -> Result<i64, OpError> {
+    if !(1..=MAX_WINDOW_HOURS).contains(&hours) {
+        return Err(OpError::InvalidHours);
+    }
+    let span = i64::try_from(hours).map_err(|_| OpError::InvalidHours)? * HOUR_MS;
+    Ok(now_ms - span)
 }
 
 /// One step of a walk through a channel, and everything needed to take the next one.
@@ -621,6 +876,11 @@ fn cursor(value: Option<&str>) -> Result<Option<MessageId>, OpError> {
     }
 }
 
+/// Whether an optional argument is absent or only whitespace, which every parser here treats alike.
+fn blank(value: Option<&str>) -> bool {
+    value.is_none_or(|v| v.trim().is_empty())
+}
+
 fn instant(value: Option<&str>) -> Result<Option<i64>, OpError> {
     match value.map(str::trim).filter(|v| !v.is_empty()) {
         None => Ok(None),
@@ -635,7 +895,8 @@ fn instant(value: Option<&str>) -> Result<Option<i64>, OpError> {
 /// # Errors
 ///
 /// [`OpError::UnknownChannel`], [`OpError::InvalidCursor`] for a cursor that is not a snowflake,
-/// [`OpError::InvalidRange`] for an unparseable or contradictory span, or [`OpError::Chat`].
+/// [`OpError::InvalidRange`] for an unparseable or contradictory span, [`OpError::InvalidHours`]
+/// or [`OpError::HoursWithSpan`] for an unusable relative window, or [`OpError::Chat`].
 pub async fn page(
     state: &AppState,
     channel_id: &str,
@@ -643,8 +904,17 @@ pub async fn page(
 ) -> Result<Page, OpError> {
     let channel = allowed(state, channel_id).await?;
     let before = cursor(request.before)?;
-    let since = instant(request.since)?;
     let until = instant(request.until)?;
+    let since = match request.hours {
+        None => instant(request.since)?,
+        // A blank `since` is absent, as everywhere else here: a model that sends `"since": ""`
+        // beside `hours` asked for one window, not two.
+        Some(_) if !blank(request.since) || until.is_some() || before.is_some() => {
+            return Err(OpError::HoursWithSpan);
+        }
+        // From then to now is exactly a `since` walk with no end, so it is one.
+        Some(hours) => Some(hours_before(hours, now_ms())?),
+    };
     if (since.is_some() || until.is_some()) && before.is_some() {
         return Err(OpError::InvalidRange);
     }
@@ -790,8 +1060,29 @@ pub async fn count(
     since: Option<&str>,
     cap: Option<u32>,
 ) -> Result<MessageCount, OpError> {
+    count_within(state, channel_id, since, None, cap).await
+}
+
+/// [`count`], optionally over the last `hours` on this server's clock instead of since an instant.
+/// Read scope. `#190 voice-agent-tools`.
+///
+/// # Errors
+///
+/// As [`count`], plus [`OpError::InvalidHours`] for an unusable window and
+/// [`OpError::HoursWithSpan`] when both `hours` and `since` are given.
+pub async fn count_within(
+    state: &AppState,
+    channel_id: &str,
+    since: Option<&str>,
+    hours: Option<u64>,
+    cap: Option<u32>,
+) -> Result<MessageCount, OpError> {
     let channel = allowed(state, channel_id).await?;
-    let since = instant(since)?;
+    let since = match hours {
+        None => instant(since)?,
+        Some(_) if !blank(since) => return Err(OpError::HoursWithSpan),
+        Some(hours) => Some(hours_before(hours, now_ms())?),
+    };
     let cap = state.effective_count_cap(cap);
 
     let stride = crate::discord::http::DISCORD_MAX_LIMIT;
@@ -2763,5 +3054,332 @@ mod tests {
         let parts = split_for_discord(&text);
         assert!(!unsent_remainder(&text, &parts, 1, true).1);
         assert!(unsent_remainder(&text, &parts, 0, true).1);
+    }
+
+    // --- `#190 voice-agent-tools` ----------------------------------------------------------------
+
+    /// A fixed clock for the activity tests: 2026-10-07T07:52:00Z, the morning of the report.
+    const NOW: i64 = 1_791_359_520_000;
+    const MINUTE: i64 = 60_000;
+
+    fn at(fake: &crate::discord::fake::FakeDiscord, channel: &str, text: &str, ago_ms: i64) {
+        fake.seed_at(
+            &crate::model::ChannelId(channel.to_owned()),
+            "agent",
+            text,
+            NOW - ago_ms,
+        );
+    }
+
+    fn request(hours: Option<u64>) -> ActivityRequest {
+        ActivityRequest {
+            hours,
+            per_channel_limit: None,
+            now_ms: NOW,
+        }
+    }
+
+    fn part<'a>(activity: &'a Activity, channel: &str) -> &'a WindowActivity {
+        activity
+            .channels
+            .iter()
+            .find(|c| c.channel.id.as_str() == channel)
+            .unwrap_or_else(|| panic!("{channel} was not read"))
+            .read
+            .as_ref()
+            .unwrap_or_else(|e| panic!("{channel} failed: {e}"))
+    }
+
+    fn summaries(read: &WindowActivity) -> Vec<&str> {
+        read.entries.iter().map(|e| e.summary.as_str()).collect()
+    }
+
+    #[tokio::test]
+    async fn activity_reads_every_channel_once_and_names_the_newest_message() {
+        let (state, fake) = testing::state();
+        at(&fake, READ_CHANNEL, "yesterday's news", 30 * HOUR_MS);
+        at(&fake, READ_CHANNEL, "three hours ago", 3 * HOUR_MS);
+        at(&fake, WRITE_CHANNEL, "an hour ago", HOUR_MS);
+        at(&fake, WRITE_CHANNEL, "twenty minutes ago", 20 * MINUTE);
+        let before = fake.fetch_count();
+
+        let activity = activity(&state, request(None)).await.expect("reads");
+
+        assert_eq!(
+            fake.fetch_count() - before,
+            2,
+            "one fetch per channel, and no list or clock round before them"
+        );
+        assert_eq!(activity.hours, DEFAULT_ACTIVITY_HOURS);
+        assert_eq!(activity.since_ms, NOW - 24 * HOUR_MS);
+        let read = part(&activity, READ_CHANNEL);
+        assert_eq!(summaries(read), ["three hours ago"]);
+        assert_eq!(read.counted, 1);
+        assert!(read.complete, "the read reached past the window's start");
+        let write = part(&activity, WRITE_CHANNEL);
+        assert_eq!(
+            summaries(write),
+            ["an hour ago", "twenty minutes ago"],
+            "oldest first, newest last, like every digest"
+        );
+        let (channel, newest) = activity.newest().expect("there is a newest message");
+        assert_eq!(channel.id.as_str(), WRITE_CHANNEL);
+        assert_eq!(newest.entry.summary, "twenty minutes ago");
+        assert_eq!(newest.at_ms, NOW - 20 * MINUTE);
+        assert!(activity.covers(newest.at_ms));
+    }
+
+    #[tokio::test]
+    async fn the_window_leaves_older_messages_out_and_a_quiet_day_still_names_the_newest() {
+        let (state, fake) = testing::state();
+        at(&fake, READ_CHANNEL, "two days ago", 50 * HOUR_MS);
+
+        let day = activity(&state, request(None)).await.expect("reads");
+        let read = part(&day, READ_CHANNEL);
+        assert_eq!(read.counted, 0);
+        assert!(read.entries.is_empty(), "{:?}", summaries(read));
+        assert!(read.complete);
+        let empty = part(&day, WRITE_CHANNEL);
+        assert_eq!((empty.counted, empty.noise), (0, 0));
+        assert!(empty.newest.is_none());
+        let (channel, newest) = day.newest().expect("the old message is still the newest");
+        assert_eq!(channel.id.as_str(), READ_CHANNEL);
+        assert!(
+            !day.covers(newest.at_ms),
+            "it is outside the window, and must be reported as older"
+        );
+
+        let three_days = activity(&state, request(Some(72))).await.expect("reads");
+        assert_eq!(summaries(part(&three_days, READ_CHANNEL)), ["two days ago"]);
+    }
+
+    #[tokio::test]
+    async fn activity_leaves_placeholders_out_and_says_how_many() {
+        let (state, fake) = testing::state();
+        at(&fake, READ_CHANNEL, "the real answer", 2 * HOUR_MS);
+        at(&fake, READ_CHANNEL, "Working…", HOUR_MS);
+
+        let activity = activity(&state, request(None)).await.expect("reads");
+        let read = part(&activity, READ_CHANNEL);
+        assert_eq!(summaries(read), ["the real answer"]);
+        assert_eq!((read.counted, read.noise), (1, 1));
+        let (_, newest) = activity.newest().expect("newest");
+        assert_eq!(
+            newest.entry.summary, "the real answer",
+            "a placeholder is never the newest message worth naming"
+        );
+    }
+
+    #[tokio::test]
+    async fn activity_says_at_least_when_its_read_stops_inside_the_window() {
+        let (state, fake) = testing::state();
+        // Thirty messages inside the window, against a default fetch of twenty.
+        for i in 0..30 {
+            at(&fake, READ_CHANNEL, &format!("m{i}"), (60 - i) * MINUTE);
+        }
+        let activity = activity(&state, request(None)).await.expect("reads");
+        let read = part(&activity, READ_CHANNEL);
+        assert!(
+            !read.complete,
+            "the fetch never reached the start of the window, so its count is a lower bound"
+        );
+        assert_eq!(read.counted, 20);
+        assert_eq!(
+            summaries(read),
+            ["m22", "m23", "m24", "m25", "m26", "m27", "m28", "m29"],
+            "the newest eight, oldest first"
+        );
+    }
+
+    #[tokio::test]
+    async fn activity_clamps_its_window_and_line_count_and_records_what_was_asked() {
+        let (state, fake) = testing::state();
+        for i in 0..40 {
+            at(&fake, READ_CHANNEL, &format!("m{i}"), (i + 1) * MINUTE);
+        }
+        for (asked, hours, recorded) in [
+            (Some(0), 1, Some(0)),
+            (Some(1_000), MAX_WINDOW_HOURS, Some(1_000)),
+            (Some(24), 24, None),
+            (None, DEFAULT_ACTIVITY_HOURS, None),
+        ] {
+            let read = activity(&state, request(asked)).await.expect("reads");
+            assert_eq!(
+                (read.hours, read.asked_hours),
+                (hours, recorded),
+                "{asked:?}"
+            );
+        }
+        for (asked, lines) in [(Some(0), 1), (Some(500), MAX_ACTIVITY_LINES), (None, 8)] {
+            let read = activity(
+                &state,
+                ActivityRequest {
+                    per_channel_limit: asked,
+                    ..request(None)
+                },
+            )
+            .await
+            .expect("reads");
+            assert_eq!(read.per_channel_limit, lines, "{asked:?}");
+            assert_eq!(
+                part(&read, READ_CHANNEL).entries.len(),
+                usize::from(lines).min(40),
+                "{asked:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn one_channel_failing_leaves_the_others_answered_and_all_failing_is_an_error() {
+        let toml = testing::config_toml().replace(
+            "[elevenlabs]",
+            "[[channels]]\nid = \"3333333333\"\nlabel = \"gone\"\nwritable = false\n\n[elevenlabs]",
+        );
+        let (state, fake, _elevenlabs) = testing::state_from_toml(&toml);
+        at(&fake, READ_CHANNEL, "still here", HOUR_MS);
+        let activity = activity(&state, request(None))
+            .await
+            .expect("two of three read");
+        assert_eq!(activity.channels.len(), 3);
+        let gone = activity
+            .channels
+            .iter()
+            .find(|c| c.channel.id.as_str() == "3333333333")
+            .expect("listed");
+        assert!(gone.read.is_err(), "the unreadable channel says so");
+        assert_eq!(summaries(part(&activity, READ_CHANNEL)), ["still here"]);
+
+        fake.revoke_token();
+        let error = super::activity(&state, request(None))
+            .await
+            .expect_err("an answer made only of failures is a failure");
+        assert_eq!(error.code(), "chat_error", "{error}");
+    }
+
+    #[tokio::test]
+    async fn activity_over_an_empty_list_is_an_answer_not_an_error() {
+        let (state, _fake) = testing::state();
+        if let Ok(mut hidden) = state.hidden_channels.write() {
+            hidden.insert(crate::model::ChannelId(READ_CHANNEL.to_owned()));
+            hidden.insert(crate::model::ChannelId(WRITE_CHANNEL.to_owned()));
+        }
+        let activity = activity(&state, request(None))
+            .await
+            .expect("nothing to read");
+        assert!(activity.channels.is_empty());
+        assert!(activity.newest().is_none());
+    }
+
+    #[tokio::test]
+    async fn a_relative_window_reads_from_that_many_hours_ago_to_now() {
+        let (state, fake) = testing::state();
+        let channel = crate::model::ChannelId(READ_CHANNEL.to_owned());
+        let now = now_ms();
+        fake.seed_at(&channel, "agent", "yesterday morning", now - 30 * HOUR_MS);
+        fake.seed_at(&channel, "agent", "two hours ago", now - 2 * HOUR_MS);
+        let step = page(
+            &state,
+            READ_CHANNEL,
+            PageRequest {
+                hours: Some(24),
+                ..PageRequest::default()
+            },
+        )
+        .await
+        .expect("reads");
+        assert_eq!(
+            step.messages
+                .iter()
+                .map(|m| m.content.as_str())
+                .collect::<Vec<_>>(),
+            ["two hours ago"]
+        );
+        let tally = count_within(&state, READ_CHANNEL, None, Some(24), None)
+            .await
+            .expect("counts");
+        assert_eq!((tally.counted, tally.at_least), (1, false));
+        let tally = count_within(&state, READ_CHANNEL, Some("  "), Some(48), None)
+            .await
+            .expect("a blank since is absent, not a second window");
+        assert_eq!(tally.counted, 2);
+    }
+
+    #[tokio::test]
+    async fn a_relative_window_stands_alone_and_inside_its_range() {
+        let (state, _fake) = testing::state();
+        let cases: [(PageRequest<'_>, &str); 6] = [
+            (
+                PageRequest {
+                    hours: Some(24),
+                    since: Some("2026-08-19T00:00:00Z"),
+                    ..PageRequest::default()
+                },
+                "invalid_range",
+            ),
+            (
+                PageRequest {
+                    hours: Some(24),
+                    before: Some("1000000000000000001"),
+                    ..PageRequest::default()
+                },
+                "invalid_range",
+            ),
+            (
+                PageRequest {
+                    hours: Some(24),
+                    until: Some("2026-08-19T00:00:00Z"),
+                    ..PageRequest::default()
+                },
+                "invalid_range",
+            ),
+            (
+                PageRequest {
+                    hours: Some(0),
+                    ..PageRequest::default()
+                },
+                "invalid_hours",
+            ),
+            (
+                PageRequest {
+                    hours: Some(MAX_WINDOW_HOURS + 1),
+                    ..PageRequest::default()
+                },
+                "invalid_hours",
+            ),
+            (
+                PageRequest {
+                    hours: Some(u64::MAX),
+                    ..PageRequest::default()
+                },
+                "invalid_hours",
+            ),
+        ];
+        for (request, code) in cases {
+            let error = page(&state, READ_CHANNEL, request)
+                .await
+                .expect_err("must refuse");
+            assert_eq!(error.code(), code, "{request:?} -> {error}");
+        }
+        let error = count_within(
+            &state,
+            READ_CHANNEL,
+            Some("2026-08-19T00:00:00Z"),
+            Some(24),
+            None,
+        )
+        .await
+        .expect_err("two windows at once");
+        assert_eq!(error.code(), "invalid_range");
+        assert!(
+            error.to_string().contains("give hours on its own"),
+            "{error}"
+        );
+        let error = count_within(&state, READ_CHANNEL, None, Some(169), None)
+            .await
+            .expect_err("past a week");
+        assert_eq!(
+            error.to_string(),
+            "hours must be a whole number from 1 to 168"
+        );
     }
 }

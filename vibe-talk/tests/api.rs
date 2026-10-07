@@ -648,6 +648,11 @@ async fn an_unusable_cursor_or_span_is_refused_by_name() {
             "invalid_range",
         ),
         ("until=2026-08-19T10:00:00Z", "invalid_range"),
+        // `#190 voice-agent-tools`: a relative window stands alone and stays inside a week.
+        ("hours=24&since=2026-08-19T10:00:00Z", "invalid_range"),
+        ("hours=24&before=1000000000000000001", "invalid_range"),
+        ("hours=0", "invalid_hours"),
+        ("hours=169", "invalid_hours"),
     ] {
         let (status, payload) = call(
             &harness,
@@ -4181,5 +4186,76 @@ async fn directory_failures_upstream_keep_their_meaning() {
     assert!(
         got.is_server_error(),
         "an outage is not the caller's fault: {got} {body}"
+    );
+}
+
+/// `#190 voice-agent-tools`. The route behind `recent_activity`: every listed channel in one read,
+/// the newest message named, an unreadable channel answered as such rather than failing the rest,
+/// and the window clamped and reported rather than refused.
+#[tokio::test]
+async fn the_activity_route_catches_up_on_every_channel_at_once() {
+    let harness = harness();
+    let now = vibe_talk::ops::now_ms();
+    let hour = 3_600_000;
+    let read = ChannelId(READ_CHANNEL.to_owned());
+    let write = ChannelId(WRITE_CHANNEL.to_owned());
+    harness
+        .discord
+        .seed_at(&read, "agent", "build is green", now - 3 * hour);
+    harness
+        .discord
+        .seed_at(&write, "lead", "ship it", now - hour);
+    harness
+        .discord
+        .seed_at(&write, "lead", "an old plan", now - 40 * hour);
+
+    let (status, payload) = call(&harness, "GET", "/api/v1/activity", Some(READ_TOKEN), None).await;
+    assert_eq!(status, StatusCode::OK, "{payload}");
+    assert_eq!(payload["hours"], 24, "{payload}");
+    assert_eq!(
+        payload["newest"]["channel"]["id"], WRITE_CHANNEL,
+        "{payload}"
+    );
+    assert_eq!(payload["newest"]["entry"]["summary"], "ship it");
+    assert_eq!(payload["newest"]["in_window"], true);
+    let channels = payload["channels"].as_array().expect("channels");
+    assert_eq!(channels.len(), 2, "{payload}");
+    let lead = channels
+        .iter()
+        .find(|c| c["channel"]["id"] == WRITE_CHANNEL)
+        .expect("lead team");
+    assert_eq!(
+        lead["counted"], 1,
+        "the old plan is outside the window: {lead}"
+    );
+    assert_eq!(lead["at_least"], false);
+    assert!(lead.get("error").is_none(), "{lead}");
+    assert!(payload["untrusted_content_notice"].is_string());
+
+    let (status, payload) = call(
+        &harness,
+        "GET",
+        "/api/v1/activity?hours=1000&per_channel_limit=1",
+        Some(READ_TOKEN),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{payload}");
+    assert_eq!(
+        payload["hours"], 168,
+        "a week at most, and the answer says so: {payload}"
+    );
+    let lead = payload["channels"]
+        .as_array()
+        .expect("channels")
+        .iter()
+        .find(|c| c["channel"]["id"] == WRITE_CHANNEL)
+        .expect("lead team")
+        .clone();
+    assert_eq!(lead["counted"], 2, "{lead}");
+    assert_eq!(
+        lead["entries"].as_array().expect("entries").len(),
+        1,
+        "{lead}"
     );
 }

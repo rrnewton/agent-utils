@@ -809,7 +809,7 @@ mod tests {
 
     #[test]
     fn the_first_channel_is_read_out_of_the_listing_prose() {
-        let listing = "Channels this bridge can reach:\n\
+        let listing = "Channels this server can reach:\n\
                        - build noise (id 1111111111) — read-only\n\
                        - lead team (id 2222222222) — readable and postable\n";
         assert_eq!(first_channel_id(listing).as_deref(), Some("1111111111"));
@@ -818,7 +818,7 @@ mod tests {
     #[test]
     fn a_listing_with_no_channel_yields_nothing_rather_than_a_guess() {
         assert_eq!(
-            first_channel_id("No channels are configured on this bridge."),
+            first_channel_id("No channels are configured on this server."),
             None
         );
         assert_eq!(first_channel_id(""), None);

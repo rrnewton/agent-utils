@@ -159,6 +159,8 @@ impl From<OpError> for ApiError {
             OpError::EmptyQuery
             | OpError::InvalidCursor
             | OpError::InvalidRange
+            | OpError::InvalidHours
+            | OpError::HoursWithSpan
             | OpError::CursorMismatch => StatusCode::BAD_REQUEST,
             OpError::ChannelNotWritable => StatusCode::FORBIDDEN,
             // A fallback only: the reply route handles this itself, because an `ApiError` body
@@ -1179,6 +1181,9 @@ pub struct PageQuery {
     pub since: Option<String>,
     /// End of a time span, exclusive, ISO-8601. Requires `since`.
     pub until: Option<String>,
+    /// The span from this many hours ago to now, on this server's clock. Stands alone.
+    /// `#190 voice-agent-tools`.
+    pub hours: Option<u64>,
 }
 
 /// One step of a walk, saying plainly that it is one.
@@ -1225,6 +1230,7 @@ pub async fn page(
             before: query.before.as_deref(),
             since: query.since.as_deref(),
             until: query.until.as_deref(),
+            hours: query.hours,
         },
     )
     .await?;
@@ -1331,6 +1337,9 @@ pub async fn timeline(
 pub struct CountQuery {
     /// Count only messages at or after this ISO-8601 instant.
     pub since: Option<String>,
+    /// Count only messages from this many hours ago to now. Not with `since`.
+    /// `#190 voice-agent-tools`.
+    pub hours: Option<u64>,
     /// Stop after this many. Clamped by `discord.max_count_scan`.
     pub cap: Option<u32>,
 }
@@ -1362,7 +1371,14 @@ pub async fn count(
     Path(channel_id): Path<String>,
     Query(query): Query<CountQuery>,
 ) -> Result<Json<CountResponse>, ApiError> {
-    let tally = ops::count(&state, &channel_id, query.since.as_deref(), query.cap).await?;
+    let tally = ops::count_within(
+        &state,
+        &channel_id,
+        query.since.as_deref(),
+        query.hours,
+        query.cap,
+    )
+    .await?;
     Ok(Json(CountResponse {
         channel: tally.channel,
         counted: tally.counted,
@@ -1440,6 +1456,111 @@ pub async fn digest(
         entries: digest.entries,
         complete: digest.complete,
         noise: digest.noise,
+        untrusted_content_notice: untrusted::NOTICE,
+    }))
+}
+
+/// Query parameters for a catch-up across every listed channel. `#190 voice-agent-tools`.
+#[derive(Debug, Default, Deserialize)]
+pub struct ActivityQuery {
+    /// Hours back from now, on this server's clock. Default 24, clamped to 1..=168.
+    pub hours: Option<u64>,
+    /// How many of each channel's most recent lines to return. Default 8, clamped to 1..=30.
+    pub per_channel_limit: Option<u16>,
+}
+
+/// The newest message any listed channel holds, as far as the reads saw.
+#[derive(Debug, Serialize)]
+pub struct ActivityNewest {
+    /// Channel it is in.
+    pub channel: ChannelInfo,
+    /// The message, as a digest line.
+    pub entry: DigestEntry,
+    /// Whether it falls inside the window that was asked about.
+    pub in_window: bool,
+}
+
+/// One channel's part of a catch-up.
+#[derive(Debug, Serialize)]
+pub struct ChannelActivityResponse {
+    /// Channel that was read.
+    pub channel: ChannelInfo,
+    /// Why this channel could not be read, as an error code. Absent when it was read; the other
+    /// channels are answered either way.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<&'static str>,
+    /// The most recent lines inside the window, oldest first, placeholders excluded.
+    pub entries: Vec<DigestEntry>,
+    /// Messages inside the window that are not placeholders.
+    pub counted: usize,
+    /// When true, `counted` is a LOWER BOUND: the read stopped before the start of the window.
+    pub at_least: bool,
+    /// Placeholders inside the window that the owner's noise rules call read.
+    pub noise: usize,
+}
+
+/// Every listed channel's last few hours.
+#[derive(Debug, Serialize)]
+pub struct ActivityResponse {
+    /// The window that was read, in hours, after clamping.
+    pub hours: u64,
+    /// Where the window starts, ISO-8601. Inclusive; it runs to the moment of the read.
+    pub since: String,
+    /// The newest message any channel holds, inside the window or not.
+    pub newest: Option<ActivityNewest>,
+    /// One entry per listed channel, in list order.
+    pub channels: Vec<ChannelActivityResponse>,
+    /// Standing reminder that the content is third-party text.
+    pub untrusted_content_notice: &'static str,
+}
+
+/// `GET /api/v1/activity` — the route behind `recent_activity`. `#190 voice-agent-tools`.
+pub async fn activity(
+    State(state): State<AppState>,
+    _scope: ReadScope,
+    Query(query): Query<ActivityQuery>,
+) -> Result<Json<ActivityResponse>, ApiError> {
+    let activity = ops::activity(
+        &state,
+        ops::ActivityRequest {
+            hours: query.hours,
+            per_channel_limit: query.per_channel_limit,
+            now_ms: ops::now_ms(),
+        },
+    )
+    .await?;
+    let newest = activity.newest().map(|(channel, newest)| ActivityNewest {
+        channel: channel.clone(),
+        entry: newest.entry.clone(),
+        in_window: activity.covers(newest.at_ms),
+    });
+    let channels = activity
+        .channels
+        .into_iter()
+        .map(|part| match part.read {
+            Ok(read) => ChannelActivityResponse {
+                channel: part.channel,
+                error: None,
+                entries: read.entries,
+                counted: read.counted,
+                at_least: !read.complete,
+                noise: read.noise,
+            },
+            Err(error) => ChannelActivityResponse {
+                channel: part.channel,
+                error: Some(error.code()),
+                entries: Vec::new(),
+                counted: 0,
+                at_least: false,
+                noise: 0,
+            },
+        })
+        .collect();
+    Ok(Json(ActivityResponse {
+        hours: activity.hours,
+        since: crate::clock::iso_from_ms(activity.since_ms),
+        newest,
+        channels,
         untrusted_content_notice: untrusted::NOTICE,
     }))
 }

@@ -859,6 +859,7 @@ async fn a_full_handshake_then_list_then_call_works_over_the_endpoint() {
     assert_eq!(
         names,
         vec![
+            "recent_activity",
             "list_channels",
             "digest_channel",
             "read_page",
@@ -867,7 +868,7 @@ async fn a_full_handshake_then_list_then_call_works_over_the_endpoint() {
             "read_message",
             "post_reply"
         ],
-        "the write credential sees exactly the seven implemented tools"
+        "the write credential sees exactly the eight implemented tools"
     );
 
     let (_status, found) = rpc(
@@ -1132,4 +1133,284 @@ async fn every_tool_result_carries_a_usable_mention_and_a_reply_built_from_it_pi
         json!([bot.as_str()]),
         "the ping the whole feature exists for was not authorized: {body}"
     );
+}
+
+// --- `#190 voice-agent-tools` ---------------------------------------------------------------------
+
+const HOUR_MS: i64 = 3_600_000;
+
+/// Seed a message `ago_ms` before this server's clock reads now.
+fn seed_ago(harness: &Harness, channel: &str, author: &str, text: &str, ago_ms: i64) {
+    harness.discord.seed_at(
+        &ChannelId(channel.to_owned()),
+        author,
+        text,
+        vibe_talk::ops::now_ms() - ago_ms,
+    );
+}
+
+async fn tools(harness: &Harness, token: &str) -> Vec<Value> {
+    let (status, body) = rpc(
+        harness,
+        Some(token),
+        json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/list" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    body["result"]["tools"]
+        .as_array()
+        .expect("a tool array")
+        .clone()
+}
+
+async fn tool_call_text(harness: &Harness, token: &str, tool: &str, arguments: Value) -> String {
+    let (status, body) = rpc(harness, Some(token), call(tool, arguments)).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    tool_text(&body)
+}
+
+/// The catch-up tool is the FIRST thing a read credential is offered, and it can be called with
+/// nothing at all: the easiest possible call to put beside a filler line.
+#[tokio::test]
+async fn recent_activity_is_offered_first_to_a_read_token_and_needs_no_argument() {
+    let harness = harness();
+    let listed = tools(&harness, READ_TOKEN).await;
+    let first = &listed[0];
+    assert_eq!(first["name"], "recent_activity", "{listed:?}");
+    assert_eq!(first["annotations"]["readOnlyHint"], true);
+    let schema = &first["inputSchema"];
+    assert!(
+        schema
+            .get("required")
+            .and_then(Value::as_array)
+            .is_none_or(Vec::is_empty),
+        "no argument may be required: {schema}"
+    );
+    for argument in ["hours", "per_channel_limit"] {
+        assert_eq!(
+            schema["properties"][argument]["type"], "integer",
+            "{schema}"
+        );
+    }
+    let description = first["description"].as_str().expect("described");
+    for phrase in [
+        "ONE call",
+        "no list_channels call first",
+        "never look up the time first",
+        "the most recent message and which channel",
+    ] {
+        assert!(description.contains(phrase), "{phrase:?}: {description}");
+    }
+    let list = listed
+        .iter()
+        .find(|t| t["name"] == "list_channels")
+        .expect("list_channels is still offered");
+    assert!(
+        list["description"]
+            .as_str()
+            .expect("described")
+            .contains("You rarely need this"),
+        "{list}"
+    );
+}
+
+/// The owner's request, end to end: one call names where the newest message is, leaves the day
+/// before out, says which channel was quiet, and leaves the placeholders out.
+#[tokio::test]
+async fn recent_activity_answers_a_catch_up_in_one_call() {
+    let harness = harness();
+    seed_ago(
+        &harness,
+        READ_CHANNEL,
+        "codex-eng",
+        "the nightly build is green again",
+        3 * HOUR_MS,
+    );
+    seed_ago(&harness, READ_CHANNEL, "codex-eng", "Working…", 2 * HOUR_MS);
+    seed_ago(
+        &harness,
+        READ_CHANNEL,
+        "codex-eng",
+        "an old note from last week",
+        100 * HOUR_MS,
+    );
+    let fetches = harness.discord.fetch_count();
+
+    let text = tool_call_text(&harness, READ_TOKEN, "recent_activity", json!({})).await;
+
+    assert_eq!(
+        harness.discord.fetch_count() - fetches,
+        2,
+        "one read per channel, in the one call"
+    );
+    assert!(
+        text.starts_with("Newest message overall: build noise, ") && text.contains("hours ago)"),
+        "{text}"
+    );
+    assert!(text.contains("the nightly build is green again"), "{text}");
+    assert!(
+        !text.contains("an old note from last week"),
+        "outside the window: {text}"
+    );
+    assert!(
+        !text.contains("Working…"),
+        "a placeholder is not news: {text}"
+    );
+    assert!(
+        text.contains(&format!(
+            "lead team (id {WRITE_CHANNEL}): no messages in the last 24 hours."
+        )),
+        "{text}"
+    );
+
+    let week = tool_call_text(
+        &harness,
+        READ_TOKEN,
+        "recent_activity",
+        json!({ "hours": "168", "per_channel_limit": 2 }),
+    )
+    .await;
+    assert!(week.contains("an old note from last week"), "{week}");
+    assert!(week.contains("in the last 168 hours"), "{week}");
+}
+
+/// `hours` on the two precise reads: the span is counted back from now, so no clock round is
+/// needed first, and it refuses to be combined with an absolute span rather than pick one.
+#[tokio::test]
+async fn read_page_and_count_messages_take_a_relative_window_on_its_own() {
+    let harness = harness();
+    seed_ago(
+        &harness,
+        READ_CHANNEL,
+        "agent",
+        "yesterday morning",
+        30 * HOUR_MS,
+    );
+    seed_ago(
+        &harness,
+        READ_CHANNEL,
+        "agent",
+        "two hours ago",
+        2 * HOUR_MS,
+    );
+
+    let page = tool_call_text(
+        &harness,
+        READ_TOKEN,
+        "read_page",
+        json!({ "channel_id": READ_CHANNEL, "hours": 24 }),
+    )
+    .await;
+    assert!(
+        page.contains("two hours ago") && !page.contains("yesterday morning"),
+        "{page}"
+    );
+    let count = tool_call_text(
+        &harness,
+        READ_TOKEN,
+        "count_messages",
+        json!({ "channel_id": READ_CHANNEL, "hours": 24 }),
+    )
+    .await;
+    assert!(
+        count.contains("holds exactly 1 message in the last 24 hours"),
+        "{count}"
+    );
+
+    for (tool, arguments, code) in [
+        (
+            "read_page",
+            json!({ "channel_id": READ_CHANNEL, "hours": 24, "since": "2026-10-06T00:00:00Z" }),
+            "invalid_range",
+        ),
+        (
+            "read_page",
+            json!({ "channel_id": READ_CHANNEL, "hours": 24, "before": "1000000000000000001" }),
+            "invalid_range",
+        ),
+        (
+            "count_messages",
+            json!({ "channel_id": READ_CHANNEL, "hours": 24, "since": "2026-10-06T00:00:00Z" }),
+            "invalid_range",
+        ),
+        (
+            "read_page",
+            json!({ "channel_id": READ_CHANNEL, "hours": 500 }),
+            "invalid_hours",
+        ),
+        (
+            "count_messages",
+            json!({ "channel_id": READ_CHANNEL, "hours": 1.5 }),
+            "invalid_hours",
+        ),
+    ] {
+        let (status, body) = rpc(&harness, Some(READ_TOKEN), call(tool, arguments.clone())).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(
+            body["result"]["isError"], true,
+            "{tool} {arguments}: {body}"
+        );
+        let text = tool_text(&body);
+        assert!(text.starts_with(code), "{tool} {arguments}: {text}");
+    }
+}
+
+/// `#190 voice-agent-tools`. The speech runtime behind one voice client has a filler call of its
+/// own that it may name a bridge. Text a model reads that ALSO called this server a bridge blurred
+/// the thing that speaks a filler line with the thing that reads channels. Not proven to cause
+/// anything, free to remove, and pinned here across every model-facing string: every tool
+/// description and schema, the initialize instructions, the channel listing (full and empty), a
+/// refusal that lists the channels, and the catch-up.
+#[tokio::test]
+async fn no_model_facing_text_calls_this_server_a_bridge() {
+    let harness = harness();
+    seed_ago(&harness, READ_CHANNEL, "agent", "status update", HOUR_MS);
+    let mut said: Vec<(String, String)> = Vec::new();
+    said.push((
+        "tools/list".to_owned(),
+        Value::Array(tools(&harness, WRITE_TOKEN).await).to_string(),
+    ));
+    let (_status, init) = rpc(
+        &harness,
+        Some(READ_TOKEN),
+        json!({ "jsonrpc": "2.0", "id": 1, "method": "initialize" }),
+    )
+    .await;
+    said.push(("initialize".to_owned(), init["result"].to_string()));
+    for (tool, arguments) in [
+        ("list_channels", json!({})),
+        ("recent_activity", json!({})),
+        ("digest_channel", json!({ "channel_id": "nowhere" })),
+        (
+            "read_page",
+            json!({ "channel_id": READ_CHANNEL, "hours": 0 }),
+        ),
+    ] {
+        said.push((
+            tool.to_owned(),
+            tool_call_text(&harness, READ_TOKEN, tool, arguments).await,
+        ));
+    }
+
+    let (state, _discord) = vibe_talk::testing::state();
+    if let Ok(mut hidden) = state.hidden_channels.write() {
+        hidden.insert(ChannelId(READ_CHANNEL.to_owned()));
+        hidden.insert(ChannelId(WRITE_CHANNEL.to_owned()));
+    }
+    let empty = Harness {
+        router: router(state),
+        discord: Arc::new(FakeDiscord::new()),
+    };
+    for tool in ["list_channels", "recent_activity"] {
+        let text = tool_call_text(&empty, READ_TOKEN, tool, json!({})).await;
+        assert_eq!(text, "No channels are configured on this server.", "{tool}");
+        said.push((format!("{tool} (no channels)"), text));
+    }
+
+    for (source, text) in said {
+        assert!(
+            !text.to_lowercase().contains("bridge"),
+            "{source} calls something a bridge: {text}"
+        );
+    }
 }

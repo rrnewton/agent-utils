@@ -87,6 +87,10 @@ fn routes(state: AppState) -> Router {
         .route("/manifest.webmanifest", get(api::web_manifest))
         .route("/icons/{name}", get(api::app_icon))
         .route("/api/v1/channels", get(api::list_channels))
+        // `#190 voice-agent-tools`. READ scope: every listed channel's last few hours in one call,
+        // the route behind the `recent_activity` tool. It reads what `/digest` reads, once per
+        // channel, and writes nothing.
+        .route("/api/v1/activity", get(api::activity))
         .route("/api/v1/agent-tools", get(api::agent_tools))
         .route("/api/v1/client-config", get(api::client_config))
         .route("/api/v1/live/events", post(api::ingest_event))

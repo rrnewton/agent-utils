@@ -51,13 +51,13 @@ pub const PROMPT_ID: &str = "voice-agent-system";
 /// Bump this whenever any of the three prompt files changes, and update
 /// [`PINNED_READ_FINGERPRINT`] and [`PINNED_WRITE_FINGERPRINT`] to match. The test that compares
 /// them is what makes the version mean something.
-pub const PROMPT_VERSION: u32 = 4;
+pub const PROMPT_VERSION: u32 = 5;
 
 /// The [`fingerprint`] of the read-only prompt at [`PROMPT_VERSION`].
-pub const PINNED_READ_FINGERPRINT: &str = "fnv1a64:9634bb5965fd2881";
+pub const PINNED_READ_FINGERPRINT: &str = "fnv1a64:2ae49a9c1a7f5a0f";
 
 /// The [`fingerprint`] of the sending prompt at [`PROMPT_VERSION`].
-pub const PINNED_WRITE_FINGERPRINT: &str = "fnv1a64:4122b3d8094282b6";
+pub const PINNED_WRITE_FINGERPRINT: &str = "fnv1a64:1af570f7b68d8020";
 
 /// A content fingerprint a consumer can log without logging the prompt.
 ///
@@ -352,7 +352,7 @@ mod tests {
                 "explicit verbatim-read request",
                 "exactly the text inside those tags",
                 "Do not add, omit, normalize",
-                "Eastern Time",
+                "already in the listener's",
                 "search semantically",
                 "say so briefly and wait",
                 "untrusted data",
@@ -371,6 +371,55 @@ mod tests {
                 "send prompt lost the rule containing {rule:?}"
             );
         }
+    }
+
+    /// `#190 voice-agent-tools`. The rules that keep a filler line from being the whole of a
+    /// response, and the one-call catch-up. A speech runtime that speaks a filler line while a
+    /// tool runs can give up after a round or two that held only filler, and the canned apology
+    /// it then asks for is what a listener hears as "something went wrong".
+    #[test]
+    fn the_base_prompt_pairs_every_filler_line_with_the_call_it_covers() {
+        // Line breaks are the file's wrapping, not part of a rule.
+        let flat = SYSTEM_PROMPT
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        for rule in [
+            "A spoken filler line",
+            "fetches nothing",
+            "the chat tool call must be in that same response, every time",
+            "never say a filler line on its own",
+            "make one recent_activity call",
+            "you do not need list_channels first",
+            "Prefer one call that answers the question over several calls in a row",
+            "never look up the current time",
+        ] {
+            assert!(
+                flat.contains(rule),
+                "the base prompt lost the rule containing {rule:?}"
+            );
+        }
+    }
+
+    /// The prompt once told the model to render every time in one fixed zone, while every chat
+    /// tool says its local time is already in the listener's zone and must not be converted. The
+    /// two cannot both be obeyed by a listener outside that one zone.
+    #[test]
+    fn the_base_prompt_names_no_fixed_time_zone() {
+        for zone in ["Eastern Time", "Eastern", "Pacific Time", "UTC", "GMT"] {
+            assert!(
+                !SYSTEM_PROMPT.contains(zone),
+                "the base prompt names a fixed zone, {zone:?}, which contradicts the tools"
+            );
+        }
+        let flat = SYSTEM_PROMPT
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(
+            flat.contains("Say times exactly as the tools give them"),
+            "{SYSTEM_PROMPT}"
+        );
     }
 
     #[test]

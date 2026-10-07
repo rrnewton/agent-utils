@@ -93,6 +93,12 @@ fn inventory() -> Vec<Route> {
         route("GET", "/manifest.webmanifest", Public, Nothing),
         route("GET", "/icons/{name}", Public, Nothing),
         route("GET", "/api/v1/channels", Read, Nothing),
+        route(
+            "GET",
+            "/api/v1/activity",
+            Read,
+            Query("?hours=5", "?hours=soon"),
+        ),
         route("GET", "/api/v1/agent-tools", Read, Nothing),
         route("GET", "/api/v1/client-config", Read, Nothing),
         route(
