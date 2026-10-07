@@ -19,6 +19,8 @@ copying its manual.
 
 - `agentctl` — start, inspect, message, and retire named agents, including owner-configured
   profiles.
+- `agentctl-chat` — answer the chat requests the agentctl chat bridge types into an agent's
+  pane, between the prompt's marker lines, and check what reached the chat.
 - `wrkslots` — provision and audit isolated Git worktree slots, protect or reclaim their caches,
   record handoff, and remove source only after verified owner absence.
 
