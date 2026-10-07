@@ -7,7 +7,17 @@ description: Answer chat requests that the agentctl chat bridge types into your 
 
 The bridge (`agentctl chat run`) types each chat message from an allowed sender
 into the coordinator's pane as a request prompt, and sends your replies back to
-the chat thread. Use the installed command as the authority:
+the chat thread.
+
+This skill describes the compiled (Rust) bridge, whose prompts say "The user's
+request arrived through the configured chat bridge" and open with the message's
+send time. The Python edition (`py/bin/agentctl chat`) words its prompts
+differently, has no `sent` or `thread` command (it has `chat context --state`)
+and adds no send-time line or delivery ✅; follow its own `--help` and the
+instructions in the prompt it types. When a prompt prints a command, run it as
+printed: it names the service's own executable, so it is the right edition.
+
+For the compiled bridge, use the installed command as the authority:
 
 - `agentctl chat quickstart`
 - `agentctl chat userguide`
@@ -29,8 +39,9 @@ your answer, as many lines as you need
 answer and the closing line after it, in your ordinary turn output. The text
 between them reaches the user twice: in this terminal, where the owner may be
 reading, and in the chat thread. Use the same two lines for every reply to that
-request, including short progress updates during a long task; each block is
-sent as one chat message. Make no tool call between the two lines. If the prompt
+request, including short progress updates during a long task. Each block with
+new text is sent as one chat message; a block whose text the request has
+already sent is not sent again, so give each progress update new wording. Make no tool call between the two lines. If the prompt
 gave a numbered ID instead (`<CHAT_REPLY_<nonce>_1>`), add one to the number for
 each later reply, as the prompt says.
 
