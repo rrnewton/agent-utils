@@ -1034,6 +1034,24 @@ PINS: tuple[Pin, ...] = (
         ),
     ),
     Pin(
+        "chat-late-prompt-seconds",
+        "how much later than its create time a prompt is typed before it says how long it waited, in seconds",
+        code=(
+            Site(
+                "rs/agentctl/src/prompt_time.rs",
+                r"(?m)^pub\(crate\) const LATE_PROMPT_AFTER: Duration = Duration::from_secs\((?P<value>[\d_]+)\);$",
+                "the Rust lateness threshold",
+            ),
+        ),
+        docs=(
+            Site(
+                "rs/agentctl/src/embedded_chat_userguide.md",
+                r"typed\s+(?P<value>[A-Za-z\d,]+)\s+seconds\s+or\s+more\s+after\s+that\s+time",
+                "the lateness threshold the chat guide states",
+            ),
+        ),
+    ),
+    Pin(
         "chat-credential-expiry-warning-hours",
         "how long before a credential's notAfter `delivery-alarm.json` lists it, in hours",
         code=(

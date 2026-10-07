@@ -251,7 +251,17 @@ Herdr/provider evidence. The command accepts one exact key and reports only an
 active retained request. An acceptance harness that later calls `chat close`
 must copy and fsync this inspection document first.
 
-After one line saying that the request arrived through the chat bridge, each
+The first line of each request prompt opens with the message's own create
+time, as `Sent 2026.10.07:08:45 EDT.`, in the bridge service's local time zone:
+the one the C library resolves from `TZ` when it is set, otherwise from the
+host's `/etc/localtime`. Set `TZ` in the service's environment to choose it; the
+zone's abbreviation is always printed, or its offset as `UTC-04:00` when the
+abbreviation is unusable, and UTC is used when the local time cannot be read.
+When the prompt is typed 120 seconds or more after that time, as after a bridge
+outage or behind a busy agent, the line also says how much later, as
+`Sent 2026.10.07:08:45 EDT, delivered 1 h 12 min later.`, so an agent handed
+several held messages at once can tell how old each one is. The rest of that
+line says that the request arrived through the chat bridge. After it, each
 request prompt gives the message's `Source:` ID, its `Sender:`, and its
 `Thread:` ID, and says whether the message starts a new thread or replies in an
 existing one. When a provider payload with schema `google.chat.message.v1`
