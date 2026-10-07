@@ -90,7 +90,7 @@ installs; never change host configuration.
 | A user systemd manager and cgroup v2 | wrkslots per-slot limits and boxes; dagrun | Present on most current Linux distributions. |
 | Passwordless `sudo`, or `/dev/fuse` with `fuse2fs` | disk-image slots (`kernel` or `fuse` backend) | `fuse2fs` is in the e2fsprogs packages of most distributions. |
 | Rust toolchain (`cargo`) | optional: Rust editions, `gh-paced`, building `vibe-talk` | https://rustup.rs |
-| `podman` or another container runtime | optional: deploying `vibe-talk` | Distribution package. |
+| `podman` or another container runtime | optional: the `vibe-talk` container image (a native build works too) | Distribution package. |
 | `gh` | optional: GitHub operations by agents | https://cli.github.com |
 
 After installing Herdr, the owner normally starts it once (`herdr`) so its server is running;
@@ -407,8 +407,22 @@ link to `.agents/skills/` if it has one, and commit the harness. For each tool, 
 - **wrkviz**: `wrkviz quickstart`; point it at the harness transcripts it lists.
 - **gh-paced**: needs `cargo`. Build it from `agent-utils/rs` as its quickstart shows
   (`common/docs/gh-paced/QUICKSTART.md`), then put it in front of the real `gh` for agents.
-- **vibe-talk**: a separately deployed service (container runtime, a chat provider bot, optional
-  voice provider). Follow `agent-utils/vibe-talk/README.md` with the owner.
+- **vibe-talk**: a separately deployed web service; `agent-utils/vibe-talk/QUICKSTART.md` and
+  its README are the reference. What a first run needs, in order:
+  - a native build (`cargo build --release --locked` in `vibe-talk/`), installed to a versioned
+    path rather than run from `target/`, unless the container image works on the host;
+  - configuration and tokens outside any directory the owner syncs between machines;
+  - `[storage] path` set, because the channel views the web app uses return 503 without it while
+    `/healthz` still passes;
+  - the built-in demo provider (`--fake-discord`) to reach a working page before wiring a real chat
+    provider, and `[read_aloud] backend = "browser"` when no voice vendor is configured;
+  - something in front that terminates TLS for the whole origin (HTTPS is required for the
+    microphone and the installable app), listening on the address family the host is reachable
+    on (some hosts are IPv6-only, where `0.0.0.0` is unreachable);
+  - user services for the app and the TLS front end, enabled by the owner.
+  Hand the owner `<URL>/voice` and the path of the token file, never the token itself; they paste
+  the write token into the page once per browser. A host-specific guide, if the owner's
+  environment has one, takes precedence over these generic steps.
 - **pr-landing-planner**: advisory only; `pr-landing-planner quickstart`. Pair it with the
   `pr-landing-operations` skill only where the primary repository's rules authorize landings.
 - **Turn the file-system sandbox on or off**: change `sandbox.isolation` in `.wrkslots.yml`, use
