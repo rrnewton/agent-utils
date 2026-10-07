@@ -180,6 +180,64 @@ def test_a_clock_that_fails_leaves_the_prompt_typed_as_stored(
     assert pane.runs == ["Sent 2026.10.07:08:45 EDT. The user's request."]
 
 
+def _queued_document(tmp_path: Path, message_id: str) -> None:
+    enqueue(str(tmp_path), "placeholder", message_id=message_id)
+    path = tmp_path / f"inbox/{message_id}.json"
+    document = json.loads(path.read_text())
+    document.update({
+        "text": "Sent 2026.10.07:08:45 EDT. The user's request.",
+        "sent_at": "2026-10-07T12:45:00Z",
+        "opening": "Sent 2026.10.07:08:45 EDT. ",
+    })
+    path.write_text(json.dumps(document))
+
+
+def _target() -> Target:
+    return Target(pane_id="w1:p1", session_agent="codex", session_value="session-1",
+                  expected_agent="codex", expected_workspace="acme", expected_cwd="/work")
+
+
+def test_the_service_shutdown_signal_is_not_swallowed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from agentctl.chat import _ServiceTerminated
+
+    _queued_document(tmp_path, "chat-stopping")
+
+    def stopping() -> int:
+        raise _ServiceTerminated()
+
+    monkeypatch.setattr(time, "time_ns", stopping)
+    pane = _Pane()
+    with pytest.raises(_ServiceTerminated):
+        drain(cast(HerdrClient, pane), _target(), str(tmp_path))
+    assert pane.runs == []
+    assert (tmp_path / "inbox/chat-stopping.json").exists()
+    assert not (tmp_path / "inflight/chat-stopping.json").exists()
+
+
+def test_the_delay_is_read_after_the_in_flight_write(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # 119 seconds old before the drain's durable writes, which then take ten minutes.
+    _queued_document(tmp_path, "chat-slow-write")
+    clock = [at(MORNING + 119)]
+    monkeypatch.setattr(time, "time_ns", lambda: clock[0])
+    import agentctl.agent as agent_module
+
+    original = agent_module._atomic_json
+
+    def slow(path: str, document: dict[str, object], *, max_artifact_bytes: int | None = None) -> None:
+        original(path, document, max_artifact_bytes=max_artifact_bytes)
+        if "inflight" in path:
+            clock[0] += 600 * 1_000_000_000
+
+    monkeypatch.setattr(agent_module, "_atomic_json", slow)
+    pane = _Pane()
+    drain(cast(HerdrClient, pane), _target(), str(tmp_path))
+    assert pane.runs == ["Sent 2026.10.07:08:45 EDT, delivered 11 min later. The user's request."]
+
+
 def test_a_prompt_the_rust_bridge_queued_is_retimed_when_python_types_it(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
