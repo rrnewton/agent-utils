@@ -221,6 +221,46 @@ pub const SENT_REPLIES_SCHEMA: &str = "agentctl-chat-sent/v1";
 // How much of each reply's text `chat sent` prints; `--json` carries the whole text.
 const SENT_PREVIEW_CHARACTERS: usize = 300;
 
+/// One reply `chat sent` may list: ordered by its send time, or its capture time when it has no
+/// send time, then by request key and reply number.
+struct SentEntry {
+    message_id: String,
+    thread_id: String,
+    reply: ReplyRecord,
+}
+
+impl SentEntry {
+    fn at(&self) -> u64 {
+        self.reply
+            .sent_at_millis
+            .unwrap_or(self.reply.captured_at_millis)
+    }
+
+    fn order(&self) -> (u64, &str, u32) {
+        (self.at(), &self.reply.request_key, self.reply.ordinal)
+    }
+}
+
+impl PartialEq for SentEntry {
+    fn eq(&self, other: &Self) -> bool {
+        self.order() == other.order()
+    }
+}
+
+impl Eq for SentEntry {}
+
+impl PartialOrd for SentEntry {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for SentEntry {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.order().cmp(&other.order())
+    }
+}
+
 fn default_ack_reaction() -> Option<String> {
     Some("🤖".to_owned())
 }
@@ -6510,9 +6550,9 @@ Lines between will be sent to the user as a chat message. {numbering}",
         {
             prompt.push_str(&format!(
                 "\n\nReply between the two lines as usual: that text reaches the user both in \
-this terminal and in the chat. Only to send a reply before your turn ends, or when a reply \
-between the two lines was reported as not sent, write its text to a file, without the two \
-lines, and run this command with the file's path in place of PATH_TO_YOUR_REPLY: \
+this terminal and in the chat. Only to send a reply before your turn ends, or to resend one \
+written between the two lines that did not reach the chat, write its text to a file, without \
+the two lines, and run this command with the file's path in place of PATH_TO_YOUR_REPLY: \
 {command}\nRun it once for each reply; running it again with the same text \
 does not send that text twice. Send each reply one way only, by this command or between the two \
 lines, not both. If the command fails twice for a reply, print that reply between the two lines \
@@ -6609,7 +6649,12 @@ at the end of your turn instead."
                 "request must be an exact 64-character lowercase hexadecimal key",
             ));
         }
-        let mut entries = Vec::new();
+        let keep = usize::try_from(last).unwrap_or(usize::MAX);
+        // Only the newest `keep` replies are held, each with its request's two identifiers, so
+        // memory stays bounded however many replies the state retains.
+        let mut newest: std::collections::BinaryHeap<std::cmp::Reverse<SentEntry>> =
+            std::collections::BinaryHeap::new();
+        let mut retained = 0_usize;
         {
             let _snapshot = self.lock_state_snapshot()?;
             for (record, _) in self.request_records()? {
@@ -6627,20 +6672,24 @@ at the end of your turn instead."
                         }
                         Err(error) => return Err(error),
                     };
-                    entries.push((record.message.clone(), reply));
+                    retained += 1;
+                    newest.push(std::cmp::Reverse(SentEntry {
+                        message_id: record.message.message_id.clone(),
+                        thread_id: record.message.thread_id.clone(),
+                        reply,
+                    }));
+                    if newest.len() > keep {
+                        newest.pop();
+                    }
                 }
             }
         }
-        let at = |reply: &ReplyRecord| reply.sent_at_millis.unwrap_or(reply.captured_at_millis);
-        entries.sort_by(|left, right| {
-            (at(&right.1), &right.1.request_key, right.1.ordinal).cmp(&(
-                at(&left.1),
-                &left.1.request_key,
-                left.1.ordinal,
-            ))
-        });
-        let retained = entries.len();
-        entries.truncate(usize::try_from(last).unwrap_or(usize::MAX));
+        // Newest first.
+        let entries: Vec<SentEntry> = newest
+            .into_sorted_vec()
+            .into_iter()
+            .map(|std::cmp::Reverse(entry)| entry)
+            .collect();
         let phase = |reply: &ReplyRecord| match reply.phase {
             ReplyPhase::Pending => "pending",
             ReplyPhase::Sending => "sending",
@@ -6649,12 +6698,13 @@ at the end of your turn instead."
         if json {
             let replies = entries
                 .iter()
-                .map(|(message, reply)| {
+                .map(|entry| {
+                    let reply = &entry.reply;
                     json!({
                         "request": reply.request_key,
                         "ordinal": reply.ordinal,
-                        "message_id": message.message_id,
-                        "thread_id": message.thread_id,
+                        "message_id": entry.message_id,
+                        "thread_id": entry.thread_id,
                         "phase": phase(reply),
                         "provider_message_id": reply.provider_message_id,
                         "captured_at_millis": reply.captured_at_millis,
@@ -6679,26 +6729,34 @@ at the end of your turn instead."
             (retained, shown) if shown == retained => {
                 format!("The bridge holds {retained} replies, newest first.\n")
             }
-            (retained, shown) => {
-                format!(
-                    "The bridge holds {retained} replies; the {shown} most recent, newest first.\n"
-                )
-            }
+            (retained, shown) => format!(
+                "The bridge holds {retained} replies; the {shown} most recent, newest first.\n"
+            ),
         };
         output.push_str(
             "It holds the replies of requests that are not retired; the chat thread is the \
 complete record.\n",
         );
-        for (message, reply) in &entries {
-            let outcome = match (&reply.phase, &reply.provider_message_id) {
-                (ReplyPhase::Sent, Some(provider_message_id)) => {
+        for entry in &entries {
+            let reply = &entry.reply;
+            let outcome = match (
+                &reply.phase,
+                &reply.provider_message_id,
+                reply.sent_at_millis,
+            ) {
+                (ReplyPhase::Sent, Some(provider_message_id), Some(_)) => {
                     format!("sent as {}", single_line(provider_message_id))
                 }
-                (ReplyPhase::Sent, None) => "sent".to_owned(),
-                (ReplyPhase::Pending, _) => "captured, not yet sent".to_owned(),
-                (ReplyPhase::Sending, _) => "send in progress or outcome unknown".to_owned(),
+                // A record from before send times were kept: its time is the capture time.
+                (ReplyPhase::Sent, Some(provider_message_id), None) => format!(
+                    "sent as {}; the time shown is when it was captured, its send time is unknown",
+                    single_line(provider_message_id)
+                ),
+                (ReplyPhase::Sent, None, _) => "sent".to_owned(),
+                (ReplyPhase::Pending, _, _) => "captured, not yet sent".to_owned(),
+                (ReplyPhase::Sending, _, _) => "send in progress or outcome unknown".to_owned(),
             };
-            let when = at(reply);
+            let when = entry.at();
             let mut preview: String = reply.body.chars().take(SENT_PREVIEW_CHARACTERS).collect();
             let more = reply
                 .body
@@ -6714,8 +6772,8 @@ complete record.\n",
                 format_age(now, when),
                 reply.ordinal,
                 reply.request_key,
-                single_line(&message.message_id),
-                single_line(&message.thread_id),
+                single_line(&entry.message_id),
+                single_line(&entry.thread_id),
                 quote_lines(&terminal_safe_text(&preview)),
             ));
         }
@@ -30454,6 +30512,77 @@ a fence ```sh here, ~~~~ there, and one ``\u{200b}` hidden"
     }
 
     #[test]
+    fn sent_labels_an_old_record_without_a_send_time_by_its_capture_time() {
+        let (state, key, nonce, root) = open_request("sent-legacy-record");
+        state
+            .submit_reply(&key, &format!("{nonce}_1"), "an old answer")
+            .expect("store the reply");
+        let mut transport = FakeReplyTransport::default();
+        state
+            .publish_one(&key, &mut transport)
+            .expect("send the reply")
+            .expect("a reply was sent");
+        // A record from before send times were kept: sent, with no sent_at_millis.
+        let path = state.reply_path(&key, 1);
+        let mut record: Value =
+            serde_json::from_slice(&fs::read(&path).expect("read reply")).expect("JSON reply");
+        record
+            .as_object_mut()
+            .expect("reply object")
+            .remove("sent_at_millis");
+        fs::write(&path, serde_json::to_vec(&record).expect("encode")).expect("write reply");
+        let listing = state.sent_replies(None, 10, false).expect("listing");
+        assert!(
+            listing.contains(
+                "sent as messages/reply-1; the time shown is when it was captured, its send time \
+is unknown\n"
+            ),
+            "{listing}"
+        );
+        let document: Value =
+            serde_json::from_str(&state.sent_replies(None, 10, true).expect("json")).expect("JSON");
+        assert!(document["replies"][0]["sent_at_millis"].is_null());
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn sent_keeps_only_the_newest_replies_across_requests() {
+        let root = temporary("sent-many");
+        let state = BridgeState::initialize(&root, config()).expect("initialize state");
+        for (sequence, key) in admitted(&state, 3).into_iter().enumerate() {
+            let sequence = sequence + 1;
+            let nonce = state.read_request(&key).expect("request").reply_nonce;
+            for ordinal in 1..=4_u32 {
+                state
+                    .submit_reply(
+                        &key,
+                        &format!("{nonce}_{ordinal}"),
+                        &format!("answer {sequence}.{ordinal}"),
+                    )
+                    .expect("store a reply");
+            }
+        }
+        let document: Value =
+            serde_json::from_str(&state.sent_replies(None, 5, true).expect("json")).expect("JSON");
+        assert_eq!(document["retained"], 12);
+        let replies = document["replies"].as_array().expect("replies");
+        assert_eq!(replies.len(), 5);
+        let at = |reply: &Value| reply["captured_at_millis"].as_u64().expect("time");
+        for pair in replies.windows(2) {
+            assert!(at(&pair[0]) >= at(&pair[1]), "{replies:?}");
+        }
+        // The kept five are the newest of all twelve.
+        let oldest_kept = at(&replies[4]);
+        let all: Value = serde_json::from_str(&state.sent_replies(None, 100, true).expect("json"))
+            .expect("JSON");
+        let all = all["replies"].as_array().expect("replies");
+        assert_eq!(all.len(), 12);
+        assert!(all[5..].iter().all(|reply| at(reply) <= oldest_kept));
+        assert_eq!(&all[..5], &replies[..]);
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
     fn a_reply_stored_by_command_is_held_once_whichever_way_it_arrives_first() {
         // `chat reply` stores a reply as if it had been read between the two marker lines, so a
         // text that also reaches the screen is held once, whichever comes first, and running the
@@ -31020,9 +31149,9 @@ a fence ```sh here, ~~~~ there, and one ``\u{200b}` hidden"
                 "Lines between will be sent to the user as a chat message. Use the same two lines \
 for every reply, with no tool call between them.\n\n\
 Reply between the two lines as usual: that text reaches the user both in this terminal and in the \
-chat. Only to send a reply before your turn ends, or when a reply between the two lines was \
-reported as not sent, write its text to a file, without the two lines, and run this command with \
-the file's path in place of PATH_TO_YOUR_REPLY: {program} chat reply \
+chat. Only to send a reply before your turn ends, or to resend one written between the two lines \
+that did not reach the chat, write its text to a file, without the two lines, and run this command \
+with the file's path in place of PATH_TO_YOUR_REPLY: {program} chat reply \
 --bridge-state {root_word} --request {key} --reply-id 001 --file PATH_TO_YOUR_REPLY\n\
 Run it once for each reply; running it again with the same text does not send that text twice. \
 Send each reply one way only, by this command or between the two lines, not both. If the command \
