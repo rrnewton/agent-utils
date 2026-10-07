@@ -143,12 +143,11 @@ def retime(text: str, sent_at: object, recorded: object, now_nanos: int | None =
             or not recorded.startswith("Sent ") or not text.startswith(recorded)
             or rfc3339_instant(sent_at) is None):
         return text
-    now = time.time_ns() if now_nanos is None else now_nanos
-    # The compiled drain reads its clock in milliseconds; the same instant renders the same text.
-    now = now // 1_000_000 * 1_000_000
     try:
-        fresh = opening(sent_at, now)
-    except (ArithmeticError, OSError, ValueError):
-        # The drain calls this after it marks the prompt in flight: never fail there.
+        now = time.time_ns() if now_nanos is None else now_nanos
+        # The compiled drain reads its clock in milliseconds; the same instant renders the same
+        # text.
+        fresh = opening(sent_at, now // 1_000_000 * 1_000_000)
+    except Exception:  # noqa: BLE001 - a stamp must never stop a prompt being typed
         return text
     return fresh + text[len(recorded):] if fresh else text

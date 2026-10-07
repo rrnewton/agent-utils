@@ -1921,6 +1921,9 @@ def _drain(
                         document["delivery_blocked_at"] = time.time()
                         _atomic_json(path, document, max_artifact_bytes=max_artifact_bytes)
                     break
+                # The text is decided before the barrier below, so nothing about it can fail
+                # once the prompt is marked in flight.
+                typed_text = _typed_text(document)
                 # ``inflight`` is a durable at-most-once barrier. Once this rename commits, a
                 # crash is treated as possibly submitted. Readiness was already proven above;
                 # this transition occurs immediately before pane.run.
@@ -1939,7 +1942,7 @@ def _drain(
                 try:
                     try:
                         _deliver_one(
-                            client, info, _typed_text(document), working_timeout=working_timeout,
+                            client, info, typed_text, working_timeout=working_timeout,
                         )
                     except _NotStaged as exc:
                         # Nothing reached the composer: undo the at-most-once barrier so the

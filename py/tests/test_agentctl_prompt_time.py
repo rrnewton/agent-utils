@@ -87,6 +87,17 @@ def test_a_clock_the_rust_drain_reads_in_milliseconds_is_read_the_same_way() -> 
             == "Sent 2026.10.07:08:45 EDT, delivered 2 min later. Request.")
 
 
+def test_retime_keeps_the_stored_text_when_the_opening_cannot_be_rendered(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def broken(_created_at: str, _now_nanos: int) -> str:
+        raise ValueError("year 0 is out of range")
+
+    monkeypatch.setattr(prompt_time, "opening", broken)
+    queued = "Sent 2026.10.07:08:45 EDT. Request."
+    assert prompt_time.retime(queued, "2026-10-07T12:45:00Z", "Sent 2026.10.07:08:45 EDT. ", at(MORNING)) == queued
+
+
 def test_retime_never_raises_once_the_prompt_is_in_flight(monkeypatch: pytest.MonkeyPatch) -> None:
     def broken(_seconds: float | None = None) -> time.struct_time:
         raise OverflowError("timestamp out of range for platform time_t")
@@ -142,6 +153,31 @@ class _Pane:
     def read(self, pane_id: str, *, source: str, lines: int) -> str:
         del pane_id, source, lines
         return ""
+
+
+def test_a_clock_that_fails_leaves_the_prompt_typed_as_stored(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    enqueue(str(tmp_path), "placeholder", message_id="chat-clockless")
+    path = tmp_path / "inbox/chat-clockless.json"
+    document = json.loads(path.read_text())
+    document.update({
+        "text": "Sent 2026.10.07:08:45 EDT. The user's request.",
+        "sent_at": "2026-10-07T12:45:00Z",
+        "opening": "Sent 2026.10.07:08:45 EDT. ",
+    })
+    path.write_text(json.dumps(document))
+
+    def no_clock() -> int:
+        raise OSError("clock_gettime failed")
+
+    monkeypatch.setattr(time, "time_ns", no_clock)
+    pane = _Pane()
+    target = Target(pane_id="w1:p1", session_agent="codex", session_value="session-1",
+                    expected_agent="codex", expected_workspace="acme", expected_cwd="/work")
+    result = drain(cast(HerdrClient, pane), target, str(tmp_path))
+    assert result.delivered == ("chat-clockless",)
+    assert pane.runs == ["Sent 2026.10.07:08:45 EDT. The user's request."]
 
 
 def test_a_prompt_the_rust_bridge_queued_is_retimed_when_python_types_it(
