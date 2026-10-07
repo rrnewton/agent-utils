@@ -777,7 +777,7 @@ pub fn submit_verified(
     let mut next_press = runtime.monotonic().saturating_add(wait);
     let submit_deadline = runtime.monotonic().saturating_add(timeouts.submit);
     let mut left_composer = false;
-    loop {
+    'submitting: loop {
         runtime.sleep(POLL);
         if runtime.cancelled() {
             return cancelled_after_typing();
@@ -836,9 +836,16 @@ pub fn submit_verified(
                             break;
                         };
                         let read_at = runtime.monotonic();
-                        observed = composer_view(harness, &screen)
-                            .filter(|view| !staged(view, text, placeholders_before))
-                            .map(|view| (view, screen, read_at));
+                        observed = match composer_view(harness, &screen) {
+                            // The prompt is staged again: the empty composer that seemed to prove
+                            // the submission was a transient redraw, and the key may have been
+                            // dropped. Without printed evidence nothing is proved, so the staged
+                            // path resumes, pressing the key again on its schedule.
+                            Some(view) if staged(&view, text, placeholders_before) => {
+                                continue 'submitting;
+                            }
+                            view => view.map(|view| (view, screen, read_at)),
+                        };
                     }
                     return Ok(Submission::Verified(receipt));
                 }
@@ -2258,6 +2265,34 @@ mod tests {
         ));
         assert!(receipt.printed, "{receipt:?}");
         assert_eq!(receipt.evidence, "prompt text appeared above the composer");
+    }
+
+    #[test]
+    fn a_prompt_staged_again_after_a_transient_empty_composer_is_not_verified() {
+        // The key was dropped: one redraw after it looks empty, so the running-turn marker that
+        // was already showing seems to corroborate a submission, and then the prompt is staged
+        // in the composer again on every read. Nothing proved the submission, so the key is
+        // pressed again until the deadline, and the prompt is reported as not submitted.
+        let busy = claude_screen(&["• earlier"], "", BUSY_STATUS);
+        let staged = claude_screen(&["• earlier"], "run the tests", BUSY_STATUS);
+        let frames = Frames::new(busy.clone(), staged.clone(), vec![busy, staged]);
+        let clock = Clock::default();
+        let outcome = submit_verified(
+            &frames,
+            "w1:p1",
+            "claude",
+            "run the tests",
+            SubmitTimeouts::default(),
+            &clock,
+        );
+        match outcome {
+            Err(error) => assert!(
+                error.to_string().contains("it was NOT submitted"),
+                "{error}"
+            ),
+            other => panic!("expected the prompt to be reported as not submitted, got {other:?}"),
+        }
+        assert!(frames.keys.lock().unwrap().len() > 1);
     }
 
     #[test]
