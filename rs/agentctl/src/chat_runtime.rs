@@ -5450,6 +5450,8 @@ impl BridgeState {
         let credential_evidence = match &credential_record {
             Ok(None) => "none",
             Err(_) => "unreadable",
+            // Observed later than now, as after the clock was set back: its age is unknown.
+            Ok(Some(record)) if record.observed_at_millis > now_millis => "untrusted",
             Ok(Some(record))
                 if u128::from(now_millis.saturating_sub(record.observed_at_millis))
                     > CREDENTIAL_RECORD_STALE_AFTER.as_millis() =>
@@ -5698,10 +5700,12 @@ impl BridgeState {
             Ok(_) => {}
         }
         let record: CredentialRecord = read_document(&path, 1 << 20)?;
-        let states_valid = record
-            .files
-            .iter()
-            .all(|file| matches!(file.state.as_str(), "present" | "missing" | "unreadable"));
+        let states_valid = record.files.iter().all(|file| {
+            matches!(
+                file.state.as_str(),
+                "present" | "missing" | "unreadable" | "inaccessible"
+            )
+        });
         if record.schema != CREDENTIAL_RECORD_SCHEMA || !states_valid {
             return Err(ChatRuntimeError::invalid(
                 "the provider credential record is inconsistent",
@@ -28286,6 +28290,10 @@ a fence ```sh here, ~~~~ there, and one ``\u{200b}` hidden"
             .write_credential_record(&files, stale_at)
             .expect("save an old record");
         let stale = evidence(&state);
+        state
+            .write_credential_record(&files, unix_millis() + 3_600_000)
+            .expect("save a record from the future");
+        let future = evidence(&state);
         fs::write(root.join(CREDENTIAL_RECORD_FILE), b"not json").expect("corrupt the record");
         let unreadable = evidence(&state);
         fs::remove_dir_all(root).expect("cleanup");
@@ -28298,6 +28306,9 @@ a fence ```sh here, ~~~~ there, and one ``\u{200b}` hidden"
         // An old observation still shows what it saw, marked stale.
         assert_eq!(stale.0, "stale");
         assert_eq!(stale.2[0]["problem"], "missing");
+        // A record observed later than now (a clock set back) is not trusted as current.
+        assert_eq!(future.0, "untrusted");
+        assert_eq!(future.1, "untrusted");
         // A corrupt record is unreadable evidence, not a clean bill.
         assert_eq!(unreadable.0, "unreadable");
         assert_eq!(unreadable.1, "unreadable");

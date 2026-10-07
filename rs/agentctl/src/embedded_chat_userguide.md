@@ -1276,19 +1276,23 @@ once at startup. Each delivery scan saves what it saw in
 `provider-credentials.json` whenever that changes, and at least every 300
 seconds, with `observed_at_millis`. `chat status` reports that record in
 `credentials`, as `evidence`, `stale_after_seconds`, `observed_at_millis` and
-`files`, each file with its `variable`, `state` (`present`, `missing` or
-`unreadable`), `not_after_millis` (negative before 1970), and `problem`.
+`files`, each file with its `variable`, `state` (`present`, `missing`,
+`unreadable` for a regular file that cannot be read, or `inaccessible` when
+the path cannot be examined at all, as under a directory the service cannot
+search), `not_after_millis` (negative before 1970), and `problem`.
 `chat status` reads the record rather than its own environment, which may
 lack the service's. `evidence` says how far to trust it: `none` before the
 service has saved one, `current`, `stale` once the observation is older than
-600 seconds (a stopped service, or a previous run's record), or `unreadable`
-when the record cannot be read; `delivery_alarm.credential_evidence` repeats
+600 seconds (a stopped service, or a previous run's record), `untrusted` when
+it is timed later than now (a clock set back), or `unreadable` when the
+record cannot be read; `delivery_alarm.credential_evidence` repeats
 it, so missing evidence never reads as no problems. A file that is missing, unreadable, expired, or
 within 24 hours of its notAfter is listed in `credential_problems` in
 `delivery-alarm.json` and in `chat status`'s `delivery_alarm`, even while the
 provider still works, so the problem shows a day before the outage. When a
 subscription or send failure happens while a file is missing, unreadable or
-expired, `last_error_class` names that file, as in
+expired, `last_error_class` names that file (an inaccessible path, not known
+to be a file, is reported but never named as the cause), as in
 `credential file missing: SOME_TLS_CERT_PATH` or
 `credential expired 12 h ago: SOME_TLS_CERT_PATH`, and the provider's own
 message stays in `last_error`. The files are read before the state lock is

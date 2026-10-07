@@ -32,7 +32,8 @@ pub(crate) struct CredentialFile {
     /// The environment variable that names the file. Its value, the path, is never reported:
     /// the bridge keeps the plugin and helper environment's values out of its state and status.
     pub(crate) variable: String,
-    /// `present`, `missing` or `unreadable`.
+    /// `present`, `missing`, `unreadable` (a regular file that cannot be read) or
+    /// `inaccessible` (the path cannot be examined, so it is not known to be a file).
     pub(crate) state: String,
     /// The notAfter of the first PEM certificate in the file, in milliseconds since the Unix
     /// epoch (negative before 1970); absent when the file holds no certificate this module can
@@ -46,6 +47,8 @@ pub(crate) struct CredentialFile {
 pub(crate) enum CredentialProblemKind {
     Missing,
     Unreadable,
+    /// The path cannot be examined, so whether it is a credential file at all is unknown.
+    Inaccessible,
     Expired,
     /// Valid now, but within [`CREDENTIAL_EXPIRY_WARNING`] of its notAfter.
     Expiring,
@@ -56,14 +59,16 @@ impl CredentialProblemKind {
         match self {
             Self::Missing => "missing",
             Self::Unreadable => "unreadable",
+            Self::Inaccessible => "inaccessible",
             Self::Expired => "expired",
             Self::Expiring => "expiring",
         }
     }
 
-    /// Whether the problem can explain a provider failure: an expiring certificate still works.
+    /// Whether the problem can explain a provider failure: an expiring certificate still works,
+    /// and a path that cannot be examined is not known to be a credential file.
     pub(crate) fn explains_failure(self) -> bool {
-        self != Self::Expiring
+        !matches!(self, Self::Expiring | Self::Inaccessible)
     }
 }
 
@@ -87,6 +92,7 @@ impl CredentialFile {
                 }
                 _ => None,
             },
+            "inaccessible" => Some(CredentialProblemKind::Inaccessible),
             _ => Some(CredentialProblemKind::Unreadable),
         }
     }
@@ -101,6 +107,9 @@ impl CredentialFile {
         Some(match self.problem(now_millis)? {
             CredentialProblemKind::Missing => format!("credential file missing: {variable}"),
             CredentialProblemKind::Unreadable => format!("credential file unreadable: {variable}"),
+            CredentialProblemKind::Inaccessible => {
+                format!("credential path cannot be examined: {variable}")
+            }
             CredentialProblemKind::Expired => {
                 format!(
                     "credential expired {} h ago: {variable}",
@@ -175,10 +184,13 @@ pub(crate) fn inspect<'a>(
             continue;
         }
         let (state, not_after_millis) = match read_bounded(path) {
-            Ok(Some(contents)) => ("present", first_certificate_not_after_millis(&contents)),
-            Ok(None) => continue,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => ("missing", None),
-            Err(_) => ("unreadable", None),
+            FileRead::Contents(contents) => {
+                ("present", first_certificate_not_after_millis(&contents))
+            }
+            FileRead::NotAFile => continue,
+            FileRead::Missing => ("missing", None),
+            FileRead::Unreadable => ("unreadable", None),
+            FileRead::Inaccessible => ("inaccessible", None),
         };
         files.push(CredentialFile {
             variable: name.clone(),
@@ -198,33 +210,55 @@ pub(crate) fn process_environment(name: &str) -> Option<OsString> {
     std::env::var_os(name)
 }
 
-/// Read at most [`MAX_CREDENTIAL_FILE_BYTES`] of `path`; `None` when it is not a regular file.
-/// The file is opened once, without blocking, and checked through that descriptor, so a path
-/// swapped for a pipe or device between a check and the open cannot make the read wait. When the
-/// open fails, a path that exists but is not a regular file (an inaccessible directory, a socket)
-/// is still not a credential file.
-fn read_bounded(path: &Path) -> io::Result<Option<Vec<u8>>> {
+/// What reading a credential path found.
+enum FileRead {
+    /// A regular file, read up to [`MAX_CREDENTIAL_FILE_BYTES`].
+    Contents(Vec<u8>),
+    /// The path exists and is not a regular file.
+    NotAFile,
+    Missing,
+    /// A regular file that cannot be read.
+    Unreadable,
+    /// Neither the open nor a look at the path's type worked, as under a directory this process
+    /// cannot search, so it is not known to be a file.
+    Inaccessible,
+}
+
+/// Read at most [`MAX_CREDENTIAL_FILE_BYTES`] of `path`. The file is opened once, without
+/// blocking, and checked through that descriptor, so a path swapped for a pipe or device between
+/// a check and the open cannot make the read wait. When the open fails, the path's type decides:
+/// a non-file is not a credential file, a regular file is unreadable, and an unknown type is
+/// inaccessible.
+fn read_bounded(path: &Path) -> FileRead {
     let file = match fs::OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_NONBLOCK)
         .open(path)
     {
         Ok(file) => file,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Err(error),
-        Err(error) => {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return FileRead::Missing,
+        Err(_) => {
             return match fs::metadata(path) {
-                Ok(metadata) if !metadata.is_file() => Ok(None),
-                _ => Err(error),
+                Ok(metadata) if metadata.is_file() => FileRead::Unreadable,
+                Ok(_) => FileRead::NotAFile,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => FileRead::Missing,
+                Err(_) => FileRead::Inaccessible,
             }
         }
     };
-    if !file.metadata()?.is_file() {
-        return Ok(None);
+    match file.metadata() {
+        Ok(metadata) if !metadata.is_file() => return FileRead::NotAFile,
+        Ok(_) => {}
+        Err(_) => return FileRead::Unreadable,
     }
     let mut contents = Vec::new();
-    file.take(MAX_CREDENTIAL_FILE_BYTES)
-        .read_to_end(&mut contents)?;
-    Ok(Some(contents))
+    match file
+        .take(MAX_CREDENTIAL_FILE_BYTES)
+        .read_to_end(&mut contents)
+    {
+        Ok(_) => FileRead::Contents(contents),
+        Err(_) => FileRead::Unreadable,
+    }
 }
 
 fn first_certificate_not_after_millis(contents: &[u8]) -> Option<i64> {
@@ -641,6 +675,54 @@ mod tests {
             .expect("unlock directory");
         fs::remove_dir_all(&directory).expect("cleanup");
         assert!(files.is_empty(), "{files:?}");
+    }
+
+    #[test]
+    fn a_path_under_an_unsearchable_directory_is_inaccessible_and_explains_no_failure() {
+        let directory = temporary("unsearchable");
+        let parent = directory.join("parent");
+        fs::create_dir(&parent).expect("create parent");
+        let file = parent.join("cert.pem");
+        fs::write(&file, UTC_TIME_CERTIFICATE).expect("write certificate");
+        fs::set_permissions(&parent, std::os::unix::fs::PermissionsExt::from_mode(0o000))
+            .expect("lock parent");
+        let names = ["HIDDEN".to_owned()];
+        let files = inspect(&names, |_| Some(file.clone().into_os_string()));
+        fs::set_permissions(&parent, std::os::unix::fs::PermissionsExt::from_mode(0o700))
+            .expect("unlock parent");
+        fs::remove_dir_all(&directory).expect("cleanup");
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].state, "inaccessible");
+        assert_eq!(
+            files[0].problem(0),
+            Some(CredentialProblemKind::Inaccessible)
+        );
+        assert_eq!(
+            files[0].describe(0).as_deref(),
+            Some("credential path cannot be examined: HIDDEN")
+        );
+        // Not known to be a credential file, so it does not stand in for a provider error.
+        assert_eq!(failure_explanation(&files, 0), None);
+        assert_eq!(problems(&files, 0)[0].problem, "inaccessible");
+    }
+
+    #[test]
+    fn a_regular_file_that_cannot_be_read_is_unreadable() {
+        let directory = temporary("unreadable");
+        let file = directory.join("cert.pem");
+        fs::write(&file, UTC_TIME_CERTIFICATE).expect("write certificate");
+        fs::set_permissions(&file, std::os::unix::fs::PermissionsExt::from_mode(0o000))
+            .expect("lock file");
+        let names = ["LOCKED".to_owned()];
+        let files = inspect(&names, |_| Some(file.clone().into_os_string()));
+        fs::set_permissions(&file, std::os::unix::fs::PermissionsExt::from_mode(0o600))
+            .expect("unlock file");
+        fs::remove_dir_all(&directory).expect("cleanup");
+        assert_eq!(files[0].state, "unreadable");
+        assert_eq!(
+            failure_explanation(&files, 0).as_deref(),
+            Some("credential file unreadable: LOCKED")
+        );
     }
 
     #[test]
