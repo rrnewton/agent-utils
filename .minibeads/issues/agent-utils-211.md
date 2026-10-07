@@ -1,10 +1,11 @@
 ---
 title: 'link-filter: a Links toggle beside Pinned that shows only each message''s links, clickable, and a bigger search glass'
-status: open
+status: closed
 priority: 2
 issue_type: feature
 created_at: 2026-10-07T16:10:43.292994545+00:00
-updated_at: 2026-10-07T16:10:43.292994545+00:00
+updated_at: 2026-10-07T17:46:40.607113469+00:00
+closed_at: 2026-10-07T17:46:40.607113349+00:00
 ---
 
 # Description
