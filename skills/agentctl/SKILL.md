@@ -22,8 +22,12 @@ start, split, move, message or read agent panes with raw `herdr agent start`,
 SPLITS the caller's current tab. It also skips the launch profile, so the new
 agent comes up without its owner-configured flags. agentctl creates a labelled
 tab in the configured workspace, and it moves a split agent into its own tab.
-If agentctl itself fails or lacks a capability, REPAIR agentctl in its source
-repository and land the fix. Do not route around it with raw herdr calls.
+agentctl is beta software. If it fails or lacks a capability, do not route
+around it with raw herdr calls. Fix it instead: file a bug report in agentctl's
+issue tracker (the project repository named in its package metadata) with the
+exact command, output, and `agentctl --version`; optionally open a pull request
+with the fix; and meanwhile run your patched agentctl locally, telling the owner
+that you are.
 Exception: the owner explicitly asks for a raw operation.
 
 To start a named local profile, first list the profiles in the intended working
