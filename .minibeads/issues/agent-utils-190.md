@@ -1,12 +1,13 @@
 ---
 title: 'voice-agent-tools: confirm the voice agent can read channels now that it connects'
-status: open
+status: closed
 priority: 2
 issue_type: task
 labels:
 - vibe-talk
 created_at: 2026-10-04T10:09:55.533695979+00:00
-updated_at: 2026-10-04T10:09:55.533695979+00:00
+updated_at: 2026-10-07T09:51:50.404823391+00:00
+closed_at: 2026-10-07T09:51:50.404823090+00:00
 ---
 
 # Description
