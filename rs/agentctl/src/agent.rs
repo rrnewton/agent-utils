@@ -3112,7 +3112,7 @@ mod tests {
             &runtime,
         )
         .unwrap();
-        assert_eq!(result.delivered, [result.message_id.clone()]);
+        assert_eq!(result.delivered, std::slice::from_ref(&result.message_id));
         assert_eq!(
             *runtime.printed.lock().expect("noted prompts"),
             [result.message_id]
