@@ -1,7 +1,7 @@
 //! Wall-clock access behind a trait, so the pacing engine can be driven by a fake clock in tests.
 
-use std::sync::{Mutex, OnceLock};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::sync::Mutex;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// Source of the current time and of blocking sleeps.
 ///
@@ -15,7 +15,8 @@ pub trait Clock: Send + Sync {
     fn sleep(&self, secs: f64);
     /// Seconds from an arbitrary origin on a clock that never moves backwards, for measuring
     /// how long something has taken: setting the system time back or forward does not change
-    /// it. The default is [`Clock::now`], which suits clocks that only move forward.
+    /// it, and time the machine spends suspended counts. The default is [`Clock::now`], which
+    /// suits clocks that only move forward.
     fn monotonic(&self) -> f64 {
         self.now()
     }
@@ -39,11 +40,35 @@ impl Clock for RealClock {
         }
     }
 
-    /// Seconds since this process first asked.
+    /// [`boottime`].
     fn monotonic(&self) -> f64 {
-        static ORIGIN: OnceLock<Instant> = OnceLock::new();
-        ORIGIN.get_or_init(Instant::now).elapsed().as_secs_f64()
+        boottime()
     }
+}
+
+/// Seconds since boot on Linux's `CLOCK_BOOTTIME`, which never moves backwards, is not changed
+/// by setting the system time, and keeps counting while the machine is suspended.
+/// `std::time::Instant` reads `CLOCK_MONOTONIC` instead, which stops during suspend, so a wait
+/// measured with it would leave out the time the machine slept.
+///
+/// If the kernel refuses `CLOCK_BOOTTIME` (Linux has had it since 2.6.39), this reads
+/// `CLOCK_MONOTONIC`, which starts from the same boot origin but leaves out suspended time.
+/// Linux always has `CLOCK_MONOTONIC`; `std::time::Instant::now` panics without it, and so does
+/// this.
+pub fn boottime() -> f64 {
+    read_clock(libc::CLOCK_BOOTTIME)
+        .or_else(|| read_clock(libc::CLOCK_MONOTONIC))
+        .expect("clock_gettime(CLOCK_MONOTONIC) failed")
+}
+
+fn read_clock(id: libc::clockid_t) -> Option<f64> {
+    let mut ts = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // SAFETY: clock_gettime writes one timespec through a valid, exclusive pointer.
+    let rc = unsafe { libc::clock_gettime(id, &mut ts) };
+    (rc == 0).then(|| ts.tv_sec as f64 + ts.tv_nsec as f64 / 1e9)
 }
 
 /// A deterministic clock for tests: `sleep` advances the time instantly and is recorded.
@@ -131,5 +156,34 @@ mod tests {
         clock.sleep(0.05);
         let took = clock.monotonic() - before;
         assert!((0.05..5.0).contains(&took), "measured {took} s");
+    }
+
+    /// The real clock measures on boot time, the clock that keeps counting while the machine is
+    /// suspended. `/proc/uptime` is the kernel's own report of that clock (fs/proc/uptime.c reads
+    /// it with `ktime_get_boottime_ts64`), truncated to hundredths of a second, so the real
+    /// clock must read it exactly when compared within that resolution. A clock measured from
+    /// the process start (`Instant` elapsed) reads near zero here and fails; plain
+    /// `CLOCK_MONOTONIC` fails too once the machine has been suspended, because it leaves the
+    /// suspended time out.
+    #[test]
+    fn real_clock_monotonic_is_boot_time() {
+        let clock = RealClock;
+        let before = clock.monotonic();
+        let text = std::fs::read_to_string("/proc/uptime").expect("read /proc/uptime");
+        let after = clock.monotonic();
+        let uptime: f64 = text
+            .split_whitespace()
+            .next()
+            .and_then(|f| f.parse().ok())
+            .expect("parse /proc/uptime");
+        assert!(
+            before - 0.011 <= uptime && uptime <= after,
+            "real clock read {before}..{after} s around /proc/uptime {uptime} s"
+        );
+        let monotonic = read_clock(libc::CLOCK_MONOTONIC).expect("CLOCK_MONOTONIC");
+        assert!(
+            clock.monotonic() >= monotonic,
+            "boot time never trails CLOCK_MONOTONIC ({monotonic} s)"
+        );
     }
 }

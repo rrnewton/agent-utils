@@ -275,7 +275,8 @@ pub fn lock_within_noting(paths: &Paths, wait_secs: f64) -> Result<(LockGuard, b
     } else {
         LOCK_WAIT_SECS
     };
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs_f64(wait);
+    // Measured on CLOCK_BOOTTIME, so time the machine spends suspended counts against the bound.
+    let deadline = crate::clock::boottime() + wait;
     let mut pause = std::time::Duration::from_millis(1);
     let mut contended = false;
     loop {
@@ -289,15 +290,15 @@ pub fn lock_within_noting(paths: &Paths, wait_secs: f64) -> Result<(LockGuard, b
             Some(libc::EINTR) => continue,
             Some(libc::EWOULDBLOCK) => {
                 contended = true;
-                let left = deadline.saturating_duration_since(std::time::Instant::now());
-                if left.is_zero() {
+                let left = deadline - crate::clock::boottime();
+                if left <= 0.0 {
                     return Err(format!(
                         "{} is still held by another gh-paced process after {wait} s; that \
                          process is stopped or stuck (GH_PACED_LOCK_WAIT sets this bound)",
                         paths.lock().display()
                     ));
                 }
-                std::thread::sleep(pause.min(left));
+                std::thread::sleep(pause.min(std::time::Duration::from_secs_f64(left)));
                 pause = (pause * 2).min(std::time::Duration::from_millis(50));
             }
             _ => return Err(format!("cannot lock {}: {err}", paths.lock().display())),
