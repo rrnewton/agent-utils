@@ -1462,13 +1462,17 @@ const SLACK: f64 = 0.25;
 
 /// A clock that runs at the rate of real time from `T0`, plus every sleep and every
 /// [`RealRateClock::advance`], which pass at once. A real wait for the state lock therefore
-/// shows on it as it would on the system clock, and a call's whole stay can be read from it.
-/// With `lock_after_sleep` set, another process takes the state lock after every sleep and
-/// keeps it for that long of real time.
+/// shows on it as it would on the system clock, and a call's whole stay can be read from its
+/// monotonic reading. With `lock_after_sleep` set, another process takes the state lock after
+/// every sleep and keeps it for that long of real time. Its wall time (`now`) is its monotonic
+/// reading less every [`RealRateClock::rewind`], as when the system time is set back; with
+/// `rewind_after_sleep` set, every sleep also sets it back that far.
 struct RealRateClock {
     start: Instant,
     skipped: Mutex<f64>,
+    rewound: Mutex<f64>,
     lock_after_sleep: Option<(Paths, Duration)>,
+    rewind_after_sleep: f64,
     holders: Mutex<Vec<std::thread::JoinHandle<()>>>,
 }
 
@@ -1477,7 +1481,9 @@ impl RealRateClock {
         Self {
             start: Instant::now(),
             skipped: Mutex::new(0.0),
+            rewound: Mutex::new(0.0),
             lock_after_sleep,
+            rewind_after_sleep: 0.0,
             holders: Mutex::new(Vec::new()),
         }
     }
@@ -1485,6 +1491,11 @@ impl RealRateClock {
     /// Let `secs` pass at once.
     fn advance(&self, secs: f64) {
         *self.skipped.lock().unwrap() += secs;
+    }
+
+    /// Set the wall time back by `secs`; the monotonic reading does not move.
+    fn rewind(&self, secs: f64) {
+        *self.rewound.lock().unwrap() += secs;
     }
 
     /// Wait for every lock holder started after a sleep to finish, and return how many there were.
@@ -1498,11 +1509,16 @@ impl RealRateClock {
 
 impl Clock for RealRateClock {
     fn now(&self) -> f64 {
+        self.monotonic() - *self.rewound.lock().unwrap()
+    }
+
+    fn monotonic(&self) -> f64 {
         T0 + self.start.elapsed().as_secs_f64() + *self.skipped.lock().unwrap()
     }
 
     fn sleep(&self, secs: f64) {
         self.advance(secs.max(0.0));
+        self.rewind(self.rewind_after_sleep);
         if let Some((paths, hold)) = &self.lock_after_sleep {
             let holder = hold_lock(paths, *hold);
             self.holders.lock().unwrap().push(holder);
@@ -1721,6 +1737,90 @@ fn credential_get_that_gets_the_lock_past_its_bound_is_refused() {
     assert!(clock.now() > before, "time passed during the call");
     let _ = std::fs::remove_dir_all(&dir);
     let _ = std::fs::remove_dir_all(&dir0);
+}
+
+/// A credential call's stay is measured on the monotonic clock, so setting the system time back
+/// while it waits does not lengthen its bound: neither the wait for the state lock after a sleep,
+/// nor the check that refuses a call that got the lock only after its bound.
+#[test]
+fn credential_get_bound_is_measured_on_the_monotonic_clock() {
+    let dir = scratch("cred-rewind");
+    let paths = Paths::new(dir.clone(), "replay");
+    let cfg = Config {
+        git_credential_max_wait_secs: 10.0,
+        ..Config::default()
+    };
+    // As in the state-lock test above, with the system time set back 120 s during the sleep:
+    // the lock is still waited for only for the 0.6 s left, not the whole GH_PACED_LOCK_WAIT.
+    let clock = RealRateClock {
+        rewind_after_sleep: 120.0,
+        ..RealRateClock::new(Some((paths.clone(), Duration::from_secs(3))))
+    };
+    let gh = RateGh::new(&clock);
+    let (outcome, messages, _) = gh_on(&clock, &gh, &dir, &cfg, &credential_get());
+    assert_eq!(outcome, Outcome::Exit(0), "{messages:?}");
+    clock.advance(0.6);
+    let (wall, before) = (clock.now(), clock.monotonic());
+    let real = Instant::now();
+    let (outcome, messages, quit) = gh_on(&clock, &gh, &dir, &cfg, &credential_get());
+    let took = real.elapsed().as_secs_f64();
+    let stayed = clock.monotonic() - before;
+    assert!(clock.now() < wall - 100.0, "the wall time went back");
+    assert_eq!(outcome, Outcome::Exit(EXIT_INTERNAL), "{messages:?}");
+    assert!(quit, "git is told to quit");
+    assert!(
+        (0.55..0.6 + SLACK).contains(&took),
+        "waited {took} s for the lock"
+    );
+    assert!(
+        (10.0..10.0 + SLACK).contains(&stayed),
+        "stayed {stayed} s against a 10 s bound"
+    );
+    let text = messages.join("\n");
+    assert!(
+        text.contains("GH_PACED_GIT_MAX_WAIT=10 s bound, which had 0.6 s left"),
+        "{text}"
+    );
+    assert_eq!(gh.runs(), 1, "gh did not run");
+    assert_eq!(clock.join_holders(), 1);
+    // A call that gets the lock 11 s after it started, by the monotonic clock, while the wall
+    // time went back 120 s, is refused as in the late-lock test above.
+    let dir2 = scratch("cred-rewind-late");
+    let paths2 = Paths::new(dir2.clone(), "replay");
+    let clock = RealRateClock::new(None);
+    let gh = RateGh::new(&clock);
+    let (held_tx, held_rx) = std::sync::mpsc::channel();
+    let (outcome, messages, quit) = std::thread::scope(|s| {
+        let (clock, paths2) = (&clock, &paths2);
+        let holder = s.spawn(move || {
+            let guard = state::lock_within(paths2, 5.0).unwrap();
+            held_tx.send(()).unwrap();
+            std::thread::sleep(Duration::from_millis(500));
+            clock.advance(11.0);
+            clock.rewind(131.0);
+            drop(guard);
+        });
+        held_rx.recv().unwrap();
+        let got = gh_on(clock, &gh, &dir2, &cfg, &credential_get());
+        holder.join().unwrap();
+        got
+    });
+    assert_eq!(outcome, Outcome::Exit(EXIT_REFUSED), "{messages:?}");
+    assert!(quit, "git is told to quit");
+    assert_eq!(gh.runs(), 0, "gh did not run");
+    let text = messages.join("\n");
+    let after: f64 = text
+        .split("became admissible ")
+        .nth(1)
+        .and_then(|rest| {
+            rest.split(" s after it started, beyond GH_PACED_GIT_MAX_WAIT=10 s")
+                .next()
+        })
+        .and_then(|n| n.parse().ok())
+        .unwrap_or_else(|| panic!("{text}"));
+    assert!((11.5..11.5 + SLACK).contains(&after), "{text}");
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_dir_all(&dir2);
 }
 
 /// Bookkeeping after gh exits waits for a busy state lock only within what is left of a

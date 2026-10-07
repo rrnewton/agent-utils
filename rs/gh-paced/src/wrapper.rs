@@ -141,7 +141,8 @@ pub struct Wrapper<'a> {
     /// have written to stdout: a GIT_CREDENTIAL call that ends without starting gh is
     /// answered with `quit=1` (see `cli::run_paced`).
     pub gh_started: bool,
-    /// Construct with `None`. The clock time at which a GIT_CREDENTIAL call
+    /// Construct with `None`. The monotonic clock reading ([`Clock::monotonic`], which setting
+    /// the system time does not move) at which a GIT_CREDENTIAL call
     /// (`auth git-credential get`) was first recognised, before gh's aliases are resolved, or
     /// after that when only an alias's expansion is one. Its wait bound (`Config::max_wait`)
     /// counts from here, and covers every wait: for its budget and for the state lock, before and
@@ -385,7 +386,7 @@ impl Wrapper<'_> {
             return (full, None);
         };
         let (bound, var) = self.cfg.max_wait(Class::GitCredential);
-        let left = (started + bound - self.clock.now()).max(0.0);
+        let left = (started + bound - self.clock.monotonic()).max(0.0);
         if left >= full {
             return (full, None);
         }
@@ -439,7 +440,7 @@ impl Wrapper<'_> {
         // A GIT_CREDENTIAL call's wait bound counts from here, before anything waits for the
         // state lock: refusing an alias below is audited under that lock too.
         if classify(args, &self.cfg).class == Class::GitCredential {
-            self.credential_started = Some(self.clock.now());
+            self.credential_started = Some(self.clock.monotonic());
         }
         // Resolve gh's own aliases first, and hand gh the expanded command line, so the command
         // classified, snapshotted and guarded below is the one gh runs, provided gh's
@@ -515,7 +516,8 @@ impl Wrapper<'_> {
         // The command gh will run decides: a GIT_CREDENTIAL call reached through an alias starts
         // its bound here, and any other call has none.
         self.credential_started = if c.class == Class::GitCredential {
-            self.credential_started.or_else(|| Some(self.clock.now()))
+            self.credential_started
+                .or_else(|| Some(self.clock.monotonic()))
         } else {
             None
         };
@@ -1034,7 +1036,11 @@ impl Wrapper<'_> {
         let class = c.class;
         let base = self.cfg.limits(class);
         let (max_wait, max_wait_var) = self.cfg.max_wait(class);
-        let started = self.credential_started.unwrap_or_else(|| self.clock.now());
+        // A GIT_CREDENTIAL call's stay is measured on the monotonic clock, so that setting the
+        // system time back cannot lengthen it; budgets and cooldowns keep using wall time.
+        let started = self
+            .credential_started
+            .unwrap_or_else(|| self.clock.monotonic());
         let mut waited = 0.0;
         // Whether any pass found the state lock held by another process and waited for it.
         let mut lock_waited = false;
@@ -1048,6 +1054,7 @@ impl Wrapper<'_> {
                 }
             };
             lock_waited |= contended;
+            let stayed = self.clock.monotonic() - started;
             let mut waits: Vec<Wait> = Vec::new();
             match self.refresh_step(c, &mut st, now) {
                 RefreshStep::Run => {
@@ -1250,7 +1257,7 @@ impl Wrapper<'_> {
             let Some(w) = worst else {
                 if class == Class::GitCredential
                     && (waited > 0.0 || lock_waited)
-                    && now - started > max_wait
+                    && stayed > max_wait
                 {
                     // It became admissible only after the bound had passed: a late wake-up, or
                     // the state lock taken just at or after the bound. A call that has waited
@@ -1264,7 +1271,7 @@ impl Wrapper<'_> {
                     let text = format!(
                         "`{}` became admissible {} s after it started, beyond {max_wait_var}={} s",
                         c.command,
-                        fmt_num(now - started),
+                        fmt_num(stayed),
                         fmt_num(max_wait)
                     );
                     self.banner(
@@ -1360,7 +1367,7 @@ impl Wrapper<'_> {
             // A GIT_CREDENTIAL call also counts time spent waiting for the state lock, so the
             // helper's whole stay stays near its short bound.
             let spent = if class == Class::GitCredential {
-                waited.max(now - started)
+                waited.max(stayed)
             } else {
                 waited
             };

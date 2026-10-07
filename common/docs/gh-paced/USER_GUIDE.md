@@ -810,7 +810,9 @@ push that may hold its caller's locks for as long as the helper sleeps:
 
 - otherwise it waits for its budget for at most `GH_PACED_GIT_MAX_WAIT`
   (default 30 s; the smaller of it and `GH_PACED_MAX_WAIT` applies), counting
-  time spent waiting for the state lock as well as sleeps, and is refused
+  time spent waiting for the state lock as well as sleeps, measured from the
+  start of the call on a monotonic clock (setting the system time back does not
+  lengthen it), and is refused
   beyond it with the banner above naming `GH_PACED_GIT_MAX_WAIT`. A call that
   becomes admissible only after the bound has passed, because a sleep ended late
   or because it got the state lock only then, is refused the same way (exit 75),

@@ -1,7 +1,7 @@
 //! Wall-clock access behind a trait, so the pacing engine can be driven by a fake clock in tests.
 
-use std::sync::Mutex;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 /// Source of the current time and of blocking sleeps.
 ///
@@ -13,6 +13,12 @@ pub trait Clock: Send + Sync {
     fn now(&self) -> f64;
     /// Block for `secs` seconds (non-positive values return at once).
     fn sleep(&self, secs: f64);
+    /// Seconds from an arbitrary origin on a clock that never moves backwards, for measuring
+    /// how long something has taken: setting the system time back or forward does not change
+    /// it. The default is [`Clock::now`], which suits clocks that only move forward.
+    fn monotonic(&self) -> f64 {
+        self.now()
+    }
 }
 
 /// The system clock.
@@ -31,6 +37,12 @@ impl Clock for RealClock {
         if secs > 0.0 && secs.is_finite() {
             std::thread::sleep(Duration::from_secs_f64(secs));
         }
+    }
+
+    /// Seconds since this process first asked.
+    fn monotonic(&self) -> f64 {
+        static ORIGIN: OnceLock<Instant> = OnceLock::new();
+        ORIGIN.get_or_init(Instant::now).elapsed().as_secs_f64()
     }
 }
 
@@ -105,5 +117,19 @@ mod tests {
         assert_eq!(clock.now(), 102.5, "advance_to never moves backwards");
         clock.advance_to(200.0);
         assert_eq!(clock.now(), 200.0);
+        assert_eq!(
+            clock.monotonic(),
+            200.0,
+            "a fake clock measures with its own time"
+        );
+    }
+
+    #[test]
+    fn real_clock_monotonic_advances_with_sleeps() {
+        let clock = RealClock;
+        let before = clock.monotonic();
+        clock.sleep(0.05);
+        let took = clock.monotonic() - before;
+        assert!((0.05..5.0).contains(&took), "measured {took} s");
     }
 }
