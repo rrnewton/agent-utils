@@ -811,9 +811,18 @@ push that may hold its caller's locks for as long as the helper sleeps:
 - otherwise it waits for its budget for at most `GH_PACED_GIT_MAX_WAIT`
   (default 30 s; the smaller of it and `GH_PACED_MAX_WAIT` applies), counting
   time spent waiting for the state lock as well as sleeps, and is refused
-  beyond it with the banner above naming `GH_PACED_GIT_MAX_WAIT`.
+  beyond it with the banner above naming `GH_PACED_GIT_MAX_WAIT`. A call whose
+  budget frees only after the bound has passed (a sleep that ended late) is
+  refused the same way, without using the budget.
+- it waits for the state lock only for what is left of that bound, not the
+  whole `GH_PACED_LOCK_WAIT`, before and after gh runs; a lock not free in time
+  exits 70 with a message naming both variables. The exception is recording a
+  cooldown that gh's output showed, which waits the whole `GH_PACED_LOCK_WAIT`
+  as for every class.
 
-Either refusal also prints `quit=1` on stdout. That is git's credential
+Either refusal, and any other failure before gh starts (exit 70, 75 or 78: a
+busy state lock, nesting too deep, a configuration error), also prints `quit=1`
+on stdout. That is git's credential
 protocol for "stop now": git ends the operation with `fatal: credential helper
 '...' told us to quit` instead of trying another helper or prompting for a
 password on a terminal. The cooldown, the budgets and every other class's
@@ -944,7 +953,7 @@ Environment variables:
 | `GH_PACED_ACCOUNT` | default for `--account` |
 | `GH_PACED_REAL_GH` | default for `--real-gh` |
 | `GH_PACED_MAX_WAIT` | longest total sleep before refusing, seconds (default 900, at most 604,800); a larger value is an error (exit 78) |
-| `GH_PACED_GIT_MAX_WAIT` | longest total wait for a GIT_CREDENTIAL call before refusing, seconds (default 30, at most 604,800; the smaller of it and `GH_PACED_MAX_WAIT` applies). During a cooldown that call is refused without waiting |
+| `GH_PACED_GIT_MAX_WAIT` | longest total wait for a GIT_CREDENTIAL call before refusing, seconds (default 30, at most 604,800; the smaller of it and `GH_PACED_MAX_WAIT` applies), including its waits for the state lock (exit 70 when the lock was not free in time). During a cooldown that call is refused without waiting |
 | `GH_PACED_LOCK_WAIT` | longest wait for the state lock, seconds (default 30, 0.1 to 3,600); then exit 70 |
 | `GH_PACED_{READ,SEARCH,WRITE,GIT}_{PER_MINUTE,BURST,PER_HOUR}` | tighten one budget |
 | `GH_PACED_PAGINATE_COST` | raise the `--paginate` cost |
@@ -970,7 +979,8 @@ account:
   process on the host. The clock is read after the lock is taken, so a process
   that waited for the lock never charges at a stale time. A process that cannot
   take the lock within `GH_PACED_LOCK_WAIT` (default 30 s) gives up with exit
-  70 and a message naming the lock file.
+  70 and a message naming the lock file. A GIT_CREDENTIAL call waits for it
+  only within what is left of `GH_PACED_GIT_MAX_WAIT`.
 - `<account>.audit.jsonl` is the append-only audit log, rotated to `.1` past
   10 MiB.
 - `<account>.cooldown` is a copy of the latest pushback cooldown, kept apart
@@ -1045,7 +1055,7 @@ other process is stuck.
 | 75 | refused: the wait would exceed `GH_PACED_MAX_WAIT` (`GH_PACED_GIT_MAX_WAIT` for GIT_CREDENTIAL, which then also prints `quit=1` on stdout), a GIT_CREDENTIAL call arrived during a cooldown, the cost is above the class's burst (not for a watch) or can never fit under the hourly cap, a watch ran past the deadline its cost paid for, or gh-paced is nested too deep |
 | 65 | refused by the write content guard: body too large, base64-looking content (in an argument, a file, stdin, or one of gh's alias expansions), a body gh would compose itself, or a body file that cannot be copied for inspection. Text refused by the editor guard makes the editor fail instead, so gh exits with its own status (usually 1) and sends nothing |
 | 64 | usage error, or a refused command shape (a watch without `GH_PACED_ALLOW_WATCH=1`, a watch interval under 30 s, or one that is not a positive whole number, or one of gh's aliases gh-paced cannot resolve for certain; see [gh's own aliases](#ghs-own-aliases)) |
-| 70 | internal error: the pacing state cannot be read or written, or its lock was not obtained within `GH_PACED_LOCK_WAIT` |
+| 70 | internal error: the pacing state cannot be read or written, or its lock was not obtained within `GH_PACED_LOCK_WAIT` (within what is left of `GH_PACED_GIT_MAX_WAIT` for a GIT_CREDENTIAL call, which then also prints `quit=1` on stdout) |
 | 78 | configuration error, `--real-gh` resolves to gh-paced, or gh's `config.yml` cannot be read and the command line names a command |
 | 127 | the real gh cannot be found or run |
 

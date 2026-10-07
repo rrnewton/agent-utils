@@ -6,7 +6,7 @@ use crate::config::{config_path, Config};
 use crate::runner::{die_by_signal, stdin_is_tty, RealRunner};
 use crate::state::{self, Paths};
 use crate::status;
-use crate::wrapper::{Outcome, Wrapper, EXIT_NO_GH, EXIT_REFUSED, EXIT_USAGE};
+use crate::wrapper::{answers_quit, Outcome, Wrapper, EXIT_NO_GH, EXIT_REFUSED, EXIT_USAGE};
 use std::ffi::OsString;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -101,10 +101,13 @@ ENVIRONMENT
                              (default 900); a longer wait exits 75
   GH_PACED_GIT_MAX_WAIT      longest total wait for a GIT_CREDENTIAL call,
                              seconds (default 30; the smaller of this and
-                             GH_PACED_MAX_WAIT applies); a longer wait exits
-                             75 with `quit=1` on stdout, which makes git stop
-                             at once. During a cooldown a GIT_CREDENTIAL call
-                             is refused without waiting at all
+                             GH_PACED_MAX_WAIT applies), including its waits
+                             for the state lock; a longer wait exits 75 (70
+                             when the lock was not free in time). During a
+                             cooldown a GIT_CREDENTIAL call is refused without
+                             waiting at all. A GIT_CREDENTIAL call that fails
+                             before gh starts prints `quit=1` on stdout, which
+                             makes git stop at once instead of prompting
   GH_PACED_LOCK_WAIT         longest wait for the state lock, seconds
                              (default 30, 0.1 to 3600); then exit 70
   GH_PACED_{READ,SEARCH,WRITE,GIT}_{PER_MINUTE,BURST,PER_HOUR}
@@ -140,7 +143,8 @@ EXIT STATUS
       GH_PACED_ALLOW_WATCH=1, a watch interval under 30 s, or one that is not
       a plain positive whole number of seconds)
   70  internal error: pacing state cannot be read or written, or its lock was
-      not obtained within GH_PACED_LOCK_WAIT
+      not obtained within GH_PACED_LOCK_WAIT (within what is left of
+      GH_PACED_GIT_MAX_WAIT for GIT_CREDENTIAL)
   78  configuration error
   127 the real gh cannot be found or run
 
@@ -341,9 +345,36 @@ fn read_stdin_capped(limit: usize) -> std::io::Result<Vec<u8>> {
 }
 
 fn run_paced(account: Option<String>, real_gh: Option<String>, gh_args: Vec<String>) -> i32 {
+    // Recognised before anything can refuse it. Only a command line naming `git-credential` is
+    // classified this early, so no other command is inspected twice.
+    let mut credential = gh_args.iter().any(|a| a == "git-credential")
+        && classify(&gh_args, &Config::default()).class == crate::classify::Class::GitCredential;
+    let mut gh_started = false;
+    let outcome = paced_outcome(account, real_gh, &gh_args, &mut credential, &mut gh_started);
+    if answers_quit(credential, gh_started, outcome) {
+        // git then stops at once instead of trying another helper or prompting on a terminal
+        // while it holds its caller's locks.
+        let mut out = std::io::stdout().lock();
+        let _ = out.write_all(b"quit=1\n").and_then(|()| out.flush());
+    }
+    match outcome {
+        Outcome::Exit(code) => code,
+        Outcome::Signal(sig) => die_by_signal(sig),
+    }
+}
+
+/// Run one paced command line. Sets `credential` when the wrapper classifies it as
+/// GIT_CREDENTIAL (after gh alias expansion), and `gh_started` once gh was started.
+fn paced_outcome(
+    account: Option<String>,
+    real_gh: Option<String>,
+    gh_args: &[String],
+    credential: &mut bool,
+    gh_started: &mut bool,
+) -> Outcome {
     let account = match account_from(account) {
         Ok(a) => a,
-        Err(code) => return code,
+        Err(code) => return Outcome::Exit(code),
     };
     let depth: u32 = env_var("GH_PACED_DEPTH")
         .and_then(|d| d.trim().parse().ok())
@@ -353,25 +384,25 @@ fn run_paced(account: Option<String>, real_gh: Option<String>, gh_args: Vec<Stri
             "GH-PACED REFUSED [{account}] gh-paced is nested {depth} deep (limit {MAX_DEPTH}); \
              an alias or extension is probably calling gh in a loop (exit {EXIT_REFUSED})"
         );
-        return EXIT_REFUSED;
+        return Outcome::Exit(EXIT_REFUSED);
     }
     let self_exe = std::env::current_exe().ok();
     let real_gh = match resolve_real_gh(real_gh.as_deref(), &env_var, self_exe.as_deref()) {
         Ok(p) => p,
         Err((code, e)) => {
             loud_error(&e);
-            return code;
+            return Outcome::Exit(code);
         }
     };
     let cfg = match load_config() {
         Ok(c) => c,
-        Err(code) => return code,
+        Err(code) => return Outcome::Exit(code),
     };
     let dir = match state::state_dir(&env_var) {
         Ok(d) => d,
         Err(e) => {
             loud_error(&format!("state directory: {e}"));
-            return EXIT_CONFIG;
+            return Outcome::Exit(EXIT_CONFIG);
         }
     };
     let chain: Vec<String> = env_var("GH_PACED_INFLIGHT_CHAIN")
@@ -414,19 +445,13 @@ fn run_paced(account: Option<String>, real_gh: Option<String>, gh_args: Vec<Stri
         editor_guard_env: crate::editor::guard_env(&env_var, self_exe.as_deref(), &account),
         self_exe,
         stderr_deadline: None,
-        credential_quit: false,
+        gh_started: false,
+        credential_started: None,
     };
-    let outcome = w.run(&gh_args);
-    if w.credential_quit {
-        // git credential protocol: `quit=1` makes git stop at once rather than try another
-        // helper or prompt on a terminal. git ignores a helper's exit status.
-        let mut out = std::io::stdout().lock();
-        let _ = out.write_all(b"quit=1\n").and_then(|()| out.flush());
-    }
-    match outcome {
-        Outcome::Exit(code) => code,
-        Outcome::Signal(sig) => die_by_signal(sig),
-    }
+    let outcome = w.run(gh_args);
+    *credential |= w.credential_started.is_some();
+    *gh_started = w.gh_started;
+    outcome
 }
 
 /// `gh-paced --drain ACCOUNT COMMAND STREAM`, started by gh-paced itself (see

@@ -136,11 +136,16 @@ pub struct Wrapper<'a> {
     /// up when it would wait past it, so a consumer that has stopped reading cannot keep
     /// gh-paced from dying by the signal.
     pub stderr_deadline: Option<Instant>,
-    /// Construct with `false`. Set when a GIT_CREDENTIAL call (`auth git-credential get`) was
-    /// not admitted, so gh never ran: the caller then writes `quit=1` to stdout, which makes
-    /// git stop at once instead of trying another helper or prompting for a password on a
-    /// terminal while it holds its caller's locks.
-    pub credential_quit: bool,
+    /// Construct with `false`. Set just before gh is started, so the caller knows whether gh
+    /// could have written to stdout: a GIT_CREDENTIAL call that ends without starting gh is
+    /// answered with `quit=1` (see `cli::run_paced`).
+    pub gh_started: bool,
+    /// Construct with `None`. The clock time at which a GIT_CREDENTIAL call
+    /// (`auth git-credential get`) was classified. Its wait bound (`Config::max_wait`) counts
+    /// from here, and covers every wait: for its budget and for the state lock, before and
+    /// after gh runs. Recording pushback is the exception: it is cleared once gh's output shows
+    /// pushback, so that cooldown is recorded within the whole GH_PACED_LOCK_WAIT.
+    pub credential_started: Option<f64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -172,6 +177,14 @@ enum RefreshStep {
     /// A refresh is due but the READ budget has no token for it yet: wait this long (subject
     /// to `GH_PACED_MAX_WAIT`) rather than run without current account feedback.
     WaitForRead(f64),
+}
+
+/// Whether a call answers `quit=1` on stdout (the git credential protocol's "stop now"): a
+/// GIT_CREDENTIAL call that ended without starting gh, refused or unable to run. git ignores a
+/// helper's exit status; without `quit=1` it would try another helper or prompt on a terminal.
+/// Never once gh started, since gh may already have answered.
+pub fn answers_quit(credential: bool, gh_started: bool, outcome: Outcome) -> bool {
+    credential && !gh_started && outcome != Outcome::Exit(0)
 }
 
 /// A call that passed admission.
@@ -343,7 +356,7 @@ impl Wrapper<'_> {
     /// Lock, read the clock, load and reap (removing dead holders' lease files). The time is
     /// read after the lock is held, so it is never older than the state it is applied to.
     fn open_state(&mut self) -> Result<(state::LockGuard, State, f64), String> {
-        let guard = state::lock_within(&self.paths, self.cfg.lock_wait_secs)?;
+        let guard = self.lock()?;
         let now = self.clock.now();
         let cfg = self.cfg.clone();
         let loaded = state::load(&self.paths, now, &|t| recovery_state(&cfg, t));
@@ -358,6 +371,37 @@ impl Wrapper<'_> {
             }
         }
         Ok((guard, st, now))
+    }
+
+    /// How long to wait for the state lock: GH_PACED_LOCK_WAIT, and for a GIT_CREDENTIAL call
+    /// no longer than what is left of its wait bound (0, a single try, once that has passed).
+    /// The second value names that bound when it is the shorter one.
+    fn lock_wait(&self) -> (f64, Option<String>) {
+        let full = self.cfg.lock_wait_secs;
+        let Some(started) = self.credential_started else {
+            return (full, None);
+        };
+        let (bound, var) = self.cfg.max_wait(Class::GitCredential);
+        let left = (started + bound - self.clock.now()).max(0.0);
+        if left >= full {
+            return (full, None);
+        }
+        let note = format!(
+            "a GIT_CREDENTIAL call waits for it only within its {var}={} s bound, which had {} s \
+             left",
+            fmt_num(bound),
+            fmt_num(left)
+        );
+        (left, Some(note))
+    }
+
+    /// Take the state lock within [`Self::lock_wait`].
+    fn lock(&self) -> Result<state::LockGuard, String> {
+        let (wait, note) = self.lock_wait();
+        state::lock_within(&self.paths, wait).map_err(|e| match note {
+            Some(n) => format!("{e}; {n}"),
+            None => e,
+        })
     }
 
     fn child_env(&self) -> Vec<(String, String)> {
@@ -459,6 +503,9 @@ impl Wrapper<'_> {
         if c.class == Class::Local {
             return self.spawn(args, None, &c, Vec::new()).0;
         }
+        if c.class == Class::GitCredential {
+            self.credential_started = Some(self.clock.now());
+        }
         let rest = &args[c.rest_start.min(args.len())..];
         for w in c.warnings.clone() {
             self.loud("WARNING", &w);
@@ -485,12 +532,7 @@ impl Wrapper<'_> {
         };
         let admitted = match self.admit(&c, &summary) {
             Ok(a) => a,
-            Err(code) => {
-                if c.class == Class::GitCredential {
-                    self.credential_quit = true;
-                }
-                return Outcome::Exit(code);
-            }
+            Err(code) => return Outcome::Exit(code),
         };
         let keep_fds: Vec<RawFd> = admitted
             .lease
@@ -500,6 +542,12 @@ impl Wrapper<'_> {
             .chain(snapshot.lock_fd())
             .collect();
         let (outcome, scanner, ran) = self.spawn(args, stdin, &c, keep_fds);
+        if scanner.verdict(&self.cfg).is_some() {
+            // The cooldown GitHub asked for must reach the state file: its bookkeeping waits
+            // for the lock the whole GH_PACED_LOCK_WAIT, not what is left of a GIT_CREDENTIAL
+            // call's bound. gh has run, so git is not told to quit either way.
+            self.credential_started = None;
+        }
         if let Err(e) = self.finish(&c, &summary, ran, &scanner, admitted) {
             self.loud("ERROR", &format!("bookkeeping after gh exited failed: {e}"));
         }
@@ -540,7 +588,7 @@ impl Wrapper<'_> {
     }
 
     fn audit_locked(&mut self, r: &Record) -> Result<(), String> {
-        let _guard = state::lock_within(&self.paths, self.cfg.lock_wait_secs)?;
+        let _guard = self.lock()?;
         self.write_audit(r);
         Ok(())
     }
@@ -570,6 +618,9 @@ impl Wrapper<'_> {
             ));
         }
         let real_gh = self.real_gh.clone();
+        // Recording a cooldown GitHub asked for is never cut short, for any class: it may wait
+        // the whole GH_PACED_LOCK_WAIT, as finish() does when gh's output showed pushback.
+        let hook_wait = self.cfg.lock_wait_secs;
         let on_pushback = if local {
             None
         } else {
@@ -577,13 +628,7 @@ impl Wrapper<'_> {
             Some(PushbackHook(Arc::new(move |s: &Scanner| {
                 if let Some(pb) = s.verdict(&cfg) {
                     // Errors surface later: finish() records the same cooldown and reports them.
-                    let _ = publish_cooldown(
-                        &paths,
-                        cfg.lock_wait_secs,
-                        RealClock.now(),
-                        &pb,
-                        &command,
-                    );
+                    let _ = publish_cooldown(&paths, hook_wait, RealClock.now(), &pb, &command);
                 }
             })))
         };
@@ -610,9 +655,10 @@ impl Wrapper<'_> {
             keep_fds,
             scan_stdout: !local && c.api.as_ref().is_some_and(|a| a.include),
             on_pushback,
-            hook_wait_secs: self.cfg.lock_wait_secs,
+            hook_wait_secs: hook_wait,
             drain,
         };
+        self.gh_started = true;
         match self.runner.run(inv, &mut scanner) {
             Ok(ran) => {
                 if ran.cut_off {
@@ -973,7 +1019,7 @@ impl Wrapper<'_> {
         let class = c.class;
         let base = self.cfg.limits(class);
         let (max_wait, max_wait_var) = self.cfg.max_wait(class);
-        let started = self.clock.now();
+        let started = self.credential_started.unwrap_or_else(|| self.clock.now());
         let mut waited = 0.0;
         let mut halve_noted = false;
         loop {
@@ -1184,6 +1230,35 @@ impl Wrapper<'_> {
                 .max_by(|a, b| a.secs.total_cmp(&b.secs))
                 .cloned();
             let Some(w) = worst else {
+                if class == Class::GitCredential && waited > 0.0 && now - started > max_wait {
+                    // Its token came free only after the bound had passed (a late wake-up, or
+                    // the state lock taken just after it). Before any wait there is nothing to
+                    // check: the only wait then is for the lock, which ends by the bound.
+                    if let Err(e) = state::save(&self.paths, &st) {
+                        drop(guard);
+                        self.internal_error("cannot save pacing state", &e);
+                        return Err(EXIT_INTERNAL);
+                    }
+                    let text = format!(
+                        "`{}` became admissible {} s after it started, beyond {max_wait_var}={} s",
+                        c.command,
+                        fmt_num(now - started),
+                        fmt_num(max_wait)
+                    );
+                    self.banner(
+                        "REFUSED",
+                        &[
+                            text.clone(),
+                            format!("not running `{}` (exit {EXIT_REFUSED})", c.command),
+                        ],
+                    );
+                    let mut r = self.record("refuse", c, summary);
+                    r.rc = Some(EXIT_REFUSED);
+                    r.waited_secs = waited;
+                    r.detail = text;
+                    self.write_audit(&r);
+                    return Err(EXIT_REFUSED);
+                }
                 let lease = if class == Class::Write {
                     match state::create_lease(&self.paths, &self.nonce) {
                         Ok(l) => Some(l),

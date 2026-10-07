@@ -648,6 +648,66 @@ fn credential_helper_wait_is_bounded_by_its_own_knob() {
     assert_eq!(sb.starts().len(), 2, "{:?}", sb.log());
 }
 
+/// Every failure before gh starts tells git to quit, so git never falls back to prompting for a
+/// password; a failure after gh started, and any other command, prints nothing on stdout.
+#[test]
+fn credential_helper_quits_on_every_failure_before_gh_starts() {
+    let sb = Sandbox::new("cred-quit", FAST);
+    let get = ["auth", "git-credential", "get"];
+    // Nesting depth.
+    let o = sb.run(&get, &[("GH_PACED_DEPTH", "8")]);
+    assert_eq!(o.status.code(), Some(75), "{}", stderr(&o));
+    assert_eq!(stdout(&o), "quit=1\n", "{}", stderr(&o));
+    let o = sb.run(&["pr", "list"], &[("GH_PACED_DEPTH", "8")]);
+    assert_eq!(o.status.code(), Some(75), "{}", stderr(&o));
+    assert_eq!(stdout(&o), "");
+    // A configuration error.
+    let missing = sb.path("no-such-config.json");
+    let missing = missing.to_str().unwrap();
+    let o = sb.run(&get, &[("GH_PACED_CONFIG", missing)]);
+    assert_eq!(o.status.code(), Some(78), "{}", stderr(&o));
+    assert_eq!(stdout(&o), "quit=1\n", "{}", stderr(&o));
+    let o = sb.run(&["pr", "list"], &[("GH_PACED_CONFIG", missing)]);
+    assert_eq!(o.status.code(), Some(78), "{}", stderr(&o));
+    assert_eq!(stdout(&o), "");
+    assert!(sb.starts().is_empty(), "{:?}", sb.log());
+    // gh ran and failed: its own output is all git sees.
+    let o = sb.run(&get, &[("FAKE_GH_EXIT", "1")]);
+    assert_eq!(o.status.code(), Some(1), "{}", stderr(&o));
+    assert_eq!(stdout(&o), "");
+    assert_eq!(sb.starts().len(), 1, "{:?}", sb.log());
+}
+
+/// A credential call waits for the account lock only within GH_PACED_GIT_MAX_WAIT, not the
+/// 30 s GH_PACED_LOCK_WAIT, then exits 70 with `quit=1`; other commands still wait the whole
+/// GH_PACED_LOCK_WAIT.
+#[test]
+fn credential_helper_waits_for_the_account_lock_only_within_its_bound() {
+    let sb = Sandbox::new("cred-lock", FAST);
+    let held = hold_account_lock(&sb);
+    let started = Instant::now();
+    let o = sb.run(
+        &["auth", "git-credential", "get"],
+        &[("GH_PACED_GIT_MAX_WAIT", "1")],
+    );
+    let took = started.elapsed().as_secs_f64();
+    let err = stderr(&o);
+    assert_eq!(o.status.code(), Some(70), "{err}");
+    assert_eq!(stdout(&o), "quit=1\n", "{err}");
+    assert!((1.0..5.0).contains(&took), "took {took} s: {err}");
+    assert!(err.contains("GH_PACED_GIT_MAX_WAIT=1 s bound"), "{err}");
+    let started = Instant::now();
+    let o = sb.run(&["pr", "list"], &[("GH_PACED_LOCK_WAIT", "2")]);
+    let took = started.elapsed().as_secs_f64();
+    let err = stderr(&o);
+    assert_eq!(o.status.code(), Some(70), "{err}");
+    assert_eq!(stdout(&o), "");
+    assert!(took >= 2.0, "took {took} s: {err}");
+    assert!(!err.contains("GH_PACED_GIT_MAX_WAIT"), "{err}");
+    drop(held);
+    assert!(sb.starts().is_empty(), "{:?}", sb.log());
+}
+
 #[test]
 fn local_commands_run_without_touching_state() {
     let sb = Sandbox::new("local", FAST);
