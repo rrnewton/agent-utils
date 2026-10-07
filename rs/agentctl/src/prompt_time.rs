@@ -6,6 +6,14 @@
 //! message's own create time, in the service's local time zone, and with how much later it was
 //! typed when that is at least [`LATE_PROMPT_AFTER`].
 //!
+//! The delay is measured when the prompt is typed, not when it is rendered: a prompt waits in the
+//! coordinator's queue while the agent is busy. The bridge therefore queues a request prompt with
+//! a [`deferred`] marker naming the create time; the queue stores the text with an opening for
+//! the time it was queued and records the create time beside it ([`QueuedOpening`]), and the
+//! drain replaces that opening with one for the moment it types the prompt ([`retime`]). The
+//! stored text stays printable, so a queue reader that knows nothing of this types it as it was
+//! queued: the send time right, the delay as of queueing.
+//!
 //! The zone is the one the C library resolves for the process: the `TZ` environment variable when
 //! it is set, otherwise the host's `/etc/localtime`. Its abbreviation is printed, so a stamp never
 //! reads as a different zone's time.
@@ -21,19 +29,67 @@ pub(crate) const LATE_PROMPT_AFTER: Duration = Duration::from_secs(120);
 /// one, `Sent 2026.10.07:08:45 EDT, delivered 1 h 12 min later. `; empty when `created_at` cannot
 /// be read, which a provider-accepted message never is.
 pub(crate) fn opening(created_at: &str, now_millis: u64) -> String {
-    let Some(created) = rfc3339_unix_seconds(created_at) else {
+    let Some(created) = rfc3339_instant(created_at) else {
         return String::new();
     };
-    let stamp = stamp(created, zone_at(created));
-    let waited = i64::try_from(now_millis / 1_000)
-        .unwrap_or(i64::MAX)
-        .saturating_sub(created);
-    match u64::try_from(waited) {
-        Ok(waited) if waited >= LATE_PROMPT_AFTER.as_secs() => {
-            format!("Sent {stamp}, delivered {} later. ", duration_words(waited))
-        }
-        _ => format!("Sent {stamp}. "),
+    let stamp = stamp(created.seconds, zone_at(created.seconds));
+    // Exact, fraction included, so a message 119.5 seconds old is not called late.
+    let waited_nanos = i128::from(now_millis) * 1_000_000
+        - (i128::from(created.seconds) * 1_000_000_000 + i128::from(created.nanos));
+    if waited_nanos >= i128::from(LATE_PROMPT_AFTER.as_secs()) * 1_000_000_000 {
+        let waited = u64::try_from(waited_nanos / 1_000_000_000).unwrap_or(u64::MAX);
+        format!("Sent {stamp}, delivered {} later. ", duration_words(waited))
+    } else {
+        format!("Sent {stamp}. ")
     }
+}
+
+/// Starts a [`deferred`] prompt. No rendered prompt holds it: prompts never carry control
+/// characters into the pane.
+const DEFERRED: char = '\u{0}';
+
+/// A request prompt whose opening is decided when it is queued and again when it is typed:
+/// `rest` is the prompt after the opening, and `created_at` the message's create time.
+pub(crate) fn deferred(created_at: &str, rest: &str) -> String {
+    format!("{DEFERRED}{created_at}{DEFERRED}{rest}")
+}
+
+/// What the queue stores for a [`deferred`] prompt: the text it keeps, opening included, and the
+/// create time and opening length it records beside it.
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) struct QueuedOpening {
+    pub(crate) text: String,
+    pub(crate) sent_at: String,
+    pub(crate) opening_bytes: usize,
+}
+
+/// The queued form of `text` when it is a [`deferred`] prompt with a readable create time, opened
+/// for `now_millis`; `None` for any other text, which is queued unchanged.
+pub(crate) fn queue_deferred(text: &str, now_millis: u64) -> Option<QueuedOpening> {
+    let (sent_at, rest) = text.strip_prefix(DEFERRED)?.split_once(DEFERRED)?;
+    rfc3339_instant(sent_at)?;
+    let opening = opening(sent_at, now_millis);
+    Some(QueuedOpening {
+        opening_bytes: opening.len(),
+        text: format!("{opening}{rest}"),
+        sent_at: sent_at.to_owned(),
+    })
+}
+
+/// The text to type for a queued prompt that recorded `sent_at` and `opening_bytes`: its opening
+/// replaced by one for `now_millis`. `None` when the record does not fit the text, which is then
+/// typed as stored.
+pub(crate) fn retime(
+    text: &str,
+    sent_at: &str,
+    opening_bytes: usize,
+    now_millis: u64,
+) -> Option<String> {
+    rfc3339_instant(sent_at)?;
+    let rest = text.get(opening_bytes..)?;
+    text[..opening_bytes]
+        .starts_with("Sent ")
+        .then(|| format!("{}{rest}", opening(sent_at, now_millis)))
 }
 
 /// The wall clock a prompt is rendered against.
@@ -134,10 +190,18 @@ fn duration_words(seconds: u64) -> String {
     }
 }
 
-/// Seconds since the Unix epoch for an RFC 3339 timestamp, `2026-10-07T12:45:00Z` or with a
-/// fraction or a `+hh:mm`/`-hh:mm` offset; `None` for anything else. A leap second reads as the
-/// second before it.
-pub(crate) fn rfc3339_unix_seconds(value: &str) -> Option<i64> {
+/// An instant: whole seconds since the Unix epoch, and nanoseconds past them.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct Instant {
+    pub(crate) seconds: i64,
+    pub(crate) nanos: u32,
+}
+
+/// The instant an RFC 3339 timestamp names, `2026-10-07T12:45:00Z` or with a fraction or a
+/// `+hh:mm`/`-hh:mm` offset; `None` for anything else. A fraction finer than a nanosecond is
+/// rounded up, so a message is never made older than it is. A leap second reads as the last
+/// instant of the second before it.
+pub(crate) fn rfc3339_instant(value: &str) -> Option<Instant> {
     let bytes = value.as_bytes();
     let number = |range: std::ops::Range<usize>| -> Option<i64> {
         let digits = bytes.get(range)?;
@@ -165,6 +229,7 @@ pub(crate) fn rfc3339_unix_seconds(value: &str) -> Option<i64> {
         return None;
     }
     let mut zone = 19;
+    let mut nanos: u32 = 0;
     if bytes.get(zone) == Some(&b'.') {
         zone += 1;
         let start = zone;
@@ -174,6 +239,17 @@ pub(crate) fn rfc3339_unix_seconds(value: &str) -> Option<i64> {
         if zone == start {
             return None;
         }
+        let mut scale = 100_000_000;
+        let mut finer = false;
+        for &digit in &bytes[start..zone] {
+            if scale == 0 {
+                finer |= digit != b'0';
+            } else {
+                nanos += u32::from(digit - b'0') * scale;
+                scale /= 10;
+            }
+        }
+        nanos += u32::from(finer);
     }
     let offset = match bytes.get(zone) {
         Some(b'Z' | b'z') if zone + 1 == bytes.len() => 0,
@@ -193,9 +269,19 @@ pub(crate) fn rfc3339_unix_seconds(value: &str) -> Option<i64> {
         }
         _ => return None,
     };
-    let local =
-        days_from_civil(year, month, day) * 86_400 + hour * 3_600 + minute * 60 + second.min(59);
-    Some(local - offset)
+    let (second, nanos) = if second == 60 {
+        (59, 999_999_999)
+    } else {
+        (second, nanos)
+    };
+    let local = days_from_civil(year, month, day) * 86_400 + hour * 3_600 + minute * 60 + second;
+    // A fraction rounded up to a whole second carries into the next one.
+    let (seconds, nanos) = if nanos == 1_000_000_000 {
+        (local - offset + 1, 0)
+    } else {
+        (local - offset, nanos)
+    };
+    Some(Instant { seconds, nanos })
 }
 
 fn days_in_month(year: i64, month: i64) -> i64 {
@@ -274,30 +360,46 @@ mod tests {
         u64::try_from(seconds).unwrap() * 1_000
     }
 
+    fn seconds(value: &str) -> Option<i64> {
+        rfc3339_instant(value).map(|instant| instant.seconds)
+    }
+
     #[test]
     fn rfc3339_reads_utc_fractions_and_offsets() {
-        assert_eq!(rfc3339_unix_seconds("2026-10-07T12:45:00Z"), Some(MORNING));
+        assert_eq!(seconds("2026-10-07T12:45:00Z"), Some(MORNING));
+        assert_eq!(seconds("2026-10-07T08:45:00-04:00"), Some(MORNING));
+        assert_eq!(seconds("2026-10-07T18:15:00+05:30"), Some(MORNING));
+        assert_eq!(seconds("1970-01-01T00:00:00Z"), Some(0));
+        assert_eq!(seconds("1969-12-31T23:59:59Z"), Some(-1));
+        assert_eq!(seconds("2024-02-29T00:00:00Z"), Some(1_709_164_800));
         assert_eq!(
-            rfc3339_unix_seconds("2026-10-07t12:45:00.123456z"),
-            Some(MORNING)
+            rfc3339_instant("2026-10-07t12:45:00.123456z"),
+            Some(Instant {
+                seconds: MORNING,
+                nanos: 123_456_000
+            })
+        );
+        // Finer than a nanosecond rounds up, carrying into the next second when it must.
+        assert_eq!(
+            rfc3339_instant("2026-10-07T12:45:00.0000000001Z"),
+            Some(Instant {
+                seconds: MORNING,
+                nanos: 1
+            })
         );
         assert_eq!(
-            rfc3339_unix_seconds("2026-10-07T08:45:00-04:00"),
-            Some(MORNING)
+            rfc3339_instant("2026-10-07T12:44:59.9999999999Z"),
+            Some(Instant {
+                seconds: MORNING,
+                nanos: 0
+            })
         );
         assert_eq!(
-            rfc3339_unix_seconds("2026-10-07T18:15:00+05:30"),
-            Some(MORNING)
-        );
-        assert_eq!(rfc3339_unix_seconds("1970-01-01T00:00:00Z"), Some(0));
-        assert_eq!(rfc3339_unix_seconds("1969-12-31T23:59:59Z"), Some(-1));
-        assert_eq!(
-            rfc3339_unix_seconds("2016-12-31T23:59:60Z"),
-            rfc3339_unix_seconds("2016-12-31T23:59:59Z")
-        );
-        assert_eq!(
-            rfc3339_unix_seconds("2024-02-29T00:00:00Z"),
-            Some(1_709_164_800)
+            rfc3339_instant("2016-12-31T23:59:60Z"),
+            Some(Instant {
+                seconds: 1_483_228_799,
+                nanos: 999_999_999
+            })
         );
     }
 
@@ -317,7 +419,7 @@ mod tests {
             "2026-10-07T12:45:00Zjunk",
             "+026-10-07T12:45:00Z",
         ] {
-            assert_eq!(rfc3339_unix_seconds(value), None, "{value}");
+            assert_eq!(rfc3339_instant(value), None, "{value}");
         }
     }
 
@@ -365,6 +467,29 @@ mod tests {
     }
 
     #[test]
+    fn lateness_counts_the_fraction_of_the_create_time() {
+        test_clock::set(at(MORNING), EDT, "EDT");
+        // 119.5 seconds is not late; 120 seconds is.
+        assert_eq!(
+            opening("2026-10-07T12:45:00.5Z", at(MORNING + 120)),
+            "Sent 2026.10.07:08:45 EDT. "
+        );
+        assert_eq!(
+            opening("2026-10-07T12:45:00.5Z", at(MORNING + 120) + 500),
+            "Sent 2026.10.07:08:45 EDT, delivered 2 min later. "
+        );
+        // 3,599.5 seconds is still under an hour.
+        assert_eq!(
+            opening("2026-10-07T12:45:00.5Z", at(MORNING + 3_600)),
+            "Sent 2026.10.07:08:45 EDT, delivered 59 min later. "
+        );
+        assert_eq!(
+            opening("2026-10-07T12:45:00.5Z", at(MORNING + 3_600) + 500),
+            "Sent 2026.10.07:08:45 EDT, delivered 1 h 0 min later. "
+        );
+    }
+
+    #[test]
     fn a_late_prompt_says_how_much_later_it_was_typed() {
         for (waited, words) in [
             (120, "2 min"),
@@ -375,7 +500,7 @@ mod tests {
         ] {
             test_clock::set(at(MORNING + waited), EDT, "EDT");
             assert_eq!(
-                opening("2026-10-07T12:45:00.5Z", now_millis()),
+                opening("2026-10-07T12:45:00Z", now_millis()),
                 format!("Sent 2026.10.07:08:45 EDT, delivered {words} later. "),
                 "{waited}"
             );
@@ -388,9 +513,58 @@ mod tests {
     }
 
     #[test]
-    fn the_process_zone_reads_a_short_name_and_a_sane_offset() {
+    fn a_deferred_prompt_is_queued_printable_and_retimed_when_typed() {
+        test_clock::set(at(MORNING + 30), EDT, "EDT");
+        let marked = deferred("2026-10-07T12:45:00Z", "The user's request arrived.");
+        let queued = queue_deferred(&marked, now_millis()).expect("deferred prompt");
+        assert_eq!(
+            queued,
+            QueuedOpening {
+                text: "Sent 2026.10.07:08:45 EDT. The user's request arrived.".to_owned(),
+                sent_at: "2026-10-07T12:45:00Z".to_owned(),
+                opening_bytes: "Sent 2026.10.07:08:45 EDT. ".len(),
+            }
+        );
+        assert!(!queued.text.chars().any(char::is_control));
+        // Typed an hour and twelve minutes after it was written, behind a busy agent.
+        assert_eq!(
+            retime(
+                &queued.text,
+                &queued.sent_at,
+                queued.opening_bytes,
+                at(MORNING + 72 * 60)
+            ),
+            Some(
+                "Sent 2026.10.07:08:45 EDT, delivered 1 h 12 min later. The user's request arrived."
+                    .to_owned()
+            )
+        );
+        // Ordinary text, and a marker without a readable create time, are queued unchanged.
+        assert_eq!(queue_deferred("plain prompt", now_millis()), None);
+        assert_eq!(
+            queue_deferred(&deferred("soon", "text"), now_millis()),
+            None
+        );
+        // A record that does not fit its text leaves the text as stored.
+        assert_eq!(retime(&queued.text, &queued.sent_at, 3, at(MORNING)), None);
+        assert_eq!(
+            retime(&queued.text, &queued.sent_at, 10_000, at(MORNING)),
+            None
+        );
+        assert_eq!(
+            retime(&queued.text, "soon", queued.opening_bytes, at(MORNING)),
+            None
+        );
+    }
+
+    #[test]
+    fn the_process_zone_reads_a_short_name_and_a_posix_offset() {
         let zone = process_zone(MORNING).expect("localtime_r");
-        assert!(zone.offset_seconds.abs() <= 18 * 3_600, "{zone:?}");
+        // POSIX TZ offsets run to 24:59:59 either way.
+        assert!(
+            zone.offset_seconds.abs() <= 24 * 3_600 + 59 * 60 + 59,
+            "{zone:?}"
+        );
         assert!(!zone.name.is_empty() && zone.name.len() <= 9, "{zone:?}");
         assert_eq!(numeric_offset(EDT), "UTC-04:00");
         assert_eq!(numeric_offset(19_800), "UTC+05:30");

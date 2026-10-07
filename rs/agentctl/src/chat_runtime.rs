@@ -6435,14 +6435,29 @@ impl BridgeState {
     /// what a read of the coordinator's pane showed just before the prompt is written: see
     /// [`Self::reveal_reply_alias`].
     pub fn prompt(&self, key: &str, screen: &str) -> Result<String> {
+        self.prompt_opened(key, screen, &|created_at| {
+            crate::prompt_time::opening(created_at, crate::prompt_time::now_millis())
+        })
+    }
+
+    /// [`Self::prompt`] as it is queued for the coordinator: its opening is left for the queue to
+    /// decide when the prompt is typed, which may be long after it is queued. See `prompt_time`.
+    pub(crate) fn queued_prompt(&self, key: &str, screen: &str) -> Result<String> {
+        self.prompt_opened(key, screen, &|created_at| {
+            crate::prompt_time::deferred(created_at, "")
+        })
+    }
+
+    /// The request prompt, its first line begun by `open` applied to the message's create time.
+    fn prompt_opened(
+        &self,
+        key: &str,
+        screen: &str,
+        open: &dyn Fn(&str) -> String,
+    ) -> Result<String> {
         let record = self.read_request(key)?;
         let context = self.prompt_context(&record.message);
-        // The first line opens with the message's own create time, and with how much later it is
-        // typed when that is late: see `prompt_time`.
-        let sent = crate::prompt_time::opening(
-            &record.message.created_at,
-            crate::prompt_time::now_millis(),
-        );
+        let sent = open(&record.message.created_at);
         if !self.config.outbound_enabled {
             return Ok(format!(
                 "{sent}The user's request arrived through your configured inbound-only chat bridge.\n\
@@ -10597,7 +10612,7 @@ pub(crate) fn deliver_request_with(
                 Ok(()) => delivery
                     .submit(
                         agent_name,
-                        &state.prompt(key, &screen)?,
+                        &state.queued_prompt(key, &screen)?,
                         message_id,
                         options,
                     )
