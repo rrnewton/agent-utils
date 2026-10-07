@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use clap::{Args, Parser, Subcommand};
 use serde::Serialize;
-use serde_json::json;
+use serde_json::{json, Value};
 
 use crate::agent::{AgentError, DrainOptions, QueueOutcome};
 use crate::client::HerdrClient;
@@ -1245,7 +1245,12 @@ fn run(args: Cli, environment: &dyn Fn(&str) -> Option<String>) -> Result<i32, F
     };
     add_capabilities(&mut result);
     write_json(&result).map_err(Failure::Output)?;
-    Ok(0)
+    // `list` prints every row it could read; an unreadable row makes the listing incomplete.
+    let incomplete = result.as_array().is_some_and(|rows| {
+        rows.iter()
+            .any(|row| row.get("record_error").and_then(Value::as_bool) == Some(true))
+    });
+    Ok(i32::from(incomplete))
 }
 
 /// The agentcloud session input is sent from: `--from-session`, else `$AGENTCLOUD_SESSION_ID`.

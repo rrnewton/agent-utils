@@ -32,6 +32,16 @@ use crate::error::{HerdrRunError, Result};
 /// Transient user-systemd unit used for a server started by `herdr-run`.
 pub const SERVER_UNIT: &str = "herdr-run-server";
 
+/// Tokio runtime workers for an auto-started server.
+///
+/// Herdr is a static musl binary, and musl's mallocng has one global allocator lock; tokio's
+/// default of one worker per core turns that lock into a convoy on a many-core host. Measured on a
+/// 316-core host with 260 panes: uncapped, the server sat above 1000% CPU with about 98% of cycles
+/// in the kernel's futex spinlock and every control call timing out; capped at 16, the same
+/// session served `pane list` in 0.03 s. This bounds only the runtime workers; per-pane blocking
+/// threads still scale with the pane count.
+pub const SERVER_WORKER_THREADS: usize = 16;
+
 const SERVER_ATTEMPTS: usize = 30;
 const SERVER_DELAY: Duration = Duration::from_millis(200);
 pub(crate) const CONTROL_TIMEOUT: Duration = Duration::from_secs(30);
@@ -437,6 +447,8 @@ impl HerdrClient {
             "herdr-run Herdr server (outside the agent sandbox)".to_owned(),
             "--setenv".to_owned(),
             format!("HOME={}", self.account_home),
+            "--setenv".to_owned(),
+            format!("TOKIO_WORKER_THREADS={SERVER_WORKER_THREADS}"),
             herdr_bin,
             "server".to_owned(),
         ];
@@ -1466,7 +1478,10 @@ mod tests {
         );
         assert_eq!(calls[1][0], "/usr/bin/systemd-run");
         assert_eq!(calls[1][8], "HOME=/home/account");
-        assert_eq!(calls[1][9], "/opt/herdr/bin/herdr");
+        assert_eq!(calls[1][9], "--setenv");
+        assert_eq!(calls[1][10], "TOKIO_WORKER_THREADS=16");
+        assert_eq!(calls[1][11], "/opt/herdr/bin/herdr");
+        assert_eq!(calls[1][12], "server");
         assert!(!calls[1].iter().any(|arg| arg.starts_with("PATH=")));
     }
 

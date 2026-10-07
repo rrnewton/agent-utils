@@ -1253,7 +1253,10 @@ impl AgentRecord {
         ) || self.mode != "interactive"
             || self.backend != "herdr"
         {
-            return Err(fail(format!("agent {:?} uses adapter {:?}, mode {:?}, backend {:?}; use the agentctl with the worker extension implementation for this runtime", self.name, self.adapter, self.mode, self.backend)));
+            return Err(fail(format!(
+                "agent {:?} uses adapter {:?}, mode {:?}, backend {:?}, which this agentctl does not run. Headless workers and other non-Herdr runtimes exist only in the Python edition of agentctl; inspect or stop this record with it",
+                self.name, self.adapter, self.mode, self.backend
+            )));
         }
         Ok(())
     }
@@ -2634,7 +2637,18 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
         }
         agent::validate_private_directory(&directory, "agent directory", false)?;
         let path = directory.join("agent.json");
-        let record: AgentRecord = serde_json::from_value(agent::read_private_json(&path)?)
+        let document = agent::read_private_json(&path)?;
+        if let Some(schema) = document
+            .get("schema")
+            .and_then(Value::as_str)
+            .filter(|schema| schema.starts_with("agentctl-session/"))
+        {
+            return Err(fail(format!(
+                "agent record {} uses the nested {schema} format, which only the Python edition of agentctl reads; inspect or stop it with that edition",
+                path.display()
+            )));
+        }
+        let record: AgentRecord = serde_json::from_value(document)
             .map_err(|error| fail(format!("invalid agent record {}: {error}", path.display())))?;
         record.validate_loaded(&path, agent_name)?;
         Ok(record)
@@ -4122,10 +4136,23 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
         names.sort();
         // One non-attaching agentcloud listing serves every cloud agent in this pass.
         let mut fleet = cloud::FleetCache::new();
-        names
+        // Each row stands alone: a record this build cannot read is reported as its own error row
+        // instead of hiding every other agent in the registry.
+        Ok(names
             .iter()
-            .map(|name| self.status_record_listed(&self.load(name)?, &mut fleet))
-            .collect()
+            .map(|name| {
+                self.load(name)
+                    .and_then(|record| self.status_record_listed(&record, &mut fleet))
+                    .unwrap_or_else(|error| {
+                        json!({
+                            "name": name,
+                            "agent_status": "unknown",
+                            "probe_error": error.to_string(),
+                            "record_error": true,
+                        })
+                    })
+            })
+            .collect())
     }
 
     /// Serialize against stop and durably deliver one prompt.
@@ -10022,6 +10049,43 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn list_reports_an_unreadable_record_as_its_own_row() {
+        let fixture = Fixture::new();
+        fixture.adopt();
+        let broken = fixture.root.join("registry/broken");
+        fs::create_dir(&broken).unwrap();
+        fs::set_permissions(&broken, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::write(broken.join("agent.json"), b"{").unwrap();
+        fs::set_permissions(broken.join("agent.json"), fs::Permissions::from_mode(0o600)).unwrap();
+
+        let rows = fixture.manager().list().unwrap();
+        assert_eq!(rows.len(), 2);
+        let bad = rows.iter().find(|row| row["name"] == "broken").unwrap();
+        assert_eq!(bad["record_error"], true);
+        assert_eq!(bad["agent_status"], "unknown");
+        assert!(!bad["probe_error"].as_str().unwrap().is_empty());
+        let good = rows.iter().find(|row| row["name"] == "foreign").unwrap();
+        assert!(good.get("record_error").is_none());
+
+        let nested = fixture.root.join("registry/nested");
+        fs::create_dir(&nested).unwrap();
+        fs::set_permissions(&nested, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::write(
+            nested.join("agent.json"),
+            br#"{"schema":"agentctl-session/v3","name":"nested"}"#,
+        )
+        .unwrap();
+        fs::set_permissions(nested.join("agent.json"), fs::Permissions::from_mode(0o600)).unwrap();
+        let rows = fixture.manager().list().unwrap();
+        let row = rows.iter().find(|row| row["name"] == "nested").unwrap();
+        assert_eq!(row["record_error"], true);
+        assert!(row["probe_error"]
+            .as_str()
+            .unwrap()
+            .contains("nested agentctl-session/v3 format"));
+    }
+
+    #[test]
     fn adoption_refuses_same_harness_session_held_by_headless_record() {
         let fixture = Fixture::new();
         fixture.start(None);
@@ -11293,7 +11357,7 @@ pub(crate) mod tests {
         assert!(status["probe_error"]
             .as_str()
             .unwrap()
-            .contains("worker extension"));
+            .contains("only in the Python edition of agentctl"));
         assert_eq!(manager.list().unwrap().len(), 1);
         assert!(manager.stop("worker").is_err());
         assert!(fixture.client.closed.lock().unwrap().is_empty());
