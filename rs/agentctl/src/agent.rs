@@ -1328,7 +1328,12 @@ fn deliver_one<A: AgentApi + ?Sized>(
     match submission {
         // The screen already proved the prompt left the composer. A lifecycle
         // transition adds nothing and is absent when the agent queues the prompt.
-        Submission::Verified(_) => return Ok(Delivered::Confirmed { verified: true }),
+        // A weak verification counts only once its wait settled: see `SubmissionReceipt::settled`.
+        Submission::Verified(receipt) => {
+            return Ok(Delivered::Confirmed {
+                verified: receipt.printed || receipt.settled,
+            })
+        }
         Submission::NotStaged(reason) => return Ok(Delivered::NotStaged(reason)),
         Submission::Unconfirmed => {}
     }
