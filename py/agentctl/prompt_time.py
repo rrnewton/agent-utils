@@ -148,6 +148,8 @@ def retime(text: str, sent_at: object, recorded: object, now_nanos: int | None =
         # The compiled drain reads its clock in milliseconds; the same instant renders the same
         # text.
         fresh = opening(sent_at, now // 1_000_000 * 1_000_000)
-    except Exception:  # noqa: BLE001 - a stamp must never stop a prompt being typed
+    except (ArithmeticError, OSError, ValueError, TypeError):
+        # A clock or calendar failure never stops a prompt being typed. Anything else, such as
+        # the service's own shutdown signal, propagates.
         return text
     return fresh + text[len(recorded):] if fresh else text
