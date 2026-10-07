@@ -169,6 +169,10 @@ const ALARM_SOURCES_FILE: &str = "delivery-alarm-sources.json";
 // observed: see `CredentialRecord`.
 const CREDENTIAL_RECORD_SCHEMA: &str = "agentctl-chat-provider-credentials/v1";
 const CREDENTIAL_RECORD_FILE: &str = "provider-credentials.json";
+/// `chat status` calls a saved credential observation stale once it is this old: two of the
+/// 300-second refreshes `chat run` makes while the files are unchanged, so a stopped service or
+/// a previous run's record is not shown as current.
+pub(crate) const CREDENTIAL_RECORD_STALE_AFTER: Duration = Duration::from_secs(600);
 const MAX_PROVIDER_ERROR_BYTES: usize = 2_000;
 const MAX_PROVIDER_ERROR_CLASS_BYTES: usize = 200;
 // Room for the largest record: two paths, each with an error and its class, which JSON may spell
@@ -5441,8 +5445,20 @@ impl BridgeState {
         }
         let provider_health = self.read_provider_health()?;
         // The credential files as the running service saw them: this process may not have the
-        // service's environment.
+        // service's environment. `evidence` says how far that record can be trusted.
         let credential_record = self.read_credential_record();
+        let credential_evidence = match &credential_record {
+            Ok(None) => "none",
+            Err(_) => "unreadable",
+            Ok(Some(record))
+                if u128::from(now_millis.saturating_sub(record.observed_at_millis))
+                    > CREDENTIAL_RECORD_STALE_AFTER.as_millis() =>
+            {
+                "stale"
+            }
+            Ok(Some(_)) => "current",
+        };
+        let credential_record = credential_record.ok().flatten();
         let credential_files = credential_record
             .as_ref()
             .map(|record| record.files.clone())
@@ -5490,9 +5506,11 @@ impl BridgeState {
                 "typed_not_replied": not_replied,
                 "replied": replied,
             },
-            "credentials": credential_record.as_ref().map(|record| serde_json::json!({
-                "observed_at_millis": record.observed_at_millis,
-                "files": record.files
+            "credentials": serde_json::json!({
+                "evidence": credential_evidence,
+                "stale_after_seconds": CREDENTIAL_RECORD_STALE_AFTER.as_secs(),
+                "observed_at_millis": credential_record.as_ref().map(|record| record.observed_at_millis),
+                "files": credential_files
                     .iter()
                     .map(|file| serde_json::json!({
                         "variable": file.variable,
@@ -5501,7 +5519,7 @@ impl BridgeState {
                         "problem": file.describe(now_millis),
                     }))
                     .collect::<Vec<_>>(),
-            })),
+            }),
             "provider_health": {
                 "subscription": provider_health.subscription,
                 "sends": provider_health.sends,
@@ -5514,6 +5532,7 @@ impl BridgeState {
                 "receipt_reactions_refused": self.refused_receipt_reactions_locked()?,
                 "subscription_down": provider_down.subscription_down,
                 "send_path_down": provider_down.send_path_down,
+                "credential_evidence": credential_evidence,
                 "credential_problems": crate::credentials::problems(&credential_files, now_millis),
                 "credential_warning_seconds": crate::credentials::CREDENTIAL_EXPIRY_WARNING.as_secs(),
             },
@@ -5668,15 +5687,27 @@ impl BridgeState {
         )
     }
 
-    /// `provider-credentials.json`, or `None` when it is missing or not a valid record.
-    fn read_credential_record(&self) -> Option<CredentialRecord> {
-        let record: CredentialRecord =
-            read_document(&self.root.join(CREDENTIAL_RECORD_FILE), 1 << 20).ok()?;
+    /// `provider-credentials.json`: `None` before the service has saved one, and an error when
+    /// it cannot be read or is not a valid record, which `chat status` reports as unreadable
+    /// evidence rather than as no problems.
+    fn read_credential_record(&self) -> Result<Option<CredentialRecord>> {
+        let path = self.root.join(CREDENTIAL_RECORD_FILE);
+        match fs::symlink_metadata(&path) {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(ChatRuntimeError::Io(error)),
+            Ok(_) => {}
+        }
+        let record: CredentialRecord = read_document(&path, 1 << 20)?;
         let states_valid = record
             .files
             .iter()
             .all(|file| matches!(file.state.as_str(), "present" | "missing" | "unreadable"));
-        (record.schema == CREDENTIAL_RECORD_SCHEMA && states_valid).then_some(record)
+        if record.schema != CREDENTIAL_RECORD_SCHEMA || !states_valid {
+            return Err(ChatRuntimeError::invalid(
+                "the provider credential record is inconsistent",
+            ));
+        }
+        Ok(Some(record))
     }
 
     /// A credential problem that explains a provider failure at `now_millis`, if any, as the class
@@ -28232,18 +28263,44 @@ a fence ```sh here, ~~~~ there, and one ``\u{200b}` hidden"
     }
 
     #[test]
-    fn status_without_a_saved_credential_record_reports_none() {
-        let directory = temporary("credential-no-record-dir");
-        let (root, state) =
-            state_with_credential("credential-no-record", &directory.join("gone.pem"));
-        let status = state.status().expect("status");
+    fn status_reports_how_far_the_saved_credential_record_can_be_trusted() {
+        let directory = temporary("credential-evidence-dir");
+        let missing = directory.join("gone.pem");
+        let (root, state) = state_with_credential("credential-evidence", &missing);
+        let evidence = |state: &BridgeState| {
+            let status = state.status().expect("status");
+            (
+                status["credentials"]["evidence"].clone(),
+                status["delivery_alarm"]["credential_evidence"].clone(),
+                status["delivery_alarm"]["credential_problems"].clone(),
+            )
+        };
+        let none = evidence(&state);
+        let files = state.credential_files();
+        state
+            .write_credential_record(&files, unix_millis())
+            .expect("save a fresh record");
+        let current = evidence(&state);
+        let stale_at = unix_millis() - CREDENTIAL_RECORD_STALE_AFTER.as_millis() as u64 - 1_000;
+        state
+            .write_credential_record(&files, stale_at)
+            .expect("save an old record");
+        let stale = evidence(&state);
+        fs::write(root.join(CREDENTIAL_RECORD_FILE), b"not json").expect("corrupt the record");
+        let unreadable = evidence(&state);
         fs::remove_dir_all(root).expect("cleanup");
         fs::remove_dir_all(directory).expect("cleanup");
-        assert!(status["credentials"].is_null());
-        assert_eq!(
-            status["delivery_alarm"]["credential_problems"],
-            serde_json::json!([])
-        );
+        assert_eq!(none.0, "none");
+        assert_eq!(none.2, serde_json::json!([]));
+        assert_eq!(current.0, "current");
+        assert_eq!(current.1, "current");
+        assert_eq!(current.2[0]["problem"], "missing");
+        // An old observation still shows what it saw, marked stale.
+        assert_eq!(stale.0, "stale");
+        assert_eq!(stale.2[0]["problem"], "missing");
+        // A corrupt record is unreadable evidence, not a clean bill.
+        assert_eq!(unreadable.0, "unreadable");
+        assert_eq!(unreadable.1, "unreadable");
     }
 
     #[test]

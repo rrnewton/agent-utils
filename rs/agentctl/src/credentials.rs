@@ -200,12 +200,24 @@ pub(crate) fn process_environment(name: &str) -> Option<OsString> {
 
 /// Read at most [`MAX_CREDENTIAL_FILE_BYTES`] of `path`; `None` when it is not a regular file.
 /// The file is opened once, without blocking, and checked through that descriptor, so a path
-/// swapped for a pipe or device between a check and the open cannot make the read wait.
+/// swapped for a pipe or device between a check and the open cannot make the read wait. When the
+/// open fails, a path that exists but is not a regular file (an inaccessible directory, a socket)
+/// is still not a credential file.
 fn read_bounded(path: &Path) -> io::Result<Option<Vec<u8>>> {
-    let file = fs::OpenOptions::new()
+    let file = match fs::OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_NONBLOCK)
-        .open(path)?;
+        .open(path)
+    {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Err(error),
+        Err(error) => {
+            return match fs::metadata(path) {
+                Ok(metadata) if !metadata.is_file() => Ok(None),
+                _ => Err(error),
+            }
+        }
+    };
     if !file.metadata()?.is_file() {
         return Ok(None);
     }
@@ -434,6 +446,20 @@ M2iX2vXNlRqk5HpRaseewxoOKNXF1CE=
 ";
     // notAfter 2061-01-01T00:00:00Z, encoded as GeneralizedTime.
     pub(crate) const GENERALIZED_TIME_NOT_AFTER: i64 = 2_871_763_200;
+    pub(crate) const BEFORE_1970_CERTIFICATE: &str = "-----BEGIN CERTIFICATE-----
+MIIBgzCCASmgAwIBAgIUScnGqW+7pSnYBEEeh/CJ3bHKCC0wCgYIKoZIzj0EAwIw
+FzEVMBMGA1UEAwwMZml4dHVyZS0xOTY5MB4XDTY4MDEwMTAwMDAwMFoXDTY5MDEw
+MTAwMDAwMFowFzEVMBMGA1UEAwwMZml4dHVyZS0xOTY5MFkwEwYHKoZIzj0CAQYI
+KoZIzj0DAQcDQgAE1K0yzqrJAoux//rRPIoEuautcH5fhGSFTkbNG+XE620EfLKw
+OQT/UThynST4IdIvfdNgTwzqpkBTHo8tOTDi3qNTMFEwHQYDVR0OBBYEFMYhNrop
+krfM5cwHrfde9YeiAXhEMB8GA1UdIwQYMBaAFMYhNropkrfM5cwHrfde9YeiAXhE
+MA8GA1UdEwEB/wQFMAMBAf8wCgYIKoZIzj0EAwIDSAAwRQIhAN6WtFJAR/6YGB35
+J9M5GzF7TgoFfvWgPR4ki1rYLFDBAiBdVJ3UQpO2/G+kMnCvqtzc3MrKZL/IWHh+
+7yMKuh3pVg==
+-----END CERTIFICATE-----
+";
+    // notAfter 1969-01-01T00:00:00Z, before the Unix epoch, encoded as UTCTime.
+    pub(crate) const BEFORE_1970_NOT_AFTER: i64 = -365 * 86_400;
 }
 
 #[cfg(test)]
@@ -577,18 +603,44 @@ mod tests {
 
     #[test]
     fn an_expiry_before_1970_is_an_expired_credential() {
-        // UTCTime 690101000000Z is 1969-01-01, before the Unix epoch.
-        assert_eq!(parse_time(0x17, b"690101000000Z"), Some(-365 * 86_400));
-        let file = CredentialFile {
-            variable: "OLD_CERT".to_owned(),
-            state: "present".to_owned(),
-            not_after_millis: Some(-365 * 86_400 * 1_000),
-        };
-        assert_eq!(file.problem(0), Some(CredentialProblemKind::Expired));
+        let directory = temporary("before-1970");
+        let certificate = directory.join("cert.pem");
+        fs::write(&certificate, BEFORE_1970_CERTIFICATE).expect("write certificate");
+        let names = ["OLD_CERT".to_owned()];
+        let files = inspect(&names, |_| Some(certificate.clone().into_os_string()));
+        fs::remove_dir_all(&directory).expect("cleanup");
+        assert_eq!(files.len(), 1);
         assert_eq!(
-            file.describe(0).as_deref(),
+            files[0].not_after_millis,
+            Some(BEFORE_1970_NOT_AFTER * 1_000)
+        );
+        assert_eq!(files[0].problem(0), Some(CredentialProblemKind::Expired));
+        assert_eq!(
+            files[0].describe(0).as_deref(),
             Some("credential expired 8760 h ago: OLD_CERT")
         );
+    }
+
+    #[test]
+    fn an_inaccessible_directory_or_a_socket_is_not_a_credential_file() {
+        let directory = temporary("not-files");
+        let locked = directory.join("locked");
+        fs::create_dir(&locked).expect("create directory");
+        fs::set_permissions(&locked, std::os::unix::fs::PermissionsExt::from_mode(0o000))
+            .expect("lock directory");
+        let socket = directory.join("socket");
+        let _listener = std::os::unix::net::UnixListener::bind(&socket).expect("bind socket");
+        let names = ["LOCKED".to_owned(), "SOCKET".to_owned()];
+        let files = inspect(&names, |name| {
+            Some(match name {
+                "LOCKED" => locked.clone().into_os_string(),
+                _ => socket.clone().into_os_string(),
+            })
+        });
+        fs::set_permissions(&locked, std::os::unix::fs::PermissionsExt::from_mode(0o700))
+            .expect("unlock directory");
+        fs::remove_dir_all(&directory).expect("cleanup");
+        assert!(files.is_empty(), "{files:?}");
     }
 
     #[test]

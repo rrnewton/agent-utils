@@ -998,6 +998,24 @@ PINS: tuple[Pin, ...] = (
         ),
     ),
     Pin(
+        "chat-credential-record-stale-seconds",
+        "the age at which `chat status` calls the saved credential observation stale, in seconds",
+        code=(
+            Site(
+                "rs/agentctl/src/chat_runtime.rs",
+                r"(?m)^pub\(crate\) const CREDENTIAL_RECORD_STALE_AFTER: Duration = Duration::from_secs\((?P<value>[\d_]+)\);$",
+                "the Rust stale threshold",
+            ),
+        ),
+        docs=(
+            Site(
+                "rs/agentctl/src/embedded_chat_userguide.md",
+                r"once\s+the\s+observation\s+is\s+older\s+than\s+(?P<value>[A-Za-z\d,]+)\s+seconds",
+                "the stale threshold the chat guide states",
+            ),
+        ),
+    ),
+    Pin(
         "chat-credential-record-refresh-seconds",
         "the longest `run` leaves `provider-credentials.json` unrewritten while the files are unchanged",
         code=(

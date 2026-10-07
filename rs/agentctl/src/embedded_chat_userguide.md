@@ -1263,8 +1263,9 @@ A deployment can point the plugin and the outbound helper at credential
 files, such as a TLS client certificate and key, through the variables in
 `subscription_environment` and `outbound_command.environment`. `run` checks
 each such file that it can see: every variable whose value is an absolute
-path to a regular file. A directory, a device or a pipe is not a credential
-file and is skipped, so a setting such as a home directory never counts. For
+path to a regular file. A directory (even one it cannot open), a device, a
+socket or a pipe is not a credential file and is skipped, so a setting such
+as a home directory never counts. For
 each file `run` records whether it exists and can be read and, when it holds
 a PEM certificate, that certificate's notAfter. It opens the file once,
 without blocking, reads it only to find a `CERTIFICATE` block, and reports
@@ -1274,11 +1275,15 @@ helper environment out of its state, status and log. `run` logs each file
 once at startup. Each delivery scan saves what it saw in
 `provider-credentials.json` whenever that changes, and at least every 300
 seconds, with `observed_at_millis`. `chat status` reports that record in
-`credentials`, as `observed_at_millis` and `files`, each with its `variable`,
-`state` (`present`, `missing` or `unreadable`), `not_after_millis`
-(negative before 1970), and `problem`. `chat status` reads the record rather
-than its own environment, which may lack the service's; before the first
-scan, `credentials` is null. A file that is missing, unreadable, expired, or
+`credentials`, as `evidence`, `stale_after_seconds`, `observed_at_millis` and
+`files`, each file with its `variable`, `state` (`present`, `missing` or
+`unreadable`), `not_after_millis` (negative before 1970), and `problem`.
+`chat status` reads the record rather than its own environment, which may
+lack the service's. `evidence` says how far to trust it: `none` before the
+service has saved one, `current`, `stale` once the observation is older than
+600 seconds (a stopped service, or a previous run's record), or `unreadable`
+when the record cannot be read; `delivery_alarm.credential_evidence` repeats
+it, so missing evidence never reads as no problems. A file that is missing, unreadable, expired, or
 within 24 hours of its notAfter is listed in `credential_problems` in
 `delivery-alarm.json` and in `chat status`'s `delivery_alarm`, even while the
 provider still works, so the problem shows a day before the outage. When a
