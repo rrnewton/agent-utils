@@ -1457,15 +1457,25 @@ impl Wrapper<'_> {
             self.flush();
             throttled = true;
             if class == Class::GitCredential {
-                // Saving the state, the audit record and stderr since `stayed` was read may
-                // have used up some of the bound (a stall, a suspend), so sleep only for what is
-                // left of it, and on the clock the bound is measured on, so that a suspend
-                // during the sleep counts too. A call whose bound has passed does not sleep, and
-                // the next pass refuses it.
-                let left = started + max_wait - self.clock.monotonic();
-                let secs = w.secs.min(left.max(0.0));
-                self.clock.sleep_monotonic(secs);
-                waited += secs;
+                // The sleep ends at a deadline on the clock the bound is measured on: `w.secs`
+                // from this reading, taken after the state, the audit record and stderr were
+                // written, and never past the bound. A deadline rather than a duration, so that
+                // neither a stall or suspend after this reading nor a suspend during the sleep
+                // moves the wake-up later. A call whose bound has passed does not sleep, and the
+                // next pass refuses it.
+                let from = self.clock.monotonic();
+                let until = (from + w.secs).min(started + max_wait);
+                if let Err(e) = self.clock.sleep_until_monotonic(until) {
+                    self.banner(
+                        "ERROR",
+                        &[
+                            format!("cannot wait on the clock {max_wait_var} is measured on: {e}"),
+                            format!("not running `{}` (exit {EXIT_INTERNAL})", c.command),
+                        ],
+                    );
+                    return Err(EXIT_INTERNAL);
+                }
+                waited += (until - from).max(0.0);
             } else {
                 self.clock.sleep(w.secs);
                 waited += w.secs;

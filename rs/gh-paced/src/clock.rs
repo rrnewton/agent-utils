@@ -1,6 +1,6 @@
 //! Wall-clock access behind a trait, so the pacing engine can be driven by a fake clock in tests.
 
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// Source of the current time and of blocking sleeps.
@@ -20,11 +20,15 @@ pub trait Clock: Send + Sync {
     fn monotonic(&self) -> f64 {
         self.now()
     }
-    /// Block for `secs` seconds of [`Clock::monotonic`] (non-positive values return at once),
-    /// so that time the machine spends suspended during the sleep counts against it, which
-    /// [`Clock::sleep`] need not do. The default is [`Clock::sleep`].
-    fn sleep_monotonic(&self, secs: f64) {
-        self.sleep(secs)
+    /// Block until [`Clock::monotonic`] reads at least `deadline` (a deadline already reached
+    /// returns at once). The deadline is absolute, so neither time that passes before the
+    /// timer is set nor time the machine spends suspended during the wait moves the wake-up
+    /// later, as a relative [`Clock::sleep`] would. An error means the clock could not wait, and
+    /// any amount of time may or may not have passed. The default reads [`Clock::monotonic`]
+    /// and sleeps with [`Clock::sleep`] for what is left.
+    fn sleep_until_monotonic(&self, deadline: f64) -> Result<(), String> {
+        self.sleep(deadline - self.monotonic());
+        Ok(())
     }
 }
 
@@ -51,13 +55,11 @@ impl Clock for RealClock {
         boottime()
     }
 
-    /// Sleeps until [`boottime`] has advanced by `secs` ([`sleep_boottime_until`]).
-    /// `std::thread::sleep`, used by [`Clock::sleep`], times on `CLOCK_MONOTONIC`, which stops
-    /// while the machine is suspended, so a suspend would lengthen it by the time suspended.
-    fn sleep_monotonic(&self, secs: f64) {
-        if secs > 0.0 && secs.is_finite() {
-            sleep_boottime_until(boottime() + secs);
-        }
+    /// [`sleep_until_boottime`]. `std::thread::sleep`, used by [`Clock::sleep`], times a
+    /// duration on `CLOCK_MONOTONIC`, which stops while the machine is suspended, so a suspend
+    /// would lengthen it by the time suspended.
+    fn sleep_until_monotonic(&self, deadline: f64) -> Result<(), String> {
+        sleep_until_boottime(deadline)
     }
 }
 
@@ -71,45 +73,58 @@ impl Clock for RealClock {
 /// Linux always has `CLOCK_MONOTONIC`; `std::time::Instant::now` panics without it, and so does
 /// this.
 pub fn boottime() -> f64 {
-    read_clock(libc::CLOCK_BOOTTIME)
-        .or_else(|| read_clock(libc::CLOCK_MONOTONIC))
-        .expect("clock_gettime(CLOCK_MONOTONIC) failed")
+    read_clock(boot_clock()).expect("clock_gettime(CLOCK_MONOTONIC) failed")
+}
+
+/// The clock [`boottime`] reads and [`sleep_until_boottime`] times on: `CLOCK_BOOTTIME`, or
+/// `CLOCK_MONOTONIC` if the kernel refuses it, decided once per process so that both always use
+/// the same one.
+fn boot_clock() -> libc::clockid_t {
+    static CLOCK: OnceLock<libc::clockid_t> = OnceLock::new();
+    *CLOCK.get_or_init(|| {
+        if read_clock(libc::CLOCK_BOOTTIME).is_some() {
+            libc::CLOCK_BOOTTIME
+        } else {
+            libc::CLOCK_MONOTONIC
+        }
+    })
 }
 
 /// Block until [`boottime`] reads at least `deadline`, with an absolute `clock_nanosleep` timer
-/// on `CLOCK_BOOTTIME`, which keeps running while the machine is suspended, restarted after a
-/// signal. If the kernel refuses that timer, sleeps with `std::thread::sleep` for what
-/// [`boottime`] says is left until it has reached the deadline.
-pub fn sleep_boottime_until(deadline: f64) {
-    if deadline.is_finite() && deadline > 0.0 {
-        let ts = libc::timespec {
-            tv_sec: deadline.trunc() as libc::time_t,
-            tv_nsec: ((deadline.fract() * 1e9) as libc::c_long).clamp(0, 999_999_999),
-        };
-        loop {
-            // SAFETY: clock_nanosleep reads one valid timespec; with TIMER_ABSTIME it writes no
-            // remainder, so that pointer may be null.
-            let rc = unsafe {
-                libc::clock_nanosleep(
-                    libc::CLOCK_BOOTTIME,
-                    libc::TIMER_ABSTIME,
-                    &ts,
-                    std::ptr::null_mut(),
-                )
-            };
-            match rc {
-                0 => return,
-                libc::EINTR => continue,
-                _ => break,
+/// on the clock it reads (`CLOCK_BOOTTIME` keeps running while the machine is suspended), see
+/// [`sleep_until_on`].
+pub fn sleep_until_boottime(deadline: f64) -> Result<(), String> {
+    sleep_until_on(boot_clock(), deadline)
+}
+
+/// Block until clock `id` reads at least `deadline` seconds, with an absolute `clock_nanosleep`
+/// timer, restarted after a signal. A deadline that is not a positive finite number returns at
+/// once. Any other failure of the timer is returned rather than replaced by a relative sleep,
+/// which would not count time the machine spends suspended.
+fn sleep_until_on(id: libc::clockid_t, deadline: f64) -> Result<(), String> {
+    if !(deadline.is_finite() && deadline > 0.0) {
+        return Ok(());
+    }
+    let ts = libc::timespec {
+        // `as` saturates: a deadline beyond `time_t` waits until the end of that clock.
+        tv_sec: deadline.trunc() as libc::time_t,
+        tv_nsec: ((deadline.fract() * 1e9) as libc::c_long).clamp(0, 999_999_999),
+    };
+    loop {
+        // SAFETY: clock_nanosleep reads one valid timespec; with TIMER_ABSTIME it writes no
+        // remainder, so that pointer may be null.
+        let rc =
+            unsafe { libc::clock_nanosleep(id, libc::TIMER_ABSTIME, &ts, std::ptr::null_mut()) };
+        match rc {
+            0 => return Ok(()),
+            libc::EINTR => continue,
+            e => {
+                return Err(format!(
+                    "clock_nanosleep(clock {id}, TIMER_ABSTIME, {deadline} s) failed: {}",
+                    std::io::Error::from_raw_os_error(e)
+                ))
             }
         }
-    }
-    loop {
-        let left = deadline - boottime();
-        if !(left > 0.0 && left.is_finite()) {
-            return;
-        }
-        std::thread::sleep(Duration::from_secs_f64(left));
     }
 }
 
@@ -210,24 +225,52 @@ mod tests {
         assert!((0.05..5.0).contains(&took), "measured {took} s");
     }
 
-    /// The real clock's monotonic sleep lasts the time asked for on boot time, and returns at
-    /// once for a non-positive or non-finite time, as [`Clock::sleep`] does. (This host cannot be
-    /// suspended from a test, so that a suspend counts is not exercised here.)
+    /// The real clock's monotonic sleep ends at its deadline on boot time: it waits until then,
+    /// and a deadline that passed before the sleep began (here, while the thread slept 0.6 s
+    /// after working out a deadline 0.5 s away, as a suspend would) returns at once, where a
+    /// relative sleep would wait its whole length again. A deadline that is not a positive
+    /// finite number returns at once. (This host cannot be suspended from a test, so a suspend
+    /// during the sleep itself is not exercised here.)
     #[test]
-    fn real_clock_sleep_monotonic_sleeps_on_boot_time() {
+    fn real_clock_sleep_until_monotonic_ends_at_its_deadline() {
         let clock = RealClock;
         let before = boottime();
-        clock.sleep_monotonic(0.05);
+        clock.sleep_until_monotonic(before + 0.05).unwrap();
         let took = boottime() - before;
         assert!((0.05..5.0).contains(&took), "slept {took} s");
+        let deadline = boottime() + 0.5;
+        std::thread::sleep(Duration::from_secs_f64(0.6));
         let before = boottime();
-        for secs in [0.0, -1.0, f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
-            clock.sleep_monotonic(secs);
+        assert!(before >= deadline);
+        clock.sleep_until_monotonic(deadline).unwrap();
+        for deadline in [
+            before - 10.0,
+            0.0,
+            -1.0,
+            f64::NAN,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+        ] {
+            clock.sleep_until_monotonic(deadline).unwrap();
         }
-        sleep_boottime_until(before - 10.0);
-        sleep_boottime_until(f64::NAN);
         let took = boottime() - before;
-        assert!(took < 1.0, "returned at once: {took} s");
+        assert!(took < 0.5, "returned at once: {took} s");
+    }
+
+    /// A timer the kernel refuses is reported, at once, instead of being replaced by a sleep
+    /// that would not count a suspend. (No clock has the id 1000000, so clock_nanosleep refuses
+    /// it with EINVAL.)
+    #[test]
+    fn sleep_until_reports_a_refused_timer() {
+        let before = boottime();
+        let e = sleep_until_on(1_000_000, before + 10.0).unwrap_err();
+        assert!(
+            e.starts_with("clock_nanosleep(clock 1000000, TIMER_ABSTIME, ")
+                && e.contains("Invalid argument"),
+            "{e}"
+        );
+        let took = boottime() - before;
+        assert!(took < 5.0, "returned at once: {took} s");
     }
 
     /// The real clock measures on boot time, the clock that keeps counting while the machine is

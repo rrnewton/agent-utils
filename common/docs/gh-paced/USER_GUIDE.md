@@ -812,15 +812,18 @@ push that may hold its caller's locks for as long as the helper sleeps:
   (default 30 s; the smaller of it and `GH_PACED_MAX_WAIT` applies), counting
   time spent waiting for the state lock as well as sleeps, measured from the
   start of the call on a monotonic clock that keeps counting while the machine
-  is suspended (setting the system time back does not lengthen it, and its
-  sleeps are timed on that clock, so a suspend does not either), and is refused
-  beyond it with the banner above naming `GH_PACED_GIT_MAX_WAIT`. A call that
-  becomes admissible only after the bound has passed, because a sleep ended late,
-  because the bound passed before a sleep began (it then does not sleep), or
-  because it got the state lock only then, is refused the same way (exit 75),
-  without using the budget. A call that waited for nothing is admitted however
-  long its own work took, so a bound of 0 still runs a call whose budget and
-  state lock are free.
+  is suspended (setting the system time back does not lengthen it), and is
+  refused beyond it with the banner above naming `GH_PACED_GIT_MAX_WAIT`. Each
+  of its sleeps ends at a deadline on that clock, never past the bound, so a
+  stall or a suspend before or during the sleep does not lengthen it either; if
+  the system refuses that timer, the call stops with exit 70 and a message
+  naming `GH_PACED_GIT_MAX_WAIT` instead of sleeping. A call that becomes
+  admissible only after the bound has passed, because a sleep ended late or the
+  machine resumed from a suspend past it, because the bound passed before a
+  sleep began (it then does not sleep), or because it got the state lock only
+  then, is refused the same way (exit 75), without using the budget. A call
+  that waited for nothing is admitted however long its own work took, so a
+  bound of 0 still runs a call whose budget and state lock are free.
 - it waits for the state lock only for what is left of that bound, not the
   whole `GH_PACED_LOCK_WAIT`: the bound counts from the start of the call, so
   this holds before gh runs (recording a refusal of one of gh's aliases
@@ -1067,7 +1070,7 @@ other process is stuck.
 | 75 | refused: the wait would exceed `GH_PACED_MAX_WAIT` (`GH_PACED_GIT_MAX_WAIT` for GIT_CREDENTIAL, which then also prints `quit=1` on stdout, as it does when the call became admissible only after that bound), a GIT_CREDENTIAL call arrived during a cooldown, the cost is above the class's burst (not for a watch) or can never fit under the hourly cap, a watch ran past the deadline its cost paid for, or gh-paced is nested too deep |
 | 65 | refused by the write content guard: body too large, base64-looking content (in an argument, a file, stdin, or one of gh's alias expansions), a body gh would compose itself, or a body file that cannot be copied for inspection. Text refused by the editor guard makes the editor fail instead, so gh exits with its own status (usually 1) and sends nothing |
 | 64 | usage error, or a refused command shape (a watch without `GH_PACED_ALLOW_WATCH=1`, a watch interval under 30 s, or one that is not a positive whole number, or one of gh's aliases gh-paced cannot resolve for certain; see [gh's own aliases](#ghs-own-aliases)) |
-| 70 | internal error: the pacing state cannot be read or written, or its lock was not obtained within `GH_PACED_LOCK_WAIT` (within what is left of `GH_PACED_GIT_MAX_WAIT` for a GIT_CREDENTIAL call, which then also prints `quit=1` on stdout) |
+| 70 | internal error: the pacing state cannot be read or written, or its lock was not obtained within `GH_PACED_LOCK_WAIT` (within what is left of `GH_PACED_GIT_MAX_WAIT` for a GIT_CREDENTIAL call, which then also prints `quit=1` on stdout), or a GIT_CREDENTIAL call could not set the timer for its sleep |
 | 78 | configuration error, `--real-gh` resolves to gh-paced, or gh's `config.yml` cannot be read and the command line names a command |
 | 127 | the real gh cannot be found or run (a GIT_CREDENTIAL call whose gh never started then also prints `quit=1` on stdout) |
 
