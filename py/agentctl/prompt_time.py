@@ -19,10 +19,13 @@ import time
 
 LATE_PROMPT_AFTER_SECONDS = 120
 
+# ASCII digits only, as the Rust parser and the subscription crate accept.
 _RFC3339 = re.compile(
-    r"(\d{4})-(\d{2})-(\d{2})[Tt](\d{2}):(\d{2}):(\d{2})(?:\.(\d+))?(?:([Zz])|([+-])(\d{2}):(\d{2}))"
+    r"([0-9]{4})-([0-9]{2})-([0-9]{2})[Tt]([0-9]{2}):([0-9]{2}):([0-9]{2})(?:\.([0-9]+))?"
+    r"(?:([Zz])|([+-])([0-9]{2}):([0-9]{2}))",
+    re.ASCII,
 )
-_ABBREVIATION = re.compile(r"[A-Za-z0-9+-]{1,8}")
+_ABBREVIATION = re.compile(r"[A-Za-z0-9+-]{1,8}", re.ASCII)
 
 
 def _days_in_month(year: int, month: int) -> int:
@@ -38,6 +41,19 @@ def _days_from_civil(year: int, month: int, day: int) -> int:
     day_of_year = (153 * ((month + 9) % 12) + 2) // 5 + day - 1
     day_of_era = year_of_era * 365 + year_of_era // 4 - year_of_era // 100 + day_of_year
     return era * 146_097 + day_of_era - 719_468
+
+
+def _civil_from_days(days: int) -> tuple[int, int, int]:
+    """The proleptic Gregorian date ``days`` after 1970-01-01, as the Rust drain computes it."""
+    days += 719_468
+    era = days // 146_097
+    day_of_era = days - era * 146_097
+    year_of_era = (day_of_era - day_of_era // 1_460 + day_of_era // 36_524 - day_of_era // 146_096) // 365
+    day_of_year = day_of_era - (365 * year_of_era + year_of_era // 4 - year_of_era // 100)
+    month_index = (5 * day_of_year + 2) // 153
+    day = day_of_year - (153 * month_index + 2) // 5 + 1
+    month = month_index + 3 if month_index < 10 else month_index - 9
+    return year_of_era + era * 400 + (month <= 2), month, day
 
 
 def rfc3339_instant(value: str) -> tuple[int, int, bool] | None:
@@ -74,15 +90,25 @@ def _numeric_offset(offset_seconds: int) -> str:
     return f"UTC{sign}{minutes // 60:02}:{minutes % 60:02}"
 
 
-def _stamp(seconds: int) -> str:
+def _zone(seconds: int) -> tuple[int, str]:
+    """The process's UTC offset and zone name at ``seconds``; UTC when it cannot be read."""
     try:
         local = time.localtime(seconds)
-        offset = local.tm_gmtoff
-        name = local.tm_zone if _ABBREVIATION.fullmatch(local.tm_zone or "") else _numeric_offset(offset)
     except (OverflowError, OSError, ValueError):
-        offset, name = 0, "UTC"
-    shifted = time.gmtime(seconds + offset)
-    return f"{shifted.tm_year:04}.{shifted.tm_mon:02}.{shifted.tm_mday:02}:{shifted.tm_hour:02}:{shifted.tm_min:02} {name}"
+        return 0, "UTC"
+    offset = local.tm_gmtoff
+    name = local.tm_zone if _ABBREVIATION.fullmatch(local.tm_zone or "") else _numeric_offset(offset)
+    return offset, name
+
+
+def _stamp(seconds: int) -> str:
+    # The local date is computed from the offset, as the Rust drain does, not by the C library,
+    # so the two agree under every zone, including one that counts leap seconds.
+    offset, name = _zone(seconds)
+    local = seconds + offset
+    year, month, day = _civil_from_days(local // 86_400)
+    minute_of_day = local % 86_400 // 60
+    return f"{year:04}.{month:02}.{day:02}:{minute_of_day // 60:02}:{minute_of_day % 60:02} {name}"
 
 
 def _duration_words(seconds: int) -> str:
@@ -121,4 +147,9 @@ def retime(text: str, sent_at: object, recorded: object, now_nanos: int | None =
     now = time.time_ns() if now_nanos is None else now_nanos
     # The Rust drain reads its clock in milliseconds; the same instant renders the same text.
     now = now // 1_000_000 * 1_000_000
-    return opening(sent_at, now) + text[len(recorded):]
+    try:
+        fresh = opening(sent_at, now)
+    except (ArithmeticError, OSError, ValueError):
+        # The drain calls this after it marks the prompt in flight: never fail there.
+        return text
+    return fresh + text[len(recorded):] if fresh else text
