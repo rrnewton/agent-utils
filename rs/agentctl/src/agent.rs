@@ -480,10 +480,13 @@ pub trait AgentRuntime {
     fn delivery_wait_chunk(&self) -> Option<Duration> {
         None
     }
-    /// Note that a queue drain typed the queued prompt `message_id`, and that the pane printed
-    /// it after the submission key. The drain calls this before it records the prompt as
-    /// processed, so a note saved here is not lost when the drain stops in between. The default
-    /// ignores the note.
+    /// Note that a queue drain typed the queued prompt `message_id` and verified the submission
+    /// against the agent's composer: the pane printed the prompt after the submission key, or
+    /// the prompt left the composer that was checked before typing, as when the agent queued it
+    /// behind another prompt and showed nothing of it. A submission confirmed only by the pane's
+    /// status is not noted. The drain calls this before it records the prompt as processed, so
+    /// a note saved here is not lost when the drain stops in between. The default ignores the
+    /// note.
     fn prompt_printed(&self, message_id: &str) {
         let _ = message_id;
     }
@@ -842,8 +845,8 @@ fn drain_with_runtime_binding<A: AgentApi + ?Sized>(
                 blocked = Some(detail);
                 break;
             }
-            Ok(Delivered::Confirmed { printed }) => {
-                if printed {
+            Ok(Delivered::Confirmed { verified }) => {
+                if verified {
                     runtime.prompt_printed(&identifier);
                 }
                 document.insert("delivery_state".to_owned(), json!("processed"));
@@ -1299,8 +1302,9 @@ fn wait_ready<A: AgentApi + ?Sized>(
 enum Delivered {
     /// The prompt was submitted and confirmed.
     Confirmed {
-        /// Whether the screen showed something the pane printed after the submission key.
-        printed: bool,
+        /// Whether the submission was verified against the agent's composer, which the queue
+        /// checked before typing: with printed evidence or with the prompt leaving the composer.
+        verified: bool,
     },
     /// Nothing was typed, so the prompt remains safe to retry.
     NotStaged(String),
@@ -1324,11 +1328,7 @@ fn deliver_one<A: AgentApi + ?Sized>(
     match submission {
         // The screen already proved the prompt left the composer. A lifecycle
         // transition adds nothing and is absent when the agent queues the prompt.
-        Submission::Verified(receipt) => {
-            return Ok(Delivered::Confirmed {
-                printed: receipt.printed,
-            })
-        }
+        Submission::Verified(_) => return Ok(Delivered::Confirmed { verified: true }),
         Submission::NotStaged(reason) => return Ok(Delivered::NotStaged(reason)),
         Submission::Unconfirmed => {}
     }
@@ -1336,7 +1336,7 @@ fn deliver_one<A: AgentApi + ?Sized>(
         let millis = working_timeout.as_millis().clamp(1, u64::MAX.into()) as u64;
         return client
             .wait_agent_status_with_runtime(&info.pane_id, "working", millis, runtime)
-            .map(|()| Delivered::Confirmed { printed: false })
+            .map(|()| Delivered::Confirmed { verified: false })
             .map_err(|error| {
                 AgentError::delivery(format!(
                     "pane {} did not confirm idle/done -> working submission: {error}",
@@ -1364,7 +1364,7 @@ fn deliver_one<A: AgentApi + ?Sized>(
         let wait = chunk.min(remaining);
         let millis = wait.as_millis().clamp(1, u64::MAX.into()) as u64;
         match client.wait_agent_status_with_runtime(&info.pane_id, "working", millis, runtime) {
-            Ok(()) => return Ok(Delivered::Confirmed { printed: false }),
+            Ok(()) => return Ok(Delivered::Confirmed { verified: false }),
             Err(error) => last_error = Some(error.to_string()),
         }
     }
@@ -2768,18 +2768,23 @@ mod tests {
             runtime: &dyn AgentRuntime,
         ) -> crate::error::Result<Submission> {
             match &self.screen {
-                // Mirrors the production override: the composer is driven directly.
-                Some(screen) => crate::submission::submit_verified(
-                    screen,
-                    pane_id,
-                    "codex",
-                    text,
-                    crate::submission::SubmitTimeouts {
-                        stage: Duration::from_secs(3),
-                        submit: Duration::from_secs(5),
-                    },
-                    runtime,
-                ),
+                // Mirrors the production override: the composer is driven directly, for the
+                // harness the screen draws.
+                Some(screen) => {
+                    // Read before the call: the screen's lock must not be held while it types.
+                    let harness = screen.state().harness;
+                    crate::submission::submit_verified(
+                        screen,
+                        pane_id,
+                        harness,
+                        text,
+                        crate::submission::SubmitTimeouts {
+                            stage: Duration::from_secs(3),
+                            submit: Duration::from_secs(5),
+                        },
+                        runtime,
+                    )
+                }
                 None => self
                     .run_with_runtime(pane_id, text, runtime)
                     .map(|()| Submission::Unconfirmed),
@@ -3085,6 +3090,33 @@ mod tests {
         .unwrap();
         assert_eq!(result.delivered, [result.message_id]);
         assert!(runtime.printed.lock().expect("printed prompts").is_empty());
+    }
+
+    #[test]
+    fn a_drain_notes_a_prompt_the_agent_queued_behind_another_without_printing_it() {
+        // A busy Claude already shows its running-turn marker and its queued-message marker for
+        // an earlier prompt, and shows nothing of a prompt queued behind it, so the submission
+        // has no printed evidence. The prompt still verifiably left the checked composer.
+        let directory = TestDirectory::new("queued-unprinted");
+        let screen = crate::submission::fake::FakeScreen::new("claude", true);
+        screen.state().queued.push("an earlier prompt".to_owned());
+        screen.state().queued_hidden = true;
+        let fake = FakeAgent::with_screen(screen);
+        let runtime = PrintNotingRuntime::default();
+        let result = send_with_runtime(
+            &fake,
+            &target(),
+            directory.path(),
+            "queued behind it",
+            DrainOptions::default(),
+            &runtime,
+        )
+        .unwrap();
+        assert_eq!(result.delivered, [result.message_id.clone()]);
+        assert_eq!(
+            *runtime.printed.lock().expect("noted prompts"),
+            [result.message_id]
+        );
     }
 
     #[test]
