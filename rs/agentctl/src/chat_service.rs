@@ -2493,7 +2493,7 @@ struct TypingNotes {
 /// A delivery that notes in `notes` when it is asked to type into the pane: `submit` types a
 /// prompt and `drain` types the queued ones. Either may have typed even when it fails, so
 /// `typed` says that a prompt may have reached the pane, not that one did. It also saves the ✅
-/// receipt reaction of each request prompt that the delivery reports the pane printed, at once:
+/// receipt reaction of each request prompt whose submission the delivery reports verified, at once:
 /// the queue reports it before it records the prompt as processed, and before the pass records
 /// the prompt as typed, which can retire the request. A saved reaction goes to `receipts` when
 /// `chat run` has an acknowledgement worker.

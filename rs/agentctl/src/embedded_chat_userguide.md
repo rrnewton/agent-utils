@@ -1330,11 +1330,15 @@ from the same template is not the whole of this one, and another paste has
 another number. A placeholder that names only a length, `[Pasted Content N
 chars]`, is not evidence, since another paste can have the same length, and
 nor is placeholder text that is part of the prompt itself. A prompt too long to
-show whole and shown without a numbered placeholder earns ✅ only by a marker. A
+show whole and shown without a numbered placeholder has printed evidence only
+from a marker. A
 busy agent shows its running-turn marker before the key and after it, so a
 marker that was already showing proves only that the prompt left the composer. When that is all the queue finds, it reads the screen
 every 100 milliseconds for up to 2 more seconds, pressing no other key, for
-printed evidence. Either way the prompt is recorded as typed and earns ✅: the
+printed evidence. If one of those reads shows the prompt in the composer again,
+the empty composer was a passing redraw and nothing is proved: the queue goes
+back to pressing the key on its schedule, and reports the prompt as not
+submitted if it is still there at the deadline. Otherwise, either way the prompt is recorded as typed and earns ✅: the
 queue typed it only into a composer it recognised as empty and ready, so a
 prompt that then left that composer was submitted, or queued by the agent. A
 busy Claude Code that already holds a queued prompt shows nothing of the next

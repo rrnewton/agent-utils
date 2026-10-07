@@ -3813,7 +3813,8 @@ pub(crate) trait CoordinatorDelivery {
         self.drain(agent_name, options).map(|()| None)
     }
     /// [`Self::submit`], also passing to `printed` the queue message ID of each prompt it typed
-    /// with evidence that the pane printed the prompt after its submission key. A drain types
+    /// and verified against the agent's composer: with evidence that the pane printed the prompt
+    /// after its submission key, or by the prompt leaving the composer it checked before typing. A drain types
     /// every prompt waiting in the queue, so the IDs may name other requests' prompts as well as
     /// `message_id`. A delivery that cannot tell passes none.
     fn submit_reporting_printed(
@@ -3989,8 +3990,8 @@ impl<A: ManagedApi + ?Sized> CoordinatorDelivery for ManagedAgents<'_, A> {
     }
 }
 
-/// A runtime that behaves as `runtime` and also passes each printed prompt's queue message ID to
-/// `printed`: how a delivery implements [`CoordinatorDelivery::submit_reporting_printed`].
+/// A runtime that behaves as `runtime` and also passes the queue message ID of each prompt whose
+/// submission the queue verified against the agent's composer to `printed`: how a delivery implements [`CoordinatorDelivery::submit_reporting_printed`].
 pub(crate) struct PrintReporter<'a> {
     pub(crate) runtime: &'a dyn agent::AgentRuntime,
     pub(crate) printed: &'a dyn Fn(&str),
@@ -4119,12 +4120,12 @@ impl BridgeState {
     /// Create a new private bridge state directory.
     pub fn initialize(root: &Path, config: BridgeConfiguration) -> Result<Self> {
         config.validate()?;
-        // ✅ marks a request whose prompt the pane printed, so a new state does not take it as the
-        // acknowledgement as well. A state made before keeps it and adds no separate receipt.
+        // ✅ marks a request whose prompt the queue verified in the agent's pane, so a new state
+        // does not take it as the acknowledgement as well. A state made before keeps it and adds no separate receipt.
         if config.ack_reaction.as_deref() == Some(RECEIPT_REACTION) {
             return Err(ChatRuntimeError::invalid(format!(
                 "ack_reaction cannot be {RECEIPT_REACTION}, which marks a request whose prompt \
-                 the pane printed; choose another emoji"
+                 the queue verified in the agent's pane; choose another emoji"
             )));
         }
         let existed = fs::symlink_metadata(root).is_ok();
