@@ -137,7 +137,8 @@ const DELIVERY_ALARM_FILE: &str = "delivery-alarm.json";
 // not on its message yet: see `ReceiptReactionRecord`.
 const RECEIPT_REACTION_SCHEMA: &str = "agentctl-chat-receipt-reaction/v1";
 const RECEIPT_REACTION_DIRECTORY: &str = "receipt-reactions";
-// The reaction a request's message gets once the coordinator's pane prints the request's prompt.
+// The reaction a request's message gets once a queue drain verifies the request's prompt against
+// the coordinator's composer: the pane printed it, or it left the composer checked before typing.
 pub(crate) const RECEIPT_REACTION: &str = "✅";
 // As many waiting reactions as the requests the state can hold. A reaction can outlive its
 // request's retirement, so the request cap does not bound them.
@@ -5831,8 +5832,8 @@ impl BridgeState {
     }
 
     /// Save a ✅ receipt reaction for each request whose queue message ID is in `message_ids`:
-    /// the prompts that a queue drain typed with evidence that the pane printed them after the
-    /// submission key. See [`ReceiptReactionRecord`]. An ID that is not a request's is ignored, as
+    /// the prompts that a queue drain typed and verified against the agent's composer, with
+    /// printed evidence or by the prompt leaving the composer it checked before typing. See [`ReceiptReactionRecord`]. An ID that is not a request's is ignored, as
     /// is a request that is retired, was admitted without an acknowledgement reaction, or already
     /// has a ✅ waiting. Nothing is saved when this state has no acknowledgement reaction. A ✅
     /// that finds `MAX_RECEIPT_REACTIONS` already waiting is lost and counted in

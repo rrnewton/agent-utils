@@ -1317,7 +1317,9 @@ null while no reply is sent or when the first reply's record cannot be read,
 `chat status`, these need no running service.
 
 When `ack_reaction` is set, the service also adds ✅ to a request's Chat
-message once the pane has printed the request's prompt. After the queue presses
+message once the queue has verified the request's prompt against the agent's
+composer: the pane printed it, or it left the composer the queue checked before
+typing. After the queue presses
 the key that submits a prompt, it looks on the screen for something the pane
 printed after the key: more copies above the composer of the whole prompt,
 blanks left out, or of a numbered paste placeholder the composer showed for
@@ -1332,33 +1334,37 @@ show whole and shown without a numbered placeholder earns ✅ only by a marker. 
 busy agent shows its running-turn marker before the key and after it, so a
 marker that was already showing proves only that the prompt left the composer. When that is all the queue finds, it reads the screen
 every 100 milliseconds for up to 2 more seconds, pressing no other key, for
-printed evidence. The prompt is recorded as typed either way, but only a prompt
-with printed evidence earns ✅. Only a submission checked against the Claude
-Code or Codex composer, as described here, gives that evidence. Any other
+printed evidence. Either way the prompt is recorded as typed and earns ✅: the
+queue typed it only into a composer it recognised as empty and ready, so a
+prompt that then left that composer was submitted, or queued by the agent. A
+busy Claude Code that already holds a queued prompt shows nothing of the next
+one it queues, so such a prompt has no printed evidence; it still earns ✅.
+Only a submission checked against the Claude Code or Codex composer, as
+described here, is verified this way. Any other
 submission is recorded as typed once the pane's own confirmation succeeds:
 herdr reporting the pane `working`, or the check of its screen after the key
-that some panes' adapters make. That confirmation carries no printed evidence,
+that some panes' adapters make. That confirmation does not check the composer,
 so such a prompt earns no ✅. The delivery
 alarm above covers a prompt that is not recorded as typed at all.
 
-`chat init` refuses ✅ as the `ack_reaction`, since ✅ marks a printed prompt. A
+`chat init` refuses ✅ as the `ack_reaction`, since ✅ marks a verified prompt. A
 state made before with ✅ as its acknowledgement still opens; its
 acknowledgement already shows ✅ once the request is acknowledged, and no
 separate receipt is added.
 
-Each prompt that a drain types and the queue finds printed earns its request
+Each prompt that a drain types and the queue verifies earns its request
 ✅, subject to the limits below, including the other requests' prompts that the
 drain reaches and those it types while it delivers a routing-error prompt. A request admitted while
 `ack_reaction` was `null` earns none. The service saves the ✅ as soon as the
-queue finds the prompt printed, before the queue records the prompt as
+queue verifies the prompt, before the queue records the prompt as
 processed and before the pass records it as typed, as
 `receipt-reactions/KEY.json` in the bridge state directory, where KEY is the
 request's key, with the request's channel and message and an operation ID that
 every attempt to add the reaction reuses, so that a retry after a failure or a
 restart repeats one operation. The file is removed once the helper reports the
 reaction added. Saving does not wait for the reaction, and a request can retire
-before its ✅ is added, since the file names the message itself. A printed
-prompt earns none when the process ends after the queue finds it printed and
+before its ✅ is added, since the file names the message itself. A verified
+prompt earns none when the process ends after the queue verifies it and
 before the file is written, or when the file cannot be written, which the pass
 reports as an error.
 

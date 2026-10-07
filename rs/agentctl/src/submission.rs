@@ -893,6 +893,9 @@ pub(crate) mod fake {
         pub top_border_label: Option<String>,
         /// Glyph Codex draws before its composer: `›` before v0.159.1, `»` from it.
         pub codex_marker: &'static str,
+        /// A busy Claude queues a prompt without showing any of it above the composer, as it does
+        /// for a prompt queued behind another that it already holds.
+        pub queued_hidden: bool,
         stale_screen: Option<String>,
         pending_reads: u32,
         paste_counter: u32,
@@ -1037,7 +1040,9 @@ pub(crate) mod fake {
             }
             match (state.harness, keys) {
                 ("claude", "Enter") => {
-                    state.transcript.push(format!("❯ {text}"));
+                    if !(state.busy && state.queued_hidden) {
+                        state.transcript.push(format!("❯ {text}"));
+                    }
                     if state.busy {
                         state.queued.push(text);
                     } else {
