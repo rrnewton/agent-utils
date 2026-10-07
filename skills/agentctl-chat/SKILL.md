@@ -42,12 +42,14 @@ when the marker lines cannot do the job:
 
 - you must send something **before your turn ends**, and the text would not
   otherwise appear until then; or
-- a block you wrote between the two lines was reported as not sent (the bridge
-  may type a short notice into your pane, beginning `Chat reply not sent`).
+- a block you wrote between the two lines did not reach the chat: the bridge
+  reported it as not sent (a short notice in your pane, beginning `Chat reply
+  not sent`), or `agentctl chat sent` does not list it, as when the screen was
+  redrawn before the bridge read it.
 
-Send each reply one way only. A reply sent by the command is not shown in this
-terminal unless you also print it, which would send it twice; say in your turn
-output that you sent it, without the markers.
+Send each reply one way only. A reply sent by the command does not appear in
+this terminal by itself; printing a copy without the marker lines sends nothing,
+so it is a safe way to show the owner what you sent.
 
 ## Check what reached the chat
 
@@ -59,15 +61,22 @@ yet sent; `sending` means a send is in progress or its outcome is unknown, and
 the bridge retries it with the same operation ID, so it is never posted twice.
 `agentctl chat thread` shows one thread's retained requests and replies in
 order. A retired request's replies are no longer held, so the chat thread
-itself remains the complete record. The prompt gives the exact state directory
-in its `chat thread` command.
+itself remains the complete record. The state directory is the `--bridge-state`
+argument of the prompt's `chat thread` or `chat reply` command when the prompt
+prints one (a prompt for a new thread, or one whose command could not be
+printed safely, has neither); otherwise it is the `--bridge-state` of the
+service's `agentctl chat run` command, which the owner or the deployment's
+notes give.
 
 ## What the reactions and the first line mean
 
 - The acknowledgement reaction (configured per deployment, for example 👀) is
   added when the bridge admits the message.
-- ✅ is added once the bridge's queue has typed the prompt into your pane and
-  verified it against your composer, printed or queued behind another prompt.
+- ✅ is added, when the deployment has an acknowledgement reaction, once the
+  bridge's queue has typed the prompt into your pane and verified it against
+  your composer, printed or queued behind another prompt. Adding it can fail
+  or lag like any provider call, so a missing ✅ does not prove the prompt was
+  not delivered.
 - Each prompt's first line opens with the message's own send time, as
   `Sent 2026.10.07:08:45 EDT.`, and says `delivered 1 h 12 min later` when it
   reached you two minutes or more after that. Several held messages can arrive

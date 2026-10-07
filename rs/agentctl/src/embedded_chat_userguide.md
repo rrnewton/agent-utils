@@ -323,7 +323,9 @@ agentctl chat sent --bridge-state /home/me/.local/state/agentctl/project-chat --
 ```
 
 Each entry gives the time the reply was sent, or captured while it is unsent,
-in UTC with its age; its number within its request; the request key; the chat
+in UTC with its age (a record kept before send times were recorded shows its
+capture time and says that its send time is unknown; entries are ordered by
+these times); its number within its request; the request key; the chat
 message and thread it answers; and its outcome: `sent as` the provider's message
 ID once the provider accepted it, `captured, not yet sent`, or `send in progress
 or outcome unknown`, which the service retries with the same operation ID so it
@@ -353,7 +355,9 @@ path included, cannot be printed safely on one line, the prompt gives only the
 two marker lines. The prompt names the two marker lines as the normal way to
 reply, since that text also stays in the agent's terminal, where the owner may
 be reading, and the command only for a reply that must go before the agent's
-turn ends or one written between the lines that was reported as not sent. It
+turn ends or one written between the lines that did not reach the chat: one
+reported as not sent, or one that `chat sent` does not list, as when the screen
+was redrawn before the service read it. It
 asks the agent to send each reply one way only, and to print a reply between
 the two lines at the end of its turn if the command fails twice for it.
 
