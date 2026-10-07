@@ -6650,17 +6650,19 @@ at the end of your turn instead."
             ));
         }
         let keep = usize::try_from(last).unwrap_or(usize::MAX);
-        // Only the newest `keep` replies are held, each with its request's two identifiers, so
-        // memory stays bounded however many replies the state retains.
+        // Requests are read one at a time, and only the newest `keep` replies are held, each with
+        // its request's two identifiers, so memory stays bounded however many requests and
+        // replies the state retains.
         let mut newest: std::collections::BinaryHeap<std::cmp::Reverse<SentEntry>> =
             std::collections::BinaryHeap::new();
         let mut retained = 0_usize;
         {
             let _snapshot = self.lock_state_snapshot()?;
-            for (record, _) in self.request_records()? {
-                if request.is_some_and(|key| key != record.key) {
+            for (path, key) in self.request_paths()? {
+                if request.is_some_and(|wanted| wanted != key) {
                     continue;
                 }
+                let (record, _) = self.load_request_record(&path, &key)?;
                 for ordinal in 1..=record.reply_count {
                     let reply = match self.read_reply(&record.key, ordinal) {
                         Ok(reply) => reply,
@@ -9490,6 +9492,17 @@ stay held until an operator repairs or deletes it, and deleting it releases ever
         &self,
         after_listing: impl FnOnce(),
     ) -> Result<Vec<(RequestRecord, u64)>> {
+        let paths = self.request_paths()?;
+        after_listing();
+        paths
+            .into_iter()
+            .map(|(path, key)| self.load_request_record(&path, &key))
+            .collect()
+    }
+
+    /// Every request record's path and key, sorted by key, refusing an unexpected artifact or a
+    /// population over its cap; nothing is read.
+    fn request_paths(&self) -> Result<Vec<(PathBuf, String)>> {
         let mut paths = Vec::new();
         for entry in fs::read_dir(self.root.join("requests"))? {
             let entry = entry?;
@@ -9512,16 +9525,15 @@ stay held until an operator repairs or deletes it, and deleting it releases ever
             }
         }
         paths.sort_by(|left, right| left.1.cmp(&right.1));
-        after_listing();
-        paths
-            .into_iter()
-            .map(|(path, key)| {
-                let (record, bytes): (RequestRecord, u64) =
-                    read_document_sized(&path, MAX_REQUEST_RECORD_BYTES)?;
-                self.validate_request_record(&record, &key)?;
-                Ok((record, bytes))
-            })
-            .collect()
+        Ok(paths)
+    }
+
+    /// One request record from `request_paths`, read and validated as `request_records` does.
+    fn load_request_record(&self, path: &Path, key: &str) -> Result<(RequestRecord, u64)> {
+        let (record, bytes): (RequestRecord, u64) =
+            read_document_sized(path, MAX_REQUEST_RECORD_BYTES)?;
+        self.validate_request_record(&record, key)?;
+        Ok((record, bytes))
     }
 
     fn reply_records(&self) -> Result<Vec<(ReplyRecord, u64)>> {
