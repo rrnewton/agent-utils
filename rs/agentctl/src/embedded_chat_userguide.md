@@ -314,6 +314,27 @@ bridge never received are absent; the provider's own thread is the complete
 record. Like `inspect`, it reads under the shared state lock and never writes
 state or contacts Herdr, a helper, or a provider.
 
+`sent` lists the replies the bridge holds across all retained requests, or one
+request's with `--request KEY`, newest first, so an agent can check what reached
+the chat:
+
+```sh
+agentctl chat sent --bridge-state /home/me/.local/state/agentctl/project-chat --last 10
+```
+
+Each entry gives the time the reply was sent, or captured while it is unsent,
+in UTC with its age; its number within its request; the request key; the chat
+message and thread it answers; and its outcome: `sent as` the provider's message
+ID once the provider accepted it, `captured, not yet sent`, or `send in progress
+or outcome unknown`, which the service retries with the same operation ID so it
+is never posted twice. The first 300 characters of the reply follow, quoted as
+`thread` quotes them. `--last` selects how many (default 10, at most 100), and
+`--json` prints one document, schema `agentctl-chat-sent/v1`, with the same
+fields, times as Unix milliseconds, `retained` (how many the bridge holds), and
+each reply's whole text. Like `thread`, it holds only replies of requests that
+are not retired, reads under the shared state lock, and never writes state or
+contacts Herdr, a helper, or a provider.
+
 A reply printed between its two marker lines reaches the user only if the
 service reads it from the agent's screen, and a terminal agent can redraw or
 clear its screen before that read. With `chat run --offer-reply-command`, each
@@ -329,9 +350,12 @@ prints, which starts with the absolute path of the service's own executable:
 
 When no file is left at the executable's path, or a word of that command, that
 path included, cannot be printed safely on one line, the prompt gives only the
-two marker lines. The prompt asks the agent to send each reply one way only,
-and to print a reply between the two lines at the end of its turn if the
-command fails twice for it.
+two marker lines. The prompt names the two marker lines as the normal way to
+reply, since that text also stays in the agent's terminal, where the owner may
+be reading, and the command only for a reply that must go before the agent's
+turn ends or one written between the lines that was reported as not sent. It
+asks the agent to send each reply one way only, and to print a reply between
+the two lines at the end of its turn if the command fails twice for it.
 
 `reply` stores the file's text as a reply of the request, as if the service had
 read it between the two marker lines of `--reply-id`, and the service sends it

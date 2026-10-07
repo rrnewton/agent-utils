@@ -216,6 +216,10 @@ const MAX_QUOTED_PARENT_NAME_CHARS: usize = 256;
 pub const DEFAULT_THREAD_HISTORY_MESSAGES: u32 = 10;
 /// Largest `--last` value `agentctl chat thread` accepts.
 pub const MAX_THREAD_HISTORY_MESSAGES: u32 = 100;
+/// Stable JSON schema emitted by `agentctl chat sent --json`.
+pub const SENT_REPLIES_SCHEMA: &str = "agentctl-chat-sent/v1";
+// How much of each reply's text `chat sent` prints; `--json` carries the whole text.
+const SENT_PREVIEW_CHARACTERS: usize = 300;
 
 fn default_ack_reaction() -> Option<String> {
     Some("🤖".to_owned())
@@ -6505,9 +6509,11 @@ Lines between will be sent to the user as a chat message. {numbering}",
             .flatten()
         {
             prompt.push_str(&format!(
-                "\n\nTo send a reply at once, before your turn ends, write its text to a file, \
-without the two lines, and run this command with the file's path in place of \
-PATH_TO_YOUR_REPLY: {command}\nRun it once for each reply; running it again with the same text \
+                "\n\nReply between the two lines as usual: that text reaches the user both in \
+this terminal and in the chat. Only to send a reply before your turn ends, or when a reply \
+between the two lines was reported as not sent, write its text to a file, without the two \
+lines, and run this command with the file's path in place of PATH_TO_YOUR_REPLY: \
+{command}\nRun it once for each reply; running it again with the same text \
 does not send that text twice. Send each reply one way only, by this command or between the two \
 lines, not both. If the command fails twice for a reply, print that reply between the two lines \
 at the end of your turn instead."
@@ -6584,6 +6590,136 @@ at the end of your turn instead."
             shell_word(reply_id)?,
         );
         (neutral_capture_syntax(&command) == command).then_some(command)
+    }
+
+    /// What the bridge holds of the replies it captured, for `agentctl chat sent`: the `last`
+    /// most recent, newest first, of every retained request or only of `request`, each with its
+    /// request, the chat message it answers, its phase, the provider's message ID once sent, and
+    /// when it was captured and sent. Text, or with `json` one JSON document that also carries
+    /// each reply's whole text. Retired requests' replies are not held, so the chat thread itself
+    /// remains the complete record. Reads under the shared state lock and never writes.
+    pub fn sent_replies(&self, request: Option<&str>, last: u32, json: bool) -> Result<String> {
+        if !(1..=MAX_THREAD_HISTORY_MESSAGES).contains(&last) {
+            return Err(ChatRuntimeError::invalid(format!(
+                "sent reply count must be between 1 and {MAX_THREAD_HISTORY_MESSAGES}"
+            )));
+        }
+        if request.is_some_and(|key| !valid_key(key)) {
+            return Err(ChatRuntimeError::invalid(
+                "request must be an exact 64-character lowercase hexadecimal key",
+            ));
+        }
+        let mut entries = Vec::new();
+        {
+            let _snapshot = self.lock_state_snapshot()?;
+            for (record, _) in self.request_records()? {
+                if request.is_some_and(|key| key != record.key) {
+                    continue;
+                }
+                for ordinal in 1..=record.reply_count {
+                    let reply = match self.read_reply(&record.key, ordinal) {
+                        Ok(reply) => reply,
+                        // As in `thread_history`: a closed request's replies are removed first.
+                        Err(ChatRuntimeError::Io(error))
+                            if record.reply_closed && error.kind() == io::ErrorKind::NotFound =>
+                        {
+                            continue;
+                        }
+                        Err(error) => return Err(error),
+                    };
+                    entries.push((record.message.clone(), reply));
+                }
+            }
+        }
+        let at = |reply: &ReplyRecord| reply.sent_at_millis.unwrap_or(reply.captured_at_millis);
+        entries.sort_by(|left, right| {
+            (at(&right.1), &right.1.request_key, right.1.ordinal).cmp(&(
+                at(&left.1),
+                &left.1.request_key,
+                left.1.ordinal,
+            ))
+        });
+        let retained = entries.len();
+        entries.truncate(usize::try_from(last).unwrap_or(usize::MAX));
+        let phase = |reply: &ReplyRecord| match reply.phase {
+            ReplyPhase::Pending => "pending",
+            ReplyPhase::Sending => "sending",
+            ReplyPhase::Sent => "sent",
+        };
+        if json {
+            let replies = entries
+                .iter()
+                .map(|(message, reply)| {
+                    json!({
+                        "request": reply.request_key,
+                        "ordinal": reply.ordinal,
+                        "message_id": message.message_id,
+                        "thread_id": message.thread_id,
+                        "phase": phase(reply),
+                        "provider_message_id": reply.provider_message_id,
+                        "captured_at_millis": reply.captured_at_millis,
+                        "sent_at_millis": reply.sent_at_millis,
+                        "body": reply.body,
+                    })
+                })
+                .collect::<Vec<_>>();
+            let document = json!({
+                "schema": SENT_REPLIES_SCHEMA,
+                "retained": retained,
+                "replies": replies,
+            });
+            return serde_json::to_string_pretty(&document)
+                .map(|text| text + "\n")
+                .map_err(|error| ChatRuntimeError::invalid(error.to_string()));
+        }
+        let now = unix_millis();
+        let mut output = match (retained, entries.len()) {
+            (0, _) => "The bridge holds no replies.\n".to_owned(),
+            (1, _) => "The bridge holds 1 reply.\n".to_owned(),
+            (retained, shown) if shown == retained => {
+                format!("The bridge holds {retained} replies, newest first.\n")
+            }
+            (retained, shown) => {
+                format!(
+                    "The bridge holds {retained} replies; the {shown} most recent, newest first.\n"
+                )
+            }
+        };
+        output.push_str(
+            "It holds the replies of requests that are not retired; the chat thread is the \
+complete record.\n",
+        );
+        for (message, reply) in &entries {
+            let outcome = match (&reply.phase, &reply.provider_message_id) {
+                (ReplyPhase::Sent, Some(provider_message_id)) => {
+                    format!("sent as {}", single_line(provider_message_id))
+                }
+                (ReplyPhase::Sent, None) => "sent".to_owned(),
+                (ReplyPhase::Pending, _) => "captured, not yet sent".to_owned(),
+                (ReplyPhase::Sending, _) => "send in progress or outcome unknown".to_owned(),
+            };
+            let when = at(reply);
+            let mut preview: String = reply.body.chars().take(SENT_PREVIEW_CHARACTERS).collect();
+            let more = reply
+                .body
+                .chars()
+                .count()
+                .saturating_sub(SENT_PREVIEW_CHARACTERS);
+            if more > 0 {
+                preview.push_str(&format!(" ...({more} more characters)"));
+            }
+            output.push_str(&format!(
+                "\n[{}, {}] reply {} of request {} to message {} in thread {}: {outcome}\n{}",
+                utc_timestamp(when),
+                format_age(now, when),
+                reply.ordinal,
+                reply.request_key,
+                single_line(&message.message_id),
+                single_line(&message.thread_id),
+                quote_lines(&terminal_safe_text(&preview)),
+            ));
+        }
+        Ok(output)
     }
 
     /// Render the most recent retained messages of one exact thread as text, oldest first.
@@ -30255,6 +30391,69 @@ a fence ```sh here, ~~~~ there, and one ``\u{200b}` hidden"
     }
 
     #[test]
+    fn sent_lists_the_held_replies_newest_first_with_their_outcome() {
+        let (state, key, nonce, root) = open_request("sent-replies");
+        assert!(state
+            .sent_replies(None, 10, false)
+            .expect("empty listing")
+            .starts_with("The bridge holds no replies.\n"));
+        let id = format!("{nonce}_1");
+        state
+            .submit_reply(&key, &id, "first answer")
+            .expect("store the first reply");
+        let mut transport = FakeReplyTransport::default();
+        state
+            .publish_one(&key, &mut transport)
+            .expect("send the first reply")
+            .expect("a reply was sent");
+        state
+            .submit_reply(&key, &id, &format!("second {}", "x".repeat(400)))
+            .expect("store the second reply");
+
+        let listing = state.sent_replies(None, 10, false).expect("listing");
+        assert!(
+            listing.starts_with("The bridge holds 2 replies, newest first.\n"),
+            "{listing}"
+        );
+        let second = listing
+            .find(&format!("reply 2 of request {key} to message spaces/example/messages/one in thread spaces/example/threads/one: captured, not yet sent\n> second x"))
+            .expect("the unsent second reply");
+        let first = listing
+            .find(&format!("reply 1 of request {key} to message spaces/example/messages/one in thread spaces/example/threads/one: sent as messages/reply-1\n> first answer"))
+            .expect("the sent first reply");
+        assert!(second < first, "{listing}");
+        assert!(listing.contains(" ...(107 more characters)"), "{listing}");
+
+        let only_one = state.sent_replies(Some(&key), 1, false).expect("one reply");
+        assert!(
+            only_one.starts_with("The bridge holds 2 replies; the 1 most recent, newest first.\n"),
+            "{only_one}"
+        );
+        assert!(!only_one.contains("reply 1 of request"), "{only_one}");
+        assert!(state
+            .sent_replies(Some(&"0".repeat(64)), 10, false)
+            .expect("another request")
+            .starts_with("The bridge holds no replies.\n"));
+        assert!(state.sent_replies(Some("not-a-key"), 10, false).is_err());
+        assert!(state.sent_replies(None, 0, false).is_err());
+
+        let document: Value =
+            serde_json::from_str(&state.sent_replies(None, 10, true).expect("json")).expect("JSON");
+        assert_eq!(document["schema"], SENT_REPLIES_SCHEMA);
+        assert_eq!(document["retained"], 2);
+        let replies = document["replies"].as_array().expect("replies");
+        assert_eq!(replies[0]["ordinal"], 2);
+        assert_eq!(replies[0]["phase"], "pending");
+        assert!(replies[0]["provider_message_id"].is_null());
+        assert_eq!(replies[0]["body"].as_str().map(str::len), Some(407));
+        assert_eq!(replies[1]["phase"], "sent");
+        assert_eq!(replies[1]["provider_message_id"], "messages/reply-1");
+        assert_eq!(replies[1]["message_id"], "spaces/example/messages/one");
+        assert!(replies[1]["sent_at_millis"].is_u64());
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
     fn a_reply_stored_by_command_is_held_once_whichever_way_it_arrives_first() {
         // `chat reply` stores a reply as if it had been read between the two marker lines, so a
         // text that also reaches the screen is held once, whichever comes first, and running the
@@ -30820,8 +31019,10 @@ a fence ```sh here, ~~~~ there, and one ``\u{200b}` hidden"
             prompt.ends_with(&format!(
                 "Lines between will be sent to the user as a chat message. Use the same two lines \
 for every reply, with no tool call between them.\n\n\
-To send a reply at once, before your turn ends, write its text to a file, without the two lines, \
-and run this command with the file's path in place of PATH_TO_YOUR_REPLY: {program} chat reply \
+Reply between the two lines as usual: that text reaches the user both in this terminal and in the \
+chat. Only to send a reply before your turn ends, or when a reply between the two lines was \
+reported as not sent, write its text to a file, without the two lines, and run this command with \
+the file's path in place of PATH_TO_YOUR_REPLY: {program} chat reply \
 --bridge-state {root_word} --request {key} --reply-id 001 --file PATH_TO_YOUR_REPLY\n\
 Run it once for each reply; running it again with the same text does not send that text twice. \
 Send each reply one way only, by this command or between the two lines, not both. If the command \

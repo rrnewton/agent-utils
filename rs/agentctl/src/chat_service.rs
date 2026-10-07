@@ -318,6 +318,17 @@ pub fn thread_history(
     Ok(BridgeState::inspect(state_root)?.thread_history(thread, last)?)
 }
 
+/// The replies the bridge holds, newest first, for `agentctl chat sent`: see
+/// [`BridgeState::sent_replies`]. Read-only.
+pub fn sent_replies(
+    state_root: &Path,
+    request: Option<&str>,
+    last: u32,
+    json: bool,
+) -> Result<String, ChatServiceError> {
+    Ok(BridgeState::inspect(state_root)?.sent_replies(request, last, json)?)
+}
+
 /// Publish one explicit owner/operator root message without mutating durable bridge state.
 ///
 /// The configured channel authority and request are validated before the exact configured helper

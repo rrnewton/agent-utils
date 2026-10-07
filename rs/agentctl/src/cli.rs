@@ -489,15 +489,21 @@ enum ChatCommand {
         after_help = "Example:\n  agentctl chat thread --bridge-state ~/.local/state/agentctl/chat \\\n    --thread spaces/example/threads/one --last 20\n\nA request prompt for a reply in an existing thread prints this command with the service's own\nexecutable, its exact state directory, and the thread. The output lists the thread's retained requests and the replies captured\nfor them, each with its UTC time and age. It drops the line breaks at the end of each request or\nreply and prefixes every line of message text with `> `, or an empty line with `>` alone.\nThe bridge retains only requests it admitted from allowed senders that have not been retired, so\nthe provider's own thread remains the complete record. It reads under the shared state lock\nand never writes state or contacts Herdr, a helper, or a provider."
     )]
     Thread(ChatThread),
+    /// List the replies the bridge holds, newest first: what was sent, when, and as which message
+    #[command(
+        after_help = "Examples:\n  agentctl chat sent --bridge-state ~/.local/state/agentctl/chat\n  agentctl chat sent --bridge-state ~/.local/state/agentctl/chat --request <KEY> --json\n\nEach reply shows when it was sent (or captured, while unsent) in UTC and how long ago, its\nnumber within its request, the request key, the chat message and thread it answers, and its\noutcome: `sent as <provider message ID>` once the chat provider accepted it, `captured, not yet\nsent`, or `send in progress or outcome unknown`, which the service retries with the same\noperation ID so it is never posted twice. The first 300 characters of each reply follow, every\nline prefixed with `> `. --json prints one document (schema agentctl-chat-sent/v1) with the\nsame fields, times as Unix milliseconds, and each reply's whole text.\n\nThe bridge holds only the replies of requests that are not retired, so the chat thread itself\nis the complete record. It reads under the shared state lock and never writes state or\ncontacts Herdr, a helper, or a provider."
+    )]
+    Sent(ChatSent),
     /// Publish one explicit operator root message through the configured helper
     Publish(ChatPublish),
     /// Run one bounded delivery, terminal-capture, and outbound recovery pass
     Tick(ChatOperate),
     /// Run event-driven provider and Herdr subscriptions until SIGINT or SIGTERM
     Run(ChatRun),
-    /// Store one reply for an open request from a file, and wake a running service to send it
+    /// Store one reply for an open request from a file, and wake a running service to send it.
+    /// Normally an agent replies between the prompt's two marker lines instead
     #[command(
-        after_help = "Example:\n  agentctl chat reply --bridge-state ~/.local/state/agentctl/chat \\\n    --request <KEY> --reply-id 001 --file reply.md\n\nWhen `chat run` has --offer-reply-command and outbound replies are enabled, each request prompt\nprints this command with the service's own executable, the absolute path of its state\ndirectory, the request key, and the reply ID, unless no file is left at that executable's path\nor one of those words cannot be printed safely; then the prompt gives only the two marker\nlines.\n\nThe command stores the file's text as a reply of that request, as if the service had read it\nbetween the reply ID's two marker lines on the agent's screen, and the service sends it like\nany reply it reads. Line breaks at the end of the file are dropped. A text the request already\nholds is not stored again, so running the command twice sends it once. It then asks a service\nrunning on the same state directory with --offer-reply-command to send the reply at once;\notherwise the reply is sent at the service's next reconciliation, when the agent goes idle, or\nwhen the service starts.\n\nOn success it prints one JSON object: request, reply_id, outcome (stored or already_stored),\nordinal, phase, and service_woken, which says whether the wake was sent to a socket of the\ncurrent user in the state directory; nothing confirms that a service received it. Exit\nstatus: 0 when the request holds the reply; 1 when the reply is refused, with the reason on\nstandard error and nothing stored, as for an empty or blank text or one over 30,000 bytes;\n1 also when the state cannot be read or written, or when the result cannot be printed after\nthe reply was stored; 75 when nothing was stored but the same command can succeed later; 2\nfor a usage error, which includes a file that cannot be read or is not UTF-8. It never\ncontacts Herdr, a helper, or a provider."
+        after_help = "Example:\n  agentctl chat reply --bridge-state ~/.local/state/agentctl/chat \\\n    --request <KEY> --reply-id 001 --file reply.md\n\nUse this command only when the two marker lines cannot do the job. A reply printed between\nthe request's two marker lines is the normal way: it reaches the user in the chat and also stays\nin the agent's terminal, where the owner may be reading. Use the command to send a reply before\nthe agent's turn ends, such as a progress update during long work, or to send again a reply that\nwas written between the lines and reported as not sent. Send each reply one way only; a reply\nsent by the command is not shown in the terminal. `agentctl chat sent` shows what was sent.\n\nWhen `chat run` has --offer-reply-command and outbound replies are enabled, each request prompt\nprints this command with the service's own executable, the absolute path of its state\ndirectory, the request key, and the reply ID, unless no file is left at that executable's path\nor one of those words cannot be printed safely; then the prompt gives only the two marker\nlines.\n\nThe command stores the file's text as a reply of that request, as if the service had read it\nbetween the reply ID's two marker lines on the agent's screen, and the service sends it like\nany reply it reads. Line breaks at the end of the file are dropped. A text the request already\nholds is not stored again, so running the command twice sends it once. It then asks a service\nrunning on the same state directory with --offer-reply-command to send the reply at once;\notherwise the reply is sent at the service's next reconciliation, when the agent goes idle, or\nwhen the service starts.\n\nOn success it prints one JSON object: request, reply_id, outcome (stored or already_stored),\nordinal, phase, and service_woken, which says whether the wake was sent to a socket of the\ncurrent user in the state directory; nothing confirms that a service received it. Exit\nstatus: 0 when the request holds the reply; 1 when the reply is refused, with the reason on\nstandard error and nothing stored, as for an empty or blank text or one over 30,000 bytes;\n1 also when the state cannot be read or written, or when the result cannot be printed after\nthe reply was stored; 75 when nothing was stored but the same command can succeed later; 2\nfor a usage error, which includes a file that cannot be read or is not UTF-8. It never\ncontacts Herdr, a helper, or a provider."
     )]
     Reply(ChatReply),
     /// Stop accepting fenced replies for one exact retained request
@@ -512,6 +518,27 @@ struct ChatState {
     /// Private durable bridge state directory
     #[arg(long, value_name = "DIR")]
     bridge_state: PathBuf,
+}
+
+#[derive(Args)]
+struct ChatSent {
+    #[command(flatten)]
+    state: ChatState,
+    /// Only this request's replies: its exact 64-character lowercase hexadecimal key
+    #[arg(long, value_name = "KEY")]
+    request: Option<String>,
+    /// Print this many of the most recent replies, newest first (1-100)
+    #[arg(
+        long,
+        value_name = "N",
+        default_value_t = crate::chat_runtime::DEFAULT_THREAD_HISTORY_MESSAGES,
+        value_parser = clap::value_parser!(u32)
+            .range(1..=i64::from(crate::chat_runtime::MAX_THREAD_HISTORY_MESSAGES))
+    )]
+    last: u32,
+    /// Print one JSON document with each reply's whole text instead of the text listing
+    #[arg(long)]
+    json: bool,
 }
 
 #[derive(Args)]
@@ -1326,6 +1353,17 @@ fn run_chat(registry: PathBuf, herdr_bin: PathBuf, chat: Chat) -> Result<i32, Fa
             )
             .map_err(Failure::Chat)?;
             write_text(&history).map_err(Failure::Output)?;
+            Ok(0)
+        }
+        ChatCommand::Sent(value) => {
+            let listing = crate::chat_service::sent_replies(
+                &value.state.bridge_state,
+                value.request.as_deref(),
+                value.last,
+                value.json,
+            )
+            .map_err(Failure::Chat)?;
+            write_text(&listing).map_err(Failure::Output)?;
             Ok(0)
         }
         ChatCommand::Publish(value) => {
