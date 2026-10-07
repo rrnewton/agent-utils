@@ -1263,24 +1263,32 @@ A deployment can point the plugin and the outbound helper at credential
 files, such as a TLS client certificate and key, through the variables in
 `subscription_environment` and `outbound_command.environment`. `run` checks
 each such file that it can see: every variable whose value is an absolute
-path. For each one it records whether the file exists and can be read and,
-when the file holds a PEM certificate, that certificate's notAfter. It reads
-a file only to find a `CERTIFICATE` block and reports nothing from it but the
-notAfter; a private key is not parsed. `run` logs each file once at startup,
-and `chat status` reports them all in `credentials`, each with its
-`variable`, `state` (`present`, `missing`, `unreadable` or `not_a_file`),
-`not_after_millis`, and `problem`. The path itself is never reported, here
-or in the log: the bridge keeps the values of the plugin and helper
-environment out of its state, status and log. A file that is missing,
-unreadable, expired, or within 24 hours of its notAfter is listed in
-`credential_problems` in `delivery-alarm.json` and in `chat status`'s
-`delivery_alarm`, even while the provider still works, so the problem shows
-a day before the outage. When a subscription or send failure happens while a
-file is missing, unreadable or expired, `last_error_class` names that file,
-as in `credential file missing: SOME_TLS_CERT_PATH` or
+path to a regular file. A directory, a device or a pipe is not a credential
+file and is skipped, so a setting such as a home directory never counts. For
+each file `run` records whether it exists and can be read and, when it holds
+a PEM certificate, that certificate's notAfter. It opens the file once,
+without blocking, reads it only to find a `CERTIFICATE` block, and reports
+nothing from it but the notAfter; a private key is not parsed. The path
+itself is never reported: the bridge keeps the values of the plugin and
+helper environment out of its state, status and log. `run` logs each file
+once at startup. Each delivery scan saves what it saw in
+`provider-credentials.json` whenever that changes, and at least every 300
+seconds, with `observed_at_millis`. `chat status` reports that record in
+`credentials`, as `observed_at_millis` and `files`, each with its `variable`,
+`state` (`present`, `missing` or `unreadable`), `not_after_millis`
+(negative before 1970), and `problem`. `chat status` reads the record rather
+than its own environment, which may lack the service's; before the first
+scan, `credentials` is null. A file that is missing, unreadable, expired, or
+within 24 hours of its notAfter is listed in `credential_problems` in
+`delivery-alarm.json` and in `chat status`'s `delivery_alarm`, even while the
+provider still works, so the problem shows a day before the outage. When a
+subscription or send failure happens while a file is missing, unreadable or
+expired, `last_error_class` names that file, as in
+`credential file missing: SOME_TLS_CERT_PATH` or
 `credential expired 12 h ago: SOME_TLS_CERT_PATH`, and the provider's own
-message stays in `last_error`. Renewing a credential is the deployment's
-job, described in its plugin's documentation; agentctl only reports it.
+message stays in `last_error`. The files are read before the state lock is
+taken. Renewing a credential is the deployment's job, described in its
+plugin's documentation; agentctl only reports it.
 
 `chat status` reports the same list in `delivery_alarm`, as
 `stall_after_seconds` and `stalled`, computed from the request records at the

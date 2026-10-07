@@ -998,6 +998,24 @@ PINS: tuple[Pin, ...] = (
         ),
     ),
     Pin(
+        "chat-credential-record-refresh-seconds",
+        "the longest `run` leaves `provider-credentials.json` unrewritten while the files are unchanged",
+        code=(
+            Site(
+                "rs/agentctl/src/chat_service.rs",
+                r"(?m)^const CREDENTIAL_RECORD_REFRESH: Duration = Duration::from_secs\((?P<value>[\d_]+)\);$",
+                "the Rust refresh interval",
+            ),
+        ),
+        docs=(
+            Site(
+                "rs/agentctl/src/embedded_chat_userguide.md",
+                r"at\s+least\s+every\s+(?P<value>[A-Za-z\d,]+)\s+seconds,\s+with\s+`observed_at_millis`",
+                "the refresh interval the chat guide states",
+            ),
+        ),
+    ),
+    Pin(
         "chat-credential-expiry-warning-hours",
         "how long before a credential's notAfter `delivery-alarm.json` lists it, in hours",
         code=(

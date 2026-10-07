@@ -165,6 +165,10 @@ pub(crate) const PROVIDER_HEALTH_FILE: &str = "provider-health.json";
 // `delivery-alarm.json` as `chat run` last read it: see `AlarmSources`.
 const ALARM_SOURCES_SCHEMA: &str = "agentctl-chat-delivery-alarm-sources/v1";
 const ALARM_SOURCES_FILE: &str = "delivery-alarm-sources.json";
+// The schema of `provider-credentials.json`, the credential files the running service last
+// observed: see `CredentialRecord`.
+const CREDENTIAL_RECORD_SCHEMA: &str = "agentctl-chat-provider-credentials/v1";
+const CREDENTIAL_RECORD_FILE: &str = "provider-credentials.json";
 const MAX_PROVIDER_ERROR_BYTES: usize = 2_000;
 const MAX_PROVIDER_ERROR_CLASS_BYTES: usize = 200;
 // Room for the largest record: two paths, each with an error and its class, which JSON may spell
@@ -2332,6 +2336,19 @@ fn next_failure(
             last_error: error,
         },
     }
+}
+
+/// The credential files named by the plugin and helper environment as the running `chat run`
+/// last observed them, saved as `provider-credentials.json` in the state directory so that
+/// `chat status`, which may run without the service's environment, reports them. It holds no
+/// paths; see [`crate::credentials`].
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CredentialRecord {
+    schema: String,
+    /// When the service last inspected the files.
+    observed_at_millis: u64,
+    files: Vec<crate::credentials::CredentialFile>,
 }
 
 /// What [`BridgeState::save_receipt_reactions`] did.
@@ -5423,7 +5440,13 @@ impl BridgeState {
             acknowledgements.insert(ack_key.to_owned(), Value::from(ack_count.saturating_add(1)));
         }
         let provider_health = self.read_provider_health()?;
-        let credential_files = self.credential_files();
+        // The credential files as the running service saw them: this process may not have the
+        // service's environment.
+        let credential_record = self.read_credential_record();
+        let credential_files = credential_record
+            .as_ref()
+            .map(|record| record.files.clone())
+            .unwrap_or_default();
         let provider_down = self.provider_down_locked()?;
         Ok(serde_json::json!({
             "subscription_plugin": self.config.subscription_plugin,
@@ -5467,15 +5490,18 @@ impl BridgeState {
                 "typed_not_replied": not_replied,
                 "replied": replied,
             },
-            "credentials": credential_files
-                .iter()
-                .map(|file| serde_json::json!({
-                    "variable": file.variable,
-                    "state": file.state,
-                    "not_after_millis": file.not_after_millis,
-                    "problem": file.describe(now_millis),
-                }))
-                .collect::<Vec<_>>(),
+            "credentials": credential_record.as_ref().map(|record| serde_json::json!({
+                "observed_at_millis": record.observed_at_millis,
+                "files": record.files
+                    .iter()
+                    .map(|file| serde_json::json!({
+                        "variable": file.variable,
+                        "state": file.state,
+                        "not_after_millis": file.not_after_millis,
+                        "problem": file.describe(now_millis),
+                    }))
+                    .collect::<Vec<_>>(),
+            })),
             "provider_health": {
                 "subscription": provider_health.subscription,
                 "sends": provider_health.sends,
@@ -5625,6 +5651,34 @@ impl BridgeState {
         )
     }
 
+    /// Save `files`, the credential files this process sees at `now_millis`, for `chat status` to
+    /// report: see [`CredentialRecord`].
+    pub(crate) fn write_credential_record(
+        &self,
+        files: &[crate::credentials::CredentialFile],
+        now_millis: u64,
+    ) -> Result<()> {
+        write_document(
+            &self.root.join(CREDENTIAL_RECORD_FILE),
+            &CredentialRecord {
+                schema: CREDENTIAL_RECORD_SCHEMA.to_owned(),
+                observed_at_millis: now_millis,
+                files: files.to_vec(),
+            },
+        )
+    }
+
+    /// `provider-credentials.json`, or `None` when it is missing or not a valid record.
+    fn read_credential_record(&self) -> Option<CredentialRecord> {
+        let record: CredentialRecord =
+            read_document(&self.root.join(CREDENTIAL_RECORD_FILE), 1 << 20).ok()?;
+        let states_valid = record
+            .files
+            .iter()
+            .all(|file| matches!(file.state.as_str(), "present" | "missing" | "unreadable"));
+        (record.schema == CREDENTIAL_RECORD_SCHEMA && states_valid).then_some(record)
+    }
+
     /// A credential problem that explains a provider failure at `now_millis`, if any, as the class
     /// a failure is recorded under instead of the provider's own message.
     fn credential_failure_explanation(&self, now_millis: u64) -> Option<String> {
@@ -5637,14 +5691,12 @@ impl BridgeState {
     /// subscribes: see [`Self::note_subscription_up`].
     pub(crate) fn note_subscription_down(&self, error: &str) -> Result<()> {
         let now = unix_millis();
+        // The credential files are read before the state lock is taken.
+        let class = self
+            .credential_failure_explanation(now)
+            .unwrap_or_else(|| subscription_error_class(error));
         self.update_provider_health(|record| {
-            record.subscription = Some(next_failure(
-                record.subscription.take(),
-                now,
-                self.credential_failure_explanation(now)
-                    .unwrap_or_else(|| subscription_error_class(error)),
-                error,
-            ));
+            record.subscription = Some(next_failure(record.subscription.take(), now, class, error));
         })
     }
 
@@ -5654,12 +5706,14 @@ impl BridgeState {
     }
 
     /// Record the outcome of one outbound send: `Ok` for a send the provider applied, or the
-    /// helper's failure. The caller holds the state lock. A failure the helper reports as not
-    /// applied and not retryable is final for that operation only and changes nothing: see
-    /// [`ProviderHealthRecord`].
+    /// helper's failure with `explanation`, a credential problem the caller found before taking
+    /// the state lock (see [`Self::send_failure_explanation`]). The caller holds the state lock. A
+    /// failure the helper reports as not applied and not retryable is final for that operation
+    /// only and changes nothing: see [`ProviderHealthRecord`].
     fn note_send_outcome_locked(
         &self,
         outcome: std::result::Result<(), &OutboundFailure>,
+        explanation: Option<String>,
     ) -> Result<()> {
         match outcome {
             Ok(()) => self.update_provider_health_locked(|record| record.sends = None),
@@ -5674,7 +5728,7 @@ impl BridgeState {
                     record.sends = Some(next_failure(
                         record.sends.take(),
                         now,
-                        self.credential_failure_explanation(now).unwrap_or_else(|| {
+                        explanation.unwrap_or_else(|| {
                             bounded_detail(&failure.code, MAX_PROVIDER_ERROR_CLASS_BYTES)
                         }),
                         &failure.to_string(),
@@ -5684,12 +5738,30 @@ impl BridgeState {
         }
     }
 
-    /// As [`Self::note_send_outcome_locked`], taking the state lock.
+    /// As [`Self::note_send_outcome_locked`], finding the explanation and then taking the state
+    /// lock.
     fn note_send_outcome(&self, outcome: std::result::Result<(), &OutboundFailure>) -> Result<()> {
+        let explanation = self.send_failure_explanation(outcome);
         let state_lock =
             agent::open_private_lock(&self.root.join(".state.lock"), "chat state lock")?;
         state_lock.lock_exclusive().map_err(ChatRuntimeError::Io)?;
-        self.note_send_outcome_locked(outcome)
+        self.note_send_outcome_locked(outcome, explanation)
+    }
+
+    /// For a send failure that counts against the send path, a credential problem that explains
+    /// it; read without the state lock, as the files may be slow to read.
+    fn send_failure_explanation(
+        &self,
+        outcome: std::result::Result<(), &OutboundFailure>,
+    ) -> Option<String> {
+        match outcome {
+            Err(failure)
+                if !(failure.outcome == OutboundOutcome::NotApplied && !failure.retryable) =>
+            {
+                self.credential_failure_explanation(unix_millis())
+            }
+            _ => None,
+        }
     }
 
     /// The provider paths that are down, as `delivery-alarm.json` reports them.
@@ -8209,11 +8281,12 @@ stay held until an operator repairs or deletes it, and deleting it releases ever
         }) {
             Ok(receipt) => receipt,
             Err(error) => {
+                let explanation = self.send_failure_explanation(Err(&error));
                 let state_lock =
                     agent::open_private_lock(&self.root.join(".state.lock"), "chat state lock")?;
                 state_lock.lock_exclusive().map_err(ChatRuntimeError::Io)?;
                 // Bookkeeping only, as in `publish_one`.
-                let _ = self.note_send_outcome_locked(Err(&error));
+                let _ = self.note_send_outcome_locked(Err(&error), explanation);
                 let mut request = self.read_request(key)?;
                 request.ack_phase = AckPhase::Sending;
                 request.ack_error = Some(bounded_detail(&error.to_string(), 2_000));
@@ -8240,7 +8313,7 @@ stay held until an operator repairs or deletes it, and deleting it releases ever
         let state_lock =
             agent::open_private_lock(&self.root.join(".state.lock"), "chat state lock")?;
         state_lock.lock_exclusive().map_err(ChatRuntimeError::Io)?;
-        let _ = self.note_send_outcome_locked(Ok(()));
+        let _ = self.note_send_outcome_locked(Ok(()), None);
         let mut request = self.read_request(key)?;
         if request.ack_request_id != request_snapshot.ack_request_id {
             return Err(ChatRuntimeError::invalid(
@@ -8700,7 +8773,7 @@ stay held until an operator repairs or deletes it, and deleting it releases ever
         let state_lock =
             agent::open_private_lock(&self.root.join(".state.lock"), "chat state lock")?;
         state_lock.lock_exclusive().map_err(ChatRuntimeError::Io)?;
-        let _ = self.note_send_outcome_locked(Ok(()));
+        let _ = self.note_send_outcome_locked(Ok(()), None);
         let mut current = self.read_reply(key, reply.ordinal)?;
         if current.body != reply.body || current.send_request_id != reply.send_request_id {
             return Err(ChatRuntimeError::invalid(
@@ -28023,6 +28096,10 @@ a fence ```sh here, ~~~~ there, and one ``\u{200b}` hidden"
                 .expect("record the subscription failing");
         }
         let down = state.provider_down().expect("provider down");
+        // What the service's delivery scan saves for `chat status`.
+        state
+            .write_credential_record(&state.credential_files(), unix_millis())
+            .expect("save the credential record");
         let status = state.status().expect("status");
         fs::remove_dir_all(root).expect("cleanup");
         fs::remove_dir_all(directory).expect("cleanup");
@@ -28036,9 +28113,9 @@ a fence ```sh here, ~~~~ there, and one ``\u{200b}` hidden"
         assert!(reported
             .last_error
             .contains("token call failed before the fence"));
-        assert_eq!(status["credentials"][0]["state"], "missing");
+        assert_eq!(status["credentials"]["files"][0]["state"], "missing");
         assert_eq!(
-            status["credentials"][0]["problem"],
+            status["credentials"]["files"][0]["problem"],
             "credential file missing: AGENTCTL_TEST_CERT_PATH"
         );
         // The variable's value, the path, stays out of the status like every plugin
@@ -28071,6 +28148,10 @@ a fence ```sh here, ~~~~ there, and one ``\u{200b}` hidden"
                 .expect("record a send failure");
         }
         let down = state.provider_down().expect("provider down");
+        // What the service's delivery scan saves for `chat status`.
+        state
+            .write_credential_record(&state.credential_files(), unix_millis())
+            .expect("save the credential record");
         let status = state.status().expect("status");
         fs::remove_dir_all(root).expect("cleanup");
         fs::remove_dir_all(directory).expect("cleanup");
@@ -28085,9 +28166,9 @@ a fence ```sh here, ~~~~ there, and one ``\u{200b}` hidden"
             reported.last_error_class
         );
         assert!(reported.last_error.contains("provider_authorization"));
-        assert_eq!(status["credentials"][0]["state"], "present");
+        assert_eq!(status["credentials"]["files"][0]["state"], "present");
         assert_eq!(
-            status["credentials"][0]["not_after_millis"],
+            status["credentials"]["files"][0]["not_after_millis"],
             crate::credentials::fixtures::UTC_TIME_NOT_AFTER * 1_000
         );
         assert_eq!(
@@ -28112,6 +28193,10 @@ a fence ```sh here, ~~~~ there, and one ``\u{200b}` hidden"
                 .expect("record a send failure");
         }
         let down = state.provider_down().expect("provider down");
+        // What the service's delivery scan saves for `chat status`.
+        state
+            .write_credential_record(&state.credential_files(), unix_millis())
+            .expect("save the credential record");
         let status = state.status().expect("status");
         fs::remove_dir_all(root).expect("cleanup");
         fs::remove_dir_all(directory).expect("cleanup");
@@ -28119,7 +28204,42 @@ a fence ```sh here, ~~~~ there, and one ``\u{200b}` hidden"
             down.send_path_down.expect("down").last_error_class,
             "provider_authorization"
         );
-        assert_eq!(status["credentials"][0]["problem"], Value::Null);
+        assert_eq!(status["credentials"]["files"][0]["problem"], Value::Null);
+        assert_eq!(
+            status["delivery_alarm"]["credential_problems"],
+            serde_json::json!([])
+        );
+    }
+
+    #[test]
+    fn a_directory_in_the_plugin_environment_never_explains_a_failure() {
+        let directory = temporary("credential-directory");
+        let (root, state) = state_with_credential("credential-directory-state", &directory);
+        for _ in 0..2 {
+            state
+                .note_send_outcome(Err(&authorization_failure()))
+                .expect("record a send failure");
+        }
+        let down = state.provider_down().expect("provider down");
+        let files = state.credential_files();
+        fs::remove_dir_all(root).expect("cleanup");
+        fs::remove_dir_all(directory).expect("cleanup");
+        assert!(files.is_empty(), "{files:?}");
+        assert_eq!(
+            down.send_path_down.expect("down").last_error_class,
+            "provider_authorization"
+        );
+    }
+
+    #[test]
+    fn status_without_a_saved_credential_record_reports_none() {
+        let directory = temporary("credential-no-record-dir");
+        let (root, state) =
+            state_with_credential("credential-no-record", &directory.join("gone.pem"));
+        let status = state.status().expect("status");
+        fs::remove_dir_all(root).expect("cleanup");
+        fs::remove_dir_all(directory).expect("cleanup");
+        assert!(status["credentials"].is_null());
         assert_eq!(
             status["delivery_alarm"]["credential_problems"],
             serde_json::json!([])

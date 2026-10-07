@@ -80,6 +80,9 @@ const MAX_SOCKET_PATH_BYTES: usize = 107;
 // them, and how often it logs again a request whose prompt it is still trying to type: see
 // `DeliveryTiming`.
 const DELIVERY_RETRY_INTERVAL: Duration = Duration::from_secs(10);
+// How long `provider-credentials.json` may go unrewritten while the credential files are unchanged,
+// so its observation time shows that the service still inspects them.
+const CREDENTIAL_RECORD_REFRESH: Duration = Duration::from_secs(300);
 const DELIVERY_STALL_REPEAT: Duration = Duration::from_secs(600);
 
 /// A service or command failure with its original typed source where available.
@@ -4330,6 +4333,8 @@ struct DeliveryWatch {
     // and saved there when it changes. A record that a scan cannot read keeps this value; see
     // `DeliveryWatch::scan`.
     known: Option<chat_runtime::AlarmSources>,
+    // The credential files last saved for `chat status`, and when.
+    credentials_saved: Option<(Vec<crate::credentials::CredentialFile>, Instant)>,
     // The sources last saved, so the file is written only when they change. `None` until a save
     // works, and again from the start of each save until it works.
     known_saved: Option<chat_runtime::AlarmSources>,
@@ -4356,6 +4361,7 @@ impl DeliveryWatch {
             written: None,
             known: None,
             known_saved: None,
+            credentials_saved: None,
             unrouted: BTreeSet::new(),
             failing: false,
             lookup_failing: false,
@@ -4570,8 +4576,26 @@ impl DeliveryWatch {
             }
         }
         // The credential files are read each scan, so a certificate that is about to expire is
-        // reported a day before the outage; see `crate::credentials`.
-        let credentials = crate::credentials::problems(&state.credential_files(), now_millis);
+        // reported a day before the outage; see `crate::credentials`. What the scan saw is saved
+        // for `chat status` whenever it changes, and at least every CREDENTIAL_RECORD_REFRESH so
+        // that its observation time shows the service still looks.
+        let files = state.credential_files();
+        let save_due = self
+            .credentials_saved
+            .as_ref()
+            .is_none_or(|(saved, at)| *saved != files || at.elapsed() >= CREDENTIAL_RECORD_REFRESH);
+        if save_due {
+            self.credentials_saved = None;
+            match state.write_credential_record(&files, now_millis) {
+                Ok(()) => self.credentials_saved = Some((files.clone(), Instant::now())),
+                Err(error) => {
+                    problem.get_or_insert_with(|| {
+                        format!("provider-credentials.json could not be written: {error}")
+                    });
+                }
+            }
+        }
+        let credentials = crate::credentials::problems(&files, now_millis);
         let alarm = (alarm, lost, refused, provider, unreadable, credentials);
         if self.written.as_ref() != Some(&alarm) {
             self.written = None;
@@ -6573,6 +6597,19 @@ printf '{"version":1,"id":"%s","action":"ensure_reaction","ok":true,"receipt":{"
             &mut routes,
         );
         let alarm = read_alarm_at(&root);
+        // `chat status` reports what the service's scan saved, even from a process that lacks
+        // the service's environment.
+        crate::credentials::test_environment::set("AGENTCTL_TEST_CERT_PATH", None);
+        let status = state.status().expect("status");
+        assert_eq!(status["credentials"]["files"][0]["state"], "missing");
+        assert!(status["credentials"]["observed_at_millis"]
+            .as_u64()
+            .is_some());
+        assert_eq!(
+            status["delivery_alarm"]["credential_problems"][0]["problem"],
+            "missing"
+        );
+        crate::credentials::test_environment::set("AGENTCTL_TEST_CERT_PATH", Some(&missing));
         let lines = Mutex::new(Vec::new());
         let now = chat_runtime::unix_millis();
         let record = |line: fmt::Arguments<'_>| lines.lock().expect("lines").push(line.to_string());

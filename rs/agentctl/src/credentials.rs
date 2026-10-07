@@ -13,6 +13,7 @@ use std::collections::BTreeSet;
 use std::ffi::OsString;
 use std::fs;
 use std::io::{self, Read};
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
 use std::time::Duration;
 
@@ -31,12 +32,13 @@ pub(crate) struct CredentialFile {
     /// The environment variable that names the file. Its value, the path, is never reported:
     /// the bridge keeps the plugin and helper environment's values out of its state and status.
     pub(crate) variable: String,
-    /// `present`, `missing`, `unreadable` or `not_a_file`.
+    /// `present`, `missing` or `unreadable`.
     pub(crate) state: String,
     /// The notAfter of the first PEM certificate in the file, in milliseconds since the Unix
-    /// epoch; absent when the file holds no certificate this module can read.
+    /// epoch (negative before 1970); absent when the file holds no certificate this module can
+    /// read.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) not_after_millis: Option<u64>,
+    pub(crate) not_after_millis: Option<i64>,
 }
 
 /// What is wrong with a credential file at a given time.
@@ -65,16 +67,21 @@ impl CredentialProblemKind {
     }
 }
 
+/// `now_millis` as a signed time, saturating at the far future.
+fn signed(now_millis: u64) -> i128 {
+    i128::from(now_millis)
+}
+
 impl CredentialFile {
     /// What is wrong with this file at `now_millis`, if anything.
     pub(crate) fn problem(&self, now_millis: u64) -> Option<CredentialProblemKind> {
+        let now = signed(now_millis);
         match self.state.as_str() {
             "missing" => Some(CredentialProblemKind::Missing),
-            "present" => match self.not_after_millis {
-                Some(not_after) if not_after <= now_millis => Some(CredentialProblemKind::Expired),
+            "present" => match self.not_after_millis.map(i128::from) {
+                Some(not_after) if not_after <= now => Some(CredentialProblemKind::Expired),
                 Some(not_after)
-                    if u128::from(not_after - now_millis)
-                        <= CREDENTIAL_EXPIRY_WARNING.as_millis() =>
+                    if not_after - now <= CREDENTIAL_EXPIRY_WARNING.as_millis() as i128 =>
                 {
                     Some(CredentialProblemKind::Expiring)
                 }
@@ -87,19 +94,25 @@ impl CredentialFile {
     /// One line naming the problem at `now_millis`, such as `credential file missing:
     /// SOME_TLS_CERT_PATH` or `credential expired 12 h ago: SOME_TLS_CERT_PATH`.
     pub(crate) fn describe(&self, now_millis: u64) -> Option<String> {
-        let hours = |millis: u64| millis / 3_600_000;
+        let now = signed(now_millis);
+        let not_after = i128::from(self.not_after_millis.unwrap_or_default());
+        let hours = |millis: i128| millis / 3_600_000;
         let variable = &self.variable;
         Some(match self.problem(now_millis)? {
             CredentialProblemKind::Missing => format!("credential file missing: {variable}"),
             CredentialProblemKind::Unreadable => format!("credential file unreadable: {variable}"),
-            CredentialProblemKind::Expired => format!(
-                "credential expired {} h ago: {variable}",
-                hours(now_millis - self.not_after_millis.unwrap_or(now_millis))
-            ),
-            CredentialProblemKind::Expiring => format!(
-                "credential expires in {} h: {variable}",
-                hours(self.not_after_millis.unwrap_or(now_millis) - now_millis)
-            ),
+            CredentialProblemKind::Expired => {
+                format!(
+                    "credential expired {} h ago: {variable}",
+                    hours(now - not_after)
+                )
+            }
+            CredentialProblemKind::Expiring => {
+                format!(
+                    "credential expires in {} h: {variable}",
+                    hours(not_after - now)
+                )
+            }
         })
     }
 }
@@ -113,7 +126,7 @@ pub(crate) struct CredentialProblem {
     /// `missing`, `unreadable`, `expired` or `expiring`.
     pub(crate) problem: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) not_after_millis: Option<u64>,
+    pub(crate) not_after_millis: Option<i64>,
 }
 
 /// Each file among `files` with a problem at `now_millis`, in order.
@@ -143,8 +156,9 @@ pub(crate) fn failure_explanation(files: &[CredentialFile], now_millis: u64) -> 
 }
 
 /// Inspect the file each variable in `names` names, looking each value up with `lookup`. A
-/// variable that is unset, or whose value is not an absolute path, names no file and is skipped;
-/// a variable listed twice is inspected once.
+/// variable that is unset, whose value is not an absolute path, or whose path is not a regular
+/// file (a directory such as a home, a device, a pipe) names no credential file and is skipped; a
+/// variable listed twice is inspected once.
 pub(crate) fn inspect<'a>(
     names: impl IntoIterator<Item = &'a String>,
     lookup: impl Fn(&str) -> Option<OsString>,
@@ -162,7 +176,7 @@ pub(crate) fn inspect<'a>(
         }
         let (state, not_after_millis) = match read_bounded(path) {
             Ok(Some(contents)) => ("present", first_certificate_not_after_millis(&contents)),
-            Ok(None) => ("not_a_file", None),
+            Ok(None) => continue,
             Err(error) if error.kind() == io::ErrorKind::NotFound => ("missing", None),
             Err(_) => ("unreadable", None),
         };
@@ -185,22 +199,25 @@ pub(crate) fn process_environment(name: &str) -> Option<OsString> {
 }
 
 /// Read at most [`MAX_CREDENTIAL_FILE_BYTES`] of `path`; `None` when it is not a regular file.
+/// The file is opened once, without blocking, and checked through that descriptor, so a path
+/// swapped for a pipe or device between a check and the open cannot make the read wait.
 fn read_bounded(path: &Path) -> io::Result<Option<Vec<u8>>> {
-    let metadata = fs::metadata(path)?;
-    if !metadata.is_file() {
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK)
+        .open(path)?;
+    if !file.metadata()?.is_file() {
         return Ok(None);
     }
     let mut contents = Vec::new();
-    fs::File::open(path)?
-        .take(MAX_CREDENTIAL_FILE_BYTES)
+    file.take(MAX_CREDENTIAL_FILE_BYTES)
         .read_to_end(&mut contents)?;
     Ok(Some(contents))
 }
 
-fn first_certificate_not_after_millis(contents: &[u8]) -> Option<u64> {
+fn first_certificate_not_after_millis(contents: &[u8]) -> Option<i64> {
     let der = pem_certificates(contents).into_iter().next()?;
-    let seconds = certificate_not_after_seconds(&der)?;
-    u64::try_from(seconds).ok()?.checked_mul(1_000)
+    certificate_not_after_seconds(&der)?.checked_mul(1_000)
 }
 
 /// The DER bytes of each PEM `CERTIFICATE` block in `contents`, in order.
@@ -461,7 +478,7 @@ mod tests {
         combined.push_str(UTC_TIME_CERTIFICATE);
         assert_eq!(
             first_certificate_not_after_millis(combined.as_bytes()),
-            Some(UTC_TIME_NOT_AFTER as u64 * 1_000)
+            Some(UTC_TIME_NOT_AFTER * 1_000)
         );
         assert_eq!(
             first_certificate_not_after_millis(b"no certificate here"),
@@ -510,9 +527,8 @@ mod tests {
         assert_eq!(
             states,
             [
-                ("CERT", "present", Some(UTC_TIME_NOT_AFTER as u64 * 1_000)),
+                ("CERT", "present", Some(UTC_TIME_NOT_AFTER * 1_000)),
                 ("GONE", "missing", None),
-                ("DIRECTORY", "not_a_file", None),
             ]
         );
     }
@@ -523,7 +539,7 @@ mod tests {
         let file = CredentialFile {
             variable: "SOME_TLS_CERT_PATH".to_owned(),
             state: "present".to_owned(),
-            not_after_millis: Some(not_after),
+            not_after_millis: Some(UTC_TIME_NOT_AFTER * 1_000),
         };
         let hour = 3_600_000;
         assert_eq!(file.problem(not_after - 25 * hour), None);
@@ -557,6 +573,38 @@ mod tests {
             failure_explanation(&[file, missing], 0).as_deref(),
             Some("credential file missing: SOME_TLS_CERT_PATH")
         );
+    }
+
+    #[test]
+    fn an_expiry_before_1970_is_an_expired_credential() {
+        // UTCTime 690101000000Z is 1969-01-01, before the Unix epoch.
+        assert_eq!(parse_time(0x17, b"690101000000Z"), Some(-365 * 86_400));
+        let file = CredentialFile {
+            variable: "OLD_CERT".to_owned(),
+            state: "present".to_owned(),
+            not_after_millis: Some(-365 * 86_400 * 1_000),
+        };
+        assert_eq!(file.problem(0), Some(CredentialProblemKind::Expired));
+        assert_eq!(
+            file.describe(0).as_deref(),
+            Some("credential expired 8760 h ago: OLD_CERT")
+        );
+    }
+
+    #[test]
+    fn a_pipe_where_a_credential_file_was_is_skipped_without_blocking() {
+        let directory = temporary("fifo");
+        let fifo = directory.join("cert.pem");
+        let path = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).expect("path");
+        // SAFETY: `path` is a valid NUL-terminated path; mkfifo only creates the node.
+        assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0, "mkfifo");
+        let names = ["FIFO".to_owned()];
+        let started = std::time::Instant::now();
+        let files = inspect(&names, |_| Some(fifo.clone().into_os_string()));
+        let waited = started.elapsed();
+        fs::remove_dir_all(&directory).expect("cleanup");
+        assert!(files.is_empty(), "{files:?}");
+        assert!(waited < std::time::Duration::from_secs(5), "{waited:?}");
     }
 
     #[test]
