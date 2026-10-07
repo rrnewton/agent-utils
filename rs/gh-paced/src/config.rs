@@ -42,6 +42,12 @@ pub struct Config {
     pub min_watch_interval_secs: f64,
     /// Longest total time one invocation may sleep before it is refused (exit 75), in seconds.
     pub max_wait_secs: f64,
+    /// Longest total time one GIT_CREDENTIAL call may wait before it is refused (exit 75), in
+    /// seconds. The smaller of this and `max_wait_secs` applies to that class, so it only ever
+    /// shortens the wait. git runs the credential helper inside an operation that may hold its
+    /// caller's locks, so the helper must fail fast instead of sleeping (a GIT_CREDENTIAL call
+    /// is also refused at once, without sleeping, during a cooldown).
+    pub git_credential_max_wait_secs: f64,
     /// Longest wait for another gh-paced process to release the account's state lock before
     /// failing with exit 70, in seconds (see `state::LOCK_WAIT_SECS`).
     pub lock_wait_secs: f64,
@@ -105,6 +111,7 @@ impl Default for Config {
             watch_cost: 20,
             min_watch_interval_secs: 30.0,
             max_wait_secs: 900.0,
+            git_credential_max_wait_secs: 30.0,
             lock_wait_secs: crate::state::LOCK_WAIT_SECS,
             cooldown_secs: 900.0,
             plain_403_cooldown_secs: 900.0,
@@ -148,6 +155,17 @@ impl Config {
             Class::Search => self.search,
             Class::Write => self.write,
             Class::GitCredential => self.git_credential,
+        }
+    }
+
+    /// Longest total wait for one call of `class`, in seconds, and the environment variable
+    /// that sets it: `max_wait_secs` (`GH_PACED_MAX_WAIT`), except that GIT_CREDENTIAL uses the
+    /// smaller of that and `git_credential_max_wait_secs` (`GH_PACED_GIT_MAX_WAIT`).
+    pub fn max_wait(&self, class: Class) -> (f64, &'static str) {
+        if class == Class::GitCredential && self.git_credential_max_wait_secs < self.max_wait_secs {
+            (self.git_credential_max_wait_secs, "GH_PACED_GIT_MAX_WAIT")
+        } else {
+            (self.max_wait_secs, "GH_PACED_MAX_WAIT")
         }
     }
 
@@ -231,6 +249,7 @@ struct FileConfig {
     watch_cost: Option<u32>,
     min_watch_interval_secs: Option<f64>,
     max_wait_secs: Option<f64>,
+    git_credential_max_wait_secs: Option<f64>,
     lock_wait_secs: Option<f64>,
     cooldown_secs: Option<f64>,
     plain_403_cooldown_secs: Option<f64>,
@@ -280,7 +299,8 @@ pub mod floors {
     pub const MAX_REFRESH_SECS: f64 = 300.0;
     /// Most admitted calls between refreshes (the requested 50).
     pub const MAX_REFRESH_CALLS: u32 = 50;
-    /// Longest configurable duration (cooldowns, `max_wait_secs`, `GH_PACED_MAX_WAIT`), seconds:
+    /// Longest configurable duration (cooldowns, `max_wait_secs`, `GH_PACED_MAX_WAIT`,
+    /// `git_credential_max_wait_secs`, `GH_PACED_GIT_MAX_WAIT`), seconds:
     /// 7 days. A longer value is a configuration error, so every deadline computed from one
     /// stays representable.
     pub const MAX_DURATION_SECS: f64 = 604_800.0;
@@ -396,6 +416,14 @@ impl FileConfig {
         }
         if let Some(v) = self.max_wait_secs {
             c.max_wait_secs = finite_in("max_wait_secs", v, 0.0, floors::MAX_DURATION_SECS)?;
+        }
+        if let Some(v) = self.git_credential_max_wait_secs {
+            c.git_credential_max_wait_secs = finite_in(
+                "git_credential_max_wait_secs",
+                v,
+                0.0,
+                floors::MAX_DURATION_SECS,
+            )?;
         }
         if let Some(v) = self.lock_wait_secs {
             c.lock_wait_secs = finite_in("lock_wait_secs", v, 0.1, 3600.0)?;
@@ -581,6 +609,15 @@ fn apply_env(
             ));
         }
         c.max_wait_secs = v;
+    }
+    if let Some(v) = env_number(env, "GH_PACED_GIT_MAX_WAIT")? {
+        if v > floors::MAX_DURATION_SECS {
+            return Err(format!(
+                "GH_PACED_GIT_MAX_WAIT={v} must be at most {} seconds",
+                floors::MAX_DURATION_SECS
+            ));
+        }
+        c.git_credential_max_wait_secs = v;
     }
     if let Some(v) = env_number(env, "GH_PACED_LOCK_WAIT")? {
         if !(0.1..=3600.0).contains(&v) {
@@ -783,5 +820,64 @@ mod tests {
         }
         let env = env_of(&[("GH_PACED_MAX_WAIT", "604800")]);
         assert!(Config::load(None, false, &env).is_ok());
+    }
+
+    #[test]
+    fn git_credential_wait_has_its_own_short_bound() {
+        let (c, warnings) = Config::load(None, false, &env_of(&[])).unwrap();
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert_eq!(c.git_credential_max_wait_secs, 30.0);
+        assert_eq!(
+            c.max_wait(Class::GitCredential),
+            (30.0, "GH_PACED_GIT_MAX_WAIT")
+        );
+        for class in [Class::Read, Class::Search, Class::Write] {
+            assert_eq!(c.max_wait(class), (900.0, "GH_PACED_MAX_WAIT"), "{class:?}");
+        }
+        // The smaller of the two applies to GIT_CREDENTIAL; the other classes never use it.
+        let env = env_of(&[("GH_PACED_GIT_MAX_WAIT", "5")]);
+        let (c, _) = Config::load(None, false, &env).unwrap();
+        assert_eq!(
+            c.max_wait(Class::GitCredential),
+            (5.0, "GH_PACED_GIT_MAX_WAIT")
+        );
+        assert_eq!(c.max_wait(Class::Read), (900.0, "GH_PACED_MAX_WAIT"));
+        let env = env_of(&[("GH_PACED_MAX_WAIT", "10")]);
+        let (c, _) = Config::load(None, false, &env).unwrap();
+        assert_eq!(
+            c.max_wait(Class::GitCredential),
+            (10.0, "GH_PACED_MAX_WAIT")
+        );
+        let env = env_of(&[
+            ("GH_PACED_MAX_WAIT", "10"),
+            ("GH_PACED_GIT_MAX_WAIT", "600"),
+        ]);
+        let (c, _) = Config::load(None, false, &env).unwrap();
+        assert_eq!(
+            c.max_wait(Class::GitCredential),
+            (10.0, "GH_PACED_MAX_WAIT")
+        );
+        for bad in ["-1", "lots", "inf", "604801"] {
+            let env = env_of(&[("GH_PACED_GIT_MAX_WAIT", bad)]);
+            assert!(Config::load(None, false, &env).is_err(), "accepted {bad}");
+        }
+        let env = env_of(&[("GH_PACED_GIT_MAX_WAIT", "0")]);
+        let (c, _) = Config::load(None, false, &env).unwrap();
+        assert_eq!(c.git_credential_max_wait_secs, 0.0);
+        // The config file key, range-checked like max_wait_secs.
+        let dir = std::env::temp_dir().join(format!("gh-paced-gitwait-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("c.json");
+        let load = |json: &str| {
+            std::fs::write(&path, json).unwrap();
+            Config::load(Some(&path), true, &env_of(&[]))
+        };
+        let (c, _) = load(r#"{"git_credential_max_wait_secs": 12}"#).unwrap();
+        assert_eq!(c.git_credential_max_wait_secs, 12.0);
+        for bad in ["-1", "604801", "1e308"] {
+            let json = format!("{{\"git_credential_max_wait_secs\": {bad}}}");
+            assert!(load(&json).is_err(), "accepted {json}");
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

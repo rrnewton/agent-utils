@@ -136,6 +136,11 @@ pub struct Wrapper<'a> {
     /// up when it would wait past it, so a consumer that has stopped reading cannot keep
     /// gh-paced from dying by the signal.
     pub stderr_deadline: Option<Instant>,
+    /// Construct with `false`. Set when a GIT_CREDENTIAL call (`auth git-credential get`) was
+    /// not admitted, so gh never ran: the caller then writes `quit=1` to stdout, which makes
+    /// git stop at once instead of trying another helper or prompting for a password on a
+    /// terminal while it holds its caller's locks.
+    pub credential_quit: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -480,7 +485,12 @@ impl Wrapper<'_> {
         };
         let admitted = match self.admit(&c, &summary) {
             Ok(a) => a,
-            Err(code) => return Outcome::Exit(code),
+            Err(code) => {
+                if c.class == Class::GitCredential {
+                    self.credential_quit = true;
+                }
+                return Outcome::Exit(code);
+            }
         };
         let keep_fds: Vec<RawFd> = admitted
             .lease
@@ -962,6 +972,8 @@ impl Wrapper<'_> {
     fn admit(&mut self, c: &Classification, summary: &str) -> Result<Admitted, i32> {
         let class = c.class;
         let base = self.cfg.limits(class);
+        let (max_wait, max_wait_var) = self.cfg.max_wait(class);
+        let started = self.clock.now();
         let mut waited = 0.0;
         let mut halve_noted = false;
         loop {
@@ -1210,6 +1222,15 @@ impl Wrapper<'_> {
                 self.internal_error("cannot save pacing state", &e);
                 return Err(EXIT_INTERNAL);
             }
+            if class == Class::GitCredential {
+                // A GIT_CREDENTIAL call never waits out a cooldown, however little of it is
+                // left: git runs the helper inside a fetch or push that may hold its caller's
+                // locks for as long as the helper sleeps.
+                if let Some(cd) = waits.iter().find(|x| x.kind == WaitKind::Cooldown) {
+                    let cd = cd.clone();
+                    return Err(self.refuse_credential_in_cooldown(c, summary, &cd, now, waited));
+                }
+            }
             if !w.secs.is_finite() {
                 let text = format!(
                     "`{}` costs {} {} tokens, more than the whole hourly cap of {}{}; it can never be admitted",
@@ -1239,8 +1260,14 @@ impl Wrapper<'_> {
                 self.write_audit(&r);
                 return Err(EXIT_REFUSED);
             }
-            let max_wait = self.cfg.max_wait_secs;
-            if waited + w.secs > max_wait {
+            // A GIT_CREDENTIAL call also counts time spent waiting for the state lock, so the
+            // helper's whole stay stays near its short bound.
+            let spent = if class == Class::GitCredential {
+                waited.max(now - started)
+            } else {
+                waited
+            };
+            if spent + w.secs > max_wait {
                 let until = now + w.secs;
                 let wait_text = if w.kind.polled() {
                     format!("waited {} s for it", waited.ceil() as i64)
@@ -1259,10 +1286,7 @@ impl Wrapper<'_> {
                         self.paths.state().display()
                     )
                 } else {
-                    format!(
-                        "{wait_text}, beyond GH_PACED_MAX_WAIT={} s",
-                        fmt_num(max_wait)
-                    )
+                    format!("{wait_text}, beyond {max_wait_var}={} s", fmt_num(max_wait))
                 };
                 self.banner(
                     "REFUSED",
@@ -1304,6 +1328,46 @@ impl Wrapper<'_> {
             self.clock.sleep(w.secs);
             waited += w.secs;
         }
+    }
+
+    /// Refuse a GIT_CREDENTIAL call at once because the account is in a cooldown (or the pause
+    /// after state recovery), with one loud line naming the cause and the seconds left, and
+    /// record the refusal. Returns the exit status.
+    fn refuse_credential_in_cooldown(
+        &mut self,
+        c: &Classification,
+        summary: &str,
+        cd: &Wait,
+        now: f64,
+        waited: f64,
+    ) -> i32 {
+        let until = now + cd.secs;
+        let left = if has_no_end(until) {
+            format!(
+                "the cooldown has no end time: every paced call is refused until a person \
+                 removes {} and the `cooldown` entry of {}",
+                self.paths.cooldown().display(),
+                self.paths.state().display()
+            )
+        } else {
+            format!(
+                "{} s left (ends {})",
+                cd.secs.ceil() as i64,
+                self.when(until)
+            )
+        };
+        let text = format!(
+            "{}; {left}; a git credential helper never waits out a cooldown, so git fails now \
+             instead of holding its caller's locks; not running `{}` (exit {EXIT_REFUSED})",
+            cd.text, c.command
+        );
+        self.loud("REFUSED", &text);
+        let mut r = self.record("refuse", c, summary);
+        r.rc = Some(EXIT_REFUSED);
+        r.waited_secs = waited;
+        r.detail = cd.text.clone();
+        self.write_audit(&r);
+        EXIT_REFUSED
     }
 
     fn finish(

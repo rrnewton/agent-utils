@@ -8,7 +8,7 @@ use crate::state::{self, Paths};
 use crate::status;
 use crate::wrapper::{Outcome, Wrapper, EXIT_NO_GH, EXIT_REFUSED, EXIT_USAGE};
 use std::ffi::OsString;
-use std::io::Read;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
 /// Exit status for a configuration error (bad config file, bad environment value, bad path).
@@ -79,7 +79,9 @@ DEFAULT BUDGETS (per host, per account; four hosts assumed)
   READ             20/min, burst 10, 500/hour
   SEARCH           5/min, burst 2, 150/hour
   WRITE            1 per 30 s, burst 1, 30/hour, 1 in flight
-  GIT_CREDENTIAL   1 per 10 s, burst 1, 120/hour
+  GIT_CREDENTIAL   1 per 10 s, burst 1, 120/hour; waits at most 30 s, and is
+                   refused at once (exit 75) during a cooldown, so git fails
+                   fast instead of holding its caller's locks
   LOCAL            unpaced, unaudited (help, completion, config, alias, ...)
   gh's aliases are expanded first and paced as the command they name.
   Unknown commands (extensions) are WRITE, even with --help.
@@ -97,6 +99,12 @@ ENVIRONMENT
   GH_PACED_REAL_GH           default for --real-gh
   GH_PACED_MAX_WAIT          longest total sleep before refusing, seconds
                              (default 900); a longer wait exits 75
+  GH_PACED_GIT_MAX_WAIT      longest total wait for a GIT_CREDENTIAL call,
+                             seconds (default 30; the smaller of this and
+                             GH_PACED_MAX_WAIT applies); a longer wait exits
+                             75 with `quit=1` on stdout, which makes git stop
+                             at once. During a cooldown a GIT_CREDENTIAL call
+                             is refused without waiting at all
   GH_PACED_LOCK_WAIT         longest wait for the state lock, seconds
                              (default 30, 0.1 to 3600); then exit 70
   GH_PACED_{READ,SEARCH,WRITE,GIT}_{PER_MINUTE,BURST,PER_HOUR}
@@ -120,9 +128,10 @@ ENVIRONMENT
 
 EXIT STATUS
   gh's own status (or gh-paced dies by the same signal), except:
-  75  refused: the wait would exceed GH_PACED_MAX_WAIT, the cost is above the
-      class's burst or can never fit the hourly cap, a watch outlasted the
-      polls its cost allows, or nesting too deep
+  75  refused: the wait would exceed GH_PACED_MAX_WAIT (GH_PACED_GIT_MAX_WAIT
+      for GIT_CREDENTIAL), a GIT_CREDENTIAL call arrived during a cooldown,
+      the cost is above the class's burst or can never fit the hourly cap, a
+      watch outlasted the polls its cost allows, or nesting too deep
   65  refused by the write content guard (body > 8 KiB, base64 run > 1000, a
       body gh composes itself, or a body file that cannot be copied). Text
       refused in the editor makes the editor fail, so gh itself exits non-zero
@@ -405,8 +414,16 @@ fn run_paced(account: Option<String>, real_gh: Option<String>, gh_args: Vec<Stri
         editor_guard_env: crate::editor::guard_env(&env_var, self_exe.as_deref(), &account),
         self_exe,
         stderr_deadline: None,
+        credential_quit: false,
     };
-    match w.run(&gh_args) {
+    let outcome = w.run(&gh_args);
+    if w.credential_quit {
+        // git credential protocol: `quit=1` makes git stop at once rather than try another
+        // helper or prompt on a terminal. git ignores a helper's exit status.
+        let mut out = std::io::stdout().lock();
+        let _ = out.write_all(b"quit=1\n").and_then(|()| out.flush());
+    }
+    match outcome {
         Outcome::Exit(code) => code,
         Outcome::Signal(sig) => die_by_signal(sig),
     }

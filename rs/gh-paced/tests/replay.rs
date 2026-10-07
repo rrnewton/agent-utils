@@ -160,6 +160,18 @@ fn gh(
     cfg: &Config,
     args: &[String],
 ) -> (Outcome, Vec<String>) {
+    let (outcome, messages, _) = gh_on(clock, fake, dir, cfg, args);
+    (outcome, messages)
+}
+
+/// [`gh`] with any clock, also returning [`Wrapper::credential_quit`].
+fn gh_on(
+    clock: &dyn Clock,
+    fake: &FakeGh<'_>,
+    dir: &Path,
+    cfg: &Config,
+    args: &[String],
+) -> (Outcome, Vec<String>, bool) {
     let alive = always_alive;
     let mut w = Wrapper {
         clock,
@@ -186,9 +198,10 @@ fn gh(
         editor_guard_env: Vec::new(),
         self_exe: None,
         stderr_deadline: None,
+        credential_quit: false,
     };
     let outcome = w.run(args);
-    (outcome, w.messages)
+    (outcome, w.messages, w.credential_quit)
 }
 
 fn strings(v: &[&str]) -> Vec<String> {
@@ -1001,6 +1014,7 @@ fn in_flight_wait_warns_on_every_poll() {
         editor_guard_env: Vec::new(),
         self_exe: None,
         stderr_deadline: None,
+        credential_quit: false,
     };
     let outcome = w.run(&strings(&["issue", "comment", "1", "--body", "short note"]));
     assert_eq!(outcome, Outcome::Exit(0), "{:?}", w.messages);
@@ -1028,4 +1042,319 @@ fn in_flight_wait_warns_on_every_poll() {
         "ran while the other write was in flight: {runs:?}"
     );
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+fn credential_get() -> Vec<String> {
+    strings(&["auth", "git-credential", "get"])
+}
+
+/// Start a pushback cooldown with one READ whose gh prints `stderr`, and return its end.
+fn start_cooldown(clock: &FakeClock, fake: &FakeGh<'_>, dir: &Path, stderr: &[u8]) -> f64 {
+    *fake.stderr.lock().unwrap() = stderr.to_vec();
+    let (outcome, messages) = gh(clock, fake, dir, &Config::default(), &get_args(0));
+    assert_eq!(outcome, Outcome::Exit(0), "{messages:?}");
+    fake.stderr.lock().unwrap().clear();
+    let st = state::load_readonly(&Paths::new(dir.to_path_buf(), "replay")).unwrap();
+    st.cooldown.expect("a cooldown").until
+}
+
+const SECONDARY_403: &[u8] =
+    b"gh: You have exceeded a secondary rate limit. Please wait a few minutes. (HTTP 403)\n";
+
+/// git runs its credential helper inside a fetch or push that may hold the caller's locks, so
+/// during a cooldown `auth git-credential get` is refused at once with one line, never slept
+/// out (with the default 900 s GH_PACED_MAX_WAIT it used to sleep the whole cooldown).
+#[test]
+fn credential_get_is_refused_at_once_during_a_cooldown() {
+    let dir = scratch("cred-cooldown");
+    let clock = FakeClock::new(T0);
+    let fake = FakeGh::new(&clock);
+    let until = start_cooldown(&clock, &fake, &dir, SECONDARY_403);
+    assert!(until - clock.now() > 850.0, "a 900 s cooldown");
+    let cfg = Config::default();
+    let runs = fake.runs().len();
+    let captures = fake.captures.lock().unwrap().len();
+    for (left, shown) in [(100.4, "101 s left"), (0.5, "1 s left")] {
+        assert!(
+            left < cfg.max_wait_secs,
+            "GH_PACED_MAX_WAIT alone would sleep the rest out"
+        );
+        clock.advance_to(until - left);
+        let before = clock.now();
+        let (outcome, messages, quit) = gh_on(&clock, &fake, &dir, &cfg, &credential_get());
+        assert_eq!(outcome, Outcome::Exit(EXIT_REFUSED), "{messages:?}");
+        assert!(clock.sleeps().is_empty(), "slept: {:?}", clock.sleeps());
+        assert_eq!(clock.now(), before, "no time passed");
+        assert_eq!(fake.runs().len(), runs, "gh was not run");
+        assert_eq!(
+            fake.captures.lock().unwrap().len(),
+            captures,
+            "no GitHub request"
+        );
+        assert!(quit, "git is told to quit");
+        assert_eq!(messages.len(), 1, "exactly one line: {messages:?}");
+        let line = &messages[0];
+        assert!(
+            line.starts_with("GH-PACED REFUSED [replay] cooldown after GitHub pushback ("),
+            "{line}"
+        );
+        assert!(
+            line.contains("secondary rate limit"),
+            "names the cause: {line}"
+        );
+        assert!(line.contains(shown), "names the seconds left: {line}");
+        let ends = human(until, before, cfg.display_tz);
+        assert!(line.contains(&format!("(ends {ends})")), "{line}");
+        assert!(line.contains("(exit 75)"), "{line}");
+    }
+    // The refusals took no token: once the cooldown is over the next call runs at once.
+    clock.advance_to(until + 1.0);
+    let (outcome, messages, quit) = gh_on(&clock, &fake, &dir, &cfg, &credential_get());
+    assert_eq!(outcome, Outcome::Exit(0), "{messages:?}");
+    assert!(!quit);
+    assert!(clock.sleeps().is_empty(), "slept: {:?}", clock.sleeps());
+    assert_eq!(fake.runs().len(), runs + 1);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The credential change shortens nothing else: a READ still sleeps out a cooldown and a WRITE
+/// is still refused against GH_PACED_MAX_WAIT, even with the GIT_CREDENTIAL bound at zero.
+#[test]
+fn reads_and_writes_still_wait_out_a_cooldown() {
+    let dir = scratch("cooldown-read-write");
+    let clock = FakeClock::new(T0);
+    let fake = FakeGh::new(&clock);
+    let until = start_cooldown(&clock, &fake, &dir, SECONDARY_403);
+    clock.advance_to(until - 100.4);
+    let runs = fake.runs().len();
+    let short = Config {
+        max_wait_secs: 60.0,
+        git_credential_max_wait_secs: 0.0,
+        ..Config::default()
+    };
+    let (outcome, messages, quit) = gh_on(
+        &clock,
+        &fake,
+        &dir,
+        &short,
+        &strings(&["pr", "comment", "1", "--body", "hi"]),
+    );
+    assert_eq!(outcome, Outcome::Exit(EXIT_REFUSED), "{messages:?}");
+    assert!(!quit, "only a credential call prints quit=1");
+    let text = messages.join("\n");
+    assert!(text.contains("cooldown after GitHub pushback"), "{text}");
+    assert!(text.contains("beyond GH_PACED_MAX_WAIT=60 s"), "{text}");
+    assert!(!text.contains("GH_PACED_GIT_MAX_WAIT"), "{text}");
+    assert!(messages.len() > 1, "the full banner: {messages:?}");
+    assert_eq!(fake.runs().len(), runs);
+    let zero_git = Config {
+        git_credential_max_wait_secs: 0.0,
+        ..Config::default()
+    };
+    let (outcome, messages, quit) = gh_on(&clock, &fake, &dir, &zero_git, &get_args(1));
+    assert_eq!(outcome, Outcome::Exit(0), "{messages:?}");
+    assert!(!quit);
+    assert!(
+        clock.sleeps().iter().any(|s| (s - 100.4).abs() < 1e-6),
+        "the READ slept the rest of the cooldown: {:?}",
+        clock.sleeps()
+    );
+    assert!(messages
+        .join("\n")
+        .contains("cooldown after GitHub pushback"));
+    let ran = fake.runs();
+    assert_eq!(ran.len(), runs + 1);
+    assert!(ran[runs].at >= until, "{ran:?}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The pause after state recovery is a cooldown too: a credential call is refused at once.
+#[test]
+fn credential_get_is_refused_at_once_during_the_recovery_pause() {
+    let dir = scratch("cred-recovery");
+    let clock = FakeClock::new(T0);
+    let fake = FakeGh::new(&clock);
+    std::fs::write(dir.join("replay.json"), b"{\"buckets\": {\"read\"").unwrap();
+    let cfg = Config::default();
+    let (outcome, messages, quit) = gh_on(&clock, &fake, &dir, &cfg, &credential_get());
+    assert_eq!(outcome, Outcome::Exit(EXIT_REFUSED), "{messages:?}");
+    assert!(quit);
+    assert!(clock.sleeps().is_empty(), "slept: {:?}", clock.sleeps());
+    assert!(fake.runs().is_empty());
+    let refused: Vec<&String> = messages.iter().filter(|m| m.contains("REFUSED")).collect();
+    assert_eq!(refused.len(), 1, "{messages:?}");
+    assert!(
+        refused[0].contains("pause after state recovery"),
+        "{refused:?}"
+    );
+    assert!(refused[0].contains("900 s left"), "{refused:?}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A cooldown with no end time is refused at once too, and the line says what to remove.
+#[test]
+fn credential_get_names_a_cooldown_with_no_end() {
+    let dir = scratch("cred-no-end");
+    let clock = FakeClock::new(T0);
+    let fake = FakeGh::new(&clock);
+    let until = start_cooldown(
+        &clock,
+        &fake,
+        &dir,
+        b"HTTP 429: Too Many Requests\nRetry-After: 99999999999\n",
+    );
+    assert!(gh_paced::pushback::has_no_end(until), "{until}");
+    let (outcome, messages, quit) =
+        gh_on(&clock, &fake, &dir, &Config::default(), &credential_get());
+    assert_eq!(outcome, Outcome::Exit(EXIT_REFUSED), "{messages:?}");
+    assert!(quit);
+    assert!(clock.sleeps().is_empty(), "slept: {:?}", clock.sleeps());
+    assert_eq!(messages.len(), 1, "{messages:?}");
+    assert!(
+        messages[0].contains("the cooldown has no end time"),
+        "{messages:?}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Ordinary GIT_CREDENTIAL budget throttling may sleep, but never past GH_PACED_GIT_MAX_WAIT
+/// (30 s), and a smaller GH_PACED_MAX_WAIT still wins.
+#[test]
+fn credential_get_waits_for_its_budget_at_most_the_short_bound() {
+    let dir = scratch("cred-budget");
+    let clock = FakeClock::new(T0);
+    let fake = FakeGh::new(&clock);
+    let cfg = Config::default();
+    assert_eq!(cfg.git_credential_max_wait_secs, 30.0);
+    let (outcome, messages, _) = gh_on(&clock, &fake, &dir, &cfg, &credential_get());
+    assert_eq!(outcome, Outcome::Exit(0), "{messages:?}");
+    assert!(clock.sleeps().is_empty());
+    // 1 per 10 s: the next call sleeps for its token, inside the bound.
+    let (outcome, messages, quit) = gh_on(&clock, &fake, &dir, &cfg, &credential_get());
+    assert_eq!(outcome, Outcome::Exit(0), "{messages:?}");
+    assert!(!quit);
+    let sleeps = clock.sleeps();
+    assert_eq!(sleeps.len(), 1, "{sleeps:?}");
+    assert!((9.0..=10.0).contains(&sleeps[0]), "{sleeps:?}");
+    // At 1 per minute the token is ~59 s away: refused at once instead of sleeping.
+    let slow = ClassLimits {
+        per_minute: 1.0,
+        burst: 1.0,
+        per_hour: 120,
+    };
+    let slow_cfg = Config {
+        git_credential: slow,
+        ..Config::default()
+    };
+    let before = clock.now();
+    let (outcome, messages, quit) = gh_on(&clock, &fake, &dir, &slow_cfg, &credential_get());
+    assert_eq!(outcome, Outcome::Exit(EXIT_REFUSED), "{messages:?}");
+    assert!(quit, "git is told to quit");
+    assert_eq!(
+        clock.sleeps().len(),
+        1,
+        "no new sleep: {:?}",
+        clock.sleeps()
+    );
+    assert_eq!(clock.now(), before);
+    assert_eq!(fake.runs().len(), 2);
+    let text = messages.join("\n");
+    assert!(text.contains("beyond GH_PACED_GIT_MAX_WAIT=30 s"), "{text}");
+    assert!(text.contains("git_credential budget 1 per 60 s"), "{text}");
+    // The bound is what refused it: raised to 900 s, the same call sleeps for its token.
+    let patient = Config {
+        git_credential_max_wait_secs: 900.0,
+        ..slow_cfg
+    };
+    let (outcome, messages, _) = gh_on(&clock, &fake, &dir, &patient, &credential_get());
+    assert_eq!(outcome, Outcome::Exit(0), "{messages:?}");
+    let last = *clock.sleeps().last().unwrap();
+    assert!(last > 30.0 && last <= 60.0, "{:?}", clock.sleeps());
+    // A GH_PACED_MAX_WAIT below the credential bound applies and is the one named.
+    let tight = Config {
+        max_wait_secs: 5.0,
+        ..Config::default()
+    };
+    let (outcome, messages, quit) = gh_on(&clock, &fake, &dir, &tight, &credential_get());
+    assert_eq!(outcome, Outcome::Exit(EXIT_REFUSED), "{messages:?}");
+    assert!(quit);
+    assert!(
+        messages.join("\n").contains("beyond GH_PACED_MAX_WAIT=5 s"),
+        "{messages:?}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A clock whose every sleep is followed by another process taking the GIT_CREDENTIAL token
+/// (and, optionally, by `late` more seconds before this process gets the state lock back).
+struct ContendedClock<'a> {
+    inner: &'a FakeClock,
+    late: f64,
+    slept: Mutex<Vec<f64>>,
+    rival: Box<dyn Fn() + Send + Sync + 'a>,
+}
+
+impl Clock for ContendedClock<'_> {
+    fn now(&self) -> f64 {
+        self.inner.now()
+    }
+
+    fn sleep(&self, secs: f64) {
+        self.slept.lock().unwrap().push(secs);
+        self.inner.advance_to(self.inner.now() + secs);
+        (self.rival)();
+        self.inner.advance_to(self.inner.now() + self.late);
+    }
+}
+
+/// A credential call that keeps losing its token to other processes gives up within the
+/// bound, counting the time it spent not sleeping (waiting for the state lock) as well.
+#[test]
+fn contended_credential_get_gives_up_within_the_bound() {
+    for late in [0.0, 8.0] {
+        let dir = scratch(&format!("cred-contended-{late}"));
+        let clock = FakeClock::new(T0);
+        let fake = FakeGh::new(&clock);
+        let cfg = Config::default();
+        let (outcome, _, _) = gh_on(&clock, &fake, &dir, &cfg, &credential_get());
+        assert_eq!(outcome, Outcome::Exit(0));
+        let rivals = AtomicU64::new(0);
+        let contended = ContendedClock {
+            inner: &clock,
+            late,
+            slept: Mutex::new(Vec::new()),
+            rival: Box::new(|| {
+                let (outcome, messages) = gh(&clock, &fake, &dir, &cfg, &credential_get());
+                assert_eq!(outcome, Outcome::Exit(0), "rival: {messages:?}");
+                rivals.fetch_add(1, Ordering::SeqCst);
+            }),
+        };
+        let start = clock.now();
+        let (outcome, messages, quit) = gh_on(&contended, &fake, &dir, &cfg, &credential_get());
+        let elapsed = clock.now() - start;
+        assert_eq!(
+            outcome,
+            Outcome::Exit(EXIT_REFUSED),
+            "late {late}: {messages:?}"
+        );
+        assert!(quit);
+        let slept: f64 = contended.slept.lock().unwrap().iter().sum();
+        assert!(slept <= 30.0, "late {late}: slept {slept}");
+        assert!(
+            rivals.load(Ordering::SeqCst) >= 2,
+            "late {late}: the bound was reached through repeated waits"
+        );
+        // At most the bound plus one wake-up (a rival's call and the late lock).
+        assert!(
+            elapsed <= 30.0 + CALL_SECS + late + 1e-6,
+            "late {late}: stayed {elapsed} s"
+        );
+        assert!(
+            messages
+                .join("\n")
+                .contains("beyond GH_PACED_GIT_MAX_WAIT=30 s"),
+            "late {late}: {messages:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

@@ -86,5 +86,11 @@ to back. Watch loops (`gh pr checks --watch`, `gh run watch`) are refused with
 exit status 64 unless `GH_PACED_ALLOW_WATCH=1` is set; poll with repeated plain
 calls instead.
 
+git's credential helper (`gh auth git-credential get`, a GIT_CREDENTIAL call)
+never waits long, because git may hold its caller's locks meanwhile: during a
+cooldown it is refused at once, otherwise it waits at most
+`GH_PACED_GIT_MAX_WAIT` (default 30 s). Either refusal exits 75 and prints
+`quit=1`, so git stops instead of prompting.
+
 Run `gh-paced userguide` for the full reference: the classes, the citations
 behind each budget, the configuration options, and every message.

@@ -581,6 +581,73 @@ fn github_pushback_starts_a_cooldown() {
     assert!(stdout(&o).contains("COOLDOWN:"), "{}", stdout(&o));
 }
 
+/// During a cooldown the git credential helper is refused at once, with one line, and prints
+/// `quit=1` so git stops instead of prompting: with the default 900 s GH_PACED_MAX_WAIT it used
+/// to sleep out the whole cooldown inside git.
+#[test]
+fn credential_helper_is_refused_at_once_during_a_cooldown() {
+    let sb = Sandbox::new("cred-cooldown", FAST);
+    let o = sb.run(
+        &["pr", "list"],
+        &[
+            ("FAKE_GH_STDERR", "HTTP 403: You have exceeded a secondary rate limit and have been temporarily blocked"),
+            ("FAKE_GH_EXIT", "1"),
+        ],
+    );
+    assert_eq!(o.status.code(), Some(1), "{}", stderr(&o));
+    let started = Instant::now();
+    let o = sb.run(&["auth", "git-credential", "get"], &[]);
+    let took = started.elapsed().as_secs_f64();
+    let err = stderr(&o);
+    assert_eq!(o.status.code(), Some(75), "{err}");
+    assert!(took < 10.0, "took {took} s: {err}");
+    assert_eq!(stdout(&o), "quit=1\n", "{err}");
+    let refused: Vec<&str> = err.lines().filter(|l| l.contains("REFUSED")).collect();
+    assert_eq!(refused.len(), 1, "{err}");
+    assert!(
+        refused[0].contains("cooldown after GitHub pushback"),
+        "{err}"
+    );
+    assert!(refused[0].contains(" s left (ends "), "{err}");
+    assert_eq!(err.lines().count(), 1, "one line: {err}");
+    assert_eq!(sb.starts().len(), 1, "gh did not run: {:?}", sb.log());
+    // Other classes are not told to quit, and still refuse against GH_PACED_MAX_WAIT.
+    let o = sb.run(&["pr", "view", "1"], &[("GH_PACED_MAX_WAIT", "5")]);
+    assert_eq!(o.status.code(), Some(75), "{}", stderr(&o));
+    assert_eq!(stdout(&o), "");
+    assert!(
+        stderr(&o).contains("beyond GH_PACED_MAX_WAIT=5 s"),
+        "{}",
+        stderr(&o)
+    );
+}
+
+/// GH_PACED_GIT_MAX_WAIT bounds a credential call's budget wait: beyond it the call is refused
+/// at once with `quit=1`, and within it the call waits and runs.
+#[test]
+fn credential_helper_wait_is_bounded_by_its_own_knob() {
+    let sb = Sandbox::new(
+        "cred-bound",
+        r#"{"git_credential": {"per_minute": 60, "burst": 1, "per_hour": 120}}"#,
+    );
+    let o = sb.run(&["auth", "git-credential", "get"], &[]);
+    assert_eq!(o.status.code(), Some(0), "{}", stderr(&o));
+    assert_eq!(stdout(&o), "");
+    let o = sb.run(
+        &["auth", "git-credential", "get"],
+        &[("GH_PACED_GIT_MAX_WAIT", "0")],
+    );
+    let err = stderr(&o);
+    assert_eq!(o.status.code(), Some(75), "{err}");
+    assert_eq!(stdout(&o), "quit=1\n", "{err}");
+    assert!(err.contains("beyond GH_PACED_GIT_MAX_WAIT=0 s"), "{err}");
+    assert_eq!(sb.starts().len(), 1, "{:?}", sb.log());
+    let o = sb.run(&["auth", "git-credential", "get"], &[]);
+    assert_eq!(o.status.code(), Some(0), "{}", stderr(&o));
+    assert_eq!(stdout(&o), "");
+    assert_eq!(sb.starts().len(), 2, "{:?}", sb.log());
+}
+
 #[test]
 fn local_commands_run_without_touching_state() {
     let sb = Sandbox::new("local", FAST);
