@@ -62,21 +62,23 @@ the bridge retries it with the same operation ID, so it is never posted twice.
 `agentctl chat thread` shows one thread's retained requests and replies in
 order. A retired request's replies are no longer held, so the chat thread
 itself remains the complete record. The state directory is the `--bridge-state`
-argument of the prompt's `chat thread` or `chat reply` command when the prompt
-prints one (a prompt for a new thread, or one whose command could not be
-printed safely, has neither); otherwise it is the `--bridge-state` of the
-service's `agentctl chat run` command, which the owner or the deployment's
-notes give.
+argument of the prompt's `chat thread` command (printed for a reply in an
+existing thread) or its `chat reply` command (printed when the bridge offers
+it); either can be left out when it cannot be printed safely. Otherwise it is
+the `--bridge-state` of the service's `agentctl chat run` command, which the
+owner or the deployment's notes give.
 
 ## What the reactions and the first line mean
 
 - The acknowledgement reaction (configured per deployment, for example 👀) is
   added when the bridge admits the message.
-- ✅ is added, when the deployment has an acknowledgement reaction, once the
-  bridge's queue has typed the prompt into your pane and verified it against
-  your composer, printed or queued behind another prompt. Adding it can fail
-  or lag like any provider call, so a missing ✅ does not prove the prompt was
-  not delivered.
+- ✅ is added, when the deployment has an acknowledgement reaction other than
+  ✅, once the bridge's queue has typed the prompt into your pane and verified
+  it against your composer, printed or queued behind another prompt. Adding it
+  can fail or lag like any provider call, so a missing ✅ does not prove the
+  prompt was not delivered. An older deployment whose acknowledgement reaction
+  is itself ✅ shows it at admission instead, before the prompt reaches you,
+  and adds no separate receipt.
 - Each prompt's first line opens with the message's own send time, as
   `Sent 2026.10.07:08:45 EDT.`, and says `delivered 1 h 12 min later` when it
   reached you two minutes or more after that. Several held messages can arrive
