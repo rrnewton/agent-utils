@@ -1,12 +1,11 @@
 """The send-time opening of a chat request prompt, decided when the prompt is typed.
 
-The Rust bridge queues a chat request prompt with its first line opened for the moment it was
-queued, as ``Sent 2026.10.07:08:45 EDT. ``, and records the message's create time (``sent_at``)
-and that exact opening (``opening``) in the queue document. A drain replaces the opening with one
-for the moment it types the prompt, which may be long after a busy agent let it through, adding
+The chat bridge queues a request prompt with its first line opened for the moment it was queued,
+as ``Sent 2026.10.07:08:45 EDT. ``, and records the message's create time (``sent_at``) and that
+exact opening (``opening``) in the queue document. A drain replaces the opening with one for the
+moment it types the prompt, which may be long after a busy agent let it through, adding
 ``, delivered 1 h 12 min later`` once the prompt is ``LATE_PROMPT_AFTER_SECONDS`` or more late.
-This module is the Python drain's copy of that rule; ``rs/agentctl/src/prompt_time.rs`` is the
-other, and both must render the same text.
+Every drain of the same queue must render the same text for the same document and instant.
 
 The zone is the process's local zone (``TZ``, else ``/etc/localtime``), and its abbreviation is
 always printed, or its numeric offset as ``UTC-04:00`` when the abbreviation is unusable.
@@ -19,7 +18,7 @@ import time
 
 LATE_PROMPT_AFTER_SECONDS = 120
 
-# ASCII digits only, as the Rust parser and the subscription crate accept.
+# ASCII digits only, as the chat subscription accepts.
 _RFC3339 = re.compile(
     r"([0-9]{4})-([0-9]{2})-([0-9]{2})[Tt]([0-9]{2}):([0-9]{2}):([0-9]{2})(?:\.([0-9]+))?"
     r"(?:([Zz])|([+-])([0-9]{2}):([0-9]{2}))",
@@ -44,7 +43,7 @@ def _days_from_civil(year: int, month: int, day: int) -> int:
 
 
 def _civil_from_days(days: int) -> tuple[int, int, int]:
-    """The proleptic Gregorian date ``days`` after 1970-01-01, as the Rust drain computes it."""
+    """The proleptic Gregorian date ``days`` after 1970-01-01."""
     days += 719_468
     era = days // 146_097
     day_of_era = days - era * 146_097
@@ -102,7 +101,7 @@ def _zone(seconds: int) -> tuple[int, str]:
 
 
 def _stamp(seconds: int) -> str:
-    # The local date is computed from the offset, as the Rust drain does, not by the C library,
+    # The local date is computed from the offset, as the compiled drain does, not by the C library,
     # so the two agree under every zone, including one that counts leap seconds.
     offset, name = _zone(seconds)
     local = seconds + offset
@@ -145,7 +144,7 @@ def retime(text: str, sent_at: object, recorded: object, now_nanos: int | None =
             or rfc3339_instant(sent_at) is None):
         return text
     now = time.time_ns() if now_nanos is None else now_nanos
-    # The Rust drain reads its clock in milliseconds; the same instant renders the same text.
+    # The compiled drain reads its clock in milliseconds; the same instant renders the same text.
     now = now // 1_000_000 * 1_000_000
     try:
         fresh = opening(sent_at, now)
