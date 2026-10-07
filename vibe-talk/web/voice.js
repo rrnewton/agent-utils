@@ -1934,7 +1934,7 @@ function setSearchOpen(open) {
 // read, as people and chat services write them: a Markdown link `[name](https://…)`, the angle
 // brackets chat services send, `<https://…>` and `<https://…|name>`, and a bare address. A Markdown
 // link that is complete and well formed shows its NAME. One that is not — brackets that do not
-// pair, an empty name, a target that is not http(s) — is not read as a link at all, and an address
+// pair, an empty name, a target that is not http or https — is not read as a link at all, and an address
 // written inside it is then found as a bare one: the reader gets the address, and never a name that
 // might not belong to it.
 //
@@ -2040,7 +2040,7 @@ function trimAddress(candidate) {
  * The Markdown link whose `[` is at `start`, complete and well formed, as `{href, name, end}`, or
  * null. The name may hold brackets that pair, as CommonMark's may, and is on one line; the target
  * may hold parentheses that pair and be followed by a quoted title. An empty name is returned as
- * one, and the caller shows the address instead. A target that is not http(s) is no link.
+ * one, and the caller shows the address instead. A target that is not http or https is no link.
  */
 function markdownLinkAt(text, start) {
   let depth = 0;
