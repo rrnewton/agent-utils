@@ -91,7 +91,8 @@ never waits long, because git may hold its caller's locks meanwhile: during a
 cooldown it is refused at once, otherwise it waits at most
 `GH_PACED_GIT_MAX_WAIT` (default 30 s), its waits for the state lock included.
 Either refusal exits 75 (70 for a state lock that was not free in time) and
-prints `quit=1`, so git stops instead of prompting.
+prints `quit=1`, so git stops instead of prompting; so does any other failure
+before gh starts, a gh that cannot be executed (exit 127) included.
 
 Run `gh-paced userguide` for the full reference: the classes, the citations
 behind each budget, the configuration options, and every message.

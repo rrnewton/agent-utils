@@ -105,8 +105,10 @@ ENVIRONMENT
                              for the state lock; a longer wait exits 75 (70
                              when the lock was not free in time). During a
                              cooldown a GIT_CREDENTIAL call is refused without
-                             waiting at all. A GIT_CREDENTIAL call that fails
-                             before gh starts prints `quit=1` on stdout, which
+                             waiting at all, and one that becomes admissible
+                             only after its bound is refused (75). A
+                             GIT_CREDENTIAL call that fails before gh starts
+                             (127 included) prints `quit=1` on stdout, which
                              makes git stop at once instead of prompting
   GH_PACED_LOCK_WAIT         longest wait for the state lock, seconds
                              (default 30, 0.1 to 3600); then exit 70

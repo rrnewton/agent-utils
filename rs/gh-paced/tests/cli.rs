@@ -694,7 +694,7 @@ fn credential_helper_waits_for_the_account_lock_only_within_its_bound() {
     let err = stderr(&o);
     assert_eq!(o.status.code(), Some(70), "{err}");
     assert_eq!(stdout(&o), "quit=1\n", "{err}");
-    assert!((1.0..5.0).contains(&took), "took {took} s: {err}");
+    assert!((1.0..1.5).contains(&took), "took {took} s: {err}");
     assert!(err.contains("GH_PACED_GIT_MAX_WAIT=1 s bound"), "{err}");
     let started = Instant::now();
     let o = sb.run(&["pr", "list"], &[("GH_PACED_LOCK_WAIT", "2")]);
@@ -705,6 +705,54 @@ fn credential_helper_waits_for_the_account_lock_only_within_its_bound() {
     assert!(took >= 2.0, "took {took} s: {err}");
     assert!(!err.contains("GH_PACED_GIT_MAX_WAIT"), "{err}");
     drop(held);
+    assert!(sb.starts().is_empty(), "{:?}", sb.log());
+}
+
+/// Refusing a credential call because gh's configuration cannot be read is recorded under the
+/// account lock, and that wait is held to GH_PACED_GIT_MAX_WAIT too: the bound counts from the
+/// start of the call, not from after the aliases are read.
+#[test]
+fn credential_helper_refusing_an_alias_waits_for_the_lock_only_within_its_bound() {
+    let sb = Sandbox::new("cred-alias-lock", FAST);
+    write_gh_config(&sb, "aliases:\n  up: !!str api -X POST x --input -\n");
+    let get = ["auth", "git-credential", "get"];
+    let held = hold_account_lock(&sb);
+    let started = Instant::now();
+    let o = sb.run(&get, &[("GH_PACED_GIT_MAX_WAIT", "1")]);
+    let took = started.elapsed().as_secs_f64();
+    let err = stderr(&o);
+    assert_eq!(o.status.code(), Some(70), "{err}");
+    assert_eq!(stdout(&o), "quit=1\n", "{err}");
+    assert!((1.0..1.5).contains(&took), "took {took} s: {err}");
+    assert!(err.contains("GH_PACED_GIT_MAX_WAIT=1 s bound"), "{err}");
+    drop(held);
+    let o = sb.run(&get, &[("GH_PACED_GIT_MAX_WAIT", "1")]);
+    let err = stderr(&o);
+    assert_eq!(o.status.code(), Some(78), "{err}");
+    assert_eq!(stdout(&o), "quit=1\n", "{err}");
+    assert!(err.contains("gh's configuration cannot be read"), "{err}");
+    assert!(sb.starts().is_empty(), "{:?}", sb.log());
+}
+
+/// A credential call whose gh cannot be executed (no execute permission, or an interpreter that
+/// does not exist) exits 127 and tells git to quit, as gh never answered.
+#[test]
+fn credential_helper_quits_when_gh_cannot_be_executed() {
+    let sb = Sandbox::new("cred-exec", FAST);
+    let get = ["auth", "git-credential", "get"];
+    let plain = sb.path("gh-not-executable");
+    std::fs::write(&plain, FAKE_GH).unwrap();
+    std::fs::set_permissions(&plain, std::fs::Permissions::from_mode(0o644)).unwrap();
+    let orphan = sb.path("gh-no-interpreter");
+    std::fs::write(&orphan, "#!/nonexistent/sh\nexit 0\n").unwrap();
+    std::fs::set_permissions(&orphan, std::fs::Permissions::from_mode(0o755)).unwrap();
+    for gh in [&plain, &orphan] {
+        let o = sb.run(&get, &[("GH_PACED_REAL_GH", gh.to_str().unwrap())]);
+        let err = stderr(&o);
+        assert_eq!(o.status.code(), Some(127), "{gh:?}: {err}");
+        assert_eq!(stdout(&o), "quit=1\n", "{gh:?}: {err}");
+        assert!(err.contains("cannot run"), "{gh:?}: {err}");
+    }
     assert!(sb.starts().is_empty(), "{:?}", sb.log());
 }
 

@@ -14,15 +14,16 @@ use gh_paced::classify::Class;
 use gh_paced::clock::{Clock, FakeClock};
 use gh_paced::config::{ClassLimits, Config};
 use gh_paced::pushback::Scanner;
-use gh_paced::runner::{Captured, Exit, Invocation, Ran, Runner};
+use gh_paced::runner::{Captured, Exit, Invocation, Ran, RunError, Runner};
 use gh_paced::state::{self, Holder, Paths};
 use gh_paced::timefmt::human;
 use gh_paced::wrapper::{
-    answers_quit, Outcome, Wrapper, EXIT_CONTENT, EXIT_INTERNAL, EXIT_REFUSED,
+    answers_quit, Outcome, Wrapper, EXIT_CONTENT, EXIT_INTERNAL, EXIT_NO_GH, EXIT_REFUSED,
 };
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 /// Measured start offsets of the 44 calls, seconds after 11:04:12.356 ET. Even indices are the
 /// POSTs (summary, then parts 1..=21); odd indices are the read-backs.
@@ -94,7 +95,7 @@ impl<'a> FakeGh<'a> {
 }
 
 impl Runner for FakeGh<'_> {
-    fn run(&self, inv: Invocation<'_>, scanner: &mut Scanner) -> Result<Ran, String> {
+    fn run(&self, inv: Invocation<'_>, scanner: &mut Scanner) -> Result<Ran, RunError> {
         self.runs.lock().unwrap().push(Call {
             at: self.clock.now(),
             args: inv.args.to_vec(),
@@ -120,24 +121,31 @@ impl Runner for FakeGh<'_> {
                 .push(window_cost(dir, Class::Read));
         }
         let (remaining, reset) = *self.core_remaining.lock().unwrap();
-        let body = format!(
-            r#"{{"resources":{{"core":{{"limit":5000,"used":{},"remaining":{remaining},"reset":{}}},
-            "graphql":{{"limit":5000,"used":0,"remaining":5000,"reset":{}}},
-            "search":{{"limit":30,"used":0,"remaining":30,"reset":{}}}}}}}"#,
-            5000 - remaining,
-            reset as u64,
-            reset as u64,
-            (self.clock.now() + 60.0) as u64
-        );
+        let answer = rate_limit_answer(remaining, reset, self.clock.now());
         self.clock.advance_to(self.clock.now() + 0.3);
-        Ok(Captured {
-            exit: Exit::Code(0),
-            stdout: body.into_bytes(),
-            stderr: Vec::new(),
-            timed_out: false,
-            stdout_cut: false,
-            stderr_cut: false,
-        })
+        Ok(answer)
+    }
+}
+
+/// gh's answer to `api rate_limit` at `now`, with `remaining` of 5000 core requests left until
+/// `reset`.
+fn rate_limit_answer(remaining: u64, reset: f64, now: f64) -> Captured {
+    let body = format!(
+        r#"{{"resources":{{"core":{{"limit":5000,"used":{},"remaining":{remaining},"reset":{}}},
+        "graphql":{{"limit":5000,"used":0,"remaining":5000,"reset":{}}},
+        "search":{{"limit":30,"used":0,"remaining":30,"reset":{}}}}}}}"#,
+        5000 - remaining,
+        reset as u64,
+        reset as u64,
+        (now + 60.0) as u64
+    );
+    Captured {
+        exit: Exit::Code(0),
+        stdout: body.into_bytes(),
+        stderr: Vec::new(),
+        timed_out: false,
+        stdout_cut: false,
+        stderr_cut: false,
     }
 }
 
@@ -1295,7 +1303,7 @@ fn credential_get_waits_for_its_budget_at_most_the_short_bound() {
 struct InstantGh;
 
 impl Runner for InstantGh {
-    fn run(&self, _inv: Invocation<'_>, _scanner: &mut Scanner) -> Result<Ran, String> {
+    fn run(&self, _inv: Invocation<'_>, _scanner: &mut Scanner) -> Result<Ran, RunError> {
         Ok(Ran {
             exit: Exit::Code(0),
             deadline_hit: false,
@@ -1331,10 +1339,12 @@ impl Clock for ContendedClock<'_> {
 }
 
 /// A credential call that keeps losing its token to other processes gives up within the
-/// bound: its whole stay, not only the time it asked to sleep, is at most 30 s.
+/// bound: its whole stay, not only the time it asked to sleep, is at most 30 s. A sleep is only
+/// begun when it ends within the bound, so a wake-up `late` seconds late can carry the stay past
+/// it by that much and no more: the call is refused as soon as it wakes.
 #[test]
 fn contended_credential_get_gives_up_within_the_bound() {
-    for late in [0.0, 2.5] {
+    for late in [0.0, 2.5, 8.0] {
         let dir = scratch(&format!("cred-contended-{late}"));
         let clock = FakeClock::new(T0);
         let fake = FakeGh::new(&clock);
@@ -1366,7 +1376,13 @@ fn contended_credential_get_gives_up_within_the_bound() {
             rivals.load(Ordering::SeqCst) >= 2,
             "late {late}: the bound was reached through repeated waits"
         );
-        assert!(elapsed <= 30.0 + 1e-6, "late {late}: stayed {elapsed} s");
+        assert!(
+            elapsed <= 30.0 + late + 1e-6,
+            "late {late}: stayed {elapsed} s"
+        );
+        if late == 0.0 {
+            assert!(elapsed <= 30.0 + 1e-6, "on time: stayed {elapsed} s");
+        }
         assert!(
             messages
                 .join("\n")
@@ -1440,24 +1456,117 @@ fn credential_get_admissible_only_past_its_bound_is_refused() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// A clock whose every sleep ends with another process taking the state lock and keeping it
-/// for `hold` of real time.
-struct LockingClock<'a> {
-    inner: &'a FakeClock,
-    paths: Paths,
-    hold: std::time::Duration,
+/// Real time a deadline may be overrun by, in the tests that measure one: the time to notice
+/// that it has passed and return, not a wait.
+const SLACK: f64 = 0.25;
+
+/// A clock that runs at the rate of real time from `T0`, plus every sleep and every
+/// [`RealRateClock::advance`], which pass at once. A real wait for the state lock therefore
+/// shows on it as it would on the system clock, and a call's whole stay can be read from it.
+/// With `lock_after_sleep` set, another process takes the state lock after every sleep and
+/// keeps it for that long of real time.
+struct RealRateClock {
+    start: Instant,
+    skipped: Mutex<f64>,
+    lock_after_sleep: Option<(Paths, Duration)>,
     holders: Mutex<Vec<std::thread::JoinHandle<()>>>,
 }
 
-impl Clock for LockingClock<'_> {
+impl RealRateClock {
+    fn new(lock_after_sleep: Option<(Paths, Duration)>) -> Self {
+        Self {
+            start: Instant::now(),
+            skipped: Mutex::new(0.0),
+            lock_after_sleep,
+            holders: Mutex::new(Vec::new()),
+        }
+    }
+
+    /// Let `secs` pass at once.
+    fn advance(&self, secs: f64) {
+        *self.skipped.lock().unwrap() += secs;
+    }
+
+    /// Wait for every lock holder started after a sleep to finish, and return how many there were.
+    fn join_holders(&self) -> usize {
+        let holders = std::mem::take(&mut *self.holders.lock().unwrap());
+        let n = holders.len();
+        holders.into_iter().for_each(|h| h.join().unwrap());
+        n
+    }
+}
+
+impl Clock for RealRateClock {
     fn now(&self) -> f64 {
-        self.inner.now()
+        T0 + self.start.elapsed().as_secs_f64() + *self.skipped.lock().unwrap()
     }
 
     fn sleep(&self, secs: f64) {
-        self.inner.advance_to(self.inner.now() + secs);
-        let holder = hold_lock(&self.paths, self.hold);
-        self.holders.lock().unwrap().push(holder);
+        self.advance(secs.max(0.0));
+        if let Some((paths, hold)) = &self.lock_after_sleep {
+            let holder = hold_lock(paths, *hold);
+            self.holders.lock().unwrap().push(holder);
+        }
+    }
+}
+
+/// A gh for [`RealRateClock`] tests. It counts its runs, takes `secs` of clock time, shows
+/// `stderr` to the scanner and exits 0. With `hold_after` set, another process takes the state
+/// lock just before it exits and keeps it for that long of real time.
+struct RateGh<'a> {
+    clock: &'a RealRateClock,
+    secs: f64,
+    stderr: &'static [u8],
+    hold_after: Option<(Paths, Duration)>,
+    runs: AtomicU64,
+    holders: Mutex<Vec<std::thread::JoinHandle<()>>>,
+}
+
+impl<'a> RateGh<'a> {
+    fn new(clock: &'a RealRateClock) -> Self {
+        Self {
+            clock,
+            secs: 0.0,
+            stderr: b"",
+            hold_after: None,
+            runs: AtomicU64::new(0),
+            holders: Mutex::new(Vec::new()),
+        }
+    }
+
+    fn runs(&self) -> u64 {
+        self.runs.load(Ordering::SeqCst)
+    }
+
+    fn join_holders(&self) -> usize {
+        let holders = std::mem::take(&mut *self.holders.lock().unwrap());
+        let n = holders.len();
+        holders.into_iter().for_each(|h| h.join().unwrap());
+        n
+    }
+}
+
+impl Runner for RateGh<'_> {
+    fn run(&self, _inv: Invocation<'_>, scanner: &mut Scanner) -> Result<Ran, RunError> {
+        self.runs.fetch_add(1, Ordering::SeqCst);
+        scanner.feed(self.stderr);
+        self.clock.advance(self.secs);
+        if let Some((paths, hold)) = &self.hold_after {
+            let holder = hold_lock(paths, *hold);
+            self.holders.lock().unwrap().push(holder);
+        }
+        Ok(Ran {
+            exit: Exit::Code(0),
+            deadline_hit: false,
+            late_signal: None,
+            cut_off: false,
+        })
+    }
+
+    fn capture(&self, inv: Invocation<'_>, _timeout: f64) -> Result<Captured, String> {
+        assert_eq!(inv.args, ["api", "rate_limit"]);
+        let now = self.clock.now();
+        Ok(rate_limit_answer(4500, now + HOUR, now))
     }
 }
 
@@ -1477,62 +1586,202 @@ fn hold_lock(paths: &Paths, hold: std::time::Duration) -> std::thread::JoinHandl
 
 /// A credential call waits for the state lock only within its bound: held by another process
 /// just as its token comes free, the lock is waited for only for what is left of the bound,
-/// not for GH_PACED_LOCK_WAIT, and git is told to quit.
+/// not for GH_PACED_LOCK_WAIT, and git is told to quit. Its whole stay, read from a clock that
+/// runs with real time, ends at the bound.
 #[test]
 fn credential_get_waits_for_the_state_lock_only_within_its_bound() {
     let dir = scratch("cred-lock");
-    let clock = FakeClock::new(T0);
-    let fake = FakeGh::new(&clock);
     let paths = Paths::new(dir.clone(), "replay");
     let cfg = Config {
         git_credential_max_wait_secs: 10.0,
         ..Config::default()
     };
     assert!(cfg.lock_wait_secs >= 30.0);
-    let (outcome, _, _) = gh_on(&clock, &fake, &dir, &cfg, &credential_get());
-    assert_eq!(outcome, Outcome::Exit(0));
-    // It sleeps 9.4 s for its token; the lock is then held for 3 s, and 0.6 s of its bound is
-    // left.
-    let locking = LockingClock {
-        inner: &clock,
-        paths: paths.clone(),
-        hold: std::time::Duration::from_secs(3),
-        holders: Mutex::new(Vec::new()),
-    };
-    let started = std::time::Instant::now();
-    let (outcome, messages, quit) = gh_on(&locking, &fake, &dir, &cfg, &credential_get());
-    let took = started.elapsed().as_secs_f64();
+    let clock = RealRateClock::new(Some((paths.clone(), Duration::from_secs(3))));
+    let gh = RateGh::new(&clock);
+    let (outcome, messages, _) = gh_on(&clock, &gh, &dir, &cfg, &credential_get());
+    assert_eq!(outcome, Outcome::Exit(0), "{messages:?}");
+    // The next call, 0.6 s later, sleeps about 9.4 s for its token; the lock is then held for
+    // 3 s, with 0.6 s of its bound left.
+    clock.advance(0.6);
+    let before = clock.now();
+    let real = Instant::now();
+    let (outcome, messages, quit) = gh_on(&clock, &gh, &dir, &cfg, &credential_get());
+    let took = real.elapsed().as_secs_f64();
+    let stayed = clock.now() - before;
     assert_eq!(outcome, Outcome::Exit(EXIT_INTERNAL), "{messages:?}");
     assert!(quit, "git is told to quit");
-    assert!((0.5..2.0).contains(&took), "waited {took} s for the lock");
+    assert!(
+        (0.55..0.6 + SLACK).contains(&took),
+        "waited {took} s for the lock"
+    );
+    assert!(
+        (10.0..10.0 + SLACK).contains(&stayed),
+        "stayed {stayed} s against a 10 s bound"
+    );
     let text = messages.join("\n");
     assert!(
         text.contains("GH_PACED_GIT_MAX_WAIT=10 s bound, which had 0.6 s left"),
         "{text}"
     );
-    assert_eq!(fake.runs().len(), 1, "gh did not run");
-    let holders = std::mem::take(&mut *locking.holders.lock().unwrap());
-    assert_eq!(holders.len(), 1);
-    holders.into_iter().for_each(|h| h.join().unwrap());
+    assert_eq!(gh.runs(), 1, "gh did not run");
+    assert_eq!(clock.join_holders(), 1);
     // Before any wait the lock gets the whole bound when that is shorter than
     // GH_PACED_LOCK_WAIT, and a bound of 0 is a single try.
-    for (bound, max_took) in [(0.3, 1.5), (0.0, 0.5)] {
+    let clock = RealRateClock::new(None);
+    let holder = hold_lock(&paths, Duration::from_millis(1500));
+    for bound in [0.3, 0.0] {
         let short = Config {
             git_credential_max_wait_secs: bound,
             ..Config::default()
         };
-        let holder = hold_lock(&paths, std::time::Duration::from_secs(2));
-        let started = std::time::Instant::now();
-        let (outcome, messages, quit) = gh_on(&clock, &fake, &dir, &short, &credential_get());
-        let took = started.elapsed().as_secs_f64();
+        let before = clock.now();
+        let real = Instant::now();
+        let (outcome, messages, quit) = gh_on(&clock, &gh, &dir, &short, &credential_get());
+        let took = real.elapsed().as_secs_f64();
+        let stayed = clock.now() - before;
         assert_eq!(outcome, Outcome::Exit(EXIT_INTERNAL), "{messages:?}");
         assert!(quit);
         assert!(
-            took >= bound && took < max_took,
+            (bound..bound + SLACK).contains(&took),
             "bound {bound}: waited {took} s"
         );
-        holder.join().unwrap();
+        assert!(
+            (bound..bound + SLACK).contains(&stayed),
+            "bound {bound}: stayed {stayed} s"
+        );
     }
+    holder.join().unwrap();
+    assert_eq!(gh.runs(), 1, "gh did not run");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A credential call that gets the state lock only after its bound has passed is refused before
+/// anything is charged, although it waited for nothing else: here another process holds the
+/// lock while the clock passes the bound (as a stopped holder or a stalled host would) and then
+/// lets it go. A call that waited for nothing at all is admitted, so a bound of 0 still runs a
+/// call whose token is there and whose lock is free.
+#[test]
+fn credential_get_that_gets_the_lock_past_its_bound_is_refused() {
+    let dir = scratch("cred-late-lock");
+    let paths = Paths::new(dir.clone(), "replay");
+    let clock = FakeClock::new(T0);
+    let fake = FakeGh::new(&clock);
+    let cfg = Config {
+        git_credential_max_wait_secs: 10.0,
+        ..Config::default()
+    };
+    let (held_tx, held_rx) = std::sync::mpsc::channel();
+    let (outcome, messages, quit) = std::thread::scope(|s| {
+        let (clock, paths) = (&clock, &paths);
+        let holder = s.spawn(move || {
+            let guard = state::lock_within(paths, 5.0).unwrap();
+            held_tx.send(()).unwrap();
+            // The call below is waiting for the lock by now, with its whole bound left.
+            std::thread::sleep(Duration::from_millis(500));
+            clock.advance_to(clock.now() + 11.0);
+            drop(guard);
+        });
+        held_rx.recv().unwrap();
+        let got = gh_on(clock, &fake, &dir, &cfg, &credential_get());
+        holder.join().unwrap();
+        got
+    });
+    assert_eq!(outcome, Outcome::Exit(EXIT_REFUSED), "{messages:?}");
+    assert!(quit, "git is told to quit");
+    assert!(fake.runs().is_empty(), "gh did not run");
+    let text = messages.join("\n");
+    assert!(
+        text.contains(
+            "`auth git-credential get` became admissible 11 s after it started, beyond \
+             GH_PACED_GIT_MAX_WAIT=10 s"
+        ),
+        "{text}"
+    );
+    // Its token was not charged: the next call runs at once.
+    let (outcome, messages, quit) = gh_on(&clock, &fake, &dir, &cfg, &credential_get());
+    assert_eq!(outcome, Outcome::Exit(0), "{messages:?}");
+    assert!(!quit);
+    assert!(clock.sleeps().is_empty(), "{:?}", clock.sleeps());
+    assert_eq!(fake.runs().len(), 1);
+    // A bound of 0, with real time passing on the clock: the call takes some time of its own,
+    // waits for nothing, and runs.
+    let dir0 = scratch("cred-zero-bound");
+    let clock = RealRateClock::new(None);
+    let gh = RateGh::new(&clock);
+    let zero = Config {
+        git_credential_max_wait_secs: 0.0,
+        ..Config::default()
+    };
+    let before = clock.now();
+    let (outcome, messages, quit) = gh_on(&clock, &gh, &dir0, &zero, &credential_get());
+    assert_eq!(outcome, Outcome::Exit(0), "{messages:?}");
+    assert!(!quit);
+    assert_eq!(gh.runs(), 1);
+    assert!(clock.now() > before, "time passed during the call");
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_dir_all(&dir0);
+}
+
+/// Bookkeeping after gh exits waits for a busy state lock only within what is left of a
+/// credential call's bound. gh's own exit status stands and git is not told to quit, since gh
+/// may already have answered. A READ in the same position still waits for the lock until it is
+/// free, within GH_PACED_LOCK_WAIT.
+#[test]
+fn credential_get_bookkeeping_after_gh_waits_only_within_its_bound() {
+    let dir = scratch("cred-finish-lock");
+    let paths = Paths::new(dir.clone(), "replay");
+    let cfg = Config {
+        git_credential_max_wait_secs: 10.0,
+        ..Config::default()
+    };
+    let clock = RealRateClock::new(None);
+    let busy = |clock| RateGh {
+        secs: 9.5,
+        hold_after: Some((paths.clone(), Duration::from_millis(1500))),
+        ..RateGh::new(clock)
+    };
+    let gh = busy(&clock);
+    let before = clock.now();
+    let real = Instant::now();
+    let (outcome, messages, quit) = gh_on(&clock, &gh, &dir, &cfg, &credential_get());
+    let took = real.elapsed().as_secs_f64();
+    let stayed = clock.now() - before;
+    assert_eq!(outcome, Outcome::Exit(0), "{messages:?}");
+    assert!(!quit, "gh ran");
+    assert_eq!(gh.runs(), 1);
+    assert!(
+        (0.45..0.5 + SLACK).contains(&took),
+        "waited {took} s for the lock"
+    );
+    assert!(
+        (10.0..10.0 + SLACK).contains(&stayed),
+        "stayed {stayed} s against a 10 s bound"
+    );
+    let text = messages.join("\n");
+    assert!(
+        text.contains("bookkeeping after gh exited failed"),
+        "{text}"
+    );
+    assert!(
+        text.contains("GH_PACED_GIT_MAX_WAIT=10 s bound, which had 0.5 s left"),
+        "{text}"
+    );
+    assert_eq!(gh.join_holders(), 1);
+    let gh = busy(&clock);
+    let real = Instant::now();
+    let (outcome, messages, quit) = gh_on(&clock, &gh, &dir, &cfg, &get_args(0));
+    let took = real.elapsed().as_secs_f64();
+    assert_eq!(outcome, Outcome::Exit(0), "{messages:?}");
+    assert!(!quit);
+    assert_eq!(gh.runs(), 1);
+    assert!(took >= 1.4, "waited {took} s for the lock: {messages:?}");
+    let text = messages.join("\n");
+    assert!(
+        !text.contains("bookkeeping after gh exited failed"),
+        "{text}"
+    );
+    assert_eq!(gh.join_holders(), 1);
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -1578,7 +1827,7 @@ struct PushbackGh<'a> {
 }
 
 impl Runner for PushbackGh<'_> {
-    fn run(&self, _inv: Invocation<'_>, scanner: &mut Scanner) -> Result<Ran, String> {
+    fn run(&self, _inv: Invocation<'_>, scanner: &mut Scanner) -> Result<Ran, RunError> {
         scanner.feed(
             b"HTTP 403: You have exceeded a secondary rate limit and have been temporarily \
               blocked\n",
@@ -1595,6 +1844,48 @@ impl Runner for PushbackGh<'_> {
 
     fn capture(&self, _inv: Invocation<'_>, _timeout: f64) -> Result<Captured, String> {
         unreachable!("a GIT_CREDENTIAL call never refreshes the rate-limit snapshot")
+    }
+}
+
+/// A gh whose run fails, before its program ran (`started` false) or after.
+struct FailingGh {
+    started: bool,
+}
+
+impl Runner for FailingGh {
+    fn run(&self, _inv: Invocation<'_>, _scanner: &mut Scanner) -> Result<Ran, RunError> {
+        Err(RunError {
+            message: "cannot run /fake/gh: Permission denied (os error 13)".to_string(),
+            started: self.started,
+        })
+    }
+
+    fn capture(&self, _inv: Invocation<'_>, _timeout: f64) -> Result<Captured, String> {
+        unreachable!("a GIT_CREDENTIAL call never refreshes the rate-limit snapshot")
+    }
+}
+
+/// A credential call whose gh could not be executed tells git to quit, as gh never answered; one
+/// that failed after gh started does not, since gh may already have answered.
+#[test]
+fn credential_get_quits_only_when_gh_never_ran() {
+    for started in [false, true] {
+        let dir = scratch(&format!("cred-exec-{started}"));
+        let clock = FakeClock::new(T0);
+        let (outcome, messages, quit) = gh_on(
+            &clock,
+            &FailingGh { started },
+            &dir,
+            &Config::default(),
+            &credential_get(),
+        );
+        assert_eq!(outcome, Outcome::Exit(EXIT_NO_GH), "{messages:?}");
+        assert_eq!(quit, !started, "started {started}: {messages:?}");
+        assert!(
+            messages.iter().any(|m| m.contains("cannot run /fake/gh")),
+            "{messages:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
 

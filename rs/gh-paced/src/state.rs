@@ -255,6 +255,12 @@ pub fn lock(paths: &Paths) -> Result<LockGuard, String> {
 /// Take the account's exclusive lock, waiting at most `wait_secs` for another process to
 /// release it, and fail with an error naming the lock file after that.
 pub fn lock_within(paths: &Paths, wait_secs: f64) -> Result<LockGuard, String> {
+    lock_within_noting(paths, wait_secs).map(|(guard, _)| guard)
+}
+
+/// [`lock_within`], also returning whether another process held the lock at the first try, so
+/// that this one waited for it (however briefly).
+pub fn lock_within_noting(paths: &Paths, wait_secs: f64) -> Result<(LockGuard, bool), String> {
     ensure_dir(&paths.dir)?;
     let file = OpenOptions::new()
         .read(true)
@@ -271,6 +277,7 @@ pub fn lock_within(paths: &Paths, wait_secs: f64) -> Result<LockGuard, String> {
     };
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs_f64(wait);
     let mut pause = std::time::Duration::from_millis(1);
+    let mut contended = false;
     loop {
         // SAFETY: flock on a valid, owned file descriptor.
         let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
@@ -281,6 +288,7 @@ pub fn lock_within(paths: &Paths, wait_secs: f64) -> Result<LockGuard, String> {
         match err.raw_os_error() {
             Some(libc::EINTR) => continue,
             Some(libc::EWOULDBLOCK) => {
+                contended = true;
                 let left = deadline.saturating_duration_since(std::time::Instant::now());
                 if left.is_zero() {
                     return Err(format!(
@@ -295,7 +303,7 @@ pub fn lock_within(paths: &Paths, wait_secs: f64) -> Result<LockGuard, String> {
             _ => return Err(format!("cannot lock {}: {err}", paths.lock().display())),
         }
     }
-    Ok(LockGuard { _file: file })
+    Ok((LockGuard { _file: file }, contended))
 }
 
 /// Result of loading state.

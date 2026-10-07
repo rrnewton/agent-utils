@@ -199,11 +199,22 @@ pub struct Captured {
     pub stderr_cut: bool,
 }
 
+/// Why [`Runner::run`] failed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunError {
+    /// What went wrong, for the caller to print.
+    pub message: String,
+    /// Whether gh had been started by then. False only when gh's program never ran (it could
+    /// not be executed), so it cannot have written anything; true for a failure after that,
+    /// such as one while waiting for gh to exit.
+    pub started: bool,
+}
+
 /// Something that can run gh. Tests substitute a fake.
 pub trait Runner: Send + Sync {
     /// Run interactively: stdout inherited (or teed, see [`Invocation::scan_stdout`]), stderr
     /// streamed to our stderr and fed to `scanner`.
-    fn run(&self, inv: Invocation<'_>, scanner: &mut Scanner) -> Result<Ran, String>;
+    fn run(&self, inv: Invocation<'_>, scanner: &mut Scanner) -> Result<Ran, RunError>;
     /// Run with stdout and stderr captured, killing the child after `timeout_secs`. Each stream
     /// keeps its first [`MAX_CAPTURE_BYTES`], and reports whether more followed.
     fn capture(&self, inv: Invocation<'_>, timeout_secs: f64) -> Result<Captured, String>;
@@ -935,7 +946,7 @@ fn feed_stdin(child: &mut std::process::Child, data: Option<Vec<u8>>) {
 }
 
 impl Runner for RealRunner {
-    fn run(&self, inv: Invocation<'_>, scanner: &mut Scanner) -> Result<Ran, String> {
+    fn run(&self, inv: Invocation<'_>, scanner: &mut Scanner) -> Result<Ran, RunError> {
         let shared = Arc::new(Mutex::new(std::mem::take(scanner)));
         let err_cap = capture_for(2);
         let out_cap = if inv.scan_stdout {
@@ -999,7 +1010,11 @@ impl Runner for RealRunner {
                 unsafe {
                     libc::pthread_sigmask(libc::SIG_SETMASK, &old, std::ptr::null_mut());
                 }
-                return Err(format!("cannot run {}: {e}", inv.program.display()));
+                // `spawn` also reports a failed exec in the child, so gh's program never ran.
+                return Err(RunError {
+                    message: format!("cannot run {}: {e}", inv.program.display()),
+                    started: false,
+                });
             }
         };
         CHILD_PID.store(i32::try_from(child.id()).unwrap_or(0), Ordering::SeqCst);
@@ -1041,8 +1056,10 @@ impl Runner for RealRunner {
             }
         }
         feed_stdin(&mut child, inv.stdin);
-        let status = wait_with_deadline(&mut child, inv.deadline_secs)
-            .map_err(|e| format!("waiting for {}: {e}", inv.program.display()));
+        let status = wait_with_deadline(&mut child, inv.deadline_secs).map_err(|e| RunError {
+            message: format!("waiting for {}: {e}", inv.program.display()),
+            started: true,
+        });
         CHILD_PID.store(0, Ordering::SeqCst);
         // Every reader stops on its own once gh has exited (see the module documentation); every
         // writer then delivers what was read, however long the consumer takes, unless a user
