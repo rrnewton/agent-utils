@@ -13353,9 +13353,12 @@ fn decode_document<T: for<'de> Deserialize<'de>>(bytes: &[u8]) -> Result<T> {
 }
 
 fn read_artifact_bytes(path: &Path, maximum: usize) -> Result<Vec<u8>> {
+    // O_NONBLOCK: a pipe left where a record belongs is rejected by the type check below
+    // instead of blocking the open, which can run under the state lock. It changes nothing for a
+    // regular file.
     let mut file = fs::OpenOptions::new()
         .read(true)
-        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
+        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK)
         .open(path)?;
     let metadata = file.metadata()?;
     if !metadata.file_type().is_file()
@@ -28324,6 +28327,36 @@ a fence ```sh here, ~~~~ there, and one ``\u{200b}` hidden"
         // A corrupt record is unreadable evidence, not a clean bill.
         assert_eq!(unreadable.0, "unreadable");
         assert_eq!(unreadable.1, "unreadable");
+    }
+
+    #[test]
+    fn a_pipe_at_the_credential_record_is_unreadable_evidence_without_blocking_status() {
+        let directory = temporary("credential-record-pipe-dir");
+        let (root, state) =
+            state_with_credential("credential-record-pipe", &directory.join("gone.pem"));
+        let record = root.join(CREDENTIAL_RECORD_FILE);
+        let path = std::ffi::CString::new(record.as_os_str().as_encoded_bytes()).expect("path");
+        // SAFETY: `path` is a valid NUL-terminated path; mkfifo only creates the node.
+        assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0, "mkfifo");
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let reader = state.clone();
+        std::thread::spawn(move || {
+            let status = reader.status().map(|status| {
+                (
+                    status["credentials"]["evidence"].clone(),
+                    status["delivery_alarm"]["credential_evidence"].clone(),
+                )
+            });
+            let _ = sender.send(status.map_err(|error| error.to_string()));
+        });
+        let answered = receiver.recv_timeout(Duration::from_secs(30));
+        fs::remove_dir_all(root).expect("cleanup");
+        fs::remove_dir_all(directory).expect("cleanup");
+        let (evidence, alarm_evidence) = answered
+            .expect("status returns instead of blocking on the pipe")
+            .expect("status");
+        assert_eq!(evidence, "unreadable");
+        assert_eq!(alarm_evidence, "unreadable");
     }
 
     #[test]
