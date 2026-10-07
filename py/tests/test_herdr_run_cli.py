@@ -438,7 +438,11 @@ def test_documentation_prints_even_when_the_configuration_cannot_be_parsed(
 
 def test_check_allows_an_allowlisted_command(
     capsys: pytest.CaptureFixture[str],
+    tmp_path: object,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    # The built-in policy alone: a project file above the checkout must not decide the result.
+    monkeypatch.chdir(str(tmp_path))
     assert main(["check", "with-proxy git ls-remote origin main"]) == 0
     out = capsys.readouterr().out
     assert "ALLOWED" in out
@@ -447,7 +451,11 @@ def test_check_allows_an_allowlisted_command(
 
 def test_check_refuses_a_non_allowlisted_command(
     capsys: pytest.CaptureFixture[str],
+    tmp_path: object,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    # The built-in policy alone: an enclosing project that allows curl must not decide the result.
+    monkeypatch.chdir(str(tmp_path))
     assert main(["check", "curl https://evil.example"]) == EXIT_REFUSED
     assert "REFUSED" in capsys.readouterr().err
 
