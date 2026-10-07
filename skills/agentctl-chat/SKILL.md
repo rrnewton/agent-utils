@@ -77,8 +77,8 @@ owner or the deployment's notes give.
   it against your composer, printed or queued behind another prompt. Adding it
   can fail or lag like any provider call, so a missing ✅ does not prove the
   prompt was not delivered. An older deployment whose acknowledgement reaction
-  is itself ✅ shows it at admission instead, before the prompt reaches you,
-  and adds no separate receipt.
+  is itself ✅ uses it to acknowledge admission instead; it can appear before
+  or after the prompt reaches you, and no separate delivery receipt is added.
 - Each prompt's first line opens with the message's own send time, as
   `Sent 2026.10.07:08:45 EDT.`, and says `delivered 1 h 12 min later` when it
   reached you two minutes or more after that. Several held messages can arrive
