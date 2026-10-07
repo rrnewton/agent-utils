@@ -777,13 +777,22 @@ pub fn submit_verified(
     let mut next_press = runtime.monotonic().saturating_add(wait);
     let submit_deadline = runtime.monotonic().saturating_add(timeouts.submit);
     let mut left_composer = false;
+    // A read taken while waiting for printed evidence that showed the prompt staged again. It is
+    // handled next as if this loop had just read it, so its bookkeeping, the deadline and the key
+    // schedule all apply to it.
+    let mut carried: Option<String> = None;
     'submitting: loop {
-        runtime.sleep(POLL);
-        if runtime.cancelled() {
-            return cancelled_after_typing();
-        }
+        let screen = match carried.take() {
+            Some(screen) => screen,
+            None => {
+                runtime.sleep(POLL);
+                if runtime.cancelled() {
+                    return cancelled_after_typing();
+                }
+                terminal.read_screen(pane_id)?
+            }
+        };
         let now = runtime.monotonic();
-        let screen = terminal.read_screen(pane_id)?;
         let current = composer_view(harness, &screen);
         match current {
             Some(current) if staged(&current, text, placeholders_before) => {
@@ -836,16 +845,20 @@ pub fn submit_verified(
                             break;
                         };
                         let read_at = runtime.monotonic();
-                        observed = match composer_view(harness, &screen) {
-                            // The prompt is staged again: the empty composer that seemed to prove
-                            // the submission was a transient redraw, and the key may have been
-                            // dropped. Without printed evidence nothing is proved, so the staged
-                            // path resumes, pressing the key again on its schedule.
-                            Some(view) if staged(&view, text, placeholders_before) => {
-                                continue 'submitting;
-                            }
-                            view => view.map(|view| (view, screen, read_at)),
-                        };
+                        let view = composer_view(harness, &screen);
+                        // The prompt is staged again: the empty composer that seemed to prove the
+                        // submission was a transient redraw, and the key may have been dropped.
+                        // Without printed evidence nothing is proved, so this read goes back to
+                        // the staged path, which notes what it shows, keeps the deadline, and
+                        // presses the key again on its schedule.
+                        if view
+                            .as_ref()
+                            .is_some_and(|view| staged(view, text, placeholders_before))
+                        {
+                            carried = Some(screen);
+                            continue 'submitting;
+                        }
+                        observed = view.map(|view| (view, screen, read_at));
                     }
                     return Ok(Submission::Verified(receipt));
                 }
@@ -2293,6 +2306,82 @@ mod tests {
             other => panic!("expected the prompt to be reported as not submitted, got {other:?}"),
         }
         assert!(frames.keys.lock().unwrap().len() > 1);
+    }
+
+    #[test]
+    fn redraws_alternating_with_the_staged_prompt_keep_the_key_schedule_and_the_deadline() {
+        // The key was dropped, and the pane alternates between an empty-looking redraw and the
+        // staged prompt. Each staged read goes through the staged path, so the key is pressed
+        // again on its schedule and the prompt is reported as not submitted at the deadline.
+        let busy = claude_screen(&["• earlier"], "", BUSY_STATUS);
+        let staged = claude_screen(&["• earlier"], "run the tests", BUSY_STATUS);
+        let after = (0..4_000)
+            .map(|read| {
+                if read % 2 == 0 {
+                    busy.clone()
+                } else {
+                    staged.clone()
+                }
+            })
+            .collect();
+        let frames = Frames::new(busy.clone(), staged.clone(), after);
+        let clock = Clock::default();
+        let started = clock.monotonic();
+        let outcome = submit_verified(
+            &frames,
+            "w1:p1",
+            "claude",
+            "run the tests",
+            SubmitTimeouts::default(),
+            &clock,
+        );
+        match outcome {
+            Err(error) => assert!(
+                error.to_string().contains("it was NOT submitted"),
+                "{error}"
+            ),
+            other => panic!("expected the prompt to be reported as not submitted, got {other:?}"),
+        }
+        assert!(frames.keys.lock().unwrap().len() > 2);
+        assert!(clock.monotonic() - started <= SubmitTimeouts::default().submit + PRINT_GRACE);
+    }
+
+    #[test]
+    fn a_row_first_seen_while_the_prompt_was_staged_again_is_not_printed_evidence() {
+        // After a dropped key: an empty-looking redraw, then the prompt staged again with an
+        // older identical row newly visible above it, then an empty-looking redraw with that same
+        // row. The row was seen while the prompt was staged, so it proves nothing.
+        let row = "❯ run the tests";
+        let busy = claude_screen(&["• earlier"], "", BUSY_STATUS);
+        let staged = claude_screen(&["• earlier"], "run the tests", BUSY_STATUS);
+        let staged_with_row = claude_screen(&["• earlier", row], "run the tests", BUSY_STATUS);
+        let busy_with_row = claude_screen(&["• earlier", row], "", BUSY_STATUS);
+        let frames = Frames::new(
+            busy.clone(),
+            staged,
+            vec![
+                busy,
+                staged_with_row.clone(),
+                busy_with_row,
+                staged_with_row,
+            ],
+        );
+        let clock = Clock::default();
+        let outcome = submit_verified(
+            &frames,
+            "w1:p1",
+            "claude",
+            "run the tests",
+            SubmitTimeouts::default(),
+            &clock,
+        );
+        match outcome {
+            Err(error) => assert!(
+                error.to_string().contains("it was NOT submitted"),
+                "{error}"
+            ),
+            other => panic!("expected the prompt to be reported as not submitted, got {other:?}"),
+        }
     }
 
     #[test]
