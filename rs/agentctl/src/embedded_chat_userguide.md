@@ -1338,11 +1338,17 @@ every 100 milliseconds for up to 2 more seconds, pressing no other key, for
 printed evidence. If one of those reads shows the prompt in the composer again,
 the empty composer was a passing redraw and nothing is proved: the queue goes
 back to pressing the key on its schedule, and reports the prompt as not
-submitted if it is still there at the deadline. Otherwise, either way the prompt is recorded as typed and earns ✅: the
-queue typed it only into a composer it recognised as empty and ready, so a
-prompt that then left that composer was submitted, or queued by the agent. A
-busy Claude Code that already holds a queued prompt shows nothing of the next
-one it queues, so such a prompt has no printed evidence; it still earns ✅.
+submitted if it is still there at the deadline. Otherwise the prompt is recorded
+as typed either way. It earns ✅ with printed evidence, or without it once the
+whole 2-second wait has passed with its last read showing a recognisable
+composer without the prompt: the queue typed it only into a composer it
+recognised as empty and ready, so a prompt that left that composer and stayed
+out of it was submitted, or queued by the agent. A busy Claude Code that already
+holds a queued prompt shows nothing of the next one it queues, so such a prompt
+has no printed evidence; it still earns ✅. A wait cut short, because the service
+is stopping or a read of the pane failed, or one that ends on a screen with no
+recognisable composer, earns none, since nothing then showed that the prompt
+did not come back.
 Only a submission checked against the Claude Code or Codex composer, as
 described here, is verified this way. Any other
 submission is recorded as typed once the pane's own confirmation succeeds:

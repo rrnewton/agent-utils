@@ -87,6 +87,12 @@ pub struct SubmissionReceipt {
     /// that no screen read before the key showed. A running-turn marker that was already
     /// showing, as it always is on a busy agent, proves only that the prompt left the composer.
     pub printed: bool,
+    /// Whether the evidence held: the wait for printed evidence ran its full course and its last
+    /// read showed a recognisable composer without the prompt, or printed evidence was found.
+    /// False when the wait ended early, because the caller stopped or a read failed, or ended on
+    /// a screen with no recognisable composer: then nothing showed that the prompt did not come
+    /// back into the composer after a key the agent dropped.
+    pub settled: bool,
 }
 
 /// How a prompt submission was established.
@@ -783,7 +789,12 @@ pub fn submit_verified(
     let mut carried: Option<String> = None;
     'submitting: loop {
         let screen = match carried.take() {
-            Some(screen) => screen,
+            Some(screen) => {
+                if runtime.cancelled() {
+                    return cancelled_after_typing();
+                }
+                screen
+            }
             None => {
                 runtime.sleep(POLL);
                 if runtime.cancelled() {
@@ -824,20 +835,28 @@ pub fn submit_verified(
                         elapsed: now.saturating_sub(started),
                         evidence,
                         printed: false,
+                        settled: false,
                     };
                     // No key is sent from here on: the prompt has left the composer.
                     let grace_deadline = now.saturating_add(PRINT_GRACE);
                     let mut observed = Some((current, screen, now));
+                    // Whether the last read showed a recognisable composer without the prompt.
+                    let mut clear = true;
                     loop {
                         if let Some((view, screen, read_at)) = &observed {
                             if let Some(evidence) = printed(view, screen, &shown) {
                                 receipt.elapsed = read_at.saturating_sub(started);
                                 receipt.evidence = evidence;
                                 receipt.printed = true;
+                                receipt.settled = true;
                                 break;
                             }
                         }
-                        if runtime.monotonic() >= grace_deadline || runtime.cancelled() {
+                        if runtime.cancelled() {
+                            break;
+                        }
+                        if runtime.monotonic() >= grace_deadline {
+                            receipt.settled = clear;
                             break;
                         }
                         runtime.sleep(POLL);
@@ -858,6 +877,7 @@ pub fn submit_verified(
                             carried = Some(screen);
                             continue 'submitting;
                         }
+                        clear = view.is_some();
                         observed = view.map(|view| (view, screen, read_at));
                     }
                     return Ok(Submission::Verified(receipt));
@@ -2306,6 +2326,71 @@ mod tests {
             other => panic!("expected the prompt to be reported as not submitted, got {other:?}"),
         }
         assert!(frames.keys.lock().unwrap().len() > 1);
+    }
+
+    #[test]
+    fn a_weak_verification_settles_only_when_the_whole_wait_shows_the_composer_clear() {
+        let busy = claude_screen(&["• earlier"], "", BUSY_STATUS);
+        let staged = claude_screen(&["• earlier"], "run the tests", BUSY_STATUS);
+        // The whole wait shows the composer clear: settled.
+        let frames = Frames::new(busy.clone(), staged.clone(), vec![busy.clone()]);
+        let (held, _) = submit_frames(&frames, "run the tests");
+        assert!(!held.printed && held.settled, "{held:?}");
+        // The wait ends on a screen with no recognisable composer: not settled.
+        let frames = Frames::new(
+            busy.clone(),
+            staged.clone(),
+            vec![
+                busy.clone(),
+                "Replace goal?\n  › 1. Replace\n  2. Cancel\n".to_owned(),
+            ],
+        );
+        let (held, _) = submit_frames(&frames, "run the tests");
+        assert!(!held.printed && !held.settled, "{held:?}");
+        // Stopped during the wait, before the prompt could be seen back in the composer: not
+        // settled.
+        let frames = Frames::new(busy.clone(), staged, vec![busy.clone(), busy]);
+        let runtime = StoppingClock {
+            clock: Clock::default(),
+            stop_after: Duration::from_millis(150),
+        };
+        let held = receipt(submit_verified(
+            &frames,
+            "w1:p1",
+            "claude",
+            "run the tests",
+            SubmitTimeouts::default(),
+            &runtime,
+        ));
+        assert!(!held.printed && !held.settled, "{held:?}");
+    }
+
+    #[test]
+    fn a_stop_before_a_carried_staged_read_sends_no_further_key() {
+        // Empty-looking redraws from 100 to 400 ms, a stop at 500 ms, and the prompt staged
+        // again on the read at 500 ms: that read is not handled, so the scheduled second key is
+        // never sent.
+        let busy = claude_screen(&["• earlier"], "", BUSY_STATUS);
+        let staged = claude_screen(&["• earlier"], "run the tests", BUSY_STATUS);
+        let frames = Frames::new(
+            busy.clone(),
+            staged.clone(),
+            vec![busy.clone(), busy.clone(), busy.clone(), busy, staged],
+        );
+        let runtime = StoppingClock {
+            clock: Clock::default(),
+            stop_after: Duration::from_millis(450),
+        };
+        let outcome = submit_verified(
+            &frames,
+            "w1:p1",
+            "claude",
+            "run the tests",
+            SubmitTimeouts::default(),
+            &runtime,
+        );
+        assert!(outcome.is_err(), "{outcome:?}");
+        assert_eq!(*frames.keys.lock().unwrap(), ["Enter"]);
     }
 
     #[test]
