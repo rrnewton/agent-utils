@@ -267,6 +267,8 @@ pub fn lock_within_noting(paths: &Paths, wait_secs: f64) -> Result<(LockGuard, b
 /// [`lock_within_noting`], also giving up once `left`, asked after every failed try, returns
 /// no more than 0 seconds. A caller whose own deadline was fixed before this function started
 /// passes it here, so that time passing in between (a stall, a suspend) still counts against it.
+/// `wait_secs` itself is measured on `std::time::Instant`, as [`lock_within`] always measured
+/// it; only `left` decides whether time the machine spends suspended counts.
 pub fn lock_within_noting_until(
     paths: &Paths,
     wait_secs: f64,
@@ -286,8 +288,7 @@ pub fn lock_within_noting_until(
     } else {
         LOCK_WAIT_SECS
     };
-    // Measured on CLOCK_BOOTTIME, so time the machine spends suspended counts against the bound.
-    let deadline = crate::clock::boottime() + wait;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs_f64(wait);
     let mut pause = std::time::Duration::from_millis(1);
     let mut contended = false;
     loop {
@@ -301,7 +302,10 @@ pub fn lock_within_noting_until(
             Some(libc::EINTR) => continue,
             Some(libc::EWOULDBLOCK) => {
                 contended = true;
-                let left = (deadline - crate::clock::boottime()).min(left());
+                let left = deadline
+                    .saturating_duration_since(std::time::Instant::now())
+                    .as_secs_f64()
+                    .min(left());
                 if left <= 0.0 {
                     return Err(format!(
                         "{} is still held by another gh-paced process after {wait} s; that \
