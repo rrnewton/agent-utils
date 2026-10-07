@@ -249,7 +249,8 @@ fn read_bounded(path: &Path) -> FileRead {
     match file.metadata() {
         Ok(metadata) if !metadata.is_file() => return FileRead::NotAFile,
         Ok(_) => {}
-        Err(_) => return FileRead::Unreadable,
+        // Opened, but its type is unknown: not confirmed to be a credential file.
+        Err(_) => return FileRead::Inaccessible,
     }
     let mut contents = Vec::new();
     match file

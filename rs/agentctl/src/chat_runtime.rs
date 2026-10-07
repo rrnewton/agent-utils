@@ -2342,6 +2342,28 @@ fn next_failure(
     }
 }
 
+/// How far `chat status` can trust the saved credential record `record`, read before
+/// `checked_at_millis`: `none` before the service has saved one, `unreadable` when it cannot be
+/// read, `untrusted` when it is timed later than `checked_at_millis` (a clock set back), `stale`
+/// when older than [`CREDENTIAL_RECORD_STALE_AFTER`], and otherwise `current`.
+fn credential_evidence(
+    record: &Result<Option<CredentialRecord>>,
+    checked_at_millis: u64,
+) -> &'static str {
+    match record {
+        Ok(None) => "none",
+        Err(_) => "unreadable",
+        Ok(Some(record)) if record.observed_at_millis > checked_at_millis => "untrusted",
+        Ok(Some(record))
+            if u128::from(checked_at_millis - record.observed_at_millis)
+                > CREDENTIAL_RECORD_STALE_AFTER.as_millis() =>
+        {
+            "stale"
+        }
+        Ok(Some(_)) => "current",
+    }
+}
+
 /// The credential files named by the plugin and helper environment as the running `chat run`
 /// last observed them, saved as `provider-credentials.json` in the state directory so that
 /// `chat status`, which may run without the service's environment, reports them. It holds no
@@ -5447,19 +5469,9 @@ impl BridgeState {
         // The credential files as the running service saw them: this process may not have the
         // service's environment. `evidence` says how far that record can be trusted.
         let credential_record = self.read_credential_record();
-        let credential_evidence = match &credential_record {
-            Ok(None) => "none",
-            Err(_) => "unreadable",
-            // Observed later than now, as after the clock was set back: its age is unknown.
-            Ok(Some(record)) if record.observed_at_millis > now_millis => "untrusted",
-            Ok(Some(record))
-                if u128::from(now_millis.saturating_sub(record.observed_at_millis))
-                    > CREDENTIAL_RECORD_STALE_AFTER.as_millis() =>
-            {
-                "stale"
-            }
-            Ok(Some(_)) => "current",
-        };
+        // Freshness is judged against a time read after the record, so a refresh the service
+        // saves while this status is being assembled is not mistaken for a future observation.
+        let credential_evidence = credential_evidence(&credential_record, unix_millis());
         let credential_record = credential_record.ok().flatten();
         let credential_files = credential_record
             .as_ref()
@@ -28312,6 +28324,38 @@ a fence ```sh here, ~~~~ there, and one ``\u{200b}` hidden"
         // A corrupt record is unreadable evidence, not a clean bill.
         assert_eq!(unreadable.0, "unreadable");
         assert_eq!(unreadable.1, "unreadable");
+    }
+
+    #[test]
+    fn credential_evidence_judges_freshness_against_the_time_after_reading() {
+        let record = |observed_at_millis| -> Result<Option<CredentialRecord>> {
+            Ok(Some(CredentialRecord {
+                schema: CREDENTIAL_RECORD_SCHEMA.to_owned(),
+                observed_at_millis,
+                files: Vec::new(),
+            }))
+        };
+        let checked = 1_800_000_000_000;
+        let stale_after = CREDENTIAL_RECORD_STALE_AFTER.as_millis() as u64;
+        // A refresh saved just before the check, after an earlier clock sample, is current.
+        assert_eq!(credential_evidence(&record(checked), checked), "current");
+        assert_eq!(
+            credential_evidence(&record(checked - stale_after), checked),
+            "current"
+        );
+        assert_eq!(
+            credential_evidence(&record(checked - stale_after - 1), checked),
+            "stale"
+        );
+        assert_eq!(
+            credential_evidence(&record(checked + 1), checked),
+            "untrusted"
+        );
+        assert_eq!(credential_evidence(&Ok(None), checked), "none");
+        assert_eq!(
+            credential_evidence(&Err(ChatRuntimeError::invalid("corrupt")), checked),
+            "unreadable"
+        );
     }
 
     #[test]
