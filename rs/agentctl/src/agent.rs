@@ -665,12 +665,25 @@ fn enqueue_internal(
             "message id already exists: {identifier}"
         )));
     }
-    let document = json!({
-        "id": identifier,
-        "text": text,
-        "queued_at": unix_seconds(),
-        "delivery_attempts": 0,
-    });
+    // A chat request prompt names its message's create time, so the drain can open its first
+    // line with the delay as of typing; the stored text stays printable. See `prompt_time`.
+    let document = match crate::prompt_time::queue_deferred(text, crate::prompt_time::now_millis())
+    {
+        Some(queued) => json!({
+            "id": identifier,
+            "text": queued.text,
+            "sent_at": queued.sent_at,
+            "opening_bytes": queued.opening_bytes,
+            "queued_at": unix_seconds(),
+            "delivery_attempts": 0,
+        }),
+        None => json!({
+            "id": identifier,
+            "text": text,
+            "queued_at": unix_seconds(),
+            "delivery_attempts": 0,
+        }),
+    };
     atomic_json_create(&path, &document).map_err(|error| {
         if error.kind() == io::ErrorKind::AlreadyExists {
             AgentError::delivery(format!("message id already exists: {identifier}"))
@@ -828,7 +841,7 @@ fn drain_with_runtime_binding<A: AgentApi + ?Sized>(
         match deliver_one(
             client,
             &info,
-            &message_text(&document)?,
+            &typed_text(&document)?,
             options.working_timeout,
             runtime,
         ) {
@@ -2350,6 +2363,25 @@ fn delivery_attempts(document: &Map<String, Value>, path: &Path) -> AgentResult<
     }
 }
 
+/// The text a drain types for a queued message: its stored text, except that a chat request prompt
+/// that recorded its message's create time gets its opening decided now. See `prompt_time`.
+fn typed_text(document: &Map<String, Value>) -> AgentResult<String> {
+    let text = message_text(document)?;
+    let retimed = document
+        .get("sent_at")
+        .and_then(Value::as_str)
+        .zip(
+            document
+                .get("opening_bytes")
+                .and_then(Value::as_u64)
+                .and_then(|bytes| usize::try_from(bytes).ok()),
+        )
+        .and_then(|(sent_at, bytes)| {
+            crate::prompt_time::retime(&text, sent_at, bytes, crate::prompt_time::now_millis())
+        });
+    Ok(retimed.unwrap_or(text))
+}
+
 fn message_text(document: &Map<String, Value>) -> AgentResult<String> {
     document
         .get("text")
@@ -3740,6 +3772,30 @@ mod tests {
                 .unwrap()
                 .is_empty());
         }
+    }
+
+    #[test]
+    fn a_chat_prompt_waiting_in_the_queue_says_how_late_it_is_when_typed() {
+        // Queued 30 seconds after its message was written, at 2026-10-07T12:45:00Z, and typed
+        // an hour and twelve minutes after it, once the busy coordinator became ready.
+        let directory = TestDirectory::new("retimed");
+        crate::prompt_time::test_clock::set(1_791_377_130_000, -4 * 3_600, "EDT");
+        let marked = crate::prompt_time::deferred("2026-10-07T12:45:00Z", "The user's request.");
+        let identifier = enqueue(directory.path(), &marked, Some("chat-retimed")).unwrap();
+        let queued = read_json(&directory.path().join(format!("inbox/{identifier}.json"))).unwrap();
+        assert_eq!(
+            queued["text"],
+            "Sent 2026.10.07:08:45 EDT. The user's request."
+        );
+        assert_eq!(queued["sent_at"], "2026-10-07T12:45:00Z");
+        crate::prompt_time::test_clock::set(1_791_381_420_000, -4 * 3_600, "EDT");
+        let fake = FakeAgent::new(&["idle"]);
+        let result = drain(&fake, &target(), directory.path(), DrainOptions::default()).unwrap();
+        assert_eq!(result.delivered, [identifier]);
+        assert_eq!(
+            fake.runs(),
+            ["Sent 2026.10.07:08:45 EDT, delivered 1 h 12 min later. The user's request."]
+        );
     }
 
     #[test]
