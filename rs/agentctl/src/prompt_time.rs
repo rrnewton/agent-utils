@@ -33,9 +33,12 @@ pub(crate) fn opening(created_at: &str, now_millis: u64) -> String {
         return String::new();
     };
     let stamp = stamp(created.seconds, zone_at(created.seconds));
-    // Exact, fraction included, so a message 119.5 seconds old is not called late.
+    // Exact, fraction included, so a message 119.5 seconds old is not called late; a fraction
+    // finer than a nanosecond counts as one more, so a message is never made older than it is.
     let waited_nanos = i128::from(now_millis) * 1_000_000
-        - (i128::from(created.seconds) * 1_000_000_000 + i128::from(created.nanos));
+        - (i128::from(created.seconds) * 1_000_000_000
+            + i128::from(created.nanos)
+            + i128::from(created.finer));
     if waited_nanos >= i128::from(LATE_PROMPT_AFTER.as_secs()) * 1_000_000_000 {
         let waited = u64::try_from(waited_nanos / 1_000_000_000).unwrap_or(u64::MAX);
         format!("Sent {stamp}, delivered {} later. ", duration_words(waited))
@@ -55,12 +58,12 @@ pub(crate) fn deferred(created_at: &str, rest: &str) -> String {
 }
 
 /// What the queue stores for a [`deferred`] prompt: the text it keeps, opening included, and the
-/// create time and opening length it records beside it.
+/// create time and the exact opening it records beside it.
 #[derive(Debug, Eq, PartialEq)]
 pub(crate) struct QueuedOpening {
     pub(crate) text: String,
     pub(crate) sent_at: String,
-    pub(crate) opening_bytes: usize,
+    pub(crate) opening: String,
 }
 
 /// The queued form of `text` when it is a [`deferred`] prompt with a readable create time, opened
@@ -70,26 +73,22 @@ pub(crate) fn queue_deferred(text: &str, now_millis: u64) -> Option<QueuedOpenin
     rfc3339_instant(sent_at)?;
     let opening = opening(sent_at, now_millis);
     Some(QueuedOpening {
-        opening_bytes: opening.len(),
         text: format!("{opening}{rest}"),
         sent_at: sent_at.to_owned(),
+        opening,
     })
 }
 
-/// The text to type for a queued prompt that recorded `sent_at` and `opening_bytes`: its opening
-/// replaced by one for `now_millis`. `None` when the record does not fit the text, which is then
-/// typed as stored.
-pub(crate) fn retime(
-    text: &str,
-    sent_at: &str,
-    opening_bytes: usize,
-    now_millis: u64,
-) -> Option<String> {
+/// The text to type for a queued prompt that recorded `sent_at` and `opening`: that opening
+/// replaced by one for `now_millis`. `None` when the text does not begin with exactly that
+/// opening, or `sent_at` cannot be read; the text is then typed as stored, never cut.
+pub(crate) fn retime(text: &str, sent_at: &str, opening: &str, now_millis: u64) -> Option<String> {
     rfc3339_instant(sent_at)?;
-    let rest = text.get(opening_bytes..)?;
-    text[..opening_bytes]
-        .starts_with("Sent ")
-        .then(|| format!("{}{rest}", opening(sent_at, now_millis)))
+    if !opening.starts_with("Sent ") {
+        return None;
+    }
+    let rest = text.strip_prefix(opening)?;
+    Some(format!("{}{rest}", self::opening(sent_at, now_millis)))
 }
 
 /// The wall clock a prompt is rendered against.
@@ -190,17 +189,19 @@ fn duration_words(seconds: u64) -> String {
     }
 }
 
-/// An instant: whole seconds since the Unix epoch, and nanoseconds past them.
+/// An instant: whole seconds since the Unix epoch, nanoseconds past them, and whether the
+/// timestamp had a nonzero fraction finer than a nanosecond.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct Instant {
     pub(crate) seconds: i64,
     pub(crate) nanos: u32,
+    pub(crate) finer: bool,
 }
 
 /// The instant an RFC 3339 timestamp names, `2026-10-07T12:45:00Z` or with a fraction or a
-/// `+hh:mm`/`-hh:mm` offset; `None` for anything else. A fraction finer than a nanosecond is
-/// rounded up, so a message is never made older than it is. A leap second reads as the last
-/// instant of the second before it.
+/// `+hh:mm`/`-hh:mm` offset; `None` for anything else. Digits finer than a nanosecond are not
+/// rounded into the others, which would change the second and so the minute shown; `finer` says
+/// they were there. A leap second reads as the last nanosecond of the second before it.
 pub(crate) fn rfc3339_instant(value: &str) -> Option<Instant> {
     let bytes = value.as_bytes();
     let number = |range: std::ops::Range<usize>| -> Option<i64> {
@@ -230,6 +231,7 @@ pub(crate) fn rfc3339_instant(value: &str) -> Option<Instant> {
     }
     let mut zone = 19;
     let mut nanos: u32 = 0;
+    let mut finer = false;
     if bytes.get(zone) == Some(&b'.') {
         zone += 1;
         let start = zone;
@@ -240,7 +242,6 @@ pub(crate) fn rfc3339_instant(value: &str) -> Option<Instant> {
             return None;
         }
         let mut scale = 100_000_000;
-        let mut finer = false;
         for &digit in &bytes[start..zone] {
             if scale == 0 {
                 finer |= digit != b'0';
@@ -249,7 +250,6 @@ pub(crate) fn rfc3339_instant(value: &str) -> Option<Instant> {
                 scale /= 10;
             }
         }
-        nanos += u32::from(finer);
     }
     let offset = match bytes.get(zone) {
         Some(b'Z' | b'z') if zone + 1 == bytes.len() => 0,
@@ -269,19 +269,17 @@ pub(crate) fn rfc3339_instant(value: &str) -> Option<Instant> {
         }
         _ => return None,
     };
-    let (second, nanos) = if second == 60 {
-        (59, 999_999_999)
+    let (second, nanos, finer) = if second == 60 {
+        (59, 999_999_999, false)
     } else {
-        (second, nanos)
+        (second, nanos, finer)
     };
     let local = days_from_civil(year, month, day) * 86_400 + hour * 3_600 + minute * 60 + second;
-    // A fraction rounded up to a whole second carries into the next one.
-    let (seconds, nanos) = if nanos == 1_000_000_000 {
-        (local - offset + 1, 0)
-    } else {
-        (local - offset, nanos)
-    };
-    Some(Instant { seconds, nanos })
+    Some(Instant {
+        seconds: local - offset,
+        nanos,
+        finer,
+    })
 }
 
 fn days_in_month(year: i64, month: i64) -> i64 {
@@ -376,29 +374,33 @@ mod tests {
             rfc3339_instant("2026-10-07t12:45:00.123456z"),
             Some(Instant {
                 seconds: MORNING,
-                nanos: 123_456_000
+                nanos: 123_456_000,
+                finer: false
             })
         );
-        // Finer than a nanosecond rounds up, carrying into the next second when it must.
+        // Digits finer than a nanosecond are noted, never carried into the second.
         assert_eq!(
             rfc3339_instant("2026-10-07T12:45:00.0000000001Z"),
             Some(Instant {
                 seconds: MORNING,
-                nanos: 1
+                nanos: 0,
+                finer: true
             })
         );
         assert_eq!(
             rfc3339_instant("2026-10-07T12:44:59.9999999999Z"),
             Some(Instant {
-                seconds: MORNING,
-                nanos: 0
+                seconds: MORNING - 1,
+                nanos: 999_999_999,
+                finer: true
             })
         );
         assert_eq!(
             rfc3339_instant("2016-12-31T23:59:60Z"),
             Some(Instant {
                 seconds: 1_483_228_799,
-                nanos: 999_999_999
+                nanos: 999_999_999,
+                finer: false
             })
         );
     }
@@ -467,6 +469,20 @@ mod tests {
     }
 
     #[test]
+    fn a_sub_nanosecond_fraction_never_changes_the_minute_shown() {
+        test_clock::set(at(MORNING), EDT, "EDT");
+        assert_eq!(
+            opening("2026-10-07T12:44:59.9999999999Z", at(MORNING)),
+            "Sent 2026.10.07:08:44 EDT. "
+        );
+        // ...and keeps a message just under the threshold from counting as late.
+        assert_eq!(
+            opening("2026-10-07T12:45:00.0000000001Z", at(MORNING + 120)),
+            "Sent 2026.10.07:08:45 EDT. "
+        );
+    }
+
+    #[test]
     fn lateness_counts_the_fraction_of_the_create_time() {
         test_clock::set(at(MORNING), EDT, "EDT");
         // 119.5 seconds is not late; 120 seconds is.
@@ -522,7 +538,7 @@ mod tests {
             QueuedOpening {
                 text: "Sent 2026.10.07:08:45 EDT. The user's request arrived.".to_owned(),
                 sent_at: "2026-10-07T12:45:00Z".to_owned(),
-                opening_bytes: "Sent 2026.10.07:08:45 EDT. ".len(),
+                opening: "Sent 2026.10.07:08:45 EDT. ".to_owned(),
             }
         );
         assert!(!queued.text.chars().any(char::is_control));
@@ -531,7 +547,7 @@ mod tests {
             retime(
                 &queued.text,
                 &queued.sent_at,
-                queued.opening_bytes,
+                &queued.opening,
                 at(MORNING + 72 * 60)
             ),
             Some(
@@ -545,27 +561,67 @@ mod tests {
             queue_deferred(&deferred("soon", "text"), now_millis()),
             None
         );
-        // A record that does not fit its text leaves the text as stored.
-        assert_eq!(retime(&queued.text, &queued.sent_at, 3, at(MORNING)), None);
+        // A record that does not fit its text leaves the text as stored, never cut: an opening
+        // the text does not begin with, one that is not an opening, an unreadable create time.
+        let stale = "Sent 2026.10.07:08:45 EDT, delivered 1 h 12 min later. ";
         assert_eq!(
-            retime(&queued.text, &queued.sent_at, 10_000, at(MORNING)),
+            retime(&queued.text, &queued.sent_at, stale, at(MORNING)),
+            None
+        );
+        assert_eq!(retime(&queued.text, &queued.sent_at, "", at(MORNING)), None);
+        assert_eq!(
+            retime(&queued.text, &queued.sent_at, "Sent", at(MORNING)),
             None
         );
         assert_eq!(
-            retime(&queued.text, "soon", queued.opening_bytes, at(MORNING)),
+            retime(&queued.text, "soon", &queued.opening, at(MORNING)),
             None
         );
     }
 
+    /// Set in the child process [`the_process_zone_follows_tz_in_both_seasons`] starts.
+    const ZONE_CHILD: &str = "AGENTCTL_PROMPT_ZONE_CHILD";
+
     #[test]
-    fn the_process_zone_reads_a_short_name_and_a_posix_offset() {
-        let zone = process_zone(MORNING).expect("localtime_r");
-        // POSIX TZ offsets run to 24:59:59 either way.
-        assert!(
-            zone.offset_seconds.abs() <= 24 * 3_600 + 59 * 60 + 59,
-            "{zone:?}"
-        );
-        assert!(!zone.name.is_empty() && zone.name.len() <= 9, "{zone:?}");
+    fn the_process_zone_follows_tz_in_both_seasons() {
+        // 2026-01-15T12:00:00Z and 2026-07-15T12:00:00Z.
+        let instants = [1_768_478_400, 1_784_116_800];
+        if std::env::var_os(ZONE_CHILD).is_some() {
+            for instant in instants {
+                let zone = process_zone(instant).expect("localtime_r");
+                println!("<zone {} {}>", zone.offset_seconds, zone.name);
+            }
+            return;
+        }
+        // The zone is the process's, so each case runs this test again in a child with its TZ.
+        for (tz, expected) in [
+            ("EST5EDT,M3.2.0,M11.1.0", ["-18000 EST", "-14400 EDT"]),
+            ("UTC0", ["0 UTC", "0 UTC"]),
+            // The extreme POSIX offset, with its implicit hour of daylight time.
+            ("STD-24:59:59DST,M3.2.0,M11.1.0", ["89999 STD", "93599 DST"]),
+        ] {
+            let output = std::process::Command::new(std::env::current_exe().expect("test binary"))
+                .args([
+                    "--exact",
+                    "prompt_time::tests::the_process_zone_follows_tz_in_both_seasons",
+                    "--nocapture",
+                    "--test-threads=1",
+                ])
+                .env(ZONE_CHILD, "1")
+                .env("TZ", tz)
+                .output()
+                .expect("run the child");
+            assert!(output.status.success(), "{tz}: {output:?}");
+            // libtest writes its own words on the line before the first output, so the zones are
+            // found between their markers wherever they fall.
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let zones: Vec<&str> = stdout
+                .split("<zone ")
+                .skip(1)
+                .filter_map(|part| part.split_once('>').map(|(zone, _)| zone))
+                .collect();
+            assert_eq!(zones, expected, "{tz}");
+        }
         assert_eq!(numeric_offset(EDT), "UTC-04:00");
         assert_eq!(numeric_offset(19_800), "UTC+05:30");
     }

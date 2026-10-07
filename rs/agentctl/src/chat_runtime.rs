@@ -17450,6 +17450,37 @@ mod tests {
     }
 
     #[test]
+    fn delivery_queues_the_prompt_with_its_opening_left_for_typing_time() {
+        // The opening says how late the prompt is typed, which only the queue's drain knows, so
+        // the bridge hands the queue the create time rather than an opening.
+        let root = temporary("deliver-deferred-opening");
+        let state = BridgeState::initialize(&root, config()).expect("initialize state");
+        let admission = state
+            .admit_batch(&delivery(1, "cursor-1", "receipt-1"))
+            .expect("admit request");
+        let key = &admission.new_request_keys[0];
+        let target = FakeDelivery::default();
+        deliver_request_with(&state, &target, key, DrainOptions::default())
+            .expect("deliver request");
+        let prompts = target.submitted_prompts.lock().expect("prompt lock");
+        let rest = prompts[0]
+            .strip_prefix("\u{0}2026-09-21T12:00:00Z\u{0}")
+            .expect("the create time between deferred markers");
+        assert!(
+            rest.starts_with("The user's request arrived through the configured chat bridge.\n"),
+            "{rest}"
+        );
+        crate::prompt_time::test_clock::set(1_789_992_030_000, -4 * 3_600, "EDT");
+        let queued =
+            crate::prompt_time::queue_deferred(&prompts[0], crate::prompt_time::now_millis())
+                .expect("the queue reads the marker");
+        assert!(queued
+            .text
+            .starts_with("Sent 2026.09.21:08:00 EDT. The user's request arrived through the configured chat bridge.\n"));
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
     fn delivery_uses_stable_id_and_generic_multi_reply_fence() {
         let root = temporary("deliver");
         let state = BridgeState::initialize(&root, config()).expect("initialize state");

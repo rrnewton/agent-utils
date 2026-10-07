@@ -673,7 +673,7 @@ fn enqueue_internal(
             "id": identifier,
             "text": queued.text,
             "sent_at": queued.sent_at,
-            "opening_bytes": queued.opening_bytes,
+            "opening": queued.opening,
             "queued_at": unix_seconds(),
             "delivery_attempts": 0,
         }),
@@ -2370,14 +2370,9 @@ fn typed_text(document: &Map<String, Value>) -> AgentResult<String> {
     let retimed = document
         .get("sent_at")
         .and_then(Value::as_str)
-        .zip(
-            document
-                .get("opening_bytes")
-                .and_then(Value::as_u64)
-                .and_then(|bytes| usize::try_from(bytes).ok()),
-        )
-        .and_then(|(sent_at, bytes)| {
-            crate::prompt_time::retime(&text, sent_at, bytes, crate::prompt_time::now_millis())
+        .zip(document.get("opening").and_then(Value::as_str))
+        .and_then(|(sent_at, opening)| {
+            crate::prompt_time::retime(&text, sent_at, opening, crate::prompt_time::now_millis())
         });
     Ok(retimed.unwrap_or(text))
 }
