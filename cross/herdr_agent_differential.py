@@ -456,7 +456,12 @@ elif args[:2] == ["pane", "read"]:
         else:
             sys.stdout.write(prefix + history + divider + "❯\n" + divider + footer)
     elif source == "recent-unwrapped":
-        sys.stdout.write(state.get("read_unwrapped", "agent transcript\n"))
+        if "read_unwrapped" in state:
+            sys.stdout.write(state["read_unwrapped"])
+        else:
+            # A harness transcript shows each submitted prompt, which read-back looks for.
+            sys.stdout.write("agent transcript\n" + "".join(
+                text + "\n" for text in state.get("submitted", [])))
     else:
         sys.stdout.write(state.get("read_recent", "fallback transcript\n"))
 elif args[:2] == ["pane", "send-keys"] and verified_composer() and state.get("composer_draft"):

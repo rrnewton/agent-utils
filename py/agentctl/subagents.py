@@ -50,14 +50,16 @@ from agentctl.client import (
 )
 from agentctl.errors import (
     AgentDeliveryError, HerdrRunError, HerdrUnavailable, InputExpectationFailed,
-    ProbableMisroute, RecipientChanged,
+    MisrouteRecovered, ProbableMisroute, RecipientChanged,
 )
 from agentctl.profiles import (
     reasoning_arguments,
     validate_structured_harness_argument_conflicts,
     workspace_for_registry,
 )
-from agentctl.submission import PromptNotStaged, SubmissionReceipt, submit_verified
+from agentctl.submission import (
+    PromptNotStaged, SubmissionReceipt, _compact, _suffix, submit_verified,
+)
 
 _T = TypeVar("_T")
 _NAME = re.compile(r"[a-z][a-z0-9-]{0,31}\Z")
@@ -896,6 +898,16 @@ def _goal_replacement_selected(screen: str, objective: str) -> bool:
             and "Press enter to confirm or esc to go back" in normalized)
 
 
+#: Longest wait for a sent prompt to appear in the target pane's scrollback.
+READBACK_SECONDS = 5.0
+#: Receipt evidence that already shows the prompt text in the target pane itself.
+_PRINTED_EVIDENCE = ("prompt text appeared above the composer",
+                     "pasted prompt appeared above the composer")
+#: What a program that received someone else's prompt is told after being interrupted.
+MISROUTE_NOTE = "Ignore the previous message: it was sent to the wrong agent by agentctl."
+_NOTE_HARNESSES = ("claude", "codex", "muse")
+
+
 class RecipientUnanchored(RecipientChanged):
     """The record pins no harness process or observed session, so input is refused."""
 
@@ -976,6 +988,7 @@ class _WorkspaceClient:
         self, client: HerdrClient, record: AgentRecord, *,
         queue: str | None = None, check_prompt: bool = True,
         expected_workspace: str | None = None,
+        peer_panes: Callable[[], builtins.list[str]] | None = None,
     ) -> None:
         self.client, self.record = client, record
         self.goal_objective: str | None = None
@@ -983,6 +996,122 @@ class _WorkspaceClient:
         self.check_prompt = check_prompt
         self.expected_workspace = expected_workspace
         self.custom_submission: tuple[str, str, int] | None = None
+        #: Panes of the other agents in this registry, searched when a prompt is missing.
+        self.peer_panes = peer_panes
+
+    def _read_back(self, pane_id: str, text: str, receipt: SubmissionReceipt | None) -> None:
+        """Confirm the prompt reached this record's pane, or recover from where it went.
+
+        A receipt that saw the prompt printed is already a read-back of the verified
+        pane. Otherwise the pane's scrollback is read until the prompt appears, within
+        ``READBACK_SECONDS``. A prompt that never appears there is looked for in the
+        other registered agents' panes; found in exactly one, that agent is interrupted.
+        Not found anywhere (a long paste shows as a placeholder, a queued prompt later),
+        it is accepted on the recipient check alone.
+        """
+        def recipient_holds() -> bool:
+            try:
+                self.verify_recipient(pane_id)
+            except (HerdrUnavailable, AgentDeliveryError) as exc:
+                self._recover_misroute(pane_id, text, "identity-changed-after-write", str(exc))
+                raise MisrouteRecovered(
+                    f"pane {pane_id} no longer holds agent {self.record.name!r} after the "
+                    f"prompt was written; the program there was told to ignore it: {exc}"
+                ) from exc
+            return True
+
+        if receipt is not None and receipt.evidence in _PRINTED_EVIDENCE:
+            recipient_holds()
+            return
+        needle = _suffix(text, 40)
+        if len(needle) < 12:
+            recipient_holds()
+            return
+        deadline = time.monotonic() + READBACK_SECONDS
+        while True:
+            screen = self.client.read_scrollback(pane_id)
+            if needle in _compact(screen):
+                recipient_holds()
+                return
+            if time.monotonic() >= deadline:
+                break
+            time.sleep(min(0.25, max(0.0, deadline - time.monotonic())))
+        recipient_holds()
+        if self.peer_panes is None:
+            return
+        found = [
+            peer for peer in self.peer_panes() if peer != pane_id
+            and needle in _compact(self.client.read_scrollback(peer))
+        ]
+        if len(found) == 1:
+            self._recover_misroute(found[0], text, "prompt-in-another-pane",
+                                   f"not in pane {pane_id} after {READBACK_SECONDS:g}s")
+            raise MisrouteRecovered(
+                f"prompt for agent {self.record.name!r} appeared in pane {found[0]}, not in "
+                f"{pane_id}; the program there was told to ignore it"
+            )
+
+    def _recover_misroute(self, wrong_pane: str, text: str, detection: str, detail: str) -> None:
+        """Interrupt the program that got this prompt, tell it to ignore it, and log it.
+
+        Nothing is typed into a pane that shows no supported harness: in a shell the
+        note could run as a command.
+        """
+        observed_agent: str | None = None
+        observed_terminal: str | None = None
+        interrupted = note_sent = False
+        skipped: str | None = None
+        try:
+            info = self.client.pane_info(wrong_pane)
+            observed_agent, observed_terminal = info.agent, info.terminal_id
+        except HerdrUnavailable as exc:
+            skipped = f"pane unavailable: {exc}"
+        if skipped is None and observed_agent not in _NOTE_HARNESSES:
+            skipped = f"pane shows {observed_agent!r}, not a supported harness; nothing typed"
+        if skipped is None:
+            try:
+                self.client.send_keys(wrong_pane, "esc")
+                interrupted = True
+                time.sleep(0.5)
+                self.client.agent_prompt(wrong_pane, MISROUTE_NOTE)
+                note_sent = True
+            except HerdrUnavailable as exc:
+                skipped = f"recovery input failed: {exc}"
+        self._log_misroute({
+            "at": time.time(), "agent": self.record.name, "token": self.record.token,
+            "detection": detection, "detail": detail,
+            "intended_pane": self.record.pane_id, "intended_terminal": self.record.terminal_id,
+            "observed_pane": wrong_pane, "observed_terminal": observed_terminal,
+            "observed_agent": observed_agent, "interrupted": interrupted,
+            "note_sent": note_sent, "skipped": skipped,
+            "message_id": self._inflight_message_id(text),
+        })
+
+    def _inflight_message_id(self, text: str) -> str | None:
+        if self.queue is None:
+            return None
+        for path in sorted((Path(self.queue) / "inflight").glob("*.json")):
+            try:
+                document = agent._read_queue_json(str(path), "queued message", require_private=True)
+            except AgentDeliveryError:
+                continue
+            if isinstance(document, dict) and document.get("text") == text:
+                return path.name[:-5]
+        return None
+
+    def _log_misroute(self, entry: dict[str, object]) -> None:
+        """Append one durable line to the agent's misroute log beside its queue."""
+        if self.queue is None:
+            return
+        path = Path(self.queue).parent / "misroutes.jsonl"
+        descriptor = os.open(
+            path, os.O_WRONLY | os.O_CREAT | os.O_APPEND | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600,
+        )
+        try:
+            os.write(descriptor, (json.dumps(entry, sort_keys=True) + "\n").encode("utf-8"))
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
 
     def _guarded(self) -> _GuardedTerminal:
         expect = None
@@ -1199,10 +1328,16 @@ class _WorkspaceClient:
                 pane_id, self.record.harness, command,
             )
         if self.record.adapter != "herdr-pane":
-            return self.client.prompt_agent(
-                pane_id, command,
-                terminal=self._guarded(),
-            )
+            try:
+                receipt = self.client.prompt_agent(pane_id, command, terminal=self._guarded())
+            except ProbableMisroute as exc:
+                self._recover_misroute(pane_id, command, "identity-changed-after-write", str(exc))
+                raise MisrouteRecovered(
+                    f"prompt for agent {self.record.name!r} reached another program in pane "
+                    f"{pane_id}, which was told to ignore it: {exc}"
+                ) from exc
+            self._read_back(pane_id, command, receipt)
+            return receipt
         if "\0" in command or "\x1b" in command:
             raise HerdrUnavailable(
                 "Muse pane prompts cannot contain NUL or terminal escape characters"
@@ -1770,6 +1905,22 @@ class ManagedAgents:
                     f"pane {record.pane_id} is already registered as {owner.name!r}"
                 )
 
+    def _peer_panes(self, name: str) -> Callable[[], builtins.list[str]]:
+        """Panes of every other readable record, for locating a misrouted prompt."""
+        def panes() -> builtins.list[str]:
+            found: builtins.list[str] = []
+            for path in sorted(self.registry.iterdir()):
+                if not _NAME.fullmatch(path.name) or path.name in ("archive", name):
+                    continue
+                try:
+                    other = AgentRecord.load(path / "agent.json", path.name)
+                except AgentDeliveryError:
+                    continue
+                if other.pane_id is not None and other.lifecycle == "running":
+                    found.append(other.pane_id)
+            return found
+        return panes
+
     def _repin_moved_terminal(self, record: AgentRecord) -> None:
         """After a verified move, keep the terminal anchor only while the harness still matches.
 
@@ -2031,6 +2182,7 @@ class ManagedAgents:
                 client = cast(HerdrClient, _WorkspaceClient(
                     self.client, record, queue=self._queue(name),
                     expected_workspace=project_workspace,
+                    peer_panes=self._peer_panes(name),
                 ))
                 agent.send(client, self._target(record), self._queue(name), brief,
                            ready_timeout=ready_timeout, working_timeout=working_timeout,
@@ -2634,6 +2786,7 @@ class ManagedAgents:
             client = cast(HerdrClient, _WorkspaceClient(
                 self.client, record, queue=self._queue(name),
                 expected_workspace=self._project_workspace(),
+                peer_panes=self._peer_panes(name),
             ))
             return agent.send(
                 client, self._target(record), self._queue(name), text,
@@ -2649,6 +2802,7 @@ class ManagedAgents:
             client = cast(HerdrClient, _WorkspaceClient(
                 self.client, record, queue=self._queue(name),
                 expected_workspace=self._project_workspace(),
+                peer_panes=self._peer_panes(name),
             ))
             return agent.drain(
                 client, self._target(record), self._queue(name),
@@ -3921,6 +4075,7 @@ class ManagedAgents:
                 client = cast(HerdrClient, _WorkspaceClient(
                     self.client, record, queue=self._queue(name),
                     expected_workspace=self._project_workspace(),
+                    peer_panes=self._peer_panes(name),
                 ))
                 result = agent.send(
                     client, self._target(record), self._queue(name), prompt,

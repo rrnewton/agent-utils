@@ -1850,6 +1850,10 @@ class HerdrClient:
             terminal.native_prompt(pane_id, text)
         return None
 
+    def read_scrollback(self, pane_id: str) -> str:
+        """Read recent scrollback without wrapping, to find text a prompt left there."""
+        return self.read(pane_id, source="recent-unwrapped", lines=400)
+
     def read_screen(self, pane_id: str) -> str:
         """Read the visible rows with SGR styling retained for composer inspection."""
         args = [

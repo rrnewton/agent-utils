@@ -62,21 +62,92 @@ def test_harness_replaced_before_send_types_nothing_and_stays_pending(
     assert "for the original agent" not in fake.submitted
 
 
-def test_replacement_after_the_last_check_is_quarantined_as_probable_misroute(
+def _misroutes(manager: ManagedAgents, name: str) -> list[dict[str, object]]:
+    path = manager._directory(name) / "misroutes.jsonl"
+    if not path.exists():
+        return []
+    return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+
+
+def test_pane_swap_between_check_and_send_interrupts_the_wrong_agent_and_retries(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager, fake, pane = _started(tmp_path, monkeypatch)
+    original = fake.harness_pids[pane]
+
+    def swap_once(effect_pane: str) -> None:
+        # Another program takes the pane after the last check, before Herdr writes.
+        fake.before_effect = None
+        fake.harness_pids[effect_pane] = 999
+
+    fake.before_effect = swap_once
+    with pytest.raises(AgentPending):
+        manager.send("worker", "work meant for the worker agent")
+    assert fake.keys_sent == [(pane, "esc")]
+    assert fake.submitted[-2:] == ["work meant for the worker agent", subagents.MISROUTE_NOTE]
+    [entry] = _misroutes(manager, "worker")
+    assert entry["detection"] == "identity-changed-after-write"
+    assert entry["interrupted"] is True and entry["note_sent"] is True
+    assert entry["observed_pane"] == pane and entry["message_id"] is not None
+    inbox = sorted((Path(manager._queue("worker")) / "inbox").glob("*.json"))
+    [pending] = [json.loads(path.read_text(encoding="utf-8")) for path in inbox]
+    assert len(pending["misroutes"]) == 1 and "probable_misroute" not in pending
+    fake.harness_pids[pane] = original  # the intended agent is back in its pane
+    manager.drain("worker")
+    assert fake.submitted[-1] == "work meant for the worker agent"
+
+
+def test_misroute_into_a_shell_types_nothing_more(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     manager, fake, pane = _started(tmp_path, monkeypatch)
 
-    def replace_harness(effect_pane: str) -> None:
-        fake.harness_pids[effect_pane] = 999
+    def harness_exits(effect_pane: str) -> None:
+        fake.before_effect = None
+        fake.infos[effect_pane] = replace(fake.infos[effect_pane], agent=None)
 
-    fake.before_effect = replace_harness
-    with pytest.raises(AgentPossiblySubmitted, match="PROBABLE MISROUTE"):
-        manager.send("worker", "raced message")
+    fake.before_effect = harness_exits
+    with pytest.raises(AgentPending):
+        manager.send("worker", "nothing should follow this text")
+    assert fake.keys_sent == [] and subagents.MISROUTE_NOTE not in fake.submitted
+    [entry] = _misroutes(manager, "worker")
+    assert entry["interrupted"] is False and "nothing typed" in str(entry["skipped"])
+
+
+def test_prompt_found_in_another_agents_pane_interrupts_that_agent_and_retries(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager, fake, pane = _started(tmp_path, monkeypatch)
+    manager.start("bystander", cwd=str(tmp_path), harness="claude")
+    other = manager.get("bystander").pane_id or ""
+    monkeypatch.setattr(subagents, "READBACK_SECONDS", 0.0)
+    fake.redirect_once[pane] = other  # Herdr writes this one prompt to the wrong pane
+    manager.send("worker", "a long enough instruction for the worker only")
+    assert (other, "esc") in fake.keys_sent
+    assert fake.transcripts[other][-1] == subagents.MISROUTE_NOTE
+    assert fake.transcripts[pane][-1] == "a long enough instruction for the worker only"
+    [entry] = _misroutes(manager, "worker")
+    assert entry["detection"] == "prompt-in-another-pane" and entry["observed_pane"] == other
+
+
+def test_second_misroute_of_one_message_is_quarantined(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager, fake, pane = _started(tmp_path, monkeypatch)
+    manager.start("bystander", cwd=str(tmp_path), harness="claude")
+    other = manager.get("bystander").pane_id or ""
+    monkeypatch.setattr(subagents, "READBACK_SECONDS", 0.0)
+
+    def redirect_every_time(effect_pane: str) -> None:
+        if effect_pane == pane:
+            fake.redirect_once[pane] = other
+
+    fake.before_effect = redirect_every_time
+    with pytest.raises(AgentPossiblySubmitted):
+        manager.send("worker", "a long enough instruction that keeps going astray")
     documents = _failed_documents(manager, "worker")
-    assert [document["text"] for document in documents] == ["raced message"]
-    assert documents[0]["probable_misroute"] is True
-    assert pane in fake.harness_pids
+    assert documents[0]["probable_misroute"] is True and len(cast(list[object], documents[0]["misroutes"])) == 2
+    assert len(_misroutes(manager, "worker")) == 2
 
 
 def test_label_drift_refuses_input(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

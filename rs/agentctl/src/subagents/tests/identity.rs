@@ -206,27 +206,101 @@ fn a_harness_replaced_before_send_types_nothing_and_stays_pending() {
     assert!(failed_documents(&fixture, "worker").is_empty());
 }
 
+fn misroutes(fixture: &Fixture, agent_name: &str) -> Vec<Value> {
+    let path = registry(fixture).join(agent_name).join("misroutes.jsonl");
+    fs::read_to_string(path)
+        .map(|text| {
+            text.lines()
+                .map(|line| serde_json::from_str(line).unwrap())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 #[test]
-fn a_replacement_after_the_last_check_is_quarantined_as_probable_misroute() {
+fn a_pane_swap_between_check_and_send_interrupts_the_wrong_agent_and_retries() {
+    let fixture = Fixture::new();
+    fixture.start(None);
+    let pane = record(&fixture, "worker")["pane_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let original = fixture.client.harness_pids.lock().unwrap()[&pane];
+    fixture
+        .client
+        .replace_harness_before_effect
+        .store(true, Ordering::SeqCst);
+    let error = send(&fixture, "worker", "work meant for the worker agent").expect_err("pending");
+    assert_eq!(
+        error.outcome(),
+        Some(agent::QueueOutcome::Pending),
+        "{error}"
+    );
+    assert_eq!(
+        *fixture.client.keys_sent.lock().unwrap(),
+        [(pane.clone(), "esc".to_owned())]
+    );
+    let all = runs(&fixture);
+    assert!(all.contains(&"work meant for the worker agent".to_owned()));
+    assert_eq!(all.last().map(String::as_str), Some(MISROUTE_NOTE));
+    let entries = misroutes(&fixture, "worker");
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0]["detection"], "identity-changed-after-write");
+    assert_eq!(entries[0]["interrupted"], true);
+    assert_eq!(entries[0]["note_sent"], true);
+    assert!(entries[0]["message_id"].is_string(), "{}", entries[0]);
+    fixture
+        .client
+        .harness_pids
+        .lock()
+        .unwrap()
+        .insert(pane, original);
+    fixture
+        .manager()
+        .drain("worker", DrainOptions::default())
+        .unwrap();
+    assert_eq!(
+        runs(&fixture).last().map(String::as_str),
+        Some("work meant for the worker agent")
+    );
+}
+
+#[test]
+fn a_second_misroute_of_one_message_is_quarantined() {
     let fixture = Fixture::new();
     fixture.start(None);
     fixture
         .client
         .replace_harness_before_effect
         .store(true, Ordering::SeqCst);
-    let error = send(&fixture, "worker", "raced message").expect_err("quarantined");
-    assert_eq!(
-        error.outcome(),
-        Some(agent::QueueOutcome::PossiblySubmitted),
-        "{error}"
-    );
-    assert!(error.to_string().contains("PROBABLE MISROUTE"), "{error}");
+    send(&fixture, "worker", "a message that keeps going astray").expect_err("pending");
+    let pane = record(&fixture, "worker")["pane_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let recorded = record(&fixture, "worker")["harness_identity"]["pid"]
+        .as_u64()
+        .unwrap();
+    fixture
+        .client
+        .harness_pids
+        .lock()
+        .unwrap()
+        .insert(pane, recorded);
+    fixture
+        .client
+        .replace_harness_before_effect
+        .store(true, Ordering::SeqCst);
+    let error = fixture
+        .manager()
+        .drain("worker", DrainOptions::default())
+        .map(|result| result.quarantined.len())
+        .unwrap();
+    assert_eq!(error, 1);
     let documents = failed_documents(&fixture, "worker");
-    assert_eq!(documents.len(), 1);
-    assert_eq!(documents[0]["text"], "raced message");
     assert_eq!(documents[0]["probable_misroute"], true);
-    assert_eq!(documents[0]["possibly_submitted"], true);
-    assert!(runs(&fixture).contains(&"raced message".to_owned()));
+    assert_eq!(documents[0]["misroutes"].as_array().unwrap().len(), 2);
+    assert_eq!(misroutes(&fixture, "worker").len(), 2);
 }
 
 #[test]

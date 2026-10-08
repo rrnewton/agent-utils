@@ -606,11 +606,11 @@ fn placeholder_labels(text: &str) -> Vec<String> {
     labels
 }
 
-fn compact(text: &str) -> String {
+pub(crate) fn compact(text: &str) -> String {
     text.chars().filter(|c| !c.is_whitespace()).collect()
 }
 
-fn suffix(text: &str, length: usize) -> String {
+pub(crate) fn suffix(text: &str, length: usize) -> String {
     let chars: Vec<char> = compact(text).chars().collect();
     chars[chars.len().saturating_sub(length)..].iter().collect()
 }

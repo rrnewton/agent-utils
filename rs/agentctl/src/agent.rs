@@ -760,141 +760,180 @@ fn drain_with_runtime_binding<A: AgentApi + ?Sized>(
     let mut target_lock: Option<TargetLock> = None;
     let mut locked_pane_id: Option<String> = None;
     let mut initial_info: Option<AgentPaneInfo> = None;
-    for path in inbox_in_queue_order(&directories.inbox)? {
-        let (mut document, attempts) = match load_message(&path).and_then(|document| {
-            let attempts = delivery_attempts(&document, &path)?;
-            Ok((document, attempts))
-        }) {
-            Ok(loaded) => loaded,
-            Err(error) => {
-                let identifier = quarantine_raw(
-                    &path,
-                    &directories.failed,
-                    "invalid_message",
-                    &error.to_string(),
-                )?;
-                quarantined.push(identifier);
-                continue;
-            }
-        };
-        let filename_id = message_id_from_path(&path)?;
-        let identifier = document
-            .get("id")
-            .and_then(Value::as_str)
-            .map_or(filename_id.clone(), str::to_owned);
-        if attempts >= options.max_attempts {
-            let detail = format!(
+    'message: for path in inbox_in_queue_order(&directories.inbox)? {
+        'retry: loop {
+            let (mut document, attempts) = match load_message(&path).and_then(|document| {
+                let attempts = delivery_attempts(&document, &path)?;
+                Ok((document, attempts))
+            }) {
+                Ok(loaded) => loaded,
+                Err(error) => {
+                    let identifier = quarantine_raw(
+                        &path,
+                        &directories.failed,
+                        "invalid_message",
+                        &error.to_string(),
+                    )?;
+                    quarantined.push(identifier);
+                    continue 'message;
+                }
+            };
+            let filename_id = message_id_from_path(&path)?;
+            let identifier = document
+                .get("id")
+                .and_then(Value::as_str)
+                .map_or(filename_id.clone(), str::to_owned);
+            if attempts >= options.max_attempts {
+                let detail = format!(
                 "message {identifier} reached the maximum delivery-attempt count ({attempts} >= {}); retained pending",
                 options.max_attempts
             );
-            document.insert("delivery_state".to_owned(), json!("pending"));
-            document.insert("delivery_error".to_owned(), json!(detail));
-            document.insert("delivery_blocked_at".to_owned(), json!(unix_seconds()));
-            atomic_json(&path, &Value::Object(document))?;
-            blocked = Some(detail);
-            break;
-        }
-
-        let readiness = (|| -> AgentResult<AgentPaneInfo> {
-            if target_lock.is_none() {
-                let (lock, info) = lock_resolved_target_with_runtime(client, target, runtime)?;
-                target_lock = Some(lock);
-                locked_pane_id = Some(info.pane_id.clone());
-                initial_info = Some(info);
-            }
-            wait_ready(
-                client,
-                target,
-                options.ready_timeout,
-                runtime,
-                locked_pane_id
-                    .as_deref()
-                    .expect("target lock always records its pane"),
-                initial_info.take(),
-            )
-        })();
-        let info = match readiness {
-            Ok(info) => info,
-            Err(error) => {
-                let detail = error.to_string();
                 document.insert("delivery_state".to_owned(), json!("pending"));
                 document.insert("delivery_error".to_owned(), json!(detail));
                 document.insert("delivery_blocked_at".to_owned(), json!(unix_seconds()));
                 atomic_json(&path, &Value::Object(document))?;
                 blocked = Some(detail);
-                break;
+                break 'message;
             }
-        };
 
-        let inflight_path = directories.inflight.join(path.file_name().ok_or_else(|| {
-            AgentError::delivery(format!(
-                "queued message has no filename: {}",
-                path.display()
-            ))
-        })?);
-        transition(&path, &inflight_path)?;
-        document.insert("possibly_submitted".to_owned(), Value::Bool(true));
-        document.insert("delivery_state".to_owned(), json!("inflight"));
-        document.insert("inflight_at".to_owned(), json!(unix_seconds()));
-        atomic_json(&inflight_path, &Value::Object(document.clone()))?;
+            let readiness = (|| -> AgentResult<AgentPaneInfo> {
+                if target_lock.is_none() {
+                    let (lock, info) = lock_resolved_target_with_runtime(client, target, runtime)?;
+                    target_lock = Some(lock);
+                    locked_pane_id = Some(info.pane_id.clone());
+                    initial_info = Some(info);
+                }
+                wait_ready(
+                    client,
+                    target,
+                    options.ready_timeout,
+                    runtime,
+                    locked_pane_id
+                        .as_deref()
+                        .expect("target lock always records its pane"),
+                    initial_info.take(),
+                )
+            })();
+            let info = match readiness {
+                Ok(info) => info,
+                Err(error) => {
+                    let detail = error.to_string();
+                    document.insert("delivery_state".to_owned(), json!("pending"));
+                    document.insert("delivery_error".to_owned(), json!(detail));
+                    document.insert("delivery_blocked_at".to_owned(), json!(unix_seconds()));
+                    atomic_json(&path, &Value::Object(document))?;
+                    blocked = Some(detail);
+                    break 'message;
+                }
+            };
 
-        match deliver_one(
-            client,
-            &info,
-            &typed_text(&document)?,
-            options.working_timeout,
-            runtime,
-        ) {
-            Ok(Delivered::NotStaged(detail)) => {
-                // Nothing reached the composer: undo the at-most-once barrier so the
-                // prompt stays pending. A crash before the rename still quarantines it.
-                document.remove("possibly_submitted");
-                document.remove("inflight_at");
-                document.insert("delivery_state".to_owned(), json!("pending"));
-                document.insert("delivery_error".to_owned(), json!(detail));
-                document.insert("delivery_blocked_at".to_owned(), json!(unix_seconds()));
-                atomic_json(&inflight_path, &Value::Object(document))?;
-                transition(&inflight_path, &path)?;
-                blocked = Some(detail);
-                break;
-            }
-            Ok(Delivered::Confirmed { verified }) => {
-                if verified {
-                    runtime.prompt_printed(&identifier);
+            let inflight_path = directories.inflight.join(path.file_name().ok_or_else(|| {
+                AgentError::delivery(format!(
+                    "queued message has no filename: {}",
+                    path.display()
+                ))
+            })?);
+            transition(&path, &inflight_path)?;
+            document.insert("possibly_submitted".to_owned(), Value::Bool(true));
+            document.insert("delivery_state".to_owned(), json!("inflight"));
+            document.insert("inflight_at".to_owned(), json!(unix_seconds()));
+            atomic_json(&inflight_path, &Value::Object(document.clone()))?;
+
+            match deliver_one(
+                client,
+                &info,
+                &typed_text(&document)?,
+                options.working_timeout,
+                runtime,
+            ) {
+                Ok(Delivered::NotStaged(detail)) => {
+                    // Nothing reached the composer: undo the at-most-once barrier so the
+                    // prompt stays pending. A crash before the rename still quarantines it.
+                    document.remove("possibly_submitted");
+                    document.remove("inflight_at");
+                    document.insert("delivery_state".to_owned(), json!("pending"));
+                    document.insert("delivery_error".to_owned(), json!(detail));
+                    document.insert("delivery_blocked_at".to_owned(), json!(unix_seconds()));
+                    atomic_json(&inflight_path, &Value::Object(document))?;
+                    transition(&inflight_path, &path)?;
+                    blocked = Some(detail);
+                    break 'message;
                 }
-                document.insert("delivery_state".to_owned(), json!("processed"));
-                document.insert("confirmed_at".to_owned(), json!(unix_seconds()));
-                atomic_json(&inflight_path, &Value::Object(document))?;
-                transition(
-                    &inflight_path,
-                    &directories
-                        .processed
-                        .join(path.file_name().expect("validated queued filename")),
-                )?;
-                delivered.push(identifier);
-            }
-            Err(Undelivered {
-                error,
-                probable_misroute,
-            }) => {
-                let attempts = attempts.saturating_add(1);
-                let detail = error.to_string();
-                document.insert("delivery_attempts".to_owned(), json!(attempts));
-                document.insert("tui_delivery_attempts".to_owned(), json!(attempts));
-                document.insert("delivery_error".to_owned(), json!(detail));
-                document.insert("possibly_submitted".to_owned(), Value::Bool(true));
-                if probable_misroute {
-                    document.insert("probable_misroute".to_owned(), Value::Bool(true));
+                Ok(Delivered::Misrouted(detail)) => {
+                    // The wrong program was interrupted and told to ignore the prompt. Retry
+                    // from readiness, which re-resolves and re-verifies the recipient;
+                    // quarantine once the same message misroutes again.
+                    let mut misroutes = document
+                        .get("misroutes")
+                        .and_then(Value::as_array)
+                        .cloned()
+                        .unwrap_or_default();
+                    misroutes.push(json!({"at": unix_seconds(), "error": detail}));
+                    let exhausted = misroutes.len() >= MAX_MISROUTES;
+                    document.insert("misroutes".to_owned(), Value::Array(misroutes));
+                    if exhausted {
+                        let attempts = attempts.saturating_add(1);
+                        document.insert("delivery_attempts".to_owned(), json!(attempts));
+                        document.insert("tui_delivery_attempts".to_owned(), json!(attempts));
+                        document.insert("delivery_error".to_owned(), json!(detail));
+                        document.insert("probable_misroute".to_owned(), Value::Bool(true));
+                        document.insert("delivery_failed_at".to_owned(), json!(unix_seconds()));
+                        atomic_json(&inflight_path, &Value::Object(document))?;
+                        let failed_path = directories
+                            .failed
+                            .join(path.file_name().expect("validated queued filename"));
+                        transition(&inflight_path, &failed_path)?;
+                        failed_metadata(&failed_path, "possibly_submitted", &detail)?;
+                        quarantined.push(identifier);
+                        break 'retry;
+                    }
+                    document.remove("possibly_submitted");
+                    document.remove("inflight_at");
+                    document.insert("delivery_state".to_owned(), json!("pending"));
+                    document.insert("delivery_error".to_owned(), json!(detail));
+                    atomic_json(&inflight_path, &Value::Object(document))?;
+                    transition(&inflight_path, &path)?;
+                    continue 'retry;
                 }
-                document.insert("delivery_failed_at".to_owned(), json!(unix_seconds()));
-                atomic_json(&inflight_path, &Value::Object(document))?;
-                let failed_path = directories
-                    .failed
-                    .join(path.file_name().expect("validated queued filename"));
-                transition(&inflight_path, &failed_path)?;
-                failed_metadata(&failed_path, "possibly_submitted", &detail)?;
-                quarantined.push(identifier);
+                Ok(Delivered::Confirmed { verified }) => {
+                    if verified {
+                        runtime.prompt_printed(&identifier);
+                    }
+                    document.insert("delivery_state".to_owned(), json!("processed"));
+                    document.insert("confirmed_at".to_owned(), json!(unix_seconds()));
+                    atomic_json(&inflight_path, &Value::Object(document))?;
+                    transition(
+                        &inflight_path,
+                        &directories
+                            .processed
+                            .join(path.file_name().expect("validated queued filename")),
+                    )?;
+                    delivered.push(identifier);
+                }
+                Err(Undelivered {
+                    error,
+                    probable_misroute,
+                }) => {
+                    let attempts = attempts.saturating_add(1);
+                    let detail = error.to_string();
+                    document.insert("delivery_attempts".to_owned(), json!(attempts));
+                    document.insert("tui_delivery_attempts".to_owned(), json!(attempts));
+                    document.insert("delivery_error".to_owned(), json!(detail));
+                    document.insert("possibly_submitted".to_owned(), Value::Bool(true));
+                    if probable_misroute {
+                        document.insert("probable_misroute".to_owned(), Value::Bool(true));
+                    }
+                    document.insert("delivery_failed_at".to_owned(), json!(unix_seconds()));
+                    atomic_json(&inflight_path, &Value::Object(document))?;
+                    let failed_path = directories
+                        .failed
+                        .join(path.file_name().expect("validated queued filename"));
+                    transition(&inflight_path, &failed_path)?;
+                    failed_metadata(&failed_path, "possibly_submitted", &detail)?;
+                    quarantined.push(identifier);
+                }
             }
+            break 'retry;
         }
     }
 
@@ -1327,7 +1366,12 @@ enum Delivered {
     },
     /// Nothing was typed, so the prompt remains safe to retry.
     NotStaged(String),
+    /// The prompt reached the wrong program, which was told to ignore it; retry is safe.
+    Misrouted(String),
 }
+
+/// Misroutes tolerated for one message before it is quarantined instead of retried.
+pub const MAX_MISROUTES: usize = 2;
 
 /// A delivery that failed after typing may have begun; the prompt is quarantined.
 struct Undelivered {
@@ -1358,6 +1402,9 @@ fn deliver_one<A: AgentApi + ?Sized>(
         // A recipient check refused the first input effect: nothing reached the pane.
         Err(error) if error.kind() == AdapterErrorKind::NotStaged => {
             return Ok(Delivered::NotStaged(error.to_string()))
+        }
+        Err(error) if error.kind() == AdapterErrorKind::MisrouteRecovered => {
+            return Ok(Delivered::Misrouted(error.to_string()))
         }
         Err(error) if error.kind() == AdapterErrorKind::ProbableMisroute => {
             return Err(Undelivered {

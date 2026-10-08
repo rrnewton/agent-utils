@@ -58,6 +58,11 @@ class FakeManagedClient:
         #: Called with the pane id immediately before each input effect reaches the pane.
         self.before_effect: Callable[[str], None] | None = None
         self.expected_terminals: list[str | None] = []
+        #: Text each pane has shown in its scrollback.
+        self.transcripts: dict[str, list[str]] = {}
+        #: One-shot: input addressed to the key pane is written to the value pane instead.
+        self.redirect_once: dict[str, str] = {}
+        self.keys_sent: list[tuple[str, str]] = []
 
     def workspace_id_for_label(self, label: str) -> str | None:
         if label == "project-agents":
@@ -154,7 +159,9 @@ class FakeManagedClient:
     def agent_prompt(self, pane_id: str, text: str, *, expect_terminal: str | None = None) -> None:
         self._effect(pane_id, expect_terminal)
         assert pane_id in self.infos
+        written = self.redirect_once.pop(pane_id, pane_id)
         self.submitted.append(text)
+        self.transcripts.setdefault(written, []).append(text)
 
     def create_tab_with_pane(
         self, *, workspace_id: str, label: str, cwd: str,
@@ -280,6 +287,10 @@ class FakeManagedClient:
         assert pane_id in self.infos and lines > 0
         return "" if source == "recent-unwrapped" else "human and coordinator transcript\n"
 
+    def read_scrollback(self, pane_id: str) -> str:
+        assert pane_id in self.infos
+        return "\n".join(self.transcripts.get(pane_id, []))
+
     def close_tab(self, tab_id: str) -> None:
         self.closed.append(tab_id)
         self.presentations = [pane for pane in self.presentations if pane.tab_id != tab_id]
@@ -297,8 +308,10 @@ class FakeManagedClient:
         self.infos[pane_id] = replace(self.infos[pane_id], session_agent=kind, session_value=session_id)
 
     def send_keys(self, pane_id: str, keys: str, *, expect_terminal: str | None = None) -> None:
-        self._effect(pane_id, expect_terminal)
-        assert pane_id in self.infos and keys == "Enter"
+        if keys != "esc":
+            self._effect(pane_id, expect_terminal)
+        assert pane_id in self.infos and keys in ("Enter", "esc")
+        self.keys_sent.append((pane_id, keys))
 
 
 def setup(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[ManagedAgents, FakeManagedClient]:

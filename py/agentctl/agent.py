@@ -27,6 +27,7 @@ from agentctl.errors import (
     AgentPending,
     AgentPossiblySubmitted,
     HerdrUnavailable,
+    MisrouteRecovered,
     ProbableMisroute,
 )
 from agentctl.prompt_time import retime as _retime_prompt
@@ -98,6 +99,14 @@ class _PossiblySubmitted(AgentDeliveryError):
         self.misroute = misroute
 
 
+class _Misrouted(AgentDeliveryError):
+    """The prompt reached the wrong program, which was told to ignore it; retry is safe."""
+
+
+#: Misroutes tolerated for one message before it is quarantined instead of retried.
+MAX_MISROUTES = 2
+
+
 class _NotStaged(AgentDeliveryError):
     """Nothing was typed into the pane, so the prompt remains safe to retry."""
 
@@ -125,6 +134,9 @@ _UPDATE_ENVELOPE: dict[str, object] = {
     "delivery_error": "\x00" * QUEUE_ERROR_MAX_BYTES,
     "possibly_submitted": True,
     "probable_misroute": True,
+    "misroutes": [
+        {"at": _LONGEST_JSON_FLOAT, "error": "\x00" * QUEUE_ERROR_MAX_BYTES}
+    ] * MAX_MISROUTES,
     "delivery_blocked_at": _LONGEST_JSON_FLOAT,
     "inflight_at": _LONGEST_JSON_FLOAT,
     "delivery_failed_at": _LONGEST_JSON_FLOAT,
@@ -1787,6 +1799,8 @@ def _deliver_one(
         receipt = client.prompt_agent(info.pane_id, text)
     except PromptNotStaged as exc:
         raise _NotStaged(str(exc)) from exc
+    except MisrouteRecovered as exc:
+        raise _Misrouted(str(exc)) from exc
     except ProbableMisroute as exc:
         raise _PossiblySubmitted(
             f"pane {info.pane_id}: PROBABLE MISROUTE, quarantined: {exc}", misroute=True,
@@ -1969,6 +1983,43 @@ def _drain(
                         _transition(inflight_path, path, max_artifact_bytes=max_artifact_bytes)
                         retained_path = path
                         break
+                    except _Misrouted as exc:
+                        # The wrong program was interrupted and told to ignore the prompt.
+                        # Retry from readiness, which re-resolves and re-verifies the
+                        # recipient; quarantine once the same message misroutes again.
+                        recorded = document.get("misroutes", [])
+                        misroutes = list(recorded) if isinstance(recorded, list) else []
+                        misroutes.append({
+                            "at": time.time(),
+                            "error": _bounded_error(str(exc), max_artifact_bytes),
+                        })
+                        document["misroutes"] = misroutes
+                        if len(misroutes) >= MAX_MISROUTES:
+                            attempts += 1
+                            document["delivery_attempts"] = attempts
+                            document["tui_delivery_attempts"] = attempts
+                            document["delivery_error"] = _bounded_error(str(exc), max_artifact_bytes)
+                            document["probable_misroute"] = True
+                            document["delivery_failed_at"] = time.time()
+                            _atomic_json(inflight_path, document, max_artifact_bytes=max_artifact_bytes)
+                            failed_path = os.path.join(failed, os.path.basename(path))
+                            _transition(inflight_path, failed_path, max_artifact_bytes=max_artifact_bytes)
+                            retained_path = failed_path
+                            _failed_metadata(
+                                failed_path, outcome="possibly_submitted", error=str(exc),
+                                max_artifact_bytes=max_artifact_bytes,
+                            )
+                            quarantined.append(identifier)
+                            break
+                        document.pop("possibly_submitted", None)
+                        document.pop("inflight_at", None)
+                        document["delivery_state"] = "pending"
+                        document["delivery_error"] = _bounded_error(str(exc), max_artifact_bytes)
+                        _atomic_json(inflight_path, document, max_artifact_bytes=max_artifact_bytes)
+                        _transition(inflight_path, path, max_artifact_bytes=max_artifact_bytes)
+                        retained_path = path
+                        attempts += 1
+                        continue
                     except _PossiblySubmitted as exc:
                         attempts += 1
                         document["delivery_attempts"] = attempts

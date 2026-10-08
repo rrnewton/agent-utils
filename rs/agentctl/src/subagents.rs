@@ -1002,6 +1002,10 @@ pub trait ManagedApi: AgentApi {
         }
         self.send_text(pane, text)
     }
+    /// Recent scrollback without wrapping, to find text a prompt left in a pane.
+    fn read_scrollback(&self, pane: &str) -> crate::error::Result<String> {
+        self.read(pane, "recent-unwrapped", Some(400))
+    }
     /// Resolve an exact live Herdr agent name.
     fn agent_pane(&self, name: &str) -> crate::error::Result<String>;
     /// Resolve an exact live Herdr agent name with service cancellation.
@@ -2099,6 +2103,255 @@ impl<A: ManagedApi + ?Sized> GuardedInput for GuardedTerminal<'_, '_, A> {
     }
 }
 
+/// Longest wait for a sent prompt to appear in the target pane's scrollback.
+const READBACK: Duration = Duration::from_secs(5);
+/// What a program that received someone else's prompt is told after being interrupted.
+pub const MISROUTE_NOTE: &str =
+    "Ignore the previous message: it was sent to the wrong agent by agentctl.";
+const NOTE_HARNESSES: [&str; 3] = ["claude", "codex", "muse"];
+
+impl<A: ManagedApi + ?Sized> WorkspaceClient<'_, A> {
+    /// Confirm the prompt reached this record's pane, or recover from where it went.
+    ///
+    /// A receipt that saw the prompt printed is already a read-back of the verified pane.
+    /// Otherwise the pane's scrollback is read until the prompt appears, within [`READBACK`].
+    /// A prompt that never appears there is looked for in the other registered agents'
+    /// panes; found in exactly one, that agent is interrupted. Not found anywhere (a long
+    /// paste shows as a placeholder, a queued prompt later), it is accepted on the
+    /// recipient check alone.
+    fn read_back(
+        &self,
+        pane_id: &str,
+        text: &str,
+        submission: &Submission,
+        runtime: &dyn agent::AgentRuntime,
+    ) -> crate::error::Result<()> {
+        let recipient_holds = || -> crate::error::Result<()> {
+            if let Err(error) = self.verify_recipient(pane_id, true) {
+                self.recover_misroute(
+                    pane_id,
+                    text,
+                    "identity-changed-after-write",
+                    &error.to_string(),
+                    runtime,
+                );
+                return Err(AdapterError::misroute_recovered(format!(
+                    "pane {pane_id} no longer holds agent {} after the prompt was written; the \
+                     program there was told to ignore it: {error}",
+                    repr(Some(&self.record.name))
+                )));
+            }
+            Ok(())
+        };
+        if matches!(submission, Submission::Verified(receipt) if receipt.printed) {
+            return recipient_holds();
+        }
+        let needle = crate::submission::suffix(text, 40);
+        if needle.chars().count() < 12 {
+            return recipient_holds();
+        }
+        let deadline = runtime.monotonic() + READBACK;
+        loop {
+            let screen = self.client.read_scrollback(pane_id)?;
+            if crate::submission::compact(&screen).contains(&needle) {
+                return recipient_holds();
+            }
+            if runtime.monotonic() >= deadline {
+                break;
+            }
+            runtime.sleep(Duration::from_millis(250).min(deadline - runtime.monotonic()));
+        }
+        recipient_holds()?;
+        let mut found = Vec::new();
+        for peer in self.peer_panes() {
+            if peer != pane_id
+                && crate::submission::compact(&self.client.read_scrollback(&peer)?)
+                    .contains(&needle)
+            {
+                found.push(peer);
+            }
+        }
+        if let [other] = found.as_slice() {
+            self.recover_misroute(
+                other,
+                text,
+                "prompt-in-another-pane",
+                &format!("not in pane {pane_id} after {}s", READBACK.as_secs()),
+                runtime,
+            );
+            return Err(AdapterError::misroute_recovered(format!(
+                "prompt for agent {} appeared in pane {other}, not in {pane_id}; the program \
+                 there was told to ignore it",
+                repr(Some(&self.record.name))
+            )));
+        }
+        Ok(())
+    }
+
+    /// Interrupt the program that got this prompt, tell it to ignore it, and log it.
+    ///
+    /// Nothing is typed into a pane that shows no supported harness: in a shell the note
+    /// could run as a command.
+    fn recover_misroute(
+        &self,
+        wrong_pane: &str,
+        text: &str,
+        detection: &str,
+        detail: &str,
+        runtime: &dyn agent::AgentRuntime,
+    ) {
+        let mut observed_agent = None;
+        let mut observed_terminal = None;
+        let mut interrupted = false;
+        let mut note_sent = false;
+        let mut skipped: Option<String> = None;
+        match self.client.pane_info(wrong_pane) {
+            Ok(info) => {
+                observed_agent = info.agent.clone();
+                observed_terminal = info.terminal_id.clone();
+            }
+            Err(error) => skipped = Some(format!("pane unavailable: {error}")),
+        }
+        if skipped.is_none() && !NOTE_HARNESSES.contains(&observed_agent.as_deref().unwrap_or("")) {
+            skipped = Some(format!(
+                "pane shows {}, not a supported harness; nothing typed",
+                repr(observed_agent.as_deref())
+            ));
+        }
+        if skipped.is_none() {
+            let result = self.client.send_keys(wrong_pane, "esc").and_then(|()| {
+                interrupted = true;
+                runtime.sleep(Duration::from_millis(500));
+                self.client
+                    .agent_prompt_expect(wrong_pane, MISROUTE_NOTE, None, runtime)
+            });
+            match result {
+                Ok(()) => note_sent = true,
+                Err(error) => skipped = Some(format!("recovery input failed: {error}")),
+            }
+        }
+        self.log_misroute(&json!({
+            "at": unix_seconds(), "agent": self.record.name, "token": self.record.token,
+            "detection": detection, "detail": detail,
+            "intended_pane": self.record.pane_id, "intended_terminal": self.record.terminal_id,
+            "observed_pane": wrong_pane, "observed_terminal": observed_terminal,
+            "observed_agent": observed_agent, "interrupted": interrupted,
+            "note_sent": note_sent, "skipped": skipped,
+            "message_id": self.inflight_message_id(text),
+        }));
+    }
+
+    fn inflight_message_id(&self, text: &str) -> Option<String> {
+        let inflight = self.queue?.join("inflight");
+        let mut paths: Vec<PathBuf> = fs::read_dir(inflight)
+            .ok()?
+            .flatten()
+            .map(|entry| entry.path())
+            .filter(|path| {
+                path.extension()
+                    .is_some_and(|extension| extension == "json")
+            })
+            .collect();
+        paths.sort();
+        paths.into_iter().find_map(|path| {
+            let document: Value = serde_json::from_slice(&fs::read(&path).ok()?).ok()?;
+            (document.get("text").and_then(Value::as_str) == Some(text))
+                .then(|| path.file_stem()?.to_str().map(str::to_owned))
+                .flatten()
+        })
+    }
+
+    /// Append one durable line to the agent's misroute log beside its queue.
+    fn log_misroute(&self, entry: &Value) {
+        let Some(directory) = self.queue.and_then(Path::parent) else {
+            return;
+        };
+        let opened = OpenOptions::new()
+            .append(true)
+            .create(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(directory.join("misroutes.jsonl"));
+        if let Ok(mut file) = opened {
+            let mut line = entry.to_string();
+            line.push('\n');
+            if file.write_all(line.as_bytes()).is_ok() {
+                let _ = file.sync_all();
+            }
+        }
+    }
+
+    /// Panes of every other running record in this registry, for locating a misroute.
+    fn peer_panes(&self) -> Vec<String> {
+        let Some(registry) = self.queue.and_then(Path::parent).and_then(Path::parent) else {
+            return Vec::new();
+        };
+        let Ok(entries) = fs::read_dir(registry) else {
+            return Vec::new();
+        };
+        let mut panes: Vec<String> = entries
+            .flatten()
+            .filter_map(|entry| {
+                let name = entry.file_name().to_str()?.to_owned();
+                if name == "archive" || name == self.record.name || !name_pattern(&name) {
+                    return None;
+                }
+                let document: Value =
+                    serde_json::from_slice(&fs::read(entry.path().join("agent.json")).ok()?)
+                        .ok()?;
+                (document.get("lifecycle").and_then(Value::as_str) == Some("running"))
+                    .then(|| document.get("pane_id")?.as_str().map(str::to_owned))
+                    .flatten()
+            })
+            .collect();
+        panes.sort();
+        panes
+    }
+
+    fn submit_unchecked(
+        &self,
+        pane_id: &str,
+        text: &str,
+        runtime: &dyn agent::AgentRuntime,
+    ) -> crate::error::Result<Submission> {
+        // Custom panes verify through their own composer model, and slash
+        // commands (including goal replacement) need the native primitive.
+        if self.record.adapter == "herdr-pane" || text.trim_start().starts_with('/') {
+            return self
+                .run_with_runtime(pane_id, text, runtime)
+                .map(|()| Submission::Unconfirmed);
+        }
+        if runtime.cancelled() {
+            return Ok(Submission::NotStaged(
+                "delivery was cancelled before typing".to_owned(),
+            ));
+        }
+        *self
+            .goal_objective
+            .lock()
+            .expect("goal operation lock poisoned") = None;
+        if self.record.adapter == "herdr-relay" {
+            let status = self.pane_info_with_runtime(pane_id, runtime)?.status;
+            if status != "idle" {
+                return Ok(Submission::NotStaged(format!(
+                    "relayed {} in pane {pane_id} is {status}, not idle",
+                    self.record.harness
+                )));
+            }
+            let guarded = self.guarded(runtime)?;
+            return self.client.submit_guarded(
+                pane_id,
+                &self.record.harness,
+                text,
+                &guarded,
+                runtime,
+            );
+        }
+        let guarded = self.guarded(runtime)?;
+        self.client.prompt_guarded(pane_id, text, &guarded, runtime)
+    }
+}
+
 impl<A: ManagedApi + ?Sized> AgentApi for WorkspaceClient<'_, A> {
     fn panes(&self) -> crate::error::Result<Vec<Pane>> {
         Ok(self
@@ -2541,41 +2794,28 @@ impl<A: ManagedApi + ?Sized> AgentApi for WorkspaceClient<'_, A> {
         text: &str,
         runtime: &dyn agent::AgentRuntime,
     ) -> crate::error::Result<Submission> {
-        // Custom panes verify through their own composer model, and slash
-        // commands (including goal replacement) need the native primitive.
-        if self.record.adapter == "herdr-pane" || text.trim_start().starts_with('/') {
-            return self
-                .run_with_runtime(pane_id, text, runtime)
-                .map(|()| Submission::Unconfirmed);
-        }
-        if runtime.cancelled() {
-            return Ok(Submission::NotStaged(
-                "delivery was cancelled before typing".to_owned(),
-            ));
-        }
-        *self
-            .goal_objective
-            .lock()
-            .expect("goal operation lock poisoned") = None;
-        if self.record.adapter == "herdr-relay" {
-            let status = self.pane_info_with_runtime(pane_id, runtime)?.status;
-            if status != "idle" {
-                return Ok(Submission::NotStaged(format!(
-                    "relayed {} in pane {pane_id} is {status}, not idle",
-                    self.record.harness
-                )));
+        let native = matches!(self.record.adapter.as_str(), "herdr" | "herdr-foreign");
+        match self.submit_unchecked(pane_id, text, runtime) {
+            Err(error) if native && error.kind() == AdapterErrorKind::ProbableMisroute => {
+                self.recover_misroute(
+                    pane_id,
+                    text,
+                    "identity-changed-after-write",
+                    &error.to_string(),
+                    runtime,
+                );
+                Err(AdapterError::misroute_recovered(format!(
+                    "prompt for agent {} reached another program in pane {pane_id}, which was \
+                     told to ignore it: {error}",
+                    repr(Some(&self.record.name))
+                )))
             }
-            let guarded = self.guarded(runtime)?;
-            return self.client.submit_guarded(
-                pane_id,
-                &self.record.harness,
-                text,
-                &guarded,
-                runtime,
-            );
+            Ok(submission) if native => {
+                self.read_back(pane_id, text, &submission, runtime)?;
+                Ok(submission)
+            }
+            other => other,
         }
-        let guarded = self.guarded(runtime)?;
-        self.client.prompt_guarded(pane_id, text, &guarded, runtime)
     }
 
     fn wait_agent_status_with_runtime(
@@ -7597,6 +7837,9 @@ pub(crate) mod tests {
                     harness_pids: Mutex::new(BTreeMap::new()),
                     herdr_names: Mutex::new(BTreeMap::new()),
                     expect_supported: AtomicBool::new(false),
+                    scrollback: Mutex::new(BTreeMap::new()),
+                    redirect_once: Mutex::new(BTreeMap::new()),
+                    keys_sent: Mutex::new(Vec::new()),
                     expected_terminals: Mutex::new(Vec::new()),
                     replace_harness_before_effect: AtomicBool::new(false),
                     swap_terminal_before_effect: AtomicBool::new(false),
@@ -7775,6 +8018,12 @@ pub(crate) mod tests {
         herdr_names: Mutex<BTreeMap<String, String>>,
         /// Whether the server advertises `input-expect`.
         expect_supported: AtomicBool,
+        /// Text each pane has shown in its scrollback.
+        pub(crate) scrollback: Mutex<BTreeMap<String, Vec<String>>>,
+        /// One-shot: a prompt addressed to the key pane is written to the value pane.
+        pub(crate) redirect_once: Mutex<BTreeMap<String, String>>,
+        /// Every key sent outside the guarded input path, with its pane.
+        pub(crate) keys_sent: Mutex<Vec<(String, String)>>,
         /// The expected terminal sent with each input effect, in order.
         expected_terminals: Mutex<Vec<Option<String>>>,
         /// Replace the pane's harness as the next input effect reaches it.
@@ -8314,7 +8563,28 @@ pub(crate) mod tests {
             _: &dyn agent::AgentRuntime,
         ) -> AdapterResult<()> {
             self.effect(pane, expect_terminal)?;
+            let written = self
+                .redirect_once
+                .lock()
+                .unwrap()
+                .remove(pane)
+                .unwrap_or_else(|| pane.to_owned());
+            self.scrollback
+                .lock()
+                .unwrap()
+                .entry(written)
+                .or_default()
+                .push(text.to_owned());
             self.run(pane, text)
+        }
+        fn read_scrollback(&self, pane: &str) -> AdapterResult<String> {
+            Ok(self
+                .scrollback
+                .lock()
+                .unwrap()
+                .get(pane)
+                .map(|lines| lines.join("\n"))
+                .unwrap_or_default())
         }
         fn send_keys_expect(
             &self,
@@ -8498,7 +8768,11 @@ pub(crate) mod tests {
         fn report_agent_session(&self, _: &str, _: &str, _: &str, _: &str) -> AdapterResult<()> {
             Ok(())
         }
-        fn send_keys(&self, _: &str, _: &str) -> AdapterResult<()> {
+        fn send_keys(&self, pane: &str, key: &str) -> AdapterResult<()> {
+            self.keys_sent
+                .lock()
+                .unwrap()
+                .push((pane.to_owned(), key.to_owned()));
             Ok(())
         }
         fn close_tab(&self, _: &str) -> AdapterResult<()> {

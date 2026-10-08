@@ -33,6 +33,13 @@ class RecipientChanged(HerdrUnavailable):
     """The pane stopped holding the verified recipient before an input effect."""
 
 
+class MisrouteRecovered(AgentDeliveryError):
+    """Input reached the wrong program, which was interrupted and told to ignore it.
+
+    The message itself was not delivered to its recipient and may be retried.
+    """
+
+
 class ProbableMisroute(AgentDeliveryError):
     """Input was written, then the pane failed its recipient check: it may have reached another program."""
 
