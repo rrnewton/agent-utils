@@ -231,7 +231,7 @@ steps:
   # reader's message kept — and All never read drawn at once from held rows, read once behind them;
   # then paged, Main drawn from All keeping its way back, and All walked back to the reader's message
   # before it is drawn. A step of its own, not another walk in offline-cache-browser, whose CPU is
-  # already near its cap. Measured alone: 2.8s wall, under 2s CPU, a 310MB peak.
+  # already near its cap. Measured in the full gate: 3.8s wall, 3.0s CPU, a 333MB peak.
   - group: check
     job: view-switch-browser
     desc: Main and All switched from what the page holds, with every timeline request counted, in current Chromium
@@ -242,7 +242,7 @@ steps:
     cpu_timeout: 30
     hint:
       resources: {browser: 1}
-      est_duration_s: 3
+      est_duration_s: 4
       classification: latency-bound
       rss_baseline_bytes: 536870912
 
