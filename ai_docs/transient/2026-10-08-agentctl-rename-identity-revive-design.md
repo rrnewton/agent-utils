@@ -79,11 +79,10 @@ Enter (`_GuardedTerminal` / `GuardedTerminal` wrapping the pane I/O of
 
 Outcomes: a failure before anything was typed leaves the message pending
 (exit 75, retryable); a failure after an earlier effect of the same submission
-quarantines it as possibly submitted; a failure **after** a write quarantines
-it as a probable misroute (exit 76, `"probable_misroute": true` on the message
-in `failed/`). Nothing is re-resolved by label or name.
+quarantines it as possibly submitted; a failure **after** a write is a
+misroute, handled as in section E. Nothing is re-resolved by label or name.
 
-**With the Herdr change (finding 1).** When `herdr status server` prints
+**With the Herdr change (finding 1; not deployed, see E).** When `herdr status server` prints
 `capabilities: input-expect`, each write also carries `--expect-terminal
 <terminal_id>` and Herdr refuses it (`expectation_failed`, nothing written)
 unless the pane still holds that terminal, checked on Herdr's app thread in the
@@ -314,6 +313,50 @@ resolve in revive v2:
 - 13: define behaviour for every wrkslots failure, not only absence, and whether
   revive keeps slot boxing.
 
+## E. Post-facto misroute recovery (owner decision, 2026-10-08)
+
+The owner chose not to run a patched Herdr and to tolerate the race window,
+detecting a misroute after the fact and recovering. The `expect` branch goes
+to the owner's fork as a private PR for review only. agentctl, without any
+Herdr dependency:
+
+1. **Read-back.** After each prompt to a native or adopted agent, the prompt
+   must show in the target pane's scrollback (`pane read --source
+   recent-unwrapped`, whitespace-insensitive match on the last 40 characters)
+   within 5 s, unless the verified submission already saw it printed in that
+   pane. The recipient check runs again either way.
+2. **Detection.** A misroute is (a) a recipient check failing after any write,
+   or (b) the prompt absent from the target but present in exactly one other
+   registered agent's pane. Only registered panes are searched, so a
+   coordinator pane that merely shows the `agentctl send` command line is not
+   mistaken for a recipient.
+3. **Recovery.** The pane that got the prompt receives Esc, then the note
+   "Ignore the previous message: it was sent to the wrong agent by agentctl."
+   (Herdr's native prompt). If that pane shows no supported harness (Claude,
+   Codex, Muse), nothing is typed: in a shell the note could run as a command.
+4. **Record.** One JSON line per misroute in `.agentctl/NAME/misroutes.jsonl`
+   (detection, intended and observed pane and terminal, observed harness,
+   whether Esc and the note were sent, the message id), fsynced; it moves with
+   the record on rename and is archived on stop. The queued message keeps a
+   `misroutes` list.
+5. **Retry.** The message returns to the inbox and the drain retries from
+   readiness, which re-resolves and re-verifies the recipient: if the intended
+   agent is verifiably in its pane the prompt is delivered there, otherwise it
+   stays pending (exit 75) until the pane is fixed or re-anchored. A second
+   misroute of the same message quarantines it with `"probable_misroute":
+   true` (exit 76). Re-resolution never follows a label or name to a new pane;
+   an agent that moved panes needs `agentctl move` or `anchor`.
+
+Limits: a prompt that never shows in any scrollback (a long paste collapsed to
+a placeholder, a prompt queued behind a running turn) is accepted on the
+recipient check alone; text already written to the wrong program cannot be
+taken back, only countermanded.
+
+**Upgrade path.** Records from before anchors refuse input with the exact fix
+in the message (`agentctl anchor NAME`, after checking the pane). Automatic
+anchoring from what Herdr shows was rejected in review (finding 2): a
+restarted server can recreate every visible field for a different program.
+
 ## C. What was built and how it was verified (2026-10-08)
 
 Both editions, one commit on the agent-utils branch:
@@ -326,8 +369,10 @@ Both editions, one commit on the agent-utils branch:
   list/rename`, `status server` with an optional `input-expect` capability,
   `--expect-terminal`, and a real process standing in for each harness.
 
-Evidence (this host): Python 2318 related tests plus 25 new identity tests and
-7 new probe tests; Rust agentctl 873 lib tests (843 before); the
+Evidence (this host): Python 2321 related tests including 28 identity tests
+(pane swap between check and send, swap to a shell, prompt in another pane,
+second misroute) and 7 new probe tests; Rust agentctl 874 lib tests (843
+before); the
 Python-vs-Rust agentctl differential 376 paired checks, 0 divergences,
 including a rename interrupted by one edition and finished by the other, both
 ways. Herdr: 3198 of 3201 tests pass with 16 jobs; the same 3 fail on
