@@ -1813,6 +1813,7 @@ dependencies = [
  "http-body-util",
  "jiff",
  "reqwest",
+ "ring",
  "rusqlite",
  "schemars",
  "serde",

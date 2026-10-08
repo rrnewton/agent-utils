@@ -9,6 +9,7 @@
 //!
 //! The route list is an INVENTORY, checked against the router's source: a route added to
 //! `src/http/mod.rs` without an entry here fails the first test, so a new route cannot opt out.
+//! The same inventory is how `#223 asset-caching` pins that no `/api/` answer is ever cacheable.
 
 use std::collections::BTreeSet;
 
@@ -914,4 +915,102 @@ async fn a_caller_without_a_token_cannot_map_the_api() {
         offences.len(),
         offences.join("\n")
     );
+}
+
+/// The headers a request is answered with, without reading the body: a granted stream or audio read
+/// would never end. `None` if the router has not answered within ten seconds.
+async fn headers_of(
+    harness: &Harness,
+    method: &str,
+    sent: &Sent,
+) -> Option<(StatusCode, axum::http::HeaderMap)> {
+    let mut builder = Request::builder().method(method).uri(&sent.uri);
+    if let Some(token) = sent.token {
+        builder = builder.header("authorization", format!("Bearer {token}"));
+    }
+    if let Some(content_type) = sent.content_type {
+        builder = builder.header("content-type", content_type);
+    }
+    let request = builder
+        .body(Body::from(sent.body.clone()))
+        .expect("request");
+    let answered = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        harness.router.clone().oneshot(request),
+    )
+    .await
+    .ok()?
+    .expect("router responds");
+    Some((answered.status(), answered.headers().clone()))
+}
+
+#[tokio::test]
+async fn every_api_answer_is_no_store_whoever_asks_and_however() {
+    // `#223 asset-caching` made the page's static files cacheable. Nothing under `/api/` may follow
+    // them: its answers are channel text, transcripts and credentials belonging to one caller, and
+    // an installed app must never keep them in a browser cache. So every route in the inventory
+    // that is not the public web app is asked well and badly, by callers who may use it and
+    // callers who may not, and every answer — 200, 4xx, 5xx — must say `no-store`.
+    let harness = harness();
+    let ticket = harness.tickets.mint(Prepared {
+        channel: READ_CHANNEL.to_owned(),
+        message: "3333333333".to_owned(),
+        said: "hello".to_owned(),
+        speed: None,
+        observation: "observation-1".to_owned(),
+        preparation_ms: 0,
+    });
+    let mut offences = Vec::new();
+    let mut checked = 0;
+    let mut granted = 0;
+    for route in inventory() {
+        if route.auth == Auth::Public {
+            assert!(!route.path.starts_with("/api/"), "{} is public", route.path);
+            continue;
+        }
+        let callers = authorized_tokens(route.auth).into_iter().chain(
+            refused_callers(route.auth)
+                .into_iter()
+                .map(|(token, _)| token),
+        );
+        for token in callers {
+            let (well_formed, malformed) = requests(&route, token, &ticket);
+            for sent in std::iter::once(well_formed).chain(malformed) {
+                let Some((status, headers)) = headers_of(&harness, route.method, &sent).await
+                else {
+                    offences.push(format!(
+                        "{} {} from {token:?}: no answer",
+                        route.method, sent.uri
+                    ));
+                    continue;
+                };
+                checked += 1;
+                if status.is_success() {
+                    granted += 1;
+                }
+                let cache_control: Vec<_> = headers
+                    .get_all("cache-control")
+                    .iter()
+                    .map(|value| value.to_str().unwrap_or("<opaque>").to_owned())
+                    .collect();
+                if cache_control != ["no-store"] || headers.contains_key("etag") {
+                    offences.push(format!(
+                        "{} {} from {token:?}: {status} cache-control {cache_control:?}, etag {:?}",
+                        route.method,
+                        sent.uri,
+                        headers.get("etag")
+                    ));
+                }
+            }
+        }
+    }
+    assert!(
+        offences.is_empty(),
+        "{} API answers a browser could keep:\n{}",
+        offences.len(),
+        offences.join("\n")
+    );
+    // Guards on the sweep itself: refusals alone would make this pass with every handler broken.
+    assert!(checked > 300, "only {checked} answers were checked");
+    assert!(granted > 20, "only {granted} answers were successes");
 }

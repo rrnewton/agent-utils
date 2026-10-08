@@ -413,9 +413,11 @@ async fn the_install_manifest_selects_standalone_without_removing_the_browser_fa
         headers.get("content-type").and_then(|v| v.to_str().ok()),
         Some("application/manifest+json; charset=utf-8")
     );
+    // Revalidated on every load rather than never stored: it is public, and `#223 asset-caching`
+    // made it answer `304` when it has not changed. See `src/http/assets.rs`.
     assert_eq!(
         headers.get("cache-control").and_then(|v| v.to_str().ok()),
-        Some("no-store")
+        Some("no-cache")
     );
 
     let manifest: Value = serde_json::from_slice(&body).expect("valid web app manifest JSON");

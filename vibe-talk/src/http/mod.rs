@@ -44,6 +44,7 @@
 
 pub mod access_layer;
 pub mod api;
+pub mod assets;
 pub mod bearer_layer;
 
 use axum::extract::DefaultBodyLimit;
@@ -89,15 +90,18 @@ pub fn router(state: AppState) -> Router {
 fn routes(state: AppState) -> Router {
     Router::new()
         .route("/healthz", get(api::healthz))
-        .route("/", get(api::index_html))
-        .route("/app.js", get(api::app_js))
-        .route("/voice", get(api::voice_html))
-        .route("/voice.js", get(api::voice_js))
-        .route("/contract.js", get(api::contract_js))
-        .route("/voice.css", get(api::voice_css))
-        .route("/style.css", get(api::style_css))
-        .route("/manifest.webmanifest", get(api::web_manifest))
-        .route("/icons/{name}", get(api::app_icon))
+        // The static web app. One handler, which finds the file by path and decides what a
+        // browser may keep of it: see `assets` for why the shells revalidate and the files they
+        // name are immutable under their hashed URLs.
+        .route("/", get(assets::serve))
+        .route("/app.js", get(assets::serve))
+        .route("/voice", get(assets::serve))
+        .route("/voice.js", get(assets::serve))
+        .route("/contract.js", get(assets::serve))
+        .route("/voice.css", get(assets::serve))
+        .route("/style.css", get(assets::serve))
+        .route("/manifest.webmanifest", get(assets::serve))
+        .route("/icons/{name}", get(assets::serve))
         .route("/api/v1/channels", get(api::list_channels))
         // `#190 voice-agent-tools`. READ scope: every listed channel's last few hours in one call,
         // the route behind the `recent_activity` tool. It reads what `/digest` reads, once per

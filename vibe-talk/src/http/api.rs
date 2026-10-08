@@ -2006,89 +2006,9 @@ pub async fn stream(
         .into_response())
 }
 
-const INDEX_HTML: &str = include_str!("../../web/index.html");
-const VOICE_HTML: &str = include_str!("../../web/voice.html");
-const VOICE_JS: &str = include_str!("../../web/voice.js");
-const CONTRACT_JS: &str = include_str!("../../web/contract.js");
-const VOICE_CSS: &str = include_str!("../../web/voice.css");
-const APP_JS: &str = include_str!("../../web/app.js");
-const STYLE_CSS: &str = include_str!("../../web/style.css");
-
-fn asset(content_type: &'static str, body: impl IntoResponse) -> Response {
-    (
-        [
-            (header::CONTENT_TYPE, content_type),
-            // The app is a single page with no third-party anything; say so.
-            (header::CACHE_CONTROL, "no-store"),
-        ],
-        body,
-    )
-        .into_response()
-}
-
-/// `GET /` — the phone web app.
-pub async fn index_html() -> Response {
-    asset("text/html; charset=utf-8", INDEX_HTML)
-}
-
-/// `GET /voice` — the minimal page that starts an authenticated conversation.
-pub async fn voice_html() -> Response {
-    asset("text/html; charset=utf-8", VOICE_HTML)
-}
-
-/// `GET /voice.js`
-pub async fn voice_js() -> Response {
-    asset("text/javascript; charset=utf-8", VOICE_JS)
-}
-
-/// `GET /contract.js` — the generated wire-contract validators `/voice` loads before its script.
-pub async fn contract_js() -> Response {
-    asset("text/javascript; charset=utf-8", CONTRACT_JS)
-}
-
-/// `GET /voice.css`
-///
-/// Held apart from `style.css` on purpose: it turns the document into a fixed application frame
-/// (`100dvh`, no page scroll), and `/` is an ordinary scrolling page that must not inherit that.
-pub async fn voice_css() -> Response {
-    asset("text/css; charset=utf-8", VOICE_CSS)
-}
-
-/// `GET /app.js`
-pub async fn app_js() -> Response {
-    asset("text/javascript; charset=utf-8", APP_JS)
-}
-
-/// `GET /style.css`
-pub async fn style_css() -> Response {
-    asset("text/css; charset=utf-8", STYLE_CSS)
-}
-
-/// `GET /manifest.webmanifest` — public home-screen identity, with no credentials.
-pub async fn web_manifest() -> Response {
-    asset(
-        "application/manifest+json; charset=utf-8",
-        include_str!("../../web/manifest.webmanifest"),
-    )
-}
-
-/// `GET /icons/{name}` — embedded artwork, available before the app is authenticated.
-pub async fn app_icon(Path(name): Path<String>) -> Response {
-    let png: &[u8] = match name.as_str() {
-        "icon.svg" => {
-            return asset("image/svg+xml", include_str!("../../web/icons/icon.svg"));
-        }
-        "icon-192.png" => include_bytes!("../../web/icons/icon-192.png"),
-        "icon-512.png" => include_bytes!("../../web/icons/icon-512.png"),
-        "maskable-512.png" => include_bytes!("../../web/icons/maskable-512.png"),
-        _ => return not_found().await.into_response(),
-    };
-    asset("image/png", png)
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{APP_JS, VOICE_JS};
+    use crate::http::assets::{APP_JS, VOICE_JS};
 
     #[test]
     fn the_voice_page_pluralizes_and_prefers_the_operators_own_clock() {

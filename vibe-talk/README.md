@@ -108,10 +108,16 @@ currently ignores `display_override`, and this page deliberately does not opt in
 standalone meta mode: it therefore remains in browser mode, preserving the established microphone
 permission fallback instead of risking repeated prompts after app switches.
 
-Installation does not add offline access. There is no service worker, every app asset is served
-with `Cache-Control: no-store`, and the server applies the same policy centrally to all `/api/`
-and `/mcp` responses, including errors. Transcripts, minted session URLs, and API responses are
-never placed in Cache Storage or any other browser-managed HTTP cache. The installed app still
+Installation does not add offline access, and there is no service worker. What makes a launch
+fast is the browser's ordinary HTTP cache, holding only the page's public files. Every script,
+stylesheet and icon the page names carries the hash of its own bytes (`/voice.js?v=<hash>`) and is
+`immutable` under that URL, so the browser never asks for it again. The two pages and the manifest
+are revalidated on every load (`no-cache` with an ETag, answered `304` when unchanged). Launching
+the installed app therefore costs one small request for the page when nothing was deployed, and
+after a deploy only the files that changed. The plain URLs (`/voice.js`) still work, revalidated,
+for an app installed before this. The server applies `Cache-Control: no-store` centrally to all
+`/api/` and `/mcp` responses, including errors. Transcripts, minted session URLs, and API responses
+are never placed in Cache Storage or any other browser-managed HTTP cache. The installed app still
 requires the server to be reachable to load at all.
 
 To ask Chrome's own installability engine about the checked-out page, run:
