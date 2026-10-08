@@ -3522,6 +3522,8 @@ def coalesce_walk(chromium: BrowserType, args: argparse.Namespace, label: str, w
             gathered_under = page.evaluate("() => document.querySelector('#discord-log > li[data-coalesce=\"parent\"]')"
                                            ".getAttribute('data-id')")
             check(gathered_under == "215", f"{label}: two {pressing}s on 216's head gathered the replies of {gathered_under}")
+            # Past the moment after two presses in which the X that has just appeared ignores a third.
+            page.wait_for_timeout(400)
             page.evaluate(CENTRE_ROW_JS, "216")
             tap("216", "x", "the X beside 216's bridge")
             wait_until("() => document.querySelector('#discord-log > li[data-coalesce]') === null",

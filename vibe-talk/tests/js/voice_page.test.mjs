@@ -8712,16 +8712,26 @@ const stackPlaces = (page) => page.el("discord-log").children
 
 const gutterChild = (li, name) => li.children.find((node) => node.hasClass(name));
 
-/** Two taps on a reply's arrow, inside the window that makes them one double tap. */
-async function doubleTapArrow(page, li) {
+/** One tap on a reply's arrow, and nothing waited for. */
+async function clickArrow(arrow, li) {
+  let stopped = false;
+  const event = { target: arrow, stopPropagation: () => { stopped = true; } };
+  await arrow.dispatch("click", event);
+  if (!stopped) await li.dispatch("click", event);
+}
+
+/**
+ * Two taps on a reply's arrow, inside the window that makes them one double tap; then, unless `wait`
+ * is false, the reader waits, and the moment after them in which more taps are ignored passes — as a
+ * first tap's jump would go, if one were wrongly still waiting, and the test would see it land.
+ */
+async function doubleTapArrow(page, li, { wait = true } = {}) {
   const arrow = replyArrowOf(li);
   assert.ok(arrow, "the row has no arrow to tap");
-  for (let i = 0; i < 2; i += 1) {
-    let stopped = false;
-    const event = { target: arrow, stopPropagation: () => { stopped = true; } };
-    await arrow.dispatch("click", event);
-    if (!stopped) await li.dispatch("click", event);
-  }
+  for (let i = 0; i < 2; i += 1) await clickArrow(arrow, li);
+  for (let i = 0; i < 4 * REPLY_JUMP_PAGES; i += 1) await page.settle();
+  if (!wait) return;
+  page.expireTimers(REPLY_DOUBLE_TAP_MS);
   for (let i = 0; i < 4 * REPLY_JUMP_PAGES; i += 1) await page.settle();
 }
 
@@ -8852,8 +8862,11 @@ test("TWO TAPS ON A REPLY'S ARROW gather the replies of what it answers, the tap
   const area = page.el("scroll-area");
   const top = parkRow(page, "607", 260);
   const before = area.scrollTop;
-  await doubleTapArrow(page, rowWithId(page, "607"));
-  assert.equal(page.expireTimers(REPLY_DOUBLE_TAP_MS), 0, "the first tap's jump is still waiting to go");
+  await doubleTapArrow(page, rowWithId(page, "607"), { wait: false });
+  // One timer at the window's length: the moment in which a third tap is ignored. Two would be that and
+  // the first tap's jump, still waiting to go.
+  assert.equal(page.expireTimers(REPLY_DOUBLE_TAP_MS), 1, "the first tap's jump is still waiting to go");
+  for (let i = 0; i < 4; i += 1) await page.settle();
   assert.deepStrictEqual(shownIds(page), GATHERED, "two taps did not gather the replies");
   assert.ok(page.el("discord-log").children.every((li) => li.getAttribute("data-landed") !== "true"),
     "the first of two taps jumped away");
@@ -9022,6 +9035,86 @@ test("...but nothing newer joins the PARENT'S row: it stays the row time order d
   await doubleTapArrow(combined, rowWithId(combined, "1000000000000000003"));
   assert.deepStrictEqual(rows(combined), drawn, "gathering redrew the parent's row as another row");
   assert.deepStrictEqual(stackPlaces(combined).map(([, place]) => place), ["parent", "only"]);
+});
+
+test("A THIRD TAP just after two is the same gesture: it neither jumps away nor presses the X", async () => {
+  const page = await scatteredPage();
+  const reply = rowWithId(page, "607");
+  const arrow = replyArrowOf(reply);
+  await doubleTapArrow(page, reply, { wait: false });
+  assert.deepStrictEqual(shownIds(page), GATHERED);
+  // The third, on the arrow and on the X that has appeared in the gutter, within the window.
+  await clickArrow(arrow, reply);
+  const x = gutterChild(rowWithId(page, "602"), "reply-ungather");
+  await x.dispatch("click", { stopPropagation() {} });
+  for (let i = 0; i < 4; i += 1) await page.settle();
+  assert.equal(page.expireTimers(REPLY_DOUBLE_TAP_MS), 1, "a third tap started a jump of its own");
+  for (let i = 0; i < 4 * REPLY_JUMP_PAGES; i += 1) await page.settle();
+  assert.deepStrictEqual(shownIds(page), GATHERED, "a third tap put the replies straight back");
+  assert.ok(page.el("discord-log").children.every((li) => li.getAttribute("data-landed") !== "true"),
+    "a third tap jumped away from the replies it had just gathered");
+  // Once the moment has passed, the X is the X again.
+  await gutterChild(rowWithId(page, "602"), "reply-ungather").dispatch("click", { stopPropagation() {} });
+  assert.deepStrictEqual(shownIds(page), SCATTERED, "the X did nothing once the taps had settled");
+});
+
+test("A TAP STILL WAITING TO JUMP goes with a change of view or of channel", async () => {
+  const page = newPage();
+  const data = scatteredThread();
+  const second = { id: "1110000000000000002", label: "second", writable: true };
+  page.threadingSupported = true;
+  page.threads = data.threads;
+  page.channels = [{ ...CHANNEL }, second];
+  await signIn(page);
+  await showDiscord(page, data.messages);
+  assert.deepStrictEqual(shownIds(page), SCATTERED);
+  const reply = rowWithId(page, "607");
+  await clickArrow(replyArrowOf(reply), reply);
+  await pickThread(page, "main");
+  assert.equal(page.expireTimers(REPLY_DOUBLE_TAP_MS), 0, "the tap taken in All still waits to jump in Main");
+  for (let i = 0; i < 4 * REPLY_JUMP_PAGES; i += 1) await page.settle();
+  assert.equal(page.el("thread-select").value, "main", "a tap taken in All jumped once Main was open");
+  assert.ok(page.el("discord-log").children.every((li) => li.getAttribute("data-landed") !== "true"));
+  await pickThread(page, "flat");
+  const again = rowWithId(page, "607");
+  await clickArrow(replyArrowOf(again), again);
+  page.el("discord-channel").value = second.id;
+  await page.el("discord-channel").dispatch("change");
+  await page.settle();
+  assert.equal(page.expireTimers(REPLY_DOUBLE_TAP_MS), 0, "the tap taken in one channel still waits to jump in another");
+});
+
+test("DONE IN HIDE READ, taking a row out from between, decides the arrows and the stack again", async () => {
+  // A provider without threads, whose Hide read takes a row dealt with out of the list where it is.
+  const page = newPage();
+  await signIn(page);
+  await showDiscord(page, [
+    message({ id: "1000000000000000001", content: "is the runner wedged?" }),
+    message({ id: "1000000000000000002", content: "the weather is nice" }),
+    message({ id: "1000000000000000003", content: "restarted it", reply_to: "1000000000000000001", ...ALICE }),
+    message({ id: "1000000000000000004", content: "lunch?" }),
+    message({ id: "1000000000000000005", content: "and the queue drains", reply_to: "1000000000000000001", ...OWNER }),
+  ]);
+  await turnTodoOn(page);
+  assert.equal(arrowStyle(rowWithId(page, "1000000000000000003")), "disconnected");
+  await doneButton(rowWithId(page, "1000000000000000002")).click();
+  await page.settle();
+  assert.deepStrictEqual(shownIds(page), ["1000000000000000001", "1000000000000000003", "1000000000000000004",
+    "1000000000000000005"]);
+  assert.equal(arrowStyle(rowWithId(page, "1000000000000000003")), "adjacent",
+    "the reply's arrow still points past the row Done took away");
+  // Gathered: a reply dealt with leaves the stack one shorter, and its parent dealt with takes the stack.
+  await doubleTapArrow(page, rowWithId(page, "1000000000000000005"));
+  assert.deepStrictEqual(stackPlaces(page).map(([, place]) => place), ["parent", "first", "last"]);
+  await doneButton(rowWithId(page, "1000000000000000003")).click();
+  await page.settle();
+  assert.deepStrictEqual(stackPlaces(page), [["1000000000000000001", "parent"], ["1000000000000000005", "only"]],
+    "the bridge still draws a reply Done took out of the stack");
+  await doneButton(rowWithId(page, "1000000000000000001")).click();
+  await page.settle();
+  assert.deepStrictEqual(stackPlaces(page), [], "the stack outlived its parent");
+  assert.deepStrictEqual(shownIds(page), ["1000000000000000004", "1000000000000000005"],
+    "the replies stayed where the stack had them");
 });
 
 /**

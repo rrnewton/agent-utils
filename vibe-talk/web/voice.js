@@ -7815,8 +7815,10 @@ async function changeChannelView(view, threadId = null, summary = null) {
   setPinnedOnly(false);
   // `#215 reply-coalesce`. Gathered replies are an arrangement of the list on screen, and go with
   // it — back into time order BEFORE the rows are kept below, so that coming back to this view
-  // finds them in the order every other read of it draws.
+  // finds them in the order every other read of it draws. A tap on an arrow still waiting to jump
+  // goes too: the message it would find is looked for in the list on screen when it fires.
   putRepliesBack();
+  dropReplyArrowTap();
   rememberChannelDraft();
   rememberChannelContext();
   if (view === "thread" && channelView !== "thread") threadOrigin = channelView;
@@ -10597,12 +10599,28 @@ const REPLY_DOUBLE_TAP_MS = 250;
 let replyArrowTap = null;
 
 /**
+ * The timer of the moment after two taps on an arrow gathered, while taps on an arrow or on the X are
+ * ignored; else null. A third tap that close is the same gesture running on, not a new one — a hand
+ * that taps three times, or a mouse that reports three clicks — and it lands where the gathering has
+ * just changed what is under the finger: on the X that has appeared in the gutter, which would put
+ * the replies straight back, or on an arrow, which would wait and then jump away from them.
+ */
+let replyTapsSettling = null;
+
+/** Forget a tap on an arrow still waiting to jump: the list it would have jumped in is going. */
+function dropReplyArrowTap() {
+  if (replyArrowTap) clearTimeout(replyArrowTap.timer);
+  replyArrowTap = null;
+}
+
+/**
  * The control in a reply's gutter. `li` is the reply's own row.
  *
  * One tap jumps to the message the reply answers; two, within `REPLY_DOUBLE_TAP_MS`, gather that
- * message's replies under it (`#215 reply-coalesce`). Counted from the clicks themselves rather than
- * from `dblclick`, which a phone does not reliably send for two taps — and a keyboard's Enter,
- * pressed twice, is two clicks as well.
+ * message's replies under it (`#215 reply-coalesce`), and a third that soon after is ignored
+ * (`replyTapsSettling`). Counted from the clicks themselves rather than from `dblclick`, which a
+ * phone does not reliably send for two taps — and a keyboard's Enter, pressed twice, is two clicks
+ * as well.
  */
 function replyArrow(li) {
   const arrow = document.createElement("button");
@@ -10627,9 +10645,12 @@ function replyArrow(li) {
     // The row's own tap handler would fold the row, or start reading it aloud in reading mode. It
     // already ignores a click on a button, and this does not rely on that: the click ends here.
     if (event) event.stopPropagation();
+    if (replyTapsSettling !== null) return;
     if (replyArrowTap && replyArrowTap.arrow === arrow) {
-      clearTimeout(replyArrowTap.timer);
-      replyArrowTap = null;
+      dropReplyArrowTap();
+      replyTapsSettling = setTimeout(() => {
+        replyTapsSettling = null;
+      }, REPLY_DOUBLE_TAP_MS);
       guardQuietly(() => gatherFromReply(li))();
       return;
     }
@@ -11313,6 +11334,8 @@ function ungatherButton() {
   button.addEventListener("click", (event) => {
     // The row's own tap would fold the reply or read it aloud; this tap is the X's.
     if (event) event.stopPropagation();
+    // ...unless it is the end of the taps on an arrow that put the X here (`replyTapsSettling`).
+    if (replyTapsSettling !== null) return;
     scatterReplies();
   });
   return button;
@@ -14468,6 +14491,12 @@ async function refreshAfterInboxChange() {
       return ids.length === 0 || !ids.every((id) => archivedIds.has(id));
     });
     el("discord-log").replaceChildren(...kept);
+    // A row gone from the list is a row gone from above another (`#214 reply-arrow`): the arrows are
+    // decided again. Gathered replies (`#215 reply-coalesce`) have their stack drawn again, by the
+    // whole pass, which puts them back in time order if what went was their parent — before the
+    // rows are counted, since that can join two of them.
+    if (rowsGathered) renderChannelRows();
+    else renderReplyLinks();
     backlogSize = el("discord-log").children.length;
     todoView = { ...todoView, left: backlogSize };
     renderChannelSeam(todoSummary());
@@ -18220,9 +18249,11 @@ function readEnteredChannel(keepPosition) {
 // one across would ask the server to step back from a message that is not there.
 function changeSelectedChannel() {
   // `#215 reply-coalesce`. Gathered replies belong to the channel they were gathered in, whose rows
-  // are about to go.
+  // are about to go — and so does a tap on an arrow still waiting to jump, which would otherwise walk
+  // this channel's history for a message of the last one.
   gathered = null;
   rowsGathered = false;
+  dropReplyArrowTap();
   applyChannelProvider();
   rememberActiveChannel();
   rememberChannelDraft();
