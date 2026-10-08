@@ -2714,6 +2714,28 @@ complete and well formed — brackets that do not pair, an empty name, a target 
 shows the address written inside it, if there is one, and never a name. An address that appears
 twice in a message, or in the messages one combined row stands for, is one line.
 
+**PRs, Commits and Actions** (`#212 link-filter`). While Links is on, three toggles hang just under
+its button — centred under it, or right-aligned under the end of the bar where centred would run
+off a narrow phone — each a full 44px target, all on until the reader turns one off. Each takes one
+kind of GitHub link out of the view, so what is left is the documents:
+
+- **PRs** — a pull request, `/OWNER/REPO/pull/N` and anything under it (its files, its checks, a
+  comment), and the `/pulls` lists;
+- **Commits** — `/commit/SHA` (seven hex digits or more), `/commits/…`, `/compare/…`, and one commit
+  seen from its pull request, `/pull/N/commits/SHA`;
+- **Actions** — `/actions/…` (runs, jobs, workflows), a check run's `/runs/ID`, and `/checks`.
+
+Only addresses on `github.com` or `www.github.com`, in any case, inside a repository, count; the
+query, the fragment and a trailing slash are ignored, and a Markdown link is judged by its address,
+not its name. An issue, a file, a wiki page, a release, and anything on any other host is never
+hidden. A row left with other links shows those; a row left with none goes, and the count says so.
+The number beside each name is how many links of that kind the messages in view hold, on or off, so
+a reader can see what turning it back on would bring ("99+" past ninety-nine). When nothing is
+left, the list names the kinds that did it — "No links left once PRs and Commits are hidden — turn
+them back on under the Links button." — and over Pinned or a search it says the same of the pins or
+the matches. The choice is kept on the device, as the page's other view preferences are, so a
+reader who always turns them off does it once; with nothing kept, all three are on.
+
 ### Choosing a thread sits beside choosing the channel
 
 `gchat-thread-selector`. The second picker on the control bar, immediately right of the channel

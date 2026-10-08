@@ -271,6 +271,24 @@
                   <path d="m15.3 15.3 4.2 4.2" />
                 </svg>
               </button>
+              <!--
+                `#212 link-filter`. Three toggles that float UNDER the Links button while Links is on,
+                and only then, as the owner asked: "3 buttons to pop up under the link icon I just
+                clicked. They should be named PRs Commits Actions and be toggled on by default.
+                Unselecting them filters out all the links that are just GitHub links to commits PRs
+                etc". Each one, turned off, takes one kind of GitHub link out of the Links view; the
+                number beside its name is how many of the links in view are of that kind. The choice
+                is kept on this device.
+
+                Last in the bar rather than beside Links, so it stands between none of the filters on
+                the bar's line: it is out of that line altogether, and web/voice.css hangs it under
+                Links from here.
+              -->
+              <div id="link-kinds" role="group" aria-label="Kinds of GitHub link to show" hidden>
+                <button id="link-kind-pr" class="link-kind" type="button" aria-pressed="true" title="Show links to pull requests">PRs<span id="link-kind-pr-count" class="link-kind-count"></span></button>
+                <button id="link-kind-commit" class="link-kind" type="button" aria-pressed="true" title="Show links to commits and comparisons">Commits<span id="link-kind-commit-count" class="link-kind-count"></span></button>
+                <button id="link-kind-action" class="link-kind" type="button" aria-pressed="true" title="Show links to Actions runs and checks">Actions<span id="link-kind-action-count" class="link-kind-count"></span></button>
+              </div>
             </div>
           </div>
 

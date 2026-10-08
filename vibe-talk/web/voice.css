@@ -129,6 +129,14 @@
      at 150% type, where the filter beside it is. */
   --float-edge: 8px;
   --float-gap: 0.3rem;
+  /* How far the open glass keeps whichever filter stands beside it, so the filter's square stays
+     out of the glass's 48px target (see `#screen-main[data-searching] #search-toggle`). A token
+     since `#212 link-filter`, because the kinds of link under Links are placed by it as well. */
+  --glass-clear: max(0px, calc(var(--search-hit) - var(--search-disc) - var(--float-edge) + 1px - var(--bar-gap)));
+  /* `#212 link-filter`. The space between the open bar's lower edge and the targets of the kinds of
+     link hung under it. The pills drawn inside those targets sit lower again, so the eye sees a
+     clear gap while the targets meet nothing on the bar. */
+  --kinds-gap: 2px;
   /* `#206 pin-message`. A pinned row's chip and edge. GOLD, because nothing else here is: the
      reading row is `--warn` orange, the kept place and pressed toggles are `--accent` blue, and the
      summary is teal — so "pinned" cannot be mistaken for "being read" or "where I left off". Judged
@@ -2501,7 +2509,7 @@ body {
    no pins — keeps its square out of the glass's (`#search-toggle::after` reaches this far left of
    the disc), so neither steals the other's taps. On the glass, so it holds for either. */
 #screen-main[data-searching] #search-toggle {
-  margin-left: max(0px, calc(var(--search-hit) - var(--search-disc) - var(--float-edge) + 1px - var(--bar-gap)));
+  margin-left: var(--glass-clear);
 }
 
 /* Pressed is the open state, and it has to be legible at a glance — the field beside it is the
@@ -2523,6 +2531,107 @@ body {
 
 #screen-main[data-searching] #pane-discord[data-freshness] {
   padding-top: 0;
+}
+
+/* `#212 link-filter`. The kinds of link — PRs, Commits, Actions — hung UNDER Links while it is on:
+   a row of three toggles floating below the bar as the bar floats over the list. Centred under the
+   Links button; and where centred would run past the bar's right-hand end — always over the call
+   view, where Links stands beside the glass, and over the channel once the numbers on them are up on
+   a narrow phone — right-aligned under the bar's end instead, so it never leaves the screen.
+
+   Placed from the bar's right-hand inner edge, because everything right of Links on the bar has a
+   size this sheet already knows: the bar's 2px of right padding, the glass's disc and the clearance
+   before it, the gap, and — over the channel — Pinned's square, whose negative margin cancels the
+   gap after Links. `--links-mid` is the distance from that edge to the middle of Links. The row's
+   right-hand end is put there, then moved right by half the row's own width, which centres the row
+   on Links, or by `--links-mid` if that is less, which puts its end on the bar's. One rule for both
+   cases, and no script measuring anything: it holds at every width and every type size. */
+#link-kinds {
+  --links-mid: calc(2px + var(--search-disc) + var(--glass-clear) + var(--bar-gap) + 1.5 * var(--toggle-hit));
+  position: absolute;
+  top: calc(100% + 1px + var(--kinds-gap));
+  right: var(--links-mid);
+  display: flex;
+  transform: translateX(min(50%, var(--links-mid)));
+}
+
+/* Over the call view there are no pins, and Links stands next to the glass. */
+#pinned-filter[hidden] ~ #link-kinds {
+  --links-mid: calc(2px + var(--search-disc) + var(--glass-clear) + var(--bar-gap) + 0.5 * var(--toggle-hit));
+}
+
+/* Each kind a whole 44px-tall target, never narrower than tall, abutting the next as the filters on
+   the bar abut; what is drawn inside is a pill in the bar's panel and edge, and the pills are what
+   the eye separates. The target is px, as the bar's buttons are; the words are type, and grow with
+   the reader's font inside it — up to 16px, a quarter larger than at the default size. Past that,
+   three of them with three-figure numbers ("99+") were wider than a 360px phone: at 150% type the
+   row measured 355px in Chromium, and right-aligned under the bar it ran off the left of the screen
+   with half of PRs. Capped, it is about 305px there. */
+.link-kind {
+  position: relative;
+  z-index: 0;
+  min-width: var(--toggle-hit);
+  height: var(--toggle-hit);
+  padding: 0 9px;
+  background: none;
+  border: none;
+  border-radius: 0;
+  color: var(--muted);
+  font-size: min(0.8rem, 16px);
+  line-height: 1;
+  white-space: nowrap;
+  touch-action: manipulation;
+  -webkit-tap-highlight-color: transparent;
+}
+
+/* The pill, behind the words: opaque, because the row floats over whatever message is scrolled
+   under it, and shadowed as the bar is. */
+.link-kind::before {
+  content: "";
+  position: absolute;
+  z-index: -1;
+  inset: 6px 2px;
+  background: var(--panel);
+  border: 1px solid var(--edge);
+  border-radius: 999px;
+  box-shadow: 0 1px 6px rgb(0 0 0 / 35%);
+  pointer-events: none;
+}
+
+/* ON — the kind is shown — ringed and tinted in the accent, as Links on is, with its words in the
+   ink, as the pressed To do chip's are: accent words on the accent's own tint come to 4.2:1 in the
+   dark theme, short of the 4.5 type this small needs, and the ink is over 9:1. OFF is the quiet grey
+   of a control at rest on the bare panel, AND struck through, because what is off is hidden: told
+   apart by more than its colour, in either theme. */
+.link-kind[aria-pressed="true"] {
+  color: var(--ink);
+}
+
+.link-kind[aria-pressed="true"]::before {
+  background: color-mix(in srgb, var(--accent) 18%, var(--panel));
+  border-color: var(--accent);
+}
+
+.link-kind[aria-pressed="false"] {
+  text-decoration: line-through;
+}
+
+/* How many links in view are of that kind, a size below the name it qualifies. Blank at none, and
+   then it takes no room either. */
+.link-kind-count {
+  margin-left: 0.3em;
+  font-size: 0.8em;
+  font-variant-numeric: tabular-nums;
+}
+
+.link-kind-count:empty {
+  display: none;
+}
+
+/* ...and the list makes room for the row as it does for the bar, so the first row starts below the
+   kinds of link rather than underneath them. */
+#screen-main[data-searching][data-link-kinds] #scroll-area {
+  padding-top: calc(var(--float-line) + var(--search-bar) / 2 + var(--kinds-gap) + var(--toggle-hit) + 0.35rem);
 }
 
 /* Armed reads differently from merely being dragged, because the difference is the whole of what

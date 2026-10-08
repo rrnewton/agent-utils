@@ -79,7 +79,8 @@ const ACTIVE_CHANNEL_KEY = "vibe-talk.voice.active-channel";
  *   | "help-link-identities"
  *   | "help-link-live-messages" | "help-link-mark-own" | "help-link-microphone"
  *   | "help-link-reading-width" | "help-link-resuming" | "help-link-speech-prep"
- *   | "help-link-storage" | "jump-marker" | "jump-newest" | "links-filter" | "load-older" | "load-older-turns"
+ *   | "help-link-storage" | "jump-marker" | "jump-newest" | "link-kind-action" | "link-kind-commit"
+ *   | "link-kind-pr" | "links-filter" | "load-older" | "load-older-turns"
  *   | "open-add-channel" | "open-browse-channels" | "open-help" | "open-settings"
  *   | "pinned-filter" | "post-confirm-cancel" | "post-confirm-send" | "prompts-open" | "read-aloud" | "read-new" | "read-speed" | "remove-channel"
  *   | "rename-channel" | "reply-cancel" | "reply-context-more" | "reply-send" | "save-alias"
@@ -1765,6 +1766,9 @@ function searchScope() {
  * redrew, or a turn that just arrived, gets its links drawn here or not at all. It is one more
  * condition on every row, so the filters in force are ANDed — the search text, Links, and the
  * Pinned list the rows came from — and the count speaks for what is left after all of them.
+ *
+ * `#212 link-filter`: and the kinds of link the reader has turned off under Links. A row whose
+ * links are all of those kinds has none left to show, and goes as a row with no link does.
  */
 function applySearch() {
   const terms = searchOpen ? searchTerms(searchQuery) : [];
@@ -1772,7 +1776,18 @@ function applySearch() {
   const scope = searchScope();
   let matched = 0;
   let loaded = 0;
-  let linked = 0;
+  // Under Links: the rows holding a link of any kind, the rows with one still shown once the kinds
+  // turned off are out, and the rows the text matches that hold one of any kind — three different
+  // answers when the list is empty, see `linksEmptySentence` — and how many links of each kind there
+  // are in all of them, and in what the text matches: the second is the number on each kind's
+  // button, and both say which hidden kinds really took something away.
+  const tally = {
+    linked: 0,
+    kept: 0,
+    saidLinked: 0,
+    everywhere: new Map(LINK_KINDS.map(({ kind }) => [kind, 0])),
+    matching: new Map(LINK_KINDS.map(({ kind }) => [kind, 0])),
+  };
   for (const id of SEARCH_LISTS) {
     const list = el(id);
     const counts = scope.includes(id);
@@ -1789,8 +1804,20 @@ function applySearch() {
       setClassWord(row, "search-hidden", !hit);
       if (counts && text !== null) {
         loaded += 1;
+        const held = links ? heldLinks(row) : [];
+        if (held.length > 0) {
+          tally.linked += 1;
+        }
         if (shown > 0) {
-          linked += 1;
+          tally.kept += 1;
+        }
+        if (said && held.length > 0) {
+          tally.saidLinked += 1;
+        }
+        for (const link of held) {
+          if (link.kind === null) continue;
+          tally.everywhere.set(link.kind, tally.everywhere.get(link.kind) + 1);
+          if (said) tally.matching.set(link.kind, tally.matching.get(link.kind) + 1);
         }
         if (hit) {
           matched += 1;
@@ -1798,13 +1825,16 @@ function applySearch() {
       }
     }
   }
+  if (links) {
+    renderLinkKindCounts(tally.matching);
+  }
   // `#206 pin-message`. Over the Pinned filter the denominator is the channel's PINS, all of them,
   // and the count says so even before anything is typed: the filter is in force, and the bar is
   // where it says what it is doing.
   if (pinnedOnly && currentView === "discord") {
     el("search-count").textContent =
       terms.length === 0 && !links ? `${loaded} pinned` : `${matched} of ${loaded} pinned`;
-    const sentence = pinnedEmptySentence(loaded, matched, terms.length > 0, links ? linked : null);
+    const sentence = pinnedEmptySentence(loaded, matched, terms.length > 0, links ? tally : null);
     el("search-empty").textContent = sentence;
     el("search-empty").hidden = sentence === "";
     return;
@@ -1818,7 +1848,7 @@ function applySearch() {
   // a blank screen whose only explanation is a 0.75rem count at the far end of the search bar.
   // Not raised over a list that was empty to begin with: there the pane already says why.
   if (links) {
-    const sentence = linksEmptySentence(loaded, linked, matched);
+    const sentence = linksEmptySentence(loaded, tally, matched);
     el("search-empty").textContent = sentence;
     el("search-empty").hidden = sentence === "";
     return;
@@ -1833,16 +1863,23 @@ function applySearch() {
  * not be read, one still on its way, and a search that matches none of the pins are four different
  * answers, and a reader shown nothing would take any of them for the page having broken.
  *
- * `linked` is how many of the pins hold a link while the Links filter is on, and null while it is
+ * `tally` is what the Links filter counted while it is on (see `applySearch`), and null while it is
  * off. `#211 link-filter`: "none of the pins has a link" and "none of the pins with a link matches
- * what you typed" are two more answers, and neither is "no pins".
+ * what you typed" are two more answers, and neither is "no pins". `#212 link-filter`: nor is "the
+ * pins' links are all of the kinds turned off", which says how to bring them back.
  */
-function pinnedEmptySentence(loaded, matched, searching, linked = null) {
+function pinnedEmptySentence(loaded, matched, searching, tally = null) {
   if (loaded > 0) {
-    if (linked === 0) return "None of this channel's pinned messages has a link.";
+    if (tally !== null && tally.linked === 0) return "None of this channel's pinned messages has a link.";
+    if (tally !== null && tally.kept === 0) {
+      return `None of this channel's pinned messages has a link left once ${hiddenKindNames(tally.everywhere)} ` +
+        "are hidden — turn them back on under the Links button.";
+    }
     if (matched > 0 || !searching) return "";
-    return linked === null
-      ? "None of this channel's pinned messages match that search."
+    if (tally === null) return "None of this channel's pinned messages match that search.";
+    return tally.saidLinked > 0
+      ? "None of this channel's pinned messages with a link match that search once " +
+        `${hiddenKindNames(tally.matching)} are hidden.`
       : "None of this channel's pinned messages with a link match that search.";
   }
   if (pinsProblem) return `This channel's pinned messages could not be loaded: ${pinsProblem}`;
@@ -1854,8 +1891,13 @@ function pinnedEmptySentence(loaded, matched, searching, linked = null) {
  * What the Links filter says where its rows would be, or "" when its rows say it. `#211
  * link-filter`. "loaded" for the reason the count says it: what is on screen is a bounded suffix
  * of a longer record, and "nobody posted a link" is a claim this page cannot make.
+ *
+ * `#212 link-filter`. With kinds of link turned off there are two more ways to have nothing left,
+ * and both say which kinds did it, because the reader turned those off on some earlier day and the
+ * page remembered: every link loaded is of those kinds, or every message the text matches links
+ * only to them. The first says where the buttons are that bring them back.
  */
-function linksEmptySentence(loaded, linked, matched) {
+function linksEmptySentence(loaded, tally, matched) {
   // The Threads list is a list of THREADS. Its rows have no text of their own to hold a link, so an
   // empty list there is not "no links" — it is the wrong list to look in, and the reader is told
   // where the links are.
@@ -1864,8 +1906,16 @@ function linksEmptySentence(loaded, linked, matched) {
   }
   // An empty list explains itself in the pane's own words.
   if (loaded === 0) return "";
-  if (linked === 0) return "No links in the messages loaded so far.";
-  return matched === 0 ? "None of the loaded messages with a link match that search." : "";
+  if (tally.linked === 0) return "No links in the messages loaded so far.";
+  if (tally.kept === 0) {
+    return `No links left once ${hiddenKindNames(tally.everywhere)} are hidden — turn them back on under the Links button.`;
+  }
+  if (matched > 0) return "";
+  // Some link is still shown, so this is the text: what it matched links only to hidden kinds, or
+  // holds no link at all.
+  return tally.saidLinked > 0
+    ? `None of the loaded messages with a link match that search once ${hiddenKindNames(tally.matching)} are hidden.`
+    : "None of the loaded messages with a link match that search.";
 }
 
 /**
@@ -2162,13 +2212,16 @@ function rowLinkSources(row) {
  * or across the messages a combined row stands for, is one line. Its place is where it first
  * appears, and its name is the first NAME it is given: a bare address followed later by the same
  * address as a Markdown link reads as the link's name.
+ *
+ * Each as `{href, name, kind}`: `#212 link-filter`, the kind its address is (`linkKind`), read once
+ * here with the address rather than on every redraw.
  */
 function rowLinks(row) {
   const byAddress = new Map();
   for (const link of rowLinkSources(row).flatMap(linksIn)) {
     const held = byAddress.get(link.href);
     if (!held) {
-      byAddress.set(link.href, { ...link });
+      byAddress.set(link.href, { ...link, kind: linkKind(link.href) });
     } else if (held.name === held.href) {
       held.name = link.name;
     }
@@ -2220,15 +2273,27 @@ function placeAfterBody(row, node) {
  * Show a row's links in place of its text, and answer how many there are. Built once per row and
  * text, and kept on the row while the filter stays on: `applySearch` asks on every redraw and every
  * keystroke, and the answer only changes when the row does.
+ *
+ * `#212 link-filter`. ...or when the kinds of link turned off do. The links are read once per text
+ * and kept, every kind of them (`heldLinks`); only the list on screen is drawn again, without the
+ * kinds the reader has hidden. So the answer is how many are SHOWN, and a row whose links are all of
+ * hidden kinds answers none, as a row with no link does.
  */
 function showRowLinks(row) {
   const key = rowLinkSources(row).join("\u0000");
   let drawn = row.linkView;
   if (!drawn || drawn.key !== key) {
     if (drawn && drawn.node && drawn.node.parentNode === row) row.removeChild(drawn.node);
-    const links = rowLinks(row);
-    drawn = { key, count: links.length, node: links.length > 0 ? linkList(links) : null };
+    drawn = { key, links: rowLinks(row), hidden: null, count: 0, node: null };
     row.linkView = drawn;
+  }
+  // The set itself, not its contents: `setLinkKindShown` replaces it whole on every change.
+  if (drawn.hidden !== hiddenLinkKinds) {
+    if (drawn.node && drawn.node.parentNode === row) row.removeChild(drawn.node);
+    const shown = drawn.links.filter((link) => !hiddenLinkKinds.has(link.kind));
+    drawn.hidden = hiddenLinkKinds;
+    drawn.count = shown.length;
+    drawn.node = shown.length > 0 ? linkList(shown) : null;
   }
   if (drawn.node && drawn.node.parentNode !== row) placeAfterBody(row, drawn.node);
   if (drawn.count > 0) row.setAttribute("data-links-view", "true");
@@ -2248,6 +2313,9 @@ function takeDownRowLinks(row) {
 
 /** Whether a row is showing its links in place of its text. */
 const showingLinks = (row) => row.getAttribute("data-links-view") === "true";
+
+/** Every link a row holds while the Links filter is on, the hidden kinds too, as `rowLinks` reads them. */
+const heldLinks = (row) => (row.linkView ? row.linkView.links : []);
 
 /** Which list the reader is in, so a place kept in one is never restored in another. */
 const filterPlace = () =>
@@ -2269,6 +2337,9 @@ function setLinksOnly(on) {
   }
   linksOnly = on;
   el("links-filter").setAttribute("aria-pressed", on ? "true" : "false");
+  // `#212 link-filter`. The kinds of link come up under it, or go, and the room the list makes for
+  // them with them — before anything below measures the list.
+  renderLinkKinds();
   // The rows' links drawn, or taken down, BEFORE the reader is placed: placing measures them.
   renderScrollTools();
   if (on) {
@@ -2282,6 +2353,191 @@ function setLinksOnly(on) {
   renderScrollTools();
   // Off, the rows' text is back on screen, and summary mode asks about what is in view.
   requestVisibleSummaries();
+}
+
+// --- the kinds of link under Links ----------------------------------------------------------------
+//
+// `#212 link-filter`. The owner, on his phone, the morning after Links shipped: "When I activate this
+// link view I would like 3 buttons to pop up under the link icon I just clicked. They should be named
+// PRs Commits Actions and be toggled on by default. Unselecting them filters out all the links that
+// are just GitHub links to commits PRs etc, which match a certain URL pattern. The reason for this is
+// I usually want to look for DOCUMENTS but these are the 3 main sources of noise in my url view."
+//
+// WHAT A KIND IS: an address on github.com itself, inside one repository, whose path says it is a
+// pull request, a commit or a run of Actions — `linkKind`, and nothing but the address decides it.
+// The name a Markdown link gives it does not: "the fix" written over a pull request's address is a
+// pull request. Everything else — an issue, a file, a wiki page, a release, any page on any other
+// host — is of no kind, and no button ever hides it. Those are the documents the reader came for.
+//
+// WHAT TURNING ONE OFF DOES: its links leave the Links view, row by row. A row left with other links
+// shows those; a row left with none goes, as a row with no link does. The count and the sentence in
+// an empty list speak for what is left, and an empty list names the kinds that emptied it.
+//
+// REMEMBERED on this device (LINK_KINDS_KEY), as the page's other view preferences are: a reader who
+// always turns them off should not have to every time. With nothing kept, all three are on.
+
+const LINK_KINDS_KEY = "vibe-talk.voice.hidden-link-kinds";
+
+/**
+ * The kinds, in the order their buttons stand under Links, each with its button's id and the word
+ * on it. The number of links of that kind in view is in `<chip>-count`, inside the button.
+ */
+const LINK_KINDS = [
+  { kind: "pr", chip: "link-kind-pr", name: "PRs" },
+  { kind: "commit", chip: "link-kind-commit", name: "Commits" },
+  { kind: "action", chip: "link-kind-action", name: "Actions" },
+];
+
+/**
+ * The largest number a kind's button prints; past it, the number and a plus. It keeps the three
+ * buttons inside a 360px screen under the reader's largest type, where the row is right-aligned and
+ * every digit it grows by comes off its left end.
+ */
+const LINK_KIND_COUNT_MAX = 99;
+
+/**
+ * An address on GitHub itself — `github.com` or `www.github.com`, in any case, and nothing longer
+ * that merely begins with it — and its path, up to the query or the fragment. A port, a user name
+ * or any other host is not GitHub's site as people link to it, and is of no kind.
+ */
+const GITHUB_PATH = /^https?:\/\/(?:www\.)?github\.com(?=[/?#]|$)([^?#]*)/i;
+
+/**
+ * A commit as GitHub writes it in a path: seven hex digits or more, which is the short form and the
+ * full one. `.patch` and `.diff` are the same commit as text.
+ */
+const COMMIT_ID = /^[0-9a-f]{7,}(?:\.(?:patch|diff))?$/i;
+
+/** A pull request's number, as text too; and a check run's, which is only ever a number. */
+const PULL_NUMBER = /^\d+(?:\.(?:patch|diff))?$/;
+const RUN_NUMBER = /^\d+$/;
+
+/**
+ * The kind of link an address is: "pr", "commit" or "action", or null for every other address.
+ * The address alone decides, and the same address always answers the same.
+ *
+ * Inside one repository, `/OWNER/REPO/…`, by the part of the path after it, as GitHub routes them:
+ *   - "pr": `/pull/N` and anything under it — its files, its checks, a comment's fragment — but
+ *     not `/pull/N/commits/SHA`, which is one commit seen from the pull request; and `/pulls`.
+ *   - "commit": `/commit/SHA`, `/commits` and anything under it, `/pull/N/commits/SHA`, and
+ *     `/compare`, which is a run of commits.
+ *   - "action": `/actions` and anything under it, a check run's `/runs/ID`, and `/checks`.
+ * A trailing slash, the query and the fragment never change the answer. Keywords are matched as
+ * GitHub writes them, lowercase, and only in the third place: `github.com/actions/checkout` is the
+ * repository named checkout, not a run.
+ */
+function linkKind(href) {
+  const found = GITHUB_PATH.exec(String(href));
+  if (!found) return null;
+  // Empty segments dropped, so a trailing slash, or a doubled one, changes nothing.
+  const [, , section, first = "", second = "", third = ""] = found[1].split("/").filter(Boolean);
+  switch (section) {
+    case "pull":
+      if (!PULL_NUMBER.test(first)) return null;
+      return second === "commits" && COMMIT_ID.test(third) ? "commit" : "pr";
+    case "pulls":
+      return "pr";
+    case "commit":
+      return COMMIT_ID.test(first) ? "commit" : null;
+    case "commits":
+    case "compare":
+      return "commit";
+    case "actions":
+    case "checks":
+      return "action";
+    case "runs":
+      return RUN_NUMBER.test(first) ? "action" : null;
+    default:
+      return null;
+  }
+}
+
+/**
+ * The kinds the reader has turned off. Empty, every link shows. REPLACED, never changed in place,
+ * so a row's drawn list can tell it is out of date by asking whether this is the set it was drawn
+ * under (`showRowLinks`).
+ */
+let hiddenLinkKinds = storedHiddenLinkKinds();
+
+/**
+ * What this device kept. Nothing kept is all three on, and so is a record that does not parse;
+ * a kind this page does not know is dropped, so one retired later cannot hide anything.
+ */
+function storedHiddenLinkKinds() {
+  let stored = null;
+  try {
+    stored = JSON.parse(localStorage.getItem(LINK_KINDS_KEY) || "[]");
+  } catch (_error) {
+    stored = null;
+  }
+  const known = LINK_KINDS.map(({ kind }) => kind);
+  return new Set(Array.isArray(stored) ? stored.filter((kind) => known.includes(kind)) : []);
+}
+
+/**
+ * Show or hide one kind, keep the choice, and redraw what is left. A reader at the newest line is
+ * kept there, as one is when a message arrives; anywhere else the list is left where it is, as it
+ * is while the search text changes under it.
+ */
+function setLinkKindShown(kind, shown) {
+  const area = el("scroll-area");
+  const newest = atBottom(area);
+  const hidden = new Set(hiddenLinkKinds);
+  if (shown) hidden.delete(kind);
+  else hidden.add(kind);
+  hiddenLinkKinds = hidden;
+  // In the order the buttons stand, so the same choice is always written the same way.
+  const kept = LINK_KINDS.map((entry) => entry.kind).filter((one) => hidden.has(one));
+  try {
+    localStorage.setItem(LINK_KINDS_KEY, JSON.stringify(kept));
+  } catch (_error) {
+    // A browser that refuses storage still honours the choice for this page.
+  }
+  renderLinkKinds();
+  renderScrollTools();
+  if (newest) scrollToNewest();
+}
+
+/**
+ * The kinds' buttons: under Links while Links is on, and at no other time — so they go when Links
+ * goes and when the bar closes — each pressed while its kind is shown. #screen-main says when they
+ * are up, so the list makes room for them at its head as it does for the bar (web/voice.css), and
+ * the first row is never underneath them.
+ */
+function renderLinkKinds() {
+  const up = linksOnly && !el("links-filter").hidden;
+  el("link-kinds").hidden = !up;
+  if (up) el("screen-main").setAttribute("data-link-kinds", "");
+  else el("screen-main").removeAttribute("data-link-kinds");
+  for (const { kind, chip } of LINK_KINDS) {
+    el(chip).setAttribute("aria-pressed", hiddenLinkKinds.has(kind) ? "false" : "true");
+  }
+}
+
+/**
+ * How many of the links in view are of each kind, beside its name: what turning it off takes away,
+ * or brings back. Counted over the messages the other filters let through, every kind whether shown
+ * or not (`applySearch`). Blank at none, so a channel with no GitHub links shows three plain words.
+ */
+function renderLinkKindCounts(kinds) {
+  for (const { kind, chip } of LINK_KINDS) {
+    const count = kinds.get(kind) || 0;
+    el(`${chip}-count`).textContent =
+      count === 0 ? "" : count > LINK_KIND_COUNT_MAX ? `${LINK_KIND_COUNT_MAX}+` : String(count);
+  }
+}
+
+/**
+ * The kinds turned off that took something away — `counts` holds how many links of each kind there
+ * are in what the sentence speaks for — named as their buttons are and joined as a sentence joins
+ * them: "PRs", "PRs and Actions", "PRs, Commits and Actions". A kind that is off but had no link
+ * there is left out, because turning it back on would bring nothing back. Every name is a plural,
+ * so "are" and "them" fit whichever it is.
+ */
+function hiddenKindNames(counts) {
+  const names = LINK_KINDS.filter(({ kind }) => hiddenLinkKinds.has(kind) && counts.get(kind) > 0)
+    .map(({ name }) => name);
+  return names.length < 2 ? names.join("") : `${names.slice(0, -1).join(", ")} and ${names[names.length - 1]}`;
 }
 
 /**
@@ -4286,6 +4542,8 @@ function renderControlBar() {
   // `#211 link-filter`. Beside Pinned while the bar is open, and over the call view as well: it
   // filters what the search filters, and a turn can hold a link as a channel message can.
   el("links-filter").hidden = el("search-field").hidden;
+  // `#212 link-filter`. The kinds of link under it go with it.
+  renderLinkKinds();
   // The bar used to yield the header row to an open search field when the reader had moved it up
   // there, because the two were sharing one 375px row. The field is not in that row any more, so
   // the bar stays where the reader put it, searching or not.
@@ -17469,6 +17727,10 @@ el("search-toggle").addEventListener("click", () => setSearchOpen(!searchOpen));
 el("pinned-filter").addEventListener("click", () => setPinnedOnly(!pinnedOnly));
 // `#211 link-filter`. The same, for links.
 el("links-filter").addEventListener("click", () => setLinksOnly(!linksOnly));
+// `#212 link-filter`. And each kind of link under it, a toggle of its own.
+for (const { kind, chip } of LINK_KINDS) {
+  el(chip).addEventListener("click", () => setLinkKindShown(kind, hiddenLinkKinds.has(kind)));
+}
 el("search-field").addEventListener("input", () => {
   searchQuery = el("search-field").value;
   renderScrollTools();

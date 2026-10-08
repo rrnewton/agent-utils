@@ -894,6 +894,9 @@ class Driver:
             # reopens there; a scene that loads the page must start from the default instead of
             # the view the previous scene left up.
             "  localStorage.removeItem('vibe-talk.voice.ui-state');\n"
+            # `#212 link-filter`. The kinds of link a reader turned off under Links are kept, and
+            # `38-link-kinds-off` turns one off: every later Links frame must start with all on.
+            "  localStorage.removeItem('vibe-talk.voice.hidden-link-kinds');\n"
             "} catch (e) {}\n"
         )
         # `#58 control-bar`. Where the control bar sits is a stored preference, so it is cleared
@@ -1981,11 +1984,15 @@ def _act_links_filter(driver: Driver) -> None:
     two forms whose drawing only a browser can judge: a Markdown link, which shows its NAME, and a
     bare address longer than a phone is wide, which is cut short on screen with its href whole.
     Then the bar opens and Links is turned on by a real click, beside Pinned and the glass.
+
+    `#212 link-filter`: the message names a GitHub pull request too, so the kinds of link that come
+    up under Links have something to count — and, in `38-link-kinds-off`, something to hide.
     """
     _act_open_channel(driver)
     driver.js(
         "window.__channelSays('9990000000000000211', 'claude-integ', "
-        "'the change is [the diff](https://example.com/diff/42) and the full log is at "
+        "'the change is [the diff](https://example.com/diff/42), reviewed in "
+        "https://github.com/example/project/pull/42, and the full log is at "
         "https://example.com/logs/nightly-integration-shard-nightly-integration-shard-"
         "nightly-integration-shard/summary.html')"
     )
@@ -1998,6 +2005,21 @@ def _act_links_filter(driver: Driver) -> None:
     driver.click("links-filter")
     driver.page.wait_for_function(
         "() => document.querySelector('#discord-log li[data-links-view=\"true\"]') !== null",
+        timeout=5_000,
+    )
+    driver.settle(300)
+
+
+def _act_link_kinds_off(driver: Driver) -> None:
+    """`#212 link-filter`: the Links view with PRs turned off under the Links button.
+
+    `37-links-filter`'s state, then a real click on PRs: the pull request leaves the row and the
+    design's own links stay, and the button reads as off.
+    """
+    _act_links_filter(driver)
+    driver.click("link-kind-pr")
+    driver.page.wait_for_function(
+        "() => document.getElementById('link-kind-pr').getAttribute('aria-pressed') === 'false'",
         timeout=5_000,
     )
     driver.settle(300)
@@ -3504,6 +3526,13 @@ SCENES: tuple[Scene, ...] = (
                 "&& f.top < c.bottom && c.top < f.bottom "
                 "&& f.top < g.bottom && g.top < f.bottom; })()",
             ),
+            (
+                # `#212 link-filter`. The kinds of link belong to Links, and Links is off here: a
+                # search is a field and its filters, with nothing hung under them.
+                "with Links off, no kinds of link hang under the bar",
+                "!window.__visible('link-kinds') "
+                "&& !document.getElementById('screen-main').hasAttribute('data-link-kinds')",
+            ),
         ),
     ),
     Scene(
@@ -3547,6 +3576,59 @@ SCENES: tuple[Scene, ...] = (
                 ".find((n) => n.href.endsWith('/summary.html')); "
                 "return Boolean(a) && a.scrollWidth > a.clientWidth "
                 "&& a.getBoundingClientRect().right <= document.documentElement.clientWidth; })()",
+            ),
+            (
+                # `#212 link-filter`. The owner: "3 buttons to pop up under the link icon I just
+                # clicked ... named PRs Commits Actions and be toggled on by default". The layout
+                # half only a browser has: below the bar, spanning the Links icon's middle, inside
+                # the screen, each a whole 44px target; and the pull request counted.
+                "PRs, Commits and Actions hang under Links, all on, inside the screen, 44px each",
+                "(() => { const row = document.getElementById('link-kinds'); "
+                "const r = row.getBoundingClientRect(); "
+                "const l = document.getElementById('links-filter').getBoundingClientRect(); "
+                "const bar = document.getElementById('search-float').getBoundingClientRect(); "
+                "const mid = (l.left + l.right) / 2; "
+                "const chips = [...row.querySelectorAll('button')]; "
+                "return window.__visible('link-kinds') "
+                "&& chips.map((c) => c.firstChild.textContent).join(' ') === 'PRs Commits Actions' "
+                "&& chips.every((c) => c.getAttribute('aria-pressed') === 'true' "
+                "&& c.getBoundingClientRect().width >= 44 && c.getBoundingClientRect().height >= 44) "
+                "&& window.__text('link-kind-pr-count') === '1' "
+                "&& r.top >= bar.bottom - 1 && r.left <= mid && r.right >= mid "
+                "&& r.left >= 0 && r.right <= document.documentElement.clientWidth; })()",
+            ),
+        ),
+    ),
+    Scene(
+        name="38-link-kinds-off",
+        what="the Links view with PRs turned off under the Links button: the pull request gone from its row",
+        act=_act_link_kinds_off,
+        expect=(
+            ("the Discord pane is up", "window.__visible('pane-discord')"),
+            (
+                # Off says so by more than colour: struck through, on the panel at rest, beside two
+                # that are still on.
+                "PRs reads as off and is struck through; Commits and Actions are still on",
+                "(() => { const pr = document.getElementById('link-kind-pr'); "
+                "return pr.getAttribute('aria-pressed') === 'false' "
+                "&& getComputedStyle(pr).textDecorationLine.includes('line-through') "
+                "&& ['link-kind-commit', 'link-kind-action'].every((id) => "
+                "document.getElementById(id).getAttribute('aria-pressed') === 'true'); })()",
+            ),
+            (
+                # THE filtering claim: the row keeps its other links, and the pull request is not
+                # drawn anywhere on the list.
+                "the row keeps its other links and the pull request is drawn nowhere",
+                "(() => { const row = document.querySelector('#discord-log li[data-id=\"9990000000000000211\"]'); "
+                "const hrefs = [...row.querySelectorAll('.row-links > a')].map((a) => a.getAttribute('href')); "
+                "return row.offsetParent !== null && hrefs.includes('https://example.com/diff/42') "
+                "&& hrefs.some((h) => h.endsWith('/summary.html')) "
+                "&& ![...document.querySelectorAll('.row-links > a')].some((a) => "
+                "a.getAttribute('href').includes('/pull/') && a.offsetParent !== null); })()",
+            ),
+            (
+                "the choice is kept on this device",
+                "localStorage.getItem('vibe-talk.voice.hidden-link-kinds') === '[\"pr\"]'",
             ),
         ),
     ),
@@ -4162,7 +4244,11 @@ def check_state_controls() -> list[str]:
         #   `the diff`        — a Markdown link shows its NAME, the owner's second request.
         #   `scrollWidth`     — a long address is cut short inside the screen rather than run
         #     off it, which no page suite can measure.
-        "37-links-filter": ("data-links-view", "the diff", "scrollWidth"),
+        "37-links-filter": ("data-links-view", "the diff", "scrollWidth", "link-kinds"),
+        # `#212 link-filter`. Pinned to the button reading OFF and drawn so (`line-through`), to
+        # the pull request being drawn nowhere while the row keeps its other links (`/pull/`) —
+        # either alone is satisfied by a button that changes nothing — and to the choice being kept.
+        "38-link-kinds-off": ("line-through", "/pull/", "hidden-link-kinds"),
         # `#49 cached-summaries`, the other half. Pinned to THREE independent things, because each
         # is separately deletable and each on its own is satisfiable by a defect:
         #   `backgroundColor` — the row is really drawn differently. Pinning this state to
