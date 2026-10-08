@@ -21380,7 +21380,8 @@ test("thread views show roots in Main and the bar's selector offers Main, All, a
   assert.ok(rootRow.children.indexOf(threadButton(rootRow)) > rootRow.children.findIndex((child) => child.className === "body"),
     "the thread reply-count decorator must sit underneath the root message");
   assert.equal(threadButton(page.el("discord-log").children[2]).textContent, "about 1 reply");
-  assert.match(page.timelineCalls[1], /view=main/);
+  // Drawn from All, which holds every row of Main: no read. `#220 view-switch-instant`.
+  assert.deepStrictEqual(page.timelineCalls.map(viewOf), ["flat"], "Main was read though All holds it");
   assert.equal(page.pageReads, 0);
   const empty = newPage();
   empty.threadingSupported = true;
@@ -21767,6 +21768,213 @@ test("a thread opened from All is a filter of what All holds, with no request, a
   await page.settle();
   assert.deepStrictEqual(shownIds(page), ["200", "201", "202", "203", "204"], "Back did not restore All");
   assert.equal(page.timelineCalls.length, reads, "returning to All went to the network");
+});
+
+// --- `#220 view-switch-instant` ------------------------------------------------------------------
+//
+// The owner, 2026-10-08: "ALL view has loaded all the messages so switching to MAIN channel only
+// should basically just hide thread replies. But instead I saw it flash to a blank screen and do the
+// message fetching/loading animation. Let's fix that. I don't want to fetch already cached data and
+// I don't want to WAIT in the UI if I don't have to." A switch draws from what the page holds, at
+// once; a read it still owes goes on behind the rows, never in place of them.
+
+/** The view a timeline read asked for. */
+const viewOf = (call) => new URL(call, "http://fixture.test").searchParams.get("view");
+
+/**
+ * Watch the channel for what a view switch must never show while there is something to draw: the
+ * list emptied, even for an instant, and the loading line that stands in an empty list.
+ */
+function watchForBlank(page) {
+  const seen = { emptied: 0, loading: 0 };
+  const log = page.el("discord-log");
+  const replace = log.replaceChildren.bind(log);
+  log.replaceChildren = (...rows) => {
+    if (rows.length === 0) seen.emptied += 1;
+    return replace(...rows);
+  };
+  const line = page.el("channel-loading");
+  let hidden = line.hidden;
+  Object.defineProperty(line, "hidden", {
+    configurable: true,
+    get: () => hidden,
+    set: (value) => {
+      if (!value) seen.loading += 1;
+      hidden = Boolean(value);
+    },
+  });
+  return seen;
+}
+
+test("All to Main hides the replies All holds: no read, never an empty list, never the loading line", async () => {
+  const page = await threadPage();
+  assert.deepStrictEqual(shownIds(page), ["200", "201", "202", "203", "204"]);
+  const reads = page.timelineCalls.length;
+  const seen = watchForBlank(page);
+
+  await pickThread(page, "main");
+  assert.deepStrictEqual(shownIds(page), ["200", "201", "203"], "Main was not All without its replies");
+  assert.deepStrictEqual(page.timelineCalls.slice(reads), [], "Main was read though All holds every row of it");
+  // The roots keep their reply counts: the thread records All carried are the ones Main's read has.
+  assert.equal(threadButton(page.el("discord-log").children[1]).textContent, "1 reply");
+  assert.equal(threadButton(page.el("discord-log").children[2]).textContent, "about 1 reply");
+  // As current as All, whose newest page answered for every one of these rows.
+  assertCurrent(page, `Main drawn from All says ${freshness(page).textContent}`);
+
+  // Back, and over again: each is held now, and nothing is read.
+  await pickThread(page, "flat");
+  assert.deepStrictEqual(shownIds(page), ["200", "201", "202", "203", "204"]);
+  await pickThread(page, "main");
+  assert.deepStrictEqual(shownIds(page), ["200", "201", "203"]);
+  assert.deepStrictEqual(page.timelineCalls.slice(reads), [], "switching between Main and All read history");
+  assert.deepStrictEqual(seen, { emptied: 0, loading: 0 }, "a switch showed an empty list or the loading line");
+  // ...and Main is in the snapshot as a view of its own, for the next start.
+  assert.ok(savedScopes(page)[scopeKey(CHANNEL.id)].views.main, "Main drawn from All was not saved as covered");
+});
+
+test("Main drawn from All counts a root's replies from the thread summaries the page holds", async () => {
+  const page = newPage();
+  const data = threadData();
+  page.threadingSupported = true;
+  page.threads = data.threads;
+  // A provider whose All carries thread records without a count.
+  const uncounted = data.messages.map((m) => (m.thread ? { ...m, thread: { ...m.thread, reply_count: null } } : m));
+  await signIn(page);
+  await showDiscord(page, uncounted);
+  // Touching the picker reads the thread list, whose summaries do count the replies.
+  await page.el("thread-select").dispatch("pointerdown");
+  await page.settle();
+  const reads = page.timelineCalls.length;
+  await pickThread(page, "main");
+  assert.deepStrictEqual(shownIds(page), ["200", "201", "203"]);
+  assert.equal(threadButton(page.el("discord-log").children[1]).textContent, "1 reply");
+  assert.equal(threadButton(page.el("discord-log").children[2]).textContent, "about 1 reply");
+  assert.equal(page.timelineCalls.length, reads, "Main was read for counts the summaries already had");
+});
+
+test("Main to All before All was read draws the held rows at once, and reads All once, behind them", async () => {
+  const page = await mainOnlyThreadPage();
+  // A thread read for itself leaves its reply in the store.
+  await threadButton(page.el("discord-log").children[1]).click();
+  await page.settle();
+  assert.deepStrictEqual(shownIds(page), ["201", "202"]);
+  await page.el("thread-back").click();
+  await page.settle();
+  assert.deepStrictEqual(shownIds(page), ["200", "201", "203"]);
+  const reads = page.timelineCalls.length;
+  const answer = gate(page.timeline);
+  page.timeline = answer.respond;
+  const seen = watchForBlank(page);
+
+  const picker = page.el("thread-select");
+  picker.value = "flat";
+  const switching = picker.dispatch("change");
+  await page.settle();
+  // Up before anything has answered: Main's rows, and the reply the thread's read brought, in order.
+  assert.deepStrictEqual(shownIds(page), ["200", "201", "202", "203"], "All waited on the network");
+  assert.deepStrictEqual(page.timelineCalls.slice(reads).map(viewOf), ["flat"], "All was not read once, behind its rows");
+  assert.match(freshness(page).textContent, / · refreshing…$/, "the read behind the rows was not said");
+
+  answer.open();
+  await switching;
+  await page.settle();
+  assert.deepStrictEqual(shownIds(page), ["200", "201", "202", "203", "204"], "All's read was not merged in");
+  assertCurrent(page, `All, read, says ${freshness(page).textContent}`);
+  assert.ok(atBottomOf(page.el("scroll-area")), "the merge took the reader off the newest line");
+  assert.equal(page.el("jump-newest").hidden, true, "rows only not drawn before were offered as new");
+  assert.equal(page.timelineCalls.length, reads + 1, "All was read more than once");
+  assert.deepStrictEqual(seen, { emptied: 0, loading: 0 }, "the switch showed an empty list or the loading line");
+  // Main and All are both held now: back and forth reads nothing.
+  await pickThread(page, "main");
+  await pickThread(page, "flat");
+  assert.deepStrictEqual(shownIds(page), ["200", "201", "202", "203", "204"]);
+  assert.equal(page.timelineCalls.length, reads + 1, "switching between read views went to the network");
+});
+
+test("a switch between Main and All keeps the reader on the message they were reading", async () => {
+  const page = newPage();
+  page.threadingSupported = true;
+  const thread = { id: "spaces/A/threads/long", root_message_id: "302", is_root: true,
+    reply_count: 7, reply_count_exact: true };
+  const messages = Array.from({ length: 24 }, (_, i) => {
+    const id = String(300 + i);
+    // Every other message from 303 to 315 is a reply in the one thread, which Main does not show.
+    const record = id === "302" ? thread : i > 2 && i < 17 && i % 2 === 1 ? { ...thread, is_root: false } : null;
+    return message({ id, content: longMessage(`row ${id}`), ...(record ? { thread: record } : {}) });
+  });
+  page.threads = [{ id: thread.id, root: messages[2], title: "the long thread", reply_count: 7,
+    reply_count_exact: true, updated_at: messages[15].timestamp }];
+  await signIn(page);
+  await showDiscord(page, messages);
+  const area = page.el("scroll-area");
+  const row = (id) => page.el("discord-log").children.find((li) => li.getAttribute("data-id") === id);
+  const reads = page.timelineCalls.length;
+
+  // A message posted to the channel itself at the top of the screen, in the middle of the channel.
+  area.scrollTop = row("308").offsetTop();
+  assert.equal(row("308").getBoundingClientRect().top, 0, "the fixture could not put 308 at the top");
+  assert.ok(!atBottomOf(area), "the reader is at the newest line, so this proves nothing");
+  await pickThread(page, "main");
+  assert.equal(row("308").getBoundingClientRect().top, 0, "Main moved the message the reader was on");
+  await pickThread(page, "flat");
+  assert.equal(row("308").getBoundingClientRect().top, 0, "All moved the message the reader was on");
+
+  // A reply at the top, which Main does not show: Main keeps the next message both show, where it was.
+  area.scrollTop = row("311").offsetTop();
+  const next = row("312").getBoundingClientRect().top;
+  assert.ok(next > 0 && next < area.clientHeight, "312 is not on the screen below the reply");
+  await pickThread(page, "main");
+  assert.equal(row("312").getBoundingClientRect().top, next, "Main lost the reader's place under a reply");
+
+  // On the newest line, a switch stays on it.
+  area.scrollTop = area.scrollHeight;
+  await pickThread(page, "flat");
+  assert.ok(atBottomOf(area), "a reader on the newest line was taken off it");
+  assert.equal(page.timelineCalls.length, reads, "keeping the reader's place went to the network");
+});
+
+test("offline, the views switch from the snapshot: no read where it holds them, no blank where it does not", async () => {
+  const data = threadData();
+  const arrange = (p) => {
+    p.threadingSupported = true;
+    p.threads = data.threads;
+    p.clientConfig = offline;
+    p.timeline = offline;
+  };
+  // All saved on this device: Main is All without its replies, with no read at all.
+  const first = await threadPage();
+  const page = reloadPage(first.storage, arrange);
+  await page.settle();
+  assert.equal(page.tab(), "discord", "the offline reload did not reopen on the channel");
+  assert.deepStrictEqual(shownIds(page), ["200", "201", "202", "203", "204"], "the saved All was not drawn");
+  // The reopen's own read has failed by now, and the pill says the device is offline.
+  assert.equal(freshness(page).getAttribute("data-state"), "offline");
+  const reads = page.timelineCalls.length;
+  const seen = watchForBlank(page);
+  await pickThread(page, "main");
+  assert.deepStrictEqual(shownIds(page), ["200", "201", "203"], "offline, Main was not drawn from the saved All");
+  assert.match(freshness(page).textContent, /^Offline · showing messages saved /,
+    "offline, Main drawn from the saved All stopped saying so");
+  await pickThread(page, "flat");
+  assert.deepStrictEqual(shownIds(page), ["200", "201", "202", "203", "204"]);
+  assert.deepStrictEqual(page.timelineCalls.slice(reads), [], "offline, a switch between saved views tried the network");
+  assert.deepStrictEqual(seen, { emptied: 0, loading: 0 }, "offline, a switch blanked the list");
+
+  // Only Main saved: All is drawn from Main's rows, asks once for the rest, and keeps them up when
+  // that fails, saying so in the pill.
+  const main = await mainOnlyThreadPage();
+  const second = reloadPage(main.storage, arrange);
+  await second.settle();
+  assert.deepStrictEqual(shownIds(second), ["200", "201", "203"], "the saved Main was not drawn");
+  const before = second.timelineCalls.length;
+  const blank = watchForBlank(second);
+  await pickThread(second, "flat");
+  await second.settle();
+  assert.deepStrictEqual(shownIds(second), ["200", "201", "203"], "offline, All dropped the rows the page held for it");
+  assert.deepStrictEqual(second.timelineCalls.slice(before).map(viewOf), ["flat"],
+    "All's missing rows were not asked for, once");
+  assert.match(freshness(second).textContent, /^Offline · /, "the failed read behind the rows was not said");
+  assert.deepStrictEqual(blank, { emptied: 0, loading: 0 }, "offline, All blanked the list");
 });
 
 test("Hide read reprojects a cached threaded timeline without fetching", async () => {
@@ -24303,16 +24511,22 @@ test("switching Main, Threads, All and a read thread in one page is local, and e
 });
 
 test("a view no page has covered is read, once", async () => {
-  // All is covered by the read that opened the channel in it (`#189 restore-ui-state`); Main is not.
+  // All is covered by the read that opened the channel in it (`#189 restore-ui-state`), and so Main
+  // is, from the same point up — every row of Main is a row of All (`#220 view-switch-instant`).
+  // The Threads list is not: its summaries are no projection of All's messages.
   const page = await threadPage();
   const before = channelReads(page).length;
   await page.el("channel-view-main").click();
   await page.settle();
-  assert.equal(channelReads(page).length, before + 1);
-  assert.match(channelReads(page).at(-1), /view=main/);
+  assert.equal(channelReads(page).length, before, "Main was read though All covers it");
   assert.deepStrictEqual(shownIds(page), ["200", "201", "203"]);
+  await page.el("channel-view-threads").click();
+  await page.settle();
+  assert.equal(channelReads(page).length, before + 1);
+  assert.match(channelReads(page).at(-1), /view=threads/);
   await page.el("channel-view-flat").click();
   await page.el("channel-view-main").click();
+  await page.el("channel-view-threads").click();
   await page.settle();
   assert.equal(channelReads(page).length, before + 1, "a covered view was read again");
 });

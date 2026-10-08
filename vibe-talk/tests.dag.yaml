@@ -226,6 +226,25 @@ steps:
       classification: latency-bound
       rss_baseline_bytes: 1073741824
 
+  # `#220 view-switch-instant` in the browser engine: All to Main and back in the bar's real picker
+  # with every timeline request intercepted — no read, never an empty list or the loading line, the
+  # reader's message kept — and All never read drawn at once from held rows, read once behind them.
+  # A step of its own, not another walk in offline-cache-browser, whose CPU is already near its cap.
+  # Measured alone: 2.1s wall, 1.6s CPU, a 310MB peak.
+  - group: check
+    job: view-switch-browser
+    desc: Main and All switched from what the page holds, with every timeline request counted, in current Chromium
+    labels: [validation-vibe-talk]
+    cmd: cd vibe-talk && python3 tests/view_switch_browser.py
+    jobs_flag: ""
+    timeout: 60
+    cpu_timeout: 30
+    hint:
+      resources: {browser: 1}
+      est_duration_s: 3
+      classification: latency-bound
+      rss_baseline_bytes: 536870912
+
   # ---- the build everything else needs ----------------------------------------------------------
   - group: build
     job: release

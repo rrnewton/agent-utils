@@ -6354,6 +6354,12 @@ const MESSAGE_CACHE_CHARS = 600000;
 let channelFreshness = "fresh";
 /** When the rows on screen were last known to be current, or 0 when there are none. */
 let channelFreshAt = 0;
+/**
+ * Whether a read of the channel is on the wire, which the freshness pill says ("· refreshing…").
+ * Its own state rather than read off the loading line: a read behind rows a view switch has already
+ * drawn shows no loading line. `#220 view-switch-instant`.
+ */
+let channelRefreshing = false;
 /** Whether `/client-config` has answered in this page, as opposed to the saved shell standing in. */
 let clientConfigApplied = false;
 /** The fingerprint of the token the channel rows on screen were read or drawn for. */
@@ -6905,6 +6911,57 @@ function drawProjection() {
 }
 
 /**
+ * The rows of the current view the store holds though no page has covered the view: each one from
+ * `since` up — a time, the oldest row the reader was looking at — or, in a thread, every one of the
+ * thread's. Empty for the Threads list, which is not drawn this way. `#220 view-switch-instant`.
+ */
+function heldViewRows(since) {
+  if (!threadingSupported || channelView === "threads" ||
+      channelCanon.channel !== String(el("discord-channel").value)) return [];
+  if (channelView !== "thread" && !Number.isFinite(since)) return [];
+  return channelCanon.messages.filter((message) => inView(message, channelView, selectedThreadId) &&
+    (channelView === "thread" || !(timeOf(message, "timestamp") < since)));
+}
+
+/**
+ * Draw a view no page has covered from `rows`, rows of it the store already holds, with no request:
+ * as current as the view the reader came from, `freshAt` and `freshness`. `#220
+ * view-switch-instant`. Main to All before All was ever read is the case: Main's rows and every
+ * reply the page has met between them are up at once, and the read behind them adds what only All
+ * can say. NEVER A COVER — nothing here proves the view complete — so the view's read is still owed,
+ * and the walk back waits for it. False, with nothing drawn, when there is nothing to draw.
+ */
+function drawHeldRows(rows, freshAt, freshness) {
+  if (!rows.length) return false;
+  const channel = el("discord-channel").value;
+  const payload = {
+    channel: knownChannel(channel),
+    thread: channelView === "thread"
+      ? channelCanon.threads.find((held) => String(held.id) === selectedThreadId) || selectedThread
+      : null,
+    has_threads: channelCanon.hasThreads,
+    // Whether older history exists is unknown until the read says.
+    has_more: true,
+    next_before: null,
+    notice: "",
+    dismissed: [...channelCanon.dismissed],
+  };
+  try {
+    timelineMessages = [];
+    timelineThreads = [];
+    applyTimelinePage(payload, false, true, false, rows);
+  } catch (_error) {
+    // Rows this version cannot draw: the read draws the view instead.
+    return false;
+  }
+  discordNewestId = timelineMessages.length > 0 ? String(timelineMessages[timelineMessages.length - 1].id) : null;
+  channelFreshAt = freshAt;
+  setChannelFreshness(freshness);
+  renderOutgoingMessages();
+  return true;
+}
+
+/**
  * Record what the channel holds. Called after every read that succeeded and after every local
  * change to the rows — a live arrival, an acknowledged send, an archive — so a reload shows what
  * the reader last saw.
@@ -6969,7 +7026,7 @@ function hydrateChannelScope() {
   screenBelongsToToken();
   if (threadingSupported) {
     if (channelCanon.channel !== String(channel)) loadCanon(channel);
-    if (channelView === "thread") inheritAllCover(selectedThreadId, selectedThread);
+    inheritAllCover(channelView, selectedThreadId, selectedThread);
     return drawProjection();
   }
   const cache = readMessageCache();
@@ -7117,7 +7174,7 @@ function renderChannelFreshness() {
   const pill = el("channel-freshness");
   const gesture = el("pull-refresh");
   const at = stamp(channelFreshAt);
-  const refreshing = !el("channel-loading").hidden;
+  const refreshing = channelRefreshing;
   // CURRENT IS SAID TOO, not left blank: a blank pill reads the same as a page that never managed
   // to refresh, which is what a reader opening the app in the car could not tell apart.
   const current = channelFreshAt
@@ -7810,7 +7867,84 @@ function rememberChannelContext() {
   });
 }
 
+/**
+ * The channel rows on screen, top to bottom — each one's message ids and the height its row stands
+ * at — and whether the reader is on the newest line: the place a switch between Main and All keeps.
+ * `#220 view-switch-instant`.
+ */
+function readerPlace() {
+  const area = el("scroll-area");
+  const top = area.getBoundingClientRect().top;
+  const bottom = top + (area.clientHeight || 0);
+  const listed = currentView === "discord" && channelView !== "threads" && !pinnedOnly
+    ? [...el("discord-log").children] : [];
+  const seen = listed
+    .map((row) => ({ row, box: row.getBoundingClientRect() }))
+    .filter(({ box }) => box.bottom > top && box.top < bottom)
+    .map(({ row, box }) => ({ ids: idsOf(row), top: box.top }));
+  return { pinned: currentView === "discord" && atBottom(area), seen };
+}
+
+/**
+ * Put the reader on the first message of `place` that the list now on screen also shows, at the
+ * height it stood at — or on the newest line, when that is where they were. False, moving nothing,
+ * when this list shows none of the messages they could see.
+ */
+function keepReaderPlace(place) {
+  if (place.pinned) {
+    scrollToNewest();
+    return true;
+  }
+  const rows = [...el("discord-log").children];
+  for (const seen of place.seen) {
+    const row = rows.find((candidate) => idsOf(candidate).some((id) => seen.ids.includes(id)));
+    if (!row) continue;
+    el("scroll-area").scrollTop += row.getBoundingClientRect().top - seen.top;
+    renderJumpNewest();
+    return true;
+  }
+  return false;
+}
+
+/**
+ * Read the view a switch drew from the rows the store held, behind them: merged into the rows on
+ * screen at the reader's place, with no loading line over them, and no "new" count for rows that
+ * were only not drawn before. A failure is said by the freshness pill over the rows it leaves up.
+ * `#220 view-switch-instant`.
+ */
+async function readBehindSwitch() {
+  try {
+    await loadDiscord({ keepPosition: true, quiet: true, ownAct: true, reason: "enter" });
+  } catch (error) {
+    if (!(error && error.shownInPill)) throw error;
+  }
+}
+
+/**
+ * Show another view of the selected channel.
+ *
+ * `#220 view-switch-instant`. NEVER A BLANK LIST WHILE THERE IS SOMETHING TO DRAW. The owner,
+ * 2026-10-08: "ALL view has loaded all the messages so switching to MAIN channel only should
+ * basically just hide thread replies. But instead I saw it flash to a blank screen and do the
+ * message fetching/loading animation. ... I don't want to fetch already cached data and I don't want
+ * to WAIT in the UI if I don't have to." Main had never been read, so no page covered it, and the
+ * switch emptied the list and read Main afresh — although every row of it was on the page in All.
+ * So, in order: a view held in this page is put back; a view the store covers — read, saved on this
+ * device, or Main or a thread taken from All's cover (`inheritAllCover`) — is projected; a view it
+ * does not cover is drawn from the rows the store holds for it, and read behind them; and only a
+ * view with nothing at all to draw is emptied and read with the loading line. Main and All keep the
+ * reader on the message they were reading.
+ */
 async function changeChannelView(view, threadId = null, summary = null) {
+  // Before the view goes: where the reader is, and how current what they are reading is — what a
+  // view drawn from held rows is as current as.
+  const place = readerPlace();
+  const from = channelView;
+  const came = {
+    freshAt: channelFreshAt,
+    freshness: channelFreshness,
+    since: timelineMessages.length > 0 ? timeOf(timelineMessages[0], "timestamp") : NaN,
+  };
   // `#206 pin-message`. Choosing a view is asking to see it, and the Pinned filter shows the same
   // pins in every view — so it steps aside, as it must for a pin opened in its thread.
   setPinnedOnly(false);
@@ -7842,37 +7976,71 @@ async function changeChannelView(view, threadId = null, summary = null) {
   else forgetChosenViews((channel) => channel === String(el("discord-channel").value));
   uiStateSettled = true;
   saveUiState();
+  // Main and All are one conversation, so a switch between them — or into one from a thread no place
+  // of theirs is held for — keeps the reader on the message they were reading, where both show it.
+  // A thread opens at its newest, and Back returns to the place its view was left at, as before.
+  const keepPlace = (view === "main" || view === "flat") &&
+    (from === "main" || from === "flat" || (from === "thread" && !held));
+  const sameStore = threadingSupported && channelCanon.channel === String(el("discord-channel").value);
+  const inherited = !held && inheritAllCover(view, threadId, summary);
+  const covered = !held && sameStore && channelCanon.views.has(viewKey());
+  const rows = held || covered ? [] : heldViewRows(came.since);
   discordMoreAbove = held ? held.more : false;
   discordOlderCursor = held ? held.cursor : null;
   discordNewestId = held ? held.newest : null;
-  el("discord-log").replaceChildren(...(held ? held.rows : []));
-  el("thread-list").replaceChildren(...(held ? held.cards : []));
-  el("channel-summary").replaceChildren(...(held ? held.seam : []));
+  // The rows on screen stay until the new view's replace them, unless there is nothing to draw.
+  if (held || (!covered && rows.length === 0)) {
+    el("discord-log").replaceChildren(...(held ? held.rows : []));
+    el("thread-list").replaceChildren(...(held ? held.cards : []));
+    el("channel-summary").replaceChildren(...(held ? held.seam : []));
+  }
   el("timeline-notice").hidden = true;
   channelFreshAt = held ? held.freshAt : 0;
   channelFreshness = held ? held.freshness : "fresh";
   if (held) archivedIds = held.dismissed;
+  // A read still on the wire is for the view the reader left: no loading line over this one.
+  renderChannelLoading(discordFetchInFlight, true);
   restoreChannelComposer();
   renderOlderControl();
   renderControls();
   if (held) {
     el("scroll-area").scrollTop = held.top;
     restoreScroll(held.position);
+    if (keepPlace) keepReaderPlace(place);
     catchUpHeldView();
     renderChannelFreshness();
     // Switching back to a view already fetched in this page is a local
     // presentation change. The live stream and periodic poll refresh the
     // active view; a tab switch itself must not become another network wait.
+    // ...but a view drawn from held rows whose read never landed still owes that read.
+    if (sameStore && view !== "threads" && !channelCanon.views.has(viewKey()) && !discordFetchInFlight) {
+      await readBehindSwitch();
+    }
     return;
   }
-  if (view === "thread") inheritAllCover(threadId, summary);
-  // Not drawn in this page yet, but covered by the channel's store — read earlier, or saved on
-  // this device: project it, with no request. The stream and the poll keep it current from here.
-  if (threadingSupported && channelCanon.channel === String(el("discord-channel").value) && drawProjection()) {
+  // Not drawn in this page yet, but covered by the channel's store: project it, with no request.
+  // The stream and the poll keep it current from here.
+  if (covered && drawProjection()) {
+    // Saved rows drawn while the device is offline say so, as the view the reader left did.
+    if (!channelCanon.views.get(viewKey()).live && came.freshness === "offline") setChannelFreshness("offline");
     renderChannelFreshness();
-    scrollToNewest();
+    if (!(keepPlace && keepReaderPlace(place))) scrollToNewest();
+    // Main is a view of its own from here, in the snapshot too. A thread drawn from All's cover is
+    // saved as All's, as it always was.
+    if (inherited && view === "main") saveChannelScope();
     return;
   }
+  // Covered by nothing, but the store holds some of it: up at once, and read behind it.
+  if (drawHeldRows(rows, came.freshAt, came.freshness)) {
+    if (!(keepPlace && keepReaderPlace(place))) scrollToNewest();
+    await readBehindSwitch();
+    return;
+  }
+  // Nothing to draw: the one case the loading line is for.
+  el("discord-log").replaceChildren();
+  el("thread-list").replaceChildren();
+  el("channel-summary").replaceChildren();
+  if (discordFetchInFlight) renderChannelLoading(true);
   scrollToNewest();
   await loadDiscord({ reason: "enter" });
 }
@@ -7886,15 +8054,37 @@ async function changeChannelView(view, threadId = null, summary = null) {
  * channel opens in, so All is nearly always covered, and an old thread — what the Threads screen is
  * for — began before All's newest page: inherited, it drew empty, with no cursor to walk back on
  * until the poll read it. That thread is read for itself instead.
+ *
+ * SO IS MAIN, and always from where All starts: every message posted to the channel itself, thread
+ * roots included, is a row of All. `#220 view-switch-instant`. Main is covered wherever All is, and
+ * drawn by hiding All's thread replies — on switching to it and on reopening the page in it — with
+ * no read. The roots keep their reply counts: their thread records, and the summaries, are the
+ * store's. Not All's notice, which can be about All alone ("replies for at most ten threads"): Main's
+ * own read says Main's. And a Main the store covers already is as current as All when All's newest
+ * page is the later read, since that page answered for every Main row in it.
+ *
+ * True when it gave the view a cover or freshened one, which the snapshot then has to be told.
  */
-function inheritAllCover(threadId, summary) {
-  if (threadingSupported && channelCanon.channel === String(el("discord-channel").value) &&
-      !channelCanon.views.has(viewKey("thread", threadId)) && allReachesThread(threadId, summary)) {
-    // Not All's forward cursor, which is bound to All: the thread's first refresh reads in full.
-    // `#203 incremental-refresh`.
-    channelCanon.views.set(viewKey("thread", threadId),
-      { ...channelCanon.views.get(viewKey("flat")), cursor: null, newest: null, fullAt: 0 });
+function inheritAllCover(view, threadId = null, summary = null) {
+  if (!threadingSupported || channelCanon.channel !== String(el("discord-channel").value)) return false;
+  const all = channelCanon.views.get(viewKey("flat"));
+  if (!all || (view !== "main" && view !== "thread")) return false;
+  const key = viewKey(view, threadId);
+  const own = channelCanon.views.get(key);
+  // Not All's forward cursor, which is bound to All: the view's first refresh reads in full.
+  // `#203 incremental-refresh`.
+  if (view === "main" && !own) {
+    const { landedHidden: _hidden, ...cover } = all;
+    channelCanon.views.set(key, { ...cover, notice: "", cursor: null, newest: null, fullAt: 0 });
+  } else if (view === "main" && all.live && (!own.live || all.at > own.at)) {
+    own.live = true;
+    own.at = all.at;
+  } else if (view === "thread" && !own && allReachesThread(threadId, summary)) {
+    channelCanon.views.set(key, { ...all, cursor: null, newest: null, fullAt: 0 });
+  } else {
+    return false;
   }
+  return true;
 }
 
 /**
@@ -8442,9 +8632,15 @@ function threadCard(summary) {
   return row;
 }
 
-function renderChannelLoading(loading) {
+/**
+ * Say that a read is on the wire, or that none is. `quiet` is a read behind rows already on screen
+ * for a view switch, `#220 view-switch-instant`: the pill says it is refreshing and the list shows
+ * no loading line, which over rows the reader is already reading would only say "wait".
+ */
+function renderChannelLoading(loading, quiet = false) {
   const indicator = el("channel-loading");
-  indicator.hidden = !loading;
+  channelRefreshing = loading;
+  indicator.hidden = !loading || quiet;
   // "Saved 14:05" and "Saved 14:05 · refreshing…" are different claims; only the second waits.
   renderChannelFreshness();
   if (!loading) return;
@@ -8521,16 +8717,17 @@ function timelinePath(before = null, after = null) {
  * has already folded into the store (`delta`, `#203 incremental-refresh`). A delta is drawn exactly
  * as a refresh that keeps the reader's place is — the store's projection of the view — but it says
  * nothing about older history, so the walk back keeps its cursor, and it names only the archived
- * rows among its own.
+ * rows among its own. `rows`, with `saved`, draws those rows of the store in place of a projection:
+ * a view no page has covered yet, drawn from what the store holds for it (`drawHeldRows`).
  */
-function applyTimelinePage(payload, older = false, saved = false, delta = false) {
+function applyTimelinePage(payload, older = false, saved = false, delta = false, rows = null) {
   if (!saved) observeOutgoingMessages(payload.messages || []);
   const previousCount = channelView === "threads" ? timelineThreads.length : timelineMessages.length;
   const incoming = channelView === "threads" ? payload.threads || [] : payload.messages || [];
   // Into the channel's store, and this view back out of it: what the reader sees is the store's
   // projection, so a row another view corrected or the stream delivered is here too.
   if (!saved && !delta) foldTimelinePage(payload, older);
-  const merged = projectView() || [];
+  const merged = rows || projectView() || [];
   if (channelView === "threads") timelineThreads = merged;
   else timelineMessages = merged;
   // Retain the oldest cursor when a refresh retained the history already walked back to.
@@ -8722,7 +8919,10 @@ async function loadTimeline(options) {
   const area = el("scroll-area");
   const position = channelReadPosition(area);
   const keepPosition = Boolean(options && options.keepPosition);
-  renderChannelLoading(true);
+  // `#220 view-switch-instant`. A read behind rows a view switch drew: no loading line over them,
+  // and what it adds was only not drawn before, not something that arrived.
+  const ownAct = Boolean(options && options.ownAct);
+  renderChannelLoading(true, Boolean(options && options.quiet));
   /** @type {VibeTalk.TimelineResponse[]} every page this refresh folded, in order */
   const landed = [];
   /** @type {VibeTalk.TimelineResponse[]} the delta pages among them, still to be drawn */
@@ -8734,7 +8934,7 @@ async function loadTimeline(options) {
   const drawDeltas = () => {
     renderChannelLoading(false);
     const messages = applyTimelinePage(joinedDeltas(deltas), false, false, true);
-    settleAfterRead(messages, { keepPosition, area, ...position });
+    settleAfterRead(messages, { keepPosition, area, ...position, ownAct });
     noteFreshRead(deltas[deltas.length - 1]);
     saveChannelScope();
     renderScrollTools();
@@ -8824,7 +9024,7 @@ async function loadTimeline(options) {
         channelCanon.views.delete(viewKey());
       }
       const messages = applyTimelinePage(payload);
-      settleAfterRead(messages, { keepPosition, area, ...position });
+      settleAfterRead(messages, { keepPosition, area, ...position, ownAct });
       noteFreshRead(payload);
       saveChannelScope();
       renderScrollTools();
@@ -10855,9 +11055,10 @@ async function seekMessage(target, arrive, openAll) {
     }
     if (!stillAll()) return;
     if (arrive() || hiddenAsRead()) return;
-    if (!channelCanon.views.has(viewKey()) && el("discord-log").children.length === 0) {
+    if (!channelCanon.views.has(viewKey())) {
       // All's read failed, and that is reported where every failed read is. Nothing was learned
-      // about the message, so nothing is said about it either.
+      // about the message, so nothing is said about it either — whether or not the rows the page
+      // already held for All are up (`#220 view-switch-instant`): those are not All read.
       setStatus("Could not read All — try again.");
       return;
     }
@@ -14198,7 +14399,7 @@ function channelReadPosition(area) {
 }
 
 /**
- * @param {{keepPosition?: boolean, reason?: string | (string | undefined)[]}} [options]
+ * @param {{keepPosition?: boolean, quiet?: boolean, ownAct?: boolean, reason?: string | (string | undefined)[]}} [options]
  *   `keepPosition` marks a RE-read of a channel already on screen — the background poll, or the
  *   Refresh button. It must not drag the reader to the bottom while they are reading older
  *   messages; it follows the newest line only if that is where they already were. The FIRST load
@@ -14206,7 +14407,10 @@ function channelReadPosition(area) {
  *   means scrolling past everything already read. `reason` says what asked for the read — one of
  *   `DELTA_REASONS`, or `enter`, `reset`, `expired` — which decides whether a timeline read may ask
  *   only for what changed; absent reads in full. A queued read carries the reasons of every
- *   trigger it stands for (`queueDiscordLoad`). `#203 incremental-refresh`.
+ *   trigger it stands for (`queueDiscordLoad`). `#203 incremental-refresh`. `quiet` and `ownAct`
+ *   are a read behind rows a view switch has already drawn (`readBehindSwitch`, `#220
+ *   view-switch-instant`): it shows no loading line over them, and what it adds is not counted as
+ *   arrived.
  */
 async function loadDiscord(options) {
   screenBelongsToToken();
@@ -15891,7 +16095,7 @@ const replaysAwaitingRead = new Map();
  * before any delta has landed it can be the other way round. The newest request's other options
  * win, as they always have.
  *
- * @param {{keepPosition?: boolean, reason?: string | (string | undefined)[]}} [options]
+ * @param {{keepPosition?: boolean, quiet?: boolean, ownAct?: boolean, reason?: string | (string | undefined)[]}} [options]
  */
 function queueDiscordLoad(options) {
   if (!discordQueuedLoad) {

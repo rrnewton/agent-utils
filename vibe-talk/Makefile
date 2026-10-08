@@ -10,7 +10,7 @@
 # tool's lightweight unboxed gate. The root includes `tests.dag.yaml` directly so vibe-talk shares
 # one scheduler and browser cap with the other repository fragments.
 
-.PHONY: validate validate-boxed dag-check fmt check scripts-check contract contract-check typecheck test page pwa-installability offline-cache-browser read-aloud-browser post-confirm-browser voice-read-acceptance-self-test android-speech-self-test live-hint-adapter-self-test container-smoke clean
+.PHONY: validate validate-boxed dag-check fmt check scripts-check contract contract-check typecheck test page pwa-installability offline-cache-browser read-aloud-browser post-confirm-browser view-switch-browser voice-read-acceptance-self-test android-speech-self-test live-hint-adapter-self-test container-smoke clean
 
 # The whole gate for this tool, cheapest and most likely to fail first.
 #
@@ -124,6 +124,13 @@ read-aloud-browser:
 # WEB_ROOT=dir to run it against another copy of the page.
 post-confirm-browser:
 	python3 tests/post_confirm_browser.py $(if $(WEB_ROOT),--web-root $(WEB_ROOT))
+
+# `#220 view-switch-instant` in a real Chromium: All to Main and back with every timeline request
+# intercepted -- no read, never an empty list or the loading line, the reader's message kept -- and
+# All never read drawn at once from held rows and read once behind them. Pass WEB_ROOT=dir to run it
+# against another copy of the page, and SCREENSHOTS=dir to keep PNGs.
+view-switch-browser:
+	python3 tests/view_switch_browser.py $(if $(WEB_ROOT),--web-root $(WEB_ROOT)) $(if $(SCREENSHOTS),--screenshots $(SCREENSHOTS))
 
 # The live #47 read-aloud-overlong check is opt-in and may consume provider time. Its transcript
 # reconciliation, PCM-duration metric, re-answer separation, privacy boundaries, threshold edges,
