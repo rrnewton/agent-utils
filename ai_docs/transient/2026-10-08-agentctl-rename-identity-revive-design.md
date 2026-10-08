@@ -209,9 +209,11 @@ Failure modes:
   never appears still refuses with nothing typed.
 - **Profiles from a slot cwd.** `start --profile` reads only
   `<cwd>/.agentctl/profiles.json`, while workspace policy is read from the
-  registry's project. Fix: look in the registry's project (registry named
-  `.agentctl`) first, then `--cwd`; the error lists both paths. Same for
-  `agentctl profiles`. Test: `--cwd SLOT` with the profile beside the registry.
+  registry's project. Fix: `--cwd` first (unchanged behaviour), then the
+  registry's project when the registry is named `.agentctl`; the error lists
+  both paths. Same for `agentctl profiles`. A slot checkout never holds the
+  git-ignored profile file, so only the previously failing case changes. Test:
+  `--cwd SLOT` with the profile beside the registry.
 
 ## 7. Tests
 
