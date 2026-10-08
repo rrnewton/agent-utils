@@ -228,8 +228,24 @@ impl Entry for Message {
     fn when(&self) -> Option<Timestamp> {
         self.timestamp.parse().ok()
     }
+    // A message changes when its reactions do (`#219 emoji-reactions`): the same message with
+    // other tallies is new, so a reaction inside the overlap reaches the page with the next delta.
+    // That is when a delivery acknowledgement arrives, seconds after the message it acknowledges.
+    // A copy that cannot see reactions keys by its id alone, as every message did before.
     fn key(&self) -> String {
-        self.id.0.clone()
+        let Some(reactions) = &self.reactions else {
+            return self.id.0.clone();
+        };
+        let mut key = format!("{}#", self.id.0);
+        for reaction in reactions {
+            key.push_str(&format!(
+                "{}\u{1f}{}\u{1f}{}\u{1e}",
+                reaction.custom_id.as_deref().unwrap_or(""),
+                reaction.emoji,
+                reaction.count
+            ));
+        }
+        key
     }
 }
 
@@ -548,6 +564,7 @@ mod tests {
             spoken_content: String::new(),
             thread: None,
             noise: false,
+            reactions: None,
         }
     }
 
@@ -964,5 +981,69 @@ mod tests {
         assert_eq!(position.floor, "2026-10-04T07:00:50Z");
         assert_eq!(position.at, "2026-10-04T07:01:00Z");
         assert_eq!(position.seen.len(), 2);
+    }
+
+    fn reacted(id: &str, at: &str, tallies: &[(&str, u32)]) -> Message {
+        Message {
+            reactions: Some(
+                tallies
+                    .iter()
+                    .map(|(emoji, count)| crate::model::Reaction {
+                        emoji: (*emoji).to_owned(),
+                        custom: false,
+                        custom_id: None,
+                        count: *count,
+                    })
+                    .collect(),
+            ),
+            ..message(id, at)
+        }
+    }
+
+    #[tokio::test]
+    async fn a_message_whose_reactions_changed_inside_the_overlap_is_new_again() {
+        // `#219 emoji-reactions`. A delivery acknowledgement lands seconds after its message, well
+        // inside the overlap, and is a change to it: the catch-up carries the message again.
+        let at = "2026-10-04T07:00:00Z";
+        let history = History::of(vec![reacted("1", at, &[])], 10);
+        let position = start(&history, TimelineView::Main).await;
+        *history.messages.lock().unwrap() = vec![reacted("1", at, &[("👀", 1)])];
+        let (ids, delta) = since(&history, &position).await;
+        assert_eq!(ids, ["1"], "the first acknowledgement was not a change");
+        assert_eq!(
+            delta.page.messages[0].reactions.as_ref().map(Vec::len),
+            Some(1)
+        );
+        let (ids, delta) = since(&history, &delta.position).await;
+        assert!(
+            ids.is_empty(),
+            "unchanged reactions were sent again: {ids:?}"
+        );
+        *history.messages.lock().unwrap() = vec![reacted("1", at, &[("👀", 1), ("✅", 1)])];
+        let (ids, delta) = since(&history, &delta.position).await;
+        assert_eq!(ids, ["1"], "the second acknowledgement was not a change");
+        *history.messages.lock().unwrap() = vec![reacted("1", at, &[("👀", 1), ("✅", 2)])];
+        let (ids, delta) = since(&history, &delta.position).await;
+        assert_eq!(ids, ["1"], "a count going up was not a change");
+        let (ids, _) = since(&history, &delta.position).await;
+        assert!(ids.is_empty());
+    }
+
+    #[test]
+    fn a_copy_that_cannot_see_reactions_keys_by_its_id_as_before() {
+        // Cursors issued before reactions existed hold keys of bare ids; a provider that reports
+        // none must keep matching them, or every message in the overlap would come back once.
+        let plain = message("1", "2026-10-04T07:00:00Z");
+        assert_eq!(plain.key(), "1");
+        let none = reacted("1", "2026-10-04T07:00:00Z", &[]);
+        assert_ne!(
+            none.key(),
+            plain.key(),
+            "known-none is an answer of its own"
+        );
+        assert_ne!(
+            reacted("1", "2026-10-04T07:00:00Z", &[("👀", 1)]).key(),
+            reacted("1", "2026-10-04T07:00:00Z", &[("👀", 2)]).key()
+        );
     }
 }

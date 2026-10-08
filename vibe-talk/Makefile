@@ -10,7 +10,7 @@
 # tool's lightweight unboxed gate. The root includes `tests.dag.yaml` directly so vibe-talk shares
 # one scheduler and browser cap with the other repository fragments.
 
-.PHONY: validate validate-boxed dag-check fmt check scripts-check contract contract-check typecheck test page pwa-installability offline-cache-browser read-aloud-browser post-confirm-browser view-switch-browser voice-read-acceptance-self-test android-speech-self-test live-hint-adapter-self-test container-smoke clean
+.PHONY: validate validate-boxed dag-check fmt check scripts-check contract contract-check typecheck test page pwa-installability offline-cache-browser reactions-browser read-aloud-browser post-confirm-browser view-switch-browser voice-read-acceptance-self-test android-speech-self-test live-hint-adapter-self-test container-smoke clean
 
 # The whole gate for this tool, cheapest and most likely to fail first.
 #
@@ -111,6 +111,12 @@ pwa-installability:
 # Pass SCREENSHOTS=dir to keep one PNG per step.
 offline-cache-browser:
 	python3 tests/offline_cache_browser.py $(if $(SCREENSHOTS),--screenshots $(SCREENSHOTS))
+
+# `#219 emoji-reactions` in a real Chromium: every reaction strip laid out under its row's text,
+# clear of the row's controls and legible, at 412px, 360px and a desk, dark and light. Pass
+# SCREENSHOTS=dir to keep PNGs.
+reactions-browser:
+	python3 tests/reactions_browser.py $(if $(SCREENSHOTS),--screenshots $(SCREENSHOTS))
 
 # `#7 read-aloud-latency` in a real Chromium: tap to audible against audio streamed at speaking
 # pace, a switch and a stop closing the response, and only a read heard to its end archived. Its

@@ -20,7 +20,7 @@ use vibe_talk::contract::{
     TranscriptRole, VibeTalkV1ClientFrame, VibeTalkV1ServerFrame,
 };
 use vibe_talk::conversation::{VoiceDescription, VoiceSession};
-use vibe_talk::model::{ChannelId, ChannelInfo, Message, MessageId, UserId};
+use vibe_talk::model::{ChannelId, ChannelInfo, Message, MessageId, Reaction, UserId};
 use vibe_talk::speech::{Description, Playback};
 use vibe_talk::store::{Pin, PinSnapshot};
 use vibe_talk::threads::{MessageThread, ThreadSummary, TimelineDelta, TimelinePage, TimelineView};
@@ -70,6 +70,7 @@ fn message(id: &str) -> Message {
         content: "hello".into(),
         spoken_content: String::new(),
         noise: false,
+        reactions: None,
     }
 }
 
@@ -88,6 +89,22 @@ fn threaded_message(id: &str) -> Message {
         // `#196 auto-read-noise`: present on one sample and absent on the other, so the
         // generated validators are proven against both.
         noise: true,
+        // `#219 emoji-reactions`: a standard emoji and a custom one here, none on the plain
+        // sample, and an empty list on a third, because absent and empty are different answers.
+        reactions: Some(vec![
+            Reaction {
+                emoji: "👀".into(),
+                custom: false,
+                custom_id: None,
+                count: 1,
+            },
+            Reaction {
+                emoji: "party-parrot".into(),
+                custom: true,
+                custom_id: Some("112233".into()),
+                count: 2,
+            },
+        ]),
         ..message(id)
     }
 }
@@ -402,7 +419,14 @@ fn samples() -> Value {
                 detail: Some("why".into()),
             }),
         ],
-        "Message": [to(&plain), to(&threaded)],
+        "Message": [
+            to(&plain),
+            to(&threaded),
+            to(&Message {
+                reactions: Some(Vec::new()),
+                ..message("302")
+            }),
+        ],
         "ThreadSummary": [to(&thread_summary(Some(plain.clone()))), to(&thread_summary(None))],
         "PinsResponse": [
             to(&PinsResponse {

@@ -96,6 +96,14 @@ it answers. Nothing is read or archived by it. The **×** beside the line, or th
 replies**, puts them back in time order, as changing view or channel, or filtering from the search
 bar, does. **Thread(N)** opens a message's thread.
 
+**Reactions show under each message.** Where the chat service reports them, a message's emoji
+reactions appear as a row of small chips under its text, each the emoji and how many reacted with it
+— a chat bridge's 👀 when it has a message and ✅ once the message reached the agent, for example.
+They are read-only: who reacted is not shown, and nothing here reacts. A custom emoji shows its name
+between colons. A post combined from several messages shows one row of chips, each emoji counted
+over all of them. Reactions reach the page with the next read, so they can trail the message by a
+refresh. Discord and a compatible bridge report them; the Slack backend does not yet.
+
 **A normal text box at the bottom.** Scroll below the newest message to write to the channel or
 selected thread. **Send** posts without requiring a message to reply to. Drafts are kept separately
 for each channel and thread. This composer scrolls with history.
@@ -1212,6 +1220,12 @@ neither callers nor bridges should interpret a thread as a quoted-message refere
 and writes must verify membership in the registered parent channel, including any narrower scope
 that registration imposes. Posts use the existing message body and nonce contract. Lookup and
 post responses use the existing message wire format.
+
+A message wire object may carry Discord's `reactions` array, each entry
+`{"emoji": {"name": "👀", "id": null}, "count": 1}` — a custom emoji has an `id`, and its `name` is
+shown as text. vibe-talk reads only the name, id, and count. An absent array means the bridge cannot
+say; send `[]` for a message it knows has none. A message whose reactions changed is a changed
+message, in forward reads too (`#219 emoji-reactions`).
 
 Timeline responses follow `src/threads.rs`: messages and thread summaries are oldest first,
 `has_more` pairs with `next_before`, and `has_threads` controls navigation. Message wire objects

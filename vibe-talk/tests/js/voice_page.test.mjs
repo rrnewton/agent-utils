@@ -29353,3 +29353,205 @@ test("the channel composer says where the message goes in its placeholder, not i
   assert.match(SCRIPT_CODE, /el\("channel-compose-text"\)\.placeholder = `\$\{destination\}…`;/);
   assert.doesNotMatch(SCRIPT_CODE, /Write a message…|Write a thread reply…/, "the old, less informative hint came back");
 });
+
+// --- emoji reactions ------------------------------------------------------------------------------
+//
+// `#219 emoji-reactions`. The owner: "I just want to see them appear. I don't care about seeing who
+// reacted and I don't care about reacting IN vibe-chat (yet)." The chat bridge acknowledges each
+// message with 👀 when it has it and ✅ once it reached the agent's transcript, so the fixture's
+// acknowledged message carries exactly those two.
+
+const ACKNOWLEDGED = [{ emoji: "👀", count: 1 }, { emoji: "✅", count: 1 }];
+const reactionStripOf = (li) => li.children.find((node) => node.className === "reactions");
+/** A row's chips as the reader sees them, "👀 1", or null when the row has no strip. */
+function chipsOf(li) {
+  const strip = reactionStripOf(li);
+  return strip ? strip.children.map((chip) => chip.children.map((part) => part.textContent).join(" ")) : null;
+}
+
+test("a message's reactions are drawn under its text as read-only chips; one without any has no strip", async () => {
+  const page = newPage();
+  await signIn(page);
+  const rows = await showDiscord(page, [
+    message({ id: "100", content: "please deploy", reactions: ACKNOWLEDGED }),
+    message({ id: "101", content: "on it", reactions: [] }),
+    message({ id: "102", content: "deployed" }),
+  ]);
+  assert.deepStrictEqual(chipsOf(rows[0]), ["👀 1", "✅ 1"]);
+  assert.equal(chipsOf(rows[1]), null, "a message with none drew an empty strip");
+  assert.equal(chipsOf(rows[2]), null, "a message whose source cannot see reactions drew a strip");
+  // Its own line under the text: after the body, and nothing of it in the meta line, which the
+  // row's controls fill.
+  const order = rows[0].children.map((node) => node.className);
+  assert.ok(order.indexOf("reactions") > order.indexOf("body"), `the strip is not under the text: ${order}`);
+  const meta = rows[0].children.find((node) => node.className === "meta");
+  assert.ok(!meta.descendants().some((node) => node.hasClass("reaction")), "a chip landed among the row's controls");
+  const strip = reactionStripOf(rows[0]);
+  assert.equal(strip.getAttribute("role"), "group");
+  assert.equal(strip.getAttribute("aria-label"), "Reactions");
+  // Labels, not controls: a tap on a chip is a tap on the row, and there is nothing to react with.
+  for (const node of strip.descendants()) {
+    assert.ok(!["button", "a", "input"].includes(node.tagName), `the strip holds a ${node.tagName}`);
+  }
+  assert.equal(strip.children[0].className, "reaction");
+  // Not searchable: "eyes" is not a search for 👀, and the emoji itself matches no message text.
+  await search(page, "👀");
+  await page.settle();
+  assert.ok(rows.every((li) => li.hasClass("search-hidden")), "a reaction made a row match a search");
+});
+
+test("a custom emoji is shown as its name between colons, as text, and two of one id are one chip", async () => {
+  const page = newPage();
+  await signIn(page);
+  const hostile = "<img src=x onerror=alert(1)>";
+  const rows = await showDiscord(page, [message({ id: "100", content: "shipped", reactions: [
+    { emoji: "party-parrot", custom: true, custom_id: "112233", count: 3 },
+    { emoji: "party-parrot", custom: true, custom_id: "445566", count: 1 },
+    { emoji: hostile, custom: true, custom_id: "9", count: 1 },
+    { emoji: "🎉", count: 2 },
+  ] })]);
+  assert.deepStrictEqual(chipsOf(rows[0]), [":party-parrot: 3", ":party-parrot: 1", `:${hostile}: 1`, "🎉 2"],
+    "two custom emoji of one name but different ids were merged, or a name was not shown as text");
+  assert.ok(reactionStripOf(rows[0]).children[0].hasClass("reaction-custom"));
+  assert.ok(!reactionStripOf(rows[0]).children[3].hasClass("reaction-custom"));
+  assert.ok(!page.createdTags.includes("img"), "an emoji's name became markup, or its image was fetched");
+});
+
+test("a combined row shows one strip, each emoji counted over all of its messages", async () => {
+  const page = newPage();
+  await signIn(page);
+  // Both halves reached the bridge; only the first has reached the transcript yet. The sum shows
+  // that as 👀 2 beside ✅ 1, where the larger count alone would have shown both as done.
+  const rows = await showDiscord(page, splitPost(
+    { reactions: ACKNOWLEDGED },
+    { reactions: [{ emoji: "👀", count: 1 }, { emoji: "party-parrot", custom: true, custom_id: "7", count: 1 }] }
+  ));
+  assert.equal(rows.length, 1, "the fixture did not produce one combined row");
+  assert.deepStrictEqual(chipsOf(rows[0]), ["👀 2", "✅ 1", ":party-parrot: 1"]);
+  assert.equal(rows[0].children.filter((node) => node.className === "reactions").length, 1, "one strip per row");
+  // With combining off, each message has its own row and its own strip.
+  await page.el("combine-messages").setChecked(false);
+  await page.settle();
+  const apart = page.el("discord-log").children;
+  assert.equal(apart.length, 2);
+  assert.deepStrictEqual(apart.map(chipsOf), [["👀 1", "✅ 1"], ["👀 1", ":party-parrot: 1"]]);
+});
+
+test("a folded row keeps its reactions under whatever stands for its text, the summary included", async () => {
+  const page = newPage();
+  await signIn(page);
+  const rows = await showDiscord(page, [message({ id: "100", content: longMessage(), reactions: ACKNOWLEDGED })]);
+  assert.equal(rows[0].getAttribute("data-collapsed"), "true", "the fixture is not folded");
+  const order = rows[0].children.map((node) => node.className);
+  assert.equal(order[order.length - 1], "reactions", `the strip is not the row's last line: ${order}`);
+  assert.ok(order.indexOf("summary") >= 0 && order.indexOf("summary") < order.indexOf("reactions"),
+    `the summary that can stand in for the text sits below the reactions: ${order}`);
+  assert.deepStrictEqual(chipsOf(rows[0]), ["👀 1", "✅ 1"]);
+});
+
+test("under the Links filter a row's reactions go with its text", async () => {
+  assert.match(cssBlock('.messages li[data-links-view="true"] > .reactions'), /display: none !important/);
+  const page = newPage();
+  await signIn(page);
+  const rows = await showDiscord(page, [
+    message({ id: "100", content: "the design doc: https://docs.example.com/design", reactions: ACKNOWLEDGED }),
+  ]);
+  await showLinks(page);
+  assert.equal(rows[0].getAttribute("data-links-view"), "true", "the row is not showing its links");
+  assert.ok(reactionStripOf(rows[0]), "the strip was taken out of the row rather than hidden with the text");
+});
+
+test("the reaction strip wraps inside a phone's width and is drawn as labels in the theme's colours", () => {
+  const strip = cssBlock(".discord-message > .reactions");
+  assert.match(strip, /display: flex/);
+  assert.match(strip, /flex-wrap: wrap/, "a row of chips could push the row wider than a 360px screen");
+  assert.match(strip, /var\(--msg-scale\)/, "the chips ignore the reader's message size");
+  const chip = cssBlock(".reaction");
+  assert.match(chip, /border: 1px solid var\(--edge\)/);
+  assert.match(chip, /max-width: 100%/);
+  assert.match(chip, /cursor: default/, "a chip offers itself as something to press");
+  assert.match(cssBlock(".reaction-emoji"), /overflow-wrap: anywhere/, "a long custom name widens the row");
+  assert.match(cssBlock(".reaction-count"), /color: var\(--muted\)/);
+  assert.doesNotMatch(CSS_CODE, /\.reaction[\w-]*:hover/, "a chip changes under the pointer, as a control does");
+  assert.equal(cssRules(CSS, ".meta .reactions").length, 0);
+});
+
+/** A threaded channel in All whose first message, and a thread's root, carry reactions. */
+async function reactedThreadPage(script = SCRIPT) {
+  const page = newPage(new Map(), script);
+  const data = threadData();
+  data.messages[0] = { ...data.messages[0], reactions: ACKNOWLEDGED };
+  data.messages[1] = { ...data.messages[1], reactions: [{ emoji: "👍", count: 2 }] };
+  page.threadingSupported = true;
+  page.threads = data.threads;
+  await signIn(page);
+  await showDiscord(page, data.messages);
+  return page;
+}
+
+test("the live echo of a message, which carries no reactions, does not wipe the ones a read brought", async () => {
+  const page = await reactedThreadPage();
+  assert.deepStrictEqual(chipsOf(rowOf(page, "200")), ["👀 1", "✅ 1"], "the fixture's row has no strip");
+  // No read succeeds from here on, so only what the page keeps can say what the reactions are.
+  const standard = page.timeline;
+  page.timeline = errorResponse(502, "chat_error", "history read timed out");
+  const { reactions: _unseen, ...echo } = page.messages.find((m) => m.id === "200");
+  await deliver(page, page.stream(), sseMessage({ ...echo, content: "main channel announcement, edited" }));
+  await page.settle();
+  assert.deepStrictEqual(chipsOf(rowOf(page, "200")), ["👀 1", "✅ 1"], "the echo wiped the acknowledgements");
+  // The store took the echo's text and kept the reactions the echo could not see.
+  const kept = savedScopes(page)[scopeKey(CHANNEL.id)].messages.find((m) => m.id === "200");
+  assert.equal(kept.content, "main channel announcement, edited", "the echo was not folded into the store");
+  assert.deepStrictEqual(kept.reactions, ACKNOWLEDGED, "the store's copy lost them");
+  // A READ is the provider's answer, and says "none" when there are none.
+  page.timeline = standard;
+  page.messages = page.messages.map((m) => (m.id === "200" ? { ...m, reactions: [] } : m));
+  await pollOnce(page);
+  assert.equal(chipsOf(rowOf(page, "200")), null, "a read saying there are none left the old ones up");
+});
+
+test("negative control: without the rule, the live echo does wipe the reactions from the store", async () => {
+  const page = await reactedThreadPage(brokenScript(
+    "if (held && Array.isArray(held.reactions) && !Array.isArray(kept.reactions)) {", "if (false) {"));
+  page.timeline = errorResponse(502, "chat_error", "history read timed out");
+  const { reactions: _unseen, ...echo } = page.messages.find((m) => m.id === "200");
+  await deliver(page, page.stream(), sseMessage({ ...echo, content: "main channel announcement, edited" }));
+  await page.settle();
+  const kept = savedScopes(page)[scopeKey(CHANNEL.id)].messages.find((m) => m.id === "200");
+  assert.equal(kept.content, "main channel announcement, edited");
+  assert.equal(kept.reactions, undefined, "the control did not take the rule away, so it proves nothing");
+});
+
+test("a thread root shows its reactions above the way into its replies", async () => {
+  const page = await reactedThreadPage();
+  const root = rowOf(page, "201");
+  assert.deepStrictEqual(chipsOf(root), ["👍 2"]);
+  const order = root.children.map((node) => node.className);
+  assert.ok(order.indexOf("thread-replies") > order.indexOf("reactions"),
+    `the reply count is not below the reactions, where the chat service puts it: ${order}`);
+});
+
+test("a pinned message shows its reactions in the Pinned list, and redraws when they change", async () => {
+  const page = newPage();
+  const data = threadData();
+  data.messages[0] = { ...data.messages[0], reactions: ACKNOWLEDGED };
+  page.threadingSupported = true;
+  page.threads = data.threads;
+  const old = message({ id: "150", content: "kept only by its pin",
+    timestamp: new Date(Date.parse(data.messages[0].timestamp) - 3_600_000).toISOString() });
+  for (const [m, at] of [[data.messages[0], 1], [old, 2]]) page.pinned.set(String(m.id), storedPin(m, at));
+  page.servePinsRevision = true;
+  page.pinsRevision = 7;
+  await signIn(page);
+  await showDiscord(page, data.messages);
+  await showPinned(page);
+  assert.deepStrictEqual(pinnedIds(page), ["150", "200"]);
+  const rows = page.el("pinned-log").children;
+  assert.equal(chipsOf(rows[0]), null, "a pin's kept copy, which holds no reactions, drew some");
+  assert.deepStrictEqual(chipsOf(rows[1]), ["👀 1", "✅ 1"]);
+  page.messages = page.messages.map((m) => (m.id === "200"
+    ? { ...m, reactions: [...ACKNOWLEDGED, { emoji: "👍", count: 1 }] } : m));
+  await pollOnce(page);
+  assert.deepStrictEqual(chipsOf(page.el("pinned-log").children[1]), ["👀 1", "✅ 1", "👍 1"],
+    "the Pinned list kept the reactions it was first drawn with");
+});

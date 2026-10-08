@@ -193,6 +193,23 @@ steps:
       classification: latency-bound
       rss_baseline_bytes: 1073741824
 
+  # `#219 emoji-reactions` in the browser engine: each message's reaction strip under its text,
+  # inside its row and the screen, clear of the row's buttons and links, the thread root's reply count
+  # below it, and each count legible, at two phone widths and a desk, in the dark and light schemes.
+  - group: check
+    job: reactions-browser
+    desc: emoji reaction strips laid out in current Chromium at 412x915 and 360x800 Android viewports and a 1280x800 desk
+    labels: [validation-vibe-talk]
+    cmd: cd vibe-talk && python3 tests/reactions_browser.py
+    jobs_flag: ""
+    timeout: 60
+    cpu_timeout: 30
+    hint:
+      resources: {browser: 1}
+      est_duration_s: 4
+      classification: latency-bound
+      rss_baseline_bytes: 1073741824
+
   # `#7 read-aloud-latency` in the browser engine: a prepared read audible within a second of the
   # tap while its audio arrives at speaking pace, a switch and a stop closing the response, and
   # only a read heard to its end archived. The `<audio src>` control must take seconds.

@@ -6815,7 +6815,13 @@ function foldLiveMessage(message, live = false) {
   if (channelCanon.channel !== channel) loadCanon(channel);
   const id = String(message.id);
   const held = channelCanon.messages.find((candidate) => String(candidate.id) === id);
-  const kept = !threadOf(message) && threadOf(held) ? { ...message, thread: held.thread } : message;
+  let kept = !threadOf(message) && threadOf(held) ? { ...message, thread: held.thread } : message;
+  // `#219 emoji-reactions`. NOR DOES A COPY WITHOUT REACTIONS REPLACE ONE WITH THEM, for the same
+  // reason: the stream's copy cannot see them, and the bridge's echo of a message lands after the
+  // read that brought its acknowledgements. Absent is "not seen"; only a read says "none".
+  if (held && Array.isArray(held.reactions) && !Array.isArray(kept.reactions)) {
+    kept = { ...kept, reactions: held.reactions };
+  }
   channelCanon.messages = inTimeOrder(
     [...channelCanon.messages.filter((candidate) => String(candidate.id) !== id), kept], "timestamp");
   if (!live || threadOf(kept)) channelCanon.unplaced.delete(id);
@@ -13440,7 +13446,85 @@ function channelRowFrame(messages) {
   const content = combinedContent(messages);
   renderMarkdownInto(body, content);
   li.append(meta, body);
-  return { li, meta, body, content };
+  // `#219 emoji-reactions`. Under the text, on a line of its own, and never in `.meta`, whose line
+  // the row's controls already fill on a phone. See `reactionStrip`.
+  const reactions = reactionStrip(messages);
+  if (reactions) li.append(reactions);
+  return { li, meta, body, content, reactions };
+}
+
+// --- reactions ------------------------------------------------------------------------------------
+//
+// `#219 emoji-reactions`. The owner: "I just want to see them appear. I don't care about seeing who
+// reacted and I don't care about reacting IN vibe-chat (yet)." What it is for, first: the chat
+// bridge acknowledges each message it takes with an emoji, and with a second one once the message
+// has reached the agent's transcript, and other tools acknowledge with one of their own. Seeing
+// those here is seeing a message arrive.
+//
+//   * A STRIP OF CHIPS UNDER THE TEXT, each the emoji and how many reacted with it. Read-only, and
+//     spans rather than buttons, so a tap on one is a tap on the row: `tapRow` passes over only
+//     controls and links. Text only — a custom emoji is its name between colons — because drawing
+//     its image would be this page's first request to a third party.
+//   * A COMBINED ROW HAS ONE STRIP, each emoji counted over all of its messages. The row is one act
+//     of writing and is acted on as one; the sum keeps an acknowledgement missing from one of its
+//     messages visible as a lower count, 👀 2 beside ✅ 1, which the largest count would hide.
+//   * A LIVE COPY NEVER WIPES THEM. The stream's copy of a message carries no reactions and can land
+//     after the read that brought them, so `foldLiveMessage` keeps the held ones.
+//   * NOT SEARCHED AND NOT READ ALOUD. A search for "eyes" is not a search for 👀.
+
+/** Two tallies of one emoji share this: a custom emoji is known by its id, a standard one by itself. */
+const reactionKey = (reaction) =>
+  reaction.custom ? `c:${reaction.custom_id || reaction.emoji}` : `u:${reaction.emoji}`;
+
+/**
+ * A row's reactions: one tally per emoji, in the order first seen, counted over every message the
+ * row stands for. Empty when none has any, whether its source reported none or cannot see them.
+ */
+function rowReactions(messages) {
+  const tallies = new Map();
+  for (const message of messages) {
+    for (const reaction of Array.isArray(message.reactions) ? message.reactions : []) {
+      const count = reaction ? Number(reaction.count) : 0;
+      if (!reaction || typeof reaction.emoji !== "string" || reaction.emoji === "" || !(count > 0)) continue;
+      const key = reactionKey(reaction);
+      const held = tallies.get(key);
+      if (held) held.count += count;
+      else tallies.set(key, { emoji: reaction.emoji, custom: reaction.custom === true, count });
+    }
+  }
+  return [...tallies.values()];
+}
+
+/** What a chip shows of its emoji: the emoji itself, or a custom emoji's name between colons. */
+const reactionText = (tally) => (tally.custom ? `:${tally.emoji}:` : tally.emoji);
+
+/** A stable account of a message's reactions, for the lists that redraw only when a row changed. */
+const reactionsDrawn = (message) => rowReactions([message]).map((tally) => [reactionText(tally), tally.count]);
+
+/**
+ * The strip of chips under a row's text, or null when the row has no reactions. `textContent`
+ * only: every emoji and every name in it is channel data.
+ */
+function reactionStrip(messages) {
+  const tallies = rowReactions(messages);
+  if (tallies.length === 0) return null;
+  const strip = document.createElement("div");
+  strip.className = "reactions";
+  strip.setAttribute("role", "group");
+  strip.setAttribute("aria-label", "Reactions");
+  for (const tally of tallies) {
+    const chip = document.createElement("span");
+    chip.className = tally.custom ? "reaction reaction-custom" : "reaction";
+    const emoji = document.createElement("span");
+    emoji.className = "reaction-emoji";
+    emoji.textContent = reactionText(tally);
+    const count = document.createElement("span");
+    count.className = "reaction-count";
+    count.textContent = String(tally.count);
+    chip.append(emoji, count);
+    strip.append(chip);
+  }
+  return strip;
 }
 
 /**
@@ -13450,7 +13534,7 @@ function channelRowFrame(messages) {
  */
 function discordNode(messages) {
   const message = messages[0];
-  const { li, meta, body, content } = channelRowFrame(messages);
+  const { li, meta, body, content, reactions } = channelRowFrame(messages);
   // `#204 reply-arrow`. FIRST in the row, ahead of the meta line, so a screen reader meets the way
   // to what this answers before the row's own words — and drawn by web/voice.css in the gutter to
   // the row's left, where nothing else on the row is. Not in the Pinned list (`#206 pin-message`):
@@ -13473,6 +13557,9 @@ function discordNode(messages) {
   // the primary alone would describe the half that stops mid-sentence, and the tail alone is the
   // least summarisable text in the channel.
   tapRow(li, foldable(li, meta, body, content, String(message.id), messages.slice(1).map((m) => String(m.id))));
+  // `#219 emoji-reactions`. Moved below the summary `foldable` may have added, which can stand in
+  // for the text: the reactions belong to the message, whichever of the two is showing.
+  if (reactions) li.append(reactions);
   // `#51 reply-view`. Every raw message can be answered, and the affordance is on the row rather
   // than in a menu — Discord's own idiom, and the thing that makes a reply a REPLY rather than a
   // loose message.
@@ -15406,7 +15493,8 @@ function syncPinnedList() {
   }
   const messages = pinnedMessages();
   const drawn = JSON.stringify([combineMessages, channelCanon.scope, threadingSupported,
-    ...messages.map((m) => [m.id, m.timestamp, m.content, m.author, threadOf(m), isNoise(m), keptByPin.has(m)])]);
+    ...messages.map((m) => [m.id, m.timestamp, m.content, m.author, threadOf(m), isNoise(m), keptByPin.has(m),
+      reactionsDrawn(m)])]);
   if (drawn === pinnedListDrawn) return;
   pinnedListDrawn = drawn;
   drawingPinnedRows = true;
@@ -16038,7 +16126,7 @@ function renderReplyContext() {
   const list = el("reply-context");
   const { earlier, more } = replyTarget ? replyContextPool() : { earlier: [], more: false };
   const shown = earlier.slice(Math.max(0, earlier.length - replyContext.shown));
-  const drawn = JSON.stringify(shown.map((message) => [String(message.id), message.content]));
+  const drawn = JSON.stringify(shown.map((message) => [String(message.id), message.content, reactionsDrawn(message)]));
   if (drawn !== replyContext.drawn) {
     list.replaceChildren(...glom(shown).map(replyContextRow));
     replyContext.drawn = drawn;

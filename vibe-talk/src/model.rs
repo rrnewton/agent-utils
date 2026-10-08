@@ -225,6 +225,45 @@ pub struct Message {
     /// and it is the server's. Absent means `false`, which is also what an older server meant.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub noise: bool,
+    /// The emoji people reacted to this message with, and how many of each. `#219
+    /// emoji-reactions`.
+    ///
+    /// ABSENT AND EMPTY ARE DIFFERENT ANSWERS. Absent (`None`) means this copy came by a path that
+    /// cannot see reactions: a provider that does not report them, or a live echo of a message,
+    /// which carries none. Empty means the source looked and there are none. So a live copy
+    /// without reactions never overwrites a held copy that has them — the echo of a message
+    /// arrives after the read that brought its acknowledgements — while a read replaces them, as
+    /// it replaces the rest of the message. Discord omits the array when there are none, so on
+    /// that provider absent from a read means none.
+    ///
+    /// Counts only, never who reacted: that is a separate question for each emoji, and asking it
+    /// would hand this server identities it has no use for. UNTRUSTED: a custom emoji's name is
+    /// written by whoever made it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reactions: Option<Vec<Reaction>>,
+}
+
+/// One emoji's tally on one message. `#219 emoji-reactions`.
+///
+/// Flat, with optional fields, rather than a union of standard and custom emoji: the contract
+/// grows by optional fields without an older page refusing the row, and a union's new variant
+/// would be refused (see [`crate::contract`]).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct Reaction {
+    /// What to show: the emoji itself for a standard one ("👀"), or a custom emoji's name without
+    /// colons ("party-parrot"), which is all of it a page can draw without fetching an image.
+    /// UNTRUSTED, and never empty.
+    pub emoji: String,
+    /// Whether `emoji` is a custom emoji's name rather than the emoji itself. A page draws a name
+    /// as `:name:`, so it reads as an emoji's name and not as a word somebody wrote.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub custom: bool,
+    /// The provider's own id of a custom emoji: a Discord snowflake, a Google Chat uid. Opaque,
+    /// never a URL and never shown; it keeps two custom emoji of the same name apart.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub custom_id: Option<String>,
+    /// How many reacted with it. At least one: an emoji nobody reacted with is not listed.
+    pub count: u32,
 }
 
 impl Message {
@@ -342,6 +381,45 @@ mod tests {
             content: String::new(),
             spoken_content: String::new(),
             noise: false,
+            reactions: None,
+        }
+    }
+
+    #[test]
+    fn reactions_keep_absent_and_empty_apart_on_the_wire() {
+        // `#219 emoji-reactions`. Absent is "this copy cannot see reactions", empty is "there are
+        // none", and a reader acts differently on the two, so neither may turn into the other.
+        let mut message = msg("7");
+        let absent = serde_json::to_value(&message).expect("serializes");
+        assert!(absent.get("reactions").is_none(), "{absent}");
+        message.reactions = Some(Vec::new());
+        let empty = serde_json::to_value(&message).expect("serializes");
+        assert_eq!(empty["reactions"], serde_json::json!([]));
+        message.reactions = Some(vec![
+            Reaction {
+                emoji: "👀".to_owned(),
+                custom: false,
+                custom_id: None,
+                count: 1,
+            },
+            Reaction {
+                emoji: "party-parrot".to_owned(),
+                custom: true,
+                custom_id: Some("112233".to_owned()),
+                count: 2,
+            },
+        ]);
+        let full = serde_json::to_value(&message).expect("serializes");
+        assert_eq!(
+            full["reactions"],
+            serde_json::json!([
+                {"emoji": "👀", "count": 1},
+                {"emoji": "party-parrot", "custom": true, "custom_id": "112233", "count": 2},
+            ])
+        );
+        for value in [absent, empty, full] {
+            let back: Message = serde_json::from_value(value.clone()).expect("round trips");
+            assert_eq!(serde_json::to_value(&back).expect("serializes"), value);
         }
     }
 

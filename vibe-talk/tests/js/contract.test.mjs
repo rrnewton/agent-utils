@@ -80,6 +80,14 @@ test("a wrong type, a wrong enum spelling, and a non-object are refused", () => 
   assert.equal(contract.is("ClientConfigResponse", { ...config, channels: [{ id: "1" }] }), false);
   const message = clone(SAMPLES.Message[0]);
   assert.equal(contract.is("Message", { ...message, author_is_bot: "no" }), false);
+  // `#219 emoji-reactions`: a tally without its emoji, with a count that is not a count, or a list
+  // that is not a list.
+  const reacted = clone(SAMPLES.Message[1]);
+  assert.ok(Array.isArray(reacted.reactions) && reacted.reactions.length > 0, "no sample carries reactions");
+  for (const reactions of [[{ count: 1 }], [{ emoji: "👀", count: "1" }], [{ emoji: "👀", count: -1 }], "👀"]) {
+    assert.equal(contract.is("Message", { ...reacted, reactions }), false,
+      `Message accepted reactions ${JSON.stringify(reactions)}`);
+  }
   for (const value of [null, undefined, "text", 3, []]) {
     assert.equal(contract.is("Message", value), false, `Message accepted ${JSON.stringify(value)}`);
   }

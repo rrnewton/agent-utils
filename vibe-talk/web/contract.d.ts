@@ -403,6 +403,23 @@ declare namespace VibeTalk {
      */
     noise?: boolean;
     /**
+     * The emoji people reacted to this message with, and how many of each. `#219
+     * emoji-reactions`.
+     *
+     * ABSENT AND EMPTY ARE DIFFERENT ANSWERS. Absent (`None`) means this copy came by a path that
+     * cannot see reactions: a provider that does not report them, or a live echo of a message,
+     * which carries none. Empty means the source looked and there are none. So a live copy
+     * without reactions never overwrites a held copy that has them — the echo of a message
+     * arrives after the read that brought its acknowledgements — while a read replaces them, as
+     * it replaces the rest of the message. Discord omits the array when there are none, so on
+     * that provider absent from a read means none.
+     *
+     * Counts only, never who reacted: that is a separate question for each emoji, and asking it
+     * would hand this server identities it has no use for. UNTRUSTED: a custom emoji's name is
+     * written by whoever made it.
+     */
+    reactions?: Reaction[] | null;
+    /**
      * The message this one is a reply to, when it is one.
      *
      * Discord records a reply on the REPLYING message, as `message_reference.message_id`, and
@@ -750,6 +767,36 @@ declare namespace VibeTalk {
      * Whether this provider exposes a write-through read cursor.
      */
     upstream_read_mark_supported: boolean;
+  }
+
+  /**
+   * One emoji's tally on one message. `#219 emoji-reactions`.
+   *
+   * Flat, with optional fields, rather than a union of standard and custom emoji: the contract
+   * grows by optional fields without an older page refusing the row, and a union's new variant
+   * would be refused (see [`crate::contract`]).
+   */
+  interface Reaction {
+    /**
+     * How many reacted with it. At least one: an emoji nobody reacted with is not listed.
+     */
+    count: number;
+    /**
+     * Whether `emoji` is a custom emoji's name rather than the emoji itself. A page draws a name
+     * as `:name:`, so it reads as an emoji's name and not as a word somebody wrote.
+     */
+    custom?: boolean;
+    /**
+     * The provider's own id of a custom emoji: a Discord snowflake, a Google Chat uid. Opaque,
+     * never a URL and never shown; it keeps two custom emoji of the same name apart.
+     */
+    custom_id?: string | null;
+    /**
+     * What to show: the emoji itself for a standard one ("👀"), or a custom emoji's name without
+     * colons ("party-parrot"), which is all of it a page can draw without fetching an image.
+     * UNTRUSTED, and never empty.
+     */
+    emoji: string;
   }
 
   /**

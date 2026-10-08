@@ -111,6 +111,7 @@ mod tests {
             content: content.to_owned(),
             spoken_content: String::new(),
             noise: false,
+            reactions: None,
         }
     }
 

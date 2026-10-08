@@ -39,7 +39,7 @@ use crate::chat::ChatError as DiscordError;
 use crate::chat::{ChatClient, ChatError, ChatIdentity, RegisteredChannel};
 use crate::config::DEFAULT_DISCORD_API_BASE;
 use crate::directory::{DirectoryEntry, DirectoryPage, DirectoryRequest};
-use crate::model::{sort_oldest_first, ChannelId, Message, MessageId, UserId};
+use crate::model::{sort_oldest_first, ChannelId, Message, MessageId, Reaction, UserId};
 
 /// The bot user id [`FakeDiscord`] answers `GET /users/@me` with.
 pub const FAKE_BOT_USER_ID: &str = "3000000000000000001";
@@ -274,6 +274,7 @@ impl FakeDiscord {
             // test said out loud rather than something it inherited.
             reply_to: None,
             content: content.to_owned(),
+            reactions: None,
         });
         id
     }
@@ -287,6 +288,15 @@ impl FakeDiscord {
         let mut state = self.lock();
         if let Some(found) = state.messages.iter_mut().find(|m| &m.id == message) {
             found.reply_to = Some(parent.clone());
+        }
+    }
+
+    /// Give an already-seeded message the reactions a provider reports on it, or none it can see.
+    /// `#219 emoji-reactions`.
+    pub fn set_reactions(&self, message: &MessageId, reactions: Option<Vec<Reaction>>) {
+        let mut state = self.lock();
+        if let Some(found) = state.messages.iter_mut().find(|m| &m.id == message) {
+            found.reactions = reactions;
         }
     }
 

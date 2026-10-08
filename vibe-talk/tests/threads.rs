@@ -8,7 +8,7 @@ use http_body_util::BodyExt as _;
 use serde_json::{json, Value};
 use tower::ServiceExt as _;
 use vibe_talk::chat::{ChatClient, ChatError, ChatIdentity};
-use vibe_talk::model::{ChannelId, Message, MessageId, UserId};
+use vibe_talk::model::{ChannelId, Message, MessageId, Reaction, UserId};
 use vibe_talk::testing::{self, READ_CHANNEL, READ_TOKEN, WRITE_CHANNEL, WRITE_TOKEN};
 use vibe_talk::threads::{
     MessageThread, ThreadSummary, TimelineDelta, TimelinePage, TimelineRequest, TimelineView,
@@ -36,6 +36,7 @@ fn message(id: &str, content: &str, thread: bool) -> Message {
             reply_count: Some(2),
             reply_count_exact: true,
         }),
+        reactions: None,
     }
 }
 
@@ -46,6 +47,8 @@ struct ThreadBackend {
     reads: Mutex<Vec<(String, TimelineRequest)>>,
     posts: Mutex<Vec<RecordedPost>>,
     lookups: Mutex<Vec<(String, String, String)>>,
+    /// The thread root's reactions, as the backend reports them. `#219 emoji-reactions`.
+    root_reactions: Mutex<Option<Vec<Reaction>>>,
 }
 
 impl ThreadBackend {
@@ -116,7 +119,8 @@ impl ChatClient for ThreadBackend {
         if let Some(thread) = &request.thread_id {
             Self::check_thread(thread)?;
         }
-        let root = message("10", "root", true);
+        let mut root = message("10", "root", true);
+        root.reactions = self.root_reactions.lock().unwrap().clone();
         let summary = ThreadSummary {
             id: THREAD.to_owned(),
             root: Some(root.clone()),
@@ -477,6 +481,21 @@ impl Journal {
             .unwrap();
         held.0 = revision;
         held.1.content = content.to_owned();
+    }
+
+    /// Set a message's reactions, as a backend that sees them records a change. `#219
+    /// emoji-reactions`.
+    fn react(&self, id: &str, reactions: Option<Vec<Reaction>>) {
+        let mut state = self.state.lock().unwrap();
+        state.revision += 1;
+        let revision = state.revision;
+        let held = state
+            .messages
+            .iter_mut()
+            .find(|(_, m)| m.id.0 == id)
+            .unwrap();
+        held.0 = revision;
+        held.1.reactions = reactions;
     }
 
     fn delete(&self, id: &str) {
@@ -871,4 +890,127 @@ async fn a_step_back_carries_no_forward_cursor_and_a_delta_reports_only_its_own_
         json!(["4"]),
         "dismissals outside the delta leaked in"
     );
+}
+
+// --- `#219 emoji-reactions`: reactions through the route -----------------------------------------
+
+fn tally(emoji: &str, count: u32) -> Reaction {
+    Reaction {
+        emoji: emoji.to_owned(),
+        custom: false,
+        custom_id: None,
+        count,
+    }
+}
+
+fn custom_tally(name: &str, id: &str, count: u32) -> Reaction {
+    Reaction {
+        emoji: name.to_owned(),
+        custom: true,
+        custom_id: Some(id.to_owned()),
+        count,
+    }
+}
+
+#[tokio::test]
+async fn reactions_reach_the_page_and_a_reaction_alone_is_a_change_in_the_next_delta() {
+    // Both kinds of backend: one with a change record, which reports the reaction itself, and one
+    // without, whose generic catch-up must see a message with new tallies as changed.
+    for native in [true, false] {
+        let (app, backend) = journal(native);
+        backend.seed("1", 0);
+        backend.seed("2", 1);
+        backend.react("2", Some(Vec::new()));
+        let (status, newest) = call(
+            &app,
+            "GET",
+            &timeline_path("view=main"),
+            Some(READ_TOKEN),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{newest}");
+        assert!(
+            newest["messages"][0].get("reactions").is_none(),
+            "a copy that cannot see reactions claimed an answer (native {native}): {newest}"
+        );
+        assert_eq!(
+            newest["messages"][1]["reactions"],
+            json!([]),
+            "known-none was not carried as an empty list (native {native})"
+        );
+        let cursor = next_after(&newest);
+
+        backend.react(
+            "2",
+            Some(vec![
+                tally("👀", 1),
+                custom_tally("party-parrot", "112233", 2),
+            ]),
+        );
+        let (status, delta) = call(
+            &app,
+            "GET",
+            &timeline_path(&format!("view=main&after={cursor}")),
+            Some(READ_TOKEN),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{delta}");
+        assert_eq!(
+            ids(&delta),
+            ["2"],
+            "a reaction-only change was not a change (native {native})"
+        );
+        assert_eq!(
+            delta["messages"][0]["reactions"],
+            json!([
+                {"emoji": "👀", "count": 1},
+                {"emoji": "party-parrot", "custom": true, "custom_id": "112233", "count": 2},
+            ])
+        );
+        let (_, quiet) = call(
+            &app,
+            "GET",
+            &timeline_path(&format!("view=main&after={}", next_after(&delta))),
+            Some(READ_TOKEN),
+            None,
+        )
+        .await;
+        assert!(
+            ids(&quiet).is_empty(),
+            "unchanged reactions came back (native {native}): {quiet}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_thread_root_carries_its_reactions_in_every_view_that_shows_it() {
+    let (app, backend) = harness();
+    *backend.root_reactions.lock().unwrap() = Some(vec![tally("✅", 1)]);
+    for view in ["main", "threads", "thread&thread_id=opaque%2Fthread-A"] {
+        let path = format!("/api/v1/channels/{WRITE_CHANNEL}/timeline?view={view}");
+        let (status, body) = call(&app, "GET", &path, Some(READ_TOKEN), None).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let root = if view == "threads" {
+            &body["threads"][0]["root"]
+        } else {
+            &body["messages"][0]
+        };
+        assert_eq!(root["id"], "10", "{body}");
+        assert_eq!(
+            root["reactions"],
+            json!([{"emoji": "✅", "count": 1}]),
+            "{view}: {body}"
+        );
+        assert!(
+            body["messages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .skip(1)
+                .all(|m| m.get("reactions").is_none()),
+            "{view}: a reply was given its root's reactions: {body}"
+        );
+    }
 }

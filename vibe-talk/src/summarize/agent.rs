@@ -597,6 +597,7 @@ mod tests {
             timestamp: "2026-01-01T00:00:00Z".to_owned(),
             spoken_time: "midnight".to_owned(),
             reply_to: None,
+            reactions: None,
         }
     }
 

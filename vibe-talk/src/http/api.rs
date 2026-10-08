@@ -448,6 +448,7 @@ pub async fn ingest_event(
                 content: String::new(),
                 spoken_content: String::new(),
                 noise: false,
+                reactions: None,
             };
             (crate::live::LiveKind::Delete, channel_id, tombstone)
         }

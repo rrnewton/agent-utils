@@ -398,6 +398,16 @@
           "description": "Whether the owner's noise rules call this message read already. `#196 auto-read-noise`.\n\nDECIDED BY THIS SERVER EVERY TIME the message is served, from its current text, by\n[`crate::noise::NoiseFilter::mark`]; it is never stored and never trusted from whoever\nsent the message. That is what lets an edited placeholder come back as unread, and a\nremoved rule un-hide everything it caught, without a single record having to change.\n\nThe page reads this flag rather than matching the text itself, so there is one predicate\nand it is the server's. Absent means `false`, which is also what an older server meant.",
           "type": "boolean"
         },
+        "reactions": {
+          "description": "The emoji people reacted to this message with, and how many of each. `#219\nemoji-reactions`.\n\nABSENT AND EMPTY ARE DIFFERENT ANSWERS. Absent (`None`) means this copy came by a path that\ncannot see reactions: a provider that does not report them, or a live echo of a message,\nwhich carries none. Empty means the source looked and there are none. So a live copy\nwithout reactions never overwrites a held copy that has them — the echo of a message\narrives after the read that brought its acknowledgements — while a read replaces them, as\nit replaces the rest of the message. Discord omits the array when there are none, so on\nthat provider absent from a read means none.\n\nCounts only, never who reacted: that is a separate question for each emoji, and asking it\nwould hand this server identities it has no use for. UNTRUSTED: a custom emoji's name is\nwritten by whoever made it.",
+          "items": {
+            "$ref": "#/$defs/Reaction"
+          },
+          "type": [
+            "array",
+            "null"
+          ]
+        },
         "reply_to": {
           "anyOf": [
             {
@@ -838,6 +848,37 @@
         "live_poll_seconds",
         "self_author_id",
         "owner_author_id"
+      ],
+      "type": "object"
+    },
+    "Reaction": {
+      "description": "One emoji's tally on one message. `#219 emoji-reactions`.\n\nFlat, with optional fields, rather than a union of standard and custom emoji: the contract\ngrows by optional fields without an older page refusing the row, and a union's new variant\nwould be refused (see [`crate::contract`]).",
+      "properties": {
+        "count": {
+          "description": "How many reacted with it. At least one: an emoji nobody reacted with is not listed.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "custom": {
+          "description": "Whether `emoji` is a custom emoji's name rather than the emoji itself. A page draws a name\nas `:name:`, so it reads as an emoji's name and not as a word somebody wrote.",
+          "type": "boolean"
+        },
+        "custom_id": {
+          "description": "The provider's own id of a custom emoji: a Discord snowflake, a Google Chat uid. Opaque,\nnever a URL and never shown; it keeps two custom emoji of the same name apart.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "emoji": {
+          "description": "What to show: the emoji itself for a standard one (\"👀\"), or a custom emoji's name without\ncolons (\"party-parrot\"), which is all of it a page can draw without fetching an image.\nUNTRUSTED, and never empty.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "emoji",
+        "count"
       ],
       "type": "object"
     },

@@ -931,6 +931,7 @@ mod tests {
                     content: String::new(),
                     spoken_content: String::new(),
                     noise: false,
+                    reactions: None,
                 }])
             }
             async fn post_message(

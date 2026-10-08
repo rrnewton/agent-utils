@@ -326,6 +326,18 @@
         "content": "hello",
         "id": "301",
         "noise": true,
+        "reactions": [
+          {
+            "count": 1,
+            "emoji": "👀"
+          },
+          {
+            "count": 2,
+            "custom": true,
+            "custom_id": "112233",
+            "emoji": "party-parrot"
+          }
+        ],
         "reply_to": "200",
         "spoken_content": "hello, spoken",
         "spoken_time": "noon",
@@ -369,6 +381,18 @@
       "content": "hello",
       "id": "301",
       "noise": true,
+      "reactions": [
+        {
+          "count": 1,
+          "emoji": "👀"
+        },
+        {
+          "count": 2,
+          "custom": true,
+          "custom_id": "112233",
+          "emoji": "party-parrot"
+        }
+      ],
       "reply_to": "200",
       "spoken_content": "hello, spoken",
       "spoken_time": "noon",
@@ -379,6 +403,18 @@
         "reply_count_exact": true,
         "root_message_id": "200"
       },
+      "timestamp": "2026-09-25T12:00:00+00:00"
+    },
+    {
+      "author": "someone",
+      "author_id": "7",
+      "author_is_bot": false,
+      "channel_id": "100",
+      "content": "hello",
+      "id": "302",
+      "reactions": [],
+      "reply_to": null,
+      "spoken_time": "",
       "timestamp": "2026-09-25T12:00:00+00:00"
     }
   ],
@@ -578,6 +614,18 @@
           "content": "hello",
           "id": "301",
           "noise": true,
+          "reactions": [
+            {
+              "count": 1,
+              "emoji": "👀"
+            },
+            {
+              "count": 2,
+              "custom": true,
+              "custom_id": "112233",
+              "emoji": "party-parrot"
+            }
+          ],
           "reply_to": "200",
           "spoken_content": "hello, spoken",
           "spoken_time": "noon",
@@ -674,6 +722,18 @@
           "content": "hello",
           "id": "301",
           "noise": true,
+          "reactions": [
+            {
+              "count": 1,
+              "emoji": "👀"
+            },
+            {
+              "count": 2,
+              "custom": true,
+              "custom_id": "112233",
+              "emoji": "party-parrot"
+            }
+          ],
           "reply_to": "200",
           "spoken_content": "hello, spoken",
           "spoken_time": "noon",
@@ -806,6 +866,18 @@
           "content": "hello",
           "id": "301",
           "noise": true,
+          "reactions": [
+            {
+              "count": 1,
+              "emoji": "👀"
+            },
+            {
+              "count": 2,
+              "custom": true,
+              "custom_id": "112233",
+              "emoji": "party-parrot"
+            }
+          ],
           "reply_to": "200",
           "spoken_content": "hello, spoken",
           "spoken_time": "noon",

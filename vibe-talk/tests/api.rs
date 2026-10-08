@@ -15,7 +15,7 @@ use serde_json::Value;
 use tower::ServiceExt as _;
 use vibe_talk::discord::fake::FakeDiscord;
 use vibe_talk::http::router;
-use vibe_talk::model::ChannelId;
+use vibe_talk::model::{ChannelId, Reaction};
 use vibe_talk::store::StateStore as _;
 use vibe_talk::testing::{READ_CHANNEL, READ_TOKEN, WRITE_CHANNEL, WRITE_TOKEN};
 
@@ -501,6 +501,45 @@ async fn an_unconfigured_channel_is_not_readable() {
         "the configured channel list must be an allowlist, not a default"
     );
     assert_eq!(payload["error"], "unknown_channel");
+}
+
+/// `#219 emoji-reactions`. The channel's page carries each message's reactions as the provider
+/// reported them, and leaves the field out of a message whose provider reported none: absent and
+/// empty are different answers, and the page decides what to keep by which one it was given.
+#[tokio::test]
+async fn the_channel_page_carries_reactions_and_leaves_out_what_was_not_reported() {
+    let harness = harness();
+    let channel = ChannelId(WRITE_CHANNEL.to_owned());
+    let acknowledged = harness.discord.seed(&channel, "owner", "please deploy");
+    let quiet = harness.discord.seed(&channel, "codex-eng", "on it");
+    harness.discord.seed(&channel, "codex-eng", "deployed");
+    let tally = |emoji: &str| Reaction {
+        emoji: emoji.to_owned(),
+        custom: false,
+        custom_id: None,
+        count: 1,
+    };
+    harness
+        .discord
+        .set_reactions(&acknowledged, Some(vec![tally("👀"), tally("✅")]));
+    harness.discord.set_reactions(&quiet, Some(Vec::new()));
+    let (status, payload) = call(
+        &harness,
+        "GET",
+        &format!("/api/v1/channels/{WRITE_CHANNEL}/page"),
+        Some(READ_TOKEN),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{payload}");
+    let messages = payload["messages"].as_array().expect("array");
+    assert_eq!(messages.len(), 3);
+    assert_eq!(
+        messages[0]["reactions"],
+        serde_json::json!([{"emoji": "👀", "count": 1}, {"emoji": "✅", "count": 1}])
+    );
+    assert_eq!(messages[1]["reactions"], serde_json::json!([]));
+    assert!(messages[2].get("reactions").is_none(), "{payload}");
 }
 
 #[tokio::test]

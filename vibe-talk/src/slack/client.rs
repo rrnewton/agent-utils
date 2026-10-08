@@ -605,6 +605,7 @@ impl Raw {
             content: super::mrkdwn::to_markdown(self.str_field("text").unwrap_or_default()),
             spoken_content: String::new(),
             noise: false,
+            reactions: None,
         })
     }
 }

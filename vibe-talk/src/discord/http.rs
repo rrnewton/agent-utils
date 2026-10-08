@@ -21,7 +21,7 @@ use super::ratelimit::{parse_rate_limit, Attempt, Headers, RateLimiter};
 use crate::chat::ChatError as DiscordError;
 use crate::chat::{ChatClient, ChatError, ChatIdentity, RegisteredChannel};
 use crate::config::{DiscordConfig, Secret};
-use crate::model::{ChannelId, Message, MessageId, UserId};
+use crate::model::{ChannelId, Message, MessageId, Reaction, UserId};
 
 /// Discord's own ceiling on `GET /channels/{id}/messages?limit=`.
 pub const DISCORD_MAX_LIMIT: u16 = 100;
@@ -449,7 +449,67 @@ pub fn parse_message(value: &serde_json::Value) -> Result<Message, ChatError> {
         // See `crate::model::Message::spoken_content`.
         spoken_content: String::new(),
         noise: false,
+        reactions: parse_reactions(value.get("reactions")),
     })
+}
+
+/// The most distinct emoji one message keeps. `#219 emoji-reactions`. Channel content sets the
+/// number, so it is bounded; past it the rest are dropped, in the order the provider listed them.
+pub const MAX_REACTIONS: usize = 50;
+
+/// The longest emoji or custom name kept, in characters. A standard emoji is a handful of code
+/// points even as a family or with a skin tone; a custom name is a short word.
+pub const MAX_REACTION_CHARS: usize = 64;
+
+/// The tallies of a Discord message's `reactions` array, which the Google Chat bridge speaks too.
+/// `#219 emoji-reactions`.
+///
+/// Absent or null is `None`, and so is anything that is not an array: this copy says nothing
+/// about reactions, which is not the same as saying there are none. Lenient inside the array,
+/// because no reaction is worth failing a message read for: an entry without a count above zero,
+/// or with neither a name nor an id, is skipped. A custom emoji is one with an `id`; it keeps its
+/// name, colons trimmed, as the text to show, or `emoji` when its name is gone (Discord sends
+/// null for a deleted one).
+#[must_use]
+pub fn parse_reactions(value: Option<&serde_json::Value>) -> Option<Vec<Reaction>> {
+    fn text(value: Option<&serde_json::Value>) -> Option<&str> {
+        value
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|text| !text.is_empty())
+    }
+    let items = value?.as_array()?;
+    let bounded = |text: &str| text.chars().take(MAX_REACTION_CHARS).collect::<String>();
+    let reactions = items
+        .iter()
+        .filter_map(|item| {
+            let count = item.get("count").and_then(serde_json::Value::as_u64)?;
+            if count == 0 {
+                return None;
+            }
+            let emoji = item.get("emoji");
+            let name = text(emoji.and_then(|emoji| emoji.get("name")));
+            let id = text(emoji.and_then(|emoji| emoji.get("id")));
+            let (emoji, custom) = match (id, name) {
+                (Some(_), name) => (
+                    name.map(|name| name.trim_matches(':'))
+                        .filter(|name| !name.is_empty())
+                        .unwrap_or("emoji"),
+                    true,
+                ),
+                (None, Some(name)) => (name, false),
+                (None, None) => return None,
+            };
+            Some(Reaction {
+                emoji: bounded(emoji),
+                custom,
+                custom_id: id.map(bounded),
+                count: u32::try_from(count).unwrap_or(u32::MAX),
+            })
+        })
+        .take(MAX_REACTIONS)
+        .collect();
+    Some(reactions)
 }
 
 /// Convert a Discord message-list payload, normalizing to oldest-first.
@@ -1861,6 +1921,103 @@ mod tests {
         let message = parse_message(&value).expect("attachment-only messages still parse");
         assert_eq!(message.content, "");
         assert!(!message.author_is_bot);
+    }
+
+    fn reacted(reactions: serde_json::Value) -> Message {
+        parse_message(&serde_json::json!({
+            "id": "5", "channel_id": "123", "timestamp": "t", "content": "ack me",
+            "author": { "id": "500000000000000005", "username": "u" },
+            "reactions": reactions,
+        }))
+        .expect("a message with reactions parses")
+    }
+
+    #[test]
+    fn reactions_are_read_as_discord_and_the_bridge_send_them() {
+        // `#219 emoji-reactions`. The shape both Discord's message object and the Google Chat
+        // bridge carry: a standard emoji is its glyph with a null id, a custom one has an id.
+        let message = reacted(serde_json::json!([
+            {"emoji": {"id": null, "name": "👀"}, "count": 1, "me": false,
+             "count_details": {"burst": 0, "normal": 1}, "burst_colors": []},
+            {"emoji": {"name": "✅"}, "count": 1},
+            {"emoji": {"id": "112233", "name": "party-parrot", "animated": false}, "count": 3},
+            {"emoji": {"id": "customEmojis/abc", "name": ":ack-claim:"}, "count": 1},
+            {"emoji": {"id": "998877", "name": null}, "count": 2},
+        ]));
+        let reactions = message.reactions.expect("an array is an answer");
+        let shown: Vec<(&str, bool, Option<&str>, u32)> = reactions
+            .iter()
+            .map(|r| (r.emoji.as_str(), r.custom, r.custom_id.as_deref(), r.count))
+            .collect();
+        assert_eq!(
+            shown,
+            [
+                ("👀", false, None, 1),
+                ("✅", false, None, 1),
+                ("party-parrot", true, Some("112233"), 3),
+                // The bridge may pass a name with its colons; the page adds its own.
+                ("ack-claim", true, Some("customEmojis/abc"), 1),
+                // A deleted custom emoji has no name left, and is still a reaction.
+                ("emoji", true, Some("998877"), 2),
+            ]
+        );
+    }
+
+    #[test]
+    fn no_reactions_array_is_not_the_same_answer_as_an_empty_one() {
+        // Absent or not an array: this copy says nothing about reactions. Empty: there are none.
+        let value = serde_json::json!({
+            "id": "5", "channel_id": "123", "timestamp": "t",
+            "author": { "id": "500000000000000005", "username": "u" }
+        });
+        assert_eq!(parse_message(&value).expect("parses").reactions, None);
+        assert_eq!(reacted(serde_json::Value::Null).reactions, None);
+        assert_eq!(reacted(serde_json::json!({"👀": 1})).reactions, None);
+        assert_eq!(reacted(serde_json::json!([])).reactions, Some(Vec::new()));
+    }
+
+    #[test]
+    fn a_malformed_reaction_is_skipped_and_never_fails_the_message() {
+        let message = reacted(serde_json::json!([
+            {"emoji": {"name": "👀"}, "count": 0},
+            {"emoji": {"name": "👀"}, "count": -1},
+            {"emoji": {"name": "👀"}, "count": "1"},
+            {"emoji": {"name": "  "}, "count": 1},
+            {"emoji": {}, "count": 1},
+            {"count": 1},
+            "👀",
+            {"emoji": {"name": "✅"}, "count": 5_000_000_000_u64},
+        ]));
+        let reactions = message.reactions.expect("an array is an answer");
+        assert_eq!(reactions.len(), 1, "{reactions:?}");
+        assert_eq!(reactions[0].emoji, "✅");
+        assert_eq!(reactions[0].count, u32::MAX, "a count past u32 saturates");
+        assert_eq!(message.content, "ack me", "the message itself survived");
+    }
+
+    #[test]
+    fn reactions_are_bounded_in_number_and_length() {
+        let many: Vec<serde_json::Value> = (0..MAX_REACTIONS + 10)
+            .map(|i| serde_json::json!({"emoji": {"id": i.to_string(), "name": format!("e{i}")}, "count": 1}))
+            .collect();
+        let reactions = reacted(serde_json::Value::Array(many))
+            .reactions
+            .expect("an answer");
+        assert_eq!(reactions.len(), MAX_REACTIONS);
+        assert_eq!(reactions[0].emoji, "e0", "the provider's order is kept");
+        let long = "x".repeat(MAX_REACTION_CHARS * 3);
+        let reactions =
+            reacted(serde_json::json!([{"emoji": {"id": long, "name": long}, "count": 1}]))
+                .reactions
+                .expect("an answer");
+        assert_eq!(reactions[0].emoji.chars().count(), MAX_REACTION_CHARS);
+        assert_eq!(
+            reactions[0]
+                .custom_id
+                .as_deref()
+                .map(|id| id.chars().count()),
+            Some(MAX_REACTION_CHARS)
+        );
     }
 
     #[test]

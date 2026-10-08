@@ -385,6 +385,7 @@ body {
 .messages li[data-links-view="true"] > .body,
 .messages li[data-links-view="true"] > .msg-text,
 .messages li[data-links-view="true"] > .summary,
+.messages li[data-links-view="true"] > .reactions,
 .messages li[data-links-view="true"] .fold {
   display: none !important;
 }
@@ -2358,6 +2359,56 @@ body {
 #pane-discord[data-pinned-only] #clear-backlog,
 #pane-discord[data-pinned-only] #timeline-notice {
   display: none;
+}
+
+/*
+ * `#219 emoji-reactions`. The reactions under a row's text: one quiet chip per emoji, the emoji and
+ * how many reacted with it. Its own line below the text, never in `.meta`, which the row's controls
+ * already fill on a phone, and wrapping rather than overflowing at 360px however many there are.
+ * Drawn as labels and not as controls — no hover, no pointer — because they are not buttons; a tap
+ * on one is a tap on the row. Under the Links filter they go with the text, above.
+ *
+ * Neutral and in the theme's own colours, so they sit on every speaker's tint, dimmed with the row
+ * when it is read, and stay legible in the light scheme and the dark. The emoji at the reader's
+ * message size; a custom emoji's `:name:` may be long, and breaks rather than widening the row.
+ */
+.discord-message > .reactions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.3rem;
+  margin-top: 0.35rem;
+  font-size: calc(0.82rem * var(--msg-scale));
+}
+
+.reaction {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.3em;
+  min-width: 0;
+  max-width: 100%;
+  padding: 0.05rem 0.5rem;
+  border: 1px solid var(--edge);
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--ink) 6%, transparent);
+  line-height: 1.45;
+  cursor: default;
+}
+
+.reaction-emoji {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.reaction-custom .reaction-emoji {
+  color: var(--muted);
+  font-size: 0.9em;
+}
+
+.reaction-count {
+  flex: 0 0 auto;
+  color: var(--muted);
+  font-size: 0.9em;
+  font-variant-numeric: tabular-nums;
 }
 
 /* The rescue is offered only on a noise row; `renderChannelRows` sets `hidden`, and a class rule
