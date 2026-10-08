@@ -1,10 +1,11 @@
 ---
 title: 'link-filter: PRs, Commits and Actions toggles under the Links button to hide GitHub noise'
-status: open
+status: closed
 priority: 2
 issue_type: feature
 created_at: 2026-10-08T08:59:41.343941635+00:00
-updated_at: 2026-10-08T08:59:41.343941635+00:00
+updated_at: 2026-10-08T10:33:23.789151785+00:00
+closed_at: 2026-10-08T10:33:23.789151614+00:00
 ---
 
 # Description
