@@ -78,12 +78,21 @@ at the message, so they are a scroll up. The newest twelve the app holds come fi
 messages** shows the rest, and then reads earlier pages of that thread, or of Main, from the server.
 
 **A reply points at what it answers.** A message that is a reply is set in from the left, with an
-arrow out of the left side of its box pointing up. Tap the arrow to go to the message it answers,
-which is brought to the top of the list and lit for a moment: in the view on screen when it is
-shown there, and otherwise in **All**, which the channel is then kept in as if you had picked it. A
-message not loaded yet is looked for a few older pages back, with progress in the status line; one
-further back than that, or no longer in the channel's history, is said so there. While the reply
-is off screen, **Back to reply** returns to it.
+arrow beside its box. When the message it answers is the one directly above it, the arrow leaves
+the top of the box's left side and reaches up until it touches that message; when the message is
+anywhere else, the arrow leaves the middle of the left side and slants away up to the left. Tap the
+arrow to go to the message it answers, which is brought to the top of the list and lit for a
+moment: in the view on screen when it is shown there, and otherwise in **All**, which the channel is
+then kept in as if you had picked it. A message not loaded yet is looked for a few older pages back,
+with progress in the status line; one further back than that, or no longer in the channel's history,
+is said so there. While the reply is off screen, **Back to reply** returns to it.
+
+**A message's replies can be gathered under it.** **N replies** under a message moves its loaded
+replies, in time order, to sit directly beneath it in **All**, joined to it by one line, while
+everything else stays where it was and the message stays where it was on the screen; tapping a
+reply's arrow twice does the same for the message it answers. Nothing is read or archived by it.
+The **×** beside the line, or the pressed **N replies**, puts them back in time order, as changing
+view or channel, or filtering from the search bar, does. **Thread(N)** opens a message's thread.
 
 **A normal text box at the bottom.** Scroll below the newest message to write to the channel or
 selected thread. **Send** posts without requiring a message to reply to. Drafts are kept separately

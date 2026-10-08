@@ -1776,6 +1776,10 @@ function searchScope() {
 function applySearch() {
   const terms = searchOpen ? searchTerms(searchQuery) : [];
   const links = searchOpen && linksOnly;
+  // `#215 reply-coalesce`. A filter that takes rows away shows a subset of the channel in time order,
+  // and gathered replies go back to theirs before it does: a bridge to rows it hides would be a
+  // bridge to nothing. See the section on gathering replies.
+  if (gatheredParent() !== null && (terms.length > 0 || links || pinnedOnly)) putRepliesBack();
   const scope = searchScope();
   let matched = 0;
   let loaded = 0;
@@ -1831,6 +1835,9 @@ function applySearch() {
   if (links) {
     renderLinkKindCounts(tally.matching);
   }
+  // `#214 reply-arrow`. What the reader can see directly above a reply is what its arrow is drawn
+  // against, and the pass above has just decided that.
+  renderReplyLinks();
   // `#206 pin-message`. Over the Pinned filter the denominator is the channel's PINS, all of them,
   // and the count says so even before anything is typed: the filter is in force, and the bar is
   // where it says what it is doing.
@@ -6932,7 +6939,9 @@ function saveChannelScope() {
       unplaced: [...channelCanon.unplaced].filter((id) => held.has(id)),
     };
   } else {
-    const messages = [...el("discord-log").children].flatMap(rowMessages);
+    // In time order, gathered replies or not (`#215 reply-coalesce`): a reload draws these as they
+    // are saved, and nothing it draws is gathered.
+    const messages = listedMessages();
     const shown = new Set(messages.map((message) => String(message.id)));
     entry = {
       mode: "page",
@@ -7804,6 +7813,10 @@ async function changeChannelView(view, threadId = null, summary = null) {
   // `#206 pin-message`. Choosing a view is asking to see it, and the Pinned filter shows the same
   // pins in every view — so it steps aside, as it must for a pin opened in its thread.
   setPinnedOnly(false);
+  // `#215 reply-coalesce`. Gathered replies are an arrangement of the list on screen, and go with
+  // it — back into time order BEFORE the rows are kept below, so that coming back to this view
+  // finds them in the order every other read of it draws.
+  putRepliesBack();
   rememberChannelDraft();
   rememberChannelContext();
   if (view === "thread" && channelView !== "thread") threadOrigin = channelView;
@@ -8443,39 +8456,51 @@ function addThreadDecoration(meta, message, row, everyThread = false) {
   const id = threadOf(message);
   // The scope is the channel itself: its root opens nothing it is not already showing.
   if (!threadingSupported || !id || (channelView === "thread" && !everyThread) || id === channelCanon.scope) return;
-  // `everyThread`: a row of the Pinned filter, which mixes every view's messages, so every one in a
-  // thread carries the way into it whichever view is underneath. `#206 pin-message`.
-  if (channelView === "flat" || everyThread) {
-    const badge = document.createElement("button");
-    badge.className = "thread-badge";
-    badge.setAttribute("type", "button");
-    badge.setAttribute("title", "Open this thread");
-    badge.style.setProperty("--thread-hue", threadHue(id));
-    // The reply count tells two tags apart at a glance, as their colours do. NOT A ZERO: a provider
-    // can name a thread nobody has answered yet — every Google Chat message heads one — and
-    // "Thread 0" on such a row read as a broken count. `#185 reply-new-thread`.
-    const replies = threadReplyCount(id, message);
-    badge.textContent = replies ? `Thread ${replies}` : "Thread";
-    if (replies) badge.setAttribute("aria-label", `Open this thread, ${threadCount(replies, true)}`);
-    badge.addEventListener("click", () => guardQuietly(() => openThread(id))());
-    meta.append(badge);
-  }
+  // THE WAY INTO A THREAD, on every row of one that is not already inside it: in All, on every
+  // message, coloured by its thread; in Main, on the roots, which are the only rows of a thread Main
+  // shows; and on a row of the Pinned filter, which mixes every view's messages, whichever view is
+  // underneath (`#206 pin-message`). `#215 reply-coalesce` brought it to Main: the N replies chip
+  // used to be the way in there, and it gathers the replies now, so without this a thread could not
+  // be opened from its own root.
+  const badge = document.createElement("button");
+  badge.className = "thread-badge";
+  badge.setAttribute("type", "button");
+  badge.setAttribute("title", "Open this thread");
+  badge.style.setProperty("--thread-hue", threadHue(id));
+  // The reply count tells two tags apart at a glance, as their colours do. NOT A ZERO: a provider
+  // can name a thread nobody has answered yet — every Google Chat message heads one — and
+  // "Thread 0" on such a row read as a broken count. `#185 reply-new-thread`.
+  //
+  // `#215 reply-coalesce`: "Thread(12)", at the owner's word. The parentheses make the number read
+  // as a count belonging to the word rather than as the thread's number, which is what "Thread 12"
+  // was taken for. Only the chip says it: the picker and the heading over an open thread name a
+  // thread, and give its count among its facts ("13h · 12 · name"), so the `#194` rule that the
+  // heading matches the picker is about the NAME and is untouched by this.
+  const replies = threadReplyCount(id, message);
+  badge.textContent = replies ? `Thread(${replies})` : "Thread";
+  if (replies) badge.setAttribute("aria-label", `Open this thread, ${threadCount(replies, true)}`);
+  badge.addEventListener("click", () => guardQuietly(() => openThread(id))());
+  meta.append(badge);
   if (message.thread.is_root) {
     // The root's own count, as it always was, unless it has none to give: then the summary's. A
-    // thread with no replies gets no chip at all — "0 replies" offered to open nothing.
+    // thread with no replies gets no chip at all — "0 replies" offered to gather nothing.
     const own = message.thread;
     const { count, exact } = typeof own.reply_count === "number" && own.reply_count > 0
       ? { count: own.reply_count, exact: own.reply_count_exact }
       : threadReplies(id, message);
     if (count === 0) return;
-    const replies = document.createElement("button");
-    replies.className = "thread-replies";
-    replies.setAttribute("type", "button");
-    replies.setAttribute("title", "Open this thread");
-    replies.style.setProperty("--thread-hue", threadHue(id));
-    replies.textContent = threadCount(count, exact);
-    replies.addEventListener("click", () => guardQuietly(() => openThread(id))());
-    row.append(replies);
+    // `#215 reply-coalesce`. NOT the way into the thread any more — the badge above is, and the two
+    // said the same thing. It gathers the thread's replies under this message in All, and while
+    // they are gathered it is pressed and puts them back. `renderReplyLinks` keeps its state.
+    const gather = document.createElement("button");
+    gather.className = "thread-replies";
+    gather.setAttribute("type", "button");
+    gather.setAttribute("title", "Gather this message's replies under it");
+    gather.setAttribute("aria-pressed", "false");
+    gather.style.setProperty("--thread-hue", threadHue(id));
+    gather.textContent = threadCount(count, exact);
+    gather.addEventListener("click", () => guardQuietly(() => toggleGathered(String(message.id), row))());
+    row.append(gather);
   }
 }
 
@@ -10175,6 +10200,9 @@ function renderChannelRows() {
   // `#206 pin-message`. The Pinned filter's list first, so that the pass below derives its rows as
   // well: it is drawn from the same messages and has to agree with the channel about every one.
   syncPinnedList();
+  // `#215 reply-coalesce`. The rows in the order they are meant to be in, gathered or in time
+  // order, before anything below derives a row's state from where it is.
+  arrangeChannelRows();
   const list = el("discord-log");
   const rows = [...list.children];
   // The channel these rows belong to, read once. Every author learned on this pass was seen HERE,
@@ -10335,6 +10363,9 @@ function renderChannelRows() {
       );
     }
   }
+  // `#214 reply-arrow` and `#215 reply-coalesce`. Each reply's gutter, from the rows now around it
+  // and the speakers just decided for them.
+  renderReplyLinks();
   renderOutgoingMessages();
   // Settings counts what is loaded, and this is where what is loaded changes.
   renderNoiseCount();
@@ -10521,6 +10552,11 @@ function jumpToMarker() {
 // NONE OF THE ROW'S OWN ACTS FIRE. The arrow is inside the row, and a tap on the row folds it or
 // reads it aloud (`tapRow`): the arrow's click stops at the arrow. A finger that comes down on the
 // arrow is not the start of a swipe or a press-and-hold on the row either (`swipeable`).
+//
+// TWO TAPS are another act: they gather the replies of the message the reply answers under it
+// (`#215 reply-coalesce`, below). So one tap waits `REPLY_DOUBLE_TAP_MS` before it jumps, long enough
+// to know a second is not coming. And since `#214 reply-arrow` the arrow is one of two, drawn by
+// whether the row above is the message it answers; see the section after this one.
 
 /** How many older pages one tap on a reply's arrow may read, looking for what the reply answers. */
 const REPLY_JUMP_PAGES = 5;
@@ -10543,13 +10579,42 @@ let replyReturn = null;
 /** The row lit by the last landing, and the timer that puts it out. */
 let replyLanded = null;
 
-/** The control in a reply's gutter. `li` is the reply's own row. */
+/**
+ * How long a tap on a reply's arrow waits to learn whether a second tap follows, in milliseconds.
+ * `#215 reply-coalesce`: two taps gather the replies of the message it answers under that message,
+ * and one tap still jumps there.
+ *
+ * WHY A DELAY AT ALL. The first tap of two cannot be told from a single tap until the second has
+ * had its chance to arrive, and the owner asked that a double tap never first jump away — a jump
+ * scrolls the list, and the second tap would then land on whatever the scroll put under the
+ * finger. So a single tap waits this long. A quarter of a second is about the shortest window in
+ * which a deliberate double tap reliably lands, mouse or thumb, and short enough that the jump
+ * still reads as the answer to the tap.
+ */
+const REPLY_DOUBLE_TAP_MS = 250;
+
+/** The first tap on an arrow, waiting for a possible second, as `{ arrow, jump, timer }`; else null. */
+let replyArrowTap = null;
+
+/**
+ * The control in a reply's gutter. `li` is the reply's own row.
+ *
+ * One tap jumps to the message the reply answers; two, within `REPLY_DOUBLE_TAP_MS`, gather that
+ * message's replies under it (`#215 reply-coalesce`). Counted from the clicks themselves rather than
+ * from `dblclick`, which a phone does not reliably send for two taps — and a keyboard's Enter,
+ * pressed twice, is two clicks as well.
+ */
 function replyArrow(li) {
   const arrow = document.createElement("button");
   arrow.className = "reply-jump";
   arrow.setAttribute("type", "button");
   arrow.setAttribute("aria-label", REPLY_JUMP_NAME);
-  arrow.setAttribute("title", REPLY_JUMP_NAME);
+  // The tooltip says what the second tap does, where a pointer can rest to read it. The accessible
+  // name stays what one tap does.
+  arrow.setAttribute("title", `${REPLY_JUMP_NAME}. Double-tap to gather its replies under it.`);
+  // Which of the two arrows `#214 reply-arrow` draws, decided by `renderReplyLinks` once the row is
+  // in the list: the row above is the one it answers, or it is not.
+  arrow.setAttribute("data-reply-style", "disconnected");
   // The arrow itself is drawn by web/voice.css on this empty span: a line out of the row's side,
   // round the corner and up, with a head on it. Drawn rather than typed, because a glyph is
   // whatever the phone's font makes of it — "↰" is a hairline in one font and an emoji in
@@ -10562,7 +10627,29 @@ function replyArrow(li) {
     // The row's own tap handler would fold the row, or start reading it aloud in reading mode. It
     // already ignores a click on a button, and this does not rely on that: the click ends here.
     if (event) event.stopPropagation();
-    guardQuietly(() => jumpToAnswered(li))();
+    if (replyArrowTap && replyArrowTap.arrow === arrow) {
+      clearTimeout(replyArrowTap.timer);
+      replyArrowTap = null;
+      guardQuietly(() => gatherFromReply(li))();
+      return;
+    }
+    // A first tap on ANOTHER arrow still waiting is that arrow's single tap, and it is taken now:
+    // the reader has moved on to this one, and dropping it would be a tap that did nothing.
+    if (replyArrowTap) {
+      const waiting = replyArrowTap;
+      clearTimeout(waiting.timer);
+      replyArrowTap = null;
+      waiting.jump();
+    }
+    const tap = {
+      arrow,
+      jump: () => guardQuietly(() => jumpToAnswered(li))(),
+      timer: setTimeout(() => {
+        if (replyArrowTap === tap) replyArrowTap = null;
+        tap.jump();
+      }, REPLY_DOUBLE_TAP_MS),
+    };
+    replyArrowTap = tap;
   });
   return arrow;
 }
@@ -10694,21 +10781,37 @@ async function jumpToAnswered(reply) {
   const target = String(reply.getAttribute("data-reply-to") || "");
   const from = String(reply.getAttribute("data-id") || "");
   if (!target) return;
+  await seekMessage(target, () => landOnAnswered(target, from),
+    () => threadingSupported && channelView !== "flat" && answeredElsewhere(target));
+}
+
+/**
+ * Bring the row holding message `target` into the list and hand it to `arrive`, which says whether
+ * it was there to be acted on. The walk the arrow's jump makes, in the order the head of this
+ * section gives, shared since `#215 reply-coalesce` with the gathering of a message's replies,
+ * which looks for the message the same way and does something else when it finds it.
+ *
+ * `openAll` says whether All has to be opened before the message can be found or acted on: for the
+ * jump, a message the view on screen cannot show; for the gathering, any view but All. Every call
+ * takes a ticket, so a later tap, on either control, ends a walk still under way.
+ */
+async function seekMessage(target, arrive, openAll) {
   const ticket = ++replyJumpTicket;
   const channel = String(el("discord-channel").value);
-  if (landOnAnswered(target, from)) return;
+  if (arrive()) return;
   // The reader's own filter, said plainly rather than walked past: the message is loaded, read,
   // and Hide read is the reason it is not drawn. No walk would find it. Asked again wherever the
   // list has just changed, because All, or an older page, may be what brings the message in.
   const hiddenAsRead = () => {
-    if (!(todoMode && threadingSupported && timelineMessages.some((message) => String(message.id) === target))) {
+    if (!(todoMode && threadingSupported && !rowHolding(target) &&
+        timelineMessages.some((message) => String(message.id) === target))) {
       return false;
     }
     setStatus("Hide read is hiding that message.");
     return true;
   };
   if (hiddenAsRead()) return;
-  if (threadingSupported && channelView !== "flat" && answeredElsewhere(target)) {
+  if (openAll()) {
     setStatus("Not in this view — opening All…");
     // The reader went somewhere else while All was being read: the tap is over.
     const stillAll = () =>
@@ -10729,7 +10832,7 @@ async function jumpToAnswered(reply) {
       await new Promise((resolve) => setTimeout(resolve, PULL_WAIT_MS));
     }
     if (!stillAll()) return;
-    if (landOnAnswered(target, from) || hiddenAsRead()) return;
+    if (arrive() || hiddenAsRead()) return;
     if (!channelCanon.views.has(viewKey()) && el("discord-log").children.length === 0) {
       // All's read failed, and that is reported where every failed read is. Nothing was learned
       // about the message, so nothing is said about it either.
@@ -10752,7 +10855,7 @@ async function jumpToAnswered(reply) {
     }
     // Another tap, another channel or another view: this walk is nobody's any more.
     if (ticket !== replyJumpTicket || context !== channelContextKey()) return;
-    if (landOnAnswered(target, from) || hiddenAsRead()) return;
+    if (arrive() || hiddenAsRead()) return;
   }
   if (todoMode && !threadingSupported) {
     setStatus("Not in this list — Hide read is on.");
@@ -10763,6 +10866,443 @@ async function jumpToAnswered(reply) {
   } else {
     setStatus("Older than what is loaded.");
   }
+}
+
+// --- two arrows: the message directly above, or one somewhere else ------------------------------
+//
+// `#214 reply-arrow`. The owner, on his desk, 2026-10-08: "the arrows make it look like the reply
+// points to the message directly above it. But that's misleading when that's not actually the reply
+// chain." Every reply drew the same arrow, out of its upper left and straight up, so every reply
+// looked like the answer to whatever happened to be above it. There are two now:
+//
+//   * ADJACENT. The row directly above holds the message the reply answers. The arrow keeps its
+//     right angle at the box's upper left, and its shaft now runs up across the gap between the two
+//     rows until its head TOUCHES that row: the arrow is a connection, not a gesture upward.
+//   * DISCONNECTED. Anything else — the message is further up, in another view, or not loaded. The
+//     arrow comes out of the MIDDLE of the box's left side and leaves at about forty-five degrees,
+//     a different shape at a different height, so it cannot be read as pointing at the row above.
+//
+// "DIRECTLY ABOVE" is the previous row the reader can SEE in this list: a row the search or Links
+// is hiding is skipped, a message Hide read leaves out is not drawn at all, and the row may be a
+// combined one, which holds the message when any of its constituents is it. Decided again by
+// `renderReplyLinks` whenever what is above a row can have changed — a redraw, a refresh, an older
+// page, a filter, the gathering below.
+//
+// WHERE THE HEAD MEETS IT is layout, so it is measured (`measureReplyArrows`). The arrow's shaft
+// sits in the reply's gutter, and the row above does not always reach over it: the owner's own rows
+// are inset from the left, by far more than a gutter on a desk, and a reply above a reply has its
+// own gutter where this one's shaft would land. Three cases, from where that row's left edge is:
+//
+//   * left of the shaft, by its rounded corner and more: the head meets its bottom edge;
+//   * inside the gutter: the shaft moves right until it is under that edge, and still meets it;
+//   * at or beyond the reply's own box: no shaft in the gutter can reach the bottom edge, so it
+//     rises past it and turns right, and the head meets the row's LEFT side, near its foot.
+
+/** How far left of a reply's box its arrow's shaft runs, in rem: where web/voice.css draws it. */
+const REPLY_SHAFT_REM = 1.2;
+
+/** How far in from a row's left edge its bottom edge is flat, past the rounded corner, in rem. */
+const REPLY_CORNER_REM = 0.6;
+
+/** The nearest a moved shaft may come to the reply's own box, its head clear of the box, in rem. */
+const REPLY_SHAFT_CLEAR_REM = 0.65;
+
+/** The shortest run to the row's side that has room for its corner and its head, in rem. */
+const REPLY_RUN_MIN_REM = 0.9;
+
+/** The rem on this page, in pixels: the arrow's drawing is in rem and its measurements in pixels. */
+function rootFontPx() {
+  const style = typeof window.getComputedStyle === "function"
+    ? window.getComputedStyle(document.documentElement) : null;
+  const size = style ? parseFloat(style.fontSize) : NaN;
+  return Number.isFinite(size) && size > 0 ? size : 16;
+}
+
+/** Whether the reader can see `row` in the list: not hidden, and not filtered out by the search. */
+const rowShown = (row) => !row.hidden && !String(row.className).split(/\s+/).includes("search-hidden");
+
+/**
+ * Where each adjacent arrow meets the row above, from where the two rows are laid out: on its
+ * bottom edge (`data-reply-reach="below"`, with `--reply-shift` the distance the shaft moved right
+ * to get under it) or on its left side (`"side"`, with `--reply-run` the distance from the shaft to
+ * that side). See the head of this section. Nothing is measured in a list that is not laid out —
+ * off the channel, or behind another screen — and the next resize, which showing it is, measures.
+ */
+function measureReplyArrows() {
+  const list = el("discord-log");
+  if (list.hidden || !(list.getBoundingClientRect().width > 0)) return;
+  const rem = rootFontPx();
+  let above = null;
+  for (const row of list.children) {
+    const arrow = childByClass(row, "reply-jump");
+    if (arrow && above && arrow.getAttribute("data-reply-style") === "adjacent") {
+      const box = row.getBoundingClientRect();
+      // From the reply's padding edge, which is where web/voice.css hangs the arrow (`right: 100%`).
+      const dx = above.getBoundingClientRect().left - (box.left + (row.clientLeft || 0));
+      // Where the head would have to be to meet the flat of that row's bottom edge, and how far a
+      // turn to its side would have to run, both from the reply's padding edge.
+      const meets = dx + REPLY_CORNER_REM * rem;
+      const run = dx + REPLY_SHAFT_REM * rem;
+      if (meets <= -REPLY_SHAFT_CLEAR_REM * rem || run < REPLY_RUN_MIN_REM * rem) {
+        // Under it. A row whose edge is so close to the box that neither fits — closer than a turn
+        // has room for, too close for the shaft to come up under its flat — is met as near its
+        // corner as the shaft may go.
+        const furthest = (REPLY_SHAFT_REM - REPLY_SHAFT_CLEAR_REM) * rem;
+        const shift = Math.min(furthest, Math.max(0, meets + REPLY_SHAFT_REM * rem));
+        arrow.setAttribute("data-reply-reach", "below");
+        arrow.style.setProperty("--reply-shift", `${shift.toFixed(2)}px`);
+        arrow.style.removeProperty("--reply-run");
+      } else {
+        arrow.setAttribute("data-reply-reach", "side");
+        arrow.style.setProperty("--reply-run", `${run.toFixed(2)}px`);
+        arrow.style.removeProperty("--reply-shift");
+      }
+    }
+    if (rowShown(row)) above = row;
+  }
+}
+
+// --- gathering a message's replies under it ---------------------------------------------------
+//
+// `#215 reply-coalesce`. The owner: "When I click the N Replies oval I want all the replies to move
+// to join their parent in a dense stack underneath. Other messages don't disappear, this is a
+// reorder operation." The stacked replies lose their arrows for one BRIDGE in the arrow's colour —
+// a spine out of the parent's foot down the gutter, and a short line from it into each reply — and
+// an X beside the bridge puts them back in time order. Two taps on any reply's arrow gather the
+// replies of the message it answers. "I don't think we need to scroll": the parent stays where it
+// was on the screen, and for two taps on an arrow, the reply that was tapped does.
+//
+// WHAT IS A REPLY, HERE. The providers carry two kinds, and both count: a message whose own reply
+// pointer names the parent — Discord's replies — and, where the parent heads a thread, every other
+// message of that thread, which is the only reply Slack and Google Chat have. A channel registered
+// as one thread is not a thread here, or every message in it would be a reply to its root.
+//
+// WHERE. All, which is the one view holding every message, and the one list of a provider without
+// threads. Asked from Main or a thread, the page opens All first, exactly as the arrow's jump does,
+// so All is then what this channel reopens in (`#205 channel-view-memory`): the reader is reading
+// All, and a reopen should come back where they were left.
+//
+// WHAT IS LOADED IS WHAT MOVES, AND NOTHING IS FETCHED. Every reply is newer than its parent, and the
+// list is the newest stretch of the channel with nothing left out of it, so a parent on screen has
+// every reply it has on screen too. Two things can still keep one off, and both are SAID: Hide read,
+// which leaves out what is read, and a provider's own reply count saying a thread holds more than its
+// history handed back. Reading the thread to make up the difference would put rows into All that All's
+// own read did not return.
+//
+// ONE AT A TIME. Gathering another message's replies puts the first's back. Two stacks interleaved
+// with what is left in time order would leave the reader unsure which order any stretch of the list
+// is in — and a reply can answer a message in the other stack, so they could not both be stacks.
+//
+// A WAY OF ARRANGING THE ROWS, NOT A CHANGE TO ANYTHING. Nothing is read, marked or written. It
+// outlives a refresh, a delta and a live arrival — the rows are drawn gathered wherever they are
+// drawn, and a new reply joins the stack — and goes with a change of view or channel. A filter that
+// takes rows away (search text, Links, Pinned) puts the replies back: it shows a subset of the
+// channel in time order, and a bridge to rows it hides would be a bridge to nothing. Hide read is
+// not that kind of filter here — it decides which messages are drawn at all — so the stack is simply
+// the replies it leaves; a parent it hides takes the stack with it.
+
+/** The X's accessible name and tooltip: what pressing it does, not what it looks like. */
+const UNGATHER_NAME = "Show replies in time order";
+
+/** The message whose replies are gathered under it, as `{ parent, context }`; null when none are. */
+let gathered = null;
+
+/** Whether the channel's rows are drawn gathered now, so putting them back has something to undo. */
+let rowsGathered = false;
+
+/** Whether the list on screen is one replies are gathered in: All, or a provider's only list. */
+const gatheringView = () => !threadingSupported || channelView === "flat";
+
+/** The message whose replies are gathered in the list on screen, or null. */
+function gatheredParent() {
+  if (gathered === null || gathered.context !== channelContextKey() || !gatheringView()) return null;
+  return gathered.parent;
+}
+
+/** The ids, among `messages`, of the replies to message `parent`. See the head of this section. */
+function repliesTo(parent, messages) {
+  const id = String(parent);
+  const root = messages.find((message) => String(message.id) === id) || heldMessage(id);
+  const record = threadingSupported && root ? heldThreadRecord(root) : null;
+  const thread = record && record.is_root === true && String(record.id) !== String(channelCanon.scope)
+    ? String(record.id) : null;
+  const replies = new Set();
+  for (const message of messages) {
+    const own = String(message.id);
+    if (own === id) continue;
+    if (String(message.reply_to || "") === id || (thread !== null && threadOf(message) === thread)) {
+      replies.add(own);
+    }
+  }
+  return replies;
+}
+
+/**
+ * `messages`, oldest first, as the rows to draw with `parent`'s replies gathered under the row that
+ * holds it; null when no row would hold it. The replies keep their time order among themselves and
+ * everything else keeps its place. The combining rule (`glom`) applies within each run and never
+ * across the stack's ends, so the parent's row and the stack's rows stay rows of their own.
+ */
+function gatheredRows(messages, parent) {
+  const replies = repliesTo(parent, messages);
+  const rows = glom(messages.filter((message) => !replies.has(String(message.id))));
+  const at = rows.findIndex((group) => group.some((message) => String(message.id) === String(parent)));
+  if (at < 0) return null;
+  rows.splice(at + 1, 0, ...glom(messages.filter((message) => replies.has(String(message.id)))));
+  return rows;
+}
+
+/**
+ * The messages of the channel's rows, oldest first, however the rows are arranged on screen. What
+ * everything that means "the channel's messages in order" reads — a saved snapshot, the boundary of
+ * a bulk clear — so that gathering, which only rearranges the rows, cannot change any of them.
+ */
+function listedMessages() {
+  const messages = [...el("discord-log").children].flatMap(rowMessages);
+  return rowsGathered ? inTimeOrder(messages, "timestamp") : messages;
+}
+
+/**
+ * Put the channel's rows in the order they are meant to be in: gathered while a message's replies
+ * are, in time order otherwise. The first thing `renderChannelRows` does, because every path that
+ * draws rows ends there — a newest page, a delta, a step back, a live arrival, the combining setting
+ * — and each of those draws in time order, knowing nothing of this.
+ *
+ * Rows that come out the same are KEPT, not rebuilt: a row keeps its fold and its open menu, and
+ * the row a scroll is being held by stays the same element. Only the rows the gathering splits or
+ * joins are drawn again.
+ */
+function arrangeChannelRows() {
+  const parent = gatheredParent();
+  if (parent === null && !rowsGathered) return;
+  const list = el("discord-log");
+  const rows = [...list.children];
+  const messages = inTimeOrder(rows.flatMap(rowMessages), "timestamp");
+  let groups = parent === null ? null : gatheredRows(messages, parent);
+  // The parent has left the list — Hide read hides it, or a read no longer holds it — and the
+  // stack goes with it.
+  if (groups === null && parent !== null) gathered = null;
+  rowsGathered = groups !== null;
+  if (groups === null) groups = glom(messages);
+  const keyOf = (ids) => ids.join(" ");
+  const wanted = groups.map((group) => keyOf(group.map((message) => String(message.id))));
+  if (wanted.length === rows.length && wanted.every((key, i) => key === keyOf(idsOf(rows[i])))) return;
+  const held = new Map(rows.map((row) => [keyOf(idsOf(row)), row]));
+  list.replaceChildren(...groups.map((group, i) => held.get(wanted[i]) || discordNode(group)));
+}
+
+/**
+ * Two taps on a reply's arrow: gather the replies of the message it answers, and keep the reply
+ * that was tapped where it is on the screen.
+ */
+function gatherFromReply(reply) {
+  const target = String(reply.getAttribute("data-reply-to") || "");
+  if (target) return gatherReplies(target, reply);
+}
+
+/**
+ * The N replies chip on `row`: gather that message's replies under it, or, with them gathered
+ * already, put them back. A toggle, and it says which it is (`aria-pressed`): a second tap that did
+ * nothing would be a control that looks broken.
+ */
+function toggleGathered(parent, row) {
+  if (gatheredParent() === String(parent)) {
+    scatterReplies();
+    return undefined;
+  }
+  return gatherReplies(String(parent), row);
+}
+
+/**
+ * Gather `parent`'s replies under it. `from` is the row the reader's eye is on — the parent's own
+ * for its chip, the reply's for two taps on its arrow — and that row is where it was on the screen
+ * afterwards: measured now, before anything moves, and put back once the rows have.
+ */
+async function gatherReplies(parent, from) {
+  const anchor = String(from.getAttribute("data-id") || parent);
+  const anchorTop = from.getBoundingClientRect().top;
+  // A filter that takes rows away would hide replies from the stack the reader just asked for, and
+  // putting the replies back is what turning one on does: it is closed, as the jump closes a search
+  // that hides the message it is for.
+  if (searchOpen) setSearchOpen(false);
+  await seekMessage(parent, () => {
+    if (!gatheringView() || !rowHolding(parent)) return false;
+    gatherNow(parent, anchor, anchorTop);
+    return true;
+  }, () => threadingSupported && channelView !== "flat");
+}
+
+/** The gathering itself, once the parent's row is in the list. */
+function gatherNow(parent, anchor, anchorTop) {
+  const report = gatherReport(parent);
+  if (report.gathered === 0) {
+    setStatus(report.hidden > 0 ? "Hide read is hiding its replies." : "No replies to it are loaded.");
+    return;
+  }
+  gathered = { parent, context: channelContextKey() };
+  renderChannelRows();
+  renderScrollTools();
+  keepOnScreen(anchor, anchorTop);
+  setStatus(report.hidden > 0 ? `Gathered ${report.gathered}; Hide read hides ${report.hidden} more.`
+    : report.missing > 0 ? `Gathered ${countOf(report.gathered)}; ${report.missing} not loaded.`
+      : `Gathered ${countOf(report.gathered)} under it.`);
+}
+
+/** "1 reply", "3 replies". */
+const countOf = (n) => `${n} ${n === 1 ? "reply" : "replies"}`;
+
+/**
+ * How many of `parent`'s replies are drawn to be gathered, how many Hide read leaves out, and how
+ * many more the thread's own exact count says it holds than either: see the head of this section.
+ */
+function gatherReport(parent) {
+  const drawn = repliesTo(parent, [...el("discord-log").children].flatMap(rowMessages));
+  const all = threadingSupported ? repliesTo(parent, timelineMessages) : drawn;
+  const hidden = todoMode ? [...all].filter((id) => !drawn.has(id)).length : 0;
+  const root = heldMessage(parent);
+  const record = threadingSupported && root ? heldThreadRecord(root) : null;
+  let missing = 0;
+  if (record && record.is_root === true) {
+    const said = threadReplies(record.id, root);
+    const loaded = timelineMessages.filter((message) => threadOf(message) === String(record.id) &&
+      String(message.id) !== String(parent)).length;
+    if (said.exact === true && typeof said.count === "number") missing = Math.max(0, said.count - loaded);
+  }
+  return { gathered: drawn.size, hidden, missing };
+}
+
+/** Scroll so that the row holding message `id` has its top at `top` on the screen again. */
+function keepOnScreen(id, top) {
+  const row = rowHolding(id);
+  if (row && Number.isFinite(top)) {
+    el("scroll-area").scrollTop += row.getBoundingClientRect().top - top;
+  }
+  renderJumpNewest();
+}
+
+/** The X beside the bridge: the replies go back to their places in time, and the parent stays put. */
+function scatterReplies() {
+  const parent = gatheredParent();
+  const row = parent === null ? null : rowHolding(parent);
+  const top = row ? row.getBoundingClientRect().top : NaN;
+  gathered = null;
+  renderChannelRows();
+  renderScrollTools();
+  if (parent !== null) keepOnScreen(parent, top);
+  setStatus("Replies back in time order.");
+}
+
+/**
+ * Put the replies back without holding anything on the screen: the list is about to be another
+ * one — a change of view, which keeps these rows to come back to and must keep them in time order —
+ * or a filter is about to take rows out of it.
+ */
+function putRepliesBack() {
+  gathered = null;
+  if (rowsGathered) renderChannelRows();
+}
+
+/**
+ * What the row's speaker and shape put its left edge at, in the words web/voice.css keys a gathered
+ * reply's inset on (`data-stack-under`): the stack hangs one gutter in from its parent's edge, so the
+ * bridge's spine is under the parent and comes out of its foot whoever sent it.
+ */
+function stackUnder(row) {
+  const who = row.getAttribute("data-who");
+  if (row.getAttribute("data-is-reply") === "true") return who === "me" ? "me-reply" : "reply";
+  return who === "me" || who === "coder" ? who : "third";
+}
+
+/**
+ * Everything in a reply's gutter that depends on the rows around it: which arrow it draws (`#214
+ * reply-arrow`), and, while replies are gathered, which rows are the stack, where each sits in it,
+ * the bridge and the X (`#215 reply-coalesce`). Run whenever those rows can have changed: after
+ * every redraw, and after every filter pass, which changes what the reader can see above a row.
+ */
+function renderReplyLinks() {
+  const list = el("discord-log");
+  const rows = [...list.children];
+  const parent = gatheredParent();
+  const parentRow = parent === null ? null : rowHolding(parent);
+  const stack = [];
+  if (parentRow) {
+    const replies = repliesTo(parent, rows.flatMap(rowMessages));
+    for (let i = rows.indexOf(parentRow) + 1; i < rows.length; i += 1) {
+      const ids = idsOf(rows[i]);
+      if (ids.length === 0 || !ids.every((one) => replies.has(one))) break;
+      stack.push(rows[i]);
+    }
+  }
+  const under = parentRow ? stackUnder(parentRow) : "";
+  let above = null;
+  for (const row of rows) {
+    const at = stack.indexOf(row);
+    const place = at < 0 ? (row === parentRow && stack.length > 0 ? "parent" : "")
+      : stack.length === 1 ? "only" : at === 0 ? "first" : at === stack.length - 1 ? "last" : "middle";
+    if (place) row.setAttribute("data-coalesce", place);
+    else row.removeAttribute("data-coalesce");
+    if (at >= 0) row.setAttribute("data-stack-under", under);
+    else row.removeAttribute("data-stack-under");
+    gutterPiece(row, "reply-bridge", at >= 0, bridgePiece);
+    gutterPiece(row, "reply-ungather", at === 0, ungatherButton);
+    const arrow = childByClass(row, "reply-jump");
+    if (arrow) {
+      const adjacent = above !== null && idsOf(above).includes(String(row.getAttribute("data-reply-to") || ""));
+      arrow.setAttribute("data-reply-style", adjacent ? "adjacent" : "disconnected");
+      if (!adjacent) {
+        arrow.removeAttribute("data-reply-reach");
+        arrow.style.removeProperty("--reply-shift");
+        arrow.style.removeProperty("--reply-run");
+      }
+    }
+    const chip = childByClass(row, "thread-replies");
+    if (chip) {
+      // Pressed while its replies are gathered, even when none of them is drawn just now — Hide read
+      // may be leaving them all out — because a tap on it then puts the gathering away.
+      const pressed = row === parentRow;
+      chip.setAttribute("aria-pressed", pressed ? "true" : "false");
+      chip.setAttribute("title", pressed ? UNGATHER_NAME : "Gather this message's replies under it");
+    }
+    if (rowShown(row)) above = row;
+  }
+  measureReplyArrows();
+}
+
+/** Put `make()` at the head of `row` when `wanted` and it is not there, and take it away when not. */
+function gutterPiece(row, name, wanted, make) {
+  const held = [...row.children].find((child) => String(child.className).split(/\s+/).includes(name));
+  if (wanted && !held) row.replaceChildren(make(row), ...row.children);
+  else if (!wanted && held) row.removeChild(held);
+}
+
+/** The bridge's part in one gathered reply's gutter: drawn by web/voice.css, and only drawn. */
+function bridgePiece() {
+  const bridge = document.createElement("span");
+  bridge.className = "reply-bridge";
+  bridge.setAttribute("aria-hidden", "true");
+  return bridge;
+}
+
+/**
+ * The X, in the first gathered reply's gutter, left of the bridge. A button a touch target square,
+ * named for what it does, with its X drawn on an empty span as the arrows are.
+ */
+function ungatherButton() {
+  const button = document.createElement("button");
+  button.className = "reply-ungather";
+  button.setAttribute("type", "button");
+  button.setAttribute("aria-label", UNGATHER_NAME);
+  button.setAttribute("title", UNGATHER_NAME);
+  const mark = document.createElement("span");
+  mark.className = "reply-ungather-mark";
+  mark.setAttribute("aria-hidden", "true");
+  button.append(mark);
+  button.addEventListener("click", (event) => {
+    // The row's own tap would fold the reply or read it aloud; this tap is the X's.
+    if (event) event.stopPropagation();
+    scatterReplies();
+  });
+  return button;
 }
 
 function toggleMessageDetails(li, messages) {
@@ -12004,6 +12544,11 @@ function swipeable(li, messages) {
     if (arrow && nodeWithin(arrow, event.target)) {
       return;
     }
+    // `#215 reply-coalesce`. Nor on the X beside the bridge of gathered replies, for the same reason.
+    const ungather = childByClass(li, "reply-ungather");
+    if (ungather && nodeWithin(ungather, event.target)) {
+      return;
+    }
     active = true;
     startX = event.clientX;
     startY = event.clientY;
@@ -12284,7 +12829,7 @@ const combinedContent = (messages) =>
  */
 function regroupChannelRows() {
   const list = el("discord-log");
-  const messages = [...list.children].flatMap(rowMessages);
+  const messages = listedMessages();
   preservingScroll(() => {
     list.replaceChildren(...glom(messages).map(discordNode));
     renderChannelRows();
@@ -12653,6 +13198,9 @@ const DISMISS_BATCH = 99;
  */
 async function markReadThroughHere(row, upstreamId) {
   // The row's OWN list: the channel's, or the Pinned filter's, where "above it" means the pins above.
+  // With replies gathered (`#215 reply-coalesce`) it is still the rows ABOVE IT ON THE SCREEN, the
+  // stack included, because that is what the item says it does and what the reader is looking at.
+  // Gathering itself marks nothing.
   const rows = [...(row.parentNode || el("discord-log")).children];
   const at = rows.indexOf(row);
   if (at < 0) return;
@@ -13828,23 +14376,29 @@ function appendChannelRow(arriving, live = false) {
     return;
   }
   const list = el("discord-log");
-  // A LIVE ARRIVAL CAN JOIN THE ROW ABOVE IT, and it has to be given the chance: the second half
-  // of a split post usually arrives over the stream a fraction of a second after the first, so
-  // appending it unconditionally would leave exactly the pair this feature exists for as two rows
-  // until the next poll happened to redraw them together.
-  const rows = [...list.children];
-  const last = rows[rows.length - 1];
-  const held = rowMessages(last);
-  if (held.length > 0 && joinsGroup(held[held.length - 1], message)) {
-    // The row is REBUILT rather than edited: one constructor for a row, wherever it came from.
-    list.replaceChildren(...rows.slice(0, -1), discordNode([...held, message]));
-  } else {
-    list.append(discordNode([message]));
-  }
-  // `#84 reply-aware-dismissal`. Re-derive the row states with the new row in place. It is here, in the one
-  // appender, rather than at each of its callers: an arriving message can be the ANSWER to
-  // something already on screen, so the row that changes is not necessarily the one just added.
-  renderChannelRows();
+  const append = () => {
+    // A LIVE ARRIVAL CAN JOIN THE ROW ABOVE IT, and it has to be given the chance: the second half
+    // of a split post usually arrives over the stream a fraction of a second after the first, so
+    // appending it unconditionally would leave exactly the pair this feature exists for as two rows
+    // until the next poll happened to redraw them together.
+    const rows = [...list.children];
+    const last = rows[rows.length - 1];
+    const held = rowMessages(last);
+    if (held.length > 0 && joinsGroup(held[held.length - 1], message)) {
+      // The row is REBUILT rather than edited: one constructor for a row, wherever it came from.
+      list.replaceChildren(...rows.slice(0, -1), discordNode([...held, message]));
+    } else {
+      list.append(discordNode([message]));
+    }
+    // `#84 reply-aware-dismissal`. Re-derive the row states with the new row in place. It is here, in the one
+    // appender, rather than at each of its callers: an arriving message can be the ANSWER to
+    // something already on screen, so the row that changes is not necessarily the one just added.
+    renderChannelRows();
+  };
+  // `#215 reply-coalesce`. With replies gathered, a new reply to the parent joins the stack, which
+  // is ABOVE the foot of the list: the reader below it is held where they are reading.
+  if (gatheredParent() !== null) preservingScroll(append);
+  else append();
   // A live arrival and an acknowledged send are both what a reload should show next.
   saveChannelScope();
   if (!todoMode) {
@@ -13932,7 +14486,9 @@ function queueInboxWrite(task) {
 /** Mark messages as dealt with, remember the exact set, and settle the list. */
 async function dismissMessages(body) {
   const channel = el("discord-channel").value;
-  const visible = [...el("discord-log").children].flatMap(idsOf);
+  // In time order, as the server resolves `through`: gathered replies (`#215 reply-coalesce`) are
+  // above rows older than they are, and are not "before" them.
+  const visible = listedMessages().map((message) => String(message.id));
   const boundary = body.through === undefined ? -1 : visible.indexOf(String(body.through));
   const requested = body.messages
     ? body.messages.map(String)
@@ -14063,8 +14619,9 @@ async function clearBacklog() {
     return;
   }
   // MESSAGES, not rows: what the server is about to clear is Discord messages, and a combined row
-  // is more than one of them. A count of rows would promise to clear fewer than it did.
-  const messages = rows.flatMap(idsOf);
+  // is more than one of them. A count of rows would promise to clear fewer than it did. In time
+  // order, so the newest is last even with replies gathered above older rows (`#215 reply-coalesce`).
+  const messages = listedMessages().map((message) => String(message.id));
   if (!backlogIsArmed()) {
     armBacklog();
     setStatus(`Tap again to clear ${messages.length} — undo will be offered afterwards.`);
@@ -17649,6 +18206,10 @@ function readEnteredChannel(keepPosition) {
 // The walk back resets with it: a cursor from one channel means nothing in another, and carrying
 // one across would ask the server to step back from a message that is not there.
 function changeSelectedChannel() {
+  // `#215 reply-coalesce`. Gathered replies belong to the channel they were gathered in, whose rows
+  // are about to go.
+  gathered = null;
+  rowsGathered = false;
   applyChannelProvider();
   rememberActiveChannel();
   rememberChannelDraft();
@@ -17870,6 +18431,22 @@ if (typeof window.ResizeObserver === "function") {
       area.scrollTop = area.scrollHeight;
     }
   }).observe(el("scroll-area"));
+}
+// `#214 reply-arrow`. Where an arrow meets the row directly above it is layout, and layout changes
+// without a redraw: the window resized or turned, the reading column dragged, the reader's type
+// size, a row folding or opening above an arrow. So the channel's list is watched, and the arrows
+// measured again once the observer has returned, as the jump is decided above. Measuring only moves
+// drawings that are out of the flow, so it cannot resize the list and come round again.
+if (typeof window.ResizeObserver === "function") {
+  let measureDue = false;
+  new window.ResizeObserver(() => {
+    if (measureDue) return;
+    measureDue = true;
+    setTimeout(() => {
+      measureDue = false;
+      measureReplyArrows();
+    }, 0);
+  }).observe(el("discord-log"));
 }
 // `#68 pull-to-refresh`. On #scroll-area rather than on the document, because the gesture is about
 // THIS list and because the page's other three scroll gestures already live here. Nothing calls

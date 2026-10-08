@@ -727,6 +727,13 @@ body {
   margin-top: 0.6rem;
 }
 
+/* `#215 reply-coalesce`. Pressed while its replies are gathered under it, in the bridge's colour, so
+   the chip that gathered them says it is the one that will put them back. */
+.thread-replies[aria-pressed="true"] {
+  border-color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 22%, transparent);
+}
+
 #thread-list .thread-card {
   border-inline-start: 3px solid hsl(var(--thread-hue, 210) 55% 50%);
 }
@@ -1430,15 +1437,21 @@ body {
  *
  * The marker line a kept place draws above its row is outside the box, and stays at full strength
  * on a reply: it is the reader's own way back, and not a state of the message.
+ *
+ * `#215 reply-coalesce`. A gathered reply is drawn the same way, whether or not it carries a reply
+ * pointer — a thread's replies do not — because what is beside its box is the bridge, which must
+ * not recede with it either, and the X beside the bridge.
  */
-#discord-log li.discord-message[data-is-reply="true"][data-who] {
+#discord-log li.discord-message[data-is-reply="true"][data-who],
+#discord-log li.discord-message[data-stack-under][data-who] {
   opacity: 1;
   filter: none;
   background-image: linear-gradient(rgb(128 128 128 / var(--row-grey, 0)), rgb(128 128 128 / var(--row-grey, 0)));
   background-blend-mode: saturation;
 }
 
-#discord-log li.discord-message[data-is-reply="true"] > :not(.reply-jump) {
+#discord-log li.discord-message[data-is-reply="true"] > :not(.reply-jump):not(.reply-bridge):not(.reply-ungather),
+#discord-log li.discord-message[data-stack-under] > :not(.reply-jump):not(.reply-bridge):not(.reply-ungather) {
   filter: var(--row-filter, none);
 }
 
@@ -1446,7 +1459,8 @@ body {
    shadow is not scrollable overflow, and the agent's tile meets the edge of the list. The second
    shadow, under the veil, is the border's colour drained: the neutral edge in place of a speaker's
    tinted one, at `--row-grey`. */
-#discord-log li.discord-message[data-is-reply="true"]::after {
+#discord-log li.discord-message[data-is-reply="true"]::after,
+#discord-log li.discord-message[data-stack-under]::after {
   --row-veil: color-mix(in srgb, var(--bg) calc((1 - var(--row-opacity, 1)) * 100%), transparent);
   content: "";
   position: absolute;
@@ -1460,20 +1474,23 @@ body {
 }
 
 /*
- * The arrow's square: the whole gutter, from the row's top. Outside the row's box, so nothing it
+ * The arrow's square: the whole gutter, beside the row's box. Outside the row's box, so nothing it
  * covers is text or a control — the row's own controls are all inside the box, and the gutter is
- * this row's alone. `right: 100%` anchors it to the box's left side rather than to the list's
- * edge, so the wider inset a desk gives the owner's rows still leaves the arrow touching its box.
+ * this row's alone. `right: 100%` anchors it to the box's left side rather than to the list's edge,
+ * so the wider inset a desk gives the owner's rows still leaves the arrow touching its box.
+ *
+ * `#214 reply-arrow`. Two arrows, and the square goes where its drawing is: at the row's MIDDLE for
+ * a reply to a message elsewhere, whose arrow leaves the middle of the box's side, and at the row's
+ * TOP for a reply to the row directly above, whose arrow reaches up to that row. Either way one
+ * touch target square inside the row's height: a reply is at least a gutter tall.
  */
 #discord-log .reply-jump {
+  --reply-stroke: 0.1875rem;
   position: absolute;
-  top: 0;
+  top: calc(50% - var(--reply-gutter) / 2);
   right: 100%;
   width: var(--reply-gutter);
   height: var(--reply-gutter);
-  display: flex;
-  align-items: flex-start;
-  justify-content: flex-end;
   padding: 0;
   background: none;
   border: none;
@@ -1484,47 +1501,136 @@ body {
   cursor: pointer;
 }
 
-/*
- * THE ARROW, drawn on an empty span in two pieces: the line, and its head. 32px by 24px at the
- * default size, against the square's right-hand edge, which is the box's left side.
- *
- * The line is one box with two borders, so the corner between them is a real curve: up its left
- * side, along its bottom into the row. Its bottom border leaves the box level with the meta line,
- * which is where the eye already is, and its left border is the shaft. The head is a solid
- * triangle centred on the shaft and overlapping its top, so the two cannot visibly come apart at
- * any size. Everything is in `rem`, so the whole drawing grows with the reader's type.
- */
-#discord-log .reply-jump-mark {
-  --reply-stroke: 0.1875rem;
-  --reply-shaft: 0.7rem;
-  position: relative;
-  flex: 0 0 auto;
-  width: 2rem;
-  height: 1.5rem;
-  margin-top: 0.1rem;
+/* The gap between this row and the one above: a row's own margin under it, and this row's top
+   border, which the square's `top: 0` is inside. An arrow that rises by this meets the row above. */
+#discord-log .reply-jump[data-reply-style="adjacent"] {
+  --reply-rise: calc(0.5rem + 1px);
+  top: 0;
 }
 
-#discord-log .reply-jump-mark::before {
+/*
+ * THE ARROW, drawn on an empty span and its two pseudo-elements, everything in `rem` so the whole
+ * drawing grows with the reader's type. Laid against the square's right-hand edge, which is the
+ * box's left side, and passing taps through to the square: a drawing that reaches past its square
+ * must not take a tap meant for the row above.
+ */
+#discord-log .reply-jump-mark {
+  position: absolute;
+  right: 0;
+  box-sizing: border-box;
+  pointer-events: none;
+}
+
+#discord-log .reply-jump-mark::before,
+#discord-log .reply-jump-mark::after {
   content: "";
   position: absolute;
-  left: var(--reply-shaft);
-  right: 0;
-  top: 0.45rem;
-  bottom: 0.25rem;
+  box-sizing: border-box;
+}
+
+/*
+ * TO A MESSAGE ELSEWHERE: out of the middle of the box's side, a short stub, then a run up and to
+ * the left at forty-five degrees, ending in a head that points along it. Nothing about it points at
+ * the row above, which is the whole of the difference.
+ *
+ * The span is the drawing's box, its right edge on the row's box and its foot on the row's middle
+ * line. The stub is its background, one band of the accent along its foot; the run is `::before`, a
+ * bar turned about the stub's end; and the head is `::after`, a right-angled triangle whose right
+ * angle is the point, so that the run is its axis.
+ */
+#discord-log .reply-jump[data-reply-style="disconnected"] .reply-jump-mark {
+  top: calc(50% - 1.2rem);
+  width: 1.7rem;
+  height: calc(1.2rem + var(--reply-stroke) / 2);
+  background: linear-gradient(currentColor, currentColor) no-repeat right bottom / 0.55rem var(--reply-stroke);
+}
+
+#discord-log .reply-jump[data-reply-style="disconnected"] .reply-jump-mark::before {
+  right: calc(0.5rem - var(--reply-stroke) / 2);
+  bottom: 0;
+  width: calc(1.15rem + var(--reply-stroke) / 2);
+  height: var(--reply-stroke);
+  border-radius: var(--reply-stroke);
+  background: currentColor;
+  transform-origin: calc(100% - var(--reply-stroke) / 2) 50%;
+  transform: rotate(45deg);
+}
+
+/* Placed by its point, at the drawing box's top left: a browser rounds a border's width to whole
+   pixels, so a head placed by its far side would put its point a fraction of a pixel off the run. */
+#discord-log .reply-jump[data-reply-style="disconnected"] .reply-jump-mark::after {
+  top: 0.087rem;
+  left: 0.087rem;
+  border-top: 0.7rem solid currentColor;
+  border-right: 0.7rem solid transparent;
+}
+
+/*
+ * TO THE ROW DIRECTLY ABOVE: the right angle at the box's upper left that the first arrow had, its
+ * shaft run up across the gap until its head meets that row. The span is one box with two borders,
+ * so the corner between them is a real curve: its bottom border leaves the box level with the meta
+ * line, where the eye already is, and its left border is the shaft, 1.2rem out from the box (see
+ * `REPLY_SHAFT_REM`). Its top is inside the head, so the shaft's square end is under it.
+ *
+ * Where the row above starts further right than the shaft, web/voice.js measures how far
+ * (`measureReplyArrows`) and the shaft moves right by `--reply-shift` to come up under its edge.
+ */
+#discord-log .reply-jump[data-reply-style="adjacent"] .reply-jump-mark {
+  top: calc(0.45rem - var(--reply-rise));
+  bottom: calc(100% - 1.35rem);
+  width: calc(1.2rem + var(--reply-stroke) / 2 - var(--reply-shift, 0px));
   border-left: var(--reply-stroke) solid currentColor;
   border-bottom: var(--reply-stroke) solid currentColor;
   border-bottom-left-radius: 0.55rem;
 }
 
-#discord-log .reply-jump-mark::after {
-  content: "";
-  position: absolute;
-  left: calc(var(--reply-shaft) + var(--reply-stroke) / 2);
-  top: 0;
+#discord-log .reply-jump[data-reply-style="adjacent"] .reply-jump-mark::before {
+  content: none;
+}
+
+/* The head, a solid triangle centred on the shaft, its point on the row above's bottom edge. */
+#discord-log .reply-jump[data-reply-style="adjacent"] .reply-jump-mark::after {
+  left: calc(var(--reply-stroke) / -2);
+  top: -0.45rem;
   transform: translateX(-50%);
   border-left: 0.5rem solid transparent;
   border-right: 0.5rem solid transparent;
   border-bottom: 0.6rem solid currentColor;
+}
+
+/*
+ * ...and where no shaft in the gutter can reach that row's bottom edge — it starts at or beyond this
+ * box, as the owner's rows do on a desk and as a reply above a reply does — the shaft rises past it
+ * and turns right, and the head meets the row's LEFT side 0.9rem above its foot, clear of its
+ * rounded corner. `--reply-run` is the measured distance from the shaft to that side. The lower
+ * corner is the span; the upper, with the run along to the head, is `::before`.
+ */
+#discord-log .reply-jump[data-reply-reach="side"] .reply-jump-mark {
+  top: calc(-1 * var(--reply-rise));
+  width: calc(1.2rem + var(--reply-stroke) / 2);
+}
+
+#discord-log .reply-jump[data-reply-reach="side"] .reply-jump-mark::before {
+  content: "";
+  left: calc(-1 * var(--reply-stroke));
+  bottom: calc(100% - 1px);
+  width: calc(var(--reply-run, 0px) - 0.6rem + var(--reply-stroke) / 2 + 1px);
+  height: calc(0.9rem + var(--reply-stroke) / 2 + 1px);
+  border-left: var(--reply-stroke) solid currentColor;
+  border-top: var(--reply-stroke) solid currentColor;
+  border-top-left-radius: 0.55rem;
+}
+
+/* Placed by its point, which is its right side, for the reason the other arrow's head is. */
+#discord-log .reply-jump[data-reply-reach="side"] .reply-jump-mark::after {
+  left: auto;
+  right: calc(1.2rem - var(--reply-run, 0px));
+  top: -0.9rem;
+  transform: translateY(-50%);
+  border-left: 0.6rem solid currentColor;
+  border-top: 0.5rem solid transparent;
+  border-right: 0;
+  border-bottom: 0.5rem solid transparent;
 }
 
 /* Pressed, and reached by keyboard: a soft disc behind the arrow, so the target shows itself. A
@@ -1536,6 +1642,164 @@ body {
 }
 
 #discord-log .reply-jump:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
+}
+
+/*
+ * `#215 reply-coalesce`. GATHERED REPLIES: a dense stack under the message they answer, joined to it
+ * by one BRIDGE in the arrow's colour — a spine out of the parent's foot down the gutter, and a short
+ * line from it into the left side of each reply, with no heads, because nothing here points
+ * anywhere: the replies are where they answer. Their own arrows go while they are gathered.
+ *
+ * THE STACK HANGS ONE GUTTER IN FROM ITS PARENT'S LEFT EDGE, whoever sent each reply. The spine runs
+ * down that gutter, so it is under the parent and comes out of its foot whatever the parent's shape
+ * — the owner's row is inset a long way on a desk, the agent's runs edge to edge — where a spine in
+ * the replies' own gutters would come out of nothing above the owner's rows. `data-stack-under`
+ * names the parent's shape, and each value restates that shape's own left edge, from the speaker
+ * rules above and, on a desk, from the desktop block at the foot of this file, where its own copies
+ * are. The extra attribute in each selector puts these over the reply rules, which they follow.
+ *
+ * At least a gutter tall, so the X — a touch target square, in the first reply's gutter — never hangs
+ * over the next reply.
+ */
+#discord-log li.discord-message[data-stack-under][data-who] {
+  min-height: var(--reply-gutter);
+}
+
+#discord-log li.discord-message[data-stack-under="coder"][data-who] {
+  margin-left: calc(var(--reply-gutter) - 0.75rem - env(safe-area-inset-left));
+}
+
+#discord-log li.discord-message[data-stack-under="me"][data-who] {
+  margin-left: calc(var(--speaker-inset) + var(--reply-gutter));
+}
+
+#discord-log li.discord-message[data-stack-under="third"][data-who] {
+  margin-left: calc(var(--speaker-inset) / 2 + var(--reply-gutter));
+}
+
+#discord-log li.discord-message[data-stack-under="reply"][data-who],
+#discord-log li.discord-message[data-stack-under="me-reply"][data-who] {
+  margin-left: calc(var(--reply-gutter) * 2);
+}
+
+/* The agent's tile keeps a left edge for its line to meet, as the agent's reply does. */
+#discord-log li.discord-message[data-stack-under][data-who="coder"] {
+  padding-left: 0.4rem;
+  border-left: 1px solid var(--edge);
+  --reply-neutral-edge: transparent;
+}
+
+/* The bridge stands in for the arrow, and the arrow's tap is not needed: the message it would jump
+   to is the one directly above the stack. */
+#discord-log li.discord-message[data-stack-under] > .reply-jump {
+  display: none;
+}
+
+/*
+ * One reply's part of the bridge, in its gutter: the spine, as its left border, 0.9rem out from the
+ * box, from the foot of the row above — the parent, or the reply before — to its own foot; and its
+ * line into the box as `::after`, level with the meta line, where an arrow's leg leaves a box. The
+ * next reply's part starts where this one ends, so the spine is one line however tall each reply
+ * is, folded or open, and at any type size: every length is the rows' own or in `rem`.
+ */
+#discord-log .reply-bridge {
+  --reply-stroke: 0.1875rem;
+  --reply-rise: calc(0.5rem + 1px);
+  position: absolute;
+  top: calc(-1 * var(--reply-rise));
+  right: 100%;
+  bottom: -1px;
+  box-sizing: border-box;
+  width: calc(0.9rem + var(--reply-stroke) / 2);
+  border-left: var(--reply-stroke) solid currentColor;
+  color: var(--accent);
+  pointer-events: none;
+}
+
+#discord-log .reply-bridge::after {
+  content: "";
+  position: absolute;
+  top: calc(var(--reply-rise) + 1.35rem - var(--reply-stroke));
+  left: 0;
+  right: 0;
+  height: var(--reply-stroke);
+  background: currentColor;
+}
+
+/* The last reply's part ends in its own line, round the corner, as the arrow's leg does. */
+#discord-log li.discord-message[data-coalesce="last"] > .reply-bridge,
+#discord-log li.discord-message[data-coalesce="only"] > .reply-bridge {
+  bottom: auto;
+  height: calc(var(--reply-rise) + 1.35rem);
+  border-bottom: var(--reply-stroke) solid currentColor;
+  border-bottom-left-radius: 0.55rem;
+}
+
+#discord-log li.discord-message[data-coalesce="last"] > .reply-bridge::after,
+#discord-log li.discord-message[data-coalesce="only"] > .reply-bridge::after {
+  content: none;
+}
+
+/*
+ * THE X, which puts the replies back in time order: a touch target square, the first reply's whole
+ * gutter, with its X drawn in a disc LEFT of the spine and level with the first line into a box —
+ * "floating to the left of the bridge connection", in the owner's words. Over the spine, the square
+ * is still the X's: the bridge takes no taps.
+ */
+#discord-log .reply-ungather {
+  position: absolute;
+  top: 0;
+  right: 100%;
+  width: var(--reply-gutter);
+  height: var(--reply-gutter);
+  padding: 0;
+  background: none;
+  border: none;
+  border-radius: 0.6rem;
+  color: var(--accent);
+  touch-action: manipulation;
+  -webkit-tap-highlight-color: transparent;
+  cursor: pointer;
+}
+
+#discord-log .reply-ungather-mark {
+  position: absolute;
+  top: calc(1.35rem - 0.09375rem - 0.6rem);
+  left: calc(var(--reply-gutter) - 0.9rem - 0.09375rem - 0.25rem - 1.2rem);
+  width: 1.2rem;
+  height: 1.2rem;
+  box-sizing: border-box;
+  border: 2px solid currentColor;
+  border-radius: 50%;
+  background: var(--bg);
+  pointer-events: none;
+}
+
+#discord-log .reply-ungather-mark::before,
+#discord-log .reply-ungather-mark::after {
+  content: "";
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  width: 0.62rem;
+  height: 2px;
+  border-radius: 1px;
+  background: currentColor;
+  transform: translate(-50%, -50%) rotate(45deg);
+}
+
+#discord-log .reply-ungather-mark::after {
+  transform: translate(-50%, -50%) rotate(-45deg);
+}
+
+#discord-log .reply-ungather:active,
+#discord-log .reply-ungather:focus-visible {
+  background: color-mix(in srgb, var(--accent) 18%, transparent);
+}
+
+#discord-log .reply-ungather:focus-visible {
   outline: 2px solid var(--accent);
   outline-offset: -2px;
 }
@@ -2839,8 +3103,10 @@ body {
     --row-grey: 0;
   }
 
-  /* `#204 reply-arrow`. The arrow's disc, under the pointer, as it shows when pressed. */
-  #discord-log .reply-jump:hover {
+  /* `#204 reply-arrow`. The arrow's disc, under the pointer, as it shows when pressed; and the X
+     beside gathered replies' bridge, `#215 reply-coalesce`. */
+  #discord-log .reply-jump:hover,
+  #discord-log .reply-ungather:hover {
     background: color-mix(in srgb, var(--accent) 18%, transparent);
   }
 }
@@ -4167,6 +4433,29 @@ textarea {
      his side of the column. The arrow follows the box (`right: 100%`). */
   #discord-log li.discord-message[data-is-reply="true"][data-who="me"] {
     margin-left: max(var(--reply-gutter), min(15%, 6rem));
+  }
+
+  /* `#215 reply-coalesce`. Gathered replies hang one gutter in from their parent's left edge, and
+     these are the desk's edges, restated from the rules just above as the phone's are restated
+     beside the stack's own rules. After the owner's reply, which they outrank in a stack. */
+  #discord-log li.discord-message[data-stack-under="coder"][data-who] {
+    margin-left: var(--reply-gutter);
+  }
+
+  #discord-log li.discord-message[data-stack-under="me"][data-who] {
+    margin-left: calc(min(15%, 6rem) + var(--reply-gutter));
+  }
+
+  #discord-log li.discord-message[data-stack-under="third"][data-who] {
+    margin-left: calc(min(7%, 3rem) + var(--reply-gutter));
+  }
+
+  #discord-log li.discord-message[data-stack-under="reply"][data-who] {
+    margin-left: calc(var(--reply-gutter) * 2);
+  }
+
+  #discord-log li.discord-message[data-stack-under="me-reply"][data-who] {
+    margin-left: calc(max(var(--reply-gutter), min(15%, 6rem)) + var(--reply-gutter));
   }
 
   /* The identity rows go back to two tracks. The phone stacks them because 27 characters of option

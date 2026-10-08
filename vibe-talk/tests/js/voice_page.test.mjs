@@ -2751,6 +2751,10 @@ const TUNING_BANDS = {
     "how long the row a jump lands on stays lit. Under most of a second the light is gone before " +
     "the eye has followed the scroll; past a few seconds it is still lit after the reader has moved " +
     "on, and reads as a state of the row rather than as where the jump landed"],
+  REPLY_DOUBLE_TAP_MS: [150, 400,
+    "how long one tap on a reply's arrow waits for a second before it jumps (#215 reply-coalesce). " +
+    "Under about a sixth of a second a deliberate double tap's second tap arrives too late and the " +
+    "first has already jumped away; past four tenths every single tap visibly lags behind the finger"],
   REPLY_LANDING_GAP_PX: [0, 24,
     "how far under the floating pill a jumped-to row lands. Below zero its top edge is under the " +
     "pill; past a couple of dozen pixels the room comes out of what is below it, which is where " +
@@ -8006,7 +8010,10 @@ test("A MESSAGE THAT IS ITSELF A REPLY SAYS SO, with an arrow in the gutter to i
   assert.equal(row(page, 1).children[0], arrow, "the arrow is not the first thing in the row");
   // An arrow on its own is announced as "up arrow", or as nothing: it is named for what it DOES.
   assert.equal(arrow.getAttribute("aria-label"), "Jump to the message this answers");
-  assert.equal(arrow.getAttribute("title"), "Jump to the message this answers");
+  // The tooltip adds what a second tap does (`#215 reply-coalesce`), where a pointer resting on it
+  // can find out; the name stays what one tap does.
+  assert.equal(arrow.getAttribute("title"),
+    "Jump to the message this answers. Double-tap to gather its replies under it.");
   // DRAWN, by the stylesheet: a typed glyph looks like whatever the phone's font makes of it.
   assert.equal(arrow.text(), "", "the arrow is a typed glyph again");
 
@@ -8043,6 +8050,7 @@ test("...and it is correct even when the message it answers is not loaded", asyn
 const replyArrowOf = (li) => li.children.find((node) => node.hasClass("reply-jump"));
 const REPLY_JUMP_PAGES = sourceConstant("REPLY_JUMP_PAGES");
 const REPLY_LANDED_MS = sourceConstant("REPLY_LANDED_MS");
+const REPLY_DOUBLE_TAP_MS = sourceConstant("REPLY_DOUBLE_TAP_MS");
 
 /**
  * A tap on a reply's arrow as a browser delivers it: to the arrow, then — unless something stopped
@@ -8057,6 +8065,8 @@ async function tapArrow(page, li) {
   const event = { target: arrow, stopPropagation: () => { stopped = true; } };
   await arrow.dispatch("click", event);
   if (!stopped) await li.dispatch("click", event);
+  // `#215 reply-coalesce`. A single tap waits to learn that no second one is coming, and then jumps.
+  assert.equal(page.expireTimers(REPLY_DOUBLE_TAP_MS), 1, "a tap on the arrow did not wait for a second");
   // A walk back is a read per page, each its own round of promises.
   for (let i = 0; i < 4 * REPLY_JUMP_PAGES; i += 1) await page.settle();
 }
@@ -8143,7 +8153,7 @@ test("...and the arrow does not recede with its row: a reply's state is drawn on
   assert.match(veil, /color-mix\(in srgb, var\(--bg\) calc\(\(1 - var\(--row-opacity, 1\)\) \* 100%\)/,
     "a reply's box no longer fades by its state's amount");
   assert.match(veil, /pointer-events:\s*none/, "the veil takes the taps meant for the reply's buttons");
-  assert.match(cssBlock('#discord-log li.discord-message[data-is-reply="true"] > :not(.reply-jump)'),
+  assert.match(cssBlock('#discord-log li.discord-message[data-is-reply="true"] > :not(.reply-jump):not(.reply-bridge):not(.reply-ungather)'),
     /filter:\s*var\(--row-filter, none\)/, "a reply's content is not greyed with its state");
   assert.match(reply, /background-blend-mode:\s*saturation/, "a reply's tint is not drained with its state");
   // A lit reply is at full strength, and the landing's own wash takes the pseudo-element: the same
@@ -8480,6 +8490,493 @@ test("...nor is a finger on the arrow the start of a swipe or a press-and-hold o
   // The reader's next tap on the reply's own text is still a tap on the reply: it opens it.
   await reply.dispatch("click", { target: reply });
   assert.equal(reply.getAttribute("data-collapsed"), "false", "the tap after the arrow was swallowed");
+});
+
+// --- two arrows, and gathering a message's replies under it --------------------------------------
+//
+// `#214 reply-arrow`: an arrow to the row directly above, which reaches up and meets it, and another
+// for a reply to a message anywhere else. `#215 reply-coalesce`: the N replies chip and two taps on
+// an arrow gather a message's replies into a stack under it, joined by a bridge, with an X to put
+// them back. The real geometry — the head meeting the row above, the bridge reaching every reply,
+// the parent not moving — is measured in Chromium by tests/offline_cache_browser.py; what is checked
+// here is the decision behind each, the rows' order, and the reader's place in the fixture's model.
+
+const arrowStyle = (li) => replyArrowOf(li)?.getAttribute("data-reply-style");
+const ALICE = { author: "alice", author_id: "1000000000000000005", author_is_bot: false };
+const OWNER = { author: "owner", author_id: "1000000000000000007", author_is_bot: false };
+
+test("AN ARROW TO THE ROW DIRECTLY ABOVE is the adjacent one; any other reply's is disconnected", async () => {
+  const page = newPage();
+  await signIn(page);
+  await showDiscord(page, [
+    message({ id: "1000000000000000001", content: "is the runner wedged?" }),
+    message({ id: "1000000000000000002", content: "restarted it", reply_to: "1000000000000000001", ...ALICE }),
+    message({ id: "1000000000000000003", content: "and the queue?" }),
+    message({ id: "1000000000000000004", content: "draining now", reply_to: "1000000000000000001", ...ALICE }),
+    message({ id: "1000000000000000005", content: "answers something never loaded", reply_to: "999" }),
+  ]);
+  assert.equal(arrowStyle(rowWithId(page, "1000000000000000002")), "adjacent",
+    "a reply directly under the message it answers does not draw the arrow that meets it");
+  assert.equal(arrowStyle(rowWithId(page, "1000000000000000004")), "disconnected",
+    "a reply two rows under what it answers draws the arrow that says it answers the row above");
+  assert.equal(arrowStyle(rowWithId(page, "1000000000000000005")), "disconnected");
+});
+
+test("...where the row above holds it as a constituent of a combined row", async () => {
+  const page = newPage();
+  await signIn(page);
+  await showDiscord(page, [
+    ...splitPost(),
+    message({ id: "1000000000000000003", content: "which runner?", reply_to: "1000000000000000002",
+      timestamp: "2026-08-19T04:40:00.000Z", ...ALICE }),
+  ]);
+  assert.equal(page.el("discord-log").children.length, 2, "the split post was not drawn as one row");
+  assert.equal(arrowStyle(row(page, 1)), "adjacent", "the second half of a combined row is not the row above");
+});
+
+test("...where the row above is the previous one the reader can SEE, and decided again as that changes", async () => {
+  const page = newPage();
+  await signIn(page);
+  await showDiscord(page, [
+    message({ id: "1000000000000000001", content: "is the runner wedged?" }),
+    message({ id: "1000000000000000002", content: "the weather is nice" }),
+    message({ id: "1000000000000000003", content: "restarted the runner", reply_to: "1000000000000000001", ...ALICE }),
+  ]);
+  const reply = rowWithId(page, "1000000000000000003");
+  assert.equal(arrowStyle(reply), "disconnected");
+  // A search that hides the row between: the message it answers is directly above it on screen.
+  await search(page, "runner");
+  assert.ok(rowWithId(page, "1000000000000000002").hasClass("search-hidden"), "the search did not hide the row between");
+  assert.equal(arrowStyle(reply), "adjacent", "a row the search hides still counts as the row above");
+  // ...and one that hides the message it answers: nothing above it is what it answers.
+  await search(page, "restarted");
+  assert.equal(arrowStyle(reply), "disconnected", "a hidden message is still met by the arrow");
+  await page.el("search-toggle").click();
+  assert.equal(arrowStyle(reply), "disconnected", "closing the search left the arrow as it was under it");
+});
+
+test("...and Hide read, which does not draw a read row at all, leaves the message directly above", async () => {
+  const page = newPage();
+  page.threadingSupported = true;
+  page.dealtWith.add("302");
+  await signIn(page);
+  await showDiscord(page, [
+    message({ id: "301", content: "is the runner wedged?" }),
+    message({ id: "302", content: "already dealt with" }),
+    message({ id: "303", content: "restarted it", reply_to: "301", ...ALICE }),
+  ]);
+  assert.equal(arrowStyle(rowWithId(page, "303")), "disconnected");
+  await page.el("todo-filter").click();
+  await page.settle();
+  assert.deepStrictEqual(shownIds(page), ["301", "303"]);
+  assert.equal(arrowStyle(rowWithId(page, "303")), "adjacent", "Hide read left the arrow pointing past an empty place");
+});
+
+test("...and an older page arriving above can bring in the message a first row answers", async () => {
+  const page = newPage();
+  await signIn(page);
+  const all = pagedChannel(page, { steps: 2, size: 3 });
+  all[3].reply_to = all[2].id;
+  await showDiscord(page, []);
+  assert.equal(row(page, 0).getAttribute("data-id"), all[3].id, "the reply is not the first row loaded");
+  assert.equal(arrowStyle(row(page, 0)), "disconnected", "nothing is above the first row");
+  await page.el("load-older").click();
+  for (let i = 0; i < 4; i += 1) await page.settle();
+  assert.equal(rowWithId(page, all[2].id), row(page, 2), "the older page did not land above");
+  assert.equal(arrowStyle(rowWithId(page, all[3].id)), "adjacent", "the arrow was not decided again");
+});
+
+test("WHERE THE ADJACENT ARROW MEETS THE ROW ABOVE is measured: its foot, moved under its edge, or its side", async () => {
+  // The fixture lays nothing out sideways, so the boxes are placed by hand: the lefts a phone gives
+  // the agent's full-width tile, the owner's inset row, a desk's owner row far right of the gutter,
+  // and an edge too close to the box for either. The rem here is the fixture's 16px.
+  const page = newPage(new Map(), SCRIPT, (p) => p.enableResizeObserver());
+  await signIn(page);
+  await showDiscord(page, [
+    message({ id: "1000000000000000001", content: "is the runner wedged?" }),
+    message({ id: "1000000000000000002", content: "restarted it", reply_to: "1000000000000000001", ...ALICE }),
+  ]);
+  const list = page.el("discord-log");
+  list.clientWidth = 380;
+  const place = (li, left) => {
+    li.getBoundingClientRect = () => ({ ...FakeElement.prototype.getBoundingClientRect.call(li), left, right: left + 300 });
+  };
+  const reply = row(page, 1);
+  const arrow = replyArrowOf(reply);
+  const measured = (parentLeft) => {
+    place(row(page, 0), parentLeft);
+    place(reply, 44);
+    page.resized(list);
+    page.expireTimers(0);
+    return [arrow.getAttribute("data-reply-reach"), arrow.style.getPropertyValue("--reply-shift") || null,
+      arrow.style.getPropertyValue("--reply-run") || null];
+  };
+  assert.deepStrictEqual(measured(-12), ["below", "0.00px", null], "a row spanning the gutter is not met at its foot");
+  assert.deepStrictEqual(measured(22), ["below", "6.80px", null],
+    "an inset row's foot is met on its rounded corner rather than under its edge");
+  assert.deepStrictEqual(measured(96), ["side", null, "71.20px"], "a row starting past the box is met at nothing");
+  assert.deepStrictEqual(measured(36), ["below", "8.80px", null], "an edge too close for a turn is not met as near as the shaft goes");
+});
+
+test("both arrows are drawn as the issue asks, in the stylesheet", () => {
+  // DISCONNECTED: out of the middle of the box's side, then forty-five degrees.
+  assert.match(cssBlock("#discord-log .reply-jump"), /top:\s*calc\(50% - var\(--reply-gutter\) \/ 2\)/,
+    "the arrow to a message elsewhere does not leave the middle of the box's side");
+  assert.match(cssBlock('#discord-log .reply-jump[data-reply-style="disconnected"] .reply-jump-mark::before'),
+    /transform:\s*rotate\(45deg\)/, "the run is not at forty-five degrees");
+  // ADJACENT: at the top, risen by exactly the gap between two rows — the margin under a row and this
+  // row's own top border, both stated in the shared sheet.
+  const adjacent = cssBlock('#discord-log .reply-jump[data-reply-style="adjacent"]');
+  assert.match(adjacent, /top:\s*0/);
+  assert.match(adjacent, /--reply-rise:\s*calc\(0\.5rem \+ 1px\)/, "the rise is not the gap between two rows");
+  const rowRule = cssRules(SHARED_CSS, ".messages li").join("\n");
+  assert.match(rowRule, /margin-bottom:\s*0\.5rem/, "the gap the rise crosses has changed under it");
+  assert.match(rowRule, /border:\s*1px solid/, "the border the rise crosses has changed under it");
+  const mark = cssBlock('#discord-log .reply-jump[data-reply-style="adjacent"] .reply-jump-mark');
+  assert.match(mark, /top:\s*calc\(0\.45rem - var\(--reply-rise\)\)/);
+  assert.match(cssBlock('#discord-log .reply-jump[data-reply-style="adjacent"] .reply-jump-mark::after'),
+    /top:\s*-0\.45rem/, "the head's point is not where the shaft's rise ends");
+  // The shaft is where web/voice.js measures it from.
+  const shaft = Number(/^const REPLY_SHAFT_REM = ([\d.]+);$/m.exec(SCRIPT_CODE)?.[1]);
+  assert.match(mark, new RegExp(`width:\\s*calc\\(${String(shaft).replace(".", "\\.")}rem \\+`),
+    "the shaft is drawn somewhere other than where it is measured from");
+  assert.match(cssBlock('#discord-log .reply-jump[data-reply-reach="side"] .reply-jump-mark::after'),
+    new RegExp(`right:\\s*calc\\(${String(shaft).replace(".", "\\.")}rem - var\\(--reply-run, 0px\\)\\)`),
+    "the turn to the row's side does not run as far as measured");
+  // A drawing that reaches past its square never takes a tap meant for the row above.
+  assert.match(cssBlock("#discord-log .reply-jump-mark"), /pointer-events:\s*none/);
+});
+
+/**
+ * `#215 reply-coalesce`. A thread whose replies are scattered among other messages: 601 heads it;
+ * 602 answers it by its reply pointer from directly below, and 603 answers 602; 604 and 606 are the
+ * thread's replies; 607 answers 601 by pointer from far below; 600, 605 and 608 are long and answer
+ * nothing. Gathering 601 moves 602, 604, 606 and 607 under it, in that order.
+ */
+function scatteredThread(count = 2) {
+  const thread = { id: "spaces/A/threads/build", root_message_id: "601", is_root: true, reply_count: count,
+    reply_count_exact: true };
+  const reply = { ...thread, is_root: false };
+  const messages = [
+    message({ id: "597", content: longMessage("filler one") }),
+    message({ id: "598", content: longMessage("filler two") }),
+    message({ id: "599", content: longMessage("filler three") }),
+    message({ id: "600", content: longMessage("before the root") }),
+    message({ id: "601", content: "the nightly build failed", thread }),
+    message({ id: "602", content: "which runner?", reply_to: "601", ...ALICE }),
+    message({ id: "603", content: "runner four", reply_to: "602" }),
+    message({ id: "604", content: "same failure here", thread: reply, ...ALICE }),
+    message({ id: "605", content: longMessage("unrelated") }),
+    message({ id: "606", content: "packaging passed", thread: reply }),
+    message({ id: "607", content: "thanks, closing it", reply_to: "601", ...OWNER }),
+    message({ id: "608", content: longMessage("after") }),
+    message({ id: "609", content: longMessage("after again") }),
+  ];
+  const threads = [{ id: thread.id, root: messages[4], title: "Nightly build", reply_count: count,
+    reply_count_exact: true, updated_at: messages[9].timestamp }];
+  return { messages, threads };
+}
+
+const SCATTERED = ["597", "598", "599", "600", "601", "602", "603", "604", "605", "606", "607", "608", "609"];
+const GATHERED = ["597", "598", "599", "600", "601", "602", "604", "606", "607", "603", "605", "608", "609"];
+
+async function scatteredPage(count = 2) {
+  const page = newPage();
+  const data = scatteredThread(count);
+  page.threadingSupported = true;
+  page.threads = data.threads;
+  await signIn(page);
+  await showDiscord(page, data.messages);
+  assert.equal(page.el("thread-select").value, "flat", "the channel did not open in All");
+  assert.deepStrictEqual(shownIds(page), SCATTERED);
+  return page;
+}
+
+/** The N replies chip on a row. */
+const gatherChip = (page, id) => threadButton(rowWithId(page, id));
+
+/** Where each row sits in a stack: "parent", "first", "middle", "last", "only", or null. */
+const stackPlaces = (page) => page.el("discord-log").children
+  .map((li) => [li.getAttribute("data-id"), li.getAttribute("data-coalesce")]).filter(([, place]) => place);
+
+const gutterChild = (li, name) => li.children.find((node) => node.hasClass(name));
+
+/** Two taps on a reply's arrow, inside the window that makes them one double tap. */
+async function doubleTapArrow(page, li) {
+  const arrow = replyArrowOf(li);
+  assert.ok(arrow, "the row has no arrow to tap");
+  for (let i = 0; i < 2; i += 1) {
+    let stopped = false;
+    const event = { target: arrow, stopPropagation: () => { stopped = true; } };
+    await arrow.dispatch("click", event);
+    if (!stopped) await li.dispatch("click", event);
+  }
+  for (let i = 0; i < 4 * REPLY_JUMP_PAGES; i += 1) await page.settle();
+}
+
+/** Put the row holding `id` `offset` pixels down the list's viewport, and say where it is. */
+function parkRow(page, id, offset = 120) {
+  const area = page.el("scroll-area");
+  area.scrollTop += rowWithId(page, id).getBoundingClientRect().top - offset;
+  return rowWithId(page, id).getBoundingClientRect().top;
+}
+
+test("THE THREAD CHIP reads Thread(N), and in Main is on the roots, the way into a thread", async () => {
+  const page = await threadPage();
+  assert.equal(threadBadge(rowWithId(page, "201")).textContent, "Thread(1)");
+  assert.equal(threadBadge(rowWithId(page, "202")).textContent, "Thread(1)");
+  assert.equal(threadBadge(rowWithId(page, "201")).getAttribute("aria-label"), "Open this thread, 1 reply");
+  await pickThread(page, "main");
+  assert.deepStrictEqual(shownIds(page), ["200", "201", "203"]);
+  assert.equal(threadBadge(rowWithId(page, "200")), undefined, "a message in no thread offers one");
+  assert.equal(threadBadge(rowWithId(page, "201")).textContent, "Thread(1)",
+    "Main's root no longer offers the way into its thread now that N replies gathers");
+  // The picker names threads by their facts and name, never "Thread(N)": the heading matches it.
+  assert.ok(threadOptions(page).every(([, label]) => !/Thread\(/.test(label)), "the picker took up the chip's form");
+  await threadBadge(rowWithId(page, "201")).click();
+  await page.settle();
+  assert.equal(page.el("thread-heading").hidden, false, "the chip in Main did not open the thread");
+});
+
+test("N REPLIES NO LONGER OPENS THE THREAD: it gathers the replies under the message, in All", async () => {
+  const page = await scatteredPage();
+  const chip = gatherChip(page, "601");
+  assert.equal(chip.textContent, "2 replies");
+  assert.equal(chip.getAttribute("aria-pressed"), "false");
+  const threadReads = () => page.timelineCalls.filter((path) => /view=thread/.test(path)).length;
+  const reads = threadReads();
+  await chip.click();
+  await page.settle();
+  assert.equal(page.el("thread-heading").hidden, true, "N replies opened the thread view");
+  assert.equal(page.el("thread-select").value, "flat");
+  assert.equal(threadReads(), reads, "N replies read the thread");
+  // EVERY reply to it, by pointer or by thread, under it in time order; nothing lost; nothing else moved.
+  assert.deepStrictEqual(shownIds(page), GATHERED);
+  assert.deepStrictEqual([...shownIds(page)].sort(), [...SCATTERED].sort(), "gathering lost or added a message");
+  assert.deepStrictEqual(stackPlaces(page),
+    [["601", "parent"], ["602", "first"], ["604", "middle"], ["606", "middle"], ["607", "last"]]);
+  assert.equal(gatherChip(page, "601").getAttribute("aria-pressed"), "true", "the chip does not say it gathered them");
+  assert.equal(statusText(page), "Gathered 4 replies under it.");
+  assert.deepEqual(page.dismissCalls, [], "gathering marked something read");
+});
+
+test("THE BRIDGE: each gathered reply has its part of it, the first the X, and none an arrow drawn", async () => {
+  const page = await scatteredPage();
+  await gatherChip(page, "601").click();
+  await page.settle();
+  for (const id of ["602", "604", "606", "607"]) {
+    const li = rowWithId(page, id);
+    assert.ok(gutterChild(li, "reply-bridge"), `${id} has no part of the bridge`);
+    assert.equal(gutterChild(li, "reply-bridge").getAttribute("aria-hidden"), "true");
+    // The stack hangs one gutter in from the parent, which is the agent's tile.
+    assert.equal(li.getAttribute("data-stack-under"), "coder");
+  }
+  const x = gutterChild(rowWithId(page, "602"), "reply-ungather");
+  assert.ok(x, "there is no way to put the replies back");
+  assert.equal(x.tagName, "button");
+  assert.equal(x.getAttribute("aria-label"), "Show replies in time order");
+  assert.equal(x.text(), "", "the X is a typed glyph");
+  assert.ok(["604", "606", "607"].every((id) => !gutterChild(rowWithId(page, id), "reply-ungather")), "more than one X");
+  assert.ok(["601", "603", "605"].every((id) => !gutterChild(rowWithId(page, id), "reply-bridge")),
+    "a row outside the stack has a part of the bridge");
+  // A gathered reply's arrow is not drawn — the bridge stands in for it — and 603, whose message is
+  // no longer directly above it, draws the other arrow.
+  assert.match(cssBlock("#discord-log li.discord-message[data-stack-under] > .reply-jump"), /display:\s*none/);
+  assert.equal(arrowStyle(rowWithId(page, "603")), "disconnected", "603 still says it answers the row above");
+  // The stylesheet's half: the X a touch target square, the spine reaching the row above, the last
+  // part ending in its own line, and an inset per shape of parent, on a desk as well.
+  const square = cssBlock("#discord-log .reply-ungather");
+  assert.match(square, /width:\s*var\(--reply-gutter\)/);
+  assert.match(square, /height:\s*var\(--reply-gutter\)/);
+  assert.match(cssBlock("#discord-log .reply-bridge"), /top:\s*calc\(-1 \* var\(--reply-rise\)\)/);
+  assert.match(cssBlock('#discord-log li.discord-message[data-coalesce="last"] > .reply-bridge'), /border-bottom:/);
+  for (const shape of ["coder", "me", "third", "reply", "me-reply"]) {
+    const selector = `#discord-log li.discord-message[data-stack-under="${shape}"][data-who]`;
+    assert.match(cssBlock(selector), /margin-left:/, `no inset for a stack under ${shape}`);
+    assert.match(cssBlockIn("(min-width: 900px) and (pointer: fine)", selector), /margin-left:/,
+      `no desk inset for a stack under ${shape}`);
+  }
+});
+
+test("THE PARENT DOES NOT MOVE: gathering, and putting back, keep it where it was on the screen", async () => {
+  const page = await scatteredPage();
+  const area = page.el("scroll-area");
+  const top = parkRow(page, "601");
+  assert.ok(area.scrollTop > 0, "the list does not scroll, so this proves nothing");
+  await gatherChip(page, "601").click();
+  await page.settle();
+  assert.equal(rowWithId(page, "601").getBoundingClientRect().top, top, "gathering moved the parent");
+  await gutterChild(rowWithId(page, "602"), "reply-ungather").dispatch("click", { stopPropagation() {} });
+  assert.deepStrictEqual(shownIds(page), SCATTERED, "the X did not put the replies back in time order");
+  assert.deepStrictEqual(stackPlaces(page), [], "the stack outlived the X");
+  assert.ok(page.el("discord-log").children.every((li) => !gutterChild(li, "reply-bridge")), "a bridge outlived the X");
+  assert.equal(rowWithId(page, "601").getBoundingClientRect().top, top, "putting them back moved the parent");
+  assert.equal(statusText(page), "Replies back in time order.");
+  assert.equal(gatherChip(page, "601").getAttribute("aria-pressed"), "false");
+});
+
+test("...and the chip, pressed, puts them back as the X does", async () => {
+  const page = await scatteredPage();
+  await gatherChip(page, "601").click();
+  await page.settle();
+  await gatherChip(page, "601").click();
+  await page.settle();
+  assert.deepStrictEqual(shownIds(page), SCATTERED, "a second tap on the chip did nothing");
+});
+
+test("FROM MAIN, the chip opens All and gathers there, with the parent where it was in Main", async () => {
+  const page = await scatteredPage();
+  await pickThread(page, "main");
+  assert.ok(!shownIds(page).includes("604"), "Main shows the thread's replies, so this proves nothing");
+  const top = parkRow(page, "601", 90);
+  await gatherChip(page, "601").click();
+  for (let i = 0; i < 4; i += 1) await page.settle();
+  assert.equal(page.el("thread-select").value, "flat", "the chip did not open All");
+  assert.deepStrictEqual(shownIds(page), GATHERED);
+  assert.equal(rowWithId(page, "601").getBoundingClientRect().top, top, "the parent jumped when All opened");
+});
+
+test("TWO TAPS ON A REPLY'S ARROW gather the replies of what it answers, the tapped reply kept in place", async () => {
+  const page = await scatteredPage();
+  const area = page.el("scroll-area");
+  const top = parkRow(page, "607", 260);
+  const before = area.scrollTop;
+  await doubleTapArrow(page, rowWithId(page, "607"));
+  assert.equal(page.expireTimers(REPLY_DOUBLE_TAP_MS), 0, "the first tap's jump is still waiting to go");
+  assert.deepStrictEqual(shownIds(page), GATHERED, "two taps did not gather the replies");
+  assert.ok(page.el("discord-log").children.every((li) => li.getAttribute("data-landed") !== "true"),
+    "the first of two taps jumped away");
+  assert.ok(area.scrollTop < before, "the reply moved up and the list did not follow it, so this proves nothing");
+  assert.equal(rowWithId(page, "607").getBoundingClientRect().top, top, "the tapped reply did not stay where it was");
+});
+
+test("...and ONE tap still jumps, once the window for a second has passed, and not before", async () => {
+  const page = await scatteredPage();
+  const reply = rowWithId(page, "607");
+  const arrow = replyArrowOf(reply);
+  await arrow.dispatch("click", { target: arrow, stopPropagation() {} });
+  await page.settle();
+  assert.equal(rowWithId(page, "601").getAttribute("data-landed"), null, "the tap jumped before a second could come");
+  assert.equal(page.expireTimers(REPLY_DOUBLE_TAP_MS), 1);
+  await page.settle();
+  assert.equal(rowWithId(page, "601").getAttribute("data-landed"), "true", "the single tap never jumped");
+  assert.deepStrictEqual(shownIds(page), SCATTERED, "a single tap gathered");
+});
+
+test("A PROVIDER WITHOUT THREADS gathers by the reply pointer, from two taps on an arrow", async () => {
+  const page = newPage();
+  await signIn(page);
+  await showDiscord(page, [
+    message({ id: "1000000000000000001", content: "is the runner wedged?" }),
+    message({ id: "1000000000000000002", content: "the weather is nice" }),
+    message({ id: "1000000000000000003", content: "restarted it", reply_to: "1000000000000000001", ...ALICE }),
+    message({ id: "1000000000000000004", content: "lunch?" }),
+    message({ id: "1000000000000000005", content: "and the queue drains", reply_to: "1000000000000000001", ...OWNER }),
+  ]);
+  await doubleTapArrow(page, rowWithId(page, "1000000000000000005"));
+  assert.deepStrictEqual(shownIds(page), ["1000000000000000001", "1000000000000000003", "1000000000000000005",
+    "1000000000000000002", "1000000000000000004"]);
+  // A message arriving live that answers it joins the stack; one that does not stays at the foot.
+  const stream = page.stream();
+  await deliver(page, stream, sseMessage(message({ id: "1000000000000000006", content: "one more", reply_to: "1000000000000000001" })));
+  await deliver(page, stream, sseMessage(message({ id: "1000000000000000007", content: "unrelated" })));
+  assert.deepStrictEqual(shownIds(page), ["1000000000000000001", "1000000000000000003", "1000000000000000005",
+    "1000000000000000006", "1000000000000000002", "1000000000000000004", "1000000000000000007"],
+  "a live reply did not join the stack");
+  // ...and what a reload draws, saved meanwhile, is in time order: a reload draws nothing gathered.
+  const saved = savedScopes(page)[scopeKey(CHANNEL.id)].messages.map((m) => m.id);
+  assert.deepStrictEqual(saved, [...saved].sort(), "the saved snapshot is in the gathered order");
+});
+
+test("GATHERED REPLIES OUTLIVE A REFRESH and a live reply joins them; a change of view or channel puts them back", async () => {
+  const page = await scatteredPage();
+  await gatherChip(page, "601").click();
+  await page.settle();
+  // A poll re-reads All and draws it in time order; it is drawn gathered.
+  page.expireTimers(DISCORD_POLL_MS);
+  for (let i = 0; i < 4; i += 1) await page.settle();
+  assert.deepStrictEqual(shownIds(page), GATHERED, "a refresh scattered the replies");
+  // A live reply in the thread joins the stack, at its end.
+  const late = message({ id: "610", content: "and green again", thread: { id: "spaces/A/threads/build",
+    root_message_id: "601", is_root: false, reply_count: 2, reply_count_exact: true } });
+  page.messages = [...page.messages, late];
+  page.stream().push(sseMessage(late));
+  for (let i = 0; i < 4; i += 1) await page.settle();
+  assert.deepStrictEqual(shownIds(page), [...GATHERED.slice(0, 9), "610", ...GATHERED.slice(9)],
+    "a live reply to the parent did not join the stack");
+  // Main and back: the replies are back in time order, in Main and in All.
+  await pickThread(page, "main");
+  await pickThread(page, "flat");
+  assert.deepStrictEqual(stackPlaces(page), [], "a change of view kept the stack");
+  assert.deepStrictEqual(shownIds(page), [...SCATTERED, "610"], "All came back in the gathered order");
+});
+
+test("A FILTER THAT TAKES ROWS AWAY puts the replies back; Hide read leaves the stack its unread replies", async () => {
+  const page = await scatteredPage();
+  await gatherChip(page, "601").click();
+  await page.settle();
+  await search(page, "runner");
+  assert.deepStrictEqual(stackPlaces(page), [], "a search left a bridge to rows it hides");
+  assert.deepStrictEqual(shownIds(page), SCATTERED);
+  await page.el("search-toggle").click();
+  // Asking to gather with the search open closes it, as the jump does for a row the search hides.
+  await search(page, "runner");
+  await gatherChip(page, "601").click();
+  await page.settle();
+  assert.equal(page.el("search-field").hidden, true, "the search was left over the replies it hides");
+  assert.deepStrictEqual(shownIds(page), GATHERED);
+  // Hide read: 604 is read, and the stack is what is left of it.
+  page.dealtWith.add("604");
+  await page.el("todo-filter").click();
+  await page.settle();
+  page.expireTimers(DISCORD_POLL_MS);
+  for (let i = 0; i < 4; i += 1) await page.settle();
+  assert.deepStrictEqual(shownIds(page), GATHERED.filter((id) => id !== "604"), "Hide read did not compose with the stack");
+  assert.deepStrictEqual(stackPlaces(page).map(([id]) => id), ["601", "602", "606", "607"]);
+});
+
+test("WHAT IS NOT GATHERED IS SAID: a thread's count above what is loaded, and Hide read", async () => {
+  const page = await scatteredPage(3);
+  await gatherChip(page, "601").click();
+  await page.settle();
+  assert.equal(statusText(page), "Gathered 4 replies; 1 not loaded.");
+  const hidden = await scatteredPage();
+  hidden.dealtWith.add("604");
+  await hidden.el("todo-filter").click();
+  hidden.expireTimers(DISCORD_POLL_MS);
+  for (let i = 0; i < 4; i += 1) await hidden.settle();
+  assert.ok(!shownIds(hidden).includes("604"), "Hide read is not hiding the read reply");
+  await gatherChip(hidden, "601").click();
+  await hidden.settle();
+  assert.equal(statusText(hidden), "Gathered 3; Hide read hides 1 more.");
+});
+
+test("TWO STACKS NEVER: gathering another message's replies puts the first's back", async () => {
+  const page = await scatteredPage();
+  await gatherChip(page, "601").click();
+  await page.settle();
+  // 603 answers 602, which is in the stack: its double tap gathers 602's replies instead.
+  await doubleTapArrow(page, rowWithId(page, "603"));
+  assert.deepStrictEqual(shownIds(page), SCATTERED, "601's replies were left gathered as well");
+  assert.deepStrictEqual(stackPlaces(page), [["602", "parent"], ["603", "only"]]);
+  assert.equal(gatherChip(page, "601").getAttribute("aria-pressed"), "false");
+});
+
+test("COMBINING inside a stack: two quick replies from one author are one gathered row", async () => {
+  const page = newPage();
+  await signIn(page);
+  const quick = (id, seconds, overrides) => message({ id, timestamp: `2026-08-19T05:00:${seconds}.000Z`, ...overrides });
+  await showDiscord(page, [
+    quick("1000000000000000001", "00", { content: "is the runner wedged?" }),
+    quick("1000000000000000002", "30", { content: "lunch?", ...ALICE }),
+    quick("1000000000000000003", "40", { content: "restarted it", reply_to: "1000000000000000001", ...OWNER }),
+    quick("1000000000000000004", "41", { content: "and the queue drains", reply_to: "1000000000000000001", ...OWNER }),
+  ]);
+  assert.equal(page.el("discord-log").children.length, 3, "the owner's two quick replies were not combined");
+  await doubleTapArrow(page, rowWithId(page, "1000000000000000003"));
+  assert.deepStrictEqual(page.el("discord-log").children.map((li) => li.getAttribute("data-ids")),
+    ["1000000000000000001", "1000000000000000003 1000000000000000004", "1000000000000000002"]);
+  assert.deepStrictEqual(stackPlaces(page).map(([, place]) => place), ["parent", "only"]);
 });
 
 /**
@@ -21057,7 +21554,7 @@ test("a rightward swipe leaves a thread and restores Main without archiving a me
   const page = await threadPage("main");
   page.el("scroll-area").clientHeight = 40;
   page.el("scroll-area").scrollTop = 20;
-  await threadButton(page.el("discord-log").children[1]).click();
+  await threadBadge(page.el("discord-log").children[1]).click();
   const row = page.el("discord-log").children[0];
   const point = (x) => ({ pointerType: "touch", clientX: x, clientY: 30 });
   await row.dispatch("pointerdown", point(10));
@@ -21085,7 +21582,7 @@ test("All marks every threaded message with a stable colored Thread button and n
   assert.equal(rows.length, 5, "messages crossed a thread boundary while combining");
   assert.equal(threadBadge(rows[0]), undefined);
   // Each tag carries its thread's reply count after the word, so two tags read differently.
-  for (const row of rows.slice(1)) assert.match(threadBadge(row).textContent, /^Thread \d+$/);
+  for (const row of rows.slice(1)) assert.match(threadBadge(row).textContent, /^Thread\(\d+\)$/);
   const color = (row) => threadBadge(row).style.getPropertyValue("--thread-hue");
   assert.equal(color(rows[1]), color(rows[2]));
   assert.notEqual(color(rows[1]), color(rows[3]));
@@ -21129,7 +21626,7 @@ test("read-only channels keep drafts but disable main and thread sends, includin
   await page.el("channel-compose-text").dispatch("keydown", { key: "Enter", preventDefault() {} });
   await page.settle();
   assert.equal(page.repliesPosted.length, 0);
-  await threadButton(page.el("discord-log").children[1]).click();
+  await threadBadge(page.el("discord-log").children[1]).click();
   assert.equal(page.el("channel-send").disabled, true);
   assert.equal(page.el("channel-compose-text").disabled, false,
     "the thread draft editor was disabled with its Send button");
@@ -21141,7 +21638,7 @@ test("read-only channels keep drafts but disable main and thread sends, includin
   assert.equal(page.repliesPosted.length, 0);
   await page.el("thread-back").click();
   assert.equal(page.el("channel-compose-text").value, "keep this main draft");
-  await threadButton(page.el("discord-log").children[1]).click();
+  await threadBadge(page.el("discord-log").children[1]).click();
   assert.equal(page.el("channel-compose-text").value, "keep this thread draft");
 });
 
@@ -21154,7 +21651,7 @@ test("removing the selected channel cannot carry its thread or composer draft in
   page.threads = data.threads;
   await signIn(page);
   await showDiscord(page, data.messages);
-  await threadButton(page.el("discord-log").children[1]).click();
+  await threadBadge(page.el("discord-log").children[1]).click();
   page.el("channel-compose-text").value = "belongs only in the original thread";
   await page.el("channel-compose-text").dispatch("input");
   await page.el("open-settings").click();
@@ -21178,7 +21675,7 @@ test("main drafts and a thread's unsent remainder survive navigation and reload 
   const page = await threadPage();
   page.el("channel-compose-text").value = "main draft";
   await page.el("channel-compose-text").dispatch("input");
-  await threadButton(page.el("discord-log").children[1]).click();
+  await threadBadge(page.el("discord-log").children[1]).click();
   assert.equal(page.el("channel-compose-text").value, "");
   page.el("channel-compose-text").value = "thread draft";
   await page.el("channel-compose-text").dispatch("input");
@@ -21198,7 +21695,7 @@ test("main drafts and a thread's unsent remainder survive navigation and reload 
   await signIn(again);
   await reopenedChannel(again);
   assert.equal(again.el("channel-compose-text").value, "main draft");
-  await threadButton(again.el("discord-log").children[1]).click();
+  await threadBadge(again.el("discord-log").children[1]).click();
   assert.equal(again.el("channel-compose-text").value, "");
   assert.match(outgoingRows(again)[0].text(), /unsent tail/);
   assert.equal(again.repliesPosted.length, 0, "opening a saved remainder posted it without consent");
@@ -21209,7 +21706,7 @@ test("a send completing after leaving a thread cannot clear or paint the main co
   const page = await threadPage("main");
   page.el("channel-compose-text").value = "keep main draft";
   await page.el("channel-compose-text").dispatch("input");
-  await threadButton(page.el("discord-log").children[1]).click();
+  await threadBadge(page.el("discord-log").children[1]).click();
   page.el("channel-compose-text").value = "thread send";
   let finish;
   page.replyResponse = () => new Promise((resolve) => { finish = resolve; });
@@ -21236,7 +21733,7 @@ test("thread paging encodes opaque cursors and ignores a response after context 
     }));
     return standard(path);
   };
-  await threadButton(page.el("discord-log").children[1]).click();
+  await threadBadge(page.el("discord-log").children[1]).click();
   const pending = page.el("load-older").click();
   await page.settle();
   assert.equal(new URL(page.timelineCalls.at(-1), "http://fixture.test").searchParams.get("before"), "opaque cursor /&?");
@@ -21249,7 +21746,7 @@ test("thread paging encodes opaque cursors and ignores a response after context 
 
 test("thread replies retain thread context on the existing message Reply control", async () => {
   const page = await threadPage();
-  await threadButton(page.el("discord-log").children[1]).click();
+  await threadBadge(page.el("discord-log").children[1]).click();
   const button = page.el("discord-log").children[1].descendants().find((node) => node.className === "reply-button");
   await button.click();
   page.el("reply-text").value = "specific answer";
@@ -21259,7 +21756,7 @@ test("thread replies retain thread context on the existing message Reply control
 
 test("live replies refresh only the active thread instead of leaking across contexts", async () => {
   const page = await threadPage();
-  await threadButton(page.el("discord-log").children[1]).click();
+  await threadBadge(page.el("discord-log").children[1]).click();
   const arriving = message({ id: "205", content: "other discussion only", thread: { ...page.messages[3].thread, is_root: false } });
   page.messages.push(arriving);
   const before = page.timelineCalls.length;
@@ -21300,7 +21797,7 @@ test("prepending older thread messages preserves the visible message and viewpor
     thread: page.threads[0], has_threads: true,
     has_more: !path.includes("before="), next_before: path.includes("before=") ? null : "step:one",
   }));
-  await threadButton(page.el("discord-log").children[1]).click();
+  await threadBadge(page.el("discord-log").children[1]).click();
   const held = page.el("discord-log").children[0];
   const area = page.el("scroll-area");
   area.clientHeight = 30;
@@ -21367,7 +21864,7 @@ test("an expired older-thread cursor starts a fresh snapshot and makes older pag
       next_before: before ? null : snapshots === 1 ? "expired:cursor" : "fresh:cursor",
     }));
   };
-  await threadButton(page.el("discord-log").children[1]).click();
+  await threadBadge(page.el("discord-log").children[1]).click();
   await page.el("load-older").click();
   assert.equal(snapshots, 2, "the expired snapshot was never replaced");
   assert.match(page.el("status").textContent, /snapshot expired.*Refreshed/);
@@ -21391,7 +21888,7 @@ test("background polling keeps walked thread history but an explicit refresh rep
       next_before: before ? "walked:cursor" : `fresh:${snapshots}`,
     }));
   };
-  await threadButton(page.el("discord-log").children[1]).click();
+  await threadBadge(page.el("discord-log").children[1]).click();
   await page.el("load-older").click();
   assert.equal(page.el("discord-log").children.length, 2);
   page.expireTimers(DISCORD_POLL_MS);
@@ -21571,7 +22068,7 @@ test("retry retains its original channel, thread and reply target after navigati
   // From Main, picked over the default All (`#189 restore-ui-state`): All would show the thread's
   // unsent reply after leaving the thread, and Main is the view that must not.
   const page = await threadPage("main");
-  await threadButton(page.el("discord-log").children[1]).click();
+  await threadBadge(page.el("discord-log").children[1]).click();
   await replyButton(page.el("discord-log").children[1]).click();
   page.replyResponse = errorResponse(403, "refused", "permission changed");
   await page.el("reply-text").setValue("answer only inside this thread");
@@ -21586,7 +22083,7 @@ test("retry retains its original channel, thread and reply target after navigati
   });
   await signIn(again);
   await reopenedChannel(again);
-  await threadButton(again.el("discord-log").children[1]).click();
+  await threadBadge(again.el("discord-log").children[1]).click();
   await outgoingRetry(outgoingRows(again)[0]).click();
   await again.settle();
   assert.equal(again.repliesPosted[0].path, original.path);
@@ -24563,7 +25060,7 @@ test("a channel with child threads keeps a root-only Main, even after visiting a
   assert.ok(threadButton(page.el("discord-log").children[1]), "a thread root lost its replies button");
 
   // A thread page names its thread too: that must not make the channel look scoped to it.
-  await threadButton(page.el("discord-log").children[1]).click();
+  await threadBadge(page.el("discord-log").children[1]).click();
   await page.settle();
   assert.deepStrictEqual(shownIds(page), ["201", "202"]);
   await page.el("thread-back").click();

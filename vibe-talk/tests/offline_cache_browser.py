@@ -132,6 +132,21 @@ summary's bar, which is the left side and wider than the right. On a phone a til
 edge of the screen to the other, a reply's from its gutter to the right edge; on a desk it is inside
 the reading column. Nothing on the page scrolls sideways, at 360px as at the other sizes.
 
+Then, in a fourth fresh profile at each size and in the dark scheme, a channel whose replies sit both
+directly under what they answer and far from it, around a thread whose replies are scattered among
+other messages (`#214 reply-arrow`, `#215 reply-coalesce`). A reply directly under the message it
+answers draws the arrow whose head meets that row — on its foot within 1px, on the flat past its
+rounded corner, or, where that row starts at or beyond the reply's box, on its left side within 1px —
+found from the pixels, where the head's width runs out; a reply to a message elsewhere draws the arrow
+that leaves the middle of its box's left side, within 1px, and runs at 45 degrees. Both at the default
+type size and at 150%. A real tap on the root's N replies gathers its replies under it, in time order,
+with the root where it was on the screen within 1px; one bridge in the accent comes out of the flat of
+the root's foot, each reply's part of it starting at the foot of the row above and its line reaching
+the reply's left edge, all drawn, and still so with a reply in the stack opened by a tap on its text and
+at 150% type; the X is a 44px target on the screen, left of the spine, that puts the replies back in time
+order with the root unmoved; and two real taps on the arrow of a reply far below the root gather them
+again, with that reply where it was on the screen and no jump taken first.
+
 First of all, the dock (`#218 desktop-dock`), in the dark theme, at a 1280x800 desk, a 1600x1000 one
 and the two phones, on the call view — idle, live, and after a call with its note under Talk — and on
 the channel, under a thirty-character name, with a thread open beside it, and under a short name. On a
@@ -372,6 +387,56 @@ class ReplyApi(FakeApi):
 
     def timeline(self, query: dict[str, list[str]]) -> Json:
         return {**super().timeline(query), "dismissed": [ARCHIVED_REPLY]}
+
+
+# `#214 reply-arrow` and `#215 reply-coalesce`. A thread and the replies around it.
+COALESCE_THREAD: Json = {"id": "spaces/A/threads/build", "root_message_id": "206", "is_root": True,
+                         "reply_count": 3, "reply_count_exact": True}
+COALESCE_FILLER = ("The integration shard was retried twice overnight and the artifact upload waited on the "
+                   "cache to warm before it went through. ") * 3
+
+
+class CoalesceApi(FakeApi):
+    """`#214 reply-arrow` and `#215 reply-coalesce`: replies directly under what they answer and away
+    from it, from every kind of speaker, and a thread whose replies are scattered among other messages.
+
+    200-205 and 215-218 are the agent's long filler, so the list scrolls both ways. 206 is the agent's
+    thread root; 207, the owner's, answers it from directly below (its arrow meets the root's foot);
+    208, the agent's, answers 207 from directly below (a reply above a reply: the arrow turns to its
+    side); 209, 212 and 214 are the thread's replies, a third party's, the agent's and the owner's;
+    210 is the owner's, and 211, the agent's, answers it from directly below (the owner's row is inset,
+    so on a desk the arrow turns to its side and on a phone it moves under its edge); 213, a third
+    party's, answers the root from far below it. Gathering 206 moves 207, 209, 212, 213 and 214, in
+    that order, under it, and leaves 208 and 211 where they are."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        reply = {**COALESCE_THREAD, "is_root": False}
+        self.messages = [
+            *(said(i, f"Shard {i}. {COALESCE_FILLER}") for i in range(0, 6)),
+            {**said(6, "The nightly build failed at the packaging step."), "thread": COALESCE_THREAD},
+            said(7, "Which runner was it on?", "me", "206"),
+            said(8, "Runner four; its disk filled up.", "coder", "207"),
+            {**said(9, "Same failure on my branch this morning.", "human"), "thread": reply},
+            said(10, "Cleaning the disk on runner four now.", "me"),
+            said(11, f"Disk cleaned; rerunning the job. {COALESCE_FILLER}", "coder", "210"),
+            {**said(12, f"Packaging passed on the rerun. {COALESCE_FILLER}", "coder"), "thread": reply},
+            said(13, "Thanks, closing the incident.", "human", "206"),
+            {**said(14, "Confirmed green here too.", "me"), "thread": reply},
+            *(said(i, f"Shard {i}. {COALESCE_FILLER}") for i in range(15, 19)),
+        ]
+        self.threads = [{"id": COALESCE_THREAD["id"], "root": self.messages[6], "title": "Nightly build",
+                         "reply_count": 3, "reply_count_exact": True,
+                         "updated_at": self.messages[14]["timestamp"]}]
+
+    def client_config(self, scope: str) -> Json:
+        return {**super().client_config(scope), "owner_author_id": OWNER_ID}
+
+
+# The CoalesceApi channel in time order, gathered under its root, and the stack itself.
+COALESCE_SCATTERED = [str(200 + i) for i in range(19)]
+GATHERED_STACK = ["207", "209", "212", "213", "214"]
+COALESCE_GATHERED = [*COALESCE_SCATTERED[:7], *GATHERED_STACK, "208", "210", "211", *COALESCE_SCATTERED[15:]]
 
 
 # `#211 link-filter`. Where the Links walk's links go. Answered by the browser context itself, so a
@@ -987,7 +1052,7 @@ REPLY_ARROW_JS = """async (id) => {""" + FLOAT_HELPERS_JS + """
 }"""
 
 # What an arrow looks like on the screen, from a screenshot of its square (`png`, base64): the page
-# behind it, from the square's empty lower-left corner, and the mark, as the pixel inside the mark's
+# behind it, from the square's empty upper-left corner, and the mark, as the pixel inside the mark's
 # box furthest in contrast from that, with the contrast between the two. From PIXELS, because a
 # computed colour says what colour the arrow is and nothing about the opacity and filter of the row
 # it is inside: that is how a mark drawn at 2:1, grey, on every row that had faded passed as the
@@ -1016,7 +1081,9 @@ ARROW_INK_JS = """async ({png, square, mark}) => {
     };
     const scale = width / square.width;
     const inset = Math.round(2 * scale);
-    const ground = pixel(inset, height - 1 - inset);
+    // The UPPER left: since `#214 reply-arrow` the row below may answer this one from directly under
+    // it, and its arrow then turns into this row's side near its foot, through the lower left.
+    const ground = pixel(inset, inset);
     const [left, right] = [Math.floor(mark.x * scale), Math.ceil((mark.x + mark.width) * scale)];
     const [top, bottom] = [Math.floor(mark.y * scale), Math.ceil((mark.y + mark.height) * scale)];
     let ink = ground;
@@ -1108,6 +1175,233 @@ TILE_JS = """({edge}) => {""" + FLOAT_HELPERS_JS + """
         }
     }
     return {problems, count: rows.length};
+}"""
+
+# `#214 reply-arrow` and `#215 reply-coalesce`. Scroll one row to the middle of the list, away from
+# the floating pill at the top and the chips and status line at the foot, and let it settle. A row
+# taller than half the list has its top put a third of the way down instead, where what is drawn
+# beside its head is.
+CENTRE_ROW_JS = """async (id) => {
+    const row = document.querySelector(`#discord-log > li[data-id="${id}"]`);
+    const area = document.getElementById('scroll-area');
+    const list = area.getBoundingClientRect(), r = row.getBoundingClientRect();
+    area.scrollTop += r.height < list.height / 2
+        ? (r.top + r.bottom) / 2 - (list.top + list.bottom) / 2
+        : r.top - (list.top + list.height / 3);
+    await new Promise((settled) => requestAnimationFrame(() => requestAnimationFrame(settled)));
+}"""
+
+# Each row's id, top, and where it is in a stack, and each arrow's style and reach.
+COALESCE_ROWS_JS = """() => [...document.querySelectorAll('#discord-log > li')].map((row) => {
+    const arrow = row.querySelector(':scope > .reply-jump');
+    return {id: row.getAttribute('data-id'), top: row.getBoundingClientRect().top,
+            place: row.getAttribute('data-coalesce'), style: arrow ? arrow.getAttribute('data-reply-style') : null,
+            reach: arrow ? arrow.getAttribute('data-reply-reach') : null};
+})"""
+
+# Where to put a finger: the centre of a row's N replies chip, arrow or X.
+TARGET_JS = """({id, part}) => {
+    const row = document.querySelector(`#discord-log > li[data-id="${id}"]`);
+    const node = row && row.querySelector(part === 'chip' ? ':scope > .thread-replies'
+        : part === 'x' ? ':scope > .reply-ungather' : part === 'body' ? ':scope > .body' : ':scope > .reply-jump');
+    if (!node) return null;
+    const b = node.getBoundingClientRect();
+    return [b.left + b.width / 2, b.top + Math.min(b.height / 2, 20)];
+}"""
+
+# What is DRAWN, from a screenshot of the viewport (`png`, base64), against the boxes of the rows: one
+# `check` at a time, each returning `problems`, empty when it holds. Pixels, because the heads, the
+# runs and the bridge's lines are borders and pseudo-elements, which have no box of their own to ask.
+#
+#   below:        the adjacent arrow of row `id` ends in a head whose point is on the bottom edge of
+#                 row `parent` — within 1px — and on the flat of it, past its rounded corner;
+#   side:         the adjacent arrow of row `id` turns and its head's point is on the LEFT side of row
+#                 `parent`, within 1px, between its top and its rounded lower corner;
+#   disconnected: the arrow of row `id` leaves the middle of its box's left side, within 1px, and runs
+#                 up and left at 45 degrees — drawn at the 45-degree point, and not level with its
+#                 start nor straight above it — as the run's own transform says;
+#   bridge:       the gathered replies under row `parent` (`stack`, in order) each have a part of the
+#                 bridge from the foot of the row above, the parent's or the reply's before, within 1px;
+#                 the spine is under the parent's flat foot and drawn down the reply `id`; its line
+#                 reaches that reply's left edge and is drawn; the last part ends at its line; the X is
+#                 a 44px square, on the screen, every point of which presses it, its disc left of the
+#                 spine; and no gathered reply draws an arrow.
+COALESCE_LOOK_JS = """async ({png, check, id, parent, stack}) => {""" + FLOAT_HELPERS_JS + """
+    const image = new Image();
+    image.src = `data:image/png;base64,${png}`;
+    await image.decode();
+    const canvas = document.createElement('canvas');
+    canvas.width = image.naturalWidth;
+    canvas.height = image.naturalHeight;
+    const context = canvas.getContext('2d');
+    context.drawImage(image, 0, 0);
+    const {data, width, height} = context.getImageData(0, 0, canvas.width, canvas.height);
+    const scale = width / window.innerWidth;
+    const rem = parseFloat(getComputedStyle(document.documentElement).fontSize);
+    const stroke = 0.1875 * rem;
+    const rgb = (text) => (text.match(/[0-9.]+/g) || []).slice(0, 3).map(Number);
+    const accent = rgb(getComputedStyle(document.querySelector('#discord-log .reply-jump')).color);
+    const pixel = (X, Y) => {
+        if (X < 0 || Y < 0 || X >= width || Y >= height) return null;
+        const i = (Y * width + X) * 4;
+        return [data[i], data[i + 1], data[i + 2]];
+    };
+    const near = (seen) => seen !== null && Math.hypot(seen[0] - accent[0], seen[1] - accent[1], seen[2] - accent[2]) <= 60;
+    const ink = (x, y) => near(pixel(Math.round(x * scale), Math.round(y * scale)));
+    // Every accent pixel in a CSS-pixel rectangle, as CSS coordinates of the device pixels' centres.
+    const inkIn = (left, top, right, bottom) => {
+        const found = [];
+        for (let Y = Math.max(0, Math.floor(top * scale)); Y < Math.min(height, Math.ceil(bottom * scale)); Y += 1) {
+            for (let X = Math.max(0, Math.floor(left * scale)); X < Math.min(width, Math.ceil(right * scale)); X += 1) {
+                if (near(pixel(X, Y))) found.push([(X + 0.5) / scale, (Y + 0.5) / scale]);
+            }
+        }
+        return found;
+    };
+    const rowOf = (one) => document.querySelector(`#discord-log > li[data-id="${one}"]`);
+    const corner = (row) => parseFloat(getComputedStyle(row).borderBottomLeftRadius) || 0;
+    const gutter = 2.75 * rem;
+    const problems = [];
+    const r = rowOf(id) ? box(rowOf(id)) : null;
+    // A head's POINT, to a fraction of a pixel: how much of each line of pixels across the head is
+    // accent — a pixel between the page and the accent counts for as much as it is accent — fitted to
+    // a straight line and followed to where the head is no width at all. The point itself is a pixel
+    // too narrow to be coloured, so the last coloured pixel is up to a pixel and a half short of it.
+    // Only the lines between the point and the head's widest, so the base, which may be cut part way
+    // through a pixel, cannot bend the line: `last` says the point is at the end of `lines`.
+    const pointOf = (lines, last) => {
+        const widest = lines.reduce((best, line, i) => (line[1] > lines[best][1] ? i : best), 0);
+        const fit = (last ? lines.slice(widest) : lines.slice(0, widest + 1))
+            .filter(([, w]) => w >= 3.5 * scale && w <= 13 * scale);
+        if (fit.length < 3) return null;
+        const n = fit.length, mx = fit.reduce((a, [x]) => a + x, 0) / n, mw = fit.reduce((a, [, w]) => a + w, 0) / n;
+        const slope = fit.reduce((a, [x, w]) => a + (x - mx) * (w - mw), 0) / fit.reduce((a, [x]) => a + (x - mx) ** 2, 0);
+        return (mx - mw / slope + 0.5) / scale;
+    };
+    const share = (ground, seen) => {
+        const span = accent.map((v, i) => v - ground[i]);
+        const size = span.reduce((a, v) => a + v * v, 0);
+        return seen === null || size === 0 ? 0
+            : Math.max(0, Math.min(1, seen.reduce((a, v, i) => a + (v - ground[i]) * span[i], 0) / size));
+    };
+    if (check === 'below' || check === 'side') {
+        const p = box(rowOf(parent));
+        const label = `${id} under ${parent}`;
+        if (Math.abs(r.top - p.bottom - 0.5 * rem) > 1) problems.push(`${label}: the rows are ${r.top - p.bottom}px apart`);
+        // The page, in the gap between the two rows at the gutter's left edge, where nothing is drawn.
+        const ground = pixel(Math.round((r.left - gutter + 2) * scale), Math.round((p.bottom + r.top) / 2 * scale));
+        if (check === 'below') {
+            const [left, right] = [Math.floor((r.left - gutter) * scale), Math.ceil((r.left - 1) * scale)];
+            const lines = [];
+            let sx = 0, sw = 0;
+            for (let Y = Math.ceil(p.bottom * scale); Y < Math.floor((p.bottom + 0.55 * rem) * scale); Y += 1) {
+                let w = 0;
+                for (let X = left; X < right; X += 1) {
+                    const a = share(ground, pixel(X, Y));
+                    w += a;
+                    sx += a * X;
+                    sw += a;
+                }
+                lines.push([Y, w]);
+            }
+            const tip = pointOf(lines, false);
+            if (tip === null) return {problems: [`${label}: no head drawn up to the row above`]};
+            const tipX = (sx / sw + 0.5) / scale;
+            if (Math.abs(tip - p.bottom) > 1) problems.push(`${label}: the head's point is at ${tip.toFixed(2)}px and the row above's foot at ${p.bottom.toFixed(2)}px`);
+            if (tipX < p.left + corner(rowOf(parent)) - 1 || tipX > p.right) {
+                problems.push(`${label}: the head's point, at x ${tipX.toFixed(1)}, is not under the flat of the row above (${p.left}..${p.right}, corner ${corner(rowOf(parent))})`);
+            }
+            return {problems, tip: [tipX, tip]};
+        }
+        const [top, bottom] = [Math.floor((p.bottom - 1.6 * rem) * scale), Math.ceil(p.bottom * scale)];
+        const lines = [];
+        let sy = 0, sw = 0;
+        // The head alone: the run along to it, and the turn up into the shaft, are further left.
+        for (let X = Math.floor((p.left - 0.55 * rem) * scale); X < Math.floor(p.left * scale); X += 1) {
+            let h = 0;
+            for (let Y = top; Y < bottom; Y += 1) {
+                const a = share(ground, pixel(X, Y));
+                h += a;
+                sy += a * Y;
+                sw += a;
+            }
+            // Followed rightward, so the line runs the other way: the head narrows as x grows.
+            lines.push([X, h]);
+        }
+        const tipX = pointOf(lines, true);
+        if (tipX === null) return {problems: [`${label}: no head drawn to the row above's side`]};
+        const tipY = (sy / sw + 0.5) / scale;
+        if (Math.abs(tipX - p.left) > 1) problems.push(`${label}: the head's point is at x ${tipX.toFixed(2)} and the row above's side at ${p.left.toFixed(2)}`);
+        if (tipY <= p.top || tipY >= p.bottom - corner(rowOf(parent))) problems.push(`${label}: the head meets the row above at y ${tipY.toFixed(1)}, off its side (${p.top}..${p.bottom})`);
+        return {problems, tip: [tipX, tipY]};
+    }
+    if (check === 'disconnected') {
+        const arrow = rowOf(id).querySelector(':scope > .reply-jump');
+        const mark = box(arrow.querySelector('.reply-jump-mark'));
+        const middle = (r.top + r.bottom) / 2;
+        const label = `${id}'s arrow`;
+        const run = getComputedStyle(arrow.querySelector('.reply-jump-mark'), '::before').transform;
+        const [a, b] = (run.match(/-?[0-9.e]+/g) || []).map(Number);
+        const angle = Math.atan2(b, a) * 180 / Math.PI;
+        if (Math.abs(angle - 45) > 1) problems.push(`${label} runs at ${angle.toFixed(1)} degrees, not 45`);
+        if (Math.abs(mark.right - r.left) > 1.5) problems.push(`${label} starts at x ${mark.right} and its box at ${r.left}`);
+        // The stub's own height on the screen, at a quarter of a rem out from the box: centred on the middle.
+        const stub = inkIn(r.left - 0.3 * rem, middle - rem, r.left - 0.2 * rem, middle + rem).map(([, y]) => y);
+        if (stub.length === 0) problems.push(`${label}: nothing drawn out of the middle of the box's side`);
+        else if (Math.abs((Math.min(...stub) + Math.max(...stub)) / 2 - middle) > 1) {
+            problems.push(`${label} leaves the box at y ${((Math.min(...stub) + Math.max(...stub)) / 2).toFixed(1)}, its middle is ${middle.toFixed(1)}`);
+        }
+        const bend = r.left - 0.5 * rem, d = 0.45 * rem;
+        if (!ink(bend - d, middle - d)) problems.push(`${label} is not drawn at its 45-degree point`);
+        if (ink(bend - d, middle)) problems.push(`${label} runs level with where it starts`);
+        if (ink(bend, middle - d)) problems.push(`${label} runs straight up`);
+        if (r.top >= window.innerHeight || r.bottom <= 0) problems.push(`${label}: the row is not on the screen`);
+        return {problems, angle};
+    }
+    if (check === 'bridge') {
+        const p = box(rowOf(parent));
+        let above = p;
+        stack.forEach((one, i) => {
+            const row = rowOf(one), c = box(row), part = row.querySelector(':scope > .reply-bridge');
+            if (!part) { problems.push(`${one} has no part of the bridge`); return; }
+            const b = box(part);
+            if (Math.abs(b.top - above.bottom) > 1) problems.push(`${one}'s part of the bridge starts at ${b.top}, the row above ends at ${above.bottom}`);
+            if (Math.abs(b.right - c.left) > 1.5) problems.push(`${one}'s line ends at ${b.right}, its box starts at ${c.left}`);
+            const spine = b.left + stroke / 2;
+            if (i === 0 && (spine < p.left + corner(rowOf(parent)) || spine > p.right)) {
+                problems.push(`the spine, at x ${spine.toFixed(1)}, does not come out of the flat of the parent's foot (${p.left}..${p.right})`);
+            }
+            const arrow = row.querySelector(':scope > .reply-jump');
+            if (arrow && getComputedStyle(arrow).display !== 'none') problems.push(`${one} still draws an arrow`);
+            const last = i === stack.length - 1;
+            const level = c.top + 1 + 1.35 * rem - stroke / 2;
+            if (last && Math.abs(b.bottom - (c.top + 1 + 1.35 * rem)) > 1) problems.push(`the last part ends at ${b.bottom}, not at its line`);
+            if (!last && Math.abs(b.bottom - c.bottom) > 1) problems.push(`${one}'s part ends at ${b.bottom}, short of its foot at ${c.bottom}`);
+            if (one === id) {
+                if (!ink(spine, (above.bottom + c.top) / 2)) problems.push(`the spine is not drawn across the gap above ${one}`);
+                if (!ink(spine, (b.top + level) / 2)) problems.push(`the spine is not drawn down to ${one}`);
+                if (!ink((b.left + stroke + c.left) / 2, level)) problems.push(`${one}'s line into its box is not drawn`);
+                if (last && c.bottom - level > 8 && ink(spine, c.bottom - 3)) problems.push('the spine runs on past the last line');
+                if (i === 0) {
+                    const x = row.querySelector(':scope > .reply-ungather');
+                    if (!x) { problems.push('there is no X'); return; }
+                    const s = box(x), disc = box(x.querySelector('.reply-ungather-mark'));
+                    if (s.width < 43.5 || s.height < 43.5) problems.push(`the X's target is ${s.width}x${s.height}px`);
+                    if (s.left < -0.5 || s.right > window.innerWidth + 0.5) problems.push(`the X is off the screen at ${s.left}..${s.right}`);
+                    if (Math.abs(s.right - c.left) > 1.5) problems.push(`the X's square ends at ${s.right}, the reply's box starts at ${c.left}`);
+                    if (disc.right > spine - stroke / 2) problems.push(`the X's disc, to ${disc.right}, is not left of the spine at ${spine}`);
+                    for (const [fx, fy] of [[0.5, 0.5], [0.08, 0.08], [0.92, 0.08], [0.08, 0.92], [0.92, 0.92]]) {
+                        const hit = document.elementFromPoint(s.left + s.width * fx, s.top + s.height * fy);
+                        if (!hit || !x.contains(hit)) problems.push(`a tap at (${fx}, ${fy}) of the X lands on ${name(hit)}.${hit ? hit.className : ''}`);
+                    }
+                    if (x.getAttribute('aria-label') !== 'Show replies in time order') problems.push(`the X is named "${x.getAttribute('aria-label')}"`);
+                }
+            }
+            above = c;
+        });
+        return {problems};
+    }
+    return {problems: [`no check called ${check}`]};
 }"""
 
 # `#206 pin-message` and `#211 link-filter`. The open search bar with its filters in it: Links, then
@@ -1809,6 +2103,14 @@ def main() -> int:
                   f"{'from edge to edge of the screen' if mobile else 'inside the reading column'}, beside the"
                   " owner's and a third party's rows and in every state that redraws a border; nothing on"
                   " the page scrolling sideways")
+            coalesce_walk(playwright.chromium, args, label, width, height, mobile)
+            print(f"{label} at {width}x{height}: a reply directly under what it answers draws the arrow whose head"
+                  " meets that row, at its foot or its side, within 1px, and a reply to a message elsewhere the one"
+                  " leaving its box's middle at 45 degrees, at the default type size and at 150%; a real"
+                  f" {'tap' if mobile else 'click'} on N replies gathered the replies under their root, the root"
+                  " unmoved, one bridge reaching every reply's left edge from the root's foot, through an opened"
+                  " reply and 150% type, its X a 44px target that put them back with the root unmoved; two"
+                  f" {'taps' if mobile else 'clicks'} on an arrow gathered them with the reply kept in place")
         for label, width, height, root_percent in MENU_SCALES:
             menu_walk(playwright.chromium, args, label, width, height, root_percent)
             print(f"{label} at {width}x{height}, root font {root_percent}%: every row's ⋯ menu, the pinned"
@@ -2991,6 +3293,197 @@ def dock_walk(chromium: BrowserType, args: argparse.Namespace, label: str, width
             context.close()
         summary = ", ".join(f"{state} {tall:.0f}px" for state, tall in heights.items())
         return summary if desk else f"{summary} (the phone's dock as it was, {PHONE_DOCK_PX:.0f}px)"
+    finally:
+        api.stopping.set()
+        server.shutdown()
+        server.server_close()
+        thread.join()
+
+
+def coalesce_walk(chromium: BrowserType, args: argparse.Namespace, label: str, width: int, height: int,
+                  mobile: bool) -> None:
+    """`#214 reply-arrow` and `#215 reply-coalesce`: both arrows as drawn, and replies gathered under a
+    message and put back by real taps, against a fresh profile in the dark scheme."""
+    api = CoalesceApi()
+    server = ThreadingHTTPServer(("127.0.0.1", 0), handler_for(api))
+    server.daemon_threads = True
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    url = f"http://127.0.0.1:{server.server_port}/voice"
+    platform = "Linux; Android 15; Pixel 7" if mobile else "X11; Linux x86_64"
+    try:
+        with tempfile.TemporaryDirectory(prefix="vibe-talk-chrome-") as profile:
+            context = chromium.launch_persistent_context(
+                profile,
+                headless=True,
+                executable_path=args.browser_executable,
+                user_agent=(
+                    f"Mozilla/5.0 ({platform}) AppleWebKit/537.36 (KHTML, like Gecko)"
+                    f" Chrome/151.0.0.0 {'Mobile ' if mobile else ''}Safari/537.36"
+                ),
+                viewport={"width": width, "height": height},
+                device_scale_factor=2.625 if mobile else 1,
+                is_mobile=mobile,
+                has_touch=mobile,
+                color_scheme="dark",
+            )
+            page = context.pages[0]
+            errors: list[str] = []
+            page.on("pageerror", lambda error: errors.append(str(error)))
+
+            def shot(name: str) -> None:
+                if args.screenshots:
+                    page.screenshot(path=str(args.screenshots / f"{label}-coalesce-{name}.png"))
+
+            def rows() -> list[dict[str, object]]:
+                return [{str(key): value for key, value in row.items()} for row in page.evaluate(COALESCE_ROWS_JS)]
+
+            def order() -> list[str]:
+                return [str(row["id"]) for row in rows()]
+
+            def top(row_id: str) -> float:
+                return float(str(next(row["top"] for row in rows() if row["id"] == row_id)))
+
+            def look(kind: str, row_id: str, parent: str = "", stack: list[str] | None = None, why: str = "") -> None:
+                page.evaluate(CENTRE_ROW_JS, row_id)
+                page.wait_for_timeout(120)
+                png = base64.b64encode(page.screenshot()).decode("ascii")
+                found = page.evaluate(COALESCE_LOOK_JS, {"png": png, "check": kind, "id": row_id, "parent": parent,
+                                                         "stack": stack or []})
+                problems = [str(problem) for problem in found["problems"]]
+                check(not problems, f"{label}, {why}: {problems}")
+
+            def tap(row_id: str, part: str, why: str, twice: bool = False) -> None:
+                at = page.evaluate(TARGET_JS, {"id": row_id, "part": part})
+                if not isinstance(at, list):
+                    raise AssertionError(f"{label}: {why}: nothing to tap on {row_id}")
+                x, y = float(at[0]), float(at[1])
+                if mobile:
+                    page.touchscreen.tap(x, y)
+                    if twice:
+                        page.touchscreen.tap(x, y)
+                elif twice:
+                    page.mouse.dblclick(x, y)
+                else:
+                    page.mouse.click(x, y)
+
+            def wait_until(ready: str, why: str) -> None:
+                deadline = time.monotonic() + 5
+                while time.monotonic() < deadline and not page.evaluate(ready):
+                    page.wait_for_timeout(50)
+                check(bool(page.evaluate(ready)), f"{label}: {why}")
+
+            def arrows(why: str) -> None:
+                styles = {str(row["id"]): (row["style"], row["reach"]) for row in rows() if row["style"]}
+                wanted = {"207": ("adjacent", "below"), "208": ("adjacent", "side"),
+                          "211": ("adjacent", "below" if mobile else "side"), "213": ("disconnected", None)}
+                for row_id, style in wanted.items():
+                    check(styles.get(row_id) == style,
+                                  f"{label}, {why}: {row_id}'s arrow is {styles.get(row_id)}, not {style}")
+                look("below", "207", "206", why=f"{why}, the owner's reply under the agent's root")
+                look("side", "208", "207", why=f"{why}, the agent's reply under the owner's reply")
+                look("below" if mobile else "side", "211", "210", why=f"{why}, the agent's reply under the owner's row")
+                look("disconnected", "213", why=f"{why}, a reply to a message far above")
+
+            def bridge(why: str) -> None:
+                for row_id in GATHERED_STACK:
+                    look("bridge", row_id, "206", GATHERED_STACK, why=f"{why}, at {row_id}")
+
+            page.goto(url, wait_until="load")
+            page.fill("#api-token", TOKEN)
+            page.click("#save-token")
+            page.wait_for_selector("#view-switch", state="visible", timeout=10_000)
+            page.click("#view-switch")
+            page.wait_for_selector('#discord-log > li[data-id="214"]', timeout=10_000)
+            if not mobile:
+                # Off every control, so nothing photographed has its hover disc behind it.
+                page.mouse.move(1, 1)
+            page.wait_for_timeout(200)
+            check(order() == COALESCE_SCATTERED, f"{label}: the channel is not what this walk assumes: {order()}")
+
+            # Both arrows, at the ordinary type size and at 150%: everything in the gutter is in rem,
+            # and where the head meets the row above is measured again when the type grows.
+            arrows("at the default type size")
+            page.evaluate(CENTRE_ROW_JS, "208")
+            page.wait_for_timeout(120)
+            shot("1-adjacent")
+            page.evaluate(CENTRE_ROW_JS, "213")
+            page.wait_for_timeout(120)
+            shot("2-disconnected")
+            large = page.add_style_tag(content="html { font-size: 150% !important; }")
+            page.wait_for_timeout(250)
+            arrows("at 150% type")
+            large.evaluate("element => element.remove()")
+            page.wait_for_timeout(250)
+
+            # A real tap on the root's N replies: its replies gathered under it, the root unmoved.
+            page.evaluate(CENTRE_ROW_JS, "206")
+            page.evaluate("() => { const a = document.getElementById('scroll-area');"
+                          " a.scrollTop += document.querySelector('#discord-log > li[data-id=\"206\"]')"
+                          ".getBoundingClientRect().top - a.getBoundingClientRect().top - 90; }")
+            page.wait_for_timeout(150)
+            before = top("206")
+            tap("206", "chip", "the root's N replies")
+            wait_until("() => document.querySelector('#discord-log > li[data-coalesce=\"parent\"]') !== null",
+                       "the N replies chip did not gather the replies")
+            page.wait_for_timeout(150)
+            check(abs(top("206") - before) <= 1,
+                          f"{label}: gathering moved the root from {before}px to {top('206')}px")
+            check(order() == COALESCE_GATHERED, f"{label}: the replies were gathered as {order()}")
+            shot("3-gathered")
+            bridge("gathered")
+            # 208 answers 207, which is no longer directly above it.
+            check(next(row["style"] for row in rows() if row["id"] == "208") == "disconnected",
+                          f"{label}: 208 still draws the arrow to the row above")
+
+            # Opening a folded reply in the stack, by a real tap on its text, and larger type: the
+            # bridge stays attached through both.
+            folded = page.evaluate("() => document.querySelector('#discord-log > li[data-id=\"212\"]')"
+                                   ".getAttribute('data-collapsed')")
+            page.evaluate(CENTRE_ROW_JS, "212")
+            tap("212", "body", "a gathered reply's text")
+            page.wait_for_timeout(200)
+            check(page.evaluate("() => document.querySelector('#discord-log > li[data-id=\"212\"]')"
+                                        ".getAttribute('data-collapsed')") != folded,
+                          f"{label}: a tap on a gathered reply's text did not open it")
+            bridge("with a gathered reply opened")
+            large = page.add_style_tag(content="html { font-size: 150% !important; }")
+            page.wait_for_timeout(250)
+            bridge("at 150% type")
+            large.evaluate("element => element.remove()")
+            page.wait_for_timeout(250)
+
+            # The X, by a real tap: back in time order, the root unmoved.
+            page.evaluate(CENTRE_ROW_JS, GATHERED_STACK[0])
+            page.wait_for_timeout(120)
+            before = top("206")
+            tap(GATHERED_STACK[0], "x", "the X beside the bridge")
+            wait_until("() => document.querySelector('#discord-log > li[data-coalesce]') === null",
+                       "the X did not put the replies back")
+            page.wait_for_timeout(150)
+            check(order() == COALESCE_SCATTERED, f"{label}: the X put the replies back as {order()}")
+            check(abs(top("206") - before) <= 1,
+                          f"{label}: putting the replies back moved the root from {before}px to {top('206')}px")
+
+            # Two real taps on the arrow of a reply far below the root: gathered, the reply unmoved.
+            page.evaluate(CENTRE_ROW_JS, "213")
+            page.wait_for_timeout(150)
+            before = top("213")
+            tap("213", "arrow", "the arrow of a reply far below its root", twice=True)
+            wait_until("() => document.querySelector('#discord-log > li[data-coalesce=\"parent\"]') !== null",
+                       "two taps on the arrow did not gather the replies")
+            page.wait_for_timeout(400)
+            check(order() == COALESCE_GATHERED, f"{label}: two taps gathered the replies as {order()}")
+            after = top("213")
+            viewport = float(page.evaluate("() => document.getElementById('scroll-area').getBoundingClientRect().bottom"))
+            check(abs(after - before) <= 1 and 0 <= after < viewport,
+                          f"{label}: the tapped reply moved from {before}px to {after}px")
+            check(page.evaluate("() => !document.querySelector('#discord-log > li[data-landed=\"true\"]')"),
+                          f"{label}: the first of two taps jumped away")
+            shot("4-double-tap")
+
+            check(not errors, f"{label}: the page threw: {errors}")
+            context.close()
     finally:
         api.stopping.set()
         server.shutdown()
