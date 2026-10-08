@@ -1,10 +1,11 @@
 ---
 title: 'asset-caching: let the installed app reuse its page files instead of downloading them on every launch'
-status: open
+status: closed
 priority: 1
 issue_type: feature
 created_at: 2026-10-08T16:12:35.586733060+00:00
-updated_at: 2026-10-08T16:12:35.586733060+00:00
+updated_at: 2026-10-08T17:55:02.665356982+00:00
+closed_at: 2026-10-08T17:55:02.665356862+00:00
 ---
 
 # Description

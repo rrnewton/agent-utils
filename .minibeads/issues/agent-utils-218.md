@@ -1,10 +1,11 @@
 ---
 title: 'desktop-dock: a compact dock and wide channel/thread pickers on a desktop'
-status: open
+status: closed
 priority: 2
 issue_type: feature
 created_at: 2026-10-08T15:33:51.304708799+00:00
-updated_at: 2026-10-08T15:33:51.304708799+00:00
+updated_at: 2026-10-08T17:55:02.669102901+00:00
+closed_at: 2026-10-08T17:55:02.669102781+00:00
 ---
 
 # Description
