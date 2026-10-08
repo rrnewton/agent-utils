@@ -11040,13 +11040,26 @@ function repliesTo(parent, messages) {
 /**
  * `messages`, oldest first, as the rows to draw with `parent`'s replies gathered under the row that
  * holds it; null when no row would hold it. The replies keep their time order among themselves and
- * everything else keeps its place. The combining rule (`glom`) applies within each run and never
- * across the stack's ends, so the parent's row and the stack's rows stay rows of their own.
+ * everything else keeps its place.
+ *
+ * The combining rule (`glom`) applies within three runs — what is up to the end of the parent's row,
+ * the stack, and what follows — and never across their ends. THE PARENT'S ROW IS THE ROW TIME ORDER
+ * DRAWS IT IN, less any reply in it: a message of the parent's author that only a reply kept out of
+ * that row must not join it once the reply has moved, or it would sit above the stack, newer than the
+ * replies under it, inside the box the bridge comes out of as though it were what they answer. What
+ * follows the parent's row does combine across the gaps the replies leave: those rows are not where
+ * the bridge comes from, and two of one author's messages with nothing now between them are one row
+ * anywhere else in the list.
  */
 function gatheredRows(messages, parent) {
+  const id = String(parent);
   const replies = repliesTo(parent, messages);
-  const rows = glom(messages.filter((message) => !replies.has(String(message.id))));
-  const at = rows.findIndex((group) => group.some((message) => String(message.id) === String(parent)));
+  const own = glom(messages).find((group) => group.some((message) => String(message.id) === id));
+  if (!own) return null;
+  const end = messages.indexOf(own[own.length - 1]) + 1;
+  const kept = (message) => !replies.has(String(message.id));
+  const rows = [...glom(messages.slice(0, end).filter(kept)), ...glom(messages.slice(end).filter(kept))];
+  const at = rows.findIndex((group) => group.some((message) => String(message.id) === id));
   if (at < 0) return null;
   rows.splice(at + 1, 0, ...glom(messages.filter((message) => replies.has(String(message.id)))));
   return rows;

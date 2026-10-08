@@ -8643,8 +8643,19 @@ test("both arrows are drawn as the issue asks, in the stylesheet", () => {
   assert.match(cssBlock('#discord-log .reply-jump[data-reply-reach="side"] .reply-jump-mark::after'),
     new RegExp(`right:\\s*calc\\(${String(shaft).replace(".", "\\.")}rem - var\\(--reply-run, 0px\\)\\)`),
     "the turn to the row's side does not run as far as measured");
-  // A drawing that reaches past its square never takes a tap meant for the row above.
+  // The head the adjacent arrow draws outside its square — in the gap, or beside the row above — is the
+  // arrow's to press, not whatever is under it: the page, or the row above's own arrow, which jumps
+  // somewhere else. Every head is the drawing's `::after`, and it takes presses though the rest of the
+  // drawing passes them to the square; no rule for a head takes that back. offline_cache_browser.py
+  // presses each head in Chromium.
   assert.match(cssBlock("#discord-log .reply-jump-mark"), /pointer-events:\s*none/);
+  assert.match(cssBlock("#discord-log .reply-jump-mark::after"), /pointer-events:\s*auto/,
+    "a press on an arrow's head goes through it to whatever is under it");
+  const heads = [...CSS_CODE.matchAll(/([^{}]*\.reply-jump-mark::after[^{}]*)\{([^}]*)\}/g)];
+  assert.ok(heads.length >= 4, "the heads are not where this test looks for them");
+  for (const [, selector, body] of heads) {
+    assert.doesNotMatch(body, /pointer-events:\s*none/, `${selector.trim()} passes presses on the head through`);
+  }
 });
 
 /**
@@ -8977,6 +8988,40 @@ test("COMBINING inside a stack: two quick replies from one author are one gather
   assert.deepStrictEqual(page.el("discord-log").children.map((li) => li.getAttribute("data-ids")),
     ["1000000000000000001", "1000000000000000003 1000000000000000004", "1000000000000000002"]);
   assert.deepStrictEqual(stackPlaces(page).map(([, place]) => place), ["parent", "only"]);
+});
+
+test("...but nothing newer joins the PARENT'S row: it stays the row time order draws it in", async () => {
+  const quick = (id, seconds, overrides) => message({ id, timestamp: `2026-08-19T05:00:${seconds}.000Z`, ...overrides });
+  const rows = (page) => page.el("discord-log").children.map((li) => li.getAttribute("data-ids"));
+  // 1 and 3 are one author's, seconds apart, and two rows only because 2, which answers 1, is between.
+  const page = newPage();
+  await signIn(page);
+  await showDiscord(page, [
+    quick("1000000000000000001", "00", { content: "is the runner wedged?", ...ALICE }),
+    quick("1000000000000000002", "01", { content: "restarted it", reply_to: "1000000000000000001", ...OWNER }),
+    quick("1000000000000000003", "02", { content: "never mind, it reported", ...ALICE }),
+  ]);
+  assert.deepStrictEqual(rows(page), ["1000000000000000001", "1000000000000000002", "1000000000000000003"]);
+  await doubleTapArrow(page, rowWithId(page, "1000000000000000002"));
+  assert.deepStrictEqual(rows(page), ["1000000000000000001", "1000000000000000002", "1000000000000000003"],
+    "a message newer than the reply joined the parent's row, above the stack and inside the box it hangs from");
+  assert.deepStrictEqual(stackPlaces(page), [["1000000000000000001", "parent"], ["1000000000000000002", "only"]]);
+  // And what time order drew in the parent's row stays there: the row the reply's arrow met is the row
+  // its bridge comes out of, and 4 still does not join it.
+  const combined = newPage();
+  await signIn(combined);
+  await showDiscord(combined, [
+    quick("1000000000000000001", "00", { content: "is the runner wedged?", ...ALICE }),
+    quick("1000000000000000002", "01", { content: "it has not reported since 03:10", ...ALICE }),
+    quick("1000000000000000003", "03", { content: "restarted it", reply_to: "1000000000000000001", ...OWNER }),
+    quick("1000000000000000004", "04", { content: "never mind, it reported", ...ALICE }),
+  ]);
+  const drawn = ["1000000000000000001 1000000000000000002", "1000000000000000003", "1000000000000000004"];
+  assert.deepStrictEqual(rows(combined), drawn);
+  assert.equal(arrowStyle(rowWithId(combined, "1000000000000000003")), "adjacent");
+  await doubleTapArrow(combined, rowWithId(combined, "1000000000000000003"));
+  assert.deepStrictEqual(rows(combined), drawn, "gathering redrew the parent's row as another row");
+  assert.deepStrictEqual(stackPlaces(combined).map(([, place]) => place), ["parent", "only"]);
 });
 
 /**

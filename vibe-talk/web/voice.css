@@ -1511,8 +1511,20 @@ body {
 /*
  * THE ARROW, drawn on an empty span and its two pseudo-elements, everything in `rem` so the whole
  * drawing grows with the reader's type. Laid against the square's right-hand edge, which is the
- * box's left side, and passing taps through to the square: a drawing that reaches past its square
- * must not take a tap meant for the row above.
+ * box's left side.
+ *
+ * THE HEAD IS PART OF THE ARROW'S TARGET, as well as the square. It is what a reader aims at — the
+ * owner asked to double-click "the arrow head" — and the arrow to the row above draws it outside the
+ * square: in the gap between the rows, or in the gutter beside the row above. A head that passed
+ * presses through would give a click on it to the page, or, where the row above is a reply with its
+ * own arrow there, to that arrow, which jumps somewhere else. Every head is the `::after`, which is
+ * inside the button, so a press on it is a press on the button; and the reply comes after the row
+ * above in the list, so its head is drawn over that row's gutter and is what a press there finds. It
+ * reaches into no row's box: it meets the row above at its edge.
+ *
+ * The rest of the drawing passes presses through to the square. Nobody aims at a three-pixel line,
+ * and the box a corner is drawn in is mostly empty: over the row above's gutter it would take presses
+ * from that row's own arrow where nothing of this one is drawn.
  */
 #discord-log .reply-jump-mark {
   position: absolute;
@@ -1526,6 +1538,10 @@ body {
   content: "";
   position: absolute;
   box-sizing: border-box;
+}
+
+#discord-log .reply-jump-mark::after {
+  pointer-events: auto;
 }
 
 /*
