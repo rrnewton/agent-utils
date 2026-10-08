@@ -662,6 +662,24 @@
 
             <section class="settings-group">
               <div class="group-head">
+                <h2>Typing</h2>
+              </div>
+              <!--
+                `#225 enter-to-send`. One rule for every message box — the channel, a thread, a
+                reply and the call — where each used to have its own. ON by default, which is what
+                the channel's box always did. The hint under it is written by web/voice.js: with
+                the switch off it names the key that sends instead, in the words on the reader's
+                own keyboard (Cmd on an Apple one, Ctrl elsewhere), which the markup cannot know.
+              -->
+              <label class="toggle">
+                <input id="enter-sends" type="checkbox" checked aria-describedby="enter-sends-hint" />
+                Enter to send
+              </label>
+              <p id="enter-sends-hint" class="hint" aria-live="polite"></p>
+            </section>
+
+            <section class="settings-group">
+              <div class="group-head">
                 <h2>Canned prompts</h2>
                 <button class="help-link" id="help-link-canned-prompts" type="button" data-help="canned-prompts" aria-label="About the canned prompts" title="What these send">?</button>
               </div>

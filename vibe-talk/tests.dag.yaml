@@ -168,6 +168,25 @@ steps:
       classification: latency-bound
       rss_baseline_bytes: 1073741824
 
+  # `#225 enter-to-send` in the browser engine: real keys in the reply box. With the default, Shift+Enter
+  # is a new line and Enter posts the reply; with "Enter to send" turned off in Settings (its hint naming
+  # the key that sends, kept across a real reload), Enter is a new line and posts nothing, and Ctrl+Enter
+  # posts. A step of its own, not another walk in offline-cache-browser, whose CPU is near its cap.
+  # Measured on 2026-10-08: about 2s wall.
+  - group: check
+    job: enter-to-send-browser
+    desc: Enter in the reply box sends by default and is a new line with Enter to send off, in current Chromium
+    labels: [validation-vibe-talk]
+    cmd: cd vibe-talk && python3 tests/enter_to_send_browser.py
+    jobs_flag: ""
+    timeout: 60
+    cpu_timeout: 30
+    hint:
+      resources: {browser: 1}
+      est_duration_s: 3
+      classification: latency-bound
+      rss_baseline_bytes: 536870912
+
   # `#18 offline-message-cache` in the browser engine: saved rows drawn across a real reload before
   # the network answers, one newest-page read, local view switches, a real fetch failure, sign-out
   # clearing, empty Cache Storage and no service worker. `#32 freshness-pill-overlap`: refreshing,

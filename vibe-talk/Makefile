@@ -10,7 +10,7 @@
 # tool's lightweight unboxed gate. The root includes `tests.dag.yaml` directly so vibe-talk shares
 # one scheduler and browser cap with the other repository fragments.
 
-.PHONY: validate validate-boxed dag-check fmt check scripts-check contract contract-check typecheck test page pwa-installability offline-cache-browser reactions-browser read-aloud-browser post-confirm-browser view-switch-browser voice-read-acceptance-self-test android-speech-self-test live-hint-adapter-self-test container-smoke clean
+.PHONY: validate validate-boxed dag-check fmt check scripts-check contract contract-check typecheck test page pwa-installability enter-to-send-browser offline-cache-browser reactions-browser read-aloud-browser post-confirm-browser view-switch-browser voice-read-acceptance-self-test android-speech-self-test live-hint-adapter-self-test container-smoke clean
 
 # The whole gate for this tool, cheapest and most likely to fail first.
 #
@@ -104,6 +104,13 @@ page:
 # server. It deliberately states that this is not physical-device launcher proof.
 pwa-installability:
 	python3 tests/pwa_installability.py
+
+# `#225 enter-to-send` in a real Chromium at a desk's size: real keys in the reply box. By default
+# Shift+Enter is a new line and Enter posts the reply; with "Enter to send" off in Settings (its hint
+# naming the key that sends, kept across a real reload), Enter is a new line and Ctrl+Enter posts.
+# Pass WEB_ROOT=dir to run it against another copy of the page.
+enter-to-send-browser:
+	python3 tests/enter_to_send_browser.py $(if $(WEB_ROOT),--web-root $(WEB_ROOT))
 
 # `#18 offline-message-cache` in a real Chromium at a phone's size: localStorage across a real
 # reload, a real fetch failure, the Cache Storage and service-worker registries, and the pill's

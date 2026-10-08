@@ -48,7 +48,7 @@ const ACTIVE_CHANNEL_KEY = "vibe-talk.voice.active-channel";
 /**
  * @overload
  * @param {"api-token" | "channel-alias" | "channel-directory-search" | "combine-messages"
- *   | "compose-text" | "mark-own-read" | "mic-auto-gain" | "mic-echo-cancellation"
+ *   | "compose-text" | "enter-sends" | "mark-own-read" | "mic-auto-gain" | "mic-echo-cancellation"
  *   | "mic-noise-suppression" | "msg-scale" | "new-channel-id" | "new-channel-label"
  *   | "new-channel-writable" | "noise-rule-new" | "read-speed-range" | "reading-width"
  *   | "reply-branch" | "resume-toggle" | "search-field"} id
@@ -3198,6 +3198,129 @@ function onTextEntry() {
 /** The Send button and the Enter key, which must not be two different opinions about sending. */
 function sendTyped() {
   return sendUserMessage(el("compose-text").value, { fromComposer: true });
+}
+
+// --- Enter, in every message box ----------------------------------------------------------------
+//
+// `#225 enter-to-send`. The owner: "In main chat view enter is send. In reply view enter is newline
+// and I must press the actual button (mouse!). Let's make it consistent between the two views."
+//
+// Each box had grown its own opinion. The call's box sent on any Enter, the channel's (and so a
+// thread's, which is the same box) sent on Enter without Shift, and the reply screen's had no
+// handler at all, so Enter there was a new line and sending took the mouse. ONE handler now decides
+// for all of them, and the reader decides what it decides: "Enter to send" on the Settings screen.
+
+const ENTER_SENDS_KEY = "vibe-talk.voice.enter-sends";
+
+/** The message boxes, each of which hands its Enter to `onComposerKey`. */
+const COMPOSER_FIELDS = ["compose-text", "channel-compose-text", "reply-text"];
+
+/**
+ * Does a bare Enter send? ON unless the reader has turned it off — see `storedEnterSends`.
+ *
+ * ON because that is what the channel box always did, and what the call's box did too: the owner
+ * asked for the reply screen to agree with them, not for them to change.
+ *
+ * Ctrl+Enter (Cmd+Enter on an Apple keyboard) sends EITHER WAY. So turning this off costs nothing
+ * but the habit: the reader who wants Enter for new lines still has a key that sends, and the one
+ * who leaves it on can use the chord without first remembering which way the setting is.
+ */
+let enterSends = true;
+
+function applyEnterSends(on) {
+  enterSends = Boolean(on);
+  try {
+    localStorage.setItem(ENTER_SENDS_KEY, enterSends ? "1" : "0");
+  } catch (_error) {
+    // A browser that refuses storage still honours the choice for this session.
+  }
+  renderEnterSends();
+}
+
+/** What was stored. ABSENT MEANS ON: the default is the behaviour, not merely the initial value. */
+function storedEnterSends() {
+  return localStorage.getItem(ENTER_SENDS_KEY) !== "0";
+}
+
+/**
+ * The platforms whose keyboards say Cmd where the rest say Ctrl, as `navigator.platform` begins
+ * for them ("MacIntel", "iPhone", "iPad", "iPod"). An iPad reporting itself as a Mac lands in
+ * the same answer, which is the right one: its keyboard says Cmd either way.
+ */
+const CMD_KEY_PLATFORMS = ["Mac", "iPhone", "iPad", "iPod"];
+
+/**
+ * The send chord, in the words printed on the reader's own keyboard.
+ *
+ * WORDING ONLY. Both keys send on every platform — `onComposerKey` reads `ctrlKey || metaKey` and
+ * never this — so a platform guessed wrong costs a hint that names the other key, not a key that
+ * stops working. `navigator.platform` rather than the user-agent string, which this page does not
+ * read for anything (the suite refuses it, because a layout decided by it rots).
+ */
+function sendChordName() {
+  const platform = String((navigator && navigator.platform) || "");
+  return CMD_KEY_PLATFORMS.some((prefix) => platform.startsWith(prefix)) ? "Cmd+Enter" : "Ctrl+Enter";
+}
+
+/**
+ * Say what Enter does, in the two places it can be said without costing the phone a line.
+ *
+ *   * The Settings hint, under the switch: with it off, the key that sends instead. That is where
+ *     the owner asked for it — "that should be indicated in the settings where the user disables
+ *     it" — and the one place a reader who has just turned Enter off is looking.
+ *   * Each box's `enterkeyhint`, which is what a phone's keyboard draws on its own return key: a
+ *     send arrow while Enter sends, a return arrow while it is a new line. The key itself is the
+ *     hint, so no placeholder or extra line under a box has to carry it.
+ */
+function renderEnterSends() {
+  el("enter-sends").checked = enterSends;
+  el("enter-sends-hint").textContent = enterSends
+    ? "Shift+Enter starts a new line."
+    : `${sendChordName()} sends. Enter starts a new line.`;
+  for (const id of COMPOSER_FIELDS) {
+    el(id).setAttribute("enterkeyhint", enterSends ? "send" : "enter");
+  }
+}
+
+/**
+ * What a keystroke in a message box does: send, or leave the box to handle it.
+ *
+ * `send` is the box's own send — the very function its Send button calls — so the key and the
+ * button cannot become two opinions about sending, and the drafts, the outbox and its idempotency
+ * are reached exactly as a tap reaches them.
+ *
+ *   * Ctrl+Enter or Cmd+Enter sends, whatever the setting says.
+ *   * A bare Enter sends while "Enter to send" is on. While it is off it is left to the box, and a
+ *     textarea's own Enter is a new line, which is the reason to turn it off.
+ *   * Shift+Enter or Alt+Enter, without Ctrl or Cmd, is never a send: it is how a new line is asked
+ *     for while Enter sends, and with the setting off it is a new line anyway.
+ *   * NOTHING while an input method is composing. Japanese, Chinese and Korean input, and a phone's
+ *     predictive text, use Enter to ACCEPT the word being built; a send there would post the
+ *     message with that word still uncommitted. `isComposing` is the standard signal, and keyCode
+ *     229 is what Safari and older Chromium report for the same keystroke instead.
+ *
+ * `singleLine` is the call's box, an `<input>`. It cannot hold a new line, and a bare Enter in a
+ * lone text input is a form submission that reloads the page under the call — so there an Enter
+ * that does not send is swallowed rather than handed to the browser. It still does not send: with
+ * the setting off, the call's box answers to the same keys as the others.
+ *
+ * Returns what `send` returned, or undefined when nothing was sent. A browser ignores a listener's
+ * return value; the page suite awaits it, so a send is finished before the next assertion reads it.
+ *
+ * @param {KeyboardEvent} event
+ * @param {() => unknown} send
+ * @param {boolean} [singleLine]
+ * @returns {unknown}
+ */
+function onComposerKey(event, send, singleLine = false) {
+  if (!event || event.key !== "Enter") return undefined;
+  if (event.isComposing || event.keyCode === 229) return undefined;
+  const chord = Boolean(event.ctrlKey || event.metaKey);
+  const sends = chord || (enterSends && !event.shiftKey && !event.altKey);
+  if ((sends || singleLine) && event.preventDefault) {
+    event.preventDefault();
+  }
+  return sends ? send() : undefined;
 }
 
 // --- the canned prompts -------------------------------------------------------------------------
@@ -18560,6 +18683,7 @@ applyMsgScale(storedMsgScale());
 applyReadSpeed(storedReadSpeed());
 applyMarkOwnRead(storedMarkOwnRead());
 applyCombineMessages(storedCombineMessages());
+applyEnterSends(storedEnterSends());
 loadPlaceMarker();
 el("reading-width").addEventListener("input", () => readingWidthChanged(el("reading-width").value));
 el("msg-scale").addEventListener("input", () => msgScaleChanged(el("msg-scale").value));
@@ -18625,6 +18749,10 @@ el("combine-messages").addEventListener("change", () => {
       : "every source message is shown as its own row."
   );
 });
+
+// `#225 enter-to-send`. Nothing to redraw and nothing to say on the status line: the hint under the
+// switch changes in place, and the next Enter in any box follows it.
+el("enter-sends").addEventListener("change", () => applyEnterSends(el("enter-sends").checked));
 
 el("jump-marker").addEventListener("click", jumpToMarker);
 el("back-to-reply").addEventListener("click", backToReply);
@@ -18719,15 +18847,9 @@ el("prompts-open").addEventListener("click", () => setPromptsOpen(!promptsOpen))
 // a state the opener has to be ASSERTING for a screen reader to hear it — an `aria-expanded` that
 // only appears after somebody has already opened the tray is no use to the reader who needs it.
 setPromptsOpen(false);
-el("compose-text").addEventListener("keydown", (event) => {
-  if (!event || event.key !== "Enter") {
-    return;
-  }
-  if (event.preventDefault) {
-    event.preventDefault(); // a bare Enter in a lone text input would submit and reload the page.
-  }
-  sendTyped();
-});
+// `#225 enter-to-send`. One rule for every message box; see `onComposerKey`. Single-line: an Enter
+// that does not send is still kept from the browser, which would submit and reload the page.
+el("compose-text").addEventListener("keydown", (event) => onComposerKey(event, sendTyped, true));
 el("dismiss-banner").addEventListener("click", dismissBanner);
 el("dismiss-status").addEventListener("click", dismissStatus);
 el("post-confirm-send").addEventListener("click", sendPostProposal);
@@ -18783,12 +18905,10 @@ for (const type of ["focus", "pointerdown"]) {
 }
 el("channel-compose-text").addEventListener("input", rememberChannelDraft);
 el("channel-send").addEventListener("click", guardQuietly(sendChannelMessage));
-el("channel-compose-text").addEventListener("keydown", (event) => {
-  if (event.key === "Enter" && !event.shiftKey && !event.isComposing) {
-    event.preventDefault();
-    guardQuietly(sendChannelMessage)();
-  }
-});
+// The channel's box, and a thread's, which is the same box posting somewhere else.
+el("channel-compose-text").addEventListener("keydown", (event) =>
+  onComposerKey(event, guardQuietly(sendChannelMessage))
+);
 let threadBackGesture = null;
 el("scroll-area").addEventListener("pointerdown", (event) => {
   if (channelView !== "thread" || event.pointerType === "mouse") return;
@@ -18815,6 +18935,9 @@ renderChannelRows();
 el("close-reply").addEventListener("click", closeReply);
 el("reply-cancel").addEventListener("click", closeReply);
 el("reply-send").addEventListener("click", guardQuietly(sendReply));
+// `#225 enter-to-send`. The box that had no Enter handler at all, so the one the owner had to reach
+// for the mouse in.
+el("reply-text").addEventListener("keydown", (event) => onComposerKey(event, guardQuietly(sendReply)));
 el("reply-branch").addEventListener("change", renderReplyDestination);
 el("reply-context-more").addEventListener("click", guardQuietly(loadEarlierReplyContext));
 // A draft survives leaving the screen without sending, so it is written as it is typed rather than

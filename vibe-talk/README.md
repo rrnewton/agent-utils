@@ -3203,6 +3203,31 @@ anchor-and-offset mechanism the fold control uses rather than a saved `scrollTop
 element is allowed to reset its scroll position to zero, and a restore expressed as a delta against
 an anchor is correct either way.
 
+### Enter sends, in every message box, until you say otherwise
+
+Enter used to mean three things. The channel's box (and so a thread's, which is the same box) sent on
+Enter, the call's box sent on any Enter, and the reply screen's box had no rule at all, so Enter
+there was a new line and sending meant reaching for the mouse. One handler now decides for all of
+them, and **Settings → Typing → Enter to send** decides what it decides:
+
+| | Enter | Shift+Enter | Ctrl+Enter / Cmd+Enter |
+|---|---|---|---|
+| **On** (the default) | sends | new line | sends |
+| **Off** | new line | new line | sends |
+
+Ctrl+Enter and Cmd+Enter send either way, so turning the switch off never leaves a box without a
+key that sends. Under the switch, the hint names that key in the words on your own keyboard: Cmd on
+an Apple one (from `navigator.platform`), Ctrl elsewhere. The platform only picks the words; both
+keys send everywhere. An input method that is still composing a word (`isComposing`, or keyCode 229)
+keeps its Enter, because there Enter accepts the word. The call's box is a single line, so with the
+switch off its Enter does nothing rather than being handed to the browser, which would submit the
+page.
+
+The choice is stored on this device under `vibe-talk.voice.enter-sends`, like the page's other
+settings. Nothing is added to the boxes themselves, so a phone screen loses no space. Instead each
+box's `enterkeyhint` follows the switch, which is what the phone keyboard's return key shows: a send
+arrow when Enter sends, a return arrow when it starts a new line.
+
 ### Two ways a channel row can already have been dealt with, and only one of them hides it
 
 `#84 reply-aware-dismissal` lands the two follow-ups `#50 todo-view` named for itself — the **swipe**, and the

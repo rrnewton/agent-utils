@@ -1720,6 +1720,8 @@ function newPage(store = new Map(), script = SCRIPT, arrange = null) {
 
   const navigator = {
     language: "en-US",
+    // `#225 enter-to-send`. What a desktop Chromium on Linux reports; see `setPlatform`.
+    platform: "Linux x86_64",
     // `#195 send-resilience`. What the browser believes about the connection; see `setOnline`.
     onLine: true,
     // `#198 copy-message-text`. The asynchronous Clipboard API, recording what was written.
@@ -1777,6 +1779,13 @@ function newPage(store = new Map(), script = SCRIPT, arrange = null) {
     for (const fn of windowListeners.get(online ? "online" : "offline") || []) {
       await fn();
     }
+  };
+  /**
+   * `#225 enter-to-send`. The platform the browser reports, as `navigator.platform` gives it. Set
+   * from `arrange`: the page reads it while it loads, to word the Settings hint.
+   */
+  page.setPlatform = (platform) => {
+    navigator.platform = platform;
   };
   const context = {
     document,
@@ -16676,6 +16685,237 @@ test("Enter sends, and does not reload the page out from under the call", async 
   await page.el("compose-text").dispatch("keydown", { key: "a", preventDefault: () => {} });
   assert.equal(typedFrames(socket).length, 1, "every keystroke sends the message");
   assert.equal(page.el("compose-text").value, "half a th", "an ordinary key cleared the field");
+});
+
+// --- Enter, in every message box (#225 enter-to-send) --------------------------------------------
+//
+// The owner: Enter sent in the channel and was a new line in the reply screen, where sending took
+// the mouse. One handler now decides for every box, and "Enter to send" on the Settings screen
+// decides what it decides. What a keystroke must do is a table, so it is checked as one: every box,
+// both ways the setting can be, every key. tests/enter_to_send_browser.py presses the real keys in
+// a real Chromium, where a new line can be seen arriving; here, a new line is the box's own default
+// left alone, which is all a page can do to get one.
+
+/** A keydown as a browser hands it over, recording whether the page took the browser's default. */
+function enterKey(fields) {
+  const event = {
+    key: "Enter", keyCode: 13, shiftKey: false, ctrlKey: false, metaKey: false, altKey: false,
+    isComposing: false, ...fields, defaulted: true,
+  };
+  event.preventDefault = () => {
+    event.defaulted = false;
+  };
+  return event;
+}
+
+/**
+ * Every Enter worth telling apart, and whether it sends with the setting on and with it off.
+ *
+ * Written out rather than computed, so the table is the specification and not a second copy of the
+ * handler. Ctrl+Enter and Meta+Enter send either way; Shift+Enter and Alt+Enter never do; an input
+ * method mid-word gets the key whatever is held with it, because Enter there accepts the word.
+ */
+const ENTER_KEYS = [
+  { name: "Enter", fields: {}, on: true, off: false },
+  { name: "Shift+Enter", fields: { shiftKey: true }, on: false, off: false },
+  { name: "Alt+Enter", fields: { altKey: true }, on: false, off: false },
+  { name: "Ctrl+Enter", fields: { ctrlKey: true }, on: true, off: true },
+  { name: "Meta+Enter", fields: { metaKey: true }, on: true, off: true },
+  { name: "Enter during IME composition", fields: { isComposing: true }, on: false, off: false, ime: true },
+  { name: "Enter reported as keyCode 229", fields: { keyCode: 229 }, on: false, off: false, ime: true },
+  { name: "Ctrl+Enter during IME composition", fields: { ctrlKey: true, isComposing: true },
+    on: false, off: false, ime: true },
+];
+
+/**
+ * Each message box, on a page of its own with "Enter to send" set through the Settings switch.
+ *
+ * `ready(text)` puts the box on screen holding `text`, as a finger would, whatever the last key
+ * did (a sent reply closes its screen); `sent()` counts what has left the browser from it; and
+ * `went(text)` checks the last of that is `text`, sent where this box sends — so a key routed to the
+ * wrong box's send cannot pass.
+ */
+const ENTER_COMPOSERS = {
+  async call(on) {
+    const page = newPage();
+    const socket = await startTalking(page);
+    await page.el("enter-sends").setChecked(on);
+    return {
+      page, field: "compose-text", singleLine: true,
+      ready: (text) => compose(page, text),
+      sent: () => typedFrames(socket).length,
+      went: (text) => assert.equal(JSON.parse(typedFrames(socket).at(-1)).text, text),
+    };
+  },
+  async channel(on) {
+    const page = newPage();
+    await signIn(page);
+    await showDiscord(page, [message({ id: "300", content: "history" })]);
+    await page.el("enter-sends").setChecked(on);
+    return {
+      page, field: "channel-compose-text", singleLine: false,
+      ready: (text) => page.el("channel-compose-text").setValue(text),
+      sent: () => page.repliesPosted.length,
+      went: (text) => assert.deepEqual(page.repliesPosted.at(-1).body, { text }),
+    };
+  },
+  async thread(on) {
+    const page = newPage();
+    const data = threadData();
+    page.threadingSupported = true;
+    page.threads = data.threads;
+    await signIn(page);
+    await showDiscord(page, data.messages);
+    await threadBadge(page.el("discord-log").children[1]).click();
+    assert.equal(page.el("thread-heading").hidden, false, "the thread did not open");
+    await page.el("enter-sends").setChecked(on);
+    return {
+      page, field: "channel-compose-text", singleLine: false,
+      ready: (text) => page.el("channel-compose-text").setValue(text),
+      sent: () => page.repliesPosted.length,
+      went: (text) =>
+        assert.deepEqual(page.repliesPosted.at(-1).body, { text, thread_id: page.threads[0].id }),
+    };
+  },
+  async reply(on) {
+    const page = newPage();
+    await signIn(page);
+    const messages = [message({ id: "111", content: "a question" })];
+    await openReplyOn(page, messages);
+    await page.el("enter-sends").setChecked(on);
+    return {
+      page, field: "reply-text", singleLine: false,
+      ready: async (text) => {
+        if (page.screen() !== "reply") await openReplyOn(page, messages);
+        await page.el("reply-text").setValue(text);
+      },
+      sent: () => page.repliesPosted.length,
+      went: (text) => assert.deepEqual(page.repliesPosted.at(-1).body, { text, reply_to: "111" }),
+    };
+  },
+};
+
+for (const [name, open] of Object.entries(ENTER_COMPOSERS)) {
+  for (const on of [true, false]) {
+    test(`ENTER IN THE ${name.toUpperCase()} BOX with Enter to send ${on ? "ON" : "OFF"}: Enter, Shift, Alt, Ctrl, Meta and IME`, async () => {
+      const box = await open(on);
+      for (const key of ENTER_KEYS) {
+        const text = `${key.name} in the ${name} box`;
+        await box.ready(text);
+        const before = box.sent();
+        const event = enterKey(key.fields);
+        await box.page.el(box.field).dispatch("keydown", event);
+        await box.page.settle();
+        if (on ? key.on : key.off) {
+          assert.equal(box.sent(), before + 1, `${key.name} did not send from the ${name} box`);
+          box.went(text);
+          assert.equal(event.defaulted, false,
+            `${key.name} sent and left the browser its default too — a stray new line, or a page reload`);
+        } else {
+          assert.equal(box.sent(), before, `${key.name} sent from the ${name} box`);
+          assert.equal(box.page.el(box.field).value, text, `${key.name} emptied the ${name} box`);
+          // A new line is the box's own default, so it is left alone — except in the call's one-line
+          // box, whose default is a form submission. An input method's Enter is the method's, always.
+          const swallowed = box.singleLine && !key.ime;
+          assert.equal(event.defaulted, !swallowed, swallowed
+            ? `${key.name} in the one-line call box was handed to the browser, which submits and reloads`
+            : `${key.name} had its default taken away, so the ${name} box gets no new line`);
+        }
+      }
+      // ...and an ordinary key is nobody's business but the box's.
+      await box.ready("half a wor");
+      const before = box.sent();
+      const letter = enterKey({ key: "d" });
+      await box.page.el(box.field).dispatch("keydown", letter);
+      await box.page.settle();
+      assert.equal(box.sent(), before, `a letter sent from the ${name} box`);
+      assert.equal(letter.defaulted, true, `a letter had its default taken away in the ${name} box`);
+    });
+  }
+}
+
+test("ENTER TO SEND is a switch on the Settings screen, and it is on as the page is served", () => {
+  const group = settingsGroup("Typing");
+  assert.match(group, /<input id="enter-sends" type="checkbox" checked aria-describedby="enter-sends-hint" \/>\s*Enter to send\s*</);
+  assert.match(group, /<p id="enter-sends-hint" class="hint" aria-live="polite"><\/p>/);
+  assert.ok(markupHolds("screen-settings", "enter-sends"), "the switch is not on the Settings screen");
+});
+
+test("ENTER TO SEND is on until the reader turns it off, and stays as they left it across a reload", async () => {
+  const page = newPage();
+  await signIn(page);
+  assert.equal(page.el("enter-sends").checked, true, "a fresh device does not send on Enter");
+  await page.el("open-settings").click();
+  await page.el("enter-sends").setChecked(false);
+  assert.equal(page.storage.get("vibe-talk.voice.enter-sends"), "0", "turning it off was not stored");
+
+  const again = newPage(page.storage);
+  await signIn(again);
+  assert.equal(again.el("enter-sends").checked, false, "a reload turned Enter to send back on");
+  // The keys follow what was stored, not merely the switch.
+  await showDiscord(again, [message({ id: "300", content: "history" })]);
+  await again.el("channel-compose-text").setValue("a first line");
+  const enter = enterKey({});
+  await again.el("channel-compose-text").dispatch("keydown", enter);
+  await again.settle();
+  assert.equal(again.repliesPosted.length, 0, "Enter sent after a reload that kept Enter to send off");
+  assert.equal(enter.defaulted, true, "Enter after the reload did not get its new line");
+
+  await again.el("enter-sends").setChecked(true);
+  assert.equal(again.storage.get("vibe-talk.voice.enter-sends"), "1", "turning it back on was not stored");
+  const third = newPage(again.storage);
+  await signIn(third);
+  assert.equal(third.el("enter-sends").checked, true, "turning it back on did not survive a reload");
+});
+
+test("THE HINT NAMES THE KEY THAT SENDS, in the words on the reader's keyboard", async () => {
+  for (const [platform, chord, other] of [
+    ["Linux x86_64", "Ctrl+Enter", "Cmd"],
+    ["Win32", "Ctrl+Enter", "Cmd"],
+    ["Linux armv8l", "Ctrl+Enter", "Cmd"],
+    ["MacIntel", "Cmd+Enter", "Ctrl"],
+    ["iPhone", "Cmd+Enter", "Ctrl"],
+    ["iPad", "Cmd+Enter", "Ctrl"],
+  ]) {
+    const page = newPage(new Map(), SCRIPT, (p) => p.setPlatform(platform));
+    await signIn(page);
+    const hint = page.el("enter-sends-hint");
+    assert.equal(hint.textContent, "Shift+Enter starts a new line.", `${platform}: the hint with it on`);
+    await page.el("enter-sends").setChecked(false);
+    assert.equal(hint.textContent, `${chord} sends. Enter starts a new line.`,
+      `${platform}: the hint with it off does not name ${chord}`);
+    assert.doesNotMatch(hint.textContent, new RegExp(other), `${platform}: the hint names the other key`);
+    await page.el("enter-sends").setChecked(true);
+    assert.equal(hint.textContent, "Shift+Enter starts a new line.", `${platform}: the hint stuck`);
+  }
+});
+
+test("the platform words the hint and decides nothing: Ctrl+Enter and Cmd+Enter send on a Mac and off it", async () => {
+  for (const platform of ["MacIntel", "Linux x86_64"]) {
+    const page = newPage(new Map(), SCRIPT, (p) => p.setPlatform(platform));
+    await signIn(page);
+    await showDiscord(page, [message({ id: "300", content: "history" })]);
+    await page.el("enter-sends").setChecked(false);
+    for (const fields of [{ ctrlKey: true }, { metaKey: true }]) {
+      const text = `${platform} ${Object.keys(fields)[0]}`;
+      await page.el("channel-compose-text").setValue(text);
+      await page.el("channel-compose-text").dispatch("keydown", enterKey(fields));
+      await page.settle();
+      assert.deepEqual(page.repliesPosted.at(-1)?.body, { text }, `${text} did not send`);
+    }
+  }
+});
+
+test("a phone's own return key says what Enter will do, in every message box", async () => {
+  // `enterkeyhint` is what an on-screen keyboard draws on its return key: a send arrow, or a return.
+  const page = newPage();
+  await signIn(page);
+  const boxes = ["compose-text", "channel-compose-text", "reply-text"];
+  for (const id of boxes) assert.equal(page.el(id).getAttribute("enterkeyhint"), "send", `#${id} with it on`);
+  await page.el("enter-sends").setChecked(false);
+  for (const id of boxes) assert.equal(page.el(id).getAttribute("enterkeyhint"), "enter", `#${id} with it off`);
+  await page.el("enter-sends").setChecked(true);
+  for (const id of boxes) assert.equal(page.el(id).getAttribute("enterkeyhint"), "send", `#${id} turned back on`);
 });
 
 test("the field states its own layout rule: the size iOS will not zoom", () => {
