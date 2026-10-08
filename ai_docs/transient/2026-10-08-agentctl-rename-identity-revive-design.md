@@ -229,15 +229,54 @@ tick-hub check) runs it on its own cadence. The user guide shows both.
   interrupted-move recovery.
 - wrkslots probe: alive while renamed agent runs; dead after stop; reused OLD
   name by another live lifetime yields alive.
+- Exit-harness (A8): adopted Claude with and without the exit confirmation;
+  unknown dialog refuses with the agent still registered; running turn
+  refuses without `--interrupt-turn`; timeout leaves registry unchanged;
+  `--close-pane` closes only the proven idle shell; owned graceful exit; the
+  archive records `retired_by` and the dialog text.
 - Cost: assert call counts per operation from the fake; `send` grows by at most
   the A2 calls per effect.
 - **No wrkslots installed**: start, send, rename, doctor and stop work with
   wrkslots absent from PATH and `AGENTCTL_WRKSLOTS_BIN` unset.
 
-## A8. Start defects (landed separately on this branch)
+## A8. Retiring a harness agentctl does not own
 
-`9a909f37c` waits up to 15 s for a recognisable composer before typing.
-`762f6d557` finds profiles beside a registry named `.agentctl` when `--cwd`
+Gap seen in use: an agent that was never registered could not be closed
+through agentctl, and `stop` on an adopted record deliberately only
+unregisters it (`subagents.py`: "never close, rename, signal, or otherwise
+mutate the adopted runtime"). The operator typed `/exit` into the pane and
+confirmed the harness's "Exit and stop tasks" dialog by hand, leaving no record.
+
+Proposal: `agentctl stop NAME --exit-harness`, an explicit opt-in that is the
+confirmation for mutating a runtime agentctl does not own.
+
+1. Unregistered pane: `agentctl adopt NAME --pane P ...` first, so the archive
+   has a record; then step 2. Two commands, both recorded.
+2. Under the stop locks: A2 identity check; refuse a paused record, a non-empty
+   composer, or a running turn unless `--interrupt-turn`.
+3. Submit the harness's exit command through the verified submission path
+   (Claude `/exit`, Codex `/quit`; the exact command and its confirmation
+   screens get a screen model per harness, verified in the implementation;
+   other harnesses refuse).
+4. If the harness shows its exit confirmation, accept only the exact
+   recognised dialog and its exit choice; any other screen refuses and leaves
+   the agent running and registered.
+5. Wait (bounded, `--exit-timeout`, default 30 s) until the pane returns to the
+   recorded shell generation (`foreign_shell_identity`, the existing returned-
+   shell proof); then archive as today with `retired_by: exit-harness`, the
+   final snapshot, and the exit dialog text if one was confirmed. The pane and
+   tab stay open unless `--close-pane`, which closes only a pane proven to be at
+   that idle shell.
+
+For owned records the same flag exits the harness gracefully before the tab is
+closed, so the harness can finish writing its own session files (useful for
+revive). Timeout or refusal changes no registry state; the result says which
+step stopped.
+
+## A9. Start defects (landed on main as 8cd29f81b and 3184726cb)
+
+`8cd29f81b` waits up to 15 s for a recognisable composer before typing.
+`3184726cb` finds profiles beside a registry named `.agentctl` when `--cwd`
 has none (`--cwd` still first).
 
 ## B. Revive (parked until Part A lands)
