@@ -1,10 +1,9 @@
 # agentctl: rename, routing-identity checks, and revive (design v2, 2026-10-08)
 
-Status: **Part A (rename, identity checks, doctor) is v2**, revised after the
-v1 review (commit a29e16683): findings 1, 2, 3, 4, 9, 12 and 14. **Part B
-(revive) is parked**; it waits until Part A has landed, and its open findings
-(5, 6, 7, 8, 10, 11, 13) are listed in section B. Both editions (Python and
-Rust) implement Part A; `cross/agentctl_differential.py` covers it.
+Status: **Part A (rename, identity checks, doctor) is implemented** in both
+editions, after two design reviews (v1 a29e16683, v2 b28e90cd8); see section C
+for what was built and verified. **Part B (revive) is parked** until Part A has
+landed; its open findings (5, 6, 7, 8, 10, 11, 13) are listed in section B.
 
 ## 0. Measured facts
 
@@ -59,62 +58,63 @@ Rust) implement Part A; `cross/agentctl_differential.py` covers it.
 Adopted records keep their existing semantics: a different label and a shared
 tab remain valid, and agentctl never renames or relabels a foreign runtime.
 
-## A2. Identity check before every input effect
+## A2. Identity check around every input effect (implemented)
 
-The check runs before **each** text or key effect, not once per operation:
-the paste and every submission-key retry inside `submit_verified`, plus every
-key sent by goal and drain. It runs under the existing pane lock.
+Every text or key effect is verified **immediately before and immediately
+after** it: the paste and every submission-key retry inside `submit_verified`,
+native `agent prompt`, the custom-pane paste and Enter, and the goal-replacement
+Enter (`_GuardedTerminal` / `GuardedTerminal` wrapping the pane I/O of
+`_WorkspaceClient`). It runs under the existing pane lock.
 
 1. existing checks for the class (above);
 2. `terminal_id` and `tab_id` equal the record's (from `agent get NAME` for
    owned records, `pane get` otherwise);
-3. owned and custom: `tab get` label equals the record name, once per operation;
-4. owned: the harness process identity recorded at start (boot id, pid, start
-   ticks, executable device/inode; captured with the existing
-   `process-info` + `/proc` code) is still a foreground process of the pane.
-   This catches a different harness in the same terminal.
+3. owned and custom: `tab get` label equals the record name;
+4. a recipient anchor: owned and adopted records need the harness process
+   pinned at start, adopt or `anchor` (boot id, pid, start ticks, executable
+   device/inode; it must still be the pane's foreground group leader), or an
+   observed native session; custom panes keep `custom_process_identity`, relays
+   their relay process. A record with no anchor refuses input
+   (`agentctl anchor NAME` pins one after the operator checks the pane).
 
-Mismatch refuses, names each differing field, and points at `agentctl doctor`.
-Nothing is re-resolved by label or name.
+Outcomes: a failure before anything was typed leaves the message pending
+(exit 75, retryable); a failure after an earlier effect of the same submission
+quarantines it as possibly submitted; a failure **after** a write quarantines
+it as a probable misroute (exit 76, `"probable_misroute": true` on the message
+in `failed/`). Nothing is re-resolved by label or name.
 
-**Residual window (finding 1).** This does not make misrouting impossible.
-Herdr writes by `pane_id`, so input can still be misdelivered if, between the
-last verification read and Herdr's write, either (a) Herdr restarts and gives
-the same `pane_id` to another pane that is ready for input, or (b) the
-verified harness exits and the pane's shell or a new program receives the
-text. The window is one Herdr round trip per effect (measured in the
-implementation, expected 2-5 ms). For (b), the submission key is sent only
-after a fresh check, and a bracketed paste into a shell with bracketed-paste
-mode does not execute without that key; a shell without it would execute pasted
-lines, which the doc and the error text state plainly. Paranoid mode (A3)
-detects some misdeliveries afterward; it cannot undo them.
+**With the Herdr change (finding 1).** When `herdr status server` prints
+`capabilities: input-expect`, each write also carries `--expect-terminal
+<terminal_id>` and Herdr refuses it (`expectation_failed`, nothing written)
+unless the pane still holds that terminal, checked on Herdr's app thread in the
+same request that queues the bytes. That closes the pane-replacement window
+atomically. The Herdr branch is `agentctl-input-expect` (base: tag v0.8.0, the
+deployed version), commit f8123a94600ecaae9790cad6d901e972df0d2554; its
+protocol number is 20 locally, which is not upstream's 20, so agentctl checks
+the capability, never the number.
 
-**Closing the window needs Herdr.** Proposed upstream change: an optional
-`expect` object on `pane.send_text`, `pane.send_keys`, `agent.prompt` and
-`agent.send_keys` (`terminal_id`, optional foreground pid), compared by the
-server under its pane-table lock immediately before the PTY write, returning
-`expectation_failed` and writing nothing on mismatch. agentctl would use it
-when the schema advertises it and fall back to A2 otherwise. Filing it is the
-owner's call; this design does not depend on it.
+**Residual, stated plainly.** Without that capability Herdr writes by pane id
+alone: a pane replacement between the last check and Herdr's write still
+receives that one effect, which the post-check then quarantines. With it, the
+remaining case is outside Herdr's pane table: the verified harness exiting or
+exec-ing inside the same terminal between the check and the write. The
+post-check detects it afterwards; nothing undoes a write. A bracketed paste
+into a shell with bracketed-paste mode does not execute without the submission
+key, and the key is sent only after a fresh check.
 
-**Legacy records (finding 2).** Records without `terminal_id` or a harness
-process identity are not backfilled from what Herdr shows now, because a
-restarted server can recreate every visible field. Backfill happens only with
-independent evidence: an adopted record whose pinned shell generation still
-owns the pane. Other legacy records keep today's checks plus the label check,
-and doctor reports them as `legacy-unanchored`; they disappear as agents are
-replaced.
+**Legacy records (finding 2).** Nothing is backfilled from what Herdr shows
+now, because a restarted server can recreate every visible field. Records
+written before this change refuse input until `agentctl anchor NAME`, an
+explicit operator assertion; doctor reports them as `unanchored`.
+Rename refuses an unanchored record.
 
-## A3. Check levels
+## A3. No check levels
 
-`--identity-check standard|paranoid`, env `AGENTCTL_IDENTITY_CHECK`, or
-`profiles.json` `"identity_check"` (that precedence). `standard` is A2.
-`paranoid` adds a check after each operation that leaves the agent live
-(`send`, `drain`, `goal`, `read`, `attach`, `rename`, `move`); a post-check
-mismatch exits 76 and marks the processed message `possibly_misrouted`. `stop`
-and the retirement paths (missing pane, returned shell, interrupted move)
-keep their existing operation-specific proofs and have no live-pane post-check.
-There is no "off" level.
+The draft's `standard`/`paranoid` levels were dropped: the check after every
+effect, which `paranoid` was to add, is always on. Its cost, measured with the
+differential's fake Herdr, is 3 Herdr calls per check for an owned agent
+(`agent get`, `tab get`, `process-info`); 2-3 ms each against live Herdr.
+`stop` and the retirement paths keep their own proofs and run no input checks.
 
 ## A4. Registry invariants and lock order
 
@@ -129,6 +129,18 @@ There is no "off" level.
   and bind-session (name, identity).
 
 ## A5. `agentctl rename OLD NEW`
+
+**Record format (re-review finding 8).** The new fields live only on flat
+schema-1 records, which both editions already round-trip unchanged when they
+do not know a key (Python keeps `_unknown`, Rust `#[serde(flatten)] extra`), so
+an older build preserves them: `terminal_id` (string or null),
+`harness_identity` (the existing six-field process identity, or null), and
+`name_history` (list of `{name, renamed_at, journal_id}`, at most 256, journal
+ids unique 32-hex). Nested v2/v3 records are only read, never written by either
+edition; `anchor` and `rename` refuse them, and they stay unanchored. Rename
+journals (`.agentctl/.renames/<token>.json`, schema `agentctl-rename/v1`, 11
+keys) are written and finished by either edition; the differential runs a
+rename interrupted by one edition and finished by the other, both ways.
 
 For a live agent whose warm context is still useful but whose purpose changed.
 
@@ -192,7 +204,7 @@ one `process-info` per record: about 20 ms + 5 ms per record of Herdr time.
 Exit 0 clean, 1 findings, 2 Herdr unreachable. Per record: `pane-missing`,
 `harness-exited`, `harness-replaced`, `terminal-mismatch`, `tab-moved`,
 `label-mismatch`, `herdr-name-mismatch`, `workspace-mismatch`,
-`rename-incomplete`, `legacy-unanchored`. Registry: `duplicate-claim` (two
+`rename-incomplete`, `unanchored`. Registry: `duplicate-claim` (two
 records, one pane or terminal). Workspace: `label-collision`, informational
 `unmanaged-tab`.
 
@@ -213,7 +225,7 @@ tick-hub check) runs it on its own cadence. The user guide shows both.
   receives nothing and the refusal names the field. Harness exits between
   paste and key: no key is sent.
 - Legacy: after a simulated restart that recreates labels, cwd and harness, no
-  backfill occurs and doctor reports `legacy-unanchored`; adopted shell-pinned
+  backfill occurs and doctor reports `unanchored`; adopted shell-pinned
   backfill succeeds.
 - Classes: adopted alias with a different label and a shared tab keeps working
   and is never relabelled; custom adapters keep their process checks.
@@ -239,7 +251,7 @@ tick-hub check) runs it on its own cadence. The user guide shows both.
 - **No wrkslots installed**: start, send, rename, doctor and stop work with
   wrkslots absent from PATH and `AGENTCTL_WRKSLOTS_BIN` unset.
 
-## A8. Retiring a harness agentctl does not own
+## A8. Retiring a harness agentctl does not own (proposed, not built)
 
 Gap seen in use: an agent that was never registered could not be closed
 through agentctl, and `stop` on an adopted record deliberately only
@@ -301,3 +313,46 @@ resolve in revive v2:
   short-token and prefix selection, and `--newest` ties.
 - 13: define behaviour for every wrkslots failure, not only absence, and whether
   revive keeps slot boxing.
+
+## C. What was built and how it was verified (2026-10-08)
+
+Both editions, one commit on the agent-utils branch:
+- `_GuardedTerminal` / `GuardedTerminal` around every input effect; anchors at
+  start and adopt; `anchor`, `rename`, `doctor [--repair-labels]`; duplicate
+  pane/terminal refusal; terminal re-pinned after a verified move.
+- History-aware wrkslots liveness probe (finding 9, including the false-dead
+  case: a stopped OLD archive plus a live NEW renamed from OLD).
+- The differential fake Herdr gained `tab get/list/rename`, `agent
+  list/rename`, `status server` with an optional `input-expect` capability,
+  `--expect-terminal`, and a real process standing in for each harness.
+
+Evidence (this host): Python 2318 related tests plus 25 new identity tests and
+7 new probe tests; Rust agentctl 873 lib tests (843 before); the
+Python-vs-Rust agentctl differential 376 paired checks, 0 divergences,
+including a rename interrupted by one edition and finished by the other, both
+ways. Herdr: 3198 of 3201 tests pass with 16 jobs; the same 3 fail on
+unmodified v0.8.0.
+
+Not built or not proven: `--exit-harness` (A8); revive (B); no end-to-end run
+of agentctl against a server built from the Herdr branch, because that needs a
+second Herdr server on a shared host; no test drives a full verified
+submission with key retries through the guard against a scripted composer
+(each retry goes through the guarded send, which unit tests cover).
+
+## D. Handoff (findings and dead ends)
+
+- Herdr's tab `number` is the base-32 tab id in decimal, not a position;
+  routing ids are stable, labels and Herdr agent names are not.
+- Herdr reports no `agent_session` for Claude panes, so agentctl never had a
+  Claude conversation id; revive needs `--session-id` assigned at launch.
+- The owner's Herdr fork was at 0.7.3 while 0.8.0 runs here; the `expect`
+  branch is based on upstream tag v0.8.0. Upstream master is at protocol 22, so
+  the fork-local 20 must be gated by the `input-expect` capability.
+- Herdr does not reject unknown request fields; never send `expect` to a
+  server that does not advertise the capability.
+- Deploying: records started or adopted before anchors refuse input until
+  `agentctl anchor NAME`; do that per agent after looking at each pane.
+- Dead end: per-operation check levels; the post-effect check is cheap enough
+  (3 Herdr calls, 2-3 ms each) to run always.
+- Dead end: walking up from a slot directory to find profiles; slots live
+  outside the project tree, so the registry's project is the fallback instead.
