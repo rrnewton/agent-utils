@@ -10239,7 +10239,7 @@ test("a thread is named by what its first message says, not by its Markdown", as
 });
 
 test("message text is styled as one block family: bullets, hanging indent, paragraph gaps, headings", () => {
-  // Layout itself is the screenshot walk's to judge (`39-message-blocks`); what can be held here is
+  // Layout itself is the screenshot walk's to judge (`41-message-blocks`); what can be held here is
   // that the rules exist on the selectors that need them.
   assert.match(cssBlock(".md"), /white-space:\s*normal/, "the server's newlines between blocks would draw as lines");
   assert.match(cssBlock(".md ul"), /list-style-type:\s*disc/, "a list has no round bullets");

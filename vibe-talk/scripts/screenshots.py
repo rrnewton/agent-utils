@@ -3823,7 +3823,7 @@ SCENES: tuple[Scene, ...] = (
         ),
     ),
     Scene(
-        name="39-message-blocks",
+        name="41-message-blocks",
         what="an agent's list message as the server rendered it: round bullets, hanging indent, paragraph gaps",
         act=_act_message_blocks,
         profiles=("iphone15", "iphone-se", "desktop", "laptop-1280", "android-412"),

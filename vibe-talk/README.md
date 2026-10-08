@@ -2722,9 +2722,11 @@ the same as a sentence with no Markdown — never as an error and never as unsan
 | Length | 16 KiB | Everything below is linear in the text, so this holds one body to a few milliseconds. Four times the longest Discord or Google Chat message; a Slack post near its own 40,000-character ceiling is drawn as text. |
 | Table cells | 2,000 | GFM pads every row to its header's width, so a wide header over many one-character rows is C × R cells: 2,000 characters made 840 KB of HTML. Counted from the text before parsing; past the budget the message renders with tables off. |
 | Depth | 32 | The sanitizer's HTML parser slows with every element still open, so thousands of nested `>` took seconds. |
-| Growth | 8 × the text + 8 KiB | HTML far larger than its words, such as hundreds of empty checkboxes, is not sent or kept in the offline copy. | A message saved on the device before the field existed is drawn the same way:
-as its text, never as markup. Nothing a model reads carries the field: `/messages`, `/digest`, one
-message by id, the MCP tools, and `/page` unless the page asks with `render=html`.
+| Growth | 8 × the text + 8 KiB | HTML far larger than its words, such as hundreds of empty checkboxes, is not sent or kept in the offline copy. |
+
+A message saved on the device before the field existed is drawn the same way: as its text, never as
+markup. Nothing a model reads carries the field: `/messages`, `/digest`, one message by id, the MCP
+tools, and `/page` unless the page asks with `render=html`.
 
 **What reads which form.** What a row draws is what the fold measures, what search matches and
 what names a thread by its first message. **Copy text copies what was written**, Markdown and all,

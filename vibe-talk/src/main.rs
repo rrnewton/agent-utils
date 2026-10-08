@@ -125,7 +125,7 @@ const SEEDED_BACKLOG: &[(&str, &str)] = &[
     // `#217 markdown-blocks`: the shape of message the page used to draw as literal dashes with
     // the closing lines run together — a paragraph, a list whose items run on to an indented line,
     // a blank line, and two closing paragraphs. The server renders it, so the screenshot walk
-    // photographs the server's rendering (`39-message-blocks`). Under the summary threshold below,
+    // photographs the server's rendering (`41-message-blocks`). Under the summary threshold below,
     // so the long entry after it is still the only one a summary is written for, and over the
     // page's fold, as such an answer is.
     (

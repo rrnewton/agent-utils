@@ -50,8 +50,8 @@ pub mod bearer_layer;
 use axum::extract::DefaultBodyLimit;
 use axum::routing::{delete, get, post};
 use axum::Router;
-use tower_http::compression::predicate::{DefaultPredicate, NotForContentType, Predicate};
-use tower_http::compression::CompressionLayer;
+use tower_http::compression::predicate::{Predicate, SizeAbove};
+use tower_http::compression::{CompressionLayer, CompressionLevel};
 
 use crate::state::AppState;
 
@@ -70,45 +70,41 @@ pub fn router(state: AppState) -> Router {
             state.clone(),
             bearer_layer::require_bearer,
         ))
-        // OUTSIDE the bearer check, so its refusal and a route's carry the same `vary` header:
-        // compression adds one to every answer it sees, and a 401 that lacked it would tell an
-        // anonymous caller which paths reached a route. `tests/scope_first.rs` compares the two.
-        .layer(compression())
         .layer(axum::middleware::from_fn_with_state(
             state,
             access_layer::log_requests,
         ))
         // Outermost, so the access log and the bearer check see the request as sent and the body
-        // is compressed last. Brotli or gzip, whichever the client offers first by preference. The
-        // default predicate already leaves alone what compression only hurts — bodies under 32
-        // bytes, images, and `text/event-stream`, which must reach the page one event at a time —
-        // and audio is added to it: the read-aloud stream is already compressed and is played as
-        // it arrives, so an encoder buffering it would only delay the first sound.
-        .layer(
-            CompressionLayer::new()
-                .compress_when(DefaultPredicate::new().and(NotForContentType::const_new("audio/"))),
-        )
+        // is compressed last. Brotli or gzip, whichever the client offers first by preference; what
+        // is compressed, and how hard, is [`compression`]'s business.
+        //
+        // And so OUTSIDE the bearer check, which `#217 markdown-blocks` found matters: compression
+        // adds a `vary` header to every answer it sees, so a 401 it never saw would lack the one a
+        // route's answer carries and tell an anonymous caller which paths reached a route.
+        // `tests/scope_first.rs` compares the two.
+        .layer(compression())
 }
 
 /// Response compression, gzip or brotli as the browser offers. `#217 markdown-blocks`.
 ///
-/// The page is one large script fetched with `no-store` on every load, and every channel read is
-/// JSON whose message bodies now come with their rendered HTML beside them. Both are text that
-/// compresses to a fraction of itself, and the reader is on a phone's connection.
+/// Nothing the server sent used to be compressed. The page's script is one large file, fetched
+/// whole on every cold load and again after every release (`assets` names it by its content hash
+/// so a browser may keep it in between), and every channel read is JSON whose message bodies now
+/// come with their rendered HTML beside them. Both are text that compresses to a fraction of
+/// itself, and the reader is on a phone's connection.
 ///
 /// BY CONTENT TYPE, and an allowlist rather than a list of exceptions: the page, its script and
 /// styles, its manifest, and JSON. Not the live stream, which must reach the page event by event
 /// rather than when a compressor's buffer fills, and not read-aloud audio, which is compressed
-/// already and is forwarded as it arrives. Anything added later stays uncompressed until it is
-/// named here, which costs bytes but never breaks a stream.
+/// already and is forwarded as it arrives, so an encoder buffering it would only delay the first
+/// sound. Anything added later stays uncompressed until it is named here, which costs bytes but
+/// never breaks a stream. Bodies under 32 bytes are left alone, as the default predicate did.
 ///
 /// Quality 5, for both encoders. The default for brotli is its maximum, eleven, which spends tens
-/// of milliseconds of CPU on every load of a script nothing caches; five keeps most of the saving
-/// for a small fraction of that. A request without `Accept-Encoding` is answered exactly as before.
-fn compression(
-) -> tower_http::compression::CompressionLayer<impl tower_http::compression::Predicate> {
-    use tower_http::compression::predicate::{Predicate, SizeAbove};
-    use tower_http::compression::{CompressionLayer, CompressionLevel};
+/// of milliseconds of CPU on every request for the script, compressed afresh each time; five keeps
+/// most of the saving for a small fraction of that. A request without `Accept-Encoding` is
+/// answered exactly as before.
+fn compression() -> CompressionLayer<impl Predicate> {
     let compressible = |_: axum::http::StatusCode,
                         _: axum::http::Version,
                         headers: &axum::http::HeaderMap,

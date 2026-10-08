@@ -95,12 +95,6 @@ tokio-tungstenite = { version = "0.30", default-features = false, features = [
     "rustls-tls-webpki-roots",
 ] }
 toml = "0.8"
-# Response compression for the page, its assets and its JSON. Already in the tree through reqwest;
-# these features add only the two encoders. See `crate::http::router`.
-tower-http = { version = "0.6", default-features = false, features = [
-    "compression-br",
-    "compression-gzip",
-] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # Response compression. Everything the server sent went out uncompressed — the page script alone
