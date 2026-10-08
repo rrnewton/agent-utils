@@ -38,6 +38,11 @@ pub const SCREEN_LINES: usize = 200;
 pub const STAGE_TIMEOUT: Duration = Duration::from_secs(60);
 /// Maximum time spent retrying the submission key and waiting for corroboration.
 pub const SUBMIT_TIMEOUT: Duration = Duration::from_secs(60);
+/// Maximum time spent waiting, before typing anything, for a recognisable composer.
+///
+/// Herdr can report a freshly launched harness ready before it has drawn its composer.
+/// Nothing is typed while waiting, so the wait cannot duplicate a prompt.
+pub const COMPOSER_WAIT: Duration = Duration::from_secs(15);
 /// First wait before a still-staged prompt receives another submission key.
 pub const FIRST_RETRY: Duration = Duration::from_millis(500);
 /// Upper bound on the doubling wait between submission keys.
@@ -123,6 +128,8 @@ pub struct SubmitTimeouts {
     pub stage: Duration,
     /// Wait for the submission to be proven.
     pub submit: Duration,
+    /// Wait, before typing, for a recognisable composer.
+    pub composer: Duration,
 }
 
 impl Default for SubmitTimeouts {
@@ -130,6 +137,7 @@ impl Default for SubmitTimeouts {
         Self {
             stage: STAGE_TIMEOUT,
             submit: SUBMIT_TIMEOUT,
+            composer: COMPOSER_WAIT,
         }
     }
 }
@@ -705,13 +713,27 @@ pub fn submit_verified(
             "pane {pane_id}: delivery was cancelled before typing"
         ));
     }
-    let screen = match terminal.read_screen(pane_id) {
-        Ok(screen) => screen,
-        Err(error) => {
-            return refuse(format!(
-                "pane {pane_id}: composer read failed before typing: {error}"
-            ))
+    let composer_deadline = runtime.monotonic() + timeouts.composer;
+    let (screen, before) = loop {
+        let screen = match terminal.read_screen(pane_id) {
+            Ok(screen) => screen,
+            Err(error) => {
+                return refuse(format!(
+                    "pane {pane_id}: composer read failed before typing: {error}"
+                ))
+            }
+        };
+        if let Some(before) = composer_view(harness, &screen) {
+            break (screen, before);
         }
+        if runtime.monotonic() >= composer_deadline || runtime.cancelled() {
+            return refuse(format!(
+                "pane {pane_id} does not show a recognisable {harness} composer after {}s \
+                 (a dialog or menu may be open); nothing was typed",
+                timeouts.composer.as_secs_f64()
+            ));
+        }
+        runtime.sleep(POLL);
     };
     let mut shown = ShownBefore {
         queue_marker: queue_marker(&screen).is_some(),
@@ -719,12 +741,6 @@ pub fn submit_verified(
         // row, may be hiding a running turn.
         running_turn: running_turn(&screen) != Some(false),
         ..ShownBefore::new(text)
-    };
-    let Some(before) = composer_view(harness, &screen) else {
-        return refuse(format!(
-            "pane {pane_id} does not show a recognisable {harness} composer \
-             (a dialog or menu may be open); nothing was typed"
-        ));
     };
     shown.note_before_paste(&before);
     let draft = before.composer_solid.trim();
@@ -931,6 +947,9 @@ pub(crate) mod fake {
         pub paste_visible_after_reads: u32,
         pub redraw_lag_reads: u32,
         pub dialog: bool,
+        /// Reads that still show the dialog before the composer is drawn, as a freshly
+        /// launched harness does; the dialog closes on the last of them.
+        pub dialog_reads: u32,
         /// Label Claude draws into the composer's top border, such as a mode name.
         pub top_border_label: Option<String>,
         /// Glyph Codex draws before its composer: `›` before v0.159.1, `»` from it.
@@ -1033,6 +1052,10 @@ pub(crate) mod fake {
     impl PromptTerminal for FakeScreen {
         fn read_screen(&self, _pane_id: &str) -> Result<String> {
             let mut state = self.state();
+            if state.dialog_reads > 0 {
+                state.dialog_reads -= 1;
+                state.dialog = state.dialog_reads > 0;
+            }
             if state.pending_reads > 0 {
                 if let Some(stale) = state.stale_screen.clone() {
                     state.pending_reads -= 1;
@@ -1315,6 +1338,7 @@ mod tests {
             SubmitTimeouts {
                 stage: STAGE_TIMEOUT,
                 submit: Duration::from_secs(20),
+                ..SubmitTimeouts::default()
             },
         );
         let message = outcome.unwrap_err().to_string();
@@ -1334,6 +1358,38 @@ mod tests {
         screen.state().composer = "someone else's words".to_owned();
         let reason = refusal(submit(&screen, "mine"));
         assert!(reason.contains("refusing to append"), "{reason}");
+        let state = screen.state();
+        assert!(state.pastes.is_empty() && state.keys.is_empty());
+    }
+
+    #[test]
+    fn late_composer_is_awaited_before_typing() {
+        let screen = FakeScreen::new("claude", false);
+        screen.state().dialog = true;
+        screen.state().dialog_reads = 3;
+        let receipt = receipt(submit(&screen, "the brief"));
+        assert_eq!(receipt.key, "Enter");
+        let state = screen.state();
+        assert_eq!(state.pastes, ["the brief"]);
+        assert_eq!(state.submitted, ["the brief"]);
+    }
+
+    #[test]
+    fn composer_wait_is_bounded_and_types_nothing() {
+        let screen = FakeScreen::new("claude", false);
+        screen.state().dialog = true;
+        let (outcome, elapsed) = submit_with(
+            &screen,
+            "the brief",
+            SubmitTimeouts {
+                composer: Duration::from_secs(2),
+                ..SubmitTimeouts::default()
+            },
+        );
+        let reason = refusal(outcome);
+        assert!(reason.contains("after 2s"), "{reason}");
+        assert!(reason.contains("nothing was typed"), "{reason}");
+        assert!(elapsed >= Duration::from_secs(2), "{elapsed:?}");
         let state = screen.state();
         assert!(state.pastes.is_empty() && state.keys.is_empty());
     }

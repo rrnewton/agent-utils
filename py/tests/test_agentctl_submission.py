@@ -288,6 +288,42 @@ def test_unrecognised_screen_is_refused_before_typing() -> None:
     assert agent.pastes == [] and agent.keys == []
 
 
+class LateComposerAgent(FakeAgent):
+    """A freshly launched harness whose composer is drawn only after a few reads."""
+
+    def __init__(self, harness: str, *, hidden_reads: int) -> None:
+        super().__init__(harness)
+        self.hidden_reads = hidden_reads
+        self.dialog = True
+
+    def read_screen(self, pane_id: str) -> str:
+        if self.hidden_reads > 0:
+            self.hidden_reads -= 1
+            if self.hidden_reads == 0:
+                self.dialog = False
+        return super().read_screen(pane_id)
+
+
+def test_late_composer_is_awaited_before_typing() -> None:
+    agent = LateComposerAgent("claude", hidden_reads=3)
+    receipt = _submit(agent, "the brief")
+    assert receipt is not None
+    assert agent.pastes == ["the brief"] and agent.submitted == ["the brief"]
+
+
+def test_composer_wait_is_bounded_and_types_nothing() -> None:
+    agent = FakeAgent("claude")
+    agent.dialog = True
+    clock = Clock()
+    with pytest.raises(PromptNotStaged, match=r"after 2s .*nothing was typed"):
+        submit_verified(
+            agent, "w1:p1", "claude", "the brief", composer_timeout=2.0,
+            sleep=clock.sleep, monotonic=clock.monotonic,
+        )
+    assert agent.pastes == [] and agent.keys == []
+    assert clock.now - 1000.0 >= 2.0
+
+
 def test_labelled_claude_top_border_still_frames_the_composer() -> None:
     agent = FakeAgent("claude")
     agent.top_border_label = "ultracode"

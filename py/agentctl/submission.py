@@ -61,6 +61,10 @@ SCREEN_LINES = 200
 STAGE_TIMEOUT_SECONDS = 60.0
 #: Maximum time spent retrying the submission key and waiting for corroboration.
 SUBMIT_TIMEOUT_SECONDS = 60.0
+#: Maximum time spent waiting, before typing anything, for a recognisable composer.
+#: Herdr can report a freshly launched harness ready before it has drawn its
+#: composer; nothing is typed while waiting, so the wait cannot duplicate a prompt.
+COMPOSER_WAIT_SECONDS = 15.0
 #: First wait before a still-staged prompt receives another submission key.
 FIRST_RETRY_SECONDS = 0.5
 #: Upper bound on the doubling wait between submission keys.
@@ -332,6 +336,7 @@ def submit_verified(
     *,
     stage_timeout: float | None = None,
     submit_timeout: float | None = None,
+    composer_timeout: float | None = None,
     sleep: Callable[[float], None] = time.sleep,
     monotonic: Callable[[], float] = time.monotonic,
 ) -> SubmissionReceipt:
@@ -340,10 +345,13 @@ def submit_verified(
     The submission key is repeated with a doubling wait while the exact text is
     still staged, so a key the agent dropped is retried without typing the
     prompt twice. A key is never repeated once the text has left the composer.
+    Before typing, it waits up to ``composer_timeout`` for a recognisable composer,
+    because a freshly launched harness can be reported ready before it draws one.
     Omitted timeouts use the module defaults at call time.
     """
     stage_timeout = STAGE_TIMEOUT_SECONDS if stage_timeout is None else stage_timeout
     submit_timeout = SUBMIT_TIMEOUT_SECONDS if submit_timeout is None else submit_timeout
+    composer_timeout = COMPOSER_WAIT_SECONDS if composer_timeout is None else composer_timeout
     if harness not in VERIFIED_HARNESSES:
         raise PromptNotStaged(f"no composer model for harness {harness!r}; nothing was typed")
     if not text.strip():
@@ -352,18 +360,24 @@ def submit_verified(
         raise PromptNotStaged(
             "prompt text contains NUL or terminal escape characters; nothing was typed"
         )
-    try:
-        screen = terminal.read_screen(pane_id)
-    except HerdrUnavailable as exc:
-        raise PromptNotStaged(
-            f"pane {pane_id}: composer read failed before typing: {exc}"
-        ) from exc
-    before = composer_view(harness, screen)
-    if before is None:
-        raise PromptNotStaged(
-            f"pane {pane_id} does not show a recognisable {harness} composer "
-            "(a dialog or menu may be open); nothing was typed"
-        )
+    composer_deadline = monotonic() + composer_timeout
+    while True:
+        try:
+            screen = terminal.read_screen(pane_id)
+        except HerdrUnavailable as exc:
+            raise PromptNotStaged(
+                f"pane {pane_id}: composer read failed before typing: {exc}"
+            ) from exc
+        before = composer_view(harness, screen)
+        if before is not None:
+            break
+        if monotonic() >= composer_deadline:
+            raise PromptNotStaged(
+                f"pane {pane_id} does not show a recognisable {harness} composer "
+                f"after {composer_timeout:g}s (a dialog or menu may be open); "
+                "nothing was typed"
+            )
+        sleep(POLL_SECONDS)
     draft = before.composer_solid.strip()
     if draft:
         preview = " ".join(draft.split())[:120]

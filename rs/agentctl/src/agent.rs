@@ -2813,6 +2813,7 @@ mod tests {
                         crate::submission::SubmitTimeouts {
                             stage: Duration::from_secs(3),
                             submit: Duration::from_secs(5),
+                            ..crate::submission::SubmitTimeouts::default()
                         },
                         runtime,
                     )
