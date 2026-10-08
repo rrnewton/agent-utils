@@ -1,10 +1,11 @@
 ---
 title: 'read-modes: open a thread on its first unread message, collapse the read ones before it, and cycle Show/Collapse/Hide read'
-status: open
+status: closed
 priority: 2
 issue_type: feature
 created_at: 2026-10-08T16:10:54.285400617+00:00
-updated_at: 2026-10-08T16:10:54.285400617+00:00
+updated_at: 2026-10-08T23:42:29.526069689+00:00
+closed_at: 2026-10-08T23:42:29.526069560+00:00
 ---
 
 # Description
