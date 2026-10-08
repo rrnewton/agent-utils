@@ -497,6 +497,41 @@ def load_profiles(cwd: str | Path, *, absent_ok: bool = False) -> tuple[Path, di
     return path, profiles
 
 
+def configuration_root(
+    cwd: str | Path, registry: str | Path, *, absent_ok: bool = False,
+) -> Path:
+    """Choose the directory whose ``.agentctl/profiles.json`` governs a start in *cwd*.
+
+    *cwd* wins when it has a profile file. Otherwise a conventional registry's
+    project (the parent of a registry directory named ``.agentctl``) is used,
+    the same project workspace policy is read from, so an agent started in a
+    worktree outside that project still finds the project's profiles. When
+    neither has one, the refusal names both paths, or with *absent_ok* *cwd* is
+    returned.
+    """
+    root = Path(cwd).expanduser().resolve()
+    candidates = [root]
+    registry_root = Path(registry).expanduser().resolve()
+    if registry_root.name == ".agentctl" and registry_root.parent != root:
+        candidates.append(registry_root.parent)
+    for candidate in candidates:
+        try:
+            profile_path(candidate).lstat()
+        except FileNotFoundError:
+            continue
+        except OSError as exc:
+            raise AgentDeliveryError(
+                f"cannot inspect profile config {profile_path(candidate)}: {exc}"
+            ) from exc
+        return candidate
+    if len(candidates) > 1 and not absent_ok:
+        raise AgentDeliveryError(
+            f"profile config does not exist: {profile_path(candidates[0])} "
+            f"(nor beside the registry: {profile_path(candidates[1])})"
+        )
+    return root
+
+
 def workspace_for_registry(registry: str | Path) -> str | None:
     """Read only workspace policy for a conventional project registry.
 

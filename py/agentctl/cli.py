@@ -19,7 +19,7 @@ from agentctl.errors import AgentPending, AgentPossiblySubmitted, HerdrRunError
 from agentctl.legacy_cli import _ascii_float, _bounded_uint
 from agentctl.profiles import (
     AGENTCLOUD_HARNESS,
-    load_configuration, load_profiles, validate_raw_harness_arguments,
+    configuration_root, load_configuration, load_profiles, validate_raw_harness_arguments,
 )
 from agentctl.sessions import Sessions
 from agentctl.skill_install import install_skill
@@ -88,7 +88,9 @@ def parser() -> argparse.ArgumentParser:
         "agentctl start reviewer --harness codex --cwd . --brief 'Review this change'", named=True)
     start.add_argument("--cwd", default=".", metavar="DIR", help="worker working directory (default: current directory)")
     start.add_argument("--profile", metavar="NAME",
-        help="owner-configured profile from CWD/.agentctl/profiles.json; conflicts with harness launch settings")
+        help="owner-configured profile from CWD/.agentctl/profiles.json, or, when CWD has none, from the "
+             "profiles.json beside a registry named .agentctl (so a worktree outside the project "
+             "uses the project's profiles); conflicts with harness launch settings")
     start.add_argument("--mode", choices=("interactive", "headless"), default=None,
         help="interactive keeps a native TUI; headless runs resumable structured turns (default: interactive)")
     start.add_argument("--backend", choices=("herdr", "tmux"), default="herdr",
@@ -200,7 +202,8 @@ def parser() -> argparse.ArgumentParser:
     profiles = command("profiles", "List safe metadata for ignored private launch profiles.",
         "agentctl profiles --cwd /work/project")
     profiles.add_argument("--cwd", default=".", metavar="DIR",
-        help="project directory containing .agentctl/profiles.json (default: current directory)")
+        help="project directory containing .agentctl/profiles.json (default: current directory); "
+             "when it has none, the profiles.json beside a registry named .agentctl is listed")
     skill = commands.add_parser("skill", help="Install the bundled agentctl harness skill.",
         description="Install the bundled agentctl harness skill.", allow_abbrev=False)
     _common(skill, inherited=True)
@@ -274,7 +277,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         return _serve(args.registry, args.herdr_bin)
     try:
         if args.command == "profiles":
-            path, profiles, workspace = load_configuration(args.cwd, absent_ok=True)
+            config_root = configuration_root(args.cwd, args.registry, absent_ok=True)
+            path, profiles, workspace = load_configuration(config_root, absent_ok=True)
             print(json.dumps({"path": str(path), "workspace": workspace,
                 "profiles": [item.public() for item in profiles.values()]},
                 indent=2, sort_keys=True))
@@ -314,7 +318,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     overlaps.append("--env")
                 if overlaps:
                     raise ValueError(f"--profile conflicts with explicit launch settings: {', '.join(overlaps)}")
-                _path, available = load_profiles(args.cwd)
+                _path, available = load_profiles(configuration_root(args.cwd, args.registry))
                 try:
                     profile = available[args.profile]
                 except KeyError as exc:

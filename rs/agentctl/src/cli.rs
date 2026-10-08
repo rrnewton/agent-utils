@@ -202,7 +202,9 @@ struct Start {
     /// Working directory for the new harness
     #[arg(long, default_value = ".", value_name = "DIR")]
     cwd: PathBuf,
-    /// Owner-configured profile from CWD/.agentctl/profiles.json
+    /// Owner-configured profile from CWD/.agentctl/profiles.json, or, when CWD has none, from the
+    /// profiles.json beside a registry named .agentctl (so a worktree outside the project uses the
+    /// project's profiles)
     #[arg(long)]
     profile: Option<String>,
     /// Execution mode; headless workers require an installation with the worker extension
@@ -289,7 +291,8 @@ struct Start {
 
 #[derive(Args)]
 struct Profiles {
-    /// Project directory containing .agentctl/profiles.json
+    /// Project directory containing .agentctl/profiles.json; when it has none, the profiles.json
+    /// beside a registry named .agentctl is listed
     #[arg(long, default_value = ".", value_name = "DIR")]
     cwd: PathBuf,
 }
@@ -955,8 +958,8 @@ fn run(args: Cli, environment: &dyn Fn(&str) -> Option<String>) -> Result<i32, F
             .map_err(Failure::Inbox);
         }
         Commands::Profiles(value) => {
-            let (path, profiles, workspace) =
-                crate::profiles::load_configuration(&value.cwd, true)?;
+            let root = crate::profiles::configuration_root(&value.cwd, &args.registry, true)?;
+            let (path, profiles, workspace) = crate::profiles::load_configuration(&root, true)?;
             write_json(&json!({
                 "path": path,
                 "workspace": workspace,
@@ -1042,7 +1045,9 @@ fn run(args: Cli, environment: &dyn Fn(&str) -> Option<String>) -> Result<i32, F
                             overlaps.join(", ")
                         )));
                     }
-                    let (_, profiles) = crate::profiles::load_profiles(&value.cwd, false)?;
+                    let root =
+                        crate::profiles::configuration_root(&value.cwd, &args.registry, false)?;
+                    let (_, profiles) = crate::profiles::load_profiles(&root, false)?;
                     let profile = profiles.get(profile_name).ok_or_else(|| {
                         Failure::Usage(format!(
                             "unknown profile {profile_name:?}; run agentctl profiles --cwd {}",

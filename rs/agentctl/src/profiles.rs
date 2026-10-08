@@ -736,6 +736,62 @@ pub(crate) fn load_profiles(
     Ok((path, profiles))
 }
 
+/// Choose the directory whose `.agentctl/profiles.json` governs a start in `cwd`.
+///
+/// `cwd` wins when it has a profile file. Otherwise a conventional registry's project (the
+/// parent of a registry directory named `.agentctl`) is used, the same project workspace policy
+/// is read from, so an agent started in a worktree outside that project still finds the
+/// project's profiles. When neither has one, the refusal names both paths, or with `absent_ok`
+/// `cwd` is returned.
+pub(crate) fn configuration_root(
+    cwd: &Path,
+    registry: &Path,
+    absent_ok: bool,
+) -> Result<PathBuf, AgentError> {
+    let root = fs::canonicalize(cwd).map_err(|error| {
+        fail(format!(
+            "cwd is not a directory: {}: {error}",
+            cwd.display()
+        ))
+    })?;
+    let mut candidates = vec![root.clone()];
+    if registry.file_name().and_then(|name| name.to_str()) == Some(".agentctl") {
+        let registry = std::path::absolute(registry).map_err(|error| {
+            fail(format!(
+                "cannot resolve agent registry {}: {error}",
+                registry.display()
+            ))
+        })?;
+        if let Some(parent) = registry.parent() {
+            let parent = fs::canonicalize(parent).unwrap_or_else(|_| parent.to_path_buf());
+            if parent != root {
+                candidates.push(parent);
+            }
+        }
+    }
+    for candidate in &candidates {
+        let path = candidate.join(PROFILE_PATH);
+        match fs::symlink_metadata(&path) {
+            Ok(_) => return Ok(candidate.clone()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(fail(format!(
+                    "cannot inspect profile config {}: {error}",
+                    path.display()
+                )))
+            }
+        }
+    }
+    if candidates.len() > 1 && !absent_ok {
+        return Err(fail(format!(
+            "profile config does not exist: {} (nor beside the registry: {})",
+            candidates[0].join(PROFILE_PATH).display(),
+            candidates[1].join(PROFILE_PATH).display()
+        )));
+    }
+    Ok(root)
+}
+
 /// Read the workspace policy belonging to a conventional project registry.
 ///
 /// Nonstandard registry directories use the default behavior: they do
@@ -923,6 +979,67 @@ mod tests {
         let error = workspace_for_registry(&directory).unwrap_err();
         assert!(error.to_string().contains("duplicate key \"workspace\""));
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn worktree_without_profiles_uses_the_registry_project_profiles() {
+        let base = std::env::temp_dir().join(format!(
+            "agentctl-profile-root-{}-{}",
+            std::process::id(),
+            SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        ));
+        let project = base.join("project");
+        let slot = base.join("worktrees").join("slot-a");
+        let bare = base.join("bare");
+        for directory in [&project, &slot, &bare] {
+            fs::create_dir_all(directory).unwrap();
+        }
+        assert!(Command::new(SYSTEM_GIT)
+            .args(["init", "-q"])
+            .arg(&project)
+            .status()
+            .unwrap()
+            .success());
+        fs::write(project.join(".gitignore"), ".agentctl/\n").unwrap();
+        let registry = project.join(".agentctl");
+        fs::create_dir(&registry).unwrap();
+        fs::set_permissions(&registry, fs::Permissions::from_mode(0o700)).unwrap();
+        let path = registry.join("profiles.json");
+        fs::write(
+            &path,
+            r#"{"schema":"agentctl-profiles/v1","profiles":{"local":{"harness":"codex","mode":"interactive"}}}"#,
+        )
+        .unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        let project = fs::canonicalize(&project).unwrap();
+
+        let root = configuration_root(&slot, &registry, false).unwrap();
+        assert_eq!(root, project);
+        let (_, profiles) = load_profiles(&root, false).unwrap();
+        assert!(profiles.contains_key("local"));
+        // The working directory's own profiles win.
+        assert_eq!(
+            configuration_root(&project, &registry, false).unwrap(),
+            project
+        );
+        // Neither has profiles: the refusal names both paths.
+        let unconfigured = base.join("unconfigured").join(".agentctl");
+        let error = configuration_root(&bare, &unconfigured, false).unwrap_err();
+        assert!(
+            error.to_string().contains("nor beside the registry"),
+            "{error}"
+        );
+        let bare = fs::canonicalize(&bare).unwrap();
+        assert_eq!(
+            configuration_root(&bare, &unconfigured, true).unwrap(),
+            bare
+        );
+        // A registry not named .agentctl lends no profiles, as for workspace policy.
+        assert_eq!(
+            configuration_root(&bare, &project.join("registry"), true).unwrap(),
+            bare
+        );
+        fs::remove_dir_all(base).unwrap();
     }
 
     fn parse(profile: serde_json::Value) -> Result<LaunchProfile, AgentError> {

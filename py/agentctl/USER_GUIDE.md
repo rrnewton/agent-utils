@@ -228,7 +228,11 @@ creating worktrees.
 ## Private launch profiles and harness skills
 
 Repeated harness policy can live in `.agentctl/profiles.json` under the working
-directory. The file is deliberately project-local and untracked. `agentctl`
+directory. When `--cwd` has no profile file, `start --profile` and `profiles`
+use the one beside the registry, when the registry directory is named
+`.agentctl`: an agent started in a worktree outside the project (for example a
+slot directory) still uses the project's profiles. The file is deliberately
+project-local and untracked. `agentctl`
 requires `.agentctl/` to match a Git ignore rule, requires the directory and
 file to be owned by the current user with no group or other permissions, and
 refuses symlinks, hard links, unknown fields, malformed text, NUL, and

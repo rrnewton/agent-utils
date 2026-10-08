@@ -18,6 +18,7 @@ from agentctl import cli, mcp
 from agentctl.client import HerdrClient, Pane
 from agentctl.errors import AgentDeliveryError
 from agentctl.profiles import (
+    configuration_root,
     load_configuration, load_profiles, validate_muse_headless_arguments,
     workspace_for_registry,
 )
@@ -746,3 +747,53 @@ def test_relay_records_round_trip_and_admit_only_relay_harnesses(tmp_path: Path)
         else:
             with pytest.raises(AgentDeliveryError):
                 AgentRecord.load(path, "w")
+
+
+def test_profiles_come_from_the_registry_project_when_cwd_has_none(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+) -> None:
+    project = tmp_path / "project"
+    project.mkdir()
+    _write_profiles(project, {"local": {"harness": "codex", "mode": "interactive"}})
+    slot = tmp_path / "worktrees" / "slot-a"
+    slot.mkdir(parents=True)
+    registry = project / ".agentctl"
+    assert configuration_root(slot, registry) == project.resolve()
+    assert cli.main(["profiles", "--cwd", str(slot), "--registry", str(registry)]) == 0
+    listed = json.loads(capsys.readouterr().out)
+    assert listed["path"] == str(project.resolve() / ".agentctl" / "profiles.json")
+    assert [item["name"] for item in listed["profiles"]] == ["local"]
+
+    monkeypatch.delenv("HERDR_WORKSPACE_ID", raising=False)
+    fake = FakeManagedClient()
+    monkeypatch.setattr(cli, "HerdrClient", lambda **_kwargs: cast(HerdrClient, fake))
+    assert cli.main([
+        "start", "worker", "--cwd", str(slot), "--registry", str(registry),
+        "--profile", "local",
+    ]) == 0
+    capsys.readouterr()
+    assert len(fake.launched) == 1
+    record = json.loads((registry / "worker" / "agent.json").read_text(encoding="utf-8"))
+    assert record["cwd"] == str(slot.resolve())
+
+
+def test_cwd_profiles_win_and_missing_profiles_name_both_paths(tmp_path: Path) -> None:
+    project = tmp_path / "project"
+    project.mkdir()
+    _write_profiles(project, {"local": {"harness": "codex", "mode": "interactive"}})
+    other = tmp_path / "other"
+    other.mkdir()
+    _write_profiles(other, {"own": {"harness": "claude", "mode": "interactive"}})
+    registry = project / ".agentctl"
+    assert configuration_root(other, registry) == other.resolve()
+
+    bare = tmp_path / "bare"
+    bare.mkdir()
+    unconfigured = tmp_path / "unconfigured" / ".agentctl"
+    with pytest.raises(AgentDeliveryError, match="nor beside the registry"):
+        configuration_root(bare, unconfigured)
+    assert configuration_root(bare, unconfigured, absent_ok=True) == bare.resolve()
+    # A registry not named .agentctl lends no profiles, as for workspace policy.
+    assert configuration_root(bare, project / "registry", absent_ok=True) == bare.resolve()
+    with pytest.raises(AgentDeliveryError, match="profile config does not exist"):
+        load_profiles(configuration_root(bare, project / "registry"))
