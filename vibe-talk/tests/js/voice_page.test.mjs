@@ -27556,3 +27556,99 @@ test("a kind turned off or on keeps a reader at the newest line there, and asks 
   assert.ok(atBottomOf(area), "turning PRs back on left the reader short of the newest link");
   assert.equal(page.pageReads, reads, "a kind cost a round trip to the server");
 });
+
+// `#212 link-filter`, from review. A list the filters empty says why at its head (`#search-empty`), but
+// its rows' going does not make it short: the channel's composer stays below every list, so with the
+// bar's room above it the list still overflowed a phone, and a reader at the newest line — where Links
+// and the kinds leave one — had the sentence scrolled up under the kinds of link it names, or off the
+// screen with the keyboard up. tests/offline_cache_browser.py measures that; this pins down where the
+// page puts the reader. Hidden rows keep their height in this fixture, which stands in for the composer.
+
+test("a list the filters empty is shown from its head, where it says why, and filled again opens at its newest", async () => {
+  const run = async (script) => {
+    const page = newPage(new Map(), script);
+    await signIn(page);
+    await showDiscord(page, Array.from({ length: 30 }, (_unused, i) =>
+      message({ id: String(i + 1), content: `note ${i}: ${REPO}/pull/${i + 1}` })));
+    await showLinks(page);
+    return page;
+  };
+  const page = await run(SCRIPT);
+  const area = page.el("scroll-area");
+  const sentence = page.el("search-empty");
+  const sentenceInView = () => {
+    const box = sentence.getBoundingClientRect();
+    return !sentence.hidden && box.top >= 0 && box.bottom <= area.clientHeight;
+  };
+  assert.ok(atBottomOf(area) && area.scrollTop > 2 * area.clientHeight,
+    "the fixture does not leave a reader at the newest line a screen or more below the head of the list");
+
+  // Every link is a pull request: PRs off empties the list, and the reader is taken to the sentence.
+  await tapKind(page, "pr");
+  assert.equal(sentence.textContent, "No links left once PRs are hidden — turn them back on under the Links button.");
+  assert.equal(area.scrollTop, 0, "the reader was left at the foot of a list that says why it is empty at its head");
+  assert.ok(sentenceInView(), "the sentence is not on screen");
+  // The scroll that put the reader there, as a browser delivers it: no jump is offered past the sentence.
+  await area.dispatch("scroll");
+  assert.equal(page.el("jump-newest").hidden, true, "the jump offers a newest message in a list with none shown");
+  // PRs on from there: the links are back, and the list opens at its newest, not its oldest.
+  await tapKind(page, "pr");
+  assert.equal(sentence.hidden, true);
+  assert.ok(atBottomOf(area), "the links came back with the reader at the oldest of them");
+
+  // The same for the search text: matching nothing, the sentence; matching again, the newest line.
+  await page.el("search-field").setValue("no such words");
+  assert.equal(sentence.textContent, "None of the loaded messages with a link match that search.");
+  assert.equal(area.scrollTop, 0, "text that matches nothing left the reader short of the sentence");
+  await page.el("search-field").setValue("note");
+  assert.equal(sentence.hidden, true);
+  assert.ok(atBottomOf(area), "text that matches again left the reader at the oldest match");
+
+  // Only after the reader's own act: a poll redrawing the emptied list leaves a reader who went down
+  // to the composer at the composer.
+  await tapKind(page, "pr");
+  area.scrollTop = area.scrollHeight;
+  await reReadChannel(page);
+  assert.equal(sentence.hidden, false);
+  assert.ok(atBottomOf(area), "a poll took the reader from the composer back up to the sentence");
+
+  // THE CONTROLS: each half of `placeForFilter`, and the jump, taken out, and the step above that
+  // needs it fails.
+  const unplaced = await run(brokenScript(
+    '  if (listEmptied()) el("scroll-area").scrollTop = 0;', '  if (listEmptied()) void 0;'));
+  await tapKind(unplaced, "pr");
+  assert.ok(unplaced.el("scroll-area").scrollTop > 0, "the test cannot see a reader left below the sentence");
+  const jumping = await run(brokenScript(
+    "    shown = !listEmptied() && (inScrollback[currentView] || jumpNewestWanted[currentView] !== false);",
+    "    shown = inScrollback[currentView] || jumpNewestWanted[currentView] !== false;"));
+  await tapKind(jumping, "pr");
+  await jumping.el("scroll-area").dispatch("scroll");
+  assert.equal(jumping.el("jump-newest").hidden, false, "the test cannot see a jump offered over an emptied list");
+  const unfilled = await run(brokenScript("  else if (wasEmptied) scrollToNewest();", "  else if (wasEmptied) void 0;"));
+  await tapKind(unfilled, "pr");
+  await tapKind(unfilled, "pr");
+  assert.ok(!atBottomOf(unfilled.el("scroll-area")), "the test cannot see links come back above the reader");
+});
+
+test("Links over a channel with no link shows the sentence, and off puts the reader back where they were", async () => {
+  const page = newPage();
+  await signIn(page);
+  await showDiscord(page, Array.from({ length: 30 }, (_unused, i) =>
+    message({ id: String(i + 1), content: `note ${i}: nothing to open in this one` })));
+  const area = page.el("scroll-area");
+  assert.ok(area.scrollHeight > 3 * area.clientHeight, "the fixture is not tall enough to leave a reader mid-list");
+  await page.el("search-toggle").click();
+  await page.settle();
+  area.scrollTop = Math.round((area.scrollHeight - area.clientHeight) / 2);
+  const top = area.scrollTop;
+  await page.el("links-filter").click();
+  await page.settle();
+  assert.equal(page.el("search-empty").textContent, "No links in the messages loaded so far.");
+  assert.equal(area.scrollTop, 0, "Links on left the reader at the newest line, below the sentence");
+  // Off, the list is the one it was, and the reader's own place stands: not the newest line an
+  // emptied list is filled again at.
+  await page.el("links-filter").click();
+  await page.settle();
+  assert.equal(page.el("search-empty").hidden, true);
+  assert.equal(area.scrollTop, top, "Links off lost the reader's place");
+});

@@ -100,6 +100,14 @@ away; and over the call view, where Links stands beside the glass, the row is ri
 bar's end and still inside the screen. With over a hundred links of each kind loaded, every button
 reading "99+", the row measures the same at 313px, and at 360px under 130% and 150% type.
 
+And where the filters empty the list (`EMPTY_SIZES`): a phone reader at the channel's newest line
+turns all three kinds off, types text that only a row without a link matches, types text nothing
+matches, or turns Links on over a channel with no link — at 412px under 150% type and on the two
+phones with the keyboard up, where the composer below the emptied list still overflows it. The
+sentence saying why is then wholly on the screen, below the bar and the kinds of link, with nothing
+covering a word of it and no jump to the newest message offered; undone, the rows come back with the
+reader at the newest line.
+
 Then, in a second fresh profile at each size, a channel whose foot holds five replies to messages
 above them (`#204 reply-arrow`): from the owner, the agent and a third party, and between them in
 every state a row recedes in — the owner's own, read by default; one somebody answered; one swiped
@@ -407,6 +415,36 @@ class CrowdedKindsApi(FakeApi):
             said(1, " ".join(f"{REPO}/commit/{n:07x}abc" for n in range(120))),
             said(2, " ".join(f"{REPO}/actions/runs/{n}" for n in range(120))),
             said(3, "The one document: https://example.com/docs/guide.html"),
+        ]
+        self.threads = []
+
+
+class EmptyKindsApi(FakeApi):
+    """`#212 link-filter`, from review: a channel whose only links are of the three kinds — 200 a pull
+    request, 201 a commit, 202 a run of Actions — and 203 none, so turning all three off empties the
+    Links view, and text that matches only 203 empties it with every kind on."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.messages = [
+            said(0, f"Review please: {REPO}/pull/41"),
+            said(1, f"Landed in {REPO}/commit/abc1234def", "human"),
+            said(2, f"CI is green: {REPO}/actions/runs/123456"),
+            said(3, "Nothing to open in this one.", "me"),
+        ]
+        self.threads = []
+
+
+class LinklessApi(FakeApi):
+    """`#212 link-filter`, from review: a channel with no link in it at all, so Links on finds none."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.messages = [
+            said(0, "The overnight run is still going."),
+            said(1, "It reported at 03:42 and the queue is draining.", "human"),
+            said(2, "Good, that matches the dashboard here."),
+            said(3, "Nothing to open in this one either.", "me"),
         ]
         self.threads = []
 
@@ -1078,6 +1116,34 @@ KIND_LOOK_JS = """(id) => {
     return {look: [own.color, own.textDecorationLine, pill.backgroundColor, pill.borderTopColor], contrast};
 }"""
 
+# `#212 link-filter`, from review. The sentence an emptied list says instead of its rows, where the reader
+# was left — the list NOT scrolled first: shown, wholly below the bar and the kinds of link under it,
+# above the foot of the list and the screen, and every point of it the sentence's own, so nothing
+# floating covers a word. The kinds' room at the head of the list holds only at its top, and a reader
+# put at the newest line of a list whose composer still overflows it had the sentence under the three
+# buttons it points to, or above the screen altogether. Answers the problems, the words, and how far
+# the list is scrolled.
+EMPTY_SENTENCE_JS = """() => {""" + FLOAT_HELPERS_JS + """
+    const problems = [];
+    const sentence = document.getElementById('search-empty');
+    const area = document.getElementById('scroll-area');
+    if (!shown(sentence)) return {problems: ['no sentence says why the list is empty'], text: '', top: area.scrollTop};
+    const s = box(sentence), list = box(area), kinds = document.getElementById('link-kinds');
+    const over = shown(kinds) ? ['the kinds of link', box(kinds)] : ['the bar', box(document.getElementById('search-float'))];
+    if (s.top < over[1].bottom - 0.5) problems.push(`the sentence starts ${(over[1].bottom - s.top).toFixed(1)}px up under ${over[0]}`);
+    const foot = Math.min(list.bottom, window.innerHeight);
+    if (s.bottom > foot + 0.5) problems.push(`the sentence runs ${(s.bottom - foot).toFixed(1)}px past the foot of the list`);
+    for (const fx of [0.1, 0.5, 0.9]) {
+        for (const fy of [0.1, 0.5, 0.9]) {
+            const x = s.left + s.width * fx, y = s.top + s.height * fy;
+            if (y < 0 || y > window.innerHeight) continue;
+            const hit = document.elementFromPoint(x, y);
+            if (!hit || !sentence.contains(hit)) problems.push(`(${fx}, ${fy}) of the sentence is under ${name(hit)}`);
+        }
+    }
+    return {problems, text: sentence.textContent.trim(), top: area.scrollTop};
+}"""
+
 # A row's open ⋯ menu: Copy text, Pin, then the read group under a hairline and a caption — two
 # items in it where the provider can move its own read marker, one where it cannot — every item at
 # least 44px tall and as wide as the others, and the whole menu ACROSS the screen wherever the "⋯"
@@ -1275,6 +1341,23 @@ KINDS_SIZES = (("phone", 412, 915, True, 100), ("phone-360", 360, 800, True, 100
 # ...and where the row is at its widest, every button reading "99+", against the narrowest lines: the
 # page zoomed to 313px, and 360px at 130% and 150% type, where it once ran off the left of the screen.
 CROWDED_KINDS_SIZES = (("zoom-313", 313, 680, 100), ("font-130", 360, 800, 130), ("font-150", 360, 800, 150))
+# `#212 link-filter`, from review. Where a list the filters emptied is read: 412px at 150% type, 800px
+# tall as a phone's browser leaves it, where the composer still overflows the list by 102px with every
+# row gone; the two phones with the keyboard up, which leaves a list about 420px tall; and a phone at
+# the ordinary size, where it does not overflow at all. Label, width, height, root font percent, and
+# how it is emptied: "kinds" turns all three kinds off, "typed" types text matching only the row without
+# a link with every kind on, "search" types text matching nothing with Links off, and "linkless" turns
+# Links on over a channel with no link in it.
+EMPTY_SIZES = (("font-150", 412, 800, 150, "kinds"), ("font-150", 412, 800, 150, "linkless"),
+               ("keyboard-360", 360, 420, 100, "typed"), ("keyboard-412", 412, 450, 100, "kinds"),
+               ("keyboard-360", 360, 420, 100, "search"), ("phone", 412, 915, 100, "kinds"))
+# What each of those says.
+EMPTY_SENTENCES = {
+    "kinds": "No links left once PRs, Commits and Actions are hidden — turn them back on under the Links button.",
+    "typed": "None of the loaded messages with a link match that search.",
+    "search": "Nothing in the messages loaded so far matches that search.",
+    "linkless": "No links in the messages loaded so far.",
+}
 
 
 def larger_root_font(page: Page, root_percent: int) -> None:
@@ -1360,6 +1443,12 @@ def main() -> int:
             span = crowded_kinds_walk(playwright.chromium, args, label, width, height, root_percent)
             print(f"{label} at {width}x{height}, root font {root_percent}%: PRs, Commits and Actions each"
                   f" reading 99+, {span:.0f}px wide, under Links and inside the screen, each a 44px target")
+        for label, width, height, root_percent, mode in EMPTY_SIZES:
+            top = empty_walk(playwright.chromium, args, label, width, height, root_percent, mode)
+            print(f"{label} at {width}x{height}, root font {root_percent}%: a list emptied ({mode}) from its"
+                  " newest line says why wholly on the screen, below the bar and any kinds of link under it,"
+                  f" covered by nothing and with no jump offered past it, the list at {top:.0f}px; undone, the"
+                  " rows came back at the newest line")
     return 0
 
 
@@ -2808,6 +2897,109 @@ def crowded_kinds_walk(chromium: BrowserType, args: argparse.Namespace, label: s
             check(not errors, f"{shape}: the page threw: {errors}")
             context.close()
             return float(span)
+    finally:
+        api.stopping.set()
+        server.shutdown()
+        server.server_close()
+        thread.join()
+
+
+def empty_walk(chromium: BrowserType, args: argparse.Namespace, label: str, width: int, height: int,
+               root_percent: int, mode: str) -> float:
+    """`#212 link-filter`, from review: the sentence a list the filters emptied says, where it is read.
+
+    A phone in the dark theme at one of `EMPTY_SIZES`, the channel opened at its newest line, and the
+    list emptied by real taps and typing as `mode` says. The sentence must then be wholly on the screen
+    below the bar and the kinds of link (`EMPTY_SENTENCE_JS`): the composer below every list kept the
+    list overflowing with all its rows gone, so a reader left at the newest line had the sentence under
+    the kinds' three buttons — at 412px and 150% type — or, with the keyboard up, above the screen.
+    No jump to the newest message is offered past it. Undone the same way, the rows come back with the reader at the newest line again. Answers how far
+    the list was scrolled while the sentence was up.
+    """
+    api: FakeApi = LinklessApi() if mode == "linkless" else EmptyKindsApi()
+    server = ThreadingHTTPServer(("127.0.0.1", 0), handler_for(api))
+    server.daemon_threads = True
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    shape = f"{label}, an emptied list ({mode})"
+    try:
+        with tempfile.TemporaryDirectory(prefix="vibe-talk-chrome-empty-") as profile:
+            context = chromium.launch_persistent_context(
+                profile, headless=True, executable_path=args.browser_executable,
+                viewport={"width": width, "height": height}, device_scale_factor=2.625,
+                is_mobile=True, has_touch=True, color_scheme="dark",
+            )
+            page = context.pages[0]
+            larger_root_font(page, root_percent)
+            errors: list[str] = []
+            page.on("pageerror", lambda error: errors.append(str(error)))
+
+            def until(script: str, why: str) -> None:
+                deadline = time.monotonic() + 10
+                while time.monotonic() < deadline and not page.evaluate(script):
+                    page.wait_for_timeout(50)
+                check(bool(page.evaluate(script)), f"{shape}: {why}")
+
+            def tap(selector: str) -> None:
+                found = page.evaluate(f"() => {{ const b = document.querySelector({json.dumps(selector)})"
+                                      ".getBoundingClientRect(); return [b.left + b.width / 2, b.top + b.height / 2]; }")
+                page.touchscreen.tap(float(found[0]), float(found[1]))
+
+            def pressed(selector: str, value: str, why: str) -> None:
+                tap(selector)
+                until(f"() => document.querySelector({json.dumps(selector)}).getAttribute('aria-pressed') === '{value}'", why)
+
+            def settled() -> None:
+                # Two frames, so a scroll the page made has been laid out and its events delivered.
+                page.evaluate("() => new Promise((done) => requestAnimationFrame(() => requestAnimationFrame(done)))")
+
+            def at_newest() -> bool:
+                return bool(page.evaluate("() => { const a = document.getElementById('scroll-area');"
+                                          " return a.scrollHeight - a.scrollTop - a.clientHeight <= 24; }"))
+
+            page.goto(f"http://127.0.0.1:{server.server_port}/voice", wait_until="load")
+            page.fill("#api-token", TOKEN)
+            page.click("#save-token")
+            page.wait_for_selector("#search-toggle", state="visible", timeout=10_000)
+            page.click("#view-switch")
+            until("() => document.querySelectorAll('#discord-log > li[data-id]').length === 4", "the channel did not open")
+            settled()
+            check(at_newest(), f"{shape}: the channel did not open at its newest line")
+            tap("#search-toggle")
+            until("() => !document.getElementById('links-filter').hidden", "the open bar has no Links filter")
+            if mode != "search":
+                pressed("#links-filter", "true", "a tap on Links did not turn it on")
+            if mode == "kinds":
+                for kind in ("pr", "commit", "action"):
+                    pressed(f"#link-kind-{kind}", "false", f"a tap on {kind} did not turn it off")
+            elif mode in ("typed", "search"):
+                page.fill("#search-field", "nothing to open" if mode == "typed" else "no such words anywhere")
+            sentence = EMPTY_SENTENCES[mode]
+            until(f"() => document.getElementById('search-empty').textContent.trim() === {json.dumps(sentence)}"
+                  " && !document.getElementById('search-empty').hidden", f"the emptied list does not say {sentence!r}")
+            settled()
+            empty = page.evaluate(EMPTY_SENTENCE_JS)
+            if args.screenshots:
+                page.screenshot(path=str(args.screenshots / f"{label}-empty-{mode}.png"))
+            check(not empty["problems"], f"{shape}, scrolled to {empty['top']}: {empty['problems']}")
+            check(bool(page.evaluate("() => document.getElementById('jump-newest').hidden")),
+                  f"{shape}: the jump to the newest message is offered over a list with none shown")
+
+            # Undone the way it was done: the rows are back, at the newest line, and the sentence gone.
+            if mode == "kinds":
+                pressed("#link-kind-pr", "true", "a tap on PRs did not turn it back on")
+            elif mode in ("typed", "search"):
+                page.fill("#search-field", "")
+            else:
+                pressed("#links-filter", "false", "a tap on Links did not turn it off")
+            until("() => document.getElementById('search-empty').hidden"
+                  " && Boolean(document.querySelector('#discord-log > li[data-id=\"200\"]').offsetParent)",
+                  "undoing the filter did not bring the first row back")
+            settled()
+            check(at_newest(), f"{shape}: the rows came back with the reader short of the newest line")
+            check(not errors, f"{shape}: the page threw: {errors}")
+            context.close()
+            return float(empty["top"])
     finally:
         api.stopping.set()
         server.shutdown()

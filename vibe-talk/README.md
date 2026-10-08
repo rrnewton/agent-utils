@@ -2677,7 +2677,12 @@ section above, what is on screen is a bounded suffix of a longer record, so "no 
 "nobody ever said that" are different answers and a bare number would let you conclude the second.
 For the same reason, a search that matches nothing says so **where the messages were** rather than
 only in the corner: every row is still in the list, hidden by a class of its own, so neither pane's
-empty state fires and the reader would otherwise get a blank screen.
+empty state fires and the reader would otherwise get a blank screen. That sentence stands at the
+head of the list, and typing — or turning Links or a kind of link off, below — that empties the
+list takes the reader there, clear of the bar: the channel's composer still runs below an empty
+list, and a reader left at its foot had the sentence above the screen. Text that matches again, or
+a kind turned back on, opens the list at its newest line, as it opens everywhere else, and no jump
+to the newest message is offered over a list with nothing in it (`#212 link-filter`).
 
 A class of its own, and not the `hidden` attribute, because `hidden` is where this page already
 records the *other* reasons a row is off screen — To do mode, dismissed, which view is up. A filter

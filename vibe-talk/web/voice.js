@@ -1559,7 +1559,10 @@ function renderJumpNewest() {
     } else if (gap > SCROLLBACK_PX) {
       inScrollback[currentView] = true;
     }
-    shown = inScrollback[currentView] || jumpNewestWanted[currentView] !== false;
+    // ...and never over a list the filters emptied (`#212 link-filter`, from review). Every row in
+    // it is hidden, so there is no newest message to go to: the jump would only take the reader past
+    // the sentence saying why to the composer under it, which `placeForFilter` scrolled them up from.
+    shown = !listEmptied() && (inScrollback[currentView] || jumpNewestWanted[currentView] !== false);
   }
   // The arrival changes what the ONE control says, rather than raising a second one beside it.
   const arrived = jumpNewestWanted[currentView];
@@ -1916,6 +1919,40 @@ function linksEmptySentence(loaded, tally, matched) {
   return tally.saidLinked > 0
     ? `None of the loaded messages with a link match that search once ${hiddenKindNames(tally.matching)} are hidden.`
     : "None of the loaded messages with a link match that search.";
+}
+
+/** Whether the filters have emptied the list on screen, and `#search-empty` is saying why. */
+function listEmptied() {
+  return !el("search-empty").hidden;
+}
+
+/**
+ * Put the reader where a filter they just changed has left something to read. Called last by the
+ * search text, Links and the kinds of link under it, once the reader has been placed as each places
+ * them; `wasEmptied` is `listEmptied()` from before the change.
+ *
+ * `#212 link-filter`, from review. EMPTIED, the list is taken to its head, where the sentence saying
+ * why is. Its rows are gone but the list is not short: the channel's composer stays below every list,
+ * so with the bar's room above it the list still overflowed a phone, and a reader put at the newest
+ * line had the sentence scrolled up out of the room kept for the bar and the kinds of link. At 150%
+ * type on a 412px phone it sat under the three buttons it names, and with the keyboard up it was above
+ * the screen — the one line saying where the links went and how to bring them back, hidden by the
+ * controls it points to. At the head of a channel with more history, that takes ONE step back for
+ * it, as arriving there by hand does (`maybeLoadOlder`): what is older may hold what the reader is
+ * after, and the sentence says "loaded so far". Rows of it the filters hide move nothing, and so
+ * take no second step.
+ *
+ * FILLED AGAIN from empty, the reader is put at the newest line, as a list opens: the sentence stood
+ * in for the newest line while there was none, and the head of the list it was at is the oldest of
+ * what came back.
+ *
+ * Only after something the reader did. A poll redrawing an emptied list leaves a reader who scrolled
+ * down to the composer at the composer. Not Pinned, either: turning it on puts up "Loading…" before
+ * the pins land, and a reader taken to the head of that would meet the pins at their oldest.
+ */
+function placeForFilter(wasEmptied) {
+  if (listEmptied()) el("scroll-area").scrollTop = 0;
+  else if (wasEmptied) scrollToNewest();
 }
 
 /**
@@ -2351,6 +2388,9 @@ function setLinksOnly(on) {
     else area.scrollTop = place.top;
   }
   renderScrollTools();
+  // ...and where nothing is left to show, at the sentence saying so. Never at the newest line for
+  // an emptied list filled again: off, the place just restored is the reader's own.
+  placeForFilter(false);
   // Off, the rows' text is back on screen, and summary mode asks about what is in view.
   requestVisibleSummaries();
 }
@@ -2477,11 +2517,13 @@ function storedHiddenLinkKinds() {
 /**
  * Show or hide one kind, keep the choice, and redraw what is left. A reader at the newest line is
  * kept there, as one is when a message arrives; anywhere else the list is left where it is, as it
- * is while the search text changes under it.
+ * is while the search text changes under it. Where nothing is left, or something is again, see
+ * `placeForFilter`.
  */
 function setLinkKindShown(kind, shown) {
   const area = el("scroll-area");
   const newest = atBottom(area);
+  const wasEmptied = listEmptied();
   const hidden = new Set(hiddenLinkKinds);
   if (shown) hidden.delete(kind);
   else hidden.add(kind);
@@ -2496,6 +2538,7 @@ function setLinkKindShown(kind, shown) {
   renderLinkKinds();
   renderScrollTools();
   if (newest) scrollToNewest();
+  placeForFilter(wasEmptied);
 }
 
 /**
@@ -17732,8 +17775,12 @@ for (const { kind, chip } of LINK_KINDS) {
   el(chip).addEventListener("click", () => setLinkKindShown(kind, hiddenLinkKinds.has(kind)));
 }
 el("search-field").addEventListener("input", () => {
+  const wasEmptied = listEmptied();
   searchQuery = el("search-field").value;
   renderScrollTools();
+  // `#212 link-filter`, from review: text that matches nothing takes the reader to the sentence
+  // saying so, and text that matches again to the newest line.
+  placeForFilter(wasEmptied);
 });
 // Escape closes AND clears, which is the same act — see `setSearchOpen`. It is the gesture a
 // desktop reader reaches for without being told, and the only one a keyboard has.
