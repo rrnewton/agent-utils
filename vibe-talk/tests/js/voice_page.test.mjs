@@ -4471,18 +4471,32 @@ test("on a desktop both lists are held to a reading column, and the phone is lef
       `${pane} is also styled outside the desktop query, so the phone gets the column too`
     );
   }
-  // The dock follows the column rather than spanning the desk — but by max-width, never by being
-  // pinned. The frame test above asserts the pane is still a grid row; this is the other half.
-  assert.match(cssBlockIn(DESKTOP_QUERY, "#control-pane"), /max-width:\s*var\(--reading-width\)/);
-  assert.doesNotMatch(cssBlock("#control-pane"), /position:\s*(fixed|absolute)/);
-  // `#58 control-bar` put a second band in the dock, and it follows the column for the same
-  // reason: a bar spanning a metre of desk above a column-width pane puts the switch a screen away
-  // from the transcript it switches.
+  // The dock follows the column rather than spanning the desk — never by being pinned. The frame
+  // test above asserts the pane is still a grid row; this is the other half. `#58 control-bar` put
+  // the bar in the dock as well, and it follows the column for the same reason: a bar spanning a
+  // metre of desk puts the switch a screen away from the transcript it switches.
+  //
+  // `#218 desktop-dock` moved the column from the bar and the pane to the DOCK, which lays the two
+  // out side by side: its padding is half of what the window has beyond the reading width, so its
+  // content box is the column — the same box the panes are held to, moving with the same handle.
+  const dock = cssBlockIn(DESKTOP_QUERY, "#dock");
   assert.match(
-    cssBlockIn(DESKTOP_QUERY, '#control-bar[data-placement="bottom"]'),
-    /max-width:\s*var\(--reading-width\)/,
-    "the control bar spans the whole desktop while everything under it is a column"
+    cssValue(dock, "padding") || "",
+    /max\([^;]*100%\s*-\s*var\(--reading-width\)/,
+    "the dock spans the whole desktop while the list above it is a column"
   );
+  assert.doesNotMatch(cssBlock("#dock"), /position:\s*(fixed|absolute)/);
+  assert.doesNotMatch(cssBlock("#control-pane"), /position:\s*(fixed|absolute)/);
+  // ...and neither half sets a column of its own any more, which would be a second column inside
+  // the first and stop the pane sitting beside the bar.
+  for (const half of ["#control-pane", '#control-bar[data-placement="bottom"]']) {
+    assert.doesNotMatch(
+      cssBlockIn(DESKTOP_QUERY, half),
+      /max-width/,
+      `${half} is held to a column of its own inside the dock's`
+    );
+  }
+  assert.match(cssBlockIn(DESKTOP_QUERY, "#status-line"), /max-width:\s*var\(--reading-width\)/);
   // The width is a token with a default, so a browser that never enters the regime still parses.
   assert.match(cssBlock(":root"), /--reading-width:\s*\d+ch/, "the column has no default width");
 });
@@ -4505,6 +4519,165 @@ test("the reading-width handle is a sibling of the scroll area, not a passenger 
     "the handle shows where it cannot be used"
   );
   assert.match(cssBlockIn(DESKTOP_QUERY, "#width-grip"), /cursor:\s*ew-resize/);
+});
+
+// --- the dock on a desk ---------------------------------------------------------------------
+//
+// `#218 desktop-dock`. The owner, at his desk: the dock built for a thumb "looks very weird for
+// desktop" — Read and Pace HUGE, the channel and view pickers cut short beside empty space, and
+// the whole dock spending vertical space the list needs. The fixture lays nothing out, so what it
+// can say is that the desktop dock is declared inside the desktop query and only there, at a
+// desk's sizes, and that the phone's declarations are still the phone's.
+// tests/offline_cache_browser.py measures the result in Chromium at 1280x800 and 1600x1000, and
+// measures the phone dock at 412 and 360 against what it was.
+
+/** How tall a control in the desktop dock may be, in px: a mouse's 32px target, short of a slab. */
+const DESK_CONTROL_PX = [32, 40];
+
+test("on a desk the dock is one wrapping row of ordinary-sized controls", () => {
+  const dock = cssBlockIn(DESKTOP_QUERY, "#dock");
+  assert.match(dock, /display:\s*flex/, "the dock is still two stacked bands on a desk");
+  assert.match(
+    dock,
+    /flex-wrap:\s*wrap/,
+    "the dock has no second row to fall back to, so a long channel name has to be cut instead"
+  );
+  // The bar takes the room the pane leaves, and the pane is a row at the right of it, not a tile.
+  assert.match(cssBlockIn(DESKTOP_QUERY, "#control-bar-bottom"), /flex:\s*1 1 auto/);
+  const pane = cssBlockIn(DESKTOP_QUERY, "#control-pane");
+  assert.match(pane, /display:\s*flex/, "the pane is still the phone's tile on a desk");
+  assert.match(pane, /margin-left:\s*auto/, "the pane is not held at the right of its row");
+  // Every control at a desk's size: no smaller than a mouse's target, and nowhere near the
+  // phone's 44px squares or the slabs the owner photographed.
+  for (const selector of [".bar-button", "#control-pane .control", ".bar-select", ".switch"]) {
+    const height = lengthPx(cssValue(cssBlockIn(DESKTOP_QUERY, selector), "min-height") || "");
+    assert.ok(
+      height >= DESK_CONTROL_PX[0] && height <= DESK_CONTROL_PX[1],
+      `${selector} is ${height}px tall on a desk, outside ${DESK_CONTROL_PX.join("-")}px`
+    );
+  }
+  assert.ok(
+    lengthPx(cssValue(cssBlockIn(DESKTOP_QUERY, ".bar-button"), "min-width")) >= DESK_CONTROL_PX[0],
+    "an icon-only bar button is narrower than a mouse's target"
+  );
+  // The word BESIDE the icon and at reading size, not the phone's 0.55rem capitals under it.
+  assert.match(cssBlockIn(DESKTOP_QUERY, ".bar-button"), /flex-direction:\s*row/);
+  assert.match(cssBlockIn(DESKTOP_QUERY, "#control-pane .control"), /grid-template-columns:\s*auto auto/);
+  for (const selector of [".mini-label", ".control-label"]) {
+    const block = cssBlockIn(DESKTOP_QUERY, selector);
+    assert.ok(
+      lengthPx(cssValue(block, "font-size")) >= 0.8 * REM_PX,
+      `${selector} is a caption on a desk, not a label`
+    );
+    assert.match(block, /text-transform:\s*none/, `${selector} still shouts in capitals on a desk`);
+  }
+});
+
+test("on a desk the pickers show their names, and the channel's holds longest", () => {
+  const select = cssBlockIn(DESKTOP_QUERY, ".bar-select");
+  // Sized to the option SHOWN, so "All" stops reserving the width of the longest thread title.
+  assert.match(select, /field-sizing:\s*content/);
+  const phoneCap = lengthPx(cssValue(cssBlockOutside(DESKTOP_QUERY, ".bar-select"), "max-width"));
+  const deskCap = lengthPx(cssValue(select, "max-width"));
+  assert.ok(deskCap > phoneCap, `the pickers are capped at ${deskCap}px on a desk, no wider than a phone's`);
+  // A name that does not fit says so.
+  assert.match(select, /text-overflow:\s*ellipsis/, "a cut name is clipped mid-letter instead of ending in …");
+  // Thirty characters of a 16px face at a generous 0.6em each, plus the padding and the arrow:
+  // room for the name the owner's picker cut off at nine rem.
+  const channel = cssBlockIn(DESKTOP_QUERY, "#discord-channel");
+  const cap = /max-width:\s*min\(([\d.]+rem),\s*100%\s*-([^;]+)\)/.exec(channel);
+  assert.ok(cap, "the channel picker is not capped at what the pack leaves it");
+  assert.ok(
+    lengthPx(cap[1]) >= 30 * 0.6 * REM_PX + 40,
+    `the channel picker is capped at ${cap[1]}, short of a thirty-character name`
+  );
+  // When the row is short the VIEW picker gives way first. The channel's does not shrink at all
+  // — any share of the shrinking is a fraction of a pixel the ellipsis turns into a visible "…" —
+  // and what it leaves the rest of the pack is at least the view picker's own floor.
+  assert.match(channel, /flex-shrink:\s*0/, "the channel's name gives way alongside the view's");
+  const floor = lengthPx(cssValue(cssBlockOutside(DESKTOP_QUERY, ".bar-select"), "min-width"));
+  const left = cap[2].split(/\s+-\s+/).reduce((total, term) => {
+    const [, times, length] = /^\s*(?:([\d.]+)\s*\*\s*)?(.+?)\s*$/.exec(term);
+    return total + Number(times || 1) * lengthPx(length);
+  }, 0);
+  assert.ok(left >= floor, `the channel picker leaves ${left}px of the pack, less than the view picker's ${floor}px`);
+  // ...and the desk does not take the sixteen pixels away: an iPad with a trackpad is a desk here.
+  assert.doesNotMatch(select, /font-size/, "the desktop pickers shrink their type below 16px");
+});
+
+test("the desktop dock leaves the phone's declarations as they were", () => {
+  // Every selector the desktop dock introduced exists inside the desktop query and nowhere else,
+  // so none of it can reach a phone.
+  for (const selector of [
+    "#control-bar-bottom",
+    "#discord-channel",
+    "#control-pane .control",
+    "#control-pane .control > svg",
+    "#control-pane .control-note",
+    "#control-pane:has(#read-aloud:not([hidden])) #speaker",
+    "#control-pane button:focus-visible",
+  ]) {
+    assert.ok(cssRules(mediaBody(DESKTOP_QUERY), selector).length > 0, `${selector} is gone from the desk`);
+    assert.equal(
+      cssRulesElsewhere(DESKTOP_QUERY, selector),
+      0,
+      `${selector} is also declared outside the desktop query, where a phone gets it`
+    );
+  }
+  // And the selectors it overrides still say what they said for everybody: two bands, a 3x2 tile
+  // of large buttons, a captioned icon, and a picker capped narrow — the dock the phone has.
+  const everybody = (selector) => cssRules(CSS_UNCONDITIONAL, selector).join("\n");
+  assert.doesNotMatch(everybody("#dock"), /display:|flex-wrap/, "the phone's dock became a flex row");
+  assert.match(everybody("#control-pane"), /display:\s*grid/);
+  assert.match(everybody("#control-pane"), /grid-template-columns:\s*3\.5rem 1fr 1fr/);
+  assert.match(everybody(".control"), /flex-direction:\s*column/);
+  assert.match(everybody(".bar-button"), /flex-direction:\s*column/);
+  assert.match(everybody(".mini-label"), /text-transform:\s*uppercase/);
+  assert.doesNotMatch(everybody(".bar-select"), /field-sizing/, "the phone's pickers lost their fixed caps");
+});
+
+test("the pane's markup runs in the order its buttons are seen, so Tab follows the eye", () => {
+  // The phone tile places each button by explicit column, so it never depended on the markup; the
+  // desk lays the pane out as a row in markup order. Read used to be declared ahead of the filter
+  // and the pace, which on a desk would have put it first — or, moved with `order`, have sent Tab
+  // the opposite way to the eye.
+  const pane = HTML_CODE.slice(HTML_CODE.indexOf('id="control-pane"'));
+  const at = (id) => pane.indexOf(`id="${id}"`);
+  for (const order of [
+    ["todo-filter", "read-speed", "read-aloud", "talk"],
+    ["speaker", "clear-view", "hang-up", "talk"],
+  ]) {
+    for (let i = 1; i < order.length; i += 1) {
+      assert.ok(at(order[i - 1]) > -1 && at(order[i - 1]) < at(order[i]),
+        `#${order[i - 1]} is not declared before #${order[i]}`);
+    }
+  }
+  assert.doesNotMatch(
+    mediaBody(DESKTOP_QUERY),
+    /(?:^|[;{\s])order:/,
+    "a desktop rule reorders the dock, so Tab and the eye disagree about what comes next"
+  );
+  // Sound acts on a call's voice. Without a call the channel view shows Hide read, Pace and Read,
+  // and on a desk nothing is left to cover Sound the way the phone tile's shared cell does.
+  assert.match(
+    cssBlockIn(DESKTOP_QUERY, "#control-pane:has(#read-aloud:not([hidden])) #speaker"),
+    /display:\s*none/
+  );
+});
+
+test("every control in the desktop dock shows keyboard focus, and the pack has room for the ring", () => {
+  const body = mediaBody(DESKTOP_QUERY);
+  assert.match(body, /#control-bar :is\(button, select\):focus-visible/, "the bar's controls have no ring");
+  const focus = cssRules(body, "#control-pane button:focus-visible").join("\n");
+  assert.match(focus, /outline:\s*2px solid var\(--accent\)/, "the pane's buttons have no ring");
+  assert.doesNotMatch(body, /outline:\s*(none|0)\b/, "a desktop rule takes a focus ring away");
+  // The pack scrolls sideways, and a scrolling box clips anything drawn outside it. Its padding is
+  // the room the ring is drawn in; the equal negative margin gives that room back to the row.
+  const ring = 2 + lengthPx(cssValue(focus, "outline-offset"));
+  const pack = cssBlockIn(DESKTOP_QUERY, "#bar-pack");
+  const room = lengthPx(cssValue(pack, "padding"));
+  assert.ok(room >= ring, `the pack keeps ${room}px for a ${ring}px ring, so its edge clips it`);
+  assert.equal(lengthPx(cssValue(pack, "margin")), -room, "the ring's room moved the bar");
 });
 
 test("the width the reader chose survives a reload", async () => {

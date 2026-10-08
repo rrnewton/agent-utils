@@ -3458,6 +3458,17 @@ clamped to 45–120 on the way in and on the way out, because storage is shared 
 on the origin and a hand-edited entry is a thing people do. The settings screen carries a slider
 that drives exactly the same value, so the choice is reachable without a mouse.
 
+**The dock is sized for a mouse on a desk, not a thumb** (`#218 desktop-dock`). On a phone it is a
+strip of 44px targets above a tile of large buttons; on a desk the same controls are one wrapping
+row of ordinary 36px buttons, icon and word side by side, inside the column. Everything shares one
+row when it fits — about 50px of dock where the phone's composition stood 149px — and when a long
+channel name and the reading buttons do not fit together, the buttons take a second row under the
+switch rather than the name being cut, for about 92px. The channel and view pickers are as wide as
+the names they show, up to a cap; the view picker gives way first when the row is short, and the
+channel's name is cut, with an ellipsis, only when the view picker is already at its floor. Every
+control shows a focus ring, and Tab visits them in the order they are seen. The phone's dock is
+not touched: `tests/offline_cache_browser.py` measures it at 412px and 360px against what it was.
+
 **The regime is `@media (min-width: 900px) and (pointer: fine)`, and nothing else decides it.**
 Not a user-agent string — a tablet with a trackpad and a phone in desktop mode both lie to one, and
 the strings keep changing — and not `matchMedia` in the script either, because two places deciding

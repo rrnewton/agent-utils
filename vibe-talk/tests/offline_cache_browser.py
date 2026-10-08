@@ -132,6 +132,19 @@ summary's bar, which is the left side and wider than the right. On a phone a til
 edge of the screen to the other, a reply's from its gutter to the right edge; on a desk it is inside
 the reading column. Nothing on the page scrolls sideways, at 360px as at the other sizes.
 
+First of all, the dock (`#218 desktop-dock`), in the dark theme, at a 1280x800 desk, a 1600x1000 one
+and the two phones, on the call view — idle, live, and after a call with its note under Talk — and on
+the channel, under a thirty-character name, with a thread open beside it, and under a short name. On a
+desk every control in it is 32 to 40px tall and at least 32px wide, inside the list's column, and
+overlapping no other; the dock is one row (at most 56px) where everything fits — the idle call, the
+short name, and the long name once the column is dragged wide — and at most 100px where it does not,
+the reading buttons then under the switch at the right of the second row; the pane reads Sound, Clear,
+Hang up, Talk and Hide read, Pace, Read, left to right; the channel's picker is as wide as its name,
+with a thread open too, and only in the narrowest column is it cut, ending in an ellipsis, with the
+view picker at its floor and nothing scrolled out of the pack; and a Tab walk from the gear visits the
+controls in the order they are seen, each with a ring nothing clips. On a phone the dock is the one it
+was before: 149px, its bar and its tile of large buttons at their old heights and widths.
+
 Pass --screenshots DIR to keep a PNG of each step for review.
 """
 
@@ -149,7 +162,7 @@ import time
 from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, TypedDict
 from urllib.parse import parse_qs, unquote, urlsplit
 
 if TYPE_CHECKING:
@@ -1495,6 +1508,158 @@ EMPTY_SENTENCES = {
 }
 
 
+# `#218 desktop-dock`. Where the dock is measured: two desks — the smallest window most people open
+# and a large one, whose column is the same width with more margin — and the two phones, where the
+# dock must be exactly what it was. Label, width, height, touch.
+DOCK_SIZES = (("desktop", 1280, 800, False), ("desktop-1600", 1600, 1000, False),
+              ("phone", 412, 915, True), ("phone-360", 360, 800, True))
+# A channel whose name is thirty characters, the length the owner's picker cut off at nine rem.
+LONG_CHANNEL = {"id": "1110000000000000002", "label": "overnight release coordination", "writable": True,
+                "alias": None, "added": False}
+# The tallest the desktop dock may stand: two rows of 36px controls with their gap and padding when
+# a long name and the three reading buttons do not share the column's one row, and one row when they
+# do. It stood 149px before, with a channel name cut short in it. The second is the post-call state,
+# whose Talk carries a one-clause note under its word.
+DOCK_DESK_MAX_PX = 100
+DOCK_ONE_ROW_MAX_PX = 56
+DOCK_NOTE_MAX_PX = 120
+# What a control on a desk measures: a mouse's 32px target, and short of the slabs it replaced.
+DESK_CONTROL_PX = (32, 40)
+# The phone dock as 9f055cf2 drew it, from its rem arithmetic: a 1px border, the bar's 2.85rem
+# (0.35 + 2.4 + 0.1) and the tile's 6.4rem (two 2.4rem rows, a 0.4rem gap and 0.6rem padding twice).
+# The tile's large controls span both rows, 5.2rem; the narrow column is 3.5rem.
+PHONE_DOCK_PX = 1 + 2.85 * 16 + 6.4 * 16
+PHONE_SPAN_PX = 5.2 * 16
+PHONE_NARROW_PX = 3.5 * 16
+
+class DockBox(TypedDict):
+    """Where one control in the dock is drawn, in CSS pixels."""
+
+    left: float
+    top: float
+    width: float
+    height: float
+
+
+class DockPicker(TypedDict):
+    """A picker's width beside the width the name it shows needs."""
+
+    text: str
+    width: float
+    natural: float
+
+
+class DockFound(TypedDict):
+    """One measurement of the dock (`DOCK_JS`)."""
+
+    height: float
+    rows: int
+    visual: list[str]
+    pane: list[str]
+    pickers: dict[str, DockPicker]
+    problems: list[str]
+    boxes: dict[str, DockBox]
+
+
+# One measurement of the dock as it is drawn: its height, every control in it with its box, how many
+# rows they make, and what is wrong — against the column on a desk, against the tile on a phone.
+DOCK_JS = """({desk, order}) => {
+    const problems = [];
+    const shown = (el) => !!el && el.getClientRects().length > 0 && getComputedStyle(el).visibility !== 'hidden';
+    const box = (el) => el.getBoundingClientRect();
+    const dock = document.getElementById('dock'), d = box(dock), ds = getComputedStyle(dock);
+    const inner = {left: d.left + parseFloat(ds.paddingLeft), right: d.right - parseFloat(ds.paddingRight)};
+    const controls = [...dock.querySelectorAll('button, select')]
+        .filter((el) => shown(el) && !el.closest('#prompts-tray') && !el.closest('#speed-popover'));
+    const boxes = controls.map((el) => ({id: el.id, r: box(el)}));
+    // A row is the controls whose middles line up: each row of the dock centres what is in it, so a
+    // taller button — Talk with its note — is still on the row it sits in.
+    const middle = (r) => (r.top + r.bottom) / 2;
+    const rows = [];
+    for (const {r} of boxes) if (!rows.some((m) => Math.abs(m - middle(r)) < 4)) rows.push(middle(r));
+    rows.sort((a, b) => a - b);
+    const rowOf = (r) => rows.findIndex((m) => Math.abs(m - middle(r)) < 4);
+    const visual = [...boxes].sort((a, b) => rowOf(a.r) - rowOf(b.r) || a.r.left - b.r.left).map((b) => b.id);
+    const pane = [...document.getElementById('control-pane').children]
+        .filter((el) => shown(el) && el.matches('button'))
+        .sort((a, b) => middle(box(a)) - middle(box(b)) || box(a).left - box(b).left).map((el) => el.id);
+    if (document.documentElement.scrollWidth > innerWidth) problems.push(`the page is ${document.documentElement.scrollWidth}px wide in a ${innerWidth}px window`);
+    // On a desk nothing may be scrolled out of the pack's sight. (A phone's pack is built to scroll,
+    // and on the channel view at 412px it already hid a few pixels of the view picker before #218.)
+    const pack = document.getElementById('bar-pack');
+    if (desk && shown(pack) && pack.scrollWidth > pack.clientWidth + 1) problems.push(`the pack hides ${pack.scrollWidth - pack.clientWidth}px of its members past its edge`);
+    const pickers = {};
+    if (desk) {
+        // Not on a phone: there the tile's narrow column puts Hide read over Sound, which the
+        // channel view leaves unhidden, and that is the phone as it was.
+        for (let i = 0; i < boxes.length; i += 1) {
+            for (let j = i + 1; j < boxes.length; j += 1) {
+                const a = boxes[i].r, b = boxes[j].r;
+                const w = Math.min(a.right, b.right) - Math.max(a.left, b.left), h = Math.min(a.bottom, b.bottom) - Math.max(a.top, b.top);
+                if (w > 0.5 && h > 0.5) problems.push(`#${boxes[i].id} and #${boxes[j].id} overlap`);
+            }
+        }
+        const list = ['pane-discord', 'pane-voice'].map((id) => document.getElementById(id)).find(shown);
+        const column = list ? box(list) : {left: inner.left, right: inner.right};
+        const note = document.getElementById('talk-note');
+        for (const {id, r} of boxes) {
+            const tall = id === 'talk' && shown(note) ? 64 : DESK[1];
+            if (r.height < DESK[0] - 0.5 || r.height > tall + 0.5) problems.push(`#${id} is ${r.height.toFixed(1)}px tall`);
+            if (r.width < DESK[0] - 0.5) problems.push(`#${id} is ${r.width.toFixed(1)}px wide`);
+            if (r.left < inner.left - 0.5 || r.right > inner.right + 0.5) problems.push(`#${id} runs out of the dock's column`);
+            if (r.left < column.left - 1 || r.right > column.right + 1) problems.push(`#${id} is outside the list's column`);
+            if (r.top < d.top || r.bottom > d.bottom + 0.5) problems.push(`#${id} hangs out of the dock`);
+        }
+        // Untruncated: as wide as the same select sized to the option it shows, with no cap and no shrink.
+        for (const id of ['discord-channel', 'thread-select']) {
+            const sel = document.getElementById(id);
+            if (!shown(sel)) continue;
+            const probe = document.createElement('select');
+            probe.className = sel.className;
+            const option = document.createElement('option');
+            option.textContent = sel.selectedOptions[0] ? sel.selectedOptions[0].textContent : '';
+            probe.append(option);
+            probe.style.cssText = 'position:absolute;visibility:hidden;max-width:none;min-width:0;flex:none;field-sizing:content';
+            sel.parentNode.append(probe);
+            const natural = box(probe).width;
+            probe.remove();
+            pickers[id] = {text: option.textContent, width: box(sel).width, natural};
+        }
+    } else {
+        // The thumb's targets, as the phone has always had them. The view switch is a pill drawn to
+        // the strip's height rather than a target of its own, and it is left as it was.
+        for (const {id, r} of boxes.filter(({id}) => id !== 'view-switch')) {
+            if (r.height < 2.4 * 16 - 1) problems.push(`#${id} is ${r.height.toFixed(1)}px tall, short of a thumb`);
+            if (r.width < 2.75 * 16 - 1) problems.push(`#${id} is ${r.width.toFixed(1)}px wide, narrower than a thumb`);
+        }
+    }
+    // On a desk the pane is a row, read left to right; the phone's tile is checked by its shape.
+    if (desk && order && JSON.stringify(pane) !== JSON.stringify(order)) problems.push(`the pane reads ${pane.join(', ')}`);
+    return {height: d.height, rows: rows.length, visual, pane, pickers, problems,
+            boxes: Object.fromEntries(boxes.map(({id, r}) => [id, {left: r.left, top: r.top, width: r.width, height: r.height}]))};
+}""".replace("DESK[0]", str(DESK_CONTROL_PX[0])).replace("DESK[1]", str(DESK_CONTROL_PX[1]))
+
+# Tab through the dock from the gear and say where focus went, and whether each stop drew a ring
+# that nothing clipped: the pack scrolls sideways, and a scrolling box clips what is drawn outside it.
+DOCK_FOCUS_JS = """() => {
+    const el = document.activeElement;
+    if (!el || !document.getElementById('dock').contains(el)) return {id: null};
+    const s = getComputedStyle(el), r = el.getBoundingClientRect();
+    const reach = parseFloat(s.outlineWidth) + parseFloat(s.outlineOffset);
+    const problems = [];
+    if (s.outlineStyle === 'none' || parseFloat(s.outlineWidth) < 2) problems.push(`#${el.id} draws no focus ring`);
+    const clip = el.closest('#bar-pack');
+    if (clip) {
+        const c = clip.getBoundingClientRect();
+        if (r.top - reach < c.top - 0.5 || r.bottom + reach > c.bottom + 0.5 || r.left - reach < c.left - 0.5
+            || r.right + reach > c.right + 0.5) problems.push(`#${el.id}'s ring is clipped by the pack`);
+    }
+    if (r.top - reach < 0 || r.bottom + reach > innerHeight || r.left - reach < 0 || r.right + reach > innerWidth)
+        problems.push(`#${el.id}'s ring runs off the window`);
+    return {id: el.id, visible: el.matches(':focus-visible'), problems};
+}"""
+
+
 def larger_root_font(page: Page, root_percent: int) -> None:
     """Stand in for a phone reader's larger system font: every rem on the page follows the root's."""
     if root_percent != 100:
@@ -1518,6 +1683,17 @@ def main() -> int:
         args.screenshots.mkdir(parents=True, exist_ok=True)
 
     with sync_playwright() as playwright:
+        for label, width, height, mobile in DOCK_SIZES:
+            heights = dock_walk(playwright.chromium, args, label, width, height, mobile)
+            if mobile:
+                print(f"{label} at {width}x{height}, dark: the dock the phone had — its bar and its tile of"
+                      f" large buttons at their heights and widths, every control a thumb's size: {heights}")
+            else:
+                print(f"{label} at {width}x{height}, dark: the dock one row of {DESK_CONTROL_PX[0]}-"
+                      f"{DESK_CONTROL_PX[1]}px controls where it fits and two where it does not, inside the"
+                      " column and overlapping nothing, the pickers wide enough for a thirty-character"
+                      " channel name with a thread open beside it, the pane in the order the phone shows,"
+                      f" and every Tab stop ringed and unclipped: {heights}")
         for label, width, height, mobile in PROFILES:
             pin_walk(playwright.chromium, args, label, width, height, mobile)
             print(f"{label} at {width}x{height}: a pin made elsewhere shown as a legible Pinned chip and an"
@@ -2462,6 +2638,214 @@ def tile_walk(chromium: BrowserType, args: argparse.Namespace, label: str, width
             check(not errors, f"{label}: the page threw: {errors}")
             context.close()
         return count
+    finally:
+        api.stopping.set()
+        server.shutdown()
+        server.server_close()
+        thread.join()
+
+
+class DockApi(FakeApi):
+    """`#218 desktop-dock`: the ordinary channel, and one whose name is thirty characters, first."""
+
+    def client_config(self, scope: str) -> Json:
+        return {**super().client_config(scope), "channels": [LONG_CHANNEL, CHANNEL]}
+
+
+def dock_walk(chromium: BrowserType, args: argparse.Namespace, label: str, width: int, height: int,
+              mobile: bool) -> str:
+    """`#218 desktop-dock`: the dock on the call view and the channel, in the dark theme the owner
+    reads in. On a desk: ordinary controls in one row where they fit and two where they do not, inside
+    the column, overlapping nothing, the pickers wide enough for a thirty-character name, and every
+    stop of a Tab walk ringed and unclipped. On a phone: the dock the phone had. Answers a summary."""
+    api = DockApi()
+    server = ThreadingHTTPServer(("127.0.0.1", 0), handler_for(api))
+    server.daemon_threads = True
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    url = f"http://127.0.0.1:{server.server_port}/voice"
+    heights: dict[str, float] = {}
+    try:
+        with tempfile.TemporaryDirectory(prefix="vibe-talk-chrome-dock-") as profile:
+            context = chromium.launch_persistent_context(
+                profile, headless=True, executable_path=args.browser_executable,
+                viewport={"width": width, "height": height}, device_scale_factor=2.625 if mobile else 1,
+                is_mobile=mobile, has_touch=mobile, color_scheme="dark",
+            )
+            page = context.pages[0]
+            errors: list[str] = []
+            page.on("pageerror", lambda error: errors.append(str(error)))
+            desk = not mobile
+
+            def shot(name: str) -> None:
+                if args.screenshots:
+                    page.screenshot(path=str(args.screenshots / f"{label}-dock-{name}.png"), animations="disabled")
+
+            def until(script: str, why: str) -> None:
+                deadline = time.monotonic() + 10
+                while time.monotonic() < deadline and not page.evaluate(script):
+                    page.wait_for_timeout(50)
+                check(bool(page.evaluate(script)), f"{label}: {why}")
+
+            def measured(state: str, order: list[str] | None, rows: int | None = None,
+                         most: float = DOCK_DESK_MAX_PX,
+                         whole: tuple[str, ...] = ("discord-channel", "thread-select")) -> DockFound:
+                # Settled: a view that has just changed redraws its picker's label once its rows land,
+                # so the dock is measured once two looks a tenth of a second apart agree.
+                found: DockFound = page.evaluate(DOCK_JS, {"desk": desk, "order": order})
+                deadline = time.monotonic() + 5
+                while time.monotonic() < deadline:
+                    page.wait_for_timeout(100)
+                    again: DockFound = page.evaluate(DOCK_JS, {"desk": desk, "order": order})
+                    if again["boxes"] == found["boxes"]:
+                        break
+                    found = again
+                where = f"{label}, {state}"
+                check(not found["problems"], f"{where}: {found['problems']}")
+                tall = float(found["height"])
+                heights[state] = tall
+                boxes = found["boxes"]
+                if desk:
+                    check(tall <= most, f"{where}: the dock is {tall:.1f}px tall, more than {most}px")
+                    if rows is not None:
+                        check(found["rows"] == rows, f"{where}: the dock's controls make {found['rows']} rows, not {rows}")
+                    if rows == 1:
+                        check(tall <= DOCK_ONE_ROW_MAX_PX, f"{where}: one row stands {tall:.1f}px tall")
+                    for picker in (found["pickers"][name] for name in whole if name in found["pickers"]):
+                        check(picker["width"] >= picker["natural"] - 1,
+                              f"{where}: the picker showing {picker['text']!r} is {picker['width']:.1f}px wide and"
+                              f" needs {picker['natural']:.1f}px, so the name is cut short: {found['pickers']}")
+                else:
+                    check(abs(tall - PHONE_DOCK_PX) <= 1,
+                          f"{where}: the phone's dock is {tall:.1f}px tall; it was {PHONE_DOCK_PX:.1f}px")
+                    for big in ("hang-up", "talk", "read-aloud", "read-speed", "todo-filter"):
+                        if big in boxes:
+                            check(abs(boxes[big]["height"] - PHONE_SPAN_PX) <= 1,
+                                  f"{where}: #{big} is {boxes[big]['height']:.1f}px tall, not the tile's two rows")
+                    for narrow in ("todo-filter", "speaker", "clear-view"):
+                        if narrow in boxes:
+                            check(abs(boxes[narrow]["width"] - PHONE_NARROW_PX) <= 1,
+                                  f"{where}: #{narrow} is {boxes[narrow]['width']:.1f}px wide, not the tile's narrow column")
+                return found
+
+            def tabbed(state: str, found: DockFound) -> None:
+                """Tab from the gear to the last control: in the order the eye reads, every stop ringed."""
+                page.focus("#open-settings")
+                page.keyboard.press("Tab")
+                page.keyboard.press("Shift+Tab")
+                stops: list[str] = []
+                for _ in range(len(found["visual"]) + 2):
+                    stop = page.evaluate(DOCK_FOCUS_JS)
+                    if stop["id"] is None:
+                        break
+                    check(stop["visible"], f"{label}, {state}: #{stop['id']} took focus without showing it")
+                    check(not stop["problems"], f"{label}, {state}: {stop['problems']}")
+                    stops.append(str(stop["id"]))
+                    page.keyboard.press("Tab")
+                check(stops == found["visual"],
+                      f"{label}, {state}: Tab goes {stops}, the eye reads {found['visual']}")
+
+            page.goto(url, wait_until="load")
+            page.fill("#api-token", TOKEN)
+            page.click("#save-token")
+            page.wait_for_selector("#view-switch", state="visible", timeout=10_000)
+            until("() => !document.getElementById('control-pane').hidden", "the call view's pane did not appear")
+
+            # The call view, idle: the bar's four and the switch, and Sound, Clear and Talk beside them.
+            measured("call view, idle", ["speaker", "clear-view", "talk"], rows=1 if desk else None)
+            shot("1-call-idle")
+            # A live call, as renderControls draws it: Hang up shown and Talk listening. The audio is
+            # tests/read_aloud_browser.py's and the screenshot harness's; the layout is this one's.
+            page.evaluate("""() => { document.getElementById('hang-up').hidden = false;
+                document.getElementById('control-pane').className = '';
+                document.getElementById('talk').className = 'control control-talk live';
+                document.getElementById('talk-label').textContent = 'Listening'; }""")
+            live = measured("call view, live", ["speaker", "clear-view", "hang-up", "talk"])
+            shot("2-call-live")
+            if desk:
+                tabbed("call view, live", live)
+            # After it, the one-clause note under Start a new call: it goes under the word.
+            page.evaluate("""() => { document.getElementById('hang-up').hidden = true;
+                document.getElementById('control-pane').className = 'solo';
+                document.getElementById('talk').className = 'control control-talk';
+                document.getElementById('talk-label').textContent = 'Start a new call';
+                const note = document.getElementById('talk-note');
+                note.textContent = 'the agent starts fresh — the earlier conversation was too long to replay';
+                note.hidden = false; }""")
+            measured("call view, after a call", ["speaker", "clear-view", "talk"], most=DOCK_NOTE_MAX_PX)
+            shot("3-call-ended")
+
+            # The channel, whose thirty-character name opens first, in All.
+            page.reload(wait_until="load")
+            page.wait_for_selector("#view-switch", state="visible", timeout=10_000)
+            page.click("#view-switch")
+            page.wait_for_selector("#discord-log > li[data-id]", timeout=10_000)
+            check(page.evaluate("() => document.getElementById('discord-channel').selectedOptions[0].textContent")
+                  == LONG_CHANNEL["label"] and len(str(LONG_CHANNEL["label"])) >= 30,
+                  f"{label}: the channel open is not the thirty-character one")
+            reading = ["todo-filter", "read-speed", "read-aloud"]
+            channel = measured("the channel, a long name", reading)
+            shot("4-channel-long-name")
+            if desk:
+                tabbed("the channel, a long name", channel)
+                # Two rows here, and the pane at the right of the second, under the switch.
+                boxes = channel["boxes"]
+                switch, read = boxes["view-switch"], boxes["read-aloud"]
+                check(channel["rows"] == 2
+                      and abs((switch["left"] + switch["width"]) - (read["left"] + read["width"])) <= 1,
+                      f"{label}: the reading buttons are not under the switch at the right of a second row")
+            # A thread open in the view picker beside the long name. In the default column the two
+            # names, the gear, the device button and the switch do not fit one row, and the VIEW
+            # picker gives way: the channel's name stays whole.
+            thread_option = page.evaluate(
+                "() => [...document.getElementById('thread-select').options].map((o) => o.value)"
+                ".find((v) => v.startsWith('thread:'))")
+            check(bool(thread_option), f"{label}: the view picker offers no thread")
+            page.select_option("#thread-select", str(thread_option))
+            until("() => document.getElementById('thread-select').value.startsWith('thread:')",
+                  "the thread did not open")
+            measured("a thread beside the long name", reading, whole=("discord-channel",))
+            shot("5-channel-thread")
+            page.select_option("#thread-select", "flat")
+            # A short name: everything shares one row on a desk.
+            page.select_option("#discord-channel", str(CHANNEL["id"]))
+            until("() => document.getElementById('discord-channel').value === "
+                  f"{json.dumps(CHANNEL['id'])}", "the short channel did not open")
+            measured("the channel, a short name", reading, rows=1 if desk else None)
+            shot("6-channel-short-name")
+
+            if desk:
+                # The column dragged wide with the reader's own control: the long name and the three
+                # reading buttons share one row.
+                page.select_option("#discord-channel", str(LONG_CHANNEL["id"]))
+                until("() => document.getElementById('discord-channel').value === "
+                      f"{json.dumps(LONG_CHANNEL['id'])}", "the long channel did not open again")
+                page.evaluate("""() => { const range = document.getElementById('reading-width');
+                    range.value = '110'; range.dispatchEvent(new Event('input')); }""")
+                until("() => document.documentElement.style.getPropertyValue('--reading-width') === '110ch'",
+                      "the width handle's control did not take")
+                measured("a wide column, the long name", reading, rows=1)
+                shot("7-wide-column")
+                # And pulled in to its narrowest, where the bar's own row truly is out of room: the
+                # view picker at its floor, the channel's name the one cut, ending in an ellipsis, and
+                # nothing pushed out of the pack's sight.
+                page.evaluate("""() => { const range = document.getElementById('reading-width');
+                    range.value = range.min; range.dispatchEvent(new Event('input')); }""")
+                until("() => document.documentElement.style.getPropertyValue('--reading-width') === "
+                      "document.getElementById('reading-width').min + 'ch'", "the width handle's control did not narrow")
+                narrow = measured("the narrowest column, the long name", reading, whole=("thread-select",))
+                cut = narrow["pickers"]["discord-channel"]
+                floor = narrow["boxes"]["thread-select"]["width"]
+                check(cut["width"] < cut["natural"] and cut["width"] >= 5 * 16 - 0.5 and floor >= 5 * 16 - 0.5,
+                      f"{label}: in the narrowest column the pickers are {cut['width']:.1f}px and {floor:.1f}px")
+                check(page.evaluate("() => getComputedStyle(document.getElementById('discord-channel')).textOverflow")
+                      == "ellipsis", f"{label}: a cut channel name does not say it was cut")
+                shot("8-narrow-column")
+
+            check(not errors, f"{label}: the page threw: {errors}")
+            context.close()
+        summary = ", ".join(f"{state} {tall:.0f}px" for state, tall in heights.items())
+        return summary if desk else f"{summary} (the phone's dock as it was, {PHONE_DOCK_PX:.0f}px)"
     finally:
         api.stopping.set()
         server.shutdown()

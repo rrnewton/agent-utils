@@ -2304,6 +2304,68 @@ def _act_canned_prompts(driver: Driver) -> None:
 
 NO_HANGUP = ("Hang up is absent, not merely dimmed", "!window.__visible('hang-up')")
 
+# `#58 control-bar` put the bar directly ABOVE the big buttons, and three states measure that.
+# `#218 desktop-dock` lays the dock on a desk out as one wrapping row, where the bar and the pane's
+# buttons share a row when they fit: there the claim is that the bar is BESIDE the pane, to its left.
+# Either way the bar is never over the controls, which is the defect those measurements exist for.
+# `b` and `p` are the bar's and the pane's boxes; the desktop query is the one web/voice.css uses.
+BAR_CLEAR_OF_PANE_JS = (
+    "(b.bottom <= p.top + 1 || (matchMedia('(min-width: 900px) and (pointer: fine)').matches "
+    "&& b.right <= p.left + 1 && b.bottom > p.top && b.top < p.bottom))"
+)
+
+# `#218 desktop-dock`. The controls the dock is showing, without the tray and the pace popover that
+# hang out of it, for the desktop dock states.
+DOCK_CONTROLS_JS = (
+    "[...document.querySelectorAll('#dock button, #dock select')].filter((n) => "
+    "n.getClientRects().length > 0 && !n.closest('#prompts-tray') && !n.closest('#speed-popover'))"
+)
+
+
+def dock_inside_column_js(pane: str) -> str:
+    """Every control in the dock inside the column `pane` is held to, and no two overlapping."""
+    return (
+        f"(() => {{ const col = document.getElementById('{pane}').getBoundingClientRect(); "
+        f"const boxes = {DOCK_CONTROLS_JS}.map((n) => n.getBoundingClientRect()); "
+        "return boxes.length > 0 && boxes.every((r) => r.left >= col.left - 1 && r.right <= col.right + 1) "
+        "&& boxes.every((a, i) => boxes.every((b, j) => j <= i "
+        "|| Math.min(a.right, b.right) - Math.max(a.left, b.left) <= 0.5 "
+        "|| Math.min(a.bottom, b.bottom) - Math.max(a.top, b.top) <= 0.5)); })()"
+    )
+
+
+def pane_reads_js(order: str) -> str:
+    """The pane's shown buttons, left to right, are `order` (ids joined by commas)."""
+    return (
+        "[...document.getElementById('control-pane').children].filter((n) => n.matches('button') "
+        "&& n.getClientRects().length > 0).sort((a, b) => a.getBoundingClientRect().left - "
+        f"b.getBoundingClientRect().left).map((n) => n.id).join(',') === '{order}'"
+    )
+
+
+# Ordinary desktop controls, which is the whole of the owner's complaint about the thumb-sized dock:
+# 32px at least, a mouse's target, and no taller than 40px.
+DESK_CONTROL_SIZES = (
+    "every control in the dock is an ordinary desktop size: 32 to 40px tall, at least 32px wide",
+    f"{DOCK_CONTROLS_JS}.every((n) => {{ const r = n.getBoundingClientRect(); "
+    "return r.height >= 32 && r.height <= 40.5 && r.width >= 32; })",
+)
+# Two rows of those at the most, with their gap and padding. The dock stood 149px before.
+DESK_DOCK_HEIGHT = (
+    "the dock is at most two rows of them, not the 149px of thumb-sized tiles it was",
+    "document.getElementById('dock').getBoundingClientRect().height <= 100",
+)
+
+
+def _act_desktop_dock_call(driver: Driver) -> None:
+    """`#218 desktop-dock`: the dock during a live call on a desk — Type, Prompts and Gist on the bar,
+    Sound, Clear, Hang up and Listening beside it."""
+    driver.load(with_token=True)
+    driver.page.wait_for_function("() => window.__visible('control-pane')", timeout=10_000)
+    driver.click("talk")
+    driver.page.wait_for_function("() => window.__text('talk-label') === 'Listening'", timeout=10_000)
+    driver.settle(300)
+
 def _act_live_message(driver: Driver) -> None:
     """A message arrives on the stream while the reader is looking at the channel.
 
@@ -2772,9 +2834,10 @@ SCENES: tuple[Scene, ...] = (
                 "document.getElementById('pane-voice').getBoundingClientRect().right) < 20",
             ),
             (
-                "the controls follow the column rather than spanning the desk",
-                "document.getElementById('control-pane').getBoundingClientRect().width <= "
-                "document.getElementById('dock').getBoundingClientRect().width - 100",
+                # `#218 desktop-dock` made the dock one wrapping row inside the column, so this is
+                # stated as the column itself rather than as the pane being narrower than the dock.
+                "the controls follow the column rather than spanning the desk, overlapping nothing",
+                dock_inside_column_js("pane-voice"),
             ),
             (
                 "there is a real transcript in it to judge the line length by",
@@ -3036,10 +3099,11 @@ SCENES: tuple[Scene, ...] = (
             # on a 375x667 phone, and the failure mode is not "it looks cramped" -- it is the
             # bar overlapping the controls the reader is trying to hit. Measured, not eyeballed.
             (
-                "the bar carrying the field sits ABOVE the big controls, not over them",
-                "(() => { const c = document.getElementById('control-bar').getBoundingClientRect(); "
+                "the bar carrying the field sits ABOVE the big controls (on a desk, beside them), "
+                "not over them",
+                "(() => { const b = document.getElementById('control-bar').getBoundingClientRect(); "
                 "const p = document.getElementById('control-pane').getBoundingClientRect(); "
-                "return c.height > 0 && c.bottom <= p.top + 1; })()",
+                f"return b.height > 0 && {BAR_CLEAR_OF_PANE_JS}; }})()",
             ),
             (
                 "...and it did not push the transcript off the screen",
@@ -3081,11 +3145,12 @@ SCENES: tuple[Scene, ...] = (
             # big buttons" and not "pinned to the viewport floor": it is the band BETWEEN the
             # transcript and the controls. Only a browser can measure that.
             (
-                "the bar sits below the transcript and directly above the big buttons",
+                "the bar sits below the transcript and directly above the big buttons (on a desk, "
+                "beside them)",
                 "(() => { const b = document.getElementById('control-bar').getBoundingClientRect(); "
                 "const s = document.getElementById('scroll-area').getBoundingClientRect(); "
                 "const p = document.getElementById('control-pane').getBoundingClientRect(); "
-                "return b.height > 0 && b.top >= s.bottom - 1 && b.bottom <= p.top + 1; })()",
+                f"return b.height > 0 && b.top >= s.bottom - 1 && {BAR_CLEAR_OF_PANE_JS}; }})()",
             ),
             # ...and the payoff. With nothing left in the header the header is gone, and the body
             # has grown into the row. `#129 message-search` put its glass up there and kept the
@@ -3181,10 +3246,10 @@ SCENES: tuple[Scene, ...] = (
                 "return s.right <= b.right + 1 && g.left >= b.left - 1 && s.width > 40; })()",
             ),
             (
-                "...and it is still one strip, not two rows",
+                "...and it is still one strip, not two rows, clear of the big buttons",
                 "(() => { const b = document.getElementById('control-bar').getBoundingClientRect(); "
                 "const p = document.getElementById('control-pane').getBoundingClientRect(); "
-                "return b.height < 70 && b.bottom <= p.top + 1; })()",
+                f"return b.height < 70 && {BAR_CLEAR_OF_PANE_JS}; }})()",
             ),
             # The tray costs the strip NOTHING, which is the entire argument for replacing two
             # members with one. Out of flow, so opening it must not make the bar taller — the
@@ -3629,6 +3694,63 @@ SCENES: tuple[Scene, ...] = (
             (
                 "the choice is kept on this device",
                 "localStorage.getItem('vibe-talk.voice.hidden-link-kinds') === '[\"pr\"]'",
+            ),
+        ),
+    ),
+    Scene(
+        name="39-desktop-dock-channel",
+        what="the dock on a desk over the channel: one wrapping row of ordinary controls, names whole",
+        act=_act_open_channel,
+        # `#218 desktop-dock`. Desks only: the phone keeps its thumb-sized dock, and these sizes on a
+        # phone would be the defect, not the feature.
+        profiles=DESKTOP_PROFILES,
+        expect=(
+            (
+                "the channel is up, with its reading buttons in the dock",
+                "window.__visible('pane-discord') && window.__visible('read-aloud')",
+            ),
+            DESK_DOCK_HEIGHT,
+            DESK_CONTROL_SIZES,
+            (
+                "Hide read, Pace and Read, left to right as on the phone, and no Sound among them",
+                pane_reads_js("todo-filter,read-speed,read-aloud"),
+            ),
+            (
+                # THE other half of the complaint: a picker cut short beside empty space. Measured
+                # against the same select sized to the name it shows, with no cap and no shrink.
+                "the channel picker is as wide as the name it is showing",
+                "(() => { const sel = document.getElementById('discord-channel'); "
+                "const probe = document.createElement('select'); probe.className = sel.className; "
+                "const o = document.createElement('option'); "
+                "o.textContent = sel.selectedOptions[0].textContent; probe.append(o); "
+                "probe.style.cssText = 'position:absolute;visibility:hidden;max-width:none;"
+                "min-width:0;flex:none;field-sizing:content'; sel.parentNode.append(probe); "
+                "const natural = probe.getBoundingClientRect().width; probe.remove(); "
+                "return sel.getBoundingClientRect().width >= natural - 1; })()",
+            ),
+            (
+                "the dock's controls are inside the list's column and overlap nothing",
+                dock_inside_column_js("pane-discord"),
+            ),
+        ),
+    ),
+    Scene(
+        name="40-desktop-dock-call",
+        what="the dock on a desk during a live call: Type and Prompts beside Sound, Clear, Hang up, Listening",
+        act=_act_desktop_dock_call,
+        profiles=DESKTOP_PROFILES,
+        expect=(
+            ("the call is live", "window.__text('talk-label') === 'Listening'"),
+            DESK_DOCK_HEIGHT,
+            DESK_CONTROL_SIZES,
+            (
+                "Sound, Clear, Hang up and Listening, left to right, with Type and Prompts on the bar",
+                pane_reads_js("speaker,clear-view,hang-up,talk")
+                + " && window.__visible('text-entry') && window.__visible('prompts-open')",
+            ),
+            (
+                "the dock's controls are inside the transcript's column and overlap nothing",
+                dock_inside_column_js("pane-voice"),
             ),
         ),
     ),
@@ -4087,6 +4209,10 @@ def check_state_controls() -> list[str]:
         # context this scene would photograph an interaction that device cannot have -- and the
         # gesture is the whole content of the picture.
         "31-pull-to-refresh-armed": PHONE_PROFILES,
+        # `#218 desktop-dock`. Desks only, for the reason the column scenes are: on a phone these
+        # measurements would certify a desktop dock on the device that must keep its thumb's one.
+        "39-desktop-dock-channel": DESKTOP_PROFILES,
+        "40-desktop-dock-call": DESKTOP_PROFILES,
     }
     for name, wanted_profiles in restricted.items():
         scene = next((s for s in SCENES if s.name == name), None)
@@ -4258,6 +4384,13 @@ def check_state_controls() -> list[str]:
         #   `.body`           — the message is still there. A red row that swallowed the message
         #     would be worse than no summary mode at all, and it satisfies every colour check.
         SUMMARY_FAILED_STATE: ("backgroundColor", "summary failed", ".body"),
+        # `#218 desktop-dock`. Pinned to the two halves of the owner's complaint, each separately
+        # deletable: the SIZE of the dock and its controls (`height <= 100`, `r.height <= 40.5`),
+        # and the picker as wide as its name (`field-sizing`) — plus, for each view, the pane in
+        # the order the phone shows it, which a desk row laid out in markup order could lose.
+        "39-desktop-dock-channel": ("height <= 100", "r.height <= 40.5", "field-sizing",
+                                    "todo-filter,read-speed,read-aloud"),
+        "40-desktop-dock-call": ("height <= 100", "r.height <= 40.5", "speaker,clear-view,hang-up,talk"),
     }
     for name, needles in required.items():
         required_scene = next((s for s in SCENES if s.name == name), None)

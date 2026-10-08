@@ -1878,30 +1878,6 @@
         </button>
 
         <!--
-          Read-aloud. Sits where Talk sits and takes its place in the CHANNEL view: talking to the
-          voice agent and being read a channel message are two different things to want, and the
-          one you want is decided by which list you are looking at.
-        -->
-        <button id="read-aloud" class="control control-read" type="button" aria-pressed="false" hidden>
-          <span class="control-ring" aria-hidden="true"></span>
-          <svg
-            class="control-icon"
-            viewBox="0 0 24 24"
-            aria-hidden="true"
-            fill="none"
-            stroke="currentColor"
-            stroke-width="1.8"
-            stroke-linecap="round"
-            stroke-linejoin="round"
-          >
-            <path d="M11 5 6.5 9H3v6h3.5L11 19z" />
-            <path d="M15.5 8.5a5 5 0 0 1 0 7" />
-            <path d="M18.5 5.5a9 9 0 0 1 0 13" />
-          </svg>
-          <span id="read-aloud-label" class="control-label">Read</span>
-        </button>
-
-        <!--
           The archive filter, in the BAR. It changes what the list is, so it belongs beside the
           other things that act on the list rather than inside the list it filters.
         -->
@@ -1945,6 +1921,35 @@
             Unset, a message is read at whatever pace the voice agent is configured with.
           </p>
         </div>
+
+        <!--
+          Read-aloud. Sits where Talk sits and takes its place in the CHANNEL view: talking to the
+          voice agent and being read a channel message are two different things to want, and the
+          one you want is decided by which list you are looking at.
+
+          Declared HERE, after the filter and the pace and just before Talk, so the markup runs in
+          the order the reader sees: Hide read, Pace, Read. The phone tile places all three by
+          explicit grid column and does not care; the desktop row is laid out in this order, and
+          Tab follows it on both (`#218 desktop-dock`).
+        -->
+        <button id="read-aloud" class="control control-read" type="button" aria-pressed="false" hidden>
+          <span class="control-ring" aria-hidden="true"></span>
+          <svg
+            class="control-icon"
+            viewBox="0 0 24 24"
+            aria-hidden="true"
+            fill="none"
+            stroke="currentColor"
+            stroke-width="1.8"
+            stroke-linecap="round"
+            stroke-linejoin="round"
+          >
+            <path d="M11 5 6.5 9H3v6h3.5L11 19z" />
+            <path d="M15.5 8.5a5 5 0 0 1 0 7" />
+            <path d="M18.5 5.5a9 9 0 0 1 0 13" />
+          </svg>
+          <span id="read-aloud-label" class="control-label">Read</span>
+        </button>
 
         <button id="talk" class="control control-talk" type="button">
           <span class="control-ring" aria-hidden="true"></span>

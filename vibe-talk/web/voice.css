@@ -3796,17 +3796,197 @@ textarea {
     margin-inline: auto;
   }
 
-  /* The dock follows the column, so the controls sit under the thing they act on instead of
-     spanning a metre of desk. `max-width` and an auto margin, NOT `position` — the pane holds its
-     place by being a grid row, and the suite asserts that it still does.
-     `#58 control-bar` joined the group: a bar spanning the whole desk above a column-width pane is
-     the same "phone layout stretched sideways" this block exists to remove, and it would push the
-     switch a screen away from the transcript it switches. */
-  #control-pane,
-  #control-bar[data-placement="bottom"],
+  /* The status pill follows the column, so it sits over the thing it reports on instead of
+     floating in the middle of a metre of desk. `max-width` and an auto margin, NOT a new
+     `position` — it is already the one overlay in the dock's neighbourhood, and only that. */
   #status-line {
     max-width: var(--reading-width);
     margin-inline: auto;
+  }
+
+  /*
+   * `#218 desktop-dock`. THE DOCK, AT DESKTOP SIZE.
+   *
+   * Everything about the dock above was priced for a thumb: a 2.4rem strip of 44px targets, and
+   * under it a tile of large buttons, each half the width of a phone. On a desk the owner
+   * photographed exactly what that becomes — Read and Pace as slabs over three hundred pixels
+   * wide, "Hide read" broken over two lines in a 3.5rem column, the channel and view pickers cut
+   * off at nine rem beside two hundred pixels of nothing, and the whole dock 149px tall. "Way
+   * bigger than buttons would ever need to be on desktop, and also wasting a significant amount of
+   * precious vertical space."
+   *
+   * So on a desk the dock is ONE WRAPPING ROW of ordinary controls, 2.25rem (36px) tall: the bar,
+   * then the pane's buttons beside it. A mouse needs a 32px target, not a 44px one, so nothing
+   * here is smaller than the first or as large as the second. Measured at 1280x800: 149px before,
+   * 50px when everything fits one row, 92px when it needs two.
+   *
+   * IT STILL FOLLOWS THE COLUMN. `#55` and `#58` put the controls under the thing they act on and
+   * the switch beside the transcript it switches, and that judgement stands; what changes is that
+   * the dock now spends the column's width instead of leaving it empty. The column is drawn as
+   * the dock's own padding — half of what the window has beyond the reader's chosen width, plus
+   * the 0.6rem inset the controls always had — so it is the same box the panes are held to, and
+   * it moves with the width handle. Padding rather than `position`: the dock is still the third
+   * grid row of the frame, and the suite asserts that it is.
+   *
+   * IT WRAPS RATHER THAN TRUNCATES. When a long channel name and the three reading buttons do not
+   * fit the column together, the pane's buttons go to a second row, at the right, under the switch
+   * — a second 36px row costs less than a name the reader cannot read, which is the other half of
+   * the owner's complaint. A picker is cut only when the bar's own row is out of room: the view
+   * picker first (a thread title beside a long channel name can do that in the default column),
+   * and the channel's only once the view picker is at its floor, which in a column of 45
+   * characters it can be.
+   */
+  #dock {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 0.4rem 0.5rem;
+    padding: 0.4rem max(0.6rem, calc((100% - var(--reading-width)) / 2 + 0.6rem));
+  }
+
+  /* The bar takes what the pane leaves, so its pack can give the pickers their names. */
+  #control-bar-bottom {
+    flex: 1 1 auto;
+    min-width: 0;
+  }
+
+  /* The dock carries the padding on a desk: there is no curved corner to clear and no band to
+     separate from the pane below, because the pane is beside it now. */
+  #control-bar[data-placement="bottom"] {
+    padding: 0;
+  }
+
+  /* Room for a focus ring. The pack scrolls sideways, and a scrolling box clips whatever is drawn
+     outside it — including the outline that tells a keyboard reader where they are. The padding
+     makes room for the ring and the equal negative margin gives the room back, so nothing moves. */
+  #bar-pack {
+    padding: 0.25rem;
+    margin: -0.25rem;
+  }
+
+  /* The pane is a row of buttons, not a tile, in markup order — Sound, Clear, Hang up, Talk on
+     the call; Hide read, Pace, Read on the channel, the order the phone tile shows them in.
+     `margin-left: auto` keeps it at the right of its row: beside the switch when everything fits,
+     under it when it has wrapped. It wraps its own buttons as a last resort, rather than running
+     past the column, when a long note after a call makes it wider than the column on its own. */
+  #control-pane {
+    flex: 0 1 auto;
+    min-width: 0;
+    display: flex;
+    flex-wrap: wrap;
+    justify-content: flex-end;
+    align-items: center;
+    gap: 0.4rem;
+    margin-left: auto;
+    padding: 0;
+  }
+
+  /* Sound silences a CALL's voice, and the channel view without a call has none. web/voice.js
+     leaves it unhidden there, and on a phone that never shows: Hide read is placed in the same
+     grid cell, later in the markup, and covers it. A row has no cells to cover anything with, so
+     the reading view says here what the phone tile already shows — Hide read, Pace, Read. */
+  #control-pane:has(#read-aloud:not([hidden])) #speaker {
+    display: none;
+  }
+
+  /* Ordinary desktop controls: the icon and its word side by side, at reading size. The phone's
+     0.55rem capital caption under the icon was the price of a 44px square, and nothing here is
+     paying it. A grid rather than a flex row because of Talk's one-clause note after a call: it
+     goes under the word, beside the icon, instead of making the button as wide as the sentence. */
+  .bar-button,
+  #control-pane .control {
+    min-height: 2.25rem;
+    border-radius: 0.6rem;
+  }
+
+  .bar-button {
+    flex-direction: row;
+    gap: 0.4rem;
+    min-width: 2.25rem;
+    padding: 0 0.5rem;
+  }
+
+  #control-pane .control {
+    display: grid;
+    grid-template-columns: auto auto;
+    justify-content: center;
+    align-content: center;
+    column-gap: 0.4rem;
+    padding: 0 0.65rem;
+    text-align: start;
+  }
+
+  #control-pane .control > svg {
+    grid-row: 1 / span 2;
+  }
+
+  /* The pane's icons at the bar's size, so a row of them reads as one set. */
+  .control-icon {
+    width: 1.15rem;
+    height: 1.15rem;
+  }
+
+  /* `inherit` rather than muted: beside the icon the word IS the label, and the states that colour
+     a button — Sound on, Gist, an armed Clear — colour it whole. */
+  .mini-label,
+  .control-label {
+    font-size: 0.85rem;
+    letter-spacing: 0.01em;
+    text-transform: none;
+    color: inherit;
+  }
+
+  #control-pane .control-note {
+    grid-column: 2;
+    max-width: 16rem;
+    padding-bottom: 0.3rem;
+    font-size: 0.72rem;
+    text-align: start;
+  }
+
+  /* The pickers show their names. `field-sizing: content` sizes each to the option it is showing
+     rather than to the longest option it holds — "All" no longer reserves the width of a thread
+     title — and where a browser lacks it, the longest option is the size, under the same caps.
+     The caps are the "sensible max": a channel name of thirty-odd characters, a thread label of
+     its age, replies and twenty-eight characters of name. A name that does not fit ends in an
+     ellipsis, so a cut name says it was cut.
+     Still sixteen pixels: an iPad with a trackpad can be in this regime, and iPadOS zooms on a
+     smaller field exactly as iOS does. */
+  .bar-select {
+    min-height: 2.25rem;
+    max-width: 20rem;
+    field-sizing: content;
+    text-overflow: ellipsis;
+    border-radius: 0.6rem;
+  }
+
+  /* THE VIEW PICKER GIVES WAY FIRST: which channel this is matters more than how much of a thread
+     title shows. So the channel's picker does not shrink at all — a share of the shrinking, however
+     small, is a fraction of a pixel the text no longer fits, and the ellipsis turns that into a
+     visible "…" — and is capped instead at what the pack has left once its other members are at
+     their floors: the view picker's 5rem, the audio button's 2.25rem and the two gaps between
+     them. Until the view picker is down to its floor the channel's name is whole; past that, it is
+     the channel's that ends in the ellipsis, and nothing is pushed out of the pack. */
+  #discord-channel {
+    flex-shrink: 0;
+    max-width: min(24rem, 100% - 5rem - 2.25rem - 2 * 0.4rem);
+  }
+
+  /* The row's height, and a little less air inside it: at the default column the switch is what
+     decides whether a short channel's name and the three reading buttons share one row. */
+  .switch {
+    min-height: 2.25rem;
+    gap: 0.4rem;
+    padding-right: 0.6rem;
+  }
+
+  /* Visible focus on every control in the dock, in the accent, outside the control so it shows
+     on a filled button as well as on a quiet one. Without it the browser's own ring is the only
+     sign, and on the filled buttons it is the same blue as the button. */
+  #control-bar :is(button, select):focus-visible,
+  #control-pane button:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 2px;
   }
 
   /* The reply screen is read the same way the channel is, so it is held to the same column.
