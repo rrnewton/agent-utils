@@ -6904,6 +6904,12 @@ function drawProjection() {
   channelFreshAt = cover.at;
   delete cover.landedHidden;
   setChannelFreshness(cover.live ? "fresh" : "saved");
+  // Main drawn from All's cover, read in this page: older history is known to exist, and the step
+  // back to it is Main's own first read (`walkCursorOwed`). `#220 view-switch-instant`.
+  if (cover.fromAll && cover.live && cover.more) {
+    discordMoreAbove = true;
+    renderOlderControl();
+  }
   // A delivered send whose row is saved here shows once, as that row — but its receipt stays until
   // the server itself is seen to have the message.
   renderOutgoingMessages();
@@ -6911,16 +6917,37 @@ function drawProjection() {
 }
 
 /**
- * The rows of the current view the store holds though no page has covered the view: each one from
- * `since` up — a time, the oldest row the reader was looking at — or, in a thread, every one of the
- * thread's. Empty for the Threads list, which is not drawn this way. `#220 view-switch-instant`.
+ * Whether the view on screen has older history but no cursor to walk back on: Main drawn from All's
+ * cover, which has All's floor and All's word that more exists but not a cursor of Main's own. Its
+ * first step back is Main's newest page, read behind the rows (`readWalkCursor`): Main's fifty
+ * reach further back than the roots among All's fifty, and the page brings the cursor the walk goes
+ * on from. `#220 view-switch-instant`.
  */
-function heldViewRows(since) {
-  if (!threadingSupported || channelView === "threads" ||
+function walkCursorOwed() {
+  if (!threadingSupported || discordOlderCursor || channelCanon.channel !== String(el("discord-channel").value)) {
+    return false;
+  }
+  const cover = channelCanon.views.get(viewKey());
+  return Boolean(cover && cover.fromAll && cover.live && cover.more);
+}
+
+/**
+ * The rows of the current view the store holds though no page has covered the view, to draw while
+ * its read is on the wire. `#220 view-switch-instant`. ONLY THE STRETCH ANOTHER COVER VOUCHES FOR,
+ * so that what is drawn is one continuous piece of the view, never two with the messages between
+ * them unread: for All, Main's cover, which holds every message posted to the channel itself from
+ * its floor up, with the replies the page has met among them; for a thread, All's, from its floor
+ * up (a thread All reaches from its start is covered already, `inheritAllCover`). An old thread read
+ * for itself is not joined to Main's newest page as All, nor a thread's root to its newest replies.
+ * Empty when no cover vouches — and for Main, which is drawn from All or read, and the Threads list.
+ */
+function heldViewRows() {
+  if (!threadingSupported || (channelView !== "flat" && channelView !== "thread") ||
       channelCanon.channel !== String(el("discord-channel").value)) return [];
-  if (channelView !== "thread" && !Number.isFinite(since)) return [];
+  const base = channelCanon.views.get(viewKey(channelView === "flat" ? "main" : "flat"));
+  if (!base || (base.more && base.floor === null)) return [];
   return channelCanon.messages.filter((message) => inView(message, channelView, selectedThreadId) &&
-    (channelView === "thread" || !(timeOf(message, "timestamp") < since)));
+    !(base.more && timeOf(message, "timestamp") < base.floor));
 }
 
 /**
@@ -7940,11 +7967,7 @@ async function changeChannelView(view, threadId = null, summary = null) {
   // view drawn from held rows is as current as.
   const place = readerPlace();
   const from = channelView;
-  const came = {
-    freshAt: channelFreshAt,
-    freshness: channelFreshness,
-    since: timelineMessages.length > 0 ? timeOf(timelineMessages[0], "timestamp") : NaN,
-  };
+  const came = { freshAt: channelFreshAt, freshness: channelFreshness };
   // `#206 pin-message`. Choosing a view is asking to see it, and the Pinned filter shows the same
   // pins in every view — so it steps aside, as it must for a pin opened in its thread.
   setPinnedOnly(false);
@@ -7984,7 +8007,7 @@ async function changeChannelView(view, threadId = null, summary = null) {
   const sameStore = threadingSupported && channelCanon.channel === String(el("discord-channel").value);
   const inherited = !held && inheritAllCover(view, threadId, summary);
   const covered = !held && sameStore && channelCanon.views.has(viewKey());
-  const rows = held || covered ? [] : heldViewRows(came.since);
+  const rows = held || covered ? [] : heldViewRows();
   discordMoreAbove = held ? held.more : false;
   discordOlderCursor = held ? held.cursor : null;
   discordNewestId = held ? held.newest : null;
@@ -8012,8 +8035,10 @@ async function changeChannelView(view, threadId = null, summary = null) {
     // Switching back to a view already fetched in this page is a local
     // presentation change. The live stream and periodic poll refresh the
     // active view; a tab switch itself must not become another network wait.
-    // ...but a view drawn from held rows whose read never landed still owes that read.
-    if (sameStore && view !== "threads" && !channelCanon.views.has(viewKey()) && !discordFetchInFlight) {
+    // ...but a view drawn from held rows whose read never landed still owes that read — queued
+    // behind a read of another view still on the wire; one of this view lands here by itself.
+    if (sameStore && view !== "threads" && !channelCanon.views.has(viewKey()) &&
+        timelineReadContext !== channelContextKey()) {
       await readBehindSwitch();
     }
     return;
@@ -8028,6 +8053,9 @@ async function changeChannelView(view, threadId = null, summary = null) {
     // Main is a view of its own from here, in the snapshot too. A thread drawn from All's cover is
     // saved as All's, as it always was.
     if (inherited && view === "main") saveChannelScope();
+    // Main drawn from All with the reader at its top — All's window held few roots, or they are
+    // reading the oldest of them: arriving there asks for what is above, as scrolling there does.
+    if (walkCursorOwed()) maybeLoadOlder();
     return;
   }
   // Covered by nothing, but the store holds some of it: up at once, and read behind it.
@@ -8061,7 +8089,9 @@ async function changeChannelView(view, threadId = null, summary = null) {
  * no read. The roots keep their reply counts: their thread records, and the summaries, are the
  * store's. Not All's notice, which can be about All alone ("replies for at most ten threads"): Main's
  * own read says Main's. And a Main the store covers already is as current as All when All's newest
- * page is the later read, since that page answered for every Main row in it.
+ * page is the later read, since that page answered for every Main row in it. Either way Main has no
+ * cursor of its own to walk back on, and `fromAll` says so: its first step back is its own read
+ * (`walkCursorOwed`). Main's own page replaces the cover, and the mark goes with it.
  *
  * True when it gave the view a cover or freshened one, which the snapshot then has to be told.
  */
@@ -8075,10 +8105,11 @@ function inheritAllCover(view, threadId = null, summary = null) {
   // `#203 incremental-refresh`.
   if (view === "main" && !own) {
     const { landedHidden: _hidden, ...cover } = all;
-    channelCanon.views.set(key, { ...cover, notice: "", cursor: null, newest: null, fullAt: 0 });
+    channelCanon.views.set(key, { ...cover, notice: "", cursor: null, newest: null, fullAt: 0, fromAll: true });
   } else if (view === "main" && all.live && (!own.live || all.at > own.at)) {
     own.live = true;
     own.at = all.at;
+    own.fromAll = true;
   } else if (view === "thread" && !own && allReachesThread(threadId, summary)) {
     channelCanon.views.set(key, { ...all, cursor: null, newest: null, fullAt: 0 });
   } else {
@@ -8102,10 +8133,13 @@ function allReachesThread(id, summary) {
   return all.floor !== null && Number.isFinite(startedAt) && startedAt >= all.floor;
 }
 
-/** A held view missed what the stream delivered while it was hidden; the store did not. */
+/**
+ * A held view missed what the stream delivered while it was hidden; the store did not. True when
+ * that changed the rows on screen.
+ */
 function catchUpHeldView() {
   const projected = threadingSupported ? projectView() : null;
-  if (!projected) return;
+  if (!projected) return false;
   const cover = channelCanon.views.get(viewKey());
   if (cover.landedHidden) {
     // A page read for this view arrived while it was hidden: it is as current as that read.
@@ -8116,7 +8150,7 @@ function catchUpHeldView() {
   const threads = channelView === "threads";
   const held = threads ? timelineThreads : timelineMessages;
   const ids = (items) => items.map((item) => String(item.id)).join("\n");
-  if (ids(projected) === ids(held)) return;
+  if (ids(projected) === ids(held)) return false;
   if (threads) {
     timelineThreads = projected;
     el("thread-list").replaceChildren(...projected.map(threadCard));
@@ -8124,6 +8158,37 @@ function catchUpHeldView() {
     timelineMessages = projected;
     renderCachedTimeline();
   }
+  return true;
+}
+
+/**
+ * A page read for All landed while the reader is in Main, or in a thread drawn from All. `#220
+ * view-switch-instant`. All's newest page, or a delta continuing it, answers for every row of Main
+ * from All's floor up, and for a thread All reaches: so the view on screen is caught up from the
+ * store now, as a refresh of its own would be — the newest line followed, or the reader's place kept
+ * and what arrived counted — and Main is as current as that read. Without this, Main drawn from All
+ * went on showing what All held before, under a pill saying Live, until its own poll. Only a view
+ * the store covers: one being read for itself is drawn by that read.
+ */
+function catchUpFromAll() {
+  if (!threadingSupported || (channelView !== "main" && channelView !== "thread") ||
+      channelCanon.channel !== String(el("discord-channel").value) || !channelCanon.views.has(viewKey())) return;
+  if (inheritAllCover(channelView, selectedThreadId, selectedThread)) {
+    channelFreshAt = channelCanon.views.get(viewKey()).at;
+    setChannelFreshness("fresh");
+    // Saved, now live: older history is known to exist, and the step back to it is Main's read.
+    if (walkCursorOwed()) {
+      discordMoreAbove = true;
+      renderOlderControl();
+    }
+  }
+  const area = el("scroll-area");
+  const position = channelReadPosition(area);
+  if (catchUpHeldView()) {
+    settleAfterRead(timelineMessages.filter((message) => !todoMode || stillToDo(message)),
+      { keepPosition: true, area, ...position });
+  }
+  renderChannelFreshness();
 }
 
 // --- thread selector ----------------------------------------------------------------------------
@@ -8738,7 +8803,10 @@ function applyTimelinePage(payload, older = false, saved = false, delta = false,
     discordMoreAbove = payload.has_more === true ? (payload.next_before ? true : undefined) : false;
     discordOlderCursor = payload.next_before || null;
   } else if (!delta && (older || merged.length <= incoming.length || previousCount === 0 ||
-      (discordMoreAbove === undefined && !discordOlderCursor))) {
+      // No cursor to retain — saved rows, or Main drawn from All's cover (`walkCursorOwed`, `#220
+      // view-switch-instant`), whose history reaches below this page: walking back from the page's
+      // own cursor re-reads rows the store holds, which only add, rather than never walking at all.
+      (discordMoreAbove !== false && !discordOlderCursor))) {
     discordMoreAbove = payload.has_more === true;
     discordOlderCursor = payload.next_before || null;
   }
@@ -8915,14 +8983,17 @@ async function loadTimeline(options) {
     return;
   }
   discordFetchInFlight = true;
+  timelineReadContext = context;
   const read = ++timelineReadsStarted;
   const area = el("scroll-area");
   const position = channelReadPosition(area);
   const keepPosition = Boolean(options && options.keepPosition);
   // `#220 view-switch-instant`. A read behind rows a view switch drew: no loading line over them,
-  // and what it adds was only not drawn before, not something that arrived.
+  // and what it adds was only not drawn before, not something that arrived. Asked of a list with
+  // rows in it: a quiet read queued with one for a view that has nothing to draw shows the line.
   const ownAct = Boolean(options && options.ownAct);
-  renderChannelLoading(true, Boolean(options && options.quiet));
+  const rowsUp = el(view === "threads" ? "thread-list" : "discord-log").children.length > 0;
+  renderChannelLoading(true, Boolean(options && options.quiet) && rowsUp);
   /** @type {VibeTalk.TimelineResponse[]} every page this refresh folded, in order */
   const landed = [];
   /** @type {VibeTalk.TimelineResponse[]} the delta pages among them, still to be drawn */
@@ -8930,6 +9001,12 @@ async function loadTimeline(options) {
   let sent = forwardCursor(options && options.reason);
   const sameStore = () => canon === channelCanon && canon.channel === channel &&
     String(el("discord-channel").value) === channel;
+  const stillCurrent = () => generation === discordLoadGeneration && context === channelContextKey();
+  // `#220 view-switch-instant`. Rows a switch drew from the store for a view no page has covered,
+  // read behind them (`drawHeldRows`): the newest page replaces them, and the message the reader is
+  // on may be older than that page reaches.
+  const behindHeld = keepPosition && view !== "threads" && sameStore() && !canon.views.has(viewKey(view, thread)) &&
+    timelineMessages.length > 0;
   /** Draw the delta pages folded so far, as the one refresh they are. */
   const drawDeltas = () => {
     renderChannelLoading(false);
@@ -8978,6 +9055,8 @@ async function loadTimeline(options) {
           if (context === channelContextKey()) {
             catchUpHeldView();
             renderChannelFreshness();
+          } else if (view === "flat") {
+            catchUpFromAll();
           }
           saveChannelScope();
           return;
@@ -9004,7 +9083,13 @@ async function loadTimeline(options) {
         return;
       }
       landed.push(payload);
-      if (!current) {
+      // Under rows drawn from the store, a reader off the newest line keeps their message: the view
+      // is walked back to it before anything is drawn, so the list changes once, under them.
+      const anchored = behindHeld && current && !position.wasAtNewest && position.anchorId
+        ? timelineMessages.find((message) => String(message.id) === position.anchorId) : null;
+      const placeAt = timeOf(anchored, "timestamp");
+      const older = Number.isFinite(placeAt) ? await pagesBackTo(payload, placeAt, stillCurrent) : [];
+      if (!current || !stillCurrent()) {
         foldLateTimelinePage(payload, { context, channel, view, thread, canon });
         return;
       }
@@ -9012,6 +9097,8 @@ async function loadTimeline(options) {
       // real browsers scrollTop is clamped when it disappears, but making the
       // order explicit also keeps the viewport model deterministic.
       renderChannelLoading(false);
+      // Where the reader is among the held rows now, which the walk gave them time to change.
+      const at = behindHeld ? { ...channelReadPosition(area), heldPlaceAt: placeAt } : position;
       // ...unless what is on screen came from the device or a read that failed: those rows are what
       // the reader has, and the refresh MERGES into them rather than replacing them with one page.
       if (!keepPosition && channelFreshness === "fresh") {
@@ -9023,8 +9110,9 @@ async function loadTimeline(options) {
         discordMoreAbove = false;
         channelCanon.views.delete(viewKey());
       }
-      const messages = applyTimelinePage(payload);
-      settleAfterRead(messages, { keepPosition, area, ...position, ownAct });
+      let messages = applyTimelinePage(payload);
+      for (const page of older) messages = applyTimelinePage(page, true);
+      settleAfterRead(messages, { keepPosition, area, ...at, ownAct });
       noteFreshRead(payload);
       saveChannelScope();
       renderScrollTools();
@@ -9057,11 +9145,65 @@ function foldLateTimelinePage(payload, read) {
     // Back on the view it was read for: that view is current now, not only on its next showing.
     catchUpHeldView();
     renderChannelFreshness();
+  } else if (read.view === "flat") {
+    // All's page answers for Main, and for a thread drawn from All, now on screen.
+    catchUpFromAll();
   }
   saveChannelScope();
 }
 
+/**
+ * The older pages of the view `payload` is the newest page of, read until one reaches back to
+ * `placeAt` — the time of the message the reader is on — for at most `REPLY_JUMP_PAGES`, while
+ * `current()` holds. `#220 view-switch-instant`. A step that fails ends the walk: what was read is
+ * drawn, and the reader is put as near their message as that reaches (`settleAfterRead`).
+ *
+ * @param {VibeTalk.TimelineResponse} payload
+ * @param {number} placeAt
+ * @param {() => boolean} current
+ * @returns {Promise<VibeTalk.TimelineResponse[]>}
+ */
+async function pagesBackTo(payload, placeAt, current) {
+  /** @type {VibeTalk.TimelineResponse[]} */
+  const pages = [];
+  let last = payload;
+  while (pages.length < REPLY_JUMP_PAGES && last.has_more === true && last.next_before &&
+      !(timeOf((last.messages || [])[0], "timestamp") <= placeAt)) {
+    const path = timelinePath(last.next_before);
+    try {
+      last = await within(CHANNEL_READ_TIMEOUT_MS, (signal) => apiDecoded("TimelineResponse", path, { signal }));
+    } catch (_error) {
+      break;
+    }
+    if (!current()) break;
+    pages.push(last);
+  }
+  return pages;
+}
+
+/**
+ * The first step back in a view with no cursor to take it from (`walkCursorOwed`): the view's own
+ * newest page, read behind its rows, keeping the reader's place. The control says the step is under
+ * way meanwhile, as for any step. `#220 view-switch-instant`.
+ */
+async function readWalkCursor() {
+  olderFetchInFlight = true;
+  renderOlderControl();
+  try {
+    await loadDiscord({ keepPosition: true, quiet: true, reason: "enter" });
+  } catch (error) {
+    if (!(error && error.shownInPill)) throw error;
+  } finally {
+    olderFetchInFlight = false;
+    renderOlderControl();
+  }
+}
+
 async function loadOlderTimeline() {
+  if (!discordOlderCursor && discordMoreAbove && !olderFetchInFlight && walkCursorOwed()) {
+    await readWalkCursor();
+    return;
+  }
   if (!discordMoreAbove || !discordOlderCursor || olderFetchInFlight) return;
   const context = channelContextKey();
   const generation = discordLoadGeneration;
@@ -11064,7 +11206,8 @@ async function seekMessage(target, arrive, openAll) {
     }
   }
   let walked = 0;
-  while (walked < REPLY_JUMP_PAGES && discordMoreAbove === true && discordOlderCursor) {
+  // Main drawn from All takes its first step from its own read (`walkCursorOwed`, `#220`).
+  while (walked < REPLY_JUMP_PAGES && discordMoreAbove === true && (discordOlderCursor || walkCursorOwed())) {
     walked += 1;
     const context = channelContextKey();
     setStatus(`Looking further back: page ${walked} of ${REPLY_JUMP_PAGES}…`);
@@ -14349,9 +14492,13 @@ let discordNewestId = null;
  * change which row is newest without anything arriving, and a chip saying "something arrived" in
  * answer to the reader's own tap is a lie about where the row came from.
  *
+ * `heldPlaceAt` is for a read that replaced rows a view switch drew from the store (`#220
+ * view-switch-instant`): the time of the message the reader was on, NaN when unknown. When the read
+ * does not reach back to it, the old offset would point at whatever the read put there instead.
+ *
  * @param {Array<{id: string}>} messages the list as it was just read, oldest first
  * @param {{keepPosition: boolean, wasAtNewest: boolean, area: object, previousTop: number,
- *          anchorId?: string|null, anchorTop?: number, ownAct?: boolean}} how
+ *          anchorId?: string|null, anchorTop?: number, ownAct?: boolean, heldPlaceAt?: number}} how
  */
 function settleAfterRead(messages, how) {
   const previous = discordNewestId;
@@ -14370,6 +14517,15 @@ function settleAfterRead(messages, how) {
     if (anchor && Number.isFinite(how.anchorTop)) {
       how.area.scrollTop = how.previousTop;
       how.area.scrollTop += anchor.getBoundingClientRect().top - how.anchorTop;
+    } else if (how.heldPlaceAt !== undefined) {
+      // As near as the read reaches: the top, when everything it brought is newer than the reader's
+      // message — the walk back goes on from there — and otherwise the newest line.
+      if (!(messages.length > 0 && timeOf(messages[0], "timestamp") > how.heldPlaceAt)) {
+        scrollToNewest();
+        setJumpNewest(false, "discord");
+        return;
+      }
+      how.area.scrollTop = 0;
     } else {
       how.area.scrollTop = how.previousTop;
     }
@@ -16066,6 +16222,10 @@ const DISCORD_POLL_MS = 45000;
 const CHANNEL_READ_TIMEOUT_MS = 20000;
 let discordPollTimer = null;
 let discordFetchInFlight = false;
+// The view a timeline read on the wire is for (`channelContextKey`), or null: a switch back to a
+// view whose read is still out lets that read land rather than queueing another. `#220
+// view-switch-instant`.
+let timelineReadContext = null;
 // Every requested replacement gets a generation, including one that arrives while another request
 // is in flight. Only the newest generation may draw. The newest blocked request is queued so a
 // channel switch cannot be swallowed by a refresh of the channel the reader just left.
@@ -16093,7 +16253,9 @@ const replaysAwaitingRead = new Map();
  * deltas carry, which is learned only when the queued read runs — on a channel whose deltas carry
  * additions only, a poll reads in full while a replay with no edit waiting reads a delta, and
  * before any delta has landed it can be the other way round. The newest request's other options
- * win, as they always have.
+ * win, as they always have — except `quiet`, kept from either: a read behind rows a view switch
+ * drew stays one without the loading line over them when a poll queues behind it (`#220
+ * view-switch-instant`; a list with nothing in it shows the line whatever was asked).
  *
  * @param {{keepPosition?: boolean, quiet?: boolean, ownAct?: boolean, reason?: string | (string | undefined)[]}} [options]
  */
@@ -16105,12 +16267,14 @@ function queueDiscordLoad(options) {
   /** @param {{reason?: string | (string | undefined)[]} | undefined} opts */
   const reasons = (opts) => (opts && Array.isArray(opts.reason) ? opts.reason : [opts ? opts.reason : undefined]);
   const all = [...new Set([...reasons(discordQueuedLoad.options), ...reasons(options)])];
-  discordQueuedLoad = { options: { ...(options || {}), reason: all.length === 1 ? all[0] : all } };
+  const quiet = Boolean(discordQueuedLoad.options && discordQueuedLoad.options.quiet) || Boolean(options && options.quiet);
+  discordQueuedLoad = { options: { ...(options || {}), reason: all.length === 1 ? all[0] : all, ...(quiet ? { quiet } : {}) } };
 }
 
 /** Release the fetch lock, then perform the newest read that was requested while it was held. */
 async function finishDiscordLoad() {
   discordFetchInFlight = false;
+  timelineReadContext = null;
   const queued = discordQueuedLoad;
   discordQueuedLoad = null;
   if (queued) {

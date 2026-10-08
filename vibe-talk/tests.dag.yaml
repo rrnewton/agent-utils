@@ -228,9 +228,10 @@ steps:
 
   # `#220 view-switch-instant` in the browser engine: All to Main and back in the bar's real picker
   # with every timeline request intercepted — no read, never an empty list or the loading line, the
-  # reader's message kept — and All never read drawn at once from held rows, read once behind them.
-  # A step of its own, not another walk in offline-cache-browser, whose CPU is already near its cap.
-  # Measured alone: 2.1s wall, 1.6s CPU, a 310MB peak.
+  # reader's message kept — and All never read drawn at once from held rows, read once behind them;
+  # then paged, Main drawn from All keeping its way back, and All walked back to the reader's message
+  # before it is drawn. A step of its own, not another walk in offline-cache-browser, whose CPU is
+  # already near its cap. Measured alone: 2.8s wall, under 2s CPU, a 310MB peak.
   - group: check
     job: view-switch-browser
     desc: Main and All switched from what the page holds, with every timeline request counted, in current Chromium

@@ -19,7 +19,13 @@ between its own messages, and intercepts every timeline request the browser send
   reopens in Main, the view last chosen, and reads only Main -> pick All, which has never been read:
   All is up at once from the rows the page holds, its one read held on the server meanwhile with the
   freshness pill saying it is refreshing, and merged when it lands, the reader's message still where
-  it was, nothing read twice, and again no empty list and no loading line.
+  it was, nothing read twice, and again no empty list and no loading line -> eight rows a read from
+  here, paged by `before`, as every real channel is: reopened in All, Main is drawn from All's newest
+  page with no read and keeps its way back, its first step back being Main's own newest page read
+  behind the rows -> reopened in Main and walked back to its start, All, never read, is drawn from
+  Main's rows at once and walked back to the message near the top of the screen before its read is
+  drawn: All's newest page alone is never painted, the message stays where it was, and again no empty
+  list and no loading line.
 
 Pass --web-root DIR to run it against another copy of the page -- the page before `#220` fails at the
 first switch -- and --screenshots DIR to keep a PNG of each stage.
@@ -89,16 +95,36 @@ class SwitchApi(FakeApi):
         return [str(m["id"]) for m in self.messages
                 if view == "flat" or not thread_of(m) or thread_of(m)["is_root"]]
 
+    # How many rows a read of Main or All answers with -- the newest that many, or the newest before
+    # `before`, the id the previous page handed back, as a real channel's reads page -- or None for
+    # every row at once.
+    page_size: int | None = None
+
+    def timeline(self, query: dict[str, list[str]]) -> Json:
+        answer = super().timeline(query)
+        rows = answer["messages"]
+        if self.page_size is None or answer["view"] not in ("main", "flat") or not isinstance(rows, list):
+            return answer
+        before = query.get("before", [None])[0]
+        end = next((i for i, row in enumerate(rows) if str(row["id"]) == before), len(rows)) if before else len(rows)
+        start = max(0, end - self.page_size)
+        return {**answer, "messages": rows[start:end], "has_more": start > 0, "returned": end - start,
+                "next_before": str(rows[start]["id"]) if start > 0 else None}
+
 
 # Watch the channel list from now on, in the page: on every change to it or to the loading line, and
 # on every frame, count an empty list and a shown loading line. A list emptied and refilled inside
 # one task is never painted, and never seen here; one left empty across a read is.
 WATCH_JS = """() => {
     const log = document.getElementById('discord-log'), line = document.getElementById('channel-loading');
-    const seen = window.__switchSeen = {emptied: 0, loading: 0};
+    const seen = window.__switchSeen = {emptied: 0, loading: 0, firsts: []};
     const look = () => {
         if (!log.querySelector('li[data-id]')) seen.emptied += 1;
         if (!line.hidden) seen.loading += 1;
+        // The first row whenever it changes: a page drawn and then walked back is two of them.
+        const first = log.querySelector('li[data-id]');
+        const id = first ? first.getAttribute('data-id') : null;
+        if (seen.firsts[seen.firsts.length - 1] !== id) seen.firsts.push(id);
     };
     new MutationObserver(look).observe(log, {childList: true});
     new MutationObserver(look).observe(line, {attributes: true, attributeFilter: ['hidden']});
@@ -164,7 +190,9 @@ def main() -> int:
     print(f"{version} {label} at {width}x{height}: All to Main and back, twice, in the bar's real picker"
           " with every timeline request intercepted -- no read, the list never empty, no loading line,"
           " the message at the top of the screen kept; reopened in Main with no saved rows, All drawn"
-          " from the held rows at once, read once behind them, and merged with the reader kept")
+          " from the held rows at once, read once behind them, and merged with the reader kept; paged,"
+          " Main drawn from All's newest page keeps its way back through its own read, and All never"
+          " read is walked back to the reader's message before it is drawn")
     return 0
 
 
@@ -189,11 +217,15 @@ def walk(chromium: BrowserType, args: argparse.Namespace, label: str, width: int
             # Every read of a view of the channel, as the browser sent it. The thread list a touch on
             # the picker refreshes is not one: it reads summaries for the picker, not rows for the list.
             reads: list[str] = []
+            # ...and each one's `before`, "" for a newest page.
+            cursors: list[str] = []
 
             def counted(route: Route) -> None:
-                view = parse_qs(urlsplit(route.request.url).query).get("view", [""])[0]
+                query = parse_qs(urlsplit(route.request.url).query)
+                view = query.get("view", [""])[0]
                 if view != "threads":
                     reads.append(view)
+                    cursors.append(query.get("before", [""])[0])
                 route.continue_()
 
             page.route(lambda address: "/timeline" in address, counted)
@@ -291,6 +323,70 @@ def walk(chromium: BrowserType, args: argparse.Namespace, label: str, width: int
             check(reads == ["main", "flat"], f"{label}: All was read more than once: {reads}")
             check(seen() == {"emptied": 0, "loading": 0}, f"{label}: All, read behind its rows, showed {seen()}")
             shot("3-merged")
+
+            # 3. Eight rows a read from here, as a channel longer than one read answers. Reopened in
+            # All: Main is drawn from All's newest page with no read, and keeps its way back -- the
+            # first step is Main's own newest page, read behind the rows, the reader kept.
+            api.page_size = 8
+            pick("flat")
+            page.evaluate(f"() => localStorage.removeItem({json.dumps(CACHE_KEY)})")
+            reads.clear()
+            page.reload(wait_until="load")
+            newest_all = api.ids("flat")[-8:]
+            wait_rows(newest_all, "the reload did not reopen on All's newest page")
+            check(reads == ["flat"], f"{label}: reopening on All read {reads}")
+            page.evaluate(WATCH_JS)
+            api.timeline_gate.clear()
+            pick("main")
+            derived = [id for id in api.ids("main") if int(id) >= int(newest_all[0])]
+            check(rows() == derived, f"{label}: Main was not drawn from All's newest page at once: {rows()}")
+            check(page.is_visible("#load-older"), f"{label}: Main drawn from All lost the way to older messages")
+            page.evaluate("() => { document.getElementById('scroll-area').scrollTop = 0; }")
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline and len(reads) < 2:
+                page.wait_for_timeout(25)
+            settled()
+            check(reads == ["flat", "main"] and cursors[-1] == "",
+                  f"{label}: Main's first step back was not its own newest page, once: {reads} {cursors}")
+            before = visible()
+            api.timeline_gate.set()
+            wait_rows(api.ids("main")[-8:], "Main's own newest page was not merged in")
+            settled()
+            kept(before, "Main's first step back")
+            check(page.is_visible("#load-older"), f"{label}: older history was not offered after Main's read")
+            check(seen()["emptied"] == 0 and seen()["loading"] == 0, f"{label}: Main's step back showed {seen()}")
+            shot("4-paged-main")
+
+            # Reopened in Main and walked back to its start, a message near the top of the screen: All,
+            # never read, is drawn from Main's rows at once and walked back to that message before its
+            # read is drawn -- the list changes once, under the reader.
+            page.evaluate(f"() => localStorage.removeItem({json.dumps(CACHE_KEY)})")
+            reads.clear()
+            cursors.clear()
+            page.reload(wait_until="load")
+            wait_rows(api.ids("main")[-8:], "the reload did not reopen on Main's newest page")
+            deadline = time.monotonic() + 10
+            while time.monotonic() < deadline and rows() != api.ids("main"):
+                if page.is_visible("#load-older") and page.is_enabled("#load-older"):
+                    page.click("#load-older")
+                page.wait_for_timeout(50)
+            check(rows() == api.ids("main"), f"{label}: Main was not walked back to its start: {rows()}")
+            check(reads == ["main"] * 3, f"{label}: walking Main back read {reads}")
+            page.evaluate(WATCH_JS)
+            page.evaluate(PARK_JS, "204")
+            settled()
+            before = visible()
+            pick("flat")
+            check(rows() == api.ids("main"), f"{label}: All was not drawn from the rows the page held at once: {rows()}")
+            wait_rows(api.ids("flat"), "All was not walked back to the reader's message")
+            settled()
+            kept(before, "walking All back to the reader's message")
+            check(reads[3:] == ["flat"] * 4 and cursors[3:] == ["", "222", "214", "206"],
+                  f"{label}: All was not read back to the reader's message, and no further: {reads[3:]} {cursors[3:]}")
+            firsts = page.evaluate("() => window.__switchSeen.firsts")
+            check(newest_all[0] not in firsts, f"{label}: All's newest page was painted before the walk: {firsts}")
+            check(seen()["emptied"] == 0 and seen()["loading"] == 0, f"{label}: All, walked back, showed {seen()}")
+            shot("5-walked-back")
             check(not errors, f"{label}: the page threw: {errors}")
             context.close()
             return version
