@@ -1033,9 +1033,14 @@ body {
  * and the edge of the screen is the smallest gutter that still reads as text rather than as
  * something falling off the display.
  *
- * No side borders and no rounding, because a full-width box with rounded corners reads as a card
- * that has outgrown its container. The top and bottom borders stay: they are what separates one
- * message from the next now that the inset no longer does it.
+ * No rounding, because a full-width box with rounded corners reads as a card that has outgrown its
+ * container. But a border on ALL FOUR SIDES, the hairline every row has (`.messages li` in
+ * web/style.css). The tile used to drop its two sides, and on a desk — where it is held inside the
+ * reading column (the desktop block at the foot of this file) and never reaches the screen's edge —
+ * the owner saw square boxes with a top and a bottom and no sides, which looked weird
+ * (`#213 row-side-borders`). With four it is a rectangle at any width. On a phone its sides sit at
+ * the screen's edges, which the owner accepts, and cost no width: a border is inside the box the
+ * negative margins size.
  *
  * They still cannot be confused with the owner's own messages, which keep their right indent AND
  * their colour -- two signals, either of which would do on its own.
@@ -1047,8 +1052,6 @@ body {
   margin-right: calc(-0.75rem - env(safe-area-inset-right));
   padding-left: calc(0.4rem + env(safe-area-inset-left));
   padding-right: calc(0.4rem + env(safe-area-inset-right));
-  border-left: none;
-  border-right: none;
   border-radius: 0;
 }
 
@@ -1253,12 +1256,14 @@ body {
  *
  * The first version of this was a 14% accent tint with a one-pixel border, and it was effectively
  * invisible — accent is a BLUE close in value to the dark surface it sat on, and the coder tile it
- * usually lands on has no side borders at all now that it runs edge to edge, so the border it was
- * counting on was two hairlines top and bottom.
+ * usually lands on had no side borders then (`#213 row-side-borders` gave it four), so the border
+ * it was counting on was two hairlines top and bottom.
  *
  * `--warn` rather than `--accent`, so the whole reading session is ONE colour: the Stop button and
- * the row it would stop. And a thick INSET BAR rather than a border, because an inset shadow does
- * not care that the tile has its side borders removed.
+ * the row it would stop. And a thick INSET BAR as well as the border, because a hairline is too
+ * thin to find a row by, on four sides as on two. An inset shadow is drawn inside whatever border
+ * the row has, so on the left it runs on from the hairline as one wider bar, and it costs the row
+ * no width.
  */
 #discord-log li.discord-message[data-reading="true"],
 #pinned-log li.discord-message[data-reading="true"] {
@@ -1387,9 +1392,10 @@ body {
  *
  * ONE INSET FOR EVERY SPEAKER. The owner's rows are already pushed in by `--speaker-inset` and a
  * third party's by half of it, but neither is a touch target wide; the coding agent's tile runs
- * edge to edge and has no left side at all. A reply from the agent is therefore the one tile that
- * keeps a left edge, and a border to show it, because that edge is what the arrow comes out of.
- * The extra attribute in each selector is what puts these over the speaker rules above.
+ * edge to edge, its left side at the screen's edge. A reply from the agent is set in like any
+ * other, and its left side — the hairline every tile has had since `#213 row-side-borders` — is
+ * the edge the arrow comes out of. The extra attribute in each selector is what puts these over
+ * the speaker rules above.
  *
  * At least the arrow's height, so the arrow can never hang below its own row and over the head of
  * the next one.
@@ -1399,12 +1405,10 @@ body {
   min-height: var(--reply-gutter);
 }
 
+/* Inside the list's own gutter, which is clear of a notch already, so its words need no room for
+   one. */
 #discord-log li.discord-message[data-is-reply="true"][data-who="coder"] {
   padding-left: 0.4rem;
-  border-left: 1px solid var(--edge);
-  /* Its edge is the neutral one already, and it has no right side for the drained edge the veil
-     below draws to put one on. */
-  --reply-neutral-edge: transparent;
 }
 
 /*
@@ -1451,7 +1455,7 @@ body {
   background: var(--row-veil);
   box-shadow:
     0 0 0 1px var(--row-veil),
-    0 0 0 1px color-mix(in srgb, var(--reply-neutral-edge, var(--edge)) calc(var(--row-grey, 0) * 100%), transparent);
+    0 0 0 1px color-mix(in srgb, var(--edge) calc(var(--row-grey, 0) * 100%), transparent);
   pointer-events: none;
 }
 
@@ -1835,8 +1839,10 @@ body {
 #pinned-log li.discord-message[data-summarised="true"] {
   background: var(--summary-bg);
   border-color: var(--summary-edge);
-  /* The coder's tiles deliberately have no side borders. This one is the exception, because it is
-     the mark that says the row is not showing the message — it has to survive that rule. */
+  /* The bar, IN PLACE OF the left side's hairline and three times as wide. Every row has a side
+     there, the coder's tile too since `#213 row-side-borders`, so a bar that merely recoloured it
+     would be one more one-pixel border, and nobody reads a border as the mark that says the row
+     is not showing the message. The width is what does that. */
   border-left: 3px solid var(--summary-edge);
 }
 
@@ -1853,9 +1859,11 @@ body {
  *   * THE COMPETING SURFACE. Declared AFTER `[data-summarised="true"]` above, and at the same
  *     specificity, so source order decides. A failed row is never `data-summarised` today, but a
  *     rule that depends on that staying true is a rule waiting to lose.
- *   * THE COMPETING SIDE BORDER. `[data-who="coder"]` sets `border-left: none`, and the coding
- *     agent writes most of a real backlog, so without the explicit bar here the mark down the edge
- *     would be missing on exactly the rows that fail most.
+ *   * THE HAIRLINE. Every row's left side is a one-pixel border (`.messages li` in web/style.css),
+ *     the coding agent's tile's too since `#213 row-side-borders`, and `border-color` alone makes
+ *     that a red hairline, which reads as an edge rather than a mark. The explicit 3px bar is the
+ *     mark down the edge, on every speaker's row — the coding agent's included, which are most of
+ *     a real backlog and so the rows that fail most.
  *   * THE GREYSCALE. An archived or already-read row is `filter: grayscale(1)` at 42% opacity, and
  *     a greyscaled red is a grey. Amounts of no filter and full opacity (see `data-replied` for
  *     how a row's amounts are drawn) are what make the failure visible on a row the reader has

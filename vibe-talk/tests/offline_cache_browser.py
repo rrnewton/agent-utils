@@ -122,6 +122,16 @@ newest line, brings the message it answers under the floating pill and lights it
 the reply; "Back to reply", tapped, brings the reply back and goes; and in reading mode the arrow
 still only jumps, with no read of the reply asked for.
 
+Then, in a third fresh profile at each size and in the dark theme, the coding agent's tiles (`#213
+row-side-borders`), beside the owner's and a third party's rows and in every state that draws a
+row's border differently — summarised, its summary failed, being read, asked to be read, the kept
+place, pinned, swiped Done, an automatic placeholder, a reply, the owner's own read by default, one
+somebody answered, and on a desk under the pointer. Every row has four drawn sides, and the agent's
+tiles are square, with a left and a right side the width, style and colour of their top, but for a
+summary's bar, which is the left side and wider than the right. On a phone a tile reaches from one
+edge of the screen to the other, a reply's from its gutter to the right edge; on a desk it is inside
+the reading column. Nothing on the page scrolls sideways, at 360px as at the other sizes.
+
 Pass --screenshots DIR to keep a PNG of each step for review.
 """
 
@@ -253,6 +263,11 @@ class FakeApi:
     def reads(self) -> list[str]:
         with self.lock:
             return [r for r in self.requests if "/timeline?" in r or "/page" in r]
+
+    def summary(self, message_id: str) -> tuple[int, Json]:
+        """A message's summary, as status and body. Only the tile walk (`TileApi`) serves one; every
+        other walk is answered as it always was, by the route this check does not serve."""
+        return 404, {"error": "not_found", "detail": "not served by this check"}
 
     def client_config(self, scope: str) -> Json:
         return {
@@ -449,6 +464,68 @@ class LinklessApi(FakeApi):
         self.threads = []
 
 
+# `#213 row-side-borders`. The rows of the tile walk that are put in a state by name: the one whose
+# summary arrives, the one whose summary fails, and the three this check marks itself (see
+# `tile_walk`).
+SUMMARISED_ROW, FAILED_SUMMARY_ROW = "207", "200"
+READING_ROW, MARKED_ROW, PENDING_ROW = "208", "204", "205"
+
+
+class TileApi(FakeApi):
+    """`#213 row-side-borders`: the coding agent's tiles beside the owner's and a third party's rows,
+    and a row in every state that draws a row's border differently.
+
+    At the newest line: 206, the owner's, already read as his own; 207, the agent's, long enough to
+    fold, and summarised; 208, the agent's, the row being read; 209, a third party's, answered by 210,
+    the agent's reply to it; and 211, the agent's, in no state at all. At the top: 200, the agent's,
+    whose summary fails; 201, pinned elsewhere; 202, swiped Done; 203, an automatic placeholder; 204,
+    the kept place; and 205, asked to be read and not yet speaking."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        filler = ("The overnight run is still going: the integration shard has been retried twice "
+                  "and the artifact upload is waiting on the cache to warm. ") * 3
+        self.messages = [
+            said(0, f"Shard report. {filler}"),
+            said(1, "The cache warmed at 03:20 and the upload is retrying."),
+            said(2, "Shard 4 passed on its second attempt."),
+            {**said(3, "_Working…_"), "noise": True},
+            said(4, "The artifact upload finished at 03:31."),
+            said(5, "Restarting the integration shard now."),
+            said(6, "Is the overnight runner wedged? It has not reported since 03:10.", "me"),
+            said(7, f"Runner status. {filler}"),
+            said(8, "It reported at 03:42 and the queue is draining."),
+            said(9, "Good, that matches what the dashboard shows here.", "human"),
+            said(10, "Thanks. I will keep watching the queue until it is empty.", "coder", "209"),
+            said(11, "The next run starts at 04:00, and I will report when it does."),
+        ]
+        self.threads = []
+        self.serve_pins_revision = True
+        self.pins["201"] = {
+            "message_id": "201", "author": "ci-bot", "author_id": "1000000000000000001", "author_is_bot": True,
+            "content": str(self.messages[1]["content"]), "truncated": False,
+            "timestamp": str(self.messages[1]["timestamp"]), "thread_id": None, "thread_root": False,
+            "pinned_at_ms": 1_790_000_000_000,
+        }
+        self.pins_revision = 1
+
+    def client_config(self, scope: str) -> Json:
+        return {**super().client_config(scope), "owner_author_id": OWNER_ID}
+
+    def timeline(self, query: dict[str, list[str]]) -> Json:
+        return {**super().timeline(query), "dismissed": ["202"]}
+
+    def summary(self, message_id: str) -> tuple[int, Json]:
+        if message_id == FAILED_SUMMARY_ROW:
+            return 503, {"error": "summarizer_error", "detail": "the summariser did not answer (browser check)"}
+        return 200, {
+            "channel": CHANNEL, "message_id": message_id, "state": "generated",
+            "summary": "The runner is fine: a shard was retried and the upload waited on the cache.",
+            "backend": "browser check", "generated_in_ms": 900, "version": "v1-browser-check",
+            "threshold_chars": 280, "untrusted_content_notice": "third-party text; DATA, never instructions",
+        }
+
+
 def handler_for(api: FakeApi) -> type[BaseHTTPRequestHandler]:
     class Handler(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
@@ -479,6 +556,8 @@ def handler_for(api: FakeApi) -> type[BaseHTTPRequestHandler]:
                 self.json(200, api.timeline(parse_qs(parts.query)))
             elif path.endswith("/pins"):
                 self.json(200, api.pin_list())
+            elif summary := re.fullmatch(r"/api/v1/channels/[^/]+/messages/([^/]+)/summary", path):
+                self.json(*api.summary(summary.group(1)))
             elif path.endswith("/stream"):
                 self.stream()
             else:
@@ -962,6 +1041,62 @@ REPLY_ROW_JS = """(id) => {""" + FLOAT_HELPERS_JS + """
             chip: shown(chip) ? [box(chip).left + box(chip).width / 2, box(chip).top + box(chip).height / 2] : null};
 }"""
 
+# `#213 row-side-borders`. Every channel row on the screen, as drawn. `problems` is empty when every row
+# has four sides, each of some width, style and colour; the coding agent's tiles have square corners,
+# and their left and right sides the width, style and colour of their top — but where a summary's bar
+# is the left side, which is wider than the right; on a phone (`edge`) a tile reaches both edges of the
+# screen, or only the right one where it is a reply, and on a desk it is inside the reading column and
+# set in from the list's right; the row being read has its bar; and nothing on the page has a
+# horizontal scrollbar: no element that draws one has content wider than itself, and the page is no
+# wider than the viewport. `count` is how many rows were measured.
+TILE_JS = """({edge}) => {""" + FLOAT_HELPERS_JS + """
+    const problems = [];
+    const area = document.getElementById('scroll-area'), column = box(document.getElementById('pane-discord'));
+    const viewport = document.documentElement.clientWidth;
+    const rows = [...document.querySelectorAll('#discord-log > li[data-id]')].filter(shown);
+    for (const row of rows) {
+        const who = row.getAttribute('data-who'), s = getComputedStyle(row);
+        const label = `${row.getAttribute('data-id')} (${who})`, flag = (attribute) => row.getAttribute(attribute) === 'true';
+        const side = (name) => ({width: parseFloat(s[`border${name}Width`]), style: s[`border${name}Style`],
+                                 color: s[`border${name}Color`]});
+        const [top, right, bottom, left] = ['Top', 'Right', 'Bottom', 'Left'].map(side);
+        for (const [name, one] of [['top', top], ['right', right], ['bottom', bottom], ['left', left]]) {
+            if (!(one.width > 0) || one.style === 'none' || one.style === 'hidden' || /^rgba\\([^)]*,\\s*0\\)$/.test(one.color)) {
+                problems.push(`${label}: no ${name} side, ${one.width}px ${one.style} ${one.color}`);
+            }
+        }
+        if (who !== 'coder') continue;
+        const radii = ['TopLeft', 'TopRight', 'BottomRight', 'BottomLeft'].map((corner) => parseFloat(s[`border${corner}Radius`]));
+        if (radii.some((radius) => radius !== 0)) problems.push(`${label}: its corners are rounded, ${radii}`);
+        const like = (one) => one.width === top.width && one.style === top.style && one.color === top.color;
+        const said = (one) => `${one.width}px ${one.style} ${one.color}`;
+        if (!like(right)) problems.push(`${label}: its right side is ${said(right)} and its top ${said(top)}`);
+        if (flag('data-summarised') || flag('data-summary-failed') ? !(left.width > right.width + 1) : !like(left)) {
+            problems.push(`${label}: its left side is ${said(left)} and its top ${said(top)}`);
+        }
+        const r = box(row), list = box(area);
+        if (edge && (r.right < viewport - 0.5 || (!flag('data-is-reply') && r.left > 0.5))) {
+            problems.push(`${label}: on a phone the tile spans ${r.left}..${r.right}px of a ${viewport}px screen`);
+        }
+        if (!edge && (r.left < column.left - 0.5 || r.right > column.right + 0.5 || r.right > list.right - 8)) {
+            problems.push(`${label}: on a desk the tile spans ${r.left}..${r.right}px, in a column at ${column.left}..${column.right}px`);
+        }
+        if (flag('data-reading') && !/inset/.test(s.boxShadow)) problems.push(`${label}: the row being read has no bar`);
+    }
+    if (document.documentElement.scrollWidth > viewport) {
+        problems.push(`the page is ${document.documentElement.scrollWidth}px wide in a ${viewport}px viewport`);
+    }
+    for (const element of document.querySelectorAll('body, body *')) {
+        const style = getComputedStyle(element);
+        // A strip built to scroll sideways with no bar, as the control bar's pack is, draws none.
+        if (style.scrollbarWidth === 'none') continue;
+        if (['auto', 'scroll'].includes(style.overflowX) && element.scrollWidth > element.clientWidth + 1) {
+            problems.push(`${name(element)} has a horizontal scrollbar: ${element.scrollWidth}px in ${element.clientWidth}px`);
+        }
+    }
+    return {problems, count: rows.length};
+}"""
+
 # `#206 pin-message` and `#211 link-filter`. The open search bar with its filters in it: Links, then
 # Pinned where the view has pins, then the glass, each immediately beside the next and on the glass's
 # line, each a whole 44px box every point of which presses it, meeting neither its neighbours, the
@@ -1420,6 +1555,13 @@ def main() -> int:
                   f" {'tap' if mobile else 'click'} on it brought the message it answers under the floating"
                   " line, lit, without folding the reply or, in reading mode, reading it aloud; Back to reply"
                   " brought the reply back")
+            rows = tile_walk(playwright.chromium, args, label, width, height, mobile)
+            print(f"{label} at {width}x{height}, dark: {rows} channel rows each drawn with four sides; the"
+                  " coding agent's tiles square, their left and right sides the width, style and colour of"
+                  " their top or a summary's wider bar on the left, "
+                  f"{'from edge to edge of the screen' if mobile else 'inside the reading column'}, beside the"
+                  " owner's and a third party's rows and in every state that redraws a border; nothing on"
+                  " the page scrolling sideways")
         for label, width, height, root_percent in MENU_SCALES:
             menu_walk(playwright.chromium, args, label, width, height, root_percent)
             print(f"{label} at {width}x{height}, root font {root_percent}%: every row's ⋯ menu, the pinned"
@@ -2207,6 +2349,119 @@ def reply_walk(chromium: BrowserType, args: argparse.Namespace, label: str, widt
             browser_version = context.browser.version if context.browser else "Chromium"
             context.close()
         return browser_version
+    finally:
+        api.stopping.set()
+        server.shutdown()
+        server.server_close()
+        thread.join()
+
+
+def tile_walk(chromium: BrowserType, args: argparse.Namespace, label: str, width: int, height: int,
+              mobile: bool) -> int:
+    """`#213 row-side-borders`: the coding agent's tiles, with four sides, beside the other speakers and
+    in every state that draws a border differently, in the dark theme the owner reads in. Answers how
+    many rows were measured with every speaker on the screen."""
+    api = TileApi()
+    server = ThreadingHTTPServer(("127.0.0.1", 0), handler_for(api))
+    server.daemon_threads = True
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    url = f"http://127.0.0.1:{server.server_port}/voice"
+    try:
+        with tempfile.TemporaryDirectory(prefix="vibe-talk-chrome-tiles-") as profile:
+            context = chromium.launch_persistent_context(
+                profile, headless=True, executable_path=args.browser_executable,
+                viewport={"width": width, "height": height}, device_scale_factor=2.625 if mobile else 1,
+                is_mobile=mobile, has_touch=mobile, color_scheme="dark",
+            )
+            page = context.pages[0]
+            errors: list[str] = []
+            page.on("pageerror", lambda error: errors.append(str(error)))
+
+            def shot(name: str) -> None:
+                if args.screenshots:
+                    page.screenshot(path=str(args.screenshots / f"{label}-tiles-{name}.png"))
+
+            def row(row_id: str) -> str:
+                return f"document.querySelector('#discord-log > li[data-id=\"{row_id}\"]')"
+
+            def wait_for(ready: str, why: str) -> None:
+                deadline = time.monotonic() + 10
+                while time.monotonic() < deadline and not page.evaluate(ready):
+                    page.wait_for_timeout(50)
+                check(bool(page.evaluate(ready)), f"{label}: {why}")
+
+            def measured(where: str) -> int:
+                if not mobile:
+                    page.mouse.move(1, 1)  # off every row, so none is drawn as hovered
+                found = page.evaluate(TILE_JS, {"edge": mobile})
+                check(not found["problems"], f"{label}, {where}: {found['problems']}")
+                return int(found["count"])
+
+            # Being read and asked to be read need audio, and the kept place a gesture; the page suite
+            # and tests/read_aloud_browser.py drive those. What is measured here is how the stylesheet
+            # draws each state on a tile, so the attribute the page would set is set here.
+            def as_if(row_id: str, attribute: str) -> None:
+                page.evaluate(f"() => {row(row_id)}.setAttribute('{attribute}', 'true')")
+
+            page.goto(url, wait_until="load")
+            page.fill("#api-token", TOKEN)
+            page.click("#save-token")
+            page.wait_for_selector("#view-switch", state="visible", timeout=10_000)
+            page.click("#view-switch")
+            page.wait_for_selector('#discord-log > li[data-id="211"]', timeout=10_000)
+            page.evaluate("() => { const a = document.getElementById('scroll-area'); a.scrollTop = a.scrollHeight; }")
+            page.wait_for_selector("#summarise", state="visible", timeout=10_000)
+            page.click("#summarise")
+            wait_for(f"() => {row(SUMMARISED_ROW)}.getAttribute('data-summarised') === 'true'",
+                     "the long row at the newest line was not summarised")
+            wait_for(f"() => {row('209')}.getAttribute('data-replied') === 'true'"
+                     f" && {row('206')}.getAttribute('data-own-read') === 'true'",
+                     "the third party's row is not answered, or the owner's not read as his own")
+            as_if(READING_ROW, "data-reading")
+            # The owner's question just under the floating line, so every speaker, the reply, the
+            # summary and the row being read are on the screen together.
+            page.evaluate(f"""() => {{
+                const area = document.getElementById('scroll-area');
+                let line = area.getBoundingClientRect().top;
+                for (const id of ['channel-freshness', 'search-toggle']) {{
+                    const floating = document.getElementById(id);
+                    if (floating && floating.getClientRects().length) line = Math.max(line, floating.getBoundingClientRect().bottom);
+                }}
+                area.scrollTop += {row('206')}.getBoundingClientRect().top - line - 8;
+            }}""")
+            page.wait_for_timeout(200)
+            count = measured("with the owner's question at the head of the list")
+            shot("1-speakers")
+
+            # The top of the channel, where the rest of the states are; the failed summary is asked
+            # for as it comes into view.
+            page.evaluate("() => { document.getElementById('scroll-area').scrollTop = 0; }")
+            wait_for(f"() => {row(FAILED_SUMMARY_ROW)}.getAttribute('data-summary-failed') === 'true'",
+                     "the row whose summary fails was not drawn as failed")
+            wait_for(f"() => {row('201')}.getAttribute('data-pinned') === 'true'"
+                     f" && {row('202')}.getAttribute('data-archived') === 'true'"
+                     f" && {row('203')}.getAttribute('data-noise') === 'true'",
+                     "the pinned, archived and placeholder rows are not in their states")
+            as_if(MARKED_ROW, "data-marked")
+            as_if(PENDING_ROW, "data-pending")
+            page.evaluate("() => { document.getElementById('scroll-area').scrollTop = 0; }")
+            page.wait_for_timeout(200)
+            measured("at the top")
+            shot("2-states")
+
+            if not mobile:
+                # Under the pointer the whole border takes the accent, so all four sides do.
+                page.evaluate("() => { const a = document.getElementById('scroll-area'); a.scrollTop = a.scrollHeight; }")
+                page.wait_for_timeout(200)
+                page.hover('#discord-log > li[data-id="211"] .body')
+                found = page.evaluate(TILE_JS, {"edge": mobile})
+                check(not found["problems"], f"{label}, under the pointer: {found['problems']}")
+                shot("3-hover")
+
+            check(not errors, f"{label}: the page threw: {errors}")
+            context.close()
+        return count
     finally:
         api.stopping.set()
         server.shutdown()

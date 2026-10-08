@@ -7261,6 +7261,66 @@ test("THE CODING AGENT'S MESSAGES RUN EDGE TO EDGE; THE OWNER'S KEEP THEIR INDEN
   assert.match(mine, /--mine/, "the owner's messages lost their colour");
 });
 
+/**
+ * The declaration that takes a side away from a box's border, however it is written — `none` or
+ * `hidden` for a style, a zero for a width, in any of the shorthands — or null when there is none.
+ * Colour, radius and image say nothing about whether a side is drawn, and are not read.
+ */
+function takesASide(block) {
+  for (const [, property, value] of block.matchAll(/(?<![-\w])(border(?:-[a-z]+)*)\s*:\s*([^;}]+)/g)) {
+    if (/-(radius|color|image)$/.test(property)) continue;
+    if (/\b(none|hidden)\b/.test(value) || /(^|\s)0(px|rem|em)?(?=\s|$)/.test(value.trim())) {
+      return `${property}: ${value.trim()}`;
+    }
+  }
+  return null;
+}
+
+/**
+ * Every rule, in every media block, that draws a channel row's own box — the row in any state, and
+ * not a pseudo-element or anything inside it: its selectors and its body.
+ */
+const CHANNEL_ROW_RULES = [...CSS_CODE.matchAll(/([^{}]+)\{([^{}]*)\}/g)]
+  .map((rule) => ({ selectors: rule[1].split(",").map((part) => part.trim()), body: rule[2] }))
+  .filter(({ selectors }) => selectors.some((selector) =>
+    /^#(discord|pinned)-log li\.discord-message(\[[^\]]*\]|:[a-z-]+(\([^)]*\))?)*$/.test(selector)));
+
+test("...AND IT IS A RECTANGLE: FOUR SIDES AND SQUARE CORNERS, ON A PHONE AND ON A DESK", () => {
+  // `#213 row-side-borders`. The owner, from a desktop browser: the agent's square boxes had borders
+  // on the top and bottom and NOT on the left and right, which looked weird — and on a desk, where
+  // the tile is held inside the reading column, there was no screen edge for the missing sides to
+  // hide against. The tile takes the hairline every row has on all four sides, and keeps its square
+  // corners; on a phone it still runs edge to edge, with its two sides at the screen's edges.
+  //
+  // The page suite lays nothing out. Chromium measures a non-zero left and right border on the
+  // agent's tile at 412 and 1280, and no horizontal scroll at 360 (tests/offline_cache_browser.py).
+  // What is checked here is that the hairline is still declared for every row, and that no rule for
+  // a channel row, in any media block and in any state, takes a side away again.
+  assert.match(cssRules(SHARED_CSS, ".messages li").join("\n"), /(?<![-\w])border:\s*1px solid var\(--edge\)/,
+    "the hairline every row is drawn with is gone from web/style.css");
+  assert.ok(CHANNEL_ROW_RULES.length > 20, "the channel row's rules were not found, so nothing was checked");
+  for (const { selectors, body } of CHANNEL_ROW_RULES) {
+    const taken = takesASide(body);
+    assert.equal(taken, null, `"${selectors.join(", ")}" takes a side off the row: ${taken}`);
+  }
+  for (const list of ["#discord-log", "#pinned-log"]) {
+    const coder = cssBlock(`${list} li.discord-message[data-who="coder"]`);
+    assert.match(coder, /border-radius:\s*0/, `${list}: the agent's tile has rounded corners again`);
+    assert.doesNotMatch(coder, /(?<![-\w])border(-(left|right))?(-color)?:/,
+      `${list}: the agent's tile draws its sides differently from the rest of its border`);
+  }
+  // ...and on a desk too, where the tile is inside the column rather than across the screen.
+  assert.doesNotMatch(
+    cssBlockIn("(min-width: 900px) and (pointer: fine)", '#discord-log li.discord-message[data-who="coder"]'),
+    /border/, "the desktop block draws the agent's tile's border differently from a phone's");
+
+  // The control: the check above goes red for the rule this replaced.
+  assert.equal(takesASide("background: var(--theirs); border-left: none; border-right: none;"), "border-left: none");
+  assert.equal(takesASide("border-width: 1px 0;"), "border-width: 1px 0");
+  assert.equal(takesASide("border-inline-style: hidden;"), "border-inline-style: hidden");
+  assert.equal(takesASide("border: 1px solid var(--edge); border-left: 3px solid var(--summary-edge);"), null);
+});
+
 test("MY OWN MESSAGES ARE READ ALREADY, BY DEFAULT, WITHOUT VISITING SETTINGS", async () => {
   const page = newPage();
   await signIn(page);
@@ -7583,15 +7643,16 @@ test("...and turning the mode off aborts a pending read too", async () => {
 test("ASKED-FOR AND BEING-READ LOOK DIFFERENT, and the loud one is actually loud", async () => {
   // The first version of the reading treatment was a 14% ACCENT tint with a one-pixel border, and
   // it was effectively invisible: accent is a blue close in value to the dark surface it sat on,
-  // and the coder tile it usually lands on has no side borders at all now that it runs edge to
-  // edge. Every test passed, because they all asserted the ATTRIBUTE and none of them asserted
+  // and the coder tile it usually lands on had no side borders then (`#213 row-side-borders` gave
+  // it four). Every test passed, because they all asserted the ATTRIBUTE and none of them asserted
   // that the attribute did anything.
   const reading = cssBlock('#discord-log li.discord-message[data-reading="true"]');
   const pending = cssBlock('#discord-log li.discord-message[data-pending="true"]');
 
-  // The event gets the SURFACE: a fill, and a bar that survives a tile with no side borders.
+  // The event gets the SURFACE: a fill, and a bar, because a hairline in any colour is too thin to
+  // find a row by, on four sides as on two.
   assert.match(reading, /background:/, "the row being read has no fill, so it barely shows");
-  assert.match(reading, /box-shadow:\s*inset/, "the bar a borderless tile needs is missing");
+  assert.match(reading, /box-shadow:\s*inset/, "the row being read has only a hairline round it, and no bar");
   assert.match(reading, /--warn/, "the reading row is not the colour of the control that stops it");
 
   // The promise gets an EDGE, and must not be mistaken for the event.
@@ -7798,9 +7859,10 @@ test("the arrow has a gutter of its own: one touch target, on every reply, whoev
   const reply = cssBlock('#discord-log li.discord-message[data-is-reply="true"][data-who]');
   assert.match(reply, /margin-left:\s*var\(--reply-gutter\)/, "a reply leaves no room for its arrow");
   assert.match(reply, /min-height:\s*var\(--reply-gutter\)/, "a short reply lets its arrow hang over the next row");
-  // The agent's tile runs edge to edge and has no left side for the arrow to come out of.
-  assert.match(cssBlock('#discord-log li.discord-message[data-is-reply="true"][data-who="coder"]'),
-    /border-left:\s*1px solid/, "a reply from the agent has no left side");
+  // The agent's tile has a left side like every row since `#213 row-side-borders` (which the test of
+  // that name pins), and it is the edge the arrow comes out of: nothing on a reply takes it away.
+  assert.equal(takesASide(cssBlock('#discord-log li.discord-message[data-is-reply="true"][data-who="coder"]')),
+    null, "a reply from the agent has no left side");
   const arrow = cssBlock("#discord-log .reply-jump");
   assert.match(arrow, /position:\s*absolute/);
   assert.match(arrow, /right:\s*100%/, "the arrow is not anchored to the box's left side");
@@ -9482,12 +9544,14 @@ test("...and a row showing a summary is DRAWN differently from one showing the m
   const drawn = cssBlock('#discord-log li.discord-message[data-summarised="true"]');
   assert.ok(drawn, "nothing in the stylesheet draws a summarised row differently");
   assert.match(drawn, /background:/, "a summarised row does not take a surface of its own");
-  assert.match(drawn, /border-left:/, "a summarised row has no mark down its edge");
-  // The coder's own tiles switch side borders OFF; the summary bar has to survive that rule.
+  assert.match(drawn, /border-left:\s*3px solid/, "a summarised row has no mark down its edge");
+  // Every row's left side is a one-pixel hairline, the coder's tile's too since
+  // `#213 row-side-borders`, and a bar no wider than that would read as one more border. It is in
+  // place of the hairline and wider than it.
   assert.match(
-    cssBlock('#discord-log li.discord-message[data-who="coder"]'),
-    /border-left:\s*none/,
-    "the fixture for the rule this one has to override has changed"
+    cssRules(SHARED_CSS, ".messages li").join("\n"),
+    /(?<![-\w])border:\s*1px solid/,
+    "the fixture for the hairline this bar has to be wider than has changed"
   );
 
   // And the word that says so is not muted grey, which is what the eye is trained to skip.
@@ -9973,12 +10037,14 @@ test("...and the red is DRAWN, distinctly, in both colour schemes", async () => 
   assert.match(drawn, /background:/, "a failed row does not take a surface of its own");
   assert.match(drawn, /border-color:/);
   assert.match(drawn, /border-left:\s*3px solid/, "a failed row has no mark down its edge");
-  // The coder's tiles switch side borders OFF and the coding agent writes most of a real backlog,
-  // so the bar has to survive that rule — the same trap the summary tint had to clear.
+  // Every row's left side is a one-pixel hairline, the coder's tile's too since
+  // `#213 row-side-borders`, and `border-color` alone would make it a red hairline — an edge, not a
+  // mark — on the coding agent's rows, which are most of a real backlog. The same trap the summary
+  // tint had to clear.
   assert.match(
-    cssBlock('#discord-log li.discord-message[data-who="coder"]'),
-    /border-left:\s*none/,
-    "the fixture for the rule this one has to override has changed"
+    cssRules(SHARED_CSS, ".messages li").join("\n"),
+    /(?<![-\w])border:\s*1px solid/,
+    "the fixture for the hairline this bar has to be wider than has changed"
   );
   // ...and an ARCHIVED row is `filter: grayscale(1)` at 42% opacity. A greyscaled red is a grey,
   // and a row the reader has filed is exactly where an unnoticed spend would hide.
