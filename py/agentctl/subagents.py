@@ -8,6 +8,7 @@ harness's permission settings. Coordinators and humans see the same terminal.
 from __future__ import annotations
 
 import copy
+import builtins
 import fcntl
 import hashlib
 import ctypes
@@ -26,7 +27,7 @@ from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
-from typing import cast
+from typing import TypeVar, cast
 
 from agentctl import agent
 from agentctl.client import (
@@ -47,15 +48,20 @@ from agentctl.client import (
     muse_verified_process_idle_composer,
     relay_trust_prompt,
 )
-from agentctl.errors import AgentDeliveryError, HerdrRunError, HerdrUnavailable
+from agentctl.errors import (
+    AgentDeliveryError, HerdrRunError, HerdrUnavailable, InputExpectationFailed,
+    ProbableMisroute, RecipientChanged,
+)
 from agentctl.profiles import (
     reasoning_arguments,
     validate_structured_harness_argument_conflicts,
     workspace_for_registry,
 )
-from agentctl.submission import SubmissionReceipt, submit_verified
+from agentctl.submission import PromptNotStaged, SubmissionReceipt, submit_verified
 
+_T = TypeVar("_T")
 _NAME = re.compile(r"[a-z][a-z0-9-]{0,31}\Z")
+_JOURNAL_ID = re.compile(r"[0-9a-f]{32}\Z")
 _KIND = re.compile(r"[a-z][a-z0-9-]{0,63}\Z")
 _ENVIRONMENT_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\Z")
 _BRACKETED_PASTE_START = "\x1b[200~"
@@ -70,6 +76,54 @@ _NESTED_SESSION_SCHEMAS = frozenset({
 _NESTED_LAUNCH_SCHEMAS = frozenset({
     "agentctl-launch/v1", "agentctl-launch/v2",
 })
+
+
+def _validate_rename_journal(value: object, path: Path) -> dict[str, object]:
+    """Validate one rename journal written by either edition."""
+    keys = {"schema", "token", "old", "new", "adapter", "pane_id", "tab_id",
+            "terminal_id", "workspace_id", "journal_id", "started_at"}
+    if not isinstance(value, dict) or set(value) != keys:
+        raise AgentDeliveryError(f"invalid rename journal: {path}")
+    journal = cast(dict[str, object], value)
+    started = journal["started_at"]
+    if (journal["schema"] != "agentctl-rename/v1"
+            or not isinstance(journal["token"], str) or path.name != f"{journal['token']}.json"
+            or re.fullmatch(r"[a-z0-9-]{1,80}", journal["token"]) is None
+            or not isinstance(journal["old"], str) or not _NAME.fullmatch(journal["old"])
+            or not isinstance(journal["new"], str) or not _NAME.fullmatch(journal["new"])
+            or journal["old"] == journal["new"]
+            or journal["adapter"] not in ("herdr", "herdr-foreign")
+            or not isinstance(journal["pane_id"], str) or not journal["pane_id"]
+            or not isinstance(journal["tab_id"], str) or not journal["tab_id"]
+            or (journal["terminal_id"] is not None and not isinstance(journal["terminal_id"], str))
+            or (journal["workspace_id"] is not None and not isinstance(journal["workspace_id"], str))
+            or not isinstance(journal["journal_id"], str)
+            or not _JOURNAL_ID.fullmatch(journal["journal_id"])
+            or isinstance(started, bool) or not isinstance(started, (int, float))
+            or not math.isfinite(started)):
+        raise AgentDeliveryError(f"invalid rename journal: {path}")
+    return journal
+
+
+def _name_history(value: object, path: Path) -> list[dict[str, object]]:
+    """Validate a record's earlier names: each a valid name with a time and journal id."""
+    if not isinstance(value, list) or len(value) > 256:
+        raise AgentDeliveryError(f"invalid name history in {path}")
+    history: list[dict[str, object]] = []
+    journals: set[str] = set()
+    for entry in value:
+        if not isinstance(entry, dict) or set(entry) != {"name", "renamed_at", "journal_id"}:
+            raise AgentDeliveryError(f"invalid name history in {path}")
+        name, renamed_at, journal_id = entry["name"], entry["renamed_at"], entry["journal_id"]
+        if (not isinstance(name, str) or not _NAME.fullmatch(name)
+                or isinstance(renamed_at, bool) or not isinstance(renamed_at, (int, float))
+                or not math.isfinite(renamed_at)
+                or not isinstance(journal_id, str) or not _JOURNAL_ID.fullmatch(journal_id)
+                or journal_id in journals):
+            raise AgentDeliveryError(f"invalid name history in {path}")
+        journals.add(journal_id)
+        history.append({"name": name, "renamed_at": renamed_at, "journal_id": journal_id})
+    return history
 
 
 def _rename_directory_noreplace_at(
@@ -267,6 +321,12 @@ class AgentRecord:
     pane_reported_by_agentctl: bool = False
     custom_process_identity: CustomProcessIdentity | None = None
     foreign_shell_identity: CustomProcessIdentity | None = None
+    #: Herdr terminal the pane held when agentctl anchored this record.
+    terminal_id: str | None = None
+    #: Kernel identity of the harness process anchored at start, adopt or anchor.
+    harness_identity: CustomProcessIdentity | None = None
+    #: Earlier names, oldest first: ``{"name", "renamed_at", "journal_id"}``.
+    name_history: list[dict[str, object]] = field(default_factory=list)
     _unknown: dict[str, object] = field(default_factory=dict, init=False, repr=False)
     _nested_storage: dict[str, object] | None = field(
         default=None, init=False, repr=False,
@@ -479,10 +539,19 @@ class AgentRecord:
             )
         custom_identity = process_identity("custom_process_identity")
         foreign_shell_identity = process_identity("foreign_shell_identity")
+        harness_identity = process_identity("harness_identity")
         if custom_identity is not None:
             fields["custom_process_identity"] = custom_identity
         if foreign_shell_identity is not None:
             fields["foreign_shell_identity"] = foreign_shell_identity
+        if harness_identity is not None:
+            fields["harness_identity"] = harness_identity
+        terminal_id = document.get("terminal_id")
+        if terminal_id is not None and (
+                not isinstance(terminal_id, str) or not terminal_id
+                or len(terminal_id) > 128 or not terminal_id.isascii()):
+            raise AgentDeliveryError(f"invalid terminal id in {path}")
+        fields["name_history"] = _name_history(document.get("name_history", []), path)
         if (custom_identity is not None
                 and ((document.get("adapter", "herdr"), document.get("harness"))
                      not in (("herdr-pane", "muse"), ("herdr-relay", "claude"), ("herdr-relay", "codex"))
@@ -827,6 +896,79 @@ def _goal_replacement_selected(screen: str, objective: str) -> bool:
             and "Press enter to confirm or esc to go back" in normalized)
 
 
+class RecipientUnanchored(RecipientChanged):
+    """The record pins no harness process or observed session, so input is refused."""
+
+
+class _GuardedTerminal:
+    """Verify the recipient immediately before and immediately after every input effect.
+
+    When the server advertises ``input-expect`` and the record pins a terminal, each
+    write also carries that terminal, and Herdr refuses it atomically if the pane
+    holds another terminal. Without that capability Herdr writes by pane id alone: a
+    replacement that takes the pane between the last check and Herdr's write still
+    receives that one effect. Either way a program exiting or exec-ing inside the
+    same terminal is outside Herdr's pane table, so the process check runs before
+    and after every effect, and a mismatch after a write becomes a quarantined
+    probable misroute.
+    """
+
+    def __init__(
+        self, client: HerdrClient, verify: Callable[[str], None],
+        expect_terminal: str | None = None,
+    ) -> None:
+        self.client, self.verify = client, verify
+        self.expect_terminal = expect_terminal
+        self.effects = 0
+
+    def read_screen(self, pane_id: str) -> str:
+        return self.client.read_screen(pane_id)
+
+    def effect(self, pane_id: str, action: Callable[[], _T]) -> _T:
+        try:
+            self.verify(pane_id)
+        except (HerdrUnavailable, AgentDeliveryError) as exc:
+            if self.effects == 0:
+                raise PromptNotStaged(f"{exc}; nothing was typed") from exc
+            raise RecipientChanged(
+                f"{exc}; input already typed into pane {pane_id} stopped here"
+            ) from exc
+        try:
+            result = action()
+        except InputExpectationFailed as exc:
+            if self.effects == 0:
+                raise PromptNotStaged(f"{exc}; nothing was typed") from exc
+            raise RecipientChanged(
+                f"{exc}; input already typed into pane {pane_id} stopped here"
+            ) from exc
+        self.effects += 1
+        try:
+            self.verify(pane_id)
+        except (HerdrUnavailable, AgentDeliveryError) as exc:
+            raise ProbableMisroute(
+                f"pane {pane_id} failed its recipient check immediately after input: {exc}"
+            ) from exc
+        return result
+
+    def send_text(self, pane_id: str, text: str) -> None:
+        if self.expect_terminal is None:
+            self.effect(pane_id, lambda: self.client.send_text(pane_id, text))
+        else:
+            self.effect(pane_id, lambda: self.client.send_text(
+                pane_id, text, expect_terminal=self.expect_terminal))
+
+    def send_keys(self, pane_id: str, keys: str) -> None:
+        if self.expect_terminal is None:
+            self.effect(pane_id, lambda: self.client.send_keys(pane_id, keys))
+        else:
+            self.effect(pane_id, lambda: self.client.send_keys(
+                pane_id, keys, expect_terminal=self.expect_terminal))
+
+    def native_prompt(self, pane_id: str, text: str) -> None:
+        self.effect(pane_id, lambda: self.client.agent_prompt(
+            pane_id, text, expect_terminal=self.expect_terminal))
+
+
 class _WorkspaceClient:
     """Add exact workspace checks to every queue readiness probe, after enqueue."""
 
@@ -841,6 +983,84 @@ class _WorkspaceClient:
         self.check_prompt = check_prompt
         self.expected_workspace = expected_workspace
         self.custom_submission: tuple[str, str, int] | None = None
+
+    def _guarded(self) -> _GuardedTerminal:
+        expect = None
+        if self.record.terminal_id is not None:
+            try:
+                supported = self.client.input_expect_supported()
+            except HerdrUnavailable as exc:
+                raise PromptNotStaged(
+                    f"cannot read the Herdr server's input capabilities: {exc}; nothing was typed"
+                ) from exc
+            expect = self.record.terminal_id if supported else None
+        return _GuardedTerminal(self.client, self.verify_recipient, expect)
+
+    def verify_recipient(self, pane_id: str, *, presentation: bool = True) -> None:
+        """Prove that the pane still holds this record's recipient; called around each effect.
+
+        ``presentation=False`` skips only the tab label, for repairing it.
+        """
+        record = self.record
+        if pane_id != record.pane_id:
+            raise RecipientChanged(f"refusing input to pane {pane_id}: agent {record.name!r} owns {record.pane_id}")
+        failures: list[str] = []
+        if record.adapter == "herdr" and presentation:
+            identity = self.client.agent_identity(record.name)
+            if identity.pane_id != record.pane_id:
+                failures.append(f"Herdr agent {record.name!r} is in pane {identity.pane_id}")
+            terminal_id, tab_id = identity.terminal_id, identity.tab_id
+            info = None
+        else:
+            info = self.client.pane_info(pane_id)
+            terminal_id, tab_id = info.terminal_id, info.tab_id
+        if record.terminal_id is not None and terminal_id != record.terminal_id:
+            failures.append(f"terminal is {terminal_id!r}, recorded {record.terminal_id!r}")
+        if record.adapter != "herdr-foreign" and record.tab_id is not None:
+            if tab_id is not None and tab_id != record.tab_id:
+                failures.append(f"tab is {tab_id!r}, recorded {record.tab_id!r}")
+            label = self.client.tab_label(record.tab_id) if presentation else record.name
+            if label != record.name:
+                failures.append(f"tab label is {label!r}, expected {record.name!r}")
+        if failures:
+            raise RecipientChanged(
+                f"refusing input to agent {record.name!r}: " + "; ".join(failures)
+                + "; run `agentctl doctor`"
+            )
+        if record.adapter == "herdr-pane":
+            self.client.verify_custom_harness(
+                pane_id, record.harness, record.custom_process_identity
+            )
+            return
+        if record.adapter == "herdr-relay":
+            if (record.custom_process_identity is None
+                    or self.client.relay_process(pane_id) != record.custom_process_identity):
+                raise RecipientChanged(
+                    f"refusing input to agent {record.name!r}: its relayed harness process changed"
+                )
+            return
+        if record.harness_identity is not None:
+            if not self.client.verify_harness_identity(pane_id, record.harness_identity):
+                raise RecipientChanged(
+                    f"refusing input to agent {record.name!r}: the anchored {record.harness} "
+                    f"process (pid {record.harness_identity.pid}) is no longer the foreground "
+                    f"program of pane {pane_id}; run `agentctl doctor`"
+                )
+            return
+        if record.session_value is not None and record._session_source != "asserted":
+            observed = (info or self.client.pane_info(pane_id)).session_value
+            if observed != record.session_value:
+                raise RecipientChanged(
+                    f"refusing input to agent {record.name!r}: native session is "
+                    f"{observed!r}, recorded {record.session_value!r}"
+                )
+            return
+        raise RecipientUnanchored(
+            f"refusing input to agent {record.name!r}: its record pins no harness process or "
+            "observed native session, so a replacement in the same pane could not be told "
+            f"apart; check that pane {pane_id} runs the intended agent, then run "
+            f"`agentctl anchor {record.name}`"
+        )
 
     def pane_info(self, pane_id: str) -> AgentPaneInfo:
         # Sessions started by this manager have a second lifecycle identity in
@@ -906,6 +1126,8 @@ class _WorkspaceClient:
                     ),
                     session_agent=info.session_agent,
                     session_value=info.session_value,
+                    terminal_id=info.terminal_id,
+                    tab_id=info.tab_id,
                 )
         return info
 
@@ -945,6 +1167,7 @@ class _WorkspaceClient:
             pane_id=info.pane_id, workspace_id=info.workspace_id, cwd=info.cwd,
             agent=self.record.harness, status=state,
             session_agent=info.session_agent, session_value=info.session_value,
+            terminal_id=info.terminal_id, tab_id=info.tab_id,
         )
 
     def panes(self, workspace_id: str | None = None) -> tuple[Pane, ...]:
@@ -971,9 +1194,15 @@ class _WorkspaceClient:
                 )
             if self.pane_info(pane_id).status != "idle":
                 raise HerdrUnavailable(f"relayed {self.record.harness} in pane {pane_id} is not idle")
-            return submit_verified(self.client, pane_id, self.record.harness, command)
+            return submit_verified(
+                self._guarded(),
+                pane_id, self.record.harness, command,
+            )
         if self.record.adapter != "herdr-pane":
-            return self.client.prompt_agent(pane_id, command)
+            return self.client.prompt_agent(
+                pane_id, command,
+                terminal=self._guarded(),
+            )
         if "\0" in command or "\x1b" in command:
             raise HerdrUnavailable(
                 "Muse pane prompts cannot contain NUL or terminal escape characters"
@@ -990,7 +1219,8 @@ class _WorkspaceClient:
                 "current YOLO input remains pending until Herdr provides an "
                 "effect-coupled process-generation guard"
             )
-        self.client.send_text(
+        guarded = self._guarded()
+        guarded.send_text(
             pane_id, f"{_BRACKETED_PASTE_START}{command}{_BRACKETED_PASTE_END}"
         )
         deadline = time.monotonic() + 2.0
@@ -1007,10 +1237,7 @@ class _WorkspaceClient:
             raise HerdrUnavailable(
                 "literal text insertion did not produce exact visible Muse editor evidence; Enter was not sent"
             )
-        self.client.verify_custom_harness(
-            pane_id, self.record.harness, self.record.custom_process_identity
-        )
-        self.client.send_keys(pane_id, "Enter")
+        guarded.send_keys(pane_id, "Enter")
         self.custom_submission = (
             staged, command, muse_prompt_transcript_count(staged, command),
         )
@@ -1061,7 +1288,7 @@ class _WorkspaceClient:
             self.pane_info(pane_id)
             screen = self.client.read(pane_id, source="visible", lines=200)
             if _goal_replacement_selected(screen, self.goal_objective):
-                self.client.send_keys(pane_id, "Enter")
+                self._guarded().send_keys(pane_id, "Enter")
             remaining = max(1, timeout_ms - int((time.monotonic() - started) * 1000))
             self.client.wait_agent_status(pane_id, status, remaining)
 
@@ -1124,6 +1351,7 @@ class ManagedAgents:
     def _load(self, name: str) -> AgentRecord:
         directory = self._directory(name)
         agent._validate_private_directory(str(self.registry), "agent registry")
+        self._refuse_pending_rename(name)
         if not directory.exists():
             raise AgentDeliveryError(f"unknown agent {name!r}; use list to inspect the registry")
         agent._validate_private_directory(str(directory), "agent directory")
@@ -1526,6 +1754,61 @@ class ManagedAgents:
         """Read durable metadata without requiring Herdr to be reachable."""
         return self._load(name)
 
+    def _anchor_fresh(self, record: AgentRecord, info: AgentPaneInfo) -> None:
+        """Pin the terminal and harness process of a pane this command just verified.
+
+        Used only where agentctl itself launched or explicitly adopted the program, so
+        the pinned identity is the intended recipient rather than whatever is visible now.
+        """
+        record.terminal_id = info.terminal_id
+        if record.adapter in ("herdr", "herdr-foreign") and record.pane_id is not None:
+            record.harness_identity = self.client.harness_identity(record.pane_id)
+        if record.pane_id is not None:
+            owner = self._claim_owner(record.pane_id, record.terminal_id, exclude=record.name)
+            if owner is not None:
+                raise AgentDeliveryError(
+                    f"pane {record.pane_id} is already registered as {owner.name!r}"
+                )
+
+    def _repin_moved_terminal(self, record: AgentRecord) -> None:
+        """After a verified move, keep the terminal anchor only while the harness still matches.
+
+        A cross-workspace move may give the pane a new terminal id. The move itself
+        proved the managed name followed the pane; the pinned harness process must
+        also still be its foreground program before the new terminal is recorded.
+        """
+        if record.pane_id is None or record.terminal_id is None:
+            return
+        terminal = self.client.pane_info(record.pane_id).terminal_id
+        if terminal == record.terminal_id:
+            return
+        if (record.harness_identity is None
+                or not self.client.verify_harness_identity(record.pane_id, record.harness_identity)):
+            record.terminal_id = None
+            return
+        record.terminal_id = terminal
+
+    def _claim_owner(
+        self, pane_id: str, terminal_id: str | None, *, exclude: str | None = None,
+    ) -> AgentRecord | None:
+        """Return another active record that claims this pane or terminal."""
+        if not self.registry.exists():
+            return None
+        for path in self.registry.iterdir():
+            if (not _NAME.fullmatch(path.name) or path.name == "archive"
+                    or path.name == exclude):
+                continue
+            try:
+                other = self._load(path.name)
+            except AgentDeliveryError:
+                continue
+            if other.lifecycle in ("stopped", "launch_failed"):
+                continue
+            if other.pane_id == pane_id or (
+                    terminal_id is not None and other.terminal_id == terminal_id):
+                return other
+        return None
+
     def _identity_owner(
         self, session_agent: str, session_value: str, *, exclude: str | None = None,
     ) -> AgentRecord | None:
@@ -1638,6 +1921,7 @@ class ManagedAgents:
                             f"native session is already registered as {owner.name!r}"
                         )
                 directory = self._directory(name)
+                self._refuse_pending_rename(name)
                 if os.path.lexists(directory):
                     raise AgentDeliveryError(f"agent {name!r} already registered; stop it before reusing the name")
                 directory.mkdir(mode=0o700)
@@ -1716,6 +2000,7 @@ class ManagedAgents:
                                 "started native session is not globally unique; "
                                 "the failed owned pane remains available for stop"
                             ) from identity_error
+                    self._anchor_fresh(record, info)
                     record.lifecycle = "running"
                     self._save(record)
                     try:
@@ -1807,6 +2092,7 @@ class ManagedAgents:
             # registry-wide identity transaction as well, so two callers cannot
             # register different panes that report the same native session.
             with self._identity_transaction():
+                self._refuse_pending_rename(name)
                 target_lock, _locked_pane, info = agent._lock_resolved_target(self.client, target)
                 try:
                     return self._adopt_locked(
@@ -1870,7 +2156,9 @@ class ManagedAgents:
                                 and info.session_value in (
                                     other.session_value, other.goal_session_id,
                                 ))
-                if other.pane_id == info.pane_id or same_session:
+                same_terminal = (info.terminal_id is not None
+                                 and other.terminal_id == info.terminal_id)
+                if other.pane_id == info.pane_id or same_session or same_terminal:
                     raise AgentDeliveryError(
                         f"pane {pane_id!r} is already registered as {other.name!r}"
                     )
@@ -1897,6 +2185,13 @@ class ManagedAgents:
             raise AgentDeliveryError(
                 f"refusing pane {pane_id}: pane shell process changed before adoption"
             )
+        # Adoption is the operator's explicit assertion about this program, so its
+        # harness process and terminal become the record's anchors.
+        harness_identity = self.client.harness_identity(confirmed.pane_id)
+        if confirmed.terminal_id != info.terminal_id:
+            raise AgentDeliveryError(
+                f"refusing pane {pane_id}: terminal changed before adoption"
+            )
         directory.mkdir(mode=0o700)
         agent._fsync_dir(str(self.registry))
         record = AgentRecord(
@@ -1907,6 +2202,7 @@ class ManagedAgents:
             session_value=info.session_value,
             adapter="herdr-foreign", mode="interactive", backend="herdr",
             foreign_shell_identity=shell_identity,
+            terminal_id=info.terminal_id, harness_identity=harness_identity,
         )
         self._save(record)
         try:
@@ -2156,6 +2452,7 @@ class ManagedAgents:
                 record.workspace_id = destination
                 record.tab_id = presentation.tab_id
                 record.pane_id = info.pane_id
+                self._repin_moved_terminal(record)
                 self._save(record)
                 self._clear_move_intent(name)
                 result = self._status_record(record)
@@ -2264,6 +2561,7 @@ class ManagedAgents:
             record.workspace_id = moved.workspace_id
             record.tab_id = moved.tab_id
             record.pane_id = moved.pane_id
+            self._repin_moved_terminal(record)
             self._save(record)
             self._clear_move_intent(name)
             result = self._status_record(record)
@@ -3892,6 +4190,414 @@ class ManagedAgents:
             agent._fsync_dir(str(archive))
             agent._fsync_dir(str(self.registry))
             return {"name": name, "archive": str(destination), "pane_closed": bool(owned), "tab_closed": tab_closed}
+
+    # Rename journals reserve both names until the rename is complete.
+
+    def _renames_dir(self) -> Path:
+        return self.registry / ".renames"
+
+    def _rename_journals(self) -> builtins.list[dict[str, object]]:
+        """Read every pending rename journal; an unreadable one refuses."""
+        directory = self._renames_dir()
+        if not directory.exists():
+            return []
+        agent._validate_private_directory(str(directory), "rename journal directory")
+        journals: list[dict[str, object]] = []
+        for path in sorted(directory.iterdir()):
+            if path.name.startswith("."):
+                continue  # an atomic writer's temporary file
+            if not path.name.endswith(".json"):
+                raise AgentDeliveryError(f"unexpected entry in rename journal directory: {path}")
+            value = agent._read_queue_json(str(path), "rename journal", require_private=True)
+            journals.append(_validate_rename_journal(value, path))
+        return journals
+
+    def _refuse_pending_rename(self, *names: str) -> None:
+        for journal in self._rename_journals():
+            if journal["old"] in names or journal["new"] in names:
+                raise AgentDeliveryError(
+                    f"rename of {journal['old']!r} to {journal['new']!r} is incomplete; "
+                    f"rerun `agentctl rename {journal['old']} {journal['new']}`"
+                )
+
+    def _write_rename_journal(self, journal: dict[str, object]) -> None:
+        directory = self._renames_dir()
+        if not directory.exists():
+            directory.mkdir(mode=0o700)
+            # Publish the new directory entry before any runtime change relies on it.
+            agent._fsync_dir(str(self.registry))
+        agent._validate_private_directory(str(directory), "rename journal directory")
+        path = directory / f"{journal['token']}.json"
+        if os.path.lexists(path):
+            raise AgentDeliveryError(f"a rename journal already exists: {path}")
+        agent._atomic_json(str(path), journal)
+
+    def _remove_rename_journal(self, journal: dict[str, object]) -> None:
+        directory = self._renames_dir()
+        os.unlink(directory / f"{journal['token']}.json")
+        agent._fsync_dir(str(directory))
+
+    @contextmanager
+    def _queue_locks(self, directory_name: str) -> Iterator[None]:
+        """Hold one existing queue's delivery and binding locks, in drain's order.
+
+        A queue is created by the first send, under the name lock the caller holds, so
+        a missing queue has nothing to exclude; it is never created here.
+        """
+        queue = self._directory(directory_name) / "queue"
+        if not queue.is_dir():
+            yield
+            return
+        descriptors: list[int] = []
+        try:
+            for lock_name, purpose in ((".delivery.lock", "queue delivery lock"),
+                                       (".binding.lock", "queue binding lock")):
+                descriptor = agent._open_private_lock(str(queue / lock_name), purpose)
+                descriptors.append(descriptor)
+                fcntl.flock(descriptor, fcntl.LOCK_EX)
+            yield
+        finally:
+            for descriptor in reversed(descriptors):
+                os.close(descriptor)
+
+    def anchor(self, name: str, *, replace: bool = False) -> dict[str, object]:
+        """Pin the terminal and harness process an operator has confirmed for NAME."""
+        with self._lock(name):
+            with self._identity_transaction():
+                record = self._load(name)
+                if record._nested_storage is not None:
+                    raise AgentDeliveryError(
+                        f"agent {name!r} uses a nested record format; anchor supports schema-1 records"
+                    )
+                if record.adapter not in ("herdr", "herdr-foreign"):
+                    raise AgentDeliveryError(
+                        "anchor applies to native and adopted Herdr agents; custom panes "
+                        "pin their process at launch"
+                    )
+                if record.pane_id is None:
+                    raise AgentDeliveryError(f"agent {name!r} has no confirmed pane")
+                with self._pane_lock(record.pane_id):
+                    info = self._checked(record)
+                    harness = self.client.harness_identity(record.pane_id)
+                    if harness is None:
+                        raise AgentDeliveryError(
+                            f"cannot pin the foreground {record.harness} process of pane "
+                            f"{record.pane_id}; is the harness running in the foreground?"
+                        )
+                    changed = (record.terminal_id not in (None, info.terminal_id)
+                               or record.harness_identity not in (None, harness))
+                    if changed and not replace:
+                        raise AgentDeliveryError(
+                            f"agent {name!r} is anchored to a different terminal or harness "
+                            "process, so the pane may hold another program; inspect it, "
+                            "then rerun with --replace"
+                        )
+                    owner = self._claim_owner(record.pane_id, info.terminal_id, exclude=name)
+                    if owner is not None:
+                        raise AgentDeliveryError(
+                            f"pane {record.pane_id} is already registered as {owner.name!r}"
+                        )
+                    previous = {
+                        "terminal_id": record.terminal_id,
+                        "harness_pid": (None if record.harness_identity is None
+                                        else record.harness_identity.pid),
+                    }
+                    record.terminal_id = info.terminal_id
+                    record.harness_identity = harness
+                    self._save(record)
+                    return {
+                        "name": name, "pane_id": record.pane_id,
+                        "terminal_id": record.terminal_id, "harness_pid": harness.pid,
+                        "replaced": changed, "previous": previous,
+                    }
+
+    def rename(self, old: str, new: str) -> dict[str, object]:
+        """Rename a live agent: registry entry, Herdr agent name and tab label together."""
+        _name(old)
+        _name(new)
+        if old == new:
+            raise AgentDeliveryError("rename needs two different names")
+        first, second = sorted((old, new))
+        with self._lock(first), self._lock(second):
+            with self._identity_transaction():
+                pending = [journal for journal in self._rename_journals()
+                           if {journal["old"], journal["new"]} & {old, new}]
+                if pending:
+                    found = pending[0]
+                    if len(pending) != 1 or (found["old"], found["new"]) != (old, new):
+                        raise AgentDeliveryError(
+                            f"rename of {found['old']!r} to {found['new']!r} is incomplete; "
+                            f"rerun exactly `agentctl rename {found['old']} {found['new']}`"
+                        )
+                    return self._finish_rename(found, recovered=True)
+                record = self._load(old)
+                if record._nested_storage is not None:
+                    raise AgentDeliveryError(
+                        f"agent {old!r} uses a nested record format; rename supports schema-1 records"
+                    )
+                if record.adapter not in ("herdr", "herdr-foreign") or record.lifecycle != "running":
+                    raise AgentDeliveryError(
+                        "rename supports running native and adopted Herdr agents"
+                    )
+                if record.pane_id is None or record.tab_id is None:
+                    raise AgentDeliveryError(f"agent {old!r} has no confirmed pane and tab")
+                if record.harness_identity is None and not (
+                        record.session_value is not None and record._session_source != "asserted"):
+                    raise AgentDeliveryError(
+                        f"agent {old!r} pins no harness process or observed session; "
+                        f"check its pane, run `agentctl anchor {old}`, then rename"
+                    )
+                if self._read_move_intent(record) is not None:
+                    raise AgentDeliveryError(f"move of {old!r} is incomplete; rerun `agentctl move {old}`")
+                if os.path.lexists(self._directory(new)):
+                    raise AgentDeliveryError(f"agent {new!r} is already registered")
+                journal: dict[str, object] = {
+                    "schema": "agentctl-rename/v1", "token": record.token,
+                    "old": old, "new": new, "adapter": record.adapter,
+                    "pane_id": record.pane_id, "tab_id": record.tab_id,
+                    "terminal_id": record.terminal_id, "workspace_id": record.workspace_id,
+                    "journal_id": uuid.uuid4().hex, "started_at": time.time(),
+                }
+                with self._queue_locks(old), self._pane_lock(record.pane_id):
+                    self._checked(record)
+                    _WorkspaceClient(self.client, record).verify_recipient(record.pane_id)
+                    if new in self.client.agent_names():
+                        raise AgentDeliveryError(f"a Herdr agent is already named {new!r}")
+                    if (record.adapter == "herdr" and record.workspace_id is not None
+                            and new in self.client.tab_labels(record.workspace_id).values()):
+                        raise AgentDeliveryError(f"a tab in the workspace is already labelled {new!r}")
+                    self._write_rename_journal(journal)
+                    return self._complete_rename(journal, old, record, recovered=False)
+
+    def _finish_rename(self, journal: dict[str, object], *, recovered: bool) -> dict[str, object]:
+        """Complete a journalled rename after a crash, refusing any state it did not create."""
+        old, new = str(journal["old"]), str(journal["new"])
+        old_exists = os.path.lexists(self._directory(old))
+        new_exists = os.path.lexists(self._directory(new))
+        if old_exists == new_exists:
+            raise AgentDeliveryError(
+                f"rename journal for {old!r} -> {new!r} found "
+                f"{'both' if old_exists else 'neither'} agent directories; refusing to guess"
+            )
+        current = old if old_exists else new
+        path = self._directory(current) / "agent.json"
+        agent._validate_private_directory(str(self._directory(current)), "agent directory")
+        raw = agent._read_queue_json(str(path), "agent record", require_private=True)
+        allowed = (old, new) if current == old else (new,)
+        if (not isinstance(raw, dict) or raw.get("token") != journal["token"]
+                or raw.get("name") not in allowed):
+            raise AgentDeliveryError(
+                f"agent record {path} does not match the rename journal; refusing to guess"
+            )
+        record = AgentRecord._from_value(raw, path, str(raw["name"]))
+        with self._queue_locks(current), self._pane_lock(str(journal["pane_id"])):
+            return self._complete_rename(journal, current, record, recovered=recovered)
+
+    def _complete_rename(
+        self, journal: dict[str, object], current: str, record: AgentRecord, *, recovered: bool,
+    ) -> dict[str, object]:
+        """Run the remaining rename steps; every step checks its own state first."""
+        old, new = str(journal["old"]), str(journal["new"])
+        pane_id, tab_id = str(journal["pane_id"]), str(journal["tab_id"])
+        live = any(pane.pane_id == pane_id for pane in self.client.panes())
+        herdr_steps = "skipped-pane-missing"
+        if live:
+            self._verify_rename_recipient(record, journal)
+            if journal["adapter"] == "herdr":
+                names = self.client.agent_names()
+                if names.get(new) != pane_id:
+                    if names.get(old) != pane_id:
+                        raise AgentDeliveryError(
+                            f"pane {pane_id} is named neither {old!r} nor {new!r} in Herdr; refusing"
+                        )
+                    self.client.rename_agent(pane_id, new)
+                label = self.client.tab_label(tab_id)
+                if label != new:
+                    if label != old:
+                        raise AgentDeliveryError(
+                            f"tab {tab_id} is labelled {label!r}, neither {old!r} nor {new!r}; refusing"
+                        )
+                    self.client.rename_tab(tab_id, new)
+            herdr_steps = "done"
+        if current == old:
+            record.name = new
+            if not any(entry["journal_id"] == journal["journal_id"] for entry in record.name_history):
+                record.name_history.append({
+                    "name": old, "renamed_at": journal["started_at"],
+                    "journal_id": journal["journal_id"],
+                })
+            agent._atomic_json(str(self._directory(old) / "agent.json"), record.to_document())
+            registry = os.open(
+                self.registry, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_CLOEXEC", 0),
+            )
+            try:
+                _rename_directory_noreplace_at(registry, old, registry, new)
+                os.fsync(registry)
+            finally:
+                os.close(registry)
+        elif not any(entry["journal_id"] == journal["journal_id"] for entry in record.name_history):
+            raise AgentDeliveryError(
+                f"agent {new!r} was moved without its rename history; refusing to guess"
+            )
+        self._remove_rename_journal(journal)
+        return {
+            "name": new, "previous_name": old, "token": record.token, "pane_id": pane_id,
+            "recovered": recovered, "herdr_steps": herdr_steps,
+            "external_references": (
+                f"wrkslots slots, chat bindings and scheduled prompts that name {old!r} "
+                "are not changed by agentctl"
+            ),
+        }
+
+    def _verify_rename_recipient(self, record: AgentRecord, journal: dict[str, object]) -> None:
+        """Every non-presentation anchor must hold; only the name and label may be OLD or NEW."""
+        pane_id = str(journal["pane_id"])
+        info = self.client.pane_info(pane_id)
+        failures: list[str] = []
+        if info.workspace_id != record.workspace_id:
+            failures.append(f"workspace is {info.workspace_id!r}, recorded {record.workspace_id!r}")
+        if os.path.realpath(info.cwd) != os.path.realpath(record.cwd):
+            failures.append(f"cwd is {info.cwd!r}, recorded {record.cwd!r}")
+        if info.agent != record.harness:
+            failures.append(f"harness is {info.agent!r}, recorded {record.harness!r}")
+        if journal["terminal_id"] is not None and info.terminal_id != journal["terminal_id"]:
+            failures.append(f"terminal is {info.terminal_id!r}, recorded {journal['terminal_id']!r}")
+        if info.tab_id is not None and info.tab_id != journal["tab_id"]:
+            failures.append(f"tab is {info.tab_id!r}, recorded {journal['tab_id']!r}")
+        if record.harness_identity is not None:
+            if not self.client.verify_harness_identity(pane_id, record.harness_identity):
+                failures.append("the anchored harness process is no longer in the foreground")
+        elif record.session_value is None or info.session_value != record.session_value:
+            failures.append("no anchored harness process or matching observed session")
+        if failures:
+            raise AgentDeliveryError(
+                f"refusing to rename pane {pane_id}: " + "; ".join(failures)
+            )
+
+    def doctor(self, *, repair_labels: bool = False) -> dict[str, object]:
+        """Compare every registry record with live Herdr state; read-only unless repairing labels."""
+        rows: list[dict[str, object]] = []
+        registry_findings: list[dict[str, object]] = []
+        try:
+            journals = self._rename_journals()
+        except AgentDeliveryError as exc:
+            journals = []
+            registry_findings.append({"finding": "rename-journal-unreadable", "detail": str(exc)})
+        journal_names = {str(name) for journal in journals for name in (journal["old"], journal["new"])}
+        records: list[AgentRecord] = []
+        if self.registry.exists():
+            for path in sorted(self.registry.iterdir()):
+                if not _NAME.fullmatch(path.name) or path.name == "archive":
+                    continue
+                try:
+                    records.append(AgentRecord.load(path / "agent.json", path.name))
+                except AgentDeliveryError as exc:
+                    if path.name in journal_names:
+                        rows.append({"name": path.name, "findings": ["rename-incomplete"],
+                                     "detail": str(exc)})
+                    else:
+                        rows.append({"name": path.name, "findings": ["record-unreadable"],
+                                     "detail": str(exc)})
+        panes = {pane.pane_id: pane for pane in self.client.panes()}
+        agent_names = self.client.agent_names()
+        workspaces = sorted({record.workspace_id for record in records if record.workspace_id})
+        labels: dict[str, str] = {}
+        for workspace in workspaces:
+            labels.update(self.client.tab_labels(workspace))
+        claims: dict[str, list[str]] = {}
+        for record in records:
+            for key in (record.pane_id, record.terminal_id):
+                if key is not None:
+                    claims.setdefault(key, []).append(record.name)
+        for record in records:
+            findings = self._doctor_findings(record, panes, agent_names, labels)
+            if record.name in journal_names:
+                findings.append("rename-incomplete")
+            if any(len(claims.get(key, [])) > 1 for key in (record.pane_id, record.terminal_id)
+                   if key is not None):
+                findings.append("duplicate-claim")
+            row: dict[str, object] = {"name": record.name, "adapter": record.adapter,
+                                      "pane_id": record.pane_id, "findings": findings}
+            if (repair_labels and findings
+                    and set(findings) <= {"label-mismatch", "herdr-name-mismatch"}
+                    and record.adapter == "herdr" and not journals):
+                row["repaired"] = self._repair_presentation(record.name)
+            rows.append(row)
+        registered = {record.name for record in records}
+        claimed_tabs = {record.tab_id for record in records}
+        workspace_findings: list[dict[str, object]] = []
+        for tab_id, label in sorted(labels.items()):
+            if tab_id in claimed_tabs:
+                owner = next(record for record in records if record.tab_id == tab_id)
+                if label in registered and label != owner.name:
+                    workspace_findings.append({"finding": "label-collision", "tab_id": tab_id,
+                                               "label": label})
+            elif label in registered:
+                workspace_findings.append({"finding": "label-collision", "tab_id": tab_id,
+                                           "label": label})
+            else:
+                workspace_findings.append({"finding": "unmanaged-tab", "tab_id": tab_id,
+                                           "label": label})
+        clean = (not registry_findings
+                 and all(not row["findings"] or row.get("repaired") is True for row in rows)
+                 and all(item["finding"] == "unmanaged-tab" for item in workspace_findings))
+        return {"clean": clean, "records": rows, "registry": registry_findings,
+                "workspace": workspace_findings,
+                "journals": [{"old": journal["old"], "new": journal["new"]} for journal in journals]}
+
+    def _doctor_findings(
+        self, record: AgentRecord, panes: dict[str, Pane], agent_names: dict[str, str],
+        labels: dict[str, str],
+    ) -> builtins.list[str]:
+        findings: list[str] = []
+        if record.pane_id is None or record.pane_id not in panes:
+            return ["pane-missing"]
+        info = self.client.pane_info(record.pane_id)
+        if info.workspace_id != record.workspace_id:
+            findings.append("workspace-mismatch")
+        if record.terminal_id is not None and info.terminal_id != record.terminal_id:
+            findings.append("terminal-mismatch")
+        if record.adapter != "herdr-foreign":
+            if record.tab_id is not None and panes[record.pane_id].tab_id != record.tab_id:
+                findings.append("tab-moved")
+            if record.tab_id is not None and labels.get(record.tab_id) != record.name:
+                findings.append("label-mismatch")
+        if record.adapter == "herdr" and agent_names.get(record.name) != record.pane_id:
+            findings.append("herdr-name-mismatch")
+        if info.agent is None:
+            findings.append("harness-exited")
+        elif info.agent != record.harness:
+            findings.append("harness-kind-mismatch")
+        if record.harness_identity is not None:
+            if not self.client.verify_harness_identity(record.pane_id, record.harness_identity):
+                findings.append("harness-replaced")
+        elif record.adapter in ("herdr", "herdr-foreign") and not (
+                record.session_value is not None and record._session_source != "asserted"):
+            findings.append("unanchored")
+        return findings
+
+    def _repair_presentation(self, name: str) -> bool:
+        """Restore one owned agent's label and Herdr name when every other anchor holds."""
+        with self._lock(name):
+            with self._identity_transaction():
+                record = self._load(name)
+                if record.pane_id is None or record.tab_id is None:
+                    return False
+                with self._queue_locks(name), self._pane_lock(record.pane_id):
+                    guard = _WorkspaceClient(self.client, record)
+                    try:
+                        guard.verify_recipient(record.pane_id, presentation=False)
+                    except (HerdrUnavailable, AgentDeliveryError):
+                        return False
+                    names = self.client.agent_names()
+                    if names.get(name) not in (None, record.pane_id):
+                        return False
+                    if names.get(name) != record.pane_id:
+                        self.client.rename_agent(record.pane_id, name)
+                    if self.client.tab_label(record.tab_id) != name:
+                        self.client.rename_tab(record.tab_id, name)
+                    guard.verify_recipient(record.pane_id)
+                    return True
 
     @staticmethod
     def _require_automation(record: AgentRecord) -> None:

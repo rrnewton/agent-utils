@@ -27,6 +27,7 @@ from agentctl.errors import (
     AgentPending,
     AgentPossiblySubmitted,
     HerdrUnavailable,
+    ProbableMisroute,
 )
 from agentctl.prompt_time import retime as _retime_prompt
 from agentctl.submission import PromptNotStaged, SubmissionReceipt
@@ -91,6 +92,11 @@ class QueueResult:
 class _PossiblySubmitted(AgentDeliveryError):
     """The atomic pane injection happened, but its working transition was not observed."""
 
+    def __init__(self, message: str, *, misroute: bool = False) -> None:
+        super().__init__(message)
+        #: The pane failed its recipient check right after input was written.
+        self.misroute = misroute
+
 
 class _NotStaged(AgentDeliveryError):
     """Nothing was typed into the pane, so the prompt remains safe to retry."""
@@ -118,6 +124,7 @@ _UPDATE_ENVELOPE: dict[str, object] = {
     "delivery_state": "processed",
     "delivery_error": "\x00" * QUEUE_ERROR_MAX_BYTES,
     "possibly_submitted": True,
+    "probable_misroute": True,
     "delivery_blocked_at": _LONGEST_JSON_FLOAT,
     "inflight_at": _LONGEST_JSON_FLOAT,
     "delivery_failed_at": _LONGEST_JSON_FLOAT,
@@ -1780,6 +1787,10 @@ def _deliver_one(
         receipt = client.prompt_agent(info.pane_id, text)
     except PromptNotStaged as exc:
         raise _NotStaged(str(exc)) from exc
+    except ProbableMisroute as exc:
+        raise _PossiblySubmitted(
+            f"pane {info.pane_id}: PROBABLE MISROUTE, quarantined: {exc}", misroute=True,
+        ) from exc
     except Exception as exc:
         # The terminal server may have accepted the atomic text+Enter before the client lost its
         # response. Once agent.prompt is entered, failure is ambiguous and must never be retried.
@@ -1964,6 +1975,8 @@ def _drain(
                         document["tui_delivery_attempts"] = attempts
                         document["delivery_error"] = _bounded_error(str(exc), max_artifact_bytes)
                         document["possibly_submitted"] = True
+                        if exc.misroute:
+                            document["probable_misroute"] = True
                         document["delivery_failed_at"] = time.time()
                         _atomic_json(inflight_path, document, max_artifact_bytes=max_artifact_bytes)
                         failed_path = os.path.join(failed, os.path.basename(path))

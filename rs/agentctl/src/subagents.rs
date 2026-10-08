@@ -3,7 +3,8 @@
 //! Herdr owns terminals and harness processes. This layer owns durable names,
 //! launch intent, queue routing, snapshots, and conservative tab teardown.
 
-use std::collections::BTreeMap;
+use std::cell::Cell;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::CString;
 use std::fs::{self, DirBuilder, File, OpenOptions};
 use std::io::{self, Read, Write};
@@ -23,10 +24,11 @@ use sha2::{Digest, Sha256};
 use crate::agent::{self, AgentApi, AgentError, DrainOptions, QueueResult, Target};
 use crate::client::{
     muse_idle_composer, muse_prompt_in_composer, muse_prompt_transcript_count,
-    muse_startup_metadata, muse_trust_prompt, AgentPaneInfo, CustomProcessIdentity, HerdrClient,
-    Pane, PaneShellProof,
+    muse_startup_metadata, muse_trust_prompt, AgentIdentity, AgentPaneInfo, CustomProcessIdentity,
+    HerdrClient, Pane, PaneShellProof,
 };
-use crate::submission::Submission;
+use crate::error::{AdapterError, AdapterErrorKind};
+use crate::submission::{GuardedInput, GuardedPrompt, Submission, SubmitTimeouts};
 
 mod cloud;
 
@@ -491,6 +493,192 @@ fn name(value: &str) -> Result<&str> {
     Ok(value)
 }
 
+/// The agent-name pattern of the shared on-disk formats: `[a-z][a-z0-9-]{0,31}`.
+fn name_pattern(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 32
+        && value.as_bytes()[0].is_ascii_lowercase()
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+}
+
+/// A rename journal id: 32 lowercase hexadecimal digits.
+fn journal_id_pattern(value: &str) -> bool {
+    value.len() == 32
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
+/// Quote an optional simple string as `'value'` or `None`, so messages read alike in both editions.
+fn repr(value: Option<&str>) -> String {
+    value.map_or_else(|| "None".to_owned(), |value| format!("'{value}'"))
+}
+
+/// One earlier name of a renamed agent, oldest first in [`AgentRecord::name_history`].
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct NameHistoryEntry {
+    name: String,
+    renamed_at: f64,
+    journal_id: String,
+}
+
+/// Validate a record's earlier names: each a valid name with a time and a unique journal id.
+fn valid_name_history(history: &[NameHistoryEntry]) -> bool {
+    let mut journals = BTreeSet::new();
+    history.len() <= 256
+        && history.iter().all(|entry| {
+            name_pattern(&entry.name)
+                && entry.renamed_at.is_finite()
+                && journal_id_pattern(&entry.journal_id)
+                && journals.insert(entry.journal_id.as_str())
+        })
+}
+
+/// Schema tag of a rename journal; both editions read and finish each other's journals.
+const RENAME_JOURNAL_SCHEMA: &str = "agentctl-rename/v1";
+const RENAME_JOURNAL_KEYS: [&str; 11] = [
+    "schema",
+    "token",
+    "old",
+    "new",
+    "adapter",
+    "pane_id",
+    "tab_id",
+    "terminal_id",
+    "workspace_id",
+    "journal_id",
+    "started_at",
+];
+
+/// `.renames/<token>.json`: reserves both names until a rename is complete.
+#[derive(Clone, Debug, PartialEq)]
+struct RenameJournal {
+    token: String,
+    old: String,
+    new: String,
+    adapter: String,
+    pane_id: String,
+    tab_id: String,
+    terminal_id: Option<String>,
+    workspace_id: Option<String>,
+    journal_id: String,
+    started_at: f64,
+}
+
+impl RenameJournal {
+    /// Validate one rename journal written by either edition.
+    fn parse(value: &Value, path: &Path) -> Result<Self> {
+        let invalid = || fail(format!("invalid rename journal: {}", path.display()));
+        let object = value.as_object().ok_or_else(invalid)?;
+        if object.len() != RENAME_JOURNAL_KEYS.len()
+            || RENAME_JOURNAL_KEYS
+                .iter()
+                .any(|key| !object.contains_key(*key))
+        {
+            return Err(invalid());
+        }
+        let text = |key: &str| object[key].as_str();
+        let optional = |key: &str| match &object[key] {
+            Value::Null => Ok(None),
+            Value::String(value) => Ok(Some(value.clone())),
+            _ => Err(invalid()),
+        };
+        let token = text("token").ok_or_else(invalid)?;
+        let old = text("old").ok_or_else(invalid)?;
+        let new = text("new").ok_or_else(invalid)?;
+        let adapter = text("adapter").ok_or_else(invalid)?;
+        let pane_id = text("pane_id").ok_or_else(invalid)?;
+        let tab_id = text("tab_id").ok_or_else(invalid)?;
+        let journal_id = text("journal_id").ok_or_else(invalid)?;
+        let started_at = object["started_at"]
+            .as_f64()
+            .filter(|value| value.is_finite())
+            .ok_or_else(invalid)?;
+        if text("schema") != Some(RENAME_JOURNAL_SCHEMA)
+            || path.file_name().and_then(|name| name.to_str()) != Some(&format!("{token}.json"))
+            || token.is_empty()
+            || token.len() > 80
+            || !token
+                .bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+            || !name_pattern(old)
+            || !name_pattern(new)
+            || old == new
+            || !matches!(adapter, "herdr" | "herdr-foreign")
+            || pane_id.is_empty()
+            || tab_id.is_empty()
+            || !journal_id_pattern(journal_id)
+        {
+            return Err(invalid());
+        }
+        Ok(Self {
+            token: token.to_owned(),
+            old: old.to_owned(),
+            new: new.to_owned(),
+            adapter: adapter.to_owned(),
+            pane_id: pane_id.to_owned(),
+            tab_id: tab_id.to_owned(),
+            terminal_id: optional("terminal_id")?,
+            workspace_id: optional("workspace_id")?,
+            journal_id: journal_id.to_owned(),
+            started_at,
+        })
+    }
+
+    fn document(&self) -> Value {
+        json!({
+            "schema": RENAME_JOURNAL_SCHEMA,
+            "token": self.token,
+            "old": self.old,
+            "new": self.new,
+            "adapter": self.adapter,
+            "pane_id": self.pane_id,
+            "tab_id": self.tab_id,
+            "terminal_id": self.terminal_id,
+            "workspace_id": self.workspace_id,
+            "journal_id": self.journal_id,
+            "started_at": self.started_at,
+        })
+    }
+
+    fn names(&self, candidates: &[&str]) -> bool {
+        candidates.contains(&self.old.as_str()) || candidates.contains(&self.new.as_str())
+    }
+}
+
+/// A fresh random rename journal id (32 lowercase hexadecimal digits, like a UUID4 hex).
+fn new_journal_id() -> Result<String> {
+    let mut bytes = [0_u8; 16];
+    let mut filled = 0;
+    while filled < bytes.len() {
+        // SAFETY: the pointer and length describe the unfilled tail of a live stack buffer.
+        let read = unsafe {
+            libc::getrandom(bytes[filled..].as_mut_ptr().cast(), bytes.len() - filled, 0)
+        };
+        if read < 0 {
+            let error = io::Error::last_os_error();
+            if error.kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(fail(format!("cannot draw a rename journal id: {error}")));
+        }
+        filled += read as usize;
+    }
+    bytes[6] = (bytes[6] & 0x0f) | 0x40;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    Ok(bytes.iter().map(|byte| format!("{byte:02x}")).collect())
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Makes the next rename fail after publishing the renamed record inside the old directory
+    /// and before moving the directory, as a crash there would.
+    static FAIL_RENAME_DIRECTORY_MOVE: Cell<bool> = const { Cell::new(false) };
+}
+
 /// Harness arguments for Codex/Claude/Muse presets, leaving permission policy untouched.
 pub fn harness_arguments(
     harness: &str,
@@ -855,6 +1043,137 @@ pub trait ManagedApi: AgentApi {
     }
     /// Close one owned tab; never close its workspace.
     fn close_tab(&self, tab: &str) -> crate::error::Result<()>;
+    /// Resolve an exact live Herdr agent name to its pane, tab and terminal.
+    fn agent_identity(&self, _name: &str) -> crate::error::Result<AgentIdentity> {
+        Err(AdapterError::unavailable(
+            "Herdr agent identity lookup is unavailable",
+        ))
+    }
+    /// Give the agent in one exact pane a new Herdr agent name.
+    fn rename_agent(&self, _pane: &str, _name: &str) -> crate::error::Result<()> {
+        Err(AdapterError::unavailable(
+            "Herdr agent rename is unavailable",
+        ))
+    }
+    /// Every named Herdr agent, mapped to its pane.
+    fn agent_names(&self) -> crate::error::Result<BTreeMap<String, String>> {
+        Err(AdapterError::unavailable(
+            "Herdr agent listing is unavailable",
+        ))
+    }
+    /// Return the label of one exact tab.
+    fn tab_label(&self, _tab: &str) -> crate::error::Result<String> {
+        Err(AdapterError::unavailable("Herdr tab lookup is unavailable"))
+    }
+    /// Every tab of one workspace, mapped to its label.
+    fn tab_labels(&self, _workspace: &str) -> crate::error::Result<BTreeMap<String, String>> {
+        Err(AdapterError::unavailable(
+            "Herdr tab listing is unavailable",
+        ))
+    }
+    /// Pin the pane's foreground process-group leader; `None` when it cannot be pinned.
+    fn harness_identity(&self, _pane: &str) -> crate::error::Result<Option<CustomProcessIdentity>> {
+        Ok(None)
+    }
+    /// Is the pinned harness process still the pane's foreground process-group leader?
+    fn verify_harness_identity(
+        &self,
+        _pane: &str,
+        _expected: &CustomProcessIdentity,
+    ) -> crate::error::Result<bool> {
+        Err(AdapterError::unavailable(
+            "harness process verification is unavailable",
+        ))
+    }
+    /// Does the running server refuse input whose expected terminal does not match?
+    fn input_expect_supported(&self) -> crate::error::Result<bool> {
+        Ok(false)
+    }
+    /// Return visible rows with SGR styling retained, for composer inspection.
+    fn read_screen_with_runtime(
+        &self,
+        pane: &str,
+        runtime: &dyn agent::AgentRuntime,
+    ) -> crate::error::Result<String> {
+        self.read_with_runtime(
+            pane,
+            "visible",
+            Some(crate::submission::SCREEN_LINES),
+            runtime,
+        )
+    }
+    /// Insert literal text, refused unless the pane holds `expect_terminal` when given.
+    fn send_text_expect(
+        &self,
+        pane: &str,
+        text: &str,
+        expect_terminal: Option<&str>,
+        runtime: &dyn agent::AgentRuntime,
+    ) -> crate::error::Result<()> {
+        match expect_terminal {
+            None => self.send_text_with_runtime(pane, text, runtime),
+            Some(_) => Err(AdapterError::unavailable(
+                "terminal-checked input is unavailable",
+            )),
+        }
+    }
+    /// Send one key, refused unless the pane holds `expect_terminal` when given.
+    fn send_keys_expect(
+        &self,
+        pane: &str,
+        key: &str,
+        expect_terminal: Option<&str>,
+        runtime: &dyn agent::AgentRuntime,
+    ) -> crate::error::Result<()> {
+        match expect_terminal {
+            None => self.send_keys_with_runtime(pane, key, runtime),
+            Some(_) => Err(AdapterError::unavailable(
+                "terminal-checked input is unavailable",
+            )),
+        }
+    }
+    /// Submit text plus Enter natively, refused unless the pane holds `expect_terminal`.
+    fn agent_prompt_expect(
+        &self,
+        pane: &str,
+        text: &str,
+        expect_terminal: Option<&str>,
+        runtime: &dyn agent::AgentRuntime,
+    ) -> crate::error::Result<()> {
+        match expect_terminal {
+            None => self.run_with_runtime(pane, text, runtime),
+            Some(_) => Err(AdapterError::unavailable(
+                "terminal-checked input is unavailable",
+            )),
+        }
+    }
+    /// Submit one prompt whose every input effect runs through `terminal`.
+    ///
+    /// The default uses the native prompt primitive and proves nothing.
+    fn prompt_guarded(
+        &self,
+        pane: &str,
+        text: &str,
+        terminal: &dyn GuardedInput,
+        _runtime: &dyn agent::AgentRuntime,
+    ) -> crate::error::Result<Submission> {
+        terminal
+            .native_prompt(pane, text)
+            .map(|()| Submission::Unconfirmed)
+    }
+    /// Submit one prompt to a known composer harness through `terminal`'s guarded effects.
+    fn submit_guarded(
+        &self,
+        pane: &str,
+        _harness: &str,
+        text: &str,
+        terminal: &dyn GuardedInput,
+        _runtime: &dyn agent::AgentRuntime,
+    ) -> crate::error::Result<Submission> {
+        terminal
+            .native_prompt(pane, text)
+            .map(|()| Submission::Unconfirmed)
+    }
 }
 
 impl ManagedApi for HerdrClient {
@@ -1048,6 +1367,115 @@ impl ManagedApi for HerdrClient {
     fn close_tab(&self, tab: &str) -> crate::error::Result<()> {
         HerdrClient::close_tab(self, tab)
     }
+    fn agent_identity(&self, name: &str) -> crate::error::Result<AgentIdentity> {
+        HerdrClient::agent_identity(self, name)
+    }
+    fn rename_agent(&self, pane: &str, name: &str) -> crate::error::Result<()> {
+        HerdrClient::rename_agent(self, pane, name)
+    }
+    fn agent_names(&self) -> crate::error::Result<BTreeMap<String, String>> {
+        HerdrClient::agent_names(self)
+    }
+    fn tab_label(&self, tab: &str) -> crate::error::Result<String> {
+        HerdrClient::tab_label(self, tab)
+    }
+    fn tab_labels(&self, workspace: &str) -> crate::error::Result<BTreeMap<String, String>> {
+        HerdrClient::tab_labels(self, workspace)
+    }
+    fn harness_identity(&self, pane: &str) -> crate::error::Result<Option<CustomProcessIdentity>> {
+        HerdrClient::harness_identity(self, pane)
+    }
+    fn verify_harness_identity(
+        &self,
+        pane: &str,
+        expected: &CustomProcessIdentity,
+    ) -> crate::error::Result<bool> {
+        HerdrClient::verify_harness_identity(self, pane, expected)
+    }
+    fn input_expect_supported(&self) -> crate::error::Result<bool> {
+        HerdrClient::input_expect_supported(self)
+    }
+    fn read_screen_with_runtime(
+        &self,
+        pane: &str,
+        runtime: &dyn agent::AgentRuntime,
+    ) -> crate::error::Result<String> {
+        HerdrClient::read_screen_with_cancellation(self, pane, &|| runtime.cancelled())
+    }
+    fn send_text_expect(
+        &self,
+        pane: &str,
+        text: &str,
+        expect_terminal: Option<&str>,
+        runtime: &dyn agent::AgentRuntime,
+    ) -> crate::error::Result<()> {
+        HerdrClient::send_text_expecting(self, pane, text, expect_terminal, &|| runtime.cancelled())
+    }
+    fn send_keys_expect(
+        &self,
+        pane: &str,
+        key: &str,
+        expect_terminal: Option<&str>,
+        runtime: &dyn agent::AgentRuntime,
+    ) -> crate::error::Result<()> {
+        HerdrClient::send_keys_expecting(self, pane, key, expect_terminal, &|| runtime.cancelled())
+    }
+    fn agent_prompt_expect(
+        &self,
+        pane: &str,
+        text: &str,
+        expect_terminal: Option<&str>,
+        runtime: &dyn agent::AgentRuntime,
+    ) -> crate::error::Result<()> {
+        HerdrClient::agent_prompt(self, pane, text, expect_terminal, &|| runtime.cancelled())
+    }
+    fn prompt_guarded(
+        &self,
+        pane: &str,
+        text: &str,
+        terminal: &dyn GuardedInput,
+        runtime: &dyn agent::AgentRuntime,
+    ) -> crate::error::Result<Submission> {
+        let harness =
+            match HerdrClient::pane_info_with_cancellation(self, pane, &|| runtime.cancelled()) {
+                Ok(info) => info.agent.unwrap_or_default(),
+                Err(error) => {
+                    return Ok(Submission::NotStaged(format!(
+                        "pane {pane}: harness lookup failed before typing: {error}"
+                    )))
+                }
+            };
+        if crate::submission::verifies(&harness, text) {
+            return crate::submission::submit_verified(
+                &GuardedPrompt(terminal),
+                pane,
+                &harness,
+                text,
+                SubmitTimeouts::default(),
+                runtime,
+            );
+        }
+        terminal
+            .native_prompt(pane, text)
+            .map(|()| Submission::Unconfirmed)
+    }
+    fn submit_guarded(
+        &self,
+        pane: &str,
+        harness: &str,
+        text: &str,
+        terminal: &dyn GuardedInput,
+        runtime: &dyn agent::AgentRuntime,
+    ) -> crate::error::Result<Submission> {
+        crate::submission::submit_verified(
+            &GuardedPrompt(terminal),
+            pane,
+            harness,
+            text,
+            SubmitTimeouts::default(),
+            runtime,
+        )
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -1068,6 +1496,15 @@ struct AgentRecord {
     custom_process_identity: Option<CustomProcessIdentity>,
     #[serde(default)]
     foreign_shell_identity: Option<CustomProcessIdentity>,
+    /// Herdr terminal the pane held when agentctl anchored this record.
+    #[serde(default)]
+    terminal_id: Option<String>,
+    /// Kernel identity of the harness process anchored at start, adopt or anchor.
+    #[serde(default)]
+    harness_identity: Option<CustomProcessIdentity>,
+    /// Earlier names, oldest first.
+    #[serde(default)]
+    name_history: Vec<NameHistoryEntry>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     agentcloud: Option<cloud::CloudRecord>,
     #[serde(flatten)]
@@ -1237,6 +1674,24 @@ impl AgentRecord {
         {
             return Err(fail(format!("invalid agent record: {}", path.display())));
         }
+        if self.terminal_id.as_deref().is_some_and(|terminal| {
+            terminal.is_empty() || terminal.len() > 128 || !terminal.is_ascii()
+        }) {
+            return Err(fail(format!("invalid terminal id in {}", path.display())));
+        }
+        if self
+            .harness_identity
+            .as_ref()
+            .is_some_and(|identity| !identity.valid())
+        {
+            return Err(fail(format!(
+                "invalid harness identity in {}",
+                path.display()
+            )));
+        }
+        if !valid_name_history(&self.name_history) {
+            return Err(fail(format!("invalid name history in {}", path.display())));
+        }
         Ok(())
     }
 
@@ -1404,6 +1859,246 @@ impl<A: ManagedApi + ?Sized> WorkspaceClient<'_, A> {
     }
 }
 
+impl<'a, A: ManagedApi + ?Sized> WorkspaceClient<'a, A> {
+    /// A terminal that verifies this record's recipient around every input effect.
+    ///
+    /// When the server advertises `input-expect` and the record pins a terminal, each write
+    /// also carries that terminal so Herdr refuses it atomically if the pane holds another.
+    fn guarded<'w>(
+        &'w self,
+        runtime: &'w dyn agent::AgentRuntime,
+    ) -> crate::error::Result<GuardedTerminal<'w, 'a, A>> {
+        let expect_terminal = match self.record.terminal_id.as_deref() {
+            Some(terminal) => match self.client.input_expect_supported() {
+                Ok(true) => Some(terminal.to_owned()),
+                Ok(false) => None,
+                Err(error) => {
+                    return Err(AdapterError::not_staged(format!(
+                    "cannot read the Herdr server's input capabilities: {error}; nothing was typed"
+                )))
+                }
+            },
+            None => None,
+        };
+        Ok(GuardedTerminal {
+            workspace: self,
+            runtime,
+            expect_terminal,
+            effects: Cell::new(0),
+        })
+    }
+
+    /// Prove that the pane still holds this record's recipient; called around each effect.
+    ///
+    /// `presentation = false` skips only the tab label and the Herdr name lookup, for
+    /// repairing them.
+    fn verify_recipient(&self, pane_id: &str, presentation: bool) -> crate::error::Result<()> {
+        let record = self.record;
+        if Some(pane_id) != record.pane_id.as_deref() {
+            return Err(AdapterError::recipient_changed(format!(
+                "refusing input to pane {pane_id}: agent '{}' owns {}",
+                record.name,
+                record.pane_id.as_deref().unwrap_or("None")
+            )));
+        }
+        let mut failures = Vec::new();
+        let mut info = None;
+        let (terminal_id, tab_id) = if record.adapter == "herdr" && presentation {
+            let identity = self.client.agent_identity(&record.name)?;
+            if Some(identity.pane_id.as_str()) != record.pane_id.as_deref() {
+                failures.push(format!(
+                    "Herdr agent '{}' is in pane {}",
+                    record.name, identity.pane_id
+                ));
+            }
+            (identity.terminal_id, identity.tab_id)
+        } else {
+            let observed = self.client.pane_info(pane_id)?;
+            let identity = (observed.terminal_id.clone(), observed.tab_id.clone());
+            info = Some(observed);
+            identity
+        };
+        if record.terminal_id.is_some() && terminal_id != record.terminal_id {
+            failures.push(format!(
+                "terminal is {}, recorded {}",
+                repr(terminal_id.as_deref()),
+                repr(record.terminal_id.as_deref())
+            ));
+        }
+        if record.adapter != "herdr-foreign" {
+            if let Some(recorded_tab) = record.tab_id.as_deref() {
+                if tab_id.as_deref().is_some_and(|tab| tab != recorded_tab) {
+                    failures.push(format!(
+                        "tab is {}, recorded '{recorded_tab}'",
+                        repr(tab_id.as_deref())
+                    ));
+                }
+                let label = if presentation {
+                    self.client.tab_label(recorded_tab)?
+                } else {
+                    record.name.clone()
+                };
+                if label != record.name {
+                    failures.push(format!(
+                        "tab label is '{label}', expected '{}'",
+                        record.name
+                    ));
+                }
+            }
+        }
+        if !failures.is_empty() {
+            return Err(AdapterError::recipient_changed(format!(
+                "refusing input to agent '{}': {}; run `agentctl doctor`",
+                record.name,
+                failures.join("; ")
+            )));
+        }
+        match record.adapter.as_str() {
+            "herdr-pane" => {
+                return self.client.verify_custom_harness(
+                    pane_id,
+                    &record.harness,
+                    record.custom_process_identity.as_ref(),
+                )
+            }
+            "herdr-relay" => {
+                if record.custom_process_identity.is_none()
+                    || self.client.relay_process(pane_id)? != record.custom_process_identity
+                {
+                    return Err(AdapterError::recipient_changed(format!(
+                        "refusing input to agent '{}': its relayed harness process changed",
+                        record.name
+                    )));
+                }
+                return Ok(());
+            }
+            _ => {}
+        }
+        if let Some(identity) = record.harness_identity.as_ref() {
+            if !self.client.verify_harness_identity(pane_id, identity)? {
+                return Err(AdapterError::recipient_changed(format!(
+                    "refusing input to agent '{}': the anchored {} process (pid {}) is no longer \
+                     the foreground program of pane {pane_id}; run `agentctl doctor`",
+                    record.name, record.harness, identity.pid
+                )));
+            }
+            return Ok(());
+        }
+        // Flat schema-1 records carry only observed native sessions, never asserted ones.
+        if let Some(recorded) = record.session_value.as_deref() {
+            let observed = match info {
+                Some(info) => info.session_value,
+                None => self.client.pane_info(pane_id)?.session_value,
+            };
+            if observed.as_deref() != Some(recorded) {
+                return Err(AdapterError::recipient_changed(format!(
+                    "refusing input to agent '{}': native session is {}, recorded '{recorded}'",
+                    record.name,
+                    repr(observed.as_deref())
+                )));
+            }
+            return Ok(());
+        }
+        Err(AdapterError::recipient_changed(format!(
+            "refusing input to agent '{}': its record pins no harness process or observed native \
+             session, so a replacement in the same pane could not be told apart; check that pane \
+             {pane_id} runs the intended agent, then run `agentctl anchor {}`",
+            record.name, record.name
+        )))
+    }
+}
+
+/// Verifies the recipient immediately before and immediately after every input effect.
+///
+/// When the server advertises `input-expect` and the record pins a terminal, each write also
+/// carries that terminal, and Herdr refuses it atomically if the pane holds another terminal.
+/// Without that capability Herdr writes by pane id alone: a replacement that takes the pane
+/// between the last check and Herdr's write still receives that one effect. Either way a
+/// program exiting or exec-ing inside the same terminal is outside Herdr's pane table, so the
+/// process check runs before and after every effect, and a mismatch after a write becomes a
+/// quarantined probable misroute.
+struct GuardedTerminal<'w, 'a, A: ManagedApi + ?Sized> {
+    workspace: &'w WorkspaceClient<'a, A>,
+    runtime: &'w dyn agent::AgentRuntime,
+    expect_terminal: Option<String>,
+    effects: Cell<u32>,
+}
+
+impl<A: ManagedApi + ?Sized> GuardedTerminal<'_, '_, A> {
+    fn refused(&self, pane_id: &str, error: &AdapterError) -> AdapterError {
+        if self.effects.get() == 0 {
+            AdapterError::not_staged(format!("{error}; nothing was typed"))
+        } else {
+            AdapterError::recipient_changed(format!(
+                "{error}; input already typed into pane {pane_id} stopped here"
+            ))
+        }
+    }
+
+    fn effect(
+        &self,
+        pane_id: &str,
+        action: impl FnOnce() -> crate::error::Result<()>,
+    ) -> crate::error::Result<()> {
+        if let Err(error) = self.workspace.verify_recipient(pane_id, true) {
+            return Err(self.refused(pane_id, &error));
+        }
+        if let Err(error) = action() {
+            return Err(if error.kind() == AdapterErrorKind::ExpectationFailed {
+                self.refused(pane_id, &error)
+            } else {
+                error
+            });
+        }
+        self.effects.set(self.effects.get().saturating_add(1));
+        self.workspace
+            .verify_recipient(pane_id, true)
+            .map_err(|error| {
+                AdapterError::probable_misroute(format!(
+                    "pane {pane_id} failed its recipient check immediately after input: {error}"
+                ))
+            })
+    }
+}
+
+impl<A: ManagedApi + ?Sized> GuardedInput for GuardedTerminal<'_, '_, A> {
+    fn read_screen(&self, pane_id: &str) -> crate::error::Result<String> {
+        self.workspace
+            .client
+            .read_screen_with_runtime(pane_id, self.runtime)
+    }
+    fn send_text(&self, pane_id: &str, text: &str) -> crate::error::Result<()> {
+        self.effect(pane_id, || {
+            self.workspace.client.send_text_expect(
+                pane_id,
+                text,
+                self.expect_terminal.as_deref(),
+                self.runtime,
+            )
+        })
+    }
+    fn send_keys(&self, pane_id: &str, keys: &str) -> crate::error::Result<()> {
+        self.effect(pane_id, || {
+            self.workspace.client.send_keys_expect(
+                pane_id,
+                keys,
+                self.expect_terminal.as_deref(),
+                self.runtime,
+            )
+        })
+    }
+    fn native_prompt(&self, pane_id: &str, text: &str) -> crate::error::Result<()> {
+        self.effect(pane_id, || {
+            self.workspace.client.agent_prompt_expect(
+                pane_id,
+                text,
+                self.expect_terminal.as_deref(),
+                self.runtime,
+            )
+        })
+    }
+}
+
 impl<A: ManagedApi + ?Sized> AgentApi for WorkspaceClient<'_, A> {
     fn panes(&self) -> crate::error::Result<Vec<Pane>> {
         Ok(self
@@ -1505,8 +2200,10 @@ impl<A: ManagedApi + ?Sized> AgentApi for WorkspaceClient<'_, A> {
         if self.record.adapter == "herdr-relay" {
             return self.relay_refuses_raw_input(text);
         }
+        let runtime = agent::SystemRuntime::default();
+        let guarded = self.guarded(&runtime)?;
         if self.record.adapter != "herdr-pane" {
-            return self.client.run(pane_id, text);
+            return guarded.native_prompt(pane_id, text);
         }
         if text.contains(['\0', '\u{1b}']) {
             return Err(crate::error::AdapterError::unavailable(
@@ -1520,7 +2217,7 @@ impl<A: ManagedApi + ?Sized> AgentApi for WorkspaceClient<'_, A> {
             )));
         }
         let before = self.client.read(pane_id, "visible", Some(200))?;
-        self.client.send_text(
+        guarded.send_text(
             pane_id,
             &format!("{BRACKETED_PASTE_START}{text}{BRACKETED_PASTE_END}"),
         )?;
@@ -1544,12 +2241,8 @@ impl<A: ManagedApi + ?Sized> AgentApi for WorkspaceClient<'_, A> {
                 Duration::from_millis(50).min(deadline.saturating_duration_since(Instant::now())),
             );
         };
-        self.client.verify_custom_harness(
-            pane_id,
-            &self.record.harness,
-            self.record.custom_process_identity.as_ref(),
-        )?;
-        self.client.send_keys(pane_id, "Enter")?;
+        // The guard verifies the pinned Muse process immediately around the Enter.
+        guarded.send_keys(pane_id, "Enter")?;
         *self
             .custom_submission
             .lock()
@@ -1630,7 +2323,8 @@ impl<A: ManagedApi + ?Sized> AgentApi for WorkspaceClient<'_, A> {
         self.pane_info(pane_id)?;
         let screen = self.client.read(pane_id, "visible", Some(200))?;
         if goal_replacement_selected(&screen, &objective) {
-            self.client.send_keys(pane_id, "Enter")?;
+            let runtime = agent::SystemRuntime::default();
+            self.guarded(&runtime)?.send_keys(pane_id, "Enter")?;
         }
         let elapsed = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
         self.client
@@ -1778,8 +2472,9 @@ impl<A: ManagedApi + ?Sized> AgentApi for WorkspaceClient<'_, A> {
         if self.record.adapter == "herdr-relay" {
             return self.relay_refuses_raw_input(text);
         }
+        let guarded = self.guarded(runtime)?;
         if self.record.adapter != "herdr-pane" {
-            return self.client.run_with_runtime(pane_id, text, runtime);
+            return guarded.native_prompt(pane_id, text);
         }
         if text.contains(['\0', '\u{1b}']) {
             return Err(crate::error::AdapterError::unavailable(
@@ -1795,10 +2490,9 @@ impl<A: ManagedApi + ?Sized> AgentApi for WorkspaceClient<'_, A> {
         let before = self
             .client
             .read_with_runtime(pane_id, "visible", Some(200), runtime)?;
-        self.client.send_text_with_runtime(
+        guarded.send_text(
             pane_id,
             &format!("{BRACKETED_PASTE_START}{text}{BRACKETED_PASTE_END}"),
-            runtime,
         )?;
         let deadline = Instant::now() + Duration::from_secs(2);
         let staged = loop {
@@ -1828,14 +2522,8 @@ impl<A: ManagedApi + ?Sized> AgentApi for WorkspaceClient<'_, A> {
                 Duration::from_millis(50).min(deadline.saturating_duration_since(Instant::now())),
             );
         };
-        self.client.verify_custom_harness_with_runtime(
-            pane_id,
-            &self.record.harness,
-            self.record.custom_process_identity.as_ref(),
-            runtime,
-        )?;
-        self.client
-            .send_keys_with_runtime(pane_id, "Enter", runtime)?;
+        // The guard verifies the pinned Muse process immediately around the Enter.
+        guarded.send_keys(pane_id, "Enter")?;
         *self
             .custom_submission
             .lock()
@@ -1877,8 +2565,17 @@ impl<A: ManagedApi + ?Sized> AgentApi for WorkspaceClient<'_, A> {
                     self.record.harness
                 )));
             }
+            let guarded = self.guarded(runtime)?;
+            return self.client.submit_guarded(
+                pane_id,
+                &self.record.harness,
+                text,
+                &guarded,
+                runtime,
+            );
         }
-        self.client.submit_with_runtime(pane_id, text, runtime)
+        let guarded = self.guarded(runtime)?;
+        self.client.prompt_guarded(pane_id, text, &guarded, runtime)
     }
 
     fn wait_agent_status_with_runtime(
@@ -1965,8 +2662,7 @@ impl<A: ManagedApi + ?Sized> AgentApi for WorkspaceClient<'_, A> {
             .client
             .read_with_runtime(pane_id, "visible", Some(200), runtime)?;
         if goal_replacement_selected(&screen, &objective) {
-            self.client
-                .send_keys_with_runtime(pane_id, "Enter", runtime)?;
+            self.guarded(runtime)?.send_keys(pane_id, "Enter")?;
         }
         let elapsed = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
         self.client.wait_agent_status_with_runtime(
@@ -2628,8 +3324,15 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
     }
 
     fn load(&self, agent_name: &str) -> Result<AgentRecord> {
-        let directory = self.directory(agent_name)?;
+        self.directory(agent_name)?;
         agent::validate_private_directory(&self.registry, "agent registry", false)?;
+        self.refuse_pending_rename(&[agent_name])?;
+        self.read_record(agent_name)
+    }
+
+    /// Read and validate one record without consulting rename journals.
+    fn read_record(&self, agent_name: &str) -> Result<AgentRecord> {
+        let directory = self.directory(agent_name)?;
         if !directory.exists() {
             return Err(fail(format!(
                 "unknown agent {agent_name:?}; use list to inspect the registry"
@@ -2876,6 +3579,763 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
         }
     }
 
+    /// A recipient checker for one record, with no queue or workspace policy.
+    fn workspace_client<'b>(&'b self, record: &'b AgentRecord) -> WorkspaceClient<'b, A> {
+        WorkspaceClient {
+            client: self.client,
+            record,
+            goal_objective: Mutex::new(None),
+            custom_submission: Mutex::new(None),
+            queue: None,
+            check_prompt: false,
+            expected_workspace: None,
+        }
+    }
+
+    /// Pin the terminal and harness process of a pane this command just verified.
+    ///
+    /// Used only where agentctl itself launched the program, so the pinned identity is the
+    /// intended recipient rather than whatever is visible now.
+    fn anchor_fresh(&self, record: &mut AgentRecord, terminal_id: Option<String>) -> Result<()> {
+        record.terminal_id = terminal_id;
+        if matches!(record.adapter.as_str(), "herdr" | "herdr-foreign") {
+            if let Some(pane) = record.pane_id.clone() {
+                record.harness_identity = self.client.harness_identity(&pane)?;
+            }
+        }
+        if let Some(pane) = record.pane_id.as_deref() {
+            if let Some(owner) =
+                self.claim_owner(pane, record.terminal_id.as_deref(), Some(&record.name))?
+            {
+                return Err(fail(format!(
+                    "pane {pane} is already registered as '{}'",
+                    owner.name
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    /// After a verified move, keep the terminal anchor only while the harness still matches.
+    ///
+    /// A cross-workspace move may give the pane a new terminal id. The move itself proved the
+    /// managed name followed the pane; the pinned harness process must also still be its
+    /// foreground program before the new terminal is recorded.
+    fn repin_moved_terminal(&self, record: &mut AgentRecord) -> Result<()> {
+        let (Some(pane), Some(recorded)) = (record.pane_id.clone(), record.terminal_id.clone())
+        else {
+            return Ok(());
+        };
+        let terminal = self.client.pane_info(&pane)?.terminal_id;
+        if terminal.as_deref() == Some(recorded.as_str()) {
+            return Ok(());
+        }
+        let harness_matches = match record.harness_identity.as_ref() {
+            Some(identity) => self.client.verify_harness_identity(&pane, identity)?,
+            None => false,
+        };
+        record.terminal_id = if harness_matches { terminal } else { None };
+        Ok(())
+    }
+
+    /// Return another active record that claims this pane or terminal.
+    fn claim_owner(
+        &self,
+        pane_id: &str,
+        terminal_id: Option<&str>,
+        exclude: Option<&str>,
+    ) -> Result<Option<AgentRecord>> {
+        if !self.registry.exists() {
+            return Ok(None);
+        }
+        for entry in fs::read_dir(&self.registry).map_err(|error| fail(error.to_string()))? {
+            let entry = entry.map_err(|error| fail(error.to_string()))?;
+            let existing_name = entry.file_name().to_string_lossy().into_owned();
+            if name(&existing_name).is_err() || Some(existing_name.as_str()) == exclude {
+                continue;
+            }
+            let Ok(other) = self.load(&existing_name) else {
+                continue;
+            };
+            if matches!(other.lifecycle.as_str(), "stopped" | "launch_failed") {
+                continue;
+            }
+            if other.pane_id.as_deref() == Some(pane_id)
+                || terminal_id
+                    .is_some_and(|terminal| other.terminal_id.as_deref() == Some(terminal))
+            {
+                return Ok(Some(other));
+            }
+        }
+        Ok(None)
+    }
+
+    fn renames_directory(&self) -> PathBuf {
+        self.registry.join(".renames")
+    }
+
+    /// Read every pending rename journal; an unreadable one refuses.
+    fn rename_journals(&self) -> Result<Vec<RenameJournal>> {
+        let directory = self.renames_directory();
+        if !directory.exists() {
+            return Ok(Vec::new());
+        }
+        agent::validate_private_directory(&directory, "rename journal directory", false)?;
+        let mut paths = fs::read_dir(&directory)
+            .map_err(|error| fail(error.to_string()))?
+            .map(|entry| entry.map(|entry| entry.path()))
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|error| fail(error.to_string()))?;
+        paths.sort();
+        let mut journals = Vec::new();
+        for path in paths {
+            let file_name = path
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            if file_name.starts_with('.') {
+                continue; // an atomic writer's temporary file
+            }
+            if !file_name.ends_with(".json") {
+                return Err(fail(format!(
+                    "unexpected entry in rename journal directory: {}",
+                    path.display()
+                )));
+            }
+            let value = agent::read_private_json(&path)?;
+            journals.push(RenameJournal::parse(&value, &path)?);
+        }
+        Ok(journals)
+    }
+
+    /// Refuse any of `names` while a rename journal reserves it.
+    fn refuse_pending_rename(&self, names: &[&str]) -> Result<()> {
+        if let Some(journal) = self
+            .rename_journals()?
+            .into_iter()
+            .find(|journal| journal.names(names))
+        {
+            return Err(fail(format!(
+                "rename of '{}' to '{}' is incomplete; rerun `agentctl rename {} {}`",
+                journal.old, journal.new, journal.old, journal.new
+            )));
+        }
+        Ok(())
+    }
+
+    fn write_rename_journal(&self, journal: &RenameJournal) -> Result<()> {
+        let directory = self.renames_directory();
+        if !directory.exists() {
+            DirBuilder::new()
+                .mode(0o700)
+                .create(&directory)
+                .map_err(|error| fail(error.to_string()))?;
+            // Publish the new directory entry before any runtime change relies on it.
+            agent::sync_directory(&self.registry)?;
+        }
+        agent::validate_private_directory(&directory, "rename journal directory", false)?;
+        let path = directory.join(format!("{}.json", journal.token));
+        if fs::symlink_metadata(&path).is_ok() {
+            return Err(fail(format!(
+                "a rename journal already exists: {}",
+                path.display()
+            )));
+        }
+        agent::atomic_json(&path, &journal.document())
+    }
+
+    fn remove_rename_journal(&self, journal: &RenameJournal) -> Result<()> {
+        let directory = self.renames_directory();
+        fs::remove_file(directory.join(format!("{}.json", journal.token)))
+            .map_err(|error| fail(format!("cannot remove rename journal: {error}")))?;
+        agent::sync_directory(&directory)
+    }
+
+    /// Hold one existing queue's delivery and binding locks, in drain's order.
+    ///
+    /// A queue is created by the first send, under the name lock the caller holds, so a
+    /// missing queue has nothing to exclude; it is never created here.
+    fn queue_locks(&self, directory_name: &str) -> Result<Vec<File>> {
+        let queue = self.directory(directory_name)?.join("queue");
+        if !queue.is_dir() {
+            return Ok(Vec::new());
+        }
+        let mut held = Vec::with_capacity(2);
+        for (lock_name, purpose) in [
+            (".delivery.lock", "queue delivery lock"),
+            (".binding.lock", "queue binding lock"),
+        ] {
+            let lock = agent::open_private_lock(&queue.join(lock_name), purpose)?;
+            lock.lock_exclusive()
+                .map_err(|error| fail(format!("cannot take {purpose}: {error}")))?;
+            held.push(lock);
+        }
+        Ok(held)
+    }
+
+    /// Pin the terminal and harness process an operator has confirmed for NAME.
+    pub fn anchor(&self, agent_name: &str, replace: bool) -> Result<Value> {
+        let _lock = self.lock(agent_name)?;
+        let _identity_lock = self.identity_lock()?;
+        let mut record = self.load(agent_name)?;
+        if !matches!(record.adapter.as_str(), "herdr" | "herdr-foreign") {
+            return Err(fail(
+                "anchor applies to native and adopted Herdr agents; custom panes pin their process at launch",
+            ));
+        }
+        let Some(pane) = record.pane_id.clone() else {
+            return Err(fail(format!("agent '{agent_name}' has no confirmed pane")));
+        };
+        let _pane_lock = self.pane_lock(&pane)?;
+        let info = self.checked(&record)?;
+        let Some(harness) = self.client.harness_identity(&pane)? else {
+            return Err(fail(format!(
+                "cannot pin the foreground {} process of pane {pane}; is the harness running in the foreground?",
+                record.harness
+            )));
+        };
+        let changed = record
+            .terminal_id
+            .as_ref()
+            .is_some_and(|terminal| Some(terminal) != info.terminal_id.as_ref())
+            || record
+                .harness_identity
+                .as_ref()
+                .is_some_and(|identity| *identity != harness);
+        if changed && !replace {
+            return Err(fail(format!(
+                "agent '{agent_name}' is anchored to a different terminal or harness process, so the pane may hold another program; inspect it, then rerun with --replace"
+            )));
+        }
+        if let Some(owner) =
+            self.claim_owner(&pane, info.terminal_id.as_deref(), Some(agent_name))?
+        {
+            return Err(fail(format!(
+                "pane {pane} is already registered as '{}'",
+                owner.name
+            )));
+        }
+        let previous = json!({
+            "terminal_id": record.terminal_id,
+            "harness_pid": record.harness_identity.as_ref().map(|identity| identity.pid),
+        });
+        record.terminal_id = info.terminal_id;
+        record.harness_identity = Some(harness.clone());
+        self.save(&record)?;
+        Ok(json!({
+            "name": agent_name,
+            "pane_id": pane,
+            "terminal_id": record.terminal_id,
+            "harness_pid": harness.pid,
+            "replaced": changed,
+            "previous": previous,
+        }))
+    }
+
+    /// Rename a live agent: registry entry, Herdr agent name and tab label together.
+    pub fn rename(&self, old: &str, new: &str) -> Result<Value> {
+        name(old)?;
+        name(new)?;
+        if old == new {
+            return Err(fail("rename needs two different names"));
+        }
+        let (first, second) = if old < new { (old, new) } else { (new, old) };
+        let _first = self.lock(first)?;
+        let _second = self.lock(second)?;
+        let _identity_lock = self.identity_lock()?;
+        let pending: Vec<RenameJournal> = self
+            .rename_journals()?
+            .into_iter()
+            .filter(|journal| journal.names(&[old, new]))
+            .collect();
+        if let Some(found) = pending.first() {
+            if pending.len() != 1 || found.old != old || found.new != new {
+                return Err(fail(format!(
+                    "rename of '{}' to '{}' is incomplete; rerun exactly `agentctl rename {} {}`",
+                    found.old, found.new, found.old, found.new
+                )));
+            }
+            return self.finish_rename(found, true);
+        }
+        let record = self.load(old)?;
+        if !matches!(record.adapter.as_str(), "herdr" | "herdr-foreign")
+            || record.lifecycle != "running"
+        {
+            return Err(fail(
+                "rename supports running native and adopted Herdr agents",
+            ));
+        }
+        let (Some(pane), Some(tab)) = (record.pane_id.clone(), record.tab_id.clone()) else {
+            return Err(fail(format!("agent '{old}' has no confirmed pane and tab")));
+        };
+        if record.harness_identity.is_none() && record.session_value.is_none() {
+            return Err(fail(format!(
+                "agent '{old}' pins no harness process or observed session; check its pane, run `agentctl anchor {old}`, then rename"
+            )));
+        }
+        if self.read_move_intent(&record)?.is_some() {
+            return Err(fail(format!(
+                "move of '{old}' is incomplete; rerun `agentctl move {old}`"
+            )));
+        }
+        if fs::symlink_metadata(self.directory(new)?).is_ok() {
+            return Err(fail(format!("agent '{new}' is already registered")));
+        }
+        let journal = RenameJournal {
+            token: record.token.clone(),
+            old: old.to_owned(),
+            new: new.to_owned(),
+            adapter: record.adapter.clone(),
+            pane_id: pane.clone(),
+            tab_id: tab,
+            terminal_id: record.terminal_id.clone(),
+            workspace_id: record.workspace_id.clone(),
+            journal_id: new_journal_id()?,
+            started_at: unix_seconds(),
+        };
+        let _queue_locks = self.queue_locks(old)?;
+        let _pane_lock = self.pane_lock(&pane)?;
+        self.checked(&record)?;
+        self.workspace_client(&record)
+            .verify_recipient(&pane, true)?;
+        if self.client.agent_names()?.contains_key(new) {
+            return Err(fail(format!("a Herdr agent is already named '{new}'")));
+        }
+        if record.adapter == "herdr" {
+            if let Some(workspace) = record.workspace_id.as_deref() {
+                if self
+                    .client
+                    .tab_labels(workspace)?
+                    .values()
+                    .any(|label| label == new)
+                {
+                    return Err(fail(format!(
+                        "a tab in the workspace is already labelled '{new}'"
+                    )));
+                }
+            }
+        }
+        self.write_rename_journal(&journal)?;
+        self.complete_rename(&journal, old, record, false)
+    }
+
+    /// Complete a journalled rename after a crash, refusing any state it did not create.
+    fn finish_rename(&self, journal: &RenameJournal, recovered: bool) -> Result<Value> {
+        let old_exists = fs::symlink_metadata(self.directory(&journal.old)?).is_ok();
+        let new_exists = fs::symlink_metadata(self.directory(&journal.new)?).is_ok();
+        if old_exists == new_exists {
+            return Err(fail(format!(
+                "rename journal for '{}' -> '{}' found {} agent directories; refusing to guess",
+                journal.old,
+                journal.new,
+                if old_exists { "both" } else { "neither" }
+            )));
+        }
+        let current = if old_exists {
+            journal.old.as_str()
+        } else {
+            journal.new.as_str()
+        };
+        let directory = self.directory(current)?;
+        agent::validate_private_directory(&directory, "agent directory", false)?;
+        let path = directory.join("agent.json");
+        let raw = agent::read_private_json(&path)?;
+        let raw_name = raw.get("name").and_then(Value::as_str).unwrap_or_default();
+        let allowed: &[&str] = if old_exists {
+            &[journal.old.as_str(), journal.new.as_str()]
+        } else {
+            &[journal.new.as_str()]
+        };
+        if raw.get("token").and_then(Value::as_str) != Some(journal.token.as_str())
+            || !allowed.contains(&raw_name)
+        {
+            return Err(fail(format!(
+                "agent record {} does not match the rename journal; refusing to guess",
+                path.display()
+            )));
+        }
+        let record: AgentRecord = serde_json::from_value(raw.clone())
+            .map_err(|error| fail(format!("invalid agent record {}: {error}", path.display())))?;
+        record.validate_loaded(&path, raw_name)?;
+        let _queue_locks = self.queue_locks(current)?;
+        let _pane_lock = self.pane_lock(&journal.pane_id)?;
+        self.complete_rename(journal, current, record, recovered)
+    }
+
+    /// Run the remaining rename steps; every step checks its own state first.
+    fn complete_rename(
+        &self,
+        journal: &RenameJournal,
+        current: &str,
+        mut record: AgentRecord,
+        recovered: bool,
+    ) -> Result<Value> {
+        let (old, new) = (journal.old.as_str(), journal.new.as_str());
+        let (pane, tab) = (journal.pane_id.as_str(), journal.tab_id.as_str());
+        let live = self
+            .client
+            .panes()?
+            .iter()
+            .any(|entry| entry.pane_id == pane);
+        let mut herdr_steps = "skipped-pane-missing";
+        if live {
+            self.verify_rename_recipient(&record, journal)?;
+            if journal.adapter == "herdr" {
+                let names = self.client.agent_names()?;
+                if names.get(new).map(String::as_str) != Some(pane) {
+                    if names.get(old).map(String::as_str) != Some(pane) {
+                        return Err(fail(format!(
+                            "pane {pane} is named neither '{old}' nor '{new}' in Herdr; refusing"
+                        )));
+                    }
+                    self.client.rename_agent(pane, new)?;
+                }
+                let label = self.client.tab_label(tab)?;
+                if label != new {
+                    if label != old {
+                        return Err(fail(format!(
+                            "tab {tab} is labelled '{label}', neither '{old}' nor '{new}'; refusing"
+                        )));
+                    }
+                    self.client.rename_tab(tab, new)?;
+                }
+            }
+            herdr_steps = "done";
+        }
+        let recorded_once = record
+            .name_history
+            .iter()
+            .any(|entry| entry.journal_id == journal.journal_id);
+        if current == old {
+            record.name = new.to_owned();
+            if !recorded_once {
+                record.name_history.push(NameHistoryEntry {
+                    name: old.to_owned(),
+                    renamed_at: journal.started_at,
+                    journal_id: journal.journal_id.clone(),
+                });
+            }
+            // The renamed content is published inside OLD first, so a crash before the move
+            // leaves a record a rerun recognises by its token and journal id.
+            agent::atomic_json(&self.directory(old)?.join("agent.json"), &json!(record))?;
+            let registry = OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_DIRECTORY | libc::O_CLOEXEC)
+                .open(&self.registry)
+                .map_err(|error| fail(format!("cannot open agent registry: {error}")))?;
+            #[cfg(test)]
+            if FAIL_RENAME_DIRECTORY_MOVE.with(|fail_once| fail_once.replace(false)) {
+                return Err(fail("simulated crash before the directory move"));
+            }
+            rename_directory_noreplace_at(&registry, old, &registry, new).map_err(|error| {
+                fail(format!(
+                    "cannot move agent directory '{old}' to '{new}': {error}"
+                ))
+            })?;
+            registry
+                .sync_all()
+                .map_err(|error| fail(format!("cannot sync agent registry: {error}")))?;
+        } else if !recorded_once {
+            return Err(fail(format!(
+                "agent '{new}' was moved without its rename history; refusing to guess"
+            )));
+        }
+        self.remove_rename_journal(journal)?;
+        Ok(json!({
+            "name": new,
+            "previous_name": old,
+            "token": record.token,
+            "pane_id": pane,
+            "recovered": recovered,
+            "herdr_steps": herdr_steps,
+            "external_references": format!(
+                "wrkslots slots, chat bindings and scheduled prompts that name '{old}' are not changed by agentctl"
+            ),
+        }))
+    }
+
+    /// Every non-presentation anchor must hold; only the name and label may be OLD or NEW.
+    fn verify_rename_recipient(&self, record: &AgentRecord, journal: &RenameJournal) -> Result<()> {
+        let pane = journal.pane_id.as_str();
+        let info = self.client.pane_info(pane)?;
+        let mut failures = Vec::new();
+        if Some(&info.workspace_id) != record.workspace_id.as_ref() {
+            failures.push(format!(
+                "workspace is '{}', recorded {}",
+                info.workspace_id,
+                repr(record.workspace_id.as_deref())
+            ));
+        }
+        let real = |path: &str| fs::canonicalize(path).unwrap_or_else(|_| PathBuf::from(path));
+        if real(&info.cwd) != real(&record.cwd) {
+            failures.push(format!("cwd is '{}', recorded '{}'", info.cwd, record.cwd));
+        }
+        if info.agent.as_deref() != Some(record.harness.as_str()) {
+            failures.push(format!(
+                "harness is {}, recorded '{}'",
+                repr(info.agent.as_deref()),
+                record.harness
+            ));
+        }
+        if journal.terminal_id.is_some() && info.terminal_id != journal.terminal_id {
+            failures.push(format!(
+                "terminal is {}, recorded {}",
+                repr(info.terminal_id.as_deref()),
+                repr(journal.terminal_id.as_deref())
+            ));
+        }
+        if info
+            .tab_id
+            .as_deref()
+            .is_some_and(|tab| tab != journal.tab_id)
+        {
+            failures.push(format!(
+                "tab is {}, recorded '{}'",
+                repr(info.tab_id.as_deref()),
+                journal.tab_id
+            ));
+        }
+        if let Some(identity) = record.harness_identity.as_ref() {
+            if !self.client.verify_harness_identity(pane, identity)? {
+                failures
+                    .push("the anchored harness process is no longer in the foreground".to_owned());
+            }
+        } else if record.session_value.is_none() || info.session_value != record.session_value {
+            failures.push("no anchored harness process or matching observed session".to_owned());
+        }
+        if !failures.is_empty() {
+            return Err(fail(format!(
+                "refusing to rename pane {pane}: {}",
+                failures.join("; ")
+            )));
+        }
+        Ok(())
+    }
+
+    /// Compare every registry record with live Herdr state; read-only unless repairing labels.
+    pub fn doctor(&self, repair_labels: bool) -> Result<Value> {
+        let mut rows = Vec::new();
+        let mut registry_findings = Vec::new();
+        let journals = match self.rename_journals() {
+            Ok(journals) => journals,
+            Err(error) => {
+                registry_findings.push(json!({
+                    "finding": "rename-journal-unreadable",
+                    "detail": error.to_string(),
+                }));
+                Vec::new()
+            }
+        };
+        let journal_names: BTreeSet<&str> = journals
+            .iter()
+            .flat_map(|journal| [journal.old.as_str(), journal.new.as_str()])
+            .collect();
+        let mut records = Vec::new();
+        if self.registry.exists() {
+            let mut names = fs::read_dir(&self.registry)
+                .map_err(|error| fail(error.to_string()))?
+                .map(|entry| entry.map(|entry| entry.file_name().to_string_lossy().into_owned()))
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .map_err(|error| fail(error.to_string()))?;
+            names.retain(|value| name(value).is_ok());
+            names.sort();
+            for agent_name in names {
+                match self.read_record(&agent_name) {
+                    Ok(record) => records.push(record),
+                    Err(error) => rows.push(json!({
+                        "name": agent_name,
+                        "findings": [if journal_names.contains(agent_name.as_str()) {
+                            "rename-incomplete"
+                        } else {
+                            "record-unreadable"
+                        }],
+                        "detail": error.to_string(),
+                    })),
+                }
+            }
+        }
+        let panes: BTreeMap<String, Pane> = self
+            .client
+            .panes()?
+            .into_iter()
+            .map(|pane| (pane.pane_id.clone(), pane))
+            .collect();
+        let agent_names = self.client.agent_names()?;
+        let workspaces: BTreeSet<&str> = records
+            .iter()
+            .filter_map(|record| record.workspace_id.as_deref())
+            .filter(|workspace| !workspace.is_empty())
+            .collect();
+        let mut labels = BTreeMap::new();
+        for workspace in workspaces {
+            labels.extend(self.client.tab_labels(workspace)?);
+        }
+        let mut claims: BTreeMap<&str, usize> = BTreeMap::new();
+        for record in &records {
+            for key in [record.pane_id.as_deref(), record.terminal_id.as_deref()]
+                .into_iter()
+                .flatten()
+            {
+                *claims.entry(key).or_default() += 1;
+            }
+        }
+        for record in &records {
+            let mut findings = self.doctor_findings(record, &panes, &agent_names, &labels)?;
+            if journal_names.contains(record.name.as_str()) {
+                findings.push("rename-incomplete");
+            }
+            if [record.pane_id.as_deref(), record.terminal_id.as_deref()]
+                .into_iter()
+                .flatten()
+                .any(|key| claims.get(key).copied().unwrap_or(0) > 1)
+            {
+                findings.push("duplicate-claim");
+            }
+            let mut row = json!({
+                "name": record.name,
+                "adapter": record.adapter,
+                "pane_id": record.pane_id,
+                "findings": findings,
+            });
+            if repair_labels
+                && !findings.is_empty()
+                && findings
+                    .iter()
+                    .all(|finding| matches!(*finding, "label-mismatch" | "herdr-name-mismatch"))
+                && record.adapter == "herdr"
+                && journals.is_empty()
+            {
+                row["repaired"] = json!(self.repair_presentation(&record.name)?);
+            }
+            rows.push(row);
+        }
+        let registered: BTreeSet<&str> =
+            records.iter().map(|record| record.name.as_str()).collect();
+        let mut workspace_findings = Vec::new();
+        for (tab_id, label) in &labels {
+            let owner = records
+                .iter()
+                .find(|record| record.tab_id.as_deref() == Some(tab_id.as_str()));
+            let finding = match owner {
+                Some(owner) if registered.contains(label.as_str()) && *label != owner.name => {
+                    Some("label-collision")
+                }
+                Some(_) => None,
+                None if registered.contains(label.as_str()) => Some("label-collision"),
+                None => Some("unmanaged-tab"),
+            };
+            if let Some(finding) = finding {
+                workspace_findings.push(json!({
+                    "finding": finding,
+                    "tab_id": tab_id,
+                    "label": label,
+                }));
+            }
+        }
+        let clean = registry_findings.is_empty()
+            && rows.iter().all(|row| {
+                row["findings"].as_array().is_some_and(Vec::is_empty) || row["repaired"] == true
+            })
+            && workspace_findings
+                .iter()
+                .all(|item| item["finding"] == "unmanaged-tab");
+        Ok(json!({
+            "clean": clean,
+            "records": rows,
+            "registry": registry_findings,
+            "workspace": workspace_findings,
+            "journals": journals
+                .iter()
+                .map(|journal| json!({"old": journal.old, "new": journal.new}))
+                .collect::<Vec<_>>(),
+        }))
+    }
+
+    fn doctor_findings(
+        &self,
+        record: &AgentRecord,
+        panes: &BTreeMap<String, Pane>,
+        agent_names: &BTreeMap<String, String>,
+        labels: &BTreeMap<String, String>,
+    ) -> Result<Vec<&'static str>> {
+        let Some(pane) = record
+            .pane_id
+            .as_deref()
+            .filter(|pane| panes.contains_key(*pane))
+        else {
+            return Ok(vec!["pane-missing"]);
+        };
+        if record.is_cloud() {
+            // An agentcloud tab runs agentterm, not a Herdr-detected harness.
+            return Ok(Vec::new());
+        }
+        let mut findings = Vec::new();
+        let info = self.client.pane_info(pane)?;
+        if Some(&info.workspace_id) != record.workspace_id.as_ref() {
+            findings.push("workspace-mismatch");
+        }
+        if record.terminal_id.is_some() && info.terminal_id != record.terminal_id {
+            findings.push("terminal-mismatch");
+        }
+        if record.adapter != "herdr-foreign" {
+            if let Some(tab) = record.tab_id.as_deref() {
+                if panes[pane].tab_id != tab {
+                    findings.push("tab-moved");
+                }
+                if labels.get(tab) != Some(&record.name) {
+                    findings.push("label-mismatch");
+                }
+            }
+        }
+        if record.adapter == "herdr"
+            && agent_names.get(&record.name).map(String::as_str) != Some(pane)
+        {
+            findings.push("herdr-name-mismatch");
+        }
+        match info.agent.as_deref() {
+            None => findings.push("harness-exited"),
+            Some(agent) if agent != record.harness => findings.push("harness-kind-mismatch"),
+            Some(_) => {}
+        }
+        if let Some(identity) = record.harness_identity.as_ref() {
+            if !self.client.verify_harness_identity(pane, identity)? {
+                findings.push("harness-replaced");
+            }
+        } else if matches!(record.adapter.as_str(), "herdr" | "herdr-foreign")
+            && record.session_value.is_none()
+        {
+            findings.push("unanchored");
+        }
+        Ok(findings)
+    }
+
+    /// Restore one owned agent's label and Herdr name when every other anchor holds.
+    fn repair_presentation(&self, agent_name: &str) -> Result<bool> {
+        let _lock = self.lock(agent_name)?;
+        let _identity_lock = self.identity_lock()?;
+        let record = self.load(agent_name)?;
+        let (Some(pane), Some(tab)) = (record.pane_id.clone(), record.tab_id.clone()) else {
+            return Ok(false);
+        };
+        let _queue_locks = self.queue_locks(agent_name)?;
+        let _pane_lock = self.pane_lock(&pane)?;
+        let guard = self.workspace_client(&record);
+        if guard.verify_recipient(&pane, false).is_err() {
+            return Ok(false);
+        }
+        let names = self.client.agent_names()?;
+        match names.get(agent_name) {
+            Some(owner) if *owner != pane => return Ok(false),
+            Some(_) => {}
+            None => self.client.rename_agent(&pane, agent_name)?,
+        }
+        if self.client.tab_label(&tab)? != agent_name {
+            self.client.rename_tab(&tab, agent_name)?;
+        }
+        guard.verify_recipient(&pane, true)?;
+        Ok(true)
+    }
+
     /// Read durable metadata even if Herdr is unreachable.
     pub fn get(&self, agent_name: &str) -> Result<Value> {
         Ok(json!(self.load(agent_name)?))
@@ -3053,6 +4513,7 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
             }
         }
         let directory = self.directory(agent_name)?;
+        self.refuse_pending_rename(&[agent_name])?;
         if fs::symlink_metadata(&directory).is_ok() {
             return Err(fail(format!(
                 "agent {agent_name:?} already registered; stop it before reusing the name"
@@ -3081,6 +4542,9 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
             pane_reported_by_agentctl: false,
             custom_process_identity: None,
             foreign_shell_identity: None,
+            terminal_id: None,
+            harness_identity: None,
+            name_history: Vec::new(),
             agentcloud: None,
             extra: BTreeMap::new(),
             name: agent_name.to_owned(),
@@ -3197,6 +4661,7 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
         // registry-wide identity transaction so simultaneous callers cannot
         // register two panes that report the same native session.
         let _identity_lock = self.identity_lock()?;
+        self.refuse_pending_rename(&[agent_name])?;
         let (_target_lock, info) = agent::lock_resolved_target(self.client, &target)?;
         match (&info.session_agent, &info.session_value) {
             (None, None) => {}
@@ -3274,7 +4739,8 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
                     == info.session_agent.as_deref().unwrap_or("")
                 && (other.session_value == info.session_value
                     || other.goal_session_id == info.session_value);
-            if other.pane_id.as_ref() == Some(&info.pane_id) || same_session {
+            let same_terminal = info.terminal_id.is_some() && other.terminal_id == info.terminal_id;
+            if other.pane_id.as_ref() == Some(&info.pane_id) || same_session || same_terminal {
                 return Err(fail(format!(
                     "pane {:?} is already registered as {:?}",
                     options.pane_id, other.name
@@ -3322,6 +4788,15 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
                 options.pane_id
             )));
         }
+        // Adoption is the operator's explicit assertion about this program, so its harness
+        // process and terminal become the record's anchors.
+        let harness_identity = self.client.harness_identity(&confirmed.pane_id)?;
+        if confirmed.terminal_id != info.terminal_id {
+            return Err(fail(format!(
+                "refusing pane {}: terminal changed before adoption",
+                options.pane_id
+            )));
+        }
         DirBuilder::new()
             .mode(0o700)
             .create(&directory)
@@ -3339,6 +4814,9 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
             pane_reported_by_agentctl: false,
             custom_process_identity: None,
             foreign_shell_identity: Some(shell_identity.clone()),
+            terminal_id: info.terminal_id,
+            harness_identity,
+            name_history: Vec::new(),
             agentcloud: None,
             extra: BTreeMap::new(),
             name: agent_name.to_owned(),
@@ -3503,6 +4981,7 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
             },
             &self.target(record)?,
         )?;
+        let terminal_id = info.terminal_id;
         record.session_agent = info.session_agent;
         record.session_value = info.session_value;
         let owner = match (&record.session_agent, &record.session_value) {
@@ -3541,6 +5020,7 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
                 )));
             }
         }
+        self.anchor_fresh(record, terminal_id)?;
         record.lifecycle = "running".to_owned();
         self.save(record)?;
         let final_info = match agent::resolve_target(self.client, &self.target(record)?)
@@ -3888,6 +5368,7 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
             record.workspace_id = Some(destination.clone());
             record.tab_id = Some(presentation.tab_id);
             record.pane_id = Some(info.pane_id);
+            self.repin_moved_terminal(&mut record)?;
             self.save(&record)?;
             self.clear_move_intent(agent_name)?;
             let mut result = self.status_record(&record)?;
@@ -4027,6 +5508,7 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
         record.workspace_id = Some(moved.workspace_id);
         record.tab_id = Some(moved.tab_id);
         record.pane_id = Some(moved.pane_id);
+        self.repin_moved_terminal(&mut record)?;
         self.save(&record)?;
         self.clear_move_intent(agent_name)?;
         let mut result = self.status_record(&record)?;
@@ -6110,6 +7592,15 @@ pub(crate) mod tests {
                     unwrapped_empty: AtomicBool::new(false),
                     status: Mutex::new(None),
                     screen_after_run: Mutex::new(None),
+                    labels: Mutex::new(BTreeMap::new()),
+                    terminals: Mutex::new(BTreeMap::new()),
+                    harness_pids: Mutex::new(BTreeMap::new()),
+                    herdr_names: Mutex::new(BTreeMap::new()),
+                    expect_supported: AtomicBool::new(false),
+                    expected_terminals: Mutex::new(Vec::new()),
+                    replace_harness_before_effect: AtomicBool::new(false),
+                    swap_terminal_before_effect: AtomicBool::new(false),
+                    fail_rename_tab: AtomicBool::new(false),
                 },
                 root,
             }
@@ -6274,8 +7765,78 @@ pub(crate) mod tests {
         /// The text `screen` becomes once the next text is written with `run`, when set, as a
         /// typed prompt and the turn it starts push the rows above them up.
         pub(crate) screen_after_run: Mutex<Option<String>>,
+        /// Tab labels by tab id.
+        labels: Mutex<BTreeMap<String, String>>,
+        /// Terminal ids by pane, overriding the default `term-PANE`.
+        terminals: Mutex<BTreeMap<String, String>>,
+        /// Foreground harness pid per pane; a test replaces the harness by changing it.
+        harness_pids: Mutex<BTreeMap<String, u64>>,
+        /// Herdr agent names mapped to their panes.
+        herdr_names: Mutex<BTreeMap<String, String>>,
+        /// Whether the server advertises `input-expect`.
+        expect_supported: AtomicBool,
+        /// The expected terminal sent with each input effect, in order.
+        expected_terminals: Mutex<Vec<Option<String>>>,
+        /// Replace the pane's harness as the next input effect reaches it.
+        replace_harness_before_effect: AtomicBool,
+        /// Give the pane another terminal as the next input effect reaches it.
+        swap_terminal_before_effect: AtomicBool,
+        /// Whether `rename_tab` fails, as a crash inside a rename would.
+        fail_rename_tab: AtomicBool,
     }
     impl Fake {
+        fn terminal(&self, pane: &str) -> String {
+            self.terminals
+                .lock()
+                .unwrap()
+                .get(pane)
+                .cloned()
+                .unwrap_or_else(|| format!("term-{pane}"))
+        }
+
+        fn harness(pid: u64) -> CustomProcessIdentity {
+            CustomProcessIdentity {
+                version: 1,
+                boot_id: "22222222-3333-4444-5555-666666666666".to_owned(),
+                pid,
+                starttime_ticks: pid,
+                executable_device: 5,
+                executable_inode: 6,
+            }
+        }
+
+        /// One input effect reaching `pane`, refused like Herdr when the terminal differs.
+        fn effect(&self, pane: &str, expect_terminal: Option<&str>) -> AdapterResult<()> {
+            if self
+                .replace_harness_before_effect
+                .swap(false, Ordering::SeqCst)
+            {
+                self.harness_pids
+                    .lock()
+                    .unwrap()
+                    .insert(pane.to_owned(), 999);
+            }
+            if self
+                .swap_terminal_before_effect
+                .swap(false, Ordering::SeqCst)
+            {
+                self.terminals
+                    .lock()
+                    .unwrap()
+                    .insert(pane.to_owned(), "term-other".to_owned());
+            }
+            self.expected_terminals
+                .lock()
+                .unwrap()
+                .push(expect_terminal.map(str::to_owned));
+            if expect_terminal.is_some_and(|terminal| terminal != self.terminal(pane)) {
+                return Err(AdapterError::expectation_failed(format!(
+                    r#"agent prompt {pane}: {{"error":{{"code":"expectation_failed"}}}}"#
+                )));
+            }
+            Ok(())
+        }
+
         fn pane(id: &str) -> Pane {
             Pane {
                 pane_id: id.to_owned(),
@@ -6404,6 +7965,14 @@ pub(crate) mod tests {
                     .to_owned()
                 }),
                 scroll: *self.scroll.lock().unwrap(),
+                terminal_id: Some(self.terminal(pane)),
+                tab_id: self
+                    .panes
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .find(|entry| entry.pane_id == pane)
+                    .map(|entry| entry.tab_id.clone()),
             })
         }
         fn workspace_label(&self, workspace: &str) -> AdapterResult<String> {
@@ -6545,11 +8114,15 @@ pub(crate) mod tests {
         fn create_tab_with_pane(
             &self,
             workspace: &str,
-            _: &str,
+            label: &str,
             _: &str,
             environment: &[String],
         ) -> AdapterResult<(String, String)> {
             self.environments.lock().unwrap().push(environment.to_vec());
+            self.labels
+                .lock()
+                .unwrap()
+                .insert("tab".to_owned(), label.to_owned());
             self.panes.lock().unwrap().push(Pane {
                 pane_id: "owned".to_owned(),
                 tab_id: "tab".to_owned(),
@@ -6578,8 +8151,29 @@ pub(crate) mod tests {
                 workspace_id: workspace.to_owned(),
             };
             panes.push(moved.clone());
+            self.labels
+                .lock()
+                .unwrap()
+                .insert(moved.tab_id.clone(), label.to_owned());
+            let terminal = self.terminal(pane);
+            self.terminals
+                .lock()
+                .unwrap()
+                .insert(moved.pane_id.clone(), terminal);
+            let pid = self.harness_pids.lock().unwrap().remove(pane);
+            if let Some(pid) = pid {
+                self.harness_pids
+                    .lock()
+                    .unwrap()
+                    .insert(moved.pane_id.clone(), pid);
+            }
             if self.move_name_follows.load(Ordering::Relaxed) {
                 *self.named_pane.lock().unwrap() = moved.pane_id.clone();
+                for owner in self.herdr_names.lock().unwrap().values_mut() {
+                    if owner == pane {
+                        owner.clone_from(&moved.pane_id);
+                    }
+                }
             }
             self.moves.lock().unwrap().push((
                 pane.to_owned(),
@@ -6612,8 +8206,135 @@ pub(crate) mod tests {
             self.focused.lock().unwrap().push(pane.to_owned());
             Ok(())
         }
-        fn rename_tab(&self, _: &str, _: &str) -> AdapterResult<()> {
+        fn rename_tab(&self, tab: &str, label: &str) -> AdapterResult<()> {
+            if self.fail_rename_tab.load(Ordering::SeqCst) {
+                return Err(AdapterError::unavailable("simulated crash inside rename"));
+            }
+            self.labels
+                .lock()
+                .unwrap()
+                .insert(tab.to_owned(), label.to_owned());
             Ok(())
+        }
+        fn agent_identity(&self, name: &str) -> AdapterResult<AgentIdentity> {
+            let pane = self.agent_pane(name)?;
+            let tab = self
+                .panes
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|entry| entry.pane_id == pane)
+                .map(|entry| entry.tab_id.clone());
+            Ok(AgentIdentity {
+                name: name.to_owned(),
+                terminal_id: Some(self.terminal(&pane)),
+                pane_id: pane,
+                tab_id: tab,
+            })
+        }
+        fn rename_agent(&self, pane: &str, name: &str) -> AdapterResult<()> {
+            let mut names = self.herdr_names.lock().unwrap();
+            names.retain(|_, owner| owner != pane);
+            names.insert(name.to_owned(), pane.to_owned());
+            Ok(())
+        }
+        fn agent_names(&self) -> AdapterResult<BTreeMap<String, String>> {
+            let live: BTreeSet<String> = self
+                .panes
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|pane| pane.pane_id.clone())
+                .collect();
+            Ok(self
+                .herdr_names
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(_, pane)| live.contains(*pane))
+                .map(|(name, pane)| (name.clone(), pane.clone()))
+                .collect())
+        }
+        fn tab_label(&self, tab: &str) -> AdapterResult<String> {
+            self.labels
+                .lock()
+                .unwrap()
+                .get(tab)
+                .cloned()
+                .ok_or_else(|| AdapterError::unavailable(format!("missing tab {tab}")))
+        }
+        fn tab_labels(&self, workspace: &str) -> AdapterResult<BTreeMap<String, String>> {
+            let labels = self.labels.lock().unwrap();
+            Ok(self
+                .panes
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|pane| pane.workspace_id == workspace)
+                .map(|pane| {
+                    (
+                        pane.tab_id.clone(),
+                        labels.get(&pane.tab_id).cloned().unwrap_or_default(),
+                    )
+                })
+                .collect())
+        }
+        fn harness_identity(&self, pane: &str) -> AdapterResult<Option<CustomProcessIdentity>> {
+            if !self.started.load(Ordering::Relaxed) {
+                return Ok(None);
+            }
+            let mut pids = self.harness_pids.lock().unwrap();
+            let next = 300 + pids.len() as u64;
+            Ok(Some(Self::harness(
+                *pids.entry(pane.to_owned()).or_insert(next),
+            )))
+        }
+        fn verify_harness_identity(
+            &self,
+            pane: &str,
+            expected: &CustomProcessIdentity,
+        ) -> AdapterResult<bool> {
+            Ok(self.started.load(Ordering::Relaxed)
+                && self
+                    .panes
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|entry| entry.pane_id == pane)
+                && self.harness_pids.lock().unwrap().get(pane) == Some(&expected.pid))
+        }
+        fn input_expect_supported(&self) -> AdapterResult<bool> {
+            Ok(self.expect_supported.load(Ordering::SeqCst))
+        }
+        fn agent_prompt_expect(
+            &self,
+            pane: &str,
+            text: &str,
+            expect_terminal: Option<&str>,
+            _: &dyn agent::AgentRuntime,
+        ) -> AdapterResult<()> {
+            self.effect(pane, expect_terminal)?;
+            self.run(pane, text)
+        }
+        fn send_keys_expect(
+            &self,
+            pane: &str,
+            key: &str,
+            expect_terminal: Option<&str>,
+            _: &dyn agent::AgentRuntime,
+        ) -> AdapterResult<()> {
+            self.effect(pane, expect_terminal)?;
+            self.send_keys(pane, key)
+        }
+        fn send_text_expect(
+            &self,
+            pane: &str,
+            text: &str,
+            expect_terminal: Option<&str>,
+            _: &dyn agent::AgentRuntime,
+        ) -> AdapterResult<()> {
+            self.effect(pane, expect_terminal)?;
+            self.send_text(pane, text)
         }
         fn harness_executable(&self, kind: &str) -> AdapterResult<PathBuf> {
             Ok(PathBuf::from(format!("/opt/bin/{kind}")))
@@ -6661,12 +8382,16 @@ pub(crate) mod tests {
         }
         fn start_agent(
             &self,
+            name: &str,
             _: &str,
-            _: &str,
-            _: &str,
+            pane: &str,
             _: &[String],
             _: Duration,
         ) -> AdapterResult<()> {
+            self.herdr_names
+                .lock()
+                .unwrap()
+                .insert(name.to_owned(), pane.to_owned());
             if self.require_start_lock.load(Ordering::Relaxed) {
                 let identity = agent::open_private_lock(
                     &self.root.join("registry/.identity.lock"),
@@ -11362,4 +13087,7 @@ pub(crate) mod tests {
         assert!(manager.stop("worker").is_err());
         assert!(fixture.client.closed.lock().unwrap().is_empty());
     }
+
+    /// Recipient checks around input, anchors, rename transactions and doctor.
+    mod identity;
 }

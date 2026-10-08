@@ -714,6 +714,62 @@ ownership. Pause before typing directly, coordinate with any separate input
 producer, and clear unfinished composer text before `resume`. The native
 harness remains usable directly in Herdr.
 
+## Recipient identity, rename, and doctor
+
+```sh
+agentctl doctor
+agentctl doctor --repair-labels
+agentctl anchor reviewer
+agentctl rename reviewer release-reviewer
+```
+
+Herdr routes input by pane ID, and a pane can come to hold another program: a
+server restart can reuse the ID, or a different harness can start in the same
+terminal. agentctl therefore checks the recipient immediately before **and**
+immediately after every text or key it sends, including each repeated
+submission key. The check covers the pane, its terminal and tab, the tab label
+(which must equal the agent name), the Herdr agent name of an agent agentctl
+started, and an anchor: the harness process pinned at start or adoption, or a
+native session Herdr reported. A failure before anything was typed leaves the
+message pending (exit 75). A failure after a write quarantines the message under
+`queue/failed` with `"probable_misroute": true` (exit 76); inspect the pane
+before resending.
+
+When `herdr status server` prints `capabilities: input-expect`, each write also
+carries the pinned terminal, and Herdr itself refuses a write to a pane that
+holds another terminal, so replacement of the pane cannot receive the input.
+Without that capability the window between the last check and Herdr's write
+remains, and only the check afterwards detects a replacement. A program exiting
+inside the same terminal is outside Herdr's knowledge in either case.
+
+Records written before anchors existed refuse input until `agentctl anchor NAME`
+pins the terminal and harness process now in the pane. Run it only after
+looking at the pane and confirming it is that agent. A record whose anchor no
+longer matches needs `--replace`, for the same reason.
+
+`agentctl rename OLD NEW` changes the registry entry, the Herdr agent name, and
+the tab label of a running native agent together; an adopted agent's alias is
+renamed without touching its foreign presentation. Use it when an agent's warm
+context is still useful but its purpose changed; otherwise start a new agent.
+Rename refuses when NEW is registered, named in Herdr, or a tab label in the
+workspace, and when OLD has no anchor. It writes a journal under
+`.agentctl/.renames/` first; if it is interrupted, both names refuse every
+command until the same `agentctl rename OLD NEW` is rerun, which verifies the
+pane again and finishes. The record keeps its earlier names in `name_history`.
+wrkslots slots, chat bindings, and scheduled prompts that name OLD are not
+changed.
+
+`agentctl doctor` compares every record with Herdr and prints one JSON report:
+per record `pane-missing`, `harness-exited`, `harness-kind-mismatch`,
+`harness-replaced`, `terminal-mismatch`, `tab-moved`, `label-mismatch`,
+`herdr-name-mismatch`, `workspace-mismatch`, `rename-incomplete`,
+`unanchored`, `duplicate-claim`; per workspace `label-collision` and the
+informational `unmanaged-tab`. It exits 0 when clean and 1 with findings, and
+changes nothing unless `--repair-labels`, which restores the label and Herdr
+name of an owned agent only when every other check still passes. agentctl does
+not schedule doctor; run it by hand, from cron, or from a coordinator's health
+tick.
+
 ## Goals and native conversation identity
 
 ```sh

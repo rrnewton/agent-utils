@@ -29663,6 +29663,8 @@ a fence ```sh here, ~~~~ there, and one ``\u{200b}` hidden"
                 max_offset_from_bottom: 0,
                 viewport_rows: 52,
             }),
+            terminal_id: None,
+            tab_id: None,
         };
         let captured = herdr_read(crate::subagents::chat_capture_source(&pane));
         let capture = state

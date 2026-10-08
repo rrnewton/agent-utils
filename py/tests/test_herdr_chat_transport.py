@@ -28,7 +28,7 @@ from agentctl.chat import (
     Bridge, CommandTransport, Config, GoogleChatTransport,
     _read, _run_command, _write, submit_reply,
 )
-from agentctl.client import AgentPaneInfo, HerdrClient, Pane
+from agentctl.client import AgentPaneInfo, GuardedInput, HerdrClient, Pane
 from agentctl.errors import AgentDeliveryError, HerdrUnavailable
 
 _SPACE = "spaces/test"
@@ -1459,7 +1459,9 @@ class NamedHarness(HerdrClient):
     def workspace_label(self, workspace_id: str) -> str:
         return "project"
 
-    def prompt_agent(self, pane_id: str, command: str) -> None:
+    def prompt_agent(
+        self, pane_id: str, command: str, *, terminal: GuardedInput | None = None,
+    ) -> None:
         self.prompts.append(command)
 
     def wait_agent_status(self, pane_id: str, status: str, timeout_ms: int) -> None:

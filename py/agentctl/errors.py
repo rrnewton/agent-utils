@@ -25,6 +25,18 @@ class AgentDeliveryError(AgentCtlError):
     exit_code = EXIT_BUSY
 
 
+class InputExpectationFailed(HerdrUnavailable):
+    """Herdr refused input because the pane no longer held the expected terminal; nothing was written."""
+
+
+class RecipientChanged(HerdrUnavailable):
+    """The pane stopped holding the verified recipient before an input effect."""
+
+
+class ProbableMisroute(AgentDeliveryError):
+    """Input was written, then the pane failed its recipient check: it may have reached another program."""
+
+
 class AgentPending(AgentDeliveryError):
     """Nothing was injected; the durable prompt remains safe to retry."""
 

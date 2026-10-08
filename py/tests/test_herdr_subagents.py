@@ -11,11 +11,13 @@ import pytest
 
 from agentctl import agent as delivery
 from agentctl.client import (
-    AgentPaneInfo, CustomProcessIdentity, HerdrClient, Pane, PaneShellProof,
+    AgentIdentity, AgentPaneInfo, CustomProcessIdentity, HerdrClient, Pane, PaneShellProof,
 )
-from agentctl.errors import AgentDeliveryError, AgentPending, HerdrUnavailable
+from agentctl.errors import (
+    AgentDeliveryError, AgentPending, HerdrUnavailable, InputExpectationFailed,
+)
 from agentctl.subagents import (
-    ManagedAgents, _WorkspaceClient, environment_entries, harness_arguments,
+    ManagedAgents, _GuardedTerminal, _WorkspaceClient, environment_entries, harness_arguments,
 )
 import agentctl.legacy_cli as cli
 import agentctl.codex_goal as native_goal
@@ -49,6 +51,13 @@ class FakeManagedClient:
             version=1, boot_id="11111111-2222-3333-4444-555555555555",
             pid=100, starttime_ticks=100, executable_device=3, executable_inode=4,
         )
+        self.labels: dict[str, str] = {}
+        #: Foreground harness pid per pane; a test replaces the harness by changing it.
+        self.harness_pids: dict[str, int] = {}
+        self.expect_supported = False
+        #: Called with the pane id immediately before each input effect reaches the pane.
+        self.before_effect: Callable[[str], None] | None = None
+        self.expected_terminals: list[str | None] = []
 
     def workspace_id_for_label(self, label: str) -> str | None:
         if label == "project-agents":
@@ -75,16 +84,77 @@ class FakeManagedClient:
         self, *, workspace_id: str, label: str, cwd: str,
         environment: tuple[str, ...] = (),
     ) -> str:
-        del label
         self.environments.append(tuple(environment))
         self.serial += 1
         tab, pane = f"w1:t{self.serial}", f"w1:p{self.serial}"
         self.presentations.append(Pane(pane, tab, workspace_id))
-        self.infos[pane] = AgentPaneInfo(pane, workspace_id, cwd, None, "unknown", None, None)
+        self.labels[tab] = label
+        self.infos[pane] = AgentPaneInfo(
+            pane, workspace_id, cwd, None, "unknown", None, None,
+            terminal_id=f"term-{self.serial}", tab_id=tab,
+        )
         return tab
 
     def rename_tab(self, tab_id: str, label: str) -> None:
-        del tab_id, label
+        self.labels[tab_id] = label
+
+    def tab_label(self, tab_id: str) -> str:
+        if self.offline:
+            raise HerdrUnavailable("server unavailable")
+        return self.labels[tab_id]
+
+    def tab_labels(self, workspace_id: str) -> dict[str, str]:
+        return {pane.tab_id: self.labels.get(pane.tab_id, "") for pane in self.presentations
+                if pane.workspace_id == workspace_id}
+
+    def agent_names(self) -> dict[str, str]:
+        names = {entry[0]: entry[2] for entry in self.launched}
+        names.update(self.moved_named_panes)
+        live = {pane.pane_id for pane in self.presentations}
+        return {name: pane for name, pane in names.items() if pane in live}
+
+    def agent_identity(self, name: str) -> AgentIdentity:
+        pane_id = self.agent_pane(name)
+        tab = next((pane.tab_id for pane in self.presentations if pane.pane_id == pane_id), None)
+        return AgentIdentity(name, pane_id, tab, self.infos[pane_id].terminal_id)
+
+    def rename_agent(self, pane_id: str, name: str) -> None:
+        self.launched = [(name if entry[2] == pane_id else entry[0], *entry[1:])
+                         for entry in self.launched]
+        for old, pane in list(self.moved_named_panes.items()):
+            if pane == pane_id:
+                del self.moved_named_panes[old]
+                self.moved_named_panes[name] = pane
+
+    def harness_identity(self, pane_id: str) -> CustomProcessIdentity | None:
+        if self.infos[pane_id].agent is None:
+            return None
+        pid = self.harness_pids.setdefault(pane_id, 300 + len(self.harness_pids))
+        return CustomProcessIdentity(
+            version=1, boot_id="00000000-0000-0000-0000-000000000000",
+            pid=pid, starttime_ticks=pid, executable_device=5, executable_inode=6,
+        )
+
+    def verify_harness_identity(self, pane_id: str, expected: CustomProcessIdentity) -> bool:
+        return (pane_id in self.infos and self.infos[pane_id].agent is not None
+                and self.harness_pids.get(pane_id) == expected.pid)
+
+    def input_expect_supported(self) -> bool:
+        return self.expect_supported
+
+    def _effect(self, pane_id: str, expect_terminal: str | None) -> None:
+        if self.before_effect is not None:
+            self.before_effect(pane_id)
+        self.expected_terminals.append(expect_terminal)
+        if expect_terminal is not None and self.infos[pane_id].terminal_id != expect_terminal:
+            raise InputExpectationFailed(
+                f'agent prompt {pane_id}: {{"error":{{"code":"expectation_failed"}}}}'
+            )
+
+    def agent_prompt(self, pane_id: str, text: str, *, expect_terminal: str | None = None) -> None:
+        self._effect(pane_id, expect_terminal)
+        assert pane_id in self.infos
+        self.submitted.append(text)
 
     def create_tab_with_pane(
         self, *, workspace_id: str, label: str, cwd: str,
@@ -185,15 +255,21 @@ class FakeManagedClient:
         self.presentations.remove(source)
         moved = Pane("w-project:p1", "w-project:t1", workspace_id)
         self.presentations.append(moved)
+        self.labels[moved.tab_id] = tab_label
         old = self.infos.pop(pane_id)
         self.infos[moved.pane_id] = replace(
-            old, pane_id=moved.pane_id, workspace_id=workspace_id,
+            old, pane_id=moved.pane_id, workspace_id=workspace_id, tab_id=moved.tab_id,
         )
+        if pane_id in self.harness_pids:
+            self.harness_pids[moved.pane_id] = self.harness_pids.pop(pane_id)
         self.moved_named_panes[tab_label] = moved.pane_id
         self.moves.append((pane_id, workspace_id, tab_label))
         return moved
 
-    def prompt_agent(self, pane_id: str, text: str) -> None:
+    def prompt_agent(self, pane_id: str, text: str, *, terminal: object = None) -> None:
+        if terminal is not None:
+            cast(_GuardedTerminal, terminal).native_prompt(pane_id, text)
+            return
         assert pane_id in self.infos
         self.submitted.append(text)
 
@@ -220,7 +296,8 @@ class FakeManagedClient:
         assert self.agent_pane(name) == pane_id
         self.infos[pane_id] = replace(self.infos[pane_id], session_agent=kind, session_value=session_id)
 
-    def send_keys(self, pane_id: str, keys: str) -> None:
+    def send_keys(self, pane_id: str, keys: str, *, expect_terminal: str | None = None) -> None:
+        self._effect(pane_id, expect_terminal)
         assert pane_id in self.infos and keys == "Enter"
 
 

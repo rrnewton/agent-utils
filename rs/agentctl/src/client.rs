@@ -6,7 +6,7 @@ use crate::error::{AdapterError, Result};
 use chat_subscription_plugin::process::ProcessPluginChild;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ffi::{CStr, OsString};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read};
@@ -1059,6 +1059,23 @@ pub struct AgentPaneInfo {
     pub session_value: Option<String>,
     /// Scrollback geometry, when Herdr reports it.
     pub scroll: Option<PaneScroll>,
+    /// Herdr terminal the pane holds, when `pane get` reported it.
+    pub terminal_id: Option<String>,
+    /// Herdr tab that contains the pane, when `pane get` reported it.
+    pub tab_id: Option<String>,
+}
+
+/// What `agent get NAME` reports about one named Herdr agent.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AgentIdentity {
+    /// Exact Herdr agent name.
+    pub name: String,
+    /// Pane the named agent occupies.
+    pub pane_id: String,
+    /// Tab of that pane, when reported.
+    pub tab_id: Option<String>,
+    /// Terminal of that pane, when reported.
+    pub terminal_id: Option<String>,
 }
 
 impl AgentPaneInfo {
@@ -1097,6 +1114,8 @@ pub struct CommandOutput {
 #[derive(Clone, Debug)]
 pub struct HerdrClient {
     executable: PathBuf,
+    /// Whether the running server advertises `input-expect`, read once.
+    input_expect: std::sync::OnceLock<bool>,
 }
 impl HerdrClient {
     /// Select a configured Herdr executable. Only the direct adapter is supported.
@@ -1108,6 +1127,7 @@ impl HerdrClient {
         }
         Ok(Self {
             executable: executable.to_owned(),
+            input_expect: std::sync::OnceLock::new(),
         })
     }
     fn invoke_with_timeout(&self, args: &[String], timeout: Duration) -> Result<CommandOutput> {
@@ -2291,9 +2311,21 @@ impl HerdrClient {
         text: &str,
         cancelled: &dyn Fn() -> bool,
     ) -> Result<()> {
-        self.call_ok_with_cancellation(
-            &strings(&["pane", "send-text", pane_id, text]),
+        self.send_text_expecting(pane_id, text, None, cancelled)
+    }
+    /// Insert literal text; with `expect_terminal` the server writes nothing unless the pane
+    /// still holds that terminal, and a refusal is an expectation-failed error.
+    pub(crate) fn send_text_expecting(
+        &self,
+        pane_id: &str,
+        text: &str,
+        expect_terminal: Option<&str>,
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<()> {
+        self.input_ok(
+            strings(&["pane", "send-text", pane_id, text]),
             &format!("pane send-text {pane_id}"),
+            expect_terminal,
             cancelled,
         )
     }
@@ -2303,10 +2335,179 @@ impl HerdrClient {
         text: &str,
         cancelled: &dyn Fn() -> bool,
     ) -> Result<()> {
-        self.call_ok_with_cancellation(
-            &strings(&["agent", "prompt", pane_id, text]),
+        self.agent_prompt(pane_id, text, None, cancelled)
+    }
+    /// Submit text plus Enter through Herdr's native prompt primitive, optionally refused by
+    /// the server unless the pane still holds `expect_terminal`.
+    pub(crate) fn agent_prompt(
+        &self,
+        pane_id: &str,
+        text: &str,
+        expect_terminal: Option<&str>,
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<()> {
+        self.input_ok(
+            strings(&["agent", "prompt", pane_id, text]),
             &format!("agent prompt {pane_id}"),
+            expect_terminal,
             cancelled,
+        )
+    }
+    /// Run one input command, inserting `--expect-terminal ID` after its two subcommand words.
+    ///
+    /// A nonzero exit whose output carries Herdr's `expectation_failed` code means the server
+    /// wrote nothing, which callers must be able to tell apart from an unknown outcome.
+    fn input_ok(
+        &self,
+        mut args: Vec<String>,
+        purpose: &str,
+        expect_terminal: Option<&str>,
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<()> {
+        if let Some(terminal) = expect_terminal {
+            args.splice(2..2, ["--expect-terminal".to_owned(), terminal.to_owned()]);
+        }
+        let completed =
+            self.invoke_with_timeout_and_cancellation(&args, CONTROL_TIMEOUT, cancelled)?;
+        if completed.status == 0 {
+            return Ok(());
+        }
+        let detail = detail(&completed);
+        if expect_terminal.is_some() && expectation_failed(&detail) {
+            return Err(AdapterError::expectation_failed(format!(
+                "{purpose}: {detail}"
+            )));
+        }
+        Err(AdapterError::unavailable(format!("{purpose}: {detail}")))
+    }
+    /// Does the running server refuse input whose expected terminal does not match?
+    ///
+    /// Read once from the `capabilities:` line of `herdr status server`. The protocol number
+    /// cannot answer this: a server without the capability ignores the field.
+    pub fn input_expect_supported(&self) -> Result<bool> {
+        if let Some(supported) = self.input_expect.get() {
+            return Ok(*supported);
+        }
+        let completed =
+            self.invoke_with_timeout(&strings(&["status", "server"]), CONTROL_TIMEOUT)?;
+        let supported = completed.status == 0 && advertises_input_expect(&completed.stdout);
+        Ok(*self.input_expect.get_or_init(|| supported))
+    }
+    /// Resolve an exact live Herdr agent name to its pane, tab and terminal.
+    pub fn agent_identity(&self, name: &str) -> Result<AgentIdentity> {
+        let result = self.call(
+            &strings(&["agent", "get", name]),
+            &format!("agent get {name:?}"),
+        )?;
+        let info = required_object(&result, "agent", "agent get")?;
+        if required_string(info, "name", "agent get")? != name {
+            return Err(AdapterError::unavailable(format!(
+                "agent get: returned a different agent name for {name:?}"
+            )));
+        }
+        Ok(AgentIdentity {
+            name: name.to_owned(),
+            pane_id: required_string(info, "pane_id", "agent get")?,
+            tab_id: optional_string(info, "tab_id", "agent get")?,
+            terminal_id: optional_string(info, "terminal_id", "agent get")?,
+        })
+    }
+    /// Give the agent in one exact pane a new Herdr agent name.
+    pub fn rename_agent(&self, pane_id: &str, name: &str) -> Result<()> {
+        self.call_ok(
+            &strings(&["agent", "rename", pane_id, name]),
+            &format!("agent rename {pane_id}"),
+        )
+    }
+    /// Every named Herdr agent, mapped to its pane.
+    pub fn agent_names(&self) -> Result<BTreeMap<String, String>> {
+        let result = self.call(&strings(&["agent", "list"]), "agent list")?;
+        let values = value_array(result.get("agents"), "agent list")?;
+        let mut names = BTreeMap::new();
+        for entry in object_entries(values, "agent list entry")? {
+            if let Some(name) = optional_string(&entry, "name", "agent list entry")? {
+                names.insert(
+                    name,
+                    required_string(&entry, "pane_id", "agent list entry")?,
+                );
+            }
+        }
+        Ok(names)
+    }
+    /// Every tab of one workspace, mapped to its label.
+    pub fn tab_labels(&self, workspace_id: &str) -> Result<BTreeMap<String, String>> {
+        let result = self.call(
+            &strings(&["tab", "list", "--workspace", workspace_id]),
+            "tab list",
+        )?;
+        let values = value_array(result.get("tabs"), "tab list")?;
+        let mut labels = BTreeMap::new();
+        for entry in object_entries(values, "tab list entry")? {
+            labels.insert(
+                required_string(&entry, "tab_id", "tab list entry")?,
+                required_string(&entry, "label", "tab list entry")?,
+            );
+        }
+        Ok(labels)
+    }
+    /// Return the label of one exact tab.
+    pub fn tab_label(&self, tab_id: &str) -> Result<String> {
+        let result = self.call(
+            &strings(&["tab", "get", tab_id]),
+            &format!("tab get {tab_id}"),
+        )?;
+        let tab = required_object(&result, "tab", "tab get")?;
+        if required_string(tab, "tab_id", "tab get")? != tab_id {
+            return Err(AdapterError::unavailable(format!(
+                "tab get: returned a different tab for {tab_id:?}"
+            )));
+        }
+        required_string(tab, "label", "tab get")
+    }
+    /// Pin the pane's foreground process-group leader, the harness Herdr detected.
+    ///
+    /// Returns `None` when the leader is the pane's shell, is not listed among the foreground
+    /// processes, or its kernel identity cannot be read coherently.
+    pub fn harness_identity(&self, pane_id: &str) -> Result<Option<CustomProcessIdentity>> {
+        let state = self.pane_process_state(pane_id, &|| false)?;
+        let leader = state.foreground_process_group_id;
+        if leader == state.shell_pid
+            || !state
+                .processes
+                .iter()
+                .any(|process| process.get("pid").and_then(Value::as_u64) == Some(leader))
+        {
+            return Ok(None);
+        }
+        let Ok(observed) = live_custom_process(leader) else {
+            return Ok(None);
+        };
+        Ok((observed.process_group_id == leader).then_some(observed.identity))
+    }
+    /// Is the pinned harness process still the pane's foreground process-group leader?
+    pub fn verify_harness_identity(
+        &self,
+        pane_id: &str,
+        expected: &CustomProcessIdentity,
+    ) -> Result<bool> {
+        let state = self.pane_process_state(pane_id, &|| false)?;
+        if state.foreground_process_group_id != expected.pid || !expected.valid() {
+            return Ok(false);
+        }
+        let listed = state
+            .processes
+            .iter()
+            .filter(|process| process.get("pid").and_then(Value::as_u64) == Some(expected.pid))
+            .count();
+        if listed != 1 {
+            return Ok(false);
+        }
+        let Ok(observed) = live_custom_process(expected.pid) else {
+            return Ok(false);
+        };
+        Ok(
+            observed.process_group_id == state.foreground_process_group_id
+                && observed.identity == *expected,
         )
     }
     /// Invoke and validate the corresponding Herdr agent-control operation.
@@ -2319,9 +2520,21 @@ impl HerdrClient {
         keys: &str,
         cancelled: &dyn Fn() -> bool,
     ) -> Result<()> {
-        self.call_ok_with_cancellation(
-            &strings(&["pane", "send-keys", pane_id, keys]),
+        self.send_keys_expecting(pane_id, keys, None, cancelled)
+    }
+    /// Send named keys, optionally refused by the server unless the pane still holds
+    /// `expect_terminal`.
+    pub(crate) fn send_keys_expecting(
+        &self,
+        pane_id: &str,
+        keys: &str,
+        expect_terminal: Option<&str>,
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<()> {
+        self.input_ok(
+            strings(&["pane", "send-keys", pane_id, keys]),
             &format!("pane send-keys {pane_id}"),
+            expect_terminal,
             cancelled,
         )
     }
@@ -2492,6 +2705,8 @@ fn parse_pane_info(result: &Map<String, Value>, pane_id: &str) -> Result<AgentPa
         session_agent,
         session_value,
         scroll,
+        terminal_id: optional_string(pane, "terminal_id", "pane get")?,
+        tab_id: optional_string(pane, "tab_id", "pane get")?,
     })
 }
 
@@ -2682,6 +2897,31 @@ fn detail(output: &CommandOutput) -> String {
     } else {
         detail.to_owned()
     }
+}
+
+/// Whether a refused input command reported Herdr's `expectation_failed` error code.
+fn expectation_failed(detail: &str) -> bool {
+    detail
+        .chars()
+        .filter(|character| *character != ' ')
+        .collect::<String>()
+        .contains("\"code\":\"expectation_failed\"")
+}
+
+/// Whether `herdr status server` output lists `input-expect` on its `capabilities:` line.
+fn advertises_input_expect(status: &str) -> bool {
+    let mut supported = false;
+    for line in status.lines() {
+        if let Some((key, value)) = line.split_once(':') {
+            if key.trim() == "capabilities" {
+                supported = value
+                    .replace(',', " ")
+                    .split_whitespace()
+                    .any(|token| token == "input-expect");
+            }
+        }
+    }
+    supported
 }
 
 fn stderr_detail(output: &CommandOutput) -> String {
@@ -4005,5 +4245,157 @@ mod tests {
             .expect_err("oversized stderr must be refused");
         assert_eq!(stderr_error.kind(), io::ErrorKind::InvalidData);
         assert!(stderr_error.to_string().contains("stderr"));
+    }
+
+    #[test]
+    fn input_expect_capability_is_read_from_the_capabilities_line() {
+        assert!(advertises_input_expect(
+            "server: running\ncapabilities: events, input-expect\n"
+        ));
+        assert!(advertises_input_expect("capabilities:input-expect"));
+        assert!(!advertises_input_expect("capabilities: events\n"));
+        assert!(!advertises_input_expect("input-expect: yes\n"));
+        assert!(!advertises_input_expect(
+            "capabilities: input-expectation\n"
+        ));
+    }
+
+    #[test]
+    fn expectation_failed_is_recognised_with_or_without_spaces() {
+        assert!(expectation_failed(
+            r#"{"error": {"code": "expectation_failed", "message": "terminal changed"}}"#
+        ));
+        assert!(expectation_failed(
+            r#"{"error":{"code":"expectation_failed"}}"#
+        ));
+        assert!(!expectation_failed(
+            r#"{"error":{"code":"pane_not_found"}}"#
+        ));
+        assert!(!expectation_failed("expectation_failed"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn expected_terminal_precedes_positionals_and_a_refusal_is_typed() {
+        let executable = FakeExecutable::new("{}");
+        let script = "#!/usr/bin/python3\nimport json, pathlib, sys\npathlib.Path(__file__).with_name('args').write_text(json.dumps(sys.argv[1:]))\nsys.stderr.write('{\"error\": {\"code\": \"expectation_failed\", \"message\": \"terminal changed\"}}\\n')\nsys.exit(1)\n";
+        fs::write(executable.root.join("herdr"), script).unwrap();
+        fs::set_permissions(
+            executable.root.join("herdr"),
+            fs::Permissions::from_mode(0o700),
+        )
+        .unwrap();
+        let client = executable.client();
+        let error = client
+            .send_text_expecting("w1:p1", "hello", Some("term-1"), &|| false)
+            .unwrap_err();
+        assert_eq!(
+            error.kind(),
+            crate::error::AdapterErrorKind::ExpectationFailed
+        );
+        assert_eq!(
+            executable.arguments(),
+            serde_json::json!([
+                "pane",
+                "send-text",
+                "--expect-terminal",
+                "term-1",
+                "w1:p1",
+                "hello"
+            ])
+        );
+        let error = client
+            .agent_prompt("w1:p1", "hi", Some("term-1"), &|| false)
+            .unwrap_err();
+        assert_eq!(
+            error.kind(),
+            crate::error::AdapterErrorKind::ExpectationFailed
+        );
+        assert_eq!(
+            executable.arguments(),
+            serde_json::json!([
+                "agent",
+                "prompt",
+                "--expect-terminal",
+                "term-1",
+                "w1:p1",
+                "hi"
+            ])
+        );
+        // Without an expectation the same refusal is an ordinary unknown outcome.
+        let error = client
+            .send_keys_expecting("w1:p1", "Enter", None, &|| false)
+            .unwrap_err();
+        assert_eq!(error.kind(), crate::error::AdapterErrorKind::Unavailable);
+        assert_eq!(
+            executable.arguments(),
+            serde_json::json!(["pane", "send-keys", "w1:p1", "Enter"])
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn input_expect_support_is_read_once_per_client() {
+        let executable = FakeExecutable::new("capabilities: input-expect");
+        let client = executable.client();
+        assert!(client.input_expect_supported().unwrap());
+        assert_eq!(
+            executable.arguments(),
+            serde_json::json!(["status", "server"])
+        );
+        executable.set_response("capabilities: events");
+        assert!(client.input_expect_supported().unwrap(), "cached");
+        assert!(!executable.client().input_expect_supported().unwrap());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn identity_queries_parse_herdr_responses() {
+        let executable = FakeExecutable::new(
+            r#"{"result":{"agent":{"name":"worker","pane_id":"w1:p1","tab_id":"w1:t1","terminal_id":"term-9"}}}"#,
+        );
+        assert_eq!(
+            executable.client().agent_identity("worker").unwrap(),
+            AgentIdentity {
+                name: "worker".to_owned(),
+                pane_id: "w1:p1".to_owned(),
+                tab_id: Some("w1:t1".to_owned()),
+                terminal_id: Some("term-9".to_owned()),
+            }
+        );
+        assert!(executable.client().agent_identity("other").is_err());
+        executable.set_response(
+            r#"{"result":{"agents":[{"name":"worker","pane_id":"w1:p1"},{"name":null,"pane_id":"w1:p2"}]}}"#,
+        );
+        let names = executable.client().agent_names().unwrap();
+        assert_eq!(names.len(), 1);
+        assert_eq!(names["worker"], "w1:p1");
+        executable.set_response(r#"{"result":{"tabs":[{"tab_id":"w1:t1","label":"worker"}]}}"#);
+        assert_eq!(
+            executable.client().tab_labels("w1").unwrap()["w1:t1"],
+            "worker"
+        );
+        assert_eq!(
+            executable.arguments(),
+            serde_json::json!(["tab", "list", "--workspace", "w1"])
+        );
+        executable.set_response(r#"{"result":{"tab":{"tab_id":"w1:t1","label":"worker"}}}"#);
+        assert_eq!(executable.client().tab_label("w1:t1").unwrap(), "worker");
+        assert!(executable.client().tab_label("w1:t2").is_err());
+        executable.set_response(
+            r#"{"result":{"pane":{"pane_id":"w1:p1","workspace_id":"w1","cwd":"/","terminal_id":"term-9","tab_id":"w1:t1"}}}"#,
+        );
+        let info = executable.client().pane_info("w1:p1").unwrap();
+        assert_eq!(info.terminal_id.as_deref(), Some("term-9"));
+        assert_eq!(info.tab_id.as_deref(), Some("w1:t1"));
+        executable.set_response(r#"{"result":{}}"#);
+        executable
+            .client()
+            .rename_agent("w1:p1", "reviewer")
+            .unwrap();
+        assert_eq!(
+            executable.arguments(),
+            serde_json::json!(["agent", "rename", "w1:p1", "reviewer"])
+        );
     }
 }

@@ -86,6 +86,15 @@ enum Commands {
     /// Move a running owned native Herdr agent into an existing configured workspace; adopted, custom-pane, and multi-pane tabs are refused
     #[command(after_help = "Example: agentctl move reviewer")]
     Move(Named),
+    /// Rename a running native or adopted agent: registry entry, Herdr agent name, and tab label together. Use it when an agent's warm context is still useful but its purpose changed; prefer a new agent otherwise. An interrupted rename refuses both names until the same command is rerun
+    #[command(after_help = "Example: agentctl rename reviewer release-reviewer")]
+    Rename(Rename),
+    /// Pin the terminal and foreground harness process of an agent whose record pins no harness process, after checking that its pane runs the intended agent. Input to an agent with no pinned harness process or observed native session is refused
+    #[command(after_help = "Example: agentctl anchor reviewer")]
+    Anchor(Anchor),
+    /// Compare every registry record with live Herdr state and report each mismatch. Read-only unless --repair-labels. Exit 0 when clean, 1 with findings
+    #[command(after_help = "Example: agentctl doctor")]
+    Doctor(Doctor),
     /// Stop an owned runtime, or safely unregister an adopted one, and archive state
     #[command(
         after_help = "Examples:\n  agentctl stop reviewer\n  agentctl stop sub-cloud-worker\n\nFor an agentcloud agent, stop runs `agentcloudctl halt` (the open run is interrupted and no new\nrun starts), closes the recorded agentterm pane, runs `agentcloudctl archive`, and archives the\nregistry record. A halt failure changes nothing locally. stop does not release the node\nreservation; the orchestrator releases it on its own schedule after the halted session goes\nidle (check `agentcloudctl inspect -s SESSION_ID`)."
@@ -152,6 +161,31 @@ enum Commands {
 struct Named {
     /// Registered agent name (1-32 lowercase letters, digits, and hyphens)
     name: String,
+}
+
+#[derive(Args)]
+struct Rename {
+    #[command(flatten)]
+    agent: Named,
+    /// New registered name (lowercase letters, digits, hyphens)
+    #[arg(value_name = "NEW")]
+    new_name: String,
+}
+
+#[derive(Args)]
+struct Anchor {
+    #[command(flatten)]
+    agent: Named,
+    /// Replace anchors that no longer match (the pane may hold another program; inspect it first)
+    #[arg(long)]
+    replace: bool,
+}
+
+#[derive(Args)]
+struct Doctor {
+    /// Restore the tab label and Herdr agent name of owned agents whose every other anchor still matches
+    #[arg(long)]
+    repair_labels: bool,
 }
 
 #[derive(Args)]
@@ -1165,6 +1199,13 @@ fn run(args: Cli, environment: &dyn Fn(&str) -> Option<String>) -> Result<i32, F
             },
         )?,
         Commands::Move(value) => manager.move_to_project_workspace(&value.name)?,
+        Commands::Rename(value) => manager.rename(&value.agent.name, &value.new_name)?,
+        Commands::Anchor(value) => manager.anchor(&value.agent.name, value.replace)?,
+        Commands::Doctor(value) => {
+            let report = manager.doctor(value.repair_labels)?;
+            write_json(&report).map_err(Failure::Output)?;
+            return Ok(if report["clean"] == true { 0 } else { 1 });
+        }
         Commands::Stop(value) => {
             if value.recover_legacy_adoption
                 && (value.expected_token.is_none() || value.expected_record_sha256.is_none())
@@ -1562,6 +1603,9 @@ fn add_capabilities(value: &mut serde_json::Value) {
             }
             if adapter == Some("herdr") {
                 capabilities.push("move");
+            }
+            if matches!(adapter, Some("herdr" | "herdr-foreign")) {
+                capabilities.extend(["anchor", "rename"]);
             }
             json!(capabilities)
         } else {
@@ -2498,7 +2542,9 @@ mod tests {
                 "terminal-snapshot",
                 "drain",
                 "goal",
-                "bind-session"
+                "bind-session",
+                "anchor",
+                "rename"
             ])
         );
     }

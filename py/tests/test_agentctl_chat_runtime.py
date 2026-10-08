@@ -25,7 +25,7 @@ from agentctl.chat_input import InputStreamError
 from agentctl.chat_output import PaneAgentStatus, PaneOutputSnapshot, PaneOutputStream
 from agentctl.chat_runtime import _Completion, _Notice, _Runtime
 from agentctl.chat_storage import ArtifactClass, read_json
-from agentctl.client import AgentPaneInfo
+from agentctl.client import AgentPaneInfo, GuardedInput
 from agentctl.errors import AgentDeliveryError
 from agentctl.jsonx import as_mapping, as_sequence, get_str
 from tests.test_herdr_chat import Harness
@@ -72,7 +72,9 @@ class GatedHarness(Harness):
             self.lookup.wait()
         return super().pane_info(pane_id)
 
-    def prompt_agent(self, pane_id: str, text: str) -> None:
+    def prompt_agent(
+        self, pane_id: str, text: str, *, terminal: GuardedInput | None = None,
+    ) -> None:
         super().prompt_agent(pane_id, text)
         self.prompted.set()
 

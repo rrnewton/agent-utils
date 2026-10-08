@@ -147,6 +147,22 @@ def parser() -> argparse.ArgumentParser:
     command("move", "Move a running owned native Herdr agent into an existing workspace required by project configuration; adopted, custom-pane, and multi-pane tabs are refused.",
         "agentctl move reviewer", named=True)
 
+    rename = command("rename", "Rename a running native or adopted agent: registry entry, Herdr agent name, and tab label "
+        "together. Use it when an agent's warm context is still useful but its purpose changed; prefer a new agent "
+        "otherwise. An interrupted rename refuses both names until the same command is rerun.",
+        "agentctl rename reviewer release-reviewer", named=True)
+    rename.add_argument("new_name", metavar="NEW", help="new registered name (lowercase letters, digits, hyphens)")
+    anchor = command("anchor", "Pin the terminal and foreground harness process of an agent whose record pins no "
+        "harness process, after checking that its pane runs the intended agent. Input to an agent with no pinned harness "
+        "process or observed native session is refused.",
+        "agentctl anchor reviewer", named=True)
+    anchor.add_argument("--replace", action="store_true",
+        help="replace anchors that no longer match (the pane may hold another program; inspect it first)")
+    doctor = command("doctor", "Compare every registry record with live Herdr state and report each mismatch. "
+        "Read-only unless --repair-labels. Exit 0 when clean, 1 with findings.",
+        "agentctl doctor")
+    doctor.add_argument("--repair-labels", action="store_true",
+        help="restore the tab label and Herdr agent name of owned agents whose every other anchor still matches")
     command("list", "List every registered session, including unavailable and failed launches.", "agentctl list")
     command("capabilities", "Show the adapters and services available in this installation.", "agentctl capabilities")
     command("status", "Inspect saved identity, runtime state, and supported operations.", "agentctl status reviewer", named=True)
@@ -381,6 +397,14 @@ def main(argv: Sequence[str] | None = None) -> int:
             return 75 if outcome.blocked else (76 if outcome.quarantined else 0)
         elif args.command == "goal":
             result = sessions.goal(name, _text(args, optional=True), goal_command=_goal_command(args), **options)
+        elif args.command == "rename":
+            result = sessions.rename(name, args.new_name)
+        elif args.command == "anchor":
+            result = sessions.anchor(name, replace=args.replace)
+        elif args.command == "doctor":
+            report = sessions.doctor(repair_labels=args.repair_labels)
+            print(json.dumps(report, indent=2, sort_keys=True))
+            return 0 if report["clean"] else 1
         elif args.command == "bind-session":
             result = sessions.bind_session(name, args.session, goal_command=_goal_command(args))
         elif args.command in ("pause", "resume"):

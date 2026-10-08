@@ -17,6 +17,7 @@ import subprocess
 import sys
 import tempfile
 import time
+from typing import cast
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 
@@ -29,7 +30,8 @@ _COMMON = ("--herdr-bin", "<HERDR>", "--registry", "<ROOT>/registry")
 _GOAL_COMMAND = ("--goal-command-json", '["<HERDR>","goal-rpc"]')
 _CAPABILITIES = ["send", "status", "read", "wait", "stop", "attach", "pause", "resume",
                  "terminal-snapshot", "drain", "goal", "bind-session"]
-_OWNED_CAPABILITIES = [*_CAPABILITIES, "move"]
+_OWNED_CAPABILITIES = [*_CAPABILITIES, "move", "anchor", "rename"]
+_ADOPTED_CAPABILITIES = [*_CAPABILITIES, "anchor", "rename"]
 _SHELL_IDENTITY_FIELDS = {
     "version", "boot_id", "pid", "starttime_ticks",
     "executable_device", "executable_inode",
@@ -42,6 +44,11 @@ def _normalize(value: object) -> object:
     if isinstance(value, dict):
         return {str(key): ("<TOKEN>" if key == "token" else 0 if key == "created_at"
                           else "<PROCESS_IDENTITY>" if key == "custom_process_identity"
+                          # Each edition's fixture runs its own harness process.
+                          else "<PROCESS_IDENTITY>" if key == "harness_identity" and item is not None
+                          else "<HARNESS_PID>" if key == "harness_pid"
+                          else "<JOURNAL_ID>" if key == "journal_id"
+                          else 0 if key == "renamed_at"
                           else "<ARCHIVE>" if key == "archive"
                           # Native identity diagnostics use edition-specific quote styles.
                           else re.sub(r'"([a-z][a-z0-9-]*)"', r"'\1'", item)
@@ -105,7 +112,7 @@ def _retire_fixture_processes(case: PairCase) -> None:
     process_ids: list[int] = []
     for root in (case.python_root, case.rust_root):
         state = _state(root)
-        for field in ("custom_pid", "retired_custom_pid"):
+        for field in ("custom_pid", "retired_custom_pid", "harness_pid"):
             process_id = state.get(field)
             if isinstance(process_id, int) and process_id not in process_ids:
                 process_ids.append(process_id)
@@ -1687,7 +1694,7 @@ def _adoption(harness: Harness, report: Report) -> None:
                        "name": "foreign", "adapter": "herdr-foreign", "mode": "interactive",
                        "backend": "herdr", "pane_id": "w1:p1", "tab_id": "w1:t1",
                        "workspace_id": "w1", "session_agent": "codex",
-                       "session_value": "session-1", "capabilities": _CAPABILITIES,
+                       "session_value": "session-1", "capabilities": _ADOPTED_CAPABILITIES,
                    }.items()), f"adoption lost exact live identity: {adopted!r}")
     report.require(
         "primary/adopt/shell-identity-schema",
@@ -1878,6 +1885,78 @@ def _adoption(harness: Harness, report: Report) -> None:
             f"{(adopted, status, sent, stopped)!r}")
 
 
+def _outcome_field(outcome: Outcome) -> object:
+    value = _json(outcome)
+    return value.get("outcome") if isinstance(value, dict) else None
+
+
+def _identity_and_rename(harness: Harness, report: Report) -> None:
+    """Anchors, per-effect identity checks, rename, doctor, and cross-edition rename recovery."""
+    common = ("--herdr-bin", "<HERDR>", "--registry", "<ROOT>/registry")
+    case = harness.case("identity-rename")
+    if not _start(harness, report, case, "identity/start", "--harness", "claude"):
+        return
+    python, _ = _pair(harness, report, case, "identity/status", ("status", "worker", *common))
+    status = _json(python)
+    report.require("identity/anchored", isinstance(status, dict)
+                   and status.get("terminal_id") == "term-1"
+                   and status.get("harness_identity") == "<PROCESS_IDENTITY>",
+                   f"start did not pin terminal and harness: {status!r}")
+    _pair(harness, report, case, "identity/doctor-clean", ("doctor", *common))
+    _pair(harness, report, case, "identity/rename", ("rename", "worker", "reviewer", *common))
+    report.require("identity/rename-presentation", all(
+        _state(root).get("name") == "reviewer" and _state(root).get("tab_label") == "reviewer"
+        and (root / "registry" / "reviewer" / "agent.json").exists()
+        and not (root / "registry" / "worker").exists()
+        for root in (case.python_root, case.rust_root)), "rename left a stale name or label")
+    _pair(harness, report, case, "identity/send-renamed", ("send", "reviewer", "after rename", *common))
+    report.require("identity/send-renamed-delivered", all(
+        _submission_count(root, "after rename") == 1 for root in (case.python_root, case.rust_root)),
+        "send after rename was not delivered exactly once")
+    _change(case, {"input_expect": True})
+    _pair(harness, report, case, "identity/send-expect", ("send", "reviewer", "with expect", *common))
+    pastes = [[call for call in cast(list[list[str]], _state(root)["calls"])
+               if call[:2] == ["pane", "send-text"]] for root in (case.python_root, case.rust_root)]
+    report.require("identity/expect-flag-used", all(
+        calls and calls[-1][:4] == ["pane", "send-text", "--expect-terminal", "term-1"]
+        for calls in pastes), f"an advertised input-expect capability was not used: {pastes!r}")
+    _change(case, {"input_expect": False, "tab_label": "retitled"})
+    outcomes = harness.invoke(case, ("send", "reviewer", "after drift", *common))
+    report.require("identity/label-drift-refused", all(
+        outcome.returncode == 75 and _outcome_field(outcome) == "pending" for outcome in outcomes)
+        and all(_submission_count(root, "after drift") == 0
+                for root in (case.python_root, case.rust_root)),
+        f"label drift did not keep the message pending: {outcomes!r}")
+    outcomes = harness.invoke(case, ("doctor", *common))
+    findings = [_json(outcome) for outcome in outcomes]
+    report.require("identity/doctor-drift", all(outcome.returncode == 1 for outcome in outcomes)
+                   and findings[0] == findings[1], f"doctor disagreed on drift: {outcomes!r}")
+    _pair(harness, report, case, "identity/doctor-repair", ("doctor", "--repair-labels", *common))
+    report.require("identity/repaired-label", all(
+        _state(root).get("tab_label") == "reviewer" for root in (case.python_root, case.rust_root)),
+        "label repair did not restore the label")
+    # An interrupted rename by one edition is finished by the other, on the same registry.
+    for first, second, root in ((harness.python, harness.rust, case.python_root),
+                                (harness.rust, harness.python, case.rust_root)):
+        state = _state(root)
+        state["fail_tab_rename_once"] = True
+        (root / "state.json").write_text(json.dumps(state), encoding="utf-8")
+        crashed = harness._invoke_one(first, root, ("rename", "reviewer", "lead", *common))
+        blocked = harness._invoke_one(second, root, ("send", "lead", "blocked", *common))
+        finished = harness._invoke_one(second, root, ("rename", "reviewer", "lead", *common))
+        record = json.loads((root / "registry" / "lead" / "agent.json").read_text(encoding="utf-8")) \
+            if (root / "registry" / "lead" / "agent.json").exists() else {}
+        history = record.get("name_history", []) if isinstance(record, dict) else []
+        report.require(f"identity/cross-recovery/{root.parent.name}",
+                       crashed.returncode != 0 and blocked.returncode != 0
+                       and finished.returncode == 0
+                       and [entry.get("name") for entry in history] == ["worker", "reviewer"]
+                       and not list((root / "registry" / ".renames").glob("*.json"))
+                       and _state(root).get("tab_label") == "lead",
+                       f"crashed={crashed!r} blocked={blocked!r} finished={finished!r} history={history!r}")
+    _retire_fixture_processes(case)
+
+
 def _invalid_cli(harness: Harness, report: Report) -> None:
     case = harness.case("primary-invalid-cli")
     for label, arguments in (
@@ -1938,6 +2017,7 @@ def build_report(python_command: Sequence[str], rust_command: Sequence[str]) -> 
             _ownership(harness, report)
             _managed_dead_recovery(harness, report)
             _adoption(harness, report)
+            _identity_and_rename(harness, report)
             _invalid_cli(harness, report)
             harness.require_no_host_cli(report)
         finally:

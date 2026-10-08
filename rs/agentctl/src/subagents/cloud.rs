@@ -588,6 +588,9 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
             pane_reported_by_agentctl: false,
             custom_process_identity: None,
             foreign_shell_identity: None,
+            terminal_id: None,
+            harness_identity: None,
+            name_history: Vec::new(),
             agentcloud: Some(CloudRecord {
                 launch,
                 agentterm: agentterm.display().to_string(),

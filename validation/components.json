@@ -44,6 +44,7 @@
         "py/tests/test_agentctl_chat_storage.py",
         "py/tests/test_agentctl_chat_tagged.py",
         "py/tests/test_agentctl_client_launch.py",
+        "py/tests/test_agentctl_identity.py",
         "py/tests/test_agentctl_lifecycle.py",
         "py/tests/test_agentctl_mcp.py",
         "py/tests/test_agentctl_prompt_time.py",

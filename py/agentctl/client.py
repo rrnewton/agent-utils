@@ -19,8 +19,9 @@ import subprocess
 import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
+from typing import Protocol
 
-from agentctl.errors import HerdrUnavailable
+from agentctl.errors import HerdrUnavailable, InputExpectationFailed
 from agentctl.jsonx import as_mapping, as_sequence, get_int, get_str, opt_str
 from agentctl.procstat import parse_process_stat
 from agentctl.submission import (
@@ -380,6 +381,39 @@ class AgentPaneInfo:
     status: str
     session_agent: str | None
     session_value: str | None
+    #: Herdr's terminal and tab for the pane, when ``pane get`` reported them.
+    terminal_id: str | None = None
+    tab_id: str | None = None
+
+
+class GuardedInput(Protocol):
+    """A prompt terminal that runs each input effect between recipient checks."""
+
+    def read_screen(self, pane_id: str) -> str:
+        """Read the pane's visible rows; reading is not an input effect."""
+        ...
+
+    def send_text(self, pane_id: str, text: str) -> None:
+        """Insert literal text between recipient checks."""
+        ...
+
+    def send_keys(self, pane_id: str, keys: str) -> None:
+        """Send named keys between recipient checks."""
+        ...
+
+    def native_prompt(self, pane_id: str, text: str) -> None:
+        """Submit through Herdr's native prompt primitive between recipient checks."""
+        ...
+
+
+@dataclass(frozen=True)
+class AgentIdentity:
+    """What ``agent get NAME`` reports about one named Herdr agent."""
+
+    name: str
+    pane_id: str
+    tab_id: str | None
+    terminal_id: str | None
 
 
 def _bounded_control_command(
@@ -537,6 +571,7 @@ class HerdrClient:
         # the only path that may invoke subprocess directly with the scrubbed environment below.
         self._production_runner = selected_runner is _PRODUCTION_RUNNER
         self._resolved_bin: str | None = None
+        self._input_expect: bool | None = None
         if broker != "direct":
             raise ValueError("agentctl uses direct Herdr control; server setup is external")
         self._run: Runner = selected_runner
@@ -1438,6 +1473,97 @@ class HerdrClient:
         self.report_pane_agent(pane_id, kind, "idle")
         return observed
 
+    def agent_prompt(
+        self, pane_id: str, text: str, *, expect_terminal: str | None = None,
+    ) -> None:
+        """Submit text plus Enter through Herdr's native prompt primitive."""
+        self._input_ok(
+            ["agent", "prompt", pane_id, text], f"agent prompt {pane_id}", expect_terminal,
+        )
+
+    def agent_identity(self, name: str) -> AgentIdentity:
+        """Resolve an exact live Herdr agent name to its pane, tab and terminal."""
+        result = self._call(["agent", "get", name], f"agent get {name!r}")
+        try:
+            info = as_mapping(result.get("agent"), "agent get")
+            if get_str(info, "name", "agent get") != name:
+                raise HerdrUnavailable(f"agent get: returned a different agent name for {name!r}")
+            return AgentIdentity(
+                name=name,
+                pane_id=get_str(info, "pane_id", "agent get"),
+                tab_id=opt_str(info, "tab_id"),
+                terminal_id=opt_str(info, "terminal_id"),
+            )
+        except TypeError as exc:
+            raise HerdrUnavailable(f"agent get: invalid Herdr response: {exc}") from exc
+
+    def rename_agent(self, pane_id: str, name: str) -> None:
+        """Give the agent in one exact pane a new Herdr agent name."""
+        self._call_ok(["agent", "rename", pane_id, name], f"agent rename {pane_id}")
+
+    def agent_names(self) -> dict[str, str]:
+        """Every named Herdr agent, mapped to its pane."""
+        result = self._call(["agent", "list"], "agent list")
+        names: dict[str, str] = {}
+        try:
+            for entry in as_sequence(result.get("agents"), "agent list"):
+                item = as_mapping(entry, "agent list entry")
+                name = opt_str(item, "name")
+                if name is not None:
+                    names[name] = get_str(item, "pane_id", "agent list entry")
+        except TypeError as exc:
+            raise HerdrUnavailable(f"agent list: invalid Herdr response: {exc}") from exc
+        return names
+
+    def tab_labels(self, workspace_id: str) -> dict[str, str]:
+        """Every tab of one workspace, mapped to its label."""
+        result = self._call(["tab", "list", "--workspace", workspace_id], "tab list")
+        labels: dict[str, str] = {}
+        try:
+            for entry in as_sequence(result.get("tabs"), "tab list"):
+                tab = as_mapping(entry, "tab list entry")
+                labels[get_str(tab, "tab_id", "tab list entry")] = get_str(
+                    tab, "label", "tab list entry"
+                )
+        except TypeError as exc:
+            raise HerdrUnavailable(f"tab list: invalid Herdr response: {exc}") from exc
+        return labels
+
+    def tab_label(self, tab_id: str) -> str:
+        """Return the label of one exact tab."""
+        result = self._call(["tab", "get", tab_id], f"tab get {tab_id}")
+        try:
+            tab = as_mapping(result.get("tab"), "tab get")
+            if get_str(tab, "tab_id", "tab get") != tab_id:
+                raise HerdrUnavailable(f"tab get: returned a different tab for {tab_id!r}")
+            return get_str(tab, "label", "tab get")
+        except TypeError as exc:
+            raise HerdrUnavailable(f"tab get: invalid Herdr response: {exc}") from exc
+
+    def harness_identity(self, pane_id: str) -> CustomProcessIdentity | None:
+        """Pin the pane's foreground process-group leader, the harness Herdr detected.
+
+        Returns ``None`` when the leader's kernel identity cannot be read coherently.
+        """
+        info = self.process_info(pane_id)
+        if info.foreground_pgid == info.shell_pid:
+            return None
+        if not any(pid == info.foreground_pgid for pid, *_rest in info.foreground):
+            return None
+        observed = self._process_identity(info.foreground_pgid)
+        if observed is None or observed[1] != info.foreground_pgid:
+            return None
+        return observed[0]
+
+    def verify_harness_identity(
+        self, pane_id: str, expected: CustomProcessIdentity,
+    ) -> bool:
+        """Is the pinned harness process still the pane's foreground group leader?"""
+        info = self.process_info(pane_id)
+        if info.foreground_pgid != expected.pid:
+            return False
+        return self._pane_process_identity(info, None, expected) is not None
+
     def agent_pane(self, name: str) -> str:
         """Resolve an exact live Herdr agent name, rejecting a stale pane occupant."""
         result = self._call(["agent", "get", name], f"agent get {name!r}")
@@ -1555,6 +1681,8 @@ class HerdrClient:
                 status=opt_str(pane, "agent_status") or "unknown",
                 session_agent=session_agent,
                 session_value=session_value,
+                terminal_id=opt_str(pane, "terminal_id"),
+                tab_id=opt_str(pane, "tab_id"),
             )
         except TypeError as exc:
             raise HerdrUnavailable(f"pane get: invalid Herdr response: {exc}") from exc
@@ -1689,7 +1817,9 @@ class HerdrClient:
             raise HerdrUnavailable(f"{purpose}: {detail}")
 
 
-    def prompt_agent(self, pane_id: str, text: str) -> SubmissionReceipt | None:
+    def prompt_agent(
+        self, pane_id: str, text: str, *, terminal: GuardedInput | None = None,
+    ) -> SubmissionReceipt | None:
         """Submit one prompt, proving the submission from the screen when the harness allows it.
 
         For harnesses with a known composer layout the text is pasted into an
@@ -1702,6 +1832,9 @@ class HerdrClient:
         submitting through the composer, and other harnesses have no composer
         model, so both use the native ``agent prompt`` primitive and return
         ``None``: the caller must then confirm submission some other way.
+
+        ``terminal``, when given, performs every input effect, so a caller can
+        verify the recipient immediately around each one.
         """
         try:
             harness = self.pane_info(pane_id).agent or ""
@@ -1710,8 +1843,11 @@ class HerdrClient:
                 f"pane {pane_id}: harness lookup failed before typing: {exc}"
             ) from exc
         if harness in VERIFIED_HARNESSES and not text.lstrip().startswith("/"):
-            return submit_verified(self, pane_id, harness, text)
-        self._call_ok(["agent", "prompt", pane_id, text], f"agent prompt {pane_id}")
+            return submit_verified(terminal or self, pane_id, harness, text)
+        if terminal is None:
+            self._call_ok(["agent", "prompt", pane_id, text], f"agent prompt {pane_id}")
+        else:
+            terminal.native_prompt(pane_id, text)
         return None
 
     def read_screen(self, pane_id: str) -> str:
@@ -1726,13 +1862,56 @@ class HerdrClient:
             raise HerdrUnavailable(f"pane read {pane_id}: {detail}")
         return completed.stdout
 
-    def send_text(self, pane_id: str, text: str) -> None:
-        """Insert literal text without synthesizing a submission keystroke."""
-        self._call_ok(["pane", "send-text", pane_id, text], f"pane send-text {pane_id}")
+    def input_expect_supported(self) -> bool:
+        """Does the running server refuse input whose expected terminal does not match?
 
-    def send_keys(self, pane_id: str, keys: str) -> None:
+        Read once from the ``capabilities`` line of ``herdr status server``. The protocol
+        number cannot answer this: a server without the capability ignores the field.
+        """
+        if self._input_expect is None:
+            completed = self._invoke(["status", "server"])
+            supported = False
+            if completed.returncode == 0:
+                for line in completed.stdout.splitlines():
+                    key, _, value = line.partition(":")
+                    if key.strip() == "capabilities":
+                        supported = "input-expect" in value.replace(",", " ").split()
+            self._input_expect = supported
+        return self._input_expect
+
+    def _input_ok(
+        self, args: list[str], purpose: str, expect_terminal: str | None,
+    ) -> None:
+        if expect_terminal is not None:
+            args[2:2] = ["--expect-terminal", expect_terminal]
+        completed = self._invoke(args)
+        if completed.returncode != 0:
+            detail = (
+                completed.stderr or completed.stdout or ""
+            ).strip() or f"exit {completed.returncode}"
+            if expect_terminal is not None and '"code":"expectation_failed"' in detail.replace(" ", ""):
+                raise InputExpectationFailed(f"{purpose}: {detail}")
+            raise HerdrUnavailable(f"{purpose}: {detail}")
+
+    def send_text(
+        self, pane_id: str, text: str, *, expect_terminal: str | None = None,
+    ) -> None:
+        """Insert literal text without synthesizing a submission keystroke.
+
+        With ``expect_terminal`` the server writes nothing unless the pane still holds
+        that terminal; refusal raises ``InputExpectationFailed``.
+        """
+        self._input_ok(
+            ["pane", "send-text", pane_id, text], f"pane send-text {pane_id}", expect_terminal,
+        )
+
+    def send_keys(
+        self, pane_id: str, keys: str, *, expect_terminal: str | None = None,
+    ) -> None:
         """Send named key presses (for example ``ctrl+u``) to a pane."""
-        self._call_ok(["pane", "send-keys", pane_id, keys], f"pane send-keys {pane_id}")
+        self._input_ok(
+            ["pane", "send-keys", pane_id, keys], f"pane send-keys {pane_id}", expect_terminal,
+        )
 
     def close_pane(self, pane_id: str) -> None:
         """Close one exact pane, preserving any other panes added to its tab."""

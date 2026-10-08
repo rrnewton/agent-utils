@@ -66,6 +66,8 @@ class Sessions(ManagedAgents):
                           else ("drain", "goal", "bind-session"))
         if record.adapter == "herdr":
             result.append("move")
+        if record.adapter in ("herdr", "herdr-foreign"):
+            result.extend(("anchor", "rename"))
         return result
 
     def start_session(self, name: str, *, cwd: str, mode: str = "interactive",

@@ -123,3 +123,68 @@ def test_malformed_name_and_record_are_unverifiable(tmp_path: Path) -> None:
     (tmp_path / ".agentctl/archive/w1-abc").mkdir(parents=True)
     (tmp_path / ".agentctl/archive/w1-abc/agent.json").write_text("{", encoding="utf-8")
     assert run(tmp_path, "w1")[0] == 2
+
+
+def history(*names: str) -> list[dict[str, object]]:
+    return [{"name": name, "renamed_at": 1.0, "journal_id": f"{index:032x}"}
+            for index, name in enumerate(names)]
+
+
+def test_renamed_live_agent_is_alive_under_its_old_name(tmp_path: Path) -> None:
+    registry = tmp_path / ".agentctl"
+    write_record(registry / "new", "new", name_history=history("old"),
+                 harness_identity=identity(os.getpid()))
+    assert run(tmp_path, "old") == (1, "alive agent=old rc=1 reason=active-record-process-alive\n")
+
+
+def test_earlier_stopped_archive_does_not_make_a_renamed_live_agent_dead(
+    tmp_path: Path, exited_identity: dict[str, object],
+) -> None:
+    # The false-dead case: OLD was stopped once, a later OLD was renamed NEW and still runs.
+    registry = tmp_path / ".agentctl"
+    write_record(registry / "archive" / "old-aaaa", "old", custom_process_identity=exited_identity)
+    write_record(registry / "new", "new", name_history=history("old"),
+                 harness_identity=identity(os.getpid()))
+    assert run(tmp_path, "old")[0] == 1
+
+
+def test_rename_chain_is_followed(tmp_path: Path) -> None:
+    registry = tmp_path / ".agentctl"
+    write_record(registry / "third", "third", name_history=history("first", "second"),
+                 harness_identity=identity(os.getpid()))
+    assert run(tmp_path, "first")[0] == 1
+    assert run(tmp_path, "second")[0] == 1
+
+
+def test_renamed_then_stopped_agent_is_dead_under_its_old_name(
+    tmp_path: Path, exited_identity: dict[str, object],
+) -> None:
+    registry = tmp_path / ".agentctl"
+    write_record(registry / "archive" / "new-bbbb", "new", name_history=history("old"),
+                 harness_identity=exited_identity)
+    assert run(tmp_path, "old") == (0, "dead agent=old rc=0 reason=stopped-by-agentctl\n")
+
+
+def test_incomplete_rename_is_unverifiable(tmp_path: Path) -> None:
+    registry = tmp_path / ".agentctl"
+    (registry / ".renames").mkdir(parents=True)
+    (registry / ".renames" / "tok.json").write_text(
+        json.dumps({"old": "old", "new": "new"}), encoding="utf-8")
+    assert run(tmp_path, "old") == (2, "unverifiable agent=old rc=2 reason=rename-incomplete\n")
+    assert run(tmp_path, "new")[0] == 2
+
+
+def test_adopted_archive_keeps_blocking_while_its_runtime_lives(tmp_path: Path) -> None:
+    # Stopping an adopted agent unregisters it without ending its runtime.
+    registry = tmp_path / ".agentctl"
+    write_record(registry / "archive" / "renamed-cccc", "renamed", adapter="herdr-foreign",
+                 name_history=history("adopted"), foreign_shell_identity=identity(os.getpid()))
+    assert run(tmp_path, "adopted")[0] == 1
+
+
+def test_unreadable_record_makes_any_name_unverifiable(tmp_path: Path) -> None:
+    registry = tmp_path / ".agentctl"
+    (registry / "archive" / "broken-dddd").mkdir(parents=True)
+    (registry / "archive" / "broken-dddd" / "agent.json").write_text("{", encoding="utf-8")
+    code, line = run(tmp_path, "other")
+    assert code == 2 and "reason=error:" in line

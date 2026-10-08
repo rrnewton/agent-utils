@@ -121,6 +121,37 @@ pub trait PromptTerminal {
     fn send_keys(&self, pane_id: &str, keys: &str) -> Result<()>;
 }
 
+/// A prompt terminal that runs each input effect between recipient checks.
+///
+/// Every write, including each submission-key retry inside [`submit_verified`],
+/// goes through one of these methods, so the implementation can prove the pane
+/// still holds the intended program immediately before and after it.
+pub trait GuardedInput {
+    /// Return visible rows with SGR styling retained.
+    fn read_screen(&self, pane_id: &str) -> Result<String>;
+    /// Insert literal bytes without a submission key.
+    fn send_text(&self, pane_id: &str, text: &str) -> Result<()>;
+    /// Send one named key.
+    fn send_keys(&self, pane_id: &str, keys: &str) -> Result<()>;
+    /// Submit text plus Enter through Herdr's native prompt primitive.
+    fn native_prompt(&self, pane_id: &str, text: &str) -> Result<()>;
+}
+
+/// The [`PromptTerminal`] view of a [`GuardedInput`], for [`submit_verified`].
+pub struct GuardedPrompt<'a>(pub &'a dyn GuardedInput);
+
+impl PromptTerminal for GuardedPrompt<'_> {
+    fn read_screen(&self, pane_id: &str) -> Result<String> {
+        self.0.read_screen(pane_id)
+    }
+    fn send_text(&self, pane_id: &str, text: &str) -> Result<()> {
+        self.0.send_text(pane_id, text)
+    }
+    fn send_keys(&self, pane_id: &str, keys: &str) -> Result<()> {
+        self.0.send_keys(pane_id, keys)
+    }
+}
+
 /// Deadlines for the two phases of one verified submission.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SubmitTimeouts {

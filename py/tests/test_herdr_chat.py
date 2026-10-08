@@ -8,7 +8,7 @@ import pytest
 
 from agentctl.agent import Target
 from agentctl.chat import Bridge, Config, _read, submit_reply
-from agentctl.client import AgentPaneInfo, HerdrClient
+from agentctl.client import AgentPaneInfo, GuardedInput, HerdrClient
 from agentctl.errors import AgentDeliveryError, HerdrUnavailable
 
 
@@ -25,7 +25,9 @@ class Harness(HerdrClient):
     def workspace_label(self, workspace_id: str) -> str:
         return "project"
 
-    def prompt_agent(self, pane_id: str, text: str) -> None:
+    def prompt_agent(
+        self, pane_id: str, text: str, *, terminal: GuardedInput | None = None,
+    ) -> None:
         self.prompts.append(text)
 
     def wait_agent_status(self, pane_id: str, state: str, timeout_ms: int) -> None:

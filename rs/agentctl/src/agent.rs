@@ -22,7 +22,7 @@ use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
 
 use crate::client::{AgentPaneInfo, HerdrClient, Pane};
-use crate::error::{AdapterError, EXIT_BUSY, EXIT_TIMEOUT};
+use crate::error::{AdapterError, AdapterErrorKind, EXIT_BUSY, EXIT_TIMEOUT};
 use crate::submission::{PromptTerminal, Submission, SubmitTimeouts};
 
 static TEMPORARY_SEQUENCE: AtomicU64 = AtomicU64::new(0);
@@ -873,13 +873,19 @@ fn drain_with_runtime_binding<A: AgentApi + ?Sized>(
                 )?;
                 delivered.push(identifier);
             }
-            Err(error) => {
+            Err(Undelivered {
+                error,
+                probable_misroute,
+            }) => {
                 let attempts = attempts.saturating_add(1);
                 let detail = error.to_string();
                 document.insert("delivery_attempts".to_owned(), json!(attempts));
                 document.insert("tui_delivery_attempts".to_owned(), json!(attempts));
                 document.insert("delivery_error".to_owned(), json!(detail));
                 document.insert("possibly_submitted".to_owned(), Value::Bool(true));
+                if probable_misroute {
+                    document.insert("probable_misroute".to_owned(), Value::Bool(true));
+                }
                 document.insert("delivery_failed_at".to_owned(), json!(unix_seconds()));
                 atomic_json(&inflight_path, &Value::Object(document))?;
                 let failed_path = directories
@@ -1323,21 +1329,53 @@ enum Delivered {
     NotStaged(String),
 }
 
+/// A delivery that failed after typing may have begun; the prompt is quarantined.
+struct Undelivered {
+    error: AgentError,
+    /// The pane failed its recipient check immediately after input was written, so the
+    /// input may have reached another program.
+    probable_misroute: bool,
+}
+
+impl From<AgentError> for Undelivered {
+    fn from(error: AgentError) -> Self {
+        Self {
+            error,
+            probable_misroute: false,
+        }
+    }
+}
+
 fn deliver_one<A: AgentApi + ?Sized>(
     client: &A,
     info: &AgentPaneInfo,
     text: &str,
     working_timeout: Duration,
     runtime: &dyn AgentRuntime,
-) -> AgentResult<Delivered> {
-    let submission = client
-        .submit_with_runtime(&info.pane_id, text, runtime)
-        .map_err(|error| {
-            AgentError::delivery(format!(
+) -> std::result::Result<Delivered, Undelivered> {
+    let submission = match client.submit_with_runtime(&info.pane_id, text, runtime) {
+        Ok(submission) => submission,
+        // A recipient check refused the first input effect: nothing reached the pane.
+        Err(error) if error.kind() == AdapterErrorKind::NotStaged => {
+            return Ok(Delivered::NotStaged(error.to_string()))
+        }
+        Err(error) if error.kind() == AdapterErrorKind::ProbableMisroute => {
+            return Err(Undelivered {
+                error: AgentError::delivery(format!(
+                    "pane {}: PROBABLE MISROUTE, quarantined: {error}",
+                    info.pane_id
+                )),
+                probable_misroute: true,
+            })
+        }
+        Err(error) => {
+            return Err(AgentError::delivery(format!(
                 "pane {} agent-prompt outcome is unknown; prompt may have been submitted: {error}",
                 info.pane_id
             ))
-        })?;
+            .into())
+        }
+    };
     match submission {
         // The screen already proved the prompt left the composer. A lifecycle
         // transition adds nothing and is absent when the agent queues the prompt.
@@ -1360,6 +1398,7 @@ fn deliver_one<A: AgentApi + ?Sized>(
                     "pane {} did not confirm idle/done -> working submission: {error}",
                     info.pane_id
                 ))
+                .into()
             });
     };
     let deadline = runtime.monotonic().saturating_add(working_timeout);
@@ -1369,7 +1408,8 @@ fn deliver_one<A: AgentApi + ?Sized>(
             return Err(AgentError::delivery(format!(
                 "pane {} delivery was cancelled after terminal injection; outcome is unknown",
                 info.pane_id
-            )));
+            ))
+            .into());
         }
         let remaining = deadline.saturating_sub(runtime.monotonic());
         if remaining.is_zero() {
@@ -1377,7 +1417,8 @@ fn deliver_one<A: AgentApi + ?Sized>(
             return Err(AgentError::delivery(format!(
                 "pane {} did not confirm idle/done -> working submission: {detail}",
                 info.pane_id
-            )));
+            ))
+            .into());
         }
         let wait = chunk.min(remaining);
         let millis = wait.as_millis().clamp(1, u64::MAX.into()) as u64;
@@ -2997,6 +3038,8 @@ mod tests {
             session_agent: Some("codex".to_owned()),
             session_value: Some(session.to_owned()),
             scroll: None,
+            terminal_id: None,
+            tab_id: None,
         }
     }
 

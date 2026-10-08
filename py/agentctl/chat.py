@@ -49,7 +49,7 @@ from agentctl.agent import (
     _validate_existing_queue, _validate_private_directory, drain, enqueue, resolve_target,
     queue_artifact_reservation_bytes,
 )
-from agentctl.client import AgentPaneInfo, HerdrClient, Pane
+from agentctl.client import AgentPaneInfo, GuardedInput, HerdrClient, Pane
 from agentctl.chat_output import PaneAgentStatus, PaneOutputSnapshot, PaneOutputStream
 from agentctl.chat_storage import (
     CONFIG, LEGACY_REPLY, REPLY_INPUT, REQUEST, REST_RESPONSE, ArtifactClass,
@@ -782,9 +782,11 @@ class _NamedClient(HerdrClient):
     def workspace_label(self, workspace_id: str) -> str:
         return self._delegate.workspace_label(workspace_id)
 
-    def prompt_agent(self, pane_id: str, command: str) -> SubmissionReceipt | None:
+    def prompt_agent(
+        self, pane_id: str, command: str, *, terminal: GuardedInput | None = None,
+    ) -> SubmissionReceipt | None:
         self.pane_info(pane_id)
-        return self._delegate.prompt_agent(pane_id, command)
+        return self._delegate.prompt_agent(pane_id, command, terminal=terminal)
 
     def wait_agent_status(self, pane_id: str, status: str, timeout_ms: int) -> None:
         self.pane_info(pane_id)

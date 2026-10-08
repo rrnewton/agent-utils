@@ -81,6 +81,12 @@ state.setdefault("calls", []).append(args)
 current_pane = state.get("pane_id", "w1:p1")
 current_tab = state.get("tab_id", "w1:t1")
 current_workspace = state.get("workspace_id", "w1")
+current_terminal = state.get("terminal_id", "term-1")
+expected_terminal = None
+if (len(args) > 3 and args[2] == "--expect-terminal"
+        and args[:2] in (["pane", "send-text"], ["pane", "send-keys"], ["agent", "prompt"])):
+    expected_terminal = args[3]
+    args = args[:2] + args[4:]
 
 if args == ["goal-rpc"]:
     for line in sys.stdin:
@@ -163,6 +169,13 @@ def composer_screen():
         lines += ["", "  tab to queue message" if busy and draft else "  model default \u00b7 project"]
     return "\n".join(lines) + "\n"
 
+if expected_terminal is not None and (
+        not state.get("input_expect") or expected_terminal != current_terminal):
+    print(json.dumps({"error": {"code": "expectation_failed", "message":
+        f"pane {args[2]} holds terminal {current_terminal}, expected {expected_terminal}"}}),
+        file=sys.stderr)
+    save()
+    raise SystemExit(1)
 if args[:2] == ["pane", "list"]:
     if state.get("offline"):
         print("server unavailable", file=sys.stderr)
@@ -191,6 +204,8 @@ elif args[:2] == ["pane", "get"]:
         "agent": None if human or state.get("empty_shell") or (state.get("custom_harness") and not state.get("custom_reported")) else state.get("harness", "codex"),
         "agent_status": "unknown" if human or state.get("empty_shell") or (state.get("custom_harness") and not state.get("custom_reported")) else state.get("status", "idle"),
         "agent_session": None if human or state.get("empty_shell") or state.get("sessionless") or state.get("custom_harness") else {"agent": state.get("harness", "codex"), "value": "session-1"},
+        "terminal_id": "term-human" if human else current_terminal,
+        "tab_id": current_tab,
     }})
 elif args[:2] == ["pane", "process-info"]:
     if state.get("fail_process_info"):
@@ -215,14 +230,14 @@ elif args[:2] == ["pane", "process-info"]:
                    else state.get("launch_command", "/usr/local/bin/muse"))
         parsed = shlex.split(command)
         executable = parsed[0]
-        process_pid = state.get("custom_pid", 200)
+        process_pid = state.get("custom_pid") or state.get("harness_pid") or 200
         foreground_processes = [] if state.get("custom_identity_hidden") else [
             {"pid":process_pid, "name":os.path.basename(executable),
              "cmdline":command, "argv":parsed, "executable":executable}
         ]
         foreground_process_group_id = (
             process_pid + 1 if state.get("wrong_custom_process_group")
-            else process_pid if state.get("custom_pid") else 200
+            else process_pid if state.get("custom_pid") or state.get("harness_pid") else 200
         )
     envelope({"process_info": {
         "pane_id":current_pane, "shell_pid":shell_pid,
@@ -237,6 +252,7 @@ elif args[:2] == ["tab", "create"]:
     ]
     state["pane_id"] = "w1:p1"
     state["tab_id"] = "w1:t1"
+    state["tab_label"] = args[args.index("--label") + 1] if "--label" in args else ""
     state["workspace_id"] = args[args.index("--workspace") + 1]
     envelope({"tab": {"tab_id": "w1:t1"}, "root_pane": {
         "pane_id":"w1:p1", "tab_id":"w1:t1", "workspace_id":"w1",
@@ -244,11 +260,12 @@ elif args[:2] == ["tab", "create"]:
 elif args[:2] == ["pane", "close"]:
     if args[2] != current_pane:
         raise SystemExit("refusing unexpected pane close")
-    if state.get("custom_pid"):
-        try:
-            os.kill(state["custom_pid"], signal.SIGTERM)
-        except ProcessLookupError:
-            pass
+    for key in ("custom_pid", "harness_pid"):
+        if state.get(key):
+            try:
+                os.kill(state[key], signal.SIGTERM)
+            except ProcessLookupError:
+                pass
     state["closed"] = True
     state.setdefault("closed_panes", []).append(args[2])
 elif args[:2] in (["agent", "focus"], ["tab", "focus"]):
@@ -257,6 +274,12 @@ elif args[:2] == ["agent", "start"]:
     state["name"] = args[2]
     state["harness"] = args[args.index("--kind") + 1]
     state["launch_arguments"] = args[args.index("--") + 1:]
+    # A real process stands in for the harness so its kernel identity can be pinned.
+    harness = subprocess.Popen(
+        ["/bin/sleep", "60"], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL, start_new_session=True,
+    )
+    state["harness_pid"] = harness.pid
     if state.get("start_failure"):
         print("startup requires attention", file=sys.stderr)
         save()
@@ -293,7 +316,50 @@ elif args[:2] == ["agent", "get"]:
         print("named agent unavailable", file=sys.stderr)
         save()
         raise SystemExit(1)
-    envelope({"agent": {"name":args[2], "pane_id":current_pane}})
+    envelope({"agent": {"name":args[2], "pane_id":current_pane, "tab_id":current_tab,
+                        "terminal_id":current_terminal}})
+elif args[:2] == ["agent", "list"]:
+    agents = [] if state.get("closed") or not state.get("name") else [{
+        "name": state["name"], "pane_id": current_pane, "tab_id": current_tab,
+        "terminal_id": current_terminal,
+    }]
+    envelope({"agents": agents})
+elif args[:2] == ["agent", "rename"]:
+    if args[2] != current_pane:
+        print("missing pane", file=sys.stderr)
+        save()
+        raise SystemExit(1)
+    state["name"] = args[3]
+    envelope({"agent": {"name": args[3], "pane_id": current_pane}})
+elif args[:2] == ["tab", "get"]:
+    if args[2] != current_tab or state.get("closed"):
+        print("missing tab", file=sys.stderr)
+        save()
+        raise SystemExit(1)
+    envelope({"tab": {"tab_id": current_tab, "label": state.get("tab_label", ""),
+                      "workspace_id": current_workspace, "pane_count": 1}})
+elif args[:2] == ["tab", "list"]:
+    tabs = [] if state.get("closed") else [{
+        "tab_id": current_tab, "label": state.get("tab_label", ""),
+        "workspace_id": current_workspace,
+    }]
+    envelope({"tabs": tabs})
+elif args[:2] == ["tab", "rename"]:
+    if state.pop("fail_tab_rename_once", False):
+        print("injected tab rename failure", file=sys.stderr)
+        save()
+        raise SystemExit(1)
+    if args[2] != current_tab:
+        print("missing tab", file=sys.stderr)
+        save()
+        raise SystemExit(1)
+    state["tab_label"] = " ".join(args[3:])
+    envelope({"tab": {"tab_id": current_tab, "label": state["tab_label"],
+                      "workspace_id": current_workspace, "pane_count": 1}})
+elif args[:2] == ["status", "server"]:
+    print("status: running\nversion: 0.8.0\nprotocol: 20")
+    if state.get("input_expect"):
+        print("capabilities: input-expect")
 elif args[:2] == ["pane", "report-agent-session"]:
     state["reported_session"] = args[args.index("--agent-session-id") + 1]
 elif args[:2] == ["workspace", "get"]:
@@ -316,6 +382,8 @@ elif args[:2] == ["pane", "move"]:
     previous = current_pane
     state["pane_id"] = "w-project:p1"
     state["tab_id"] = "w-project:t1"
+    if "--label" in args:
+        state["tab_label"] = args[args.index("--label") + 1]
     state["workspace_id"] = destination
     envelope({"move_result": {
         "changed": True,
@@ -1602,7 +1670,11 @@ def _managed_lifecycle(harness: Harness, report: Report) -> None:
             if isinstance(item, dict):
                 return {
                     str(key): ("<TOKEN>" if key == "token" else 0 if key == "created_at"
-                               else "<ARCHIVE>" if key == "archive" else clean(child))
+                               else "<ARCHIVE>" if key == "archive"
+                               # Each edition's fixture runs its own harness process.
+                               else "<PROCESS_IDENTITY>"
+                               if key == "harness_identity" and child is not None
+                               else clean(child))
                     for key, child in item.items()
                 }
             return item
