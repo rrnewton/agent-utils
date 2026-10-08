@@ -1,10 +1,11 @@
 ---
 title: 'reply-coalesce: an N replies button that gathers a message''s replies under it, and Thread(N) on the thread chip'
-status: open
+status: closed
 priority: 2
 issue_type: feature
 created_at: 2026-10-08T14:24:01.907697401+00:00
-updated_at: 2026-10-08T14:24:01.907697401+00:00
+updated_at: 2026-10-08T19:06:08.695168877+00:00
+closed_at: 2026-10-08T19:06:08.695168766+00:00
 ---
 
 # Description

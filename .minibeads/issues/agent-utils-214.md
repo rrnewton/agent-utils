@@ -1,10 +1,11 @@
 ---
 title: 'reply-arrow: one arrow for a reply directly under its parent, another for a reply whose parent is elsewhere'
-status: open
+status: closed
 priority: 2
 issue_type: feature
 created_at: 2026-10-08T14:24:01.899752116+00:00
-updated_at: 2026-10-08T14:24:01.899752116+00:00
+updated_at: 2026-10-08T19:06:08.690703417+00:00
+closed_at: 2026-10-08T19:06:08.690703177+00:00
 ---
 
 # Description
