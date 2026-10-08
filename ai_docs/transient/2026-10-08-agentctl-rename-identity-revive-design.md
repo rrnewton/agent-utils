@@ -357,6 +357,21 @@ in the message (`agentctl anchor NAME`, after checking the pane). Automatic
 anchoring from what Herdr shows was rejected in review (finding 2): a
 restarted server can recreate every visible field for a different program.
 
+## F. Implementation review fixes (2026-10-08)
+
+| # | Finding | Resolution (both editions unless noted) |
+|---|---|---|
+| 1 | Misroute recovery absent; transport errors skip the post-check | Section E; a failed write now runs the post-check too, and only a definite mismatch counts as a misroute (an unverifiable check stays "possibly submitted"), so an outage never interrupts the right agent |
+| 2 | Anchor pins a surviving wrapper | The pinned process is the foreground process named like the harness (name, executable or script stem), else the only foreground process; verification needs that exact kernel lifetime among the foreground processes, not leadership. A recorded observed session is checked as well, never bypassed. Re-exec of the same binary keeps pid, start time and inode and stays indistinguishable |
+| 3 | Rename stuck when the harness exits | Recovery finishes the registry steps and skips the Herdr name/label steps whenever the surviving pane fails any non-presentation check (`herdr_steps: skipped-recipient-changed: ...`), so a replacement program is never relabelled |
+| 4 | Existing duplicate claims allow input | Every input checks a census of the other active records read as plain JSON (unreadable JSON refuses input); start, adopt, anchor, rename and repair use the same conservative census |
+| 5 | Goal-confirmation misroutes mishandled | The goal Enter goes through misroute recovery, and the confirmation wait translates misroute errors exactly like the submission does |
+| 6 | Doctor false clean; repair under-verifies | New `session-mismatch` and `cwd-mismatch` findings; the input check now covers workspace and cwd; repair adds harness kind, the census and a label-collision check under the locks |
+| 7 | Nested Python records without a remedy | `agentctl anchor` rewrites a nested v2/v3 record as schema 1 (an asserted session moves to `goal_session_id`, never to the observed field) and reports `migrated_from`. Python only: the Rust edition cannot read nested records at all |
+| 8 | Probe calls a corrupt active record dead | A record without a string name makes the probe unverifiable, and an active directory named AGENT always counts as a claim |
+| 9 | Rename 257 makes an unloadable record | Rename refuses at 256 history entries, before any change |
+| - | Differential masked all of `harness_identity` | Only `pid` and `starttime_ticks` are masked now |
+
 ## C. What was built and how it was verified (2026-10-08)
 
 Both editions, one commit on the agent-utils branch:
