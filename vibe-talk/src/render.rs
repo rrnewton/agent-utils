@@ -33,6 +33,32 @@
 //! Step 5 is the boundary. Steps 1 to 4 decide what the message LOOKS like, and none of them is
 //! trusted to keep anything out: a mistake there is a rendering bug, never an injection.
 //!
+//! # What a body may cost
+//!
+//! Anyone in a channel writes the text rendered here, bots included, and it is rendered on every
+//! page load, every refresh and every live event, inside the request that asked. So the work for
+//! one body is bounded, three ways out of four before it starts, and a body past a bound is simply
+//! drawn as plain paragraphs — the same answer as a sentence with no Markdown in it, never an error
+//! and never unsanitized text. One bound for each way the work or the answer could outgrow the
+//! text:
+//!
+//! - **Length** ([`MAX_RENDERED_BYTES`]). Within the other bounds, comrak and the sanitizer are
+//!   linear in what they read, so this holds one body to a few milliseconds.
+//! - **Table cells** ([`MAX_TABLE_CELLS`]). GFM pads every row of a table out to its header's
+//!   width, so a wide header over many one-character rows is a few kilobytes of text and C × R
+//!   cells: 2,000 characters made 840 KB of HTML, and 20,000 made 83 MB in 38 seconds. The cells
+//!   are counted from the text before it is parsed ([`table_cells_bound`]); past the budget, the
+//!   message renders with tables off and its pipes are shown as written, which is how Discord,
+//!   Google Chat and Slack draw them anyway.
+//! - **Depth** ([`MAX_DEPTH`]). comrak builds twenty thousand nested quotes from twenty thousand
+//!   `>` in a millisecond, but the sanitizer's HTML parser does work for every open element at
+//!   every new one, and took 2.2 seconds over thirty-two thousand. The parsed tree is measured
+//!   before anything is written.
+//! - **Growth** ([`MAX_GROWTH`]). What comes out may be several times what went in — a link is
+//!   its address twice and a `rel` — but a body whose HTML grew far beyond that is sent as text
+//!   instead, so a window of a hundred messages, and the offline copy a phone keeps of it, stays
+//!   the size of its words.
+//!
 //! # What the page is sent
 //!
 //! [`body_html`] answers EMPTY when the HTML says nothing the text does not — a message of plain
@@ -50,8 +76,10 @@
 
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
+use std::ops::Range;
 use std::sync::LazyLock;
 
+use comrak::arena_tree::NodeEdge;
 use comrak::nodes::{AstNode, NodeValue};
 use comrak::{Arena, Options};
 
@@ -87,16 +115,32 @@ impl Markup {
     /// code spans, a lone asterisk in arithmetic — and only the MEANING of an asterisk emphasis
     /// changes: it is drawn as strong. `**a**` is strong in every dialect already, so text written
     /// as Markdown by an agent reads the same; `_a_` stays italic, as both services draw it.
+    ///
+    /// Its other half: neither service has a double-underscore bold, so there `__init__.py` is the
+    /// file it names, and the strong emphasis CommonMark reads in it is put back as the
+    /// underscores that were written. Discord keeps CommonMark's reading, where Discord's own
+    /// client underlines it.
     #[must_use]
     pub fn asterisk_is_bold(self) -> bool {
         matches!(self, Self::GoogleChat | Self::Slack)
     }
 
     /// The text as Markdown, before it is parsed.
-    fn prepare(self, text: &str) -> Cow<'_, str> {
+    ///
+    /// A labelled link is rewritten only OUTSIDE code. Inside a code span or a code block it is
+    /// text the writer meant to show as written, and comrak, not this module, says where code is:
+    /// the text is parsed once as it stands to find out, and only when it holds a link to rewrite
+    /// at all, which almost no message does.
+    fn prepare<'t>(self, text: &'t str, options: &Options) -> Cow<'t, str> {
         match self {
             Self::Discord => Cow::Borrowed(text),
-            Self::GoogleChat | Self::Slack => crate::slack::mrkdwn::angle_links(text),
+            Self::GoogleChat | Self::Slack => {
+                use crate::slack::mrkdwn::angle_links_outside;
+                match angle_links_outside(text, &[]) {
+                    Cow::Borrowed(text) => Cow::Borrowed(text),
+                    Cow::Owned(_) => angle_links_outside(text, &code_ranges(text, options)),
+                }
+            }
         }
     }
 }
@@ -165,17 +209,131 @@ pub fn body_html(text: &str, markup: Markup) -> String {
     }
 }
 
-/// The sanitized HTML for one body, always.
+/// The sanitized HTML for one body, always: rendered, or, past one of the bounds in the module
+/// note, the [`plain_html`] the page would draw without it.
 #[must_use]
 pub fn to_html(text: &str, markup: Markup) -> String {
-    let source = markup.prepare(text);
+    if text.len() > MAX_RENDERED_BYTES {
+        return plain_html(text);
+    }
+    let options = options(table_cells_bound(text) <= MAX_TABLE_CELLS);
+    let source = markup.prepare(text, &options);
     let arena = Arena::new();
-    let options = options();
     let root = comrak::parse_document(&arena, &source, &options);
+    if deeper_than(root, MAX_DEPTH) {
+        return plain_html(text);
+    }
     adjust(&arena, root, &source, markup);
     let mut html = String::new();
     comrak::format_html(root, &options, &mut html).expect("formatting into a String cannot fail");
-    SANITIZER.clean(&html).to_string()
+    let html = SANITIZER.clean(&html).to_string();
+    if html.len() > text.len().saturating_mul(MAX_GROWTH) + GROWTH_ALLOWANCE {
+        return plain_html(text);
+    }
+    html
+}
+
+/// The longest body rendered, in bytes. Four times the longest message Discord or Google Chat
+/// accepts, so every message of theirs renders, in any script; a longer one — a Slack post near
+/// its own forty-thousand-character ceiling — is drawn as plain paragraphs. See the module note.
+pub const MAX_RENDERED_BYTES: usize = 16 * 1024;
+
+/// The most table cells one body may make, counted before parsing by [`table_cells_bound`]: a
+/// table of twelve columns and a hundred and fifty rows, larger than anything written in a chat,
+/// at about twenty kilobytes of HTML.
+pub const MAX_TABLE_CELLS: usize = 2_000;
+
+/// The deepest the parsed tree may nest, counting every node from the document down to a word:
+/// a dozen lists inside one another with a link in bold at the bottom. Far below where the
+/// sanitizer's cost for nesting is measurable, and far beyond what a phone could indent.
+pub const MAX_DEPTH: usize = 32;
+
+/// How many times the length of its text a body's HTML may be, beyond [`GROWTH_ALLOWANCE`].
+///
+/// A link written as a bare address is the largest ordinary growth: its address twice, the
+/// `target` and the `rel`, six to ten times a short address on a line of its own. A list of
+/// nothing but addresses still renders; what does not is HTML that grew from something that is
+/// not writing, such as hundreds of empty checkboxes.
+pub const MAX_GROWTH: usize = 8;
+
+/// The HTML every body may have beyond [`MAX_GROWTH`] times its text, so a short message is never
+/// held to a ratio its few characters cannot meet.
+pub const GROWTH_ALLOWANCE: usize = 8 * 1024;
+
+/// An upper bound on the table cells comrak would make of `text`, read without parsing it.
+///
+/// A table's width is its delimiter row's cell count, and each of those cells holds at least one
+/// hyphen, so no table is wider than the line of its run with the most runs of hyphens. Its rows
+/// all sit in one run of non-blank lines, because a blank line ends a table. So each run of lines
+/// contributes at most its widest line times its length, and the bound is their sum.
+///
+/// Deliberately generous: any line counts, whatever else is on it, and only a line of nothing but
+/// spaces and tabs is blank — exactly the lines comrak calls blank, or fewer. Overcounting only
+/// turns tables off for a message that has none, which changes nothing; undercounting is the one
+/// mistake that matters, and line endings are split as comrak splits them so a lone `\r` cannot
+/// hide a table from this count.
+#[must_use]
+pub fn table_cells_bound(text: &str) -> usize {
+    let mut total = 0_usize;
+    let (mut widest, mut lines) = (0_usize, 0_usize);
+    let all_lines = text
+        .split('\n')
+        .flat_map(|line| line.strip_suffix('\r').unwrap_or(line).split('\r'));
+    for line in all_lines {
+        if line.bytes().all(|byte| matches!(byte, b' ' | b'\t')) {
+            total = total.saturating_add(widest.saturating_mul(lines));
+            (widest, lines) = (0, 0);
+            continue;
+        }
+        lines += 1;
+        let runs = line
+            .split(|character| character != '-')
+            .filter(|run| !run.is_empty())
+            .count();
+        widest = widest.max(runs);
+    }
+    total.saturating_add(widest.saturating_mul(lines))
+}
+
+/// Whether the tree under `root` nests more than `limit` deep, counting `root`.
+fn deeper_than<'a>(root: &'a AstNode<'a>, limit: usize) -> bool {
+    let mut depth = 0_usize;
+    for edge in root.traverse() {
+        match edge {
+            NodeEdge::Start(_) => {
+                depth += 1;
+                if depth > limit {
+                    return true;
+                }
+            }
+            NodeEdge::End(_) => depth -= 1,
+        }
+    }
+    false
+}
+
+/// Where `text` holds code, by byte, as comrak reads it with `options`: each code span from its
+/// first backtick to its last, and each code block as the whole lines it spans.
+fn code_ranges(text: &str, options: &Options) -> Vec<Range<usize>> {
+    let arena = Arena::new();
+    let root = comrak::parse_document(&arena, text, options);
+    let lines = line_starts(text);
+    let line_start = |line: usize| lines.get(line.wrapping_sub(1)).copied();
+    let mut ranges = Vec::new();
+    for node in root.descendants() {
+        let ast = node.data.borrow();
+        let (start, end) = (ast.sourcepos.start, ast.sourcepos.end);
+        let range = match ast.value {
+            NodeValue::Code(_) => offset(&lines, start.line, start.column)
+                .zip(offset(&lines, end.line, end.column))
+                .map(|(from, to)| from..to + 1),
+            NodeValue::CodeBlock(_) => line_start(start.line)
+                .map(|from| from..line_start(end.line + 1).unwrap_or(text.len())),
+            _ => None,
+        };
+        ranges.extend(range);
+    }
+    ranges
 }
 
 /// How the page draws a body that has no HTML: each run of lines that are not blank is a
@@ -217,11 +375,13 @@ fn escape_text(out: &mut String, text: &str) {
     }
 }
 
-/// comrak's settings. A function rather than a static because they are a handful of booleans.
-fn options() -> Options<'static> {
+/// comrak's settings, with or without tables. A function rather than a static because they are a
+/// handful of booleans.
+fn options(tables: bool) -> Options<'static> {
     let mut options = Options::default();
     options.extension.strikethrough = true;
-    options.extension.table = true;
+    // Off only for a message whose tables would cost more than they show: see `MAX_TABLE_CELLS`.
+    options.extension.table = tables;
     options.extension.tasklist = true;
     // A bare `https://…` or `www.…` is a link. Chat is full of pasted addresses, and a message
     // whose links have to be copied out by hand is the failure this whole module is about.
@@ -347,6 +507,21 @@ fn adjust<'a>(arena: &'a Arena<'a>, root: &'a AstNode<'a>, source: &str, markup:
                     ast.value = NodeValue::Strong;
                 }
             }
+            // The other half of the same rule: `__a__` is not bold where `*a*` is, so the
+            // underscores are text again, around whatever they held.
+            NodeValue::Strong if markup.asterisk_is_bold() => {
+                let at = offset(&lines, ast.sourcepos.start.line, ast.sourcepos.start.column);
+                if at.and_then(|at| source.as_bytes().get(at)) == Some(&b'_') {
+                    drop(ast);
+                    let underscores = || arena.alloc(NodeValue::Text("__".into()).into());
+                    node.insert_before(underscores());
+                    for kid in node.children().collect::<Vec<_>>() {
+                        node.insert_before(kid);
+                    }
+                    node.insert_before(underscores());
+                    node.detach();
+                }
+            }
             // A block of raw HTML is text like any other line in chat. Escaped by comrak as one
             // run with its newlines collapsed; as a paragraph its lines stay lines.
             NodeValue::HtmlBlock(block) => {
@@ -386,9 +561,19 @@ fn adjust<'a>(arena: &'a Arena<'a>, root: &'a AstNode<'a>, source: &str, markup:
 
 /// Whether a link's address is one a tap can be trusted with. The sanitizer enforces the same
 /// rule; this is only where the page is told what to SHOW instead.
+///
+/// Asked exactly as the sanitizer will ask it, so the two never disagree: of the `href` comrak
+/// will write — its percent-encoding, then the two entities it uses, decoded as an HTML parser
+/// decodes them — parsed by the same URL parser. An address the sanitizer would strip, such as
+/// one whose host holds a `|`, is shown as text here, rather than reaching the page as a link
+/// with nowhere to go.
 fn web_address(url: &str) -> bool {
-    let scheme = url.get(..8).unwrap_or(url).to_ascii_lowercase();
-    scheme.starts_with("http://") || scheme.starts_with("https://")
+    let mut href = String::new();
+    if comrak::html::escape_href(&mut href, url, false).is_err() {
+        return false;
+    }
+    let href = href.replace("&#x27;", "'").replace("&amp;", "&");
+    url::Url::parse(&href).is_ok_and(|parsed| matches!(parsed.scheme(), "http" | "https"))
 }
 
 /// Replace a link that may not be followed with its own text and, after it, the address it
@@ -520,7 +705,12 @@ fn offset(lines: &[usize], line: usize, column: usize) -> Option<usize> {
 
 #[cfg(test)]
 mod tests {
-    use super::{body_html, plain_html, to_html, Markup, SANITIZER};
+    use std::time::{Duration, Instant};
+
+    use super::{
+        body_html, plain_html, table_cells_bound, to_html, Markup, GROWTH_ALLOWANCE, MAX_DEPTH,
+        MAX_GROWTH, MAX_RENDERED_BYTES, MAX_TABLE_CELLS, SANITIZER,
+    };
 
     const LINK: &str = r#"target="_blank" rel="noopener noreferrer nofollow""#;
 
@@ -863,5 +1053,208 @@ mod tests {
             "<p>a<br>\nb</p>\n<p>c &amp;&lt;&gt;</p>\n"
         );
         assert_eq!(plain_html("\n\n"), "");
+    }
+
+    /// The table shape from the review of `#217 markdown-blocks`: a header and delimiter row of
+    /// `columns` cells over `rows` one-character rows. GFM pads every row to the header's width,
+    /// so before the cell budget this was `columns × rows` cells — 840 KB of HTML from 2,001
+    /// characters, 83 MB from 20,001.
+    fn padded_table(columns: usize, rows: usize, newline: &str) -> String {
+        format!(
+            "{}{newline}{}{newline}{}",
+            "|a".repeat(columns),
+            "|-".repeat(columns),
+            format!("|b{newline}").repeat(rows)
+        )
+    }
+
+    #[test]
+    fn a_table_that_pads_out_to_millions_of_cells_costs_what_its_text_does() {
+        let started = Instant::now();
+        for (columns, rows) in [(250, 333), (500, 666), (1_500, 2_000)] {
+            for newline in ["\n", "\r\n", "\r"] {
+                let text = padded_table(columns, rows, newline);
+                assert!(text.len() <= MAX_RENDERED_BYTES, "{} bytes", text.len());
+                assert!(table_cells_bound(&text) > MAX_TABLE_CELLS);
+                let html = body_html(&text, Markup::GoogleChat);
+                assert!(
+                    html.len() <= 2 * text.len(),
+                    "{columns} columns over {rows} rows ({newline:?}): {} bytes of text became \
+                     {} of HTML",
+                    text.len(),
+                    html.len()
+                );
+                assert!(!html.contains("<td"), "the padded table was still drawn");
+            }
+        }
+        let took = started.elapsed();
+        assert!(
+            took < Duration::from_secs(5),
+            "nine padded tables, the largest 14 KB, took {took:?}"
+        );
+    }
+
+    #[test]
+    fn a_table_within_the_budget_is_a_table_and_the_count_only_overcounts() {
+        // Twelve columns by a hundred and fifty rows: the size the budget is set at.
+        let row = |cell: &str| format!("|{}\n", format!("{cell}|").repeat(12));
+        let text = format!("{}{}{}", row("h"), row("-"), row("1").repeat(150));
+        assert!(table_cells_bound(&text) <= MAX_TABLE_CELLS);
+        let html = to_html(&text, Markup::Discord);
+        assert_eq!(html.matches("<td>").count(), 12 * 150);
+        assert_eq!(html.matches("<th>").count(), 12);
+        // One column more and it is over, and drawn as the text it is.
+        let wide = text.replace("|h|", "|h|h|").replace("|-|", "|-|-|");
+        assert!(table_cells_bound(&wide) > MAX_TABLE_CELLS);
+        assert!(!to_html(&wide, Markup::Discord).contains("<table>"));
+
+        // Each run of lines counts on its own, and a blank line ends one.
+        assert_eq!(table_cells_bound("|a|b|\n|-|-|\n|1|2|"), 6);
+        assert_eq!(table_cells_bound("|a|b|\n|-|-|\n \t\n|a|\n|-|"), 2 * 2 + 2);
+        // A lone carriage return ends a line for comrak, so it does here, and `\r\n` is one line
+        // ending rather than two with a blank line between them.
+        assert_eq!(table_cells_bound("|a|b|\r|-|-|\r|1|2|"), 6);
+        assert_eq!(table_cells_bound("|a|b|\r\n|-|-|\r\n|1|2|"), 6);
+        // Prose with a hyphen in it counts too, which costs nothing: it has no table to turn off.
+        assert_eq!(table_cells_bound("well-known\nup-to-date"), 2 * 2);
+    }
+
+    #[test]
+    fn nesting_deeper_than_anything_written_is_drawn_as_text() {
+        let started = Instant::now();
+        for text in [
+            ">".repeat(16_000),
+            "> ".repeat(8_000),
+            "- ".repeat(8_000) + "a",
+            (0..100)
+                .map(|depth| format!("{}- a\n", "  ".repeat(depth)))
+                .collect(),
+        ] {
+            assert_eq!(body_html(&text, Markup::Discord), "", "{:?}…", &text[..20]);
+        }
+        let took = started.elapsed();
+        assert!(
+            took < Duration::from_secs(5),
+            "four deeply nested bodies took {took:?}"
+        );
+        // A dozen levels of list, with emphasis and a link at the bottom, is well inside.
+        let deep: String = (0..12)
+            .map(|depth| format!("{}- level {depth}\n", "  ".repeat(depth)))
+            .collect::<String>()
+            + &"  ".repeat(12)
+            + "- **see [it](https://example.com)**";
+        let html = to_html(&deep, Markup::Discord);
+        assert_eq!(html.matches("<ul>").count(), 13, "{html}");
+        assert!(html.contains("<strong>see <a href=\"https://example.com\""));
+        // ...and the limit is the one stated: the document, its quotes, a paragraph and a word.
+        let at_limit = format!("{}a", "> ".repeat(MAX_DEPTH - 3));
+        assert!(to_html(&at_limit, Markup::Discord).contains("<blockquote>"));
+        let past = format!("{}a", "> ".repeat(MAX_DEPTH - 2));
+        assert_eq!(body_html(&past, Markup::Discord), "");
+    }
+
+    #[test]
+    fn a_body_past_the_length_bound_is_drawn_as_text() {
+        let fits = "- an item\n".repeat(MAX_RENDERED_BYTES / 10);
+        assert!(fits.len() <= MAX_RENDERED_BYTES);
+        assert!(body_html(&fits, Markup::Discord).starts_with("<ul>"));
+        let over = format!("{fits}- one more\n");
+        assert!(over.len() > MAX_RENDERED_BYTES);
+        assert_eq!(body_html(&over, Markup::Discord), "");
+    }
+
+    #[test]
+    fn html_far_larger_than_its_text_is_sent_as_text() {
+        // Empty checkboxes are the largest growth there is: about seventeen times their text.
+        let boxes = "- [ ]\n".repeat(2_000);
+        assert_eq!(body_html(&boxes, Markup::Discord), "");
+        // A message of nothing but short addresses, one to a line, is the largest ordinary growth,
+        // and still renders.
+        let addresses = "- www.example.com\n".repeat(400);
+        let html = body_html(&addresses, Markup::Discord);
+        assert_eq!(html.matches("<a href=").count(), 400);
+        assert!(html.len() <= addresses.len() * MAX_GROWTH + GROWTH_ALLOWANCE);
+        // And a short message is never held to the ratio.
+        assert!(body_html("- [ ]\n- [ ]", Markup::Discord).contains("checkbox"));
+    }
+
+    #[test]
+    fn a_labelled_link_inside_code_is_left_as_written() {
+        let link = "<https://example.com/d|the doc>";
+        let anchor = format!("<a href=\"https://example.com/d\" {LINK}>the doc</a>");
+        for markup in [Markup::GoogleChat, Markup::Slack] {
+            for (text, expected) in [
+                (
+                    format!("`{link}` but {link}"),
+                    format!(
+                        "<p><code>&lt;https://example.com/d|the doc&gt;</code> but {anchor}</p>\n"
+                    ),
+                ),
+                (
+                    format!("```\n{link}\n```\n{link}"),
+                    format!(
+                        "<pre><code>&lt;https://example.com/d|the doc&gt;\n</code></pre>\n\
+                         <p>{anchor}</p>\n"
+                    ),
+                ),
+                (
+                    format!("- `{link}`\n> `{link}` {link}"),
+                    format!(
+                        "<ul>\n<li><code>&lt;https://example.com/d|the doc&gt;</code></li>\n</ul>\n\
+                         <blockquote>\n<p><code>&lt;https://example.com/d|the doc&gt;</code> \
+                         {anchor}</p>\n</blockquote>\n"
+                    ),
+                ),
+                (
+                    format!("    {link}\n\n{link}"),
+                    format!(
+                        "<pre><code>&lt;https://example.com/d|the doc&gt;\n</code></pre>\n\
+                         <p>{anchor}</p>\n"
+                    ),
+                ),
+            ] {
+                assert_eq!(to_html(&text, markup), expected, "{markup:?} {text:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn an_address_the_sanitizer_would_strip_is_shown_as_text() {
+        // Discord's dialect reads `<https://a.test|label>` as a CommonMark autolink whose host
+        // holds a `|`, which the sanitizer's URL parser refuses. It used to reach the page as a
+        // link with no address; it is the text it was.
+        assert_eq!(
+            html("see <https://a.test|label>"),
+            "<p>see https://a.test|label</p>\n"
+        );
+        assert_eq!(
+            html("[x](<https://a b/>) [y](https://[::1/)"),
+            "<p>x (https://a b/) y (https://[::1/)</p>\n"
+        );
+        // An address the parser takes stays a link, whatever comrak had to encode in it.
+        assert_eq!(
+            html("[q](<https://example.com/a b?c='d'&e>)"),
+            format!("<p><a href=\"https://example.com/a%20b?c='d'&amp;e\" {LINK}>q</a></p>\n")
+        );
+    }
+
+    #[test]
+    fn double_underscores_are_text_where_one_asterisk_is_bold() {
+        for markup in [Markup::GoogleChat, Markup::Slack] {
+            assert_eq!(
+                to_html("__init__.py and __a *b* c__ and _it_", markup),
+                "<p>__init__.py and __a <strong>b</strong> c__ and <em>it</em></p>\n",
+                "{markup:?}"
+            );
+            assert_eq!(
+                to_html("**bold**", markup),
+                "<p><strong>bold</strong></p>\n"
+            );
+        }
+        assert_eq!(
+            html("__init__.py"),
+            "<p><strong>init</strong>.py</p>\n",
+            "Discord keeps CommonMark's reading"
+        );
     }
 }

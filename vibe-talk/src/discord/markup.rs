@@ -20,6 +20,10 @@ const MAX_ID: usize = 32;
 /// role, `<@&id>`, is left as text, as the page has always drawn it.
 ///
 /// The chip's characters are exactly the sigil and the id, so it needs no escaping in HTML.
+///
+/// The closing `>` is looked for only as far as the longest id could reach. A search to the end of
+/// the text would read the whole rest of the message for every `<@` in it, and a message of
+/// nothing but `<@` would take time that grew with the square of its length.
 #[must_use]
 pub fn mention_at(text: &str) -> Option<(usize, String)> {
     let (sigil, after) = if let Some(rest) = text.strip_prefix("<@!") {
@@ -29,7 +33,10 @@ pub fn mention_at(text: &str) -> Option<(usize, String)> {
     } else {
         ('#', text.strip_prefix("<#")?)
     };
-    let end = after.find('>')?;
+    let end = after
+        .bytes()
+        .take(MAX_ID + 1)
+        .position(|byte| byte == b'>')?;
     let id = &after[..end];
     if id.is_empty() || id.len() > MAX_ID || !id.bytes().all(|b| b.is_ascii_alphanumeric()) {
         return None;
@@ -67,5 +74,29 @@ mod tests {
         ] {
             assert_eq!(mention_at(text), None, "{text:?} was read as a mention");
         }
+    }
+
+    #[test]
+    fn a_message_of_unclosed_mentions_is_read_in_time_that_grows_with_its_length() {
+        // Each `<@` once searched the whole rest of the text for its `>`. That search is fast enough
+        // that it takes a megabyte of them to show, which is why the text is so long.
+        let text = "<@".repeat(512 * 1024);
+        let started = std::time::Instant::now();
+        let mut rest = text.as_str();
+        while !rest.is_empty() {
+            assert_eq!(mention_at(rest), None);
+            rest = &rest[2..];
+        }
+        let took = started.elapsed();
+        assert!(
+            took < std::time::Duration::from_secs(2),
+            "a megabyte of unclosed mentions took {took:?}"
+        );
+        // The longest id still closes.
+        let longest = format!("<@{}>", "9".repeat(32));
+        assert_eq!(
+            mention_at(&longest),
+            Some((35, format!("@{}", "9".repeat(32))))
+        );
     }
 }

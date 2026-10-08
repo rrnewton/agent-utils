@@ -484,6 +484,12 @@ pub async fn ingest_event(
     // This is the live path, so it is the one `read new` relays from: a message reaches the page
     // already carrying the body a voice should say, with no second round trip on the leg that is
     // most latency-sensitive.
+    //
+    // `#217 markdown-blocks`. Nor is the rendered body an adapter's to supply, and of the three it
+    // matters most: it is HTML the page inserts as it stands, so only this server's renderer and
+    // sanitizer may write it. Cleared here, for every kind, and rendered again on the way out to
+    // each page by `live::judge`; no subscriber of the hub ever sees what an adapter put there.
+    message.content_html = String::new();
     if kind == crate::live::LiveKind::Delete {
         message.spoken_time = String::new();
         message.spoken_content = String::new();

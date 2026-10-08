@@ -10244,6 +10244,7 @@ test("message text is styled as one block family: bullets, hanging indent, parag
   assert.match(cssBlock(".md"), /white-space:\s*normal/, "the server's newlines between blocks would draw as lines");
   assert.match(cssBlock(".md ul"), /list-style-type:\s*disc/, "a list has no round bullets");
   assert.match(cssBlock(".md ul ul"), /list-style-type:\s*circle/);
+  assert.match(cssBlock(".md ul ul ul"), /list-style-type:\s*square/, "a third level reuses the second's marker");
   // An item is not a row: the shared sheet's `.messages li` panel must not reach it.
   assert.match(cssRules(SHARED_CSS, ".messages li").join("\n"), /padding:/, "the row rule this resets moved");
   const item = cssBlock(".md li");

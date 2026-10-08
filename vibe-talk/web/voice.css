@@ -3125,8 +3125,14 @@ body {
   margin: 0;
 }
 
+/* Disc, circle, then square from the third level down, as the chat clients and a browser's own
+   sheet mark depth, so a reader can tell two levels of a deep list apart by their markers. */
 .md ul ul {
   list-style-type: circle;
+}
+
+.md ul ul ul {
+  list-style-type: square;
 }
 
 .md li + li,

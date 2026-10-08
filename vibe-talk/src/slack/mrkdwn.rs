@@ -23,6 +23,7 @@
 //! [`crate::render::Markup::asterisk_is_bold`].
 
 use std::borrow::Cow;
+use std::ops::Range;
 
 /// Rewrite Slack `mrkdwn` into the Discord-markdown forms the rest of the server reads.
 #[must_use]
@@ -158,8 +159,11 @@ fn user_mention_at(text: &str) -> Option<&str> {
 ///
 /// The address goes in angle brackets so that a parenthesis in it cannot end the link early, and
 /// a bracket in the label is escaped so that it cannot either.
+///
+/// A link that overlaps any of the byte ranges in `code` is left as written: the renderer passes
+/// the code spans and blocks comrak found, where the text is shown exactly as typed.
 #[must_use]
-pub fn angle_links(text: &str) -> Cow<'_, str> {
+pub fn angle_links_outside<'t>(text: &'t str, code: &[Range<usize>]) -> Cow<'t, str> {
     let mut out = String::new();
     let mut copied = 0;
     let mut from = 0;
@@ -169,6 +173,12 @@ pub fn angle_links(text: &str) -> Cow<'_, str> {
         let Some((length, href, label)) = angle_link_at(&text[at..]) else {
             continue;
         };
+        if code
+            .iter()
+            .any(|range| range.start < at + length && at < range.end)
+        {
+            continue;
+        }
         out.push_str(&text[copied..at]);
         out.push('[');
         for character in label.chars() {
@@ -193,11 +203,17 @@ pub fn angle_links(text: &str) -> Cow<'_, str> {
 /// `<https://x|label>` at the start of `text`, with a label that is not empty and not the address
 /// itself, as its length, the address and the label. A bare `<https://x>` is already a CommonMark
 /// autolink and is left alone.
+///
+/// The search for the closing bracket stops at the next `<` too, because an address or a label
+/// holding one is not a link. That is also what keeps a whole message linear: the next search
+/// starts from that `<`, so no character is read twice, where a search to the end of the line
+/// from every `<` in a line of them is quadratic.
 fn angle_link_at(text: &str) -> Option<(usize, &str, &str)> {
-    let inner = &text[1..text.find(['>', '\n'])?];
-    if text.as_bytes().get(1 + inner.len()) != Some(&b'>') || inner.contains('<') {
+    let close = 1 + text[1..].find(['>', '\n', '<'])?;
+    if text.as_bytes()[close] != b'>' {
         return None;
     }
+    let inner = &text[1..close];
     let (href, label) = inner.split_once('|')?;
     let scheme = href.get(..8).unwrap_or(href).to_ascii_lowercase();
     if !(scheme.starts_with("http://") || scheme.starts_with("https://"))
@@ -211,7 +227,13 @@ fn angle_link_at(text: &str) -> Option<(usize, &str, &str)> {
 
 #[cfg(test)]
 mod tests {
-    use super::angle_links;
+    use std::borrow::Cow;
+
+    use super::angle_links_outside;
+
+    fn angle_links(text: &str) -> Cow<'_, str> {
+        angle_links_outside(text, &[])
+    }
 
     #[test]
     fn a_labelled_link_becomes_a_markdown_link_and_nothing_else_changes() {
@@ -239,6 +261,33 @@ mod tests {
             "a < b > c",
         ] {
             assert_eq!(angle_links(text), text, "{text:?} was rewritten");
+        }
+    }
+
+    #[test]
+    fn a_link_inside_code_is_left_as_written() {
+        let text = "`<https://a.test|b>` then <https://c.test|d>";
+        let code = 0..20;
+        assert_eq!(
+            angle_links_outside(text, std::slice::from_ref(&code)),
+            "`<https://a.test|b>` then [d](<https://c.test>)"
+        );
+        // Overlapping a range at either end is inside it.
+        assert_eq!(angle_links_outside(text, &[5..6, 40..41]), text);
+    }
+
+    #[test]
+    fn a_line_of_angle_brackets_is_read_once() {
+        // Each `<` used to search to the end of its line for a `>`, so a line of them took time
+        // that grew with the square of its length: channel text, read on every page load.
+        for text in ["<".repeat(64 * 1024), "<h".repeat(32 * 1024)] {
+            let started = std::time::Instant::now();
+            assert_eq!(angle_links(&text), text);
+            let took = started.elapsed();
+            assert!(
+                took < std::time::Duration::from_secs(2),
+                "64 KiB of angle brackets took {took:?}"
+            );
         }
     }
 }

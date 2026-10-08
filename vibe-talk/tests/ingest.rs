@@ -423,6 +423,46 @@ async fn a_pushed_message_arrives_carrying_the_body_a_voice_should_say() {
 }
 
 #[tokio::test]
+async fn a_rendered_body_an_adapter_sends_never_reaches_the_hub_or_the_page() {
+    // `#217 markdown-blocks`. `content_html` is HTML the page inserts as it stands, so this
+    // server's sanitizer is the only writer it may have. The stream renders every message again on
+    // its way out, but that is one consumer's habit, not a property of the hub: whatever reads the
+    // hub next must not find an adapter's markup waiting in it.
+    let (app, live) = enabled();
+    let channel = ChannelId(READ_CHANNEL.to_owned());
+    let mut subscription = live.subscribe(&channel, None);
+    let stream = open_stream(&app, None).await;
+    assert_eq!(stream.status(), StatusCode::OK);
+    let mut body = stream.into_body();
+
+    let smuggled = "<img src=x onerror=alert(1)><a href=\"javascript:alert(2)\">x</a>";
+    let mut event = create("event-html", "10", false);
+    event["message"]["content"] = json!("- a\n- b");
+    event["message"]["content_html"] = json!(smuggled);
+    assert_eq!(
+        post(&app, Some(INGEST_TOKEN), event).await.0,
+        StatusCode::ACCEPTED
+    );
+    let held = subscription
+        .receiver
+        .try_recv()
+        .expect("create broadcast")
+        .message;
+    assert_eq!(held.content_html, "", "an adapter's HTML entered the hub");
+
+    let text = read_events(&mut body, 1).await;
+    let payload: Value = text
+        .lines()
+        .find_map(|line| line.strip_prefix("data:"))
+        .map(|json| serde_json::from_str(json.trim()).expect("json"))
+        .expect("a data line");
+    assert_eq!(
+        payload["message"]["content_html"], "<ul>\n<li>a</li>\n<li>b</li>\n</ul>\n",
+        "the page was not sent this server's own rendering of the text"
+    );
+}
+
+#[tokio::test]
 async fn uid_endings_are_stable_across_two_pushed_messages() {
     // The same compact UID form is used for independent live arrivals.
     let (app, live) = enabled();

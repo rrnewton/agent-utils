@@ -106,6 +106,10 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # Response compression. Everything the server sent went out uncompressed — the page script alone
 # was 836 KB on every cold load, over phone and airplane links. Already in the tree transitively.
 tower-http = { version = "0.6", default-features = false, features = ["compression-br", "compression-gzip"] }
+# The URL parser ammonia judges a link's address with, asked the same question before the HTML is
+# written so a link the sanitizer would strip is shown as text instead. Already in the tree through
+# ammonia and reqwest; see `render::web_address`.
+url = "2"
 
 [dev-dependencies]
 http-body-util = "0.1"

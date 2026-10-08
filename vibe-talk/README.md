@@ -2691,25 +2691,38 @@ live stream, a post's answer and the pins — and sends it beside the text as `c
 
 1. The provider's own syntax is turned into Markdown first. Every provider's mention, `<@id>` or
    `<#id>`, becomes a chip showing the id; a `<https://…|label>` link from Google Chat or Slack
-   becomes a link named by its label.
+   becomes a link named by its label, except inside code, where it is shown as written.
 2. [comrak](https://github.com/kivikakk/comrak) parses GitHub-flavoured Markdown — tables,
    strikethrough, task lists, and bare `https://…` and `www.…` addresses as links — with chat's two
    line rules: a single newline is a line break, and only a blank line starts a paragraph. A line
    of `---` under a sentence is a rule, not a heading.
 3. On Google Chat and Slack, where `*a*` means bold, an asterisk emphasis is drawn bold; `_a_` stays
-   italic and `**a**` is bold everywhere. That is the provider's `markup` setting
+   italic and `**a**` is bold everywhere. Neither service has a double-underscore bold, so there
+   `__init__.py` is the file it names; on Discord it reads as CommonMark reads it, with "init" in
+   bold, and backticks keep it literal anywhere. That is the provider's `markup` setting
    ([Configuration](#configuration)): a Slack provider is always Slack's, and a Discord-protocol
    bridge says `markup = "google-chat"` when it serves Google Chat.
 4. An image is drawn as a link to it, so no phone fetches it from wherever the message pointed. A
-   link to anything but `http` or `https` is drawn as its text with the address after it, so the
-   reader still sees what the message pointed at.
+   link to anything but a well-formed `http` or `https` address is drawn as its text with the
+   address after it, so the reader still sees what the message pointed at.
 5. Raw HTML written in a message is shown as the characters it is, and
    [ammonia](https://github.com/rust-ammonia/ammonia) then keeps only a short allowlist of
    elements and attributes; see [Security](#security).
 
 **A plain message carries no HTML.** When drawing the text as paragraphs would look the same —
 most chat — `content_html` is left off and the page draws `content` itself, so a window of messages
-is not sent twice. A message saved on the device before the field existed is drawn the same way:
+is not sent twice.
+
+**What one body may cost is bounded before it is rendered**, because anyone in the channel writes
+the text and it is rendered on every page load. A body past a bound is drawn as plain paragraphs —
+the same as a sentence with no Markdown — never as an error and never as unsanitized text:
+
+| Bound | Value | What it stops |
+|---|---|---|
+| Length | 16 KiB | Everything below is linear in the text, so this holds one body to a few milliseconds. Four times the longest Discord or Google Chat message; a Slack post near its own 40,000-character ceiling is drawn as text. |
+| Table cells | 2,000 | GFM pads every row to its header's width, so a wide header over many one-character rows is C × R cells: 2,000 characters made 840 KB of HTML. Counted from the text before parsing; past the budget the message renders with tables off. |
+| Depth | 32 | The sanitizer's HTML parser slows with every element still open, so thousands of nested `>` took seconds. |
+| Growth | 8 × the text + 8 KiB | HTML far larger than its words, such as hundreds of empty checkboxes, is not sent or kept in the offline copy. | A message saved on the device before the field existed is drawn the same way:
 as its text, never as markup. Nothing a model reads carries the field: `/messages`, `/digest`, one
 message by id, the MCP tools, and `/page` unless the page asks with `render=html`.
 
@@ -4010,7 +4023,11 @@ makes it, not the voice agent, the real security boundary of the whole design.
   `src`, `id` or `class` beyond the few listed. Raw HTML written in a message is shown as text.
   The page parses exactly one kind of string as HTML, a message's `content_html`, through an inert
   `<template>`; everything else it shows, message text included, goes in through `textContent`.
-  The page suite holds that sink to one call site. See [How message text is drawn](#how-message-text-is-drawn).
+  The page suite holds that sink to one call site. Only this server writes `content_html`: a
+  live-event adapter's copy is discarded on arrival. See [How message text is drawn](#how-message-text-is-drawn).
+* **One message cannot make the server render for long.** Length, table cells, nesting depth and
+  HTML growth are each bounded before or while a body is rendered, and a body past a bound is sent
+  as plain text; see [How message text is drawn](#how-message-text-is-drawn).
 
 **What v0 does NOT do — the honest list.**
 
