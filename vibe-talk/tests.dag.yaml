@@ -179,11 +179,15 @@ steps:
     labels: [validation-vibe-talk]
     cmd: cd vibe-talk && python3 tests/offline_cache_browser.py
     jobs_flag: ""
-    timeout: 90
-    cpu_timeout: 45
+    # The walk has grown with every page feature it checks (search bar, Pinned, Links and their kinds,
+    # tiles, the desktop dock, reply arrows) and measured 70-75 s wall and 42-46 s of CPU on a loaded
+    # host on 2026-10-08, against the old 90 s / 45 s — so a passing run was killed for its CPU. The
+    # budgets are a backstop against a hung browser, not a speed target: about twice the measurement.
+    timeout: 180
+    cpu_timeout: 100
     hint:
       resources: {browser: 1}
-      est_duration_s: 12
+      est_duration_s: 75
       classification: latency-bound
       rss_baseline_bytes: 1073741824
 
