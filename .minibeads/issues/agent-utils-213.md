@@ -1,10 +1,11 @@
 ---
 title: 'row-side-borders: give the agent''s message boxes a border on all four sides'
-status: open
+status: closed
 priority: 3
 issue_type: feature
 created_at: 2026-10-08T14:01:13.346673056+00:00
-updated_at: 2026-10-08T14:01:13.346673056+00:00
+updated_at: 2026-10-08T14:53:58.093057386+00:00
+closed_at: 2026-10-08T14:53:58.093057096+00:00
 ---
 
 # Description
