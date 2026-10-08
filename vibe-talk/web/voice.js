@@ -8085,7 +8085,8 @@ function keepReaderPlace(place) {
   }
   const rows = [...el("discord-log").children];
   for (const seen of place.seen) {
-    const row = rows.find((candidate) => idsOf(candidate).some((id) => seen.ids.includes(id)));
+    // A message inside a collapsed run of read messages is on screen as the run's line. `#221 read-modes`.
+    const row = shownRowFor(rows.find((candidate) => idsOf(candidate).some((id) => seen.ids.includes(id))));
     if (!row) continue;
     el("scroll-area").scrollTop += row.getBoundingClientRect().top - seen.top;
     renderJumpNewest();
@@ -8148,6 +8149,7 @@ async function changeChannelView(view, threadId = null, summary = null) {
   // its rows are drawn — from what this page holds, or when its read lands (`payThreadEntry`). The
   // thread is laid out afresh, so runs of read messages opened on an earlier visit collapse again.
   threadEntryOwed = view === "thread" ? channelContextKey() : null;
+  threadEntryAwaitsRead = false;
   if (view === "thread") openedReadRuns.delete(viewKey());
   ++discordLoadGeneration;
   stopReading();
@@ -8231,6 +8233,9 @@ async function changeChannelView(view, threadId = null, summary = null) {
   // Covered by nothing, but the store holds some of it: up at once, and read behind it.
   if (drawHeldRows(rows, came.freshAt, came.freshness)) {
     if (!(keepPlace && keepReaderPlace(place))) scrollToNewest();
+    // A thread lands on its first unread among those rows now, and the read behind them leaves it
+    // there (`keepEntryLanding`): the reader is moved once. `#221 read-modes`.
+    payThreadEntry();
     await readBehindSwitch();
     return;
   }
@@ -8382,6 +8387,15 @@ function catchUpFromAll() {
 let threadEntryOwed = null;
 
 /**
+ * Whether the landing owed waits for the read behind rows the store held (`drawHeldRows`, `#220
+ * view-switch-instant`), because none of them was unread. Those rows are the thread's newest stretch,
+ * from where All's window starts: an older message the read brings may still be unread. Paid only to
+ * a reader still on the newest line, where the switch left them. One who has scrolled since has
+ * chosen what to read, and is not moved.
+ */
+let threadEntryAwaitsRead = false;
+
+/**
  * How far down the room under the floating line the first unread message may start with the root
  * still kept at the head of the list: half. Below that too little of the message shows to read
  * without scrolling, and the message the reader came for outranks the one it answers.
@@ -8399,11 +8413,51 @@ function payThreadEntry() {
     threadEntryOwed = null;
     return;
   }
-  if (el("discord-log").children.length === 0 && !channelCanon.views.has(viewKey())) return;
+  const covered = channelCanon.views.has(viewKey());
+  if ((el("discord-log").children.length === 0 || threadEntryAwaitsRead) && !covered) return;
+  const awaited = threadEntryAwaitsRead;
   threadEntryOwed = null;
+  threadEntryAwaitsRead = false;
+  if (awaited && !atBottom(el("scroll-area"))) return;
   // The thread's runs were forgotten on entry; a view this page held was drawn before that.
   applyReadRuns();
-  landOnFirstUnread();
+  // On rows drawn from the store ahead of the thread's read (`drawHeldRows`) the landing is made now,
+  // and that read keeps it (`keepEntryLanding`). With nothing unread among them, the read pays it.
+  if (!landOnFirstUnread() && !covered) {
+    threadEntryOwed = channelContextKey();
+    threadEntryAwaitsRead = true;
+  }
+}
+
+/**
+ * The landing a read is about to rebuild the rows under, `{ ids, top }`: the messages of the row the
+ * entry brought to the head, and where on screen that row stands now. Null when the reader has moved
+ * since the landing, or there was none.
+ */
+function entryLandingMark() {
+  if (!entryLandingHolds()) return null;
+  return { ids: idsOf(entryLanding.row), top: entryLanding.row.getBoundingClientRect().top };
+}
+
+/**
+ * `#221 read-modes` x `#220 view-switch-instant`. A thread drawn from rows the store held lands on
+ * its first unread among them at once, and the read behind those rows rebuilds the list: the root
+ * and older replies arrive above the landed message, and the newest line may move below it. The read
+ * keeps its reader by the row at the top of the screen, or on the newest line, and either can move
+ * the landed message — a row above it that grows by a message the read brought, or a list that was
+ * on its newest line because it ended just below the landing. So the landed message is put back
+ * where it stood, in the rows the read drew, and the landing goes on holding from there. False, with
+ * nothing moved, when the read did not draw it.
+ */
+function keepEntryLanding(mark) {
+  const row = shownRowFor([...el("discord-log").children].find((candidate) =>
+    idsOf(candidate).some((id) => mark.ids.includes(id))));
+  if (!row || row.hidden) return false;
+  const area = el("scroll-area");
+  area.scrollTop += row.getBoundingClientRect().top - mark.top;
+  entryLanding = { key: channelContextKey(), row, at: area.scrollTop };
+  renderJumpNewest();
+  return true;
 }
 
 /**
@@ -9418,9 +9472,13 @@ async function loadTimeline(options) {
         discordMoreAbove = false;
         channelCanon.views.delete(viewKey());
       }
+      // A thread entered on rows the store held has landed on its first unread among them: asked
+      // BEFORE the rows are rebuilt, which takes the landed row with it. `#221 read-modes`.
+      const landing = behindHeld ? entryLandingMark() : null;
       let messages = applyTimelinePage(payload);
       for (const page of older) messages = applyTimelinePage(page, true);
       settleAfterRead(messages, { keepPosition, area, ...at, ownAct });
+      if (landing) keepEntryLanding(landing);
       noteFreshRead(payload);
       saveChannelScope();
       renderScrollTools();

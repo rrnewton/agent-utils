@@ -30199,17 +30199,28 @@ test("...once: the reader's own fold, a redraw and a scroll after the entry open
   assert.ok(atTheHead(page, answer()), "entering again did not land on the first unread");
 });
 
-test("...and a thread read for itself lands when its read does, not on the empty list before it", async () => {
-  const page = newPage();
-  const messages = runThread(page, { tail: RUN_TAIL });
-  // All reaches back three messages and has more: the thread began before it, so it is read for itself.
+/**
+ * All's newest page, from here on: the last `n` messages of the thread, or, with `n` 0, the
+ * channel's own `newer` messages. Either way it has more, and the thread began before it, so the
+ * thread is not covered by All (`#220 view-switch-instant`): what All holds of it is drawn at once
+ * and the thread is read behind it, and with nothing of it held the thread is read on an empty list.
+ */
+function allWindow(page, n, newer = []) {
   const serve = page.timeline;
   page.timeline = async (path, options) => {
     if (new URL(path, "http://fixture.test").searchParams.get("view") !== "flat") return serve(path, options);
-    const recent = page.messages.slice(-3);
+    const recent = n === 0 ? newer : page.messages.slice(-n);
     return json(200, timelineAnswer({ view: "flat", messages: recent, has_threads: true, has_more: true,
-      next_before: "older-than-three", dismissed: recent.map((m) => m.id).filter((id) => page.dealtWith.has(id)) }));
+      next_before: "older-than-the-window",
+      dismissed: recent.map((m) => m.id).filter((id) => page.dealtWith.has(id)) }));
   };
+}
+
+test("...and a thread read for itself lands when its read does, not on the empty list before it", async () => {
+  const page = newPage();
+  const messages = runThread(page, { tail: RUN_TAIL });
+  // All's window is three later messages of the channel's own: nothing of the thread is held.
+  allWindow(page, 0, [1, 2, 3].map((n) => message({ id: String(9100 + n), content: `later, ${n}`, ...CODER })));
   await signIn(page);
   await showDiscord(page, messages);
   const hold = holdChannelReads(page, "timeline");
@@ -30224,6 +30235,169 @@ test("...and a thread read for itself lands when its read does, not on the empty
   const answer = rowWithId(page, runId(500));
   assert.equal(answer.getAttribute("data-collapsed"), "false", "the landing was spent on the empty list");
   assert.ok(atTheHead(page, answer), `the answer landed at ${answer.getBoundingClientRect().top}px`);
+});
+
+// `#221 read-modes` x `#220 view-switch-instant`. A thread All's window holds part of, but not its
+// start, is drawn at once from the rows the page holds and read behind them. The landing is paid on
+// those rows — the reader is not kept waiting for the read to open the message they came for — and
+// the read behind them, which brings the root and the older replies above, leaves the landed message
+// where it is: no second jump, and not folded again.
+
+/** The ids of the messages a row stands for, oldest first. */
+const rowIds = (li) => li.getAttribute("data-ids").split(" ");
+
+/** Enter the run thread with its read held, from All holding its last `n` messages. */
+async function enterFromHeldRows(page, messages, n, before = async () => {}) {
+  allWindow(page, n);
+  await signIn(page);
+  await showDiscord(page, messages);
+  await before();
+  const hold = holdChannelReads(page, "timeline");
+  const entering = pickThread(page, `thread:${RUN_THREAD}`);
+  await page.settle();
+  assert.ok(hold.held.length > 0, "the thread was not read behind the held rows");
+  return { hold, entering };
+}
+
+for (const mode of ["Show read", "Collapse read", "Hide read"]) {
+  test(`${mode}: a thread drawn from held rows lands on its first unread at once, and the read behind them leaves it there`, async () => {
+    const page = newPage();
+    // Two more replies after the answer than RUN_TAIL, so the answer can stand at the head.
+    const messages = runThread(page, { tail: [...RUN_TAIL, ["agent", true], ["own", true]] });
+    const held = messages.slice(-8);
+    const { hold, entering } = await enterFromHeldRows(page, messages, held.length,
+      () => chooseReadMode(page, mode));
+    const unread = new Set([runId(500), runId(502), runId(503)]);
+    assert.deepStrictEqual(shownIds(page),
+      held.map((m) => m.id).filter((id) => mode !== "Hide read" || unread.has(id)),
+      "the rows the page held were not drawn while the thread was read");
+    const answer = () => rowWithId(page, runId(500));
+    assert.equal(answer().getAttribute("data-collapsed"), "false", "the held rows' first unread was not opened");
+    assert.ok(atTheHead(page, answer()),
+      `the answer landed at ${answer().getBoundingClientRect().top}px, not under the floating line at ${floatingLine(page)}px`);
+    const top = answer().getBoundingClientRect().top;
+    hold.release();
+    await entering;
+    await page.settle();
+    assert.equal(rowWithId(page, runId(0)) !== undefined, mode !== "Hide read", "the thread's read did not land");
+    assert.equal(answer().getAttribute("data-collapsed"), "false", "the read behind the held rows folded the landed message");
+    assert.equal(foldButton(answer()).getAttribute("aria-expanded"), "true");
+    assert.equal(answer().getBoundingClientRect().top, top, "the read behind the held rows moved the landed message");
+    if (mode === "Collapse read") {
+      assert.equal(readRunLineOf(rowWithId(page, runId(1))).textContent, "… 12 read messages …",
+        "the read messages the read brought above the landing were not collapsed");
+    }
+  });
+}
+
+test("...and the read behind held rows keeps the landing when the row above it grows by a message the read brought", async () => {
+  const run = async (script) => {
+    const page = newPage(new Map(), script);
+    const messages = runThread(page, { tail: RUN_TAIL });
+    // Reply 11 in the owner's words too, two seconds before reply 12, so the two are one row once 11
+    // is drawn. All's window starts at 12, the row above the landing, and the read brings 11 into it.
+    const at = Date.parse(messages[12].timestamp);
+    messages[11] = { ...messages[11], ...OWN, timestamp: new Date(at - 2000).toISOString() };
+    page.dealtWith.delete(runId(11));
+    const { hold, entering } = await enterFromHeldRows(page, messages, 6);
+    const answer = () => rowWithId(page, runId(500));
+    assert.equal(answer().getAttribute("data-collapsed"), "false", "the held rows' first unread was not opened");
+    assert.ok(atTheHead(page, answer()), `the answer landed at ${answer().getBoundingClientRect().top}px`);
+    assert.deepStrictEqual(rowIds(rowWithId(page, runId(12))), [runId(12)], "reply 11 was held after all; this proves nothing");
+    const top = answer().getBoundingClientRect().top;
+    hold.release();
+    await entering;
+    await page.settle();
+    assert.deepStrictEqual(rowIds(rowWithId(page, runId(12))), [runId(11), runId(12)],
+      "the read did not join 11 to the row above the landing; this proves nothing");
+    assert.equal(answer().getAttribute("data-collapsed"), "false", "the read behind the held rows folded the landed message");
+    return answer().getBoundingClientRect().top - top;
+  };
+  assert.equal(await run(SCRIPT), 0, "the read behind the held rows moved the landed message");
+  // Negative control: without putting the landing back, the read keeps the reader by the row at the
+  // top of the screen, which now starts a message earlier, and the answer goes down by that message.
+  assert.notEqual(await run(brokenScript("      if (landing) keepEntryLanding(landing);\n", "")), 0,
+    "the read left the landing where it was without being told to; the control proves nothing");
+});
+
+test("...a reader who scrolls before the read behind held rows lands is left where they scrolled to", async () => {
+  const page = newPage();
+  const messages = runThread(page, { tail: [...RUN_TAIL, ["agent", true], ["own", true]] });
+  const { hold, entering } = await enterFromHeldRows(page, messages, 8);
+  const area = page.el("scroll-area");
+  area.scrollTop = 0;
+  const first = page.el("discord-log").children[0];
+  const top = first.getBoundingClientRect().top;
+  hold.release();
+  await entering;
+  await page.settle();
+  assert.equal(shownIds(page).length, 20, "the thread's read did not land");
+  assert.equal(rowWithId(page, first.getAttribute("data-id")).getBoundingClientRect().top, top,
+    "the read put the reader back on the landing they had scrolled away from");
+});
+
+test("...held rows with nothing unread leave the landing to the read, which finds the older unread", async () => {
+  const page = newPage();
+  const messages = runThread(page, { tail: [["own", true], ["agent", true], ["own", true]] });
+  // All holds the last two replies, both read: the agent's answer, older, is not among them.
+  const { hold, entering } = await enterFromHeldRows(page, messages, 2);
+  assert.deepStrictEqual(shownIds(page), messages.slice(-2).map((m) => m.id));
+  assert.ok(atBottomOf(page.el("scroll-area")), "held rows with nothing unread did not open on the newest line");
+  hold.release();
+  await entering;
+  await page.settle();
+  const answer = rowWithId(page, runId(500));
+  assert.equal(answer.getAttribute("data-collapsed"), "false", "the read did not open the thread's first unread");
+  assert.ok(atTheHead(page, answer), `the answer landed at ${answer.getBoundingClientRect().top}px`);
+});
+
+test("...but not for a reader who has scrolled since the held rows were drawn", async () => {
+  const page = newPage();
+  const messages = runThread(page, { tail: [["own", true], ["agent", true], ["own", true]] });
+  const { hold, entering } = await enterFromHeldRows(page, messages, 3);
+  const area = page.el("scroll-area");
+  area.scrollTop = 0;
+  assert.ok(!atBottomOf(area), "the held rows fit on one screen; this proves nothing");
+  const first = page.el("discord-log").children[0];
+  const top = first.getBoundingClientRect().top;
+  hold.release();
+  await entering;
+  await page.settle();
+  assert.equal(rowWithId(page, runId(500)).getAttribute("data-collapsed"), "true", "the read opened a message under a reader who had moved");
+  assert.equal(rowWithId(page, first.getAttribute("data-id")).getBoundingClientRect().top, top, "the read moved a reader who had moved");
+});
+
+test("a landed message keeps the body the server rendered and its reactions, and a collapsed run holds them behind its line", async () => {
+  const page = newPage();
+  const messages = runThread(page, { tail: RUN_TAIL }).map((m) => {
+    if (m.id === runId(500)) return { ...m, ...OWNERS_MESSAGE, reactions: ACKNOWLEDGED };
+    if (m.id === runId(1)) return { ...m, content: "**checked** step 1", reactions: [{ emoji: "👍", count: 2 }],
+      content_html: "<p><strong>checked</strong> step 1</p>\n" };
+    return m;
+  });
+  page.messages = messages;
+  await enterRunThread(page, messages, () => chooseReadMode(page, "Collapse read"));
+  const answer = rowWithId(page, runId(500));
+  assert.equal(answer.getAttribute("data-collapsed"), "false", "the rendered answer was not opened");
+  assert.ok(atTheHead(page, answer), `the answer landed at ${answer.getBoundingClientRect().top}px`);
+  const [box] = mdBoxes(answer);
+  assert.deepStrictEqual(box.children.filter((kid) => kid.nodeType === 1).map((kid) => kid.tagName),
+    ["p", "ul", "p", "p"], "the landed message is not the server's rendering");
+  assert.deepStrictEqual(chipsOf(answer), ["👀 1", "✅ 1"], "the landed message lost its reactions");
+  // The run's line is drawn on its first row, which is still that message: its rendered body and its
+  // reactions are behind the line (web/voice.css hides every child but the line), and come back with it.
+  const head = rowWithId(page, runId(1));
+  assert.equal(head.getAttribute("data-read-run"), "head");
+  assert.equal(head.children[0], readRunLineOf(head), "the line is not the head row's first child");
+  assert.equal(tagged(mdBoxes(head)[0], "strong").length, 1, "the run's first row lost its rendered body");
+  assert.deepStrictEqual(chipsOf(head), ["👍 2"], "the run's first row lost its reactions");
+  assert.match(CSS_CODE, /#discord-log li\.discord-message\[data-read-run="head"\] > :not\(\.read-run\) \{\s*display: none !important;/,
+    "the line no longer hides the rest of its row, the reactions among it");
+  await readRunLineOf(head).click();
+  await page.settle();
+  assert.equal(head.hasAttribute("data-read-run"), false, "the run did not open");
+  assert.equal(readRunLineOf(head).hidden, true, "the line stayed up over the opened run");
+  assert.deepStrictEqual(chipsOf(head), ["👍 2"]);
 });
 
 test("the Hide read button cycles Show read, Collapse read and Hide read, names each, and keeps it", async () => {
