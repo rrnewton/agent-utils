@@ -717,6 +717,8 @@ function scrollAnchor(area) {
   const edge = area.getBoundingClientRect().top;
   const items = visibleList().children;
   for (const li of items) {
+    // A row hidden in a collapsed run of read messages has no box to be looking at. `#221 read-modes`.
+    if (li.getAttribute("data-read-run") === "member") continue;
     if (li.getBoundingClientRect().bottom > edge) {
       return li;
     }
@@ -787,6 +789,10 @@ function restoreScroll(mark) {
     renderJumpNewest();
     return;
   }
+  // An anchor that has just joined a collapsed run of read messages is held by the run's line,
+  // where it went. `#221 read-modes`.
+  const shown = shownRowFor(mark.anchor);
+  if (shown !== mark.anchor) mark = { ...mark, anchor: shown };
   area.scrollTop += mark.anchor.getBoundingClientRect().top - mark.top;
   // Wherever that put the reader decides the jump, now: up the history it is offered, on the
   // newest line it is not. `#207 scrollback-jump`.
@@ -1264,7 +1270,8 @@ function summaryTargets() {
   const bottom = top + (area.clientHeight || 0) + 2 * SUMMARY_LOOKAHEAD_PX;
   const list = shownChannelList();
   return liveFolds().filter((entry) => {
-    if (!entry.id || entry.li.parentNode !== list) {
+    // Not a row of a collapsed run of read messages, which is not on screen. `#221 read-modes`.
+    if (!entry.id || entry.li.parentNode !== list || entry.li.hasAttribute("data-read-run")) {
       return false;
     }
     const box = entry.li.getBoundingClientRect();
@@ -1588,7 +1595,8 @@ function renderJumpNewest() {
 function visibleFolds() {
   if (searchOpen && linksOnly) return [];
   const list = visibleList();
-  return liveFolds().filter((entry) => entry.li.parentNode === list);
+  // Nor the rows of a collapsed run of read messages, whose text is behind its line. `#221 read-modes`.
+  return liveFolds().filter((entry) => entry.li.parentNode === list && !entry.li.hasAttribute("data-read-run"));
 }
 
 function renderScrollTools() {
@@ -1774,6 +1782,9 @@ function searchScope() {
  * links are all of those kinds has none left to show, and goes as a row with no link does.
  */
 function applySearch() {
+  // `#221 read-modes`. FIRST: a filter choosing rows opens every collapsed run, so no match is
+  // hidden behind a line, and closing it collapses them again.
+  applyReadRuns();
   const terms = searchOpen ? searchTerms(searchQuery) : [];
   const links = searchOpen && linksOnly;
   // `#215 reply-coalesce`. A filter that takes rows away shows a subset of the channel in time order,
@@ -6218,7 +6229,7 @@ function renderControls() {
   el("read-speed").hidden = !reading;
   // The archive filter belongs to the CHANNEL, so it appears with the channel and not with a call.
   el("todo-filter").hidden = !reading;
-  el("todo-filter-label").textContent = todoMode ? "Showing" : "Hide read";
+  renderReadModeControl();
   el("read-aloud").setAttribute("aria-pressed", readingMode ? "true" : "false");
   // THE CONTROL SAYS WHICH ACT IT PERFORMS, not which state you are in. "Reading" described the
   // state and left the reader guessing what pressing it would do; "Stop" is the act, and the
@@ -7733,7 +7744,10 @@ function saveUiState() {
     v: UI_STATE_VERSION,
     identity,
     view: currentView === "discord" ? "discord" : "voice",
+    // Hide read, as every page has kept it, and beside it the read mode it is one of (`#221
+    // read-modes`): a page from before the modes reads `todo` and ignores `read`.
     todo: todoMode,
+    read: readMode,
     channel,
     place: heldPlace && heldPlace.key === placeKey() ? heldPlace.place : null,
     channels: chosenViews,
@@ -8031,6 +8045,9 @@ function rememberChannelContext() {
     freshness: channelFreshness,
     freshAt: channelFreshAt,
     dismissed: archivedIds,
+    // `#221 read-modes`. The read mode its rows were drawn under, so a mode chosen elsewhere since
+    // redraws them on the way back rather than showing what the old mode left.
+    readMode,
   });
 }
 
@@ -8123,6 +8140,11 @@ async function changeChannelView(view, threadId = null, summary = null) {
   channelView = view;
   selectedThreadId = view === "thread" ? threadId : null;
   selectedThread = view === "thread" ? summary : null;
+  // `#221 read-modes`. Entering a thread owes the reader its first unread message, unfolded, once
+  // its rows are drawn — from what this page holds, or when its read lands (`payThreadEntry`). The
+  // thread is laid out afresh, so runs of read messages opened on an earlier visit collapse again.
+  threadEntryOwed = view === "thread" ? channelContextKey() : null;
+  if (view === "thread") openedReadRuns.delete(viewKey());
   ++discordLoadGeneration;
   stopReading();
   readingMode = false;
@@ -8171,7 +8193,9 @@ async function changeChannelView(view, threadId = null, summary = null) {
     restoreScroll(held.position);
     if (keepPlace) keepReaderPlace(place);
     catchUpHeldView();
+    if (held.readMode !== readMode) renderCachedTimeline();
     renderChannelFreshness();
+    payThreadEntry();
     // Switching back to a view already fetched in this page is a local
     // presentation change. The live stream and periodic poll refresh the
     // active view; a tab switch itself must not become another network wait.
@@ -8190,6 +8214,8 @@ async function changeChannelView(view, threadId = null, summary = null) {
     if (!channelCanon.views.get(viewKey()).live && came.freshness === "offline") setChannelFreshness("offline");
     renderChannelFreshness();
     if (!(keepPlace && keepReaderPlace(place))) scrollToNewest();
+    // A thread lands on its first unread, from the rows just projected. `#221 read-modes`.
+    payThreadEntry();
     // Main is a view of its own from here, in the snapshot too. A thread drawn from All's cover is
     // saved as All's, as it always was.
     if (inherited && view === "main") saveChannelScope();
@@ -8329,6 +8355,80 @@ function catchUpFromAll() {
       { keepPosition: true, area, ...position });
   }
   renderChannelFreshness();
+}
+
+// --- entering a thread, on its first unread message ---------------------------------------------
+//
+// `#221 read-modes`. The owner: "When I see a message that has replies in a thread (the agents
+// replies), I click into the thread to read the response. But I get to the new screen and the reply
+// I'm reading is contracted. I would like the heuristic to instead be to expand the first unread
+// message when jumping into the thread. This gives me exactly what I want to read."
+//
+// So entering a thread puts its first unread message on screen, under the floating line, and opens
+// its fold — with the thread's root above it at the head of the list when both fit, since the root
+// is what the reply answers. UNREAD is what both read modes call unread (`rowIsRead`): not Done, not
+// the reader's own words, not a placeholder read automatically. A thread with nothing unread opens
+// as it always has: on its newest message, folded.
+//
+// ONCE, ON ENTRY. The fold is opened through `setFolded`, so the message stays open across every
+// redraw after — and a reader who folds it again has folded it for good, as with any message they
+// fold. Nothing after the entry moves the reader or opens anything.
+
+/** The thread entered and still owed its landing, as its `channelContextKey`, or null. */
+let threadEntryOwed = null;
+
+/**
+ * How far down the room under the floating line the first unread message may start with the root
+ * still kept at the head of the list: half. Below that too little of the message shows to read
+ * without scrolling, and the message the reader came for outranks the one it answers.
+ */
+const ENTRY_ROOT_ROOM = 0.5;
+
+/**
+ * Land the thread just entered on its first unread message, once its rows are drawn. Called where a
+ * thread's rows first appear: from what the page holds, or when the entering read lands. A read for
+ * any other view, or a thread left before its read landed, owes nothing.
+ */
+function payThreadEntry() {
+  if (threadEntryOwed === null) return;
+  if (threadEntryOwed !== channelContextKey() || channelView !== "thread") {
+    threadEntryOwed = null;
+    return;
+  }
+  if (el("discord-log").children.length === 0 && !channelCanon.views.has(viewKey())) return;
+  threadEntryOwed = null;
+  // The thread's runs were forgotten on entry; a view this page held was drawn before that.
+  applyReadRuns();
+  landOnFirstUnread();
+}
+
+/**
+ * Put the first unread message of the list on screen, unfolded. False, and nothing moved, when the
+ * list holds nothing unread that is drawn.
+ */
+function landOnFirstUnread() {
+  const rows = [...el("discord-log").children];
+  const drawn = (row) => !row.hidden && !row.hasAttribute("data-read-run") &&
+    !String(row.className).split(/\s+/).includes("search-hidden");
+  const first = rows.find((row) => drawn(row) && !rowIsRead(row));
+  if (!first) return false;
+  // Opened by its own control, which every row keeps whether or not the list of folds still holds
+  // it — a view this page held, drawn again, comes back without its folds in that list.
+  const fold = childByClass(first, "fold");
+  if (fold && first.getAttribute("data-collapsed") === "true") fold.click();
+  const area = el("scroll-area");
+  const head = floatingClearance(area) + REPLY_LANDING_GAP_PX;
+  const tools = el("scroll-tools");
+  const foot = area.getBoundingClientRect().top + area.clientHeight -
+    (tools.hidden ? 0 : tools.getBoundingClientRect().height);
+  const rootId = openThreadRootId();
+  const root = rows.find((row) => drawn(row) && isOpenThreadRoot(row, rootId));
+  const rootFits = root && root !== first &&
+    first.getBoundingClientRect().top - root.getBoundingClientRect().top <= (foot - head) * ENTRY_ROOT_ROOM;
+  area.scrollTop += (rootFits ? root : first).getBoundingClientRect().top - head;
+  renderScrollTools();
+  requestVisibleSummaries();
+  return true;
 }
 
 // --- thread selector ----------------------------------------------------------------------------
@@ -8987,6 +9087,30 @@ function applyTimelinePage(payload, older = false, saved = false, delta = false,
   return channelView === "threads" ? timelineThreads : shown;
 }
 
+/**
+ * `preservingScroll` for a redraw that REBUILDS the rows, which takes its anchor with it: the reader
+ * is held on the same MESSAGE, found again by id, or on the line of the collapsed run it has joined.
+ * `#221 read-modes`: a message dealt with under Collapse read joins a run, a mode change collapses
+ * or hides whole runs above the reader, and a pixel offset kept across either lands on whatever
+ * message has moved into that pixel. Kept to the offset as before when the message is not drawn.
+ */
+function holdingMessage(mutate) {
+  const area = el("scroll-area");
+  const mark = captureScroll();
+  const position = channelReadPosition(area);
+  mutate();
+  if (mark.pinned || (mark.anchor && mark.anchor.parentNode)) {
+    restoreScroll(mark);
+    return;
+  }
+  const row = position.anchorId
+    ? shownRowFor([...visibleList().children].find((candidate) =>
+      candidate.getAttribute("data-context-id") === position.anchorId || idsOf(candidate).includes(position.anchorId)))
+    : null;
+  if (row && currentView === "discord") area.scrollTop += row.getBoundingClientRect().top - position.anchorTop;
+  renderJumpNewest();
+}
+
 /** Re-project the already fetched timeline after a local preference or archive change. */
 function renderCachedTimeline() {
   if (!threadingSupported || channelView === "threads") return;
@@ -9004,7 +9128,7 @@ function renderCachedTimeline() {
         : channelName(knownChannel(el("discord-channel").value))
     ));
   };
-  preservingScroll(redraw);
+  holdingMessage(redraw);
   renderScrollTools();
   requestVisibleSummaries();
   guardQuietly(prepareSpeech)();
@@ -9157,6 +9281,7 @@ async function loadTimeline(options) {
     saveChannelScope();
     renderScrollTools();
     requestVisibleSummaries();
+    payThreadEntry();
   };
   try {
     for (;;) {
@@ -9258,6 +9383,9 @@ async function loadTimeline(options) {
       saveChannelScope();
       renderScrollTools();
       requestVisibleSummaries();
+      // A thread entered with nothing of it on the page lands here, on its first read: LAST, once
+      // the freshness pill it lands under is up. `#221 read-modes`.
+      payThreadEntry();
       return;
     }
   } catch (error) {
@@ -10864,6 +10992,9 @@ function renderChannelRows() {
   renderOutgoingMessages();
   // Settings counts what is loaded, and this is where what is loaded changes.
   renderNoiseCount();
+  // `#221 read-modes`. LAST, from the read state every row has just been given: under Collapse
+  // read a message dealt with on this pass joins its run, and a run that grew says so.
+  applyReadRuns();
 }
 
 /**
@@ -10999,6 +11130,8 @@ function jumpToMarker() {
     setStatus("that message is further back than what is loaded — pull down or walk back to it.");
     return;
   }
+  // A marker inside a collapsed run of read messages: the run opens to show it. `#221 read-modes`.
+  openReadRun(row);
   row.scrollIntoView();
   setStatus("back where you left off.");
 }
@@ -11257,6 +11390,8 @@ function landOnAnswered(target, from) {
   // The reader asked for this message by name. A search that filtered it out is closed rather
   // than left standing over a row that cannot be scrolled to, because it is not drawn.
   if (String(row.className).split(/\s+/).includes("search-hidden")) setSearchOpen(false);
+  // ...and a run of read messages it is collapsed into is opened, for the same reason. `#221 read-modes`.
+  openReadRun(row);
   revealRow(row);
   const reply = rowHolding(from);
   replyReturn = reply && reply !== row && !rowOnScreen(reply) ? { id: from, context: channelContextKey() } : null;
@@ -11902,7 +12037,10 @@ function renderReplyLinks() {
     gutterPiece(row, "reply-ungather", at === 0, ungatherButton);
     const arrow = childByClass(row, "reply-jump");
     if (arrow) {
-      const adjacent = above !== null && idsOf(above).includes(String(row.getAttribute("data-reply-to") || ""));
+      // Not to the line of a collapsed run of read messages, which stands for messages it does not
+      // draw: the message answered is behind it. `#221 read-modes`.
+      const adjacent = above !== null && above.getAttribute("data-read-run") !== "head" &&
+        idsOf(above).includes(String(row.getAttribute("data-reply-to") || ""));
       arrow.setAttribute("data-reply-style", adjacent ? "adjacent" : "disconnected");
       if (!adjacent) {
         arrow.removeAttribute("data-reply-reach");
@@ -12130,7 +12268,9 @@ function isNoise(message) {
  * Does this message belong in the list behind Hide read?
  *
  * ONE definition, for both places the threaded view filters. Not archived, not read automatically,
- * and not the reader's own words when they have said those are read.
+ * and not the reader's own words when they have said those are read. And for what Collapse read
+ * collapses and what entering a thread lands on (`#221 read-modes`, `rowIsRead`): a refinement of
+ * what counts as unread belongs here, and reaches every read mode at once.
  */
 function stillToDo(message) {
   return !archivedIds.has(String(message.id)) && !isNoise(message) &&
@@ -13190,6 +13330,11 @@ function swipeable(li, messages) {
   };
 
   li.addEventListener("pointerdown", (event) => {
+    // `#221 read-modes`. While the row is the line of a collapsed run it IS that line, and a finger
+    // on it is pressing the line: neither archiving the message under it nor opening its details.
+    if (li.getAttribute("data-read-run") === "head") {
+      return;
+    }
     if (!event || event.pointerType === "mouse") {
       return;
     }
@@ -14749,9 +14894,10 @@ function settleAfterRead(messages, how) {
     // A pixel offset is not a place in a conversation: an edit or deletion above it changes which
     // message occupies that pixel. Prefer the same rendered message at the same viewport offset.
     // A deleted anchor has no semantic destination, so only that case falls back to the old offset.
+    // ...or the line of the collapsed run it has joined since. `#221 read-modes`.
     const anchor = how.anchorId
-      ? [...visibleList().children].find((row) =>
-        row.getAttribute("data-context-id") === how.anchorId || idsOf(row).includes(how.anchorId))
+      ? shownRowFor([...visibleList().children].find((row) =>
+        row.getAttribute("data-context-id") === how.anchorId || idsOf(row).includes(how.anchorId)))
       : null;
     if (anchor && Number.isFinite(how.anchorTop)) {
       how.area.scrollTop = how.previousTop;
@@ -14897,8 +15043,312 @@ async function loadDiscord(options) {
 /**
  * Is the reader looking at the to-do list rather than the whole channel? Kept across a reload with
  * the rest of what was on screen, in `UI_STATE_KEY`. `#189 restore-ui-state`.
+ *
+ * Since `#221 read-modes` this is Hide read, the third of the read modes: `readMode === "hide"`,
+ * written only where `readMode` is. It keeps its own name because every read path already asks it
+ * the one question it answers, which is whether read messages are left out of the list.
  */
 let todoMode = false;
+
+// --- the read modes: Show read, Collapse read, Hide read ------------------------------------------
+//
+// `#221 read-modes`. The owner, 2026-10-08: "since we may have long threads we can introduce
+// further collapsing for the read messages in between. I.e show the thread root then ' ... 45 read
+// messages ... ' then the expanded next message I want to read. Maybe it could become the new
+// behavior of the 'Hide read' feature. That could actually cycle between 3 modes - Show Read,
+// Collapse Read, and Hide Read."
+//
+// So the Hide read button is a cycle, and it names the mode the list is IN, with an icon for each:
+//
+//   * SHOW READ. Every message, read ones greyed: the list as it always was with Hide read off.
+//   * COLLAPSE READ. Each run of read messages is one line, "… 12 read messages …", and a tap on the
+//     line opens that run. Unread messages are shown, and so are two read ones: the root of the
+//     thread on screen, which says what the thread is about, and the newest message, which is where
+//     the conversation stands, what the composer under it answers, and what a send just put there.
+//     Replies gathered under their message (`#215 reply-coalesce`) are never collapsed either.
+//   * HIDE READ. Read messages are left out, as they always were with Hide read on.
+//
+// THE ORDER IS ASCENDING: each tap takes more of what is read away, and the third gives it all back.
+// The name on the button is then always where a tap has just put the list, and a reader on Hide read
+// still turns it off with one tap, as before. SHOW READ IS THE DEFAULT, as Hide read off was: the
+// page does not start hiding anything nobody asked it to hide, and a record kept by an older page —
+// `todo` alone — still means what it meant.
+//
+// WHAT IS READ is `stillToDo`'s answer and nobody else's: Collapse read collapses exactly the
+// messages Hide read hides. A refinement of what counts as read reaches both modes from there.
+//
+// ENTERING A THREAD lands on its first unread message, unfolded — see `landOnFirstUnread` — in every
+// mode, and the read run before it is a line only under Collapse read. Show read shows what is read:
+// a mode that said "Show read" while hiding messages on entry would be a button that lies, and the
+// owner's root, "… 45 read messages …", first unread is Collapse read's own drawing.
+
+/** The read modes, in the order a tap on the button moves through them. */
+const READ_MODES = ["show", "collapse", "hide"];
+
+/** What the button calls each mode: the mode the list is in, not the act a tap performs. */
+const READ_MODE_LABELS = { show: "Show read", collapse: "Collapse read", hide: "Hide read" };
+
+/**
+ * The first word of each name, drawn on its own where the room is a desk's dock row: `#218
+ * desktop-dock` fitted that row to "Hide read" with nothing to spare, and "Collapse read" beside
+ * its icon would push the dock onto a second row. web/voice.css hides the second word there; the
+ * button's accessible name and its tooltip still say the whole name.
+ */
+const READ_MODE_VERBS = { show: "Show", collapse: "Collapse", hide: "Hide" };
+
+/** The sentence under the pointer for each mode: what it does, and where a tap goes next. */
+const READ_MODE_TITLES = {
+  show: "Read messages are shown, greyed. Tap to collapse each run of them into one line.",
+  collapse: "Each run of read messages is one line; tap a line to open it. Tap to hide read messages.",
+  hide: "Read messages are hidden. Tap to show them again.",
+};
+
+/**
+ * How few rows a run of read messages may have and still collapse: two. A line in place of ONE row
+ * saves nothing — the line is as tall as a short message — and would hide the reader's own words
+ * between the two answers on either side of them, which is the commonest read message there is.
+ */
+const READ_RUN_MIN_ROWS = 2;
+
+/** The mode the list is in: one of `READ_MODES`. Kept with the rest of the UI state. */
+let readMode = "show";
+
+/**
+ * The runs of read messages the reader has opened, per view (`viewKey`), as the ids of the messages
+ * in them. Ids, because the rows are rebuilt by every read; and a run with any opened message in it
+ * stays open as it grows, so a message that joins it later is recorded too. Forgotten when the mode
+ * changes, and a thread's when it is entered, since entering lays the thread out afresh.
+ */
+const openedReadRuns = new Map();
+
+/**
+ * How many rows the last pass left in collapsed runs. At zero, outside Collapse read, there is
+ * nothing to undo, and a pass — which runs with every redraw and every filter change — is free.
+ */
+let collapsedRunRows = 0;
+
+/** The mode a saved UI record holds: its own `read` when it has one, and otherwise its `todo`. */
+function savedReadMode(saved) {
+  return READ_MODES.includes(saved.read) ? saved.read : saved.todo ? "hide" : "show";
+}
+
+/** The mode after `mode`, round the cycle. */
+const nextReadMode = (mode) => READ_MODES[(READ_MODES.indexOf(mode) + 1) % READ_MODES.length];
+
+/**
+ * The button, saying the mode: its word, its icon (drawn by web/voice.css off `data-read-mode`), and
+ * to a screen reader the mode and where a tap goes. `aria-pressed` is the tri-state ARIA gives a
+ * button that is partly on: off for Show read, `mixed` for Collapse read, on for Hide read.
+ */
+function renderReadModeControl() {
+  const button = el("todo-filter");
+  const label = READ_MODE_LABELS[readMode];
+  // Two words in two spans, so a desk can draw the first alone; made here when the markup's are absent.
+  const words = el("todo-filter-label");
+  let verb = childByClass(words, "read-mode-verb");
+  if (!verb) {
+    verb = document.createElement("span");
+    verb.className = "read-mode-verb";
+    const noun = document.createElement("span");
+    noun.className = "read-mode-noun";
+    noun.textContent = " read";
+    words.replaceChildren(verb, noun);
+  }
+  if (verb.textContent !== READ_MODE_VERBS[readMode]) verb.textContent = READ_MODE_VERBS[readMode];
+  // The mode's own icon, and only it, by `hidden`: an icon is something a test of the dock can ask
+  // for by that attribute, as it asks of every other control's.
+  for (const icon of [...button.children]) {
+    if (!String(icon.getAttribute("class") || "").split(/\s+/).includes("read-mode-icon")) continue;
+    const mine = icon.getAttribute("data-mode") === readMode;
+    if (icon.hasAttribute("hidden") === mine) icon.toggleAttribute("hidden", !mine);
+  }
+  // Written only when they change: this runs with every redraw of the controls.
+  const said = {
+    "data-read-mode": readMode,
+    "aria-pressed": readMode === "hide" ? "true" : readMode === "collapse" ? "mixed" : "false",
+    "aria-label": `${label}. Tap for ${READ_MODE_LABELS[nextReadMode(readMode)]}`,
+    title: READ_MODE_TITLES[readMode],
+  };
+  for (const [name, value] of Object.entries(said)) {
+    if (button.getAttribute(name) !== value) button.setAttribute(name, value);
+  }
+}
+
+/** Is `row` read, by the one rule both read modes share? Every message it stands for has to be. */
+function rowIsRead(row) {
+  const held = rowMessages(row);
+  return held.length > 0 && held.every((message) => !stillToDo(message));
+}
+
+/** Is `row` the root of the thread on screen? By identity, never by position: older replies may not be loaded. */
+function isOpenThreadRoot(row, rootId) {
+  if (channelView !== "thread" || !selectedThreadId) return false;
+  const thread = String(selectedThreadId);
+  return rowMessages(row).some((message) => String(message.id) === rootId || String(message.id) === thread ||
+    (threadOf(message) === thread && message.thread.is_root === true));
+}
+
+/** The id of the open thread's root as its summary names it, or null. */
+function openThreadRootId() {
+  if (channelView !== "thread" || !selectedThreadId) return null;
+  const summary = channelCanon.threads.find((held) => String(held.id) === String(selectedThreadId)) || selectedThread;
+  return summary && summary.root ? String(summary.root.id) : null;
+}
+
+/** Whether a filter is choosing rows: then every match is shown, and no run hides one behind a line. */
+function readRunsSuspended() {
+  return searchOpen && (linksOnly || searchTerms(searchQuery).length > 0);
+}
+
+/**
+ * The line a collapsed run is drawn as, on the run's first row: made once per row and kept on it.
+ * The row's own content is hidden behind it by web/voice.css, so the row is still the message it
+ * was — every act that finds a row by its ids still finds it — and the list holds only messages.
+ */
+function readRunLine(row) {
+  if (row.readRunLine) return row.readRunLine;
+  const line = document.createElement("button");
+  line.className = "read-run";
+  line.setAttribute("type", "button");
+  line.setAttribute("aria-expanded", "false");
+  line.addEventListener("click", (event) => {
+    // The row's own tap would fold it or read it aloud; this tap is the line's alone.
+    if (event) event.stopPropagation();
+    openReadRun(row);
+  });
+  row.replaceChildren(line, ...row.children);
+  row.readRunLine = line;
+  return line;
+}
+
+/** What the line on `row` says now, or "" when it has none. */
+function readRunWords(row) {
+  return row.readRunLine ? String(row.readRunLine.textContent) : "";
+}
+
+/** Put one row in its place in a run: "head" (drawn as the line), "member" (hidden), or null (shown). */
+function placeInReadRun(row, role, count) {
+  if (role === null) {
+    if (row.hasAttribute("data-read-run")) row.removeAttribute("data-read-run");
+    if (row.hidden) row.hidden = false;
+    if (row.readRunLine && !row.readRunLine.hidden) row.readRunLine.hidden = true;
+    return;
+  }
+  row.setAttribute("data-read-run", role);
+  row.hidden = role === "member";
+  if (role !== "head") return;
+  const line = readRunLine(row);
+  const words = `… ${count} read message${count === 1 ? "" : "s"} …`;
+  if (line.textContent !== words) line.textContent = words;
+  line.setAttribute("title", `Show ${count === 1 ? "this read message" : `these ${count} read messages`}`);
+  line.hidden = false;
+}
+
+/**
+ * Collapse the runs of read messages in the channel list, under Collapse read, and undo every run
+ * otherwise. Called at the end of every pass over the rows (`renderChannelRows`) and whenever a
+ * filter changes (`applySearch`), and idempotent, so a second call changes nothing.
+ *
+ * The reader does not move. A run that grows, shrinks, splits or opens changes rows that may be
+ * above the viewport, so the change is made under `preservingScroll`; a message the reader was
+ * looking at that has just joined a run is held where it was by the line it joined.
+ */
+function applyReadRuns() {
+  const collapsing = readMode === "collapse" && !readRunsSuspended();
+  if (!collapsing && collapsedRunRows === 0) return;
+  const list = el("discord-log");
+  const rows = [...list.children];
+  const key = viewKey();
+  const opened = openedReadRuns.get(key) || new Set();
+  const rootId = collapsing ? openThreadRootId() : null;
+  /** @type {Map<Element, {role: string, count: number}>} */
+  const placed = new Map();
+  if (collapsing) {
+    let run = [];
+    const close = () => {
+      const ids = run.flatMap(idsOf);
+      if (run.length >= READ_RUN_MIN_ROWS && ids.some((id) => opened.has(id))) {
+        // Opened: it stays open as it grows, so what joined it since is remembered with it.
+        for (const id of ids) opened.add(id);
+      } else if (run.length >= READ_RUN_MIN_ROWS) {
+        run.forEach((row, index) => placed.set(row, { role: index === 0 ? "head" : "member", count: ids.length }));
+      }
+      run = [];
+    };
+    rows.forEach((row, index) => {
+      // Nor a row of replies the reader gathered under their message (`#215 reply-coalesce`): they
+      // were gathered to be read together, and a line in the stack would break the bridge.
+      if (index < rows.length - 1 && rowIsRead(row) && !isOpenThreadRoot(row, rootId) &&
+          !row.hasAttribute("data-coalesce")) {
+        run.push(row);
+      } else {
+        close();
+      }
+    });
+    close();
+    if (opened.size > 0) openedReadRuns.set(key, opened);
+  }
+  collapsedRunRows = placed.size;
+  const want = (row) => placed.get(row) || { role: null, count: 0 };
+  const changed = rows.some((row) => {
+    const { role, count } = want(row);
+    return (row.getAttribute("data-read-run") || null) !== role ||
+      (role === "head" && !readRunWords(row).includes(` ${count} `));
+  });
+  if (!changed) return;
+  const apply = () => {
+    for (const row of rows) {
+      const { role, count } = want(row);
+      placeInReadRun(row, role, count);
+    }
+  };
+  // Only where the list is the one on screen: anywhere else there is no reader in it to hold.
+  if (currentScreen === "main" && currentView === "discord") preservingScroll(apply);
+  else apply();
+  // Which row is directly above a reply has changed with what is drawn, and its arrow with it.
+  renderReplyLinks();
+}
+
+/** The rows of the collapsed run `row` belongs to, its line's row first. */
+function readRunRows(row) {
+  const rows = [...el("discord-log").children];
+  let head = rows.indexOf(row);
+  while (head > 0 && rows[head].getAttribute("data-read-run") === "member") head -= 1;
+  const run = [rows[head]];
+  for (let at = head + 1; at < rows.length && rows[at].getAttribute("data-read-run") === "member"; at += 1) {
+    run.push(rows[at]);
+  }
+  return run;
+}
+
+/** Open the collapsed run `row` is in: a tap on its line, or a jump to a message inside it. */
+function openReadRun(row) {
+  if (!row || !row.hasAttribute("data-read-run")) return;
+  const key = viewKey();
+  const opened = openedReadRuns.get(key) || new Set();
+  for (const one of readRunRows(row)) {
+    for (const id of idsOf(one)) opened.add(id);
+  }
+  openedReadRuns.set(key, opened);
+  applyReadRuns();
+  renderScrollTools();
+  requestVisibleSummaries();
+}
+
+/** The row on screen standing for `row`: itself, or the line of the collapsed run it is hidden in. */
+function shownRowFor(row) {
+  if (!row || row.getAttribute("data-read-run") !== "member" || !row.parentNode) return row;
+  const rows = [...row.parentNode.children];
+  for (let at = rows.indexOf(row); at >= 0; at -= 1) {
+    if (rows[at].getAttribute("data-read-run") === "head") return rows[at];
+  }
+  return row;
+}
+
+/** Cycle to the next read mode. The Hide read button's tap. */
+function cycleReadMode() {
+  setReadMode(nextReadMode(readMode));
+}
 
 /**
  * Which LOADED messages the reader has archived, as the server reported them.
@@ -14941,12 +15391,11 @@ let lastDismissal = null;
 let backlogSize = 0;
 
 function renderTodoControls() {
-  // `aria-pressed` and nothing else: the WORD does not change, because "To do" names where the
-  // control takes you in both directions and a toggle that renames itself to its own opposite is
-  // the ambiguity every mute button in history has had. web/voice.css draws the pressed state off
-  // this same attribute, so the state is said twice — to a screen reader and to an eye — from one
-  // source.
-  el("todo-filter").setAttribute("aria-pressed", todoMode ? "true" : "false");
+  // The read mode, said by the button in its word, its icon and its pressed state. `#221
+  // read-modes`: three modes, so the word names the mode the list is in — never the act, which
+  // would be the ambiguity every mute button in history has had, with a third state to be wrong
+  // about. web/voice.css draws each mode off the same attribute a screen reader is told.
+  renderReadModeControl();
   el("inbox-note").hidden = !todoMode;
   const clear = el("clear-backlog");
   clear.hidden = threadingSupported || !todoMode || backlogSize === 0;
@@ -15416,23 +15865,36 @@ async function clearBacklog() {
   });
 }
 
-function setTodoMode(on) {
-  todoMode = on;
+/** Put the list in read mode `mode`. `#221 read-modes`. */
+function setReadMode(mode) {
+  if (!READ_MODES.includes(mode)) return;
+  const wasHiding = todoMode;
+  readMode = mode;
+  todoMode = mode === "hide";
+  // Runs opened under Collapse read are a way of looking at that list, and the reader has just
+  // chosen another way: coming back to Collapse read collapses them all again.
+  openedReadRuns.clear();
   // Kept across a reload, as the reader left it. `#189 restore-ui-state`.
   uiStateSettled = true;
   saveUiState();
   disarmBacklog();
   // An undo belongs to the act it undoes, and leaving the view is the reader moving on. Keeping
-  // it would offer to restore messages into a list they are no longer looking at.
-  lastDismissal = null;
-  if (!on) {
+  // it would offer to restore messages into a list they are no longer looking at. Showing or
+  // collapsing what is read leaves every message in the list, so the undo stays between those two.
+  if (todoMode !== wasHiding) lastDismissal = null;
+  if (!todoMode) {
     backlogSize = 0;
   }
   renderTodoControls();
   if (threadingSupported) {
     renderCachedTimeline();
+  } else if (todoMode !== wasHiding) {
+    guardQuietly(() => (todoMode ? loadTodo() : loadDiscord()))();
   } else {
-    guardQuietly(() => (on ? loadTodo() : loadDiscord()))();
+    // Show read and Collapse read are the same read of the channel, drawn two ways.
+    applyReadRuns();
+    renderScrollTools();
+    requestVisibleSummaries();
   }
 }
 
@@ -19108,7 +19570,7 @@ el("load-older").addEventListener("click", guardQuietly(loadOlder));
 el("load-older-turns").addEventListener("click", guardQuietly(loadOlderTurns));
 el("collapse-all").addEventListener("click", () => setAllFolded(true));
 el("expand-all").addEventListener("click", () => setAllFolded(false));
-el("todo-filter").addEventListener("click", () => setTodoMode(!todoMode));
+el("todo-filter").addEventListener("click", cycleReadMode);
 el("clear-backlog").addEventListener("click", guardQuietly(clearBacklog));
 el("undo-dismiss").addEventListener("click", guardQuietly(undoDismissal));
 el("summarise").addEventListener("click", () => setSummaryMode(!summaryMode));
@@ -19294,8 +19756,12 @@ if (token()) {
 // Before the first screen is shown, so the bar is in its home from the first frame rather than
 // visibly jumping out of the header once script catches up. `#58 control-bar`.
 setPlacement(storedPlacement());
-// Hide read as the reader left it, before the first row is drawn or read. `#189 restore-ui-state`.
-if (savedUi) todoMode = savedUi.todo;
+// The read mode as the reader left it, before the first row is drawn or read. `#189
+// restore-ui-state`, and `#221 read-modes`: a record an older page kept says only Hide read or not.
+if (savedUi) {
+  readMode = savedReadMode(savedUi);
+  todoMode = readMode === "hide";
+}
 showView("voice");
 renderEmptyState();
 renderControls();

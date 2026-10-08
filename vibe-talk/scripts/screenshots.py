@@ -1920,6 +1920,15 @@ def _act_summary_failed(driver: Driver) -> None:
     driver.settle(300)
 
 
+def _choose_hide_read(driver: Driver) -> None:
+    """Tap the read-mode button on to Hide read: `#221 read-modes` put Collapse read before it."""
+    for _tap in range(3):
+        if driver.js("document.getElementById('todo-filter').getAttribute('aria-pressed')") == "true":
+            return
+        driver.click("todo-filter")
+        driver.settle(150)
+
+
 def _act_todo_view(driver: Driver) -> None:
     """`#50 todo-view`: the channel filtered down to what has not been dealt with."""
     _act_open_channel(driver)
@@ -1927,7 +1936,7 @@ def _act_todo_view(driver: Driver) -> None:
         "(() => { window.__beforeTodo = "
         "document.querySelectorAll('#discord-log > li').length; return window.__beforeTodo; })()"
     )
-    driver.click("todo-filter")
+    _choose_hide_read(driver)
     driver.page.wait_for_function(
         "() => document.getElementById('todo-filter').getAttribute('aria-pressed') === 'true' "
         "&& (window.__text('inbox-note') || '').length > 0",
@@ -1956,7 +1965,7 @@ def _act_todo_view(driver: Driver) -> None:
 def _act_bankruptcy_armed(driver: Driver) -> None:
     """The bulk clear with one tap on it: saying how many, before it has done anything."""
     _act_open_channel(driver)
-    driver.click("todo-filter")
+    _choose_hide_read(driver)
     driver.page.wait_for_function(
         "() => !document.getElementById('clear-backlog').hidden", timeout=15_000
     )

@@ -1865,6 +1865,91 @@ body {
 }
 
 /*
+ * A RUN OF READ MESSAGES, COLLAPSED. `#221 read-modes`: under Collapse read each run of read
+ * messages is one line, "… 12 read messages …", and a tap on it opens the run.
+ *
+ * The line is drawn ON THE RUN'S FIRST ROW, which stays the message it is — every act that finds a
+ * row by its ids still finds it there — and the rest of the run is `hidden`. So the row gives up
+ * everything that makes it a message tile while it is the line: its speaker's tint and insets, its
+ * border, the fade and the drained colour of a read row, the reply gutter and its veil, the kept
+ * place's rule. `!important` for the reason `.search-hidden` has it: those are drawn by rules as
+ * specific as this one, keyed on the very states every row in a run is in, and a line wearing a
+ * speaker's tile is not a line.
+ */
+#discord-log li.discord-message[data-read-run="head"] {
+  --row-opacity: 1 !important;
+  --row-filter: none !important;
+  --row-grey: 0 !important;
+  opacity: 1 !important;
+  filter: none !important;
+  background: none !important;
+  border-color: transparent !important;
+  border-radius: 0 !important;
+  box-shadow: none !important;
+  outline: none !important;
+  animation: none !important;
+  margin-left: 0 !important;
+  margin-right: 0 !important;
+  padding: 0 !important;
+  min-height: 0 !important;
+}
+
+#discord-log li.discord-message[data-read-run="head"]::before,
+#discord-log li.discord-message[data-read-run="head"]::after {
+  content: none !important;
+}
+
+#discord-log li.discord-message[data-read-run="head"] > :not(.read-run) {
+  display: none !important;
+}
+
+/*
+ * The line itself: quiet, because it stands for what the reader has finished with, and a whole
+ * thumb tall, because opening it is the one thing to do with it. A hairline runs out from each side
+ * of the words, so it reads as a seam in the list rather than as another message.
+ */
+#discord-log .read-run {
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+  width: 100%;
+  min-height: 2.75rem;
+  margin: 0;
+  padding: 0.25rem 0.5rem;
+  background: none;
+  border: none;
+  border-radius: 0.6rem;
+  color: var(--muted);
+  font: inherit;
+  font-size: calc(0.82rem * var(--msg-scale));
+  letter-spacing: 0.02em;
+  white-space: nowrap;
+  cursor: pointer;
+  touch-action: manipulation;
+  -webkit-tap-highlight-color: transparent;
+}
+
+#discord-log .read-run::before,
+#discord-log .read-run::after {
+  content: "";
+  flex: 1 1 0;
+  min-width: 1rem;
+  border-top: 1px dashed var(--edge);
+}
+
+#discord-log .read-run:active,
+#discord-log .read-run:focus-visible {
+  background: color-mix(in srgb, var(--accent) 14%, transparent);
+  color: var(--ink);
+}
+
+#discord-log .read-run:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
+}
+
+
+/*
  * Available to a screen reader and to nothing else.
  *
  * `clip-path` rather than `display: none`, which would take it out of the accessibility tree
@@ -2464,12 +2549,15 @@ body {
   -webkit-tap-highlight-color: transparent;
 }
 
-/* The filter reads as thrown, drawn from the SAME attribute that says so to a screen reader —
-   `#todo-filter` keeps its word in both positions, so this is the only thing an eye has. */
-#todo-filter[aria-pressed="true"] {
+/* The filter reads as thrown, drawn from the SAME attribute that says so to a screen reader:
+   `true` for Hide read and `mixed` for Collapse read, the two modes that take read messages out of
+   the way. `#221 read-modes`. */
+#todo-filter[aria-pressed="true"],
+#todo-filter[aria-pressed="mixed"] {
   border-color: var(--accent);
   color: var(--ink);
 }
+
 
 #inbox-note {
   margin: 0 0 0.4rem;
@@ -3323,6 +3411,11 @@ body {
   #discord-log .reply-ungather:hover {
     background: color-mix(in srgb, var(--accent) 18%, transparent);
   }
+
+  /* `#221 read-modes`. A collapsed run's line, brought up under the pointer, as when pressed. */
+  #discord-log .read-run:hover {
+    color: var(--ink);
+  }
 }
 
 /* The keyboard's equivalent, and deliberately UNGATED: a keyboard is not a pointer, and somebody
@@ -4109,6 +4202,14 @@ textarea {
   grid-row: 1 / span 2;
 }
 
+/* `#221 read-modes`. The narrow column holds the mode's name, and "Collapse" is its longest word: a
+   size down, so the word stands clear of the tile's edges instead of touching both. */
+#control-pane #todo-filter .control-label {
+  font-size: 0.72rem;
+  line-height: 1.15;
+  text-align: center;
+}
+
 /*
  * READING MODE, ON. The control that starts a session has to look like the control that ends one,
  * or the reader cannot tell from the bar whether they are in the mode at all -- which is how a tap
@@ -4514,6 +4615,21 @@ textarea {
     letter-spacing: 0.01em;
     text-transform: none;
     color: inherit;
+  }
+
+  /* `#221 read-modes`. The read mode's name is a size down on the phone tile, where its column is
+     narrow; beside its icon here it is a word like the others, at their size — and ONE word, the
+     mode's first: this row was fitted to "Hide read" with nothing to spare, and "Collapse read"
+     would push the dock onto a second row. The icon says which mode, the word says what it does to
+     what is read, and the whole name is the button's accessible name and its tooltip. */
+  #control-pane #todo-filter .control-label {
+    font-size: 0.85rem;
+    line-height: inherit;
+    text-align: start;
+  }
+
+  #control-pane #todo-filter .read-mode-noun {
+    display: none;
   }
 
   #control-pane .control-note {

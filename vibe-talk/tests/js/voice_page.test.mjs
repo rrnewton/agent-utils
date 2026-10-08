@@ -2947,6 +2947,12 @@ const TUNING_BANDS = {
     "channels whose chosen view is kept. Under ten, a reader moving among a dozen channels finds " +
     "the ones they left longest ago back in the default; past a couple of hundred it mostly keeps " +
     "choices made in channels nobody opens any more"],
+  // `#221 read-modes`. How short a run of read messages may be and still collapse to a line.
+  READ_RUN_MIN_ROWS: [2, 3,
+    "the fewest rows a run of read messages collapses at. One trades a message for a line as tall as " +
+    "it and hides the reader's own words between the two answers around them; past three, a pair " +
+    "or trio of long read messages between two unread ones is a screen of scrolling Collapse read " +
+    "was chosen to take away"],
   UI_STATE_CHARS: [20000, 200000,
     "the whole record in UTF-16 units. A remembered thread carries its root message, so under " +
     "twenty thousand a few long roots push every other channel's choice out; past two hundred " +
@@ -8579,7 +8585,7 @@ test("HIDE READ hiding the message is said, not walked past", async () => {
     message({ id: "301", content: "is the runner wedged?" }),
     message({ id: "302", content: "restarted it", reply_to: "301" }),
   ]);
-  await page.el("todo-filter").click();
+  await turnTodoOn(page);
   assert.deepStrictEqual(shownIds(page), ["302"]);
   const reads = page.timelineCalls.length;
 
@@ -8600,8 +8606,7 @@ test("...and when it is All that turns up the message Hide read is hiding, that 
   page.dealtWith.add("202");
   await signIn(page);
   await showDiscord(page, data.messages);
-  await page.el("todo-filter").click();
-  await page.settle();
+  await turnTodoOn(page);
   await pickThread(page, "main");
   assert.ok(shownIds(page).includes("203"), "the reply is not on screen in Main");
 
@@ -8714,8 +8719,7 @@ test("...and Hide read, which does not draw a read row at all, leaves the messag
     message({ id: "303", content: "restarted it", reply_to: "301", ...ALICE }),
   ]);
   assert.equal(arrowStyle(rowWithId(page, "303")), "disconnected");
-  await page.el("todo-filter").click();
-  await page.settle();
+  await turnTodoOn(page);
   assert.deepStrictEqual(shownIds(page), ["301", "303"]);
   assert.equal(arrowStyle(rowWithId(page, "303")), "adjacent", "Hide read left the arrow pointing past an empty place");
 });
@@ -9100,8 +9104,7 @@ test("A FILTER THAT TAKES ROWS AWAY puts the replies back; Hide read leaves the 
   assert.deepStrictEqual(shownIds(page), GATHERED);
   // Hide read: 604 is read, and the stack is what is left of it.
   page.dealtWith.add("604");
-  await page.el("todo-filter").click();
-  await page.settle();
+  await turnTodoOn(page);
   page.expireTimers(DISCORD_POLL_MS);
   for (let i = 0; i < 4; i += 1) await page.settle();
   assert.deepStrictEqual(shownIds(page), GATHERED.filter((id) => id !== "604"), "Hide read did not compose with the stack");
@@ -9115,7 +9118,7 @@ test("WHAT IS NOT GATHERED IS SAID: a thread's count above what is loaded, and H
   assert.equal(statusText(page), "Gathered 5 replies; 1 not loaded.");
   const hidden = await scatteredPage();
   hidden.dealtWith.add("604");
-  await hidden.el("todo-filter").click();
+  await turnTodoOn(hidden);
   hidden.expireTimers(DISCORD_POLL_MS);
   for (let i = 0; i < 4; i += 1) await hidden.settle();
   assert.ok(!shownIds(hidden).includes("604"), "Hide read is not hiding the read reply");
@@ -9278,8 +9281,7 @@ test("...and a link through a message Hide read leaves out still joins what is d
     message({ id: "303", content: "lunch?" }),
     message({ id: "304", content: "the queue drains", reply_to: "302", ...OWNER }),
   ]);
-  await page.el("todo-filter").click();
-  await page.settle();
+  await turnTodoOn(page);
   assert.deepStrictEqual(shownIds(page), ["300", "301", "303", "304"], "Hide read is drawing the read reply");
   await doubleTapArrow(page, rowWithId(page, "304"));
   assert.deepStrictEqual(shownIds(page), ["300", "301", "304", "303"]);
@@ -11612,10 +11614,16 @@ const rowMoreMenu = (li) => li.descendants().find((node) => node.className === "
 const shownIds = (page) =>
   [...page.el("discord-log").children].map((li) => li.getAttribute("data-id"));
 
-/** Turn the to-do filter on the way a thumb does. */
+/**
+ * Turn the to-do filter on the way a thumb does. `#221 read-modes`: Hide read is the third of the
+ * read modes, so the thumb taps on through Collapse read to it — at most twice from Show read.
+ */
 async function turnTodoOn(page) {
-  await page.el("todo-filter").click();
-  await page.settle();
+  for (let taps = 0; taps < 3 && page.el("todo-filter").getAttribute("aria-pressed") !== "true"; taps += 1) {
+    await page.el("todo-filter").click();
+    await page.settle();
+  }
+  assert.equal(page.el("todo-filter").getAttribute("aria-pressed"), "true", "three taps did not reach Hide read");
 }
 
 /** A channel of plain short messages with predictable ids. */
@@ -22748,7 +22756,7 @@ test("Hide read reprojects a cached threaded timeline without fetching", async (
   await showDiscord(page, [first, second]);
   const fetched = page.timelineCalls.length;
   assert.equal(page.el("discord-log").children.length, 2);
-  await page.el("todo-filter").click();
+  await turnTodoOn(page);
   assert.equal(page.el("discord-log").children.length, 1);
   assert.equal(page.el("discord-log").children[0].getAttribute("data-id"), "302");
   assert.equal(page.timelineCalls.length, fetched, "Hide read refetched an already cached timeline");
@@ -30025,4 +30033,507 @@ test("a pinned message shows its reactions in the Pinned list, and redraws when 
   await pollOnce(page);
   assert.deepStrictEqual(chipsOf(page.el("pinned-log").children[1]), ["👀 1", "✅ 1", "👍 1"],
     "the Pinned list kept the reactions it was first drawn with");
+});
+
+// --- `#221 read-modes` ---------------------------------------------------------------------------
+//
+// The owner, 2026-10-08: entering a thread to read the agent's answer landed on it folded. "I would
+// like the heuristic to instead be to expand the first unread message when jumping into the thread
+// ... show the thread root then ' ... 45 read messages ... ' then the expanded next message I want
+// to read ... cycle between 3 modes - Show Read, Collapse Read, and Hide Read."
+
+const RUN_THREAD = "spaces/A/threads/canary";
+const runId = (n) => `77000000000000${String(n).padStart(5, "0")}`;
+const readRunLineOf = (li) => li.children.find((node) => node.className === "read-run");
+const collapsedRows = (page) =>
+  page.el("discord-log").children.filter((li) => li.hasAttribute("data-read-run"));
+/**
+ * Where the floating line over the head of the list ends: the bottom of the freshness pill or the
+ * search glass, whichever is lower. The rule `floatingClearance` follows, restated rather than
+ * reached into, because a row landed "under the floating line" is a claim about exactly that line.
+ */
+function floatingLine(page) {
+  let line = page.el("scroll-area").getBoundingClientRect().top;
+  for (const id of ["channel-freshness", "search-float"]) {
+    const node = page.el(id);
+    if (!node.hidden && node.getBoundingClientRect().height > 0) line = Math.max(line, node.getBoundingClientRect().bottom);
+  }
+  return line;
+}
+/** Whether `row` starts just under the floating line: at the head of the list, as a landing puts it. */
+const atTheHead = (page, row) => {
+  const top = row.getBoundingClientRect().top;
+  return top >= floatingLine(page) && top <= floatingLine(page) + LINE_PX;
+};
+const readModeSaid = (page) => [
+  page.el("todo-filter-label").text(),
+  page.el("todo-filter").getAttribute("aria-pressed"),
+  page.el("todo-filter").getAttribute("data-read-mode"),
+];
+
+/**
+ * A thread the owner asked in, answered at length: `read` replies already read — the agent's swiped
+ * Done, the owner's own read by default, the third of them long — then the agent's long answer that
+ * nobody has read (`runId(500)`), then `tail`, each `[who, read]` with `who` "own" or "agent".
+ */
+function runThread(page, { read = 12, tail = [] } = {}) {
+  const thread = { id: RUN_THREAD, root_message_id: runId(0), is_root: true, reply_count: null,
+    reply_count_exact: true };
+  const reply = (n, fields) => message({ id: runId(n), thread: { ...thread, is_root: false }, ...fields });
+  const messages = [message({ id: runId(0), content: "should we roll the canary back?", thread, ...OWN })];
+  for (let n = 1; n <= read; n += 1) {
+    const own = n % 2 === 0;
+    const content = n === 3 ? longMessage("step three") : own ? `noted, step ${n}` : `checked step ${n}`;
+    messages.push(reply(n, { content, ...(own ? OWN : CODER) }));
+    if (!own) page.dealtWith.add(runId(n));
+  }
+  messages.push(reply(500, { content: longMessage("the canary answer"), ...CODER }));
+  tail.forEach(([who, isRead], i) => {
+    messages.push(reply(501 + i, { content: `after the answer ${i}`, ...(who === "own" ? OWN : CODER) }));
+    if (isRead && who !== "own") page.dealtWith.add(runId(501 + i));
+  });
+  page.threadingSupported = true;
+  page.threads = [{ id: RUN_THREAD, root: messages[0], title: "Canary rollback",
+    reply_count: messages.length - 1, reply_count_exact: true, updated_at: messages[messages.length - 1].timestamp }];
+  return messages;
+}
+
+/** Into the channel, in All, and then into the thread from the bar's picker, as a thumb does. */
+async function enterRunThread(page, messages, before = async () => {}) {
+  await signIn(page);
+  await showDiscord(page, messages);
+  await before();
+  await pickThread(page, `thread:${RUN_THREAD}`);
+}
+
+/** Tap the Hide read button until it names `label`, at most once round the cycle. */
+async function chooseReadMode(page, label) {
+  for (let taps = 0; taps < 3 && page.el("todo-filter-label").text() !== label; taps += 1) {
+    await page.el("todo-filter").click();
+    await page.settle();
+  }
+  assert.equal(page.el("todo-filter-label").text(), label, `the cycle never reached ${label}`);
+}
+
+/** What follows the agent's answer in most of these threads: enough that it can reach the head. */
+const RUN_TAIL = [["own", true], ["agent", false], ["agent", false], ["own", true]];
+
+test("entering a thread lands on its first unread message, unfolded, at the head of the list", async () => {
+  const page = newPage();
+  const messages = runThread(page, { tail: RUN_TAIL });
+  await enterRunThread(page, messages);
+  assert.equal(page.el("thread-select").value, `thread:${RUN_THREAD}`, "the thread did not open");
+  assert.equal(shownIds(page).length, 18, "Show read left a message out");
+  const answer = rowWithId(page, runId(500));
+  assert.equal(answer.getAttribute("data-collapsed"), "false", "the answer the reader came for is folded");
+  assert.equal(foldButton(answer).getAttribute("aria-expanded"), "true");
+  assert.ok(atTheHead(page, answer),
+    `the answer landed at ${answer.getBoundingClientRect().top}px, not under the floating line at ${floatingLine(page)}px`);
+  // Show read shows what is read: nothing is collapsed, and the root, a long run above, is scrolled past.
+  assert.deepStrictEqual(collapsedRows(page), [], "Show read collapsed read messages on entry");
+  assert.ok(rowWithId(page, runId(0)).getBoundingClientRect().bottom <= 0, "the run fit after all; this proves nothing");
+  // Only the one message: a long read reply stays as it arrived.
+  assert.equal(rowWithId(page, runId(3)).getAttribute("data-collapsed"), "true", "entry opened a message already read");
+});
+
+test("...a thread with nothing unread opens on its newest message, folded, as it always has", async () => {
+  const page = newPage();
+  const messages = runThread(page);
+  page.dealtWith.add(runId(500));
+  await enterRunThread(page, messages);
+  assert.ok(atBottomOf(page.el("scroll-area")), "a thread with nothing unread did not open on its newest line");
+  assert.equal(rowWithId(page, runId(500)).getAttribute("data-collapsed"), "true", "a read message was opened");
+});
+
+test("...once: the reader's own fold, a redraw and a scroll after the entry open nothing and move nobody", async () => {
+  const page = newPage();
+  const messages = runThread(page, { tail: RUN_TAIL });
+  await enterRunThread(page, messages);
+  const answer = () => rowWithId(page, runId(500));
+  assert.equal(answer().getAttribute("data-collapsed"), "false");
+  // The reader folds it again, and goes up to the question.
+  await foldButton(answer()).click();
+  assert.equal(answer().getAttribute("data-collapsed"), "true");
+  const area = page.el("scroll-area");
+  area.scrollTop = 0;
+  await reReadChannel(page);
+  assert.equal(answer().getAttribute("data-collapsed"), "true", "a redraw opened what the reader folded");
+  assert.equal(area.scrollTop, 0, "a redraw took the reader back to the entry's landing");
+  // A message arriving in the thread is not an entry either.
+  page.messages = [...messages, message({ id: runId(600), content: "one more thing",
+    thread: { ...messages[1].thread }, ...CODER })];
+  await reReadChannel(page);
+  assert.equal(answer().getAttribute("data-collapsed"), "true", "an arrival opened what the reader folded");
+  assert.equal(area.scrollTop, 0, "an arrival moved the reader");
+  // Entering again is a new entry: it lands on the first unread, which is the answer still.
+  await pickThread(page, "flat");
+  await pickThread(page, `thread:${RUN_THREAD}`);
+  assert.equal(answer().getAttribute("data-collapsed"), "false", "entering again did not open the first unread");
+  assert.ok(atTheHead(page, answer()), "entering again did not land on the first unread");
+});
+
+test("...and a thread read for itself lands when its read does, not on the empty list before it", async () => {
+  const page = newPage();
+  const messages = runThread(page, { tail: RUN_TAIL });
+  // All reaches back three messages and has more: the thread began before it, so it is read for itself.
+  const serve = page.timeline;
+  page.timeline = async (path, options) => {
+    if (new URL(path, "http://fixture.test").searchParams.get("view") !== "flat") return serve(path, options);
+    const recent = page.messages.slice(-3);
+    return json(200, timelineAnswer({ view: "flat", messages: recent, has_threads: true, has_more: true,
+      next_before: "older-than-three", dismissed: recent.map((m) => m.id).filter((id) => page.dealtWith.has(id)) }));
+  };
+  await signIn(page);
+  await showDiscord(page, messages);
+  const hold = holdChannelReads(page, "timeline");
+  const entering = pickThread(page, `thread:${RUN_THREAD}`);
+  await page.settle();
+  assert.deepStrictEqual(shownIds(page), [], "the thread was drawn before it was read");
+  assert.ok(hold.held.length > 0, "the thread was not read");
+  hold.release();
+  await entering;
+  await page.settle();
+  assert.equal(shownIds(page).length, 18, "the thread's read did not land");
+  const answer = rowWithId(page, runId(500));
+  assert.equal(answer.getAttribute("data-collapsed"), "false", "the landing was spent on the empty list");
+  assert.ok(atTheHead(page, answer), `the answer landed at ${answer.getBoundingClientRect().top}px`);
+});
+
+test("the Hide read button cycles Show read, Collapse read and Hide read, names each, and keeps it", async () => {
+  const page = newPage();
+  await signIn(page);
+  await showDiscord(page, backlog());
+  assert.deepStrictEqual(readModeSaid(page), ["Show read", "false", "show"], "the default is not Show read");
+  assert.equal(page.el("todo-filter").getAttribute("aria-label"), "Show read. Tap for Collapse read");
+  const steps = [
+    [["Collapse read", "mixed", "collapse"], "collapse", false, "Collapse read. Tap for Hide read"],
+    [["Hide read", "true", "hide"], "hide", true, "Hide read. Tap for Show read"],
+    [["Show read", "false", "show"], "show", false, "Show read. Tap for Collapse read"],
+  ];
+  for (const [said, read, todo, name] of steps) {
+    await page.el("todo-filter").click();
+    await page.settle();
+    assert.deepStrictEqual(readModeSaid(page), said);
+    assert.equal(page.el("todo-filter").getAttribute("aria-label"), name);
+    assert.ok(page.el("todo-filter").getAttribute("title").length > 20, "the mode is not explained under the pointer");
+    const saved = savedUiState(page);
+    assert.equal(saved.read, read, "the mode was not kept");
+    assert.equal(saved.todo, todo, "Hide read, as older pages read it, was not kept beside the mode");
+  }
+  // Kept across a reload, like Hide read always was.
+  await page.el("todo-filter").click();
+  await page.settle();
+  const reopened = reloadWith(page.storage, backlog());
+  await reopenedChannel(reopened);
+  assert.deepStrictEqual(readModeSaid(reopened), ["Collapse read", "mixed", "collapse"], "a reload lost Collapse read");
+  // A record from before the modes says only Hide read or not, and means what it meant.
+  for (const [todo, said] of [[true, ["Hide read", "true", "hide"]], [false, ["Show read", "false", "show"]]]) {
+    const record = { ...savedUiState(reopened), todo };
+    delete record.read;
+    reopened.storage.set(UI_STATE_KEY, JSON.stringify(record));
+    const older = reloadWith(reopened.storage, backlog());
+    await reopenedChannel(older);
+    assert.deepStrictEqual(readModeSaid(older), said, `a record with todo: ${todo} and no mode`);
+  }
+  // Each mode has its own icon, and the page first draws Show read's alone. (Which one is drawn
+  // after each tap is measured in Chromium: tests/read_modes_browser.py.)
+  for (const [mode, hidden] of [["show", ""], ["collapse", " hidden"], ["hide", " hidden"]]) {
+    assert.match(HTML_CODE, new RegExp(`class="control-icon read-mode-icon" data-mode="${mode}"${hidden} viewBox`),
+      `the ${mode} icon is not drawn as the page starts`);
+  }
+  // The name is two words, and the desk's one-row dock draws the first alone. (This page was left
+  // on Collapse read before the reloads.)
+  const words = page.el("todo-filter-label").children.map((node) => [node.className, node.textContent]);
+  assert.deepStrictEqual(words, [["read-mode-verb", "Collapse"], ["read-mode-noun", " read"]]);
+  assert.match(cssBlockIn("(min-width: 900px) and (pointer: fine)", "#control-pane #todo-filter .read-mode-noun"),
+    /display:\s*none/, "a desk's dock draws the whole name, and the row it was fitted to wraps");
+});
+
+test("Collapse read: a thread opens on its root, one line for the read run, and the first unread unfolded", async () => {
+  const page = newPage();
+  const messages = runThread(page, { tail: RUN_TAIL });
+  await enterRunThread(page, messages, async () => {
+    await chooseReadMode(page, "Collapse read");
+    // A viewport the root, the line and the start of the answer fit in, as they do on a phone in
+    // Chromium. This fixture lays a row's meta line out as a column of five lines, and draws the
+    // line's row with the message it hides; neither is so in a browser.
+    page.el("scroll-area").clientHeight = 700;
+  });
+  const rows = page.el("discord-log").children;
+  assert.equal(rows.length, 18, "Collapse read took a message out of the list");
+  assert.equal(rows[0].getAttribute("data-id"), runId(0));
+  assert.equal(rows[0].hasAttribute("data-read-run"), false, "the root, read as it is, was collapsed");
+  assert.equal(rows[0].hidden, false);
+  assert.equal(rows[1].getAttribute("data-read-run"), "head");
+  const line = readRunLineOf(rows[1]);
+  assert.ok(line, "the run has no line");
+  assert.equal(line.textContent, "… 12 read messages …");
+  assert.equal(line.hidden, false);
+  assert.equal(line.getAttribute("aria-expanded"), "false");
+  assert.equal(line.getAttribute("type"), "button");
+  for (const row of rows.slice(2, 13)) {
+    assert.equal(row.getAttribute("data-read-run"), "member");
+    assert.equal(row.hidden, true, "a read message in the run is still drawn");
+  }
+  const answer = rows[13];
+  assert.equal(answer.getAttribute("data-id"), runId(500));
+  assert.equal(answer.hasAttribute("data-read-run"), false);
+  assert.equal(answer.getAttribute("data-collapsed"), "false", "the first unread is folded");
+  const area = page.el("scroll-area");
+  const rootTop = rows[0].getBoundingClientRect().top;
+  assert.ok(atTheHead(page, rows[0]), `the root is not at the head of the list: ${rootTop}px`);
+  assert.ok(answer.getBoundingClientRect().top < area.clientHeight / 2, "the answer is not on screen below the root");
+  // The folds under the line are not the list's: Expand all has nothing it could show.
+  assert.equal(page.el("expand-all").hidden, true, "Expand all offered to open a message behind the line");
+
+  // A tap on the line opens the run where it is: the root does not move.
+  await line.click();
+  await page.settle();
+  assert.deepStrictEqual(collapsedRows(page), [], "the run did not open");
+  assert.ok(rows.every((row) => !row.hidden), "a message of the opened run is still hidden");
+  assert.equal(line.hidden, true, "the line stayed over the run it opened");
+  assert.equal(rows[0].getBoundingClientRect().top, rootTop, "opening the run moved the reader");
+  assert.equal(page.el("expand-all").hidden, false, "the long read message in the run cannot be opened");
+  // Open stays open: a redraw does not collapse it again, nor does a message joining it.
+  page.dealtWith.add(runId(500));
+  await reReadChannel(page);
+  assert.deepStrictEqual(collapsedRows(page), [], "a redraw collapsed the run the reader opened");
+});
+
+/**
+ * A channel without threads: an unread message, one read message alone, then two read messages
+ * the agent posted a second apart — one combined row — and another read one, an unread message,
+ * one read message and the newest message, read.
+ */
+function splitRunChannel(page) {
+  const at = (minutes, seconds = 0) => new Date(MESSAGE_EPOCH + minutes * 60000 + seconds * 1000).toISOString();
+  const rows = [
+    ["8800000000000000001", "agent", false, at(0)],
+    ["8800000000000000002", "agent", true, at(1)],
+    ["8800000000000000003", "unread", false, at(2)],
+    ["8800000000000000004", "agent", true, at(3)],
+    ["8800000000000000005", "agent", true, at(3, 1)],
+    ["8800000000000000006", "own", true, at(4)],
+    ["8800000000000000007", "unread", false, at(5)],
+    ["8800000000000000008", "agent", true, at(6)],
+    ["8800000000000000009", "own", true, at(7)],
+  ];
+  return rows.map(([id, who, read, timestamp]) => {
+    if (read && who === "agent") page.dealtWith.add(id);
+    return message({ id, timestamp, content: `message ${id.slice(-1)}`,
+      ...(who === "own" ? OWN : who === "agent" ? CODER : { author: "alice", author_id: "30", author_is_bot: false }) });
+  });
+}
+
+test("Collapse read collapses runs of two rows or more, split by unread messages, never the newest", async () => {
+  const page = newPage();
+  await signIn(page);
+  await showDiscord(page, splitRunChannel(page));
+  assert.equal(page.el("discord-log").children.length, 8, "the two messages a second apart were not combined");
+  await chooseReadMode(page, "Collapse read");
+  const role = (id) => rowWithId(page, id).getAttribute("data-read-run");
+  // One read message alone between two unread ones is shown: a line would save nothing.
+  assert.equal(role("8800000000000000002"), null, "a single read message was collapsed");
+  // The combined row and the read one after it: two rows, three messages.
+  assert.equal(role("8800000000000000004"), "head");
+  assert.equal(readRunLineOf(rowWithId(page, "8800000000000000004")).textContent, "… 3 read messages …",
+    "the line counted rows, not the messages in them");
+  assert.equal(role("8800000000000000006"), "member");
+  assert.equal(role("8800000000000000003"), null, "an unread message was collapsed");
+  assert.equal(role("8800000000000000007"), null, "an unread message was collapsed");
+  // The newest message is where the conversation stands, and what the composer answers.
+  assert.equal(role("8800000000000000009"), null, "the newest message was collapsed");
+  assert.equal(role("8800000000000000008"), null, "a run of one, cut short by the newest, was collapsed");
+  // A search, or Links, chooses rows: every match is shown, and closing it collapses them again.
+  await search(page, "message");
+  assert.deepStrictEqual(collapsedRows(page), [], "a search left matches behind a line");
+  await page.el("search-toggle").click();
+  await page.settle();
+  assert.equal(role("8800000000000000004"), "head", "closing the search did not collapse the run again");
+  // Show read and Collapse read are one read of this channel, drawn two ways.
+  const reads = page.pageReads;
+  await chooseReadMode(page, "Hide read");
+  await chooseReadMode(page, "Show read");
+  assert.deepStrictEqual(collapsedRows(page), [], "Show read left a run collapsed");
+  await chooseReadMode(page, "Collapse read");
+  assert.equal(role("8800000000000000004"), "head");
+  assert.equal(page.pageReads, reads + 1, "Collapse read read the channel again; only leaving Hide read should");
+});
+
+/** A threaded channel's All: unread, two read, unread, two read, then eight unread. */
+function joiningChannel(page) {
+  const ids = Array.from({ length: 14 }, (_unused, i) => `99000000000000000${String(i).padStart(2, "0")}`);
+  const read = new Set([1, 2, 4, 5]);
+  page.threadingSupported = true;
+  return ids.map((id, i) => {
+    if (read.has(i)) page.dealtWith.add(id);
+    return message({ id, content: `update ${i}: the same length`, ...CODER });
+  });
+}
+
+test("Collapse read: a message marked Done joins the runs around it, and the reader does not move", async () => {
+  const page = newPage();
+  const messages = joiningChannel(page);
+  await signIn(page);
+  await showDiscord(page, messages);
+  await chooseReadMode(page, "Collapse read");
+  const head = (id) => readRunLineOf(rowWithId(page, id));
+  assert.equal(head(messages[1].id).textContent, "… 2 read messages …");
+  assert.equal(head(messages[4].id).textContent, "… 2 read messages …");
+  // The reader is on the sixth message, at the top of the screen, below both runs.
+  const area = page.el("scroll-area");
+  const reading = () => rowWithId(page, messages[6].id);
+  area.scrollTop += reading().getBoundingClientRect().top;
+  assert.equal(reading().getBoundingClientRect().top, 0, "the fixture cannot put the reader there");
+  await doneButton(rowWithId(page, messages[3].id)).click();
+  await page.settle();
+  assert.equal(head(messages[1].id).textContent, "… 5 read messages …", "the runs did not join round it");
+  assert.equal(rowWithId(page, messages[3].id).hidden, true, "the message dealt with is still drawn");
+  assert.equal(reading().getBoundingClientRect().top, 0, "joining the runs moved the reader");
+  // Put back, it splits them again, where the reader is.
+  await doneButton(rowWithId(page, messages[3].id)).click();
+  await page.settle();
+  assert.equal(head(messages[1].id).textContent, "… 2 read messages …", "the run did not split round it");
+  assert.equal(reading().getBoundingClientRect().top, 0, "splitting the run moved the reader");
+});
+
+test("...and a read that finds a message read elsewhere grows the run, without moving the reader", async () => {
+  const page = newPage();
+  const messages = joiningChannel(page);
+  await signIn(page);
+  await showDiscord(page, messages);
+  await chooseReadMode(page, "Collapse read");
+  const area = page.el("scroll-area");
+  const reading = () => rowWithId(page, messages[6].id);
+  area.scrollTop += reading().getBoundingClientRect().top;
+  // Dealt with on another device; the poll reads the channel again.
+  page.dealtWith.add(messages[3].id);
+  await reReadChannel(page);
+  assert.equal(readRunLineOf(rowWithId(page, messages[1].id)).textContent, "… 5 read messages …",
+    "a read did not grow the run");
+  assert.equal(reading().getBoundingClientRect().top, 0, "a read that grew a run moved the reader");
+  // ...and one put back elsewhere shrinks it.
+  page.dealtWith.delete(messages[2].id);
+  await reReadChannel(page);
+  assert.equal(rowWithId(page, messages[1].id).hasAttribute("data-read-run"), false, "a run of one stayed collapsed");
+  assert.equal(readRunLineOf(rowWithId(page, messages[3].id)).textContent, "… 3 read messages …");
+  assert.equal(reading().getBoundingClientRect().top, 0, "a read that shrank a run moved the reader");
+});
+
+test("Collapse read: a jump to a message inside a run opens the run; Pinned and Hide read are as they were", async () => {
+  const page = newPage();
+  const messages = joiningChannel(page);
+  messages[13] = { ...messages[13], reply_to: messages[5].id };
+  page.pinned.set(messages[1].id, storedPin(messages[1]));
+  page.servePinsRevision = true;
+  page.pinsRevision = 3;
+  await signIn(page);
+  await showDiscord(page, messages);
+  await chooseReadMode(page, "Collapse read");
+  assert.equal(rowWithId(page, messages[5].id).getAttribute("data-read-run"), "member");
+  await tapArrow(page, rowWithId(page, messages[13].id));
+  const answered = rowWithId(page, messages[5].id);
+  assert.equal(answered.hidden, false, "the jump landed on a message hidden in a run");
+  assert.equal(answered.hasAttribute("data-read-run"), false, "the run the jump went into stayed collapsed");
+  assert.equal(answered.getAttribute("data-landed"), "true", "the message the reply answers was not lit");
+  assert.equal(rowWithId(page, messages[1].id).getAttribute("data-read-run"), "head",
+    "the jump opened a run it did not go into");
+  // A pin outranks every read mode: the Pinned list is never collapsed.
+  await showPinned(page);
+  assert.deepStrictEqual(pinnedIds(page), [messages[1].id]);
+  assert.ok(page.el("pinned-log").children.every((li) => !li.hasAttribute("data-read-run") && !li.hidden));
+  await page.el("search-toggle").click();
+  await page.settle();
+  // Hide read, as before: what is read is left out, and nothing is collapsed.
+  await chooseReadMode(page, "Hide read");
+  assert.deepStrictEqual(shownIds(page), [0, 3, 6, 7, 8, 9, 10, 11, 12, 13].map((i) => messages[i].id));
+  assert.deepStrictEqual(collapsedRows(page), []);
+});
+
+test("Hide read: entering a thread lands on its first unread message too", async () => {
+  const page = newPage();
+  const messages = runThread(page, { tail: [["agent", false]] });
+  await enterRunThread(page, messages, () => chooseReadMode(page, "Hide read"));
+  assert.deepStrictEqual(shownIds(page), [runId(500), runId(501)], "Hide read showed a read message");
+  assert.equal(rowWithId(page, runId(500)).getAttribute("data-collapsed"), "false", "the first unread is folded");
+});
+
+test("a collapsed run's line is the row's only face, a thumb tall, and not something a swipe can archive", () => {
+  const head = cssBlock('#discord-log li.discord-message[data-read-run="head"] > :not(.read-run)');
+  assert.match(head, /display:\s*none !important/, "the message shows through its run's line");
+  const box = cssBlock('#discord-log li.discord-message[data-read-run="head"]');
+  for (const property of ["background: none", "opacity: 1", "filter: none", "margin-left: 0", "padding: 0"]) {
+    assert.ok(box.includes(`${property} !important`), `the line wears the row's ${property.split(":")[0]}`);
+  }
+  assert.match(cssBlock('#discord-log li.discord-message[data-read-run="head"]::after'), /content:\s*none !important/);
+  const line = cssBlock("#discord-log .read-run");
+  assert.match(line, /min-height:\s*2\.75rem/, "the line is not a 44px target");
+  assert.match(line, /width:\s*100%/);
+  assert.match(cssBlockIn(HOVER_QUERY, "#discord-log .read-run:hover"), /color:\s*var\(--ink\)/);
+  // A finger on the line presses the line: it is neither a swipe to Done nor a hold for details.
+  assert.match(SCRIPT_CODE, /if \(li\.getAttribute\("data-read-run"\) === "head"\) \{\s*return;\s*\}/);
+});
+
+test("...and the message the reader is on, marked Done, is held where it was by the line it joins", async () => {
+  // A channel with threads is redrawn from its store on a Done; one without keeps its rows and
+  // re-derives them. Both have to leave the reader looking at the run that took their message.
+  for (const threaded of [true, false]) {
+    const page = newPage();
+    const messages = joiningChannel(page);
+    page.threadingSupported = threaded;
+    await signIn(page);
+    await showDiscord(page, messages);
+    await chooseReadMode(page, "Collapse read");
+    const area = page.el("scroll-area");
+    area.scrollTop += rowWithId(page, messages[3].id).getBoundingClientRect().top;
+    assert.equal(rowWithId(page, messages[3].id).getBoundingClientRect().top, 0, "the fixture cannot put the reader there");
+    const below = rowWithId(page, messages[6].id).getBoundingClientRect().top;
+    await doneButton(rowWithId(page, messages[3].id)).click();
+    await page.settle();
+    const line = rowWithId(page, messages[1].id);
+    assert.equal(readRunLineOf(line).textContent, "… 5 read messages …", `threaded ${threaded}: the runs did not join`);
+    assert.equal(line.getBoundingClientRect().top, 0,
+      `threaded ${threaded}: the line that took the reader's message is not where the message was`);
+    assert.ok(rowWithId(page, messages[6].id).getBoundingClientRect().top < below,
+      `threaded ${threaded}: what follows did not come up into the room the run gave back`);
+  }
+});
+
+test("Collapse read and gathered replies: a reply below a run's line is not drawn as joined to it, and a gathered stack stays whole", async () => {
+  // A reply whose message is behind a line points at nothing drawn: its arrow is the disconnected one.
+  const page = newPage();
+  page.dealtWith.add("1000000000000000001");
+  page.dealtWith.add("1000000000000000002");
+  await signIn(page);
+  await showDiscord(page, [
+    message({ id: "1000000000000000001", content: "is the runner wedged?" }),
+    message({ id: "1000000000000000002", content: "and the queue?" }),
+    message({ id: "1000000000000000003", content: "restarted it", reply_to: "1000000000000000001", ...ALICE }),
+    message({ id: "1000000000000000004", content: "draining now", reply_to: "1000000000000000003", ...ALICE }),
+    message({ id: "1000000000000000005", content: "thanks" }),
+  ]);
+  await chooseReadMode(page, "Collapse read");
+  assert.equal(rowWithId(page, "1000000000000000001").getAttribute("data-read-run"), "head");
+  assert.equal(arrowStyle(rowWithId(page, "1000000000000000003")), "disconnected",
+    "the reply's arrow joins the line as though the line were the message it answers");
+  assert.equal(arrowStyle(rowWithId(page, "1000000000000000004")), "adjacent", "an arrow between drawn rows changed");
+  await chooseReadMode(page, "Hide read");
+  await chooseReadMode(page, "Show read");
+  assert.equal(arrowStyle(rowWithId(page, "1000000000000000003")), "disconnected");
+
+  // Replies the reader gathered under their message are read together, read or not.
+  const gathered = await scatteredPage();
+  for (const id of ["597", "598", "599", "602", "603"]) gathered.dealtWith.add(id);
+  await reReadChannel(gathered);
+  await gatherChip(gathered, "601").click();
+  await gathered.settle();
+  assert.deepStrictEqual(shownIds(gathered), GATHERED);
+  await chooseReadMode(gathered, "Collapse read");
+  assert.equal(readRunLineOf(rowWithId(gathered, "597")).textContent, "… 3 read messages …",
+    "the read messages outside the stack were not collapsed");
+  for (const id of ["602", "603"]) {
+    assert.equal(rowWithId(gathered, id).hasAttribute("data-read-run"), false, `gathered reply ${id} was collapsed`);
+  }
+  assert.deepStrictEqual(stackPlaces(gathered).map(([id]) => id), ["601", "602", "603", "604", "606", "607"],
+    "Collapse read broke the gathered stack");
 });

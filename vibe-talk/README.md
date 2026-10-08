@@ -201,7 +201,7 @@ under `vibe-talk.voice.ui-state` and reopens on it:
   All where its chat service has threads and in Main where it has none. The 50 channels most
   recently on screen keep their choice, and fewer when long thread roots would make the record
   large; the least recently used give theirs up first.
-- **Hide read**, on or off.
+- **The read mode**: Show read, Collapse read or Hide read.
 - **The message you were reading**, at the same height on the screen — the message, not a pixel
   offset. If you were on the newest message, or yours is no longer on the device, the newest.
 - **One read.** The reopened view is drawn from the saved messages first, and the single newest-page
@@ -2561,6 +2561,33 @@ size of the channel.
   Until it lands, "dealt with" here is always **declared** — which is also why nothing yet has to
   decide what happens when derived and declared disagree.
 
+### Show read, Collapse read, Hide read
+
+`#221 read-modes`. The button beside Pace names what the list does with messages already read —
+archived (Done), your own words, and placeholders read automatically — and each tap moves it on.
+Each mode has its own icon; a desk's one-row dock shows the name's first word beside it (Show,
+Collapse, Hide), and the tooltip and the accessible name say it whole:
+
+- **Show read** (the default): every message, the read ones greyed.
+- **Collapse read**: each run of two or more read rows becomes one line, `… 12 read messages …`,
+  counting messages rather than rows, and a tap on the line opens that run. A thread's first
+  message and the newest message in the list stay in view however read they are: the first says
+  what the thread is about, the newest is where the conversation stands. A run grows, shrinks or
+  splits as messages are dealt with or put back, here or elsewhere, without moving the message you
+  are reading; a search or Links opens every run while it is choosing rows; the Pinned list is never
+  collapsed, nor are replies you have gathered under their message; and a jump to a message inside
+  a run opens it.
+- **Hide read**: read messages are left out, the queue it always was.
+
+What counts as read is one rule for every mode, so Collapse read collapses exactly what Hide read
+hides. The mode is kept with the rest of the UI state; a record written before the modes, which
+says only whether Hide read was on, is read as Hide read or Show read.
+
+`make -C vibe-talk read-modes-browser` enters a thread with a 45-message read run in each mode in a
+real Chromium at 412x915 and 1280x800, against a loopback fake API, and checks where the first unread
+message lands and that the run's line is a 44px target a real tap opens. Pass
+`SCREENSHOTS=/tmp/shots` to keep a PNG of each step.
+
 ### A long message can be read as a summary of itself
 
 `#49 cached-summaries` landed as a **server half with no caller**: the endpoint answered, the store
@@ -2869,6 +2896,11 @@ arrow returns to the line you were reading. The screen only reads, so a read-sco
 
 The floating chips over the list (Summaries, Undo, Expand all, …) keep their height clear under
 the channel composer, so scrolled to the end they never cover the box you are typing in.
+
+Opening a thread lands on its **first unread message**, expanded, just under the floating pill, with
+the thread's first message above it when both fit in the upper half of the screen (`#221
+read-modes`). A thread with nothing unread opens on its newest message, folded, as before. That
+happens once, on entering: a message you fold again stays folded through every refresh after.
 
 The threads it lists come from what the page already holds, so opening it costs no request.
 Touching it also reads the channel's thread list in the background, at most once a minute, so the
