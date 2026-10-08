@@ -44,9 +44,10 @@
 //!
 //! Anything else is left as it is written: another host, a repository's own page, a user's page, a
 //! gist, `/tree/REF/PATH` — where a branch name with a slash in it cannot be told from a
-//! directory — and any address whose query holds a parameter not known to change only how the page
-//! is shown ([`DISPLAY_ONLY_QUERY`]). A trailing slash, either scheme, `www.` and the host's case
-//! change nothing.
+//! directory — a page of the host's own under a word no account may take (`/orgs/OWNER/…`,
+//! [`GITHUB_RESERVED`]), and any address whose query holds a parameter not known to change only how
+//! the page is shown ([`DISPLAY_ONLY_QUERY`]). A trailing slash, either scheme, `www.` and the
+//! host's case change nothing.
 //!
 //! # A label is never decoded
 //!
@@ -55,6 +56,12 @@
 //! for a name. A part holding anything else — a percent-escape, a space, a character from another
 //! script that could turn the text around it — leaves the whole address as it is. So no label is
 //! ever wrong about the address beneath it, and none holds anything that is not plain text.
+//!
+//! Nor is a path ever resolved. A browser resolves `.` and `..` segments, and their `%2e`
+//! spellings, before it goes anywhere, and treats a backslash as a slash, so
+//! `github.com/octo/widgets/blob/main/../../../../other/repo/pull/5` opens a pull request in
+//! ANOTHER repository. An address holding any of these, or a control character or a space a
+//! browser would drop or trip over, is left as written.
 //!
 //! # Other hosts
 //!
@@ -79,6 +86,10 @@ struct Host {
     /// The names it is reached by, lowercase. Matched exactly, in any case: a port, a user name or
     /// a longer name that merely begins with one of these is another host.
     names: &'static [&'static str],
+    /// First path segments that are the host's own pages and never an account, compared in any
+    /// case: an address under one is left as written, because its second segment is not a
+    /// repository's owner and its third is not a repository.
+    reserved: &'static [&'static str],
     /// The label for an address on it, from its parts.
     label: fn(&Address<'_>) -> Option<String>,
 }
@@ -86,8 +97,33 @@ struct Host {
 /// Every host that has short labels. See the module note on adding one.
 const HOSTS: [Host; 1] = [Host {
     names: &["github.com", "www.github.com"],
+    reserved: &GITHUB_RESERVED,
     label: github,
 }];
+
+/// GitHub's top-level words that no account may take, under which a path is GitHub's own and not
+/// `OWNER/REPO/…`. `/orgs/OWNER/discussions/N` is an organisation's discussion, whose thread lives
+/// in whichever repository the organisation chose, so `OWNER#N` would name the wrong repository;
+/// the rest are here so that no future route can be matched under one of them.
+const GITHUB_RESERVED: [&str; 17] = [
+    "orgs",
+    "organizations",
+    "users",
+    "enterprises",
+    "sponsors",
+    "settings",
+    "marketplace",
+    "apps",
+    "topics",
+    "collections",
+    "features",
+    "advisories",
+    "notifications",
+    "codespaces",
+    "search",
+    "explore",
+    "login",
+];
 
 /// An address cut into the parts a label is read from, each a slice of the address as written.
 struct Address<'u> {
@@ -103,7 +139,7 @@ struct Address<'u> {
 /// The short label for `address`, or `None` when it is not one this knows. See the module note.
 #[must_use]
 pub fn short_label(address: &str) -> Option<String> {
-    if address.len() > MAX_ADDRESS {
+    if address.len() > MAX_ADDRESS || address.bytes().any(unresolved) {
         return None;
     }
     let rest = strip_scheme(address)?;
@@ -130,7 +166,18 @@ pub fn short_label(address: &str) -> Option<String> {
     } else {
         path.split('/').collect()
     };
-    if segments.iter().any(|segment| segment.is_empty()) {
+    if segments
+        .iter()
+        .any(|segment| segment.is_empty() || dot_segment(segment))
+    {
+        return None;
+    }
+    if segments.first().is_some_and(|first| {
+        entry
+            .reserved
+            .iter()
+            .any(|word| word.eq_ignore_ascii_case(first))
+    }) {
         return None;
     }
     (entry.label)(&Address {
@@ -138,6 +185,32 @@ pub fn short_label(address: &str) -> Option<String> {
         query,
         fragment,
     })
+}
+
+/// Whether a browser could read `byte` as other than what it shows: a backslash, which it treats
+/// as a slash in a web address, and a space or a control character, which it drops or stops at.
+fn unresolved(byte: u8) -> bool {
+    byte == b'\\' || byte == b' ' || byte.is_ascii_control()
+}
+
+/// Whether a path segment is one a browser resolves before it goes anywhere: dots alone, each
+/// written `.` or `%2e` in any case. The web's own rule is one or two of them; any number is
+/// refused here, since none is a name a label would show.
+fn dot_segment(segment: &str) -> bool {
+    let mut rest = segment;
+    while !rest.is_empty() {
+        if let Some(after) = rest.strip_prefix('.') {
+            rest = after;
+        } else if rest
+            .get(..3)
+            .is_some_and(|head| head.eq_ignore_ascii_case("%2e"))
+        {
+            rest = &rest[3..];
+        } else {
+            return false;
+        }
+    }
+    !segment.is_empty()
 }
 
 /// `text` without a leading `http://` or `https://`, in any case, or `None` when it has neither.
@@ -798,6 +871,80 @@ mod tests {
         // Whatever an address holds, a label is ASCII letters, digits and a few signs.
         let label = label("https://github.com/octo/widgets/pull/41").expect("labelled");
         assert!(label.bytes().all(|b| b.is_ascii_graphic() || b == b' '));
+    }
+
+    #[test]
+    fn a_path_a_browser_would_resolve_elsewhere_is_left_as_written() {
+        // Each of these opens a page in a repository, or under a name, other than the one a label
+        // read from its segments would show: a browser resolves dot segments, `%2e` spelled or
+        // not, and reads a backslash as a slash, before it goes anywhere.
+        unlabelled(&[
+            format!("{REPO}/blob/main/../../../../evil/repo/pull/5"),
+            format!("{REPO}/blob/main/../../../../evil/repo/blob/main/README.md"),
+            format!("{REPO}/releases/tag/../../../../evil/payload"),
+            format!("{REPO}/tree/.."),
+            format!("{REPO}/tree/."),
+            format!("{REPO}/blob/main/.."),
+            format!("{REPO}/blob/main/./README.md"),
+            format!("{REPO}/blob/../README.md"),
+            format!("{REPO}/pull/41/.."),
+            format!("{REPO}/./pull/41"),
+            format!("{REPO}/../widgets/pull/41"),
+            format!("{REPO}/blob/%2e%2e/%2e%2e/%2e%2e/evil/repo/blob/main/x.rs"),
+            format!("{REPO}/blob/main/.%2E/.%2e/%2E./%2e/evil/repo/blob/main/x.rs"),
+            format!("{REPO}/blob/main/docs/%2e%2e/x.rs"),
+            format!("{REPO}/tree/%2e%2e"),
+            format!("{REPO}/blob/main/...\\..\\..\\evil/repo/blob/main/x.rs"),
+            format!("{REPO}/blob/main/..\\..\\..\\..\\evil/repo/blob/main/README.md"),
+            format!("{REPO}\\pull\\41"),
+            format!("{REPO}/pull/41\\"),
+            format!("{REPO}/blob/main/.\t./x.rs"),
+            format!("{REPO}/blob/main/.\n./x.rs"),
+            format!("{REPO}/pull/41\r"),
+            format!("{REPO}/pull/4 1"),
+        ]);
+        // A name that merely holds dots is a name, and still labelled.
+        labels(&[
+            (
+                "https://github.com/octo/.github/pull/2".to_owned(),
+                ".github#2",
+            ),
+            (format!("{REPO}/blob/main/.gitignore"), "widgets:.gitignore"),
+            (
+                format!("{REPO}/blob/main/.config/a..b.rs"),
+                "widgets:a..b.rs",
+            ),
+            (format!("{REPO}/tree/v1.0.x"), "widgets@v1.0.x"),
+            (format!("{REPO}/releases/tag/.hidden"), "widgets@.hidden"),
+        ]);
+    }
+
+    #[test]
+    fn a_page_under_a_word_no_account_may_take_is_left_as_written() {
+        // An organisation's discussion: its thread lives in whichever repository the organisation
+        // chose, so `octo#3` would name a repository, and a thread, it may not be.
+        unlabelled(&[
+            "https://github.com/orgs/octo/discussions/3".to_owned(),
+            "https://github.com/orgs/octo/discussions/3#discussioncomment-5".to_owned(),
+            "https://www.github.com/ORGS/octo/discussions/3".to_owned(),
+            "https://github.com/Orgs/octo/pull/3".to_owned(),
+            "https://github.com/users/octo/issues/3".to_owned(),
+            "https://github.com/enterprises/octo/discussions/3".to_owned(),
+            "https://github.com/sponsors/octo/pull/3".to_owned(),
+            "https://github.com/organizations/octo/issues/3".to_owned(),
+            "https://github.com/marketplace/actions/actions/runs/1".to_owned(),
+        ]);
+        // An account whose name merely begins with one of those words is an account.
+        labels(&[
+            (
+                "https://github.com/orgsmith/widgets/pull/3".to_owned(),
+                "widgets#3",
+            ),
+            (
+                "https://github.com/octo/orgs/discussions/3".to_owned(),
+                "orgs#3",
+            ),
+        ]);
     }
 
     #[test]

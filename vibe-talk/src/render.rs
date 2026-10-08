@@ -1516,6 +1516,39 @@ mod tests {
     }
 
     #[test]
+    fn no_markup_labels_an_address_that_opens_another_repository() {
+        // Labels read from these addresses' segments would name `widgets` or `octo`, but a browser
+        // opens a page elsewhere: it resolves dot segments, and an organisation's discussion lives
+        // in a repository of the organisation's choosing. Each stays as written, with no title.
+        for href in [
+            format!("{REPO}/blob/main/../../../../evil/repo/pull/5"),
+            format!("{REPO}/blob/main/../../../../evil/repo/blob/main/README.md"),
+            format!("{REPO}/releases/tag/../../../../evil/payload"),
+            format!("{REPO}/blob/%2e%2e/%2e%2e/%2e%2e/evil/repo/blob/main/x.rs"),
+            format!("{REPO}/tree/.."),
+            format!("{REPO}/blob/main/.."),
+            "https://github.com/orgs/octo/discussions/3".to_owned(),
+        ] {
+            let link = format!("<p>{}</p>\n", anchor(&href, &href));
+            // A bare address's closing dots are punctuation to the autolinker, so an address that
+            // ends in them is only ever all of a link in angle brackets.
+            let bare = (!href.ends_with('.')).then(|| href.clone());
+            for markup in [Markup::Discord, Markup::GoogleChat, Markup::Slack] {
+                for text in bare.iter().cloned().chain([format!("<{href}>")]) {
+                    assert_eq!(to_html(&text, markup), link, "{markup:?} {text:?}");
+                }
+            }
+            for markup in [Markup::GoogleChat, Markup::Slack] {
+                assert_eq!(
+                    to_html(&format!("<{href}|{href}>"), markup),
+                    link,
+                    "{markup:?} {href}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn a_status_line_of_addresses_reads_as_short_references() {
         // The shape of the message in `#227 github-link-abbrev`, with neutral names: a count, then
         // addresses, each followed by what it was, two of them joined by "and".

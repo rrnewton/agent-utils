@@ -2741,8 +2741,11 @@ live stream, a post's answer and the pins — and sends it beside the text as `c
    for a run of Actions and `widgets:render.rs#L10` for lines of a file. The repository's owner is
    left out. The link still goes to the same address, and a pointer resting on the label shows it.
    A link its writer named keeps its name, code is never relabelled, and any other address — other
-   hosts, and GitHub pages with no short form — is drawn as written. Copy text and every voice still
-   have the address as it was written. The rules are a table in `src/link_labels.rs`, where another
+   hosts, and GitHub pages with no short form — is drawn as written. So is any address a browser
+   would open somewhere other than its label says: one whose path holds a `.` or `..` segment
+   (spelled with `%2e` or not), a backslash or a control character, and one under a word of
+   GitHub's own that no account may take, such as an organisation's `/orgs/NAME/discussions/3`.
+   Copy text and every voice still have the address as it was written. The rules are a table in `src/link_labels.rs`, where another
    host can be added.
 6. Raw HTML written in a message is shown as the characters it is, and
    [ammonia](https://github.com/rust-ammonia/ammonia) then keeps only a short allowlist of
