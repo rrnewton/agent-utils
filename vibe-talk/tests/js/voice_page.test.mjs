@@ -21855,7 +21855,7 @@ test("Main drawn from All counts a root's replies from the thread summaries the 
 test("Main to All before All was read draws the held rows at once, and reads All once, behind them", async () => {
   const page = await mainOnlyThreadPage();
   // A thread read for itself leaves its reply in the store.
-  await threadButton(page.el("discord-log").children[1]).click();
+  await threadBadge(page.el("discord-log").children[1]).click();
   await page.settle();
   assert.deepStrictEqual(shownIds(page), ["201", "202"]);
   await page.el("thread-back").click();
