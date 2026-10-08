@@ -1,10 +1,11 @@
 ---
 title: 'enter-to-send: one Enter behaviour in every composer, with a Settings switch and Ctrl/Cmd-Enter'
-status: open
+status: closed
 priority: 2
 issue_type: feature
 created_at: 2026-10-08T16:13:22.186015443+00:00
-updated_at: 2026-10-08T16:13:22.186015443+00:00
+updated_at: 2026-10-08T23:30:34.294442233+00:00
+closed_at: 2026-10-08T23:30:34.294442093+00:00
 ---
 
 # Description
