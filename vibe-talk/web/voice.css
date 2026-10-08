@@ -1663,10 +1663,11 @@ body {
 }
 
 /*
- * `#215 reply-coalesce`. GATHERED REPLIES: a dense stack under the message they answer, joined to it
- * by one BRIDGE in the arrow's colour — a spine out of the parent's foot down the gutter, and a short
- * line from it into the left side of each reply, with no heads, because nothing here points
- * anywhere: the replies are where they answer. Their own arrows go while they are gathered.
+ * `#215 reply-coalesce`. GATHERED REPLIES: a dense stack, in time order, under the message they
+ * answer — directly, or through a reply to a reply, all one conversation — joined to it by one
+ * BRIDGE in the arrow's colour: a spine out of the parent's foot down the gutter, and a short line
+ * from it into the left side of each reply, with no heads, because nothing here points anywhere:
+ * the replies are in the conversation they answer. Their own arrows go while they are gathered.
  *
  * THE STACK HANGS ONE GUTTER IN FROM ITS PARENT'S LEFT EDGE, whoever sent each reply. The spine runs
  * down that gutter, so it is under the parent and comes out of its foot whatever the parent's shape
@@ -1707,8 +1708,9 @@ body {
   --reply-neutral-edge: transparent;
 }
 
-/* The bridge stands in for the arrow, and the arrow's tap is not needed: the message it would jump
-   to is the one directly above the stack. */
+/* The bridge stands in for the arrow. Every reply in the stack is there because what it answers is
+   the parent or another reply in the stack, a reply to a reply as much as one to the parent; one tap
+   on an arrow means that message, and it is back in its row once the stack is put away. */
 #discord-log li.discord-message[data-stack-under] > .reply-jump {
   display: none;
 }

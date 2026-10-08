@@ -141,9 +141,10 @@ found from the pixels, where the head's width runs out — and a press at that p
 the head is that arrow's, even where the head is drawn over the row above's own arrow; a reply to a
 message elsewhere draws the arrow that leaves the middle of its box's left side, within 1px, and runs
 at 45 degrees. Both at the default type size and at 150%. A real tap or click on each such head jumps
-to the row above and lights it, and two on the head drawn over another arrow gather the replies of the
-row it meets, not of the message that row answers. A real tap on the root's N replies gathers its
-replies under it, in time order, with the root where it was on the screen within 1px; one bridge in the
+to the row above and lights it, and two on the head drawn over another arrow are both that arrow's, and
+gather the conversation its reply is in under the conversation's first message. A real tap on the root's
+N replies gathers its replies, a reply to a reply among them, under it, in time order, with the root
+where it was on the screen within 1px; one bridge in the
 accent comes out of the flat of the root's foot, each reply's part of it starting at the foot of the
 row above and its line reaching the reply's left edge, all drawn, and still so with a reply in the
 stack opened by a tap on its text and at 150% type; the X is a 44px target on the screen, left of the
@@ -413,8 +414,9 @@ class CoalesceApi(FakeApi):
     party's, answers the root from far below it. 215, a third party's one line, answers 210 from below
     the thread, so its arrow's square is at its middle and reaches down beside its foot; and 216, the
     agent's, answers 215 from directly below, so its arrow's head is drawn over that square. Gathering
-    206 moves 207, 209, 212, 213 and 214, in that order, under it, and leaves 208, 211, 215 and 216
-    where they are."""
+    206 moves 207, 208 (a reply to a reply, so in 206's conversation too), 209, 212, 213 and 214, in
+    that order, under it, and leaves 210, 211, 215 and 216 where they are; 210 heads the conversation
+    211, 215 and 216 are in."""
 
     def __init__(self) -> None:
         super().__init__()
@@ -444,8 +446,8 @@ class CoalesceApi(FakeApi):
 
 # The CoalesceApi channel in time order, gathered under its root, and the stack itself.
 COALESCE_SCATTERED = [str(200 + i) for i in range(21)]
-GATHERED_STACK = ["207", "209", "212", "213", "214"]
-COALESCE_GATHERED = [*COALESCE_SCATTERED[:7], *GATHERED_STACK, "208", "210", "211", *COALESCE_SCATTERED[15:]]
+GATHERED_STACK = ["207", "208", "209", "212", "213", "214"]
+COALESCE_GATHERED = [*COALESCE_SCATTERED[:7], *GATHERED_STACK, "210", "211", *COALESCE_SCATTERED[15:]]
 
 
 def adjacent_heads(mobile: bool) -> list[tuple[str, str, str, str, bool]]:
@@ -1250,6 +1252,16 @@ LANDING_LATCH_JS = """(id) => {
             observer.disconnect();
         }
     }).observe(document.getElementById('discord-log'), {subtree: true, attributes: true, attributeFilter: ['data-landed']});
+}"""
+
+# `#214 reply-arrow` and `#215 reply-coalesce`. From now on, the row of every reply arrow a click lands
+# on, in `window.__arrowPresses`: which arrow two presses on one head were, whatever they gathered.
+ARROW_PRESS_LATCH_JS = """() => {
+    window.__arrowPresses = [];
+    document.addEventListener('click', (event) => {
+        const arrow = event.target instanceof Element ? event.target.closest('.reply-jump') : null;
+        if (arrow) window.__arrowPresses.push(arrow.closest('li[data-id]').getAttribute('data-id'));
+    }, true);
 }"""
 
 # `#214 reply-arrow`. What a pointer or finger on an adjacent arrow's HEAD presses, the head being the
@@ -2179,9 +2191,10 @@ def main() -> int:
             print(f"{label} at {width}x{height}: a reply directly under what it answers draws the arrow whose head"
                   " meets that row, at its foot or its side, within 1px, a press on that head its arrow's even over"
                   f" another arrow, a real {'tap' if mobile else 'click'} there jumping to the row it meets and two"
-                  " gathering that row's replies; and a reply to a message elsewhere the one"
-                  " leaving its box's middle at 45 degrees, at the default type size and at 150%; a real"
-                  f" {'tap' if mobile else 'click'} on N replies gathered the replies under their root, the root"
+                  " both that arrow's, gathering its conversation under the conversation's head; and a reply to a"
+                  " message elsewhere the one leaving its box's middle at 45 degrees, at the default type size and at"
+                  f" 150%; a real {'tap' if mobile else 'click'} on N replies gathered the replies, a reply to a reply"
+                  " among them, under their root, the root"
                   " unmoved, one bridge reaching every reply's left edge from the root's foot, through an opened"
                   " reply and 150% type, its X a 44px target that put them back with the root unmoved; two"
                   f" {'taps' if mobile else 'clicks'} on an arrow gathered them with the reply kept in place")
@@ -3505,8 +3518,9 @@ def coalesce_walk(chromium: BrowserType, args: argparse.Namespace, label: str, w
             page.wait_for_timeout(250)
 
             # A real press on each adjacent arrow's HEAD, the part a reader aims at: it jumps to the row
-            # above and lights it. Then two on 216's, whose head is drawn over 215's own arrow: they
-            # gather 215's replies, and not those of 210, which 215's arrow would have gathered.
+            # above and lights it. Then two on 216's, whose head is drawn over 215's own arrow: both are
+            # 216's arrow's, and they gather the conversation 216 is in under its head, 210, which 215
+            # answers.
             pressing = "tap" if mobile else "click"
             for kind, row_id, parent, whose, over in adjacent_heads(mobile):
                 x, y = head(kind, row_id, parent, over, f"before a {pressing} on its head, {whose}")
@@ -3516,19 +3530,25 @@ def coalesce_walk(chromium: BrowserType, args: argparse.Namespace, label: str, w
                            f"a {pressing} on {row_id}'s head did not jump to {parent}; the status line says"
                            f" {page.evaluate('() => document.getElementById(\"status\").textContent')!r}")
             x, y = head("side", "216", "215", True, f"before two {pressing}s on its head")
+            page.evaluate(ARROW_PRESS_LATCH_JS)
             press(x, y, twice=True)
             wait_until("() => document.querySelector('#discord-log > li[data-coalesce=\"parent\"]') !== null",
                        f"two {pressing}s on 216's head gathered nothing")
+            pressed_arrows = page.evaluate("() => window.__arrowPresses")
+            check(pressed_arrows == ["216", "216"], f"{label}: two {pressing}s on 216's head pressed the arrows of {pressed_arrows}")
             gathered_under = page.evaluate("() => document.querySelector('#discord-log > li[data-coalesce=\"parent\"]')"
                                            ".getAttribute('data-id')")
-            check(gathered_under == "215", f"{label}: two {pressing}s on 216's head gathered the replies of {gathered_under}")
+            check(gathered_under == "210", f"{label}: two {pressing}s on 216's head gathered under {gathered_under}")
+            under_210 = [*COALESCE_SCATTERED[:11], "211", "215", "216", *COALESCE_SCATTERED[12:15],
+                         *COALESCE_SCATTERED[17:]]
+            check(order() == under_210, f"{label}: two {pressing}s on 216's head gathered its conversation as {order()}")
             # Past the moment after two presses in which the X that has just appeared ignores a third.
             page.wait_for_timeout(400)
-            page.evaluate(CENTRE_ROW_JS, "216")
-            tap("216", "x", "the X beside 216's bridge")
+            page.evaluate(CENTRE_ROW_JS, "211")
+            tap("211", "x", "the X beside the bridge from 210")
             wait_until("() => document.querySelector('#discord-log > li[data-coalesce]') === null",
-                       "the X did not put 216 back")
-            check(order() == COALESCE_SCATTERED, f"{label}: 216 went back as {order()}")
+                       "the X did not put 210's conversation back")
+            check(order() == COALESCE_SCATTERED, f"{label}: 210's conversation went back as {order()}")
 
             # A real tap on the root's N replies: its replies gathered under it, the root unmoved.
             page.evaluate(CENTRE_ROW_JS, "206")
@@ -3546,9 +3566,6 @@ def coalesce_walk(chromium: BrowserType, args: argparse.Namespace, label: str, w
             check(order() == COALESCE_GATHERED, f"{label}: the replies were gathered as {order()}")
             shot("3-gathered")
             bridge("gathered")
-            # 208 answers 207, which is no longer directly above it.
-            check(next(row["style"] for row in rows() if row["id"] == "208") == "disconnected",
-                          f"{label}: 208 still draws the arrow to the row above")
 
             # Opening a folded reply in the stack, by a real tap on its text, and larger type: the
             # bridge stays attached through both.

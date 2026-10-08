@@ -88,11 +88,13 @@ with progress in the status line; one further back than that, or no longer in th
 is said so there. While the reply is off screen, **Back to reply** returns to it.
 
 **A message's replies can be gathered under it.** **N replies** under a message moves its loaded
-replies, in time order, to sit directly beneath it in **All**, joined to it by one line, while
-everything else stays where it was and the message stays where it was on the screen; tapping a
-reply's arrow twice does the same for the message it answers. Nothing is read or archived by it.
-The **×** beside the line, or the pressed **N replies**, puts them back in time order, as changing
-view or channel, or filtering from the search bar, does. **Thread(N)** opens a message's thread.
+replies, and the replies to those, all the way down, in time order, to sit directly beneath it in
+**All**, joined to it by one line, while everything else stays where it was and the message stays
+where it was on the screen. Tapping a reply's arrow twice does the same for the whole conversation
+the reply is in, under the first message of it that is loaded; one tap still goes to the message
+it answers. Nothing is read or archived by it. The **×** beside the line, or the pressed **N
+replies**, puts them back in time order, as changing view or channel, or filtering from the search
+bar, does. **Thread(N)** opens a message's thread.
 
 **A normal text box at the bottom.** Scroll below the newest message to write to the channel or
 selected thread. **Send** posts without requiring a message to reply to. Drafts are kept separately

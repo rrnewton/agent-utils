@@ -7617,11 +7617,12 @@ function threadOf(message) {
  * The thread record the page holds for a message: the store's copy's, the row's own, or — for a
  * thread root whose copy arrived without one — the summary of the thread it starts. The store
  * first: a row keeps the objects it was drawn from, and the store may have learnt more about them
- * since, a root's reply count above all.
+ * since, a root's reply count above all. `stored` is the store's copy, for a caller that has looked
+ * it up already (`replyLinks`, which asks after every message in the list).
  */
-function heldThreadRecord(message) {
+function heldThreadRecord(message, stored = heldMessage(String(message.id))) {
   const id = String(message.id);
-  for (const copy of [heldMessage(id), message]) {
+  for (const copy of [stored, message]) {
     if (threadOf(copy)) return copy.thread;
   }
   const summary = channelCanon.threads.find((held) => held.root && String(held.root.id) === id);
@@ -10555,7 +10556,7 @@ function jumpToMarker() {
 // reads it aloud (`tapRow`): the arrow's click stops at the arrow. A finger that comes down on the
 // arrow is not the start of a swipe or a press-and-hold on the row either (`swipeable`).
 //
-// TWO TAPS are another act: they gather the replies of the message the reply answers under it
+// TWO TAPS are another act: they gather the conversation the reply is in under its first message
 // (`#215 reply-coalesce`, below). So one tap waits `REPLY_DOUBLE_TAP_MS` before it jumps, long enough
 // to know a second is not coming. And since `#214 reply-arrow` the arrow is one of two, drawn by
 // whether the row above is the message it answers; see the section after this one.
@@ -10583,8 +10584,8 @@ let replyLanded = null;
 
 /**
  * How long a tap on a reply's arrow waits to learn whether a second tap follows, in milliseconds.
- * `#215 reply-coalesce`: two taps gather the replies of the message it answers under that message,
- * and one tap still jumps there.
+ * `#215 reply-coalesce`: two taps gather the conversation the reply is in under its first message,
+ * and one tap still jumps to the message it answers.
  *
  * WHY A DELAY AT ALL. The first tap of two cannot be told from a single tap until the second has
  * had its chance to arrive, and the owner asked that a double tap never first jump away — a jump
@@ -10616,11 +10617,11 @@ function dropReplyArrowTap() {
 /**
  * The control in a reply's gutter. `li` is the reply's own row.
  *
- * One tap jumps to the message the reply answers; two, within `REPLY_DOUBLE_TAP_MS`, gather that
- * message's replies under it (`#215 reply-coalesce`), and a third that soon after is ignored
- * (`replyTapsSettling`). Counted from the clicks themselves rather than from `dblclick`, which a
- * phone does not reliably send for two taps — and a keyboard's Enter, pressed twice, is two clicks
- * as well.
+ * One tap jumps to the message the reply answers; two, within `REPLY_DOUBLE_TAP_MS`, gather the
+ * conversation the reply is in under its first message (`#215 reply-coalesce`, `conversationHead`),
+ * and a third that soon after is ignored (`replyTapsSettling`). Counted from the clicks themselves
+ * rather than from `dblclick`, which a phone does not reliably send for two taps — and a keyboard's
+ * Enter, pressed twice, is two clicks as well.
  */
 function replyArrow(li) {
   const arrow = document.createElement("button");
@@ -10629,7 +10630,7 @@ function replyArrow(li) {
   arrow.setAttribute("aria-label", REPLY_JUMP_NAME);
   // The tooltip says what the second tap does, where a pointer can rest to read it. The accessible
   // name stays what one tap does.
-  arrow.setAttribute("title", `${REPLY_JUMP_NAME}. Double-tap to gather its replies under it.`);
+  arrow.setAttribute("title", `${REPLY_JUMP_NAME}. Double-tap to gather its whole conversation.`);
   // Which of the two arrows `#214 reply-arrow` draws, decided by `renderReplyLinks` once the row is
   // in the list: the row above is the one it answers, or it is not.
   arrow.setAttribute("data-reply-style", "disconnected");
@@ -10990,13 +10991,34 @@ function measureReplyArrows() {
 // reorder operation." The stacked replies lose their arrows for one BRIDGE in the arrow's colour —
 // a spine out of the parent's foot down the gutter, and a short line from it into each reply — and
 // an X beside the bridge puts them back in time order. Two taps on any reply's arrow gather the
-// replies of the message it answers. "I don't think we need to scroll": the parent stays where it
-// was on the screen, and for two taps on an arrow, the reply that was tapped does.
+// conversation it is in. "I don't think we need to scroll": the parent stays where it was on the
+// screen, and for two taps on an arrow, the reply that was tapped does.
 //
 // WHAT IS A REPLY, HERE. The providers carry two kinds, and both count: a message whose own reply
-// pointer names the parent — Discord's replies — and, where the parent heads a thread, every other
-// message of that thread, which is the only reply Slack and Google Chat have. A channel registered
-// as one thread is not a thread here, or every message in it would be a reply to its root.
+// pointer names another — Discord's replies, and Google Chat's quote-replies, which arrive as the
+// same pointer — and, where a message heads a thread, every other message of that thread, which is
+// the only reply Slack has. A channel registered as one thread is not a thread here, or every
+// message in it would be a reply to its root.
+//
+// AND THE REPLIES TO THOSE, ALL THE WAY DOWN. The owner, 2026-10-08: a pointer may name any message,
+// so "B answers A, C answers B" and "B and C both answer A" are different trees — and for gathering
+// they are the same. What is gathered under a parent is every message that answers it, every message
+// that answers one of those, and so on, by either kind of reply: drawn as ONE stack in time order
+// under the parent, joined by one bridge, not as the tree (`replyGroup`). The walk visits each
+// message once, so a cycle in the pointers — a provider's data, not something a person can send —
+// ends instead of looping, and the walk is never longer than the list. It walks everything the page
+// holds of the view, so a link through a message Hide read leaves out still joins the replies drawn
+// either side of it; only what is drawn moves.
+//
+// ONE TAP STILL MEANS THE REPLY'S OWN PARENT. One tap on an arrow jumps to the message the reply
+// actually answers, which in a chain is the reply before it, not the conversation's first message.
+// TWO TAPS gather the conversation the reply is in under its HEAD: walking up from what the reply
+// answers — its pointer first, then the root of its thread — to the topmost message of it the list
+// draws (`conversationHead`). Not under what it answers, because in a chain that message is in the middle
+// of the conversation: gathering under it would pull its own replies up under it and leave it, and
+// everything above it, where they were — a piece of the conversation stacked in the middle of the
+// list, and a different piece for each reply tapped. The head's group holds the whole conversation,
+// the tapped reply too, so two taps on any arrow in it draw the same stack.
 //
 // WHERE. All, which is the one view holding every message, and the one list of a provider without
 // threads. Asked from Main or a thread, the page opens All first, exactly as the arrow's jump does,
@@ -11040,22 +11062,117 @@ function gatheredParent() {
   return gathered.parent;
 }
 
-/** The ids, among `messages`, of the replies to message `parent`. See the head of this section. */
-function repliesTo(parent, messages) {
-  const id = String(parent);
-  const root = messages.find((message) => String(message.id) === id) || heldMessage(id);
-  const record = threadingSupported && root ? heldThreadRecord(root) : null;
-  const thread = record && record.is_root === true && String(record.id) !== String(channelCanon.scope)
-    ? String(record.id) : null;
-  const replies = new Set();
-  for (const message of messages) {
-    const own = String(message.id);
-    if (own === id) continue;
-    if (String(message.reply_to || "") === id || (thread !== null && threadOf(message) === thread)) {
-      replies.add(own);
+/** The store's copies of this channel's messages by id, for a pass that asks after many of them. */
+function heldMessagesById() {
+  const channel = String(el("discord-channel").value);
+  if (channelCanon.channel !== channel) loadCanon(channel);
+  return new Map(channelCanon.messages.map((held) => [String(held.id), held]));
+}
+
+/**
+ * The reply links among `messages`, both kinds (see the head of this section). `children` maps a
+ * message's id to the ids of the messages that answer it: by their pointer, whether or not the
+ * message it names is among `messages`, and as the rest of the thread it heads. `parents` maps a
+ * message's id to the ids, among `messages`, of what it answers: its pointer's first, then its
+ * thread's root. `heads` maps each thread a message among them heads to that message's id.
+ */
+function replyLinks(messages) {
+  const ids = new Set(messages.map((message) => String(message.id)));
+  const children = new Map();
+  const parents = new Map();
+  const heads = new Map();
+  const link = (child, parent) => {
+    if (!parent || child === parent) return;
+    if (!children.has(parent)) children.set(parent, []);
+    children.get(parent).push(child);
+    if (!ids.has(parent)) return;
+    if (!parents.has(child)) parents.set(child, []);
+    parents.get(child).push(parent);
+  };
+  if (threadingSupported) {
+    const held = heldMessagesById();
+    for (const message of messages) {
+      const record = heldThreadRecord(message, held.get(String(message.id)) || null);
+      if (record && record.is_root === true && String(record.id) !== String(channelCanon.scope)) {
+        heads.set(String(record.id), String(message.id));
+      }
     }
   }
-  return replies;
+  for (const message of messages) {
+    const own = String(message.id);
+    link(own, String(message.reply_to || ""));
+    const thread = threadingSupported ? threadOf(message) : null;
+    if (thread !== null && heads.has(thread)) link(own, heads.get(thread));
+  }
+  return { children, parents, heads };
+}
+
+/**
+ * What the reply links are walked over: `messages`, and, where the provider has threads, every other
+ * message the page holds of the view — the ones Hide read leaves out — so that a link through one of
+ * them still joins the messages drawn either side of it.
+ */
+function withHeldMessages(messages) {
+  if (!threadingSupported) return messages;
+  const ids = new Set(messages.map((message) => String(message.id)));
+  return [...messages, ...timelineMessages.filter((message) => !ids.has(String(message.id)))];
+}
+
+/**
+ * Message `parent`'s group, from `messages` and `withHeldMessages`: as `replies`, the ids of every
+ * message that answers it, every message that answers one of those, and so on, by either kind of
+ * reply (see the head of this section); as `threads`, each thread the parent or one of its replies
+ * heads, by its id, to the id of the message heading it.
+ *
+ * A breadth-first walk from the parent in which a message already found is not walked again and the
+ * parent is never its own reply: a cycle in the pointers ends where it comes back round, and the walk
+ * is one step per link, of which a message has at most two — its pointer and its thread.
+ */
+function replyGroup(parent, messages) {
+  const id = String(parent);
+  const walked = withHeldMessages(messages);
+  const root = walked.some((message) => String(message.id) === id) ? null : heldMessage(id);
+  const { children, heads } = replyLinks(root ? [...walked, root] : walked);
+  const replies = new Set();
+  const queue = [id];
+  for (let i = 0; i < queue.length; i += 1) {
+    for (const child of children.get(queue[i]) || []) {
+      if (child === id || replies.has(child)) continue;
+      replies.add(child);
+      queue.push(child);
+    }
+  }
+  return { replies, threads: new Map([...heads].filter(([, head]) => head === id || replies.has(head))) };
+}
+
+/** The ids, among `messages`, of message `parent`'s replies, to any depth: see `replyGroup`. */
+function repliesTo(parent, messages) {
+  const among = new Set(messages.map((message) => String(message.id)));
+  return new Set([...replyGroup(parent, messages).replies].filter((one) => among.has(one)));
+}
+
+/**
+ * The head of the conversation that message `target` is in, for two taps on the arrow of `from`, a
+ * reply to it: the topmost message of it that the list draws, walking up from `target` by what each
+ * message answers, its pointer first and then its thread's root (see the head of this section). Null
+ * when neither `target` nor anything above it is drawn.
+ *
+ * Walked over what the page holds of the view, so a message Hide read leaves out is passed through,
+ * though it cannot be the head, since it is not drawn. No message is walked twice and `from` never
+ * is, so a cycle in the pointers ends where it would come back round, at most a step per message.
+ */
+function conversationHead(target, from) {
+  const drawn = [...el("discord-log").children].flatMap(rowMessages);
+  const shown = new Set(drawn.map((message) => String(message.id)));
+  const { parents } = replyLinks(withHeldMessages(drawn));
+  const seen = new Set(String(from) === String(target) ? [] : [String(from)]);
+  let head = null;
+  for (let at = String(target); at !== undefined && !seen.has(at);
+    at = (parents.get(at) || []).find((one) => !seen.has(one))) {
+    seen.add(at);
+    if (shown.has(at)) head = at;
+  }
+  return head;
 }
 
 /**
@@ -11126,12 +11243,15 @@ function arrangeChannelRows() {
 }
 
 /**
- * Two taps on a reply's arrow: gather the replies of the message it answers, and keep the reply
- * that was tapped where it is on the screen.
+ * Two taps on a reply's arrow: gather the conversation it is in under its head, the topmost message
+ * of it the list draws (`conversationHead`), and keep the reply that was tapped where it is on the
+ * screen. The message it answers is looked for first, as the jump looks for it, because the walk up
+ * starts there.
  */
 function gatherFromReply(reply) {
   const target = String(reply.getAttribute("data-reply-to") || "");
-  if (target) return gatherReplies(target, reply);
+  const from = String(reply.getAttribute("data-id") || "");
+  if (target) return gatherReplies(target, reply, (id) => conversationHead(id, from));
 }
 
 /**
@@ -11148,11 +11268,14 @@ function toggleGathered(parent, row) {
 }
 
 /**
- * Gather `parent`'s replies under it. `from` is the row the reader's eye is on — the parent's own
- * for its chip, the reply's for two taps on its arrow — and that row is where it was on the screen
- * afterwards: measured now, before anything moves, and put back once the rows have.
+ * Find message `parent` and gather a group under the message `headOf` names for it once it is in the
+ * list: by default the parent itself, while its row is drawn; for two taps on an arrow, the head of
+ * its conversation. Null from `headOf` is "not found yet", and the walk goes on looking. `from` is the
+ * row the reader's eye is on — the parent's own for its chip, the reply's for two taps on its arrow —
+ * and that row is where it was on the screen afterwards: measured now, before anything moves, and put
+ * back once the rows have.
  */
-async function gatherReplies(parent, from) {
+async function gatherReplies(parent, from, headOf = (id) => (rowHolding(id) ? id : null)) {
   const anchor = String(from.getAttribute("data-id") || parent);
   const anchorTop = from.getBoundingClientRect().top;
   // A filter that takes rows away would hide replies from the stack the reader just asked for, and
@@ -11160,8 +11283,9 @@ async function gatherReplies(parent, from) {
   // that hides the message it is for.
   if (searchOpen) setSearchOpen(false);
   await seekMessage(parent, () => {
-    if (!gatheringView() || !rowHolding(parent)) return false;
-    gatherNow(parent, anchor, anchorTop);
+    const head = gatheringView() ? headOf(parent) : null;
+    if (head === null) return false;
+    gatherNow(head, anchor, anchorTop);
     return true;
   }, () => threadingSupported && channelView !== "flat");
 }
@@ -11186,23 +11310,26 @@ function gatherNow(parent, anchor, anchorTop) {
 const countOf = (n) => `${n} ${n === 1 ? "reply" : "replies"}`;
 
 /**
- * How many of `parent`'s replies are drawn to be gathered, how many Hide read leaves out, and how
- * many more the thread's own exact count says it holds than either: see the head of this section.
+ * How many of `parent`'s replies, to any depth, are drawn to be gathered, how many Hide read leaves
+ * out, and how many more the threads in the group — the parent's, and any a reply heads — hold by
+ * their own exact counts than are loaded: see the head of this section.
  */
 function gatherReport(parent) {
-  const drawn = repliesTo(parent, [...el("discord-log").children].flatMap(rowMessages));
-  const all = threadingSupported ? repliesTo(parent, timelineMessages) : drawn;
-  const hidden = todoMode ? [...all].filter((id) => !drawn.has(id)).length : 0;
-  const root = heldMessage(parent);
-  const record = threadingSupported && root ? heldThreadRecord(root) : null;
+  const drawn = [...el("discord-log").children].flatMap(rowMessages);
+  const shown = new Set(drawn.map((message) => String(message.id)));
+  const group = replyGroup(parent, drawn);
+  const gathered = [...group.replies].filter((id) => shown.has(id)).length;
+  // Every reply not drawn is one the page holds of the view, and in All only Hide read leaves one out.
+  const hidden = todoMode ? group.replies.size - gathered : 0;
   let missing = 0;
-  if (record && record.is_root === true) {
-    const said = threadReplies(record.id, root);
-    const loaded = timelineMessages.filter((message) => threadOf(message) === String(record.id) &&
-      String(message.id) !== String(parent)).length;
-    if (said.exact === true && typeof said.count === "number") missing = Math.max(0, said.count - loaded);
+  for (const [thread, head] of group.threads) {
+    const said = threadReplies(thread, heldMessage(head) ||
+      drawn.find((message) => String(message.id) === head) || null);
+    const loaded = timelineMessages.filter((message) => threadOf(message) === thread &&
+      String(message.id) !== head).length;
+    if (said.exact === true && typeof said.count === "number") missing += Math.max(0, said.count - loaded);
   }
-  return { gathered: drawn.size, hidden, missing };
+  return { gathered, hidden, missing };
 }
 
 /** Scroll so that the row holding message `id` has its top at `top` on the screen again. */

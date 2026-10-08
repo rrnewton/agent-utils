@@ -8013,7 +8013,7 @@ test("A MESSAGE THAT IS ITSELF A REPLY SAYS SO, with an arrow in the gutter to i
   // The tooltip adds what a second tap does (`#215 reply-coalesce`), where a pointer resting on it
   // can find out; the name stays what one tap does.
   assert.equal(arrow.getAttribute("title"),
-    "Jump to the message this answers. Double-tap to gather its replies under it.");
+    "Jump to the message this answers. Double-tap to gather its whole conversation.");
   // DRAWN, by the stylesheet: a typed glyph looks like whatever the phone's font makes of it.
   assert.equal(arrow.text(), "", "the arrow is a typed glyph again");
 
@@ -8662,7 +8662,8 @@ test("both arrows are drawn as the issue asks, in the stylesheet", () => {
  * `#215 reply-coalesce`. A thread whose replies are scattered among other messages: 601 heads it;
  * 602 answers it by its reply pointer from directly below, and 603 answers 602; 604 and 606 are the
  * thread's replies; 607 answers 601 by pointer from far below; 600, 605 and 608 are long and answer
- * nothing. Gathering 601 moves 602, 604, 606 and 607 under it, in that order.
+ * nothing. Gathering 601 moves 602, 603 — a reply to a reply, so in 601's conversation too — 604, 606
+ * and 607 under it, in that order.
  */
 function scatteredThread(count = 2) {
   const thread = { id: "spaces/A/threads/build", root_message_id: "601", is_root: true, reply_count: count,
@@ -8689,7 +8690,7 @@ function scatteredThread(count = 2) {
 }
 
 const SCATTERED = ["597", "598", "599", "600", "601", "602", "603", "604", "605", "606", "607", "608", "609"];
-const GATHERED = ["597", "598", "599", "600", "601", "602", "604", "606", "607", "603", "605", "608", "609"];
+const GATHERED = ["597", "598", "599", "600", "601", "602", "603", "604", "606", "607", "605", "608", "609"];
 
 async function scatteredPage(count = 2) {
   const page = newPage();
@@ -8771,13 +8772,14 @@ test("N REPLIES NO LONGER OPENS THE THREAD: it gathers the replies under the mes
   assert.equal(page.el("thread-heading").hidden, true, "N replies opened the thread view");
   assert.equal(page.el("thread-select").value, "flat");
   assert.equal(threadReads(), reads, "N replies read the thread");
-  // EVERY reply to it, by pointer or by thread, under it in time order; nothing lost; nothing else moved.
+  // EVERY reply to it, by pointer or by thread, and the reply to a reply, under it in time order;
+  // nothing lost; nothing else moved.
   assert.deepStrictEqual(shownIds(page), GATHERED);
   assert.deepStrictEqual([...shownIds(page)].sort(), [...SCATTERED].sort(), "gathering lost or added a message");
-  assert.deepStrictEqual(stackPlaces(page),
-    [["601", "parent"], ["602", "first"], ["604", "middle"], ["606", "middle"], ["607", "last"]]);
+  assert.deepStrictEqual(stackPlaces(page), [["601", "parent"], ["602", "first"], ["603", "middle"],
+    ["604", "middle"], ["606", "middle"], ["607", "last"]]);
   assert.equal(gatherChip(page, "601").getAttribute("aria-pressed"), "true", "the chip does not say it gathered them");
-  assert.equal(statusText(page), "Gathered 4 replies under it.");
+  assert.equal(statusText(page), "Gathered 5 replies under it.");
   assert.deepEqual(page.dismissCalls, [], "gathering marked something read");
 });
 
@@ -8785,7 +8787,7 @@ test("THE BRIDGE: each gathered reply has its part of it, the first the X, and n
   const page = await scatteredPage();
   await gatherChip(page, "601").click();
   await page.settle();
-  for (const id of ["602", "604", "606", "607"]) {
+  for (const id of ["602", "603", "604", "606", "607"]) {
     const li = rowWithId(page, id);
     assert.ok(gutterChild(li, "reply-bridge"), `${id} has no part of the bridge`);
     assert.equal(gutterChild(li, "reply-bridge").getAttribute("aria-hidden"), "true");
@@ -8797,13 +8799,12 @@ test("THE BRIDGE: each gathered reply has its part of it, the first the X, and n
   assert.equal(x.tagName, "button");
   assert.equal(x.getAttribute("aria-label"), "Show replies in time order");
   assert.equal(x.text(), "", "the X is a typed glyph");
-  assert.ok(["604", "606", "607"].every((id) => !gutterChild(rowWithId(page, id), "reply-ungather")), "more than one X");
-  assert.ok(["601", "603", "605"].every((id) => !gutterChild(rowWithId(page, id), "reply-bridge")),
+  assert.ok(["603", "604", "606", "607"].every((id) => !gutterChild(rowWithId(page, id), "reply-ungather")),
+    "more than one X");
+  assert.ok(["601", "605"].every((id) => !gutterChild(rowWithId(page, id), "reply-bridge")),
     "a row outside the stack has a part of the bridge");
-  // A gathered reply's arrow is not drawn — the bridge stands in for it — and 603, whose message is
-  // no longer directly above it, draws the other arrow.
+  // A gathered reply's arrow is not drawn — the bridge stands in for it.
   assert.match(cssBlock("#discord-log li.discord-message[data-stack-under] > .reply-jump"), /display:\s*none/);
-  assert.equal(arrowStyle(rowWithId(page, "603")), "disconnected", "603 still says it answers the row above");
   // The stylesheet's half: the X a touch target square, the spine reaching the row above, the last
   // part ending in its own line, and an inset per shape of parent, on a desk as well.
   const square = cssBlock("#discord-log .reply-ungather");
@@ -8926,7 +8927,7 @@ test("GATHERED REPLIES OUTLIVE A REFRESH and a live reply joins them; a change o
   page.messages = [...page.messages, late];
   page.stream().push(sseMessage(late));
   for (let i = 0; i < 4; i += 1) await page.settle();
-  assert.deepStrictEqual(shownIds(page), [...GATHERED.slice(0, 9), "610", ...GATHERED.slice(9)],
+  assert.deepStrictEqual(shownIds(page), [...GATHERED.slice(0, 10), "610", ...GATHERED.slice(10)],
     "a live reply to the parent did not join the stack");
   // Main and back: the replies are back in time order, in Main and in All.
   await pickThread(page, "main");
@@ -8956,14 +8957,14 @@ test("A FILTER THAT TAKES ROWS AWAY puts the replies back; Hide read leaves the 
   page.expireTimers(DISCORD_POLL_MS);
   for (let i = 0; i < 4; i += 1) await page.settle();
   assert.deepStrictEqual(shownIds(page), GATHERED.filter((id) => id !== "604"), "Hide read did not compose with the stack");
-  assert.deepStrictEqual(stackPlaces(page).map(([id]) => id), ["601", "602", "606", "607"]);
+  assert.deepStrictEqual(stackPlaces(page).map(([id]) => id), ["601", "602", "603", "606", "607"]);
 });
 
 test("WHAT IS NOT GATHERED IS SAID: a thread's count above what is loaded, and Hide read", async () => {
   const page = await scatteredPage(3);
   await gatherChip(page, "601").click();
   await page.settle();
-  assert.equal(statusText(page), "Gathered 4 replies; 1 not loaded.");
+  assert.equal(statusText(page), "Gathered 5 replies; 1 not loaded.");
   const hidden = await scatteredPage();
   hidden.dealtWith.add("604");
   await hidden.el("todo-filter").click();
@@ -8972,18 +8973,171 @@ test("WHAT IS NOT GATHERED IS SAID: a thread's count above what is loaded, and H
   assert.ok(!shownIds(hidden).includes("604"), "Hide read is not hiding the read reply");
   await gatherChip(hidden, "601").click();
   await hidden.settle();
-  assert.equal(statusText(hidden), "Gathered 3; Hide read hides 1 more.");
+  assert.equal(statusText(hidden), "Gathered 4; Hide read hides 1 more.");
 });
 
-test("TWO STACKS NEVER: gathering another message's replies puts the first's back", async () => {
+test("TWO STACKS NEVER: gathering another conversation puts the first's back", async () => {
   const page = await scatteredPage();
   await gatherChip(page, "601").click();
   await page.settle();
-  // 603 answers 602, which is in the stack: its double tap gathers 602's replies instead.
-  await doubleTapArrow(page, rowWithId(page, "603"));
-  assert.deepStrictEqual(shownIds(page), SCATTERED, "601's replies were left gathered as well");
-  assert.deepStrictEqual(stackPlaces(page), [["602", "parent"], ["603", "only"]]);
+  assert.deepStrictEqual(shownIds(page), GATHERED);
+  // 611 answers 600, a message of another conversation: its double tap gathers that one instead.
+  const late = message({ id: "611", content: "about the step before", reply_to: "600" });
+  page.messages = [...page.messages, late];
+  page.stream().push(sseMessage(late));
+  for (let i = 0; i < 4; i += 1) await page.settle();
+  assert.deepStrictEqual(shownIds(page), [...GATHERED, "611"], "the live message is not where this test assumes");
+  await doubleTapArrow(page, rowWithId(page, "611"));
+  assert.deepStrictEqual(shownIds(page), [...SCATTERED.slice(0, 4), "611", ...SCATTERED.slice(4)],
+    "601's replies were left gathered as well");
+  assert.deepStrictEqual(stackPlaces(page), [["600", "parent"], ["611", "only"]]);
   assert.equal(gatherChip(page, "601").getAttribute("aria-pressed"), "false");
+});
+
+/**
+ * The owner's two trees, 2026-10-08: A <- B <- C, where C answers B, and A <- B, A <- C, where both
+ * answer A. 1 is A; 3 is B; 5 is C; 2, 4 and 6 are other messages between and after them.
+ */
+function twoTrees(chain) {
+  return [
+    message({ id: "1000000000000000001", content: "is the runner wedged?" }),
+    message({ id: "1000000000000000002", content: "the weather is nice" }),
+    message({ id: "1000000000000000003", content: "restarted it", reply_to: "1000000000000000001", ...ALICE }),
+    message({ id: "1000000000000000004", content: "lunch?" }),
+    message({ id: "1000000000000000005", content: "the queue drains too",
+      reply_to: chain ? "1000000000000000003" : "1000000000000000001", ...OWNER }),
+    message({ id: "1000000000000000006", content: "back at two" }),
+  ];
+}
+
+const TREE_GATHERED = ["1000000000000000001", "1000000000000000003", "1000000000000000005",
+  "1000000000000000002", "1000000000000000004", "1000000000000000006"];
+
+test("REPLIES TO REPLIES: A <- B <- C and A <- B, A <- C both stack B and C under A, in time order", async () => {
+  for (const chain of [true, false]) {
+    const tree = chain ? "A <- B <- C" : "A <- B, A <- C";
+    const page = newPage();
+    await signIn(page);
+    await showDiscord(page, twoTrees(chain));
+    // Two taps on C's arrow: in the chain C answers B, and the stack is still the whole of A's.
+    const top = parkRow(page, "1000000000000000005", 200);
+    await doubleTapArrow(page, rowWithId(page, "1000000000000000005"));
+    assert.deepStrictEqual(shownIds(page), TREE_GATHERED, `${tree}: B and C are not under A in time order`);
+    assert.deepStrictEqual(stackPlaces(page), [["1000000000000000001", "parent"], ["1000000000000000003", "first"],
+      ["1000000000000000005", "last"]], `${tree}: the stack is not one bridge from A to B and C`);
+    assert.equal(rowWithId(page, "1000000000000000005").getBoundingClientRect().top, top,
+      `${tree}: the tapped reply did not stay where it was`);
+    assert.equal(statusText(page), "Gathered 2 replies under it.");
+    // B's arrow, two taps, and A's N replies would say the same: one stack for the conversation.
+    await gutterChild(rowWithId(page, "1000000000000000003"), "reply-ungather").dispatch("click", { stopPropagation() {} });
+    await doubleTapArrow(page, rowWithId(page, "1000000000000000003"));
+    assert.deepStrictEqual(shownIds(page), TREE_GATHERED, `${tree}: B's arrow gathered something else`);
+  }
+});
+
+test("...and ONE tap on C's arrow still jumps to its ACTUAL parent: B in the chain, A in the other tree", async () => {
+  for (const chain of [true, false]) {
+    const page = newPage();
+    await signIn(page);
+    await showDiscord(page, twoTrees(chain));
+    await tapArrow(page, rowWithId(page, "1000000000000000005"));
+    const landed = page.el("discord-log").children.filter((li) => li.getAttribute("data-landed") === "true")
+      .map((li) => li.getAttribute("data-id"));
+    assert.deepStrictEqual(landed, [chain ? "1000000000000000003" : "1000000000000000001"],
+      `${chain ? "A <- B <- C" : "A <- B, A <- C"}: one tap on C's arrow went to the head of the conversation`);
+    assert.deepStrictEqual(stackPlaces(page), [], "one tap gathered");
+  }
+});
+
+test("TWO TAPS ON A REPLY TO A REPLY gather its conversation's head, the topmost message the list holds", async () => {
+  // 603 answers 602, which answers 601: two taps on 603's arrow stack 601's whole conversation, not
+  // 602's piece of it, and 603 stays where it was.
+  const page = await scatteredPage();
+  const top = parkRow(page, "603", 200);
+  await doubleTapArrow(page, rowWithId(page, "603"));
+  assert.deepStrictEqual(shownIds(page), GATHERED, "two taps on a reply to a reply gathered a piece of the conversation");
+  assert.equal(stackPlaces(page)[0][0], "601");
+  assert.equal(gatherChip(page, "601").getAttribute("aria-pressed"), "true",
+    "the stack two taps drew is not the one 601's N replies says it holds");
+  assert.equal(rowWithId(page, "603").getBoundingClientRect().top, top, "the tapped reply did not stay where it was");
+});
+
+test("A CYCLE IN THE POINTERS ends: no loop, and a stack under the message the tapped arrow names", async () => {
+  // 1 and 3 answer each other, 5 answers 3, and 6 answers itself: no person can send these, and a
+  // provider's data could still say them.
+  const page = newPage();
+  await signIn(page);
+  await showDiscord(page, [
+    message({ id: "1000000000000000001", content: "is the runner wedged?", reply_to: "1000000000000000003" }),
+    message({ id: "1000000000000000002", content: "the weather is nice" }),
+    message({ id: "1000000000000000003", content: "restarted it", reply_to: "1000000000000000001", ...ALICE }),
+    message({ id: "1000000000000000004", content: "lunch?" }),
+    message({ id: "1000000000000000005", content: "the queue drains", reply_to: "1000000000000000003", ...OWNER }),
+    message({ id: "1000000000000000006", content: "a note to myself", reply_to: "1000000000000000006" }),
+  ]);
+  // 5's arrow: up from 3 to 1, and 1's pointer comes back round to 3. 1 is the head, and its group is
+  // 3 and 5, each once.
+  await doubleTapArrow(page, rowWithId(page, "1000000000000000005"));
+  assert.deepStrictEqual(shownIds(page), ["1000000000000000001", "1000000000000000003", "1000000000000000005",
+    "1000000000000000002", "1000000000000000004", "1000000000000000006"]);
+  assert.deepStrictEqual(stackPlaces(page).map(([id]) => id),
+    ["1000000000000000001", "1000000000000000003", "1000000000000000005"]);
+  // 3's arrow names 1, and the walk up does not come back round through 3 itself: the same stack.
+  await doubleTapArrow(page, rowWithId(page, "1000000000000000003"));
+  assert.deepStrictEqual(stackPlaces(page).map(([id]) => id),
+    ["1000000000000000001", "1000000000000000003", "1000000000000000005"]);
+  // A message that answers itself has no replies to gather, and says so.
+  await doubleTapArrow(page, rowWithId(page, "1000000000000000006"));
+  assert.equal(statusText(page), "No replies to it are loaded.");
+});
+
+test("A MISSING PARENT ends the walk up: the head is the topmost message loaded", async () => {
+  // 1 answers a message never loaded; 3 answers 1, and 5 answers 3; 6 answers another message never
+  // loaded, so it is in no conversation here.
+  const page = newPage();
+  await signIn(page);
+  await showDiscord(page, [
+    message({ id: "1000000000000000001", content: "is the runner wedged?", reply_to: "999" }),
+    message({ id: "1000000000000000002", content: "the weather is nice" }),
+    message({ id: "1000000000000000003", content: "restarted it", reply_to: "1000000000000000001", ...ALICE }),
+    message({ id: "1000000000000000004", content: "lunch?" }),
+    message({ id: "1000000000000000005", content: "the queue drains", reply_to: "1000000000000000003", ...OWNER }),
+    message({ id: "1000000000000000006", content: "same here", reply_to: "998" }),
+  ]);
+  // Up from 3 to 1, whose own message is not loaded: 1 is the head.
+  await doubleTapArrow(page, rowWithId(page, "1000000000000000005"));
+  assert.deepStrictEqual(stackPlaces(page), [["1000000000000000001", "parent"], ["1000000000000000003", "first"],
+    ["1000000000000000005", "last"]]);
+  assert.deepStrictEqual(shownIds(page), ["1000000000000000001", "1000000000000000003", "1000000000000000005",
+    "1000000000000000002", "1000000000000000004", "1000000000000000006"]);
+  // Two taps on an arrow whose message is not loaded at all look for it, as one tap does, and say so.
+  await doubleTapArrow(page, rowWithId(page, "1000000000000000006"));
+  assert.equal(statusText(page), "Older than what is loaded.");
+  assert.equal(stackPlaces(page)[0][0], "1000000000000000001", "a message not found put the stack away");
+});
+
+test("...and a link through a message Hide read leaves out still joins what is drawn either side of it", async () => {
+  // 302 is read, so Hide read does not draw it; 304 answers it, and it answers 301. Two taps on 304's
+  // arrow pass through 302 to 301, and 304 is gathered under it, with 302 said as hidden.
+  const page = newPage();
+  page.threadingSupported = true;
+  page.dealtWith.add("302");
+  await signIn(page);
+  await showDiscord(page, [
+    message({ id: "300", content: "the weather is nice" }),
+    message({ id: "301", content: "is the runner wedged?" }),
+    message({ id: "302", content: "restarted it", reply_to: "301", ...ALICE }),
+    message({ id: "303", content: "lunch?" }),
+    message({ id: "304", content: "the queue drains", reply_to: "302", ...OWNER }),
+  ]);
+  await page.el("todo-filter").click();
+  await page.settle();
+  assert.deepStrictEqual(shownIds(page), ["300", "301", "303", "304"], "Hide read is drawing the read reply");
+  await doubleTapArrow(page, rowWithId(page, "304"));
+  assert.deepStrictEqual(shownIds(page), ["300", "301", "304", "303"]);
+  assert.deepStrictEqual(stackPlaces(page), [["301", "parent"], ["304", "only"]],
+    "the conversation stopped at the message Hide read leaves out");
+  assert.equal(statusText(page), "Gathered 1; Hide read hides 1 more.");
 });
 
 test("COMBINING inside a stack: two quick replies from one author are one gathered row", async () => {
