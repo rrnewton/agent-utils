@@ -49,6 +49,8 @@ pub mod bearer_layer;
 use axum::extract::DefaultBodyLimit;
 use axum::routing::{delete, get, post};
 use axum::Router;
+use tower_http::compression::predicate::{DefaultPredicate, NotForContentType, Predicate};
+use tower_http::compression::CompressionLayer;
 
 use crate::state::AppState;
 
@@ -71,6 +73,16 @@ pub fn router(state: AppState) -> Router {
             state,
             access_layer::log_requests,
         ))
+        // Outermost, so the access log and the bearer check see the request as sent and the body
+        // is compressed last. Brotli or gzip, whichever the client offers first by preference. The
+        // default predicate already leaves alone what compression only hurts — bodies under 32
+        // bytes, images, and `text/event-stream`, which must reach the page one event at a time —
+        // and audio is added to it: the read-aloud stream is already compressed and is played as
+        // it arrives, so an encoder buffering it would only delay the first sound.
+        .layer(
+            CompressionLayer::new()
+                .compress_when(DefaultPredicate::new().and(NotForContentType::const_new("audio/"))),
+        )
 }
 
 /// Every route. `tests/scope_first.rs` reads the routes from this function's source.

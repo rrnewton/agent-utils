@@ -4259,3 +4259,61 @@ async fn the_activity_route_catches_up_on_every_channel_at_once() {
         "{lead}"
     );
 }
+
+/// What a response came back encoded as, for a client that offers `accept`.
+async fn encoding_of(
+    harness: &Harness,
+    uri: &str,
+    accept: &str,
+    token: Option<&str>,
+) -> Option<String> {
+    let mut builder = Request::builder()
+        .method("GET")
+        .uri(uri)
+        .header("accept-encoding", accept);
+    if let Some(token) = token {
+        builder = builder.header("authorization", format!("Bearer {token}"));
+    }
+    let response = harness
+        .router
+        .clone()
+        .oneshot(builder.body(Body::empty()).expect("request"))
+        .await
+        .expect("router answers");
+    assert_eq!(response.status(), StatusCode::OK, "{uri}");
+    response
+        .headers()
+        .get("content-encoding")
+        .map(|value| value.to_str().expect("ascii").to_owned())
+}
+
+#[tokio::test]
+async fn the_page_and_its_json_go_out_compressed_and_a_live_stream_does_not() {
+    // Everything used to leave uncompressed: the page script alone was 836 KB on every cold load,
+    // over a phone link. The live stream is the exception that must stay: an encoder buffers, and
+    // an event stream has to reach the page one event at a time.
+    let harness = harness();
+    assert_eq!(
+        encoding_of(&harness, "/voice.js", "br, gzip", None)
+            .await
+            .as_deref(),
+        Some("br")
+    );
+    assert_eq!(
+        encoding_of(&harness, "/voice", "gzip", None)
+            .await
+            .as_deref(),
+        Some("gzip")
+    );
+    assert_eq!(
+        encoding_of(&harness, "/api/v1/channels", "gzip", Some(READ_TOKEN))
+            .await
+            .as_deref(),
+        Some("gzip"),
+        "a JSON answer went out uncompressed"
+    );
+    assert_eq!(
+        encoding_of(&harness, "/voice.js", "identity", None).await,
+        None
+    );
+}
