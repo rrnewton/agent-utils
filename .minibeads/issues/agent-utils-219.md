@@ -1,10 +1,11 @@
 ---
 title: 'emoji-reactions: show reactions, especially delivery acknowledgements, in vibe-talk'
-status: open
+status: closed
 priority: 2
 issue_type: feature
 created_at: 2026-10-08T15:33:51.308397951+00:00
-updated_at: 2026-10-08T15:33:51.308397951+00:00
+updated_at: 2026-10-08T22:45:59.451138170+00:00
+closed_at: 2026-10-08T22:45:59.451138060+00:00
 ---
 
 # Description
