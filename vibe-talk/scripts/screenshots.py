@@ -2355,6 +2355,16 @@ DESK_DOCK_HEIGHT = (
     "the dock is at most two rows of them, not the 149px of thumb-sized tiles it was",
     "document.getElementById('dock').getBoundingClientRect().height <= 100",
 )
+# The switch's one place on a desk: the column's lower right corner, at the end of the dock's last row,
+# whatever the view and whether there is a call. It moved with the row, and the second click of a
+# flick between the views met an empty dock.
+DESK_SWITCH_CORNER = (
+    "the Voice/Channel switch is in the column's lower right corner, at the end of the dock's last row",
+    "(() => { const d = document.getElementById('dock'), s = getComputedStyle(d), r = d.getBoundingClientRect(); "
+    "const w = document.getElementById('view-switch').getBoundingClientRect(); "
+    "return Math.abs(w.right - (r.right - parseFloat(s.paddingRight))) <= 0.5 "
+    "&& Math.abs(w.bottom - (r.bottom - parseFloat(s.paddingBottom))) <= 0.5; })()",
+)
 
 
 def _act_desktop_dock_call(driver: Driver) -> None:
@@ -3238,12 +3248,20 @@ SCENES: tuple[Scene, ...] = (
             # THE packing claim, and the only place it can be answered: on a 375px phone five
             # controls have to fit a strip that also carries a switch with a 3.6rem word in it.
             # Nothing may hang past the bar's own right edge, because that is where the switch is.
+            # (`#218 desktop-dock`: on a desk the switch is not in the bar's box but in the column's
+            # lower right corner, so there it is held to the column's edge, and the pack, which
+            # scrolls, to hiding nothing past its own.)
             (
-                "no member is clipped past the right-hand edge of the bar",
+                "no member is clipped past the right-hand edge of the bar (on a desk, of the column)",
                 "(() => { const b = document.getElementById('control-bar').getBoundingClientRect(); "
                 "const s = document.getElementById('view-switch').getBoundingClientRect(); "
                 "const g = document.getElementById('open-settings').getBoundingClientRect(); "
-                "return s.right <= b.right + 1 && g.left >= b.left - 1 && s.width > 40; })()",
+                "const d = document.getElementById('dock'), r = d.getBoundingClientRect(); "
+                "const pack = document.getElementById('bar-pack'); "
+                "const desk = matchMedia('(min-width: 900px) and (pointer: fine)').matches; "
+                "const edge = desk ? r.right - parseFloat(getComputedStyle(d).paddingRight) : b.right; "
+                "return s.right <= edge + 1 && g.left >= b.left - 1 && s.width > 40 "
+                "&& (!desk || pack.scrollWidth <= pack.clientWidth + 1); })()",
             ),
             (
                 "...and it is still one strip, not two rows, clear of the big buttons",
@@ -3711,6 +3729,7 @@ SCENES: tuple[Scene, ...] = (
             ),
             DESK_DOCK_HEIGHT,
             DESK_CONTROL_SIZES,
+            DESK_SWITCH_CORNER,
             (
                 "Hide read, Pace and Read, left to right as on the phone, and no Sound among them",
                 pane_reads_js("todo-filter,read-speed,read-aloud"),
@@ -3743,6 +3762,7 @@ SCENES: tuple[Scene, ...] = (
             ("the call is live", "window.__text('talk-label') === 'Listening'"),
             DESK_DOCK_HEIGHT,
             DESK_CONTROL_SIZES,
+            DESK_SWITCH_CORNER,
             (
                 "Sound, Clear, Hang up and Listening, left to right, with Type and Prompts on the bar",
                 pane_reads_js("speaker,clear-view,hang-up,talk")
@@ -4387,10 +4407,12 @@ def check_state_controls() -> list[str]:
         # `#218 desktop-dock`. Pinned to the two halves of the owner's complaint, each separately
         # deletable: the SIZE of the dock and its controls (`height <= 100`, `r.height <= 40.5`),
         # and the picker as wide as its name (`field-sizing`) — plus, for each view, the pane in
-        # the order the phone shows it, which a desk row laid out in markup order could lose.
+        # the order the phone shows it, which a desk row laid out in markup order could lose, and the
+        # switch in its one corner (`paddingBottom`), which a row that carried it along could lose.
         "39-desktop-dock-channel": ("height <= 100", "r.height <= 40.5", "field-sizing",
-                                    "todo-filter,read-speed,read-aloud"),
-        "40-desktop-dock-call": ("height <= 100", "r.height <= 40.5", "speaker,clear-view,hang-up,talk"),
+                                    "todo-filter,read-speed,read-aloud", "paddingBottom"),
+        "40-desktop-dock-call": ("height <= 100", "r.height <= 40.5", "speaker,clear-view,hang-up,talk",
+                                 "paddingBottom"),
     }
     for name, needles in required.items():
         required_scene = next((s for s in SCENES if s.name == name), None)

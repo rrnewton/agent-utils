@@ -1531,6 +1531,50 @@ DESK_CONTROL_PX = (32, 40)
 PHONE_DOCK_PX = 1 + 2.85 * 16 + 6.4 * 16
 PHONE_SPAN_PX = 5.2 * 16
 PHONE_NARROW_PX = 3.5 * 16
+# How far from the end of the list a reader may be and still be followed: web/voice.js's own number.
+_BOTTOM_SLACK = re.search(r"const BOTTOM_SLACK_PX = (\d+);", (WEB_ROOT / "voice.js").read_text())
+if _BOTTOM_SLACK is None:
+    raise SystemExit("web/voice.js no longer declares BOTTOM_SLACK_PX, which the dock walk follows from")
+BOTTOM_SLACK_PX = int(_BOTTOM_SLACK[1])
+
+# Rows enough to make the call's transcript scroll, then the reader parked on its newest line. The
+# rows are the transcript's own kind of element; what is measured is the list around them.
+DOCK_TRANSCRIPT_JS = """async () => {
+    const list = document.getElementById('transcript');
+    for (let i = 0; i < 40; i += 1) {
+        const row = document.createElement('li');
+        row.textContent = `turn ${i}, long enough to take a line of the column and make the list scroll`;
+        list.append(row);
+    }
+    const area = document.getElementById('scroll-area');
+    area.scrollTop = area.scrollHeight;
+    await new Promise((settled) => requestAnimationFrame(() => requestAnimationFrame(settled)));
+    return area.scrollHeight > area.clientHeight * 2;
+}"""
+
+# Where the reader is in the list: how far the newest line is below the fold, and the scroll offset.
+DOCK_PLACE_JS = """async () => {
+    await new Promise((settled) => requestAnimationFrame(() => requestAnimationFrame(settled)));
+    const area = document.getElementById('scroll-area');
+    return {gap: area.scrollHeight - area.clientHeight - area.scrollTop, top: area.scrollTop};
+}"""
+
+# The pace popover, open: what is wrong with where it is. It belongs over the list, above the dock and
+# inside the column, and not over the switch or anything else in the dock.
+DOCK_POPOVER_JS = """() => {
+    const problems = [];
+    const pop = document.getElementById('speed-popover').getBoundingClientRect();
+    const dock = document.getElementById('dock'), d = dock.getBoundingClientRect(), ds = getComputedStyle(dock);
+    if (pop.bottom > d.top + 0.5) problems.push(`it hangs ${(pop.bottom - d.top).toFixed(1)}px into the dock`);
+    if (pop.top < 0) problems.push('it runs off the top of the window');
+    if (pop.left < d.left + parseFloat(ds.paddingLeft) - 0.5 || pop.right > d.right - parseFloat(ds.paddingRight) + 0.5)
+        problems.push(`it is outside the column: ${pop.left.toFixed(1)}-${pop.right.toFixed(1)}`);
+    const s = document.getElementById('view-switch').getBoundingClientRect();
+    const hit = document.elementFromPoint((s.left + s.right) / 2, (s.top + s.bottom) / 2);
+    if (!hit || !hit.closest('#view-switch')) problems.push('the switch cannot be clicked while it is open');
+    return problems;
+}"""
+
 
 class DockBox(TypedDict):
     """Where one control in the dock is drawn, in CSS pixels."""
@@ -1572,17 +1616,18 @@ DOCK_JS = """({desk, order}) => {
     const controls = [...dock.querySelectorAll('button, select')]
         .filter((el) => shown(el) && !el.closest('#prompts-tray') && !el.closest('#speed-popover'));
     const boxes = controls.map((el) => ({id: el.id, r: box(el)}));
-    // A row is the controls whose middles line up: each row of the dock centres what is in it, so a
-    // taller button — Talk with its note — is still on the row it sits in.
-    const middle = (r) => (r.top + r.bottom) / 2;
+    // A row is the controls whose feet line up: on a desk each row of the dock stands what is in it
+    // on one floor, so a taller button — Talk with its note — is still on the row it sits in. (The
+    // phone's rows are not asked about.)
+    const foot = (r) => r.bottom;
     const rows = [];
-    for (const {r} of boxes) if (!rows.some((m) => Math.abs(m - middle(r)) < 4)) rows.push(middle(r));
+    for (const {r} of boxes) if (!rows.some((m) => Math.abs(m - foot(r)) < 4)) rows.push(foot(r));
     rows.sort((a, b) => a - b);
-    const rowOf = (r) => rows.findIndex((m) => Math.abs(m - middle(r)) < 4);
+    const rowOf = (r) => rows.findIndex((m) => Math.abs(m - foot(r)) < 4);
     const visual = [...boxes].sort((a, b) => rowOf(a.r) - rowOf(b.r) || a.r.left - b.r.left).map((b) => b.id);
     const pane = [...document.getElementById('control-pane').children]
         .filter((el) => shown(el) && el.matches('button'))
-        .sort((a, b) => middle(box(a)) - middle(box(b)) || box(a).left - box(b).left).map((el) => el.id);
+        .sort((a, b) => rowOf(box(a)) - rowOf(box(b)) || box(a).left - box(b).left).map((el) => el.id);
     if (document.documentElement.scrollWidth > innerWidth) problems.push(`the page is ${document.documentElement.scrollWidth}px wide in a ${innerWidth}px window`);
     // On a desk nothing may be scrolled out of the pack's sight. (A phone's pack is built to scroll,
     // and on the channel view at 412px it already hid a few pixels of the view picker before #218.)
@@ -1609,6 +1654,28 @@ DOCK_JS = """({desk, order}) => {
             if (r.left < inner.left - 0.5 || r.right > inner.right + 0.5) problems.push(`#${id} runs out of the dock's column`);
             if (r.left < column.left - 1 || r.right > column.right + 1) problems.push(`#${id} is outside the list's column`);
             if (r.top < d.top || r.bottom > d.bottom + 0.5) problems.push(`#${id} hangs out of the dock`);
+            // The word level with its icon, as a desktop control's is: all but Talk over its note.
+            const el = document.getElementById(id);
+            const icon = el.querySelector(':scope > svg:not([hidden])');
+            const word = el.querySelector(':scope > .control-label, :scope > .mini-label');
+            if (icon && word && !(id === 'talk' && shown(note))) {
+                const i = icon.getBoundingClientRect(), w = word.getBoundingClientRect();
+                const off = (w.top + w.bottom) / 2 - (i.top + i.bottom) / 2;
+                if (Math.abs(off) > 0.5) problems.push(`#${id}'s word stands ${off.toFixed(1)}px off its icon's middle`);
+            }
+        }
+        // The switch's one place: the column's lower right corner, at the end of the dock's last row,
+        // with nothing to the right of it and nothing below it.
+        const flick = boxes.find(({id}) => id === 'view-switch');
+        if (flick) {
+            const s = flick.r;
+            if (Math.abs(s.right - inner.right) > 0.5) problems.push(`the switch ends ${(inner.right - s.right).toFixed(1)}px short of the column's right edge`);
+            if (Math.abs(s.bottom - (d.bottom - parseFloat(ds.paddingBottom))) > 0.5) problems.push(`the switch is not at the foot of the dock`);
+            if (boxes.some(({id, r}) => id !== 'view-switch' && (r.top + r.bottom) / 2 > (s.top + s.bottom) / 2 + 4)) problems.push('a control sits below the switch');
+            if (boxes.some(({id, r}) => id !== 'view-switch' && r.right > s.left + 0.5 && r.bottom > s.top + 0.5)) problems.push('a control sits right of the switch on its row');
+            // Its width is fixed so that its place can be; the word in it must still be whole.
+            const word = document.getElementById('view-switch-label');
+            if (word.scrollWidth > word.clientWidth) problems.push(`the switch's word "${word.textContent}" is cut short`);
         }
         // Untruncated: as wide as the same select sized to the option it shows, with no cap and no shrink.
         for (const id of ['discord-channel', 'thread-select']) {
@@ -1693,6 +1760,10 @@ def main() -> int:
                       f"{DESK_CONTROL_PX[1]}px controls where it fits and two where it does not, inside the"
                       " column and overlapping nothing, the pickers wide enough for a thirty-character"
                       " channel name with a thread open beside it, the pane in the order the phone shows,"
+                      " every word level with its icon, the switch whole and in the column's lower right"
+                      " corner in every state with a second click in the same spot switching back, the pace"
+                      " popover over the list and clear of the switch, a reader on the newest turn kept"
+                      " there as the dock grows a row and one up the history left alone,"
                       f" and every Tab stop ringed and unclipped: {heights}")
         for label, width, height, mobile in PROFILES:
             pin_walk(playwright.chromium, args, label, width, height, mobile)
@@ -2656,7 +2727,8 @@ def dock_walk(chromium: BrowserType, args: argparse.Namespace, label: str, width
               mobile: bool) -> str:
     """`#218 desktop-dock`: the dock on the call view and the channel, in the dark theme the owner
     reads in. On a desk: ordinary controls in one row where they fit and two where they do not, inside
-    the column, overlapping nothing, the pickers wide enough for a thirty-character name, and every
+    the column, overlapping nothing, the pickers wide enough for a thirty-character name, the switch
+    in the same corner in every state and a second click in the same spot switching back, and every
     stop of a Tab walk ringed and unclipped. On a phone: the dock the phone had. Answers a summary."""
     api = DockApi()
     server = ThreadingHTTPServer(("127.0.0.1", 0), handler_for(api))
@@ -2665,6 +2737,8 @@ def dock_walk(chromium: BrowserType, args: argparse.Namespace, label: str, width
     thread.start()
     url = f"http://127.0.0.1:{server.server_port}/voice"
     heights: dict[str, float] = {}
+    # Where the view switch is drawn in each state measured in the default column.
+    switches: dict[str, DockBox] = {}
     try:
         with tempfile.TemporaryDirectory(prefix="vibe-talk-chrome-dock-") as profile:
             context = chromium.launch_persistent_context(
@@ -2705,6 +2779,8 @@ def dock_walk(chromium: BrowserType, args: argparse.Namespace, label: str, width
                 tall = float(found["height"])
                 heights[state] = tall
                 boxes = found["boxes"]
+                if "view-switch" in boxes:
+                    switches[state] = boxes["view-switch"]
                 if desk:
                     check(tall <= most, f"{where}: the dock is {tall:.1f}px tall, more than {most}px")
                     if rows is not None:
@@ -2729,7 +2805,16 @@ def dock_walk(chromium: BrowserType, args: argparse.Namespace, label: str, width
                 return found
 
             def tabbed(state: str, found: DockFound) -> None:
-                """Tab from the gear to the last control: in the order the eye reads, every stop ringed."""
+                """Tab from the gear to the last control, every stop ringed: the bar's controls in the
+                order the eye reads them, then the switch, then the pane's in the order the eye reads
+                them. The switch is drawn in the corner, after the pane, so that it never moves; Tab
+                reaches it where the markup has it — the end of the bar — as it does on a phone and
+                in the bar's other home, in the header."""
+                bar = [stop for stop in found["visual"] if stop not in found["pane"] and stop != "view-switch"]
+                expected = bar + (["view-switch"] if "view-switch" in found["visual"] else []) + found["pane"]
+                check(sorted(expected) == sorted(found["visual"]),
+                      f"{label}, {state}: the dock shows {found['visual']}, which is not the bar, the switch"
+                      f" and the pane {found['pane']}")
                 page.focus("#open-settings")
                 page.keyboard.press("Tab")
                 page.keyboard.press("Shift+Tab")
@@ -2742,8 +2827,7 @@ def dock_walk(chromium: BrowserType, args: argparse.Namespace, label: str, width
                     check(not stop["problems"], f"{label}, {state}: {stop['problems']}")
                     stops.append(str(stop["id"]))
                     page.keyboard.press("Tab")
-                check(stops == found["visual"],
-                      f"{label}, {state}: Tab goes {stops}, the eye reads {found['visual']}")
+                check(stops == expected, f"{label}, {state}: Tab goes {stops}, not {expected}")
 
             page.goto(url, wait_until="load")
             page.fill("#api-token", TOKEN)
@@ -2752,8 +2836,10 @@ def dock_walk(chromium: BrowserType, args: argparse.Namespace, label: str, width
             until("() => !document.getElementById('control-pane').hidden", "the call view's pane did not appear")
 
             # The call view, idle: the bar's four and the switch, and Sound, Clear and Talk beside them.
-            measured("call view, idle", ["speaker", "clear-view", "talk"], rows=1 if desk else None)
+            idle = measured("call view, idle", ["speaker", "clear-view", "talk"], rows=1 if desk else None)
             shot("1-call-idle")
+            # A transcript long enough to scroll, and the reader on its newest line as they press Talk.
+            check(bool(page.evaluate(DOCK_TRANSCRIPT_JS)), f"{label}: the transcript does not scroll")
             # A live call, as renderControls draws it: Hang up shown and Talk listening. The audio is
             # tests/read_aloud_browser.py's and the screenshot harness's; the layout is this one's.
             page.evaluate("""() => { document.getElementById('hang-up').hidden = false;
@@ -2761,9 +2847,18 @@ def dock_walk(chromium: BrowserType, args: argparse.Namespace, label: str, width
                 document.getElementById('talk').className = 'control control-talk live';
                 document.getElementById('talk-label').textContent = 'Listening'; }""")
             live = measured("call view, live", ["speaker", "clear-view", "hang-up", "talk"])
+            # On a desk that was a second row, taken from the bottom of the list: the reader who was on
+            # the newest turn is on it still, close enough that the call's next turn is followed.
+            place = page.evaluate(DOCK_PLACE_JS)
+            check(float(place["gap"]) <= BOTTOM_SLACK_PX,
+                  f"{label}: the dock grew from {idle['height']:.0f}px to {live['height']:.0f}px and left the"
+                  f" reader {place['gap']:.0f}px above the newest turn, past the {BOTTOM_SLACK_PX}px it follows from")
             shot("2-call-live")
             if desk:
                 tabbed("call view, live", live)
+            # Up the history now, for the dock growing again below a reader who is not following.
+            up = page.evaluate("""() => { const area = document.getElementById('scroll-area');
+                area.scrollTop = Math.round((area.scrollHeight - area.clientHeight) / 2); return area.scrollTop; }""")
             # After it, the one-clause note under Start a new call: it goes under the word.
             page.evaluate("""() => { document.getElementById('hang-up').hidden = true;
                 document.getElementById('control-pane').className = 'solo';
@@ -2772,13 +2867,31 @@ def dock_walk(chromium: BrowserType, args: argparse.Namespace, label: str, width
                 const note = document.getElementById('talk-note');
                 note.textContent = 'the agent starts fresh — the earlier conversation was too long to replay';
                 note.hidden = false; }""")
-            measured("call view, after a call", ["speaker", "clear-view", "talk"], most=DOCK_NOTE_MAX_PX)
+            ended = measured("call view, after a call", ["speaker", "clear-view", "talk"], most=DOCK_NOTE_MAX_PX)
+            check(abs(float(page.evaluate(DOCK_PLACE_JS)["top"]) - float(up)) <= 0.5,
+                  f"{label}: the dock grew from {live['height']:.0f}px to {ended['height']:.0f}px and moved a reader"
+                  " who was up the history")
             shot("3-call-ended")
 
-            # The channel, whose thirty-character name opens first, in All.
+            # The channel, whose thirty-character name opens first, in All. On a desk it is opened by a
+            # real click in the middle of where the switch stood on the idle call view, and later
+            # closed by another in the same spot: the switch is the control the reader flicks, and
+            # after a flick it has to be under the pointer that flicked it.
             page.reload(wait_until="load")
             page.wait_for_selector("#view-switch", state="visible", timeout=10_000)
-            page.click("#view-switch")
+            until("() => !document.getElementById('control-pane').hidden", "the call view's pane did not appear")
+            spot = switches["call view, idle"]
+            spot_x, spot_y = spot["left"] + spot["width"] / 2, spot["top"] + spot["height"] / 2
+
+            def flick(checked: str, why: str) -> None:
+                if desk:
+                    page.mouse.click(spot_x, spot_y)
+                else:
+                    page.click("#view-switch")
+                until("() => document.getElementById('view-switch').getAttribute('aria-checked') === "
+                      f"{json.dumps(checked)}", why)
+
+            flick("true", "a click where the switch stood on the call view did not open the channel")
             page.wait_for_selector("#discord-log > li[data-id]", timeout=10_000)
             check(page.evaluate("() => document.getElementById('discord-channel').selectedOptions[0].textContent")
                   == LONG_CHANNEL["label"] and len(str(LONG_CHANNEL["label"])) >= 30,
@@ -2788,12 +2901,34 @@ def dock_walk(chromium: BrowserType, args: argparse.Namespace, label: str, width
             shot("4-channel-long-name")
             if desk:
                 tabbed("the channel, a long name", channel)
-                # Two rows here, and the pane at the right of the second, under the switch.
+                # Two rows here: the pickers on the first, and on the second the reading buttons at its
+                # right, beside the switch.
                 boxes = channel["boxes"]
-                switch, read = boxes["view-switch"], boxes["read-aloud"]
-                check(channel["rows"] == 2
-                      and abs((switch["left"] + switch["width"]) - (read["left"] + read["width"])) <= 1,
-                      f"{label}: the reading buttons are not under the switch at the right of a second row")
+                switch, read, picker = boxes["view-switch"], boxes["read-aloud"], boxes["discord-channel"]
+                middle = {name: box["top"] + box["height"] / 2 for name, box in boxes.items()}
+                check(channel["rows"] == 2 and abs(middle["view-switch"] - middle["read-aloud"]) < 4
+                      and middle["discord-channel"] < middle["read-aloud"] - 4
+                      and read["left"] + read["width"] < switch["left"],
+                      f"{label}: the reading buttons are not beside the switch on a second row, under the"
+                      f" pickers: {picker}, {read}, {switch}")
+                # Pace's popover, opened by a real click: over the list, above the dock and inside the
+                # column. Placed against the pane, it opened over the row above the pane — the switch
+                # and the pickers, under it until it was dismissed.
+                pace = boxes["read-speed"]
+                pace_x, pace_y = pace["left"] + pace["width"] / 2, pace["top"] + pace["height"] / 2
+                page.mouse.click(pace_x, pace_y)
+                until("() => !document.getElementById('speed-popover').hidden", "Pace did not open its popover")
+                shot("4b-pace-open")
+                problems = page.evaluate(DOCK_POPOVER_JS)
+                check(not problems, f"{label}: the pace popover, open: {problems}")
+                page.mouse.click(pace_x, pace_y)
+                until("() => document.getElementById('speed-popover').hidden", "Pace did not close its popover")
+                # The same spot again is the switch again: back to the call, and back to the channel.
+                flick("false", "a second click in the same spot did not switch back to the call")
+                until("() => !document.getElementById('talk').hidden", "the call view's Talk did not come back")
+                flick("true", "a third click in the same spot did not open the channel again")
+                until("() => document.getElementById('read-aloud').hidden === false",
+                      "the channel's Read did not come back")
             # A thread open in the view picker beside the long name. In the default column the two
             # names, the gear, the device button and the switch do not fit one row, and the VIEW
             # picker gives way: the channel's name stays whole.
@@ -2815,6 +2950,16 @@ def dock_walk(chromium: BrowserType, args: argparse.Namespace, label: str, width
             shot("6-channel-short-name")
 
             if desk:
+                # ONE PLACE FOR THE SWITCH in every state of the default column: idle, live, after a
+                # call, a long name over two rows, a thread, a short name in one. Its right edge and its
+                # bottom are the same in all of them, and so is its width, whichever word it shows.
+                spread = {edge: max(values) - min(values) for edge, values in (
+                    ("right", [b["left"] + b["width"] for b in switches.values()]),
+                    ("bottom", [b["top"] + b["height"] for b in switches.values()]),
+                    ("width", [b["width"] for b in switches.values()]))}
+                check(len(switches) >= 6 and all(moved <= 0.5 for moved in spread.values()),
+                      f"{label}: the switch moves between states ({spread}): {switches}")
+
                 # The column dragged wide with the reader's own control: the long name and the three
                 # reading buttons share one row.
                 page.select_option("#discord-channel", str(LONG_CHANNEL["id"]))

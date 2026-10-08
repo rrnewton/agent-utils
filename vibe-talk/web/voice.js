@@ -17841,6 +17841,36 @@ if (typeof window.ResizeObserver === "function") {
   });
   for (const box of [el("scroll-area"), ...el("scroll-area").children]) geometry.observe(box);
 }
+// `#218 desktop-dock`. On a desk the dock is one row of controls or two, and which depends on what
+// is in it — a call going live, a long channel name, a label changing length. When it grows it takes
+// that height from the bottom of #scroll-area, and a reader on the newest line is left that far above
+// it: a second row is 42px, past BOTTOM_SLACK_PX, so the next turn of the call they just started was
+// no longer followed. On a phone the dock is one height on the main screen and this never acts.
+//
+// So a reader who was on the newest line BEFORE the dock grew is kept on it: within the slack of it
+// once the growth is given back. Anyone further up is left exactly where they are — the list's top
+// edge did not move, and neither does what they are reading. A view switch that grows the dock puts
+// the other list back in its own place first; a place within the slack of its newest line, plus the
+// growth, is taken the rest of the way, and anywhere further up is left alone.
+//
+// THE LIST is what is watched, not the dock, because the list is what changes size whenever this can
+// matter — and also whenever the main screen comes and goes, which is the case this must stay out of:
+// the list is hidden on every other screen, so coming back is a list that was nothing a moment ago,
+// and the dock growing then (the pane returning) is not a reader losing their place. A window that
+// shrinks is not the dock growing either, and it leaves the reader where they are, as `#207`
+// decided. What is kept between reports is the list's height and the dock's.
+if (typeof window.ResizeObserver === "function") {
+  let seen = null;
+  new window.ResizeObserver(() => {
+    const area = el("scroll-area");
+    const now = { list: area.clientHeight, dock: el("dock").offsetHeight };
+    const grew = seen !== null && seen.list > 0 && currentScreen === "main" ? now.dock - seen.dock : 0;
+    seen = now;
+    if (grew > 0 && atBottom(area, BOTTOM_SLACK_PX + grew)) {
+      area.scrollTop = area.scrollHeight;
+    }
+  }).observe(el("scroll-area"));
+}
 // `#68 pull-to-refresh`. On #scroll-area rather than on the document, because the gesture is about
 // THIS list and because the page's other three scroll gestures already live here. Nothing calls
 // `preventDefault`: the pull only ever begins where the element has nothing left to scroll, so

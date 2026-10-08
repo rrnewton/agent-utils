@@ -4479,10 +4479,17 @@ test("on a desktop both lists are held to a reading column, and the phone is lef
   // `#218 desktop-dock` moved the column from the bar and the pane to the DOCK, which lays the two
   // out side by side: its padding is half of what the window has beyond the reading width, so its
   // content box is the column — the same box the panes are held to, moving with the same handle.
+  // The inset is stated once, as `--dock-inset`, because the switch and the prompts tray are placed
+  // by it as well as the dock's padding.
   const dock = cssBlockIn(DESKTOP_QUERY, "#dock");
   assert.match(
-    cssValue(dock, "padding") || "",
+    cssValue(dock, "--dock-inset") || "",
     /max\([^;]*100%\s*-\s*var\(--reading-width\)/,
+    "the dock's inset is not the column's"
+  );
+  assert.match(
+    cssValue(dock, "padding") || "",
+    /var\(--dock-inset\)/,
     "the dock spans the whole desktop while the list above it is a column"
   );
   assert.doesNotMatch(cssBlock("#dock"), /position:\s*(fixed|absolute)/);
@@ -4616,6 +4623,10 @@ test("the desktop dock leaves the phone's declarations as they were", () => {
     "#control-pane .control-note",
     "#control-pane:has(#read-aloud:not([hidden])) #speaker",
     "#control-pane button:focus-visible",
+    '#control-bar[data-placement="bottom"] #view-switch',
+    "#control-bar-bottom:has(#view-switch:not([hidden])) + #control-pane",
+    '#control-bar[data-placement="bottom"] .switch-word',
+    "#control-pane .control:has(> .control-note:not([hidden])) > svg",
   ]) {
     assert.ok(cssRules(mediaBody(DESKTOP_QUERY), selector).length > 0, `${selector} is gone from the desk`);
     assert.equal(
@@ -4663,6 +4674,60 @@ test("the pane's markup runs in the order its buttons are seen, so Tab follows t
     cssBlockIn(DESKTOP_QUERY, "#control-pane:has(#read-aloud:not([hidden])) #speaker"),
     /display:\s*none/
   );
+});
+
+test("on a desk the view switch has one place, and the pane keeps the room for it", () => {
+  // The switch rode along with the row: between the bar and the pane when they shared one, at the end
+  // of the first row when they did not — about 265px sideways and a row up between the call and the
+  // channel, so a second click where the first had landed met an empty dock. It is set in the
+  // column's lower right corner now, the same width whatever word it shows.
+  const flick = cssBlockIn(DESKTOP_QUERY, '#control-bar[data-placement="bottom"] #view-switch');
+  assert.match(flick, /position:\s*absolute/, "the switch is still carried along by the row");
+  assert.match(flick, /right:\s*var\(--dock-inset\)/, "the switch is not at the column's right edge");
+  assert.match(flick, /bottom:\s*0\.4rem/, "the switch is not at the foot of the dock");
+  assert.equal(
+    cssValue(flick, "bottom"),
+    cssValue(cssBlockIn(DESKTOP_QUERY, "#dock"), "padding").split(/\s+/)[0],
+    "the switch's foot is not the dock's last row"
+  );
+  assert.match(flick, /width:\s*var\(--dock-switch\)/, "the switch's width follows its word, so its edge moves");
+  // Its `ch`-based column measured in the page's type, not in its own 0.9rem: see the rule.
+  assert.match(flick, /font-size:\s*inherit/);
+  assert.match(cssBlockIn(DESKTOP_QUERY, '#control-bar[data-placement="bottom"] .switch-word'),
+    /text-overflow:\s*ellipsis/, "a wider face can push the word out of a fixed-width switch");
+  // Positioned against the DOCK: the bar is static on a desk, the dock is not. The tray, which hung
+  // off the bar, hangs off the dock across the column.
+  assert.match(cssBlockIn(DESKTOP_QUERY, "#dock"), /position:\s*relative/, "the switch has nothing to stand in");
+  assert.match(cssBlockIn(DESKTOP_QUERY, '#control-bar[data-placement="bottom"]'), /position:\s*static/);
+  const tray = cssBlockIn(DESKTOP_QUERY, '#control-bar[data-placement="bottom"] #prompts-tray');
+  assert.match(tray, /left:\s*var\(--dock-inset\)/, "the tray spans the window rather than the column");
+  assert.match(tray, /right:\s*var\(--dock-inset\)/, "the tray spans the window rather than the column");
+  // The room: the pane's right margin is the switch's width and a gap, and only while the switch is
+  // up (text mode takes it down, and the pane does not hold an empty corner for it).
+  const room = cssBlockIn(DESKTOP_QUERY, "#control-bar-bottom:has(#view-switch:not([hidden])) + #control-pane");
+  assert.match(room, /margin-right:\s*calc\(var\(--dock-switch\) \+ [\d.]+rem\)/, "the pane keeps no room for the switch");
+  assert.match(cssValue(cssBlockIn(DESKTOP_QUERY, "#dock"), "--dock-switch") || "", /^[\d.]+rem$/);
+  // ...and it is the pane that keeps it, the last thing in the dock and so on its last row.
+  const dock = HTML_CODE.slice(HTML_CODE.indexOf('id="dock"'), HTML_CODE.indexOf("</footer>"));
+  assert.ok(dock.indexOf('id="control-pane"') > dock.indexOf('id="control-bar-bottom"'));
+  // Still no `order`: Tab reaches the switch where the markup has it, at the end of the bar and
+  // before the pane, as it does on a phone and in the header. tests/offline_cache_browser.py walks it.
+  assert.doesNotMatch(mediaBody(DESKTOP_QUERY), /(?:^|[;{\s])order:/);
+  // The pace popover opens above the dock at the column's edge, not over the row above the pane.
+  assert.match(cssBlockIn(DESKTOP_QUERY, "#control-pane"), /position:\s*static/);
+  assert.match(cssBlockIn(DESKTOP_QUERY, ".popover"), /right:\s*var\(--dock-inset\)/);
+});
+
+test("on a desk a pane button's word stands level with its icon", () => {
+  // The icon spanned two grid lines in every button so that Talk's note could go under its word; in
+  // every other button the second line was empty and still took a pixel or two of the icon's height,
+  // standing the word that much above the icon. It spans two only when there is a note.
+  assert.match(cssBlockIn(DESKTOP_QUERY, "#control-pane .control > svg"), /grid-row:\s*1;/);
+  assert.match(
+    cssBlockIn(DESKTOP_QUERY, "#control-pane .control:has(> .control-note:not([hidden])) > svg"),
+    /grid-row:\s*1 \/ span 2/
+  );
+  assert.match(cssBlockIn(DESKTOP_QUERY, "#control-pane .control"), /align-items:\s*center/);
 });
 
 test("every control in the desktop dock shows keyboard focus, and the pack has room for the ring", () => {
@@ -16445,6 +16510,68 @@ test("the list changing size under a reader who has not scrolled decides the jum
     '  for (const box of [el("scroll-area"), ...el("scroll-area").children]) geometry.observe(box);\n', ""
   ));
   assert.deepStrictEqual(control, { windowShrank: false, windowGrew: true, rowGrewBelow: false });
+});
+
+test("a desk's dock growing keeps a reader on the newest turn there, and moves nobody else", async () => {
+  // `#218 desktop-dock`. On a desk the dock is one row of controls or two, and a call going live is a
+  // second row: 42px taken from the bottom of the list, past the slack, so the reader who had just
+  // pressed Talk on the newest turn was no longer on it and the call's next turn was not followed.
+  // The fixture lays nothing out, so the test does what a browser does: the dock is the new height,
+  // the list has lost that much, and whatever watches the list is told.
+  const GROWTH = 42;
+  const run = async (script) => {
+    const page = newPage(new Map(), script, (p) => p.enableResizeObserver());
+    const area = await startTalking(page).then(() => fillTranscript(page));
+    const dock = page.el("dock");
+    dock.offsetHeight = 50;
+    // The first report has nothing before it: the dock as the page has it.
+    page.resized(area);
+    const grow = (by) => {
+      dock.offsetHeight += by;
+      area.clientHeight -= by;
+      page.resized(area);
+    };
+    assert.ok(atBottomOf(area), "the premise: the reader is on the newest turn");
+    grow(GROWTH);
+    const newest = atBottomOf(area);
+    // Up the history, the dock growing again: the reader stays on the line they were reading.
+    await scrollToGap(page, halfway(page));
+    const up = area.scrollTop;
+    grow(20);
+    const upHeld = area.scrollTop === up;
+    // A WINDOW losing height is not the dock growing, and leaves a reader where they are (`#207`).
+    await scrollToGap(page, 0);
+    area.clientHeight -= GROWTH;
+    page.resized(area);
+    const windowLeft = !atBottomOf(area);
+    // Away to Settings and back, which on a phone grows the dock by the whole tile as the pane
+    // returns. The list is hidden while Settings is up, so it reports nothing to lose.
+    await scrollToGap(page, BOTTOM_SLACK_PX + 10);
+    await page.el("open-settings").click();
+    await page.settle();
+    area.clientHeight = 0;
+    page.resized(area);
+    dock.offsetHeight += 100;
+    area.clientHeight = SCROLL_VIEWPORT_PX - 100;
+    await page.el("close-settings").click();
+    await page.settle();
+    page.resized(area);
+    return { newest, upHeld, windowLeft, back: area.scrollHeight - area.clientHeight - area.scrollTop };
+  };
+  const real = await run(SCRIPT);
+  assert.equal(real.newest, true, "the dock grew under a reader on the newest turn and left them above it");
+  assert.equal(real.upHeld, true, "the dock grew under a reader up the history and moved them");
+  assert.equal(real.windowLeft, true, "a window losing height pulled the reader down to the newest turn");
+
+  // THE CONTROL: nothing keeps the reader. The growth leaves them above the newest turn — further than
+  // the slack, so this is the defect and not a rounding — and everything else comes out the same,
+  // the return from Settings included: what the page does there, it did before this.
+  const control = await run(brokenScript(
+    "    if (grew > 0 && atBottom(area, BOTTOM_SLACK_PX + grew)) {\n      area.scrollTop = area.scrollHeight;\n    }\n",
+    ""
+  ));
+  assert.ok(GROWTH > BOTTOM_SLACK_PX, "the premise: a second row is more than the slack");
+  assert.deepStrictEqual(control, { ...real, newest: false });
 });
 
 test("a tap on the jump only scrolls: no refresh, no fold, nothing read aloud", async () => {

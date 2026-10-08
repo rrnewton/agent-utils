@@ -3462,12 +3462,17 @@ that drives exactly the same value, so the choice is reachable without a mouse.
 strip of 44px targets above a tile of large buttons; on a desk the same controls are one wrapping
 row of ordinary 36px buttons, icon and word side by side, inside the column. Everything shares one
 row when it fits — about 50px of dock where the phone's composition stood 149px — and when a long
-channel name and the reading buttons do not fit together, the buttons take a second row under the
-switch rather than the name being cut, for about 92px. The channel and view pickers are as wide as
-the names they show, up to a cap; the view picker gives way first when the row is short, and the
-channel's name is cut, with an ellipsis, only when the view picker is already at its floor. Every
-control shows a focus ring, and Tab visits them in the order they are seen. The phone's dock is
-not touched: `tests/offline_cache_browser.py` measures it at 412px and 360px against what it was.
+channel name and the reading buttons do not fit together, the buttons take a second row, beside the
+switch, rather than the name being cut, for about 92px. The Voice/Channel switch has ONE place on a
+desk, the lower right corner of the column, in every view and state: flicking it changes the row it
+sits in, and a switch that moved with the row was somewhere else for the second click. The channel
+and view pickers are as wide as the names they show, up to a cap; the view picker gives way first
+when the row is short, and the channel's name is cut, with an ellipsis, only when the view picker is
+already at its floor. Every control shows a focus ring; Tab visits the bar's controls in the order
+they are seen, then the switch, then the pane's buttons — the bar's own order, as on a phone. A
+reader on the newest line stays on it when the dock grows a row under them, so a call's turns are
+still followed once it goes live. The phone's dock is not touched: `tests/offline_cache_browser.py`
+measures it at 412px and 360px against what it was.
 
 **The regime is `@media (min-width: 900px) and (pointer: fine)`, and nothing else decides it.**
 Not a user-agent string — a tablet with a trackpad and a phone in desktop mode both lie to one, and
