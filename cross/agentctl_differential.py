@@ -44,8 +44,10 @@ def _normalize(value: object) -> object:
     if isinstance(value, dict):
         return {str(key): ("<TOKEN>" if key == "token" else 0 if key == "created_at"
                           else "<PROCESS_IDENTITY>" if key == "custom_process_identity"
-                          # Each edition's fixture runs its own harness process.
-                          else "<PROCESS_IDENTITY>" if key == "harness_identity" and item is not None
+                          # Each edition's fixture runs its own harness process: only its
+                          # pid and start time differ, the rest of the identity is compared.
+                          else {**item, "pid": "<PID>", "starttime_ticks": "<TICKS>"}
+                          if key == "harness_identity" and isinstance(item, dict)
                           else "<HARNESS_PID>" if key == "harness_pid"
                           else "<JOURNAL_ID>" if key == "journal_id"
                           else 0 if key == "renamed_at"
@@ -1900,7 +1902,9 @@ def _identity_and_rename(harness: Harness, report: Report) -> None:
     status = _json(python)
     report.require("identity/anchored", isinstance(status, dict)
                    and status.get("terminal_id") == "term-1"
-                   and status.get("harness_identity") == "<PROCESS_IDENTITY>",
+                   and isinstance(status.get("harness_identity"), dict)
+                   and status["harness_identity"].get("pid") == "<PID>"
+                   and status["harness_identity"].get("version") == 1,
                    f"start did not pin terminal and harness: {status!r}")
     _pair(harness, report, case, "identity/doctor-clean", ("doctor", *common))
     _pair(harness, report, case, "identity/rename", ("rename", "worker", "reviewer", *common))

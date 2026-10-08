@@ -227,7 +227,10 @@ elif args[:2] == ["pane", "process-info"]:
         )
     else:
         command = ("/tmp/lookalike/muse" if state.get("wrong_custom_process")
-                   else state.get("launch_command", "/usr/local/bin/muse"))
+                   else state.get("launch_command", "/usr/local/bin/muse")
+                   if state.get("custom_harness") or not state.get("harness_pid")
+                   # A native harness shows under its own name, as a real one does.
+                   else "/usr/local/bin/" + state.get("harness", "codex"))
         parsed = shlex.split(command)
         executable = parsed[0]
         process_pid = state.get("custom_pid") or state.get("harness_pid") or 200
@@ -1676,9 +1679,10 @@ def _managed_lifecycle(harness: Harness, report: Report) -> None:
                 return {
                     str(key): ("<TOKEN>" if key == "token" else 0 if key == "created_at"
                                else "<ARCHIVE>" if key == "archive"
-                               # Each edition's fixture runs its own harness process.
-                               else "<PROCESS_IDENTITY>"
-                               if key == "harness_identity" and child is not None
+                               # Each edition's fixture runs its own harness process: only
+                               # its pid and start time differ.
+                               else {**child, "pid": "<PID>", "starttime_ticks": "<TICKS>"}
+                               if key == "harness_identity" and isinstance(child, dict)
                                else clean(child))
                     for key, child in item.items()
                 }

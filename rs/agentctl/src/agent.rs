@@ -1435,18 +1435,39 @@ fn deliver_one<A: AgentApi + ?Sized>(
         Submission::NotStaged(reason) => return Ok(Delivered::NotStaged(reason)),
         Submission::Unconfirmed => {}
     }
+    // A confirmation key (such as a goal-replacement Enter) can itself misroute.
+    let misrouted = |error: &AdapterError| -> Option<std::result::Result<Delivered, Undelivered>> {
+        match error.kind() {
+            AdapterErrorKind::MisrouteRecovered => {
+                Some(Ok(Delivered::Misrouted(error.to_string())))
+            }
+            AdapterErrorKind::ProbableMisroute => Some(Err(Undelivered {
+                error: AgentError::delivery(format!(
+                    "pane {}: PROBABLE MISROUTE, quarantined: {error}",
+                    info.pane_id
+                )),
+                probable_misroute: true,
+            })),
+            _ => None,
+        }
+    };
     let Some(chunk) = runtime.delivery_wait_chunk() else {
         let millis = working_timeout.as_millis().clamp(1, u64::MAX.into()) as u64;
-        return client
-            .wait_agent_status_with_runtime(&info.pane_id, "working", millis, runtime)
-            .map(|()| Delivered::Confirmed { verified: false })
-            .map_err(|error| {
-                AgentError::delivery(format!(
+        return match client.wait_agent_status_with_runtime(
+            &info.pane_id,
+            "working",
+            millis,
+            runtime,
+        ) {
+            Ok(()) => Ok(Delivered::Confirmed { verified: false }),
+            Err(error) => misrouted(&error).unwrap_or_else(|| {
+                Err(AgentError::delivery(format!(
                     "pane {} did not confirm idle/done -> working submission: {error}",
                     info.pane_id
                 ))
-                .into()
-            });
+                .into())
+            }),
+        };
     };
     let deadline = runtime.monotonic().saturating_add(working_timeout);
     let mut last_error = None;
@@ -1471,7 +1492,12 @@ fn deliver_one<A: AgentApi + ?Sized>(
         let millis = wait.as_millis().clamp(1, u64::MAX.into()) as u64;
         match client.wait_agent_status_with_runtime(&info.pane_id, "working", millis, runtime) {
             Ok(()) => return Ok(Delivered::Confirmed { verified: false }),
-            Err(error) => last_error = Some(error.to_string()),
+            Err(error) => {
+                if let Some(outcome) = misrouted(&error) {
+                    return outcome;
+                }
+                last_error = Some(error.to_string());
+            }
         }
     }
 }

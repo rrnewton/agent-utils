@@ -131,7 +131,7 @@ class FakeManagedClient:
                 del self.moved_named_panes[old]
                 self.moved_named_panes[name] = pane
 
-    def harness_identity(self, pane_id: str) -> CustomProcessIdentity | None:
+    def harness_identity(self, pane_id: str, kind: str = "") -> CustomProcessIdentity | None:
         if self.infos[pane_id].agent is None:
             return None
         pid = self.harness_pids.setdefault(pane_id, 300 + len(self.harness_pids))

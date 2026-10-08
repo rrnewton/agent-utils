@@ -2467,31 +2467,73 @@ impl HerdrClient {
     /// Pin the pane's foreground process-group leader, the harness Herdr detected.
     ///
     /// Returns `None` when the leader is the pane's shell, is not listed among the foreground
-    /// processes, or its kernel identity cannot be read coherently.
-    pub fn harness_identity(&self, pane_id: &str) -> Result<Option<CustomProcessIdentity>> {
+    /// Pin the harness process itself among the pane's foreground processes.
+    ///
+    /// The pinned process is the one foreground process whose name, executable or script
+    /// name is `kind` (a wrapper that launched the harness is not it), or the only
+    /// foreground process when none is named so. `None` when no single process qualifies
+    /// or its kernel identity cannot be read coherently.
+    pub fn harness_identity(
+        &self,
+        pane_id: &str,
+        kind: &str,
+    ) -> Result<Option<CustomProcessIdentity>> {
         let state = self.pane_process_state(pane_id, &|| false)?;
-        let leader = state.foreground_process_group_id;
-        if leader == state.shell_pid
-            || !state
-                .processes
-                .iter()
-                .any(|process| process.get("pid").and_then(Value::as_u64) == Some(leader))
-        {
+        if state.foreground_process_group_id == state.shell_pid {
             return Ok(None);
         }
-        let Ok(observed) = live_custom_process(leader) else {
+        let stem = |path: &str| {
+            Path::new(path)
+                .file_name()
+                .and_then(|name| name.to_str())
+                .and_then(|name| name.split('.').next())
+                .unwrap_or("")
+                .to_owned()
+        };
+        let pids: Vec<u64> = state
+            .processes
+            .iter()
+            .filter_map(|process| process.get("pid").and_then(Value::as_u64))
+            .collect();
+        let named: Vec<u64> = state
+            .processes
+            .iter()
+            .filter_map(|process| {
+                let pid = process.get("pid")?.as_u64()?;
+                let argv: Vec<&str> = process
+                    .get("argv")
+                    .and_then(Value::as_array)
+                    .map(|items| items.iter().filter_map(Value::as_str).collect())
+                    .unwrap_or_default();
+                let named = process.get("name").and_then(Value::as_str) == Some(kind)
+                    || argv.iter().take(2).any(|word| stem(word) == kind);
+                named.then_some(pid)
+            })
+            .collect();
+        let candidates = if named.is_empty() && pids.len() == 1 {
+            pids
+        } else {
+            named
+        };
+        let [pid] = candidates.as_slice() else {
             return Ok(None);
         };
-        Ok((observed.process_group_id == leader).then_some(observed.identity))
+        let Ok(observed) = live_custom_process(*pid) else {
+            return Ok(None);
+        };
+        Ok(
+            (observed.process_group_id == state.foreground_process_group_id)
+                .then_some(observed.identity),
+        )
     }
-    /// Is the pinned harness process still the pane's foreground process-group leader?
+    /// Is the pinned harness process, the same kernel lifetime, still in the foreground?
     pub fn verify_harness_identity(
         &self,
         pane_id: &str,
         expected: &CustomProcessIdentity,
     ) -> Result<bool> {
         let state = self.pane_process_state(pane_id, &|| false)?;
-        if state.foreground_process_group_id != expected.pid || !expected.valid() {
+        if !expected.valid() {
             return Ok(false);
         }
         let listed = state

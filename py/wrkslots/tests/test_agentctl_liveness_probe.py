@@ -188,3 +188,14 @@ def test_unreadable_record_makes_any_name_unverifiable(tmp_path: Path) -> None:
     (registry / "archive" / "broken-dddd" / "agent.json").write_text("{", encoding="utf-8")
     code, line = run(tmp_path, "other")
     assert code == 2 and "reason=error:" in line
+
+
+def test_a_corrupt_active_record_is_unverifiable_not_dead(
+    tmp_path: Path, exited_identity: dict[str, object],
+) -> None:
+    registry = tmp_path / ".agentctl"
+    (registry / "old").mkdir(parents=True)
+    (registry / "old" / "agent.json").write_text("{}", encoding="utf-8")
+    write_record(registry / "archive" / "old-eeee", "old", custom_process_identity=exited_identity)
+    code, line = run(tmp_path, "old")
+    assert code == 2 and "has_no_name" in line

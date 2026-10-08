@@ -132,7 +132,9 @@ def processes_with_pane(pane_id: str) -> Iterator[int]:
 def names_of(record: dict[str, object]) -> set[str]:
     """Every name a record has carried: its current name and its rename history."""
 
-    names = {record["name"]} if isinstance(record.get("name"), str) else set()
+    if not isinstance(record.get("name"), str):
+        raise Unverifiable("an agentctl record has no name")
+    names = {record["name"]}
     history = record.get("name_history", [])
     if not isinstance(history, list):
         raise Unverifiable("name_history is not a list")
@@ -144,9 +146,17 @@ def names_of(record: dict[str, object]) -> set[str]:
 
 
 def matching(paths: list[Path], agent: str) -> list[dict[str, object]]:
-    """Load every record and keep those that ever carried AGENT; an unreadable one is fatal."""
+    """Load every record and keep those that ever carried AGENT; an unreadable one is fatal.
 
-    return [record for record in (load_record(path) for path in paths) if agent in names_of(record)]
+    An active directory named AGENT is a claim on the name whatever its content says.
+    """
+
+    found: list[dict[str, object]] = []
+    for path in paths:
+        record = load_record(path)
+        if agent in names_of(record) or path.parent.name == agent:
+            found.append(record)
+    return found
 
 
 def check(agent: str, registry: Path) -> int:

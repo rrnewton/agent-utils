@@ -1540,17 +1540,29 @@ class HerdrClient:
         except TypeError as exc:
             raise HerdrUnavailable(f"tab get: invalid Herdr response: {exc}") from exc
 
-    def harness_identity(self, pane_id: str) -> CustomProcessIdentity | None:
-        """Pin the pane's foreground process-group leader, the harness Herdr detected.
+    def harness_identity(self, pane_id: str, kind: str) -> CustomProcessIdentity | None:
+        """Pin the harness process itself among the pane's foreground processes.
 
-        Returns ``None`` when the leader's kernel identity cannot be read coherently.
+        The pinned process is the one foreground process whose name, executable or
+        script name is ``kind`` (a wrapper that launched the harness is not it), or the
+        only foreground process when none is named so. Returns ``None`` when no single
+        process qualifies or its kernel identity cannot be read coherently.
         """
         info = self.process_info(pane_id)
         if info.foreground_pgid == info.shell_pid:
             return None
-        if not any(pid == info.foreground_pgid for pid, *_rest in info.foreground):
+
+        def stem(path: str) -> str:
+            return os.path.basename(path).split(".", 1)[0]
+
+        named = [
+            pid for pid, name, command, argv0, _executable in info.foreground
+            if kind in (name, stem(argv0), *(stem(word) for word in command.split()[1:2]))
+        ]
+        candidates = named or ([info.foreground[0][0]] if len(info.foreground) == 1 else [])
+        if len(candidates) != 1:
             return None
-        observed = self._process_identity(info.foreground_pgid)
+        observed = self._process_identity(candidates[0])
         if observed is None or observed[1] != info.foreground_pgid:
             return None
         return observed[0]
@@ -1558,11 +1570,10 @@ class HerdrClient:
     def verify_harness_identity(
         self, pane_id: str, expected: CustomProcessIdentity,
     ) -> bool:
-        """Is the pinned harness process still the pane's foreground group leader?"""
-        info = self.process_info(pane_id)
-        if info.foreground_pgid != expected.pid:
-            return False
-        return self._pane_process_identity(info, None, expected) is not None
+        """Is the pinned harness process, the same kernel lifetime, still in the foreground?"""
+        return self._pane_process_identity(
+            self.process_info(pane_id), None, expected
+        ) is not None
 
     def agent_pane(self, name: str) -> str:
         """Resolve an exact live Herdr agent name, rejecting a stale pane occupant."""

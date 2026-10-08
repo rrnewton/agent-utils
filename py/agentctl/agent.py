@@ -1817,7 +1817,14 @@ def _deliver_one(
         return
     try:
         client.wait_agent_status(info.pane_id, "working", max(1, int(working_timeout * 1000)))
-    except HerdrUnavailable as exc:
+    except MisrouteRecovered as exc:
+        # A confirmation key (such as a goal-replacement Enter) reached the wrong program.
+        raise _Misrouted(str(exc)) from exc
+    except ProbableMisroute as exc:
+        raise _PossiblySubmitted(
+            f"pane {info.pane_id}: PROBABLE MISROUTE, quarantined: {exc}", misroute=True,
+        ) from exc
+    except (HerdrUnavailable, AgentDeliveryError) as exc:
         raise _PossiblySubmitted(
             f"pane {info.pane_id} did not confirm idle/done -> working submission: {exc}"
         ) from exc

@@ -198,7 +198,7 @@ fn a_harness_replaced_before_send_types_nothing_and_stays_pending() {
         "{error}"
     );
     assert!(
-        error.to_string().contains("no longer the foreground"),
+        error.to_string().contains("no longer a foreground process"),
         "{error}"
     );
     assert!(!runs(&fixture).contains(&"for the original agent".to_owned()));
@@ -615,7 +615,7 @@ fn a_crash_between_publication_and_the_directory_move_recovers_with_one_history_
 }
 
 #[test]
-fn rename_recovery_refuses_a_replaced_harness() {
+fn rename_recovery_after_the_harness_exits_finishes_the_registry_only() {
     let fixture = Fixture::new();
     fixture.start(None);
     crash_rename(&fixture);
@@ -625,15 +625,66 @@ fn rename_recovery_refuses_a_replaced_harness() {
         .lock()
         .unwrap()
         .insert("owned".to_owned(), 999);
+    let result = fixture.manager().rename("worker", "reviewer").unwrap();
+    assert!(
+        result["herdr_steps"]
+            .as_str()
+            .unwrap()
+            .starts_with("skipped-recipient-changed"),
+        "{result}"
+    );
+    assert_eq!(journal_count(&fixture), 0);
+    assert!(registry(&fixture).join("reviewer").exists());
+    assert!(!registry(&fixture).join("worker").exists());
+}
+
+#[test]
+fn an_existing_duplicate_claim_refuses_input() {
+    let fixture = Fixture::new();
+    fixture.start(None);
+    write_claiming_record(&fixture, "other");
+    let error = send(&fixture, "worker", "must not reach a shared pane").expect_err("claimed");
+    assert_eq!(error.outcome(), Some(agent::QueueOutcome::Pending));
+    assert!(error.to_string().contains("also claims pane"), "{error}");
+}
+
+#[test]
+fn an_unreadable_record_refuses_input_conservatively() {
+    let fixture = Fixture::new();
+    fixture.start(None);
+    let broken = registry(&fixture).join("broken");
+    fs::create_dir(&broken).unwrap();
+    fs::write(broken.join("agent.json"), "{").unwrap();
+    let error = send(&fixture, "worker", "held until readable").expect_err("unreadable");
+    assert_eq!(error.outcome(), Some(agent::QueueOutcome::Pending));
+    assert!(
+        error
+            .to_string()
+            .contains("cannot prove that pane ownership is unique"),
+        "{error}"
+    );
+}
+
+#[test]
+fn rename_refuses_at_the_history_limit() {
+    let fixture = Fixture::new();
+    fixture.start(None);
+    let mut document = record(&fixture, "worker");
+    document["name_history"] = Value::Array(
+        (0..256)
+            .map(|index| json!({"name": "earlier", "renamed_at": 1.0, "journal_id": format!("{index:032x}")}))
+            .collect(),
+    );
+    write_record(&fixture, "worker", &document);
     let error = fixture
         .manager()
         .rename("worker", "reviewer")
-        .expect_err("replaced harness");
+        .expect_err("history full");
     assert!(
-        error.to_string().contains("anchored harness process"),
+        error.to_string().contains("the most a record keeps"),
         "{error}"
     );
-    assert_eq!(journal_count(&fixture), 1);
+    assert!(registry(&fixture).join("worker").exists());
 }
 
 #[test]

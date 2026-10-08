@@ -9,7 +9,7 @@ from typing import cast
 import pytest
 
 import agentctl.subagents as subagents
-from agentctl.client import AgentPaneInfo, Pane
+from agentctl.client import AgentPaneInfo, CustomProcessIdentity, HerdrClient, Pane, ProcessInfo
 from agentctl.errors import AgentDeliveryError, AgentPending, AgentPossiblySubmitted, HerdrUnavailable
 from agentctl.subagents import ManagedAgents
 
@@ -57,7 +57,7 @@ def test_harness_replaced_before_send_types_nothing_and_stays_pending(
 ) -> None:
     manager, fake, pane = _started(tmp_path, monkeypatch)
     fake.harness_pids[pane] = 999  # another program now runs in the same terminal
-    with pytest.raises(AgentPending, match="no longer the foreground"):
+    with pytest.raises(AgentPending, match="no longer a foreground process"):
         manager.send("worker", "for the original agent")
     assert "for the original agent" not in fake.submitted
 
@@ -346,16 +346,140 @@ def test_crash_between_publication_and_move_recovers_with_one_history_entry(
     assert [entry["name"] for entry in history] == ["old"]
 
 
-def test_recovery_refuses_a_replaced_harness(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_recovery_after_the_harness_exits_finishes_the_registry_and_leaves_the_pane_alone(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
     manager, fake, pane = _started(tmp_path, monkeypatch, "old")
+    tab = manager.get("old").tab_id or ""
+    real = fake.rename_tab
     monkeypatch.setattr(fake, "rename_tab", lambda tab, label: (_ for _ in ()).throw(
         HerdrUnavailable("simulated crash")))
     with pytest.raises(HerdrUnavailable):
         manager.rename("old", "new")
-    monkeypatch.undo()
-    fake.harness_pids[pane] = 999
-    with pytest.raises(AgentDeliveryError, match="anchored harness process"):
+    monkeypatch.setattr(fake, "rename_tab", real)
+    fake.infos[pane] = replace(fake.infos[pane], agent=None)  # back at the shell
+    result = manager.rename("old", "new")
+    assert str(result["herdr_steps"]).startswith("skipped-recipient-changed")
+    assert manager._directory("new").exists() and not manager._directory("old").exists()
+    assert fake.labels[tab] == "old"  # the pane's presentation is not changed
+    manager.start("old", cwd=str(tmp_path), harness="claude")  # both names usable again
+
+
+def test_existing_duplicate_claim_refuses_input(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager, _fake, pane = _started(tmp_path, monkeypatch)
+    manager.start("other", cwd=str(tmp_path), harness="claude")
+    other = manager.get("other")
+    other.pane_id = pane
+    manager._save(other)
+    with pytest.raises(AgentPending, match="also claims pane"):
+        manager.send("worker", "must not reach a shared pane")
+
+
+def test_unreadable_record_refuses_input_conservatively(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager, _fake, _pane = _started(tmp_path, monkeypatch)
+    broken = manager.registry / "broken"
+    broken.mkdir(mode=0o700)
+    (broken / "agent.json").write_text("{", encoding="utf-8")
+    with pytest.raises(AgentPending, match="cannot prove that pane ownership is unique"):
+        manager.send("worker", "held until the registry is readable")
+
+
+def test_session_change_refuses_input_even_with_a_matching_process(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager, fake, pane = _started(tmp_path, monkeypatch)
+    assert manager.get("worker").session_value is not None
+    fake.infos[pane] = replace(fake.infos[pane], session_value="another-conversation")
+    with pytest.raises(AgentPending, match="session"):
+        manager.send("worker", "hello")
+    assert "session-mismatch" in _findings(manager.doctor())["worker"]
+
+
+def test_transport_error_after_a_write_checks_the_recipient_and_recovers(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager, fake, pane = _started(tmp_path, monkeypatch)
+    real = fake.agent_prompt
+    calls = {"count": 0}
+
+    def accepted_then_lost(pane_id: str, text: str, *, expect_terminal: str | None = None) -> None:
+        calls["count"] += 1
+        real(pane_id, text, expect_terminal=expect_terminal)
+        if calls["count"] == 1:
+            fake.harness_pids[pane_id] = 999
+            raise HerdrUnavailable("connection reset after the write")
+
+    monkeypatch.setattr(fake, "agent_prompt", accepted_then_lost)
+    with pytest.raises(AgentPending):
+        manager.send("worker", "written before the transport failed")
+    [entry] = _misroutes(manager, "worker")
+    assert "outcome is unknown" in str(entry["detail"])
+    assert fake.keys_sent == [(pane, "esc")]
+
+
+def test_goal_confirmation_misroutes_are_translated_durably() -> None:
+    from agentctl import agent as delivery
+    from agentctl.errors import MisrouteRecovered, ProbableMisroute
+
+    class Client:
+        def __init__(self, error: Exception) -> None:
+            self.error = error
+
+        def prompt_agent(self, pane_id: str, text: str) -> None:
+            return None
+
+        def wait_agent_status(self, pane_id: str, status: str, timeout_ms: int) -> None:
+            raise self.error
+
+    info = AgentPaneInfo("w1:p1", "w1", "/", "codex", "idle", None, None)
+    with pytest.raises(delivery._Misrouted):
+        delivery._deliver_one(cast(HerdrClient, Client(MisrouteRecovered("x"))), info,
+                              "/goal y", working_timeout=1.0)
+    with pytest.raises(delivery._PossiblySubmitted) as caught:
+        delivery._deliver_one(cast(HerdrClient, Client(ProbableMisroute("x"))), info,
+                              "/goal y", working_timeout=1.0)
+    assert caught.value.misroute is True
+
+
+def test_anchor_migrates_a_nested_record_to_schema_1(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from .test_herdr_subagents import _nested_v2_record
+
+    manager, fake, pane = _started(tmp_path, monkeypatch)
+    path = manager.registry / "worker" / "agent.json"
+    flat = json.loads(path.read_text(encoding="utf-8"))
+    for key in ("terminal_id", "harness_identity", "name_history"):
+        flat.pop(key)
+    nested = _nested_v2_record(flat)
+    nested["session_agent"] = nested["session_value"] = None
+    path.write_text(json.dumps(nested), encoding="utf-8")
+    fake.infos[pane] = replace(fake.infos[pane], session_agent=None, session_value=None)
+    with pytest.raises(AgentPending, match="agentctl anchor worker"):
+        manager.send("worker", "queued until anchored")
+    result = manager.anchor("worker")
+    assert result["migrated_from"] == "agentctl-session/v2"
+    stored = json.loads(path.read_text(encoding="utf-8"))
+    assert stored["schema"] == 1 and stored["harness_identity"] is not None
+    manager.drain("worker")
+    assert fake.submitted[-1] == "queued until anchored"
+
+
+def test_rename_refuses_at_the_history_limit(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    manager, _fake, _pane = _started(tmp_path, monkeypatch, "old")
+    record = manager.get("old")
+    record.name_history = [
+        {"name": "earlier", "renamed_at": 1.0, "journal_id": f"{index:032x}"}
+        for index in range(256)
+    ]
+    manager._save(record)
+    with pytest.raises(AgentDeliveryError, match="the most a record keeps"):
         manager.rename("old", "new")
+    assert manager._directory("old").exists()
 
 
 def test_recovery_with_the_pane_gone_finishes_the_registry_only(
@@ -470,3 +594,28 @@ def test_doctor_reports_an_incomplete_rename(tmp_path: Path, monkeypatch: pytest
     assert report["journals"] == [{"old": "old", "new": "new"}]
     assert "rename-incomplete" in _findings(report)["old"]
     assert report["clean"] is False
+
+
+def test_harness_identity_pins_the_harness_not_a_wrapper(monkeypatch: pytest.MonkeyPatch) -> None:
+    def identity(pid: int) -> CustomProcessIdentity:
+        return CustomProcessIdentity(
+            version=1, boot_id="00000000-0000-0000-0000-000000000000",
+            pid=pid, starttime_ticks=pid, executable_device=1, executable_inode=pid,
+        )
+
+    foreground = [(200, "bash", "bash wrap.sh", "/bin/bash", None),
+                  (201, "claude", "claude --model x", "/usr/local/bin/claude", None)]
+
+    class Client(HerdrClient):
+        def process_info(self, pane_id: str) -> ProcessInfo:
+            return ProcessInfo(pane_id, 100, 200, tuple(foreground))
+
+    monkeypatch.setattr(HerdrClient, "_process_identity",
+                        staticmethod(lambda pid: (identity(pid), 200, "/x")))
+    monkeypatch.setattr(HerdrClient, "_process_executable", staticmethod(lambda pid: "/x"))
+    client = Client(herdr_bin="herdr")
+    pinned = client.harness_identity("w1:p1", "claude")
+    assert pinned is not None and pinned.pid == 201
+    assert client.verify_harness_identity("w1:p1", pinned)
+    foreground[1] = (202, "claude", "claude --model x", "/usr/local/bin/claude", None)
+    assert not client.verify_harness_identity("w1:p1", pinned)  # the wrapper survived; the harness did not
