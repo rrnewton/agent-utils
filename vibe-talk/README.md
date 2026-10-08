@@ -2718,7 +2718,8 @@ live stream, a post's answer and the pins — and sends it beside the text as `c
 
 1. The provider's own syntax is turned into Markdown first. Every provider's mention, `<@id>` or
    `<#id>`, becomes a chip showing the id; a `<https://…|label>` link from Google Chat or Slack
-   becomes a link named by its label, except inside code, where it is shown as written.
+   becomes a link named by its label — or, when the label is the address itself, a link whose
+   text is its address — except inside code, where it is shown as written.
 2. [comrak](https://github.com/kivikakk/comrak) parses GitHub-flavoured Markdown — tables,
    strikethrough, task lists, and bare `https://…` and `www.…` addresses as links — with chat's two
    line rules: a single newline is a line break, and only a blank line starts a paragraph. A line
@@ -2732,7 +2733,18 @@ live stream, a post's answer and the pins — and sends it beside the text as `c
 4. An image is drawn as a link to it, so no phone fetches it from wherever the message pointed. A
    link to anything but a well-formed `http` or `https` address is drawn as its text with the
    address after it, so the reader still sees what the message pointed at.
-5. Raw HTML written in a message is shown as the characters it is, and
+5. A link whose text is its own address — a bare address, `<https://…>`, or a chat service's
+   address labelled with itself — is drawn with a **short label** when it is a GitHub page that has
+   one (`#227 github-link-abbrev`): `widgets#123` for a pull request, an issue or a discussion,
+   `widgets#123 (comment)` for a comment in one, `widgets@4f21ab0` for a commit,
+   `widgets@v1.0...v1.1` for a comparison, `widgets@v1.2.0` for a release, `widgets run 123456`
+   for a run of Actions and `widgets:render.rs#L10` for lines of a file. The repository's owner is
+   left out. The link still goes to the same address, and a pointer resting on the label shows it.
+   A link its writer named keeps its name, code is never relabelled, and any other address — other
+   hosts, and GitHub pages with no short form — is drawn as written. Copy text and every voice still
+   have the address as it was written. The rules are a table in `src/link_labels.rs`, where another
+   host can be added.
+6. Raw HTML written in a message is shown as the characters it is, and
    [ammonia](https://github.com/rust-ammonia/ammonia) then keeps only a short allowlist of
    elements and attributes; see [Security](#security).
 
@@ -2837,7 +2849,8 @@ Pinned.
 
 **A message the server rendered lists the links it draws** — its anchors, by the names they are drawn
 with — so the Links view and the row never disagree about what is a link (`#217 markdown-blocks`;
-see [How message text is drawn](#how-message-text-is-drawn)). The rules below are for text no
+see [How message text is drawn](#how-message-text-is-drawn)). A GitHub address drawn with a short
+label is listed by that label (`#227 github-link-abbrev`); the kinds below still read its address. The rules below are for text no
 server rendered: a voice turn, a message being sent, a message saved before rendering existed.
 
 Only **http and https** addresses become links; `javascript:`, `data:` and anything without a scheme
@@ -4082,8 +4095,9 @@ makes it, not the voice agent, the real security boundary of the whole design.
 * **Channel text becomes markup in one place, on the server, through a sanitizer.** Message bodies
   are rendered by comrak and cut by ammonia to a short allowlist — paragraphs, lists, emphasis,
   code, quotes, four heading levels, tables, a mention chip, and links to `http`/`https` only,
-  each opening in a new tab with `noopener noreferrer nofollow`; no script, style, event handler,
-  `src`, `id` or `class` beyond the few listed. Raw HTML written in a message is shown as text.
+  each opening in a new tab with `noopener noreferrer nofollow`, and with a `title` only when it is
+  the address of a link drawn with a short label; no script, style, event handler, `src`, `id` or
+  `class` beyond the few listed. Raw HTML written in a message is shown as text.
   The page parses exactly one kind of string as HTML, a message's `content_html`, through an inert
   `<template>`; everything else it shows, message text included, goes in through `textContent`.
   The page suite holds that sink to one call site. Only this server writes `content_html`: a

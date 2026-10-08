@@ -486,6 +486,82 @@ async fn a_provider_configured_as_google_chat_reads_one_asterisk_as_bold() {
     );
 }
 
+/// The pull requests in the status line from `#227 github-link-abbrev`, with neutral names: each
+/// address and the label the page should show for it.
+const LANDED: [(&str, &str); 4] = [
+    ("https://github.com/octo/gizmo/pull/3871", "gizmo#3871"),
+    ("https://github.com/octo/gizmo/pull/3908", "gizmo#3908"),
+    ("https://github.com/octo/sprocket/pull/969", "sprocket#969"),
+    ("https://github.com/octo/sprocket/pull/974", "sprocket#974"),
+];
+
+/// That status line, as an agent writes it, with each address put in the shape `form` gives it.
+fn status_line(form: fn(&str) -> String) -> String {
+    let [a, b, c, d] = LANDED.map(|(address, _)| form(address));
+    format!(
+        "Landed (4): {a} (record of accept/accept4), {b} (fix the poll loop), {c} and {d} \
+         (bump the toolchain)"
+    )
+}
+
+#[tokio::test]
+async fn a_status_line_of_pull_request_addresses_reaches_the_page_as_short_links_in_every_markup() {
+    // The owner: "These PR URLs are annoying. … Just say REPO#123 as a hyperlink instead of the
+    // bare url." (`REPO` stands for the repository he named.) Every markup a provider may be
+    // configured with, and every form its text sends an address in: bare, in angle brackets, and
+    // the chat services' address labelled with itself.
+    let bare: fn(&str) -> String = str::to_owned;
+    let angled: fn(&str) -> String = |address| format!("<{address}>");
+    let labelled: fn(&str) -> String = |address| format!("<{address}|{address}>");
+    for (markup, forms) in [
+        (None, vec![bare, angled]),
+        (Some("google-chat"), vec![bare, angled, labelled]),
+        (Some("slack"), vec![bare, angled, labelled]),
+    ] {
+        let toml = match markup {
+            None => vibe_talk::testing::config_toml(),
+            Some(markup) => vibe_talk::testing::config_toml().replace(
+                "bot_token = \"test-bot-token\"",
+                &format!("bot_token = \"test-bot-token\"\nmarkup = \"{markup}\""),
+            ),
+        };
+        let (router, discord) = threaded(&toml);
+        let channel = ChannelId(WRITE_CHANNEL.to_owned());
+        let written: Vec<String> = forms.iter().map(|form| status_line(*form)).collect();
+        for text in &written {
+            discord.seed(&channel, "an agent", text);
+        }
+        let body = get_json(
+            &router,
+            &format!("/api/v1/channels/{WRITE_CHANNEL}/timeline?view=flat"),
+        )
+        .await;
+        for text in &written {
+            let message = with_text(&body, text);
+            let html = message["content_html"].as_str().expect("rendered");
+            for (address, label) in LANDED {
+                // The address exactly as written, twice — where it goes and what a hover says —
+                // and the short label as the only thing on the screen.
+                let link = format!(
+                    "<a href=\"{address}\" title=\"{address}\" target=\"_blank\" \
+                     rel=\"noopener noreferrer nofollow\">{label}</a>"
+                );
+                assert!(html.contains(&link), "{markup:?}: no {label} in {html}");
+            }
+            assert!(
+                !html.contains(">https://"),
+                "{markup:?}: an address is still on the screen: {html}"
+            );
+            assert!(
+                html.contains("</a> (record of accept/accept4), <a "),
+                "{markup:?}: the words between the links moved: {html}"
+            );
+            // The text the page copies and the voice falls back to is the message as written.
+            assert_eq!(message["content"], text.as_str());
+        }
+    }
+}
+
 /// A response's body length, and its `content-encoding`.
 async fn fetched(
     router: &axum::Router,

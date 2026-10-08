@@ -158,7 +158,10 @@ fn user_mention_at(text: &str) -> Option<&str> {
 /// been through [`to_markdown`] already and hold none of these, so this changes nothing for them.
 ///
 /// The address goes in angle brackets so that a parenthesis in it cannot end the link early, and
-/// a bracket in the label is escaped so that it cannot either.
+/// a bracket in the label is escaped so that it cannot either. A link whose label is its own
+/// address, `<https://x|https://x>`, becomes the address alone in angle brackets, which is what
+/// [`to_markdown`] makes of it too: to the renderer that is a link whose text is its address, so it
+/// may be drawn with a short label (`#227 github-link-abbrev`).
 ///
 /// A link that overlaps any of the byte ranges in `code` is left as written: the renderer passes
 /// the code spans and blocks comrak found, where the text is shown exactly as typed.
@@ -180,16 +183,22 @@ pub fn angle_links_outside<'t>(text: &'t str, code: &[Range<usize>]) -> Cow<'t, 
             continue;
         }
         out.push_str(&text[copied..at]);
-        out.push('[');
-        for character in label.chars() {
-            if matches!(character, '[' | ']' | '\\') {
-                out.push('\\');
+        if label == href {
+            out.push('<');
+            out.push_str(href);
+            out.push('>');
+        } else {
+            out.push('[');
+            for character in label.chars() {
+                if matches!(character, '[' | ']' | '\\') {
+                    out.push('\\');
+                }
+                out.push(character);
             }
-            out.push(character);
+            out.push_str("](<");
+            out.push_str(href);
+            out.push_str(">)");
         }
-        out.push_str("](<");
-        out.push_str(href);
-        out.push_str(">)");
         copied = at + length;
         from = copied;
     }
@@ -200,9 +209,8 @@ pub fn angle_links_outside<'t>(text: &'t str, code: &[Range<usize>]) -> Cow<'t, 
     Cow::Owned(out)
 }
 
-/// `<https://x|label>` at the start of `text`, with a label that is not empty and not the address
-/// itself, as its length, the address and the label. A bare `<https://x>` is already a CommonMark
-/// autolink and is left alone.
+/// `<https://x|label>` at the start of `text`, with a label that is not empty, as its length, the
+/// address and the label. A bare `<https://x>` is already a CommonMark autolink and is left alone.
 ///
 /// The search for the closing bracket stops at the next `<` too, because an address or a label
 /// holding one is not a link. That is also what keeps a whole message linear: the next search
@@ -222,7 +230,7 @@ fn angle_link_at(text: &str) -> Option<(usize, &str, &str)> {
         return None;
     }
     let label = label.trim();
-    (!label.is_empty() && label != href).then_some((inner.len() + 2, href, label))
+    (!label.is_empty()).then_some((inner.len() + 2, href, label))
 }
 
 #[cfg(test)]
@@ -253,7 +261,6 @@ mod tests {
             "no links",
             "<https://example.com>",
             "<https://example.com|>",
-            "<https://example.com|https://example.com>",
             "<javascript:alert(1)|click>",
             "<https://a b|label>",
             "<https://a|label",
@@ -262,6 +269,25 @@ mod tests {
         ] {
             assert_eq!(angle_links(text), text, "{text:?} was rewritten");
         }
+    }
+
+    #[test]
+    fn a_link_labelled_with_its_own_address_is_the_address_alone() {
+        // `#227 github-link-abbrev`: as `to_markdown` reads it, so the renderer sees a link whose
+        // text is its address — and the address's own `|` can no longer hide it.
+        assert_eq!(
+            angle_links("see <https://example.com/a|https://example.com/a>, <https://b.test|b>"),
+            "see <https://example.com/a>, [b](<https://b.test>)"
+        );
+        assert_eq!(
+            super::to_markdown("<https://example.com/a|https://example.com/a>"),
+            "https://example.com/a"
+        );
+        // A label that differs from the address at all, even by its scheme, is a name.
+        assert_eq!(
+            angle_links("<https://example.com|example.com>"),
+            "[example.com](<https://example.com>)"
+        );
     }
 
     #[test]

@@ -46,6 +46,7 @@ pub mod directory;
 pub mod discord;
 pub mod elevenlabs;
 pub mod http;
+pub mod link_labels;
 pub mod live;
 pub mod mcp;
 pub mod model;

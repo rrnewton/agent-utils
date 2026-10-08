@@ -808,10 +808,12 @@ class FakeElement {
 
 /**
  * The attributes the server's sanitizer leaves on each element it keeps (src/render.rs,
- * `SANITIZER`), and the values it allows where it restricts them. Anything else is refused.
+ * `SANITIZER`), and the values it allows where it restricts them. Anything else is refused. A
+ * link's `title` is the address of a link the server gave a short label
+ * (`#227 github-link-abbrev`).
  */
 const SANITIZED_ATTRIBUTES = new Map([
-  ["a", new Set(["href", "target", "rel"])],
+  ["a", new Set(["href", "title", "target", "rel"])],
   ["ol", new Set(["start", "class"])],
   ["ul", new Set(["class"])],
   ["li", new Set(["class"])],
@@ -10232,6 +10234,31 @@ test("the Links view lists the links a rendered row draws, by the names it draws
   await showLinks(page);
   assert.deepStrictEqual(linkPairs(rows[0]),
     [["the doc", "https://example.com/doc"], ["https://example.com/raw", "https://example.com/raw"]]);
+});
+
+test("a GitHub address the server drew with a short label is listed by that label, and its kind is still its address's", async () => {
+  // `#227 github-link-abbrev`. The label is the server's (src/link_labels.rs), and the page reads it
+  // from the anchor the server drew, as it reads a Markdown link's name: there are no rules for it
+  // here to drift from the server's. What a link IS — the PRs, Commits and Actions toggles — is
+  // still read from where it goes.
+  const page = newPage();
+  await signIn(page);
+  const pull = "https://github.com/octo/widgets/pull/12";
+  const doc = "https://example.com/design";
+  const rows = await showDiscord(page, [message({
+    id: "7100000000000000010",
+    content: `landed ${pull}, see ${doc}`,
+    content_html: `<p>landed <a href="${pull}" title="${pull}" ${LINK_ATTRS}>widgets#12</a>, see ` +
+      `<a href="${doc}" ${LINK_ATTRS}>${doc}</a></p>\n`,
+  })]);
+  const [link] = tagged(mdBoxes(rows[0])[0], "a");
+  assert.equal(link.text(), "widgets#12");
+  assert.equal(link.getAttribute("href"), pull, "the label moved the link");
+  assert.equal(link.getAttribute("title"), pull, "a pointer resting on the label is not told the address");
+  await showLinks(page);
+  assert.deepStrictEqual(linkPairs(rows[0]), [["widgets#12", pull], [doc, doc]]);
+  await tapKind(page, "pr");
+  assert.deepStrictEqual(linkPairs(rows[0]), [[doc, doc]], "the PRs toggle read the label rather than the address");
 });
 
 test("the fold measures what a row draws, and Copy text still copies what was written", async () => {

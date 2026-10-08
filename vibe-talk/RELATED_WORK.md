@@ -5,6 +5,24 @@ source code, vendor documentation, and package metadata. Where a claim rests on 
 file is cited; where it rests on vendor documentation, the doc page is linked; claims that could not
 be confirmed are marked **unverified** and are never used to carry a conclusion.
 
+## Short labels for repository links (2026-10-08)
+
+`#227 github-link-abbrev` draws a link whose text is its own GitHub address with a short label,
+`widgets#123` rather than the address. The convention is GitHub's own:
+[autolinked references](https://docs.github.com/en/get-started/writing-on-github/working-with-advanced-formatting/autolinked-references-and-urls)
+shortens an issue or pull request address to `OWNER/REPO#N` (or `#N` within the same repository),
+a commit to `OWNER/REPO@SHA` with the hash cut short, and a comment's address to the same with
+`(comment)` after it. The labels here follow those forms and differ in one respect, at the owner's
+request: the repository's owner is left out, because in a status line that names a dozen pull
+requests the owner is the same dozen times. A label's address stays the link's address, and the
+full address is the link's hover text. GitHub's forms cover only issues, pull requests and commits;
+the labels for comparisons, releases, runs and files here have no upstream convention to follow,
+and an address of any other shape is left as written.
+
+GitHub leaves an address inside code as written, and so does this server, for the reason that it
+relabels only what the parser made a link: the labels are written onto comrak's parsed tree
+(`src/render.rs`), never by a pattern over the source, and code holds no links.
+
 ## Rendering message Markdown on the server (2026-10-08)
 
 `#217 markdown-blocks` replaced the page's own hundred-line Markdown renderer with rendering on

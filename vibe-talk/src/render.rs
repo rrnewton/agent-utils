@@ -22,13 +22,16 @@
 //! 2. comrak parses GFM — tables, strikethrough, task lists, bare-URL autolinks — with chat's two
 //!    line rules: a single newline is a line break, and a blank line separates paragraphs.
 //! 3. The parsed tree is adjusted ([`adjust`]): mentions become chips, an image becomes a link to
-//!    it, a deep heading is held at the fourth level, and where the service writes bold with one
-//!    asterisk, an asterisk emphasis is bold.
+//!    it, a deep heading is held at the fourth level, where the service writes bold with one
+//!    asterisk, an asterisk emphasis is bold, and a link whose text is its own address is drawn
+//!    with a short label made from it, `widgets#123` (`#227 github-link-abbrev`, see
+//!    [`crate::link_labels`]).
 //! 4. comrak writes HTML with raw HTML in the SOURCE escaped: it is shown as the characters it is,
 //!    as every chat client shows it, so the only markup in the output is markup comrak made.
 //! 5. ammonia keeps exactly [`TAGS`] and the attributes listed in [`SANITIZER`], and drops the
 //!    rest. A link keeps its address only when that is `http` or `https`, and every link opens in
-//!    a new tab with `noopener noreferrer nofollow`.
+//!    a new tab with `noopener noreferrer nofollow`. A link may keep a `title`, which step 3
+//!    writes only onto a link it gave a short label, as the address beneath it.
 //!
 //! Step 5 is the boundary. Steps 1 to 4 decide what the message LOOKS like, and none of them is
 //! trusted to keep anything out: a mistake there is a rendering bug, never an injection.
@@ -437,7 +440,12 @@ pub const MENTION_CLASS: &str = "mention";
 /// The sanitizer, built once.
 ///
 /// From [`ammonia::Builder::empty`], so nothing is allowed that is not named here: no generic
-/// attributes (not even `title` or `lang`), no `style`, no `id`, no event handler, no `src`.
+/// attributes (not even `lang`), no `style`, no `id`, no event handler, no `src`.
+///
+/// A link's `title` is plain text the browser shows on hover, never a URL it loads, and the
+/// sanitizer's serializer escapes it as it does any attribute. [`adjust`] clears every title a
+/// message wrote and writes one only onto a link it gave a short label: the address the link goes
+/// to, so the hover can never claim an address the link does not have. `#227 github-link-abbrev`.
 static SANITIZER: LazyLock<ammonia::Builder<'static>> = LazyLock::new(|| {
     let alignment = || HashMap::from([("align", HashSet::from(["left", "center", "right"]))]);
     let mut builder = ammonia::Builder::empty();
@@ -445,7 +453,7 @@ static SANITIZER: LazyLock<ammonia::Builder<'static>> = LazyLock::new(|| {
         .tags(HashSet::from(TAGS))
         .generic_attributes(HashSet::new())
         .tag_attributes(HashMap::from([
-            ("a", HashSet::from(["href"])),
+            ("a", HashSet::from(["href", "title"])),
             ("ol", HashSet::from(["start"])),
             ("input", HashSet::from(["checked"])),
         ]))
@@ -547,6 +555,10 @@ fn adjust<'a>(arena: &'a Arena<'a>, root: &'a AstNode<'a>, source: &str, markup:
                 drop(ast);
                 unwrap_link(arena, node, url);
             }
+            NodeValue::Link(_) => {
+                drop(ast);
+                label_link(node);
+            }
             NodeValue::Text(text) => {
                 let pieces = mention_pieces(text);
                 drop(ast);
@@ -599,6 +611,50 @@ fn unwrap_link<'a>(arena: &'a Arena<'a>, node: &'a AstNode<'a>, url: String) {
         node.insert_before(arena.alloc(NodeValue::Text(format!(" ({url})").into()).into()));
     }
     node.detach();
+}
+
+/// Give a link whose visible text is its own address a short label, when
+/// [`crate::link_labels`] has one for it, and the address as its `title`. `#227
+/// github-link-abbrev`.
+///
+/// ON THE PARSED TREE, never the source, so what is a link is comrak's answer: a bare address, an
+/// address in angle brackets, and the chat services' `<address|address>` once [`Markup::prepare`]
+/// has made that a link. Code is never a link, so no code is ever relabelled. A link its writer
+/// named keeps the name — the label replaces only text that said nothing but where the link goes —
+/// and `www.example` is its own address as much as `http://www.example` is.
+///
+/// Every other link loses any title the message gave it, as it always has: the sanitizer keeps a
+/// link's title now, and the only one it may keep is the one written here.
+fn label_link<'a>(node: &'a AstNode<'a>) {
+    let mut ast = node.data.borrow_mut();
+    let NodeValue::Link(link) = &mut ast.value else {
+        return;
+    };
+    link.title.clear();
+    let mut shown = String::new();
+    for kid in node.children() {
+        match &kid.data.borrow().value {
+            NodeValue::Text(text) => shown.push_str(text),
+            _ => return,
+        }
+    }
+    let address = crate::link_labels::strip_scheme(&link.url).unwrap_or(&link.url);
+    if shown.is_empty() || crate::link_labels::strip_scheme(&shown).unwrap_or(&shown) != address {
+        return;
+    }
+    let Some(label) = crate::link_labels::short_label(&link.url) else {
+        return;
+    };
+    link.title = link.url.clone();
+    drop(ast);
+    // In place, so the walk in [`adjust`] that visits this text next finds it where it was.
+    let kids: Vec<_> = node.children().collect();
+    if let Some((first, rest)) = kids.split_first() {
+        first.data.borrow_mut().value = NodeValue::Text(label.into());
+        for kid in rest {
+            kid.detach();
+        }
+    }
 }
 
 /// Join runs of adjacent text nodes, so a mention split across two of them is still one.
@@ -1255,6 +1311,257 @@ mod tests {
             html("__init__.py"),
             "<p><strong>init</strong>.py</p>\n",
             "Discord keeps CommonMark's reading"
+        );
+    }
+
+    // --- short labels for links whose text is their address: `#227 github-link-abbrev` -------
+
+    /// A neutral repository every GitHub address below is in.
+    const REPO: &str = "https://github.com/octo/widgets";
+
+    /// The anchor a link to `href` is drawn as when it was given the short label `label`.
+    fn short(href: &str, label: &str) -> String {
+        format!("<a href=\"{href}\" title=\"{href}\" {LINK}>{label}</a>")
+    }
+
+    /// The anchor a link to `href` is drawn as with its text as written.
+    fn anchor(href: &str, text: &str) -> String {
+        format!("<a href=\"{href}\" {LINK}>{text}</a>")
+    }
+
+    #[test]
+    fn a_bare_github_address_is_drawn_with_its_short_label_and_goes_where_it_went() {
+        let pull = format!("{REPO}/pull/12");
+        assert_eq!(
+            html(&format!("landed {pull} today")),
+            format!("<p>landed {} today</p>\n", short(&pull, "widgets#12"))
+        );
+        // Every way a link's text can be its own address: in angle brackets, `www.` without a
+        // scheme, written out as a Markdown link's name, or without its scheme as one.
+        for text in [
+            format!("<{pull}>"),
+            format!("[{pull}]({pull})"),
+            format!("[github.com/octo/widgets/pull/12]({pull})"),
+            format!("[HTTP://github.com/octo/widgets/pull/12]({pull})"),
+        ] {
+            assert_eq!(
+                html(&text),
+                format!("<p>{}</p>\n", short(&pull, "widgets#12")),
+                "{text:?}"
+            );
+        }
+        let www = "http://www.github.com/octo/widgets/issues/7";
+        assert_eq!(
+            html("www.github.com/octo/widgets/issues/7"),
+            format!("<p>{}</p>\n", short(www, "widgets#7"))
+        );
+    }
+
+    #[test]
+    fn each_kind_of_github_page_has_its_label_in_a_rendered_body() {
+        // The rules are `link_labels`'s and tested there; here, that every shape reaches the page.
+        let sha = "4f21ab0c9d8e7f6a5b4c3d2e1f0a9b8c7d6e5f4a";
+        for (path, label) in [
+            ("/pull/12", "widgets#12"),
+            ("/issues/7", "widgets#7"),
+            ("/discussions/3", "widgets#3"),
+            ("/pull/12#issuecomment-1234", "widgets#12 (comment)"),
+            ("/pull/12#discussion_r99", "widgets#12 (comment)"),
+            ("/pull/12#pullrequestreview-5", "widgets#12 (review)"),
+            ("/pull/12/files", "widgets#12 (files)"),
+            ("/pull/12/commits", "widgets#12 (commits)"),
+            ("/pull/12/checks", "widgets#12 (checks)"),
+            (&format!("/commit/{sha}"), "widgets@4f21ab0"),
+            (&format!("/pull/12/commits/{sha}"), "widgets@4f21ab0"),
+            (&format!("/compare/v1.0...{sha}"), "widgets@v1.0...4f21ab0"),
+            ("/releases/tag/v1.2.0", "widgets@v1.2.0"),
+            ("/tree/main", "widgets@main"),
+            ("/actions/runs/123456", "widgets run 123456"),
+            ("/actions/runs/123456/job/789", "widgets run 123456 (job)"),
+            (
+                "/blob/main/src/render.rs#L10-L20",
+                "widgets:render.rs#L10-L20",
+            ),
+        ] {
+            let href = format!("{REPO}{path}");
+            assert_eq!(
+                html(&href),
+                format!("<p>{}</p>\n", short(&href, label)),
+                "{path}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_named_link_another_host_and_an_unknown_page_keep_their_text() {
+        let pull = format!("{REPO}/pull/12");
+        // Named by its writer: the name stays, and so does nothing else — not even a title the
+        // Markdown gave it, which the sanitizer would keep now.
+        assert_eq!(
+            html(&format!(
+                "[the fix]({pull}) and [the fix]({pull} \"hover\")"
+            )),
+            format!(
+                "<p>{} and {}</p>\n",
+                anchor(&pull, "the fix"),
+                anchor(&pull, "the fix")
+            )
+        );
+        // Text that is an address, over a DIFFERENT address, is a name too.
+        let other = format!("{REPO}/pull/13");
+        assert_eq!(
+            html(&format!(
+                "[{pull}]({other}) [{pull}](https://example.com/x)"
+            )),
+            format!(
+                "<p>{} {}</p>\n",
+                anchor(&other, &pull),
+                anchor("https://example.com/x", &pull)
+            )
+        );
+        // Formatted text is not the address alone.
+        assert_eq!(
+            html(&format!("[**{pull}**]({pull})")),
+            format!("<p><a href=\"{pull}\" {LINK}><strong>{pull}</strong></a></p>\n")
+        );
+        // Another host, a repository's own page, and a page with no short form.
+        for href in [
+            "https://example.com/octo/widgets/pull/12".to_owned(),
+            "https://gitlab.example.com/octo/widgets/-/merge_requests/4".to_owned(),
+            REPO.to_owned(),
+            format!("{REPO}/wiki/Home"),
+            format!("{REPO}/tree/main/docs"),
+            format!("{REPO}/pull/12?notification_referrer_id=abc"),
+        ] {
+            assert_eq!(
+                html(&href),
+                format!("<p>{}</p>\n", anchor(&href, &href)),
+                "{href}"
+            );
+        }
+        // An image's title goes with every other title a message writes.
+        assert_eq!(
+            html(&format!("![shot]({pull} \"t\")")),
+            format!("<p>{}</p>\n", anchor(&pull, "shot"))
+        );
+    }
+
+    #[test]
+    fn an_address_in_code_is_never_a_link_and_never_relabelled() {
+        let pull = format!("{REPO}/pull/12");
+        assert_eq!(
+            html(&format!("`{pull}` and `<{pull}>`\n```\n{pull}\n```")),
+            format!(
+                "<p><code>{pull}</code> and <code>&lt;{pull}&gt;</code></p>\n\
+                 <pre><code>{pull}\n</code></pre>\n"
+            )
+        );
+        for markup in [Markup::GoogleChat, Markup::Slack] {
+            assert_eq!(
+                to_html(&format!("`<{pull}|{pull}>`"), markup),
+                format!("<p><code>&lt;{pull}|{pull}&gt;</code></p>\n"),
+                "{markup:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn punctuation_next_to_an_address_stays_outside_its_label() {
+        let pull = format!("{REPO}/pull/12");
+        let link = short(&pull, "widgets#12");
+        for (text, expected) in [
+            (format!("({pull})"), format!("({link})")),
+            (format!("see {pull}."), format!("see {link}.")),
+            (format!("{pull}, {pull}!"), format!("{link}, {link}!")),
+            (format!("\"{pull}\"?"), format!("\"{link}\"?")),
+            (format!("({pull}).",), format!("({link}).")),
+            (format!("**{pull}**"), format!("<strong>{link}</strong>")),
+        ] {
+            assert_eq!(html(&text), format!("<p>{expected}</p>\n"), "{text:?}");
+        }
+    }
+
+    #[test]
+    fn every_markup_shortens_the_forms_it_writes_an_address_in() {
+        let pull = format!("{REPO}/pull/12");
+        let link = format!("<p>{}</p>\n", short(&pull, "widgets#12"));
+        for markup in [Markup::Discord, Markup::GoogleChat, Markup::Slack] {
+            for text in [pull.clone(), format!("<{pull}>")] {
+                assert_eq!(to_html(&text, markup), link, "{markup:?} {text:?}");
+            }
+        }
+        // The chat services' `<address|address>`, and their `<address|name>`, which is a name.
+        for markup in [Markup::GoogleChat, Markup::Slack] {
+            assert_eq!(
+                to_html(&format!("<{pull}|{pull}>"), markup),
+                link,
+                "{markup:?}"
+            );
+            assert_eq!(
+                to_html(&format!("<{pull}|the fix>"), markup),
+                format!("<p>{}</p>\n", anchor(&pull, "the fix")),
+                "{markup:?}"
+            );
+        }
+        // A Slack provider's bodies have been through its reader first: `<address>`, the address
+        // as its own label, and the label Slack writes for an address typed without a scheme.
+        for written in [
+            format!("<{pull}>"),
+            format!("<{pull}|{pull}>"),
+            format!("<{pull}|github.com/octo/widgets/pull/12>"),
+        ] {
+            let read = crate::slack::mrkdwn::to_markdown(&written);
+            assert_eq!(to_html(&read, Markup::Slack), link, "{written:?}");
+        }
+    }
+
+    #[test]
+    fn a_status_line_of_addresses_reads_as_short_references() {
+        // The shape of the message in `#227 github-link-abbrev`, with neutral names: a count, then
+        // addresses, each followed by what it was, two of them joined by "and".
+        let [a, b, c, d] = [
+            "https://github.com/octo/gizmo/pull/3871",
+            "https://github.com/octo/gizmo/pull/3908",
+            "https://github.com/octo/sprocket/pull/969",
+            "https://github.com/octo/sprocket/pull/974",
+        ];
+        let text = format!(
+            "Landed (4): {a} (record of accept/accept4), {b} (fix the poll loop), {c} and {d} \
+             (bump the toolchain)"
+        );
+        assert_eq!(
+            html(&text),
+            format!(
+                "<p>Landed (4): {} (record of accept/accept4), {} (fix the poll loop), {} and {} \
+                 (bump the toolchain)</p>\n",
+                short(a, "gizmo#3871"),
+                short(b, "gizmo#3908"),
+                short(c, "sprocket#969"),
+                short(d, "sprocket#974")
+            )
+        );
+    }
+
+    #[test]
+    fn a_body_of_nothing_but_github_addresses_still_renders_within_its_bounds() {
+        let addresses: String = (1..=300)
+            .map(|n| format!("- https://github.com/octo/widgets/pull/{n}\n"))
+            .collect();
+        let html = body_html(&addresses, Markup::Discord);
+        assert_eq!(html.matches("title=").count(), 300, "{}", &html[..200]);
+        assert!(html.contains(">widgets#300</a>"));
+        assert!(html.len() <= addresses.len() * MAX_GROWTH + GROWTH_ALLOWANCE);
+    }
+
+    #[test]
+    fn the_sanitizer_keeps_a_links_title_and_no_other_elements() {
+        assert_eq!(
+            SANITIZER
+                .clean("<a href=\"https://ok.test/\" title=\"a &quot;b&quot; <c>\">x</a><p title=\"t\">y</p>")
+                .to_string(),
+            format!(
+                "<a href=\"https://ok.test/\" title=\"a &quot;b&quot; &lt;c&gt;\" {LINK}>x</a><p>y</p>"
+            )
         );
     }
 }
