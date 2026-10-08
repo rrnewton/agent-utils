@@ -268,6 +268,7 @@ impl FakeDiscord {
             // Empty, and for the stronger form of the same reason: a fake that pre-filled the
             // spoken body would let every test pass with the preparation gone.
             spoken_content: String::new(),
+            content_html: String::new(),
             noise: false,
             // Seeding an ordinary message. `seed_reply` is how a fixture makes one that answers
             // another, and it is a separate call so that "this is a reply" is always something a

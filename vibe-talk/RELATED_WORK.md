@@ -5,6 +5,39 @@ source code, vendor documentation, and package metadata. Where a claim rests on 
 file is cited; where it rests on vendor documentation, the doc page is linked; claims that could not
 be confirmed are marked **unverified** and are never used to carry a conclusion.
 
+## Rendering message Markdown on the server (2026-10-08)
+
+`#217 markdown-blocks` replaced the page's own hundred-line Markdown renderer with rendering on
+the server, the arrangement public forges with their own servers use: the server owns one
+renderer and one sanitizer, and the browser inserts sanitized HTML.
+[crates.io](https://github.com/rust-lang/crates.io/tree/main/crates/crates_io_markdown) renders
+README files with comrak and sanitizes them with ammonia; GitHub renders with its fork of cmark,
+[cmark-gfm](https://github.com/github/cmark-gfm), and sanitizes the result before it reaches the
+page. Chat messages need the same GitHub-flavoured extensions those READMEs do — above all bare
+addresses as links, which chat is full of.
+
+Three maintained Rust CommonMark parsers were compared:
+
+* [comrak](https://github.com/kivikakk/comrak) is a port of cmark-gfm. It implements every GFM
+  extension, including the extended autolinks, has a hard-line-break option for chat's
+  one-newline-one-break rule and an option to escape rather than pass raw HTML, and exposes the
+  parsed tree for adjustment before it is written. That last property is what lets the provider
+  dialects here — mention chips, one-asterisk bold for Google Chat and Slack, images as links — be
+  small edits to a parsed tree instead of a second parser. Chosen; 0.55, because 0.56 raised its
+  minimum Rust above this crate's.
+* [pulldown-cmark](https://github.com/pulldown-cmark/pulldown-cmark) is a fast pull parser with GFM
+  tables, strikethrough and task lists, but it does not implement GFM's extended autolinks, so a
+  bare `https://…` stays text — the most common link form in chat.
+* [markdown-rs](https://github.com/wooorm/markdown-rs) implements GFM including autolink literals and
+  can produce a syntax tree, but its HTML is written from its own events: there is no way to adjust
+  the tree and then write that tree as HTML.
+
+For sanitizing, [ammonia](https://github.com/rust-ammonia/ammonia) is an allowlist sanitizer built
+on html5ever, the HTML5 parser from Servo, so it parses its input the way a browser would before
+deciding what survives. The client-side alternative,
+[DOMPurify](https://github.com/cure53/DOMPurify), would have meant shipping a renderer and a
+sanitizer to every phone and keeping the page dependency-free no longer.
+
 ## Device speech for individual messages (2026-09-19)
 
 Reading a selected message does not require a conversational agent. Chromium's implementation of

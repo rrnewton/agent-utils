@@ -619,6 +619,11 @@ pub struct Pin {
     /// When it was pinned, in milliseconds since the Unix epoch, by this server's clock. The order
     /// the bound drops pins in.
     pub pinned_at_ms: i64,
+    /// The snapshot's text as the page draws it, rendered and sanitized when the pin is SERVED,
+    /// never stored. It follows [`crate::model::Message::content_html`]'s convention: empty means
+    /// "draw the text as plain paragraphs". `#217 markdown-blocks`.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub content_html: String,
 }
 
 /// A channel's pins, and the revision they are at.

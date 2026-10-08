@@ -2087,8 +2087,8 @@ const TRAILING = new Set([".", ",", ";", ":", "!", "?", "'", "\"", "*", "_", "~"
 
 /**
  * The longest Markdown name, and the longest target, read before deciding a bracket opens no link.
- * Bounded for the reason `INLINE` is: every `[` asks for its closing `]`, and a long line of
- * brackets that never close would otherwise be read to its end once per bracket.
+ * Bounded because every `[` asks for its closing `]`, and a long line of brackets that never close
+ * would otherwise be read to its end once per bracket.
  */
 const LINK_NAME_MAX = 500;
 const LINK_TARGET_MAX = 4096;
@@ -2243,12 +2243,23 @@ function linksIn(text) {
   return links;
 }
 
-/** The texts a row's links are read from: every message a channel row stands for, or a turn's. */
-function rowLinkSources(row) {
-  if (row.messages) {
-    return row.messages.map((m) => String(m.content === null || m.content === undefined ? "" : m.content));
-  }
-  return typeof row.linkText === "string" ? [row.linkText] : [];
+/**
+ * The links each part of a row holds: every message a channel row stands for, or a turn's text.
+ *
+ * `#217 markdown-blocks`. A message the server rendered holds the links it DRAWS — its anchors, a
+ * Markdown link by its name, a bare address as the renderer recognised it — so the Links view and
+ * the row agree about what is a link. Text that no server rendered, a voice turn's or an old saved
+ * message's, is read for links as it always was.
+ */
+function rowLinkParts(row) {
+  if (row.messages) return row.messages.map(messageLinks);
+  return typeof row.linkText === "string" ? [linksIn(row.linkText)] : [];
+}
+
+/** What a row's links are read from, as one value: when it changes, they are read again. */
+function rowLinkKey(row) {
+  if (row.messages) return row.messages.map((m) => renderedHtmlOf(m) || rawTextOf(m)).join("\u0000");
+  return typeof row.linkText === "string" ? row.linkText : "";
 }
 
 /**
@@ -2262,7 +2273,7 @@ function rowLinkSources(row) {
  */
 function rowLinks(row) {
   const byAddress = new Map();
-  for (const link of rowLinkSources(row).flatMap(linksIn)) {
+  for (const link of rowLinkParts(row).flat()) {
     const held = byAddress.get(link.href);
     if (!held) {
       byAddress.set(link.href, { ...link, kind: linkKind(link.href) });
@@ -2324,7 +2335,7 @@ function placeAfterBody(row, node) {
  * hidden kinds answers none, as a row with no link does.
  */
 function showRowLinks(row) {
-  const key = rowLinkSources(row).join("\u0000");
+  const key = rowLinkKey(row);
   let drawn = row.linkView;
   if (!drawn || drawn.key !== key) {
     if (drawn && drawn.node && drawn.node.parentNode === row) row.removeChild(drawn.node);
@@ -8304,7 +8315,8 @@ function threadName(choice, chars = THREAD_TITLE_CHARS) {
   const named = summary && typeof summary.display_name === "string" ? summary.display_name : "";
   const title = summary && typeof summary.title === "string" && summary.title.trim() !== "Thread"
     ? summary.title : "";
-  for (const source of [named, title, choice && choice.root ? choice.root.content : ""]) {
+  // The first message by what it SAYS, so a root that opens with `**Plan**` is named "Plan".
+  for (const source of [named, title, choice && choice.root ? messageText(choice.root) : ""]) {
     const name = firstLineOf(source, chars);
     if (name) return name;
   }
@@ -9403,10 +9415,17 @@ function renderOutgoingMessages() {
     }
     const body = document.createElement("div");
     body.className = "msg-text";
-    const text = entry.state === "sent" && unseen.length
-      ? unseen.map((part) => part.content).join("\n\n")
+    const acknowledged = entry.state === "sent" && unseen.length > 0;
+    const text = acknowledged
+      ? unseen.map(rawTextOf).join("\n\n")
       : entry.postedCount ? entry.remaining : entry.text;
-    renderMarkdownInto(body, text);
+    // The parts the server acknowledged are drawn as it rendered them; text still on its way is
+    // the reader's own draft, drawn as plain paragraphs until a read brings it back rendered.
+    if (acknowledged) {
+      renderBodyInto(body, unseen);
+    } else {
+      body.append(textBody(text));
+    }
     const status = document.createElement("div");
     status.className = "outgoing-status";
     status.setAttribute("role", "status");
@@ -9922,72 +9941,93 @@ async function sendChannelMessage() {
   await completion;
 }
 
-// --- raw Discord, rendered ------------------------------------------------------------------
+// --- message text, as the server rendered it ------------------------------------------------
 //
 // The value of this view is being able to point at a specific real message — the agent has
 // described messages that did not exist. So every line carries its author and its message id.
 //
-// Channel text is third-party data written by whoever is in the channel. NOTHING below turns it
-// into markup: there is no innerHTML, no insertAdjacentHTML, no template string that becomes a
-// document. Every fragment of a message becomes an element created HERE whose text is assigned
-// with textContent, which is escaping by construction rather than escaping by remembering. The
-// markdown subset is deliberately small, and the only sink that is not plain text — a link's href —
-// is scheme-checked before anything is written to it.
-
-/** Only these become clickable. Everything else is shown as the text it is. */
-const SAFE_LINK = /^https?:\/\//i;
-
-/**
- * One inline construct.
- *
- * Groups, in the order they are tried: code span, bold, strikethrough, italic (asterisk), italic
- * (underscore), link, user mention, channel mention. Code is first so that backticked text is
- * taken verbatim; a construct is not parsed across a line break.
- *
- * AN UNDERSCORE INSIDE A WORD IS TEXT. `#200 reply-context`: `ABC_E2E_DEF` was drawn as "ABC",
- * an italic "E2E" and "DEF", two underscores gone, and a snake_case feature name inside an
- * attribute lost its underscores the same way. CommonMark's rule for `_`, which `*` does not
- * share: it opens emphasis only where no letter or digit comes before it, and closes only where
- * none comes after. The pattern holds the closing half: it passes over a closer with a letter, a
- * digit or an underscore after it, so `_snake_case_` is one emphasis. `underscoreEmphasis` holds
- * the opening half: in the pattern it would be a lookbehind, which Safari before 16.4 does not
- * compile, and a pattern that does not compile stops the whole page. Neither half may touch a
- * space or a second underscore, so `__init__.py` is text: a doubled underscore is no construct
- * here. `*` keeps emphasising inside a word, as CommonMark allows. A combining mark counts as part
- * of the letter it sits on, so a decomposed accent before an underscore keeps it inside the word.
- *
- * A CLOSER BELONGS TO THE NEAREST OPENER BEFORE IT, as in CommonMark. The emphasised text may not
- * pass an underscore that could open one itself — one after a space or punctuation, before
- * something that is not a space — so in "call _private_helper then _really_ do it" only
- * "really" is emphasised, rather than everything from "private" with a stray underscore inside.
- *
- * AND IT REACHES AT MOST 255 CHARACTERS. Each underscore makes the pattern look ahead for its
- * closer, and the opening check only runs once one is found, so an underscore that cannot close
- * — every one in a long run of identifiers — used to read to the end of its line. That is the
- * line's length once per underscore. Measured on one line of `a_a_a…` in Node: 0.2s at 20,000
- * characters, 0.8s at 40,000, which is the longest message Slack allows, and 4.7s at 100,000, on
- * the page's one thread and again on every refresh that redraws the row. Bounded, each underscore
- * costs at most the bound (40,000 characters take 25ms), and an emphasis longer than that is shown
- * as the text it was written as.
- */
-const INLINE =
-  /`([^`\n]+)`|\*\*([^*\n]+)\*\*|~~([^~\n]+)~~|\*([^*\n]+)\*|_(?![\s_])((?:[\p{L}\p{M}\p{N}_]|[^\p{L}\p{M}\p{N}_\n](?!_[^\s_])){0,254}?[^\s_])_(?![\p{L}\p{M}\p{N}_])|\[([^\]\n]*)\]\(([^)\s]*)\)|<@!?(\d+)>|<#(\d+)>/gu;
+// `#217 markdown-blocks`. THIS PAGE NO LONGER RENDERS MARKDOWN. It used to, with a hundred lines of
+// its own drawing one block per line: a `- ` item stayed a dash, a list had no indent, and a blank
+// line between paragraphs vanished, so the closing lines of an agent's answer ran together. The
+// server renders every body now, with an off-the-shelf Markdown renderer and an off-the-shelf
+// sanitizer (src/render.rs), and sends the result as `content_html`.
+//
+// Channel text is third-party data written by whoever is in the channel, and that is unchanged.
+// What changed is where it becomes markup: on the server, through a sanitizer that keeps a short
+// list of elements and attributes and drops everything else — no script, no style, no event
+// handler, no `src`, and a link only to `http` or `https`. The page has exactly ONE sink that
+// parses a string, `insertSanitizedHtml`, and the only strings that reach it are `content_html`.
+// Message text itself — `content`, a typed draft, an author's name — still goes in through
+// `textContent` and nothing else, which is escaping by construction rather than by remembering.
+//
+// A message with no `content_html` is drawn from `content` as plain paragraphs. That is most chat:
+// the server leaves the field empty when rendering would change nothing. It is also a saved
+// message from before the field existed, which is drawn as the text it is and never as markup.
 
 /**
- * A letter, a mark on one, a digit, or an underscore: what an emphasis underscore may not have on
- * its outer side.
+ * Put a body the SERVER rendered and sanitized into `parent`.
+ *
+ * THE ONLY PLACE THIS PAGE PARSES A STRING AS HTML, and the string is always a message's
+ * `content_html`: the output of the server's sanitizer and nothing else. Never message text, never
+ * a draft, never anything typed here. The page suite holds this to one call site.
+ *
+ * Through a `<template>`, whose contents are inert while they are parsed — no script runs and
+ * nothing is fetched — and then moved into the document.
  */
-const WORDLIKE = /^[\p{L}\p{M}\p{N}_]$/u;
-
-/**
- * Whether an underscore pair the pattern found opens where CommonMark lets it: at the start of the
- * text, or after something that is not a letter, a mark, a digit or another underscore.
- */
-function underscoreEmphasis(text, match) {
-  const before = [...text.slice(Math.max(0, match.index - 2), match.index)].pop() || "";
-  return !WORDLIKE.test(before);
+function insertSanitizedHtml(parent, contentHtml) {
+  const template = document.createElement("template");
+  template.innerHTML = contentHtml;
+  parent.append(...template.content.childNodes);
 }
 
+/** A message's rendered body, or "" when it has none and is drawn from its text. */
+const renderedHtmlOf = (message) =>
+  message && typeof message.content_html === "string" ? message.content_html : "";
+
+/** A message's raw text, as written. */
+const rawTextOf = (message) =>
+  String(message && message.content !== null && message.content !== undefined ? message.content : "");
+
+/**
+ * Text as plain paragraphs: each run of lines that are not blank is a paragraph, and the lines in
+ * it are separated by line breaks. Exactly the shape the server compares against before it decides
+ * a body needs no HTML (`plain_html` in src/render.rs), so a message drawn this way looks as it
+ * would have with its rendering. Every line through a text node.
+ */
+function plainParagraphs(parent, text) {
+  let paragraph = null;
+  for (const line of String(text).split("\n")) {
+    if (/^[ \t]*$/.test(line)) {
+      paragraph = null;
+      continue;
+    }
+    if (paragraph) {
+      paragraph.append(document.createElement("br"));
+    } else {
+      paragraph = document.createElement("p");
+      parent.append(paragraph);
+    }
+    paragraph.append(document.createTextNode(line));
+  }
+}
+
+/**
+ * One message's body, as a `.md` box: the server's rendering when there is one, its text as plain
+ * paragraphs otherwise. Every message on the page is drawn through here.
+ */
+function messageBody(message) {
+  const box = document.createElement("div");
+  box.className = "md";
+  const html = renderedHtmlOf(message);
+  if (html !== "") {
+    insertSanitizedHtml(box, html);
+  } else {
+    plainParagraphs(box, rawTextOf(message));
+  }
+  return box;
+}
+
+/** An element of `tag` holding `text`, assigned as text. */
 function styled(tag, className, text) {
   const node = document.createElement(tag);
   if (className) {
@@ -9997,109 +10037,90 @@ function styled(tag, className, text) {
   return node;
 }
 
+/** A body drawn from text alone: a draft being sent, which no server has rendered yet. */
+function textBody(text) {
+  const box = document.createElement("div");
+  box.className = "md";
+  plainParagraphs(box, text);
+  return box;
+}
+
+/** The elements whose edges are line ends when a body is read as text. */
+const TEXT_BLOCKS = new Set([
+  "blockquote", "div", "h1", "h2", "h3", "h4", "hr", "li", "ol", "p", "pre", "table", "tr", "ul",
+]);
+
 /**
- * A run of plain message text.
- *
- * A span rather than a text node so that every fragment is built the same way, through the one
- * function that assigns textContent — there is no second path to audit.
+ * What a drawn body SAYS, as text: what the reader sees, with a line end at each line break and at
+ * the edge of each block. What search matches and a thread is named by — not the Markdown source,
+ * whose asterisks and link targets are not on the screen.
  */
-function plain(text) {
-  return styled("span", "", text);
-}
-
-function mdLink(label, href) {
-  // A URL is a sink. `javascript:` and `data:` execute; a scheme-less string resolves against this
-  // origin and can be made to look like somewhere else entirely. None of those becomes a tappable
-  // link — the message is shown with its URL as visible text instead, which is strictly more
-  // informative than a link the operator cannot inspect on a phone.
-  if (!SAFE_LINK.test(href)) {
-    return plain(`${label} (${href})`);
-  }
-  const anchor = document.createElement("a");
-  anchor.textContent = label;
-  anchor.setAttribute("href", href);
-  anchor.setAttribute("rel", "noopener noreferrer nofollow");
-  anchor.setAttribute("target", "_blank");
-  return anchor;
-}
-
-function renderInline(parent, text) {
-  INLINE.lastIndex = 0;
-  let at = 0;
-  let match = INLINE.exec(text);
-  while (match !== null) {
-    // An underscore inside a word: text, not an opener. Look again from the character after it, so
-    // a construct that starts inside what it would have covered is still found.
-    if (match[5] !== undefined && !underscoreEmphasis(text, match)) {
-      INLINE.lastIndex = match.index + 1;
-      match = INLINE.exec(text);
-      continue;
-    }
-    if (match.index > at) {
-      parent.append(plain(text.slice(at, match.index)));
-    }
-    at = match.index + match[0].length;
-    if (match[1] !== undefined) {
-      parent.append(styled("code", "md-code", match[1]));
-    } else if (match[2] !== undefined) {
-      parent.append(styled("strong", "", match[2]));
-    } else if (match[3] !== undefined) {
-      parent.append(styled("s", "", match[3]));
-    } else if (match[4] !== undefined) {
-      parent.append(styled("em", "", match[4]));
-    } else if (match[5] !== undefined) {
-      parent.append(styled("em", "", match[5]));
-    } else if (match[6] !== undefined) {
-      parent.append(mdLink(match[6], match[7]));
-    } else if (match[8] !== undefined) {
-      // Rendered as the id, not as a name: this page has no user directory, and inventing a
-      // display name here is exactly the kind of thing this view exists to catch.
-      parent.append(styled("span", "md-mention", `@${match[8]}`));
-    } else if (match[9] !== undefined) {
-      parent.append(styled("span", "md-mention", `#${match[9]}`));
-    }
-    match = INLINE.exec(text);
-  }
-  if (at < text.length) {
-    parent.append(plain(text.slice(at)));
-  }
-}
-
-const FENCE = /^\s*```/;
-const QUOTE = /^\s*>\s?/;
-
-function renderMarkdownInto(parent, raw) {
-  const lines = String(raw === null || raw === undefined ? "" : raw).split("\n");
-  let i = 0;
-  while (i < lines.length) {
-    if (FENCE.test(lines[i])) {
-      const body = [];
-      i += 1;
-      while (i < lines.length && !FENCE.test(lines[i])) {
-        body.push(lines[i]);
-        i += 1;
+function renderedText(node) {
+  let out = "";
+  const walk = (at) => {
+    for (const kid of at.childNodes) {
+      if (kid.nodeType === 3) {
+        out += kid.textContent;
+        continue;
       }
-      i += 1; // the closing fence, or the end of an unclosed block.
-      parent.append(styled("pre", "md-pre", body.join("\n")));
-      continue;
-    }
-    if (QUOTE.test(lines[i])) {
-      const quote = document.createElement("div");
-      quote.className = "md-quote";
-      const body = [];
-      while (i < lines.length && QUOTE.test(lines[i])) {
-        body.push(lines[i].replace(QUOTE, ""));
-        i += 1;
+      if (kid.nodeType !== 1) continue;
+      const tag = String(kid.tagName).toLowerCase();
+      if (tag === "br") {
+        out += "\n";
+        continue;
       }
-      renderInline(quote, body.join("\n"));
-      parent.append(quote);
-      continue;
+      const block = TEXT_BLOCKS.has(tag);
+      if (block) out += "\n";
+      walk(kid);
+      if (block) out += "\n";
     }
-    const paragraph = document.createElement("div");
-    renderInline(paragraph, lines[i]);
-    parent.append(paragraph);
-    i += 1;
-  }
+  };
+  walk(node);
+  return out.replace(/[ \t]*\n\s*/g, "\n").trim();
+}
+
+/** Every link a drawn body holds, in order, as `{href, name}`: only the ones it really draws. */
+function anchorsIn(node) {
+  const found = [];
+  const walk = (at) => {
+    for (const kid of at.childNodes) {
+      if (kid.nodeType !== 1) continue;
+      const href = String(kid.tagName).toLowerCase() === "a" ? kid.getAttribute("href") : null;
+      if (href && HTTP_ADDRESS.test(href)) {
+        found.push({ href, name: renderedText(kid) || href });
+      } else {
+        walk(kid);
+      }
+    }
+  };
+  walk(node);
+  return found;
+}
+
+/**
+ * What one message says, as text, kept per message object: a thread's name asks on every draw of
+ * the selector, and a row's message objects are replaced, never edited, when a read brings a newer
+ * copy.
+ */
+const textByMessage = new WeakMap();
+function messageText(message) {
+  if (!message || typeof message !== "object") return "";
+  if (!textByMessage.has(message)) textByMessage.set(message, renderedText(messageBody(message)));
+  return textByMessage.get(message);
+}
+
+/**
+ * The links one message draws. A rendered body's links are its anchors — what the reader can tap,
+ * exactly — and a body drawn from text has none drawn, so its links are read from the text as the
+ * voice transcript's are.
+ */
+function messageLinks(message) {
+  return renderedHtmlOf(message) !== "" ? anchorsIn(messageBody(message)) : linksIn(rawTextOf(message));
+}
+
+/** Draw a row's messages into its body, one `.md` box each, in order. */
+function renderBodyInto(parent, messages) {
+  for (const message of messages) parent.append(messageBody(message));
   return parent;
 }
 
@@ -13439,18 +13460,21 @@ function channelRowFrame(messages) {
   meta.append(author, stamp, pinChip);
   const body = document.createElement("div");
   body.className = "body";
-  // THE COMBINED TEXT, and it is the only thing the reader sees of the grouping. A line break
-  // between the parts rather than nothing: the second half of a split post begins mid-sentence,
-  // and running the two together with no seam would read as one mangled sentence instead of two
-  // halves of one message.
-  const content = combinedContent(messages);
-  renderMarkdownInto(body, content);
+  // THE COMBINED BODY, and it is the only thing the reader sees of the grouping: each part as the
+  // server rendered it, one block after the other. The second half of a split post begins
+  // mid-sentence, and the block edge is the seam that keeps it from reading as one mangled
+  // sentence.
+  renderBodyInto(body, messages);
   li.append(meta, body);
+  // Two forms of the same words, for two different jobs: `content` is the SOURCE, which a copy
+  // keeps (`#198 copy-message-text`), and `text` is what the row SAYS, which is what the fold
+  // measures and the search matches. `#217 markdown-blocks`.
+  const text = renderedText(body);
   // `#219 emoji-reactions`. Under the text, on a line of its own, and never in `.meta`, whose line
   // the row's controls already fill on a phone. See `reactionStrip`.
   const reactions = reactionStrip(messages);
   if (reactions) li.append(reactions);
-  return { li, meta, body, content, reactions };
+  return { li, meta, body, content: combinedContent(messages), text, reactions };
 }
 
 // --- reactions ------------------------------------------------------------------------------------
@@ -13534,7 +13558,7 @@ function reactionStrip(messages) {
  */
 function discordNode(messages) {
   const message = messages[0];
-  const { li, meta, body, content, reactions } = channelRowFrame(messages);
+  const { li, meta, body, content, text, reactions } = channelRowFrame(messages);
   // `#204 reply-arrow`. FIRST in the row, ahead of the meta line, so a screen reader meets the way
   // to what this answers before the row's own words — and drawn by web/voice.css in the gutter to
   // the row's left, where nothing else on the row is. Not in the Pinned list (`#206 pin-message`):
@@ -13556,7 +13580,7 @@ function discordNode(messages) {
   // into the one piece of writing they were before Discord's length limit cut them up; summarising
   // the primary alone would describe the half that stops mid-sentence, and the tail alone is the
   // least summarisable text in the channel.
-  tapRow(li, foldable(li, meta, body, content, String(message.id), messages.slice(1).map((m) => String(m.id))));
+  tapRow(li, foldable(li, meta, body, text, String(message.id), messages.slice(1).map((m) => String(m.id))));
   // `#219 emoji-reactions`. Moved below the summary `foldable` may have added, which can stand in
   // for the text: the reactions belong to the message, whichever of the two is showing.
   if (reactions) li.append(reactions);
@@ -13754,7 +13778,12 @@ function discordNode(messages) {
   // would hide a row that visibly contains the word they typed. The author name goes in because
   // "everything the bot said" is a search a reader performs, and the id does not, because it is
   // not on the row — see the note above about where the snowflake lives.
-  searchable(li, message.author, content);
+  //
+  // `#217 markdown-blocks`. What the row SAYS, not its Markdown source: a word split by emphasis
+  // marks is one word on screen, and a mention is found by the `@id` it is drawn as. With the
+  // address of every link it draws, which the source held and the drawn text does not, so a pasted
+  // address still finds its row.
+  searchable(li, message.author, text, ...anchorsIn(body).map((link) => link.href));
   return li;
 }
 
@@ -14049,7 +14078,7 @@ async function loadOlderPage() {
   try {
     const payload = await api(
       `/api/v1/channels/${encodeURIComponent(channel)}/page` +
-        `?limit=${DISCORD_PAGE_LIMIT}&before=${encodeURIComponent(discordOlderCursor)}`
+        `?limit=${DISCORD_PAGE_LIMIT}&before=${encodeURIComponent(discordOlderCursor)}&render=html`
     );
     if (generation !== discordLoadGeneration || channel !== el("discord-channel").value) return;
     observeOutgoingMessages(payload.messages || []);
@@ -14684,7 +14713,9 @@ async function loadDiscord(options) {
     if (!keepPosition) {
       setStatus("fetching the channel…");
     }
-    const path = `/api/v1/channels/${encodeURIComponent(channel)}/page?limit=${DISCORD_PAGE_LIMIT}`;
+    // `render=html`: this route is also the voice agent's `read_page`, so its bodies are rendered
+    // only when asked. `#217 markdown-blocks`.
+    const path = `/api/v1/channels/${encodeURIComponent(channel)}/page?limit=${DISCORD_PAGE_LIMIT}&render=html`;
     const payload = await within(CHANNEL_READ_TIMEOUT_MS, (signal) => api(path, { signal }));
     if (!currentDiscordLoad(generation, channel, false)) {
       return;
@@ -15432,6 +15463,8 @@ function provisionalPin(message) {
     author_id: String(message.author_id || ""),
     author_is_bot: message.author_is_bot === true,
     content: String(message.content === null || message.content === undefined ? "" : message.content),
+    // Drawn as the message is until the server's own copy of the pin arrives; never sent.
+    content_html: renderedHtmlOf(message),
     truncated: false,
     timestamp: String(message.timestamp || ""),
     thread_id: threadOf(message),
@@ -15453,8 +15486,10 @@ function keptMessage(pin, channel) {
     spoken_time: "",
     reply_to: null,
     // An ellipsis where the server cut it, so a shortened text does not read as the whole message.
+    // The server renders the snapshot with the same ellipsis after it. `#217 markdown-blocks`.
     content: pin.truncated ? `${pin.content}…` : pin.content,
   };
+  if (renderedHtmlOf(pin) !== "") message.content_html = pin.content_html;
   if (pin.thread_id) {
     message.thread = {
       id: pin.thread_id, root_message_id: null, is_root: pin.thread_root, reply_count: null, reply_count_exact: false,
@@ -15493,8 +15528,8 @@ function syncPinnedList() {
   }
   const messages = pinnedMessages();
   const drawn = JSON.stringify([combineMessages, channelCanon.scope, threadingSupported,
-    ...messages.map((m) => [m.id, m.timestamp, m.content, m.author, threadOf(m), isNoise(m), keptByPin.has(m),
-      reactionsDrawn(m)])]);
+    ...messages.map((m) => [m.id, m.timestamp, m.content, renderedHtmlOf(m), m.author, threadOf(m), isNoise(m),
+      keptByPin.has(m), reactionsDrawn(m)])]);
   if (drawn === pinnedListDrawn) return;
   pinnedListDrawn = drawn;
   drawingPinnedRows = true;
@@ -15891,9 +15926,9 @@ function openReply(messages) {
   replyScrollMark = captureScroll();
   const target = el("reply-target");
   target.replaceChildren();
-  // The same renderer the channel list uses. Untrusted text, so the same guarantee: every fragment
-  // is an element built here with textContent, and there is no second path.
-  renderMarkdownInto(target, combinedContent(messages));
+  // The same bodies the channel list draws, through the same function, so the same guarantee: the
+  // server's sanitized rendering or the text as text, and no second path.
+  renderBodyInto(target, messages);
   el("reply-target-meta").textContent = `${
     message.author_is_bot ? `${message.author} (bot)` : String(message.author)
   } · id ${message.id}`;
@@ -16126,7 +16161,8 @@ function renderReplyContext() {
   const list = el("reply-context");
   const { earlier, more } = replyTarget ? replyContextPool() : { earlier: [], more: false };
   const shown = earlier.slice(Math.max(0, earlier.length - replyContext.shown));
-  const drawn = JSON.stringify(shown.map((message) => [String(message.id), message.content, reactionsDrawn(message)]));
+  const drawn = JSON.stringify(shown.map((message) =>
+    [String(message.id), message.content, renderedHtmlOf(message), reactionsDrawn(message)]));
   if (drawn !== replyContext.drawn) {
     list.replaceChildren(...glom(shown).map(replyContextRow));
     replyContext.drawn = drawn;
@@ -16154,7 +16190,7 @@ function renderReplyContext() {
  * summarised.
  */
 function replyContextRow(messages) {
-  const { li, meta, body, content } = channelRowFrame(messages);
+  const { li, meta, body, text } = channelRowFrame(messages);
   const message = messages[0];
   // The speaker treatment the channel gives the row, from the same census: the two principals are
   // told apart by colour, and everyone else is named.
@@ -16162,7 +16198,7 @@ function replyContextRow(messages) {
   li.setAttribute("data-who", who);
   const named = childByClass(li, "msg-author");
   if (named) named.hidden = who === "me" || who === "coder";
-  if (content.length <= COLLAPSE_OVER_CHARS) return li;
+  if (text.length <= COLLAPSE_OVER_CHARS) return li;
   const id = String(message.id);
   const fold = document.createElement("button");
   fold.className = "fold";

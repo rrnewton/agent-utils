@@ -507,7 +507,7 @@ bot_token = "screenshot-run-bot-token-never-sent-anywhere"
 # really pages, the "Older messages" control really appears, and 21-channel-older-loaded is a
 # picture of a server-cursored step rather than of a control that happens to be rendered.
 #
-# SIX, not eight, and the difference is a whole page. Thirteen seeded messages at eight arrive in
+# SIX, not eight, and the difference is a whole page. Fourteen seeded messages at eight arrive in
 # exactly two reads, so one step back reaches the beginning -- and `31-pull-to-refresh-armed` is
 # specifically the channel that STILL has history above the reader after that step, which is the
 # case pull-to-refresh exists for. At eight there is no such position to photograph. At six the

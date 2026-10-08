@@ -70,6 +70,10 @@ pub fn router(state: AppState) -> Router {
             state.clone(),
             bearer_layer::require_bearer,
         ))
+        // OUTSIDE the bearer check, so its refusal and a route's carry the same `vary` header:
+        // compression adds one to every answer it sees, and a 401 that lacked it would tell an
+        // anonymous caller which paths reached a route. `tests/scope_first.rs` compares the two.
+        .layer(compression())
         .layer(axum::middleware::from_fn_with_state(
             state,
             access_layer::log_requests,
@@ -84,6 +88,63 @@ pub fn router(state: AppState) -> Router {
             CompressionLayer::new()
                 .compress_when(DefaultPredicate::new().and(NotForContentType::const_new("audio/"))),
         )
+}
+
+/// Response compression, gzip or brotli as the browser offers. `#217 markdown-blocks`.
+///
+/// The page is one large script fetched with `no-store` on every load, and every channel read is
+/// JSON whose message bodies now come with their rendered HTML beside them. Both are text that
+/// compresses to a fraction of itself, and the reader is on a phone's connection.
+///
+/// BY CONTENT TYPE, and an allowlist rather than a list of exceptions: the page, its script and
+/// styles, its manifest, and JSON. Not the live stream, which must reach the page event by event
+/// rather than when a compressor's buffer fills, and not read-aloud audio, which is compressed
+/// already and is forwarded as it arrives. Anything added later stays uncompressed until it is
+/// named here, which costs bytes but never breaks a stream.
+///
+/// Quality 5, for both encoders. The default for brotli is its maximum, eleven, which spends tens
+/// of milliseconds of CPU on every load of a script nothing caches; five keeps most of the saving
+/// for a small fraction of that. A request without `Accept-Encoding` is answered exactly as before.
+fn compression(
+) -> tower_http::compression::CompressionLayer<impl tower_http::compression::Predicate> {
+    use tower_http::compression::predicate::{Predicate, SizeAbove};
+    use tower_http::compression::{CompressionLayer, CompressionLevel};
+    let compressible = |_: axum::http::StatusCode,
+                        _: axum::http::Version,
+                        headers: &axum::http::HeaderMap,
+                        _: &axum::http::Extensions| {
+        compressible_type(
+            headers
+                .get(axum::http::header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok())
+                .unwrap_or(""),
+        )
+    };
+    CompressionLayer::new()
+        .gzip(true)
+        .br(true)
+        .quality(CompressionLevel::Precise(5))
+        .compress_when(SizeAbove::default().and(compressible))
+}
+
+/// Whether a response of this `Content-Type` is compressed. See [`compression`].
+#[must_use]
+pub fn compressible_type(content_type: &str) -> bool {
+    let essence = content_type
+        .split(';')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
+    matches!(
+        essence.as_str(),
+        "text/html"
+            | "text/css"
+            | "text/javascript"
+            | "application/javascript"
+            | "application/json"
+            | "application/manifest+json"
+    )
 }
 
 /// Every route. `tests/scope_first.rs` reads the routes from this function's source.

@@ -10,11 +10,14 @@
 //   * `getElementById` knows ONLY the ids that really appear in web/voice.html, and THROWS for
 //     anything else. So a script that reaches for an element the page does not have fails loudly
 //     here instead of silently doing nothing in a phone browser at the roadside.
-//   * There is no innerHTML, no insertAdjacentHTML, and no HTML parser anywhere in the fixture. A
-//     test therefore CANNOT accidentally certify markup injection as "rendered" — the only way a
-//     `<script>` in a Discord message could become an element is if the page created that element
-//     itself, and `page.createdTags` records every element the page creates so that is checked
-//     directly.
+//   * There is no innerHTML on an ordinary element, no insertAdjacentHTML, and only ONE HTML parser:
+//     a `<template>`'s `innerHTML`, which is how the page inserts a body the server rendered and
+//     sanitized (`#217 markdown-blocks`). That parser is deliberately narrower than the server's
+//     sanitizer: it knows the elements src/render.rs names in `TAGS`, read from that file, and the
+//     attributes the sanitizer keeps, and it THROWS on anything else. So a test still CANNOT
+//     certify markup injection as "rendered" — a `<script>` reaching the page's one sink is a
+//     failing test, not an element — and `page.createdTags` records every element the page
+//     creates, parsed ones included, so that is checked directly.
 //
 // What this fixture CANNOT do, stated so nobody reads more into a green run than is there:
 //
@@ -39,6 +42,15 @@ const SCRIPT = readFileSync(join(WEB, "voice.js"), "utf8");
 // payload this fixture's fake server sends is decoded by them before the page reads it.
 const CONTRACT = readFileSync(join(WEB, "contract.js"), "utf8");
 const HTML = readFileSync(join(WEB, "voice.html"), "utf8");
+/**
+ * The elements the server's sanitizer may send, from src/render.rs itself rather than restated, so
+ * this fixture's parser and the sanitizer cannot drift apart. `#217 markdown-blocks`.
+ */
+const RENDER_RS = readFileSync(join(WEB, "..", "src", "render.rs"), "utf8");
+const SANITIZED_TAGS = new Set(
+  [...(/pub const TAGS: \[&str; \d+\] = \[([^\]]*)\]/.exec(RENDER_RS) ||
+    assert.fail("src/render.rs no longer states its TAGS"))[1].matchAll(/"([a-z0-9]+)"/g)].map((m) => m[1])
+);
 const CSS = readFileSync(join(WEB, "voice.css"), "utf8");
 // The SHARED sheet, which this page is layered on and does not own. Read only so that a claim
 // about a colour differing from the resting one can be checked against the resting one, rather
@@ -524,6 +536,19 @@ class FakeElement {
     return this.className.split(/\s+/).includes(name);
   }
 
+  /**
+   * Every child, text included. A text node here is a `#text` element whose `textContent` is its
+   * data; one the page makes with `createTextNode` or the template parser makes from markup.
+   */
+  get childNodes() {
+    return this.children;
+  }
+
+  /** 3 for a text node, 1 for an element, as the DOM numbers them. */
+  get nodeType() {
+    return this.tagName === "#text" ? 3 : 1;
+  }
+
   /** The height of everything inside, ignoring any clamp on this element itself. */
   contentHeight() {
     const own = this.textContent.length
@@ -757,6 +782,109 @@ class FakeElement {
   /** The visible text of this subtree, concatenated in document order. */
   text() {
     return [this, ...this.descendants()].map((node) => node.textContent).join("");
+  }
+}
+
+/**
+ * The attributes the server's sanitizer leaves on each element it keeps (src/render.rs,
+ * `SANITIZER`), and the values it allows where it restricts them. Anything else is refused.
+ */
+const SANITIZED_ATTRIBUTES = new Map([
+  ["a", new Set(["href", "target", "rel"])],
+  ["ol", new Set(["start", "class"])],
+  ["ul", new Set(["class"])],
+  ["li", new Set(["class"])],
+  ["span", new Set(["class"])],
+  ["input", new Set(["class", "type", "checked", "disabled"])],
+  ["th", new Set(["align"])],
+  ["td", new Set(["align"])],
+]);
+const VOID_TAGS = new Set(["br", "hr", "input"]);
+const ENTITIES = { amp: "&", lt: "<", gt: ">", quot: "\"", apos: "'", nbsp: "\u00a0" };
+const decodeEntities = (text) =>
+  text.replace(/&(#x[0-9a-f]+|#\d+|[a-z]+);/gi, (whole, name) => {
+    if (name[0] === "#") {
+      return String.fromCodePoint(Number.parseInt(name.slice(name[1] === "x" ? 2 : 1), name[1] === "x" ? 16 : 10));
+    }
+    if (!(name in ENTITIES)) throw new Error(`the sanitized HTML holds an entity this fixture does not know: ${whole}`);
+    return ENTITIES[name];
+  });
+
+/**
+ * Parse what the server's sanitizer sends into `host`'s children, or THROW.
+ *
+ * Strict on purpose: a tag outside `SANITIZED_TAGS`, an attribute the sanitizer does not keep, a
+ * link to anything but http(s), an unclosed or misnested element — each is an error naming what it
+ * found. The page is entitled to insert the sanitizer's output and nothing else, and a test that
+ * hands this parser anything else finds out at once.
+ */
+function parseSanitizedHtml(html, host, record) {
+  const open = [host];
+  const top = () => open[open.length - 1];
+  const tag = /<(\/?)([a-z][a-z0-9]*)((?:\s+[a-z-]+(?:="[^"]*")?)*)\s*\/?>/gy;
+  let at = 0;
+  const text = (run) => {
+    if (run === "") return;
+    if (/[<>]/.test(run)) throw new Error(`the sanitized HTML holds a raw angle bracket: ${JSON.stringify(run)}`);
+    const node = new FakeElement("", "#text");
+    node.textContent = decodeEntities(run);
+    top().append(node);
+  };
+  while (at < html.length) {
+    const next = html.indexOf("<", at);
+    if (next < 0) {
+      text(html.slice(at));
+      break;
+    }
+    text(html.slice(at, next));
+    tag.lastIndex = next;
+    const match = tag.exec(html);
+    if (!match) throw new Error(`the sanitized HTML holds markup this fixture refuses: ${html.slice(next, next + 60)}`);
+    at = tag.lastIndex;
+    const [, closing, name, attributes] = match;
+    if (!SANITIZED_TAGS.has(name)) throw new Error(`the sanitized HTML holds a <${name}>, which src/render.rs never allows`);
+    if (closing) {
+      if (top().tagName !== name) throw new Error(`</${name}> closes <${top().tagName}>`);
+      open.pop();
+      continue;
+    }
+    record(name);
+    const element = new FakeElement("", name);
+    for (const attribute of attributes.matchAll(/([a-z-]+)(?:="([^"]*)")?/g)) {
+      const [, key, raw = ""] = attribute;
+      const allowed = SANITIZED_ATTRIBUTES.get(name);
+      if (!allowed || !allowed.has(key)) throw new Error(`<${name}> carries ${key}, which the sanitizer drops`);
+      const value = decodeEntities(raw);
+      if (key === "href" && !/^https?:\/\//i.test(value)) throw new Error(`a link to ${value} survived the sanitizer`);
+      if (key === "class") element.className = value;
+      else element.setAttribute(key, value);
+    }
+    top().append(element);
+    if (!VOID_TAGS.has(name)) open.push(element);
+  }
+  if (open.length !== 1) throw new Error(`the sanitized HTML leaves <${top().tagName}> open`);
+}
+
+/** A `<template>`: its `innerHTML` is the one parser here, and its `content` what was parsed. */
+class FakeTemplate extends FakeElement {
+  constructor(page) {
+    super("", "template");
+    this.page = page;
+    this.parsed = new FakeElement("", "#document-fragment");
+  }
+
+  set innerHTML(html) {
+    if (this.page.onParse) this.page.onParse(String(html));
+    this.parsed = new FakeElement("", "#document-fragment");
+    parseSanitizedHtml(String(html), this.parsed, (name) => this.page.createdTags.push(name));
+  }
+
+  get innerHTML() {
+    throw new Error("the page reads markup back out of a template, which it has no reason to");
+  }
+
+  get content() {
+    return this.parsed;
   }
 }
 
@@ -1349,8 +1477,10 @@ function newPage(store = new Map(), script = SCRIPT, arrange = null) {
     ticketStatus: 200,
     /** Every ScriptProcessorNode it has built, in order. */
     processors: [],
-    /** Every tag name the page has passed to createElement, in order. */
+    /** Every tag name the page has passed to createElement, in order, and every one it parsed. */
     createdTags: [],
+    /** How many `<template>`s the page has made: one per body it inserted from HTML. */
+    templatesParsed: 0,
     /** Every reply the page has POSTed, exactly as it went out. */
     repliesPosted: [],
     /** `#49 cached-summaries`: every summary the page has asked for, in order. */
@@ -1520,7 +1650,16 @@ function newPage(store = new Map(), script = SCRIPT, arrange = null) {
     getElementById: (id) => elements.get(id) || null,
     createElement: (tag) => {
       page.createdTags.push(String(tag).toLowerCase());
+      if (String(tag).toLowerCase() === "template") {
+        page.templatesParsed += 1;
+        return new FakeTemplate(page);
+      }
       return new FakeElement("", String(tag).toLowerCase());
+    },
+    createTextNode: (data) => {
+      const node = new FakeElement("", "#text");
+      node.textContent = String(data);
+      return node;
     },
   };
   /** Fire a document-level event (a tap's `pointerdown`, a `keydown`) at the page's listeners. */
@@ -9860,205 +9999,265 @@ test("a bot author is labelled as one", async () => {
   assert.match(lines[0].text(), /MyDiscordBot \(bot\)/);
 });
 
-test("the small markdown subset renders, and renders as ELEMENTS the page made itself", async () => {
+// --- message bodies, as the server rendered them ---------------------------------------------------
+//
+// `#217 markdown-blocks`. The page used to render Markdown itself, one block per line; the server
+// does it now (src/render.rs, with its own tests of the renderer and the sanitizer), and sends the
+// sanitized result as `content_html`. What is pinned down here is the page's half: the body is
+// inserted as it was sent, through ONE sink that only ever receives `content_html`; a message
+// without it is drawn from its text as plain paragraphs and never as markup; and everything that
+// used to read the Markdown source — search, the Links view, the fold, a thread's name — reads what
+// the row draws, while Copy text keeps the source.
+
+/** The owner's message, as `body_html` renders it (the same string src/render.rs asserts). */
+const OWNERS_MESSAGE = {
+  content: "Here is where things stand after the run:\n\n- the build is green on both runners\n" +
+    "- the flaky test is quarantined\n  and has an issue filed against it\n- docs are updated\n" +
+    "- the release notes are drafted\n- the tag is not pushed yet\n  because it waits on your review\n" +
+    "- nothing else is open\n\n\nI will push the tag when you say so.\n\nThanks!",
+  content_html: "<p>Here is where things stand after the run:</p>\n<ul>\n" +
+    "<li>the build is green on both runners</li>\n" +
+    "<li>the flaky test is quarantined<br>\nand has an issue filed against it</li>\n" +
+    "<li>docs are updated</li>\n<li>the release notes are drafted</li>\n" +
+    "<li>the tag is not pushed yet<br>\nbecause it waits on your review</li>\n" +
+    "<li>nothing else is open</li>\n</ul>\n<p>I will push the tag when you say so.</p>\n<p>Thanks!</p>\n",
+};
+
+const LINK_ATTRS = 'target="_blank" rel="noopener noreferrer nofollow"';
+/** The `.md` boxes a row's body holds, one per message. */
+const mdBoxes = (li) => bodyOf(li).children.filter((node) => node.hasClass("md"));
+/** Every element of `tag` under `node`. */
+const tagged = (node, tag) => node.descendants().filter((kid) => kid.tagName === tag);
+
+test("a body the server rendered is drawn as it was sent: paragraphs, one list, its items whole", async () => {
   const page = newPage();
   await signIn(page);
-
-  const lines = await showDiscord(page, [
-    message({ content: "**bold** and *italic* and `code` and ~~gone~~ and <@123> in <#456>" }),
-  ]);
-
-  const kinds = lines[0].descendants();
-  const of = (tag) => kinds.filter((node) => node.tagName === tag).map((node) => node.textContent);
-  assert.deepStrictEqual(of("strong"), ["bold"]);
-  assert.deepStrictEqual(of("em"), ["italic"]);
-  assert.deepStrictEqual(of("code"), ["code"]);
-  assert.deepStrictEqual(of("s"), ["gone"]);
-  // A mention is shown as the id it really is. Inventing a display name here would be the same
-  // class of mistake this view exists to expose.
-  assert.ok(lines[0].text().includes("@123"), "a user mention should render as its id");
-  assert.ok(lines[0].text().includes("#456"), "a channel mention should render as its id");
+  const before = page.templatesParsed;
+  const rows = await showDiscord(page, [message({ id: "7100000000000000001", ...OWNERS_MESSAGE })]);
+  const [box] = mdBoxes(rows[0]);
+  assert.ok(box, "the row's body holds no .md box");
+  assert.equal(page.templatesParsed - before, 1, "the rendered body was not inserted through the template");
+  assert.deepStrictEqual(box.children.filter((kid) => kid.nodeType === 1).map((kid) => kid.tagName),
+    ["p", "ul", "p", "p"], "the blocks are not the server's blocks");
+  const items = tagged(box, "li");
+  assert.equal(items.length, 6, "six items, one list");
+  assert.equal(tagged(box, "ul").length, 1, "the items were split into several lists");
+  // A continuation line stays INSIDE its item, after a line break.
+  assert.equal(items[1].text(), "the flaky test is quarantined\nand has an issue filed against it");
+  assert.equal(tagged(items[1], "br").length, 1);
+  // ...and no Markdown is left on screen.
+  assert.doesNotMatch(rows[0].text(), /^- /m, "a list marker was drawn as a dash");
 });
 
-test("a fenced code block is taken verbatim, not parsed", async () => {
-  const page = newPage();
-  await signIn(page);
-
-  const lines = await showDiscord(page, [
-    message({ content: "look:\n```\n**not bold** <b>not markup</b>\n```\ndone" }),
-  ]);
-
-  const pre = lines[0].descendants().filter((node) => node.tagName === "pre");
-  assert.equal(pre.length, 1);
-  assert.equal(pre[0].textContent, "**not bold** <b>not markup</b>");
-  assert.equal(
-    lines[0].descendants().filter((node) => node.tagName === "strong").length,
-    0,
-    "markdown inside a code fence was parsed"
-  );
-});
-
-test("an underscore inside a word is text, and only an underscore at a word's edge is emphasis", async () => {
-  // `#200 reply-context`. An identifier in SCREAMING_SNAKE_CASE lost two underscores and had its
-  // middle word italicised, and a snake_case name inside an attribute went the same way: `_` in the
-  // middle of a word opened and closed emphasis. CommonMark's rule for `_` is that it opens only
-  // where no letter or digit comes before it and closes only where none comes after; `*` may be
-  // used inside a word, and still is.
-  const page = newPage();
-  await signIn(page);
-  /** [what was posted, the text the row shows, its emphasised fragments, its code spans] */
-  const cases = [
-    ["call parse_reply_body before render_row", "call parse_reply_body before render_row", [], []],
-    ["set ALPHA_E2E_EMPTY_DIR and BETA_V2_LIMIT_9", "set ALPHA_E2E_EMPTY_DIR and BETA_V2_LIMIT_9", [], []],
-    ["#![feature(sample_inner_flag)]", "#![feature(sample_inner_flag)]", [], []],
-    ["see /srv/sample_tree/src_dir/file_name.rs", "see /srv/sample_tree/src_dir/file_name.rs", [], []],
-    ["__init__.py is a file name", "__init__.py is a file name", [], []],
-    ["this is _really_ needed", "this is really needed", ["really"], []],
-    ["_starts_ and ends _here_", "starts and ends here", ["starts", "here"], []],
-    ["(_like this_), and _this_.", "(like this), and this.", ["like this", "this"], []],
-    ["_snake_case_ stays one word", "snake_case stays one word", ["snake_case"], []],
-    ["`keep_this_raw` and `_this_ too`", "keep_this_raw and _this_ too", [], ["keep_this_raw", "_this_ too"]],
-    ["*intra*word and in*side*", "intraword and inside", ["intra", "side"], []],
-    // A closer belongs to the nearest opener before it, so a name that starts with an underscore
-    // does not open an emphasis that runs on to the next real one.
-    ["call _private_helper then _really_ do it", "call _private_helper then really do it", ["really"], []],
-    ["_lead_name and _tail_", "_lead_name and tail", ["tail"], []],
-    ["see (_inner_) here", "see (inner) here", ["inner"], []],
-    // A decomposed accent is part of its letter, so the underscore after it is inside a word.
-    ["cafe\u0301_x_ here", "cafe\u0301_x_ here", [], []],
-  ];
-  const lines = await showDiscord(page, cases.map(([content], i) => message({ id: String(700 + i), content })));
-  cases.forEach(([content, shown, emphasised, code], i) => {
-    const body = lines[i].descendants().find((node) => node.className === "body");
-    const of = (tag) => body.descendants().filter((node) => node.tagName === tag).map((node) => node.textContent);
-    assert.equal(body.text(), shown, `${JSON.stringify(content)} was drawn as ${JSON.stringify(body.text())}`);
-    assert.deepStrictEqual(of("em"), emphasised, `${JSON.stringify(content)} emphasised the wrong text`);
-    assert.deepStrictEqual(of("code"), code, `${JSON.stringify(content)} lost a code span`);
-  });
-});
-
-test("a line full of underscores renders in time that grows with its length, not with its square", async () => {
-  // `#200 reply-context`, from review. Each underscore made the pattern look ahead for its closer,
-  // and the check that it may open at all only ran once one was found, so a line of underscores
-  // that cannot close — a run of identifiers — was read to its end once per underscore: 4.7s for
-  // 100,000 characters, on the page's one thread, on every refresh that redraws the row. The
-  // emphasis now reaches at most 255 characters, which bounds the look-ahead.
-  const page = newPage();
-  await signIn(page);
-  const runOn = "a_".repeat(50000);
-  const openers = " _a".repeat(33334);
-  const within = `_${"w".repeat(255)}_`;
-  const beyond = `_${"w".repeat(256)}_`;
-  const started = performance.now();
-  const lines = await showDiscord(page, [runOn, openers, within, beyond].map((content, i) =>
-    message({ id: String(790 + i), content })));
-  const took = performance.now() - started;
-  // `hasClass`, as the first two are long enough to be folded, which adds a class.
-  const body = (line) => line.descendants().find((node) => node.hasClass("body"));
-  const emphasised = (line) =>
-    body(line).descendants().filter((node) => node.tagName === "em").map((node) => node.textContent);
-  assert.equal(body(lines[0]).text(), runOn, "a run of identifiers was not drawn as written");
-  assert.equal(body(lines[1]).text(), openers, "a run of openers with no closer was not drawn as written");
-  // The bound, at its edge: 255 characters of emphasis are emphasis, and 256 are the text written.
-  assert.deepStrictEqual(emphasised(lines[2]), ["w".repeat(255)]);
-  assert.deepStrictEqual(emphasised(lines[3]), []);
-  assert.equal(body(lines[3]).text(), beyond);
-  // Generous, because this host may be loaded: the bounded pattern takes tens of milliseconds here,
-  // and the unbounded one took seconds.
-  assert.ok(took < 1500, `200,000 characters of underscores took ${Math.round(took)}ms to draw`);
-});
-
-test("a blockquote renders as a quote rather than as a stray angle bracket", async () => {
-  const page = newPage();
-  await signIn(page);
-  const lines = await showDiscord(page, [message({ content: "> quoted line\nplain line" })]);
-  const quotes = lines[0].descendants().filter((node) => node.className === "md-quote");
-  assert.equal(quotes.length, 1);
-  assert.match(quotes[0].text(), /quoted line/);
-  assert.doesNotMatch(quotes[0].text(), /plain line/);
-});
-
-test("HOSTILE MESSAGE TEXT NEVER BECOMES MARKUP", async () => {
-  // Channel text is written by whoever is in the channel, including bots nobody here controls.
-  // The payloads below are the ones that matter: a script tag, an event-handler attribute, and an
-  // image that fires on error. All three must come out as the characters they are.
+test("a message without content_html is drawn from its text, as plain paragraphs and never as markup", async () => {
+  // Most chat — the server sends no HTML when rendering would change nothing — and every message
+  // saved on a device before the field existed. Either way the text is TEXT: Markdown stays the
+  // characters it is, and so does HTML.
   const page = newPage();
   await signIn(page);
   const HOSTILE =
     '<script>alert("xss")</script> <img src=x onerror=alert(1)> ' +
     '<iframe src="javascript:alert(2)"></iframe> &lt;already escaped&gt;';
-
   const before = page.createdTags.length;
-  const lines = await showDiscord(page, [message({ content: HOSTILE })]);
-
-  // 1. It is all still there, verbatim, as text the operator can read.
-  assert.ok(
-    lines[0].text().includes('<script>alert("xss")</script>'),
-    `the payload was mangled rather than shown: ${lines[0].text()}`
-  );
-  assert.ok(lines[0].text().includes("<img src=x onerror=alert(1)>"));
-  assert.ok(
-    lines[0].text().includes("&lt;already escaped&gt;"),
-    "text that was already escaped must not be double-unescaped into live markup"
-  );
-
-  // 2. No element of a dangerous kind was ever created. The fixture has no HTML parser, so the
-  //    ONLY way one could exist is if the page created it — and every createElement is recorded.
+  const templates = page.templatesParsed;
+  const rows = await showDiscord(page, [
+    message({ id: "7100000000000000002", content: `${HOSTILE}\n**not bold**\n\n- not a list` }),
+  ]);
+  const [box] = mdBoxes(rows[0]);
+  assert.equal(page.templatesParsed, templates, "text with no content_html reached the HTML sink");
+  assert.deepStrictEqual(box.children.map((kid) => kid.tagName), ["p", "p"], "a blank line is the only paragraph break");
+  const [first, second] = box.children;
+  assert.equal(first.text(), `${HOSTILE}**not bold**`, "the text was not drawn verbatim");
+  assert.equal(tagged(first, "br").length, 1, "the single newline is not a line break");
+  assert.equal(second.text(), "- not a list");
+  assert.ok(box.text().includes("&lt;already escaped&gt;"), "text that was already escaped was unescaped");
   const created = page.createdTags.slice(before);
-  for (const tag of ["script", "img", "iframe", "style", "object", "embed", "link"]) {
-    assert.ok(!created.includes(tag), `rendering a message created a <${tag}>`);
+  for (const tag of ["script", "img", "iframe", "style", "object", "embed", "link", "strong", "ul"]) {
+    assert.ok(!created.includes(tag), `drawing a message's text created a <${tag}>`);
   }
-
-  // 3. Nothing carried an event-handler or a src attribute out of the message.
-  for (const node of lines[0].descendants()) {
+  for (const node of rows[0].descendants()) {
     for (const name of node.attributes.keys()) {
       assert.doesNotMatch(name, /^on/i, `an ${name} attribute was set from channel text`);
       assert.notEqual(name, "src");
     }
   }
-
-  // 4. The reply control `#51 reply-view` puts on the row carries NOTHING from the message —
-  //    neither in its text nor in any attribute value. An attribute is not markup here, so this is
-  //    belt and braces rather than a live hazard; it is asserted because "the accessible name
-  //    quotes the author" is an obvious and tempting next change, and the author string is written
-  //    by whoever is in the channel.
-  const reply = replyButton(lines[0]);
-  assert.ok(reply, "the row grew no reply control");
+  // The reply control carries nothing from the message, in its text or in any attribute.
+  const reply = replyButton(rows[0]);
   assert.equal(reply.textContent, "Reply");
   for (const value of reply.attributes.values()) {
-    assert.ok(
-      !value.includes("<script>") && !value.includes("onerror"),
-      `channel text reached a reply-button attribute: ${value}`
-    );
+    assert.ok(!value.includes("<script>") && !value.includes("onerror"), `channel text reached ${value}`);
   }
-
-  // 5. And the page really does have no HTML sink to reach for.
-  assert.doesNotMatch(SCRIPT_CODE, /innerHTML|outerHTML|insertAdjacentHTML|document\.write/);
 });
 
-test("a link is only a link when its scheme is one a tap can be trusted with", async () => {
+test("the page has ONE html sink, and only a message's content_html ever reaches it", async () => {
+  // Static: one assignment to innerHTML in the whole script, inside `insertSanitizedHtml`, and that
+  // function is called from one place, with what `renderedHtmlOf` read off a message. None of the
+  // other ways to turn a string into markup appears at all.
+  assert.equal((SCRIPT_CODE.match(/innerHTML/g) || []).length, 1, "a second innerHTML sink appeared");
+  const sink = /function insertSanitizedHtml\(parent, contentHtml\) \{([\s\S]*?)\n\}/.exec(SCRIPT_CODE);
+  assert.ok(sink && /template\.innerHTML = contentHtml;/.test(sink[1]), "innerHTML moved out of insertSanitizedHtml");
+  const calls = [...SCRIPT_CODE.matchAll(/insertSanitizedHtml\(([^)]*)\)/g)].map((m) => m[1]);
+  assert.deepStrictEqual(calls, ["parent, contentHtml", "box, html"], "insertSanitizedHtml gained a caller");
+  assert.match(SCRIPT_CODE, /const html = renderedHtmlOf\(message\);\s*if \(html !== ""\) \{\s*insertSanitizedHtml\(box, html\);/,
+    "the one caller no longer passes a message's content_html");
+  assert.match(SCRIPT_CODE, /const renderedHtmlOf = \(message\) =>\s*message && typeof message\.content_html === "string" \? message\.content_html : "";/);
+  assert.doesNotMatch(SCRIPT_CODE,
+    /outerHTML|insertAdjacentHTML|document\.write|createContextualFragment|DOMParser|srcdoc/);
+
+  // Dynamic: every string the page parses is some message's content_html, and never its text.
   const page = newPage();
   await signIn(page);
+  const parsed = [];
+  page.onParse = (html) => parsed.push(html);
+  const messages = [
+    message({ id: "7100000000000000003", content: "**bold** <b>x</b>", content_html: "<p><strong>bold</strong> &lt;b&gt;x&lt;/b&gt;</p>\n" }),
+    message({ id: "7100000000000000004", content: "<i>plain</i>" }),
+    message({ id: "7100000000000000005", author: "someone else", author_id: "1000000000000000005",
+      content: "see https://example.com/x", content_html: `<p>see <a href="https://example.com/x" ${LINK_ATTRS}>https://example.com/x</a></p>\n` }),
+  ];
+  await showDiscord(page, messages);
+  assert.ok(parsed.length >= 2, "the rendered bodies were not inserted");
+  for (const html of parsed) {
+    assert.ok(messages.some((m) => m.content_html === html), `the page parsed something that is no content_html: ${html}`);
+    assert.ok(!messages.some((m) => m.content === html), `the page parsed a message's raw text: ${html}`);
+  }
+});
 
-  const lines = await showDiscord(page, [
-    message({
-      content:
-        "[safe](https://example.com/x) [script](javascript:alert(1)) " +
-        "[data](data:text/html,<script>1</script>) [relative](/admin/delete)",
-    }),
+test("a rendered body keeps its links, mentions and code, each as the element the server sent", async () => {
+  const page = newPage();
+  await signIn(page);
+  const rows = await showDiscord(page, [message({
+    id: "7100000000000000006",
+    content: "**bold** *it* `code` <@123> [the fix](https://example.com/pull/1)",
+    content_html: '<p><strong>bold</strong> <em>it</em> <code>code</code> <span class="mention">@123</span> ' +
+      `<a href="https://example.com/pull/1" ${LINK_ATTRS}>the fix</a></p>\n`,
+  })]);
+  const box = mdBoxes(rows[0])[0];
+  const of = (tag) => tagged(box, tag).map((node) => node.text());
+  assert.deepStrictEqual(of("strong"), ["bold"]);
+  assert.deepStrictEqual(of("em"), ["it"]);
+  assert.deepStrictEqual(of("code"), ["code"]);
+  const [chip] = tagged(box, "span");
+  assert.equal(chip.className, "mention");
+  assert.equal(chip.text(), "@123", "a mention is the id it is, not an invented name");
+  const [link] = tagged(box, "a");
+  assert.equal(link.getAttribute("href"), "https://example.com/pull/1");
+  assert.equal(link.getAttribute("target"), "_blank");
+  assert.match(link.getAttribute("rel"), /noopener/);
+});
+
+test("the fixture refuses anything the server's sanitizer would not send, so no test can certify it", () => {
+  // The guard on every test above: a body with a <script>, an event handler or a javascript: link
+  // is an ERROR here, never a rendered row. Read from src/render.rs, so the two cannot drift.
+  assert.ok(SANITIZED_TAGS.has("ul") && SANITIZED_TAGS.has("span") && !SANITIZED_TAGS.has("script"));
+  for (const html of [
+    "<script>alert(1)</script>",
+    "<img src=\"x\">",
+    "<p onclick=\"x()\">a</p>",
+    "<p style=\"color:red\">a</p>",
+    "<a href=\"javascript:alert(1)\">a</a>",
+    "<a href=\"/relative\">a</a>",
+    "<p>unclosed",
+    "<p>a</em>",
+  ]) {
+    assert.throws(() => parseSanitizedHtml(html, new FakeElement("", "#document-fragment"), () => {}),
+      undefined, `the fixture accepted ${html}`);
+  }
+});
+
+test("search matches what a rendered row SAYS and the addresses it links to, not its Markdown", async () => {
+  const page = newPage();
+  await signIn(page);
+  const rows = await showDiscord(page, [message({
+    id: "7100000000000000007",
+    content: "re**deploy** done, see [the log](https://example.com/logs/42) <@123>",
+    content_html: '<p>re<strong>deploy</strong> done, see ' +
+      `<a href="https://example.com/logs/42" ${LINK_ATTRS}>the log</a> <span class="mention">@123</span></p>\n`,
+  })]);
+  const said = rows[0].getAttribute("data-search");
+  assert.ok(said.includes("redeploy done"), `a word split by emphasis is one word on screen: ${said}`);
+  assert.ok(said.includes("@123"), "a mention is found by the id it is drawn as");
+  assert.ok(said.includes("https://example.com/logs/42"), "a link's address no longer finds its row");
+  assert.ok(!said.includes("**") && !said.includes("<@"), `the Markdown source was searched: ${said}`);
+});
+
+test("the Links view lists the links a rendered row draws, by the names it draws them with", async () => {
+  const page = newPage();
+  await signIn(page);
+  const rows = await showDiscord(page, [message({
+    id: "7100000000000000008",
+    // The source names a refused link too; the server drew it as text, so it is not a link.
+    content: "[the doc](https://example.com/doc) and [bad](javascript:alert(1)) and https://example.com/raw",
+    content_html: `<p><a href="https://example.com/doc" ${LINK_ATTRS}>the doc</a> and bad (javascript:alert(1)) and ` +
+      `<a href="https://example.com/raw" ${LINK_ATTRS}>https://example.com/raw</a></p>\n`,
+  })]);
+  await showLinks(page);
+  assert.deepStrictEqual(linkPairs(rows[0]),
+    [["the doc", "https://example.com/doc"], ["https://example.com/raw", "https://example.com/raw"]]);
+});
+
+test("the fold measures what a row draws, and Copy text still copies what was written", async () => {
+  const page = newPage();
+  await signIn(page);
+  // Long in the source — a long address behind a short name — and short on screen.
+  const address = `https://example.com/${"a".repeat(COLLAPSE_OVER_CHARS)}`;
+  const rows = await showDiscord(page, [message({
+    id: "7100000000000000009",
+    content: `see [the summary](${address}) for **all** of it`,
+    content_html: `<p>see <a href="${address}" ${LINK_ATTRS}>the summary</a> for <strong>all</strong> of it</p>\n`,
+  })]);
+  assert.ok(rows[0].messages[0].content.length > COLLAPSE_OVER_CHARS, "the fixture's source is not long");
+  assert.equal(foldButton(rows[0]), undefined, "a row that draws one short line was folded for its source");
+  await rowMoreButton(rows[0]).click();
+  await rows[0].descendants().find((node) => node.className === "row-copy-button").click();
+  await page.settle();
+  assert.equal(page.clipboard, `see [the summary](${address}) for **all** of it`, "Copy text lost the source");
+});
+
+test("a combined row draws each of its messages as its own block", async () => {
+  const page = newPage();
+  await signIn(page);
+  const rows = await showDiscord(page, [
+    message({ id: "8000000000000000300", content: "first half with a list:\n- one",
+      content_html: "<p>first half with a list:</p>\n<ul>\n<li>one</li>\n</ul>\n", timestamp: "2026-08-19T04:31:00.000Z" }),
+    message({ id: "8000000000000000301", content: "second half", timestamp: "2026-08-19T04:31:01.000Z" }),
   ]);
+  assert.equal(rows.length, 1, "the fixture did not produce one combined row");
+  const boxes = mdBoxes(rows[0]);
+  assert.equal(boxes.length, 2, "the parts are not one block each");
+  assert.equal(tagged(boxes[0], "li").length, 1);
+  assert.equal(boxes[1].text(), "second half");
+});
 
-  const anchors = lines[0].descendants().filter((node) => node.tagName === "a");
-  assert.equal(anchors.length, 1, "exactly one of those four is safe to make tappable");
-  assert.equal(anchors[0].textContent, "safe");
-  assert.equal(anchors[0].getAttribute("href"), "https://example.com/x");
-  assert.match(anchors[0].getAttribute("rel"), /noopener/);
+test("a thread is named by what its first message says, not by its Markdown", async () => {
+  // `#194 thread-picker-polish`'s rule, the first line of the first message, read from the row's
+  // drawn text: a root that opens with `**Release plan**` is "Release plan".
+  const root = message({ content: "**Release plan**\nthe rest", content_html: "<p><strong>Release plan</strong><br>\nthe rest</p>\n" });
+  const threadName = newPage().pure("threadName");
+  assert.equal(threadName({ summary: null, root }), "Release plan");
+  assert.equal(threadName({ summary: null, root: message({ content: "- plain text root" }) }), "- plain text root");
+});
 
-  // The rejected ones are not silently dropped: the operator gets to SEE what the message said,
-  // which is the point of a verification view.
-  const text = lines[0].text();
-  assert.ok(text.includes("javascript:alert(1)"), "a refused URL must still be visible as text");
-  assert.ok(text.includes("/admin/delete"), "a same-origin URL is not automatically safe");
+test("message text is styled as one block family: bullets, hanging indent, paragraph gaps, headings", () => {
+  // Layout itself is the screenshot walk's to judge (`39-message-blocks`); what can be held here is
+  // that the rules exist on the selectors that need them.
+  assert.match(cssBlock(".md"), /white-space:\s*normal/, "the server's newlines between blocks would draw as lines");
+  assert.match(cssBlock(".md ul"), /list-style-type:\s*disc/, "a list has no round bullets");
+  assert.match(cssBlock(".md ul ul"), /list-style-type:\s*circle/);
+  // An item is not a row: the shared sheet's `.messages li` panel must not reach it.
+  assert.match(cssRules(SHARED_CSS, ".messages li").join("\n"), /padding:/, "the row rule this resets moved");
+  const item = cssBlock(".md li");
+  for (const reset of [/border:\s*0/, /padding:\s*0/, /background:\s*none/, /margin:\s*0/]) {
+    assert.match(item, reset, "a bullet point would be drawn as a row's card");
+  }
+  const indent = cssRules(CSS, ".md :is(ul").join("\n");
+  assert.match(indent, /padding-left:\s*1\.35em/, "a list has no room for its markers");
+  assert.match(indent, /list-style-position:\s*outside/, "a wrapped item would start under its bullet");
+  assert.match(cssBlock(".md > * + *"), /margin-top:\s*0\.55em/, "a blank line makes no gap");
+  assert.match(cssBlock(".md h1"), /font-size:\s*1\.25em/);
+  assert.match(cssBlock(".md pre"), /white-space:\s*pre-wrap/, "a code block lost its own spacing");
+  assert.match(cssBlock(".md table"), /overflow-x:\s*auto/, "a wide table would widen the row");
+  assert.match(cssBlock(".md .mention"), /color:\s*var\(--accent\)/);
 });
 
 test("a message with no content at all renders without throwing", async () => {
@@ -24364,6 +24563,37 @@ test("a legacy page-mode channel is saved, drawn first on reload, and merged the
   assert.deepStrictEqual(shownIds(page), ["602", "603"]);
   assert.match(page.el("discord-log").children[0].text(), /two, edited/);
   assertCurrent(page, "a legacy-mode refresh still says the rows are saved");
+});
+
+test("a saved rendered body is drawn again from the device, and one saved before the field as text", async () => {
+  // `#217 markdown-blocks`. The device keeps each message as the server sent it, so a reload draws
+  // the rendered list before any request answers. A message saved by a page from before the field
+  // existed has only its text, and is drawn as text: never handed to the HTML sink.
+  const first = newPage();
+  first.threadingSupported = true;
+  await signIn(first);
+  await showDiscord(first, [
+    message({ id: "701", ...OWNERS_MESSAGE }),
+    message({ id: "702", content: "**old** saved copy", content_html: "<p><strong>old</strong> saved copy</p>\n" }),
+  ]);
+  const cache = savedCache(first);
+  const entry = cache.scopes[scopeKey(CHANNEL.id)];
+  assert.equal(entry.messages[0].content_html, OWNERS_MESSAGE.content_html, "the rendered body was not saved");
+  delete entry.messages[1].content_html;
+  first.storage.set(MESSAGE_CACHE_KEY, JSON.stringify(cache));
+
+  const page = reloadPage(first.storage, (p) => {
+    p.threadingSupported = true;
+    p.timeline = offline;
+  });
+  const parsed = [];
+  page.onParse = (html) => parsed.push(html);
+  const [rendered, plain] = page.el("discord-log").children;
+  assert.equal(tagged(mdBoxes(rendered)[0], "li").length, 6, "the saved list was not drawn as a list");
+  assert.equal(tagged(mdBoxes(plain)[0], "strong").length, 0, "a saved body without HTML was rendered");
+  assert.equal(mdBoxes(plain)[0].text(), "**old** saved copy");
+  await page.settle();
+  assert.ok(!parsed.includes("**old** saved copy"), "the old saved text reached the HTML sink");
 });
 
 test("offline, the saved rows stay up and say how old they are, and the next poll recovers", async () => {

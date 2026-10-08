@@ -3978,7 +3978,7 @@ def links_walk(chromium: BrowserType, args: argparse.Namespace, label: str, widt
             until("() => document.getElementById('links-filter').hidden", "folding the bar left Links on screen")
             check(page.evaluate("() => document.getElementById('links-filter').getAttribute('aria-pressed')") == "false",
                   f"{label}: Links still says it is on")
-            until("() => !document.querySelector('#discord-log li.search-hidden, #discord-log .row-links')",
+            until("() => !document.querySelector('#discord-log > li.search-hidden, #discord-log .row-links')",
                   "folding the bar left the Links view up")
 
             # Over the call view there are no pins: Links stands beside the glass on its own.

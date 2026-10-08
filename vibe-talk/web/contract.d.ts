@@ -387,6 +387,23 @@ declare namespace VibeTalk {
      */
     content: string;
     /**
+     * The body as the page draws it: `content` rendered from Markdown and SANITIZED, by
+     * [`crate::render`]. `#217 markdown-blocks`.
+     *
+     * A third field for the same body, and it answers a third question: not what was written
+     * (`content`, which a copy keeps and the speech path falls back to) nor what a voice should
+     * say (`spoken_content`), but what the reader should SEE — lists with bullets, paragraphs with
+     * space between them, a link that is a link. HTML the server's sanitizer has already cut to a
+     * small allowlist, so the page inserts it as it stands and builds no markup of its own from
+     * channel text.
+     *
+     * EMPTY means "draw `content` as plain paragraphs", by the convention `spoken_content`
+     * follows: it is what a message carries before anything renders it — on every path toward a
+     * model, which has no use for HTML — and what it carries when rendering changed nothing,
+     * which is most chat. Filled only on the routes the page reads.
+     */
+    content_html?: string;
+    /**
      * Snowflake of this message.
      */
     id: MessageId;
@@ -614,6 +631,12 @@ declare namespace VibeTalk {
      * Its text when it was pinned, at most [`MAX_PIN_TEXT_CHARS`] characters. UNTRUSTED.
      */
     content: string;
+    /**
+     * The snapshot's text as the page draws it, rendered and sanitized when the pin is SERVED,
+     * never stored. It follows [`crate::model::Message::content_html`]'s convention: empty means
+     * "draw the text as plain paragraphs". `#217 markdown-blocks`.
+     */
+    content_html?: string;
     /**
      * The message pinned, in the provider-neutral namespace the page was served it in.
      */

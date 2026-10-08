@@ -562,6 +562,7 @@ mod tests {
             reply_to: None,
             content: format!("message {id}"),
             spoken_content: String::new(),
+            content_html: String::new(),
             thread: None,
             noise: false,
             reactions: None,

@@ -35,6 +35,9 @@ path = "src/bin/mock_elevenlabs.rs"
 
 [dependencies]
 anyhow = "1"
+# The sanitizer every rendered message body passes through before it reaches the page. See
+# `src/render.rs`: comrak writes the HTML, and ammonia decides what of it may exist.
+ammonia = "4"
 async-trait = "0.1"
 axum = { version = "0.8", default-features = false, features = [
     "http1",
@@ -44,6 +47,11 @@ axum = { version = "0.8", default-features = false, features = [
 ] }
 base64 = "0.22"
 bytes = "1"
+# Message bodies are rendered HERE, not in the browser: GitHub-flavoured Markdown with chat's line
+# breaks. Without default features, which are its command-line front end and syntax highlighting —
+# neither is wanted by a server that only parses a document and formats it. 0.55 rather than the
+# newest because 0.56 raised its minimum Rust past this crate's declared 1.85.
+comrak = { version = "0.55", default-features = false }
 # Ticket minting only: 256 bits from the system CSPRNG. Already in the tree transitively.
 getrandom = "0.3"
 futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
@@ -87,6 +95,12 @@ tokio-tungstenite = { version = "0.30", default-features = false, features = [
     "rustls-tls-webpki-roots",
 ] }
 toml = "0.8"
+# Response compression for the page, its assets and its JSON. Already in the tree through reqwest;
+# these features add only the two encoders. See `crate::http::router`.
+tower-http = { version = "0.6", default-features = false, features = [
+    "compression-br",
+    "compression-gzip",
+] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # Response compression. Everything the server sent went out uncompressed — the page script alone

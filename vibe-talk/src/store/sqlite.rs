@@ -1285,6 +1285,7 @@ impl StateStore for SqliteStore {
                             thread_root: row.get::<_, i64>(8)? != 0,
                         },
                         pinned_at_ms: row.get::<_, i64>(9)?,
+                        content_html: String::new(),
                     })
                 })
                 .map_err(backend)?;
@@ -1404,6 +1405,7 @@ impl StateStore for SqliteStore {
                 pin: Some(Pin {
                     snapshot,
                     pinned_at_ms,
+                    content_html: String::new(),
                 }),
                 unpinned,
                 revision,

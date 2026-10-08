@@ -122,8 +122,25 @@ const SEEDED_BACKLOG: &[(&str, &str)] = &[
          flake, it is a real ordering bug that only shows up when the machine is loaded, and I \
          would rather we not label it flaky because that is how it gets ignored.",
     ),
+    // `#217 markdown-blocks`: the shape of message the page used to draw as literal dashes with
+    // the closing lines run together — a paragraph, a list whose items run on to an indented line,
+    // a blank line, and two closing paragraphs. The server renders it, so the screenshot walk
+    // photographs the server's rendering (`39-message-blocks`). Under the summary threshold below,
+    // so the long entry after it is still the only one a summary is written for, and over the
+    // page's fold, as such an answer is.
+    (
+        "claude-integ",
+        "seeded: where the release stands this morning:\n\n\
+         - the build is green on both runners\n\
+         - the flaky ordering test is quarantined\n  and has an issue filed against it\n\
+         - the docs are updated\n\
+         - the release notes are drafted\n\
+         - the tag is not pushed yet\n  because it waits on your review\n\
+         - nothing else is open\n\n\n\
+         I will push the tag when you say so.\n\nThanks!",
+    ),
     // OVER `summaries.threshold_chars`, which is 400 by default, and it is the only entry here
-    // that is. Everything above is between 140 and 340 characters, so against this backlog every
+    // that is. Everything above is between 140 and 350 characters, so against this backlog every
     // summary the page asked for came back `below_threshold` and `#49 cached-summaries` could not
     // be exercised locally AT ALL — the seam existed, the endpoint answered, and nothing a
     // developer could see ever produced a summary. It is also the honest case: the message this

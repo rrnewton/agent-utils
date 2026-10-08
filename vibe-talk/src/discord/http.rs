@@ -448,6 +448,7 @@ pub fn parse_message(value: &serde_json::Value) -> Result<Message, ChatError> {
         // reads a message is an application decision, not something a chat adapter gets a say in.
         // See `crate::model::Message::spoken_content`.
         spoken_content: String::new(),
+        content_html: String::new(),
         noise: false,
         reactions: parse_reactions(value.get("reactions")),
     })
@@ -1020,6 +1021,7 @@ mod tests {
             request_timeout_seconds: 20,
             channel_registration,
             upstream_read_marks: false,
+            markup: crate::render::Markup::GoogleChat,
         }
     }
 

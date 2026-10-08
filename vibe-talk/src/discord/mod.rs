@@ -6,6 +6,7 @@
 
 pub mod fake;
 pub mod http;
+pub mod markup;
 pub mod ratelimit;
 pub mod split;
 

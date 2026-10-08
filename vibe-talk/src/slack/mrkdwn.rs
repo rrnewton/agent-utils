@@ -17,8 +17,12 @@
 //!
 //! User mentions are kept verbatim because vibe-talk's mention syntax is the same `<@id>`: a reply
 //! that quotes one notifies the same person in Slack, and the speech preparer already reads it as
-//! "a mention". Emphasis markers are left alone; both dialects use `*` and `_`, and the speech
-//! preparer strips them either way.
+//! "a mention". Emphasis markers are left alone here, because the two dialects use the same
+//! characters and the speech preparer strips them either way; what they MEAN differs — `*a*` is
+//! bold in Slack and italic in Markdown — and that is settled where bodies are drawn, by
+//! [`crate::render::Markup::asterisk_is_bold`].
+
+use std::borrow::Cow;
 
 /// Rewrite Slack `mrkdwn` into the Discord-markdown forms the rest of the server reads.
 #[must_use]
@@ -140,4 +144,101 @@ fn user_mention_at(text: &str) -> Option<&str> {
             .bytes()
             .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit()))
     .then(|| &text[..end + 3])
+}
+
+/// Rewrite only the LINKS of this syntax into Markdown, leaving every other character as written.
+/// `#217 markdown-blocks`.
+///
+/// For the page's renderer, which reads Google Chat's text this way too: both services send a
+/// link as `<https://x|label>`, and to CommonMark that is an autolink whose address and text are
+/// both `https://x|label`. Only links, and only `http` and `https` ones, because the rest of
+/// [`to_markdown`] — entities, `<!here>`, channel names — is a Slack reader's job, and doing it to
+/// text that has already been read would decode an entity twice. A Slack provider's bodies have
+/// been through [`to_markdown`] already and hold none of these, so this changes nothing for them.
+///
+/// The address goes in angle brackets so that a parenthesis in it cannot end the link early, and
+/// a bracket in the label is escaped so that it cannot either.
+#[must_use]
+pub fn angle_links(text: &str) -> Cow<'_, str> {
+    let mut out = String::new();
+    let mut copied = 0;
+    let mut from = 0;
+    while let Some(found) = text[from..].find('<') {
+        let at = from + found;
+        from = at + 1;
+        let Some((length, href, label)) = angle_link_at(&text[at..]) else {
+            continue;
+        };
+        out.push_str(&text[copied..at]);
+        out.push('[');
+        for character in label.chars() {
+            if matches!(character, '[' | ']' | '\\') {
+                out.push('\\');
+            }
+            out.push(character);
+        }
+        out.push_str("](<");
+        out.push_str(href);
+        out.push_str(">)");
+        copied = at + length;
+        from = copied;
+    }
+    if copied == 0 {
+        return Cow::Borrowed(text);
+    }
+    out.push_str(&text[copied..]);
+    Cow::Owned(out)
+}
+
+/// `<https://x|label>` at the start of `text`, with a label that is not empty and not the address
+/// itself, as its length, the address and the label. A bare `<https://x>` is already a CommonMark
+/// autolink and is left alone.
+fn angle_link_at(text: &str) -> Option<(usize, &str, &str)> {
+    let inner = &text[1..text.find(['>', '\n'])?];
+    if text.as_bytes().get(1 + inner.len()) != Some(&b'>') || inner.contains('<') {
+        return None;
+    }
+    let (href, label) = inner.split_once('|')?;
+    let scheme = href.get(..8).unwrap_or(href).to_ascii_lowercase();
+    if !(scheme.starts_with("http://") || scheme.starts_with("https://"))
+        || href.chars().any(char::is_whitespace)
+    {
+        return None;
+    }
+    let label = label.trim();
+    (!label.is_empty() && label != href).then_some((inner.len() + 2, href, label))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::angle_links;
+
+    #[test]
+    fn a_labelled_link_becomes_a_markdown_link_and_nothing_else_changes() {
+        assert_eq!(
+            angle_links("see <https://example.com/a_(b)|the *doc*> &amp; <@U1> <!here>"),
+            "see [the *doc*](<https://example.com/a_(b)>) &amp; <@U1> <!here>"
+        );
+        assert_eq!(
+            angle_links("<HTTP://x.test/|a [b] \\ c>"),
+            "[a \\[b\\] \\\\ c](<HTTP://x.test/>)"
+        );
+    }
+
+    #[test]
+    fn what_is_not_a_labelled_web_link_is_left_as_written() {
+        for text in [
+            "no links",
+            "<https://example.com>",
+            "<https://example.com|>",
+            "<https://example.com|https://example.com>",
+            "<javascript:alert(1)|click>",
+            "<https://a b|label>",
+            "<https://a|label",
+            "<https://a|la\nbel>",
+            "a < b > c",
+        ] {
+            assert_eq!(angle_links(text), text, "{text:?} was rewritten");
+        }
+    }
 }

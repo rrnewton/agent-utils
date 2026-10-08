@@ -184,6 +184,7 @@ mod tests {
             reply_to: None,
             content: content.to_owned(),
             spoken_content: String::new(),
+            content_html: String::new(),
             noise: false,
             reactions: None,
         }

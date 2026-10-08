@@ -3067,9 +3067,110 @@ body {
   font-size: 0.82rem;
 }
 
-/* --------------------------------------------------------------- raw Discord, rendered ----- */
+/* ---------------------------------------------------------- message text, as rendered ----- */
+/*
+ * `#217 markdown-blocks`. Every message body is a `.md` box: the server's rendering of it, or its
+ * text as plain paragraphs. These rules are what make the two read like the chat service's own
+ * client — round bullets with the text hanging clear of them, a gap at each blank line, headings a
+ * little larger than the text, and code set apart — and they are the only rules that style
+ * message text, so the channel, the reply screen, the pinned list and a message still being sent
+ * all read alike.
+ *
+ * `white-space: normal`, against the `pre-wrap` the shared `.body` rule gives everything else:
+ * the server's HTML has a newline between its blocks, and pre-wrap would draw each one as an empty
+ * line. A line break inside a paragraph is a `<br>`, so nothing written is lost. Only `pre` keeps
+ * its own spacing.
+ */
+.md {
+  white-space: normal;
+  overflow-wrap: anywhere;
+}
 
-.md-code {
+/* No margin of their own at either end, so a one-line message is one line tall and the row's own
+   padding is what spaces it from the next. `:where`, which adds nothing to the selector's weight,
+   so the gap below — a rule no heavier than `.md` — still wins over it. */
+.md :where(p, ul, ol, pre, blockquote, table, h1, h2, h3, h4, hr) {
+  margin: 0;
+}
+
+/* THE GAP AT A BLANK LINE: between any two blocks, at every depth — paragraphs, a list after its
+   introduction, the paragraph after a list, two parts of a combined row. Less than a full line,
+   the way a chat client spaces paragraphs rather than the way a document does. */
+.md > * + *,
+.md + .md,
+.md :is(li, blockquote) > * + * {
+  margin-top: 0.55em;
+}
+
+/* HANGING INDENT. The marker sits in the padding, outside the text, so a second line of an item —
+   a wrapped one or a continuation the writer indented — starts under the first line's text and
+   not under the bullet. */
+.md :is(ul, ol) {
+  padding-left: 1.35em;
+  list-style-position: outside;
+}
+
+.md ul {
+  list-style-type: disc;
+}
+
+/* AN ITEM IN A MESSAGE IS NOT A ROW. Every row of a list here is an `li` too, and the shared sheet's
+   `.messages li` gives each one a panel, a border, a radius and padding — which, before this, drew
+   every bullet point of a message as a little card of its own. */
+.md li {
+  background: none;
+  border: 0;
+  border-radius: 0;
+  padding: 0;
+  margin: 0;
+}
+
+.md ul ul {
+  list-style-type: circle;
+}
+
+.md li + li,
+.md li > :is(ul, ol) {
+  margin-top: 0.25em;
+}
+
+.md li::marker {
+  color: var(--muted);
+}
+
+/* A task list's checkbox is its marker. */
+.md .contains-task-list {
+  padding-left: 0.2em;
+  list-style: none;
+}
+
+.md .task-list-item-checkbox {
+  margin: 0 0.4em 0 0;
+  vertical-align: -0.1em;
+}
+
+.md :is(h1, h2, h3, h4) {
+  font-weight: 650;
+  line-height: 1.25;
+}
+
+.md h1 {
+  font-size: 1.25em;
+}
+
+.md h2 {
+  font-size: 1.16em;
+}
+
+.md h3 {
+  font-size: 1.08em;
+}
+
+.md h4 {
+  font-size: 1em;
+}
+
+.md code {
   font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
   font-size: 0.85em;
   background: var(--bg);
@@ -3078,26 +3179,64 @@ body {
   padding: 0 0.25em;
 }
 
-.md-pre {
+.md pre {
   font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
   font-size: 0.85em;
   background: var(--bg);
   border: 1px solid var(--edge);
   border-radius: 0.35rem;
   padding: 0.4rem 0.5rem;
-  margin: 0.35rem 0;
   white-space: pre-wrap;
   overflow-wrap: anywhere;
 }
 
-.md-quote {
+.md pre code {
+  font-size: inherit;
+  background: none;
+  border: 0;
+  padding: 0;
+}
+
+.md blockquote {
   border-left: 3px solid var(--edge);
   padding-left: 0.6rem;
-  margin: 0.2rem 0;
   color: var(--muted);
 }
 
-.md-mention {
+.md hr {
+  border: 0;
+  border-top: 1px solid var(--edge);
+}
+
+/* A table scrolls sideways inside its row rather than widening the row past a phone's screen. */
+.md table {
+  display: block;
+  max-width: 100%;
+  overflow-x: auto;
+  border-collapse: collapse;
+}
+
+.md :is(th, td) {
+  border: 1px solid var(--edge);
+  padding: 0.2em 0.5em;
+  text-align: left;
+  overflow-wrap: normal;
+}
+
+.md th {
+  font-weight: 650;
+}
+
+.md :is(th, td)[align="center"] {
+  text-align: center;
+}
+
+.md :is(th, td)[align="right"] {
+  text-align: right;
+}
+
+/* A mention is the id it is: no directory here turns it into a name. */
+.md .mention {
   color: var(--accent);
 }
 

@@ -28,6 +28,7 @@ fn message(id: &str, content: &str, thread: bool) -> Message {
         reply_to: None,
         content: content.to_owned(),
         spoken_content: String::new(),
+        content_html: String::new(),
         noise: false,
         thread: thread.then(|| MessageThread {
             id: THREAD.to_owned(),

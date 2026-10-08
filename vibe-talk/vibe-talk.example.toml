@@ -28,6 +28,9 @@ bind = "0.0.0.0:8080"
 # Source service named in errors, diagnostics, and the app. A compatible bridge can set
 # this to "Google Chat"; the HTTP wire format and existing configuration keys stay the same.
 provider_name = "Discord"
+# How the service writes message text, for the page's renderer: "discord", or "google-chat" for a
+# bridge serving Google Chat, where *a* is bold and a link may arrive as <https://...|label>.
+# markup = "discord"
 # Thread protocol: "native" for Discord, "bridge" for compatible normalized thread endpoints,
 # or "off" for an older bridge without thread support. Thread ids and cursors are opaque.
 thread_api = "native"

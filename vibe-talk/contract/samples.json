@@ -324,6 +324,7 @@
         "author_is_bot": false,
         "channel_id": "100",
         "content": "hello",
+        "content_html": "<p><em>hello</em></p>\n",
         "id": "301",
         "noise": true,
         "reactions": [
@@ -379,6 +380,7 @@
       "author_is_bot": false,
       "channel_id": "100",
       "content": "hello",
+      "content_html": "<p><em>hello</em></p>\n",
       "id": "301",
       "noise": true,
       "reactions": [
@@ -462,6 +464,7 @@
         "author_id": "7",
         "author_is_bot": true,
         "content": "hello",
+        "content_html": "<p><strong>hello</strong></p>\n",
         "message_id": "301",
         "pinned_at_ms": 1790000000000,
         "thread_id": "t1",
@@ -522,6 +525,7 @@
           "author_id": "7",
           "author_is_bot": true,
           "content": "hello",
+          "content_html": "<p><strong>hello</strong></p>\n",
           "message_id": "301",
           "pinned_at_ms": 1790000000000,
           "thread_id": "t1",
@@ -612,6 +616,7 @@
           "author_is_bot": false,
           "channel_id": "100",
           "content": "hello",
+          "content_html": "<p><em>hello</em></p>\n",
           "id": "301",
           "noise": true,
           "reactions": [
@@ -720,6 +725,7 @@
           "author_is_bot": false,
           "channel_id": "100",
           "content": "hello",
+          "content_html": "<p><em>hello</em></p>\n",
           "id": "301",
           "noise": true,
           "reactions": [
@@ -864,6 +870,7 @@
           "author_is_bot": false,
           "channel_id": "100",
           "content": "hello",
+          "content_html": "<p><em>hello</em></p>\n",
           "id": "301",
           "noise": true,
           "reactions": [

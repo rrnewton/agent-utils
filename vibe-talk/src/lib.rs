@@ -54,6 +54,7 @@ pub mod ops;
 pub mod post_gate;
 pub mod probe;
 pub mod providers;
+pub mod render;
 pub mod replay;
 pub mod retrieval;
 pub mod slack;

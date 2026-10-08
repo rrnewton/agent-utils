@@ -1055,6 +1055,7 @@ code path the startup probe uses, which is itself in the same position — see *
 | Channel registration | `discord.channel_registration` | — | **off by default**; enable only when `discord.api_base` is a compatible bridge implementing `POST /channels` and `DELETE /channels/{id}` |
 | Upstream read marks | `discord.upstream_read_marks` | — | **off by default**; enable only when `discord.api_base` is a compatible bridge implementing `POST /channels/{id}/read` |
 | Chat service name | `discord.provider_name` | — | `Discord`; set to the source service's name (for example, `Google Chat`) when using a compatible HTTP bridge |
+| Message markup | `discord.markup` | — | how the service writes message text, for the page's renderer: `discord` (default), `google-chat` for a bridge serving Google Chat, where `*a*` is bold and a link may arrive as `<https://…\|label>`, or `slack` for a bridge passing Slack's text through. A Slack provider is always `slack` and refuses the key. See [How message text is drawn](#how-message-text-is-drawn) |
 | Thread protocol | `discord.thread_api` | — | `native` (default) for Discord, `bridge` for the normalized endpoints below, or `off` to disable child-thread timelines; an added source that identifies one upstream conversation remains an ordinary channel-picker entry in every mode |
 | Discord bot token | `discord.bot_token` | `VIBE_TALK_DISCORD_BOT_TOKEN` | **secret** |
 | Read token | `auth.read_token` | `VIBE_TALK_READ_TOKEN` | **secret**, ≥ 24 chars |
@@ -1114,6 +1115,7 @@ default_fetch_limit = 50
 key = "gchat"
 kind = "discord"                         # Discord's HTTP API, or a bridge speaking it
 name = "Google Chat"
+markup = "google-chat"                   # *a* is bold there; see "How message text is drawn"
 api_base = "http://127.0.0.1:18765/api/v10"
 token = "REPLACE-ME"                     # or VIBE_TALK_PROVIDER_GCHAT_TOKEN
 channel_registration = true
@@ -1138,7 +1140,7 @@ Keys common to both kinds: `key` (1–32 lowercase letters, digits, or hyphens),
 or `slack`), `name` (display name; defaults to `Discord` or `Slack`), `api_base`, `token`,
 `owner_user_id`, `request_timeout_seconds` (default `20`, range `1`–`120`), `live_poll_seconds`
 (default `0`, off; at least `5`), and `channel_registration`. Discord-protocol providers also take
-`thread_api` and `upstream_read_marks`, with the same meaning as in `[discord]`. Slack providers
+`thread_api`, `upstream_read_marks` and `markup`, with the same meaning as in `[discord]`. Slack providers
 also take `registered_channels_writable` and `channel_discovery`; see [Slack](#slack). A key that
 does not apply to the provider's kind is refused by name.
 
@@ -1612,7 +1614,7 @@ own adapter-only token; every other route uses the read/write tokens described a
 | GET | `/api/v1/channels/{id}/messages/{message_id}` | read | one message in full |
 | GET | `/api/v1/channels/{id}/digest?limit=&width=` | read | one speakable line per message |
 | GET | `/api/v1/channels/{id}/messages/{message_id}/summary` | read | one message summarised, from cache when it can be |
-| GET | `/api/v1/channels/{id}/page?limit=&before=&since=&until=&hours=` | read | **one step of a walk**, saying that it is one |
+| GET | `/api/v1/channels/{id}/page?limit=&before=&since=&until=&hours=&render=` | read | **one step of a walk**, saying that it is one; `render=html` adds each message's `content_html`, which the page asks for and the voice agent's `read_page` does not |
 | GET | `/api/v1/channels/{id}/timeline?view=&thread_id=&limit=&before=&after=` | read | main channel, thread list, flattened history, or one thread; opaque backward cursor, or `after=` for what changed since a newest read: `400 cursor_mismatch` for a cursor from another channel, view or thread, `410 cursor_expired` for one the backend can no longer continue — read the newest page again (`#203 incremental-refresh`) |
 | GET | `/api/v1/channels/{id}/count?since=&hours=&cap=` | read | a bounded, honest count |
 | POST | `/api/v1/channels/{id}/resolve` | read | **semantic random access** |
@@ -2676,6 +2678,51 @@ Where a call ends and the next begins is drawn as a **seam**, because an unbroke
 itself a claim that it is all one conversation, and across a walk back through weeks of calls that
 claim is false more often than it is true.
 
+### How message text is drawn
+
+`#217 markdown-blocks`. A message is drawn the way the chat service's own client draws it: a `- `
+list has round bullets with each item's text hanging clear of them, a continuation line stays
+inside its item, a blank line is a gap between paragraphs, a heading is a little larger than the
+text, a table is a table, and code is set apart. The page used to render Markdown itself, one block
+per line, and drew lists as literal dashes and ran paragraphs together; it renders nothing now.
+
+**The server renders every body**, on the routes the page reads — the timeline, the to-do list, the
+live stream, a post's answer and the pins — and sends it beside the text as `content_html`:
+
+1. The provider's own syntax is turned into Markdown first. Every provider's mention, `<@id>` or
+   `<#id>`, becomes a chip showing the id; a `<https://…|label>` link from Google Chat or Slack
+   becomes a link named by its label.
+2. [comrak](https://github.com/kivikakk/comrak) parses GitHub-flavoured Markdown — tables,
+   strikethrough, task lists, and bare `https://…` and `www.…` addresses as links — with chat's two
+   line rules: a single newline is a line break, and only a blank line starts a paragraph. A line
+   of `---` under a sentence is a rule, not a heading.
+3. On Google Chat and Slack, where `*a*` means bold, an asterisk emphasis is drawn bold; `_a_` stays
+   italic and `**a**` is bold everywhere. That is the provider's `markup` setting
+   ([Configuration](#configuration)): a Slack provider is always Slack's, and a Discord-protocol
+   bridge says `markup = "google-chat"` when it serves Google Chat.
+4. An image is drawn as a link to it, so no phone fetches it from wherever the message pointed. A
+   link to anything but `http` or `https` is drawn as its text with the address after it, so the
+   reader still sees what the message pointed at.
+5. Raw HTML written in a message is shown as the characters it is, and
+   [ammonia](https://github.com/rust-ammonia/ammonia) then keeps only a short allowlist of
+   elements and attributes; see [Security](#security).
+
+**A plain message carries no HTML.** When drawing the text as paragraphs would look the same —
+most chat — `content_html` is left off and the page draws `content` itself, so a window of messages
+is not sent twice. A message saved on the device before the field existed is drawn the same way:
+as its text, never as markup. Nothing a model reads carries the field: `/messages`, `/digest`, one
+message by id, the MCP tools, and `/page` unless the page asks with `render=html`.
+
+**What reads which form.** What a row draws is what the fold measures, what search matches and
+what names a thread by its first message. **Copy text copies what was written**, Markdown and all,
+because a pasted message should keep its own markup (`#198 copy-message-text`); pinning sends that
+text too, and the device voice and the live relay still say the server's spoken form, falling back
+to it — which is why `content` still travels beside `content_html`.
+
+The page, its script and its JSON travel **compressed** — brotli or gzip, as the browser offers —
+and the live stream and read-aloud audio do not: an event has to reach the page when it happens,
+not when a compressor's buffer fills, and audio is compressed already.
+
 ### Finding something in what is on screen
 
 A magnifying glass floating over the top-right corner of the list opens a field, and the field
@@ -2696,6 +2743,11 @@ take the field's room for it, so at 150% type the field still shows what is type
 aside while the bar is open, and the list makes room for the bar at its head so the first match is
 never underneath it. A reader who moved the control bar to the top keeps it there while searching:
 the field no longer shares that row.
+
+**It matches what a row says**, as the reader sees it, and the author's name: a word split by
+emphasis marks is one word, a mention is found by the `@id` it is drawn as, and the Markdown source
+is not searched. The address of every link a row draws is searched too, so a pasted address still
+finds its row (`#217 markdown-blocks`).
 
 **Every term has to match**, and matching is substring rather than whole-word: a second word is
 typed to narrow, and "runner" has to find "runners". **Double quotes group words into one term**,
@@ -2740,6 +2792,11 @@ matches it, and with Pinned on as well it is the pins that hold a link. When not
 list says which answer it is: no links in what is loaded, none of the pins has a link, or none of
 the messages with a link matches the search. Closing the search bar turns it off, as it does
 Pinned.
+
+**A message the server rendered lists the links it draws** — its anchors, by the names they are drawn
+with — so the Links view and the row never disagree about what is a link (`#217 markdown-blocks`;
+see [How message text is drawn](#how-message-text-is-drawn)). The rules below are for text no
+server rendered: a voice turn, a message being sent, a message saved before rendering existed.
 
 Only **http and https** addresses become links; `javascript:`, `data:` and anything without a scheme
 never do. Three forms are read: a bare address, with the sentence's punctuation after it left off
@@ -3946,8 +4003,14 @@ makes it, not the voice agent, the real security boundary of the whole design.
 * The image runs as a non-root user and contains no configuration.
 * Durable state is `0600` in a `0700` directory, is bounded by retention, and is off unless an
   absolute path is configured. See **Durable state** above.
-* The web app never uses `innerHTML` and never renders markdown, so channel text cannot become
-  markup or a tappable link.
+* **Channel text becomes markup in one place, on the server, through a sanitizer.** Message bodies
+  are rendered by comrak and cut by ammonia to a short allowlist — paragraphs, lists, emphasis,
+  code, quotes, four heading levels, tables, a mention chip, and links to `http`/`https` only,
+  each opening in a new tab with `noopener noreferrer nofollow`; no script, style, event handler,
+  `src`, `id` or `class` beyond the few listed. Raw HTML written in a message is shown as text.
+  The page parses exactly one kind of string as HTML, a message's `content_html`, through an inert
+  `<template>`; everything else it shows, message text included, goes in through `textContent`.
+  The page suite holds that sink to one call site. See [How message text is drawn](#how-message-text-is-drawn).
 
 **What v0 does NOT do — the honest list.**
 

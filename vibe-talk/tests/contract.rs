@@ -69,6 +69,7 @@ fn message(id: &str) -> Message {
         reply_to: None,
         content: "hello".into(),
         spoken_content: String::new(),
+        content_html: String::new(),
         noise: false,
         reactions: None,
     }
@@ -89,6 +90,8 @@ fn threaded_message(id: &str) -> Message {
         // `#196 auto-read-noise`: present on one sample and absent on the other, so the
         // generated validators are proven against both.
         noise: true,
+        // `#217 markdown-blocks`, the same way.
+        content_html: "<p><em>hello</em></p>\n".into(),
         // `#219 emoji-reactions`: a standard emoji and a custom one here, none on the plain
         // sample, and an empty list on a third, because absent and empty are different answers.
         reactions: Some(vec![
@@ -248,6 +251,12 @@ fn pin(id: &str, threaded: bool) -> Pin {
             thread_root: threaded,
         },
         pinned_at_ms: 1_790_000_000_000,
+        // `#217 markdown-blocks`: present on the threaded sample and absent on the other.
+        content_html: if threaded {
+            "<p><strong>hello</strong></p>\n".into()
+        } else {
+            String::new()
+        },
     }
 }
 

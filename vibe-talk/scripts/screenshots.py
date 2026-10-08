@@ -725,6 +725,10 @@ class Profile:
     scale: float
     mobile: bool
     user_agent: str
+    # Captured only for the scenes that name it in `Scene.profiles`, rather than for the whole walk.
+    # A width a scene's subject needs to be seen at need not cost the forty other scenes a profile
+    # each -- nor make each of them a claim about a device it was never designed against.
+    opt_in: bool = False
 
     def context_options(self, theme: Theme) -> ContextOptions:
         return {
@@ -746,6 +750,10 @@ IPHONE_UA = (
 DESKTOP_UA = (
     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) "
     "Chrome/140.0.0.0 Safari/537.36"
+)
+ANDROID_UA = (
+    "Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/140.0.0.0 Mobile Safari/537.36"
 )
 
 PROFILES: tuple[Profile, ...] = (
@@ -791,6 +799,19 @@ PROFILES: tuple[Profile, ...] = (
         scale=1.0,
         mobile=False,
         user_agent=DESKTOP_UA,
+    ),
+    Profile(
+        # `#217 markdown-blocks`. The Android width the offline-cache suite also uses, for the one
+        # state whose subject is how message text lays out at a phone's width: a bullet's hanging
+        # indent and the gap at a blank line are exactly what a few pixels of width change.
+        name="android-412",
+        what="a 412px Android phone, for message text only",
+        width=412,
+        height=915,
+        scale=2.625,
+        mobile=True,
+        user_agent=ANDROID_UA,
+        opt_in=True,
     ),
 )
 
@@ -1040,9 +1061,9 @@ def _act_seam_open(driver: Driver) -> None:
     # The disclosure inside the end-of-call seam. Its first capture caught it unfolding UNDERNEATH
     # the dock, where it is invisible -- the page scrolls it into view on `toggle`, and whether that
     # actually worked is a layout fact no behavioural test can see.
-    driver.page.click("#transcript li.seam summary")
+    driver.page.click("#transcript > li.seam summary")
     driver.page.wait_for_function(
-        "() => !!document.querySelector('#transcript li.seam details[open]')", timeout=5_000
+        "() => !!document.querySelector('#transcript > li.seam details[open]')", timeout=5_000
     )
     driver.settle(500)  # the scrollIntoView the page runs on toggle has to land before the shutter
 
@@ -1069,7 +1090,7 @@ def _act_discord(driver: Driver) -> None:
     driver.click("view-switch")
     # A real read of the real server's channel; --fake-discord seeds it.
     driver.page.wait_for_function(
-        "() => document.querySelectorAll('#discord-log li').length > 0 "
+        "() => document.querySelectorAll('#discord-log > li').length > 0 "
         "&& !window.__visible('channel-loading')",
         timeout=15_000,
     )
@@ -1227,7 +1248,7 @@ def _act_one_expanded(driver: Driver) -> None:
     # happened to be longest — at desktop width it passed for the wrong reason.
     driver.js(
         "(() => { const items = "
-        "[...document.querySelectorAll(\"#transcript li[data-collapsed='true']\")]; "
+        "[...document.querySelectorAll(\"#transcript > li[data-collapsed='true']\")]; "
         "const li = items.sort((a, b) => b.textContent.length - a.textContent.length)[0]; "
         "li.id = 'fold-probe'; "
         "window.__foldedHeight = li.querySelector('.body').getBoundingClientRect().height; "
@@ -1235,7 +1256,7 @@ def _act_one_expanded(driver: Driver) -> None:
     )
     driver.page.click("#fold-probe .fold")
     driver.page.wait_for_function(
-        "() => !!document.querySelector(\"#transcript li[data-collapsed='false']\")", timeout=5_000
+        "() => !!document.querySelector(\"#transcript > li[data-collapsed='false']\")", timeout=5_000
     )
     # Playwright scrolls an element into view before clicking it, which parks the opened message
     # alone on the screen — a picture of one long message, not of one long message AMONG the
@@ -1419,6 +1440,10 @@ def _act_connection_failed(driver: Driver) -> None:
 # under the keyboard -- is a layout fact nothing else here can see.
 
 
+# A ROW IS `#discord-log > li`, never `#discord-log li`. `#217 markdown-blocks`: a message body is
+# the server's rendered HTML, and a message with a list holds `li` elements of its own, so the
+# descendant selector counted a message's bullet points as rows -- and the ordering check of
+# `21-channel-older-loaded` read their missing ids as history out of order.
 def _act_open_channel(driver: Driver) -> None:
     driver.load(with_token=True)
     driver.page.wait_for_function("() => window.__visible('control-pane')", timeout=10_000)
@@ -1427,7 +1452,7 @@ def _act_open_channel(driver: Driver) -> None:
     # but they cannot certify a scene that says it read the real throwaway server. Wait for both the
     # rows and the end of the live read, so a saved snapshot alone never satisfies this precondition.
     driver.page.wait_for_function(
-        "() => document.querySelectorAll('#discord-log li').length > 0 "
+        "() => document.querySelectorAll('#discord-log > li').length > 0 "
         "&& !window.__visible('channel-loading')",
         timeout=15_000,
     )
@@ -1453,11 +1478,11 @@ def _act_whole_channel(driver: Driver) -> None:
             break
         driver.js(
             "(() => { window.__walkFrom = "
-            "document.querySelectorAll('#discord-log li').length; "
+            "document.querySelectorAll('#discord-log > li').length; "
             "document.getElementById('scroll-area').scrollTop = 0; return window.__walkFrom; })()"
         )
         driver.page.wait_for_function(
-            "() => document.querySelectorAll('#discord-log li').length > window.__walkFrom",
+            "() => document.querySelectorAll('#discord-log > li').length > window.__walkFrom",
             timeout=10_000,
         )
         driver.settle(120)
@@ -1486,7 +1511,7 @@ def _act_channel_older(driver: Driver) -> None:
         state = driver.js(
             "(() => { const b = document.getElementById('load-older'); "
             "return JSON.stringify({ visible: window.__visible('load-older'), "
-            "disabled: b.disabled, rows: document.querySelectorAll('#discord-log li').length }); })()"
+            "disabled: b.disabled, rows: document.querySelectorAll('#discord-log > li').length }); })()"
         )
         raise Unreachable(
             "21-channel-older-loaded",
@@ -1506,7 +1531,7 @@ def _act_channel_older(driver: Driver) -> None:
     # looking at sits. Both are compared after, which is what makes this a picture of an anchored
     # prepend rather than of a longer list.
     driver.js(
-        "(() => { const rows = [...document.querySelectorAll('#discord-log li')]; "
+        "(() => { const rows = [...document.querySelectorAll('#discord-log > li')]; "
         "const a = document.getElementById('scroll-area').getBoundingClientRect(); "
         "const seen = rows.find((n) => n.getBoundingClientRect().bottom > a.top); "
         "seen.id = 'anchor-probe'; "
@@ -1518,14 +1543,14 @@ def _act_channel_older(driver: Driver) -> None:
     # click would scroll the control into view, and scrolling is what this scene is measuring.
     driver.js("(() => { document.getElementById('load-older').click(); })()")
     driver.page.wait_for_function(
-        "() => document.querySelectorAll('#discord-log li').length > window.__loadedBefore",
+        "() => document.querySelectorAll('#discord-log > li').length > window.__loadedBefore",
         timeout=10_000,
     )
     driver.settle(250)
     driver.js(
         "(() => { window.__anchorAfter = "
         "document.getElementById('anchor-probe').getBoundingClientRect().top; "
-        "window.__loadedAfter = document.querySelectorAll('#discord-log li').length; "
+        "window.__loadedAfter = document.querySelectorAll('#discord-log > li').length; "
         "return window.__anchorAfter; })()"
     )
 
@@ -1556,11 +1581,11 @@ def _act_channel_picker_reachable(driver: Driver) -> None:
             break
         driver.js(
             "(() => { window.__walkFrom = "
-            "document.querySelectorAll('#discord-log li').length; "
+            "document.querySelectorAll('#discord-log > li').length; "
             "document.getElementById('scroll-area').scrollTop = 0; return window.__walkFrom; })()"
         )
         driver.page.wait_for_function(
-            "() => document.querySelectorAll('#discord-log li').length > window.__walkFrom",
+            "() => document.querySelectorAll('#discord-log > li').length > window.__walkFrom",
             timeout=10_000,
         )
         driver.settle(120)
@@ -1592,7 +1617,7 @@ def _act_channel_picker_reachable(driver: Driver) -> None:
         "Math.abs(r.left - window.__pickerBefore.left)); "
         "window.__pickerInScroll = document.getElementById('scroll-area')"
         ".contains(document.getElementById('discord-channel')); "
-        "window.__loadedAfter = document.querySelectorAll('#discord-log li').length; "
+        "window.__loadedAfter = document.querySelectorAll('#discord-log > li').length; "
         "return window.__pickerMoved; })()"
     )
 
@@ -1628,14 +1653,14 @@ PULL_GESTURE = """
       bubbles: true, cancelable: true,
     });
   };
-  window.__pullRowsBefore = document.querySelectorAll('#discord-log li').length;
+  window.__pullRowsBefore = document.querySelectorAll('#discord-log > li').length;
   window.__pullMoreAbove = window.__visible('load-older');
   area.dispatchEvent(at('touchstart', start));
   area.scrollTop = 0;
   area.dispatchEvent(new Event('scroll'));
   area.dispatchEvent(at('touchmove', start + 30));
   area.dispatchEvent(at('touchmove', start + 30 + 140));
-  window.__pullRowsAfter = document.querySelectorAll('#discord-log li').length;
+  window.__pullRowsAfter = document.querySelectorAll('#discord-log > li').length;
   return document.getElementById('pull-refresh').getAttribute('data-state');
 })()
 """
@@ -1656,11 +1681,11 @@ def _act_pull_armed(driver: Driver) -> None:
     """
     _act_open_channel(driver)
     driver.js(
-        "(() => { window.__walkFrom = document.querySelectorAll('#discord-log li').length; "
+        "(() => { window.__walkFrom = document.querySelectorAll('#discord-log > li').length; "
         "document.getElementById('scroll-area').scrollTop = 0; return window.__walkFrom; })()"
     )
     driver.page.wait_for_function(
-        "() => document.querySelectorAll('#discord-log li').length > window.__walkFrom",
+        "() => document.querySelectorAll('#discord-log > li').length > window.__walkFrom",
         timeout=10_000,
     )
     driver.settle(250)
@@ -1798,7 +1823,7 @@ def _act_summary_mode(driver: Driver) -> None:
     # exactly one message over the server's summarisation threshold and it is the newest, so it is
     # on screen from the first read; its height here is what the three-line clamp gives it.
     driver.js(
-        "(() => { const rows = [...document.querySelectorAll('#discord-log li')].reverse(); "
+        "(() => { const rows = [...document.querySelectorAll('#discord-log > li')].reverse(); "
         "const row = rows.find((n) => n.getAttribute('data-collapsed') === 'true'); "
         "row.id = 'summary-probe'; "
         "window.__foldedHeight = row.getBoundingClientRect().height; "
@@ -1869,7 +1894,7 @@ def _act_summary_failed(driver: Driver) -> None:
     _tell_the_mock(driver, SUMMARY_FAILED_STATE, "no_reply")
     _act_open_channel(driver)
     driver.js(
-        "(() => { const rows = [...document.querySelectorAll('#discord-log li')].reverse(); "
+        "(() => { const rows = [...document.querySelectorAll('#discord-log > li')].reverse(); "
         "const row = rows.find((n) => n.getAttribute('data-collapsed') === 'true'); "
         "row.id = 'summary-failed-probe'; "
         "window.__failedProbeHeight = row.getBoundingClientRect().height; "
@@ -1900,7 +1925,7 @@ def _act_todo_view(driver: Driver) -> None:
     _act_open_channel(driver)
     driver.js(
         "(() => { window.__beforeTodo = "
-        "document.querySelectorAll('#discord-log li').length; return window.__beforeTodo; })()"
+        "document.querySelectorAll('#discord-log > li').length; return window.__beforeTodo; })()"
     )
     driver.click("todo-filter")
     driver.page.wait_for_function(
@@ -1912,19 +1937,19 @@ def _act_todo_view(driver: Driver) -> None:
     # filter that has been switched on and has done nothing yet. Through the DOM, because a real
     # click would scroll the row into view and this frame is about the list at rest.
     driver.js(
-        "(() => { const row = document.querySelector('#discord-log li'); "
+        "(() => { const row = document.querySelector('#discord-log > li'); "
         "window.__dealtWith = row.getAttribute('data-id'); "
         "row.querySelector('.done-button').click(); return window.__dealtWith; })()"
     )
     driver.page.wait_for_function(
-        "() => document.querySelectorAll('#discord-log li').length < window.__beforeTodo "
+        "() => document.querySelectorAll('#discord-log > li').length < window.__beforeTodo "
         "&& !document.getElementById('undo-dismiss').hidden",
         timeout=15_000,
     )
     driver.settle(300)
     driver.js(
         "(() => { window.__afterTodo = "
-        "document.querySelectorAll('#discord-log li').length; return window.__afterTodo; })()"
+        "document.querySelectorAll('#discord-log > li').length; return window.__afterTodo; })()"
     )
 
 
@@ -1937,7 +1962,7 @@ def _act_bankruptcy_armed(driver: Driver) -> None:
     )
     driver.js(
         "(() => { window.__backlog = "
-        "document.querySelectorAll('#discord-log li').length; return window.__backlog; })()"
+        "document.querySelectorAll('#discord-log > li').length; return window.__backlog; })()"
     )
     driver.js("(() => { document.getElementById('clear-backlog').click(); })()")
     driver.page.wait_for_function(
@@ -1966,7 +1991,7 @@ def _act_message_search(driver: Driver) -> None:
     _act_open_channel(driver)
     driver.js(
         "(() => { window.__beforeSearch = "
-        "document.querySelectorAll('#discord-log li').length; return window.__beforeSearch; })()"
+        "document.querySelectorAll('#discord-log > li').length; return window.__beforeSearch; })()"
     )
     driver.click("search-toggle")
     driver.page.wait_for_function("() => window.__visible('search-field')", timeout=5_000)
@@ -1997,14 +2022,14 @@ def _act_links_filter(driver: Driver) -> None:
         "nightly-integration-shard/summary.html')"
     )
     driver.page.wait_for_function(
-        "() => document.querySelector('#discord-log li[data-id=\"9990000000000000211\"]') !== null",
+        "() => document.querySelector('#discord-log > li[data-id=\"9990000000000000211\"]') !== null",
         timeout=10_000,
     )
     driver.click("search-toggle")
     driver.page.wait_for_function("() => window.__visible('links-filter')", timeout=5_000)
     driver.click("links-filter")
     driver.page.wait_for_function(
-        "() => document.querySelector('#discord-log li[data-links-view=\"true\"]') !== null",
+        "() => document.querySelector('#discord-log > li[data-links-view=\"true\"]') !== null",
         timeout=5_000,
     )
     driver.settle(300)
@@ -2025,6 +2050,29 @@ def _act_link_kinds_off(driver: Driver) -> None:
     driver.settle(300)
 
 
+# `#217 markdown-blocks`. The seeded message in the shape the owner photographed drawn as literal
+# dashes: a paragraph, six items two of which run on to an indented line, and two closing paragraphs.
+MESSAGE_BLOCKS_PROBE = "where the release stands this morning"
+
+
+def _act_message_blocks(driver: Driver) -> None:
+    """`#217 markdown-blocks`: the server-rendered list message, opened in full and in view.
+
+    The message is over the page's fold, so it arrives folded to its opening lines, as such an
+    answer does. The row is opened the way a reader opens it -- the fold control a tap on the row
+    toggles -- and brought to the middle of the screen, so the picture is the whole list.
+    """
+    _act_open_channel(driver)
+    driver.js(
+        "(() => { const row = [...document.querySelectorAll('#discord-log > li')].find((n) => "
+        f"(n.textContent || '').includes({json.dumps(MESSAGE_BLOCKS_PROBE)})); "
+        "if (!row) return false; row.id = 'message-blocks-probe'; "
+        "if (row.getAttribute('data-collapsed') === 'true') row.querySelector('.fold').click(); "
+        "row.scrollIntoView({ block: 'center' }); return true; })()"
+    )
+    driver.settle(300)
+
+
 def _act_reply_view(driver: Driver) -> None:
     _act_whole_channel(driver)
     # Park in the middle of the channel, and record it. The round trip below is then a MEASURED
@@ -2041,7 +2089,7 @@ def _act_reply_view(driver: Driver) -> None:
     # state would then be measuring the harness rather than the page. (It did, the first time.)
     driver.js(
         "(() => { const a = document.getElementById('scroll-area').getBoundingClientRect(); "
-        "const li = [...document.querySelectorAll('#discord-log li')].find((n) => { "
+        "const li = [...document.querySelectorAll('#discord-log > li')].find((n) => { "
         "const r = n.getBoundingClientRect(); return r.top >= a.top && r.bottom <= a.bottom; }); "
         "if (!li) throw new Error('no channel row is fully on screen to reply to'); "
         "li.id = 'reply-probe'; return li.id; })()"
@@ -2128,7 +2176,7 @@ def _act_reply_long_target(driver: Driver) -> None:
         # released pull ends up calling, so this takes the same path with none of the scrolling.
         driver.page.evaluate("async () => { await window.loadDiscord(); }")
         driver.page.wait_for_function(
-            "() => [...document.querySelectorAll('#discord-log li')]"
+            "() => [...document.querySelectorAll('#discord-log > li')]"
             ".some((n) => n.textContent.includes('in full, because you asked'))",
             timeout=10_000,
         )
@@ -2136,7 +2184,7 @@ def _act_reply_long_target(driver: Driver) -> None:
     # The LONGEST message now in the channel. Chosen by measuring rather than by index: the seed is
     # the server's, and an index would silently become a short message the day it changes.
     driver.js(
-        "(() => { const items = [...document.querySelectorAll('#discord-log li')]; "
+        "(() => { const items = [...document.querySelectorAll('#discord-log > li')]; "
         "const li = items.sort((a, b) => b.textContent.length - a.textContent.length)[0]; "
         "li.id = 'reply-probe'; return li.textContent.length; })()"
     )
@@ -2180,7 +2228,7 @@ def _act_reply_long_target(driver: Driver) -> None:
 def _act_discord_hover(driver: Driver) -> None:
     _act_open_channel(driver)
     driver.js(
-        "(() => { const rows = [...document.querySelectorAll('#discord-log li.discord-message')]; "
+        "(() => { const rows = [...document.querySelectorAll('#discord-log > li.discord-message')]; "
         "if (rows.length < 3) throw new Error('not enough channel rows to hover one among them'); "
         "rows[2].id = 'hover-probe'; return rows.length; })()"
     )
@@ -2231,7 +2279,7 @@ def _act_typed_turn(driver: Driver) -> None:
     driver.page.fill("#compose-text", "and 9c07d3e — did that land on integration")
     driver.click("send-text")
     driver.page.wait_for_function(
-        "() => document.querySelectorAll('#transcript li.mine').length > 0", timeout=5_000
+        "() => document.querySelectorAll('#transcript > li.mine').length > 0", timeout=5_000
     )
     # Typing again, so the field in the photograph is not the empty one a send leaves behind.
     driver.page.fill("#compose-text", "and the nightly")
@@ -2391,7 +2439,7 @@ def _act_live_message(driver: Driver) -> None:
     # one control could only ever have spoken for that control.
     driver.js(
         "(() => { window.__loadedBefore = "
-        "document.querySelectorAll('#discord-log li').length; "
+        "document.querySelectorAll('#discord-log > li').length; "
         "window.__refreshes = 0; "
         "const real = window.loadDiscord; "
         "window.loadDiscord = function (...args) { window.__refreshes += 1; "
@@ -2403,7 +2451,7 @@ def _act_live_message(driver: Driver) -> None:
         "'the arm64 runner came back by itself -- 11 jobs completed, 0 skipped, and the tag is cut')"
     )
     driver.page.wait_for_function(
-        "() => document.querySelectorAll('#discord-log li').length > window.__loadedBefore",
+        "() => document.querySelectorAll('#discord-log > li').length > window.__loadedBefore",
         timeout=10_000,
     )
     driver.settle(250)
@@ -2525,7 +2573,7 @@ SCENES: tuple[Scene, ...] = (
             ("Hang up is present, because there is a call", "window.__visible('hang-up')"),
             (
                 "the transcript has turns from both sides, and the empty state is gone",
-                "document.querySelectorAll('#transcript li').length >= 3 && "
+                "document.querySelectorAll('#transcript > li').length >= 3 && "
                 "!window.__visible('empty-state')",
             ),
             # `#45 post-call-state`. The voice is labelled "assistant", because the sibling view on
@@ -2533,7 +2581,7 @@ SCENES: tuple[Scene, ...] = (
             # word is a rendered fact, so it is pinned where it can be SEEN as well as asserted.
             (
                 "the other speaker is labelled 'assistant', not 'agent'",
-                "(() => { const w = [...document.querySelectorAll('#transcript li.theirs .who')]; "
+                "(() => { const w = [...document.querySelectorAll('#transcript > li.theirs .who')]; "
                 "return w.length > 0 && w.every((n) => n.textContent.trim() === 'assistant'); })()",
             ),
         ),
@@ -2582,7 +2630,7 @@ SCENES: tuple[Scene, ...] = (
         expect=(
             (
                 "the transcript carries the seam that marks a new conversation",
-                "[...document.querySelectorAll('#transcript li.seam .seam-label')]"
+                "[...document.querySelectorAll('#transcript > li.seam .seam-label')]"
                 ".some((n) => n.textContent.trim() === 'new conversation')",
             ),
             (
@@ -2605,11 +2653,11 @@ SCENES: tuple[Scene, ...] = (
         expect=(
             (
                 "the disclosure is open",
-                "!!document.querySelector('#transcript li.seam details[open]')",
+                "!!document.querySelector('#transcript > li.seam details[open]')",
             ),
             (
                 "the explanation has actually been laid out",
-                "document.querySelector('#transcript li.seam .seam-detail')"
+                "document.querySelector('#transcript > li.seam .seam-detail')"
                 ".getBoundingClientRect().height > 0",
             ),
             # THE point of this state. The page scrolls the seam into view on toggle; whether that
@@ -2617,7 +2665,7 @@ SCENES: tuple[Scene, ...] = (
             # where nobody can read it.
             (
                 "the explanation is not hidden underneath the dock",
-                "(() => { const d = document.querySelector('#transcript li.seam .seam-detail'); "
+                "(() => { const d = document.querySelector('#transcript > li.seam .seam-detail'); "
                 "const r = d.getBoundingClientRect(); "
                 "const dock = document.getElementById('dock').getBoundingClientRect(); "
                 "return r.bottom <= dock.top + 1 && r.top >= 0; })()",
@@ -2636,7 +2684,7 @@ SCENES: tuple[Scene, ...] = (
             ),
             (
                 "nothing has been cleared yet — arming must not erase",
-                "document.querySelectorAll('#transcript li').length >= 3",
+                "document.querySelectorAll('#transcript > li').length >= 3",
             ),
             # The POSITIVE control for 02-idle. A page that had simply deleted the status line
             # would satisfy "nothing is holding real estate"; this is the frame where it has
@@ -2694,7 +2742,7 @@ SCENES: tuple[Scene, ...] = (
             ),
             (
                 "there are several real messages rendered",
-                "document.querySelectorAll('#discord-log li').length >= 5",
+                "document.querySelectorAll('#discord-log > li').length >= 5",
             ),
             # This used to read "every message SHOWS its id". It no longer shows it: the id moved
             # into the press-and-hold details sheet, and the row got its width back. What the
@@ -2703,7 +2751,7 @@ SCENES: tuple[Scene, ...] = (
             # gesture rather than by reciting an 18-digit number beside every line.
             (
                 "every message carries its id, so it can still be checked against a real one",
-                "[...document.querySelectorAll('#discord-log li[data-id]')].length >= 5",
+                "[...document.querySelectorAll('#discord-log > li[data-id]')].length >= 5",
             ),
             (
                 "and no row is reciting it: the sheet that shows it is shut in this picture",
@@ -2736,7 +2784,7 @@ SCENES: tuple[Scene, ...] = (
         expect=(
             (
                 "the transcript is long",
-                "document.querySelectorAll('#transcript li').length >= 15",
+                "document.querySelectorAll('#transcript > li').length >= 15",
             ),
             (
                 "the scroll region really overflows",
@@ -2763,11 +2811,11 @@ SCENES: tuple[Scene, ...] = (
         expect=(
             (
                 "most of the list is still showing openings only",
-                "document.querySelectorAll(\"#transcript li[data-collapsed='true']\").length >= 4",
+                "document.querySelectorAll(\"#transcript > li[data-collapsed='true']\").length >= 4",
             ),
             (
                 "exactly one message is open, so the comparison is the point of the picture",
-                "document.querySelectorAll(\"#transcript li[data-collapsed='false']\").length === 1",
+                "document.querySelectorAll(\"#transcript > li[data-collapsed='false']\").length === 1",
             ),
             # The assertion no unit test can make: THE SAME message, clamped, is really shorter
             # than it is unclamped. A line clamp is a rendering fact — the page fixture can only
@@ -2851,7 +2899,7 @@ SCENES: tuple[Scene, ...] = (
             ),
             (
                 "there is a real transcript in it to judge the line length by",
-                "document.querySelectorAll('#transcript li').length >= 6",
+                "document.querySelectorAll('#transcript > li').length >= 6",
             ),
         ),
     ),
@@ -2878,7 +2926,7 @@ SCENES: tuple[Scene, ...] = (
             ),
             (
                 "there is a real transcript in it to judge the line length by",
-                "document.querySelectorAll('#transcript li').length >= 6",
+                "document.querySelectorAll('#transcript > li').length >= 6",
             ),
         ),
     ),
@@ -2903,7 +2951,7 @@ SCENES: tuple[Scene, ...] = (
             ),
             (
                 "the boundary is marked in the transcript, so nothing implies continuity",
-                "[...document.querySelectorAll('#transcript li.seam .seam-label')]"
+                "[...document.querySelectorAll('#transcript > li.seam .seam-label')]"
                 ".some((n) => n.textContent.trim() === 'new conversation')",
             ),
             NO_HANGUP,
@@ -3015,7 +3063,7 @@ SCENES: tuple[Scene, ...] = (
             (
                 "the hovered row is a visibly different surface from its neighbours",
                 "(() => { const rows = "
-                "[...document.querySelectorAll('#discord-log li.discord-message')]; "
+                "[...document.querySelectorAll('#discord-log > li.discord-message')]; "
                 "const hot = document.getElementById('hover-probe'); "
                 "const cold = rows.find((r) => r !== hot); "
                 "return getComputedStyle(hot).backgroundColor !== "
@@ -3024,7 +3072,7 @@ SCENES: tuple[Scene, ...] = (
             (
                 "and its border is picked out too, not only its fill",
                 "(() => { const rows = "
-                "[...document.querySelectorAll('#discord-log li.discord-message')]; "
+                "[...document.querySelectorAll('#discord-log > li.discord-message')]; "
                 "const hot = document.getElementById('hover-probe'); "
                 "const cold = rows.find((r) => r !== hot); "
                 "return getComputedStyle(hot).borderTopColor !== "
@@ -3060,7 +3108,7 @@ SCENES: tuple[Scene, ...] = (
                 # is perfectly ordered. web/voice.js compares them the same way, for the same
                 # reason.
                 "they are ABOVE what was already there, oldest first",
-                "(() => { const ids = [...document.querySelectorAll('#discord-log li')]"
+                "(() => { const ids = [...document.querySelectorAll('#discord-log > li')]"
                 ".map((n) => n.getAttribute('data-id') || ''); "
                 "const older = (a, b) => (a.length === b.length ? a < b : a.length < b.length); "
                 "return ids.length > 1 && ids.every((id, i) => i === 0 || older(ids[i - 1], id)); "
@@ -3075,7 +3123,7 @@ SCENES: tuple[Scene, ...] = (
         expect=(
             (
                 "the restored turns are on screen after a reload",
-                "document.querySelectorAll('#transcript li:not(.seam)').length >= 2",
+                "document.querySelectorAll('#transcript > li:not(.seam)').length >= 2",
             ),
             (
                 "the seam names them as an EARLIER conversation, not as this one",
@@ -3102,7 +3150,7 @@ SCENES: tuple[Scene, ...] = (
             ),
             (
                 "the typed turn is in the transcript, attributed to you",
-                "[...document.querySelectorAll('#transcript li.mine .body')]"
+                "[...document.querySelectorAll('#transcript > li.mine .body')]"
                 ".some((n) => (n.textContent || '').includes('9c07d3e'))",
             ),
             # THE claim no fixture can make. A fourth band in the dock competes with the transcript
@@ -3304,7 +3352,7 @@ SCENES: tuple[Scene, ...] = (
             ),
             (
                 "the list grew",
-                "document.querySelectorAll('#discord-log li').length > window.__loadedBefore",
+                "document.querySelectorAll('#discord-log > li').length > window.__loadedBefore",
             ),
             (
                 # THE claim. A scene that only asserted the list grew would be satisfied by the
@@ -3315,7 +3363,7 @@ SCENES: tuple[Scene, ...] = (
             (
                 "the arriving row carries its id, exactly as a fetched one does",
                 "!!document.querySelector("
-                "'#discord-log li[data-id=\"9990000000000000001\"]')",
+                "'#discord-log > li[data-id=\"9990000000000000001\"]')",
             ),
             (
                 "and its text is on screen",
@@ -3347,7 +3395,7 @@ SCENES: tuple[Scene, ...] = (
             ),
             (
                 "the transcript seam stops saying the agent remembers nothing above the line",
-                "[...document.querySelectorAll('#transcript li.seam')]"
+                "[...document.querySelectorAll('#transcript > li.seam')]"
                 ".some((n) => /read the lines above back to it/.test(n.textContent || ''))",
             ),
         ),
@@ -3492,7 +3540,7 @@ SCENES: tuple[Scene, ...] = (
             (
                 "a message the reader dealt with really left the list",
                 "window.__afterTodo > 0 && window.__afterTodo < window.__beforeTodo && "
-                "![...document.querySelectorAll('#discord-log li')]"
+                "![...document.querySelectorAll('#discord-log > li')]"
                 ".some((n) => n.getAttribute('data-id') === window.__dealtWith)",
             ),
             (
@@ -3513,7 +3561,7 @@ SCENES: tuple[Scene, ...] = (
             ("there is a way back from the dismissal", "window.__visible('undo-dismiss')"),
             (
                 "every remaining row offers the act, and none of them is clipped past the edge",
-                "(() => { const rows = [...document.querySelectorAll('#discord-log li')]; "
+                "(() => { const rows = [...document.querySelectorAll('#discord-log > li')]; "
                 "const pane = document.getElementById('pane-discord').getBoundingClientRect(); "
                 "return rows.length > 0 && rows.every((n) => { "
                 "const b = n.querySelector('.done-button'); "
@@ -3536,7 +3584,7 @@ SCENES: tuple[Scene, ...] = (
             ),
             (
                 "nothing has been cleared yet: the backlog is all still there",
-                "document.querySelectorAll('#discord-log li').length === window.__backlog",
+                "document.querySelectorAll('#discord-log > li').length === window.__backlog",
             ),
             (
                 "and it is drawn as armed rather than merely relabelled",
@@ -3563,7 +3611,7 @@ SCENES: tuple[Scene, ...] = (
                 # A state pinned to the class alone would be green with the rule deleted, which is
                 # a search that visibly does nothing.
                 "a filtered row is really not drawn, not merely marked",
-                "(() => { const gone = document.querySelector('#discord-log li.search-hidden'); "
+                "(() => { const gone = document.querySelector('#discord-log > li.search-hidden'); "
                 "return gone !== null && gone.offsetParent === null; })()",
             ),
             (
@@ -3572,7 +3620,7 @@ SCENES: tuple[Scene, ...] = (
                 # the quotes changed nothing would be visibly a different picture.
                 "what is left is fewer than arrived, and every row of it holds the PHRASE",
                 "(() => { const left = [...document.querySelectorAll("
-                "'#discord-log li:not(.search-hidden)')]; "
+                "'#discord-log > li:not(.search-hidden)')]; "
                 "return left.length > 0 && left.length < window.__beforeSearch "
                 "&& left.every((n) => /mac runner/i.test(n.textContent)); })()",
             ),
@@ -3702,7 +3750,7 @@ SCENES: tuple[Scene, ...] = (
                 # THE filtering claim: the row keeps its other links, and the pull request is not
                 # drawn anywhere on the list.
                 "the row keeps its other links and the pull request is drawn nowhere",
-                "(() => { const row = document.querySelector('#discord-log li[data-id=\"9990000000000000211\"]'); "
+                "(() => { const row = document.querySelector('#discord-log > li[data-id=\"9990000000000000211\"]'); "
                 "const hrefs = [...row.querySelectorAll('.row-links > a')].map((a) => a.getAttribute('href')); "
                 "return row.offsetParent !== null && hrefs.includes('https://example.com/diff/42') "
                 "&& hrefs.some((h) => h.endsWith('/summary.html')) "
@@ -3774,6 +3822,59 @@ SCENES: tuple[Scene, ...] = (
             ),
         ),
     ),
+    Scene(
+        name="39-message-blocks",
+        what="an agent's list message as the server rendered it: round bullets, hanging indent, paragraph gaps",
+        act=_act_message_blocks,
+        profiles=("iphone15", "iphone-se", "desktop", "laptop-1280", "android-412"),
+        expect=(
+            ("the Discord pane is up", "window.__visible('pane-discord')"),
+            (
+                "the probed message is on screen, opened in full",
+                "(() => { const r = document.getElementById('message-blocks-probe'); "
+                "if (!r) return false; const b = r.getBoundingClientRect(); "
+                "return r.getAttribute('data-collapsed') !== 'true' && b.top >= 0 "
+                "&& b.bottom <= innerHeight; })()",
+            ),
+            (
+                # The server's blocks, not the page's: one list of six, between paragraphs.
+                "its body is a paragraph, ONE list of six items, and two paragraphs",
+                "(() => { const md = document.querySelector('#message-blocks-probe .md'); "
+                "return [...md.children].map((n) => n.tagName).join(' ') === 'P UL P P' "
+                "&& md.querySelectorAll('ul > li').length === 6; })()",
+            ),
+            (
+                "the bullets are round",
+                "getComputedStyle(document.querySelector('#message-blocks-probe .md ul'))"
+                ".listStyleType === 'disc'",
+            ),
+            (
+                # THE layout claim the page suite cannot make. The item's text is indented clear of
+                # the list's edge, and an item's continuation line starts exactly where its first
+                # line does -- under the text, not under the bullet.
+                "a continuation line hangs under its item's text, clear of the bullet",
+                "(() => { const ul = document.querySelector('#message-blocks-probe .md ul'); "
+                "const li = ul.children[1]; const range = document.createRange(); "
+                "range.selectNodeContents(li); const lines = [...range.getClientRects()]; "
+                "const first = lines[0], last = lines[lines.length - 1]; "
+                "return li.getBoundingClientRect().left - ul.getBoundingClientRect().left >= 10 "
+                "&& last.top > first.top + 4 && Math.abs(last.left - first.left) < 1.5; })()",
+            ),
+            (
+                # A blank line is space: between the introduction and the list, and between the two
+                # closing paragraphs that used to run together.
+                "a blank line is a gap between blocks, not nothing",
+                "(() => { const md = document.querySelector('#message-blocks-probe .md'); "
+                "const [intro, list, last1, last2] = md.children; "
+                "const gap = (a, b) => b.getBoundingClientRect().top - a.getBoundingClientRect().bottom; "
+                "return gap(intro, list) >= 5 && gap(list, last1) >= 5 && gap(last1, last2) >= 5; })()",
+            ),
+            (
+                "no Markdown is left on screen",
+                "!/(^|\\n)- /.test(document.querySelector('#message-blocks-probe .body').innerText)",
+            ),
+        ),
+    ),
     # LAST IN THE WALK, and not by accident: it empties the server's durable store on the way in,
     # so that the summary the state above cached is really regenerated and can really fail. Nothing
     # after it in this profile would miss what it deletes, and the next profile purges anyway.
@@ -3802,7 +3903,7 @@ SCENES: tuple[Scene, ...] = (
                 # deleted.
                 "the failed row is really DRAWN differently from an ordinary one",
                 "(() => { const f = document.getElementById('summary-failed-probe'); "
-                "const rows = [...document.querySelectorAll('#discord-log li')]; "
+                "const rows = [...document.querySelectorAll('#discord-log > li')]; "
                 "const other = rows.find((n) => n !== f); "
                 "if (!other) return false; "
                 "const a = getComputedStyle(f), b = getComputedStyle(other); "
@@ -4015,7 +4116,9 @@ def run_captures(
                         # than attempted: the desktop reading column has nothing to photograph on
                         # a phone, and a scene that quietly succeeded there would be filed as
                         # evidence of a layout the phone does not have.
-                        if scene.profiles and profile.name not in scene.profiles:
+                        if (scene.profiles and profile.name not in scene.profiles) or (
+                            profile.opt_in and not scene.profiles
+                        ):
                             print(f"  skip  {scene.name:<30} not a state this profile has")
                             continue
                         # A timeout inside the walk is an UNREACHABLE STATE and must read as one.

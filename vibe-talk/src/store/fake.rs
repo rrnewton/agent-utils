@@ -740,6 +740,7 @@ impl StateStore for FakeStore {
                         Pin {
                             snapshot,
                             pinned_at_ms,
+                            content_html: String::new(),
                         },
                         seq,
                     ),
@@ -755,6 +756,7 @@ impl StateStore for FakeStore {
                         Pin {
                             snapshot,
                             pinned_at_ms: now_ms(),
+                            content_html: String::new(),
                         },
                         seq,
                     ),

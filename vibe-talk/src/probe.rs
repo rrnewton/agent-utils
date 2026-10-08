@@ -930,6 +930,7 @@ mod tests {
                     reply_to: None,
                     content: String::new(),
                     spoken_content: String::new(),
+                    content_html: String::new(),
                     noise: false,
                     reactions: None,
                 }])

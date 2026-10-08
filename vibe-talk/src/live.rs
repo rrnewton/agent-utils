@@ -114,7 +114,7 @@ use tokio::sync::{broadcast, watch};
 
 use crate::chat::{ChatClient, ChatError};
 use crate::contract::{LiveDeleteEvent, LiveMessageEvent, LiveResetEvent};
-use crate::model::{sort_oldest_first, ChannelId, Message, MessageId};
+use crate::model::{sort_oldest_first, ChannelId, ChannelInfo, Message, MessageId};
 use crate::state::AppState;
 
 /// How many published messages each channel keeps for replay after a dropped connection.
@@ -458,7 +458,7 @@ pub const EVENT_RESET: &str = "reset";
 pub fn events(
     subscription: Subscription,
     app: AppState,
-    channel: ChannelId,
+    channel: ChannelInfo,
 ) -> impl futures_util::Stream<Item = Result<axum::response::sse::Event, std::convert::Infallible>>
 {
     struct State {
@@ -468,18 +468,23 @@ pub fn events(
         done: bool,
         app: AppState,
         channel: ChannelId,
+        /// How the channel's provider writes, for the rendered body each message event carries.
+        /// `#217 markdown-blocks`.
+        markup: crate::render::Markup,
         /// The rules as they stood when the replay burst began. Up to [`REPLAY_TAIL`] events go
         /// out back to back on attach, and two store reads for each would be the attach's whole
         /// cost for no change in the answer.
         replay_noise: Option<crate::noise::NoiseFilter>,
     }
+    let markup = crate::render::markup_for(&app.config, &channel);
     let start = State {
         replay: subscription.replay.into_iter().collect(),
         receiver: subscription.receiver,
         reset_on_attach: subscription.reset_on_attach,
         done: false,
         app,
-        channel,
+        channel: channel.id,
+        markup,
         replay_noise: None,
     };
     futures_util::stream::unfold(start, |mut state| async move {
@@ -494,7 +499,7 @@ pub fn events(
                     Some(crate::noise::filter_for(&state.app, &state.channel).await);
             }
             if let Some(noise) = &state.replay_noise {
-                judge(noise, &mut held);
+                judge(noise, state.markup, &mut held);
             }
             return Some((Ok(message_event(&held, true)), state));
         }
@@ -504,7 +509,7 @@ pub fn events(
         match state.receiver.recv().await {
             Ok(mut live) => {
                 let noise = crate::noise::filter_for(&state.app, &state.channel).await;
-                judge(&noise, &mut live);
+                judge(&noise, state.markup, &mut live);
                 Some((Ok(message_event(&live, false)), state))
             }
             Err(broadcast::error::RecvError::Lagged(missed)) => {
@@ -516,10 +521,15 @@ pub fn events(
     })
 }
 
-/// Decide whether one outgoing event's message is noise. A delete carries no text to judge.
-fn judge(noise: &crate::noise::NoiseFilter, live: &mut LiveMessage) {
+/// Decide whether one outgoing event's message is noise, and render its body for the page. A
+/// delete carries no text to judge.
+///
+/// Rendered on the way OUT, like the noise verdict, rather than when it was published: the tail is
+/// shared by every subscriber, and only this stream's reader is the page.
+fn judge(noise: &crate::noise::NoiseFilter, markup: crate::render::Markup, live: &mut LiveMessage) {
     if live.kind != LiveKind::Delete {
         noise.mark(std::slice::from_mut(&mut live.message));
+        live.message.content_html = crate::render::body_html(&live.message.content, markup);
     }
 }
 
@@ -1933,6 +1943,7 @@ mod tests {
             reply_to: None,
             content: content.to_owned(),
             spoken_content: String::new(),
+            content_html: String::new(),
             noise: false,
             reactions: None,
         }

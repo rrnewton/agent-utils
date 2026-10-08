@@ -375,6 +375,12 @@ pub struct DiscordConfig {
     /// Off by default because Discord itself does not provide this operation. An operator must
     /// opt in only when `api_base` names a compatible bridge.
     pub upstream_read_marks: bool,
+    /// How this provider's messages are written, for the page's renderer. `#217 markdown-blocks`.
+    ///
+    /// Discord's own Markdown unless the operator says otherwise. A bridge for another service
+    /// passes that service's text through, and the one difference worth a setting is whether a
+    /// single asterisk means bold: it does in Google Chat. See [`crate::render::Markup`].
+    pub markup: crate::render::Markup,
 }
 
 /// Read limits shared by every chat provider.
@@ -481,6 +487,16 @@ impl ProviderConfig {
         match &self.kind {
             ProviderKind::Discord(discord) => discord.owner_user_id.as_deref(),
             ProviderKind::Slack(slack) => slack.owner_user_id.as_deref(),
+        }
+    }
+
+    /// How this provider's messages are written, for the page's renderer: the configured
+    /// `markup` of a Discord-protocol provider, and always Slack's for a Slack provider.
+    #[must_use]
+    pub fn markup(&self) -> crate::render::Markup {
+        match &self.kind {
+            ProviderKind::Discord(discord) => discord.markup,
+            ProviderKind::Slack(_) => crate::render::Markup::Slack,
         }
     }
 
@@ -688,6 +704,7 @@ struct FileDiscord {
     live_poll_seconds: Option<u64>,
     channel_registration: Option<bool>,
     upstream_read_marks: Option<bool>,
+    markup: Option<crate::render::Markup>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -713,6 +730,7 @@ struct FileProvider {
     // Discord-protocol providers only.
     thread_api: Option<crate::threads::ThreadApi>,
     upstream_read_marks: Option<bool>,
+    markup: Option<crate::render::Markup>,
     // Slack providers only.
     registered_channels_writable: Option<bool>,
     channel_discovery: Option<bool>,
@@ -1500,6 +1518,7 @@ fn legacy_discord_provider<'e>(
             || file.live_poll_seconds.is_some()
             || file.channel_registration.is_some()
             || file.upstream_read_marks.is_some()
+            || file.markup.is_some()
             || get(ENV_DISCORD_OWNER_USER_ID).is_some()
             || get(ENV_LIVE_POLL_SECONDS).is_some();
         if configures_a_provider {
@@ -1553,6 +1572,7 @@ fn legacy_discord_provider<'e>(
         file.channel_registration,
         file.thread_api,
         file.upstream_read_marks,
+        file.markup,
     )?;
     Ok(Some(ProviderConfig {
         key: LEGACY_DISCORD_PROVIDER_KEY.to_owned(),
@@ -1574,6 +1594,7 @@ fn discord_protocol(
     channel_registration: Option<bool>,
     thread_api: Option<crate::threads::ThreadApi>,
     upstream_read_marks: Option<bool>,
+    markup: Option<crate::render::Markup>,
 ) -> Result<DiscordConfig, ConfigError> {
     let channel_registration = channel_registration.unwrap_or(false);
     let api_base = api_base.unwrap_or_else(|| DEFAULT_DISCORD_API_BASE.to_owned());
@@ -1602,6 +1623,7 @@ fn discord_protocol(
         request_timeout_seconds,
         channel_registration,
         upstream_read_marks: upstream_read_marks.unwrap_or(false),
+        markup: markup.unwrap_or_default(),
     })
 }
 
@@ -1691,6 +1713,7 @@ fn provider_entry<'e>(
                 entry.channel_registration,
                 entry.thread_api,
                 entry.upstream_read_marks,
+                entry.markup,
             )?)
         }
         "slack" => {
@@ -1699,6 +1722,10 @@ fn provider_entry<'e>(
             }
             if entry.upstream_read_marks.is_some() {
                 return Err(refuse("upstream_read_marks", "slack"));
+            }
+            // A Slack provider's text is Slack's by definition; there is nothing to choose.
+            if entry.markup.is_some() {
+                return Err(refuse("markup", "slack"));
             }
             let api_base = entry
                 .api_base

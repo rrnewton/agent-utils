@@ -447,6 +447,7 @@ pub async fn ingest_event(
                 reply_to: None,
                 content: String::new(),
                 spoken_content: String::new(),
+                content_html: String::new(),
                 noise: false,
                 reactions: None,
             };
@@ -1185,6 +1186,22 @@ pub struct PageQuery {
     /// The span from this many hours ago to now, on this server's clock. Stands alone.
     /// `#190 voice-agent-tools`.
     pub hours: Option<u64>,
+    /// `html` to have each message carry its rendered body, `content_html`. `#217 markdown-blocks`.
+    pub render: Option<RenderQuery>,
+}
+
+/// What a read may be asked to render besides the text it returns. `#217 markdown-blocks`.
+///
+/// ASKED FOR, on the one route that needs asking: `/page` is the page's history walk for a
+/// provider without threads AND the voice agent's `read_page` tool, and a model given HTML beside
+/// every message would be reading the same words twice in a form it has no use for. The routes
+/// only the page reads — the timeline, the to-do list, the live stream, a post's answer and the
+/// pins — render without being asked.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum RenderQuery {
+    /// Fill each message's `content_html`.
+    Html,
 }
 
 /// One step of a walk, saying plainly that it is one.
@@ -1223,7 +1240,7 @@ pub async fn page(
     Path(channel_id): Path<String>,
     Query(query): Query<PageQuery>,
 ) -> Result<Json<PageResponse>, ApiError> {
-    let step = ops::page(
+    let mut step = ops::page(
         &state,
         &channel_id,
         ops::PageRequest {
@@ -1235,6 +1252,9 @@ pub async fn page(
         },
     )
     .await?;
+    if query.render == Some(RenderQuery::Html) {
+        crate::render::fill(&state.config, &step.channel, &mut step.messages);
+    }
     let dismissed = ops::dismissed_within(&state, &step.channel.id, &step.messages).await?;
     let pins_revision = ops::pins_revision(&state, &step.channel.id).await;
     Ok(Json(PageResponse {
@@ -1316,7 +1336,10 @@ pub async fn timeline(
         after: query.after,
         limit,
     };
-    let (channel, page) = ops::timeline(&state, &channel_id, &request).await?;
+    let (channel, mut page) = ops::timeline(&state, &channel_id, &request).await?;
+    // `#217 markdown-blocks`. Here and not in `ops::timeline`: this route's only reader is the
+    // page, and the operation under it is shared with paths toward a model.
+    crate::render::fill_page(&state.config, &channel, &mut page);
     let dismissed = ops::dismissed_within(&state, &channel.id, &page.messages).await?;
     // `#206 pin-message`. One indexed lookup on every read, delta included: this is how a refresh
     // that is happening anyway tells the page whether another device changed the pins.
@@ -1691,7 +1714,12 @@ pub async fn reply(
     )
     .await
     {
-        Ok((_channel, posted, parts)) => Ok(Json(ReplyResponse { posted, parts }).into_response()),
+        Ok((channel, mut posted, mut parts)) => {
+            // The page draws the acknowledged parts before any read brings them back.
+            crate::render::fill(&state.config, &channel, std::slice::from_mut(&mut posted));
+            crate::render::fill(&state.config, &channel, &mut parts);
+            Ok(Json(ReplyResponse { posted, parts }).into_response())
+        }
         // 207, not 200 and not 502. A machine caller reading only the status must not conclude
         // "sent" — nor "nothing happened", which would have them send the whole thing again and
         // post the first half twice. Multi-Status says exactly what is true: look inside.
@@ -1884,12 +1912,18 @@ pub async fn commit_post(
         reply_to: request.reply_to,
     };
     match ops::commit_proposal(&state, &request.handle, &restated, request.confirmed_by).await {
-        Ok((serial, posted, parts)) => Ok(Json(crate::contract::CommittedPostResponse {
-            serial,
-            posted,
-            parts,
-        })
-        .into_response()),
+        Ok((serial, mut posted, mut parts)) => {
+            if let Some(channel) = state.channel(&restated.channel_id) {
+                crate::render::fill(&state.config, &channel, std::slice::from_mut(&mut posted));
+                crate::render::fill(&state.config, &channel, &mut parts);
+            }
+            Ok(Json(crate::contract::CommittedPostResponse {
+                serial,
+                posted,
+                parts,
+            })
+            .into_response())
+        }
         Err(ops::CommitError::Refused(why)) => Err(why.into()),
         Err(ops::CommitError::Post(OpError::PartiallyPosted {
             posted,
@@ -1990,7 +2024,7 @@ pub async fn stream(
         .map(|value| crate::model::MessageId(value.to_owned()));
     let (channel, subscription) = ops::watch(&state, &channel_id, after.as_ref())?;
     let body =
-        axum::response::sse::Sse::new(crate::live::events(subscription, state.clone(), channel.id))
+        axum::response::sse::Sse::new(crate::live::events(subscription, state.clone(), channel))
             .keep_alive(
                 axum::response::sse::KeepAlive::new().interval(std::time::Duration::from_secs(15)),
             );
@@ -2793,7 +2827,8 @@ pub async fn todo(
     Path(channel_id): Path<String>,
     Query(query): Query<LimitQuery>,
 ) -> Result<Response, ApiError> {
-    let todo = ops::todo(&state, &channel_id, query.limit).await?;
+    let mut todo = ops::todo(&state, &channel_id, query.limit).await?;
+    crate::render::fill(&state.config, &todo.channel, &mut todo.messages);
     let pins_revision = ops::pins_revision(&state, &todo.channel.id).await;
     Ok(no_store(Json(TodoResponse {
         pins_revision,
@@ -2950,7 +2985,8 @@ pub async fn pins(
     _scope: ReadScope,
     Path(channel_id): Path<String>,
 ) -> Result<Response, ApiError> {
-    let (channel, pins) = ops::pins(&state, &channel_id).await?;
+    let (channel, mut pins) = ops::pins(&state, &channel_id).await?;
+    crate::render::fill_pins(&state.config, &channel, &mut pins.pins);
     Ok(no_store(Json(crate::contract::PinsResponse {
         channel,
         pins: pins.pins,
@@ -2983,7 +3019,8 @@ pub async fn pin_message(
         thread_id: request.thread_id,
         thread_root: request.thread_root,
     };
-    let (channel, change) = ops::pin(&state, &channel_id, &snapshot).await?;
+    let (channel, mut change) = ops::pin(&state, &channel_id, &snapshot).await?;
+    crate::render::fill_pins(&state.config, &channel, &mut change.pin);
     Ok(no_store(Json(crate::contract::PinChangeResponse {
         channel,
         message_id: snapshot.message_id,

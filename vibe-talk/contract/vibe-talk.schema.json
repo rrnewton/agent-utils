@@ -390,6 +390,10 @@
           "description": "Raw message body. UNTRUSTED: written by whoever is in the channel.",
           "type": "string"
         },
+        "content_html": {
+          "description": "The body as the page draws it: `content` rendered from Markdown and SANITIZED, by\n[`crate::render`]. `#217 markdown-blocks`.\n\nA third field for the same body, and it answers a third question: not what was written\n(`content`, which a copy keeps and the speech path falls back to) nor what a voice should\nsay (`spoken_content`), but what the reader should SEE — lists with bullets, paragraphs with\nspace between them, a link that is a link. HTML the server's sanitizer has already cut to a\nsmall allowlist, so the page inserts it as it stands and builds no markup of its own from\nchannel text.\n\nEMPTY means \"draw `content` as plain paragraphs\", by the convention `spoken_content`\nfollows: it is what a message carries before anything renders it — on every path toward a\nmodel, which has no use for HTML — and what it carries when rendering changed nothing,\nwhich is most chat. Filled only on the routes the page reads.",
+          "type": "string"
+        },
         "id": {
           "$ref": "#/$defs/MessageId",
           "description": "Snowflake of this message."
@@ -619,6 +623,10 @@
         },
         "content": {
           "description": "Its text when it was pinned, at most [`MAX_PIN_TEXT_CHARS`] characters. UNTRUSTED.",
+          "type": "string"
+        },
+        "content_html": {
+          "description": "The snapshot's text as the page draws it, rendered and sanitized when the pin is SERVED,\nnever stored. It follows [`crate::model::Message::content_html`]'s convention: empty means\n\"draw the text as plain paragraphs\". `#217 markdown-blocks`.",
           "type": "string"
         },
         "message_id": {

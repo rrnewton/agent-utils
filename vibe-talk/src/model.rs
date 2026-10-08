@@ -214,6 +214,22 @@ pub struct Message {
     /// genuinely rewritten.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub spoken_content: String,
+    /// The body as the page draws it: `content` rendered from Markdown and SANITIZED, by
+    /// [`crate::render`]. `#217 markdown-blocks`.
+    ///
+    /// A third field for the same body, and it answers a third question: not what was written
+    /// (`content`, which a copy keeps and the speech path falls back to) nor what a voice should
+    /// say (`spoken_content`), but what the reader should SEE — lists with bullets, paragraphs with
+    /// space between them, a link that is a link. HTML the server's sanitizer has already cut to a
+    /// small allowlist, so the page inserts it as it stands and builds no markup of its own from
+    /// channel text.
+    ///
+    /// EMPTY means "draw `content` as plain paragraphs", by the convention `spoken_content`
+    /// follows: it is what a message carries before anything renders it — on every path toward a
+    /// model, which has no use for HTML — and what it carries when rendering changed nothing,
+    /// which is most chat. Filled only on the routes the page reads.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub content_html: String,
     /// Whether the owner's noise rules call this message read already. `#196 auto-read-noise`.
     ///
     /// DECIDED BY THIS SERVER EVERY TIME the message is served, from its current text, by
@@ -380,6 +396,7 @@ mod tests {
             reply_to: None,
             content: String::new(),
             spoken_content: String::new(),
+            content_html: String::new(),
             noise: false,
             reactions: None,
         }
