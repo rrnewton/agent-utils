@@ -327,7 +327,7 @@ const FIXTURE_TREE = {
     "outgoing-log",
     "channel-composer",
   ],
-  "channel-composer": ["channel-compose-label", "channel-compose-text", "channel-send", "channel-compose-state"],
+  "channel-composer": ["channel-compose-text", "channel-send", "channel-compose-state"],
   // `#59 text-entry-button` and `#60 canned-prompt-buttons` put their buttons in the pack, and
   // web/voice.js hides and shows them by ITERATING it rather than by name — which is what makes a
   // third button one list entry rather than a new code path. So the fixture has to really nest
@@ -27717,4 +27717,15 @@ test("Links over a channel with no link shows the sentence, and off puts the rea
   await page.settle();
   assert.equal(page.el("search-empty").hidden, true);
   assert.equal(area.scrollTop, top, "Links off lost the reader's place");
+});
+
+// `#216 compose-hint`. The owner: the "Message the main channel" line read as one more message, in
+// the same type as the messages. There is no heading line now: the box says where the message goes in
+// its placeholder and names itself with the same words, in the main channel and in a thread alike.
+test("the channel composer says where the message goes in its placeholder, not in a heading line", () => {
+  assert.doesNotMatch(HTML_CODE, /id="channel-compose-label"/, "the composer's heading line came back");
+  assert.match(HTML_CODE, /id="channel-compose-text"[^>]*placeholder="Message the main channel…"[^>]*aria-label="Message the main channel"/);
+  assert.match(SCRIPT_CODE, /const destination = selectedThreadId \? "Reply in this thread" : "Message the main channel";/);
+  assert.match(SCRIPT_CODE, /el\("channel-compose-text"\)\.placeholder = `\$\{destination\}…`;/);
+  assert.doesNotMatch(SCRIPT_CODE, /Write a message…|Write a thread reply…/, "the old, less informative hint came back");
 });

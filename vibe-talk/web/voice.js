@@ -7737,8 +7737,11 @@ function renderChannelNavigation() {
   el("thread-list").hidden = channelView !== "threads" || pinnedOnly;
   el("discord-log").hidden = channelView === "threads" || pinnedOnly;
   el("pinned-log").hidden = !pinnedOnly;
-  el("channel-compose-label").textContent = selectedThreadId ? "Reply in this thread" : "Message the main channel";
-  el("channel-compose-text").placeholder = selectedThreadId ? "Write a thread reply…" : "Write a message…";
+  // `#216 compose-hint`. Where the message goes, said in the box rather than in a heading line above
+  // it, and the same words as the box's name for a screen reader.
+  const destination = selectedThreadId ? "Reply in this thread" : "Message the main channel";
+  el("channel-compose-text").setAttribute("aria-label", destination);
+  el("channel-compose-text").placeholder = `${destination}…`;
   renderOutgoingMessages();
 }
 

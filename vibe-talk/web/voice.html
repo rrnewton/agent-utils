@@ -431,8 +431,9 @@
               <ol id="pinned-log" class="messages" aria-label="Pinned messages" hidden></ol>
               <ol id="outgoing-log" class="messages" aria-label="Outgoing messages" hidden></ol>
               <div id="channel-composer">
-                <label id="channel-compose-label" for="channel-compose-text">Message the channel</label>
-                <textarea id="channel-compose-text" rows="3" placeholder="Write a message…" aria-describedby="channel-compose-state"></textarea>
+                <!-- No heading line: it read like one more message. The box says where the message
+                     goes in its placeholder, and names itself to a screen reader the same way. -->
+                <textarea id="channel-compose-text" rows="3" placeholder="Message the main channel…" aria-label="Message the main channel" aria-describedby="channel-compose-state"></textarea>
                 <button id="channel-send" type="button">Send</button>
                 <p id="channel-compose-state" class="hint" role="status" aria-live="polite"></p>
               </div>
