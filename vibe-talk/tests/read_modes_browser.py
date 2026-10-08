@@ -15,13 +15,15 @@ taking turns, the owner's read as his own and the agent's unread. At 412x915 (an
 touch) and 1280x800 (a desk, mouse) the walk is:
 
   sign in, open the channel in All, whose dock on a desk is one row in every mode, with the
-  button's name cut to its first word there -> Show read: pick the thread, which lands on the answer,
+  button's whole name stacked in two short lines there -> Show read: pick the thread, which lands on the answer,
   unfolded, at the head of the list under the pill, with nothing collapsed -> back to All, tap the
   button on to Collapse read, which names itself -> pick the thread again: its root at the head,
   one line "… 45 read messages …" at least 44px tall and every point of it pressing it, the answer
   unfolded below in the upper half of the screen -> tap the line: the run opens where it is, the
-  root unmoved -> tap the button on to Hide read and enter again: the first row is the answer,
-  unfolded. No horizontal overflow and no page error at any step.
+  root unmoved, no message given the focus -> enter again and press Enter on the line: the run
+  opens with the keyboard's focus on its first message -> tap the button on to Hide read and enter
+  again: the first row is the answer, unfolded, under the pill. No horizontal overflow and no page
+  error at any step.
 
 Pass --screenshots DIR to keep a PNG of each step for review; --web-root DIR to run the same walk
 against another copy of the page.
@@ -276,6 +278,14 @@ MEASURE_JS = """({root, answer}) => {
   return {
     dockRows: dockFeet.length,
     shownWords: [...label.children].filter((span) => getComputedStyle(span).display !== 'none').map((span) => span.textContent).join(''),
+    // The lines the name is drawn in: one per distinct top among its words' boxes.
+    labelLines: (() => {
+      const range = document.createRange();
+      range.selectNodeContents(label);
+      const tops = [];
+      for (const r of range.getClientRects()) if (r.width > 0 && !tops.some((t) => Math.abs(t - r.top) < 3)) tops.push(r.top);
+      return tops.length;
+    })(),
     floating: line,
     atEnd: area.scrollTop >= area.scrollHeight - area.clientHeight - 1,
     viewport: window.innerHeight,
@@ -288,6 +298,7 @@ MEASURE_JS = """({root, answer}) => {
     heads: heads.length,
     members: document.querySelectorAll('#discord-log > li[data-read-run="member"]').length,
     hiddenRows: [...document.querySelectorAll('#discord-log > li')].filter((li) => li.getBoundingClientRect().height === 0).length,
+    focusedRow: document.activeElement && document.activeElement.matches('#discord-log > li') ? document.activeElement.dataset.id : null,
     line: box(runLine),
     lineText: runLine ? runLine.textContent : null,
     linePressable: centre,
@@ -368,10 +379,10 @@ def walk(page: Page, touch: bool, size: str, shots: Path | None) -> list[str]:
     notes: list[str] = []
 
     def dock_holds(m: dict[str, object], name: str) -> None:
-        """The phone tile says the whole name; a desk's one-row dock, its first word, and stays one row."""
-        words = name if touch else name.split()[0]
-        check(m["shownWords"] == words, f"{size}: the button draws {m['shownWords']!r}, not {words!r}")
+        """The button says the whole name, on the phone tile and on a desk; a desk's dock stays one row."""
+        check(m["shownWords"] == name, f"{size}: the button draws {m['shownWords']!r}, not {name!r}")
         if not touch:
+            check(m["labelLines"] == 2, f"{size}: a desk draws {name!r} in {m['labelLines']} lines, not two short ones")
             check(m["dockRows"] == 1, f"{size}: under {name} the dock's controls make {m['dockRows']} rows, not 1")
 
     def shot(name: str) -> None:
@@ -468,8 +479,31 @@ def walk(page: Page, touch: bool, size: str, shots: Path | None) -> list[str]:
     check(opened["hiddenRows"] == 0, f"{size}: {opened['hiddenRows']} rows of the opened run are still hidden")
     moved = number(opened, "root", "top") - root_top
     check(abs(moved) <= 1, f"{size}: opening the run moved the root by {moved:.1f}px")
-    notes.append("the line, tapped, opened the run with the root unmoved")
+    # A tap focuses the line too, and a row holding the focus is lit: a read message drawn as unread.
+    check(opened["focusedRow"] is None, f"{size}: a tap on the line put the focus on message {opened['focusedRow']}")
+    notes.append("the line, tapped, opened the run with the root unmoved and no message lit")
     shot("3-collapse-read-opened")
+
+    # From the keyboard: entered again the run is a line again, and Enter on it hands the focus to the
+    # run's first message, where the line was, rather than dropping it to the start of the page.
+    back_to_all()
+    settled_entry()
+    head = '#discord-log > li[data-read-run="head"]'
+    first_id = page.evaluate(f"() => document.querySelector('{head}').dataset.id")
+    page.keyboard.press("Shift")
+    page.focus(f"{head} .read-run")
+    check(page.evaluate("() => document.activeElement.matches('.read-run:focus-visible')") is True,
+          f"{size}: the premise: the line has the keyboard's focus")
+    before = measure(page)
+    page.keyboard.press("Enter")
+    page.wait_for_function("() => !document.querySelector('#discord-log > li[data-read-run]')", timeout=5_000)
+    page.wait_for_timeout(250)
+    keyed = measure(page)
+    check(keyed["focusedRow"] == first_id,
+          f"{size}: Enter on the line left the focus on {keyed['focusedRow']}, not the run's first message {first_id}")
+    moved = number(keyed, "root", "top") - number(before, "root", "top")
+    check(abs(moved) <= 1, f"{size}: opening the run from the keyboard moved the root by {moved:.1f}px")
+    notes.append("Enter on the line opened the run with the focus on its first message")
 
     # Hide read: the read messages are left out, and the entry lands on the answer.
     back_to_all()
@@ -482,7 +516,12 @@ def walk(page: Page, touch: bool, size: str, shots: Path | None) -> list[str]:
     m = settled_entry()
     check(m["firstShown"] == ANSWER_ID, f"{size}: Hide read's thread starts at {m['firstShown']}, not the answer")
     check(m["answerFolded"] == "false", f"{size}: Hide read's answer is folded")
-    notes.append("Hide read: the thread starts at the answer, unfolded")
+    floating = number(m, "floating")
+    top = number(m, "answer", "top")
+    check(floating <= top <= floating + 16,
+          f"{size}: Hide read landed the answer at {top:.0f}px, not just under the floating line at {floating:.0f}px"
+          f"{' (the list is at its end)' if m['atEnd'] else ''}")
+    notes.append(f"Hide read: the thread starts at the answer, unfolded at {top:.0f}px under the pill at {floating:.0f}px")
     shot("4-hide-read-entry")
     return notes
 

@@ -4617,19 +4617,22 @@ textarea {
     color: inherit;
   }
 
-  /* `#221 read-modes`. The read mode's name is a size down on the phone tile, where its column is
-     narrow; beside its icon here it is a word like the others, at their size — and ONE word, the
-     mode's first: this row was fitted to "Hide read" with nothing to spare, and "Collapse read"
-     would push the dock onto a second row. The icon says which mode, the word says what it does to
-     what is read, and the whole name is the button's accessible name and its tooltip. */
+  /* `#221 read-modes`. The read mode's WHOLE name, here as on the phone tile. Its first word alone
+     — "Hide", "Collapse" — reads as the act a tap performs, beside Pace and Read and under the
+     "Collapse all" chip, which is the ambiguity the button names its mode to avoid. This row was
+     fitted to "Hide read" with nothing to spare, and "Collapse read" on one line beside its icon
+     pushes the dock onto a second row, the button with it. So the name stands in two short lines a
+     size down from the row's words: no wider than its first word was at the row's size, and inside
+     the row's height. */
   #control-pane #todo-filter .control-label {
-    font-size: 0.85rem;
-    line-height: inherit;
+    font-size: 0.78rem;
+    line-height: 1.1;
     text-align: start;
   }
 
+  #control-pane #todo-filter .read-mode-verb,
   #control-pane #todo-filter .read-mode-noun {
-    display: none;
+    display: block;
   }
 
   #control-pane .control-note {

@@ -2565,8 +2565,8 @@ size of the channel.
 
 `#221 read-modes`. The button beside Pace names what the list does with messages already read —
 archived (Done), your own words, and placeholders read automatically — and each tap moves it on.
-Each mode has its own icon; a desk's one-row dock shows the name's first word beside it (Show,
-Collapse, Hide), and the tooltip and the accessible name say it whole:
+Each mode has its own icon and is named in full beside it — on a desk's one-row dock in two short
+lines, so the row stays one row — and the tooltip says what the mode does and what a tap moves to:
 
 - **Show read** (the default): every message, the read ones greyed.
 - **Collapse read**: each run of two or more read rows becomes one line, `… 12 read messages …`,

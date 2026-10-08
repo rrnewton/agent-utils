@@ -140,10 +140,14 @@ if (typeof window.ResizeObserver === "function") {
   new window.ResizeObserver(([entry]) => {
     const height = entry.contentRect.height;
     const area = el("scroll-area");
-    const pinned = currentScreen === "main" && currentView === "discord" && atBottom(area);
+    // `#221 read-modes`. A reader just landed on a thread's first unread is reading that, however near
+    // the end of the list it is: the chips changed because the entry opened the message's fold.
+    const landed = currentScreen === "main" && currentView === "discord" && entryLandingHolds();
+    const pinned = !landed && currentScreen === "main" && currentView === "discord" && atBottom(area);
     el("frame-body").style.setProperty(
       "--scroll-tools-clearance", height > 0 ? `calc(${height}px + 0.5rem)` : "0px"
     );
+    if (landed) placeEntryLanding(entryLanding.row);
     if (pinned) area.scrollTop = area.scrollHeight;
   }).observe(el("scroll-tools"));
 }
@@ -8425,10 +8429,48 @@ function landOnFirstUnread() {
   const root = rows.find((row) => drawn(row) && isOpenThreadRoot(row, rootId));
   const rootFits = root && root !== first &&
     first.getBoundingClientRect().top - root.getBoundingClientRect().top <= (foot - head) * ENTRY_ROOT_ROOM;
-  area.scrollTop += (rootFits ? root : first).getBoundingClientRect().top - head;
+  placeEntryLanding(rootFits ? root : first);
   renderScrollTools();
   requestVisibleSummaries();
   return true;
+}
+
+/**
+ * Where the entry put the reader, as `{ key, row, at }`: the thread, the row it brought to the head
+ * of the list, and the scroll position that did it. Null once the reader has moved.
+ *
+ * KEPT, because entering a thread also changes what is around the list, and that is reported after
+ * the landing. On a desk the thread picker takes the thread's name and the dock wraps onto a second
+ * row (`#218 desktop-dock`); opening the message's fold can put "Collapse all" up under the list.
+ * The observers of both keep a reader within the slack of the newest line ON it — and a landing in a
+ * short thread is within that slack on purpose, because the list ends close below the message. Read
+ * as a reader following the newest line, the landing was undone as soon as it was made: on a desk in
+ * Hide read the message went up under the pill and past the list's top edge.
+ *
+ * So until the reader scrolls, the landing outranks the newest line: those observers put the landed
+ * row back at the head instead, as near as the list allows.
+ */
+let entryLanding = null;
+
+/** Bring `row` to just under the floating line, as near as the list allows, and keep it there. */
+function placeEntryLanding(row) {
+  const area = el("scroll-area");
+  area.scrollTop += row.getBoundingClientRect().top - floatingClearance(area) - REPLY_LANDING_GAP_PX;
+  entryLanding = { key: channelContextKey(), row, at: area.scrollTop };
+}
+
+/**
+ * Whether the reader is still where entering the thread put them: that thread's list on screen, the
+ * landed row still drawn in it, and nothing scrolled since. The landing is forgotten once it is not.
+ */
+function entryLandingHolds() {
+  const landing = entryLanding;
+  if (landing === null) return false;
+  const holds = currentScreen === "main" && currentView === "discord" && channelView === "thread" &&
+    !pinnedOnly && landing.key === channelContextKey() && landing.row.parentNode === el("discord-log") &&
+    landing.row.getBoundingClientRect().height > 0 && Math.abs(el("scroll-area").scrollTop - landing.at) <= 1;
+  if (!holds) entryLanding = null;
+  return holds;
 }
 
 // --- thread selector ----------------------------------------------------------------------------
@@ -15089,10 +15131,10 @@ const READ_MODES = ["show", "collapse", "hide"];
 const READ_MODE_LABELS = { show: "Show read", collapse: "Collapse read", hide: "Hide read" };
 
 /**
- * The first word of each name, drawn on its own where the room is a desk's dock row: `#218
- * desktop-dock` fitted that row to "Hide read" with nothing to spare, and "Collapse read" beside
- * its icon would push the dock onto a second row. web/voice.css hides the second word there; the
- * button's accessible name and its tooltip still say the whole name.
+ * The first word of each name, in a span of its own so that a desk's dock row can stand the name in
+ * two short lines: `#218 desktop-dock` fitted that row to "Hide read" with nothing to spare, and
+ * "Collapse read" on one line beside its icon would push the dock onto a second row. Never drawn
+ * alone — a lone "Hide" or "Collapse" reads as the act a tap performs. See web/voice.css.
  */
 const READ_MODE_VERBS = { show: "Show", collapse: "Collapse", hide: "Hide" };
 
@@ -15143,7 +15185,7 @@ const nextReadMode = (mode) => READ_MODES[(READ_MODES.indexOf(mode) + 1) % READ_
 function renderReadModeControl() {
   const button = el("todo-filter");
   const label = READ_MODE_LABELS[readMode];
-  // Two words in two spans, so a desk can draw the first alone; made here when the markup's are absent.
+  // Two words in two spans, so a desk can stack them; made here when the markup's are absent.
   const words = el("todo-filter-label");
   let verb = childByClass(words, "read-mode-verb");
   if (!verb) {
@@ -15210,11 +15252,21 @@ function readRunLine(row) {
   const line = document.createElement("button");
   line.className = "read-run";
   line.setAttribute("type", "button");
-  line.setAttribute("aria-expanded", "false");
+  // No `aria-expanded`: the line is not a disclosure that stays to say it is open. It goes, and the
+  // run is drawn in its place.
   line.addEventListener("click", (event) => {
     // The row's own tap would fold it or read it aloud; this tap is the line's alone.
     if (event) event.stopPropagation();
+    // A keyboard on the line is left on nothing as it goes, and falls back to the start of the page.
+    // It moves to the run's first message instead, which is where the line was. Only a keyboard's
+    // focus, the kind drawn as a ring: a tap or a click focuses the line too, and a row holding the
+    // focus is lit as if under the pointer — a read message drawn as though it were not.
+    const focused = document.activeElement === line && line.matches(":focus-visible");
     openReadRun(row);
+    if (focused) {
+      row.setAttribute("tabindex", "-1");
+      row.focus({ preventScroll: true });
+    }
   });
   row.replaceChildren(line, ...row.children);
   row.readRunLine = line;
@@ -19675,6 +19727,13 @@ if (typeof window.ResizeObserver === "function") {
     const now = { list: area.clientHeight, dock: el("dock").offsetHeight };
     const grew = seen !== null && seen.list > 0 && currentScreen === "main" ? now.dock - seen.dock : 0;
     seen = now;
+    // `#221 read-modes`. Except a reader just landed on a thread's first unread who has not moved
+    // since: on a desk the entry itself wrapped the dock, by putting the thread's name in the picker,
+    // and the message is kept at the head however near the end of the list it is.
+    if (entryLandingHolds()) {
+      placeEntryLanding(entryLanding.row);
+      return;
+    }
     if (grew > 0 && atBottom(area, BOTTOM_SLACK_PX + grew)) {
       area.scrollTop = area.scrollHeight;
     }

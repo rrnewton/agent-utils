@@ -762,7 +762,28 @@ class FakeElement {
     this.scrolledIntoView += 1;
   }
 
-  focus() {}
+  /**
+   * Take the focus, as the document reports it in `activeElement`, and keep what was asked of it.
+   * Nothing is laid out, so `preventScroll` changes nothing here; a test reads it back to know the
+   * page asked for it. Focus moved by the page is drawn as the focus it moved from was, as a browser
+   * draws it; `focusFrom` is how a test says what gave the focus in the first place.
+   */
+  focus(options) {
+    FakeElement.focused = this;
+    this.focusedWith = options === undefined ? null : options;
+  }
+
+  /** Focused by `"keyboard"` (drawn as a ring, `:focus-visible`) or by a `"pointer"` (not). */
+  focusFrom(how) {
+    this.focus();
+    FakeElement.focusVisible = how === "keyboard";
+  }
+
+  /** The one selector the page asks an element about. */
+  matches(selector) {
+    if (selector !== ":focus-visible") throw new Error(`this fixture cannot match ${selector}`);
+    return FakeElement.focused === this && FakeElement.focusVisible === true;
+  }
 
   /** Every element at or under this one, so a test can ask what was really rendered. */
   descendants() {
@@ -1638,8 +1659,13 @@ function newPage(store = new Map(), script = SCRIPT, arrange = null) {
   // browser gives for "this page went away". `#54 resume-recovery` turns entirely on it, and
   // before this the fake document had no way to be hidden at all.
   const documentListeners = new Map();
+  FakeElement.focused = null;
+  FakeElement.focusVisible = false;
   const document = {
     documentElement: page.documentElement,
+    get activeElement() {
+      return FakeElement.focused;
+    },
     visibilityState: "visible",
     hidden: false,
     addEventListener: (type, fn) => {
@@ -1662,6 +1688,7 @@ function newPage(store = new Map(), script = SCRIPT, arrange = null) {
       return node;
     },
   };
+  page.document = document;
   /** Fire a document-level event (a tap's `pointerdown`, a `keydown`) at the page's listeners. */
   page.documentEvent = async (type, event) => {
     for (const fn of documentListeners.get(type) || []) {
@@ -30241,12 +30268,17 @@ test("the Hide read button cycles Show read, Collapse read and Hide read, names 
     assert.match(HTML_CODE, new RegExp(`class="control-icon read-mode-icon" data-mode="${mode}"${hidden} viewBox`),
       `the ${mode} icon is not drawn as the page starts`);
   }
-  // The name is two words, and the desk's one-row dock draws the first alone. (This page was left
-  // on Collapse read before the reloads.)
+  // The name is two words, and the desk's one-row dock stacks them, whole: a lone "Collapse" reads as
+  // the act a tap performs. (This page was left on Collapse read before the reloads. That the dock
+  // stays one row is measured in Chromium.)
   const words = page.el("todo-filter-label").children.map((node) => [node.className, node.textContent]);
   assert.deepStrictEqual(words, [["read-mode-verb", "Collapse"], ["read-mode-noun", " read"]]);
-  assert.match(cssBlockIn("(min-width: 900px) and (pointer: fine)", "#control-pane #todo-filter .read-mode-noun"),
-    /display:\s*none/, "a desk's dock draws the whole name, and the row it was fitted to wraps");
+  const desk = "(min-width: 900px) and (pointer: fine)";
+  for (const word of ["verb", "noun"]) {
+    assert.match(cssBlockIn(desk, `#control-pane #todo-filter .read-mode-${word}`), /display:\s*block/,
+      "a desk's dock does not stand the name in two lines");
+  }
+  assert.doesNotMatch(CSS_CODE, /\.read-mode-noun\s*\{\s*display:\s*none/, "a desk's dock cuts the name to its first word");
 });
 
 test("Collapse read: a thread opens on its root, one line for the read run, and the first unread unfolded", async () => {
@@ -30269,7 +30301,8 @@ test("Collapse read: a thread opens on its root, one line for the read run, and 
   assert.ok(line, "the run has no line");
   assert.equal(line.textContent, "… 12 read messages …");
   assert.equal(line.hidden, false);
-  assert.equal(line.getAttribute("aria-expanded"), "false");
+  // It goes when it opens the run, so it never says it is open: an `aria-expanded` would stay "false".
+  assert.equal(line.hasAttribute("aria-expanded"), false, "the line claims a state it never has");
   assert.equal(line.getAttribute("type"), "button");
   for (const row of rows.slice(2, 13)) {
     assert.equal(row.getAttribute("data-read-run"), "member");
@@ -30286,13 +30319,18 @@ test("Collapse read: a thread opens on its root, one line for the read run, and 
   // The folds under the line are not the list's: Expand all has nothing it could show.
   assert.equal(page.el("expand-all").hidden, true, "Expand all offered to open a message behind the line");
 
-  // A tap on the line opens the run where it is: the root does not move.
+  // A tap on the line opens the run where it is: the root does not move. Pressed from the keyboard,
+  // the focus goes to the run's first message, where the line was, and not back to the page's start.
+  line.focusFrom("keyboard");
   await line.click();
   await page.settle();
   assert.deepStrictEqual(collapsedRows(page), [], "the run did not open");
   assert.ok(rows.every((row) => !row.hidden), "a message of the opened run is still hidden");
   assert.equal(line.hidden, true, "the line stayed over the run it opened");
   assert.equal(rows[0].getBoundingClientRect().top, rootTop, "opening the run moved the reader");
+  assert.equal(page.document.activeElement, rows[1], "the focus was left on the line that went");
+  assert.equal(rows[1].getAttribute("tabindex"), "-1", "the run's first message cannot take the focus");
+  assert.equal(rows[1].focusedWith && rows[1].focusedWith.preventScroll, true, "taking the focus may scroll the reader");
   assert.equal(page.el("expand-all").hidden, false, "the long read message in the run cannot be opened");
   // Open stays open: a redraw does not collapse it again, nor does a message joining it.
   page.dealtWith.add(runId(500));
@@ -30397,6 +30435,31 @@ test("Collapse read: a message marked Done joins the runs around it, and the rea
   assert.equal(reading().getBoundingClientRect().top, 0, "splitting the run moved the reader");
 });
 
+test("Collapse read: a run opened from the keyboard hands the focus to its first message, and one tapped open does not", async () => {
+  // The line goes as it opens the run. A keyboard left on it would fall back to the start of the page.
+  // A tap or a click focuses the line as well, but a row holding the focus is lit as under the
+  // pointer, and a read message must not be drawn as though it were not: that focus stays put.
+  const page = newPage();
+  const messages = joiningChannel(page);
+  await signIn(page);
+  await showDiscord(page, messages);
+  await chooseReadMode(page, "Collapse read");
+  const tapped = readRunLineOf(rowWithId(page, messages[1].id));
+  tapped.focusFrom("pointer");
+  await tapped.click();
+  await page.settle();
+  assert.equal(rowWithId(page, messages[1].id).hasAttribute("data-read-run"), false, "the tap did not open the run");
+  assert.equal(page.document.activeElement, tapped, "a tap moved the focus onto a read message");
+  assert.equal(rowWithId(page, messages[1].id).hasAttribute("tabindex"), false);
+  const pressed = readRunLineOf(rowWithId(page, messages[4].id));
+  pressed.focusFrom("keyboard");
+  await pressed.click();
+  await page.settle();
+  assert.equal(rowWithId(page, messages[4].id).hasAttribute("data-read-run"), false, "the key did not open the run");
+  assert.equal(page.document.activeElement, rowWithId(page, messages[4].id),
+    "the keyboard was left on the line that went, not the run's first message");
+});
+
 test("...and a read that finds a message read elsewhere grows the run, without moving the reader", async () => {
   const page = newPage();
   const messages = joiningChannel(page);
@@ -30418,6 +30481,29 @@ test("...and a read that finds a message read elsewhere grows the run, without m
   assert.equal(rowWithId(page, messages[1].id).hasAttribute("data-read-run"), false, "a run of one stayed collapsed");
   assert.equal(readRunLineOf(rowWithId(page, messages[3].id)).textContent, "… 3 read messages …");
   assert.equal(reading().getBoundingClientRect().top, 0, "a read that shrank a run moved the reader");
+});
+
+test("...and the reader's own words turned unread in Settings split the run they were in, with no read and no filter", async () => {
+  // A channel without threads re-derives the rows it holds: nothing is read and no filter changes,
+  // so the pass over the rows is the only thing that can decide the runs again.
+  const page = newPage();
+  await signIn(page);
+  await showDiscord(page, splitRunChannel(page));
+  await chooseReadMode(page, "Collapse read");
+  const role = (id) => rowWithId(page, id).getAttribute("data-read-run");
+  assert.equal(role("8800000000000000004"), "head");
+  assert.equal(role("8800000000000000006"), "member");
+  const reads = page.pageReads;
+  await page.el("mark-own-read").setChecked(false);
+  await page.settle();
+  assert.equal(page.pageReads, reads, "the premise: the setting redrew what the page holds, without a read");
+  assert.equal(role("8800000000000000006"), null, "the reader's own message, unread now, is hidden in the run");
+  assert.equal(rowWithId(page, "8800000000000000006").hidden, false);
+  assert.equal(role("8800000000000000004"), null, "what is left of the run, one row, stayed collapsed");
+  await page.el("mark-own-read").setChecked(true);
+  await page.settle();
+  assert.equal(readRunLineOf(rowWithId(page, "8800000000000000004")).textContent, "… 3 read messages …",
+    "the reader's own words read again did not rejoin the run");
 });
 
 test("Collapse read: a jump to a message inside a run opens the run; Pinned and Hide read are as they were", async () => {
@@ -30456,6 +30542,61 @@ test("Hide read: entering a thread lands on its first unread message too", async
   await enterRunThread(page, messages, () => chooseReadMode(page, "Hide read"));
   assert.deepStrictEqual(shownIds(page), [runId(500), runId(501)], "Hide read showed a read message");
   assert.equal(rowWithId(page, runId(500)).getAttribute("data-collapsed"), "false", "the first unread is folded");
+});
+
+test("...and the dock and the chips changing as the thread opens leave the first unread where the entry put it", async () => {
+  // On a desk the picker takes the thread's name as the thread opens and the dock wraps onto a second
+  // row (`#218 desktop-dock`); opening the message's fold can put "Collapse all" up under the list. A
+  // browser lays both out before the landing measures, and reports them AFTER it, to observers that
+  // keep a reader within the slack of the newest line on it. A short thread in Hide read leaves the
+  // landing that near the end on purpose, and the dock's observer took the message up under the pill.
+  const GROWTH = 42;
+  const run = async (script) => {
+    const page = newPage(new Map(), script, (p) => p.enableResizeObserver());
+    const messages = runThread(page, { tail: [["agent", false]] });
+    const area = page.el("scroll-area");
+    const dock = page.el("dock");
+    await enterRunThread(page, messages, async () => {
+      await chooseReadMode(page, "Hide read");
+      // The dock as All had it, reported. Then the thread's name wraps it: laid out, and so measured
+      // by the landing, but not yet reported to anything watching the list.
+      area.clientHeight = 470;
+      dock.offsetHeight = 50;
+      page.resized(area);
+      dock.offsetHeight += GROWTH;
+      area.clientHeight -= GROWTH;
+    });
+    const answer = rowWithId(page, runId(500));
+    const landed = atTheHead(page, answer);
+    const short = area.scrollHeight - area.scrollTop - area.clientHeight;
+    page.resized(area);
+    const afterDock = atTheHead(page, answer);
+    page.resized(page.el("scroll-tools"));
+    const afterChips = atTheHead(page, answer);
+    // Once the reader has moved, the landing is spent: on the newest line, the dock growing again
+    // keeps them there, as it always has.
+    await scrollToGap(page, 0);
+    dock.offsetHeight += GROWTH;
+    area.clientHeight -= GROWTH;
+    page.resized(area);
+    return { landed, nearTheEnd: short > 0 && short <= BOTTOM_SLACK_PX, afterDock, afterChips,
+      newestKept: atBottomOf(area) };
+  };
+  const real = await run(SCRIPT);
+  assert.equal(real.landed, true, "the entry did not land the answer at the head");
+  assert.equal(real.nearTheEnd, true, "the premise: the landing is within the slack of the list's end");
+  assert.equal(real.afterDock, true, "the dock wrapping took the landed answer up under the floating line");
+  assert.equal(real.afterChips, true, "the chips changing took the landed answer up under the floating line");
+  assert.equal(real.newestKept, true, "a reader who went down to the newest line was not kept on it");
+
+  // THE CONTROLS: either observer reading the landing as a reader on the newest line.
+  const dockOnly = await run(brokenScript(
+    "    if (entryLandingHolds()) {\n      placeEntryLanding(entryLanding.row);\n      return;\n    }\n", ""));
+  assert.deepStrictEqual(dockOnly, { ...real, afterDock: false, afterChips: false });
+  const chipsOnly = await run(brokenScript(
+    "const landed = currentScreen === \"main\" && currentView === \"discord\" && entryLandingHolds();",
+    "const landed = false;"));
+  assert.deepStrictEqual(chipsOnly, { ...real, afterChips: false });
 });
 
 test("a collapsed run's line is the row's only face, a thumb tall, and not something a swipe can archive", () => {
