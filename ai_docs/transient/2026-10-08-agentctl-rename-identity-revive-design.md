@@ -1,246 +1,264 @@
-# agentctl: rename, routing-identity checks, and revive (design, 2026-10-08)
+# agentctl: rename, routing-identity checks, and revive (design v2, 2026-10-08)
 
-Status: proposal for review. Build order, set by the owner: (1) `rename` and the
-routing-identity checks, including `doctor`; (2) `revive`. Two small start
-defects are fixed in their own commits (section 6).
+Status: **Part A (rename, identity checks, doctor) is v2**, revised after the
+v1 review (commit a29e16683): findings 1, 2, 3, 4, 9, 12 and 14. **Part B
+(revive) is parked**; it waits until Part A has landed, and its open findings
+(5, 6, 7, 8, 10, 11, 13) are listed in section B. Both editions (Python and
+Rust) implement Part A; `cross/agentctl_differential.py` covers it.
 
-## 0. Facts this design rests on (measured, not assumed)
+## 0. Measured facts
 
-- **Engine.** `common/bin/engine-resolver` runs the Python edition unless
-  `DAGRUN_ENGINE=rust`. `cross/agentctl_differential.py` pins one shared
-  capability list for both editions, so a shared verb needs both editions or an
-  explicit edition-specific advertisement (as `move` and `agentcloud` already are).
-- **Mutable state agentctl keeps** (besides the declarative `profiles.json`):
-  `.agentctl/<name>/agent.json` (mutable: lifecycle, pane, goal fields),
-  `.agentctl/<name>/queue/` (durable delivery queue; `target.json` binds to a
-  *pane id*, not a name), `.agentctl/.<name>.lock`, `.identity.lock`, move
-  intents, and `.agentctl/archive/<name>-<token>/` written once by `stop`.
-  The archive is already agentctl's memory; this design makes it the source of
-  truth for past agents and their conversation IDs.
-- **Herdr identity is not positional.** `tab_id` (`wJ:t85`) and `pane_id`
-  (`wJ:p85`) are opaque and stable; the displayed tab `number` is the decimal
-  value of the base-32 suffix (`t85` = 8*32+5 = 261), with gaps where tabs
-  closed. `terminal_id` (`term_65d5...`) is a second stable key. What *is*
-  mutable is human-facing: the **tab label** (`herdr tab rename`, or the UI) and
-  the **Herdr agent name** (`herdr agent rename`; `herdr agent get NAME`
-  resolves by it, and `move` recovery depends on it). Herdr pane/tab IDs are
-  only unique within one server lifetime; `terminal_id` guards reuse.
-- **What the per-operation check verifies today** (`agent._validate` via
-  `_checked`): pane exists; harness kind; workspace label (when configured);
-  cwd; Herdr-reported session when one is recorded. It does **not** check the
-  tab label, the Herdr agent name, or `terminal_id`, and records do not store
-  `terminal_id`.
-- **Session IDs are not captured.** `session_value` is copied once at start from
-  Herdr's `pane get` `agent_session`; Herdr reports none for Claude panes. In one
-  consumer's registry, 0 of 37 archived Claude records and 0 live Claude records
-  hold an ID; Codex IDs exist only where a caller ran `bind-session`/`goal`.
-  Crucially, `resolve_target` treats a non-null `session_value` as a *routing*
-  key (it scans panes for a Herdr-reported match), so an ID agentctl merely
-  knows must **not** be written there.
-- **A live sweep of that registry** found 2 records whose panes no longer exist,
-  2 live panes whose harness had exited (pane back at a shell), and 4 tabs in the
-  project workspace that no record owns. Nothing reports this today.
-- `agentctl resume NAME` already exists and means "un-pause input", hence the new
-  verb is `revive`.
-- **wrkslots** records per slot: `agent` (a name), `task`, `purpose`, and an
-  `owner` *process* identity (pid, start ticks, boot id). It does not know
-  agentctl tokens. `wrkslots adopt` binds an unowned slot to a live owner.
+- **Engine.** `common/bin/engine-resolver` runs Python unless
+  `DAGRUN_ENGINE=rust`; the differential pins one shared capability list.
+- **Mutable state.** `.agentctl/<name>/agent.json`, `.agentctl/<name>/queue/`
+  (`target.json` binds to a pane id, never to a name; `.delivery.lock`,
+  `.binding.lock`), `.agentctl/.<name>.lock`, `.identity.lock`, move intents,
+  and `archive/<name>-<token>/` written once by `stop`.
+- **Herdr identity.** `tab_id`/`pane_id` are opaque and stable within one
+  server lifetime; the displayed tab `number` is the base-32 suffix in decimal
+  (`t85` -> 261). `terminal_id` names the terminal. Mutable, human-facing: the
+  tab label and the Herdr agent name. A `terminal_id` does not change when the
+  program inside the terminal changes.
+- **Herdr input has no conditional form.** `herdr api schema --json`
+  (protocol 19): `pane.send_text {pane_id, text}`, `pane.send_keys {pane_id,
+  keys}`, `agent.prompt {target, text, wait}`, `agent.send_keys {target, keys}`.
+  No expected-terminal or expected-process field; targets do not accept a
+  `terminal_id`. Herdr's source is not in this tree.
+- **What is verified today** (correcting v1). Owned records (adapter `herdr`):
+  `agent get NAME` must return the recorded pane (`_WorkspaceClient.pane_info`),
+  then `pane get` for workspace, cwd, harness, and the Herdr session when one
+  was observed; Claude's trust prompt is screen-checked. Custom-pane records
+  also pin the foreground process (`custom_process_identity`); adopted records
+  pin the pane shell (`foreign_shell_identity`). Not verified: `terminal_id`,
+  tab label, and, for owned records, the harness process. `agent get` already
+  returns `tab_id` and `terminal_id`, so checking those costs no extra call.
+- **Cost today**, counted with the executable fake Herdr of the differential
+  (identical in both editions): `send` 20 Herdr calls (7 `pane read`, 5 `pane
+  get`, 4 `agent get`, 2 `pane list`, 1 `send-text`, 1 `send-keys`); `start`
+  27-29; `stop` 15; `status` 10. Live Herdr: 2-3 ms per `pane get`/`agent get`/
+  `tab get`/`process-info`, 6 ms `agent list`, 10 ms `pane list`. A live
+  `agentctl status` makes 4 calls in about 200 ms wall, mostly interpreter
+  start; `list` over 8 records makes 20 calls in 346 ms. Records with an
+  observed session resolve by scanning every pane (`pane list` + one `pane get`
+  per pane).
+- **Drift observed in one consumer's live registry**: 2 records whose panes are
+  gone, 2 panes whose harness exited, 4 workspace tabs owned by no record.
+- **wrkslots** records per slot an agent *name* and an owner *process*. Its
+  shipped probe `py/wrkslots/examples/agentctl_liveness_probe.py` looks up
+  `registry/AGENT/agent.json` and `archive/AGENT-*/agent.json`; an unknown name
+  is "unverifiable" (rc 2), which blocks slot removal.
 
-## 1. Names and identity
+## A1. Ownership classes
 
-- A **live name** is unique within one registry (the directory name). That is
-  the only uniqueness agentctl promises for names.
-- A **token** (32-hex, already in every record) identifies one agent lifetime
-  forever. Archive ID = `<name>-<token>`. Past agents are addressed by token;
-  names are reusable labels. Names are therefore *not* globally unique in
-  history, and nothing pretends they are.
-- New record fields (Python and Rust read/write the same schema):
-  - `terminal_id`: from `pane get` at start/adopt/move.
-  - `conversation`: `{harness, id, source, recorded_at}` where `source` is
-    `assigned` (agentctl chose it at launch), `herdr` (Herdr reported it),
-    `bound` (`bind-session`), `discovered` (matched from harness files at stop),
-    or `missing` (with `reason`). `session_value` keeps its current meaning
-    (Herdr-observed routing identity) and is never filled from `conversation`.
-  - `name_history`: `[{name, renamed_at}]`, appended by `rename`.
-  - `slot`: `{name, project_root, path}` only when started with `--slot`
-    (taken from `wrkslots shell-command` output, which is already parsed).
-  - `revived_from`: archive token, set by `revive`.
-  - `archived_at`: set by `stop`.
+| Class | Adapters | agentctl owns | Identity anchors |
+|---|---|---|---|
+| owned | `herdr` | tab, label, Herdr name, process | name->pane, `terminal_id`, `tab_id`, label, harness process |
+| custom | `herdr-pane`, `herdr-relay` | tab, label, process | as today (`custom_process_identity`) plus `terminal_id`, `tab_id`, label |
+| adopted | `herdr-foreign` | registry alias only | as today (pane, cwd, harness, shell generation) plus `terminal_id` |
 
-## 2. Routing-identity check (every pane-touching operation)
+Adopted records keep their existing semantics: a different label and a shared
+tab remain valid, and agentctl never renames or relabels a foreign runtime.
 
-Define one **identity check** used by `send`, `drain`, `read`, `wait`, `goal`,
-`attach`, `bind-session`, `move`, `rename`, `stop`:
+## A2. Identity check before every input effect
 
-1. existing checks (pane, harness, workspace, cwd, Herdr session);
-2. `pane get` `terminal_id` equals the record's;
-3. `pane get` `tab_id` equals the record's `tab_id`, and the tab has one pane;
-4. `tab get` label equals the record name;
-5. for adapter `herdr` (agentctl-started), `agent get PANE` name equals the
-   record name. Adopted panes may have no Herdr agent name; when they have one
-   it must match.
+The check runs before **each** text or key effect, not once per operation:
+the paste and every submission-key retry inside `submit_verified`, plus every
+key sent by goal and drain. It runs under the existing pane lock.
 
-Any mismatch refuses the operation, names every differing field with recorded
-and observed values, and points at `agentctl doctor`. It never re-resolves by
-label or name ("never guess"). Cost: two extra Herdr calls, measured at 2-3 ms
-each.
+1. existing checks for the class (above);
+2. `terminal_id` and `tab_id` equal the record's (from `agent get NAME` for
+   owned records, `pane get` otherwise);
+3. owned and custom: `tab get` label equals the record name, once per operation;
+4. owned: the harness process identity recorded at start (boot id, pid, start
+   ticks, executable device/inode; captured with the existing
+   `process-info` + `/proc` code) is still a foreground process of the pane.
+   This catches a different harness in the same terminal.
 
-Levels (`--identity-check`, env `AGENTCTL_IDENTITY_CHECK`, or `profiles.json`
-`"identity_check"`; precedence in that order):
+Mismatch refuses, names each differing field, and points at `agentctl doctor`.
+Nothing is re-resolved by label or name.
 
-- `standard` (default): the check before each operation.
-- `paranoid`: also after each operation (after the submit for `send`/`drain`).
-  A post-check mismatch cannot unsend text; it exits 76 ("delivered, identity
-  changed during delivery") and records the message as `possibly_misrouted` in
-  the queue's processed record.
-- There is no "off" level.
+**Residual window (finding 1).** This does not make misrouting impossible.
+Herdr writes by `pane_id`, so input can still be misdelivered if, between the
+last verification read and Herdr's write, either (a) Herdr restarts and gives
+the same `pane_id` to another pane that is ready for input, or (b) the
+verified harness exits and the pane's shell or a new program receives the
+text. The window is one Herdr round trip per effect (measured in the
+implementation, expected 2-5 ms). For (b), the submission key is sent only
+after a fresh check, and a bracketed paste into a shell with bracketed-paste
+mode does not execute without that key; a shell without it would execute pasted
+lines, which the doc and the error text state plainly. Paranoid mode (A3)
+detects some misdeliveries afterward; it cannot undo them.
 
-Legacy records without `terminal_id` are backfilled on the first check in which
-every other field matches; the result reports `identity_backfilled: true`.
+**Closing the window needs Herdr.** Proposed upstream change: an optional
+`expect` object on `pane.send_text`, `pane.send_keys`, `agent.prompt` and
+`agent.send_keys` (`terminal_id`, optional foreground pid), compared by the
+server under its pane-table lock immediately before the PTY write, returning
+`expectation_failed` and writing nothing on mismatch. agentctl would use it
+when the schema advertises it and fall back to A2 otherwise. Filing it is the
+owner's call; this design does not depend on it.
 
-## 3. `agentctl doctor` (registry-vs-Herdr sweep)
+**Legacy records (finding 2).** Records without `terminal_id` or a harness
+process identity are not backfilled from what Herdr shows now, because a
+restarted server can recreate every visible field. Backfill happens only with
+independent evidence: an adopted record whose pinned shell generation still
+owns the pane. Other legacy records keep today's checks plus the label check,
+and doctor reports them as `legacy-unanchored`; they disappear as agents are
+replaced.
 
-Read-only by default, one call per workspace for `tab list`/`pane list` plus one
-`pane get` per record (about 50 ms for 10 agents). JSON output, exit 0 when clean,
-1 on any finding, 2 when Herdr is unreachable. Findings per record:
-`pane-missing` (suggest `agentctl stop NAME`), `harness-exited` (pane at a
-shell), `terminal-mismatch`, `tab-moved`, `label-mismatch`, `herdr-name-mismatch`,
-`workspace-mismatch`, `rename-incomplete` (journal present, section 4),
-`legacy-no-terminal-id`. Workspace-level findings: `label-collision` (two tabs or
-a foreign tab carry a registered name), and informational `unmanaged-tab`.
-`--repair-labels` restores a tab label/Herdr agent name only for records whose
-pane, terminal, tab, harness and cwd all match; everything else stays manual.
-The health tick runs `agentctl doctor`.
+## A3. Check levels
 
-## 4. `agentctl rename OLD NEW`
+`--identity-check standard|paranoid`, env `AGENTCTL_IDENTITY_CHECK`, or
+`profiles.json` `"identity_check"` (that precedence). `standard` is A2.
+`paranoid` adds a check after each operation that leaves the agent live
+(`send`, `drain`, `goal`, `read`, `attach`, `rename`, `move`); a post-check
+mismatch exits 76 and marks the processed message `possibly_misrouted`. `stop`
+and the retirement paths (missing pane, returned shell, interrupted move)
+keep their existing operation-specific proofs and have no live-pane post-check.
+There is no "off" level.
+
+## A4. Registry invariants and lock order
+
+- At most one live record per `pane_id` and per `terminal_id` in a registry.
+  Enforced under `.identity.lock` at start, adopt, move and rename; doctor
+  reports violations. Across registries, owned agents are protected by Herdr's
+  global agent-name uniqueness; adopted aliases in two registries are not, and
+  doctor run per registry cannot see the other registry.
+- One lock order for every operation: name locks (sorted by name), then
+  `.identity.lock`, then the queue `.delivery.lock`, then `.binding.lock`, then
+  the pane lock. This matches move (name, delivery, binding, pane) and start
+  and bind-session (name, identity).
+
+## A5. `agentctl rename OLD NEW`
 
 For a live agent whose warm context is still useful but whose purpose changed.
-Not a substitute for starting a new agent.
 
-Preconditions (all refusals, nothing changed):
-- `NEW` passes the name rule, is not a live record, has no live Herdr agent
-  named `NEW`, and no tab in the workspace is labelled `NEW`;
-- `OLD` passes the full identity check; adapter is `herdr` or `herdr-foreign`
-  (relay/pane/agentcloud adapters refused in the first version);
-- no message for `OLD` is in flight (`queue/inflight` empty), and no move intent.
+Preconditions, checked under all locks of A4 (`OLD`, `NEW`, identity, OLD's
+queue delivery and binding locks, pane): `NEW` is a valid unused live name; no
+Herdr agent is named `NEW`; no tab in the workspace is labelled `NEW` (owned
+and custom); `OLD` passes A2; no rename journal names either name; no move
+intent. Holding the delivery lock excludes this registry's drains; messages
+waiting in `inbox` move with the directory and stay bound to the same pane.
+Raw pane-addressed queues from other tools are unaffected, since nothing they
+bind to (pane, terminal) changes.
 
-Locks: `.OLD.lock` and `.NEW.lock` in sorted order, then `.identity.lock`.
-
-Steps, each idempotent and checked before acting:
-1. write `.agentctl/.rename-OLD.json` `{old, new, token, pane_id, tab_id,
-   terminal_id, started_at}` (fsync file and directory);
-2. `herdr agent rename PANE NEW` (adapter `herdr`, or when a name was present);
+Steps (owned and custom do all; adopted does 1, 4, 5 only):
+1. journal `.agentctl/.renames/<token>.json` `{token, old, new, pane_id,
+   terminal_id, tab_id, journal_id, started_at}`: temp file, fsync, rename,
+   fsync directory;
+2. `herdr agent rename PANE NEW` (owned);
 3. `herdr tab rename TAB NEW`;
-4. `renameat2(RENAME_NOREPLACE)` `.agentctl/OLD` -> `.agentctl/NEW` (helper
-   already used by archive), then rewrite `agent.json` with `name=NEW` and a
-   `name_history` entry (temp file + rename);
-5. delete the journal.
+4. rewrite `OLD/agent.json` with `name=NEW` and one `name_history` entry
+   `{name: OLD, renamed_at, journal_id}` (appended only if no entry carries
+   this `journal_id`), fsync file and `OLD/`; then `renameat2(NOREPLACE)`
+   `OLD` -> `NEW` and fsync `.agentctl/`;
+5. unlink the journal, fsync `.renames/`.
 
-Recovery: a journal makes every command on `OLD` or `NEW` refuse with "rename
-incomplete; rerun `agentctl rename OLD NEW`". Rerunning re-verifies the pane by
-`pane_id`+`terminal_id` from the journal (the name and label may be either value)
-and completes the remaining steps. If the pane is gone, it completes only the
-registry steps and reports `herdr_steps: skipped-pane-missing`. If any observed
-value is neither OLD nor NEW, it refuses. No rollback mode in the first version.
+Every command that loads a record first lists `.renames/` (cheap; usually
+empty) and refuses any name a journal mentions: "rename incomplete; rerun
+`agentctl rename OLD NEW`".
 
-Not updated, reported as `external_references` hints: the wrkslots `agent`
-field (when the record has a `slot`, the hint names the slot), chat-bridge or
-cron configuration that names `OLD`. agentctl never edits another tool's state.
+Recovery, by rerunning the same command: a scoped loader, used only with a
+journal, accepts exactly these states and requires the record token to equal
+the journal token:
 
-## 5. `agentctl revive NAME` (after 1-4 land)
+| Directory | `name` field | Meaning |
+|---|---|---|
+| OLD | OLD | before step 4 |
+| OLD | NEW | inside step 4 (content published, not moved) |
+| NEW | NEW | after step 4 |
+| NEW | OLD, or both dirs exist, or token differs | refuse: corruption |
 
-Resolution: archives whose `agent.json` name or `name_history` contains `NAME`.
-Exactly one -> use it. More than one -> refuse and print, per candidate, token,
-created/archived times, harness, cwd, slot, conversation source and the first
-line of the last delivered message, so the coordinator picks with one more call:
-`--archive TOKEN` (unique prefix of 8 or more characters). `--newest` accepts
-the newest by `archived_at` (directory mtime for legacy archives, labelled so).
+It re-verifies the pane by `pane_id` + `terminal_id` from the journal (label and
+Herdr name may be OLD or NEW, nothing else), redoes steps 2-5 idempotently, and,
+if the pane is gone, completes 4-5 and reports `herdr_steps:
+skipped-pane-missing`. No rollback mode. Both editions read and write the same
+journal, so either can finish the other's rename.
 
-Launch: same harness, profile/argv and model from the archived launch block
-(legacy schema-1 records rebuild it from `harness`/`model`/`arguments`), with a
-structured resume of `conversation.id`; new token; `revived_from` set; tab label
-and Herdr name `NAME` (or `--as NEW`). Optional `--brief/--file` delivered after
-the harness is ready. The archive is never modified.
+**wrkslots (finding 9).** agentctl does not edit wrkslots. The shipped probe is
+changed to match any active or archived record whose `name` or `name_history`
+contains AGENT, so a renamed agent is reported alive while it runs and dead
+after `agentctl stop`. A later lifetime that reuses OLD is also matched; any
+live match yields "alive", which errs toward blocking removal. Relabelling the
+slot's agent name would be a new wrkslots-owned command (`adopt` refuses to
+replace a historical owner); not needed for removal safety, so not in scope.
+Rename reports the other references it cannot update (wrkslots slot, chat or
+cron configuration naming OLD) as `external_references`.
 
-Conversation capture, so revive has something to resume:
-- **Claude**: `start` generates a UUID and passes `--session-id UUID`
-  (refused together with raw `--session-id/--resume/--continue`, extending the
-  existing selector validation). `source: assigned`.
-- **Codex**: no pre-assignment exists. `stop` (and `status`, lazily) looks in
-  `$CODEX_HOME/sessions` (default `~/.codex/sessions`) for rollouts whose
-  `session_meta` cwd equals the record cwd and start time is after `created_at`,
-  and whose first user message equals the brief agentctl delivered. Exactly one
-  -> `discovered`; otherwise `missing` with the candidate count. `herdr`/`bound`
-  sources win when present.
-- **Muse**: Herdr reports it (`source: herdr`).
-- `stop` never refuses for a missing conversation (retirement must not depend on
-  metadata); it records `missing` and why. `revive` then refuses unless
-  `--session ID` asserts one explicitly.
+## A6. `agentctl doctor`
 
-Wrkslots, opportunistic: if the record has `slot` and wrkslots is runnable,
-revive reads `wrkslots status --slot S --format json` in `project_root` and
-requires an active row with the same path; it reports (does not fix) an `agent`
-field that differs and prints the exact `wrkslots adopt` command when the owner
-process is dead. If wrkslots is not installed, revive continues when the recorded
-cwd exists and reports `slot_verification: unavailable`.
+Read-only by default and lock-free; its report is a labelled snapshot. One
+`tab list`, `pane list` and `agent list` per workspace, then one `pane get` and
+one `process-info` per record: about 20 ms + 5 ms per record of Herdr time.
+Exit 0 clean, 1 findings, 2 Herdr unreachable. Per record: `pane-missing`,
+`harness-exited`, `harness-replaced`, `terminal-mismatch`, `tab-moved`,
+`label-mismatch`, `herdr-name-mismatch`, `workspace-mismatch`,
+`rename-incomplete`, `legacy-unanchored`. Registry: `duplicate-claim` (two
+records, one pane or terminal). Workspace: `label-collision`, informational
+`unmanaged-tab`.
 
-Failure modes:
+`--repair-labels` acts per owned or custom record under that record's A4 locks,
+refuses while any rename journal exists or when the record is in a
+`duplicate-claim`, rechecks everything under the locks, and restores the label
+and Herdr name only when every other anchor matches. Adopted records are never
+repaired.
 
-| Case | Behaviour |
-|---|---|
-| no archive / unreadable `agent.json` | refuse; list readable candidates |
-| several archives | refuse with candidate table (above) |
-| live record already named `NAME` | refuse; suggest `--as` |
-| same conversation already live under another name | refuse (identity lock, extending `_identity_owner` to `conversation`) |
-| two revives race | serialized by `.NAME.lock` + `.identity.lock` |
-| slot reclaimed or path differs | refuse; `--cwd DIR` override, but for Claude only when the session file exists under the new cwd's project directory |
-| another live record has the same `slot` | refuse ("two agents in one slot"); no override |
-| session expired harness-side | pre-check: Claude `~/.claude/projects/<cwd-slug>/<id>.jsonl`, Codex rollout file; after launch, a pane back at its shell within the startup timeout -> `launch_failed`, tab closed, archive untouched |
-| Herdr unreachable | refuse before any state change |
+Scheduling: agentctl does not schedule itself. Standalone users run `agentctl
+doctor` by hand or from cron; a coordinator's health tick (for example a
+tick-hub check) runs it on its own cadence. The user guide shows both.
 
-## 6. Start defects (own commits, with tests)
+## A7. Tests (both editions; differential cases for shared behaviour)
 
-- **Composer readiness.** `submission.submit` reads the screen once and raises
-  `PromptNotStaged` when no composer is recognisable, so a fresh Claude pane that
-  Herdr reports ready before the composer is drawn leaves the brief pending
-  (exit 75). Fix: while nothing has been typed, poll for a recognisable composer
-  within the ready timeout before refusing. Test: fake terminal shows the
-  composer on the third read; the brief is delivered with exit 0; a composer that
-  never appears still refuses with nothing typed.
-- **Profiles from a slot cwd.** `start --profile` reads only
-  `<cwd>/.agentctl/profiles.json`, while workspace policy is read from the
-  registry's project. Fix: `--cwd` first (unchanged behaviour), then the
-  registry's project when the registry is named `.agentctl`; the error lists
-  both paths. Same for `agentctl profiles`. A slot checkout never holds the
-  git-ignored profile file, so only the previously failing case changes. Test:
-  `--cwd SLOT` with the profile beside the registry.
+- Input safety: the fake Herdr swaps the pane's terminal, or its foreground
+  process, immediately before each paste and each key; the replacement
+  receives nothing and the refusal names the field. Harness exits between
+  paste and key: no key is sent.
+- Legacy: after a simulated restart that recreates labels, cwd and harness, no
+  backfill occurs and doctor reports `legacy-unanchored`; adopted shell-pinned
+  backfill succeeds.
+- Classes: adopted alias with a different label and a shared tab keeps working
+  and is never relabelled; custom adapters keep their process checks.
+- Rename: success; each precondition refusal; crash injected after each step and
+  inside step 4 (between content and move); fsync failure; journal present
+  blocks commands on both names; recovery inserts history once when rerun
+  twice; Python crash finished by Rust and vice versa; pane gone mid-rename;
+  queued inbox message delivered to the same pane afterwards.
+- Concurrency (barriers in the fake): rename vs send, drain, stop, move, a
+  second rename, and doctor `--repair-labels`; duplicate claims refused at
+  start/adopt/move/rename.
+- Retirement paths unchanged: missing-pane stop, returned-shell stop,
+  interrupted-move recovery.
+- wrkslots probe: alive while renamed agent runs; dead after stop; reused OLD
+  name by another live lifetime yields alive.
+- Cost: assert call counts per operation from the fake; `send` grows by at most
+  the A2 calls per effect.
+- **No wrkslots installed**: start, send, rename, doctor and stop work with
+  wrkslots absent from PATH and `AGENTCTL_WRKSLOTS_BIN` unset.
 
-## 7. Tests
+## A8. Start defects (landed separately on this branch)
 
-Python unit tests with the existing fake Herdr, plus differential cases in
-`cross/agentctl_differential.py` for every shared verb:
-- identity check refuses on each changed field (terminal, tab, label, Herdr name)
-  and never resolves by label; paranoid post-check reports exit 76;
-  legacy backfill only when all else matches;
-- doctor: each finding kind from a synthetic registry, exit codes, read-only by
-  default, `--repair-labels` refuses when any non-label field differs;
-- rename: success; every refusal; crash injected after each step, then rerun
-  completes; pane gone mid-rename; journal blocks other commands on both names;
-  queue survives with messages delivered to the same pane;
-- revive: single, ambiguous, `--archive` prefix, `--as`, legacy archive, missing
-  conversation, duplicate conversation, slot reclaimed, shared-slot refusal,
-  session file missing, launch failure leaves the archive byte-identical;
-- Claude start passes `--session-id` and records `assigned`; raw selectors
-  refused; Codex discovery: unique, ambiguous, absent;
-- **no wrkslots installed** (PATH without it, `AGENTCTL_WRKSLOTS_BIN` unset):
-  start, send, stop, doctor, rename and revive of a record with a `slot` all
-  work, revive reporting `slot_verification: unavailable`.
+`9a909f37c` waits up to 15 s for a recognisable composer before typing.
+`762f6d557` finds profiles beside a registry named `.agentctl` when `--cwd`
+has none (`--cwd` still first).
 
-## 8. Open questions for review
+## B. Revive (parked until Part A lands)
 
-1. Rust parity: proposed both editions for identity checks, doctor and rename in
-   this branch (routing safety must hold on either engine); revive Python-first,
-   advertised as an edition-specific capability until the Rust port lands.
-2. Should a `label-mismatch` in `standard` refuse (proposed) or warn? Refusal
-   means a human retitling a tab in the UI blocks automation until
-   `doctor --repair-labels`.
+The v1 proposal (a29e16683, section 5) stands as a starting point: archives
+addressed by token, refusal on ambiguous names, Claude conversation IDs assigned
+at launch with `--session-id`, opportunistic wrkslots checks. Open findings to
+resolve in revive v2:
+
+- 5: status-time capture must reload under the name lock and verify token and
+  directory generation before writing.
+- 6: build on the existing nested `native_session` (observed/asserted) instead of
+  a new field; define migration and Rust support for nested records; reject
+  conflicting IDs.
+- 7: Codex rollout matching can pick one wrong session; preserve known resume
+  IDs, tie a session to the process, record the session-store location.
+- 8: prove the resumed session positively before any brief; define argv
+  transformation (`--session-id` vs `--resume`) and the adapter matrix.
+- 10: slot revalidation must use generation, storage findings, checkout identity
+  and owner state, with a wrkslots-side synchronization protocol.
+- 11: Rust tokens are `<nanoseconds>-<pid>`, not 32-hex; define token formats,
+  short-token and prefix selection, and `--newest` ties.
+- 13: define behaviour for every wrkslots failure, not only absence, and whether
+  revive keeps slot boxing.
