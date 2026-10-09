@@ -3445,7 +3445,7 @@ from, so it cannot name a key the page does not answer.
 | Enter or `o` | Open or close the selected message, as a tap does (in Read, read it aloud) |
 | → | Into the thread of the selected message |
 | ← | Out of a thread, back to the message it was opened from |
-| Esc | Back (see above). In a message box with text in it, the first Esc leaves the box and keeps the draft |
+| Esc | Back (see above). In a message box with text in it, the first Esc leaves the box and keeps the draft; on the channel or thread picker, back to the messages |
 | Home, End | The top of the list or its newest message, and select it |
 | `e` | Done or not Done; marked Done, the ring moves on to the next unread below |
 | Shift+E | Done through here |
@@ -3460,7 +3460,7 @@ from, so it cannot name a key the page does not answer.
 | `c` | Write to the channel (or the thread you are in) |
 | ↑ in the empty message box | Select the newest message |
 | Alt+↓, Alt+↑ (Option on a Mac) | The next or previous channel |
-| Ctrl+K (Cmd+K) | Choose a channel |
+| Ctrl+K (Cmd+K) | Choose a channel; once chosen, the keys are back on the messages |
 
 A click on a message selects it without a ring, so the next key starts there. PgUp, PgDn and Space
 stay the browser's, and once the page comes to rest the ring moves to the first message shown whole.
@@ -3475,6 +3475,12 @@ chords stay on. The choice is stored on this device under `vibe-talk.voice.singl
 marks anything read, no key starts a call, and the call's view takes no message keys. The buttons
 that have a key carry `aria-keyshortcuts`. Browser history is not used yet, so the browser's Back
 still leaves the page.
+
+Ctrl and Cmd both work for every chord on every platform (the owner asked for Ctrl+S on his Mac),
+with one exception: in a text field on a Mac, Ctrl and a letter that macOS uses for text editing
+(Ctrl+K deletes to the end of the line, Ctrl+A and Ctrl+E go to its ends, and the rest) belong to the
+field. There, Cmd+K chooses a channel. Ctrl+S is not one of those keys, so it opens the search from a
+message box on a Mac too.
 
 ### Two ways a channel row can already have been dealt with, and only one of them hides it
 

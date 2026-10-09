@@ -375,6 +375,12 @@ const SCREEN_TITLES = { settings: "Settings", reply: "Reply", help: "Help", thre
 let screenBeforeSettings = "signin";
 let currentScreen = "signin";
 
+/**
+ * Where Back on Help goes: Settings, which is where Help is opened from, unless `?` opened it
+ * (`keysFromKeyboard`). Put back to Settings whenever Help is left, by `showScreen`.
+ */
+let helpReturn = "settings";
+
 function showScreen(name) {
   const previous = currentScreen;
   // The channel list is about to be hidden, and a hidden list has nothing left to measure: the
@@ -422,6 +428,11 @@ function showScreen(name) {
   if (name !== "settings" && name !== "help") {
     screenBeforeSettings = name;
   }
+  // `#224 keyboard-shortcuts`. Help left by any way at all (its Back, Esc, or the search or Settings
+  // key, which leave it as Settings' Back does) forgets where `?` opened it from: the next Help, from
+  // a `?` in Settings, goes back to Settings. Here rather than in each way out, so that a way out
+  // added later cannot leave a stale answer behind.
+  if (previous === "help" && name !== "help") helpReturn = "settings";
   currentScreen = name;
   // The jump is about the list on the main screen, and is gone with it. `#207 scrollback-jump`.
   renderJumpNewest();
@@ -3446,7 +3457,10 @@ function onComposerKey(event, send, singleLine = false) {
 //     chord alone. Escape and the Ctrl/Cmd chords do fire in a field: a field is where the reader is
 //     when they want the search, Settings or the ends of the list. Nothing fires while an input method
 //     composes, and a phone keyboard, which reports keyCode 229 and types only into fields, never
-//     reaches the table.
+//     reaches the table. A chord takes Ctrl or Cmd on every platform (the owner asked for Ctrl+S on
+//     his Mac), except in a text field on a Mac, where Ctrl and a letter macOS edits text with
+//     (Ctrl+K, Ctrl+A, Ctrl+E and the rest) is the field's: there the page's chord is Cmd only
+//     (`macFieldEditKey`).
 //   * Those character keys can all be turned off in Settings, "Single-key shortcuts", on by default:
 //     what WCAG 2.1.4 asks of them. The arrows, Escape, Enter and the chords stay.
 //   * THE SELECTED MESSAGE IS REAL FOCUS ON ITS ROW, so the ring is the browser's own `:focus-visible`,
@@ -4278,11 +4292,18 @@ function stepChannel(event) {
   return true;
 }
 
-/** Ctrl+K (Cmd+K): the channel picker, open (question 11). */
+/**
+ * Whether the channel picker was opened by Ctrl+K (Cmd+K) and no channel has been chosen from it
+ * since. See `channelPicked`.
+ */
+let channelPickByKey = false;
+
+/** Ctrl+K (Cmd+K): the channel picker, open (question 11). See `channelPicked` for the way back. */
 function pickChannel() {
   if (!channelOnScreen()) return false;
   const picker = el("discord-channel");
   if (picker.hidden || picker.disabled) return false;
+  channelPickByKey = true;
   picker.focus();
   if (typeof picker.showPicker === "function") {
     try {
@@ -4292,6 +4313,23 @@ function pickChannel() {
     }
   }
   return true;
+}
+
+/**
+ * A channel chosen from the picker Ctrl+K opened: the keys go back to the list, on the new channel.
+ *
+ * Without it the focus stayed on the picker, where every single key is the picker's own: j did
+ * nothing, Esc had nothing to do, and the ↑ or ↓ meant for the next message chose another channel
+ * (or, on a Mac, opened the picker again). Only after Ctrl+K: a picker reached by a click or by Tab
+ * keeps the focus through a change, because on Windows and Linux ↑ and ↓ on a closed picker step it
+ * one channel at a time, firing `change` at each step, and taking the focus at the first step would
+ * stop a reader walking through the channels that way. Esc on a picker of the bar hands the focus to
+ * the list however it was reached (`onEscape`).
+ */
+function channelPicked() {
+  if (!channelPickByKey || document.activeElement !== el("discord-channel")) return;
+  channelPickByKey = false;
+  settleFocus();
 }
 
 // --- search, Settings, help and Escape
@@ -4331,14 +4369,9 @@ function settingsFromKeyboard() {
   return false;
 }
 
-/** Where Back on Help goes: Settings, which is where Help is opened from, unless `?` opened it. */
-let helpReturn = "settings";
-
-/** Leave Help: back to Settings, or to wherever `?` was pressed. */
+/** Leave Help: back to Settings, or to wherever `?` was pressed (`helpReturn`). */
 function closeHelp() {
-  const to = helpReturn;
-  helpReturn = "settings";
-  showScreen(to);
+  showScreen(helpReturn);
 }
 
 /**
@@ -4380,8 +4413,9 @@ function closeDetailsOn(target) {
  * What Escape does: the first that applies of the proposal's section 5.2. An open ⋯ menu, the pace
  * popover, the prompts tray, or a details sheet closes; then the search; then a message box with text
  * in it is left, the draft kept and the focus back on the list (question 4), while an empty one goes
- * Back at once, there being nothing to keep; then Back: out of Settings, Help, Reply or the Threads
- * screen, or out of a thread. Returns whether it did anything. With none of those it does nothing:
+ * Back at once, there being nothing to keep; a picker on the bar is left for the list, whatever it
+ * holds (`isBarPicker`); then Back: out of Settings, Help, Reply or the Threads screen, or out of a
+ * thread. Returns whether it did anything. With none of those it does nothing:
  * in particular it marks nothing read, which is the proposal's answer to the clients whose Escape does.
  */
 function onEscape(event, target) {
@@ -4408,7 +4442,21 @@ function onEscape(event, target) {
     else focusList(paneFor(target));
     return true;
   }
+  if (isBarPicker(target)) {
+    channelPickByKey = false;
+    focusList(paneFor(target));
+    return true;
+  }
   return goBack();
+}
+
+/**
+ * A picker on the bar of the main screen: the channel's, or the thread's. Every single key on one is
+ * its own (`keepsOwnKeys`), so Escape is the way off it, back to the list, as from a message box
+ * with text in it: the first Escape leaves the picker and the next goes Back.
+ */
+function isBarPicker(node) {
+  return currentScreen === "main" && Boolean(node) && ["discord-channel", "thread-select"].includes(String(node.id || ""));
 }
 
 /** Keep a key from the browser's own default for it. */
@@ -4423,15 +4471,41 @@ function isLetterKey(event, letter) {
   return event.code === `Key${letter.toUpperCase()}`;
 }
 
-/** Whether Ctrl or Cmd is held: every chord takes either, on every platform (see `modKeyName`). */
+/**
+ * Whether Ctrl or Cmd is held: every chord takes either, on every platform (see `modKeyName`), but
+ * for the one exception `macFieldEditKey` makes in a text field on a Mac.
+ */
 const modHeld = (event) => Boolean(event.ctrlKey || event.metaKey);
+
+/**
+ * The letters whose Ctrl chord edits text in every field on a Mac: the Emacs-style keys macOS gives
+ * all its text fields, and Chrome honours in a page's. Ctrl+A and Ctrl+E go to the ends of the line,
+ * Ctrl+K deletes to its end and Ctrl+Y puts that back, Ctrl+F, B, N and P move the caret, Ctrl+D and
+ * Ctrl+H delete, Ctrl+O opens a line, Ctrl+T swaps two letters, Ctrl+L centres and Ctrl+V pages.
+ */
+const MAC_FIELD_EDIT_LETTERS = "abdefhklnoptvy";
+
+/**
+ * Whether `event` is one of those keys, pressed in a text field on an Apple keyboard: Ctrl and one
+ * of `MAC_FIELD_EDIT_LETTERS`, without Cmd. Such a key is the field's, never a chord of the page, so
+ * in a message box on a Mac Ctrl+K deletes to the end of the line as it does everywhere else there,
+ * and Cmd+K is the channel picker. Off the field, and on other keyboards, Ctrl works as Cmd does.
+ * Ctrl+S is not one of them, and stays the search the owner asked for on his Mac.
+ */
+function macFieldEditKey(event, target) {
+  if (!event.ctrlKey || event.metaKey || !isTextField(target) || !appleKeyboard()) return false;
+  const key = String(event.key || "");
+  const letter = /^[a-z]$/i.test(key) ? key.toLowerCase() : /^Key[A-Z]$/.test(String(event.code || ""))
+    ? String(event.code).slice(3).toLowerCase() : "";
+  return letter !== "" && MAC_FIELD_EDIT_LETTERS.includes(letter);
+}
 
 // --- the keymap
 
 /**
  * @typedef {object} KeyChord
  * @property {string} key `KeyboardEvent.key`: a letter in lower case, a character, or a named key.
- * @property {boolean} [mod] Ctrl, or Cmd: either works on every platform.
+ * @property {boolean} [mod] Ctrl, or Cmd: either works on every platform, but for `macFieldEditKey`.
  * @property {boolean} [alt] Alt (Option on a Mac). Only ever with an arrow: Option and a letter types
  *   a character on a Mac.
  * @property {boolean} [shift] For a letter or a named key. A character such as "?" or ":" is matched
@@ -4469,7 +4543,8 @@ const KEYMAP = [
   {
     group: KEYS_PAGE, chords: [{ key: "Escape" }],
     does: "Back: closes a menu, the search or a sheet, leaves Settings, Help, Reply, Threads or a thread. " +
-      "In a message box with text in it, leaves the box first and keeps the draft",
+      "In a message box with text in it, leaves the box first and keeps the draft; on the channel or " +
+      "thread picker, back to the messages",
     controls: ["close-settings", "close-reply", "close-help", "close-threads", "thread-back"],
     run: (event, target) => onEscape(event, target),
   },
@@ -4723,6 +4798,7 @@ function onPageKey(event) {
   if (!event || event.defaultPrevented) return;
   if (event.isComposing || event.keyCode === 229) return;
   const target = /** @type {HTMLElement} */ (event.target || document.activeElement);
+  if (macFieldEditKey(event, target)) return;
   for (const binding of KEYMAP) {
     if (!binding.run) continue;
     if (!binding.chords.some((chord) => chordMatches(chord, event) && chordAllowed(binding, chord, target))) continue;
@@ -22950,6 +23026,8 @@ function changeSelectedChannel() {
   return loadDiscord(saved && currentView === "discord" ? { keepPosition: true, reason: "enter" } : { reason: "enter" });
 }
 el("discord-channel").addEventListener("change", guardQuietly(changeSelectedChannel));
+// `#224 keyboard-shortcuts`. After the change above has started: a channel chosen from Ctrl+K.
+el("discord-channel").addEventListener("change", channelPicked);
 // `#39 channel-alias`. Pointing the editor at another channel shows THAT channel's name; it does
 // not change which channel the Discord view is reading, which is the picker on the bar.
 // Changing channel closes whatever was open: the panels belong to the channel that was chosen

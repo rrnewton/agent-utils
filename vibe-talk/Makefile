@@ -161,8 +161,9 @@ read-modes-browser:
 # open the search (the browser's Save page refused); "," and Ctrl+, open Settings and Escape comes
 # back; in the message box PgUp pages the list and Ctrl+Home/End jump it; then the keymap: j, k and the
 # arrows move a visible focus ring, e marks Done and moves on, PgDn brings the ring to the page, Enter
-# folds, and -> enters a thread that <- and Esc leave. Pass WEB_ROOT=dir to run it against another copy
-# of the page, and SCREENSHOTS=dir to keep a PNG of each step.
+# folds, and -> enters a thread that <- and Esc leave; Ctrl+K and a channel chosen give the keys back to
+# the list, and Esc leaves the picker. Pass WEB_ROOT=dir to run it against another copy of the page,
+# and SCREENSHOTS=dir to keep a PNG of each step.
 keyboard-browser:
 	python3 tests/keyboard_browser.py $(if $(WEB_ROOT),--web-root $(WEB_ROOT)) $(if $(SCREENSHOTS),--screenshots $(SCREENSHOTS))
 

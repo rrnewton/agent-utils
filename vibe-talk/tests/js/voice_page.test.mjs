@@ -18050,6 +18050,116 @@ test("Alt+↓ AND Alt+↑ step through the channels in the picker's order; Ctrl+
   }
 });
 
+/** Whether the focus is on the channel's list: its scroller, or a message in it. */
+const onChannelList = (page) => focused(page) === page.el("scroll-area") ||
+  Boolean(focused(page) && focused(page).parentNode === page.el("discord-log"));
+
+test("A CHANNEL CHOSEN FROM Ctrl+K gives the keys back to the list; Esc on a picker of the bar does too", async () => {
+  const page = newPage();
+  const second = { id: "1110000000000000002", label: "second", writable: true };
+  const third = { id: "1110000000000000003", label: "third", writable: true };
+  page.channels = [{ ...CHANNEL }, second, third];
+  await signIn(page);
+  await showDiscord(page, tallChannel(30));
+  const picker = page.el("discord-channel");
+  await press(page, page.el("scroll-area"), "k", { ctrlKey: true });
+  assert.equal(focused(page), picker, "Ctrl+K did not open the channel picker");
+  // THE DEFECT: the focus stayed on the picker, where j did nothing, Esc did nothing, and the ↑ meant
+  // for the previous message chose the channel above instead.
+  picker.value = second.id;
+  await picker.dispatch("change");
+  await page.settle();
+  assert.equal(String(picker.value), second.id);
+  assert.ok(onChannelList(page), `after a channel was chosen from Ctrl+K the focus is on ${focusName(page)}`);
+  let event = await pressHere(page, "j");
+  assert.equal(event.defaulted, false, "j after choosing a channel was left to the browser");
+  assert.match(selectedId(page), /^\d+$/, `j after choosing a channel selected ${selectedId(page)}`);
+  await pressHere(page, "ArrowUp");
+  await page.settle();
+  assert.equal(String(picker.value), second.id, "↑ after choosing a channel chose another channel");
+  // Ctrl+K and nothing chosen: Esc on the picker is the way back to the list, the channel unchanged.
+  await press(page, focused(page), "k", { ctrlKey: true });
+  assert.equal(focused(page), picker);
+  event = await press(page, picker, "Escape");
+  assert.equal(event.defaulted, false, "Esc on the picker was left to the browser");
+  assert.ok(onChannelList(page), `Esc on the picker left the focus on ${focusName(page)}`);
+  assert.equal(String(picker.value), second.id, "Esc on the picker changed the channel");
+  assert.equal(page.screen(), "main");
+  // A picker reached by a click keeps the focus through a change: ↑ and ↓ on a closed picker step it
+  // one channel at a time off a Mac, firing `change` at each step. That Esc above also forgot the Ctrl+K.
+  picker.focusFrom("pointer");
+  picker.value = third.id;
+  await picker.dispatch("change");
+  await page.settle();
+  assert.equal(focused(page), picker, `a change made on a clicked picker moved the focus to ${focusName(page)}`);
+  await press(page, picker, "Escape");
+  assert.ok(onChannelList(page), `Esc on a clicked picker left the focus on ${focusName(page)}`);
+  assert.equal(String(picker.value), third.id);
+  // The thread's picker on the bar is left the same way, and the first Esc goes no further.
+  const threads = page.el("thread-select");
+  const view = page.tab();
+  event = await press(page, threads, "Escape");
+  assert.equal(event.defaulted, false, "Esc on the thread picker was left to the browser");
+  assert.ok(onChannelList(page), `Esc on the thread picker left the focus on ${focusName(page)}`);
+  assert.equal(page.screen(), "main");
+  assert.equal(page.tab(), view, "Esc on the thread picker left the channel's view");
+});
+
+test("ON A MAC, Ctrl+K in a message box is the box's own (delete to the end of the line); Cmd+K picks the channel there", async () => {
+  const page = await keyboardPage("MacIntel");
+  const box = page.el("channel-compose-text");
+  const picker = page.el("discord-channel");
+  box.focus();
+  await box.setValue("delete the rest of this line");
+  // By its character, and by the place of the key on a layout that types no Latin letter there.
+  for (const fields of [{ ctrlKey: true, code: "KeyK" }, { ctrlKey: true, code: "KeyK", key: "л" }]) {
+    const event = await press(page, box, fields.key || "k", fields);
+    assert.equal(event.defaulted, true, `Ctrl+${fields.key || "k"} in the box on a Mac was taken from the field`);
+    assert.equal(focused(page), box, `Ctrl+${fields.key || "k"} in the box on a Mac moved the focus to ${focusName(page)}`);
+  }
+  assert.equal(box.value, "delete the rest of this line");
+  let event = await press(page, box, "k", { metaKey: true, code: "KeyK" });
+  assert.equal(event.defaulted, false, "Cmd+K in the box on a Mac was left to the browser");
+  assert.equal(focused(page), picker, `Cmd+K in the box on a Mac left the focus on ${focusName(page)}`);
+  // Off a field, Ctrl+K is the picker on a Mac too.
+  event = await press(page, page.el("scroll-area"), "k", { ctrlKey: true, code: "KeyK" });
+  assert.equal(event.defaulted, false);
+  assert.equal(focused(page), picker, `Ctrl+K on the list on a Mac left the focus on ${focusName(page)}`);
+  await press(page, picker, "Escape");
+  // Ctrl+S edits nothing on a Mac, and stays the search the owner asked for, in the box as well.
+  event = await press(page, box, "s", { ctrlKey: true, code: "KeyS" });
+  assert.equal(event.defaulted, false, "Ctrl+S in the box on a Mac was left to the browser's Save page");
+  assert.equal(focused(page), page.el("search-field"), `Ctrl+S in the box on a Mac left the focus on ${focusName(page)}`);
+  await press(page, page.el("search-field"), "Escape");
+  // Elsewhere Ctrl has no editing keys of its own in a field, and Ctrl+K picks the channel from the box.
+  const linux = await keyboardPage("Linux x86_64");
+  linux.el("channel-compose-text").focus();
+  event = await press(linux, linux.el("channel-compose-text"), "k", { ctrlKey: true, code: "KeyK" });
+  assert.equal(event.defaulted, false);
+  assert.equal(focused(linux), linux.el("discord-channel"), `Ctrl+K in the box off a Mac left the focus on ${focusName(linux)}`);
+});
+
+test("HELP LEFT BY THE SEARCH OR SETTINGS KEY forgets the ?: the next Help from Settings goes back to Settings", async () => {
+  for (const [key, fields] of [[",", {}], [",", { ctrlKey: true }], ["/", {}], ["s", { ctrlKey: true }]]) {
+    const said = `${fields.ctrlKey ? "Ctrl+" : ""}${key}`;
+    const page = await keyboardPage();
+    await press(page, page.el("scroll-area"), "?", { shiftKey: true });
+    assert.equal(page.screen(), "help");
+    await press(page, page.el("screen-help"), key, fields);
+    assert.equal(page.screen(), "main", `${said} on Help did not leave it`);
+    if (focused(page) === page.el("search-field")) await press(page, page.el("search-field"), "Escape");
+    // Help from a group's ? in Settings: its Back, and Esc, go back to Settings (#85).
+    await page.el("open-settings").click();
+    await page.el("help-link-keyboard").click();
+    assert.equal(page.screen(), "help");
+    await page.el("close-help").click();
+    assert.equal(page.screen(), "settings", `after ? and then ${said}, Back on Help from Settings went to ${page.screen()}`);
+    await page.el("help-link-keyboard").click();
+    await press(page, page.el("screen-help"), "Escape");
+    assert.equal(page.screen(), "settings", `after ? and then ${said}, Esc on Help from Settings went to ${page.screen()}`);
+  }
+});
+
 test("? AND Ctrl+/ open the list of every key, and Esc goes back to where they were pressed", async () => {
   for (const [key, fields] of [["?", { shiftKey: true }], ["/", { ctrlKey: true }], ["/", { metaKey: true }]]) {
     const page = await keyboardPage();

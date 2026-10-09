@@ -313,7 +313,9 @@ steps:
   # returns to the list unmoved; in the message box PgUp pages the list and Ctrl+Home/End jump it; then
   # the keymap: j, k and the arrows move a visible focus ring the list follows, e marks Done on the
   # server and moves on to the next unread, PgDn brings the ring to the page, Enter folds, and -> enters
-  # a thread that <- and Esc leave, back on the message it was opened from. Measured under dagrun on
+  # a thread that <- and Esc leave, back on the message it was opened from; Ctrl+K opens the channel
+  # picker, Esc leaves it for the list, a channel chosen from it gives the keys back to the list, and
+  # Help left by "," after "?" still goes back to Settings from Settings. Measured under dagrun on
   # 2026-10-09 on a host at load 220: 27s wall (most of it waiting for each animated scroll to come to
   # rest), 6.4s CPU, a 358MB peak.
   - group: check

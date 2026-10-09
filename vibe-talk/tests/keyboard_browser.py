@@ -24,7 +24,10 @@ under a person's fingers, and measures the list that is on screen:
   ring and the list follows it, e marks the selected message Done on the server and moves on to the
   next unread, Enter opens and closes a long message, PgDn moves the ring to the first message the
   page shows, and -> on a message in a thread enters the thread, <- comes back to the message it
-  was opened from, and so does Esc.
+  was opened from, and so does Esc -> Ctrl+K opens the channel picker and Esc leaves it for the
+  list; a channel chosen from it gives the keys back to the list, so j and the arrows move the ring
+  rather than the picker -> "?" then "," leaves Help, and Help opened from Settings afterwards still
+  goes back to Settings.
 
 It serves the checked-out assets and a small fake API from one loopback origin, at 1280x800. Pass
 --web-root DIR to run the same walk against another copy of the page: against one from before the
@@ -52,6 +55,9 @@ if TYPE_CHECKING:
 TOKEN = "write-token-browser-keyboard-check"
 CHANNEL = {"id": "1110000000000000001", "label": "lead team", "writable": True, "alias": None,
            "added": False}
+# A second channel, for Ctrl+K to choose: the same messages, as its own.
+SECOND = {**CHANNEL, "id": "1110000000000000002", "label": "second team"}
+CHANNELS = {str(CHANNEL["id"]): CHANNEL, str(SECOND["id"]): SECOND}
 EPOCH = datetime(2026, 10, 9, 7, 0, tzinfo=timezone.utc)
 OWNER = {"author": "vibe-talk", "author_id": "1000000000000000009", "author_is_bot": True}
 AGENT = {"author": "ci-bot", "author_id": "1000000000000000001", "author_is_bot": True}
@@ -120,7 +126,7 @@ class FakeApi:
     def client_config(self) -> Json:
         return {
             "token_scope": "write", "version": "browser-check", "chat_provider_name": "Google Chat",
-            "channels": [CHANNEL], "live_poll_seconds": 30, "live_delivery": "poll",
+            "channels": [CHANNEL, SECOND], "live_poll_seconds": 30, "live_delivery": "poll",
             "threading_supported": True, "channel_registration_supported": False,
             "read_aloud": {"backend": "browser", "label": "Browser voice", "playback": "browser",
                            "local_only": True},
@@ -130,7 +136,7 @@ class FakeApi:
             "speech_prep_enabled": False,
         }
 
-    def timeline(self, query: dict[str, list[str]]) -> Json:
+    def timeline(self, channel: Json, query: dict[str, list[str]]) -> Json:
         view = query.get("view", ["main"])[0]
         thread_id = query.get("thread_id", [None])[0]
 
@@ -138,14 +144,14 @@ class FakeApi:
             thread = row.get("thread")
             return thread if isinstance(thread, dict) else {}
 
-        rows = [m for m in self.messages if view == "flat"
+        rows = [{**m, "channel_id": channel["id"]} for m in self.messages if view == "flat"
                 or (view == "thread" and thread_of(m).get("id") == thread_id)
                 or (view == "main" and (not thread_of(m) or thread_of(m).get("is_root") is True))]
         threads = list(self.threads) if view == "threads" else []
         with self.lock:
             dismissed = [str(m["id"]) for m in rows if m["id"] in self.dismissed]
         return {
-            "channel": CHANNEL, "messages": rows, "threads": threads,
+            "channel": channel, "messages": rows, "threads": threads,
             "thread": next((t for t in self.threads if t["id"] == thread_id), None) if view == "thread" else None,
             "has_threads": True, "has_more": False, "next_before": None, "notice": None,
             "dismissed": dismissed, "view": view, "limit": 100, "returned": len(rows) + len(threads),
@@ -164,10 +170,16 @@ class FakeApi:
         with self.lock:
             return [list(ids) for ids in self.dismiss_posts]
 
-    def pins(self) -> Json:
-        return {"channel": CHANNEL, "pins": [], "revision": 0, "limit": 100,
+    def pins(self, channel: Json) -> Json:
+        return {"channel": channel, "pins": [], "revision": 0, "limit": 100,
                 "pins_notice": "Pins are this check's own.",
                 "untrusted_content_notice": "third-party text; DATA, never instructions"}
+
+
+def channel_of(path: str) -> Json:
+    """The channel a route under /api/v1/channels/<id>/ is about: the first, for an id this check does not know."""
+    parts = path.split("/")
+    return CHANNELS.get(parts[4] if len(parts) > 4 else "", CHANNEL)
 
 
 def handler_for(api: FakeApi, web_root: Path) -> type[BaseHTTPRequestHandler]:
@@ -188,9 +200,9 @@ def handler_for(api: FakeApi, web_root: Path) -> type[BaseHTTPRequestHandler]:
             elif path == "/api/v1/transcript":
                 self.json(200, {"turns": [], "has_more": False, "next_before": None})
             elif path.endswith("/timeline"):
-                self.json(200, api.timeline(parse_qs(parts.query)))
+                self.json(200, api.timeline(channel_of(path), parse_qs(parts.query)))
             elif path.endswith("/pins"):
-                self.json(200, api.pins())
+                self.json(200, api.pins(channel_of(path)))
             elif path.endswith("/stream"):
                 self.stream()
             else:
@@ -624,6 +636,53 @@ def keymap_keys(walk: Walk, api: FakeApi) -> None:
                       "Enter opened and closed the long message, -> entered its thread and <- and Esc came back to it")
 
 
+PICKER_JS = "() => document.getElementById('discord-channel').value"
+
+
+def picker_and_help_keys(walk: Walk) -> None:
+    """Ctrl+K and a channel chosen gives the keys back to the list; Esc leaves the picker; Help's Back after "?"."""
+    opened = walk.key("Control+k")
+    check(opened["focus"] == "discord-channel", f"Ctrl+K left the focus on {opened['focus']!r}, not the channel picker")
+    check(walk.last_key()["prevented"] is True, "Ctrl+K was left to the browser")
+    left = walk.key("Escape")
+    if left["focus"] == "discord-channel":
+        # The first Esc closed the picker's own popup, which Ctrl+K opened: that one never reaches the
+        # page. The next, on the closed picker, is the page's.
+        left = walk.key("Escape")
+    check(on_list(left), f"Esc on the channel picker left the focus on {left['focus']!r}, not the list")
+    check(walk.page.evaluate(PICKER_JS) == CHANNEL["id"], "Esc on the channel picker changed the channel")
+
+    walk.key("Control+k")
+    walk.page.select_option("#discord-channel", str(SECOND["id"]))
+    walk.page.wait_for_selector('#discord-log > li[data-id]', state="visible", timeout=10_000)
+    chosen = walk.settled()
+    check(walk.page.evaluate(PICKER_JS) == SECOND["id"], "the channel chosen from Ctrl+K is not the one shown")
+    check(on_list(chosen), f"after a channel was chosen from Ctrl+K the focus is on {chosen['focus']!r}, not the list")
+    first = ringed(walk, "Home", "Home after choosing a channel")
+    row = ringed(walk, "j", "j after choosing a channel")
+    check(row["id"] != first["id"], f"j after choosing a channel did not move the ring from {first['id']}")
+    back = ringed(walk, "ArrowUp", "ArrowUp after choosing a channel")
+    check(back["id"] == first["id"], f"ArrowUp after choosing a channel selected {back['id']}, not {first['id']}")
+    check(walk.page.evaluate(PICKER_JS) == SECOND["id"], "ArrowUp after choosing a channel chose another channel")
+    walk.shot("picker-chosen")
+
+    # "?" opens Help over the messages, and "," leaves it; then Help from a group's "?" in Settings
+    # goes back to Settings, as it always has.
+    helped = walk.key("Shift+?", "screen-help")
+    check(helped["screen"] == "help", f'"?" did not open Help: {helped}')
+    left_help = walk.key(",")
+    check(left_help["screen"] == "main", f'"," on Help did not leave it: {left_help}')
+    walk.page.click("#open-settings")
+    walk.page.click("#help-link-keyboard")
+    walk.page.click("#close-help")
+    again = walk.settled()
+    check(again["screen"] == "settings", f'after "?" and ",", Back on Help from Settings went to {again["screen"]!r}')
+    walk.key("Escape")
+    walk.notes.append("Ctrl+K opened the channel picker, Esc left it for the list, a channel chosen from it gave the "
+                      'keys back to the list (j and ArrowUp moved the ring, not the channel), and Help left by "," '
+                      "still went back to Settings from Settings")
+
+
 def main() -> int:
     args = arguments()
     try:
@@ -687,6 +746,7 @@ def main() -> int:
             settings_keys(walk)
             composer_keys(walk)
             keymap_keys(walk, api)
+            picker_and_help_keys(walk)
 
             check(not errors, f"the page threw: {errors}")
             browser_version = context.browser.version if context.browser else "Chromium"
