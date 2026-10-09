@@ -962,6 +962,32 @@ def test_snapshot_failure_before_any_write_leaves_the_message_pending(
     assert _failed_documents(manager, "worker") == []
 
 
+def test_peer_pane_herdr_reports_missing_is_skipped_by_the_snapshot(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager, fake, _pane = _started(tmp_path, monkeypatch)
+    manager.start("bystander", cwd=str(tmp_path), harness="claude")
+    real = fake.read_scrollback
+    bystander = manager.get("bystander").pane_id
+    text = "a long enough instruction for the worker only"
+
+    def closed_peer(pane_id: str) -> str:
+        if pane_id == bystander:
+            raise HerdrUnavailable(
+                f'pane read {pane_id}: {{"error":{{"code":"pane_not_found",'
+                f'"message":"pane {pane_id} not found"}}}}')
+        return real(pane_id)
+
+    monkeypatch.setattr(fake, "read_scrollback", closed_peer)
+    manager.send("worker", text)
+    assert text in fake.submitted
+    assert _failed_documents(manager, "worker") == []
+    readback = [json.loads(line) for line in
+                (manager._directory("worker") / "readback.jsonl").read_text(encoding="utf-8").splitlines()]
+    assert [(entry["result"], entry["evidence"]["peer"], entry["evidence"]["finding"])
+            for entry in readback] == [("peer-skipped", bystander, "pane-missing")]
+
+
 def test_failed_readback_log_on_an_unverified_accept_quarantines(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
