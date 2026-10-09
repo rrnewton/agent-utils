@@ -1101,6 +1101,64 @@ def test_stop_refuses_missing_or_duplicated_recorded_foreign_pane(
     assert sessions.get("foreign").lifecycle == "running"
 
 
+@pytest.mark.parametrize(("closed", "source"), [
+    ("workspace", "workspace-missing"), ("pane", "pane-missing"),
+])
+def test_stop_archives_foreign_agent_whose_workspace_or_pane_herdr_reports_closed(
+    closed: str, source: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sessions, fake, pane = setup_foreign(tmp_path, monkeypatch)
+    original = adopt(sessions, pane, tmp_path)
+    fake.presentations.clear()
+    tab_labels = fake.tab_labels
+
+    def closed_workspace(workspace_id: str) -> dict[str, str]:
+        if closed == "workspace":
+            raise HerdrUnavailable(f'tab list: {{"error":{{"code":"workspace_not_found",'
+                                   f'"message":"workspace {workspace_id} not found"}}}}')
+        return tab_labels(workspace_id)
+
+    def closed_pane(pane_id: str) -> AgentPaneInfo:
+        raise HerdrUnavailable(f'pane get: {{"error":{{"code":"pane_not_found",'
+                               f'"message":"pane {pane_id} not found"}}}}')
+
+    monkeypatch.setattr(fake, "tab_labels", closed_workspace)
+    monkeypatch.setattr(fake, "pane_info", closed_pane)
+
+    stopped = sessions.stop("foreign", expected_token=str(original["token"]))
+
+    assert stopped["source"] == source
+    assert stopped["pane_closed"] is False and stopped["tab_closed"] is False
+    assert fake.closed == []
+    assert sessions.list() == []
+    archive = Path(str(stopped["archive"]))
+    saved = json.loads((archive / "agent.json").read_text())
+    assert saved["token"] == original["token"] and saved["lifecycle"] == "stopped"
+    reason = json.loads((archive / "stop.json").read_text())
+    assert reason["source"] == source and reason["pane_id"] == pane
+    assert "_not_found" in reason["detail"]
+
+
+def test_stop_refuses_foreign_agent_missing_from_the_pane_list_during_an_outage(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sessions, fake, pane = setup_foreign(tmp_path, monkeypatch)
+    original = adopt(sessions, pane, tmp_path)
+    fake.presentations.clear()
+
+    def outage(_target: str) -> object:
+        raise HerdrUnavailable("tab list: connection refused")
+
+    monkeypatch.setattr(fake, "tab_labels", outage)
+    monkeypatch.setattr(fake, "pane_info", outage)
+
+    with pytest.raises(AgentDeliveryError, match="expected one recorded pane, found 0"):
+        sessions.stop("foreign", expected_token=str(original["token"]))
+
+    assert fake.closed == []
+    assert sessions.get("foreign").lifecycle == "running"
+
+
 @pytest.mark.parametrize("change", ["cwd", "presentation", "session"])
 def test_stop_refuses_dead_foreign_agent_with_changed_identity(
     change: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,

@@ -4442,6 +4442,11 @@ class ManagedAgents:
                 raise AgentDeliveryError(
                     "--expected-record-sha256 requires --recover-legacy-adoption"
                 )
+            if (record.adapter == "herdr-foreign" and record.pane_id is not None
+                    and not any(pane.pane_id == record.pane_id for pane in self.client.panes())):
+                closed = self._closed_foreign_target(record)
+                if closed is not None:
+                    return self._archive_closed_foreign(record, *closed)
             if record.adapter == "herdr-foreign":
                 # This registry owns only delivery state.  Revalidate and retain
                 # one final snapshot, but never close, rename, signal, or
@@ -4650,6 +4655,47 @@ class ManagedAgents:
             agent._fsync_dir(str(archive))
             agent._fsync_dir(str(self.registry))
             return {"name": name, "archive": str(destination), "pane_closed": bool(owned), "tab_closed": tab_closed}
+
+    def _closed_foreign_target(self, record: AgentRecord) -> tuple[str, str] | None:
+        """The doctor finding and Herdr's refusal when Herdr positively reports the
+        adopted record's workspace or pane as not found; ``None`` when it may exist."""
+        probes: builtins.list[Callable[[], object]] = []
+        if record.workspace_id is not None:
+            workspace = record.workspace_id
+            probes.append(lambda: self.client.tab_labels(workspace))
+        if record.pane_id is not None:
+            pane = record.pane_id
+            probes.append(lambda: self.client.pane_info(pane))
+        for probe in probes:
+            try:
+                probe()
+            except HerdrUnavailable as exc:
+                missing = _missing_target(exc)
+                if missing is not None:
+                    return missing, str(exc)
+        return None
+
+    def _archive_closed_foreign(
+        self, record: AgentRecord, missing: str, detail: str,
+    ) -> dict[str, object]:
+        """Archive an adopted record whose runtime Herdr reports closed; nothing is closed.
+
+        There is no pane left to capture or revalidate, so the reason is kept beside the
+        record as ``stop.json``.
+        """
+        name = record.name
+        archive, destination = self._archive_destination(record)
+        agent._atomic_json(str(self._directory(name) / "stop.json"), {
+            "source": missing, "detail": detail, "stopped_at": time.time(),
+            "pane_id": record.pane_id, "workspace_id": record.workspace_id,
+        })
+        record.lifecycle = "stopped"
+        self._save(record)
+        os.rename(self._directory(name), destination)
+        agent._fsync_dir(str(archive))
+        agent._fsync_dir(str(self.registry))
+        return {"name": name, "archive": str(destination),
+                "pane_closed": False, "tab_closed": False, "source": missing}
 
     # Rename journals reserve both names until the rename is complete.
 

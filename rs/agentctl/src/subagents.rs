@@ -6026,6 +6026,53 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
         )
     }
 
+    /// The doctor finding and Herdr's refusal when Herdr positively reports the adopted
+    /// record's workspace or pane as not found; `None` when it may exist.
+    fn closed_foreign_target(&self, record: &AgentRecord) -> Option<(&'static str, String)> {
+        if let Some(workspace) = record.workspace_id.as_deref() {
+            if let Err(error) = self.client.tab_labels(workspace) {
+                if let Some(missing) = missing_target(&error) {
+                    return Some((missing, error.to_string()));
+                }
+            }
+        }
+        let error = self.client.pane_info(record.pane_id.as_deref()?).err()?;
+        missing_target(&error).map(|missing| (missing, error.to_string()))
+    }
+
+    /// Archive an adopted record whose runtime Herdr reports closed; nothing is closed.
+    /// There is no pane left to capture or revalidate, so the reason is kept beside the
+    /// record as `stop.json`.
+    fn archive_closed_foreign(
+        &self,
+        agent_name: &str,
+        mut record: AgentRecord,
+        missing: &str,
+        detail: &str,
+    ) -> Result<Value> {
+        let (archive, destination) = self.archive_destination(&record)?;
+        agent::atomic_json(
+            &self.directory(agent_name)?.join("stop.json"),
+            &json!({
+                "source": missing, "detail": detail, "stopped_at": unix_seconds(),
+                "pane_id": record.pane_id, "workspace_id": record.workspace_id,
+            }),
+        )?;
+        record.lifecycle = "stopped".to_owned();
+        self.save(&record)?;
+        fs::rename(self.directory(agent_name)?, &destination)
+            .map_err(|error| fail(error.to_string()))?;
+        agent::sync_directory(&archive)?;
+        agent::sync_directory(&self.registry)?;
+        Ok(json!({
+            "name": agent_name,
+            "archive": destination,
+            "pane_closed": false,
+            "tab_closed": false,
+            "source": missing,
+        }))
+    }
+
     fn inspect_foreign(
         &self,
         agent_name: &str,
@@ -8183,6 +8230,18 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
             ));
         }
         if record.adapter == "herdr-foreign" {
+            if let Some(pane_id) = record.pane_id.as_deref() {
+                if !self
+                    .client
+                    .panes()?
+                    .iter()
+                    .any(|pane| pane.pane_id == pane_id)
+                {
+                    if let Some((missing, detail)) = self.closed_foreign_target(&record) {
+                        return self.archive_closed_foreign(agent_name, record, missing, &detail);
+                    }
+                }
+            }
             let (live, info, presentation) = self.inspect_foreign(agent_name, &record)?;
             let text = self.bounded_terminal_text(&info.pane_id)?;
             // Output capture is another control round trip. Refuse archival if
@@ -12582,6 +12641,67 @@ pub(crate) mod tests {
                 "running"
             );
         }
+    }
+
+    #[test]
+    fn stopping_an_adopted_agent_archives_a_workspace_or_pane_herdr_reports_closed() {
+        for (closed, source) in [("workspace", "workspace-missing"), ("pane", "pane-missing")] {
+            let fixture = Fixture::new();
+            let original = fixture.adopt();
+            let record = fixture.manager().load("foreign").unwrap();
+            let pane_id = record.pane_id.clone().unwrap();
+            fixture.client.panes.lock().unwrap().clear();
+            let mut gone = fixture.client.herdr_closed.lock().unwrap();
+            gone.insert(pane_id.clone());
+            if closed == "workspace" {
+                gone.insert(record.workspace_id.clone().unwrap());
+            }
+            drop(gone);
+
+            let stopped = fixture.manager().stop("foreign").unwrap();
+
+            assert_eq!(stopped["source"], source, "{stopped}");
+            assert_eq!(stopped["pane_closed"], false);
+            assert_eq!(stopped["tab_closed"], false);
+            assert!(fixture.client.closed.lock().unwrap().is_empty());
+            assert!(fixture.manager().load("foreign").is_err());
+            let archive = PathBuf::from(stopped["archive"].as_str().unwrap());
+            let saved = agent::read_private_json(&archive.join("agent.json")).unwrap();
+            assert_eq!(saved["token"], original["token"]);
+            assert_eq!(saved["lifecycle"], "stopped");
+            let reason = agent::read_private_json(&archive.join("stop.json")).unwrap();
+            assert_eq!(reason["source"], source);
+            assert_eq!(reason["pane_id"], pane_id.as_str());
+            assert!(
+                reason["detail"].as_str().unwrap().contains("_not_found"),
+                "{reason}"
+            );
+        }
+    }
+
+    #[test]
+    fn stopping_an_adopted_agent_missing_from_the_pane_list_refuses_during_an_outage() {
+        let fixture = Fixture::new();
+        fixture.adopt();
+        fixture.client.panes.lock().unwrap().clear();
+        fixture
+            .client
+            .fail_pane_info_once
+            .store(true, Ordering::SeqCst);
+
+        let error = fixture.manager().stop("foreign").unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("expected one recorded pane, found 0"),
+            "{error}"
+        );
+        assert!(fixture.client.closed.lock().unwrap().is_empty());
+        assert_eq!(
+            fixture.manager().load("foreign").unwrap().lifecycle,
+            "running"
+        );
     }
 
     #[test]
