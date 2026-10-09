@@ -1498,6 +1498,13 @@ def plan(opts: argparse.Namespace) -> list[Json]:
 
 
 def worker_main(opts: argparse.Namespace) -> int:
+    # A stopped run must not leave its server and browser behind: turn SIGTERM and SIGHUP into an
+    # exit, so the job's own teardown runs.
+    def stop(signum: int, _frame: object) -> None:
+        raise SystemExit(128 + signum)
+
+    signal.signal(signal.SIGTERM, stop)
+    signal.signal(signal.SIGHUP, stop)
     job = json.loads(opts.job)
     if job.get("cpu_profile"):
         opts.cpu_profile = True
