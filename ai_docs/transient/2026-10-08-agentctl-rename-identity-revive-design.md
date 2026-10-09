@@ -372,6 +372,27 @@ restarted server can recreate every visible field for a different program.
 | 9 | Rename 257 makes an unloadable record | Rename refuses at 256 history entries, before any change |
 | - | Differential masked all of `harness_identity` | Only `pid` and `starttime_ticks` are masked now |
 
+## G. Delta review fixes (2026-10-08, second implementation review)
+
+| # | Finding | Resolution |
+|---|---|---|
+| 1 | Recovery could reach another recipient | Countermand re-verifies the occupant seen at detection (terminal plus harness process) immediately before Esc and before the note, sends with the expected terminal when Herdr supports it, and types nothing if either check fails. Only a completed countermand returns `MisrouteRecovered` (one retry); skipped or failed countermands quarantine (`ProbableMisroute`, no retry) |
+| 2 | Historical scrollback | Occurrence counts are taken in the target and peers before the send; only new occurrences count. Unstaged submissions are not read back |
+| 3 | Surviving-launcher anchors | Pinning and verification require the harness to be the pane's only foreground process; a launcher plus child is refused with a remedy, and anchors pinned earlier to a launcher no longer verify |
+| 4 | Ambiguous acknowledgements, short prompts | A write with an unknown outcome is read back: newly in a peer is countermanded; otherwise it stays possibly submitted (text in the target is no proof of submission, since an unsubmitted paste shows in the composer) and the result is logged in `readback.jsonl`. Prompts under 12 characters are checked in the target only and logged as unverified when not seen |
+| 5 | Session provider | Provider and id are compared in input, rename and doctor |
+| 6 | Old journal at the history limit | Completion drops the oldest names to stay at 256 |
+| 8 | Python drain reported delivered | A misroute retry no longer consumes an attempt (as in Rust); the misroute count bounds it |
+| 9 | Rust read-back underflow | One clock sample and `saturating_sub` |
+| 10 | Audit records | Message id falls back to the single inflight message; a failed misroute-log write is reported in the error |
+
+Known, not fixed here:
+- Python's nested-record migration (`anchor` on v2/v3) keeps the decoded fields but drops the nested-only
+  metadata (extensions, launch profile, environment names, executable identity, original `argv[0]`).
+- The countermand does not take the wrong pane's lock: concurrent agentctl input to that pane is
+  serialised only by the occupant re-checks around each effect.
+- A harness that re-execs the same binary keeps pid, start time and inode, so it is indistinguishable.
+
 ## C. What was built and how it was verified (2026-10-08)
 
 Both editions, one commit on the agent-utils branch:
