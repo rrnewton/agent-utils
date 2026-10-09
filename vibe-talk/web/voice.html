@@ -691,6 +691,25 @@
 
             <section class="settings-group">
               <div class="group-head">
+                <h2>Keyboard</h2>
+                <button class="help-link" id="help-link-keyboard" type="button" data-help="keyboard" aria-label="Every keyboard shortcut" title="Every key">?</button>
+              </div>
+              <!--
+                `#224 keyboard-shortcuts`. The keys that type a character — j, k, e, /, ? and the rest
+                — can be turned off, which is what WCAG 2.1.4 asks of them; Escape, the arrows, Enter
+                and the Ctrl or Cmd chords stay. ON by default. The line under it is written by
+                web/voice.js, which names the chord's key as the reader's own keyboard names it. The
+                `?` opens the list of every key, which `?` on the keyboard opens too.
+              -->
+              <label class="toggle">
+                <input id="single-keys" type="checkbox" checked aria-describedby="single-keys-hint" />
+                Single-key shortcuts
+              </label>
+              <p id="single-keys-hint" class="hint" aria-live="polite"></p>
+            </section>
+
+            <section class="settings-group">
+              <div class="group-head">
                 <h2>Canned prompts</h2>
                 <button class="help-link" id="help-link-canned-prompts" type="button" data-help="canned-prompts" aria-label="About the canned prompts" title="What these send">?</button>
               </div>
@@ -1206,6 +1225,25 @@
                 back the next time you sign in — <strong>Forget stored conversations</strong> is the
                 only control that erases that, and it leaves the screen alone in return.
               </p>
+            </article>
+
+            <!--
+              `#224 keyboard-shortcuts`. Every key the page answers. The list is written by
+              web/voice.js from the same table the keys are answered from (`KEYMAP`), so it cannot
+              say a key the page does not answer, or miss one it does; and in the words on the
+              reader's own keyboard, Cmd and Option on an Apple one, Ctrl and Alt elsewhere.
+            -->
+            <article id="help-keyboard" class="help-entry">
+              <h2>Keyboard</h2>
+              <p class="hint">
+                On a computer the messages can be read and dealt with from the keyboard. The arrows,
+                or j and k, move a ring from message to message; what a key does to "the selected
+                message" it does to the one in the ring, and a click on a message selects it without
+                one. A key that types a character never acts while you are typing in a box: Esc and
+                the Ctrl or Cmd chords do. Those single keys can be turned off under Keyboard in
+                Settings. Nothing here starts a call, and Esc never marks anything read.
+              </p>
+              <div id="keyboard-keys" role="group" aria-label="Keyboard shortcuts"></div>
             </article>
 
             <article id="help-microphone" class="help-entry">

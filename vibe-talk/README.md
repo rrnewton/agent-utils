@@ -3405,7 +3405,7 @@ scrolls from the keyboard the way any web page does:
 | Ctrl+Home, Ctrl+End (Cmd on a Mac) | The same from anywhere, a message box included |
 | `/` or Ctrl+S (Cmd+S) | Open the search with its field ready; pressed again, back to what you typed |
 | `,` or Ctrl+, (Cmd+,) | Settings; pressed again, or Esc, back to where you were |
-| Esc | Closes a menu or the search, leaves Settings or Help; never marks anything read |
+| Esc | Closes a menu, the search or a sheet; leaves Settings, Help, Reply, Threads or a thread; never marks anything read |
 
 These keys did nothing before, and nothing was eating them. A browser scrolls the box that holds
 the focus, or else the document, and this page's document never scrolls: the frame is fixed and each
@@ -3428,6 +3428,53 @@ acts while you are typing in a field, and nothing acts while an input method is 
 real Chromium at 1280x800, so the browser's own default scrolling runs, and measures the list on
 screen after each one: on load, after a view switch, in the search, on Settings and in the message
 box. Pass `SCREENSHOTS=/tmp/shots` to keep a PNG of each step.
+
+### The keyboard: moving through the messages and acting on them
+
+`#224 keyboard-shortcuts`. On a desk the messages can be read and dealt with without the mouse.
+The arrows, or `j` and `k`, move a ring from message to message. The ring is real keyboard focus on
+the row, so a screen reader announces the message and its buttons are one Tab away. What a key does
+to "the selected message" it does to the one in the ring. **`?`** (or Ctrl+/, Cmd+/ on a Mac) opens
+the full list on the Help screen; the list is generated from the same table the keys are answered
+from, so it cannot name a key the page does not answer.
+
+| Key | Does |
+|---|---|
+| ↓ or `j`, ↑ or `k` | The next or previous message. A message taller than the screen is scrolled through first |
+| `n` | The next unread message below |
+| Enter or `o` | Open or close the selected message, as a tap does (in Read, read it aloud) |
+| → | Into the thread of the selected message |
+| ← | Out of a thread, back to the message it was opened from |
+| Esc | Back (see above). In a message box with text in it, the first Esc leaves the box and keeps the draft |
+| Home, End | The top of the list or its newest message, and select it |
+| `e` | Done or not Done; marked Done, the ring moves on to the next unread below |
+| Shift+E | Done through here |
+| `z` | Undo the last Done |
+| `r`, `p`, `s`, `.`, `i` | Reply, pin, read aloud, the ⋯ menu, the message details |
+| Ctrl+C (Cmd+C) | Copy the text of the selected message, when no text is selected |
+| `1`, `2`, `3` | Main, Threads, All |
+| `h` | Show read, Collapse read, Hide read, in turn |
+| Shift+P, Shift+L | The Pinned and Links filters |
+| `;`, `:` | Expand all, Collapse all |
+| `m` | Back to My place |
+| `c` | Write to the channel (or the thread you are in) |
+| ↑ in the empty message box | Select the newest message |
+| Alt+↓, Alt+↑ (Option on a Mac) | The next or previous channel |
+| Ctrl+K (Cmd+K) | Choose a channel |
+
+A click on a message selects it without a ring, so the next key starts there. PgUp, PgDn and Space
+stay the browser's, and once the page comes to rest the ring moves to the first message shown whole.
+A key about one message never acts on a message scrolled out of sight: it brings the ring to the
+first message showing instead, and the next press acts on that. The selection is kept by message id
+for each list, so a refresh that redraws the rows puts the ring back on the same message.
+
+The keys that type a character (letters, digits, `/`, `,`, `?` and the rest) never act while you
+are typing in a box, and can be turned off under **Settings → Keyboard → Single-key shortcuts**,
+which is on by default (WCAG 2.1.4). The arrows, Esc, Enter, PgUp/PgDn, Home/End and the Ctrl or Cmd
+chords stay on. The choice is stored on this device under `vibe-talk.voice.single-keys`. Esc never
+marks anything read, no key starts a call, and the call's view takes no message keys. The buttons
+that have a key carry `aria-keyshortcuts`. Browser history is not used yet, so the browser's Back
+still leaves the page.
 
 ### Two ways a channel row can already have been dealt with, and only one of them hides it
 

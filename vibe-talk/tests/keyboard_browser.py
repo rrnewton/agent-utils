@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Press the scroll keys, the search keys and the Settings key in real Chromium at a desk's size.
+"""Press the scroll keys, the search and Settings keys and the keymap in real Chromium at a desk's size.
 
 `#224 keyboard-shortcuts`. The owner, in the installed app on a Mac desk: PgUp, PgDn, Home and End did
 nothing, though the page is "basically a website", and he wanted "/" and Ctrl+S for the search and a
@@ -19,7 +19,12 @@ under a person's fingers, and measures the list that is on screen:
   "," opens Settings with its screen focused, PgDn scrolls Settings, Escape returns to the list
   where the reader was; Ctrl+, does the same -> in the channel's message box, PgUp pages the list
   while the box keeps the focus and the draft, Home and End move the caret, and Ctrl+Home and
-  Ctrl+End take the list to its top and its newest message.
+  Ctrl+End take the list to its top and its newest message -> the keymap: Home selects the first
+  message with a ring drawn round it (real focus, `:focus-visible`), j, k and the arrows move the
+  ring and the list follows it, e marks the selected message Done on the server and moves on to the
+  next unread, Enter opens and closes a long message, PgDn moves the ring to the first message the
+  page shows, and -> on a message in a thread enters the thread, <- comes back to the message it
+  was opened from, and so does Esc.
 
 It serves the checked-out assets and a small fake API from one loopback origin, at 1280x800. Pass
 --web-root DIR to run the same walk against another copy of the page: against one from before the
@@ -316,6 +321,22 @@ STATE_JS = """(id) => {
 }"""
 
 
+# The row the focus is on, as a reader sees it: whether the browser draws its focus ring, and how.
+RING_JS = """() => {
+  const held = document.activeElement;
+  if (!held || !held.matches('#discord-log > li[data-id]')) return null;
+  const style = getComputedStyle(held);
+  const box = held.getBoundingClientRect();
+  const area = document.getElementById('scroll-area').getBoundingClientRect();
+  return {id: held.dataset.id, visible: held.matches(':focus-visible'), outline: style.outlineStyle,
+          width: parseFloat(style.outlineWidth), tabindex: held.getAttribute('tabindex'),
+          archived: held.dataset.archived || null, collapsed: held.dataset.collapsed || null,
+          top: box.top - area.top, bottom: box.bottom - area.top, height: area.height,
+          threaded: !document.getElementById('thread-heading').hidden,
+          rows: [...document.querySelectorAll('#discord-log > li[data-id]')].filter((li) => !li.hidden).length};
+}"""
+
+
 def check(condition: bool, message: str) -> None:
     if not condition:
         raise AssertionError(message)
@@ -390,6 +411,12 @@ def number(state: Json, name: str) -> float:
     return float(value)
 
 
+def on_list(state: Json) -> bool:
+    """Whether the focus is on the list: its scroller, or the message the keyboard selected in it."""
+    focus = state["focus"]
+    return focus == "scroll-area" or (isinstance(focus, str) and focus.startswith("li#"))
+
+
 def scroll_keys(walk: Walk, where: str) -> None:
     """PgUp, PgDn, Space, Shift+Space, Home and End, each moving the channel's list as it says."""
     start = walk.settled()
@@ -416,9 +443,11 @@ def scroll_keys(walk: Walk, where: str) -> None:
     moved(" ", 1)
     home = walk.key("Home")
     check(number(home, "top") <= 1, f"{where}: Home did not take the list to its top: {home}")
+    check(on_list(home), f"{where}: after Home the focus is on {home['focus']!r}")
     walk.shot(f"{where}-home")
     end = walk.key("End")
     check(number(end, "top") >= number(end, "max") - 2, f"{where}: End did not take the list to its newest message: {end}")
+    check(on_list(end), f"{where}: after End the focus is on {end['focus']!r}")
     walk.notes.append(f"{where}: PgUp/PgDn/Space/Shift+Space paged a {height:.0f}px list, Home and End reached its ends")
 
 
@@ -438,7 +467,7 @@ def search_keys(walk: Walk) -> None:
         check(typed == "de", f"after {chord!r} the search field did not take the typing: {typed!r}")
         closed = walk.key("Escape")
         check(closed["search"] is False, f"Escape did not close the search: {closed}")
-        check(closed["focus"] == "scroll-area", f"after Escape the focus is on {closed['focus']!r}, not the list")
+        check(on_list(closed), f"after Escape the focus is on {closed['focus']!r}, not the list")
     walk.notes.append('"/" and Ctrl+S opened the search with the field focused (Save page refused), Escape closed it')
 
 
@@ -458,7 +487,7 @@ def settings_keys(walk: Walk) -> None:
         walk.shot(f"settings-{'comma' if chord == ',' else 'ctrl-comma'}")
         back = walk.key("Escape")
         check(back["screen"] == "main", f"Escape did not leave Settings: {back}")
-        check(back["focus"] == "scroll-area", f"back from Settings the focus is on {back['focus']!r}")
+        check(on_list(back), f"back from Settings the focus is on {back['focus']!r}")
         check(abs(number(back, "top") - number(before, "top")) <= 2,
               f"back from Settings the list was at {back['top']}, not where the reader left it ({before['top']})")
     walk.notes.append('"," and Ctrl+, opened Settings with its screen focused, PgDn scrolled it, Escape came back unmoved')
@@ -493,6 +522,106 @@ def composer_keys(walk: Walk) -> None:
     walk.page.evaluate("() => { const box = document.getElementById('channel-compose-text'); box.value = ''; "
                        "box.dispatchEvent(new Event('input')); }")
     walk.notes.append("in the message box PgUp paged the list, Home/End moved the caret, Ctrl+Home/End jumped the list")
+
+
+def ring(walk: Walk) -> dict[str, object]:
+    """The selected row as drawn, once the list has come to rest; failing when no row holds the focus."""
+    walk.settled()
+    value = walk.page.evaluate(RING_JS)
+    check(isinstance(value, dict), f"no message holds the focus: it is on {walk.state()['focus']!r}")
+    assert isinstance(value, dict)
+    return value
+
+
+def ringed(walk: Walk, chord: str, why: str) -> dict[str, object]:
+    """Press `chord`, and the row it selected: ringed, a Tab stop, and shown whole."""
+    press(walk.cdp, chord)
+    row = ring(walk)
+    check(row["visible"] is True and row["outline"] != "none" and number(row, "width") >= 1,
+          f"{why}: the selected message {row['id']} has no visible focus ring: {row}")
+    check(row["tabindex"] == "0", f"{why}: the selected message is not the Tab stop: {row}")
+    check(number(row, "top") >= -1 and number(row, "bottom") <= number(row, "height") + 1 or number(row, "top") >= -1,
+          f"{why}: the selected message is not on screen: {row}")
+    return row
+
+
+def keymap_keys(walk: Walk, api: FakeApi) -> None:
+    """The keymap: a ring moved by j, k and the arrows, e, Enter, PgDn, and a thread entered and left."""
+    ids = [str(m["id"]) for m in api.messages]
+    # Out of the message box first: Esc leaves it for the list.
+    left = walk.key("Escape")
+    check(on_list(left), f"Esc in the message box left the focus on {left['focus']!r}, not the list")
+    first = ringed(walk, "Home", "Home")
+    check(first["id"] == ids[0], f"Home selected {first['id']}, not the first message {ids[0]}")
+    walk.shot("keymap-home")
+    for chord, at in (("j", 1), ("ArrowDown", 2), ("j", 3), ("k", 2), ("ArrowUp", 1)):
+        row = ringed(walk, chord, chord)
+        check(row["id"] == ids[at], f"{chord} selected {row['id']}, not {ids[at]}")
+    walk.shot("keymap-moved")
+    # Down the list far enough that the list must follow the ring.
+    for _ in range(12):
+        row = ringed(walk, "j", "j")
+    check(row["id"] == ids[13], f"twelve more j selected {row['id']}, not {ids[13]}")
+    check(walk.settled()["top"] != 0, "the list did not follow the ring down")
+
+    # e: Done on the server, and on to the next unread message.
+    done = row["id"]
+    before = len(api.dismissals())
+    after = ringed(walk, "e", "e")
+    for _ in range(100):
+        if len(api.dismissals()) > before:
+            break
+        walk.page.wait_for_timeout(20)
+    check(api.dismissals()[before:] == [[done]], f"e did not mark {done} Done on the server: {api.dismissals()}")
+    marked = walk.page.evaluate("(id) => document.querySelector(`#discord-log > li[data-id='${id}']`).dataset.archived", done)
+    check(marked == "true", f"the message e marked does not show as Done: {marked!r}")
+    check(after["id"] == ids[14], f"after e the ring went to {after['id']}, not the next unread {ids[14]}")
+    walk.shot("keymap-done")
+
+    # PgDn from the selected message: the browser pages the list, and the ring comes to the screen.
+    paged = ringed(walk, "PageDown", "PgDn")
+    check(paged["id"] != after["id"] and number(paged, "top") >= -1,
+          f"after PgDn the ring stayed on {after['id']} rather than following the page: {paged}")
+
+    # Enter on the long message: open, then closed again.
+    long_id = ids[MESSAGES - 8]
+    walk.key("End")
+    for _ in range(30):
+        if ring(walk)["id"] == long_id:
+            break
+        press(walk.cdp, "k")
+    row = ring(walk)
+    check(row["id"] == long_id and row["collapsed"] == "true", f"the long message is not selected and folded: {row}")
+    opened = ringed(walk, "Enter", "Enter")
+    check(opened["collapsed"] == "false", f"Enter did not open the long message: {opened}")
+    walk.shot("keymap-enter")
+    closed = ringed(walk, "Enter", "Enter again")
+    check(closed["collapsed"] == "true", f"Enter again did not close the long message: {closed}")
+
+    # → into the thread of its root, ← back to it; → again, and Esc back.
+    root_id = ids[MESSAGES // 2]
+    for _ in range(40):
+        if ring(walk)["id"] == root_id:
+            break
+        press(walk.cdp, "k")
+    check(ring(walk)["id"] == root_id, f"the thread's root was not reached: {ring(walk)}")
+    for back in ("ArrowLeft", "Escape"):
+        press(walk.cdp, "ArrowRight")
+        walk.page.wait_for_function("() => !document.getElementById('thread-heading').hidden", timeout=5000)
+        walk.settled()
+        inside = walk.page.evaluate("() => [...document.querySelectorAll('#discord-log > li[data-id]')].filter((li) => !li.hidden).length")
+        check(inside == THREAD_REPLIES + 1, f"-> did not open the thread: {inside} messages shown")
+        walk.shot(f"keymap-thread-{back.lower()}")
+        threaded = ringed(walk, "ArrowDown", "ArrowDown in the thread")
+        check(threaded["threaded"] is True, "ArrowDown in the thread left it")
+        press(walk.cdp, back)
+        walk.page.wait_for_function("() => document.getElementById('thread-heading').hidden", timeout=5000)
+        row = ring(walk)
+        check(row["id"] == root_id and row["visible"] is True,
+              f"back from the thread with {back}, the ring is on {row['id']}, not the message it was opened from")
+    walk.notes.append(f"the keymap: Home, j/k and the arrows moved a visible focus ring the list followed, e marked "
+                      f"{done} Done on the server and moved on to the next unread, PgDn brought the ring to the page, "
+                      "Enter opened and closed the long message, -> entered its thread and <- and Esc came back to it")
 
 
 def main() -> int:
@@ -551,12 +680,13 @@ def main() -> int:
             page.click("#view-switch")
             page.wait_for_selector(first_row, state="visible", timeout=10_000)
             switched = walk.settled()
-            check(switched["focus"] == "scroll-area", f"after a view switch the focus is on {switched['focus']!r}")
+            check(on_list(switched), f"after a view switch the focus is on {switched['focus']!r}")
             scroll_keys(walk, "after a view switch")
 
             search_keys(walk)
             settings_keys(walk)
             composer_keys(walk)
+            keymap_keys(walk, api)
 
             check(not errors, f"the page threw: {errors}")
             browser_version = context.browser.version if context.browser else "Chromium"

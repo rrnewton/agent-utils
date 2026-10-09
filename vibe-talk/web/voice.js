@@ -51,7 +51,7 @@ const ACTIVE_CHANNEL_KEY = "vibe-talk.voice.active-channel";
  *   | "compose-text" | "enter-sends" | "mark-own-read" | "mic-auto-gain" | "mic-echo-cancellation"
  *   | "mic-noise-suppression" | "msg-scale" | "new-channel-id" | "new-channel-label"
  *   | "new-channel-writable" | "noise-rule-new" | "read-speed-range" | "reading-width"
- *   | "reply-branch" | "resume-toggle" | "search-field"} id
+ *   | "reply-branch" | "resume-toggle" | "search-field" | "single-keys"} id
  * @returns {HTMLInputElement}
  */
 /**
@@ -76,7 +76,7 @@ const ACTIVE_CHANNEL_KEY = "vibe-talk.voice.active-channel";
  *   | "dismiss-status" | "expand-all" | "forget-conversations" | "forget-token" | "hang-up"
  *   | "help-link-auto-read" | "help-link-canned-prompts" | "help-link-channel-alias"
  *   | "help-link-combining" | "help-link-connection" | "help-link-control-bar"
- *   | "help-link-identities"
+ *   | "help-link-identities" | "help-link-keyboard"
  *   | "help-link-live-messages" | "help-link-mark-own" | "help-link-microphone"
  *   | "help-link-reading-width" | "help-link-resuming" | "help-link-speech-prep"
  *   | "help-link-storage" | "jump-marker" | "jump-newest" | "link-kind-action" | "link-kind-commit"
@@ -464,6 +464,7 @@ function closeSettings() {
 const HELP_TOPICS = [
   "microphone",
   "control-bar",
+  "keyboard",
   "canned-prompts",
   "identities",
   "channel-alias",
@@ -1684,6 +1685,9 @@ function renderScrollTools() {
   // LAST: it measures how far the list runs below the reader, and the filter just above can have
   // taken most of the list away. `#207 scrollback-jump`.
   renderJumpNewest();
+  // `#224 keyboard-shortcuts`. A redraw that took the selected message's row away puts the selection
+  // on its new one, the focus with it.
+  keepSelection();
 }
 
 /**
@@ -3317,16 +3321,22 @@ function storedEnterSends() {
 const CMD_KEY_PLATFORMS = ["Mac", "iPhone", "iPad", "iPod"];
 
 /**
- * The send chord, in the words printed on the reader's own keyboard.
+ * The chord modifier, in the word printed on the reader's own keyboard: "Cmd" or "Ctrl".
  *
- * WORDING ONLY. Both keys send on every platform — `onComposerKey` reads `ctrlKey || metaKey` and
- * never this — so a platform guessed wrong costs a hint that names the other key, not a key that
- * stops working. `navigator.platform` rather than the user-agent string, which this page does not
- * read for anything (the suite refuses it, because a layout decided by it rots).
+ * WORDING ONLY. Every chord this page answers takes either key on every platform — `onComposerKey`
+ * and `onPageKey` read `ctrlKey || metaKey` and never this — so a platform guessed wrong costs a
+ * hint that names the other key, not a key that stops working. `navigator.platform` rather than the
+ * user-agent string, which this page does not read for anything (the suite refuses it, because a
+ * layout decided by it rots). `#224 keyboard-shortcuts` names every chord with it.
  */
-function sendChordName() {
+function modKeyName() {
   const platform = String((navigator && navigator.platform) || "");
-  return CMD_KEY_PLATFORMS.some((prefix) => platform.startsWith(prefix)) ? "Cmd+Enter" : "Ctrl+Enter";
+  return CMD_KEY_PLATFORMS.some((prefix) => platform.startsWith(prefix)) ? "Cmd" : "Ctrl";
+}
+
+/** The send chord, in the words printed on the reader's own keyboard. See `modKeyName`. */
+function sendChordName() {
+  return `${modKeyName()}+Enter`;
 }
 
 /**
@@ -3395,7 +3405,8 @@ function onComposerKey(event, send, singleLine = false) {
 // `#224 keyboard-shortcuts`. The owner, in the installed app on a Mac desk: "pgup/pgdown and home/end
 // don't work even though this is basically a website inside the installed PWA ... I want to make
 // sure those plus "/" and "Ctrl-s" for opening search work. Plus a key to go to the settings, and to
-// save and exit settings, though I think the saving is implicit."
+// save and exit settings, though I think the saving is implicit." And of the keymap proposed after a
+// study of how other chat clients do it: "go ahead and implement the keyboard shortcuts on desktop."
 //
 // WHY THE SCROLL KEYS DID NOTHING. A browser scrolls with PgUp, PgDn, Space, Home, End and the arrows
 // by scrolling the box that holds the focus (with nothing focused, the box the last click landed in)
@@ -3417,12 +3428,16 @@ function onComposerKey(event, send, singleLine = false) {
 // default, which runs after this page's listener, then scrolls it, at the browser's distances and
 // with its smoothing. The page scrolls a list itself only where the browser's default would do
 // something else with the key: PgUp and PgDn in a text field (a page of caret movement) and on a
-// picker (another option), Home and End on a picker, and Ctrl+Home and Ctrl+End from anywhere.
+// picker (another option), Home and End on a picker, Ctrl+Home and Ctrl+End from anywhere, and Home
+// and End over the channel, which also select the message there.
 //
-// ONE TABLE, `KEYMAP`, and one listener that walks it, `onPageKey`. The message boxes keep their own
-// Enter (`onComposerKey`), the reading-width handle its arrows and the search field its Escape; each
-// runs first, at its element, and a key it handled arrives here with `defaultPrevented` and is left
-// alone.
+// ONE TABLE, `KEYMAP`, and one listener that walks it, `onPageKey`. Three things are read off the
+// table: what each key does, the list of every key on the Help screen (`renderKeyHints`), and the
+// `aria-keyshortcuts` of the buttons that have one, so the list a reader is shown cannot drift from
+// what the keys do. The message boxes keep their own Enter (`onComposerKey`), the reading-width handle
+// its arrows and the search field its Escape; each runs first, at its element, and a key it handled
+// arrives here with `defaultPrevented` and is left alone. The table names those keys too, as answered
+// by someone else, so that the list is whole.
 //
 // THE RULES, which are the proposal's section 5:
 //
@@ -3432,9 +3447,22 @@ function onComposerKey(event, send, singleLine = false) {
 //     when they want the search, Settings or the ends of the list. Nothing fires while an input method
 //     composes, and a phone keyboard, which reports keyCode 229 and types only into fields, never
 //     reaches the table.
-//   * PER LIST, NOT PER PAGE. A list the keys move through is a `KeyPane`, and nothing below names
-//     #scroll-area except the channel pane. A second column is a second entry in `KEY_PANES`, and the
-//     pane holding the focus is the one the keys move.
+//   * Those character keys can all be turned off in Settings, "Single-key shortcuts", on by default:
+//     what WCAG 2.1.4 asks of them. The arrows, Escape, Enter and the chords stay.
+//   * THE SELECTED MESSAGE IS REAL FOCUS ON ITS ROW, so the ring is the browser's own `:focus-visible`,
+//     a screen reader announces the row, and its buttons are a Tab away. A row has no `tabindex` until
+//     the keyboard selects it (a tap on a phone must not give a row the focus and light it) and the
+//     selected one has `tabindex="0"`, so Shift+Tab from its buttons comes back to it. It is kept by
+//     message id, because rows are rebuilt under the reader (`expandedIds` says why), per list, and
+//     put back after every rebuild (`keepSelection`). A click selects silently: no focus, no ring. A
+//     key about one message never acts on one scrolled out of sight: it brings the ring to the first
+//     message showing instead (`rowForAct`).
+//   * PER LIST, NOT PER PAGE. A list the keys move through is a `KeyPane` (its scroller, its rows,
+//     and the room its floating line and its chips take) and nothing below names #scroll-area except
+//     the channel pane. A second column is a second entry in `KEY_PANES`; the pane holding the focus
+//     is the one the keys move, else the one used last, and a click there notes its row.
+//   * Escape never marks anything read (the proposal's question 5), and no key starts a call (question
+//     9): the call's view takes no keys but Escape and the search, Settings and help of the page.
 //   * Browser history is not touched: Back in the browser still leaves the page. A follow-up.
 
 /**
@@ -3471,6 +3499,12 @@ function pressedBySpace(node) {
   return ["BUTTON", "INPUT", "SELECT", "TEXTAREA", "SUMMARY"].includes(tag);
 }
 
+/** The controls an Enter presses or follows: on one of them Enter is its own, not the row's. */
+function answersEnter(node) {
+  const tag = String((node && node.tagName) || "").toUpperCase();
+  return ["BUTTON", "A", "INPUT", "SELECT", "TEXTAREA", "SUMMARY"].includes(tag) || isTextField(node);
+}
+
 /** A textarea holding more than it shows, which has a page of its own for the page keys to move through. */
 function scrollsItself(field) {
   return String(field.tagName || "").toUpperCase() === "TEXTAREA" &&
@@ -3491,36 +3525,79 @@ function shownNode(node) {
   return true;
 }
 
+/** The message boxes are where Escape leaves the field before it goes Back. See `onEscape`. */
+const isComposer = (node) => Boolean(node) && COMPOSER_FIELDS.includes(String(node.id || ""));
+
 // --- the lists the keys move through
+
+/**
+ * @typedef {object} KeySelection
+ * @property {string} id The message the selection is on: its row's `data-id`.
+ * @property {boolean} keyed Whether the keyboard chose it (a ring) or a click did (none).
+ * @property {number} index Where its row was in the list, for when the row goes.
+ */
 
 /**
  * @typedef {object} KeyPane
  * @property {string} name
  * @property {() => HTMLElement} scroller The element that scrolls the pane's list.
+ * @property {() => (HTMLElement | null)} list The list whose rows the keys move through, or null
+ *   where the pane takes no row keys at the moment.
+ * @property {() => number} head Viewport y of the pane's floating line: a row above it is under it.
+ * @property {() => number} foot Viewport y of the pane's chips: a row below it is under them.
+ * @property {() => string} context Which list the pane is showing. A selection is kept per list.
+ * @property {Map<string, KeySelection>} marks The selected message in each list the pane has shown.
+ * @property {HTMLElement | null} row The row the keyboard selected, while it holds the `tabindex`.
  */
 
 /**
- * The one scrolling area on the main screen, which both views share: the call's transcript or the
- * channel's messages, whichever is up.
+ * The channel's messages, in the one scrolling area both views share. Its rows are the channel's own
+ * list or the Pinned filter's, never the call's transcript (the proposal's question 9) and never the
+ * list of threads, whose rows are threads.
  *
  * @type {KeyPane}
  */
 const channelPane = {
   name: "channel",
   scroller: () => el("scroll-area"),
+  list: () => (currentScreen === "main" && currentView === "discord" && (pinnedOnly || channelView !== "threads")
+    ? shownChannelList() : null),
+  head: () => floatingClearance(el("scroll-area")),
+  // The chips float over the foot of the list, and the status line floats over them: a row under
+  // either is under something.
+  foot: () => {
+    const area = el("scroll-area");
+    const over = ["scroll-tools", "status-line"].reduce((room, id) =>
+      room + (el(id).hidden ? 0 : el(id).getBoundingClientRect().height), 0);
+    return area.getBoundingClientRect().top + (area.clientHeight || 0) - over;
+  },
+  context: () => JSON.stringify([channelContextKey(), pinnedOnly]),
+  // Session-only and one short entry per list visited, for the reason `expandedIds` gives.
+  marks: new Map(),
+  row: null,
 };
 
 /** Every list the keys can move through. A second column is a second entry here. */
 const KEY_PANES = [channelPane];
 
-/** The pane `node` is in, or null. */
+/** The pane the keys moved last, which keys from outside every pane go to while it takes them. */
+let lastPane = channelPane;
+
+/**
+ * The pane `node` is in; or else the one the keys moved last, while it takes row keys; or else the
+ * first that does. Null when no pane takes them, as on the call's view.
+ */
 function paneFor(node) {
-  return KEY_PANES.find((pane) => Boolean(node) && nodeWithin(pane.scroller(), node)) || null;
+  for (const pane of KEY_PANES) {
+    if (node && nodeWithin(pane.scroller(), node)) return pane;
+  }
+  if (lastPane.list() !== null) return lastPane;
+  return KEY_PANES.find((pane) => pane.list() !== null) || null;
 }
 
 /**
  * The element the scroll keys are for, on the screen that is up: on the main screen the scroller of
- * the pane `node` is in (or the first pane), on Reply its conversation, elsewhere the screen.
+ * the pane `node` is in (or the pane `paneFor` picks), on Reply its conversation, elsewhere the screen.
  */
 function visibleScroller(node = document.activeElement) {
   if (currentScreen === "main") return (paneFor(node) || KEY_PANES[0]).scroller();
@@ -3528,12 +3605,190 @@ function visibleScroller(node = document.activeElement) {
   return el(`screen-${currentScreen}`);
 }
 
+/** The rows a pane's keys move through, top to bottom: its messages that are drawn. */
+function paneRows(pane) {
+  const list = pane.list();
+  if (!list) return [];
+  return /** @type {HTMLElement[]} */ ([...list.children]).filter((row) => row.hasAttribute("data-id") && rowShown(row));
+}
+
+/** The row of `pane` that `node` is in, or null. */
+function rowOf(pane, node) {
+  const list = pane.list();
+  if (!list || !node) return null;
+  for (let at = node; at && at !== list; at = at.parentNode) {
+    if (at.parentNode === list) {
+      return typeof at.hasAttribute === "function" && at.hasAttribute("data-id") ? /** @type {HTMLElement} */ (at) : null;
+    }
+  }
+  return null;
+}
+
 /**
- * Give the list on screen the focus, so that the scroll keys reach it. `preventScroll`: taking the
- * focus must not move the list, because where the reader is has rules of its own.
+ * The row standing for message `id` in `pane` now: its own, the combined row holding it, or the
+ * line of the collapsed run it is in (`#221 read-modes`). Null when the list does not draw it.
  */
-function focusList() {
-  const target = visibleScroller();
+function paneRowFor(pane, id) {
+  const list = pane.list();
+  if (!list || !id) return null;
+  const held = /** @type {HTMLElement[]} */ ([...list.children]).find((row) => idsOf(row).includes(String(id)));
+  const shown = held ? shownRowFor(held) : null;
+  return shown && rowShown(shown) ? shown : null;
+}
+
+/** The selection kept for the list `pane` is showing now, or null. */
+const markOf = (pane) => pane.marks.get(pane.context()) || null;
+
+/** Note `row` as the selection of the list `pane` is showing. */
+function markRow(pane, row, keyed) {
+  pane.marks.set(pane.context(), { id: String(row.getAttribute("data-id")), keyed, index: paneRows(pane).indexOf(row) });
+  lastPane = pane;
+}
+
+/** Take the `tabindex` back from the row the keyboard selected last, when `row` is not that row. */
+function releaseRow(pane, row = null) {
+  if (pane.row && pane.row !== row && pane.row.getAttribute("tabindex") === "0") pane.row.removeAttribute("tabindex");
+  pane.row = row;
+}
+
+/**
+ * The row the keys act on: the one holding the focus, or else the one selected in this list, by
+ * the keyboard or silently by a click. Null when there is neither.
+ */
+function currentRow(pane, node) {
+  const held = rowOf(pane, node);
+  if (held && rowShown(held)) return held;
+  const mark = markOf(pane);
+  return mark ? paneRowFor(pane, mark.id) : null;
+}
+
+/** The row the keyboard selected in this list, while it is drawn: what the focus comes back to. */
+function keyedRow(pane) {
+  const mark = markOf(pane);
+  return mark && mark.keyed ? paneRowFor(pane, mark.id) : null;
+}
+
+/** The row at `index` in `pane`, or the nearest one there is: where a row that went is replaced. */
+function nearRow(pane, index) {
+  const rows = paneRows(pane);
+  return rows.length ? rows[Math.max(0, Math.min(index, rows.length - 1))] : null;
+}
+
+/** Whether any of `row` shows between the pane's floating line and its chips. */
+function rowInView(pane, row) {
+  const box = row.getBoundingClientRect();
+  return box.bottom > pane.head() && box.top < pane.foot();
+}
+
+/** The first row of `pane` shown whole between its floating line and its chips, else the first showing at all. */
+function firstRowInView(pane) {
+  const seen = paneRows(pane).filter((row) => rowInView(pane, row));
+  const head = pane.head();
+  const foot = pane.foot();
+  return seen.find((row) => {
+    const box = row.getBoundingClientRect();
+    return box.top >= head - 1 && box.bottom <= foot + 1;
+  }) || seen[0] || null;
+}
+
+/**
+ * Select `row`: the focus on it, without the browser's own jump, and then (unless `bring` is false)
+ * the least scrolling that shows it whole. See `bringIntoView` for a row taller than the room.
+ */
+function selectRow(pane, row, bring = true, from = 1) {
+  releaseRow(pane, row);
+  markRow(pane, row, true);
+  row.setAttribute("tabindex", "0");
+  row.focus({ preventScroll: true });
+  if (bring) bringIntoView(pane, row, from);
+}
+
+/**
+ * Scroll `pane` the least that puts `row` between its floating line and its chips. A row taller than
+ * the room shows its head, where reading it starts, unless the reader arrived on it going up (`from`
+ * below zero): then its foot, so that ↑ reads back up through it as ↓ read down.
+ */
+function bringIntoView(pane, row, from = 1) {
+  const area = pane.scroller();
+  const box = row.getBoundingClientRect();
+  const head = pane.head() + REPLY_LANDING_GAP_PX;
+  const foot = pane.foot() - REPLY_LANDING_GAP_PX;
+  if (from < 0 && box.height > foot - head) {
+    if (box.bottom > foot || box.bottom < head) area.scrollTop += box.bottom - foot;
+    return;
+  }
+  if (box.top < head) area.scrollTop += box.top - head;
+  else if (box.bottom > foot) area.scrollTop += Math.min(box.bottom - foot, box.top - head);
+}
+
+/**
+ * Put the keyboard's selection back after a redraw took its row away. Called at the end of every
+ * pass over the scroll tools, which every bulk redraw of the lists ends with.
+ *
+ * The same message's new row takes the `tabindex`, and the focus too when the old row had it: a
+ * browser drops the focus to the body when the focused row is removed, and the ring would vanish
+ * under the reader at every refresh. A message that has gone (Done under Hide read) hands the
+ * selection to the row now where it was: the next one, or the last at the end of the list.
+ */
+function keepSelection() {
+  for (const pane of KEY_PANES) {
+    const held = pane.row;
+    const list = pane.list();
+    if (held === null || list === null) continue;
+    if (held.parentNode === list && rowShown(held)) continue;
+    releaseRow(pane);
+    const mark = markOf(pane);
+    if (!mark || !mark.keyed) continue;
+    const lost = document.activeElement === held || focusLost();
+    const row = paneRowFor(pane, mark.id) || (lost ? nearRow(pane, mark.index) : null);
+    if (!row) continue;
+    pane.row = row;
+    markRow(pane, row, true);
+    row.setAttribute("tabindex", "0");
+    if (lost) row.focus({ preventScroll: true });
+  }
+}
+
+/** A click in a pane selects its row SILENTLY: the next key starts there, and no ring is drawn. */
+function noteClickedRow(pane, node) {
+  const row = rowOf(pane, node);
+  if (!row) return;
+  const mark = markOf(pane);
+  if (mark && mark.keyed && mark.id === row.getAttribute("data-id")) return;
+  releaseRow(pane);
+  markRow(pane, row, false);
+}
+
+/**
+ * The keyboard selection follows a page of scrolling. PgUp, PgDn and Space are the browser's, and
+ * scroll the list under a selected row without moving the focus; once the scroll has come to rest,
+ * the ring moves to the first message shown whole, so the next key acts on what is on screen. Only
+ * a selection the keyboard made, and only while it still holds the focus. Without a `scrollend` event
+ * (older browsers) the ring stays put, and the next arrow starts from the screen as it always does.
+ */
+function followPageScroll(pane, row) {
+  const area = pane.scroller();
+  const settle = () => {
+    if (document.activeElement !== row || pane.row !== row) return;
+    if (rowInView(pane, row) && row.getBoundingClientRect().top >= pane.head() - 1) return;
+    const first = firstRowInView(pane);
+    if (first && first !== row) selectRow(pane, first, false);
+  };
+  if ("onscrollend" in area) area.addEventListener("scrollend", settle, { once: true });
+}
+
+/**
+ * Give the list on screen the focus (the keyboard's selected message when it is drawn, else the
+ * scroller) so that the scroll keys and the row keys reach it. `preventScroll`: taking the focus
+ * must not move the list, because where the reader is has rules of its own.
+ */
+function focusList(pane) {
+  const row = pane ? keyedRow(pane) : null;
+  if (row && pane) {
+    releaseRow(pane, row);
+    row.setAttribute("tabindex", "0");
+  }
+  const target = row || visibleScroller();
   if (target && document.activeElement !== target && typeof target.focus === "function") {
     target.focus({ preventScroll: true });
   }
@@ -3543,7 +3798,7 @@ function focusList() {
 function settleFocus() {
   const held = document.activeElement;
   if (held && isTextField(held) && shownNode(held)) return;
-  focusList();
+  focusList(currentScreen === "main" ? paneFor(held) : null);
 }
 
 // --- scrolling
@@ -3578,7 +3833,8 @@ const SCROLL_KEYS = ["PageUp", "PageDown", "Home", "End", " ", "ArrowUp", "Arrow
  *     focus and the text, so the reader is never stuck in a box.
  *   * On a picker, the arrows and Space choose and open, as they always did; the page keys and
  *     Home/End page the list rather than skipping options. A slider and the width handle keep all.
- *   * Inside the list, the browser scrolls it already.
+ *   * Inside the list, the browser scrolls it already; from the selected message, the ring follows
+ *     the page once it comes to rest (`followPageScroll`).
  *   * A focused button keeps Space, which presses it.
  *   * Anywhere else (nothing focused, a control in the dock or the header) the list takes the
  *     focus, and the browser's own default, which runs after this, scrolls it.
@@ -3607,7 +3863,11 @@ function routeScrollKey(event, target) {
     }
     return;
   }
-  if (target && nodeWithin(area, target)) return;
+  if (target && nodeWithin(area, target)) {
+    const pane = currentScreen === "main" ? paneFor(target) : null;
+    if (pane && pane.row === target && (paging || key === " ")) followPageScroll(pane, target);
+    return;
+  }
   if (key === " " && pressedBySpace(target)) return;
   if (typeof area.focus === "function") area.focus({ preventScroll: true });
 }
@@ -3621,7 +3881,420 @@ function jumpList(target, newest) {
   return true;
 }
 
-// --- search, Settings and Escape
+/**
+ * Home and End over the channel: its top or its newest message, as the browser would scroll there,
+ * and that message selected. Home asks for no more history than scrolling to the top does: the
+ * scroll listener steps back once, as it always has. Elsewhere they are the browser's.
+ */
+function listEdge(target, newest) {
+  const pane = paneFor(target);
+  const rows = pane ? paneRows(pane) : [];
+  if (!pane || rows.length === 0) return false;
+  if (newest) toNewest(pane.scroller());
+  else pane.scroller().scrollTop = 0;
+  selectRow(pane, rows[newest ? rows.length - 1 : 0], false);
+  return true;
+}
+
+// --- moving the selection
+
+/** How far ↓ and ↑ scroll through a message taller than the room before moving on: half the room. */
+const READ_STEP = 0.5;
+
+/**
+ * ↓ and ↑, j and k. The next or previous message, or, while the selected one runs past the foot of
+ * the room (or above its head), half a room further through it first: the long answer of an agent is
+ * read with the same key that moves on from it (the proposal's question 10).
+ *
+ * Starts from what is on screen when nothing is selected or the selection has been scrolled away,
+ * never from a row far off: ↓ takes the top message showing, ↑ the bottom one. In a thread just
+ * entered (`#221 read-modes`) the first key takes the message the entry landed on.
+ */
+function stepSelection(pane, node, direction) {
+  const rows = paneRows(pane);
+  if (rows.length === 0) return false;
+  const area = pane.scroller();
+  const head = pane.head();
+  const foot = pane.foot();
+  const step = Math.max(1, Math.round((foot - head) * READ_STEP));
+  const current = currentRow(pane, node);
+  const at = current ? rows.indexOf(current) : -1;
+  if (at < 0 || !rowInView(pane, current)) {
+    const landed = entryLandingHolds() && rows.includes(entryLanding.first) ? entryLanding.first : null;
+    const seen = rows.filter((row) => rowInView(pane, row));
+    const start = landed || (seen.length > 0 ? seen[direction > 0 ? 0 : seen.length - 1] : rows[direction > 0 ? 0 : rows.length - 1]);
+    selectRow(pane, start);
+    return true;
+  }
+  // A message a click selected silently takes the ring now: the key moves on from it, or reads on
+  // through it, with the ring showing where the reader is.
+  if (document.activeElement !== current) selectRow(pane, current, false);
+  const box = current.getBoundingClientRect();
+  if (direction > 0 && box.bottom > foot + 1) {
+    area.scrollTop += Math.min(box.bottom - foot + REPLY_LANDING_GAP_PX, step);
+    return true;
+  }
+  if (direction < 0 && box.top < head - 1) {
+    area.scrollTop -= Math.min(head - box.top + REPLY_LANDING_GAP_PX, step);
+    return true;
+  }
+  const next = rows[at + direction];
+  // Past the last message the list still has the box to write in below it, and past the first the
+  // walk back to older history above: the key scrolls on toward either, as the arrow always did.
+  if (!next) {
+    area.scrollTop += direction * step;
+    return true;
+  }
+  selectRow(pane, next, true, direction);
+  return true;
+}
+
+/** The buttons in the open ⋯ menu that are shown, in order: what ↓ and ↑ move through there. */
+function menuItems() {
+  if (!openRowMenu) return [];
+  const items = [];
+  const walk = (node) => {
+    for (const kid of node.children || []) {
+      if (kid.hidden) continue;
+      if (String(kid.tagName).toUpperCase() === "BUTTON" && kid !== openRowMenu.button) items.push(kid);
+      else walk(kid);
+    }
+  };
+  walk(openRowMenu.root);
+  return items;
+}
+
+/** ↓ and ↑ in an open ⋯ menu move through its items, as the arrows of a menu do, round from the ends. */
+function stepMenu(node, direction) {
+  if (!openRowMenu || !nodeWithin(openRowMenu.root, node)) return false;
+  const items = menuItems();
+  if (items.length === 0) return false;
+  const at = items.indexOf(node);
+  const next = at < 0 ? items[direction > 0 ? 0 : items.length - 1] : items[(at + direction + items.length) % items.length];
+  next.focus();
+  return true;
+}
+
+/** ↓/j or ↑/k, wherever the focus is: the items of a menu, else the selection in the pane. */
+function stepFromKeyboard(target, direction) {
+  if (stepMenu(target, direction)) return true;
+  const pane = paneFor(target);
+  return pane ? stepSelection(pane, target, direction) : false;
+}
+
+/** The pane the keys move and its current row. */
+function keyContext(target) {
+  const pane = paneFor(target);
+  return { pane, row: pane ? currentRow(pane, target) : null };
+}
+
+/**
+ * The row a key about one message acts on: `keyContext`, while any of the row is on screen. A row
+ * scrolled out of sight, by the wheel or the scrollbar, is never acted on unseen: the key selects the
+ * first message showing instead and does nothing else (`took`), so the next press acts on the row
+ * the ring is round.
+ *
+ * The line of a collapsed run of read messages (`#221 read-modes`) stands for every message in the
+ * run, so no key about ONE message acts on it; only Enter and o, which open the run (`runLine`).
+ */
+function rowForAct(target, runLine = false) {
+  const { pane, row } = keyContext(target);
+  if (!pane || !row) return { pane, row: null, took: false };
+  if (!runLine && row.getAttribute("data-read-run") === "head") {
+    setStatus("Read messages: Enter opens them.");
+    return { pane, row: null, took: true };
+  }
+  if (rowInView(pane, row)) return { pane, row, took: false };
+  const first = firstRowInView(pane);
+  if (first) {
+    selectRow(pane, first, false);
+    setStatus("Selected the first message showing.");
+  }
+  return { pane, row: null, took: Boolean(first) };
+}
+
+/** The first unread message after `at` in `rows`, by the read rule both read modes share. */
+const unreadAfter = (rows, at) => rows.slice(at + 1).find((row) => !rowIsRead(row)) || null;
+
+/** n: the next unread message below the selected one, or below the top of the screen. */
+function nextUnreadFromKeyboard(target) {
+  const { pane, row } = keyContext(target);
+  const rows = pane ? paneRows(pane) : [];
+  if (!pane || rows.length === 0) return false;
+  let from = row && rowInView(pane, row) ? rows.indexOf(row) : -1;
+  if (from < 0) {
+    const seen = rows.findIndex((one) => rowInView(pane, one));
+    from = seen < 0 ? -1 : seen - 1;
+  }
+  const next = unreadAfter(rows, from);
+  if (next) selectRow(pane, next);
+  else setStatus("Nothing unread below.");
+  return true;
+}
+
+/**
+ * After a Done made from the keyboard: on to the unread message `nextId` it chose before the act,
+ * else back on the message itself, else (it has gone, under Hide read) the row now where it was.
+ * The rows are already the new ones: the list is redrawn before the write goes out.
+ */
+function landAfterDone(pane, nextId, ownId, at) {
+  const row = (nextId && paneRowFor(pane, nextId)) || paneRowFor(pane, ownId) || nearRow(pane, at);
+  if (row) selectRow(pane, row);
+}
+
+/** e: Done or not Done, the act of the row's Done button; marked Done, on to the next unread below (question 2). */
+function doneFromKeyboard(target) {
+  const { pane, row, took } = rowForAct(target);
+  if (!pane || !row) return took;
+  const ids = idsOf(row);
+  if (ids.length === 0) return false;
+  const marking = !ids.every((id) => archivedIds.has(id));
+  const rows = paneRows(pane);
+  const at = rows.indexOf(row);
+  const next = marking ? unreadAfter(rows, at) : null;
+  guardQuietly(() => toggleArchived(ids))();
+  landAfterDone(pane, next && next.getAttribute("data-id"), ids[0], at);
+  return true;
+}
+
+/** Shift+E: Done through here (`#202 read-through-here`), the act of the ⋯ menu, then on to the next unread below. */
+function throughHereFromKeyboard(target) {
+  const { pane, row, took } = rowForAct(target);
+  const messages = row ? rowMessages(row) : [];
+  if (!pane || !row || messages.length === 0) return took;
+  const rows = paneRows(pane);
+  const at = rows.indexOf(row);
+  const next = unreadAfter(rows, at);
+  guardQuietly(() => markReadThroughHere(row, String(messages[messages.length - 1].id)))();
+  landAfterDone(pane, next && next.getAttribute("data-id"), idsOf(row)[0], at);
+  return true;
+}
+
+/**
+ * Enter and o: what a tap on the selected message does (fold or unfold it, or in Read read it aloud:
+ * `actOnRow`) and, on the line of a collapsed run of read messages, open the run. Enter on a button
+ * or a link inside a row is that control's own press, and is left to it.
+ */
+function openFromKeyboard(event, target) {
+  if (event.key === "Enter" && answersEnter(target)) return false;
+  const { pane, row, took } = rowForAct(target, true);
+  if (!pane || !row) return took;
+  if (row.getAttribute("data-read-run") === "head") {
+    openReadRun(row);
+    selectRow(pane, row, false);
+    return true;
+  }
+  actOnRow(row, childByClass(row, "fold"));
+  return true;
+}
+
+/** Press one of the selected row's own buttons, found by its class: the act a click there performs. */
+function pressRowButton(target, className) {
+  const { row, took } = rowForAct(target);
+  const button = row ? childByClass(row, className) : null;
+  if (!button) return took ? "took" : null;
+  button.click();
+  return button;
+}
+
+/** →: into the selected message's thread, by its own thread tag (question 3). */
+function threadFromKeyboard(target) {
+  const { row, took } = rowForAct(target);
+  const badge = row ? childByClass(row, "thread-badge") : null;
+  if (!badge || badge.hidden) return took;
+  badge.click();
+  // The rows the focus was on have been replaced by the rows of the thread.
+  settleFocus();
+  return true;
+}
+
+/** Back out of a thread to the view it was opened from, the focus on the list. */
+function leaveThread() {
+  // Its drawing is done before its first wait: the focus can be settled on what it drew.
+  guardQuietly(closeThread)();
+  settleFocus();
+}
+
+/** ←: out of a thread. Elsewhere it is nobody's. */
+function threadOutFromKeyboard() {
+  if (currentScreen !== "main" || currentView !== "discord" || channelView !== "thread") return false;
+  leaveThread();
+  return true;
+}
+
+/** r: reply to the selected message, on the Reply screen with its box ready to type in. */
+function replyFromKeyboard(target) {
+  const pressed = pressRowButton(target, "reply-button");
+  if (pressed === null) return false;
+  if (pressed !== "took" && currentScreen === "reply") el("reply-text").focus();
+  return true;
+}
+
+/** .: the ⋯ menu of the selected message, the focus on its first item; ↓ and ↑ move through it. */
+function menuFromKeyboard(target) {
+  const pressed = pressRowButton(target, "row-more-button");
+  if (pressed === null) return false;
+  if (pressed === "took") return true;
+  const [first] = menuItems();
+  if (first) first.focus();
+  return true;
+}
+
+/** s: read the selected message aloud, or stop it: the act of a tap in Read. */
+function readFromKeyboard(target) {
+  const { row, took } = rowForAct(target);
+  if (!row) return took;
+  guardQuietly(() => readAloud(idsOf(row)))();
+  return true;
+}
+
+/** i: the details sheet a press-and-hold opens (author, time and id) on the selected message. */
+function detailsFromKeyboard(target) {
+  const { row, took } = rowForAct(target);
+  if (!row) return took;
+  toggleMessageDetails(row, rowMessages(row));
+  return true;
+}
+
+/** The text the reader has selected on the page, or "". */
+function selectedText() {
+  return typeof getSelection === "function" ? String(getSelection() || "") : "";
+}
+
+/**
+ * Ctrl+C (Cmd+C) on a message the keyboard has selected, with no text selected: its text, as Copy
+ * text in the ⋯ menu gives it. With text selected, or the focus anywhere else, the copy of the browser.
+ */
+function copyFromKeyboard(target) {
+  const pane = paneFor(target);
+  const row = pane ? rowOf(pane, target) : null;
+  if (!row || selectedText() !== "") return false;
+  guardQuietly(() => copyMessageText(combinedContent(rowMessages(row))))();
+  return true;
+}
+
+// --- views, filters and channels
+
+/** Whether the list of the channel is the one on screen: where the keys about messages and views apply. */
+const channelOnScreen = () => currentScreen === "main" && currentView === "discord";
+
+/** 1, 2 and 3: Main, the Threads screen, and All (question 12). */
+function viewFromKeyboard(event) {
+  if (!channelOnScreen()) return false;
+  const key = event.key;
+  if (key === "1") {
+    if (channelView !== "main" || pinnedOnly) guardQuietly(() => changeChannelView("main"))();
+  } else if (!threadingSupported) {
+    setStatus("No threads here: Main is all of it.");
+    return true;
+  } else if (key === "2") {
+    guardQuietly(openThreadDirectory)();
+  } else if (channelView !== "flat" || pinnedOnly) {
+    guardQuietly(() => changeChannelView("flat"))();
+  }
+  settleFocus();
+  return true;
+}
+
+/** h: the cycle of the Hide read button: Show read, Collapse read, Hide read. */
+function readModeFromKeyboard() {
+  if (!channelOnScreen() || el("todo-filter").hidden) return false;
+  cycleReadMode();
+  return true;
+}
+
+/**
+ * Shift+P and Shift+L: the Pinned and Links filters, which live in the search bar. So the bar opens
+ * with them, as a filter in force must be on screen (`setSearchOpen`), and the focus goes back to the
+ * list, where the reader is going to read what is left.
+ */
+function filterFromKeyboard(which) {
+  if (!channelOnScreen()) return false;
+  if (!searchOpen) setSearchOpen(true);
+  if (which === "pinned") setPinnedOnly(!pinnedOnly);
+  else setLinksOnly(!linksOnly);
+  focusList(channelPane);
+  return true;
+}
+
+/** ; and :: Expand all and Collapse all, over the list on screen. */
+function foldAllFromKeyboard(folded) {
+  if (!channelOnScreen()) return false;
+  setAllFolded(folded);
+  return true;
+}
+
+/** m: back to My place, and that message selected. */
+function markerFromKeyboard() {
+  if (!channelOnScreen() || placeMarker === null) return false;
+  jumpToMarker();
+  const row = paneRowFor(channelPane, placeMarker);
+  if (row) selectRow(channelPane, row);
+  return true;
+}
+
+/** z: undo the last Done, as the Undo chip does. */
+function undoFromKeyboard() {
+  if (!channelOnScreen()) return false;
+  if (lastDismissal === null) setStatus("Nothing to undo.");
+  else guardQuietly(undoDismissal)();
+  return true;
+}
+
+/** c: the box to write in: the channel's (a thread's, in a thread), or the reply's on Reply. */
+function composeFromKeyboard() {
+  if (currentScreen === "reply") {
+    el("reply-text").focus();
+    return true;
+  }
+  const box = el("channel-compose-text");
+  if (!channelOnScreen() || !shownNode(box)) return false;
+  // Not `preventScroll`: the box is at the foot of the list, and writing in it is going there.
+  box.focus();
+  return true;
+}
+
+/** ↑ in the box of the channel while it is empty: the newest message selected, as a preference of Slack has it. */
+function newestFromComposer(target) {
+  if (!target || target.id !== "channel-compose-text" || String(target.value || "") !== "") return false;
+  const rows = paneRows(channelPane);
+  if (rows.length === 0) return false;
+  selectRow(channelPane, rows[rows.length - 1]);
+  return true;
+}
+
+/** Alt+↓ and Alt+↑ (Option on a Mac): the next or previous channel, in the order of the picker. */
+function stepChannel(event) {
+  if (!channelOnScreen()) return false;
+  const picker = el("discord-channel");
+  if (picker.hidden || picker.disabled) return false;
+  const at = knownChannels.findIndex((channel) => String(channel.id) === String(picker.value));
+  const next = at < 0 ? null : knownChannels[at + (event.key === "ArrowDown" ? 1 : -1)];
+  // At either end the list stops, rather than wrapping round to a channel at the other end.
+  if (!next) return true;
+  picker.value = String(next.id);
+  guardQuietly(changeSelectedChannel)();
+  settleFocus();
+  return true;
+}
+
+/** Ctrl+K (Cmd+K): the channel picker, open (question 11). */
+function pickChannel() {
+  if (!channelOnScreen()) return false;
+  const picker = el("discord-channel");
+  if (picker.hidden || picker.disabled) return false;
+  picker.focus();
+  if (typeof picker.showPicker === "function") {
+    try {
+      picker.showPicker();
+    } catch (_error) {
+      // A browser that will not open it from a key still has it focused: Space or Alt+↓ opens it.
+    }
+  }
+  return true;
+}
+
+// --- search, Settings, help and Escape
 
 /**
  * "/" and Ctrl+S (Cmd+S): the search, with its field ready to type in. Settings and Help are left
@@ -3658,25 +4331,81 @@ function settingsFromKeyboard() {
   return false;
 }
 
+/** Where Back on Help goes: Settings, which is where Help is opened from, unless `?` opened it. */
+let helpReturn = "settings";
+
+/** Leave Help: back to Settings, or to wherever `?` was pressed. */
+function closeHelp() {
+  const to = helpReturn;
+  helpReturn = "settings";
+  showScreen(to);
+}
+
+/**
+ * "?" and Ctrl+/ (Cmd+/): the list of every key, the Keyboard entry of the Help screen, and Escape
+ * back to where it was pressed with the place of the reader kept. From the screens the gear reaches.
+ */
+function keysFromKeyboard() {
+  if (currentScreen !== "help") {
+    if (!["main", "signin", "settings"].includes(currentScreen)) return false;
+    helpReturn = currentScreen;
+  }
+  showHelp("keyboard");
+  return true;
+}
+
 /** Where Back goes from the screen that is up, taken; false when there is no Back to take. */
 function goBack() {
   if (currentScreen === "settings") closeSettings();
-  else if (currentScreen === "help") showScreen("settings");
+  else if (currentScreen === "help") closeHelp();
+  else if (currentScreen === "reply") closeReply();
+  else if (currentScreen === "threads") closeThreadDirectory();
+  else if (channelOnScreen() && channelView === "thread") leaveThread();
   else return false;
   return true;
 }
 
+/** Close the details sheet on the message the keys act on. Returns whether one was open. */
+function closeDetailsOn(target) {
+  const { pane, row } = keyContext(target);
+  const sheet = row ? childByClass(row, "msg-details") : null;
+  if (!pane || !row || !sheet) return false;
+  const inside = nodeWithin(sheet, document.activeElement);
+  row.removeChild(sheet);
+  if (inside) selectRow(pane, row, false);
+  return true;
+}
+
 /**
- * What Escape does: the first that applies of the proposal's section 5.2. An open ⋯ menu closes;
- * then the search; then Back, out of Settings or Help. Returns whether it did anything. With none of
- * those it does nothing: in particular it marks nothing read, which is the proposal's answer to the
- * clients whose Escape does.
+ * What Escape does: the first that applies of the proposal's section 5.2. An open ⋯ menu, the pace
+ * popover, the prompts tray, or a details sheet closes; then the search; then a message box with text
+ * in it is left, the draft kept and the focus back on the list (question 4), while an empty one goes
+ * Back at once, there being nothing to keep; then Back: out of Settings, Help, Reply or the Threads
+ * screen, or out of a thread. Returns whether it did anything. With none of those it does nothing:
+ * in particular it marks nothing read, which is the proposal's answer to the clients whose Escape does.
  */
-function onEscape(event) {
+function onEscape(event, target) {
   if (closeRowMenuOnEscape(event)) return true;
+  if (!el("speed-popover").hidden) {
+    closeSpeedPopover();
+    el("read-speed").focus();
+    return true;
+  }
+  if (promptsOpen) {
+    setPromptsOpen(false);
+    el("prompts-open").focus();
+    return true;
+  }
+  if (closeDetailsOn(target)) return true;
   if (searchOpen && currentScreen === "main") {
     setSearchOpen(false);
     settleFocus();
+    return true;
+  }
+  if (isComposer(target) && shownNode(target)) {
+    if (String(target.value || "") === "" && goBack()) return true;
+    if (currentScreen === "reply") el("reply-scroll").focus({ preventScroll: true });
+    else focusList(paneFor(target));
     return true;
   }
   return goBack();
@@ -3694,7 +4423,7 @@ function isLetterKey(event, letter) {
   return event.code === `Key${letter.toUpperCase()}`;
 }
 
-/** Whether Ctrl or Cmd is held: every chord takes either, on every platform. */
+/** Whether Ctrl or Cmd is held: every chord takes either, on every platform (see `modKeyName`). */
 const modHeld = (event) => Boolean(event.ctrlKey || event.metaKey);
 
 // --- the keymap
@@ -3718,48 +4447,224 @@ const modHeld = (event) => Boolean(event.ctrlKey || event.metaKey);
  *   of a message box (`onComposerKey`), rather than by `run`: listed so the list is whole.
  * @property {boolean} [repeats] A held key repeats it. Only the keys that move.
  * @property {boolean} [inField] Fires in a text field too, where `run` decides for itself.
+ * @property {string[]} [controls] Ids of the buttons of the page this key presses, for `aria-keyshortcuts`.
+ * @property {string[]} [rowControls] Classes of the buttons of a row this key presses, the same.
  * @property {(event: KeyboardEvent, target: HTMLElement) => boolean} [run] Do it; whether it did.
  */
 
 const KEYS_PAGE = "Scrolling, search and Settings";
+const KEYS_MOVING = "Moving through the messages";
+const KEYS_MESSAGE = "The selected message";
+const KEYS_VIEW = "Views and filters";
+const KEYS_WRITING = "Writing";
 
 /**
  * Every key the page answers, in the order the list of keys shows them. The first binding whose chord
- * matches and may fire there, and that does something, takes the key; one that does nothing leaves it
- * to the next, and at the end to the browser.
+ * matches and may fire there, and that does something, takes the key; one that does nothing (→ on a
+ * message with no thread) leaves it to the next, and at the end to the browser.
  *
  * @type {KeyBinding[]}
  */
 const KEYMAP = [
   {
     group: KEYS_PAGE, chords: [{ key: "Escape" }],
-    does: "Back: closes a menu or the search, leaves Settings or Help",
-    run: (event) => onEscape(event),
+    does: "Back: closes a menu, the search or a sheet, leaves Settings, Help, Reply, Threads or a thread. " +
+      "In a message box with text in it, leaves the box first and keeps the draft",
+    controls: ["close-settings", "close-reply", "close-help", "close-threads", "thread-back"],
+    run: (event, target) => onEscape(event, target),
   },
   {
     group: KEYS_PAGE, by: "browser",
     chords: [{ key: "PageUp" }, { key: "PageDown" }, { key: " " }, { key: " ", shift: true }],
-    does: "Scroll a screenful, up or down. In a message box, PgUp and PgDn scroll the list beside it",
+    does: "Scroll a screenful, up or down; the selected message follows. In a message box, PgUp and PgDn " +
+      "scroll the list beside it",
   },
   {
-    group: KEYS_PAGE, by: "browser", chords: [{ key: "Home" }, { key: "End" }],
-    does: "The top of the list, or its newest message",
+    group: KEYS_PAGE, chords: [{ key: "Home" }, { key: "End" }],
+    does: "The top of the list or its newest message, and select it",
+    run: (event, target) => listEdge(target, event.key === "End"),
   },
   {
     group: KEYS_PAGE, chords: [{ key: "Home", mod: true }, { key: "End", mod: true }],
-    does: "The same from anywhere, a message box included",
+    does: "The top or the newest from anywhere, a message box included",
     run: (event, target) => jumpList(target, event.key === "End"),
   },
   {
     group: KEYS_PAGE, chords: [{ key: "/" }, { key: "s", mod: true }],
     does: "Search the messages; pressed again, back to what you typed",
+    controls: ["search-toggle"],
     // The chord is the Save page of the browser as well, which must never open over this one.
     run: (event) => searchFromKeyboard() || modHeld(event),
   },
   {
     group: KEYS_PAGE, chords: [{ key: "," }, { key: ",", mod: true }],
     does: "Settings, and again (or Esc) back to where you were. Settings keep themselves as they change",
+    controls: ["open-settings"],
     run: (event) => settingsFromKeyboard() || modHeld(event),
+  },
+  {
+    group: KEYS_PAGE, chords: [{ key: "?" }, { key: "/", mod: true }],
+    does: "This list of keys",
+    controls: ["help-link-keyboard"],
+    run: () => keysFromKeyboard(),
+  },
+  {
+    group: KEYS_MOVING, chords: [{ key: "ArrowDown" }, { key: "j" }], repeats: true,
+    does: "The next message. One taller than the screen is scrolled through first",
+    run: (event, target) => stepFromKeyboard(target, 1),
+  },
+  {
+    group: KEYS_MOVING, chords: [{ key: "ArrowUp" }, { key: "k" }], repeats: true,
+    does: "The previous message",
+    run: (event, target) => stepFromKeyboard(target, -1),
+  },
+  {
+    group: KEYS_MOVING, chords: [{ key: "n" }], repeats: true,
+    does: "The next unread message below",
+    run: (event, target) => nextUnreadFromKeyboard(target),
+  },
+  {
+    group: KEYS_MOVING, chords: [{ key: "Enter" }, { key: "o" }],
+    does: "Open or close the selected message, as a tap does (in Read, read it aloud). On a “… read messages …” line, open the run",
+    rowControls: ["fold"],
+    run: (event, target) => openFromKeyboard(event, target),
+  },
+  {
+    group: KEYS_MOVING, chords: [{ key: "ArrowRight" }],
+    does: "Into the thread of the selected message",
+    rowControls: ["thread-badge"],
+    run: (event, target) => threadFromKeyboard(target),
+  },
+  {
+    group: KEYS_MOVING, chords: [{ key: "ArrowLeft" }],
+    does: "Out of a thread, back where you came from",
+    controls: ["thread-back"],
+    run: () => threadOutFromKeyboard(),
+  },
+  {
+    group: KEYS_MOVING, chords: [{ key: "ArrowDown", alt: true }, { key: "ArrowUp", alt: true }],
+    does: "The next or previous channel",
+    controls: ["discord-channel"],
+    run: (event) => stepChannel(event),
+  },
+  {
+    group: KEYS_MOVING, chords: [{ key: "k", mod: true }],
+    does: "Choose a channel",
+    controls: ["discord-channel"],
+    run: () => pickChannel(),
+  },
+  {
+    group: KEYS_MOVING, chords: [{ key: "1" }, { key: "2" }, { key: "3" }],
+    does: "Main, Threads or All",
+    controls: ["thread-select"],
+    run: (event) => viewFromKeyboard(event),
+  },
+  {
+    group: KEYS_MOVING, chords: [{ key: "m" }],
+    does: "Back to My place",
+    controls: ["jump-marker"],
+    run: () => markerFromKeyboard(),
+  },
+  {
+    group: KEYS_MESSAGE, chords: [{ key: "e" }],
+    does: "Done, or not Done. Marked Done, on to the next unread below",
+    rowControls: ["done-button"],
+    run: (event, target) => doneFromKeyboard(target),
+  },
+  {
+    group: KEYS_MESSAGE, chords: [{ key: "e", shift: true }],
+    does: "Done through here: this message and every one above it",
+    rowControls: ["row-read-through-button"],
+    run: (event, target) => throughHereFromKeyboard(target),
+  },
+  {
+    group: KEYS_MESSAGE, chords: [{ key: "z" }],
+    does: "Undo the last Done",
+    controls: ["undo-dismiss"],
+    run: () => undoFromKeyboard(),
+  },
+  {
+    group: KEYS_MESSAGE, chords: [{ key: "r" }],
+    does: "Reply",
+    rowControls: ["reply-button"],
+    run: (event, target) => replyFromKeyboard(target),
+  },
+  {
+    group: KEYS_MESSAGE, chords: [{ key: "p" }],
+    does: "Pin or unpin",
+    rowControls: ["row-pin-button"],
+    run: (event, target) => pressRowButton(target, "row-pin-button") !== null,
+  },
+  {
+    group: KEYS_MESSAGE, chords: [{ key: "s" }],
+    does: "Read it aloud, or stop",
+    run: (event, target) => readFromKeyboard(target),
+  },
+  {
+    group: KEYS_MESSAGE, chords: [{ key: "." }],
+    does: "Its ⋯ menu; ↑ and ↓ move through it",
+    rowControls: ["row-more-button"],
+    run: (event, target) => menuFromKeyboard(target),
+  },
+  {
+    group: KEYS_MESSAGE, chords: [{ key: "i" }],
+    does: "Who wrote it, when, and its id",
+    run: (event, target) => detailsFromKeyboard(target),
+  },
+  {
+    group: KEYS_MESSAGE, chords: [{ key: "c", mod: true }],
+    does: "Copy its text, when no text is selected",
+    rowControls: ["row-copy-button"],
+    run: (event, target) => !isTextField(target) && copyFromKeyboard(target),
+  },
+  {
+    group: KEYS_VIEW, chords: [{ key: "h" }],
+    does: "Show read, Collapse read, Hide read, in turn",
+    controls: ["todo-filter"],
+    run: () => readModeFromKeyboard(),
+  },
+  {
+    group: KEYS_VIEW, chords: [{ key: "p", shift: true }],
+    does: "Only the pinned messages, or all of them again",
+    controls: ["pinned-filter"],
+    run: () => filterFromKeyboard("pinned"),
+  },
+  {
+    group: KEYS_VIEW, chords: [{ key: "l", shift: true }],
+    does: "Only the links, or the messages again",
+    controls: ["links-filter"],
+    run: () => filterFromKeyboard("links"),
+  },
+  {
+    group: KEYS_VIEW, chords: [{ key: ";" }],
+    does: "Expand all",
+    controls: ["expand-all"],
+    run: () => foldAllFromKeyboard(false),
+  },
+  {
+    group: KEYS_VIEW, chords: [{ key: ":" }],
+    does: "Collapse all",
+    controls: ["collapse-all"],
+    run: () => foldAllFromKeyboard(true),
+  },
+  {
+    group: KEYS_WRITING, chords: [{ key: "c" }],
+    does: "Write to the channel, or in the thread you are in; on Reply, the reply",
+    controls: ["channel-compose-text"],
+    run: () => composeFromKeyboard(),
+  },
+  {
+    group: KEYS_WRITING, by: "box", chords: [{ key: "Enter" }, { key: "Enter", shift: true }],
+    does: "In a message box: send, or a new line. Which is which is Enter to send in Settings",
+  },
+  {
+    group: KEYS_WRITING, by: "box", chords: [{ key: "Enter", mod: true }],
+    does: "In a message box: send, whatever Enter does",
+  },
+  {
+    group: KEYS_WRITING, chords: [{ key: "ArrowUp" }], inField: true,
+    does: "In the box of the channel while it is empty: the newest message",
+    run: (event, target) => newestFromComposer(target),
   },
 ];
 
@@ -3774,11 +4679,37 @@ function chordMatches(chord, event) {
   return key === chord.key && Boolean(chord.shift) === Boolean(event.shiftKey);
 }
 
-/** A chord of one key that types a character: what never fires in a field. */
+/** A chord of one key that types a character: what the Settings switch turns off, and what never fires in a field. */
 const typesCharacter = (chord) => !chord.mod && !chord.alt && chord.key.length === 1 && chord.key !== " ";
+
+/** Whether the single-key shortcuts are on. ON unless the reader turned them off: see `storedSingleKeys`. */
+let singleKeys = true;
+
+const SINGLE_KEYS_KEY = "vibe-talk.voice.single-keys";
+
+/** What was stored. ABSENT MEANS ON, as for Enter to send: the default is the behaviour. */
+function storedSingleKeys() {
+  try {
+    return localStorage.getItem(SINGLE_KEYS_KEY) !== "0";
+  } catch (_error) {
+    return true;
+  }
+}
+
+/** Turn the single-key shortcuts on or off, keep the choice, and say the keys as they now are. */
+function applySingleKeys(on) {
+  singleKeys = Boolean(on);
+  try {
+    localStorage.setItem(SINGLE_KEYS_KEY, singleKeys ? "1" : "0");
+  } catch (_error) {
+    // A browser that refuses storage still honours the choice for this session.
+  }
+  renderKeyHints();
+}
 
 /** Whether `chord` of `binding` may fire with the focus on `target`. See the rules at the top of this section. */
 function chordAllowed(binding, chord, target) {
+  if (typesCharacter(chord) && !singleKeys) return false;
   if (chord.mod || chord.key === "Escape" || binding.inField) return true;
   return !isTextField(target) && !keepsOwnKeys(target);
 }
@@ -3803,6 +4734,126 @@ function onPageKey(event) {
     }
   }
   routeScrollKey(event, target);
+}
+
+// --- saying the keys
+
+/** Whether this keyboard says Cmd and Option, as an Apple one does. See `modKeyName`. */
+const appleKeyboard = () => modKeyName() === "Cmd";
+
+/** The names this list gives the named keys. */
+const KEY_WORDS = {
+  Escape: "Esc", " ": "Space", PageUp: "PgUp", PageDown: "PgDn", ArrowDown: "↓", ArrowUp: "↑",
+  ArrowLeft: "←", ArrowRight: "→",
+};
+
+/** One chord, in the words on the keyboard of the reader: "Ctrl+S" or "Cmd+S", "Option+↓", "Shift+E", "j". */
+function chordWords(chord) {
+  const parts = [];
+  if (chord.mod) parts.push(modKeyName());
+  if (chord.alt) parts.push(appleKeyboard() ? "Option" : "Alt");
+  if (chord.shift) parts.push("Shift");
+  const letter = /^[a-z]$/.test(chord.key);
+  parts.push(KEY_WORDS[chord.key] || (letter && (chord.shift || chord.mod) ? chord.key.toUpperCase() : chord.key));
+  return parts.join("+");
+}
+
+/** The chords of a binding, said: "↓ or j", "1, 2, 3". `live` leaves out what the switch has turned off. */
+function bindingWords(binding, live = false) {
+  const words = binding.chords.filter((chord) => !live || singleKeys || !typesCharacter(chord)).map(chordWords);
+  return words.length === 2 ? words.join(" or ") : words.join(", ");
+}
+
+/** One chord as `aria-keyshortcuts` names it: "Control+S Meta+S" for a chord, as either key works. */
+function chordShortcuts(chord) {
+  const tail = [];
+  if (chord.alt) tail.push("Alt");
+  if (chord.shift) tail.push("Shift");
+  tail.push(chord.key === " " ? "Space" : /^[a-z]$/.test(chord.key) ? chord.key.toUpperCase() : chord.key);
+  const said = tail.join("+");
+  return chord.mod ? [`Control+${said}`, `Meta+${said}`] : [said];
+}
+
+/** For each control a key presses, the keys that press it now: id (or the class of a row button) to the attribute value. */
+function controlShortcuts(field) {
+  /** @type {Map<string, string[]>} */
+  const out = new Map();
+  for (const binding of KEYMAP) {
+    for (const name of binding[field] || []) {
+      const said = binding.chords.filter((chord) => singleKeys || !typesCharacter(chord)).flatMap(chordShortcuts);
+      out.set(name, [...(out.get(name) || []), ...said]);
+    }
+  }
+  return out;
+}
+
+/** The `aria-keyshortcuts` of each row button as `renderKeyHints` last said them, by class, for the rows drawn after it. */
+let rowShortcuts = new Map();
+
+/** Give a row button its `aria-keyshortcuts`, or take them away when its key is turned off. */
+function sayRowShortcut(button, className) {
+  const said = (rowShortcuts.get(className) || []).join(" ");
+  if (said) button.setAttribute("aria-keyshortcuts", said);
+  else button.removeAttribute("aria-keyshortcuts");
+}
+
+/**
+ * Say the keys where a reader looks for them, from `KEYMAP` and in the words on their own keyboard:
+ * the list of every key on the Keyboard entry of the Help screen; the switch in Settings and the line
+ * under it; the `aria-keyshortcuts` of each button, which is what a screen reader reads, on the page
+ * and on every row; and the tooltips of the glass, the gear and the Back buttons.
+ */
+function renderKeyHints() {
+  const mod = modKeyName();
+  el("single-keys").checked = singleKeys;
+  el("single-keys-hint").textContent = singleKeys
+    ? "Keys such as j, k, e and / act on the messages. Press ? for the list."
+    : `Off: Esc, the arrows, Enter and the ${mod} chords still work. ${mod}+/ lists them.`;
+  for (const [id, said] of controlShortcuts("controls")) {
+    if (said.length) el(id).setAttribute("aria-keyshortcuts", said.join(" "));
+    else el(id).removeAttribute("aria-keyshortcuts");
+  }
+  rowShortcuts = controlShortcuts("rowControls");
+  for (const list of ["discord-log", "pinned-log"]) {
+    for (const row of /** @type {HTMLElement[]} */ ([...el(list).children])) {
+      for (const className of rowShortcuts.keys()) {
+        const button = childByClass(row, className);
+        if (button) sayRowShortcut(button, className);
+      }
+    }
+  }
+  const binding = (id) => KEYMAP.find((one) => (one.controls || []).includes(id));
+  el("search-toggle").setAttribute("title", `Search messages (${bindingWords(binding("search-toggle"), true)})`);
+  el("open-settings").setAttribute("title", `Settings (${bindingWords(binding("open-settings"), true)})`);
+  for (const id of ["close-settings", "close-reply", "close-help", "close-threads"]) {
+    el(id).setAttribute("title", "Back (Esc)");
+  }
+  const groups = [];
+  if (!singleKeys) {
+    const off = document.createElement("p");
+    off.className = "hint";
+    off.textContent = `Single-key shortcuts are off in Settings: only Esc, the arrows, Enter, PgUp, PgDn, Home, End ` +
+      `and the ${mod} and ${appleKeyboard() ? "Option" : "Alt"} chords act.`;
+    groups.push(off);
+  }
+  for (const group of [KEYS_PAGE, KEYS_MOVING, KEYS_MESSAGE, KEYS_VIEW, KEYS_WRITING]) {
+    const heading = document.createElement("h3");
+    heading.className = "key-group";
+    heading.textContent = group;
+    const list = document.createElement("ul");
+    list.className = "key-list";
+    for (const one of KEYMAP.filter((entry) => entry.group === group)) {
+      const row = document.createElement("li");
+      const keys = document.createElement("kbd");
+      keys.textContent = bindingWords(one);
+      const meaning = document.createElement("span");
+      meaning.textContent = one.does;
+      row.append(keys, meaning);
+      list.append(row);
+    }
+    groups.push(heading, list);
+  }
+  el("keyboard-keys").replaceChildren(...groups);
 }
 
 // --- the canned prompts -------------------------------------------------------------------------
@@ -9860,6 +10911,8 @@ function addThreadDecoration(meta, message, row, everyThread = false) {
   badge.textContent = replies ? `Thread(${replies})` : "Thread";
   if (replies) badge.setAttribute("aria-label", `Open this thread, ${threadCount(replies, true)}`);
   badge.addEventListener("click", () => guardQuietly(() => openThread(id))());
+  // `#224 keyboard-shortcuts`. → on the selected message presses it.
+  sayRowShortcut(badge, "thread-badge");
   meta.append(badge);
   if (message.thread.is_root) {
     // A thread with no replies gets no chip at all — "0 replies" offered to gather nothing.
@@ -15424,22 +16477,30 @@ function tapRow(li, fold) {
     if (selection && String(selection) !== "") {
       return;
     }
-    // IN READING MODE A TAP IS A REQUEST TO HEAR IT, not to fold it. One gesture, two meanings,
-    // decided by a mode the reader turned on deliberately and can see in the control bar.
-    if (readingMode) {
-      // EVERY message the row is showing, so a combined row is heard whole rather than half.
-      guardQuietly(() => readAloud(idsOf(li)))();
-      return;
-    }
-    // A SHORT message has no fold control, and that is fine: it is already whole. The handler is
-    // still attached to every row, because reading mode has to reach a short message too — gating
-    // this on foldability made the shortest messages the only ones that could not be read aloud.
-    // Nor while the row shows its links in place of its text (`#211 link-filter`): the text is not
-    // on screen to be folded, and a fold changed out of sight would surprise the reader later.
-    if (fold && !showingLinks(li)) {
-      fold.click();
-    }
+    actOnRow(li, fold);
   });
+}
+
+/**
+ * What a tap that is meant for the row does to it. `#224 keyboard-shortcuts`: and Enter, or o, on the
+ * selected message: the same act, so the key and the tap cannot become two opinions about a row.
+ */
+function actOnRow(li, fold) {
+  // IN READING MODE A TAP IS A REQUEST TO HEAR IT, not to fold it. One gesture, two meanings,
+  // decided by a mode the reader turned on deliberately and can see in the control bar.
+  if (readingMode) {
+    // EVERY message the row is showing, so a combined row is heard whole rather than half.
+    guardQuietly(() => readAloud(idsOf(li)))();
+    return;
+  }
+  // A SHORT message has no fold control, and that is fine: it is already whole. The handler is
+  // still attached to every row, because reading mode has to reach a short message too — gating
+  // this on foldability made the shortest messages the only ones that could not be read aloud.
+  // Nor while the row shows its links in place of its text (`#211 link-filter`): the text is not
+  // on screen to be folded, and a fold changed out of sight would surprise the reader later.
+  if (fold && !showingLinks(li)) {
+    fold.click();
+  }
 }
 
 const SWIPE_START_PX = 12;
@@ -16021,7 +17082,10 @@ function discordNode(messages) {
   // into the one piece of writing they were before Discord's length limit cut them up; summarising
   // the primary alone would describe the half that stops mid-sentence, and the tail alone is the
   // least summarisable text in the channel.
-  tapRow(li, foldable(li, meta, body, text, String(message.id), messages.slice(1).map((m) => String(m.id))));
+  const fold = foldable(li, meta, body, text, String(message.id), messages.slice(1).map((m) => String(m.id)));
+  tapRow(li, fold);
+  // `#224 keyboard-shortcuts`. Each of the row's buttons that has a key says so, to a screen reader.
+  if (fold) sayRowShortcut(fold, "fold");
   // `#219 emoji-reactions`. Moved below the summary `foldable` may have added, which can stand in
   // for the text: the reactions belong to the message, whichever of the two is showing.
   if (reactions) li.append(reactions);
@@ -16044,6 +17108,7 @@ function discordNode(messages) {
   // THE ANSWER GOES TO THE FIRST CONSTITUENT. A glommed row is a primary message with a tail
   // hanging off it, and threading a reply under the tail would put the answer under a fragment.
   reply.addEventListener("click", () => openReply(messages));
+  sayRowShortcut(reply, "reply-button");
   meta.append(reply);
   // `#228 reply-visible`. Held on the row, as its messages are, so that the pass which says how many
   // replies each row has (`renderReplyCounts`) finds the button without walking the row's text.
@@ -16106,6 +17171,7 @@ function discordNode(messages) {
   };
   const closeMenu = () => setMenu(false);
   moreButton.addEventListener("click", () => setMenu(menu.hidden));
+  sayRowShortcut(moreButton, "row-more-button");
   upstreamRead.addEventListener("click", () => {
     setMenu(false);
     guardQuietly(() => markReadUpstream(String(upstreamBoundary.id)))();
@@ -16118,6 +17184,7 @@ function discordNode(messages) {
   copy.setAttribute("type", "button");
   copy.setAttribute("title", "Copy this message's text to the clipboard");
   copy.textContent = "Copy text";
+  sayRowShortcut(copy, "row-copy-button");
   copy.addEventListener("click", () => {
     setMenu(false);
     guardQuietly(() => copyMessageText(content))();
@@ -16139,6 +17206,7 @@ function discordNode(messages) {
     "Mark this message and every message above it in this list as Done here" +
       (upstreamReadMarkSupported ? `, and move ${service}'s own read marker for the whole space.` : ".")
   );
+  sayRowShortcut(readThrough, "row-read-through-button");
   readThrough.addEventListener("click", () => {
     setMenu(false);
     guardQuietly(() => markReadThroughHere(li, String(upstreamBoundary.id)))();
@@ -16155,6 +17223,7 @@ function discordNode(messages) {
       `the search glass. ${service}'s own pinned messages are not changed.`
   );
   pinItem.textContent = messages.some((m) => isPinnedId(m.id)) ? "Unpin message" : "Pin message";
+  sayRowShortcut(pinItem, "row-pin-button");
   pinItem.addEventListener("click", () => {
     setMenu(false);
     guardQuietly(() => togglePin(messages))();
@@ -16196,6 +17265,7 @@ function discordNode(messages) {
   // queue is the failure mode a display-layer grouping has to be built against.
   const ids = messages.map((m) => String(m.id));
   done.addEventListener("click", () => guardQuietly(() => toggleArchived(ids))());
+  sayRowShortcut(done, "done-button");
   // `#196 auto-read-noise`. The rescue for a rule that caught a message by mistake: ONE message,
   // recorded on the server, leaving the rule to go on catching the placeholders it is right about.
   // On every row and shown only on a noise row by `renderChannelRows`, for the reason Done is on
@@ -21528,8 +22598,16 @@ el("width-grip").addEventListener("keydown", onGripKey);
 // something is broken.
 document.addEventListener("visibilitychange", onVisibility);
 document.addEventListener("pointerdown", closeRowMenuOutside);
-// `#224 keyboard-shortcuts`. Every key the page answers, in one place: see `onPageKey`.
+// `#224 keyboard-shortcuts`. Every key the page answers, in one place: see `onPageKey`. The switch
+// for the single-key shortcuts is restored first, so the keys are said as they will act.
 document.addEventListener("keydown", onPageKey);
+singleKeys = storedSingleKeys();
+renderKeyHints();
+el("single-keys").addEventListener("change", () => applySingleKeys(el("single-keys").checked));
+// A click in a list selects its row silently, so that the next key starts there.
+for (const pane of KEY_PANES) {
+  pane.scroller().addEventListener("click", (event) => noteClickedRow(pane, event && event.target));
+}
 // `#189 restore-ui-state`. The last moments a phone promises this page before it may reclaim it —
 // hidden, or being unloaded — are when the reader's place is written down. Hidden comes first on
 // a phone, and is the one an installed app reliably gets before it is killed.
@@ -21702,7 +22780,7 @@ el("close-settings").addEventListener("click", closeSettings);
 // `?` — and this page's suite refuses ids that are not declared in web/voice.html, so a new
 // settings group would mean inventing one there purely to hang a listener on. The attribute names
 // the entry, the entry's id is `help-<that>`, and adding a group is one button plus one article.
-el("close-help").addEventListener("click", () => showScreen("settings"));
+el("close-help").addEventListener("click", closeHelp);
 el("open-help").addEventListener("click", () => showHelp(null));
 for (const topic of HELP_TOPICS) {
   el(`help-link-${topic}`).addEventListener("click", () => showHelp(topic));

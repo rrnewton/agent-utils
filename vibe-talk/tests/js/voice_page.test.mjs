@@ -17201,7 +17201,9 @@ test("A BOX THE READER IS TYPING IN keeps the focus through a sign-in, and throu
 test("THE SCROLL KEYS are the browser's, and reach the list from wherever the focus is", async () => {
   const page = await keyboardPage();
   const area = page.el("scroll-area");
-  const keys = ["PageUp", "PageDown", " ", "Home", "End", "ArrowUp", "ArrowDown"];
+  // Over the channel the arrows and Home/End move the selection (below); the page keys and Space stay
+  // the browser's. In the call's view, further down, every one of them is.
+  const keys = ["PageUp", "PageDown", " "];
   // From nothing — a load, a control that hid itself — and from a control in the dock: the list takes
   // the focus on the way past, and the browser's own default, left alone, scrolls it.
   for (const from of [null, page.el("open-settings"), page.el("view-switch"), page.el("search-toggle")]) {
@@ -17234,6 +17236,22 @@ test("THE SCROLL KEYS are the browser's, and reach the list from wherever the fo
     const event = await press(page, null, "PageDown", fields);
     assert.equal(event.defaulted, true);
     assert.equal(focused(page), null, `${Object.keys(fields)[0]}+PageDown moved the focus`);
+  }
+  // The call's view has no messages to select (the proposal's question 9): every scroll key there is
+  // the browser's, the list taking the focus on the way past.
+  const call = newPage();
+  await startTalking(call);
+  assert.equal(call.tab(), "voice");
+  const transcript = fillTranscript(call, 30);
+  for (const key of ["PageUp", "PageDown", " ", "Home", "End", "ArrowUp", "ArrowDown", "j", "k", "e"]) {
+    const top = transcript.scrollTop;
+    const event = await press(call, null, key);
+    assert.equal(event.defaulted, true, `${JSON.stringify(key)} in the call's view was taken from the browser`);
+    if (key.length > 1 || key === " ") {
+      assert.equal(focused(call), transcript, `${JSON.stringify(key)} in the call's view left the focus on ${focusName(call)}`);
+    }
+    assert.equal(transcript.scrollTop, top, `${JSON.stringify(key)} in the call's view scrolled the list itself`);
+    assert.equal(call.tab(), "voice", `${JSON.stringify(key)} left the call's view`);
   }
 });
 
@@ -17287,9 +17305,9 @@ test("IN A MESSAGE BOX the box keeps its keys, but a page key pages the list whe
     event = await press(page, box, "PageDown");
     assert.equal(event.defaulted, false);
     assert.equal(area.scrollTop, bottom, "PageDown in the box did not page the list back");
-    // The caret's keys, and typing.
-    for (const [key, fields] of [["Home", {}], ["End", {}], [" ", {}], ["ArrowUp", {}], ["PageUp", { shiftKey: true }],
-      ["/", {}], [",", {}]]) {
+    // The caret's keys, and typing. ↑ in the box while it is empty is a key of its own (below).
+    for (const [key, fields] of [["Home", {}], ["End", {}], [" ", {}], ["ArrowDown", {}], ["PageUp", { shiftKey: true }],
+      ["/", {}], [",", {}], ["j", {}], ["e", {}], ["?", {}], ["1", {}], ...(text ? [["ArrowUp", {}]] : [])]) {
       event = await press(page, box, key, fields);
       assert.equal(event.defaulted, true, `${JSON.stringify(key)} was taken from the box`);
       assert.equal(area.scrollTop, bottom, `${JSON.stringify(key)} in the box moved the list`);
@@ -17527,7 +17545,8 @@ test("NO KEY FIRES while an input method composes, from a phone's keyboard, or w
     ["/", { isComposing: true }], [",", { isComposing: true }], ["s", { ctrlKey: true, isComposing: true }],
     // What a phone's on-screen keyboard reports for nearly every key.
     ["Unidentified", { keyCode: 229 }], ["/", { keyCode: 229 }],
-    ["/", { ctrlKey: true }], ["/", { metaKey: true }], [",", { altKey: true }], ["/", { altKey: true }],
+    ["/", { altKey: true }], [",", { altKey: true }], ["j", { ctrlKey: true }], ["e", { metaKey: true }],
+    ["e", { altKey: true }], ["1", { ctrlKey: true }],
     ["PageDown", { isComposing: true }],
   ]) {
     const event = await press(page, area, key, fields);
@@ -17558,6 +17577,622 @@ test("WITH A MENU OPEN Escape closes it first, and gives its button back the foc
   event = await press(page, rowMoreButton(row), "PageUp");
   assert.equal(event.defaulted, true);
   assert.equal(focused(page), rowMoreButton(row));
+});
+
+// --- the keymap (#224 keyboard-shortcuts) ---------------------------------------------------------
+//
+// The proposal's section 4, with the owner's go-ahead and the coordinator's answers to section 6:
+// j/k as well as the arrows; after e, on to the next unread below; ←/→ thread out and in, Enter and o
+// fold; Esc in a box with text leaves the box first; Esc marks nothing read; single keys on by default
+// with a switch; 1/2/3 for Main/Threads/All; Ctrl+K opens the channel picker. THE SELECTION IS THE
+// FOCUS: each test below says where the focus is after a key, because that is the selection.
+
+/** The id of the message the focus is on, or what holds it when that is not a row. */
+const selectedId = (page) => {
+  const held = focused(page);
+  return held && held.getAttribute && held.getAttribute("data-id") !== null ? held.getAttribute("data-id") : focusName(page);
+};
+
+/** Press `key` where the focus is now, as a reader does who has stopped reaching for the mouse. */
+const pressHere = (page, key, fields = {}) => press(page, focused(page), key, fields);
+
+/** A channel at its top, where the first message is the first one showing. */
+async function keyboardPageAtTop(messages = tallChannel(30)) {
+  const page = newPage();
+  await signIn(page);
+  await showDiscord(page, messages);
+  page.el("scroll-area").scrollTop = 0;
+  return page;
+}
+
+test("THE SELECTION IS THE FOCUS: ↓ or j takes the first message showing, then the next; ↑ or k goes back", async () => {
+  const page = await keyboardPageAtTop();
+  const area = page.el("scroll-area");
+  let event = await press(page, area, "ArrowDown");
+  assert.equal(event.defaulted, false, "↓ over the channel was left to the browser");
+  assert.equal(selectedId(page), "1", "the first ↓ did not take the first message showing");
+  const first = channelRow(page, "1");
+  assert.equal(first.getAttribute("tabindex"), "0", "the selected row cannot be come back to with Shift+Tab");
+  assert.equal(first.focusedWith && first.focusedWith.preventScroll, true, "the focus moved the list itself");
+  for (const [key, id] of [["j", "2"], ["ArrowDown", "3"], ["k", "2"], ["ArrowUp", "1"]]) {
+    event = await pressHere(page, key);
+    assert.equal(event.defaulted, false, `${key} was left to the browser`);
+    assert.equal(selectedId(page), id, `${key} selected ${selectedId(page)}, not message ${id}`);
+  }
+  // One row holds the tabindex: the one selected.
+  const tabbed = page.el("discord-log").children.filter((li) => li.getAttribute("tabindex") === "0");
+  assert.deepStrictEqual(tabbed.map((li) => li.getAttribute("data-id")), ["1"], "more than the selected row is a Tab stop");
+  // ↑ past the first scrolls on toward the older history, and the selection stays where it is.
+  event = await pressHere(page, "k");
+  assert.equal(selectedId(page), "1");
+  // A held ↓ repeats; it is one of the keys that move.
+  event = await pressHere(page, "ArrowDown", { repeat: true });
+  assert.equal(selectedId(page), "2", "a held ↓ did not repeat");
+  // Each selected row is brought on screen: twenty more and the list has followed.
+  for (let i = 0; i < 20; i += 1) await pressHere(page, "j");
+  assert.equal(selectedId(page), "22");
+  const box = channelRow(page, "22").getBoundingClientRect();
+  assert.ok(box.top >= 0 && box.bottom <= SCROLL_VIEWPORT_PX, `the selected row is off screen: ${JSON.stringify(box)}`);
+});
+
+test("FROM THE NEWEST LINE, ↑ takes the last message showing; a selection scrolled away starts again from the screen", async () => {
+  const page = await keyboardPage();
+  const area = page.el("scroll-area");
+  await press(page, area, "ArrowUp");
+  assert.equal(selectedId(page), "30", "↑ at the newest line did not take the last message showing");
+  // Scrolled away with the wheel: the next ↓ starts from what is on screen, not from message 30.
+  area.scrollTop = 0;
+  await pressHere(page, "ArrowDown");
+  assert.equal(selectedId(page), "1", `after scrolling to the top, ↓ selected ${selectedId(page)}`);
+});
+
+test("↓ READS THROUGH a message taller than the screen before it moves on (the proposal's question 10)", async () => {
+  const huge = "a line of the agent's long report. ".repeat(320);
+  const page = await keyboardPageAtTop([
+    message({ id: "1", content: SHORT_MESSAGE }),
+    message({ id: "2", content: huge }),
+    message({ id: "3", content: SHORT_MESSAGE }),
+    ...tallChannel(6).map((m, i) => ({ ...m, id: String(10 + i) })),
+  ]);
+  const area = page.el("scroll-area");
+  await press(page, area, "j");
+  await pressHere(page, "j");
+  assert.equal(selectedId(page), "2");
+  await pressHere(page, "Enter");
+  assert.equal(channelRow(page, "2").getAttribute("data-collapsed"), "false", "Enter did not open the long message");
+  assert.ok(channelRow(page, "2").getBoundingClientRect().height > 3 * SCROLL_VIEWPORT_PX, "the message is not taller than the screen");
+  let steps = 0;
+  while (selectedId(page) === "2" && steps < 40) {
+    const before = area.scrollTop;
+    await pressHere(page, "ArrowDown");
+    steps += 1;
+    if (selectedId(page) === "2") {
+      assert.ok(area.scrollTop > before, "↓ on a tall message neither scrolled through it nor moved on");
+      assert.ok(area.scrollTop - before <= SCROLL_VIEWPORT_PX / 2 + 1, "↓ scrolled more than half a screen at once");
+    }
+  }
+  assert.ok(steps > 3, `↓ moved on from a message ${channelRow(page, "2").getBoundingClientRect().height}px tall after ${steps} presses`);
+  assert.equal(selectedId(page), "3", "after reading through it ↓ did not move on to the next message");
+  // And ↑ reads back up through it before it moves on.
+  await pressHere(page, "ArrowUp");
+  assert.equal(selectedId(page), "2");
+  const top = area.scrollTop;
+  await pressHere(page, "ArrowUp");
+  assert.equal(selectedId(page), "2", "↑ left the tall message before reading back up through it");
+  assert.ok(area.scrollTop < top, "↑ on a tall message did not scroll back up through it");
+});
+
+test("THE SELECTION OUTLIVES A REDRAW: the new row takes the focus; a row that goes hands it to the next", async () => {
+  const messages = tallChannel(30);
+  const page = await keyboardPageAtTop(messages);
+  await press(page, page.el("scroll-area"), "ArrowDown");
+  for (let i = 0; i < 9; i += 1) await pressHere(page, "j");
+  assert.equal(selectedId(page), "10");
+  const old = channelRow(page, "10");
+  // A re-read that brings a new message redraws every row.
+  await refreshDiscord(page, [...messages, message({ id: "31", content: "a new message" })]);
+  assert.equal(selectedId(page), "10", `after the redraw the focus is on ${selectedId(page)}`);
+  assert.equal(focused(page).parentNode, page.el("discord-log"), "the focus is on a row no longer in the list");
+  assert.equal(focused(page).getAttribute("tabindex"), "0");
+  if (focused(page) !== old) assert.equal(old.getAttribute("tabindex"), null, "the row that went kept its tabindex");
+  // A redraw while the reader types takes nothing from them.
+  page.el("channel-compose-text").focus();
+  await refreshDiscord(page, [...messages, message({ id: "31", content: "a new message" }), message({ id: "32", content: "and another" })]);
+  assert.equal(focused(page), page.el("channel-compose-text"), "a redraw took the focus out of the message box");
+});
+
+test("e MARKS THE SELECTED MESSAGE DONE and moves on to the next unread below; e on a Done one puts it back", async () => {
+  const page = await keyboardPageAtTop();
+  await press(page, page.el("scroll-area"), "ArrowDown");
+  let event = await pressHere(page, "e");
+  assert.equal(event.defaulted, false);
+  assert.deepStrictEqual(page.dismissCalls.map((call) => call.messages), [["1"]], "e did not mark the selected message Done");
+  assert.equal(channelRow(page, "1").getAttribute("data-archived"), "true");
+  assert.equal(selectedId(page), "2", "after e the selection did not move on to the next unread message");
+  await pressHere(page, "e");
+  assert.equal(selectedId(page), "3");
+  // Back up to a Done message: e puts it back, and the selection stays on it.
+  await pressHere(page, "k");
+  await pressHere(page, "k");
+  assert.equal(selectedId(page), "1");
+  event = await pressHere(page, "e");
+  assert.deepStrictEqual(page.restoreCalls.map((call) => call.messages), [["1"]], "e on a Done message did not put it back");
+  assert.equal(channelRow(page, "1").getAttribute("data-archived"), "false");
+  assert.equal(selectedId(page), "1", "putting a message back moved the selection off it");
+  // n: the next unread below, past the Done one.
+  await pressHere(page, "n");
+  assert.equal(selectedId(page), "3", `n selected ${selectedId(page)}, not the next unread below`);
+  // z: the last Done undone, as the Undo chip does it.
+  await pressHere(page, "e");
+  const restores = page.restoreCalls.length;
+  await pressHere(page, "z");
+  assert.equal(page.restoreCalls.length, restores + 1, "z did not undo the last Done");
+  assert.equal(channelRow(page, "3").getAttribute("data-archived"), "false", "z did not put back the message e marked");
+  // A held e is one Done, not one on every row it passes.
+  const calls = page.dismissCalls.length;
+  await pressHere(page, "e", { repeat: true });
+  assert.equal(page.dismissCalls.length, calls, "a held e marked another message Done");
+  // Shift+E: Done through here, the ⋯ menu's act.
+  await pressHere(page, "E", { shiftKey: true });
+  const through = page.dismissCalls[page.dismissCalls.length - 1];
+  assert.ok(through && (through.through || (through.messages || []).length > 1),
+    `Shift+E did not mark through the selected message: ${JSON.stringify(through)}`);
+});
+
+test("UNDER HIDE READ, the row e takes away hands the selection to the next unread message", async () => {
+  const page = await keyboardPageAtTop();
+  await turnTodoOn(page);
+  page.el("scroll-area").scrollTop = 0;
+  await press(page, page.el("scroll-area"), "ArrowDown");
+  const first = selectedId(page);
+  await pressHere(page, "e");
+  assert.notEqual(selectedId(page), first, "the selection stayed on a message Hide read took away");
+  assert.ok(channelRow(page, selectedId(page)), `after e the focus is on ${selectedId(page)}, not a row`);
+  assert.notEqual(channelRow(page, selectedId(page)).getAttribute("data-archived"), "true");
+});
+
+test("Enter AND o FOLD the selected message as a tap does; Enter on a button inside the row is the button's", async () => {
+  const page = await keyboardPageAtTop();
+  await press(page, page.el("scroll-area"), "ArrowDown");
+  const row = channelRow(page, "1");
+  assert.equal(row.getAttribute("data-collapsed"), "true", "a long message did not arrive folded");
+  let event = await pressHere(page, "Enter");
+  assert.equal(event.defaulted, false);
+  assert.equal(row.getAttribute("data-collapsed"), "false", "Enter did not open the selected message");
+  event = await pressHere(page, "o");
+  assert.equal(row.getAttribute("data-collapsed"), "true", "o did not close it again");
+  // Enter on the row's own Reply button presses that button, not the row.
+  event = await press(page, replyButton(row), "Enter");
+  assert.equal(event.defaulted, true, "Enter on a button in the row was taken from the button");
+  assert.equal(row.getAttribute("data-collapsed"), "true", "Enter on a button in the row folded the row");
+});
+
+test("→ ENTERS THE SELECTED MESSAGE'S THREAD; ← and Esc come back, the focus on the message it was opened from", async () => {
+  const page = await threadPage();
+  assert.deepStrictEqual(shownIds(page), ["200", "201", "202", "203", "204"]);
+  page.el("scroll-area").scrollTop = 0;
+  await press(page, page.el("scroll-area"), "ArrowDown");
+  assert.equal(selectedId(page), "200");
+  // A message in no thread has nowhere to go: → is left alone.
+  let event = await pressHere(page, "ArrowRight");
+  assert.equal(event.defaulted, true, "→ on a message in no thread was taken");
+  await pressHere(page, "j");
+  await pressHere(page, "j");
+  assert.equal(selectedId(page), "202");
+  for (const back of ["ArrowLeft", "Escape"]) {
+    event = await pressHere(page, "ArrowRight");
+    await page.settle();
+    assert.equal(event.defaulted, false, "→ on a message in a thread was left to the browser");
+    assert.deepStrictEqual(shownIds(page), ["201", "202"], "→ did not open the thread of the selected message");
+    assert.equal(page.el("thread-heading").hidden, false, "→ did not open the thread");
+    assert.ok(focused(page) === page.el("scroll-area") || nodeIn(page.el("discord-log"), focused(page)),
+      `in the thread the focus is on ${focusName(page)}`);
+    // ↓ in the thread moves through its messages.
+    await pressHere(page, "ArrowDown");
+    assert.ok(["201", "202"].includes(selectedId(page)), `↓ in the thread selected ${selectedId(page)}`);
+    event = await pressHere(page, back);
+    await page.settle();
+    assert.equal(event.defaulted, false, `${back} in a thread was left to the browser`);
+    assert.deepStrictEqual(shownIds(page), ["200", "201", "202", "203", "204"], `${back} did not leave the thread`);
+    assert.equal(selectedId(page), "202", `back from the thread with ${back}, the focus is on ${selectedId(page)}`);
+  }
+  // ← outside a thread is nobody's.
+  event = await pressHere(page, "ArrowLeft");
+  assert.equal(event.defaulted, true, "← outside a thread was taken");
+});
+
+/** Whether `node` is `root` or inside it. */
+function nodeIn(root, node) {
+  for (let at = node; at; at = at.parentNode) if (at === root) return true;
+  return false;
+}
+
+test("ESC IN A MESSAGE BOX leaves the box and keeps the draft; the next Esc goes Back; an empty box goes Back at once", async () => {
+  const page = await threadPage();
+  await pickThread(page, "main");
+  await threadBadge(channelRow(page, "201")).click();
+  await page.settle();
+  assert.equal(page.el("thread-heading").hidden, false, "the thread did not open");
+  const box = page.el("channel-compose-text");
+  box.focus();
+  await box.setValue("half a reply");
+  let event = await press(page, box, "Escape");
+  assert.equal(event.defaulted, false);
+  assert.notEqual(focused(page), box, "Esc in a box with text in it did not leave the box");
+  assert.equal(page.el("thread-heading").hidden, false, "the first Esc in a box with text left the thread too");
+  assert.equal(box.value, "half a reply", "Esc lost the draft");
+  event = await pressHere(page, "Escape");
+  await page.settle();
+  assert.equal(page.el("thread-heading").hidden, true, "the second Esc did not leave the thread");
+  // An empty box has nothing to keep: one Esc goes Back.
+  await threadBadge(channelRow(page, "201")).click();
+  await page.settle();
+  await box.setValue("");
+  event = await press(page, box, "Escape");
+  await page.settle();
+  assert.equal(page.el("thread-heading").hidden, true, "Esc in an empty box did not go Back");
+  // The reply screen: Esc leaves its box first, then closes it, and the draft is still there after.
+  const reply = newPage();
+  await signIn(reply);
+  await openReplyOn(reply, tallChannel(5), 1);
+  reply.el("reply-text").focus();
+  await reply.el("reply-text").setValue("not sent yet");
+  await press(reply, reply.el("reply-text"), "Escape");
+  assert.equal(reply.screen(), "reply", "the first Esc in the reply box with text left the reply screen");
+  assert.equal(focused(reply), reply.el("reply-scroll"), `after Esc the focus is on ${focusName(reply)}`);
+  await press(reply, reply.el("reply-scroll"), "Escape");
+  assert.equal(reply.screen(), "main", "the second Esc did not leave the reply screen");
+  await replyButton(reply.el("discord-log").children[1]).click();
+  assert.equal(reply.el("reply-text").value, "not sent yet", "the draft did not survive Esc");
+});
+
+test("ESC NEVER MARKS ANYTHING READ, from the list, a selected message, or a thread", async () => {
+  const page = await threadPage();
+  page.el("scroll-area").scrollTop = 0;
+  await press(page, page.el("scroll-area"), "ArrowDown");
+  for (let i = 0; i < 3; i += 1) await pressHere(page, "Escape");
+  await press(page, page.el("scroll-area"), "Escape");
+  assert.deepStrictEqual(page.dismissCalls, [], "Escape marked something read");
+  assert.equal(page.screen(), "main");
+});
+
+test("r REPLIES with the box ready; p pins; . opens the ⋯ menu on its first item; i opens the details; Ctrl+C copies", async () => {
+  const page = await keyboardPageAtTop();
+  await press(page, page.el("scroll-area"), "ArrowDown");
+  await pressHere(page, "j");
+  const row = channelRow(page, "2");
+  // p
+  let event = await pressHere(page, "p");
+  assert.equal(event.defaulted, false);
+  assert.deepStrictEqual(page.pinCalls.map((call) => call.id), ["2"], "p did not pin the selected message");
+  // .
+  event = await pressHere(page, ".");
+  assert.equal(rowMoreMenu(channelRow(page, "2")).hidden, false, ". did not open the ⋯ menu");
+  const firstItem = focused(page);
+  assert.equal(String(firstItem.tagName).toUpperCase(), "BUTTON", `. left the focus on ${focusName(page)}`);
+  assert.ok(nodeIn(rowMoreMenu(channelRow(page, "2")), firstItem), "the focus is not on an item in the menu");
+  await pressHere(page, "ArrowDown");
+  assert.notEqual(focused(page), firstItem, "↓ in the menu did not move to its next item");
+  assert.ok(nodeIn(rowMoreMenu(channelRow(page, "2")), focused(page)), "↓ in the menu left the menu");
+  await pressHere(page, "Escape");
+  assert.equal(rowMoreMenu(channelRow(page, "2")).hidden, true, "Esc did not close the menu");
+  assert.equal(focused(page), rowMoreButton(channelRow(page, "2")), "the focus did not go back to the ⋯");
+  // i, and Esc closes the sheet with the focus back on the row.
+  await press(page, channelRow(page, "2"), "i");
+  const sheet = () => channelRow(page, "2").descendants().find((node) => node.className === "msg-details");
+  assert.ok(sheet(), "i did not open the details of the selected message");
+  assert.match(sheet().text(), /id 2/, "the details do not name the message");
+  await press(page, channelRow(page, "2"), "Escape");
+  assert.equal(sheet(), undefined, "Esc did not close the details");
+  // Ctrl+C with no text selected: the text of the message.
+  event = await press(page, channelRow(page, "2"), "c", { ctrlKey: true });
+  assert.equal(event.defaulted, false, "Ctrl+C on the selected message was left to the browser, which copies nothing");
+  assert.match(String(page.clipboard), /^message 2: /, "Ctrl+C did not copy the text of the selected message");
+  // In a field, Ctrl+C is the field's.
+  event = await press(page, page.el("channel-compose-text"), "c", { ctrlKey: true });
+  assert.equal(event.defaulted, true, "Ctrl+C in a message box was taken from it");
+  // r: the reply screen, its box ready to type in.
+  await press(page, channelRow(page, "2"), "r");
+  assert.equal(page.screen(), "reply", "r did not open the reply screen");
+  assert.equal(focused(page), page.el("reply-text"), `on Reply after r the focus is on ${focusName(page)}`);
+  assert.ok(row, "the row went");
+});
+
+test("c FOCUSES THE CHANNEL'S BOX; ↑ in it while empty selects the newest message, and with text is the caret's", async () => {
+  const page = await keyboardPage();
+  let event = await press(page, page.el("scroll-area"), "c");
+  assert.equal(event.defaulted, false);
+  assert.equal(focused(page), page.el("channel-compose-text"), `c left the focus on ${focusName(page)}`);
+  event = await pressHere(page, "ArrowUp");
+  assert.equal(event.defaulted, false, "↑ in the empty box was left to it");
+  assert.equal(selectedId(page), "30", `↑ in the empty box selected ${selectedId(page)}, not the newest message`);
+  await page.el("channel-compose-text").setValue("a line");
+  event = await press(page, page.el("channel-compose-text"), "ArrowUp");
+  assert.equal(event.defaulted, true, "↑ in a box with text was taken from the caret");
+  assert.equal(focused(page), page.el("channel-compose-text"));
+});
+
+test("HOME AND END over the channel take the list to its ends and select the message there", async () => {
+  const page = await keyboardPage();
+  const area = page.el("scroll-area");
+  let event = await press(page, area, "Home");
+  assert.equal(event.defaulted, false, "Home over the channel was left to the browser");
+  assert.equal(area.scrollTop, 0, "Home did not take the list to its top");
+  assert.equal(selectedId(page), "1", `Home selected ${selectedId(page)}`);
+  event = await pressHere(page, "End");
+  assert.ok(atBottomOf(area), "End did not take the list to its newest message");
+  assert.equal(selectedId(page), "30", `End selected ${selectedId(page)}`);
+  assert.equal(page.el("jump-newest").hidden, true, "End left the jump to the newest standing");
+});
+
+test("A CLICK SELECTS SILENTLY: no focus and no ring, and the next key starts from the message clicked", async () => {
+  const page = await keyboardPageAtTop();
+  const area = page.el("scroll-area");
+  area.focus();
+  const row = channelRow(page, "1");
+  await area.dispatch("click", { target: row });
+  assert.equal(focused(page), area, "a click on a message gave the row the focus");
+  assert.equal(row.getAttribute("tabindex"), null, "a click on a message made the row a Tab stop");
+  await press(page, area, "ArrowDown");
+  assert.equal(selectedId(page), "2", `after a click on 1, ↓ selected ${selectedId(page)}`);
+});
+
+test("A KEY ABOUT ONE MESSAGE never acts on one scrolled out of sight: it brings the ring to the screen instead", async () => {
+  const page = await keyboardPageAtTop();
+  const area = page.el("scroll-area");
+  await press(page, area, "ArrowDown");
+  assert.equal(selectedId(page), "1");
+  area.scrollTop = area.scrollHeight;
+  const event = await pressHere(page, "e");
+  assert.equal(event.defaulted, false);
+  assert.deepStrictEqual(page.dismissCalls, [], "e marked Done a message the reader could not see");
+  assert.equal(statusText(page), "Selected the first message showing.", "nothing said why e did not act");
+  const now = channelRow(page, selectedId(page));
+  assert.ok(now && selectedId(page) !== "1", `the ring did not come to the screen: the focus is on ${selectedId(page)}`);
+  const box = now.getBoundingClientRect();
+  assert.ok(box.bottom > 0 && box.top < SCROLL_VIEWPORT_PX, "the ring came to a message that is not on screen");
+  await pressHere(page, "e");
+  assert.deepStrictEqual(page.dismissCalls.map((call) => call.messages), [[now.getAttribute("data-id")]],
+    "the second e did not mark the message the ring is round");
+});
+
+test("1, 2 AND 3 choose Main, the Threads screen and All; h cycles the read mode; ; and : expand and collapse all", async () => {
+  const page = await threadPage();
+  await press(page, page.el("scroll-area"), "1");
+  assert.equal(page.el("thread-select").value, "main", "1 did not choose Main");
+  await press(page, page.el("scroll-area"), "3");
+  assert.equal(page.el("thread-select").value, "flat", "3 did not choose All");
+  await press(page, page.el("scroll-area"), "2");
+  assert.equal(page.screen(), "threads", "2 did not open the Threads screen");
+  assert.equal(focused(page), page.el("screen-threads"), `on Threads the focus is on ${focusName(page)}`);
+  await press(page, page.el("screen-threads"), "Escape");
+  assert.equal(page.screen(), "main", "Esc did not leave the Threads screen");
+  const mode = () => page.el("todo-filter").getAttribute("data-read-mode");
+  const modes = [mode()];
+  for (let i = 0; i < 3; i += 1) {
+    await press(page, page.el("scroll-area"), "h");
+    modes.push(mode());
+  }
+  assert.deepStrictEqual(modes, ["show", "collapse", "hide", "show"], "h did not cycle the read modes");
+  const tall = await keyboardPage();
+  const folded = () => tall.el("discord-log").children.filter((li) => li.getAttribute("data-collapsed") === "true").length;
+  assert.ok(folded() > 0);
+  await press(tall, tall.el("scroll-area"), ";");
+  assert.equal(folded(), 0, "; did not expand every message");
+  await press(tall, tall.el("scroll-area"), ":");
+  assert.ok(folded() > 0, ": did not collapse them again");
+});
+
+test("Shift+P AND Shift+L turn the Pinned and Links filters on and off, with the search bar that holds them", async () => {
+  const page = await keyboardPage();
+  await press(page, page.el("scroll-area"), "P", { shiftKey: true });
+  assert.equal(page.el("pinned-filter").getAttribute("aria-pressed"), "true", "Shift+P did not turn Pinned on");
+  assert.equal(page.el("search-field").hidden, false, "a filter came on with the bar that holds it shut");
+  assert.equal(focused(page), page.el("scroll-area"), `after Shift+P the focus is on ${focusName(page)}`);
+  await press(page, page.el("scroll-area"), "P", { shiftKey: true });
+  assert.equal(page.el("pinned-filter").getAttribute("aria-pressed"), "false", "Shift+P did not turn Pinned off");
+  await press(page, page.el("scroll-area"), "L", { shiftKey: true });
+  assert.equal(page.el("links-filter").getAttribute("aria-pressed"), "true", "Shift+L did not turn Links on");
+  // A plain p is the selected message's pin, not the filter.
+  await press(page, page.el("scroll-area"), "L", { shiftKey: true });
+  assert.equal(page.el("links-filter").getAttribute("aria-pressed"), "false");
+});
+
+test("m GOES BACK TO MY PLACE and selects the message there", async () => {
+  const page = await keyboardPageAtTop();
+  // A place is kept from the details sheet, which i opens.
+  await press(page, page.el("scroll-area"), "ArrowDown");
+  for (let i = 0; i < 2; i += 1) await pressHere(page, "j");
+  assert.equal(selectedId(page), "3");
+  await pressHere(page, "i");
+  await channelRow(page, "3").descendants().find((node) => node.text() === "Keep my place here").click();
+  page.el("scroll-area").scrollTop = page.el("scroll-area").scrollHeight;
+  page.el("scroll-area").focus();
+  const event = await press(page, page.el("scroll-area"), "m");
+  assert.equal(event.defaulted, false, "m was left to the browser with a place kept");
+  assert.equal(selectedId(page), "3", `m selected ${selectedId(page)}, not the kept place`);
+  const box = channelRow(page, "3").getBoundingClientRect();
+  assert.ok(box.bottom > 0 && box.top < SCROLL_VIEWPORT_PX, "m did not bring the kept place on screen");
+});
+
+test("Alt+↓ AND Alt+↑ step through the channels in the picker's order; Ctrl+K opens the picker", async () => {
+  const page = newPage();
+  const second = { id: "1110000000000000002", label: "second", writable: true };
+  const third = { id: "1110000000000000003", label: "third", writable: true };
+  page.channels = [{ ...CHANNEL }, second, third];
+  await signIn(page);
+  await showDiscord(page, tallChannel(5));
+  const picker = page.el("discord-channel");
+  assert.equal(String(picker.value), CHANNEL.id);
+  let event = await press(page, page.el("scroll-area"), "ArrowDown", { altKey: true });
+  await page.settle();
+  assert.equal(event.defaulted, false);
+  assert.equal(String(picker.value), second.id, "Alt+↓ did not move to the next channel");
+  await press(page, focused(page) || page.el("scroll-area"), "ArrowDown", { altKey: true });
+  await page.settle();
+  assert.equal(String(picker.value), third.id);
+  // At the end it stops, rather than wrapping round.
+  await press(page, page.el("scroll-area"), "ArrowDown", { altKey: true });
+  await page.settle();
+  assert.equal(String(picker.value), third.id, "Alt+↓ at the last channel wrapped round");
+  await press(page, page.el("scroll-area"), "ArrowUp", { altKey: true });
+  await page.settle();
+  assert.equal(String(picker.value), second.id, "Alt+↑ did not move to the previous channel");
+  // On the picker itself, Alt+↓ is the picker's own (it opens it).
+  event = await press(page, picker, "ArrowDown", { altKey: true });
+  assert.equal(event.defaulted, true, "Alt+↓ on the focused picker was taken from it");
+  assert.equal(String(picker.value), second.id);
+  for (const mod of ["ctrlKey", "metaKey"]) {
+    page.el("scroll-area").focus();
+    event = await press(page, page.el("scroll-area"), "k", { [mod]: true });
+    assert.equal(event.defaulted, false, `${mod}+K was left to the browser`);
+    assert.equal(focused(page), picker, `${mod}+K left the focus on ${focusName(page)}, not the channel picker`);
+  }
+});
+
+test("? AND Ctrl+/ open the list of every key, and Esc goes back to where they were pressed", async () => {
+  for (const [key, fields] of [["?", { shiftKey: true }], ["/", { ctrlKey: true }], ["/", { metaKey: true }]]) {
+    const page = await keyboardPage();
+    const area = page.el("scroll-area");
+    area.scrollTop = 1000;
+    const scrolled = page.el("help-keyboard").scrolledIntoView;
+    let event = await press(page, area, key, fields);
+    assert.equal(event.defaulted, false, `${key} was left to the browser`);
+    assert.equal(page.screen(), "help", `${key} did not open Help`);
+    assert.equal(page.el("help-keyboard").scrolledIntoView, scrolled + 1, `${key} did not open Help at the Keyboard entry`);
+    assert.equal(focused(page), page.el("screen-help"));
+    event = await press(page, page.el("screen-help"), "Escape");
+    assert.equal(page.screen(), "main", `Esc on the list of keys opened by ${key} did not go back to the messages`);
+    assert.equal(area.scrollTop, 1000, "back from the list of keys the reader was not where they were");
+    assert.equal(focused(page), area);
+  }
+  // From Settings, it comes back to Settings; Help's own Back still goes to Settings.
+  const page = await keyboardPage();
+  await press(page, page.el("scroll-area"), ",");
+  await press(page, page.el("screen-settings"), "?", { shiftKey: true });
+  assert.equal(page.screen(), "help");
+  await page.el("close-help").click();
+  assert.equal(page.screen(), "settings", "Back on Help opened from Settings did not go back to Settings");
+  // Not where the gear is not: on Reply, ? is nobody's.
+  const reply = newPage();
+  await signIn(reply);
+  await openReplyOn(reply, tallChannel(5), 1);
+  const event = await press(reply, reply.el("reply-scroll"), "?", { shiftKey: true });
+  assert.equal(event.defaulted, true);
+  assert.equal(reply.screen(), "reply");
+});
+
+test("THE LIST OF KEYS IS THE KEYMAP: every binding's words and meaning, in the reader's own keyboard words", async () => {
+  // Read off the source's own table, so the list cannot be checked against a second copy of it.
+  const table = /const KEYMAP = \[([\s\S]*?)\n\];/.exec(SCRIPT_CODE);
+  assert.ok(table, "web/voice.js has no KEYMAP table");
+  const meanings = [...table[1].matchAll(/does:\s*((?:"(?:[^"\\]|\\.)*"\s*\+?\s*)+)/g)].map((m) =>
+    [...m[1].matchAll(/"((?:[^"\\]|\\.)*)"/g)].map((part) => JSON.parse(`"${part[1]}"`)).join(""));
+  assert.ok(meanings.length >= 30, `only ${meanings.length} bindings were found in KEYMAP`);
+  for (const [platform, mod, alt, other] of [["Linux x86_64", "Ctrl", "Alt", "Cmd"], ["MacIntel", "Cmd", "Option", "Ctrl"]]) {
+    const page = newPage(new Map(), SCRIPT, (p) => p.setPlatform(platform));
+    const list = page.el("keyboard-keys").text();
+    for (const meaning of meanings) {
+      assert.ok(list.includes(meaning), `${platform}: the list of keys leaves out "${meaning}"`);
+    }
+    for (const words of ["↓ or j", "↑ or k", "Enter or o", "Esc", "PgUp", "Shift+E", "1, 2, 3", `${mod}+S`, `${mod}+,`,
+      `${mod}+K`, `${mod}+/`, `${mod}+Home`, `${alt}+↓`, "Shift+P", "Shift+L"]) {
+      assert.ok(list.includes(words), `${platform}: the list of keys does not name ${words}`);
+    }
+    assert.ok(!list.includes(`${other}+`), `${platform}: the list of keys names ${other}`);
+    assert.equal(page.el("search-toggle").getAttribute("title"), `Search messages (/ or ${mod}+S)`, platform);
+    assert.equal(page.el("open-settings").getAttribute("title"), `Settings (, or ${mod}+,)`, platform);
+    assert.equal(page.el("close-settings").getAttribute("title"), "Back (Esc)");
+  }
+  assert.ok(markupHolds("screen-help", "keyboard-keys"), "the list of keys is not on the Help screen");
+  assert.match(helpEntry("keyboard"), /id="keyboard-keys"/);
+});
+
+test("aria-keyshortcuts names each control's key, from the same table, and drops a key the switch turns off", async () => {
+  const page = await keyboardPage();
+  const row = page.el("discord-log").children[3];
+  const expected = new Map([
+    [page.el("search-toggle"), "/ Control+S Meta+S"],
+    [page.el("open-settings"), ", Control+, Meta+,"],
+    [page.el("close-settings"), "Escape"],
+    [page.el("thread-back"), "Escape ArrowLeft"],
+    [page.el("todo-filter"), "H"],
+    [page.el("discord-channel"), "Alt+ArrowDown Alt+ArrowUp Control+K Meta+K"],
+    [doneButton(row), "E"],
+    [replyButton(row), "R"],
+    [foldButton(row), "Enter O"],
+    [rowMoreButton(row), "."],
+  ]);
+  for (const [control, shortcuts] of expected) {
+    assert.equal(control.getAttribute("aria-keyshortcuts"), shortcuts, `#${control.id || control.className}`);
+  }
+  await page.el("open-settings").click();
+  await page.el("single-keys").setChecked(false);
+  assert.equal(page.el("search-toggle").getAttribute("aria-keyshortcuts"), "Control+S Meta+S");
+  assert.equal(page.el("todo-filter").getAttribute("aria-keyshortcuts"), null, "a key turned off is still announced");
+  assert.equal(doneButton(page.el("discord-log").children[3]).getAttribute("aria-keyshortcuts"), null,
+    "a row's Done still announces a key the switch turned off");
+  assert.equal(foldButton(page.el("discord-log").children[3]).getAttribute("aria-keyshortcuts"), "Enter");
+});
+
+test("THE SINGLE-KEY SWITCH turns off every key that types a character, and keeps the arrows, Esc, Enter and the chords", async () => {
+  const store = new Map();
+  const page = newPage(store);
+  await signIn(page);
+  await showDiscord(page, tallChannel(30));
+  assert.equal(page.el("single-keys").checked, true, "single-key shortcuts are not on by default");
+  assert.equal(store.has("vibe-talk.voice.single-keys"), false, "the default was written down as a choice");
+  await page.el("open-settings").click();
+  await page.el("single-keys").setChecked(false);
+  assert.equal(store.get("vibe-talk.voice.single-keys"), "0", "turning them off was not kept");
+  assert.match(page.el("single-keys-hint").text(), /Off: Esc, the arrows, Enter and the Ctrl chords still work/);
+  await press(page, page.el("screen-settings"), "Escape");
+  assert.equal(page.screen(), "main", "with single keys off, Esc no longer leaves Settings");
+  const area = page.el("scroll-area");
+  area.scrollTop = 0;
+  for (const [key, fields] of [["j", {}], ["k", {}], ["e", {}], ["/", {}], [",", {}], ["?", { shiftKey: true }],
+    ["1", {}], ["h", {}], ["E", { shiftKey: true }], [";", {}], ["c", {}]]) {
+    const event = await press(page, area, key, fields);
+    assert.equal(event.defaulted, true, `with single keys off, ${key} was taken`);
+    assert.equal(focused(page), area, `with single keys off, ${key} moved the focus`);
+    assert.equal(page.screen(), "main");
+    assert.equal(page.el("search-field").hidden, true);
+  }
+  assert.deepStrictEqual(page.dismissCalls, []);
+  let event = await press(page, area, "ArrowDown");
+  assert.equal(event.defaulted, false, "with single keys off, ↓ stopped selecting");
+  assert.equal(selectedId(page), "1");
+  event = await pressHere(page, "Enter");
+  assert.equal(channelRow(page, "1").getAttribute("data-collapsed"), "false", "with single keys off, Enter stopped opening");
+  event = await pressHere(page, "s", { ctrlKey: true });
+  assert.equal(page.el("search-field").hidden, false, "with single keys off, Ctrl+S stopped opening the search");
+  // Kept across a reload; and absent means on.
+  const again = newPage(store);
+  assert.equal(again.el("single-keys").checked, false, "a reload turned single keys back on");
+  assert.equal(newPage(new Map()).el("single-keys").checked, true);
+});
+
+test("NO SINGLE KEY FIRES WHILE TYPING, in any field on any screen, and the field keeps every character", async () => {
+  const page = await keyboardPage();
+  const singles = [["j", {}], ["k", {}], ["n", {}], ["o", {}], ["e", {}], ["E", { shiftKey: true }], ["z", {}], ["r", {}],
+    ["p", {}], ["s", {}], [".", {}], ["i", {}], ["h", {}], ["P", { shiftKey: true }], ["L", { shiftKey: true }],
+    [";", {}], [":", { shiftKey: true }], ["c", {}], ["/", {}], [",", {}], ["?", { shiftKey: true }], ["1", {}], ["2", {}],
+    ["3", {}], ["m", {}], [" ", {}], ["ArrowDown", {}], ["ArrowLeft", {}], ["ArrowRight", {}], ["Home", {}], ["End", {}]];
+  const fields = ["search-field", "channel-compose-text", "reply-text", "compose-text", "api-token", "prompt-summary",
+    "prompt-blockers", "channel-alias", "new-channel-id", "new-channel-label", "channel-directory-search", "noise-rule-new"];
+  for (const id of fields) {
+    const field = page.el(id);
+    for (const [key, extra] of singles) {
+      const screen = page.screen();
+      const event = await press(page, field, key, extra);
+      const what = `${JSON.stringify(key)} in #${id}`;
+      assert.equal(event.defaulted, true, `${what} was taken from the field`);
+      assert.equal(focused(page), field, `${what} took the focus out of the field`);
+      assert.equal(page.screen(), screen, `${what} changed the screen`);
+    }
+  }
+  assert.deepStrictEqual(page.dismissCalls, [], "a key typed in a field marked something Done");
+  assert.deepStrictEqual(page.pinCalls, [], "a key typed in a field pinned something");
 });
 
 // --- the canned prompts (#60 canned-prompt-buttons) -----------------------------------------------
@@ -34615,4 +35250,31 @@ test("THE COUNTS AND THE CIRCLES READ NO LAYOUT: a redraw with circles and no ad
   } finally {
     FakeElement.prototype.getBoundingClientRect = read;
   }
+});
+
+test("`#224 keyboard-shortcuts` x `#221 read-modes`: on the line of a collapsed run, Enter opens the run and e acts on nothing", async () => {
+  const page = newPage();
+  const messages = runThread(page, { tail: RUN_TAIL });
+  page.messages = messages;
+  await enterRunThread(page, messages, () => chooseReadMode(page, "Collapse read"));
+  const head = rowWithId(page, runId(1));
+  assert.equal(head.getAttribute("data-read-run"), "head");
+  // Up from the landed answer to the line, as the keys go.
+  page.el("scroll-area").focus();
+  await press(page, page.el("scroll-area"), "ArrowUp");
+  for (let i = 0; i < 6 && focused(page) !== head; i += 1) await press(page, focused(page), "k");
+  assert.equal(focused(page), head, `↑ and k did not reach the run's line: the focus is on ${focusName(page)}`);
+  for (const key of ["e", "p", "r", "i"]) {
+    const event = await press(page, head, key);
+    assert.equal(event.defaulted, false, `${key} on the run's line was left to the browser`);
+    assert.equal(page.screen(), "main", `${key} on the run's line left the list`);
+  }
+  assert.deepStrictEqual(page.dismissCalls, [], "e on the run's line marked a message");
+  assert.deepStrictEqual(page.restoreCalls, [], "e on the run's line put a read message back");
+  assert.deepStrictEqual(page.pinCalls, [], "p on the run's line pinned a message");
+  assert.match(statusText(page), /Enter opens them/, "nothing said why the key did nothing");
+  await press(page, head, "Enter");
+  await page.settle();
+  assert.equal(head.hasAttribute("data-read-run"), false, "Enter on the run's line did not open the run");
+  assert.equal(focused(page), head, "opening the run took the focus off it");
 });

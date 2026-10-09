@@ -622,6 +622,45 @@ body {
   border-color: var(--accent);
 }
 
+/* `#224 keyboard-shortcuts`. Help's Keyboard entry: each key, then what it does, one per line, under
+   a heading for each part of the list. The keys in the reader's ink and a column of their own, so the
+   list reads down the keys at a glance; the meanings quiet, as every hint on this screen is. On a
+   phone too narrow for the column a line wraps with its meaning under its key rather than squeezing
+   either. */
+.key-group {
+  margin: 1rem 0 0.4rem;
+  font-size: 0.9rem;
+  font-weight: 600;
+}
+
+.key-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: grid;
+  gap: 0.35rem;
+  font-size: 0.85rem;
+  color: var(--muted);
+}
+
+.key-list li {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 0.15rem 0.75rem;
+}
+
+.key-list kbd {
+  flex: 0 0 10.5rem;
+  color: var(--ink);
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 0.8rem;
+}
+
+.key-list span {
+  flex: 1 1 14rem;
+}
+
 /* One entry per settings group, and the target of its `?`. `scroll-margin-top` is what makes the
    deep link land with the heading visible rather than jammed under the top edge of the scroller. */
 .help-entry {
@@ -3613,6 +3652,16 @@ body {
 #pinned-log li.discord-message:focus-within {
   background: var(--row-hover);
   border-color: var(--accent);
+}
+
+/* `#224 keyboard-shortcuts`. THE SELECTED MESSAGE: the row itself holds the focus (see the keyboard
+   section of web/voice.js), and the ring says so whenever the keyboard put it there — `:focus-visible`,
+   so a click on the selected row lights it as `:focus-within` above does and draws no ring. Inside
+   the row's own border, which the scroller's edge would otherwise clip. */
+#discord-log li.discord-message:focus-visible,
+#pinned-log li.discord-message:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
 }
 
 /* The reply control gains the accent WITH its row rather than appearing out of nothing. Discord
