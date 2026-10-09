@@ -1,10 +1,11 @@
 ---
 title: 'unread-replies: show ''N replies, M unread'' on Main and keep roots with unread replies under Hide read'
-status: open
+status: closed
 priority: 2
 issue_type: feature
 created_at: 2026-10-08T16:10:54.290729775+00:00
-updated_at: 2026-10-08T16:10:54.290729775+00:00
+updated_at: 2026-10-09T02:47:05.250795551+00:00
+closed_at: 2026-10-09T02:47:05.250795431+00:00
 ---
 
 # Description
