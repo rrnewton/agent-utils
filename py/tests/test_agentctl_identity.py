@@ -72,6 +72,7 @@ def _misroutes(manager: ManagedAgents, name: str) -> list[dict[str, object]]:
 def test_pane_swap_between_check_and_send_interrupts_the_wrong_agent_and_retries(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.setenv(subagents.COUNTERMAND_ENV, "1")  # opt-in countermand
     manager, fake, pane = _started(tmp_path, monkeypatch)
     original = fake.harness_pids[pane]
 
@@ -100,6 +101,7 @@ def test_pane_swap_between_check_and_send_interrupts_the_wrong_agent_and_retries
 def test_misroute_into_a_shell_types_nothing_more(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.setenv(subagents.COUNTERMAND_ENV, "1")  # opt-in countermand
     manager, fake, pane = _started(tmp_path, monkeypatch)
 
     def harness_exits(effect_pane: str) -> None:
@@ -119,6 +121,7 @@ def test_misroute_into_a_shell_types_nothing_more(
 def test_prompt_found_in_another_agents_pane_interrupts_that_agent_and_retries(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.setenv(subagents.COUNTERMAND_ENV, "1")  # opt-in countermand
     manager, fake, pane = _started(tmp_path, monkeypatch)
     manager.start("bystander", cwd=str(tmp_path), harness="claude")
     other = manager.get("bystander").pane_id or ""
@@ -135,6 +138,7 @@ def test_prompt_found_in_another_agents_pane_interrupts_that_agent_and_retries(
 def test_second_misroute_of_one_message_is_quarantined(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.setenv(subagents.COUNTERMAND_ENV, "1")  # opt-in countermand
     manager, fake, pane = _started(tmp_path, monkeypatch)
     manager.start("bystander", cwd=str(tmp_path), harness="claude")
     other = manager.get("bystander").pane_id or ""
@@ -404,6 +408,7 @@ def test_session_change_refuses_input_even_with_a_matching_process(
 def test_transport_error_after_a_write_checks_the_recipient_and_recovers(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.setenv(subagents.COUNTERMAND_ENV, "1")  # opt-in countermand
     manager, fake, pane = _started(tmp_path, monkeypatch)
     real = fake.agent_prompt
     calls = {"count": 0}
@@ -631,6 +636,7 @@ def test_harness_identity_refuses_an_ambiguous_foreground(monkeypatch: pytest.Mo
 def test_countermand_stops_when_the_occupant_changes_after_the_interrupt(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.setenv(subagents.COUNTERMAND_ENV, "1")  # opt-in countermand
     manager, fake, pane = _started(tmp_path, monkeypatch)
     real_keys = fake.send_keys
 
@@ -662,17 +668,15 @@ def test_old_matching_text_in_another_pane_is_not_a_misroute(
     monkeypatch.setattr(subagents, "READBACK_SECONDS", 0.0)
     text = "an instruction that also appeared in yesterday's transcript"
     fake.transcripts[other] = [text]  # history, not this send
-    fake.infos["w1:void"] = fake.infos[pane]
-    fake.redirect_once[pane] = "w1:void"  # the target shows no echo this time
     manager.send("worker", text)
     assert fake.keys_sent == [] and _misroutes(manager, "worker") == []
-    readback = (manager._directory("worker") / "readback.jsonl").read_text(encoding="utf-8")
-    assert '"result": "not-seen"' in readback
+    assert fake.transcripts[pane][-1] == text
 
 
 def test_lost_acknowledgement_after_a_write_elsewhere_is_countermanded(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.setenv(subagents.COUNTERMAND_ENV, "1")  # opt-in countermand
     manager, fake, pane = _started(tmp_path, monkeypatch)
     manager.start("bystander", cwd=str(tmp_path), harness="claude")
     other = manager.get("bystander").pane_id or ""
@@ -696,14 +700,17 @@ def test_lost_acknowledgement_after_a_write_elsewhere_is_countermanded(
     assert entry["detection"] == "prompt-in-another-pane"
 
 
-def test_short_prompt_without_echo_is_logged_unverified(
+def test_prompt_the_target_never_shows_is_quarantined_as_unproven(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    # A native prompt (no screen receipt) that never shows: Herdr's working event alone
+    # is not proof that this recipient got it.
     manager, fake, pane = _started(tmp_path, monkeypatch)
     monkeypatch.setattr(subagents, "READBACK_SECONDS", 0.0)
     fake.infos["w1:void"] = fake.infos[pane]
     fake.redirect_once[pane] = "w1:void"
-    manager.send("worker", "continue")
+    with pytest.raises(AgentPossiblySubmitted, match="delivery is unproven"):
+        manager.send("worker", "continue")
     readback = (manager._directory("worker") / "readback.jsonl").read_text(encoding="utf-8")
     assert '"result": "not-seen"' in readback
 
@@ -750,6 +757,7 @@ def test_old_journal_at_the_history_limit_completes_with_the_newest_names(
 def test_note_that_never_shows_in_the_wrong_pane_is_not_a_recovery(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.setenv(subagents.COUNTERMAND_ENV, "1")  # opt-in countermand
     manager, fake, pane = _started(tmp_path, monkeypatch)
     monkeypatch.setattr(subagents, "READBACK_SECONDS", 0.0)
     real = fake.agent_prompt
@@ -776,6 +784,7 @@ def test_note_that_never_shows_in_the_wrong_pane_is_not_a_recovery(
 def test_countermand_needs_the_wrong_panes_input_lock(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.setenv(subagents.COUNTERMAND_ENV, "1")  # opt-in countermand
     from agentctl import agent as delivery
 
     manager, fake, pane = _started(tmp_path, monkeypatch)
@@ -793,27 +802,54 @@ def test_countermand_needs_the_wrong_panes_input_lock(
     assert fake.keys_sent == []
 
 
-def test_window_moving_past_an_old_match_in_a_peer_is_uncertain(
+def test_full_peer_window_with_an_old_match_is_uncertain(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    # The peer's window is full, so an old match may have scrolled out as a new one came
+    # in: equal counts cannot tell those histories apart, even though the target shows it.
     manager, fake, pane = _started(tmp_path, monkeypatch)
     manager.start("bystander", cwd=str(tmp_path), harness="claude")
     other = manager.get("bystander").pane_id or ""
     monkeypatch.setattr(subagents, "READBACK_SECONDS", 0.0)
     text = "a long enough instruction for the worker only"
-    fake.transcripts[other] = [text, "output after the old match"]
-
-    def scroll_peer(effect_pane: str) -> None:
-        fake.before_effect = None
-        # The old match scrolls out of the peer's window as a new one arrives.
-        fake.transcripts[other] = ["output after the old match", text]
-
-    fake.before_effect = scroll_peer
-    fake.infos["w1:void"] = fake.infos[pane]
-    fake.redirect_once[pane] = "w1:void"
+    filler = [f"line {index}" for index in range(subagents.SCROLLBACK_LINES)]
+    fake.transcripts[other] = [*filler[:-1], text]
     with pytest.raises(AgentPossiblySubmitted, match="cannot be attributed"):
         manager.send("worker", text)
-    assert fake.keys_sent == []
+    assert fake.keys_sent == [] and fake.transcripts[pane][-1] == text
+
+
+def test_by_default_a_pane_swap_is_quarantined_and_nothing_is_typed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv(subagents.COUNTERMAND_ENV, raising=False)
+    manager, fake, _pane = _started(tmp_path, monkeypatch)
+
+    def swap_once(effect_pane: str) -> None:
+        fake.before_effect = None
+        fake.harness_pids[effect_pane] = 999
+
+    fake.before_effect = swap_once
+    with pytest.raises(AgentPossiblySubmitted, match="nothing typed into any pane"):
+        manager.send("worker", "work meant for the worker agent")
+    assert fake.keys_sent == [] and subagents.MISROUTE_NOTE not in fake.submitted
+    [entry] = _misroutes(manager, "worker")
+    assert entry["interrupted"] is False and "countermand is off" in str(entry["skipped"])
+    assert _failed_documents(manager, "worker")[0]["probable_misroute"] is True
+
+
+def test_by_default_a_prompt_in_another_pane_is_quarantined_and_nothing_is_typed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv(subagents.COUNTERMAND_ENV, raising=False)
+    manager, fake, pane = _started(tmp_path, monkeypatch)
+    manager.start("bystander", cwd=str(tmp_path), harness="claude")
+    other = manager.get("bystander").pane_id or ""
+    monkeypatch.setattr(subagents, "READBACK_SECONDS", 0.0)
+    fake.redirect_once[pane] = other
+    with pytest.raises(AgentPossiblySubmitted, match=f"probably reached pane {other}"):
+        manager.send("worker", "a long enough instruction for the worker only")
+    assert fake.keys_sent == [] and subagents.MISROUTE_NOTE not in fake.submitted
 
 
 def test_prompt_new_in_target_and_peer_is_quarantined_without_a_note(
@@ -898,3 +934,24 @@ def test_a_peer_that_keeps_working_after_an_old_match_is_not_uncertain(
     fake.before_effect = peer_works_on
     manager.send("worker", text)
     assert fake.keys_sent == [] and fake.submitted[-1] == text
+
+
+def test_relay_submission_needs_evidence_in_the_target(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from agentctl.submission import SubmissionReceipt
+
+    manager, fake, pane = _started(tmp_path, monkeypatch)
+    monkeypatch.setattr(subagents, "READBACK_SECONDS", 0.0)
+    record = manager.get("worker")
+    record.adapter = "herdr-relay"
+    record.custom_process_identity = fake.custom_identity
+    monkeypatch.setattr(fake, "relay_process", lambda pane_id: fake.custom_identity, raising=False)
+    # The relay's composer reported only an active turn, never the prompt itself.
+    monkeypatch.setattr(subagents, "submit_verified", lambda terminal, pane_id, harness, text:
+                        SubmissionReceipt("Enter", 1, 0.1, "agent reports an active turn"))
+    client = subagents._WorkspaceClient(cast(HerdrClient, fake), record,
+                                        queue=manager._queue("worker"))
+    monkeypatch.setattr(client, "pane_info", lambda pane_id: replace(fake.infos[pane_id], status="idle"))
+    with pytest.raises(AgentDeliveryError, match="delivery is unproven"):
+        client.prompt_agent(pane, "a long enough instruction for the relayed worker")

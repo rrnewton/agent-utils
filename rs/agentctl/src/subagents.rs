@@ -1012,7 +1012,7 @@ pub trait ManagedApi: AgentApi {
     }
     /// Recent scrollback without wrapping, to find text a prompt left in a pane.
     fn read_scrollback(&self, pane: &str) -> crate::error::Result<String> {
-        self.read(pane, "recent-unwrapped", Some(400))
+        self.read(pane, "recent-unwrapped", Some(SCROLLBACK_LINES))
     }
     /// Resolve an exact live Herdr agent name.
     fn agent_pane(&self, name: &str) -> crate::error::Result<String>;
@@ -2260,9 +2260,21 @@ thread_local! {
     /// shared pane locks for the full limit.
     pub(crate) static TEST_READBACK: std::cell::Cell<Option<Duration>> =
         const { std::cell::Cell::new(None) };
+    /// A test's own countermand opt-in, since the environment is shared by parallel tests.
+    pub(crate) static TEST_COUNTERMAND: std::cell::Cell<Option<bool>> =
+        const { std::cell::Cell::new(None) };
     /// A test's own wait for another pane's input lock.
     pub(crate) static TEST_COUNTERMAND_LOCK: std::cell::Cell<Option<Duration>> =
         const { std::cell::Cell::new(None) };
+}
+
+/// Whether a misroute is countermanded (Esc and a note) instead of only quarantined.
+fn countermand_enabled() -> bool {
+    #[cfg(test)]
+    if let Some(enabled) = TEST_COUNTERMAND.with(std::cell::Cell::get) {
+        return enabled;
+    }
+    std::env::var(COUNTERMAND_ENV).as_deref() == Ok("1")
 }
 
 /// How long a countermand waits for the wrong pane's input lock.
@@ -2286,6 +2298,10 @@ fn readback_limit() -> Duration {
 const ATTRIBUTABLE: usize = 12;
 /// Longest wait for another pane's input lock before a countermand gives up.
 const COUNTERMAND_LOCK: Duration = Duration::from_secs(2);
+/// Lines of scrollback each read-back reads; a read this long may have lost old lines.
+const SCROLLBACK_LINES: usize = 400;
+/// Opt-in for countermanding a misroute; by default a misroute is only quarantined.
+const COUNTERMAND_ENV: &str = "AGENTCTL_MISROUTE_COUNTERMAND";
 /// What a program that received someone else's prompt is told after being interrupted.
 pub const MISROUTE_NOTE: &str =
     "Ignore the previous message: it was sent to the wrong agent by agentctl.";
@@ -2300,7 +2316,7 @@ impl<A: ManagedApi + ?Sized> WorkspaceClient<'_, A> {
         &self,
         pane_id: &str,
         text: &str,
-    ) -> crate::error::Result<BTreeMap<String, (usize, Option<usize>)>> {
+    ) -> crate::error::Result<BTreeMap<String, (usize, bool)>> {
         let mut panes = vec![pane_id.to_owned()];
         if crate::submission::suffix(text, 40).chars().count() >= ATTRIBUTABLE {
             panes.extend(self.peer_panes().into_iter().filter(|peer| peer != pane_id));
@@ -2317,30 +2333,32 @@ impl<A: ManagedApi + ?Sized> WorkspaceClient<'_, A> {
         Ok(windows)
     }
 
-    fn window(&self, pane: &str, text: &str) -> crate::error::Result<(usize, Option<usize>)> {
-        let compact = crate::submission::compact(&self.client.read_scrollback(pane)?);
-        let needle = crate::submission::suffix(text, 40);
-        let distance = compact.rfind(&needle).map(|last| compact.len() - last);
-        Ok((compact.matches(&needle).count(), distance))
+    /// How often the text shows, and whether the read window was full.
+    fn window(&self, pane: &str, text: &str) -> crate::error::Result<(usize, bool)> {
+        let screen = self.client.read_scrollback(pane)?;
+        let full = screen.lines().count() >= SCROLLBACK_LINES;
+        let count = crate::submission::compact(&screen)
+            .matches(&crate::submission::suffix(text, 40))
+            .count();
+        Ok((count, full))
     }
 
-    /// `fresh` when the text shows more often than before; `uncertain` when it does not, yet
-    /// its last occurrence is nearer the end of the window than before (an old one may have
-    /// scrolled out as a new one came in); otherwise `absent`. Output after an old occurrence
-    /// only moves it away from the end.
+    /// `fresh` when the text shows more often than before. When it does not, a pane that
+    /// already showed it and whose window is full is `uncertain`: an old occurrence may have
+    /// scrolled out as a new one came in, which the counts cannot tell apart. Otherwise
+    /// `absent`: in a window that never filled nothing scrolled out, so a new occurrence
+    /// would have raised the count.
     fn observe(
         &self,
         pane: &str,
         text: &str,
-        before: &BTreeMap<String, (usize, Option<usize>)>,
+        before: &BTreeMap<String, (usize, bool)>,
     ) -> crate::error::Result<&'static str> {
-        let (count, distance) = self.window(pane, text)?;
-        let (old_count, old_distance) = before.get(pane).copied().unwrap_or((0, None));
+        let (count, full) = self.window(pane, text)?;
+        let (old_count, old_full) = before.get(pane).copied().unwrap_or((0, false));
         Ok(if count > old_count {
             "fresh"
-        } else if old_count > 0
-            && matches!((distance, old_distance), (Some(now), Some(then)) if now < then)
-        {
+        } else if old_count > 0 && (full || old_full) {
             "uncertain"
         } else {
             "absent"
@@ -2352,7 +2370,7 @@ impl<A: ManagedApi + ?Sized> WorkspaceClient<'_, A> {
         &self,
         pane_id: &str,
         text: &str,
-        before: &BTreeMap<String, (usize, Option<usize>)>,
+        before: &BTreeMap<String, (usize, bool)>,
         runtime: &dyn agent::AgentRuntime,
     ) -> crate::error::Result<bool> {
         let deadline = runtime.monotonic() + readback_limit();
@@ -2372,7 +2390,7 @@ impl<A: ManagedApi + ?Sized> WorkspaceClient<'_, A> {
         &self,
         pane_id: &str,
         text: &str,
-        before: &BTreeMap<String, (usize, Option<usize>)>,
+        before: &BTreeMap<String, (usize, bool)>,
     ) -> crate::error::Result<BTreeMap<String, &'static str>> {
         let mut states = BTreeMap::new();
         for peer in before.keys().filter(|peer| peer.as_str() != pane_id) {
@@ -2388,7 +2406,7 @@ impl<A: ManagedApi + ?Sized> WorkspaceClient<'_, A> {
         &self,
         pane_id: &str,
         text: &str,
-        before: &BTreeMap<String, (usize, Option<usize>)>,
+        before: &BTreeMap<String, (usize, bool)>,
         detail: &str,
         runtime: &dyn agent::AgentRuntime,
     ) -> crate::error::Result<()> {
@@ -2426,7 +2444,7 @@ impl<A: ManagedApi + ?Sized> WorkspaceClient<'_, A> {
         pane_id: &str,
         text: &str,
         submission: &Submission,
-        before: &BTreeMap<String, (usize, Option<usize>)>,
+        before: &BTreeMap<String, (usize, bool)>,
         runtime: &dyn agent::AgentRuntime,
     ) -> crate::error::Result<()> {
         let recipient_holds = || -> crate::error::Result<()> {
@@ -2480,22 +2498,20 @@ impl<A: ManagedApi + ?Sized> WorkspaceClient<'_, A> {
         if in_target {
             return Ok(());
         }
+        // A confirmation without target evidence proves nothing about the recipient.
         let verified = matches!(submission, Submission::Verified(_));
         let logged = self.log_readback(pane_id, text, "not-seen", &json!({"receipt": verified}));
-        if verified || !logged {
-            return Err(AdapterError::unavailable(format!(
-                "prompt for agent {} was submitted but never showed in pane {pane_id} within {}s; \
-                 delivery is unproven{}",
-                repr(Some(&self.record.name)),
-                READBACK.as_secs(),
-                if logged {
-                    ""
-                } else {
-                    " (the read-back log could not be written)"
-                }
-            )));
-        }
-        Ok(())
+        Err(AdapterError::unavailable(format!(
+            "prompt for agent {} was submitted but never showed in pane {pane_id} within {}s; \
+             delivery is unproven{}",
+            repr(Some(&self.record.name)),
+            READBACK.as_secs(),
+            if logged {
+                ""
+            } else {
+                " (the read-back log could not be written)"
+            }
+        )))
     }
 
     /// The program in `pane` now: its detected harness, terminal, and the harness process
@@ -2541,6 +2557,33 @@ impl<A: ManagedApi + ?Sized> WorkspaceClient<'_, A> {
         let mut note_confirmed = false;
         let mut skipped: Option<String> = None;
         let mut lock = None;
+        if !countermand_enabled() {
+            let logged = self.append_log(
+                "misroutes.jsonl",
+                &json!({
+                    "at": unix_seconds(), "agent": self.record.name, "token": self.record.token,
+                    "detection": detection, "detail": detail,
+                    "intended_pane": self.record.pane_id,
+                    "intended_terminal": self.record.terminal_id,
+                    "observed_pane": wrong_pane, "interrupted": false, "note_sent": false,
+                    "note_confirmed": false,
+                    "skipped": format!(
+                        "automatic countermand is off ({COUNTERMAND_ENV}=1 enables it); nothing typed"
+                    ),
+                    "message_id": self.inflight_message_id(text),
+                }),
+            );
+            return AdapterError::probable_misroute(format!(
+                "prompt for agent {} probably reached pane {wrong_pane} ({detection}); \
+                 quarantined, nothing typed into any pane: {detail}{}",
+                repr(Some(&self.record.name)),
+                if logged {
+                    ""
+                } else {
+                    " (the misroute log could not be written)"
+                }
+            ));
+        }
         if Some(wrong_pane) != self.record.pane_id.as_deref() {
             match agent::lock_target_within(wrong_pane, "pane input lock", countermand_lock_limit())
             {
@@ -3255,7 +3298,10 @@ impl<A: ManagedApi + ?Sized> AgentApi for WorkspaceClient<'_, A> {
         text: &str,
         runtime: &dyn agent::AgentRuntime,
     ) -> crate::error::Result<Submission> {
-        if !matches!(self.record.adapter.as_str(), "herdr" | "herdr-foreign") {
+        if !matches!(
+            self.record.adapter.as_str(),
+            "herdr" | "herdr-foreign" | "herdr-relay"
+        ) {
             return self.submit_unchecked(pane_id, text, runtime);
         }
         let before = self.snapshot(pane_id, text)?;

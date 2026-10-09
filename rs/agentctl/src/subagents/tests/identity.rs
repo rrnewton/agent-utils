@@ -219,6 +219,7 @@ fn misroutes(fixture: &Fixture, agent_name: &str) -> Vec<Value> {
 
 #[test]
 fn a_pane_swap_between_check_and_send_interrupts_the_wrong_agent_and_retries() {
+    TEST_COUNTERMAND.with(|enabled| enabled.set(Some(true)));
     let fixture = Fixture::new();
     fixture.start(None);
     let pane = record(&fixture, "worker")["pane_id"]
@@ -267,6 +268,7 @@ fn a_pane_swap_between_check_and_send_interrupts_the_wrong_agent_and_retries() {
 
 #[test]
 fn a_second_misroute_of_one_message_is_quarantined() {
+    TEST_COUNTERMAND.with(|enabled| enabled.set(Some(true)));
     let fixture = Fixture::new();
     fixture.start(None);
     fixture
@@ -976,6 +978,7 @@ fn rename_journals_validate_like_the_python_edition() {
 
 #[test]
 fn the_countermand_stops_when_the_occupant_changes_after_the_interrupt() {
+    TEST_COUNTERMAND.with(|enabled| enabled.set(Some(true)));
     let fixture = Fixture::new();
     fixture.start(None);
     fixture
@@ -1024,6 +1027,7 @@ const LONG: &str = "a long enough instruction for the worker only";
 
 #[test]
 fn a_note_that_never_shows_in_the_wrong_pane_is_not_a_recovery() {
+    TEST_COUNTERMAND.with(|enabled| enabled.set(Some(true)));
     TEST_READBACK.with(|limit| limit.set(Some(Duration::ZERO)));
     let fixture = Fixture::new();
     fixture.start(None);
@@ -1049,6 +1053,7 @@ fn a_note_that_never_shows_in_the_wrong_pane_is_not_a_recovery() {
 
 #[test]
 fn a_countermand_needs_the_wrong_panes_input_lock() {
+    TEST_COUNTERMAND.with(|enabled| enabled.set(Some(true)));
     TEST_COUNTERMAND_LOCK.with(|limit| limit.set(Some(Duration::from_millis(50))));
     TEST_READBACK.with(|limit| limit.set(Some(Duration::ZERO)));
     let fixture = Fixture::new();
@@ -1076,24 +1081,78 @@ fn a_countermand_needs_the_wrong_panes_input_lock() {
 }
 
 #[test]
-fn a_peer_window_moving_past_an_old_match_is_uncertain() {
+fn a_full_peer_window_with_an_old_match_is_uncertain() {
     let fixture = Fixture::new();
     fixture.start(None);
     add_bystander(&fixture);
-    fixture.client.scrollback.lock().unwrap().insert(
-        "peer".to_owned(),
-        vec![LONG.to_owned(), "output after the old match".to_owned()],
-    );
-    *fixture.client.scrollback_on_effect.lock().unwrap() = Some((
-        "peer".to_owned(),
-        vec!["output after the old match".to_owned(), LONG.to_owned()],
-    ));
+    let mut lines: Vec<String> = (0..SCROLLBACK_LINES - 1)
+        .map(|index| format!("line {index}"))
+        .collect();
+    lines.push(LONG.to_owned());
+    fixture
+        .client
+        .scrollback
+        .lock()
+        .unwrap()
+        .insert("peer".to_owned(), lines);
     let error = send(&fixture, "worker", LONG).expect_err("quarantined");
     assert!(
         error.to_string().contains("cannot be attributed"),
         "{error}"
     );
     assert!(fixture.client.keys_sent.lock().unwrap().is_empty());
+}
+
+#[test]
+fn by_default_a_pane_swap_is_quarantined_and_nothing_is_typed() {
+    TEST_COUNTERMAND.with(|enabled| enabled.set(Some(false)));
+    let fixture = Fixture::new();
+    fixture.start(None);
+    fixture
+        .client
+        .replace_harness_before_effect
+        .store(true, Ordering::SeqCst);
+    let error = send(&fixture, "worker", LONG).expect_err("quarantined");
+    assert_eq!(
+        error.outcome(),
+        Some(agent::QueueOutcome::PossiblySubmitted),
+        "{error}"
+    );
+    assert!(
+        error.to_string().contains("nothing typed into any pane"),
+        "{error}"
+    );
+    assert!(fixture.client.keys_sent.lock().unwrap().is_empty());
+    assert!(!runs(&fixture).contains(&MISROUTE_NOTE.to_owned()));
+    let entries = misroutes(&fixture, "worker");
+    assert_eq!(entries[0]["interrupted"], false);
+    assert!(entries[0]["skipped"]
+        .as_str()
+        .unwrap()
+        .contains("countermand is off"));
+}
+
+#[test]
+fn a_prompt_the_target_never_shows_is_quarantined_as_unproven() {
+    let fixture = Fixture::new();
+    fixture.start(None);
+    fixture
+        .client
+        .redirect_once
+        .lock()
+        .unwrap()
+        .insert("owned".to_owned(), "void".to_owned());
+    TEST_READBACK.with(|limit| limit.set(Some(Duration::ZERO)));
+    let error = send(&fixture, "worker", LONG).expect_err("unproven");
+    assert_eq!(
+        error.outcome(),
+        Some(agent::QueueOutcome::PossiblySubmitted),
+        "{error}"
+    );
+    assert!(
+        error.to_string().contains("delivery is unproven"),
+        "{error}"
+    );
 }
 
 #[test]

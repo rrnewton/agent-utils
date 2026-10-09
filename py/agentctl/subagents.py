@@ -937,6 +937,10 @@ def _goal_replacement_selected(screen: str, objective: str) -> bool:
 READBACK_SECONDS = 5.0
 #: Shorter prompts are too common to attribute to another pane by their text.
 _ATTRIBUTABLE = 12
+#: Lines of scrollback each read-back reads; a read this long may have lost old lines.
+SCROLLBACK_LINES = 400
+#: Opt-in for countermanding a misroute; by default a misroute is only quarantined.
+COUNTERMAND_ENV = "AGENTCTL_MISROUTE_COUNTERMAND"
 #: Longest wait for another pane's input lock before a countermand gives up.
 _COUNTERMAND_LOCK_SECONDS = 2.0
 #: Receipt evidence that already shows the prompt text in the target pane itself.
@@ -1052,6 +1056,8 @@ class _WorkspaceClient:
         self.peer_panes = peer_panes
         #: Other registered agents' pane and terminal claims, checked before input.
         self.claims = claims
+        #: Whether a misroute is countermanded (Esc and a note) instead of only quarantined.
+        self.countermand_enabled = os.environ.get(COUNTERMAND_ENV) == "1"
 
     def _snapshot(self, pane_id: str, text: str) -> dict[str, tuple[int, int]]:
         """Before sending: how often the prompt shows, and how far its last occurrence is
@@ -1069,21 +1075,22 @@ class _WorkspaceClient:
             raise PromptNotStaged(f"cannot read scrollback before sending: {exc}; nothing was typed") from exc
 
     def _window(self, pane: str, text: str) -> tuple[int, int]:
-        compact = _compact(self.client.read_scrollback(pane))
-        needle = _suffix(text, 40)
-        last = compact.rfind(needle)
-        return compact.count(needle), (len(compact) - last if last >= 0 else -1)
+        """How often the text shows, and whether the read window was full (1) or not (0)."""
+        screen = self.client.read_scrollback(pane)
+        full = int(len(screen.splitlines()) >= SCROLLBACK_LINES)
+        return _compact(screen).count(_suffix(text, 40)), full
 
     def _observe(self, pane: str, text: str, before: dict[str, tuple[int, int]]) -> str:
-        """``fresh`` when the text shows more often than before; ``uncertain`` when it does
-        not, yet its last occurrence is nearer the end of the window than before (an old
-        one may have scrolled out as a new one came in); otherwise ``absent``. Output
-        after an old occurrence only moves it away from the end."""
-        count, distance = self._window(pane, text)
-        old_count, old_distance = before.get(pane, (0, -1))
+        """``fresh`` when the text shows more often than before. When it does not, a pane
+        that already showed it and whose window is full is ``uncertain``: an old
+        occurrence may have scrolled out as a new one came in, which the counts cannot
+        tell apart. Otherwise ``absent``: in a window that never filled nothing scrolled
+        out, so a new occurrence would have raised the count."""
+        count, full = self._window(pane, text)
+        old_count, old_full = before.get(pane, (0, 0))
         if count > old_count:
             return "fresh"
-        if old_count > 0 and 0 <= distance < old_distance:
+        if old_count > 0 and (full or old_full):
             return "uncertain"
         return "absent"
 
@@ -1101,11 +1108,12 @@ class _WorkspaceClient:
 
     def _deliver_checked(
         self, pane_id: str, command: str, guarded: _GuardedTerminal,
+        submit: Callable[[], SubmissionReceipt | None],
     ) -> SubmissionReceipt | None:
         """Submit, then attribute the prompt to where it actually appeared."""
         before = self._snapshot(pane_id, command)
         try:
-            receipt = self.client.prompt_agent(pane_id, command, terminal=guarded)
+            receipt = submit()
         except ProbableMisroute as exc:
             self._countermand(pane_id, command, "identity-changed-after-write", str(exc))
         except PromptNotStaged:
@@ -1141,16 +1149,16 @@ class _WorkspaceClient:
         self, pane_id: str, text: str, receipt: SubmissionReceipt | None,
         before: dict[str, tuple[int, int]],
     ) -> None:
-        """Prove the prompt reached this record's pane, or countermand where it went.
+        """Prove the prompt reached this record's pane, or quarantine it.
 
         Evidence for the target: a receipt that saw the prompt printed there, or the
-        prompt newly in its scrollback within ``READBACK_SECONDS``. Every other
-        registered agent's pane is inspected as well. The prompt newly in exactly one of
-        them, and not in the target, is countermanded there. Newly in the target and a
-        peer, in several peers, or a peer whose window moved past an old match, cannot
-        be told apart: the message is quarantined without a note. A verified submission
-        that the target never shows is quarantined too; a native prompt goes on to
-        Herdr's working-state confirmation, and is logged as not seen.
+        prompt newly in its scrollback within ``READBACK_SECONDS``, each followed by a
+        passing recipient check. Every other registered agent's pane is inspected as
+        well. The prompt newly in exactly one of them, and not in the target, is a
+        misroute (quarantined; countermanded only when that is enabled). Newly in the
+        target and a peer, in several peers, or a peer whose full window cannot rule
+        out a new occurrence: quarantined without a note. A prompt the target never
+        shows is unproven and quarantined, whatever confirmed the submission.
         """
         try:
             self.verify_recipient(pane_id)
@@ -1177,13 +1185,13 @@ class _WorkspaceClient:
             )
         if in_target:
             return
+        # A confirmation without target evidence proves nothing about the recipient.
         logged = self._log_readback(pane_id, text, "not-seen", {"receipt": receipt is not None})
-        if receipt is not None or not logged:
-            raise AgentDeliveryError(
-                f"prompt for agent {self.record.name!r} was submitted but never showed in pane "
-                f"{pane_id} within {READBACK_SECONDS:g}s; delivery is unproven"
-                + ("" if logged else " (the read-back log could not be written)")
-            )
+        raise AgentDeliveryError(
+            f"prompt for agent {self.record.name!r} was submitted but never showed in pane "
+            f"{pane_id} within {READBACK_SECONDS:g}s; delivery is unproven"
+            + ("" if logged else " (the read-back log could not be written)")
+        )
 
     def _occupant(self, pane: str) -> tuple[str | None, str | None, CustomProcessIdentity | None]:
         info = self.client.pane_info(pane)
@@ -1206,6 +1214,21 @@ class _WorkspaceClient:
         interrupted = note_sent = note_confirmed = False
         skipped: str | None = None
         lock = None
+        if not self.countermand_enabled:
+            logged = self._log_misroute({
+                "at": time.time(), "agent": self.record.name, "token": self.record.token,
+                "detection": detection, "detail": detail,
+                "intended_pane": self.record.pane_id, "intended_terminal": self.record.terminal_id,
+                "observed_pane": wrong_pane, "interrupted": False, "note_sent": False,
+                "note_confirmed": False,
+                "skipped": f"automatic countermand is off ({COUNTERMAND_ENV}=1 enables it); nothing typed",
+                "message_id": self._inflight_message_id(text),
+            })
+            raise ProbableMisroute(
+                f"prompt for agent {self.record.name!r} probably reached pane {wrong_pane} "
+                f"({detection}); quarantined, nothing typed into any pane: {detail}"
+                + ("" if logged else " (the misroute log could not be written)")
+            )
         if wrong_pane != self.record.pane_id:
             try:
                 lock = agent._lock_target_within(wrong_pane, "pane input lock", _COUNTERMAND_LOCK_SECONDS)
@@ -1544,12 +1567,17 @@ class _WorkspaceClient:
                 )
             if self.pane_info(pane_id).status != "idle":
                 raise HerdrUnavailable(f"relayed {self.record.harness} in pane {pane_id} is not idle")
-            return submit_verified(
-                self._guarded(),
-                pane_id, self.record.harness, command,
+            relay = self._guarded()
+            return self._deliver_checked(
+                pane_id, command, relay,
+                lambda: submit_verified(relay, pane_id, self.record.harness, command),
             )
         if self.record.adapter != "herdr-pane":
-            return self._deliver_checked(pane_id, command, self._guarded())
+            native = self._guarded()
+            return self._deliver_checked(
+                pane_id, command, native,
+                lambda: self.client.prompt_agent(pane_id, command, terminal=native),
+            )
         if "\0" in command or "\x1b" in command:
             raise HerdrUnavailable(
                 "Muse pane prompts cannot contain NUL or terminal escape characters"
