@@ -1427,11 +1427,15 @@ fn deliver_one<A: AgentApi + ?Sized>(
         // The screen already proved the prompt left the composer. A lifecycle
         // transition adds nothing and is absent when the agent queues the prompt.
         // A weak verification counts only once its wait settled: see `SubmissionReceipt::settled`.
-        Submission::Verified(receipt) => {
-            return Ok(Delivered::Confirmed {
-                verified: receipt.printed || receipt.settled,
-            })
+        // A receipt that neither printed nor settled proves nothing about the recipient.
+        Submission::Verified(receipt) if !receipt.printed && !receipt.settled => {
+            return Err(AgentError::delivery(format!(
+                "pane {} submission receipt neither printed nor settled; prompt may have been submitted",
+                info.pane_id
+            ))
+            .into())
         }
+        Submission::Verified(_) => return Ok(Delivered::Confirmed { verified: true }),
         Submission::NotStaged(reason) => return Ok(Delivered::NotStaged(reason)),
         Submission::Unconfirmed => {}
     }
@@ -1448,6 +1452,12 @@ fn deliver_one<A: AgentApi + ?Sized>(
                 )),
                 probable_misroute: true,
             })),
+            // The confirmation came from a pane that no longer holds the recipient.
+            AdapterErrorKind::RecipientChanged => Some(Err(AgentError::delivery(format!(
+                "pane {} did not confirm idle/done -> working submission: {error}",
+                info.pane_id
+            ))
+            .into())),
             _ => None,
         }
     };
@@ -2817,6 +2827,8 @@ mod tests {
         fail_run: bool,
         fail_wait: bool,
         unwrapped_empty: bool,
+        /// A receipt the submission returns after writing, instead of `Unconfirmed`.
+        receipt: Option<crate::submission::SubmissionReceipt>,
     }
 
     struct FakeAgent {
@@ -2957,9 +2969,11 @@ mod tests {
                         runtime,
                     )
                 }
-                None => self
-                    .run_with_runtime(pane_id, text, runtime)
-                    .map(|()| Submission::Unconfirmed),
+                None => {
+                    self.run_with_runtime(pane_id, text, runtime)?;
+                    let receipt = self.state.lock().expect("fake state").receipt.clone();
+                    Ok(receipt.map_or(Submission::Unconfirmed, Submission::Verified))
+                }
             }
         }
 
@@ -3349,6 +3363,45 @@ mod tests {
         assert!(
             fake.waits().is_empty(),
             "screen proof replaces the working wait"
+        );
+    }
+
+    #[test]
+    fn a_receipt_that_neither_printed_nor_settled_is_quarantined() {
+        let directory = TestDirectory::new("unproven-receipt");
+        let fake = FakeAgent::new(&["idle"]);
+        fake.state.lock().expect("fake state").receipt =
+            Some(crate::submission::SubmissionReceipt {
+                key: "Enter",
+                key_presses: 1,
+                elapsed: Duration::from_millis(10),
+                evidence: "the composer emptied".to_owned(),
+                printed: false,
+                settled: false,
+            });
+        let runtime = FakeRuntime::default();
+        let error = send_with_runtime(
+            &fake,
+            &target(),
+            directory.path(),
+            "a receipt proves nothing",
+            DrainOptions::default(),
+            &runtime,
+        )
+        .unwrap_err();
+        assert_eq!(
+            error.outcome(),
+            Some(QueueOutcome::PossiblySubmitted),
+            "{error}"
+        );
+        assert!(
+            error.to_string().contains("neither printed nor settled"),
+            "{error}"
+        );
+        assert_eq!(fake.runs(), ["a receipt proves nothing"]);
+        assert_eq!(
+            json_paths(&directory.path().join("failed")).unwrap().len(),
+            1
         );
     }
 

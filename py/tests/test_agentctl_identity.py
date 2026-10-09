@@ -802,21 +802,27 @@ def test_countermand_needs_the_wrong_panes_input_lock(
     assert fake.keys_sent == []
 
 
-def test_full_peer_window_with_an_old_match_is_uncertain(
+def test_window_moving_past_an_old_match_in_a_peer_is_uncertain(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    # The peer's window is full, so an old match may have scrolled out as a new one came
-    # in: equal counts cannot tell those histories apart, even though the target shows it.
     manager, fake, pane = _started(tmp_path, monkeypatch)
     manager.start("bystander", cwd=str(tmp_path), harness="claude")
     other = manager.get("bystander").pane_id or ""
     monkeypatch.setattr(subagents, "READBACK_SECONDS", 0.0)
     text = "a long enough instruction for the worker only"
-    filler = [f"line {index}" for index in range(subagents.SCROLLBACK_LINES)]
-    fake.transcripts[other] = [*filler[:-1], text]
+    fake.transcripts[other] = [text, "output after the old match"]
+
+    def scroll_peer(effect_pane: str) -> None:
+        fake.before_effect = None
+        # The old match scrolls out of the peer's window as a new one arrives.
+        fake.transcripts[other] = ["output after the old match", text]
+
+    fake.before_effect = scroll_peer
+    fake.infos["w1:void"] = fake.infos[pane]
+    fake.redirect_once[pane] = "w1:void"
     with pytest.raises(AgentPossiblySubmitted, match="cannot be attributed"):
         manager.send("worker", text)
-    assert fake.keys_sent == [] and fake.transcripts[pane][-1] == text
+    assert fake.keys_sent == []
 
 
 def test_by_default_a_pane_swap_is_quarantined_and_nothing_is_typed(
@@ -917,9 +923,11 @@ def test_failed_readback_log_on_an_unverified_accept_quarantines(
         manager.send("worker", "a long enough instruction for the worker only")
 
 
-def test_a_peer_that_keeps_working_after_an_old_match_is_not_uncertain(
+def test_a_peer_that_changed_after_an_old_match_is_uncertain(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    # A peer that already showed this text and whose window changed during the send:
+    # equal counts cannot rule out an old copy leaving as a new one arrived.
     manager, fake, _pane = _started(tmp_path, monkeypatch)
     manager.start("bystander", cwd=str(tmp_path), harness="claude")
     other = manager.get("bystander").pane_id or ""
@@ -932,8 +940,39 @@ def test_a_peer_that_keeps_working_after_an_old_match_is_not_uncertain(
         fake.transcripts[other] = [text, "more of its own output"]
 
     fake.before_effect = peer_works_on
+    with pytest.raises(AgentPossiblySubmitted, match="cannot be attributed"):
+        manager.send("worker", text)
+    assert fake.keys_sent == []
+
+
+def test_a_repeat_while_an_unchanged_peer_shows_the_old_copy_is_delivered(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The peer's full window is byte-identical before and after the send: it received
+    # nothing, so the old copy there does not make the repeat ambiguous.
+    manager, fake, pane = _started(tmp_path, monkeypatch)
+    manager.start("bystander", cwd=str(tmp_path), harness="claude")
+    other = manager.get("bystander").pane_id or ""
+    monkeypatch.setattr(subagents, "READBACK_SECONDS", 0.0)
+    text = "a long enough instruction for the worker only"
+    fake.transcripts[other] = [*(f"line {index}" for index in range(399)), text]
     manager.send("worker", text)
-    assert fake.keys_sent == [] and fake.submitted[-1] == text
+    manager.send("worker", text)
+    assert fake.transcripts[pane][-2:] == [text, text] and fake.keys_sent == []
+
+
+def test_confirmation_with_a_replaced_harness_is_quarantined(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Herdr confirms the working state, but by then another program holds the pane.
+    manager, fake, pane = _started(tmp_path, monkeypatch)
+
+    def working_then_replaced(pane_id: str, status: str, timeout_ms: int) -> None:
+        fake.harness_pids[pane_id] = 999
+
+    monkeypatch.setattr(fake, "wait_agent_status", working_then_replaced)
+    with pytest.raises(AgentPossiblySubmitted, match="did not confirm"):
+        manager.send("worker", "a long enough instruction for the worker only")
 
 
 def test_relay_submission_needs_evidence_in_the_target(

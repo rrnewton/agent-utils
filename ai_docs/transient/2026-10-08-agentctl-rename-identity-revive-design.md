@@ -425,8 +425,20 @@ countermand (H4).
 | Round-4 finding | Stage 1 |
 |---|---|
 | B3 delivered not occupant-bound | Every delivered result needs target evidence (printed receipt or a new occurrence in the target's scrollback) and a passing recipient check. A prompt the target never shows is quarantined on every path, native prompts included (Herdr's working event alone no longer counts); relay submissions go through the same read-back; a Rust receipt counts only when printed |
-| H5 indistinguishable windows | A pane that already showed the text and whose 400-line window is full is uncertain unless the count rose, so the message is quarantined. A window that never filled cannot have lost an occurrence |
+| H5 indistinguishable windows | Superseded in round 5 (below) |
 | Countermand reachable by default | Off unless `AGENTCTL_MISROUTE_COUNTERMAND=1`; with it off a misroute is logged and quarantined and nothing is typed into any pane |
+
+### Round 5 (stage 1)
+
+| Round-5 finding | Fix (both editions unless noted) |
+|---|---|
+| H5 regression: the original rolling-window tests were replaced | The round-4 tests are restored unchanged. A pane that already showed the text and whose count did not rise is `uncertain` in a window of any length, so the message is quarantined |
+| Freshness | Each pane's snapshot carries a SHA-256 digest of the scrollback read. A pane whose read is byte-identical before and after the send received nothing and is `absent`, so a repeated prompt while an idle peer shows the old copy is delivered; a changed window with an old match quarantines |
+| B3a confirmation not recipient-bound | After the working-state confirmation (native, Muse and relay paths) the full pinned-recipient check runs; a mismatch quarantines as possibly submitted |
+| B3b (Rust) unproven receipt | A receipt that neither printed nor settled is quarantined instead of confirmed |
+
+Deferred to a follow-up issue: staged composer text read back as a fresh occurrence, and raw
+queue clients that bypass the managed read-back.
 
 ## C. What was built and how it was verified (2026-10-08)
 

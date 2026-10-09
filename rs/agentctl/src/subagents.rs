@@ -2316,7 +2316,7 @@ impl<A: ManagedApi + ?Sized> WorkspaceClient<'_, A> {
         &self,
         pane_id: &str,
         text: &str,
-    ) -> crate::error::Result<BTreeMap<String, (usize, bool)>> {
+    ) -> crate::error::Result<BTreeMap<String, (usize, [u8; 32])>> {
         let mut panes = vec![pane_id.to_owned()];
         if crate::submission::suffix(text, 40).chars().count() >= ATTRIBUTABLE {
             panes.extend(self.peer_panes().into_iter().filter(|peer| peer != pane_id));
@@ -2333,32 +2333,33 @@ impl<A: ManagedApi + ?Sized> WorkspaceClient<'_, A> {
         Ok(windows)
     }
 
-    /// How often the text shows, and whether the read window was full.
-    fn window(&self, pane: &str, text: &str) -> crate::error::Result<(usize, bool)> {
+    /// How often the text shows, and a digest of the whole scrollback read.
+    fn window(&self, pane: &str, text: &str) -> crate::error::Result<(usize, [u8; 32])> {
         let screen = self.client.read_scrollback(pane)?;
-        let full = screen.lines().count() >= SCROLLBACK_LINES;
         let count = crate::submission::compact(&screen)
             .matches(&crate::submission::suffix(text, 40))
             .count();
-        Ok((count, full))
+        Ok((count, Sha256::digest(screen.as_bytes()).into()))
     }
 
-    /// `fresh` when the text shows more often than before. When it does not, a pane that
-    /// already showed it and whose window is full is `uncertain`: an old occurrence may have
-    /// scrolled out as a new one came in, which the counts cannot tell apart. Otherwise
-    /// `absent`: in a window that never filled nothing scrolled out, so a new occurrence
-    /// would have raised the count.
+    /// `absent` when the pane's scrollback is byte-identical to the snapshot: it received
+    /// nothing. Otherwise `fresh` when the text shows more often than before, and `uncertain`
+    /// when the pane already showed it: an old occurrence may have scrolled or redrawn out as
+    /// a new one came in, which equal counts cannot tell apart, whatever the window's length.
+    /// Otherwise `absent`.
     fn observe(
         &self,
         pane: &str,
         text: &str,
-        before: &BTreeMap<String, (usize, bool)>,
+        before: &BTreeMap<String, (usize, [u8; 32])>,
     ) -> crate::error::Result<&'static str> {
-        let (count, full) = self.window(pane, text)?;
-        let (old_count, old_full) = before.get(pane).copied().unwrap_or((0, false));
-        Ok(if count > old_count {
+        let (count, digest) = self.window(pane, text)?;
+        let (old_count, old_digest) = before.get(pane).copied().unwrap_or((0, [0; 32]));
+        Ok(if digest == old_digest {
+            "absent"
+        } else if count > old_count {
             "fresh"
-        } else if old_count > 0 && (full || old_full) {
+        } else if old_count > 0 {
             "uncertain"
         } else {
             "absent"
@@ -2370,7 +2371,7 @@ impl<A: ManagedApi + ?Sized> WorkspaceClient<'_, A> {
         &self,
         pane_id: &str,
         text: &str,
-        before: &BTreeMap<String, (usize, bool)>,
+        before: &BTreeMap<String, (usize, [u8; 32])>,
         runtime: &dyn agent::AgentRuntime,
     ) -> crate::error::Result<bool> {
         let deadline = runtime.monotonic() + readback_limit();
@@ -2390,7 +2391,7 @@ impl<A: ManagedApi + ?Sized> WorkspaceClient<'_, A> {
         &self,
         pane_id: &str,
         text: &str,
-        before: &BTreeMap<String, (usize, bool)>,
+        before: &BTreeMap<String, (usize, [u8; 32])>,
     ) -> crate::error::Result<BTreeMap<String, &'static str>> {
         let mut states = BTreeMap::new();
         for peer in before.keys().filter(|peer| peer.as_str() != pane_id) {
@@ -2406,7 +2407,7 @@ impl<A: ManagedApi + ?Sized> WorkspaceClient<'_, A> {
         &self,
         pane_id: &str,
         text: &str,
-        before: &BTreeMap<String, (usize, bool)>,
+        before: &BTreeMap<String, (usize, [u8; 32])>,
         detail: &str,
         runtime: &dyn agent::AgentRuntime,
     ) -> crate::error::Result<()> {
@@ -2444,7 +2445,7 @@ impl<A: ManagedApi + ?Sized> WorkspaceClient<'_, A> {
         pane_id: &str,
         text: &str,
         submission: &Submission,
-        before: &BTreeMap<String, (usize, bool)>,
+        before: &BTreeMap<String, (usize, [u8; 32])>,
         runtime: &dyn agent::AgentRuntime,
     ) -> crate::error::Result<()> {
         let recipient_holds = || -> crate::error::Result<()> {
@@ -2856,6 +2857,181 @@ impl<A: ManagedApi + ?Sized> WorkspaceClient<'_, A> {
     }
 }
 
+impl<A: ManagedApi + ?Sized> WorkspaceClient<'_, A> {
+    fn wait_agent_status_unchecked(
+        &self,
+        pane_id: &str,
+        status: &str,
+        timeout_ms: u64,
+    ) -> crate::error::Result<()> {
+        if self.record.adapter == "herdr-relay" {
+            return self.relay_wait(pane_id, status, timeout_ms);
+        }
+        if self.record.adapter == "herdr-pane" && status == "working" {
+            let submission = self
+                .custom_submission
+                .lock()
+                .expect("custom submission lock poisoned")
+                .clone()
+                .ok_or_else(|| {
+                    crate::error::AdapterError::unavailable(
+                        "custom pane harness has no pending submission receipt",
+                    )
+                })?;
+            let deadline = Instant::now() + Duration::from_millis(timeout_ms);
+            loop {
+                self.client.verify_custom_harness(
+                    pane_id,
+                    &self.record.harness,
+                    self.record.custom_process_identity.as_ref(),
+                )?;
+                let screen = self.client.read(pane_id, "visible", Some(200))?;
+                if screen != submission.staged_screen
+                    && muse_prompt_transcript_count(&screen, &submission.text)
+                        > submission.prior_transcript_count
+                    && !muse_prompt_in_composer(&screen, &submission.text)
+                {
+                    *self
+                        .custom_submission
+                        .lock()
+                        .expect("custom submission lock poisoned") = None;
+                    return Ok(());
+                }
+                if Instant::now() >= deadline {
+                    return Err(crate::error::AdapterError::unavailable(
+                        "Muse did not show a verified post-Enter screen transition",
+                    ));
+                }
+                std::thread::sleep(
+                    Duration::from_millis(50)
+                        .min(deadline.saturating_duration_since(Instant::now())),
+                );
+            }
+        }
+        let Some(objective) = self
+            .goal_objective
+            .lock()
+            .expect("goal operation lock poisoned")
+            .clone()
+            .filter(|_| status == "working")
+        else {
+            return self.client.wait_agent_status(pane_id, status, timeout_ms);
+        };
+        let start = Instant::now();
+        if self
+            .client
+            .wait_agent_status(pane_id, status, timeout_ms.min(1000))
+            .is_ok()
+        {
+            return Ok(());
+        }
+        self.pane_info(pane_id)?;
+        let screen = self.client.read(pane_id, "visible", Some(200))?;
+        if goal_replacement_selected(&screen, &objective) {
+            let runtime = agent::SystemRuntime::default();
+            self.confirm_goal_replacement(pane_id, &runtime)?;
+        }
+        let elapsed = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
+        self.client
+            .wait_agent_status(pane_id, status, timeout_ms.saturating_sub(elapsed).max(1))
+    }
+
+    fn wait_agent_status_with_runtime_unchecked(
+        &self,
+        pane_id: &str,
+        status: &str,
+        timeout_ms: u64,
+        runtime: &dyn agent::AgentRuntime,
+    ) -> crate::error::Result<()> {
+        if self.record.adapter == "herdr-relay" {
+            let _ = runtime;
+            return self.relay_wait(pane_id, status, timeout_ms);
+        }
+        if self.record.adapter == "herdr-pane" && status == "working" {
+            let submission = self
+                .custom_submission
+                .lock()
+                .expect("custom submission lock poisoned")
+                .clone()
+                .ok_or_else(|| {
+                    crate::error::AdapterError::unavailable(
+                        "custom pane harness has no pending submission receipt",
+                    )
+                })?;
+            let deadline = Instant::now() + Duration::from_millis(timeout_ms);
+            loop {
+                if runtime.cancelled() {
+                    return Err(crate::error::AdapterError::unavailable(
+                        "Herdr control operation was cancelled",
+                    ));
+                }
+                self.client.verify_custom_harness_with_runtime(
+                    pane_id,
+                    &self.record.harness,
+                    self.record.custom_process_identity.as_ref(),
+                    runtime,
+                )?;
+                let screen =
+                    self.client
+                        .read_with_runtime(pane_id, "visible", Some(200), runtime)?;
+                if screen != submission.staged_screen
+                    && muse_prompt_transcript_count(&screen, &submission.text)
+                        > submission.prior_transcript_count
+                    && !muse_prompt_in_composer(&screen, &submission.text)
+                {
+                    *self
+                        .custom_submission
+                        .lock()
+                        .expect("custom submission lock poisoned") = None;
+                    return Ok(());
+                }
+                if Instant::now() >= deadline {
+                    return Err(crate::error::AdapterError::unavailable(
+                        "Muse did not show a verified post-Enter screen transition",
+                    ));
+                }
+                std::thread::sleep(
+                    Duration::from_millis(50)
+                        .min(deadline.saturating_duration_since(Instant::now())),
+                );
+            }
+        }
+        let Some(objective) = self
+            .goal_objective
+            .lock()
+            .expect("goal operation lock poisoned")
+            .clone()
+            .filter(|_| status == "working")
+        else {
+            return self
+                .client
+                .wait_agent_status_with_runtime(pane_id, status, timeout_ms, runtime);
+        };
+        let start = Instant::now();
+        if self
+            .client
+            .wait_agent_status_with_runtime(pane_id, status, timeout_ms.min(1000), runtime)
+            .is_ok()
+        {
+            return Ok(());
+        }
+        self.pane_info_with_runtime(pane_id, runtime)?;
+        let screen = self
+            .client
+            .read_with_runtime(pane_id, "visible", Some(200), runtime)?;
+        if goal_replacement_selected(&screen, &objective) {
+            self.confirm_goal_replacement(pane_id, runtime)?;
+        }
+        let elapsed = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
+        self.client.wait_agent_status_with_runtime(
+            pane_id,
+            status,
+            timeout_ms.saturating_sub(elapsed).max(1),
+            runtime,
+        )
+    }
+}
+
 impl<A: ManagedApi + ?Sized> AgentApi for WorkspaceClient<'_, A> {
     fn panes(&self) -> crate::error::Result<Vec<Pane>> {
         Ok(self
@@ -3016,76 +3192,12 @@ impl<A: ManagedApi + ?Sized> AgentApi for WorkspaceClient<'_, A> {
         status: &str,
         timeout_ms: u64,
     ) -> crate::error::Result<()> {
-        if self.record.adapter == "herdr-relay" {
-            return self.relay_wait(pane_id, status, timeout_ms);
+        self.wait_agent_status_unchecked(pane_id, status, timeout_ms)?;
+        // A replacement's state must never confirm delivery to the recorded recipient.
+        if status == "working" {
+            self.verify_recipient(pane_id, true)?;
         }
-        if self.record.adapter == "herdr-pane" && status == "working" {
-            let submission = self
-                .custom_submission
-                .lock()
-                .expect("custom submission lock poisoned")
-                .clone()
-                .ok_or_else(|| {
-                    crate::error::AdapterError::unavailable(
-                        "custom pane harness has no pending submission receipt",
-                    )
-                })?;
-            let deadline = Instant::now() + Duration::from_millis(timeout_ms);
-            loop {
-                self.client.verify_custom_harness(
-                    pane_id,
-                    &self.record.harness,
-                    self.record.custom_process_identity.as_ref(),
-                )?;
-                let screen = self.client.read(pane_id, "visible", Some(200))?;
-                if screen != submission.staged_screen
-                    && muse_prompt_transcript_count(&screen, &submission.text)
-                        > submission.prior_transcript_count
-                    && !muse_prompt_in_composer(&screen, &submission.text)
-                {
-                    *self
-                        .custom_submission
-                        .lock()
-                        .expect("custom submission lock poisoned") = None;
-                    return Ok(());
-                }
-                if Instant::now() >= deadline {
-                    return Err(crate::error::AdapterError::unavailable(
-                        "Muse did not show a verified post-Enter screen transition",
-                    ));
-                }
-                std::thread::sleep(
-                    Duration::from_millis(50)
-                        .min(deadline.saturating_duration_since(Instant::now())),
-                );
-            }
-        }
-        let Some(objective) = self
-            .goal_objective
-            .lock()
-            .expect("goal operation lock poisoned")
-            .clone()
-            .filter(|_| status == "working")
-        else {
-            return self.client.wait_agent_status(pane_id, status, timeout_ms);
-        };
-        let start = Instant::now();
-        if self
-            .client
-            .wait_agent_status(pane_id, status, timeout_ms.min(1000))
-            .is_ok()
-        {
-            return Ok(());
-        }
-        self.pane_info(pane_id)?;
-        let screen = self.client.read(pane_id, "visible", Some(200))?;
-        if goal_replacement_selected(&screen, &objective) {
-            let runtime = agent::SystemRuntime::default();
-            self.confirm_goal_replacement(pane_id, &runtime)?;
-        }
-        let elapsed = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
-        self.client
-            .wait_agent_status(pane_id, status, timeout_ms.saturating_sub(elapsed).max(1))
+        Ok(())
     }
     fn read(
         &self,
@@ -3345,92 +3457,12 @@ impl<A: ManagedApi + ?Sized> AgentApi for WorkspaceClient<'_, A> {
         timeout_ms: u64,
         runtime: &dyn agent::AgentRuntime,
     ) -> crate::error::Result<()> {
-        if self.record.adapter == "herdr-relay" {
-            let _ = runtime;
-            return self.relay_wait(pane_id, status, timeout_ms);
+        self.wait_agent_status_with_runtime_unchecked(pane_id, status, timeout_ms, runtime)?;
+        // A replacement's state must never confirm delivery to the recorded recipient.
+        if status == "working" {
+            self.verify_recipient(pane_id, true)?;
         }
-        if self.record.adapter == "herdr-pane" && status == "working" {
-            let submission = self
-                .custom_submission
-                .lock()
-                .expect("custom submission lock poisoned")
-                .clone()
-                .ok_or_else(|| {
-                    crate::error::AdapterError::unavailable(
-                        "custom pane harness has no pending submission receipt",
-                    )
-                })?;
-            let deadline = Instant::now() + Duration::from_millis(timeout_ms);
-            loop {
-                if runtime.cancelled() {
-                    return Err(crate::error::AdapterError::unavailable(
-                        "Herdr control operation was cancelled",
-                    ));
-                }
-                self.client.verify_custom_harness_with_runtime(
-                    pane_id,
-                    &self.record.harness,
-                    self.record.custom_process_identity.as_ref(),
-                    runtime,
-                )?;
-                let screen =
-                    self.client
-                        .read_with_runtime(pane_id, "visible", Some(200), runtime)?;
-                if screen != submission.staged_screen
-                    && muse_prompt_transcript_count(&screen, &submission.text)
-                        > submission.prior_transcript_count
-                    && !muse_prompt_in_composer(&screen, &submission.text)
-                {
-                    *self
-                        .custom_submission
-                        .lock()
-                        .expect("custom submission lock poisoned") = None;
-                    return Ok(());
-                }
-                if Instant::now() >= deadline {
-                    return Err(crate::error::AdapterError::unavailable(
-                        "Muse did not show a verified post-Enter screen transition",
-                    ));
-                }
-                std::thread::sleep(
-                    Duration::from_millis(50)
-                        .min(deadline.saturating_duration_since(Instant::now())),
-                );
-            }
-        }
-        let Some(objective) = self
-            .goal_objective
-            .lock()
-            .expect("goal operation lock poisoned")
-            .clone()
-            .filter(|_| status == "working")
-        else {
-            return self
-                .client
-                .wait_agent_status_with_runtime(pane_id, status, timeout_ms, runtime);
-        };
-        let start = Instant::now();
-        if self
-            .client
-            .wait_agent_status_with_runtime(pane_id, status, timeout_ms.min(1000), runtime)
-            .is_ok()
-        {
-            return Ok(());
-        }
-        self.pane_info_with_runtime(pane_id, runtime)?;
-        let screen = self
-            .client
-            .read_with_runtime(pane_id, "visible", Some(200), runtime)?;
-        if goal_replacement_selected(&screen, &objective) {
-            self.confirm_goal_replacement(pane_id, runtime)?;
-        }
-        let elapsed = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
-        self.client.wait_agent_status_with_runtime(
-            pane_id,
-            status,
-            timeout_ms.saturating_sub(elapsed).max(1),
-            runtime,
-        )
+        Ok(())
     }
 
     fn read_with_runtime(
@@ -8422,6 +8454,7 @@ pub(crate) mod tests {
                     redirect_once: Mutex::new(BTreeMap::new()),
                     keys_sent: Mutex::new(Vec::new()),
                     replace_harness_after_esc: AtomicBool::new(false),
+                    replace_harness_on_wait: AtomicBool::new(false),
                     drop_note: AtomicBool::new(false),
                     scrollback_on_effect: Mutex::new(None),
                     fail_scrollback: Mutex::new(None),
@@ -8611,6 +8644,8 @@ pub(crate) mod tests {
         pub(crate) keys_sent: Mutex<Vec<(String, String)>>,
         /// Replace the pane's harness right after the next Esc reaches it.
         pub(crate) replace_harness_after_esc: AtomicBool,
+        /// Replace the pane's harness as the next status wait reports its state.
+        pub(crate) replace_harness_on_wait: AtomicBool,
         /// Whether a countermand note never shows in any pane.
         pub(crate) drop_note: AtomicBool,
         /// One-shot: replace a pane's scrollback as the next input effect reaches its target.
@@ -8832,7 +8867,13 @@ pub(crate) mod tests {
             }
             Ok(())
         }
-        fn wait_agent_status(&self, _: &str, _: &str, _: u64) -> AdapterResult<()> {
+        fn wait_agent_status(&self, pane: &str, _: &str, _: u64) -> AdapterResult<()> {
+            if self.replace_harness_on_wait.swap(false, Ordering::SeqCst) {
+                self.harness_pids
+                    .lock()
+                    .unwrap()
+                    .insert(pane.to_owned(), 999);
+            }
             if self.fail_first_wait.swap(false, Ordering::Relaxed) {
                 return Err(AdapterError::unavailable("injected first wait failure"));
             }

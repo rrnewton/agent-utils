@@ -745,8 +745,10 @@ never retried automatically:
 - a check after the write fails, or the prompt newly shows in another
   registered agent's pane (`"probable_misroute": true`, with the panes involved
   in the error and in `.agentctl/NAME/misroutes.jsonl`);
-- the prompt newly shows in the target and another pane, in several panes, or
-  in a pane whose full 400-line window cannot rule out a new occurrence;
+- the prompt newly shows in the target and another pane, or in several panes;
+- another pane already showed the prompt and its scrollback changed during the
+  send, so a new occurrence cannot be ruled out (a pane whose scrollback is
+  byte-identical before and after received nothing);
 - the target never shows the prompt (delivery is unproven; recorded in
   `.agentctl/NAME/readback.jsonl`).
 

@@ -1081,10 +1081,32 @@ fn a_countermand_needs_the_wrong_panes_input_lock() {
 }
 
 #[test]
-fn a_full_peer_window_with_an_old_match_is_uncertain() {
+fn a_peer_window_moving_past_an_old_match_is_uncertain() {
     let fixture = Fixture::new();
     fixture.start(None);
     add_bystander(&fixture);
+    fixture.client.scrollback.lock().unwrap().insert(
+        "peer".to_owned(),
+        vec![LONG.to_owned(), "output after the old match".to_owned()],
+    );
+    *fixture.client.scrollback_on_effect.lock().unwrap() = Some((
+        "peer".to_owned(),
+        vec!["output after the old match".to_owned(), LONG.to_owned()],
+    ));
+    let error = send(&fixture, "worker", LONG).expect_err("quarantined");
+    assert!(
+        error.to_string().contains("cannot be attributed"),
+        "{error}"
+    );
+    assert!(fixture.client.keys_sent.lock().unwrap().is_empty());
+}
+
+#[test]
+fn a_repeat_while_an_unchanged_peer_shows_the_old_copy_is_delivered() {
+    let fixture = Fixture::new();
+    fixture.start(None);
+    add_bystander(&fixture);
+    // A full window whose bytes do not change received nothing, whatever it shows.
     let mut lines: Vec<String> = (0..SCROLLBACK_LINES - 1)
         .map(|index| format!("line {index}"))
         .collect();
@@ -1095,12 +1117,54 @@ fn a_full_peer_window_with_an_old_match_is_uncertain() {
         .lock()
         .unwrap()
         .insert("peer".to_owned(), lines);
+    let result = send(&fixture, "worker", LONG).expect("delivered");
+    assert_eq!(result.outcome, agent::QueueOutcome::Delivered);
+    assert!(failed_documents(&fixture, "worker").is_empty());
+}
+
+#[test]
+fn a_peer_that_changed_after_an_old_match_is_uncertain() {
+    let fixture = Fixture::new();
+    fixture.start(None);
+    add_bystander(&fixture);
+    fixture.client.scrollback.lock().unwrap().insert(
+        "peer".to_owned(),
+        vec![LONG.to_owned(), "output after the old match".to_owned()],
+    );
+    // The peer kept printing: same count, changed window, so the old copy proves nothing.
+    *fixture.client.scrollback_on_effect.lock().unwrap() = Some((
+        "peer".to_owned(),
+        vec![
+            LONG.to_owned(),
+            "output after the old match".to_owned(),
+            "more output".to_owned(),
+        ],
+    ));
     let error = send(&fixture, "worker", LONG).expect_err("quarantined");
     assert!(
         error.to_string().contains("cannot be attributed"),
         "{error}"
     );
     assert!(fixture.client.keys_sent.lock().unwrap().is_empty());
+}
+
+#[test]
+fn confirmation_with_a_replaced_harness_is_quarantined() {
+    // Herdr confirms the working state, but by then another program holds the pane.
+    let fixture = Fixture::new();
+    fixture.start(None);
+    fixture
+        .client
+        .replace_harness_on_wait
+        .store(true, Ordering::SeqCst);
+    let error = send(&fixture, "worker", LONG).expect_err("quarantined");
+    assert_eq!(
+        error.outcome(),
+        Some(agent::QueueOutcome::PossiblySubmitted),
+        "{error}"
+    );
+    assert!(error.to_string().contains("did not confirm"), "{error}");
+    assert_eq!(failed_documents(&fixture, "worker").len(), 1);
 }
 
 #[test]
