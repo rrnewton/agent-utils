@@ -1585,6 +1585,12 @@ function newPage(store = new Map(), script = SCRIPT, arrange = null) {
     /** Every dismissal and every restoration the page sent, exactly as it went out. */
     dismissCalls: [],
     restoreCalls: [],
+    /**
+     * `#222 unread-replies`. When set, each Done write waits on it, after it is recorded and before
+     * the store takes it: `(kind, body) => Promise<Response | undefined>`. A response answers in the
+     * store's place, so a test can hold a write open or fail it.
+     */
+    inboxWriteHook: null,
     /** Which message ids were sent to the voice service, in order. */
     speakCalls: [],
     /** `#read-aloud-latency`: every prepare request, so "ahead of the tap" is testable. */
@@ -2241,6 +2247,10 @@ function newPage(store = new Map(), script = SCRIPT, arrange = null) {
       if (/\/dismiss$/.test(String(path))) {
         const body = JSON.parse((options && options.body) || "null");
         page.dismissCalls.push(body);
+        if (page.inboxWriteHook) {
+          const answer = await page.inboxWriteHook("dismiss", body);
+          if (answer) return answer;
+        }
         let cleared = [];
         if (body && body.through) {
           const at = page.messages.findIndex((m) => String(m.id) === String(body.through));
@@ -31514,14 +31524,20 @@ test("A THREAD NOT ALL HELD counts what is held, as at least that many, and exac
   assert.equal(page.el("thread-select").value, "main");
   assert.deepStrictEqual(page.timelineCalls.map((call) => new URL(call, "http://fixture.test").searchParams.get("view")),
     ["main"], "the reopen read more than Main");
-  // Nothing held, nothing known: no count, and Hide read keeps nothing for it.
-  assert.deepStrictEqual(unreadSaid(page), { 2: null, 5: null, 7: null });
+  // Nothing held, but Main's read says each root has replies, and nothing has said they are read:
+  // each says how many the page has not brought, and Hide read keeps them all — question B too,
+  // whose one reply is Done, because keeping a read root errs the safe way for an inbox and hiding an
+  // answered one is the failure this is for. (It was: before review, this said nothing and Hide read
+  // kept only 12, hiding questions A and C with their unread answers.)
+  assert.deepStrictEqual(unreadSaid(page), { 2: "2 new", 5: "1 new", 7: "3 new" });
+  assert.equal(unreadChip(page, inboxId(5)).getAttribute("aria-label"),
+    "Open this thread at its first unread reply, 1 new reply not loaded yet");
   await chooseReadMode(page, "Hide read");
-  assert.deepStrictEqual(shownIds(page), [inboxId(12)]);
+  assert.deepStrictEqual(shownIds(page), [2, 5, 7, 12].map(inboxId), "Hide read hid a root whose replies are not known to be read");
   // One reply of question C's three comes in on the stream: held, unread, and the rest unknown.
   const reply = page.messages.find((m) => m.id === inboxId(9));
   await deliver(page, page.stream(), sseMessage(reply));
-  assert.deepStrictEqual(shownIds(page), [7, 12].map(inboxId));
+  assert.deepStrictEqual(shownIds(page), [2, 5, 7, 12].map(inboxId));
   const chip = unreadChip(page, inboxId(7));
   assert.equal(chip.textContent, "1+ unread", "a count of what is held claimed to be the whole");
   assert.equal(chip.getAttribute("aria-label"), "Open this thread at its first unread reply, at least 1 unread reply");
@@ -31530,7 +31546,356 @@ test("A THREAD NOT ALL HELD counts what is held, as at least that many, and exac
   await page.settle();
   assert.equal(page.el("thread-select").value, `thread:${INBOX.c}`);
   await pickThread(page, "main");
-  assert.deepStrictEqual(unreadSaid(page), { 7: "2 unread" });
+  assert.deepStrictEqual(unreadSaid(page), { 2: "2 new", 5: "1 new", 7: "2 unread" });
+  // And All, read once, makes every thread exact: B's one reply is Done, and B goes.
+  await pickThread(page, "flat");
+  await page.settle();
+  await pickThread(page, "main");
+  assert.deepStrictEqual(shownIds(page), [2, 7, 12].map(inboxId));
+  assert.deepStrictEqual(unreadSaid(page), { 2: "1 unread", 7: "2 unread" });
+});
+
+/** Which views the page has read, in order. */
+const viewsRead = (page) => page.timelineCalls.map((call) => new URL(call, "http://fixture.test").searchParams.get("view"));
+
+/**
+ * The agent answers question B again and question C a third time, and nothing brings the answers:
+ * Slack's stream carries no thread reply, so only Main's read sees them, in its roots' counts.
+ * Answers the two new replies.
+ */
+function answeredUnseen(page, messages) {
+  const b = { ...messages[4].thread, reply_count: 2 };
+  const c = { ...messages[7].thread, reply_count: 4 };
+  const newB = message({ id: inboxId(13), content: "one page failed after all", thread: { ...b, is_root: false }, ...CODER });
+  const newC = message({ id: inboxId(14), content: "the fix merged", thread: { ...c, is_root: false }, ...CODER });
+  page.messages = [...messages.map((m) => (m.id === inboxId(5) ? { ...m, thread: b } : m.id === inboxId(7) ? { ...m, thread: c } : m)),
+    newB, newC];
+  page.threads = page.threads.map((t) => (t.id === b.id ? { ...t, reply_count: 2 } : t.id === c.id ? { ...t, reply_count: 4 } : t));
+  return [newB, newC];
+}
+
+test("A REPLY ONLY MAIN'S READ REPORTS, which nothing brought, counts as new on its root and keeps it; exact once All brings it", async () => {
+  const page = newPage();
+  const messages = inboxChannel(page);
+  await inboxOnMain(page, messages);
+  await chooseReadMode(page, "Hide read");
+  assert.deepStrictEqual(shownIds(page), [2, 7, 12].map(inboxId));
+  const [newB] = answeredUnseen(page, messages);
+  const before = viewsRead(page).length;
+  await reReadChannel(page);
+  assert.deepStrictEqual(viewsRead(page).slice(before), ["main"], "learning of the answers read more than Main");
+  // B's one held reply is Done, and Main says it has two: one the page has not brought, which nothing
+  // says is read. C holds two unread and is reported a fourth: at least two unread, not exactly two.
+  assert.deepStrictEqual(shownIds(page), [2, 5, 7, 12].map(inboxId), "Hide read hid a root with an answer it had not brought");
+  assert.deepStrictEqual(unreadSaid(page), { 2: "1 unread", 5: "1 new", 7: "2+ unread" });
+  assert.equal(unreadChip(page, inboxId(5)).getAttribute("aria-label"),
+    "Open this thread at its first unread reply, 1 new reply not loaded yet");
+  assert.equal(unreadChip(page, inboxId(7)).getAttribute("aria-label"),
+    "Open this thread at its first unread reply, at least 2 unread replies");
+  const root = rowWithId(page, inboxId(5));
+  assert.equal(threadBadge(root).textContent, "Thread(2)");
+  assert.equal(threadButton(root).textContent, "2 replies");
+  assert.equal(threadBadge(rowWithId(page, inboxId(7))).textContent, "Thread(4)");
+  // Collapse read does not fold it into a run either: 10 is a run of one now, beside it.
+  await chooseReadMode(page, "Collapse read");
+  assert.equal(root.hasAttribute("data-read-run"), false, "Collapse read folded a root with an answer it had not brought");
+  assert.equal(rowWithId(page, inboxId(5)).getAttribute("data-unread-replies"), "1");
+  // All, read, brings both answers: the counts are exact, with no read of Main.
+  await pickThread(page, "flat");
+  await reReadChannel(page);
+  const reads = page.timelineCalls.length;
+  await pickThread(page, "main");
+  assert.deepStrictEqual(unreadSaid(page), { 2: "1 unread", 5: "1 unread", 7: "3 unread" });
+  assert.deepStrictEqual(page.timelineCalls.slice(reads), [], "Main was read for what All's read had answered");
+  // Dealt with in All, B's answer takes its root with it under Hide read.
+  await pickThread(page, "flat");
+  await chooseReadMode(page, "Show read");
+  await doneButton(rowWithId(page, newB.id)).click();
+  await page.settle();
+  await pickThread(page, "main");
+  await chooseReadMode(page, "Hide read");
+  assert.deepStrictEqual(shownIds(page), [2, 7, 12].map(inboxId));
+});
+
+test("SLACK-SHAPED: the owner's question whose first answer only Main's poll reports is kept, with nothing on the stream", async () => {
+  // Slack ids, and no thread record on the question until it has a reply, as Slack sends one.
+  const page = newPage();
+  const threadIds = { a: "1700000000.000200", b: "1700000000.000500", c: "1700000000.000700" };
+  const messages = inboxChannel(page, threadIds);
+  const asked = message({ id: inboxId(15), content: "can you check the nightly?", ...OWN });
+  await inboxOnMain(page, [...messages, asked]);
+  await chooseReadMode(page, "Hide read");
+  assert.deepStrictEqual(shownIds(page), [2, 7, 12].map(inboxId), "the owner's own question is read, and hidden");
+  const thread = { id: "1700000000.001500", root_message_id: asked.id, reply_count: 1, reply_count_exact: true };
+  const answer = message({ id: inboxId(16), content: "nightly is red: a flaky test", thread: { ...thread, is_root: false }, ...CODER });
+  page.messages = [...messages, { ...asked, thread: { ...thread, is_root: true } }, answer];
+  await reReadChannel(page);
+  assert.deepStrictEqual(shownIds(page), [2, 7, 12, 15].map(inboxId), "the answered question stayed hidden");
+  assert.equal(unreadChip(page, asked.id).textContent, "1 new");
+  // The owner reads it in its thread; back on Main it is read, and goes.
+  await unreadChip(page, asked.id).click();
+  await page.settle();
+  assert.equal(page.el("thread-select").value, `thread:${thread.id}`);
+  // All reaches the thread, but its read was before the answer: the thread is read, not drawn from
+  // All without it, and the reader lands on the answer.
+  assert.equal(viewsRead(page).at(-1), "thread", "the thread was drawn from All's read, which has not the answer");
+  const landed = rowWithId(page, answer.id);
+  assert.ok(landed, "the answer the reader tapped for is not in the thread");
+  assert.notEqual(landed.getAttribute("data-collapsed"), "true", "the answer the reader tapped for is folded");
+  const top = landed.getBoundingClientRect().top;
+  assert.ok(top >= floatingLine(page) && top < page.el("scroll-area").clientHeight,
+    `the answer the reader tapped for is at ${top}px, out of view`);
+  await doneButton(rowWithId(page, answer.id)).click();
+  await page.settle();
+  await pickThread(page, "main");
+  assert.deepStrictEqual(shownIds(page), [2, 7, 12].map(inboxId));
+});
+
+/**
+ * All's newest page as the newest `newest` messages, with older history behind it, and each step back
+ * as the `back` before that: so a thread can be older than anything All has read. A cursor is how
+ * many messages from the newest the step starts at.
+ */
+function pagedAll(page, newest, back = Infinity) {
+  const serve = page.timeline;
+  page.timeline = async (path, options) => {
+    const url = new URL(path, "http://fixture.test");
+    const answer = await serve(path, options);
+    if (url.searchParams.get("view") !== "flat") return answer;
+    const body = JSON.parse(await answer.text());
+    const from = Number(url.searchParams.get("before") || 0);
+    const rest = from ? body.messages.slice(0, -from) : body.messages;
+    const size = from ? back : newest;
+    const messages = rest.slice(-size);
+    const more = rest.length > size;
+    const on = new Set(messages.map((m) => String(m.id)));
+    return json(200, { ...body, messages, returned: messages.length, has_more: more,
+      next_before: more ? String(from + size) : null, dismissed: body.dismissed.filter((id) => on.has(id)) });
+  };
+}
+
+test("A THREAD OLDER THAN ALL REACHES does not count its old replies as new; a new one is, and a step back keeps the count right", async () => {
+  // An old question of the owner's, long answered (one Done, one his own); another of his, older than
+  // All reaches too, with no answer yet and so, as Slack sends it, no thread; then a day of updates.
+  const page = newPage();
+  page.threadingSupported = true;
+  const old = { id: "spaces/A/threads/old", root_message_id: inboxId(20), is_root: true, reply_count: 2, reply_count_exact: true };
+  const under = { ...old, is_root: false };
+  const messages = [
+    message({ id: inboxId(20), content: "why is the queue slow?", thread: old, ...OWN }),
+    message({ id: inboxId(21), content: "a stuck consumer; restarted", thread: under, ...CODER }),
+    message({ id: inboxId(22), content: "thanks", thread: under, ...OWN }),
+    message({ id: inboxId(25), content: "and the disk alarm?", ...OWN }),
+    ...[30, 31, 32, 33, 34].map((n) => message({ id: inboxId(n), content: `update ${n}`, ...CODER })),
+  ];
+  page.dealtWith.add(inboxId(21));
+  page.threads = [{ id: old.id, root: messages[0], title: "queue", reply_count: 2, reply_count_exact: true,
+    updated_at: messages[2].timestamp }];
+  pagedAll(page, 4, 6);
+  await inboxOnMain(page, messages);
+  // Main's own read brings the old questions: two replies to the first, neither held, both older
+  // than All's page; none to the second.
+  await reReadChannel(page);
+  await chooseReadMode(page, "Hide read");
+  assert.deepStrictEqual(shownIds(page), [30, 31, 32, 33, 34].map(inboxId), "an old answered question was kept as new");
+  await chooseReadMode(page, "Show read");
+  assert.equal(unreadChip(page, inboxId(20)), null, "old replies the page never brought were counted as new");
+  // The same after a reload, from what the device kept.
+  const reopened = reloadWith(page.storage, page.messages, (p) => {
+    p.threadingSupported = true;
+    p.dealtWith = page.dealtWith;
+    p.threads = page.threads;
+    pagedAll(p, 4, 6);
+  });
+  await reopenedChannel(reopened);
+  await reReadChannel(reopened);
+  assert.equal(unreadChip(reopened, inboxId(20)), null, "the reload forgot which replies were old");
+  // The agent adds to the first and answers the second, and nothing brings either reply: one new
+  // each. The second had no reply when the page last held it, so none of its can be old.
+  const grown = { ...old, reply_count: 3 };
+  const disk = { id: "spaces/A/threads/disk", root_message_id: inboxId(25), is_root: true, reply_count: 1, reply_count_exact: true };
+  const late = message({ id: inboxId(40), content: "it is slow again", thread: under, ...CODER });
+  const diskAnswer = message({ id: inboxId(41), content: "the disk alarm was a full log volume", thread: { ...disk, is_root: false }, ...CODER });
+  const withAnswers = (first) => [{ ...messages[0], thread: first }, messages[1], messages[2], { ...messages[3], thread: disk },
+    ...messages.slice(4), late, diskAnswer];
+  reopened.messages = withAnswers(grown);
+  await reReadChannel(reopened);
+  assert.equal(unreadChip(reopened, inboxId(20)).textContent, "1 new");
+  assert.equal(unreadChip(reopened, inboxId(25)).textContent, "1 new", "the first answer to an old question was read as old");
+  // All's read brings both: held, unread, and the first question's two old ones still not held.
+  await pickThread(reopened, "flat");
+  await reReadChannel(reopened);
+  await pickThread(reopened, "main");
+  assert.equal(unreadChip(reopened, inboxId(20)).textContent, "1+ unread");
+  assert.equal(unreadChip(reopened, inboxId(25)).textContent, "1 unread");
+  // A step back in All brings the old ones, though not the question itself: all three held, the
+  // count exact.
+  await pickThread(reopened, "flat");
+  await reopened.el("load-older").click();
+  await reopened.settle();
+  assert.ok(rowWithId(reopened, inboxId(21)), "the step back did not bring the old replies");
+  assert.equal(reopened.el("load-older").hidden, false,
+    "the step back reached the question, which would say its count itself");
+  await pickThread(reopened, "main");
+  assert.equal(unreadChip(reopened, inboxId(20)).textContent, "1 unread");
+  // Dealt with, then answered once more, with nothing to bring it: one new — the two the step back
+  // brought are no longer counted as missing for being old.
+  await pickThread(reopened, "flat");
+  await doneButton(rowWithId(reopened, late.id)).click();
+  await reopened.settle();
+  await pickThread(reopened, "main");
+  assert.equal(unreadChip(reopened, inboxId(20)), null);
+  reopened.messages = [...withAnswers({ ...old, reply_count: 4 }),
+    message({ id: inboxId(42), content: "slow once more", thread: under, ...CODER })];
+  await reReadChannel(reopened);
+  assert.equal(unreadChip(reopened, inboxId(20)).textContent, "1 new", "a step back's replies were still counted as missing");
+});
+
+test("ALL'S PAGE SHORT OF A THREAD'S REPLIES, as Slack's gives the newest of each, counts nothing new for what it left out", async () => {
+  const page = newPage();
+  const messages = inboxChannel(page);
+  // C's second answer is dealt with, and All's page leaves out its first: held, C has only what is read.
+  page.dealtWith.add(inboxId(9));
+  const serve = page.timeline;
+  page.timeline = async (path, options) => {
+    const answer = await serve(path, options);
+    if (new URL(path, "http://fixture.test").searchParams.get("view") !== "flat") return answer;
+    const body = JSON.parse(await answer.text());
+    const kept = body.messages.filter((m) => m.id !== inboxId(8));
+    return json(200, { ...body, messages: kept, returned: kept.length,
+      notice: "Flat view includes replies for at most 10 threads per page and the newest 50 replies of each; open a thread to read all of it.",
+      dismissed: body.dismissed.filter((id) => id !== inboxId(8)) });
+  };
+  await inboxOnMain(page, messages);
+  assert.deepStrictEqual(unreadSaid(page), { 2: "1 unread", 5: null, 7: null },
+    "a reply All's page left out was counted as one posted since");
+  await chooseReadMode(page, "Hide read");
+  await reReadChannel(page);
+  assert.deepStrictEqual(shownIds(page), [2, 12].map(inboxId));
+});
+
+test("AN OLD REPLY DELETED takes the count of old replies down with it, so the next new one still counts", async () => {
+  const page = newPage();
+  page.threadingSupported = true;
+  const old = { id: "spaces/A/threads/old", root_message_id: inboxId(20), is_root: true, reply_count: 2, reply_count_exact: true };
+  const under = { ...old, is_root: false };
+  const messages = [
+    message({ id: inboxId(20), content: "why is the queue slow?", thread: old, ...OWN }),
+    message({ id: inboxId(21), content: "a stuck consumer", thread: under, ...CODER }),
+    message({ id: inboxId(22), content: "restarted it", thread: under, ...CODER }),
+    ...[30, 31, 32, 33, 34].map((n) => message({ id: inboxId(n), content: `update ${n}`, ...CODER })),
+  ];
+  pagedAll(page, 4);
+  await inboxOnMain(page, messages);
+  await reReadChannel(page);
+  assert.equal(unreadChip(page, inboxId(20)), null);
+  // One of the two old answers is deleted upstream: the root says one reply now.
+  const shrunk = { ...old, reply_count: 1 };
+  page.messages = [{ ...messages[0], thread: shrunk }, ...messages.slice(2)];
+  await reReadChannel(page);
+  assert.equal(unreadChip(page, inboxId(20)), null);
+  // Then a new answer, which nothing brings: it is the one reply past what is old.
+  const late = message({ id: inboxId(40), content: "slow again", thread: under, ...CODER });
+  page.messages = [{ ...messages[0], thread: { ...old, reply_count: 2 } }, ...messages.slice(2), late];
+  await reReadChannel(page);
+  assert.equal(unreadChip(page, inboxId(20)).textContent, "1 new", "a deleted old reply hid a new one");
+});
+
+test("DONE IN ALL WHILE ALL'S READ IS ON ITS WAY: the row stays dealt with when the read, sent before, lands", async () => {
+  const page = newPage();
+  const messages = inboxChannel(page);
+  await signIn(page);
+  await showDiscord(page, messages);
+  const serve = page.timeline;
+  let land = () => {};
+  page.timeline = (path, options) => {
+    const answered = serve(path, options);
+    page.timeline = serve;
+    return new Promise((resolve) => { land = () => resolve(answered); });
+  };
+  page.expireTimers(DISCORD_POLL_MS);
+  await page.settle();
+  const calls = page.timelineCalls.length;
+  await doneButton(rowWithId(page, inboxId(12))).click();
+  await page.settle();
+  assert.equal(rowWithId(page, inboxId(12)).getAttribute("data-archived"), "true");
+  land();
+  await page.settle();
+  await page.settle();
+  assert.equal(page.timelineCalls.length, calls, "a later read answered for the Done, so this proves nothing");
+  assert.equal(rowWithId(page, inboxId(12)).getAttribute("data-archived"), "true",
+    "a read sent before the Done put the row back");
+});
+
+test("DONE HERE WHILE MAIN'S READ IS ON ITS WAY: the read, sent before, does not count the reply as unread again", async () => {
+  const page = newPage();
+  const messages = inboxChannel(page);
+  page.pinned.set(inboxId(8), storedPin(messages[8]));
+  page.servePinsRevision = true;
+  page.pinsRevision = 1;
+  await inboxOnMain(page, messages);
+  // Main's poll goes out, and its answer is held on the way back: as the server had it then.
+  const serve = page.timeline;
+  let land = () => {};
+  let sentWithout = false;
+  page.timeline = (path, options) => {
+    const answered = serve(path, options);
+    sentWithout = !page.dealtWith.has(inboxId(8));
+    page.timeline = serve;
+    return new Promise((resolve) => { land = () => resolve(answered); });
+  };
+  page.expireTimers(DISCORD_POLL_MS);
+  await page.settle();
+  const calls = page.timelineCalls.length;
+  // Meanwhile the reader deals with C's first answer from the Pinned list.
+  await showPinned(page);
+  await doneButton(page.el("pinned-log").children[0]).click();
+  await page.settle();
+  assert.ok(page.dealtWith.has(inboxId(8)), "the Done was not stored");
+  await page.el("pinned-filter").click();
+  await page.settle();
+  assert.deepStrictEqual(unreadSaid(page), { 2: "1 unread", 5: null, 7: "1 unread" });
+  land();
+  await page.settle();
+  await page.settle();
+  assert.ok(sentWithout, "the read was sent after the Done, so this proves nothing");
+  assert.equal(page.timelineCalls.length, calls, "a later read answered for the Done, so this proves nothing");
+  assert.deepStrictEqual(unreadSaid(page), { 2: "1 unread", 5: null, 7: "1 unread" },
+    "a read sent before the Done counted the reply as unread again");
+  // A read sent after it speaks for it as ever: put back on another device, it is unread again.
+  page.dealtWith.delete(inboxId(8));
+  await reReadChannel(page);
+  assert.deepStrictEqual(unreadSaid(page), { 2: "1 unread", 5: null, 7: "2 unread" });
+});
+
+test("A DONE WHOSE WRITE FAILS puts back only what it changed, not what a read brought meanwhile", async () => {
+  const page = newPage();
+  const messages = inboxChannel(page);
+  page.pinned.set(inboxId(8), storedPin(messages[8]));
+  page.servePinsRevision = true;
+  page.pinsRevision = 1;
+  await inboxOnMain(page, messages);
+  let fail = () => {};
+  page.inboxWriteHook = () => new Promise((resolve) => {
+    fail = () => resolve(json(500, { error: "store_failed", detail: "the store could not be written" }));
+  });
+  await showPinned(page);
+  const done = doneButton(page.el("pinned-log").children[0]).click();
+  await page.settle();
+  await page.el("pinned-filter").click();
+  await page.settle();
+  assert.deepStrictEqual(unreadSaid(page), { 2: "1 unread", 5: null, 7: "1 unread" }, "the Done waited for its write");
+  // While it is on its way, A's answer is dealt with on another device, and Main's poll says so —
+  // and, the write not having reached the server, nothing of C's.
+  page.dealtWith.add(inboxId(3));
+  await reReadChannel(page);
+  assert.deepStrictEqual(unreadSaid(page), { 2: null, 5: null, 7: "1 unread" }, "a read undid a Done still on its way");
+  fail();
+  await Promise.resolve(done).catch(() => {});
+  await page.settle();
+  await page.settle();
+  assert.deepStrictEqual(unreadSaid(page), { 2: null, 5: null, 7: "2 unread" },
+    "the failed Done put back more than it changed, or kept what it did");
 });
 
 test("EVERY PROVIDER'S THREADS: Google Chat, Slack and Discord thread ids count and keep their roots alike", async () => {

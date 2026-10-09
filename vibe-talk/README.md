@@ -103,9 +103,18 @@ Such a message stays in the list under **Hide read**, and is never folded into a
 read**, although it is still drawn as read itself. The count follows replies as they arrive, as they
 are marked Done here or on another device — Main's own refresh says which, with no read of All or
 the thread — and as you answer in the thread, your own words counting as read. It counts the replies
-the page holds, which is everything since the oldest message **All** has loaded, and what it has read
-of threads you have opened; when a thread may have older replies the page has not seen, it says **M+
-unread**, and a thread with none it knows of unread says nothing. `#222 unread-replies`.
+the page holds — from **All**, from threads you have opened, and from the live stream — with their
+Done state. While you stay on Main only Main is read, and Slack's live stream carries no thread reply
+at all, so an answer can exist before the page has it: Main's refresh still reports each message's
+reply count, and replies counted there that the page has not brought, posted since it last read the
+thread or All, count as possibly unread. The chip then says **M+ unread** beside what is known, or **N
+new** when nothing the page holds is unread, and the message is kept under both read modes until a
+read of the thread or of All brings those replies; a tap reads the thread rather than drawing it from
+All. Opened cold in Main, before All or the thread was ever read, every message with replies says so —
+the page cannot yet tell answered from read — until the first read of All. Replies older than
+anything read of the thread are not counted either way: **M+ unread** means older ones may not be
+loaded yet, and a thread with none it knows of unread or new says nothing. Discord's own threads give
+only an estimated count, so there nothing is inferred from it. `#222 unread-replies`.
 
 **Reactions show under each message.** Where the chat service reports them, a message's emoji
 reactions appear as a row of small chips under its text, each the emoji and how many reacted with it
@@ -2591,8 +2600,8 @@ lines, so the row stays one row — and the tooltip says what the mode does and 
 - **Hide read**: read messages are left out, the queue it always was.
 
 What counts as read is one rule for every mode, so Collapse read collapses exactly what Hide read
-hides. On Main, a message whose thread holds unread replies is kept by both, as though it were unread
-itself (`#222 unread-replies`; see "A message's replies can be gathered under it" above). The mode is kept with the rest of the UI state; a record written before the modes, which
+hides. On Main, a message whose thread holds unread replies, or new ones the page has not loaded, is
+kept by both, as though it were unread itself (`#222 unread-replies`; see "A message's replies can be gathered under it" above). The mode is kept with the rest of the UI state; a record written before the modes, which
 says only whether Hide read was on, is read as Hide read or Show read.
 
 `make -C vibe-talk read-modes-browser` enters a thread with a 45-message read run in each mode in a

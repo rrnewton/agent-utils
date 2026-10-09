@@ -6577,7 +6577,11 @@ function validCacheEntry(entry) {
       (entry.scope === undefined || entry.scope === null || typeof entry.scope === "string") &&
       // Absent from an entry saved before `#185 reply-new-thread`, which then has nothing unplaced.
       (entry.unplaced === undefined ||
-        (Array.isArray(entry.unplaced) && entry.unplaced.every((id) => typeof id === "string")));
+        (Array.isArray(entry.unplaced) && entry.unplaced.every((id) => typeof id === "string"))) &&
+      // Absent from an entry saved before `#222 unread-replies`, which then knows no gap yet.
+      (entry.replyGaps === undefined || (entry.replyGaps !== null && typeof entry.replyGaps === "object" &&
+        !Array.isArray(entry.replyGaps) &&
+        Object.values(entry.replyGaps).every((gap) => Number.isInteger(gap) && gap >= 0)));
   }
   return entry.mode === "page" && Number.isFinite(entry.savedAt) && typeof entry.more === "boolean";
 }
@@ -6628,6 +6632,14 @@ function trimCanonField(entry, field, limit) {
   const removed = entry[field].slice(0, entry[field].length - limit);
   entry[field] = entry[field].slice(-limit);
   const cut = timeOf(entry[field][0], timeField);
+  // `#222 unread-replies`. A reply cut is one more of its thread's the store lacks for being old, so
+  // the shortfall against the thread's count is not read as replies posted since.
+  if (field === "messages" && entry.replyGaps) {
+    for (const message of removed) {
+      const id = threadOf(message);
+      if (id && message.thread.is_root !== true && Number.isInteger(entry.replyGaps[id])) entry.replyGaps[id] += 1;
+    }
+  }
   for (const [key, cover] of Object.entries(entry.views)) {
     const { view, thread } = viewOfKey(key);
     if ((field === "threads") !== (view === "threads")) continue;
@@ -6762,6 +6774,9 @@ function emptyCanon(channel = "") {
     // null until one has landed. The backend's property rather than a view's, so it outlives a
     // view's cover being reset by an explicit refresh.
     complete: null,
+    // `#222 unread-replies`. By thread id: how many of its replies the store lacks for being older
+    // than anything read of it (`noteReplyGaps`). Absent is "not known yet".
+    replyGaps: new Map(),
   };
 }
 
@@ -6855,6 +6870,7 @@ function foldTimelinePage(payload, older, view = channelView, thread = selectedT
   const hasMore = payload.has_more === true;
   // Outside the thread view a page names a thread only when the channel IS that one thread.
   if (view !== "thread") channelCanon.scope = payload.thread ? String(payload.thread.id) : null;
+  const before = view === "threads" ? new Map() : heldCopies(payload.messages || []);
   if (view === "threads") {
     mergeIntoCanon("threads", payload.threads || [], older, hasMore, () => true);
   } else {
@@ -6876,8 +6892,21 @@ function foldTimelinePage(payload, older, view = channelView, thread = selectedT
   for (const summary of [...(payload.threads || []), payload.thread]) {
     if (summary && summary.root) channelCanon.unplaced.delete(String(summary.root.id));
   }
-  // ...and read state too. `#222 unread-replies`.
+  // ...and read state too, and what it says of the replies the store lacks. `#222 unread-replies`.
   foldReadState(payload, view);
+  noteReplyGaps(payload, view, older, false, before);
+}
+
+/** The store's copies of `messages`, by id, for those it holds. One walk over the store. */
+function heldCopies(messages) {
+  const wanted = new Set(messages.map((message) => String(message.id)));
+  /** @type {Map<string, any>} */
+  const found = new Map();
+  if (wanted.size === 0) return found;
+  for (const held of channelCanon.messages) {
+    if (wanted.has(String(held.id))) found.set(String(held.id), held);
+  }
+  return found;
 }
 
 /**
@@ -6919,6 +6948,7 @@ function foldTimelineDelta(payload, sent, view = channelView, thread = selectedT
     }
   }
   const arriving = payload.messages || [];
+  const before = heldCopies(arriving);
   if (arriving.length) {
     const ids = new Set(arriving.map((message) => String(message.id)));
     channelCanon.messages = inTimeOrder(
@@ -6937,6 +6967,7 @@ function foldTimelineDelta(payload, sent, view = channelView, thread = selectedT
     channelCanon.scope = payload.thread ? String(payload.thread.id) : null;
     channelCanon.hasThreads = payload.has_threads === true;
   }
+  noteReplyGaps(payload, view, false, true, before);
   const asOf = staleAsOf(payload);
   channelCanon.views.set(key, {
     ...cover,
@@ -7020,6 +7051,7 @@ function loadCanon(channel) {
   channelCanon.dismissed = new Set(entry.dismissed.map(String));
   // A reload does not place a message either: what the stream left unplaced stays so until read.
   channelCanon.unplaced = new Set((entry.unplaced || []).map(String));
+  channelCanon.replyGaps = new Map(Object.entries(entry.replyGaps || {}));
   for (const [key, cover] of Object.entries(entry.views)) {
     channelCanon.views.set(key, { ...cover, live: false, cursor: null });
   }
@@ -7169,6 +7201,7 @@ function saveChannelScope() {
       views[view] = { floor: cover.floor, more: cover.more, at: cover.at, notice: cover.notice };
     }
     const held = new Set(channelCanon.messages.map((message) => String(message.id)));
+    const heldThreads = new Set(channelCanon.messages.map(threadOf).filter((id) => id !== null));
     entry = {
       mode: "timeline",
       usedAt: now,
@@ -7179,6 +7212,8 @@ function saveChannelScope() {
       scope: channelCanon.scope,
       dismissed: [...channelCanon.dismissed].filter((id) => held.has(id)),
       unplaced: [...channelCanon.unplaced].filter((id) => held.has(id)),
+      // Only for threads the store still holds something of: the rest have no chip to draw.
+      replyGaps: Object.fromEntries([...channelCanon.replyGaps].filter(([id]) => heldThreads.has(id))),
     };
   } else {
     // In time order, gathered replies or not (`#215 reply-coalesce`): a reload draws these as they
@@ -8268,6 +8303,10 @@ async function changeChannelView(view, threadId = null, summary = null) {
  * for — began before All's newest page: inherited, it drew empty, with no cursor to walk back on
  * until the poll read it. That thread is read for itself instead.
  *
+ * ...and when nothing says the thread has outgrown what is held. `#222 unread-replies`: a root's
+ * count, as Main last read it, can be ahead of All's read, by replies nothing has brought — Slack's
+ * stream carries none. All does not answer for that thread, so it is read too (`threadOutrunsStore`).
+ *
  * SO IS MAIN, and always from where All starts: every message posted to the channel itself, thread
  * roots included, is a row of All. `#220 view-switch-instant`. Main is covered wherever All is, and
  * drawn by hiding All's thread replies — on switching to it and on reopening the page in it — with
@@ -8295,7 +8334,7 @@ function inheritAllCover(view, threadId = null, summary = null) {
     own.live = true;
     own.at = all.at;
     own.fromAll = true;
-  } else if (view === "thread" && !own && allReachesThread(threadId, summary)) {
+  } else if (view === "thread" && !own && allReachesThread(threadId, summary) && !threadOutrunsStore(threadId, summary)) {
     channelCanon.views.set(key, { ...all, cursor: null, newest: null, fullAt: 0 });
   } else {
     return false;
@@ -9203,74 +9242,179 @@ function gatherCount(id, message, held = 0) {
 // Counting on the server would read every thread on Main's page from the chat service on every read
 // of Main; the store already holds what is recent, and nothing here adds a read.
 //
-// WHAT IS NOT HELD IS NOT COUNTED. All covers the channel from its floor up, so every reply newer
-// than that is held; one older, in a thread neither All nor its own read reaches back through, may be
-// unread and is not known to be. That thread's count is a floor, "3+ unread"; one holding no unread
-// reply it knows of says nothing, and its root is read like any other.
+// WHAT IS NOT HELD BUT IS REPORTED IS NEW. The store holds a reply only once a read of All or of its
+// thread, or the stream, brought it — and while the reader sits on Main only Main is read. Slack's
+// stream carries no thread reply at all, and the Google Chat bridge's carries one without saying
+// which thread it is in. What Main's own read does carry is each root's count, so the page knows a
+// reply exists before it holds it. A shortfall of the held replies against an exact count is one of
+// two things: replies older than anything read of the thread, which the reader has had every chance
+// to see, or replies posted since the last read that brought the thread's newest, which nothing has
+// brought. `noteReplyGaps` keeps the first by thread, whenever a read says it (All's page carrying
+// the root, the thread's own read, a step back), so the rest is the second (`unseenReplies`): those
+// may be unread, and the root says so — "2+ unread" beside what is known, "1 new" when nothing held
+// is unread — and is kept by both read filters until a read of the thread or of All brings them and
+// the count is exact again. A thread no read has said anything of — Main opened cold, before All or
+// the thread was ever read — counts its whole shortfall, which errs towards keeping a root that is
+// read over hiding one that is not, the failure this is for.
+//
+// What is older than anything read and not held is not counted either way: a thread holding no
+// unread reply it knows of, and no new one, says nothing, and its root is read like any other. One
+// that does hold one says it is a floor, "3+ unread".
 //
 // ONLY ON MAIN. In All and in a thread the replies are rows of the list, and speak for themselves.
 
 /**
- * Each thread's replies the store holds, by thread id: how many, and how many are unread. One walk
- * over the store, for a pass over the rows that asks after every thread on screen.
+ * @typedef {object} ReplyTally
+ * @property {Map<string, {held: number, unread: number}>} threads each thread's replies the store
+ *   holds, by thread id: how many, and how many are unread
+ * @property {Map<string, any>} records the thread record of every message the store holds with one,
+ *   by message id
+ * @property {Map<string, any>} summaries the thread summaries the store holds, by thread id
+ * @property {Map<string, any>} byRoot the same summaries, by their root's message id
+ */
+
+/**
+ * What the store holds of every thread's replies (`ReplyTally`). One walk over the store, for a
+ * pass over the rows that asks after every thread on screen.
  *
- * @returns {Map<string, {held: number, unread: number}>}
+ * @returns {ReplyTally}
  */
 function replyTally() {
-  /** @type {Map<string, {held: number, unread: number}>} */
-  const tally = new Map();
+  /** @type {ReplyTally} */
+  const tally = { threads: new Map(), records: new Map(), summaries: new Map(), byRoot: new Map() };
   if (!threadingSupported || channelCanon.channel !== String(el("discord-channel").value)) return tally;
   for (const message of channelCanon.messages) {
     const id = threadOf(message);
-    if (!id || message.thread.is_root === true || id === channelCanon.scope) continue;
-    const entry = tally.get(id) || { held: 0, unread: 0 };
+    if (!id) continue;
+    tally.records.set(String(message.id), message.thread);
+    if (message.thread.is_root === true || id === channelCanon.scope) continue;
+    const entry = tally.threads.get(id) || { held: 0, unread: 0 };
     entry.held += 1;
     if (stillToDo(message, channelCanon.dismissed)) entry.unread += 1;
-    tally.set(id, entry);
+    tally.threads.set(id, entry);
+  }
+  for (const summary of channelCanon.threads) {
+    tally.summaries.set(String(summary.id), summary);
+    if (summary.root) tally.byRoot.set(String(summary.root.id), summary);
   }
   return tally;
 }
 
+/**
+ * The thread record the store holds for `message`, by `tally`: `heldThreadRecord`'s answer — the
+ * store's copy's, the row's own, or the summary of the thread it starts — without a walk per row.
+ */
+function tallyRecord(message, tally) {
+  const id = String(message.id);
+  const record = tally.records.get(id) || (threadOf(message) ? message.thread : null);
+  if (record) return record;
+  const summary = tally.byRoot.get(id);
+  return summary ? {
+    id: String(summary.id), root_message_id: id, is_root: true,
+    reply_count: summary.reply_count, reply_count_exact: summary.reply_count_exact,
+  } : null;
+}
+
 /** The thread `message` heads, when it is a root Main shows and the channel is not that thread, or null. */
-function rootThreadOf(message) {
-  const record = threadOf(message) ? message.thread : heldThreadRecord(message);
+function rootThreadOf(message, tally) {
+  const record = tallyRecord(message, tally);
   return record && record.is_root === true && String(record.id) !== String(channelCanon.scope)
     ? String(record.id) : null;
 }
 
+/** A record's or a summary's reply count when it says the count is exact, or null. */
+function exactCount(record) {
+  return record && typeof record.reply_count === "number" && record.reply_count_exact !== false
+    ? record.reply_count : null;
+}
+
+/**
+ * The most replies thread `id`, headed by `message`, is reported to have, by an exact count: the
+ * summary's or the root's record's, whichever is higher, because either may be the older — a summary
+ * from a thread read an hour ago, a root as Main last read it. Null when neither is exact (Discord's
+ * own threads give an estimate, from which no reply can be inferred).
+ */
+function exactReplyCount(id, message, tally, summary = null) {
+  const counts = [tally.summaries.get(id), message && tally.records.get(String(message.id)), message && message.thread,
+    summary].map(exactCount).filter((count) => count !== null);
+  return counts.length ? Math.max(...counts) : null;
+}
+
+/**
+ * How many of thread `id`'s replies were posted since the last read that brought its newest, and
+ * are not held: its exact count, less the replies held and the ones it lacks for being old
+ * (`noteReplyGaps`). Not one of them is known to be read, so each may be unread. Zero without an
+ * exact count. `message` is its root, when held; `summary` one more summary to take a count from.
+ */
+function unseenReplies(id, message, tally, summary = null) {
+  const count = exactReplyCount(id, message, tally, summary);
+  if (count === null) return 0;
+  const entry = tally.threads.get(id);
+  return Math.max(0, count - (entry ? entry.held : 0) - (channelCanon.replyGaps.get(id) || 0));
+}
+
+/**
+ * Whether thread `id` has replies the store has not brought (`unseenReplies`). Then All's cover,
+ * however far back it reaches, does not answer for the thread — those replies came after All's read
+ * — and entering it reads it, behind what is held: a tap on "1 new" that drew the thread from All
+ * would show everything but the reply it was tapped for.
+ */
+function threadOutrunsStore(id, summary = null) {
+  const key = String(id);
+  const root = channelCanon.messages.find((message) => threadOf(message) === key && message.thread.is_root === true);
+  return unseenReplies(key, root || null, replyTally(), summary) > 0;
+}
+
 /**
  * Whether thread `id` may have replies the store does not hold, holding `held`: then what is counted
- * of it is a floor. Not when the store holds as many as the provider's exact count, nor when the
- * thread's own read or All's reaches back to where it starts.
+ * of it is a floor. By an exact count when there is one; otherwise unless the thread's own read or
+ * All's reaches back to where it starts.
  */
-function repliesPartlyHeld(id, message, held) {
-  const { count, exact } = threadReplies(id, message);
-  if (typeof count === "number" && exact !== false && held >= count) return false;
+function repliesPartlyHeld(id, message, held, tally) {
+  const count = exactReplyCount(id, message, tally);
+  if (count !== null) return count > held;
   const own = channelCanon.views.get(viewKey("thread", id));
   if (own && !own.more) return false;
   return !allReachesThread(id, null);
 }
 
 /**
- * Whether `message` is a root on Main whose thread holds an unread reply, by `tally`. Outside Main
- * nothing is: there the replies are rows of the list.
+ * What a root on Main says of its thread's replies, by `tally`: the unread ones held, and the ones
+ * reported but not held (`unseenReplies`). Nothing outside Main, where the replies are rows of the
+ * list, and nothing for a message that heads no thread.
  */
+function rootReplyState(message, tally) {
+  const id = channelView === "main" ? rootThreadOf(message, tally) : null;
+  if (id === null) return { id: null, unread: 0, unseen: 0 };
+  const entry = tally.threads.get(id);
+  return { id, unread: entry ? entry.unread : 0, unseen: unseenReplies(id, message, tally) };
+}
+
+/** Whether `message` is a root on Main whose thread holds an unread reply, or may (`rootReplyState`). */
 function holdsUnreadReplies(message, tally) {
-  const id = channelView === "main" ? rootThreadOf(message) : null;
-  const entry = id === null ? undefined : tally.get(id);
-  return entry !== undefined && entry.unread > 0;
+  const { unread, unseen } = rootReplyState(message, tally);
+  return unread > 0 || unseen > 0;
 }
 
 /**
  * What the read filters keep: an unread message, and on Main a root whose thread holds an unread
- * reply as well (`holdsUnreadReplies`). Hide read draws exactly these; Collapse read folds every row
- * but these (`applyReadRuns`, by the attribute the pass over the rows sets from the same rule).
+ * reply, or may, as well (`holdsUnreadReplies`). Hide read draws exactly these; Collapse read folds
+ * every row but these (`applyReadRuns`, by the attribute the pass over the rows sets from the same
+ * rule). The store is walked only when a read row is asked after: Show read and Collapse read ask
+ * after none.
  *
  * @returns {(message: any) => boolean}
  */
 function readFilterKeeps() {
-  const tally = threadingSupported && channelView === "main" ? replyTally() : null;
-  return (message) => stillToDo(message) || (tally !== null && holdsUnreadReplies(message, tally));
+  const counting = threadingSupported && channelView === "main";
+  /** @type {ReplyTally | null} */
+  let tally = null;
+  return (message) => {
+    if (stillToDo(message)) return true;
+    if (!counting) return false;
+    if (tally === null) tally = replyTally();
+    return holdsUnreadReplies(message, tally);
+  };
 }
 
 /**
@@ -9285,9 +9429,10 @@ function drawThreadChips(row, tally, inMain) {
   const message = rowMessages(row)[0];
   const id = message ? threadOf(message) : null;
   if (!id) return;
-  const entry = tally.get(id) || { held: 0, unread: 0 };
+  const entry = tally.threads.get(id) || { held: 0, unread: 0 };
   const reported = threadReplyCount(id, message);
-  const replies = typeof reported === "number" ? Math.max(reported, entry.held) : entry.held;
+  const replies = Math.max(typeof reported === "number" ? reported : 0, entry.held,
+    exactReplyCount(id, message, tally) || 0);
   const text = replies ? `Thread(${replies})` : "Thread";
   if (badge.textContent !== text) {
     badge.textContent = text;
@@ -9300,31 +9445,35 @@ function drawThreadChips(row, tally, inMain) {
     const words = threadCount(count, exact);
     if (gather.textContent !== words) gather.textContent = words;
   }
-  const unread = inMain && rootThreadOf(message) === id ? entry.unread : 0;
+  const state = inMain ? rootReplyState(message, tally) : null;
+  const [unread, unseen] = state && state.id === id ? [state.unread, state.unseen] : [0, 0];
   let chip = childByClass(row, "thread-unread");
-  if (unread === 0) {
+  if (unread === 0 && unseen === 0) {
     if (row.hasAttribute("data-unread-replies")) row.removeAttribute("data-unread-replies");
     if (chip && !chip.hidden) chip.hidden = true;
     return;
   }
-  row.setAttribute("data-unread-replies", String(unread));
+  row.setAttribute("data-unread-replies", String(unread || unseen));
   if (!chip) {
     chip = document.createElement("button");
     chip.className = "thread-unread";
     chip.setAttribute("type", "button");
     chip.setAttribute("title", "Open this thread at its first unread reply");
-    chip.style.setProperty("--thread-hue", threadHue(id));
     chip.addEventListener("click", () => guardQuietly(() => openThread(id))());
     // After N replies, the last thing on the row, so the two read as one line: "12 replies  3 unread".
     row.append(chip);
   }
-  const floor = repliesPartlyHeld(id, message, entry.held);
-  const words = `${unread}${floor ? "+" : ""} unread`;
+  // What is known first: the unread replies held, a floor when there may be more. Only when none is
+  // held, the replies reported but not yet brought, "1 new": not known to be unread, but nothing has
+  // said they are read either. In words for a screen reader: "3+" is a glyph, read "three plus".
+  const floor = repliesPartlyHeld(id, message, entry.held, tally);
+  const replyWord = (count) => (count === 1 ? "reply" : "replies");
+  const [words, label] = unread > 0
+    ? [`${unread}${floor ? "+" : ""} unread`, `${floor ? "at least " : ""}${unread} unread ${replyWord(unread)}`]
+    : [`${unseen} new`, `${unseen} new ${replyWord(unseen)} not loaded yet`];
   if (chip.textContent !== words) {
     chip.textContent = words;
-    // In words: "3+" is a glyph, which a screen reader reads as "three plus".
-    chip.setAttribute("aria-label", `Open this thread at its first unread reply, ${floor ? "at least " : ""}` +
-      `${unread} unread ${unread === 1 ? "reply" : "replies"}`);
+    chip.setAttribute("aria-label", `Open this thread at its first unread reply, ${label}`);
   }
   if (chip.hidden) chip.hidden = false;
 }
@@ -9373,6 +9522,7 @@ function foldReadState(payload, view) {
   const done = new Set((payload.dismissed || []).map(String));
   for (const message of payload.messages || []) {
     const id = String(message.id);
+    if (!readSpeaksFor(payload, id)) continue;
     if (done.has(id)) channelCanon.dismissed.add(id);
     else channelCanon.dismissed.delete(id);
   }
@@ -9382,25 +9532,172 @@ function foldReadState(payload, view) {
   const from = String(marks.from);
   for (const message of channelCanon.messages) {
     const id = String(message.id);
-    if (!atOrAfter(id, from)) continue;
+    if (!atOrAfter(id, from) || !readSpeaksFor(payload, id)) continue;
     if (named.has(id)) channelCanon.dismissed.add(id);
     else channelCanon.dismissed.delete(id);
   }
 }
 
 /**
+ * What one page says of the replies the store lacks for being old, by thread, into
+ * `channelCanon.replyGaps`. `#222 unread-replies`. Called after the page is folded; `before` is the
+ * store's copies of the page's messages from before it was, by id.
+ *
+ * A thread's gap is its exact count less the replies held, at a moment the held ones are known to
+ * reach its newest: then every one missing is older than anything read of it. So it is SET by a read
+ * that brings a thread's newest replies together with its count — the thread's own newest page or
+ * delta, with the summary it carries, and All's newest page, for each root on it — and otherwise only
+ * ever lowered: by each reply a step back brings (one fewer is missing), and by a count that has
+ * dropped below it (old replies were deleted, or brought). What a count says beyond the gap is new
+ * (`unseenReplies`). Main's page carries counts but no replies, so it sets no gap it can lower, with
+ * one exception: a thread it is the first to say anything of. That one's gap is nothing when the
+ * thread can have no old replies missing — its root was held with no replies, as Slack sends a
+ * message before its first, or All reaches back to where it starts, so a reply posted since All's
+ * read is new — and otherwise its whole shortfall, read as old: one posted between All's last read
+ * and this one, to a thread older than All reaches, is not counted until that thread or All is read.
+ * Without any read of All there is no gap at all, and every reply missing counts.
+ */
+function noteReplyGaps(payload, view, older, delta, before) {
+  if (view === "threads" || channelCanon.scope) return;
+  const gaps = channelCanon.replyGaps;
+  const messages = payload.messages || [];
+  if (older) {
+    for (const message of messages) {
+      const id = threadOf(message);
+      if (!id || message.thread.is_root === true || before.has(String(message.id)) || !gaps.has(id)) continue;
+      gaps.set(id, Math.max(0, gaps.get(id) - 1));
+    }
+  }
+  /** @type {Map<string, number>} */
+  const held = new Map();
+  for (const message of channelCanon.messages) {
+    const id = threadOf(message);
+    if (id && message.thread.is_root !== true) held.set(id, (held.get(id) || 0) + 1);
+  }
+  const shortfall = (id, count) => Math.max(0, count - (held.get(id) || 0));
+  if (view === "thread") {
+    const count = exactCount(payload.thread);
+    if (!older && count !== null) gaps.set(String(payload.thread.id), shortfall(String(payload.thread.id), count));
+    return;
+  }
+  const allRead = channelCanon.views.has(viewKey("flat"));
+  for (const message of messages) {
+    if (!threadOf(message) || message.thread.is_root !== true) continue;
+    const id = String(message.thread.id);
+    const count = exactCount(message.thread);
+    if (count === null) continue;
+    const short = shortfall(id, count);
+    if (view === "flat" && !older && !delta) {
+      gaps.set(id, short);
+    } else if (gaps.has(id)) {
+      gaps.set(id, Math.min(gaps.get(id), short));
+    } else {
+      const prior = before.get(String(message.id));
+      const hadNone = prior !== undefined && (!threadOf(prior) || exactCount(prior.thread) === 0);
+      if (hadNone || allReachesThread(id, null)) gaps.set(id, 0);
+      else if (allRead) gaps.set(id, short);
+    }
+  }
+}
+
+// `#222 unread-replies`. DONE HERE RACES THE READS ON THE WIRE. A read sent before a Done or a put
+// back reached the server answers with the read state from before it, and folding that would undo
+// the reader's own act until the next read: a reply dealt with in its thread counted as unread on
+// Main again. So each local write is remembered by message id until a read sent after it settled can
+// speak for that message: while the write is on its way no read does, and once it is settled only a
+// read sent after. `readStateEpoch` moves at every write's start and end; a read records it when sent.
+let readStateEpoch = 0;
+/** @type {Map<string, {pending: number, from: number}>} */
+const localReadWrites = new Map();
+/** @type {WeakMap<object, number>} */
+const readSentEpochs = new WeakMap();
+
+/** Whether `payload`'s read state for message `id` is newer than every local write to it. */
+function readSpeaksFor(payload, id) {
+  const write = localReadWrites.get(String(id));
+  if (!write) return true;
+  if (write.pending > 0) return false;
+  return sentEpochOf(payload) >= write.from;
+}
+
+/**
+ * When `payload`'s read was sent, as `readStateEpoch` then. Now for a payload no read sent — the
+ * store drawn as a page, say — which holds the local state already.
+ */
+function sentEpochOf(payload) {
+  const sent = readSentEpochs.get(payload);
+  return typeof sent === "number" ? sent : readStateEpoch;
+}
+
+/**
+ * Read one timeline page, remembering when it was sent (`readSpeaksFor`).
+ *
+ * @param {string} path
+ * @param {{signal?: AbortSignal}} [options]
+ * @returns {Promise<VibeTalk.TimelineResponse>}
+ */
+async function readTimeline(path, options) {
+  const sent = readStateEpoch;
+  const payload = await apiDecoded("TimelineResponse", path, options);
+  readSentEpochs.set(payload, sent);
+  return payload;
+}
+
+/**
+ * @typedef {object} HeldDoneMark
+ * @property {string[]} ids the messages written
+ * @property {boolean} done Done, or put back
+ * @property {any} canon the store changed, or null
+ * @property {string[]} flipped the ids whose state in that store this changed
+ */
+
+/**
  * Done, or put back, here: the store's read state for `ids` follows at once, as `archivedIds` does,
- * so a reply dealt with from All, a thread or the Pinned list counts as read on Main straight away.
- * Answers the state before, to put back if the write fails, or null where there is no store.
+ * so a reply dealt with from All, a thread or the Pinned list counts as read on Main straight away;
+ * and no read sent before the write settles undoes it (`readSpeaksFor`). Answers what to give
+ * `settleHeldDone` when the write has settled.
+ *
+ * @returns {HeldDoneMark}
  */
 function markHeldDone(ids, done) {
-  if (!threadingSupported || channelCanon.channel !== String(el("discord-channel").value)) return null;
-  const before = new Set(channelCanon.dismissed);
-  for (const id of ids) {
-    if (done) channelCanon.dismissed.add(String(id));
-    else channelCanon.dismissed.delete(String(id));
+  readStateEpoch += 1;
+  const marked = ids.map(String);
+  for (const id of marked) {
+    const write = localReadWrites.get(id) || { pending: 0, from: 0 };
+    write.pending += 1;
+    localReadWrites.set(id, write);
   }
-  return before;
+  const canon = threadingSupported && channelCanon.channel === String(el("discord-channel").value)
+    ? channelCanon : null;
+  const flipped = canon ? marked.filter((id) => canon.dismissed.has(id) !== done) : [];
+  for (const id of flipped) {
+    if (done) canon.dismissed.add(id);
+    else canon.dismissed.delete(id);
+  }
+  return { ids: marked, done, canon, flipped };
+}
+
+/**
+ * The write `mark` stands for has settled, `ok` or not. Failed, exactly what it changed in the store
+ * goes back — never a copy from before it, which would undo whatever reads folded meanwhile, and in
+ * another channel's store would save this one's state into it.
+ *
+ * @param {HeldDoneMark} mark
+ * @param {boolean} ok
+ */
+function settleHeldDone(mark, ok) {
+  readStateEpoch += 1;
+  for (const id of mark.ids) {
+    const write = localReadWrites.get(id);
+    if (!write) continue;
+    write.pending = Math.max(0, write.pending - 1);
+    if (write.pending === 0) write.from = readStateEpoch;
+  }
+  if (ok || mark.canon === null) return;
+  for (const id of mark.flipped) {
+    if (mark.done) mark.canon.dismissed.delete(id);
+    else mark.canon.dismissed.add(id);
+  }
 }
 
 function timelinePath(before = null, after = null) {
@@ -9614,12 +9911,15 @@ function noteFreshRead(payload) {
 /** Several delta pages of one refresh, as the one page that draws them. */
 function joinedDeltas(pages) {
   const last = pages[pages.length - 1];
-  return {
+  const joined = {
     ...last,
     messages: pages.flatMap((page) => page.messages || []),
     threads: pages.flatMap((page) => page.threads || []),
     dismissed: pages.flatMap((page) => page.dismissed || []),
   };
+  // As old as its oldest page, for `readSpeaksFor`. `#222 unread-replies`.
+  readSentEpochs.set(joined, Math.min(...pages.map(sentEpochOf)));
+  return joined;
 }
 
 /** What one refresh's landed pages answer for, for `settleReplays`; null when none landed. */
@@ -9686,7 +9986,7 @@ async function loadTimeline(options) {
       let payload;
       try {
         payload = await within(CHANNEL_READ_TIMEOUT_MS,
-          (signal) => apiDecoded("TimelineResponse", path, { signal }));
+          (signal) => readTimeline(path, { signal }));
       } catch (error) {
         // A cursor the server can no longer continue is not a failed refresh. Forget it and read
         // the newest page now, in the same hold: the pill says "refreshing…" and nothing else.
@@ -9858,7 +10158,7 @@ async function pagesBackTo(payload, placeAt, current) {
       !(timeOf((last.messages || [])[0], "timestamp") <= placeAt)) {
     const path = timelinePath(last.next_before);
     try {
-      last = await within(CHANNEL_READ_TIMEOUT_MS, (signal) => apiDecoded("TimelineResponse", path, { signal }));
+      last = await within(CHANNEL_READ_TIMEOUT_MS, (signal) => readTimeline(path, { signal }));
     } catch (_error) {
       break;
     }
@@ -9897,7 +10197,7 @@ async function loadOlderTimeline() {
   olderFetchInFlight = true;
   renderOlderControl();
   try {
-    const payload = await apiDecoded("TimelineResponse", timelinePath(discordOlderCursor));
+    const payload = await readTimeline(timelinePath(discordOlderCursor));
     if (context !== channelContextKey() || generation !== discordLoadGeneration) return;
     olderFetchInFlight = false;
     preservingScroll(() => applyTimelinePage(payload, true));
@@ -11288,7 +11588,7 @@ function renderChannelRows() {
   // previous pass did.
   advanceMarkerPastRead();
   // `#222 unread-replies`. The replies the store holds, counted once for every row's thread chip.
-  const tally = threadingSupported ? replyTally() : new Map();
+  const tally = replyTally();
   const mainList = new Set(rows);
   for (const row of [...rows, ...el("pinned-log").children]) {
     const id = row.getAttribute("data-id") || "";
@@ -15808,11 +16108,13 @@ let archivedIds = new Set();
  * for rows that are no longer anywhere.
  */
 function noteArchived(payload, replace) {
+  // Not over a Done or a put back made here since the read was sent (`readSpeaksFor`, `#222
+  // unread-replies`): the read answers for the state before it.
   if (replace) {
-    archivedIds = new Set();
+    archivedIds = new Set([...archivedIds].filter((id) => !readSpeaksFor(payload, id)));
   }
   for (const id of payload.dismissed || []) {
-    archivedIds.add(String(id));
+    if (readSpeaksFor(payload, String(id))) archivedIds.add(String(id));
   }
 }
 
@@ -16154,7 +16456,9 @@ async function dismissMessages(body) {
       ? visible.slice(0, boundary + 1)
       : [];
   if (requested.length === 0) return;
-  const previous = new Set(archivedIds);
+  // Exactly what this changes, to put back if the write fails: never a copy of the whole set, which
+  // would undo what reads folded meanwhile (`#222 unread-replies`).
+  const added = requested.filter((id) => !archivedIds.has(id));
   const previousDismissal = lastDismissal;
   lastDismissal = { channel, messages: requested };
   for (const id of requested) {
@@ -16184,13 +16488,14 @@ async function dismissMessages(body) {
       return { messages: stored };
     });
   } catch (error) {
-    archivedIds = previous;
-    if (held) channelCanon.dismissed = held;
+    for (const id of added) archivedIds.delete(id);
+    settleHeldDone(held, false);
     lastDismissal = previousDismissal;
     await refreshAfterInboxChange();
     renderTodoControls();
     throw error;
   }
+  settleHeldDone(held, true);
   const stored = (payload.messages || requested).map(String);
   lastDismissal = { channel, messages: stored };
   const count = stored.length;
@@ -16229,7 +16534,7 @@ async function markReadUpstream(messageId) {
 async function restoreMessages(ids) {
   const channel = el("discord-channel").value;
   const restored = ids.map(String);
-  const previous = new Set(archivedIds);
+  const removed = restored.filter((id) => archivedIds.has(id));
   const previousDismissal = lastDismissal;
   for (const id of restored) {
     archivedIds.delete(id);
@@ -16242,17 +16547,21 @@ async function restoreMessages(ids) {
   await refreshAfterInboxChange();
   renderTodoControls();
   setStatus(`Restoring ${restored.length} message${restored.length === 1 ? "" : "s"}…`);
+  let settled = false;
   try {
     await queueInboxWrite(() => api(`/api/v1/channels/${encodeURIComponent(channel)}/restore`, {
       method: "POST",
       body: { messages: restored },
     }));
+    // Settled before the read below, which then speaks for these messages.
+    settleHeldDone(held, true);
+    settled = true;
     if (todoMode && !threadingSupported) {
       await loadTodo({ keepPosition: true, ownAct: true });
     }
   } catch (error) {
-    archivedIds = previous;
-    if (held) channelCanon.dismissed = held;
+    for (const id of removed) archivedIds.add(id);
+    if (!settled) settleHeldDone(held, false);
     lastDismissal = previousDismissal;
     await refreshAfterInboxChange();
     renderTodoControls();
@@ -17311,7 +17620,7 @@ async function loadEarlierReplyContext() {
       let path = withThreadQuery(
         `/api/v1/channels/${encodeURIComponent(channel)}/timeline?view=${view}&limit=${DISCORD_PAGE_LIMIT}`, thread);
       if (cursor) path += `&before=${encodeURIComponent(cursor)}`;
-      const payload = await apiDecoded("TimelineResponse", path);
+      const payload = await readTimeline(path);
       if (generation !== replyContext.generation || String(el("discord-channel").value) !== channel) return;
       foldTimelinePage(payload, Boolean(cursor), view, thread);
       replyContext.cursor = payload.has_more === true ? payload.next_before || null : null;
