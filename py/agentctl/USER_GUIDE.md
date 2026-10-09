@@ -840,7 +840,13 @@ A live pane may have moved to another tab in the same workspace; its process,
 session, and original shell identity must still match the record. An adopted
 record without the shell's boot ID, PID, start ticks, and executable
 device/inode cannot be retired automatically, whether the agent looks live or
-absent.
+absent. When the recorded pane is gone from Herdr's pane list and Herdr
+positively reports its workspace, tab or pane as not found (`agentctl doctor`
+shows `workspace-missing`, `tab-missing` or `pane-missing`), there is nothing
+left to verify or close: `stop` archives the record as stopped, writes the
+finding and Herdr's refusal to `stop.json` in the archived directory, reports
+it as `source`, and exits 0. A Herdr outage is not such a report, so `stop`
+still refuses.
 
 A narrowly scoped recovery command exists only for an identity-less
 `herdr-foreign` record whose raw JSON omits `foreign_shell_identity`. Run
