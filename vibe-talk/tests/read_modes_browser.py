@@ -67,6 +67,8 @@ AGENT = {"author": "ci-bot", "author_id": "1000000000000000001", "author_is_bot"
 READ_REPLIES = 45
 # All's newest page in the second walk: the answer and the six messages after it.
 HELD_WINDOW = 7
+# The longest the second walk's thread read is held for, should the walk fail before it opens the gate.
+THREAD_HOLD_S = 30.0
 ROOT_ID = "7700000000000000000"
 ANSWER_ID = "7700000000000000500"
 # The smallest target a thumb is given anywhere on this page.
@@ -100,7 +102,9 @@ class FakeApi:
     """The routes /voice reads, answering from one fixed channel.
 
     `all_window`, when set, makes All's newest page the channel's last that many messages, with more
-    before them; `thread_delay` holds a thread's read back by that many seconds.
+    before them; `thread_gate`, when set, holds a thread's read until the walk opens the gate, for at
+    most `THREAD_HOLD_S`: a gate rather than a delay, so a loaded host cannot let the read land before
+    the walk has looked at what was up without it.
     """
 
     stopping: threading.Event = field(default_factory=threading.Event)
@@ -108,7 +112,7 @@ class FakeApi:
     dismissed: set[str] = field(default_factory=set)
     threads: list[Json] = field(default_factory=list)
     all_window: int | None = None
-    thread_delay: float = 0.0
+    thread_gate: threading.Event | None = None
 
     def __post_init__(self) -> None:
         root: Json = {"id": THREAD_ID, "root_message_id": ROOT_ID, "is_root": True,
@@ -173,8 +177,8 @@ class FakeApi:
         windowed = window is not None
         if window is not None:
             rows = rows[-window:]
-        if view == "thread" and self.thread_delay:
-            self.stopping.wait(self.thread_delay)
+        if view == "thread" and self.thread_gate is not None:
+            self.thread_gate.wait(THREAD_HOLD_S)
         return {
             "channel": CHANNEL, "messages": rows, "threads": threads,
             "thread": next((t for t in self.threads if t["id"] == thread_id), None) if view == "thread" else None,
@@ -555,9 +559,14 @@ def walk(page: Page, touch: bool, size: str, shots: Path | None, collapsed: dict
     return notes
 
 
-def held_walk(page: Page, touch: bool, size: str, shots: Path | None, collapsed: dict[str, float]) -> list[str]:
-    """An old thread in Collapse read: drawn from the rows All holds, then read behind them."""
+def held_walk(page: Page, touch: bool, size: str, shots: Path | None, collapsed: dict[str, float],
+              gate: threading.Event) -> list[str]:
+    """An old thread in Collapse read: drawn from the rows All holds, then read behind them.
+
+    The thread's read is held at `gate` until the rows All held have been measured.
+    """
     notes: list[str] = []
+    gate.clear()
     answer_open = (f"() => {{ const row = document.querySelector('#discord-log > li[data-id=\"{ANSWER_ID}\"]');"
                    " return row && row.dataset.collapsed === 'false'; }")
 
@@ -598,6 +607,7 @@ def held_walk(page: Page, touch: bool, size: str, shots: Path | None, collapsed:
           f"{size}: the held rows landed the answer at {top:.0f}px, not just under the floating line at {floating:.0f}px")
     notes.append(f"held rows: answer unfolded at {top:.0f}px before the read")
     shot("5-held-rows-before-read")
+    gate.set()
 
     # The read lands: the root at the head, the line, the answer still open, as in a thread entered
     # with every row held.
@@ -648,8 +658,9 @@ def main() -> int:
 
     web_root = args.web_root.resolve()
     api = FakeApi()
-    # The old thread: All's newest page starts at the answer, and the thread's read takes two seconds.
-    held_api = FakeApi(all_window=HELD_WINDOW, thread_delay=2.0)
+    # The old thread: All's newest page starts at the answer, and the thread's read waits at the gate.
+    gate = threading.Event()
+    held_api = FakeApi(all_window=HELD_WINDOW, thread_gate=gate)
     served = [(api, *serve(api, web_root)), (held_api, *serve(held_api, web_root))]
     url, held_url = served[0][3], served[1][3]
     sizes = (("412x915", 412, 915, True), ("1280x800", 1280, 800, False))
@@ -678,7 +689,7 @@ def main() -> int:
                         page.on("pageerror", lambda error: errors.append(str(error)))
                         page.goto(held_url if held else url, wait_until="load")
                         if held:
-                            notes = held_walk(page, phone, size, args.screenshots, collapsed)
+                            notes = held_walk(page, phone, size, args.screenshots, collapsed, gate)
                         else:
                             notes = walk(page, phone, size, args.screenshots, collapsed)
                         check(not errors, f"{size}: the page threw: {errors}")
@@ -689,6 +700,7 @@ def main() -> int:
             print(line)
         return 0
     finally:
+        gate.set()
         for fake, server, thread, _url in served:
             fake.stopping.set()
             server.shutdown()

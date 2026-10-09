@@ -2925,8 +2925,10 @@ goes to the head when both fit in the upper half of the screen, as above (under 
 first message, then "… 12 read messages …", then the expanded message), and otherwise the unread
 message stays exactly where it landed. Either way it stays expanded, even when the read joins an
 earlier message of the same author onto its row, and another read that overtakes this one (a live
-message, the poll) keeps the landing too. When none of those replies is unread, the landing waits
-for that read, and does not move you if you have scrolled meanwhile, or if that read fails.
+message, the poll) keeps the landing too, as you left it: once you have opened the read messages
+under the first message, no read takes you down past them to the unread one. When none of those
+replies is unread, the landing waits for that read, and does not move you if you have scrolled
+meanwhile, or if that read fails.
 
 The threads it lists come from what the page already holds, so opening it costs no request.
 Touching it also reads the channel's thread list in the background, at most once a minute, so the

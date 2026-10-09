@@ -8460,7 +8460,10 @@ function entryLandingMark() {
  *   held rows never hold it, and the rule that keeps the root above the first unread could not
  *   apply until the read brought it (`entryHeadRow`). It applies now: the root goes to the head and
  *   the message moves down under it, at most into the upper half of the screen.
- * - Otherwise THE MESSAGE STAYS where it stood.
+ * - Otherwise THE ROW AT THE HEAD STAYS where it stood: the message, or a root the landing already
+ *   brought there. Opening something under that root does not scroll, so the landing still holds,
+ *   and the root may no longer fit: a reader who opened the run of read messages under it is
+ *   reading them, and is not sent down past them to the message.
  * - OPEN, as it was. A fold is kept by its row's first message, and the read can join an older
  *   message of the same author at the head of the landed row: the row is then kept under that
  *   message, which nobody opened. It is opened through its own control, so the record of opened
@@ -8479,12 +8482,14 @@ function keepEntryLanding(mark) {
     fold.click();
   }
   const head = entryHeadRow(first);
+  const kept = rowFor(mark.ids);
   const area = el("scroll-area");
-  if (head === first && rowFor(mark.ids) === first) {
-    area.scrollTop += first.getBoundingClientRect().top - mark.top;
-    entryLanding = { key: channelContextKey(), row: first, first, at: area.scrollTop };
-  } else {
+  if (head !== first && head !== kept) {
     placeEntryLanding(head, first);
+  } else {
+    const row = kept && !kept.hidden ? kept : first;
+    area.scrollTop += row.getBoundingClientRect().top - mark.top;
+    entryLanding = { key: channelContextKey(), row, first, at: area.scrollTop };
   }
   renderScrollTools();
   requestVisibleSummaries();

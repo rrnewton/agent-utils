@@ -30542,6 +30542,67 @@ test("...and keeps it when another read overtakes the read behind the held rows:
   assert.notEqual(control.moved, 0, "the overtaken read kept the landing without being told to; the control proves nothing");
 });
 
+// Opening the run of read messages under a root at the head scrolls nothing, so the landing still
+// holds — and the root no longer fits above the first unread, twelve messages further down. A read
+// that keeps the landing then must keep the reader on the root they are reading down from, not make
+// the landing again on the message below the run they have just opened.
+test("...and a root the landing put at the head stays there when the reader opens the read run under it, through a poll a live message overtakes", async () => {
+  const run = async (script, fromHeldRows) => {
+    const page = newPage(new Map(), script);
+    const messages = runThread(page, { tail: RUN_TAIL });
+    // As in "Collapse read: an old thread drawn from held rows ends on its root ...": root and answer fit.
+    const before = async () => {
+      await chooseReadMode(page, "Collapse read");
+      page.el("scroll-area").clientHeight = 700;
+    };
+    if (fromHeldRows) {
+      const { hold, entering } = await enterFromHeldRows(page, messages, 5, before);
+      hold.release();
+      await entering;
+    } else {
+      await enterRunThread(page, messages, before);
+    }
+    await page.settle();
+    const root = () => rowWithId(page, runId(0));
+    const answer = () => rowWithId(page, runId(500));
+    assert.ok(atTheHead(page, root()), `the thread did not open on its root, at ${root().getBoundingClientRect().top}px; this proves nothing`);
+    const line = readRunLineOf(rowWithId(page, runId(1)));
+    assert.equal(line && line.textContent, "… 12 read messages …", "no line for the read run; this proves nothing");
+    const top = root().getBoundingClientRect().top;
+    await line.click();
+    await page.settle();
+    assert.deepStrictEqual(collapsedRows(page), [], "the tap did not open the run; this proves nothing");
+    assert.equal(root().getBoundingClientRect().top, top, "opening the run moved the reader; this proves nothing");
+    assert.ok(answer().getBoundingClientRect().top > page.el("scroll-area").clientHeight,
+      "the answer still shows under the opened run; this proves nothing");
+    // The poll reads the thread, and a live message asks for another read before that one lands: the
+    // poll's page is folded into the store as late, and the landing is kept through it.
+    const hold = holdChannelReads(page, "timeline");
+    assert.ok(page.expireTimers(DISCORD_POLL_MS) > 0, "no poll was armed");
+    await page.settle();
+    page.stream().push(sseMessage(message({ id: "9900001", content: "elsewhere in the channel", ...CODER })));
+    await page.settle();
+    assert.ok(hold.held.length > 0, "the poll did not read the thread; this proves nothing");
+    // Measured from here: the line saying the thread is loading went up above the list meanwhile.
+    const held = root().getBoundingClientRect().top;
+    hold.release();
+    for (let settles = 0; settles < 4; settles += 1) await page.settle();
+    return { moved: root().getBoundingClientRect().top - held, runOpen: collapsedRows(page).length === 0,
+      rootShown: root().getBoundingClientRect().top >= 0 };
+  };
+  for (const fromHeldRows of [false, true]) {
+    assert.deepStrictEqual(await run(SCRIPT, fromHeldRows), { moved: 0, runOpen: true, rootShown: true },
+      `${fromHeldRows ? "drawn from held rows" : "entered with every row held"}: the overtaken poll moved the reader off the root`);
+  }
+  // Negative control: the landing made again on the first unread whenever the root no longer fits,
+  // whatever the landing had at the head. The reader goes down past the run, and the root off screen.
+  const control = brokenScript("  if (head !== first && head !== kept) {", "  if (head !== first || kept !== first) {");
+  for (const fromHeldRows of [false, true]) {
+    const { moved, rootShown } = await run(control, fromHeldRows);
+    assert.equal(rootShown, false, `the control left the root on screen (moved ${moved}px); it proves nothing`);
+  }
+});
+
 test("...and a landing left to the read behind held rows is paid by that read when it is overtaken, not by the next poll", async () => {
   const run = async (script) => {
     const page = newPage(new Map(), script);
