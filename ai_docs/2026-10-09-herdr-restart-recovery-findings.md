@@ -1,6 +1,6 @@
 # Recovering agents after a Herdr server restart: what agentctl and wrkslots support, and what they should
 
-Date: 2026-10-09. Author: the dev-hermit coordinator (Claude), after a live recovery.
+Date: 2026-10-09. Author: a consuming project's coordinator (Claude), after a live recovery. Project and slot names below are redacted to `consumer-a` and `<slot>`.
 
 ## Background
 
@@ -17,7 +17,7 @@ All three agents and the bridge were recovered in about 25 minutes, with their c
 | Step | What the tools gave | What had to be done by hand |
 |---|---|---|
 | 1. Which agents were live | `herdr agent list` showed only the coordinator; `herdr pane list` showed ~70 restored shells across 6 workspaces with no labels. `agentctl list` showed 4 records (`liteinst`, `pause-signal`, and two Codex lanes whose harness had already exited the day before). | One live agent (`scorecard`) had never been registered with agentctl at all. Its existence came from the coordinator's own notes. |
-| 2. Which conversation each agent was in | **Nothing.** Every record has `session_value: null`, `session_agent: null`, `resume: null`. | Listed the 25 newest transcripts in `~/.claude/projects/-…-dev-hermit/`, read each one's first user message ("You are pause-signal, …", "Resume the LiteInst fat lane…"), and for the two that started with `/goal`, grepped their tails for the slot name. |
+| 2. Which conversation each agent was in | **Nothing.** Every record has `session_value: null`, `session_agent: null`, `resume: null`. | Listed the 25 newest transcripts in `~/.claude/projects/-…-consumer-a/`, read each one's first user message ("You are pause-signal, …", "Resume the LiteInst fat lane…"), and for the two that started with `/goal`, grepped their tails for the slot name. |
 | 3. Retire the dead record | `agentctl stop pause-signal` exited **75 with no message at all**. | Read `stop --help`, found `--expected-token` ("mandatory for managed-dead recovery"), read the token out of `.agentctl/pause-signal/agent.json`, reran. That worked and closed the stale tab. |
 | 4. Retire an adopted record | `agentctl stop liteinst` refused: "recorded pane shell generation changed". No flag covers it (`--recover-legacy-adoption` is only for identity-less rows). | Moved `.agentctl/liteinst` into `.agentctl/archive/` by hand. |
 | 5. Relaunch with the same launch policy | `agentctl start NAME --profile claude-opus-55 --resume UUID` refused: "--profile conflicts with explicit launch settings: --resume". | Read the profile (`harness claude`, `model opus`, no extra arguments) and passed `--harness claude --model opus --resume UUID` explicitly. The record no longer names the profile. |
@@ -42,7 +42,7 @@ All three agents and the bridge were recovered in about 25 minutes, with their c
 13. **With Herdr 0.9.3, agentctl's readiness and process checks fail for Codex and Muse.** Herdr reports a Codex pane's `agent_status` as `unknown`, so `start` timed out ("timed out waiting for agent startup") although Codex was running and idle, and `drain` timed out the same way; the brief had to be typed with `herdr agent prompt`. For a Muse launch, `pane process-info` returned no foreground argv and agentctl refused the response ("expected an array, got NoneType"). `adopt` refuses Muse outright, so a Muse agent started outside `start` stays unregistered.
 14. **A profile can name a reasoning effort the model rejects.** The owner's Muse command used `--reasoning-effort max`; the model `kiki_gb300_mxfp8_6p2_840_nwr` returns HTTP 400 ("supported values: minimal, low, medium, high, xhigh"). `agentctl profiles` could validate effort against the harness's model catalogue before a launch.
 15. **wrkslots cannot rebind a slot to the agent's new session.** Every slot that existed before the restart records an owner PID that is now dead. `wrkslots adopt` from the resumed agent refuses ("already has a dead historical owner ... ordinary adopt cannot replace it"), and `recover-unbound-owner` only records coordinator evidence; by design it never replaces the owner. The slots keep working only because agents had put them on hold.
-16. **who-am-i cannot name an adopted Codex agent.** The resumed liteinst lane (Codex, adopted because `start` timed out) tagged its commit `[hermit2, unknown-agentname, gpt-6-astra, role=impl]`. Agent-name resolution depends on a record shape that adoption after a launch failure does not produce. who-am-i also does not recognise Muse at all (tracked separately).
+16. **who-am-i cannot name an adopted Codex agent.** The resumed liteinst lane (Codex, adopted because `start` timed out) tagged its commit `[<slot>, unknown-agentname, gpt-6-astra, role=impl]`. Agent-name resolution depends on a record shape that adoption after a launch failure does not produce. who-am-i also does not recognise Muse at all (tracked separately).
 
 ## Suggested improvements
 
