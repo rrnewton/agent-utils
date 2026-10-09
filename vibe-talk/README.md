@@ -2236,6 +2236,20 @@ more than two minutes old makes the freshness pill say the service is slow, with
 of claiming the list is current. An edit or removal replayed from the tail is answered only by a
 newest page or a complete delta.
 
+**A refresh that brings nothing draws nothing, and a hidden page waits** (`#226
+page-energy-profile`). When a delta changes nothing — no message, deletion, read state, thread,
+count or notice — and every row on screen is the one a redraw would build, the rows stay as they
+are; only the freshness pill moves. A refresh nobody asked for (the poll, the read behind a live
+message, coming back to the page) shows its loading line over the rows only once it has been out
+for a second; the pill says "refreshing…" from the start. While the page is hidden — another app
+in front, the phone locked, the window minimized — the poll does not run, a live message goes into
+the channel's store with no row drawn and no read made, and an edit or removal waits the same way;
+after two minutes hidden with no call the live stream is closed, which ends its keep-alive every
+fifteen seconds. Coming back draws what arrived from the store, reads once what changed, polls at
+once if the poll came due meanwhile, and reopens the stream from the last event it saw, so nothing
+in between is skipped. Until the stream is back the pill says "Updated" rather than "Live ·
+updated". During a call the stream stays open and the agent hears what arrives, as before.
+
 **`user_message`, not `contextual_update`, and that is the substance of the feature.** A
 contextual update injects text into the agent's context *without consuming a turn*: the agent
 silently knows a message arrived and says nothing about it until asked. That is right for a

@@ -2099,8 +2099,15 @@ body {
    The mask is the fade under the header: content used to be sliced off square at the top edge,
    mid-word, which reads as a rendering fault rather than as a list that continues upward. The
    gradient makes the top ~1.1rem of the scrolling content dissolve instead. It costs no element
-   and cannot be scrolled out of position. */
+   and cannot be scrolled out of position.
+
+   `#226 page-energy-profile`. Its size is its grid cell's and nothing inside it, so it says so:
+   without `contain: size layout` every change next to it — the freshness pill's words, which change
+   at every refresh — had #screen-main lay it out again from its content, twice over for the
+   scrollbar it found it did and did not need, which with a channel's history scrolled in was 25-35ms
+   of a desk's CPU for one changed word. Nothing in it is positioned against anything outside it. */
 #scroll-area {
+  contain: size layout;
   min-height: 0;
   overflow-y: auto;
   overscroll-behavior: contain;

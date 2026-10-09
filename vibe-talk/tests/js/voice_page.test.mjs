@@ -1521,6 +1521,11 @@ function newPage(store = new Map(), script = SCRIPT, arrange = null) {
     createdTags: [],
     /** How many `<template>`s the page has made: one per body it inserted from HTML. */
     templatesParsed: 0,
+    /**
+     * How many date formatters the page has had made: each `Intl.DateTimeFormat`, and each
+     * `toLocaleTimeString`, which makes one for the call. `#226 page-energy-profile`.
+     */
+    dateFormatsMade: 0,
     /** Every reply the page has POSTed, exactly as it went out. */
     repliesPosted: [],
     /** `#49 cached-summaries`: every summary the page has asked for, in order. */
@@ -1817,6 +1822,13 @@ function newPage(store = new Map(), script = SCRIPT, arrange = null) {
     static now() {
       return clockMs;
     }
+
+    // Each call makes a date formatter of its own, as `Intl.DateTimeFormat` below does: both are
+    // counted in `dateFormatsMade`. `#226 page-energy-profile`.
+    toLocaleTimeString(...args) {
+      page.dateFormatsMade += 1;
+      return super.toLocaleTimeString(...args);
+    }
   }
   page.setClock = (ms) => {
     clockMs = ms;
@@ -1853,6 +1865,14 @@ function newPage(store = new Map(), script = SCRIPT, arrange = null) {
     },
     navigator,
     console,
+    // The real `Intl`, counting the date formatters the page makes (`dateFormatsMade`): one per row
+    // on every redraw was a twentieth of the page's work in live traffic. `#226 page-energy-profile`.
+    Intl: Object.assign(Object.create(Intl), {
+      DateTimeFormat: function DateTimeFormat(...args) {
+        page.dateFormatsMade += 1;
+        return new Intl.DateTimeFormat(...args);
+      },
+    }),
     // Timers the TEST drives. Nothing is really scheduled, so the page's own 8-second banner timer
     // cannot hold the runner open — and, more usefully, a delay the page relies on stops being
     // untestable. `expireTimers` is what lets the "armed for a few seconds" behaviour below be
@@ -2890,6 +2910,16 @@ const TUNING_BANDS = {
     "how long a dropped live stream waits before reconnecting. Under a second it hammers a " +
     "server that is already unwell; past a couple of minutes the channel view is stale for long " +
     "enough that the reader trusts it and should not"],
+  // `#226 page-energy-profile`.
+  LOADING_LINE_DELAY_MS: [300, 3000,
+    "how long a refresh nobody asked for may be out before its loading line shows over the rows. " +
+    "Under a third of a second an ordinary poll puts the line and its spinner up and takes them down " +
+    "again, laying the whole history out twice for a word the pill already says; past three seconds a " +
+    "slow refresh looks like none"],
+  LIVE_HIDDEN_CLOSE_MS: [30000, 600000,
+    "how long a hidden page with no call keeps its live stream. Under half a minute a glance at " +
+    "another app closes and reopens it, and comes back to a pill without 'Live' while it does; past " +
+    "ten minutes a phone in a pocket has its radio woken every fifteen seconds for that long"],
   LIVE_ATTACH_WAIT_MS: [1000, 10000,
     "how long a reopen's read waits for the live stream to attach. Under a second an ordinary " +
     "phone connection has not answered yet, and an edit out of the replay tail costs a second " +
@@ -28346,6 +28376,383 @@ test("coming back after fifteen seconds away reads what changed; a glance away r
   assert.ok(shownIds(page).includes("340"));
 });
 
+// --- `#226 page-energy-profile`: what the page costs while nothing is happening -----------------
+//
+// The owner keeps the page open as an installed app, on a desk and on a phone, and asked that it not
+// drain either. Measured with CPU time as the proxy: every poll rebuilt every row when nothing had
+// changed, a hidden page polled and re-read every live message as if it were on screen and kept its
+// stream's keep-alive waking the phone's radio, the reply arrows asked for a layout per arrow, the
+// lookup of a row's parts walked every word of every message, and every row made its own clock
+// formatter. These pin each of those away, by what the page does rather than by how long it takes.
+
+const LIVE_HIDDEN_CLOSE_MS = sourceConstant("LIVE_HIDDEN_CLOSE_MS");
+const LOADING_LINE_DELAY_MS = sourceConstant("LOADING_LINE_DELAY_MS");
+
+/** How many elements of `tag` the page has built since `from` entries into `createdTags`. */
+const builtSince = (page, from, tag) => page.createdTags.slice(from).filter((made) => made === tag).length;
+
+test("A REFRESH THAT BRINGS NOTHING BUILDS NOTHING: the same rows stay, and what did change still redraws", async () => {
+  const { page, server } = await forwardPage();
+  const rows = [...page.el("discord-log").children];
+  const made = page.createdTags.length;
+  const reads = server.reads.length;
+  await pollOnce(page);
+  assert.deepStrictEqual(forwardReadKinds(server, reads), [true], "the poll did not read what changed");
+  assert.equal(builtSince(page, made, "li"), 0, "a poll that brought nothing built rows");
+  assert.equal(builtSince(page, made, "button"), 0, "a poll that brought nothing built controls");
+  assert.ok(rows.length > 0 && page.el("discord-log").children.length === rows.length &&
+    [...page.el("discord-log").children].every((li, at) => li === rows[at]), "a poll that brought nothing replaced the rows");
+  // What a delta does carry is drawn: a message, a Done from another device, a deletion.
+  server.post(message({ id: "380", content: "posted on another device" }));
+  await pollOnce(page);
+  assert.ok(shownIds(page).includes("380"), "a new message was not drawn");
+  page.dealtWith.add("200");
+  server.edit("200", {});
+  await pollOnce(page);
+  assert.equal(rowWithId(page, "200").getAttribute("data-archived"), "true", "a Done from another device was not drawn");
+  server.remove("380");
+  await pollOnce(page);
+  assert.ok(!shownIds(page).includes("380"), "a deletion was not drawn");
+});
+
+test("A LIVE MESSAGE IS BUILT ONCE: the read behind it, bringing the same message, rebuilds nothing", async () => {
+  const { page, server } = await forwardPage();
+  const arriving = server.post(message({ id: "390", content: "the runner came back" }));
+  const reads = server.reads.length;
+  const held = gate(server.answer);
+  server.hold = held;
+  await deliver(page, page.stream(), sseMessage(arriving));
+  assert.ok(rowWithId(page, "390"), "the live message was not drawn at once");
+  const rows = [...page.el("discord-log").children];
+  const made = page.createdTags.length;
+  server.hold = null;
+  held.open();
+  await page.settle();
+  await page.settle();
+  assert.deepStrictEqual(forwardReadKinds(server, reads), [true], "the live message was not read behind");
+  assert.equal(builtSince(page, made, "li"), 0, "the read behind a live message built the rows again");
+  assert.ok([...page.el("discord-log").children].every((li, at) => li === rows[at]),
+    "the read behind a live message replaced the rows");
+});
+
+test("...BUT A ROW THE STREAM CHANGED UNDER is drawn again by the read behind it, though that read changes nothing held", async () => {
+  // The stream's copy of a message already on screen goes into the store and leaves its row as it
+  // was; the read behind it brings the same copy. Nothing in the store changes, but the row on
+  // screen was drawn from an older one.
+  const { page, server } = await forwardPage();
+  server.edit("200", { content: "main channel announcement, corrected" });
+  await deliver(page, page.stream(), sseMessage(page.messages.find((m) => m.id === "200")));
+  await page.settle();
+  await page.settle();
+  assert.ok(rowShowing(page, "main channel announcement, corrected"), "the row kept the copy it was drawn from");
+});
+
+test("...NOR ONE THAT MARKS A REPLY DONE ON ANOTHER DEVICE: Main's count of it goes", async () => {
+  const { page, server } = await forwardPage();
+  await pickThread(page, "flat");
+  await pickThread(page, "main");
+  await page.settle();
+  assert.equal(unreadChip(page, "201") && unreadChip(page, "201").textContent, "1 unread");
+  // Main's deltas say what is Done among every message from a position on, the replies among them.
+  const answer = server.answer;
+  server.answer = async (path) => {
+    const response = await answer(path);
+    const url = new URL(path, "http://fixture.test");
+    if (!url.searchParams.get("after") || url.searchParams.get("view") !== "main") return response;
+    return json(response.status, { ...JSON.parse(await response.text()),
+      reply_dismissals: replyDismissals(page.messages, page.dealtWith) });
+  };
+  await pollOnce(page);
+  assert.equal(unreadChip(page, "201") && unreadChip(page, "201").textContent, "1 unread", "nothing was marked yet");
+  page.dealtWith.add("202");
+  await pollOnce(page);
+  assert.equal(unreadChip(page, "201"), null, "a reply marked Done on another device still counted as unread on Main");
+});
+
+test("A REFRESH NOBODY ASKED FOR, over rows on screen, shows its loading line only once it is slow", async () => {
+  const { page, server } = await forwardPage();
+  const line = page.el("channel-loading");
+  const held = gate(server.answer);
+  server.hold = held;
+  assert.equal(page.expireTimers(DISCORD_POLL_MS), 1);
+  await page.settle();
+  assert.equal(line.hidden, true, "a poll over rows on screen put its loading line up at once");
+  assert.match(page.el("channel-freshness").textContent, /refreshing…$/, "the pill did not say the poll was out");
+  assert.equal(page.expireTimers(LOADING_LINE_DELAY_MS), 1, "nothing waited to show the line of a slow poll");
+  assert.equal(line.hidden, false, "a slow poll never said it was loading");
+  server.hold = null;
+  held.open();
+  await page.settle();
+  await page.settle();
+  assert.equal(line.hidden, true, "the line outlived its poll");
+  // A quick one never shows it, and leaves nothing waiting to.
+  await pollOnce(page);
+  assert.equal(line.hidden, true);
+  assert.equal(page.expireTimers(LOADING_LINE_DELAY_MS), 0, "a finished poll left its line waiting to show");
+});
+
+test("THE SCROLLER IS SIZED BY ITS CELL ALONE, so a change beside it does not lay its history out again", () => {
+  // `#226 page-energy-profile`. The freshness pill shares #scroll-area's grid cell, and its words
+  // change at every refresh: without containment that laid the whole history out, twice.
+  assert.match(cssBlock("#scroll-area"), /contain:\s*size layout/, "the scroller is sized by its content again");
+  // Layout containment makes the scroller what everything positioned inside it is placed against, so
+  // nothing in the list may hang off anything outside it: what is positioned there hangs off its row.
+  assert.match(cssBlock("#discord-log li.discord-message"), /position:\s*relative/);
+  assert.doesNotMatch(CSS_CODE, /position:\s*(fixed|sticky)/, "something now escapes the scroller's containment");
+});
+
+test("A HIDDEN PAGE POLLS NOTHING: the poll waits for it to come back, and one that came due meanwhile runs then", async () => {
+  const { page, server } = await forwardPage();
+  const reads = server.reads.length;
+  await page.setVisibility("hidden");
+  assert.equal(page.expireTimers(DISCORD_POLL_MS), 0, "a hidden page kept its poll armed");
+  page.setClock(page.clock() + 10 * 60 * 1000);
+  await page.settle();
+  assert.equal(server.reads.length, reads, "a hidden page read the channel");
+  // Back after ten minutes: one read of what changed, and the poll armed again.
+  await page.setVisibility("visible");
+  await page.settle();
+  await page.settle();
+  assert.deepStrictEqual(forwardReadKinds(server, reads), [true], "coming back did not read what changed, once");
+  await pollOnce(page);
+  assert.deepStrictEqual(forwardReadKinds(server, reads), [true, true], "the poll was not armed again");
+  // A glance away that the poll came due in: it runs on the way back.
+  page.setClock(page.clock() + DISCORD_POLL_MS - 5000);
+  await page.setVisibility("hidden");
+  page.setClock(page.clock() + 10000);
+  await page.setVisibility("visible");
+  await page.settle();
+  await page.settle();
+  assert.deepStrictEqual(forwardReadKinds(server, reads), [true, true, true], "a poll that came due while hidden never ran");
+  // A glance away that it did not: nothing is read, and the poll goes on with the rest of its wait,
+  // so glancing away again and again cannot put it off for good.
+  await page.setVisibility("hidden");
+  page.setClock(page.clock() + 5000);
+  await page.setVisibility("visible");
+  await page.settle();
+  assert.equal(server.reads.length, reads + 3, "a five-second glance read the channel");
+  assert.equal(page.expireTimers(DISCORD_POLL_MS), 0, "a glance away started the poll's wait again");
+  // A poll on the wire when the page is hidden, landing after: it arms no next one until the return.
+  const held = gate(server.answer);
+  server.hold = held;
+  assert.equal(page.expireTimers(DISCORD_POLL_MS - 5000), 1, "the poll was not armed for the rest of its wait");
+  await page.settle();
+  await page.setVisibility("hidden");
+  server.hold = null;
+  held.open();
+  await page.settle();
+  await page.settle();
+  assert.equal(server.reads.length, reads + 4, "the poll on the wire did not land");
+  assert.equal(page.expireTimers(DISCORD_POLL_MS), 0, "a poll landing on a hidden page armed the next");
+  await page.setVisibility("visible");
+  await page.settle();
+  assert.equal(page.expireTimers(DISCORD_POLL_MS), 1, "the poll did not come back with the page");
+});
+
+test("...and a channel read whole polls at once on the way back when its poll came due while hidden", async () => {
+  // No deltas here, so no read for coming back: the poll that came due is that read.
+  const page = newPage();
+  await signIn(page);
+  await showDiscord(page, [message({ id: "100", content: "the only message" })]);
+  const reads = page.pageReads;
+  page.setClock(page.clock() + DISCORD_POLL_MS - 5000);
+  await page.setVisibility("hidden");
+  assert.equal(page.expireTimers(DISCORD_POLL_MS), 0, "a hidden page kept its poll armed");
+  page.setClock(page.clock() + 10000);
+  await page.setVisibility("visible");
+  await page.settle();
+  assert.equal(page.pageReads, reads + 1, "a poll that came due while hidden did not run on the way back");
+});
+
+test("A LIVE MESSAGE ON A HIDDEN PAGE is kept, not drawn or read; coming back draws it at once and reads once", async () => {
+  const { page, server } = await forwardPage();
+  const reads = server.reads.length;
+  await page.setVisibility("hidden");
+  const arriving = server.post(message({ id: "361", content: "posted while the phone was in a pocket" }));
+  await deliver(page, page.stream(), sseMessage(arriving));
+  await page.settle();
+  assert.equal(server.reads.length, reads, "a hidden page re-read the channel for a live message");
+  assert.ok(!shownIds(page).includes("361"), "a hidden page drew a row for a live message");
+  // Back within a glance: drawn before any read answers, then read once behind it.
+  const held = gate(server.answer);
+  server.hold = held;
+  page.setClock(page.clock() + 5000);
+  await page.setVisibility("visible");
+  await page.settle();
+  assert.ok(shownIds(page).includes("361"), "coming back did not draw what arrived while hidden");
+  server.hold = null;
+  held.open();
+  await page.settle();
+  await page.settle();
+  assert.deepStrictEqual(forwardReadKinds(server, reads), [true], "coming back did not read what changed, once");
+  assert.ok(shownIds(page).includes("361"));
+  // An edit waits for that read the same way.
+  const before = server.reads.length;
+  await page.setVisibility("hidden");
+  server.edit("361", { content: "edited in the pocket" });
+  await deliver(page, page.stream(), sseUpdate("u361", page.messages.find((m) => m.id === "361")));
+  await page.settle();
+  assert.equal(server.reads.length, before, "a hidden page re-read the channel for an edit");
+  page.setClock(page.clock() + 5000);
+  await page.setVisibility("visible");
+  await page.settle();
+  await page.settle();
+  await page.settle();
+  assert.equal(server.reads.length, before + 1, "coming back did not read the edit, once");
+  assert.ok(rowShowing(page, "edited in the pocket"), "the edit made while hidden never showed");
+});
+
+test("A HIDDEN PAGE LETS ITS STREAM GO after a while with no call, and takes it up again from the last event it saw", async () => {
+  const { page, server } = await forwardPage();
+  const first = server.post(message({ id: "370", content: "seen before the pocket" }));
+  await deliver(page, page.stream(), sseMessage(first));
+  await page.settle();
+  const stream = page.stream();
+  const opens = page.streamOpens.length;
+  await page.setVisibility("hidden");
+  assert.equal(page.expireTimers(LIVE_HIDDEN_CLOSE_MS), 1, "a hidden page kept its stream with nothing listening");
+  // The reader lets go at its next chunk, the keep-alive being the one that comes.
+  stream.push(": keep-alive\n\n");
+  await page.settle();
+  assert.equal(stream.cancels, 1, "the stream was not closed");
+  const missed = server.post(message({ id: "371", content: "posted while the stream was closed" }));
+  const reads = server.reads.length;
+  page.setClock(page.clock() + LIVE_HIDDEN_CLOSE_MS);
+  await page.setVisibility("visible");
+  await page.settle();
+  await page.settle();
+  await page.settle();
+  assert.deepStrictEqual(forwardReadKinds(server, reads), [true], "coming back did not read what changed, once");
+  assert.ok(shownIds(page).includes(missed.id), "what was posted while the stream was closed never showed");
+  assert.equal(page.streamOpens.length, opens + 1, "the stream did not come back");
+  assert.equal(page.streamOpens[opens].lastEventId, "370", "the stream came back from its tail, not from the last event it saw");
+});
+
+test("...BUT A CALL KEEPS ITS STREAM, and hears what arrives while the page is hidden", async () => {
+  const page = newPage();
+  await startTalking(page);
+  page.messages = [];
+  await page.el("view-switch").click();
+  await page.settle();
+  const stream = page.stream();
+  await setReadNew(page, "gist");
+  await page.setVisibility("hidden");
+  page.expireTimers(LIVE_HIDDEN_CLOSE_MS);
+  await deliver(page, stream, sseMessage(message({ id: "502", content: "and the tag is cut" })));
+  await speakRelay(page);
+  assert.equal(page.stream(), stream, "a call's stream was replaced while the page was hidden");
+  assert.equal(stream.cancels, 0, "a call's stream was closed while the page was hidden");
+  assert.equal(relayed(page).length, 1, "a call did not hear what arrived while the page was hidden");
+});
+
+/** A forward-capable Main with two answers drawn directly under what they answer, so both arrows meet. */
+const twoAdjacentReplies = (p) => {
+  p.messages = [...p.messages,
+    message({ id: "205", content: "is the runner wedged?" }),
+    message({ id: "206", content: "restarted it", reply_to: "205", ...ALICE }),
+    message({ id: "207", content: "and the cache?" }),
+    message({ id: "208", content: "cleared too", reply_to: "207", ...ALICE })];
+  p.enableResizeObserver();
+};
+
+test("THE ARROWS ARE MEASURED ONCE A REDRAW, every rectangle before any write; never hidden, never with none to measure", async () => {
+  const { page, server } = await forwardPage({}, twoAdjacentReplies);
+  const list = page.el("discord-log");
+  list.clientWidth = 380;
+  assert.equal(arrowStyle(rowWithId(page, "206")), "adjacent");
+  // Every rectangle read and every arrow written, in order: "list" for the list's own box.
+  const log = [];
+  const read = FakeElement.prototype.getBoundingClientRect;
+  const write = FakeElement.prototype.setAttribute;
+  FakeElement.prototype.getBoundingClientRect = function rect() {
+    log.push(this === list ? "list" : "read");
+    return read.call(this);
+  };
+  FakeElement.prototype.setAttribute = function set(name, value) {
+    if (name === "data-reply-reach") log.push("write");
+    return write.call(this, name, value);
+  };
+  try {
+    server.post(message({ id: "209", content: "one more thing" }));
+    await pollOnce(page);
+    assert.ok(shownIds(page).includes("209"));
+    assert.equal(log.filter((entry) => entry === "list").length, 1, "a redraw measured the arrows more than once");
+    const measuring = log.slice(log.indexOf("list"));
+    assert.deepStrictEqual(measuring.filter((entry) => entry === "write"), ["write", "write"], "the two arrows were not measured");
+    assert.ok(measuring.lastIndexOf("read") < measuring.indexOf("write"), "a rectangle was read after an arrow was written");
+    // Measured again with nothing changed, nothing is written.
+    log.length = 0;
+    page.resized(list);
+    page.expireTimers(0);
+    assert.deepStrictEqual(log.filter((entry) => entry !== "read"), ["list"], "an unchanged list had its arrows written again");
+    // Hidden: nothing is laid out for nobody. Shown again: measured, once.
+    await page.setVisibility("hidden");
+    log.length = 0;
+    page.resized(list);
+    page.expireTimers(0);
+    assert.deepStrictEqual(log, [], "a hidden page measured the arrows");
+    await page.setVisibility("visible");
+    await page.settle();
+    assert.equal(log.filter((entry) => entry === "list").length, 1, "the arrows a hidden page left were not measured on its return");
+  } finally {
+    FakeElement.prototype.getBoundingClientRect = read;
+    FakeElement.prototype.setAttribute = write;
+  }
+  // A list with no arrow meeting the row above asks for no layout at all.
+  const plain = await forwardPage();
+  const quiet = plain.page.el("discord-log");
+  quiet.clientWidth = 380;
+  let asked = 0;
+  quiet.getBoundingClientRect = () => {
+    asked += 1;
+    return read.call(quiet);
+  };
+  plain.server.post(message({ id: "210", content: "nothing answers anything" }));
+  await pollOnce(plain.page);
+  assert.ok(shownIds(plain.page).includes("210"));
+  assert.equal(asked, 0, "a list with no adjacent arrow was laid out to measure them");
+});
+
+test("A ROW'S PARTS ARE FOUND WITHOUT WALKING THE MESSAGE'S OWN TEXT", async () => {
+  const { page } = await forwardPage({}, twoAdjacentReplies);
+  // A row with no arrow, holding in its text something that would pass for one. The sanitizer lets
+  // no such class through, so this is the fixture's doing: what it shows is whether the lookup of a
+  // row's parts — six to eight of them a row, on every pass — reads every word of the message.
+  const plain = rowWithId(page, "205");
+  assert.equal(replyArrowOf(plain), undefined, "the question has an arrow of its own");
+  const text = plain.descendants().find((node) => node.className === "md");
+  const decoy = page.document.createElement("span");
+  decoy.className = "reply-jump";
+  text.append(decoy);
+  // Every pass over the search decides every row's arrow (`renderReplyLinks`): opening every fold is one.
+  await page.el("expand-all").click();
+  await page.settle();
+  assert.equal(decoy.getAttribute("data-reply-style"), null, "looking for a row's arrow walked into the text of its message");
+  assert.equal(arrowStyle(rowWithId(page, "206")), "adjacent", "the arrows themselves were not found");
+});
+
+test("ONE CLOCK FORMATTER FOR EVERY ROW, made again when the device's zone moves", async () => {
+  const { page, server } = await forwardPage();
+  const made = page.dateFormatsMade;
+  const at = server.post(message({ id: "395", content: "what time is it" })).timestamp;
+  await pollOnce(page);
+  const stamp = () => rowWithId(page, "395").descendants().find((node) => node.className === "msg-time").textContent;
+  assert.ok(page.dateFormatsMade - made <= 1, `a redraw of ${shownIds(page).length} rows made ${page.dateFormatsMade - made} formatters`);
+  assert.equal(stamp(), new Date(at).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }),
+    "the row's time is not what the browser's own short time says");
+  const zone = process.env.TZ;
+  try {
+    process.env.TZ = new Date(at).getTimezoneOffset() === -540 ? "America/New_York" : "Asia/Tokyo";
+    server.post(message({ id: "396", content: "and now" }));
+    await pollOnce(page);
+    assert.equal(stamp(), new Date(at).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }),
+      "a row drawn after the device changed zone kept the old zone's time");
+  } finally {
+    if (zone === undefined) delete process.env.TZ;
+    else process.env.TZ = zone;
+  }
+});
+
 test("the first refresh fifteen minutes after a view's last full read reads it in full", async () => {
   const { page, server } = await forwardPage();
   await pollOnce(page);
@@ -32438,12 +32845,22 @@ test("THE READ OF ALL FOR MAIN'S COUNTS IS BOUNDED: not while All is fresh, not 
   await reReadChannel(page);
   assert.deepStrictEqual(viewsRead(page).slice(reads), ["main", "flat"], "a count that grew did not read All");
   assert.equal(unreadChip(page, inboxId(5)).textContent, "2 new");
-  // Hidden, the page reads nothing it was not asked for.
+  // Hidden, the page reads nothing it was not asked for. A hidden page polls nothing (`#226
+  // page-energy-profile`), so the read of Main that finds the news is one already on the wire when
+  // the page is hidden, and lands after.
   page.setClock(page.clock() + COUNTS_ALL_READ_MS);
   page.messages = page.messages.map((m) => (m.id === inboxId(5) ? { ...m, thread: { ...b3, reply_count: 4 } } : m));
-  await page.setVisibility("hidden");
+  const answer = page.timeline;
+  const held = gate(answer);
+  page.timeline = (path) => held.respond(path);
   reads = viewsRead(page).length;
   await reReadChannel(page);
+  await page.setVisibility("hidden");
+  page.timeline = answer;
+  held.open();
+  await page.settle();
+  await page.settle();
+  assert.deepStrictEqual(viewsRead(page).slice(reads), ["main"], "the read of Main behind the hide did not land");
   assert.ok(!viewsRead(page).slice(reads).includes("flat"), "a hidden page read All for its counts");
 });
 

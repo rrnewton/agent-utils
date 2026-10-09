@@ -1603,7 +1603,33 @@ function visibleFolds() {
   return liveFolds().filter((entry) => entry.li.parentNode === list && !entry.li.hasAttribute("data-read-run"));
 }
 
+/** How many redraws are under way that pass over the scroll tools once, at their end. `#226`. */
+let scrollToolsHeld = 0;
+/** Whether a pass over them was asked for inside one. */
+let scrollToolsOwed = false;
+
+/**
+ * Run `draw`, a redraw that ends with a pass over the scroll tools, passing over them once, at its
+ * end, however often it asks. `#226 page-energy-profile`. A refresh asked three times — following
+ * the newest line, putting its jump down, and as its last step — and each pass runs the search over
+ * every row and decides every reply's arrow again.
+ */
+function holdingScrollTools(draw) {
+  scrollToolsHeld += 1;
+  try {
+    return draw();
+  } finally {
+    scrollToolsHeld -= 1;
+    if (scrollToolsHeld === 0 && scrollToolsOwed) renderScrollTools();
+  }
+}
+
 function renderScrollTools() {
+  if (scrollToolsHeld > 0) {
+    scrollToolsOwed = true;
+    return;
+  }
+  scrollToolsOwed = false;
   // ONE snapshot for all three chips, so they cannot disagree about a list that changed between
   // two queries.
   const folds = visibleFolds();
@@ -5086,6 +5112,8 @@ function onVisibility() {
     if (session.socket) {
       hiddenDuringCall = true;
     }
+    // `#226 page-energy-profile`. Nor is refreshing a channel nobody can see.
+    pauseWhileHidden();
     return;
   }
   visibleAt = Date.now();
@@ -5094,13 +5122,37 @@ function onVisibility() {
   // `#195 send-resilience`. A phone holds a hidden page's timers; a send whose wait ran out while
   // the reader was away goes now, not a further wait after they are back.
   resumeOutgoingRetries();
+  // `#226 page-energy-profile`. What the stream delivered while the page was hidden is drawn now,
+  // from the store, and the arrows a hidden page did not measure are measured.
+  const owed = catchUpHiddenArrivals();
+  if (replyArrowsOwed) measureReplyArrows();
+  const resume = liveResumeAfterHidden;
+  liveResumeAfterHidden = null;
+  const pollDue = discordPollPaused && discordPollDueAt <= visibleAt;
   // `#203 incremental-refresh`. Coming back to the channel after a while is the moment a reader
   // most wants it current, and a phone held the poll's timer the whole time it was away. Only what
-  // changed is asked for, so this costs one small read rather than the next poll's wait.
-  if (away >= VISIBLE_REFRESH_MS && currentView === "discord" && threadingSupported &&
-      clientConfigApplied && el("discord-channel").value) {
-    refreshQuietly(() => loadDiscord({ keepPosition: true, reason: "visible" }))();
+  // changed is asked for, so this costs one small read rather than the next poll's wait. `#226`:
+  // and after any absence the stream delivered something in, the poll came due in, or that let the
+  // stream go.
+  if ((away >= VISIBLE_REFRESH_MS || owed !== null || pollDue || resume !== null) &&
+      currentView === "discord" && threadingSupported && clientConfigApplied && el("discord-channel").value) {
+    refreshQuietly(async () => {
+      try {
+        if (owed === "mutation") refreshAfterLiveMutation();
+        else await loadDiscord({ keepPosition: true, reason: "visible" });
+      } finally {
+        // The stream comes back once that read has brought what it missed, so what it replays from
+        // the last event it saw is held already rather than drawn a row at a time.
+        resumeLiveStream(resume);
+      }
+    })();
+    resumePolling("fresh");
+    return;
   }
+  // An edit the stream delivered is read for wherever the reader is, as it was when it arrived.
+  if (owed === "mutation") refreshAfterLiveMutation();
+  resumeLiveStream(resume);
+  resumePolling(pollDue ? "now" : "rest");
 }
 
 function wasSuspended() {
@@ -7016,12 +7068,18 @@ function staleAsOf(payload) {
  * gap, so the floor and whether older history exists stay as they were, and "a projection never
  * invents coverage" still holds. Its rows are the server's own answer, so a thread record on one
  * replaces the store's, and the id leaves `unplaced`, as a page row does (`#185`).
+ *
+ * `#226 page-energy-profile`. A copy the store holds word for word changes nothing, so the store
+ * keeps its own object, the one the row on screen was drawn from. A delta that changed nothing at
+ * all — no row, no deletion, no read state, no thread, no count, no notice — is put in
+ * `unchangedDeltas`, which is what lets a refresh with nothing new draw nothing (`rowsAsDrawn`).
  */
 function foldTimelineDelta(payload, sent, view = channelView, thread = selectedThreadId) {
   const key = viewKey(view, thread);
   const cover = channelCanon.views.get(key);
   if (!cover || !sent || cover.newest !== sent) return false;
   const delta = payload.delta;
+  const sideBefore = deltaSideState(payload.thread);
   const gone = new Set((delta.deleted || []).map(String));
   if (gone.size) {
     channelCanon.messages = channelCanon.messages.filter((message) => !gone.has(String(message.id)));
@@ -7033,13 +7091,14 @@ function foldTimelineDelta(payload, sent, view = channelView, thread = selectedT
   }
   const arriving = payload.messages || [];
   const before = heldCopies(arriving);
-  if (arriving.length) {
-    const ids = new Set(arriving.map((message) => String(message.id)));
+  const fresh = arriving.filter((message) => !sameMessage(before.get(String(message.id)), message));
+  if (fresh.length) {
+    const ids = new Set(fresh.map((message) => String(message.id)));
     channelCanon.messages = inTimeOrder(
-      [...channelCanon.messages.filter((held) => !ids.has(String(held.id))), ...arriving], "timestamp");
-    for (const id of ids) channelCanon.unplaced.delete(id);
+      [...channelCanon.messages.filter((held) => !ids.has(String(held.id))), ...fresh], "timestamp");
   }
-  foldReadState(payload, view);
+  for (const message of arriving) channelCanon.unplaced.delete(String(message.id));
+  const readChanged = foldReadState(payload, view);
   for (const summary of payload.threads || []) upsertThreadSummary(summary);
   const removed = new Set((delta.removed_threads || []).map(String));
   if (removed.size) channelCanon.threads = channelCanon.threads.filter((held) => !removed.has(String(held.id)));
@@ -7052,6 +7111,10 @@ function foldTimelineDelta(payload, sent, view = channelView, thread = selectedT
     channelCanon.hasThreads = payload.has_threads === true;
   }
   noteReplyGaps(payload, view, false, true, before);
+  if (!gone.size && !fresh.length && !readChanged && !(payload.threads || []).length && !removed.size &&
+      (payload.notice || "") === (cover.notice || "") && deltaSideState(payload.thread) === sideBefore) {
+    unchangedDeltas.add(payload);
+  }
   const asOf = staleAsOf(payload);
   channelCanon.views.set(key, {
     ...cover,
@@ -7062,6 +7125,24 @@ function foldTimelineDelta(payload, sent, view = channelView, thread = selectedT
   });
   channelCanon.complete = delta.complete === true;
   return true;
+}
+
+/** The delta pages `foldTimelineDelta` found changed nothing. `#226 page-energy-profile`. */
+const unchangedDeltas = new WeakSet();
+
+/** Whether `held` is `arriving`, word for word: the same message, to draw and to keep. */
+const sameMessage = (held, arriving) => held !== undefined && JSON.stringify(held) === JSON.stringify(arriving);
+
+/**
+ * What a delta can change in the store besides its rows — the counts of replies the store lacks,
+ * what Done settled of them, the threads passed over, what the channel is scoped to, whether it has
+ * threads, and the summary of thread `thread` it carries — to be compared before and after one is
+ * folded.
+ */
+function deltaSideState(thread) {
+  const summary = thread ? channelCanon.threads.find((held) => String(held.id) === String(thread.id)) : null;
+  return JSON.stringify([[...channelCanon.replyGaps], [...channelCanon.settledByDone], [...channelCanon.passedOver],
+    channelCanon.scope, channelCanon.hasThreads, summary || null]);
 }
 
 /**
@@ -9260,11 +9341,29 @@ function threadCard(summary) {
  * Say that a read is on the wire, or that none is. `quiet` is a read behind rows already on screen
  * for a view switch, `#220 view-switch-instant`: the pill says it is refreshing and the list shows
  * no loading line, which over rows the reader is already reading would only say "wait".
+ *
+ * `delayed` is a refresh nobody asked for over rows on screen — the poll, the read behind a live
+ * message, coming back to the page — and its line shows only if it is still out after
+ * `LOADING_LINE_DELAY_MS`. `#226 page-energy-profile`: shown at once, the line and its spinner went
+ * in above the whole history and came out again a moment later on every poll, laying the list out
+ * twice and animating, which was most of what a refresh with nothing new still cost. The pill says
+ * "refreshing…" all the while, and a slow refresh still shows the line.
  */
-function renderChannelLoading(loading, quiet = false) {
+function renderChannelLoading(loading, quiet = false, delayed = false) {
   const indicator = el("channel-loading");
   channelRefreshing = loading;
-  indicator.hidden = !loading || quiet;
+  if (loadingLineTimer !== null) {
+    clearTimeout(loadingLineTimer);
+    loadingLineTimer = null;
+  }
+  if (loading && delayed && !quiet && indicator.hidden) {
+    loadingLineTimer = setTimeout(() => {
+      loadingLineTimer = null;
+      if (channelRefreshing) indicator.hidden = false;
+    }, LOADING_LINE_DELAY_MS);
+  } else {
+    indicator.hidden = !loading || quiet;
+  }
   // "Saved 14:05" and "Saved 14:05 · refreshing…" are different claims; only the second waits.
   renderChannelFreshness();
   if (!loading) return;
@@ -9273,6 +9372,23 @@ function renderChannelLoading(loading, quiet = false) {
     : channelView === "thread"
       ? "Loading thread…"
       : "Loading messages…";
+}
+
+/** How long a refresh nobody asked for may be out before its loading line shows: one second. `#226`. */
+const LOADING_LINE_DELAY_MS = 1000;
+/** The timer that shows that line, or null. */
+let loadingLineTimer = null;
+
+/**
+ * Whether a read was asked for by nothing the reader did — the poll, a live message, coming back to
+ * the page, the stream's replay or an edit it carried — every reason a queued read stands for
+ * included. `#226 page-energy-profile`.
+ *
+ * @param {{reason?: string | (string | undefined)[]} | undefined} options
+ */
+function backgroundRead(options) {
+  const reasons = options && Array.isArray(options.reason) ? options.reason : [options ? options.reason : undefined];
+  return reasons.every((reason) => ["poll", "live", "visible", "replay", "mutation"].includes(String(reason)));
 }
 
 function addThreadDecoration(meta, message, row, everyThread = false) {
@@ -9667,25 +9783,33 @@ function atOrAfter(id, from) {
  * Done. Main's newest page and its deltas say more (`reply_dismissals`): every mark from a position
  * up, complete there, so every message the store holds from that position is Done exactly when it is
  * named, the replies Main never draws among them.
+ *
+ * Answers whether that changed anything the store held (`#226 page-energy-profile`).
  */
 function foldReadState(payload, view) {
+  let changed = false;
+  const mark = (id, done) => {
+    if (channelCanon.dismissed.has(id) === done) return;
+    if (done) channelCanon.dismissed.add(id);
+    else channelCanon.dismissed.delete(id);
+    changed = true;
+  };
   const done = new Set((payload.dismissed || []).map(String));
   for (const message of payload.messages || []) {
     const id = String(message.id);
     if (!readSpeaksFor(payload, id)) continue;
-    if (done.has(id)) channelCanon.dismissed.add(id);
-    else channelCanon.dismissed.delete(id);
+    mark(id, done.has(id));
   }
   const marks = payload.reply_dismissals;
-  if (view !== "main" || !marks) return;
+  if (view !== "main" || !marks) return changed;
   const named = new Set(marks.messages.map(String));
   const from = String(marks.from);
   for (const message of channelCanon.messages) {
     const id = String(message.id);
     if (!atOrAfter(id, from) || !readSpeaksFor(payload, id)) continue;
-    if (named.has(id)) channelCanon.dismissed.add(id);
-    else channelCanon.dismissed.delete(id);
+    mark(id, named.has(id));
   }
+  return changed;
 }
 
 /**
@@ -10104,6 +10228,34 @@ function timelinePath(before = null, after = null) {
 }
 
 /**
+ * Whether the list on screen is exactly what drawing delta `pages` would draw: the store's projection
+ * of the view, the same messages grouped the same way in the same order, every row drawn from the
+ * very objects the store holds, and every message the pages say is Done already shown as Done.
+ * `#226 page-energy-profile`.
+ *
+ * The poll every forty-five seconds rebuilt every row on screen, and every one of its listeners, when
+ * the server said nothing had changed: measured, that was most of what an idle page spent, and with
+ * history scrolled in each rebuild cost a third of a second of a phone's CPU. Not the Threads list,
+ * whose cards say how long ago each thread moved; not while replies are gathered, which moves rows
+ * out of time order; and not while entering a thread waits on a read to land on.
+ */
+function rowsAsDrawn(pages) {
+  if (channelView === "threads" || gatheredParent() !== null || threadEntryOwed !== null) return false;
+  if (!pages.every((page) => (page.dismissed || []).every((id) => archivedIds.has(String(id))))) return false;
+  const projected = projectView();
+  if (!projected) return false;
+  const keeps = readFilterKeeps();
+  const groups = glom(projected.filter((message) => !todoMode || keeps(message)));
+  const rows = el("discord-log").children;
+  if (rows.length !== groups.length) return false;
+  for (let i = 0; i < groups.length; i += 1) {
+    const drawn = rowMessages(rows[i]);
+    if (drawn.length !== groups[i].length || groups[i].some((message, at) => drawn[at] !== message)) return false;
+  }
+  return true;
+}
+
+/**
  * Draw a page: a newest page, an older one (`older`), saved rows (`saved`), or a delta the caller
  * has already folded into the store (`delta`, `#203 incremental-refresh`). A delta is drawn exactly
  * as a refresh that keeps the reader's place is — the store's projection of the view — but it says
@@ -10156,7 +10308,8 @@ function applyTimelinePage(payload, older = false, saved = false, delta = false,
     el("discord-log").replaceChildren(...glom(shown).map(discordNode));
     el("thread-list").replaceChildren(...timelineThreads.map(threadCard));
   }
-  renderChannelRows();
+  // The arrows are measured once, by the pass over the search every caller ends with. `#226`.
+  holdingReplyArrows(renderChannelRows);
   renderChannelNavigation();
   renderOlderControl();
   el("timeline-notice").textContent = payload.notice || "";
@@ -10204,7 +10357,7 @@ function renderCachedTimeline() {
   const shown = timelineMessages.filter((message) => !todoMode || keeps(message));
   const redraw = () => {
     el("discord-log").replaceChildren(...glom(shown).map(discordNode));
-    renderChannelRows();
+    holdingReplyArrows(renderChannelRows);
     backlogSize = shown.length;
     renderTodoControls();
     renderChannelSeam(channelSummary(
@@ -10348,7 +10501,9 @@ async function loadTimeline(options) {
   // rows in it: a quiet read queued with one for a view that has nothing to draw shows the line.
   const ownAct = Boolean(options && options.ownAct);
   const rowsUp = el(view === "threads" ? "thread-list" : "discord-log").children.length > 0;
-  renderChannelLoading(true, Boolean(options && options.quiet) && rowsUp);
+  // `#226 page-energy-profile`. A refresh nobody asked for, over rows on screen, shows its line only
+  // once it has been out for `LOADING_LINE_DELAY_MS`: the pill already says "refreshing…".
+  renderChannelLoading(true, Boolean(options && options.quiet) && rowsUp, rowsUp && backgroundRead(options));
   /** @type {VibeTalk.TimelineResponse[]} every page this refresh folded, in order */
   const landed = [];
   /** @type {VibeTalk.TimelineResponse[]} the delta pages among them, still to be drawn */
@@ -10365,11 +10520,26 @@ async function loadTimeline(options) {
   /** Draw the delta pages folded so far, as the one refresh they are. */
   const drawDeltas = () => {
     renderChannelLoading(false);
-    const messages = applyTimelinePage(joinedDeltas(deltas), false, false, true);
-    settleAfterRead(messages, { keepPosition, area, ...position, ownAct });
-    noteFreshRead(deltas[deltas.length - 1]);
-    saveChannelScope();
-    renderScrollTools();
+    // `#226 page-energy-profile`. Nothing changed, and every row on screen is the row a redraw
+    // would draw: the refresh says how fresh the rows are and draws nothing.
+    if (keepPosition && !ownAct && entryReadOwed !== context &&
+        deltas.every((page) => unchangedDeltas.has(page)) && rowsAsDrawn(deltas)) {
+      timelineMessages = projectView() || timelineMessages;
+      observeOutgoingMessages(deltas.flatMap((page) => page.messages || []));
+      noteFreshRead(deltas[deltas.length - 1]);
+      saveChannelScope();
+      // The thread picker's ages ("13h · 16") are the one thing on screen a clock moves.
+      renderChannelNavigation();
+      return;
+    }
+    // One pass over the scroll tools, at the end, however often settling asks. `#226`.
+    holdingScrollTools(() => {
+      const messages = applyTimelinePage(joinedDeltas(deltas), false, false, true);
+      settleAfterRead(messages, { keepPosition, area, ...position, ownAct });
+      noteFreshRead(deltas[deltas.length - 1]);
+      saveChannelScope();
+      renderScrollTools();
+    });
     requestVisibleSummaries();
     if (entryReadOwed === context) entryReadOwed = null;
     payThreadEntry();
@@ -10474,12 +10644,14 @@ async function loadTimeline(options) {
       // one entered on rows it held for replies they lack (`entryReadOwed`, `#222 unread-replies`).
       const owed = entryReadOwed === context;
       const landing = behindHeld || owed ? entryLandingMark() : null;
-      let messages = applyTimelinePage(payload);
-      for (const page of older) messages = applyTimelinePage(page, true);
-      settleAfterRead(messages, { keepPosition, area, ...at, ownAct });
-      noteFreshRead(payload);
-      saveChannelScope();
-      renderScrollTools();
+      holdingScrollTools(() => {
+        let messages = applyTimelinePage(payload);
+        for (const page of older) messages = applyTimelinePage(page, true);
+        settleAfterRead(messages, { keepPosition, area, ...at, ownAct });
+        noteFreshRead(payload);
+        saveChannelScope();
+        renderScrollTools();
+      });
       requestVisibleSummaries();
       // A thread entered with nothing of it on the page lands here, on its first read, and one landed
       // on held rows is landed again on what the read drew: LAST, once the freshness pill and the
@@ -11902,27 +12074,38 @@ function noteAuthor(channelId, id, name, isBot) {
 /**
  * The row's own archive control, found by walking the row rather than by selector.
  *
- * A row is a small tree this file built itself — a meta line and a body — so a walk is exact and
- * costs nothing. It is also the only lookup here that does not go through `el`, and going through
- * `children` keeps it to the same handful of DOM operations the rest of this page uses.
+ * A row is a small tree this file built itself — a meta line and a body — so a walk is exact. It is
+ * also the only lookup here that does not go through `el`, and going through `children` keeps it to
+ * the same handful of DOM operations the rest of this page uses.
+ *
+ * `#226 page-energy-profile`. NOT INTO THE MESSAGE'S OWN TEXT. Since the server renders bodies
+ * (`#217 markdown-blocks`) a row's text is most of its tree — paragraphs, lists, code — and none of
+ * the parts this looks for is ever in it: a `.md` box holds the message and nothing of this file's,
+ * and the sanitizer lets no class through that could pass for one of them. Every pass over the rows
+ * asks this six to eight times a row, so walking every word of every message, splitting each class
+ * attribute on the way, was a quarter of the page's work in live traffic. A class attribute that does
+ * not even contain the name is passed over without being split.
  */
 function childByClass(row, className) {
   // Matched among the element's classes rather than against the whole attribute. The row being
   // read carries `msg-author reading-mark`, and an exact-string match stopped finding it the
   // moment the second class was added -- so the label could be set to "reading" and never set
   // back, which is precisely the bug that reached the suite.
-  const has = (node) =>
-    String(node.className || "")
-      .split(/\s+/)
-      .includes(className);
-  const stack = [...(row.children || [])];
+  const has = (name) => name === className || (name.includes(className) && name.split(/\s+/).includes(className));
+  const stack = [];
+  const push = (node) => {
+    const kids = node.children;
+    if (kids) for (let at = 0; at < kids.length; at += 1) stack.push(kids[at]);
+  };
+  push(row);
   while (stack.length > 0) {
     const node = stack.pop();
-    if (has(node)) {
+    const name = String(node.className || "");
+    if (has(name)) {
       return node;
     }
-    if (node.children) {
-      stack.push(...node.children);
+    if (name !== "md") {
+      push(node);
     }
   }
   return null;
@@ -12700,38 +12883,91 @@ const rowShown = (row) => !row.hidden && !String(row.className).split(/\s+/).inc
  * to get under it) or on its left side (`"side"`, with `--reply-run` the distance from the shaft to
  * that side). See the head of this section. Nothing is measured in a list that is not laid out —
  * off the channel, or behind another screen — and the next resize, which showing it is, measures.
+ *
+ * `#226 page-energy-profile`. EVERY RECTANGLE IS READ BEFORE ANYTHING IS WRITTEN. Reading one after
+ * an arrow's attributes were written made the browser lay the list out again, so a redraw paid one
+ * layout per adjacent arrow, two or three times over: in a profile of live traffic this function
+ * and the row-by-row geometry it asked for were a third of the page's work. Now one layout, and only
+ * what changed is written, so a second measure of an unchanged list lays nothing out again. Nothing
+ * at all is asked of a list with no adjacent arrow, nor of a hidden page, which has no frame to draw
+ * and is measured when it is shown again (`replyArrowsOwed`); nor inside a redraw, which measures
+ * once, at its end (`holdingReplyArrows`).
  */
 function measureReplyArrows() {
+  if (replyArrowsHeld > 0) {
+    replyArrowsOwed = true;
+    return;
+  }
+  replyArrowsOwed = false;
   const list = el("discord-log");
-  if (list.hidden || !(list.getBoundingClientRect().width > 0)) return;
-  const rem = rootFontPx();
+  /** @type {{row: any, arrow: any, above: any}[]} */
+  const pairs = [];
   let above = null;
   for (const row of list.children) {
     const arrow = childByClass(row, "reply-jump");
-    if (arrow && above && arrow.getAttribute("data-reply-style") === "adjacent") {
-      const box = row.getBoundingClientRect();
-      // From the reply's padding edge, which is where web/voice.css hangs the arrow (`right: 100%`).
-      const dx = above.getBoundingClientRect().left - (box.left + (row.clientLeft || 0));
-      // Where the head would have to be to meet the flat of that row's bottom edge, and how far a
-      // turn to its side would have to run, both from the reply's padding edge.
-      const meets = dx + REPLY_CORNER_REM * rem;
-      const run = dx + REPLY_SHAFT_REM * rem;
-      if (meets <= -REPLY_SHAFT_CLEAR_REM * rem || run < REPLY_RUN_MIN_REM * rem) {
-        // Under it. A row whose edge is so close to the box that neither fits — closer than a turn
-        // has room for, too close for the shaft to come up under its flat — is met as near its
-        // corner as the shaft may go.
-        const furthest = (REPLY_SHAFT_REM - REPLY_SHAFT_CLEAR_REM) * rem;
-        const shift = Math.min(furthest, Math.max(0, meets + REPLY_SHAFT_REM * rem));
-        arrow.setAttribute("data-reply-reach", "below");
-        arrow.style.setProperty("--reply-shift", `${shift.toFixed(2)}px`);
-        arrow.style.removeProperty("--reply-run");
-      } else {
-        arrow.setAttribute("data-reply-reach", "side");
-        arrow.style.setProperty("--reply-run", `${run.toFixed(2)}px`);
-        arrow.style.removeProperty("--reply-shift");
-      }
-    }
+    if (arrow && above && arrow.getAttribute("data-reply-style") === "adjacent") pairs.push({ row, arrow, above });
     if (rowShown(row)) above = row;
+  }
+  if (pairs.length === 0) return;
+  if (document.hidden) {
+    replyArrowsOwed = true;
+    return;
+  }
+  if (list.hidden || !(list.getBoundingClientRect().width > 0)) return;
+  const rem = rootFontPx();
+  // From the reply's padding edge, which is where web/voice.css hangs the arrow (`right: 100%`).
+  const gaps = pairs.map(({ row, above: over }) => {
+    const box = row.getBoundingClientRect();
+    return over.getBoundingClientRect().left - (box.left + (row.clientLeft || 0));
+  });
+  pairs.forEach(({ arrow }, at) => {
+    const dx = gaps[at];
+    // Where the head would have to be to meet the flat of that row's bottom edge, and how far a
+    // turn to its side would have to run, both from the reply's padding edge.
+    const meets = dx + REPLY_CORNER_REM * rem;
+    const run = dx + REPLY_SHAFT_REM * rem;
+    if (meets <= -REPLY_SHAFT_CLEAR_REM * rem || run < REPLY_RUN_MIN_REM * rem) {
+      // Under it. A row whose edge is so close to the box that neither fits — closer than a turn
+      // has room for, too close for the shaft to come up under its flat — is met as near its
+      // corner as the shaft may go.
+      const furthest = (REPLY_SHAFT_REM - REPLY_SHAFT_CLEAR_REM) * rem;
+      const shift = Math.min(furthest, Math.max(0, meets + REPLY_SHAFT_REM * rem));
+      setArrowReach(arrow, "below", "--reply-shift", `${shift.toFixed(2)}px`, "--reply-run");
+    } else {
+      setArrowReach(arrow, "side", "--reply-run", `${run.toFixed(2)}px`, "--reply-shift");
+    }
+  });
+}
+
+/** Write one arrow's reach and its distance, and clear the other distance, where they differ. */
+function setArrowReach(arrow, reach, property, value, other) {
+  if (arrow.getAttribute("data-reply-reach") !== reach) arrow.setAttribute("data-reply-reach", reach);
+  if (arrow.style.getPropertyValue(property) !== value) arrow.style.setProperty(property, value);
+  if (arrow.style.getPropertyValue(other) !== "") arrow.style.removeProperty(other);
+}
+
+/** How many redraws are under way that measure the arrows once, at their end. `#226`. */
+let replyArrowsHeld = 0;
+/** Whether the arrows want measuring: asked inside a redraw, or of a hidden page. `#226`. */
+let replyArrowsOwed = false;
+
+/**
+ * Run `draw`, a redraw of the rows, measuring the arrows once at its end rather than at every pass
+ * inside it — the pass over the rows measures, and so does the search pass that every redraw ends
+ * with (`renderScrollTools`). Should neither come, the end of this task measures. `#226
+ * page-energy-profile`.
+ */
+function holdingReplyArrows(draw) {
+  replyArrowsHeld += 1;
+  try {
+    return draw();
+  } finally {
+    replyArrowsHeld -= 1;
+    if (replyArrowsHeld === 0 && replyArrowsOwed) {
+      Promise.resolve().then(() => {
+        if (replyArrowsHeld === 0 && replyArrowsOwed && !document.hidden) measureReplyArrows();
+      });
+    }
   }
 }
 
@@ -14581,7 +14817,25 @@ function shortLocalTime(message) {
   if (at === null) {
     return String(message.spoken_time || "");
   }
-  return at.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+  return shortTimeFormat().format(at);
+}
+
+/**
+ * The formatter `shortLocalTime` uses: what `toLocaleTimeString([], { hour, minute })` makes on every
+ * call, made once. `#226 page-energy-profile`: every row asked for its own on every redraw, which was
+ * a twentieth of the page's work in live traffic. Made again when the device's offset from UTC
+ * moves — the reader travelled, or the clocks changed — since a formatter keeps the zone it was made
+ * in.
+ *
+ * @type {{offset: number, format: Intl.DateTimeFormat} | null}
+ */
+let shortTimeFormatter = null;
+function shortTimeFormat() {
+  const offset = new Date().getTimezoneOffset();
+  if (shortTimeFormatter === null || shortTimeFormatter.offset !== offset) {
+    shortTimeFormatter = { offset, format: new Intl.DateTimeFormat([], { hour: "2-digit", minute: "2-digit" }) };
+  }
+  return shortTimeFormatter.format;
 }
 
 /** The whole truth, for the details sheet: date, time and zone, all local. */
@@ -18155,6 +18409,7 @@ function currentDiscordLoad(generation, channel, readingTodo) {
 }
 
 function stopDiscordPolling() {
+  discordPollPaused = false;
   if (discordPollTimer !== null) {
     clearTimeout(discordPollTimer);
     discordPollTimer = null;
@@ -18165,28 +18420,158 @@ function stopDiscordPolling() {
  * Self-rescheduling rather than setInterval, for two reasons: a slow fetch can never stack a
  * second one up behind it, and the next delay is armed only once the previous poll has actually
  * finished. Polling stops the moment the channel stops being the visible view, so a voice call
- * is never sharing its network with a background refresh nobody is looking at.
+ * is never sharing its network with a background refresh nobody is looking at — and, `#226
+ * page-energy-profile`, while the page is hidden: a poll armed or come due then waits for the
+ * page to be shown (`resumePolling`). `delay` is the rest of a wait a glance away interrupted.
  */
-function scheduleDiscordPoll() {
+function scheduleDiscordPoll(delay = DISCORD_POLL_MS) {
   stopDiscordPolling();
+  discordPollDueAt = Date.now() + delay;
+  if (document.hidden) {
+    discordPollPaused = true;
+    return;
+  }
   discordPollTimer = setTimeout(() => {
     discordPollTimer = null;
     if (currentView !== "discord") return;
-    refreshQuietly(async () => {
-      // A failed poll is the case polling exists for — the network comes back — so the next one
-      // is armed whatever this one did. A page that opened offline never heard `/client-config`
-      // either, and it asks again first.
-      let refused = false;
-      try {
-        refused = !clientConfigApplied && !(await signIn());
-        if (!refused) await loadDiscord({ keepPosition: true, reason: "poll" });
-      } finally {
-        if (currentView === "discord" && !refused) {
-          scheduleDiscordPoll();
-        }
+    if (document.hidden) {
+      discordPollPaused = true;
+      return;
+    }
+    pollDiscord();
+  }, delay);
+}
+
+/** One poll of the channel on screen, which arms the next. */
+function pollDiscord() {
+  refreshQuietly(async () => {
+    // A failed poll is the case polling exists for — the network comes back — so the next one
+    // is armed whatever this one did. A page that opened offline never heard `/client-config`
+    // either, and it asks again first.
+    let refused = false;
+    try {
+      refused = !clientConfigApplied && !(await signIn());
+      if (!refused) await loadDiscord({ keepPosition: true, reason: "poll" });
+    } finally {
+      if (currentView === "discord" && !refused) {
+        scheduleDiscordPoll();
       }
-    })();
-  }, DISCORD_POLL_MS);
+    }
+  })();
+}
+
+// --- a hidden page -------------------------------------------------------------------------------
+//
+// `#226 page-energy-profile`. The owner keeps this page open as an installed app, on a desk and on
+// a phone, and asked that it not drain either. Measured with the window minimized, so that the page
+// really was hidden: the poll kept its forty-five seconds, because a timer re-armed from a fetch's
+// continuation is not one Chromium's background throttling slows; every live message was re-read
+// and every row rebuilt, forced layouts and all, for a page nobody could see; and the stream's
+// keep-alive, every fifteen seconds, is what keeps a phone's radio from ever going idle.
+//
+// So, while the page is hidden:
+//
+//   * THE POLL WAITS. One armed, or come due, resumes when the page is shown: a fresh wait, or now
+//     when its time passed while hidden.
+//   * A LIVE MESSAGE GOES INTO THE STORE AND NO FURTHER. No row, no read. An edit or a removal waits
+//     for a read the same way. The agent of a call still hears it (`relayToAgent`): a call is what
+//     the phone in a pocket is most likely to be doing.
+//   * AFTER `LIVE_HIDDEN_CLOSE_MS` WITHOUT A CALL, THE STREAM IS LET GO, with the last event it saw.
+//     During a call it stays: that is how the agent hears the channel.
+//
+// Coming back pays for all of it at once (`onVisibility`): what the store took in is drawn from the
+// store as a read would have drawn it, the newest line followed or the reader's place kept and what
+// arrived counted; then one read of what changed; then the stream, resumed from its last event, so
+// what it replays is held already and nothing between is skipped. The pill says "Updated" rather
+// than "Live · updated" from the stream's going until it is back, which is the only thing a reader
+// can see of this, and only in the moment after a return.
+
+/** How long a hidden page with no call keeps its live stream: two minutes. */
+const LIVE_HIDDEN_CLOSE_MS = 120000;
+/** Whether a poll was armed, or came due, while the page was hidden, and waits for it to be shown. */
+let discordPollPaused = false;
+/** When the poll last armed was due, by the clock. */
+let discordPollDueAt = 0;
+/** Whether the stream delivered a message for this channel while the page was hidden. */
+let liveArrivedHidden = false;
+/** Whether it delivered an edit or a removal then, which a read answers. */
+let mutationArrivedHidden = false;
+/** The timer that lets the stream go while the page stays hidden, or null. */
+let liveHiddenTimer = null;
+/** The stream let go while hidden, to resume: `{ channel, from, generation }`, or null. */
+let liveResumeAfterHidden = null;
+
+/** The page went out of sight: stop what can wait for it to come back. */
+function pauseWhileHidden() {
+  if (discordPollTimer !== null) {
+    stopDiscordPolling();
+    discordPollPaused = true;
+  }
+  if (liveHiddenTimer === null && liveChannel !== null) {
+    liveHiddenTimer = setTimeout(letStreamGoWhileHidden, LIVE_HIDDEN_CLOSE_MS);
+  }
+}
+
+/** Still hidden, and no call is listening: close the stream, keeping where it was up to. */
+function letStreamGoWhileHidden() {
+  liveHiddenTimer = null;
+  if (!document.hidden || liveChannel === null || session.socket) return;
+  const resume = { channel: String(liveChannel), from: liveLastEventId };
+  stopChannelStream();
+  liveResumeAfterHidden = { ...resume, generation: liveGeneration };
+}
+
+/** Follow the stream let go while hidden again, from its last event, unless something else has since. */
+function resumeLiveStream(resume) {
+  if (resume === null || resume.generation !== liveGeneration || liveChannel !== null) return;
+  if (String(el("discord-channel").value) !== resume.channel || !token()) return;
+  startChannelStream(resume.channel, resume.from);
+}
+
+/**
+ * Take up the poll a hidden page paused: `"now"`, when it came due meanwhile; `"fresh"`, a whole
+ * wait, behind a read coming back has just made; otherwise the rest of the wait it was in, so that
+ * glancing away again and again does not put the poll off for good.
+ *
+ * @param {"now" | "fresh" | "rest"} how
+ */
+function resumePolling(how) {
+  if (!discordPollPaused) return;
+  discordPollPaused = false;
+  if (currentView !== "discord") return;
+  if (how === "now") pollDiscord();
+  else scheduleDiscordPoll(how === "fresh" ? DISCORD_POLL_MS : Math.max(0, discordPollDueAt - Date.now()));
+}
+
+/**
+ * Back in sight: draw what the stream put in the store while the page was hidden, as a read would
+ * have drawn it. Answers what is still owed a read — "mutation" for an edit or a removal, "live" for
+ * a message, which the server places (its thread, its counts) — or null for nothing.
+ */
+function catchUpHiddenArrivals() {
+  if (liveHiddenTimer !== null) {
+    clearTimeout(liveHiddenTimer);
+    liveHiddenTimer = null;
+  }
+  const mutation = mutationArrivedHidden;
+  const arrived = liveArrivedHidden || replaysAwaitingRead.size > 0;
+  mutationArrivedHidden = false;
+  liveArrivedHidden = false;
+  if (arrived && currentView === "discord" && threadingSupported &&
+      channelCanon.channel === String(el("discord-channel").value) && channelCanon.views.has(viewKey())) {
+    const area = el("scroll-area");
+    const position = channelReadPosition(area);
+    if (catchUpHeldView()) {
+      const keeps = readFilterKeeps();
+      settleAfterRead(timelineMessages.filter((message) => !todoMode || keeps(message)),
+        { keepPosition: true, area, ...position });
+    } else {
+      // Nothing of this view's own, but a reply on Main is one more on its root's chip.
+      syncUnreadReplies();
+    }
+    saveChannelScope();
+  }
+  return mutation ? "mutation" : arrived ? "live" : null;
 }
 
 // --- resuming an earlier conversation ------------------------------------------------------------
@@ -18678,9 +19063,13 @@ function releaseLiveAttachWaiters() {
   for (const waiter of [...liveAttachWaiters]) waiter();
 }
 
-/** Follow `channelId`, replacing any stream already running. */
-function startChannelStream(channelId) {
+/**
+ * Follow `channelId`, replacing any stream already running — from event `resumeFrom` on, for a
+ * stream a hidden page let go (`#226 page-energy-profile`), and otherwise from the server's tail.
+ */
+function startChannelStream(channelId, resumeFrom = null) {
   stopChannelStream();
+  liveLastEventId = resumeFrom;
   if (!channelId || !token()) {
     return;
   }
@@ -18881,6 +19270,11 @@ let liveMutationRefreshNeeded = false;
 
 /** Coalesce a burst of edits/deletes into authoritative re-reads without leaving a stale tail. */
 function refreshAfterLiveMutation() {
+  // `#226 page-energy-profile`. Not for a hidden page: the read that coming back makes answers it.
+  if (threadingSupported && document.hidden) {
+    mutationArrivedHidden = true;
+    return;
+  }
   liveMutationRefreshNeeded = true;
   if (liveMutationRefreshRunning) {
     return;
@@ -18944,6 +19338,17 @@ function receiveLiveMessage(message, selfPosted, replayed, fromTail) {
     // make every message look already held. A held message is already in the view drawn from the
     // store, or deliberately not when the to-do filter hides it, so it is not appended again.
     const held = replayed ? heldMessage(message.id) : null;
+    if (document.hidden) {
+      // `#226 page-energy-profile`. Into the store, for coming back to draw and read behind; no row
+      // and no read for a page nobody can see. A call's agent is told as ever.
+      if (!held) {
+        foldLiveMessage(message, true);
+        liveArrivedHidden = true;
+      }
+      renderOutgoingMessages();
+      relayToAgent(message, selfPosted, replayed);
+      return;
+    }
     if (!held) appendChannelRow(message, true);
     renderOutgoingMessages();
     relayToAgent(message, selfPosted, replayed);
@@ -19026,7 +19431,8 @@ function awaitReplayRead(key, channel, arrivedAfter) {
   // a newest page, or a complete delta. A delta of additions says nothing about either.
   if ((isMutationKey(key) ? mutationReadsLanded : timelineReadsLanded) > arrivedAfter) return;
   replaysAwaitingRead.set(key, { channel, arrivedAfter });
-  if (!discordFetchInFlight && currentView === "discord") {
+  // `#226 page-energy-profile`. A hidden page leaves it waiting for the read coming back makes.
+  if (!discordFetchInFlight && currentView === "discord" && !document.hidden) {
     refreshQuietly(() => loadDiscord({ keepPosition: true, reason: "replay" }))();
   }
 }
