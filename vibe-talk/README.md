@@ -120,19 +120,28 @@ nothing is inferred from it. `#222 unread-replies`.
 whose reply counts are ahead of the replies the page holds — always so when Main is opened cold, on a
 device that never read All, where every message with replies would otherwise say **N new** until All
 happened to be opened — the page reads All's newest page once, behind Main: no loading line, nothing
-waits on it, and a view switch is drawn from what is held as ever. The counts are then exact. It is
-not free: on Slack one read of All is about eleven of the chat service's calls (the channel's history,
-and one per thread it brings replies for); on Google Chat it is one more page. So it happens at most
-once every five minutes per channel, counted from the last read of All of any kind, including one
-saved on the device; only for news — a message already seen at the same count by the last such read
-does not ask again; and never while the page is hidden. A read that fails waits out the same five
-minutes. Discord's own threads never ask, having no exact counts.
+waits on it, and a view switch is drawn from what is held as ever. The counts are then exact for
+every thread All brings the replies of — on Google Chat all of them, on Slack at most ten (below). It
+is not free: on Slack one read of All is about eleven of the chat service's calls (the channel's
+history, and one per thread it brings replies for); on Google Chat it is one more page. So it happens
+at most once every five minutes per channel, counted from the last read of All of any kind, including
+one saved on the device; only for news — a message already seen at the same count by the last such
+read does not ask again; and never while the page is hidden. A read that fails waits out the same
+five minutes. Discord's own threads never ask, having no exact counts. On a Slack channel where agents
+keep answering while you sit on Main, that is a read about every five minutes: some 130 of Slack's
+calls an hour on top of Main's own refresh.
 
 **Slack's All brings the replies of at most ten threads per page**, the ten most recently active
 among its messages, and says so in its notice. A thread past those ten is on the page with its count
 but none of its replies, which says nothing about them: the replies the page already holds for it
-stay held, counted and drawn, and its count says **N new** for any it has never held. A step back in
-All that brings an old thread without its replies counts them as old, not new.
+stay held, counted and drawn, and its count says **N new** for any it has never held — on a device
+that never read it, such as a fresh one, that is every reply it has. Nothing brings those replies
+while nothing new happens in the thread; opening it reads it (it is never drawn from All with its
+replies missing), and marking the message itself Done says you have dealt with it: replies no read
+has placed are then taken as read, and only a reply posted after that counts as new. Done never
+settles a reply posted since a read that placed the thread, so Done through a list cannot hide an
+answer nothing has brought. A step back in All that brings an old thread without its replies counts
+them as old, not new.
 
 Known limits of the counts (`#222 unread-replies`):
 - A reply the page never held that is marked Done on another device still counts as new on its
@@ -143,7 +152,10 @@ Known limits of the counts (`#222 unread-replies`):
 - On Slack a refresh of Main between full reads may not carry a message's new reply count; the next
   full refresh, at most forty-five seconds later, does.
 - A Slack thread past the ten All brings replies for, whose replies this device has never held, says
-  **N new** until it is opened, or until a later read of All brings its replies.
+  **N new** until it is opened or its message is marked Done, or until new activity puts it among the
+  ten and a read of All brings its replies. On a fresh device, a busy channel can show many such
+  messages under **Hide read** at first; Done through the list clears them at once. Done there is
+  this device's: another device that never held those replies still counts them.
 
 **Reactions show under each message.** Where the chat service reports them, a message's emoji
 reactions appear as a row of small chips under its text, each the emoji and how many reacted with it
