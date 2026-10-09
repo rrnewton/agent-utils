@@ -1,0 +1,54 @@
+# Recovering agents after a Herdr server restart: what agentctl and wrkslots support, and what they should
+
+Date: 2026-10-09. Author: the dev-hermit coordinator (Claude), after a live recovery.
+
+## Background
+
+A coordinator runs persistent coding agents (Claude, Codex, agentcloud, Muse) in Herdr panes, one tab per agent, through `agentctl`. Each agent's work happens in a `wrkslots` worktree slot. The agent's conversation (its *native session*) lives in the harness's own store: for Claude, one transcript file per conversation under `~/.claude/projects/<escaped starting directory>/<session-uuid>.jsonl`, resumable with `claude --resume <uuid>` from the same starting directory.
+
+On 2026-10-09 the owner ran `herdr update` (to herdr 0.9.3) without `--handoff`. The Herdr server restarted and every harness process in every pane was killed. Herdr then restored the tab layout, but each tab came back as a plain shell, without the agent, without the tab label, and in the pane's last directory.
+
+At the time three subagents were mid-task (`liteinst`, `scorecard`, `pause-signal`), plus the coordinator itself and the Google Chat bridge service that delivers owner messages into the coordinator's pane.
+
+## What recovery took
+
+All three agents and the bridge were recovered in about 25 minutes, with their conversations intact. Almost every step went around a gap in the tools:
+
+| Step | What the tools gave | What had to be done by hand |
+|---|---|---|
+| 1. Which agents were live | `herdr agent list` showed only the coordinator; `herdr pane list` showed ~70 restored shells across 6 workspaces with no labels. `agentctl list` showed 4 records (`liteinst`, `pause-signal`, and two Codex lanes whose harness had already exited the day before). | One live agent (`scorecard`) had never been registered with agentctl at all. Its existence came from the coordinator's own notes. |
+| 2. Which conversation each agent was in | **Nothing.** Every record has `session_value: null`, `session_agent: null`, `resume: null`. | Listed the 25 newest transcripts in `~/.claude/projects/-…-dev-hermit/`, read each one's first user message ("You are pause-signal, …", "Resume the LiteInst fat lane…"), and for the two that started with `/goal`, grepped their tails for the slot name. |
+| 3. Retire the dead record | `agentctl stop pause-signal` exited **75 with no message at all**. | Read `stop --help`, found `--expected-token` ("mandatory for managed-dead recovery"), read the token out of `.agentctl/pause-signal/agent.json`, reran. That worked and closed the stale tab. |
+| 4. Retire an adopted record | `agentctl stop liteinst` refused: "recorded pane shell generation changed". No flag covers it (`--recover-legacy-adoption` is only for identity-less rows). | Moved `.agentctl/liteinst` into `.agentctl/archive/` by hand. |
+| 5. Relaunch with the same launch policy | `agentctl start NAME --profile claude-opus-55 --resume UUID` refused: "--profile conflicts with explicit launch settings: --resume". | Read the profile (`harness claude`, `model opus`, no extra arguments) and passed `--harness claude --model opus --resume UUID` explicitly. The record no longer names the profile. |
+| 6. Tell each agent it was restarted | The first note was delivered; the second and third (same text, sent to other agents) were **quarantined as PROBABLE MISROUTE**, because the identical note was already visible in a peer's pane. Changing only the first line did not help: the read-back compares the prompt's tail. | Checked each pane by hand: every note had in fact arrived exactly once, with no copy in any other pane. |
+| 7. Chat bridge | `systemctl --user is-active` said `active`, and `chat status` said the provider was healthy. But the service had started the previous day and logged nothing since the Herdr restart; its event subscription to the old Herdr server was gone. | Restarted the service by hand. |
+| 8. Leftover tabs | The restored shells (old agent tabs, closed lanes, herdr-run panes, validate panes) are still there. | Not cleaned up; no tool knows which restored shells belonged to which record. |
+
+## Findings
+
+1. **agentctl does not record the native conversation ID for Claude agents.** This is the single biggest gap. Without it, resuming means reading transcripts by hand. The 2026-10-08 design (`ai_docs/transient/2026-10-08-agentctl-rename-identity-revive-design.md`) already found this ("0 of 37 archived Claude records" carry a session) and proposed assigning `--session-id <uuid>` at start and storing it in a new `conversation` field. Stage 1 landed rename, identity anchors, doctor and misroute handling, but not that.
+2. **There is no resume-by-name command.** `start --resume SESSION` exists, but the caller must know the session ID, must give the name again, and cannot keep the profile (finding 5). There is no `agentctl revive NAME` and no "restore everything that was running" operation.
+3. **Retiring a dead record is undiscoverable.** A managed record whose harness died needs `stop --expected-token TOKEN`, and the token is only in the private `agent.json`. Without it, `stop` exits 75 silently. (A refusal with no message is itself a defect.)
+4. **Adopted records cannot be recovered after a Herdr restart.** Herdr restarts every shell, so the recorded shell generation always changes and `stop` refuses forever.
+5. **`--profile` cannot be combined with `--resume`.** Resuming therefore drops the owner's launch policy or forces the caller to copy it by hand, which the agentctl skill forbids in normal use ("never invent, add, remove, or rewrite harness arguments").
+6. **The record does not keep the profile name or the slot.** After a restart nothing says which profile, model or slot an agent ran with. `wrkslots` records the agent name per slot, but not the session, and agentctl records no slot (agents often keep their starting directory at the project root and work in the slot by absolute path, which is also the directory Claude needs for `--resume`).
+7. **Unregistered agents are invisible.** An agent started outside agentctl (or registered under a different registry) leaves no record to recover from.
+8. **Identical restart notes trip the misroute quarantine** (known Gap 3 of https://github.com/rrnewton/agent-utils/issues/231). The obvious recovery action, sending the same "you were restarted" note to every agent, fails safe for every agent after the first.
+9. **The chat bridge does not notice a Herdr server restart.** It stays `active` and reports a healthy provider while it can no longer deliver.
+10. **`herdr update` without `--handoff` kills every agent.** `herdr update --handoff` ("try live handoff after installing") exists; nothing in agent-utils warns about this, checks for live agents before an update, or snapshots what is running.
+
+## Suggested improvements
+
+In priority order.
+
+1. **Record the conversation ID at start and show it.** For Claude, generate a UUID and pass `--session-id`; for Codex and Muse, capture the native session the harness reports; for agentcloud, the session ID is already recorded. Store it with the profile name, model, starting directory and (when known) slot. Show it in `list` and `status`.
+2. **Add `agentctl revive NAME` and `agentctl revive --all`.** For each record whose lifecycle is `running` but whose harness is gone: open a fresh tab, launch with the recorded profile, directory and `--resume <conversation>`, retire the dead record and its stale tab, and optionally send a note. `--all --dry-run` prints the plan, which also answers "what was running?".
+3. **Make dead-record retirement one obvious step.** When `stop` refuses, always print why and the exact recovery command (including the expected token). `revive` should do this itself.
+4. **Give adopted records a recovery path after a server restart** (for example, recognise that the whole Herdr server restarted, and allow retire-without-close when the recorded harness process no longer exists).
+5. **Allow `--profile` with `--resume`.** Resuming should keep the owner's launch policy.
+6. **Snapshot before a Herdr update.** A small `agentctl snapshot` (or a pre-update hook) writing name, profile, directory, slot, conversation ID and pane for every live agent, so that recovery never depends on transcript archaeology. Recommend `herdr update --handoff` in the agentctl user guide and quickstart.
+7. **Let `wrkslots status` show the session per slot** (agent name, harness, conversation ID), or point to the agentctl record.
+8. **Fix Gap 3 for recovery notes**: have agentctl prefix each sent note with a unique per-message nonce line (and compare the whole prompt, not only its tail), so identical broadcasts can be attributed.
+9. **Bridge liveness**: exit non-zero when the Herdr event subscription ends (so systemd restarts it), and add a delivery health check that `chat status` reports.
+10. **`doctor`**: flag "lifecycle running, harness gone" as `revivable` and print the `revive` command; flag restored shells in the configured workspace that belong to no record.
