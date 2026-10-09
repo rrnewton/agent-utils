@@ -15,6 +15,15 @@ from agentctl.subagents import ManagedAgents
 
 from .test_herdr_subagents import FakeManagedClient, setup
 
+#: A known, documented limitation of stage 1 (readback-gaps issue, Gap 3): a peer that already
+#: shows the prompt and whose count did not rise cannot exclude a new copy, so the send is
+#: quarantined (fails safe) until Herdr gives causal evidence. These tests keep the delivery
+#: they require; strict, so each fails loudly once it starts passing.
+KNOWN_LIMITATION_GAP3 = pytest.mark.xfail(
+    strict=True, raises=AgentPossiblySubmitted,
+    reason="readback-gaps Gap 3: equal counts in a peer that already shows the prompt quarantine",
+)
+
 
 def _started(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, name: str = "worker",
@@ -118,6 +127,7 @@ def test_misroute_into_a_shell_types_nothing_more(
     assert _failed_documents(manager, "worker")[0]["probable_misroute"] is True
 
 
+@KNOWN_LIMITATION_GAP3
 def test_prompt_found_in_another_agents_pane_interrupts_that_agent_and_retries(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -659,6 +669,7 @@ def test_countermand_stops_when_the_occupant_changes_after_the_interrupt(
     assert entry["interrupted"] is True and entry["note_sent"] is False
 
 
+@KNOWN_LIMITATION_GAP3
 def test_old_matching_text_in_another_pane_is_not_a_misroute(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -673,6 +684,7 @@ def test_old_matching_text_in_another_pane_is_not_a_misroute(
     assert fake.transcripts[pane][-1] == text
 
 
+@KNOWN_LIMITATION_GAP3
 def test_lost_acknowledgement_after_a_write_elsewhere_is_countermanded(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -923,11 +935,10 @@ def test_failed_readback_log_on_an_unverified_accept_quarantines(
         manager.send("worker", "a long enough instruction for the worker only")
 
 
-def test_a_peer_that_changed_after_an_old_match_is_uncertain(
+@KNOWN_LIMITATION_GAP3
+def test_a_peer_that_keeps_working_after_an_old_match_is_not_uncertain(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    # A peer that already showed this text and whose window changed during the send:
-    # equal counts cannot rule out an old copy leaving as a new one arrived.
     manager, fake, _pane = _started(tmp_path, monkeypatch)
     manager.start("bystander", cwd=str(tmp_path), harness="claude")
     other = manager.get("bystander").pane_id or ""
@@ -940,25 +951,25 @@ def test_a_peer_that_changed_after_an_old_match_is_uncertain(
         fake.transcripts[other] = [text, "more of its own output"]
 
     fake.before_effect = peer_works_on
-    with pytest.raises(AgentPossiblySubmitted, match="cannot be attributed"):
-        manager.send("worker", text)
-    assert fake.keys_sent == []
+    manager.send("worker", text)
+    assert fake.keys_sent == [] and fake.submitted[-1] == text
 
 
-def test_a_repeat_while_an_unchanged_peer_shows_the_old_copy_is_delivered(
+def test_full_peer_window_with_an_old_match_is_uncertain(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    # The peer's full window is byte-identical before and after the send: it received
-    # nothing, so the old copy there does not make the repeat ambiguous.
+    # The peer's window is full, so an old match may have scrolled out as a new one came
+    # in: equal counts cannot tell those histories apart, even though the target shows it.
     manager, fake, pane = _started(tmp_path, monkeypatch)
     manager.start("bystander", cwd=str(tmp_path), harness="claude")
     other = manager.get("bystander").pane_id or ""
     monkeypatch.setattr(subagents, "READBACK_SECONDS", 0.0)
     text = "a long enough instruction for the worker only"
-    fake.transcripts[other] = [*(f"line {index}" for index in range(399)), text]
-    manager.send("worker", text)
-    manager.send("worker", text)
-    assert fake.transcripts[pane][-2:] == [text, text] and fake.keys_sent == []
+    filler = [f"line {index}" for index in range(subagents.SCROLLBACK_LINES)]
+    fake.transcripts[other] = [*filler[:-1], text]
+    with pytest.raises(AgentPossiblySubmitted, match="cannot be attributed"):
+        manager.send("worker", text)
+    assert fake.keys_sent == [] and fake.transcripts[pane][-1] == text
 
 
 def test_confirmation_with_a_replaced_harness_is_quarantined(

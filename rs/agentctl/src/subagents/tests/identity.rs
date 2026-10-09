@@ -1102,11 +1102,10 @@ fn a_peer_window_moving_past_an_old_match_is_uncertain() {
 }
 
 #[test]
-fn a_repeat_while_an_unchanged_peer_shows_the_old_copy_is_delivered() {
+fn a_full_peer_window_with_an_old_match_is_uncertain() {
     let fixture = Fixture::new();
     fixture.start(None);
     add_bystander(&fixture);
-    // A full window whose bytes do not change received nothing, whatever it shows.
     let mut lines: Vec<String> = (0..SCROLLBACK_LINES - 1)
         .map(|index| format!("line {index}"))
         .collect();
@@ -1117,9 +1116,12 @@ fn a_repeat_while_an_unchanged_peer_shows_the_old_copy_is_delivered() {
         .lock()
         .unwrap()
         .insert("peer".to_owned(), lines);
-    let result = send(&fixture, "worker", LONG).expect("delivered");
-    assert_eq!(result.outcome, agent::QueueOutcome::Delivered);
-    assert!(failed_documents(&fixture, "worker").is_empty());
+    let error = send(&fixture, "worker", LONG).expect_err("quarantined");
+    assert!(
+        error.to_string().contains("cannot be attributed"),
+        "{error}"
+    );
+    assert!(fixture.client.keys_sent.lock().unwrap().is_empty());
 }
 
 #[test]

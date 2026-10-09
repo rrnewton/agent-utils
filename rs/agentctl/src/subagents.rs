@@ -2308,15 +2308,11 @@ pub const MISROUTE_NOTE: &str =
 const NOTE_HARNESSES: [&str; 3] = ["claude", "codex", "muse"];
 
 impl<A: ManagedApi + ?Sized> WorkspaceClient<'_, A> {
-    /// Before sending: how often the prompt shows, and how far its last occurrence is from the
-    /// end of the scrollback window, in the target and, for a prompt long enough to attribute,
-    /// in every other registered agent's pane. Only occurrences beyond these are evidence
-    /// about this send. A failure here happens before anything is typed, so it is not staged.
-    fn snapshot(
-        &self,
-        pane_id: &str,
-        text: &str,
-    ) -> crate::error::Result<BTreeMap<String, (usize, [u8; 32])>> {
+    /// Before sending: how often the prompt shows in the target and, for a prompt long enough
+    /// to attribute, in every other registered agent's pane. Only occurrences beyond these are
+    /// evidence about this send. A failure here happens before anything is typed, so it is not
+    /// staged.
+    fn snapshot(&self, pane_id: &str, text: &str) -> crate::error::Result<BTreeMap<String, usize>> {
         let mut panes = vec![pane_id.to_owned()];
         if crate::submission::suffix(text, 40).chars().count() >= ATTRIBUTABLE {
             panes.extend(self.peer_panes().into_iter().filter(|peer| peer != pane_id));
@@ -2333,31 +2329,27 @@ impl<A: ManagedApi + ?Sized> WorkspaceClient<'_, A> {
         Ok(windows)
     }
 
-    /// How often the text shows, and a digest of the whole scrollback read.
-    fn window(&self, pane: &str, text: &str) -> crate::error::Result<(usize, [u8; 32])> {
+    /// How often the text shows in the pane's scrollback.
+    fn window(&self, pane: &str, text: &str) -> crate::error::Result<usize> {
         let screen = self.client.read_scrollback(pane)?;
-        let count = crate::submission::compact(&screen)
+        Ok(crate::submission::compact(&screen)
             .matches(&crate::submission::suffix(text, 40))
-            .count();
-        Ok((count, Sha256::digest(screen.as_bytes()).into()))
+            .count())
     }
 
-    /// `absent` when the pane's scrollback is byte-identical to the snapshot: it received
-    /// nothing. Otherwise `fresh` when the text shows more often than before, and `uncertain`
-    /// when the pane already showed it: an old occurrence may have scrolled or redrawn out as
-    /// a new one came in, which equal counts cannot tell apart, whatever the window's length.
-    /// Otherwise `absent`.
+    /// `fresh` when the text shows more often than before. When it does not, a pane that
+    /// already showed it is `uncertain`: an old occurrence may have scrolled or redrawn out as
+    /// a new one came in, which equal counts cannot tell apart, whatever the window's length
+    /// and even when the bytes read are unchanged. Otherwise `absent`.
     fn observe(
         &self,
         pane: &str,
         text: &str,
-        before: &BTreeMap<String, (usize, [u8; 32])>,
+        before: &BTreeMap<String, usize>,
     ) -> crate::error::Result<&'static str> {
-        let (count, digest) = self.window(pane, text)?;
-        let (old_count, old_digest) = before.get(pane).copied().unwrap_or((0, [0; 32]));
-        Ok(if digest == old_digest {
-            "absent"
-        } else if count > old_count {
+        let count = self.window(pane, text)?;
+        let old_count = before.get(pane).copied().unwrap_or(0);
+        Ok(if count > old_count {
             "fresh"
         } else if old_count > 0 {
             "uncertain"
@@ -2371,7 +2363,7 @@ impl<A: ManagedApi + ?Sized> WorkspaceClient<'_, A> {
         &self,
         pane_id: &str,
         text: &str,
-        before: &BTreeMap<String, (usize, [u8; 32])>,
+        before: &BTreeMap<String, usize>,
         runtime: &dyn agent::AgentRuntime,
     ) -> crate::error::Result<bool> {
         let deadline = runtime.monotonic() + readback_limit();
@@ -2391,7 +2383,7 @@ impl<A: ManagedApi + ?Sized> WorkspaceClient<'_, A> {
         &self,
         pane_id: &str,
         text: &str,
-        before: &BTreeMap<String, (usize, [u8; 32])>,
+        before: &BTreeMap<String, usize>,
     ) -> crate::error::Result<BTreeMap<String, &'static str>> {
         let mut states = BTreeMap::new();
         for peer in before.keys().filter(|peer| peer.as_str() != pane_id) {
@@ -2407,7 +2399,7 @@ impl<A: ManagedApi + ?Sized> WorkspaceClient<'_, A> {
         &self,
         pane_id: &str,
         text: &str,
-        before: &BTreeMap<String, (usize, [u8; 32])>,
+        before: &BTreeMap<String, usize>,
         detail: &str,
         runtime: &dyn agent::AgentRuntime,
     ) -> crate::error::Result<()> {
@@ -2445,7 +2437,7 @@ impl<A: ManagedApi + ?Sized> WorkspaceClient<'_, A> {
         pane_id: &str,
         text: &str,
         submission: &Submission,
-        before: &BTreeMap<String, (usize, [u8; 32])>,
+        before: &BTreeMap<String, usize>,
         runtime: &dyn agent::AgentRuntime,
     ) -> crate::error::Result<()> {
         let recipient_holds = || -> crate::error::Result<()> {

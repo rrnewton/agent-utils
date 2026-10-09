@@ -937,6 +937,8 @@ def _goal_replacement_selected(screen: str, objective: str) -> bool:
 READBACK_SECONDS = 5.0
 #: Shorter prompts are too common to attribute to another pane by their text.
 _ATTRIBUTABLE = 12
+#: Lines of scrollback each read-back reads; a read this long may have lost old lines.
+SCROLLBACK_LINES = 400
 #: Opt-in for countermanding a misroute; by default a misroute is only quarantined.
 COUNTERMAND_ENV = "AGENTCTL_MISROUTE_COUNTERMAND"
 #: Longest wait for another pane's input lock before a countermand gives up.
@@ -1057,10 +1059,9 @@ class _WorkspaceClient:
         #: Whether a misroute is countermanded (Esc and a note) instead of only quarantined.
         self.countermand_enabled = os.environ.get(COUNTERMAND_ENV) == "1"
 
-    def _snapshot(self, pane_id: str, text: str) -> dict[str, tuple[int, str]]:
-        """Before sending: how often the prompt shows, and how far its last occurrence is
-        from the end of the scrollback window, in the target and, for a prompt long enough to attribute, in every other
-        registered agent's pane. Only occurrences beyond these are evidence about this send.
+    def _snapshot(self, pane_id: str, text: str) -> dict[str, int]:
+        """Before sending: how often the prompt shows in the target and, for a prompt long
+        enough to attribute, in every other registered agent's pane. Only occurrences beyond these are evidence about this send.
 
         A failure here happens before anything is typed, so it leaves the message pending.
         """
@@ -1072,29 +1073,25 @@ class _WorkspaceClient:
         except (HerdrUnavailable, AgentDeliveryError) as exc:
             raise PromptNotStaged(f"cannot read scrollback before sending: {exc}; nothing was typed") from exc
 
-    def _window(self, pane: str, text: str) -> tuple[int, str]:
-        """How often the text shows, and a digest of the whole scrollback read."""
-        screen = self.client.read_scrollback(pane)
-        digest = hashlib.sha256(screen.encode("utf-8", "surrogatepass")).hexdigest()
-        return _compact(screen).count(_suffix(text, 40)), digest
+    def _window(self, pane: str, text: str) -> int:
+        """How often the text shows in the pane's scrollback."""
+        return _compact(self.client.read_scrollback(pane)).count(_suffix(text, 40))
 
-    def _observe(self, pane: str, text: str, before: dict[str, tuple[int, str]]) -> str:
-        """``absent`` when the pane's scrollback is byte-identical to the snapshot: it
-        received nothing. Otherwise ``fresh`` when the text shows more often than before,
-        and ``uncertain`` when the pane already showed it: an old occurrence may have
-        scrolled or redrawn out as a new one came in, which equal counts cannot tell
-        apart, whatever the window's length. Otherwise ``absent``."""
-        count, digest = self._window(pane, text)
-        old_count, old_digest = before.get(pane, (0, ""))
-        if digest == old_digest:
-            return "absent"
+    def _observe(self, pane: str, text: str, before: dict[str, int]) -> str:
+        """``fresh`` when the text shows more often than before. When it does not, a pane
+        that already showed it is ``uncertain``: an old occurrence may have scrolled or
+        redrawn out as a new one came in, which equal counts cannot tell apart, whatever
+        the window's length and even when the bytes read are unchanged. Otherwise
+        ``absent``."""
+        count = self._window(pane, text)
+        old_count = before.get(pane, 0)
         if count > old_count:
             return "fresh"
         if old_count > 0:
             return "uncertain"
         return "absent"
 
-    def _seen_in_target(self, pane_id: str, text: str, before: dict[str, tuple[int, str]]) -> bool:
+    def _seen_in_target(self, pane_id: str, text: str, before: dict[str, int]) -> bool:
         deadline = time.monotonic() + READBACK_SECONDS
         while True:
             if self._observe(pane_id, text, before) == "fresh":
@@ -1103,7 +1100,7 @@ class _WorkspaceClient:
                 return False
             time.sleep(min(0.25, max(0.0, deadline - time.monotonic())))
 
-    def _peer_states(self, pane_id: str, text: str, before: dict[str, tuple[int, str]]) -> dict[str, str]:
+    def _peer_states(self, pane_id: str, text: str, before: dict[str, int]) -> dict[str, str]:
         return {peer: self._observe(peer, text, before) for peer in before if peer != pane_id}
 
     def _deliver_checked(
@@ -1131,7 +1128,7 @@ class _WorkspaceClient:
         return receipt
 
     def _located(
-        self, pane_id: str, text: str, before: dict[str, tuple[int, str]], detail: str,
+        self, pane_id: str, text: str, before: dict[str, int], detail: str,
     ) -> None:
         """After an unknown outcome: countermand a prompt that newly shows in exactly one
         other agent's pane and not in the target; otherwise only record what was seen.
@@ -1147,7 +1144,7 @@ class _WorkspaceClient:
 
     def _read_back(
         self, pane_id: str, text: str, receipt: SubmissionReceipt | None,
-        before: dict[str, tuple[int, str]],
+        before: dict[str, int],
     ) -> None:
         """Prove the prompt reached this record's pane, or quarantine it.
 

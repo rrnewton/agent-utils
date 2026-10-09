@@ -746,9 +746,12 @@ never retried automatically:
   registered agent's pane (`"probable_misroute": true`, with the panes involved
   in the error and in `.agentctl/NAME/misroutes.jsonl`);
 - the prompt newly shows in the target and another pane, or in several panes;
-- another pane already showed the prompt and its scrollback changed during the
-  send, so a new occurrence cannot be ruled out (a pane whose scrollback is
-  byte-identical before and after received nothing);
+- another registered agent's pane already showed the prompt and its count did
+  not rise: an old copy may have scrolled out as a new one came in, so a new
+  occurrence cannot be ruled out, whatever the window's length. This fails safe
+  at a cost: a repeated identical prompt, or a broadcast while a peer that
+  already shows the old copy keeps producing output, is quarantined and needs
+  an operator resend. Removing that cost needs causal evidence from Herdr;
 - the target never shows the prompt (delivery is unproven; recorded in
   `.agentctl/NAME/readback.jsonl`).
 

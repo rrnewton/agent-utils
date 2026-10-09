@@ -433,12 +433,20 @@ countermand (H4).
 | Round-5 finding | Fix (both editions unless noted) |
 |---|---|
 | H5 regression: the original rolling-window tests were replaced | The round-4 tests are restored unchanged. A pane that already showed the text and whose count did not rise is `uncertain` in a window of any length, so the message is quarantined |
-| Freshness | Each pane's snapshot carries a SHA-256 digest of the scrollback read. A pane whose read is byte-identical before and after the send received nothing and is `absent`, so a repeated prompt while an idle peer shows the old copy is delivered; a changed window with an old match quarantines |
+| Freshness | Tried in round 5 (a byte-identical SHA-256 snapshot counted as received-nothing) and reverted in round 6: equal bytes prove equal captures, not non-receipt (a capped window can be replaced by identical content). The round-4 full-window quarantine test is restored unchanged |
 | B3a confirmation not recipient-bound | After the working-state confirmation (native, Muse and relay paths) the full pinned-recipient check runs; a mismatch quarantines as possibly submitted |
 | B3b (Rust) unproven receipt | A receipt that neither printed nor settled is quarantined instead of confirmed |
 
-Deferred to a follow-up issue: staged composer text read back as a fresh occurrence, and raw
-queue clients that bypass the managed read-back.
+Round 6 decision: stage 1 must be no worse than main on safety; availability regressions that fail
+safe (quarantine) are accepted and documented. Known cost (Gap 3 of the follow-up issue): a
+repeated identical prompt, or a broadcast while a peer that already shows the old copy keeps
+producing output, is quarantined and needs an operator resend. Four Python tests that require
+delivery in that situation keep their bodies under a strict `xfail` (`KNOWN_LIMITATION_GAP3`,
+`raises=AgentPossiblySubmitted`), which fails if they start passing: the broadcast test, old
+matching text in another pane, and two opt-in countermand retries.
+
+Deferred to a follow-up issue: staged composer text read back as a fresh occurrence, raw queue
+clients that bypass the managed read-back, and the Gap 3 availability cost.
 
 ## C. What was built and how it was verified (2026-10-08)
 
