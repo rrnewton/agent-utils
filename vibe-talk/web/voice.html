@@ -146,7 +146,7 @@
 
       <div id="screens">
         <!-- ------------------------------------------------------------------ sign-in screen -->
-        <section id="screen-signin" class="screen">
+        <section id="screen-signin" class="screen" tabindex="-1" aria-label="Sign in">
           <h1>vibe-talk</h1>
           <p class="hint">Server: <code id="signin-server-url"></code></p>
 
@@ -292,8 +292,19 @@
             </div>
           </div>
 
-          <!-- THE one scrolling element on the page. -->
-          <div id="scroll-area">
+          <!--
+            THE one scrolling element on the page.
+
+            `#224 keyboard-shortcuts`. Focusable (`tabindex="-1"`: by script and by a click, never
+            by Tab) because the browser's own scrolling keys (PgUp, PgDn, Space, Home, End and the
+            arrows) scroll the element that holds the focus, or failing that the DOCUMENT, and this
+            document never scrolls. With the focus on the body or on a control in the dock those
+            keys did nothing at all. web/voice.js hands the focus here when the screen or the view
+            changes, and when one of those keys arrives from somewhere it cannot act; see
+            `routeScrollKey`. A named region, so a screen reader landing here says "Messages"
+            rather than reading the whole list out.
+          -->
+          <div id="scroll-area" tabindex="-1" role="region" aria-label="Messages">
             <!--
               `#129 message-search`. A filter that matches nothing otherwise leaves a BLANK
               region and no explanation: every row is still in the list, so neither pane's own
@@ -562,7 +573,7 @@
                and the composer below it stays on screen. Contained: reading back must not move
                the channel behind it, and a flick that reaches the end must not become a page
                gesture. The rows are built by `renderReplyContext` in web/voice.js. -->
-          <div id="reply-scroll">
+          <div id="reply-scroll" tabindex="-1" role="region" aria-label="The conversation being answered">
             <button id="reply-context-more" class="secondary" type="button" hidden>Load earlier messages</button>
             <p id="reply-context-state" class="hint" aria-live="polite" hidden></p>
             <ul id="reply-context" class="messages" aria-label="Earlier messages"></ul>
@@ -596,7 +607,7 @@
           older steps back one server page at a time. Rows are built by `renderThreadDirectory` in
           web/voice.js; choosing one opens that thread on the channel.
         -->
-        <section id="screen-threads" class="screen" hidden>
+        <section id="screen-threads" class="screen" tabindex="-1" aria-label="Threads" hidden>
           <p id="thread-directory-state" class="hint" role="status" aria-live="polite"></p>
           <ul id="thread-directory-list" class="thread-directory" aria-label="Threads in this channel"></ul>
           <div class="channel-actions">
@@ -623,7 +634,7 @@
           than a setting and it was standing at the top of the screen holding the position a reader
           arrives at — and what they arrive wanting is a switch.
         -->
-        <section id="screen-settings" class="screen" hidden>
+        <section id="screen-settings" class="screen" tabindex="-1" aria-label="Settings" hidden>
           <div class="settings-column">
             <section class="settings-group">
               <div class="group-head">
@@ -1143,7 +1154,7 @@
           in the MARKUP: the page suite derives its element set from this file and refuses an id
           invented at runtime.
         -->
-        <section id="screen-help" class="screen" hidden>
+        <section id="screen-help" class="screen" tabindex="-1" aria-label="Help" hidden>
           <div class="settings-column">
             <p class="hint">
               What each control does, and what it costs. Every entry here is reachable from the

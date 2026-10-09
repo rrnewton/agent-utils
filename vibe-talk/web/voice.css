@@ -2237,6 +2237,17 @@ body {
   mask-image: linear-gradient(to bottom, transparent 0, #000 1.1rem);
 }
 
+/* `#224 keyboard-shortcuts`. Every list takes the focus, so that the browser's own scroll keys move it
+   (see the keyboard section of web/voice.js), and the screen whose list it is takes it whenever it
+   comes up. A ring round a whole screen would say nothing a reader can use: what the keys move is
+   the list, and it visibly moves. So none is drawn on the lists themselves; everything focusable
+   inside them keeps its own. */
+#scroll-area:focus,
+#reply-scroll:focus,
+.screen:focus {
+  outline: none;
+}
+
 #error-wrap {
   margin: 0.5rem 0.75rem;
 }

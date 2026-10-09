@@ -95,6 +95,9 @@ const PAGE_ELEMENTS = new Map(
       // same reason: "the summary chip starts OFF" is a claim about the page as served, and a
       // fixture that dropped the attribute would answer null and make it untestable.
       pressed: (/\baria-pressed="([^"]+)"/.exec(m[2]) || [])[1],
+      // `#224 keyboard-shortcuts`. An input's `type`, which is how the page tells a field the reader
+      // types in from a checkbox or a slider; undefined where the markup gives none.
+      type: (/(?:^|\s)type="([^"]+)"/.exec(m[2]) || [])[1],
       text: m[4].trim(),
     },
   ])
@@ -773,6 +776,23 @@ class FakeElement {
     this.focusedWith = options === undefined ? null : options;
   }
 
+  /**
+   * Select a field's text, as `HTMLInputElement.select` does: counted, so a test knows the page asked.
+   * `#224 keyboard-shortcuts` selects the search text when the search key is pressed again.
+   */
+  select() {
+    this.selectedTimes = (this.selectedTimes || 0) + 1;
+  }
+
+  /**
+   * Let go of the focus, as `HTMLElement.blur` does: counted, so a test knows the page asked. A field
+   * kept on `change` is kept when it loses the focus, which is why `#224 keyboard-shortcuts` asks.
+   */
+  blur() {
+    this.blurred = (this.blurred || 0) + 1;
+    if (FakeElement.focused === this) FakeElement.focused = null;
+  }
+
   /** Focused by `"keyboard"` (drawn as a ring, `:focus-visible`) or by a `"pointer"` (not). */
   focusFrom(how) {
     this.focus();
@@ -1157,7 +1177,11 @@ function replyDismissals(messages, dealtWith) {
 function newPage(store = new Map(), script = SCRIPT, arrange = null) {
   const elements = new Map();
   for (const [id, markup] of PAGE_ELEMENTS) {
-    const element = new FakeElement(id, markup.tag === "svg" ? "svg" : "");
+    // The tag as the DOM reports an HTML element's, upper-case: `#224 keyboard-shortcuts` decides what
+    // a key is for by what holds the focus (a textarea, a picker, a button), so the fixture's
+    // elements say what they are. (Elements the page creates keep the lower-case name it asked for.)
+    const element = new FakeElement(id, markup.tag === "svg" ? "svg" : markup.tag.toUpperCase());
+    if (markup.type !== undefined) element.type = markup.type;
     if (markup.tag === "svg") {
       // SVGElement has no reflecting `hidden` property, so a browser keeps the markup's `hidden`
       // as an attribute and treats `.hidden = x` as an expando that changes nothing on screen.
@@ -17071,6 +17095,469 @@ test("the field states its own layout rule: the size iOS will not zoom", () => {
   // uses. A toggle that looks identical in both modes is not a mode indicator.
   const pressed = cssBlock('#text-entry[aria-pressed="true"]');
   assert.match(pressed, /var\(--accent\)/, "the pressed toggle looks exactly like the unpressed one");
+});
+
+// --- the keyboard (#224 keyboard-shortcuts) -------------------------------------------------------
+//
+// The owner, in the installed app on a Mac desk: PgUp, PgDn, Home and End did nothing, and he wanted
+// "/" and Ctrl+S for the search, and a key for Settings and back out of it. The browser does the
+// scrolling: what the page owes it is a list holding the focus, so these check WHERE THE FOCUS IS
+// after each thing a reader does, and that a scroll key is left to the browser (not prevented) or,
+// in the two cases the browser would misuse it, handled here. tests/keyboard_browser.py presses the
+// real keys in a real Chromium, where the list can be seen moving.
+
+/** A keydown as the document hears it: `key` from `target`, recording whether the page took it. */
+function keyOn(target, key, fields = {}) {
+  const event = {
+    key, code: "", keyCode: 0, shiftKey: false, ctrlKey: false, metaKey: false, altKey: false,
+    isComposing: false, repeat: false, defaultPrevented: false, target, ...fields, defaulted: true,
+  };
+  event.preventDefault = () => {
+    event.defaulted = false;
+    event.defaultPrevented = true;
+  };
+  return event;
+}
+
+/**
+ * Press `key` with the focus on `target` — null for nothing focused, which a browser reports as the
+ * body — the target's own listeners first and then the document's, as a keydown bubbles.
+ */
+async function press(page, target, key, fields = {}) {
+  if (target && typeof target.focus === "function") target.focus();
+  else FakeElement.focused = null;
+  const event = keyOn(target, key, fields);
+  if (target && typeof target.dispatch === "function") await target.dispatch("keydown", event);
+  await page.documentEvent("keydown", event);
+  await page.settle();
+  return event;
+}
+
+/** A page on a channel taller than the screen, at its newest message. */
+async function keyboardPage(platform = "Linux x86_64") {
+  const page = newPage(new Map(), SCRIPT, (p) => p.setPlatform(platform));
+  await signIn(page);
+  await showDiscord(page, tallChannel(30));
+  assert.ok(atBottomOf(page.el("scroll-area")), "the channel did not open at its newest message");
+  return page;
+}
+
+const focused = (page) => page.document.activeElement;
+const scrollToBottom = (area) => {
+  area.scrollTop = area.scrollHeight;
+};
+const focusName = (page) => (focused(page) ? `#${focused(page).id || focused(page).tagName}` : "nothing");
+
+test("EVERY LIST CAN HOLD THE FOCUS, from script and a click but never as a Tab stop, and draws no ring", () => {
+  for (const id of ["scroll-area", "reply-scroll", "screen-signin", "screen-settings", "screen-help", "screen-threads"]) {
+    const tag = new RegExp(`<[a-z]+ id="${id}"[^>]*>`).exec(HTML_CODE);
+    assert.ok(tag, `#${id} is not in the markup`);
+    assert.match(tag[0], /\btabindex="-1"/, `#${id} cannot hold the focus, so the scroll keys cannot reach it`);
+  }
+  // Not a Tab stop anywhere: a list reached by Tab would put a stop the reader has to pass on every screen.
+  assert.doesNotMatch(HTML_CODE, /id="(scroll-area|reply-scroll|screen-[a-z]+)"[^>]*tabindex="0"/);
+  for (const selector of ["#scroll-area:focus", "#reply-scroll:focus", ".screen:focus"]) {
+    assert.match(cssBlock(selector), /outline:\s*none/, `${selector} draws a ring round the whole screen`);
+  }
+});
+
+test("THE LIST ON SCREEN TAKES THE FOCUS: signed in, at a view switch, back from Settings and from Reply", async () => {
+  const page = newPage();
+  await signIn(page);
+  assert.equal(focused(page), page.el("scroll-area"), `signed in, the focus is on ${focusName(page)}`);
+  // THE DEFECT: the switch kept the focus from the click that pressed it, so Space pressed it again.
+  page.el("view-switch").focusFrom("pointer");
+  await showDiscord(page, tallChannel(30));
+  assert.equal(focused(page), page.el("scroll-area"), `after the view switch the focus is on ${focusName(page)}`);
+  page.el("open-settings").focusFrom("pointer");
+  await page.el("open-settings").click();
+  assert.equal(focused(page), page.el("screen-settings"), `on Settings the focus is on ${focusName(page)}`);
+  // Back hides itself as it is pressed, which drops the focus on the floor in a browser.
+  await page.el("close-settings").click();
+  assert.equal(focused(page), page.el("scroll-area"), `back from Settings the focus is on ${focusName(page)}`);
+  await replyButton(page.el("discord-log").children[3]).click();
+  assert.equal(page.screen(), "reply");
+  assert.equal(focused(page), page.el("reply-scroll"), `on Reply the focus is on ${focusName(page)}`);
+  await page.el("close-reply").click();
+  assert.equal(focused(page), page.el("scroll-area"), `back from Reply the focus is on ${focusName(page)}`);
+});
+
+test("A BOX THE READER IS TYPING IN keeps the focus through a sign-in, and through a view change behind Settings", async () => {
+  const page = await keyboardPage();
+  page.el("channel-compose-text").focus();
+  await page.el("channel-compose-text").setValue("half a thought");
+  // A sign-in that answers while the reader types lands on the screen already up.
+  await page.el("save-token").click();
+  await page.settle();
+  assert.equal(page.screen(), "main");
+  assert.equal(focused(page), page.el("channel-compose-text"), `a sign-in took the focus to ${focusName(page)}`);
+  // The search field, which stays on screen through a view switch.
+  await press(page, page.el("scroll-area"), "/");
+  await page.el("view-switch").click();
+  assert.equal(page.tab(), "voice");
+  assert.equal(focused(page), page.el("search-field"), `a view switch took the focus from the search to ${focusName(page)}`);
+});
+
+test("THE SCROLL KEYS are the browser's, and reach the list from wherever the focus is", async () => {
+  const page = await keyboardPage();
+  const area = page.el("scroll-area");
+  const keys = ["PageUp", "PageDown", " ", "Home", "End", "ArrowUp", "ArrowDown"];
+  // From nothing — a load, a control that hid itself — and from a control in the dock: the list takes
+  // the focus on the way past, and the browser's own default, left alone, scrolls it.
+  for (const from of [null, page.el("open-settings"), page.el("view-switch"), page.el("search-toggle")]) {
+    for (const key of keys) {
+      if (key === " " && from) continue;
+      const top = area.scrollTop;
+      const event = await press(page, from, key);
+      const where = `${JSON.stringify(key)} from ${from ? `#${from.id}` : "nothing"}`;
+      assert.equal(event.defaulted, true, `${where} was taken from the browser, which does the scrolling`);
+      assert.equal(focused(page), area, `${where} left the focus on ${focusName(page)}`);
+      assert.equal(area.scrollTop, top, `${where} scrolled the list itself instead of the browser`);
+      assert.equal(page.screen(), "main", `${where} left the main screen`);
+    }
+  }
+  // A focused button keeps Space: it presses it.
+  for (const button of [page.el("open-settings"), page.el("view-switch")]) {
+    const event = await press(page, button, " ");
+    assert.equal(event.defaulted, true, `Space on #${button.id} was taken from the button`);
+    assert.equal(focused(page), button, `Space on #${button.id} moved the focus to ${focusName(page)}`);
+  }
+  // Inside the list the browser scrolls it already: nothing moves the focus.
+  const reply = replyButton(page.el("discord-log").children[5]);
+  for (const key of keys) {
+    const event = await press(page, reply, key);
+    assert.equal(event.defaulted, true, `${JSON.stringify(key)} on a row's button was taken from the browser`);
+    assert.equal(focused(page), reply, `${JSON.stringify(key)} on a row's button moved the focus`);
+  }
+  // Ctrl and Alt are somebody else's: the browser's tab keys, the proposal's channel switching.
+  for (const fields of [{ ctrlKey: true }, { altKey: true }]) {
+    const event = await press(page, null, "PageDown", fields);
+    assert.equal(event.defaulted, true);
+    assert.equal(focused(page), null, `${Object.keys(fields)[0]}+PageDown moved the focus`);
+  }
+});
+
+test("ON A PICKER the arrows and Space are the picker's, and the page keys page the list", async () => {
+  const page = await keyboardPage();
+  const area = page.el("scroll-area");
+  const picker = page.el("discord-channel");
+  for (const key of ["ArrowUp", "ArrowDown", " ", "a"]) {
+    const event = await press(page, picker, key);
+    assert.equal(event.defaulted, true, `${JSON.stringify(key)} was taken from the channel picker`);
+    assert.equal(focused(page), picker, `${JSON.stringify(key)} took the focus off the picker`);
+  }
+  const bottom = area.scrollTop;
+  let event = await press(page, picker, "PageUp");
+  assert.equal(event.defaulted, false, "PageUp on the picker was left to it, which skips channels");
+  assert.equal(area.scrollTop, bottom - Math.round(SCROLL_VIEWPORT_PX * 0.875), "PageUp did not page the list");
+  assert.equal(focused(page), picker, "PageUp took the focus off the picker");
+  event = await press(page, picker, "Home");
+  assert.equal(event.defaulted, false);
+  assert.equal(area.scrollTop, 0, "Home on the picker did not take the list to its top");
+  event = await press(page, picker, "End");
+  assert.equal(event.defaulted, false);
+  assert.ok(atBottomOf(area), "End on the picker did not take the list to its newest message");
+  // A slider keeps every key, and so does the width handle, which answers them itself.
+  for (const key of ["PageUp", "Home", "ArrowDown", " "]) {
+    const slider = page.el("msg-scale");
+    event = await press(page, slider, key);
+    assert.equal(event.defaulted, true, `${JSON.stringify(key)} was taken from a slider`);
+    assert.equal(focused(page), slider, `${JSON.stringify(key)} took the focus off a slider`);
+  }
+  const grip = page.el("width-grip");
+  event = await press(page, grip, "PageDown");
+  assert.equal(event.defaulted, false, "the width handle no longer answers its own keys");
+  assert.equal(focused(page), grip, "a key the width handle answered moved the focus");
+});
+
+test("IN A MESSAGE BOX the box keeps its keys, but a page key pages the list when the box has nothing to page", async () => {
+  const page = await keyboardPage();
+  const area = page.el("scroll-area");
+  const box = page.el("channel-compose-text");
+  const step = Math.round(SCROLL_VIEWPORT_PX * 0.875);
+  for (const text of ["", "a reply in progress"]) {
+    await box.setValue(text);
+    scrollToBottom(area);
+    const bottom = area.scrollTop;
+    let event = await press(page, box, "PageUp");
+    assert.equal(event.defaulted, false, `PageUp in the box (${JSON.stringify(text)}) was left to the box`);
+    assert.equal(area.scrollTop, bottom - step, `PageUp in the box (${JSON.stringify(text)}) did not page the list`);
+    assert.equal(focused(page), box, "PageUp took the reader out of the box");
+    assert.equal(box.value, text, "PageUp changed what is in the box");
+    event = await press(page, box, "PageDown");
+    assert.equal(event.defaulted, false);
+    assert.equal(area.scrollTop, bottom, "PageDown in the box did not page the list back");
+    // The caret's keys, and typing.
+    for (const [key, fields] of [["Home", {}], ["End", {}], [" ", {}], ["ArrowUp", {}], ["PageUp", { shiftKey: true }],
+      ["/", {}], [",", {}]]) {
+      event = await press(page, box, key, fields);
+      assert.equal(event.defaulted, true, `${JSON.stringify(key)} was taken from the box`);
+      assert.equal(area.scrollTop, bottom, `${JSON.stringify(key)} in the box moved the list`);
+      assert.equal(focused(page), box, `${JSON.stringify(key)} took the reader out of the box`);
+      assert.equal(page.screen(), "main");
+      assert.equal(page.el("search-field").hidden, true, `${JSON.stringify(key)} in the box opened the search`);
+    }
+    // Ctrl+Home and Ctrl+End (Cmd on a Mac) jump the list from anywhere, the box included.
+    for (const mod of ["ctrlKey", "metaKey"]) {
+      event = await press(page, box, "Home", { [mod]: true });
+      assert.equal(event.defaulted, false, `${mod}+Home was left to the box`);
+      assert.equal(area.scrollTop, 0, `${mod}+Home did not take the list to its top`);
+      assert.equal(focused(page), box, `${mod}+Home took the reader out of the box`);
+      event = await press(page, box, "End", { [mod]: true });
+      assert.equal(event.defaulted, false, `${mod}+End was left to the box`);
+      assert.ok(atBottomOf(area), `${mod}+End did not take the list to its newest message`);
+    }
+  }
+  // A box holding more than it shows has a page of its own, and keeps its page keys.
+  const longDraft = { tagName: "TEXTAREA", scrollHeight: 240, clientHeight: 60 };
+  const top = area.scrollTop;
+  const event = keyOn(longDraft, "PageUp");
+  await page.documentEvent("keydown", event);
+  assert.equal(event.defaulted, true, "a draft taller than its box lost its own PageUp");
+  assert.equal(area.scrollTop, top, "PageUp in a draft taller than its box paged the list");
+});
+
+test("IN THE CALL'S BOX AND THE REPLY BOX a page key pages the list beside them", async () => {
+  const page = newPage();
+  await startTalking(page);
+  const area = fillTranscript(page, 30);
+  scrollToBottom(area);
+  const bottom = area.scrollTop;
+  assert.ok(bottom > 0, "the transcript is not taller than the screen");
+  let event = await press(page, page.el("compose-text"), "PageUp");
+  assert.equal(event.defaulted, false);
+  assert.equal(area.scrollTop, bottom - Math.round(SCROLL_VIEWPORT_PX * 0.875), "PageUp in the call's box did not page the transcript");
+
+  const reply = newPage();
+  await signIn(reply);
+  await openReplyOn(reply, tallChannel(30), 29);
+  const context = reply.el("reply-scroll");
+  const at = context.scrollTop;
+  assert.ok(at > 0, `the reply screen opened at ${at}, so a page up from it would prove nothing`);
+  event = await press(reply, reply.el("reply-text"), "PageUp");
+  assert.equal(event.defaulted, false, "PageUp in the reply box was left to the box");
+  assert.equal(context.scrollTop, Math.max(0, at - Math.round(REPLY_VIEWPORT_PX * 0.875)),
+    "PageUp in the reply box did not page the conversation above it");
+  assert.equal(focused(reply), reply.el("reply-text"), "PageUp took the reader out of the reply box");
+});
+
+test("/ AND Ctrl+S OPEN THE SEARCH with its field ready; pressed again, the field is focused with its text selected", async () => {
+  for (const [key, fields] of [["/", {}], ["s", { ctrlKey: true }], ["s", { metaKey: true }], ["S", { ctrlKey: true }],
+    // A layout that types no Latin letter there: the key's place says which it is.
+    ["ы", { ctrlKey: true, code: "KeyS" }]]) {
+    const page = await keyboardPage();
+    const what = `${Object.keys(fields).filter((f) => fields[f] === true).join("+")}${key}`;
+    const event = await press(page, page.el("scroll-area"), key, fields);
+    assert.equal(event.defaulted, false, `${what} was left to the browser — Ctrl+S is its Save page`);
+    assert.equal(page.el("search-field").hidden, false, `${what} did not open the search`);
+    assert.equal(focused(page), page.el("search-field"), `${what} left the focus on ${focusName(page)}`);
+    await page.el("search-field").setValue("deploy");
+    // Again, from the list: the field again, its text selected to be typed over.
+    const selected = page.el("search-field").selectedTimes || 0;
+    const again = await press(page, page.el("scroll-area"), key, fields);
+    assert.equal(again.defaulted, false);
+    assert.equal(page.el("search-field").hidden, false, `${what} again closed the search`);
+    assert.equal(page.el("search-field").value, "deploy", `${what} again lost the search text`);
+    assert.equal(focused(page), page.el("search-field"), `${what} again left the focus on ${focusName(page)}`);
+    assert.equal(page.el("search-field").selectedTimes, selected + 1, `${what} again did not select the text`);
+  }
+  // In the field itself "/" is a character, and Ctrl+S still selects.
+  const page = await keyboardPage();
+  await press(page, null, "/");
+  let event = await press(page, page.el("search-field"), "/");
+  assert.equal(event.defaulted, true, "\"/\" typed in the search field was taken from it");
+  event = await press(page, page.el("search-field"), "s", { ctrlKey: true });
+  assert.equal(event.defaulted, false, "Ctrl+S in the search field was left to the browser");
+  // From a message box, while typing: Ctrl+S opens it; "/" is a character.
+  const typing = await keyboardPage();
+  await typing.el("channel-compose-text").setValue("see the ");
+  event = await press(typing, typing.el("channel-compose-text"), "s", { metaKey: true });
+  assert.equal(event.defaulted, false);
+  assert.equal(typing.el("search-field").hidden, false, "Cmd+S from a message box did not open the search");
+  assert.equal(typing.el("channel-compose-text").value, "see the ", "opening the search touched the draft");
+  // Not with Shift or Alt, and not a bare "s".
+  for (const [key, fields] of [["s", { ctrlKey: true, shiftKey: true }], ["s", { ctrlKey: true, altKey: true }], ["s", {}]]) {
+    const other = await keyboardPage();
+    event = await press(other, other.el("scroll-area"), key, fields);
+    assert.equal(event.defaulted, true, `${JSON.stringify(fields)} ${key} was taken`);
+    assert.equal(other.el("search-field").hidden, true, `${JSON.stringify(fields)} ${key} opened the search`);
+  }
+});
+
+test("Ctrl+S OFF THE MAIN SCREEN: from Settings it goes back and searches; elsewhere it only keeps Save page shut", async () => {
+  const page = await keyboardPage();
+  await page.el("open-settings").click();
+  let event = await press(page, page.el("screen-settings"), "s", { ctrlKey: true });
+  assert.equal(event.defaulted, false);
+  assert.equal(page.screen(), "main", "Ctrl+S on Settings did not go back to the list");
+  assert.equal(page.el("search-field").hidden, false, "Ctrl+S on Settings did not open the search");
+  await openReplyOn(page, tallChannel(30), 2);
+  event = await press(page, page.el("reply-text"), "s", { ctrlKey: true });
+  assert.equal(event.defaulted, false, "Ctrl+S on Reply was left to the browser's Save page");
+  assert.equal(page.screen(), "reply", "Ctrl+S left the reply screen");
+  event = await press(page, page.el("reply-scroll"), "/");
+  assert.equal(event.defaulted, true, "\"/\" on Reply, where there is nothing to search, was taken anyway");
+  assert.equal(page.screen(), "reply", "\"/\" left the reply screen");
+});
+
+test("ESCAPE CLOSES THE SEARCH, clears it, and gives the list back the focus", async () => {
+  const page = await keyboardPage();
+  await press(page, page.el("scroll-area"), "/");
+  await page.el("search-field").setValue("deploy");
+  // In the field: its own listener, then the document's, with the one event.
+  let event = await press(page, page.el("search-field"), "Escape");
+  assert.equal(event.defaulted, false);
+  assert.equal(page.el("search-field").hidden, true, "Escape did not close the search");
+  assert.equal(page.el("search-field").value, "", "Escape left the search text standing");
+  assert.equal(focused(page), page.el("scroll-area"), `after Escape the focus is on ${focusName(page)}`);
+  assert.equal(page.screen(), "main");
+  // From the list, with the search open behind it.
+  await press(page, page.el("scroll-area"), "/");
+  event = await press(page, page.el("scroll-area"), "Escape");
+  assert.equal(page.el("search-field").hidden, true, "Escape from the list did not close the search");
+  assert.equal(focused(page), page.el("scroll-area"));
+  // With nothing to close it does nothing — in particular it marks nothing read.
+  const reads = page.dismissCalls.length;
+  event = await press(page, page.el("scroll-area"), "Escape");
+  assert.equal(event.defaulted, true, "an Escape with nothing to close was taken from the browser");
+  assert.equal(page.screen(), "main");
+  assert.equal(page.dismissCalls.length, reads, "Escape marked something read");
+});
+
+test("THE SETTINGS KEY: \",\" and Ctrl+, open Settings with its screen focused; Escape or the key again goes back", async () => {
+  for (const [key, fields] of [[",", {}], [",", { ctrlKey: true }], [",", { metaKey: true }]]) {
+    const page = await keyboardPage();
+    const what = `${Object.keys(fields).filter((f) => fields[f] === true).join("+")}${key}`;
+    const area = page.el("scroll-area");
+    area.scrollTop = 1000;
+    let event = await press(page, area, key, fields);
+    assert.equal(event.defaulted, false, `${what} was left to the browser`);
+    assert.equal(page.screen(), "settings", `${what} did not open Settings`);
+    assert.equal(focused(page), page.el("screen-settings"), `on Settings the focus is on ${focusName(page)}`);
+    event = await press(page, page.el("screen-settings"), "Escape");
+    assert.equal(event.defaulted, false);
+    assert.equal(page.screen(), "main", "Escape did not close Settings");
+    assert.equal(focused(page), area, `back from Settings the focus is on ${focusName(page)}`);
+    assert.equal(area.scrollTop, 1000, "back from Settings the reader was not where they were");
+    await press(page, area, key, fields);
+    event = await press(page, page.el("screen-settings"), key, fields);
+    assert.equal(event.defaulted, false);
+    assert.equal(page.screen(), "main", `${what} again did not close Settings`);
+  }
+  // In a field on Settings "," is a comma; Escape still leaves, and what was typed is already kept.
+  const page = await keyboardPage();
+  await press(page, page.el("scroll-area"), ",");
+  const prompt = page.el("prompt-summary");
+  let event = await press(page, prompt, ",");
+  assert.equal(event.defaulted, true, "\",\" typed in a Settings field was taken from it");
+  assert.equal(page.screen(), "settings", "\",\" typed in a Settings field left Settings");
+  await prompt.setValue("Summarize, briefly.");
+  const blurred = prompt.blurred || 0;
+  event = await press(page, prompt, "Escape");
+  assert.equal(event.defaulted, false);
+  assert.equal(page.screen(), "main", "Escape in a Settings field did not leave Settings");
+  // As a click on Back takes the focus from the field, which is what fires a field's `change`.
+  assert.equal(prompt.blurred, blurred + 1, "Escape left Settings without letting go of the field first");
+  assert.match(page.storage.get("vibe-talk.voice.prompts") || "", /Summarize, briefly\./,
+    "what was typed in Settings was not kept before it was left");
+  // Help is a page of Settings: Escape goes back to Settings, and again to the list.
+  await press(page, page.el("scroll-area"), ",");
+  await page.el("open-help").click();
+  assert.equal(page.screen(), "help");
+  assert.equal(focused(page), page.el("screen-help"), `on Help the focus is on ${focusName(page)}`);
+  await press(page, page.el("screen-help"), "Escape");
+  assert.equal(page.screen(), "settings", "Escape on Help did not go back to Settings");
+  await press(page, page.el("screen-settings"), "Escape");
+  assert.equal(page.screen(), "main");
+});
+
+test("THE SETTINGS KEY where the gear is not: from sign-in it opens and returns; on Reply it does nothing", async () => {
+  const page = newPage();
+  assert.equal(page.screen(), "signin");
+  await press(page, null, ",");
+  assert.equal(page.screen(), "settings", "\",\" on the sign-in screen did not open Settings, which the gear there does");
+  await press(page, page.el("screen-settings"), "Escape");
+  assert.equal(page.screen(), "signin", "Escape did not go back to the sign-in screen");
+  // Typing the token: "," is a character.
+  const event = await press(page, page.el("api-token"), ",");
+  assert.equal(event.defaulted, true);
+  assert.equal(page.screen(), "signin");
+
+  const reply = newPage();
+  await signIn(reply);
+  await openReplyOn(reply, tallChannel(5), 1);
+  let key = await press(reply, reply.el("reply-scroll"), ",");
+  assert.equal(key.defaulted, true, "\",\" on Reply, where it does nothing, was taken anyway");
+  assert.equal(reply.screen(), "reply");
+  key = await press(reply, reply.el("reply-scroll"), ",", { metaKey: true });
+  assert.equal(key.defaulted, false, "Cmd+, on Reply was left to the browser, which opens its own settings");
+  assert.equal(reply.screen(), "reply");
+});
+
+test("EVERY CONTROL ON SETTINGS keeps its value the moment it changes: nothing there waits for a Save", () => {
+  // `#224 keyboard-shortcuts`. Escape leaves Settings, so leaving must lose nothing. The four fields
+  // below are not settings but the inputs of an act with its own button — rename the channel, add
+  // one, add a rule — each a write to the server that a half-typed value must not make.
+  const ACTS = {
+    "channel-alias": "save-alias",
+    "new-channel-id": "add-channel",
+    "new-channel-label": "add-channel",
+    "new-channel-writable": "add-channel",
+    "noise-rule-new": "add-noise-rule",
+  };
+  const page = newPage();
+  const controls = [...PAGE_ELEMENTS].filter(([id, markup]) =>
+    ["input", "select", "textarea"].includes(markup.tag) && markupHolds("screen-settings", id));
+  assert.ok(controls.length >= 15, `only ${controls.length} controls were found on Settings`);
+  for (const [id] of controls) {
+    if (Object.prototype.hasOwnProperty.call(ACTS, id)) {
+      assert.ok(markupHolds("screen-settings", ACTS[id]), `#${id}'s act has no button of its own on Settings`);
+      continue;
+    }
+    const listens = page.el(id).listeners;
+    assert.ok(listens.has("change") || listens.has("input"),
+      `#${id} on Settings answers neither change nor input, so it keeps nothing until something else saves it`);
+  }
+});
+
+test("NO KEY FIRES while an input method composes, from a phone's keyboard, or with Ctrl, Cmd or Alt held", async () => {
+  const page = await keyboardPage();
+  const area = page.el("scroll-area");
+  for (const [key, fields] of [
+    ["/", { isComposing: true }], [",", { isComposing: true }], ["s", { ctrlKey: true, isComposing: true }],
+    // What a phone's on-screen keyboard reports for nearly every key.
+    ["Unidentified", { keyCode: 229 }], ["/", { keyCode: 229 }],
+    ["/", { ctrlKey: true }], ["/", { metaKey: true }], [",", { altKey: true }], ["/", { altKey: true }],
+    ["PageDown", { isComposing: true }],
+  ]) {
+    const event = await press(page, area, key, fields);
+    const what = `${JSON.stringify(fields)} ${JSON.stringify(key)}`;
+    assert.equal(event.defaulted, true, `${what} was taken`);
+    assert.equal(page.screen(), "main", `${what} left the list`);
+    assert.equal(page.el("search-field").hidden, true, `${what} opened the search`);
+  }
+  // An Escape while composing is the input method's: the search stays open.
+  await press(page, area, "/");
+  await press(page, page.el("search-field"), "Escape", { isComposing: true });
+  assert.equal(page.el("search-field").hidden, false, "an input method's Escape closed the search");
+});
+
+test("WITH A MENU OPEN Escape closes it first, and gives its button back the focus", async () => {
+  const page = await keyboardPage();
+  await press(page, page.el("scroll-area"), "/");
+  const row = page.el("discord-log").children[4];
+  await rowMoreButton(row).click();
+  const item = rowMoreMenu(row).descendants().find((node) => node.tagName === "button");
+  assert.ok(item, "the ⋯ menu holds no item");
+  let event = await press(page, item, "Escape");
+  assert.equal(event.defaulted, false);
+  assert.equal(rowMoreMenu(row).hidden, true, "Escape did not close the ⋯ menu");
+  assert.equal(focused(page), rowMoreButton(row), `the focus went to ${focusName(page)}, not the ⋯ that opened the menu`);
+  assert.equal(page.el("search-field").hidden, false, "one Escape closed the menu AND the search");
+  // A page key from the ⋯ is the browser's: it is inside the list.
+  event = await press(page, rowMoreButton(row), "PageUp");
+  assert.equal(event.defaulted, true);
+  assert.equal(focused(page), rowMoreButton(row));
 });
 
 // --- the canned prompts (#60 canned-prompt-buttons) -----------------------------------------------

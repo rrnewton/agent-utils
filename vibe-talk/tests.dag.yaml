@@ -305,6 +305,26 @@ steps:
       classification: latency-bound
       rss_baseline_bytes: 1073741824
 
+  # `#224 keyboard-shortcuts` in the browser engine, the keys pressed through CDP Input.dispatchKeyEvent
+  # so that the browser's own default scrolling runs: PgUp, PgDn, Space, Shift+Space, Home and End move
+  # the channel's list with the focus where the page put it on load and after a view switch, and Space
+  # does not press the switch; "/" and Ctrl+S open the search with its field focused and the browser's
+  # Save page refused; "," and Ctrl+, open Settings with its screen focused, PgDn scrolls it and Escape
+  # returns to the list unmoved; in the message box PgUp pages the list and Ctrl+Home/End jump it.
+  - group: check
+    job: keyboard-browser
+    desc: the scroll, search and Settings keys pressed through CDP in current Chromium at 1280x800
+    labels: [validation-vibe-talk]
+    cmd: cd vibe-talk && python3 tests/keyboard_browser.py
+    jobs_flag: ""
+    timeout: 90
+    cpu_timeout: 45
+    hint:
+      resources: {browser: 1}
+      est_duration_s: 10
+      classification: latency-bound
+      rss_baseline_bytes: 1073741824
+
   # ---- the build everything else needs ----------------------------------------------------------
   - group: build
     job: release

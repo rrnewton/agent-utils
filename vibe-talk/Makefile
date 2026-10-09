@@ -10,7 +10,7 @@
 # tool's lightweight unboxed gate. The root includes `tests.dag.yaml` directly so vibe-talk shares
 # one scheduler and browser cap with the other repository fragments.
 
-.PHONY: validate validate-boxed dag-check fmt check scripts-check contract contract-check typecheck test page pwa-installability enter-to-send-browser offline-cache-browser reactions-browser read-aloud-browser post-confirm-browser view-switch-browser read-modes-browser voice-read-acceptance-self-test android-speech-self-test live-hint-adapter-self-test container-smoke clean
+.PHONY: validate validate-boxed dag-check fmt check scripts-check contract contract-check typecheck test page pwa-installability enter-to-send-browser offline-cache-browser reactions-browser read-aloud-browser post-confirm-browser view-switch-browser read-modes-browser keyboard-browser voice-read-acceptance-self-test android-speech-self-test live-hint-adapter-self-test container-smoke clean
 
 # The whole gate for this tool, cheapest and most likely to fail first.
 #
@@ -154,6 +154,15 @@ view-switch-browser:
 # run it against another copy of the page, and SCREENSHOTS=dir to keep a PNG of each step.
 read-modes-browser:
 	python3 tests/read_modes_browser.py $(if $(WEB_ROOT),--web-root $(WEB_ROOT)) $(if $(SCREENSHOTS),--screenshots $(SCREENSHOTS))
+
+# `#224 keyboard-shortcuts` in a real Chromium at 1280x800, the keys pressed through CDP
+# Input.dispatchKeyEvent so the browser's own defaults run: PgUp, PgDn, Space, Home and End move the
+# list on screen with the focus where the page put it on load and after a view switch; "/" and Ctrl+S
+# open the search (the browser's Save page refused); "," and Ctrl+, open Settings and Escape comes
+# back; in the message box PgUp pages the list and Ctrl+Home/End jump it. Pass WEB_ROOT=dir to run it
+# against another copy of the page, and SCREENSHOTS=dir to keep a PNG of each step.
+keyboard-browser:
+	python3 tests/keyboard_browser.py $(if $(WEB_ROOT),--web-root $(WEB_ROOT)) $(if $(SCREENSHOTS),--screenshots $(SCREENSHOTS))
 
 # The live #47 read-aloud-overlong check is opt-in and may consume provider time. Its transcript
 # reconciliation, PCM-duration metric, re-answer separation, privacy boundaries, threshold edges,

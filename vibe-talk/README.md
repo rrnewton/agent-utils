@@ -3393,6 +3393,42 @@ settings. Nothing is added to the boxes themselves, so a phone screen loses no s
 box's `enterkeyhint` follows the switch, which is what the phone keyboard's return key shows: a send
 arrow when Enter sends, a return arrow when it starts a new line.
 
+### The keyboard: scrolling, search and Settings
+
+`#224 keyboard-shortcuts`. On a desk, in a browser tab or the installed app, the list on screen
+scrolls from the keyboard the way any web page does:
+
+| Key | Does |
+|---|---|
+| PgUp, PgDn, Space, Shift+Space | Scroll a screenful up or down |
+| Home, End | The top of the list, or its newest message |
+| Ctrl+Home, Ctrl+End (Cmd on a Mac) | The same from anywhere, a message box included |
+| `/` or Ctrl+S (Cmd+S) | Open the search with its field ready; pressed again, back to what you typed |
+| `,` or Ctrl+, (Cmd+,) | Settings; pressed again, or Esc, back to where you were |
+| Esc | Closes a menu or the search, leaves Settings or Help; never marks anything read |
+
+These keys did nothing before, and nothing was eating them. A browser scrolls the box that holds
+the focus, or else the document, and this page's document never scrolls: the frame is fixed and each
+list scrolls inside it. None of those lists could hold the focus, so after a load, after a Back
+button, or after a click on anything in the dock the keys went to the document and moved nothing.
+Worse, a click on the view switch left the focus on it, so the next Space pressed it again. Each
+list can now take the focus (by script and by a click, never as a Tab stop), the list on screen
+takes it whenever the screen or the view changes, and a scroll key that arrives from somewhere it
+cannot act hands it the focus on the way past. The browser then scrolls at its own distances and
+with its own smoothing.
+
+In a message box, Home, End, Space and the arrows are the box's own. PgUp and PgDn page the list
+beside the box while the box keeps the focus and the draft, unless the draft is taller than the box,
+when they page the draft. Ctrl+S is also the browser's "Save page", which the page refuses, so it
+never opens over the app. Every control in Settings keeps its value the moment it changes, so leaving
+Settings, with Back or Esc, is all that saving needs. A key that types a character (`/`, `,`) never
+acts while you are typing in a field, and nothing acts while an input method is composing a word.
+
+`make -C vibe-talk keyboard-browser` presses these keys through CDP `Input.dispatchKeyEvent` in a
+real Chromium at 1280x800, so the browser's own default scrolling runs, and measures the list on
+screen after each one: on load, after a view switch, in the search, on Settings and in the message
+box. Pass `SCREENSHOTS=/tmp/shots` to keep a PNG of each step.
+
 ### Two ways a channel row can already have been dealt with, and only one of them hides it
 
 `#84 reply-aware-dismissal` lands the two follow-ups `#50 todo-view` named for itself — the **swipe**, and the

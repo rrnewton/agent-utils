@@ -376,6 +376,7 @@ let screenBeforeSettings = "signin";
 let currentScreen = "signin";
 
 function showScreen(name) {
+  const previous = currentScreen;
   // The channel list is about to be hidden, and a hidden list has nothing left to measure: the
   // reader's message is noted now, for a reopen. `#189 restore-ui-state`.
   if (currentScreen === "main" && name !== "main") holdChannelPlace();
@@ -427,6 +428,26 @@ function showScreen(name) {
   // LAST, and after `currentScreen` is set: the bar decides what it shows from the screen that is
   // now up, and it is also what collapses the header when nothing is left in it. `#58 control-bar`.
   renderControlBar();
+  // `#224 keyboard-shortcuts`. A new screen is a new list for the scroll keys, so its scroller takes
+  // the focus, which the control that brought the reader here would otherwise keep (the gear) or
+  // drop (a Back button, which has just hidden itself), leaving PgDn and Space to the document. Only
+  // on a real change, or with the focus already lost: a sign-in that lands on the screen already up
+  // must not pull the reader out of the box they have started typing in.
+  if (name !== previous || focusLost()) settleFocus();
+}
+
+/**
+ * Leave Settings for the screen it was opened from: what its Back button does, and Escape.
+ *
+ * `#224 keyboard-shortcuts`. Every control on Settings keeps its value the moment it changes, so
+ * leaving is the whole of "save and exit". The one thing done first is to let go of a field that
+ * still holds the focus: a click on Back takes the focus from it, which is what fires its `change`,
+ * and Escape must lose no more than that click does.
+ */
+function closeSettings() {
+  const held = /** @type {HTMLElement | null} */ (document.activeElement);
+  if (held && !focusLost() && typeof held.blur === "function") held.blur();
+  showScreen(screenBeforeSettings);
 }
 
 /**
@@ -622,6 +643,11 @@ function showView(name) {
   renderControlBar();
   renderChannelNavigation();
   saveUiState();
+  // `#224 keyboard-shortcuts`. The list on screen takes the focus, so that the scroll keys move it.
+  // Above all off the view switch: left holding the focus from the click that pressed it, it took
+  // the next Space as another press and switched straight back. Only on the main screen: a view
+  // changed behind Settings must not take the focus from the control the reader is on there.
+  if (leaving !== name && currentScreen === "main") settleFocus();
 }
 
 // --- connection details -------------------------------------------------------------------------
@@ -3362,6 +3388,421 @@ function onComposerKey(event, send, singleLine = false) {
     event.preventDefault();
   }
   return sends ? send() : undefined;
+}
+
+// --- the keyboard -------------------------------------------------------------------------------
+//
+// `#224 keyboard-shortcuts`. The owner, in the installed app on a Mac desk: "pgup/pgdown and home/end
+// don't work even though this is basically a website inside the installed PWA ... I want to make
+// sure those plus "/" and "Ctrl-s" for opening search work. Plus a key to go to the settings, and to
+// save and exit settings, though I think the saving is implicit."
+//
+// WHY THE SCROLL KEYS DID NOTHING. A browser scrolls with PgUp, PgDn, Space, Home, End and the arrows
+// by scrolling the box that holds the focus (with nothing focused, the box the last click landed in)
+// and, failing both, the DOCUMENT. This page's document never scrolls: the frame is a fixed grid and
+// each list scrolls inside it (#scroll-area, #reply-scroll, and the Settings, Help, Threads and
+// sign-in screens), and none of them could hold the focus. So after a load, after any control that
+// hides itself once pressed (every Back button does), and after a click on anything in the dock (the
+// view switch, the channel picker, Hide read) the keys went to the document and moved nothing. Space
+// was worse: the view switch kept the focus from the click that opened the channel, so Space pressed
+// it again and left the channel. A click on a message made the keys work until the next click
+// elsewhere, which is why it looked like a key that worked only sometimes. Measured in Chromium
+// before the fix (tests/keyboard_browser.py, run against the old page); `contain: size layout` on
+// #scroll-area (`#226 page-energy-profile`) is not involved, as the keys behave the same without it.
+//
+// THE FIX IS TO LET THE BROWSER DO IT. Every scroller can take the focus (`tabindex="-1"` in
+// web/voice.html: from script and a click, never a Tab stop), the screen's scroller takes it whenever
+// the screen or the view changes (`settleFocus`), and a scroll key arriving from somewhere that
+// cannot scroll anything hands it the focus on the way past (`routeScrollKey`). The browser's own
+// default, which runs after this page's listener, then scrolls it, at the browser's distances and
+// with its smoothing. The page scrolls a list itself only where the browser's default would do
+// something else with the key: PgUp and PgDn in a text field (a page of caret movement) and on a
+// picker (another option), Home and End on a picker, and Ctrl+Home and Ctrl+End from anywhere.
+//
+// ONE TABLE, `KEYMAP`, and one listener that walks it, `onPageKey`. The message boxes keep their own
+// Enter (`onComposerKey`), the reading-width handle its arrows and the search field its Escape; each
+// runs first, at its element, and a key it handled arrives here with `defaultPrevented` and is left
+// alone.
+//
+// THE RULES, which are the proposal's section 5:
+//
+//   * A key that types a character (a letter, a digit, a mark) never fires while the reader types in
+//     a field or works a picker or a slider, nor with Ctrl, Cmd or Alt held, which leaves every browser
+//     chord alone. Escape and the Ctrl/Cmd chords do fire in a field: a field is where the reader is
+//     when they want the search, Settings or the ends of the list. Nothing fires while an input method
+//     composes, and a phone keyboard, which reports keyCode 229 and types only into fields, never
+//     reaches the table.
+//   * PER LIST, NOT PER PAGE. A list the keys move through is a `KeyPane`, and nothing below names
+//     #scroll-area except the channel pane. A second column is a second entry in `KEY_PANES`, and the
+//     pane holding the focus is the one the keys move.
+//   * Browser history is not touched: Back in the browser still leaves the page. A follow-up.
+
+/**
+ * The input types that take no typing: on one of these a single key is a command, not a character.
+ * Every other input (text, search, password, number, a date) is a field the reader types in.
+ */
+const UNTYPED_INPUTS = ["checkbox", "radio", "range", "button", "submit", "reset", "image", "file", "color"];
+
+/** Whether `node` is somewhere the reader types: a text input, a textarea, or editable content. */
+function isTextField(node) {
+  if (!node) return false;
+  if (node.isContentEditable === true) return true;
+  const tag = String(node.tagName || "").toUpperCase();
+  if (tag === "TEXTAREA") return true;
+  return tag === "INPUT" && !UNTYPED_INPUTS.includes(String(node.type || "text").toLowerCase());
+}
+
+/**
+ * Whether `node` keeps the arrow keys for itself: a picker, a slider, the reading-width handle. A
+ * single key on one of those is the control's too: a picker's type-to-find, a slider's step.
+ */
+function keepsOwnKeys(node) {
+  if (!node) return false;
+  const tag = String(node.tagName || "").toUpperCase();
+  if (tag === "SELECT") return true;
+  if (tag === "INPUT" && String(node.type || "").toLowerCase() === "range") return true;
+  const role = typeof node.getAttribute === "function" ? node.getAttribute("role") : null;
+  return role === "separator" || role === "slider" || role === "spinbutton";
+}
+
+/** The controls a Space presses, toggles or opens. On one of them Space is the control's own. */
+function pressedBySpace(node) {
+  const tag = String((node && node.tagName) || "").toUpperCase();
+  return ["BUTTON", "INPUT", "SELECT", "TEXTAREA", "SUMMARY"].includes(tag);
+}
+
+/** A textarea holding more than it shows, which has a page of its own for the page keys to move through. */
+function scrollsItself(field) {
+  return String(field.tagName || "").toUpperCase() === "TEXTAREA" &&
+    Number(field.scrollHeight) > Number(field.clientHeight) + 1;
+}
+
+/** Whether nothing holds the focus: the body has it, as after a load or a control that hid itself. */
+function focusLost() {
+  const held = document.activeElement;
+  return !held || held === document.body || held === document.documentElement;
+}
+
+/** Whether `node` and every element around it are shown, as far as their `hidden` says. */
+function shownNode(node) {
+  for (let at = node; at && at.nodeType === 1; at = at.parentNode) {
+    if (at.hidden === true) return false;
+  }
+  return true;
+}
+
+// --- the lists the keys move through
+
+/**
+ * @typedef {object} KeyPane
+ * @property {string} name
+ * @property {() => HTMLElement} scroller The element that scrolls the pane's list.
+ */
+
+/**
+ * The one scrolling area on the main screen, which both views share: the call's transcript or the
+ * channel's messages, whichever is up.
+ *
+ * @type {KeyPane}
+ */
+const channelPane = {
+  name: "channel",
+  scroller: () => el("scroll-area"),
+};
+
+/** Every list the keys can move through. A second column is a second entry here. */
+const KEY_PANES = [channelPane];
+
+/** The pane `node` is in, or null. */
+function paneFor(node) {
+  return KEY_PANES.find((pane) => Boolean(node) && nodeWithin(pane.scroller(), node)) || null;
+}
+
+/**
+ * The element the scroll keys are for, on the screen that is up: on the main screen the scroller of
+ * the pane `node` is in (or the first pane), on Reply its conversation, elsewhere the screen.
+ */
+function visibleScroller(node = document.activeElement) {
+  if (currentScreen === "main") return (paneFor(node) || KEY_PANES[0]).scroller();
+  if (currentScreen === "reply") return el("reply-scroll");
+  return el(`screen-${currentScreen}`);
+}
+
+/**
+ * Give the list on screen the focus, so that the scroll keys reach it. `preventScroll`: taking the
+ * focus must not move the list, because where the reader is has rules of its own.
+ */
+function focusList() {
+  const target = visibleScroller();
+  if (target && document.activeElement !== target && typeof target.focus === "function") {
+    target.focus({ preventScroll: true });
+  }
+}
+
+/** `focusList`, unless the reader is typing in a field still on screen, which is never taken from them. */
+function settleFocus() {
+  const held = document.activeElement;
+  if (held && isTextField(held) && shownNode(held)) return;
+  focusList();
+}
+
+// --- scrolling
+
+/** How far a page key moves a list: seven-eighths of what it shows, as Chromium pages a scroller. */
+function pageStep(area) {
+  return Math.max(1, Math.round((area.clientHeight || 0) * 0.875));
+}
+
+/** To the end of `area`. On the main screen exactly what the Newest chip does, which End is. */
+function toNewest(area) {
+  if (area === el("scroll-area")) scrollToNewest();
+  else area.scrollTop = area.scrollHeight;
+}
+
+/** Move `area` for a page key, or Home or End, that the browser would have spent on something else. */
+function scrollForKey(area, key) {
+  if (key === "Home") area.scrollTop = 0;
+  else if (key === "End") toNewest(area);
+  else area.scrollTop += (key === "PageUp" ? -1 : 1) * pageStep(area);
+}
+
+/** The keys a browser scrolls with. Space is " ", as `KeyboardEvent.key` spells it. */
+const SCROLL_KEYS = ["PageUp", "PageDown", "Home", "End", " ", "ArrowUp", "ArrowDown"];
+
+/**
+ * A scroll key no binding took, sent to the list on screen when it came from somewhere that cannot
+ * use it.
+ *
+ *   * In a text field, Home, End, Space and the arrows are the field's. So are the page keys while
+ *     the field holds more than it shows; otherwise they page the list, and the field keeps the
+ *     focus and the text, so the reader is never stuck in a box.
+ *   * On a picker, the arrows and Space choose and open, as they always did; the page keys and
+ *     Home/End page the list rather than skipping options. A slider and the width handle keep all.
+ *   * Inside the list, the browser scrolls it already.
+ *   * A focused button keeps Space, which presses it.
+ *   * Anywhere else (nothing focused, a control in the dock or the header) the list takes the
+ *     focus, and the browser's own default, which runs after this, scrolls it.
+ *
+ * With Ctrl or Alt held, nothing: Ctrl+Home and Ctrl+End are a binding of their own, and Alt with
+ * the arrows belongs to the channels. Cmd is let through, for the Cmd+Up and Cmd+Down of a Mac.
+ */
+function routeScrollKey(event, target) {
+  const key = event.key;
+  if (!SCROLL_KEYS.includes(key) || event.ctrlKey || event.altKey) return;
+  const area = visibleScroller(target);
+  if (!area) return;
+  const paging = key === "PageUp" || key === "PageDown";
+  if (isTextField(target)) {
+    if (paging && !event.shiftKey && !event.metaKey && !scrollsItself(target)) {
+      swallow(event);
+      scrollForKey(area, key);
+    }
+    return;
+  }
+  if (keepsOwnKeys(target)) {
+    const picker = String(target.tagName || "").toUpperCase() === "SELECT";
+    if (picker && (paging || key === "Home" || key === "End") && !event.shiftKey && !event.metaKey) {
+      swallow(event);
+      scrollForKey(area, key);
+    }
+    return;
+  }
+  if (target && nodeWithin(area, target)) return;
+  if (key === " " && pressedBySpace(target)) return;
+  if (typeof area.focus === "function") area.focus({ preventScroll: true });
+}
+
+/** Ctrl+Home and Ctrl+End (Cmd on a Mac): the list to its top or its newest line, from anywhere. */
+function jumpList(target, newest) {
+  const area = visibleScroller(target);
+  if (!area) return false;
+  if (newest) toNewest(area);
+  else area.scrollTop = 0;
+  return true;
+}
+
+// --- search, Settings and Escape
+
+/**
+ * "/" and Ctrl+S (Cmd+S): the search, with its field ready to type in. Settings and Help are left
+ * first, as their Back button leaves them: the search is over the list they cover. Anywhere else off
+ * the main screen there is nothing to search, and nothing happens. Pressed again while the search is
+ * open, the field takes the focus back with its text selected, ready to be typed over. Returns whether
+ * it did anything.
+ */
+function searchFromKeyboard() {
+  if (currentScreen === "settings" || currentScreen === "help") closeSettings();
+  if (currentScreen !== "main") return false;
+  if (!searchOpen) setSearchOpen(true);
+  const field = el("search-field");
+  field.focus();
+  if (typeof field.select === "function") field.select();
+  return true;
+}
+
+/**
+ * "," and Ctrl+, (Cmd+,): Settings, from the screens the gear is on (the main one and sign-in), and
+ * back out of Settings or Help to where the reader was, as Back takes them. Every control in Settings
+ * keeps its value the moment it changes, so leaving is all that "save and exit" needs. Returns whether
+ * it did anything.
+ */
+function settingsFromKeyboard() {
+  if (currentScreen === "settings" || currentScreen === "help") {
+    closeSettings();
+    return true;
+  }
+  if (currentScreen === "main" || currentScreen === "signin") {
+    showScreen("settings");
+    return true;
+  }
+  return false;
+}
+
+/** Where Back goes from the screen that is up, taken; false when there is no Back to take. */
+function goBack() {
+  if (currentScreen === "settings") closeSettings();
+  else if (currentScreen === "help") showScreen("settings");
+  else return false;
+  return true;
+}
+
+/**
+ * What Escape does: the first that applies of the proposal's section 5.2. An open ⋯ menu closes;
+ * then the search; then Back, out of Settings or Help. Returns whether it did anything. With none of
+ * those it does nothing: in particular it marks nothing read, which is the proposal's answer to the
+ * clients whose Escape does.
+ */
+function onEscape(event) {
+  if (closeRowMenuOnEscape(event)) return true;
+  if (searchOpen && currentScreen === "main") {
+    setSearchOpen(false);
+    settleFocus();
+    return true;
+  }
+  return goBack();
+}
+
+/** Keep a key from the browser's own default for it. */
+function swallow(event) {
+  if (event && typeof event.preventDefault === "function") event.preventDefault();
+}
+
+/** Whether the key is `letter`, on any layout: by the character, or by the place of the key on a layout that types no Latin letter there. */
+function isLetterKey(event, letter) {
+  const key = String(event.key || "");
+  if (/^[a-z]$/i.test(key)) return key.toLowerCase() === letter;
+  return event.code === `Key${letter.toUpperCase()}`;
+}
+
+/** Whether Ctrl or Cmd is held: every chord takes either, on every platform. */
+const modHeld = (event) => Boolean(event.ctrlKey || event.metaKey);
+
+// --- the keymap
+
+/**
+ * @typedef {object} KeyChord
+ * @property {string} key `KeyboardEvent.key`: a letter in lower case, a character, or a named key.
+ * @property {boolean} [mod] Ctrl, or Cmd: either works on every platform.
+ * @property {boolean} [alt] Alt (Option on a Mac). Only ever with an arrow: Option and a letter types
+ *   a character on a Mac.
+ * @property {boolean} [shift] For a letter or a named key. A character such as "?" or ":" is matched
+ *   as it is typed, whatever it took to type it on the layout of the reader.
+ */
+
+/**
+ * @typedef {object} KeyBinding
+ * @property {string} group Which part of the list of keys it is in.
+ * @property {KeyChord[]} chords
+ * @property {string} does What it does, as the list of keys says it.
+ * @property {"browser" | "box"} [by] Answered by the browser's own scrolling, or by the own handler
+ *   of a message box (`onComposerKey`), rather than by `run`: listed so the list is whole.
+ * @property {boolean} [repeats] A held key repeats it. Only the keys that move.
+ * @property {boolean} [inField] Fires in a text field too, where `run` decides for itself.
+ * @property {(event: KeyboardEvent, target: HTMLElement) => boolean} [run] Do it; whether it did.
+ */
+
+const KEYS_PAGE = "Scrolling, search and Settings";
+
+/**
+ * Every key the page answers, in the order the list of keys shows them. The first binding whose chord
+ * matches and may fire there, and that does something, takes the key; one that does nothing leaves it
+ * to the next, and at the end to the browser.
+ *
+ * @type {KeyBinding[]}
+ */
+const KEYMAP = [
+  {
+    group: KEYS_PAGE, chords: [{ key: "Escape" }],
+    does: "Back: closes a menu or the search, leaves Settings or Help",
+    run: (event) => onEscape(event),
+  },
+  {
+    group: KEYS_PAGE, by: "browser",
+    chords: [{ key: "PageUp" }, { key: "PageDown" }, { key: " " }, { key: " ", shift: true }],
+    does: "Scroll a screenful, up or down. In a message box, PgUp and PgDn scroll the list beside it",
+  },
+  {
+    group: KEYS_PAGE, by: "browser", chords: [{ key: "Home" }, { key: "End" }],
+    does: "The top of the list, or its newest message",
+  },
+  {
+    group: KEYS_PAGE, chords: [{ key: "Home", mod: true }, { key: "End", mod: true }],
+    does: "The same from anywhere, a message box included",
+    run: (event, target) => jumpList(target, event.key === "End"),
+  },
+  {
+    group: KEYS_PAGE, chords: [{ key: "/" }, { key: "s", mod: true }],
+    does: "Search the messages; pressed again, back to what you typed",
+    // The chord is the Save page of the browser as well, which must never open over this one.
+    run: (event) => searchFromKeyboard() || modHeld(event),
+  },
+  {
+    group: KEYS_PAGE, chords: [{ key: "," }, { key: ",", mod: true }],
+    does: "Settings, and again (or Esc) back to where you were. Settings keep themselves as they change",
+    run: (event) => settingsFromKeyboard() || modHeld(event),
+  },
+];
+
+/** Whether `chord` is the key `event` reports. Shift counts for letters and named keys only. */
+function chordMatches(chord, event) {
+  if (Boolean(chord.mod) !== modHeld(event) || Boolean(chord.alt) !== Boolean(event.altKey)) return false;
+  if (/^[a-z]$/.test(chord.key)) {
+    return Boolean(chord.shift) === Boolean(event.shiftKey) && isLetterKey(event, chord.key);
+  }
+  const key = String(event.key || "");
+  if (chord.key.length === 1 && chord.key !== " ") return key === chord.key;
+  return key === chord.key && Boolean(chord.shift) === Boolean(event.shiftKey);
+}
+
+/** A chord of one key that types a character: what never fires in a field. */
+const typesCharacter = (chord) => !chord.mod && !chord.alt && chord.key.length === 1 && chord.key !== " ";
+
+/** Whether `chord` of `binding` may fire with the focus on `target`. See the rules at the top of this section. */
+function chordAllowed(binding, chord, target) {
+  if (chord.mod || chord.key === "Escape" || binding.inField) return true;
+  return !isTextField(target) && !keepsOwnKeys(target);
+}
+
+/**
+ * The one keydown listener of the page. See the top of this section.
+ *
+ * @param {KeyboardEvent} event
+ */
+function onPageKey(event) {
+  if (!event || event.defaultPrevented) return;
+  if (event.isComposing || event.keyCode === 229) return;
+  const target = /** @type {HTMLElement} */ (event.target || document.activeElement);
+  for (const binding of KEYMAP) {
+    if (!binding.run) continue;
+    if (!binding.chords.some((chord) => chordMatches(chord, event) && chordAllowed(binding, chord, target))) continue;
+    // A held key repeats only the keys that move: a held e is one Done, not a Done on every row it passes.
+    if (event.repeat && !binding.repeats) continue;
+    if (binding.run(event, target)) {
+      swallow(event);
+      return;
+    }
+  }
+  routeScrollKey(event, target);
 }
 
 // --- the canned prompts -------------------------------------------------------------------------
@@ -15658,7 +16099,7 @@ function discordNode(messages) {
     // outside it, or Escape, closes it — what a phone's own pop-up menus do.
     if (open) {
       if (openRowMenu && openRowMenu.close !== closeMenu) openRowMenu.close();
-      openRowMenu = { root: more, close: closeMenu };
+      openRowMenu = { root: more, close: closeMenu, button: moreButton };
     } else if (openRowMenu && openRowMenu.close === closeMenu) {
       openRowMenu = null;
     }
@@ -15790,7 +16231,10 @@ function discordNode(messages) {
   return li;
 }
 
-/** The one row ⋯ menu that is open, as `{root, close}`, or null. `#202 read-through-here`. */
+/**
+ * The one row ⋯ menu that is open, as `{root, close, button}` (`button` being the ⋯ that opened it),
+ * or null. `#202 read-through-here`.
+ */
 let openRowMenu = null;
 
 /** Whether `node` is `root` or inside it. Walked by hand so it holds for any element. */
@@ -15806,9 +16250,20 @@ function closeRowMenuOutside(event) {
   if (openRowMenu && !nodeWithin(openRowMenu.root, event && event.target)) openRowMenu.close();
 }
 
-/** Escape closes the open ⋯ menu. */
+/**
+ * Escape closes the open ⋯ menu, and returns whether there was one. Asked first by `onEscape`.
+ *
+ * `#224 keyboard-shortcuts`. With the focus on an item in the menu, the focus goes back to the ⋯
+ * that opened it, as a menu's does: the item has just been hidden, and a focus left on a hidden
+ * item is a focus on nothing, where the scroll keys would have nowhere to go.
+ */
 function closeRowMenuOnEscape(event) {
-  if (openRowMenu && event && event.key === "Escape") openRowMenu.close();
+  if (!openRowMenu || !event || event.key !== "Escape") return false;
+  const { root, close, button } = openRowMenu;
+  const inside = nodeWithin(root, document.activeElement);
+  close();
+  if (inside && button && typeof button.focus === "function") button.focus({ preventScroll: true });
+  return true;
 }
 
 /** Most ids one dismissal request carries; the server refuses a larger batch. */
@@ -16364,8 +16819,7 @@ function clearPullOffer() {
  */
 function inScrollingDraft(event) {
   const target = event && event.target;
-  return Boolean(target) && String(target.tagName).toUpperCase() === "TEXTAREA" &&
-    Number(target.scrollHeight) > Number(target.clientHeight) + 1;
+  return Boolean(target) && scrollsItself(target);
 }
 
 function pullCancel() {
@@ -21074,7 +21528,8 @@ el("width-grip").addEventListener("keydown", onGripKey);
 // something is broken.
 document.addEventListener("visibilitychange", onVisibility);
 document.addEventListener("pointerdown", closeRowMenuOutside);
-document.addEventListener("keydown", closeRowMenuOnEscape);
+// `#224 keyboard-shortcuts`. Every key the page answers, in one place: see `onPageKey`.
+document.addEventListener("keydown", onPageKey);
 // `#189 restore-ui-state`. The last moments a phone promises this page before it may reclaim it —
 // hidden, or being unloaded — are when the reader's place is written down. Hidden comes first on
 // a phone, and is the one an installed app reliably gets before it is killed.
@@ -21238,7 +21693,7 @@ el("audio-source").addEventListener("click", () =>
 el("settings-audio-source").addEventListener("change", () =>
   setReadAudioSource(el("settings-audio-source").value)
 );
-el("close-settings").addEventListener("click", () => showScreen(screenBeforeSettings));
+el("close-settings").addEventListener("click", closeSettings);
 
 // `#85 voice-desktop-review`. The paragraphs that used to stand between the reader and every switch
 // now live on their own screen, and each `?` on the settings screen opens the matching entry.
@@ -21509,10 +21964,15 @@ el("search-field").addEventListener("input", () => {
   placeForFilter(wasEmptied);
 });
 // Escape closes AND clears, which is the same act — see `setSearchOpen`. It is the gesture a
-// desktop reader reaches for without being told, and the only one a keyboard has.
+// desktop reader reaches for without being told, and the only one a keyboard has. `#224
+// keyboard-shortcuts`: and the reader is put back on the list, rather than on a field that has just
+// gone; handled here, so the page's own listener (`onPageKey`) leaves it alone. Not while an input
+// method composes, whose Escape is its own.
 el("search-field").addEventListener("keydown", (event) => {
-  if (event.key === "Escape") {
+  if (event.key === "Escape" && !event.isComposing) {
     setSearchOpen(false);
+    settleFocus();
+    swallow(event);
   }
 });
 // The chip is an offer to go somewhere the reader may simply go themselves. Once they are there it
