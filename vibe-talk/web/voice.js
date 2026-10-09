@@ -6584,7 +6584,11 @@ function validCacheEntry(entry) {
         Object.values(entry.replyGaps).every((gap) => Number.isInteger(gap) && gap >= 0))) &&
       // Absent from an entry saved before All's page passing over a thread was kept.
       (entry.passedOver === undefined ||
-        (Array.isArray(entry.passedOver) && entry.passedOver.every((id) => typeof id === "string")));
+        (Array.isArray(entry.passedOver) && entry.passedOver.every((id) => typeof id === "string"))) &&
+      // Absent from an entry saved before what Done settled was kept (`loadCanon` then drops its gaps).
+      (entry.settledByDone === undefined || (entry.settledByDone !== null &&
+        typeof entry.settledByDone === "object" && !Array.isArray(entry.settledByDone) &&
+        Object.values(entry.settledByDone).every((gap) => Number.isInteger(gap) && gap >= 0)));
   }
   return entry.mode === "page" && Number.isFinite(entry.savedAt) && typeof entry.more === "boolean";
 }
@@ -6635,12 +6639,20 @@ function trimCanonField(entry, field, limit) {
   const removed = entry[field].slice(0, entry[field].length - limit);
   entry[field] = entry[field].slice(-limit);
   const cut = timeOf(entry[field][0], timeField);
-  // `#222 unread-replies`. A reply cut is one more of its thread's the store lacks for being old, so
-  // the shortfall against the thread's count is not read as replies posted since.
+  // `#222 unread-replies`. A read reply cut is one more of its thread's the store lacks for being
+  // old, so the shortfall against the thread's count is not read as replies posted since. AN UNREAD
+  // ONE IS NOT: counted as old it would vanish from its root's count, and the root from Hide read,
+  // after a reload. Left out of the gap, it counts as new ("1 new") until a read of the thread or
+  // of All brings it back. What Done settled moves with the gap, so putting the root back still
+  // finds it (`unsettleReplies`).
   if (field === "messages" && entry.replyGaps) {
+    const done = new Set(entry.dismissed.map(String));
     for (const message of removed) {
       const id = threadOf(message);
-      if (id && message.thread.is_root !== true && Number.isInteger(entry.replyGaps[id])) entry.replyGaps[id] += 1;
+      if (!id || message.thread.is_root === true || !Number.isInteger(entry.replyGaps[id]) ||
+          stillToDo(message, done)) continue;
+      entry.replyGaps[id] += 1;
+      if (entry.settledByDone && Number.isInteger(entry.settledByDone[id])) entry.settledByDone[id] += 1;
     }
   }
   for (const [key, cover] of Object.entries(entry.views)) {
@@ -6784,6 +6796,10 @@ function emptyCanon(channel = "") {
     // none of their replies, saying it leaves some out (Slack's ten threads): All reaching such a
     // root says nothing of its replies' age (`noteReplyGaps`).
     passedOver: new Set(),
+    // ...and by thread id, the gap Done on the root set for a thread whose gap was not known
+    // (`settleUnknownReplies`), until a read sets one of its own (a read that only lowers it leaves
+    // it Done's, lowered): putting the root back takes it back (`unsettleReplies`).
+    settledByDone: new Map(),
   };
 }
 
@@ -7119,9 +7135,17 @@ function loadCanon(channel) {
   channelCanon.dismissed = new Set(entry.dismissed.map(String));
   // A reload does not place a message either: what the stream left unplaced stays so until read.
   channelCanon.unplaced = new Set((entry.unplaced || []).map(String));
-  channelCanon.replyGaps = new Map(Object.entries(entry.replyGaps || {}));
+  // `#222 unread-replies`. A copy saved before passed-over threads and Done's settling were both
+  // kept may hold a wrong gap for a thread All's page passed over: nothing, which made its unknown
+  // replies "N new" for good, past Done; or its whole count, set by Main's read after the copy was
+  // cut, which hid an unread answer. Its gaps are not trusted, and All's cover goes with them, so
+  // All is read behind Main once more and places them afresh (`readAllForCounts`).
+  const trusted = entry.passedOver !== undefined && entry.settledByDone !== undefined;
+  channelCanon.replyGaps = trusted ? new Map(Object.entries(entry.replyGaps || {})) : new Map();
   channelCanon.passedOver = new Set((entry.passedOver || []).map(String));
+  channelCanon.settledByDone = trusted ? new Map(Object.entries(entry.settledByDone || {})) : new Map();
   for (const [key, cover] of Object.entries(entry.views)) {
+    if (!trusted && key === viewKey("flat")) continue;
     channelCanon.views.set(key, { ...cover, live: false, cursor: null });
   }
   entry.usedAt = Date.now();
@@ -7284,6 +7308,7 @@ function saveChannelScope() {
       // Only for threads the store still holds something of: the rest have no chip to draw.
       replyGaps: Object.fromEntries([...channelCanon.replyGaps].filter(([id]) => heldThreads.has(id))),
       passedOver: [...channelCanon.passedOver].filter((id) => heldThreads.has(id)),
+      settledByDone: Object.fromEntries([...channelCanon.settledByDone].filter(([id]) => heldThreads.has(id))),
     };
   } else {
     // In time order, gathered replies or not (`#215 reply-coalesce`): a reload draws these as they
@@ -9691,10 +9716,12 @@ function foldReadState(payload, view) {
  * message before its first, or All reaches back to where it starts, so a reply posted since All's
  * read is new — and otherwise its whole shortfall, read as old: one posted between All's last read
  * and this one, to a thread older than All reaches, is not counted until that thread or All is read.
- * Without any read of All there is no gap at all, and every reply missing counts. NOR when All's
- * newest page carried the root and passed over its thread (`passedOver`): All reaching the root
- * says nothing of replies that page did not bring, so the gap stays unknown — counted whole, as new,
- * and settled by Done on the root (`settleUnknownReplies`) as well as by a read that brings them.
+ * Without any read of All there is no gap at all, and every reply missing counts. NOR, by any read
+ * that does not bring its replies, when All's newest page carried the root and passed over its
+ * thread (`passedOver`): All reaching the root says nothing of replies that page did not bring, and
+ * neither does All falling short of it, nor a step back bringing the root alone, so the gap stays
+ * unknown — counted whole, as new, and settled by Done on the root (`settleUnknownReplies`) as well
+ * as by a read that brings them.
  *
  * Every root's count, read now, is also the thread's count from here on: the summary the store holds
  * is put to it (`exactReplyCount` takes the higher of the two, so a summary from a thread read before
@@ -9704,12 +9731,23 @@ function foldReadState(payload, view) {
 function noteReplyGaps(payload, view, older, delta, before) {
   if (view === "threads" || channelCanon.scope) return;
   const gaps = channelCanon.replyGaps;
+  // What Done settled (`settledByDone`): a gap a read SETS is that read's from then on, and putting
+  // the root back leaves it; one a read only LOWERS is still Done's, lowered — without Done's gap the
+  // read would have lowered nothing — and putting the root back takes it back all the same.
+  const place = (/** @type {string} */ id, /** @type {number} */ gap) => {
+    gaps.set(id, gap);
+    channelCanon.settledByDone.delete(id);
+  };
+  const lower = (/** @type {string} */ id, /** @type {number} */ gap) => {
+    if (channelCanon.settledByDone.has(id)) channelCanon.settledByDone.set(id, gap);
+    gaps.set(id, gap);
+  };
   const messages = payload.messages || [];
   if (older) {
     for (const message of messages) {
       const id = threadOf(message);
       if (!id || message.thread.is_root === true || before.has(String(message.id)) || !gaps.has(id)) continue;
-      gaps.set(id, Math.max(0, gaps.get(id) - 1));
+      lower(id, Math.max(0, gaps.get(id) - 1));
     }
   }
   /** @type {Map<string, number>} */
@@ -9721,7 +9759,7 @@ function noteReplyGaps(payload, view, older, delta, before) {
   const shortfall = (id, count) => Math.max(0, count - (held.get(id) || 0));
   if (view === "thread") {
     const count = exactCount(payload.thread);
-    if (!older && count !== null) gaps.set(String(payload.thread.id), shortfall(String(payload.thread.id), count));
+    if (!older && count !== null) place(String(payload.thread.id), shortfall(String(payload.thread.id), count));
     return;
   }
   const allRead = channelCanon.views.has(viewKey("flat"));
@@ -9743,21 +9781,30 @@ function noteReplyGaps(payload, view, older, delta, before) {
       upsertThreadSummary({ ...summary, reply_count: count, reply_count_exact: true });
     }
     const short = shortfall(id, count);
-    if (view === "flat" && !older && !delta && (carried.has(id) || count === 0 || !payload.notice)) {
-      gaps.set(id, short);
+    const allNewest = view === "flat" && !older && !delta;
+    if (allNewest && (carried.has(id) || count === 0 || !payload.notice)) {
+      place(id, short);
       channelCanon.passedOver.delete(id);
-    } else if (gaps.has(id)) {
-      gaps.set(id, Math.min(gaps.get(id), short));
-    } else {
-      const prior = before.get(String(message.id));
-      const hadNone = prior !== undefined && (!threadOf(prior) || exactCount(prior.thread) === 0);
-      if (hadNone) gaps.set(id, 0);
-      else if (view === "flat" && older) gaps.set(id, short);
-      else if (view === "flat" && !delta) channelCanon.passedOver.add(id);
-      else if (allReachesThread(id, null)) {
-        if (!channelCanon.passedOver.has(id)) gaps.set(id, 0);
-      } else if (allRead) gaps.set(id, short);
+      continue;
     }
+    // All's newest page carried the root and nothing of its thread, saying it leaves some out: kept
+    // whether its gap is known or not, for the moment it is not (a root put back, `unsettleReplies`).
+    if (allNewest) channelCanon.passedOver.add(id);
+    if (gaps.has(id)) {
+      if (short < gaps.get(id)) lower(id, short);
+      continue;
+    }
+    const prior = before.get(String(message.id));
+    const hadNone = prior !== undefined && (!threadOf(prior) || exactCount(prior.thread) === 0);
+    if (hadNone) place(id, 0);
+    // Passed over: no read that does not bring its replies says how old they are — not Main's, even
+    // once a cut copy leaves All's cover short of the root, nor a step back in All that brings the
+    // root alone. Its unknown replies count as new until a read brings them, or Done on the root
+    // settles them.
+    else if (channelCanon.passedOver.has(id) && !carried.has(id)) continue;
+    else if (view === "flat" && older) place(id, short);
+    else if (allReachesThread(id, null)) place(id, 0);
+    else if (allRead) place(id, short);
   }
   if (view === "main" && !older) queueReadAllForCounts();
 }
@@ -9897,6 +9944,8 @@ async function readTimeline(path, options) {
  * @property {string[]} flipped the ids whose state in that store this changed
  * @property {Array<[string, number]>} settled the threads whose unknown replies Done on their root
  *   settled, with the gap that set (`settleUnknownReplies`)
+ * @property {Array<[string, number]>} unsettled the threads whose settling putting their root back
+ *   took back, with the gap it took (`unsettleReplies`)
  */
 
 /**
@@ -9905,9 +9954,17 @@ async function readTimeline(path, options) {
  * and no read sent before the write settles undoes it (`readSpeaksFor`). Answers what to give
  * `settleHeldDone` when the write has settled.
  *
+ * `settles`: Done issued from Main's list, where a root's count of new replies is drawn, settles the
+ * replies of its roots no read has placed (`settleUnknownReplies`). Done in All, in a thread or in the
+ * Pinned list, where nothing says a root has new replies, does not. A put back, from anywhere, takes
+ * back what Done settled (`unsettleReplies`).
+ *
+ * @param {string[]} ids
+ * @param {boolean} done
+ * @param {boolean} [settles]
  * @returns {HeldDoneMark}
  */
-function markHeldDone(ids, done) {
+function markHeldDone(ids, done, settles = false) {
   readStateEpoch += 1;
   const marked = ids.map(String);
   for (const id of marked) {
@@ -9922,9 +9979,13 @@ function markHeldDone(ids, done) {
     if (done) canon.dismissed.add(id);
     else canon.dismissed.delete(id);
   }
-  const settled = canon && done ? settleUnknownReplies(canon, marked) : [];
-  return { ids: marked, done, canon, flipped, settled };
+  const settled = canon && done && settles ? settleUnknownReplies(canon, marked) : [];
+  const unsettled = canon && !done ? unsettleReplies(canon, marked) : [];
+  return { ids: marked, done, canon, flipped, settled, unsettled };
 }
+
+/** Whether Done issued now is issued from Main's list, where roots say they have new replies (`markHeldDone`). */
+const doneSettlesHere = () => threadingSupported && channelView === "main" && !pinnedOnly;
 
 /**
  * Done on a root settles the replies of its thread that no read has said anything of: they are read
@@ -9933,10 +9994,17 @@ function markHeldDone(ids, done) {
  * replies for (`passedOver`), which no later read of All brings either while nothing new happens
  * in it. Such a root said "N new" until the reader opened its thread, and Done on the root did not
  * clear it; Done is the reader saying they have dealt with it. A read that brings the replies later
- * places them again, unread ones included. A thread with a gap known is not touched: what its
- * count says beyond that gap was posted since a read that brought its newest, and stays new until
- * a read brings it — so Done through a list never hides an answer posted since. Answers the threads
- * settled, with the gap each was given, for a write that fails to take back.
+ * places them again, unread ones included; putting the root back, or Undo, takes the settling back
+ * (`settledByDone`, `unsettleReplies`).
+ *
+ * WHAT DONE ON A ROOT DOES NOT SETTLE, and why it differs from what it does: Done on a root is Done on
+ * that message, and it never stands for a reply the page knows may be unread. A reply the page holds
+ * keeps its own read state, which the server keeps and other devices share, until it is marked
+ * itself ("1 unread" stays). Replies its count reports beyond a known gap stay new ("1 new" stays):
+ * they were posted since a read that brought the thread's newest, or they were unread when cut from
+ * the device's copy (`trimCanonField`), so nothing suggests the reader has seen them. Only replies the
+ * page cannot place at all — old and seen, or new, it cannot tell — are taken as the reader says.
+ * Answers the threads settled, with the gap each was given, for a write that fails to take back.
  *
  * @param {any} canon
  * @param {string[]} ids
@@ -9957,9 +10025,39 @@ function settleUnknownReplies(canon, ids) {
     const gap = count === null ? 0 : Math.max(0, count - (entry ? entry.held : 0));
     if (gap === 0) continue;
     canon.replyGaps.set(id, gap);
+    canon.settledByDone.set(id, gap);
     settled.push([id, gap]);
   }
   return settled;
+}
+
+/**
+ * Putting a root back takes back what Done on it settled (`settleUnknownReplies`): its thread's gap
+ * is unknown again, so its unplaced replies count as new as they did before the Done, and the root is
+ * back under Hide read. Not once a read has set the gap (`noteReplyGaps` forgets Done's then): that
+ * gap is the read's, and stands. Answers the threads it took back, with the gap each had, for a write
+ * that fails to put back.
+ *
+ * @param {any} canon
+ * @param {string[]} ids
+ * @returns {Array<[string, number]>}
+ */
+function unsettleReplies(canon, ids) {
+  if (canon.settledByDone.size === 0) return [];
+  const wanted = new Set(ids);
+  /** @type {Array<[string, number]>} */
+  const unsettled = [];
+  for (const message of canon.messages) {
+    const id = threadOf(message);
+    if (!id || message.thread.is_root !== true || !wanted.has(String(message.id))) continue;
+    const gap = canon.settledByDone.get(id);
+    if (gap === undefined) continue;
+    canon.settledByDone.delete(id);
+    if (canon.replyGaps.get(id) !== gap) continue;
+    canon.replyGaps.delete(id);
+    unsettled.push([id, gap]);
+  }
+  return unsettled;
 }
 
 /**
@@ -9983,8 +10081,16 @@ function settleHeldDone(mark, ok) {
     if (mark.done) mark.canon.dismissed.delete(id);
     else mark.canon.dismissed.add(id);
   }
-  for (const [id, gap] of mark.settled) {
-    if (mark.canon.replyGaps.get(id) === gap) mark.canon.replyGaps.delete(id);
+  // Still Done's, lowered or not: not once a read has set the gap since.
+  for (const [id] of mark.settled) {
+    if (!mark.canon.settledByDone.has(id)) continue;
+    if (mark.canon.replyGaps.get(id) === mark.canon.settledByDone.get(id)) mark.canon.replyGaps.delete(id);
+    mark.canon.settledByDone.delete(id);
+  }
+  for (const [id, gap] of mark.unsettled) {
+    if (mark.canon.replyGaps.has(id)) continue;
+    mark.canon.replyGaps.set(id, gap);
+    mark.canon.settledByDone.set(id, gap);
   }
 }
 
@@ -16758,7 +16864,7 @@ async function dismissMessages(body) {
   for (const id of requested) {
     archivedIds.add(id);
   }
-  const held = markHeldDone(requested, true);
+  const held = markHeldDone(requested, true, doneSettlesHere());
   await refreshAfterInboxChange();
   renderTodoControls();
   setStatus(`Saving ${requested.length} local change${requested.length === 1 ? "" : "s"}…`);

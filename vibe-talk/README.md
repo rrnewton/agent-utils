@@ -137,11 +137,20 @@ but none of its replies, which says nothing about them: the replies the page alr
 stay held, counted and drawn, and its count says **N new** for any it has never held — on a device
 that never read it, such as a fresh one, that is every reply it has. Nothing brings those replies
 while nothing new happens in the thread; opening it reads it (it is never drawn from All with its
-replies missing), and marking the message itself Done says you have dealt with it: replies no read
-has placed are then taken as read, and only a reply posted after that counts as new. Done never
-settles a reply posted since a read that placed the thread, so Done through a list cannot hide an
-answer nothing has brought. A step back in All that brings an old thread without its replies counts
-them as old, not new.
+replies missing), and marking the message itself Done on Main — its own **Done**, or **Mark read
+through here** — says you have dealt with it: replies no read has placed are then taken as read, and
+only a reply posted after that counts as new. **Undo**, or putting the message back, takes that back.
+Done in All, in a thread or in the Pinned list, where nothing says the message has new replies,
+settles none. Neither Main's refresh nor a step back in All bringing the message alone counts its
+replies as old; a step back that brings, without its replies, an old thread All's newest page did
+not pass over counts them as old, not new.
+
+**What Done on a message does not settle, and why.** Done on a message is Done on that message, and
+never stands for a reply that may be unread. A reply the page holds keeps its own Done state, which
+other devices share, so **1 unread** stays until that reply is marked. A reply counted as posted
+since a read that placed the thread stays **1 new**, so Done through a list cannot hide an answer
+nothing has brought; so does an unread reply cut from the device's copy (below). Only replies the
+page cannot place at all — read long ago or new, it cannot tell — are taken as you say.
 
 Known limits of the counts (`#222 unread-replies`):
 - A reply the page never held that is marked Done on another device still counts as new on its
@@ -154,8 +163,14 @@ Known limits of the counts (`#222 unread-replies`):
 - A Slack thread past the ten All brings replies for, whose replies this device has never held, says
   **N new** until it is opened or its message is marked Done, or until new activity puts it among the
   ten and a read of All brings its replies. On a fresh device, a busy channel can show many such
-  messages under **Hide read** at first; Done through the list clears them at once. Done there is
-  this device's: another device that never held those replies still counts them.
+  messages under **Hide read** at first; **Mark read through here** on Main clears them at once. Done
+  there is this device's: another device that never held those replies still counts them.
+- The device keeps the newest 120 messages of a channel. After a reload, a read reply cut from that
+  copy counts as old, and an unread one as **new**, so its message stays under **Hide read** until a
+  read of the thread or of All brings the reply back.
+- A copy saved on the device by an earlier version of the page is placed afresh once: All is read
+  behind Main, and a message whose replies Done had settled may say **N new** again until it is
+  marked Done once more.
 
 **Reactions show under each message.** Where the chat service reports them, a message's emoji
 reactions appear as a row of small chips under its text, each the emoji and how many reacted with it

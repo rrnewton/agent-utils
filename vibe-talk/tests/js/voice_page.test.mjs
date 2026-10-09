@@ -1586,9 +1586,10 @@ function newPage(store = new Map(), script = SCRIPT, arrange = null) {
     dismissCalls: [],
     restoreCalls: [],
     /**
-     * `#222 unread-replies`. When set, each Done write waits on it, after it is recorded and before
-     * the store takes it: `(kind, body) => Promise<Response | undefined>`. A response answers in the
-     * store's place, so a test can hold a write open or fail it.
+     * `#222 unread-replies`. When set, each Done or put-back write waits on it, after it is recorded
+     * and before the store takes it: `(kind, body) => Promise<Response | undefined>`, `kind` being
+     * "dismiss" or "restore". A response answers in the store's place, so a test can hold a write
+     * open or fail it.
      */
     inboxWriteHook: null,
     /** Which message ids were sent to the voice service, in order. */
@@ -2293,6 +2294,10 @@ function newPage(store = new Map(), script = SCRIPT, arrange = null) {
       if (/\/restore$/.test(String(path))) {
         const body = JSON.parse((options && options.body) || "null");
         page.restoreCalls.push(body);
+        if (page.inboxWriteHook) {
+          const answer = await page.inboxWriteHook("restore", body);
+          if (answer) return answer;
+        }
         for (const id of (body && body.messages) || []) {
           page.dealtWith.delete(String(id));
         }
@@ -32551,15 +32556,16 @@ test("ALL'S PAGE CARRYING A THREAD WHOLE answers for every reply of it: replies 
 /**
  * Questions A, B and C on Slack, reopened in Main with no copy on the device, where All's page
  * passes over question B's thread — ten others are busier — and says so. B's one reply is Done on
- * the server, which this device cannot know without reading it.
+ * the server, which this device cannot know without reading it. `left` is what All's page leaves out
+ * (`allLeavingOut`), for a test to change later.
  */
-async function coldSlackPastTheTen() {
+async function coldSlackPastTheTen(left = [SLACK_IDS.b]) {
   const first = newPage();
   await inboxOnMain(first, inboxChannel(first, SLACK_IDS));
   first.storage.delete(MESSAGE_CACHE_KEY);
   const page = reloadWith(first.storage, inboxChannel(newPage(), SLACK_IDS), (p) => {
     inboxChannel(p, SLACK_IDS);
-    allLeavingOut(p, [SLACK_IDS.b]);
+    allLeavingOut(p, left);
   });
   await reopenedChannel(page);
   await page.settle();
@@ -32696,4 +32702,402 @@ test("THE READ OF ALL FOR MAIN'S COUNTS, answering after the reader's own read o
   await pickThread(page, "main");
   assert.ok(rowWithId(page, late.id), "Main lost the message too");
   assert.deepStrictEqual(unreadSaid(page), { 2: "1 unread", 5: null, 7: "2 unread" });
+});
+
+// --- `#222 unread-replies`, after the third review -----------------------------------------------
+
+/** What question B's root says on Main of its thread's unread replies: its chip's words, or null. */
+const saidB = (page) => (unreadChip(page, inboxId(5)) ? unreadChip(page, inboxId(5)).textContent : null);
+
+test("UNDO OF A DONE THAT SETTLED a passed-over thread's unknown reply puts its \"1 new\" back, and Main's reads keep it", async () => {
+  const page = await coldSlackPastTheTen();
+  await chooseReadMode(page, "Hide read");
+  assert.deepStrictEqual(shownIds(page), [2, 5, 7, 12].map(inboxId));
+  assert.equal(saidB(page), "1 new");
+  await doneButton(rowWithId(page, inboxId(5))).click();
+  await page.settle();
+  assert.deepStrictEqual(shownIds(page), [2, 7, 12].map(inboxId), "Done on question B's root did not settle it");
+  assert.equal(page.el("undo-dismiss").hidden, false, "no undo offered");
+  await page.el("undo-dismiss").click();
+  await page.settle();
+  assert.deepStrictEqual(shownIds(page), [2, 5, 7, 12].map(inboxId), "Undo of Done left question B hidden under Hide read");
+  assert.equal(saidB(page), "1 new", "Undo of Done did not put question B's \"1 new\" back");
+  await reReadChannel(page);
+  assert.equal(saidB(page), "1 new", "Main's next read settled question B again");
+  // Done again settles it again: the Undo left nothing of the first behind.
+  await doneButton(rowWithId(page, inboxId(5))).click();
+  await page.settle();
+  assert.deepStrictEqual(shownIds(page), [2, 7, 12].map(inboxId), "a second Done did not settle question B");
+
+  // Undo of "Mark read through here" on Main, which settled B with the rest of the list, the same.
+  const through = await coldSlackPastTheTen();
+  await chooseReadMode(through, "Hide read");
+  const newest = rowWithId(through, inboxId(12));
+  await rowMoreButton(newest).click();
+  await readThroughButton(newest).click();
+  await through.settle();
+  // A's and C's agent answers are unread, and keep their roots; B's unknown reply is settled.
+  assert.deepStrictEqual(shownIds(through), [2, 7].map(inboxId));
+  await through.el("undo-dismiss").click();
+  await through.settle();
+  assert.deepStrictEqual(shownIds(through), [2, 5, 7, 12].map(inboxId), "Undo of Mark read through here left question B hidden");
+  assert.equal(saidB(through), "1 new");
+
+  // THE CONTROL: Undo of a Done that settled nothing — A's root, whose answer the page holds unread —
+  // changes nothing of A's count.
+  const held = await coldSlackPastTheTen();
+  await chooseReadMode(held, "Hide read");
+  await doneButton(rowWithId(held, inboxId(2))).click();
+  await held.settle();
+  assert.deepStrictEqual(unreadSaid(held), { 2: "1 unread", 5: "1 new", 7: "2 unread" }, "Done on a root marked its held reply");
+  await held.el("undo-dismiss").click();
+  await held.settle();
+  assert.deepStrictEqual(unreadSaid(held), { 2: "1 unread", 5: "1 new", 7: "2 unread" });
+});
+
+test("PUTTING THE ROOT BACK takes back what its Done settled, after a reload too; a put back that fails takes nothing back", async () => {
+  const page = await coldSlackPastTheTen();
+  await doneButton(rowWithId(page, inboxId(5))).click();
+  await page.settle();
+  assert.equal(saidB(page), null);
+  const reopened = reloadWith(page.storage, page.messages, (p) => {
+    inboxChannel(p, SLACK_IDS);
+    for (const id of page.dealtWith) p.dealtWith.add(id);
+    allLeavingOut(p, [SLACK_IDS.b]);
+  });
+  await reopenedChannel(reopened);
+  await reopened.settle();
+  assert.deepStrictEqual(viewsRead(reopened), ["main"]);
+  assert.equal(saidB(reopened), null, "the reload took the Done's settling back");
+  await chooseReadMode(reopened, "Show read");
+  assert.equal(doneButton(rowWithId(reopened, inboxId(5))).textContent, "Unarchive");
+  // The put back's write fails: nothing changes.
+  reopened.inboxWriteHook = async (kind) => (kind === "restore"
+    ? json(502, { error: "store_error", detail: "the store is read-only" }) : undefined);
+  await doneButton(rowWithId(reopened, inboxId(5))).click().catch(() => {});
+  await reopened.settle();
+  assert.equal(saidB(reopened), null, "a put back that failed took the settling back");
+  await chooseReadMode(reopened, "Hide read");
+  assert.equal(rowWithId(reopened, inboxId(5)), undefined, "a put back that failed brought question B back");
+  // It goes through: B is as it was before the Done, its reply unknown and counted as new.
+  reopened.inboxWriteHook = null;
+  await chooseReadMode(reopened, "Show read");
+  await doneButton(rowWithId(reopened, inboxId(5))).click();
+  await reopened.settle();
+  assert.equal(saidB(reopened), "1 new", "putting question B's root back left its reply settled");
+  await chooseReadMode(reopened, "Hide read");
+  assert.ok(rowWithId(reopened, inboxId(5)), "Hide read hid question B, put back with its reply unknown");
+  await reReadChannel(reopened);
+  assert.equal(saidB(reopened), "1 new");
+
+  // THE CONTROL: once a read has placed B's reply, the gap is that read's, and putting the root back
+  // leaves it: the reply is held, and Done on the server, so B has nothing to say.
+  const left = [SLACK_IDS.b];
+  const placed = await coldSlackPastTheTen(left);
+  await chooseReadMode(placed, "Hide read");
+  await doneButton(rowWithId(placed, inboxId(5))).click();
+  await placed.settle();
+  assert.equal(rowWithId(placed, inboxId(5)), undefined);
+  // B's thread is among All's ten again.
+  left.length = 0;
+  await chooseReadMode(placed, "Show read");
+  await pickThread(placed, "flat");
+  await reReadChannel(placed);
+  assert.ok(rowWithId(placed, inboxId(6)), "All did not bring question B's reply");
+  await pickThread(placed, "main");
+  await chooseReadMode(placed, "Hide read");
+  await placed.el("undo-dismiss").click();
+  await placed.settle();
+  assert.equal(saidB(placed), null, `question B, its one reply Done, says "${saidB(placed)}"`);
+  assert.equal(rowWithId(placed, inboxId(5)), undefined);
+});
+
+test("DONE IN ALL on a root whose thread All passes over settles nothing: Main, where its \"1 new\" is drawn, is where Done settles it", async () => {
+  const page = await coldSlackPastTheTen();
+  // Show read: in All, question B's root is the owner's own words, read, and Hide read hides it.
+  await pickThread(page, "flat");
+  await page.settle();
+  await doneButton(rowWithId(page, inboxId(5))).click();
+  await page.settle();
+  await pickThread(page, "main");
+  await chooseReadMode(page, "Hide read");
+  assert.equal(saidB(page), "1 new", "Done in All, where nothing says B has a new reply, settled it");
+  assert.ok(rowWithId(page, inboxId(5)), "Hide read hid question B after a Done in All");
+  // The tap on it reads the thread, which places the reply: it is Done on the server, so B goes.
+  await unreadChip(page, inboxId(5)).click();
+  await page.settle();
+  await page.settle();
+  assert.equal(viewsRead(page).at(-1), "thread");
+  await pickThread(page, "main");
+  assert.equal(rowWithId(page, inboxId(5)), undefined);
+});
+
+test("A STEP BACK IN SLACK'S ALL bringing a passed-over root without its replies does not hide its unread answer", async () => {
+  const page = newPage();
+  const messages = inboxChannel(page, SLACK_IDS);
+  // B's one answer is unread on the server.
+  page.dealtWith.delete(inboxId(6));
+  const later = [30, 31, 32, 33, 34].map((n) => message({ id: inboxId(n), content: `update ${n}`, ...CODER }));
+  const laterIds = new Set(later.map((m) => m.id));
+  for (const m of later) page.dealtWith.add(m.id);
+  let slid = false;
+  const serve = page.timeline;
+  page.timeline = async (path, options) => {
+    const url = new URL(path, "http://fixture.test");
+    const answer = await serve(path, options);
+    if (url.searchParams.get("view") !== "flat") return answer;
+    const body = JSON.parse(await answer.text());
+    const back = url.searchParams.get("before");
+    // Slack's All past the ten for question B: its root on the page, none of its replies.
+    let rows = body.messages.filter((m) => !(m.thread && m.thread.id === SLACK_IDS.b && !m.thread.is_root));
+    if (!slid && back) rows = [];
+    // Later, enough newer messages that B's root is off All's newest page, and on the step back.
+    if (slid) rows = rows.filter((m) => laterIds.has(m.id) === !back);
+    const on = new Set(rows.map((m) => m.id));
+    return json(200, { ...body, messages: rows, returned: rows.length, has_more: !back, next_before: back ? null : "older",
+      notice: BOUND_NOTICE, dismissed: body.dismissed.filter((id) => on.has(id)) });
+  };
+  await inboxOnMain(page, messages);
+  await chooseReadMode(page, "Hide read");
+  await reReadChannel(page);
+  assert.deepStrictEqual(unreadSaid(page), { 2: "1 unread", 5: "1 new", 7: "2 unread" });
+  page.messages = [...page.messages, ...later];
+  slid = true;
+  await chooseReadMode(page, "Show read");
+  await pickThread(page, "flat");
+  await reReadChannel(page);
+  await page.el("load-older").click();
+  await page.settle();
+  assert.ok(rowWithId(page, inboxId(5)), "the step back did not bring question B's root");
+  assert.equal(rowWithId(page, inboxId(6)), undefined, "the step back brought B's reply");
+  await pickThread(page, "main");
+  await chooseReadMode(page, "Hide read");
+  await reReadChannel(page);
+  assert.ok(rowWithId(page, inboxId(5)),
+    "Hide read hid question B, whose agent answer is unread and was never brought, after a step back in All");
+  assert.equal(saidB(page), "1 new");
+});
+
+test("A RELOAD WHOSE DEVICE COPY WAS CUT past a passed-over root keeps its unread answer counted through Main's read", async () => {
+  const page = newPage();
+  const messages = inboxChannel(page, SLACK_IDS);
+  page.dealtWith.delete(inboxId(6));
+  const later = Array.from({ length: 125 }, (_, i) => message({ id: inboxId(100 + i), content: `update ${i}`, ...CODER }));
+  for (const m of later) page.dealtWith.add(m.id);
+  allLeavingOut(page, [SLACK_IDS.b]);
+  await inboxOnMain(page, [...messages, ...later]);
+  await chooseReadMode(page, "Hide read");
+  await reReadChannel(page);
+  assert.equal(saidB(page), "1 new");
+  const reopened = reloadWith(page.storage, page.messages, (p) => {
+    inboxChannel(p, SLACK_IDS);
+    p.dealtWith = page.dealtWith;
+    allLeavingOut(p, [SLACK_IDS.b]);
+  });
+  await reopenedChannel(reopened);
+  await reopened.settle();
+  await reReadChannel(reopened);
+  assert.equal(reopened.el("todo-filter").getAttribute("data-read-mode"), "hide");
+  assert.ok(rowWithId(reopened, inboxId(5)),
+    `Hide read hid question B after a reload, its unread answer never brought; says ${JSON.stringify(unreadSaid(reopened))}`);
+  assert.equal(saidB(reopened), "1 new");
+});
+
+/** The device's saved copy of the one timeline channel, to edit as an older version would have saved it. */
+function editSavedChannel(page, edit) {
+  const cache = JSON.parse(page.storage.get(MESSAGE_CACHE_KEY));
+  const entry = Object.values(cache.scopes).find((scope) => scope.mode === "timeline");
+  edit(entry);
+  page.storage.set(MESSAGE_CACHE_KEY, JSON.stringify(cache));
+}
+
+test("A DEVICE COPY SAVED BY AN EARLIER VERSION has its gaps placed afresh: B says \"1 new\", and Done on its root settles it", async () => {
+  // Saved before passed-over threads were kept: B's gap set to nothing, as Main's read did once All
+  // reached B's root, so B said "1 new" for good and Done on it did not clear it.
+  const saved = async (edit) => {
+    const page = await coldSlackPastTheTen();
+    await chooseReadMode(page, "Hide read");
+    await reReadChannel(page);
+    editSavedChannel(page, (entry) => {
+      assert.deepStrictEqual(entry.passedOver, [SLACK_IDS.b]);
+      assert.equal(entry.replyGaps[SLACK_IDS.b], undefined);
+      edit(entry);
+    });
+    const reopened = reloadWith(page.storage, page.messages, (p) => {
+      inboxChannel(p, SLACK_IDS);
+      for (const id of page.dealtWith) p.dealtWith.add(id);
+      allLeavingOut(p, [SLACK_IDS.b]);
+    });
+    await reopenedChannel(reopened);
+    await reopened.settle();
+    return reopened;
+  };
+  const before = await saved((entry) => {
+    delete entry.passedOver;
+    delete entry.settledByDone;
+    entry.replyGaps[SLACK_IDS.b] = 0;
+  });
+  assert.equal(before.el("todo-filter").getAttribute("data-read-mode"), "hide");
+  assert.equal(saidB(before), "1 new");
+  await doneButton(rowWithId(before, inboxId(5))).click();
+  await before.settle();
+  await reReadChannel(before);
+  assert.equal(rowWithId(before, inboxId(5)), undefined,
+    "Done on question B's root did not clear it, on a device copy saved before passed-over threads were kept");
+  assert.deepStrictEqual(unreadSaid(before), { 2: "1 unread", 7: "2 unread" });
+  // The cost, once: All read again behind Main's first read.
+  assert.deepStrictEqual(viewsRead(before), ["main", "flat", "main"], "All was not read again behind Main to place the gaps");
+
+  // Saved by the version before this one: B's gap set to its whole count by Main's read after the
+  // copy was cut, hiding B's answer.
+  const cut = await saved((entry) => {
+    delete entry.settledByDone;
+    entry.replyGaps[SLACK_IDS.b] = 1;
+  });
+  assert.ok(rowWithId(cut, inboxId(5)), "Hide read hid question B, on a copy whose gap for it was its whole count");
+  assert.equal(saidB(cut), "1 new");
+  assert.deepStrictEqual(viewsRead(cut), ["main", "flat"]);
+
+  // THE CONTROL: a copy this version saved keeps its gaps, and reads no All for them.
+  const current = await saved(() => {});
+  assert.deepStrictEqual(viewsRead(current), ["main"], "a copy this version saved was not trusted");
+  assert.deepStrictEqual(unreadSaid(current), { 2: "1 unread", 5: "1 new", 7: "2 unread" });
+});
+
+test("UNREAD REPLIES CUT FROM THE DEVICE'S COPY still count after a reload, as new, and keep their roots; read ones cut count as old", async () => {
+  const page = newPage();
+  const messages = inboxChannel(page);
+  const later = Array.from({ length: 125 }, (_, i) => message({ id: inboxId(100 + i), content: `update ${i}`, ...CODER }));
+  for (const m of later) page.dealtWith.add(m.id);
+  await inboxOnMain(page, [...messages, ...later]);
+  await chooseReadMode(page, "Hide read");
+  assert.deepStrictEqual(unreadSaid(page), { 2: "1 unread", 7: "2 unread" });
+  editSavedChannel(page, (entry) => {
+    assert.equal(entry.messages.length, 120);
+    assert.ok(!entry.messages.some((m) => m.thread), "the copy kept a reply: nothing is cut");
+  });
+  const reopened = reloadWith(page.storage, page.messages, (p) => {
+    inboxChannel(p);
+    p.dealtWith = page.dealtWith;
+  });
+  await reopenedChannel(reopened);
+  await reopened.settle();
+  assert.deepStrictEqual(viewsRead(reopened), ["main"]);
+  assert.equal(reopened.el("todo-filter").getAttribute("data-read-mode"), "hide");
+  // A's agent answer and C's two are unread: no longer held, they count as new, and keep A and C.
+  // B's one reply was Done, A's other is the owner's own, C's third a placeholder: cut, those are old.
+  assert.deepStrictEqual(unreadSaid(reopened), { 2: "1 new", 7: "2 new" }, "unread agent answers cut from the copy vanished");
+  assert.deepStrictEqual(shownIds(reopened).slice(0, 2), [2, 7].map(inboxId));
+  // Nor is Done on the root a way to lose them: they are known to be unread.
+  await doneButton(rowWithId(reopened, inboxId(7))).click();
+  await reopened.settle();
+  assert.equal(unreadChip(reopened, inboxId(7)) && unreadChip(reopened, inboxId(7)).textContent, "2 new");
+  // A tap reads the thread: the replies are held again, and the count exact.
+  await unreadChip(reopened, inboxId(7)).click();
+  await reopened.settle();
+  await reopened.settle();
+  assert.ok(rowWithId(reopened, inboxId(8)), "the thread's read did not bring C's answers");
+  await pickThread(reopened, "main");
+  assert.deepStrictEqual(unreadSaid(reopened), { 2: "1 new", 7: "2 unread" });
+});
+
+/**
+ * Questions A, B and C on Slack, reopened in Main from the device's copy `store`, while All fails to
+ * read whenever `failing()` says so; All's page passes over question B's thread when it does read.
+ */
+async function reopenedWithAllFailing(store, messages, dealtWith, failing) {
+  const page = reloadWith(store, messages, (p) => {
+    inboxChannel(p, SLACK_IDS);
+    p.messages = messages;
+    for (const id of dealtWith) p.dealtWith.add(id);
+    allLeavingOut(p, [SLACK_IDS.b]);
+    const serve = p.timeline;
+    p.timeline = (path, options) => (failing() && viewOf(path) === "flat"
+      ? json(502, { error: "discord_error", detail: "the provider is down" }) : serve(path, options));
+  });
+  await reopenedChannel(page);
+  await page.settle();
+  return page;
+}
+
+test("UNDO AFTER THE SETTLED THREAD WAS LOWERED OR PASSED OVER by later reads still takes the settling back, and Done settles it again", async () => {
+  // A cold open whose read of All fails: no read has placed any thread, and Done on B settles it.
+  const first = newPage();
+  await inboxOnMain(first, inboxChannel(first, SLACK_IDS));
+  first.storage.delete(MESSAGE_CACHE_KEY);
+  let failing = true;
+  const page = await reopenedWithAllFailing(first.storage, first.messages, first.dealtWith, () => failing);
+  assert.deepStrictEqual(viewsRead(page), ["main", "flat"]);
+  assert.deepStrictEqual(unreadSaid(page), { 2: "2 new", 5: "1 new", 7: "3 new" });
+  await chooseReadMode(page, "Hide read");
+  await doneButton(rowWithId(page, inboxId(5))).click();
+  await page.settle();
+  assert.equal(rowWithId(page, inboxId(5)), undefined);
+  // The read of All goes through, past the interval, and passes B over.
+  failing = false;
+  page.setClock(page.clock() + COUNTS_ALL_READ_MS);
+  await reReadChannel(page);
+  assert.deepStrictEqual(viewsRead(page).slice(-2), ["main", "flat"]);
+  assert.deepStrictEqual(unreadSaid(page), { 2: "1 unread", 7: "2 unread" });
+  await page.el("undo-dismiss").click();
+  await page.settle();
+  assert.equal(saidB(page), "1 new");
+  // Main's read, All now reaching B's root, does not make B's unknown reply a known one Done cannot settle.
+  await reReadChannel(page);
+  assert.equal(saidB(page), "1 new");
+  await doneButton(rowWithId(page, inboxId(5))).click();
+  await page.settle();
+  assert.equal(rowWithId(page, inboxId(5)), undefined, "Done after the Undo did not settle question B again");
+
+  // A settled gap a read only lowers — a reply deleted upstream — is still the Done's to take back.
+  const lowered = await coldSlackPastTheTen();
+  answeredUnseen(lowered, lowered.messages);
+  await reReadChannel(lowered);
+  await chooseReadMode(lowered, "Hide read");
+  assert.equal(saidB(lowered), "2 new");
+  await doneButton(rowWithId(lowered, inboxId(5))).click();
+  await lowered.settle();
+  assert.equal(rowWithId(lowered, inboxId(5)), undefined);
+  lowered.messages = lowered.messages.filter((m) => m.id !== inboxId(13))
+    .map((m) => (m.id === inboxId(5) ? { ...m, thread: { ...m.thread, reply_count: 1 } } : m));
+  await reReadChannel(lowered);
+  assert.equal(rowWithId(lowered, inboxId(5)), undefined);
+  await lowered.el("undo-dismiss").click();
+  await lowered.settle();
+  assert.equal(saidB(lowered), "1 new", "Undo after a read lowered the settled gap left question B settled");
+});
+
+test("A SETTLED THREAD'S READ REPLIES CUT FROM THE DEVICE'S COPY move with what Done settled, so putting the root back still takes it back", async () => {
+  // B's first reply held and Done, its second never brought; then a copy saved by an earlier version,
+  // whose gaps are dropped, reopened while All fails: B's gap is unknown, and Done on B settles it.
+  const first = newPage();
+  const messages = inboxChannel(first, SLACK_IDS);
+  await inboxOnMain(first, messages);
+  answeredUnseen(first, messages);
+  await reReadChannel(first);
+  editSavedChannel(first, (entry) => {
+    delete entry.settledByDone;
+  });
+  const page = await reopenedWithAllFailing(first.storage, first.messages, first.dealtWith, () => true);
+  assert.equal(saidB(page), "1 new");
+  await doneButton(rowWithId(page, inboxId(5))).click();
+  await page.settle();
+  assert.equal(saidB(page), null);
+  // Then enough updates that the copy is cut past B's thread, its Done reply included.
+  const later = Array.from({ length: 125 }, (_, i) => message({ id: inboxId(100 + i), content: `update ${i}`, ...CODER }));
+  for (const m of later) page.dealtWith.add(m.id);
+  page.messages = [...page.messages, ...later];
+  await reReadChannel(page);
+  editSavedChannel(page, (entry) => {
+    assert.ok(!entry.messages.some((m) => m.id === inboxId(6)), "the copy was not cut past B's reply");
+  });
+  const again = await reopenedWithAllFailing(page.storage, page.messages, page.dealtWith, () => true);
+  await chooseReadMode(again, "Hide read");
+  assert.equal(rowWithId(again, inboxId(5)), undefined, "the reload took the Done's settling back");
+  await chooseReadMode(again, "Show read");
+  await doneButton(rowWithId(again, inboxId(5))).click();
+  await again.settle();
+  await chooseReadMode(again, "Hide read");
+  assert.ok(rowWithId(again, inboxId(5)), "putting question B's root back, after the copy was cut, left it settled");
+  assert.ok(saidB(again), "question B is back with nothing to say why");
 });
