@@ -11017,6 +11017,11 @@ function renderOutgoingMessages() {
   host.replaceChildren(...rows);
   // Nor over the Pinned filter, which shows pinned messages and nothing else. `#206 pin-message`.
   host.hidden = rows.length === 0 || pinnedOnly;
+  // `#228 reply-visible`. A reply of the owner's counts on the Reply of the message it answers from
+  // the moment it is queued, and that count changes as it lands, fails or is dismissed: counted
+  // again when the outbox's replies have changed since the counts were drawn. Not on a pass over
+  // the rows, which has just counted them.
+  if (outgoingReplyKey() !== countedOutgoingKey) renderReplyCounts();
 }
 
 /**
@@ -12572,6 +12577,9 @@ function replyArrow(li) {
   mark.className = "reply-jump-mark";
   mark.setAttribute("aria-hidden", "true");
   arrow.append(mark);
+  // `#228 reply-visible`. On the row, for the pass that asks which replies are joined to the row
+  // above by this arrow (`renderReplyCounts`), without walking the row for it.
+  li.replyArrowButton = arrow;
   arrow.addEventListener("click", (event) => {
     // The row's own tap handler would fold the row, or start reading it aloud in reading mode. It
     // already ignores a click on a button, and this does not rely on that: the click ends here.
@@ -12866,6 +12874,13 @@ const REPLY_SHAFT_CLEAR_REM = 0.65;
 /** The shortest run to the row's side that has room for its corner and its head, in rem. */
 const REPLY_RUN_MIN_REM = 0.9;
 
+/**
+ * `#228 reply-visible`. How far right of a row's lower-left corner the point of a head under its
+ * foot must be, in rem, for the head to keep clear of a circle centred on that corner: half the
+ * head's width, the disc's radius, and a gap, which also keeps a press on the head off the circle.
+ */
+const REPLY_HUB_CLEAR_REM = 1.1;
+
 /** The rem on this page, in pixels: the arrow's drawing is in rem and its measurements in pixels. */
 function rootFontPx() {
   const style = typeof window.getComputedStyle === "function"
@@ -12920,8 +12935,12 @@ function measureReplyArrows() {
     const box = row.getBoundingClientRect();
     return over.getBoundingClientRect().left - (box.left + (row.clientLeft || 0));
   });
-  pairs.forEach(({ arrow }, at) => {
+  pairs.forEach(({ arrow, above: over }, at) => {
     const dx = gaps[at];
+    // `#228 reply-visible`. A row with a circle on its corner as well: the circle is lifted up the
+    // row's side, out of the way of a head that comes up under its foot too near the corner for
+    // both. A head that meets the row's side is raised instead, by web/voice.css.
+    const hub = arrow.hasAttribute("data-reply-hub");
     // Where the head would have to be to meet the flat of that row's bottom edge, and how far a
     // turn to its side would have to run, both from the reply's padding edge.
     const meets = dx + REPLY_CORNER_REM * rem;
@@ -12933,10 +12952,20 @@ function measureReplyArrows() {
       const furthest = (REPLY_SHAFT_REM - REPLY_SHAFT_CLEAR_REM) * rem;
       const shift = Math.min(furthest, Math.max(0, meets + REPLY_SHAFT_REM * rem));
       setArrowReach(arrow, "below", "--reply-shift", `${shift.toFixed(2)}px`, "--reply-run");
+      if (hub) setMarkerLift(over, shift - REPLY_SHAFT_REM * rem - dx < REPLY_HUB_CLEAR_REM * rem);
     } else {
       setArrowReach(arrow, "side", "--reply-run", `${run.toFixed(2)}px`, "--reply-shift");
+      if (hub) setMarkerLift(over, false);
     }
   });
+}
+
+/** Lift `row`'s circle up its side, or put it back on the corner, where that differs. `#228`. */
+function setMarkerLift(row, lift) {
+  if (lift !== row.hasAttribute("data-reply-lift")) {
+    if (lift) row.setAttribute("data-reply-lift", "true");
+    else row.removeAttribute("data-reply-lift");
+  }
 }
 
 /** Write one arrow's reach and its distance, and clear the other distance, where they differ. */
@@ -13416,6 +13445,8 @@ function renderReplyLinks() {
     }
     if (rowShown(row)) above = row;
   }
+  // `#228 reply-visible`. The other end of each arrow, from the arrows just decided.
+  renderReplyCounts();
   measureReplyArrows();
 }
 
@@ -13456,6 +13487,324 @@ function ungatherButton() {
     scatterReplies();
   });
   return button;
+}
+
+// --- how many replies a message has, and the way down to them ----------------------------------
+//
+// `#228 reply-visible`. The owner, 2026-10-09: "When I press Reply on a message and write a reply it
+// gets marked as read. Fine. But there's still a button that says Reply ... I would like the button
+// to change to say Reply (1), Reply (2) if there are already replies so that it is clear that it is
+// already replied to." And: "a blue circle about the size of our arrow head centered on the lower
+// left corner of the message box ... the other end of the disconnected arrow pointing up/left from
+// the reply lower in the view. If we click it we should jump to the child, just as clicking the
+// arrow jumps to the parent."
+//
+// WHAT IS COUNTED. A reply by POINTER — a message whose `reply_to` names this one: Discord's
+// replies, and Google Chat's quote-replies, which arrive as the same pointer — that the page holds:
+// every message in the channel's store, which every view reads into (Main, All, each thread, the
+// stream), and every row of the list, each counted once, by id. The owner's own replies count, which
+// is the point. A combined row counts the replies to any message it stands for, as `data-replied`
+// dims it for any, but not one of its own messages answering another of its own. A thread's replies
+// that name no message are not counted: Thread(N) and N replies already say how many the thread
+// has, and Reply (N) beside them would be a second number for another kind of reply, a centimetre
+// away. One in a thread that does name this message is a reply by pointer like any other.
+//
+// SLACK HAS NO POINTER. Its only reply is a thread reply, and its Reply posts into the message's
+// thread, which the thread chips count. So there Reply stays "Reply": none of its messages names
+// another, and a send of the owner's is not counted either (below). The thread's count is not put on
+// the button as well, for the reason just given.
+//
+// THE OWNER'S OWN SEND COUNTS AT ONCE, from the outbox, the moment Send is pressed — where the
+// channel's replies are known to carry the pointer: a provider without threads, whose only reply is
+// one, or a channel in which the page already holds a message naming another. Nothing else tells the
+// page before the server answers whether a send will carry it; on Slack it will not, and counting it
+// there would say (1) for the second the send took and then go back to nothing. Once the server has
+// acknowledged a send, its answer says: a first part that came back naming the message is that
+// reply, and the same reply as the row the acknowledgement draws, so it is counted once. A send
+// waiting to go again on its own (`outgoingRetries`) is still being sent, and still counts. One that
+// failed for good posted nothing; one whose delivery is unconfirmed, and that nothing is retrying,
+// is a reply only once a read brings it.
+//
+// THE CIRCLE is a button on the row's lower-left corner, the size of the disconnected arrow's head
+// and in the arrow's blue, placed by web/voice.css against the row itself: no rectangle is read to
+// draw it, and it adds nothing to the one layout the arrows take (`measureReplyArrows`). It is on a
+// row with a reply the reader can be taken to that is NOT joined to the row already:
+//
+//   * A REPLY DIRECTLY BELOW, whose arrow is the one that reaches up and meets this row, is joined
+//     to it: that arrow's head meets this row at its foot, or at its side just above the foot, a
+//     few pixels from where the circle would be, and two marks there for one connection read as two
+//     things. Photographed both ways at 412 and 1280 pixels: on a desk the head and a circle all but
+//     touched. A row whose only replies are those has no circle; one with another reply anywhere
+//     else has — the owner's "other end of the disconnected arrow".
+//   * BOTH, a reply directly below and another further away: the circle is drawn, for the other,
+//     and it and the joined reply's arrow step aside for each other at the corner they share
+//     (`data-reply-hub`, `data-reply-lift`, web/voice.css), so neither is drawn over the other and
+//     a press on either is that one's.
+//   * GATHERED (`#215 reply-coalesce`), the conversation is the stack under its parent, joined by
+//     the bridge: neither the parent nor a reply in the stack has a circle.
+//   * One the reader CAN be taken to: on a row of this list, shown, filtered out by the search or
+//     collapsed into a run of read messages; or, from Main or a thread, a message another view
+//     shows, which All draws — unless Hide read leaves it out there as well. A circle whose every tap
+//     answered "Hide read is hiding that message" would be a control that looks broken. The button
+//     still counts that reply: it was written.
+//
+// A TAP goes to the reply the way a tap on an arrow goes to what it answers (`seekMessage`): All is
+// opened for a reply this view does not show, a collapsed run is opened and a search that hides it
+// closed, and the reply lands at the head of the list, lit. With several, the first tap goes to the
+// earliest reply NOT joined to the row — the one the circle is there for, rather than the one already
+// in view under it — and each tap after that to the next in time order, round to the first after the
+// last. Which comes next is kept by the row's message (`replyMarkerVisited`), so a redraw does not
+// start it again, and the circle's name says where the next tap goes.
+//
+// NOT IN THE PINNED LIST, which is drawn without the reply gutter (`#206 pin-message`): there Reply
+// is "Reply", and there is no circle.
+
+/** Reply's tooltip on a message nobody has answered. No channel data, for the reason in `discordNode`. */
+const REPLY_BUTTON_TITLE = "Reply to this message";
+
+/** By the id of a row's first message, the reply its circle last took the reader to. */
+const replyMarkerVisited = new Map();
+
+/** What each circle can take the reader to: the replies' ids in time order, and which are joined. */
+const replyMarkerTargets = new WeakMap();
+
+/** Whether any Reply on the list says a count, or any row has a circle: a pass then has something to undo. */
+let replyCountsDrawn = false;
+
+/** The circle's accessible name, for the `at`th (from 1) of `of` replies. No channel data. */
+const replyMarkerName = (at, of) =>
+  of === 1 ? "Jump to the reply to this message" : `Jump to reply ${at} of ${of} to this message`;
+
+/**
+ * The replies by pointer the page holds of the channel on screen, as `replies`: by the id of the
+ * message each answers, each reply's id to its time in milliseconds (NaN when it has none). And as
+ * `held`, every message the page holds of it, by id. See the head of this section.
+ *
+ * @param {any[]} rows the channel list's rows
+ * @returns {{replies: Map<string, Map<string, number>>, held: Map<string, any>}}
+ */
+function heldReplies(rows) {
+  const viewing = String(el("discord-channel").value);
+  /** @type {Map<string, any>} */
+  const held = new Map();
+  if (threadingSupported && channelCanon.channel === viewing) {
+    for (const message of channelCanon.messages) held.set(String(message.id), message);
+  }
+  for (const row of rows) {
+    for (const message of rowMessages(row)) {
+      if (!held.has(String(message.id))) held.set(String(message.id), message);
+    }
+  }
+  /** @type {Map<string, Map<string, number>>} */
+  const replies = new Map();
+  const add = (parent, child, at) => {
+    if (!parent || parent === child) return;
+    if (!replies.has(parent)) replies.set(parent, new Map());
+    replies.get(parent).set(child, at);
+  };
+  // ...and what each says, so that a send the stream has already brought back, ahead of the
+  // server's answer to it, is not counted a second time from the outbox.
+  const said = new Set();
+  for (const [id, message] of held) {
+    if (!message.reply_to) continue;
+    add(String(message.reply_to), id, timeOf(message, "timestamp"));
+    said.add(`${message.reply_to}\n${String(message.content || "").trim()}`);
+  }
+  const pointers = !threadingSupported || replies.size > 0;
+  for (const entry of outgoingMessages.values()) {
+    if (entry.channel !== viewing || !entry.replyTo) continue;
+    const first = entry.parts[0];
+    if (first) {
+      if (first.reply_to) add(String(first.reply_to), String(first.id), timeOf(first, "timestamp"));
+    } else if ((entry.state === "sending" || outgoingRetries.has(entry.id)) && entry.postedCount === 0 &&
+        pointers && !said.has(`${entry.replyTo}\n${String(entry.text).trim()}`)) {
+      add(String(entry.replyTo), `outgoing:${entry.id}`, entry.createdAt);
+    }
+  }
+  return { replies, held };
+}
+
+/**
+ * What of the outbox the Reply counts on the channel on screen are drawn from: each reply's
+ * entry, how far its send has got, and what the server said it posted. `renderOutgoingMessages`
+ * counts again only when this has changed since the last count. `#228 reply-visible`.
+ */
+function outgoingReplyKey() {
+  const viewing = String(el("discord-channel").value);
+  const parts = [viewing];
+  for (const entry of outgoingMessages.values()) {
+    if (entry.channel !== viewing || !entry.replyTo) continue;
+    const first = entry.parts[0];
+    parts.push(`${entry.id}:${entry.state}:${entry.postedCount}:${outgoingRetries.has(entry.id)}:` +
+      `${first ? String(first.id) : ""}`);
+  }
+  return parts.join(" ");
+}
+
+/** `outgoingReplyKey` as it stood when the Reply counts were last drawn. */
+let countedOutgoingKey = "";
+
+/** Say on a row's Reply how many replies it has: "Reply (2)", and in words to a screen reader. */
+function labelReplyButton(button, count) {
+  if (!button) return;
+  const text = count > 0 ? `Reply (${count})` : "Reply";
+  if (button.textContent !== text) button.textContent = text;
+  if (count > 0) {
+    const name = `Reply, ${countOf(count)} already`;
+    if (button.getAttribute("aria-label") !== name) button.setAttribute("aria-label", name);
+    const title = `${REPLY_BUTTON_TITLE}. It has ${countOf(count)} already.`;
+    if (button.getAttribute("title") !== title) button.setAttribute("title", title);
+  } else if (button.hasAttribute("aria-label")) {
+    button.removeAttribute("aria-label");
+    button.setAttribute("title", REPLY_BUTTON_TITLE);
+  }
+}
+
+/**
+ * Every row's Reply count, and its circle, from the replies the page holds and the arrows just
+ * decided. Run by `renderReplyLinks`, which every pass over the rows and every filter ends with,
+ * and by `renderOutgoingMessages`, for a send of the owner's. Writes only what changed, and reads
+ * no layout. See the head of this section.
+ */
+function renderReplyCounts() {
+  countedOutgoingKey = outgoingReplyKey();
+  const rows = /** @type {HTMLLIElement[]} */ ([...el("discord-log").children]);
+  const { replies, held } = heldReplies(rows);
+  if (replies.size === 0 && !replyCountsDrawn) return;
+  /** @type {Map<string, any>} */
+  const drawn = new Map();
+  for (const row of rows) {
+    for (const id of idsOf(row)) drawn.set(id, row);
+  }
+  // From Main or a thread, a reply this view does not show is one All does, unless Hide read leaves
+  // it out there too: by the store's read state, as the unread counts go (`replyTally`).
+  const elsewhere = threadingSupported && channelView !== "flat";
+  const reachable = (id) => {
+    if (drawn.has(id)) return true;
+    const message = held.get(id);
+    return elsewhere && Boolean(message) && !inView(message, channelView, selectedThreadId) &&
+      !(todoMode && !stillToDo(message, channelCanon.dismissed));
+  };
+  // Drawn directly under the row it answers, at the head of its own row, with the arrow that meets it.
+  const joined = (id) => {
+    const row = drawn.get(id);
+    const arrow = row ? row.replyArrowButton : null;
+    return Boolean(arrow) && rowShown(row) && idsOf(row)[0] === id &&
+      row.getAttribute("data-read-run") !== "head" && arrow.getAttribute("data-reply-style") === "adjacent";
+  };
+  let shown = false;
+  // The replies joined to a row with a circle, whose arrows arrive at that row's corner too.
+  const hubs = new Set();
+  for (const row of rows) {
+    const ids = idsOf(row);
+    const own = new Set(ids);
+    /** @type {Map<string, number>} */
+    const answers = new Map();
+    for (const id of ids) {
+      for (const [child, at] of replies.get(id) || []) {
+        if (!own.has(child)) answers.set(child, at);
+      }
+    }
+    labelReplyButton(row.replyButton, answers.size);
+    if (answers.size > 0) shown = true;
+    const gathered = row.hasAttribute("data-stack-under") || row.getAttribute("data-coalesce") === "parent";
+    const order = (at) => (Number.isFinite(at) ? at : Infinity);
+    const targets = gathered ? [] : [...answers].filter(([child]) => reachable(child))
+      .sort((a, b) => order(a[1]) - order(b[1])).map(([child]) => child);
+    const together = new Set(targets.filter(joined));
+    let marker = row.replyMarker || null;
+    if (targets.length > together.size) {
+      if (!marker) marker = replyMarker(row);
+      replyMarkerTargets.set(marker, { parent: ids[0], ids: targets, joined: together });
+      labelReplyMarker(marker);
+      if (row.getAttribute("data-reply-marker") !== "true") row.setAttribute("data-reply-marker", "true");
+      for (const child of together) hubs.add(child);
+      shown = true;
+    } else if (marker) {
+      row.removeChild(marker);
+      row.replyMarker = null;
+      row.removeAttribute("data-reply-marker");
+    }
+    // Lifted only beside a joined reply's arrow, as `measureReplyArrows` decides.
+    if (!(targets.length > together.size && together.size > 0) && row.hasAttribute("data-reply-lift")) {
+      row.removeAttribute("data-reply-lift");
+    }
+  }
+  // Each joined arrow knows whether a circle shares its corner, and steps aside for it (web/voice.css).
+  for (const row of rows) {
+    const arrow = row.replyArrowButton;
+    if (!arrow) continue;
+    const hub = hubs.has(idsOf(row)[0]);
+    if (hub !== arrow.hasAttribute("data-reply-hub")) {
+      if (hub) arrow.setAttribute("data-reply-hub", "true");
+      else arrow.removeAttribute("data-reply-hub");
+    }
+  }
+  replyCountsDrawn = shown;
+}
+
+/** Which of a circle's replies the next tap goes to, as an index into them. */
+function nextReplyTarget(marker) {
+  const held = replyMarkerTargets.get(marker);
+  if (!held || held.ids.length === 0) return -1;
+  const last = replyMarkerVisited.get(held.parent);
+  const at = last === undefined ? -1 : held.ids.indexOf(last);
+  if (at >= 0) return (at + 1) % held.ids.length;
+  const first = held.ids.findIndex((id) => !held.joined.has(id));
+  return first < 0 ? 0 : first;
+}
+
+/** Name a circle for where its next tap goes, and how many replies there are to go to. */
+function labelReplyMarker(marker) {
+  const held = replyMarkerTargets.get(marker);
+  const next = nextReplyTarget(marker);
+  if (!held || next < 0) return;
+  const name = replyMarkerName(next + 1, held.ids.length);
+  if (marker.getAttribute("aria-label") !== name) marker.setAttribute("aria-label", name);
+  const title = held.ids.length === 1 ? name : `${name}. Each tap goes on to the next.`;
+  if (marker.getAttribute("title") !== title) marker.setAttribute("title", title);
+}
+
+/**
+ * The circle, at the end of `row`, drawn by web/voice.css on its lower-left corner. A button, so the
+ * keyboard reaches it after the row's own controls, with a ring when it does.
+ */
+function replyMarker(row) {
+  const marker = document.createElement("button");
+  marker.className = "reply-marker";
+  marker.setAttribute("type", "button");
+  marker.addEventListener("click", (event) => {
+    // The row's own tap would fold it or read it aloud: this tap is the circle's.
+    if (event && typeof event.stopPropagation === "function") event.stopPropagation();
+    const held = replyMarkerTargets.get(marker);
+    const next = nextReplyTarget(marker);
+    if (!held || next < 0) return;
+    const target = held.ids[next];
+    replyMarkerVisited.set(held.parent, target);
+    labelReplyMarker(marker);
+    guardQuietly(() => jumpToReply(target, next + 1, held.ids.length))();
+  });
+  row.append(marker);
+  row.replyMarker = marker;
+  return marker;
+}
+
+/** A tap on a circle: the walk the arrow's jump makes, down to reply `target`, the `at`th of `of`. */
+async function jumpToReply(target, at, of) {
+  await seekMessage(target, () => landOnReply(target, at, of),
+    () => threadingSupported && channelView !== "flat" && answeredElsewhere(target));
+}
+
+/** Take the reader to reply `target` if a row on screen holds it, as `landOnAnswered` does; else false. */
+function landOnReply(target, at, of) {
+  const row = rowHolding(target);
+  if (!row) return false;
+  if (String(row.className).split(/\s+/).includes("search-hidden")) setSearchOpen(false);
+  openReadRun(row);
+  revealRow(row);
+  renderScrollTools();
+  setStatus(of === 1 ? "Here is the reply to it." : `Here is reply ${at} of ${of} to it.`);
+  return true;
 }
 
 function toggleMessageDetails(li, messages) {
@@ -14712,6 +15061,10 @@ function swipeable(li, messages) {
     if (ungather && nodeWithin(ungather, event.target)) {
       return;
     }
+    // `#228 reply-visible`. Nor on the circle at the row's corner, the way down to a reply.
+    if (li.replyMarker && nodeWithin(li.replyMarker, event.target)) {
+      return;
+    }
     active = true;
     startX = event.clientX;
     startY = event.clientY;
@@ -15242,7 +15595,7 @@ function discordNode(messages) {
   const reply = document.createElement("button");
   reply.className = "reply-button";
   reply.setAttribute("type", "button");
-  reply.setAttribute("title", "Reply to this message");
+  reply.setAttribute("title", REPLY_BUTTON_TITLE);
   reply.textContent = "Reply";
   // A closure over the message OBJECTS, not over their ids: an id would be looked up again later
   // against a list that the next poll may have replaced.
@@ -15251,6 +15604,9 @@ function discordNode(messages) {
   // hanging off it, and threading a reply under the tail would put the answer under a fragment.
   reply.addEventListener("click", () => openReply(messages));
   meta.append(reply);
+  // `#228 reply-visible`. Held on the row, as its messages are, so that the pass which says how many
+  // replies each row has (`renderReplyCounts`) finds the button without walking the row's text.
+  li.replyButton = reply;
   // A row of the Pinned filter offers the way into its message's thread whatever view is under it.
   addThreadDecoration(meta, message, li, drawingPinnedRows);
   // A provider write, distinct from the reversible local Done/archive below. Most providers do

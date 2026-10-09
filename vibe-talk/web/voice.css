@@ -1476,10 +1476,16 @@ body {
  * `#222 unread-replies`. So is a root on Main whose thread holds unread replies, for the chip that
  * says so: it is inside the box, so it is lifted over the veil and left out of the drained colour
  * (below). The root is read, and looks it; the count of what is not is not faded with it.
+ *
+ * `#228 reply-visible`. And so is a row with the circle on its corner that leads down to a reply:
+ * the circle is the other end of an arrow, and is drawn at the arrow's strength. Most such rows
+ * recede — a message with a reply is an answered one (`data-replied`) — and it is on exactly those
+ * that a faded circle would be the faint mark the owner called useless.
  */
 #discord-log li.discord-message[data-is-reply="true"][data-who],
 #discord-log li.discord-message[data-stack-under][data-who],
-#discord-log li.discord-message[data-unread-replies][data-who] {
+#discord-log li.discord-message[data-unread-replies][data-who],
+#discord-log li.discord-message[data-reply-marker][data-who] {
   opacity: 1;
   filter: none;
   background-image: linear-gradient(rgb(128 128 128 / var(--row-grey, 0)), rgb(128 128 128 / var(--row-grey, 0)));
@@ -1488,7 +1494,8 @@ body {
 
 #discord-log li.discord-message[data-is-reply="true"] > :not(.reply-jump):not(.reply-bridge):not(.reply-ungather),
 #discord-log li.discord-message[data-stack-under] > :not(.reply-jump):not(.reply-bridge):not(.reply-ungather),
-#discord-log li.discord-message[data-unread-replies] > :not(.thread-unread):not(.reply-jump):not(.reply-bridge):not(.reply-ungather) {
+#discord-log li.discord-message[data-unread-replies] > :not(.thread-unread):not(.reply-jump):not(.reply-bridge):not(.reply-ungather),
+#discord-log li.discord-message[data-reply-marker] > :not(.reply-marker):not(.reply-jump):not(.reply-bridge):not(.reply-ungather) {
   filter: var(--row-filter, none);
 }
 
@@ -1506,7 +1513,8 @@ body {
    tinted one, at `--row-grey`. */
 #discord-log li.discord-message[data-is-reply="true"]::after,
 #discord-log li.discord-message[data-stack-under]::after,
-#discord-log li.discord-message[data-unread-replies]::after {
+#discord-log li.discord-message[data-unread-replies]::after,
+#discord-log li.discord-message[data-reply-marker]::after {
   --row-veil: color-mix(in srgb, var(--bg) calc((1 - var(--row-opacity, 1)) * 100%), transparent);
   content: "";
   position: absolute;
@@ -1706,6 +1714,117 @@ body {
 #discord-log .reply-jump:focus-visible {
   outline: 2px solid var(--accent);
   outline-offset: -2px;
+}
+
+/*
+ * `#228 reply-visible`. THE OTHER END OF A DISCONNECTED ARROW: a disc in the arrow's blue, on the
+ * lower-left corner of a message that has a reply somewhere else, and the way down to it. See the
+ * section in web/voice.js for which rows have one.
+ *
+ * THE ARROWHEAD'S SIZE. The disconnected arrow's head is a right-angled triangle 0.7rem along each
+ * side (above), and the disc is 0.7rem across: the same box, so the two ends of one connection
+ * read as a pair, and both grow with the reader's type.
+ *
+ * CENTRED ON THE CORNER of the row's border box: the button is placed against the row's padding
+ * box, and its centre is moved out by the row's one-pixel border (`.messages li`, web/style.css).
+ * A quarter of the disc is inside the box, in its padding — 0.6rem at the foot and 0.7rem at the
+ * side, where nothing but space is: the text, the controls and the N replies chip all stand inside
+ * that padding, and the disc reaches 0.35rem into it. The rest is outside, over the row's corner
+ * border and into the 0.5rem gap under it, which it does not cross.
+ *
+ * THE BUTTON IS A TARGET ROUND THE DISC, 1.75rem across (28px at the page's type): a disc an
+ * arrowhead wide is too small to aim a thumb at. Round, so the part of it inside the row stays in
+ * the corner of the padding — 1.75rem across reaches 0.875rem from the corner, and the nearest
+ * corner of the content box is 0.6rem up and 0.7rem in, 0.92rem away. Over the row's veil and
+ * borders (`z-index`), and left out of the drained colour a receding row's parts get (below).
+ *
+ * Positioned against the row, never measured: placing it costs the page no layout of its own
+ * (`#226 page-energy-profile`).
+ */
+#discord-log .reply-marker {
+  --reply-marker-dot: 0.7rem;
+  --reply-marker-target: 1.75rem;
+  position: absolute;
+  z-index: 1;
+  left: calc(-1px - var(--reply-marker-target) / 2);
+  bottom: calc(-1px - var(--reply-marker-target) / 2);
+  width: var(--reply-marker-target);
+  height: var(--reply-marker-target);
+  min-height: 0;
+  margin: 0;
+  padding: 0;
+  background: none;
+  border: none;
+  border-radius: 50%;
+  color: var(--accent);
+  touch-action: manipulation;
+  -webkit-tap-highlight-color: transparent;
+  cursor: pointer;
+}
+
+#discord-log .reply-marker::before {
+  content: "";
+  position: absolute;
+  top: calc(50% - var(--reply-marker-dot) / 2);
+  left: calc(50% - var(--reply-marker-dot) / 2);
+  width: var(--reply-marker-dot);
+  height: var(--reply-marker-dot);
+  border-radius: 50%;
+  background: currentColor;
+}
+
+/* At full strength on a receding row, as the arrow is: weighed above the rule over a reply's parts,
+   for a row that is a reply and has replies of its own. */
+#discord-log li.discord-message[data-reply-marker] > .reply-marker:not(.reply-jump):not(.reply-bridge):not(.reply-ungather) {
+  filter: none;
+}
+
+/*
+ * THE AGENT'S TILE, ON A PHONE, has its left side at the screen's edge (its rule, above), and half a
+ * disc centred there would be cut off by the edge of the list. There the disc stands just inside the
+ * corner instead, its left edge on the tile's — still on the row's foot, and still clear of the text,
+ * whose 0.6rem of padding is under it. Not a reply of the agent's, nor one gathered under a message:
+ * those are set in by a gutter, and their corner has room. A desk puts the tile inside the reading
+ * column, and the disc back on the corner (the desktop block at the foot of this file).
+ */
+#discord-log li.discord-message[data-who="coder"]:not([data-is-reply="true"]):not([data-stack-under]) > .reply-marker {
+  left: calc(env(safe-area-inset-left) - 1px - (var(--reply-marker-target) - var(--reply-marker-dot)) / 2);
+}
+
+/* Pressed, and reached by keyboard: a halo round the disc, and the arrow's own ring round its target. */
+#discord-log .reply-marker:active::before,
+#discord-log .reply-marker:focus-visible::before {
+  box-shadow: 0 0 0 0.25rem color-mix(in srgb, var(--accent) 30%, transparent);
+}
+
+#discord-log .reply-marker:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
+}
+
+/*
+ * A CIRCLE AND AN ARROW AT ONE CORNER. A row answered from directly below, whose reply's arrow
+ * comes up and meets it, and from further away as well, which the circle stands for, has the ends of
+ * two connections at its lower-left corner. Neither is drawn over the other; each keeps to its own
+ * place (`data-reply-hub` on the arrow, set by web/voice.js when its row above has a circle):
+ *
+ *   * A HEAD THAT MEETS THE ROW'S SIDE is raised: 1.4rem above the foot rather than 0.9rem, so it is
+ *     clear of the disc and of the disc's round target, and a press on the head is the arrow's.
+ *   * A HEAD UNDER THE ROW'S FOOT is left where it is, and where it is too near the corner for both
+ *     (`measureReplyArrows`), the circle is lifted 0.7rem up the row's side instead
+ *     (`data-reply-lift`): still on the box's edge, its disc inside the side padding, where nothing
+ *     but space is. Elsewhere the head is far enough along the foot, and the circle stays put.
+ */
+#discord-log .reply-jump[data-reply-reach="side"][data-reply-hub] .reply-jump-mark::before {
+  height: calc(1.4rem + var(--reply-stroke) / 2 + 1px);
+}
+
+#discord-log .reply-jump[data-reply-reach="side"][data-reply-hub] .reply-jump-mark::after {
+  top: -1.4rem;
+}
+
+#discord-log li.discord-message[data-reply-lift] > .reply-marker {
+  bottom: calc(-1px - var(--reply-marker-target) / 2 + 0.7rem);
 }
 
 /*
@@ -3464,6 +3583,11 @@ body {
     background: color-mix(in srgb, var(--accent) 18%, transparent);
   }
 
+  /* `#228 reply-visible`. The circle's halo, under the pointer, as it shows when pressed. */
+  #discord-log .reply-marker:hover::before {
+    box-shadow: 0 0 0 0.25rem color-mix(in srgb, var(--accent) 30%, transparent);
+  }
+
   /* `#221 read-modes`. A collapsed run's line, brought up under the pointer, as when pressed. */
   #discord-log .read-run:hover {
     color: var(--ink);
@@ -4841,6 +4965,12 @@ textarea {
 
   #discord-log li.discord-message[data-stack-under="me-reply"][data-who] {
     margin-left: calc(max(var(--reply-gutter), min(15%, 6rem)) + var(--reply-gutter));
+  }
+
+  /* `#228 reply-visible`. Inside the reading column the agent's tile has room beside it, and its
+     circle goes back to the corner, as every other row's is. */
+  #discord-log li.discord-message[data-who="coder"]:not([data-is-reply="true"]):not([data-stack-under]) > .reply-marker {
+    left: calc(-1px - var(--reply-marker-target) / 2);
   }
 
   /* The identity rows go back to two tracks. The phone stacks them because 27 characters of option

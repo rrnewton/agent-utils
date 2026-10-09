@@ -33518,3 +33518,614 @@ test("A SETTLED THREAD'S READ REPLIES CUT FROM THE DEVICE'S COPY move with what 
   assert.ok(rowWithId(again, inboxId(5)), "putting question B's root back, after the copy was cut, left it settled");
   assert.ok(saidB(again), "question B is back with nothing to say why");
 });
+
+// --- how many replies a message has, and the way down to them ----------------------------------
+//
+// `#228 reply-visible`. The owner: "I would like the button to change to say Reply (1) Reply (2) if
+// there are already replies so that it is clear that it is already replied to." And: "a blue circle
+// about the size of our arrow head centered on the lower left corner of the message box ... If we
+// click it we should jump to the child, just as clicking the arrow jumps to the parent." The circle's
+// geometry — on the corner, over the borders, clear of the text and the buttons, and Reply (2)
+// leaving the buttons on one line at 412px — is measured in Chromium by the screenshot states
+// `42-reply-count-and-marker` and `43-reply-marker-jumped` (scripts/screenshots.py).
+
+const replyLabel = (li) => replyButton(li).textContent;
+const replyMarkerOf = (li) => li.children.find((node) => node.hasClass("reply-marker"));
+
+/** A tap on a row's circle as a browser delivers it: to the circle, then — unless stopped — to the row. */
+async function tapMarker(page, li) {
+  const marker = replyMarkerOf(li);
+  assert.ok(marker, "the row has no circle to tap");
+  let stopped = false;
+  const event = { target: marker, stopPropagation: () => { stopped = true; } };
+  await marker.dispatch("click", event);
+  if (!stopped) await li.dispatch("click", event);
+  for (let i = 0; i < 4 * REPLY_JUMP_PAGES; i += 1) await page.settle();
+}
+
+/**
+ * A question, the reply directly under it, a screenful of other messages, and two more replies to the
+ * question at the foot: one from a third party, one from the owner.
+ */
+function answeredThreeTimes() {
+  return [
+    message({ id: "1000000000000000001", content: longMessage("is the runner wedged?") }),
+    message({ id: "1000000000000000002", content: "which runner?", reply_to: "1000000000000000001", ...ALICE }),
+    ...Array.from({ length: 6 }, (_unused, i) =>
+      message({ id: `10000000000000000${10 + i}`, content: longMessage(`filler ${i}`), ...(i % 2 ? CODER : {}) })),
+    message({ id: "1000000000000000098", content: "restarted it", reply_to: "1000000000000000001", ...ALICE }),
+    message({ id: "1000000000000000099", content: "and it is green now", reply_to: "1000000000000000001", ...OWNER }),
+  ];
+}
+
+test("REPLY SAYS HOW MANY REPLIES A MESSAGE HAS: Reply, Reply (1), Reply (2), and in words to a screen reader", async () => {
+  const page = newPage();
+  await signIn(page);
+  await showDiscord(page, [
+    message({ id: "1000000000000000001", content: "is the runner wedged?" }),
+    message({ id: "1000000000000000002", content: "which runner?", reply_to: "1000000000000000001", ...ALICE }),
+    message({ id: "1000000000000000003", content: "nobody has answered this one", ...OWNER }),
+    message({ id: "1000000000000000004", content: "runner four", reply_to: "1000000000000000001", ...CODER }),
+    message({ id: "1000000000000000005", content: "thanks", reply_to: "1000000000000000002", ...ALICE }),
+  ]);
+  const button = (id) => replyButton(rowWithId(page, id));
+  assert.equal(button("1000000000000000001").textContent, "Reply (2)", "a message two replies answer does not say so");
+  assert.equal(button("1000000000000000001").getAttribute("aria-label"), "Reply, 2 replies already");
+  assert.equal(button("1000000000000000001").getAttribute("title"), "Reply to this message. It has 2 replies already.");
+  // A reply can be answered too, and is counted as any message is.
+  assert.equal(button("1000000000000000002").textContent, "Reply (1)");
+  assert.equal(button("1000000000000000002").getAttribute("aria-label"), "Reply, 1 reply already");
+  // Nobody has answered it: plain, and named by its words, as it always was.
+  for (const id of ["1000000000000000003", "1000000000000000004", "1000000000000000005"]) {
+    assert.equal(button(id).textContent, "Reply", `${id} says it has replies it has not`);
+    assert.equal(button(id).getAttribute("aria-label"), null, `${id} is named for replies it has not`);
+    assert.equal(button(id).getAttribute("title"), "Reply to this message");
+  }
+  // Short enough to leave the row's buttons on one line: four characters, at most five.
+  assert.ok(SCRIPT_CODE.includes("`Reply (${count})`"), "the count is not drawn as Reply (N)");
+});
+
+test("...a combined row counts the replies to any message it stands for, once each", async () => {
+  const page = newPage();
+  await signIn(page);
+  await showDiscord(page, [
+    ...splitPost(),
+    message({ id: "1000000000000000003", content: "which runner?", reply_to: "1000000000000000002",
+      timestamp: "2026-08-19T04:40:00.000Z", ...ALICE }),
+    message({ id: "1000000000000000004", content: "and since when?", reply_to: "1000000000000000001",
+      timestamp: "2026-08-19T04:41:00.000Z", ...OWNER }),
+  ]);
+  assert.equal(page.el("discord-log").children.length, 3, "the split post was not drawn as one row");
+  assert.equal(replyLabel(row(page, 0)), "Reply (2)", "a reply to the second half of a combined row was not counted");
+  // ...but not the row answering itself: its second half naming its first is one message to the reader.
+  const self = newPage();
+  await signIn(self);
+  await showDiscord(self, splitPost({}, { reply_to: "1000000000000000001" }));
+  assert.equal(self.el("discord-log").children.length, 1, "the split post was not drawn as one row");
+  assert.equal(replyLabel(row(self, 0)), "Reply", "a combined row counted its own half as a reply to it");
+  assert.equal(replyMarkerOf(row(self, 0)), undefined);
+});
+
+test("...and follows the channel: a reply arriving on the stream adds one, and one deleted upstream takes it away", async () => {
+  const page = newPage();
+  const question = message({ id: "100", content: "is the runner wedged?" });
+  const stream = await withLiveChannel(page, [question]);
+  assert.equal(replyLabel(rowWithId(page, "100")), "Reply");
+
+  const answer = message({ id: "200", content: "restarted it", reply_to: "100", ...ALICE });
+  page.messages = [question, answer];
+  await deliver(page, stream, sseMessage(answer));
+  assert.equal(replyLabel(rowWithId(page, "100")), "Reply (1)", "a reply that arrived live was not counted");
+
+  page.messages = [question];
+  await deliver(page, stream, sseDelete("delete-200", CHANNEL.id, "200"));
+  await page.settle();
+  assert.equal(rowWithId(page, "200"), undefined, "the deleted reply is still drawn");
+  assert.equal(replyLabel(rowWithId(page, "100")), "Reply", "a reply deleted upstream is still counted");
+});
+
+test("THE OWNER'S OWN REPLY COUNTS from the moment Send is pressed, and once when the server answers", async () => {
+  const page = newPage();
+  await signIn(page);
+  let release = null;
+  const held = new Promise((resolve) => { release = resolve; });
+  const answer = page.replyResponse;
+  page.replyResponse = async (path, options) => {
+    await held;
+    return answer(path, options);
+  };
+  await openReplyOn(page, conversation(), 2);
+  page.el("reply-text").value = "on it";
+  const sending = page.el("reply-send").click();
+  await page.settle();
+  assert.equal(outgoingRows(page).length, 1, "the send is not in the outbox, so this proves nothing");
+  const target = () => rowWithId(page, "1000000000000000003");
+  assert.equal(replyLabel(target()), "Reply (1)", "the reply on its way was not counted");
+  // The outbox's copy is not a message in the list: no circle leads to it.
+  assert.equal(replyMarkerOf(target()), undefined, "a circle leads to a reply nothing has posted yet");
+
+  release();
+  await sending;
+  await page.settle();
+  assert.ok(rowWithId(page, "9000000000000000001"), "the acknowledged reply was not drawn");
+  assert.equal(replyLabel(target()), "Reply (1)", "the reply was counted twice once the server answered");
+});
+
+test("...and once when the stream brings the reply back before the server has answered the send", async () => {
+  const page = newPage();
+  const question = message({ id: "100", content: "is the runner wedged?" });
+  const stream = await withLiveChannel(page, [question]);
+  let release = null;
+  const held = new Promise((resolve) => { release = resolve; });
+  const answer = page.replyResponse;
+  page.replyResponse = async (path, options) => {
+    await held;
+    return answer(path, options);
+  };
+  await openReplyOn(page, [question], 0);
+  page.el("reply-text").value = "restarted it";
+  const sending = page.el("reply-send").click();
+  await page.settle();
+  assert.equal(replyLabel(rowWithId(page, "100")), "Reply (1)");
+  // The provider's own copy of the post, on the stream, ahead of the POST's answer.
+  const echo = message({ id: "9000000000000000001", content: "restarted it", reply_to: "100", ...OWN });
+  page.messages = [question, echo];
+  await deliver(page, stream, sseMessage(echo, { self_posted: true }));
+  assert.ok(rowWithId(page, "9000000000000000001"), "the stream's copy was not drawn, so this proves nothing");
+  assert.equal(replyLabel(rowWithId(page, "100")), "Reply (1)", "the reply was counted from the outbox and the stream both");
+  release();
+  await sending;
+  await page.settle();
+  assert.equal(replyLabel(rowWithId(page, "100")), "Reply (1)");
+});
+
+test("...not once it has failed, and still while it is waiting to go again on its own", async () => {
+  // Refused: nothing was posted.
+  const failed = newPage();
+  await signIn(failed);
+  failed.replyResponse = errorResponse(400, "discord_error", "Discord refused the message");
+  await openReplyOn(failed, conversation(), 2);
+  failed.el("reply-text").value = "on it";
+  await failed.el("reply-send").click();
+  await failed.settle();
+  assert.match(outgoingRows(failed)[0].text(), /Not sent/);
+  assert.equal(replyLabel(rowWithId(failed, "1000000000000000003")), "Reply", "a send that posted nothing was counted");
+
+  // Its answer lost, and nothing sending it again: a reply only once a read brings it.
+  const lost = newPage();
+  await signIn(lost);
+  lost.replyResponse = errorResponse(502, "discord_error", "nope");
+  await openReplyOn(lost, conversation(), 2);
+  lost.el("reply-text").value = "on it";
+  await lost.el("reply-send").click();
+  await lost.settle();
+  assert.match(outgoingRows(lost)[0].text(), /Delivery unconfirmed/);
+  assert.equal(replyLabel(rowWithId(lost, "1000000000000000003")), "Reply", "a send nobody knows arrived was counted");
+
+  const retrying = newPage();
+  retrying.idempotentPostsSupported = true;
+  await signIn(retrying);
+  retrying.replyResponse = errorResponse(502, "chat_error", SLOW_SEND);
+  await openReplyOn(retrying, conversation(), 2);
+  retrying.el("reply-text").value = "on it";
+  await retrying.el("reply-send").click();
+  await retrying.settle();
+  assert.match(outgoingRows(retrying)[0].text(), /Retrying in/, "no automatic retry was armed, so this proves nothing");
+  assert.equal(replyLabel(rowWithId(retrying, "1000000000000000003")), "Reply (1)",
+    "a reply the page is still sending stopped counting between attempts");
+  // Dismissed, it is gone from the count.
+  await outgoingRows(retrying)[0].descendants().find((node) => node.className === "outgoing-dismiss").click();
+  await retrying.settle();
+  assert.equal(replyLabel(rowWithId(retrying, "1000000000000000003")), "Reply", "a dismissed send is still counted");
+});
+
+test("...nor where Reply posts into the message's thread: the thread's chips count those, and Reply stays Reply", async () => {
+  // A provider whose only reply is a thread reply. None of its messages names another, and its post
+  // comes back naming none either; Thread(N) and N replies already say how many there are.
+  const page = await threadPage();
+  const root = () => rowWithId(page, "201");
+  assert.equal(threadBadge(root()).textContent, "Thread(1)");
+  assert.equal(replyLabel(root()), "Reply", "a thread's replies were counted on Reply as well as on its chips");
+  let release = null;
+  const held = new Promise((resolve) => { release = resolve; });
+  page.replyResponse = async (_path, options) => {
+    await held;
+    return json(200, { posted: message({ id: "9000000000000000009", content: JSON.parse(options.body).text,
+      thread: { id: "spaces/A/threads/one & two", root_message_id: "201", is_root: false, reply_count: 2,
+        reply_count_exact: true } }) });
+  };
+  await replyButton(root()).click();
+  page.el("reply-text").value = "on it";
+  const sending = page.el("reply-send").click();
+  await page.settle();
+  assert.equal(replyLabel(root()), "Reply", "a send that will carry no pointer was counted while it was on its way");
+  release();
+  await sending;
+  await page.settle();
+  assert.equal(replyLabel(root()), "Reply", "a thread reply was counted on Reply");
+});
+
+test("THE CIRCLE is on a message a reply further down answers: a button, named for where it goes, and last in the row", async () => {
+  const page = newPage();
+  await signIn(page);
+  await showDiscord(page, answeredThreeTimes());
+  const question = rowWithId(page, "1000000000000000001");
+  const marker = replyMarkerOf(question);
+  assert.ok(marker, "the message answered from far below has no circle");
+  assert.equal(marker.tagName, "button");
+  assert.equal(marker.getAttribute("type"), "button");
+  assert.equal(question.getAttribute("data-reply-marker"), "true");
+  // After the row's own controls, so the keyboard reaches it last — and drawn by the stylesheet.
+  assert.equal(question.children.at(-1), marker, "the circle is not the last thing in the row");
+  assert.equal(marker.text(), "", "the circle is a typed glyph");
+  // The first tap goes to the earliest reply the arrow does not already join to it: the second of three.
+  assert.equal(marker.getAttribute("aria-label"), "Jump to reply 2 of 3 to this message");
+  assert.equal(marker.getAttribute("title"), "Jump to reply 2 of 3 to this message. Each tap goes on to the next.");
+  assert.equal(replyLabel(question), "Reply (3)");
+  // No other row has one: nothing answers them.
+  assert.deepStrictEqual(page.el("discord-log").children.filter((li) => replyMarkerOf(li)).map((li) => li.getAttribute("data-id")),
+    ["1000000000000000001"]);
+});
+
+test("...but not on a message answered only from directly below: the arrow that rises from the reply meets it there", async () => {
+  const page = newPage();
+  await signIn(page);
+  await showDiscord(page, conversation());
+  assert.equal(arrowStyle(row(page, 1)), "adjacent");
+  assert.equal(replyLabel(row(page, 0)), "Reply (1)", "the reply directly under it is not counted");
+  assert.equal(replyMarkerOf(row(page, 0)), undefined, "two marks on the one foot for one connection");
+  assert.equal(row(page, 0).getAttribute("data-reply-marker"), null);
+  // ...and with a row between, the arrow leaves it, and the circle is its other end.
+  const later = newPage();
+  await signIn(later);
+  await showDiscord(later, [
+    message({ id: "1000000000000000001", content: "is the runner wedged?" }),
+    message({ id: "1000000000000000005", content: "in between" }),
+    message({ id: "1000000000000000002", content: "the runner restarted", reply_to: "1000000000000000001", ...ALICE }),
+  ]);
+  const question = () => rowWithId(later, "1000000000000000001");
+  assert.equal(arrowStyle(rowWithId(later, "1000000000000000002")), "disconnected");
+  assert.ok(replyMarkerOf(question()), "the other end of a disconnected arrow has no circle");
+  // A search that hides the row between joins them again, and the circle goes with it...
+  await search(later, "runner");
+  assert.ok(rowWithId(later, "1000000000000000005").hasClass("search-hidden"));
+  assert.equal(arrowStyle(rowWithId(later, "1000000000000000002")), "adjacent");
+  assert.equal(replyMarkerOf(question()), undefined,
+    "the circle stayed when the row between was filtered out and the arrow met the message");
+  // ...and comes back when the search goes.
+  await later.el("search-toggle").click();
+  assert.ok(replyMarkerOf(question()), "closing the search left the circle off");
+});
+
+test("A CIRCLE AND AN ARROW AT ONE CORNER step aside for each other: the head raised up the side, or the circle lifted", async () => {
+  // Answered from directly below and from further away: the reply below's arrow and the circle both
+  // end at the question's lower-left corner. Boxes placed by hand, as for the arrows' own measuring;
+  // tests/offline_cache_browser.py measures the real ones in Chromium.
+  const page = newPage(new Map(), SCRIPT, (p) => p.enableResizeObserver());
+  await signIn(page);
+  await showDiscord(page, answeredThreeTimes());
+  const question = () => rowWithId(page, "1000000000000000001");
+  const below = () => rowWithId(page, "1000000000000000002");
+  assert.ok(replyMarkerOf(question()), "the question has no circle, so this proves nothing");
+  assert.equal(arrowStyle(below()), "adjacent");
+  assert.equal(replyArrowOf(below()).getAttribute("data-reply-hub"), "true", "the arrow does not know it shares a corner");
+  // No other arrow steps aside: nothing else meets a row with a circle.
+  for (const id of ["1000000000000000098", "1000000000000000099"]) {
+    assert.equal(replyArrowOf(rowWithId(page, id)).getAttribute("data-reply-hub"), null, `${id}'s arrow stepped aside`);
+  }
+  const list = page.el("discord-log");
+  list.clientWidth = 380;
+  const place = (li, left) => {
+    li.getBoundingClientRect = () => ({ ...FakeElement.prototype.getBoundingClientRect.call(li), left, right: left + 300 });
+  };
+  const measured = (parentLeft) => {
+    place(question(), parentLeft);
+    place(below(), 44);
+    page.resized(list);
+    page.expireTimers(0);
+    return [replyArrowOf(below()).getAttribute("data-reply-reach"), question().getAttribute("data-reply-lift")];
+  };
+  // A row spanning the gutter: the head comes up 2.3rem along its foot, clear of the circle.
+  assert.deepStrictEqual(measured(-12), ["below", null], "the circle was lifted from a head nowhere near it");
+  // The owner's inset row: the head comes up as near its corner as the shaft may go, and the circle
+  // makes way, up the row's side.
+  assert.deepStrictEqual(measured(22), ["below", "true"], "the circle was left on a head at its corner");
+  // A row starting past the reply's box: the head meets its side, raised by the stylesheet, and the
+  // circle stays on the corner.
+  assert.deepStrictEqual(measured(96), ["side", null], "the circle was lifted for a head that meets the row's side");
+  measured(22);
+  assert.equal(question().getAttribute("data-reply-lift"), "true");
+  // A search that hides the reply below leaves nothing at the corner but the circle: it goes back on it.
+  await search(page, "wedged");
+  assert.ok(below().hasClass("search-hidden"), "the search did not hide the reply below");
+  assert.equal(replyArrowOf(below()).getAttribute("data-reply-hub"), null, "a hidden reply's arrow still steps aside");
+  assert.equal(question().getAttribute("data-reply-lift"), null, "the circle stayed lifted for a head nobody can see");
+  await page.el("search-toggle").click();
+  assert.equal(replyArrowOf(below()).getAttribute("data-reply-hub"), "true");
+  // The far replies gone, the circle goes, and so does all its stepping aside.
+  page.messages = answeredThreeTimes().slice(0, 8);
+  await reReadChannel(page);
+  assert.equal(replyMarkerOf(question()), undefined, "the circle outlived the replies it led to");
+  assert.equal(replyArrowOf(below()).getAttribute("data-reply-hub"), null, "the arrow still steps aside for no circle");
+  assert.equal(question().getAttribute("data-reply-lift"), null, "the row is still lifted for no circle");
+  // The stylesheet's half.
+  assert.match(cssBlock('#discord-log .reply-jump[data-reply-reach="side"][data-reply-hub] .reply-jump-mark::after'),
+    /top:\s*-1\.4rem/, "a head that meets the row's side is not raised clear of the circle");
+  assert.match(cssBlock('#discord-log .reply-jump[data-reply-reach="side"] .reply-jump-mark::after'), /top:\s*-0\.9rem/);
+  assert.match(cssBlock("#discord-log li.discord-message[data-reply-lift] > .reply-marker"),
+    /bottom:\s*calc\(-1px - var\(--reply-marker-target\) \/ 2 \+ 0\.7rem\)/, "a lifted circle is not lifted");
+  assert.ok(/^const REPLY_HUB_CLEAR_REM = 1\.1;$/m.test(SCRIPT_CODE), "the head's clearance from the circle has changed");
+});
+
+test("TAPPING THE CIRCLE lands on the reply, lit, the way the arrow lands on what it answers", async () => {
+  const page = newPage();
+  await signIn(page);
+  await showDiscord(page, [
+    message({ id: "1000000000000000001", content: longMessage("is the runner wedged?") }),
+    ...Array.from({ length: 8 }, (_unused, i) =>
+      message({ id: `10000000000000000${10 + i}`, content: longMessage(`filler ${i}`), ...(i % 2 ? CODER : {}) })),
+    message({ id: "1000000000000000099", content: longMessage("restarted it"), reply_to: "1000000000000000001", ...ALICE }),
+    // Enough after it that the reply can come to the head of the list.
+    ...Array.from({ length: 4 }, (_unused, i) =>
+      message({ id: `10000000000000001${10 + i}`, content: longMessage(`later ${i}`), ...(i % 2 ? {} : CODER) })),
+  ]);
+  const area = page.el("scroll-area");
+  const question = rowWithId(page, "1000000000000000001");
+  const reply = rowWithId(page, "1000000000000000099");
+  area.scrollTop = 0;
+  await area.dispatch("scroll");
+  assert.ok(reply.getBoundingClientRect().top > area.clientHeight, "the reply was already on screen");
+  assert.equal(replyMarkerOf(question).getAttribute("aria-label"), "Jump to the reply to this message");
+  assert.equal(replyMarkerOf(question).getAttribute("title"), "Jump to the reply to this message");
+
+  await tapMarker(page, question);
+  const top = reply.getBoundingClientRect().top;
+  assert.ok(top >= 0 && top <= 3 * LINE_PX, `the reply landed at ${top}px, not at the head of the list`);
+  assert.equal(reply.getAttribute("data-landed"), "true", "nothing says which row the jump was for");
+  assert.equal(statusText(page), "Here is the reply to it.");
+  assert.equal(page.expireTimers(REPLY_LANDED_MS), 1, "the light was never timed to go out");
+  assert.equal(reply.getAttribute("data-landed"), null);
+  // ...and the reply's own arrow is the way back up.
+  await tapArrow(page, reply);
+  assert.equal(question.getAttribute("data-landed"), "true");
+});
+
+test("...with several, each tap goes on to the next in time order, round to the first", async () => {
+  const page = newPage();
+  await signIn(page);
+  await showDiscord(page, answeredThreeTimes());
+  const question = () => rowWithId(page, "1000000000000000001");
+  const landed = () => page.el("discord-log").children.filter((li) => li.getAttribute("data-landed") === "true")
+    .map((li) => li.getAttribute("data-id"));
+  // The reply already joined to it from below is not where the first tap goes: it is in view.
+  await tapMarker(page, question());
+  assert.deepStrictEqual(landed(), ["1000000000000000098"]);
+  assert.equal(statusText(page), "Here is reply 2 of 3 to it.");
+  assert.equal(replyMarkerOf(question()).getAttribute("aria-label"), "Jump to reply 3 of 3 to this message");
+  await tapMarker(page, question());
+  assert.deepStrictEqual(landed(), ["1000000000000000099"]);
+  assert.equal(statusText(page), "Here is reply 3 of 3 to it.");
+  await tapMarker(page, question());
+  assert.deepStrictEqual(landed(), ["1000000000000000002"], "the taps did not go round to the first");
+  assert.equal(statusText(page), "Here is reply 1 of 3 to it.");
+  // A redraw does not start the round again.
+  await reReadChannel(page);
+  assert.equal(replyMarkerOf(question()).getAttribute("aria-label"), "Jump to reply 2 of 3 to this message");
+  await tapMarker(page, question());
+  assert.deepStrictEqual(landed(), ["1000000000000000098"]);
+});
+
+test("...and the tap is the circle's: it neither folds the row nor reads it, nor starts a swipe or a hold", async () => {
+  const page = newPage();
+  await signIn(page);
+  await showDiscord(page, answeredThreeTimes());
+  const question = rowWithId(page, "1000000000000000001");
+  assert.equal(question.getAttribute("data-collapsed"), "true", "the question is not foldable, so this proves nothing");
+  await tapMarker(page, question);
+  assert.equal(question.getAttribute("data-collapsed"), "true", "tapping the circle also opened the row");
+  await readButton(page).click();
+  await page.settle();
+  await tapMarker(page, question);
+  assert.deepStrictEqual(page.speakCalls, [], "tapping the circle started reading the row aloud");
+
+  const marker = replyMarkerOf(question);
+  const commit = sourceConstant("SWIPE_COMMIT_PX") + 10;
+  const touch = (x) => ({ pointerId: 1, pointerType: "touch", clientX: x, clientY: 10, target: marker });
+  await question.dispatch("pointerdown", touch(10));
+  assert.equal(page.expireTimers(HOLD_MS), 0, "a finger resting on the circle armed the row's press-and-hold");
+  await question.dispatch("pointermove", touch(10 + commit));
+  assert.ok(!question.style.transform, "the row followed a finger that came down on its circle");
+  await question.dispatch("pointerup", touch(10 + commit));
+  await page.settle();
+  assert.deepEqual(page.dismissCalls, [], "a drag that began on the circle archived the row");
+});
+
+test("...it opens a run of read messages the reply is collapsed into, and closes a search that hides it", async () => {
+  const page = newPage();
+  page.threadingSupported = true;
+  const messages = [
+    message({ id: "301", content: "is the runner wedged?" }),
+    message({ id: "302", content: "already dealt with" }),
+    message({ id: "303", content: "restarted it", reply_to: "301", ...ALICE }),
+    message({ id: "304", content: "dealt with too" }),
+    message({ id: "305", content: "still to read" }),
+  ];
+  for (const id of ["302", "303", "304"]) page.dealtWith.add(id);
+  await signIn(page);
+  await showDiscord(page, messages);
+  await chooseReadMode(page, "Collapse read");
+  const reply = () => rowWithId(page, "303");
+  assert.equal(reply().getAttribute("data-read-run"), "member", "the reply is not collapsed, so this proves nothing");
+  const question = rowWithId(page, "301");
+  assert.equal(replyMarkerOf(question).getAttribute("aria-label"), "Jump to the reply to this message",
+    "a reply collapsed into a run has no way down to it");
+  await tapMarker(page, question);
+  assert.equal(reply().hidden, false, "the run the reply is in was not opened");
+  assert.equal(reply().getAttribute("data-landed"), "true");
+
+  const searched = newPage();
+  await signIn(searched);
+  await showDiscord(searched, answeredThreeTimes());
+  await search(searched, "wedged");
+  // The reply directly under the question is hidden as well, so nothing joins it to the question:
+  // the first tap is for it.
+  assert.ok(rowWithId(searched, "1000000000000000002").hasClass("search-hidden"), "the search did not hide the reply");
+  assert.equal(replyMarkerOf(rowWithId(searched, "1000000000000000001")).getAttribute("aria-label"),
+    "Jump to reply 1 of 3 to this message", "a reply the search hides was taken as joined to the question");
+  await tapMarker(searched, rowWithId(searched, "1000000000000000001"));
+  assert.equal(searched.el("search-field").hidden, true, "the search hiding the reply was left open");
+  assert.equal(rowWithId(searched, "1000000000000000002").getAttribute("data-landed"), "true");
+});
+
+test("IN MAIN, the circle on a message answered from inside a thread opens All and lands there", async () => {
+  const page = newPage();
+  const data = threadData();
+  // The second thread's answer answers the main channel's announcement, which Main shows.
+  data.messages[4].reply_to = "200";
+  page.threadingSupported = true;
+  page.threads = data.threads;
+  await signIn(page);
+  await showDiscord(page, data.messages);
+  await pickThread(page, "main");
+  assert.deepStrictEqual(shownIds(page), ["200", "201", "203"], "Main is not what this test assumes");
+  const announcement = rowWithId(page, "200");
+  assert.equal(replyLabel(announcement), "Reply (1)", "a reply Main does not show, but the page holds, was not counted");
+  assert.ok(replyMarkerOf(announcement), "a reply in another view has no way down to it");
+
+  await tapMarker(page, announcement);
+  assert.equal(page.el("thread-select").value, "flat", "the jump did not open All");
+  assert.equal(rowWithId(page, "204").getAttribute("data-landed"), "true", "All opened and the reply was not shown");
+  assert.equal(statusText(page), "Here is the reply to it.");
+  // In All the reply is two rows below, its arrow disconnected: the circle is still there.
+  assert.ok(replyMarkerOf(rowWithId(page, "200")));
+});
+
+test("...IN A THREAD as well; but not to a reply Hide read leaves out of All too, which Reply still counts", async () => {
+  const page = newPage();
+  const data = threadData();
+  // The first thread's answer answers the second thread's root.
+  data.messages[2].reply_to = "203";
+  page.threadingSupported = true;
+  page.threads = data.threads;
+  await signIn(page);
+  await showDiscord(page, data.messages);
+  await pickThread(page, `thread:${data.threads[1].id}`);
+  assert.deepStrictEqual(shownIds(page), ["203", "204"]);
+  assert.ok(replyMarkerOf(rowWithId(page, "203")), "from a thread, a reply elsewhere has no way down to it");
+  await tapMarker(page, rowWithId(page, "203"));
+  assert.equal(page.el("thread-select").value, "flat");
+  assert.equal(rowWithId(page, "202").getAttribute("data-landed"), "true");
+
+  const hidden = newPage();
+  const again = threadData();
+  again.messages[4].reply_to = "200";
+  hidden.threadingSupported = true;
+  hidden.threads = again.threads;
+  hidden.dealtWith.add("204");
+  await signIn(hidden);
+  await showDiscord(hidden, again.messages);
+  await turnTodoOn(hidden);
+  await pickThread(hidden, "main");
+  const announcement = rowWithId(hidden, "200");
+  assert.ok(announcement, "Main under Hide read is not what this test assumes");
+  assert.equal(replyLabel(announcement), "Reply (1)", "a reply that was written, and read, stopped counting");
+  assert.equal(replyMarkerOf(announcement), undefined,
+    "a circle leads to a reply Hide read hides wherever it could be shown");
+});
+
+test("GATHERED, the stack under its message is the connection: no circle on the parent or in it", async () => {
+  const page = await scatteredPage();
+  // 601's replies by pointer: 602 from directly below, 607 from far below. 604 and 606 are the
+  // thread's, which its chips count.
+  assert.equal(replyLabel(rowWithId(page, "601")), "Reply (2)");
+  assert.equal(gatherChip(page, "601").textContent, "2 replies");
+  assert.equal(replyMarkerOf(rowWithId(page, "601")).getAttribute("aria-label"), "Jump to reply 2 of 2 to this message");
+  assert.equal(replyLabel(rowWithId(page, "602")), "Reply (1)");
+  assert.equal(replyMarkerOf(rowWithId(page, "602")), undefined, "603 answers it from directly below");
+  await gatherChip(page, "601").click();
+  await page.settle();
+  assert.deepStrictEqual(shownIds(page), GATHERED);
+  assert.ok(page.el("discord-log").children.every((li) => !replyMarkerOf(li)), "a circle in a gathered conversation");
+  assert.equal(replyLabel(rowWithId(page, "601")), "Reply (2)", "gathering changed the count");
+  await gutterChild(rowWithId(page, "602"), "reply-ungather").dispatch("click", { stopPropagation() {} });
+  assert.ok(replyMarkerOf(rowWithId(page, "601")), "putting the replies back left no way down to them");
+});
+
+test("NOT IN THE PINNED LIST: there Reply is Reply, and there is no circle", async () => {
+  const page = newPage();
+  const messages = answeredThreeTimes();
+  page.pinned.set(messages[0].id, storedPin(messages[0]));
+  page.servePinsRevision = true;
+  page.pinsRevision = 1;
+  await signIn(page);
+  await showDiscord(page, messages);
+  await showPinned(page);
+  const pinned = page.el("pinned-log").children[0];
+  assert.equal(pinned.getAttribute("data-id"), messages[0].id);
+  assert.equal(replyLabel(pinned), "Reply", "a pinned row says how many replies it has in a list without them");
+  assert.equal(replyMarkerOf(pinned), undefined, "a pinned row has a circle to replies the list does not hold");
+});
+
+test("THE CIRCLE IS DRAWN AS THE ARROWHEAD IS: its size, its blue, on the corner, over the borders, with a ring", () => {
+  // The disconnected arrow's head is a right-angled triangle 0.7rem along each side; the disc is the same box.
+  assert.match(cssBlock('#discord-log .reply-jump[data-reply-style="disconnected"] .reply-jump-mark::after'),
+    /border-top:\s*0\.7rem solid currentColor/, "the arrowhead the disc is sized by has changed under it");
+  const marker = cssBlock("#discord-log .reply-marker");
+  assert.match(marker, /--reply-marker-dot:\s*0\.7rem/, "the disc is not an arrowhead wide");
+  assert.match(marker, /color:\s*var\(--accent\)/, "the disc is not in the arrow's blue");
+  assert.match(marker, /position:\s*absolute/);
+  assert.match(marker, /z-index:\s*1/, "the disc is not drawn over the row's borders and veil");
+  // Centred on the corner of the border box: out by half its target and by the row's one-pixel border.
+  assert.match(marker, /left:\s*calc\(-1px - var\(--reply-marker-target\) \/ 2\)/);
+  assert.match(marker, /bottom:\s*calc\(-1px - var\(--reply-marker-target\) \/ 2\)/);
+  assert.match(marker, /border-radius:\s*50%/, "the target is not round, so its corner reaches into the row");
+  const dot = cssBlock("#discord-log .reply-marker::before");
+  assert.match(dot, /width:\s*var\(--reply-marker-dot\)/);
+  assert.match(dot, /background:\s*currentColor/);
+  assert.match(cssBlock("#discord-log .reply-marker:focus-visible"), /outline:\s*2px solid var\(--accent\)/,
+    "a keyboard on the circle has no ring");
+  // At full strength on a receding row, as the arrow is: the row recedes in its box instead.
+  assert.match(cssBlock("#discord-log li.discord-message[data-reply-marker][data-who]"), /opacity:\s*1/,
+    "a row with a circle still fades as a whole, circle and all");
+  assert.match(cssBlock("#discord-log li.discord-message[data-reply-marker]::after"),
+    /color-mix\(in srgb, var\(--bg\) calc\(\(1 - var\(--row-opacity, 1\)\) \* 100%\)/,
+    "a row with a circle no longer recedes in its box");
+  assert.match(CSS, /li\.discord-message\[data-reply-marker\] > :not\(\.reply-marker\)/,
+    "the circle is greyed with the row it is on");
+  // The agent's tile meets the screen's edge on a phone, where half a disc on its corner would be cut
+  // off: there the disc stands just inside the corner. A desk holds the tile in the column, and the
+  // disc goes back on the corner.
+  const tile = '#discord-log li.discord-message[data-who="coder"]:not([data-is-reply="true"]):not([data-stack-under]) > .reply-marker';
+  assert.match(cssBlock(tile), /left:\s*calc\(env\(safe-area-inset-left\) - 1px - \(var\(--reply-marker-target\) - var\(--reply-marker-dot\)\) \/ 2\)/);
+  assert.match(cssBlockIn("(min-width: 900px) and (pointer: fine)", tile), /left:\s*calc\(-1px - var\(--reply-marker-target\) \/ 2\)/,
+    "a desk leaves the agent's disc inside its tile's corner");
+  // A collapsed run's line hides every part of its row: the circle too.
+  assert.match(cssBlock('#discord-log li.discord-message[data-read-run="head"] > :not(.read-run)'), /display:\s*none/);
+});
+
+test("THE COUNTS AND THE CIRCLES READ NO LAYOUT: a redraw with circles and no adjacent arrow lays nothing out", async () => {
+  const { page, server } = await forwardPage({}, (p) => {
+    p.messages = [...p.messages,
+      message({ id: "205", content: "is the runner wedged?" }),
+      message({ id: "206", content: "in between" }),
+      message({ id: "207", content: "restarted it", reply_to: "205", ...ALICE })];
+  });
+  const list = page.el("discord-log");
+  list.clientWidth = 380;
+  assert.ok(replyMarkerOf(rowWithId(page, "205")), "there is no circle, so this proves nothing");
+  const read = FakeElement.prototype.getBoundingClientRect;
+  const asked = [];
+  FakeElement.prototype.getBoundingClientRect = function rect() {
+    if (this === list || this.hasClass("reply-marker")) asked.push(this === list ? "list" : "circle");
+    return read.call(this);
+  };
+  try {
+    server.post(message({ id: "208", content: "one more thing", reply_to: "205", ...OWNER }));
+    await pollOnce(page);
+    assert.equal(replyLabel(rowWithId(page, "205")), "Reply (2)");
+    assert.ok(replyMarkerOf(rowWithId(page, "205")));
+    assert.deepStrictEqual(asked, [], "drawing the counts and the circles laid the list out");
+  } finally {
+    FakeElement.prototype.getBoundingClientRect = read;
+  }
+});

@@ -87,6 +87,18 @@ then kept in as if you had picked it. A message not loaded yet is looked for a f
 with progress in the status line; one further back than that, or no longer in the channel's history,
 is said so there. While the reply is off screen, **Back to reply** returns to it.
 
+**A message says how many replies it has.** Its **Reply** reads **Reply (1)**, **Reply (2)** once
+replies to it are loaded, in any view, yours included from the moment you press Send, so an answered
+message says so on the button that would answer it again; a screen reader hears "Reply, 2 replies
+already". Replies that point at no message, such as a thread's, are counted by **Thread(N)** and
+**N replies** instead, so on Slack, whose only reply is a thread reply, Reply stays **Reply**. When a
+reply is not the message directly below, the message it answers has a small blue circle on its
+lower-left corner, the other end of that reply's arrow. Tap it to go to the reply, brought to the top
+of the list and lit as an arrow's tap brings what it answers, in **All** when the reply is in another
+part of the channel. With several replies, each tap goes on to the next in time order, starting with
+the first that is not directly below. The circle is not drawn for a reply directly below, whose arrow
+already meets the message, nor in a gathered conversation, nor in the Pinned list.
+
 **A message's replies can be gathered under it.** **N replies** under a message moves its loaded
 replies, and the replies to those, all the way down, in time order, to sit directly beneath it in
 **All**, joined to it by one line, while everything else stays where it was and the message stays

@@ -17,4 +17,10 @@ interface HTMLLIElement {
    * stand for channel messages: a voice turn, or a message still being sent.
    */
   linkText?: string;
+  /** `#228 reply-visible`. A channel row's Reply button, whose label says how many replies it has. */
+  replyButton?: HTMLButtonElement;
+  /** `#228 reply-visible`. A reply's arrow, on its row, for the pass that asks which arrows meet the row above. */
+  replyArrowButton?: HTMLButtonElement;
+  /** `#228 reply-visible`. The circle on the row's lower-left corner, while it has one: the way down to a reply. */
+  replyMarker?: HTMLButtonElement | null;
 }

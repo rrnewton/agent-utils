@@ -140,7 +140,10 @@ rounded corner, or, where that row starts at or beyond the reply's box, on its l
 found from the pixels, where the head's width runs out — and a press at that point or on the middle of
 the head is that arrow's, even where the head is drawn over the row above's own arrow; a reply to a
 message elsewhere draws the arrow that leaves the middle of its box's left side, within 1px, and runs
-at 45 degrees. Both at the default type size and at 150%. A real tap or click on each such head jumps
+at 45 degrees. Both at the default type size and at 150%. Where the row above also has a circle on
+its lower-left corner for a reply further away (`#228 reply-visible`), the circle and the head keep at
+least 2px apart — the head raised up the row's side, or the circle lifted up it beside a head under the
+foot — with a press on each that one's. A real tap or click on each such head jumps
 to the row above and lights it, and two on the head drawn over another arrow are both that arrow's, and
 gather the conversation its reply is in under the conversation's first message. A real tap on the root's
 N replies gathers its replies, a reply to a reply among them, under it, in time order, with the root
@@ -411,8 +414,11 @@ class CoalesceApi(FakeApi):
     side); 209, 212 and 214 are the thread's replies, a third party's, the agent's and the owner's;
     210 is the owner's, and 211, the agent's, answers it from directly below (the owner's row is inset,
     so on a desk the arrow turns to its side and on a phone it moves under its edge); 213, a third
-    party's, answers the root from far below it. 215, a third party's one line, answers 210 from below
-    the thread, so its arrow's square is at its middle and reaches down beside its foot; and 216, the
+    party's, answers the root from far below it. 215, the agent's one line, answers 210 from below
+    the thread, so its arrow's square is at its middle and reaches down beside its foot — the agent's,
+    whose name a row does not print, so that its line still holds its Reply (1) at 360px (`#228
+    reply-visible`): a third party's name beside it wraps the line there, and the row is no longer
+    short; and 216, the
     agent's, answers 215 from directly below, so its arrow's head is drawn over that square. Gathering
     206 moves 207, 208 (a reply to a reply, so in 206's conversation too), 209, 212, 213 and 214, in
     that order, under it, and leaves 210, 211, 215 and 216 where they are; 210 heads the conversation
@@ -432,7 +438,7 @@ class CoalesceApi(FakeApi):
             {**said(12, f"Packaging passed on the rerun. {COALESCE_FILLER}", "coder"), "thread": reply},
             said(13, "Thanks, closing the incident.", "human", "206"),
             {**said(14, "Confirmed green here too.", "me"), "thread": reply},
-            said(15, "Runner five is at 90% too.", "human", "210"),
+            said(15, "Runner five is at 90% too.", "coder", "210"),
             said(16, "Cleaning it after this run.", "coder", "215"),
             *(said(i, f"Shard {i}. {COALESCE_FILLER}") for i in range(17, 21)),
         ]
@@ -1293,6 +1299,45 @@ HEAD_HIT_JS = """({id, kind, tip, over}) => {
     return {problems, at: places[0]};
 }"""
 
+# `#228 reply-visible`. Where the row above (`parent`) has a circle on its corner as well as row `id`'s
+# adjacent arrow meeting it: that the arrow knows (`data-reply-hub`), that the disc keeps at least two
+# pixels clear of the head whose point `tip` the `below` or `side` check found, that a press on the
+# disc's centre is the circle's, and that the circle is on the row's left edge — centred on the corner,
+# or inside it on the agent's tile at a phone's edge — or lifted 0.7rem up it (`data-reply-lift`). With
+# no circle there, only that the arrow does not step aside for one.
+CIRCLE_BESIDE_HEAD_JS = """({id, parent, kind, tip}) => {
+    const rem = parseFloat(getComputedStyle(document.documentElement).fontSize);
+    const above = document.querySelector(`#discord-log > li[data-id="${parent}"]`);
+    const arrow = document.querySelector(`#discord-log > li[data-id="${id}"] > .reply-jump`);
+    const marker = above.querySelector(':scope > .reply-marker');
+    const hub = arrow.hasAttribute('data-reply-hub');
+    if (!marker) {
+        return {circle: false, lifted: false, problems: hub ? [`${id}'s arrow steps aside for a circle ${parent} has not`] : []};
+    }
+    const problems = [];
+    if (!hub) problems.push(`${id}'s arrow does not know ${parent} has a circle on its corner`);
+    const b = marker.getBoundingClientRect();
+    const r = parseFloat(getComputedStyle(marker, '::before').width) / 2;
+    const [cx, cy] = [b.left + b.width / 2, b.top + b.height / 2];
+    const [x, y] = tip;
+    const head = kind === 'below' ? [x - 0.5 * rem, y, x + 0.5 * rem, y + 0.6 * rem]
+        : [x - 0.6 * rem, y - 0.5 * rem, x, y + 0.5 * rem];
+    const nearX = Math.max(head[0], Math.min(cx, head[2])), nearY = Math.max(head[1], Math.min(cy, head[3]));
+    const gap = Math.hypot(cx - nearX, cy - nearY) - r;
+    if (gap < 2) problems.push(`${parent}'s circle comes within ${gap.toFixed(1)}px of ${id}'s head`);
+    const hit = document.elementFromPoint(cx, cy);
+    if (!hit || !marker.contains(hit)) problems.push(`a press on ${parent}'s circle lands on ${hit ? hit.className : 'nothing'}`);
+    const p = above.getBoundingClientRect();
+    const lifted = above.hasAttribute('data-reply-lift');
+    if (Math.abs(cx - p.left) > 1 && Math.abs(cx - (p.left + r)) > 1) {
+        problems.push(`${parent}'s circle is at x ${cx.toFixed(1)}, off its left edge at ${p.left.toFixed(1)}`);
+    }
+    if (Math.abs(cy - (p.bottom - (lifted ? 0.7 * rem : 0))) > 1) {
+        problems.push(`${parent}'s circle is at y ${cy.toFixed(1)}, not ${lifted ? 'lifted 0.7rem up from' : 'on'} its foot at ${p.bottom.toFixed(1)}`);
+    }
+    return {circle: true, lifted, problems};
+}"""
+
 # What is DRAWN, from a screenshot of the viewport (`png`, base64), against the boxes of the rows: one
 # `check` at a time, each returning `problems`, empty when it holds. Pixels, because the heads, the
 # runs and the bridge's lines are borders and pseudo-elements, which have no box of their own to ask.
@@ -1397,7 +1442,9 @@ COALESCE_LOOK_JS = """async ({png, check, id, parent, stack}) => {""" + FLOAT_HE
             }
             return {problems, tip: [tipX, tip]};
         }
-        const [top, bottom] = [Math.floor((p.bottom - 1.6 * rem) * scale), Math.ceil(p.bottom * scale)];
+        // `#228 reply-visible`. Raised where the row above has a circle on its corner as well.
+        const hub = rowOf(id).querySelector(':scope > .reply-jump').hasAttribute('data-reply-hub');
+        const [top, bottom] = [Math.floor((p.bottom - (hub ? 2.1 : 1.6) * rem) * scale), Math.ceil(p.bottom * scale)];
         const lines = [];
         let sy = 0, sw = 0;
         // The head alone: the run along to it, and the turn up into the shaft, are further left.
@@ -3435,7 +3482,14 @@ def coalesce_walk(chromium: BrowserType, args: argparse.Namespace, label: str, w
                      why: str = "") -> dict[str, object]:
                 page.evaluate(CENTRE_ROW_JS, row_id)
                 page.wait_for_timeout(120)
+                # `#228 reply-visible`. A head is found by the accent in its pixels, and a circle on
+                # the row above's corner is the accent too: photographed without it. That the two
+                # keep apart is `circle_beside`'s to say, with the circle drawn.
+                hidden = page.add_style_tag(content="#discord-log .reply-marker { visibility: hidden !important; }") \
+                    if kind in ("below", "side") else None
                 png = base64.b64encode(page.screenshot()).decode("ascii")
+                if hidden is not None:
+                    hidden.evaluate("element => element.remove()")
                 found = page.evaluate(COALESCE_LOOK_JS, {"png": png, "check": kind, "id": row_id, "parent": parent,
                                                          "stack": stack or []})
                 problems = [str(problem) for problem in found["problems"]]
@@ -3448,7 +3502,17 @@ def coalesce_walk(chromium: BrowserType, args: argparse.Namespace, label: str, w
                 hit = page.evaluate(HEAD_HIT_JS, {"id": row_id, "kind": kind, "tip": found["tip"], "over": over})
                 problems = [str(problem) for problem in hit["problems"]]
                 check(not problems, f"{label}, {why}: {problems}")
+                circle_beside(kind, row_id, parent, found["tip"], why)
                 return float(hit["at"][0]), float(hit["at"][1])
+
+            def circle_beside(kind: str, row_id: str, parent: str, tip: object, why: str) -> None:
+                """`#228 reply-visible`. A circle on the row above's corner keeps clear of the head."""
+                found = page.evaluate(CIRCLE_BESIDE_HEAD_JS, {"id": row_id, "parent": parent, "kind": kind,
+                                                              "tip": tip})
+                if found["circle"]:
+                    circles_beside.append(f"{row_id} under {parent} ({kind}{', lifted' if found['lifted'] else ''})")
+                problems = [str(problem) for problem in found["problems"]]
+                check(not problems, f"{label}, {why}: {problems}")
 
             def press(x: float, y: float, twice: bool = False) -> None:
                 if mobile:
@@ -3471,6 +3535,8 @@ def coalesce_walk(chromium: BrowserType, args: argparse.Namespace, label: str, w
                 while time.monotonic() < deadline and not page.evaluate(ready):
                     page.wait_for_timeout(50)
                 check(bool(page.evaluate(ready)), f"{label}: {why}")
+
+            circles_beside: list[str] = []
 
             def arrows(why: str, default_size: bool) -> None:
                 styles = {str(row["id"]): (row["style"], row["reach"]) for row in rows() if row["style"]}
@@ -3505,6 +3571,13 @@ def coalesce_walk(chromium: BrowserType, args: argparse.Namespace, label: str, w
             # Both arrows, at the ordinary type size and at 150%: everything in the gutter is in rem,
             # and where the head meets the row above is measured again when the type grows.
             arrows("at the default type size", True)
+            # `#228 reply-visible`. 206 and 210 are each answered from directly below and from further
+            # away, so each has a circle beside the head that meets it. On a phone 211's head comes up
+            # under the owner's inset row too near its corner for both, and the circle is lifted; on a
+            # desk it meets the row's side, raised, and the circle stays on the corner.
+            wanted_211 = "211 under 210 (below, lifted)" if mobile else "211 under 210 (side)"
+            check(wanted_211 in circles_beside and any(seen.startswith("207 under 206") for seen in circles_beside),
+                  f"{label}: the circles beside a head were not the ones this walk assumes: {circles_beside}")
             page.evaluate(CENTRE_ROW_JS, "208")
             page.wait_for_timeout(120)
             shot("1-adjacent")

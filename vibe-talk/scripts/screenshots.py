@@ -648,8 +648,9 @@ STUB_JS = r"""
     return __realFetch(input, init);
   };
 
-  // Put one message on the live stream, exactly as src/live.rs frames one.
-  window.__channelSays = (id, author, content, selfPosted) => {
+  // Put one message on the live stream, exactly as src/live.rs frames one. `replyTo`, when given,
+  // is the id of the message it answers (`#228 reply-visible`).
+  window.__channelSays = (id, author, content, selfPosted, replyTo) => {
     if (!__liveController) return false;
     const message = {
       id: String(id),
@@ -659,7 +660,7 @@ STUB_JS = r"""
       author_is_bot: false,
       timestamp: "2026-08-20T11:04:00.000Z",
       spoken_time: "07:04:00 PDT",
-      reply_to: null,
+      reply_to: replyTo ? String(replyTo) : null,
       content,
     };
     const frame =
@@ -2521,6 +2522,146 @@ def _act_resume_partial(driver: Driver) -> None:
     driver.settle()
 
 
+# `#228 reply-visible`. --fake-discord makes the tenth seeded message answer the fourth, from far
+# below it, and the sixth answer the fifth, from directly under it (src/main.rs). The scene puts a
+# second reply to the fourth on the stream.
+REPLY_MARKER_PARENT = "seeded: re-fired. Same runner, same stall."
+REPLY_MARKER_ADJACENT = "seeded: review of the retry-budget branch."
+REPLY_MARKER_FIRST_REPLY = "seeded: landed. integration is at 9c07d3e"
+REPLY_MARKER_ARRIVAL = "9990000000000000228"
+
+# A row by the words it says, asked afresh by every check: the list is drawn again as messages
+# arrive, and an id the walk gave a row would not survive that.
+REPLY_ROW_JS = (
+    "window.__replyRow = (text) => [...document.querySelectorAll('#discord-log > li')]"
+    ".find((n) => (n.textContent || '').includes(text)) || null"
+)
+
+# Where the circle on a row is, and the disc it draws: its centre, and the disc's radius, in pixels.
+REPLY_DISC_JS = (
+    "window.__replyDisc = (row) => { const m = row && row.querySelector(':scope > .reply-marker'); "
+    "if (!m) return null; const b = m.getBoundingClientRect(); "
+    "const r = parseFloat(getComputedStyle(m, '::before').width) / 2; "
+    "return { marker: m, x: b.left + b.width / 2, y: b.top + b.height / 2, r }; }"
+)
+
+
+def _act_reply_marker(driver: Driver) -> None:
+    """`#228 reply-visible`: Reply (N) on a message that has replies, and the circle on its corner.
+
+    The whole channel, then a second reply to the fourth seeded message arriving on the stream, as
+    a reply of the owner's would: the fourth's Reply reads Reply (2), and the circle on its
+    lower-left corner is the other end of the two disconnected arrows further down. The fifth,
+    answered only from directly under it, reads Reply (1), and has no circle: the arrow that rises
+    from the sixth already meets its foot. The fourth is brought up under the floating line, so the
+    three are on the screen together.
+    """
+    _act_whole_channel(driver)
+    driver.js(REPLY_ROW_JS)
+    driver.js(REPLY_DISC_JS)
+    driver.js(
+        f"window.__channelSays({json.dumps(REPLY_MARKER_ARRIVAL)}, 'claude-integ', "
+        "'confirmed: the second mac is back in the pool and the arm64 queue is draining', false, "
+        f"window.__replyRow({json.dumps(REPLY_MARKER_PARENT)}).getAttribute('data-id'))"
+    )
+    driver.page.wait_for_function(
+        f"() => {{ const row = window.__replyRow({json.dumps(REPLY_MARKER_PARENT)}); "
+        "return row && row.querySelector('.reply-button').textContent === 'Reply (2)'; }",
+        timeout=10_000,
+    )
+    driver.js(
+        f"(() => {{ const row = window.__replyRow({json.dumps(REPLY_MARKER_PARENT)}); "
+        "const area = document.getElementById('scroll-area'); "
+        "area.scrollTop += row.getBoundingClientRect().top - area.getBoundingClientRect().top - 64; "
+        "return area.scrollTop; })()"
+    )
+    # The walk's "fetching the channel…" is still on the status strip, over the rows below; the
+    # reader would tap it away, and so does this.
+    driver.js(
+        "(() => { if (window.__visible('status-line')) "
+        "document.getElementById('dismiss-status').click(); return true; })()"
+    )
+    driver.settle(300)
+
+
+def _act_reply_marker_jump(driver: Driver) -> None:
+    """`#228 reply-visible`: a real click on the circle, and where it lands.
+
+    The first tap goes to the earliest of the two replies, the seeded one, which comes to the head
+    of the list lit, as a tap on an arrow brings what it answers; the circle now says the next tap
+    goes to the second.
+    """
+    _act_reply_marker(driver)
+    driver.js(
+        f"(() => {{ const row = window.__replyRow({json.dumps(REPLY_MARKER_PARENT)}); "
+        "row.querySelector(':scope > .reply-marker').id = 'reply-marker-probe'; return true; })()"
+    )
+    driver.click("reply-marker-probe")
+    driver.page.wait_for_function(
+        f"() => {{ const row = window.__replyRow({json.dumps(REPLY_MARKER_FIRST_REPLY)}); "
+        "return row && row.getAttribute('data-landed') === 'true'; }",
+        timeout=5_000,
+    )
+    # The landing's light fades over two seconds, and a capture with animations disabled would
+    # show it already out: held at its start instead, as the reader sees it on arriving.
+    driver.js(
+        "(() => { const lit = document.getAnimations().filter((a) => a.animationName === 'reply-landed'); "
+        "lit.forEach((a) => { a.pause(); a.currentTime = 0; }); return lit.length; })()"
+    )
+    # The pointer is left where the circle was, over whatever row the jump scrolled there, which a
+    # desk would draw as hovered. Moved to the empty margin, as a hand would move on.
+    driver.page.mouse.move(2, 200)
+    driver.settle(300)
+
+
+def _act_reply_marker_beside_arrow(driver: Driver) -> None:
+    """`#228 reply-visible`: a circle and an arrow at one corner.
+
+    `42-reply-count-and-marker`'s state, then a second reply to the fifth seeded message on the stream:
+    answered from directly below and from further away, it has the head of the reply below's arrow and
+    the circle at the one corner, each keeping to its own place.
+    """
+    _act_reply_marker(driver)
+    driver.js(
+        "window.__channelSays('9990000000000000229', 'codex-review', "
+        "'and the same ordering bug is in the cache client', false, "
+        f"window.__replyRow({json.dumps(REPLY_MARKER_ADJACENT)}).getAttribute('data-id'))"
+    )
+    driver.page.wait_for_function(
+        f"() => {{ const row = window.__replyRow({json.dumps(REPLY_MARKER_ADJACENT)}); "
+        "return row && row.querySelector('.reply-button').textContent === 'Reply (2)' "
+        "&& row.querySelector(':scope > .reply-marker') !== null; }",
+        timeout=10_000,
+    )
+    driver.js(
+        f"(() => {{ const row = window.__replyRow({json.dumps(REPLY_MARKER_PARENT)}); "
+        "const area = document.getElementById('scroll-area'); "
+        "area.scrollTop += row.getBoundingClientRect().top - area.getBoundingClientRect().top - 64; "
+        "if (window.__visible('status-line')) document.getElementById('dismiss-status').click(); "
+        "return area.scrollTop; })()"
+    )
+    driver.settle(300)
+
+
+# Where the head of the arrow from the row under `parent` is, from what is drawn as elements: the
+# point and the box of the triangle, in CSS pixels. A head under the foot is centred on the shaft,
+# the span's left border; one at the side has its point on the row's left edge, raised where the
+# arrow shares the corner with a circle.
+REPLY_HEAD_JS = (
+    "window.__replyHead = (parent) => { const p = parent.getBoundingClientRect(); "
+    "const arrow = parent.nextElementSibling.querySelector(':scope > .reply-jump'); "
+    "const rem = parseFloat(getComputedStyle(document.documentElement).fontSize); "
+    "if (arrow.getAttribute('data-reply-reach') === 'side') { "
+    "const y = p.bottom - (arrow.hasAttribute('data-reply-hub') ? 1.4 : 0.9) * rem; "
+    "return { arrow, x: p.left, y, box: [p.left - 0.6 * rem, y - 0.5 * rem, p.left, y + 0.5 * rem], "
+    "press: [p.left - 0.3 * rem, y] }; } "
+    "const m = arrow.querySelector('.reply-jump-mark').getBoundingClientRect(); "
+    "const x = m.left + 0.1875 * rem / 2; "
+    "return { arrow, x, y: p.bottom, box: [x - 0.5 * rem, p.bottom, x + 0.5 * rem, p.bottom + 0.6 * rem], "
+    "press: [x, p.bottom + 0.3 * rem] }; }"
+)
+
+
 SCENES: tuple[Scene, ...] = (
     Scene(
         name="01-signed-out",
@@ -3881,6 +4022,148 @@ SCENES: tuple[Scene, ...] = (
             (
                 "no Markdown is left on screen",
                 "!/(^|\\n)- /.test(document.querySelector('#message-blocks-probe .body').innerText)",
+            ),
+        ),
+    ),
+    Scene(
+        name="42-reply-count-and-marker",
+        what="Reply (2) on a message two replies answer, and the circle on its corner that leads to them",
+        act=_act_reply_marker,
+        profiles=("android-412", "laptop-1280"),
+        expect=(
+            ("the Discord pane is up", "window.__visible('pane-discord')"),
+            (
+                "the message with two replies says so on its Reply, and in words to a screen reader",
+                f"(() => {{ const b = window.__replyRow({json.dumps(REPLY_MARKER_PARENT)})"
+                ".querySelector('.reply-button'); return b.textContent === 'Reply (2)' "
+                "&& b.getAttribute('aria-label') === 'Reply, 2 replies already'; })()",
+            ),
+            (
+                # The arrow from the reply directly under it already meets its foot: one end there.
+                "the message answered only from directly below reads Reply (1), with no circle",
+                f"(() => {{ const row = window.__replyRow({json.dumps(REPLY_MARKER_ADJACENT)}); "
+                "return row.querySelector('.reply-button').textContent === 'Reply (1)' "
+                "&& !window.__replyDisc(row); })()",
+            ),
+            (
+                "the circle is a button named for where it goes, and the whole of both rows is on screen",
+                f"(() => {{ const d = window.__replyDisc(window.__replyRow({json.dumps(REPLY_MARKER_PARENT)})); "
+                "const area = document.getElementById('scroll-area').getBoundingClientRect(); "
+                f"const rows = [{json.dumps(REPLY_MARKER_PARENT)}, {json.dumps(REPLY_MARKER_ADJACENT)}]"
+                ".map((t) => window.__replyRow(t).getBoundingClientRect()); "
+                "return d && d.marker.tagName === 'BUTTON' "
+                "&& d.marker.getAttribute('aria-label') === 'Jump to reply 1 of 2 to this message' "
+                "&& rows.every((r) => r.top >= area.top && r.bottom <= area.bottom); })()",
+            ),
+            (
+                # THE geometry claim, which only a layout engine can make. Centred on the corner of
+                # the border box, within a pixel -- or, for the agent's tile on a phone, whose corner
+                # is the edge of the screen, just inside it, its left edge on the tile's.
+                "the disc is an arrowhead wide and centred on the row's lower-left corner",
+                f"(() => {{ const row = window.__replyRow({json.dumps(REPLY_MARKER_PARENT)}); "
+                "const d = window.__replyDisc(row), r = row.getBoundingClientRect(); "
+                "const rem = parseFloat(getComputedStyle(document.documentElement).fontSize); "
+                "const edge = row.getAttribute('data-who') === 'coder' && innerWidth < 900 "
+                "&& !row.hasAttribute('data-is-reply'); "
+                "const x = edge ? r.left + d.r : r.left; "
+                "return Math.abs(d.r * 2 - 0.7 * rem) < 0.5 && Math.abs(d.x - x) <= 1 "
+                "&& Math.abs(d.y - r.bottom) <= 1; })()",
+            ),
+            (
+                "the disc is drawn in the arrow's blue",
+                f"(() => {{ const d = window.__replyDisc(window.__replyRow({json.dumps(REPLY_MARKER_PARENT)})); "
+                "const arrow = document.querySelector('#discord-log > li > .reply-jump'); "
+                "return getComputedStyle(d.marker, '::before').backgroundColor === "
+                "getComputedStyle(arrow).color; })()",
+            ),
+            (
+                # Over the row's border and its veil: what is under the disc's centre is the circle.
+                "the disc is on top of the row's border, where a press finds it",
+                f"(() => {{ const d = window.__replyDisc(window.__replyRow({json.dumps(REPLY_MARKER_PARENT)})); "
+                "const hit = document.elementFromPoint(d.x, d.y); "
+                "return hit !== null && d.marker.contains(hit); })()",
+            ),
+            (
+                "the disc covers none of the row's words, buttons or chips",
+                f"(() => {{ const row = window.__replyRow({json.dumps(REPLY_MARKER_PARENT)}); "
+                "const d = window.__replyDisc(row); "
+                "const parts = [...row.querySelectorAll('.body, .summary, .reactions, button, .chip, a')]"
+                ".filter((n) => n !== d.marker && !d.marker.contains(n) && n.getClientRects().length > 0); "
+                "return parts.length > 3 && parts.every((n) => { const b = n.getBoundingClientRect(); "
+                "if (b.width < 2 || b.height < 2) return true; "
+                "return b.right <= d.x - d.r || b.left >= d.x + d.r || "
+                "b.bottom <= d.y - d.r || b.top >= d.y + d.r; }); })()",
+            ),
+            (
+                # A label four characters longer must not push the row's controls onto a new line.
+                "Reply (2) leaves the row's controls on one line",
+                f"(() => {{ const row = window.__replyRow({json.dumps(REPLY_MARKER_PARENT)}); "
+                "const tops = [...row.querySelectorAll(':scope > .meta > button, :scope > .meta > .row-more')]"
+                ".filter((n) => n.getClientRects().length > 0).map((n) => n.getBoundingClientRect().top); "
+                "return tops.length >= 3 && Math.max(...tops) - Math.min(...tops) < 4; })()",
+            ),
+        ),
+    ),
+    Scene(
+        name="43-reply-marker-jumped",
+        what="the circle tapped: the first reply at the head of the list, lit, and the circle on to the next",
+        act=_act_reply_marker_jump,
+        # The act holds the landing's light where it starts; disabling animations would end it.
+        freeze_animations=False,
+        profiles=("android-412", "laptop-1280"),
+        expect=(
+            ("the Discord pane is up", "window.__visible('pane-discord')"),
+            (
+                "the earliest reply is lit, at the head of the list",
+                f"(() => {{ const row = window.__replyRow({json.dumps(REPLY_MARKER_FIRST_REPLY)}); "
+                "const area = document.getElementById('scroll-area').getBoundingClientRect(); "
+                "const top = row.getBoundingClientRect().top; "
+                "return row.getAttribute('data-landed') === 'true' && top >= area.top "
+                "&& top < area.top + area.height / 3; })()",
+            ),
+            (
+                "the status line says which reply it is",
+                "(window.__text('status') || '') === 'Here is reply 1 of 2 to it.'",
+            ),
+            (
+                "the circle says its next tap goes to the second",
+                f"window.__replyDisc(window.__replyRow({json.dumps(REPLY_MARKER_PARENT)})).marker"
+                ".getAttribute('aria-label') === 'Jump to reply 2 of 2 to this message'",
+            ),
+        ),
+    ),
+    Scene(
+        name="44-reply-marker-beside-arrow",
+        what="a message answered from directly below and from further away: the arrow's head and the circle at one corner, apart",
+        act=_act_reply_marker_beside_arrow,
+        profiles=("android-412", "laptop-1280"),
+        expect=(
+            ("the Discord pane is up", "window.__visible('pane-discord')"),
+            (
+                "the message answered twice reads Reply (2), with a circle, and the arrow below knows it",
+                f"(() => {{ {REPLY_HEAD_JS}; const row = window.__replyRow({json.dumps(REPLY_MARKER_ADJACENT)}); "
+                "const head = window.__replyHead(row); "
+                "return row.querySelector('.reply-button').textContent === 'Reply (2)' "
+                "&& window.__replyDisc(row) !== null "
+                "&& head.arrow.getAttribute('data-reply-style') === 'adjacent' "
+                "&& head.arrow.hasAttribute('data-reply-hub'); })()",
+            ),
+            (
+                # THE claim: two ends of two connections at one corner, neither drawn over the other.
+                "the disc keeps at least two pixels clear of the head",
+                f"(() => {{ {REPLY_HEAD_JS}; const row = window.__replyRow({json.dumps(REPLY_MARKER_ADJACENT)}); "
+                "const d = window.__replyDisc(row), h = window.__replyHead(row).box; "
+                "const nx = Math.max(h[0], Math.min(d.x, h[2])), ny = Math.max(h[1], Math.min(d.y, h[3])); "
+                "return Math.hypot(d.x - nx, d.y - ny) - d.r >= 2; })()",
+            ),
+            (
+                "a press on the disc is the circle's, and a press on the head is the arrow's",
+                f"(() => {{ {REPLY_HEAD_JS}; const row = window.__replyRow({json.dumps(REPLY_MARKER_ADJACENT)}); "
+                "const d = window.__replyDisc(row), head = window.__replyHead(row); "
+                "const onDisc = document.elementFromPoint(d.x, d.y); "
+                "const onHead = document.elementFromPoint(head.press[0], head.press[1]); "
+                "return onDisc !== null && d.marker.contains(onDisc) && onHead !== null "
+                "&& head.arrow.contains(onHead); })()",
             ),
         ),
     ),
