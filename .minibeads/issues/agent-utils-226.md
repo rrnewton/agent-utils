@@ -1,10 +1,11 @@
 ---
 title: 'page-energy-profile: profile the installed app''s CPU and memory, find hot spots, check for regressions'
-status: open
+status: closed
 priority: 2
 issue_type: task
 created_at: 2026-10-08T16:13:57.675339806+00:00
-updated_at: 2026-10-08T16:13:57.675339806+00:00
+updated_at: 2026-10-09T10:08:04.900647769+00:00
+closed_at: 2026-10-09T10:08:04.900647588+00:00
 ---
 
 # Description
