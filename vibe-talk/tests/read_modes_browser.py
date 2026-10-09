@@ -22,8 +22,11 @@ touch) and 1280x800 (a desk, mouse) the walk is:
   unfolded below in the upper half of the screen -> tap the line: the run opens where it is, the
   root unmoved, no message given the focus -> enter again and press Enter on the line: the run
   opens with the keyboard's focus on its first message -> tap the button on to Hide read and enter
-  again: the first row is the answer, unfolded, under the pill. No horizontal overflow and no page
-  error at any step.
+  again: the first row is the answer, unfolded, under the pill -> `#222 unread-replies`: pick Main,
+  still in Hide read: the owner's question, read as his own words, is kept because four of its
+  replies are unread, and says "4 unread" in the accent beside its "52 replies", on one line, over
+  the veil its read row is faded under -> tap that count: the thread opens on the answer, unfolded,
+  under the pill. No horizontal overflow and no page error at any step.
 
 Then, in a fresh profile at the same size, the thread is an OLD one: All's window holds only the
 answer and the six messages after it, and says there is more, so the thread's root precedes it.
@@ -346,6 +349,45 @@ MEASURE_JS = """({root, answer}) => {
 }"""
 
 
+# `#222 unread-replies`: Main's rows, and the root's unread count beside its N replies.
+MAIN_JS = """(root) => {
+  const rows = [...document.querySelectorAll('#discord-log > li')];
+  const row = rows.find((li) => li.dataset.id === root);
+  const box = (node) => {
+    if (!node) return null;
+    const r = node.getBoundingClientRect();
+    return {top: r.top, bottom: r.bottom, left: r.left, right: r.right, height: r.height, width: r.width};
+  };
+  const chip = row ? row.querySelector(':scope > .thread-unread') : null;
+  const replies = row ? row.querySelector(':scope > .thread-replies') : null;
+  const probe = document.createElement('span');
+  probe.style.color = 'var(--accent)';
+  document.body.append(probe);
+  const accent = getComputedStyle(probe).color;
+  probe.remove();
+  return {
+    shown: rows.filter((li) => !li.hidden && li.getBoundingClientRect().height > 0).map((li) => li.dataset.id),
+    text: chip ? chip.textContent : null,
+    label: chip ? chip.getAttribute('aria-label') : null,
+    chip: box(chip),
+    replies: box(replies),
+    row: box(row),
+    chipColor: chip ? getComputedStyle(chip).color : null,
+    chipBorder: chip ? getComputedStyle(chip).borderTopColor : null,
+    chipLayer: chip ? [getComputedStyle(chip).position, getComputedStyle(chip).zIndex, getComputedStyle(chip).filter] : null,
+    accent,
+    ownRead: row ? row.dataset.ownRead : null,
+    rowOpacity: row ? getComputedStyle(row).opacity : null,
+    veil: row ? getComputedStyle(row, '::after').backgroundColor : null,
+    chipPressable: chip ? (() => {
+      const r = chip.getBoundingClientRect();
+      return chip.contains(document.elementFromPoint(r.left + r.width / 2, r.top + r.height / 2));
+    })() : null,
+    overflow: document.scrollingElement.scrollWidth - window.innerWidth,
+  };
+}"""
+
+
 def arguments() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument(
@@ -556,6 +598,56 @@ def walk(page: Page, touch: bool, size: str, shots: Path | None, collapsed: dict
           f"{' (the list is at its end)' if m['atEnd'] else ''}")
     notes.append(f"Hide read: the thread starts at the answer, unfolded at {top:.0f}px under the pill at {floating:.0f}px")
     shot("4-hide-read-entry")
+
+    # `#222 unread-replies`: Main, still in Hide read. The owner's question is read, and kept.
+    page.select_option("#thread-select", "main")
+    page.wait_for_function(
+        f"() => !!document.querySelector('#discord-log > li[data-id=\"{ROOT_ID}\"] > .thread-unread:not([hidden])')",
+        timeout=10_000)
+    page.wait_for_timeout(300)
+    main_js: object = page.evaluate(MAIN_JS, ROOT_ID)
+    check(isinstance(main_js, dict), f"{size}: Main measured nothing: {main_js!r}")
+    assert isinstance(main_js, dict)
+    mm = {str(key): value for key, value in main_js.items()}
+    check(mm["shown"] == ["7600000000000000001", ROOT_ID],
+          f"{size}: Hide read on Main draws {mm['shown']}, not the agent's update and the kept question")
+    check(mm["text"] == "4 unread", f"{size}: the question's unread count says {mm['text']!r}")
+    check(mm["label"] == "Open this thread at its first unread reply, 4 unread replies",
+          f"{size}: the count's accessible name is {mm['label']!r}")
+    check(mm["ownRead"] == "true", f"{size}: the kept question is no longer drawn as read")
+    check(mm["veil"] not in ("rgba(0, 0, 0, 0)", "transparent"),
+          f"{size}: the kept question is not faded as a read row: {mm['veil']}")
+    check(mm["chipColor"] == mm["accent"] and mm["chipBorder"] == mm["accent"],
+          f"{size}: the count is drawn {mm['chipColor']} on {mm['chipBorder']}, not the accent {mm['accent']}")
+    check(mm["chipLayer"] == ["relative", "1", "none"],
+          f"{size}: the count is not lifted over the veil, undrained: {mm['chipLayer']}")
+    chip_box, replies_box, row_box = mm["chip"], mm["replies"], mm["row"]
+    check(isinstance(chip_box, dict) and isinstance(replies_box, dict) and isinstance(row_box, dict),
+          f"{size}: the count, N replies or the row has no box: {mm}")
+    assert isinstance(chip_box, dict) and isinstance(replies_box, dict) and isinstance(row_box, dict)
+    check(abs(chip_box["top"] - replies_box["top"]) <= 2 and chip_box["left"] >= replies_box["right"],
+          f"{size}: the count is not beside N replies on one line: {chip_box} against {replies_box}")
+    check(chip_box["right"] <= row_box["right"], f"{size}: the count runs past its row: {chip_box} in {row_box}")
+    check(mm["chipPressable"] is True, f"{size}: the middle of the count does not press it")
+    check(number(mm, "overflow") <= 0, f"{size}: Main scrolls sideways by {number(mm, 'overflow'):.0f}px")
+    notes.append(f"Main, Hide read: the read question kept, '4 unread' beside '52 replies' at {chip_box['top']:.0f}px, "
+                 f"{chip_box['width']:.0f}x{chip_box['height']:.0f}px, in the accent over the veil")
+    shot("4b-main-unread-replies")
+
+    # A real tap on the count enters the thread on its first unread reply.
+    tap(page, f'#discord-log > li[data-id="{ROOT_ID}"] > .thread-unread', touch)
+    page.wait_for_function(
+        f"() => {{ const row = document.querySelector('#discord-log > li[data-id=\"{ANSWER_ID}\"]');"
+        " return row && row.dataset.collapsed === 'false'; }", timeout=10_000)
+    page.wait_for_timeout(400)
+    m = measure(page)
+    check(m["firstShown"] == ANSWER_ID, f"{size}: the count opened the thread at {m['firstShown']}, not the answer")
+    floating = number(m, "floating")
+    top = number(m, "answer", "top")
+    check(floating <= top <= floating + 16,
+          f"{size}: the count landed the answer at {top:.0f}px, not just under the floating line at {floating:.0f}px")
+    notes.append(f"the count, tapped, opened the thread on the answer, unfolded at {top:.0f}px")
+    shot("4c-from-the-count")
     return notes
 
 

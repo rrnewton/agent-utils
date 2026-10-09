@@ -444,6 +444,9 @@ struct Journal {
     native: bool,
     state: Mutex<JournalState>,
     reads: Mutex<Vec<TimelineRequest>>,
+    /// The one conversation the channel is registered as, when it is: its Main is then that whole
+    /// conversation, and it has no child threads.
+    scope: Mutex<Option<ThreadSummary>>,
 }
 
 #[derive(Default)]
@@ -459,6 +462,7 @@ impl Journal {
             native,
             state: Mutex::new(JournalState::default()),
             reads: Mutex::new(Vec::new()),
+            scope: Mutex::new(None),
         }
     }
 
@@ -604,9 +608,11 @@ impl ChatClient for Journal {
                 all.len() > limit,
             )
         };
+        let scope = self.scope.lock().unwrap().clone();
         Ok(TimelinePage {
             messages,
-            has_threads: true,
+            has_threads: scope.is_none(),
+            thread: scope,
             has_more,
             next_before: has_more.then(|| "older".to_owned()),
             next_after: self.native.then(|| format!("fake:{}", state.revision)),
@@ -890,6 +896,147 @@ async fn a_step_back_carries_no_forward_cursor_and_a_delta_reports_only_its_own_
         delta["dismissed"],
         json!(["4"]),
         "dismissals outside the delta leaked in"
+    );
+}
+
+// --- `#222 unread-replies`: the replies' read state through Main --------------------------------
+
+async fn mark(app: &axum::Router, act: &str, ids: &[&str]) {
+    let (status, body) = call(
+        app,
+        "POST",
+        &format!("/api/v1/channels/{WRITE_CHANNEL}/{act}"),
+        Some(WRITE_TOKEN),
+        Some(json!({ "messages": ids })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{act}: {body}");
+}
+
+#[tokio::test]
+async fn main_says_which_messages_are_done_from_its_oldest_row_up_and_nothing_else_does() {
+    // Main shows a thread's root and none of its replies, so its rows' own `dismissed` cannot tell
+    // a page that a reply it holds from All was marked Done, or put back, on another device.
+    let (app, backend) = journal(true);
+    for (id, minute) in [("2", 0), ("3", 1), ("4", 2)] {
+        backend.seed(id, minute);
+    }
+    // One mark older than the page, one on it, and two on replies Main never shows.
+    mark(&app, "dismiss", &["1", "3", "5", "6"]).await;
+    let (status, main) = call(
+        &app,
+        "GET",
+        &timeline_path("view=main"),
+        Some(READ_TOKEN),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{main}");
+    assert_eq!(
+        main["dismissed"],
+        json!(["3"]),
+        "the rows' own marks changed"
+    );
+    assert_eq!(
+        main["reply_dismissals"],
+        json!({"from": "2", "messages": ["6", "5", "3"]}),
+        "not every mark from the oldest row up, newest first"
+    );
+    // Put back on another device: complete from `from` up, so its absence says so.
+    mark(&app, "restore", &["5"]).await;
+    let (_, again) = call(
+        &app,
+        "GET",
+        &timeline_path("view=main"),
+        Some(READ_TOKEN),
+        None,
+    )
+    .await;
+    assert_eq!(again["reply_dismissals"]["messages"], json!(["6", "3"]));
+    // All carries every reply as a row of its own, and a thread view every message of its thread.
+    for view in ["flat", "thread&thread_id=opaque%2Fthread-A"] {
+        let (_, other) = call(
+            &app,
+            "GET",
+            &timeline_path(&format!("view={view}")),
+            Some(READ_TOKEN),
+            None,
+        )
+        .await;
+        assert!(
+            other.get("reply_dismissals").is_none(),
+            "view={view} carried Main's list: {other}"
+        );
+    }
+    // A step back's roots are older than anything waiting; a delta's rows say it from their oldest.
+    let (_, newest) = call(
+        &app,
+        "GET",
+        &timeline_path("view=main&limit=2"),
+        Some(READ_TOKEN),
+        None,
+    )
+    .await;
+    assert_eq!(newest["reply_dismissals"]["from"], "3");
+    let cursor = next_after(&newest);
+    let (_, older) = call(
+        &app,
+        "GET",
+        &timeline_path("view=main&limit=2&before=older"),
+        Some(READ_TOKEN),
+        None,
+    )
+    .await;
+    assert!(
+        older.get("reply_dismissals").is_none(),
+        "a step back carried it: {older}"
+    );
+    backend.seed("7", 3);
+    mark(&app, "dismiss", &["8"]).await;
+    let (_, delta) = call(
+        &app,
+        "GET",
+        &timeline_path(&format!("view=main&limit=2&after={cursor}")),
+        Some(READ_TOKEN),
+        None,
+    )
+    .await;
+    assert_eq!(ids(&delta), ["7"]);
+    assert_eq!(
+        delta["reply_dismissals"],
+        json!({"from": "7", "messages": ["8"]})
+    );
+}
+
+#[tokio::test]
+async fn a_channel_scoped_to_one_conversation_has_no_replies_outside_main_to_speak_for() {
+    // Its Main is the whole conversation, replies and all, so `dismissed` already covers them.
+    let (app, backend) = journal(false);
+    backend.seed("2", 0);
+    *backend.scope.lock().unwrap() = Some(ThreadSummary {
+        id: THREAD.to_owned(),
+        root: None,
+        title: "the conversation".to_owned(),
+        reply_count: None,
+        reply_count_exact: false,
+        updated_at: "2026-10-04T07:00:00Z".to_owned(),
+        display_name: None,
+        summary: None,
+    });
+    mark(&app, "dismiss", &["2", "5"]).await;
+    let (status, main) = call(
+        &app,
+        "GET",
+        &timeline_path("view=main"),
+        Some(READ_TOKEN),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{main}");
+    assert_eq!(main["dismissed"], json!(["2"]));
+    assert!(
+        main.get("reply_dismissals").is_none(),
+        "a scoped channel carried it: {main}"
     );
 }
 

@@ -96,6 +96,17 @@ it answers. Nothing is read or archived by it. The **×** beside the line, or th
 replies**, puts them back in time order, as changing view or channel, or filtering from the search
 bar, does. **Thread(N)** opens a message's thread.
 
+**On Main, a message whose thread holds unread replies says how many.** Beside its **N replies**, a
+chip in the accent says **M unread**, and a tap on it opens the thread at the first of them. Unread is
+what the read modes call unread: not Done, not your own words, not a placeholder read automatically.
+Such a message stays in the list under **Hide read**, and is never folded into a run under **Collapse
+read**, although it is still drawn as read itself. The count follows replies as they arrive, as they
+are marked Done here or on another device — Main's own refresh says which, with no read of All or
+the thread — and as you answer in the thread, your own words counting as read. It counts the replies
+the page holds, which is everything since the oldest message **All** has loaded, and what it has read
+of threads you have opened; when a thread may have older replies the page has not seen, it says **M+
+unread**, and a thread with none it knows of unread says nothing. `#222 unread-replies`.
+
 **Reactions show under each message.** Where the chat service reports them, a message's emoji
 reactions appear as a row of small chips under its text, each the emoji and how many reacted with it
 — a chat bridge's 👀 when it has a message and ✅ once the message reached the agent, for example.
@@ -2580,13 +2591,16 @@ lines, so the row stays one row — and the tooltip says what the mode does and 
 - **Hide read**: read messages are left out, the queue it always was.
 
 What counts as read is one rule for every mode, so Collapse read collapses exactly what Hide read
-hides. The mode is kept with the rest of the UI state; a record written before the modes, which
+hides. On Main, a message whose thread holds unread replies is kept by both, as though it were unread
+itself (`#222 unread-replies`; see "A message's replies can be gathered under it" above). The mode is kept with the rest of the UI state; a record written before the modes, which
 says only whether Hide read was on, is read as Hide read or Show read.
 
 `make -C vibe-talk read-modes-browser` enters a thread with a 45-message read run in each mode in a
 real Chromium at 412x915 and 1280x800, against a loopback fake API, and checks where the first unread
-message lands and that the run's line is a 44px target a real tap opens. Pass
-`SCREENSHOTS=/tmp/shots` to keep a PNG of each step.
+message lands and that the run's line is a 44px target a real tap opens. It then picks Main under Hide
+read, where the read question is kept by its four unread replies and says **4 unread** beside **52
+replies**, on one line and in the accent, and a real tap on that count opens the thread at the first
+of them. Pass `SCREENSHOTS=/tmp/shots` to keep a PNG of each step.
 
 ### A long message can be read as a summary of itself
 

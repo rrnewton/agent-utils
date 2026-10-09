@@ -1806,13 +1806,86 @@ pub async fn dismissed_within(
     channel: &ChannelId,
     messages: &[Message],
 ) -> Result<Vec<MessageId>, OpError> {
+    let dismissed = state.store.dismissals(channel).await?;
+    Ok(dismissed_among(dismissed, messages))
+}
+
+/// The marks among `dismissed` that name one of `messages`, in `dismissed`'s order.
+fn dismissed_among(dismissed: Vec<MessageId>, messages: &[Message]) -> Vec<MessageId> {
     let present: std::collections::HashSet<&str> =
         messages.iter().map(|message| message.id.as_str()).collect();
-    let dismissed = state.store.dismissals(channel).await?;
-    Ok(dismissed
+    dismissed
         .into_iter()
         .filter(|id| present.contains(id.as_str()))
-        .collect())
+        .collect()
+}
+
+/// The most Done marks one [`crate::contract::ReplyDismissals`] carries. `#222 unread-replies`.
+///
+/// A thousand ids is about twenty kilobytes before compression, on a newest read of Main and not on
+/// a step back. Main's newest page is fifty rows; the marks from its oldest row up are what the
+/// reader dealt with since then, which is a day or two of reading in a busy channel and well under
+/// this. Past it the newest are kept and the list says where it starts, so what it does say is
+/// still complete.
+pub const MAX_REPLY_DISMISSALS: usize = 1_000;
+
+/// The read state a timeline page carries: `dismissed` for its rows, and, when `replies` is asked
+/// for, every mark from the page's oldest row up. ONE read of the store for both: it is the same
+/// list, cut two ways. `#222 unread-replies`.
+///
+/// # Errors
+///
+/// [`OpError`] when the store cannot be read.
+pub async fn timeline_read_state(
+    state: &AppState,
+    channel: &ChannelId,
+    messages: &[Message],
+    replies: bool,
+) -> Result<(Vec<MessageId>, Option<crate::contract::ReplyDismissals>), OpError> {
+    let dismissed = state.store.dismissals(channel).await?;
+    let from_up = if replies {
+        reply_dismissals(&dismissed, messages)
+    } else {
+        None
+    };
+    Ok((dismissed_among(dismissed, messages), from_up))
+}
+
+/// Every mark at or after the oldest of `messages`, newest first, capped at
+/// [`MAX_REPLY_DISMISSALS`]. `#222 unread-replies`.
+///
+/// `None` when no message has a position — an empty page, or ids that are not numbers, which the
+/// store could never have marked anyway. Each mark is ordered by its own position, not by the
+/// order the store answered in: the list is complete from `from` up only if nothing above `from`
+/// was cut, and that is a statement about positions.
+#[must_use]
+pub fn reply_dismissals(
+    dismissed: &[MessageId],
+    messages: &[Message],
+) -> Option<crate::contract::ReplyDismissals> {
+    let oldest = messages
+        .iter()
+        .filter_map(|message| message.id.numeric().map(|at| (at, &message.id)))
+        .min_by_key(|(at, _)| *at)?;
+    let mut above: Vec<(u64, &MessageId)> = dismissed
+        .iter()
+        .filter_map(|id| id.numeric().map(|at| (at, id)))
+        .filter(|(at, _)| *at >= oldest.0)
+        .collect();
+    above.sort_by_key(|(at, _)| std::cmp::Reverse(*at));
+    let from = if above.len() > MAX_REPLY_DISMISSALS {
+        above.truncate(MAX_REPLY_DISMISSALS);
+        // The oldest mark kept: everything above it is kept, so the list is complete from there.
+        above
+            .last()
+            .map_or_else(|| oldest.1.clone(), |(_, id)| (*id).clone())
+    } else {
+        oldest.1.clone()
+    };
+    Some(crate::contract::ReplyDismissals {
+        from,
+        messages: above.into_iter().map(|(_, id)| id.clone()).collect(),
+    })
 }
 
 /// What one dismissal or one restoration did.
@@ -3380,6 +3453,66 @@ mod tests {
         assert_eq!(
             error.to_string(),
             "hours must be a whole number from 1 to 168"
+        );
+    }
+
+    /// A message with only an id, which is all [`reply_dismissals`] reads of one.
+    fn positioned(id: &str) -> Message {
+        serde_json::from_value(serde_json::json!({
+            "id": id, "channel_id": WRITE_CHANNEL, "author": "agent", "author_id": "1",
+            "author_is_bot": true, "timestamp": "2026-10-08T07:00:00Z", "content": "",
+        }))
+        .expect("a message")
+    }
+
+    fn ids(raw: &[&str]) -> Vec<MessageId> {
+        raw.iter().map(|id| MessageId((*id).to_owned())).collect()
+    }
+
+    #[test]
+    fn reply_dismissals_are_every_mark_from_the_pages_oldest_row_up_by_position_newest_first() {
+        // `#222 unread-replies`. "9" is below "10" as a number and above it as a string: the cut is
+        // by number, as the store orders marks.
+        let page = [positioned("100"), positioned("10"), positioned("300")];
+        let marks = ids(&["9", "1000", "10", "250", "5"]);
+        let got = reply_dismissals(&marks, &page).expect("a page with positions");
+        assert_eq!(
+            got.from,
+            MessageId("10".to_owned()),
+            "complete from the oldest row"
+        );
+        assert_eq!(got.messages, ids(&["1000", "250", "10"]));
+    }
+
+    #[test]
+    fn reply_dismissals_past_the_cap_keep_the_newest_and_say_where_they_start() {
+        let page = [positioned("1")];
+        let marks: Vec<MessageId> = (1..=MAX_REPLY_DISMISSALS as u64 + 5)
+            .map(|n| MessageId(n.to_string()))
+            .collect();
+        let got = reply_dismissals(&marks, &page).expect("a page with positions");
+        assert_eq!(got.messages.len(), MAX_REPLY_DISMISSALS);
+        assert_eq!(
+            got.messages[0],
+            MessageId((MAX_REPLY_DISMISSALS as u64 + 5).to_string())
+        );
+        // From 6 up every mark is kept; 1 to 5 were cut, so the list no longer speaks for them.
+        assert_eq!(got.from, MessageId("6".to_owned()));
+        assert_eq!(got.messages.last(), Some(&got.from));
+    }
+
+    #[test]
+    fn reply_dismissals_say_nothing_for_a_page_without_positions() {
+        assert_eq!(reply_dismissals(&ids(&["5"]), &[]), None, "an empty page");
+        assert_eq!(
+            reply_dismissals(&ids(&["5"]), &[positioned("spaces/A/messages/x")]),
+            None,
+            "ids that are not numbers"
+        );
+        let none = reply_dismissals(&[], &[positioned("7")]).expect("a page with positions");
+        assert!(
+            none.messages.is_empty(),
+            "nothing marked is an empty list, not an absent one"
         );
     }
 }

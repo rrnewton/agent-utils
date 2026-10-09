@@ -284,13 +284,15 @@ steps:
 
   # `#221 read-modes` in the browser engine: entering a thread lands on its first unread message,
   # unfolded, under the pill, in Show read, Collapse read and Hide read, at 412x915 and 1280x800; the
-  # collapsed run's line is a 44px target a real tap opens with the reader unmoved; and an old thread,
+  # collapsed run's line is a 44px target a real tap opens with the reader unmoved; an old thread,
   # drawn from the rows All holds and read behind them, ends where one entered with every row held
-  # does, its read held at a gate the walk opens rather than for a fixed time. Measured under dagrun:
-  # 13s wall, 4.4s CPU, a 347MB peak.
+  # does, its read held at a gate the walk opens rather than for a fixed time; and, `#222
+  # unread-replies`, on Main under Hide read the read root is kept by its unread replies, says
+  # "4 unread" beside "52 replies", and a real tap on that count lands on the first of them.
+  # Measured under dagrun with the Main step: 17s wall on a host at load 320, 5.5s CPU, a 349MB peak.
   - group: check
     job: read-modes-browser
-    desc: a thread entered on its first unread, and a collapsed read run opened by a real tap, in current Chromium at 412x915 and 1280x800
+    desc: a thread entered on its first unread, a collapsed read run opened by a real tap, and Main's unread-replies count, in current Chromium at 412x915 and 1280x800
     labels: [validation-vibe-talk]
     cmd: cd vibe-talk && python3 tests/read_modes_browser.py
     jobs_flag: ""
@@ -298,7 +300,7 @@ steps:
     cpu_timeout: 45
     hint:
       resources: {browser: 1}
-      est_duration_s: 13
+      est_duration_s: 15
       classification: latency-bound
       rss_baseline_bytes: 1073741824
 

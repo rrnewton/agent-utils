@@ -890,6 +890,27 @@
       ],
       "type": "object"
     },
+    "ReplyDismissals": {
+      "description": "Every message marked Done at or after one position in a channel. `#222 unread-replies`.\n\nCOMPLETE FROM `from` UP, which is the whole of its use: a message at or after `from` that is\nnot in `messages` is not Done, so a reply put back on another device leaves the list as surely\nas one marked Done joins it. Below `from` it says nothing. A position is a message id read as a\nnumber, which every provider here orders by time, so a reply is never before its thread's root\nand every reply to a root at or after `from` is covered.\n\n`from` is the page's oldest row, raised to the oldest mark kept when more than\n[`crate::ops::MAX_REPLY_DISMISSALS`] marks lie above it: the newest are kept, because unread\nreplies are the recent ones. Ids and no text, as `dismissed` is.",
+      "properties": {
+        "from": {
+          "$ref": "#/$defs/MessageId",
+          "description": "The position the list is complete from: a message id, compared as a number."
+        },
+        "messages": {
+          "description": "Every message at or after `from` that is marked Done, newest first.",
+          "items": {
+            "$ref": "#/$defs/MessageId"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "from",
+        "messages"
+      ],
+      "type": "object"
+    },
     "ThreadSummary": {
       "description": "One thread in the thread list, independent of the underlying provider's channel model.",
       "properties": {
@@ -1072,6 +1093,17 @@
             "integer",
             "null"
           ]
+        },
+        "reply_dismissals": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ReplyDismissals"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "`#222 unread-replies`. On the newest page of Main, or a delta of it, in a channel with\nthreads: every message marked Done from a position on, the replies in Main's threads\nincluded. Absent everywhere else.\n\n`dismissed` names only the rows on the page, and Main shows a thread's root but none of its\nreplies, so without this a page in Main could not learn that a reply it holds from All was\nmarked Done, or put back, on another device. See [`ReplyDismissals`]."
         },
         "returned": {
           "description": "Entries on this page, never a channel-wide total.",

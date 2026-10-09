@@ -1346,7 +1346,16 @@ pub async fn timeline(
     // `#217 markdown-blocks`. Here and not in `ops::timeline`: this route's only reader is the
     // page, and the operation under it is shared with paths toward a model.
     crate::render::fill_page(&state.config, &channel, &mut page);
-    let dismissed = ops::dismissed_within(&state, &channel.id, &page.messages).await?;
+    // `#222 unread-replies`. Main's newest page and its deltas also say which replies in its threads
+    // are Done, which its own rows cannot: Main shows a root and none of its replies. Not on a step
+    // back, whose roots are older than anything the reader is waiting on; not in a channel scoped
+    // to one conversation, whose Main holds the replies themselves.
+    let replies = request.view == crate::threads::TimelineView::Main
+        && request.before.is_none()
+        && page.has_threads
+        && page.thread.is_none();
+    let (dismissed, reply_dismissals) =
+        ops::timeline_read_state(&state, &channel.id, &page.messages, replies).await?;
     // `#206 pin-message`. One indexed lookup on every read, delta included: this is how a refresh
     // that is happening anyway tells the page whether another device changed the pins.
     let pins_revision = ops::pins_revision(&state, &channel.id).await;
@@ -1358,6 +1367,7 @@ pub async fn timeline(
         limit,
         page,
         dismissed,
+        reply_dismissals,
         untrusted_content_notice: untrusted::NOTICE,
     })))
 }

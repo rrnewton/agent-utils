@@ -728,6 +728,32 @@ body {
   margin-top: 0.6rem;
 }
 
+/* `#222 unread-replies`. On Main, beside a root's N replies, how many of them are unread: "12 replies
+   3 unread", one line. The accent, on its edge, its tint and its words, is what the jump to the
+   newest message wears when something has arrived below — on this page that colour says "something
+   here is waiting for you". The chips' shape and size otherwise, as one of them. */
+.thread-unread {
+  display: inline-block;
+  border: 1px solid var(--accent);
+  border-radius: 1rem;
+  background: color-mix(in srgb, var(--accent) 16%, transparent);
+  color: var(--accent);
+  font-weight: 600;
+  padding: 0.2rem 0.65rem;
+  min-height: 2rem;
+  font-size: 0.85rem;
+  margin-top: 0.6rem;
+}
+
+/* N replies gives up its line to share it. */
+#discord-log li.discord-message[data-unread-replies] > .thread-replies {
+  display: inline-block;
+}
+
+.thread-replies + .thread-unread {
+  margin-inline-start: 0.4rem;
+}
+
 /* `#215 reply-coalesce`. Pressed while its replies are gathered under it, in the bridge's colour, so
    the chip that gathered them says it is the one that will put them back. */
 .thread-replies[aria-pressed="true"] {
@@ -1442,9 +1468,14 @@ body {
  * `#215 reply-coalesce`. A gathered reply is drawn the same way, whether or not it carries a reply
  * pointer — a thread's replies do not — because what is beside its box is the bridge, which must
  * not recede with it either, and the X beside the bridge.
+ *
+ * `#222 unread-replies`. So is a root on Main whose thread holds unread replies, for the chip that
+ * says so: it is inside the box, so it is lifted over the veil and left out of the drained colour
+ * (below). The root is read, and looks it; the count of what is not is not faded with it.
  */
 #discord-log li.discord-message[data-is-reply="true"][data-who],
-#discord-log li.discord-message[data-stack-under][data-who] {
+#discord-log li.discord-message[data-stack-under][data-who],
+#discord-log li.discord-message[data-unread-replies][data-who] {
   opacity: 1;
   filter: none;
   background-image: linear-gradient(rgb(128 128 128 / var(--row-grey, 0)), rgb(128 128 128 / var(--row-grey, 0)));
@@ -1452,8 +1483,17 @@ body {
 }
 
 #discord-log li.discord-message[data-is-reply="true"] > :not(.reply-jump):not(.reply-bridge):not(.reply-ungather),
-#discord-log li.discord-message[data-stack-under] > :not(.reply-jump):not(.reply-bridge):not(.reply-ungather) {
+#discord-log li.discord-message[data-stack-under] > :not(.reply-jump):not(.reply-bridge):not(.reply-ungather),
+#discord-log li.discord-message[data-unread-replies] > :not(.thread-unread):not(.reply-jump):not(.reply-bridge):not(.reply-ungather) {
   filter: var(--row-filter, none);
+}
+
+/* The unread count, over the veil and in its own colour. Weighed above the rule over a reply's
+   parts, for a root that is also a reply. */
+#discord-log li.discord-message[data-unread-replies] > .thread-unread:not(.reply-jump):not(.reply-bridge):not(.reply-ungather) {
+  position: relative;
+  z-index: 1;
+  filter: none;
 }
 
 /* Over the padding box, and over the border by a one-pixel shadow rather than a negative inset: a
@@ -1461,7 +1501,8 @@ body {
    shadow, under the veil, is the border's colour drained: the neutral edge in place of a speaker's
    tinted one, at `--row-grey`. */
 #discord-log li.discord-message[data-is-reply="true"]::after,
-#discord-log li.discord-message[data-stack-under]::after {
+#discord-log li.discord-message[data-stack-under]::after,
+#discord-log li.discord-message[data-unread-replies]::after {
   --row-veil: color-mix(in srgb, var(--bg) calc((1 - var(--row-opacity, 1)) * 100%), transparent);
   content: "";
   position: absolute;

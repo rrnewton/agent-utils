@@ -16,8 +16,8 @@ use serde_json::{json, Value};
 use vibe_talk::contract::{
     ApiErrorBody, ClientConfigResponse, CommittedPostResponse, LiveDeleteEvent, LiveDelivery,
     LiveMessageEvent, LiveResetEvent, NoiseRules, PendingPost, PendingPostResponse,
-    PinChangeResponse, PinsResponse, ProviderDescription, TimelineResponse, TokenScope,
-    TranscriptRole, VibeTalkV1ClientFrame, VibeTalkV1ServerFrame,
+    PinChangeResponse, PinsResponse, ProviderDescription, ReplyDismissals, TimelineResponse,
+    TokenScope, TranscriptRole, VibeTalkV1ClientFrame, VibeTalkV1ServerFrame,
 };
 use vibe_talk::conversation::{VoiceDescription, VoiceSession};
 use vibe_talk::model::{ChannelId, ChannelInfo, Message, MessageId, Reaction, UserId};
@@ -231,6 +231,7 @@ fn timeline(view: TimelineView, page: TimelinePage) -> TimelineResponse {
         returned: page.messages.len() + page.threads.len(),
         page,
         dismissed: vec![MessageId("150".into())],
+        reply_dismissals: None,
         pins_revision: None,
         untrusted_content_notice: "third-party text",
     }
@@ -354,18 +355,26 @@ fn samples() -> Value {
                     ..TimelinePage::default()
                 })
             }),
-            to(&timeline(TimelineView::Main, TimelinePage {
-                messages: vec![threaded.clone()],
-                has_threads: true,
-                next_after: Some("forward-2".into()),
-                delta: Some(TimelineDelta {
-                    more: false,
-                    complete: true,
-                    deleted: vec![MessageId("299".into())],
-                    removed_threads: Vec::new(),
+            // `#222 unread-replies`: Main's delta in a channel with threads says which of its
+            // threads' replies are Done, from its oldest row up.
+            to(&TimelineResponse {
+                reply_dismissals: Some(ReplyDismissals {
+                    from: MessageId("150".into()),
+                    messages: vec![MessageId("299".into()), MessageId("150".into())],
                 }),
-                ..TimelinePage::default()
-            })),
+                ..timeline(TimelineView::Main, TimelinePage {
+                    messages: vec![threaded.clone()],
+                    has_threads: true,
+                    next_after: Some("forward-2".into()),
+                    delta: Some(TimelineDelta {
+                        more: false,
+                        complete: true,
+                        deleted: vec![MessageId("299".into())],
+                        removed_threads: Vec::new(),
+                    }),
+                    ..TimelinePage::default()
+                })
+            }),
             to(&timeline(TimelineView::Threads, TimelinePage {
                 threads: vec![thread_summary(None)],
                 next_after: Some("forward-3".into()),

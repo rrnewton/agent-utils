@@ -185,6 +185,15 @@ pub struct TimelineResponse {
     pub page: crate::threads::TimelinePage,
     /// Messages on this page that the reader has archived locally.
     pub dismissed: Vec<MessageId>,
+    /// `#222 unread-replies`. On the newest page of Main, or a delta of it, in a channel with
+    /// threads: every message marked Done from a position on, the replies in Main's threads
+    /// included. Absent everywhere else.
+    ///
+    /// `dismissed` names only the rows on the page, and Main shows a thread's root but none of its
+    /// replies, so without this a page in Main could not learn that a reply it holds from All was
+    /// marked Done, or put back, on another device. See [`ReplyDismissals`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reply_dismissals: Option<ReplyDismissals>,
     /// The revision this channel's pins are at. `#206 pin-message`.
     ///
     /// On every read, newest page and delta alike, so a refresh that already happens is what tells
@@ -195,6 +204,25 @@ pub struct TimelineResponse {
     pub pins_revision: Option<i64>,
     /// Channel content remains untrusted data in every view.
     pub untrusted_content_notice: &'static str,
+}
+
+/// Every message marked Done at or after one position in a channel. `#222 unread-replies`.
+///
+/// COMPLETE FROM `from` UP, which is the whole of its use: a message at or after `from` that is
+/// not in `messages` is not Done, so a reply put back on another device leaves the list as surely
+/// as one marked Done joins it. Below `from` it says nothing. A position is a message id read as a
+/// number, which every provider here orders by time, so a reply is never before its thread's root
+/// and every reply to a root at or after `from` is covered.
+///
+/// `from` is the page's oldest row, raised to the oldest mark kept when more than
+/// [`crate::ops::MAX_REPLY_DISMISSALS`] marks lie above it: the newest are kept, because unread
+/// replies are the recent ones. Ids and no text, as `dismissed` is.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, JsonSchema)]
+pub struct ReplyDismissals {
+    /// The position the list is complete from: a message id, compared as a number.
+    pub from: MessageId,
+    /// Every message at or after `from` that is marked Done, newest first.
+    pub messages: Vec<MessageId>,
 }
 
 /// One channel's pins: `GET /api/v1/channels/{id}/pins`. `#206 pin-message`.

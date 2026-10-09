@@ -6876,6 +6876,8 @@ function foldTimelinePage(payload, older, view = channelView, thread = selectedT
   for (const summary of [...(payload.threads || []), payload.thread]) {
     if (summary && summary.root) channelCanon.unplaced.delete(String(summary.root.id));
   }
+  // ...and read state too. `#222 unread-replies`.
+  foldReadState(payload, view);
 }
 
 /**
@@ -6923,6 +6925,7 @@ function foldTimelineDelta(payload, sent, view = channelView, thread = selectedT
       [...channelCanon.messages.filter((held) => !ids.has(String(held.id))), ...arriving], "timestamp");
     for (const id of ids) channelCanon.unplaced.delete(id);
   }
+  foldReadState(payload, view);
   for (const summary of payload.threads || []) upsertThreadSummary(summary);
   const removed = new Set((delta.removed_threads || []).map(String));
   if (removed.size) channelCanon.threads = channelCanon.threads.filter((held) => !removed.has(String(held.id)));
@@ -8202,7 +8205,10 @@ async function changeChannelView(view, threadId = null, summary = null) {
     restoreScroll(held.position);
     if (keepPlace) keepReaderPlace(place);
     catchUpHeldView();
+    // What was read, dealt with or answered elsewhere since the held rows were drawn: in a thread
+    // just left, above all, whose replies Main's chips count (`#222 unread-replies`).
     if (held.readMode !== readMode) renderCachedTimeline();
+    else syncUnreadReplies();
     renderChannelFreshness();
     payThreadEntry();
     // Switching back to a view already fetched in this page is a local
@@ -8364,7 +8370,8 @@ function catchUpFromAll() {
   const area = el("scroll-area");
   const position = channelReadPosition(area);
   if (catchUpHeldView()) {
-    settleAfterRead(timelineMessages.filter((message) => !todoMode || stillToDo(message)),
+    const keeps = readFilterKeeps();
+    settleAfterRead(timelineMessages.filter((message) => !todoMode || keeps(message)),
       { keepPosition: true, area, ...position });
   }
   renderChannelFreshness();
@@ -9135,12 +9142,8 @@ function addThreadDecoration(meta, message, row, everyThread = false) {
   badge.addEventListener("click", () => guardQuietly(() => openThread(id))());
   meta.append(badge);
   if (message.thread.is_root) {
-    // The root's own count, as it always was, unless it has none to give: then the summary's. A
-    // thread with no replies gets no chip at all — "0 replies" offered to gather nothing.
-    const own = message.thread;
-    const { count, exact } = typeof own.reply_count === "number" && own.reply_count > 0
-      ? { count: own.reply_count, exact: own.reply_count_exact }
-      : threadReplies(id, message);
+    // A thread with no replies gets no chip at all — "0 replies" offered to gather nothing.
+    const { count, exact } = gatherCount(id, message);
     if (count === 0) return;
     // `#215 reply-coalesce`. NOT the way into the thread any more — the badge above is, and the two
     // said the same thing. It gathers the thread's replies under this message in All, and while
@@ -9155,6 +9158,249 @@ function addThreadDecoration(meta, message, row, everyThread = false) {
     gather.addEventListener("click", () => guardQuietly(() => toggleGathered(String(message.id), row))());
     row.append(gather);
   }
+}
+
+/**
+ * The count a root's N replies chip gives: the root's own, as it always was, unless it has none to
+ * give: then the summary's. With `held`, never fewer than the replies the store holds — a reply that
+ * came in on the stream is one more than the count the root was last read with (`#222
+ * unread-replies`), and "1 reply" over two would read as a broken count.
+ */
+function gatherCount(id, message, held = 0) {
+  const own = message.thread;
+  const { count, exact } = typeof own.reply_count === "number" && own.reply_count > 0
+    ? { count: own.reply_count, exact: own.reply_count_exact }
+    : threadReplies(id, message);
+  return typeof count === "number" ? { count: Math.max(count, held), exact } : { count: held || null, exact: true };
+}
+
+// --- unread replies, on Main ----------------------------------------------------------------------
+//
+// `#222 unread-replies`. The owner, 2026-10-08: replying marks a message read, and his own messages
+// count as read automatically, so in Main his last messages — each answered by an agent in a thread —
+// vanished under Hide read although the agents' replies were unread. He treats the channel as an
+// inbox. So on Main a root whose thread holds unread replies says how many, in a chip beside its N
+// replies — "12 replies  3 unread", his "N replies, M unread" — and the read filters keep that root:
+// Hide read leaves it in the list and Collapse read never folds it into a run. The root itself is
+// still drawn as read; the chip is drawn at full strength over it (web/voice.css), so the cue is not
+// faded with the root it is on.
+//
+// A CHIP OF ITS OWN, and a tap on it enters the thread, which lands on its first unread message
+// (`#221 read-modes`): the count of what is waiting is the way to the first of it. Not more words on
+// N replies, which in Main opens All to gather the replies — and under Hide read All leaves the read
+// root out, with them. Nor on Thread(N), the way in that every row has: in the meta line of a phone
+// "Thread(12) · 3 unread" wrapped the row's controls onto a second line, the ⋯ at its start,
+// measured at 412px on exactly the rows this is for — the owner's own messages, inset from the
+// edge. The line N replies is on has the room. Nothing is drawn when nothing is unread.
+//
+// UNREAD is `stillToDo`'s rule, the one both read modes use: not Done, not the reader's own words,
+// not noise. FROM THE REPLIES THE STORE HOLDS, with the store's read state, because Main draws no
+// reply and its rows' `dismissed` says nothing about one. The replies come from All's pages — Main is
+// drawn from All's cover (`#220 view-switch-instant`) — the thread's own, and the stream. Their read
+// state comes from those pages (`foldReadState`), from Done here (`markHeldDone`), and from Main's own
+// reads, which carry every mark from their oldest row up (`reply_dismissals`): a reply dealt with or
+// put back on another device is known at Main's next read, without reading All or the thread.
+// Counting on the server would read every thread on Main's page from the chat service on every read
+// of Main; the store already holds what is recent, and nothing here adds a read.
+//
+// WHAT IS NOT HELD IS NOT COUNTED. All covers the channel from its floor up, so every reply newer
+// than that is held; one older, in a thread neither All nor its own read reaches back through, may be
+// unread and is not known to be. That thread's count is a floor, "3+ unread"; one holding no unread
+// reply it knows of says nothing, and its root is read like any other.
+//
+// ONLY ON MAIN. In All and in a thread the replies are rows of the list, and speak for themselves.
+
+/**
+ * Each thread's replies the store holds, by thread id: how many, and how many are unread. One walk
+ * over the store, for a pass over the rows that asks after every thread on screen.
+ *
+ * @returns {Map<string, {held: number, unread: number}>}
+ */
+function replyTally() {
+  /** @type {Map<string, {held: number, unread: number}>} */
+  const tally = new Map();
+  if (!threadingSupported || channelCanon.channel !== String(el("discord-channel").value)) return tally;
+  for (const message of channelCanon.messages) {
+    const id = threadOf(message);
+    if (!id || message.thread.is_root === true || id === channelCanon.scope) continue;
+    const entry = tally.get(id) || { held: 0, unread: 0 };
+    entry.held += 1;
+    if (stillToDo(message, channelCanon.dismissed)) entry.unread += 1;
+    tally.set(id, entry);
+  }
+  return tally;
+}
+
+/** The thread `message` heads, when it is a root Main shows and the channel is not that thread, or null. */
+function rootThreadOf(message) {
+  const record = threadOf(message) ? message.thread : heldThreadRecord(message);
+  return record && record.is_root === true && String(record.id) !== String(channelCanon.scope)
+    ? String(record.id) : null;
+}
+
+/**
+ * Whether thread `id` may have replies the store does not hold, holding `held`: then what is counted
+ * of it is a floor. Not when the store holds as many as the provider's exact count, nor when the
+ * thread's own read or All's reaches back to where it starts.
+ */
+function repliesPartlyHeld(id, message, held) {
+  const { count, exact } = threadReplies(id, message);
+  if (typeof count === "number" && exact !== false && held >= count) return false;
+  const own = channelCanon.views.get(viewKey("thread", id));
+  if (own && !own.more) return false;
+  return !allReachesThread(id, null);
+}
+
+/**
+ * Whether `message` is a root on Main whose thread holds an unread reply, by `tally`. Outside Main
+ * nothing is: there the replies are rows of the list.
+ */
+function holdsUnreadReplies(message, tally) {
+  const id = channelView === "main" ? rootThreadOf(message) : null;
+  const entry = id === null ? undefined : tally.get(id);
+  return entry !== undefined && entry.unread > 0;
+}
+
+/**
+ * What the read filters keep: an unread message, and on Main a root whose thread holds an unread
+ * reply as well (`holdsUnreadReplies`). Hide read draws exactly these; Collapse read folds every row
+ * but these (`applyReadRuns`, by the attribute the pass over the rows sets from the same rule).
+ *
+ * @returns {(message: any) => boolean}
+ */
+function readFilterKeeps() {
+  const tally = threadingSupported && channelView === "main" ? replyTally() : null;
+  return (message) => stillToDo(message) || (tally !== null && holdsUnreadReplies(message, tally));
+}
+
+/**
+ * The thread chip and N replies on one row, from `tally`, with counts never below the replies held;
+ * and on a root in Main's list the count of its unread replies, in a chip of its own beside N replies.
+ * Called by every pass over the rows, which follows every redraw, so the counts follow arrivals, reads
+ * and Done wherever they happen. Written only when they change: this runs with every pass.
+ */
+function drawThreadChips(row, tally, inMain) {
+  const badge = childByClass(row, "thread-badge");
+  if (!badge) return;
+  const message = rowMessages(row)[0];
+  const id = message ? threadOf(message) : null;
+  if (!id) return;
+  const entry = tally.get(id) || { held: 0, unread: 0 };
+  const reported = threadReplyCount(id, message);
+  const replies = typeof reported === "number" ? Math.max(reported, entry.held) : entry.held;
+  const text = replies ? `Thread(${replies})` : "Thread";
+  if (badge.textContent !== text) {
+    badge.textContent = text;
+    if (replies) badge.setAttribute("aria-label", `Open this thread, ${threadCount(replies, true)}`);
+    else badge.removeAttribute("aria-label");
+  }
+  const gather = childByClass(row, "thread-replies");
+  if (gather && message.thread && message.thread.is_root) {
+    const { count, exact } = gatherCount(id, message, entry.held);
+    const words = threadCount(count, exact);
+    if (gather.textContent !== words) gather.textContent = words;
+  }
+  const unread = inMain && rootThreadOf(message) === id ? entry.unread : 0;
+  let chip = childByClass(row, "thread-unread");
+  if (unread === 0) {
+    if (row.hasAttribute("data-unread-replies")) row.removeAttribute("data-unread-replies");
+    if (chip && !chip.hidden) chip.hidden = true;
+    return;
+  }
+  row.setAttribute("data-unread-replies", String(unread));
+  if (!chip) {
+    chip = document.createElement("button");
+    chip.className = "thread-unread";
+    chip.setAttribute("type", "button");
+    chip.setAttribute("title", "Open this thread at its first unread reply");
+    chip.style.setProperty("--thread-hue", threadHue(id));
+    chip.addEventListener("click", () => guardQuietly(() => openThread(id))());
+    // After N replies, the last thing on the row, so the two read as one line: "12 replies  3 unread".
+    row.append(chip);
+  }
+  const floor = repliesPartlyHeld(id, message, entry.held);
+  const words = `${unread}${floor ? "+" : ""} unread`;
+  if (chip.textContent !== words) {
+    chip.textContent = words;
+    // In words: "3+" is a glyph, which a screen reader reads as "three plus".
+    chip.setAttribute("aria-label", `Open this thread at its first unread reply, ${floor ? "at least " : ""}` +
+      `${unread} unread ${unread === 1 ? "reply" : "replies"}`);
+  }
+  if (chip.hidden) chip.hidden = false;
+}
+
+/**
+ * Bring Main up to date with its threads' replies after something changed them that redrew no row:
+ * a reply arriving, a read of All or of a thread landing behind Main, or coming back to Main held
+ * from earlier. Under Hide read a root may have to come back or go, which is a redraw; otherwise the
+ * pass over the rows redraws the chips and decides the runs again.
+ */
+function syncUnreadReplies() {
+  if (!threadingSupported || channelView !== "main" || channelCanon.channel !== String(el("discord-channel").value)) return;
+  if (todoMode) {
+    const keeps = readFilterKeeps();
+    const wanted = timelineMessages.filter(keeps).map((message) => String(message.id)).sort().join(" ");
+    const drawn = [...el("discord-log").children].flatMap(idsOf).sort().join(" ");
+    if (wanted !== drawn) {
+      renderCachedTimeline();
+      return;
+    }
+  }
+  renderChannelRows();
+}
+
+/**
+ * Whether message id `id` is at or after position `from`. Both are ids in the order the server keeps
+ * them in, decimal numbers of any length (`MessageId::numeric`): longer is later, and at one length
+ * the text compares as the number does. False for anything that is not such a number.
+ */
+function atOrAfter(id, from) {
+  if (!/^[0-9]+$/.test(id) || !/^[0-9]+$/.test(from)) return false;
+  const [a, b] = [id.replace(/^0+(?=.)/, ""), from.replace(/^0+(?=.)/, "")];
+  return a.length !== b.length ? a.length > b.length : a >= b;
+}
+
+/**
+ * What a page says about read state, into the store. `#222 unread-replies`.
+ *
+ * A page is the server's answer for every message on it, Done or not, whichever view it was read for
+ * — so a read of All landing while the reader is in Main still tells the store which replies are
+ * Done. Main's newest page and its deltas say more (`reply_dismissals`): every mark from a position
+ * up, complete there, so every message the store holds from that position is Done exactly when it is
+ * named, the replies Main never draws among them.
+ */
+function foldReadState(payload, view) {
+  const done = new Set((payload.dismissed || []).map(String));
+  for (const message of payload.messages || []) {
+    const id = String(message.id);
+    if (done.has(id)) channelCanon.dismissed.add(id);
+    else channelCanon.dismissed.delete(id);
+  }
+  const marks = payload.reply_dismissals;
+  if (view !== "main" || !marks) return;
+  const named = new Set(marks.messages.map(String));
+  const from = String(marks.from);
+  for (const message of channelCanon.messages) {
+    const id = String(message.id);
+    if (!atOrAfter(id, from)) continue;
+    if (named.has(id)) channelCanon.dismissed.add(id);
+    else channelCanon.dismissed.delete(id);
+  }
+}
+
+/**
+ * Done, or put back, here: the store's read state for `ids` follows at once, as `archivedIds` does,
+ * so a reply dealt with from All, a thread or the Pinned list counts as read on Main straight away.
+ * Answers the state before, to put back if the write fails, or null where there is no store.
+ */
+function markHeldDone(ids, done) {
+  if (!threadingSupported || channelCanon.channel !== String(el("discord-channel").value)) return null;
+  const before = new Set(channelCanon.dismissed);
+  for (const id of ids) {
+    if (done) channelCanon.dismissed.add(String(id));
+    else channelCanon.dismissed.delete(String(id));
+  }
+  return before;
 }
 
 function timelinePath(before = null, after = null) {
@@ -9204,7 +9450,8 @@ function applyTimelinePage(payload, older = false, saved = false, delta = false,
   channelHasThreads = payload.has_threads === true || channelView === "thread";
   if (payload.thread) selectedThread = payload.thread;
   noteArchived(payload, !delta && !older && merged.length <= incoming.length);
-  const shown = timelineMessages.filter((message) => !todoMode || stillToDo(message));
+  const keeps = readFilterKeeps();
+  const shown = timelineMessages.filter((message) => !todoMode || keeps(message));
   if (older) {
     // Keep existing elements attached to the same messages: scroll restoration holds one of
     // those elements as its anchor, and recreating it would throw away the reader's position.
@@ -9262,7 +9509,8 @@ function holdingMessage(mutate) {
 /** Re-project the already fetched timeline after a local preference or archive change. */
 function renderCachedTimeline() {
   if (!threadingSupported || channelView === "threads") return;
-  const shown = timelineMessages.filter((message) => !todoMode || stillToDo(message));
+  const keeps = readFilterKeeps();
+  const shown = timelineMessages.filter((message) => !todoMode || keeps(message));
   const redraw = () => {
     el("discord-log").replaceChildren(...glom(shown).map(discordNode));
     renderChannelRows();
@@ -9472,6 +9720,8 @@ async function loadTimeline(options) {
           } else if (view === "flat") {
             catchUpFromAll();
           }
+          // A read of All or of a thread brings replies, and their read state, that Main counts.
+          syncUnreadReplies();
           saveChannelScope();
           return;
         }
@@ -9584,6 +9834,8 @@ function foldLateTimelinePage(payload, read) {
     // All's page answers for Main, and for a thread drawn from All, now on screen.
     catchUpFromAll();
   }
+  // A read of All or of a thread brings replies, and their read state, that Main counts.
+  syncUnreadReplies();
   saveChannelScope();
 }
 
@@ -11035,8 +11287,12 @@ function renderChannelRows() {
   // row that ends up carrying the marker is the one this pass draws it on rather than the one the
   // previous pass did.
   advanceMarkerPastRead();
+  // `#222 unread-replies`. The replies the store holds, counted once for every row's thread chip.
+  const tally = threadingSupported ? replyTally() : new Map();
+  const mainList = new Set(rows);
   for (const row of [...rows, ...el("pinned-log").children]) {
     const id = row.getAttribute("data-id") || "";
+    drawThreadChips(row, tally, channelView === "main" && mainList.has(row));
     // Every message the row stands for. One of them on an ordinary row; see the combining note.
     const ids = idsOf(row);
     // DIMS, never hides. See the note at the head of this section: this is derived from what
@@ -12437,9 +12693,12 @@ function isNoise(message) {
  * and not the reader's own words when they have said those are read. And for what Collapse read
  * collapses and what entering a thread lands on (`#221 read-modes`, `rowIsRead`): a refinement of
  * what counts as unread belongs here, and reaches every read mode at once.
+ *
+ * `done` is the read state asked: the marks for the rows on screen by default, and the store's for
+ * a reply Main does not draw (`#222 unread-replies`, `replyTally`).
  */
-function stillToDo(message) {
-  return !archivedIds.has(String(message.id)) && !isNoise(message) &&
+function stillToDo(message, done = archivedIds) {
+  return !done.has(String(message.id)) && !isNoise(message) &&
     (!markOwnRead || bucketFor(message.author_id, message.author_is_bot, messageChannel(message)) !== "me");
 }
 
@@ -15454,8 +15713,10 @@ function applyReadRuns() {
     rows.forEach((row, index) => {
       // Nor a row of replies the reader gathered under their message (`#215 reply-coalesce`): they
       // were gathered to be read together, and a line in the stack would break the bridge.
+      // Nor a root on Main whose thread holds an unread reply (`#222 unread-replies`): Hide read
+      // keeps it, so Collapse read does, by the attribute the pass has just set from the same rule.
       if (index < rows.length - 1 && rowIsRead(row) && !isOpenThreadRoot(row, rootId) &&
-          !row.hasAttribute("data-coalesce")) {
+          !row.hasAttribute("data-coalesce") && !row.hasAttribute("data-unread-replies")) {
         run.push(row);
       } else {
         close();
@@ -15751,7 +16012,9 @@ function appendChannelRow(arriving, live = false) {
     if (channelView === "threads" ||
         (channelView === "thread" && id !== selectedThreadId) ||
         (channelView === "main" && !inView(message, "main", null))) {
-      // Not this view's row, but the store has it, and so will the next start.
+      // Not this view's row, but the store has it, and so will the next start. On Main a reply is
+      // one more to count on its root's chip, and may bring the root back under Hide read.
+      syncUnreadReplies();
       saveChannelScope();
       return;
     }
@@ -15897,6 +16160,7 @@ async function dismissMessages(body) {
   for (const id of requested) {
     archivedIds.add(id);
   }
+  const held = markHeldDone(requested, true);
   await refreshAfterInboxChange();
   renderTodoControls();
   setStatus(`Saving ${requested.length} local change${requested.length === 1 ? "" : "s"}…`);
@@ -15921,6 +16185,7 @@ async function dismissMessages(body) {
     });
   } catch (error) {
     archivedIds = previous;
+    if (held) channelCanon.dismissed = held;
     lastDismissal = previousDismissal;
     await refreshAfterInboxChange();
     renderTodoControls();
@@ -15969,6 +16234,7 @@ async function restoreMessages(ids) {
   for (const id of restored) {
     archivedIds.delete(id);
   }
+  const held = markHeldDone(restored, false);
   if (lastDismissal !== null) {
     const left = lastDismissal.messages.filter((id) => !restored.includes(id));
     lastDismissal = left.length === 0 ? null : { ...lastDismissal, messages: left };
@@ -15986,6 +16252,7 @@ async function restoreMessages(ids) {
     }
   } catch (error) {
     archivedIds = previous;
+    if (held) channelCanon.dismissed = held;
     lastDismissal = previousDismissal;
     await refreshAfterInboxChange();
     renderTodoControls();
