@@ -413,6 +413,21 @@ occupant.
 Also: a verified submission the target never shows is now quarantined; a native prompt that is
 not seen still needs Herdr's working-state confirmation and is logged as not seen.
 
+## I. Stage 1 (2026-10-08): detection and quarantine only
+
+After four review rounds the automatic countermand is split out. Stage 1 lands detection and
+quarantine; the countermand stays in the code behind `AGENTCTL_MISROUTE_COUNTERMAND=1`, off by
+default, and stage 2 (a separate series with its own review) makes it safe: each candidate
+peer's occupant captured before the send and carried through the lock (round-4 B1), a latched
+post-note mismatch and submitted-note evidence (B2), all ambiguity rejected before any
+countermand (H4).
+
+| Round-4 finding | Stage 1 |
+|---|---|
+| B3 delivered not occupant-bound | Every delivered result needs target evidence (printed receipt or a new occurrence in the target's scrollback) and a passing recipient check. A prompt the target never shows is quarantined on every path, native prompts included (Herdr's working event alone no longer counts); relay submissions go through the same read-back; a Rust receipt counts only when printed |
+| H5 indistinguishable windows | A pane that already showed the text and whose 400-line window is full is uncertain unless the count rose, so the message is quarantined. A window that never filled cannot have lost an occurrence |
+| Countermand reachable by default | Off unless `AGENTCTL_MISROUTE_COUNTERMAND=1`; with it off a misroute is logged and quarantined and nothing is typed into any pane |
+
 ## C. What was built and how it was verified (2026-10-08)
 
 Both editions, one commit on the agent-utils branch:
