@@ -1339,6 +1339,28 @@ def _lock_target(
     return lock
 
 
+def _lock_target_within(name: str, purpose: str, seconds: float) -> _TargetLock:
+    """Lock one target like ``_lock_target``, giving up after ``seconds`` instead of waiting.
+
+    Used where the caller already holds another target lock, so it can never deadlock.
+    """
+    deadline = time.monotonic() + seconds
+
+    def wait(descriptor: int, _path: str) -> None:
+        while True:
+            try:
+                fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                return
+            except BlockingIOError:
+                if time.monotonic() >= deadline:
+                    raise AgentDeliveryError(
+                        f"{purpose} for {name} is held by another sender"
+                    ) from None
+                time.sleep(0.05)
+
+    return _lock_target(name, purpose, wait)
+
+
 def _lock_current_file(
     path: str,
     purpose: str,

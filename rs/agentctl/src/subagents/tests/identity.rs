@@ -1004,3 +1004,153 @@ fn the_countermand_stops_when_the_occupant_changes_after_the_interrupt() {
         true
     );
 }
+
+fn add_bystander(fixture: &Fixture) {
+    fixture
+        .client
+        .panes
+        .lock()
+        .unwrap()
+        .push(Fake::pane("peer"));
+    let mut other = record(fixture, "worker");
+    other["name"] = json!("bystander");
+    other["token"] = json!("bystander-generation");
+    other["pane_id"] = json!("peer");
+    other["terminal_id"] = json!("term-peer");
+    write_record(fixture, "bystander", &other);
+}
+
+const LONG: &str = "a long enough instruction for the worker only";
+
+#[test]
+fn a_note_that_never_shows_in_the_wrong_pane_is_not_a_recovery() {
+    TEST_READBACK.with(|limit| limit.set(Some(Duration::ZERO)));
+    let fixture = Fixture::new();
+    fixture.start(None);
+    fixture.client.drop_note.store(true, Ordering::SeqCst);
+    fixture
+        .client
+        .replace_harness_before_effect
+        .store(true, Ordering::SeqCst);
+    let error = send(&fixture, "worker", LONG).expect_err("quarantined");
+    assert_eq!(
+        error.outcome(),
+        Some(agent::QueueOutcome::PossiblySubmitted),
+        "{error}"
+    );
+    assert!(
+        error.to_string().contains("recipient is unproven"),
+        "{error}"
+    );
+    let entries = misroutes(&fixture, "worker");
+    assert_eq!(entries[0]["note_sent"], true);
+    assert_eq!(entries[0]["note_confirmed"], false);
+}
+
+#[test]
+fn a_countermand_needs_the_wrong_panes_input_lock() {
+    TEST_COUNTERMAND_LOCK.with(|limit| limit.set(Some(Duration::from_millis(50))));
+    TEST_READBACK.with(|limit| limit.set(Some(Duration::ZERO)));
+    let fixture = Fixture::new();
+    fixture.start(None);
+    add_bystander(&fixture);
+    fixture
+        .client
+        .redirect_once
+        .lock()
+        .unwrap()
+        .insert("owned".to_owned(), "peer".to_owned());
+    let held = agent::lock_target("peer", "another sender").unwrap();
+    let error = send(&fixture, "worker", LONG).expect_err("quarantined");
+    drop(held);
+    assert_eq!(
+        error.outcome(),
+        Some(agent::QueueOutcome::PossiblySubmitted),
+        "{error}"
+    );
+    assert!(
+        error.to_string().contains("held by another sender"),
+        "{error}"
+    );
+    assert!(fixture.client.keys_sent.lock().unwrap().is_empty());
+}
+
+#[test]
+fn a_peer_window_moving_past_an_old_match_is_uncertain() {
+    let fixture = Fixture::new();
+    fixture.start(None);
+    add_bystander(&fixture);
+    fixture.client.scrollback.lock().unwrap().insert(
+        "peer".to_owned(),
+        vec![LONG.to_owned(), "output after the old match".to_owned()],
+    );
+    *fixture.client.scrollback_on_effect.lock().unwrap() = Some((
+        "peer".to_owned(),
+        vec!["output after the old match".to_owned(), LONG.to_owned()],
+    ));
+    let error = send(&fixture, "worker", LONG).expect_err("quarantined");
+    assert!(
+        error.to_string().contains("cannot be attributed"),
+        "{error}"
+    );
+    assert!(fixture.client.keys_sent.lock().unwrap().is_empty());
+}
+
+#[test]
+fn a_prompt_new_in_target_and_peer_is_quarantined_without_a_note() {
+    let fixture = Fixture::new();
+    fixture.start(None);
+    add_bystander(&fixture);
+    *fixture.client.scrollback_on_effect.lock().unwrap() =
+        Some(("peer".to_owned(), vec![LONG.to_owned()]));
+    let error = send(&fixture, "worker", LONG).expect_err("quarantined");
+    assert!(
+        error.to_string().contains("cannot be attributed"),
+        "{error}"
+    );
+    assert!(fixture.client.keys_sent.lock().unwrap().is_empty());
+    assert!(!runs(&fixture).contains(&MISROUTE_NOTE.to_owned()));
+}
+
+#[test]
+fn an_anchor_from_an_earlier_rule_does_not_count() {
+    let fixture = Fixture::new();
+    fixture.start(None);
+    let mut document = record(&fixture, "worker");
+    document["anchor_rule"] = Value::Null;
+    document["session_agent"] = Value::Null;
+    document["session_value"] = Value::Null;
+    write_record(&fixture, "worker", &document);
+    fixture.client.report_session.store(false, Ordering::SeqCst);
+    let error = send(&fixture, "worker", "held until re-anchored").expect_err("unanchored");
+    assert_eq!(
+        error.outcome(),
+        Some(agent::QueueOutcome::Pending),
+        "{error}"
+    );
+    assert!(
+        error.to_string().contains("agentctl anchor worker"),
+        "{error}"
+    );
+}
+
+#[test]
+fn a_snapshot_failure_before_any_write_leaves_the_message_pending() {
+    let fixture = Fixture::new();
+    fixture.start(None);
+    add_bystander(&fixture);
+    *fixture.client.fail_scrollback.lock().unwrap() = Some("peer".to_owned());
+    let error = send(&fixture, "worker", LONG).expect_err("pending");
+    assert_eq!(
+        error.outcome(),
+        Some(agent::QueueOutcome::Pending),
+        "{error}"
+    );
+    assert!(
+        error
+            .to_string()
+            .contains("cannot read scrollback before sending"),
+        "{error}"
+    );
+    assert!(failed_documents(&fixture, "worker").is_empty());
+}

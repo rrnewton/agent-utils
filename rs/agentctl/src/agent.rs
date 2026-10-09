@@ -2026,6 +2026,31 @@ fn refresh_lock_files(directory: &Path) {
     }
 }
 
+/// Lock one target like [`lock_target`], giving up after `within` instead of waiting.
+///
+/// Used where the caller already holds another target lock, so it can never deadlock.
+pub(crate) fn lock_target_within(
+    name: &str,
+    purpose: &str,
+    within: Duration,
+) -> AgentResult<TargetLock> {
+    let deadline = Instant::now() + within;
+    lock_target_with(name, purpose, |file, path| loop {
+        match FileExt::try_lock_exclusive(file) {
+            Ok(()) => return Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                if Instant::now() >= deadline {
+                    return Err(AgentError::delivery(format!(
+                        "{purpose} for {name} is held by another sender"
+                    )));
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            Err(error) => return Err(io_error(&format!("lock {purpose}"), path, error)),
+        }
+    })
+}
+
 /// Lock one target name, blocking until every holder releases it.
 pub(crate) fn lock_target(name: &str, purpose: &str) -> AgentResult<TargetLock> {
     lock_target_with(name, purpose, |file, path| {

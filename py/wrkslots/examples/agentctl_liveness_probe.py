@@ -8,8 +8,8 @@ line naming ``agent=AGENT`` and ``rc=1``, so every outcome prints exactly one su
 The registry is ``$AGENTCTL_REGISTRY`` when set, else ``$WRKSLOTS_PROJECT_ROOT/.agentctl``: the
 registry a coordinator gets by running agentctl from the project root.
 
-A record matches AGENT when its ``name`` is AGENT or its ``name_history`` (written by
-``agentctl rename``) contains AGENT, so a renamed agent is still found under the name the slot
+A record matches AGENT when its ``name`` is AGENT or its ``name_history`` or
+``former_names`` (written by ``agentctl rename``) contains AGENT, so a renamed agent is still found under the name the slot
 recorded. A later agent that reuses the name also matches; any live match counts, which errs
 toward keeping the slot.
 
@@ -142,6 +142,10 @@ def names_of(record: dict[str, object]) -> set[str]:
         if not isinstance(entry, dict) or not isinstance(entry.get("name"), str):
             raise Unverifiable("name_history entry has no name")
         names.add(entry["name"])
+    former = record.get("former_names", [])
+    if not isinstance(former, list) or any(not isinstance(item, str) for item in former):
+        raise Unverifiable("former_names is not a list of names")
+    names.update(former)
     return cast(set[str], names)
 
 

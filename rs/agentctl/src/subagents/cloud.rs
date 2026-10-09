@@ -591,6 +591,8 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
             terminal_id: None,
             harness_identity: None,
             name_history: Vec::new(),
+            anchor_rule: None,
+            former_names: Vec::new(),
             agentcloud: Some(CloudRecord {
                 launch,
                 agentterm: agentterm.display().to_string(),

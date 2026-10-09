@@ -742,16 +742,22 @@ the write fails, or the prompt newly shows in another registered agent's pane
 instead, agentctl countermands it once: it re-checks that the pane still holds
 the program it saw (terminal and harness process), sends Esc, re-checks, and
 sends "Ignore the previous message: it was sent to the wrong agent by
-agentctl.". If any re-check fails, or the pane shows no single verifiable
-harness (a shell could run the note), nothing more is typed. Each case is
+agentctl.", then checks that the same program is still there and that the note
+shows in its pane. It holds that pane's agentctl input lock throughout, giving
+up after 2 seconds if another sender has it. If any re-check fails, or the pane
+shows no single verifiable harness (a shell could run the note), nothing more
+is typed. The prompt newly showing in the target and another pane, or in
+several panes, cannot be attributed and quarantines the message without a
+note. Each case is
 appended to `.agentctl/NAME/misroutes.jsonl`. A countermanded message returns
 to the queue: the retry re-checks the recipient and delivers only to the
 verified agent, so it stays pending (exit 75) while the pane holds another
 program. A message that could not be countermanded, or that misroutes twice,
 is quarantined under `queue/failed` with `"probable_misroute": true` (exit 76).
-A prompt that never shows anywhere (a long paste shows only a placeholder) is
-accepted on the recipient check alone and recorded in
-`.agentctl/NAME/readback.jsonl` as unverified. A write whose acknowledgement was
+A verified submission that never shows in the target is quarantined as
+unproven. A prompt sent through Herdr's native prompt (slash commands) that is
+not seen still needs Herdr's working-state confirmation, and is recorded in
+`.agentctl/NAME/readback.jsonl` as not seen. A write whose acknowledgement was
 lost and whose text cannot be found anywhere stays possibly submitted (exit 76)
 and is recorded there too.
 

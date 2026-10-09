@@ -66,6 +66,11 @@ _NAME = re.compile(r"[a-z][a-z0-9-]{0,31}\Z")
 _JOURNAL_ID = re.compile(r"[0-9a-f]{32}\Z")
 #: Earlier names one record keeps; rename refuses rather than exceed it.
 _MAX_NAME_HISTORY = 256
+#: Names evicted from the history that a record still remembers for liveness lookups.
+_MAX_FORMER_NAMES = 4096
+#: The harness pinning rule: the harness must be the pane's only foreground process.
+#: Anchors written under an earlier rule (none, or a launcher-capable one) do not count.
+ANCHOR_RULE = 2
 _KIND = re.compile(r"[a-z][a-z0-9-]{0,63}\Z")
 _ENVIRONMENT_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\Z")
 _BRACKETED_PASTE_START = "\x1b[200~"
@@ -340,6 +345,15 @@ class AgentRecord:
     harness_identity: CustomProcessIdentity | None = None
     #: Earlier names, oldest first: ``{"name", "renamed_at", "journal_id"}``.
     name_history: list[dict[str, object]] = field(default_factory=list)
+    #: Which pinning rule produced ``harness_identity``; only ``ANCHOR_RULE`` anchors count.
+    anchor_rule: int | None = None
+    #: Earlier names evicted from the capped ``name_history``, kept for liveness lookups.
+    former_names: list[str] = field(default_factory=list)
+
+    @property
+    def harness_anchor(self) -> CustomProcessIdentity | None:
+        """The pinned harness process, if the current pinning rule produced it."""
+        return self.harness_identity if self.anchor_rule == ANCHOR_RULE else None
     _unknown: dict[str, object] = field(default_factory=dict, init=False, repr=False)
     _nested_storage: dict[str, object] | None = field(
         default=None, init=False, repr=False,
@@ -565,6 +579,16 @@ class AgentRecord:
                 or len(terminal_id) > 128 or not terminal_id.isascii()):
             raise AgentDeliveryError(f"invalid terminal id in {path}")
         fields["name_history"] = _name_history(document.get("name_history", []), path)
+        anchor_rule = document.get("anchor_rule")
+        if anchor_rule is not None and (isinstance(anchor_rule, bool) or not isinstance(anchor_rule, int)):
+            raise AgentDeliveryError(f"invalid anchor rule in {path}")
+        fields["anchor_rule"] = anchor_rule
+        former = document.get("former_names", [])
+        if (not isinstance(former, list) or len(former) > _MAX_FORMER_NAMES
+                or any(not isinstance(item, str) or not _NAME.fullmatch(item) for item in former)
+                or len(set(former)) != len(former)):
+            raise AgentDeliveryError(f"invalid former names in {path}")
+        fields["former_names"] = list(former)
         if (custom_identity is not None
                 and ((document.get("adapter", "herdr"), document.get("harness"))
                      not in (("herdr-pane", "muse"), ("herdr-relay", "claude"), ("herdr-relay", "codex"))
@@ -913,6 +937,8 @@ def _goal_replacement_selected(screen: str, objective: str) -> bool:
 READBACK_SECONDS = 5.0
 #: Shorter prompts are too common to attribute to another pane by their text.
 _ATTRIBUTABLE = 12
+#: Longest wait for another pane's input lock before a countermand gives up.
+_COUNTERMAND_LOCK_SECONDS = 2.0
 #: Receipt evidence that already shows the prompt text in the target pane itself.
 _PRINTED_EVIDENCE = ("prompt text appeared above the composer",
                      "pasted prompt appeared above the composer")
@@ -1027,21 +1053,51 @@ class _WorkspaceClient:
         #: Other registered agents' pane and terminal claims, checked before input.
         self.claims = claims
 
-    def _snapshot(self, pane_id: str, text: str) -> dict[str, int]:
-        """Count the prompt's occurrences before sending, in the target and, for a prompt
-        long enough to attribute, in every other registered agent's pane.
+    def _snapshot(self, pane_id: str, text: str) -> dict[str, tuple[int, int]]:
+        """Before sending: how often the prompt shows, and how far its last occurrence is
+        from the end of the scrollback window, in the target and, for a prompt long enough to attribute, in every other
+        registered agent's pane. Only occurrences beyond these are evidence about this send.
 
-        Only occurrences beyond these counts are evidence about this send.
+        A failure here happens before anything is typed, so it leaves the message pending.
         """
-        needle = _suffix(text, 40)
         panes = [pane_id]
-        if len(needle) >= _ATTRIBUTABLE and self.peer_panes is not None:
+        if len(_suffix(text, 40)) >= _ATTRIBUTABLE and self.peer_panes is not None:
             panes += [peer for peer in self.peer_panes() if peer != pane_id]
-        return {pane: _compact(self.client.read_scrollback(pane)).count(needle) for pane in panes}
+        try:
+            return {pane: self._window(pane, text) for pane in panes}
+        except (HerdrUnavailable, AgentDeliveryError) as exc:
+            raise PromptNotStaged(f"cannot read scrollback before sending: {exc}; nothing was typed") from exc
 
-    def _fresh(self, pane_id: str, text: str, before: dict[str, int]) -> bool:
+    def _window(self, pane: str, text: str) -> tuple[int, int]:
+        compact = _compact(self.client.read_scrollback(pane))
         needle = _suffix(text, 40)
-        return _compact(self.client.read_scrollback(pane_id)).count(needle) > before.get(pane_id, 0)
+        last = compact.rfind(needle)
+        return compact.count(needle), (len(compact) - last if last >= 0 else -1)
+
+    def _observe(self, pane: str, text: str, before: dict[str, tuple[int, int]]) -> str:
+        """``fresh`` when the text shows more often than before; ``uncertain`` when it does
+        not, yet its last occurrence is nearer the end of the window than before (an old
+        one may have scrolled out as a new one came in); otherwise ``absent``. Output
+        after an old occurrence only moves it away from the end."""
+        count, distance = self._window(pane, text)
+        old_count, old_distance = before.get(pane, (0, -1))
+        if count > old_count:
+            return "fresh"
+        if old_count > 0 and 0 <= distance < old_distance:
+            return "uncertain"
+        return "absent"
+
+    def _seen_in_target(self, pane_id: str, text: str, before: dict[str, tuple[int, int]]) -> bool:
+        deadline = time.monotonic() + READBACK_SECONDS
+        while True:
+            if self._observe(pane_id, text, before) == "fresh":
+                return True
+            if time.monotonic() >= deadline:
+                return False
+            time.sleep(min(0.25, max(0.0, deadline - time.monotonic())))
+
+    def _peer_states(self, pane_id: str, text: str, before: dict[str, tuple[int, int]]) -> dict[str, str]:
+        return {peer: self._observe(peer, text, before) for peer in before if peer != pane_id}
 
     def _deliver_checked(
         self, pane_id: str, command: str, guarded: _GuardedTerminal,
@@ -1066,61 +1122,68 @@ class _WorkspaceClient:
         self._read_back(pane_id, command, receipt, before)
         return receipt
 
-    def _located(self, pane_id: str, text: str, before: dict[str, int], detail: str) -> None:
-        """After an unknown outcome: countermand a prompt that newly shows in another
-        agent's pane, otherwise record where it was (or was not) seen."""
-        deadline = time.monotonic() + READBACK_SECONDS
-        while True:
-            if self._fresh(pane_id, text, before):
-                self._log_readback(pane_id, text, "unknown-outcome-in-target", detail)
-                return
-            if time.monotonic() >= deadline:
-                break
-            time.sleep(min(0.25, max(0.0, deadline - time.monotonic())))
-        elsewhere = [peer for peer in before if peer != pane_id and self._fresh(peer, text, before)]
-        if len(elsewhere) == 1:
-            self._countermand(elsewhere[0], text, "prompt-in-another-pane", detail)
-        self._log_readback(pane_id, text, "unknown-outcome-not-seen", detail)
+    def _located(
+        self, pane_id: str, text: str, before: dict[str, tuple[int, int]], detail: str,
+    ) -> None:
+        """After an unknown outcome: countermand a prompt that newly shows in exactly one
+        other agent's pane and not in the target; otherwise only record what was seen.
+        The caller reports the write as possibly submitted either way."""
+        in_target = self._seen_in_target(pane_id, text, before)
+        states = self._peer_states(pane_id, text, before)
+        fresh = [peer for peer, state in states.items() if state == "fresh"]
+        if len(fresh) == 1 and not in_target:
+            self._countermand(fresh[0], text, "prompt-in-another-pane", detail)
+        self._log_readback(pane_id, text, "unknown-outcome", {
+            "in_target": in_target, "peers": states, "detail": detail,
+        })
 
     def _read_back(
-        self, pane_id: str, text: str, receipt: SubmissionReceipt | None, before: dict[str, int],
+        self, pane_id: str, text: str, receipt: SubmissionReceipt | None,
+        before: dict[str, tuple[int, int]],
     ) -> None:
-        """Confirm the prompt reached this record's pane, or countermand where it went.
+        """Prove the prompt reached this record's pane, or countermand where it went.
 
-        A receipt that saw the prompt printed is already a read-back of the verified
-        pane. Otherwise the pane's scrollback is read until the prompt newly appears,
-        within ``READBACK_SECONDS``. A prompt that newly appears in exactly one other
-        registered agent's pane instead is countermanded there. Seen nowhere (a long
-        paste shows as a placeholder, a queued prompt later), it is accepted on the
-        recipient check and logged as unverified.
+        Evidence for the target: a receipt that saw the prompt printed there, or the
+        prompt newly in its scrollback within ``READBACK_SECONDS``. Every other
+        registered agent's pane is inspected as well. The prompt newly in exactly one of
+        them, and not in the target, is countermanded there. Newly in the target and a
+        peer, in several peers, or a peer whose window moved past an old match, cannot
+        be told apart: the message is quarantined without a note. A verified submission
+        that the target never shows is quarantined too; a native prompt goes on to
+        Herdr's working-state confirmation, and is logged as not seen.
         """
-        def recipient_holds() -> None:
-            try:
-                self.verify_recipient(pane_id)
-            except RecipientChanged as exc:
-                self._countermand(pane_id, text, "identity-changed-after-write", str(exc))
-
-        if receipt is not None and receipt.evidence in _PRINTED_EVIDENCE:
-            recipient_holds()
-            return
-        deadline = time.monotonic() + READBACK_SECONDS
-        while True:
-            if self._fresh(pane_id, text, before):
-                recipient_holds()
-                return
-            if time.monotonic() >= deadline:
-                break
-            time.sleep(min(0.25, max(0.0, deadline - time.monotonic())))
-        recipient_holds()
-        elsewhere = [peer for peer in before if peer != pane_id and self._fresh(peer, text, before)]
-        if len(elsewhere) == 1:
-            self._countermand(elsewhere[0], text, "prompt-in-another-pane",
+        try:
+            self.verify_recipient(pane_id)
+        except RecipientChanged as exc:
+            self._countermand(pane_id, text, "identity-changed-after-write", str(exc))
+        in_target = (receipt is not None and receipt.evidence in _PRINTED_EVIDENCE) or (
+            self._seen_in_target(pane_id, text, before))
+        try:
+            self.verify_recipient(pane_id)
+        except RecipientChanged as exc:
+            self._countermand(pane_id, text, "identity-changed-after-write", str(exc))
+        states = self._peer_states(pane_id, text, before)
+        fresh = [peer for peer, state in states.items() if state == "fresh"]
+        uncertain = [peer for peer, state in states.items() if state == "uncertain"]
+        if len(fresh) == 1 and not in_target:
+            self._countermand(fresh[0], text, "prompt-in-another-pane",
                               f"not newly in pane {pane_id} after {READBACK_SECONDS:g}s")
-        self._log_readback(
-            pane_id, text,
-            "not-seen" if len(_suffix(text, 40)) >= _ATTRIBUTABLE else "short-prompt-not-seen",
-            f"accepted on the recipient check after {READBACK_SECONDS:g}s",
-        )
+        if fresh or uncertain:
+            self._log_readback(pane_id, text, "ambiguous", {"in_target": in_target, "peers": states})
+            raise ProbableMisroute(
+                f"prompt for agent {self.record.name!r} cannot be attributed: target "
+                f"{'shows' if in_target else 'does not show'} it, other panes {states}; "
+                "quarantined without a note"
+            )
+        if in_target:
+            return
+        logged = self._log_readback(pane_id, text, "not-seen", {"receipt": receipt is not None})
+        if receipt is not None or not logged:
+            raise AgentDeliveryError(
+                f"prompt for agent {self.record.name!r} was submitted but never showed in pane "
+                f"{pane_id} within {READBACK_SECONDS:g}s; delivery is unproven"
+                + ("" if logged else " (the read-back log could not be written)")
+            )
 
     def _occupant(self, pane: str) -> tuple[str | None, str | None, CustomProcessIdentity | None]:
         info = self.client.pane_info(pane)
@@ -1131,65 +1194,90 @@ class _WorkspaceClient:
     def _countermand(self, wrong_pane: str, text: str, detection: str, detail: str) -> NoReturn:
         """Interrupt the program that got this prompt and tell it to ignore it, once.
 
-        The occupant seen now (terminal and harness process) is re-verified immediately
-        before the interrupt and before the note; if it cannot be, nothing more is
-        typed. Raises ``MisrouteRecovered`` (retry allowed) only when both were sent to
-        that verified occupant, otherwise ``ProbableMisroute`` (quarantine, no retry).
+        The wrong pane's input lock is taken (within a bounded wait; this sender already
+        holds its own target's lock) so no other agentctl input interleaves. The occupant
+        seen now (terminal and harness process) is re-verified before the interrupt,
+        before the note, and after it, and the note must newly show in that pane.
+        ``MisrouteRecovered`` (one retry) needs all of that; anything less raises
+        ``ProbableMisroute`` (quarantine, no retry).
         """
         observed_agent = observed_terminal = None
-        interrupted = note_sent = False
+        occupant: CustomProcessIdentity | None = None
+        interrupted = note_sent = note_confirmed = False
         skipped: str | None = None
+        lock = None
+        if wrong_pane != self.record.pane_id:
+            try:
+                lock = agent._lock_target_within(wrong_pane, "pane input lock", _COUNTERMAND_LOCK_SECONDS)
+            except AgentDeliveryError as exc:
+                skipped = f"{exc}; nothing typed"
         try:
-            observed_agent, observed_terminal, occupant = self._occupant(wrong_pane)
-        except HerdrUnavailable as exc:
-            occupant, skipped = None, f"pane unavailable: {exc}"
-        if skipped is None and occupant is None:
-            skipped = (f"pane shows {observed_agent!r} without one verifiable harness process; "
-                       "nothing typed")
-        expect = (observed_terminal
-                  if observed_terminal is not None and self.client.input_expect_supported()
-                  else None)
+            if skipped is None:
+                try:
+                    observed_agent, observed_terminal, occupant = self._occupant(wrong_pane)
+                except HerdrUnavailable as exc:
+                    skipped = f"pane unavailable: {exc}"
+            if skipped is None and occupant is None:
+                skipped = (f"pane shows {observed_agent!r} without one verifiable harness "
+                           "process; nothing typed")
+            expect = (observed_terminal
+                      if observed_terminal is not None and self.client.input_expect_supported()
+                      else None)
 
-        def same_occupant() -> bool:
-            try:
-                return (self._occupant(wrong_pane)[1:] == (observed_terminal, occupant))
-            except HerdrUnavailable:
-                return False
+            def same_occupant() -> bool:
+                try:
+                    return self._occupant(wrong_pane)[1:] == (observed_terminal, occupant)
+                except HerdrUnavailable:
+                    return False
 
-        if skipped is None:
-            try:
-                if not same_occupant():
-                    skipped = "occupant changed before the interrupt; nothing typed"
-                else:
-                    self.client.send_keys(wrong_pane, "esc", expect_terminal=expect)
-                    interrupted = True
-                    time.sleep(0.5)
+            if skipped is None:
+                try:
                     if not same_occupant():
-                        skipped = "occupant changed after the interrupt; note not sent"
+                        skipped = "occupant changed before the interrupt; nothing typed"
                     else:
-                        self.client.agent_prompt(wrong_pane, MISROUTE_NOTE, expect_terminal=expect)
-                        note_sent = True
-            except HerdrUnavailable as exc:
-                skipped = f"recovery input failed: {exc}"
+                        self.client.send_keys(wrong_pane, "esc", expect_terminal=expect)
+                        interrupted = True
+                        time.sleep(0.5)
+                        note_before = {wrong_pane: self._window(wrong_pane, MISROUTE_NOTE)}
+                        if not same_occupant():
+                            skipped = "occupant changed after the interrupt; note not sent"
+                        else:
+                            self.client.agent_prompt(wrong_pane, MISROUTE_NOTE, expect_terminal=expect)
+                            note_sent = True
+                            deadline = time.monotonic() + READBACK_SECONDS
+                            while not note_confirmed:
+                                note_confirmed = (
+                                    self._observe(wrong_pane, MISROUTE_NOTE, note_before) == "fresh"
+                                    and same_occupant())
+                                if note_confirmed or time.monotonic() >= deadline:
+                                    break
+                                time.sleep(0.25)
+                            if not note_confirmed:
+                                skipped = ("the note did not show in that pane for the same "
+                                           "occupant; its recipient is unproven")
+                except (HerdrUnavailable, AgentDeliveryError) as exc:
+                    skipped = f"recovery input failed: {exc}"
+        finally:
+            if lock is not None:
+                lock.close()
         logged = self._log_misroute({
             "at": time.time(), "agent": self.record.name, "token": self.record.token,
             "detection": detection, "detail": detail,
             "intended_pane": self.record.pane_id, "intended_terminal": self.record.terminal_id,
             "observed_pane": wrong_pane, "observed_terminal": observed_terminal,
             "observed_agent": observed_agent, "interrupted": interrupted,
-            "note_sent": note_sent, "skipped": skipped,
+            "note_sent": note_sent, "note_confirmed": note_confirmed, "skipped": skipped,
             "message_id": self._inflight_message_id(text),
         })
         suffix = "" if logged else " (the misroute log could not be written)"
-        if note_sent:
+        if note_confirmed and logged:
             raise MisrouteRecovered(
                 f"prompt for agent {self.record.name!r} reached pane {wrong_pane} "
-                f"({detection}); that program was interrupted and told to ignore it: "
-                f"{detail}{suffix}"
+                f"({detection}); that program was interrupted and told to ignore it: {detail}"
             )
         raise ProbableMisroute(
             f"prompt for agent {self.record.name!r} probably reached pane {wrong_pane} "
-            f"({detection}) and could not be countermanded ({skipped}): {detail}{suffix}"
+            f"({detection}) and was not proven countermanded ({skipped}): {detail}{suffix}"
         )
 
     def _inflight_message_id(self, text: str) -> str | None:
@@ -1228,10 +1316,13 @@ class _WorkspaceClient:
     def _log_misroute(self, entry: dict[str, object]) -> bool:
         return self._append_log("misroutes.jsonl", entry)
 
-    def _log_readback(self, pane_id: str, text: str, result: str, detail: str) -> None:
-        self._append_log("readback.jsonl", {
+    def _log_readback(
+        self, pane_id: str, text: str, result: str, evidence: dict[str, object],
+    ) -> bool:
+        return self._append_log("readback.jsonl", {
             "at": time.time(), "agent": self.record.name, "pane": pane_id,
-            "result": result, "detail": detail, "message_id": self._inflight_message_id(text),
+            "result": result, "evidence": evidence,
+            "message_id": self._inflight_message_id(text),
         })
 
     def _guarded(self) -> _GuardedTerminal:
@@ -1304,11 +1395,11 @@ class _WorkspaceClient:
                     f"refusing input to agent {record.name!r}: its relayed harness process changed"
                 )
             return
-        if record.harness_identity is not None:
-            if not self.client.verify_harness_identity(pane_id, record.harness_identity):
+        if record.harness_anchor is not None:
+            if not self.client.verify_harness_identity(pane_id, record.harness_anchor):
                 raise RecipientChanged(
                     f"refusing input to agent {record.name!r}: the anchored {record.harness} "
-                    f"process (pid {record.harness_identity.pid}) is no longer a foreground "
+                    f"process (pid {record.harness_anchor.pid}) is no longer a foreground "
                     f"process of pane {pane_id}; run `agentctl doctor`"
                 )
             return
@@ -2023,6 +2114,7 @@ class ManagedAgents:
         record.terminal_id = info.terminal_id
         if record.adapter in ("herdr", "herdr-foreign") and record.pane_id is not None:
             record.harness_identity = self.client.harness_identity(record.pane_id, record.harness)
+            record.anchor_rule = ANCHOR_RULE if record.harness_identity is not None else None
         if record.pane_id is not None:
             owner = self._claim_owner(record.pane_id, record.terminal_id, exclude=record.name)
             if owner is not None:
@@ -2093,8 +2185,8 @@ class ManagedAgents:
         terminal = self.client.pane_info(record.pane_id).terminal_id
         if terminal == record.terminal_id:
             return
-        if (record.harness_identity is None
-                or not self.client.verify_harness_identity(record.pane_id, record.harness_identity)):
+        if (record.harness_anchor is None
+                or not self.client.verify_harness_identity(record.pane_id, record.harness_anchor)):
             record.terminal_id = None
             return
         record.terminal_id = terminal
@@ -2508,6 +2600,7 @@ class ManagedAgents:
             adapter="herdr-foreign", mode="interactive", backend="herdr",
             foreign_shell_identity=shell_identity,
             terminal_id=info.terminal_id, harness_identity=harness_identity,
+            anchor_rule=ANCHOR_RULE if harness_identity is not None else None,
         )
         self._save(record)
         try:
@@ -4601,7 +4694,7 @@ class ManagedAgents:
                             "again, or stop it and start a new agent"
                         )
                     changed = (record.terminal_id not in (None, info.terminal_id)
-                               or record.harness_identity not in (None, harness))
+                               or record.harness_anchor not in (None, harness))
                     if changed and not replace:
                         raise AgentDeliveryError(
                             f"agent {name!r} is anchored to a different terminal or harness "
@@ -4620,6 +4713,7 @@ class ManagedAgents:
                     }
                     record.terminal_id = info.terminal_id
                     record.harness_identity = harness
+                    record.anchor_rule = ANCHOR_RULE
                     self._save(record)
                     return {
                         "name": name, "pane_id": record.pane_id,
@@ -4664,7 +4758,7 @@ class ManagedAgents:
                     )
                 if record.pane_id is None or record.tab_id is None:
                     raise AgentDeliveryError(f"agent {old!r} has no confirmed pane and tab")
-                if record.harness_identity is None and not (
+                if record.harness_anchor is None and not (
                         record.session_value is not None and record._session_source != "asserted"):
                     raise AgentDeliveryError(
                         f"agent {old!r} pins no harness process or observed session; "
@@ -4761,7 +4855,11 @@ class ManagedAgents:
             if not any(entry["journal_id"] == journal["journal_id"] for entry in record.name_history):
                 # A journal from before the history limit may find it full: keep the newest
                 # names rather than publish a record no edition can read.
-                del record.name_history[:max(0, len(record.name_history) - _MAX_NAME_HISTORY + 1)]
+                evicted = record.name_history[:max(0, len(record.name_history) - _MAX_NAME_HISTORY + 1)]
+                del record.name_history[:len(evicted)]
+                for entry in evicted:
+                    if entry["name"] not in record.former_names:
+                        record.former_names.append(str(entry["name"]))
                 record.name_history.append({
                     "name": old, "renamed_at": journal["started_at"],
                     "journal_id": journal["journal_id"],
@@ -4806,8 +4904,8 @@ class ManagedAgents:
             failures.append(f"tab is {info.tab_id!r}, recorded {journal['tab_id']!r}")
         if not _session_matches(record, info):
             failures.append("the observed native session changed")
-        if record.harness_identity is not None:
-            if not self.client.verify_harness_identity(pane_id, record.harness_identity):
+        if record.harness_anchor is not None:
+            if not self.client.verify_harness_identity(pane_id, record.harness_anchor):
                 failures.append("the anchored harness process is no longer in the foreground")
         elif record.session_value is None:
             failures.append("no anchored harness process or observed session")
@@ -4914,8 +5012,8 @@ class ManagedAgents:
             findings.append("harness-exited")
         elif info.agent != record.harness:
             findings.append("harness-kind-mismatch")
-        if record.harness_identity is not None:
-            if not self.client.verify_harness_identity(record.pane_id, record.harness_identity):
+        if record.harness_anchor is not None:
+            if not self.client.verify_harness_identity(record.pane_id, record.harness_anchor):
                 findings.append("harness-replaced")
         elif record.adapter in ("herdr", "herdr-foreign") and not (
                 record.session_value is not None and record._session_source != "asserted"):

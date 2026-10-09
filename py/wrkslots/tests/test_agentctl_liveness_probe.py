@@ -199,3 +199,13 @@ def test_a_corrupt_active_record_is_unverifiable_not_dead(
     write_record(registry / "archive" / "old-eeee", "old", custom_process_identity=exited_identity)
     code, line = run(tmp_path, "old")
     assert code == 2 and "has_no_name" in line
+
+
+def test_a_former_name_beyond_the_history_cap_still_finds_the_live_lifetime(
+    tmp_path: Path, exited_identity: dict[str, object],
+) -> None:
+    registry = tmp_path / ".agentctl"
+    write_record(registry / "archive" / "old-ffff", "old", custom_process_identity=exited_identity)
+    write_record(registry / "new", "new", name_history=history("recent"), former_names=["old"],
+                 harness_identity=identity(os.getpid()))
+    assert run(tmp_path, "old")[0] == 1

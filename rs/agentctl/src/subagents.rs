@@ -528,6 +528,11 @@ struct NameHistoryEntry {
 /// Validate a record's earlier names: each a valid name with a time and a unique journal id.
 /// Earlier names one record keeps; rename refuses rather than exceed it.
 const MAX_NAME_HISTORY: usize = 256;
+/// Names evicted from the history that a record still remembers for liveness lookups.
+const MAX_FORMER_NAMES: usize = 4096;
+/// The harness pinning rule: the harness must be the pane's only foreground process. Anchors
+/// written under an earlier rule (none, or a launcher-capable one) do not count.
+const ANCHOR_RULE: u32 = 2;
 
 fn valid_name_history(history: &[NameHistoryEntry]) -> bool {
     let mut journals = BTreeSet::new();
@@ -1520,6 +1525,12 @@ struct AgentRecord {
     /// Earlier names, oldest first.
     #[serde(default)]
     name_history: Vec<NameHistoryEntry>,
+    /// Which pinning rule produced `harness_identity`; only [`ANCHOR_RULE`] anchors count.
+    #[serde(default)]
+    anchor_rule: Option<u32>,
+    /// Earlier names evicted from the capped `name_history`, kept for liveness lookups.
+    #[serde(default)]
+    former_names: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     agentcloud: Option<cloud::CloudRecord>,
     #[serde(flatten)]
@@ -1620,6 +1631,15 @@ fn interactive_mode() -> String {
 }
 
 impl AgentRecord {
+    /// The pinned harness process, if the current pinning rule produced it.
+    fn harness_anchor(&self) -> Option<&CustomProcessIdentity> {
+        if self.anchor_rule == Some(ANCHOR_RULE) {
+            self.harness_identity.as_ref()
+        } else {
+            None
+        }
+    }
+
     fn validate_loaded(&self, path: &Path, agent_name: &str) -> Result<()> {
         if self.name != agent_name
             || self.schema != 1
@@ -1703,6 +1723,12 @@ impl AgentRecord {
                 "invalid harness identity in {}",
                 path.display()
             )));
+        }
+        if self.former_names.len() > MAX_FORMER_NAMES
+            || self.former_names.iter().any(|former| !name_pattern(former))
+            || self.former_names.iter().collect::<BTreeSet<_>>().len() != self.former_names.len()
+        {
+            return Err(fail(format!("invalid former names in {}", path.display())));
         }
         if !valid_name_history(&self.name_history) {
             return Err(fail(format!("invalid name history in {}", path.display())));
@@ -2020,7 +2046,7 @@ impl<'a, A: ManagedApi + ?Sized> WorkspaceClient<'a, A> {
             }
             _ => {}
         }
-        if let Some(identity) = record.harness_identity.as_ref() {
+        if let Some(identity) = record.harness_anchor() {
             if !self.client.verify_harness_identity(pane_id, identity)? {
                 return Err(AdapterError::recipient_changed(format!(
                     "refusing input to agent '{}': the anchored {} process (pid {}) is no longer \
@@ -2227,57 +2253,111 @@ impl<A: ManagedApi + ?Sized> GuardedInput for GuardedTerminal<'_, '_, A> {
 
 /// Longest wait for a sent prompt to appear in the target pane's scrollback.
 const READBACK: Duration = Duration::from_secs(5);
+
+#[cfg(test)]
+thread_local! {
+    /// A test's own read-back limit, so a test that expects nothing to show does not hold
+    /// shared pane locks for the full limit.
+    pub(crate) static TEST_READBACK: std::cell::Cell<Option<Duration>> =
+        const { std::cell::Cell::new(None) };
+    /// A test's own wait for another pane's input lock.
+    pub(crate) static TEST_COUNTERMAND_LOCK: std::cell::Cell<Option<Duration>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// How long a countermand waits for the wrong pane's input lock.
+fn countermand_lock_limit() -> Duration {
+    #[cfg(test)]
+    if let Some(limit) = TEST_COUNTERMAND_LOCK.with(std::cell::Cell::get) {
+        return limit;
+    }
+    COUNTERMAND_LOCK
+}
+
+/// The read-back limit in force.
+fn readback_limit() -> Duration {
+    #[cfg(test)]
+    if let Some(limit) = TEST_READBACK.with(std::cell::Cell::get) {
+        return limit;
+    }
+    READBACK
+}
 /// Shorter prompts are too common to attribute to another pane by their text.
 const ATTRIBUTABLE: usize = 12;
+/// Longest wait for another pane's input lock before a countermand gives up.
+const COUNTERMAND_LOCK: Duration = Duration::from_secs(2);
 /// What a program that received someone else's prompt is told after being interrupted.
 pub const MISROUTE_NOTE: &str =
     "Ignore the previous message: it was sent to the wrong agent by agentctl.";
 const NOTE_HARNESSES: [&str; 3] = ["claude", "codex", "muse"];
 
 impl<A: ManagedApi + ?Sized> WorkspaceClient<'_, A> {
-    /// Count the prompt's occurrences before sending, in the target and, for a prompt long
-    /// enough to attribute, in every other registered agent's pane. Only occurrences beyond
-    /// these counts are evidence about this send.
-    fn snapshot(&self, pane_id: &str, text: &str) -> crate::error::Result<BTreeMap<String, usize>> {
-        let needle = crate::submission::suffix(text, 40);
-        let mut panes = vec![pane_id.to_owned()];
-        if needle.chars().count() >= ATTRIBUTABLE {
-            panes.extend(self.peer_panes().into_iter().filter(|peer| peer != pane_id));
-        }
-        let mut counts = BTreeMap::new();
-        for pane in panes {
-            let count = crate::submission::compact(&self.client.read_scrollback(&pane)?)
-                .matches(&needle)
-                .count();
-            counts.insert(pane, count);
-        }
-        Ok(counts)
-    }
-
-    fn fresh(
-        &self,
-        pane: &str,
-        text: &str,
-        before: &BTreeMap<String, usize>,
-    ) -> crate::error::Result<bool> {
-        let needle = crate::submission::suffix(text, 40);
-        let count = crate::submission::compact(&self.client.read_scrollback(pane)?)
-            .matches(&needle)
-            .count();
-        Ok(count > before.get(pane).copied().unwrap_or(0))
-    }
-
-    /// Wait up to [`READBACK`] for the prompt to appear newly in the target pane.
-    fn fresh_in_target(
+    /// Before sending: how often the prompt shows, and how far its last occurrence is from the
+    /// end of the scrollback window, in the target and, for a prompt long enough to attribute,
+    /// in every other registered agent's pane. Only occurrences beyond these are evidence
+    /// about this send. A failure here happens before anything is typed, so it is not staged.
+    fn snapshot(
         &self,
         pane_id: &str,
         text: &str,
-        before: &BTreeMap<String, usize>,
+    ) -> crate::error::Result<BTreeMap<String, (usize, Option<usize>)>> {
+        let mut panes = vec![pane_id.to_owned()];
+        if crate::submission::suffix(text, 40).chars().count() >= ATTRIBUTABLE {
+            panes.extend(self.peer_panes().into_iter().filter(|peer| peer != pane_id));
+        }
+        let mut windows = BTreeMap::new();
+        for pane in panes {
+            let window = self.window(&pane, text).map_err(|error| {
+                AdapterError::not_staged(format!(
+                    "cannot read scrollback before sending: {error}; nothing was typed"
+                ))
+            })?;
+            windows.insert(pane, window);
+        }
+        Ok(windows)
+    }
+
+    fn window(&self, pane: &str, text: &str) -> crate::error::Result<(usize, Option<usize>)> {
+        let compact = crate::submission::compact(&self.client.read_scrollback(pane)?);
+        let needle = crate::submission::suffix(text, 40);
+        let distance = compact.rfind(&needle).map(|last| compact.len() - last);
+        Ok((compact.matches(&needle).count(), distance))
+    }
+
+    /// `fresh` when the text shows more often than before; `uncertain` when it does not, yet
+    /// its last occurrence is nearer the end of the window than before (an old one may have
+    /// scrolled out as a new one came in); otherwise `absent`. Output after an old occurrence
+    /// only moves it away from the end.
+    fn observe(
+        &self,
+        pane: &str,
+        text: &str,
+        before: &BTreeMap<String, (usize, Option<usize>)>,
+    ) -> crate::error::Result<&'static str> {
+        let (count, distance) = self.window(pane, text)?;
+        let (old_count, old_distance) = before.get(pane).copied().unwrap_or((0, None));
+        Ok(if count > old_count {
+            "fresh"
+        } else if old_count > 0
+            && matches!((distance, old_distance), (Some(now), Some(then)) if now < then)
+        {
+            "uncertain"
+        } else {
+            "absent"
+        })
+    }
+
+    /// Wait up to [`READBACK`] for the prompt to appear newly in the target pane.
+    fn seen_in_target(
+        &self,
+        pane_id: &str,
+        text: &str,
+        before: &BTreeMap<String, (usize, Option<usize>)>,
         runtime: &dyn agent::AgentRuntime,
     ) -> crate::error::Result<bool> {
-        let deadline = runtime.monotonic() + READBACK;
+        let deadline = runtime.monotonic() + readback_limit();
         loop {
-            if self.fresh(pane_id, text, before)? {
+            if self.observe(pane_id, text, before)? == "fresh" {
                 return Ok(true);
             }
             let now = runtime.monotonic();
@@ -2288,56 +2368,65 @@ impl<A: ManagedApi + ?Sized> WorkspaceClient<'_, A> {
         }
     }
 
-    /// The other panes where the prompt newly appeared.
-    fn fresh_elsewhere(
+    fn peer_states(
         &self,
         pane_id: &str,
         text: &str,
-        before: &BTreeMap<String, usize>,
-    ) -> crate::error::Result<Vec<String>> {
-        let mut found = Vec::new();
+        before: &BTreeMap<String, (usize, Option<usize>)>,
+    ) -> crate::error::Result<BTreeMap<String, &'static str>> {
+        let mut states = BTreeMap::new();
         for peer in before.keys().filter(|peer| peer.as_str() != pane_id) {
-            if self.fresh(peer, text, before)? {
-                found.push(peer.clone());
-            }
+            states.insert(peer.clone(), self.observe(peer, text, before)?);
         }
-        Ok(found)
+        Ok(states)
     }
 
-    /// After an unknown outcome: countermand a prompt that newly shows in another agent's
-    /// pane, otherwise record where it was (or was not) seen.
+    /// After an unknown outcome: countermand a prompt that newly shows in exactly one other
+    /// agent's pane and not in the target; otherwise only record what was seen. The caller
+    /// reports the write as possibly submitted either way.
     fn located(
         &self,
         pane_id: &str,
         text: &str,
-        before: &BTreeMap<String, usize>,
+        before: &BTreeMap<String, (usize, Option<usize>)>,
         detail: &str,
         runtime: &dyn agent::AgentRuntime,
     ) -> crate::error::Result<()> {
-        if self.fresh_in_target(pane_id, text, before, runtime)? {
-            self.log_readback(pane_id, text, "unknown-outcome-in-target", detail);
-            return Ok(());
-        }
-        if let [other] = self.fresh_elsewhere(pane_id, text, before)?.as_slice() {
+        let in_target = self.seen_in_target(pane_id, text, before, runtime)?;
+        let states = self.peer_states(pane_id, text, before)?;
+        let fresh: Vec<&String> = states
+            .iter()
+            .filter(|(_, state)| **state == "fresh")
+            .map(|(peer, _)| peer)
+            .collect();
+        if let ([other], false) = (fresh.as_slice(), in_target) {
             return Err(self.countermand(other, text, "prompt-in-another-pane", detail, runtime));
         }
-        self.log_readback(pane_id, text, "unknown-outcome-not-seen", detail);
+        self.log_readback(
+            pane_id,
+            text,
+            "unknown-outcome",
+            &json!({"in_target": in_target, "peers": states, "detail": detail}),
+        );
         Ok(())
     }
 
-    /// Confirm the prompt reached this record's pane, or countermand where it went.
+    /// Prove the prompt reached this record's pane, or countermand where it went.
     ///
-    /// A receipt that saw the prompt printed is already a read-back of the verified pane.
-    /// Otherwise the pane's scrollback is read until the prompt newly appears, within
-    /// [`READBACK`]. A prompt that newly appears in exactly one other registered agent's pane
-    /// instead is countermanded there. Seen nowhere (a long paste shows as a placeholder, a
-    /// queued prompt later), it is accepted on the recipient check and logged as unverified.
+    /// Evidence for the target: a receipt that saw the prompt printed there, or the prompt
+    /// newly in its scrollback within [`READBACK`]. Every other registered agent's pane is
+    /// inspected as well. The prompt newly in exactly one of them, and not in the target, is
+    /// countermanded there. Newly in the target and a peer, in several peers, or a peer whose
+    /// last occurrence moved nearer the end without a new one, cannot be told apart: the
+    /// message is quarantined without a note. A verified submission that the target never
+    /// shows is quarantined too; a native prompt goes on to Herdr's working-state
+    /// confirmation, and is logged as not seen.
     fn read_back(
         &self,
         pane_id: &str,
         text: &str,
         submission: &Submission,
-        before: &BTreeMap<String, usize>,
+        before: &BTreeMap<String, (usize, Option<usize>)>,
         runtime: &dyn agent::AgentRuntime,
     ) -> crate::error::Result<()> {
         let recipient_holds = || -> crate::error::Result<()> {
@@ -2354,14 +2443,17 @@ impl<A: ManagedApi + ?Sized> WorkspaceClient<'_, A> {
                 )),
             }
         };
-        if matches!(submission, Submission::Verified(receipt) if receipt.printed) {
-            return recipient_holds();
-        }
-        if self.fresh_in_target(pane_id, text, before, runtime)? {
-            return recipient_holds();
-        }
         recipient_holds()?;
-        if let [other] = self.fresh_elsewhere(pane_id, text, before)?.as_slice() {
+        let in_target = matches!(submission, Submission::Verified(receipt) if receipt.printed)
+            || self.seen_in_target(pane_id, text, before, runtime)?;
+        recipient_holds()?;
+        let states = self.peer_states(pane_id, text, before)?;
+        let fresh: Vec<&String> = states
+            .iter()
+            .filter(|(_, state)| **state == "fresh")
+            .map(|(peer, _)| peer)
+            .collect();
+        if let ([other], false) = (fresh.as_slice(), in_target) {
             return Err(self.countermand(
                 other,
                 text,
@@ -2370,20 +2462,39 @@ impl<A: ManagedApi + ?Sized> WorkspaceClient<'_, A> {
                 runtime,
             ));
         }
-        let short = crate::submission::suffix(text, 40).chars().count() < ATTRIBUTABLE;
-        self.log_readback(
-            pane_id,
-            text,
-            if short {
-                "short-prompt-not-seen"
-            } else {
-                "not-seen"
-            },
-            &format!(
-                "accepted on the recipient check after {}s",
-                READBACK.as_secs()
-            ),
-        );
+        if states.values().any(|state| *state != "absent") {
+            self.log_readback(
+                pane_id,
+                text,
+                "ambiguous",
+                &json!({"in_target": in_target, "peers": states}),
+            );
+            return Err(AdapterError::probable_misroute(format!(
+                "prompt for agent {} cannot be attributed: target {} it, other panes {}; \
+                 quarantined without a note",
+                repr(Some(&self.record.name)),
+                if in_target { "shows" } else { "does not show" },
+                json!(states)
+            )));
+        }
+        if in_target {
+            return Ok(());
+        }
+        let verified = matches!(submission, Submission::Verified(_));
+        let logged = self.log_readback(pane_id, text, "not-seen", &json!({"receipt": verified}));
+        if verified || !logged {
+            return Err(AdapterError::unavailable(format!(
+                "prompt for agent {} was submitted but never showed in pane {pane_id} within {}s; \
+                 delivery is unproven{}",
+                repr(Some(&self.record.name)),
+                READBACK.as_secs(),
+                if logged {
+                    ""
+                } else {
+                    " (the read-back log could not be written)"
+                }
+            )));
+        }
         Ok(())
     }
 
@@ -2409,10 +2520,11 @@ impl<A: ManagedApi + ?Sized> WorkspaceClient<'_, A> {
 
     /// Interrupt the program that got this prompt and tell it to ignore it, once.
     ///
-    /// The occupant seen now (terminal and harness process) is re-verified immediately
-    /// before the interrupt and before the note; if it cannot be, nothing more is typed.
-    /// Returns a `MisrouteRecovered` error (retry allowed) only when both were sent to that
-    /// verified occupant, otherwise `ProbableMisroute` (quarantine, no retry).
+    /// The wrong pane's input lock is taken (within a bounded wait; this sender already holds
+    /// its own target's lock) so no other agentctl input interleaves. The occupant seen now
+    /// (terminal and harness process) is re-verified before the interrupt, before the note,
+    /// and after it, and the note must newly show in that pane. A `MisrouteRecovered` error
+    /// (one retry) needs all of that; anything less is `ProbableMisroute` (quarantine).
     fn countermand(
         &self,
         wrong_pane: &str,
@@ -2426,14 +2538,25 @@ impl<A: ManagedApi + ?Sized> WorkspaceClient<'_, A> {
         let mut occupant = None;
         let mut interrupted = false;
         let mut note_sent = false;
+        let mut note_confirmed = false;
         let mut skipped: Option<String> = None;
-        match self.occupant(wrong_pane) {
-            Ok((agent, terminal, harness)) => {
-                observed_agent = agent;
-                observed_terminal = terminal;
-                occupant = harness;
+        let mut lock = None;
+        if Some(wrong_pane) != self.record.pane_id.as_deref() {
+            match agent::lock_target_within(wrong_pane, "pane input lock", countermand_lock_limit())
+            {
+                Ok(held) => lock = Some(held),
+                Err(error) => skipped = Some(format!("{error}; nothing typed")),
             }
-            Err(error) => skipped = Some(format!("pane unavailable: {error}")),
+        }
+        if skipped.is_none() {
+            match self.occupant(wrong_pane) {
+                Ok((agent, terminal, harness)) => {
+                    observed_agent = agent;
+                    observed_terminal = terminal;
+                    occupant = harness;
+                }
+                Err(error) => skipped = Some(format!("pane unavailable: {error}")),
+            }
         }
         if skipped.is_none() && occupant.is_none() {
             skipped = Some(format!(
@@ -2453,36 +2576,59 @@ impl<A: ManagedApi + ?Sized> WorkspaceClient<'_, A> {
         if skipped.is_none() {
             if !same_occupant() {
                 skipped = Some("occupant changed before the interrupt; nothing typed".to_owned());
-            } else {
-                match self
-                    .client
+            } else if let Err(error) =
+                self.client
                     .send_keys_expect(wrong_pane, "esc", expect.as_deref(), runtime)
-                {
-                    Err(error) => skipped = Some(format!("recovery input failed: {error}")),
-                    Ok(()) => {
-                        interrupted = true;
-                        runtime.sleep(Duration::from_millis(500));
-                        if !same_occupant() {
-                            skipped = Some(
-                                "occupant changed after the interrupt; note not sent".to_owned(),
-                            );
-                        } else {
-                            match self.client.agent_prompt_expect(
-                                wrong_pane,
-                                MISROUTE_NOTE,
-                                expect.as_deref(),
-                                runtime,
-                            ) {
-                                Ok(()) => note_sent = true,
-                                Err(error) => {
-                                    skipped = Some(format!("recovery input failed: {error}"))
+            {
+                skipped = Some(format!("recovery input failed: {error}"));
+            } else {
+                interrupted = true;
+                runtime.sleep(Duration::from_millis(500));
+                let note_before = self
+                    .window(wrong_pane, MISROUTE_NOTE)
+                    .map(|window| BTreeMap::from([(wrong_pane.to_owned(), window)]));
+                match note_before {
+                    Err(error) => skipped = Some(format!("recovery read failed: {error}")),
+                    Ok(_) if !same_occupant() => {
+                        skipped =
+                            Some("occupant changed after the interrupt; note not sent".to_owned())
+                    }
+                    Ok(note_before) => match self.client.agent_prompt_expect(
+                        wrong_pane,
+                        MISROUTE_NOTE,
+                        expect.as_deref(),
+                        runtime,
+                    ) {
+                        Err(error) => skipped = Some(format!("recovery input failed: {error}")),
+                        Ok(()) => {
+                            note_sent = true;
+                            let deadline = runtime.monotonic() + readback_limit();
+                            loop {
+                                note_confirmed = matches!(
+                                    self.observe(wrong_pane, MISROUTE_NOTE, &note_before),
+                                    Ok("fresh")
+                                ) && same_occupant();
+                                let now = runtime.monotonic();
+                                if note_confirmed || now >= deadline {
+                                    break;
                                 }
+                                runtime.sleep(
+                                    Duration::from_millis(250).min(deadline.saturating_sub(now)),
+                                );
+                            }
+                            if !note_confirmed {
+                                skipped = Some(
+                                    "the note did not show in that pane for the same occupant; \
+                                     its recipient is unproven"
+                                        .to_owned(),
+                                );
                             }
                         }
-                    }
+                    },
                 }
             }
         }
+        drop(lock);
         let logged = self.append_log(
             "misroutes.jsonl",
             &json!({
@@ -2491,29 +2637,28 @@ impl<A: ManagedApi + ?Sized> WorkspaceClient<'_, A> {
                 "intended_pane": self.record.pane_id, "intended_terminal": self.record.terminal_id,
                 "observed_pane": wrong_pane, "observed_terminal": observed_terminal,
                 "observed_agent": observed_agent, "interrupted": interrupted,
-                "note_sent": note_sent, "skipped": skipped,
+                "note_sent": note_sent, "note_confirmed": note_confirmed, "skipped": skipped,
                 "message_id": self.inflight_message_id(text),
             }),
         );
-        let suffix = if logged {
-            ""
-        } else {
-            " (the misroute log could not be written)"
-        };
-        if note_sent {
-            AdapterError::misroute_recovered(format!(
+        if note_confirmed && logged {
+            return AdapterError::misroute_recovered(format!(
                 "prompt for agent {} reached pane {wrong_pane} ({detection}); that program was \
-                 interrupted and told to ignore it: {detail}{suffix}",
+                 interrupted and told to ignore it: {detail}",
                 repr(Some(&self.record.name))
-            ))
-        } else {
-            AdapterError::probable_misroute(format!(
-                "prompt for agent {} probably reached pane {wrong_pane} ({detection}) and could \
-                 not be countermanded ({}): {detail}{suffix}",
-                repr(Some(&self.record.name)),
-                skipped.unwrap_or_default()
-            ))
+            ));
         }
+        AdapterError::probable_misroute(format!(
+            "prompt for agent {} probably reached pane {wrong_pane} ({detection}) and was not \
+             proven countermanded ({}): {detail}{}",
+            repr(Some(&self.record.name)),
+            skipped.unwrap_or_default(),
+            if logged {
+                ""
+            } else {
+                " (the misroute log could not be written)"
+            }
+        ))
     }
 
     /// Press Enter on a goal-replacement menu; a misroute is countermanded like a prompt's.
@@ -2586,14 +2731,15 @@ impl<A: ManagedApi + ?Sized> WorkspaceClient<'_, A> {
         file.write_all(line.as_bytes()).is_ok() && file.sync_all().is_ok()
     }
 
-    fn log_readback(&self, pane_id: &str, text: &str, result: &str, detail: &str) {
+    fn log_readback(&self, pane_id: &str, text: &str, result: &str, evidence: &Value) -> bool {
         self.append_log(
             "readback.jsonl",
             &json!({
                 "at": unix_seconds(), "agent": self.record.name, "pane": pane_id,
-                "result": result, "detail": detail, "message_id": self.inflight_message_id(text),
+                "result": result, "evidence": evidence,
+                "message_id": self.inflight_message_id(text),
             }),
-        );
+        )
     }
 
     /// Panes of every other running record in this registry, for locating a misroute.
@@ -4169,6 +4315,7 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
         if matches!(record.adapter.as_str(), "herdr" | "herdr-foreign") {
             if let Some(pane) = record.pane_id.clone() {
                 record.harness_identity = self.client.harness_identity(&pane, &record.harness)?;
+                record.anchor_rule = record.harness_identity.as_ref().map(|_| ANCHOR_RULE);
             }
         }
         if let Some(pane) = record.pane_id.as_deref() {
@@ -4198,7 +4345,7 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
         if terminal.as_deref() == Some(recorded.as_str()) {
             return Ok(());
         }
-        let harness_matches = match record.harness_identity.as_ref() {
+        let harness_matches = match record.harness_anchor() {
             Some(identity) => self.client.verify_harness_identity(&pane, identity)?,
             None => false,
         };
@@ -4356,8 +4503,7 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
             .as_ref()
             .is_some_and(|terminal| Some(terminal) != info.terminal_id.as_ref())
             || record
-                .harness_identity
-                .as_ref()
+                .harness_anchor()
                 .is_some_and(|identity| *identity != harness);
         if changed && !replace {
             return Err(fail(format!(
@@ -4378,6 +4524,7 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
         });
         record.terminal_id = info.terminal_id;
         record.harness_identity = Some(harness.clone());
+        record.anchor_rule = Some(ANCHOR_RULE);
         self.save(&record)?;
         Ok(json!({
             "name": agent_name,
@@ -4386,6 +4533,8 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
             "harness_pid": harness.pid,
             "replaced": changed,
             "previous": previous,
+            // This edition reads only schema-1 records, so it never migrates one.
+            "migrated_from": Value::Null,
         }))
     }
 
@@ -4425,7 +4574,7 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
         let (Some(pane), Some(tab)) = (record.pane_id.clone(), record.tab_id.clone()) else {
             return Err(fail(format!("agent '{old}' has no confirmed pane and tab")));
         };
-        if record.harness_identity.is_none() && record.session_value.is_none() {
+        if record.harness_anchor().is_none() && record.session_value.is_none() {
             return Err(fail(format!(
                 "agent '{old}' pins no harness process or observed session; check its pane, run `agentctl anchor {old}`, then rename"
             )));
@@ -4589,7 +4738,16 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
                 // A journal from before the history limit may find it full: keep the newest
                 // names rather than publish a record no edition can read.
                 let excess = (record.name_history.len() + 1).saturating_sub(MAX_NAME_HISTORY);
-                record.name_history.drain(..excess);
+                let evicted: Vec<String> = record
+                    .name_history
+                    .drain(..excess)
+                    .map(|entry| entry.name)
+                    .collect();
+                for former in evicted {
+                    if !record.former_names.contains(&former) {
+                        record.former_names.push(former);
+                    }
+                }
                 record.name_history.push(NameHistoryEntry {
                     name: old.to_owned(),
                     renamed_at: journal.started_at,
@@ -4686,7 +4844,7 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
         if !session_matches(record, &info) {
             failures.push("the observed native session changed".to_owned());
         }
-        if let Some(identity) = record.harness_identity.as_ref() {
+        if let Some(identity) = record.harness_anchor() {
             if !self.client.verify_harness_identity(pane, identity)? {
                 failures
                     .push("the anchored harness process is no longer in the foreground".to_owned());
@@ -4893,7 +5051,7 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
             Some(agent) if agent != record.harness => findings.push("harness-kind-mismatch"),
             Some(_) => {}
         }
-        if let Some(identity) = record.harness_identity.as_ref() {
+        if let Some(identity) = record.harness_anchor() {
             if !self.client.verify_harness_identity(pane, identity)? {
                 findings.push("harness-replaced");
             }
@@ -5156,6 +5314,8 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
             terminal_id: None,
             harness_identity: None,
             name_history: Vec::new(),
+            anchor_rule: None,
+            former_names: Vec::new(),
             agentcloud: None,
             extra: BTreeMap::new(),
             name: agent_name.to_owned(),
@@ -5428,8 +5588,10 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
             custom_process_identity: None,
             foreign_shell_identity: Some(shell_identity.clone()),
             terminal_id: info.terminal_id,
+            anchor_rule: harness_identity.as_ref().map(|_| ANCHOR_RULE),
             harness_identity,
             name_history: Vec::new(),
+            former_names: Vec::new(),
             agentcloud: None,
             extra: BTreeMap::new(),
             name: agent_name.to_owned(),
@@ -8214,6 +8376,9 @@ pub(crate) mod tests {
                     redirect_once: Mutex::new(BTreeMap::new()),
                     keys_sent: Mutex::new(Vec::new()),
                     replace_harness_after_esc: AtomicBool::new(false),
+                    drop_note: AtomicBool::new(false),
+                    scrollback_on_effect: Mutex::new(None),
+                    fail_scrollback: Mutex::new(None),
                     expected_terminals: Mutex::new(Vec::new()),
                     replace_harness_before_effect: AtomicBool::new(false),
                     swap_terminal_before_effect: AtomicBool::new(false),
@@ -8400,6 +8565,12 @@ pub(crate) mod tests {
         pub(crate) keys_sent: Mutex<Vec<(String, String)>>,
         /// Replace the pane's harness right after the next Esc reaches it.
         pub(crate) replace_harness_after_esc: AtomicBool,
+        /// Whether a countermand note never shows in any pane.
+        pub(crate) drop_note: AtomicBool,
+        /// One-shot: replace a pane's scrollback as the next input effect reaches its target.
+        pub(crate) scrollback_on_effect: Mutex<Option<(String, Vec<String>)>>,
+        /// A pane whose scrollback cannot be read.
+        pub(crate) fail_scrollback: Mutex<Option<String>>,
         /// The expected terminal sent with each input effect, in order.
         expected_terminals: Mutex<Vec<Option<String>>>,
         /// Replace the pane's harness as the next input effect reaches it.
@@ -8943,6 +9114,12 @@ pub(crate) mod tests {
             _: &dyn agent::AgentRuntime,
         ) -> AdapterResult<()> {
             self.effect(pane, expect_terminal)?;
+            if let Some((other, lines)) = self.scrollback_on_effect.lock().unwrap().take() {
+                self.scrollback.lock().unwrap().insert(other, lines);
+            }
+            if text == MISROUTE_NOTE && self.drop_note.load(Ordering::SeqCst) {
+                return self.run(pane, text);
+            }
             let written = self
                 .redirect_once
                 .lock()
@@ -8958,6 +9135,9 @@ pub(crate) mod tests {
             self.run(pane, text)
         }
         fn read_scrollback(&self, pane: &str) -> AdapterResult<String> {
+            if self.fail_scrollback.lock().unwrap().as_deref() == Some(pane) {
+                return Err(AdapterError::unavailable("scrollback read failed"));
+            }
             Ok(self
                 .scrollback
                 .lock()

@@ -107,7 +107,7 @@ def test_misroute_into_a_shell_types_nothing_more(
         fake.infos[effect_pane] = replace(fake.infos[effect_pane], agent=None)
 
     fake.before_effect = harness_exits
-    with pytest.raises(AgentPossiblySubmitted, match="could not be countermanded"):
+    with pytest.raises(AgentPossiblySubmitted, match="not proven countermanded"):
         manager.send("worker", "nothing should follow this text")
     assert fake.keys_sent == [] and subagents.MISROUTE_NOTE not in fake.submitted
     [entry] = _misroutes(manager, "worker")
@@ -705,7 +705,7 @@ def test_short_prompt_without_echo_is_logged_unverified(
     fake.redirect_once[pane] = "w1:void"
     manager.send("worker", "continue")
     readback = (manager._directory("worker") / "readback.jsonl").read_text(encoding="utf-8")
-    assert '"result": "short-prompt-not-seen"' in readback
+    assert '"result": "not-seen"' in readback
 
 
 def test_session_provider_change_refuses_input(
@@ -745,3 +745,156 @@ def test_old_journal_at_the_history_limit_completes_with_the_newest_names(
     manager.rename("old", "new")
     history = manager.get("new").name_history
     assert len(history) == 256 and history[-1]["name"] == "old"
+
+
+def test_note_that_never_shows_in_the_wrong_pane_is_not_a_recovery(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager, fake, pane = _started(tmp_path, monkeypatch)
+    monkeypatch.setattr(subagents, "READBACK_SECONDS", 0.0)
+    real = fake.agent_prompt
+
+    def note_vanishes(pane_id: str, text: str, *, expect_terminal: str | None = None) -> None:
+        if text == subagents.MISROUTE_NOTE:
+            fake.redirect_once[pane_id] = "w1:void"  # the note goes somewhere else
+            fake.infos.setdefault("w1:void", fake.infos[pane_id])
+        real(pane_id, text, expect_terminal=expect_terminal)
+
+    monkeypatch.setattr(fake, "agent_prompt", note_vanishes)
+
+    def swap_once(effect_pane: str) -> None:
+        fake.before_effect = None
+        fake.harness_pids[effect_pane] = 999
+
+    fake.before_effect = swap_once
+    with pytest.raises(AgentPossiblySubmitted, match="recipient is unproven"):
+        manager.send("worker", "work meant for the worker agent")
+    [entry] = _misroutes(manager, "worker")
+    assert entry["note_sent"] is True and entry["note_confirmed"] is False
+
+
+def test_countermand_needs_the_wrong_panes_input_lock(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from agentctl import agent as delivery
+
+    manager, fake, pane = _started(tmp_path, monkeypatch)
+    manager.start("bystander", cwd=str(tmp_path), harness="claude")
+    other = manager.get("bystander").pane_id or ""
+    monkeypatch.setattr(subagents, "READBACK_SECONDS", 0.0)
+    monkeypatch.setattr(subagents, "_COUNTERMAND_LOCK_SECONDS", 0.1)
+    fake.redirect_once[pane] = other
+    held = delivery._lock_target(other, "another sender")
+    try:
+        with pytest.raises(AgentPossiblySubmitted, match="held by another sender"):
+            manager.send("worker", "a long enough instruction for the worker only")
+    finally:
+        held.close()
+    assert fake.keys_sent == []
+
+
+def test_window_moving_past_an_old_match_in_a_peer_is_uncertain(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager, fake, pane = _started(tmp_path, monkeypatch)
+    manager.start("bystander", cwd=str(tmp_path), harness="claude")
+    other = manager.get("bystander").pane_id or ""
+    monkeypatch.setattr(subagents, "READBACK_SECONDS", 0.0)
+    text = "a long enough instruction for the worker only"
+    fake.transcripts[other] = [text, "output after the old match"]
+
+    def scroll_peer(effect_pane: str) -> None:
+        fake.before_effect = None
+        # The old match scrolls out of the peer's window as a new one arrives.
+        fake.transcripts[other] = ["output after the old match", text]
+
+    fake.before_effect = scroll_peer
+    fake.infos["w1:void"] = fake.infos[pane]
+    fake.redirect_once[pane] = "w1:void"
+    with pytest.raises(AgentPossiblySubmitted, match="cannot be attributed"):
+        manager.send("worker", text)
+    assert fake.keys_sent == []
+
+
+def test_prompt_new_in_target_and_peer_is_quarantined_without_a_note(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager, fake, pane = _started(tmp_path, monkeypatch)
+    manager.start("bystander", cwd=str(tmp_path), harness="claude")
+    other = manager.get("bystander").pane_id or ""
+    monkeypatch.setattr(subagents, "READBACK_SECONDS", 0.0)
+    text = "a long enough instruction for the worker only"
+
+    def echo_in_peer_too(effect_pane: str) -> None:
+        fake.before_effect = None
+        fake.transcripts.setdefault(other, []).append(text)
+
+    fake.before_effect = echo_in_peer_too
+    with pytest.raises(AgentPossiblySubmitted, match="cannot be attributed"):
+        manager.send("worker", text)
+    assert fake.keys_sent == [] and subagents.MISROUTE_NOTE not in fake.submitted
+
+
+def test_anchor_from_an_earlier_rule_does_not_count(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager, fake, pane = _started(tmp_path, monkeypatch)
+    record = manager.get("worker")
+    record.anchor_rule = None  # pinned before the only-foreground-process rule
+    record.session_agent = record.session_value = None
+    manager._save(record)
+    fake.infos[pane] = replace(fake.infos[pane], session_agent=None, session_value=None)
+    with pytest.raises(AgentPending, match="agentctl anchor worker"):
+        manager.send("worker", "held until re-anchored")
+    assert manager.anchor("worker")["replaced"] is False
+    assert manager.get("worker").anchor_rule == subagents.ANCHOR_RULE
+
+
+def test_snapshot_failure_before_any_write_leaves_the_message_pending(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager, fake, _pane = _started(tmp_path, monkeypatch)
+    manager.start("bystander", cwd=str(tmp_path), harness="claude")
+    real = fake.read_scrollback
+    bystander = manager.get("bystander").pane_id
+
+    def dead_peer(pane_id: str) -> str:
+        if pane_id == bystander:
+            raise HerdrUnavailable("peer pane is gone")
+        return real(pane_id)
+
+    monkeypatch.setattr(fake, "read_scrollback", dead_peer)
+    with pytest.raises(AgentPending, match="cannot read scrollback before sending"):
+        manager.send("worker", "a long enough instruction for the worker only")
+    assert _failed_documents(manager, "worker") == []
+
+
+def test_failed_readback_log_on_an_unverified_accept_quarantines(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager, fake, pane = _started(tmp_path, monkeypatch)
+    monkeypatch.setattr(subagents, "READBACK_SECONDS", 0.0)
+    monkeypatch.setattr(subagents._WorkspaceClient, "_append_log", lambda self, name, entry: False)
+    fake.infos["w1:void"] = fake.infos[pane]
+    fake.redirect_once[pane] = "w1:void"
+    with pytest.raises(AgentPossiblySubmitted, match="read-back log could not be written"):
+        manager.send("worker", "a long enough instruction for the worker only")
+
+
+def test_a_peer_that_keeps_working_after_an_old_match_is_not_uncertain(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager, fake, _pane = _started(tmp_path, monkeypatch)
+    manager.start("bystander", cwd=str(tmp_path), harness="claude")
+    other = manager.get("bystander").pane_id or ""
+    monkeypatch.setattr(subagents, "READBACK_SECONDS", 0.0)
+    text = "the same instruction broadcast to several agents"
+    fake.transcripts[other] = ["older output", text]  # it got the broadcast earlier
+
+    def peer_works_on(effect_pane: str) -> None:
+        fake.before_effect = None
+        fake.transcripts[other] = [text, "more of its own output"]
+
+    fake.before_effect = peer_works_on
+    manager.send("worker", text)
+    assert fake.keys_sent == [] and fake.submitted[-1] == text
