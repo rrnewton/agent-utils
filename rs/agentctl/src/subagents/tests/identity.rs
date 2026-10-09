@@ -973,3 +973,34 @@ fn rename_journals_validate_like_the_python_edition() {
         );
     }
 }
+
+#[test]
+fn the_countermand_stops_when_the_occupant_changes_after_the_interrupt() {
+    let fixture = Fixture::new();
+    fixture.start(None);
+    fixture
+        .client
+        .replace_harness_before_effect
+        .store(true, Ordering::SeqCst);
+    fixture
+        .client
+        .replace_harness_after_esc
+        .store(true, Ordering::SeqCst);
+    let error =
+        send(&fixture, "worker", "work meant for the worker agent").expect_err("quarantined");
+    assert_eq!(
+        error.outcome(),
+        Some(agent::QueueOutcome::PossiblySubmitted),
+        "{error}"
+    );
+    assert!(error.to_string().contains("note not sent"), "{error}");
+    assert!(!runs(&fixture).contains(&MISROUTE_NOTE.to_owned()));
+    let entries = misroutes(&fixture, "worker");
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0]["interrupted"], true);
+    assert_eq!(entries[0]["note_sent"], false);
+    assert_eq!(
+        failed_documents(&fixture, "worker")[0]["probable_misroute"],
+        true
+    );
+}

@@ -27,7 +27,7 @@ from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
-from typing import TypeVar, cast
+from typing import NoReturn, TypeVar, cast
 
 from agentctl import agent
 from agentctl.client import (
@@ -80,6 +80,15 @@ _NESTED_SESSION_SCHEMAS = frozenset({
 _NESTED_LAUNCH_SCHEMAS = frozenset({
     "agentctl-launch/v1", "agentctl-launch/v2",
 })
+
+
+def _session_matches(record: AgentRecord, info: AgentPaneInfo) -> bool:
+    """Does the pane still report the observed native session, provider and id, this
+    record holds? A record without one has nothing to compare."""
+    if record.session_value is None or record._session_source == "asserted":
+        return True
+    return (info.session_value == record.session_value
+            and info.session_agent == (record.session_agent or record.harness))
 
 
 def _validate_rename_journal(value: object, path: Path) -> dict[str, object]:
@@ -902,6 +911,8 @@ def _goal_replacement_selected(screen: str, objective: str) -> bool:
 
 #: Longest wait for a sent prompt to appear in the target pane's scrollback.
 READBACK_SECONDS = 5.0
+#: Shorter prompts are too common to attribute to another pane by their text.
+_ATTRIBUTABLE = 12
 #: Receipt evidence that already shows the prompt text in the target pane itself.
 _PRINTED_EVIDENCE = ("prompt text appeared above the composer",
                      "pasted prompt appeared above the composer")
@@ -1016,85 +1027,151 @@ class _WorkspaceClient:
         #: Other registered agents' pane and terminal claims, checked before input.
         self.claims = claims
 
-    def _read_back(self, pane_id: str, text: str, receipt: SubmissionReceipt | None) -> None:
-        """Confirm the prompt reached this record's pane, or recover from where it went.
+    def _snapshot(self, pane_id: str, text: str) -> dict[str, int]:
+        """Count the prompt's occurrences before sending, in the target and, for a prompt
+        long enough to attribute, in every other registered agent's pane.
+
+        Only occurrences beyond these counts are evidence about this send.
+        """
+        needle = _suffix(text, 40)
+        panes = [pane_id]
+        if len(needle) >= _ATTRIBUTABLE and self.peer_panes is not None:
+            panes += [peer for peer in self.peer_panes() if peer != pane_id]
+        return {pane: _compact(self.client.read_scrollback(pane)).count(needle) for pane in panes}
+
+    def _fresh(self, pane_id: str, text: str, before: dict[str, int]) -> bool:
+        needle = _suffix(text, 40)
+        return _compact(self.client.read_scrollback(pane_id)).count(needle) > before.get(pane_id, 0)
+
+    def _deliver_checked(
+        self, pane_id: str, command: str, guarded: _GuardedTerminal,
+    ) -> SubmissionReceipt | None:
+        """Submit, then attribute the prompt to where it actually appeared."""
+        before = self._snapshot(pane_id, command)
+        try:
+            receipt = self.client.prompt_agent(pane_id, command, terminal=guarded)
+        except ProbableMisroute as exc:
+            self._countermand(pane_id, command, "identity-changed-after-write", str(exc))
+        except PromptNotStaged:
+            raise
+        except Exception as exc:
+            if guarded.effects == 0:
+                raise
+            # The outcome of a write is unknown (lost acknowledgement, composer
+            # failure). Text in the target is no proof of submission (an unsubmitted
+            # paste shows in the composer), so it stays possibly submitted; the read-back
+            # only looks for the prompt in another agent's pane.
+            self._located(pane_id, command, before, str(exc))
+            raise
+        self._read_back(pane_id, command, receipt, before)
+        return receipt
+
+    def _located(self, pane_id: str, text: str, before: dict[str, int], detail: str) -> None:
+        """After an unknown outcome: countermand a prompt that newly shows in another
+        agent's pane, otherwise record where it was (or was not) seen."""
+        deadline = time.monotonic() + READBACK_SECONDS
+        while True:
+            if self._fresh(pane_id, text, before):
+                self._log_readback(pane_id, text, "unknown-outcome-in-target", detail)
+                return
+            if time.monotonic() >= deadline:
+                break
+            time.sleep(min(0.25, max(0.0, deadline - time.monotonic())))
+        elsewhere = [peer for peer in before if peer != pane_id and self._fresh(peer, text, before)]
+        if len(elsewhere) == 1:
+            self._countermand(elsewhere[0], text, "prompt-in-another-pane", detail)
+        self._log_readback(pane_id, text, "unknown-outcome-not-seen", detail)
+
+    def _read_back(
+        self, pane_id: str, text: str, receipt: SubmissionReceipt | None, before: dict[str, int],
+    ) -> None:
+        """Confirm the prompt reached this record's pane, or countermand where it went.
 
         A receipt that saw the prompt printed is already a read-back of the verified
-        pane. Otherwise the pane's scrollback is read until the prompt appears, within
-        ``READBACK_SECONDS``. A prompt that never appears there is looked for in the
-        other registered agents' panes; found in exactly one, that agent is interrupted.
-        Not found anywhere (a long paste shows as a placeholder, a queued prompt later),
-        it is accepted on the recipient check alone.
+        pane. Otherwise the pane's scrollback is read until the prompt newly appears,
+        within ``READBACK_SECONDS``. A prompt that newly appears in exactly one other
+        registered agent's pane instead is countermanded there. Seen nowhere (a long
+        paste shows as a placeholder, a queued prompt later), it is accepted on the
+        recipient check and logged as unverified.
         """
-        def recipient_holds() -> bool:
+        def recipient_holds() -> None:
             try:
                 self.verify_recipient(pane_id)
             except RecipientChanged as exc:
-                self._recover_misroute(pane_id, text, "identity-changed-after-write", str(exc))
-                raise MisrouteRecovered(
-                    f"pane {pane_id} no longer holds agent {self.record.name!r} after the "
-                    f"prompt was written; the program there was told to ignore it: {exc}"
-                ) from exc
-            return True
+                self._countermand(pane_id, text, "identity-changed-after-write", str(exc))
 
         if receipt is not None and receipt.evidence in _PRINTED_EVIDENCE:
             recipient_holds()
             return
-        needle = _suffix(text, 40)
-        if len(needle) < 12:
-            recipient_holds()
-            return
         deadline = time.monotonic() + READBACK_SECONDS
         while True:
-            screen = self.client.read_scrollback(pane_id)
-            if needle in _compact(screen):
+            if self._fresh(pane_id, text, before):
                 recipient_holds()
                 return
             if time.monotonic() >= deadline:
                 break
             time.sleep(min(0.25, max(0.0, deadline - time.monotonic())))
         recipient_holds()
-        if self.peer_panes is None:
-            return
-        found = [
-            peer for peer in self.peer_panes() if peer != pane_id
-            and needle in _compact(self.client.read_scrollback(peer))
-        ]
-        if len(found) == 1:
-            self._recover_misroute(found[0], text, "prompt-in-another-pane",
-                                   f"not in pane {pane_id} after {READBACK_SECONDS:g}s")
-            raise MisrouteRecovered(
-                f"prompt for agent {self.record.name!r} appeared in pane {found[0]}, not in "
-                f"{pane_id}; the program there was told to ignore it"
-            )
+        elsewhere = [peer for peer in before if peer != pane_id and self._fresh(peer, text, before)]
+        if len(elsewhere) == 1:
+            self._countermand(elsewhere[0], text, "prompt-in-another-pane",
+                              f"not newly in pane {pane_id} after {READBACK_SECONDS:g}s")
+        self._log_readback(
+            pane_id, text,
+            "not-seen" if len(_suffix(text, 40)) >= _ATTRIBUTABLE else "short-prompt-not-seen",
+            f"accepted on the recipient check after {READBACK_SECONDS:g}s",
+        )
 
-    def _recover_misroute(self, wrong_pane: str, text: str, detection: str, detail: str) -> None:
-        """Interrupt the program that got this prompt, tell it to ignore it, and log it.
+    def _occupant(self, pane: str) -> tuple[str | None, str | None, CustomProcessIdentity | None]:
+        info = self.client.pane_info(pane)
+        harness = (self.client.harness_identity(pane, info.agent)
+                   if info.agent in _NOTE_HARNESSES else None)
+        return info.agent, info.terminal_id, harness
 
-        Nothing is typed into a pane that shows no supported harness: in a shell the
-        note could run as a command.
+    def _countermand(self, wrong_pane: str, text: str, detection: str, detail: str) -> NoReturn:
+        """Interrupt the program that got this prompt and tell it to ignore it, once.
+
+        The occupant seen now (terminal and harness process) is re-verified immediately
+        before the interrupt and before the note; if it cannot be, nothing more is
+        typed. Raises ``MisrouteRecovered`` (retry allowed) only when both were sent to
+        that verified occupant, otherwise ``ProbableMisroute`` (quarantine, no retry).
         """
-        observed_agent: str | None = None
-        observed_terminal: str | None = None
+        observed_agent = observed_terminal = None
         interrupted = note_sent = False
         skipped: str | None = None
         try:
-            info = self.client.pane_info(wrong_pane)
-            observed_agent, observed_terminal = info.agent, info.terminal_id
+            observed_agent, observed_terminal, occupant = self._occupant(wrong_pane)
         except HerdrUnavailable as exc:
-            skipped = f"pane unavailable: {exc}"
-        if skipped is None and observed_agent not in _NOTE_HARNESSES:
-            skipped = f"pane shows {observed_agent!r}, not a supported harness; nothing typed"
+            occupant, skipped = None, f"pane unavailable: {exc}"
+        if skipped is None and occupant is None:
+            skipped = (f"pane shows {observed_agent!r} without one verifiable harness process; "
+                       "nothing typed")
+        expect = (observed_terminal
+                  if observed_terminal is not None and self.client.input_expect_supported()
+                  else None)
+
+        def same_occupant() -> bool:
+            try:
+                return (self._occupant(wrong_pane)[1:] == (observed_terminal, occupant))
+            except HerdrUnavailable:
+                return False
+
         if skipped is None:
             try:
-                self.client.send_keys(wrong_pane, "esc")
-                interrupted = True
-                time.sleep(0.5)
-                self.client.agent_prompt(wrong_pane, MISROUTE_NOTE)
-                note_sent = True
+                if not same_occupant():
+                    skipped = "occupant changed before the interrupt; nothing typed"
+                else:
+                    self.client.send_keys(wrong_pane, "esc", expect_terminal=expect)
+                    interrupted = True
+                    time.sleep(0.5)
+                    if not same_occupant():
+                        skipped = "occupant changed after the interrupt; note not sent"
+                    else:
+                        self.client.agent_prompt(wrong_pane, MISROUTE_NOTE, expect_terminal=expect)
+                        note_sent = True
             except HerdrUnavailable as exc:
                 skipped = f"recovery input failed: {exc}"
-        self._log_misroute({
+        logged = self._log_misroute({
             "at": time.time(), "agent": self.record.name, "token": self.record.token,
             "detection": detection, "detail": detail,
             "intended_pane": self.record.pane_id, "intended_terminal": self.record.terminal_id,
@@ -1103,32 +1180,59 @@ class _WorkspaceClient:
             "note_sent": note_sent, "skipped": skipped,
             "message_id": self._inflight_message_id(text),
         })
+        suffix = "" if logged else " (the misroute log could not be written)"
+        if note_sent:
+            raise MisrouteRecovered(
+                f"prompt for agent {self.record.name!r} reached pane {wrong_pane} "
+                f"({detection}); that program was interrupted and told to ignore it: "
+                f"{detail}{suffix}"
+            )
+        raise ProbableMisroute(
+            f"prompt for agent {self.record.name!r} probably reached pane {wrong_pane} "
+            f"({detection}) and could not be countermanded ({skipped}): {detail}{suffix}"
+        )
 
     def _inflight_message_id(self, text: str) -> str | None:
+        """The message being delivered: its inflight file, matched by text or, since
+        the inflight barrier holds one message at a time, the only one present."""
         if self.queue is None:
             return None
-        for path in sorted((Path(self.queue) / "inflight").glob("*.json")):
+        paths = sorted((Path(self.queue) / "inflight").glob("*.json"))
+        for path in paths:
             try:
                 document = agent._read_queue_json(str(path), "queued message", require_private=True)
             except AgentDeliveryError:
                 continue
             if isinstance(document, dict) and document.get("text") == text:
                 return path.name[:-5]
-        return None
+        return paths[0].name[:-5] if len(paths) == 1 else None
 
-    def _log_misroute(self, entry: dict[str, object]) -> None:
-        """Append one durable line to the agent's misroute log beside its queue."""
+    def _append_log(self, filename: str, entry: dict[str, object]) -> bool:
+        """Append one fsynced line to a log beside the queue; False when it failed."""
         if self.queue is None:
-            return
-        path = Path(self.queue).parent / "misroutes.jsonl"
-        descriptor = os.open(
-            path, os.O_WRONLY | os.O_CREAT | os.O_APPEND | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600,
-        )
+            return False
         try:
-            os.write(descriptor, (json.dumps(entry, sort_keys=True) + "\n").encode("utf-8"))
-            os.fsync(descriptor)
-        finally:
-            os.close(descriptor)
+            descriptor = os.open(
+                Path(self.queue).parent / filename,
+                os.O_WRONLY | os.O_CREAT | os.O_APPEND | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600,
+            )
+            try:
+                os.write(descriptor, (json.dumps(entry, sort_keys=True) + "\n").encode("utf-8"))
+                os.fsync(descriptor)
+            finally:
+                os.close(descriptor)
+        except OSError:
+            return False
+        return True
+
+    def _log_misroute(self, entry: dict[str, object]) -> bool:
+        return self._append_log("misroutes.jsonl", entry)
+
+    def _log_readback(self, pane_id: str, text: str, result: str, detail: str) -> None:
+        self._append_log("readback.jsonl", {
+            "at": time.time(), "agent": self.record.name, "pane": pane_id,
+            "result": result, "detail": detail, "message_id": self._inflight_message_id(text),
+        })
 
     def _guarded(self) -> _GuardedTerminal:
         expect = None
@@ -1171,11 +1275,11 @@ class _WorkspaceClient:
             label = self.client.tab_label(record.tab_id) if presentation else record.name
             if label != record.name:
                 failures.append(f"tab label is {label!r}, expected {record.name!r}")
-        if record.session_value is not None and record._session_source != "asserted":
-            if info.session_value != record.session_value:
-                failures.append(
-                    f"native session is {info.session_value!r}, recorded {record.session_value!r}"
-                )
+        if not _session_matches(record, info):
+            failures.append(
+                f"native session is {info.session_agent!r}/{info.session_value!r}, recorded "
+                f"{record.session_agent or record.harness!r}/{record.session_value!r}"
+            )
         if failures:
             raise RecipientChanged(
                 f"refusing input to agent {record.name!r}: " + "; ".join(failures)
@@ -1354,16 +1458,7 @@ class _WorkspaceClient:
                 pane_id, self.record.harness, command,
             )
         if self.record.adapter != "herdr-pane":
-            try:
-                receipt = self.client.prompt_agent(pane_id, command, terminal=self._guarded())
-            except ProbableMisroute as exc:
-                self._recover_misroute(pane_id, command, "identity-changed-after-write", str(exc))
-                raise MisrouteRecovered(
-                    f"prompt for agent {self.record.name!r} reached another program in pane "
-                    f"{pane_id}, which was told to ignore it: {exc}"
-                ) from exc
-            self._read_back(pane_id, command, receipt)
-            return receipt
+            return self._deliver_checked(pane_id, command, self._guarded())
         if "\0" in command or "\x1b" in command:
             raise HerdrUnavailable(
                 "Muse pane prompts cannot contain NUL or terminal escape characters"
@@ -1452,11 +1547,8 @@ class _WorkspaceClient:
                 try:
                     self._guarded().send_keys(pane_id, "Enter")
                 except ProbableMisroute as exc:
-                    self._recover_misroute(pane_id, "Enter", "identity-changed-after-write", str(exc))
-                    raise MisrouteRecovered(
-                        f"the goal confirmation for agent {self.record.name!r} reached another "
-                        f"program in pane {pane_id}, which was told to ignore it: {exc}"
-                    ) from exc
+                    self._countermand(pane_id, "Enter", "identity-changed-after-write",
+                                      f"goal confirmation: {exc}")
             remaining = max(1, timeout_ms - int((time.monotonic() - started) * 1000))
             self.client.wait_agent_status(pane_id, status, remaining)
 
@@ -4503,8 +4595,10 @@ class ManagedAgents:
                     harness = self.client.harness_identity(record.pane_id, record.harness)
                     if harness is None:
                         raise AgentDeliveryError(
-                            f"cannot pin the foreground {record.harness} process of pane "
-                            f"{record.pane_id}; is the harness running in the foreground?"
+                            f"cannot pin the {record.harness} process of pane {record.pane_id}: "
+                            "an anchor needs the harness to be the pane's only foreground "
+                            "process; wait until it is idle at its prompt and run anchor "
+                            "again, or stop it and start a new agent"
                         )
                     changed = (record.terminal_id not in (None, info.terminal_id)
                                or record.harness_identity not in (None, harness))
@@ -4665,6 +4759,9 @@ class ManagedAgents:
         if current == old:
             record.name = new
             if not any(entry["journal_id"] == journal["journal_id"] for entry in record.name_history):
+                # A journal from before the history limit may find it full: keep the newest
+                # names rather than publish a record no edition can read.
+                del record.name_history[:max(0, len(record.name_history) - _MAX_NAME_HISTORY + 1)]
                 record.name_history.append({
                     "name": old, "renamed_at": journal["started_at"],
                     "journal_id": journal["journal_id"],
@@ -4707,8 +4804,7 @@ class ManagedAgents:
             failures.append(f"terminal is {info.terminal_id!r}, recorded {journal['terminal_id']!r}")
         if info.tab_id is not None and info.tab_id != journal["tab_id"]:
             failures.append(f"tab is {info.tab_id!r}, recorded {journal['tab_id']!r}")
-        if (record.session_value is not None and record._session_source != "asserted"
-                and info.session_value != record.session_value):
+        if not _session_matches(record, info):
             failures.append("the observed native session changed")
         if record.harness_identity is not None:
             if not self.client.verify_harness_identity(pane_id, record.harness_identity):
@@ -4812,8 +4908,7 @@ class ManagedAgents:
                 findings.append("label-mismatch")
         if record.adapter == "herdr" and agent_names.get(record.name) != record.pane_id:
             findings.append("herdr-name-mismatch")
-        if (record.session_value is not None and record._session_source != "asserted"
-                and info.session_value != record.session_value):
+        if not _session_matches(record, info):
             findings.append("session-mismatch")
         if info.agent is None:
             findings.append("harness-exited")

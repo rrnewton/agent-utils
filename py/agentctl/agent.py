@@ -2025,7 +2025,7 @@ def _drain(
                         _atomic_json(inflight_path, document, max_artifact_bytes=max_artifact_bytes)
                         _transition(inflight_path, path, max_artifact_bytes=max_artifact_bytes)
                         retained_path = path
-                        attempts += 1
+                        # The retry does not consume an attempt: the misroute count bounds it.
                         continue
                     except _PossiblySubmitted as exc:
                         attempts += 1

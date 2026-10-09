@@ -107,11 +107,13 @@ def test_misroute_into_a_shell_types_nothing_more(
         fake.infos[effect_pane] = replace(fake.infos[effect_pane], agent=None)
 
     fake.before_effect = harness_exits
-    with pytest.raises(AgentPending):
+    with pytest.raises(AgentPossiblySubmitted, match="could not be countermanded"):
         manager.send("worker", "nothing should follow this text")
     assert fake.keys_sent == [] and subagents.MISROUTE_NOTE not in fake.submitted
     [entry] = _misroutes(manager, "worker")
     assert entry["interrupted"] is False and "nothing typed" in str(entry["skipped"])
+    # Not countermanded, so not retried: quarantined for a human to look at.
+    assert _failed_documents(manager, "worker")[0]["probable_misroute"] is True
 
 
 def test_prompt_found_in_another_agents_pane_interrupts_that_agent_and_retries(
@@ -596,15 +598,16 @@ def test_doctor_reports_an_incomplete_rename(tmp_path: Path, monkeypatch: pytest
     assert report["clean"] is False
 
 
-def test_harness_identity_pins_the_harness_not_a_wrapper(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_harness_identity_refuses_an_ambiguous_foreground(monkeypatch: pytest.MonkeyPatch) -> None:
     def identity(pid: int) -> CustomProcessIdentity:
         return CustomProcessIdentity(
             version=1, boot_id="00000000-0000-0000-0000-000000000000",
             pid=pid, starttime_ticks=pid, executable_device=1, executable_inode=pid,
         )
 
-    foreground = [(200, "bash", "bash wrap.sh", "/bin/bash", None),
-                  (201, "claude", "claude --model x", "/usr/local/bin/claude", None)]
+    # A launcher named like the harness, with the real program as its child.
+    foreground = [(200, "bash", "bash /opt/claude", "/bin/bash", None),
+                  (201, "node", "node /opt/claude/cli.js", "/usr/bin/node", None)]
 
     class Client(HerdrClient):
         def process_info(self, pane_id: str) -> ProcessInfo:
@@ -614,8 +617,131 @@ def test_harness_identity_pins_the_harness_not_a_wrapper(monkeypatch: pytest.Mon
                         staticmethod(lambda pid: (identity(pid), 200, "/x")))
     monkeypatch.setattr(HerdrClient, "_process_executable", staticmethod(lambda pid: "/x"))
     client = Client(herdr_bin="herdr")
+    assert client.harness_identity("w1:p1", "claude") is None
+    # An anchor pinned earlier to the launcher no longer verifies either.
+    assert not client.verify_harness_identity("w1:p1", identity(200))
+    foreground[:] = [(201, "claude", "claude", "/usr/local/bin/claude", None)]
     pinned = client.harness_identity("w1:p1", "claude")
     assert pinned is not None and pinned.pid == 201
     assert client.verify_harness_identity("w1:p1", pinned)
-    foreground[1] = (202, "claude", "claude --model x", "/usr/local/bin/claude", None)
-    assert not client.verify_harness_identity("w1:p1", pinned)  # the wrapper survived; the harness did not
+    foreground[:] = [(202, "claude", "claude", "/usr/local/bin/claude", None)]
+    assert not client.verify_harness_identity("w1:p1", pinned)
+
+
+def test_countermand_stops_when_the_occupant_changes_after_the_interrupt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager, fake, pane = _started(tmp_path, monkeypatch)
+    real_keys = fake.send_keys
+
+    def swap_harness_on_esc(pane_id: str, keys: str, *, expect_terminal: str | None = None) -> None:
+        real_keys(pane_id, keys, expect_terminal=expect_terminal)
+        if keys == "esc":
+            fake.harness_pids[pane_id] = 777  # yet another program arrives after the Esc
+
+    monkeypatch.setattr(fake, "send_keys", swap_harness_on_esc)
+
+    def swap_once(effect_pane: str) -> None:
+        fake.before_effect = None
+        fake.harness_pids[effect_pane] = 999
+
+    fake.before_effect = swap_once
+    with pytest.raises(AgentPossiblySubmitted, match="note not sent"):
+        manager.send("worker", "work meant for the worker agent")
+    assert subagents.MISROUTE_NOTE not in fake.submitted
+    [entry] = _misroutes(manager, "worker")
+    assert entry["interrupted"] is True and entry["note_sent"] is False
+
+
+def test_old_matching_text_in_another_pane_is_not_a_misroute(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager, fake, pane = _started(tmp_path, monkeypatch)
+    manager.start("bystander", cwd=str(tmp_path), harness="claude")
+    other = manager.get("bystander").pane_id or ""
+    monkeypatch.setattr(subagents, "READBACK_SECONDS", 0.0)
+    text = "an instruction that also appeared in yesterday's transcript"
+    fake.transcripts[other] = [text]  # history, not this send
+    fake.infos["w1:void"] = fake.infos[pane]
+    fake.redirect_once[pane] = "w1:void"  # the target shows no echo this time
+    manager.send("worker", text)
+    assert fake.keys_sent == [] and _misroutes(manager, "worker") == []
+    readback = (manager._directory("worker") / "readback.jsonl").read_text(encoding="utf-8")
+    assert '"result": "not-seen"' in readback
+
+
+def test_lost_acknowledgement_after_a_write_elsewhere_is_countermanded(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager, fake, pane = _started(tmp_path, monkeypatch)
+    manager.start("bystander", cwd=str(tmp_path), harness="claude")
+    other = manager.get("bystander").pane_id or ""
+    monkeypatch.setattr(subagents, "READBACK_SECONDS", 0.0)
+    real = fake.agent_prompt
+    calls = {"count": 0}
+
+    def written_elsewhere_then_lost(pane_id: str, text: str, *, expect_terminal: str | None = None) -> None:
+        calls["count"] += 1
+        if calls["count"] == 1:
+            fake.redirect_once[pane_id] = other
+            real(pane_id, text, expect_terminal=expect_terminal)
+            raise HerdrUnavailable("acknowledgement lost")
+        real(pane_id, text, expect_terminal=expect_terminal)
+
+    monkeypatch.setattr(fake, "agent_prompt", written_elsewhere_then_lost)
+    manager.send("worker", "a long enough instruction for the worker only")
+    assert (other, "esc") in fake.keys_sent
+    assert fake.transcripts[pane][-1] == "a long enough instruction for the worker only"
+    [entry] = _misroutes(manager, "worker")
+    assert entry["detection"] == "prompt-in-another-pane"
+
+
+def test_short_prompt_without_echo_is_logged_unverified(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager, fake, pane = _started(tmp_path, monkeypatch)
+    monkeypatch.setattr(subagents, "READBACK_SECONDS", 0.0)
+    fake.infos["w1:void"] = fake.infos[pane]
+    fake.redirect_once[pane] = "w1:void"
+    manager.send("worker", "continue")
+    readback = (manager._directory("worker") / "readback.jsonl").read_text(encoding="utf-8")
+    assert '"result": "short-prompt-not-seen"' in readback
+
+
+def test_session_provider_change_refuses_input(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager, fake, pane = _started(tmp_path, monkeypatch)
+    record = manager.get("worker")
+    record.harness_identity = None  # session-anchored only
+    manager._save(record)
+    fake.infos[pane] = replace(fake.infos[pane], session_agent="codex")
+    with pytest.raises(AgentPending):
+        manager.send("worker", "hello")
+    assert "session-mismatch" in _findings(manager.doctor())["worker"]
+
+
+def test_old_journal_at_the_history_limit_completes_with_the_newest_names(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager, fake, _pane = _started(tmp_path, monkeypatch, "old")
+    record = manager.get("old")
+    record.name_history = [
+        {"name": "earlier", "renamed_at": 1.0, "journal_id": f"{index:032x}"}
+        for index in range(255)
+    ]
+    manager._save(record)
+    monkeypatch.setattr(fake, "rename_tab", lambda tab, label: (_ for _ in ()).throw(
+        HerdrUnavailable("simulated crash")))
+    with pytest.raises(HerdrUnavailable):
+        manager.rename("old", "new")
+    monkeypatch.undo()
+    monkeypatch.delenv("HERDR_WORKSPACE_ID", raising=False)
+    record_path = manager._directory("old") / "agent.json"
+    document = json.loads(record_path.read_text(encoding="utf-8"))
+    document["name_history"].append(
+        {"name": "earlier", "renamed_at": 1.0, "journal_id": f"{999:032x}"})  # now full
+    record_path.write_text(json.dumps(document), encoding="utf-8")
+    manager.rename("old", "new")
+    history = manager.get("new").name_history
+    assert len(history) == 256 and history[-1]["name"] == "old"

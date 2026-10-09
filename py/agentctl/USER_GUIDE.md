@@ -733,19 +733,27 @@ started, and an anchor: the harness process pinned at start or adoption, or a
 native session Herdr reported. A failure before anything was typed leaves the
 message pending (exit 75).
 
-After each prompt, agentctl reads the pane back: the prompt must show in that
-pane's scrollback within 5 seconds, unless the submission already saw it printed
-there. When a check after the write fails, or the prompt shows in another
-registered agent's pane instead, the program that received it is interrupted
-(Esc) and sent "Ignore the previous message: it was sent to the wrong agent by
-agentctl.", unless that pane shows no supported harness, in which case nothing
-is typed into it (a shell could run the note). Each case is appended to
-`.agentctl/NAME/misroutes.jsonl`, and the message returns to the queue: the
-retry re-checks the recipient and delivers only to the verified agent, so it
-stays pending (exit 75) while the pane holds another program. A message that
-misroutes twice is quarantined under `queue/failed` with
-`"probable_misroute": true` (exit 76). A prompt that never shows anywhere (a
-long paste shows only a placeholder) is accepted on the recipient check alone.
+After each prompt, agentctl reads the pane back. It counts the prompt's text in
+the target pane (and, for prompts of 12 or more characters, in the other
+registered agents' panes) before sending, and only text that appears after the
+send counts. The prompt must newly show in the target's scrollback within 5
+seconds, unless the submission already saw it printed there. When a check after
+the write fails, or the prompt newly shows in another registered agent's pane
+instead, agentctl countermands it once: it re-checks that the pane still holds
+the program it saw (terminal and harness process), sends Esc, re-checks, and
+sends "Ignore the previous message: it was sent to the wrong agent by
+agentctl.". If any re-check fails, or the pane shows no single verifiable
+harness (a shell could run the note), nothing more is typed. Each case is
+appended to `.agentctl/NAME/misroutes.jsonl`. A countermanded message returns
+to the queue: the retry re-checks the recipient and delivers only to the
+verified agent, so it stays pending (exit 75) while the pane holds another
+program. A message that could not be countermanded, or that misroutes twice,
+is quarantined under `queue/failed` with `"probable_misroute": true` (exit 76).
+A prompt that never shows anywhere (a long paste shows only a placeholder) is
+accepted on the recipient check alone and recorded in
+`.agentctl/NAME/readback.jsonl` as unverified. A write whose acknowledgement was
+lost and whose text cannot be found anywhere stays possibly submitted (exit 76)
+and is recorded there too.
 
 When `herdr status server` prints `capabilities: input-expect`, each write also
 carries the pinned terminal, and Herdr itself refuses a write to a pane that
