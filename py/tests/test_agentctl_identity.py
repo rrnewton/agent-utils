@@ -2,6 +2,9 @@
 from __future__ import annotations
 
 import json
+import math
+import time
+from collections.abc import Callable
 from dataclasses import replace
 from pathlib import Path
 from typing import cast
@@ -1070,3 +1073,92 @@ def test_relay_submission_needs_evidence_in_the_target(
     monkeypatch.setattr(client, "pane_info", lambda pane_id: replace(fake.infos[pane_id], status="idle"))
     with pytest.raises(AgentDeliveryError, match="delivery is unproven"):
         client.prompt_agent(pane, "a long enough instruction for the relayed worker")
+
+
+# The first prompt after start, and how a harness prints a prompt.
+
+class _VirtualClock:
+    """Monotonic time for read-back waits, advanced by sleeping instead of waiting."""
+
+    def __init__(self) -> None:
+        self.now = 1000.0
+        self.time, self.time_ns = time.time, time.time_ns
+
+    def monotonic(self) -> float:
+        return self.now
+
+    def sleep(self, seconds: float) -> None:
+        self.now += max(seconds, 0.0)
+
+
+def _harness_prints_late(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *, after: float | None,
+    shown: Callable[[str], str] = lambda text: text,
+) -> tuple[ManagedAgents, FakeManagedClient]:
+    """Each harness prints a prompt ``after`` seconds once it is submitted (never for
+    None), as ``shown`` renders it."""
+    manager, fake = setup(tmp_path, monkeypatch)
+    clock = _VirtualClock()
+    monkeypatch.setattr(subagents, "time", clock)
+    printed_at: dict[str, float] = {}
+    submit = fake.agent_prompt
+
+    def agent_prompt(pane_id: str, text: str, *, expect_terminal: str | None = None) -> None:
+        submit(pane_id, text, expect_terminal=expect_terminal)
+        printed_at[text] = math.inf if after is None else clock.now + after
+
+    def read_scrollback(pane_id: str) -> str:
+        assert pane_id in fake.infos
+        return "\n".join(shown(text) for text in fake.transcripts.get(pane_id, [])
+                         if printed_at.get(text, -math.inf) <= clock.now)
+
+    monkeypatch.setattr(fake, "agent_prompt", agent_prompt)
+    monkeypatch.setattr(fake, "read_scrollback", read_scrollback)
+    return manager, fake
+
+
+def test_start_brief_a_new_harness_prints_after_five_seconds_is_delivered(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager, fake = _harness_prints_late(tmp_path, monkeypatch, after=6.0)
+    brief = "a brief the new harness prints only after it finishes starting"
+    assert manager.start("worker", cwd=str(tmp_path), harness="claude", brief=brief)["lifecycle"] == "running"
+    assert fake.submitted == [brief] and _failed_documents(manager, "worker") == []
+
+
+def test_start_brief_a_new_harness_never_prints_is_quarantined_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager, fake = _harness_prints_late(tmp_path, monkeypatch, after=None)
+    brief = "a brief the new harness never prints anywhere"
+    with pytest.raises(AgentPossiblySubmitted, match="never showed in pane .* within 30s"):
+        manager.start("worker", cwd=str(tmp_path), harness="claude", brief=brief,
+                      working_timeout=30.0)
+    assert fake.submitted == [brief]  # never retried
+    [document] = _failed_documents(manager, "worker")
+    assert document["possibly_submitted"] is True
+
+
+def test_later_prompt_printed_after_five_seconds_stays_unproven(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The longer window belongs to the start brief alone.
+    manager, fake = _harness_prints_late(tmp_path, monkeypatch, after=6.0)
+    manager.start("worker", cwd=str(tmp_path), harness="claude")
+    with pytest.raises(AgentPossiblySubmitted, match="never showed in pane .* within 5s"):
+        manager.send("worker", "a later instruction printed only after six seconds")
+
+
+def test_prompt_printed_without_its_markdown_markup_is_delivered(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Claude prints `code` without backticks and **bold** without asterisks.
+    def rendered(text: str) -> str:
+        return "".join(char for char in text if char not in "`*")
+
+    manager, fake = _harness_prints_late(tmp_path, monkeypatch, after=0.0, shown=rendered)
+    brief = "read **issue 233** first; Eastern times come from `TZ=America/New_York date`"
+    manager.start("worker", cwd=str(tmp_path), harness="claude", brief=brief)
+    later = "then run `make validate` and report the **head** commit"
+    manager.send("worker", later)
+    assert fake.submitted == [brief, later] and _failed_documents(manager, "worker") == []

@@ -1358,3 +1358,104 @@ fn a_peer_pane_herdr_reports_missing_is_skipped_by_the_snapshot() {
         )]
     );
 }
+
+// The first prompt after start, and how a harness prints a prompt.
+
+/// Start `worker` with `brief` while its harness prints each prompt `print_after` its
+/// submission.
+fn start_printing_late(
+    fixture: &Fixture,
+    print_after: Duration,
+    brief: &str,
+    working_timeout: Duration,
+) -> Result<Value> {
+    *fixture.client.print_after.lock().unwrap() = Some(print_after);
+    fixture.manager().start(
+        "worker",
+        &fixture.root,
+        StartOptions {
+            workspace_id: Some("workspace".to_owned()),
+            brief: Some(brief.to_owned()),
+            delivery: DrainOptions {
+                working_timeout,
+                ..DrainOptions::default()
+            },
+            ..StartOptions::default()
+        },
+    )
+}
+
+#[test]
+fn a_start_brief_a_new_harness_prints_after_five_seconds_is_delivered() {
+    let fixture = Fixture::new();
+    let brief = "a brief the new harness prints only after it finishes starting";
+    let started = start_printing_late(
+        &fixture,
+        READBACK + Duration::from_secs(1),
+        brief,
+        Duration::from_secs(30),
+    )
+    .expect("delivered");
+    assert_eq!(started["lifecycle"], "running");
+    assert_eq!(runs(&fixture), [brief]);
+    assert!(failed_documents(&fixture, "worker").is_empty());
+}
+
+#[test]
+fn a_start_brief_a_new_harness_never_prints_is_quarantined_once() {
+    // The test read-back limit stands in for READBACK; the start brief waits its working
+    // timeout instead.
+    TEST_READBACK.with(|limit| limit.set(Some(Duration::from_millis(100))));
+    let fixture = Fixture::new();
+    let brief = "a brief the new harness never prints anywhere";
+    let error = start_printing_late(&fixture, Duration::MAX, brief, Duration::from_secs(1))
+        .expect_err("quarantined");
+    assert_eq!(
+        error.outcome(),
+        Some(agent::QueueOutcome::PossiblySubmitted),
+        "{error}"
+    );
+    assert!(
+        error
+            .to_string()
+            .contains("never showed in pane owned within 1s"),
+        "{error}"
+    );
+    assert_eq!(runs(&fixture), [brief]); // never retried
+    assert_eq!(
+        failed_documents(&fixture, "worker")[0]["possibly_submitted"],
+        true
+    );
+}
+
+#[test]
+fn a_later_prompt_printed_after_the_read_back_limit_stays_unproven() {
+    // The longer window belongs to the start brief alone.
+    TEST_READBACK.with(|limit| limit.set(Some(Duration::from_millis(100))));
+    let fixture = Fixture::new();
+    fixture.start(None);
+    *fixture.client.print_after.lock().unwrap() = Some(Duration::from_millis(600));
+    let error = send(&fixture, "worker", LONG).expect_err("quarantined");
+    assert_eq!(
+        error.outcome(),
+        Some(agent::QueueOutcome::PossiblySubmitted),
+        "{error}"
+    );
+    assert!(
+        error.to_string().contains("never showed in pane"),
+        "{error}"
+    );
+}
+
+#[test]
+fn a_prompt_printed_without_its_markdown_markup_is_delivered() {
+    // Claude prints `code` without backticks and **bold** without asterisks.
+    let fixture = Fixture::new();
+    *fixture.client.printed_without.lock().unwrap() = vec!['`', '*'];
+    let brief = "read **issue 233** first; Eastern times come from `TZ=America/New_York date`";
+    fixture.start(Some(brief.to_owned()));
+    let later = "then run `make validate` and report the **head** commit";
+    send(&fixture, "worker", later).expect("delivered");
+    assert_eq!(runs(&fixture), [brief, later]);
+    assert!(failed_documents(&fixture, "worker").is_empty());
+}

@@ -741,7 +741,11 @@ was closed) cannot receive the prompt: it is skipped and logged as
 `peer-skipped` in `.agentctl/NAME/readback.jsonl`; any other failure to read a
 pane before sending leaves the message pending. Delivery is reported only with evidence: the submission saw the
 prompt printed in the target, or the prompt newly shows in the target's
-scrollback within 5 seconds, and the recipient check still passes. Anything
+scrollback within 5 seconds (for the `start --file` brief, within the
+`--working-timeout`, since a harness that has just started can take longer to
+print its first prompt), and the recipient check still passes. Text is compared
+without whitespace and without the inline Markdown markup a harness may drop
+when it prints a prompt (`` ` ``, `*`, `_`, `~`, `\`). Anything
 else is quarantined under `queue/failed` (exit 76) for the operator, and is
 never retried automatically:
 

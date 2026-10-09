@@ -59,7 +59,7 @@ from agentctl.profiles import (
     workspace_for_registry,
 )
 from agentctl.submission import (
-    PromptNotStaged, SubmissionReceipt, _compact, _suffix, submit_verified,
+    PromptNotStaged, SubmissionReceipt, _compact, submit_verified,
 )
 
 _T = TypeVar("_T")
@@ -952,6 +952,10 @@ def _goal_replacement_selected(screen: str, objective: str) -> bool:
 READBACK_SECONDS = 5.0
 #: Shorter prompts are too common to attribute to another pane by their text.
 _ATTRIBUTABLE = 12
+#: Inline Markdown markup a harness may drop when it prints a submitted prompt (Claude
+#: shows `code` without its backticks); read-back compares the prompt and the scrollback
+#: with it removed from both.
+_RENDERED_MARKUP = frozenset("`*_~\\")
 #: Lines of scrollback each read-back reads; a read this long may have lost old lines.
 SCROLLBACK_LINES = 400
 #: Opt-in for countermanding a misroute; by default a misroute is only quarantined.
@@ -964,6 +968,16 @@ _PRINTED_EVIDENCE = ("prompt text appeared above the composer",
 #: What a program that received someone else's prompt is told after being interrupted.
 MISROUTE_NOTE = "Ignore the previous message: it was sent to the wrong agent by agentctl."
 _NOTE_HARNESSES = ("claude", "codex", "muse")
+
+
+def _readback_form(text: str) -> str:
+    """Text as read-back compares it: no whitespace and no droppable inline markup."""
+    return "".join(char for char in _compact(text) if char not in _RENDERED_MARKUP)
+
+
+def _readback_tail(text: str) -> str:
+    """The end of a prompt that read-back looks for in a pane."""
+    return _readback_form(text)[-40:]
 
 
 class RecipientUnanchored(RecipientChanged):
@@ -1060,6 +1074,7 @@ class _WorkspaceClient:
         expected_workspace: str | None = None,
         peer_panes: Callable[[], builtins.list[str]] | None = None,
         claims: Callable[[], builtins.list[tuple[str, str, str | None]]] | None = None,
+        readback_seconds: float | None = None,
     ) -> None:
         self.client, self.record = client, record
         self.goal_objective: str | None = None
@@ -1073,6 +1088,8 @@ class _WorkspaceClient:
         self.claims = claims
         #: Whether a misroute is countermanded (Esc and a note) instead of only quarantined.
         self.countermand_enabled = os.environ.get(COUNTERMAND_ENV) == "1"
+        #: A longer read-back limit than ``READBACK_SECONDS``, for a just-started harness.
+        self.readback_seconds = readback_seconds
 
     def _snapshot(self, pane_id: str, text: str) -> dict[str, int]:
         """Before sending: how often the prompt shows in the target and, for a prompt long
@@ -1083,7 +1100,7 @@ class _WorkspaceClient:
         skipped. Any other failure, for the target or a peer, is a failure.
         """
         panes = [pane_id]
-        if len(_suffix(text, 40)) >= _ATTRIBUTABLE and self.peer_panes is not None:
+        if len(_readback_tail(text)) >= _ATTRIBUTABLE and self.peer_panes is not None:
             panes += [peer for peer in self.peer_panes() if peer != pane_id]
         windows: dict[str, int] = {}
         for pane in panes:
@@ -1102,7 +1119,10 @@ class _WorkspaceClient:
 
     def _window(self, pane: str, text: str) -> int:
         """How often the text shows in the pane's scrollback."""
-        return _compact(self.client.read_scrollback(pane)).count(_suffix(text, 40))
+        tail = _readback_tail(text)
+        if not tail:
+            return 0
+        return _readback_form(self.client.read_scrollback(pane)).count(tail)
 
     def _observe(self, pane: str, text: str, before: dict[str, int]) -> str:
         """``fresh`` when the text shows more often than before. When it does not, a pane
@@ -1118,8 +1138,12 @@ class _WorkspaceClient:
             return "uncertain"
         return "absent"
 
+    def _readback_seconds(self) -> float:
+        """How long the target has to show a sent prompt."""
+        return max(READBACK_SECONDS, self.readback_seconds or 0.0)
+
     def _seen_in_target(self, pane_id: str, text: str, before: dict[str, int]) -> bool:
-        deadline = time.monotonic() + READBACK_SECONDS
+        deadline = time.monotonic() + self._readback_seconds()
         while True:
             if self._observe(pane_id, text, before) == "fresh":
                 return True
@@ -1176,7 +1200,8 @@ class _WorkspaceClient:
         """Prove the prompt reached this record's pane, or quarantine it.
 
         Evidence for the target: a receipt that saw the prompt printed there, or the
-        prompt newly in its scrollback within ``READBACK_SECONDS``, each followed by a
+        prompt newly in its scrollback within the read-back limit (``READBACK_SECONDS``,
+        or the working timeout for a start brief), each followed by a
         passing recipient check. Every other registered agent's pane is inspected as
         well. The prompt newly in exactly one of them, and not in the target, is a
         misroute (quarantined; countermanded only when that is enabled). Newly in the
@@ -1199,7 +1224,7 @@ class _WorkspaceClient:
         uncertain = [peer for peer, state in states.items() if state == "uncertain"]
         if len(fresh) == 1 and not in_target:
             self._countermand(fresh[0], text, "prompt-in-another-pane",
-                              f"not newly in pane {pane_id} after {READBACK_SECONDS:g}s")
+                              f"not newly in pane {pane_id} after {self._readback_seconds():g}s")
         if fresh or uncertain:
             self._log_readback(pane_id, text, "ambiguous", {"in_target": in_target, "peers": states})
             raise ProbableMisroute(
@@ -1213,7 +1238,7 @@ class _WorkspaceClient:
         logged = self._log_readback(pane_id, text, "not-seen", {"receipt": receipt is not None})
         raise AgentDeliveryError(
             f"prompt for agent {self.record.name!r} was submitted but never showed in pane "
-            f"{pane_id} within {READBACK_SECONDS:g}s; delivery is unproven"
+            f"{pane_id} within {self._readback_seconds():g}s; delivery is unproven"
             + ("" if logged else " (the read-back log could not be written)")
         )
 
@@ -2487,6 +2512,9 @@ class ManagedAgents:
                     self.client, record, queue=self._queue(name),
                     expected_workspace=project_workspace,
                     peer_panes=self._peer_panes(name), claims=self._peer_claims(name),
+                    # A just-started harness may take longer than READBACK_SECONDS to print
+                    # its first prompt; it gets as long as it has to start working.
+                    readback_seconds=working_timeout,
                 ))
                 agent.send(client, self._target(record), self._queue(name), brief,
                            ready_timeout=ready_timeout, working_timeout=working_timeout,

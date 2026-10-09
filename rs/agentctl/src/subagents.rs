@@ -1805,6 +1805,8 @@ struct WorkspaceClient<'a, A: ManagedApi + ?Sized> {
     queue: Option<&'a Path>,
     check_prompt: bool,
     expected_workspace: Option<String>,
+    /// A longer read-back limit than [`READBACK`], for a just-started harness.
+    readback: Option<Duration>,
 }
 
 impl<A: ManagedApi + ?Sized> WorkspaceClient<'_, A> {
@@ -2296,6 +2298,24 @@ fn readback_limit() -> Duration {
 }
 /// Shorter prompts are too common to attribute to another pane by their text.
 const ATTRIBUTABLE: usize = 12;
+/// Inline Markdown markup a harness may drop when it prints a submitted prompt (Claude shows
+/// `code` without its backticks); read-back compares the prompt and the scrollback with it
+/// removed from both.
+const RENDERED_MARKUP: [char; 5] = ['`', '*', '_', '~', '\\'];
+
+/// Text as read-back compares it: no whitespace and no droppable inline markup.
+fn readback_form(text: &str) -> String {
+    crate::submission::compact(text)
+        .chars()
+        .filter(|char| !RENDERED_MARKUP.contains(char))
+        .collect()
+}
+
+/// The end of a prompt that read-back looks for in a pane.
+fn readback_tail(text: &str) -> String {
+    let chars: Vec<char> = readback_form(text).chars().collect();
+    chars[chars.len().saturating_sub(40)..].iter().collect()
+}
 /// Longest wait for another pane's input lock before a countermand gives up.
 const COUNTERMAND_LOCK: Duration = Duration::from_secs(2);
 /// Lines of scrollback each read-back reads; a read this long may have lost old lines.
@@ -2325,7 +2345,7 @@ impl<A: ManagedApi + ?Sized> WorkspaceClient<'_, A> {
     /// and skipped. Any other failure, for the target or a peer, is a failure.
     fn snapshot(&self, pane_id: &str, text: &str) -> crate::error::Result<BTreeMap<String, usize>> {
         let mut panes = vec![pane_id.to_owned()];
-        if crate::submission::suffix(text, 40).chars().count() >= ATTRIBUTABLE {
+        if readback_tail(text).chars().count() >= ATTRIBUTABLE {
             panes.extend(self.peer_panes().into_iter().filter(|peer| peer != pane_id));
         }
         let mut windows = BTreeMap::new();
@@ -2357,9 +2377,16 @@ impl<A: ManagedApi + ?Sized> WorkspaceClient<'_, A> {
     /// How often the text shows in the pane's scrollback.
     fn window(&self, pane: &str, text: &str) -> crate::error::Result<usize> {
         let screen = self.client.read_scrollback(pane)?;
-        Ok(crate::submission::compact(&screen)
-            .matches(&crate::submission::suffix(text, 40))
-            .count())
+        let tail = readback_tail(text);
+        if tail.is_empty() {
+            return Ok(0);
+        }
+        Ok(readback_form(&screen).matches(&tail).count())
+    }
+
+    /// How long the target has to show a sent prompt.
+    fn readback_limit(&self) -> Duration {
+        readback_limit().max(self.readback.unwrap_or_default())
     }
 
     /// `fresh` when the text shows more often than before. When it does not, a pane that
@@ -2383,7 +2410,7 @@ impl<A: ManagedApi + ?Sized> WorkspaceClient<'_, A> {
         })
     }
 
-    /// Wait up to [`READBACK`] for the prompt to appear newly in the target pane.
+    /// Wait up to the read-back limit for the prompt to appear newly in the target pane.
     fn seen_in_target(
         &self,
         pane_id: &str,
@@ -2391,7 +2418,7 @@ impl<A: ManagedApi + ?Sized> WorkspaceClient<'_, A> {
         before: &BTreeMap<String, usize>,
         runtime: &dyn agent::AgentRuntime,
     ) -> crate::error::Result<bool> {
-        let deadline = runtime.monotonic() + readback_limit();
+        let deadline = runtime.monotonic() + self.readback_limit();
         loop {
             if self.observe(pane_id, text, before)? == "fresh" {
                 return Ok(true);
@@ -2450,7 +2477,8 @@ impl<A: ManagedApi + ?Sized> WorkspaceClient<'_, A> {
     /// Prove the prompt reached this record's pane, or countermand where it went.
     ///
     /// Evidence for the target: a receipt that saw the prompt printed there, or the prompt
-    /// newly in its scrollback within [`READBACK`]. Every other registered agent's pane is
+    /// newly in its scrollback within the read-back limit ([`READBACK`], or the working timeout
+    /// for a start brief). Every other registered agent's pane is
     /// inspected as well. The prompt newly in exactly one of them, and not in the target, is
     /// countermanded there. Newly in the target and a peer, in several peers, or a peer whose
     /// last occurrence moved nearer the end without a new one, cannot be told apart: the
@@ -2494,7 +2522,10 @@ impl<A: ManagedApi + ?Sized> WorkspaceClient<'_, A> {
                 other,
                 text,
                 "prompt-in-another-pane",
-                &format!("not newly in pane {pane_id} after {}s", READBACK.as_secs()),
+                &format!(
+                    "not newly in pane {pane_id} after {}s",
+                    self.readback_limit().as_secs()
+                ),
                 runtime,
             ));
         }
@@ -2523,7 +2554,7 @@ impl<A: ManagedApi + ?Sized> WorkspaceClient<'_, A> {
             "prompt for agent {} was submitted but never showed in pane {pane_id} within {}s; \
              delivery is unproven{}",
             repr(Some(&self.record.name)),
-            READBACK.as_secs(),
+            self.readback_limit().as_secs(),
             if logged {
                 ""
             } else {
@@ -4398,6 +4429,7 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
             queue: None,
             check_prompt: false,
             expected_workspace: None,
+            readback: None,
         }
     }
 
@@ -5480,7 +5512,10 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
         // Keep this generation's lifecycle lock through startup delivery and returned status.
         // Sending by name after releasing it can redirect the old brief into a replacement.
         if let Some(brief) = options.brief {
-            self.send_record(&record, &brief, options.delivery, None)?;
+            // A just-started harness may take longer than READBACK to print its first prompt;
+            // it gets as long as it has to start working.
+            let readback = Some(options.delivery.working_timeout);
+            self.send_record(&record, &brief, options.delivery, None, readback)?;
         }
         self.status(agent_name)
     }
@@ -5867,6 +5902,7 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
                 queue: None,
                 check_prompt: true,
                 expected_workspace: None,
+                readback: None,
             },
             &self.target(record)?,
         )?;
@@ -6006,6 +6042,7 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
                 queue: None,
                 check_prompt: false,
                 expected_workspace: None,
+                readback: None,
             },
             &self.target(record)?,
         )
@@ -6021,6 +6058,7 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
                 queue: None,
                 check_prompt,
                 expected_workspace: self.project_workspace()?,
+                readback: None,
             },
             &self.target(record)?,
         )
@@ -6328,6 +6366,7 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
                     queue: None,
                     check_prompt: true,
                     expected_workspace: None,
+                    readback: None,
                 };
                 let (_target_lock, source_info) =
                     agent::lock_resolved_target(&source_client, &previous_target)?;
@@ -6471,6 +6510,7 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
                 queue: None,
                 check_prompt: false,
                 expected_workspace: None,
+                readback: None,
             },
             &self.target(&record)?,
             runtime,
@@ -6518,6 +6558,7 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
             queue: None,
             check_prompt: false,
             expected_workspace: None,
+            readback: None,
         };
         let probe = self.target(record).and_then(|target| {
             agent::resolve_target(&client, &target)
@@ -6588,7 +6629,7 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
     ) -> Result<QueueResult> {
         let _lock = self.lock(agent_name)?;
         let record = self.load(agent_name)?;
-        self.send_record(&record, text, options, message_id)
+        self.send_record(&record, text, options, message_id, None)
     }
 
     /// Submit through an injected runtime that can interrupt bounded readiness waits.
@@ -6612,6 +6653,7 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
             queue: Some(&queue),
             check_prompt: true,
             expected_workspace: self.project_workspace()?,
+            readback: None,
         };
         agent::send_identified_managed_with_runtime(
             &client,
@@ -6654,6 +6696,7 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
         text: &str,
         options: DrainOptions,
         message_id: Option<&str>,
+        readback: Option<Duration>,
     ) -> Result<QueueResult> {
         record.input_allowed()?;
         let queue = self.queue(&record.name)?;
@@ -6665,6 +6708,7 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
             queue: Some(&queue),
             check_prompt: true,
             expected_workspace: self.project_workspace()?,
+            readback,
         };
         match message_id {
             Some(identifier) => agent::send_identified_managed(
@@ -6717,6 +6761,7 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
                 queue: Some(&self.queue(agent_name)?),
                 check_prompt: true,
                 expected_workspace: self.project_workspace()?,
+                readback: None,
             },
             &self.target(&record)?,
             &self.queue(agent_name)?,
@@ -6744,6 +6789,7 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
                 queue: Some(&queue),
                 check_prompt: true,
                 expected_workspace: self.project_workspace()?,
+                readback: None,
             },
             &self.target(&record)?,
             &queue,
@@ -6827,6 +6873,7 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
                 queue: None,
                 check_prompt: false,
                 expected_workspace: None,
+                readback: None,
             },
             &target,
             runtime,
@@ -7095,6 +7142,7 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
             queue: Some(&queue),
             check_prompt: true,
             expected_workspace: self.project_workspace()?,
+            readback: None,
         };
         let outcome = agent::send_identified_managed(
             &client,
@@ -8558,6 +8606,9 @@ pub(crate) mod tests {
                     swap_terminal_before_effect: AtomicBool::new(false),
                     fail_rename_tab: AtomicBool::new(false),
                     herdr_closed: Mutex::new(BTreeSet::new()),
+                    print_after: Mutex::new(None),
+                    printing: Mutex::new(Vec::new()),
+                    printed_without: Mutex::new(Vec::new()),
                 },
                 root,
             }
@@ -8758,6 +8809,13 @@ pub(crate) mod tests {
         fail_rename_tab: AtomicBool,
         /// Workspaces and panes Herdr has closed: lookups fail with its not-found codes.
         pub(crate) herdr_closed: Mutex<BTreeSet<String>>,
+        /// How long after its submission a prompt shows in the pane's scrollback, as a harness
+        /// that is still starting prints it; `None` shows it at once, `Duration::MAX` never.
+        pub(crate) print_after: Mutex<Option<Duration>>,
+        /// Prompts submitted but not shown yet: pane, printed text, and when it shows.
+        printing: Mutex<Vec<(String, String, Option<std::time::Instant>)>>,
+        /// Characters a harness drops when it prints a prompt, as Markdown rendering does.
+        pub(crate) printed_without: Mutex<Vec<char>>,
     }
     impl Fake {
         fn terminal(&self, pane: &str) -> String {
@@ -9321,15 +9379,45 @@ pub(crate) mod tests {
                 .unwrap()
                 .remove(pane)
                 .unwrap_or_else(|| pane.to_owned());
-            self.scrollback
-                .lock()
-                .unwrap()
-                .entry(written)
-                .or_default()
-                .push(text.to_owned());
+            let dropped = self.printed_without.lock().unwrap().clone();
+            let printed: String = text
+                .chars()
+                .filter(|char| !dropped.contains(char))
+                .collect();
+            match *self.print_after.lock().unwrap() {
+                None => self
+                    .scrollback
+                    .lock()
+                    .unwrap()
+                    .entry(written)
+                    .or_default()
+                    .push(printed),
+                Some(delay) => self.printing.lock().unwrap().push((
+                    written,
+                    printed,
+                    std::time::Instant::now().checked_add(delay),
+                )),
+            }
             self.run(pane, text)
         }
         fn read_scrollback(&self, pane: &str) -> AdapterResult<String> {
+            {
+                let now = std::time::Instant::now();
+                let mut scrollback = self.scrollback.lock().unwrap();
+                self.printing
+                    .lock()
+                    .unwrap()
+                    .retain(|(written, printed, at)| {
+                        let due = at.is_some_and(|at| at <= now);
+                        if due {
+                            scrollback
+                                .entry(written.clone())
+                                .or_default()
+                                .push(printed.clone());
+                        }
+                        !due
+                    });
+            }
             if self.herdr_closed.lock().unwrap().contains(pane) {
                 return Err(AdapterError::unavailable(format!(
                     r#"pane read {pane}: {{"error":{{"code":"pane_not_found","message":"pane {pane} not found"}}}}"#
@@ -10655,6 +10743,7 @@ pub(crate) mod tests {
             queue: None,
             check_prompt: false,
             expected_workspace: None,
+            readback: None,
         };
 
         let error = AgentApi::wait_agent_status(&client, "owned", "working", 30).unwrap_err();
