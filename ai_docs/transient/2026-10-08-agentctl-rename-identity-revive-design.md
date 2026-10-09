@@ -393,6 +393,26 @@ Known, not fixed here:
   serialised only by the occupant re-checks around each effect.
 - A harness that re-execs the same binary keeps pid, start time and inode, so it is indistinguishable.
 
+## H. Round 3 (2026-10-08): one invariant
+
+Rule: a path that cannot prove its outcome ends in quarantine (no automatic retry, surfaced to
+the operator). Delivered and `MisrouteRecovered` need positive evidence bound to the same
+occupant.
+
+| Finding | Resolution (both editions) |
+|---|---|
+| BLOCKING note without post-check | Before the note its text is counted in the wrong pane; after it, the occupant is re-checked and the note must newly show there within the read-back limit. Only then `MisrouteRecovered`; otherwise quarantine |
+| HIGH legacy launcher anchor | Anchors carry `anchor_rule` (2 = only-foreground-process rule); an anchor without it does not count, so input needs `agentctl anchor`, which rewrites it |
+| HIGH rolling window | Each pane's last occurrence is located by its distance from the window end; a count that did not rise while the last occurrence moved nearer the end is `uncertain`, and any uncertain peer quarantines. Output after an old occurrence only moves it away from the end, so a peer that merely keeps working stays clear |
+| HIGH no input lock on the wrong pane | The countermand takes the wrong pane's target lock with a bounded try (2 s; the sender already holds its own target lock, so it can never deadlock); failing to get it quarantines without typing |
+| HIGH target sighting suppressed peers | Peers are inspected in every case; the prompt new in the target and a peer, or in several peers, quarantines without a note |
+| MED snapshot failure before a write | Not staged: the message stays pending |
+| MED journal cap dropped liveness evidence | Evicted history names move to `former_names` (up to 4096), which the wrkslots probe reads |
+| MED read-back log failures silent | On a path accepted without being seen, a failed log write quarantines |
+
+Also: a verified submission the target never shows is now quarantined; a native prompt that is
+not seen still needs Herdr's working-state confirmation and is logged as not seen.
+
 ## C. What was built and how it was verified (2026-10-08)
 
 Both editions, one commit on the agent-utils branch:
