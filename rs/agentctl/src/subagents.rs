@@ -2321,7 +2321,8 @@ impl<A: ManagedApi + ?Sized> WorkspaceClient<'_, A> {
     /// Before sending: how often the prompt shows in the target and, for a prompt long enough
     /// to attribute, in every other registered agent's pane. Only occurrences beyond these are
     /// evidence about this send. A failure here happens before anything is typed, so it is not
-    /// staged.
+    /// staged. A peer pane Herdr reports as not found cannot receive the prompt: it is logged
+    /// and skipped. Any other failure, for the target or a peer, is a failure.
     fn snapshot(&self, pane_id: &str, text: &str) -> crate::error::Result<BTreeMap<String, usize>> {
         let mut panes = vec![pane_id.to_owned()];
         if crate::submission::suffix(text, 40).chars().count() >= ATTRIBUTABLE {
@@ -2329,12 +2330,26 @@ impl<A: ManagedApi + ?Sized> WorkspaceClient<'_, A> {
         }
         let mut windows = BTreeMap::new();
         for pane in panes {
-            let window = self.window(&pane, text).map_err(|error| {
-                AdapterError::not_staged(format!(
-                    "cannot read scrollback before sending: {error}; nothing was typed"
-                ))
-            })?;
-            windows.insert(pane, window);
+            match self.window(&pane, text) {
+                Ok(window) => {
+                    windows.insert(pane, window);
+                }
+                Err(error) => match missing_target(&error).filter(|_| pane != pane_id) {
+                    Some(missing) => {
+                        self.log_readback(
+                            pane_id,
+                            text,
+                            "peer-skipped",
+                            &json!({"peer": pane, "finding": missing, "detail": error.to_string()}),
+                        );
+                    }
+                    None => {
+                        return Err(AdapterError::not_staged(format!(
+                            "cannot read scrollback before sending: {error}; nothing was typed"
+                        )));
+                    }
+                },
+            }
         }
         Ok(windows)
     }
@@ -9256,6 +9271,11 @@ pub(crate) mod tests {
             self.run(pane, text)
         }
         fn read_scrollback(&self, pane: &str) -> AdapterResult<String> {
+            if self.herdr_closed.lock().unwrap().contains(pane) {
+                return Err(AdapterError::unavailable(format!(
+                    r#"pane read {pane}: {{"error":{{"code":"pane_not_found","message":"pane {pane} not found"}}}}"#
+                )));
+            }
             if self.fail_scrollback.lock().unwrap().as_deref() == Some(pane) {
                 return Err(AdapterError::unavailable("scrollback read failed"));
             }

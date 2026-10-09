@@ -1079,14 +1079,26 @@ class _WorkspaceClient:
         enough to attribute, in every other registered agent's pane. Only occurrences beyond these are evidence about this send.
 
         A failure here happens before anything is typed, so it leaves the message pending.
+        A peer pane Herdr reports as not found cannot receive the prompt: it is logged and
+        skipped. Any other failure, for the target or a peer, is a failure.
         """
         panes = [pane_id]
         if len(_suffix(text, 40)) >= _ATTRIBUTABLE and self.peer_panes is not None:
             panes += [peer for peer in self.peer_panes() if peer != pane_id]
-        try:
-            return {pane: self._window(pane, text) for pane in panes}
-        except (HerdrUnavailable, AgentDeliveryError) as exc:
-            raise PromptNotStaged(f"cannot read scrollback before sending: {exc}; nothing was typed") from exc
+        windows: dict[str, int] = {}
+        for pane in panes:
+            try:
+                windows[pane] = self._window(pane, text)
+            except (HerdrUnavailable, AgentDeliveryError) as exc:
+                missing = _missing_target(exc) if pane != pane_id else None
+                if missing is None:
+                    raise PromptNotStaged(
+                        f"cannot read scrollback before sending: {exc}; nothing was typed"
+                    ) from exc
+                self._log_readback(pane_id, text, "peer-skipped", {
+                    "peer": pane, "finding": missing, "detail": str(exc),
+                })
+        return windows
 
     def _window(self, pane: str, text: str) -> int:
         """How often the text shows in the pane's scrollback."""

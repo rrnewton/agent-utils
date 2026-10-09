@@ -1313,3 +1313,48 @@ fn a_snapshot_failure_before_any_write_leaves_the_message_pending() {
     );
     assert!(failed_documents(&fixture, "worker").is_empty());
 }
+
+#[test]
+fn a_peer_pane_herdr_reports_missing_is_skipped_by_the_snapshot() {
+    let fixture = Fixture::new();
+    fixture.start(None);
+    add_bystander(&fixture);
+    // Herdr closed the bystander's pane: it is gone from the list and reads are refused.
+    fixture
+        .client
+        .panes
+        .lock()
+        .unwrap()
+        .retain(|pane| pane.pane_id != "peer");
+    fixture
+        .client
+        .herdr_closed
+        .lock()
+        .unwrap()
+        .insert("peer".to_owned());
+    send(&fixture, "worker", LONG).expect("delivered");
+    assert!(runs(&fixture).contains(&LONG.to_owned()));
+    assert!(failed_documents(&fixture, "worker").is_empty());
+    let readback =
+        fs::read_to_string(registry(&fixture).join("worker").join("readback.jsonl")).unwrap();
+    let entries: Vec<(String, String, String)> = readback
+        .lines()
+        .map(|line| {
+            let entry: Value = serde_json::from_str(line).unwrap();
+            let text = |value: &Value| value.as_str().unwrap().to_owned();
+            (
+                text(&entry["result"]),
+                text(&entry["evidence"]["peer"]),
+                text(&entry["evidence"]["finding"]),
+            )
+        })
+        .collect();
+    assert_eq!(
+        entries,
+        [(
+            "peer-skipped".to_owned(),
+            "peer".to_owned(),
+            "pane-missing".to_owned()
+        )]
+    );
+}

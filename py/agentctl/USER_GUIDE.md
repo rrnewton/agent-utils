@@ -736,7 +736,10 @@ message pending (exit 75).
 After each prompt, agentctl reads the pane back. It counts the prompt's text in
 the target pane (and, for prompts of 12 or more characters, in the other
 registered agents' panes) before sending, and only text that appears after the
-send counts. Delivery is reported only with evidence: the submission saw the
+send counts. A peer pane Herdr reports as not found (its pane, tab or workspace
+was closed) cannot receive the prompt: it is skipped and logged as
+`peer-skipped` in `.agentctl/NAME/readback.jsonl`; any other failure to read a
+pane before sending leaves the message pending. Delivery is reported only with evidence: the submission saw the
 prompt printed in the target, or the prompt newly shows in the target's
 scrollback within 5 seconds, and the recipient check still passes. Anything
 else is quarantined under `queue/failed` (exit 76) for the operator, and is
