@@ -109,12 +109,41 @@ at all, so an answer can exist before the page has it: Main's refresh still repo
 reply count, and replies counted there that the page has not brought, posted since it last read the
 thread or All, count as possibly unread. The chip then says **M+ unread** beside what is known, or **N
 new** when nothing the page holds is unread, and the message is kept under both read modes until a
-read of the thread or of All brings those replies; a tap reads the thread rather than drawing it from
-All. Opened cold in Main, before All or the thread was ever read, every message with replies says so —
-the page cannot yet tell answered from read — until the first read of All. Replies older than
-anything read of the thread are not counted either way: **M+ unread** means older ones may not be
-loaded yet, and a thread with none it knows of unread or new says nothing. Discord's own threads give
-only an estimated count, so there nothing is inferred from it. `#222 unread-replies`.
+read of the thread or of All brings those replies. A tap reads the thread: it is drawn at once from
+what the page holds — the rows of an earlier visit, or the copy saved on the device — and the read
+behind them brings the reply and lands on it. Replies older than anything read of the thread are not
+counted either way: **M+ unread** means older ones may not be loaded yet, and a thread with none it
+knows of unread or new says nothing. Discord's own threads give only an estimated count, so there
+nothing is inferred from it. `#222 unread-replies`.
+
+**All is read behind Main when Main's counts call for it.** When a refresh of Main finds messages
+whose reply counts are ahead of the replies the page holds — always so when Main is opened cold, on a
+device that never read All, where every message with replies would otherwise say **N new** until All
+happened to be opened — the page reads All's newest page once, behind Main: no loading line, nothing
+waits on it, and a view switch is drawn from what is held as ever. The counts are then exact. It is
+not free: on Slack one read of All is about eleven of the chat service's calls (the channel's history,
+and one per thread it brings replies for); on Google Chat it is one more page. So it happens at most
+once every five minutes per channel, counted from the last read of All of any kind, including one
+saved on the device; only for news — a message already seen at the same count by the last such read
+does not ask again; and never while the page is hidden. A read that fails waits out the same five
+minutes. Discord's own threads never ask, having no exact counts.
+
+**Slack's All brings the replies of at most ten threads per page**, the ten most recently active
+among its messages, and says so in its notice. A thread past those ten is on the page with its count
+but none of its replies, which says nothing about them: the replies the page already holds for it
+stay held, counted and drawn, and its count says **N new** for any it has never held. A step back in
+All that brings an old thread without its replies counts them as old, not new.
+
+Known limits of the counts (`#222 unread-replies`):
+- A reply the page never held that is marked Done on another device still counts as new on its
+  message until a read of All or of the thread brings it: Main's refresh names Done replies by id,
+  and the page cannot tell which of a thread's unknown replies those are.
+- Your own reply posted from another client counts as **1 new** until such a read brings it — the
+  read behind Main above, at most five minutes later, or a tap.
+- On Slack a refresh of Main between full reads may not carry a message's new reply count; the next
+  full refresh, at most forty-five seconds later, does.
+- A Slack thread past the ten All brings replies for, whose replies this device has never held, says
+  **N new** until it is opened, or until a later read of All brings its replies.
 
 **Reactions show under each message.** Where the chat service reports them, a message's emoji
 reactions appear as a row of small chips under its text, each the emoji and how many reacted with it

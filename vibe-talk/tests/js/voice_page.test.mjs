@@ -3009,6 +3009,12 @@ const TUNING_BANDS = {
     "it and hides the reader's own words between the two answers around them; past three, a pair " +
     "or trio of long read messages between two unread ones is a screen of scrolling Collapse read " +
     "was chosen to take away"],
+  // `#222 unread-replies`. How seldom a read of Main may read All behind it for its counts.
+  COUNTS_ALL_READ_MS: [120000, 900000,
+    "the least time between two reads of All that Main's counts ask for. Under two minutes a reader " +
+    "sitting on Main while agents answer reads All, about eleven of Slack's calls, nearly as often " +
+    "as Main itself is polled; past a quarter of an hour, a read that failed on a cold open leaves " +
+    "every answered root saying 'N new' for that long"],
   UI_STATE_CHARS: [20000, 200000,
     "the whole record in UTF-16 units. A remembered thread carries its root message, so under " +
     "twenty thousand a few long roots push every other channel's choice out; past two hundred " +
@@ -9554,6 +9560,7 @@ async function tapInMainWithoutAll({ polled = true, answer = null } = {}) {
   const page = reloadWith(first.storage, data.messages, (p) => {
     p.threadingSupported = true;
     p.threads = data.threads;
+    holdCountsRead(p);
   });
   await reopenedChannel(page);
   await page.settle();
@@ -21748,11 +21755,36 @@ async function threadPage(view = null) {
 }
 
 /**
+ * `#222 unread-replies`. A read of Main that finds roots whose counts outrun what the page holds is
+ * followed by one read of All, behind it, for the counts (`readAllForCounts`) — and a page reopened in
+ * Main with no snapshot finds every answered root so. The tests whose subject is what the page does
+ * BEFORE All is read keep that page by leaving that read on the wire: every read of All's newest page
+ * sent while the reader is on Main is never answered. It is moved from `timelineCalls` and `requests`
+ * to `countsReads`, so the reads such a test counts are the ones it is about. Installed over any other
+ * stand-in for the server, last.
+ */
+function holdCountsRead(page) {
+  const serve = page.timeline;
+  page.countsReads = [];
+  page.timeline = (path, options) => {
+    const url = new URL(path, "http://fixture.test");
+    if (url.searchParams.get("view") === "flat" && !url.searchParams.get("before") && !url.searchParams.get("after") &&
+        page.el("thread-select").value === "main") {
+      page.countsReads.push(page.timelineCalls.pop());
+      page.requests.splice(page.requests.lastIndexOf(`GET ${path}`), 1);
+      return new Promise(() => {});
+    }
+    return serve(path, options);
+  };
+}
+
+/**
  * The same channel, read only in Main: the reader chose Main in an earlier session, and this device
  * no longer holds that session's snapshot — a full quota gives it up first — so the reopen reads
- * Main alone. A thread opened here is read for itself, where one opened with All covered is drawn
- * from All's rows (`#189 restore-ui-state` made All the default); this is the page the reading of a
- * thread, its cursor and its walk back are tested on.
+ * Main alone, and the read of All it asks for behind it for its counts is left on the wire
+ * (`holdCountsRead`). A thread opened here is read for itself, where one opened with All covered is
+ * drawn from All's rows (`#189 restore-ui-state` made All the default); this is the page the reading
+ * of a thread, its cursor and its walk back are tested on.
  */
 async function mainOnlyThreadPage() {
   const first = await threadPage("main");
@@ -21761,11 +21793,13 @@ async function mainOnlyThreadPage() {
   const page = reloadWith(first.storage, data.messages, (p) => {
     p.threadingSupported = true;
     p.threads = data.threads;
+    holdCountsRead(p);
   });
   await reopenedChannel(page);
   await page.settle();
   assert.deepStrictEqual(page.timelineCalls.map((call) => new URL(call, "http://fixture.test").searchParams.get("view")),
     ["main"], "the reopen read more than the Main the reader chose");
+  assert.equal(page.countsReads.length, 1, "the reopen did not ask for All behind Main, for its counts");
   return page;
 }
 
@@ -22575,7 +22609,10 @@ async function pagedMainOnly() {
   await showDiscord(first, messages);
   await pickThread(first, "main");
   first.storage.delete(MESSAGE_CACHE_KEY);
-  const page = reloadWith(first.storage, messages, arrange);
+  const page = reloadWith(first.storage, messages, (p) => {
+    arrange(p);
+    holdCountsRead(p);
+  });
   await reopenedChannel(page);
   await page.settle();
   assert.deepStrictEqual(page.timelineCalls.map(viewOf), ["main"], "the reopen read more than Main");
@@ -24085,7 +24122,10 @@ test("Load earlier pages the thread back from the server on its cursor, with a G
   await showDiscord(first, all);
   await pickThread(first, "main");
   first.storage.delete(MESSAGE_CACHE_KEY);
-  const page = reloadWith(first.storage, all, arrange);
+  const page = reloadWith(first.storage, all, (p) => {
+    arrange(p);
+    holdCountsRead(p);
+  });
   await reopenedChannel(page);
   await page.settle();
   await pickThread(page, `thread:${thread.id}`);
@@ -27791,6 +27831,7 @@ test("the choices kept are bounded, and the channel least recently on screen giv
       p.channels = [{ ...CHANNEL }, ...rooms];
       p.threadingSupported = true;
       p.threads = threadData().threads;
+      holdCountsRead(p);
     });
   };
 
@@ -28066,6 +28107,7 @@ async function forwardPage(options = {}, arrange = null, script = SCRIPT) {
     p.messages = data.messages;
     if (arrange) arrange(p);
     server = forwardTimeline(p, options);
+    holdCountsRead(p);
   });
   await reopenedChannel(page);
   await page.settle();
@@ -28365,6 +28407,7 @@ test("a cold start reads in full: no forward cursor is kept on the device", asyn
     p.threads = threadData().threads;
     p.messages = first.messages;
     server = forwardTimeline(p);
+    holdCountsRead(p);
   });
   await page.settle();
   await page.el("view-switch").click();
@@ -31513,17 +31556,23 @@ test("FROM THE COUNT, the thread opens on its first unread reply, unfolded, in e
 });
 
 test("A THREAD NOT ALL HELD counts what is held, as at least that many, and exactly once its thread is read", async () => {
-  // Reopened in Main with no snapshot: only Main was read, so the page holds no reply at all.
+  // Reopened in Main with no snapshot: only Main was read, so the page holds no reply at all — and
+  // the read of All it asks for behind Main, for these counts, is still on its way (`holdCountsRead`;
+  // landed, it makes them exact at once: see "A COLD OPEN IN MAIN" below).
   const first = newPage();
   await inboxOnMain(first, inboxChannel(first));
   first.storage.delete(MESSAGE_CACHE_KEY);
-  const arrange = (p) => inboxChannel(p);
+  const arrange = (p) => {
+    inboxChannel(p);
+    holdCountsRead(p);
+  };
   const page = reloadWith(first.storage, inboxChannel(newPage()), arrange);
   await reopenedChannel(page);
   await page.settle();
   assert.equal(page.el("thread-select").value, "main");
   assert.deepStrictEqual(page.timelineCalls.map((call) => new URL(call, "http://fixture.test").searchParams.get("view")),
     ["main"], "the reopen read more than Main");
+  assert.equal(page.countsReads.length, 1, "Main's read did not ask for All behind it");
   // Nothing held, but Main's read says each root has replies, and nothing has said they are read:
   // each says how many the page has not brought, and Hide read keeps them all — question B too,
   // whose one reply is Done, because keeping a read root errs the safe way for an inbox and hiding an
@@ -31967,4 +32016,455 @@ test("DONE FROM THE PINNED LIST on Main: a pinned reply dealt with there counts 
   assert.deepStrictEqual(unreadSaid(page), { 2: "1 unread", 5: null, 7: "1 unread" },
     "a reply dealt with in the Pinned list still counted as unread");
   assert.deepStrictEqual(page.timelineCalls.slice(reads), [], "the count waited for a read");
+});
+
+// --- `#222 unread-replies`, after the post-land review -------------------------------------------
+
+const SLACK_IDS = { a: "1700000000.000200", b: "1700000000.000500", c: "1700000000.000700" };
+const BOUND_NOTICE = "Flat view includes replies for at most 10 threads per page and the newest 50 replies of each; " +
+  "open a thread to read all of it.";
+
+/**
+ * From now on All's newest page leaves out every reply of the threads `left` names, as Slack's does
+ * past the ten threads it reads replies for, and says so in `notice` — Slack's own words by default.
+ * `left` is read at each read, so a test can change it.
+ */
+function allLeavingOut(page, left, notice = BOUND_NOTICE) {
+  const serve = page.timeline;
+  page.timeline = async (path, options) => {
+    const url = new URL(path, "http://fixture.test");
+    const answer = await serve(path, options);
+    if (url.searchParams.get("view") !== "flat" || url.searchParams.get("before")) return answer;
+    const body = JSON.parse(await answer.text());
+    const kept = body.messages.filter((m) => !(m.thread && left.includes(m.thread.id) && !m.thread.is_root));
+    const on = new Set(kept.map((m) => String(m.id)));
+    return json(200, { ...body, messages: kept, returned: kept.length, notice,
+      dismissed: body.dismissed.filter((id) => on.has(id)) });
+  };
+}
+
+test("SLACK'S BOUNDED ALL, leaving out a thread's replies, does not take them out of its root's count", async () => {
+  const page = newPage();
+  const messages = inboxChannel(page, SLACK_IDS);
+  await inboxOnMain(page, messages);
+  await chooseReadMode(page, "Hide read");
+  assert.deepStrictEqual(shownIds(page), [2, 7, 12].map(inboxId));
+  assert.deepStrictEqual(unreadSaid(page), { 2: "1 unread", 7: "2 unread" });
+  // Ten other threads are busier than question A's now: All's next page carries none of A's replies,
+  // and says it leaves some out.
+  allLeavingOut(page, [SLACK_IDS.a]);
+  await pickThread(page, "flat");
+  await reReadChannel(page);
+  assert.ok(rowWithId(page, inboxId(3)), "All dropped an unread reply its page only left out");
+  await pickThread(page, "main");
+  // Nothing was dealt with: 03, the agent's answer to A, is as unread as it was.
+  assert.ok(!page.dealtWith.has(inboxId(3)));
+  assert.deepStrictEqual(shownIds(page), [2, 7, 12].map(inboxId),
+    "Hide read hid question A, whose agent answer is unread, after a look at All");
+  assert.deepStrictEqual(unreadSaid(page), { 2: "1 unread", 7: "2 unread" });
+  await reReadChannel(page);
+  assert.deepStrictEqual(unreadSaid(page), { 2: "1 unread", 7: "2 unread" }, "Main's next read lost A's count");
+
+  // THE CONTROL: a page that says nothing of leaving anything out answers for every reply of a root it
+  // carries, so one it lacks is gone upstream — here every reply of A, as the page has it.
+  const plain = newPage();
+  await inboxOnMain(plain, inboxChannel(plain, SLACK_IDS));
+  allLeavingOut(plain, [SLACK_IDS.a], null);
+  await pickThread(plain, "flat");
+  await reReadChannel(plain);
+  assert.equal(rowWithId(plain, inboxId(3)), undefined, "a reply an unbounded page lacks was kept as though it were there");
+  await pickThread(plain, "main");
+  assert.equal(unreadChip(plain, inboxId(2)), null);
+  // ...and a bounded page whose root says its thread has no replies answers for every one held: A's
+  // were deleted upstream.
+  const emptied = newPage();
+  await inboxOnMain(emptied, inboxChannel(emptied, SLACK_IDS));
+  allLeavingOut(emptied, []);
+  emptied.messages = emptied.messages.filter((m) => m.id !== inboxId(3) && m.id !== inboxId(4))
+    .map((m) => (m.id === inboxId(2) ? { ...m, thread: { ...m.thread, reply_count: 0 } } : m));
+  await pickThread(emptied, "flat");
+  await reReadChannel(emptied);
+  assert.equal(rowWithId(emptied, inboxId(3)), undefined, "a reply deleted upstream was kept");
+  await pickThread(emptied, "main");
+  assert.equal(unreadChip(emptied, inboxId(2)), null);
+});
+
+test("A REPLY ONLY MAIN'S COUNT KNOWS OF stays \"1 new\" when a bounded All page passes over its thread, and counts once one carries it", async () => {
+  const page = newPage();
+  const messages = inboxChannel(page, SLACK_IDS);
+  await inboxOnMain(page, messages);
+  await chooseReadMode(page, "Hide read");
+  const [newB] = answeredUnseen(page, messages);
+  await reReadChannel(page);
+  assert.equal(unreadChip(page, inboxId(5)).textContent, "1 new");
+  const left = [SLACK_IDS.b];
+  allLeavingOut(page, left);
+  await pickThread(page, "flat");
+  await reReadChannel(page);
+  assert.equal(rowWithId(page, newB.id), undefined, "the fixture's All carried the answer after all");
+  await pickThread(page, "main");
+  assert.equal(unreadChip(page, inboxId(5)) && unreadChip(page, inboxId(5)).textContent, "1 new",
+    "question B's new answer, which nothing has brought, is no longer counted");
+  await reReadChannel(page);
+  assert.ok(rowWithId(page, inboxId(5)), "Hide read hid question B with its new answer unread");
+  assert.equal(unreadChip(page, inboxId(5)).textContent, "1 new");
+  // B's thread is among All's ten again: the answer is brought, and counted as held and unread.
+  left.length = 0;
+  await pickThread(page, "flat");
+  await reReadChannel(page);
+  await pickThread(page, "main");
+  assert.equal(unreadChip(page, inboxId(5)).textContent, "1 unread");
+});
+
+test("A STEP BACK in Slack's All that brings an old question without its replies counts them as old, and a new one as new", async () => {
+  const page = newPage();
+  page.threadingSupported = true;
+  const old = { id: "1700000000.002000", root_message_id: inboxId(20), is_root: true, reply_count: 2, reply_count_exact: true };
+  const under = { ...old, is_root: false };
+  const messages = [
+    message({ id: inboxId(20), content: "why is the queue slow?", thread: old, ...OWN }),
+    message({ id: inboxId(21), content: "a stuck consumer; restarted", thread: under, ...CODER }),
+    message({ id: inboxId(22), content: "thanks", thread: under, ...OWN }),
+    ...[30, 31, 32, 33, 34].map((n) => message({ id: inboxId(n), content: `update ${n}`, ...CODER })),
+  ];
+  page.dealtWith.add(inboxId(21));
+  page.threads = [{ id: old.id, root: messages[0], title: "queue", reply_count: 2, reply_count_exact: true,
+    updated_at: messages[2].timestamp }];
+  // Slack's All: the newest page is the newest messages; the step back is the old question, its thread
+  // not among the ten Slack reads replies for.
+  const serve = page.timeline;
+  page.timeline = async (path, options) => {
+    const url = new URL(path, "http://fixture.test");
+    const answer = await serve(path, options);
+    if (url.searchParams.get("view") !== "flat") return answer;
+    const body = JSON.parse(await answer.text());
+    const back = url.searchParams.get("before");
+    const rows = back ? body.messages.filter((m) => m.id === inboxId(20))
+      : body.messages.filter((m) => Number(m.id.slice(-2)) >= 30);
+    const on = new Set(rows.map((m) => m.id));
+    return json(200, { ...body, messages: rows, returned: rows.length, has_more: !back, next_before: back ? null : "older",
+      notice: back ? BOUND_NOTICE : null, dismissed: body.dismissed.filter((id) => on.has(id)) });
+  };
+  await signIn(page);
+  await showDiscord(page, messages);
+  await page.el("load-older").click();
+  await page.settle();
+  assert.ok(rowWithId(page, inboxId(20)), "the step back did not bring the old question");
+  assert.equal(rowWithId(page, inboxId(21)), undefined, "the step back brought the old question's replies");
+  await pickThread(page, "main");
+  await reReadChannel(page);
+  await reReadChannel(page);
+  assert.equal(unreadChip(page, inboxId(20)), null,
+    `an old question, its two replies read, says "${unreadChip(page, inboxId(20)) && unreadChip(page, inboxId(20)).textContent}"`);
+  // The agent answers it again, and nothing brings the answer: that one is new.
+  page.messages = [{ ...messages[0], thread: { ...old, reply_count: 3 } }, ...messages.slice(1),
+    message({ id: inboxId(40), content: "slow again", thread: under, ...CODER })];
+  await reReadChannel(page);
+  assert.equal(unreadChip(page, inboxId(20)) && unreadChip(page, inboxId(20)).textContent, "1 new");
+});
+
+/**
+ * In Show read: question B answered at length and dealt with in its thread, which this page holds
+ * from that visit, left scrolled to its top; then the agent answers B again, at length, which only
+ * Main's read reports. Long, so each answer is folded until a landing opens it, and the thread is
+ * taller than the screen. Answers the new reply.
+ */
+async function answeredAgainAfterVisit(page, messages) {
+  await chooseReadMode(page, "Show read");
+  const [short] = answeredUnseen(page, messages);
+  const newB = { ...short, content: longMessage("one page failed after all").repeat(3) };
+  page.messages = page.messages.map((m) => (m.id === newB.id ? newB : m));
+  await reReadChannel(page);
+  await unreadChip(page, inboxId(5)).click();
+  await page.settle();
+  assert.equal(viewsRead(page).at(-1), "thread");
+  assert.equal(rowWithId(page, newB.id).getAttribute("data-collapsed"), "false", "the first visit did not land on the answer");
+  await doneButton(rowWithId(page, newB.id)).click();
+  await page.settle();
+  page.el("scroll-area").scrollTop = 0;
+  await pickThread(page, "main");
+  assert.equal(unreadChip(page, inboxId(5)), null, "question B, all dealt with, still says it has news");
+  const b3 = { ...messages[4].thread, reply_count: 3 };
+  const again = message({ id: inboxId(17), content: longMessage("the docs build broke again").repeat(3),
+    thread: { ...b3, is_root: false }, ...CODER });
+  page.messages = [...page.messages.map((m) => (m.id === inboxId(5) ? { ...m, thread: b3 } : m)), again];
+  page.threads = page.threads.map((t) => (t.id === b3.id ? { ...t, reply_count: 3 } : t));
+  return again;
+}
+
+/** Whether `row` starts on screen, under the floating line: where a landing on it puts it. */
+const landedInView = (page, row) => {
+  const top = row.getBoundingClientRect().top;
+  return top >= floatingLine(page) && top < page.el("scroll-area").clientHeight;
+};
+
+/** Hold every read of a thread until `open()`. */
+function holdThreadReads(page) {
+  const serve = page.timeline;
+  const held = gate(serve);
+  page.timeline = (path, options) => (viewOf(path) === "thread" ? held.respond(path, options) : serve(path, options));
+  return held;
+}
+
+test("THE TAP ON \"1 new\" FOR A THREAD HELD FROM EARLIER draws it at once, reads it behind, and lands on the reply", async () => {
+  const page = newPage();
+  const messages = inboxChannel(page, SLACK_IDS);
+  await inboxOnMain(page, messages);
+  const again = await answeredAgainAfterVisit(page, messages);
+  await reReadChannel(page);
+  assert.equal(unreadChip(page, inboxId(5)).textContent, "1 new");
+  const reads = viewsRead(page).length;
+  const held = holdThreadReads(page);
+  // Not awaited: the tap's own promise settles with the read it starts, which is held.
+  unreadChip(page, inboxId(5)).click();
+  await page.settle();
+  // Up at once from what the page held, with the read on its way behind it.
+  assert.equal(page.el("thread-select").value, `thread:${SLACK_IDS.b}`);
+  assert.deepStrictEqual(shownIds(page), [5, 6, 13].map(inboxId), "the thread waited for its read with nothing up");
+  assert.equal(page.el("channel-loading").hidden, true, "the loading line stood over the held rows");
+  assert.deepStrictEqual(viewsRead(page).slice(reads), ["thread"],
+    "the thread held from earlier was not read for the reply its root reports");
+  held.open();
+  await page.settle();
+  await page.settle();
+  const landed = rowWithId(page, again.id);
+  assert.ok(landed, "the reply the reader tapped \"1 new\" for is not in the thread");
+  assert.equal(landed.getAttribute("data-collapsed"), "false", "the reply tapped for is folded: nothing landed on it");
+  assert.ok(landedInView(page, landed), `the reply tapped for is at ${landed.getBoundingClientRect().top}px, out of view`);
+  // Back on Main, B is read again only when the reply is.
+  await doneButton(landed).click();
+  await page.settle();
+  await pickThread(page, "main");
+  await chooseReadMode(page, "Hide read");
+  assert.equal(rowWithId(page, inboxId(5)), undefined);
+});
+
+test("...AFTER A RELOAD, the tap on \"1 new\" for a thread the device's copy covers reads it behind that cover too", async () => {
+  const page = newPage();
+  const messages = inboxChannel(page, SLACK_IDS);
+  await inboxOnMain(page, messages);
+  const again = await answeredAgainAfterVisit(page, messages);
+  await page.settle();
+  const reopened = reloadWith(page.storage, page.messages, (p) => {
+    p.threadingSupported = true;
+    p.dealtWith = page.dealtWith;
+    p.threads = page.threads;
+  });
+  await reopenedChannel(reopened);
+  await reopened.settle();
+  assert.equal(reopened.el("thread-select").value, "main");
+  assert.equal(unreadChip(reopened, inboxId(5)) && unreadChip(reopened, inboxId(5)).textContent, "1 new");
+  const reads = viewsRead(reopened).length;
+  await unreadChip(reopened, inboxId(5)).click();
+  await reopened.settle();
+  await reopened.settle();
+  assert.deepStrictEqual(viewsRead(reopened).slice(reads), ["thread"], "the saved cover was taken for the thread");
+  const landed = rowWithId(reopened, again.id);
+  assert.ok(landed, "the reply the reader tapped \"1 new\" for is not in the thread");
+  assert.equal(landed.getAttribute("data-collapsed"), "false", "the reply tapped for is folded: nothing landed on it");
+  assert.ok(landedInView(reopened, landed), `the reply tapped for is at ${landed.getBoundingClientRect().top}px, out of view`);
+
+  // THE CONTROL: a thread whose root reports nothing the cover lacks is drawn from it with no read.
+  await pickThread(reopened, "main");
+  await reReadChannel(reopened);
+  const before = viewsRead(reopened).length;
+  await pickThread(reopened, `thread:${SLACK_IDS.a}`);
+  await reopened.settle();
+  assert.deepStrictEqual(viewsRead(reopened).slice(before), [], "a thread All answers for was read on entry");
+});
+
+test("...WITH AN UNREAD REPLY HELD, the tap lands on it at once, and the read behind keeps it there", async () => {
+  const page = newPage();
+  const messages = inboxChannel(page, SLACK_IDS);
+  await inboxOnMain(page, messages);
+  // In Hide read the thread is short, its two unread answers: the landing leaves the list at its end,
+  // where a read that follows the newest line would carry the reader past the landing.
+  await chooseReadMode(page, "Hide read");
+  // Question C's thread, visited and left with its two answers unread.
+  await unreadChip(page, inboxId(7)).click();
+  await page.settle();
+  await pickThread(page, "main");
+  // The new answer is long: following the newest line down to it would take the landing off screen.
+  const [, short] = answeredUnseen(page, messages);
+  const newC = { ...short, content: longMessage("the fix merged").repeat(4) };
+  page.messages = page.messages.map((m) => (m.id === newC.id ? newC : m));
+  await reReadChannel(page);
+  assert.equal(unreadChip(page, inboxId(7)).textContent, "2+ unread");
+  const held = holdThreadReads(page);
+  unreadChip(page, inboxId(7)).click();
+  await page.settle();
+  const first = rowWithId(page, inboxId(8));
+  assert.ok(landedInView(page, first), "the tap did not land on the first unread reply it held");
+  const top = first.getBoundingClientRect().top;
+  held.open();
+  await page.settle();
+  await page.settle();
+  assert.ok(rowWithId(page, newC.id), "the read behind did not bring the new reply");
+  assert.equal(rowWithId(page, inboxId(8)).getBoundingClientRect().top, top, "the read moved the reader off the landing");
+});
+
+test("A REPLY DELETED UPSTREAM after its thread was read stops counting: the root's count read since is the thread's", async () => {
+  const page = newPage();
+  const messages = inboxChannel(page, SLACK_IDS);
+  await inboxOnMain(page, messages);
+  await chooseReadMode(page, "Hide read");
+  const [, newC] = answeredUnseen(page, messages);
+  await reReadChannel(page);
+  assert.equal(unreadChip(page, inboxId(7)).textContent, "2+ unread");
+  await unreadChip(page, inboxId(7)).click();
+  await page.settle();
+  assert.equal(viewsRead(page).at(-1), "thread");
+  for (const id of [inboxId(8), inboxId(9), newC.id]) {
+    await doneButton(rowWithId(page, id)).click();
+    await page.settle();
+  }
+  await pickThread(page, "main");
+  assert.equal(rowWithId(page, inboxId(7)), undefined, "question C, all dealt with, stayed");
+  // The newest answer is deleted upstream: C has three replies again, as its root says to All and Main.
+  const c3 = { ...messages[7].thread, reply_count: 3 };
+  page.messages = page.messages.filter((m) => m.id !== newC.id).map((m) => (m.id === inboxId(7) ? { ...m, thread: c3 } : m));
+  page.threads = page.threads.map((t) => (t.id === c3.id ? { ...t, reply_count: 3 } : t));
+  await pickThread(page, "flat");
+  await reReadChannel(page);
+  assert.equal(rowWithId(page, newC.id), undefined, "All kept the deleted reply");
+  await pickThread(page, "main");
+  await reReadChannel(page);
+  assert.equal(unreadChip(page, inboxId(7)), null,
+    `question C, every reply dealt with, says "${unreadChip(page, inboxId(7)) && unreadChip(page, inboxId(7)).textContent}"`);
+  assert.equal(rowWithId(page, inboxId(7)), undefined, "Hide read keeps question C for a deleted reply");
+  assert.equal(threadBadge(rowWithId(page, inboxId(2))).textContent, "Thread(2)");
+});
+
+const COUNTS_ALL_READ_MS = sourceConstant("COUNTS_ALL_READ_MS");
+
+/** Question A, B and C's Main, reopened with no copy on the device; `arrange` arranges its network. */
+async function coldInboxInMain(arrange = null) {
+  const first = newPage();
+  await inboxOnMain(first, inboxChannel(first));
+  first.storage.delete(MESSAGE_CACHE_KEY);
+  const page = reloadWith(first.storage, inboxChannel(newPage()), (p) => {
+    inboxChannel(p);
+    if (arrange) arrange(p);
+  });
+  await reopenedChannel(page);
+  await page.settle();
+  assert.equal(page.el("thread-select").value, "main");
+  return page;
+}
+
+test("A COLD OPEN IN MAIN reads All once, behind Main, and the counts are exact: through polls, a reload, and Done", async () => {
+  const page = await coldInboxInMain();
+  // Main first, drawn from its own read; then All, behind it, for the replies Main's counts report.
+  assert.deepStrictEqual(viewsRead(page), ["main", "flat"], "the cold open did not read All behind Main, once");
+  assert.equal(page.el("channel-loading").hidden, true);
+  // B's one reply is Done: nothing to say. Before, with no read of All, every root said "N new".
+  assert.deepStrictEqual(unreadSaid(page), { 2: "1 unread", 5: null, 7: "2 unread" });
+  await chooseReadMode(page, "Hide read");
+  assert.deepStrictEqual(shownIds(page), [2, 7, 12].map(inboxId));
+  for (let i = 0; i < 3; i += 1) await reReadChannel(page);
+  assert.deepStrictEqual(viewsRead(page), ["main", "flat", "main", "main", "main"], "Main's polls read All again");
+  // A reload: the device's copy holds All's read, so Main alone; and past the interval, a poll with
+  // nothing outrunning the store reads no All either.
+  const again = reloadWith(page.storage, page.messages, (p) => inboxChannel(p));
+  await reopenedChannel(again);
+  await again.settle();
+  again.setClock(again.clock() + 10 * 60 * 1000);
+  await reReadChannel(again);
+  assert.deepStrictEqual(viewsRead(again), ["main", "main"], "a reload with All held read it again");
+  assert.deepStrictEqual(unreadSaid(again), { 2: "1 unread", 7: "2 unread" });
+  // Done on question A's answer, in its thread: A goes.
+  await unreadChip(again, inboxId(2)).click();
+  await again.settle();
+  await doneButton(rowWithId(again, inboxId(3))).click();
+  await again.settle();
+  await pickThread(again, "main");
+  assert.deepStrictEqual(shownIds(again), [7, 12].map(inboxId));
+});
+
+test("...AND IF THAT READ OF ALL FAILS, the roots stay kept as \"N new\", and Main asks again only once the interval is up", async () => {
+  let failing = true;
+  const page = await coldInboxInMain((p) => {
+    const serve = p.timeline;
+    p.timeline = (path, options) => (failing && viewOf(path) === "flat"
+      ? json(502, { error: "discord_error", detail: "the provider is down" }) : serve(path, options));
+  });
+  assert.deepStrictEqual(viewsRead(page), ["main", "flat"]);
+  assert.equal(page.el("error").hidden, true, "a read nobody asked to see raised the error banner");
+  assert.deepStrictEqual(unreadSaid(page), { 2: "2 new", 5: "1 new", 7: "3 new" });
+  await chooseReadMode(page, "Hide read");
+  assert.deepStrictEqual(shownIds(page), [2, 5, 7, 12].map(inboxId), "a failed read of All let answered roots go");
+  failing = false;
+  await reReadChannel(page);
+  await reReadChannel(page);
+  assert.deepStrictEqual(viewsRead(page), ["main", "flat", "main", "main"], "a failed read of All was asked again at once");
+  page.setClock(page.clock() + COUNTS_ALL_READ_MS);
+  await reReadChannel(page);
+  assert.deepStrictEqual(viewsRead(page).slice(4), ["main", "flat"], "the interval up, Main did not ask for All again");
+  assert.deepStrictEqual(shownIds(page), [2, 7, 12].map(inboxId));
+  assert.deepStrictEqual(unreadSaid(page), { 2: "1 unread", 7: "2 unread" });
+});
+
+test("THE READ OF ALL FOR MAIN'S COUNTS IS BOUNDED: not while All is fresh, not for a count it already saw, again for one that grew", async () => {
+  const page = newPage();
+  const messages = inboxChannel(page, SLACK_IDS);
+  await inboxOnMain(page, messages);
+  answeredUnseen(page, messages);
+  // All was read at the open, a moment ago: Main's own read says B and C have news, and reads no All.
+  await reReadChannel(page);
+  assert.deepStrictEqual(unreadSaid(page), { 2: "1 unread", 5: "1 new", 7: "2+ unread" });
+  let reads = viewsRead(page).length;
+  assert.deepStrictEqual(viewsRead(page).slice(-1), ["main"]);
+  // Past the interval, the next read of Main reads All behind it. Slack's page leaves out B's replies.
+  allLeavingOut(page, [SLACK_IDS.b]);
+  page.setClock(page.clock() + COUNTS_ALL_READ_MS);
+  await reReadChannel(page);
+  assert.deepStrictEqual(viewsRead(page).slice(reads), ["main", "flat"]);
+  assert.deepStrictEqual(unreadSaid(page), { 2: "1 unread", 5: "1 new", 7: "3 unread" }, "All's read was not counted");
+  // Another interval on, B is as Main last saw it: All, which does not carry it, is not read for it again.
+  page.setClock(page.clock() + COUNTS_ALL_READ_MS);
+  reads = viewsRead(page).length;
+  await reReadChannel(page);
+  assert.deepStrictEqual(viewsRead(page).slice(reads), ["main"], "All was read again for a count it had already seen");
+  // B is answered once more: news, and the interval is up.
+  const b3 = { ...messages[4].thread, reply_count: 3 };
+  page.messages = [...page.messages.map((m) => (m.id === inboxId(5) ? { ...m, thread: b3 } : m)),
+    message({ id: inboxId(18), content: "and the index page", thread: { ...b3, is_root: false }, ...CODER })];
+  reads = viewsRead(page).length;
+  await reReadChannel(page);
+  assert.deepStrictEqual(viewsRead(page).slice(reads), ["main", "flat"], "a count that grew did not read All");
+  assert.equal(unreadChip(page, inboxId(5)).textContent, "2 new");
+  // Hidden, the page reads nothing it was not asked for.
+  page.setClock(page.clock() + COUNTS_ALL_READ_MS);
+  page.messages = page.messages.map((m) => (m.id === inboxId(5) ? { ...m, thread: { ...b3, reply_count: 4 } } : m));
+  await page.setVisibility("hidden");
+  reads = viewsRead(page).length;
+  await reReadChannel(page);
+  assert.ok(!viewsRead(page).slice(reads).includes("flat"), "a hidden page read All for its counts");
+});
+
+test("A ROOT HIDE READ KEEPS SHOWS ITS CHIP, drawn from a copy that has no thread record yet", async () => {
+  // Slack's question has no thread until its first answer. The Threads list, read when the reader
+  // touches the picker, knows of the answer before Main's next read does.
+  const page = newPage();
+  const messages = inboxChannel(page, SLACK_IDS);
+  const asked = message({ id: inboxId(15), content: "can you check the nightly?", ...OWN });
+  await inboxOnMain(page, [...messages, asked]);
+  await chooseReadMode(page, "Hide read");
+  assert.equal(rowWithId(page, asked.id), undefined, "the owner's own question is read, and hidden");
+  const thread = { id: "1700000000.001500", root_message_id: asked.id, is_root: true, reply_count: 1, reply_count_exact: true };
+  page.threads = [...page.threads, { id: thread.id, root: { ...asked, thread }, title: "nightly", reply_count: 1,
+    reply_count_exact: true, updated_at: asked.timestamp }];
+  page.setClock(page.clock() + 5 * 60 * 1000);
+  await page.el("thread-select").dispatch("pointerdown");
+  await page.settle();
+  assert.ok(viewsRead(page).includes("threads"), "the Threads list was not read");
+  const root = rowWithId(page, asked.id);
+  assert.ok(root, "Hide read hid the question the Threads list says is answered");
+  assert.equal(unreadChip(page, asked.id) && unreadChip(page, asked.id).textContent, "1 new",
+    "Hide read kept the question with nothing to say why");
+});
+
+test("THE UNREAD COUNT AND N REPLIES never break inside themselves on a narrow row", () => {
+  assert.match(cssBlock(".thread-unread"), /white-space:\s*nowrap/);
+  assert.match(cssBlock(".thread-replies"), /white-space:\s*nowrap/);
 });

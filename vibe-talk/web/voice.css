@@ -726,6 +726,9 @@ body {
   display: block;
   width: fit-content;
   margin-top: 0.6rem;
+  /* `#222 unread-replies`. One line each, so on a narrow row the unread count beside it moves down
+     whole rather than either chip breaking inside itself ("about 52 / replies"). */
+  white-space: nowrap;
 }
 
 /* `#222 unread-replies`. On Main, beside a root's N replies, how many of them are unread: "12 replies
@@ -743,6 +746,7 @@ body {
   min-height: 2rem;
   font-size: 0.85rem;
   margin-top: 0.6rem;
+  white-space: nowrap;
 }
 
 /* N replies gives up its line to share it. */

@@ -25,8 +25,10 @@ touch) and 1280x800 (a desk, mouse) the walk is:
   again: the first row is the answer, unfolded, under the pill -> `#222 unread-replies`: pick Main,
   still in Hide read: the owner's question, read as his own words, is kept because four of its
   replies are unread, and says "4 unread" in the accent beside its "52 replies", on one line, over
-  the veil its read row is faded under -> tap that count: the thread opens on the answer, unfolded,
-  under the pill. No horizontal overflow and no page error at any step.
+  the veil its read row is faded under; the longest words the two chips take ("about 52 replies"
+  beside "12+ unread", "120 new") keep each chip on one line inside the row, side by side -> tap
+  that count: the thread opens on the answer, unfolded, under the pill. No horizontal overflow and
+  no page error at any step.
 
 Then, in a fresh profile at the same size, the thread is an OLD one: All's window holds only the
 answer and the six messages after it, and says there is more, so the thread's root precedes it.
@@ -388,6 +390,40 @@ MAIN_JS = """(root) => {
 }"""
 
 
+# `#222 unread-replies`: the longest words the two chips take, set on the row in place, measured, and put
+# back in one evaluation, so no redraw comes between. An estimated count ("about 52 replies") beside a
+# floor ("12+ unread"), and a count nothing has brought yet ("120 new"). Each chip must stay one line,
+# inside its row, with nothing scrolling sideways; whether the pair still shares a line is reported.
+LONG_PAIRS = [("about 52 replies", "12+ unread"), ("52 replies", "120 new"), ("about 120 replies", "120+ unread")]
+LONG_PAIRS_JS = """([root, pairs]) => {
+  const row = [...document.querySelectorAll('#discord-log > li')].find((li) => li.dataset.id === root);
+  const chip = row.querySelector(':scope > .thread-unread');
+  const replies = row.querySelector(':scope > .thread-replies');
+  const box = (node) => {
+    const r = node.getBoundingClientRect();
+    return {top: r.top, bottom: r.bottom, left: r.left, right: r.right, height: r.height};
+  };
+  const saved = [replies.textContent, chip.textContent];
+  const line = Math.max(box(chip).height, box(replies).height);
+  const edge = box(row).right;
+  const out = pairs.map(([words, count]) => {
+    replies.textContent = words;
+    chip.textContent = count;
+    const [r, c] = [box(replies), box(chip)];
+    return {
+      pair: words + ' + ' + count,
+      oneLine: Math.abs(c.top - r.top) <= 2 && c.left >= r.right,
+      whole: c.height <= line + 1 && r.height <= line + 1,
+      inside: c.right <= edge + 0.5 && r.right <= edge + 0.5,
+      overflow: document.scrollingElement.scrollWidth - window.innerWidth,
+      chip: c, replies: r,
+    };
+  });
+  [replies.textContent, chip.textContent] = saved;
+  return out;
+}"""
+
+
 def arguments() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument(
@@ -633,6 +669,23 @@ def walk(page: Page, touch: bool, size: str, shots: Path | None, collapsed: dict
     notes.append(f"Main, Hide read: the read question kept, '4 unread' beside '52 replies' at {chip_box['top']:.0f}px, "
                  f"{chip_box['width']:.0f}x{chip_box['height']:.0f}px, in the accent over the veil")
     shot("4b-main-unread-replies")
+    pairs_js: object = page.evaluate(LONG_PAIRS_JS, [ROOT_ID, [list(pair) for pair in LONG_PAIRS]])
+    check(isinstance(pairs_js, list) and len(pairs_js) == len(LONG_PAIRS), f"{size}: the long pairs measured nothing: {pairs_js!r}")
+    assert isinstance(pairs_js, list)
+    shared = []
+    for measured in pairs_js:
+        check(isinstance(measured, dict), f"{size}: a long pair measured nothing: {measured!r}")
+        assert isinstance(measured, dict)
+        pair = measured["pair"]
+        check(measured["whole"] is True, f"{size}: a chip of '{pair}' broke onto a second line inside itself: {measured}")
+        check(measured["inside"] is True, f"{size}: a chip of '{pair}' runs past its row: {measured}")
+        check(number(measured, "overflow") <= 0, f"{size}: '{pair}' makes Main scroll sideways")
+        if measured["oneLine"] is True:
+            shared.append(str(pair))
+    # The two pairs the owner's phone is likeliest to show stay on one line at either size.
+    check(f"{LONG_PAIRS[0][0]} + {LONG_PAIRS[0][1]}" in shared and f"{LONG_PAIRS[1][0]} + {LONG_PAIRS[1][1]}" in shared,
+          f"{size}: a long pair no longer shares one line: {pairs_js}")
+    notes.append(f"the longest pairs each one line, inside the row; side by side: {', '.join(shared) or 'none'}")
 
     # A real tap on the count enters the thread on its first unread reply.
     tap(page, f'#discord-log > li[data-id="{ROOT_ID}"] > .thread-unread', touch)

@@ -288,7 +288,8 @@ steps:
   # drawn from the rows All holds and read behind them, ends where one entered with every row held
   # does, its read held at a gate the walk opens rather than for a fixed time; and, `#222
   # unread-replies`, on Main under Hide read the read root is kept by its unread replies, says
-  # "4 unread" beside "52 replies", and a real tap on that count lands on the first of them.
+  # "4 unread" beside "52 replies", the longest pairs ("about 52 replies" and "12+ unread") stay one
+  # line each beside each other, and a real tap on that count lands on the first of them.
   # Measured under dagrun with the Main step: 17s wall on a host at load 320, 5.5s CPU, a 349MB peak.
   - group: check
     job: read-modes-browser

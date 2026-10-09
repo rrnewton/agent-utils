@@ -16,7 +16,9 @@ between its own messages, and intercepts every timeline request the browser send
   and All again, picked in the bar's real thread picker: no request at all, the list never empty and
   the loading line never shown -- watched on every change to either and on every frame -- and the
   message at the top of the screen where it was -> reload with the saved rows removed, so the page
-  reopens in Main, the view last chosen, and reads only Main -> pick All, which has never been read:
+  reopens in Main, the view last chosen, and reads only Main (the read of All it asks for behind
+  Main, for its roots' reply counts, `#222 unread-replies`, is failed here) -> pick All, which has
+  never been read:
   All is up at once from the rows the page holds, its one read held on the server meanwhile with the
   freshness pill saying it is refreshing, and merged when it lands, the reader's message still where
   it was, nothing read twice, and again no empty list and no loading line -> eight rows a read from
@@ -219,10 +221,21 @@ def walk(chromium: BrowserType, args: argparse.Namespace, label: str, width: int
             reads: list[str] = []
             # ...and each one's `before`, "" for a newest page.
             cursors: list[str] = []
+            # `#222 unread-replies`: a read of Main whose roots report replies the page does not hold
+            # reads All behind it, for the counts. While this is set, the next newest read of All is
+            # failed, as a network would fail it, and kept here rather than in `reads`: the page then
+            # has still never read All, which is what the walk's second stage is about.
+            fail_counts_read = threading.Event()
+            counts_reads: list[str] = []
 
             def counted(route: Route) -> None:
                 query = parse_qs(urlsplit(route.request.url).query)
                 view = query.get("view", [""])[0]
+                if view == "flat" and "before" not in query and fail_counts_read.is_set():
+                    fail_counts_read.clear()
+                    counts_reads.append(view)
+                    route.abort()
+                    return
                 if view != "threads":
                     reads.append(view)
                     cursors.append(query.get("before", [""])[0])
@@ -292,14 +305,20 @@ def walk(chromium: BrowserType, args: argparse.Namespace, label: str, width: int
             check(seen() == {"emptied": 0, "loading": 0}, f"{label}: switching between Main and All showed {seen()}")
             shot("1-local")
 
-            # 2. Reopened in Main with no saved rows, so All has never been read: picked, it is drawn
+            # 2. Reopened in Main with no saved rows, so All has never been read -- the read of All
+            # Main asks for behind it, for the counts its roots report, fails: picked, All is drawn
             # from what the page holds at once, read once behind those rows, and merged under the reader.
             pick("main")
             wait_rows(api.ids("main"), "Main was not drawn before the reload")
             page.evaluate(f"() => localStorage.removeItem({json.dumps(CACHE_KEY)})")
             reads.clear()
+            fail_counts_read.set()
             page.reload(wait_until="load")
             wait_rows(api.ids("main"), "the reload did not reopen on Main")
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline and not counts_reads:
+                page.wait_for_timeout(25)
+            check(counts_reads == ["flat"], f"{label}: reopening on Main did not ask for All behind it, once")
             check(reads == ["main"], f"{label}: reopening on Main read {reads}")
             page.evaluate(WATCH_JS)
             page.evaluate(PARK_JS, ANCHOR)
