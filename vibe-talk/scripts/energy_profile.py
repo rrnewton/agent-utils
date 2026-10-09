@@ -67,6 +67,7 @@ Build the binaries first (web/ is compiled into the server), then, for example:
         --repeats 3 --parallel 6 --out /tmp/energy
 
     scripts/energy_profile.py --report-only /tmp/energy     # re-aggregate saved results
+    scripts/energy_profile.py --report-only /tmp/energy --compare base,now   # side by side, with changes
 
 A full run (two builds, two profiles, every scenario, three repeats) is a few CPU-hours of
 Chromium and roughly an hour of wall time at --parallel 8, which is why it is not in the validate
@@ -1544,6 +1545,8 @@ def orchestrate(opts: argparse.Namespace) -> int:
     with concurrent.futures.ThreadPoolExecutor(opts.parallel) as pool:
         codes = list(pool.map(launch, jobs))
     report(out)
+    if opts.compare:
+        print(compare(out, opts.compare[0], opts.compare[1]))
     return 0 if all(c == 0 for c in codes) else 1
 
 
@@ -1629,6 +1632,49 @@ def report(out: Path) -> None:
     print(text)
 
 
+def compare(out: Path, before: str, after: str) -> str:
+    """Two builds of one run side by side, from its summary.json: each measure's median with its
+    (min-max) spread, and the change in the median. Written to compare.md as well."""
+    summary = obj(json.loads((out / "summary.json").read_text()))
+
+    def stat(segment: str, profile: str, build: str, metric: str, scale: float = 1.0) -> tuple[float, str] | None:
+        row = summary.get(f"{segment}|{profile}|{build}")
+        if not isinstance(row, dict) or metric not in row:
+            return None
+        cell = obj(row[metric])
+        med, low, high = num(cell["median"]) * scale, num(cell["min"]) * scale, num(cell["max"]) * scale
+        said = f"{med:.3g}" if num(cell["n"]) < 2 else f"{med:.3g} ({low:.3g}-{high:.3g})"
+        return med, said
+
+    def pair(segment: str, profile: str, metric: str, scale: float = 1.0) -> tuple[str, str, str]:
+        a, b = stat(segment, profile, before, metric, scale), stat(segment, profile, after, metric, scale)
+        if a is None or b is None:
+            return (a[1] if a else "-", b[1] if b else "-", "")
+        change = f"{100 * (b[0] - a[0]) / a[0]:+.0f}%" if a[0] else ""
+        return a[1], b[1], change
+
+    keys = sorted({tuple(text(k).split("|")[:2]) for k in summary})
+    lines = [f"| segment | profile | Chromium CPU s, {before} | {after} | change | renderer CPU s, {before} | "
+             f"{after} | change | layouts {before} → {after} | long tasks {before} → {after} | server CPU s "
+             f"{before} → {after} |", "|---|---|---|---|---|---|---|---|---|---|---|"]
+    snaps = [f"| checkpoint | profile | JS heap MB, {before} → {after} | nodes | listeners | rows |",
+             "|---|---|---|---|---|---|"]
+    for segment, profile in keys:
+        if stat(segment, profile, before, "chrome_cpu_s") or stat(segment, profile, after, "chrome_cpu_s"):
+            chrome, renderer = pair(segment, profile, "chrome_cpu_s"), pair(segment, profile, "renderer_cpu_s")
+            lay, longs, server = (pair(segment, profile, m) for m in ("layouts", "longtasks", "server_cpu_s"))
+            lines.append(f"| {segment} | {profile} | {' | '.join(chrome)} | {' | '.join(renderer)} | "
+                         f"{lay[0]} → {lay[1]} | {longs[0]} → {longs[1]} | {server[0]} → {server[1]} |")
+        elif stat(segment, profile, before, "Nodes") or stat(segment, profile, after, "Nodes"):
+            heap = pair(segment, profile, "JSHeapUsedSize", 1e-6)
+            nodes, listeners, rows = (pair(segment, profile, m) for m in ("Nodes", "JSEventListeners", "rows"))
+            snaps.append(f"| {segment} | {profile} | {heap[0]} → {heap[1]} | {nodes[0]} → {nodes[1]} | "
+                         f"{listeners[0]} → {listeners[1]} | {rows[0]} → {rows[1]} |")
+    said = "\n".join(lines) + "\n\n" + "\n".join(snaps) + "\n"
+    (out / "compare.md").write_text(said)
+    return said
+
+
 # =================================================================================================
 
 def arguments(argv: list[str]) -> argparse.Namespace:
@@ -1637,6 +1683,9 @@ def arguments(argv: list[str]) -> argparse.Namespace:
                    help="a vibe-talk server binary to measure, under a label; repeat for each build")
     p.add_argument("--out", default=None, help="directory for per-job JSON, logs and summary.{md,json}")
     p.add_argument("--report-only", metavar="DIR", help="only re-aggregate the results already in DIR")
+    p.add_argument("--compare", metavar="BEFORE,AFTER", type=lambda s: s.split(","), default=None,
+                   help="after the tables, put two of the run's build labels side by side, with the change "
+                        "in each median (also written to compare.md); with --report-only or a run")
     p.add_argument("--scenarios", default="a,b,ceg,d,f", type=lambda s: s.split(","),
                    help="jobs to run: a, b, ceg (c, e and g in one page), d, f, and p, the per-refresh "
                         "micro-benchmark, and e alone, both for comparing many builds (default: a,b,ceg,d,f)")
@@ -1684,8 +1733,12 @@ def arguments(argv: list[str]) -> argparse.Namespace:
 
 def main(argv: list[str]) -> int:
     opts = arguments(argv)
+    if opts.compare is not None and len(opts.compare) != 2:
+        raise SystemExit("--compare takes two build labels, BEFORE,AFTER")
     if opts.report_only:
         report(Path(opts.report_only))
+        if opts.compare:
+            print(compare(Path(opts.report_only), opts.compare[0], opts.compare[1]))
         return 0
     opts.chrome = opts.chrome or find_chrome()
     try:
