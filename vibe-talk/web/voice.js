@@ -3562,6 +3562,8 @@ const isComposer = (node) => Boolean(node) && COMPOSER_FIELDS.includes(String(no
  * @property {() => string} context Which list the pane is showing. A selection is kept per list.
  * @property {Map<string, KeySelection>} marks The selected message in each list the pane has shown.
  * @property {HTMLElement | null} row The row the keyboard selected, while it holds the `tabindex`.
+ * @property {HTMLElement | null} follow The selected row a page key scrolled away under, while the
+ *   ring waits for that scroll to end to follow it: one wait at a time (`followPageScroll`).
  */
 
 /**
@@ -3589,6 +3591,7 @@ const channelPane = {
   // Session-only and one short entry per list visited, for the reason `expandedIds` gives.
   marks: new Map(),
   row: null,
+  follow: null,
 };
 
 /** Every list the keys can move through. A second column is a second entry here. */
@@ -3773,22 +3776,42 @@ function noteClickedRow(pane, node) {
   markRow(pane, row, false);
 }
 
+/** The scrollers `followPageScroll` listens on: one `scrollend` listener each, added once, for good. */
+const followedScrollers = new Set();
+
 /**
  * The keyboard selection follows a page of scrolling. PgUp, PgDn and Space are the browser's, and
  * scroll the list under a selected row without moving the focus; once the scroll has come to rest,
  * the ring moves to the first message shown whole, so the next key acts on what is on screen. Only
  * a selection the keyboard made, and only while it still holds the focus. Without a `scrollend` event
  * (older browsers) the ring stays put, and the next arrow starts from the screen as it always does.
+ *
+ * ONE WAIT PER PANE, and none for a key that cannot move the list (`up`: PgUp or Shift+Space at the
+ * top; PgDn or Space at the end): a listener per key piled up under a held PgDn at the newest line,
+ * and the next scroll to end, the wheel's, then moved the ring, which the wheel never does.
  */
-function followPageScroll(pane, row) {
+function followPageScroll(pane, row, up) {
   const area = pane.scroller();
-  const settle = () => {
-    if (document.activeElement !== row || pane.row !== row) return;
-    if (rowInView(pane, row) && row.getBoundingClientRect().top >= pane.head() - 1) return;
-    const first = firstRowInView(pane);
-    if (first && first !== row) selectRow(pane, first, false);
-  };
-  if ("onscrollend" in area) area.addEventListener("scrollend", settle, { once: true });
+  pane.follow = null;
+  if (!("onscrollend" in area)) return;
+  const end = Math.max(0, Number(area.scrollHeight) - Number(area.clientHeight));
+  if (up ? area.scrollTop <= 0 : area.scrollTop >= end - 1) return;
+  pane.follow = row;
+  if (followedScrollers.has(area)) return;
+  followedScrollers.add(area);
+  area.addEventListener("scrollend", () => {
+    for (const each of KEY_PANES) if (each.scroller() === area) settleFollow(each);
+  });
+}
+
+/** A page key's scroll has come to rest: the ring to the first message shown whole, if its row has gone by. */
+function settleFollow(pane) {
+  const row = pane.follow;
+  pane.follow = null;
+  if (!row || document.activeElement !== row || pane.row !== row) return;
+  if (rowInView(pane, row) && row.getBoundingClientRect().top >= pane.head() - 1) return;
+  const first = firstRowInView(pane);
+  if (first && first !== row) selectRow(pane, first, false);
 }
 
 /**
@@ -3879,7 +3902,9 @@ function routeScrollKey(event, target) {
   }
   if (target && nodeWithin(area, target)) {
     const pane = currentScreen === "main" ? paneFor(target) : null;
-    if (pane && pane.row === target && (paging || key === " ")) followPageScroll(pane, target);
+    if (pane && pane.row === target && (paging || key === " ")) {
+      followPageScroll(pane, target, key === "PageUp" || (key === " " && Boolean(event.shiftKey)));
+    }
     return;
   }
   if (key === " " && pressedBySpace(target)) return;

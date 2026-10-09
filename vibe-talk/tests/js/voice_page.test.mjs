@@ -18160,6 +18160,40 @@ test("HELP LEFT BY THE SEARCH OR SETTINGS KEY forgets the ?: the next Help from 
   }
 });
 
+test("PgDn FROM THE SELECTED MESSAGE waits for ONE scroll to end, and for none at the end of the list", async () => {
+  const page = await keyboardPageAtTop();
+  const area = page.el("scroll-area");
+  // A browser with the event: the ring follows a page key once its scroll comes to rest.
+  area.onscrollend = null;
+  const waiting = () => (area.listeners.get("scrollend") || []).length;
+  await press(page, area, "ArrowDown");
+  assert.equal(selectedId(page), "1");
+  // At the top, PgUp cannot move the list, and nothing waits for a scroll that will not come.
+  await pressHere(page, "PageUp");
+  assert.equal(waiting(), 0, "PgUp at the top waited for a scroll");
+  // A held PgDn is one wait, not one per press.
+  for (let i = 0; i < 5; i += 1) await pressHere(page, "PageDown", { repeat: i > 0 });
+  assert.equal(waiting(), 1, `a held PgDn left ${waiting()} listeners waiting`);
+  // The browser's scroll comes to rest: the ring moves to the first message shown whole.
+  area.scrollTop += Math.round(SCROLL_VIEWPORT_PX * 0.875);
+  await area.dispatch("scrollend");
+  const followed = selectedId(page);
+  assert.notEqual(followed, "1", "the ring did not follow the page");
+  const box = channelRow(page, followed).getBoundingClientRect();
+  assert.ok(box.top >= 0 && box.bottom <= SCROLL_VIEWPORT_PX, `the ring followed to a row off screen: ${JSON.stringify(box)}`);
+  // A later scroll of the wheel finds nothing waiting: the wheel never moves the ring.
+  area.scrollTop += 2 * SCROLL_VIEWPORT_PX;
+  await area.dispatch("scrollend");
+  assert.equal(selectedId(page), followed, "a scroll of the wheel moved the ring");
+  // At the end of the list PgDn and Space cannot move it either.
+  area.scrollTop = area.scrollHeight - area.clientHeight;
+  await pressHere(page, "PageDown");
+  await pressHere(page, " ");
+  await area.dispatch("scrollend");
+  assert.equal(selectedId(page), followed, "PgDn at the end of the list moved the ring at the next scroll's end");
+  assert.equal(waiting(), 1, "the pane's one listener was added again");
+});
+
 test("? AND Ctrl+/ open the list of every key, and Esc goes back to where they were pressed", async () => {
   for (const [key, fields] of [["?", { shiftKey: true }], ["/", { ctrlKey: true }], ["/", { metaKey: true }]]) {
     const page = await keyboardPage();
