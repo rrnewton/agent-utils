@@ -613,6 +613,45 @@ def test_doctor_reports_an_incomplete_rename(tmp_path: Path, monkeypatch: pytest
     assert report["clean"] is False
 
 
+def test_doctor_reports_closed_workspaces_and_panes_per_record(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager, fake, _pane = _started(tmp_path, monkeypatch)
+    for name in ("stale", "closing"):
+        manager.start(name, cwd=str(tmp_path), harness="claude")
+    stale = manager.get("stale")
+    stale.workspace_id = "wP"  # a workspace Herdr has since closed
+    manager._save(stale)
+    closing = manager.get("closing").pane_id or ""
+    tab_labels, pane_info = fake.tab_labels, fake.pane_info
+
+    def refuse_closed_workspace(workspace_id: str) -> dict[str, str]:
+        if workspace_id == "wP":
+            raise HerdrUnavailable('tab list: {"error":{"code":"workspace_not_found",'
+                                   '"message":"workspace wP not found"}}')
+        return tab_labels(workspace_id)
+
+    def refuse_closed_pane(pane_id: str) -> AgentPaneInfo:
+        if pane_id == closing:  # closed after the pane list was read
+            raise HerdrUnavailable(f'pane get: {{"error": {{"code": "pane_not_found", '
+                                   f'"message": "pane {pane_id} not found"}}}}')
+        return pane_info(pane_id)
+
+    monkeypatch.setattr(fake, "tab_labels", refuse_closed_workspace)
+    monkeypatch.setattr(fake, "pane_info", refuse_closed_pane)
+    report = manager.doctor()
+    findings = _findings(report)
+    assert findings["stale"] == ["workspace-missing"]
+    assert findings["closing"] == ["pane-missing"]
+    assert findings["worker"] == []
+    assert report["clean"] is False
+    # Any other failure is an outage, not a finding: doctor still refuses to guess.
+    monkeypatch.setattr(fake, "tab_labels", lambda workspace_id: (_ for _ in ()).throw(
+        HerdrUnavailable("tab list: connection refused")))
+    with pytest.raises(HerdrUnavailable, match="connection refused"):
+        manager.doctor()
+
+
 def test_harness_identity_refuses_an_ambiguous_foreground(monkeypatch: pytest.MonkeyPatch) -> None:
     def identity(pid: int) -> CustomProcessIdentity:
         return CustomProcessIdentity(

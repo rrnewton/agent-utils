@@ -862,6 +862,40 @@ fn doctor_reports_an_incomplete_rename() {
     assert_eq!(report["clean"], false);
 }
 
+#[test]
+fn doctor_reports_closed_workspaces_and_panes_per_record() {
+    let fixture = Fixture::new();
+    fixture.start(None);
+    add_bystander(&fixture);
+    let mut stale = record(&fixture, "worker");
+    stale["name"] = json!("stale");
+    stale["token"] = json!("stale-generation");
+    stale["workspace_id"] = json!("wP"); // a workspace Herdr has since closed
+    stale["pane_id"] = json!("wP:p1");
+    stale["terminal_id"] = Value::Null;
+    write_record(&fixture, "stale", &stale);
+    // `peer` is still in the pane list but closes before its own lookup.
+    fixture
+        .client
+        .herdr_closed
+        .lock()
+        .unwrap()
+        .extend(["wP".to_owned(), "peer".to_owned()]);
+    let report = fixture.manager().doctor(false).unwrap();
+    assert_eq!(findings(&report, "stale"), ["workspace-missing"]);
+    assert_eq!(findings(&report, "bystander"), ["pane-missing"]);
+    assert!(findings(&report, "worker").is_empty(), "{report}");
+    assert_eq!(report["clean"], false);
+    // Any other failure is an outage, not a finding: doctor still refuses to guess.
+    fixture.client.herdr_closed.lock().unwrap().clear();
+    fixture
+        .client
+        .fail_pane_info_once
+        .store(true, Ordering::SeqCst);
+    let error = fixture.manager().doctor(false).expect_err("outage");
+    assert!(error.to_string().contains("pane query failed"), "{error}");
+}
+
 // Shared on-disk formats.
 
 #[test]

@@ -2307,6 +2307,16 @@ pub const MISROUTE_NOTE: &str =
     "Ignore the previous message: it was sent to the wrong agent by agentctl.";
 const NOTE_HARNESSES: [&str; 3] = ["claude", "codex", "muse"];
 
+/// The doctor finding for a Herdr refusal naming a closed workspace, tab, or pane.
+fn missing_target(error: &impl std::fmt::Display) -> Option<&'static str> {
+    match crate::client::herdr_error_code(&error.to_string())?.as_str() {
+        "workspace_not_found" => Some("workspace-missing"),
+        "tab_not_found" => Some("tab-missing"),
+        "pane_not_found" => Some("pane-missing"),
+        _ => None,
+    }
+}
+
 impl<A: ManagedApi + ?Sized> WorkspaceClient<'_, A> {
     /// Before sending: how often the prompt shows in the target and, for a prompt long enough
     /// to attribute, in every other registered agent's pane. Only occurrences beyond these are
@@ -4985,8 +4995,15 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
             .filter(|workspace| !workspace.is_empty())
             .collect();
         let mut labels = BTreeMap::new();
+        let mut missing_workspaces = BTreeSet::new();
         for workspace in workspaces {
-            labels.extend(self.client.tab_labels(workspace)?);
+            match self.client.tab_labels(workspace) {
+                Ok(found) => labels.extend(found),
+                Err(error) if missing_target(&error) == Some("workspace-missing") => {
+                    missing_workspaces.insert(workspace);
+                }
+                Err(error) => return Err(error.into()),
+            }
         }
         let mut claims: BTreeMap<&str, usize> = BTreeMap::new();
         for record in &records {
@@ -4998,7 +5015,19 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
             }
         }
         for record in &records {
-            let mut findings = self.doctor_findings(record, &panes, &agent_names, &labels)?;
+            let mut findings = if record
+                .workspace_id
+                .as_deref()
+                .is_some_and(|workspace| missing_workspaces.contains(workspace))
+            {
+                vec!["workspace-missing"]
+            } else {
+                match self.doctor_findings(record, &panes, &agent_names, &labels) {
+                    Ok(findings) => findings,
+                    // Closed between the pane list and this record's checks.
+                    Err(error) => vec![missing_target(&error).ok_or(error)?],
+                }
+            };
             if journal_names.contains(record.name.as_str()) {
                 findings.push("rename-incomplete");
             }
@@ -8454,6 +8483,7 @@ pub(crate) mod tests {
                     replace_harness_before_effect: AtomicBool::new(false),
                     swap_terminal_before_effect: AtomicBool::new(false),
                     fail_rename_tab: AtomicBool::new(false),
+                    herdr_closed: Mutex::new(BTreeSet::new()),
                 },
                 root,
             }
@@ -8652,6 +8682,8 @@ pub(crate) mod tests {
         swap_terminal_before_effect: AtomicBool,
         /// Whether `rename_tab` fails, as a crash inside a rename would.
         fail_rename_tab: AtomicBool,
+        /// Workspaces and panes Herdr has closed: lookups fail with its not-found codes.
+        pub(crate) herdr_closed: Mutex<BTreeSet<String>>,
     }
     impl Fake {
         fn terminal(&self, pane: &str) -> String {
@@ -8748,6 +8780,11 @@ pub(crate) mod tests {
         }
         fn pane_info(&self, pane: &str) -> AdapterResult<AgentPaneInfo> {
             self.pane_info_calls.fetch_add(1, Ordering::Relaxed);
+            if self.herdr_closed.lock().unwrap().contains(pane) {
+                return Err(AdapterError::unavailable(format!(
+                    r#"pane get: {{"error": {{"code": "pane_not_found", "message": "pane {pane} not found"}}}}"#
+                )));
+            }
             let fail_once = self.fail_pane_info_once.swap(false, Ordering::SeqCst);
             if self.fail_panes.load(Ordering::Relaxed) || fail_once {
                 return Err(AdapterError::unavailable(
@@ -9139,6 +9176,11 @@ pub(crate) mod tests {
                 .ok_or_else(|| AdapterError::unavailable(format!("missing tab {tab}")))
         }
         fn tab_labels(&self, workspace: &str) -> AdapterResult<BTreeMap<String, String>> {
+            if self.herdr_closed.lock().unwrap().contains(workspace) {
+                return Err(AdapterError::unavailable(format!(
+                    r#"tab list: {{"error":{{"code":"workspace_not_found","message":"workspace {workspace} not found"}}}}"#
+                )));
+            }
             let labels = self.labels.lock().unwrap();
             Ok(self
                 .panes

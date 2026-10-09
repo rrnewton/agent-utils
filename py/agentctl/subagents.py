@@ -36,6 +36,7 @@ from agentctl.client import (
     HerdrClient,
     Pane,
     PaneShellProof,
+    herdr_error_code,
     muse_auto_review_idle_composer,
     muse_idle_composer,
     muse_prompt_in_composer,
@@ -85,6 +86,20 @@ _NESTED_SESSION_SCHEMAS = frozenset({
 _NESTED_LAUNCH_SCHEMAS = frozenset({
     "agentctl-launch/v1", "agentctl-launch/v2",
 })
+
+
+#: Herdr error codes for a target that no longer exists, as doctor reports them.
+_MISSING_TARGETS = {
+    "workspace_not_found": "workspace-missing",
+    "tab_not_found": "tab-missing",
+    "pane_not_found": "pane-missing",
+}
+
+
+def _missing_target(exc: Exception) -> str | None:
+    """The doctor finding for a Herdr refusal naming a closed workspace, tab, or pane."""
+    code = herdr_error_code(str(exc))
+    return _MISSING_TARGETS.get(code) if code is not None else None
 
 
 def _session_matches(record: AgentRecord, info: AgentPaneInfo) -> bool:
@@ -4974,15 +4989,31 @@ class ManagedAgents:
         agent_names = self.client.agent_names()
         workspaces = sorted({record.workspace_id for record in records if record.workspace_id})
         labels: dict[str, str] = {}
+        missing_workspaces: set[str] = set()
         for workspace in workspaces:
-            labels.update(self.client.tab_labels(workspace))
+            try:
+                labels.update(self.client.tab_labels(workspace))
+            except HerdrUnavailable as exc:
+                if _missing_target(exc) != "workspace-missing":
+                    raise
+                missing_workspaces.add(workspace)
         claims: dict[str, list[str]] = {}
         for record in records:
             for key in (record.pane_id, record.terminal_id):
                 if key is not None:
                     claims.setdefault(key, []).append(record.name)
         for record in records:
-            findings = self._doctor_findings(record, panes, agent_names, labels)
+            if record.workspace_id in missing_workspaces:
+                findings = ["workspace-missing"]
+            else:
+                try:
+                    findings = self._doctor_findings(record, panes, agent_names, labels)
+                except HerdrUnavailable as exc:
+                    # Closed between the pane list and this record's checks.
+                    missing = _missing_target(exc)
+                    if missing is None:
+                        raise
+                    findings = [missing]
             if record.name in journal_names:
                 findings.append("rename-incomplete")
             if any(len(claims.get(key, [])) > 1 for key in (record.pane_id, record.terminal_id)

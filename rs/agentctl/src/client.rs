@@ -2905,6 +2905,16 @@ fn detail(output: &CommandOutput) -> String {
     }
 }
 
+/// The `code` of a Herdr error object quoted in `detail`, such as `pane_not_found`.
+pub(crate) fn herdr_error_code(detail: &str) -> Option<String> {
+    let compact: String = detail
+        .chars()
+        .filter(|character| !character.is_whitespace())
+        .collect();
+    let (_, rest) = compact.split_once("\"code\":\"")?;
+    rest.split_once('"').map(|(code, _)| code.to_owned())
+}
+
 /// Whether a refused input command reported Herdr's `expectation_failed` error code.
 fn expectation_failed(detail: &str) -> bool {
     detail

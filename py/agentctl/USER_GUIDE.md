@@ -786,7 +786,8 @@ wrkslots slots, chat bindings, and scheduled prompts that name OLD are not
 changed.
 
 `agentctl doctor` compares every record with Herdr and prints one JSON report:
-per record `pane-missing`, `harness-exited`, `harness-kind-mismatch`,
+per record `workspace-missing`, `tab-missing` and `pane-missing` (Herdr has
+closed it; doctor reports it and goes on to the other records), `harness-exited`, `harness-kind-mismatch`,
 `harness-replaced`, `terminal-mismatch`, `tab-moved`, `label-mismatch`,
 `herdr-name-mismatch`, `workspace-mismatch`, `rename-incomplete`,
 `unanchored`, `duplicate-claim`; per workspace `label-collision` and the

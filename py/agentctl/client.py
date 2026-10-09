@@ -68,6 +68,15 @@ _BOOT_ID = re.compile(
 )
 
 
+_HERDR_ERROR_CODE = re.compile(r'"code"\s*:\s*"([a-z_]+)"')
+
+
+def herdr_error_code(detail: str) -> str | None:
+    """The ``code`` of a Herdr error object quoted in ``detail``, such as ``pane_not_found``."""
+    match = _HERDR_ERROR_CODE.search(detail)
+    return match.group(1) if match else None
+
+
 def muse_startup_metadata(screen: str) -> tuple[str | None, str | None]:
     """Return a bounded Muse downgrade warning and its explicit effective effort.
 
