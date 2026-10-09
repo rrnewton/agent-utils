@@ -284,7 +284,9 @@ steps:
 
   # `#221 read-modes` in the browser engine: entering a thread lands on its first unread message,
   # unfolded, under the pill, in Show read, Collapse read and Hide read, at 412x915 and 1280x800; the
-  # collapsed run's line is a 44px target a real tap opens with the reader unmoved.
+  # collapsed run's line is a 44px target a real tap opens with the reader unmoved; and an old thread,
+  # drawn from the rows All holds and read behind them, ends where one entered with every row held
+  # does. Measured in the full gate: 18s wall, 4.8s CPU, a 329MB peak.
   - group: check
     job: read-modes-browser
     desc: a thread entered on its first unread, and a collapsed read run opened by a real tap, in current Chromium at 412x915 and 1280x800
@@ -295,7 +297,7 @@ steps:
     cpu_timeout: 45
     hint:
       resources: {browser: 1}
-      est_duration_s: 15
+      est_duration_s: 18
       classification: latency-bound
       rss_baseline_bytes: 1073741824
 

@@ -147,7 +147,7 @@ if (typeof window.ResizeObserver === "function") {
     el("frame-body").style.setProperty(
       "--scroll-tools-clearance", height > 0 ? `calc(${height}px + 0.5rem)` : "0px"
     );
-    if (landed) placeEntryLanding(entryLanding.row);
+    if (landed) placeEntryLanding(entryLanding.row, entryLanding.first);
     if (pinned) area.scrollTop = area.scrollHeight;
   }).observe(el("scroll-tools"));
 }
@@ -8150,6 +8150,9 @@ async function changeChannelView(view, threadId = null, summary = null) {
   // thread is laid out afresh, so runs of read messages opened on an earlier visit collapse again.
   threadEntryOwed = view === "thread" ? channelContextKey() : null;
   threadEntryAwaitsRead = false;
+  // ...and a landing made on an earlier visit is spent: a view this page held comes back with the
+  // rows it was made on, at the scroll position it left, and must not hold the reader there again.
+  entryLanding = null;
   if (view === "thread") openedReadRuns.delete(viewKey());
   ++discordLoadGeneration;
   stopReading();
@@ -8233,8 +8236,9 @@ async function changeChannelView(view, threadId = null, summary = null) {
   // Covered by nothing, but the store holds some of it: up at once, and read behind it.
   if (drawHeldRows(rows, came.freshAt, came.freshness)) {
     if (!(keepPlace && keepReaderPlace(place))) scrollToNewest();
-    // A thread lands on its first unread among those rows now, and the read behind them leaves it
-    // there (`keepEntryLanding`): the reader is moved once. `#221 read-modes`.
+    // A thread lands on its first unread among those rows now, and the read behind them keeps it
+    // there, or brings the root to the head above it when both fit (`keepEntryLanding`). `#221
+    // read-modes`.
     payThreadEntry();
     await readBehindSwitch();
     return;
@@ -8391,7 +8395,8 @@ let threadEntryOwed = null;
  * view-switch-instant`), because none of them was unread. Those rows are the thread's newest stretch,
  * from where All's window starts: an older message the read brings may still be unread. Paid only to
  * a reader still on the newest line, where the switch left them. One who has scrolled since has
- * chosen what to read, and is not moved.
+ * chosen what to read, and is not moved. Nor by a later read when that one fails: it is the read
+ * that answers the entry, and a poll's, forty-five seconds on, is not.
  */
 let threadEntryAwaitsRead = false;
 
@@ -8430,13 +8435,16 @@ function payThreadEntry() {
 }
 
 /**
- * The landing a read is about to rebuild the rows under, `{ ids, top }`: the messages of the row the
- * entry brought to the head, and where on screen that row stands now. Null when the reader has moved
- * since the landing, or there was none.
+ * The landing a read is about to rebuild the rows under, `{ ids, top, first, open }`: the messages
+ * of the row the entry brought to the head and where on screen that row stands now, and the
+ * messages of the first unread row it landed on and whether that row's fold is open. Null when the
+ * reader has moved since the landing, or there was none.
  */
 function entryLandingMark() {
   if (!entryLandingHolds()) return null;
-  return { ids: idsOf(entryLanding.row), top: entryLanding.row.getBoundingClientRect().top };
+  const { row, first } = entryLanding;
+  return { ids: idsOf(row), top: row.getBoundingClientRect().top, first: idsOf(first),
+    open: first.getAttribute("data-collapsed") === "false" };
 }
 
 /**
@@ -8445,19 +8453,66 @@ function entryLandingMark() {
  * and older replies arrive above the landed message, and the newest line may move below it. The read
  * keeps its reader by the row at the top of the screen, or on the newest line, and either can move
  * the landed message — a row above it that grows by a message the read brought, or a list that was
- * on its newest line because it ended just below the landing. So the landed message is put back
- * where it stood, in the rows the read drew, and the landing goes on holding from there. False, with
- * nothing moved, when the read did not draw it.
+ * on its newest line because it ended just below the landing. So the landing is made again on the
+ * rows the read drew, as entering the thread with all of them held would have made it:
+ *
+ * - THE ROOT, when it fits. An old thread is exactly one whose root precedes All's window, so the
+ *   held rows never hold it, and the rule that keeps the root above the first unread could not
+ *   apply until the read brought it (`entryHeadRow`). It applies now: the root goes to the head and
+ *   the message moves down under it, at most into the upper half of the screen.
+ * - Otherwise THE MESSAGE STAYS where it stood.
+ * - OPEN, as it was. A fold is kept by its row's first message, and the read can join an older
+ *   message of the same author at the head of the landed row: the row is then kept under that
+ *   message, which nobody opened. It is opened through its own control, so the record of opened
+ *   messages has it, and a fold the reader makes afterwards holds as any other.
+ *
+ * The landing goes on holding from there. False, with nothing moved, when the read did not draw the
+ * landed message.
  */
 function keepEntryLanding(mark) {
-  const row = shownRowFor([...el("discord-log").children].find((candidate) =>
-    idsOf(candidate).some((id) => mark.ids.includes(id))));
-  if (!row || row.hidden) return false;
+  const rows = [...el("discord-log").children];
+  const rowFor = (ids) => shownRowFor(rows.find((candidate) => idsOf(candidate).some((id) => ids.includes(id))));
+  const first = rowFor(mark.first);
+  if (!first || first.hidden) return false;
+  const fold = childByClass(first, "fold");
+  if (mark.open && fold && !first.hasAttribute("data-read-run") && first.getAttribute("data-collapsed") === "true") {
+    fold.click();
+  }
+  const head = entryHeadRow(first);
   const area = el("scroll-area");
-  area.scrollTop += row.getBoundingClientRect().top - mark.top;
-  entryLanding = { key: channelContextKey(), row, at: area.scrollTop };
-  renderJumpNewest();
+  if (head === first && rowFor(mark.ids) === first) {
+    area.scrollTop += first.getBoundingClientRect().top - mark.top;
+    entryLanding = { key: channelContextKey(), row: first, first, at: area.scrollTop };
+  } else {
+    placeEntryLanding(head, first);
+  }
+  renderScrollTools();
+  requestVisibleSummaries();
   return true;
+}
+
+/** Whether `row` is drawn as a message of its own: not hidden, not behind a run's line, not filtered out. */
+function drawnOnItsOwn(row) {
+  return !row.hidden && !row.hasAttribute("data-read-run") &&
+    !String(row.className).split(/\s+/).includes("search-hidden");
+}
+
+/**
+ * The row a landing on the first unread row `first` brings to the head of the list: the thread's
+ * root when it is drawn and `first` then still starts within `ENTRY_ROOT_ROOM` of the room under the
+ * floating line, else `first`. Measured with `first` open, as it is shown.
+ */
+function entryHeadRow(first) {
+  const area = el("scroll-area");
+  const head = floatingClearance(area) + REPLY_LANDING_GAP_PX;
+  const tools = el("scroll-tools");
+  const foot = area.getBoundingClientRect().top + area.clientHeight -
+    (tools.hidden ? 0 : tools.getBoundingClientRect().height);
+  const rootId = openThreadRootId();
+  const root = [...el("discord-log").children].find((row) => drawnOnItsOwn(row) && isOpenThreadRoot(row, rootId));
+  const rootFits = root && root !== first &&
+    first.getBoundingClientRect().top - root.getBoundingClientRect().top <= (foot - head) * ENTRY_ROOT_ROOM;
+  return rootFits ? root : first;
 }
 
 /**
@@ -8465,33 +8520,22 @@ function keepEntryLanding(mark) {
  * list holds nothing unread that is drawn.
  */
 function landOnFirstUnread() {
-  const rows = [...el("discord-log").children];
-  const drawn = (row) => !row.hidden && !row.hasAttribute("data-read-run") &&
-    !String(row.className).split(/\s+/).includes("search-hidden");
-  const first = rows.find((row) => drawn(row) && !rowIsRead(row));
+  const first = [...el("discord-log").children].find((row) => drawnOnItsOwn(row) && !rowIsRead(row));
   if (!first) return false;
   // Opened by its own control, which every row keeps whether or not the list of folds still holds
   // it — a view this page held, drawn again, comes back without its folds in that list.
   const fold = childByClass(first, "fold");
   if (fold && first.getAttribute("data-collapsed") === "true") fold.click();
-  const area = el("scroll-area");
-  const head = floatingClearance(area) + REPLY_LANDING_GAP_PX;
-  const tools = el("scroll-tools");
-  const foot = area.getBoundingClientRect().top + area.clientHeight -
-    (tools.hidden ? 0 : tools.getBoundingClientRect().height);
-  const rootId = openThreadRootId();
-  const root = rows.find((row) => drawn(row) && isOpenThreadRoot(row, rootId));
-  const rootFits = root && root !== first &&
-    first.getBoundingClientRect().top - root.getBoundingClientRect().top <= (foot - head) * ENTRY_ROOT_ROOM;
-  placeEntryLanding(rootFits ? root : first);
+  placeEntryLanding(entryHeadRow(first), first);
   renderScrollTools();
   requestVisibleSummaries();
   return true;
 }
 
 /**
- * Where the entry put the reader, as `{ key, row, at }`: the thread, the row it brought to the head
- * of the list, and the scroll position that did it. Null once the reader has moved.
+ * Where the entry put the reader, as `{ key, row, first, at }`: the thread, the row it brought to
+ * the head of the list, the first unread row it landed on (the same row, or the one under the root),
+ * and the scroll position that did it. Null once the reader has moved.
  *
  * KEPT, because entering a thread also changes what is around the list, and that is reported after
  * the landing. On a desk the thread picker takes the thread's name and the dock wraps onto a second
@@ -8506,11 +8550,14 @@ function landOnFirstUnread() {
  */
 let entryLanding = null;
 
-/** Bring `row` to just under the floating line, as near as the list allows, and keep it there. */
-function placeEntryLanding(row) {
+/**
+ * Bring `row` to just under the floating line, as near as the list allows, and keep it there, for
+ * the first unread row `first`: `row` itself, or the one under the root.
+ */
+function placeEntryLanding(row, first) {
   const area = el("scroll-area");
   area.scrollTop += row.getBoundingClientRect().top - floatingClearance(area) - REPLY_LANDING_GAP_PX;
-  entryLanding = { key: channelContextKey(), row, at: area.scrollTop };
+  entryLanding = { key: channelContextKey(), row, first, at: area.scrollTop };
 }
 
 /**
@@ -9478,18 +9525,23 @@ async function loadTimeline(options) {
       let messages = applyTimelinePage(payload);
       for (const page of older) messages = applyTimelinePage(page, true);
       settleAfterRead(messages, { keepPosition, area, ...at, ownAct });
-      if (landing) keepEntryLanding(landing);
       noteFreshRead(payload);
       saveChannelScope();
       renderScrollTools();
       requestVisibleSummaries();
-      // A thread entered with nothing of it on the page lands here, on its first read: LAST, once
-      // the freshness pill it lands under is up. `#221 read-modes`.
+      // A thread entered with nothing of it on the page lands here, on its first read, and one landed
+      // on held rows is landed again on what the read drew: LAST, once the freshness pill and the
+      // chips it is measured against are up, as on every other entry. `#221 read-modes`.
+      if (landing) keepEntryLanding(landing);
       payThreadEntry();
       return;
     }
   } catch (error) {
     if (generation === discordLoadGeneration && context === channelContextKey()) {
+      // A landing left to this read is not paid by a later one: that finds a reader who has been
+      // reading the rows the failure left up. `#221 read-modes`.
+      if (threadEntryAwaitsRead) threadEntryOwed = null;
+      threadEntryAwaitsRead = false;
       noteChannelReadFailure(error);
       throw error;
     }
@@ -9512,8 +9564,17 @@ function foldLateTimelinePage(payload, read) {
   channelCanon.views.get(viewKey(read.view, read.thread)).landedHidden = true;
   if (read.context === channelContextKey()) {
     // Back on the view it was read for: that view is current now, not only on its next showing.
+    // `#221 read-modes`. The read behind held rows that another read overtook — a live message, the
+    // poll, the page shown again, or the reader out of the thread and back before it landed — is
+    // still that read: a landing made on the held rows is kept through it, and one left to it is paid.
+    // On what the page says is read, as that read would have drawn it: the first unread message and
+    // the runs of read messages are decided by it.
+    const landing = entryLandingMark();
+    noteArchived(payload, false);
     catchUpHeldView();
     renderChannelFreshness();
+    if (landing) keepEntryLanding(landing);
+    payThreadEntry();
   } else if (read.view === "flat") {
     // All's page answers for Main, and for a thread drawn from All, now on screen.
     catchUpFromAll();
@@ -19789,7 +19850,7 @@ if (typeof window.ResizeObserver === "function") {
     // since: on a desk the entry itself wrapped the dock, by putting the thread's name in the picker,
     // and the message is kept at the head however near the end of the list it is.
     if (entryLandingHolds()) {
-      placeEntryLanding(entryLanding.row);
+      placeEntryLanding(entryLanding.row, entryLanding.first);
       return;
     }
     if (grew > 0 && atBottom(area, BOTTOM_SLACK_PX + grew)) {

@@ -30394,6 +30394,287 @@ test("...but not for a reader who has scrolled since the held rows were drawn", 
   assert.equal(rowWithId(page, first.getAttribute("data-id")).getBoundingClientRect().top, top, "the read moved a reader who had moved");
 });
 
+/** Where the root and the answer stand, whether the answer is open, and what the read run's line says. */
+function entryLayout(page) {
+  const answer = rowWithId(page, runId(500));
+  const line = readRunLineOf(rowWithId(page, runId(1)));
+  return { root: rowWithId(page, runId(0)).getBoundingClientRect().top, answer: answer.getBoundingClientRect().top,
+    open: answer.getAttribute("data-collapsed"), line: line && !line.hidden ? line.textContent : null };
+}
+
+// An old thread is exactly one whose root precedes All's window, so the held rows never hold its
+// root, and the rule that keeps the root above the first unread when both fit could not apply when
+// the held rows landed. It applies when the read behind them brings the root: the thread ends as one
+// entered with every row of it held. The owner's words for Collapse read: "show the thread root then
+// '… 45 read messages …' then the expanded next message".
+for (const [mode, read, tail, held] of [
+  ["Collapse read", 12, RUN_TAIL, 5],
+  ["Show read", 2, [...RUN_TAIL, ["agent", true], ["own", true]], 7],
+]) {
+  test(`${mode}: an old thread drawn from held rows ends on its root above the first unread when both fit, as one entered with its root held does`, async () => {
+    const enter = async (script, fromHeldRows, interrupt = async () => {}) => {
+      const page = newPage(new Map(), script);
+      const messages = runThread(page, { read, tail });
+      const before = async () => {
+        await chooseReadMode(page, mode);
+        // A viewport the root and the start of the answer fit in, as in "Collapse read: a thread opens
+        // on its root, one line for the read run, and the first unread unfolded".
+        page.el("scroll-area").clientHeight = 700;
+      };
+      if (!fromHeldRows) {
+        await enterRunThread(page, messages, before);
+        return { ...entryLayout(page), rootAtHead: atTheHead(page, rowWithId(page, runId(0))) };
+      }
+      const { hold, entering } = await enterFromHeldRows(page, messages, held, before);
+      const answer = rowWithId(page, runId(500));
+      assert.equal(rowWithId(page, runId(0)), undefined, "All's window held the root; this proves nothing");
+      assert.equal(answer.getAttribute("data-collapsed"), "false", "the held rows' first unread was not opened");
+      assert.ok(atTheHead(page, answer), `the held rows' answer landed at ${answer.getBoundingClientRect().top}px`);
+      await interrupt(page);
+      hold.release();
+      await entering;
+      await page.settle();
+      await page.settle();
+      return { ...entryLayout(page), rootAtHead: atTheHead(page, rowWithId(page, runId(0))) };
+    };
+    const covered = await enter(SCRIPT, false);
+    assert.equal(covered.rootAtHead, true, "the premise: entered with every row held, the thread opens on its root");
+    assert.ok(covered.answer > covered.root, "the premise: the answer is under the root");
+    assert.equal(covered.line, mode === "Collapse read" ? "… 12 read messages …" : null);
+    assert.deepStrictEqual(await enter(SCRIPT, true), covered,
+      "the read behind the held rows left the root off screen above the answer");
+    // ...and the same when a live message overtakes that read, which then lands as a page folded into
+    // the store: its read messages are drawn read, and collapsed, before the landing is made again.
+    const live = async (page) => {
+      page.stream().push(sseMessage(message({ id: "9900001", content: "elsewhere in the channel", ...CODER })));
+      await page.settle();
+    };
+    assert.deepStrictEqual(await enter(SCRIPT, true, live), covered,
+      "the read behind the held rows, overtaken by a live message, did not end as the covered thread does");
+    // Negative control: the answer kept where it landed, as before. The root is above the screen.
+    const control = await enter(brokenScript("  const head = entryHeadRow(first);\n", "  const head = first;\n"), true);
+    assert.equal(control.rootAtHead, false, "the control still put the root at the head; it proves nothing");
+    assert.ok(control.root < covered.root, "the control did not leave the root above the screen");
+  });
+}
+
+test("...and keeps the landed message open when the read joins an older message of the same author at the head of its row", async () => {
+  const run = async (script) => {
+    const page = newPage(new Map(), script);
+    const messages = runThread(page, { tail: [...RUN_TAIL, ["agent", true], ["own", true]] });
+    // Reply 12 the first part of the agent's answer, a second before it and unread: the two are one
+    // row once 12 is drawn, and a row keeps its fold under its first message. All's window starts at
+    // the answer, so the read brings 12 into the landed row.
+    const at = Date.parse(messages[13].timestamp);
+    messages[12] = { ...messages[12], ...CODER, content: "the canary answer, part one", timestamp: new Date(at - 1000).toISOString() };
+    page.dealtWith.delete(runId(12));
+    const { hold, entering } = await enterFromHeldRows(page, messages, 7);
+    const answer = () => rowWithId(page, runId(500));
+    assert.deepStrictEqual(rowIds(answer()), [runId(500)], "reply 12 was held after all; this proves nothing");
+    assert.equal(answer().getAttribute("data-collapsed"), "false", "the held rows' first unread was not opened");
+    assert.ok(atTheHead(page, answer()), `the answer landed at ${answer().getBoundingClientRect().top}px`);
+    const top = answer().getBoundingClientRect().top;
+    hold.release();
+    await entering;
+    await page.settle();
+    assert.deepStrictEqual(rowIds(answer()), [runId(12), runId(500)], "the read did not join 12 to the landed row; this proves nothing");
+    return { page, open: answer().getAttribute("data-collapsed"), moved: answer().getBoundingClientRect().top - top };
+  };
+  const { page, open, moved } = await run(SCRIPT);
+  assert.equal(open, "false", "the read folded the landed message under the message it joined to its row");
+  assert.equal(foldButton(rowWithId(page, runId(500))).getAttribute("aria-expanded"), "true");
+  assert.equal(moved, 0, "the read moved the landed message");
+  // Opened through its own control: the reader folding it afterwards holds through the next read.
+  await foldButton(rowWithId(page, runId(500))).click();
+  await reReadChannel(page);
+  assert.equal(rowWithId(page, runId(500)).getAttribute("data-collapsed"), "true", "a read opened the row the reader folded");
+  // Negative control: without opening the row again, it is drawn folded under message 12.
+  const control = await run(brokenScript("    fold.click();\n  }\n  const head = entryHeadRow(first);",
+    "  }\n  const head = entryHeadRow(first);"));
+  assert.equal(control.open, "true", "the row stayed open without being opened; the control proves nothing");
+});
+
+test("...and keeps it when another read overtakes the read behind the held rows: a live message, the poll, or All and back", async () => {
+  const run = async (script, interrupt) => {
+    const page = newPage(new Map(), script);
+    const messages = runThread(page, { tail: RUN_TAIL });
+    // As in "...when the row above it grows by a message the read brought": reply 11 joins the row
+    // above the landing, which the read keeps its reader by, unless the landing is kept.
+    const at = Date.parse(messages[12].timestamp);
+    messages[11] = { ...messages[11], ...OWN, timestamp: new Date(at - 2000).toISOString() };
+    page.dealtWith.delete(runId(11));
+    const { hold, entering } = await enterFromHeldRows(page, messages, 6);
+    await interrupt(page);
+    const answer = () => rowWithId(page, runId(500));
+    assert.ok(atTheHead(page, answer()), `the answer stands at ${answer().getBoundingClientRect().top}px`);
+    const top = answer().getBoundingClientRect().top;
+    hold.release();
+    await entering;
+    await page.settle();
+    await page.settle();
+    assert.deepStrictEqual(rowIds(rowWithId(page, runId(12))), [runId(11), runId(12)],
+      "the read did not join 11 to the row above the landing; this proves nothing");
+    return { moved: answer().getBoundingClientRect().top - top, open: answer().getAttribute("data-collapsed") };
+  };
+  const interruptions = {
+    "a live message": async (page) => {
+      page.stream().push(sseMessage(message({ id: "9900001", content: "elsewhere in the channel", ...CODER })));
+      await page.settle();
+    },
+    "the poll": async (page) => {
+      assert.ok(page.expireTimers(DISCORD_POLL_MS) > 0, "no poll was armed");
+      await page.settle();
+    },
+    "All and back": async (page) => {
+      await pickThread(page, "flat");
+      await page.settle();
+      await pickThread(page, `thread:${RUN_THREAD}`);
+      await page.settle();
+    },
+  };
+  for (const [name, interrupt] of Object.entries(interruptions)) {
+    assert.deepStrictEqual(await run(SCRIPT, interrupt), { moved: 0, open: "false" },
+      `${name} during the read behind the held rows moved or folded the landed message`);
+  }
+  // Negative control: the overtaken read folded into the store without keeping the landing.
+  const control = await run(brokenScript("    if (landing) keepEntryLanding(landing);\n    payThreadEntry();\n  } else if",
+    "    payThreadEntry();\n  } else if"), interruptions["a live message"]);
+  assert.notEqual(control.moved, 0, "the overtaken read kept the landing without being told to; the control proves nothing");
+});
+
+test("...and a landing left to the read behind held rows is paid by that read when it is overtaken, not by the next poll", async () => {
+  const run = async (script) => {
+    const page = newPage(new Map(), script);
+    const messages = runThread(page, { tail: [["own", true], ["agent", true], ["own", true]] });
+    // All holds the last two replies, both read: the landing waits for the read, which finds the answer.
+    const { hold, entering } = await enterFromHeldRows(page, messages, 2);
+    await pickThread(page, "flat");
+    await page.settle();
+    await pickThread(page, `thread:${RUN_THREAD}`);
+    await page.settle();
+    assert.ok(atBottomOf(page.el("scroll-area")), "the thread did not come back on the newest line; this proves nothing");
+    hold.release();
+    await entering;
+    await page.settle();
+    await page.settle();
+    assert.equal(shownIds(page).length, messages.length, "the thread's read did not land; this proves nothing");
+    const answer = rowWithId(page, runId(500));
+    return { open: answer.getAttribute("data-collapsed"), atTheHead: atTheHead(page, answer) };
+  };
+  assert.deepStrictEqual(await run(SCRIPT), { open: "false", atTheHead: true },
+    "the read behind the held rows, overtaken by the way out and back, did not land on the answer");
+  // Negative control: the overtaken read pays nothing, and the landing is left to the next poll.
+  assert.deepStrictEqual(await run(brokenScript("    if (landing) keepEntryLanding(landing);\n    payThreadEntry();\n  } else if",
+    "    if (landing) keepEntryLanding(landing);\n  } else if")), { open: "true", atTheHead: false },
+  "the overtaken read landed without paying the landing; the control proves nothing");
+  // ...nor on the page's read messages drawn unread: the landing goes to the oldest of them instead.
+  assert.deepStrictEqual(await run(brokenScript("    noteArchived(payload, false);\n    catchUpHeldView();", "    catchUpHeldView();")),
+    { open: "true", atTheHead: false }, "the overtaken read found the answer without what it says is read; the control proves nothing");
+});
+
+test("...but not a landing made on an earlier visit, when the thread comes back with nothing unread", async () => {
+  // A thread the page holds comes back with the rows it was left with, at the scroll position it was
+  // left at: the very row and position the first visit's landing was made with. Read meanwhile in All,
+  // none of those rows is unread now, so this visit lands nowhere, and the read behind them, landing
+  // late, is not held to the first visit's landing — which would open a row nobody opened.
+  const run = async (script) => {
+    const page = newPage(new Map(), script);
+    const messages = runThread(page, { tail: [...RUN_TAIL, ["agent", true], ["own", true]] });
+    // As in "...keeps the landed message open when the read joins ...": the read joins reply 12, unread,
+    // to the head of the answer's row, which is then kept folded under 12.
+    const at = Date.parse(messages[13].timestamp);
+    messages[12] = { ...messages[12], ...CODER, content: "the canary answer, part one", timestamp: new Date(at - 1000).toISOString() };
+    page.dealtWith.delete(runId(12));
+    const { hold, entering } = await enterFromHeldRows(page, messages, 7);
+    const answer = rowWithId(page, runId(500));
+    assert.ok(atTheHead(page, answer), "the premise: the first visit landed on the answer");
+    await pickThread(page, "flat");
+    for (const n of [500, 502, 503]) {
+      await doneButton(rowWithId(page, runId(n))).click();
+      await page.settle();
+    }
+    await pickThread(page, `thread:${RUN_THREAD}`);
+    await page.settle();
+    assert.equal(rowWithId(page, runId(500)), answer, "the thread did not come back with its rows; this proves nothing");
+    assert.ok(atTheHead(page, answer), "the thread did not come back where it was left; this proves nothing");
+    hold.release();
+    await entering;
+    await page.settle();
+    await page.settle();
+    assert.deepStrictEqual(rowIds(rowWithId(page, runId(500))), [runId(12), runId(500)],
+      "the read did not join 12 to the answer's row; this proves nothing");
+    return rowWithId(page, runId(500)).getAttribute("data-collapsed");
+  };
+  assert.equal(await run(SCRIPT), "true", "the first visit's landing opened the row the read drew under message 12");
+  // Negative control: the landing left standing when the view changes.
+  assert.equal(await run(brokenScript("  entryLanding = null;\n  if (view === \"thread\")", "  if (view === \"thread\")")), "false",
+    "the first visit's landing did not hold without the reset; the control proves nothing");
+});
+
+test("...and held rows with nothing unread whose read fails leave the reader on the newest line, through the next poll", async () => {
+  const run = async (script) => {
+    const page = newPage(new Map(), script);
+    const messages = runThread(page, { tail: [["own", true], ["agent", true], ["own", true]] });
+    const { hold, entering } = await enterFromHeldRows(page, messages, 2);
+    const area = page.el("scroll-area");
+    assert.ok(atBottomOf(area), "held rows with nothing unread did not open on the newest line");
+    hold.fail();
+    await entering;
+    await page.settle();
+    assert.deepStrictEqual(shownIds(page), messages.slice(-2).map((m) => m.id), "the failed read drew something");
+    assert.ok(atBottomOf(area), "the failed read moved the reader");
+    // Forty-five seconds on, the poll reads the thread: the reader has been reading what was drawn.
+    assert.ok(page.expireTimers(DISCORD_POLL_MS) > 0, "no poll was armed");
+    await page.settle();
+    await page.settle();
+    assert.equal(shownIds(page).length, messages.length, "the poll did not read the thread; this proves nothing");
+    return { atBottom: atBottomOf(area), open: rowWithId(page, runId(500)).getAttribute("data-collapsed") };
+  };
+  assert.deepStrictEqual(await run(SCRIPT), { atBottom: true, open: "true" },
+    "the poll after the failed read paid the landing the read owed");
+  // Negative control: the deferral kept through the failure, as before.
+  assert.deepStrictEqual(await run(brokenScript("      if (threadEntryAwaitsRead) threadEntryOwed = null;\n", "")),
+    { atBottom: false, open: "false" }, "the poll moved nobody without the failure ending the wait; the control proves nothing");
+});
+
+test("Collapse read: a switch from All to Main keeps the reader's message by the line of the run it is hidden in there", async () => {
+  const run = async (script) => {
+    const page = newPage(new Map(), script);
+    page.threadingSupported = true;
+    const thread = { id: "spaces/A/threads/long", root_message_id: "302", is_root: true,
+      reply_count: 7, reply_count_exact: true };
+    // Every other message from 303 to 315 is a reply in the one thread, which Main does not show, and
+    // unread. 304, 306 and 308, posted to the channel itself, are read: one at a time between unread
+    // replies in All, and one run of three in Main, where the replies are not drawn.
+    const messages = Array.from({ length: 24 }, (_, i) => {
+      const id = String(300 + i);
+      const record = id === "302" ? thread : i > 2 && i < 17 && i % 2 === 1 ? { ...thread, is_root: false } : null;
+      return message({ id, content: longMessage(`row ${id}`), ...(record ? { thread: record } : {}) });
+    });
+    for (const id of ["304", "306", "308"]) page.dealtWith.add(id);
+    page.threads = [{ id: thread.id, root: messages[2], title: "the long thread", reply_count: 7,
+      reply_count_exact: true, updated_at: messages[15].timestamp }];
+    await signIn(page);
+    await showDiscord(page, messages);
+    await chooseReadMode(page, "Collapse read");
+    assert.deepStrictEqual(collapsedRows(page), [], "All collapsed a read message standing alone; this proves nothing");
+    const area = page.el("scroll-area");
+    area.scrollTop = rowWithId(page, "306").offsetTop();
+    assert.equal(rowWithId(page, "306").getBoundingClientRect().top, 0, "the fixture could not put 306 at the top");
+    await pickThread(page, "main");
+    const line = rowWithId(page, "304");
+    assert.equal(readRunLineOf(line) && readRunLineOf(line).textContent, "… 3 read messages …",
+      "Main did not collapse 304, 306 and 308; this proves nothing");
+    assert.equal(rowWithId(page, "306").getAttribute("data-read-run"), "member");
+    return line.getBoundingClientRect().top;
+  };
+  assert.equal(await run(SCRIPT), 0, "Main did not put the run hiding the reader's message where the message was");
+  // Negative control: found by the hidden row's own empty box, which stands below the line's row.
+  assert.notEqual(await run(brokenScript("    const row = shownRowFor(rows.find((candidate) => idsOf(candidate).some((id) => seen.ids.includes(id))));",
+    "    const row = rows.find((candidate) => idsOf(candidate).some((id) => seen.ids.includes(id)));")), 0,
+  "the hidden row's box put the reader in the same place; the control proves nothing");
+});
+
 test("a landed message keeps the body the server rendered and its reactions, and a collapsed run holds them behind its line", async () => {
   const page = newPage();
   const messages = runThread(page, { tail: RUN_TAIL }).map((m) => {
@@ -30792,7 +31073,7 @@ test("...and the dock and the chips changing as the thread opens leave the first
 
   // THE CONTROLS: either observer reading the landing as a reader on the newest line.
   const dockOnly = await run(brokenScript(
-    "    if (entryLandingHolds()) {\n      placeEntryLanding(entryLanding.row);\n      return;\n    }\n", ""));
+    "    if (entryLandingHolds()) {\n      placeEntryLanding(entryLanding.row, entryLanding.first);\n      return;\n    }\n", ""));
   assert.deepStrictEqual(dockOnly, { ...real, afterDock: false, afterChips: false });
   const chipsOnly = await run(brokenScript(
     "const landed = currentScreen === \"main\" && currentView === \"discord\" && entryLandingHolds();",

@@ -2918,9 +2918,15 @@ the thread's first message above it when both fit in the upper half of the scree
 read-modes`). A thread with nothing unread opens on its newest message, folded, as before. That
 happens once, on entering: a message you fold again stays folded through every refresh after.
 A thread that began before All's window is drawn at once from the replies the page already holds
-(`#220 view-switch-instant`) and lands on the first unread among them. The read behind them brings
-the root and older replies in above it without moving it. When none of those replies is unread, the
-landing waits for that read, and does not move you if you have scrolled meanwhile.
+(`#220 view-switch-instant`) and lands on the first unread among them, expanded. Those replies never
+include the thread's first message, so the read behind them brings it in, with the older replies,
+and the landing is made again as though they had all been there from the start: the first message
+goes to the head when both fit in the upper half of the screen, as above (under Collapse read: the
+first message, then "… 12 read messages …", then the expanded message), and otherwise the unread
+message stays exactly where it landed. Either way it stays expanded, even when the read joins an
+earlier message of the same author onto its row, and another read that overtakes this one (a live
+message, the poll) keeps the landing too. When none of those replies is unread, the landing waits
+for that read, and does not move you if you have scrolled meanwhile, or if that read fails.
 
 The threads it lists come from what the page already holds, so opening it costs no request.
 Touching it also reads the channel's thread list in the background, at most once a minute, so the
