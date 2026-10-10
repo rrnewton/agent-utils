@@ -36250,3 +36250,46 @@ test("`#229 desktop-two-column`: a reopen in two columns reads nothing before si
   assert.ok(views.includes("main"), `the reopen did not read Main once sign-in answered: ${JSON.stringify(views)}`);
   assert.equal(views.filter((view) => view === "main").length, 1, `Main was read more than once: ${JSON.stringify(views)}`);
 });
+
+test("`#229 desktop-two-column`: keys for the page — another channel, the Pinned filter, My place — act for the page with the keys in the right column", async () => {
+  const page = newPage();
+  const data = threadData();
+  const other = { id: "1110000000000000002", label: "second team", writable: true };
+  page.channels = [{ ...CHANNEL }, other];
+  page.threadingSupported = true;
+  page.threads = data.threads;
+  await signIn(page);
+  await showDiscord(page, data.messages);
+  await twoColumns(page);
+  await threadBadge(rowWithId(page, "201")).click();
+  await page.settle();
+  // Shift+P from the right column: the Pinned filter, which is the left column's list.
+  await press(page, page.el("side-scroll"), "P", { shiftKey: true });
+  assert.equal(page.el("pinned-filter").getAttribute("aria-pressed"), "true", "Shift+P from the right column did nothing");
+  assert.equal(page.el("pinned-log").hidden, false, "the Pinned filter is not the left column's list");
+  assert.equal(page.el("side-pinned-log").hidden, true, "the Pinned filter took the right column's list");
+  assert.equal(page.el("side-log").hidden, false, "the right column's thread went behind the Pinned filter");
+  await press(page, page.el("side-scroll"), "Escape");
+  await page.settle();
+  // The other channel holds a message of its own.
+  const serve = page.timeline;
+  page.timeline = (path, options) => {
+    if (!String(path).includes(other.id)) return serve(path, options);
+    const held = page.messages;
+    page.messages = [message({ id: "300", content: "in the second team" })];
+    try {
+      return serve(path, options);
+    } finally {
+      page.messages = held;
+    }
+  };
+  // Alt+↓ from the right column: the next channel, the left column on its Main, the right on its cards.
+  await press(page, page.el("side-scroll"), "ArrowDown", { altKey: true });
+  await page.settle();
+  await page.settle();
+  assert.equal(page.el("discord-channel").value, other.id, "Alt+↓ from the right column did not change channel");
+  assert.equal(page.el("thread-select").value, "main", "the left column left Main");
+  assert.deepStrictEqual(shownIds(page), ["300"], "the left column did not read the new channel");
+  assert.equal(page.el("side-list").hidden, false, "the right column did not go to the new channel's cards");
+  assert.equal(page.el("channel-compose-text").getAttribute("aria-label"), "Message the main channel");
+});

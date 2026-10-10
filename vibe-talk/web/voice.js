@@ -4432,6 +4432,8 @@ function readModeFromKeyboard() {
  * list, where the reader is going to read what is left.
  */
 function filterFromKeyboard(which) {
+  // The bar and its Pinned filter are the left column's, whichever column the keys are in. `#229`.
+  if (sideActive) return inColumn(columns.main, () => filterFromKeyboard(which));
   if (!channelOnScreen()) return false;
   if (!searchOpen) setSearchOpen(true);
   if (which === "pinned") setPinnedOnly(!pinnedOnly);
@@ -4449,6 +4451,7 @@ function foldAllFromKeyboard(folded) {
 
 /** m: back to My place, and that message selected. */
 function markerFromKeyboard() {
+  if (sideActive) return inColumn(columns.main, markerFromKeyboard);
   if (!channelOnScreen() || placeMarker === null) return false;
   jumpToMarker();
   const row = paneRowFor(channelPane, placeMarker);
@@ -9328,6 +9331,8 @@ function hydrateFromCache() {
 
 /** Take every channel row off the screen and out of memory. */
 function clearChannelScreen() {
+  // From the left column, whichever column's read found the credential refused. `#229`.
+  if (sideActive) return inColumn(columns.main, clearChannelScreen);
   ++discordLoadGeneration;
   stopReading();
   readingMode = false;
@@ -9371,6 +9376,7 @@ function screenBelongsToToken() {
 
 /** Sign-out, another token, or a refusal: nothing this credential read may stay behind. */
 function forgetMessages() {
+  if (sideActive) return inColumn(columns.main, forgetMessages);
   dropMessageCache();
   clearChannelScreen();
   // ...nor where the reader was in it: the record names a thread this credential read, and the
@@ -14311,8 +14317,11 @@ function setPlaceMarker(id) {
   } catch (_error) {
     // A browser that refuses storage still honours the marker for this session.
   }
-  renderChannelRows();
-  renderScrollTools();
+  // On the message wherever it is drawn, and its chip over the left column. `#229 desktop-two-column`.
+  eachColumn(() => {
+    renderChannelRows();
+    renderScrollTools();
+  });
 }
 
 /**
@@ -14383,6 +14392,8 @@ function advanceMarkerPastRead() {
 
 /** Take the reader back to where they left off, if that message is still loaded. */
 function jumpToMarker() {
+  // "My place" is the left column's chip, and the place is in its list. `#229 desktop-two-column`.
+  if (sideActive) return inColumn(columns.main, jumpToMarker);
   if (placeMarker === null) {
     return;
   }
@@ -24152,6 +24163,8 @@ function readEnteredChannel(keepPosition) {
 // The walk back resets with it: a cursor from one channel means nothing in another, and carrying
 // one across would ask the server to step back from a message that is not there.
 function changeSelectedChannel() {
+  // From the left column, whichever column the key that asked for it was in. `#229 desktop-two-column`.
+  if (sideActive) return inColumn(columns.main, changeSelectedChannel);
   // `#215 reply-coalesce`. Gathered replies belong to the channel they were gathered in, whose rows
   // are about to go — and so does a tap on an arrow still waiting to jump, which would otherwise walk
   // this channel's history for a message of the last one.
