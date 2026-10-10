@@ -5308,9 +5308,29 @@ textarea {
  * never reads this query itself.
  */
 @media (min-width: 1000px) and (pointer: fine) {
-  /* The layout button, a bar button like the others; `hidden` still wins, off the channel. */
+  /* The layout button: a bar button joined to the view picker it greys out, as two halves of one
+     control, with no gap between them and the desk's least target width. That is also what lets the
+     desk's dock keep its one row in the default column with a short channel name: #218 fitted that
+     row with about 38px to spare, and a button with the pack's gap before it is 42px. `hidden` still
+     wins, off the channel. */
   #column-toggle {
     display: flex;
+    min-width: 2rem;
+    padding: 0;
+    margin-inline-start: -0.4rem;
+    border-start-start-radius: 0;
+    border-end-start-radius: 0;
+  }
+
+  #bar-pack:has(> #column-toggle:not([hidden])) > #thread-select {
+    border-start-end-radius: 0;
+    border-end-end-radius: 0;
+  }
+
+  /* The channel's picker is capped at what the pack leaves once the others are at their floors
+     (`#218 desktop-dock`), and the layout button is one more of them: 2rem, with no gap. */
+  #bar-pack:has(> #column-toggle:not([hidden])) > #discord-channel {
+    max-width: min(24rem, 100% - 5rem - 2.25rem - 2rem - 2 * 0.4rem);
   }
 
   #column-toggle[aria-pressed="true"] {
