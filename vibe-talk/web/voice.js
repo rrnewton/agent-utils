@@ -131,9 +131,9 @@ let sideActive = false;
  *   | "channel-directory-more" | "channel-directory-retry" | "channel-send"
  *   | "channel-view-flat" | "channel-view-main" | "channel-view-threads" | "clear-alias"
  *   | "clear-backlog" | "clear-view" | "close-browse-channels" | "close-help" | "close-reply"
- *   | "column-toggle"
- *   | "close-settings" | "close-threads" | "collapse-all" | "dismiss-banner" | "dismiss-error"
- *   | "dismiss-status" | "expand-all" | "forget-conversations" | "forget-token" | "hang-up"
+ *   | "close-settings" | "close-threads" | "collapse-all" | "column-toggle" | "dismiss-banner"
+ *   | "dismiss-error" | "dismiss-status" | "expand-all" | "forget-conversations" | "forget-token"
+ *   | "hang-up"
  *   | "help-link-auto-read" | "help-link-canned-prompts" | "help-link-channel-alias"
  *   | "help-link-combining" | "help-link-connection" | "help-link-control-bar"
  *   | "help-link-identities" | "help-link-keyboard"
@@ -4759,7 +4759,7 @@ const KEYMAP = [
     does: "Back: closes a menu, the search or a sheet, leaves Settings, Help, Reply, Threads or a thread. " +
       "In a message box with text in it, leaves the box first and keeps the draft; on the channel or " +
       "thread picker, back to the messages",
-    controls: ["close-settings", "close-reply", "close-help", "close-threads", "thread-back"],
+    controls: ["close-settings", "close-reply", "close-help", "close-threads", "thread-back", "side-close"],
     run: (event, target) => onEscape(event, target),
   },
   {
@@ -21212,7 +21212,8 @@ function renderSideCards() {
     choice,
     text: sideCardText(choice),
     age: briefAge(Number.isFinite(choice.at) ? choice.at : choice.started),
-    replies: typeof choice.count === "number" && choice.count > 0 ? threadCount(choice.count, true) : "",
+    replies: typeof choice.count === "number" && choice.count > 0
+      ? threadCount(choice.count, choice.summary ? choice.summary.reply_count_exact : true) : "",
     unread: sideCardUnread(choice, tally),
   }));
   const signature = JSON.stringify(cards.map(({ choice, text, age, replies, unread }) =>
