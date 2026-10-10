@@ -675,7 +675,15 @@ _PROCESS_CENSUS_INODE_RANGE_LIMIT = 128
 # The systemd manager listing is an input to a stricter, much smaller typed
 # projection.  Bound the raw D-Bus JSON independently so an irrelevant unit
 # description cannot turn that projection into an unbounded memory sink.
+# The bound applies to EACH listing read, not to a snapshot's cumulative reads.
 _USER_SYSTEMD_LISTING_BYTES_LIMIT = 4 * 1024 * 1024
+# A snapshot lists the manager once up front and once more after every
+# enumeration attempt, so its operation-wide raw-listing input bound is the
+# per-listing bound times that maximum number of reads.  Charging all reads to a
+# single-listing bound refused a stable manager whose listings were each about
+# 2 MB on the third read (https://github.com/rrnewton/agent-utils/issues/235).
+_USER_SYSTEMD_SNAPSHOT_ATTEMPTS = 3
+_USER_SYSTEMD_SNAPSHOT_LISTING_READS = 1 + _USER_SYSTEMD_SNAPSHOT_ATTEMPTS
 _USER_SYSTEMD_UNIT_LIMIT = 4096
 _FILE_HANDLE_BYTES_LIMIT = 128
 _AT_FDCWD = -100
@@ -47348,6 +47356,11 @@ def _run_user_busctl(
     )
     budget.remaining_seconds()
     if raw_listing:
+        if len(stdout) > _USER_SYSTEMD_LISTING_BYTES_LIMIT:
+            raise Refusal(
+                "user-systemd unit listing exceeds its per-listing bound of "
+                f"{_USER_SYSTEMD_LISTING_BYTES_LIMIT} bytes"
+            )
         budget.reserve_input(len(stdout))
         budget.consume_output(b"", stderr)
     else:
@@ -47756,7 +47769,9 @@ def _user_systemd_snapshot() -> tuple[Mapping[str, str], ...]:
         timeout_seconds=30,
         stdout_limit=1024 * 1024,
         stderr_limit=64 * 1024,
-        input_limit=_USER_SYSTEMD_LISTING_BYTES_LIMIT,
+        input_limit=(
+            _USER_SYSTEMD_LISTING_BYTES_LIMIT * _USER_SYSTEMD_SNAPSHOT_LISTING_READS
+        ),
     )
     selected = _user_systemd_units(budget)
     property_names = {
@@ -47766,7 +47781,7 @@ def _user_systemd_snapshot() -> tuple[Mapping[str, str], ...]:
             *_USER_SYSTEMD_UNIT_PROPERTIES,
         )
     }
-    for attempt in range(3):
+    for attempt in range(_USER_SYSTEMD_SNAPSHOT_ATTEMPTS):
         selected_by_name = {unit.unit: unit for unit in selected}
         evidence: dict[str, dict[str, str]] = {}
         for unit in selected:
@@ -47851,7 +47866,7 @@ def _user_systemd_snapshot() -> tuple[Mapping[str, str], ...]:
             and current_by_name == listed_with_jobs_by_name
         )
         if not stable:
-            if attempt < 2:
+            if attempt < _USER_SYSTEMD_SNAPSHOT_ATTEMPTS - 1:
                 selected = listed_with_jobs
                 continue
             raise Refusal(

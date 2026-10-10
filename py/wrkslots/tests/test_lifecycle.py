@@ -46583,6 +46583,123 @@ def test_user_systemd_busctl_refuses_continuous_state_churn(
     assert unit_reads == 3
 
 
+def large_user_systemd_listing(target_state: str, minimum_bytes: int) -> bytes:
+    """Build a synthetic manager listing of at least ``minimum_bytes``.
+
+    Failed transient units whose descriptions are whole command lines are the
+    shape that made a real manager listing about 2 MB.
+    """
+
+    description = "/bin/bash -lc " + "x" * (64 * 1024)
+    rows = [busctl_unit_row(active_state=target_state)]
+    filler_count = minimum_bytes // len(description) + 1
+    for index in range(filler_count):
+        row = busctl_unit_row(f"run-filler{index}.service", active_state="failed")
+        row[1] = description
+        row[4] = "failed"
+        rows.append(row)
+    listing = busctl_json("a(ssssssouso)", [rows])
+    assert len(listing) >= minimum_bytes
+    return listing
+
+
+def test_user_systemd_snapshot_bounds_each_listing_not_the_cumulative_reads(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression for https://github.com/rrnewton/agent-utils/issues/235."""
+
+    limit = wrkslots._USER_SYSTEMD_LISTING_BYTES_LIMIT
+    # The target unit churns between the first three listings, so the snapshot
+    # performs its maximum of four listing reads before it sees a stable set.
+    target_states = ["inactive", "active", "inactive", "inactive"]
+    listings = {
+        state: large_user_systemd_listing(state, 2_000_000)
+        for state in set(target_states)
+    }
+    assert all(2_000_000 <= len(listing) < limit // 2 for listing in listings.values())
+    monkeypatch.setattr(wrkslots, "_user_bus_environment", lambda: {})
+    monkeypatch.setattr(
+        wrkslots,
+        "_root_owned_executable",
+        lambda path, _label: wrkslots._TrustedExecutablePath(path, ()),
+    )
+    original_units = wrkslots._user_systemd_units
+    budgets: list[wrkslots._ReadOnlyCommandBudget] = []
+
+    def units(
+        budget: wrkslots._ReadOnlyCommandBudget,
+    ) -> tuple[wrkslots._UserSystemdUnit, ...]:
+        budgets.append(budget)
+        return original_units(budget)
+
+    monkeypatch.setattr(wrkslots, "_user_systemd_units", units)
+    listing_limits: list[int] = []
+    listed_bytes = 0
+    latest_state = ""
+
+    def bounded(command: list[str], **kwargs: object) -> tuple[int, bytes, bytes]:
+        nonlocal latest_state, listed_bytes
+        call = tuple(command[3:])
+        if call[0] == "call" and call[4] == "ListUnitsByPatterns":
+            stdout_limit = kwargs["stdout_limit"]
+            assert isinstance(stdout_limit, int)
+            listing_limits.append(stdout_limit)
+            latest_state = target_states[len(listing_limits) - 1]
+            listing = listings[latest_state]
+            listed_bytes += len(listing)
+            return 0, listing, b""
+        if call[0] == "call" and call[4] == "ListJobs":
+            return 0, busctl_json("a(usssoo)", [[]]), b""
+        assert call[0] == "get-property"
+        if call[3] == wrkslots._USER_SYSTEMD_UNIT_INTERFACE:
+            encoded = call[2].rsplit("/", 1)[1]
+            unit = encoded.replace("_2e", ".").replace("_2d", "-")
+            state = latest_state if unit == "unit.service" else "failed"
+            sub_state = {"active": "running", "inactive": "dead"}.get(state, state)
+            return (
+                0,
+                busctl_property_values(
+                    wrkslots._USER_SYSTEMD_UNIT_PROPERTIES,
+                    {
+                        "Id": unit,
+                        "LoadState": "loaded",
+                        "ActiveState": state,
+                        "SubState": sub_state,
+                    },
+                ),
+                b"",
+            )
+        specs = tuple(
+            spec
+            for spec in wrkslots._USER_SYSTEMD_SERVICE_PROPERTIES
+            if spec[0] in call[4:]
+        )
+        return 0, busctl_property_values(specs, {"ControlGroup": "/unit.service"}), b""
+
+    monkeypatch.setattr(wrkslots, "_run_bounded_read_only_command", bounded)
+    snapshot = wrkslots._user_systemd_snapshot()
+    assert len(listing_limits) == wrkslots._USER_SYSTEMD_SNAPSHOT_LISTING_READS == 4
+    assert listing_limits == [limit] * 4
+    by_id = {unit["Id"]: unit for unit in snapshot}
+    assert by_id["unit.service"]["ActiveState"] == "inactive"
+    assert len(by_id) == len(json.loads(listings["inactive"])["data"][0])
+    # Every listing is still charged to the snapshot's one finite total bound.
+    assert len(budgets) == 4
+    assert all(budget is budgets[0] for budget in budgets)
+    assert budgets[0].input_remaining == limit * 4 - listed_bytes
+
+    # One listing larger than the per-listing bound is refused even though the
+    # snapshot's cumulative bound would have room for it.
+    oversized = large_user_systemd_listing("active", limit + 1)
+    monkeypatch.setattr(
+        wrkslots,
+        "_run_bounded_read_only_command",
+        lambda _command, **_kwargs: (0, oversized, b""),
+    )
+    with pytest.raises(wrkslots.Refusal, match="exceeds its per-listing bound"):
+        wrkslots._user_systemd_snapshot()
+
+
 @pytest.mark.parametrize(
     ("initial_names", "later_names", "expected_names"),
     (
