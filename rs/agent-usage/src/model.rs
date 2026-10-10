@@ -114,6 +114,10 @@ pub struct Sample {
     /// is the difference between two samples.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tokens_cumulative: Option<Tokens>,
+    /// The provider asked not to be polled again before this time (Unix seconds), from an HTTP
+    /// 429's `Retry-After`. Polls before then reuse the history instead.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backoff_until: Option<i64>,
     /// Milliseconds the reading took.
     #[serde(default)]
     pub elapsed_ms: u64,
@@ -132,6 +136,7 @@ impl Sample {
             plan: None,
             meters: Vec::new(),
             tokens_cumulative: None,
+            backoff_until: None,
             elapsed_ms: 0,
         }
     }

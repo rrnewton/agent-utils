@@ -77,8 +77,15 @@ pub struct ProviderReport {
     pub age_secs: i64,
     /// Whether this call took the reading (false: served from the history).
     pub fresh: bool,
-    /// Plan meters.
+    /// Plan meters. When the newest reading failed, these come from the newest good one (see
+    /// `meters_sampled_at`), so a transient failure does not blank the figures.
     pub meters: Vec<MeterReport>,
+    /// Set when `meters` come from an older good reading: its time (Unix seconds).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub meters_sampled_at: Option<i64>,
+    /// No poll before this time (Unix seconds): the provider answered HTTP 429 with Retry-After.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub backoff_until: Option<i64>,
     /// Local token burn.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tokens: Option<TokenReport>,
@@ -175,6 +182,14 @@ pub fn build(
             ("claude", None) => None,
             _ => counter_tokens(samples, provider, now),
         };
+        let good = (latest.status == Status::Error)
+            .then(|| {
+                samples
+                    .iter()
+                    .rev()
+                    .find(|s| s.provider == provider && s.status == Status::Ok)
+            })
+            .flatten();
         out.push(ProviderReport {
             provider: provider.to_string(),
             status: latest.status,
@@ -184,7 +199,9 @@ pub fn build(
             sampled_at: latest.ts,
             age_secs: now - latest.ts,
             fresh: fresh.contains(&provider),
-            meters: meter_report(samples, latest, now),
+            meters: meter_report(samples, good.unwrap_or(latest), now),
+            meters_sampled_at: good.map(|g| g.ts),
+            backoff_until: latest.backoff_until.filter(|u| *u > now),
             tokens,
             history_samples: samples.iter().filter(|s| s.provider == provider).count(),
         });
@@ -264,11 +281,19 @@ pub fn render(report: &Report) -> String {
                 p.provider,
                 p.detail.as_deref().unwrap_or("")
             )),
-            Status::Error => out.push_str(&format!(
-                "{}{plan}: plan usage UNKNOWN ({age}): {}\n",
-                p.provider,
-                p.detail.as_deref().unwrap_or("")
-            )),
+            Status::Error => {
+                out.push_str(&format!(
+                    "{}{plan}: plan usage UNKNOWN ({age}): {}\n",
+                    p.provider,
+                    p.detail.as_deref().unwrap_or("")
+                ));
+                if let Some(ts) = p.meters_sampled_at {
+                    out.push_str(&format!(
+                        "  showing the last good reading, {} old:\n",
+                        human_duration(now - ts)
+                    ));
+                }
+            }
         }
         let width = p.meters.iter().map(|m| m.label.len()).max().unwrap_or(0);
         for m in &p.meters {
@@ -357,6 +382,10 @@ pub fn render(report: &Report) -> String {
     out
 }
 
+fn now_of(report: &Report) -> i64 {
+    report.now
+}
+
 fn short_id(provider: &str, id: &str) -> String {
     let id = id.strip_prefix(&format!("{provider}:")).unwrap_or(id);
     match id {
@@ -398,7 +427,16 @@ pub fn render_line(report: &Report) -> String {
                 .collect::<Vec<_>>()
                 .join(", "),
             Status::Unavailable => "no-plan".into(),
-            Status::Error => "UNKNOWN".into(),
+            Status::Error if p.meters.is_empty() => "UNKNOWN".into(),
+            Status::Error => format!(
+                "STALE({}) {}",
+                human_duration(now_of(report) - p.meters_sampled_at.unwrap_or(p.sampled_at)),
+                p.meters
+                    .iter()
+                    .map(|m| format!("{} {}", short_id(&p.provider, &m.id), pct(m.used_pct)))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
         };
         parts.push(format!("{}{plan} {body}", p.provider));
         if let Some(t) = &p.tokens {

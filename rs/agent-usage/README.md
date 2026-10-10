@@ -12,11 +12,27 @@ agent-usage daemon --detach   # 15-minute history for burn rates
 `agent-usage quickstart` and `agent-usage userguide` are the operator documentation (also in
 [`common/docs/agent-usage/`](../../common/docs/agent-usage/QUICKSTART.md)).
 
+## Which hosts get percentages
+
+Plan percentages and reset times exist only for subscription logins. Everything else gets local
+burn only, and the report says why instead of showing an error.
+
+| How the harness is logged in | Plan windows (% used, reset) | Local burn |
+| --- | --- | --- |
+| Claude Code, claude.ai Pro / Max / Team / Enterprise interactive login (`/login`) | yes: session, weekly, per-model weekly, extra usage | yes (transcripts) |
+| Claude Code, `claude setup-token` long-lived token (inference-only scope) | no (`unavailable`) | yes |
+| Claude Code on an API key, Bedrock, Vertex, Foundry or a gateway | no (`unavailable`; there are no plan limits) | yes |
+| Codex, ChatGPT login | yes: 5-hour and weekly windows, extra buckets | yes (thread totals) |
+| Codex on an API key or a gateway | no (`unavailable`) | yes |
+
+In practice: personal machines logged in to claude.ai or ChatGPT get percentages; shared
+development servers whose harnesses run through a provider gateway get local burn only.
+
 ## How a reading is taken
 
 | Provider | Source | Cost per reading |
 | --- | --- | --- |
-| Claude Code | `GET /api/oauth/usage` with the stored claude.ai login, the endpoint behind `/status` → Usage | one `curl` process (≈6 ms locally) plus one HTTPS round trip |
+| Claude Code | `GET /api/oauth/usage` with the stored claude.ai login, the endpoint behind `/status` → Usage | one `curl` process (≈6 ms locally) plus one HTTPS round trip; at most one request per 300 s, and none during a 429 `Retry-After` |
 | Codex | `codex app-server`, JSON-RPC `account/rateLimits/read` | ≈0.6-0.8 s wall, ≈1.2-1.4 s CPU, ≈410 MB peak RSS (the app-server), freed on exit |
 | Local tokens | Claude transcripts (incremental index), Codex `threads.tokens_used` via `sqlite3` | included in the `status` numbers below |
 
@@ -92,8 +108,11 @@ not scrape.
 
 ## Tests
 
-`cargo test -p agent-usage`: 34 unit tests (burn arithmetic including resets, proration and
-short histories; both reply parsers on fixtures; transcript parsing, incremental scan,
-duplicate lines and binary search; paths; argument parsing) and 5 end-to-end tests that drive
-the binary against a fake `curl`, a fake `codex app-server` and a fake `sqlite3`, including a
-check that the bearer token is never on `curl`'s command line or in the cache directory.
+`cargo test -p agent-usage`: 38 unit tests (burn arithmetic including resets, proration and
+short histories; both reply parsers on fixtures, including two published recordings of real
+Claude usage replies; transcript parsing, incremental scan, duplicate lines and binary search;
+polling floor and back-off rules; header and `Retry-After` parsing; paths; argument parsing) and
+7 end-to-end tests that drive the binary against a fake `curl`, a fake `codex app-server` and a
+fake `sqlite3`: the bearer token is never on `curl`'s command line, in the cache or in a recorded
+raw reply; a 429 with `Retry-After` stops requests and keeps the last good figures; the 300 s
+floor holds even with `--max-age 0`.

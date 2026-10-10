@@ -41,6 +41,37 @@ pub fn read_provider(provider: &str, env: Env, now: i64) -> Sample {
     }
 }
 
+/// The Claude usage endpoint's minimum polling interval (`AGENT_USAGE_CLAUDE_MIN_INTERVAL`, else
+/// [`claude::MIN_INTERVAL`]).
+pub fn claude_floor(env: Env) -> i64 {
+    env("AGENT_USAGE_CLAUDE_MIN_INTERVAL")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(claude::MIN_INTERVAL)
+}
+
+/// Whether `provider` should be read now: its newest sample is at least `max_age` old, no
+/// `Retry-After` back-off from it is still running, and, for a sample that came from the Claude
+/// usage endpoint, at least `claude_floor` seconds have passed (that endpoint rate-limits).
+pub fn should_poll(
+    samples: &[Sample],
+    provider: &str,
+    now: i64,
+    max_age: i64,
+    claude_floor: i64,
+) -> bool {
+    let Some(latest) = history::latest(samples, provider) else {
+        return true;
+    };
+    if latest.backoff_until.is_some_and(|until| now < until) {
+        return false;
+    }
+    let mut min_age = max_age;
+    if provider == "claude" && latest.source.as_deref() == Some("oauth-usage") {
+        min_age = min_age.max(claude_floor);
+    }
+    now - latest.ts >= min_age
+}
+
 /// Run one step.
 pub fn step(
     paths: &CachePaths,
@@ -55,8 +86,7 @@ pub fn step(
     let mut taken = Vec::new();
     if let Some(max_age) = opts.max_age {
         for &provider in &opts.providers {
-            let stale = history::latest(&samples, provider).is_none_or(|s| now - s.ts >= max_age);
-            if stale {
+            if should_poll(&samples, provider, now, max_age, claude_floor(env)) {
                 taken.push(read_provider(provider, env, now));
                 fresh.push(provider);
             }
@@ -84,4 +114,38 @@ pub fn step(
         index,
         scan,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::Status;
+
+    fn sample(provider: &str, ts: i64, source: &str) -> Sample {
+        let mut s = Sample::new(provider, ts, Status::Ok);
+        s.source = Some(source.into());
+        s
+    }
+
+    #[test]
+    fn polling_rules() {
+        assert!(should_poll(&[], "claude", 1_000, 120, 300));
+        let codex = [sample("codex", 1_000, "app-server")];
+        assert!(!should_poll(&codex, "codex", 1_100, 120, 300));
+        assert!(should_poll(&codex, "codex", 1_120, 120, 300));
+        assert!(should_poll(&codex, "codex", 1_000, 0, 300));
+        // The Claude endpoint is never asked more often than the floor, even with --max-age 0.
+        let claude = [sample("claude", 1_000, "oauth-usage")];
+        assert!(!should_poll(&claude, "claude", 1_200, 0, 300));
+        assert!(should_poll(&claude, "claude", 1_300, 0, 300));
+        // ...but a reading that never contacted it (no login) is cheap to repeat.
+        let none = [sample("claude", 1_000, "none")];
+        assert!(should_poll(&none, "claude", 1_120, 120, 300));
+        // A Retry-After back-off holds until it expires.
+        let mut limited = sample("claude", 1_000, "oauth-usage");
+        limited.status = Status::Error;
+        limited.backoff_until = Some(3_000);
+        assert!(!should_poll(&[limited.clone()], "claude", 2_999, 0, 300));
+        assert!(should_poll(&[limited], "claude", 3_000, 0, 300));
+    }
 }

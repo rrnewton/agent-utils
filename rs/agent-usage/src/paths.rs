@@ -46,6 +46,18 @@ pub fn codex_dir(env: Env) -> Result<PathBuf, String> {
     Ok(home(env)?.join(".codex"))
 }
 
+/// When `AGENT_USAGE_RAW_DIR` is set, write a provider's raw reply there as `<kind>-<ts>.json`,
+/// for recording real replies as test fixtures. Replies carry usage figures, not credentials.
+/// Failures are ignored: recording must never break a reading.
+pub fn save_raw(env: Env, kind: &str, ts: i64, body: &str) {
+    if let Some(dir) = env("AGENT_USAGE_RAW_DIR") {
+        let dir = PathBuf::from(dir);
+        if ensure_dir(&dir).is_ok() {
+            let _ = std::fs::write(dir.join(format!("{kind}-{ts}.json")), body);
+        }
+    }
+}
+
 /// Create a private directory (mode 0700) and its parents if missing.
 pub fn ensure_dir(dir: &Path) -> Result<(), String> {
     use std::os::unix::fs::DirBuilderExt;

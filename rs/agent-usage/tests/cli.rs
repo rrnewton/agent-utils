@@ -47,10 +47,21 @@ impl Sandbox {
     }
 
     fn fake_curl(&self, fixture: &str, code: u16) {
+        self.fake_curl_with_headers(fixture, code, "");
+    }
+
+    /// A fake curl answering with `fixture`; `headers` (CRLF-separated, without the status line)
+    /// are emitted first, as `--dump-header -` would.
+    fn fake_curl_with_headers(&self, fixture: &str, code: u16, headers: &str) {
         let log = self.path("curl-argv.txt");
         let stdin = self.path("curl-stdin.txt");
         let body = format!(
-            "printf '%s\\n' \"$@\" > {log}\ncat > {stdin}\ncat {FIXTURES}/{fixture}\nprintf '\\n{code}'",
+            "printf '%s\\n' \"$@\" > {log}\ncat > {stdin}\n{head}cat {FIXTURES}/{fixture}\nprintf '\\n{code}'",
+            head = if headers.is_empty() {
+                String::new()
+            } else {
+                format!("printf 'HTTP/2 {code}\\r\\n{headers}\\r\\n\\r\\n'\n")
+            },
             log = log.display(),
             stdin = stdin.display()
         );
@@ -332,4 +343,69 @@ fn daemon_once_status_and_usage_errors() {
     let (code, out, _) = sb.run(&["quickstart"], &[]);
     assert_eq!(code, 0);
     assert!(out.contains("agent-usage"));
+}
+
+#[test]
+fn claude_429_backs_off_and_keeps_the_last_good_reading() {
+    let sb = Sandbox::new("claude-429");
+    sb.claude_login((now_secs() + 3_600) * 1000, r#""user:profile""#);
+    sb.fake_curl("claude-usage-published-a.json", 200);
+    let floor = [("AGENT_USAGE_CLAUDE_MIN_INTERVAL", "0")];
+    let r = sb.status_json(&["--provider", "claude", "--no-tokens"], &floor);
+    assert_eq!(provider(&r, "claude")["status"], "ok");
+
+    sb.fake_curl_with_headers("claude-usage-legacy.json", 429, "retry-after: 832");
+    let r = sb.status_json(
+        &["--provider", "claude", "--no-tokens", "--max-age", "0"],
+        &floor,
+    );
+    let p = provider(&r, "claude");
+    assert_eq!(p["status"], "error");
+    assert!(p["detail"].as_str().unwrap().contains("13m"), "{p}");
+    // The figures stay visible, from the last good reading.
+    assert_eq!(p["meters"][0]["used_pct"], 6.0);
+    assert!(p["meters_sampled_at"].is_i64());
+    let until = p["backoff_until"].as_i64().unwrap();
+    assert!((until - now_secs() - 832).abs() < 30, "{until}");
+
+    // During the back-off nothing is sent, even when asked to poll.
+    std::fs::remove_file(sb.path("curl-argv.txt")).unwrap();
+    let r = sb.status_json(
+        &["--provider", "claude", "--no-tokens", "--max-age", "0"],
+        &floor,
+    );
+    assert_eq!(provider(&r, "claude")["fresh"], false);
+    assert!(!sb.path("curl-argv.txt").exists());
+    let (_, line, _) = sb.run(
+        &["--line", "--provider", "claude", "--no-tokens", "--cached"],
+        &[],
+    );
+    assert!(line.starts_with("claude[max] STALE("), "{line}");
+}
+
+#[test]
+fn claude_endpoint_floor_holds_even_with_max_age_zero() {
+    let sb = Sandbox::new("claude-floor");
+    sb.claude_login((now_secs() + 3_600) * 1000, r#""user:profile""#);
+    sb.fake_curl("claude-usage-limits.json", 200);
+    let raw = sb.path("raw");
+    sb.status_json(
+        &["--provider", "claude", "--no-tokens"],
+        &[("AGENT_USAGE_RAW_DIR", raw.to_str().unwrap())],
+    );
+    // The raw reply was recorded for fixtures, and holds no credential.
+    let recorded: Vec<_> = std::fs::read_dir(&raw)
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .collect();
+    assert_eq!(recorded.len(), 1);
+    let text = std::fs::read_to_string(&recorded[0]).unwrap();
+    assert!(text.contains("weekly_scoped") && !text.contains(FAKE_TOKEN));
+    std::fs::remove_file(sb.path("curl-argv.txt")).unwrap();
+    let r = sb.status_json(
+        &["--provider", "claude", "--no-tokens", "--max-age", "0"],
+        &[],
+    );
+    assert_eq!(provider(&r, "claude")["fresh"], false);
+    assert!(!sb.path("curl-argv.txt").exists());
 }

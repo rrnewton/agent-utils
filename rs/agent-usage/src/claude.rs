@@ -16,6 +16,15 @@ use std::path::Path;
 pub const USAGE_URL: &str = "https://api.anthropic.com/api/oauth/usage";
 /// Beta header the OAuth endpoints require.
 pub const OAUTH_BETA: &str = "oauth-2025-04-20";
+/// Shortest time between two requests to the usage endpoint, whatever `--max-age` says. The
+/// endpoint answers frequent polling with HTTP 429 and a long `Retry-After` (third-party reports
+/// show 832 s and 2,449 s); a 10-minute cadence is reported stable. Override with
+/// `AGENT_USAGE_CLAUDE_MIN_INTERVAL` (seconds).
+pub const MIN_INTERVAL: i64 = 300;
+/// Back-off after a 429 that carries no usable `Retry-After`.
+pub const BACKOFF_DEFAULT: i64 = 600;
+/// Longest back-off honoured, so a garbage `Retry-After` cannot stop polling indefinitely.
+pub const BACKOFF_MAX: i64 = 6 * 3_600;
 
 /// The parts of a stored claude.ai login this tool needs. Never logged or written anywhere.
 pub struct Login {
@@ -289,14 +298,22 @@ fn read_inner(env: Env, now: i64) -> Sample {
         }
     }
     if let Some(exp) = login.expires_at_ms {
-        if exp / 1000 <= now {
+        // Claude Code writes milliseconds; some third-party tools have written seconds.
+        let exp = if exp >= 100_000_000_000 {
+            exp / 1000
+        } else {
+            exp
+        };
+        if exp <= now {
             let mut s = error(
                 now,
                 &format!(
                     "stored claude.ai login expired {} ago; any Claude Code session refreshes it",
-                    crate::timefmt::human_duration(now - exp / 1000)
+                    crate::timefmt::human_duration(now - exp)
                 ),
             );
+            // Nothing was sent, so this does not count against the endpoint's polling floor.
+            s.source = Some("none".into());
             s.plan = login.subscription.clone();
             return s;
         }
@@ -314,6 +331,24 @@ fn read_inner(env: Env, now: i64) -> Sample {
         Ok(r) => r,
         Err(e) => return error(now, &e),
     };
+    crate::paths::save_raw(env, "claude-usage", now, &resp.body);
+    if resp.status == 429 {
+        // The usage endpoint is itself rate-limited, per organisation and shared with Claude
+        // Code's own polling. Honour Retry-After (capped) so no poll runs before it expires.
+        let wait = http::retry_after_secs(resp.header("retry-after"))
+            .unwrap_or(BACKOFF_DEFAULT)
+            .clamp(60, BACKOFF_MAX);
+        let mut s = error(
+            now,
+            &format!(
+                "usage endpoint rate-limited (HTTP 429); not asking again for {}",
+                crate::timefmt::human_duration(wait)
+            ),
+        );
+        s.backoff_until = Some(now + wait);
+        s.plan = login.subscription;
+        return s;
+    }
     if resp.status != 200 && resp.status != 0 {
         let snippet: String = resp.body.chars().take(160).collect();
         return error(
@@ -370,6 +405,34 @@ mod tests {
         );
         assert_eq!(meters[1].used_pct, 22.0);
         assert_eq!(meters[1].window_mins, Some(10_080));
+    }
+
+    #[test]
+    fn parses_published_real_replies() {
+        let a = parse_usage(include_str!(
+            "../tests/fixtures/claude-usage-published-a.json"
+        ))
+        .unwrap();
+        let got: Vec<_> = a.iter().map(|m| (m.id.as_str(), m.used_pct)).collect();
+        assert_eq!(
+            got,
+            [
+                ("session", 6.0),
+                ("weekly_all", 35.0),
+                ("weekly:Sonnet", 21.0),
+                ("weekly:Opus", 12.0),
+                ("extra_usage", 12.5)
+            ]
+        );
+        assert_eq!(a[0].resets_at, parse_iso8601("2026-04-08T18:59:59Z"));
+        let b = parse_usage(include_str!(
+            "../tests/fixtures/claude-usage-published-b.json"
+        ))
+        .unwrap();
+        assert_eq!(b.len(), 2);
+        assert_eq!(b[0].used_pct, 0.37);
+        assert_eq!(b[0].resets_at, parse_iso8601("2026-04-21T03:00:00Z"));
+        assert_eq!(b[1].used_pct, 0.67);
     }
 
     #[test]

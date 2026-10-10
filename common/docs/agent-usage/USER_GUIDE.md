@@ -4,6 +4,22 @@
 windows is used, when each window resets, how fast it is being spent, and how many tokens this
 host has used recently. It covers the Claude Code and Codex CLIs.
 
+## Which hosts get percentages
+
+Plan percentages and reset times exist only for subscription logins. Everything else gets local
+burn only, and the report says why instead of showing an error.
+
+| How the harness is logged in | Plan windows (% used, reset) | Local burn |
+| --- | --- | --- |
+| Claude Code, claude.ai Pro / Max / Team / Enterprise interactive login (`/login`) | yes: session, weekly, per-model weekly, extra usage | yes (transcripts) |
+| Claude Code, `claude setup-token` long-lived token (inference-only scope) | no (`unavailable`) | yes |
+| Claude Code on an API key, Bedrock, Vertex, Foundry or a gateway | no (`unavailable`; there are no plan limits) | yes |
+| Codex, ChatGPT login | yes: 5-hour and weekly windows, extra buckets | yes (thread totals) |
+| Codex on an API key or a gateway | no (`unavailable`) | yes |
+
+In practice: personal machines logged in to claude.ai or ChatGPT get percentages; shared
+development servers whose harnesses run through a provider gateway get local burn only.
+
 ## Commands
 
 ```text
@@ -24,7 +40,8 @@ agent-usage quickstart | userguide | help | --version
   `claude[max] 5h 34% +8.0/h reset 1h25m, wk 22% +1.0/h reset 1d03h, wk:Fable 5% +0.4/h reset 1d03h | codex no-plan | 1h tokens: claude 304M (977 req), codex 52M`.
   `5h` is the session window, `wk` the weekly one, `+N/h` the projection's rate in points per
   hour, and `FULL-BEFORE-RESET` marks a window that would fill before it resets; `no-plan` is
-  `unavailable` and `UNKNOWN` is `error`.
+  `unavailable`, `UNKNOWN` is `error` with no earlier good reading, and `STALE(<age>)` precedes the
+  last good figures when the newest reading failed.
 - `poll` reads every selected provider now, appends the samples, and prints one line each.
 - `daemon` polls every `--interval` (default 15 minutes, at least 60 s) in the foreground until
   SIGTERM, SIGINT or SIGHUP. Only one daemon runs per cache directory; a second exits with 75.
@@ -61,7 +78,15 @@ without those rows fall back to the named windows `five_hour`, `seven_day`, `sev
 | No claude.ai login (API key, Bedrock, Vertex, Foundry, a gateway) | `unavailable` | Nothing is sent. These have no plan limits; the detail names the provider when `CLAUDE_CODE_USE_*` says which. |
 | Login from `claude setup-token` (inference-only scope) | `unavailable` | The endpoint would refuse it. |
 | Stored access token expired | `error` | Nothing is sent. agent-usage does not refresh tokens, because refreshing rotates the refresh token that Claude Code itself holds; any running Claude Code session refreshes it. |
-| HTTP error, malformed reply, or a window whose percentage is missing | `error` | The reply is not partially trusted: unknown headroom never reads as zero. |
+| HTTP 429 from the usage endpoint | `error` | Nothing more is sent until the `Retry-After` time (delta seconds, capped at 6 h; 10 minutes when absent or unusable), and the report keeps showing the last good reading, marked as such (`STALE(...)` in `--line`). |
+| HTTP error, malformed reply, or a window whose percentage is missing | `error` | The reply is not partially trusted: unknown headroom never reads as zero. The last good reading is shown, marked as such. |
+
+The usage endpoint is itself rate-limited, per organisation, and Claude Code's own Usage tab
+polls it too. Third-party reports show 429s with `Retry-After` values of 832 s and 2,449 s under
+frequent polling and a 10-minute cadence as stable. So agent-usage never asks it more often than
+every 300 s (`AGENT_USAGE_CLAUDE_MIN_INTERVAL`), whatever `--max-age` says, including
+`--max-age 0` and the daemon. Readings that never reach the endpoint (no login, expired token) do
+not count against that floor.
 
 ### Codex
 
@@ -150,7 +175,9 @@ With samples every 15 minutes, the 15 m window rests on a single interval. Poll 
 }
 ```
 
-`status` is one of `ok`, `unavailable` and `error`; `detail` explains the last two. A provider
+`status` is one of `ok`, `unavailable` and `error`; `detail` explains the last two. When the newest
+reading failed, `meters` come from the newest good reading and `meters_sampled_at` gives its time;
+`backoff_until` is set while a `Retry-After` back-off runs. A provider
 with no sample (`--cached` with an empty history) is left out.
 
 `poll --json` and `history --json` print one sample per line, as stored in `history.jsonl`:
@@ -171,6 +198,8 @@ with no sample (`--cached` with an empty history) is left out.
 | `AGENT_USAGE_CLAUDE_USAGE_URL` | Override the usage endpoint (tests). |
 | `AGENT_USAGE_CURL`, `AGENT_USAGE_SQLITE3`, `AGENT_USAGE_CODEX_BIN` | Override the `curl`, `sqlite3` and `codex` commands (tests, unusual installs). |
 | `AGENT_USAGE_CODEX_PROBE=always` | Start the Codex app-server even without a ChatGPT login. |
+| `AGENT_USAGE_CLAUDE_MIN_INTERVAL` | Seconds between requests to the Claude usage endpoint (default 300). |
+| `AGENT_USAGE_RAW_DIR` | Write each raw provider reply there (`claude-usage-<ts>.json`, `codex-ratelimits-<ts>.json`), to record real replies as test fixtures. Replies carry usage figures, not credentials. |
 
 ## Exit status
 

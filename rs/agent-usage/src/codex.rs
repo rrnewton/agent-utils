@@ -319,7 +319,11 @@ fn read_plan(env: Env, dir: &Path, now: i64) -> Sample {
         }
     }
     let binary = env("AGENT_USAGE_CODEX_BIN").unwrap_or_else(|| "codex".to_string());
-    match probe_app_server(&binary, PROBE_TIMEOUT) {
+    let probed = probe_app_server(&binary, PROBE_TIMEOUT);
+    if let Ok(result) = &probed {
+        crate::paths::save_raw(env, "codex-ratelimits", now, &result.to_string());
+    }
+    match probed {
         Ok(result) => match parse_rate_limits(&result) {
             Ok((meters, plan)) => {
                 let mut s = Sample::new("codex", now, Status::Ok);
