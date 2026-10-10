@@ -260,7 +260,7 @@ def validate_structured_harness_argument_conflicts(
             "with a raw Codex profile selector"
         )
     duplicate_resume = (
-        harness == "codex" and "resume" in arguments
+        harness in ("codex", "muse") and "resume" in arguments
     ) or (
         harness == "claude" and any(
             _value_option(item, "-r", "--resume")

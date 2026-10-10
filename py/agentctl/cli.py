@@ -92,7 +92,8 @@ def parser() -> argparse.ArgumentParser:
     start.add_argument("--profile", metavar="NAME",
         help="owner-configured profile from CWD/.agentctl/profiles.json, or, when CWD has none, from the "
              "profiles.json beside a registry named .agentctl (so a worktree outside the project "
-             "uses the project's profiles); conflicts with harness launch settings")
+             "uses the project's profiles); accepts --resume for local interactive Claude/Codex/Muse profiles; conflicts "
+             "with other explicit harness launch settings")
     start.add_argument("--mode", choices=("interactive", "headless"), default=None,
         help="interactive keeps a native TUI; headless runs resumable structured turns (default: interactive)")
     start.add_argument("--backend", choices=("herdr", "tmux"), default="herdr",
@@ -102,7 +103,8 @@ def parser() -> argparse.ArgumentParser:
     start.add_argument("--model", metavar="MODEL", help="native model name; omission preserves the harness default")
     start.add_argument("--reasoning-effort", metavar="EFFORT",
         help="structured harness effort; use the profile or this option, never a duplicate raw argument")
-    start.add_argument("--resume", metavar="SESSION", help="resume an explicit native conversation (interactive only)")
+    start.add_argument("--resume", metavar="SESSION",
+        help="resume an explicit native conversation for local interactive Claude/Codex/Muse, optionally using --profile")
     start.add_argument("--harness-arg", action="append", default=[], metavar="ARG",
         help="literal interactive harness argument; repeat and use = for flags")
     start.add_argument("--env", action="append", default=[], type=_environment_entry,
@@ -338,7 +340,6 @@ def main(argv: Sequence[str] | None = None) -> int:
                 for option, value in (
                     ("--mode", args.mode), ("--harness", args.harness), ("--model", args.model),
                     ("--reasoning-effort", args.reasoning_effort),
-                    ("--resume", args.resume),
                 ):
                     if value is not None:
                         overlaps.append(option)

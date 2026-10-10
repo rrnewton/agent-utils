@@ -653,6 +653,121 @@ def _profiles(harness: Harness, report: Report) -> None:
         ))
 
 
+def _profile_resume(harness: Harness, report: Report) -> None:
+    """A profile resumes the asserted conversation without changing its launch policy."""
+    conversation = "11111111-1111-4111-8111-111111111111"
+    literal_argument = '--meta-tag=literal $(unexpanded) "quotes"'
+    literal_environment = 'PROFILE_SELECTOR=literal $(unexpanded) "quotes"'
+    expected_arguments = {
+        "claude": ["--resume", conversation, "--model", "selected-model", "--effort", "high", literal_argument],
+        "codex": ["resume", conversation, "--no-alt-screen", "--model", "selected-model", "--config",
+                  "model_reasoning_effort=high", literal_argument],
+        "muse": ["--model", "selected-model", "--reasoning-effort", "high", literal_argument,
+                 "resume", conversation],
+    }
+
+    def configured_case(kind: str, scenario: str, *, raw: Sequence[str] | None = None) -> PairCase:
+        case = harness.case(f"primary-profile-resume-{kind}-{scenario}", {
+            "report_custom_session": True,
+            **({"session_value_override": "wrong-conversation"} if scenario == "mismatch" else {}),
+        })
+        document = {
+            "schema": "agentctl-profiles/v1",
+            "profiles": {"local-policy": {
+                "harness": kind, "mode": "interactive", "model": "selected-model",
+                "reasoning_effort": "high", "argv": [literal_argument] if raw is None else list(raw),
+                "env": {"PROFILE_SELECTOR": literal_environment.partition("=")[2]},
+            }},
+        }
+        for root in (case.python_root, case.rust_root):
+            init_case_repository(root)
+            (root / ".gitignore").write_text(".agentctl/\n", encoding="utf-8")
+            directory = root / ".agentctl"
+            directory.mkdir(mode=0o700)
+            config = directory / "profiles.json"
+            config.write_text(json.dumps(document), encoding="utf-8")
+            config.chmod(0o600)
+        return case
+
+    for kind in ("claude", "codex", "muse"):
+        selected = configured_case(kind, "selected")
+        outcomes = _pair(harness, report, selected, f"primary/profile/resume/{kind}/start", (
+            "start", "worker", "--cwd", "<ROOT>", "--workspace-id", "w1", "--profile", "local-policy",
+            "--resume", conversation, "--brief", "continue the saved conversation", *_COMMON,
+        ))
+        for edition, root, outcome in zip(
+            ("python", "rust"), (selected.python_root, selected.rust_root), outcomes, strict=True,
+        ):
+            if outcome.returncode:
+                continue
+            value = _json(outcome)
+            native = {
+                "schema": "agentctl-native-session/v1", "agent": kind,
+                "value": conversation, "source": "asserted",
+            }
+            report.require(f"primary/profile/resume/{kind}/policy/{edition}",
+                           isinstance(value, dict) and value.get("profile") == "local-policy"
+                           and value.get("model") == "selected-model"
+                           and value.get("reasoning_effort") == "high"
+                           and value.get("cwd") == "<ROOT>" and value.get("mode") == "interactive"
+                           and value.get("arguments") == expected_arguments[kind]
+                           and value.get("native_session") == native and value.get("resume") == conversation
+                           and value.get("session_agent") == kind and value.get("session_value") == conversation
+                           and value.get("environment_names") == ["PROFILE_SELECTOR"],
+                           f"profile resume did not retain its conversation and policy: {value!r}")
+            state = _state(root)
+            report.require(f"primary/profile/resume/{kind}/launch/{edition}",
+                           state.get("launch_arguments") == expected_arguments[kind]
+                           and state.get("tab_environment") == [literal_environment]
+                           and state.get("submitted") == ["continue the saved conversation"],
+                           "the literal launch policy or startup brief changed")
+        _pair(harness, report, selected, f"primary/profile/resume/{kind}/status", (
+            "status", "worker", *_COMMON,
+        ))
+        _pair(harness, report, selected, f"primary/profile/resume/{kind}/list", ("list", *_COMMON))
+        roots = (selected.python_root, selected.rust_root)
+        before = {
+            root: ((_state(root).get("calls")), (root / "registry/worker/agent.json").read_bytes())
+            for root in roots if (root / "registry/worker/agent.json").exists()
+        }
+        _pair(harness, report, selected, f"primary/profile/resume/{kind}/occupied", (
+            "start", "other-worker", "--cwd", "<ROOT>", "--workspace-id", "w1",
+            "--profile", "local-policy", "--resume", conversation, *_COMMON,
+        ), 75)
+        report.require(f"primary/profile/resume/{kind}/occupied-atomic",
+                       len(before) == 2 and all(
+                           not (root / "registry/other-worker").exists()
+                           and _state(root).get("calls") == calls
+                           and (root / "registry/worker/agent.json").read_bytes() == record
+                           for root, (calls, record) in before.items()
+                       ), "an occupied conversation changed its owner or allocated a new tab")
+        _pair(harness, report, selected, f"primary/profile/resume/{kind}/stop", (
+            "stop", "worker", *_COMMON,
+        ))
+
+        mismatch = configured_case(kind, "mismatch")
+        _pair(harness, report, mismatch, f"primary/profile/resume/{kind}/mismatch", (
+            "start", "worker", "--cwd", "<ROOT>", "--workspace-id", "w1",
+            "--profile", "local-policy", "--resume", conversation, "--brief", "must never arrive", *_COMMON,
+        ), 75)
+        report.require(f"primary/profile/resume/{kind}/mismatch-no-brief",
+                       all(not _state(root).get("submitted")
+                           for root in (mismatch.python_root, mismatch.rust_root)),
+                       "a startup brief reached a contradictory conversation")
+        _retire_fixture_processes(mismatch)
+
+        raw_selector = ("--resume", "other-conversation") if kind == "claude" else ("resume", "other-conversation")
+        duplicate = configured_case(kind, "duplicate", raw=raw_selector)
+        _pair(harness, report, duplicate, f"primary/profile/resume/{kind}/duplicate", (
+            "start", "worker", "--cwd", "<ROOT>", "--workspace-id", "w1",
+            "--profile", "local-policy", "--resume", conversation, *_COMMON,
+        ), 75)
+        report.require(f"primary/profile/resume/{kind}/duplicate-atomic",
+                       all(not (root / "registry").exists() and not _state(root).get("calls")
+                           for root in (duplicate.python_root, duplicate.rust_root)),
+                       "duplicate resume selectors allocated a registry or contacted Herdr")
+
+
 def _skill_install(harness: Harness, report: Report) -> None:
     case = harness.case("primary-skill-install")
     first_python, first_rust = harness.invoke(case, ("skill", "install"))
@@ -824,14 +939,6 @@ def _profile_refusals(harness: Harness, report: Report) -> None:
     report.require("primary/profile/refusal/precedence",
                    all(outcome.returncode == 2 for outcome in outcomes),
                    f"profile precedence was ambiguous: {outcomes!r}")
-    outcomes = harness.invoke(overlap, (
-        "start", "worker", "--cwd", "<ROOT>", "--profile", "worker", "--resume", "session-1",
-        *FIXTURE_HERDR,
-    ))
-    report.require("primary/profile/refusal/resume-precedence",
-                   all(outcome.returncode == 2 for outcome in outcomes),
-                   f"profile resume precedence was ambiguous: {outcomes!r}")
-
     direct_precedence = (
         ("model-short-attached", "codex", ("--model", "structured"), ("-mother-model",)),
         ("effort-config-attached", "codex", ("--reasoning-effort", "ultra"),
@@ -843,6 +950,7 @@ def _profile_refusals(harness: Harness, report: Report) -> None:
         ("model-opaque-config", "codex", ("--model", "structured"),
          ("--config=sandbox_mode=read-only",)),
         ("codex-resume", "codex", ("--resume", "session-1"), ("resume",)),
+        ("muse-resume", "muse", ("--resume", "session-1"), ("resume",)),
         ("claude-resume", "claude", ("--resume", "session-1"), ("--continue",)),
     )
     for label, kind, structured, raw in direct_precedence:
@@ -2204,6 +2312,7 @@ def build_report(python_command: Sequence[str], rust_command: Sequence[str]) -> 
             _lifecycle(harness, report)
             _conversations(harness, report)
             _profiles(harness, report)
+            _profile_resume(harness, report)
             _workspace_policy(harness, report)
             _skill_install(harness, report)
             _profile_refusals(harness, report)

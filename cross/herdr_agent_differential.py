@@ -385,7 +385,7 @@ elif args[:2] == ["pane", "get"]:
         "cwd": root,
         "agent": None if human or state.get("empty_shell") or (state.get("custom_harness") and not state.get("custom_reported")) else state.get("harness", "codex"),
         "agent_status": "unknown" if human or state.get("empty_shell") or (state.get("custom_harness") and not state.get("custom_reported")) else state.get("status", "idle"),
-        "agent_session": None if human or state.get("empty_shell") or state.get("sessionless") or state.get("custom_harness") else {"agent": state.get("harness", "codex"), "value": state.get("session_value_override", state.get("session_value", "session-1"))},
+        "agent_session": None if human or state.get("empty_shell") or state.get("sessionless") or (state.get("custom_harness") and not state.get("report_custom_session")) else {"agent": state.get("harness", "codex"), "value": state.get("session_value_override", state.get("session_value", "session-1"))},
         "terminal_id": "term-human" if human else current_terminal,
         "tab_id": current_tab,
     }})
@@ -478,6 +478,9 @@ elif args[:2] == ["pane", "run"]:
     parsed = shlex.split(args[3])
     state["launch_arguments"] = parsed[1:]
     state["custom_harness"] = True
+    if (state.get("report_custom_session") and len(state["launch_arguments"]) >= 2
+            and state["launch_arguments"][-2] == "resume"):
+        state["session_value"] = state["launch_arguments"][-1]
     if parsed and outside_case(parsed[0]):
         # The harness's rule for a program an edition runs, applied to the one this fixture runs.
         with open(os.path.join(root, "host-cli-guard.jsonl"), "a", encoding="utf-8") as stream:

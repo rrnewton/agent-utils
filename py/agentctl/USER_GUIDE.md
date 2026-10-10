@@ -281,7 +281,7 @@ Within each profile, `harness` and `mode` are required. `model`,
 arguments or environment entries; they are never shell-expanded. A profile
 cannot specify the model or effort both structurally and in `argv`. When
 `--profile NAME` is present, explicit `--harness`, `--mode`, `--model`,
-`--reasoning-effort`, `--resume`, `--harness-arg`, and `--env` are refused instead of
+`--reasoning-effort`, `--harness-arg`, and `--env` are refused instead of
 silently winning or losing. The config is not a credential store. Environment
 values are not written to session records or profile-list output; raw arguments
 are launch policy and therefore must not contain secrets. Raw Codex
@@ -302,6 +302,18 @@ chmod 600 .agentctl/profiles.json
 agentctl profiles --cwd .
 agentctl start reviewer --cwd . --profile preferred-reviewer
 ```
+
+To resume a saved local interactive Claude, Codex, or Muse conversation with
+a project profile's launch settings, combine `--profile` with `--resume`:
+
+```sh
+agentctl start reviewer-again --cwd . --profile preferred-reviewer --resume SESSION
+```
+
+The profile still selects the harness, model, effort, arguments, and environment.
+Its raw arguments cannot repeat the resume selector. A conversation already
+registered under another agent name is refused. Headless and agentcloud profiles
+do not accept `--resume`.
 
 `agentctl skill install` installs the bundled `agentctl` skill for Codex,
 Claude, and Muse. A byte-identical installation is left unchanged. Divergent

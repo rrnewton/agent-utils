@@ -335,7 +335,8 @@ pub(crate) fn validate_structured_harness_argument_conflicts(
             "{label} cannot combine structured model or reasoning effort with a raw Codex profile selector"
         )));
     }
-    let duplicate_resume = (harness == "codex" && argv.iter().any(|value| value == "resume"))
+    let duplicate_resume = (matches!(harness, "codex" | "muse")
+        && argv.iter().any(|value| value == "resume"))
         || (harness == "claude"
             && argv.iter().any(|value| {
                 value_option(value, "-r", "--resume")
@@ -922,6 +923,32 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     static SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+    #[test]
+    fn profile_resume_rejects_duplicate_native_subcommands_but_preserves_raw_only_policy() {
+        let arguments = vec!["resume".to_owned(), "raw-conversation".to_owned()];
+        for harness in ["codex", "muse"] {
+            assert!(validate_structured_harness_argument_conflicts(
+                "launch", harness, &arguments, false, false, false
+            )
+            .is_ok());
+            let error = validate_structured_harness_argument_conflicts(
+                "launch", harness, &arguments, false, false, true,
+            )
+            .unwrap_err();
+            assert_eq!(
+                error.to_string(),
+                "launch cannot repeat the structured resume selector in raw arguments"
+            );
+            let profile = parse(serde_json::json!({
+                "harness": harness,
+                "mode": "interactive",
+                "argv": arguments,
+            }))
+            .expect("raw-only profile remains valid");
+            assert_eq!(profile.argv, arguments);
+        }
+    }
 
     #[test]
     fn workspace_labels_are_bounded_literal_non_control_text() {

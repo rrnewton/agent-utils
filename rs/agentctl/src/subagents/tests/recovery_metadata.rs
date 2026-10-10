@@ -1,5 +1,273 @@
 use super::*;
 
+fn loaded_resume_profile(
+    fixture: &Fixture,
+    harness: &str,
+    arguments: &[&str],
+) -> crate::profiles::LaunchProfile {
+    assert!(std::process::Command::new("/usr/bin/git")
+        .args(["init", "-q"])
+        .arg(&fixture.root)
+        .status()
+        .unwrap()
+        .success());
+    fs::write(fixture.root.join(".gitignore"), ".agentctl/\n").unwrap();
+    let directory = fixture.root.join(".agentctl");
+    agent::create_private_directory(&directory, "test launch profiles", false, false).unwrap();
+    agent::atomic_json(
+        &directory.join("profiles.json"),
+        &json!({
+            "schema": "agentctl-profiles/v1",
+            "profiles": {"reviewer": {
+                "harness": harness,
+                "mode": "interactive",
+                "model": "profile-model",
+                "reasoning_effort": "high",
+                "argv": arguments,
+                "env": {"REVIEW_MODE": "literal $(setting)"},
+            }},
+        }),
+    )
+    .unwrap();
+    let (_, mut profiles) = crate::profiles::load_profiles(&fixture.root, false).unwrap();
+    profiles.remove("reviewer").unwrap()
+}
+
+fn resume_profile_options(profile: &crate::profiles::LaunchProfile, resume: &str) -> StartOptions {
+    StartOptions {
+        profile: Some(profile.name.clone()),
+        harness: profile.harness.clone(),
+        model: profile.model.clone(),
+        resume: Some(resume.to_owned()),
+        harness_args: profile.argv.clone(),
+        environment: profile.environment.clone(),
+        ..StartOptions::default()
+    }
+}
+
+#[test]
+fn profile_resume_preserves_loaded_policy_and_literal_conversation_for_each_local_harness() {
+    let conversation = "saved conversation 'quoted' $(literal)";
+    let policy = "--literal-policy=owner choice";
+    for harness in ["claude", "codex", "muse"] {
+        let fixture = Fixture::new();
+        let profile = loaded_resume_profile(&fixture, harness, &[policy]);
+        let mut options = resume_profile_options(&profile, conversation);
+        options.slot = Some(SlotLaunch {
+            slot: "slot-a".to_owned(),
+            project: Some(fixture.root.clone()),
+            isolation: Some("cgroup".to_owned()),
+            executable: Some(fake_wrkslots(&fixture.root, &fixture.root, "ok")),
+            ..SlotLaunch::default()
+        });
+        let status = fixture
+            .manager()
+            .start_with_reasoning_effort(
+                "worker",
+                &fixture.root,
+                profile.reasoning_effort.as_deref().unwrap(),
+                options,
+            )
+            .unwrap();
+        let expected = match harness {
+            "claude" => vec![
+                "--resume",
+                conversation,
+                "--model",
+                "profile-model",
+                "--effort",
+                "high",
+                policy,
+            ],
+            "codex" => vec![
+                "resume",
+                conversation,
+                "--no-alt-screen",
+                "--model",
+                "profile-model",
+                "--config",
+                "model_reasoning_effort=high",
+                policy,
+            ],
+            "muse" => vec![
+                "--model",
+                "profile-model",
+                "--reasoning-effort",
+                "high",
+                policy,
+                "resume",
+                conversation,
+            ],
+            _ => unreachable!(),
+        };
+        assert_eq!(status["arguments"], json!(expected));
+        let record = fixture.manager().load("worker").unwrap();
+        assert_eq!(
+            fixture.client.launches.lock().unwrap()["owned"].1,
+            record.arguments
+        );
+        assert_eq!(
+            record
+                .arguments
+                .iter()
+                .filter(|argument| argument.as_str() == conversation)
+                .count(),
+            1
+        );
+        assert!(!record
+            .arguments
+            .iter()
+            .any(|argument| argument == "--session-id"));
+        assert_eq!(status["profile"], "reviewer");
+        assert_eq!(status["model"], "profile-model");
+        assert_eq!(status["reasoning_effort"], "high");
+        assert_eq!(status["resume"], conversation);
+        assert_eq!(status["native_session"]["agent"], harness);
+        assert_eq!(status["native_session"]["value"], conversation);
+        assert_eq!(status["native_session"]["source"], "asserted");
+        assert_eq!(status["session_agent"], harness);
+        assert_eq!(status["session_value"], conversation);
+        let cwd = fs::canonicalize(&fixture.root)
+            .unwrap()
+            .display()
+            .to_string();
+        assert_eq!(status["cwd"], cwd);
+        assert_eq!(status["slot"], "slot-a");
+        assert_eq!(status["slot_project"], cwd);
+        assert_eq!(status["slot_isolation"], "cgroup");
+        assert_eq!(status["environment_names"], json!(["REVIEW_MODE"]));
+        assert!(!status.to_string().contains("literal $(setting)"));
+        assert_eq!(fixture.client.slot_commands.lock().unwrap().len(), 1);
+        assert_eq!(
+            *fixture.client.environments.lock().unwrap(),
+            [profile.environment]
+        );
+    }
+}
+
+#[test]
+fn profile_resume_wrong_native_reports_refuse_without_submitting_the_brief() {
+    for harness in ["claude", "codex", "muse"] {
+        let other_provider = if harness == "codex" {
+            "claude"
+        } else {
+            "codex"
+        };
+        for reported in [(harness, "different-id"), (other_provider, "requested-id")] {
+            let fixture = Fixture::new();
+            let profile = loaded_resume_profile(&fixture, harness, &[]);
+            *fixture.client.session_override.lock().unwrap() =
+                Some((Some(reported.0.to_owned()), Some(reported.1.to_owned())));
+            let mut options = resume_profile_options(&profile, "requested-id");
+            options.brief = Some("never submit this task".to_owned());
+            let error = fixture
+                .manager()
+                .start_with_reasoning_effort(
+                    "worker",
+                    &fixture.root,
+                    profile.reasoning_effort.as_deref().unwrap(),
+                    options,
+                )
+                .unwrap_err();
+            assert!(
+                error.to_string().contains("different native"),
+                "{harness}: {error}"
+            );
+            assert!(fixture.client.runs.lock().unwrap().is_empty());
+            assert!(fixture.client.keys_sent.lock().unwrap().is_empty());
+            let record = fixture.manager().load("worker").unwrap();
+            assert_eq!(record.lifecycle, "launch_failed");
+            assert_eq!(record.profile, Some(profile.name));
+            assert_eq!(record.native_session.unwrap().value, "requested-id");
+            assert!(record.session_agent.is_none() && record.session_value.is_none());
+        }
+    }
+}
+
+#[test]
+fn profile_resume_duplicate_raw_selectors_refuse_before_allocation_without_changing_raw_only_policy(
+) {
+    for harness in ["claude", "codex", "muse"] {
+        let fixture = Fixture::new();
+        let arguments = if harness == "claude" {
+            vec!["--resume", "raw-conversation"]
+        } else {
+            vec!["resume", "raw-conversation"]
+        };
+        let profile = loaded_resume_profile(&fixture, harness, &arguments);
+        let error = fixture
+            .manager()
+            .start_with_reasoning_effort(
+                "worker",
+                &fixture.root,
+                profile.reasoning_effort.as_deref().unwrap(),
+                resume_profile_options(&profile, "structured-conversation"),
+            )
+            .unwrap_err();
+        if harness == "claude" {
+            assert_eq!(error.to_string(), "Claude conversation selectors must use --resume; agentctl assigns --session-id for new conversations");
+        } else {
+            assert!(error
+                .to_string()
+                .contains("cannot repeat the structured resume selector"));
+        }
+        assert!(!fixture.root.join("registry").exists());
+        assert!(fixture.client.environments.lock().unwrap().is_empty());
+        assert!(fixture.client.launches.lock().unwrap().is_empty());
+        if harness != "claude" {
+            let mut options = resume_profile_options(&profile, "unused");
+            options.resume = None;
+            let status = fixture
+                .manager()
+                .start_with_reasoning_effort(
+                    "worker",
+                    &fixture.root,
+                    profile.reasoning_effort.as_deref().unwrap(),
+                    options,
+                )
+                .unwrap();
+            assert_eq!(status["resume"], Value::Null);
+            assert_eq!(status["native_session"]["value"], "raw-conversation");
+            assert_eq!(status["native_session"]["source"], "observed");
+        }
+    }
+}
+
+#[test]
+fn profile_resume_rejects_an_occupied_asserted_conversation_before_opening_another_tab() {
+    for harness in ["claude", "codex", "muse"] {
+        let fixture = Fixture::new();
+        fixture
+            .client
+            .report_session
+            .store(false, Ordering::Relaxed);
+        let profile = loaded_resume_profile(&fixture, harness, &[]);
+        fixture
+            .manager()
+            .start_with_reasoning_effort(
+                "owner",
+                &fixture.root,
+                profile.reasoning_effort.as_deref().unwrap(),
+                resume_profile_options(&profile, "already-bound-session"),
+            )
+            .unwrap();
+        let error = fixture
+            .manager()
+            .start_with_reasoning_effort(
+                "worker",
+                &fixture.root,
+                profile.reasoning_effort.as_deref().unwrap(),
+                resume_profile_options(&profile, "already-bound-session"),
+            )
+            .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("already registered as \"owner\""));
+        assert!(!fixture.root.join("registry/worker").exists());
+        assert_eq!(fixture.client.environments.lock().unwrap().len(), 1);
+    }
+}
+
 #[test]
 fn fresh_claude_records_an_assigned_conversation_and_safe_launch_metadata() {
     let fixture = Fixture::new();

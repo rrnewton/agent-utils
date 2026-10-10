@@ -24,6 +24,7 @@ from agentctl.errors import (
 from agentctl.profiles import (
     configuration_root,
     load_configuration, load_profiles, validate_muse_headless_arguments,
+    validate_raw_harness_arguments, validate_structured_harness_argument_conflicts,
     workspace_for_registry,
 )
 from agentctl.sessions import Sessions
@@ -1121,3 +1122,274 @@ def test_stop_refusal_headless_unavailable_keeps_record_and_prints_doctor(
     assert "headless worker control unavailable" in captured.err
     assert _cli_stop_recovery_argv(captured.err)[3:] == ["doctor"]
     assert (sessions.registry / "worker/agent.json").read_bytes() == before and fake.closed == []
+
+
+def _profile_resume_setup(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, harness: str,
+    *, argv: tuple[str, ...] = (),
+) -> tuple[Sessions, FakeManagedClient]:
+    sessions, fake, _calls = setup(tmp_path, monkeypatch)
+    _write_profiles(tmp_path, {"owner-policy": {
+        "harness": harness, "mode": "interactive", "model": "chosen-model",
+        "reasoning_effort": "high", "argv": list(argv),
+        "env": {"TAB_SETTING": "owner value"},
+    }})
+    monkeypatch.setattr(cli, "HerdrClient", lambda **_kwargs: cast(HerdrClient, fake))
+    return sessions, fake
+
+
+def _profile_resume_native_report(
+    fake: FakeManagedClient, monkeypatch: pytest.MonkeyPatch, harness: str,
+    value: str, *, provider: str | None = None,
+) -> None:
+    if harness == "muse":
+        original_custom = fake.start_pane_agent
+
+        def custom(
+            name: str, kind: str, pane_id: str, arguments: tuple[str, ...], *,
+            timeout: float, on_observed: Callable[[CustomProcessIdentity], None] | None = None,
+        ) -> CustomProcessIdentity:
+            identity = original_custom(name, kind, pane_id, arguments,
+                timeout=timeout, on_observed=on_observed)
+            fake.infos[pane_id] = replace(fake.infos[pane_id],
+                session_agent=provider or kind, session_value=value)
+            return identity
+
+        monkeypatch.setattr(fake, "start_pane_agent", custom)
+    else:
+        original_native = fake.start_agent
+
+        def native(
+            name: str, kind: str, pane_id: str, arguments: tuple[str, ...], *, timeout: float,
+        ) -> None:
+            original_native(name, kind, pane_id, arguments, timeout=timeout)
+            fake.infos[pane_id] = replace(fake.infos[pane_id],
+                session_agent=provider or kind, session_value=value)
+
+        monkeypatch.setattr(fake, "start_agent", native)
+
+
+@pytest.mark.parametrize("harness,raw,expected", [
+    ("codex", "--ask-for-approval=never", (
+        "resume", "selected-conversation", "--no-alt-screen", "--model", "chosen-model",
+        "--config", "model_reasoning_effort=high", "--ask-for-approval=never",
+    )),
+    ("claude", "--dangerously-skip-permissions", (
+        "--resume", "selected-conversation", "--model", "chosen-model", "--effort", "high",
+        "--dangerously-skip-permissions",
+    )),
+    ("muse", "--image=profile attachment.png", (
+        "--model", "chosen-model", "--reasoning-effort", "high",
+        "--image=profile attachment.png", "resume", "selected-conversation",
+    )),
+])
+def test_profile_resume_cli_preserves_policy_and_boxes_the_selected_native_launch(
+    harness: str, raw: str, expected: tuple[str, ...], tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+) -> None:
+    sessions, fake = _profile_resume_setup(tmp_path, monkeypatch, harness, argv=(raw,))
+    _profile_resume_native_report(fake, monkeypatch, harness, "selected-conversation")
+    slot_path = tmp_path / "slots" / "worker"
+    slot_path.mkdir(parents=True)
+    entered: list[tuple[str, str]] = []
+
+    def slot_shell(
+        slot: str, *, isolation: str | None, project: str, explicit_project: bool = False,
+    ) -> tuple[str, str, str]:
+        assert slot == "worker-slot" and isolation == "userns"
+        assert project == str(tmp_path) and explicit_project
+        return "exec boxed-shell", str(slot_path), "userns"
+
+    def enter(pane_id: str, command_line: str, *, timeout: float) -> int:
+        assert fake.launched == [] and timeout > 0
+        entered.append((pane_id, command_line))
+        return 4242
+
+    monkeypatch.setattr("agentctl.subagents._slot_shell_command", slot_shell)
+    monkeypatch.setattr(fake, "enter_slot_sandbox", enter, raising=False)
+    assert cli.main([
+        "start", "worker", "--cwd", str(tmp_path), "--registry", str(sessions.registry),
+        "--profile", "owner-policy", "--resume", "selected-conversation",
+        "--slot", "worker-slot", "--slot-isolation", "userns", "--slot-project", str(tmp_path),
+    ]) == 0
+    captured = capsys.readouterr()
+    result = json.loads(captured.out)
+    record = sessions.get("worker")
+    assert fake.launched == [("worker", harness, "w1:p1", expected)]
+    assert record.arguments == list(expected) and "--session-id" not in record.arguments
+    assert record.profile == "owner-policy" and record.model == "chosen-model"
+    assert record.reasoning_effort == "high" and record.cwd == str(slot_path)
+    assert record.slot == "worker-slot" and record.slot_project == str(tmp_path)
+    assert record.slot_isolation == "userns" and entered == [("w1:p1", "exec boxed-shell")]
+    assert fake.infos["w1:p1"].cwd == str(slot_path)
+    assert fake.environments == [("TAB_SETTING=owner value",)]
+    assert record.environment_names == ["TAB_SETTING"] and "owner value" not in captured.out
+    assert record.resume == "selected-conversation"
+    assert record.native_session == {
+        "schema": "agentctl-native-session/v1", "agent": harness,
+        "value": "selected-conversation", "source": "asserted",
+    }
+    assert result["native_session"] == record.native_session
+    assert result["lifecycle"] == "running" and captured.err == ""
+
+
+@pytest.mark.parametrize("harness", ["codex", "claude", "muse"])
+@pytest.mark.parametrize("mismatch", ["conversation", "provider"])
+def test_profile_resume_cli_refuses_wrong_native_reports_before_initial_instructions(
+    harness: str, mismatch: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    sessions, fake = _profile_resume_setup(tmp_path, monkeypatch, harness)
+    _profile_resume_native_report(fake, monkeypatch, harness,
+        "other-conversation" if mismatch == "conversation" else "selected-conversation",
+        provider="other-provider" if mismatch == "provider" else None)
+    assert cli.main([
+        "start", "worker", "--cwd", str(tmp_path), "--registry", str(sessions.registry),
+        "--profile", "owner-policy", "--resume", "selected-conversation",
+        "--brief", "must never arrive",
+    ]) == 75
+    captured = capsys.readouterr()
+    assert "different native" in captured.err and captured.out == ""
+    record = sessions.get("worker")
+    assert record.lifecycle == "launch_failed" and record.profile == "owner-policy"
+    assert record.native_session is not None and record.native_session["value"] == "selected-conversation"
+    assert record.session_agent is None and record.session_value is None
+    assert fake.submitted == [] and fake.closed == []
+    assert "--session-id" not in record.arguments
+
+
+@pytest.mark.parametrize("harness,argv", [
+    ("codex", ("resume", "other-conversation")),
+    ("muse", ("resume", "other-conversation")),
+    ("claude", ("--resume=other-conversation",)),
+    ("claude", ("--session-id=other-conversation",)),
+    ("claude", ("--fork-session",)),
+])
+def test_profile_resume_cli_rejects_duplicate_raw_conversation_selectors_before_effects(
+    harness: str, argv: tuple[str, ...], tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    sessions, fake = _profile_resume_setup(tmp_path, monkeypatch, harness, argv=argv)
+    assert cli.main([
+        "start", "worker", "--cwd", str(tmp_path), "--registry", str(sessions.registry),
+        "--profile", "owner-policy", "--resume", "selected-conversation",
+    ]) == 75
+    captured = capsys.readouterr()
+    assert "resume" in captured.err and captured.out == ""
+    assert not sessions.registry.exists() and fake.environments == [] and fake.launched == []
+
+
+@pytest.mark.parametrize("override", [
+    ("--mode=interactive",), ("--harness=codex",), ("--model=other-model",),
+    ("--reasoning-effort=low",), ("--harness-arg=--other-flag",), ("--env=OTHER_SETTING=1",),
+])
+def test_profile_resume_cli_keeps_other_explicit_launch_settings_in_conflict(
+    override: tuple[str, ...], tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    sessions, fake = _profile_resume_setup(tmp_path, monkeypatch, "codex")
+    assert cli.main([
+        "start", "worker", "--cwd", str(tmp_path), "--registry", str(sessions.registry),
+        "--profile", "owner-policy", "--resume", "selected-conversation", *override,
+    ]) == 2
+    captured = capsys.readouterr()
+    assert "--profile conflicts" in captured.err and override[0].split("=", 1)[0] in captured.err
+    assert "--resume" not in captured.err and captured.out == ""
+    assert not sessions.registry.exists() and fake.environments == [] and fake.launched == []
+
+
+@pytest.mark.parametrize("harness", ["codex", "claude", "muse"])
+def test_profile_resume_cli_refuses_an_already_registered_native_conversation_before_allocation(
+    harness: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    sessions, fake = _profile_resume_setup(tmp_path, monkeypatch, harness)
+    _profile_resume_native_report(fake, monkeypatch, harness, "selected-conversation")
+    arguments = [
+        "--cwd", str(tmp_path), "--registry", str(sessions.registry),
+        "--profile", "owner-policy", "--resume", "selected-conversation",
+    ]
+    assert cli.main(["start", "first", *arguments]) == 0
+    capsys.readouterr()
+    original = (sessions.registry / "first/agent.json").read_bytes()
+    assert cli.main(["start", "second", *arguments]) == 75
+    captured = capsys.readouterr()
+    assert "already registered as 'first'" in captured.err and captured.out == ""
+    assert len(fake.launched) == 1 and len(fake.environments) == 1 and fake.submitted == []
+    assert not (sessions.registry / "second").exists()
+    assert (sessions.registry / "first/agent.json").read_bytes() == original
+
+
+@pytest.mark.parametrize("harness", ["codex", "muse"])
+def test_profile_resume_cli_keeps_headless_resume_out_of_scope(
+    harness: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    sessions, fake, _calls = setup(tmp_path, monkeypatch)
+    _write_profiles(tmp_path, {"headless": {"harness": harness, "mode": "headless", "env": {}}})
+    monkeypatch.setattr(cli, "HerdrClient", lambda **_kwargs: cast(HerdrClient, fake))
+    monkeypatch.setattr(Sessions, "_worker", lambda *_args, **_kwargs: pytest.fail("no worker dispatch"))
+    assert cli.main([
+        "start", "worker", "--cwd", str(tmp_path), "--registry", str(sessions.registry),
+        "--profile", "headless", "--resume", "selected-conversation",
+    ]) == 75
+    captured = capsys.readouterr()
+    assert "headless start does not accept resume" in captured.err and captured.out == ""
+    assert not sessions.registry.exists() and fake.environments == [] and fake.launched == []
+
+
+def test_profile_resume_cli_keeps_agentcloud_as_a_rust_only_adapter(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+) -> None:
+    sessions, fake, _calls = setup(tmp_path, monkeypatch)
+    _write_profiles(tmp_path, {"cloud": _CLOUD_PROFILE})
+    monkeypatch.setattr(cli, "HerdrClient", lambda **_kwargs: cast(HerdrClient, fake))
+    assert cli.main([
+        "start", "worker", "--cwd", str(tmp_path), "--registry", str(sessions.registry),
+        "--profile", "cloud", "--resume", "selected-conversation",
+    ]) == 2
+    captured = capsys.readouterr()
+    assert "only the Rust edition" in captured.err and "conflicts" not in captured.err
+    assert not sessions.registry.exists() and fake.environments == [] and fake.launched == []
+
+
+@pytest.mark.parametrize("harness", ["codex", "muse"])
+def test_profile_resume_raw_only_selectors_remain_allowed_without_structured_resume(
+    harness: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    arguments = ("resume", "raw-conversation")
+    validate_raw_harness_arguments(harness, arguments, label="raw-only")
+    validate_structured_harness_argument_conflicts(harness, arguments, label="raw-only")
+    with pytest.raises(AgentDeliveryError, match="structured resume selector"):
+        validate_structured_harness_argument_conflicts(
+            harness, arguments, label="structured", structured_resume=True,
+        )
+    sessions, fake = _profile_resume_setup(tmp_path, monkeypatch, harness, argv=arguments)
+    _profile_resume_native_report(fake, monkeypatch, harness, "raw-conversation")
+    assert cli.main([
+        "start", "worker", "--cwd", str(tmp_path), "--registry", str(sessions.registry),
+        "--profile", "owner-policy",
+    ]) == 0
+    captured = capsys.readouterr()
+    assert captured.err == "" and fake.launched[0][3][-2:] == arguments
+    record = sessions.get("worker")
+    assert record.resume is None and record.native_session == {
+        "schema": "agentctl-native-session/v1", "agent": harness,
+        "value": "raw-conversation", "source": "observed",
+    }
+
+
+@pytest.mark.parametrize("resume", ["", "bad\0conversation"])
+def test_profile_resume_cli_rejects_invalid_conversations_before_allocation(
+    resume: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    sessions, fake = _profile_resume_setup(tmp_path, monkeypatch, "codex")
+    assert cli.main([
+        "start", "worker", "--cwd", str(tmp_path), "--registry", str(sessions.registry),
+        "--profile", "owner-policy", "--resume", resume,
+    ]) == 75
+    captured = capsys.readouterr()
+    assert "native session id must be nonempty and contain no NUL" in captured.err
+    assert not sessions.registry.exists() and fake.environments == [] and fake.launched == []

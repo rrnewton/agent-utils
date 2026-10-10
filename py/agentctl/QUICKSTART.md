@@ -43,6 +43,13 @@ while keeping their terminals available for direct inspection.
    agentctl start reviewer --cwd . --profile preferred-reviewer
    ```
 
+   Resume a saved local interactive Claude, Codex, or Muse conversation with
+   that profile's launch settings:
+
+   ```sh
+   agentctl start reviewer-again --cwd . --profile preferred-reviewer --resume SESSION
+   ```
+
    An optional top-level `"workspace": "project-agents"` setting makes that
    Herdr workspace label authoritative for starts and automated input. Status
    and stop remain available for diagnosis and retirement.

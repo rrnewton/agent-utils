@@ -266,7 +266,8 @@ struct Start {
     cwd: PathBuf,
     /// Owner-configured profile from CWD/.agentctl/profiles.json, or, when CWD has none, from the
     /// profiles.json beside a registry named .agentctl (so a worktree outside the project uses the
-    /// project's profiles)
+    /// project's profiles). Can combine with --resume for local interactive Claude, Codex, or
+    /// Muse; other explicit launch settings conflict
     #[arg(long)]
     profile: Option<String>,
     /// Execution mode; headless workers require an installation with the worker extension
@@ -302,7 +303,8 @@ struct Start {
     /// Structured harness reasoning effort
     #[arg(long)]
     reasoning_effort: Option<String>,
-    /// Existing native conversation ID to resume instead of starting a new one
+    /// Existing native conversation ID for local interactive Claude, Codex, or Muse; can combine
+    /// with --profile (example: --profile reviewer --resume CONVERSATION_ID)
     #[arg(long, value_name = "SESSION")]
     resume: Option<String>,
     /// Extra literal harness argument; repeat or use --harness-arg=--flag
@@ -1166,9 +1168,6 @@ fn run(args: Cli, environment: &dyn Fn(&str) -> Option<String>) -> Result<i32, F
                     if value.reasoning_effort.is_some() {
                         overlaps.push("--reasoning-effort");
                     }
-                    if value.resume.is_some() {
-                        overlaps.push("--resume");
-                    }
                     if !value.harness_args.is_empty() {
                         overlaps.push("--harness-arg");
                     }
@@ -1749,7 +1748,119 @@ fn add_capabilities(value: &mut serde_json::Value) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agent;
     use clap::CommandFactory;
+
+    fn profile_resume_arguments(root: &Path) -> Vec<OsString> {
+        vec![
+            "agentctl".into(),
+            "--registry".into(),
+            root.join("registry").into_os_string(),
+            "--herdr-bin=/definitely/missing/herdr".into(),
+            "start".into(),
+            "worker".into(),
+            "--cwd".into(),
+            root.as_os_str().to_owned(),
+            "--profile=reviewer".into(),
+            "--resume=saved-conversation".into(),
+        ]
+    }
+
+    #[test]
+    fn profile_resume_cli_accepts_the_combination_and_documents_its_local_scope() {
+        let fixture = crate::subagents::tests::Fixture::new();
+        let parsed = Cli::try_parse_from(profile_resume_arguments(&fixture.root)).unwrap();
+        let Some(Commands::Start(start)) = parsed.command else {
+            panic!("start command");
+        };
+        assert_eq!(start.profile.as_deref(), Some("reviewer"));
+        assert_eq!(start.resume.as_deref(), Some("saved-conversation"));
+        let help = Cli::try_parse_from(["agentctl", "start", "--help"])
+            .err()
+            .unwrap()
+            .to_string()
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(help.contains("local interactive Claude, Codex, or Muse"));
+        assert!(help.contains("--profile reviewer --resume CONVERSATION_ID"));
+        assert!(help.contains("other explicit launch settings conflict"));
+    }
+
+    #[test]
+    fn profile_resume_cli_retains_every_other_explicit_profile_override_conflict() {
+        let fixture = crate::subagents::tests::Fixture::new();
+        for (flag, arguments) in [
+            ("--mode", vec!["--mode=interactive"]),
+            ("--harness", vec!["--harness=codex"]),
+            ("--model", vec!["--model=other-model"]),
+            ("--reasoning-effort", vec!["--reasoning-effort=high"]),
+            ("--harness-arg", vec!["--harness-arg=--other-policy"]),
+            ("--env", vec!["--env=REVIEW_MODE=other"]),
+            ("--cloud-harness", vec!["--cloud-harness=native"]),
+            ("--provision", vec!["--provision"]),
+            ("--envspec", vec!["--provision", "--envspec=example"]),
+            ("--purpose", vec!["--provision", "--purpose=example"]),
+            ("--cloud-workspace", vec!["--cloud-workspace=/work/example"]),
+            ("--node-id", vec!["--node-id=example"]),
+        ] {
+            let mut argv = profile_resume_arguments(&fixture.root);
+            argv.extend(arguments.iter().map(OsString::from));
+            let error = run(Cli::try_parse_from(argv).unwrap(), &|_| None).unwrap_err();
+            let Failure::Usage(message) = error else {
+                panic!("expected usage refusal for {flag}");
+            };
+            assert!(message.contains("--profile conflicts"), "{flag}: {message}");
+            assert!(message.contains(flag), "{flag}: {message}");
+            assert!(!message.contains("--resume"), "{flag}: {message}");
+        }
+        assert!(!fixture.root.join("registry").exists());
+    }
+
+    #[test]
+    fn profile_resume_cli_keeps_headless_and_agentcloud_out_of_native_resume_scope() {
+        for (harness, mode) in [("codex", "headless"), ("agentcloud", "interactive")] {
+            let fixture = crate::subagents::tests::Fixture::new();
+            assert!(std::process::Command::new("/usr/bin/git")
+                .args(["init", "-q"])
+                .arg(&fixture.root)
+                .status()
+                .unwrap()
+                .success());
+            fs::write(fixture.root.join(".gitignore"), ".agentctl/\n").unwrap();
+            let directory = fixture.root.join(".agentctl");
+            agent::create_private_directory(&directory, "test launch profiles", false, false)
+                .unwrap();
+            agent::atomic_json(
+                &directory.join("profiles.json"),
+                &json!({
+                    "schema": "agentctl-profiles/v1",
+                    "profiles": {"reviewer": {"harness": harness, "mode": mode}},
+                }),
+            )
+            .unwrap();
+            let error = run(
+                Cli::try_parse_from(profile_resume_arguments(&fixture.root)).unwrap(),
+                &|_| None,
+            )
+            .unwrap_err();
+            if mode == "headless" {
+                let Failure::Usage(message) = error else {
+                    panic!("expected headless usage refusal");
+                };
+                assert!(message.contains("headless"));
+            } else {
+                let Failure::Agent(error) = error else {
+                    panic!("expected agentcloud resume refusal");
+                };
+                assert_eq!(error.exit_code(), 75);
+                assert!(error
+                    .to_string()
+                    .contains("--resume does not apply to agentcloud"));
+            }
+            assert!(!fixture.root.join("registry").exists());
+        }
+    }
 
     #[test]
     fn stop_advice_parser_uses_recognized_grammar_and_successfully_parsed_globals() {
