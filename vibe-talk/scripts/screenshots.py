@@ -919,6 +919,9 @@ class Driver:
             # `#212 link-filter`. The kinds of link a reader turned off under Links are kept, and
             # `38-link-kinds-off` turns one off: every later Links frame must start with all on.
             "  localStorage.removeItem('vibe-talk.voice.hidden-link-kinds');\n"
+            # `#230 text-size-buttons`. `45-settings-text-size` presses +, and the message text of
+            # every later frame must be at its usual size, not a step larger.
+            "  localStorage.removeItem('vibe-talk.voice.msg-scale');\n"
             "} catch (e) {}\n"
         )
         # `#58 control-bar`. Where the control bar sits is a stored preference, so it is cleared
@@ -2643,6 +2646,28 @@ def _act_reply_marker_beside_arrow(driver: Driver) -> None:
     driver.settle(300)
 
 
+def _act_settings_text_size(driver: Driver) -> None:
+    """`#230 text-size-buttons`: the Text size group, a − and a + either side of its slider.
+
+    A fresh load (the size is a stored preference, cleared by `load`), Settings, and the group in the
+    middle of the screen. Then + is really clicked once, so the picture shows what a press does (the
+    slider a step along, the line under it saying so), and the keyboard backs onto − from the slider
+    with Shift+Tab, so the picture shows its focus ring too.
+    """
+    driver.load(with_token=True)
+    driver.page.wait_for_function("() => window.__visible('control-pane')", timeout=10_000)
+    driver.click("open-settings")
+    driver.page.wait_for_function("() => window.__visible('close-settings')", timeout=5_000)
+    driver.js(
+        "(() => { document.getElementById('msg-scale').closest('.settings-group')"
+        ".scrollIntoView({ block: 'center' }); return true; })()"
+    )
+    driver.click("msg-scale-larger")
+    driver.js("(() => { document.getElementById('msg-scale').focus(); return true; })()")
+    driver.page.keyboard.press("Shift+Tab")
+    driver.settle(300)
+
+
 # Where the head of the arrow from the row under `parent` is, from what is drawn as elements: the
 # point and the box of the triangle, in CSS pixels. A head under the foot is centred on the shaft,
 # the span's left border; one at the side has its point on the row's left edge, raised where the
@@ -4164,6 +4189,53 @@ SCENES: tuple[Scene, ...] = (
                 "const onHead = document.elementFromPoint(head.press[0], head.press[1]); "
                 "return onDisc !== null && d.marker.contains(onDisc) && onHead !== null "
                 "&& head.arrow.contains(onHead); })()",
+            ),
+        ),
+    ),
+    Scene(
+        name="45-settings-text-size",
+        what="Settings, Text size: a − and a + either side of the slider, one press of + in, the ring on −",
+        act=_act_settings_text_size,
+        profiles=("android-412", "laptop-1280"),
+        expect=(
+            ("the settings screen is up", "window.__visible('screen-settings')"),
+            (
+                "the slider and both buttons are on screen",
+                "['msg-scale-smaller', 'msg-scale', 'msg-scale-larger'].every((id) => { "
+                "const b = document.getElementById(id).getBoundingClientRect(); "
+                "return window.__visible(id) && b.top >= 0 && b.bottom <= innerHeight; })",
+            ),
+            (
+                # THE layout claim: one row, never the + wrapped under the slider.
+                "−, the slider and + are one row, left to right, centred on one line",
+                "(() => { const [m, s, p] = ['msg-scale-smaller', 'msg-scale', 'msg-scale-larger']"
+                ".map((id) => document.getElementById(id).getBoundingClientRect()); "
+                "const mid = (b) => b.top + b.height / 2; "
+                "return m.right <= s.left && s.right <= p.left "
+                "&& Math.abs(mid(m) - mid(s)) < 3 && Math.abs(mid(p) - mid(s)) < 3; })()",
+            ),
+            (
+                "each button is a target of at least 44 by 44 CSS pixels",
+                "['msg-scale-smaller', 'msg-scale-larger'].every((id) => { "
+                "const b = document.getElementById(id).getBoundingClientRect(); "
+                "return b.width >= 44 && b.height >= 44; })",
+            ),
+            (
+                "the slider keeps a track a thumb can use beside them",
+                "document.getElementById('msg-scale').getBoundingClientRect().width >= 150",
+            ),
+            (
+                "one press of + moved the slider a step and the line under it says so",
+                "document.getElementById('msg-scale').value === '105' "
+                "&& window.__text('msg-scale-state') === 'Saved — message text at 105% of its usual size.' "
+                "&& !document.getElementById('msg-scale-smaller').disabled "
+                "&& !document.getElementById('msg-scale-larger').disabled",
+            ),
+            (
+                "the keyboard is on −, and the ring is drawn",
+                "document.activeElement === document.getElementById('msg-scale-smaller') "
+                "&& document.activeElement.matches(':focus-visible') "
+                "&& getComputedStyle(document.activeElement).outlineStyle === 'solid'",
             ),
         ),
     ),
