@@ -259,8 +259,13 @@ class Sessions(ManagedAgents):
         self, name: str, *, expected_token: str | None = None,
         recover_legacy_adoption: bool = False,
         expected_record_sha256: str | None = None,
+        retire_dead_adoption: bool = False,
     ) -> dict[str, object]:
         """Retire a runtime, then archive its canonical identity and artifacts."""
+        if retire_dead_adoption and recover_legacy_adoption:
+            raise AgentDeliveryError(
+                "--retire-dead-adoption and --recover-legacy-adoption are mutually exclusive"
+            )
         record = self._load_expected(name, expected_token)
         if record.adapter in ("herdr", "herdr-pane", "herdr-foreign", "herdr-relay"):
             return self._stop(
@@ -268,6 +273,11 @@ class Sessions(ManagedAgents):
                 recover_legacy_adoption=recover_legacy_adoption,
                 expected_record_sha256=expected_record_sha256,
                 expected_token_explicit=expected_token is not None,
+                retire_dead_adoption=retire_dead_adoption,
+            )
+        if retire_dead_adoption:
+            raise AgentDeliveryError(
+                "dead-adoption retirement is supported only for interactive herdr-foreign records"
             )
         if recover_legacy_adoption or expected_record_sha256 is not None:
             raise AgentDeliveryError(

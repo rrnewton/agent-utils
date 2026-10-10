@@ -61,6 +61,7 @@ struct Args {
     goal_command_json: Option<String>,
     expected_token: Option<String>,
     recover_legacy_adoption: bool,
+    retire_dead_adoption: bool,
     expected_record_sha256: Option<String>,
 }
 
@@ -94,6 +95,7 @@ impl Default for Args {
             goal_command_json: None,
             expected_token: None,
             recover_legacy_adoption: false,
+            retire_dead_adoption: false,
             expected_record_sha256: None,
         }
     }
@@ -228,6 +230,11 @@ fn run(args: Args) -> Result<i32, CliError> {
         .first()
         .expect("validated command is present")
         .as_str();
+    if args.retire_dead_adoption && command != "stop" {
+        return Err(CliError::Usage(
+            "--retire-dead-adoption is valid only with stop".to_owned(),
+        ));
+    }
     if args.name.is_some()
         || matches!(
             command,
@@ -305,6 +312,7 @@ fn run_managed(args: Args) -> Result<i32, CliError> {
     if command != "stop"
         && (args.expected_token.is_some()
             || args.recover_legacy_adoption
+            || args.retire_dead_adoption
             || args.expected_record_sha256.is_some())
     {
         return Err(CliError::Usage(
@@ -334,19 +342,32 @@ fn run_managed(args: Args) -> Result<i32, CliError> {
     {
         return Err(CliError::Usage("managed commands use registry identity; do not combine --name with pane/session assertions".to_owned()));
     }
-    if command == "stop"
-        && args.recover_legacy_adoption
-        && (args.expected_token.is_none() || args.expected_record_sha256.is_none())
-    {
-        return Err(CliError::Usage(
-            "--recover-legacy-adoption requires --expected-token and --expected-record-sha256"
-                .to_owned(),
-        ));
-    }
-    if command == "stop" && !args.recover_legacy_adoption && args.expected_record_sha256.is_some() {
-        return Err(CliError::Usage(
-            "--expected-record-sha256 requires --recover-legacy-adoption".to_owned(),
-        ));
+    if command == "stop" {
+        if args.recover_legacy_adoption && args.retire_dead_adoption {
+            return Err(CliError::Usage(
+                "--retire-dead-adoption and --recover-legacy-adoption are mutually exclusive"
+                    .to_owned(),
+            ));
+        }
+        let recovery_selector = if args.retire_dead_adoption {
+            Some("--retire-dead-adoption")
+        } else if args.recover_legacy_adoption {
+            Some("--recover-legacy-adoption")
+        } else {
+            None
+        };
+        if let Some(selector) = recovery_selector
+            .filter(|_| args.expected_token.is_none() || args.expected_record_sha256.is_none())
+        {
+            return Err(CliError::Usage(format!(
+                "{selector} requires --expected-token and --expected-record-sha256"
+            )));
+        }
+        if recovery_selector.is_none() && args.expected_record_sha256.is_some() {
+            return Err(CliError::Usage(
+                "--expected-record-sha256 requires --recover-legacy-adoption or --retire-dead-adoption".to_owned(),
+            ));
+        }
     }
     let goal_command = args
         .goal_command_json
@@ -412,6 +433,7 @@ fn run_managed(args: Args) -> Result<i32, CliError> {
             StopOptions {
                 expected_token: args.expected_token.clone(),
                 recover_legacy_adoption: args.recover_legacy_adoption,
+                retire_dead_adoption: args.retire_dead_adoption,
                 expected_record_sha256: args.expected_record_sha256.clone(),
                 skip_cloud_halt: false,
             },
@@ -637,6 +659,7 @@ where
                 }
                 "--userguide" => args.userguide = true,
                 "--recover-legacy-adoption" => args.recover_legacy_adoption = true,
+                "--retire-dead-adoption" => args.retire_dead_adoption = true,
                 option if value_option(option).is_some() => {
                     let value = raw
                         .get(index + 1)
@@ -835,7 +858,7 @@ fn usage_line() -> &'static str {
 
 fn print_help() {
     println!(
-        "usage: {}\n\nQueue, submit, inspect, and read interactive agents hosted in Herdr panes.\n\npositional arguments:\n  {{start,stop,list,wait,goal,bind-session,send,drain,status,read,userguide}}\n  text\n\noptions:\n  -h, --help\n  --version\n  --userguide\n  --file FILE\n  --pane PANE\n  --session-agent SESSION_AGENT\n  --session SESSION\n  --agent AGENT\n  --workspace WORKSPACE\n  --cwd CWD\n  --queue QUEUE\n  --ready-timeout READY_TIMEOUT\n  --working-timeout WORKING_TIMEOUT\n  --max-attempts MAX_ATTEMPTS\n  --lines LINES\n  --herdr-bin HERDR_BIN\n  --name NAME\n  --registry REGISTRY\n  --workspace-id WORKSPACE_ID\n  --harness HARNESS\n  --model MODEL\n  --resume SESSION\n  --harness-arg ARGUMENT\n  --brief TEXT\n  --startup-timeout SECONDS\n  --goal-command-json ARGV_JSON\n  --expected-token TOKEN\n  --recover-legacy-adoption\n  --expected-record-sha256 SHA256",
+        "usage: {}\n\nQueue, submit, inspect, and read interactive agents hosted in Herdr panes.\n\npositional arguments:\n  {{start,stop,list,wait,goal,bind-session,send,drain,status,read,userguide}}\n  text\n\noptions:\n  -h, --help\n  --version\n  --userguide\n  --file FILE\n  --pane PANE\n  --session-agent SESSION_AGENT\n  --session SESSION\n  --agent AGENT\n  --workspace WORKSPACE\n  --cwd CWD\n  --queue QUEUE\n  --ready-timeout READY_TIMEOUT\n  --working-timeout WORKING_TIMEOUT\n  --max-attempts MAX_ATTEMPTS\n  --lines LINES\n  --herdr-bin HERDR_BIN\n  --name NAME\n  --registry REGISTRY\n  --workspace-id WORKSPACE_ID\n  --harness HARNESS\n  --model MODEL\n  --resume SESSION\n  --harness-arg ARGUMENT\n  --brief TEXT\n  --startup-timeout SECONDS\n  --goal-command-json ARGV_JSON\n  --expected-token TOKEN\n  --recover-legacy-adoption\n  --retire-dead-adoption\n  --expected-record-sha256 SHA256\n\nAdoption recovery applies only to stop. Select exactly one recovery flag and supply\n--expected-token TOKEN and the lowercase 64-hex SHA-256 of the raw agent.json bytes.\n--retire-dead-adoption archives a running adopted record with a dead pinned harness\nwithout querying Herdr. Example: herdr-agent stop reviewer --retire-dead-adoption\n  --expected-token TOKEN --expected-record-sha256 SHA256",
         usage_line()
     );
 }
@@ -918,6 +941,46 @@ mod tests {
             panic!("unexpected early exit");
         };
         assert_eq!(args.expected_token.as_deref(), Some("-original-generation"));
+    }
+
+    #[test]
+    fn dead_adoption_flags_preserve_authority_and_reject_invalid_modes_before_herdr() {
+        let ParseResult::Args(mut args) = parse(strings(&[
+            "stop",
+            "foreign",
+            "--retire-dead-adoption",
+            "--expected-token=-original-generation",
+            "--expected-record-sha256",
+            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+        ]))
+        .unwrap() else {
+            panic!("unexpected early exit");
+        };
+        assert!(args.retire_dead_adoption);
+        assert!(!args.recover_legacy_adoption);
+        assert_eq!(args.expected_token.as_deref(), Some("-original-generation"));
+        assert_eq!(
+            args.expected_record_sha256.as_deref(),
+            Some("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef")
+        );
+        args.herdr_bin = PathBuf::from("/definitely/missing/herdr");
+        args.recover_legacy_adoption = true;
+        assert!(matches!(
+            run(*args),
+            Err(CliError::Usage(message)) if message.contains("mutually exclusive")
+        ));
+
+        let args = Args {
+            positional: vec!["send".to_owned(), "text".to_owned()],
+            pane: Some("p1".to_owned()),
+            retire_dead_adoption: true,
+            herdr_bin: PathBuf::from("/definitely/missing/herdr"),
+            ..Args::default()
+        };
+        assert!(matches!(
+            run(args),
+            Err(CliError::Usage(message)) if message.contains("valid only with stop")
+        ));
     }
 
     #[test]

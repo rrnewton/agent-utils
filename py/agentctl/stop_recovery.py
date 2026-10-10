@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import re
 import shlex
 import sys
 from collections.abc import Iterable
@@ -30,7 +31,16 @@ def stop_refusal_message(
                 and expected_record_sha256 != action.record_sha256)):
         action = RecoveryAction("doctor")
     argv = ["agentctl", "--registry=" + os.path.abspath(registry), "--herdr-bin=" + herdr_bin]
-    if (action.command in ("stop", "revive") and action.name and action.token
+    if (action.command == "retire-dead-adoption" and action.name and action.token
+            and "\0" not in action.name and "\0" not in action.token
+            and action.record_sha256 is not None
+            and re.fullmatch(r"[0-9a-f]{64}", action.record_sha256) is not None):
+        argv.extend([
+            "stop", action.name, "--retire-dead-adoption",
+            "--expected-token=" + action.token,
+            "--expected-record-sha256=" + action.record_sha256,
+        ])
+    elif (action.command in ("stop", "revive") and action.name and action.token
             and "\0" not in action.name and "\0" not in action.token):
         argv.extend([action.command, action.name, "--expected-token=" + action.token])
         if action.command == "stop" and action.record_sha256 is not None:

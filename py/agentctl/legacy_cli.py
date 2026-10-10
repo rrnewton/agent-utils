@@ -77,11 +77,14 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--brief", help="initial task after successful launch")
     parser.add_argument("--startup-timeout", type=_ascii_float, default=30.0)
     parser.add_argument("--goal-command-json", help="native Codex goal RPC argv as a JSON string array")
-    parser.add_argument("--expected-token", help="exact current registry generation for stop")
-    parser.add_argument("--recover-legacy-adoption", action="store_true",
-        help="recover an identity-less dead adopted row without mutating its pane")
+    parser.add_argument("--expected-token", help="exact current registry generation for stop; mandatory for adoption recovery")
+    adoption_recovery = parser.add_mutually_exclusive_group()
+    adoption_recovery.add_argument("--recover-legacy-adoption", action="store_true",
+        help="stop only: recover an identity-less dead adopted row without changing its pane; requires token and raw digest")
+    adoption_recovery.add_argument("--retire-dead-adoption", action="store_true",
+        help="stop only: archive a running adopted record whose pinned harness is dead, without querying Herdr; requires token and raw digest")
     parser.add_argument("--expected-record-sha256",
-        help="exact lowercase SHA-256 of legacy agent.json")
+        help="stop only: exact lowercase 64-hex SHA-256 of raw agent.json; requires an adoption recovery selector")
     parser.add_argument("--ready-timeout", type=_ascii_float, default=900.0)
     parser.add_argument("--working-timeout", type=_ascii_float, default=30.0)
     parser.add_argument("--max-attempts", type=_bounded_uint, default=3)
@@ -99,7 +102,7 @@ def _managed(args: argparse.Namespace, client: HerdrClient) -> int:
     name = args.name
     command = args.command
     if command != "stop" and (
-        args.expected_token is not None or args.recover_legacy_adoption
+        args.expected_token is not None or args.recover_legacy_adoption or args.retire_dead_adoption
         or args.expected_record_sha256 is not None
     ):
         raise ValueError("legacy recovery options are valid only with stop")
@@ -134,21 +137,25 @@ def _managed(args: argparse.Namespace, client: HerdrClient) -> int:
             working_timeout=args.working_timeout, max_attempts=args.max_attempts,
         )
     elif command == "stop":
-        if args.recover_legacy_adoption and (
+        recovery_selector = ("--retire-dead-adoption" if args.retire_dead_adoption
+                             else "--recover-legacy-adoption" if args.recover_legacy_adoption
+                             else None)
+        if recovery_selector is not None and (
             args.expected_token is None or args.expected_record_sha256 is None
         ):
             raise ValueError(
-                "--recover-legacy-adoption requires --expected-token and "
+                f"{recovery_selector} requires --expected-token and "
                 "--expected-record-sha256"
             )
-        if (not args.recover_legacy_adoption
+        if (recovery_selector is None
                 and args.expected_record_sha256 is not None):
             raise ValueError(
-                "--expected-record-sha256 requires --recover-legacy-adoption"
+                "--expected-record-sha256 requires --recover-legacy-adoption or --retire-dead-adoption"
             )
         result = manager.stop(
             name, expected_token=args.expected_token,
             recover_legacy_adoption=args.recover_legacy_adoption,
+            retire_dead_adoption=args.retire_dead_adoption,
             expected_record_sha256=args.expected_record_sha256,
         )
     elif command == "list":
@@ -252,6 +259,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             f"{_MAX_WAIT_SECONDS:g}s); max-attempts and lines must be positive"
         )
     try:
+        if args.retire_dead_adoption and args.command != "stop":
+            raise ValueError("--retire-dead-adoption is valid only with stop")
         client = HerdrClient(herdr_bin=str(args.herdr_bin))
         target = _target(args)
         queue = os.path.abspath(str(args.queue))

@@ -1714,6 +1714,20 @@ struct ManagedRecordSnapshot {
     directory_inode: u64,
 }
 
+#[derive(Clone, Debug, PartialEq)]
+struct DeadAdoptionSnapshot {
+    record: AgentRecord,
+    content: Vec<u8>,
+    record_identity: (u64, u64),
+    directory_identity: (u64, u64),
+}
+
+#[derive(Debug)]
+struct RetirementQueue {
+    directory: Option<PinnedParentDirectory>,
+    locks: Vec<(&'static str, File)>,
+}
+
 impl ManagedRecordSnapshot {
     fn same_generation(&self, other: &Self) -> bool {
         self.record == other.record
@@ -4054,7 +4068,9 @@ pub struct StopOptions {
     pub expected_token: Option<String>,
     /// Enable the narrowly scoped identity-less adopted-row recovery path.
     pub recover_legacy_adoption: bool,
-    /// SHA-256 of the exact current identity-less `agent.json` bytes.
+    /// Retire a dead adopted harness's record without inspecting or changing its runtime.
+    pub retire_dead_adoption: bool,
+    /// SHA-256 of the exact current `agent.json` bytes for explicit adoption recovery.
     pub expected_record_sha256: Option<String>,
     /// Retire an agentcloud agent's record and tab without halting or archiving its session.
     pub skip_cloud_halt: bool,
@@ -4374,6 +4390,15 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
         pinned: &PinnedAgentDirectory,
         require_active_name: bool,
     ) -> Result<Vec<u8>> {
+        self.record_bytes_with_identity(pinned, require_active_name)
+            .map(|(content, _identity)| content)
+    }
+
+    fn record_bytes_with_identity(
+        &self,
+        pinned: &PinnedAgentDirectory,
+        require_active_name: bool,
+    ) -> Result<(Vec<u8>, (u64, u64))> {
         if require_active_name {
             Self::verify_pinned_agent_directory(pinned)?;
         }
@@ -4434,7 +4459,14 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
         if require_active_name {
             Self::verify_pinned_agent_directory(pinned)?;
         }
-        Ok(content)
+        let current = Self::open_pinned_file(pinned, "agent.json", libc::O_RDONLY)?;
+        let current = current
+            .metadata()
+            .map_err(|error| fail(format!("cannot reinspect current agent record: {error}")))?;
+        if (current.dev(), current.ino()) != (before.dev(), before.ino()) {
+            return Err(fail("agent record pathname changed while reading"));
+        }
+        Ok((content, (before.dev(), before.ino())))
     }
 
     fn load(&self, agent_name: &str) -> Result<AgentRecord> {
@@ -4551,6 +4583,48 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
             directory_device: pinned.device,
             directory_inode: pinned.inode,
         })
+    }
+
+    fn dead_adoption_snapshot(
+        &self,
+        pinned: &PinnedAgentDirectory,
+        expected_token: &str,
+    ) -> Result<DeadAdoptionSnapshot> {
+        let (content, record_identity) = self.record_bytes_with_identity(pinned, true)?;
+        let path = pinned.path.join("agent.json");
+        let record: AgentRecord = serde_json::from_slice(&content)
+            .map_err(|error| fail(format!("invalid agent record {}: {error}", path.display())))?;
+        record.validate_loaded(&path, &pinned.name)?;
+        if record.token != expected_token {
+            return Err(fail(format!(
+                "agent {:?} was replaced before adoption retirement",
+                pinned.name
+            )));
+        }
+        Ok(DeadAdoptionSnapshot {
+            record,
+            content,
+            record_identity,
+            directory_identity: (pinned.device, pinned.inode),
+        })
+    }
+
+    fn dead_adoption_anchor(record: &AgentRecord) -> Result<&CustomProcessIdentity> {
+        if record.lifecycle != "running"
+            || record.mode != "interactive"
+            || record.backend != "herdr"
+            || record.adapter != "herdr-foreign"
+        {
+            return Err(fail(
+                "--retire-dead-adoption applies only to a running interactive herdr-foreign record",
+            ));
+        }
+        record
+            .harness_anchor()
+            .filter(|identity| identity.valid())
+            .ok_or_else(|| {
+                fail("dead adoption retirement requires a valid harness anchor from the current pinning rule")
+            })
     }
 
     fn save(&self, record: &AgentRecord) -> Result<()> {
@@ -4953,6 +5027,106 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
             held.push(lock);
         }
         Ok(held)
+    }
+
+    fn retirement_lock_identity(file: &File) -> Result<(u64, u64)> {
+        let metadata = file.metadata().map_err(|error| {
+            fail(format!(
+                "cannot inspect adoption retirement queue lock: {error}"
+            ))
+        })?;
+        if !metadata.is_file()
+            || metadata.uid() != unsafe { libc::getuid() }
+            || metadata.permissions().mode() & 0o077 != 0
+            || metadata.nlink() != 1
+        {
+            return Err(fail(
+                "adoption retirement queue lock must be a private regular file with one link",
+            ));
+        }
+        Ok((metadata.dev(), metadata.ino()))
+    }
+
+    fn open_retirement_queue_lock(directory: &File, lock_name: &str, create: bool) -> Result<File> {
+        let name = CString::new(lock_name).map_err(|_| fail("queue lock name contains NUL"))?;
+        let descriptor = unsafe {
+            libc::openat(
+                directory.as_raw_fd(),
+                name.as_ptr(),
+                libc::O_CLOEXEC
+                    | libc::O_NOFOLLOW
+                    | libc::O_NONBLOCK
+                    | libc::O_RDWR
+                    | if create { libc::O_CREAT } else { 0 },
+                0o600,
+            )
+        };
+        if descriptor < 0 {
+            return Err(fail(format!(
+                "cannot open adoption retirement queue lock {lock_name}: {}",
+                io::Error::last_os_error()
+            )));
+        }
+        let file = unsafe { File::from_raw_fd(descriptor) };
+        Self::retirement_lock_identity(&file)?;
+        Ok(file)
+    }
+
+    fn retirement_queue_locks(&self, pinned: &PinnedAgentDirectory) -> Result<RetirementQueue> {
+        Self::verify_pinned_agent_directory(pinned)?;
+        let identity = Self::child_directory_identity(&pinned.file, "queue")?;
+        let mut held = RetirementQueue {
+            directory: None,
+            locks: Vec::new(),
+        };
+        let Some(identity) = identity else {
+            return Ok(held);
+        };
+        let queue =
+            Self::pinned_parent_directory(&pinned.path.join("queue"), "adoption retirement queue")?;
+        if (queue.device, queue.inode) != identity {
+            return Err(fail("adoption retirement queue changed before locking"));
+        }
+        held.directory = Some(queue);
+        for name in [".delivery.lock", ".binding.lock"] {
+            let queue = held.directory.as_ref().expect("existing queue is pinned");
+            let file = Self::open_retirement_queue_lock(&queue.file, name, true)?;
+            file.lock_exclusive()
+                .map_err(|error| fail(format!("cannot lock adoption retirement queue: {error}")))?;
+            held.locks.push((name, file));
+            self.verify_retirement_queue(pinned, &held)?;
+        }
+        Ok(held)
+    }
+
+    fn verify_retirement_queue(
+        &self,
+        pinned: &PinnedAgentDirectory,
+        held: &RetirementQueue,
+    ) -> Result<()> {
+        Self::verify_pinned_agent_directory(pinned)?;
+        let expected = held
+            .directory
+            .as_ref()
+            .map(|directory| (directory.device, directory.inode));
+        if Self::child_directory_identity(&pinned.file, "queue")? != expected {
+            return Err(fail("adoption retirement queue generation changed"));
+        }
+        if let Some(queue) = held.directory.as_ref() {
+            Self::verify_pinned_parent_directory(queue, "adoption retirement queue")?;
+            for (name, file) in &held.locks {
+                let current = Self::open_retirement_queue_lock(&queue.file, name, false)?;
+                if Self::retirement_lock_identity(&current)?
+                    != Self::retirement_lock_identity(file)?
+                {
+                    return Err(fail(format!(
+                        "adoption retirement queue lock {name} changed"
+                    )));
+                }
+            }
+            Self::verify_pinned_parent_directory(queue, "adoption retirement queue")?;
+        }
+        Self::verify_pinned_agent_directory(pinned)
     }
 
     /// Pin the terminal and harness process an operator has confirmed for NAME.
@@ -6710,8 +6884,10 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
         }
         let Some(shell_identity) = record.foreign_shell_identity.as_ref() else {
             if let Some(recovery) = recovery {
-                if let Some(action) = self.legacy_stop_recovery(record, &info, &presentation)? {
-                    *recovery = action;
+                if matches!(recovery, RecoveryAction::Doctor) {
+                    if let Some(action) = self.legacy_stop_recovery(record, &info, &presentation)? {
+                        *recovery = action;
+                    }
                 }
             }
             return Err(fail(format!(
@@ -8074,6 +8250,38 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
         AfterRollback: FnOnce(),
         Sync: FnMut(&File, &str) -> io::Result<()>,
     {
+        self.publish_pinned_directory_with_preflight(
+            pinned,
+            destination,
+            expected_record,
+            published,
+            || Ok(()),
+            publication_hooks,
+        )
+    }
+
+    fn publish_pinned_directory_with_preflight<
+        BeforeRename,
+        Rename,
+        AfterRename,
+        AfterRollback,
+        Sync,
+    >(
+        &self,
+        pinned: &PinnedAgentDirectory,
+        destination: &Path,
+        expected_record: &[u8],
+        published: &mut bool,
+        before_rename: BeforeRename,
+        publication_hooks: (Rename, AfterRename, AfterRollback, Sync),
+    ) -> Result<()>
+    where
+        BeforeRename: FnOnce() -> Result<()>,
+        Rename: FnOnce(&File, &str, &File, &str) -> Result<()>,
+        AfterRename: FnOnce(),
+        AfterRollback: FnOnce(),
+        Sync: FnMut(&File, &str) -> io::Result<()>,
+    {
         let (rename, after_rename, after_rollback, mut sync) = publication_hooks;
         *published = false;
         let archive_path = destination
@@ -8098,6 +8306,7 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
                 pinned.name
             )));
         }
+        before_rename()?;
         if let Err(rename_error) = rename(
             &registry_parent.file,
             &pinned.name,
@@ -8650,6 +8859,143 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
         }))
     }
 
+    fn require_dead_adoption(&self, record: &AgentRecord) -> Result<()> {
+        let anchor = Self::dead_adoption_anchor(record)?;
+        match self.client.process_liveness(anchor) {
+            ProcessLiveness::Dead => Ok(()),
+            ProcessLiveness::Alive => Err(fail(
+                "the recorded adopted harness generation is still alive",
+            )),
+            ProcessLiveness::Unknown => Err(fail(
+                "cannot prove the recorded adopted harness generation is dead",
+            )),
+        }
+    }
+
+    fn dead_adoption_stop_recovery(
+        &self,
+        record: &AgentRecord,
+        pinned: &PinnedAgentDirectory,
+        queue: &RetirementQueue,
+    ) -> Result<Option<RecoveryAction>> {
+        let Ok(anchor) = Self::dead_adoption_anchor(record) else {
+            return Ok(None);
+        };
+        let initial = self.dead_adoption_snapshot(pinned, &record.token)?;
+        if &initial.record != record {
+            return Err(fail("adopted record changed before stop recovery advice"));
+        }
+        if self.client.process_liveness(anchor) != ProcessLiveness::Dead {
+            return Ok(None);
+        }
+        self.verify_retirement_queue(pinned, queue)?;
+        if self.dead_adoption_snapshot(pinned, &record.token)? != initial {
+            return Err(fail("adopted record changed during stop recovery advice"));
+        }
+        if self.client.process_liveness(anchor) != ProcessLiveness::Dead {
+            return Ok(None);
+        }
+        self.verify_retirement_queue(pinned, queue)?;
+        if self.dead_adoption_snapshot(pinned, &record.token)? != initial {
+            return Err(fail(
+                "adopted record changed during final stop recovery proof",
+            ));
+        }
+        Ok(Some(RecoveryAction::RetireDeadAdoption {
+            name: record.name.clone(),
+            token: record.token.clone(),
+            record_sha256: format!("{:x}", Sha256::digest(&initial.content)),
+        }))
+    }
+
+    fn retire_dead_adoption_locked(
+        &self,
+        record: &AgentRecord,
+        pinned: &PinnedAgentDirectory,
+        queue: &RetirementQueue,
+        options: &StopOptions,
+    ) -> Result<Value> {
+        self.retire_dead_adoption_locked_with(record, pinned, queue, options, || {})
+    }
+
+    fn retire_dead_adoption_locked_with(
+        &self,
+        record: &AgentRecord,
+        pinned: &PinnedAgentDirectory,
+        queue: &RetirementQueue,
+        options: &StopOptions,
+        after_initial_proof: impl FnOnce(),
+    ) -> Result<Value> {
+        let expected_token = options.expected_token.as_deref().ok_or_else(|| {
+            fail("dead adoption retirement requires --expected-token and --expected-record-sha256")
+        })?;
+        let expected_hash = options.expected_record_sha256.as_deref().ok_or_else(|| {
+            fail("dead adoption retirement requires --expected-token and --expected-record-sha256")
+        })?;
+        if !stop_advice::valid_record_digest(expected_hash) {
+            return Err(fail(
+                "expected-record-sha256 must be exactly 64 lowercase hexadecimal characters",
+            ));
+        }
+        let initial = self.dead_adoption_snapshot(pinned, expected_token)?;
+        if &initial.record != record
+            || format!("{:x}", Sha256::digest(&initial.content)) != expected_hash
+        {
+            return Err(fail(
+                "adopted record changed before dead adoption retirement",
+            ));
+        }
+        self.verify_retirement_queue(pinned, queue)?;
+        self.require_dead_adoption(&initial.record)?;
+        after_initial_proof();
+        let (_, destination) = self.archive_destination(&initial.record)?;
+        let mut published = false;
+        self.publish_pinned_directory_with_preflight(
+            pinned,
+            &destination,
+            &initial.content,
+            &mut published,
+            || {
+                self.refuse_pending_rename(&[&record.name])?;
+                if self.pending_move_destination_for_stop(record)?.is_some() {
+                    return Err(fail(
+                        "refusing dead adoption retirement: move is incomplete",
+                    ));
+                }
+                self.verify_retirement_queue(pinned, queue)?;
+                let final_snapshot = self.dead_adoption_snapshot(pinned, expected_token)?;
+                if final_snapshot != initial {
+                    return Err(fail(
+                        "adopted record generation changed before dead adoption retirement",
+                    ));
+                }
+                self.require_dead_adoption(&final_snapshot.record)?;
+                self.verify_retirement_queue(pinned, queue)?;
+                if self.dead_adoption_snapshot(pinned, expected_token)? != initial {
+                    return Err(fail(
+                        "adopted record generation changed during final death proof",
+                    ));
+                }
+                Ok(())
+            },
+            (
+                rename_directory_noreplace_at,
+                || {},
+                || {},
+                |directory: &File, _label| directory.sync_all(),
+            ),
+        )?;
+        Ok(json!({
+            "name": record.name,
+            "archive": destination,
+            "pane_closed": false,
+            "tab_closed": false,
+            "runtime_preserved": true,
+            "retired_dead_adoption": true,
+            "record_sha256": expected_hash,
+        }))
+    }
+
     fn retire_managed_dead_locked(
         &self,
         record: &AgentRecord,
@@ -8895,6 +9241,14 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
     ) -> Result<Value> {
         let _lock = self.lock(agent_name)?;
         let mut record = self.load_with_stop_advice(agent_name, Some(&mut *recovery))?;
+        if options.recover_legacy_adoption && options.retire_dead_adoption {
+            return Err(fail(
+                "--retire-dead-adoption and --recover-legacy-adoption are mutually exclusive",
+            ));
+        }
+        if options.retire_dead_adoption {
+            Self::dead_adoption_anchor(&record)?;
+        }
         if !record.is_cloud() {
             record.supported()?;
             if options.skip_cloud_halt {
@@ -8910,6 +9264,13 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
                 "agent {agent_name:?} was replaced before this operation"
             )));
         }
+        let identity_lock = if options.retire_dead_adoption {
+            Some(self.identity_lock()?)
+        } else if !options.recover_legacy_adoption && Self::dead_adoption_anchor(&record).is_ok() {
+            self.identity_lock().ok()
+        } else {
+            None
+        };
         let confirmed_record = self.load_with_stop_advice(agent_name, Some(&mut *recovery))?;
         if confirmed_record.token != record.token || json!(confirmed_record) != json!(record) {
             return Err(fail(format!(
@@ -8929,6 +9290,26 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
                 "refusing to stop {agent_name:?}: move is incomplete"
             )));
         }
+        let retirement = if options.retire_dead_adoption {
+            let pinned = self.pinned_agent_directory(agent_name)?;
+            let queue = self.retirement_queue_locks(&pinned)?;
+            Some((pinned, queue))
+        } else if identity_lock.is_some() {
+            self.pinned_agent_directory(agent_name)
+                .and_then(|pinned| {
+                    self.retirement_queue_locks(&pinned)
+                        .map(|queue| (pinned, queue))
+                })
+                .ok()
+        } else {
+            None
+        };
+        if options.retire_dead_adoption {
+            let (pinned, queue) = retirement
+                .as_ref()
+                .expect("retirement pins and locks are held");
+            return self.retire_dead_adoption_locked(&record, pinned, queue, options);
+        }
         if options.recover_legacy_adoption {
             let pane_id = record
                 .pane_id
@@ -8940,10 +9321,19 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
         }
         if options.expected_record_sha256.is_some() {
             return Err(fail(
-                "--expected-record-sha256 requires --recover-legacy-adoption",
+                "--expected-record-sha256 requires --recover-legacy-adoption or --retire-dead-adoption",
             ));
         }
         if record.adapter == "herdr-foreign" {
+            if let Some((pinned, queue)) = retirement.as_ref() {
+                if let Some(action) = self
+                    .dead_adoption_stop_recovery(&record, pinned, queue)
+                    .ok()
+                    .flatten()
+                {
+                    *recovery = action;
+                }
+            }
             if let Some(pane_id) = record.pane_id.as_deref() {
                 if !self
                     .client
@@ -12161,6 +12551,7 @@ pub(crate) mod tests {
                 StopOptions {
                     expected_token: Some(adopted["token"].as_str().unwrap().to_owned()),
                     recover_legacy_adoption: true,
+                    retire_dead_adoption: false,
                     expected_record_sha256: Some(digest.clone()),
                     skip_cloud_halt: false,
                 },
@@ -12216,6 +12607,7 @@ pub(crate) mod tests {
                     }
                 }),
                 recover_legacy_adoption: true,
+                retire_dead_adoption: false,
                 expected_record_sha256: (case != "missing-hash").then(|| {
                     if case == "wrong-hash" {
                         "0".repeat(64)
@@ -12284,6 +12676,7 @@ pub(crate) mod tests {
                     StopOptions {
                         expected_token: Some(token),
                         recover_legacy_adoption: true,
+                        retire_dead_adoption: false,
                         expected_record_sha256: Some(digest),
                         skip_cloud_halt: false,
                     },
@@ -12328,6 +12721,7 @@ pub(crate) mod tests {
                     StopOptions {
                         expected_token: Some(token),
                         recover_legacy_adoption: true,
+                        retire_dead_adoption: false,
                         expected_record_sha256: Some(digest),
                         skip_cloud_halt: false,
                     },
@@ -12368,6 +12762,7 @@ pub(crate) mod tests {
                     StopOptions {
                         expected_token: Some(token),
                         recover_legacy_adoption: true,
+                        retire_dead_adoption: false,
                         expected_record_sha256: Some(digest),
                         skip_cloud_halt: false,
                     },
@@ -12401,6 +12796,7 @@ pub(crate) mod tests {
                 StopOptions {
                     expected_token: Some(token),
                     recover_legacy_adoption: true,
+                    retire_dead_adoption: false,
                     expected_record_sha256: Some(digest),
                     skip_cloud_halt: false,
                 },
@@ -12425,6 +12821,7 @@ pub(crate) mod tests {
         let options = StopOptions {
             expected_token: Some(token),
             recover_legacy_adoption: true,
+            retire_dead_adoption: false,
             expected_record_sha256: Some(digest),
             skip_cloud_halt: false,
         };
@@ -12458,6 +12855,7 @@ pub(crate) mod tests {
                 StopOptions {
                     expected_token: Some(token.clone()),
                     recover_legacy_adoption: true,
+                    retire_dead_adoption: false,
                     expected_record_sha256: Some(digest),
                     skip_cloud_halt: false,
                 },
@@ -12489,6 +12887,7 @@ pub(crate) mod tests {
                 StopOptions {
                     expected_token: Some(token),
                     recover_legacy_adoption: true,
+                    retire_dead_adoption: false,
                     expected_record_sha256: Some(digest),
                     skip_cloud_halt: false,
                 },
@@ -13393,6 +13792,7 @@ pub(crate) mod tests {
                 StopOptions {
                     expected_token: Some(token),
                     recover_legacy_adoption: true,
+                    retire_dead_adoption: false,
                     expected_record_sha256: Some(digest),
                     skip_cloud_halt: false,
                 },
@@ -15178,6 +15578,8 @@ pub(crate) mod tests {
         assert!(fixture.client.closed.lock().unwrap().is_empty());
     }
 
+    /// Offline retirement of an exact adopted generation with no runtime mutation.
+    mod dead_adoption;
     /// Herdr readiness and adopted Muse process ownership compatibility.
     mod herdr_compatibility;
     /// Recipient checks around input, anchors, rename transactions and doctor.

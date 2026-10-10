@@ -201,7 +201,7 @@ def _orientation(harness: Harness, report: Report) -> None:
                                 " ".join(outcome.stdout.lower().split())
                                 if arguments == ("adopt", "--help") else True)
                            and (all(option in outcome.stdout for option in (
-                               "--recover-legacy-adoption", "--expected-token",
+                               "--recover-legacy-adoption", "--retire-dead-adoption", "--expected-token",
                                "--expected-record-sha256",
                            )) if arguments == ("stop", "--help") else True),
                            f"missing operation help: {outcome!r}")
@@ -1976,6 +1976,218 @@ def _ownership(harness: Harness, report: Report) -> None:
                            for root in (case.python_root, case.rust_root)), f"uncertain identity was retired: {outcomes!r}")
 
 
+def _adopted_generation(harness: Harness, report: Report, label: str) -> PairCase | None:
+    """Produce foreign records through the CLI with real foreground generations."""
+    case = harness.case(label, {"empty_shell": True, "sessionless": True})
+    for root in (case.python_root, case.rust_root):
+        subprocess.run([
+            str(root / "fake-herdr"), "agent", "start", "external-runtime",
+            "--kind", "codex", "--pane", "w1:p1", "--timeout", "1", "--",
+        ], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    outcomes = _pair(harness, report, case, label + "/adopt", (
+        "adopt", "foreign", "--pane", "w1:p1", "--workspace", "project",
+        "--cwd", "<ROOT>", "--harness", "codex", *_COMMON,
+    ))
+    if any(outcome.returncode != 0 for outcome in outcomes):
+        _retire_fixture_processes(case)
+        return None
+    return case
+
+
+def _record_document(path: Path) -> dict[str, object]:
+    value: object = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(value, dict):
+        raise TypeError("fixture record must be an object")
+    return {str(key): item for key, item in value.items()}
+
+
+def _artifact_bytes(directory: Path) -> dict[str, bytes]:
+    """Capture original artifacts, including arbitrary forensic file formats."""
+    return {path.relative_to(directory).as_posix(): path.read_bytes()
+            for path in directory.rglob("*") if path.is_file()}
+
+
+def _dead_adopted_retirement(harness: Harness, report: Report) -> None:
+    """Cross-consume raw adopted records without consulting the restarted server."""
+    case = _adopted_generation(harness, report, "primary/dead-adopted")
+    if case is None:
+        return
+    originals: list[dict[str, bytes]] = []
+    tokens: list[str] = []
+    digests: list[str] = []
+    for root in (case.python_root, case.rust_root):
+        directory = root / "registry/foreign"
+        path = directory / "agent.json"
+        document = _record_document(path)
+        token = document["token"]
+        if not isinstance(token, str):
+            raise TypeError("fixture record token must be a string")
+        tokens.append(token)
+        document["future_metadata"] = {"preserve": "☃", "opaque": [1, None, True]}
+        path.write_bytes((json.dumps(document, ensure_ascii=False, indent=1) + "\n \n").encode())
+        artifacts = {
+            "output.json": b'{"text":"saved output","captured_at":7}\n',
+            "operator-note.bin": b"\x00\xffpreserve\r\n",
+            "queue/.delivery.lock": b"",
+            "queue/inbox/pending.json": b'{"id":"pending","text":"never replay","queued_at":1}\n',
+            "queue/inflight/uncertain.json": b'{"id":"uncertain","text":"maybe submitted"}\n',
+            "queue/failed/quarantined.json": b'{"id":"quarantined","text":"do not retry"}\n',
+            "queue/failed/quarantined.json.error": b'{"outcome":"possibly_submitted"}\n',
+            "queue/processed/done.json": b'{"id":"done","text":"already submitted"}\n',
+        }
+        for relative, content in artifacts.items():
+            target = directory / relative
+            target.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+            target.write_bytes(content)
+            target.chmod(0o600)
+        originals.append(_artifact_bytes(directory))
+        digests.append(hashlib.sha256(path.read_bytes()).hexdigest())
+    _retire_fixture_processes(case)
+    _change(case, {
+        "closed": False, "closed_panes": [], "empty_shell": True,
+        "fixture_shell_pid": harness.replacement_shell.pid,
+        "fixture_shell_executable": harness.fixture_shell_executable,
+    })
+    # Each consumer reads the other edition's producer record in its own fixture root.
+    consumers = ((harness.rust, case.python_root), (harness.python, case.rust_root))
+    refused = [harness._invoke_one(command, root, ("stop", "foreign", *_COMMON))
+               for command, root in consumers]
+    actions = [_stop_recovery_arguments(outcome) for outcome in refused]
+    report.require("primary/dead-adopted/restart-advice", all(
+        outcome.returncode == 75 and "recorded pane shell generation changed" in outcome.stderr
+        and arguments is not None and "--retire-dead-adoption" in arguments
+        and "--recover-legacy-adoption" not in arguments
+        and _option_values(arguments, "--expected-token") == [token]
+        and _option_values(arguments, "--expected-record-sha256") == [digest]
+        for outcome, arguments, token, digest in zip(refused, actions, tokens, digests, strict=True)
+    ), f"restart refused without exact dead-adoption advice: {refused!r}")
+    _change(case, {"offline": True})
+    offline_refused = [harness._invoke_one(command, root, ("stop", "foreign", *_COMMON))
+                       for command, root in consumers]
+    report.require("primary/dead-adopted/offline-advice", all(
+        outcome.returncode == 69 and (arguments := _stop_recovery_arguments(outcome)) is not None
+        and "--retire-dead-adoption" in arguments
+        and _option_values(arguments, "--expected-token") == [token]
+        and _option_values(arguments, "--expected-record-sha256") == [digest]
+        for outcome, token, digest in zip(offline_refused, tokens, digests, strict=True)
+    ), f"offline failure lost previously captured authority: {offline_refused!r}")
+    calls = [_fixture_calls(root) for _command, root in consumers]
+    for label, extra in (
+        ("missing-assertions", ()),
+        ("missing-digest", ("--expected-token", "stale-token")),
+        ("both-selectors", ("--recover-legacy-adoption",)),
+    ):
+        outcomes = [harness._invoke_one(command, root, (
+            "stop", "foreign", "--retire-dead-adoption", *extra, *_COMMON,
+        )) for command, root in consumers]
+        report.require("primary/dead-adopted/cli/" + label, all(
+            outcome.returncode == 2
+            and (arguments := _stop_recovery_arguments(outcome)) is not None
+            and arguments[-1] == "doctor" for outcome in outcomes
+        ), f"invalid retirement syntax did not refuse with advice: {outcomes!r}")
+    for label, change in (("token", "token"), ("same-token-raw-bytes", "format")):
+        for index, (_command, root) in enumerate(consumers):
+            path = root / "registry/foreign/agent.json"
+            content = originals[index]["agent.json"]
+            if change == "token":
+                document = _record_document(path)
+                document["token"] = "replacement-token"
+                path.write_text(json.dumps(document), encoding="utf-8")
+            else:
+                path.write_bytes(content + b"\n")
+        outcomes = [
+            harness._invoke_one(command, root, arguments[1:]) if arguments is not None
+            else Outcome(1, "", "missing captured command")
+            for (command, root), arguments in zip(consumers, actions, strict=True)
+        ]
+        report.require("primary/dead-adopted/stale-advice/" + label, all(
+            outcome.returncode == 75
+            and (arguments := _stop_recovery_arguments(outcome)) is not None
+            and arguments[-1] == "doctor" for outcome in outcomes
+        ) and all((root / "registry/foreign/agent.json").is_file()
+                  and _fixture_calls(root) == calls[index]
+                  for index, (_command, root) in enumerate(consumers)),
+                       f"stale command acquired new record authority: {outcomes!r}")
+        for index, (_command, root) in enumerate(consumers):
+            (root / "registry/foreign/agent.json").write_bytes(originals[index]["agent.json"])
+    retired = [
+        harness._invoke_one(command, root, arguments[1:]) if arguments is not None
+        else Outcome(1, "", "missing captured command")
+        for (command, root), arguments in zip(consumers, actions, strict=True)
+    ]
+    values: list[object] = []
+    for index, ((_command, root), outcome) in enumerate(zip(consumers, retired, strict=True)):
+        value = _json(outcome)
+        report.require(f"primary/dead-adopted/interop/{index}", outcome.returncode == 0
+                       and not outcome.stderr and isinstance(value, dict)
+                       and value.get("record_sha256") == digests[index]
+                       and value.get("retired_dead_adoption") is True
+                       and value.get("runtime_preserved") is True
+                       and value.get("pane_closed") is False and value.get("tab_closed") is False,
+                       f"dead adoption did not retire through the other edition: {outcome!r}")
+        if isinstance(value, dict):
+            value["record_sha256"] = "<RAW-RECORD-HASH>"
+        values.append(value)
+    report.require("primary/dead-adopted/result-parity", values[0] == values[1],
+                   f"retirement result schema differs: {values!r}")
+    report.require("primary/dead-adopted/whole-original-preserved", all(
+        not (root / "registry/foreign").exists()
+        and len(archived := list((root / "registry/archive").glob("*/agent.json"))) == 1
+        and all((archived[0].parent / relative).read_bytes() == content
+                for relative, content in originals[index].items())
+        and _fixture_calls(root) == calls[index]
+        and _state(root).get("submitted") == []
+        and _state(root).get("closed_panes") == []
+        for index, (_command, root) in enumerate(consumers)
+    ) and harness.replacement_shell.poll() is None,
+                   "retirement changed original bytes, replayed a prompt or touched the replacement shell")
+
+    for label in ("live", "unknown-image", "missing-pin", "old-anchor", "nonrunning", "owned"):
+        guarded = _adopted_generation(harness, report, "primary/dead-adopted/refuse-" + label)
+        if guarded is None:
+            continue
+        assertions: list[tuple[str, str]] = []
+        for root in (guarded.python_root, guarded.rust_root):
+            path = root / "registry/foreign/agent.json"
+            document = _record_document(path)
+            if label == "unknown-image":
+                identity = document.get("harness_identity")
+                if not isinstance(identity, dict) or not isinstance(identity.get("executable_inode"), int):
+                    raise TypeError("fixture harness identity is missing")
+                identity["executable_inode"] += 1
+            elif label == "missing-pin":
+                document["harness_identity"] = None
+            elif label == "old-anchor":
+                document["anchor_rule"] = 1
+            elif label == "nonrunning":
+                document["lifecycle"] = "stopped"
+            elif label == "owned":
+                document["adapter"] = "herdr"
+            path.write_text(json.dumps(document), encoding="utf-8")
+            token = document["token"]
+            if not isinstance(token, str):
+                raise TypeError("fixture record token must be a string")
+            assertions.append((token, hashlib.sha256(path.read_bytes()).hexdigest()))
+        _change(guarded, {"offline": True})
+        before = [_fixture_calls(root) for root in (guarded.python_root, guarded.rust_root)]
+        outcomes = [harness._invoke_one(command, root, (
+            "stop", "foreign", "--retire-dead-adoption", "--expected-token", token,
+            "--expected-record-sha256", digest, *_COMMON,
+        )) for command, root, (token, digest) in zip(
+            (harness.python, harness.rust), (guarded.python_root, guarded.rust_root), assertions, strict=True,
+        )]
+        report.require("primary/dead-adopted/guard/" + label, all(
+            outcome.returncode == 75
+            and (arguments := _stop_recovery_arguments(outcome)) is not None
+            and arguments[-1] == "doctor" for outcome in outcomes
+        ) and all((root / "registry/foreign/agent.json").is_file()
+                  and _fixture_calls(root) == before[index]
+                  for index, root in enumerate((guarded.python_root, guarded.rust_root))),
+                       f"{label} record was retired or queried Herdr: {outcomes!r}")
+        _change(guarded, {"offline": False})
+        _retire_fixture_processes(guarded)
+
+
 def _managed_dead_recovery(harness: Harness, report: Report) -> None:
     case = harness.case("primary-managed-dead", {"empty_shell": False})
     if not _start(harness, report, case, "primary/managed-dead/start"):
@@ -2589,6 +2801,7 @@ def build_report(python_command: Sequence[str], rust_command: Sequence[str]) -> 
             _registry_and_interop(harness, report)
             _legacy_adopted_registry_and_queue(harness, report)
             _ownership(harness, report)
+            _dead_adopted_retirement(harness, report)
             _managed_dead_recovery(harness, report)
             _stop_recovery_quoted_globals(harness, report)
             _revive_interop(harness, report)

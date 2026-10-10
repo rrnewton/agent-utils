@@ -1534,7 +1534,7 @@ def test_stop_refusal_legacy_prepass_preserves_valid_intermixed_syntax(
     assert seen == {
         "registry": registry, "binary": binary, "name": "worker",
         "options": {"expected_token": None, "recover_legacy_adoption": False,
-                    "expected_record_sha256": None},
+                    "retire_dead_adoption": False, "expected_record_sha256": None},
     }
     assert not (tmp_path / "unused-registry").exists()
 

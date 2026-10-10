@@ -2158,6 +2158,201 @@ class ManagedAgents:
             directory_inode=pinned.inode,
         )
 
+    @staticmethod
+    def _dead_adoption_eligible(record: AgentRecord) -> bool:
+        """Only an anchored running local adoption has kernel retirement authority."""
+        return (record.adapter == "herdr-foreign" and record.lifecycle == "running"
+                and record.mode == "interactive" and record.backend == "herdr"
+                and record.harness_anchor is not None)
+
+    def _require_dead_adoption(self, record: AgentRecord) -> None:
+        """Prove the stored harness generation dead without querying Herdr."""
+        if not self._dead_adoption_eligible(record):
+            raise AgentDeliveryError(
+                "--retire-dead-adoption requires a running interactive herdr-foreign "
+                "record with a current harness process anchor"
+            )
+        anchor = record.harness_anchor
+        assert anchor is not None
+        checker = getattr(self.client, "process_liveness", None)
+        if not callable(checker):
+            raise AgentDeliveryError("cannot prove the recorded adopted harness process dead")
+        try:
+            liveness = checker(anchor)
+        except (HerdrRunError, OSError, TypeError, ValueError) as exc:
+            raise AgentDeliveryError(
+                f"cannot prove the recorded adopted harness process dead: {exc}"
+            ) from exc
+        if liveness != "dead":
+            observed = "alive" if liveness == "alive" else "unknown"
+            raise AgentDeliveryError(
+                f"refusing dead-adoption retirement: recorded harness process is {observed}"
+            )
+
+    def _dead_adoption_pending(self, record: AgentRecord) -> None:
+        """Preserve existing transaction authority before registry retirement."""
+        try:
+            self._refuse_pending_rename(record.name)
+            if self._pending_move_destination(record) is not None:
+                raise _with_recovery(AgentDeliveryError(
+                    f"refusing to stop {record.name!r}: move is incomplete"
+                ), RecoveryAction("move", name=record.name, token=record.token))
+        except HerdrRunError as exc:
+            if exc.recovery_action is None:
+                _with_recovery(exc, RecoveryAction("doctor"))
+            raise
+
+    def _dead_adoption_stop_recovery(self, record: AgentRecord) -> RecoveryAction | None:
+        """Capture supplemental recovery before probing the ordinary foreign runtime."""
+        if not self._dead_adoption_eligible(record):
+            return None
+        try:
+            with self._identity_transaction():
+                self._dead_adoption_pending(record)
+                with self._pinned_agent_directory(record.name) as pinned:
+                    with self._dead_adoption_queue_locks(pinned) as verify_queue:
+                        snapshot = self._managed_record_snapshot(pinned, expected_token=record.token)
+                        if snapshot.record.to_document() != record.to_document():
+                            return None
+                        self._require_dead_adoption(snapshot.record)
+                        verify_queue()
+                        if self._record_bytes(pinned) != snapshot.content:
+                            return None
+                        return RecoveryAction(
+                            "retire-dead-adoption", name=record.name, token=record.token,
+                            record_sha256=hashlib.sha256(snapshot.content).hexdigest(),
+                        )
+        except (HerdrRunError, OSError, TypeError, ValueError) as exc:
+            if isinstance(exc, HerdrRunError) and exc.recovery_action is not None:
+                # A pending transaction has its own captured authority.
+                raise
+            # Supplemental proof must not change ordinary stop's result or reason.
+            return None
+
+    @contextmanager
+    def _dead_adoption_queue_locks(
+        self, pinned: _PinnedAgentDirectory,
+    ) -> Iterator[Callable[[], None]]:
+        """Hold generation-checked queue locks without preparing delivery artifacts."""
+        self._verify_pinned_agent_directory(pinned)
+        try:
+            before = os.stat("queue", dir_fd=pinned.descriptor, follow_symlinks=False)
+        except FileNotFoundError:
+            def verify_absent() -> None:
+                self._verify_pinned_agent_directory(pinned)
+                try:
+                    os.stat("queue", dir_fd=pinned.descriptor, follow_symlinks=False)
+                except FileNotFoundError:
+                    return
+                except OSError as exc:
+                    raise AgentDeliveryError(f"cannot verify absent adopted queue: {exc}") from exc
+                raise AgentDeliveryError("adopted queue appeared during retirement")
+
+            verify_absent()
+            yield verify_absent
+            return
+        except OSError as exc:
+            raise AgentDeliveryError(f"cannot inspect adopted queue: {exc}") from exc
+        queue = pinned.path / "queue"
+        with self._pinned_parent_directory(queue, label="adopted queue") as held:
+            if (before.st_dev, before.st_ino) != (held.device, held.inode):
+                raise AgentDeliveryError("adopted queue changed while being pinned")
+            descriptors: list[tuple[str, int]] = []
+
+            def verify_queue() -> None:
+                self._verify_pinned_agent_directory(pinned)
+                self._verify_pinned_parent_directory(held, label="adopted queue")
+                try:
+                    current = os.stat("queue", dir_fd=pinned.descriptor, follow_symlinks=False)
+                    if (current.st_dev, current.st_ino) != (held.device, held.inode):
+                        raise AgentDeliveryError("adopted queue directory changed")
+                    for lock_name, descriptor in descriptors:
+                        agent._verify_queue_lock(
+                            str(queue), (held.device, held.inode),
+                            str(queue / lock_name), descriptor, "adopted queue lock",
+                        )
+                        named = os.stat(lock_name, dir_fd=held.descriptor, follow_symlinks=False)
+                        opened = os.fstat(descriptor)
+                        if (named.st_nlink != 1 or opened.st_nlink != 1
+                                or (named.st_dev, named.st_ino) != (opened.st_dev, opened.st_ino)):
+                            raise AgentDeliveryError("adopted queue lock generation changed")
+                except OSError as exc:
+                    raise AgentDeliveryError(f"cannot verify adopted queue locks: {exc}") from exc
+
+            try:
+                verify_queue()
+                for lock_name in (".delivery.lock", ".binding.lock"):
+                    # Valid queues acquire these coordination files lazily. Open
+                    # only in the pinned queue; never prepare or bind its messages.
+                    descriptor = os.open(
+                        lock_name,
+                        os.O_RDWR | os.O_CREAT | getattr(os, "O_CLOEXEC", 0)
+                        | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0),
+                        0o600, dir_fd=held.descriptor,
+                    )
+                    descriptors.append((lock_name, descriptor))
+                    verify_queue()
+                    fcntl.flock(descriptor, fcntl.LOCK_EX)
+                    verify_queue()
+                yield verify_queue
+            except OSError as exc:
+                raise AgentDeliveryError(f"cannot lock adopted queue: {exc}") from exc
+            finally:
+                primary = sys.exc_info()[1]
+                cleanup: HerdrRunError | None = None
+                for _lock_name, descriptor in reversed(descriptors):
+                    try:
+                        _close_descriptor(descriptor, "adopted queue lock", primary=primary)
+                    except HerdrRunError as exc:
+                        if cleanup is None:
+                            cleanup = exc
+                if cleanup is not None:
+                    raise cleanup
+
+    def _retire_dead_adoption(
+        self, record: AgentRecord, *, expected_token: str,
+        expected_record_sha256: str,
+    ) -> dict[str, object]:
+        """Archive exact adopted registry artifacts using only a stored dead process pin."""
+        with self._identity_transaction():
+            self._dead_adoption_pending(record)
+            with self._pinned_agent_directory(record.name) as pinned:
+                with self._dead_adoption_queue_locks(pinned) as verify_queue:
+                    initial = self._managed_record_snapshot(pinned, expected_token=expected_token)
+                    digest = hashlib.sha256(initial.content).hexdigest()
+                    if (initial.record.to_document() != record.to_document()
+                            or digest != expected_record_sha256):
+                        raise AgentDeliveryError(
+                            f"agent {record.name!r} record changed before dead-adoption retirement"
+                        )
+                    self._require_dead_adoption(initial.record)
+                    _archive, destination = self._archive_destination(initial.record)
+
+                    def before_publish() -> None:
+                        self._dead_adoption_pending(initial.record)
+                        verify_queue()
+                        final = self._managed_record_snapshot(pinned, expected_token=expected_token)
+                        if final != initial:
+                            raise AgentDeliveryError(
+                                f"agent {record.name!r} record changed before dead-adoption publication"
+                            )
+                        self._require_dead_adoption(final.record)
+                        if self._record_bytes(pinned) != initial.content:
+                            raise AgentDeliveryError(
+                                f"agent {record.name!r} record changed during final dead-harness proof"
+                            )
+                        verify_queue()
+
+                    self._publish_pinned_directory(
+                        pinned, destination, expected_record=initial.content,
+                        before_publish=before_publish,
+                    )
+        return {
+            "name": record.name, "archive": str(destination), "pane_closed": False,
+            "tab_closed": False, "runtime_preserved": True, "retired_dead_adoption": True,
+            "record_sha256": digest,
+        }
+
     def _legacy_stop_recovery(self, record: AgentRecord) -> RecoveryAction | None:
         """Offer legacy retirement only for exact bytes and a proved dead pane."""
         if (record.adapter != "herdr-foreign" or record.lifecycle != "running"
@@ -3920,6 +4115,7 @@ class ManagedAgents:
         destination: Path,
         *,
         expected_record: bytes,
+        before_publish: Callable[[], None] | None = None,
     ) -> None:
         """Atomically publish the exact held generation and its exact record."""
         archive_path = destination.parent
@@ -3947,6 +4143,15 @@ class ManagedAgents:
                     raise AgentDeliveryError(
                         f"agent {pinned.name!r} registry directory changed before publication"
                     )
+                if before_publish is not None:
+                    before_publish()
+                    self._verify_pinned_parent_directory(
+                        registry_parent, label="agent registry",
+                    )
+                    self._verify_pinned_parent_directory(
+                        archive_parent, label="agent archive",
+                    )
+                    self._verify_pinned_agent_directory(pinned)
                 try:
                     _rename_directory_noreplace_at(
                         registry_parent.descriptor,
@@ -4681,6 +4886,7 @@ class ManagedAgents:
         self, name: str, *, expected_token: str | None = None,
         recover_legacy_adoption: bool = False,
         expected_record_sha256: str | None = None,
+        retire_dead_adoption: bool = False,
     ) -> dict[str, object]:
         """Retire one exact registered generation or recover an adopted runtime."""
         return self._stop(
@@ -4689,6 +4895,7 @@ class ManagedAgents:
             recover_legacy_adoption=recover_legacy_adoption,
             expected_record_sha256=expected_record_sha256,
             expected_token_explicit=expected_token is not None,
+            retire_dead_adoption=retire_dead_adoption,
         )
 
     def _stop(
@@ -4696,12 +4903,29 @@ class ManagedAgents:
         recover_legacy_adoption: bool,
         expected_record_sha256: str | None,
         expected_token_explicit: bool,
+        retire_dead_adoption: bool = False,
     ) -> dict[str, object]:
         """Close only the owned single-pane tab and archive the complete record/queue.
 
         A confirmed missing pane permits archival. A probe failure, changed agent
         identity, or extra human-created panes refuses teardown and keeps state.
         """
+        if retire_dead_adoption and recover_legacy_adoption:
+            raise AgentDeliveryError(
+                "--retire-dead-adoption and --recover-legacy-adoption are mutually exclusive"
+            )
+        if retire_dead_adoption:
+            if (not expected_token_explicit or expected_token is None
+                    or expected_record_sha256 is None):
+                raise AgentDeliveryError(
+                    "dead-adoption retirement requires --expected-token and --expected-record-sha256"
+                )
+            if re.fullmatch(r"[a-z0-9-]{1,80}", expected_token) is None:
+                raise AgentDeliveryError("expected-token must be a valid recorded generation token")
+            if _SHA256.fullmatch(expected_record_sha256) is None:
+                raise AgentDeliveryError(
+                    "expected-record-sha256 must be exactly 64 lowercase hexadecimal characters"
+                )
         with self._lock(name):
             record = self._load_expected(name, expected_token)
             confirmed_record = self._load_expected(name, record.token)
@@ -4713,6 +4937,12 @@ class ManagedAgents:
                 raise _with_recovery(AgentDeliveryError(
                     f"refusing to stop {name!r}: move is incomplete"
                 ), RecoveryAction("move", name=name, token=record.token))
+            if retire_dead_adoption:
+                assert expected_token is not None and expected_record_sha256 is not None
+                return self._retire_dead_adoption(
+                    record, expected_token=expected_token,
+                    expected_record_sha256=expected_record_sha256,
+                )
             if recover_legacy_adoption:
                 return self._recover_legacy_adoption(
                     record, expected_token=expected_token,
@@ -4721,227 +4951,244 @@ class ManagedAgents:
                 )
             if expected_record_sha256 is not None:
                 raise AgentDeliveryError(
-                    "--expected-record-sha256 requires --recover-legacy-adoption"
+                    "--expected-record-sha256 requires --recover-legacy-adoption or --retire-dead-adoption"
                 )
-            if (record.adapter == "herdr-foreign" and record.pane_id is not None
-                    and not any(pane.pane_id == record.pane_id for pane in self.client.panes())):
-                closed = self._closed_foreign_target(record)
-                if closed is not None:
-                    return self._archive_closed_foreign(record, *closed)
-            if record.adapter == "herdr-foreign":
-                # This registry owns only delivery state.  Revalidate and retain
-                # one final snapshot, but never close, rename, signal, or
-                # otherwise mutate the adopted runtime.
-                def inspect_foreign() -> tuple[str, AgentPaneInfo, Pane]:
-                    presentations = [
-                        pane for pane in self.client.panes()
-                        if pane.pane_id == record.pane_id
-                    ]
-                    if len(presentations) != 1:
-                        raise AgentDeliveryError(
-                            f"refusing to unregister adopted agent {name!r}: "
-                            f"expected one recorded pane, found {len(presentations)}"
-                        )
-                    presentation = presentations[0]
-                    if presentation.workspace_id != record.workspace_id:
-                        raise AgentDeliveryError(
-                            f"refusing to unregister adopted agent {name!r}: "
-                            "recorded presentation workspace changed"
-                        )
-                    info = self.client.pane_info(presentation.pane_id)
-                    if (info.pane_id != record.pane_id
-                            or info.workspace_id != record.workspace_id
-                            or os.path.realpath(info.cwd) != os.path.realpath(record.cwd)):
-                        raise AgentDeliveryError(
-                            f"refusing to unregister adopted agent {name!r}: "
-                            "recorded pane, workspace, or cwd changed"
-                        )
-                    shell_identity = record.foreign_shell_identity
-                    if shell_identity is None:
-                        error = AgentDeliveryError(
-                            f"refusing to unregister adopted agent {name!r}: "
-                            "legacy record has no identity-bound pane shell"
-                        )
-                        if (presentation.tab_id == record.tab_id and info.agent is None
-                                and info.session_agent is None and info.session_value is None):
-                            recovery = self._legacy_stop_recovery(record)
-                            if recovery is not None:
-                                error = _with_recovery(error, recovery)
-                        raise error
-                    if self.client.pane_shell_identity(info.pane_id) != shell_identity:
-                        raise AgentDeliveryError(
-                            f"refusing to unregister adopted agent {name!r}: "
-                            "recorded pane shell generation changed"
-                        )
-                    if info.agent is None:
-                        # A live agent is pinned by its harness and, when one was
-                        # reported, native session.  A returned shell has no such
-                        # process identity, so its recorded tab remains part of
-                        # the fallback proof.  This still lets an operator
-                        # unregister a fully revalidated live agent after moving
-                        # its pane between tabs in the same workspace.
-                        if presentation.tab_id != record.tab_id:
-                            raise AgentDeliveryError(
-                                f"refusing to unregister adopted agent {name!r}: "
-                                "recorded tab changed while the agent was absent"
-                            )
-                        if info.session_agent is not None or info.session_value is not None:
-                            raise AgentDeliveryError(
-                                f"refusing pane {info.pane_id}: absent agent has "
-                                "native session identity"
-                            )
-                        if not self.client.pane_is_same_idle_shell(
-                            info.pane_id, shell_identity
-                        ):
-                            raise AgentDeliveryError(
-                                f"refusing pane {info.pane_id}: absent agent is not "
-                                "at the recorded identity-bound idle shell process group"
-                            )
-                        return "absent", info, presentation
-                    return "live", self._checked(record), presentation
+            recovery = self._dead_adoption_stop_recovery(record)
+            try:
+                return self._stop_runtime(
+                    record, expected_token=expected_token,
+                    expected_token_explicit=expected_token_explicit,
+                )
+            except HerdrRunError as exc:
+                if recovery is not None and exc.recovery_action is None:
+                    _with_recovery(exc, recovery)
+                raise
 
-                state, info, presentation = inspect_foreign()
-                output = self._bounded_terminal_text(
-                    info.pane_id, operation="unregistering"
-                )
-                try:
-                    final_state, final_info, final_presentation = inspect_foreign()
-                except (AgentDeliveryError, HerdrRunError) as exc:
+    def _stop_runtime(
+        self, record: AgentRecord, *, expected_token: str | None,
+        expected_token_explicit: bool,
+    ) -> dict[str, object]:
+        """Run ordinary runtime retirement under the caller's name lock."""
+        name = record.name
+        if (record.adapter == "herdr-foreign" and record.pane_id is not None
+                and not any(pane.pane_id == record.pane_id for pane in self.client.panes())):
+            closed = self._closed_foreign_target(record)
+            if closed is not None:
+                return self._archive_closed_foreign(record, *closed)
+        if record.adapter == "herdr-foreign":
+            # This registry owns only delivery state.  Revalidate and retain
+            # one final snapshot, but never close, rename, signal, or
+            # otherwise mutate the adopted runtime.
+            def inspect_foreign() -> tuple[str, AgentPaneInfo, Pane]:
+                presentations = [
+                    pane for pane in self.client.panes()
+                    if pane.pane_id == record.pane_id
+                ]
+                if len(presentations) != 1:
                     raise AgentDeliveryError(
                         f"refusing to unregister adopted agent {name!r}: "
-                        "runtime identity could not be reverified after output capture"
-                    ) from exc
-                if (
-                    final_state,
-                    final_info.pane_id,
-                    final_info.workspace_id,
-                    os.path.realpath(final_info.cwd),
-                    final_info.agent,
-                    final_info.session_agent,
-                    final_info.session_value,
-                    final_presentation.tab_id,
-                    final_presentation.workspace_id,
-                ) != (
-                    state,
-                    info.pane_id,
-                    info.workspace_id,
-                    os.path.realpath(info.cwd),
-                    info.agent,
-                    info.session_agent,
-                    info.session_value,
-                    presentation.tab_id,
-                    presentation.workspace_id,
-                ):
-                    raise AgentDeliveryError(
-                        f"refusing to unregister adopted agent {name!r}: "
-                        "runtime identity changed during output capture"
+                        f"expected one recorded pane, found {len(presentations)}"
                     )
-                archive, destination = self._archive_destination(record)
-                agent._atomic_json(str(self._directory(name) / "output.json"),
-                                   {"text": output, "captured_at": time.time(),
-                                    "pane_id": record.pane_id})
-                try:
-                    persisted_state, persisted_info, persisted_presentation = inspect_foreign()
-                except (AgentDeliveryError, HerdrRunError) as exc:
+                presentation = presentations[0]
+                if presentation.workspace_id != record.workspace_id:
                     raise AgentDeliveryError(
                         f"refusing to unregister adopted agent {name!r}: "
-                        "runtime identity could not be reverified before archival"
-                    ) from exc
-                if (
-                    persisted_state,
-                    persisted_info.pane_id,
-                    persisted_info.workspace_id,
-                    os.path.realpath(persisted_info.cwd),
-                    persisted_info.agent,
-                    persisted_info.session_agent,
-                    persisted_info.session_value,
-                    persisted_presentation.tab_id,
-                    persisted_presentation.workspace_id,
-                ) != (
-                    state,
-                    info.pane_id,
-                    info.workspace_id,
-                    os.path.realpath(info.cwd),
-                    info.agent,
-                    info.session_agent,
-                    info.session_value,
-                    presentation.tab_id,
-                    presentation.workspace_id,
-                ):
-                    raise AgentDeliveryError(
-                        f"refusing to unregister adopted agent {name!r}: "
-                        "runtime identity changed before archival"
+                        "recorded presentation workspace changed"
                     )
-                record.lifecycle = "stopped"
-                self._save(record)
-                os.rename(self._directory(name), destination)
-                agent._fsync_dir(str(archive))
-                agent._fsync_dir(str(self.registry))
-                return {"name": name, "archive": str(destination),
-                        "pane_closed": False, "tab_closed": False,
-                        "runtime_preserved": True}
-            panes = self.client.panes()
-            if (record.adapter == "herdr" and record.lifecycle in ("running", "stopping")
-                    and record.pane_id is not None):
-                recorded = [pane for pane in panes if pane.pane_id == record.pane_id]
-                if len(recorded) == 1:
-                    observed = self.client.pane_info(record.pane_id)
-                    if observed.agent is None:
-                        if record.lifecycle != "running":
-                            raise AgentDeliveryError(
-                                "managed-dead retirement requires a running herdr record"
-                            )
-                        return self._retire_managed_dead(
-                            record, expected_token=expected_token,
-                            expected_token_explicit=expected_token_explicit,
+                info = self.client.pane_info(presentation.pane_id)
+                if (info.pane_id != record.pane_id
+                        or info.workspace_id != record.workspace_id
+                        or os.path.realpath(info.cwd) != os.path.realpath(record.cwd)):
+                    raise AgentDeliveryError(
+                        f"refusing to unregister adopted agent {name!r}: "
+                        "recorded pane, workspace, or cwd changed"
+                    )
+                shell_identity = record.foreign_shell_identity
+                if shell_identity is None:
+                    error = AgentDeliveryError(
+                        f"refusing to unregister adopted agent {name!r}: "
+                        "legacy record has no identity-bound pane shell"
+                    )
+                    if (presentation.tab_id == record.tab_id and info.agent is None
+                            and info.session_agent is None and info.session_value is None):
+                        recovery = self._legacy_stop_recovery(record)
+                        if recovery is not None:
+                            error = _with_recovery(error, recovery)
+                    raise error
+                if self.client.pane_shell_identity(info.pane_id) != shell_identity:
+                    raise AgentDeliveryError(
+                        f"refusing to unregister adopted agent {name!r}: "
+                        "recorded pane shell generation changed"
+                    )
+                if info.agent is None:
+                    # A live agent is pinned by its harness and, when one was
+                    # reported, native session.  A returned shell has no such
+                    # process identity, so its recorded tab remains part of
+                    # the fallback proof.  This still lets an operator
+                    # unregister a fully revalidated live agent after moving
+                    # its pane between tabs in the same workspace.
+                    if presentation.tab_id != record.tab_id:
+                        raise AgentDeliveryError(
+                            f"refusing to unregister adopted agent {name!r}: "
+                            "recorded tab changed while the agent was absent"
                         )
-            tab_closed: bool | None = False
-            owned = [pane for pane in panes if pane.tab_id == record.tab_id]
-            if record.pane_id is None and record.lifecycle == "launch_failed" and len(owned) == 1:
-                # Recover an older partial allocation only when its unique root
-                # still identifies an unclaimed shell in the recorded directory.
-                info = self.client.pane_info(owned[0].pane_id)
-                if (info.agent is None and info.workspace_id == record.workspace_id
-                        and os.path.realpath(info.cwd) == os.path.realpath(record.cwd)):
-                    record.pane_id = owned[0].pane_id
-                    self._save(record)
-            if any(pane.pane_id == record.pane_id and pane.tab_id != record.tab_id for pane in panes):
-                raise AgentDeliveryError("refusing to archive an agent whose pane moved to another tab")
-            if owned:
-                if len(owned) != 1 or owned[0].pane_id != record.pane_id or owned[0].workspace_id != record.workspace_id:
-                    raise AgentDeliveryError("refusing to close a tab whose pane ownership changed")
+                    if info.session_agent is not None or info.session_value is not None:
+                        raise AgentDeliveryError(
+                            f"refusing pane {info.pane_id}: absent agent has "
+                            "native session identity"
+                        )
+                    if not self.client.pane_is_same_idle_shell(
+                        info.pane_id, shell_identity
+                    ):
+                        raise AgentDeliveryError(
+                            f"refusing pane {info.pane_id}: absent agent is not "
+                            "at the recorded identity-bound idle shell process group"
+                        )
+                    return "absent", info, presentation
+                return "live", self._checked(record), presentation
+
+            state, info, presentation = inspect_foreign()
+            output = self._bounded_terminal_text(
+                info.pane_id, operation="unregistering"
+            )
+            try:
+                final_state, final_info, final_presentation = inspect_foreign()
+            except (AgentDeliveryError, HerdrRunError) as exc:
+                raise AgentDeliveryError(
+                    f"refusing to unregister adopted agent {name!r}: "
+                    "runtime identity could not be reverified after output capture"
+                ) from exc
+            if (
+                final_state,
+                final_info.pane_id,
+                final_info.workspace_id,
+                os.path.realpath(final_info.cwd),
+                final_info.agent,
+                final_info.session_agent,
+                final_info.session_value,
+                final_presentation.tab_id,
+                final_presentation.workspace_id,
+            ) != (
+                state,
+                info.pane_id,
+                info.workspace_id,
+                os.path.realpath(info.cwd),
+                info.agent,
+                info.session_agent,
+                info.session_value,
+                presentation.tab_id,
+                presentation.workspace_id,
+            ):
+                raise AgentDeliveryError(
+                    f"refusing to unregister adopted agent {name!r}: "
+                    "runtime identity changed during output capture"
+                )
             archive, destination = self._archive_destination(record)
-            if owned:
-                if (record.adapter in ("herdr-pane", "herdr-relay") or record.lifecycle == "running"
-                        or self.client.pane_info(owned[0].pane_id).agent is not None):
-                    self._checked_or_failed_pane_report(record, owned[0].pane_id)
-                try:
-                    output = self.client.read(owned[0].pane_id, source="recent-unwrapped", lines=5000)
-                    if not output:
-                        output = self.client.read(owned[0].pane_id, source="recent", lines=5000)
-                    agent._atomic_json(str(self._directory(name) / "output.json"),
-                                       {"text": output, "captured_at": time.time(), "pane_id": record.pane_id})
-                except HerdrRunError as exc:
-                    raise AgentDeliveryError(f"cannot preserve terminal output before stop: {exc}") from exc
-                # Output capture can involve another control round trip. Recheck
-                # the owned native identity before acting on that pane again.
-                if (record.adapter in ("herdr-pane", "herdr-relay") or record.lifecycle == "running"
-                        or self.client.pane_info(owned[0].pane_id).agent is not None):
-                    self._checked_or_failed_pane_report(record, owned[0].pane_id)
-                record.lifecycle = "stopping"
-                self._save(record)
-                assert record.pane_id is not None
-                self.client.close_pane(record.pane_id)
-                try:
-                    tab_closed = not any(pane.tab_id == record.tab_id for pane in self.client.panes())
-                except HerdrRunError:
-                    tab_closed = None
+            agent._atomic_json(str(self._directory(name) / "output.json"),
+                               {"text": output, "captured_at": time.time(),
+                                "pane_id": record.pane_id})
+            try:
+                persisted_state, persisted_info, persisted_presentation = inspect_foreign()
+            except (AgentDeliveryError, HerdrRunError) as exc:
+                raise AgentDeliveryError(
+                    f"refusing to unregister adopted agent {name!r}: "
+                    "runtime identity could not be reverified before archival"
+                ) from exc
+            if (
+                persisted_state,
+                persisted_info.pane_id,
+                persisted_info.workspace_id,
+                os.path.realpath(persisted_info.cwd),
+                persisted_info.agent,
+                persisted_info.session_agent,
+                persisted_info.session_value,
+                persisted_presentation.tab_id,
+                persisted_presentation.workspace_id,
+            ) != (
+                state,
+                info.pane_id,
+                info.workspace_id,
+                os.path.realpath(info.cwd),
+                info.agent,
+                info.session_agent,
+                info.session_value,
+                presentation.tab_id,
+                presentation.workspace_id,
+            ):
+                raise AgentDeliveryError(
+                    f"refusing to unregister adopted agent {name!r}: "
+                    "runtime identity changed before archival"
+                )
             record.lifecycle = "stopped"
             self._save(record)
             os.rename(self._directory(name), destination)
             agent._fsync_dir(str(archive))
             agent._fsync_dir(str(self.registry))
-            return {"name": name, "archive": str(destination), "pane_closed": bool(owned), "tab_closed": tab_closed}
+            return {"name": name, "archive": str(destination),
+                    "pane_closed": False, "tab_closed": False,
+                    "runtime_preserved": True}
+        panes = self.client.panes()
+        if (record.adapter == "herdr" and record.lifecycle in ("running", "stopping")
+                and record.pane_id is not None):
+            recorded = [pane for pane in panes if pane.pane_id == record.pane_id]
+            if len(recorded) == 1:
+                observed = self.client.pane_info(record.pane_id)
+                if observed.agent is None:
+                    if record.lifecycle != "running":
+                        raise AgentDeliveryError(
+                            "managed-dead retirement requires a running herdr record"
+                        )
+                    return self._retire_managed_dead(
+                        record, expected_token=expected_token,
+                        expected_token_explicit=expected_token_explicit,
+                    )
+        tab_closed: bool | None = False
+        owned = [pane for pane in panes if pane.tab_id == record.tab_id]
+        if record.pane_id is None and record.lifecycle == "launch_failed" and len(owned) == 1:
+            # Recover an older partial allocation only when its unique root
+            # still identifies an unclaimed shell in the recorded directory.
+            info = self.client.pane_info(owned[0].pane_id)
+            if (info.agent is None and info.workspace_id == record.workspace_id
+                    and os.path.realpath(info.cwd) == os.path.realpath(record.cwd)):
+                record.pane_id = owned[0].pane_id
+                self._save(record)
+        if any(pane.pane_id == record.pane_id and pane.tab_id != record.tab_id for pane in panes):
+            raise AgentDeliveryError("refusing to archive an agent whose pane moved to another tab")
+        if owned:
+            if len(owned) != 1 or owned[0].pane_id != record.pane_id or owned[0].workspace_id != record.workspace_id:
+                raise AgentDeliveryError("refusing to close a tab whose pane ownership changed")
+        archive, destination = self._archive_destination(record)
+        if owned:
+            if (record.adapter in ("herdr-pane", "herdr-relay") or record.lifecycle == "running"
+                    or self.client.pane_info(owned[0].pane_id).agent is not None):
+                self._checked_or_failed_pane_report(record, owned[0].pane_id)
+            try:
+                output = self.client.read(owned[0].pane_id, source="recent-unwrapped", lines=5000)
+                if not output:
+                    output = self.client.read(owned[0].pane_id, source="recent", lines=5000)
+                agent._atomic_json(str(self._directory(name) / "output.json"),
+                                   {"text": output, "captured_at": time.time(), "pane_id": record.pane_id})
+            except HerdrRunError as exc:
+                raise AgentDeliveryError(f"cannot preserve terminal output before stop: {exc}") from exc
+            # Output capture can involve another control round trip. Recheck
+            # the owned native identity before acting on that pane again.
+            if (record.adapter in ("herdr-pane", "herdr-relay") or record.lifecycle == "running"
+                    or self.client.pane_info(owned[0].pane_id).agent is not None):
+                self._checked_or_failed_pane_report(record, owned[0].pane_id)
+            record.lifecycle = "stopping"
+            self._save(record)
+            assert record.pane_id is not None
+            self.client.close_pane(record.pane_id)
+            try:
+                tab_closed = not any(pane.tab_id == record.tab_id for pane in self.client.panes())
+            except HerdrRunError:
+                tab_closed = None
+        record.lifecycle = "stopped"
+        self._save(record)
+        os.rename(self._directory(name), destination)
+        agent._fsync_dir(str(archive))
+        agent._fsync_dir(str(self.registry))
+        return {"name": name, "archive": str(destination), "pane_closed": bool(owned), "tab_closed": tab_closed}
 
     def _closed_foreign_target(self, record: AgentRecord) -> tuple[str, str] | None:
         """The doctor finding and Herdr's refusal when Herdr positively reports the

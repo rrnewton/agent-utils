@@ -21,6 +21,15 @@ pub enum RecoveryAction {
         /// Preserve the caller's request to retire an agentcloud viewer without halting.
         skip_cloud_halt: bool,
     },
+    /// Archive the captured adopted generation after independently proving its harness dead.
+    RetireDeadAdoption {
+        /// Registered name from the exact private record snapshot.
+        name: String,
+        /// Exact registry generation captured before the refusal.
+        token: String,
+        /// SHA-256 of the original raw record bytes.
+        record_sha256: String,
+    },
     /// Inspect the rename that reserves both names; its CLI cannot assert this token.
     Rename {
         /// Original registered name in the validated journal.
@@ -51,6 +60,7 @@ impl RecoveryAction {
         match self {
             Self::Doctor => None,
             Self::Stop { token, .. }
+            | Self::RetireDeadAdoption { token, .. }
             | Self::Rename { token, .. }
             | Self::Move { token, .. }
             | Self::Revive { token, .. } => Some(token),
@@ -58,8 +68,12 @@ impl RecoveryAction {
     }
 
     pub(super) fn for_assertions(self, options: &StopOptions) -> Self {
+        if !self.valid_retirement_authority() {
+            return Self::Doctor;
+        }
         let digest = match &self {
             Self::Stop { record_sha256, .. } => record_sha256.as_deref(),
+            Self::RetireDeadAdoption { record_sha256, .. } => Some(record_sha256.as_str()),
             _ => None,
         };
         if options
@@ -78,6 +92,9 @@ impl RecoveryAction {
     }
 
     fn arguments(&self) -> Vec<String> {
+        if !self.valid_retirement_authority() {
+            return vec!["doctor".to_owned()];
+        }
         match self {
             Self::Doctor => vec!["doctor".to_owned()],
             Self::Stop {
@@ -100,6 +117,17 @@ impl RecoveryAction {
                 }
                 arguments
             }
+            Self::RetireDeadAdoption {
+                name,
+                token,
+                record_sha256,
+            } => vec![
+                "stop".to_owned(),
+                name.clone(),
+                "--retire-dead-adoption".to_owned(),
+                format!("--expected-token={token}"),
+                format!("--expected-record-sha256={record_sha256}"),
+            ],
             Self::Rename { .. } | Self::Move { .. } => vec!["doctor".to_owned()],
             Self::Revive { name, token } => vec![
                 "revive".to_owned(),
@@ -108,6 +136,32 @@ impl RecoveryAction {
             ],
         }
     }
+
+    fn valid_retirement_authority(&self) -> bool {
+        match self {
+            Self::RetireDeadAdoption {
+                name,
+                token,
+                record_sha256,
+            } => {
+                super::name_pattern(name)
+                    && !token.is_empty()
+                    && token.len() <= 80
+                    && token.bytes().all(|byte| {
+                        byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-'
+                    })
+                    && valid_record_digest(record_sha256)
+            }
+            _ => true,
+        }
+    }
+}
+
+pub(super) fn valid_record_digest(digest: &str) -> bool {
+    digest.len() == 64
+        && digest
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 /// A stop refusal and the recovery action proved before that refusal.
@@ -279,6 +333,7 @@ mod tests {
             recovery.clone().for_assertions(&StopOptions {
                 expected_token: Some("original".to_owned()),
                 recover_legacy_adoption: true,
+                retire_dead_adoption: false,
                 expected_record_sha256: Some(digest),
                 skip_cloud_halt: false,
             }),
@@ -288,11 +343,87 @@ mod tests {
             recovery.for_assertions(&StopOptions {
                 expected_token: Some("original".to_owned()),
                 recover_legacy_adoption: true,
+                retire_dead_adoption: false,
                 expected_record_sha256: Some("b".repeat(64)),
                 skip_cloud_halt: false,
             }),
             RecoveryAction::Doctor
         );
+    }
+
+    #[test]
+    fn dead_adoption_recovery_has_a_distinct_selector_and_checks_both_assertions() {
+        let digest = "a".repeat(64);
+        let action = RecoveryAction::RetireDeadAdoption {
+            name: "foreign".to_owned(),
+            token: "-generation".to_owned(),
+            record_sha256: digest.clone(),
+        };
+        let context = StopContext::new(Path::new("/work/registry"), Path::new("literal-herdr"));
+        assert_eq!(
+            context.command(&action),
+            format!("agentctl --registry=/work/registry --herdr-bin=literal-herdr stop foreign --retire-dead-adoption --expected-token=-generation --expected-record-sha256={digest}")
+        );
+        assert_eq!(
+            action.clone().for_assertions(&StopOptions::default()),
+            action
+        );
+        assert_eq!(
+            action.clone().for_assertions(&StopOptions {
+                expected_token: Some("-generation".to_owned()),
+                expected_record_sha256: Some(digest),
+                retire_dead_adoption: true,
+                ..StopOptions::default()
+            }),
+            action
+        );
+        for options in [
+            StopOptions {
+                expected_token: Some("replacement".to_owned()),
+                ..StopOptions::default()
+            },
+            StopOptions {
+                expected_record_sha256: Some("b".repeat(64)),
+                ..StopOptions::default()
+            },
+            StopOptions {
+                expected_record_sha256: Some("bad hash".to_owned()),
+                ..StopOptions::default()
+            },
+        ] {
+            assert_eq!(
+                action.clone().for_assertions(&options),
+                RecoveryAction::Doctor
+            );
+        }
+    }
+
+    #[test]
+    fn dead_adoption_recovery_never_formats_malformed_captured_authority() {
+        let context = StopContext::new(Path::new("/work/registry"), Path::new("literal-herdr"));
+        for (name, token, digest) in [
+            ("bad name", "generation".to_owned(), "a".repeat(64)),
+            ("foreign", String::new(), "a".repeat(64)),
+            ("foreign", "bad\0token".to_owned(), "a".repeat(64)),
+            ("foreign", "A".to_owned(), "a".repeat(64)),
+            ("foreign", "a".repeat(81), "a".repeat(64)),
+            ("foreign", "generation".to_owned(), "A".repeat(64)),
+            ("foreign", "generation".to_owned(), "a".repeat(63)),
+        ] {
+            let action = RecoveryAction::RetireDeadAdoption {
+                name: name.to_owned(),
+                token,
+                record_sha256: digest,
+            };
+            assert_eq!(
+                context.command(&action),
+                "agentctl --registry=/work/registry --herdr-bin=literal-herdr doctor"
+            );
+            assert_eq!(
+                action.for_assertions(&StopOptions::default()),
+                RecoveryAction::Doctor
+            );
+        }
     }
 
     #[test]

@@ -128,7 +128,7 @@ while keeping their terminals available for direct inspection.
    For an adopted agent it only
    unregisters and archives the control state; the foreign pane and process keep
    running. Adoption accepts only a supported shell process and records its
-   exact generation. Unregistration requires that same shell generation before
+   exact generation. Normal unregistration requires that same shell generation before
    and after the final snapshot whether the foreign agent is live or has
    exited; the exited path additionally requires the recorded idle shell.
    Records without that process identity refuse normal retirement. A dead,
@@ -142,6 +142,11 @@ while keeping their terminals available for direct inspection.
    it archives control state without touching the foreign runtime. An owned
    managed agent that has returned to its shell likewise requires
    `--expected-token TOKEN` before `stop` can close its exact pane.
+   After a Herdr restart, a running adopted record with a saved harness identity
+   can be archived once that exact harness generation is proved dead. Its
+   printed recovery command uses `--retire-dead-adoption` with the exact token
+   and raw record SHA-256. That recovery preserves all original record, output
+   and queue files, including quarantine, and works without contacting Herdr.
    Exiting the CLI or closing its caller does not stop the worker.
 
 State defaults to `.agentctl` in the current directory. Use the same

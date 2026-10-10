@@ -97,7 +97,7 @@ enum Commands {
     Doctor(Doctor),
     /// Stop an owned runtime, or safely unregister an adopted one, and archive state
     #[command(
-        after_help = "Examples:\n  agentctl stop reviewer\n  agentctl stop sub-cloud-worker\n\nFor an agentcloud agent, stop runs `agentcloudctl halt` (the open run is interrupted and no new\nrun starts), closes the recorded agentterm pane, runs `agentcloudctl archive`, and archives the\nregistry record. A halt failure changes nothing locally. stop does not release the node\nreservation; the orchestrator releases it on its own schedule after the halted session goes\nidle (check `agentcloudctl inspect -s SESSION_ID`)."
+        after_help = "Examples:\n  agentctl stop reviewer\n  agentctl stop sub-cloud-worker\n  agentctl stop reviewer --retire-dead-adoption --expected-token TOKEN --expected-record-sha256 SHA256\n\nFor an agentcloud agent, stop runs `agentcloudctl halt` (the open run is interrupted and no new\nrun starts), closes the recorded agentterm pane, runs `agentcloudctl archive`, and archives the\nregistry record. A halt failure changes nothing locally. stop does not release the node\nreservation; the orchestrator releases it on its own schedule after the halted session goes\nidle (check `agentcloudctl inspect -s SESSION_ID`)."
     )]
     Stop(Stop),
     /// Relaunch a dead owned local agent from its recorded conversation and launch policy, preserving its old queue in the archive
@@ -220,13 +220,16 @@ struct Doctor {
 struct Stop {
     #[command(flatten)]
     agent: Named,
-    /// Require this exact current registry generation; mandatory for managed-dead recovery
+    /// Require this exact current registry generation; mandatory for dead managed or adopted recovery
     #[arg(long, value_name = "TOKEN")]
     expected_token: Option<String>,
-    /// Loud recovery for an identity-less dead adopted row; never mutates its pane
+    /// Recover an identity-less dead adopted row without changing its pane; requires --expected-token and --expected-record-sha256
     #[arg(long)]
     recover_legacy_adoption: bool,
-    /// Exact lowercase SHA-256 of the identity-less agent.json bytes
+    /// Archive a running adopted record whose pinned harness is dead, without querying Herdr; requires --expected-token and --expected-record-sha256
+    #[arg(long, conflicts_with = "recover_legacy_adoption")]
+    retire_dead_adoption: bool,
+    /// Exact lowercase 64-hex SHA-256 of raw agent.json bytes; valid only with an adopted-record recovery flag
     #[arg(long, value_name = "SHA256")]
     expected_record_sha256: Option<String>,
     /// Agentcloud agents only: close the tab and archive the record WITHOUT halting or archiving
@@ -1310,17 +1313,23 @@ fn run(args: Cli, environment: &dyn Fn(&str) -> Option<String>) -> Result<i32, F
             return Ok(if report["clean"] == true { 0 } else { 1 });
         }
         Commands::Stop(value) => {
-            if value.recover_legacy_adoption
-                && (value.expected_token.is_none() || value.expected_record_sha256.is_none())
-            {
-                return Err(Failure::Usage(
-                    "--recover-legacy-adoption requires --expected-token and --expected-record-sha256"
-                        .to_owned(),
-                ));
+            let recovery_selector = if value.retire_dead_adoption {
+                Some("--retire-dead-adoption")
+            } else if value.recover_legacy_adoption {
+                Some("--recover-legacy-adoption")
+            } else {
+                None
+            };
+            if let Some(selector) = recovery_selector.filter(|_| {
+                value.expected_token.is_none() || value.expected_record_sha256.is_none()
+            }) {
+                return Err(Failure::Usage(format!(
+                    "{selector} requires --expected-token and --expected-record-sha256"
+                )));
             }
-            if !value.recover_legacy_adoption && value.expected_record_sha256.is_some() {
+            if recovery_selector.is_none() && value.expected_record_sha256.is_some() {
                 return Err(Failure::Usage(
-                    "--expected-record-sha256 requires --recover-legacy-adoption".to_owned(),
+                    "--expected-record-sha256 requires --recover-legacy-adoption or --retire-dead-adoption".to_owned(),
                 ));
             }
             manager.advised_stop_with_options(
@@ -1328,6 +1337,7 @@ fn run(args: Cli, environment: &dyn Fn(&str) -> Option<String>) -> Result<i32, F
                 StopOptions {
                     expected_token: value.expected_token,
                     recover_legacy_adoption: value.recover_legacy_adoption,
+                    retire_dead_adoption: value.retire_dead_adoption,
                     expected_record_sha256: value.expected_record_sha256,
                     skip_cloud_halt: value.skip_cloud_halt,
                 },
@@ -2056,6 +2066,7 @@ mod tests {
         let help = error.to_string();
         for required in [
             "--recover-legacy-adoption",
+            "--retire-dead-adoption",
             "--expected-token",
             "--expected-record-sha256",
         ] {
@@ -2521,11 +2532,48 @@ mod tests {
         };
         assert_eq!(stop.agent.name, "legacy");
         assert!(stop.recover_legacy_adoption);
+        assert!(!stop.retire_dead_adoption);
         assert_eq!(stop.expected_token.as_deref(), Some("generation-1"));
         assert_eq!(
             stop.expected_record_sha256.as_deref(),
             Some("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef")
         );
+    }
+
+    #[test]
+    fn stop_parser_preserves_dead_adoption_assertions_and_refuses_both_selectors() {
+        let digest = "a".repeat(64);
+        let parsed = Cli::try_parse_from([
+            "agentctl",
+            "stop",
+            "adopted",
+            "--retire-dead-adoption",
+            "--expected-token",
+            "generation-1",
+            "--expected-record-sha256",
+            &digest,
+        ])
+        .unwrap();
+        let Some(Commands::Stop(stop)) = parsed.command else {
+            panic!("expected stop command");
+        };
+        assert!(stop.retire_dead_adoption);
+        assert!(!stop.recover_legacy_adoption);
+        assert_eq!(stop.expected_token.as_deref(), Some("generation-1"));
+        assert_eq!(
+            stop.expected_record_sha256.as_deref(),
+            Some(digest.as_str())
+        );
+        let error = Cli::try_parse_from([
+            "agentctl",
+            "stop",
+            "adopted",
+            "--recover-legacy-adoption",
+            "--retire-dead-adoption",
+        ])
+        .err()
+        .unwrap();
+        assert_eq!(error.kind(), clap::error::ErrorKind::ArgumentConflict);
     }
 
     #[test]

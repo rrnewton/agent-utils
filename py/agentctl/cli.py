@@ -199,13 +199,16 @@ def parser() -> argparse.ArgumentParser:
         help="replacement harness startup deadline, greater than 0 and at most 300 seconds (default: 30)")
 
     stop = command("stop", "Stop an owned runtime, or unregister an adopted runtime without closing it, and archive state.",
-        "agentctl stop reviewer", named=True)
+        "agentctl stop reviewer\nagentctl stop reviewer --retire-dead-adoption --expected-token TOKEN --expected-record-sha256 SHA256", named=True)
     stop.add_argument("--expected-token", metavar="TOKEN",
-        help="require this exact current registry generation; mandatory for managed-dead recovery")
-    stop.add_argument("--recover-legacy-adoption", action="store_true",
-        help="loud recovery for an identity-less dead adopted row; never mutates its pane")
+        help="require this exact current registry generation; mandatory for dead managed or adopted recovery")
+    adoption_recovery = stop.add_mutually_exclusive_group()
+    adoption_recovery.add_argument("--recover-legacy-adoption", action="store_true",
+        help="recover an identity-less dead adopted row without changing its pane; requires --expected-token and --expected-record-sha256")
+    adoption_recovery.add_argument("--retire-dead-adoption", action="store_true",
+        help="archive a running adopted record whose pinned harness is dead, without querying Herdr; requires --expected-token and --expected-record-sha256")
     stop.add_argument("--expected-record-sha256", metavar="SHA256",
-        help="exact lowercase SHA-256 of legacy agent.json; requires --recover-legacy-adoption")
+        help="exact lowercase 64-hex SHA-256 of raw agent.json bytes; requires --recover-legacy-adoption or --retire-dead-adoption")
     for name, purpose in (
         ("attach", "Focus the session's terminal for direct inspection and interaction."),
         ("pause", "Pause automated input while allowing an active turn to finish."),
@@ -440,21 +443,26 @@ def main(argv: Sequence[str] | None = None) -> int:
         elif args.command == "attach":
             result = sessions.attach(name)
         elif args.command == "stop":
-            if args.recover_legacy_adoption and (
+            recovery_selector = ("--retire-dead-adoption" if args.retire_dead_adoption
+                                 else "--recover-legacy-adoption" if args.recover_legacy_adoption
+                                 else None)
+            if recovery_selector is not None and (
                 args.expected_token is None or args.expected_record_sha256 is None
             ):
                 raise ValueError(
-                    "--recover-legacy-adoption requires --expected-token and "
+                    f"{recovery_selector} requires --expected-token and "
                     "--expected-record-sha256"
                 )
-            if (not args.recover_legacy_adoption
+            if (recovery_selector is None
                     and args.expected_record_sha256 is not None):
                 raise ValueError(
-                    "--expected-record-sha256 requires --recover-legacy-adoption"
+                    "--expected-record-sha256 requires --recover-legacy-adoption "
+                    "or --retire-dead-adoption"
                 )
             result = sessions.stop(
                 name, expected_token=args.expected_token,
                 recover_legacy_adoption=args.recover_legacy_adoption,
+                retire_dead_adoption=args.retire_dead_adoption,
                 expected_record_sha256=args.expected_record_sha256,
             )
         elif args.command in ("reset", "repair"):

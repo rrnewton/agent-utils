@@ -3,22 +3,30 @@ from __future__ import annotations
 
 import json
 import hashlib
+import fcntl
 import os
+import shlex
 import threading
 import time
+from collections.abc import Sequence
 from dataclasses import replace
 from pathlib import Path
+from subprocess import CompletedProcess
 from typing import cast
 
 import pytest
 
-from agentctl import agent, cli
+from agentctl import agent, cli, legacy_cli
 import agentctl.subagents as subagents_module
 from agentctl.client import (
     AgentPaneInfo, CustomProcessIdentity, HerdrClient, Pane, PaneShellProof,
 )
-from agentctl.errors import AgentDeliveryError, AgentPossiblySubmitted, HerdrUnavailable
+from agentctl.errors import (
+    AgentDeliveryError, AgentPossiblySubmitted, HerdrRunError, HerdrUnavailable,
+    RecoveryAction, _with_recovery,
+)
 from agentctl.sessions import Sessions
+from agentctl.stop_recovery import stop_refusal_message
 from agentctl.subagents import AgentRecord
 import agentctl.codex_goal as native_goal
 from .test_herdr_subagents import FakeManagedClient
@@ -1788,3 +1796,607 @@ def test_suggestion13_foreign_muse_after_paste_replacement_quarantines_without_e
     assert document["possibly_submitted"] is True and document["probable_misroute"] is True
     assert sessions.drain("foreign", ready_timeout=0).delivered == ()
     assert fake.keys_sent == [] and fake.submitted == []
+
+
+def _suggestion4_dead_adoption(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> tuple[Sessions, FakeManagedClient, str, str, bytes]:
+    sessions, fake, pane = setup_foreign(tmp_path, monkeypatch)
+    original = adopt(sessions, pane, tmp_path)
+    path = sessions.registry / "foreign" / "agent.json"
+    document = json.loads(path.read_bytes())
+    document["future_field"] = {"nested": [0.918216731832064, "unchanged"]}
+    raw = (json.dumps(document, indent=3) + "\n\n").encode("utf-8")
+    path.write_bytes(raw)
+    return sessions, fake, str(original["token"]), hashlib.sha256(raw).hexdigest(), raw
+
+
+def _suggestion4_no_runtime(
+    fake: FakeManagedClient, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def forbidden(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("dead-adoption retirement must not query or mutate Herdr")
+
+    for name in (
+        "panes", "pane_info", "pane_shell_identity", "pane_is_same_idle_shell",
+        "harness_identity", "verify_harness_identity", "read", "close_pane",
+        "close_tab", "rename_tab", "rename_agent", "report_pane_agent", "agent_names",
+        "tab_labels", "send_text", "send_keys", "launch",
+    ):
+        monkeypatch.setattr(fake, name, forbidden, raising=False)
+
+
+def _suggestion4_offline_client() -> HerdrClient:
+    def forbidden(_argv: Sequence[str]) -> CompletedProcess[str]:
+        raise AssertionError("dead-adoption retirement must not invoke Herdr")
+
+    return HerdrClient(herdr_bin="absent-herdr", run=forbidden)
+
+
+@pytest.mark.skipif(not hasattr(os, "pidfd_open"), reason="Linux process identity required")
+@pytest.mark.parametrize("queued", [False, True])
+def test_suggestion4_offline_retirement_preserves_exact_artifacts_and_lazy_queue(
+    queued: bool, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sessions, fake, token, digest, raw = _suggestion4_dead_adoption(tmp_path, monkeypatch)
+    directory = sessions.registry / "foreign"
+    agent_inode = (directory / "agent.json").stat().st_ino
+    (directory / "output.json").write_bytes(b"previous snapshot: retain exact bytes\x00\n")
+    (directory / "output.json").chmod(0o600)
+    (directory / "misroutes.jsonl").write_bytes(b'{"quarantined":true}\n')
+    (directory / "misroutes.jsonl").chmod(0o600)
+    if queued:
+        queue = directory / "queue"
+        agent.enqueue(str(queue), "never drained", message_id="pending-work")
+        assert (queue / ".delivery.lock").exists()
+        assert not (queue / ".binding.lock").exists()
+        (queue / "failed" / "quarantined.json").write_bytes(b'{"possibly_submitted":true}\n')
+        (queue / "failed" / "quarantined.json").chmod(0o600)
+        (queue / "future.json").write_bytes(b"opaque future artifact")
+        (queue / "future.json").chmod(0o600)
+    before = {
+        path.relative_to(directory).as_posix(): path.read_bytes()
+        for path in directory.rglob("*") if path.is_file()
+    }
+    sessions.client = _suggestion4_offline_client()
+    anchor = sessions.get("foreign").harness_anchor
+    assert anchor is not None and sessions.client.process_liveness(anchor) == "dead"
+
+    result = sessions.stop(
+        "foreign", retire_dead_adoption=True, expected_token=token,
+        expected_record_sha256=digest,
+    )
+
+    archive = sessions.registry / "archive" / f"foreign-{token}"
+    assert result == {
+        "name": "foreign", "archive": str(archive), "pane_closed": False,
+        "tab_closed": False, "runtime_preserved": True, "retired_dead_adoption": True,
+        "record_sha256": digest,
+    }
+    assert not directory.exists() and (archive / "agent.json").read_bytes() == raw
+    assert (archive / "agent.json").stat().st_ino == agent_inode
+    assert json.loads(raw)["lifecycle"] == "running"
+    assert {name: (archive / name).read_bytes() for name in before} == before
+    if queued:
+        assert (archive / "queue/.binding.lock").read_bytes() == b""
+        assert not (archive / "queue/target.json").exists()
+        assert (archive / "queue/inbox/pending-work.json").read_bytes() == before["queue/inbox/pending-work.json"]
+    else:
+        assert not (archive / "queue").exists()
+    assert fake.closed == [] and fake.submitted == [] and fake.keys_sent == []
+
+
+@pytest.mark.skipif(not hasattr(os, "pidfd_open"), reason="Linux process identity required")
+@pytest.mark.parametrize("generation", ["reused-pid", "live", "exec-image", "probe-error"])
+def test_suggestion4_kernel_generation_proof_preserves_live_replacement(
+    generation: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sessions, fake, token, _digest, _raw = _suggestion4_dead_adoption(tmp_path, monkeypatch)
+    client = _suggestion4_offline_client()
+    observed = client._process_identity(os.getpid())
+    assert observed is not None
+    identity = observed[0]
+    assert client.process_liveness(identity) == "alive"
+    record = sessions.get("foreign")
+    if generation == "reused-pid":
+        assert identity.starttime_ticks > 1
+        record.harness_identity = replace(identity, starttime_ticks=identity.starttime_ticks - 1)
+    elif generation == "exec-image":
+        record.harness_identity = replace(identity, executable_inode=identity.executable_inode + 1)
+    else:
+        record.harness_identity = identity
+    sessions._save(record)
+    path = sessions.registry / "foreign" / "agent.json"
+    raw = path.read_bytes()
+    sessions.client = client
+    if generation == "probe-error":
+        def unavailable(_pid: int) -> None:
+            raise PermissionError("kernel generation unavailable")
+        monkeypatch.setattr(client, "_liveness_process_stat", unavailable)
+    if generation == "reused-pid":
+        result = sessions.stop("foreign", retire_dead_adoption=True, expected_token=token,
+                               expected_record_sha256=hashlib.sha256(raw).hexdigest())
+        assert (Path(str(result["archive"])) / "agent.json").read_bytes() == raw
+    else:
+        with pytest.raises(AgentDeliveryError, match="alive|unknown"):
+            sessions.stop("foreign", retire_dead_adoption=True, expected_token=token,
+                          expected_record_sha256=hashlib.sha256(raw).hexdigest())
+        assert path.read_bytes() == raw
+    # Even a reused PID belongs to the current live generation and is untouched.
+    os.kill(os.getpid(), 0)
+    assert fake.closed == [] and fake.keys_sent == []
+
+
+@pytest.mark.parametrize("case", [
+    "missing-token", "missing-hash", "wrong-token", "wrong-hash", "malformed-token",
+    "uppercase-hash", "short-hash", "same-token-raw-change", "legacy-overlap",
+])
+def test_suggestion4_explicit_retirement_requires_exact_assertions_before_runtime(
+    case: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sessions, fake, token, digest, raw = _suggestion4_dead_adoption(tmp_path, monkeypatch)
+    _suggestion4_no_runtime(fake, monkeypatch)
+    monkeypatch.setattr(fake, "process_liveness", lambda _identity: "dead", raising=False)
+    expected_token: str | None = token
+    expected_digest: str | None = digest
+    if case == "missing-token":
+        expected_token = None
+    elif case == "missing-hash":
+        expected_digest = None
+    elif case == "wrong-token":
+        expected_token = "replacement"
+    elif case == "wrong-hash":
+        expected_digest = "0" * 64
+    elif case == "malformed-token":
+        expected_token = "bad\x00token"
+    elif case == "uppercase-hash":
+        expected_digest = digest.upper()
+    elif case == "short-hash":
+        expected_digest = digest[:-1]
+    elif case == "same-token-raw-change":
+        raw += b" \n"
+        (sessions.registry / "foreign/agent.json").write_bytes(raw)
+    with pytest.raises(AgentDeliveryError):
+        sessions.stop("foreign", retire_dead_adoption=True,
+                      recover_legacy_adoption=case == "legacy-overlap",
+                      expected_token=expected_token, expected_record_sha256=expected_digest)
+    assert (sessions.registry / "foreign/agent.json").read_bytes() == raw
+    assert not (sessions.registry / "archive").exists()
+
+
+@pytest.mark.parametrize("case", [
+    "alive", "unknown", "missing-anchor", "old-anchor-rule", "bad-anchor",
+    "managed", "custom", "headless", "invalid-cloud", "stopped",
+])
+def test_suggestion4_retirement_refuses_unproved_or_ineligible_records_without_runtime(
+    case: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sessions, fake, token, _digest, _raw = _suggestion4_dead_adoption(tmp_path, monkeypatch)
+    path = sessions.registry / "foreign/agent.json"
+    document = json.loads(path.read_bytes())
+    if case == "missing-anchor":
+        document["harness_identity"] = None
+    elif case == "old-anchor-rule":
+        document["anchor_rule"] = 1
+    elif case == "bad-anchor":
+        document["harness_identity"]["pid"] = 0
+    elif case in ("managed", "custom"):
+        document["adapter"] = "herdr" if case == "managed" else "herdr-pane"
+    elif case in ("headless", "invalid-cloud"):
+        document["mode"] = "headless"
+        document["backend"] = "tmux" if case == "headless" else "agentcloud"
+        document["adapter"] = "turn-runner" if case == "headless" else "agentcloud"
+        document["foreign_shell_identity"] = None
+        document["harness_identity"] = None
+        document["anchor_rule"] = None
+    elif case == "stopped":
+        document["lifecycle"] = "stopped"
+    path.write_text(json.dumps(document), encoding="utf-8")
+    raw = path.read_bytes()
+    if case == "headless":
+        assert sessions.get("foreign").adapter == "turn-runner"
+    _suggestion4_no_runtime(fake, monkeypatch)
+    monkeypatch.setattr(fake, "process_liveness", lambda _identity: case if case in ("alive", "unknown") else "dead", raising=False)
+
+    def no_worker(_record: AgentRecord, _action: str, **_options: object) -> dict[str, object]:
+        raise AssertionError("dead-adoption retirement must not dispatch a worker")
+
+    monkeypatch.setattr(sessions, "_worker", no_worker)
+    with pytest.raises(AgentDeliveryError):
+        sessions.stop("foreign", retire_dead_adoption=True, expected_token=token,
+                      expected_record_sha256=hashlib.sha256(raw).hexdigest())
+    assert path.read_bytes() == raw and not (sessions.registry / "archive").exists()
+
+
+@pytest.mark.parametrize("case", [
+    "record", "liveness", "raw-during-proof", "directory", "queue", "queue-appeared",
+    "lock", "archive-parent", "archive-collision",
+])
+def test_suggestion4_final_publication_rechecks_bound_state_and_preserves_replacements(
+    case: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sessions, fake, token, digest, raw = _suggestion4_dead_adoption(tmp_path, monkeypatch)
+    directory = sessions.registry / "foreign"
+    queue = directory / "queue"
+    if case in ("queue", "lock"):
+        agent.enqueue(str(queue), "saved work", message_id="saved")
+    _suggestion4_no_runtime(fake, monkeypatch)
+    checks = 0
+
+    def liveness(_identity: CustomProcessIdentity) -> str:
+        nonlocal checks
+        checks += 1
+        if checks == 2:
+            if case in ("record", "raw-during-proof"):
+                (directory / "agent.json").write_bytes(raw + b" \n")
+            elif case == "liveness":
+                return "alive"
+            elif case == "directory":
+                directory.rename(sessions.registry / "held-original")
+                directory.mkdir(mode=0o700)
+                (directory / "agent.json").write_bytes(raw)
+                (directory / "agent.json").chmod(0o600)
+            elif case == "queue":
+                queue.rename(directory / "held-queue")
+                queue.mkdir(mode=0o700)
+            elif case == "queue-appeared":
+                queue.mkdir(mode=0o700)
+            elif case == "lock":
+                replacement = queue / "new-lock"
+                replacement.write_bytes(b"")
+                replacement.chmod(0o600)
+                os.replace(replacement, queue / ".binding.lock")
+            elif case == "archive-parent":
+                archive = sessions.registry / "archive"
+                archive.rename(sessions.registry / "held-archive")
+                archive.mkdir(mode=0o700)
+            elif case == "archive-collision":
+                target = sessions.registry / "archive" / f"foreign-{token}"
+                target.mkdir(mode=0o700)
+                (target / "replacement").write_bytes(b"keep this generation")
+        return "dead"
+
+    monkeypatch.setattr(fake, "process_liveness", liveness, raising=False)
+    if case == "record":
+        original_destination = sessions._archive_destination
+
+        def destination(record: AgentRecord) -> tuple[Path, Path]:
+            result = original_destination(record)
+            (directory / "agent.json").write_bytes(raw + b"\n")
+            return result
+
+        monkeypatch.setattr(sessions, "_archive_destination", destination)
+    with pytest.raises((AgentDeliveryError, OSError)):
+        sessions.stop("foreign", retire_dead_adoption=True, expected_token=token,
+                      expected_record_sha256=digest)
+    assert directory.is_dir()
+    if case in ("record", "raw-during-proof"):
+        assert (directory / "agent.json").read_bytes().startswith(raw)
+    else:
+        assert (directory / "agent.json").read_bytes() == raw
+    archive = sessions.registry / "archive" / f"foreign-{token}"
+    if case == "archive-collision":
+        assert (archive / "replacement").read_bytes() == b"keep this generation"
+        assert not (archive / "agent.json").exists()
+    else:
+        assert not archive.exists()
+    if case == "directory":
+        assert (sessions.registry / "held-original/agent.json").read_bytes() == raw
+    elif case == "queue":
+        assert (directory / "held-queue/inbox/saved.json").is_file()
+    assert fake.closed == [] and fake.keys_sent == []
+
+
+@pytest.mark.parametrize("case", ["reported-error", "active-replacement"])
+def test_suggestion4_interrupted_publication_keeps_the_archived_generation_exact(
+    case: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sessions, fake, token, digest, raw = _suggestion4_dead_adoption(tmp_path, monkeypatch)
+    directory = sessions.registry / "foreign"
+    _suggestion4_no_runtime(fake, monkeypatch)
+    monkeypatch.setattr(fake, "process_liveness", lambda _identity: "dead", raising=False)
+    real = subagents_module._rename_directory_noreplace_at
+
+    def interrupted(source_fd: int, source: str, target_fd: int, target: str) -> None:
+        real(source_fd, source, target_fd, target)
+        if case == "reported-error":
+            raise OSError("rename completed but wrapper failed")
+        directory.mkdir(mode=0o700)
+        (directory / "replacement").write_bytes(b"new generation")
+
+    monkeypatch.setattr(subagents_module, "_rename_directory_noreplace_at", interrupted)
+    with pytest.raises(AgentDeliveryError):
+        sessions.stop("foreign", retire_dead_adoption=True, expected_token=token,
+                      expected_record_sha256=digest)
+    archive = sessions.registry / "archive" / f"foreign-{token}"
+    assert (archive / "agent.json").read_bytes() == raw
+    assert not (archive / "output.json").exists()
+    if case == "active-replacement":
+        assert (directory / "replacement").read_bytes() == b"new generation"
+    else:
+        assert not directory.exists()
+    assert fake.closed == [] and fake.submitted == []
+
+
+@pytest.mark.parametrize("case", [
+    "record-mode", "record-symlink", "record-hardlink", "record-fifo", "oversize",
+    "queue-mode", "queue-symlink", "lock-mode", "lock-symlink", "lock-hardlink", "lock-fifo",
+])
+def test_suggestion4_retirement_refuses_unsafe_private_artifacts_without_runtime(
+    case: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sessions, fake, token, digest, raw = _suggestion4_dead_adoption(tmp_path, monkeypatch)
+    directory = sessions.registry / "foreign"
+    record_path = directory / "agent.json"
+    _suggestion4_no_runtime(fake, monkeypatch)
+    monkeypatch.setattr(fake, "process_liveness", lambda _identity: "dead", raising=False)
+    if case == "record-mode":
+        record_path.chmod(0o644)
+    elif case in ("record-symlink", "record-fifo"):
+        record_path.rename(directory / "original-record")
+        if case == "record-symlink":
+            record_path.symlink_to("original-record")
+        else:
+            os.mkfifo(record_path, 0o600)
+    elif case == "record-hardlink":
+        os.link(record_path, directory / "record-alias")
+    elif case == "oversize":
+        document = json.loads(raw)
+        document["large_unknown"] = "x" * subagents_module._MAX_AGENT_RECORD_BYTES
+        raw = json.dumps(document).encode("utf-8")
+        record_path.write_bytes(raw)
+        digest = hashlib.sha256(raw).hexdigest()
+    else:
+        queue = directory / "queue"
+        queue.mkdir(mode=0o700)
+        if case == "queue-mode":
+            queue.chmod(0o755)
+        elif case == "queue-symlink":
+            queue.rename(directory / "original-queue")
+            queue.symlink_to("original-queue", target_is_directory=True)
+        else:
+            lock = queue / ".delivery.lock"
+            if case == "lock-fifo":
+                os.mkfifo(lock, 0o600)
+            elif case == "lock-symlink":
+                (queue / "original-lock").write_bytes(b"")
+                (queue / "original-lock").chmod(0o600)
+                lock.symlink_to("original-lock")
+            else:
+                lock.write_bytes(b"")
+                lock.chmod(0o644 if case == "lock-mode" else 0o600)
+                if case == "lock-hardlink":
+                    os.link(lock, queue / "lock-alias")
+    with pytest.raises(AgentDeliveryError):
+        sessions.stop("foreign", retire_dead_adoption=True, expected_token=token,
+                      expected_record_sha256=digest)
+    assert directory.is_dir() and not (sessions.registry / "archive").exists()
+    assert fake.closed == [] and fake.keys_sent == []
+
+
+def test_suggestion4_queue_waiter_cannot_lock_a_replaced_generation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sessions, fake, token, digest, raw = _suggestion4_dead_adoption(tmp_path, monkeypatch)
+    directory = sessions.registry / "foreign"
+    queue = directory / "queue"
+    agent.enqueue(str(queue), "saved work", message_id="saved")
+    delivery_inode = (queue / ".delivery.lock").stat().st_ino
+    _suggestion4_no_runtime(fake, monkeypatch)
+    monkeypatch.setattr(fake, "process_liveness", lambda _identity: "dead", raising=False)
+    real = fcntl.flock
+    swapped = False
+
+    def flock(descriptor: int, operation: int) -> None:
+        nonlocal swapped
+        if not swapped and os.fstat(descriptor).st_ino == delivery_inode:
+            swapped = True
+            queue.rename(directory / "held-queue")
+            queue.mkdir(mode=0o700)
+            (queue / ".delivery.lock").write_bytes(b"replacement coordination")
+            (queue / ".delivery.lock").chmod(0o600)
+        real(descriptor, operation)
+
+    monkeypatch.setattr(fcntl, "flock", flock)
+    with pytest.raises(AgentDeliveryError, match="queue.*changed"):
+        sessions.stop("foreign", retire_dead_adoption=True, expected_token=token,
+                      expected_record_sha256=digest)
+    assert swapped and (directory / "agent.json").read_bytes() == raw
+    assert (directory / "held-queue/inbox/saved.json").is_file()
+    assert (queue / ".delivery.lock").read_bytes() == b"replacement coordination"
+    assert not (queue / ".binding.lock").exists()
+    assert not (sessions.registry / "archive").exists()
+
+
+@pytest.mark.parametrize("transaction", ["rename", "move", "revive"])
+@pytest.mark.parametrize("explicit", [False, True])
+def test_suggestion4_pending_transactions_retain_authority_before_any_runtime_access(
+    transaction: str, explicit: bool, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sessions, fake, token, digest, raw = _suggestion4_dead_adoption(tmp_path, monkeypatch)
+    record = sessions.get("foreign")
+    if transaction == "move":
+        sessions._write_move_intent(record, "w2")
+    elif transaction == "rename":
+        sessions._write_rename_journal({
+            "schema": "agentctl-rename/v1", "token": token, "old": "foreign", "new": "reviewer",
+            "adapter": record.adapter, "pane_id": record.pane_id, "tab_id": record.tab_id,
+            "terminal_id": record.terminal_id, "workspace_id": record.workspace_id,
+            "journal_id": "a" * 32, "started_at": 0.0,
+        })
+    else:
+        journal_directory = sessions.registry / ".revives"
+        journal_directory.mkdir(mode=0o700)
+        metadata = (sessions.registry / "foreign").stat()
+        agent._atomic_json(str(journal_directory / f"{token}.json"), {
+            "schema": "agentctl-revive/v1", "name": "foreign", "old_token": token,
+            "new_token": "new-generation", "phase": "launching", "started_at": 0.0,
+            "old_directory_device": metadata.st_dev, "old_directory_inode": metadata.st_ino,
+            "new_directory_device": metadata.st_dev, "new_directory_inode": metadata.st_ino + 1,
+            "old_record_sha256": digest, "stopped_record_sha256": "0" * 64,
+            "ready_record_sha256": None,
+            "proof": {
+                "kind": "missing", "pane_id": record.pane_id, "tab_id": record.tab_id,
+                "workspace_id": record.workspace_id, "cwd": record.cwd,
+                "terminal_id": None, "reported_agent": None, "reported_session_agent": None,
+                "reported_session_value": None, "shell": None, "shell_executable": None,
+            },
+        })
+    _suggestion4_no_runtime(fake, monkeypatch)
+    monkeypatch.setattr(fake, "process_liveness", lambda _identity: "dead", raising=False)
+    with pytest.raises(AgentDeliveryError, match="incomplete") as refused:
+        sessions.stop("foreign", retire_dead_adoption=explicit, expected_token=token,
+                      expected_record_sha256=digest if explicit else None)
+    action = refused.value.recovery_action
+    assert action is not None and action.command == transaction and action.token == token
+    assert (sessions.registry / "foreign/agent.json").read_bytes() == raw
+    assert not (sessions.registry / "archive").exists()
+
+
+@pytest.mark.parametrize("transaction", ["rename", "move", "revive"])
+def test_suggestion4_late_corrupt_transaction_refuses_before_optional_advice_or_rpc(
+    transaction: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sessions, fake, _token, _digest, raw = _suggestion4_dead_adoption(tmp_path, monkeypatch)
+    original = sessions._dead_adoption_pending
+
+    def pending(record: AgentRecord) -> None:
+        if transaction == "move":
+            path = sessions.registry / "foreign/move.json"
+        else:
+            directory = sessions.registry / (".renames" if transaction == "rename" else ".revives")
+            directory.mkdir(mode=0o700)
+            path = directory / f"{record.token}.json"
+        agent._atomic_json(str(path), {})
+        original(record)
+
+    monkeypatch.setattr(sessions, "_dead_adoption_pending", pending)
+    _suggestion4_no_runtime(fake, monkeypatch)
+    monkeypatch.setattr(fake, "process_liveness", lambda _identity: "dead", raising=False)
+    with pytest.raises(AgentDeliveryError) as refused:
+        sessions.stop("foreign")
+    assert refused.value.recovery_action == RecoveryAction("doctor")
+    assert (sessions.registry / "foreign/agent.json").read_bytes() == raw
+    assert not (sessions.registry / "archive").exists()
+
+
+@pytest.mark.parametrize("change", ["token", "raw-bytes"])
+def test_suggestion4_captured_advice_cannot_retire_a_replacement_and_replays_exact_original(
+    change: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    sessions, fake, token, digest, raw = _suggestion4_dead_adoption(tmp_path, monkeypatch)
+    path = sessions.registry / "foreign/agent.json"
+    monkeypatch.setattr(fake, "process_liveness", lambda _identity: "dead", raising=False)
+
+    def unavailable(_workspace_id: str | None = None) -> tuple[Pane, ...]:
+        # A later runtime probe cannot supply the replacement's token or digest.
+        document = json.loads(raw)
+        if change == "token":
+            document["token"] = "replacement-generation"
+        else:
+            document["future_field"]["nested"].append("replacement bytes")
+        path.write_bytes(json.dumps(document).encode("utf-8"))
+        raise HerdrUnavailable("Herdr server is offline")
+
+    monkeypatch.setattr(fake, "panes", unavailable)
+    with pytest.raises(HerdrUnavailable, match="server is offline") as refused:
+        sessions.stop("foreign")
+    assert refused.value.exit_code == 69
+    assert refused.value.recovery_action == RecoveryAction(
+        "retire-dead-adoption", name="foreign", token=token, record_sha256=digest,
+    )
+    message = stop_refusal_message(refused.value, prefix="agentctl", registry=str(sessions.registry),
+                                   herdr_bin="missing herdr's $(literal)")
+    command = shlex.split(message.split("Recovery command: ", 1)[1])
+    assert command == [
+        "agentctl", "--registry=" + str(sessions.registry), "--herdr-bin=missing herdr's $(literal)",
+        "stop", "foreign", "--retire-dead-adoption", "--expected-token=" + token,
+        "--expected-record-sha256=" + digest,
+    ]
+    replacement = path.read_bytes()
+    _suggestion4_no_runtime(fake, monkeypatch)
+    monkeypatch.setattr(cli, "Sessions", lambda *_args, **_kwargs: sessions)
+    assert cli.main(command[1:]) == 75
+    refused_output = capsys.readouterr()
+    assert shlex.split(refused_output.err.split("Recovery command: ", 1)[1])[-1] == "doctor"
+    assert path.read_bytes() == replacement and not (sessions.registry / "archive").exists()
+    path.write_bytes(raw)
+    assert cli.main(command[1:]) == 0
+    completed = json.loads(capsys.readouterr().out)
+    assert completed["retired_dead_adoption"] is True
+    assert (Path(completed["archive"]) / "agent.json").read_bytes() == raw
+
+
+@pytest.mark.parametrize("proof", ["alive", "unknown", "error", "identity-lock-error"])
+def test_suggestion4_optional_advice_failure_preserves_successful_ordinary_stop(
+    proof: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sessions, fake, _token, _digest, _raw = _suggestion4_dead_adoption(tmp_path, monkeypatch)
+
+    def liveness(_identity: CustomProcessIdentity) -> str:
+        if proof == "error":
+            raise PermissionError("kernel proof unavailable")
+        return proof
+
+    monkeypatch.setattr(fake, "process_liveness", liveness, raising=False)
+    if proof == "identity-lock-error":
+        original = agent._open_private_lock
+
+        def open_lock(path: str, purpose: str) -> int:
+            if path.endswith("/.identity.lock"):
+                raise AgentDeliveryError("supplemental identity lock unavailable")
+            return original(path, purpose)
+
+        monkeypatch.setattr(agent, "_open_private_lock", open_lock)
+    result = sessions.stop("foreign")
+    assert result["runtime_preserved"] is True and "retired_dead_adoption" not in result
+    archive = Path(str(result["archive"]))
+    assert json.loads((archive / "agent.json").read_bytes())["lifecycle"] == "stopped"
+    assert (archive / "output.json").is_file() and fake.closed == []
+
+
+@pytest.mark.parametrize("digest", [None, "0" * 63, "A" * 64, "0" * 63 + "\x00"])
+def test_suggestion4_formatter_refuses_missing_or_malformed_new_digest_authority(
+    digest: str | None,
+) -> None:
+    error = _with_recovery(AgentDeliveryError("refused"), RecoveryAction(
+        "retire-dead-adoption", name="foreign", token="original", record_sha256=digest,
+    ))
+    command = stop_refusal_message(error, prefix="agentctl", registry="records", herdr_bin="herdr")
+    assert shlex.split(command.split("Recovery command: ", 1)[1])[-1] == "doctor"
+
+
+def test_suggestion4_legacy_digest_advice_keeps_the_distinct_existing_recovery_mode() -> None:
+    digest = "0" * 64
+    error = _with_recovery(AgentDeliveryError("legacy refusal"), RecoveryAction(
+        "stop", name="foreign", token="original", record_sha256=digest,
+    ))
+    command = stop_refusal_message(error, prefix="agentctl", registry="records", herdr_bin="herdr")
+    argv = shlex.split(command.split("Recovery command: ", 1)[1])
+    assert "--recover-legacy-adoption" in argv and "--retire-dead-adoption" not in argv
+    assert "--expected-record-sha256=" + digest in argv
+
+
+def test_suggestion4_older_cli_retirement_and_stop_only_boundary_use_real_private_record(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+) -> None:
+    sessions, fake, token, digest, raw = _suggestion4_dead_adoption(tmp_path, monkeypatch)
+    _suggestion4_no_runtime(fake, monkeypatch)
+    monkeypatch.setattr(fake, "process_liveness", lambda _identity: "dead", raising=False)
+    monkeypatch.setattr(legacy_cli, "HerdrClient", lambda **_kwargs: cast(HerdrClient, fake))
+    globals_ = ["--registry=" + str(sessions.registry), "--herdr-bin=offline-herdr"]
+    assert legacy_cli.main([*globals_, "status", "foreign", "--retire-dead-adoption"]) == 2
+    assert "--retire-dead-adoption is valid only with stop" in capsys.readouterr().err
+    assert (sessions.registry / "foreign/agent.json").read_bytes() == raw
+    assert not (sessions.registry / "archive").exists()
+    assert legacy_cli.main([
+        *globals_, "stop", "foreign", "--retire-dead-adoption",
+        "--expected-token=" + token, "--expected-record-sha256=" + digest,
+    ]) == 0
+    captured = capsys.readouterr()
+    assert captured.err == ""
+    result = json.loads(captured.out)
+    assert result["retired_dead_adoption"] is True and result["record_sha256"] == digest
+    assert (Path(result["archive"]) / "agent.json").read_bytes() == raw
+    assert not (Path(result["archive"]) / "queue").exists()

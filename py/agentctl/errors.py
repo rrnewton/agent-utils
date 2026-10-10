@@ -13,7 +13,7 @@ EXIT_TIMEOUT = 76
 class RecoveryAction:
     """Recovery authority captured at the refusal, never from a later record."""
 
-    command: Literal["doctor", "stop", "rename", "move", "revive"]
+    command: Literal["doctor", "stop", "rename", "move", "revive", "retire-dead-adoption"]
     name: str | None = None
     token: str | None = None
     rename_to: str | None = None

@@ -13,6 +13,7 @@ fn retry_options(recovery: &RecoveryAction) -> StopOptions {
     StopOptions {
         expected_token: Some(token.clone()),
         recover_legacy_adoption: record_sha256.is_some(),
+        retire_dead_adoption: false,
         expected_record_sha256: record_sha256.clone(),
         skip_cloud_halt: *skip_cloud_halt,
     }

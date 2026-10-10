@@ -520,7 +520,7 @@ archives its queue without closing the pane, tab, or process. Stop the foreign
 runtime through the authority that created it. Adoption accepts Herdr's pane
 shell only when kernel process inspection identifies a supported shell image,
 then records its boot ID, PID, process start ticks, and executable device/inode.
-Every `stop` requires that exact shell generation both before and after the
+Normal `stop` requires that exact shell generation both before and after the
 snapshot, including while the foreign agent is still live. If Herdr no longer
 reports the agent or its native session, `stop` additionally proves the same
 recorded pane and tab contain that exact idle shell generation. An adopted
@@ -535,6 +535,31 @@ basename (`bash`, `zsh`, `sh`, `dash`, `fish`, or `ksh`) and then pinned by
 boot/process/image identity. It is not a package-signature or trusted-binary
 attestation; another executable installed under one of those basenames is
 outside this same-user cleanup boundary.
+
+### Retire a dead adopted record after a restart
+
+After a Herdr restart, an adopted record can refer to a shell generation that
+has ended. A stop refusal prints a recovery command when agentctl can prove
+that the record's saved harness generation is dead:
+
+```sh
+agentctl stop reviewer --retire-dead-adoption --expected-token TOKEN \
+  --expected-record-sha256 SHA256
+```
+
+Use the exact token, raw record digest and registry from the printed command.
+The selector requires a running adopted Herdr record with a stored harness
+process identity, and both assertions are mandatory. A live or unverified
+generation, a changed record, or an incomplete identity transaction blocks
+retirement. The digest is the lowercase 64-hex SHA-256 of the exact
+`agent.json` bytes, including formatting and unknown fields.
+
+This recovery archives the original record, saved output and entire queue,
+including quarantine, without querying Herdr or changing any pane, tab or
+process. It works while Herdr is offline and leaves the original archived
+record bytes intact. It is separate from the explicit recovery for records
+without a saved shell identity; their selector and proof requirements are
+listed by `agentctl stop --help`.
 
 `send` accepts literal text or `--file`. In interactive mode, the instruction is
 persisted before submission. The manager waits for native readiness, records an
