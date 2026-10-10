@@ -21,8 +21,10 @@ desk size, with a mouse:
   right column under a heading naming it, with the X -> each column scrolls on its own, under the
   wheel over it -> the X goes back to the cards, and a Main message's Thread(N) selects its thread on
   the right -> the window narrowed to 900px: one column, as the channel was in one, the button not
-  drawn; widened again: two columns, the same thread selected -> at a phone's width the button is not
-  drawn. No horizontal overflow and no page error at any step.
+  drawn; widened again: two columns, the same thread selected -> the keys, pressed for real: ] gives
+  them to the right column, Esc there is its X, j rings the first card, Enter selects its thread and
+  [ gives them back to Main -> at a phone's width the button is not drawn. No horizontal overflow
+  and no page error at any step.
 
 Pass --screenshots DIR to keep a PNG of each state (the list and a selected thread, at each size) for
 review; --web-root DIR to run the same walk against another copy of the page.
@@ -395,6 +397,27 @@ def columns_walk(desk: Desk) -> None:
     desk.wait_for("() => document.querySelectorAll('#side-log > li[data-id]').length === 4",
                   "widening again lost the thread selected")
     desk.notes.append("at 900px one column in All with the button gone; wide again, two with the same thread")
+
+    # The keys, pressed for real: ] to the right column, Esc its X, j to a card with a ring, Enter
+    # selects it, [ back to the left column.
+    page.focus("#scroll-area")
+    page.keyboard.press("]")
+    desk.wait_for("() => document.activeElement === document.getElementById('side-scroll')",
+                  "] did not give the keys to the right column")
+    page.keyboard.press("Escape")
+    desk.wait_for("() => !document.getElementById('side-list').hidden", "Esc in the right column did not close its thread")
+    page.keyboard.press("j")
+    desk.wait_for("() => document.activeElement && document.activeElement.matches('#side-cards > li')"
+                  " && document.activeElement.matches(':focus-visible')",
+                  "j did not put a ring round the first card")
+    page.keyboard.press("Enter")
+    desk.wait_for("() => document.querySelectorAll('#side-log > li[data-id]').length === 9",
+                  "Enter on the card did not select its thread")
+    page.keyboard.press("[")
+    desk.wait_for("() => document.getElementById('scroll-area').contains(document.activeElement)",
+                  "[ did not give the keys back to the left column")
+    desk.check(len(desk.rows("discord-log")) == 11, "the keys changed the left column")
+    desk.notes.append("] Esc j Enter [ moved the keys between the columns and through the cards")
 
     # A phone's width: the button is never drawn.
     page.set_viewport_size({"width": 412, "height": 915})

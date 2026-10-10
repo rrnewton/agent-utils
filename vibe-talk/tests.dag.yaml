@@ -338,7 +338,8 @@ steps:
   # the summarised thread by its name and summary and the long question cut to three lines; a card and
   # a Main message's Thread(N) select a thread on the right under its name, each column scrolls alone
   # under the wheel over it, the X goes back to the cards, a 900px window is one column in the view it
-  # was in and two again when widened, and a phone's width draws neither the button nor the column.
+  # was in and two again when widened, real keys (] Esc j Enter [) move between the columns and through
+  # the cards, and a phone's width draws neither the button nor the column.
   # Measured on 2026-10-09: about 3s wall.
   - group: check
     job: two-column-browser
