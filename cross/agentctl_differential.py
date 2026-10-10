@@ -402,7 +402,8 @@ def _profiles(harness: Harness, report: Report) -> None:
                 "harness": "agentcloud", "mode": "interactive", "model": "provider-model",
                 "argv": ["--narration"], "env": {"TAB_SETTING": "private-tab-value"},
                 "agentcloud": {"harness": "claude-code", "provision": True,
-                               "envspec": "<envspec>", "purpose": "<purpose>"},
+                               "envspec": "<envspec>", "purpose": "<purpose>",
+                               "title": "{name}-{host}"},
             },
         },
     }
@@ -449,6 +450,7 @@ def _profiles(harness: Harness, report: Report) -> None:
                     and item.get("agentcloud") == {
                         "harness": "claude-code", "provision": True, "envspec": "<envspec>",
                         "purpose": "<purpose>", "workspace": None, "node_id": None,
+                        "title": "{name}-{host}",
                     }
                     for item in public.get("profiles", [])
                 )

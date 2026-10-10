@@ -1,6 +1,6 @@
 ---
 name: agent-utils-setup
-description: Adopt the agent-utils suite for a project through a guided, wizard-style conversation - detect what can be detected, install missing dependencies such as Herdr with the owner's consent, turn a Git checkout into a coordinator harness (primary checkout, worktrees, agent-utils, skills, harness AGENTS.md), and configure agentctl, wrkslots, and optionally the chat bridge and other suite tools. Use when the owner says "adopt agent-utils for my project", "set up agent-utils here", or later asks to add, remove, or reconfigure a suite tool.
+description: Adopt the agent-utils suite for a project through a guided, wizard-style conversation - detect what can be detected, install missing dependencies such as Herdr with the owner's consent, turn a Git checkout into a coordinator harness (primary checkout, worktrees, agent-utils, skills, harness AGENTS.md), and configure agentctl, wrkslots, and optionally the chat bridge and other suite tools. Use when the owner says "adopt agent-utils for my project", "set up agent-utils here", "set up agentutils", or "set up agent utils", or later asks to add, remove, or reconfigure a suite tool.
 ---
 
 # Adopt agent-utils for a project
@@ -373,6 +373,10 @@ addressable: tick-hub deliveries, other agents, and the owner's scripts reach it
 starts by hand in some terminal is not registered, so nothing can deliver to it. (With chat
 configured, start it instead with `agentctl chat launch --config chat.json --harness <harness>`
 from a Herdr shell tab in `$H`, in the project's workspace; the bridge owns that pane.)
+
+If the owner instead asks you to "attach yourself to Herdr", follow the agentctl skill's section
+of that name: a session that can be viewed remotely registers itself with `agentctl attach-self`
+from `$H`; a local terminal session cannot be moved and hands off to the started coordinator.
 
 Do not continue as the coordinator yourself: your session started in the checkout, which is now
 `$H/$PRIMARY`. Once the coordinator is up, end this session. (If agentctl launched you, its record

@@ -1102,6 +1102,23 @@ mod tests {
         assert_eq!(public["requires_edition"], "rust");
         assert_eq!(public["environment"], serde_json::json!(["TAB_SETTING"]));
 
+        let templated = parse(serde_json::json!({
+            "harness": "agentcloud",
+            "mode": "interactive",
+            "agentcloud": {"node_id": "{fqdn}", "workspace": "{cwd}", "title": "{name}-{host}"}
+        }))
+        .expect("placeholders are valid in node_id, workspace, and title");
+        assert_eq!(
+            templated.public().agentcloud.unwrap().title.as_deref(),
+            Some("{name}-{host}")
+        );
+        assert!(parse(serde_json::json!({
+            "harness": "agentcloud",
+            "mode": "interactive",
+            "agentcloud": {"title": "{user}"}
+        }))
+        .is_err());
+
         let minimal = parse(serde_json::json!({"harness": "agentcloud", "mode": "interactive"}))
             .expect("server defaults are valid");
         assert_eq!(minimal.cloud, Some(CloudLaunch::default()));

@@ -6688,7 +6688,23 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
         options: &StartOptions,
         project_workspace: Option<&str>,
     ) -> Result<()> {
-        let default_label = project_workspace.unwrap_or("subagents");
+        self.create_presentation_in(
+            record,
+            options,
+            project_workspace,
+            project_workspace.unwrap_or("subagents"),
+        )
+    }
+
+    /// Create the tab in the selected workspace, else in the one labelled `default_label`,
+    /// creating that workspace when it does not exist.
+    fn create_presentation_in(
+        &self,
+        record: &mut AgentRecord,
+        options: &StartOptions,
+        project_workspace: Option<&str>,
+        default_label: &str,
+    ) -> Result<()> {
         let _lock = agent::lock_target(
             &format!("managed-workspace:{default_label}"),
             "workspace allocation lock",
@@ -6699,7 +6715,9 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
             .filter(|s| !s.is_empty())
             .or_else(|| {
                 if project_workspace.is_none() {
-                    self.inherited_workspace.clone()
+                    self.inherited_workspace
+                        .clone()
+                        .or_else(|| self.attached_self_workspace())
                 } else {
                     None
                 }

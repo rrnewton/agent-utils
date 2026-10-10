@@ -140,6 +140,11 @@ enum Commands {
     /// Verify and focus the agent pane for human interaction; does not pause automation
     #[command(after_help = "Example: agentctl pause reviewer && agentctl attach reviewer")]
     Attach(Named),
+    /// Show the agentcloud session this process runs in through its viewer in a Herdr tab, and register it so it is listed beside the agents it starts
+    #[command(
+        after_help = "Examples:\n  agentctl attach-self coordinator\n  agentctl attach-self coordinator --cwd . --workspace-id w2\n\nThe session is $AGENTCLOUD_SESSION_ID; without it attach-self is refused, because a session\nin a local terminal cannot be moved into Herdr. Nothing changes in agentcloud: the tab runs\n`agentterm -s SESSION_ID` with the same endpoint resolution as start. The tab goes to\n--workspace-id, else the configured project workspace, else HERDR_WORKSPACE_ID, else the\nworkspace labelled with the --cwd directory's base name, which is created when absent; agents this session starts later\nwithout an explicit workspace open in the same workspace. stop NAME closes the tab and archives\nthe record but never halts or archives the session, which is the caller itself."
+    )]
+    AttachSelf(AttachSelf),
     /// Pause automation input without suspending the harness or its running work
     #[command(after_help = "Example: agentctl pause reviewer")]
     Pause(Named),
@@ -261,6 +266,21 @@ impl Delivery {
 }
 
 #[derive(Args)]
+struct AttachSelf {
+    #[command(flatten)]
+    agent: Named,
+    /// Directory recorded for the session; with no workspace configured, its base name labels the Herdr workspace
+    #[arg(long, default_value = ".", value_name = "DIR")]
+    cwd: PathBuf,
+    /// Existing Herdr workspace ID; default: configured project workspace, else HERDR_WORKSPACE_ID, else the workspace labelled with the --cwd base name; an explicit ID must match configured policy
+    #[arg(long, value_name = "ID")]
+    workspace_id: Option<String>,
+    /// Seconds to wait for the viewer to become the tab's foreground process, greater than zero and at most 300
+    #[arg(long, default_value = "30", value_parser = startup_seconds)]
+    startup_timeout: f64,
+}
+
+#[derive(Args)]
 struct Start {
     #[command(flatten)]
     agent: Named,
@@ -294,12 +314,15 @@ struct Start {
     /// agentcloud only: roster label for the provisioned node; requires --provision
     #[arg(long, value_name = "TEXT", requires = "provision")]
     purpose: Option<String>,
-    /// agentcloud only: absolute session working directory on the node (default: server default)
+    /// agentcloud only: absolute session working directory on the node (default: server default); may contain {cwd}, {name}, {host}, or {fqdn}
     #[arg(long, value_name = "PATH")]
     cloud_workspace: Option<String>,
-    /// agentcloud only: bind this existing node at creation; conflicts with --provision
+    /// agentcloud only: bind this existing node at creation; conflicts with --provision; may contain {host} or {fqdn} (example: --node-id '{fqdn}')
     #[arg(long, value_name = "ID", conflicts_with = "provision")]
     node_id: Option<String>,
+    /// agentcloud only: session title (default: NAME); {name} is the agent name, {host} the local host's first label, {fqdn} its full name, {cwd} the agent's directory (example: --cloud-title '{name}-{host}')
+    #[arg(long, value_name = "TEMPLATE")]
+    cloud_title: Option<String>,
     /// Model identifier passed unchanged to the Codex or Claude harness
     #[arg(long)]
     model: Option<String>,
@@ -322,7 +345,7 @@ struct Start {
     /// UTF-8 file containing the initial prompt; conflicts with --brief
     #[arg(long, value_name = "PATH")]
     file: Option<PathBuf>,
-    /// Existing Herdr workspace ID; default: configured project workspace, else HERDR_WORKSPACE_ID, else shared subagents; an explicit ID must match configured policy
+    /// Existing Herdr workspace ID; default: configured project workspace, else HERDR_WORKSPACE_ID, else the workspace of the caller's own agentcloud session registered by attach-self, else shared subagents; an explicit ID must match configured policy
     #[arg(long, value_name = "ID")]
     workspace_id: Option<String>,
     /// Interactive only: box the agent to this wrkslots slot (plain-worktree or image-backed); the pane shell is replaced by the line `wrkslots shell-command SLOT` prints (per-slot slice limits and, except with cgroup isolation, a confined file-system view) before the harness starts, and the agent's cwd is the slot directory. Needs wrkslots on PATH or AGENTCTL_WRKSLOTS_BIN
@@ -1142,6 +1165,7 @@ fn run(args: Cli, environment: &dyn Fn(&str) -> Option<String>) -> Result<i32, F
         endpoint_explicit: args.agentcloud_url.is_some(),
         endpoint: args.agentcloud_url.or(from_environment.endpoint),
         ambient_session: from_environment.ambient_session,
+        hostname: from_environment.hostname,
     });
     let mut result = match command {
         Commands::Start(value) => {
@@ -1152,6 +1176,7 @@ fn run(args: Cli, environment: &dyn Fn(&str) -> Option<String>) -> Result<i32, F
                 (value.purpose.is_some(), "--purpose"),
                 (value.cloud_workspace.is_some(), "--cloud-workspace"),
                 (value.node_id.is_some(), "--node-id"),
+                (value.cloud_title.is_some(), "--cloud-title"),
             ]
             .into_iter()
             .filter_map(|(present, flag)| present.then_some(flag))
@@ -1212,6 +1237,7 @@ fn run(args: Cli, environment: &dyn Fn(&str) -> Option<String>) -> Result<i32, F
                             purpose: value.purpose,
                             workspace: value.cloud_workspace,
                             node_id: value.node_id,
+                            title: value.cloud_title,
                         })
                     } else {
                         if !cloud_flags.is_empty() {
@@ -1442,6 +1468,16 @@ fn run(args: Cli, environment: &dyn Fn(&str) -> Option<String>) -> Result<i32, F
                 .map(|command| command.0.as_slice()),
         )?,
         Commands::Attach(value) => manager.attach(&value.name)?,
+        Commands::AttachSelf(value) => manager.attach_self(
+            &value.agent.name,
+            &value.cwd,
+            StartOptions {
+                workspace_id: value.workspace_id,
+                harness: "agentcloud".to_owned(),
+                startup_timeout: Duration::from_secs_f64(value.startup_timeout),
+                ..StartOptions::default()
+            },
+        )?,
         Commands::Pause(value) => manager.pause(&value.name, true)?,
         Commands::Resume(value) => manager.pause(&value.name, false)?,
         Commands::Capabilities

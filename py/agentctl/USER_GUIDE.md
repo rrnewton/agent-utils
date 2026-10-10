@@ -689,7 +689,7 @@ start them. `agentctl capabilities` lists the adapter under
 Starting one is two steps, and `agentctl` performs both:
 
 1. `agentcloudctl create` makes a root session. The agent name becomes its
-   `--title`, the brief becomes its durable `--prompt`, and the model,
+   `--title` unless a title is configured, the brief becomes its durable `--prompt`, and the model,
    reasoning effort, driver, and node settings come from the profile or flags.
    `agentctl` requires stdout to be exactly one complete session UUID and
    records it before anything else happens; a shorter ID is refused, because the
@@ -755,8 +755,24 @@ The same launch without a profile uses explicit flags:
 `--node-id ID` where needed. The `agentcloud` block accepts `harness`
 (`native`, `claude-code`, `codex`, or `muse-code`; omitted means the server
 default), `provision`, `envspec` and `purpose` (both require `provision`),
-`workspace` (an absolute path on the node), and `node_id` (which conflicts with
-`provision`). Profile `argv` and `--harness-arg` add literal `agentcloudctl
+`workspace` (an absolute path on the node), `node_id` (which conflicts with
+`provision`), and `title` (default: the agent name; `--cloud-title` on the
+command line). `title`, `workspace`, and `node_id` may contain placeholders that
+`start` expands: `{name}` is the agent name, `{host}` the local host name's
+first label, `{fqdn}` the full local host name, and `{cwd}` the agent's
+absolute directory. Any other `{...}` is refused, and the record and `status`
+show the expanded values. A profile that binds the session to this host, uses
+the agent's directory as the session directory, and titles it after both:
+
+```json
+"agentcloud": {
+  "harness": "claude-code",
+  "node_id": "{fqdn}",
+  "workspace": "{cwd}",
+  "title": "{name}-{host}"
+}
+```
+ Profile `argv` and `--harness-arg` add literal `agentcloudctl
 create` options, written as `--option=value`. Options that `agentctl` sets
 itself, and endpoint or identity options that must match every later command
 (`--ws-url`, `--client-cert`, `--client-key`, `--as-crewmate`), are refused.
@@ -794,6 +810,29 @@ recorded executable and endpoint, as does `attach` when the tab is gone. Every
 printed `agentctl` recovery command names the registry it applies to. `goal`, `drain`, `bind-session`, and `adopt`
 are refused for agentcloud agents; a goal travels as
 `agentctl send NAME '/goal OBJECTIVE'`.
+
+### Attach your own session
+
+In the Rust distribution, an agent that itself runs in an agentcloud session
+(`$AGENTCLOUD_SESSION_ID` is set) can show its own session in Herdr beside the
+agents it starts:
+
+```sh
+agentctl attach-self coordinator --cwd .
+```
+
+Nothing is created or changed in agentcloud. `attach-self` registers the
+session under the given name, opens a tab that runs `agentterm -s SESSION_ID`
+with the same endpoint resolution as `start`, and returns the agent's status.
+The tab goes to `--workspace-id`, else the configured project workspace, else
+`HERDR_WORKSPACE_ID`, else the workspace labelled with the `--cwd` directory's
+base name, which is created when absent. Later `start` calls from the same
+session without an explicit or configured workspace open their tabs in that
+workspace. A session that is already registered in this registry is refused
+with its name. `stop NAME` closes the tab and archives the record but never
+halts or archives the session, because it is the caller itself. Without
+`$AGENTCLOUD_SESSION_ID`, `attach-self` is refused: a session in a local
+terminal cannot be moved into Herdr.
 
 ## Observe and take over
 

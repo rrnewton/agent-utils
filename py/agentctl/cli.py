@@ -209,6 +209,15 @@ def parser() -> argparse.ArgumentParser:
         help="archive a running adopted record whose pinned harness is dead, without querying Herdr; requires --expected-token and --expected-record-sha256")
     stop.add_argument("--expected-record-sha256", metavar="SHA256",
         help="exact lowercase 64-hex SHA-256 of raw agent.json bytes; requires --recover-legacy-adoption or --retire-dead-adoption")
+    attach_self = command("attach-self",
+        "Show the agentcloud session this process runs in through its viewer in a Herdr tab and "
+        "register it (Rust edition only; this edition refuses).",
+        "agentctl attach-self coordinator --cwd .", named=True)
+    attach_self.add_argument("--cwd", default=".", metavar="DIR",
+        help="directory recorded for the session (default: current directory)")
+    attach_self.add_argument("--workspace-id", metavar="ID", help="existing Herdr workspace ID")
+    attach_self.add_argument("--startup-timeout", type=_ascii_float, default=30.0, metavar="SECONDS",
+        help="viewer startup deadline, greater than 0 and at most 300 seconds (default: 30)")
     for name, purpose in (
         ("attach", "Focus the session's terminal for direct inspection and interaction."),
         ("pause", "Pause automated input while allowing an active turn to finish."),
@@ -336,6 +345,11 @@ def main(argv: Sequence[str] | None = None) -> int:
             ("ready_timeout", "working_timeout", "max_attempts") if hasattr(args, key)}
         result: object
         name = getattr(args, "name", "")
+        if args.command == "attach-self":
+            raise ValueError(
+                "attach-self presents an agentcloud session, which only the Rust edition of "
+                "agentctl implements; run it with the Rust agentctl"
+            )
         if args.command == "start":
             profile = None
             if args.profile is not None:

@@ -577,6 +577,22 @@ def test_agentcloud_profile_is_listed_as_rust_only_without_breaking_other_profil
     assert "agentcloud" not in listed["local"]
 
 
+def test_agentcloud_title_and_placeholders_are_listed_as_written(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str],
+) -> None:
+    _write_profiles(tmp_path, {"cloud": {
+        **_CLOUD_PROFILE,
+        "agentcloud": {"harness": "claude-code", "node_id": "{fqdn}", "workspace": "{cwd}",
+                       "title": "{name}-{host}"},
+    }})
+    assert cli.main(["profiles", "--cwd", str(tmp_path)]) == 0
+    listed = json.loads(capsys.readouterr().out)["profiles"][0]
+    assert listed["agentcloud"] == {
+        "harness": "claude-code", "provision": False, "envspec": None, "purpose": None,
+        "workspace": "{cwd}", "node_id": "{fqdn}", "title": "{name}-{host}",
+    }
+
+
 def test_explicit_null_agentcloud_on_a_local_profile_means_absent(tmp_path: Path) -> None:
     _write_profiles(tmp_path, {
         "local": {"harness": "codex", "mode": "interactive", "agentcloud": None},
@@ -610,6 +626,17 @@ def test_python_refuses_to_start_agentcloud_and_names_the_rust_edition(
     assert fake.environments == []
 
 
+def test_python_refuses_attach_self_and_names_the_rust_edition(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str],
+) -> None:
+    registry = tmp_path / "registry"
+    assert cli.main([
+        "attach-self", "coordinator", "--cwd", str(tmp_path), "--registry", str(registry),
+    ]) == 2
+    assert "only the Rust edition of agentctl implements" in capsys.readouterr().err
+    assert not registry.exists()
+
+
 @pytest.mark.parametrize(("change", "expected"), [
     ({"mode": "headless"}, "harness/mode combination"),
     ({"harness": "claude"}, "agentcloud block"),
@@ -619,6 +646,10 @@ def test_python_refuses_to_start_agentcloud_and_names_the_rust_edition(
     ({"agentcloud": {"harness": "claude"}}, "claude-code"),
     ({"agentcloud": {"provison": True}}, "unknown fields"),
     ({"agentcloud": {"provision": "yes"}}, "true or false"),
+    ({"agentcloud": {"title": "{nme}"}}, "unknown placeholder"),
+    ({"agentcloud": {"title": "open {name"}}, "unknown placeholder"),
+    ({"agentcloud": {"title": " "}}, "title must be a nonempty single-line string"),
+    ({"agentcloud": {"workspace": "relative{cwd}"}}, "absolute path"),
     ({"argv": ["--title=other"]}, "--title"),
     ({"argv": ["--skill", "builder"]}, "--option=value"),
     ({"argv": ["--token=abc"]}, "secret"),

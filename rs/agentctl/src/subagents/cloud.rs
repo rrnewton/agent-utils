@@ -81,15 +81,115 @@ pub struct CloudLaunch {
     /// Existing node bound at creation; conflicts with `provision`.
     #[serde(default)]
     pub node_id: Option<String>,
+    /// Session title for `agentcloudctl create --title`; `None` uses the agent name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
 }
 
 fn single_line(value: &str) -> bool {
     !value.trim().is_empty() && !value.contains(['\0', '\n', '\r'])
 }
 
+/// Placeholders that `title`, `workspace`, and `node_id` may contain; `agentctl start` expands
+/// them, so one profile can name the agent, this host, and the agent's directory.
+pub(crate) const CLOUD_PLACEHOLDERS: [&str; 4] = ["{name}", "{host}", "{fqdn}", "{cwd}"];
+
+/// The values the placeholders expand to for one launch.
+pub(crate) struct LaunchContext<'a> {
+    /// Agent name (`{name}`).
+    pub(crate) name: &'a str,
+    /// Full local host name (`{fqdn}`); `{host}` is its first label. `None` when unknown.
+    pub(crate) hostname: Option<&'a str>,
+    /// Absolute agent working directory (`{cwd}`).
+    pub(crate) cwd: &'a str,
+}
+
+/// Fixed values that check a template's shape without depending on the local host.
+const SAMPLE_CONTEXT: LaunchContext<'static> = LaunchContext {
+    name: "agent",
+    hostname: Some("host.example"),
+    cwd: "/directory",
+};
+
+fn expand_template(
+    label: &str,
+    field: &str,
+    template: &str,
+    context: &LaunchContext<'_>,
+) -> Result<String> {
+    let mut expanded = String::with_capacity(template.len());
+    let mut rest = template;
+    while let Some(start) = rest.find('{') {
+        expanded.push_str(&rest[..start]);
+        let placeholder = rest[start..]
+            .find('}')
+            .map(|end| &rest[start..=start + end])
+            .filter(|candidate| CLOUD_PLACEHOLDERS.contains(candidate))
+            .ok_or_else(|| {
+                fail(format!(
+                    "{label} agentcloud {field} {template:?} has an unknown placeholder; use {}",
+                    CLOUD_PLACEHOLDERS.join(", ")
+                ))
+            })?;
+        let host = || {
+            context.hostname.ok_or_else(|| {
+                fail(format!(
+                    "{label} agentcloud {field} uses {placeholder}, but the local host name is unknown"
+                ))
+            })
+        };
+        match placeholder {
+            "{name}" => expanded.push_str(context.name),
+            "{fqdn}" => expanded.push_str(host()?),
+            "{host}" => expanded.push_str(host()?.split('.').next().unwrap_or_default()),
+            _ => expanded.push_str(context.cwd),
+        }
+        rest = &rest[start + placeholder.len()..];
+    }
+    expanded.push_str(rest);
+    Ok(expanded)
+}
+
+/// The local host name, as `hostname` prints it.
+pub(crate) fn local_hostname() -> Option<String> {
+    let mut buffer = [0u8; 256];
+    // SAFETY: the buffer is valid for its full length and gethostname writes at most that much.
+    let status = unsafe { libc::gethostname(buffer.as_mut_ptr().cast(), buffer.len()) };
+    if status != 0 {
+        return None;
+    }
+    let length = buffer.iter().position(|byte| *byte == 0)?;
+    String::from_utf8(buffer[..length].to_vec())
+        .ok()
+        .filter(|name| !name.is_empty())
+}
+
 impl CloudLaunch {
     /// Refuse contradictory or malformed settings before any registry or remote state exists.
     pub(crate) fn validate(&self, label: &str) -> Result<()> {
+        // Placeholders are checked by expanding fixed sample values, so a template is held to
+        // exactly the rules its expansion must meet.
+        self.expand(label, &SAMPLE_CONTEXT)?
+            .validate_expanded(label)
+    }
+
+    /// Substitute the placeholders in `title`, `workspace`, and `node_id`.
+    pub(crate) fn expand(&self, label: &str, context: &LaunchContext<'_>) -> Result<CloudLaunch> {
+        let expand = |field: &str, value: &Option<String>| {
+            value
+                .as_deref()
+                .map(|template| expand_template(label, field, template, context))
+                .transpose()
+        };
+        Ok(CloudLaunch {
+            workspace: expand("workspace", &self.workspace)?,
+            node_id: expand("node_id", &self.node_id)?,
+            title: expand("title", &self.title)?,
+            ..self.clone()
+        })
+    }
+
+    pub(super) fn validate_expanded(&self, label: &str) -> Result<()> {
         if let Some(driver) = self.harness.as_deref() {
             if !CLOUD_DRIVERS.contains(&driver) {
                 return Err(fail(format!(
@@ -103,6 +203,7 @@ impl CloudLaunch {
             ("purpose", self.purpose.as_deref()),
             ("workspace", self.workspace.as_deref()),
             ("node_id", self.node_id.as_deref()),
+            ("title", self.title.as_deref()),
         ] {
             if value.is_some_and(|value| !single_line(value)) {
                 return Err(fail(format!(
@@ -177,6 +278,8 @@ pub struct CloudTools {
     /// any session"); `None` leaves the inherited environment untouched. Absence is never an
     /// instruction to erase attribution, so agentcloudctl's own guard always sees the real context.
     pub ambient_session: Option<String>,
+    /// Local host name that `{host}` and `{fqdn}` in agentcloud settings expand to.
+    pub hostname: Option<String>,
 }
 
 impl CloudTools {
@@ -194,6 +297,7 @@ impl CloudTools {
             endpoint: environment("AGENTCLOUD_ORCHESTRATOR_URL").filter(|value| !value.is_empty()),
             endpoint_explicit: false,
             ambient_session: observed,
+            hostname: local_hostname(),
         }
     }
 }
@@ -228,11 +332,16 @@ pub(super) struct CloudRecord {
     pub(super) terminal_identity: Option<CustomProcessIdentity>,
     #[serde(default)]
     pub(super) halted: bool,
+    /// The session is the one `agentctl attach-self` ran inside, so stop only closes its viewer
+    /// and archives the record; halting or archiving it would end the caller itself.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub(super) attached_self: bool,
 }
 
 impl CloudRecord {
     pub(super) fn valid(&self) -> bool {
-        self.launch.validate("agent record").is_ok()
+        // A record holds expanded settings, whose values may legitimately contain braces.
+        self.launch.validate_expanded("agent record").is_ok()
             && self.agentterm.starts_with('/')
             && !self.agentterm.contains('\0')
             && self.endpoint.as_deref().is_none_or(valid_endpoint)
@@ -467,7 +576,14 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
         self.save(record)?;
         let directory = self.directory(&record.name)?;
         let stop = self.agentctl_command(&["stop", &record.name]);
+        let attached_self = record
+            .agentcloud
+            .as_ref()
+            .is_some_and(|cloud| cloud.attached_self);
         let remedy = match record.session_value.as_deref() {
+            Some(_) if attached_self => format!(
+                "; run `{stop}` to archive the record, which never halts this session"
+            ),
             Some(session) => format!(
                 "; agentcloud session {session} exists and may be live: attach with `{}`, or run `{stop}` to halt it and archive the record",
                 self.viewer_command(record, session)?
@@ -491,8 +607,16 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
         mut options: StartOptions,
         reasoning_effort: Option<&str>,
     ) -> Result<Value> {
-        let launch = options.cloud.clone().unwrap_or_default();
-        launch.validate("agentcloud launch")?;
+        let cwd_text = cwd.display().to_string();
+        let launch = options.cloud.clone().unwrap_or_default().expand(
+            "agentcloud launch",
+            &LaunchContext {
+                name: agent_name,
+                hostname: self.cloud_tools.hostname.as_deref(),
+                cwd: &cwd_text,
+            },
+        )?;
+        launch.validate_expanded("agentcloud launch")?;
         if options.resume.is_some() {
             return Err(fail(
                 "--resume does not apply to agentcloud agents; attach an existing session directly with `agentterm --ws-url ENDPOINT -s SESSION_ID`",
@@ -538,7 +662,10 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
             "--ws-url".to_owned(),
             endpoint.clone(),
             "--title".to_owned(),
-            agent_name.to_owned(),
+            launch
+                .title
+                .clone()
+                .unwrap_or_else(|| agent_name.to_owned()),
         ];
         push_value(&mut create, "--harness", launch.harness.as_deref());
         push_value(&mut create, "--model", options.model.as_deref());
@@ -564,44 +691,12 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
         // The project workspace policy places the terminal tab exactly as for a local worker,
         // and a mismatched explicit workspace is refused before any session is created.
         let project_workspace = self.start_workspace_policy(&options)?;
-        let _lock = self.lock(agent_name)?;
-        let directory = self.directory(agent_name)?;
-        if fs::symlink_metadata(&directory).is_ok() {
-            return Err(fail(format!(
-                "agent {agent_name:?} already registered; stop it before reusing the name"
-            )));
-        }
-        DirBuilder::new()
-            .mode(0o700)
-            .create(&directory)
-            .map_err(|error| fail(error.to_string()))?;
-        agent::sync_directory(&self.registry)?;
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_err(|error| fail(error.to_string()))?;
-        let mut record = AgentRecord {
-            storage_directory: None,
-            adapter: CLOUD_HARNESS.to_owned(),
-            mode: interactive_mode(),
-            backend: herdr_adapter(),
-            paused: false,
-            runtime_home: None,
-            pane_reported_by_agentctl: false,
-            custom_process_identity: None,
-            foreign_shell_identity: None,
-            terminal_id: None,
-            harness_identity: None,
-            name_history: Vec::new(),
-            anchor_rule: None,
-            former_names: Vec::new(),
-            native_session: None,
-            profile: options.profile.clone(),
-            slot: None,
-            slot_project: None,
-            slot_isolation: None,
-            reasoning_effort: reasoning_effort.map(str::to_owned),
-            environment_names: environment_names(&options.environment),
-            agentcloud: Some(CloudRecord {
+        let (_lock, mut record) = self.register_cloud_record(
+            agent_name,
+            &cwd,
+            &options,
+            reasoning_effort,
+            CloudRecord {
                 launch,
                 agentterm: agentterm.display().to_string(),
                 endpoint: Some(endpoint.clone()),
@@ -610,34 +705,10 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
                 create_note: None,
                 terminal_identity: None,
                 halted: false,
-            }),
-            extra: BTreeMap::new(),
-            name: agent_name.to_owned(),
-            token: format!("{}-{}", now.as_nanos(), std::process::id()),
-            harness: CLOUD_HARNESS.to_owned(),
-            cwd: cwd.display().to_string(),
-            created_at: now.as_secs_f64(),
-            schema: 1,
-            lifecycle: "starting".to_owned(),
-            workspace_id: None,
-            tab_id: None,
-            pane_id: None,
-            session_agent: None,
-            session_value: None,
-            model: options.model.clone(),
-            resume: None,
-            arguments: recorded_arguments,
-            startup_warning: None,
-            effective_reasoning_effort: reasoning_effort.map(str::to_owned),
-            error: None,
-            goal: None,
-            goal_delivery: None,
-            goal_session_id: None,
-            goal_command: None,
-            goal_messages: BTreeMap::new(),
-            goal_message_id: None,
-        };
-        self.save(&record)?;
+                attached_self: false,
+            },
+            recorded_arguments,
+        )?;
 
         let run = match run_tool(
             &agentcloudctl,
@@ -762,6 +833,226 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
             return Err(client_error(message));
         }
         self.status(agent_name)
+    }
+
+    /// Register the agentcloud session this process runs inside as `agent_name` and present it
+    /// through the viewer in a Herdr tab, so it appears beside the agents it starts. Nothing is
+    /// created or changed in agentcloud: the session already exists and is the caller itself.
+    pub fn attach_self(
+        &self,
+        agent_name: &str,
+        cwd: &Path,
+        options: StartOptions,
+    ) -> Result<Value> {
+        name(agent_name)?;
+        let cwd = fs::canonicalize(cwd)
+            .ok()
+            .filter(|cwd| cwd.is_dir())
+            .ok_or_else(|| fail(format!("cwd is not a directory: {}", cwd.display())))?;
+        if options.startup_timeout.is_zero() || options.startup_timeout > Duration::from_secs(300) {
+            return Err(fail("startup timeout must be between 0 and 300 seconds"));
+        }
+        let session = self.ambient().map(str::to_owned).ok_or_else(|| {
+            fail(
+                "attach-self presents the agentcloud session this process runs in, and $AGENTCLOUD_SESSION_ID is unset or empty; a session in a local terminal cannot be moved into Herdr, so start it in Herdr instead",
+            )
+        })?;
+        if !valid_session_id(&session) {
+            return Err(fail(format!(
+                "$AGENTCLOUD_SESSION_ID {session:?} is not a complete session ID"
+            )));
+        }
+        if !options.environment.is_empty() {
+            return Err(fail(
+                "attach-self takes no environment entries; the viewer tab needs none",
+            ));
+        }
+        if let Some(owner) = self.identity_owner(CLOUD_HARNESS, &session, None)? {
+            return Err(fail(format!(
+                "this session is already registered as {:?}; inspect it with `{}`, or retire that record with `{}` first",
+                owner.name,
+                self.agentctl_command(&["status", &owner.name]),
+                self.agentctl_command(&["stop", &owner.name]),
+            )));
+        }
+        let endpoint = self.default_endpoint();
+        if !valid_endpoint(&endpoint) {
+            return Err(fail(format!(
+                "agentcloud endpoint {endpoint:?} must be a ws:// or wss:// URL without whitespace"
+            )));
+        }
+        let agentterm = resolve_tool(&self.cloud_tools.agentterm, "--agentterm-bin")?;
+        let project_workspace = self.start_workspace_policy(&options)?;
+        // Without a project workspace, the tab goes to the workspace named after the directory,
+        // which is created when absent; agents this session starts later join it.
+        let default_label = match project_workspace.clone() {
+            Some(label) => label,
+            None => cwd
+                .file_name()
+                .map(|base| base.to_string_lossy().into_owned())
+                .filter(|base| !base.trim().is_empty())
+                .unwrap_or_else(|| "subagents".to_owned()),
+        };
+        let (_lock, mut record) = self.register_cloud_record(
+            agent_name,
+            &cwd,
+            &options,
+            None,
+            CloudRecord {
+                launch: CloudLaunch::default(),
+                agentterm: agentterm.display().to_string(),
+                endpoint: Some(endpoint.clone()),
+                create_exit: None,
+                verified: None,
+                create_note: None,
+                terminal_identity: None,
+                halted: false,
+                attached_self: true,
+            },
+            Vec::new(),
+        )?;
+        record.session_agent = Some(CLOUD_HARNESS.to_owned());
+        record.session_value = Some(session.clone());
+        record.native_session = Some(NativeSession::new(CLOUD_HARNESS, &session, "observed"));
+        self.save(&record)?;
+        if let Err(error) = self.create_presentation_in(
+            &mut record,
+            &options,
+            project_workspace.as_deref(),
+            &default_label,
+        ) {
+            return self.cloud_launch_failed(
+                &mut record,
+                &options,
+                format!("cannot create the Herdr tab: {error}"),
+            );
+        }
+        let pane_id = record.pane_id.clone().expect("new tab has pane");
+        let arguments = ["--ws-url".to_owned(), endpoint, "-s".to_owned(), session];
+        match self.client.start_pane_command(
+            &pane_id,
+            &agentterm,
+            &arguments,
+            options.startup_timeout,
+        ) {
+            Ok(identity) => {
+                record
+                    .agentcloud
+                    .as_mut()
+                    .expect("cloud record")
+                    .terminal_identity = Some(identity);
+            }
+            Err(error) => {
+                return self.cloud_launch_failed(
+                    &mut record,
+                    &options,
+                    format!("agentterm did not attach in pane {pane_id}: {error}"),
+                );
+            }
+        }
+        record.lifecycle = "running".to_owned();
+        self.save(&record)?;
+        self.status(agent_name)
+    }
+
+    /// The live Herdr workspace of the record `attach-self` made for the caller's own session,
+    /// so agents that session starts appear beside it.
+    pub(super) fn attached_self_workspace(&self) -> Option<String> {
+        let session = self.ambient()?;
+        let owner = self.identity_owner(CLOUD_HARNESS, session, None).ok()??;
+        if !owner
+            .agentcloud
+            .as_ref()
+            .is_some_and(|cloud| cloud.attached_self)
+        {
+            return None;
+        }
+        let workspace = owner.workspace_id?;
+        self.client
+            .panes()
+            .ok()?
+            .iter()
+            .any(|pane| pane.workspace_id == workspace)
+            .then_some(workspace)
+    }
+
+    /// Reserve the name and save a fresh `starting` record for an agentcloud session; the
+    /// returned lock must be held until the launch finishes.
+    fn register_cloud_record(
+        &self,
+        agent_name: &str,
+        cwd: &Path,
+        options: &StartOptions,
+        reasoning_effort: Option<&str>,
+        cloud: CloudRecord,
+        arguments: Vec<String>,
+    ) -> Result<(File, AgentRecord)> {
+        let lock = self.lock(agent_name)?;
+        let directory = self.directory(agent_name)?;
+        if fs::symlink_metadata(&directory).is_ok() {
+            return Err(fail(format!(
+                "agent {agent_name:?} already registered; stop it before reusing the name"
+            )));
+        }
+        DirBuilder::new()
+            .mode(0o700)
+            .create(&directory)
+            .map_err(|error| fail(error.to_string()))?;
+        agent::sync_directory(&self.registry)?;
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|error| fail(error.to_string()))?;
+        let record = AgentRecord {
+            storage_directory: None,
+            adapter: CLOUD_HARNESS.to_owned(),
+            mode: interactive_mode(),
+            backend: herdr_adapter(),
+            paused: false,
+            runtime_home: None,
+            pane_reported_by_agentctl: false,
+            custom_process_identity: None,
+            foreign_shell_identity: None,
+            terminal_id: None,
+            harness_identity: None,
+            name_history: Vec::new(),
+            anchor_rule: None,
+            former_names: Vec::new(),
+            native_session: None,
+            profile: options.profile.clone(),
+            slot: None,
+            slot_project: None,
+            slot_isolation: None,
+            reasoning_effort: reasoning_effort.map(str::to_owned),
+            environment_names: environment_names(&options.environment),
+            agentcloud: Some(cloud),
+            extra: BTreeMap::new(),
+            name: agent_name.to_owned(),
+            token: format!("{}-{}", now.as_nanos(), std::process::id()),
+            harness: CLOUD_HARNESS.to_owned(),
+            cwd: cwd.display().to_string(),
+            created_at: now.as_secs_f64(),
+            schema: 1,
+            lifecycle: "starting".to_owned(),
+            workspace_id: None,
+            tab_id: None,
+            pane_id: None,
+            session_agent: None,
+            session_value: None,
+            model: options.model.clone(),
+            resume: None,
+            arguments,
+            startup_warning: None,
+            effective_reasoning_effort: reasoning_effort.map(str::to_owned),
+            error: None,
+            goal: None,
+            goal_delivery: None,
+            goal_session_id: None,
+            goal_command: None,
+            goal_messages: BTreeMap::new(),
+            goal_message_id: None,
+        };
+        self.save(&record)?;
+        Ok((lock, record))
     }
 
     fn cloud_fleet<'f>(
@@ -1452,7 +1743,12 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
         }
         let retry = self.agentctl_command(&retry_arguments);
         // --skip-cloud-halt never contacts agentcloud, so it needs no endpoint and always works.
-        let contact = session.is_some() && !options.skip_cloud_halt;
+        // An attach-self record is the caller's own session: halting it would end the caller.
+        let attached_self = record
+            .agentcloud
+            .as_ref()
+            .is_some_and(|cloud| cloud.attached_self);
+        let contact = session.is_some() && !options.skip_cloud_halt && !attached_self;
         let endpoint = if contact {
             Some(self.persist_endpoint(&mut record)?)
         } else {
@@ -1506,6 +1802,8 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
             // recorded viewer or back at its idle shell.
             let halt_state = if session.is_none() {
                 "no agentcloud session was recorded"
+            } else if attached_self {
+                "the session was NOT halted (attach-self registered the caller's own session)"
             } else if executable.is_some() {
                 "the session is halted"
             } else {
@@ -1575,6 +1873,7 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
                     "stop does not release the node reservation; the orchestrator releases a provisioned node's reservation on its own schedule after the halted session goes idle, which can be long after stop returns. Check the reservation line of `{}`",
                     self.agentcloudctl_command("inspect", endpoint, &["--session", session])
                 ),
+                (Some(_), None) if attached_self => "attach-self registered the caller's own session, so stop left it untouched, including any node reservation".to_owned(),
                 (Some(_), None) => "--skip-cloud-halt left the agentcloud session untouched, including any node reservation".to_owned(),
             },
         }))
@@ -1904,6 +2203,7 @@ exit 0
                 endpoint_explicit: false,
                 // Explicitly outside any session, whatever this test process inherited.
                 ambient_session: Some(String::new()),
+                hostname: Some("node-a.example.test".to_owned()),
             }
         }
 
@@ -3618,5 +3918,230 @@ exit 0
         ] {
             assert!(parse_session_id(invalid).is_none(), "{invalid:?}");
         }
+    }
+
+    #[test]
+    fn launch_placeholders_expand_to_the_name_host_and_directory() {
+        let fixture = Fixture::new();
+        fixture.list_row(true);
+        let mut options = fixture.options(None);
+        options.cloud = Some(CloudLaunch {
+            harness: Some("claude-code".to_owned()),
+            node_id: Some("{fqdn}".to_owned()),
+            workspace: Some("{cwd}".to_owned()),
+            title: Some("{name}-{host}".to_owned()),
+            ..CloudLaunch::default()
+        });
+        fixture
+            .manager()
+            .start("sub-worker", &fixture.root, options)
+            .unwrap();
+        let cwd = fs::canonicalize(&fixture.root).unwrap();
+        let create = &fixture.calls()[0];
+        let value = |flag: &str| {
+            let index = create.iter().position(|item| item == flag).unwrap();
+            create[index + 1].clone()
+        };
+        assert_eq!(value("--title"), "sub-worker-node-a");
+        assert_eq!(value("--node-id"), "node-a.example.test");
+        assert_eq!(value("--workspace"), cwd.display().to_string());
+        // The record keeps the expanded values, which status and every later verb report.
+        let launch = &fixture.record()["agentcloud"]["launch"];
+        assert_eq!(launch["title"], "sub-worker-node-a");
+        assert_eq!(launch["node_id"], "node-a.example.test");
+    }
+
+    #[test]
+    fn launch_placeholders_refuse_unknown_names_and_unresolvable_hosts() {
+        assert!(CloudLaunch::default().validate("profile").is_ok());
+        for (launch, expected) in [
+            (
+                CloudLaunch {
+                    title: Some("{nme}".to_owned()),
+                    ..CloudLaunch::default()
+                },
+                "unknown placeholder",
+            ),
+            (
+                CloudLaunch {
+                    title: Some("open {name".to_owned()),
+                    ..CloudLaunch::default()
+                },
+                "unknown placeholder",
+            ),
+            (
+                CloudLaunch {
+                    workspace: Some("relative{cwd}".to_owned()),
+                    ..CloudLaunch::default()
+                },
+                "absolute path",
+            ),
+            (
+                CloudLaunch {
+                    title: Some(" ".to_owned()),
+                    ..CloudLaunch::default()
+                },
+                "title must be a nonempty single-line string",
+            ),
+        ] {
+            let message = launch.validate("profile").unwrap_err().to_string();
+            assert!(
+                message.contains(expected),
+                "{expected:?} not in {message:?}"
+            );
+        }
+        let template = CloudLaunch {
+            node_id: Some("{host}".to_owned()),
+            ..CloudLaunch::default()
+        };
+        template.validate("profile").unwrap();
+        let unknown_host = LaunchContext {
+            name: "sub-worker",
+            hostname: None,
+            cwd: "/work",
+        };
+        let message = template
+            .expand("profile", &unknown_host)
+            .unwrap_err()
+            .to_string();
+        assert!(message.contains("host name is unknown"), "{message}");
+        // Braces that arrive through an expanded value are literal, never re-expanded.
+        let braced = CloudLaunch {
+            workspace: Some("{cwd}".to_owned()),
+            ..CloudLaunch::default()
+        }
+        .expand(
+            "profile",
+            &LaunchContext {
+                name: "sub-worker",
+                hostname: None,
+                cwd: "/work/{name}",
+            },
+        )
+        .unwrap();
+        assert_eq!(braced.workspace.as_deref(), Some("/work/{name}"));
+        braced.validate_expanded("agent record").unwrap();
+    }
+
+    fn self_manager(fixture: &Fixture) -> ManagedAgents<'_, Herdr> {
+        ManagedAgents::new(&fixture.herdr, &fixture.root.join("registry"))
+            .unwrap()
+            .with_inherited_workspace(None)
+            .with_cloud_tools(CloudTools {
+                caller_session: Some(SESSION.to_owned()),
+                ambient_session: Some(SESSION.to_owned()),
+                ..fixture.tools()
+            })
+    }
+
+    fn self_options() -> StartOptions {
+        StartOptions {
+            harness: CLOUD_HARNESS.to_owned(),
+            ..StartOptions::default()
+        }
+    }
+
+    #[test]
+    fn attach_self_presents_the_callers_session_without_touching_agentcloud() {
+        let fixture = Fixture::new();
+        fixture.list_row(true);
+        let manager = self_manager(&fixture);
+        let status = manager
+            .attach_self("sub-worker", &fixture.root, self_options())
+            .unwrap();
+        assert_eq!(status["name"], "sub-worker");
+        // No create, send, or halt: only the status listing ran.
+        assert!(
+            fixture.verbs().iter().all(|verb| verb == "list"),
+            "{:?}",
+            fixture.verbs()
+        );
+        let base = fs::canonicalize(&fixture.root)
+            .unwrap()
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        assert_eq!(*fixture.herdr.labels.lock().unwrap(), vec![base]);
+        let commands = fixture.herdr.commands.lock().unwrap().clone();
+        assert_eq!(
+            commands[0].2,
+            strings(&["--ws-url", ENDPOINT, "-s", SESSION])
+        );
+        let record = fixture.record();
+        assert_eq!(record["session_value"], SESSION);
+        assert_eq!(record["lifecycle"], "running");
+        assert_eq!(record["agentcloud"]["attached_self"], true);
+
+        let message = manager
+            .attach_self("sub-again", &fixture.root, self_options())
+            .unwrap_err()
+            .to_string();
+        assert!(
+            message.contains("already registered as \"sub-worker\""),
+            "{message}"
+        );
+        assert!(!fixture.root.join("registry/sub-again").exists());
+
+        // Agents this session starts without an explicit workspace join the attached one.
+        // The fake gives every label the same workspace, so move the attached tab elsewhere.
+        fixture.herdr.panes.lock().unwrap()[0].workspace_id = "self-workspace".to_owned();
+        let mut attached = manager.load("sub-worker").unwrap();
+        attached.workspace_id = Some("self-workspace".to_owned());
+        manager.save(&attached).unwrap();
+        let mut options = fixture.options(None);
+        options.workspace_id = None;
+        fixture.respond(
+            "create",
+            Some("c0ffee00-0000-4000-8000-000000000003\n"),
+            None,
+            None,
+        );
+        manager.start("sub-child", &fixture.root, options).unwrap();
+        let child: Value =
+            agent::read_private_json(&fixture.root.join("registry/sub-child/agent.json")).unwrap();
+        assert_eq!(child["workspace_id"], "self-workspace");
+
+        let stopped = manager.stop("sub-worker").unwrap();
+        assert_eq!(stopped["session_halted"], false);
+        assert_eq!(stopped["session_archived"], false);
+        assert_eq!(stopped["pane_closed"], true);
+        assert!(
+            !fixture
+                .verbs()
+                .iter()
+                .any(|verb| verb == "halt" || verb == "archive"),
+            "stop must never halt or archive the caller's own session: {:?}",
+            fixture.verbs()
+        );
+        assert!(!fixture.root.join("registry/sub-worker").exists());
+    }
+
+    #[test]
+    fn attach_self_is_refused_outside_an_agentcloud_session() {
+        let fixture = Fixture::new();
+        let message = fixture
+            .manager()
+            .attach_self("sub-worker", &fixture.root, self_options())
+            .unwrap_err()
+            .to_string();
+        assert!(
+            message.contains("$AGENTCLOUD_SESSION_ID is unset"),
+            "{message}"
+        );
+        let partial = ManagedAgents::new(&fixture.herdr, &fixture.root.join("registry"))
+            .unwrap()
+            .with_cloud_tools(CloudTools {
+                ambient_session: Some("0b7c9a2e".to_owned()),
+                ..fixture.tools()
+            });
+        let message = partial
+            .attach_self("sub-worker", &fixture.root, self_options())
+            .unwrap_err()
+            .to_string();
+        assert!(message.contains("not a complete session ID"), "{message}");
+        assert!(fixture.calls().is_empty());
+        assert!(fixture.herdr.commands.lock().unwrap().is_empty());
+        assert!(!fixture.root.join("registry/sub-worker").exists());
     }
 }

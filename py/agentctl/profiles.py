@@ -30,7 +30,11 @@ _HARNESSES = frozenset(("codex", "claude", "muse", "agy", "agentcloud"))
 AGENTCLOUD_HARNESS = "agentcloud"
 _CLOUD_DRIVERS = ("native", "claude-code", "codex", "muse-code")
 _CLOUD_TEXT_FIELDS = ("envspec", "purpose", "workspace", "node_id")
-_CLOUD_FIELDS = frozenset(("harness", "provision", *_CLOUD_TEXT_FIELDS))
+_CLOUD_FIELDS = frozenset(("harness", "provision", "title", *_CLOUD_TEXT_FIELDS))
+#: Placeholders the Rust launcher expands in ``title``, ``workspace``, and ``node_id``.
+_CLOUD_PLACEHOLDERS = ("{name}", "{host}", "{fqdn}", "{cwd}")
+#: Fixed sample values that check a template's shape, exactly as the Rust validator does.
+_CLOUD_SAMPLE = {"{name}": "agent", "{host}": "host", "{fqdn}": "host.example", "{cwd}": "/directory"}
 #: Options the launcher sets itself, or that must match every later agentcloud command.
 _CLOUD_RESERVED_OPTIONS = frozenset((
     "--prompt", "--title", "--harness", "--model", "--effort", "--provision", "--envspec",
@@ -279,6 +283,25 @@ def _single_line(value: object) -> bool:
             and not any(character in value for character in "\0\n\r"))
 
 
+def _expand_cloud_template(label: str, field: str, template: str) -> str:
+    """Expand ``template`` with the sample values; refuse any unknown placeholder."""
+    expanded: list[str] = []
+    rest = template
+    while (start := rest.find("{")) >= 0:
+        expanded.append(rest[:start])
+        end = rest.find("}", start)
+        placeholder = rest[start:end + 1] if end >= 0 else ""
+        if placeholder not in _CLOUD_PLACEHOLDERS:
+            raise AgentDeliveryError(
+                f"{label} agentcloud {field} {template!r} has an unknown placeholder; "
+                f"use {', '.join(_CLOUD_PLACEHOLDERS)}"
+            )
+        expanded.append(_CLOUD_SAMPLE[placeholder])
+        rest = rest[start + len(placeholder):]
+    expanded.append(rest)
+    return "".join(expanded)
+
+
 def _agentcloud_settings(name: str, raw: object) -> dict[str, object]:
     """Validate an ``agentcloud`` block with the same rules as the Rust launcher."""
     label = f"profile {name!r}"
@@ -298,13 +321,20 @@ def _agentcloud_settings(name: str, raw: object) -> dict[str, object]:
     if not isinstance(provision, bool):
         raise AgentDeliveryError(f"{label} agentcloud provision must be true or false")
     settings: dict[str, object] = {"harness": driver, "provision": provision}
-    for field in _CLOUD_TEXT_FIELDS:
+    expanded: dict[str, object] = {}
+    for field in (*_CLOUD_TEXT_FIELDS, "title"):
         value = raw.get(field)
-        if value is not None and not _single_line(value):
+        sample = value
+        if isinstance(value, str) and field in ("workspace", "node_id", "title"):
+            sample = _expand_cloud_template(label, field, value)
+        if sample is not None and not _single_line(sample):
             raise AgentDeliveryError(
                 f"{label} agentcloud {field} must be a nonempty single-line string"
             )
-        settings[field] = value
+        expanded[field] = sample
+        # Like the Rust edition, an absent title is omitted rather than listed as null.
+        if field != "title" or value is not None:
+            settings[field] = value
     if not provision and (settings["envspec"] is not None or settings["purpose"] is not None):
         raise AgentDeliveryError(
             f"{label} sets an agentcloud envspec or purpose without provision; "
@@ -314,7 +344,7 @@ def _agentcloud_settings(name: str, raw: object) -> dict[str, object]:
         raise AgentDeliveryError(
             f"{label} cannot both provision a fresh node and bind node_id; choose one"
         )
-    workspace = settings["workspace"]
+    workspace = expanded["workspace"]
     if isinstance(workspace, str) and not workspace.startswith("/"):
         raise AgentDeliveryError(
             f"{label} agentcloud workspace must be an absolute path on the session's node"

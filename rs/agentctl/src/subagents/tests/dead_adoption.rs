@@ -435,6 +435,7 @@ fn dead_adoption_retirement_refuses_a_valid_cloud_record_before_any_control_call
         create_note: None,
         terminal_identity: None,
         halted: false,
+        attached_self: false,
     });
     fixture.manager().save(&record).unwrap();
     let loaded = fixture.manager().load("foreign").unwrap();
@@ -453,6 +454,7 @@ fn dead_adoption_retirement_refuses_a_valid_cloud_record_before_any_control_call
         endpoint: Some("wss://example.invalid/ws".to_owned()),
         endpoint_explicit: true,
         ambient_session: None,
+        hostname: None,
     });
     for skip_cloud_halt in [false, true] {
         let mut assertions = options(&fixture, &record);
