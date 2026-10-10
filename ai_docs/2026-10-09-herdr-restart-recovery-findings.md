@@ -64,3 +64,37 @@ In priority order.
 14. **Validate profiles**: reject a profile whose reasoning effort or model the harness does not accept, at `profiles` time.
 15. **Let a resumed agent re-own its slot**: a `wrkslots rebind` (or an `adopt --replace-dead-owner`) that requires proof the old owner process is gone and the new process runs the same conversation (agentctl's recorded conversation ID).
 16. **who-am-i should take the agent name from the agentctl record for every adapter** (managed, adopted, launch-failed-then-adopted), and recognise every harness agentctl can launch.
+
+## Status
+
+Updated 2026-10-09. The sections above describe the restart; the numbers below
+refer to **Suggested improvements**. These changes are landed on agent-utils
+`main`:
+
+| Suggestions | Delivered | Commit |
+|---|---|---|
+| 1 | Native conversations and launch metadata for new records, shown in list/status | `645f56d9942b5c0320140eb6c531285f61962a60` |
+| 2 | Revive positively dead owned interactive agents and close proved stale tabs | `e9cd2b88669c2a261b1493f5500747c9ab7f8f39` |
+| 3 | Explained stop refusals and exact recovery commands | `25b51acce89071901217830e161dc56feb85253e` |
+| 4 | Retire a positively dead adopted record while preserving the restarted runtime | `113d67dba2ed3936379fe3d8eeb2dc25ff18762a` |
+| 5 | Local interactive `--profile` with native `--resume` | `756f54ea06eb4899e34f9168f7d722c91e7880d8` |
+| 13 | Herdr 0.9.3 Codex readiness, missing foreground argv and Muse adoption | `f281f5cd0f386f9f4d555b227bcff0272c15cb3d` |
+
+`stop --retire-dead-adoption` requires the exact token/raw-record digest and a
+positive kernel proof that the stored harness generation is dead. It archives
+the original record, output and queue/quarantine without runtime or tab effects.
+
+Suggestion **16** is landed in the companion identity tooling as
+`6948411d19af4319ba1946bb7ae4811b91609697`: `who-am-i` resolves agent names
+from managed and adopted agentctl records, including adoption after a failed
+launch, and recognises Muse.
+
+Remaining open:
+
+- **6–7:** pre-update snapshots/handoff guidance and slot/session visibility.
+- **8–10:** identical recovery-note attribution, bridge liveness and doctor
+  revival/orphan guidance.
+- **11:** owned-agent stale-tab closure ships with 2; broader old-pane reuse and
+  cleanup for adopted or unregistered agents remain open.
+- **12, 14–15:** client/server protocol preflight, profile/model validation and
+  conversation-based slot rebinding.
