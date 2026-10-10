@@ -126,7 +126,7 @@ def refuse_pending(manager: ManagedAgents, names: tuple[str, ...]) -> None:
             raise _with_recovery(AgentDeliveryError(
                 f"revive of {journal['name']!r} is incomplete; rerun `agentctl revive {journal['name']}`"
             ), RecoveryAction(
-                "revive", name=journal["name"], token=cast(str, journal["old_token"]),
+                "revive", name=cast(str, journal["name"]), token=cast(str, journal["old_token"]),
             ), stop_reason=f"revive of {journal['name']!r} is incomplete")
 
 

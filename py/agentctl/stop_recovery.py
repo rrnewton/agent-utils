@@ -6,9 +6,9 @@ import os
 import re
 import shlex
 import sys
-from collections.abc import Iterable
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, field
-from typing import NoReturn, TypeVar, overload
+from typing import NoReturn, TypeVar, cast, overload
 
 from agentctl.errors import AgentCtlError, RecoveryAction
 
@@ -117,7 +117,8 @@ class StopRecoveryParser(argparse.ArgumentParser):
             context.completed = None
         context.active.append(current)
         try:
-            result = super().parse_known_args(args, current)
+            # argparse copies `args` with list(); typeshed versions differ on Sequence vs Iterable.
+            result = super().parse_known_args(cast("Sequence[str] | None", args), current)
             context.completed = result[0]
             return result
         finally:
@@ -154,7 +155,7 @@ class StopRecoveryParser(argparse.ArgumentParser):
             context.completed = None
         context.active.append(current)
         try:
-            result = super().parse_known_intermixed_args(args, current)
+            result = super().parse_known_intermixed_args(cast("Sequence[str] | None", args), current)
             context.completed = result[0]
             return result
         finally:
