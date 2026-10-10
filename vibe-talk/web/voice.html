@@ -989,15 +989,38 @@
                 phone screen is not asking for a bigger Reply button, and scaling the row would
                 scale its controls with it. Percent rather than points: it multiplies whatever the
                 stylesheet's own size is, so the two lists stay in proportion.
+
+                `#230 text-size-buttons`. A − and a + either side of the slider, one step of it
+                each, for a thumb that cannot land a five-per-cent drag on a phone. They step by
+                the slider's own step through the slider's own code (`stepMsgScale` in voice.js),
+                and each is disabled at the end it moves towards.
               -->
-              <input
-                id="msg-scale"
-                type="range"
-                min="80"
-                max="150"
-                step="5"
-                aria-label="message text size, percent"
-              />
+              <div class="msg-scale-row">
+                <button
+                  id="msg-scale-smaller"
+                  class="secondary step-button"
+                  type="button"
+                  aria-label="Smaller text"
+                  aria-controls="msg-scale"
+                  title="Smaller text"
+                >−</button>
+                <input
+                  id="msg-scale"
+                  type="range"
+                  min="80"
+                  max="150"
+                  step="5"
+                  aria-label="message text size, percent"
+                />
+                <button
+                  id="msg-scale-larger"
+                  class="secondary step-button"
+                  type="button"
+                  aria-label="Larger text"
+                  aria-controls="msg-scale"
+                  title="Larger text"
+                >+</button>
+              </div>
               <p id="msg-scale-state" class="hint" aria-live="polite"></p>
             </section>
 

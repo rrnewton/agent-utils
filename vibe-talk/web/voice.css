@@ -2231,6 +2231,48 @@ body {
   accent-color: var(--accent);
 }
 
+/* `#230 text-size-buttons`. The text size slider between its − and +, on ONE line at every width:
+   no `flex-wrap`, so the + can never fall under the slider on its own. Each button keeps a 44px
+   square (2.75rem at the page's 16px root, which the reader's text size does not touch: that
+   scales message text only) and the slider takes the rest, still about two hundred pixels of track
+   on a 360px phone. The slider loses the generic field box for the reason #reading-width does. */
+.msg-scale-row {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+}
+
+.msg-scale-row #msg-scale {
+  flex: 1 1 auto;
+  min-width: 0;
+  display: block;
+  padding: 0.35rem 0;
+  background: none;
+  border: none;
+  accent-color: var(--accent);
+}
+
+/* The page's quiet `secondary` button, square, with the sign large enough to read as one. Two
+   quick presses must be two steps, never a double-tap zoom, hence `touch-action`. The ring is the
+   accent outside the button, as in the dock, so it shows on the panel colour the button is. */
+.step-button {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 2.75rem;
+  height: 2.75rem;
+  padding: 0;
+  font-size: 1.35rem;
+  line-height: 1;
+  touch-action: manipulation;
+}
+
+.step-button:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
 /* Shown once and then gone; the same text stays reachable from Settings. */
 /* The small type is on the TEXT, not on the box around it. That reads like a nicety and is not
    one: the desktop regime caps this box in `ch`, and `ch` is resolved against the element's OWN

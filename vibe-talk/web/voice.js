@@ -81,6 +81,7 @@ const ACTIVE_CHANNEL_KEY = "vibe-talk.voice.active-channel";
  *   | "help-link-reading-width" | "help-link-resuming" | "help-link-speech-prep"
  *   | "help-link-storage" | "jump-marker" | "jump-newest" | "link-kind-action" | "link-kind-commit"
  *   | "link-kind-pr" | "links-filter" | "load-older" | "load-older-turns"
+ *   | "msg-scale-larger" | "msg-scale-smaller"
  *   | "open-add-channel" | "open-browse-channels" | "open-help" | "open-settings"
  *   | "pinned-filter" | "post-confirm-cancel" | "post-confirm-send" | "prompts-open" | "read-aloud" | "read-new" | "read-speed" | "remove-channel"
  *   | "rename-channel" | "reply-cancel" | "reply-context-more" | "reply-send" | "save-alias"
@@ -6410,6 +6411,8 @@ function renderControlBar() {
 const MIN_MSG_SCALE = 80;
 const MAX_MSG_SCALE = 150;
 const DEFAULT_MSG_SCALE = 100;
+/** The slider's `step` in web/voice.html, and what one press of its − or + moves it by. */
+const MSG_SCALE_STEP = 5;
 
 const clampMsgScale = (value) => {
   const n = Math.round(Number(value));
@@ -6419,11 +6422,17 @@ const clampMsgScale = (value) => {
   return Math.min(MAX_MSG_SCALE, Math.max(MIN_MSG_SCALE, n));
 };
 
-/** Put a type size on the page, and return the one actually applied, which is the clamped one. */
+/**
+ * Put a type size on the page, and return the one actually applied, which is the clamped one.
+ * The − and + beside the slider are disabled at the end each moves towards, here, so that they are
+ * right after a drag and at load as well as after a press of one of them.
+ */
 function applyMsgScale(value) {
   const pct = clampMsgScale(value);
   document.documentElement.style.setProperty("--msg-scale", String(pct / 100));
   el("msg-scale").value = String(pct);
+  el("msg-scale-smaller").disabled = pct <= MIN_MSG_SCALE;
+  el("msg-scale-larger").disabled = pct >= MAX_MSG_SCALE;
   return pct;
 }
 
@@ -6445,6 +6454,27 @@ function msgScaleChanged(value) {
     ? `Saved — message text at ${pct}% of its usual size.`
     : "This browser refused to store the text size, so it will be forgotten when you reload " +
       `(private browsing does this). Message text is at ${pct}% until then.`;
+}
+
+/**
+ * `#230 text-size-buttons`. One step of the slider, down (-1) or up (+1): what its − and + do.
+ *
+ * Through `msgScaleChanged`, the slider's own path, so a press is applied, kept and said exactly as
+ * a drag to the same place is. It lands on one of the slider's marks: from a size between two (a
+ * hand-edited 83 in storage), the next mark that way, as the slider's own `stepUp` and `stepDown`
+ * would. A held button does not repeat: one press, one step, and the slider is there for a big move.
+ *
+ * @param {1 | -1} direction
+ */
+function stepMsgScale(direction) {
+  const marks = (clampMsgScale(el("msg-scale").value) - MIN_MSG_SCALE) / MSG_SCALE_STEP;
+  const mark = direction > 0 ? Math.floor(marks) + 1 : Math.ceil(marks) - 1;
+  const button = el(direction > 0 ? "msg-scale-larger" : "msg-scale-smaller");
+  const held = document.activeElement === button;
+  msgScaleChanged(MIN_MSG_SCALE + mark * MSG_SCALE_STEP);
+  // A button disabled under the focus drops it, and the keyboard is left on nothing. The slider
+  // between the two takes it, which says the size it is at and moves on with the arrows.
+  if (held && button.disabled) el("msg-scale").focus();
 }
 
 const MIN_READING_CH = 45;
@@ -22688,6 +22718,8 @@ applyEnterSends(storedEnterSends());
 loadPlaceMarker();
 el("reading-width").addEventListener("input", () => readingWidthChanged(el("reading-width").value));
 el("msg-scale").addEventListener("input", () => msgScaleChanged(el("msg-scale").value));
+el("msg-scale-smaller").addEventListener("click", () => stepMsgScale(-1));
+el("msg-scale-larger").addEventListener("click", () => stepMsgScale(1));
 el("width-grip").addEventListener("pointerdown", onGripDown);
 el("width-grip").addEventListener("pointermove", onGripMove);
 el("width-grip").addEventListener("pointerup", onGripUp);

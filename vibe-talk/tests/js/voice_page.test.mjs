@@ -2978,6 +2978,10 @@ const TUNING_BANDS = {
     "they belong to and one message fills the screen"],
   DEFAULT_MSG_SCALE: [80, 150,
     "what an unconfigured reader gets, and it has to be a size that is actually offered"],
+  MSG_SCALE_STEP: [1, 10,
+    "one press of the − or + beside the slider (`#230 text-size-buttons`), and the slider's own " +
+    "step. Past ten per cent a press jumps the size a reader was trying to fine-tune, and the " +
+    "range holds only a handful of sizes"],
   MIN_READ_SPEED: [25, 100,
     "the slowest a message may be read, as a percentage of the agent's own pace. Much below half " +
     "and the words stop being words, which is a vendor request nobody wanted to pay for"],
@@ -6918,6 +6922,172 @@ test("the reader can resize MESSAGE text, and it survives a reload", async () =>
     /#discord-log \.body[\s\S]{0,80}--msg-scale/,
     "the type scale does not reach the message body"
   );
+});
+
+// `#230 text-size-buttons`. The owner: "Put a plus and minus button next to the text size control in
+// the settings." A − before the slider and a + after it, each one step of the slider, through the
+// slider's own code, and disabled at the end it moves towards.
+
+const MSG_SCALE_STORE = "vibe-talk.voice.msg-scale";
+const scaleOf = (page) => page.documentElement.style.getPropertyValue("--msg-scale");
+
+test("the text size slider has a − before it and a + after it on one row, each named for a screen reader", () => {
+  const group = settingsGroup("Text size");
+  const row = /<div class="msg-scale-row">([\s\S]*?)<\/div>/.exec(group);
+  assert.ok(row, "the slider and its two buttons are not one row");
+  const order = [...row[1].matchAll(/\bid="([^"]+)"/g)].map((m) => m[1]);
+  assert.deepEqual(order, ["msg-scale-smaller", "msg-scale", "msg-scale-larger"], "not −, slider, + in that order");
+  for (const [id, name, sign] of [["msg-scale-smaller", "Smaller text", "−"], ["msg-scale-larger", "Larger text", "+"]]) {
+    const button = new RegExp(`<button([^>]*\\bid="${id}"[^>]*)>([^<]*)</button>`).exec(row[1]);
+    assert.ok(button, `#${id} is not a button`);
+    assert.match(button[1], /\btype="button"/, `#${id} is not type="button"`);
+    assert.match(button[1], new RegExp(`\\baria-label="${name}"`), `#${id} is not called "${name}"`);
+    assert.match(button[1], /\baria-controls="msg-scale"/, `#${id} does not say which control it moves`);
+    assert.match(button[1], /\bclass="secondary step-button"/, `#${id} is not the page's own quiet button`);
+    assert.equal(button[2].trim(), sign, `#${id} does not show its sign`);
+  }
+  // One step, and the ends, said once in the markup and once in the script: the two must agree.
+  const slider = /<input([^>]*\bid="msg-scale"[^>]*)>/.exec(group)[1];
+  for (const [attribute, constant] of [["min", "MIN_MSG_SCALE"], ["max", "MAX_MSG_SCALE"], ["step", "MSG_SCALE_STEP"]]) {
+    const markup = (new RegExp(`\\b${attribute}="(\\d+)"`).exec(slider) || [])[1];
+    const script = (new RegExp(`const ${constant} = (\\d+);`).exec(SCRIPT) || [])[1];
+    assert.ok(markup !== undefined && script !== undefined, `the slider's ${attribute} or ${constant} is gone`);
+    assert.equal(markup, script, `the slider's ${attribute} and ${constant} disagree`);
+  }
+  // The usual size and the largest are whole steps from the smallest, so every press lands on a mark.
+  for (const name of ["DEFAULT_MSG_SCALE", "MAX_MSG_SCALE"]) {
+    assert.equal((sourceConstant(name) - sourceConstant("MIN_MSG_SCALE")) % sourceConstant("MSG_SCALE_STEP"), 0,
+      `${name} is not a whole number of steps from MIN_MSG_SCALE`);
+  }
+});
+
+test("− and + move the text size one step of the slider, exactly as a drag to the same place does", async () => {
+  const page = newPage();
+  await signIn(page);
+  await page.el("open-settings").click();
+  assert.equal(page.el("msg-scale").value, "100");
+
+  await page.el("msg-scale-larger").click();
+  assert.equal(scaleOf(page), "1.05", "+ did not make the message text larger by one step");
+  assert.equal(page.el("msg-scale").value, "105", "the slider did not follow the button");
+  assert.equal(page.storage.get(MSG_SCALE_STORE), "105", "the step was not kept");
+  assert.equal(page.el("msg-scale-state").textContent, "Saved — message text at 105% of its usual size.");
+
+  // Everything a drag to 105 does, to the letter: one path, not a second copy of it.
+  const dragged = newPage();
+  await signIn(dragged);
+  await dragged.el("msg-scale").setValue("105");
+  for (const [what, read] of [
+    ["applied size", scaleOf],
+    ["slider", (p) => p.el("msg-scale").value],
+    ["stored size", (p) => p.storage.get(MSG_SCALE_STORE)],
+    ["line under the slider", (p) => p.el("msg-scale-state").textContent],
+  ]) {
+    assert.equal(read(page), read(dragged), `a press and a drag to the same size differ in the ${what}`);
+  }
+
+  await page.el("msg-scale-smaller").click();
+  await page.el("msg-scale-smaller").click();
+  assert.equal(scaleOf(page), "0.95", "two presses of − did not make the message text two steps smaller");
+  assert.equal(page.el("msg-scale").value, "95");
+  assert.equal(page.storage.get(MSG_SCALE_STORE), "95");
+  assert.equal(page.el("msg-scale-state").textContent, "Saved — message text at 95% of its usual size.");
+
+  // A reload keeps what the buttons chose.
+  const again = newPage(page.storage);
+  assert.equal(scaleOf(again), "0.95", "a size chosen with the buttons did not survive a reload");
+  assert.equal(again.el("msg-scale").value, "95");
+
+  // And a browser that keeps nothing is owned up to after a press as after a drag.
+  page.storage.set = () => page.storage;
+  await page.el("msg-scale-larger").click();
+  assert.equal(scaleOf(page), "1", "a refused store stopped the step being applied");
+  assert.match(page.el("msg-scale-state").textContent, /refused to store the text size/);
+});
+
+test("− is disabled at the smallest size and + at the largest, from load on, and neither steps past its end", async () => {
+  const page = newPage();
+  await signIn(page);
+  assert.equal(page.el("msg-scale-smaller").disabled, false, "− is dead at the usual size");
+  assert.equal(page.el("msg-scale-larger").disabled, false, "+ is dead at the usual size");
+
+  await page.el("msg-scale").setValue("145");
+  await page.el("msg-scale-larger").click();
+  assert.equal(scaleOf(page), "1.5");
+  assert.equal(page.el("msg-scale-larger").disabled, true, "+ is still live at the largest size");
+  assert.equal(page.el("msg-scale-smaller").disabled, false, "− died at the largest size");
+  // A browser sends a disabled button no click; were one to arrive, the size still stops at the end.
+  await page.el("msg-scale-larger").click();
+  assert.equal(scaleOf(page), "1.5", "+ stepped past the largest size");
+  assert.equal(page.storage.get(MSG_SCALE_STORE), "150");
+
+  // A drag decides them as well: away from the end, + is live again.
+  await page.el("msg-scale").setValue("85");
+  assert.equal(page.el("msg-scale-larger").disabled, false, "a drag away from the end left + disabled");
+  await page.el("msg-scale-smaller").click();
+  assert.equal(scaleOf(page), "0.8");
+  assert.equal(page.el("msg-scale-smaller").disabled, true, "− is still live at the smallest size");
+  await page.el("msg-scale-smaller").click();
+  assert.equal(scaleOf(page), "0.8", "− stepped past the smallest size");
+  await page.el("msg-scale").setValue("900");
+  assert.equal(page.el("msg-scale-smaller").disabled, false);
+  assert.equal(page.el("msg-scale-larger").disabled, true, "a size clamped to the largest left + live");
+
+  // At load, from what was stored, a size from outside the range included.
+  for (const [stored, smaller, larger] of [["80", true, false], ["150", false, true], ["900", false, true],
+    ["10", true, false], ["100", false, false]]) {
+    const loaded = newPage(new Map([[MSG_SCALE_STORE, stored]]));
+    assert.equal(loaded.el("msg-scale-smaller").disabled, smaller, `− at load with ${stored} stored`);
+    assert.equal(loaded.el("msg-scale-larger").disabled, larger, `+ at load with ${stored} stored`);
+  }
+
+  // A size between two marks (a hand-edited 83) steps to the next mark that way, not to 88 or 78.
+  for (const [id, applied] of [["msg-scale-larger", "0.85"], ["msg-scale-smaller", "0.8"]]) {
+    const between = newPage(new Map([[MSG_SCALE_STORE, "83"]]));
+    await signIn(between);
+    await between.el(id).click();
+    assert.equal(scaleOf(between), applied, `#${id} from 83 did not land on the slider's next mark`);
+  }
+});
+
+test("a step button disabled under the keyboard hands the focus to the slider; one still live keeps it", async () => {
+  const page = newPage();
+  await signIn(page);
+  await page.el("open-settings").click();
+  const slider = page.el("msg-scale");
+  const larger = page.el("msg-scale-larger");
+  await slider.setValue("140");
+  larger.focusFrom("keyboard");
+  await larger.click();
+  assert.equal(page.document.activeElement, larger, "a press that left + live took the focus off it");
+  await larger.click();
+  assert.equal(larger.disabled, true);
+  assert.equal(page.document.activeElement, slider, "the focus was left on a disabled +, which is nowhere");
+
+  // Safari gives a clicked button no focus. Then there is nothing to hand on, and nothing is taken.
+  const smaller = page.el("msg-scale-smaller");
+  await slider.setValue("85");
+  slider.blur();
+  await smaller.click();
+  assert.equal(smaller.disabled, true);
+  assert.equal(page.document.activeElement, null, "a press with the focus elsewhere moved the focus");
+});
+
+test("the − and + are thumb-sized squares that never wrap off the slider's row, with a ring for the keyboard", () => {
+  const row = cssBlock(".msg-scale-row");
+  assert.match(row, /display:\s*flex/, "the slider and its buttons are not laid out as a row");
+  assert.doesNotMatch(row, /flex-wrap:\s*wrap/, "the row may wrap, leaving + under the slider on a phone");
+  const slider = cssBlock(".msg-scale-row #msg-scale");
+  assert.match(slider, /flex:\s*1 1 auto/, "the slider does not take the room the buttons leave");
+  assert.match(slider, /min-width:\s*0/, "the slider cannot shrink, so the row overflows a narrow phone");
+  const button = cssBlock(".step-button");
+  assert.match(button, /flex:\s*0 0 auto/, "the slider can squeeze a button below its target");
+  for (const side of ["width", "height"]) {
+    const rem = new RegExp(`(?:^|[\\s;])${side}:\\s*([\\d.]+)rem`).exec(button);
+    assert.ok(rem && Number(rem[1]) * 16 >= 44, `the buttons' ${side} is under a 44px target`);
+  }
+  assert.match(button, /touch-action:\s*manipulation/, "two quick presses can zoom the page instead");
+  assert.match(cssBlock(".step-button:focus-visible"), /outline:\s*2px solid var\(--accent\)/, "no ring for the keyboard");
 });
 
 // --- reading a message aloud ------------------------------------------------------------------
@@ -17286,6 +17456,33 @@ test("ON A PICKER the arrows and Space are the picker's, and the page keys page 
   event = await press(page, grip, "PageDown");
   assert.equal(event.defaulted, false, "the width handle no longer answers its own keys");
   assert.equal(focused(page), grip, "a key the width handle answered moved the focus");
+});
+
+test("the text size takes no key of its own: Ctrl or Cmd with = or - is the browser's zoom, and − and + keep Enter and Space", async () => {
+  // `#230 text-size-buttons`. The natural chords for "bigger text" are the browser's zoom, which
+  // the reader must keep, and a single key for it would be one more to press by accident. So no
+  // key: the − and + are a Tab away on Settings (`,`), and the slider between them steps on arrows.
+  const page = await keyboardPage();
+  const before = scaleOf(page);
+  for (const key of ["=", "-", "+", "0"]) {
+    for (const mod of ["ctrlKey", "metaKey"]) {
+      const event = await press(page, page.el("scroll-area"), key, { [mod]: true });
+      assert.equal(event.defaulted, true, `${mod} with ${JSON.stringify(key)} was taken from the browser's zoom`);
+    }
+  }
+  assert.equal(scaleOf(page), before, "a zoom chord changed the message text size");
+  const table = /const KEYMAP = \[([\s\S]*?)\n\];/.exec(SCRIPT_CODE);
+  assert.ok(table, "web/voice.js has no KEYMAP table");
+  assert.doesNotMatch(table[1], /msg-scale|MsgScale/, "the keymap took a key for the text size");
+  await page.el("open-settings").click();
+  for (const id of ["msg-scale-smaller", "msg-scale-larger"]) {
+    for (const key of ["Enter", " "]) {
+      const event = await press(page, page.el(id), key);
+      assert.equal(event.defaulted, true, `${JSON.stringify(key)} on #${id} was taken from the button`);
+      assert.equal(focused(page), page.el(id), `${JSON.stringify(key)} on #${id} moved the focus`);
+      assert.equal(page.screen(), "settings", `${JSON.stringify(key)} on #${id} left Settings`);
+    }
+  }
 });
 
 test("IN A MESSAGE BOX the box keeps its keys, but a page key pages the list when the box has nothing to page", async () => {
