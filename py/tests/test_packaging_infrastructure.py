@@ -848,9 +848,11 @@ def test_wrkslots_lifecycle_partitions_are_disjoint_and_complete() -> None:
     # The two clean-caches tests of 96d9f268 (unpacked Cargo package sources and
     # unmarked wildcard matches are kept; a nested Git repository under an
     # unmarked match is still refused) are mapped.
-    assert len(all_tests) == 1875
+    # The user-systemd per-listing bound regression test of
+    # https://github.com/rrnewton/agent-utils/issues/235 is mapped.
+    assert len(all_tests) == 1876
     assert len(ordinary) == 290
-    assert len(mapped) == 1585
+    assert len(mapped) == 1586
     assert {
         node.split("::", 1)[1].split("[", 1)[0] for node in ordinary
     } == {
