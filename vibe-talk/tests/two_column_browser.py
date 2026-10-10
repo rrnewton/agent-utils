@@ -392,7 +392,11 @@ def columns_walk(desk: Desk) -> None:
     desk.check(not narrow.drawn("toggle"), "the layout button is drawn at 900px")
     desk.check(narrow.drawn("grip"), "the reading-width handle did not come back")
     page.set_viewport_size({"width": desk.width, "height": desk.height})
-    desk.wait_for("() => document.getElementById('side-column').getClientRects().length > 0",
+    # The stylesheet draws the right column the moment the window is wide again; the page decides two
+    # columns at the next frame, and its picker greying out is what says it has.
+    desk.wait_for("() => document.getElementById('side-column').getClientRects().length > 0"
+                  " && document.getElementById('thread-select').disabled"
+                  " && document.querySelectorAll('#discord-log > li[data-id]').length === 11",
                   "widening the window again did not bring two columns back")
     desk.wait_for("() => document.querySelectorAll('#side-log > li[data-id]').length === 4",
                   "widening again lost the thread selected")
