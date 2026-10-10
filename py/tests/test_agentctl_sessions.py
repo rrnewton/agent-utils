@@ -5,6 +5,7 @@ import fcntl
 import json
 import os
 import re
+import shlex
 import subprocess
 import sys
 from collections.abc import Callable
@@ -15,9 +16,11 @@ from typing import cast
 
 import pytest
 
-from agentctl import cli, mcp
+from agentctl import cli, legacy_cli, mcp
 from agentctl.client import CustomProcessIdentity, HerdrClient, Pane
-from agentctl.errors import AgentDeliveryError
+from agentctl.errors import (
+    AgentCtlError, AgentDeliveryError, AgentPending, AgentPossiblySubmitted, HerdrUnavailable,
+)
 from agentctl.profiles import (
     configuration_root,
     load_configuration, load_profiles, validate_muse_headless_arguments,
@@ -991,3 +994,130 @@ def test_cwd_profiles_win_and_missing_profiles_name_both_paths(tmp_path: Path) -
     assert configuration_root(bare, project / "registry", absent_ok=True) == bare.resolve()
     with pytest.raises(AgentDeliveryError, match="profile config does not exist"):
         load_profiles(configuration_root(bare, project / "registry"))
+
+
+def _cli_stop_recovery_argv(stderr: str) -> list[str]:
+    commands = [line.removeprefix("Recovery command: ") for line in stderr.splitlines()
+                if line.startswith("Recovery command: ")]
+    assert len(commands) == 1
+    return shlex.split(commands[0])
+
+
+@pytest.mark.parametrize("edition", ["primary", "legacy"])
+@pytest.mark.parametrize("suffix_globals", [False, True])
+@pytest.mark.parametrize("case", ["unknown", "missing-token-value", "bad-value"])
+def test_stop_refusal_parser_context_keeps_parsed_globals_without_registry_access(
+    edition: str, suffix_globals: bool, case: str, tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+) -> None:
+    registry = tmp_path / "registry space's $(literal)"
+    binary = "--herdr path's $(literal)"
+    selected = ["--registry=" + str(registry), "--herdr-bin=" + binary]
+    prefix = ["--registry=unused-registry", "--herdr-bin=unused-herdr"] if suffix_globals else selected
+    options = selected if suffix_globals else []
+    if case == "unknown":
+        invalid = ["--unknown-stop-option"]
+    elif case == "missing-token-value":
+        invalid = ["--expected-token"]
+    elif edition == "primary":
+        invalid = ["--recover-legacy-adoption=unexpected-value"]
+    else:
+        invalid = ["--ready-timeout=not-a-number"]
+
+    def no_client(**_kwargs: object) -> HerdrClient:
+        raise AssertionError("syntax failure must not allocate a runtime client")
+
+    monkeypatch.setattr(cli, "HerdrClient", no_client)
+    monkeypatch.setattr(legacy_cli, "HerdrClient", no_client)
+    run = cli.main if edition == "primary" else legacy_cli.main
+    with pytest.raises(SystemExit) as error:
+        run([*prefix, "stop", "worker", *options, *invalid])
+    assert error.value.code == 2
+    captured = capsys.readouterr()
+    assert "usage:" in captured.err and ": error:" in captured.err
+    assert _cli_stop_recovery_argv(captured.err) == [
+        "agentctl", "--registry=" + str(registry), "--herdr-bin=" + binary, "doctor",
+    ]
+    assert not registry.exists() and captured.out == ""
+
+
+@pytest.mark.parametrize("edition", ["primary", "legacy"])
+def test_stop_refusal_missing_name_keeps_usage_status_and_selected_registry(
+    edition: str, tmp_path: Path, capsys: pytest.CaptureFixture[str],
+) -> None:
+    registry = tmp_path / "unused-registry"
+    run = cli.main if edition == "primary" else legacy_cli.main
+    if edition == "primary":
+        with pytest.raises(SystemExit) as error:
+            run(["--registry", str(registry), "stop"])
+        assert error.value.code == 2
+    else:
+        assert run(["--registry", str(registry), "stop"]) == 2
+    captured = capsys.readouterr()
+    assert _cli_stop_recovery_argv(captured.err) == [
+        "agentctl", "--registry=" + str(registry), "--herdr-bin=herdr", "doctor",
+    ]
+    assert not registry.exists() and captured.out == ""
+
+
+@pytest.mark.parametrize("edition", ["primary", "legacy"])
+def test_stop_refusal_parser_does_not_treat_a_literal_stop_as_the_command(
+    edition: str, capsys: pytest.CaptureFixture[str],
+) -> None:
+    run = cli.main if edition == "primary" else legacy_cli.main
+    with pytest.raises(SystemExit) as error:
+        run(["--registry=stop", "send", "worker", "--unknown-option"])
+    assert error.value.code == 2
+    assert "Recovery command:" not in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("edition", ["primary", "legacy"])
+@pytest.mark.parametrize("error,status", [
+    (HerdrUnavailable(), 69), (AgentDeliveryError("  "), 75), (AgentCtlError(), 1),
+    (ValueError(), 2), (TypeError(), 2), (OSError(), 2),
+    (AgentPending("", message_id="pending", artifact="pending.json"), 75),
+    (AgentPossiblySubmitted("", message_id="uncertain", artifact="uncertain.json"), 76),
+])
+def test_stop_refusal_empty_errors_keep_all_exit_statuses_and_queue_outcomes(
+    edition: str, error: BaseException, status: int, tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+) -> None:
+    class RefusingBackend:
+        def stop(self, _name: str, **_options: object) -> dict[str, object]:
+            raise error
+
+    backend = RefusingBackend()
+    monkeypatch.setattr(cli, "Sessions", lambda *_args, **_kwargs: backend)
+    monkeypatch.setattr(legacy_cli, "ManagedAgents", lambda *_args, **_kwargs: backend)
+    run = cli.main if edition == "primary" else legacy_cli.main
+    registry = tmp_path / "unused-registry"
+    assert run(["--registry", str(registry), "stop", "worker"]) == status
+    captured = capsys.readouterr()
+    assert "stop refused without a reason" in captured.err
+    assert _cli_stop_recovery_argv(captured.err)[3:] == ["doctor"]
+    if isinstance(error, (AgentPending, AgentPossiblySubmitted)):
+        outcome = json.loads(captured.out)
+        assert outcome["outcome"] == error.outcome
+        assert outcome["safe_to_retry"] is isinstance(error, AgentPending)
+    else:
+        assert captured.out == ""
+    assert not registry.exists()
+
+
+def test_stop_refusal_headless_unavailable_keeps_record_and_prints_doctor(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+) -> None:
+    sessions, fake, _calls = setup(tmp_path, monkeypatch)
+    sessions.start_session("worker", cwd=str(tmp_path), mode="headless", backend="tmux")
+    before = (sessions.registry / "worker/agent.json").read_bytes()
+
+    def unavailable(_record: AgentRecord, _action: str, **_options: object) -> dict[str, object]:
+        raise HerdrUnavailable("headless worker control unavailable")
+
+    monkeypatch.setattr(sessions, "_worker", unavailable)
+    monkeypatch.setattr(cli, "Sessions", lambda *_args, **_kwargs: sessions)
+    assert cli.main(["--registry", str(sessions.registry), "stop", "worker"]) == 69
+    captured = capsys.readouterr()
+    assert "headless worker control unavailable" in captured.err
+    assert _cli_stop_recovery_argv(captured.err)[3:] == ["doctor"]
+    assert (sessions.registry / "worker/agent.json").read_bytes() == before and fake.closed == []

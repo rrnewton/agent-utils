@@ -22,7 +22,8 @@ from collections.abc import Mapping, Sequence
 from pathlib import Path
 
 from herdr_agent_differential import (
-    FIXTURE_HERDR, Harness, Outcome, PairCase, Report, _queue_snapshot, _revive_interop, _state,
+    FIXTURE_HERDR, Harness, Outcome, PairCase, Report, _option_values, _queue_snapshot, _revive_interop, _state,
+    _stop_recovery_arguments,
     init_case_repository,
 )
 
@@ -112,6 +113,10 @@ def _pair(harness: Harness, report: Report, case: PairCase, label: str,
                    and _json(python) == _json(rust)
                    and (python.stderr == rust.stderr if expected == 0 else True),
                    f"expected rc {expected}; python={python!r} rust={rust!r}")
+    if arguments and arguments[0] == "stop" and expected != 0:
+        report.require(label + "/recovery-command",
+                       all(_stop_recovery_arguments(outcome) is not None for outcome in (python, rust)),
+                       f"stop refusal omitted its reason or copyable command: {python!r} {rust!r}")
     return python, rust
 
 
@@ -1614,6 +1619,51 @@ def _managed_dead_recovery(harness: Harness, report: Report) -> None:
         json.loads((root / "registry/worker/agent.json").read_text(encoding="utf-8"))["token"]
         for root in (case.python_root, case.rust_root)
     ]
+    recovery_arguments = [_stop_recovery_arguments(outcome) for outcome in refused]
+    report.require(
+        "primary/managed-dead/exact-recovery-command",
+        all(arguments is not None and "stop" in arguments and "worker" in arguments
+            for arguments in recovery_arguments)
+        and all(
+            _option_values(arguments or (), "--registry") == ["<ROOT>/registry"]
+            and _option_values(arguments or (), "--herdr-bin") == ["<ROOT>/fake-herdr"]
+            and _option_values(arguments or (), "--expected-token") == [token]
+            for arguments, token in zip(recovery_arguments, tokens, strict=True)
+        ),
+        f"recovery command lost its trusted token or selected globals: {refused!r}",
+    )
+    original_records: list[tuple[Path, bytes]] = []
+    for root in (case.python_root, case.rust_root):
+        path = root / "registry/worker/agent.json"
+        original = path.read_bytes()
+        original_records.append((path, original))
+        document = json.loads(original)
+        document["token"] += "-replacement"
+        path.write_text(json.dumps(document), encoding="utf-8")
+    stale_retries = [
+        harness._invoke_one(command, root, arguments[1:])
+        if arguments is not None else Outcome(1, "", "missing recovery command")
+        for command, root, arguments in zip(
+            (harness.python, harness.rust),
+            (case.python_root, case.rust_root), recovery_arguments, strict=True,
+        )
+    ]
+    report.require(
+        "primary/managed-dead/stale-advice-preserves-replacement",
+        all(outcome.returncode == 75 for outcome in stale_retries)
+        and all(
+            (arguments := _stop_recovery_arguments(outcome)) is not None
+            and arguments[-1] == "doctor"
+            and not _option_values(arguments, "--expected-token")
+            for outcome in stale_retries
+        )
+        and all((root / "registry/worker/agent.json").is_file()
+                and not _state(root).get("closed_panes")
+                for root in (case.python_root, case.rust_root)),
+        f"stale advice acquired a replacement generation: {stale_retries!r}",
+    )
+    for path, original in original_records:
+        path.write_bytes(original)
     _change(case, {"fail_read": True})
     capture_failures = [
         harness._invoke_one(command, root, (
@@ -1732,15 +1782,12 @@ def _managed_dead_recovery(harness: Harness, report: Report) -> None:
         document["lifecycle"] = "running"
         path.write_text(json.dumps(document), encoding="utf-8")
     outcomes = []
-    for command, root in (
-        (harness.python, case.python_root), (harness.rust, case.rust_root),
+    for command, root, arguments in zip(
+        (harness.python, harness.rust), (case.python_root, case.rust_root),
+        recovery_arguments, strict=True,
     ):
-        token = json.loads(
-            (root / "registry/worker/agent.json").read_text(encoding="utf-8")
-        )["token"]
-        outcomes.append(harness._invoke_one(command, root, (
-            "stop", "worker", "--expected-token", token, *_COMMON,
-        )))
+        outcomes.append(harness._invoke_one(command, root, arguments[1:])
+                        if arguments is not None else Outcome(1, "", "missing recovery command"))
     report.require(
         "primary/managed-dead/recovery-parity",
         all(outcome.returncode == 0 for outcome in outcomes)
@@ -1752,6 +1799,59 @@ def _managed_dead_recovery(harness: Harness, report: Report) -> None:
             for root in (case.python_root, case.rust_root)
         ),
         f"managed-dead retirement diverged: {outcomes!r}",
+    )
+
+
+def _stop_recovery_quoted_globals(harness: Harness, report: Report) -> None:
+    """Execute refusal advice with literal spaces, quotes, and shell characters."""
+    case = harness.case("primary-stop-quoted-globals")
+    registry = "private state's $(literal); registry"
+    executable = "fake herdr's $(literal); executable"
+    common = (f"--registry=<ROOT>/{registry}", f"--herdr-bin=<ROOT>/{executable}")
+    for root in (case.python_root, case.rust_root):
+        shutil.copyfile(root / "fake-herdr", root / executable)
+        (root / executable).chmod(0o700)
+    outcomes = harness.invoke(case, (
+        "start", "worker", "--cwd", "<ROOT>", "--workspace-id", "w1", *common,
+    ))
+    report.require("primary/stop/quoted-globals/start", all(outcome.returncode == 0 for outcome in outcomes),
+                   f"fixture could not start with literal globals: {outcomes!r}")
+    if any(outcome.returncode != 0 for outcome in outcomes):
+        return
+    _change(case, {"empty_shell": True, "sessionless": True})
+    refused = harness.invoke(case, ("stop", "worker", *common))
+    commands = [_stop_recovery_arguments(outcome) for outcome in refused]
+    tokens = [
+        json.loads((root / registry / "worker/agent.json").read_text(encoding="utf-8"))["token"]
+        for root in (case.python_root, case.rust_root)
+    ]
+    report.require(
+        "primary/stop/quoted-globals/advice",
+        all(outcome.returncode == 75 for outcome in refused)
+        and all(
+            arguments is not None
+            and _option_values(arguments, "--registry") == [f"<ROOT>/{registry}"]
+            and _option_values(arguments, "--herdr-bin") == [f"<ROOT>/{executable}"]
+            and _option_values(arguments, "--expected-token") == [token]
+            for arguments, token in zip(commands, tokens, strict=True)
+        ),
+        f"quoted recovery advice changed a literal value: {refused!r}",
+    )
+    recovered = [
+        harness._invoke_one(command, root, arguments[1:])
+        if arguments is not None else Outcome(1, "", "missing recovery command")
+        for command, root, arguments in zip(
+            (harness.python, harness.rust), (case.python_root, case.rust_root), commands, strict=True,
+        )
+    ]
+    report.require(
+        "primary/stop/quoted-globals/execute",
+        all(outcome.returncode == 0 for outcome in recovered)
+        and all(not (root / registry / "worker").exists()
+                and _state(root).get("closed_panes") == ["w1:p1"]
+                and len(list((root / registry / "archive").glob("*/agent.json"))) == 1
+                for root in (case.python_root, case.rust_root)),
+        f"printed advice could not recover the selected registry: {recovered!r}",
     )
 
 
@@ -2066,11 +2166,30 @@ def _invalid_cli(harness: Harness, report: Report) -> None:
         ("legacy-hash-without-recovery", (
             "stop", "worker", "--expected-record-sha256", "0" * 64, *FIXTURE_HERDR,
         )),
+        ("stop-missing-name", (*_COMMON, "stop")),
+        ("stop-unknown-option", (*_COMMON, "stop", "worker", "--unrecognized")),
+        ("stop-missing-option-value", (*_COMMON, "stop", "worker", "--expected-token")),
     ):
         outcomes = harness.invoke(case, arguments)
         report.require(f"primary/cli/{label}", all(outcome.returncode == 2
                        and "traceback" not in outcome.stderr.lower() and "panicked" not in outcome.stderr.lower()
                        for outcome in outcomes), f"invalid invocation was not a clean usage error: {outcomes!r}")
+        if arguments and (arguments[0] == "stop" or label.startswith("stop-")):
+            report.require(f"primary/cli/{label}/recovery-command",
+                           all(_stop_recovery_arguments(outcome) is not None for outcome in outcomes),
+                           f"stop usage refusal omitted recovery advice: {outcomes!r}")
+        if label.startswith("stop-"):
+            report.require(
+                f"primary/cli/{label}/recovery-globals",
+                all(
+                    (recovery := _stop_recovery_arguments(outcome)) is not None
+                    and recovery[-1] == "doctor"
+                    and _option_values(recovery, "--registry") == ["<ROOT>/registry"]
+                    and _option_values(recovery, "--herdr-bin") == ["<ROOT>/fake-herdr"]
+                    for outcome in outcomes
+                ),
+                f"stop syntax advice lost parsed globals or inferred a target: {outcomes!r}",
+            )
     report.require("primary/cli/no-registry-side-effect", all(not (root / ".agentctl").exists()
                    for root in (case.python_root, case.rust_root)), "invalid syntax created persistent state")
 
@@ -2093,6 +2212,7 @@ def build_report(python_command: Sequence[str], rust_command: Sequence[str]) -> 
             _legacy_adopted_registry_and_queue(harness, report)
             _ownership(harness, report)
             _managed_dead_recovery(harness, report)
+            _stop_recovery_quoted_globals(harness, report)
             _revive_interop(harness, report)
             _adoption(harness, report)
             _identity_and_rename(harness, report)

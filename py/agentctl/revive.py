@@ -17,7 +17,7 @@ from typing import cast
 
 from agentctl import agent
 from agentctl.client import AgentPaneInfo, CustomProcessIdentity, HerdrClient, Pane, herdr_error_code
-from agentctl.errors import AgentDeliveryError, HerdrRunError, HerdrUnavailable
+from agentctl.errors import AgentDeliveryError, HerdrRunError, HerdrUnavailable, RecoveryAction, _with_recovery
 from agentctl.profiles import configuration_root, load_profiles, reasoning_arguments, validate_structured_harness_argument_conflicts
 from agentctl.subagents import (
     AgentRecord, ManagedAgents, _MAX_AGENT_RECORD_BYTES, _NAME, _SHA256,
@@ -123,9 +123,11 @@ def refuse_pending(manager: ManagedAgents, names: tuple[str, ...]) -> None:
     """Refuse control of any name reserved by an incomplete revive."""
     for journal in journals(manager):
         if journal["name"] in names:
-            raise AgentDeliveryError(
+            raise _with_recovery(AgentDeliveryError(
                 f"revive of {journal['name']!r} is incomplete; rerun `agentctl revive {journal['name']}`"
-            )
+            ), RecoveryAction(
+                "revive", name=journal["name"], token=cast(str, journal["old_token"]),
+            ), stop_reason=f"revive of {journal['name']!r} is incomplete")
 
 
 def _paths(manager: ManagedAgents, journal: dict[str, object]) -> tuple[Path, Path, Path]:

@@ -32,11 +32,14 @@ use crate::submission::{GuardedInput, GuardedPrompt, Submission, SubmitTimeouts}
 
 mod cloud;
 mod revive;
+mod stop_advice;
 
 pub(crate) use cloud::{
     validate_create_arguments as validate_cloud_create_arguments, CLOUD_DRIVERS,
 };
 pub use cloud::{CloudLaunch, CloudTools};
+pub(crate) use stop_advice::{stop_reason, StopContext};
+pub use stop_advice::{RecoveryAction, StopFailure};
 
 const BRACKETED_PASTE_START: &str = "\u{1b}[200~";
 const BRACKETED_PASTE_END: &str = "\u{1b}[201~";
@@ -4370,9 +4373,17 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
     }
 
     fn load(&self, agent_name: &str) -> Result<AgentRecord> {
+        self.load_with_stop_advice(agent_name, None)
+    }
+
+    fn load_with_stop_advice(
+        &self,
+        agent_name: &str,
+        recovery: Option<&mut RecoveryAction>,
+    ) -> Result<AgentRecord> {
         self.directory(agent_name)?;
         agent::validate_private_directory(&self.registry, "agent registry", false)?;
-        self.refuse_pending_rename(&[agent_name])?;
+        self.refuse_pending_rename_with_stop_advice(&[agent_name], recovery)?;
         self.read_record(agent_name)
     }
 
@@ -4541,21 +4552,34 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
     }
 
     fn read_move_intent(&self, record: &AgentRecord) -> Result<Option<Value>> {
+        self.read_move_intent_with_stop_context(record, false)
+    }
+
+    fn read_move_intent_with_stop_context(
+        &self,
+        record: &AgentRecord,
+        for_stop: bool,
+    ) -> Result<Option<Value>> {
         let path = self.move_intent_path(&record.name)?;
-        let actual = match fs::symlink_metadata(&path) {
-            Ok(_) => agent::read_private_json(&path).map_err(|error| {
+        let unreadable = |error: String| {
+            if for_stop {
+                fail(format!(
+                    "move of {:?} has an unreadable durable intent: {error}",
+                    record.name
+                ))
+            } else {
                 fail(format!(
                     "move of {:?} has an unreadable durable intent; rerun `agentctl move {}`: {error}",
                     record.name, record.name
                 ))
-            })?,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-            Err(error) => {
-                return Err(fail(format!(
-                    "move of {:?} has an unreadable durable intent; rerun `agentctl move {}`: {error}",
-                    record.name, record.name
-                )))
             }
+        };
+        let actual = match fs::symlink_metadata(&path) {
+            Ok(_) => {
+                agent::read_private_json(&path).map_err(|error| unreadable(error.to_string()))?
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(unreadable(error.to_string())),
         };
         let valid = actual["schema"] == "agentctl-move/v1"
             && actual["token"] == record.token
@@ -4572,6 +4596,12 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
             .iter()
             .all(|key| actual[key].as_str().is_some());
         if !valid {
+            if for_stop {
+                return Err(fail(format!(
+                    "move of {:?} has an invalid durable intent",
+                    record.name
+                )));
+            }
             return Err(fail(format!(
                 "move of {:?} has an invalid durable intent; rerun `agentctl move {}`",
                 record.name, record.name
@@ -4581,7 +4611,19 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
     }
 
     fn pending_move_destination(&self, record: &AgentRecord) -> Result<Option<String>> {
-        let Some(actual) = self.read_move_intent(record)? else {
+        self.pending_move_destination_with_stop_context(record, false)
+    }
+
+    fn pending_move_destination_for_stop(&self, record: &AgentRecord) -> Result<Option<String>> {
+        self.pending_move_destination_with_stop_context(record, true)
+    }
+
+    fn pending_move_destination_with_stop_context(
+        &self,
+        record: &AgentRecord,
+        for_stop: bool,
+    ) -> Result<Option<String>> {
+        let Some(actual) = self.read_move_intent_with_stop_context(record, for_stop)? else {
             return Ok(None);
         };
         let destination = actual
@@ -4591,6 +4633,12 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
         let completed = record.workspace_id.as_deref() == Some(destination)
             && actual["source_workspace_id"].as_str() != Some(destination);
         if actual != self.move_intent(record, destination) && !completed {
+            if for_stop {
+                return Err(fail(format!(
+                    "move of {:?} has a durable intent that does not match its record",
+                    record.name
+                )));
+            }
             return Err(fail(format!(
                 "move of {:?} has a durable intent that does not match its record; rerun `agentctl move {}`",
                 record.name, record.name
@@ -4757,17 +4805,39 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
 
     /// Refuse any of `names` while a rename journal reserves it.
     fn refuse_pending_rename(&self, names: &[&str]) -> Result<()> {
+        self.refuse_pending_rename_with_stop_advice(names, None)
+    }
+
+    fn refuse_pending_rename_with_stop_advice(
+        &self,
+        names: &[&str],
+        recovery: Option<&mut RecoveryAction>,
+    ) -> Result<()> {
         if let Some(journal) = self
             .rename_journals()?
             .into_iter()
             .find(|journal| journal.names(names))
         {
+            let for_stop = recovery.is_some();
+            if let Some(recovery) = recovery {
+                *recovery = RecoveryAction::Rename {
+                    old: journal.old.clone(),
+                    new: journal.new.clone(),
+                    token: journal.token.clone(),
+                };
+            }
+            if for_stop {
+                return Err(fail(format!(
+                    "rename of '{}' to '{}' is incomplete",
+                    journal.old, journal.new
+                )));
+            }
             return Err(fail(format!(
                 "rename of '{}' to '{}' is incomplete; rerun `agentctl rename {} {}`",
                 journal.old, journal.new, journal.old, journal.new
             )));
         }
-        self.refuse_pending_revive(names)
+        self.refuse_pending_revive_with_stop_advice(names, recovery)
     }
 
     fn write_rename_journal(&self, journal: &RenameJournal) -> Result<()> {
@@ -6484,6 +6554,15 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
         agent_name: &str,
         record: &AgentRecord,
     ) -> Result<(bool, AgentPaneInfo, Pane)> {
+        self.inspect_foreign_with_stop_advice(agent_name, record, None)
+    }
+
+    fn inspect_foreign_with_stop_advice(
+        &self,
+        agent_name: &str,
+        record: &AgentRecord,
+        recovery: Option<&mut RecoveryAction>,
+    ) -> Result<(bool, AgentPaneInfo, Pane)> {
         let pane_id = record
             .pane_id
             .as_deref()
@@ -6519,11 +6598,16 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
                 "refusing to unregister adopted agent {agent_name:?}: recorded pane, workspace, or cwd changed"
             )));
         }
-        let shell_identity = record.foreign_shell_identity.as_ref().ok_or_else(|| {
-            fail(format!(
+        let Some(shell_identity) = record.foreign_shell_identity.as_ref() else {
+            if let Some(recovery) = recovery {
+                if let Some(action) = self.legacy_stop_recovery(record, &info, &presentation)? {
+                    *recovery = action;
+                }
+            }
+            return Err(fail(format!(
                 "refusing to unregister adopted agent {agent_name:?}: legacy record has no identity-bound pane shell"
-            ))
-        })?;
+            )));
+        };
         if self.client.pane_shell_identity(&info.pane_id)? != *shell_identity {
             return Err(fail(format!(
                 "refusing to unregister adopted agent {agent_name:?}: recorded pane shell generation changed"
@@ -6559,6 +6643,56 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
             return Ok((false, info, presentation));
         }
         Ok((true, self.checked(record)?, presentation))
+    }
+
+    fn legacy_stop_recovery(
+        &self,
+        record: &AgentRecord,
+        info: &AgentPaneInfo,
+        presentation: &Pane,
+    ) -> Result<Option<RecoveryAction>> {
+        if record.adapter != "herdr-foreign"
+            || record.lifecycle != "running"
+            || record.mode != "interactive"
+            || record.backend != "herdr"
+            || info.agent.is_some()
+            || info.session_agent.is_some()
+            || info.session_value.is_some()
+            || record.tab_id.as_ref() != Some(&presentation.tab_id)
+        {
+            return Ok(None);
+        }
+        let pinned = self.pinned_agent_directory(&record.name)?;
+        let snapshot = self.managed_record_snapshot(&pinned, &record.token)?;
+        if &snapshot.record != record {
+            return Err(fail(format!(
+                "agent {:?} record changed before stop recovery advice",
+                record.name
+            )));
+        }
+        let document: Value = serde_json::from_slice(&snapshot.content)
+            .map_err(|_| fail("invalid legacy agent record before stop recovery advice"))?;
+        if document.get("foreign_shell_identity").is_some() {
+            return Ok(None);
+        }
+        if self
+            .dead_pane_proof(record, "prepare legacy stop recovery advice")
+            .is_err()
+        {
+            return Ok(None);
+        }
+        if self.record_bytes(&pinned)? != snapshot.content {
+            return Err(fail(format!(
+                "agent {:?} record changed during stop recovery advice",
+                record.name
+            )));
+        }
+        Ok(Some(RecoveryAction::Stop {
+            name: record.name.clone(),
+            token: record.token.clone(),
+            record_sha256: Some(format!("{:x}", Sha256::digest(&snapshot.content))),
+            skip_cloud_halt: false,
+        }))
     }
 
     /// Report live state or an explicit probe error without reaping durable records.
@@ -8410,12 +8544,28 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
         &self,
         record: &AgentRecord,
         pinned: &PinnedAgentDirectory,
-        expected_token: Option<&str>,
+        options: &StopOptions,
+        recovery: &mut RecoveryAction,
     ) -> Result<Value> {
+        if options.expected_token.is_none() {
+            let snapshot = self.managed_record_snapshot(pinned, &record.token)?;
+            if &snapshot.record != record {
+                return Err(fail(format!(
+                    "agent {:?} record changed before stop recovery advice",
+                    record.name
+                )));
+            }
+            *recovery = RecoveryAction::Stop {
+                name: record.name.clone(),
+                token: record.token.clone(),
+                record_sha256: None,
+                skip_cloud_halt: options.skip_cloud_halt,
+            };
+        }
         self.retire_managed_dead_locked_with(
             record,
             pinned,
-            expected_token,
+            options.expected_token.as_deref(),
             || {},
             || {},
             (
@@ -8609,8 +8759,32 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
 
     /// Stop with explicit generation assertions or the loud adoption-recovery gate.
     pub fn stop_with_options(&self, agent_name: &str, options: StopOptions) -> Result<Value> {
+        self.advised_stop_with_options(agent_name, options)
+            .map_err(|failure| *failure.error)
+    }
+
+    /// Stop with recovery advice captured at the trusted refusal site.
+    pub fn advised_stop_with_options(
+        &self,
+        agent_name: &str,
+        options: StopOptions,
+    ) -> std::result::Result<Value, StopFailure> {
+        let mut recovery = RecoveryAction::Doctor;
+        self.stop_with_options_inner(agent_name, &options, &mut recovery)
+            .map_err(|error| StopFailure {
+                error: Box::new(error),
+                recovery: recovery.for_assertions(&options),
+            })
+    }
+
+    fn stop_with_options_inner(
+        &self,
+        agent_name: &str,
+        options: &StopOptions,
+        recovery: &mut RecoveryAction,
+    ) -> Result<Value> {
         let _lock = self.lock(agent_name)?;
-        let mut record = self.load(agent_name)?;
+        let mut record = self.load_with_stop_advice(agent_name, Some(&mut *recovery))?;
         if !record.is_cloud() {
             record.supported()?;
             if options.skip_cloud_halt {
@@ -8626,7 +8800,7 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
                 "agent {agent_name:?} was replaced before this operation"
             )));
         }
-        let confirmed_record = self.load(agent_name)?;
+        let confirmed_record = self.load_with_stop_advice(agent_name, Some(&mut *recovery))?;
         if confirmed_record.token != record.token || json!(confirmed_record) != json!(record) {
             return Err(fail(format!(
                 "agent {agent_name:?} record changed before stop"
@@ -8634,11 +8808,15 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
         }
         record = confirmed_record;
         if record.is_cloud() {
-            return self.cloud_stop(record, &options);
+            return self.cloud_stop(record, options);
         }
-        if self.pending_move_destination(&record)?.is_some() {
+        if self.pending_move_destination_for_stop(&record)?.is_some() {
+            *recovery = RecoveryAction::Move {
+                name: record.name.clone(),
+                token: record.token.clone(),
+            };
             return Err(fail(format!(
-                "refusing to stop {agent_name:?}: move is incomplete; rerun `agentctl move {agent_name}`"
+                "refusing to stop {agent_name:?}: move is incomplete"
             )));
         }
         if options.recover_legacy_adoption {
@@ -8648,7 +8826,7 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
                 .ok_or_else(|| fail("legacy adopted record has no pane identity"))?;
             let _pane_lock = self.pane_lock(pane_id)?;
             let pinned = self.pinned_agent_directory(agent_name)?;
-            return self.recover_legacy_adoption_locked(&record, &pinned, &options);
+            return self.recover_legacy_adoption_locked(&record, &pinned, options);
         }
         if options.expected_record_sha256.is_some() {
             return Err(fail(
@@ -8668,7 +8846,8 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
                     }
                 }
             }
-            let (live, info, presentation) = self.inspect_foreign(agent_name, &record)?;
+            let (live, info, presentation) =
+                self.inspect_foreign_with_stop_advice(agent_name, &record, Some(&mut *recovery))?;
             let text = self.bounded_terminal_text(&info.pane_id)?;
             // Output capture is another control round trip. Refuse archival if
             // the exact foreign identity changed while it was in progress.
@@ -8753,11 +8932,7 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
                 }
                 let _pane_lock = self.pane_lock(&recorded[0].pane_id)?;
                 let pinned = self.pinned_agent_directory(agent_name)?;
-                return self.retire_managed_dead_locked(
-                    &record,
-                    &pinned,
-                    options.expected_token.as_deref(),
-                );
+                return self.retire_managed_dead_locked(&record, &pinned, options, recovery);
             }
         }
         if panes.iter().any(|pane| {
@@ -14798,4 +14973,6 @@ pub(crate) mod tests {
     mod recovery_metadata;
     /// Resume recovery, immutable planning, exact publication and crash reconciliation.
     mod revive;
+    /// Trusted stop refusals and generation-bound recovery advice.
+    mod stop_advice;
 }

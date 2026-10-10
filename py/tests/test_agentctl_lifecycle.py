@@ -5,6 +5,7 @@ import errno
 import fcntl
 import json
 import os
+import shlex
 import stat
 import threading
 from collections.abc import Callable, Sequence
@@ -15,10 +16,11 @@ from typing import Literal, cast
 
 import pytest
 
-from agentctl import agent
+from agentctl import agent, cli, legacy_cli
 import agentctl.subagents as subagents_module
 from agentctl.client import AgentPaneInfo, CustomProcessIdentity, HerdrClient, Pane, PaneShellProof
 from agentctl.errors import AgentDeliveryError, HerdrUnavailable
+from agentctl.sessions import Sessions
 from agentctl.subagents import AgentRecord, ManagedAgents
 from .test_agentctl_adopt import prepare_legacy_dead, setup_foreign
 from .test_herdr_subagents import FakeManagedClient, setup
@@ -2360,6 +2362,279 @@ def test_revive_oversized_journal_timestamp_refuses_control_without_a_traceback(
     with pytest.raises(AgentDeliveryError, match="invalid revive journal"):
         manager.stop("worker")
     assert registry_bytes(manager.registry) == before and len(fake.launched) == 2 and fake.closed == []
+
+
+def _stop_cli(
+    edition: str, manager: ManagedAgents, monkeypatch: pytest.MonkeyPatch,
+) -> Callable[[Sequence[str] | None], int]:
+    sessions = manager if isinstance(manager, Sessions) else Sessions(manager.client, manager.registry)
+    sessions.project_workspace = manager.project_workspace
+    monkeypatch.setattr(cli, "Sessions", lambda *_args, **_kwargs: sessions)
+    monkeypatch.setattr(legacy_cli, "ManagedAgents", lambda *_args, **_kwargs: manager)
+    return cli.main if edition == "primary" else legacy_cli.main
+
+
+def _stop_recovery_argv(stderr: str) -> list[str]:
+    commands = [line.removeprefix("Recovery command: ") for line in stderr.splitlines()
+                if line.startswith("Recovery command: ")]
+    assert len(commands) == 1
+    return shlex.split(commands[0])
+
+
+@pytest.mark.parametrize("edition", ["primary", "legacy"])
+def test_stop_refusal_managed_dead_command_is_quoted_and_bound_to_failed_generation(
+    edition: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+) -> None:
+    manager, fake = setup(tmp_path, monkeypatch)
+    _pane, token = make_managed_dead(manager, fake, tmp_path)
+    selected = tmp_path / "registry space's $(literal)"
+    manager.registry.rename(selected)
+    manager.registry = selected
+    record_path = selected / "worker/agent.json"
+    original = record_path.read_bytes()
+    binary = "herdr path's $(literal); --literal"
+    run = _stop_cli(edition, manager, monkeypatch)
+
+    assert run(["--registry", str(selected), "--herdr-bin", binary, "stop", "worker"]) == 75
+    captured = capsys.readouterr()
+    assert captured.out == "" and "requires --expected-token" in captured.err
+    recovery = _stop_recovery_argv(captured.err)
+    assert recovery == [
+        "agentctl", "--registry=" + str(selected), "--herdr-bin=" + binary,
+        "stop", "worker", "--expected-token=" + token,
+    ]
+    assert record_path.read_bytes() == original and fake.closed == []
+
+    replacement = manager.get("worker")
+    replacement.token = "replacement-generation"
+    manager._save(replacement)
+    replacement_bytes = record_path.read_bytes()
+    assert cli.main(recovery[1:]) == 75
+    refused = capsys.readouterr()
+    assert "replaced" in refused.err
+    assert _stop_recovery_argv(refused.err)[3:] == ["doctor"]
+    assert record_path.read_bytes() == replacement_bytes and fake.closed == []
+
+    record_path.write_bytes(original)
+    assert cli.main(recovery[1:]) == 0
+    stopped = json.loads(capsys.readouterr().out)
+    assert stopped["managed_dead"] is True and fake.closed == ["w1:t1"]
+    assert Path(stopped["archive"]).name == "worker-" + token
+
+
+@pytest.mark.parametrize("edition", ["primary", "legacy"])
+def test_stop_refusal_changed_pinned_snapshot_does_not_borrow_replacement_token(
+    edition: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+) -> None:
+    manager, fake = setup(tmp_path, monkeypatch)
+    make_managed_dead(manager, fake, tmp_path)
+    run = _stop_cli(edition, manager, monkeypatch)
+    # The primary facade has its own instance, so inject at the shared class's
+    # actual bounded read, after both ordinary stop record loads have succeeded.
+    original = ManagedAgents._managed_record_snapshot
+    changed = False
+
+    def replace_before_snapshot(
+        instance: ManagedAgents, pinned: subagents_module._PinnedAgentDirectory, *, expected_token: str,
+    ) -> subagents_module._ManagedRecordSnapshot:
+        nonlocal changed
+        if not changed:
+            changed = True
+            document = json.loads((manager.registry / "worker/agent.json").read_text())
+            document["token"] = "replacement-during-refusal"
+            agent._atomic_json(str(manager.registry / "worker/agent.json"), document)
+        return original(instance, pinned, expected_token=expected_token)
+
+    monkeypatch.setattr(ManagedAgents, "_managed_record_snapshot", replace_before_snapshot)
+    assert run(["--registry", str(manager.registry), "stop", "worker"]) == 75
+    captured = capsys.readouterr()
+    assert _stop_recovery_argv(captured.err)[3:] == ["doctor"]
+    assert manager.get("worker").token == "replacement-during-refusal"
+    assert changed and fake.closed == []
+
+
+@pytest.mark.parametrize("edition", ["primary", "legacy"])
+def test_stop_refusal_legacy_adoption_command_binds_exact_raw_digest(
+    edition: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+) -> None:
+    sessions, fake, pane = setup_foreign(tmp_path, monkeypatch)
+    token, digest, original = prepare_legacy_dead(sessions, fake, pane)
+    run = _stop_cli(edition, sessions, monkeypatch)
+    record_path = sessions.registry / "foreign/agent.json"
+    presentation = list(fake.presentations)
+
+    assert run(["--registry", str(sessions.registry), "stop", "foreign"]) == 75
+    captured = capsys.readouterr()
+    assert "legacy record has no identity-bound" in captured.err
+    recovery = _stop_recovery_argv(captured.err)
+    assert recovery[3:] == [
+        "stop", "foreign", "--expected-token=" + token,
+        "--recover-legacy-adoption", "--expected-record-sha256=" + digest,
+    ]
+    assert record_path.read_bytes() == original and fake.closed == []
+
+    record_path.write_bytes(original + b"\n")
+    assert cli.main(recovery[1:]) == 75
+    refused = capsys.readouterr()
+    assert _stop_recovery_argv(refused.err)[3:] == ["doctor"]
+    assert record_path.read_bytes() == original + b"\n" and fake.presentations == presentation
+
+    record_path.write_bytes(original)
+    assert cli.main(recovery[1:]) == 0
+    stopped = json.loads(capsys.readouterr().out)
+    assert stopped["recovered_legacy_adoption"] is True
+    assert Path(stopped["archive"]).joinpath("agent.json").read_bytes() == original
+    assert fake.closed == [] and fake.presentations == presentation
+
+
+@pytest.mark.parametrize("case", ["null", "live", "session", "tab", "busy", "unavailable"])
+def test_stop_refusal_ineligible_legacy_adoption_uses_doctor_and_preserves_status(
+    case: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+) -> None:
+    sessions, fake, pane = setup_foreign(tmp_path, monkeypatch)
+    prepare_legacy_dead(sessions, fake, pane)
+    path = sessions.registry / "foreign/agent.json"
+    if case == "null":
+        document = json.loads(path.read_text())
+        document["foreign_shell_identity"] = None
+        agent._atomic_json(str(path), document)
+    elif case == "live":
+        fake.infos[pane] = replace(fake.infos[pane], agent="codex")
+    elif case == "session":
+        fake.infos[pane] = replace(fake.infos[pane], session_agent="codex", session_value="still-reported")
+    elif case == "tab":
+        fake.presentations = [replace(fake.presentations[0], tab_id="w1:replacement-tab")]
+    elif case == "busy":
+        fake.custom_at_idle_shell = False
+    else:
+        def unavailable(_pane: str) -> PaneShellProof | None:
+            raise HerdrUnavailable("shell probe unavailable")
+
+        monkeypatch.setattr(fake, "pane_idle_shell_identity", unavailable)
+    before = path.read_bytes()
+    run = _stop_cli("primary", sessions, monkeypatch)
+    assert run(["--registry", str(sessions.registry), "stop", "foreign"]) == 75
+    captured = capsys.readouterr()
+    assert "legacy record has no identity-bound" in captured.err
+    assert _stop_recovery_argv(captured.err)[3:] == ["doctor"]
+    assert path.read_bytes() == before and fake.closed == []
+
+
+@pytest.mark.parametrize("edition", ["primary", "legacy"])
+@pytest.mark.parametrize("case", ["unreadable", "invalid", "mismatched"])
+def test_stop_refusal_corrupt_move_intent_has_readonly_advice_and_no_inline_mutation(
+    edition: str, case: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    manager, fake = setup(tmp_path, monkeypatch)
+    manager.start("worker", cwd=str(tmp_path))
+    record = manager.get("worker")
+    manager._write_move_intent(record, "w-project")
+    path = manager.registry / "worker/move.json"
+    if case == "unreadable":
+        path.write_bytes(b"{")
+    elif case == "invalid":
+        agent._atomic_json(str(path), {})
+    else:
+        document = json.loads(path.read_text())
+        document["source_pane_id"] = "w1:another-pane"
+        agent._atomic_json(str(path), document)
+    before = path.read_bytes()
+    run = _stop_cli(edition, manager, monkeypatch)
+
+    assert run(["--registry", str(manager.registry), "stop", "worker"]) == 75
+    captured = capsys.readouterr()
+    assert "durable intent" in captured.err and "rerun `agentctl move" not in captured.err
+    assert _stop_recovery_argv(captured.err)[3:] == ["doctor"]
+    assert path.read_bytes() == before and fake.closed == [] and fake.moves == []
+    assert "rerun `agentctl move" in str(manager.status("worker")["probe_error"])
+
+
+@pytest.mark.parametrize("operation", ["rename", "move"])
+def test_stop_refusal_pending_advice_stays_readonly_after_original_operation_and_replacement(
+    operation: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+) -> None:
+    manager, fake = setup(tmp_path, monkeypatch)
+    first = manager.start("worker", cwd=str(tmp_path), harness="claude")
+    restore = fake.rename_tab
+    if operation == "rename":
+        def interrupt(_tab: str, _label: str) -> None:
+            raise HerdrUnavailable("interrupted rename")
+
+        monkeypatch.setattr(fake, "rename_tab", interrupt)
+        with pytest.raises(HerdrUnavailable):
+            manager.rename("worker", "reviewer")
+    else:
+        manager.project_workspace = "project-agents"
+        manager._write_move_intent(manager.get("worker"), "w-project")
+    run = _stop_cli("primary", manager, monkeypatch)
+    assert run(["--registry", str(manager.registry), "stop", "worker"]) == 75
+    captured = capsys.readouterr()
+    assert "incomplete" in captured.err and "rerun `agentctl" not in captured.err
+    recovery = _stop_recovery_argv(captured.err)
+    assert recovery[3:] == ["doctor"]
+
+    if operation == "rename":
+        monkeypatch.setattr(fake, "rename_tab", restore)
+        assert manager.rename("worker", "reviewer")["recovered"] is True
+        manager.stop("reviewer")
+    else:
+        manager.move_to_project_workspace("worker")
+        manager.stop("worker")
+        manager.project_workspace = None
+        # The fake retains moved-name entries after their pane closes. Reflect
+        # the completed runtime retirement before starting the replacement.
+        fake.moved_named_panes.pop("worker", None)
+    replacement = manager.start("worker", cwd=str(tmp_path), harness="claude")
+    assert replacement["token"] != first["token"]
+    # Refresh the facade's policy to the current manager before replaying the
+    # old printed command; the command itself remains a read-only diagnostic.
+    _stop_cli("primary", manager, monkeypatch)
+    before = registry_bytes(manager.registry)
+    effects = (list(fake.closed), list(fake.moves), dict(fake.labels))
+    assert cli.main(recovery[1:]) in (0, 1)
+    capsys.readouterr()
+    assert registry_bytes(manager.registry) == before
+    assert (fake.closed, fake.moves, fake.labels) == effects
+    assert manager.get("worker").token == replacement["token"]
+
+
+@pytest.mark.parametrize("edition", ["primary", "legacy"])
+@pytest.mark.parametrize("asserted", [False, True])
+def test_stop_refusal_pending_revive_uses_only_the_journal_generation(
+    edition: str, asserted: bool, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    from agentctl import revive as recovery
+    manager, fake, old = prepare_revive(tmp_path, monkeypatch)
+    write = recovery._write_journal
+    interrupted = False
+
+    def interrupt(journal_manager: ManagedAgents, journal: dict[str, object]) -> None:
+        nonlocal interrupted
+        if journal["phase"] == "ready" and not interrupted:
+            interrupted = True
+            raise AgentDeliveryError("interrupted ready publication")
+        write(journal_manager, journal)
+
+    monkeypatch.setattr(recovery, "_write_journal", interrupt)
+    with pytest.raises(AgentDeliveryError):
+        manager.revive("worker")
+    run = _stop_cli(edition, manager, monkeypatch)
+    options = ["--expected-token=another-generation"] if asserted else []
+    before = registry_bytes(manager.registry)
+    assert run(["--registry", str(manager.registry), "stop", "worker", *options]) == 75
+    captured = capsys.readouterr()
+    assert "revive" in captured.err and "incomplete" in captured.err
+    advice = _stop_recovery_argv(captured.err)
+    assert registry_bytes(manager.registry) == before and fake.closed == []
+    if asserted:
+        assert advice[3:] == ["doctor"]
+    else:
+        assert advice[3:] == ["revive", "worker", "--expected-token=" + old.token]
+        assert cli.main(advice[1:]) == 0
+        assert json.loads(capsys.readouterr().out)["revived"] is True
+        assert len(fake.launched) == 2 and fake.closed == [old.tab_id]
 
 
 def test_revive_retries_a_stale_native_report_without_relaxing_ordinary_session_routing(

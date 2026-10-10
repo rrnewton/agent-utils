@@ -1,14 +1,42 @@
 """Stable failure outcomes for persistent agent control."""
 from __future__ import annotations
 
+from dataclasses import dataclass
+from typing import Literal, TypeVar
+
 EXIT_UNAVAILABLE = 69
 EXIT_BUSY = 75
 EXIT_TIMEOUT = 76
 
 
+@dataclass(frozen=True)
+class RecoveryAction:
+    """Recovery authority captured at the refusal, never from a later record."""
+
+    command: Literal["doctor", "stop", "rename", "move", "revive"]
+    name: str | None = None
+    token: str | None = None
+    rename_to: str | None = None
+    record_sha256: str | None = None
+
+
 class AgentCtlError(Exception):
     """Base exception for session, adapter, and delivery failures."""
     exit_code = 1
+    recovery_action: RecoveryAction | None = None
+    stop_reason: str | None = None
+
+
+_Error = TypeVar("_Error", bound=AgentCtlError)
+
+
+def _with_recovery(
+    error: _Error, action: RecoveryAction, *, stop_reason: str | None = None,
+) -> _Error:
+    """Annotate an existing failure without changing its class or exit status."""
+    error.recovery_action = action
+    error.stop_reason = stop_reason
+    return error
 
 
 # Kept for extracted library callers while internal imports migrate.

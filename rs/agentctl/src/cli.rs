@@ -5,15 +5,15 @@ use std::io::{self, Read as _, Write};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use clap::{Args, Parser, Subcommand};
+use clap::{Args, CommandFactory, Parser, Subcommand};
 use serde::Serialize;
 use serde_json::{json, Value};
 
 use crate::agent::{AgentError, DrainOptions, QueueOutcome};
 use crate::client::HerdrClient;
 use crate::subagents::{
-    environment_entries, AdoptOptions, CloudLaunch, CloudTools, ManagedAgents, SlotLaunch,
-    StartOptions, StopOptions,
+    environment_entries, stop_reason, AdoptOptions, CloudLaunch, CloudTools, ManagedAgents,
+    RecoveryAction, SlotLaunch, StartOptions, StopContext, StopFailure, StopOptions,
 };
 
 const MAX_CHAT_PUBLISH_BYTES: usize = 30_000;
@@ -882,48 +882,118 @@ pub(crate) fn main_with_environment<I: IntoIterator<Item = OsString>>(
     arguments: I,
     environment: &dyn Fn(&str) -> Option<String>,
 ) -> i32 {
-    let args =
-        match Cli::try_parse_from(std::iter::once(OsString::from("agentctl")).chain(arguments)) {
-            Ok(args) => args,
-            Err(error) => {
-                let code = error.exit_code();
-                let _ = error.print();
-                return code;
+    let arguments: Vec<OsString> = std::iter::once(OsString::from("agentctl"))
+        .chain(arguments)
+        .collect();
+    let args = match Cli::try_parse_from(arguments.iter().cloned()) {
+        Ok(args) => args,
+        Err(error) => {
+            let code = error.exit_code();
+            let _ = error.print();
+            if code != 0 {
+                if let Some(context) = partial_stop_context(&arguments) {
+                    print_stop_recovery(&context, &RecoveryAction::Doctor);
+                }
             }
-        };
+            return code;
+        }
+    };
+    let stop_context = matches!(&args.command, Some(Commands::Stop(_)))
+        .then(|| StopContext::new(&args.registry, &args.herdr_bin));
     let service_log = args.writes_service_log();
     match run(args, environment) {
         Ok(code) => code,
-        Err(Failure::Agent(error)) => {
-            if let Some(message) = error.undelivered() {
-                if let Err(output) = write_json(
-                    &json!({"outcome": error.outcome().map(QueueOutcome::as_str), "message_id": message.message_id, "artifact": message.artifact, "error": error.to_string(), "safe_to_retry": error.safe_to_retry()}),
-                ) {
-                    print_failure(service_log, format_args!("{output}"));
-                    return 1;
-                }
+        Err(Failure::Agent(error)) => emit_agent_failure(
+            service_log,
+            &error,
+            stop_context.as_ref(),
+            &RecoveryAction::Doctor,
+        ),
+        Err(Failure::Stop(failure)) => emit_agent_failure(
+            service_log,
+            &failure.error,
+            stop_context.as_ref(),
+            &failure.recovery,
+        ),
+        Err(Failure::Usage(error)) => {
+            if let Some(context) = &stop_context {
+                print_failure(service_log, format_args!("{}", stop_reason(&error)));
+                print_stop_recovery(context, &RecoveryAction::Doctor);
             } else {
                 print_failure(service_log, format_args!("{error}"));
             }
-            error.exit_code()
-        }
-        Err(Failure::Usage(error)) => {
-            print_failure(service_log, format_args!("{error}"));
             2
         }
         Err(Failure::Output(error)) => {
             print_failure(service_log, format_args!("cannot write output: {error}"));
+            if let Some(context) = &stop_context {
+                print_stop_recovery(context, &RecoveryAction::Doctor);
+            }
             1
         }
         Err(Failure::Chat(error)) => {
             print_failure(service_log, format_args!("{error}"));
+            if let Some(context) = &stop_context {
+                print_stop_recovery(context, &RecoveryAction::Doctor);
+            }
             1
         }
         Err(Failure::Inbox(error)) => {
             print_failure(service_log, format_args!("{error}"));
+            if let Some(context) = &stop_context {
+                print_stop_recovery(context, &RecoveryAction::Doctor);
+            }
             error.exit_code()
         }
     }
+}
+
+fn partial_stop_context(arguments: &[OsString]) -> Option<StopContext> {
+    let matches = Cli::command()
+        .ignore_errors(true)
+        .try_get_matches_from(arguments.iter().cloned())
+        .ok()?;
+    if matches.subcommand_name() != Some("stop") {
+        return None;
+    }
+    Some(StopContext::new(
+        matches
+            .get_one::<PathBuf>("registry")
+            .map_or(Path::new(".agentctl"), PathBuf::as_path),
+        matches
+            .get_one::<PathBuf>("herdr_bin")
+            .map_or(Path::new("herdr"), PathBuf::as_path),
+    ))
+}
+
+fn print_stop_recovery(context: &StopContext, recovery: &RecoveryAction) {
+    eprintln!("Recovery command: {}", context.command(recovery));
+}
+
+fn emit_agent_failure(
+    service_log: bool,
+    error: &AgentError,
+    stop_context: Option<&StopContext>,
+    recovery: &RecoveryAction,
+) -> i32 {
+    if let Some(message) = error.undelivered() {
+        if let Err(output) = write_json(
+            &json!({"outcome": error.outcome().map(QueueOutcome::as_str), "message_id": message.message_id, "artifact": message.artifact, "error": error.to_string(), "safe_to_retry": error.safe_to_retry()}),
+        ) {
+            print_failure(service_log, format_args!("{output}"));
+            if let Some(context) = stop_context {
+                print_stop_recovery(context, recovery);
+            }
+            return 1;
+        }
+    }
+    if let Some(context) = stop_context {
+        print_failure(service_log, format_args!("{}", stop_reason(error)));
+        print_stop_recovery(context, recovery);
+    } else if error.undelivered().is_none() {
+        print_failure(service_log, format_args!("{error}"));
+    }
+    error.exit_code()
 }
 
 impl Cli {
@@ -950,6 +1020,7 @@ fn print_failure(service_log: bool, message: std::fmt::Arguments<'_>) {
 
 enum Failure {
     Agent(AgentError),
+    Stop(StopFailure),
     Usage(String),
     Output(io::Error),
     Chat(crate::chat_service::ChatServiceError),
@@ -958,6 +1029,11 @@ enum Failure {
 impl From<AgentError> for Failure {
     fn from(error: AgentError) -> Self {
         Self::Agent(error)
+    }
+}
+impl From<StopFailure> for Failure {
+    fn from(error: StopFailure) -> Self {
+        Self::Stop(error)
     }
 }
 fn write_json(value: &impl Serialize) -> io::Result<()> {
@@ -977,7 +1053,6 @@ fn plugin_discovery_required(command: &Commands) -> bool {
 }
 
 fn run(args: Cli, environment: &dyn Fn(&str) -> Option<String>) -> Result<i32, Failure> {
-    use clap::CommandFactory;
     if args.userguide {
         print!("{}", crate::USER_GUIDE);
         return Ok(0);
@@ -1249,7 +1324,7 @@ fn run(args: Cli, environment: &dyn Fn(&str) -> Option<String>) -> Result<i32, F
                     "--expected-record-sha256 requires --recover-legacy-adoption".to_owned(),
                 ));
             }
-            manager.stop_with_options(
+            manager.advised_stop_with_options(
                 &value.agent.name,
                 StopOptions {
                     expected_token: value.expected_token,
@@ -1675,6 +1750,84 @@ fn add_capabilities(value: &mut serde_json::Value) {
 mod tests {
     use super::*;
     use clap::CommandFactory;
+
+    #[test]
+    fn stop_advice_parser_uses_recognized_grammar_and_successfully_parsed_globals() {
+        let prefix = [
+            "agentctl",
+            "--registry=/work/record dir/'registry'",
+            "--herdr-bin=-literal herdr $argument",
+        ];
+        let expected = StopContext::new(
+            Path::new("/work/record dir/'registry'"),
+            Path::new("-literal herdr $argument"),
+        )
+        .command(&RecoveryAction::Doctor);
+        for suffix in [
+            &["stop"][..],
+            &["stop", "worker", "--unknown-option"][..],
+            &["stop", "worker", "--expected-token"][..],
+        ] {
+            for arguments in [
+                [&prefix[..], suffix].concat(),
+                [&prefix[..1], &suffix[..1], &prefix[1..], &suffix[1..]].concat(),
+                [
+                    &[
+                        "agentctl",
+                        "--registry=/work/earlier",
+                        "--herdr-bin=earlier",
+                    ][..],
+                    &suffix[..1],
+                    &prefix[1..],
+                    &suffix[1..],
+                ]
+                .concat(),
+            ] {
+                let arguments: Vec<OsString> = arguments.iter().map(OsString::from).collect();
+                assert_eq!(
+                    Cli::try_parse_from(arguments.iter().cloned())
+                        .err()
+                        .unwrap()
+                        .exit_code(),
+                    2
+                );
+                assert_eq!(
+                    partial_stop_context(&arguments)
+                        .expect("grammar identified stop before the error")
+                        .command(&RecoveryAction::Doctor),
+                    expected
+                );
+            }
+        }
+        for arguments in [
+            vec!["agentctl", "--registry", "stop"],
+            vec!["agentctl", "--herdr-bin=stop", "status"],
+            vec!["agentctl", "send", "worker", "stop", "--unknown-option"],
+        ] {
+            let arguments: Vec<OsString> = arguments.iter().map(OsString::from).collect();
+            assert!(partial_stop_context(&arguments).is_none());
+        }
+    }
+
+    #[test]
+    fn stop_advice_bound_flags_accept_leading_hyphen_tokens_as_one_argument() {
+        let parsed = Cli::try_parse_from([
+            "agentctl",
+            "stop",
+            "worker",
+            "--expected-token=-original-generation",
+            "--skip-cloud-halt",
+        ])
+        .unwrap();
+        let Some(Commands::Stop(options)) = parsed.command else {
+            panic!("stop command");
+        };
+        assert_eq!(
+            options.expected_token.as_deref(),
+            Some("-original-generation")
+        );
+        assert!(options.skip_cloud_halt);
+    }
 
     #[test]
     fn revive_requires_one_scope_and_limits_startup_deadlines() {

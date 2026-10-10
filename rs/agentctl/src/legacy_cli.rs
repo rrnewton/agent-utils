@@ -12,7 +12,9 @@ use serde_json::json;
 use crate::agent::{self, AgentError, DrainOptions, QueueOutcome, Target};
 use crate::client::HerdrClient;
 use crate::error::AdapterError;
-use crate::subagents::{ManagedAgents, StartOptions, StopOptions};
+use crate::subagents::{
+    stop_reason, ManagedAgents, RecoveryAction, StartOptions, StopContext, StopFailure, StopOptions,
+};
 
 const COMMANDS: [&str; 11] = [
     "start",
@@ -102,16 +104,24 @@ enum ParseResult {
     Exit(i32),
 }
 
+struct ParseFailure {
+    message: String,
+    stop_context: Option<StopContext>,
+}
+
 /// Run the `herdr-agent` command over an argument iterator.
 pub fn main<I>(arguments: I) -> i32
 where
     I: IntoIterator<Item = OsString>,
 {
-    let parsed = match parse(arguments) {
+    let parsed = match parse_with_context(arguments) {
         Ok(parsed) => parsed,
-        Err(message) => {
+        Err(failure) => {
             eprintln!("usage: {}", usage_line());
-            eprintln!("herdr-agent: error: {message}");
+            eprintln!("herdr-agent: error: {}", failure.message);
+            if let Some(context) = &failure.stop_context {
+                print_stop_recovery(context, &RecoveryAction::Doctor);
+            }
             return 2;
         }
     };
@@ -119,9 +129,13 @@ where
         ParseResult::Args(args) => *args,
         ParseResult::Exit(code) => return code,
     };
+    let stop_context = parsed_stop_context(&args);
     if let Err(message) = validate_positionals(&args) {
         eprintln!("usage: {}", usage_line());
         eprintln!("herdr-agent: error: {message}");
+        if let Some(context) = &stop_context {
+            print_stop_recovery(context, &RecoveryAction::Doctor);
+        }
         return 2;
     }
     if args.userguide
@@ -140,21 +154,42 @@ where
     if let Err(message) = validate(&args) {
         eprintln!("usage: {}", usage_line());
         eprintln!("herdr-agent: error: {message}");
+        if let Some(context) = &stop_context {
+            print_stop_recovery(context, &RecoveryAction::Doctor);
+        }
         return 2;
     }
     match run(args) {
         Ok(code) => code,
-        Err(CliError::Agent(error)) => emit_agent_error(&error),
+        Err(CliError::Agent(error)) => {
+            emit_agent_error(&error, stop_context.as_ref(), &RecoveryAction::Doctor)
+        }
+        Err(CliError::Stop(failure)) => {
+            emit_agent_error(&failure.error, stop_context.as_ref(), &failure.recovery)
+        }
         Err(CliError::Herdr(error)) => {
-            eprintln!("herdr-agent: {error}");
+            if let Some(context) = &stop_context {
+                eprintln!("herdr-agent: {}", stop_reason(&error));
+                print_stop_recovery(context, &RecoveryAction::Doctor);
+            } else {
+                eprintln!("herdr-agent: {error}");
+            }
             error.exit_code()
         }
         Err(CliError::Usage(message)) => {
-            eprintln!("herdr-agent: {message}");
+            if let Some(context) = &stop_context {
+                eprintln!("herdr-agent: {}", stop_reason(&message));
+                print_stop_recovery(context, &RecoveryAction::Doctor);
+            } else {
+                eprintln!("herdr-agent: {message}");
+            }
             2
         }
         Err(CliError::Output(error)) => {
             eprintln!("herdr-agent: cannot write output: {error}");
+            if let Some(context) = &stop_context {
+                print_stop_recovery(context, &RecoveryAction::Doctor);
+            }
             1
         }
     }
@@ -163,6 +198,7 @@ where
 #[derive(Debug)]
 enum CliError {
     Agent(AgentError),
+    Stop(StopFailure),
     Herdr(AdapterError),
     Usage(String),
     Output(io::Error),
@@ -171,6 +207,12 @@ enum CliError {
 impl From<AgentError> for CliError {
     fn from(error: AgentError) -> Self {
         Self::Agent(error)
+    }
+}
+
+impl From<StopFailure> for CliError {
+    fn from(error: StopFailure) -> Self {
+        Self::Stop(error)
     }
 }
 
@@ -365,7 +407,7 @@ fn run_managed(args: Args) -> Result<i32, CliError> {
             };
             write_json(&manager.start(name, cwd, options)?)?;
         }
-        "stop" => write_json(&manager.stop_with_options(
+        "stop" => write_json(&manager.advised_stop_with_options(
             name,
             StopOptions {
                 expected_token: args.expected_token.clone(),
@@ -427,7 +469,23 @@ fn run_managed(args: Args) -> Result<i32, CliError> {
     Ok(0)
 }
 
-fn emit_agent_error(error: &AgentError) -> i32 {
+fn print_stop_recovery(context: &StopContext, recovery: &RecoveryAction) {
+    eprintln!("Recovery command: {}", context.command(recovery));
+}
+
+fn parsed_stop_context(args: &Args) -> Option<StopContext> {
+    if args.positional.first().map(String::as_str) != Some("stop") {
+        return None;
+    }
+    let registry = absolute_lexical(&args.registry).unwrap_or_else(|_| args.registry.clone());
+    Some(StopContext::new(&registry, &args.herdr_bin))
+}
+
+fn emit_agent_error(
+    error: &AgentError,
+    stop_context: Option<&StopContext>,
+    recovery: &RecoveryAction,
+) -> i32 {
     if let Some(message) = error.undelivered() {
         let document = json!({
             "outcome": error.outcome().map(QueueOutcome::as_str),
@@ -438,9 +496,16 @@ fn emit_agent_error(error: &AgentError) -> i32 {
         });
         if let Err(output_error) = write_json(&document) {
             eprintln!("herdr-agent: cannot write output: {output_error:?}");
+            if let Some(context) = stop_context {
+                print_stop_recovery(context, recovery);
+            }
             return 1;
         }
-    } else {
+    }
+    if let Some(context) = stop_context {
+        eprintln!("herdr-agent: {}", stop_reason(error));
+        print_stop_recovery(context, recovery);
+    } else if error.undelivered().is_none() {
         eprintln!("herdr-agent: {error}");
     }
     error.exit_code()
@@ -516,7 +581,30 @@ fn validate_positionals(args: &Args) -> Result<(), String> {
     Ok(())
 }
 
+#[cfg(test)]
 fn parse<I>(arguments: I) -> Result<ParseResult, String>
+where
+    I: IntoIterator<Item = OsString>,
+{
+    parse_with_context(arguments).map_err(|failure| failure.message)
+}
+
+fn parse_with_context<I>(arguments: I) -> Result<ParseResult, ParseFailure>
+where
+    I: IntoIterator<Item = OsString>,
+{
+    let mut args = Args::default();
+    match parse_into(arguments, &mut args) {
+        Ok(Some(code)) => Ok(ParseResult::Exit(code)),
+        Ok(None) => Ok(ParseResult::Args(Box::new(args))),
+        Err(message) => Err(ParseFailure {
+            message,
+            stop_context: parsed_stop_context(&args),
+        }),
+    }
+}
+
+fn parse_into<I>(arguments: I, args: &mut Args) -> Result<Option<i32>, String>
 where
     I: IntoIterator<Item = OsString>,
 {
@@ -528,7 +616,6 @@ where
                 .map_err(|_| "arguments must be valid UTF-8".to_owned())
         })
         .collect::<Result<Vec<_>, _>>()?;
-    let mut args = Args::default();
     let mut index = 0;
     let mut options = true;
     while index < raw.len() {
@@ -542,11 +629,11 @@ where
             match token.as_str() {
                 "--help" | "-h" => {
                     print_help();
-                    return Ok(ParseResult::Exit(0));
+                    return Ok(Some(0));
                 }
                 "--version" => {
                     println!("herdr-agent {}", env!("CARGO_PKG_VERSION"));
-                    return Ok(ParseResult::Exit(0));
+                    return Ok(Some(0));
                 }
                 "--userguide" => args.userguide = true,
                 "--recover-legacy-adoption" => args.recover_legacy_adoption = true,
@@ -558,7 +645,7 @@ where
                     if value.starts_with('-') && value != "-" {
                         return Err(format!("argument {option}: expected one value"));
                     }
-                    assign(&mut args, option, value)?;
+                    assign(args, option, value)?;
                     index += 1;
                 }
                 option if option.starts_with("--") && option.contains('=') => {
@@ -566,7 +653,7 @@ where
                     if value_option(name).is_none() {
                         return Err(format!("unrecognized arguments: {option}"));
                     }
-                    assign(&mut args, name, value.to_owned())?;
+                    assign(args, name, value.to_owned())?;
                 }
                 option if option.starts_with('-') => {
                     return Err(format!("unrecognized arguments: {option}"));
@@ -578,7 +665,7 @@ where
         }
         index += 1;
     }
-    Ok(ParseResult::Args(Box::new(args)))
+    Ok(None)
 }
 
 fn value_option(option: &str) -> Option<()> {
@@ -759,6 +846,78 @@ mod tests {
 
     fn strings(values: &[&str]) -> Vec<OsString> {
         values.iter().map(OsString::from).collect()
+    }
+
+    #[test]
+    fn stop_advice_parser_retains_only_its_recognized_command_and_parsed_globals() {
+        let prefix = [
+            "--registry=/work/legacy record dir/'registry'",
+            "--herdr-bin=-literal herdr $argument",
+        ];
+        let expected = StopContext::new(
+            Path::new("/work/legacy record dir/'registry'"),
+            Path::new("-literal herdr $argument"),
+        )
+        .command(&RecoveryAction::Doctor);
+        for suffix in [
+            &["stop", "worker", "--unknown-option"][..],
+            &["stop", "worker", "--expected-token"][..],
+            &["stop", "worker", "--lines=bad-number"][..],
+        ] {
+            for arguments in [
+                [&prefix[..], suffix].concat(),
+                [&suffix[..1], &prefix[..], &suffix[1..]].concat(),
+                [
+                    &["--registry=/work/earlier", "--herdr-bin=earlier"][..],
+                    &suffix[..1],
+                    &prefix[..],
+                    &suffix[1..],
+                ]
+                .concat(),
+            ] {
+                let failure = parse_with_context(strings(&arguments))
+                    .err()
+                    .expect("syntax refusal");
+                assert!(!failure.message.is_empty());
+                assert_eq!(
+                    failure
+                        .stop_context
+                        .expect("grammar identified stop before the error")
+                        .command(&RecoveryAction::Doctor),
+                    expected
+                );
+            }
+        }
+        for arguments in [
+            &["--registry", "stop", "--unknown-option"][..],
+            &["send", "stop", "--unknown-option"][..],
+            &["--unknown-option", "stop"][..],
+        ] {
+            let failure = parse_with_context(strings(arguments))
+                .err()
+                .expect("syntax refusal");
+            assert!(failure.stop_context.is_none());
+        }
+        let ParseResult::Args(args) = parse_with_context(strings(&["stop"]))
+            .ok()
+            .expect("parsed command with missing name")
+        else {
+            panic!("unexpected early exit");
+        };
+        assert!(parsed_stop_context(&args).is_some());
+    }
+
+    #[test]
+    fn stop_advice_bound_flags_accept_leading_hyphen_tokens_as_one_argument() {
+        let ParseResult::Args(args) = parse(strings(&[
+            "stop",
+            "worker",
+            "--expected-token=-original-generation",
+        ]))
+        .unwrap() else {
+            panic!("unexpected early exit");
+        };
+        assert_eq!(args.expected_token.as_deref(), Some("-original-generation"));
     }
 
     #[test]

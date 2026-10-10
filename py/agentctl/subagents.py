@@ -51,7 +51,7 @@ from agentctl.client import (
 )
 from agentctl.errors import (
     AgentDeliveryError, HerdrRunError, HerdrUnavailable, InputExpectationFailed,
-    MisrouteRecovered, ProbableMisroute, RecipientChanged,
+    MisrouteRecovered, ProbableMisroute, RecipientChanged, RecoveryAction, _with_recovery,
 )
 from agentctl.profiles import (
     reasoning_arguments,
@@ -2121,6 +2121,29 @@ class ManagedAgents:
             directory_inode=pinned.inode,
         )
 
+    def _legacy_stop_recovery(self, record: AgentRecord) -> RecoveryAction | None:
+        """Offer legacy retirement only for exact bytes and a proved dead pane."""
+        if (record.adapter != "herdr-foreign" or record.lifecycle != "running"
+                or record.mode != "interactive" or record.backend != "herdr"):
+            return None
+        try:
+            self._dead_pane_proof(record, operation="inspect legacy adoption recovery")
+        except HerdrRunError:
+            return None
+        with self._pinned_agent_directory(record.name) as pinned:
+            snapshot = self._managed_record_snapshot(pinned, expected_token=record.token)
+            if snapshot.record.to_document() != record.to_document():
+                raise AgentDeliveryError(
+                    f"agent {record.name!r} record changed before adoption recovery advice"
+                )
+            document = json.loads(snapshot.content)
+            if "foreign_shell_identity" in document:
+                return None
+            return RecoveryAction(
+                "stop", name=record.name, token=snapshot.record.token,
+                record_sha256=hashlib.sha256(snapshot.content).hexdigest(),
+            )
+
     @contextmanager
     def _pane_lock(self, pane_id: str) -> Iterator[None]:
         """Serialize cooperative control across registries for one exact pane."""
@@ -2198,10 +2221,12 @@ class ManagedAgents:
                 str(path), "move intent", require_private=True,
             )
         except HerdrRunError as exc:
-            raise AgentDeliveryError(
+            raise _with_recovery(AgentDeliveryError(
                 f"move of {record.name!r} has an unreadable durable intent; "
                 f"rerun `agentctl move {record.name}`: {exc}"
-            ) from exc
+            ), RecoveryAction("doctor"), stop_reason=(
+                f"move of {record.name!r} has an unreadable durable intent: {exc}"
+            )) from exc
         invariant = {
             "schema": "agentctl-move/v1",
             "token": record.token,
@@ -2216,10 +2241,12 @@ class ManagedAgents:
                     "source_pane_id", "source_tab_id", "source_workspace_id",
                     "destination_workspace_id",
                 ))):
-            raise AgentDeliveryError(
+            raise _with_recovery(AgentDeliveryError(
                 f"move of {record.name!r} has an invalid durable intent; "
                 f"rerun `agentctl move {record.name}`"
-            )
+            ), RecoveryAction("doctor"), stop_reason=(
+                f"move of {record.name!r} has an invalid durable intent"
+            ))
         return actual
 
     def _pending_move_destination(self, record: AgentRecord) -> str | None:
@@ -2243,10 +2270,12 @@ class ManagedAgents:
         completed = (record.workspace_id == destination
                      and actual["source_workspace_id"] != destination)
         if actual != expected and not completed:
-            raise AgentDeliveryError(
+            raise _with_recovery(AgentDeliveryError(
                 f"move of {record.name!r} has a durable intent that does not match "
                 f"its record; rerun `agentctl move {record.name}`"
-            )
+            ), RecoveryAction("doctor"), stop_reason=(
+                f"move of {record.name!r} has a durable intent that does not match its record"
+            ))
         return destination
 
     def _source_unchanged_after_failed_move(self, record: AgentRecord) -> bool:
@@ -4413,12 +4442,8 @@ class ManagedAgents:
         expected_token: str | None,
         expected_token_explicit: bool,
     ) -> dict[str, object]:
-        if not expected_token_explicit or expected_token is None:
-            raise AgentDeliveryError(
-                f"retiring dead managed agent {record.name!r} requires --expected-token"
-            )
         initial = self._managed_record_snapshot(
-            pinned, expected_token=expected_token,
+            pinned, expected_token=expected_token if expected_token is not None else record.token,
         )
         if initial.record.to_document() != record.to_document():
             raise AgentDeliveryError(
@@ -4431,6 +4456,10 @@ class ManagedAgents:
                 "managed-dead retirement requires a running herdr record in "
                 "interactive/herdr mode"
             )
+        if not expected_token_explicit or expected_token is None:
+            raise _with_recovery(AgentDeliveryError(
+                f"retiring dead managed agent {record.name!r} requires --expected-token"
+            ), RecoveryAction("stop", name=record.name, token=record.token))
         before = self._dead_pane_proof(record, operation="retire dead managed agent")
         text = self._bounded_terminal_text(
             before.info.pane_id, operation="managed-dead retirement"
@@ -4631,10 +4660,9 @@ class ManagedAgents:
             record = confirmed_record
             pending_destination = self._pending_move_destination(record)
             if pending_destination is not None:
-                raise AgentDeliveryError(
-                    f"refusing to stop {name!r}: move is incomplete; "
-                    f"rerun `agentctl move {name}`"
-                )
+                raise _with_recovery(AgentDeliveryError(
+                    f"refusing to stop {name!r}: move is incomplete"
+                ), RecoveryAction("move", name=name, token=record.token))
             if recover_legacy_adoption:
                 return self._recover_legacy_adoption(
                     record, expected_token=expected_token,
@@ -4680,10 +4708,16 @@ class ManagedAgents:
                         )
                     shell_identity = record.foreign_shell_identity
                     if shell_identity is None:
-                        raise AgentDeliveryError(
+                        error = AgentDeliveryError(
                             f"refusing to unregister adopted agent {name!r}: "
                             "legacy record has no identity-bound pane shell"
                         )
+                        if (presentation.tab_id == record.tab_id and info.agent is None
+                                and info.session_agent is None and info.session_value is None):
+                            recovery = self._legacy_stop_recovery(record)
+                            if recovery is not None:
+                                error = _with_recovery(error, recovery)
+                        raise error
                     if self.client.pane_shell_identity(info.pane_id) != shell_identity:
                         raise AgentDeliveryError(
                             f"refusing to unregister adopted agent {name!r}: "
@@ -4926,10 +4960,13 @@ class ManagedAgents:
         refuse_pending(self, names)
         for journal in self._rename_journals():
             if journal["old"] in names or journal["new"] in names:
-                raise AgentDeliveryError(
+                raise _with_recovery(AgentDeliveryError(
                     f"rename of {journal['old']!r} to {journal['new']!r} is incomplete; "
                     f"rerun `agentctl rename {journal['old']} {journal['new']}`"
-                )
+                ), RecoveryAction(
+                    "rename", name=cast(str, journal["old"]),
+                    rename_to=cast(str, journal["new"]), token=cast(str, journal["token"]),
+                ), stop_reason=f"rename of {journal['old']!r} to {journal['new']!r} is incomplete")
 
     def _write_rename_journal(self, journal: dict[str, object]) -> None:
         directory = self._renames_dir()

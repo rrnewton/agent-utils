@@ -638,14 +638,33 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
     }
 
     pub(super) fn refuse_pending_revive(&self, names: &[&str]) -> Result<()> {
+        self.refuse_pending_revive_with_stop_advice(names, None)
+    }
+
+    pub(super) fn refuse_pending_revive_with_stop_advice(
+        &self,
+        names: &[&str],
+        recovery: Option<&mut RecoveryAction>,
+    ) -> Result<()> {
         if let Some(journal) = journals(&self.registry)?
             .into_iter()
             .find(|journal| names.contains(&journal.name.as_str()))
         {
-            return Err(fail(format!(
-                "revive of '{}' is incomplete; rerun `agentctl revive {} --expected-token {}`",
-                journal.name, journal.name, journal.old_token
-            )));
+            let for_stop = recovery.is_some();
+            if let Some(recovery) = recovery {
+                *recovery = RecoveryAction::Revive {
+                    name: journal.name.clone(),
+                    token: journal.old_token.clone(),
+                };
+            }
+            return Err(fail(if for_stop {
+                format!("revive of '{}' is incomplete", journal.name)
+            } else {
+                format!(
+                    "revive of '{}' is incomplete; rerun `agentctl revive {} --expected-token {}`",
+                    journal.name, journal.name, journal.old_token
+                )
+            }));
         }
         Ok(())
     }

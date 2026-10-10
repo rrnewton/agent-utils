@@ -24,6 +24,7 @@ from agentctl.agent import Target, drain, read, send, status
 from agentctl.client import HerdrClient
 from agentctl.errors import AgentPending, AgentPossiblySubmitted, HerdrRunError
 from agentctl.subagents import ManagedAgents
+from agentctl.stop_recovery import StopRecoveryParser, stop_refusal_message
 
 _MAX_WAIT_SECONDS = 31_536_000.0
 _MAX_COUNT = 1_000_000
@@ -49,7 +50,7 @@ def _bounded_uint(value: str) -> int:
 
 
 def _parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
+    parser = StopRecoveryParser(
         prog="herdr-agent",
         description="Queue, submit, inspect, and read interactive agents hosted in Herdr panes.",
         allow_abbrev=False,
@@ -223,7 +224,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     """Run the durable interactive-agent messaging command-line interface."""
 
     parser = _parser()
-    args = parser.parse_intermixed_args(list(argv) if argv is not None else None)
+    arguments = list(sys.argv[1:] if argv is None else argv)
+    # Intermixed parsing reads options before positionals on some supported
+    # Python versions. Use the same grammar first so an option error after a
+    # recognized stop retains its parsed command and globals.
+    parser.parse_known_args(arguments)
+    args = parser.parse_intermixed_args(arguments)
     if args.userguide or args.command == "userguide":
         return _guide()
     if args.command is None:
@@ -245,10 +251,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             "timeouts must be finite and positive (ready-timeout may be zero and must not exceed "
             f"{_MAX_WAIT_SECONDS:g}s); max-attempts and lines must be positive"
         )
-    client = HerdrClient(herdr_bin=str(args.herdr_bin))
-    target = _target(args)
-    queue = os.path.abspath(str(args.queue))
     try:
+        client = HerdrClient(herdr_bin=str(args.herdr_bin))
+        target = _target(args)
+        queue = os.path.abspath(str(args.queue))
         if args.name is not None or args.command in ("start", "stop", "list", "wait", "goal", "bind-session"):
             return _managed(args, client)
         if args.command == "send":
@@ -289,9 +295,22 @@ def main(argv: Sequence[str] | None = None) -> int:
             sort_keys=True,
         )
         sys.stdout.write("\n")
+        if args.command == "stop":
+            print(stop_refusal_message(
+                exc, prefix="herdr-agent", registry=args.registry, herdr_bin=args.herdr_bin,
+                expected_token=args.expected_token,
+                expected_record_sha256=args.expected_record_sha256,
+            ), file=sys.stderr)
         return exc.exit_code
-    except (HerdrRunError, ValueError, OSError) as exc:
-        print(f"herdr-agent: {exc}", file=sys.stderr)
+    except (HerdrRunError, ValueError, TypeError, OSError) as exc:
+        if args.command == "stop":
+            print(stop_refusal_message(
+                exc, prefix="herdr-agent", registry=args.registry, herdr_bin=args.herdr_bin,
+                expected_token=args.expected_token,
+                expected_record_sha256=args.expected_record_sha256,
+            ), file=sys.stderr)
+        else:
+            print(f"herdr-agent: {exc}", file=sys.stderr)
         return exc.exit_code if isinstance(exc, HerdrRunError) else 2
 
 

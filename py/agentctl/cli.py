@@ -23,6 +23,7 @@ from agentctl.profiles import (
 )
 from agentctl.sessions import Sessions
 from agentctl.skill_install import install_skill
+from agentctl.stop_recovery import StopRecoveryParser, stop_refusal_message
 from agentctl.subagents import environment_entries
 
 
@@ -64,7 +65,7 @@ def _environment_entry(value: str) -> str:
 
 def parser() -> argparse.ArgumentParser:
     """Build real subcommands with operation-specific options and examples."""
-    root = argparse.ArgumentParser(prog="agentctl", allow_abbrev=False,
+    root = StopRecoveryParser(prog="agentctl", allow_abbrev=False,
         description="Start persistent coding agents, delegate follow-up work, and keep their terminals accessible.",
         epilog=("Start here: agentctl quickstart\n"
             "Examples:\n"
@@ -79,6 +80,7 @@ def parser() -> argparse.ArgumentParser:
     def command(name: str, purpose: str, example: str, *, named: bool = False) -> argparse.ArgumentParser:
         child = commands.add_parser(name, help=purpose, description=purpose, allow_abbrev=False,
             epilog=f"Example: {example}", formatter_class=argparse.RawDescriptionHelpFormatter)
+        root.share_stop_context(child)
         _common(child, inherited=True)
         if named:
             child.add_argument("name", metavar="NAME", help="registered session name (lowercase letters, digits, hyphens)")
@@ -232,9 +234,11 @@ def parser() -> argparse.ArgumentParser:
              "when it has none, the profiles.json beside a registry named .agentctl is listed")
     skill = commands.add_parser("skill", help="Install the bundled agentctl harness skill.",
         description="Install the bundled agentctl harness skill.", allow_abbrev=False)
+    root.share_stop_context(skill)
     _common(skill, inherited=True)
     skill_commands = skill.add_subparsers(dest="skill_command", required=True, metavar="COMMAND")
     install = skill_commands.add_parser("install", help="Install for Codex, Claude, and Muse.", allow_abbrev=False)
+    root.share_stop_context(install)
     _common(install, inherited=True)
     install.add_argument("--harness", action="append", choices=("codex", "claude", "muse"), default=[],
         help="target harness; repeat; omission installs all supported harnesses")
@@ -463,9 +467,22 @@ def main(argv: Sequence[str] | None = None) -> int:
     except (AgentPending, AgentPossiblySubmitted) as exc:
         print(json.dumps({"outcome": exc.outcome, "message_id": exc.message_id,
             "artifact": exc.artifact, "error": str(exc), "safe_to_retry": isinstance(exc, AgentPending)}, sort_keys=True))
+        if args.command == "stop":
+            print(stop_refusal_message(
+                exc, prefix="agentctl", registry=args.registry, herdr_bin=args.herdr_bin,
+                expected_token=args.expected_token,
+                expected_record_sha256=args.expected_record_sha256,
+            ), file=sys.stderr)
         return exc.exit_code
     except (ValueError, TypeError, OSError, HerdrRunError) as exc:
-        print(f"agentctl: {exc}", file=sys.stderr)
+        if args.command == "stop":
+            print(stop_refusal_message(
+                exc, prefix="agentctl", registry=args.registry, herdr_bin=args.herdr_bin,
+                expected_token=args.expected_token,
+                expected_record_sha256=args.expected_record_sha256,
+            ), file=sys.stderr)
+        else:
+            print(f"agentctl: {exc}", file=sys.stderr)
         return exc.exit_code if isinstance(exc, HerdrRunError) else 2
 
 

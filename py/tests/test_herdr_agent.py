@@ -14,6 +14,7 @@ from typing import cast
 import pytest
 
 from agentctl import __version__
+from agentctl import cli as primary_cli
 import agentctl.agent as agent_api
 from agentctl.agent import Target, drain, enqueue, read, send, status
 from agentctl.agent import QueueResult
@@ -1494,3 +1495,74 @@ def test_enqueue_and_delivery_state_transitions_fsync(monkeypatch: pytest.Monkey
     # Enqueue file+directory, inbox->inflight, inflight update, and
     # inflight->processed each require syncs; keep the assertion structural.
     assert len(calls) >= 8
+
+
+@pytest.mark.parametrize("ordering", ["between-positionals", "prefix-and-middle", "named-suffix"])
+def test_stop_refusal_legacy_prepass_preserves_valid_intermixed_syntax(
+    ordering: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    registry = str(tmp_path / "unused-registry")
+    binary = "literal-herdr"
+    seen: dict[str, object] = {}
+
+    class Backend:
+        def stop(self, name: str, **options: object) -> dict[str, object]:
+            seen["name"] = name
+            seen["options"] = options
+            return {"name": name, "stopped": True}
+
+    def client_factory(*, herdr_bin: str) -> HerdrClient:
+        seen["binary"] = herdr_bin
+        return cast(HerdrClient, object())
+
+    def manager_factory(_client: HerdrClient, selected_registry: str) -> Backend:
+        seen["registry"] = selected_registry
+        return Backend()
+
+    monkeypatch.setattr(agent_cli, "HerdrClient", client_factory)
+    monkeypatch.setattr(agent_cli, "ManagedAgents", manager_factory)
+    if ordering == "between-positionals":
+        arguments = ["stop", "--registry", registry, "worker", "--herdr-bin", binary]
+    elif ordering == "prefix-and-middle":
+        arguments = ["--registry", registry, "stop", "--herdr-bin", binary, "worker"]
+    else:
+        arguments = ["--herdr-bin", binary, "stop", "--registry", registry, "--name", "worker"]
+    assert agent_cli.main(arguments) == 0
+    captured = capsys.readouterr()
+    assert json.loads(captured.out) == {"name": "worker", "stopped": True} and captured.err == ""
+    assert seen == {
+        "registry": registry, "binary": binary, "name": "worker",
+        "options": {"expected_token": None, "recover_legacy_adoption": False,
+                    "expected_record_sha256": None},
+    }
+    assert not (tmp_path / "unused-registry").exists()
+
+
+@pytest.mark.parametrize("edition", ["primary", "legacy"])
+@pytest.mark.parametrize("possibly_submitted", [False, True])
+def test_stop_refusal_changes_leave_ordinary_send_pending_json_and_stderr_unchanged(
+    edition: str, possibly_submitted: bool, monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    error = (AgentPossiblySubmitted("uncertain", message_id="m", artifact="retained.json")
+             if possibly_submitted else AgentPending("busy", message_id="m", artifact="retained.json"))
+
+    class Backend:
+        def send_session(self, _name: str, _text: str, **_options: object) -> dict[str, object]:
+            raise error
+
+    def fail_send(*_args: object, **_options: object) -> QueueResult:
+        raise error
+
+    monkeypatch.setattr(primary_cli, "Sessions", lambda *_args, **_kwargs: Backend())
+    monkeypatch.setattr(agent_cli, "send", fail_send)
+    run = primary_cli.main if edition == "primary" else agent_cli.main
+    arguments = ["send", "worker", "instruction"] if edition == "primary" else ["send", "--pane=p", "instruction"]
+    assert run(arguments) == error.exit_code
+    captured = capsys.readouterr()
+    assert captured.err == ""
+    assert json.loads(captured.out) == {
+        "outcome": error.outcome, "message_id": "m", "artifact": "retained.json",
+        "error": str(error), "safe_to_retry": not possibly_submitted,
+    }

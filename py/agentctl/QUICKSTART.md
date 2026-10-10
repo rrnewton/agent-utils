@@ -115,7 +115,10 @@ while keeping their terminals available for direct inspection.
    ```
 
 5. Finish with `agentctl stop reviewer`. This stops a runtime created by
-   `agentctl` and archives its session state. For an adopted agent it only
+   `agentctl` and archives its session state. A refusal prints its reason and
+   a `Recovery command:` line with the selected registry and verified identity
+   assertions. Run that command to recover or inspect the record.
+   For an adopted agent it only
    unregisters and archives the control state; the foreign pane and process keep
    running. Adoption accepts only a supported shell process and records its
    exact generation. Unregistration requires that same shell generation before

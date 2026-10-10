@@ -886,6 +886,15 @@ completed native goal.
 agentctl stop reviewer
 ```
 
+Every refused stop prints a reason and a `Recovery command:` line. The command
+keeps the selected registry and Herdr executable, with shell quoting ready to
+copy. Retirement advice includes the saved token. For an adopted record with no
+saved shell identity, it also includes the raw record digest. Unverified
+ownership, pending renames, and pending moves produce a `doctor` command for
+inspection. An interrupted revive
+provides the command that finishes its recorded transaction with the saved
+token.
+
 Stopping closes only a runtime created and owned by the session manager, then
 archives its state. For an adopted `herdr-foreign` record, stopping means safe
 unregistration: the manager verifies the supported shell's exact recorded
@@ -905,13 +914,10 @@ it as `source`, and exits 0. A Herdr outage is not such a report, so `stop`
 still refuses.
 
 A narrowly scoped recovery command exists only for an identity-less
-`herdr-foreign` record whose raw JSON omits `foreign_shell_identity`. Run
-`agentctl stop --help` for the exact required recovery selector, token, and raw
-record-digest options.
-
-```sh
-sha256sum .agentctl/NAME/agent.json
-```
+`herdr-foreign` record whose raw JSON omits `foreign_shell_identity`. When the
+record generation is verified, the refusal prints a command with the recovery
+selector, its expected token, and its raw record digest.
+`agentctl stop --help` describes these recovery options.
 
 All three options are required together. Under the name and pane locks, the
 manager re-reads the exact record bytes, requires the token and digest twice,
@@ -924,7 +930,8 @@ renames, or reports the foreign pane. An explicit `null` identity field is not
 the missing-key shape and is refused.
 
 If a managed `herdr` agent has exited and its exact owned pane has returned to
-an idle shell, normal stop requires an explicit generation assertion:
+an idle shell, normal stop requires an explicit generation assertion. The
+refusal prints the command with the verified token filled in:
 
 ```sh
 agentctl stop NAME --expected-token TOKEN

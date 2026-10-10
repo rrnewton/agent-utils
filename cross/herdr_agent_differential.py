@@ -39,6 +39,25 @@ class Outcome:
     stderr: str
 
 
+def _stop_recovery_arguments(outcome: Outcome) -> tuple[str, ...] | None:
+    """Parse one copyable command only when a refusal also explains its reason."""
+    prefix = "Recovery command: "
+    lines = outcome.stderr.splitlines()
+    commands = [line[len(prefix):] for line in lines if line.startswith(prefix)]
+    explained = any(
+        line.startswith(("agentctl: ", "agentctl stop: ", "herdr-agent: ", "error: "))
+        and bool(line.partition(":")[2].strip())
+        for line in lines
+    )
+    if len(commands) != 1 or not explained:
+        return None
+    try:
+        arguments = tuple(shlex.split(commands[0]))
+    except ValueError:
+        return None
+    return arguments if arguments and arguments[0] == "agentctl" else None
+
+
 @dataclass
 class Report:
     """Accumulated cross-edition assertions."""
@@ -2137,6 +2156,42 @@ def _invalid_cli(harness: Harness, report: Report) -> None:
         and expected in rust.stderr,
         "empty exact pane did not fail target validation before Herdr resolution: "
         f"python={python!r} rust={rust!r}",
+    )
+
+    registry = "<ROOT>/legacy state's $literal; directory"
+    common = (f"--registry={registry}", "--herdr-bin=<HERDR>")
+    for label, arguments in (
+        ("missing-name", (*common, "stop")),
+        ("unknown-option", (*common, "stop", "worker", "--unrecognized")),
+        ("missing-option-value", (*common, "stop", "worker", "--expected-token")),
+    ):
+        outcomes = harness.invoke(case, arguments)
+        report.require(
+            f"cli/stop-refusal/{label}",
+            all(
+                outcome.returncode == 2
+                and (recovery := _stop_recovery_arguments(outcome)) is not None
+                and recovery[-1] == "doctor"
+                and _option_values(recovery, "--registry") == [registry]
+                and _option_values(recovery, "--herdr-bin") == ["<ROOT>/fake-herdr"]
+                for outcome in outcomes
+            ),
+            f"legacy syntax refusal lost its reason or selected globals: {outcomes!r}",
+        )
+    outcomes = harness.invoke(case, (
+        "--registry=stop", "--herdr-bin=<HERDR>", "status", "--unrecognized",
+    ))
+    report.require(
+        "cli/non-stop-literal-value",
+        all(outcome.returncode == 2 and "Recovery command:" not in outcome.stderr
+            for outcome in outcomes),
+        f"a literal option value invented stop recovery context: {outcomes!r}",
+    )
+    report.require(
+        "cli/stop-refusal/no-registry-side-effect",
+        all(not (root / registry.removeprefix("<ROOT>/")).exists()
+            for root in (case.python_root, case.rust_root)),
+        "legacy syntax refusal created persistent registry state",
     )
 
 
