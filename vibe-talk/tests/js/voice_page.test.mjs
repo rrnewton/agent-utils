@@ -375,13 +375,36 @@ const FIXTURE_TREE = {
   // `#200 reply-context`. The reply screen's one scroll: the earlier messages, oldest at the top,
   // then the message being answered. The SECOND element the model scrolls — see `SCROLLERS`.
   "reply-scroll": ["reply-context-more", "reply-context-state", "reply-context", "reply-target-meta", "reply-target"],
+  // `#229 desktop-two-column`. The right column of the desk's two-column layout: its heading, its
+  // one scrolling element (the THIRD the model scrolls, see `SCROLLERS`) holding the cards and the
+  // thread pane, which nests exactly as #pane-discord does, and its jump over the foot.
+  "side-column": ["side-heading", "side-scroll", "side-tools"],
+  "side-heading": ["side-facts", "side-title", "side-close"],
+  "side-scroll": ["side-search-empty", "side-list", "side-pane"],
+  "side-list": ["side-list-state", "side-cards", "side-more-threads"],
+  "side-pane": [
+    "side-summary",
+    "side-summary-note",
+    "side-inbox-note",
+    "side-clear-backlog",
+    "side-older",
+    "side-notice",
+    "side-loading",
+    "side-thread-list",
+    "side-log",
+    "side-pinned-log",
+    "side-outgoing-log",
+    "side-composer",
+  ],
+  "side-composer": ["side-compose-text", "side-send", "side-compose-state"],
+  "side-tools": ["side-jump-newest"],
 };
 
 /**
  * The elements the page scrolls: the channel and transcript's shared area, and the reply screen's
  * conversation. Every other element holds a position of zero, as a box that does not scroll does.
  */
-const SCROLLERS = new Set(["scroll-area", "reply-scroll"]);
+const SCROLLERS = new Set(["scroll-area", "reply-scroll", "side-scroll"]);
 
 /** The reply screen's viewport, so "the message being answered is in view" means something. */
 const REPLY_VIEWPORT_PX = 200;
@@ -1212,6 +1235,16 @@ function newPage(store = new Map(), script = SCRIPT, arrange = null) {
   }
   elements.get("scroll-area").clientHeight = SCROLL_VIEWPORT_PX;
   elements.get("reply-scroll").clientHeight = REPLY_VIEWPORT_PX;
+  // `#229 desktop-two-column`. The right column's list is as tall as the left's.
+  elements.get("side-scroll").clientHeight = SCROLL_VIEWPORT_PX;
+  // ...and the one layout question the page asks about it: whether it has a box at all. web/voice.css
+  // gives it one only on a desk at least 1000px wide, while #screen-main carries `data-columns="two"`.
+  // `page.wideDesk` says which window this is — a phone or a narrow window unless a test says
+  // otherwise — and `page.setDesk` changes it as resizing the window does, resize event and all.
+  elements.get("side-column").getClientRects = () => {
+    const screen = elements.get("screen-main");
+    return page.wideDesk && !screen.hidden && screen.getAttribute("data-columns") === "two" ? [{ top: 0, bottom: 0 }] : [];
+  };
   const page = {
     elements,
     el: (id) => {
@@ -1868,6 +1901,16 @@ function newPage(store = new Map(), script = SCRIPT, arrange = null) {
     for (const fn of windowListeners.get(online ? "online" : "offline") || []) {
       await fn();
     }
+  };
+  /** `#229 desktop-two-column`. Whether the window is a desk wide enough for two columns. */
+  page.wideDesk = false;
+  /** Resize the window: a desk wide enough for two columns, or not, and the resize event a browser fires. */
+  page.setDesk = async (wide) => {
+    page.wideDesk = wide;
+    for (const fn of windowListeners.get("resize") || []) {
+      await fn();
+    }
+    await page.settle();
   };
   /**
    * `#225 enter-to-send`. The platform the browser reports, as `navigator.platform` gives it. Set
@@ -35624,4 +35667,481 @@ test("`#224 keyboard-shortcuts` x `#221 read-modes`: on the line of a collapsed 
   await page.settle();
   assert.equal(head.hasAttribute("data-read-run"), false, "Enter on the run's line did not open the run");
   assert.equal(focused(page), head, "opening the run took the focus off it");
+});
+
+// --- two columns on a desk (#229 desktop-two-column) -----------------------------------------------
+//
+// The owner, 2026-10-09: other chat clients' desktop apps give him a two-column view of a channel and
+// he uses it a lot, so on a desk the dock gets a layout button: one column, or Main on the left and a
+// thread on the right, the view picker greyed out because it has nothing left to choose; with no
+// thread selected the right column lists the threads, a few lines each, and the way into a thread on
+// a message selects it there; an X deselects it. The fixture lays nothing out, so whether two columns
+// are in force is the one question it answers for the stylesheet: the right column has a box only on
+// a desk at least 1000px wide, while #screen-main asks for two columns (`page.wideDesk`). Real
+// Chromium checks the layout itself (tests/two_column_browser.py).
+
+const TWO_COLUMN_QUERY = "(min-width: 1000px) and (pointer: fine)";
+const COLUMNS_STORAGE = "vibe-talk.voice.columns";
+
+/** Whether the page has two columns on screen: asked for, and given a box by the stylesheet. */
+const inTwoColumns = (page) => page.el("screen-main").getAttribute("data-columns") === "two" &&
+  page.el("side-column").getClientRects().length > 0;
+/** The right column's rows, as `shownIds` gives the left's. */
+const sideIds = (page) => page.el("side-log").children.map((li) => li.getAttribute("data-id"));
+/** The right column's row holding message `id`. */
+const sideRow = (page, id) =>
+  page.el("side-log").children.find((li) => String(li.getAttribute("data-ids")).split(" ").includes(id));
+/** The thread ids of the right column's cards, in order. */
+const cardIds = (page) => page.el("side-cards").children.map((li) => li.getAttribute("data-id"));
+/** A card's button, by its thread id. */
+const cardOf = (page, id) => {
+  const row = page.el("side-cards").children.find((li) => li.getAttribute("data-id") === id);
+  return row ? row.children[0] : null;
+};
+const cardPart = (page, id, name) => {
+  const card = cardOf(page, id);
+  const part = card ? card.descendants().find((node) => node.className === name) : null;
+  return part ? part.text() : null;
+};
+/** The timeline reads made since `from`, as their views: "thread", "main", "flat", "threads". */
+const readViewsSince = (page, from) => page.timelineCalls.slice(from).map(viewOf);
+
+/** Two columns: a desk wide enough, and the layout button pressed. */
+async function twoColumns(page) {
+  page.wideDesk = true;
+  await page.el("column-toggle").click();
+  await page.settle();
+  assert.ok(inTwoColumns(page), "pressing the layout button on a wide desk did not give two columns");
+  return page;
+}
+
+/** The channel of `threadData`, on a server with a change record, read in All and then in two columns. */
+async function twoColumnServer(arrange = null) {
+  const page = newPage();
+  const data = threadData();
+  page.threadingSupported = true;
+  page.threads = data.threads;
+  page.messages = data.messages;
+  if (arrange) arrange(page, data);
+  const server = forwardTimeline(page);
+  await signIn(page);
+  await showDiscord(page, data.messages);
+  await twoColumns(page);
+  await page.settle();
+  return { page, server, data };
+}
+
+test("`#229 desktop-two-column`: the layout button is a toggle in the bar, offered on a channel with threads and drawn only on a desk 1000px wide", async () => {
+  assertMarkupContains("bar-pack", "column-toggle");
+  const bar = HTML_CODE.slice(HTML_CODE.indexOf('id="bar-pack"'));
+  assert.ok(bar.indexOf('id="thread-select"') < bar.indexOf('id="column-toggle"'),
+    "the layout button is not beside the view picker it greys out");
+  const tag = /<button\s+id="column-toggle"[^>]*>/.exec(HTML_CODE)[0];
+  assert.match(tag, /aria-pressed="false"/, "the button does not say whether two columns are on");
+  assert.match(tag, /aria-label="Two columns"/, "the button has no fixed name");
+  assert.match(tag, /(?:^|\s)hidden(?=[\s>])/, "the button ships on screen, before anything has decided it is offered");
+  // Drawn only inside the block, whose query is the desk's AND a width for two columns. Outside it,
+  // neither the button nor the right column is ever drawn: a phone and a narrow window are unchanged.
+  assert.match(cssBlockOutside(TWO_COLUMN_QUERY, "#column-toggle"), /display:\s*none/);
+  assert.match(cssBlockIn(TWO_COLUMN_QUERY, "#column-toggle"), /display:\s*flex/);
+  assert.match(cssBlockOutside(TWO_COLUMN_QUERY, "#side-column"), /display:\s*none/);
+  assert.match(cssBlockIn(TWO_COLUMN_QUERY, '#screen-main[data-columns="two"] > #side-column'), /display:\s*grid/);
+  assert.match(cssBlockIn(TWO_COLUMN_QUERY, '#screen-main[data-columns="two"]'),
+    /grid-template-columns:\s*minmax\(0, 1fr\) minmax\(0, 1fr\)/);
+  // ...and it is the stylesheet's to say, never a query the script reads.
+  assert.doesNotMatch(SCRIPT_CODE, /matchMedia|innerWidth|outerWidth|screen\.width/);
+
+  const page = await threadPage();
+  assert.equal(page.el("column-toggle").hidden, false, "not offered on a channel whose provider has threads");
+  assert.equal(page.el("column-toggle").getAttribute("aria-pressed"), "false");
+  await page.el("view-switch").click();
+  await page.settle();
+  assert.equal(page.el("column-toggle").hidden, true, "offered over the call's transcript");
+  const flat = newPage();
+  await signIn(flat);
+  await showDiscord(flat, [message({ content: "no threads on this provider" })]);
+  assert.equal(flat.el("column-toggle").hidden, true, "offered where the provider has no threads");
+});
+
+test("`#229 desktop-two-column`: pressed in a narrow window it waits for a wide one; narrowed, one column comes back as it was, and the choice is kept", async () => {
+  const page = await threadPage();
+  assert.equal(page.el("thread-select").value, "flat");
+  await page.el("column-toggle").click();
+  await page.settle();
+  assert.equal(page.el("column-toggle").getAttribute("aria-pressed"), "true", "the button does not say it is pressed");
+  assert.equal(page.storage.get(COLUMNS_STORAGE), "two", "the choice was not kept on the device");
+  assert.equal(page.el("screen-main").getAttribute("data-columns"), "two", "the stylesheet was not asked for two columns");
+  assert.ok(!inTwoColumns(page), "a narrow window was given two columns");
+  assert.equal(page.el("thread-select").disabled, false, "one column on screen, and the view picker greyed out");
+  assert.deepStrictEqual(shownIds(page), ["200", "201", "202", "203", "204"], "a narrow window left All");
+
+  await page.setDesk(true);
+  assert.ok(inTwoColumns(page), "widening the window did not bring two columns");
+  assert.equal(page.el("thread-select").disabled, true, "the view picker did not grey out");
+  assert.equal(page.el("thread-select").value, "main");
+  assert.deepStrictEqual(shownIds(page), ["200", "201", "203"], "the left column is not Main");
+  await threadBadge(rowWithId(page, "201")).click();
+  await page.settle();
+  assert.deepStrictEqual(sideIds(page), ["201", "202"], "the thread was not selected on the right");
+
+  await page.setDesk(false);
+  assert.ok(!inTwoColumns(page));
+  assert.equal(page.el("thread-select").disabled, false, "one column again, and the view picker still grey");
+  assert.equal(page.el("thread-select").value, "flat", "one column again is not the view last chosen in one");
+  assert.deepStrictEqual(shownIds(page), ["200", "201", "202", "203", "204"]);
+  assert.equal(page.storage.get(COLUMNS_STORAGE), "two", "narrowing the window forgot the choice");
+  // Main in two columns was the layout's, not a choice: the record still opens the channel in All.
+  assert.equal(JSON.parse(page.storage.get(UI_STATE_KEY)).channels[0].channelView, "flat",
+    "two columns recorded Main as the reader's choice of view");
+
+  await page.setDesk(true);
+  assert.ok(inTwoColumns(page));
+  assert.deepStrictEqual(sideIds(page), ["201", "202"], "widening again lost the thread selected");
+  assert.equal(page.el("side-close").hidden, false);
+
+  // The button again: one column, for good, and said so.
+  await page.el("column-toggle").click();
+  await page.settle();
+  assert.ok(!inTwoColumns(page));
+  assert.equal(page.el("screen-main").hasAttribute("data-columns"), false);
+  assert.equal(page.storage.get(COLUMNS_STORAGE), "one");
+  assert.equal(page.el("column-toggle").getAttribute("aria-pressed"), "false");
+  assert.equal(page.el("thread-select").value, "flat");
+});
+
+test("`#229 desktop-two-column`: a reload on a wide desk opens the channel in two columns, Main on the left", async () => {
+  const first = await threadPage();
+  await twoColumns(first);
+  const data = threadData();
+  const page = reloadWith(first.storage, data.messages, (p) => {
+    p.threadingSupported = true;
+    p.threads = data.threads;
+    p.wideDesk = true;
+  });
+  await reopenedChannel(page);
+  await page.settle();
+  assert.ok(inTwoColumns(page), "the reload forgot two columns");
+  assert.equal(page.el("column-toggle").getAttribute("aria-pressed"), "true");
+  assert.equal(page.el("thread-select").value, "main");
+  assert.deepStrictEqual(shownIds(page), ["200", "201", "203"]);
+  assert.equal(page.el("side-list").hidden, false, "the right column did not open on its list of threads");
+  // ...and a narrow window reloads in one column, in the view chosen there.
+  const narrow = reloadWith(page.storage, data.messages, (p) => {
+    p.threadingSupported = true;
+    p.threads = data.threads;
+  });
+  await reopenedChannel(narrow);
+  await narrow.settle();
+  assert.ok(!inTwoColumns(narrow));
+  assert.equal(narrow.el("thread-select").value, "flat");
+  assert.equal(narrow.el("thread-select").disabled, false);
+});
+
+test("`#229 desktop-two-column`: in two columns the view picker is greyed and says why, and the view keys say it too", async () => {
+  const page = await threadPage();
+  await twoColumns(page);
+  const picker = page.el("thread-select");
+  assert.equal(picker.disabled, true);
+  assert.match(picker.title, /^Two columns: Main is on the left and the thread on the right\./);
+  for (const key of ["1", "2", "3"]) {
+    const event = await press(page, page.el("scroll-area"), key);
+    assert.equal(event.defaulted, false, `${key} was left to the browser`);
+    assert.match(page.el("status").textContent, /^Two columns: Main is on the left/, `${key} did not say why it did nothing`);
+  }
+  assert.equal(page.screen(), "main", "2 opened the Threads screen in two columns");
+  assert.deepStrictEqual(shownIds(page), ["200", "201", "203"], "a view key changed the left column");
+});
+
+test("`#229 desktop-two-column`: with no thread selected, a card per thread, newest activity first, saying the summariser's name and summary or else its first message", async () => {
+  const page = newPage();
+  const data = threadData();
+  const [first, second] = data.threads;
+  first.display_name = "runner-wedged";
+  first.summary = "The overnight runner hung and was restarted by hand.";
+  // A name with no summary yet is not "name: nothing": the first message says more.
+  second.display_name = "half-named";
+  page.threadingSupported = true;
+  page.threads = data.threads;
+  await signIn(page);
+  await showDiscord(page, data.messages);
+  await twoColumns(page);
+  assert.equal(page.el("side-list").hidden, false);
+  assert.equal(page.el("side-pane").hidden, true);
+  assert.equal(page.el("side-close").hidden, true, "an X with nothing to close");
+  assert.equal(page.el("side-title").textContent, "Threads");
+  assert.deepStrictEqual(cardIds(page), [second.id, first.id], "the cards are not newest activity first");
+  assert.equal(cardPart(page, first.id, "side-card-text"), "runner-wedged: The overnight runner hung and was restarted by hand.");
+  assert.equal(cardPart(page, second.id, "side-card-text"), "second thread root");
+  assert.match(cardPart(page, first.id, "side-card-facts"), /^(now|\d+[mhdwy]|\d+d\d+h) · 1 reply/,
+    "the card does not say how long since the thread moved and how many replies it has");
+  for (const id of cardIds(page)) {
+    assert.ok(page.el("side-cards").children.find((li) => li.getAttribute("data-id") === id).hasAttribute("data-card"));
+  }
+  // Fixed height, three lines, cut with an ellipsis: the stylesheet's, since this fixture lays nothing out.
+  const text = cssBlockIn(TWO_COLUMN_QUERY, ".side-card-text");
+  assert.match(text, /-webkit-line-clamp:\s*3/);
+  assert.match(text, /overflow:\s*hidden/);
+  assert.match(text, /height:\s*calc\(3 \* 1\.35em\)/, "a card is not a fixed three lines tall");
+  // A long first message is given whole, its line breaks folded, for the clamp to cut.
+  page.threads = [];
+  const long = message({ id: "210", content: "a long first message\n\nthat runs over several lines " + "and on ".repeat(40),
+    thread: { id: "spaces/A/threads/long", root_message_id: "210", is_root: true, reply_count: 1, reply_count_exact: true } });
+  const answer = message({ id: "211", content: "answered", thread: { ...long.thread, is_root: false } });
+  page.messages = [...data.messages, long, answer];
+  await page.setDesk(true);
+  page.expireTimers(DISCORD_POLL_MS);
+  await page.settle();
+  await page.settle();
+  const said = cardPart(page, "spaces/A/threads/long", "side-card-text");
+  assert.ok(said && said.startsWith("a long first message that runs over several lines and on"), `the long card says ${said}`);
+});
+
+test("`#229 desktop-two-column`: every way into a thread selects it on the right — its tag, its N replies, a card — and a plain tap does not", async () => {
+  const page = await threadPage();
+  await twoColumns(page);
+  const [first, second] = threadData().threads;
+  // A tap on a message folds and unfolds it, as in one column: it does not select its thread.
+  await rowWithId(page, "201").click();
+  await page.settle();
+  assert.equal(page.el("side-list").hidden, false, "a plain tap on a root selected its thread");
+  // N replies, which in one column gathers the replies under the root.
+  await threadButton(rowWithId(page, "201")).click();
+  await page.settle();
+  assert.deepStrictEqual(sideIds(page), ["201", "202"], "N replies did not select the thread on the right");
+  assert.deepStrictEqual(shownIds(page), ["200", "201", "203"], "N replies changed the left column");
+  assert.equal(page.el("side-title").textContent, "First discussion", "the heading does not name the thread");
+  assert.match(page.el("side-facts").textContent, /^(now|\d+[mhdwy]|\d+d\d+h) · 1$/);
+  assert.equal(page.el("side-close").hidden, false);
+  assert.equal(page.el("side-pane").hidden, false);
+  assert.equal(page.el("side-list").hidden, true);
+  // Its tag, on the other root.
+  await threadBadge(rowWithId(page, "203")).click();
+  await page.settle();
+  assert.deepStrictEqual(sideIds(page), ["203", "204"]);
+  assert.equal(page.el("side-title").textContent, "Second discussion");
+  // The X: back to the cards, and a card selects.
+  await page.el("side-close").click();
+  await page.settle();
+  assert.equal(page.el("side-list").hidden, false, "the X did not go back to the list");
+  assert.equal(page.el("side-close").hidden, true);
+  assert.equal(page.el("side-title").textContent, "Threads");
+  const reads = page.timelineCalls.length;
+  await cardOf(page, first.id).click();
+  await page.settle();
+  assert.deepStrictEqual(sideIds(page), ["201", "202"], "a card did not select its thread");
+  // Drawn from what the page holds: All was read, and covers both threads.
+  assert.deepStrictEqual(readViewsSince(page, reads).filter((view) => view === "thread"), [],
+    "a thread the page holds was read again to be selected");
+  assert.equal(page.el("thread-select").value, "main", "selecting on the right moved the view picker");
+  assert.ok(second);
+});
+
+test("`#229 desktop-two-column`: the right column's composer posts into its thread, and the left column's into Main", async () => {
+  const page = await threadPage();
+  // The server's answer to a post in a thread carries the thread, as a provider's does.
+  const answer = page.replyResponse;
+  page.replyResponse = async (path, options) => {
+    const response = await answer(path, options);
+    const body = JSON.parse(options.body);
+    if (!body.thread_id) return response;
+    const sent = JSON.parse(await response.text());
+    const thread = { id: body.thread_id, root_message_id: "201", is_root: false, reply_count: null, reply_count_exact: false };
+    return json(200, { ...sent, posted: { ...sent.posted, thread } });
+  };
+  await twoColumns(page);
+  await threadBadge(rowWithId(page, "201")).click();
+  await page.settle();
+  assert.equal(page.el("side-compose-text").getAttribute("aria-label"), "Reply in this thread");
+  assert.equal(page.el("channel-compose-text").getAttribute("aria-label"), "Message the main channel",
+    "the left column's box stopped posting to Main");
+  page.el("side-compose-text").value = "answered from the right";
+  await page.el("side-send").click();
+  await page.settle();
+  assert.equal(page.repliesPosted.length, 1);
+  assert.equal(page.repliesPosted[0].body.thread_id, "spaces/A/threads/one & two", "the right column's box did not post in its thread");
+  assert.equal(page.el("side-compose-text").value, "", "the box was not emptied");
+  assert.ok(sideIds(page).includes("9000000000000000001"), "the acknowledged reply was not drawn in the thread");
+  assert.ok(!shownIds(page).includes("9000000000000000001"), "a thread's reply was drawn on Main");
+  page.el("channel-compose-text").value = "and one to Main";
+  await page.el("channel-send").click();
+  await page.settle();
+  assert.equal(page.repliesPosted.length, 2);
+  assert.equal(page.repliesPosted[1].body.thread_id, undefined, "the left column's box posted into the thread");
+});
+
+test("`#229 desktop-two-column`: a live reply goes to the thread on the right and is read once, as the thread; a live message to Main, read once as Main", async () => {
+  const { page, server, data } = await twoColumnServer();
+  await threadBadge(rowWithId(page, "201")).click();
+  await page.settle();
+  const first = data.messages[1].thread;
+  const reads = server.reads.length;
+  const reply = server.post(message({ id: "205", content: "a second answer", thread: { ...first, is_root: false } }));
+  await deliver(page, page.stream(), sseMessage(reply));
+  await page.settle();
+  assert.deepStrictEqual(sideIds(page), ["201", "202", "205"], "the live reply did not reach the thread on the right");
+  assert.ok(!shownIds(page).includes("205"), "a thread's reply was drawn on Main");
+  // One read, of the thread: in full, the first time — it was drawn from All's page, and has no
+  // forward position of its own yet — and never one of Main as well.
+  assert.deepStrictEqual(server.reads.slice(reads).map((read) => read.view), ["thread"],
+    `the live reply was not read once, as the thread: ${JSON.stringify(server.reads.slice(reads))}`);
+  assert.equal(threadButton(rowWithId(page, "201")).textContent, "2 replies", "Main's root did not count the reply");
+  // The next is read as what changed in the thread since.
+  const again = server.reads.length;
+  const third = server.post(message({ id: "207", content: "a third answer", thread: { ...first, is_root: false } }));
+  await deliver(page, page.stream(), sseMessage(third));
+  await page.settle();
+  assert.deepStrictEqual(sideIds(page), ["201", "202", "205", "207"]);
+  assert.deepStrictEqual(server.reads.slice(again).map((read) => [read.view, read.after !== null]), [["thread", true]],
+    `the second live reply was not read once, as the thread's delta: ${JSON.stringify(server.reads.slice(again))}`);
+
+  const later = server.reads.length;
+  const posted = server.post(message({ id: "206", content: "to the channel itself" }));
+  await deliver(page, page.stream(), sseMessage(posted));
+  await page.settle();
+  assert.ok(shownIds(page).includes("206"), "a live message to Main did not reach the left column");
+  assert.ok(!sideIds(page).includes("206"), "a Main message was drawn in the thread");
+  assert.deepStrictEqual(server.reads.slice(later).map((read) => read.view), ["main"]);
+});
+
+test("`#229 desktop-two-column`: the poll reads Main and the thread on the right, one delta each and never the same view twice, and a poll that brings nothing builds nothing in either column", async () => {
+  const { page, server } = await twoColumnServer();
+  await threadBadge(rowWithId(page, "203")).click();
+  await page.settle();
+  // The first poll reads the thread in full — drawn from All's page, it has no forward position of
+  // its own yet — and Main as what changed. From then on, both as what changed.
+  await pollOnce(page);
+  await page.settle();
+  const left = [...page.el("discord-log").children];
+  const right = [...page.el("side-log").children];
+  const made = page.createdTags.length;
+  const reads = server.reads.length;
+  await pollOnce(page);
+  await page.settle();
+  const polled = server.reads.slice(reads).map((read) => [read.view, read.after !== null]);
+  assert.deepStrictEqual(polled.map(([view]) => view).sort(), ["main", "thread"], `the poll read ${JSON.stringify(polled)}`);
+  assert.ok(polled.every(([, delta]) => delta), "a poll of a view read in this page was not a delta");
+  assert.ok(page.el("discord-log").children.every((li, at) => li === left[at]), "the left column's rows were replaced");
+  assert.ok(page.el("side-log").children.every((li, at) => li === right[at]), "the right column's rows were replaced");
+  assert.equal(builtSince(page, made, "li"), 0, "a poll that brought nothing built rows");
+  assert.equal(builtSince(page, made, "button"), 0, "a poll that brought nothing built controls");
+  assert.ok(page.el("discord-log").children.every((li, at) => li === left[at]), "the left column's rows were replaced");
+  assert.ok(page.el("side-log").children.every((li, at) => li === right[at]), "the right column's rows were replaced");
+  // With the cards up, the poll reads the thread list, at most once a minute, and not Main twice.
+  await page.el("side-close").click();
+  await page.settle();
+  const before = server.reads.length;
+  await pollOnce(page);
+  await page.settle();
+  const views = server.reads.slice(before).map((read) => read.view);
+  assert.equal(views.filter((view) => view === "main").length, 1, `Main was read ${JSON.stringify(views)}`);
+  assert.ok(views.filter((view) => view === "threads").length <= 1);
+  assert.ok(!views.includes("thread"), "a thread no longer shown was polled");
+});
+
+test("`#229 desktop-two-column`: one read mode for both columns, and Done in one column is Done in the other", async () => {
+  const page = await threadPage();
+  await twoColumns(page);
+  await threadBadge(rowWithId(page, "201")).click();
+  await page.settle();
+  // Done on the root, in the thread on the right: Main's row for it greys too.
+  await doneButton(sideRow(page, "201")).click();
+  await page.settle();
+  assert.equal(sideRow(page, "201").getAttribute("data-archived"), "true");
+  assert.equal(rowWithId(page, "201").getAttribute("data-archived"), "true", "Done on the right did not reach Main's row");
+  assert.deepStrictEqual(page.dismissCalls.map((call) => call.messages), [["201"]]);
+  // Hide read takes the read messages out of both columns.
+  await turnTodoOn(page);
+  assert.ok(!shownIds(page).includes("201") || unreadChip(page, "201"), "Hide read kept a read root with nothing unread");
+  assert.ok(!sideIds(page).includes("201"), "Hide read did not reach the right column");
+  assert.ok(sideIds(page).includes("202"), "Hide read hid the unread reply");
+  // Done on the reply, on the right: the root's count of unread replies on Main goes.
+  await doneButton(sideRow(page, "202")).click();
+  await page.settle();
+  assert.ok(!sideIds(page).includes("202"));
+  assert.equal(unreadChip(page, "201"), null, "Main still counts an unread reply that is Done on the right");
+});
+
+test("`#229 desktop-two-column`: the search and Links reach both columns, and the count speaks for both", async () => {
+  const page = await threadPage();
+  await twoColumns(page);
+  await threadBadge(rowWithId(page, "201")).click();
+  await page.settle();
+  await page.el("search-toggle").click();
+  await page.el("search-field").setValue("answer");
+  await page.settle();
+  const visible = (list) => page.el(list).children.filter((li) => !li.hasClass("search-hidden")).map((li) => li.getAttribute("data-id"));
+  assert.deepStrictEqual(visible("side-log"), ["202"], "the search did not reach the right column");
+  assert.deepStrictEqual(visible("discord-log"), [], "the left column was not searched");
+  assert.equal(page.el("search-count").textContent, "1 of 5 loaded", "the count does not speak for both columns");
+  assert.equal(page.el("search-empty").hidden, false, "the left column said nothing of its empty list");
+  assert.equal(page.el("side-search-empty").hidden, true);
+  await page.el("search-field").setValue("root");
+  await page.settle();
+  assert.deepStrictEqual(visible("discord-log"), ["201", "203"]);
+  assert.deepStrictEqual(visible("side-log"), ["201"]);
+  assert.equal(page.el("search-count").textContent, "3 of 5 loaded");
+  await page.el("search-toggle").click();
+  await page.settle();
+  assert.deepStrictEqual(visible("side-log"), ["201", "202"], "closing the search left the right column filtered");
+});
+
+test("`#229 desktop-two-column`: [ and ] move the keys between the columns, → selects a Main message's thread on the right, ← goes back, Esc closes the thread, and Enter opens a card", async () => {
+  const page = await threadPage();
+  await twoColumns(page);
+  page.el("scroll-area").focus();
+  await press(page, page.el("scroll-area"), "]");
+  assert.equal(focused(page), page.el("side-scroll"), `] did not give the keys to the right column: ${focusName(page)}`);
+  await press(page, focused(page), "j");
+  const card = page.el("side-cards").children[0];
+  assert.equal(focused(page), card, `j did not select the first card: ${focusName(page)}`);
+  await press(page, card, "j");
+  assert.equal(focused(page), page.el("side-cards").children[1]);
+  await press(page, focused(page), "Enter");
+  await page.settle();
+  assert.deepStrictEqual(sideIds(page), ["201", "202"], "Enter on a card did not select its thread");
+  await press(page, page.el("side-scroll"), "[");
+  assert.ok(focused(page) === page.el("scroll-area") || page.el("discord-log").children.includes(focused(page)),
+    `[ did not give the keys to the left column: ${focusName(page)}`);
+  // → on Main's other root: its thread on the right, the keys with it.
+  const root = rowWithId(page, "203");
+  root.focus();
+  FakeElement.focusVisible = true;
+  await press(page, root, "ArrowRight");
+  await page.settle();
+  assert.deepStrictEqual(sideIds(page), ["203", "204"], "→ did not select the thread on the right");
+  assert.deepStrictEqual(shownIds(page), ["200", "201", "203"], "→ left Main");
+  assert.ok(focused(page) === page.el("side-scroll") || page.el("side-log").children.includes(focused(page)),
+    `→ did not give the keys to the right column: ${focusName(page)}`);
+  // ← from the right: back to Main, the thread kept.
+  await press(page, focused(page), "ArrowLeft");
+  assert.ok(focused(page) === page.el("scroll-area") || page.el("discord-log").children.includes(focused(page)),
+    `← did not go back to the left column: ${focusName(page)}`);
+  assert.deepStrictEqual(sideIds(page), ["203", "204"], "← closed the thread");
+  // Esc in the right column is its X.
+  await press(page, page.el("side-scroll"), "Escape");
+  await page.settle();
+  assert.equal(page.el("side-list").hidden, false, "Esc in the right column did not close its thread");
+  assert.deepStrictEqual(shownIds(page), ["200", "201", "203"], "Esc changed the left column");
+  // The keys are listed, and [ and ] are not on a phone's list as if they did something there.
+  assert.ok(page.el("keyboard-keys").text().includes("In two columns"), "the list of keys does not name [ and ]");
+});
+
+test("`#229 desktop-two-column`: leaving two columns returns to the view last chosen in one, and the thread selected comes back with two", async () => {
+  const page = await threadPage("main");
+  await pickThread(page, "thread:spaces/A/threads/another");
+  assert.equal(page.el("thread-select").value, "thread:spaces/A/threads/another");
+  const name = page.el("thread-title").textContent;
+  // Into two columns from a thread: Main on the left, that thread on the right.
+  await twoColumns(page);
+  assert.deepStrictEqual(shownIds(page), ["200", "201", "203"]);
+  assert.deepStrictEqual(sideIds(page), ["203", "204"], "the thread open in one column did not go to the right");
+  await page.el("column-toggle").click();
+  await page.settle();
+  assert.equal(page.el("thread-select").value, "thread:spaces/A/threads/another",
+    "one column again is not the view last chosen there");
+  await page.el("column-toggle").click();
+  await page.settle();
+  assert.deepStrictEqual(sideIds(page), ["203", "204"], "the thread selected was forgotten");
+  // Named as one column named it.
+  assert.equal(page.el("side-title").textContent, name);
 });

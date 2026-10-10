@@ -789,6 +789,7 @@ body {
 }
 
 /* N replies gives up its line to share it. */
+#side-log li.discord-message[data-unread-replies] > .thread-replies,
 #discord-log li.discord-message[data-unread-replies] > .thread-replies {
   display: inline-block;
 }
@@ -837,6 +838,7 @@ body {
 
 /* Local sends live beside the confirmed history until their provider IDs arrive. They look like
    the reader's own messages, but carry delivery state instead of actions on a server message. */
+#side-outgoing-log .outgoing-message,
 #outgoing-log .outgoing-message {
   background: var(--mine);
   border-color: var(--mine-edge);
@@ -845,6 +847,7 @@ body {
   overflow-wrap: anywhere;
 }
 
+#side-outgoing-log .msg-text,
 #outgoing-log .msg-text {
   white-space: pre-wrap;
   font-size: calc(0.88rem * var(--msg-scale));
@@ -894,6 +897,7 @@ body {
   .channel-loading::before { animation: none; }
 }
 
+#side-composer,
 #channel-composer {
   display: grid;
   gap: 0.5rem;
@@ -906,6 +910,7 @@ body {
   border-top: 1px solid var(--edge);
 }
 
+#side-compose-text,
 #channel-compose-text {
   width: 100%;
   box-sizing: border-box;
@@ -915,6 +920,7 @@ body {
   font-size: max(1rem, 16px);
 }
 
+#side-send,
 #channel-send {
   justify-self: end;
   min-width: 5rem;
@@ -1094,6 +1100,7 @@ body {
  * `me` includes the voice bot, because it posts on the owner's behalf. The words are his; the
  * account that delivered them is an implementation detail of this bridge.
  */
+#side-log li.discord-message[data-who="me"],
 #discord-log li.discord-message[data-who="me"],
 #pinned-log li.discord-message[data-who="me"] {
   background: var(--mine);
@@ -1122,6 +1129,7 @@ body {
  * They still cannot be confused with the owner's own messages, which keep their right indent AND
  * their colour -- two signals, either of which would do on its own.
  */
+#side-log li.discord-message[data-who="coder"],
 #discord-log li.discord-message[data-who="coder"],
 #pinned-log li.discord-message[data-who="coder"] {
   background: var(--theirs);
@@ -1143,8 +1151,10 @@ body {
  *
  * Warm rather than a third blue, so it is not read as a variant of `me`, and centred between the
  * two insets so the geometry still says "neither side of this conversation". */
+#side-log li.discord-message[data-who="human"],
 #discord-log li.discord-message[data-who="human"],
 #pinned-log li.discord-message[data-who="human"],
+#side-log li.discord-message[data-who="bot"],
 #discord-log li.discord-message[data-who="bot"],
 #pinned-log li.discord-message[data-who="bot"] {
   background: var(--third);
@@ -1249,12 +1259,14 @@ body {
  * amount is declared where its opacity used to be, with the same weight and the same place in the
  * file — so every row that is not a reply is drawn exactly as before.
  */
+#side-log li.discord-message,
 #discord-log li.discord-message,
 #pinned-log li.discord-message {
   opacity: var(--row-opacity, 1);
   filter: var(--row-filter, none);
 }
 
+#side-log li.discord-message[data-replied="true"],
 #discord-log li.discord-message[data-replied="true"],
 #pinned-log li.discord-message[data-replied="true"] {
   --row-opacity: 0.55;
@@ -1276,8 +1288,10 @@ body {
  * Declared AFTER the replied rule so a row that is both lands here, which is the right way round:
  * archived is the reader's own decision and outranks an inference about what happens to be loaded.
  */
+#side-log li.discord-message[data-archived="true"],
 #discord-log li.discord-message[data-archived="true"],
 #pinned-log li.discord-message[data-archived="true"],
+#side-log li.discord-message[data-own-read="true"],
 #discord-log li.discord-message[data-own-read="true"],
 #pinned-log li.discord-message[data-own-read="true"] {
   --row-opacity: 0.42;
@@ -1295,6 +1309,7 @@ body {
  * Not hidden: hiding is Hide read's job, and a row that vanished from the channel view could not be
  * rescued with Not noise when a rule caught a real message.
  */
+#side-log li.discord-message[data-noise="true"],
 #discord-log li.discord-message[data-noise="true"],
 #pinned-log li.discord-message[data-noise="true"] {
   --row-opacity: 0.32;
@@ -1307,10 +1322,13 @@ body {
    Reply and an Unarchive, and a control nobody can read is a control that looks broken. The
    opacity half of this is handled by the shared rules below; the tint has to be restored here
    because `filter` does not inherit that treatment. */
+#side-log li.discord-message[data-archived="true"]:focus-within,
 #discord-log li.discord-message[data-archived="true"]:focus-within,
 #pinned-log li.discord-message[data-archived="true"]:focus-within,
+#side-log li.discord-message[data-own-read="true"]:focus-within,
 #discord-log li.discord-message[data-own-read="true"]:focus-within,
 #pinned-log li.discord-message[data-own-read="true"]:focus-within,
+#side-log li.discord-message[data-noise="true"]:focus-within,
 #discord-log li.discord-message[data-noise="true"]:focus-within,
 #pinned-log li.discord-message[data-noise="true"]:focus-within {
   --row-filter: none;
@@ -1342,6 +1360,7 @@ body {
  * the row has, so on the left it runs on from the hairline as one wider bar, and it costs the row
  * no width.
  */
+#side-log li.discord-message[data-reading="true"],
 #discord-log li.discord-message[data-reading="true"],
 #pinned-log li.discord-message[data-reading="true"] {
   --row-opacity: 1;
@@ -1369,6 +1388,7 @@ body {
  * promise the reader can still take back with a second tap, and the filled one is an event they
  * cannot. So the promise gets an edge and the event gets the surface.
  */
+#side-log li.discord-message[data-pending="true"],
 #discord-log li.discord-message[data-pending="true"],
 #pinned-log li.discord-message[data-pending="true"] {
   --row-opacity: 1;
@@ -1386,6 +1406,7 @@ body {
 
 /* A reader who has asked not to be moved is not asking to be moved by this either. */
 @media (prefers-reduced-motion: reduce) {
+  #side-log li.discord-message[data-pending="true"],
   #discord-log li.discord-message[data-pending="true"],
   #pinned-log li.discord-message[data-pending="true"] {
     animation: none;
@@ -1420,6 +1441,7 @@ body {
  * to come back to it. It must be findable once they are near it and must not compete with the row
  * that is actually speaking.
  */
+#side-log li.discord-message[data-marked="true"],
 #discord-log li.discord-message[data-marked="true"],
 #pinned-log li.discord-message[data-marked="true"] {
   box-shadow: inset 0.2rem 0 0 var(--accent);
@@ -1439,6 +1461,7 @@ body {
  * width. On the coder tile — which is most of what a backlog is, and runs edge to edge — the row
  * IS the full width, so nothing is lost where it matters.
  */
+#side-log li.discord-message[data-marked="true"]::before,
 #discord-log li.discord-message[data-marked="true"]::before,
 #pinned-log li.discord-message[data-marked="true"]::before {
   content: "";
@@ -1452,6 +1475,7 @@ body {
 }
 
 /* ...except when it IS the row speaking, where the loud state wins outright. */
+#side-log li.discord-message[data-marked="true"][data-reading="true"],
 #discord-log li.discord-message[data-marked="true"][data-reading="true"],
 #pinned-log li.discord-message[data-marked="true"][data-reading="true"] {
   box-shadow: inset 0.25rem 0 0 var(--warn);
@@ -1477,6 +1501,7 @@ body {
  * At least the arrow's height, so the arrow can never hang below its own row and over the head of
  * the next one.
  */
+#side-log li.discord-message[data-is-reply="true"][data-who],
 #discord-log li.discord-message[data-is-reply="true"][data-who] {
   margin-left: var(--reply-gutter);
   min-height: var(--reply-gutter);
@@ -1484,6 +1509,7 @@ body {
 
 /* Inside the list's own gutter, which is clear of a notch already, so its words need no room for
    one. */
+#side-log li.discord-message[data-is-reply="true"][data-who="coder"],
 #discord-log li.discord-message[data-is-reply="true"][data-who="coder"] {
   padding-left: 0.4rem;
 }
@@ -1521,9 +1547,13 @@ body {
  * recede — a message with a reply is an answered one (`data-replied`) — and it is on exactly those
  * that a faded circle would be the faint mark the owner called useless.
  */
+#side-log li.discord-message[data-is-reply="true"][data-who],
 #discord-log li.discord-message[data-is-reply="true"][data-who],
+#side-log li.discord-message[data-stack-under][data-who],
 #discord-log li.discord-message[data-stack-under][data-who],
+#side-log li.discord-message[data-unread-replies][data-who],
 #discord-log li.discord-message[data-unread-replies][data-who],
+#side-log li.discord-message[data-reply-marker][data-who],
 #discord-log li.discord-message[data-reply-marker][data-who] {
   opacity: 1;
   filter: none;
@@ -1531,15 +1561,20 @@ body {
   background-blend-mode: saturation;
 }
 
+#side-log li.discord-message[data-is-reply="true"] > :not(.reply-jump):not(.reply-bridge):not(.reply-ungather),
 #discord-log li.discord-message[data-is-reply="true"] > :not(.reply-jump):not(.reply-bridge):not(.reply-ungather),
+#side-log li.discord-message[data-stack-under] > :not(.reply-jump):not(.reply-bridge):not(.reply-ungather),
 #discord-log li.discord-message[data-stack-under] > :not(.reply-jump):not(.reply-bridge):not(.reply-ungather),
+#side-log li.discord-message[data-unread-replies] > :not(.thread-unread):not(.reply-jump):not(.reply-bridge):not(.reply-ungather),
 #discord-log li.discord-message[data-unread-replies] > :not(.thread-unread):not(.reply-jump):not(.reply-bridge):not(.reply-ungather),
+#side-log li.discord-message[data-reply-marker] > :not(.reply-marker):not(.reply-jump):not(.reply-bridge):not(.reply-ungather),
 #discord-log li.discord-message[data-reply-marker] > :not(.reply-marker):not(.reply-jump):not(.reply-bridge):not(.reply-ungather) {
   filter: var(--row-filter, none);
 }
 
 /* The unread count, over the veil and in its own colour. Weighed above the rule over a reply's
    parts, for a root that is also a reply. */
+#side-log li.discord-message[data-unread-replies] > .thread-unread:not(.reply-jump):not(.reply-bridge):not(.reply-ungather),
 #discord-log li.discord-message[data-unread-replies] > .thread-unread:not(.reply-jump):not(.reply-bridge):not(.reply-ungather) {
   position: relative;
   z-index: 1;
@@ -1550,9 +1585,13 @@ body {
    shadow is not scrollable overflow, and the agent's tile meets the edge of the list. The second
    shadow, under the veil, is the border's colour drained: the neutral edge in place of a speaker's
    tinted one, at `--row-grey`. */
+#side-log li.discord-message[data-is-reply="true"]::after,
 #discord-log li.discord-message[data-is-reply="true"]::after,
+#side-log li.discord-message[data-stack-under]::after,
 #discord-log li.discord-message[data-stack-under]::after,
+#side-log li.discord-message[data-unread-replies]::after,
 #discord-log li.discord-message[data-unread-replies]::after,
+#side-log li.discord-message[data-reply-marker]::after,
 #discord-log li.discord-message[data-reply-marker]::after {
   --row-veil: color-mix(in srgb, var(--bg) calc((1 - var(--row-opacity, 1)) * 100%), transparent);
   content: "";
@@ -1577,6 +1616,7 @@ body {
  * TOP for a reply to the row directly above, whose arrow reaches up to that row. Either way one
  * touch target square inside the row's height: a reply is at least a gutter tall.
  */
+#side-log .reply-jump,
 #discord-log .reply-jump {
   --reply-stroke: 0.1875rem;
   position: absolute;
@@ -1596,6 +1636,7 @@ body {
 
 /* The gap between this row and the one above: a row's own margin under it, and this row's top
    border, which the square's `top: 0` is inside. An arrow that rises by this meets the row above. */
+#side-log .reply-jump[data-reply-style="adjacent"],
 #discord-log .reply-jump[data-reply-style="adjacent"] {
   --reply-rise: calc(0.5rem + 1px);
   top: 0;
@@ -1619,6 +1660,7 @@ body {
  * and the box a corner is drawn in is mostly empty: over the row above's gutter it would take presses
  * from that row's own arrow where nothing of this one is drawn.
  */
+#side-log .reply-jump-mark,
 #discord-log .reply-jump-mark {
   position: absolute;
   right: 0;
@@ -1626,13 +1668,16 @@ body {
   pointer-events: none;
 }
 
+#side-log .reply-jump-mark::before,
 #discord-log .reply-jump-mark::before,
+#side-log .reply-jump-mark::after,
 #discord-log .reply-jump-mark::after {
   content: "";
   position: absolute;
   box-sizing: border-box;
 }
 
+#side-log .reply-jump-mark::after,
 #discord-log .reply-jump-mark::after {
   pointer-events: auto;
 }
@@ -1647,6 +1692,7 @@ body {
  * bar turned about the stub's end; and the head is `::after`, a right-angled triangle whose right
  * angle is the point, so that the run is its axis.
  */
+#side-log .reply-jump[data-reply-style="disconnected"] .reply-jump-mark,
 #discord-log .reply-jump[data-reply-style="disconnected"] .reply-jump-mark {
   top: calc(50% - 1.2rem);
   width: 1.7rem;
@@ -1654,6 +1700,7 @@ body {
   background: linear-gradient(currentColor, currentColor) no-repeat right bottom / 0.55rem var(--reply-stroke);
 }
 
+#side-log .reply-jump[data-reply-style="disconnected"] .reply-jump-mark::before,
 #discord-log .reply-jump[data-reply-style="disconnected"] .reply-jump-mark::before {
   right: calc(0.5rem - var(--reply-stroke) / 2);
   bottom: 0;
@@ -1667,6 +1714,7 @@ body {
 
 /* Placed by its point, at the drawing box's top left: a browser rounds a border's width to whole
    pixels, so a head placed by its far side would put its point a fraction of a pixel off the run. */
+#side-log .reply-jump[data-reply-style="disconnected"] .reply-jump-mark::after,
 #discord-log .reply-jump[data-reply-style="disconnected"] .reply-jump-mark::after {
   top: 0.087rem;
   left: 0.087rem;
@@ -1684,6 +1732,7 @@ body {
  * Where the row above starts further right than the shaft, web/voice.js measures how far
  * (`measureReplyArrows`) and the shaft moves right by `--reply-shift` to come up under its edge.
  */
+#side-log .reply-jump[data-reply-style="adjacent"] .reply-jump-mark,
 #discord-log .reply-jump[data-reply-style="adjacent"] .reply-jump-mark {
   top: calc(0.45rem - var(--reply-rise));
   bottom: calc(100% - 1.35rem);
@@ -1693,11 +1742,13 @@ body {
   border-bottom-left-radius: 0.55rem;
 }
 
+#side-log .reply-jump[data-reply-style="adjacent"] .reply-jump-mark::before,
 #discord-log .reply-jump[data-reply-style="adjacent"] .reply-jump-mark::before {
   content: none;
 }
 
 /* The head, a solid triangle centred on the shaft, its point on the row above's bottom edge. */
+#side-log .reply-jump[data-reply-style="adjacent"] .reply-jump-mark::after,
 #discord-log .reply-jump[data-reply-style="adjacent"] .reply-jump-mark::after {
   left: calc(var(--reply-stroke) / -2);
   top: -0.45rem;
@@ -1714,11 +1765,13 @@ body {
  * rounded corner. `--reply-run` is the measured distance from the shaft to that side. The lower
  * corner is the span; the upper, with the run along to the head, is `::before`.
  */
+#side-log .reply-jump[data-reply-reach="side"] .reply-jump-mark,
 #discord-log .reply-jump[data-reply-reach="side"] .reply-jump-mark {
   top: calc(-1 * var(--reply-rise));
   width: calc(1.2rem + var(--reply-stroke) / 2);
 }
 
+#side-log .reply-jump[data-reply-reach="side"] .reply-jump-mark::before,
 #discord-log .reply-jump[data-reply-reach="side"] .reply-jump-mark::before {
   content: "";
   left: calc(-1 * var(--reply-stroke));
@@ -1731,6 +1784,7 @@ body {
 }
 
 /* Placed by its point, which is its right side, for the reason the other arrow's head is. */
+#side-log .reply-jump[data-reply-reach="side"] .reply-jump-mark::after,
 #discord-log .reply-jump[data-reply-reach="side"] .reply-jump-mark::after {
   left: auto;
   right: calc(1.2rem - var(--reply-run, 0px));
@@ -1745,11 +1799,14 @@ body {
 /* Pressed, and reached by keyboard: a soft disc behind the arrow, so the target shows itself. A
    pointer gets the same under hover, in the pointer query beside the row's own tint and for the
    same reason — a touch screen leaves `:hover` stuck on whatever was tapped last. */
+#side-log .reply-jump:active,
 #discord-log .reply-jump:active,
+#side-log .reply-jump:focus-visible,
 #discord-log .reply-jump:focus-visible {
   background: color-mix(in srgb, var(--accent) 18%, transparent);
 }
 
+#side-log .reply-jump:focus-visible,
 #discord-log .reply-jump:focus-visible {
   outline: 2px solid var(--accent);
   outline-offset: -2px;
@@ -1780,6 +1837,7 @@ body {
  * Positioned against the row, never measured: placing it costs the page no layout of its own
  * (`#226 page-energy-profile`).
  */
+#side-log .reply-marker,
 #discord-log .reply-marker {
   --reply-marker-dot: 0.7rem;
   --reply-marker-target: 1.75rem;
@@ -1801,6 +1859,7 @@ body {
   cursor: pointer;
 }
 
+#side-log .reply-marker::before,
 #discord-log .reply-marker::before {
   content: "";
   position: absolute;
@@ -1814,6 +1873,7 @@ body {
 
 /* At full strength on a receding row, as the arrow is: weighed above the rule over a reply's parts,
    for a row that is a reply and has replies of its own. */
+#side-log li.discord-message[data-reply-marker] > .reply-marker:not(.reply-jump):not(.reply-bridge):not(.reply-ungather),
 #discord-log li.discord-message[data-reply-marker] > .reply-marker:not(.reply-jump):not(.reply-bridge):not(.reply-ungather) {
   filter: none;
 }
@@ -1826,16 +1886,20 @@ body {
  * those are set in by a gutter, and their corner has room. A desk puts the tile inside the reading
  * column, and the disc back on the corner (the desktop block at the foot of this file).
  */
+#side-log li.discord-message[data-who="coder"]:not([data-is-reply="true"]):not([data-stack-under]) > .reply-marker,
 #discord-log li.discord-message[data-who="coder"]:not([data-is-reply="true"]):not([data-stack-under]) > .reply-marker {
   left: calc(env(safe-area-inset-left) - 1px - (var(--reply-marker-target) - var(--reply-marker-dot)) / 2);
 }
 
 /* Pressed, and reached by keyboard: a halo round the disc, and the arrow's own ring round its target. */
+#side-log .reply-marker:active::before,
 #discord-log .reply-marker:active::before,
+#side-log .reply-marker:focus-visible::before,
 #discord-log .reply-marker:focus-visible::before {
   box-shadow: 0 0 0 0.25rem color-mix(in srgb, var(--accent) 30%, transparent);
 }
 
+#side-log .reply-marker:focus-visible,
 #discord-log .reply-marker:focus-visible {
   outline: 2px solid var(--accent);
   outline-offset: -2px;
@@ -1854,14 +1918,17 @@ body {
  *     (`data-reply-lift`): still on the box's edge, its disc inside the side padding, where nothing
  *     but space is. Elsewhere the head is far enough along the foot, and the circle stays put.
  */
+#side-log .reply-jump[data-reply-reach="side"][data-reply-hub] .reply-jump-mark::before,
 #discord-log .reply-jump[data-reply-reach="side"][data-reply-hub] .reply-jump-mark::before {
   height: calc(1.4rem + var(--reply-stroke) / 2 + 1px);
 }
 
+#side-log .reply-jump[data-reply-reach="side"][data-reply-hub] .reply-jump-mark::after,
 #discord-log .reply-jump[data-reply-reach="side"][data-reply-hub] .reply-jump-mark::after {
   top: -1.4rem;
 }
 
+#side-log li.discord-message[data-reply-lift] > .reply-marker,
 #discord-log li.discord-message[data-reply-lift] > .reply-marker {
   bottom: calc(-1px - var(--reply-marker-target) / 2 + 0.7rem);
 }
@@ -1884,28 +1951,35 @@ body {
  * At least a gutter tall, so the X — a touch target square, in the first reply's gutter — never hangs
  * over the next reply.
  */
+#side-log li.discord-message[data-stack-under][data-who],
 #discord-log li.discord-message[data-stack-under][data-who] {
   min-height: var(--reply-gutter);
 }
 
+#side-log li.discord-message[data-stack-under="coder"][data-who],
 #discord-log li.discord-message[data-stack-under="coder"][data-who] {
   margin-left: calc(var(--reply-gutter) - 0.75rem - env(safe-area-inset-left));
 }
 
+#side-log li.discord-message[data-stack-under="me"][data-who],
 #discord-log li.discord-message[data-stack-under="me"][data-who] {
   margin-left: calc(var(--speaker-inset) + var(--reply-gutter));
 }
 
+#side-log li.discord-message[data-stack-under="third"][data-who],
 #discord-log li.discord-message[data-stack-under="third"][data-who] {
   margin-left: calc(var(--speaker-inset) / 2 + var(--reply-gutter));
 }
 
+#side-log li.discord-message[data-stack-under="reply"][data-who],
 #discord-log li.discord-message[data-stack-under="reply"][data-who],
+#side-log li.discord-message[data-stack-under="me-reply"][data-who],
 #discord-log li.discord-message[data-stack-under="me-reply"][data-who] {
   margin-left: calc(var(--reply-gutter) * 2);
 }
 
 /* The agent's tile keeps a left edge for its line to meet, as the agent's reply does. */
+#side-log li.discord-message[data-stack-under][data-who="coder"],
 #discord-log li.discord-message[data-stack-under][data-who="coder"] {
   padding-left: 0.4rem;
   border-left: 1px solid var(--edge);
@@ -1915,6 +1989,7 @@ body {
 /* The bridge stands in for the arrow. Every reply in the stack is there because what it answers is
    the parent or another reply in the stack, a reply to a reply as much as one to the parent; one tap
    on an arrow means that message, and it is back in its row once the stack is put away. */
+#side-log li.discord-message[data-stack-under] > .reply-jump,
 #discord-log li.discord-message[data-stack-under] > .reply-jump {
   display: none;
 }
@@ -1926,6 +2001,7 @@ body {
  * next reply's part starts where this one ends, so the spine is one line however tall each reply
  * is, folded or open, and at any type size: every length is the rows' own or in `rem`.
  */
+#side-log .reply-bridge,
 #discord-log .reply-bridge {
   --reply-stroke: 0.1875rem;
   --reply-rise: calc(0.5rem + 1px);
@@ -1940,6 +2016,7 @@ body {
   pointer-events: none;
 }
 
+#side-log .reply-bridge::after,
 #discord-log .reply-bridge::after {
   content: "";
   position: absolute;
@@ -1951,7 +2028,9 @@ body {
 }
 
 /* The last reply's part ends in its own line, round the corner, as the arrow's leg does. */
+#side-log li.discord-message[data-coalesce="last"] > .reply-bridge,
 #discord-log li.discord-message[data-coalesce="last"] > .reply-bridge,
+#side-log li.discord-message[data-coalesce="only"] > .reply-bridge,
 #discord-log li.discord-message[data-coalesce="only"] > .reply-bridge {
   bottom: auto;
   height: calc(var(--reply-rise) + 1.35rem);
@@ -1959,7 +2038,9 @@ body {
   border-bottom-left-radius: 0.55rem;
 }
 
+#side-log li.discord-message[data-coalesce="last"] > .reply-bridge::after,
 #discord-log li.discord-message[data-coalesce="last"] > .reply-bridge::after,
+#side-log li.discord-message[data-coalesce="only"] > .reply-bridge::after,
 #discord-log li.discord-message[data-coalesce="only"] > .reply-bridge::after {
   content: none;
 }
@@ -1970,6 +2051,7 @@ body {
  * "floating to the left of the bridge connection", in the owner's words. Over the spine, the square
  * is still the X's: the bridge takes no taps.
  */
+#side-log .reply-ungather,
 #discord-log .reply-ungather {
   position: absolute;
   top: 0;
@@ -1986,6 +2068,7 @@ body {
   cursor: pointer;
 }
 
+#side-log .reply-ungather-mark,
 #discord-log .reply-ungather-mark {
   position: absolute;
   top: calc(1.35rem - 0.09375rem - 0.6rem);
@@ -1999,7 +2082,9 @@ body {
   pointer-events: none;
 }
 
+#side-log .reply-ungather-mark::before,
 #discord-log .reply-ungather-mark::before,
+#side-log .reply-ungather-mark::after,
 #discord-log .reply-ungather-mark::after {
   content: "";
   position: absolute;
@@ -2012,15 +2097,19 @@ body {
   transform: translate(-50%, -50%) rotate(45deg);
 }
 
+#side-log .reply-ungather-mark::after,
 #discord-log .reply-ungather-mark::after {
   transform: translate(-50%, -50%) rotate(-45deg);
 }
 
+#side-log .reply-ungather:active,
 #discord-log .reply-ungather:active,
+#side-log .reply-ungather:focus-visible,
 #discord-log .reply-ungather:focus-visible {
   background: color-mix(in srgb, var(--accent) 18%, transparent);
 }
 
+#side-log .reply-ungather:focus-visible,
 #discord-log .reply-ungather:focus-visible {
   outline: 2px solid var(--accent);
   outline-offset: -2px;
@@ -2035,6 +2124,7 @@ body {
  * beneath it; and the row comes back to full strength while it is lit, because the message a reply
  * answers is usually dimmed as answered (`data-replied`) — the very row being looked for.
  */
+#side-log li.discord-message[data-landed="true"],
 #discord-log li.discord-message[data-landed="true"] {
   --row-opacity: 1;
   --row-filter: none;
@@ -2043,6 +2133,7 @@ body {
 
 /* Declared after the veil a reply's box recedes under, and weighing the same, so on a lit reply
    this takes the pseudo-element: a lit row is at full strength, and has no veil to draw. */
+#side-log li.discord-message[data-landed="true"]::after,
 #discord-log li.discord-message[data-landed="true"]::after {
   content: "";
   position: absolute;
@@ -2062,6 +2153,7 @@ body {
 
 /* Lit and then simply gone, for a reader who has asked the page not to animate. */
 @media (prefers-reduced-motion: reduce) {
+  #side-log li.discord-message[data-landed="true"]::after,
   #discord-log li.discord-message[data-landed="true"]::after {
     animation: none;
   }
@@ -2079,6 +2171,7 @@ body {
  * specific as this one, keyed on the very states every row in a run is in, and a line wearing a
  * speaker's tile is not a line.
  */
+#side-log li.discord-message[data-read-run="head"],
 #discord-log li.discord-message[data-read-run="head"] {
   --row-opacity: 1 !important;
   --row-filter: none !important;
@@ -2097,11 +2190,14 @@ body {
   min-height: 0 !important;
 }
 
+#side-log li.discord-message[data-read-run="head"]::before,
 #discord-log li.discord-message[data-read-run="head"]::before,
+#side-log li.discord-message[data-read-run="head"]::after,
 #discord-log li.discord-message[data-read-run="head"]::after {
   content: none !important;
 }
 
+#side-log li.discord-message[data-read-run="head"] > :not(.read-run),
 #discord-log li.discord-message[data-read-run="head"] > :not(.read-run) {
   display: none !important;
 }
@@ -2111,6 +2207,7 @@ body {
  * thumb tall, because opening it is the one thing to do with it. A hairline runs out from each side
  * of the words, so it reads as a seam in the list rather than as another message.
  */
+#side-log .read-run,
 #discord-log .read-run {
   display: flex;
   align-items: center;
@@ -2132,7 +2229,9 @@ body {
   -webkit-tap-highlight-color: transparent;
 }
 
+#side-log .read-run::before,
 #discord-log .read-run::before,
+#side-log .read-run::after,
 #discord-log .read-run::after {
   content: "";
   flex: 1 1 0;
@@ -2140,12 +2239,15 @@ body {
   border-top: 1px dashed var(--edge);
 }
 
+#side-log .read-run:active,
 #discord-log .read-run:active,
+#side-log .read-run:focus-visible,
 #discord-log .read-run:focus-visible {
   background: color-mix(in srgb, var(--accent) 14%, transparent);
   color: var(--ink);
 }
 
+#side-log .read-run:focus-visible,
 #discord-log .read-run:focus-visible {
   outline: 2px solid var(--accent);
   outline-offset: -2px;
@@ -2179,6 +2281,7 @@ body {
 
 /* Anchor for the mark above, and the reason a swipe can move the row: a transform on a static
    element still paints, but the strike would travel with it and the row's own box would not. */
+#side-log li.discord-message,
 #discord-log li.discord-message,
 #pinned-log li.discord-message {
   position: relative;
@@ -2191,6 +2294,7 @@ body {
    The hover half of this pair is inside the pointer query above, and the split is not cosmetic — a
    tap on a touch screen leaves `:hover` stuck on the row it landed on, so a phone would end up with
    one permanently undimmed row and no way to clear it. Same rule, same reason, as the row tint. */
+#side-log li.discord-message:focus-within,
 #discord-log li.discord-message:focus-within,
 #pinned-log li.discord-message:focus-within {
   --row-opacity: 1;
@@ -2201,6 +2305,7 @@ body {
    gesture and bails out of anything that is mostly vertical. The transition is for the SNAP BACK —
    the drag itself sets `transition: none` while a finger is down, because a transform that eases
    toward the finger reads as lag. */
+#side-log li.discord-message,
 #discord-log li.discord-message,
 #pinned-log li.discord-message {
   touch-action: pan-y;
@@ -2324,6 +2429,7 @@ body {
    the list, and it visibly moves. So none is drawn on the lists themselves; everything focusable
    inside them keeps its own. */
 #scroll-area:focus,
+#side-scroll:focus,
 #reply-scroll:focus,
 .screen:focus {
   outline: none;
@@ -2466,6 +2572,7 @@ body {
  * Applied to the row rather than to the note, and with the tint applied over every `data-who`
  * colour, because the three speaker colours are what the reader is otherwise reading the row by.
  */
+#side-log li.discord-message[data-summarised="true"],
 #discord-log li.discord-message[data-summarised="true"],
 #pinned-log li.discord-message[data-summarised="true"] {
   background: var(--summary-bg);
@@ -2501,6 +2608,7 @@ body {
  *     filed — which is the case where they would otherwise never learn that the money was spent
  *     and nothing came back.
  */
+#side-log li.discord-message[data-summary-failed="true"],
 #discord-log li.discord-message[data-summary-failed="true"],
 #pinned-log li.discord-message[data-summary-failed="true"] {
   background: var(--summary-fail-bg);
@@ -2513,6 +2621,7 @@ body {
 
 /* The two words, in the failure's own ink. The tint says something is wrong at a glance; this is
    the part a screen reader can say and a greyscale screenshot still carries. */
+#side-log li.discord-message[data-summary-failed="true"] .summary-mark,
 #discord-log li.discord-message[data-summary-failed="true"] .summary-mark,
 #pinned-log li.discord-message[data-summary-failed="true"] .summary-mark {
   color: var(--summary-fail-ink);
@@ -2536,6 +2645,7 @@ body {
 
 /* The standing sentence naming the summariser, at the head of the channel view while the mode is
    on. Quiet, because it is a fact about the view rather than a message. */
+#side-summary-note,
 #summary-note {
   margin: 0 0 0.4rem;
 }
@@ -2543,6 +2653,7 @@ body {
 /* ...except when what it is stating is that this server cannot summarise at all. That is the one
    thing this line ever says that the reader has to ACT on, and the reported failure of its
    predecessor is precisely that a quiet grey hint at the head of a view goes unread for weeks. */
+#side-summary-note[data-unavailable="true"],
 #summary-note[data-unavailable="true"] {
   color: var(--summary-fail-ink);
   font-weight: 600;
@@ -2570,6 +2681,7 @@ body {
  * wherever the button is. No `white-space: nowrap` — a menu wider than the row wraps its labels
  * instead, each item growing taller rather than any item, or the menu, running off the screen.
  */
+#side-log .meta,
 #discord-log .meta,
 #pinned-log .meta {
   position: relative;
@@ -2685,6 +2797,7 @@ body {
 /* `left: auto` because a reply already draws its veil on this same pseudo-element with `inset: 0`,
    and with both sides set and a width the box is overconstrained and the right one is dropped: the
    gold edge landed on a pinned reply's LEFT side, against its arrow. */
+#side-log li.discord-message[data-pinned="true"]::after,
 #discord-log li.discord-message[data-pinned="true"]::after,
 #pinned-log li.discord-message[data-pinned="true"]::after {
   content: "";
@@ -2822,6 +2935,7 @@ body {
 }
 
 
+#side-inbox-note,
 #inbox-note {
   margin: 0 0 0.4rem;
 }
@@ -2830,11 +2944,13 @@ body {
    the colour, and only the second acts. Same treatment, because a reader who has learnt one of
    these has learnt the other, and two different confirmation idioms on one screen is worse than
    either. */
+#side-clear-backlog,
 #clear-backlog {
   display: block;
   margin: 0 0 0.4rem;
 }
 
+#side-clear-backlog.armed,
 #clear-backlog.armed {
   border-color: var(--warn);
   color: var(--warn);
@@ -2873,7 +2989,8 @@ body {
 
 /* The auto margin takes whatever the line has spare, which is what puts every chip after the jump
    at the right-hand end. */
-#jump-newest {
+#jump-newest,
+#side-jump-newest {
   position: relative;
   margin-inline-end: auto;
 }
@@ -2884,7 +3001,8 @@ body {
    chip taller than 44px, and then it is its own target. Measured from the padding box, so 100% is
    the chip less its two borders. The row stands 0.5rem above the dock and the square reaches less
    than that below the chip, so a tap on the dock's top edge is still the dock's. */
-#jump-newest::after {
+#jump-newest::after,
+#side-jump-newest::after {
   content: "";
   position: absolute;
   inset: min(0px, calc((100% - 2.75rem) / 2));
@@ -2893,7 +3011,8 @@ body {
 /* Something arrived below while the reader was up in the history. The accent the armed pull and
    the pressed toggles use, so "there is news down there" is told from "this is the way down" at a
    glance and not by the word alone. */
-#jump-newest[data-arrivals] {
+#jump-newest[data-arrivals],
+#side-jump-newest[data-arrivals] {
   color: var(--accent);
   border-color: var(--accent);
 }
@@ -3337,7 +3456,8 @@ body {
   border-color: var(--accent);
 }
 
-#scroll-tools .chip {
+#scroll-tools .chip,
+#side-tools .chip {
   display: inline-flex;
   align-items: center;
   gap: 0.3rem;
@@ -3601,12 +3721,14 @@ body {
    nothing older — the same rule Hang up follows. A control that is always there and usually inert
    teaches the eye to skip the place it lives in, and the place this lives in is the one the reader
    arrives at when they are looking for something old. */
+#side-older,
 #load-older,
 #load-older-turns {
   display: block;
   margin: 0.6rem auto 0.2rem;
 }
 
+#side-older[disabled],
 #load-older[disabled],
 #load-older-turns[disabled] {
   opacity: 0.7;
@@ -3631,18 +3753,23 @@ body {
  * something else entirely.
  */
 @media (hover: hover) and (pointer: fine) {
+  #side-log li.discord-message:hover,
   #discord-log li.discord-message:hover,
   #pinned-log li.discord-message:hover {
     background: var(--row-hover);
     border-color: var(--accent);
   }
 
+  #side-log li.discord-message:hover .reply-button,
   #discord-log li.discord-message:hover .reply-button,
   #pinned-log li.discord-message:hover .reply-button,
+  #side-log li.discord-message:hover .done-button,
   #discord-log li.discord-message:hover .done-button,
   #pinned-log li.discord-message:hover .done-button,
+  #side-log li.discord-message:hover .not-noise-button,
   #discord-log li.discord-message:hover .not-noise-button,
   #pinned-log li.discord-message:hover .not-noise-button,
+  #side-log li.discord-message:hover .upstream-read-button,
   #discord-log li.discord-message:hover .upstream-read-button,
   #pinned-log li.discord-message:hover .upstream-read-button {
     color: var(--ink);
@@ -3652,16 +3779,20 @@ body {
   /* An answered or archived row is dimmed, and comes back to full contrast under the pointer. In
      here rather than outside, because `:hover` sticks to the last-tapped row on a touch screen and
      a phone would be left with exactly one permanently bright row. */
+  #side-log li.discord-message:hover,
   #discord-log li.discord-message:hover,
   #pinned-log li.discord-message:hover {
     --row-opacity: 1;
   }
 
   /* The archived row's colour, on the same terms and for the same reason. */
+  #side-log li.discord-message[data-archived="true"]:hover,
   #discord-log li.discord-message[data-archived="true"]:hover,
   #pinned-log li.discord-message[data-archived="true"]:hover,
+  #side-log li.discord-message[data-own-read="true"]:hover,
   #discord-log li.discord-message[data-own-read="true"]:hover,
   #pinned-log li.discord-message[data-own-read="true"]:hover,
+  #side-log li.discord-message[data-noise="true"]:hover,
   #discord-log li.discord-message[data-noise="true"]:hover,
   #pinned-log li.discord-message[data-noise="true"]:hover {
     --row-filter: none;
@@ -3670,17 +3801,21 @@ body {
 
   /* `#204 reply-arrow`. The arrow's disc, under the pointer, as it shows when pressed; and the X
      beside gathered replies' bridge, `#215 reply-coalesce`. */
+  #side-log .reply-jump:hover,
   #discord-log .reply-jump:hover,
+  #side-log .reply-ungather:hover,
   #discord-log .reply-ungather:hover {
     background: color-mix(in srgb, var(--accent) 18%, transparent);
   }
 
   /* `#228 reply-visible`. The circle's halo, under the pointer, as it shows when pressed. */
+  #side-log .reply-marker:hover::before,
   #discord-log .reply-marker:hover::before {
     box-shadow: 0 0 0 0.25rem color-mix(in srgb, var(--accent) 30%, transparent);
   }
 
   /* `#221 read-modes`. A collapsed run's line, brought up under the pointer, as when pressed. */
+  #side-log .read-run:hover,
   #discord-log .read-run:hover {
     color: var(--ink);
   }
@@ -3690,6 +3825,7 @@ body {
    tabbing through the channel gets the same "you are here" a mouse gets, on every device. Discord's
    principle is that the row lights up AND its actions become reachable; the actionable child is the
    reply control `#51 reply-view` puts on the row, and `:focus-within` covers both the row and it. */
+#side-log li.discord-message:focus-within,
 #discord-log li.discord-message:focus-within,
 #pinned-log li.discord-message:focus-within {
   background: var(--row-hover);
@@ -3700,6 +3836,7 @@ body {
    section of web/voice.js), and the ring says so whenever the keyboard put it there — `:focus-visible`,
    so a click on the selected row lights it as `:focus-within` above does and draws no ring. Inside
    the row's own border, which the scroller's edge would otherwise clip. */
+#side-log li.discord-message:focus-visible,
 #discord-log li.discord-message:focus-visible,
 #pinned-log li.discord-message:focus-visible {
   outline: 2px solid var(--accent);
@@ -3712,6 +3849,7 @@ body {
    that CAN act must not be invisible. A reader who has never hovered a row still has to be able to
    see that a reply is possible. (The hover half of this pair lives inside the query above; only
    the focus half belongs out here.) */
+#side-log li.discord-message:focus-within .reply-button,
 #discord-log li.discord-message:focus-within .reply-button,
 #pinned-log li.discord-message:focus-within .reply-button {
   color: var(--ink);
@@ -3734,6 +3872,7 @@ body {
  * Scoped to `#discord-log` rather than put on `.meta` in web/style.css: that file is shared with
  * the phone app at `/`, and the transcript's own metadata line has three things on it and fits.
  */
+#side-log .meta,
 #discord-log .meta,
 #pinned-log .meta,
 #reply-context .meta {
@@ -3762,6 +3901,8 @@ body {
 #reply-context .body,
 #pinned-log .body,
 #pinned-log .summary-text,
+#side-log .body,
+#side-log .summary-text,
 #discord-log .body,
 #discord-log .summary-text {
   font-size: calc(0.88rem * var(--msg-scale));
@@ -3775,6 +3916,7 @@ body {
  * to this and it appears. `clip` rather than `display: none` is what keeps it in the tab order at
  * all -- a hidden button is not focusable, and would have removed the keyboard path entirely.
  */
+#side-log .fold,
 #discord-log .fold,
 #pinned-log .fold,
 #reply-context .fold {
@@ -3787,6 +3929,7 @@ body {
   white-space: nowrap;
 }
 
+#side-log .fold:focus-visible,
 #discord-log .fold:focus-visible,
 #pinned-log .fold:focus-visible,
 #reply-context .fold:focus-visible {
@@ -5019,11 +5162,13 @@ textarea {
   /* `#85 voice-desktop-review`. The channel's two principals, bounded exactly as the transcript's
      two speakers directly above — same numbers, because they are the same two people and a reader
      switching views must not see the column change shape under them. */
+  #side-log li.discord-message[data-who="me"],
   #discord-log li.discord-message[data-who="me"],
   #pinned-log li.discord-message[data-who="me"] {
     margin-left: min(15%, 6rem); /* a desk has the room a phone does not */
   }
 
+  #side-log li.discord-message[data-who="coder"],
   #discord-log li.discord-message[data-who="coder"],
   #pinned-log li.discord-message[data-who="coder"] {
     /* A desk has the room, and a full-bleed tile a metre wide is the "phone layout stretched
@@ -5032,8 +5177,10 @@ textarea {
     margin-right: min(15%, 6rem);
   }
 
+  #side-log li.discord-message[data-who="human"],
   #discord-log li.discord-message[data-who="human"],
   #pinned-log li.discord-message[data-who="human"],
+  #side-log li.discord-message[data-who="bot"],
   #discord-log li.discord-message[data-who="bot"],
   #pinned-log li.discord-message[data-who="bot"] {
     margin-inline: min(7%, 3rem);
@@ -5042,6 +5189,7 @@ textarea {
   /* `#204 reply-arrow`. A reply's gutter is a touch target wide everywhere, and the owner's own
      inset is wider than that here: his reply keeps the larger of the two, so it is still drawn on
      his side of the column. The arrow follows the box (`right: 100%`). */
+  #side-log li.discord-message[data-is-reply="true"][data-who="me"],
   #discord-log li.discord-message[data-is-reply="true"][data-who="me"] {
     margin-left: max(var(--reply-gutter), min(15%, 6rem));
   }
@@ -5049,28 +5197,34 @@ textarea {
   /* `#215 reply-coalesce`. Gathered replies hang one gutter in from their parent's left edge, and
      these are the desk's edges, restated from the rules just above as the phone's are restated
      beside the stack's own rules. After the owner's reply, which they outrank in a stack. */
+  #side-log li.discord-message[data-stack-under="coder"][data-who],
   #discord-log li.discord-message[data-stack-under="coder"][data-who] {
     margin-left: var(--reply-gutter);
   }
 
+  #side-log li.discord-message[data-stack-under="me"][data-who],
   #discord-log li.discord-message[data-stack-under="me"][data-who] {
     margin-left: calc(min(15%, 6rem) + var(--reply-gutter));
   }
 
+  #side-log li.discord-message[data-stack-under="third"][data-who],
   #discord-log li.discord-message[data-stack-under="third"][data-who] {
     margin-left: calc(min(7%, 3rem) + var(--reply-gutter));
   }
 
+  #side-log li.discord-message[data-stack-under="reply"][data-who],
   #discord-log li.discord-message[data-stack-under="reply"][data-who] {
     margin-left: calc(var(--reply-gutter) * 2);
   }
 
+  #side-log li.discord-message[data-stack-under="me-reply"][data-who],
   #discord-log li.discord-message[data-stack-under="me-reply"][data-who] {
     margin-left: calc(max(var(--reply-gutter), min(15%, 6rem)) + var(--reply-gutter));
   }
 
   /* `#228 reply-visible`. Inside the reading column the agent's tile has room beside it, and its
      circle goes back to the corner, as every other row's is. */
+  #side-log li.discord-message[data-who="coder"]:not([data-is-reply="true"]):not([data-stack-under]) > .reply-marker,
   #discord-log li.discord-message[data-who="coder"]:not([data-is-reply="true"]):not([data-stack-under]) > .reply-marker {
     left: calc(-1px - var(--reply-marker-target) / 2);
   }
@@ -5122,6 +5276,215 @@ textarea {
   #width-grip:hover::before,
   #width-grip:focus-visible::before {
     background: var(--accent);
+  }
+}
+
+/* `#229 desktop-two-column`. Never drawn outside the block below: not on a phone, not in a narrow
+   window, not in one column. First, so the block's rules for the same elements are the later ones. */
+#side-column,
+#column-toggle {
+  display: none;
+}
+
+/*
+ * `#229 desktop-two-column`. MAIN ON THE LEFT AND A THREAD ON THE RIGHT, on a desk at least 1000px
+ * wide, while the reader has chosen two columns (web/voice.js sets `data-columns="two"` on
+ * #screen-main then, and only on the channel). Outside this block the right column and the layout
+ * button are never drawn — below, unconditionally — so a phone and a narrow window are exactly as they
+ * were, and a window narrowed below 1000px falls back to one column by this block ceasing to apply.
+ *
+ * WHY 1000px. Each column then gets about 490px, which after a row's insets holds about 45
+ * characters: the narrowest reading width the width setting allows for the page's only column. Any
+ * narrower and one of the two would be narrower than the page lets a reader make its one column. At
+ * 1280px each holds about 60 characters, and at 1440px about 70, near the default 72.
+ *
+ * The two columns are the window's two halves, each holding its list in the reading column centred
+ * in it, a hairline between them. The width handle goes: the reading width is set in Settings, and
+ * a handle at one column's edge would say it sized only that one. The dock, the chips and the line
+ * the pill and the search glass float on follow the left column, which is Main's; the right column
+ * has a heading of its own above its list and its own jump to its newest message.
+ *
+ * web/voice.js asks whether #side-column has a box to know whether two columns are in force, and
+ * never reads this query itself.
+ */
+@media (min-width: 1000px) and (pointer: fine) {
+  /* The layout button, a bar button like the others; `hidden` still wins, off the channel. */
+  #column-toggle {
+    display: flex;
+  }
+
+  #column-toggle[aria-pressed="true"] {
+    border-color: var(--accent);
+    color: var(--accent);
+  }
+
+  #screen-main[data-columns="two"] {
+    grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  }
+
+  #screen-main[data-columns="two"] > #connection-banner,
+  #screen-main[data-columns="two"] > #channel-navigation,
+  #screen-main[data-columns="two"] > #channel-freshness-anchor,
+  #screen-main[data-columns="two"] > #scroll-area {
+    grid-column: 1;
+  }
+
+  #screen-main[data-columns="two"] > #side-column {
+    display: grid;
+    grid-column: 2;
+    grid-row: 1 / -1;
+    grid-template-rows: auto minmax(0, 1fr);
+    grid-template-columns: minmax(0, 1fr);
+    min-height: 0;
+    position: relative;
+    border-left: 1px solid var(--edge);
+  }
+
+  #screen-main[data-columns="two"] > #width-grip {
+    display: none;
+  }
+
+  /* The chips over the foot of the LEFT list: the left half's centre, as wide as its column. */
+  #screen-main[data-columns="two"] > #scroll-tools {
+    left: 25%;
+    width: calc(min(var(--reading-width), 50%) - 1.2rem);
+  }
+
+  /* The dock spans the pair: from the left column's left edge to the right column's right edge. */
+  body:has(#screen-main[data-columns="two"]:not([hidden])) #dock {
+    --dock-inset: max(0.6rem, calc(25% - var(--reading-width) / 2 + 0.6rem));
+  }
+
+  /* The heading names the thread as the picker does — "13h · 16 · its name" — and holds the X. */
+  #side-heading {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    box-sizing: border-box;
+    width: 100%;
+    max-width: var(--reading-width);
+    min-height: 2.75rem;
+    margin-inline: auto;
+    padding: 0.35rem 0.75rem;
+    border-bottom: 1px solid var(--edge);
+  }
+
+  #side-facts {
+    flex: none;
+    white-space: pre;
+    color: var(--muted);
+  }
+
+  #side-facts::after {
+    content: " · ";
+  }
+
+  #side-title {
+    flex: 1 1 auto;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    font-weight: 600;
+  }
+
+  #side-close {
+    flex: none;
+    margin-inline-start: auto;
+  }
+
+  /* The right column's one scrolling element, built as #scroll-area is: its size is its cell's. */
+  #side-scroll {
+    contain: size layout;
+    min-height: 0;
+    overflow-y: auto;
+    overscroll-behavior: contain;
+    padding: 0.35rem 0.75rem 0.5rem;
+  }
+
+  #side-list,
+  #side-pane {
+    max-width: var(--reading-width);
+    margin-inline: auto;
+  }
+
+  #side-tools {
+    position: absolute;
+    z-index: 2;
+    left: 50%;
+    bottom: 0.5rem;
+    width: calc(min(var(--reading-width), 100%) - 1.2rem);
+    transform: translateX(-50%);
+    display: flex;
+    pointer-events: none;
+  }
+
+  /* The threads, one card each, every card the same height: three lines of what the thread is
+     about, clamped with an ellipsis, then its facts. Edged in the thread's own colour, as its tag. */
+  .side-cards {
+    display: grid;
+    gap: 0.45rem;
+    margin: 0.2rem 0 0.6rem;
+    padding: 0;
+    list-style: none;
+  }
+
+  .side-card {
+    display: grid;
+    gap: 0.3rem;
+    box-sizing: border-box;
+    width: 100%;
+    padding: 0.55rem 0.75rem;
+    background: var(--panel);
+    color: inherit;
+    border: 1px solid var(--edge);
+    border-left: 3px solid hsl(var(--thread-hue, 210) 55% 50%);
+    border-radius: 0.6rem;
+    font: inherit;
+    text-align: start;
+    cursor: pointer;
+  }
+
+  .side-card:hover,
+  .side-card:focus-visible,
+  .side-card-row:focus-visible > .side-card {
+    border-color: var(--accent);
+    border-left-color: hsl(var(--thread-hue, 210) 55% 50%);
+  }
+
+  .side-card-row:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 2px;
+    border-radius: 0.6rem;
+  }
+
+  .side-card-text {
+    display: -webkit-box;
+    -webkit-box-orient: vertical;
+    -webkit-line-clamp: 3;
+    line-clamp: 3;
+    overflow: hidden;
+    height: calc(3 * 1.35em);
+    line-height: 1.35;
+    overflow-wrap: anywhere;
+  }
+
+  .side-card-facts {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0 0.6rem;
+    color: var(--muted);
+    font-size: 0.8rem;
+  }
+
+  .side-card-unread {
+    color: var(--accent);
+    font-weight: 600;
+  }
+
+  #side-more-threads {
+    margin: 0 auto 0.6rem;
+    display: block;
   }
 }
 
