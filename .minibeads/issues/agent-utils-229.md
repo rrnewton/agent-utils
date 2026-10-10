@@ -1,10 +1,11 @@
 ---
 title: 'desktop-two-column: a desktop layout toggle with Main on the left and the selected thread or a thread list on the right'
-status: open
+status: closed
 priority: 2
 issue_type: task
 created_at: 2026-10-09T20:58:56.953180064+00:00
-updated_at: 2026-10-09T20:58:56.953180064+00:00
+updated_at: 2026-10-10T02:13:38.578908411+00:00
+closed_at: 2026-10-10T02:13:38.578908271+00:00
 ---
 
 # Description
