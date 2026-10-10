@@ -29,6 +29,7 @@ from agentctl.submission import (
     VERIFIED_HARNESSES,
     PromptNotStaged,
     SubmissionReceipt,
+    codex_idle_composer,
     composer_view,
     submit_verified,
 )
@@ -75,6 +76,29 @@ def herdr_error_code(detail: str) -> str | None:
     """The ``code`` of a Herdr error object quoted in ``detail``, such as ``pane_not_found``."""
     match = _HERDR_ERROR_CODE.search(detail)
     return match.group(1) if match else None
+
+
+def _unique_response_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    result: dict[str, object] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("duplicate Herdr response field")
+        result[key] = value
+    return result
+
+
+def _is_codex_startup_timeout(completed: subprocess.CompletedProcess[str]) -> bool:
+    """Recognize only Herdr's documented startup-timeout error envelope."""
+    if completed.returncode != 1 or completed.stdout.strip():
+        return False
+    try:
+        document = json.loads(completed.stderr, object_pairs_hook=_unique_response_object)
+    except (TypeError, ValueError):
+        return False
+    return bool(document == {
+        "id": "cli:agent:start",
+        "error": {"code": "timeout", "message": "timed out waiting for agent startup"},
+    })
 
 
 def muse_startup_metadata(screen: str) -> tuple[str | None, str | None]:
@@ -355,7 +379,7 @@ class ProcessInfo:
     pane_id: str
     shell_pid: int
     foreground_pgid: int
-    #: ``(pid, name, cmdline, argv0, reported_executable)`` for each foreground process.
+    #: ``(pid, name, cmdline, argv0, reported_executable)``; unknown argv0 is empty.
     foreground: tuple[tuple[int, str, str, str, str | None], ...]
 
 
@@ -882,14 +906,45 @@ class HerdrClient:
         """
         if not 0 < timeout <= 300:
             raise ValueError("agent startup timeout must be between 0 and 300 seconds")
+        initial: AgentPaneInfo | None = None
+        if kind == "codex":
+            try:
+                initial = self.pane_info(pane_id)
+            except HerdrUnavailable:
+                # Ordinary native success remains independent of the extra fallback proof.
+                pass
         completed = self._invoke(
             ["agent", "start", name, "--kind", kind, "--pane", pane_id,
              "--timeout", str(max(1, int(timeout * 1000))), "--", *arguments],
             timeout=timeout + CONTROL_TIMEOUT_SECONDS,
         )
         if completed.returncode != 0:
+            if kind == "codex" and initial is not None and _is_codex_startup_timeout(completed):
+                try:
+                    if self._codex_ready_after_startup_timeout(name, initial):
+                        return
+                except HerdrUnavailable:
+                    # A failed or unavailable proof does not erase the launch failure.
+                    pass
             detail = (completed.stderr or completed.stdout).strip() or f"exit {completed.returncode}"
             raise HerdrUnavailable(f"agent start {name!r}: {detail}")
+
+    def _codex_ready_after_startup_timeout(self, name: str, initial: AgentPaneInfo) -> bool:
+        if initial.agent is not None or not initial.terminal_id or "\0" in initial.terminal_id:
+            return False
+        info = self.pane_info(initial.pane_id)
+        if ((info.pane_id, info.workspace_id, info.cwd, info.tab_id, info.terminal_id)
+                != (initial.pane_id, initial.workspace_id, initial.cwd, initial.tab_id, initial.terminal_id)):
+            return False
+        named = self.agent_identity(name)
+        if ((named.pane_id, named.tab_id, named.terminal_id)
+                != (info.pane_id, info.tab_id, info.terminal_id)):
+            return False
+        identity = self.harness_identity(info.pane_id, "codex")
+        if identity is None or not self.codex_idle_ready(info):
+            return False
+        return (self.agent_identity(name) == named and self.pane_info(info.pane_id) == info
+                and self.verify_harness_identity(info.pane_id, identity))
 
     def _harness_executable(self, kind: str) -> str:
         if not kind or any(
@@ -1251,6 +1306,8 @@ class HerdrClient:
                 or info.foreground[0][0] != info.shell_pid):
             return None
         _pid, _name, _command, argv0, _reported = info.foreground[0]
+        if not argv0:
+            return None
         observed = self._supported_shell_identity(info.shell_pid)
         if observed is None or observed[1] != info.foreground_pgid:
             return None
@@ -1284,12 +1341,16 @@ class HerdrClient:
         for pid, _process_name, _command, argv0, reported_executable in info.foreground:
             if expected is not None and pid != expected.pid:
                 continue
-            if expected is None and (executable is None or os.path.realpath(argv0) != executable):
+            if expected is None and (
+                executable is None or (argv0 and os.path.realpath(argv0) != executable)
+                or (not argv0 and launch_image is None)
+            ):
                 continue
             observed_path = self._process_executable(pid)
             observed = self._process_identity(pid)
             if (observed is None and observed_path is None
-                    and not self._production_runner and reported_executable is not None):
+                    and not self._production_runner and argv0
+                    and reported_executable is not None):
                 try:
                     metadata = os.stat(reported_executable)
                 except OSError:
@@ -1696,6 +1757,26 @@ class HerdrClient:
             return False
         return self._pane_process_identity(info, None, expected) is not None
 
+    def codex_idle_ready(self, info: AgentPaneInfo) -> bool:
+        """Prove unknown Codex readiness with one stable foreground generation.
+
+        Reported idle/done states keep their existing readiness behavior. This
+        additional proof never changes the reported status or authorizes input.
+        """
+        if (info.agent != "codex" or info.status != "unknown"
+                or not info.terminal_id or "\0" in info.terminal_id
+                or (info.session_agent is None) != (info.session_value is None)
+                or (info.session_agent is not None and (
+                    info.session_agent != "codex" or not info.session_value
+                    or "\0" in info.session_value
+                ))):
+            return False
+        identity = self.harness_identity(info.pane_id, "codex")
+        if identity is None or not codex_idle_composer(self.read_screen(info.pane_id)):
+            return False
+        return (self.pane_info(info.pane_id) == info
+                and self.verify_harness_identity(info.pane_id, identity))
+
     def agent_pane(self, name: str) -> str:
         """Resolve an exact live Herdr agent name, rejecting a stale pane occupant."""
         result = self._call(["agent", "get", name], f"agent get {name!r}")
@@ -1884,15 +1965,19 @@ class HerdrClient:
                 info.get("foreground_processes"), "foreground_processes"
             ):
                 process = as_mapping(entry, "foreground process")
-                argv = as_sequence(process.get("argv"), "foreground process argv")
-                if not argv or not isinstance(argv[0], str) or not argv[0]:
-                    raise TypeError("foreground process argv must have a nonempty argv[0]")
+                raw_argv = process.get("argv")
+                argv = () if raw_argv is None else as_sequence(raw_argv, "foreground process argv")
+                if argv and (
+                    any(not isinstance(argument, str) for argument in argv)
+                    or not argv[0] or "\0" in str(argv[0])
+                ):
+                    raise TypeError("foreground process argv must have string entries and a nonempty NUL-free argv[0]")
                 foreground.append(
                     (
                         _get_process_id(process, "pid", "foreground process"),
                         opt_str(process, "name") or "",
                         opt_str(process, "cmdline") or "",
-                        argv[0],
+                        str(argv[0]) if argv else "",
                         opt_str(process, "executable"),
                     )
                 )

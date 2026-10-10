@@ -167,7 +167,7 @@ def after_write(text):
 def composer_screen():
     dim = lambda text: "\x1b[2m" + text + "\x1b[22m"
     draft = state.get("composer_draft", "")
-    busy = state.get("status") == "working"
+    busy = state.get("status") == "working" or state.get("composer_busy")
     if state.get("harness", "codex") == "claude":
         rule = "\u2500" * 40
         lines = ["\u2022 earlier output"]
@@ -182,13 +182,16 @@ def composer_screen():
         lines = ["\u2022 earlier output"]
         for text in state.get("submitted", []):
             lines += ["\u203a " + text, "\u2022 accepted"]
+        if busy:
+            lines.append(state.get("codex_activity", "Working (esc to interrupt)"))
         if draft:
             rows = draft.split("\n")
             lines.append("\u203a " + rows[0])
             lines += ["  " + row for row in rows[1:]]
         else:
             lines.append("\u203a " + dim("Ask Codex to do anything"))
-        lines += ["", "  tab to queue message" if busy and draft else "  model default \u00b7 project"]
+        lines += ["", "  tab to queue message" if busy and draft else
+                  state.get("codex_footer", "  model default \u00b7 project")]
     return "\n".join(lines) + "\n"
 
 def revive_fixture():
@@ -424,6 +427,15 @@ elif args[:2] == ["pane", "process-info"]:
             process_pid + 1 if state.get("wrong_custom_process_group")
             else process_pid if state.get("custom_pid") or state.get("harness_pid") else 200
         )
+    for process in foreground_processes:
+        if state.get("foreground_argv_mode") == "missing":
+            process.pop("argv", None)
+        elif state.get("foreground_argv_mode") == "null":
+            process["argv"] = None
+        elif state.get("foreground_argv_mode") == "empty":
+            process["argv"] = []
+        elif "foreground_argv_override" in state:
+            process["argv"] = state["foreground_argv_override"]
     envelope({"process_info": {
         "pane_id":current_pane, "shell_pid":shell_pid,
         "foreground_process_group_id":foreground_process_group_id,
@@ -457,6 +469,7 @@ elif args[:2] in (["agent", "focus"], ["tab", "focus"]):
     state["focused"] = args[2]
 elif args[:2] == ["agent", "start"]:
     state["name"] = args[2]
+    state["empty_shell"] = False
     state["harness"] = args[args.index("--kind") + 1]
     state["launch_arguments"] = args[args.index("--") + 1:]
     for selector in ("--session-id", "--resume", "resume"):
@@ -469,6 +482,15 @@ elif args[:2] == ["agent", "start"]:
         stderr=subprocess.DEVNULL, start_new_session=True,
     )
     state["harness_pid"] = harness.pid
+    if state.get("startup_timeout"):
+        error = state.get("startup_error", {
+            "id":"cli:agent:start", "error": {
+                "code":"timeout", "message":"timed out waiting for agent startup",
+            },
+        })
+        print(json.dumps(error), file=sys.stderr)
+        save()
+        raise SystemExit(1)
     if state.get("start_failure"):
         print("startup requires attention", file=sys.stderr)
         save()
@@ -626,6 +648,8 @@ elif args[:2] == ["pane", "read"]:
     if state.get("leave_idle_shell_on_read"):
         state["idle_shell_busy"] = True
     source = args[args.index("--source") + 1]
+    if source == "visible" and state.get("terminal_on_visible_read"):
+        state["terminal_id"] = state["terminal_on_visible_read"]
     if source == "visible" and state.get("screen"):
         sys.stdout.write(state["screen"])
     elif source == "visible" and verified_composer():
@@ -634,7 +658,8 @@ elif args[:2] == ["pane", "read"]:
         prefix = "Muse Code 1.3.0\n\nreasoning effort ultra is not available (gate ultra_reasoning_effort is closed); using xhigh\n"
         divider = "────────────────\n"
         history = "".join("❯ " + text + "\n◆ accepted\n" for text in state.get("submitted", []))
-        footer = "watermelon-preview · xhigh · project · Auto-review\n"
+        footer = "watermelon-preview · xhigh · project · " + state.get(
+            "custom_permission", "Auto-review") + "\n"
         if state.get("custom_submitted"):
             if state.get("custom_post_error"):
                 sys.stdout.write(prefix + history + divider + "❯ " + state["custom_draft"] +

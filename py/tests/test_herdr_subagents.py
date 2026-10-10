@@ -1286,23 +1286,103 @@ def test_direct_start_rejects_quoted_config_and_opaque_profile_conflicts_before_
     assert fake.environments == []
 
 
-def test_adoption_rejects_muse_before_registry_or_live_pane_access(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+@pytest.mark.parametrize("missing", ["terminal", "process"])
+def test_suggestion13_muse_adoption_requires_terminal_and_process_anchors(
+    missing: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     manager, fake = setup(tmp_path, monkeypatch)
     fake.workspace = "w1"
-    fake.presentations.append(Pane("w1:p1", "w1:t1", "w1"))
+    fake.create_tab(workspace_id="w1", label="foreign", cwd=str(tmp_path))
     fake.infos["w1:p1"] = AgentPaneInfo(
         "w1:p1", "w1", str(tmp_path), "muse", "idle", None, None,
+        terminal_id=None if missing == "terminal" else "term-1", tab_id="w1:t1",
     )
-    with pytest.raises(AgentDeliveryError, match="adopting Muse is unsupported"):
+    if missing == "process":
+        monkeypatch.setattr(fake, "harness_identity", lambda _pane, _kind: None)
+    with pytest.raises(AgentDeliveryError, match="terminal identity|pin.*foreground process"):
         manager.adopt(
             "worker", pane_id="w1:p1", expected_workspace="subagents",
             expected_cwd=str(tmp_path), harness="muse",
         )
-    assert not manager.registry.exists()
-    assert fake.panes_calls == 0
-    assert fake.pane_info_calls == 0
+    assert not (manager.registry / "worker").exists()
+    assert fake.launched == [] and fake.closed == [] and fake.submitted == []
+    assert fake.labels == {"w1:t1": "foreign"}
+
+
+def _suggestion13_codex_hook(fake: FakeManagedClient, monkeypatch: pytest.MonkeyPatch) -> None:
+    def ready(info: AgentPaneInfo) -> bool:
+        return HerdrClient.codex_idle_ready(cast(HerdrClient, fake), info)
+
+    monkeypatch.setattr(fake, "codex_idle_ready", ready, raising=False)
+
+
+def test_suggestion13_unknown_codex_busy_prompt_drains_only_after_verified_idle_composer(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager, fake = setup(tmp_path, monkeypatch)
+    manager.start("worker", cwd=str(tmp_path))
+    fake.infos["w1:p1"] = replace(fake.infos["w1:p1"], status="unknown")
+    screen = "›\n  esc to interrupt\n  GPT default · /work\n"
+    monkeypatch.setattr(fake, "read_screen", lambda _pane: screen, raising=False)
+    _suggestion13_codex_hook(fake, monkeypatch)
+    with pytest.raises(AgentPending) as pending:
+        manager.send("worker", "queued turn", ready_timeout=0)
+    assert Path(pending.value.artifact).is_file() and fake.submitted == []
+    assert manager.status("worker")["agent_status"] == "unknown"
+    screen = "› \x1b[2mAsk Codex to do anything\x1b[0m\n  GPT default · /work\n"
+    drained = manager.drain("worker", ready_timeout=0)
+    assert drained.delivered == (pending.value.message_id,)
+    assert fake.submitted == ["queued turn"]
+    assert manager.status("worker")["agent_status"] == "unknown"
+
+
+@pytest.mark.parametrize("failure", ["draft", "unanchored", "replacement", "during-screen", "no-hook"])
+def test_suggestion13_unknown_codex_readiness_cannot_relax_saved_recipient_proof(
+    failure: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager, fake = setup(tmp_path, monkeypatch)
+    manager.start("worker", cwd=str(tmp_path))
+    info = fake.infos["w1:p1"] = replace(fake.infos["w1:p1"], status="unknown")
+    screen = "›\n  GPT default · /work\n"
+    if failure == "draft":
+        screen = "› human draft\n  GPT default · /work\n"
+    elif failure == "unanchored":
+        record = manager.get("worker")
+        record.session_agent = record.session_value = None
+        record.harness_identity = None
+        record.anchor_rule = None
+        manager._save(record)
+        fake.infos[info.pane_id] = replace(info, session_agent=None, session_value=None)
+    elif failure == "replacement":
+        fake.harness_pids[info.pane_id] += 1
+
+    def read_screen(_pane: str) -> str:
+        if failure == "during-screen":
+            fake.harness_pids[info.pane_id] += 1
+        return screen
+
+    monkeypatch.setattr(fake, "read_screen", read_screen, raising=False)
+    if failure != "no-hook":
+        _suggestion13_codex_hook(fake, monkeypatch)
+    with pytest.raises(AgentDeliveryError):
+        manager.send("worker", "must remain pending", ready_timeout=0)
+    assert fake.submitted == [] and fake.keys_sent == []
+
+
+@pytest.mark.parametrize("status", ["idle", "done"])
+def test_suggestion13_native_ready_status_keeps_existing_behavior_without_screen_hook(
+    status: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager, fake = setup(tmp_path, monkeypatch)
+    manager.start("worker", cwd=str(tmp_path))
+    fake.infos["w1:p1"] = replace(fake.infos["w1:p1"], status=status)
+
+    def unexpected(_info: AgentPaneInfo) -> bool:
+        raise AssertionError("native readiness must not call compatibility hook")
+
+    monkeypatch.setattr(fake, "codex_idle_ready", unexpected, raising=False)
+    assert manager.send("worker", "native ready", ready_timeout=0).delivered
+    assert fake.submitted == ["native ready"]
 
 
 def test_failed_launch_status_does_not_retain_environment_values(

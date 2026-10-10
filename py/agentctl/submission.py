@@ -36,6 +36,7 @@ __all__ = [
     "PromptStagedNotSubmitted",
     "SubmissionReceipt",
     "VERIFIED_HARNESSES",
+    "codex_idle_composer",
     "composer_view",
     "render_screen",
     "submit_verified",
@@ -89,6 +90,24 @@ _CODEX_QUEUE_HINT = "tab to queue message"
 #: draw ``›``; v0.159.1 draws ``»``, and keeps ``›`` for selection lists such as
 #: its folder-trust prompt.
 _CODEX_COMPOSER_MARKERS = ("›", "»")
+_CODEX_READY_BLOCKERS = (
+    _WORKING_MARKER, _CODEX_QUEUE_HINT, *_QUEUE_MARKERS,
+    "paste again to expand", "trust this folder?", "trust and continue",
+    "approval required", "requires approval", "approve this", "would you like to run",
+    "press enter to continue", "enter to confirm", "esc to cancel",
+    " to interrupt", "messages to be submitted after next tool call",
+    "messages to be submitted at end of turn", "enter to submit answer",
+    "enter to submit all", "allow command?", "do you trust the contents of this directory?",
+)
+_CODEX_LIVE_TIMER = re.compile(
+    r"^(?:[•◦][ \t]+)?[^\s›•◦■✗✓─][^\r\n]* "
+    r"\((?:[0-9]+[hm] )*[0-9]+s(?: • [^\r\n]+? to interrupt)?\)"
+    r"(?: · [^\r\n]*)?$"
+)
+_CODEX_QUEUED_ROWS = (
+    "queued follow-up inputs", "messages to be submitted after next tool call",
+    "messages to be submitted at end of turn",
+)
 
 
 class PromptNotStaged(HerdrUnavailable):
@@ -279,6 +298,43 @@ def composer_view(harness: str, screen: str) -> ComposerView | None:
     if harness == "codex":
         return _codex_view(rows)
     return None
+
+
+def codex_idle_composer(screen: str) -> bool:
+    """Recognize an empty idle Codex editor; this is no proof of its recipient.
+
+    Busy Codex screens retain their editor. A live elapsed timer without a later
+    response, or an active queue or dialog in the final sixteen rows, refuses readiness.
+    """
+    view = composer_view("codex", screen)
+    if (view is None or view.composer_solid.strip()
+            or _PASTE_PLACEHOLDER.search(view.composer) is not None):
+        return False
+    footer = view.footer.strip()
+    if not (
+        ("·" in footer and re.search(r"(?:^|\s)(?:~/|/)(?:\S|$)", footer) is not None)
+        or "? for shortcuts" in footer
+        or re.search(r"\b\d+(?:\.\d+)?% context (?:left|remaining)\b", footer) is not None
+    ):
+        return False
+    active_timer = False
+    for row in view.transcript.splitlines():
+        if _CODEX_LIVE_TIMER.fullmatch(row.rstrip()) is not None:
+            active_timer = True
+        elif (row.startswith(("•", "◦", "■", "✗", "✓"))
+                and not any(label in row.casefold() for label in _CODEX_QUEUED_ROWS)):
+            active_timer = False
+    if active_timer:
+        return False
+    rows = [plain for plain, _solid in render_screen(screen)]
+    while rows and not rows[-1].strip():
+        rows.pop()
+    active = "\n".join(
+        row for row in rows[-16:] if _CODEX_LIVE_TIMER.fullmatch(row.rstrip()) is None
+    ).casefold()
+    if all(label in active for label in ("all results", "filesystem only", "plugins")):
+        return False
+    return not any(marker.casefold() in active for marker in _CODEX_READY_BLOCKERS)
 
 
 def _compact(text: str) -> str:

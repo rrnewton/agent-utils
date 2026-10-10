@@ -302,6 +302,17 @@ pub trait AgentApi: Send + Sync {
     ) -> crate::error::Result<String> {
         self.read(pane_id, source, lines)
     }
+    /// Verify an idle Codex composer when its native status is unknown.
+    ///
+    /// Implementations must independently prove the same live recipient around the screen
+    /// observation. Unsupported adapters leave unknown status unready.
+    fn codex_idle_ready_with_runtime(
+        &self,
+        _info: &AgentPaneInfo,
+        _runtime: &dyn AgentRuntime,
+    ) -> crate::error::Result<bool> {
+        Ok(false)
+    }
 }
 
 impl AgentApi for HerdrClient {
@@ -311,6 +322,14 @@ impl AgentApi for HerdrClient {
 
     fn pane_info(&self, pane_id: &str) -> crate::error::Result<AgentPaneInfo> {
         HerdrClient::pane_info(self, pane_id)
+    }
+
+    fn codex_idle_ready_with_runtime(
+        &self,
+        info: &AgentPaneInfo,
+        runtime: &dyn AgentRuntime,
+    ) -> crate::error::Result<bool> {
+        self.codex_idle_ready_with_cancellation(info, &|| runtime.cancelled())
     }
 
     fn workspace_label(&self, workspace_id: &str) -> crate::error::Result<String> {
@@ -1351,6 +1370,14 @@ fn wait_ready<A: AgentApi + ?Sized>(
             )));
         }
         if matches!(info.status.as_str(), "idle" | "done") {
+            return Ok(info);
+        }
+        if info.status == "unknown"
+            && info.agent.as_deref() == Some("codex")
+            && client
+                .codex_idle_ready_with_runtime(&info, runtime)
+                .map_err(client_error)?
+        {
             return Ok(info);
         }
         if info.status == "blocked" {
@@ -2950,6 +2977,8 @@ mod tests {
         unwrapped_empty: bool,
         /// A receipt the submission returns after writing, instead of `Unconfirmed`.
         receipt: Option<crate::submission::SubmissionReceipt>,
+        codex_ready: bool,
+        readiness_checks: usize,
     }
 
     struct FakeAgent {
@@ -3027,6 +3056,16 @@ mod tests {
     }
 
     impl AgentApi for FakeAgent {
+        fn codex_idle_ready_with_runtime(
+            &self,
+            _info: &AgentPaneInfo,
+            _runtime: &dyn AgentRuntime,
+        ) -> crate::error::Result<bool> {
+            let mut state = self.state.lock().unwrap();
+            state.readiness_checks += 1;
+            Ok(state.codex_ready)
+        }
+
         fn panes(&self) -> crate::error::Result<Vec<Pane>> {
             Ok(self.panes.clone())
         }
@@ -3293,6 +3332,80 @@ mod tests {
             pane_lock_digest("w1:p1"),
             "a176b65b6a799f512519f02899c894b47e31ae17567009e92b90383974dcd38c"
         );
+    }
+
+    #[test]
+    fn herdr_093_drain_uses_codex_readiness_only_for_unknown_and_preserves_native_states() {
+        for (status, ready, delivered, checked) in [
+            ("unknown", true, true, 1),
+            ("unknown", false, false, 1),
+            ("idle", false, true, 0),
+            ("done", false, true, 0),
+            ("working", true, false, 0),
+            ("blocked", true, false, 0),
+        ] {
+            let directory = TestDirectory::new("herdr093-ready");
+            let fake = FakeAgent::new(&[status]);
+            fake.state.lock().unwrap().codex_ready = ready;
+            enqueue(directory.path(), "one prompt", Some("once")).unwrap();
+            let result = drain_with_runtime(
+                &fake,
+                &target(),
+                directory.path(),
+                DrainOptions {
+                    ready_timeout: Duration::ZERO,
+                    ..DrainOptions::default()
+                },
+                &FakeRuntime::default(),
+            )
+            .unwrap();
+            assert_eq!(result.delivered == ["once"], delivered, "{status}");
+            assert_eq!(
+                fake.state.lock().unwrap().readiness_checks,
+                checked,
+                "{status}"
+            );
+            if delivered {
+                assert_eq!(fake.runs(), ["one prompt"]);
+            } else {
+                assert!(fake.runs().is_empty());
+                let document =
+                    read_private_json(&directory.path().join("inbox/once.json")).unwrap();
+                assert_eq!(document["delivery_attempts"], 0);
+                assert_eq!(document["delivery_state"], "pending");
+            }
+        }
+    }
+
+    #[test]
+    fn herdr_093_unknown_other_harness_never_uses_codex_readiness() {
+        let directory = TestDirectory::new("herdr093-other");
+        let fake = FakeAgent::new(&["unknown"]);
+        {
+            let mut state = fake.state.lock().unwrap();
+            state.codex_ready = true;
+            let info = state.infos.get_mut("w1:p1").unwrap();
+            info.agent = Some("claude".to_owned());
+            info.session_agent = Some("claude".to_owned());
+        }
+        let mut target = target();
+        target.expected_agent = Some("claude".to_owned());
+        target.session_agent = Some("claude".to_owned());
+        enqueue(directory.path(), "one prompt", Some("once")).unwrap();
+        let result = drain_with_runtime(
+            &fake,
+            &target,
+            directory.path(),
+            DrainOptions {
+                ready_timeout: Duration::ZERO,
+                ..DrainOptions::default()
+            },
+            &FakeRuntime::default(),
+        )
+        .unwrap();
+        assert!(result.delivered.is_empty());
+        assert!(fake.runs().is_empty());
+        assert_eq!(fake.state.lock().unwrap().readiness_checks, 0);
     }
 
     #[test]

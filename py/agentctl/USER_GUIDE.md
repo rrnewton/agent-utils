@@ -379,10 +379,19 @@ and an empty value are not expanded or rewritten. Names must match
 `[A-Za-z_][A-Za-z0-9_]*`, and neither names nor values may contain NUL. This
 option does not apply to headless workers.
 
-Muse is launched through Herdr's generic `pane run` interface because Herdr's
-native agent-kind registry does not currently accept it. `agentctl` resolves the
-installed executable, launches a shell-quoted literal argv, verifies both its
-kernel `/proc/PID/exe` identity and argv in the allocated pane, and then publishes pane-local agent
+Herdr 0.9.3 can report Codex as `unknown` while its composer is idle. For
+startup and durable drain, agentctl can prove readiness from an empty Codex
+composer with a recognized idle footer, checking the same foreground process,
+terminal, and native identity before and after reading the screen. Busy input,
+drafts, menus, and trust prompts still block delivery. The reported status
+remains `unknown`. A startup timeout is accepted only for Herdr's exact startup
+timeout response and this positive readiness proof; other launch errors remain
+failures.
+
+Muse is launched through Herdr's generic `pane run` interface. `agentctl`
+resolves the installed executable, launches a shell-quoted literal argv,
+verifies its kernel `/proc/PID/exe` identity and any supplied foreground argv
+in the allocated pane, and then publishes pane-local agent
 status. New owned sessions persist the Linux boot ID, PID, process start time,
 and executable device/inode before readiness checks. Subsequent operations bind
 to that tuple and intentionally do not consult the installation pathname, so
@@ -395,6 +404,9 @@ current-path verification and are not auto-migrated after their image is
 already deleted. It never resolves this adapter with `agent get NAME`. A visible
 workspace-trust prompt fails startup and leaves the pane for a human; only an
 owner-configured literal `--trust-workspace` argument bypasses that refusal.
+Herdr may omit foreground argv. A new launch can still be pinned only when its
+kernel executable matches the already-opened launch image; names and command
+text cannot substitute for that proof. Malformed supplied argv is refused.
 For delivery, the adapter verifies the same foreground Muse process and a bare
 idle composer, inserts the prompt as one bracketed literal paste with Herdr's
 `pane send-text` (so embedded newlines cannot submit it), proves the draft is
@@ -475,11 +487,12 @@ agentctl adopt reviewer --pane w1:p2 --workspace project \
   --cwd /work/project --harness codex
 ```
 
-Muse uses a custom pane protocol whose existing foreground process cannot yet be
-pinned during adoption, so `adopt --harness muse` is refused before registry
-state is created. Start an owned Muse session instead, either directly with
-`agentctl start --harness muse ...` or through a validated profile; other
-Herdr-native harness kinds keep the existing adoption path.
+Muse can be adopted with `--harness muse` when Herdr reports that exact live
+harness. Adoption requires the foreground process and terminal to be pinned,
+along with the recorded shell generation and the identity assertions below.
+Delivery uses the same verified composer, process checks, and Auto-review
+policy as an owned Muse session. Adoption does not report a new agent, change
+its label, or take ownership of its runtime.
 
 Use the pane ID, working directory, harness, workspace ID, and workspace label
 reported by those read-only Herdr commands; do not infer them from a tab title.

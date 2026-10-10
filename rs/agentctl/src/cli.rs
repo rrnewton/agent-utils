@@ -78,7 +78,7 @@ enum Commands {
     Profiles(Profiles),
     /// Install the bundled agentctl harness skill
     Skill(Skill),
-    /// Register an existing Herdr agent without taking ownership of its runtime; Muse is refused
+    /// Register an existing Herdr agent without taking ownership of its runtime; Muse requires a pinned foreground process
     #[command(
         after_help = "Example: agentctl adopt reviewer --pane w1:p2 --workspace project --cwd /work/project --harness codex"
     )]
@@ -396,7 +396,7 @@ struct Adopt {
     /// Expected live agent working directory; compared canonically (required)
     #[arg(long, value_name = "DIR")]
     cwd: PathBuf,
-    /// Expected live Herdr harness kind, such as codex or claude; muse is refused (required)
+    /// Expected live Herdr harness kind, such as codex, claude, or muse (required)
     #[arg(long, value_name = "KIND")]
     harness: String,
     /// Stable native conversation ID already reported by this exact pane
@@ -2049,7 +2049,7 @@ mod tests {
             assert!(help.contains(required));
         }
         assert!(help.contains("without taking ownership"));
-        assert!(help.to_ascii_lowercase().contains("muse is refused"));
+        assert!(help.contains("Muse requires a pinned foreground process"));
         let error = Cli::try_parse_from(["agentctl", "stop", "--help"])
             .err()
             .unwrap();

@@ -18,7 +18,7 @@ from pathlib import Path
 
 import agentctl.client as client_module
 from agentctl.client import (
-    CustomProcessIdentity, Pane,
+    AgentIdentity, AgentPaneInfo, CustomProcessIdentity, Pane,
     HerdrClient,
     ProcessInfo,
     muse_auto_review_idle_composer,
@@ -393,6 +393,307 @@ def test_custom_harness_rejects_matching_report_when_kernel_executable_differs(
     )
     with pytest.raises(HerdrUnavailable, match="not the foreground process"):
         client.verify_custom_harness("p1", "muse")
+
+
+def _suggestion13_process_response(foreground: dict[str, object]) -> dict[str, object]:
+    return {"process_info": {
+        "pane_id": "p1", "shell_pid": 10, "foreground_process_group_id": 11,
+        "foreground_processes": [foreground],
+    }}
+
+
+@pytest.mark.parametrize("variant", ["absent", "null", "empty"])
+def test_suggestion13_missing_foreground_argv_remains_unknown_metadata(variant: str) -> None:
+    foreground: dict[str, object] = {
+        "pid": 2_147_483_647, "name": "muse", "cmdline": os.path.realpath("/bin/true"),
+        "executable": os.path.realpath("/bin/true"),
+    }
+    if variant != "absent":
+        foreground["argv"] = None if variant == "null" else []
+    client = HerdrClient(herdr_bin="fixture-herdr", run=Runner(_suggestion13_process_response(foreground)))
+    info = client.process_info("p1")
+    assert info.foreground == ((2_147_483_647, "muse", os.path.realpath("/bin/true"), "", os.path.realpath("/bin/true")),)
+    metadata = os.stat(os.path.realpath("/bin/true"))
+    assert client._pane_process_identity(info, os.path.realpath("/bin/true"),
+        launch_image=(metadata.st_dev, metadata.st_ino)) is None
+    assert client._idle_shell_proof(info) is None
+
+
+@pytest.mark.parametrize("argv", ["/bin/true", 7, {}, [None], [""], ["/bin/true", 7], ["/bad\0path"]])
+def test_suggestion13_supplied_malformed_foreground_argv_still_refuses(argv: object) -> None:
+    client = HerdrClient(herdr_bin="fixture-herdr", run=Runner(_suggestion13_process_response({
+        "pid": 11, "name": "muse", "cmdline": "/bin/true", "argv": argv,
+    })))
+    with pytest.raises(HerdrUnavailable, match="foreground process argv"):
+        client.process_info("p1")
+
+
+@pytest.mark.skipif(not hasattr(os, "pidfd_open"), reason="Linux pidfd identity required")
+def test_suggestion13_unknown_argv_can_verify_only_kernel_generation_or_opened_launch_image(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    executable = tmp_path / "muse"
+    shutil.copyfile("/usr/bin/sleep", executable)
+    executable.chmod(0o700)
+    process = subprocess.Popen([str(executable), "30"], start_new_session=True)
+    try:
+        foreground: dict[str, object] = {
+            "pid": process.pid, "name": "untrusted-name", "cmdline": "untrusted-command", "argv": None,
+            "executable": "/untrusted/reported-image",
+        }
+        response = _suggestion13_process_response(foreground)
+        process_info = response["process_info"]
+        assert isinstance(process_info, dict)
+        process_info["foreground_process_group_id"] = process.pid
+        runner = Runner(response)
+        client = HerdrClient(herdr_bin="fixture-herdr", run=runner)
+        info = client.process_info("p1")
+        identity = client.harness_identity("p1", "muse")
+        assert identity is not None and client.verify_harness_identity("p1", identity)
+        assert client._pane_process_identity(info, str(executable)) is None
+        image = executable.stat()
+        assert client._pane_process_identity(info, str(executable),
+            launch_image=(image.st_dev, image.st_ino)) == identity
+        assert client._pane_process_identity(info, str(executable),
+            launch_image=(image.st_dev, image.st_ino + 1)) is None
+        altered = (
+            replace(identity, pid=identity.pid + 1), replace(identity, starttime_ticks=identity.starttime_ticks + 1),
+            replace(identity, boot_id="ffffffff-ffff-ffff-ffff-ffffffffffff"),
+            replace(identity, executable_device=identity.executable_device + 1),
+            replace(identity, executable_inode=identity.executable_inode + 1),
+        )
+        assert all(not client.verify_harness_identity("p1", expected) for expected in altered)
+        process_info["foreground_process_group_id"] = process.pid + 1
+        assert not client.verify_harness_identity("p1", identity)
+        process_info["foreground_process_group_id"] = process.pid
+
+        screen = "Muse Code 1.3.0\n────────────────\n❯\n────────────────\nmodel · high · /work · Auto-review\n"
+
+        def run(command: Sequence[str]) -> subprocess.CompletedProcess[str]:
+            if list(command)[1:3] == ["pane", "read"]:
+                runner.calls.append(list(command))
+                return subprocess.CompletedProcess(command, 0, screen, "")
+            return runner(command)
+
+        monkeypatch.setattr(client, "_harness_executable", lambda _kind: str(executable))
+        monkeypatch.setattr(client, "_run", run)
+        observed: list[CustomProcessIdentity] = []
+        assert client.start_pane_agent("worker", "muse", "p1", (), timeout=1,
+            on_observed=observed.append) == identity
+        assert observed == [identity]
+    finally:
+        process.terminate()
+        process.wait(timeout=5)
+
+
+_SUGGESTION13_CODEX_INFO = AgentPaneInfo(
+    "p1", "w1", "/work", "codex", "unknown", "codex", "native", "terminal", "t1",
+)
+
+
+def _suggestion13_codex_readiness(
+    monkeypatch: pytest.MonkeyPatch,
+) -> tuple[HerdrClient, AgentPaneInfo, CustomProcessIdentity, list[str]]:
+    client = HerdrClient(herdr_bin="fixture-herdr", run=Runner({}))
+    info = _SUGGESTION13_CODEX_INFO
+    identity = CustomProcessIdentity(1, "00000000-0000-0000-0000-000000000000", 11, 11, 1, 2)
+    checks: list[str] = []
+    monkeypatch.setattr(client, "harness_identity", lambda _pane, _kind: identity)
+    monkeypatch.setattr(client, "verify_harness_identity", lambda _pane, expected: expected == identity)
+    monkeypatch.setattr(client, "pane_info", lambda _pane: info)
+
+    def screen(_pane: str) -> str:
+        checks.append("screen")
+        return "› \x1b[2mAsk Codex to do anything\x1b[0m\n  GPT default · /work\n"
+
+    monkeypatch.setattr(client, "read_screen", screen)
+    return client, info, identity, checks
+
+
+def test_suggestion13_codex_unknown_readiness_keeps_raw_status_and_requires_process_proof(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client, info, _identity, checks = _suggestion13_codex_readiness(monkeypatch)
+    assert client.codex_idle_ready(info) and info.status == "unknown"
+    assert checks == ["screen"]
+    monkeypatch.setattr(client, "harness_identity", lambda _pane, _kind: None)
+    assert not client.codex_idle_ready(info) and checks == ["screen"]
+
+
+@pytest.mark.parametrize("changed", [
+    replace(_SUGGESTION13_CODEX_INFO, agent="claude"),
+    replace(_SUGGESTION13_CODEX_INFO, status="idle"),
+    replace(_SUGGESTION13_CODEX_INFO, status="working"),
+    replace(_SUGGESTION13_CODEX_INFO, status="blocked"),
+    replace(_SUGGESTION13_CODEX_INFO, terminal_id=None),
+    replace(_SUGGESTION13_CODEX_INFO, terminal_id=""),
+    replace(_SUGGESTION13_CODEX_INFO, terminal_id="bad\0terminal"),
+    replace(_SUGGESTION13_CODEX_INFO, session_agent=None),
+    replace(_SUGGESTION13_CODEX_INFO, session_agent="muse"),
+    replace(_SUGGESTION13_CODEX_INFO, session_value=None),
+    replace(_SUGGESTION13_CODEX_INFO, session_value=""),
+    replace(_SUGGESTION13_CODEX_INFO, session_value="bad\0session"),
+])
+def test_suggestion13_codex_unknown_readiness_rejects_ineligible_live_metadata(
+    changed: AgentPaneInfo, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client, _info, _identity, checks = _suggestion13_codex_readiness(monkeypatch)
+    assert not client.codex_idle_ready(changed) and checks == []
+
+
+@pytest.mark.parametrize("changed", [
+    replace(_SUGGESTION13_CODEX_INFO, pane_id="p2"),
+    replace(_SUGGESTION13_CODEX_INFO, workspace_id="w2"),
+    replace(_SUGGESTION13_CODEX_INFO, cwd="/other"),
+    replace(_SUGGESTION13_CODEX_INFO, agent="claude"),
+    replace(_SUGGESTION13_CODEX_INFO, status="working"),
+    replace(_SUGGESTION13_CODEX_INFO, session_agent="muse"),
+    replace(_SUGGESTION13_CODEX_INFO, session_value="replacement"),
+    replace(_SUGGESTION13_CODEX_INFO, terminal_id="replacement"),
+    replace(_SUGGESTION13_CODEX_INFO, tab_id="other-tab"),
+])
+def test_suggestion13_codex_unknown_readiness_rejects_pane_changes_during_screen_read(
+    changed: AgentPaneInfo, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client, info, _identity, _checks = _suggestion13_codex_readiness(monkeypatch)
+    monkeypatch.setattr(client, "pane_info", lambda _pane: changed)
+    assert not client.codex_idle_ready(info)
+
+
+def test_suggestion13_codex_unknown_readiness_rejects_process_change_during_screen_read(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client, info, _identity, _checks = _suggestion13_codex_readiness(monkeypatch)
+    monkeypatch.setattr(client, "verify_harness_identity", lambda _pane, _expected: False)
+    assert not client.codex_idle_ready(info)
+
+
+_SUGGESTION13_START_TIMEOUT = (
+    '{"id":"cli:agent:start","error":{"code":"timeout",'
+    '"message":"timed out waiting for agent startup"}}'
+)
+
+
+def _suggestion13_timeout_client(
+    monkeypatch: pytest.MonkeyPatch, *, returncode: int = 1,
+    stdout: str = "", stderr: str = _SUGGESTION13_START_TIMEOUT,
+) -> tuple[HerdrClient, AgentPaneInfo, list[list[str]], list[str]]:
+    client, info, _identity, screens = _suggestion13_codex_readiness(monkeypatch)
+    initial = replace(info, agent=None, session_agent=None, session_value=None)
+    calls: list[list[str]] = []
+
+    def run(command: Sequence[str]) -> subprocess.CompletedProcess[str]:
+        calls.append(list(command))
+        return subprocess.CompletedProcess(command, returncode, stdout, stderr)
+
+    monkeypatch.setattr(client, "_run", run)
+    monkeypatch.setattr(client, "pane_info", lambda _pane: info if calls else initial)
+    monkeypatch.setattr(client, "agent_identity", lambda name: AgentIdentity(
+        name, info.pane_id, info.tab_id, info.terminal_id,
+    ))
+    return client, info, calls, screens
+
+
+def test_suggestion13_exact_codex_start_timeout_accepts_verified_unknown_idle_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client, info, calls, screens = _suggestion13_timeout_client(monkeypatch)
+    client.start_agent("worker", "codex", info.pane_id, ("--resume", "native"), timeout=1)
+    assert calls == [["fixture-herdr", "agent", "start", "worker", "--kind", "codex",
+                      "--pane", "p1", "--timeout", "1000", "--", "--resume", "native"]]
+    assert screens == ["screen"] and client.pane_info(info.pane_id).status == "unknown"
+
+
+@pytest.mark.parametrize("returncode,stdout,stderr", [
+    (2, "", _SUGGESTION13_START_TIMEOUT),
+    (1, "unexpected output", _SUGGESTION13_START_TIMEOUT),
+    (1, "", "timed out waiting for agent startup"),
+    (1, "", _SUGGESTION13_START_TIMEOUT.replace('"timeout"', '"agent_not_ready"')),
+    (1, "", _SUGGESTION13_START_TIMEOUT.replace('"cli:agent:start"', '"cli:agent:start:timeout"')),
+    (1, "", _SUGGESTION13_START_TIMEOUT.replace('"timeout"', '"timeout","extra":true')),
+    (1, "", _SUGGESTION13_START_TIMEOUT.replace('"timeout"', '"timeout","code":"timeout"')),
+    (1, "", _SUGGESTION13_START_TIMEOUT.replace('"cli:agent:start"', '"cli:agent:start","extra":true')),
+])
+def test_suggestion13_other_start_errors_never_use_codex_readiness_fallback(
+    returncode: int, stdout: str, stderr: str, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client, info, calls, screens = _suggestion13_timeout_client(
+        monkeypatch, returncode=returncode, stdout=stdout, stderr=stderr,
+    )
+    with pytest.raises(HerdrUnavailable, match="agent start 'worker'"):
+        client.start_agent("worker", "codex", info.pane_id, timeout=1)
+    assert len(calls) == 1 and screens == []
+
+
+@pytest.mark.parametrize("failure", [
+    "draft", "busy", "trust", "process", "name", "terminal", "workspace", "native",
+    "occupied-before-start", "final-name",
+])
+def test_suggestion13_exact_timeout_still_requires_coherent_idle_runtime(
+    failure: str, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client, info, calls, _screens = _suggestion13_timeout_client(monkeypatch)
+    if failure in ("draft", "busy", "trust"):
+        screen = {
+            "draft": "› human draft\n  GPT · /work\n",
+            "busy": "›\n  esc to interrupt\n  GPT · /work\n",
+            "trust": "Trust this folder?\n›\n  GPT · /work\n",
+        }[failure]
+        monkeypatch.setattr(client, "read_screen", lambda _pane: screen)
+    elif failure == "process":
+        monkeypatch.setattr(client, "verify_harness_identity", lambda _pane, _expected: False)
+    elif failure in ("name", "final-name"):
+        named_calls = 0
+
+        def named(name: str) -> AgentIdentity:
+            nonlocal named_calls
+            named_calls += 1
+            wrong = failure == "name" or named_calls > 1
+            return AgentIdentity(name, "other" if wrong else "p1", "t1", "terminal")
+
+        monkeypatch.setattr(client, "agent_identity", named)
+    else:
+        initial = replace(info, agent=None, session_agent=None, session_value=None)
+        changed = info
+        if failure == "terminal":
+            changed = replace(info, terminal_id="replacement")
+        elif failure == "workspace":
+            changed = replace(info, workspace_id="other")
+        elif failure == "native":
+            changed = replace(info, session_agent="muse")
+        else:
+            initial = info
+        monkeypatch.setattr(client, "pane_info", lambda _pane: changed if calls else initial)
+    with pytest.raises(HerdrUnavailable, match="timed out waiting for agent startup"):
+        client.start_agent("worker", "codex", info.pane_id, timeout=1)
+    assert len(calls) == 1
+
+
+@pytest.mark.parametrize("returncode", [0, 1])
+def test_suggestion13_unavailable_optional_snapshot_preserves_native_result(
+    returncode: int, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client, info, calls, screens = _suggestion13_timeout_client(monkeypatch, returncode=returncode)
+
+    def unavailable(_pane: str) -> AgentPaneInfo:
+        raise HerdrUnavailable("optional snapshot unavailable")
+
+    monkeypatch.setattr(client, "pane_info", unavailable)
+    if returncode == 0:
+        client.start_agent("worker", "codex", info.pane_id, timeout=1)
+    else:
+        with pytest.raises(HerdrUnavailable, match="timed out waiting for agent startup"):
+            client.start_agent("worker", "codex", info.pane_id, timeout=1)
+    assert len(calls) == 1 and screens == []
+
+
+def test_suggestion13_claude_start_timeout_keeps_existing_refusal(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client, info, calls, screens = _suggestion13_timeout_client(monkeypatch)
+    with pytest.raises(HerdrUnavailable, match="timed out waiting for agent startup"):
+        client.start_agent("worker", "claude", info.pane_id, timeout=1)
+    assert len(calls) == 1 and screens == []
 
 
 @pytest.mark.skipif(not hasattr(os, "pidfd_open"), reason="Linux pidfd identity required")

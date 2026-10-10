@@ -17,7 +17,7 @@ import agentctl.subagents as subagents_module
 from agentctl.client import (
     AgentPaneInfo, CustomProcessIdentity, HerdrClient, Pane, PaneShellProof,
 )
-from agentctl.errors import AgentDeliveryError, HerdrUnavailable
+from agentctl.errors import AgentDeliveryError, AgentPossiblySubmitted, HerdrUnavailable
 from agentctl.sessions import Sessions
 from agentctl.subagents import AgentRecord
 import agentctl.codex_goal as native_goal
@@ -1570,4 +1570,221 @@ def test_adopt_help_names_every_required_identity_assertion(
     for value in ("--pane", "--workspace", "--cwd", "--harness", "--session",
                   "without taking ownership"):
         assert value in output
-    assert "muse is refused" in output.lower()
+    assert "Muse requires a pinned foreground process" in output
+
+
+def _suggestion13_foreign_muse(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *, native_session: bool = True,
+    mode: str = "Auto-review",
+) -> tuple[Sessions, FakeManagedClient, str, list[str]]:
+    sessions, fake, pane = setup_foreign(tmp_path, monkeypatch, native_session=native_session)
+    fake.infos[pane] = replace(
+        fake.infos[pane], agent="muse", session_agent="muse" if native_session else None,
+        terminal_id="term-1", tab_id="w1:t1",
+    )
+    draft = ""
+    pastes: list[str] = []
+
+    def screen(_pane: str) -> str:
+        transcript = "\n".join(fake.transcripts.get(pane, []))
+        permission = "" if mode == "standard" else f" · {mode}"
+        return ("Muse Code 1.3.0\n" + transcript + "\n" + "─" * 40 + "\n❯"
+                + (" " + draft if draft else "") + "\n" + "─" * 40
+                + f"\nmodel · high · {tmp_path}{permission}\n")
+
+    def read(pane_id: str, *, source: str, lines: int) -> str:
+        assert pane_id == pane and lines > 0
+        return "\n".join(fake.transcripts.get(pane, [])) if source == "recent-unwrapped" else screen(pane_id)
+
+    def paste(pane_id: str, text: str, *, expect_terminal: str | None = None) -> None:
+        nonlocal draft
+        fake._effect(pane_id, expect_terminal)
+        assert text.startswith("\x1b[200~") and text.endswith("\x1b[201~")
+        draft = text[len("\x1b[200~"):-len("\x1b[201~")]
+        pastes.append(text)
+
+    original_keys = fake.send_keys
+
+    def keys(pane_id: str, value: str, *, expect_terminal: str | None = None) -> None:
+        nonlocal draft
+        original_keys(pane_id, value, expect_terminal=expect_terminal)
+        if value == "Enter":
+            fake.submitted.append(draft)
+            fake.transcripts.setdefault(pane_id, []).append(f"❯ {draft}")
+            draft = ""
+
+    def forbidden_native(_pane: str, _text: str, *, expect_terminal: str | None = None) -> None:
+        del expect_terminal
+        raise AssertionError("foreign Muse must use guarded editor input")
+
+    monkeypatch.setattr(fake, "read", read)
+    monkeypatch.setattr(fake, "read_screen", screen, raising=False)
+    monkeypatch.setattr(fake, "send_text", paste, raising=False)
+    monkeypatch.setattr(fake, "send_keys", keys)
+    monkeypatch.setattr(fake, "agent_prompt", forbidden_native)
+    return sessions, fake, pane, pastes
+
+
+@pytest.mark.parametrize("native_session", [False, True])
+def test_suggestion13_adopted_muse_uses_pinned_guarded_editor_and_preserves_runtime_ownership(
+    native_session: bool, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sessions, fake, pane, pastes = _suggestion13_foreign_muse(
+        tmp_path, monkeypatch, native_session=native_session,
+    )
+    original_info, original_labels = fake.infos[pane], dict(fake.labels)
+    result = sessions.adopt("foreign", pane_id=pane, expected_workspace="subagents",
+                            expected_cwd=str(tmp_path), harness="muse")
+    record = sessions.get("foreign")
+    assert result["adapter"] == "herdr-foreign" and result["agent_status"] == "idle"
+    assert record.harness_anchor == fake.harness_identity(pane, "muse")
+    assert record.foreign_shell_identity == fake.foreign_shell_identity
+    assert record.custom_process_identity is None and not record.pane_reported_by_agentctl
+    fake.expect_supported = True
+    assert sessions.send_session("foreign", "literal follow up", ready_timeout=0)["delivered"]
+    assert fake.submitted == ["literal follow up"]
+    assert pastes == ["\x1b[200~literal follow up\x1b[201~"]
+    assert fake.keys_sent == [(pane, "Enter")]
+    assert fake.expected_terminals == ["term-1", "term-1"]
+    sessions.rename("foreign", "reviewer")
+    assert sessions.get("reviewer").adapter == "herdr-foreign"
+    assert sessions.get("reviewer").token == record.token
+    sessions.stop("reviewer")
+    assert fake.infos[pane] == original_info and fake.labels == original_labels
+    assert fake.launched == [] and fake.closed == []
+
+
+@pytest.mark.parametrize("mode", ["YOLO", "standard"])
+def test_suggestion13_foreign_muse_retains_current_composer_permission_policy(
+    mode: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sessions, fake, pane, pastes = _suggestion13_foreign_muse(tmp_path, monkeypatch, mode=mode)
+    fake.transcripts[pane] = ["quoted prior model · high · /work · Auto-review"]
+    sessions.adopt("foreign", pane_id=pane, expected_workspace="subagents",
+                   expected_cwd=str(tmp_path), harness="muse")
+    with pytest.raises(AgentPossiblySubmitted, match="Auto-review|YOLO"):
+        sessions.send_session("foreign", "must remain untyped", ready_timeout=0)
+    assert pastes == [] and fake.keys_sent == [] and fake.submitted == []
+    assert sessions.get("foreign").adapter == "herdr-foreign"
+
+
+@pytest.mark.parametrize("changed", ["harness", "shell", "terminal", "native", "anchor"])
+def test_suggestion13_foreign_muse_input_refuses_replacement_or_unanchored_recipient(
+    changed: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sessions, fake, pane, pastes = _suggestion13_foreign_muse(tmp_path, monkeypatch)
+    sessions.adopt("foreign", pane_id=pane, expected_workspace="subagents",
+                   expected_cwd=str(tmp_path), harness="muse")
+    if changed == "harness":
+        fake.harness_pids[pane] += 1
+    elif changed == "shell":
+        fake.foreign_shell_identity = replace(fake.foreign_shell_identity,
+            starttime_ticks=fake.foreign_shell_identity.starttime_ticks + 1)
+    elif changed == "terminal":
+        fake.infos[pane] = replace(fake.infos[pane], terminal_id="replacement")
+    elif changed == "native":
+        fake.infos[pane] = replace(fake.infos[pane], session_value="replacement")
+    else:
+        record = sessions.get("foreign")
+        record.harness_identity = None
+        record.anchor_rule = None
+        sessions._save(record)
+    with pytest.raises((AgentDeliveryError, HerdrUnavailable)):
+        sessions.send_session("foreign", "must remain pending", ready_timeout=0)
+    assert pastes == [] and fake.keys_sent == [] and fake.submitted == [] and fake.closed == []
+
+
+def test_suggestion13_foreign_muse_screen_read_cannot_replace_saved_shell_proof(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sessions, fake, pane, _pastes = _suggestion13_foreign_muse(tmp_path, monkeypatch)
+    result = sessions.adopt("foreign", pane_id=pane, expected_workspace="subagents",
+                            expected_cwd=str(tmp_path), harness="muse")
+    original_read = fake.read
+
+    def read(pane_id: str, *, source: str, lines: int) -> str:
+        text = original_read(pane_id, source=source, lines=lines)
+        fake.foreign_shell_identity = replace(fake.foreign_shell_identity,
+            starttime_ticks=fake.foreign_shell_identity.starttime_ticks + 1)
+        return text
+
+    monkeypatch.setattr(fake, "read", read)
+    status = sessions.status("foreign")
+    assert status["agent_status"] == "unknown"
+    assert "pinned shell process" in str(status["probe_error"])
+    assert status["foreign_shell_identity"] == result["foreign_shell_identity"]
+    assert fake.submitted == [] and fake.keys_sent == []
+
+
+@pytest.mark.parametrize("native_session", [False, True])
+def test_suggestion13_muse_adoption_does_not_accept_foreground_replacement_during_census(
+    native_session: bool, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sessions, fake, pane, _pastes = _suggestion13_foreign_muse(
+        tmp_path, monkeypatch, native_session=native_session,
+    )
+    original_panes = fake.panes
+    replaced = False
+
+    def panes(workspace_id: str | None = None) -> tuple[Pane, ...]:
+        nonlocal replaced
+        if not replaced:
+            fake.harness_pids[pane] += 1
+            replaced = True
+        return original_panes(workspace_id)
+
+    monkeypatch.setattr(fake, "panes", panes)
+    with pytest.raises(AgentDeliveryError, match="Muse foreground process changed"):
+        sessions.adopt("foreign", pane_id=pane, expected_workspace="subagents",
+                       expected_cwd=str(tmp_path), harness="muse")
+    assert not (sessions.registry / "foreign").exists()
+    assert fake.launched == [] and fake.closed == [] and fake.submitted == []
+
+
+def test_suggestion13_muse_adoption_final_process_failure_archives_diagnostic_without_runtime_effects(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sessions, fake, pane, _pastes = _suggestion13_foreign_muse(tmp_path, monkeypatch)
+    original_save = sessions._save
+
+    def save(record: AgentRecord) -> None:
+        original_save(record)
+        fake.harness_pids[pane] += 1
+
+    monkeypatch.setattr(sessions, "_save", save)
+    with pytest.raises(AgentDeliveryError, match="diagnostic record archived"):
+        sessions.adopt("foreign", pane_id=pane, expected_workspace="subagents",
+                       expected_cwd=str(tmp_path), harness="muse")
+    assert not (sessions.registry / "foreign").exists()
+    archived = list((sessions.registry / "archive").iterdir())
+    assert len(archived) == 1
+    diagnostic = AgentRecord.load(archived[0] / "agent.json", "foreign")
+    assert diagnostic.lifecycle == "adopt_failed" and diagnostic.adapter == "herdr-foreign"
+    assert diagnostic.harness_anchor is not None and diagnostic.harness_anchor.pid != fake.harness_pids[pane]
+    assert fake.launched == [] and fake.closed == [] and fake.submitted == []
+
+
+def test_suggestion13_foreign_muse_after_paste_replacement_quarantines_without_enter(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sessions, fake, pane, pastes = _suggestion13_foreign_muse(tmp_path, monkeypatch)
+    sessions.adopt("foreign", pane_id=pane, expected_workspace="subagents",
+                   expected_cwd=str(tmp_path), harness="muse")
+    paste = cast(object, getattr(fake, "send_text"))
+    assert callable(paste)
+
+    def replace_after_paste(pane_id: str, text: str, *, expect_terminal: str | None = None) -> None:
+        paste(pane_id, text, expect_terminal=expect_terminal)
+        fake.harness_pids[pane] += 1
+
+    monkeypatch.setattr(fake, "send_text", replace_after_paste)
+    with pytest.raises(AgentPossiblySubmitted, match="MISROUTE|quarantin") as refused:
+        sessions.send_session("foreign", "possibly staged", ready_timeout=0)
+    assert pastes == ["\x1b[200~possibly staged\x1b[201~"]
+    assert fake.keys_sent == [] and fake.submitted == [] and fake.closed == []
+    artifact = Path(refused.value.artifact)
+    assert artifact.parent.name == "failed" and artifact.is_file()
+    document = json.loads(artifact.read_text(encoding="utf-8"))
+    assert document["possibly_submitted"] is True and document["probable_misroute"] is True
+    assert sessions.drain("foreign", ready_timeout=0).delivered == ()
+    assert fake.keys_sent == [] and fake.submitted == []

@@ -1844,6 +1844,10 @@ def _wait_ready(
             )
         if info.status in ("idle", "done"):
             return info
+        codex_ready = getattr(client, "codex_idle_ready", None)
+        if (info.agent == "codex" and info.status == "unknown"
+                and callable(codex_ready) and codex_ready(info)):
+            return info
         if info.status == "blocked":
             raise AgentDeliveryError(f"pane {info.pane_id} is blocked; resolve its visible prompt")
         if monotonic() >= deadline:

@@ -134,7 +134,7 @@ def parser() -> argparse.ArgumentParser:
         help="interactive startup deadline, greater than 0 and at most 300 (default: 30)")
     _delivery(start)
 
-    adopt = command("adopt", "Register an existing Herdr agent without taking ownership of its runtime; Muse is refused.",
+    adopt = command("adopt", "Register an existing Herdr agent without taking ownership of its runtime; Muse requires a pinned foreground process.",
         "agentctl adopt reviewer --pane w1:p2 --workspace project --cwd /work/project --harness codex",
         named=True)
     adopt.add_argument("--pane", required=True, metavar="ID",
@@ -144,7 +144,7 @@ def parser() -> argparse.ArgumentParser:
     adopt.add_argument("--cwd", required=True, metavar="DIR",
         help="expected live agent working directory; compared canonically (required)")
     adopt.add_argument("--harness", required=True, metavar="KIND",
-        help="expected live harness kind, for example codex or claude; muse is refused (required)")
+        help="expected live harness kind, for example codex, claude, or muse (required)")
     adopt.add_argument("--session", metavar="ID",
         help="optional stable native conversation ID already reported by this exact pane")
 

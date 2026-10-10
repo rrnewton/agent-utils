@@ -118,6 +118,40 @@ struct PaneProcessState {
     processes: Vec<Map<String, Value>>,
 }
 
+fn foreground_argv0(process: &Map<String, Value>) -> Result<Option<&str>> {
+    let values = match process.get("argv") {
+        None | Some(Value::Null) => return Ok(None),
+        Some(Value::Array(values)) => values,
+        Some(_) => {
+            return Err(AdapterError::unavailable(
+                "foreground process argv: expected an array",
+            ))
+        }
+    };
+    if values.iter().any(|value| !value.is_string()) {
+        return Err(AdapterError::unavailable(
+            "foreground process argv: expected string arguments",
+        ));
+    }
+    let Some(value) = values.first().and_then(Value::as_str) else {
+        return Ok(None);
+    };
+    if value.is_empty() || value.contains('\0') {
+        return Err(AdapterError::unavailable(
+            "foreground process argv must have a nonempty argv[0] without NUL",
+        ));
+    }
+    Ok(Some(value))
+}
+
+fn foreground_process_entries(values: &[Value]) -> Result<Vec<Map<String, Value>>> {
+    let processes = object_entries(values, "foreground process")?;
+    for process in &processes {
+        foreground_argv0(process)?;
+    }
+    Ok(processes)
+}
+
 /// Whether a Claude or Codex workspace trust dialog is on screen.
 pub fn relay_trust_prompt(screen: &str) -> bool {
     (screen.contains("Quick safety check: Is this a project you created or one you trust?")
@@ -920,7 +954,19 @@ pub(crate) fn muse_trust_prompt(screen: &str) -> bool {
 }
 
 pub(crate) fn muse_idle_composer(screen: &str) -> bool {
-    screen.contains("Auto-review") && screen.lines().any(|line| matches!(line.trim(), "❯" | "›"))
+    muse_composer_regions_checked(screen, true)
+        .is_some_and(|(_, composer, _)| matches!(composer.trim(), "❯" | "›"))
+}
+
+pub(crate) fn muse_verified_process_idle_composer(screen: &str) -> bool {
+    muse_composer_regions_checked(screen, false)
+        .is_some_and(|(_, composer, _)| matches!(composer.trim(), "❯" | "›"))
+}
+
+pub(crate) fn muse_auto_review_idle_composer(screen: &str) -> bool {
+    muse_composer_regions_checked(screen, true).is_some_and(|(_, composer, mode)| {
+        mode == "Auto-review" && matches!(composer.trim(), "❯" | "›")
+    })
 }
 
 fn muse_text_visible(screen: &str, text: &str) -> bool {
@@ -939,12 +985,12 @@ fn muse_text_visible(screen: &str, text: &str) -> bool {
     rendered.contains(&prefix) && rendered.contains(&suffix)
 }
 
-fn muse_composer_regions(screen: &str) -> Option<(String, String)> {
+fn muse_composer_regions_checked(
+    screen: &str,
+    require_header: bool,
+) -> Option<(String, String, &str)> {
     let lines = screen.lines().collect::<Vec<_>>();
-    let footer = lines
-        .iter()
-        .rposition(|line| line.contains("Auto-review"))?;
-    let dividers = lines[..footer]
+    let dividers = lines
         .iter()
         .enumerate()
         .filter_map(|(index, line)| {
@@ -958,7 +1004,75 @@ fn muse_composer_regions(screen: &str) -> Option<(String, String)> {
         .collect::<Vec<_>>();
     let bottom = *dividers.last()?;
     let top = *dividers.get(dividers.len().checked_sub(2)?)?;
-    Some((lines[..top].join("\n"), lines[top + 1..bottom].join("\n")))
+    let header = lines[..top].iter().any(|line| {
+        line.trim()
+            .strip_prefix("Muse Code ")
+            .is_some_and(|version| {
+                let parts: Vec<&str> = version.split('.').collect();
+                parts.len() == 3
+                    && parts.iter().all(|part| {
+                        !part.is_empty() && part.bytes().all(|value| value.is_ascii_digit())
+                    })
+            })
+    });
+    if require_header && !header {
+        return None;
+    }
+    let modes = lines[bottom + 1..]
+        .iter()
+        .filter_map(|line| {
+            let fields: Vec<&str> = line.trim().split('·').map(str::trim).collect();
+            if !matches!(fields.len(), 3 | 4)
+                || fields.iter().any(|field| field.is_empty())
+                || !muse_effort(fields[1])
+            {
+                return None;
+            }
+            match fields.as_slice() {
+                [_, _, _] => Some("standard"),
+                [_, _, _, mode @ ("Auto-review" | "YOLO")] => Some(*mode),
+                _ => None,
+            }
+        })
+        .collect::<Vec<_>>();
+    if modes.len() != 1 {
+        return None;
+    }
+    Some((
+        lines[..top].join("\n"),
+        lines[top + 1..bottom].join("\n"),
+        modes[0],
+    ))
+}
+
+fn muse_composer_regions(screen: &str) -> Option<(String, String)> {
+    muse_composer_regions_checked(screen, true)
+        .map(|(transcript, composer, _)| (transcript, composer))
+}
+
+pub(crate) fn muse_prompt_is_exact_composer(screen: &str, text: &str) -> bool {
+    let Some((_, composer)) = muse_composer_regions(screen) else {
+        return false;
+    };
+    let mut lines = composer
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty());
+    let Some(first) = lines.next() else {
+        return false;
+    };
+    let Some(first) = first.strip_prefix('❯').or_else(|| first.strip_prefix('›')) else {
+        return false;
+    };
+    if !first.is_empty() && !first.starts_with(char::is_whitespace) {
+        return false;
+    }
+    let rendered = std::iter::once(first)
+        .chain(lines)
+        .collect::<Vec<_>>()
+        .join(" ");
+    let wanted = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    !wanted.is_empty() && rendered.split_whitespace().collect::<Vec<_>>().join(" ") == wanted
 }
 
 pub(crate) fn muse_prompt_in_composer(screen: &str, text: &str) -> bool {
@@ -1313,6 +1427,30 @@ pub struct CommandOutput {
     pub stderr: String,
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AgentStartupTimeout {
+    id: String,
+    error: AgentStartupTimeoutError,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AgentStartupTimeoutError {
+    code: String,
+    message: String,
+}
+
+fn codex_startup_timeout(output: &CommandOutput) -> bool {
+    output.status == 1
+        && output.stdout.trim().is_empty()
+        && serde_json::from_str::<AgentStartupTimeout>(&output.stderr).is_ok_and(|response| {
+            response.id == "cli:agent:start"
+                && response.error.code == "timeout"
+                && response.error.message == "timed out waiting for agent startup"
+        })
+}
+
 /// Direct Herdr CLI adapter; executable availability is checked when used.
 #[derive(Clone, Debug)]
 pub struct HerdrClient {
@@ -1423,6 +1561,13 @@ impl HerdrClient {
                 "agent startup timeout must be between 0 and 300 seconds",
             ));
         }
+        // This observation is required only for the additional readiness proof. A native
+        // successful launch does not depend on the fallback's inspection being available.
+        let initial = if kind == "codex" {
+            self.pane_info(pane_id).ok()
+        } else {
+            None
+        };
         let mut args = strings(&[
             "agent",
             "start",
@@ -1437,12 +1582,60 @@ impl HerdrClient {
         args.extend_from_slice(arguments);
         let result = self.invoke_with_timeout(&args, timeout + CONTROL_TIMEOUT)?;
         if result.status != 0 {
+            if codex_startup_timeout(&result)
+                && initial.as_ref().is_some_and(|initial| {
+                    self.codex_ready_after_startup_timeout(name, initial)
+                        .unwrap_or(false)
+                })
+            {
+                return Ok(());
+            }
             return Err(AdapterError::unavailable(format!(
                 "agent start {name:?}: {}",
                 stderr_detail(&result)
             )));
         }
         Ok(())
+    }
+
+    fn codex_ready_after_startup_timeout(
+        &self,
+        name: &str,
+        initial: &AgentPaneInfo,
+    ) -> Result<bool> {
+        if initial.agent.is_some()
+            || initial
+                .terminal_id
+                .as_deref()
+                .is_none_or(|value| value.is_empty() || value.contains('\0'))
+        {
+            return Ok(false);
+        }
+        let info = self.pane_info(&initial.pane_id)?;
+        if info.pane_id != initial.pane_id
+            || info.workspace_id != initial.workspace_id
+            || info.cwd != initial.cwd
+            || info.tab_id != initial.tab_id
+            || info.terminal_id != initial.terminal_id
+        {
+            return Ok(false);
+        }
+        let named = self.agent_identity(name)?;
+        if named.pane_id != info.pane_id
+            || named.tab_id != info.tab_id
+            || named.terminal_id != info.terminal_id
+        {
+            return Ok(false);
+        }
+        let Some(identity) = self.harness_identity(&info.pane_id, "codex")? else {
+            return Ok(false);
+        };
+        if !self.codex_idle_ready_with_cancellation(&info, &|| false)? {
+            return Ok(false);
+        }
+        Ok(self.agent_identity(name)? == named
+            && self.pane_info(&info.pane_id)? == info
+            && self.verify_harness_identity(&info.pane_id, &identity)?)
     }
 
     fn pane_process_state(
@@ -1483,7 +1676,7 @@ impl HerdrClient {
         Ok(PaneProcessState {
             shell_pid,
             foreground_process_group_id,
-            processes: object_entries(processes, "foreground process")?,
+            processes: foreground_process_entries(processes)?,
         })
     }
 
@@ -1515,7 +1708,7 @@ impl HerdrClient {
         let processes = value_array(info.get("foreground_processes"), "foreground_processes")?;
         Ok((
             foreground_process_group_id,
-            object_entries(processes, "foreground process")?,
+            foreground_process_entries(processes)?,
         ))
     }
 
@@ -1538,31 +1731,27 @@ impl HerdrClient {
                         "foreground process: \"pid\" is not a positive Linux process id",
                     )
                 })?;
-            let argv0 = process
-                .get("argv")
-                .and_then(Value::as_array)
-                .and_then(|values| values.first())
-                .and_then(Value::as_str)
-                .unwrap_or_default();
-            let exact_argv =
-                fs::canonicalize(argv0).is_ok_and(|path| path == executable.path.as_path());
-            if !exact_argv {
+            if foreground_argv0(&process)?.is_some_and(|argv0| {
+                !fs::canonicalize(argv0).is_ok_and(|path| path == executable.path.as_path())
+            }) {
                 continue;
             }
-            if candidate.replace(pid).is_some() {
+            let observed = live_custom_process(pid)?;
+            if observed.process_group_id != foreground_process_group_id
+                || observed.identity.executable_device != executable.device
+                || observed.identity.executable_inode != executable.inode
+            {
+                continue;
+            }
+            // Omitted argv carries no executable authority. The already-open launch image
+            // and a coherent kernel observation can still establish this exact process.
+            if candidate.replace(observed.identity).is_some() {
                 return Err(AdapterError::unavailable(
                     "pane process-info returned multiple matching custom harness processes",
                 ));
             }
         }
-        let Some(pid) = candidate else {
-            return Ok(None);
-        };
-        let observed = live_custom_process(pid)?;
-        Ok((observed.process_group_id == foreground_process_group_id
-            && observed.identity.executable_device == executable.device
-            && observed.identity.executable_inode == executable.inode)
-            .then_some(observed.identity))
+        Ok(candidate)
     }
 
     fn recorded_custom_harness_observed(
@@ -2698,8 +2887,17 @@ impl HerdrClient {
         pane_id: &str,
         kind: &str,
     ) -> Result<Option<CustomProcessIdentity>> {
+        self.harness_identity_with_cancellation(pane_id, kind, &|| false)
+    }
+
+    fn harness_identity_with_cancellation(
+        &self,
+        pane_id: &str,
+        kind: &str,
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<Option<CustomProcessIdentity>> {
         let _ = kind;
-        let state = self.pane_process_state(pane_id, &|| false)?;
+        let state = self.pane_process_state(pane_id, cancelled)?;
         if state.foreground_process_group_id == state.shell_pid || state.processes.len() != 1 {
             return Ok(None);
         }
@@ -2721,7 +2919,16 @@ impl HerdrClient {
         pane_id: &str,
         expected: &CustomProcessIdentity,
     ) -> Result<bool> {
-        let state = self.pane_process_state(pane_id, &|| false)?;
+        self.verify_harness_identity_with_cancellation(pane_id, expected, &|| false)
+    }
+
+    fn verify_harness_identity_with_cancellation(
+        &self,
+        pane_id: &str,
+        expected: &CustomProcessIdentity,
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<bool> {
+        let state = self.pane_process_state(pane_id, cancelled)?;
         if !expected.valid() || state.processes.len() != 1 {
             return Ok(false);
         }
@@ -2735,6 +2942,46 @@ impl HerdrClient {
             observed.process_group_id == state.foreground_process_group_id
                 && observed.identity == *expected,
         )
+    }
+
+    pub(crate) fn codex_idle_ready_with_cancellation(
+        &self,
+        info: &AgentPaneInfo,
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<bool> {
+        let native_valid = match (&info.session_agent, &info.session_value) {
+            (None, None) => true,
+            (Some(agent), Some(value)) => {
+                agent == "codex" && !value.is_empty() && !value.contains('\0')
+            }
+            _ => false,
+        };
+        if info.agent.as_deref() != Some("codex")
+            || info.status != "unknown"
+            || !native_valid
+            || info
+                .terminal_id
+                .as_deref()
+                .is_none_or(|value| value.is_empty() || value.contains('\0'))
+        {
+            return Ok(false);
+        }
+        let Some(identity) =
+            self.harness_identity_with_cancellation(&info.pane_id, "codex", cancelled)?
+        else {
+            return Ok(false);
+        };
+        let screen = self.read_screen_with_cancellation(&info.pane_id, cancelled)?;
+        if !crate::submission::codex_idle_composer(&screen) {
+            return Ok(false);
+        }
+        let confirmed = self.pane_info_with_cancellation(&info.pane_id, cancelled)?;
+        Ok(confirmed == *info
+            && self.verify_harness_identity_with_cancellation(
+                &info.pane_id,
+                &identity,
+                cancelled,
+            )?)
     }
     /// Invoke and validate the corresponding Herdr agent-control operation.
     pub fn send_keys(&self, pane_id: &str, keys: &str) -> Result<()> {
@@ -3254,6 +3501,8 @@ fn unique_label_id(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(target_os = "linux")]
+    mod herdr_compatibility;
     #[cfg(target_os = "linux")]
     use std::io::Write as _;
     #[cfg(target_os = "linux")]

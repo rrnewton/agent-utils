@@ -453,6 +453,166 @@ pub fn composer_view(harness: &str, screen: &str) -> Option<ComposerView> {
     }
 }
 
+/// Whether Codex shows an empty idle composer with a recognized status footer.
+///
+/// This screen observation establishes readiness only after the caller independently
+/// verifies the live recipient. A retained composer during a turn or dialog is not idle.
+pub(crate) fn codex_idle_composer(screen: &str) -> bool {
+    let Some(view) = composer_view("codex", screen) else {
+        return false;
+    };
+    if !view.composer_solid.trim().is_empty()
+        || view.composer.contains("[Pasted text #")
+        || view.composer.contains("[Pasted Content ")
+    {
+        return false;
+    }
+    let footer = view.footer.to_ascii_lowercase();
+    let words: Vec<&str> = footer.split_whitespace().collect();
+    let context = words.windows(3).any(|words| {
+        words[0].strip_suffix('%').is_some_and(|number| {
+            let digits = |value: &str| {
+                !value.is_empty() && value.bytes().all(|value| value.is_ascii_digit())
+            };
+            match number.split_once('.') {
+                Some((whole, fraction)) => digits(whole) && digits(fraction),
+                None => digits(number),
+            }
+        }) && words[1] == "context"
+            && matches!(words[2], "left" | "remaining")
+    });
+    let path_footer = footer.contains('·')
+        && words
+            .iter()
+            .any(|word| word.starts_with('/') || word.starts_with("~/"));
+    if !path_footer && !footer.contains("? for shortcuts") && !context {
+        return false;
+    }
+    let mut active_timer = false;
+    for line in view.transcript.lines() {
+        if codex_timer_row(line) {
+            active_timer = true;
+        } else if line.starts_with(['•', '◦', '■', '✗', '✓'])
+            && ![
+                "queued follow-up inputs",
+                "messages to be submitted after next tool call",
+                "messages to be submitted at end of turn",
+            ]
+            .iter()
+            .any(|marker| line.to_ascii_lowercase().contains(marker))
+        {
+            active_timer = false;
+        }
+    }
+    if active_timer {
+        return false;
+    }
+    let rows = render_screen(screen);
+    let Some(last) = rows
+        .iter()
+        .rposition(|(plain, _)| plain.iter().any(|character| !character.is_whitespace()))
+    else {
+        return false;
+    };
+    const REFUSALS: [&str; 22] = [
+        "esc to interrupt",
+        " to interrupt",
+        "tab to queue message",
+        "press up to edit queued messages",
+        "edit last queued message",
+        "queued follow-up inputs",
+        "messages to be submitted after next tool call",
+        "messages to be submitted at end of turn",
+        "paste again to expand",
+        "trust this folder?",
+        "trust and continue",
+        "do you trust the contents of this directory?",
+        "approval required",
+        "requires approval",
+        "approve this",
+        "would you like to run",
+        "press enter to continue",
+        "enter to confirm",
+        "esc to cancel",
+        "enter to submit answer",
+        "enter to submit all",
+        "allow command?",
+    ];
+    let active = &rows[(last + 1).saturating_sub(RUNNING_TURN_ROWS)..=last];
+    if ["all results", "filesystem only", "plugins"]
+        .iter()
+        .all(|marker| {
+            active
+                .iter()
+                .any(|(plain, _)| text_of(plain).to_ascii_lowercase().contains(marker))
+        })
+    {
+        return false;
+    }
+    !active.iter().any(|(plain, _)| {
+        let line = text_of(plain);
+        if codex_timer_row(&line) {
+            return false;
+        }
+        let line = line.to_ascii_lowercase();
+        REFUSALS.iter().any(|refusal| line.contains(refusal))
+    })
+}
+
+fn codex_timer_row(line: &str) -> bool {
+    let line = line.trim_end();
+    let line = if let Some(rest) = line.strip_prefix('•').or_else(|| line.strip_prefix('◦')) {
+        if !rest.starts_with([' ', '\t']) {
+            return false;
+        }
+        rest.trim_start_matches([' ', '\t'])
+    } else {
+        line
+    };
+    if line.chars().next().is_none_or(|first| {
+        first.is_whitespace() || matches!(first, '›' | '•' | '◦' | '■' | '✗' | '✓' | '─')
+    }) {
+        return false;
+    }
+    line.match_indices(" (")
+        .any(|(index, _)| codex_elapsed_suffix(&line[index + 2..]))
+}
+
+fn codex_elapsed_suffix(mut elapsed: &str) -> bool {
+    loop {
+        let digits = elapsed.bytes().take_while(u8::is_ascii_digit).count();
+        if digits == 0 {
+            return false;
+        }
+        elapsed = &elapsed[digits..];
+        if let Some(rest) = elapsed
+            .strip_prefix("h ")
+            .or_else(|| elapsed.strip_prefix("m "))
+        {
+            elapsed = rest;
+            continue;
+        }
+        let Some(rest) = elapsed.strip_prefix('s') else {
+            return false;
+        };
+        let suffix_valid = |suffix: &str| {
+            suffix.is_empty()
+                || suffix
+                    .strip_prefix(" · ")
+                    .is_some_and(|text| !text.is_empty())
+        };
+        if let Some(suffix) = rest.strip_prefix(')') {
+            return suffix_valid(suffix);
+        }
+        let Some(hint) = rest.strip_prefix(" • ") else {
+            return false;
+        };
+        return hint
+            .match_indices(" to interrupt)")
+            .any(|(end, marker)| end > 0 && suffix_valid(&hint[end + marker.len()..]));
+    }
+}
+
 /// Whether the bottom of `screen` shows that the agent is running a turn: `Some(true)` if it
 /// does, `Some(false)` if it shows none, and `None` if it cannot tell.
 ///
@@ -1888,6 +2048,146 @@ mod tests {
         }
         let view = composer_view("codex", &codex_v0_159_1::session_idle()).unwrap();
         assert!(view.transcript.contains("Worked for 52s"), "{view:?}");
+    }
+
+    #[test]
+    fn herdr_093_codex_idle_composer_accepts_only_recognized_empty_idle_frames() {
+        for screen in [codex_v0_159_1::fresh_idle(), codex_v0_159_1::session_idle()] {
+            assert!(codex_idle_composer(&screen), "{screen:?}");
+        }
+        for marker in ['›', '»'] {
+            for footer in [
+                "? for shortcuts",
+                "100% context left",
+                "82% context remaining",
+                "82.5% context remaining",
+                "model high · /work/project",
+            ] {
+                let screen = format!(
+                    "Codex\n{marker} \u{1b}[2mAsk Codex to do anything\u{1b}[0m\n  {footer}\n"
+                );
+                assert!(codex_idle_composer(&screen), "{screen:?}");
+            }
+        }
+        for screen in [
+            codex_v0_159_1::working(),
+            codex_v0_159_1::staged(),
+            codex_v0_159_1::trust_prompt(),
+            "Codex\n» draft text\n  ? for shortcuts\n".to_owned(),
+            "Codex\n» \u{1b}[2m[Pasted text #4 +12 lines]\u{1b}[0m\n  ? for shortcuts\n".to_owned(),
+            "Codex\n» \u{1b}[2m[Pasted Content 50 chars]\u{1b}[0m\n  ? for shortcuts\n".to_owned(),
+            "shell$\n".to_owned(),
+            "Codex\n»\n  arbitrary footer\n".to_owned(),
+        ] {
+            assert!(!codex_idle_composer(&screen), "{screen:?}");
+        }
+    }
+
+    #[test]
+    fn herdr_093_codex_idle_composer_refuses_current_attention_cues_without_scanning_history() {
+        for cue in [
+            "esc to interrupt",
+            "tab to queue message",
+            "Press up to edit queued messages",
+            "edit last queued message",
+            "Queued follow-up inputs",
+            "paste again to expand",
+            "Trust this folder?",
+            "Trust and continue",
+            "Approval required",
+            "requires approval",
+            "Approve this",
+            "Would you like to run",
+            "Press enter to continue",
+            "Enter to confirm",
+            "Esc to cancel",
+        ] {
+            let screen = format!("{cue}\n»\n  ? for shortcuts\n");
+            assert!(!codex_idle_composer(&screen), "{cue}");
+        }
+        let screen = format!(
+            "Approval required in an old quoted message\n{}»\n  ? for shortcuts\n",
+            "prior answer\n".repeat(20)
+        );
+        assert!(codex_idle_composer(&screen));
+    }
+
+    #[test]
+    fn herdr_093_unknown_codex_live_timers_follow_the_source_grammar_and_response_tail() {
+        let timer = regex::Regex::new(
+            r"^(?:[•◦][ \t]+)?[^\s›•◦■✗✓─][^\r\n]* \((?:[0-9]+[hm] )*[0-9]+s(?: • [^\r\n]+? to interrupt)?\)(?: · [^\r\n]*)?$"
+        ).unwrap();
+        for row in [
+            "Working (7s)",
+            "Working (7s)   ",
+            "◦ Exploring (1m 2s • Ctrl+c to interrupt)",
+            "• Working (7s • esc to interrupt)",
+            "Processing inputs (7s) · command (background)",
+            "Working (1h 2m 3s • remapped (key) to interrupt) · model",
+            "• Thinking about changes (12s)",
+            "› old prompt (7s)",
+            "■ prior response (7s)",
+            "Working (soon)",
+            "Working (7s) extra",
+            "Working (1m 2s • to interrupt)",
+        ] {
+            assert_eq!(
+                codex_timer_row(row),
+                timer.is_match(row.trim_end()),
+                "{row:?}"
+            );
+        }
+        for row in [
+            "Working (7s)",
+            "Working (7s)   ",
+            "◦ Exploring (1m 2s • Ctrl+c to interrupt)",
+            "• Working (7s • esc to interrupt)",
+            "Processing inputs (7s) · command (background)",
+            "Working (1h 2m 3s • remapped (key) to interrupt) · model",
+            "Working (7s)\u{1b}[48;5;235m   \u{1b}[0m",
+        ] {
+            let screen = format!("{row}\n»\n  ? for shortcuts\n");
+            assert!(!codex_idle_composer(&screen), "active {row:?}");
+            let screen = format!("{row}\n■ completed response\n»\n  ? for shortcuts\n");
+            assert!(codex_idle_composer(&screen), "completed {row:?}");
+        }
+        let queued = format!(
+            "Working (7s)\n• Messages to be submitted after next tool call\n{}»\n  ? for shortcuts\n",
+            "queued body\n".repeat(30)
+        );
+        assert!(!codex_idle_composer(&queued));
+        let complete = format!(
+            "Working (7s)\n• Messages to be submitted after next tool call\n{}✓ completed response\n»\n  ? for shortcuts\n",
+            "queued body\n".repeat(30)
+        );
+        assert!(codex_idle_composer(&complete));
+        let queued_uppercase =
+            queued.replace("Messages to be submitted", "MESSAGES TO BE SUBMITTED");
+        assert!(!codex_idle_composer(&queued_uppercase));
+    }
+
+    #[test]
+    fn herdr_093_unknown_codex_refuses_current_source_dialogs_and_grouped_search_menu() {
+        for cue in [
+            "enter to submit answer",
+            "enter to submit all",
+            "allow command?",
+            "Do you trust the contents of this directory?",
+            "All Results   Filesystem Only   Plugins",
+            "All Results\nFilesystem Only\nPlugins",
+        ] {
+            let screen = format!("{cue}\n»\n  ? for shortcuts\n");
+            assert!(!codex_idle_composer(&screen), "{cue}");
+        }
+        for cue in ["All Results", "Plugins", "All Results   Filesystem Only"] {
+            let screen = format!("{cue}\n»\n  ? for shortcuts\n");
+            assert!(codex_idle_composer(&screen), "incomplete menu {cue}");
+        }
+        let history = format!(
+            "All Results   Filesystem Only   Plugins\n{}»\n  ? for shortcuts\n",
+            "prior answer\n".repeat(20)
+        );
+        assert!(codex_idle_composer(&history));
     }
 
     #[test]

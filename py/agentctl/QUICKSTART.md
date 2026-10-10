@@ -96,9 +96,9 @@ while keeping their terminals available for direct inspection.
      --cwd /work/project --harness codex
    ```
 
-   `adopt --harness muse` is refused. Start an owned Muse session—for example,
-   through a validated profile—so agentctl can pin the exact foreground process
-   identity itself.
+   Muse can also be adopted with `--harness muse`. Adoption requires a stable
+   foreground process and terminal identity; automated delivery uses the same
+   verified composer and Auto-review policy as an owned Muse session.
 
 3. Send follow-up work and inspect progress:
 

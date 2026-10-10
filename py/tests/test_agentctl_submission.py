@@ -19,6 +19,7 @@ from agentctl.submission import (
     _corroborated,
     _is_labelled_rule,
     _staged,
+    codex_idle_composer,
     composer_view,
     submit_verified,
 )
@@ -544,6 +545,91 @@ def test_codex_0_159_1_idle_composer_is_recognised(screen: str) -> None:
     assert "Ask Codex to do anything" in view.composer
     assert "~/project" in view.footer
     assert "Ask Codex" not in view.transcript
+
+
+@pytest.mark.parametrize("screen", [
+    _V159_FRESH_IDLE, _V159_SESSION_IDLE, FakeAgent("codex")._render(),
+    "›\n  ? for shortcuts\n", "»\n  99% context left\n",
+])
+def test_suggestion13_codex_unknown_readiness_recognizes_supported_idle_screens(screen: str) -> None:
+    assert codex_idle_composer(screen)
+
+
+@pytest.mark.parametrize("screen", [
+    _V159_WORKING_SCREEN, _V159_WORKING_WITHOUT_COMPOSER, _V159_TRUST_PROMPT,
+    _V159_STAGED,
+    "› a human draft\n  GPT default · /work\n",
+    "› \x1b[2m[Pasted text #1 +2 lines]\x1b[0m\n  GPT default · /work\n",
+    "›\n  choose one\n",
+    "• Working (0s • esc to interrupt)\n›\n  GPT default · /work\n",
+    "Queued follow-up inputs\n›\n  GPT default · /work\n",
+    "›\n  tab to queue message · /work\n",
+    "Approval required\n›\n  GPT default · /work\n",
+    "Trust this folder?\n›\n  GPT default · /work\n",
+    "›\n  GPT default · /work · paste again to expand\n",
+    "›\n  GPT default · /work · esc to cancel\n",
+])
+def test_suggestion13_codex_unknown_readiness_refuses_busy_drafts_and_dialogs(screen: str) -> None:
+    assert not codex_idle_composer(screen)
+
+
+def test_suggestion13_codex_unknown_readiness_ignores_old_status_words_above_active_rows() -> None:
+    screen = "Approval required; esc to interrupt\n" + "old output\n" * 16 + _V159_FRESH_IDLE
+    assert codex_idle_composer(screen)
+
+
+@pytest.mark.parametrize("activity", [
+    "Processing inputs (7s)", "• Pondering request (1m 2s • Ctrl+c to interrupt)",
+    "◦ Checking context (1h 2m 3s)", "\x1b[2mCompiling reply (7s)\x1b[0m   ",
+])
+def test_suggestion13_codex_unknown_refuses_hidden_or_remapped_active_timers(activity: str) -> None:
+    assert not codex_idle_composer(activity + "\n›\n  GPT default · /work\n")
+
+
+@pytest.mark.parametrize("queue", [
+    "Queued follow-up inputs", "Messages to be submitted after next tool call",
+    "Messages to be submitted at end of turn",
+])
+def test_suggestion13_codex_unknown_refuses_active_timer_above_long_queue(queue: str) -> None:
+    screen = "Processing inputs (7s)\n• " + queue + "\n" + "  queued text\n" * 20
+    assert not codex_idle_composer(screen + "›\n  GPT default · /work\n")
+
+
+@pytest.mark.parametrize("activity", [
+    "Processing inputs (7s)", "• Pondering request (1m 2s • Ctrl+c to interrupt)",
+    "• Working (2s • esc to interrupt)",
+])
+def test_suggestion13_codex_unknown_ignores_completed_timer_before_later_response(activity: str) -> None:
+    assert codex_idle_composer(activity + "\n■ Completed response\n›\n  GPT default · /work\n")
+
+
+@pytest.mark.parametrize("cue", [
+    "enter to submit answer", "enter to submit all", "allow command?",
+    "Messages to be submitted after next tool call", "Messages to be submitted at end of turn",
+    "Ctrl+c to interrupt", "Do you trust the contents of this directory?",
+])
+def test_suggestion13_codex_unknown_refuses_manifest_dialog_and_queue_cues(cue: str) -> None:
+    assert not codex_idle_composer(cue + "\n›\n  GPT default · /work\n")
+
+
+@pytest.mark.parametrize("menu", [
+    "All Results   Filesystem Only   Plugins", "all RESULTS\nfilesystem ONLY\nPLUGINS",
+])
+def test_suggestion13_codex_unknown_refuses_manifest_grouped_active_menu(menu: str) -> None:
+    assert not codex_idle_composer(menu + "\n»\n  ? for shortcuts\n")
+
+
+@pytest.mark.parametrize("labels", [
+    "All Results", "Filesystem Only", "Plugins", "All Results   Filesystem Only",
+    "All Results   Plugins", "Filesystem Only   Plugins",
+])
+def test_suggestion13_codex_unknown_does_not_treat_partial_menu_labels_as_active_menu(labels: str) -> None:
+    assert codex_idle_composer(labels + "\n»\n  ? for shortcuts\n")
+
+
+def test_suggestion13_codex_unknown_ignores_grouped_menu_outside_active_window() -> None:
+    screen = "All Results   Filesystem Only   Plugins\n" + "historical output\n" * 16
+    assert codex_idle_composer(screen + "»\n  ? for shortcuts\n")
 
 
 def test_codex_0_159_1_prompt_is_staged_submitted_and_verified() -> None:

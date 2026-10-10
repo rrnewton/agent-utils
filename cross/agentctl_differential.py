@@ -12,6 +12,7 @@ import json
 import hashlib
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -65,7 +66,10 @@ def _normalize(value: object, conversations: set[str] | None = None) -> object:
                           else "<PROCESS_IDENTITY>" if key == "custom_process_identity"
                           # Each edition's fixture runs its own harness process: only its
                           # pid and start time differ, the rest of the identity is compared.
-                          else {**item, "pid": "<PID>", "starttime_ticks": "<TICKS>"}
+                          else {**item, "pid": "<PID>", "starttime_ticks": "<TICKS>",
+                                **({"executable_inode": "<IMAGE_INODE>"}
+                                   if value.get("harness") == "muse"
+                                   and value.get("adapter") == "herdr-foreign" else {})}
                           if key == "harness_identity" and isinstance(item, dict)
                           else "<HARNESS_PID>" if key == "harness_pid"
                           else "<JOURNAL_ID>" if key == "journal_id"
@@ -132,6 +136,17 @@ def _submission_count(root: Path, text: str) -> int:
     return values.count(text) if isinstance(values, list) else 0
 
 
+def _fixture_calls(root: Path) -> list[list[str]]:
+    """Read the protocol calls recorded by one executable fixture."""
+    values = _state(root).get("calls", [])
+    if not isinstance(values, list) or any(
+        not isinstance(call, list) or any(not isinstance(word, str) for word in call)
+        for call in values
+    ):
+        raise TypeError("fixture calls must be argv arrays")
+    return cast(list[list[str]], values)
+
+
 def _retire_fixture_processes(case: PairCase) -> None:
     """Stop only custom children created by this differential's private Herdr fixtures."""
     process_ids: list[int] = []
@@ -182,7 +197,8 @@ def _orientation(harness: Harness, report: Report) -> None:
                            and ("--env" in outcome.stdout if arguments == ("start", "--help") else True)
                            and (all(option in outcome.stdout for option in
                                     ("--pane", "--workspace", "--cwd", "--harness", "--session"))
-                                and "muse is refused" in outcome.stdout.lower()
+                                and "muse requires a pinned foreground process" in
+                                " ".join(outcome.stdout.lower().split())
                                 if arguments == ("adopt", "--help") else True)
                            and (all(option in outcome.stdout for option in (
                                "--recover-legacy-adoption", "--expected-token",
@@ -972,18 +988,17 @@ def _profile_refusals(harness: Harness, report: Report) -> None:
             "rejected direct launch allocated registry state",
         )
 
-    adopt_muse = harness.case("primary-adopt-muse-refusal")
+    adopt_muse = harness.case("primary-adopt-muse-mismatched-harness")
     outcomes = harness.invoke(adopt_muse, (
         "adopt", "worker", "--pane", "w1:p1", "--workspace", "project",
         "--cwd", "<ROOT>", "--harness", "muse", *_COMMON,
     ))
     report.require(
-        "primary/adopt/muse-refusal",
-        all(outcome.returncode == 75 and "adopting Muse is unsupported" in outcome.stderr
-            for outcome in outcomes)
-        and all(not (root / "registry").exists()
+        "primary/adopt/muse-mismatched-harness",
+        all(outcome.returncode == 75 for outcome in outcomes)
+        and all(not (root / "registry/worker").exists()
                 for root in (adopt_muse.python_root, adopt_muse.rust_root)),
-        f"Muse adoption was accepted or allocated state: {outcomes!r}",
+        f"a different harness was adopted as Muse: {outcomes!r}",
     )
 
     hostile_path = harness.case("primary-profile-hostile-path", {"hostile_path": True})
@@ -1366,6 +1381,258 @@ def _workspace_policy(harness: Harness, report: Report) -> None:
             f"Muse exit between text and Enter submitted to a replacement: {outcomes!r}",
         )
         _retire_fixture_processes(exited)
+
+
+def _herdr_093_compatibility(harness: Harness, report: Report) -> None:
+    """Exercise the 0.9.3 startup envelope and missing optional process argv."""
+    unknown: dict[str, object] = {
+        "status": "unknown", "startup_timeout": True, "empty_shell": True,
+        "codex_footer": "  model default · /work/project",
+        "foreground_argv_mode": "missing",
+    }
+    case = harness.case("primary-herdr-093-codex", unknown)
+    started, _ = _pair(harness, report, case, "primary/herdr-093/codex/start", (
+        "start", "worker", "--cwd", "<ROOT>", "--workspace-id", "w1",
+        "--startup-timeout", "0.1", "--brief", "compatibility brief", *_COMMON,
+    ))
+    status = _json(started)
+    report.require("primary/herdr-093/codex/raw-status-and-once",
+                   isinstance(status, dict) and status.get("lifecycle") == "running"
+                   and status.get("agent_status") == "unknown"
+                   and all(_submission_count(root, "compatibility brief") == 1
+                           and sum(call[:2] == ["agent", "start"]
+                                   for call in _fixture_calls(root)) == 1
+                           for root in (case.python_root, case.rust_root)),
+                   f"unknown Codex was relabeled, relaunched, or lost its brief: {status!r}")
+    if started.returncode == 0:
+        _change(case, {"composer_busy": True})
+        _pair(harness, report, case, "primary/herdr-093/codex/busy-pending", (
+            "send", "worker", "compatibility follow-up", "--message-id", "compat-next",
+            "--ready-timeout", "0", *_COMMON,
+        ), 75)
+        _pair(harness, report, case, "primary/herdr-093/codex/busy-drain", (
+            "drain", "worker", "--ready-timeout", "0", *_COMMON,
+        ), 75)
+        report.require("primary/herdr-093/codex/busy-no-input", all(
+            _submission_count(root, "compatibility follow-up") == 0
+            and (root / "registry/worker/queue/inbox/compat-next.json").is_file()
+            for root in (case.python_root, case.rust_root)),
+            "an unknown busy composer received a queued follow-up")
+        _change(case, {"composer_busy": False})
+        _pair(harness, report, case, "primary/herdr-093/codex/idle-drain", (
+            "drain", "worker", "--ready-timeout", "0", *_COMMON,
+        ))
+        report.require("primary/herdr-093/codex/drain-once", all(
+            _submission_count(root, "compatibility follow-up") == 1
+            and (root / "registry/worker/queue/processed/compat-next.json").is_file()
+            for root in (case.python_root, case.rust_root)),
+            "idle unknown Codex did not acknowledge the queued follow-up exactly once")
+        _pair(harness, report, case, "primary/herdr-093/codex/stop", (
+            "stop", "worker", *_COMMON,
+        ))
+    else:
+        _retire_fixture_processes(case)
+
+    refused: tuple[tuple[str, Mapping[str, object]], ...] = (
+        ("busy", {"composer_busy": True}),
+        ("hidden-interrupt", {"composer_busy": True, "codex_activity": "• Exploring (7s)"}),
+        ("padded-hidden-interrupt", {"composer_busy": True,
+                                    "codex_activity": "Working (7s)   "}),
+        ("annotated-hidden-interrupt", {"composer_busy": True,
+                                       "codex_activity": "Processing inputs (7s) · command (background)"}),
+        ("remapped-interrupt", {"composer_busy": True,
+                               "codex_activity": "• Exploring (1m 2s • Ctrl+c to interrupt)"}),
+        ("queued-turn", {"composer_busy": True,
+                         "codex_activity": "• Messages to be submitted at end of turn"}),
+        ("grouped-menu", {"composer_busy": True,
+                          "codex_activity": "All Results   Filesystem Only   Plugins"}),
+        ("draft", {"composer_draft": "operator draft"}),
+        ("unrecognized-footer", {"codex_footer": "unrecognized screen"}),
+        ("terminal-swap", {"terminal_on_visible_read": "term-replacement"}),
+        ("other-error", {"startup_error": {
+            "id": "cli:agent:start", "error": {
+                "code": "agent_not_ready", "message": "timed out waiting for agent startup",
+            },
+        }}),
+        ("wrong-id", {"startup_error": {
+            "id": "cli:request", "error": {
+                "code": "timeout", "message": "timed out waiting for agent startup",
+            },
+        }}),
+    )
+    for label, overrides in refused:
+        failed = harness.case(f"primary-herdr-093-codex-{label}", {**unknown, **overrides})
+        _pair(harness, report, failed, f"primary/herdr-093/codex/refuse-{label}", (
+            "start", "worker", "--cwd", "<ROOT>", "--workspace-id", "w1",
+            "--startup-timeout", "0.1", "--brief", "must remain unsent", *_COMMON,
+        ), 75)
+        report.require(f"primary/herdr-093/codex/refuse-{label}-atomic", all(
+            _state(root).get("submitted") == []
+            and sum(call[:2] == ["agent", "start"]
+                    for call in _fixture_calls(root)) == 1
+            and json.loads((root / "registry/worker/agent.json").read_text(
+                encoding="utf-8")).get("lifecycle") == "launch_failed"
+            for root in (failed.python_root, failed.rust_root)),
+            f"{label} caused a startup retry, input, or a running record")
+        _retire_fixture_processes(failed)
+
+    for mode in ("missing", "null", "empty"):
+        muse = harness.case(f"primary-herdr-093-muse-{mode}", {
+            "foreground_argv_mode": mode,
+        })
+        if _start(harness, report, muse, f"primary/herdr-093/muse/{mode}/start",
+                  "--harness", "muse", "--startup-timeout", "0.2"):
+            report.require(f"primary/herdr-093/muse/{mode}/kernel-pin", all(
+                _valid_foreign_shell_identity(json.loads(
+                    (root / "registry/worker/agent.json").read_text(encoding="utf-8")
+                ).get("custom_process_identity"))
+                for root in (muse.python_root, muse.rust_root)),
+                "missing argv discarded the custom harness kernel identity")
+            _pair(harness, report, muse, f"primary/herdr-093/muse/{mode}/send", (
+                "send", "worker", "optional argv delivery", "--message-id", "optional-argv",
+                *_COMMON,
+            ))
+            report.require(f"primary/herdr-093/muse/{mode}/receipt", all(
+                _submission_count(root, "optional argv delivery") == 1
+                and _state(root).get("paste_wrapped") is True
+                and (root / "registry/worker/queue/processed/optional-argv.json").is_file()
+                for root in (muse.python_root, muse.rust_root)),
+                "missing argv bypassed verified Muse delivery")
+            _pair(harness, report, muse, f"primary/herdr-093/muse/{mode}/stop", (
+                "stop", "worker", *_COMMON,
+            ))
+        else:
+            _retire_fixture_processes(muse)
+
+    malformed: tuple[tuple[str, Mapping[str, object]], ...] = (
+        ("wrong-kernel", {"foreground_argv_mode": "missing",
+                          "wrong_custom_process_identity": True}),
+        ("argv-object", {"foreground_argv_override": {"0": "muse"}}),
+        ("argv-nonstring", {"foreground_argv_override": ["muse", 42]}),
+        ("argv-empty-first", {"foreground_argv_override": [""]}),
+    )
+    for label, state in malformed:
+        failed = harness.case(f"primary-herdr-093-muse-{label}", state)
+        outcomes = harness.invoke(failed, (
+            "start", "worker", "--cwd", "<ROOT>", "--workspace-id", "w1",
+            "--harness", "muse", "--startup-timeout", "0.05", *_COMMON,
+        ))
+        report.require(f"primary/herdr-093/muse/refuse-{label}",
+                       outcomes[0].returncode == outcomes[1].returncode
+                       and outcomes[0].returncode in (69, 75)
+                       and all(_state(root).get("submitted") == []
+                               and json.loads((root / "registry/worker/agent.json").read_text(
+                                   encoding="utf-8")).get("lifecycle") == "launch_failed"
+                               for root in (failed.python_root, failed.rust_root)),
+                       f"{label} became a verified Muse launch: {outcomes!r}")
+        _retire_fixture_processes(failed)
+
+
+def _muse_adoption(harness: Harness, report: Report) -> None:
+    """A foreign Muse keeps its runtime and shares verified composer delivery."""
+    failures: tuple[tuple[str, Mapping[str, object]], ...] = (
+        ("missing-process", {"custom_identity_hidden": True}),
+        ("wrong-process-group", {"wrong_custom_process_group": True}),
+        ("missing-terminal", {"terminal_id": ""}),
+    )
+    for label, overrides in failures:
+        refused = harness.case(f"primary-muse-adoption-{label}", {
+            "harness": "muse", "custom_reported": True, "report_custom_session": True,
+            "foreground_argv_mode": "missing", **overrides,
+        })
+        for root in (refused.python_root, refused.rust_root):
+            subprocess.run([
+                str(root / "fake-herdr"), "pane", "run", "w1:p1",
+                shlex.join([str(root / "fake-muse-runtime")]),
+            ], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        _pair(harness, report, refused, f"primary/adopt/muse/refuse-{label}", (
+            "adopt", "foreign", "--pane", "w1:p1", "--workspace", "project",
+            "--cwd", "<ROOT>", "--harness", "muse", "--session", "session-1", *_COMMON,
+        ), 75)
+        report.require(f"primary/adopt/muse/refuse-{label}-atomic", all(
+            not (root / "registry/foreign").exists()
+            and not _state(root).get("closed")
+            and not any(call[:2] in (["agent", "prompt"], ["pane", "send-text"],
+                                     ["pane", "send-keys"], ["pane", "report-agent"],
+                                     ["agent", "rename"], ["tab", "rename"])
+                        for call in _fixture_calls(root))
+            for root in (refused.python_root, refused.rust_root)),
+            "unanchored Muse adoption saved a record or changed the foreign runtime")
+        _retire_fixture_processes(refused)
+    for label, with_session in (("native-session", True), ("sessionless", False)):
+        case = harness.case(f"primary-muse-adoption-{label}", {
+            "harness": "muse", "custom_reported": True,
+            "report_custom_session": with_session, "foreground_argv_mode": "missing",
+        })
+        for root in (case.python_root, case.rust_root):
+            subprocess.run([
+                str(root / "fake-herdr"), "pane", "run", "w1:p1",
+                shlex.join([str(root / "fake-muse-runtime")]),
+            ], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        session = ("--session", "session-1") if with_session else ()
+        adopted, _ = _pair(harness, report, case, f"primary/adopt/muse/{label}/register", (
+            "adopt", "foreign", "--pane", "w1:p1", "--workspace", "project",
+            "--cwd", "<ROOT>", "--harness", "muse", *session, *_COMMON,
+        ))
+        record = _json(adopted)
+        report.require(f"primary/adopt/muse/{label}/anchors", isinstance(record, dict)
+                       and record.get("adapter") == "herdr-foreign"
+                       and isinstance(record.get("harness_identity"), dict)
+                       and _valid_foreign_shell_identity(record.get("foreign_shell_identity"))
+                       and all(json.loads((root / "registry/foreign/agent.json").read_text(
+                           encoding="utf-8")).get("custom_process_identity") is None
+                           for root in (case.python_root, case.rust_root)),
+                       f"adoption changed ownership or omitted mandatory Muse pins: {record!r}")
+        if adopted.returncode != 0:
+            _retire_fixture_processes(case)
+            continue
+        _pair(harness, report, case, f"primary/adopt/muse/{label}/send", (
+            "send", "foreign", "foreign Muse literal mentions Auto-review\nsecond line",
+            "--message-id", "foreign-muse",
+            *_COMMON,
+        ))
+        report.require(f"primary/adopt/muse/{label}/guarded-receipt", all(
+            _submission_count(root, "foreign Muse literal mentions Auto-review\nsecond line") == 1
+            and _state(root).get("paste_wrapped") is True
+            and (root / "registry/foreign/queue/processed/foreign-muse.json").is_file()
+            and not any(call[:2] in (["agent", "prompt"], ["pane", "report-agent"],
+                                     ["agent", "rename"], ["tab", "rename"])
+                        for call in _fixture_calls(root))
+            for root in (case.python_root, case.rust_root)),
+            "foreign Muse bypassed staged input or changed runtime ownership")
+        _change(case, {"custom_permission": "YOLO", "custom_submitted": False,
+                       "custom_draft": ""})
+        _pair(harness, report, case, f"primary/adopt/muse/{label}/yolo-refusal", (
+            "send", "foreign", "must not bypass Auto-review", "--message-id", "foreign-yolo",
+            "--ready-timeout", "0", *_COMMON,
+        ), 76)
+        report.require(f"primary/adopt/muse/{label}/yolo-no-input", all(
+            _submission_count(root, "must not bypass Auto-review") == 0
+            and (root / "registry/foreign/queue/failed/foreign-yolo.json").is_file()
+            for root in (case.python_root, case.rust_root)),
+            "foreign Muse delivery ignored Auto-review policy")
+        _change(case, {"custom_permission": "Auto-review",
+                       "fixture_shell_pid": harness.replacement_shell.pid})
+        outcomes = harness.invoke(case, ("send", "foreign", "must not cross shell generation",
+                                         "--message-id", "foreign-replacement", *_COMMON))
+        report.require(f"primary/adopt/muse/{label}/shell-replacement-refusal",
+                       all(outcome.returncode == 75 for outcome in outcomes)
+                       and all(_submission_count(root, "must not cross shell generation") == 0
+                               for root in (case.python_root, case.rust_root)),
+                       f"foreign Muse input crossed a shell generation: {outcomes!r}")
+        _change(case, {"fixture_shell_pid": harness.fixture_shell.pid})
+        stopped, _ = _pair(harness, report, case, f"primary/adopt/muse/{label}/unregister", (
+            "stop", "foreign", *_COMMON,
+        ))
+        result = _json(stopped)
+        report.require(f"primary/adopt/muse/{label}/runtime-preserved",
+                       isinstance(result, dict) and result.get("runtime_preserved") is True
+                       and all(not _state(root).get("closed")
+                               and not (root / "registry/foreign").exists()
+                               and len(list((root / "registry/archive").glob("*/agent.json"))) == 1
+                               for root in (case.python_root, case.rust_root)),
+                       f"foreign Muse unregister closed or discarded its runtime: {result!r}")
+        _retire_fixture_processes(case)
 
 
 def _handoff_and_pending(harness: Harness, report: Report) -> None:
@@ -2316,6 +2583,8 @@ def build_report(python_command: Sequence[str], rust_command: Sequence[str]) -> 
             _workspace_policy(harness, report)
             _skill_install(harness, report)
             _profile_refusals(harness, report)
+            _herdr_093_compatibility(harness, report)
+            _muse_adoption(harness, report)
             _handoff_and_pending(harness, report)
             _registry_and_interop(harness, report)
             _legacy_adopted_registry_and_queue(harness, report)

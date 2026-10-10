@@ -1540,6 +1540,9 @@ class _WorkspaceClient:
                     f"refusing input to agent {record.name!r}: its relayed harness process changed"
                 )
             return
+        if record.adapter == "herdr-foreign" and record.harness == "muse":
+            self._verify_muse_harness(pane_id)
+            return
         if record.harness_anchor is not None:
             if not self.client.verify_harness_identity(pane_id, record.harness_anchor):
                 raise RecipientChanged(
@@ -1587,12 +1590,11 @@ class _WorkspaceClient:
                     raise HerdrUnavailable("Claude workspace trust prompt requires human attention; no input was submitted")
             if self.record.adapter == "herdr-relay":
                 return self._relay_pane_info(info)
-            if self.record.adapter == "herdr-pane":
-                self.client.verify_custom_harness(
-                    pane_id, self.record.harness, self.record.custom_process_identity
-                )
+            if self._uses_muse_composer():
+                self._verify_muse_harness(pane_id)
                 reported_status = info.status
                 screen = self.client.read(pane_id, source="visible", lines=200)
+                self._verify_muse_harness(pane_id)
                 if muse_trust_prompt(screen):
                     raise HerdrUnavailable(
                         "Muse workspace trust prompt requires human attention; no input was submitted"
@@ -1625,6 +1627,43 @@ class _WorkspaceClient:
                     tab_id=info.tab_id,
                 )
         return info
+
+    def _uses_muse_composer(self) -> bool:
+        """Foreign Muse retains its ownership class and shares guarded editor input."""
+        return (self.record.harness == "muse"
+                and self.record.adapter in ("herdr-pane", "herdr-foreign"))
+
+    def _verify_muse_harness(self, pane_id: str) -> None:
+        """Check the appropriate stored process pin without acquiring a new one."""
+        if self.record.adapter == "herdr-pane":
+            self.client.verify_custom_harness(
+                pane_id, self.record.harness, self.record.custom_process_identity
+            )
+        else:
+            if (self.record.foreign_shell_identity is None
+                    or self.client.pane_shell_identity(pane_id) != self.record.foreign_shell_identity):
+                raise RecipientChanged(
+                    f"adopted Muse in pane {pane_id} no longer holds its pinned shell process"
+                )
+            if (self.record.harness_anchor is None
+                    or not self.client.verify_harness_identity(pane_id, self.record.harness_anchor)):
+                raise RecipientChanged(
+                    f"adopted Muse in pane {pane_id} no longer holds its pinned foreground process"
+                )
+
+    def codex_idle_ready(self, info: AgentPaneInfo) -> bool:
+        """Add Codex readiness only between existing record recipient checks."""
+        if (self.record.harness != "codex" or info.agent != "codex"
+                or info.status != "unknown" or info.pane_id != self.record.pane_id):
+            return False
+        checker = getattr(self.client, "codex_idle_ready", None)
+        if not callable(checker):
+            return False
+        self.verify_recipient(info.pane_id)
+        if not checker(info):
+            return False
+        self.verify_recipient(info.pane_id)
+        return True
 
     def _relay_pane_info(self, info: AgentPaneInfo) -> AgentPaneInfo:
         """State of a harness behind a root slot relay, from Herdr's live screen rules.
@@ -1694,7 +1733,7 @@ class _WorkspaceClient:
                 pane_id, command, relay,
                 lambda: submit_verified(relay, pane_id, self.record.harness, command),
             )
-        if self.record.adapter != "herdr-pane":
+        if not self._uses_muse_composer():
             native = self._guarded()
             return self._deliver_checked(
                 pane_id, command, native,
@@ -1723,10 +1762,9 @@ class _WorkspaceClient:
         deadline = time.monotonic() + 2.0
         staged = ""
         while time.monotonic() < deadline:
-            self.client.verify_custom_harness(
-                pane_id, self.record.harness, self.record.custom_process_identity
-            )
+            self._verify_muse_harness(pane_id)
             staged = self.client.read(pane_id, source="visible", lines=200)
+            self._verify_muse_harness(pane_id)
             if staged != before and muse_prompt_is_exact_composer(staged, command):
                 break
             time.sleep(min(0.05, max(0.0, deadline - time.monotonic())))
@@ -1760,7 +1798,7 @@ class _WorkspaceClient:
                         f"within {timeout_ms} ms (last {observed})"
                     )
                 time.sleep(min(0.2, max(0.0, deadline - time.monotonic())))
-        if self.record.adapter == "herdr-pane" and status == "working":
+        if self._uses_muse_composer() and status == "working":
             if self.custom_submission is None:
                 raise HerdrUnavailable(
                     "custom pane harness has no pending submission receipt"
@@ -1768,10 +1806,9 @@ class _WorkspaceClient:
             staged, command, prior_count = self.custom_submission
             deadline = time.monotonic() + timeout_ms / 1000
             while time.monotonic() < deadline:
-                self.client.verify_custom_harness(
-                    pane_id, self.record.harness, self.record.custom_process_identity
-                )
+                self._verify_muse_harness(pane_id)
                 screen = self.client.read(pane_id, source="visible", lines=200)
+                self._verify_muse_harness(pane_id)
                 if (screen != staged
                         and muse_prompt_transcript_count(screen, command) > prior_count
                         and not muse_prompt_in_composer(screen, command)):
@@ -2733,11 +2770,6 @@ class ManagedAgents:
             )
         if not _KIND.fullmatch(harness):
             raise AgentDeliveryError("harness must be a Herdr agent kind")
-        if harness == "muse":
-            raise AgentDeliveryError(
-                "adopting Muse is unsupported because agentctl cannot yet pin the existing "
-                "foreground process identity; start an owned Muse session instead"
-            )
         root = str(Path(expected_cwd).expanduser().resolve())
         if not Path(root).is_dir():
             raise AgentDeliveryError(f"cwd is not a directory: {root}")
@@ -2791,6 +2823,15 @@ class ManagedAgents:
             raise AgentDeliveryError(
                 f"refusing pane {pane_id}: native session agent is "
                 f"{info.session_agent!r}, expected {harness!r}"
+            )
+        if harness == "muse" and (not info.terminal_id or "\0" in info.terminal_id):
+            raise AgentDeliveryError(
+                f"refusing pane {pane_id}: adopting Muse requires a terminal identity"
+            )
+        muse_identity = self.client.harness_identity(info.pane_id, harness) if harness == "muse" else None
+        if harness == "muse" and muse_identity is None:
+            raise AgentDeliveryError(
+                f"refusing pane {pane_id}: cannot pin the existing Muse foreground process"
             )
         if info.session_value is not None:
             # A reported native session becomes the durable queue authority.
@@ -2865,7 +2906,13 @@ class ManagedAgents:
             )
         # Adoption is the operator's explicit assertion about this program, so its
         # harness process and terminal become the record's anchors.
-        harness_identity = self.client.harness_identity(confirmed.pane_id, harness)
+        harness_identity = (muse_identity if harness == "muse"
+                            else self.client.harness_identity(confirmed.pane_id, harness))
+        if (muse_identity is not None
+                and not self.client.verify_harness_identity(confirmed.pane_id, muse_identity)):
+            raise AgentDeliveryError(
+                f"refusing pane {pane_id}: Muse foreground process changed before adoption"
+            )
         if confirmed.terminal_id != info.terminal_id:
             raise AgentDeliveryError(
                 f"refusing pane {pane_id}: terminal changed before adoption"
@@ -2904,6 +2951,9 @@ class ManagedAgents:
                 raise AgentDeliveryError("final live-presentation verification failed")
             if self.client.pane_shell_identity(confirmed.pane_id) != shell_identity:
                 raise AgentDeliveryError("final pane shell process identity changed")
+            if (muse_identity is not None
+                    and not self.client.verify_harness_identity(confirmed.pane_id, muse_identity)):
+                raise AgentDeliveryError("final Muse foreground process identity changed")
             return result
         except (HerdrRunError, OSError) as exc:
             try:

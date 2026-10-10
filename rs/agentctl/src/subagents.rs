@@ -23,9 +23,10 @@ use sha2::{Digest, Sha256};
 
 use crate::agent::{self, AgentApi, AgentError, DrainOptions, QueueResult, Target};
 use crate::client::{
-    muse_idle_composer, muse_prompt_in_composer, muse_prompt_transcript_count,
-    muse_startup_metadata, muse_trust_prompt, AgentIdentity, AgentPaneInfo, CustomProcessIdentity,
-    HerdrClient, Pane, PaneShellProof, ProcessLiveness,
+    muse_auto_review_idle_composer, muse_idle_composer, muse_prompt_in_composer,
+    muse_prompt_is_exact_composer, muse_prompt_transcript_count, muse_startup_metadata,
+    muse_trust_prompt, muse_verified_process_idle_composer, AgentIdentity, AgentPaneInfo,
+    CustomProcessIdentity, HerdrClient, Pane, PaneShellProof, ProcessLiveness,
 };
 use crate::error::{AdapterError, AdapterErrorKind};
 use crate::submission::{GuardedInput, GuardedPrompt, Submission, SubmitTimeouts};
@@ -2005,6 +2006,54 @@ struct WorkspaceClient<'a, A: ManagedApi + ?Sized> {
 }
 
 impl<A: ManagedApi + ?Sized> WorkspaceClient<'_, A> {
+    fn uses_muse_composer(&self) -> bool {
+        self.record.harness == "muse"
+            && matches!(self.record.adapter.as_str(), "herdr-pane" | "herdr-foreign")
+    }
+
+    fn verify_muse_process(&self, pane_id: &str) -> crate::error::Result<()> {
+        self.verify_muse_process_with_runtime(pane_id, &agent::SystemRuntime::default())
+    }
+
+    fn verify_muse_process_with_runtime(
+        &self,
+        pane_id: &str,
+        runtime: &dyn agent::AgentRuntime,
+    ) -> crate::error::Result<()> {
+        if self.record.adapter == "herdr-pane" {
+            return self.client.verify_custom_harness_with_runtime(
+                pane_id,
+                &self.record.harness,
+                self.record.custom_process_identity.as_ref(),
+                runtime,
+            );
+        }
+        if runtime.cancelled() {
+            return Err(AdapterError::unavailable(
+                "Herdr control operation was cancelled",
+            ));
+        }
+        let identity = self.record.harness_anchor().ok_or_else(|| {
+            AdapterError::recipient_changed(
+                "adopted Muse record has no current foreground harness process anchor",
+            )
+        })?;
+        let shell = self.record.foreign_shell_identity.as_ref().ok_or_else(|| {
+            AdapterError::recipient_changed("adopted Muse record has no pane shell identity")
+        })?;
+        if self.client.pane_shell_identity(pane_id)? != *shell {
+            return Err(AdapterError::recipient_changed(
+                "adopted Muse pane shell process generation changed",
+            ));
+        }
+        if !self.client.verify_harness_identity(pane_id, identity)? {
+            return Err(AdapterError::recipient_changed(
+                "adopted Muse foreground harness process generation changed",
+            ));
+        }
+        Ok(())
+    }
+
     /// State of a harness behind a root slot relay, from Herdr's live screen rules.
     ///
     /// Herdr reports the state agentctl last reported for such a pane, so the live verdict
@@ -2242,6 +2291,9 @@ impl<'a, A: ManagedApi + ?Sized> WorkspaceClient<'a, A> {
                 return Ok(());
             }
             _ => {}
+        }
+        if self.uses_muse_composer() {
+            return self.verify_muse_process(pane_id);
         }
         if let Some(identity) = record.harness_anchor() {
             if !self.client.verify_harness_identity(pane_id, identity)? {
@@ -3071,7 +3123,7 @@ impl<A: ManagedApi + ?Sized> WorkspaceClient<'_, A> {
     ) -> crate::error::Result<Submission> {
         // Custom panes verify through their own composer model, and slash
         // commands (including goal replacement) need the native primitive.
-        if self.record.adapter == "herdr-pane" || text.trim_start().starts_with('/') {
+        if self.uses_muse_composer() || text.trim_start().starts_with('/') {
             return self
                 .run_with_runtime(pane_id, text, runtime)
                 .map(|()| Submission::Unconfirmed);
@@ -3117,7 +3169,7 @@ impl<A: ManagedApi + ?Sized> WorkspaceClient<'_, A> {
         if self.record.adapter == "herdr-relay" {
             return self.relay_wait(pane_id, status, timeout_ms);
         }
-        if self.record.adapter == "herdr-pane" && status == "working" {
+        if self.uses_muse_composer() && status == "working" {
             let submission = self
                 .custom_submission
                 .lock()
@@ -3130,12 +3182,9 @@ impl<A: ManagedApi + ?Sized> WorkspaceClient<'_, A> {
                 })?;
             let deadline = Instant::now() + Duration::from_millis(timeout_ms);
             loop {
-                self.client.verify_custom_harness(
-                    pane_id,
-                    &self.record.harness,
-                    self.record.custom_process_identity.as_ref(),
-                )?;
+                self.verify_muse_process(pane_id)?;
                 let screen = self.client.read(pane_id, "visible", Some(200))?;
+                self.verify_muse_process(pane_id)?;
                 if screen != submission.staged_screen
                     && muse_prompt_transcript_count(&screen, &submission.text)
                         > submission.prior_transcript_count
@@ -3197,7 +3246,7 @@ impl<A: ManagedApi + ?Sized> WorkspaceClient<'_, A> {
             let _ = runtime;
             return self.relay_wait(pane_id, status, timeout_ms);
         }
-        if self.record.adapter == "herdr-pane" && status == "working" {
+        if self.uses_muse_composer() && status == "working" {
             let submission = self
                 .custom_submission
                 .lock()
@@ -3215,15 +3264,11 @@ impl<A: ManagedApi + ?Sized> WorkspaceClient<'_, A> {
                         "Herdr control operation was cancelled",
                     ));
                 }
-                self.client.verify_custom_harness_with_runtime(
-                    pane_id,
-                    &self.record.harness,
-                    self.record.custom_process_identity.as_ref(),
-                    runtime,
-                )?;
+                self.verify_muse_process_with_runtime(pane_id, runtime)?;
                 let screen =
                     self.client
                         .read_with_runtime(pane_id, "visible", Some(200), runtime)?;
+                self.verify_muse_process_with_runtime(pane_id, runtime)?;
                 if screen != submission.staged_screen
                     && muse_prompt_transcript_count(&screen, &submission.text)
                         > submission.prior_transcript_count
@@ -3283,6 +3328,24 @@ impl<A: ManagedApi + ?Sized> WorkspaceClient<'_, A> {
 }
 
 impl<A: ManagedApi + ?Sized> AgentApi for WorkspaceClient<'_, A> {
+    fn codex_idle_ready_with_runtime(
+        &self,
+        info: &AgentPaneInfo,
+        runtime: &dyn agent::AgentRuntime,
+    ) -> crate::error::Result<bool> {
+        if self.record.harness != "codex"
+            || info.status != "unknown"
+            || info.agent.as_deref() != Some("codex")
+            || Some(info.pane_id.as_str()) != self.record.pane_id.as_deref()
+        {
+            return Ok(false);
+        }
+        self.verify_recipient(&info.pane_id, true)?;
+        let ready = self.client.codex_idle_ready_with_runtime(info, runtime)?;
+        self.verify_recipient(&info.pane_id, true)?;
+        Ok(ready)
+    }
+
     fn panes(&self) -> crate::error::Result<Vec<Pane>> {
         Ok(self
             .client
@@ -3334,23 +3397,23 @@ impl<A: ManagedApi + ?Sized> AgentApi for WorkspaceClient<'_, A> {
             if self.record.adapter == "herdr-relay" {
                 return self.relay_pane_info(info);
             }
-            if self.record.adapter == "herdr-pane" {
-                self.client.verify_custom_harness(
-                    pane_id,
-                    &self.record.harness,
-                    self.record.custom_process_identity.as_ref(),
-                )?;
+            if self.uses_muse_composer() {
+                self.verify_muse_process(pane_id)?;
                 let screen = self.client.read(pane_id, "visible", Some(200))?;
                 if muse_trust_prompt(&screen) {
                     return Err(crate::error::AdapterError::unavailable(
                         "Muse workspace trust prompt requires human attention; no input was submitted",
                     ));
                 }
-                info.status = if muse_idle_composer(&screen) {
+                info.status = if muse_idle_composer(&screen)
+                    || (matches!(info.status.as_str(), "idle" | "done")
+                        && muse_verified_process_idle_composer(&screen))
+                {
                     "idle".to_owned()
                 } else {
                     "working".to_owned()
                 };
+                self.verify_muse_process(pane_id)?;
             }
         }
         Ok(info)
@@ -3385,7 +3448,7 @@ impl<A: ManagedApi + ?Sized> AgentApi for WorkspaceClient<'_, A> {
         }
         let runtime = agent::SystemRuntime::default();
         let guarded = self.guarded(&runtime)?;
-        if self.record.adapter != "herdr-pane" {
+        if !self.uses_muse_composer() {
             return guarded.native_prompt(pane_id, text);
         }
         if text.contains(['\0', '\u{1b}']) {
@@ -3400,19 +3463,21 @@ impl<A: ManagedApi + ?Sized> AgentApi for WorkspaceClient<'_, A> {
             )));
         }
         let before = self.client.read(pane_id, "visible", Some(200))?;
+        if !muse_auto_review_idle_composer(&before) {
+            return Err(AdapterError::unavailable(
+                "Muse input requires the legacy reviewed Auto-review composer; current YOLO input remains pending until Herdr provides an effect-coupled process-generation guard",
+            ));
+        }
         guarded.send_text(
             pane_id,
             &format!("{BRACKETED_PASTE_START}{text}{BRACKETED_PASTE_END}"),
         )?;
         let deadline = Instant::now() + Duration::from_secs(2);
         let staged = loop {
-            self.client.verify_custom_harness(
-                pane_id,
-                &self.record.harness,
-                self.record.custom_process_identity.as_ref(),
-            )?;
+            self.verify_muse_process(pane_id)?;
             let screen = self.client.read(pane_id, "visible", Some(200))?;
-            if screen != before && muse_prompt_in_composer(&screen, text) {
+            self.verify_muse_process(pane_id)?;
+            if screen != before && muse_prompt_is_exact_composer(&screen, text) {
                 break screen;
             }
             if Instant::now() >= deadline {
@@ -3522,13 +3587,8 @@ impl<A: ManagedApi + ?Sized> AgentApi for WorkspaceClient<'_, A> {
             if self.record.adapter == "herdr-relay" {
                 return self.relay_pane_info(info);
             }
-            if self.record.adapter == "herdr-pane" {
-                self.client.verify_custom_harness_with_runtime(
-                    pane_id,
-                    &self.record.harness,
-                    self.record.custom_process_identity.as_ref(),
-                    runtime,
-                )?;
+            if self.uses_muse_composer() {
+                self.verify_muse_process_with_runtime(pane_id, runtime)?;
                 let screen =
                     self.client
                         .read_with_runtime(pane_id, "visible", Some(200), runtime)?;
@@ -3537,11 +3597,15 @@ impl<A: ManagedApi + ?Sized> AgentApi for WorkspaceClient<'_, A> {
                         "Muse workspace trust prompt requires human attention; no input was submitted",
                     ));
                 }
-                info.status = if muse_idle_composer(&screen) {
+                info.status = if muse_idle_composer(&screen)
+                    || (matches!(info.status.as_str(), "idle" | "done")
+                        && muse_verified_process_idle_composer(&screen))
+                {
                     "idle".to_owned()
                 } else {
                     "working".to_owned()
                 };
+                self.verify_muse_process_with_runtime(pane_id, runtime)?;
             }
         }
         Ok(info)
@@ -3592,7 +3656,7 @@ impl<A: ManagedApi + ?Sized> AgentApi for WorkspaceClient<'_, A> {
             return self.relay_refuses_raw_input(text);
         }
         let guarded = self.guarded(runtime)?;
-        if self.record.adapter != "herdr-pane" {
+        if !self.uses_muse_composer() {
             return guarded.native_prompt(pane_id, text);
         }
         if text.contains(['\0', '\u{1b}']) {
@@ -3609,6 +3673,11 @@ impl<A: ManagedApi + ?Sized> AgentApi for WorkspaceClient<'_, A> {
         let before = self
             .client
             .read_with_runtime(pane_id, "visible", Some(200), runtime)?;
+        if !muse_auto_review_idle_composer(&before) {
+            return Err(AdapterError::unavailable(
+                "Muse input requires the legacy reviewed Auto-review composer; current YOLO input remains pending until Herdr provides an effect-coupled process-generation guard",
+            ));
+        }
         guarded.send_text(
             pane_id,
             &format!("{BRACKETED_PASTE_START}{text}{BRACKETED_PASTE_END}"),
@@ -3620,16 +3689,12 @@ impl<A: ManagedApi + ?Sized> AgentApi for WorkspaceClient<'_, A> {
                     "Herdr control operation was cancelled",
                 ));
             }
-            self.client.verify_custom_harness_with_runtime(
-                pane_id,
-                &self.record.harness,
-                self.record.custom_process_identity.as_ref(),
-                runtime,
-            )?;
+            self.verify_muse_process_with_runtime(pane_id, runtime)?;
             let screen = self
                 .client
                 .read_with_runtime(pane_id, "visible", Some(200), runtime)?;
-            if screen != before && muse_prompt_in_composer(&screen, text) {
+            self.verify_muse_process_with_runtime(pane_id, runtime)?;
+            if screen != before && muse_prompt_is_exact_composer(&screen, text) {
                 break screen;
             }
             if Instant::now() >= deadline {
@@ -5934,11 +5999,6 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
             )));
         }
         harness_arguments(&options.harness, None, None, &[])?;
-        if options.harness == "muse" {
-            return Err(fail(
-                "adopting Muse is unsupported because agentctl cannot yet pin the existing foreground process identity; start an owned Muse session instead",
-            ));
-        }
         let cwd = fs::canonicalize(&options.cwd)
             .map_err(|_| fail(format!("cwd is not a directory: {}", options.cwd.display())))?;
         if !cwd.is_dir() {
@@ -6002,6 +6062,35 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
                 )));
             }
         }
+        let muse_identity = if options.harness == "muse" {
+            if info
+                .terminal_id
+                .as_deref()
+                .is_none_or(|value| !valid_metadata_text(value))
+            {
+                return Err(fail(
+                    "adopting Muse requires an unchanged foreground harness and terminal identity",
+                ));
+            }
+            let identity = self
+                .client
+                .harness_identity(&info.pane_id, &options.harness)?
+                .ok_or_else(|| {
+                    fail("adopting Muse requires a pinned sole foreground harness process")
+                })?;
+            if !identity.valid()
+                || !self
+                    .client
+                    .verify_harness_identity(&info.pane_id, &identity)?
+            {
+                return Err(fail(
+                    "adopting Muse requires an unchanged foreground harness and terminal identity",
+                ));
+            }
+            Some(identity)
+        } else {
+            None
+        };
         if info.session_value.is_some() {
             // A reported native session becomes the durable queue authority.
             // Prove now that it resolves uniquely back to this exact pane.
@@ -6120,14 +6209,35 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
         }
         // Adoption is the operator's explicit assertion about this program, so its harness
         // process and terminal become the record's anchors.
-        let harness_identity = self
-            .client
-            .harness_identity(&confirmed.pane_id, &options.harness)?;
+        let harness_identity = if options.harness == "muse" {
+            muse_identity
+        } else {
+            self.client
+                .harness_identity(&confirmed.pane_id, &options.harness)?
+        };
         if confirmed.terminal_id != info.terminal_id {
             return Err(fail(format!(
                 "refusing pane {}: terminal changed before adoption",
                 options.pane_id
             )));
+        }
+        if options.harness == "muse" {
+            let identity = harness_identity.as_ref().ok_or_else(|| {
+                fail("adopting Muse requires a pinned sole foreground harness process")
+            })?;
+            if !identity.valid()
+                || confirmed
+                    .terminal_id
+                    .as_deref()
+                    .is_none_or(|value| !valid_metadata_text(value))
+                || !self
+                    .client
+                    .verify_harness_identity(&confirmed.pane_id, identity)?
+            {
+                return Err(fail(
+                    "adopting Muse requires an unchanged foreground harness and terminal identity",
+                ));
+            }
         }
         DirBuilder::new()
             .mode(0o700)
@@ -9151,6 +9261,13 @@ pub(crate) mod tests {
                     labels: Mutex::new(BTreeMap::new()),
                     terminals: Mutex::new(BTreeMap::new()),
                     harness_pids: Mutex::new(BTreeMap::new()),
+                    missing_harness_identity: AtomicBool::new(false),
+                    missing_terminal: AtomicBool::new(false),
+                    replace_harness_after_pin: AtomicBool::new(false),
+                    replace_harness_after_save: AtomicBool::new(false),
+                    replace_harness_on_read: AtomicBool::new(false),
+                    literal_pastes: Mutex::new(Vec::new()),
+                    muse_editor: Mutex::new(None),
                     herdr_names: Mutex::new(BTreeMap::new()),
                     expect_supported: AtomicBool::new(false),
                     scrollback: Mutex::new(BTreeMap::new()),
@@ -9346,6 +9463,13 @@ pub(crate) mod tests {
         terminals: Mutex<BTreeMap<String, String>>,
         /// Foreground harness pid per pane; a test replaces the harness by changing it.
         harness_pids: Mutex<BTreeMap<String, u64>>,
+        missing_harness_identity: AtomicBool,
+        missing_terminal: AtomicBool,
+        replace_harness_after_pin: AtomicBool,
+        replace_harness_after_save: AtomicBool,
+        replace_harness_on_read: AtomicBool,
+        literal_pastes: Mutex<Vec<(String, String)>>,
+        muse_editor: Mutex<Option<herdr_compatibility::MuseEditor>>,
         /// Herdr agent names mapped to their panes.
         herdr_names: Mutex<BTreeMap<String, String>>,
         /// Whether the server advertises `input-expect`.
@@ -9468,12 +9592,42 @@ pub(crate) mod tests {
         }
     }
     impl AgentApi for Fake {
+        fn codex_idle_ready_with_runtime(
+            &self,
+            info: &AgentPaneInfo,
+            runtime: &dyn agent::AgentRuntime,
+        ) -> AdapterResult<bool> {
+            if runtime.cancelled()
+                || info.agent.as_deref() != Some("codex")
+                || info.status != "unknown"
+            {
+                return Ok(false);
+            }
+            let Some(identity) = self.harness_identity(&info.pane_id, "codex")? else {
+                return Ok(false);
+            };
+            let screen = self.read(&info.pane_id, "visible", Some(200))?;
+            Ok(crate::submission::codex_idle_composer(&screen)
+                && self.pane_info(&info.pane_id)? == *info
+                && self.verify_harness_identity(&info.pane_id, &identity)?)
+        }
+
         fn panes(&self) -> AdapterResult<Vec<Pane>> {
             self.panes_calls.fetch_add(1, Ordering::Relaxed);
             if self.fail_panes.load(Ordering::Relaxed) {
                 return Err(AdapterError::unavailable(
                     "pane query failed after allocation",
                 ));
+            }
+            if !self.harness_pids.lock().unwrap().is_empty()
+                && self
+                    .replace_harness_after_pin
+                    .swap(false, Ordering::Relaxed)
+            {
+                self.harness_pids
+                    .lock()
+                    .unwrap()
+                    .insert("owned".to_owned(), 999);
             }
             Ok(self.panes.lock().unwrap().clone())
         }
@@ -9596,7 +9750,8 @@ pub(crate) mod tests {
                 session_agent: reported_agent,
                 session_value: reported_value,
                 scroll: *self.scroll.lock().unwrap(),
-                terminal_id: Some(self.terminal(pane)),
+                terminal_id: (!self.missing_terminal.load(Ordering::Relaxed))
+                    .then(|| self.terminal(pane)),
                 tab_id: self
                     .panes
                     .lock()
@@ -9633,13 +9788,19 @@ pub(crate) mod tests {
             }
             Ok(())
         }
-        fn read(&self, _: &str, source: &str, _: Option<usize>) -> AdapterResult<String> {
+        fn read(&self, pane: &str, source: &str, _: Option<usize>) -> AdapterResult<String> {
             self.read_sources.lock().unwrap().push(source.to_owned());
             if self.fail_read.load(Ordering::Relaxed) {
                 return Err(AdapterError::unavailable("capture failed"));
             }
             if source == "recent-unwrapped" && self.unwrapped_empty.load(Ordering::Relaxed) {
                 return Ok(String::new());
+            }
+            if self.replace_harness_on_read.swap(false, Ordering::Relaxed) {
+                self.harness_pids
+                    .lock()
+                    .unwrap()
+                    .insert(pane.to_owned(), 999);
             }
             if self.oversized_read.load(Ordering::Relaxed) {
                 return Ok("\0".repeat(3 << 20));
@@ -9713,6 +9874,9 @@ pub(crate) mod tests {
             }
             if let Some(text) = self.screens.lock().unwrap().pop_front() {
                 return Ok(text);
+            }
+            if let Some(editor) = self.muse_editor.lock().unwrap().as_ref() {
+                return Ok(editor.screen());
             }
             Ok(self
                 .screen
@@ -9971,7 +10135,8 @@ pub(crate) mod tests {
             pane: &str,
             _kind: &str,
         ) -> AdapterResult<Option<CustomProcessIdentity>> {
-            if !self.started.load(Ordering::Relaxed)
+            if self.missing_harness_identity.load(Ordering::Relaxed)
+                || !self.started.load(Ordering::Relaxed)
                 || self.dead_panes.lock().unwrap().contains(pane)
             {
                 return Ok(None);
@@ -9987,6 +10152,16 @@ pub(crate) mod tests {
             pane: &str,
             expected: &CustomProcessIdentity,
         ) -> AdapterResult<bool> {
+            if self.root.join("registry/foreign/agent.json").exists()
+                && self
+                    .replace_harness_after_save
+                    .swap(false, Ordering::Relaxed)
+            {
+                self.harness_pids
+                    .lock()
+                    .unwrap()
+                    .insert(pane.to_owned(), 999);
+            }
             Ok(self.started.load(Ordering::Relaxed)
                 && !self.dead_panes.lock().unwrap().contains(pane)
                 && self
@@ -10301,6 +10476,38 @@ pub(crate) mod tests {
                     .unwrap()
                     .insert(pane.to_owned(), 777);
             }
+            if key == "Enter" {
+                if let Some(prompt) = self
+                    .muse_editor
+                    .lock()
+                    .unwrap()
+                    .as_mut()
+                    .and_then(|editor| editor.enter())
+                {
+                    self.scrollback
+                        .lock()
+                        .unwrap()
+                        .entry(pane.to_owned())
+                        .or_default()
+                        .push(prompt);
+                }
+            }
+            Ok(())
+        }
+        fn send_text(&self, pane: &str, text: &str) -> AdapterResult<()> {
+            let mut editor = self.muse_editor.lock().unwrap();
+            let editor = editor
+                .as_mut()
+                .ok_or_else(|| AdapterError::unavailable("literal pane input is unavailable"))?;
+            let prompt = text
+                .strip_prefix(BRACKETED_PASTE_START)
+                .and_then(|value| value.strip_suffix(BRACKETED_PASTE_END))
+                .ok_or_else(|| AdapterError::unavailable("expected literal bracketed paste"))?;
+            self.literal_pastes
+                .lock()
+                .unwrap()
+                .push((pane.to_owned(), text.to_owned()));
+            editor.paste(prompt);
             Ok(())
         }
         fn close_tab(&self, _: &str) -> AdapterResult<()> {
@@ -11592,16 +11799,20 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn adoption_rejects_muse_before_registry_or_live_pane_access() {
+    fn herdr_093_muse_adoption_refuses_a_wrong_reported_harness_without_registration() {
         let fixture = Fixture::new();
         fixture.prepare_foreign();
         let mut options = fixture.adopt_options();
         options.harness = "muse".to_owned();
         let error = fixture.manager().adopt("foreign", options).unwrap_err();
-        assert!(error.to_string().contains("adopting Muse is unsupported"));
-        assert!(!fixture.root.join("registry").exists());
-        assert_eq!(fixture.client.panes_calls.load(Ordering::Relaxed), 0);
-        assert_eq!(fixture.client.pane_info_calls.load(Ordering::Relaxed), 0);
+        assert!(
+            error.to_string().contains("expected 'muse'")
+                || error.to_string().contains("expected \"muse\""),
+            "{error}"
+        );
+        assert!(!fixture.root.join("registry/foreign").exists());
+        assert!(fixture.client.closed.lock().unwrap().is_empty());
+        assert!(fixture.client.runs.lock().unwrap().is_empty());
     }
 
     #[test]
@@ -14967,6 +15178,8 @@ pub(crate) mod tests {
         assert!(fixture.client.closed.lock().unwrap().is_empty());
     }
 
+    /// Herdr readiness and adopted Muse process ownership compatibility.
+    mod herdr_compatibility;
     /// Recipient checks around input, anchors, rename transactions and doctor.
     mod identity;
     /// Recorded conversation and launch policy, with no status-time mutation.
