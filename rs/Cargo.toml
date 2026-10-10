@@ -11,6 +11,7 @@ members = [
     "chat-subscription-fake",
     "wrkslotsd",
     "gh-paced",
+    "agent-usage",
 ]
 
 [workspace.package]

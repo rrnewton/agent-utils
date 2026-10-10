@@ -30,6 +30,7 @@ PYTHON_ONLY_TOOLS = (
 )
 RESOLVER_TOOLS = RUST_TOOLS + PYTHON_ONLY_TOOLS
 NON_PUBLISHED_RUST_BINARIES = (
+    "agent-usage",
     "chat-subscription-fake-plugin",
     "gh-paced",
     "wrkslotsd",

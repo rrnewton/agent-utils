@@ -58,6 +58,7 @@ project's own rules, and reports substance back to the owner.
 | Sandbox escape | `herdr-run` | optional | Runs an allowlisted command, such as `git push`, in a visible Herdr pane outside whatever confines the agent, and keeps an audit record of every run. |
 | Local CI | `dagrun` | optional | Runs a project's validation as a dependency graph under CPU, memory, and named-resource limits, with cgroup containment. `cpuset-alloc` and `parallel-experiment-runner` build on it. |
 | Retrospective | `wrkviz` | optional | Builds a zoomable timeline of what the coordinator and its subagents did, from their transcripts, across agents and teams. |
+| Budget awareness | `agent-usage` | optional | Reads each harness's plan usage and reset times (Claude Code and Codex, the numbers their `/status` screens show) without a model call, keeps a history, and reports burn rates over 15 minutes to 24 hours plus local token use. |
 | GitHub hygiene | `gh-paced` | optional | Paces `gh` calls against per-account budgets so many agents sharing one GitHub account stay inside GitHub's limits and do not get the account suspended. |
 | Landing | `pr-landing-planner` | experimental | Produces an advisory, conflict- and CI-aware plan for landing a queue of pull requests. |
 
@@ -102,8 +103,10 @@ These tools are independently installable and follow the same package
 documentation and artifact checks. They are explicit exceptions to the
 two-language implementation and behavioral-differential contract.
 
-`gh-paced` is the one Rust-only tool. It is built from `rs/gh-paced` and ships
-in no package index; see its [quickstart](common/docs/gh-paced/QUICKSTART.md).
+`gh-paced` and `agent-usage` are Rust-only tools. They are built from
+`rs/gh-paced` and `rs/agent-usage` and ship in no package index; see the
+[gh-paced quickstart](common/docs/gh-paced/QUICKSTART.md) and the
+[agent-usage quickstart](common/docs/agent-usage/QUICKSTART.md).
 
 ## Persistent coding agents
 
