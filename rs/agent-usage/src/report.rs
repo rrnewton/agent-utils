@@ -55,6 +55,86 @@ pub struct TokenReport {
     pub windows: Vec<TokenWindow>,
 }
 
+/// Rate-limit errors in one window.
+#[derive(Debug, Clone, Serialize)]
+pub struct LimitWindow {
+    /// Window name.
+    pub window: &'static str,
+    /// HTTP 429 responses.
+    pub rate_limited: u64,
+    /// Other API errors.
+    pub other_errors: u64,
+}
+
+/// Rate-limit evidence for one provider (see [`crate::limits`]).
+#[derive(Debug, Clone, Serialize)]
+pub struct LimitsReport {
+    /// `transcripts` (Claude Code: only errors that exhausted its retries) or `codex-logs`
+    /// (every retried request).
+    pub source: &'static str,
+    /// Whether 429s that a retry got past are counted.
+    pub includes_retried: bool,
+    /// Counts per window (15m, 1h, 3h, 24h).
+    pub windows: Vec<LimitWindow>,
+    /// The newest 429 in the last 24 hours.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_rate_limit: Option<crate::limits::Event>,
+    /// Model requests from this host in the last 10 minutes (Claude transcripts only).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub requests_10m: Option<u64>,
+    /// Requests in this host's busiest minute of the last hour (Claude transcripts only).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub peak_requests_per_minute_1h: Option<u64>,
+}
+
+fn claude_limits(index: &Index, now: i64) -> LimitsReport {
+    LimitsReport {
+        source: "transcripts",
+        includes_retried: false,
+        windows: WINDOWS
+            .iter()
+            .map(|(name, secs)| {
+                let e = index.errors_in(now, *secs);
+                LimitWindow {
+                    window: name,
+                    rate_limited: e.rate_limited,
+                    other_errors: e.other,
+                }
+            })
+            .collect(),
+        last_rate_limit: index.last_rate_limit.clone(),
+        requests_10m: Some(index.window(now, 600).requests),
+        peak_requests_per_minute_1h: Some(index.peak_minute(now, 3_600)),
+    }
+}
+
+fn codex_limits(retries: &[(i64, u16, String)], now: i64) -> LimitsReport {
+    let last_rate_limit = retries
+        .iter()
+        .rev()
+        .find(|(_, code, _)| *code == 429)
+        .map(|(ts, _, text)| crate::limits::event(*ts, text));
+    LimitsReport {
+        source: "codex-logs",
+        includes_retried: true,
+        windows: WINDOWS
+            .iter()
+            .map(|(name, secs)| {
+                let inside = retries.iter().filter(|(ts, _, _)| *ts >= now - secs);
+                let (limited, other): (Vec<_>, Vec<_>) = inside.partition(|(_, c, _)| *c == 429);
+                LimitWindow {
+                    window: name,
+                    rate_limited: limited.len() as u64,
+                    other_errors: other.len() as u64,
+                }
+            })
+            .collect(),
+        last_rate_limit,
+        requests_10m: None,
+        peak_requests_per_minute_1h: None,
+    }
+}
+
 /// Everything known about one provider.
 #[derive(Debug, Clone, Serialize)]
 pub struct ProviderReport {
@@ -91,6 +171,9 @@ pub struct ProviderReport {
     pub tokens: Option<TokenReport>,
     /// Samples of this provider in the history.
     pub history_samples: usize,
+    /// Rate-limit (HTTP 429) evidence from local files.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub limits: Option<LimitsReport>,
 }
 
 /// The whole report.
@@ -170,6 +253,7 @@ pub fn build(
     index: Option<&Index>,
     providers: &[&str],
     fresh: &[&str],
+    codex_retries: Option<&[(i64, u16, String)]>,
     now: i64,
 ) -> Report {
     let mut out = Vec::new();
@@ -204,6 +288,11 @@ pub fn build(
             backoff_until: latest.backoff_until.filter(|u| *u > now),
             tokens,
             history_samples: samples.iter().filter(|s| s.provider == provider).count(),
+            limits: match (provider, index, codex_retries) {
+                ("claude", Some(index), _) => Some(claude_limits(index, now)),
+                ("codex", _, Some(retries)) => Some(codex_limits(retries, now)),
+                _ => None,
+            },
         });
     }
     Report {
@@ -378,6 +467,57 @@ pub fn render(report: &Report) -> String {
                 }
             }
         }
+        if let Some(l) = &p.limits {
+            out.push_str(&render_limits(l, now));
+        }
+    }
+    out
+}
+
+fn describe_event(e: &crate::limits::Event, now: i64) -> String {
+    use crate::limits::Kind;
+    let whose = match (e.kind, e.count) {
+        (Kind::GatewayUser, Some((count, max, window))) => {
+            format!("gateway per-user limit, {count}/{max} requests in {window}s")
+        }
+        (Kind::GatewayUser, None) => "gateway per-user limit".to_string(),
+        (Kind::ProviderQuota, _) => "provider quota, shared beyond this user".to_string(),
+        (Kind::Other, _) => "other".to_string(),
+    };
+    let text: String = e.detail.chars().take(120).collect();
+    format!("{} ago, {whose}: {text}", human_duration(now - e.ts))
+}
+
+fn render_limits(l: &LimitsReport, now: i64) -> String {
+    let mut out = String::new();
+    let what = if l.includes_retried {
+        "every retried request, from Codex's logs"
+    } else {
+        "only those that exhausted Claude Code's retries; retried ones leave no local trace"
+    };
+    out.push_str(&format!("  rate limits (HTTP 429; {what}):\n"));
+    let cells: Vec<String> = l
+        .windows
+        .iter()
+        .map(|w| format!("{} {}", w.window, w.rate_limited))
+        .collect();
+    let other = l
+        .windows
+        .iter()
+        .find(|w| w.window == "24h")
+        .map_or(0, |w| w.other_errors);
+    out.push_str(&format!(
+        "    {} (other API errors in 24h: {other})\n",
+        cells.join(", ")
+    ));
+    match &l.last_rate_limit {
+        Some(e) => out.push_str(&format!("    last 429: {}\n", describe_event(e, now))),
+        None => out.push_str("    no 429 in the last 24h\n"),
+    }
+    if let (Some(r10), Some(peak)) = (l.requests_10m, l.peak_requests_per_minute_1h) {
+        out.push_str(&format!(
+            "    requests from this host: {r10} in the last 10 min, busiest minute of the last hour {peak}\n"
+        ));
     }
     out
 }
@@ -453,6 +593,18 @@ pub fn render_line(report: &Report) -> String {
     if !tokens.is_empty() {
         parts.push(format!("1h tokens: {}", tokens.join(", ")));
     }
+    let limited: Vec<String> = report
+        .providers
+        .iter()
+        .filter_map(|p| {
+            let l = p.limits.as_ref()?;
+            let w = l.windows.iter().find(|w| w.window == "24h")?;
+            Some(format!("{} {}", p.provider, w.rate_limited))
+        })
+        .collect();
+    if !limited.is_empty() {
+        parts.push(format!("429s 24h: {}", limited.join(", ")));
+    }
     parts.join(" | ")
 }
 
@@ -490,7 +642,7 @@ mod tests {
         let samples: Vec<_> = (0..=8)
             .map(|i| sample(now - (8 - i) * 900, 10.0 + i as f64))
             .collect();
-        let r = build(&samples, None, &["claude", "codex"], &["claude"], now);
+        let r = build(&samples, None, &["claude", "codex"], &["claude"], None, now);
         assert_eq!(r.providers.len(), 1);
         let p = &r.providers[0];
         assert!(p.fresh);

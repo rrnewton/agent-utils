@@ -14,6 +14,7 @@ pub mod codex;
 pub mod daemon;
 pub mod history;
 pub mod http;
+pub mod limits;
 pub mod model;
 pub mod paths;
 pub mod poll;

@@ -11,6 +11,7 @@
 //! first time is entered at the first line inside the horizon, found by binary search on the
 //! line timestamps, so a cold start does not read days of old transcript.
 
+use crate::limits::{self, Errors, Event};
 use crate::model::Tokens;
 use crate::timefmt::parse_iso8601;
 use serde::{Deserialize, Serialize};
@@ -54,7 +55,17 @@ pub struct Index {
     /// Unix seconds of the last scan.
     #[serde(default)]
     pub scanned_at: i64,
+    /// API errors per minute (HTTP 429 and others) that exhausted Claude Code's retries.
+    #[serde(default)]
+    pub errors: BTreeMap<i64, Errors>,
+    /// The newest HTTP 429 inside the horizon.
+    #[serde(default)]
+    pub last_rate_limit: Option<Event>,
 }
+
+/// Index format version. An index written by an older version is rebuilt from the horizon, so
+/// fields it never collected (API errors, from version 2) are filled in.
+pub const INDEX_VERSION: u32 = 2;
 
 /// What one scan did, for benchmarks and `--verbose`.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
@@ -93,7 +104,12 @@ struct Usage {
 }
 
 fn contains(haystack: &[u8], needle: &[u8]) -> bool {
-    haystack.windows(needle.len()).any(|w| w == needle)
+    // Transcripts are UTF-8 JSON: validating is SIMD-fast and lets `str::contains` (two-way
+    // search) do the work, far quicker than a naive window scan over 100 KB tool-result lines.
+    match (std::str::from_utf8(haystack), std::str::from_utf8(needle)) {
+        (Ok(h), Ok(n)) => h.contains(n),
+        _ => haystack.windows(needle.len()).any(|w| w == needle),
+    }
 }
 
 /// Parse one transcript line into `(unix seconds, message id, tokens)` when it is an assistant
@@ -121,6 +137,61 @@ pub fn parse_line(line: &[u8]) -> Option<(i64, Option<String>, Tokens)> {
             + usage.cache_creation_input_tokens,
     };
     Some((ts, message.id, tokens))
+}
+
+#[derive(Deserialize)]
+struct ErrorLine {
+    timestamp: Option<String>,
+    #[serde(rename = "apiErrorStatus")]
+    api_error_status: Option<u16>,
+    message: Option<ErrorMessage>,
+}
+
+#[derive(Deserialize)]
+struct ErrorMessage {
+    #[serde(default)]
+    content: Vec<serde_json::Value>,
+}
+
+/// Parse an API-error line (Claude Code writes one when its retries are exhausted) into
+/// `(unix seconds, HTTP status, error text)`.
+pub fn parse_error_line(line: &[u8]) -> Option<(i64, Option<u16>, String)> {
+    if !contains(line, b"\"isApiErrorMessage\":true") {
+        return None;
+    }
+    let parsed: ErrorLine = serde_json::from_slice(line).ok()?;
+    let ts = parse_iso8601(parsed.timestamp.as_deref()?)?;
+    let text = parsed
+        .message
+        .map(|m| {
+            m.content
+                .iter()
+                .filter_map(|b| b.get("text").and_then(serde_json::Value::as_str))
+                .collect::<Vec<_>>()
+                .join(" ")
+        })
+        .unwrap_or_default();
+    Some((ts, parsed.api_error_status, text))
+}
+
+impl Index {
+    /// API errors in the last `seconds` before `now`.
+    pub fn errors_in(&self, now: i64, seconds: i64) -> Errors {
+        let mut total = Errors::default();
+        for (_, e) in self.errors.range(now - seconds..) {
+            total.add(e);
+        }
+        total
+    }
+
+    /// Requests in the busiest single minute of the last `seconds`.
+    pub fn peak_minute(&self, now: i64, seconds: i64) -> u64 {
+        self.buckets
+            .range(now - seconds..)
+            .map(|(_, t)| t.requests)
+            .max()
+            .unwrap_or(0)
+    }
 }
 
 fn line_timestamp(line: &[u8]) -> Option<i64> {
@@ -216,6 +287,9 @@ impl Index {
     /// Bring the index up to date with every transcript under `projects`.
     pub fn scan(&mut self, projects: &Path, now: i64) -> ScanStats {
         let cutoff = now - HORIZON;
+        if self.v != INDEX_VERSION {
+            *self = Index::default();
+        }
         let mut found = Vec::new();
         walk(projects, cutoff, &mut found);
         let mut stats = ScanStats {
@@ -243,7 +317,11 @@ impl Index {
         self.files.retain(|k, _| seen.contains(k));
         self.buckets.retain(|&minute, _| minute >= cutoff - 60);
         self.scanned_at = now;
-        self.v = 1;
+        self.errors.retain(|&minute, _| minute >= cutoff - 60);
+        if self.last_rate_limit.as_ref().is_some_and(|e| e.ts < cutoff) {
+            self.last_rate_limit = None;
+        }
+        self.v = INDEX_VERSION;
         stats
     }
 
@@ -272,6 +350,25 @@ impl Index {
             }
             state.offset += n as u64;
             stats.bytes_read += n as u64;
+            // Both message kinds counted here are assistant lines; skip everything else after
+            // one search (user and tool-result lines are the large ones).
+            if !contains(&line, b"\"assistant\"") {
+                continue;
+            }
+            if let Some((ts, status, text)) = parse_error_line(&line) {
+                if ts >= cutoff {
+                    let bucket = self.errors.entry(ts - ts.rem_euclid(60)).or_default();
+                    if status == Some(429) {
+                        bucket.rate_limited += 1;
+                        if self.last_rate_limit.as_ref().is_none_or(|e| e.ts <= ts) {
+                            self.last_rate_limit = Some(limits::event(ts, &text));
+                        }
+                    } else {
+                        bucket.other += 1;
+                    }
+                }
+                continue;
+            }
             let Some((ts, id, tokens)) = parse_line(&line) else {
                 continue;
             };
@@ -349,6 +446,13 @@ mod tests {
         assert_eq!(w.output, 120 + 40);
         // Older than 15 minutes: msg_01 at 10:30, msg_02 at 10:50.
         assert_eq!(index.window(now, 15 * 60).requests, 1);
+        // The API error at 10:51 (no status) and the 429 at 10:55.
+        let e = index.errors_in(now, 3_600);
+        assert_eq!((e.rate_limited, e.other), (1, 1));
+        let last = index.last_rate_limit.clone().unwrap();
+        assert_eq!(last.kind, crate::limits::Kind::GatewayUser);
+        assert_eq!(last.count, Some((436, 425, 60)));
+        assert_eq!(index.peak_minute(now, 3_600), 1);
 
         // Append a subagent file and a partial line; only complete new lines count.
         let sub = proj.join("s").join("subagents").join("agent-a.jsonl");

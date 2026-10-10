@@ -14,13 +14,16 @@ with a model call costs tokens.
 - the burn over the last 15 minutes, 1 hour, 3 hours and 24 hours, and whether the window
   would fill before it resets at the current rate;
 - local token use from Claude Code transcripts and Codex's thread totals, which also works where
-  there are no plan limits (API keys, cloud providers, gateways).
+  there are no plan limits (API keys, cloud providers, gateways);
+- rate-limit evidence for gateway hosts, whose real limit is a request rate: HTTP 429s from
+  Claude transcripts and Codex's logs, classified as a gateway's per-user limit or a provider
+  quota, and this host's recent request rate.
 
 It reads the same structured sources the CLIs' own `/status` screens use: Claude's claude.ai
 usage endpoint (one HTTPS GET with the stored login) and Codex's app-server
 `account/rateLimits/read` request. No model call, no session, no tokens.
 
-**Dependencies.** Linux or macOS, `curl`, `sqlite3` (optional, for Codex token totals), and a
+**Dependencies.** Linux or macOS, `curl`, `sqlite3` (optional, for Codex token totals and retry logs), and a
 Rust toolchain to build. Plan windows need a subscription login (claude.ai for Claude, ChatGPT
 for Codex); without one the tool says so and still reports local tokens.
 

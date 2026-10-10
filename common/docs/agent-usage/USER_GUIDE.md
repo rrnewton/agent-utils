@@ -120,6 +120,40 @@ summed through the `sqlite3` command (read-only), is a cumulative counter stored
 Codex sample. Its burn over each window comes from the history, like a plan meter's, so it needs
 two samples at least a minute apart.
 
+### Rate limits (HTTP 429)
+
+Hosts whose harnesses run through a provider gateway have no plan windows; their real limits are
+request rates: the gateway's per-user limit (requests per 60 s and per 600 s, counted per user
+and upstream across every host) and the model provider's quota behind it. Neither can be read in
+advance, so the report shows the evidence that is on disk:
+
+- **Claude Code** writes an API error into the transcript only when its retries are exhausted
+  (`isApiErrorMessage`, `apiErrorStatus`). A 429 that a retry got past leaves no local trace, so
+  Claude's counts are a floor. The same index that counts tokens counts these per minute.
+- **Codex** logs every retried request (`codex_core::responses_retry`, `unexpected status <code>`)
+  to its log database, `$CODEX_HOME/logs_<n>.sqlite`, so its counts include 429s a retry got past.
+  `codex-logs.json` in the cache keeps the last 24 hours and the highest row id read, so each call
+  reads only rows added since (by primary key) after one indexed read of the last 24 hours.
+
+Each 429's text is classified: `gateway-user` when it names a counted key and `count/max in
+<window>s` (shown as, for example, `gateway per-user limit, 436/425 requests in 60s`);
+`provider-quota` for `RESOURCE_EXHAUSTED` or `Quota exceeded` replies, which are shared by
+everyone behind the same provider project; `other` otherwise. For Claude the report also gives
+this host's requests in the last 10 minutes and in its busiest minute of the last hour, from the
+per-minute buckets (minute granularity: "the last 10 minutes" covers the buckets that start
+inside it). Other hosts' requests count against the same gateway limit and are not visible here.
+
+Example from a host on a gateway:
+
+```text
+  rate limits (HTTP 429; only those that exhausted Claude Code's retries; retried ones leave no local trace):
+    15m 0, 1h 0, 3h 0, 24h 2 (other API errors in 24h: 0)
+    last 429: 11h48m ago, provider quota, shared beyond this user: API Error: Request rejected (429) · [{"error":{"code":429,"message":"Resource exhausted. ...
+    requests from this host: 168 in the last 10 min, busiest minute of the last hour 33
+```
+
+`--line` ends with `429s 24h: claude 2, codex 0`.
+
 ## Burn rates
 
 For every plan meter, and for the Codex token counter, the report gives the increase over the
@@ -166,6 +200,11 @@ With samples every 15 minutes, the 15 m window rests on a single interval. Poll 
                          "full_before_reset": false}
         }
       ],
+      "limits": {"source": "transcripts", "includes_retried": false,
+                 "windows": [{"window": "15m", "rate_limited": 0, "other_errors": 0}],
+                 "last_rate_limit": {"ts": 1791591054, "kind": "provider-quota",
+                                     "detail": "API Error: Request rejected (429) ..."},
+                 "requests_10m": 168, "peak_requests_per_minute_1h": 33},
       "tokens": {"source": "transcripts", "windows": [
         {"window": "15m", "covered_secs": 900, "tokens": {"requests": 259, "input": 518,
          "output": 216000, "cache_read": 69000000, "cache_write": 1900000, "total": 71116518}}
@@ -190,7 +229,8 @@ with no sample (`--cached` with an empty history) is left out.
 | --- | --- |
 | `$AGENT_USAGE_DIR`, else `$XDG_CACHE_HOME/agent-usage`, else `~/.cache/agent-usage` | Cache directory (mode 0700). |
 | `history.jsonl` | Append-only samples (mode 0600). Only the newest 32 MiB are read, about a year of 15-minute samples. |
-| `claude-transcripts.json` | Transcript index. Safe to delete; it is rebuilt from the last 25 hours. |
+| `claude-transcripts.json` | Transcript index (tokens and API errors per minute). Safe to delete; it is rebuilt from the last 25 hours. |
+| `codex-logs.json` | Codex's retried requests of the last 24 hours and the highest log row read. Safe to delete. |
 | `lock` | Serialises polls and index updates, so concurrent callers do not all poll. |
 | `daemon.lock`, `daemon.pid`, `daemon.log` | The daemon's single-instance lock, pid and log. |
 | `CLAUDE_CONFIG_DIR`, `CODEX_HOME` | Harness homes, as the CLIs themselves use them. |
@@ -213,9 +253,9 @@ Measured on a Linux development host, 2026-10-10 (see the crate README for the m
 
 | Operation | Wall | CPU | Peak RSS |
 | --- | --- | --- | --- |
-| `status`, answer from the history (sample fresh, index warm) | ~10 ms | ~9 ms | ~2.5 MB |
+| `status`, answer from the history (sample fresh, indexes warm) | ~14 ms | ~12 ms | ~2.5 MB |
 | `status --cached --no-tokens` | ~1 ms | ~1 ms | ~2.5 MB |
-| `status`, cold transcript index (52 transcripts, 641 MB touched in 24 h) | ~0.25 s | ~0.25 s | ~2.5 MB |
+| `status`, cold indexes (52 transcripts, 641 MB touched in 24 h; Codex logs) | ~0.17 s | ~0.17 s | ~2.5 MB |
 | Claude reading | one `curl` process (~6 ms) plus one HTTPS request | | |
 | Codex reading (app-server start, reply, stop) | ~0.6-0.8 s | ~1.2-1.4 s | ~410 MB (the app-server) |
 

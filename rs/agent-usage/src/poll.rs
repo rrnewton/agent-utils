@@ -4,7 +4,7 @@
 
 use crate::history::{self, Lock};
 use crate::model::Sample;
-use crate::paths::{claude_dir, ensure_dir, CachePaths, Env};
+use crate::paths::{claude_dir, codex_dir, ensure_dir, CachePaths, Env};
 use crate::transcripts::{Index, ScanStats};
 use crate::{claude, codex};
 
@@ -31,6 +31,9 @@ pub struct PollResult {
     pub index: Option<Index>,
     /// What the scan read.
     pub scan: Option<ScanStats>,
+    /// Codex's retried requests in the last 24 hours `(ts, status, text)`, when scanned and its
+    /// log database is readable.
+    pub codex_retries: Option<Vec<(i64, u16, String)>>,
 }
 
 /// Take one reading of `provider`.
@@ -108,11 +111,22 @@ pub fn step(
     } else {
         (None, None)
     };
+    let codex_retries = if opts.scan_transcripts && opts.providers.contains(&"codex") {
+        codex_dir(env).ok().and_then(|dir| {
+            let mut logs = crate::limits::CodexLogIndex::load(&paths.codex_logs());
+            logs.update(&dir, now)?;
+            let _ = logs.save(&paths.codex_logs());
+            Some(logs.events)
+        })
+    } else {
+        None
+    };
     Ok(PollResult {
         samples,
         fresh,
         index,
         scan,
+        codex_retries,
     })
 }
 

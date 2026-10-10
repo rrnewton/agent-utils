@@ -92,6 +92,10 @@ impl CachePaths {
     pub fn claude_index(&self) -> PathBuf {
         self.dir.join("claude-transcripts.json")
     }
+    /// Incremental index of Codex's retried requests (from its log database).
+    pub fn codex_logs(&self) -> PathBuf {
+        self.dir.join("codex-logs.json")
+    }
     /// Lock held by a running daemon for its whole life.
     pub fn daemon_lock(&self) -> PathBuf {
         self.dir.join("daemon.lock")

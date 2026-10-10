@@ -26,4 +26,5 @@ made-up values. They contain no account data and no credentials.
   weekly row.
 - `claude-usage-legacy.json`: a reply with only the legacy named windows and extra usage.
 - `codex-ratelimits.jsonl`: a fake app-server conversation (one JSON-RPC message per line).
-- `claude-transcript.jsonl`: Claude Code transcript lines, one message split over two lines.
+- `claude-transcript.jsonl`: Claude Code transcript lines: one message split over two lines, an
+  API error without a status, and an exhausted-retries HTTP 429 in a gateway's per-user wording.

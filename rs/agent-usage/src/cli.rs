@@ -250,6 +250,7 @@ fn run(args: &Args) -> Result<i32, String> {
                 result.index.as_ref(),
                 &args.providers,
                 &result.fresh,
+                result.codex_retries.as_deref(),
                 t,
             );
             if args.json {

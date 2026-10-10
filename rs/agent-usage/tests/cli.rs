@@ -409,3 +409,80 @@ fn claude_endpoint_floor_holds_even_with_max_age_zero() {
     assert_eq!(provider(&r, "claude")["fresh"], false);
     assert!(!sb.path("curl-argv.txt").exists());
 }
+
+#[test]
+fn rate_limit_evidence_from_transcripts_and_codex_logs() {
+    let sb = Sandbox::new("limits");
+    let now = now_secs();
+    let iso = |t: i64| {
+        let out = Command::new("date")
+            .args(["-u", "-d", &format!("@{t}"), "+%Y-%m-%dT%H:%M:%SZ"])
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    };
+    // Claude: two requests and one exhausted-retries 429 from a gateway, 5 minutes ago.
+    let proj = sb.path("claude/projects/p");
+    std::fs::create_dir_all(&proj).unwrap();
+    let mut lines = String::new();
+    for (i, id) in ["m1", "m2"].iter().enumerate() {
+        lines.push_str(&format!(
+            r#"{{"type":"assistant","timestamp":"{}","message":{{"id":"{id}","model":"m","usage":{{"input_tokens":1,"output_tokens":2}}}}}}"#,
+            iso(now - 500 + i as i64 * 60)
+        ));
+        lines.push('\n');
+    }
+    lines.push_str(&format!(
+        r#"{{"type":"assistant","timestamp":"{}","isApiErrorMessage":true,"apiErrorStatus":429,"message":{{"id":"x","model":"<synthetic>","content":[{{"type":"text","text":"API Error: Request rejected (429) · rate limit exceeded for u-1::w-60s: 436/425 in 60s"}}],"usage":{{"input_tokens":0,"output_tokens":0}}}}}}"#,
+        iso(now - 300)
+    ));
+    lines.push('\n');
+    std::fs::write(proj.join("s.jsonl"), lines).unwrap();
+    // Codex: a retried 429 and a retried 404 in its log database.
+    std::fs::write(sb.path("codex/logs_2.sqlite"), "").unwrap();
+    std::fs::write(sb.path("codex/state_5.sqlite"), "").unwrap();
+    let rows = format!(
+        r#"[{{"id":10,"ts":-1,"b":""}},{{"id":8,"ts":{},"b":"retrying sampling request (1/5 in 200ms)... sampling_error=unexpected status 429 Too Many Requests: rate limit exceeded for u-1::w-600s: 901/900 in 600s"}},{{"id":9,"ts":{},"b":"sampling_error=unexpected status 404 Not Found: no such model"}}]"#,
+        now - 120,
+        now - 60
+    );
+    std::fs::write(sb.path("rows.json"), rows).unwrap();
+    sb.script(
+        "sqlite3",
+        &format!(
+            "case \"$*\" in *-json*) cat {} ;; *) echo '10 1' ;; esac",
+            sb.path("rows.json").display()
+        ),
+    );
+    let r = sb.status_json(&[], &[]);
+    let cl = &provider(&r, "claude")["limits"];
+    assert_eq!(cl["source"], "transcripts");
+    assert_eq!(cl["includes_retried"], false);
+    assert_eq!(cl["windows"][0]["window"], "15m");
+    assert_eq!(cl["windows"][0]["rate_limited"], 1);
+    assert_eq!(cl["last_rate_limit"]["kind"], "gateway-user");
+    assert_eq!(
+        cl["last_rate_limit"]["count"],
+        serde_json::json!([436, 425, 60])
+    );
+    assert_eq!(cl["requests_10m"], 2);
+    assert_eq!(cl["peak_requests_per_minute_1h"], 1);
+    let cx = &provider(&r, "codex")["limits"];
+    assert_eq!(cx["source"], "codex-logs");
+    assert_eq!(cx["windows"][0]["rate_limited"], 1);
+    assert_eq!(cx["windows"][0]["other_errors"], 1);
+    assert_eq!(
+        cx["last_rate_limit"]["count"],
+        serde_json::json!([901, 900, 600])
+    );
+    let (_, text, _) = sb.run(&["--cached"], &[]);
+    assert!(
+        text.contains("gateway per-user limit, 436/425 requests in 60s"),
+        "{text}"
+    );
+    let (_, line, _) = sb.run(&["--line", "--cached"], &[]);
+    assert!(
+        line.trim_end().ends_with("429s 24h: claude 1, codex 1"),
+        "{line}"
+    );
+}

@@ -50,20 +50,24 @@ GNU `time`.
 
 | Scenario | N | Wall (median) | CPU (median) |
 | --- | --- | --- | --- |
-| `status`, sample fresh, transcript index warm | 30 | 10.3 ms | 9.0 ms |
-| `status --json`, same | 30 | 9.7 ms | 8.6 ms |
-| `status --cached --no-tokens` (history only) | 30 | 1.1 ms | 0.8 ms |
-| `status`, cold transcript index (52 transcripts, 641 MB touched in the last 24 h; binary search skips older bytes) | 5 | 247 ms | 245 ms |
-| `poll`, both providers, no subscription login (file checks, `sqlite3` total) | 20 | 8.1 ms | 7.7 ms |
+| `status`, sample fresh, transcript and Codex-log indexes warm | 30 | 13.5 ms | 12.0 ms |
+| `status --json`, same | 30 | 14.1 ms | 12.5 ms |
+| `status --cached --no-tokens` (history only) | 30 | 1.2 ms | 1.0 ms |
+| `status`, cold indexes (52 transcripts, 641 MB touched in the last 24 h, binary search skipping older bytes; first 24-hour read of Codex's log database) | 5 | 167 ms | 166 ms |
+| `poll`, both providers, no subscription login (file checks, `sqlite3` total) | 20 | 8.8 ms | 8.1 ms |
 | `poll --provider codex` with the app-server forced | 5 | 610 ms (582-841) | 1,182 ms |
 | one `curl` process (file URL), the local part of a Claude reading | 20 | 5.7 ms | 5.5 ms |
 
 agent-usage's own peak RSS is about 2.5 MB. Disk: about 255 bytes per history line (two lines
 per poll: 96 polls a day at the 15-minute default is about 49 KB a day); the transcript index
-was 168 KB for 52 active transcripts.
+was 173 KB for 52 active transcripts, the Codex-log index 4 KB.
 
-The warm `status` cost is dominated by walking the transcript directories (1,368 files) and
-rewriting the index; `--no-tokens` drops it to about 1 ms.
+The warm `status` cost is walking the transcript directories (1,368 files), rewriting the
+index, and one `sqlite3` process for new Codex log rows (about 3 ms; a plain 24-hour query of
+that 9.7 GB log database took 18 ms, which is why it is read incrementally). `--no-tokens` drops
+it all to about 1 ms. An earlier build took 10 ms warm and 247 ms cold; transcript lines are now
+searched with `str::contains` after UTF-8 validation instead of a naive byte-window scan, which
+is what brought the cold scan down despite the extra error parsing.
 
 ### The alternative: scraping `/status` from a Claude Code TUI
 
@@ -108,11 +112,13 @@ not scrape.
 
 ## Tests
 
-`cargo test -p agent-usage`: 38 unit tests (burn arithmetic including resets, proration and
+`cargo test -p agent-usage`: 41 unit tests (burn arithmetic including resets, proration and
 short histories; both reply parsers on fixtures, including two published recordings of real
 Claude usage replies; transcript parsing, incremental scan, duplicate lines and binary search;
 polling floor and back-off rules; header and `Retry-After` parsing; paths; argument parsing) and
-7 end-to-end tests that drive the binary against a fake `curl`, a fake `codex app-server` and a
+8 end-to-end tests that drive the binary against a fake `curl`, a fake `codex app-server` and a
 fake `sqlite3`: the bearer token is never on `curl`'s command line, in the cache or in a recorded
 raw reply; a 429 with `Retry-After` stops requests and keeps the last good figures; the 300 s
-floor holds even with `--max-age 0`.
+floor holds even with `--max-age 0`; 429s are counted and classified from a transcript and a
+Codex log database. The unit tests also cover 429 classification, transcript error lines and the
+incremental Codex-log reader.
