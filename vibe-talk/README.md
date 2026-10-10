@@ -3443,8 +3443,9 @@ from, so it cannot name a key the page does not answer.
 | ↓ or `j`, ↑ or `k` | The next or previous message. A message taller than the screen is scrolled through first |
 | `n` | The next unread message below |
 | Enter or `o` | Open or close the selected message, as a tap does (in Read, read it aloud) |
-| → | Into the thread of the selected message |
-| ← | Out of a thread, back to the message it was opened from |
+| → | Into the thread of the selected message; in two columns it opens on the right, and the keys go with it |
+| ← | Out of a thread, back to the message it was opened from; in two columns, back to Main on the left |
+| `[`, `]` | In two columns, the keys to the left column (Main) or the right one (the thread, or its list) |
 | Esc | Back (see above). In a message box with text in it, the first Esc leaves the box and keeps the draft; on the channel or thread picker, back to the messages |
 | Home, End | The top of the list or its newest message, and select it |
 | `e` | Done or not Done; marked Done, the ring moves on to the next unread below |
@@ -3849,6 +3850,23 @@ they are seen, then the switch, then the pane's buttons — the bar's own order,
 reader on the newest line stays on it when the dock grows a row under them, so a call's turns are
 still followed once it goes live. The phone's dock is not touched: `tests/offline_cache_browser.py`
 measures it at 412px and 360px against what it was.
+
+**Two columns on a wide desk** (`#229 desktop-two-column`). In a window at least 1000px wide, a
+layout button beside the view picker puts Main in the left column and a thread in the right, as
+other chat clients' desktop apps lay a channel out; the choice is kept per device. 1000px is where
+each column still holds about 45 characters, the narrowest reading width the page allows; a window
+narrowed below it shows one column again and keeps the choice. In two columns the view picker greys
+out. The right column shows the selected thread, with its name, an X that deselects it, and its own
+composer; with none selected, a card per thread, newest activity first, saying the summariser's
+`display_name: summary` or else the thread's first message, three lines at most. Thread(N), the
+unread count, N replies, the Threads screen and the cards select a thread there, and a plain tap on
+a message still only folds it. Search, Links and the read mode apply to both columns; Pinned stands
+in for the left column's list. The poll reads Main and the selected thread (two views, one delta
+each), a live reply in that thread is read once as the thread, and a refresh that brings nothing
+draws nothing in either column. The thread is drawn by the same code as a thread in one column: the
+right column's elements stand in for the channel pane's while the code works on that column, and
+its state is swapped in around that work (`COLUMN_IDS`, `COLUMN_STATE` and `inColumn` in
+`web/voice.js`). `tests/two_column_browser.py` checks the layout in Chromium at 1440x900 and 1280x800.
 
 **The regime is `@media (min-width: 900px) and (pointer: fine)`, and nothing else decides it.**
 Not a user-agent string — a tablet with a trackpad and a phone in desktop mode both lie to one, and

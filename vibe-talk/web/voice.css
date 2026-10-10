@@ -5355,6 +5355,11 @@ textarea {
     --dock-inset: max(0.6rem, calc(25% - var(--reading-width) / 2 + 0.6rem));
   }
 
+  /* The transient status speaks over the left column, where its chips are, not across the divider. */
+  body:has(#screen-main[data-columns="two"]:not([hidden])) #status-line {
+    inset-inline: 0 50%;
+  }
+
   /* The heading names the thread as the picker does — "13h · 16 · its name" — and holds the X. */
   #side-heading {
     display: flex;

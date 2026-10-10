@@ -10,7 +10,7 @@
 # tool's lightweight unboxed gate. The root includes `tests.dag.yaml` directly so vibe-talk shares
 # one scheduler and browser cap with the other repository fragments.
 
-.PHONY: validate validate-boxed dag-check fmt check scripts-check contract contract-check typecheck test page pwa-installability enter-to-send-browser offline-cache-browser reactions-browser read-aloud-browser post-confirm-browser view-switch-browser read-modes-browser keyboard-browser voice-read-acceptance-self-test android-speech-self-test live-hint-adapter-self-test container-smoke clean
+.PHONY: validate validate-boxed dag-check fmt check scripts-check contract contract-check typecheck test page pwa-installability enter-to-send-browser offline-cache-browser reactions-browser read-aloud-browser post-confirm-browser view-switch-browser read-modes-browser keyboard-browser two-column-browser voice-read-acceptance-self-test android-speech-self-test live-hint-adapter-self-test container-smoke clean
 
 # The whole gate for this tool, cheapest and most likely to fail first.
 #
@@ -166,6 +166,16 @@ read-modes-browser:
 # and SCREENSHOTS=dir to keep a PNG of each step.
 keyboard-browser:
 	python3 tests/keyboard_browser.py $(if $(WEB_ROOT),--web-root $(WEB_ROOT)) $(if $(SCREENSHOTS),--screenshots $(SCREENSHOTS))
+
+# `#229 desktop-two-column` in a real Chromium at 1440x900 and 1280x800: the layout button draws Main
+# and the right column side by side inside the window, the view picker greyed; the right column's cards
+# are one height, newest activity first, the long one cut to three lines; a card and a Main message's
+# Thread(N) select a thread there under its name, each column scrolls alone under the wheel, the X goes
+# back to the cards, and a window narrowed to 900px is one column in its old view, two again when wide.
+# Pass WEB_ROOT=dir to run it against another copy of the page, and SCREENSHOTS=dir to keep the list and
+# thread states as PNGs.
+two-column-browser:
+	python3 tests/two_column_browser.py $(if $(WEB_ROOT),--web-root $(WEB_ROOT)) $(if $(SCREENSHOTS),--screenshots $(SCREENSHOTS))
 
 # The live #47 read-aloud-overlong check is opt-in and may consume provider time. Its transcript
 # reconciliation, PCM-duration metric, re-answer separation, privacy boundaries, threshold edges,

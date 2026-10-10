@@ -8785,7 +8785,10 @@ function foldTimelinePage(payload, older, view = channelView, thread = selectedT
   if (channelCanon.channel !== channel) loadCanon(channel);
   const hasMore = payload.has_more === true;
   // Outside the thread view a page names a thread only when the channel IS that one thread.
+  const scopeWas = channelCanon.scope;
   if (view !== "thread") channelCanon.scope = payload.thread ? String(payload.thread.id) : null;
+  // A channel that is one thread has no other thread to show beside it. `#229 desktop-two-column`.
+  if (channelCanon.scope !== scopeWas) Promise.resolve().then(renderColumns);
   const before = view === "threads" ? new Map() : heldCopies(payload.messages || []);
   if (view === "threads") {
     mergeIntoCanon("threads", payload.threads || [], older, hasMore, () => true);
@@ -9346,7 +9349,9 @@ function clearChannelScreen() {
   channelFreshAt = 0;
   setChannelFreshness("fresh");
   screenIdentity = tokenFingerprint(token());
-  // `#229 desktop-two-column`. What the right column read goes with the rest.
+  // `#229 desktop-two-column`. What the right column read goes with the rest, and the threads selected
+  // there, which this credential read.
+  sideThreads.clear();
   resetSideColumn();
 }
 
@@ -9483,6 +9488,8 @@ function reconcileChannelSnapshot(before) {
   hydrateChannelScope();
   restoreChannelComposer();
   renderControls();
+  // Threads or none, as sign-in says: one column or two decided again. `#229 desktop-two-column`.
+  renderColumns();
   saveUiState();
 }
 
@@ -11166,7 +11173,10 @@ function threadDirectorySentence(count) {
 /** Draw the list. Every string is text; nothing from the chat service is parsed as markup. */
 function renderThreadDirectory() {
   const choices = threadChoices();
-  const open = channelView === "thread" && selectedThreadId ? String(selectedThreadId) : null;
+  // In two columns, the thread open on the right. `#229 desktop-two-column`.
+  const open = columnsShown
+    ? (sideShowing() ? inColumn(columns.side, () => String(selectedThreadId)) : null)
+    : channelView === "thread" && selectedThreadId ? String(selectedThreadId) : null;
   el("thread-directory-list").replaceChildren(...choices.map((choice) => {
     const row = document.createElement("li");
     row.setAttribute("data-context-id", choice.id);
@@ -14116,8 +14126,8 @@ function renderChannelRows() {
   }
   // The kept place follows the reader down the backlog. Done BEFORE the rows are marked, so the
   // row that ends up carrying the marker is the one this pass draws it on rather than the one the
-  // previous pass did.
-  advanceMarkerPastRead();
+  // previous pass did. The left column's reader: "My place" is its chip. `#229 desktop-two-column`.
+  if (!sideActive) advanceMarkerPastRead();
   // `#222 unread-replies`. The replies the store holds, counted once for every row's thread chip.
   const tally = replyTally();
   const mainList = new Set(rows);
@@ -16190,7 +16200,7 @@ function readWithBrowserSpeech(parts, id, ticket) {
       if (pendingRead === id) setStatus(`Reading with ${readAloudLabel}.`);
       pendingRead = null;
       setReadState("ready");
-      renderChannelRows();
+      eachColumn(renderChannelRows);
     };
     utterance.onerror = (event) => { if (isCurrentPart()) fail(event.error); };
     utterance.onend = () => {
@@ -16380,7 +16390,7 @@ function stopReading() {
       if (readingMode) {
         setReadState("ready");
       }
-      renderChannelRows();
+      eachColumn(renderChannelRows);
     }
     return;
   }
@@ -16411,7 +16421,7 @@ function stopReading() {
     }
   }
   if (wasPending && readingMode) setReadState("ready");
-  renderChannelRows();
+  eachColumn(renderChannelRows);
 }
 
 /** Fetch the audio for one message. Bytes, not JSON, so it cannot go through `api`. */
@@ -16774,7 +16784,8 @@ async function readAloud(ids) {
   // answer now rather than when ElevenLabs is finished.
   pendingRead = id;
   setReadState("working");
-  renderChannelRows();
+  // In both columns: the row asked for may be in either. `#229 desktop-two-column`.
+  eachColumn(renderChannelRows);
   if (readAloudPlayback !== "audio") {
     try {
       if (readAloudPlayback !== "browser") throw new Error("This speech playback method is not supported by this page.");
@@ -16814,7 +16825,7 @@ async function readAloud(ids) {
     if (ticket === readingTicket) {
       pendingRead = null;
       setReadState("failed");
-      renderChannelRows();
+      eachColumn(renderChannelRows);
     }
     // BOTH places, and this one is why it is caught here at all: `guardQuietly` puts the reason in
     // the standing error panel, which is right for a background failure and wrong for a tap. The
@@ -16917,7 +16928,7 @@ async function readAloud(ids) {
   // The same array the players are added to, so a stop reaches a part requested later.
   nowPlaying = { id, audio: players[0], urls: objectUrls, players };
   setReadState("ready");
-  renderChannelRows();
+  eachColumn(renderChannelRows);
   await startPlayer(0);
 }
 
@@ -20285,6 +20296,8 @@ let replyRouting = { thread: null, branch: null, unknown: false, note: "" };
 // Where the reader was in the channel when they opened this. Captured with the SAME mechanism the
 // fold control uses (`#47 scrollback-stability`), not a second one.
 let replyScrollMark = null;
+/** The column the reply was opened from, whose list that place is in. `#229 desktop-two-column`. */
+let replyColumn = columns.main;
 
 function rememberDraft() {
   if (!replyTarget) {
@@ -20332,6 +20345,7 @@ function openReply(messages) {
   // BEFORE the screen changes: once #screen-main is hidden nothing in it has a rectangle, so the
   // anchor has to be taken while the reader can still see it.
   replyScrollMark = captureScroll();
+  replyColumn = activeColumn;
   const target = el("reply-target");
   target.replaceChildren();
   // The same bodies the channel list draws, through the same function, so the same guarantee: the
@@ -20396,7 +20410,8 @@ function closeReply() {
   rememberDraft();
   showScreen("main");
   if (replyScrollMark) {
-    restoreScroll(replyScrollMark);
+    const mark = replyScrollMark;
+    inColumn(replyColumn, () => restoreScroll(mark));
     replyScrollMark = null;
   }
   replyTarget = null;
@@ -20437,7 +20452,8 @@ async function sendReply() {
   resetReplyContext();
   showScreen("main");
   showView("discord");
-  scrollToNewest();
+  // To the newest of the list the reply was opened from: the thread's, on the right. `#229`.
+  inColumn(replyColumn, scrollToNewest);
   await completion;
 }
 
@@ -21253,10 +21269,11 @@ function closeSideThread() {
 }
 
 /**
- * Forget what the right column shows, for another channel or another credential, and show that
- * channel's thread selected there earlier in this session, or its cards.
+ * Forget what the right column shows, for another channel or another credential. `reopen`, for a
+ * channel the reader changed to: show that channel's thread selected there earlier in this session,
+ * or its cards and the thread list read behind them.
  */
-function resetSideColumn() {
+function resetSideColumn(reopen = false) {
   inColumn(columns.side, () => {
     dropReplyArrowTap();
     gathered = null;
@@ -21272,8 +21289,9 @@ function resetSideColumn() {
   leftEl("side-loading").hidden = true;
   sideCardsDrawn = "";
   leftEl("side-cards").replaceChildren();
-  if (!columnsShown) {
+  if (!columnsShown || !reopen) {
     columns.side.mode = "list";
+    if (columnsShown) renderSideMode();
     return;
   }
   const open = sideThreads.get(String(el("discord-channel").value));
@@ -24014,7 +24032,6 @@ inColumn(columns.side, () => {
     maybeLoadOlder();
     requestVisibleSummaries();
   }));
-  el("scroll-area").addEventListener("click", (event) => noteClickedRow(sidePane, event && event.target));
 });
 // The window's width decides one column or two, through the stylesheet: asked again once per frame of
 // a resize, never per scroll.
@@ -24143,7 +24160,7 @@ function changeSelectedChannel() {
   }
   // `#229 desktop-two-column`. The right column shows this channel's thread selected earlier in
   // the session, or its cards; and a channel without threads is one column.
-  resetSideColumn();
+  resetSideColumn(true);
   renderColumns();
   // A stream follows ONE channel, and a cursor from the old one means nothing in the new one —
   // the same reason the walk-back cursor is dropped two lines above.
@@ -24352,6 +24369,22 @@ if (typeof window.ResizeObserver === "function") {
       area.scrollTop = area.scrollHeight;
     }
   }).observe(el("scroll-area"));
+  // `#229 desktop-two-column`. The same for the right column's reader, under the same dock.
+  let seenSide = null;
+  new window.ResizeObserver(() => {
+    const area = leftEl("side-scroll");
+    const now = { list: area.clientHeight, dock: el("dock").offsetHeight };
+    const grew = seenSide !== null && seenSide.list > 0 && currentScreen === "main" ? now.dock - seenSide.dock : 0;
+    seenSide = now;
+    if (!sideShowing()) return;
+    inColumn(columns.side, () => {
+      if (entryLandingHolds()) {
+        placeEntryLanding(entryLanding.row, entryLanding.first);
+        return;
+      }
+      if (grew > 0 && atBottom(area, BOTTOM_SLACK_PX + grew)) area.scrollTop = area.scrollHeight;
+    });
+  }).observe(leftEl("side-scroll"));
 }
 // `#214 reply-arrow`. Where an arrow meets the row directly above it is layout, and layout changes
 // without a redraw: the window resized or turned, the reading column dragged, the reader's type
