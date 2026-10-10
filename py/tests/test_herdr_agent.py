@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import errno
+import fcntl
 import json
 import os
 import stat
@@ -963,6 +964,111 @@ def test_queue_directories_are_tightened_and_symlink_lock_is_refused(tmp_path: P
     with pytest.raises(AgentDeliveryError, match="cannot open queue delivery lock"):
         drain(client(FakeAgentHerdr(["idle"])), target(), str(tmp_path))
     assert victim.read_text(encoding="utf-8") == "do not touch"
+
+
+@pytest.mark.parametrize("operation", ["enqueue", "drain", "drain-binding"])
+@pytest.mark.parametrize("replacement", ["directory", "directory-reused-lock", "lock"])
+def test_queue_waiter_refuses_archived_directory_or_replaced_lock(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, operation: str, replacement: str,
+) -> None:
+    active = tmp_path / "worker"
+    queue = active / "queue"
+    archive = tmp_path / "archive" / "worker-old"
+    archive.parent.mkdir(mode=0o700)
+    enqueue(str(queue), "old pending prompt", message_id="old")
+    agent_api._bind_queue(str(queue), target())
+    (active / "agent.json").write_text("old lifetime\n", encoding="utf-8")
+    for folder in ("inflight", "failed", "processed"):
+        agent_api._atomic_json(str(queue / folder / "retained.json"), {"text": folder})
+
+    def artifacts(root: Path) -> dict[str, bytes]:
+        return {str(path.relative_to(root)): path.read_bytes()
+                for path in root.rglob("*") if path.is_file()}
+
+    lock_name = ".binding.lock" if operation == "drain-binding" else ".delivery.lock"
+    holder = agent_api._open_private_lock(str(queue / lock_name), "test queue holder")
+    original_flock = fcntl.flock
+    original_flock(holder, fcntl.LOCK_EX)
+    held = os.fstat(holder)
+    attempted = False
+    expected: dict[Path, dict[str, bytes]] = {}
+
+    def replace_while_waiting(descriptor: int, mode: int) -> None:
+        nonlocal attempted
+        observed = os.fstat(descriptor)
+        if (not attempted and mode == fcntl.LOCK_EX
+                and (observed.st_dev, observed.st_ino) == (held.st_dev, held.st_ino)):
+            attempted = True
+            with pytest.raises(BlockingIOError):
+                original_flock(descriptor, mode | fcntl.LOCK_NB)
+            if replacement == "lock":
+                path = queue / lock_name
+                path.rename(path.with_name(f".retired{lock_name}"))
+                os.close(agent_api._open_private_lock(str(path), "replacement queue lock"))
+                expected[active] = artifacts(active)
+            else:
+                active.rename(archive)
+                enqueue(str(queue), "new lifetime prompt", message_id="new")
+                agent_api._bind_queue(str(queue), target(session_value="session-2"))
+                (active / "agent.json").write_text("new lifetime\n", encoding="utf-8")
+                if replacement == "directory-reused-lock":
+                    path = queue / lock_name
+                    path.rename(path.with_name(f".replacement{lock_name}"))
+                    # Directory identity is independent of the exact lock inode.
+                    os.link(archive / "queue" / lock_name, path)
+                expected[archive] = artifacts(archive)
+                expected[active] = artifacts(active)
+            original_flock(holder, fcntl.LOCK_UN)
+        original_flock(descriptor, mode)
+
+    monkeypatch.setattr(fcntl, "flock", replace_while_waiting)
+    fake = FakeAgentHerdr(["idle", "working", "idle"])
+    try:
+        with pytest.raises(AgentDeliveryError, match="changed while waiting") as error:
+            if operation == "enqueue":
+                enqueue(str(queue), "stale writer prompt", message_id="stale")
+            else:
+                drain(client(fake), target(), str(queue))
+    finally:
+        os.close(holder)
+    assert attempted, "the operation must actually contend on the old lock"
+    assert type(error.value) is AgentDeliveryError
+    assert fake.runs == []
+    assert expected
+    for root, snapshot in expected.items():
+        assert artifacts(root) == snapshot
+
+
+def test_drain_keeps_queue_generation_from_binding_until_delivery(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    queue = tmp_path / "queue"
+    archive = tmp_path / "old-queue"
+    enqueue(str(queue), "old pending prompt", message_id="old")
+    original_bind = agent_api._bind_queue
+
+    def bind_then_replace(
+        root: str, bound_target: Target, *, max_artifact_bytes: int | None = None,
+        allow_legacy_workspace_binding: bool = False,
+    ) -> tuple[int, int]:
+        identity = original_bind(
+            root, bound_target, max_artifact_bytes=max_artifact_bytes,
+            allow_legacy_workspace_binding=allow_legacy_workspace_binding,
+        )
+        queue.rename(archive)
+        enqueue(str(queue), "new pending prompt", message_id="new")
+        original_bind(str(queue), target(session_value="session-2"))
+        return identity
+
+    monkeypatch.setattr(agent_api, "_bind_queue", bind_then_replace)
+    fake = FakeAgentHerdr(["idle", "working", "idle"])
+    with pytest.raises(AgentDeliveryError, match="queue directory changed while waiting"):
+        drain(client(fake), target(), str(queue))
+    assert fake.runs == []
+    assert json.loads((archive / "inbox/old.json").read_text())["delivery_attempts"] == 0
+    assert json.loads((queue / "inbox/new.json").read_text())["delivery_attempts"] == 0
+    assert list((queue / "failed").iterdir()) == []
+    assert list((queue / "processed").iterdir()) == []
 
 
 def test_timeout_retains_prompt_and_loud_error(tmp_path: object) -> None:

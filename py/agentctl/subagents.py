@@ -291,10 +291,12 @@ def harness_arguments(
         if model:
             args.extend(("--model", model))
     elif harness == "muse":
-        if resume is not None:
-            raise AgentDeliveryError("interactive Muse resume is not supported; use literal owner-configured argv")
         if model:
             args.extend(("--model", model))
+        if resume is not None:
+            args.extend(extra)
+            args.extend(("resume", resume))
+            extra = ()
     elif model is not None or resume is not None:
         raise AgentDeliveryError("model and resume presets support codex/claude/muse; use harness arguments for other kinds")
     if any("\0" in value for value in args):
@@ -408,6 +410,8 @@ class AgentRecord:
         default=None, init=False, repr=False,
     )
     _session_source: str | None = field(default=None, init=False, repr=False)
+    # A revive candidate is saved through its pinned directory, never through NAME.
+    _storage: tuple[Path, int, int] | None = field(default=None, init=False, repr=False)
 
     def to_document(self) -> dict[str, object]:
         """Serialize in the decoded row's schema without duplicating launch intent."""
@@ -417,6 +421,7 @@ class AgentRecord:
         document.pop("_unknown")
         document.pop("_nested_storage")
         document.pop("_session_source")
+        document.pop("_storage")
         if self._unknown.keys() & document.keys():
             raise AgentDeliveryError("unknown agent metadata conflicts with a known schema field")
         document.update(self._unknown)
@@ -1997,9 +2002,12 @@ class ManagedAgents:
 
     def _record_bytes(
         self, pinned: _PinnedAgentDirectory, *, require_active_name: bool = True,
+        file_name: str = "agent.json",
     ) -> bytes:
         """Read one bounded record relative to the held directory generation."""
-        path = pinned.path / "agent.json"
+        if file_name not in ("agent.json", "stopped.json") and re.fullmatch(r"[a-z0-9-]{1,80}\.json", file_name) is None:
+            raise AgentDeliveryError("unsupported pinned record artifact")
+        path = pinned.path / file_name
         if require_active_name:
             self._verify_pinned_agent_directory(pinned)
         flags = (
@@ -2010,7 +2018,7 @@ class ManagedAgents:
         )
         descriptor = -1
         try:
-            descriptor = os.open("agent.json", flags, dir_fd=pinned.descriptor)
+            descriptor = os.open(file_name, flags, dir_fd=pinned.descriptor)
             before = os.fstat(descriptor)
             if (not stat.S_ISREG(before.st_mode) or before.st_uid != os.getuid()
                     or stat.S_IMODE(before.st_mode) & 0o077 or before.st_nlink != 1
@@ -2028,7 +2036,9 @@ class ManagedAgents:
                     break
                 content.extend(block)
             after = os.fstat(descriptor)
+            named = os.stat(file_name, dir_fd=pinned.descriptor, follow_symlinks=False)
             if (before.st_size != len(content)
+                    or (named.st_dev, named.st_ino) != (before.st_dev, before.st_ino)
                     or (after.st_dev, after.st_ino, after.st_mode, after.st_uid,
                         after.st_nlink, after.st_size, after.st_mtime_ns,
                         after.st_ctime_ns) != (
@@ -2118,7 +2128,18 @@ class ManagedAgents:
             yield
 
     def _save(self, record: AgentRecord) -> None:
-        agent._atomic_json(str(self._directory(record.name) / "agent.json"), record.to_document())
+        if record._storage is None:
+            agent._atomic_json(str(self._directory(record.name) / "agent.json"), record.to_document())
+            return
+        path, device, inode = record._storage
+        with self._pinned_parent_directory(path, label="revive candidate") as parent:
+            if (parent.device, parent.inode) != (device, inode):
+                raise AgentDeliveryError("revive candidate directory changed")
+            pinned = _PinnedAgentDirectory(record.name, path, parent.descriptor, device, inode)
+            self._atomic_snapshot_bytes(
+                pinned, agent._json_text(record.to_document()).encode("utf-8"), name="agent.json",
+            )
+            self._verify_pinned_parent_directory(parent, label="revive candidate")
 
     def _queue(self, name: str) -> str:
         return str(self._directory(name) / "queue")
@@ -2306,6 +2327,10 @@ class ManagedAgents:
                 pane, terminal = raw.get("pane_id"), raw.get("terminal_id")
                 if isinstance(pane, str):
                     found.append((path.name, pane, terminal if isinstance(terminal, str) else None))
+            from agentctl.revive import candidate_records
+            for candidate in candidate_records(self):
+                if candidate.name != name and candidate.pane_id is not None:
+                    found.append((candidate.name, candidate.pane_id, candidate.terminal_id))
             return found
         return claims
 
@@ -2368,12 +2393,35 @@ class ManagedAgents:
             if (not _NAME.fullmatch(path.name) or path.name == "archive"
                     or path.name == exclude):
                 continue
-            other = self._load(path.name)
+            agent._validate_private_directory(str(path), "agent directory")
+            other = AgentRecord.load(path / "agent.json", path.name)
             if ((other.session_agent or other.harness) == session_agent
                     and session_value in (other.resume, other.session_value, other.goal_session_id,
                                           None if other.native_session is None else other.native_session["value"])):
                 return other
+        from agentctl.revive import candidate_records
+        for other in candidate_records(self):
+            if (other.name != exclude and other.harness == session_agent
+                    and session_value in (other.resume, other.session_value,
+                        None if other.native_session is None else other.native_session["value"])):
+                return other
         return None
+
+    def revive(
+        self, name: str, *, dry_run: bool = False,
+        expected_token: str | None = None, startup_timeout: float = 30.0,
+    ) -> dict[str, object]:
+        """Resume one positively dead owned harness in a fresh tab."""
+        from agentctl.revive import revive
+        return revive(self, name, dry_run=dry_run, expected_token=expected_token,
+                      startup_timeout=startup_timeout)
+
+    def revive_all(
+        self, *, dry_run: bool = False, startup_timeout: float = 30.0,
+    ) -> dict[str, object]:
+        """Plan or resume each recoverable generation, preserving failed plans."""
+        from agentctl.revive import revive_all
+        return revive_all(self, dry_run=dry_run, startup_timeout=startup_timeout)
 
     def start(
         self, name: str, *, cwd: str, workspace_id: str | None = None,
@@ -2506,91 +2554,10 @@ class ManagedAgents:
                                      else "herdr-pane" if harness == "muse" else "herdr")
                 self._save(record)
                 try:
-                    self._create_presentation(
-                        record, workspace_id, environment, project_workspace
+                    self._launch_interactive(
+                        record, workspace_id, environment, project_workspace,
+                        startup_timeout, slot_command, relay_command,
                     )
-                    assert record.pane_id is not None
-                    if slot_command is not None:
-                        self.client.enter_slot_sandbox(
-                            record.pane_id, slot_command, timeout=startup_timeout
-                        )
-                    if relay_command is not None:
-                        def persist_relay(identity: CustomProcessIdentity) -> None:
-                            record.custom_process_identity = identity
-                            self._save(record)
-
-                        self.client.start_relay_agent(
-                            harness, record.pane_id, relay_command,
-                            timeout=startup_timeout, on_observed=persist_relay,
-                        )
-                        record.pane_reported_by_agentctl = True
-                        self._save(record)
-                    elif record.adapter == "herdr-pane":
-                        def persist_identity(identity: CustomProcessIdentity) -> None:
-                            record.custom_process_identity = identity
-                            self._save(record)
-
-                        self.client.start_pane_agent(
-                            name, harness, record.pane_id, arguments,
-                            timeout=startup_timeout, on_observed=persist_identity,
-                        )
-                        record.pane_reported_by_agentctl = True
-                        self._save(record)
-                        screen = self.client.read(
-                            record.pane_id, source="visible", lines=200
-                        )
-                        (record.startup_warning,
-                         record.effective_reasoning_effort) = muse_startup_metadata(screen)
-                    else:
-                        self.client.start_agent(name, harness, record.pane_id, arguments, timeout=startup_timeout)
-                    info = self._checked(record, ready=True, enforce_policy=True)
-                    if info.workspace_id != record.workspace_id:
-                        raise AgentDeliveryError("started agent moved to another workspace")
-                    _capture_native_session(record, info)
-                    record.session_agent = info.session_agent
-                    record.session_value = info.session_value
-                    if info.session_agent is not None and info.session_value is not None:
-                        owner = self._identity_owner(
-                            info.session_agent, info.session_value, exclude=name
-                        )
-                        if owner is not None:
-                            try:
-                                self.client.close_pane(record.pane_id)
-                            except HerdrRunError as close_error:
-                                record.session_agent = record.session_value = None
-                                raise AgentDeliveryError(
-                                    f"native session is already registered as {owner.name!r}; "
-                                    f"could not close the conflicting new pane: {close_error}"
-                                ) from close_error
-                            record.session_agent = record.session_value = None
-                            raise AgentDeliveryError(
-                                f"native session is already registered as {owner.name!r}; "
-                                "closed the conflicting new pane"
-                            )
-                        try:
-                            agent.resolve_target(self.client, self._target(record))
-                        except HerdrRunError as identity_error:
-                            record.session_agent = record.session_value = None
-                            raise AgentDeliveryError(
-                                "started native session is not globally unique; "
-                                "the failed owned pane remains available for stop"
-                            ) from identity_error
-                    self._anchor_fresh(record, info)
-                    record.lifecycle = "running"
-                    self._save(record)
-                    try:
-                        agent.resolve_target(self.client, self._target(record))
-                        final_info = self._checked(record, ready=True)
-                    except HerdrRunError:
-                        record.session_agent = record.session_value = None
-                        raise
-                    if (final_info.session_agent != record.session_agent
-                            or final_info.session_value != record.session_value):
-                        record.session_agent = record.session_value = None
-                        raise AgentDeliveryError(
-                            "started agent native session changed during identity commit"
-                        )
-                    _capture_native_session(record, final_info)
                 except (HerdrRunError, ValueError, OSError) as exc:
                     record.lifecycle = "launch_failed"
                     record.error = (
@@ -2619,6 +2586,99 @@ class ManagedAgents:
             # Keep the generation lock until its initial instruction and result
             # are captured; a replacement must never receive this launch's brief.
             return self.status(name)
+
+    def _launch_interactive(
+        self, record: AgentRecord, workspace_id: str | None,
+        environment: Sequence[str], project_workspace: str | None,
+        startup_timeout: float, slot_command: str | None, relay_command: str | None,
+    ) -> None:
+        """Launch into the record's storage destination and capture independent anchors."""
+        name, harness, arguments = record.name, record.harness, tuple(record.arguments)
+        self._create_presentation(
+            record, workspace_id, environment, project_workspace
+        )
+        assert record.pane_id is not None
+        if slot_command is not None:
+            self.client.enter_slot_sandbox(
+                record.pane_id, slot_command, timeout=startup_timeout
+            )
+        if relay_command is not None:
+            def persist_relay(identity: CustomProcessIdentity) -> None:
+                record.custom_process_identity = identity
+                self._save(record)
+
+            self.client.start_relay_agent(
+                harness, record.pane_id, relay_command,
+                timeout=startup_timeout, on_observed=persist_relay,
+            )
+            record.pane_reported_by_agentctl = True
+            self._save(record)
+        elif record.adapter == "herdr-pane":
+            def persist_identity(identity: CustomProcessIdentity) -> None:
+                record.custom_process_identity = identity
+                self._save(record)
+
+            self.client.start_pane_agent(
+                name, harness, record.pane_id, arguments,
+                timeout=startup_timeout, on_observed=persist_identity,
+            )
+            record.pane_reported_by_agentctl = True
+            self._save(record)
+            screen = self.client.read(
+                record.pane_id, source="visible", lines=200
+            )
+            (record.startup_warning,
+             record.effective_reasoning_effort) = muse_startup_metadata(screen)
+        else:
+            self.client.start_agent(name, harness, record.pane_id, arguments, timeout=startup_timeout)
+        info = self._checked(record, ready=True, enforce_policy=True)
+        if info.workspace_id != record.workspace_id:
+            raise AgentDeliveryError("started agent moved to another workspace")
+        _capture_native_session(record, info)
+        record.session_agent = info.session_agent
+        record.session_value = info.session_value
+        if info.session_agent is not None and info.session_value is not None:
+            owner = self._identity_owner(
+                info.session_agent, info.session_value, exclude=name
+            )
+            if owner is not None:
+                try:
+                    self.client.close_pane(record.pane_id)
+                except HerdrRunError as close_error:
+                    record.session_agent = record.session_value = None
+                    raise AgentDeliveryError(
+                        f"native session is already registered as {owner.name!r}; "
+                        f"could not close the conflicting new pane: {close_error}"
+                    ) from close_error
+                record.session_agent = record.session_value = None
+                raise AgentDeliveryError(
+                    f"native session is already registered as {owner.name!r}; "
+                    "closed the conflicting new pane"
+                )
+            try:
+                agent.resolve_target(self.client, self._target(record))
+            except HerdrRunError as identity_error:
+                record.session_agent = record.session_value = None
+                raise AgentDeliveryError(
+                    "started native session is not globally unique; "
+                    "the failed owned pane remains available for stop"
+                ) from identity_error
+        self._anchor_fresh(record, info)
+        record.lifecycle = "running"
+        self._save(record)
+        try:
+            agent.resolve_target(self.client, self._target(record))
+            final_info = self._checked(record, ready=True)
+        except HerdrRunError:
+            record.session_agent = record.session_value = None
+            raise
+        if (final_info.session_agent != record.session_agent
+                or final_info.session_value != record.session_value):
+            record.session_agent = record.session_value = None
+            raise AgentDeliveryError(
+                "started agent native session changed during identity commit"
+            )
+        _capture_native_session(record, final_info)
 
     def adopt(
         self, name: str, *, pane_id: str, expected_workspace: str,
@@ -2724,12 +2784,20 @@ class ManagedAgents:
                 f"refusing pane {pane_id}: presentation workspace identity changed"
             )
         shell_identity = self.client.pane_shell_identity(info.pane_id)
+        owner = self._claim_owner(info.pane_id, info.terminal_id)
+        if owner is not None:
+            raise AgentDeliveryError(f"pane {pane_id!r} is already registered as {owner!r}")
+        if info.session_agent is not None and info.session_value is not None:
+            session_owner = self._identity_owner(info.session_agent, info.session_value)
+            if session_owner is not None:
+                raise AgentDeliveryError(f"pane {pane_id!r} is already registered as {session_owner.name!r}")
         if self.registry.exists():
             agent._validate_private_directory(str(self.registry), "agent registry")
             for path in self.registry.iterdir():
                 if not _NAME.fullmatch(path.name) or path.name == "archive":
                     continue
-                other = self._load(path.name)
+                agent._validate_private_directory(str(path), "agent directory")
+                other = AgentRecord.load(path / "agent.json", path.name)
                 same_session = (info.session_value is not None
                                 and (other.session_agent or other.harness)
                                     == info.session_agent
@@ -3378,7 +3446,7 @@ class ManagedAgents:
         return result
 
     def _dead_pane_proof(
-        self, record: AgentRecord, *, operation: str,
+        self, record: AgentRecord, *, operation: str, allow_reported_dead: bool = False,
     ) -> _DeadPaneProof:
         """Prove one exact absent-agent, one-pane tab and idle shell generation."""
         pane_id = record.pane_id
@@ -3413,11 +3481,17 @@ class ManagedAgents:
                 raise AgentDeliveryError(
                     f"refusing to {operation} {record.name!r}: recorded pane, workspace, or cwd changed"
                 )
-            if info.agent is not None:
+            stale_report = (allow_reported_dead and record.adapter in ("herdr-pane", "herdr-relay")
+                and record.pane_reported_by_agentctl and info.agent in (None, record.harness)
+                and (info.session_agent, info.session_value) in (
+                    (None, None), (record.session_agent, record.session_value),
+                    (record.harness, record.resume),
+                    (record.harness, None if record.native_session is None else record.native_session["value"])))
+            if info.agent is not None and not stale_report:
                 raise AgentDeliveryError(
                     f"refusing to {operation} {record.name!r}: pane still reports agent {info.agent!r}"
                 )
-            if info.session_agent is not None or info.session_value is not None:
+            if (info.session_agent is not None or info.session_value is not None) and not stale_report:
                 raise AgentDeliveryError(
                     f"refusing to {operation} {record.name!r}: absent agent has native session identity"
                 )
@@ -3528,9 +3602,9 @@ class ManagedAgents:
         pinned: _PinnedAgentDirectory, content: bytes, *, name: str = "output.json",
     ) -> _InstalledArtifact:
         """Replace one private snapshot with exact bytes and durable directory metadata."""
-        if name not in {"agent.json", "output.json"}:
+        if name not in {"agent.json", "output.json", "stopped.json"} and re.fullmatch(r"[a-z0-9-]{1,80}\.json", name) is None:
             raise AgentDeliveryError("unsupported pinned registry artifact name")
-        limit = _MAX_AGENT_RECORD_BYTES if name == "agent.json" else _MAX_SNAPSHOT_BYTES
+        limit = _MAX_SNAPSHOT_BYTES if name == "output.json" else _MAX_AGENT_RECORD_BYTES
         if len(content) > limit:
             raise AgentDeliveryError(
                 f"refusing {name} larger than {limit} bytes"
@@ -4848,6 +4922,8 @@ class ManagedAgents:
         return journals
 
     def _refuse_pending_rename(self, *names: str) -> None:
+        from agentctl.revive import refuse_pending
+        refuse_pending(self, names)
         for journal in self._rename_journals():
             if journal["old"] in names or journal["new"] in names:
                 raise AgentDeliveryError(

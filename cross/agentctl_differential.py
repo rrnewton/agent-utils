@@ -22,7 +22,7 @@ from collections.abc import Mapping, Sequence
 from pathlib import Path
 
 from herdr_agent_differential import (
-    FIXTURE_HERDR, Harness, Outcome, PairCase, Report, _queue_snapshot, _state,
+    FIXTURE_HERDR, Harness, Outcome, PairCase, Report, _queue_snapshot, _revive_interop, _state,
     init_case_repository,
 )
 
@@ -30,7 +30,7 @@ _COMMON = ("--herdr-bin", "<HERDR>", "--registry", "<ROOT>/registry")
 _GOAL_COMMAND = ("--goal-command-json", '["<HERDR>","goal-rpc"]')
 _CAPABILITIES = ["send", "status", "read", "wait", "stop", "attach", "pause", "resume",
                  "terminal-snapshot", "drain", "goal", "bind-session"]
-_OWNED_CAPABILITIES = [*_CAPABILITIES, "move", "anchor", "rename"]
+_OWNED_CAPABILITIES = [*_CAPABILITIES, "move", "anchor", "rename", "revive"]
 _ADOPTED_CAPABILITIES = [*_CAPABILITIES, "anchor", "rename"]
 _SHELL_IDENTITY_FIELDS = {
     "version", "boot_id", "pid", "starttime_ticks",
@@ -2093,6 +2093,7 @@ def build_report(python_command: Sequence[str], rust_command: Sequence[str]) -> 
             _legacy_adopted_registry_and_queue(harness, report)
             _ownership(harness, report)
             _managed_dead_recovery(harness, report)
+            _revive_interop(harness, report)
             _adoption(harness, report)
             _identity_and_rename(harness, report)
             _invalid_cli(harness, report)

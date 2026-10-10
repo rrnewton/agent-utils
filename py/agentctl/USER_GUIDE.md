@@ -408,6 +408,48 @@ fails, its retained status record uses a generic diagnostic so terminal-control
 errors cannot copy a value into later status output; the immediate command still
 reports the launch failure to its caller.
 
+### Revive a dead owned harness
+
+After a harness is killed or its terminal server restarts, its registry record
+can still say `running`. Inspect the recovery plan, then resume its recorded
+native conversation in a fresh tab:
+
+```sh
+agentctl revive reviewer --dry-run
+agentctl revive reviewer
+agentctl revive --all --dry-run
+agentctl revive --all
+```
+
+Revive requires proof that the recorded harness process is dead and that its
+old presentation is either absent or the same idle shell in a one-pane tab.
+A live process, a server outage, changed pane ownership, or an unknown native
+conversation blocks recovery. Adopted agents, headless workers, and remote
+agentcloud sessions are not eligible. `--expected-token TOKEN` binds a named
+revive to the old generation; it does not apply to `--all`. The replacement
+startup deadline is `--startup-timeout SECONDS`, greater than zero and at most
+300 seconds, default 30.
+
+The recorded model, reasoning effort, literal policy arguments, cwd, pause
+state, and slot isolation are retained. A recorded profile must still match
+those launch settings. Environment values come from that private profile;
+records store only their names. A changed or missing profile, an unrecoverable
+literal environment, or a changed slot mapping blocks revival before launch.
+
+Once the replacement is verified, the complete old generation is archived,
+including its queue, quarantine, and terminal output. The stale pane and its
+one-pane tab are closed after publication. Old queued prompts and goal delivery
+receipts are never replayed into the replacement; the recorded goal text remains
+available for the coordinator to inspect and assign deliberately.
+
+An interrupted revive reserves the name and both generations. Rerun the same
+command to finish publication or stale-tab cleanup; it never starts a second
+replacement. If a launch was interrupted before usable process and terminal
+anchors were saved, recovery remains blocked and identifies the retained
+candidate record and terminal for inspection. `--dry-run` does not change
+records, locks, tabs, or processes. Batch recovery skips live and non-running
+records, continues past blocked names, and exits 75 if any name remains blocked.
+
 ### Adopt an existing Herdr agent
 
 An agent that is already running in Herdr can join the same named registry

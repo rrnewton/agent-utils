@@ -25,12 +25,13 @@ use crate::agent::{self, AgentApi, AgentError, DrainOptions, QueueResult, Target
 use crate::client::{
     muse_idle_composer, muse_prompt_in_composer, muse_prompt_transcript_count,
     muse_startup_metadata, muse_trust_prompt, AgentIdentity, AgentPaneInfo, CustomProcessIdentity,
-    HerdrClient, Pane, PaneShellProof,
+    HerdrClient, Pane, PaneShellProof, ProcessLiveness,
 };
 use crate::error::{AdapterError, AdapterErrorKind};
 use crate::submission::{GuardedInput, GuardedPrompt, Submission, SubmitTimeouts};
 
 mod cloud;
+mod revive;
 
 pub(crate) use cloud::{
     validate_create_arguments as validate_cloud_create_arguments, CLOUD_DRIVERS,
@@ -165,13 +166,14 @@ where
     AfterRename: FnOnce(&PinnedAgentDirectory, &str, &str) -> Result<()>,
 {
     let (after_write, after_rename) = hooks;
-    if !matches!(name, "agent.json" | "output.json") {
+    if !matches!(name, "agent.json" | "output.json") && !revive::artifact_name_allowed(pinned, name)
+    {
         return Err(fail("unsupported pinned registry artifact name").into());
     }
-    let limit = if name == "agent.json" {
-        MAX_AGENT_RECORD_BYTES
-    } else {
+    let limit = if name == "output.json" {
         MAX_SNAPSHOT_BYTES
+    } else {
+        MAX_AGENT_RECORD_BYTES
     };
     if content.len() > limit {
         return Err(fail(format!("refusing {name} larger than {limit} bytes")).into());
@@ -775,11 +777,6 @@ pub fn harness_arguments(
             }
         }
         "muse" => {
-            if resume.is_some() {
-                return Err(fail(
-                    "interactive Muse resume is not supported; use literal owner-configured argv",
-                ));
-            }
             if let Some(model) = model.filter(|value| !value.is_empty()) {
                 arguments.extend(["--model".to_owned(), model.to_owned()]);
             }
@@ -793,6 +790,11 @@ pub fn harness_arguments(
         return Err(fail("harness arguments must contain no NUL"));
     }
     arguments.extend_from_slice(extra);
+    if harness == "muse" {
+        if let Some(resume) = resume.filter(|value| !value.is_empty()) {
+            arguments.extend(["resume".to_owned(), resume.to_owned()]);
+        }
+    }
     Ok(arguments)
 }
 
@@ -825,6 +827,10 @@ pub fn environment_entries(values: &[String]) -> Result<Vec<String>> {
 
 /// Lifecycle operations in addition to the existing interactive messaging API.
 pub trait ManagedApi: AgentApi {
+    /// Read kernel evidence for one pinned process generation; unavailable evidence is unknown.
+    fn process_liveness(&self, _expected: &CustomProcessIdentity) -> ProcessLiveness {
+        ProcessLiveness::Unknown
+    }
     /// Resolve a unique workspace label.
     fn workspace_id_for_label(&self, label: &str) -> crate::error::Result<Option<String>>;
     /// Create a workspace and return its workspace, tab, and pane IDs.
@@ -1237,6 +1243,9 @@ pub trait ManagedApi: AgentApi {
 }
 
 impl ManagedApi for HerdrClient {
+    fn process_liveness(&self, expected: &CustomProcessIdentity) -> ProcessLiveness {
+        HerdrClient::process_liveness(self, expected)
+    }
     fn agent_pane(&self, name: &str) -> crate::error::Result<String> {
         HerdrClient::agent_pane(self, name)
     }
@@ -1584,6 +1593,9 @@ impl NativeSession {
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 struct AgentRecord {
+    /// Private launch storage; serialized records cannot request another write directory.
+    #[serde(skip)]
+    storage_directory: Option<StorageDirectory>,
     #[serde(default = "herdr_adapter")]
     adapter: String,
     #[serde(default = "interactive_mode")]
@@ -1665,6 +1677,13 @@ struct AgentRecord {
     #[serde(default)]
     goal_messages: BTreeMap<String, String>,
     goal_message_id: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct StorageDirectory {
+    path: PathBuf,
+    device: u64,
+    inode: u64,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -2319,6 +2338,13 @@ fn registry_claims(
                     .and_then(Value::as_str)
                     .map(str::to_owned),
             ));
+        }
+    }
+    for record in revive::pending_claim_records(registry).map_err(|error| error.to_string())? {
+        if record.name != exclude {
+            if let Some(pane) = record.pane_id {
+                claims.push((record.name, pane, record.terminal_id));
+            }
         }
     }
     Ok(claims)
@@ -3978,6 +4004,8 @@ pub struct ManagedAgents<'a, A: ManagedApi + ?Sized> {
     inherited_workspace: Option<String>,
     /// Executables for agentcloud-backed agents.
     cloud_tools: CloudTools,
+    #[cfg(test)]
+    revive_wrkslots_executable: Option<PathBuf>,
 }
 
 impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
@@ -3999,6 +4027,8 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
             project_workspace_override: None,
             inherited_workspace,
             cloud_tools: CloudTools::default(),
+            #[cfg(test)]
+            revive_wrkslots_executable: None,
         })
     }
 
@@ -4448,6 +4478,16 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
     }
 
     fn save(&self, record: &AgentRecord) -> Result<()> {
+        if let Some(storage) = record.storage_directory.as_ref() {
+            let pinned = revive::pin_directory(&storage.path, &record.name)?;
+            if (pinned.device, pinned.inode) != (storage.device, storage.inode) {
+                return Err(fail("staged revive directory changed before save"));
+            }
+            let content = revive::record_document_bytes(record)?;
+            atomic_replace_bytes(&pinned, "agent.json", &content).map_err(|error| *error.error)?;
+            Self::verify_pinned_agent_directory(&pinned)?;
+            return Ok(());
+        }
         agent::atomic_json(
             &self.directory(&record.name)?.join("agent.json"),
             &json!(record),
@@ -4727,7 +4767,7 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
                 journal.old, journal.new, journal.old, journal.new
             )));
         }
-        Ok(())
+        self.refuse_pending_revive(names)
     }
 
     fn write_rename_journal(&self, journal: &RenameJournal) -> Result<()> {
@@ -4843,6 +4883,7 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
 
     /// Rename a live agent: registry entry, Herdr agent name and tab label together.
     pub fn rename(&self, old: &str, new: &str) -> Result<Value> {
+        self.refuse_pending_revive(&[old, new])?;
         name(old)?;
         name(new)?;
         if old == new {
@@ -5448,7 +5489,7 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
             if name(&existing_name).is_err() || Some(existing_name.as_str()) == exclude {
                 continue;
             }
-            let other = self.load(&existing_name)?;
+            let other = self.read_record(&existing_name)?;
             if (other.session_agent.as_deref().unwrap_or(&other.harness) == session_agent
                 && (other.session_value.as_deref() == Some(session_value)
                     || other.goal_session_id.as_deref() == Some(session_value)
@@ -5456,6 +5497,19 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
                 || other.native_session.as_ref().is_some_and(|native| {
                     native.agent == session_agent && native.value == session_value
                 })
+            {
+                return Ok(Some(other));
+            }
+        }
+        for other in revive::pending_claim_records(&self.registry)? {
+            if Some(other.name.as_str()) != exclude
+                && ((other.session_agent.as_deref().unwrap_or(&other.harness) == session_agent
+                    && (other.session_value.as_deref() == Some(session_value)
+                        || other.goal_session_id.as_deref() == Some(session_value)
+                        || other.resume.as_deref() == Some(session_value)))
+                    || other.native_session.as_ref().is_some_and(|native| {
+                        native.agent == session_agent && native.value == session_value
+                    }))
             {
                 return Ok(Some(other));
             }
@@ -5697,6 +5751,7 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
             .duration_since(UNIX_EPOCH)
             .map_err(|error| fail(error.to_string()))?;
         let mut record = AgentRecord {
+            storage_directory: None,
             adapter: if relay_command.is_some() {
                 "herdr-relay".to_owned()
             } else if options.harness == "muse" {
@@ -5761,6 +5816,7 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
             project_workspace.as_deref(),
             slot_command.as_deref(),
             relay_command.as_deref(),
+            None,
         );
         if let Err(error) = launched {
             record.lifecycle = "launch_failed".to_owned();
@@ -5912,13 +5968,27 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
             )));
         }
         let shell_identity = self.client.pane_shell_identity(&info.pane_id)?;
+        if let Some(owner) = self.claim_owner(&info.pane_id, info.terminal_id.as_deref(), None)? {
+            return Err(fail(format!(
+                "pane {:?} is already registered as {owner:?}",
+                options.pane_id
+            )));
+        }
+        if let (Some(kind), Some(value)) = (&info.session_agent, &info.session_value) {
+            if let Some(owner) = self.identity_owner(kind, value, None)? {
+                return Err(fail(format!(
+                    "native session is already registered as {:?}",
+                    owner.name
+                )));
+            }
+        }
         for entry in fs::read_dir(&self.registry).map_err(|error| fail(error.to_string()))? {
             let entry = entry.map_err(|error| fail(error.to_string()))?;
             let existing_name = entry.file_name().to_string_lossy().into_owned();
             if name(&existing_name).is_err() {
                 continue;
             }
-            let other = self.load(&existing_name)?;
+            let other = self.read_record(&existing_name)?;
             let same_session = info.session_value.is_some()
                 && ((other.session_agent.as_deref().unwrap_or(&other.harness)
                     == info.session_agent.as_deref().unwrap_or("")
@@ -5998,6 +6068,7 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
             .duration_since(UNIX_EPOCH)
             .map_err(|error| fail(error.to_string()))?;
         let mut record = AgentRecord {
+            storage_directory: None,
             adapter: "herdr-foreign".to_owned(),
             mode: interactive_mode(),
             backend: herdr_adapter(),
@@ -6115,6 +6186,7 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
         project_workspace: Option<&str>,
         slot_command: Option<&str>,
         relay_command: Option<&str>,
+        exclusion: Option<&revive::CensusExclusion>,
     ) -> Result<()> {
         self.create_presentation(record, options, project_workspace)?;
         let pane_id = record.pane_id.clone().expect("new tab has pane");
@@ -6173,7 +6245,7 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
                 options.startup_timeout,
             )?;
         }
-        let info = agent::resolve_target(
+        let info = self.resolve_recovery_target(
             &WorkspaceClient {
                 client: self.client,
                 record,
@@ -6185,6 +6257,8 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
                 readback: None,
             },
             &self.target(record)?,
+            exclusion,
+            record.workspace_id.as_deref(),
         )?;
         record.capture_native_session(&info)?;
         let terminal_id = info.terminal_id;
@@ -6218,7 +6292,9 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
             }
         }
         if record.session_value.is_some() {
-            if let Err(error) = agent::resolve_target(self.client, &self.target(record)?) {
+            if let Err(error) =
+                self.resolve_recovery_target(self.client, &self.target(record)?, exclusion, None)
+            {
                 record.session_agent = None;
                 record.session_value = None;
                 return Err(fail(format!(
@@ -6229,8 +6305,9 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
         self.anchor_fresh(record, terminal_id)?;
         record.lifecycle = "running".to_owned();
         self.save(record)?;
-        let final_info = match agent::resolve_target(self.client, &self.target(record)?)
-            .and_then(|_| self.checked(record))
+        let final_info = match self
+            .resolve_recovery_target(self.client, &self.target(record)?, exclusion, None)
+            .and_then(|_| self.checked_with_recovery(record, exclusion))
         {
             Ok(info) => info,
             Err(error) => {
@@ -6314,7 +6391,15 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
     }
 
     fn checked(&self, record: &AgentRecord) -> Result<AgentPaneInfo> {
-        agent::resolve_target(
+        self.checked_with_recovery(record, None)
+    }
+
+    fn checked_with_recovery(
+        &self,
+        record: &AgentRecord,
+        exclusion: Option<&revive::CensusExclusion>,
+    ) -> Result<AgentPaneInfo> {
+        self.resolve_recovery_target(
             &WorkspaceClient {
                 client: self.client,
                 record,
@@ -6326,6 +6411,8 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
                 readback: None,
             },
             &self.target(record)?,
+            exclusion,
+            record.workspace_id.as_deref(),
         )
     }
 
@@ -8841,6 +8928,11 @@ pub(crate) mod tests {
                     add_sibling_on_read: AtomicBool::new(false),
                     require_start_lock: AtomicBool::new(false),
                     started: AtomicBool::new(false),
+                    fresh_presentations: AtomicBool::new(false),
+                    dead_panes: Mutex::new(BTreeSet::new()),
+                    stale_reported_panes: Mutex::new(BTreeSet::new()),
+                    liveness_unknown: AtomicBool::new(false),
+                    custom_processes: Mutex::new(BTreeMap::new()),
                     launches: Mutex::new(BTreeMap::new()),
                     session_override: Mutex::new(None),
                     report_session: AtomicBool::new(true),
@@ -9020,6 +9112,11 @@ pub(crate) mod tests {
         add_sibling_on_read: AtomicBool,
         require_start_lock: AtomicBool,
         started: AtomicBool,
+        fresh_presentations: AtomicBool,
+        dead_panes: Mutex<BTreeSet<String>>,
+        stale_reported_panes: Mutex<BTreeSet<String>>,
+        liveness_unknown: AtomicBool,
+        custom_processes: Mutex<BTreeMap<String, CustomProcessIdentity>>,
         launches: Mutex<BTreeMap<String, (String, Vec<String>)>>,
         session_override: Mutex<Option<(Option<String>, Option<String>)>>,
         report_session: AtomicBool,
@@ -9242,9 +9339,13 @@ pub(crate) mod tests {
                         .as_deref()
                         == Some("running");
             let changed_after_save = changed_after_save || owned_changed_after_save;
-            let report_session = self.report_session.load(Ordering::Relaxed)
-                || changed_after_save
-                || pane == "reported";
+            let dead = self.dead_panes.lock().unwrap().contains(pane);
+            let stale_report = self.stale_reported_panes.lock().unwrap().contains(pane);
+            let report_session = stale_report
+                || (!dead
+                    && (self.report_session.load(Ordering::Relaxed)
+                        || changed_after_save
+                        || pane == "reported"));
             let launch = self.launches.lock().unwrap().get(pane).cloned();
             let kind = launch
                 .as_ref()
@@ -9309,9 +9410,7 @@ pub(crate) mod tests {
                 } else {
                     self.root.display().to_string()
                 },
-                agent: self
-                    .started
-                    .load(Ordering::Relaxed)
+                agent: (stale_report || (self.started.load(Ordering::Relaxed) && !dead))
                     .then(|| kind.to_owned()),
                 status: self
                     .status
@@ -9449,6 +9548,33 @@ pub(crate) mod tests {
         }
     }
     impl ManagedApi for Fake {
+        fn process_liveness(&self, expected: &CustomProcessIdentity) -> ProcessLiveness {
+            if self.liveness_unknown.load(Ordering::Relaxed) {
+                return ProcessLiveness::Unknown;
+            }
+            let dead = self.dead_panes.lock().unwrap();
+            for (pane, pid) in self.harness_pids.lock().unwrap().iter() {
+                if Self::harness(*pid) == *expected {
+                    return if dead.contains(pane) {
+                        ProcessLiveness::Dead
+                    } else if self.started.load(Ordering::Relaxed) {
+                        ProcessLiveness::Alive
+                    } else {
+                        ProcessLiveness::Unknown
+                    };
+                }
+            }
+            for (pane, identity) in self.custom_processes.lock().unwrap().iter() {
+                if identity == expected {
+                    return if dead.contains(pane) {
+                        ProcessLiveness::Dead
+                    } else {
+                        ProcessLiveness::Alive
+                    };
+                }
+            }
+            ProcessLiveness::Unknown
+        }
         fn workspace_id_for_label(&self, label: &str) -> AdapterResult<Option<String>> {
             Ok(match label {
                 "subagents" => Some("workspace".to_owned()),
@@ -9481,17 +9607,32 @@ pub(crate) mod tests {
             _: &str,
             environment: &[String],
         ) -> AdapterResult<(String, String)> {
-            self.environments.lock().unwrap().push(environment.to_vec());
+            let allocation = {
+                let mut environments = self.environments.lock().unwrap();
+                environments.push(environment.to_vec());
+                environments.len()
+            };
+            let fresh = self.fresh_presentations.load(Ordering::Relaxed) && allocation > 1;
+            let tab = if fresh {
+                format!("tab-{allocation}")
+            } else {
+                "tab".to_owned()
+            };
+            let pane = if fresh {
+                format!("owned-{allocation}")
+            } else {
+                "owned".to_owned()
+            };
             self.labels
                 .lock()
                 .unwrap()
-                .insert("tab".to_owned(), label.to_owned());
+                .insert(tab.clone(), label.to_owned());
             self.panes.lock().unwrap().push(Pane {
-                pane_id: "owned".to_owned(),
-                tab_id: "tab".to_owned(),
+                pane_id: pane.clone(),
+                tab_id: tab.clone(),
                 workspace_id: workspace.to_owned(),
             });
-            Ok(("tab".to_owned(), "owned".to_owned()))
+            Ok((tab, pane))
         }
         fn move_pane_to_new_tab(
             &self,
@@ -9558,6 +9699,9 @@ pub(crate) mod tests {
             }
             self.closed.lock().unwrap().push(pane.to_owned());
             self.panes.lock().unwrap().retain(|p| p.pane_id != pane);
+            if self.fresh_presentations.load(Ordering::Relaxed) {
+                self.herdr_closed.lock().unwrap().insert(pane.to_owned());
+            }
             if self.fail_after_close.swap(false, Ordering::Relaxed) {
                 return Err(AdapterError::unavailable(
                     "injected result loss after close",
@@ -9652,7 +9796,9 @@ pub(crate) mod tests {
             pane: &str,
             _kind: &str,
         ) -> AdapterResult<Option<CustomProcessIdentity>> {
-            if !self.started.load(Ordering::Relaxed) {
+            if !self.started.load(Ordering::Relaxed)
+                || self.dead_panes.lock().unwrap().contains(pane)
+            {
                 return Ok(None);
             }
             let mut pids = self.harness_pids.lock().unwrap();
@@ -9667,6 +9813,7 @@ pub(crate) mod tests {
             expected: &CustomProcessIdentity,
         ) -> AdapterResult<bool> {
             Ok(self.started.load(Ordering::Relaxed)
+                && !self.dead_panes.lock().unwrap().contains(pane)
                 && self
                     .panes
                     .lock()
@@ -9862,7 +10009,17 @@ pub(crate) mod tests {
                 .insert(pane.to_owned(), (kind.to_owned(), arguments.to_vec()));
             self.started.store(true, Ordering::Relaxed);
             self.custom_alive.store(true, Ordering::Relaxed);
-            persist_identity(Self::custom_identity())?;
+            let mut identity = Self::custom_identity();
+            if self.fresh_presentations.load(Ordering::Relaxed) {
+                let generation = self.environments.lock().unwrap().len() as u64 - 1;
+                identity.pid += generation;
+                identity.starttime_ticks += generation;
+                self.custom_processes
+                    .lock()
+                    .unwrap()
+                    .insert(pane.to_owned(), identity.clone());
+            }
+            persist_identity(identity)?;
             if self.custom_fails_after_identity.load(Ordering::Relaxed) {
                 let record =
                     agent::read_private_json(&self.root.join("registry/worker/agent.json"))
@@ -9882,12 +10039,20 @@ pub(crate) mod tests {
         }
         fn verify_custom_harness(
             &self,
-            _: &str,
+            pane: &str,
             _: &str,
             identity: Option<&CustomProcessIdentity>,
         ) -> AdapterResult<()> {
+            let custom = self
+                .custom_processes
+                .lock()
+                .unwrap()
+                .get(pane)
+                .cloned()
+                .unwrap_or_else(Self::custom_identity);
             if self.custom_alive.load(Ordering::Relaxed)
-                && identity.is_none_or(|identity| identity == &Self::custom_identity())
+                && !self.dead_panes.lock().unwrap().contains(pane)
+                && identity.is_none_or(|identity| identity == &custom)
             {
                 Ok(())
             } else {
@@ -9918,12 +10083,14 @@ pub(crate) mod tests {
                 && self.custom_at_idle_shell.load(Ordering::Relaxed)
                 && *expected == *self.foreign_shell_identity.lock().unwrap())
         }
-        fn pane_idle_shell_identity(&self, _: &str) -> AdapterResult<Option<PaneShellProof>> {
+        fn pane_idle_shell_identity(&self, pane: &str) -> AdapterResult<Option<PaneShellProof>> {
             if self.fail_shell_proof.load(Ordering::Relaxed) {
                 return Err(AdapterError::unavailable("injected procfs proof failure"));
             }
-            let proof = (!self.custom_alive.load(Ordering::Relaxed)
-                && self.custom_at_idle_shell.load(Ordering::Relaxed))
+            let proof = (self.dead_panes.lock().unwrap().contains(pane)
+                || (!self.custom_alive.load(Ordering::Relaxed)
+                    && self.custom_at_idle_shell.load(Ordering::Relaxed))
+                    && !self.fresh_presentations.load(Ordering::Relaxed))
             .then(|| PaneShellProof {
                 identity: self.foreign_shell_identity.lock().unwrap().clone(),
                 executable_path: self.foreign_shell_path.lock().unwrap().clone(),
@@ -9937,7 +10104,12 @@ pub(crate) mod tests {
             }
             Ok(proof)
         }
-        fn agent_pane(&self, _: &str) -> AdapterResult<String> {
+        fn agent_pane(&self, name: &str) -> AdapterResult<String> {
+            if self.fresh_presentations.load(Ordering::Relaxed) {
+                if let Some(pane) = self.herdr_names.lock().unwrap().get(name) {
+                    return Ok(pane.clone());
+                }
+            }
             Ok(self.named_pane.lock().unwrap().clone())
         }
         fn report_agent_session(&self, _: &str, _: &str, _: &str, _: &str) -> AdapterResult<()> {
@@ -14624,4 +14796,6 @@ pub(crate) mod tests {
     mod identity;
     /// Recorded conversation and launch policy, with no status-time mutation.
     mod recovery_metadata;
+    /// Resume recovery, immutable planning, exact publication and crash reconciliation.
+    mod revive;
 }

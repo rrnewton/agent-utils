@@ -464,6 +464,38 @@ def _prepare(root: str) -> tuple[str, str, str, str]:
     return paths
 
 
+def _queue_directory_identity(root: str) -> tuple[int, int]:
+    """Remember the private queue generation before waiting on one of its locks."""
+    try:
+        metadata = os.stat(root, follow_symlinks=False)
+    except OSError as exc:
+        raise AgentDeliveryError(f"cannot inspect queue directory {root}: {exc}") from exc
+    if not stat.S_ISDIR(metadata.st_mode) or metadata.st_uid != os.getuid():
+        raise AgentDeliveryError(f"unsafe queue directory: {root}")
+    if stat.S_IMODE(metadata.st_mode) & 0o077:
+        raise AgentDeliveryError(f"queue directory is not private: {root}")
+    return metadata.st_dev, metadata.st_ino
+
+
+def _verify_queue_lock(
+    root: str, directory_identity: tuple[int, int], path: str, descriptor: int, purpose: str,
+) -> None:
+    """A lock on an archived or replaced inode cannot protect the reused queue path."""
+    if _queue_directory_identity(root) != directory_identity:
+        raise AgentDeliveryError(f"queue directory changed while waiting for {purpose}: {root}")
+    try:
+        current = os.stat(path, follow_symlinks=False)
+        opened = os.fstat(descriptor)
+    except OSError as exc:
+        raise AgentDeliveryError(f"cannot inspect {purpose} after locking {path}: {exc}") from exc
+    for metadata in (current, opened):
+        if (not stat.S_ISREG(metadata.st_mode) or metadata.st_uid != os.getuid()
+                or stat.S_IMODE(metadata.st_mode) & 0o077):
+            raise AgentDeliveryError(f"unsafe {purpose}: {path}")
+    if (current.st_dev, current.st_ino) != (opened.st_dev, opened.st_ino):
+        raise AgentDeliveryError(f"{purpose} changed while waiting: {path}")
+
+
 def _atomic_policy_directory(policy: AtomicWritePolicy) -> int:
     _validate_artifact_limit(policy.max_bytes)
     parent = os.path.dirname(policy.directory)
@@ -1177,9 +1209,11 @@ def _enqueue(
     descriptor = -1
     try:
         if serialize:
+            directory_identity = _queue_directory_identity(root)
             lock_path = os.path.join(root, ".delivery.lock")
             descriptor = _open_private_lock(lock_path, "queue delivery lock")
             fcntl.flock(descriptor, fcntl.LOCK_EX)
+            _verify_queue_lock(root, directory_identity, lock_path, descriptor, "queue delivery lock")
         if any(os.path.lexists(os.path.join(directory, filename)) for directory in (inbox, inflight, processed, failed)):
             raise AgentDeliveryError(f"message id already exists: {identifier}")
         try:
@@ -1475,18 +1509,20 @@ def _lock_resolved_target(
 def _bind_queue(
     root: str, target: Target, *, max_artifact_bytes: int | None = None,
     allow_legacy_workspace_binding: bool = False,
-) -> None:
+) -> tuple[int, int]:
     """Create or verify the durable queue-to-target binding under its own lock."""
     if not (target.pane_id or target.session_value):
         raise AgentDeliveryError("target needs --pane or a stable session value")
     max_artifact_bytes = _effective_artifact_limit(max_artifact_bytes)
     _prepare(root)
+    directory_identity = _queue_directory_identity(root)
     lock_path = os.path.join(root, ".binding.lock")
     binding_path = os.path.join(root, "target.json")
     descriptor = _open_private_lock(lock_path, "queue binding lock")
     expected = _binding(target)
     try:
         fcntl.flock(descriptor, fcntl.LOCK_EX)
+        _verify_queue_lock(root, directory_identity, lock_path, descriptor, "queue binding lock")
         policy = _ACTIVE_ATOMIC_POLICY.get()
         if policy is not None:
             # Bootstrap binding is read before the delivery lock/recovery
@@ -1513,6 +1549,7 @@ def _bind_queue(
             _atomic_json(binding_path, expected, max_artifact_bytes=max_artifact_bytes)
     finally:
         os.close(descriptor)
+    return directory_identity
 
 
 def rebind_queue(root: str, previous: Target, replacement: Target) -> None:
@@ -1526,6 +1563,7 @@ def rebind_queue(root: str, previous: Target, replacement: Target) -> None:
         if not (target.pane_id or target.session_value):
             raise AgentDeliveryError("target needs --pane or a stable session value")
     _prepare(root)
+    directory_identity = _queue_directory_identity(root)
     delivery_path = os.path.join(root, ".delivery.lock")
     binding_lock_path = os.path.join(root, ".binding.lock")
     binding_path = os.path.join(root, "target.json")
@@ -1533,10 +1571,12 @@ def rebind_queue(root: str, previous: Target, replacement: Target) -> None:
     binding_descriptor = -1
     try:
         fcntl.flock(delivery_descriptor, fcntl.LOCK_EX)
+        _verify_queue_lock(root, directory_identity, delivery_path, delivery_descriptor, "queue delivery lock")
         binding_descriptor = _open_private_lock(
             binding_lock_path, "queue binding lock"
         )
         fcntl.flock(binding_descriptor, fcntl.LOCK_EX)
+        _verify_queue_lock(root, directory_identity, binding_lock_path, binding_descriptor, "queue binding lock")
         old = _binding(previous)
         new = _binding(replacement)
         if os.path.lexists(binding_path):
@@ -1575,6 +1615,7 @@ def rebind_queue_after(
     if not (previous.pane_id or previous.session_value):
         raise AgentDeliveryError("target needs --pane or a stable session value")
     _prepare(root)
+    directory_identity = _queue_directory_identity(root)
     delivery_path = os.path.join(root, ".delivery.lock")
     binding_lock_path = os.path.join(root, ".binding.lock")
     binding_path = os.path.join(root, "target.json")
@@ -1582,8 +1623,10 @@ def rebind_queue_after(
     binding_descriptor = -1
     try:
         fcntl.flock(delivery_descriptor, fcntl.LOCK_EX)
+        _verify_queue_lock(root, directory_identity, delivery_path, delivery_descriptor, "queue delivery lock")
         binding_descriptor = _open_private_lock(binding_lock_path, "queue binding lock")
         fcntl.flock(binding_descriptor, fcntl.LOCK_EX)
+        _verify_queue_lock(root, directory_identity, binding_lock_path, binding_descriptor, "queue binding lock")
         old = _binding(previous)
         if os.path.lexists(binding_path):
             actual = _read_queue_json(
@@ -1889,11 +1932,11 @@ def _drain(
     intact; a failed post-submission update retains the durable inflight barrier.
     """
     max_artifact_bytes = _effective_artifact_limit(max_artifact_bytes)
-    _bind_queue(
+    directory_identity = _bind_queue(
         root, target, max_artifact_bytes=max_artifact_bytes,
         allow_legacy_workspace_binding=allow_legacy_workspace_binding,
     )
-    inbox, inflight, processed, failed = _prepare(root)
+    inbox, inflight, processed, failed = _dirs(root)
     lock_path = os.path.join(root, ".delivery.lock")
     delivered: list[str] = []
     quarantined: list[str] = []
@@ -1904,6 +1947,7 @@ def _drain(
     initial_info: AgentPaneInfo | None = None
     try:
         fcntl.flock(descriptor, fcntl.LOCK_EX)
+        _verify_queue_lock(root, directory_identity, lock_path, descriptor, "queue delivery lock")
         policy = _ACTIVE_ATOMIC_POLICY.get()
         if policy is not None:
             # enqueue's create-only final may still share the fixed slot after

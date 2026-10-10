@@ -100,6 +100,11 @@ enum Commands {
         after_help = "Examples:\n  agentctl stop reviewer\n  agentctl stop sub-cloud-worker\n\nFor an agentcloud agent, stop runs `agentcloudctl halt` (the open run is interrupted and no new\nrun starts), closes the recorded agentterm pane, runs `agentcloudctl archive`, and archives the\nregistry record. A halt failure changes nothing locally. stop does not release the node\nreservation; the orchestrator releases it on its own schedule after the halted session goes\nidle (check `agentcloudctl inspect -s SESSION_ID`)."
     )]
     Stop(Stop),
+    /// Relaunch a dead owned local agent from its recorded conversation and launch policy, preserving its old queue in the archive
+    #[command(
+        after_help = "Examples:\n  agentctl revive reviewer\n  agentctl revive --all --dry-run\n  agentctl revive reviewer --expected-token TOKEN\n\nA live or unverifiable harness is never relaunched. Recovery opens a fresh tab, verifies the\nresumed runtime, archives the complete old generation, then closes only its proved stale pane.\nAn interrupted revive reserves the name until the same command finishes publication or cleanup.\nAdopted agents, headless workers, and remote agentcloud sessions are refused."
+    )]
+    Revive(Revive),
     /// List registered agents with live status or an explicit probe error
     #[command(after_help = "Example: agentctl list --registry .agentctl")]
     List,
@@ -161,6 +166,29 @@ enum Commands {
 struct Named {
     /// Registered agent name (1-32 lowercase letters, digits, and hyphens)
     name: String,
+}
+
+#[derive(Args)]
+struct Revive {
+    /// Registered name to recover; required unless --all
+    #[arg(
+        value_name = "NAME",
+        required_unless_present = "all",
+        conflicts_with = "all"
+    )]
+    name: Option<String>,
+    /// Inspect every registered generation and continue through independent recovery refusals
+    #[arg(long, conflicts_with_all = ["name", "expected_token"])]
+    all: bool,
+    /// Print safe recovery plans without changing records, tabs, queues, or lock files
+    #[arg(long)]
+    dry_run: bool,
+    /// Require this exact old generation token; applies only to a named revive
+    #[arg(long, requires = "name", value_name = "TOKEN")]
+    expected_token: Option<String>,
+    /// Startup-readiness deadline in seconds, greater than 0 and at most 300 (default: 30)
+    #[arg(long, default_value = "30", value_parser = startup_seconds, value_name = "SECONDS")]
+    startup_timeout: f64,
 }
 
 #[derive(Args)]
@@ -1231,6 +1259,31 @@ fn run(args: Cli, environment: &dyn Fn(&str) -> Option<String>) -> Result<i32, F
                 },
             )?
         }
+        Commands::Revive(value) => {
+            let timeout = Duration::from_secs_f64(value.startup_timeout);
+            let mut result = if value.all {
+                manager.revive_all(value.dry_run, timeout)?
+            } else {
+                manager.revive(
+                    value.name.as_deref().expect("clap requires NAME or --all"),
+                    value.dry_run,
+                    value.expected_token.as_deref(),
+                    timeout,
+                )?
+            };
+            add_capabilities(&mut result);
+            if let Some(agents) = result.get_mut("agents") {
+                add_capabilities(agents);
+            }
+            let code =
+                if !value.dry_run && result["blocked"].as_u64().is_some_and(|count| count > 0) {
+                    75
+                } else {
+                    0
+                };
+            write_json(&result).map_err(Failure::Output)?;
+            return Ok(code);
+        }
         Commands::List => json!(manager.list()?),
         Commands::Status(value) => manager.status(&value.name)?,
         Commands::Send(value) => {
@@ -1608,6 +1661,9 @@ fn add_capabilities(value: &mut serde_json::Value) {
             if matches!(adapter, Some("herdr" | "herdr-foreign")) {
                 capabilities.extend(["anchor", "rename"]);
             }
+            if matches!(adapter, Some("herdr" | "herdr-pane" | "herdr-relay")) {
+                capabilities.push("revive");
+            }
             json!(capabilities)
         } else {
             json!(["status"])
@@ -1619,6 +1675,89 @@ fn add_capabilities(value: &mut serde_json::Value) {
 mod tests {
     use super::*;
     use clap::CommandFactory;
+
+    #[test]
+    fn revive_requires_one_scope_and_limits_startup_deadlines() {
+        for arguments in [
+            vec!["agentctl", "revive"],
+            vec!["agentctl", "revive", "worker", "--all"],
+            vec![
+                "agentctl",
+                "revive",
+                "--all",
+                "--expected-token",
+                "generation",
+            ],
+            vec!["agentctl", "revive", "worker", "--startup-timeout", "0"],
+            vec!["agentctl", "revive", "worker", "--startup-timeout", "301"],
+            vec!["agentctl", "revive", "worker", "--startup-timeout", "NaN"],
+        ] {
+            assert_eq!(Cli::try_parse_from(arguments).err().unwrap().exit_code(), 2);
+        }
+        let parsed = Cli::try_parse_from([
+            "agentctl",
+            "revive",
+            "worker",
+            "--expected-token",
+            "generation",
+            "--dry-run",
+        ])
+        .unwrap();
+        let Some(Commands::Revive(value)) = parsed.command else {
+            panic!("revive command");
+        };
+        assert_eq!(value.name.as_deref(), Some("worker"));
+        assert_eq!(value.expected_token.as_deref(), Some("generation"));
+        assert!(value.dry_run);
+        assert!(!value.all);
+        assert_eq!(value.startup_timeout, 30.0);
+        assert!(Cli::try_parse_from([
+            "agentctl",
+            "revive",
+            "--all",
+            "--dry-run",
+            "--startup-timeout",
+            "300"
+        ])
+        .is_ok());
+        let help = Cli::try_parse_from(["agentctl", "revive", "--help"])
+            .err()
+            .unwrap()
+            .to_string();
+        for option in [
+            "NAME",
+            "--all",
+            "--dry-run",
+            "--expected-token",
+            "--startup-timeout",
+        ] {
+            assert!(help.contains(option));
+        }
+    }
+
+    #[test]
+    fn revive_capability_requires_an_owned_interactive_adapter() {
+        for (adapter, mode, expected) in [
+            ("herdr", "interactive", true),
+            ("herdr-pane", "interactive", true),
+            ("herdr-relay", "interactive", true),
+            ("herdr-foreign", "interactive", false),
+            ("codex-app-server", "headless", false),
+        ] {
+            let mut record =
+                json!({"name":"worker", "adapter":adapter, "mode":mode, "backend":"herdr"});
+            add_capabilities(&mut record);
+            assert_eq!(
+                record["capabilities"]
+                    .as_array()
+                    .unwrap()
+                    .contains(&json!("revive")),
+                expected,
+                "{adapter}"
+            );
+        }
+    }
+
     #[test]
     fn subcommands_have_local_help_and_registry_is_global() {
         Cli::command().debug_assert();

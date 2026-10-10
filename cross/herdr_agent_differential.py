@@ -10,10 +10,12 @@ compares durable queue transitions and crash-sensitive machine outcomes.
 from __future__ import annotations
 
 import json
+import hashlib
 import os
 import shlex
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -169,6 +171,166 @@ def composer_screen():
             lines.append("\u203a " + dim("Ask Codex to do anything"))
         lines += ["", "  tab to queue message" if busy and draft else "  model default \u00b7 project"]
     return "\n".join(lines) + "\n"
+
+def revive_fixture():
+    # Recovery needs an old idle pane and a distinct newly allocated pane. The kernel
+    # processes are children of the test driver, which kills and reaps only those children.
+    panes = state.setdefault("revive_panes", {})
+
+    def missing(kind, target):
+        print(json.dumps({"error": {"code": kind + "_not_found",
+              "message": "missing " + target}}), file=sys.stderr)
+        save()
+        raise SystemExit(1)
+
+    def pane_at(target):
+        pane = panes.get(target)
+        if pane is None or pane.get("closed"):
+            missing("pane", target)
+        return pane
+
+    def presentation(pane_id, pane):
+        return {"pane_id":pane_id, "tab_id":pane["tab_id"],
+                "workspace_id":pane["workspace_id"]}
+
+    def agent_identity(pane_id, pane):
+        return {"name":pane["name"], "pane_id":pane_id, "tab_id":pane["tab_id"],
+                "terminal_id":pane["terminal_id"]}
+
+    live = {pane_id:pane for pane_id, pane in panes.items() if not pane.get("closed")}
+    if args[:2] == ["pane", "list"]:
+        envelope({"panes":[presentation(pane_id, pane) for pane_id, pane in live.items()]})
+    elif args[:2] == ["pane", "get"]:
+        pane = pane_at(args[2])
+        idle = pane.get("empty_shell", True)
+        envelope({"pane": {**presentation(args[2], pane), "cwd":root,
+            "terminal_id":pane["terminal_id"], "agent":None if idle else pane["harness"],
+            "agent_status":"unknown" if idle else pane.get("status", "idle"),
+            "agent_session":None if idle else {
+                "agent":pane["harness"], "value":pane["session_value"],
+            },
+        }})
+    elif args[:2] == ["pane", "process-info"]:
+        pane_id = args[args.index("--pane") + 1]
+        pane = pane_at(pane_id)
+        shell_pid = state["fixture_shell_pid"]
+        if pane.get("empty_shell", True):
+            pid, executable = shell_pid, state["fixture_shell_executable"]
+        else:
+            pid, executable = pane["harness_pid"], "/usr/local/bin/" + pane["harness"]
+        envelope({"process_info": {"pane_id":pane_id, "shell_pid":shell_pid,
+            "foreground_process_group_id":pid,
+            "foreground_processes":[{"pid":pid, "name":os.path.basename(executable),
+                "cmdline":executable, "argv":[executable], "executable":executable}],
+        }})
+    elif args[:2] == ["tab", "create"]:
+        number = state.get("revive_tabs_created", 0) + 1
+        state["revive_tabs_created"] = number
+        pane_id, tab_id = "w1:p" + str(number), "w1:t" + str(number)
+        panes[pane_id] = {
+            "tab_id":tab_id, "workspace_id":args[args.index("--workspace") + 1],
+            "terminal_id":"term-" + str(number), "empty_shell":True,
+            "label":args[args.index("--label") + 1],
+        }
+        envelope({"tab":{"tab_id":tab_id}, "root_pane":presentation(pane_id, panes[pane_id])})
+    elif args[:2] == ["agent", "start"]:
+        pane = pane_at(args[args.index("--pane") + 1])
+        index = state.get("revive_launch_count", 0)
+        pids = state["revive_harness_pids"]
+        if index >= len(pids):
+            raise SystemExit("fixture refuses an unplanned extra harness launch")
+        launch = args[args.index("--") + 1:]
+        session = "session-1"
+        for selector in ("--session-id", "--resume", "resume"):
+            if selector in launch:
+                session = launch[launch.index(selector) + 1]
+                break
+        pane.update({"name":args[2], "harness":args[args.index("--kind") + 1],
+            "harness_pid":pids[index], "session_value":session, "empty_shell":False,
+            "status":"idle", "launch_arguments":launch,
+        })
+        state["revive_launch_count"] = index + 1
+        state.setdefault("revive_launch_arguments", []).append(launch)
+    elif args[:2] == ["agent", "get"]:
+        matches = [(pane_id, pane) for pane_id, pane in live.items()
+                   if not pane.get("empty_shell", True) and pane.get("name") == args[2]]
+        if len(matches) != 1:
+            missing("agent", args[2])
+        envelope({"agent":agent_identity(*matches[0])})
+    elif args[:2] == ["agent", "list"]:
+        envelope({"agents":[agent_identity(pane_id, pane) for pane_id, pane in live.items()
+                            if not pane.get("empty_shell", True) and pane.get("name")]})
+    elif args[:2] in (["tab", "get"], ["tab", "list"]):
+        tabs = [{"tab_id":pane["tab_id"], "workspace_id":pane["workspace_id"],
+                 "label":pane["label"], "pane_count":1} for pane in live.values()]
+        if args[1] == "list":
+            envelope({"tabs":tabs})
+        else:
+            matches = [tab for tab in tabs if tab["tab_id"] == args[2]]
+            if len(matches) != 1:
+                missing("tab", args[2])
+            envelope({"tab":matches[0]})
+    elif args[:2] == ["workspace", "get"]:
+        if args[2] != "w1":
+            missing("workspace", args[2])
+        envelope({"workspace":{"workspace_id":"w1", "label":"project"}})
+    elif args[:2] == ["workspace", "list"]:
+        envelope({"workspaces":[{"workspace_id":"w1", "label":"project"}]})
+    elif args[:2] == ["pane", "read"]:
+        pane = pane_at(args[2])
+        if args[2] == "w1:p1" and state.pop("revive_fail_old_read_once", False):
+            print("injected old output read interruption", file=sys.stderr)
+            save()
+            raise SystemExit(1)
+        source = args[args.index("--source") + 1]
+        if source == "visible" and not pane.get("empty_shell", True):
+            state["harness"], state["status"] = pane["harness"], pane.get("status", "idle")
+            sys.stdout.write(composer_screen())
+        else:
+            sys.stdout.write("preserved old terminal output\n")
+    elif args[:2] == ["pane", "close"]:
+        pane = pane_at(args[2])
+        if args[2] == "w1:p1" and state.pop("revive_fail_old_close_once", False):
+            print("injected stale pane close interruption", file=sys.stderr)
+            save()
+            raise SystemExit(1)
+        pane["closed"] = True
+        state.setdefault("closed_panes", []).append(args[2])
+    elif args[:2] == ["tab", "close"]:
+        matches = [pane_id for pane_id, pane in live.items() if pane["tab_id"] == args[2]]
+        if len(matches) != 1:
+            missing("tab", args[2])
+        pane_at(matches[0])["closed"] = True
+        state.setdefault("closed_tabs", []).append(args[2])
+    elif args[:2] in (["agent", "focus"], ["tab", "focus"]):
+        state["focused"] = args[2]
+    elif args[:2] == ["tab", "rename"]:
+        matches = [pane for pane in live.values() if pane["tab_id"] == args[2]]
+        if len(matches) != 1:
+            missing("tab", args[2])
+        matches[0]["label"] = " ".join(args[3:])
+    elif args[:2] == ["agent", "rename"]:
+        pane_at(args[2])["name"] = args[3]
+    elif args[:2] == ["status", "server"]:
+        print("status: running\nversion: 0.8.0\nprotocol: 20\ncapabilities: input-expect")
+    elif args[:2] == ["agent", "wait"]:
+        envelope({"agent":{"pane_id":args[2], "agent_status":"working"}})
+    elif args[:2] == ["pane", "report-agent-session"]:
+        pane_at(args[2])["session_value"] = args[args.index("--agent-session-id") + 1]
+    elif args[:2] in (["pane", "send-text"], ["pane", "send-keys"], ["agent", "prompt"]):
+        # Every input effect is observable, including a replay that never submits a prompt.
+        state.setdefault("revive_input_calls", []).append(args)
+        if args[:2] == ["agent", "prompt"]:
+            state.setdefault("submitted", []).append(args[3])
+    else:
+        print("unsupported recovery fixture call: " + repr(args), file=sys.stderr)
+        save()
+        raise SystemExit(2)
+    save()
+
+if state.get("revive_mode"):
+    revive_fixture()
+    raise SystemExit(0)
 
 if expected_terminal is not None and (
         not state.get("input_expect") or expected_terminal != current_terminal):
@@ -1155,6 +1317,313 @@ def _queue_snapshot(root: Path, queue: str) -> dict[str, object]:
                     )
             snapshot[_MESSAGE_ID.sub("<MESSAGE_ID>", relative)] = value
     return snapshot
+
+
+def _revive_document(path: Path) -> dict[str, object]:
+    value: object = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(value, dict):
+        raise AssertionError(f"recovery fixture is not an object: {path.name}")
+    return {str(key): item for key, item in value.items()}
+
+
+def _revive_tree(path: Path) -> dict[str, tuple[int, int, int, bytes | None]]:
+    """Capture all entries, including binding, lock, audit and quarantine artifacts."""
+    if not path.exists():
+        return {}
+    result: dict[str, tuple[int, int, int, bytes | None]] = {}
+    for entry in (path, *sorted(path.rglob("*"))):
+        metadata = entry.lstat()
+        if not stat.S_ISREG(metadata.st_mode) and not stat.S_ISDIR(metadata.st_mode):
+            raise AssertionError("recovery fixture must contain only regular files and directories")
+        result[entry.relative_to(path).as_posix()] = (
+            metadata.st_dev, metadata.st_ino, stat.S_IMODE(metadata.st_mode),
+            entry.read_bytes() if stat.S_ISREG(metadata.st_mode) else None,
+        )
+    return result
+
+
+def _revive_pane_state(root: Path, values: Mapping[str, object]) -> None:
+    state = _state(root)
+    panes = state.get("revive_panes")
+    if not isinstance(panes, dict) or not isinstance(panes.get("w1:p1"), dict):
+        raise AssertionError("recovery fixture has no old pane")
+    panes["w1:p1"].update(values)
+    (root / "state.json").write_text(json.dumps(state, sort_keys=True), encoding="utf-8")
+
+
+def _revive_dry_run(
+    harness: Harness, report: Report, root: Path, command: Sequence[str],
+    label: str, *, batch: bool, action: str,
+) -> None:
+    before = _revive_tree(root / "registry")
+    initial_state = _state(root)
+    effect_keys = ("revive_launch_count", "revive_tabs_created", "closed_panes", "revive_input_calls")
+    arguments = ("revive", "--all" if batch else "worker", "--dry-run",
+                 "--registry", "<ROOT>/registry", *FIXTURE_HERDR)
+    outcome = harness._invoke_one(command, root, arguments)
+    try:
+        value: object = json.loads(outcome.stdout)
+    except ValueError:
+        value = None
+    plans = value.get("agents") if isinstance(value, dict) and batch else [value]
+    report.require(
+        label + "/plan",
+        outcome.returncode == 0 and isinstance(plans, list) and len(plans) == 1
+        and isinstance(plans[0], dict) and plans[0].get("action") == action,
+        f"expected one {action} plan: {outcome!r}",
+    )
+    after = _state(root)
+    report.require(
+        label + "/immutable",
+        _revive_tree(root / "registry") == before
+        and all(after.get(key) == initial_state.get(key) for key in effect_keys),
+        "dry-run changed a record, queue, directory identity, runtime or presentation",
+    )
+
+
+def _revive_interop(harness: Harness, report: Report) -> None:
+    """Recover each edition's producer bytes through the other canonical CLI."""
+    common = ("--registry", "<ROOT>/registry", *FIXTURE_HERDR)
+    expected_arguments = [
+        "resume", "session-1", "--no-alt-screen", "--model", "recovery-model",
+        "--config", "model_reasoning_effort=high", "--sandbox", "read-only",
+    ]
+    directions = (
+        ("python-to-rust", harness.python, harness.rust),
+        ("rust-to-python", harness.rust, harness.python),
+    )
+    for direction, producer, consumer in directions:
+        for phase in ("ready", "published"):
+            label = f"primary/revive/{direction}/{phase}"
+            processes: list[subprocess.Popen[bytes]] = []
+            try:
+                for _ in range(2):
+                    processes.append(subprocess.Popen(
+                        ["/bin/sleep", "600"], stdin=subprocess.DEVNULL,
+                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                        start_new_session=True,
+                    ))
+                old_process, new_process = processes
+                case = harness.case(label, {
+                    "revive_mode": True, "input_expect": True,
+                    "revive_harness_pids": [old_process.pid, new_process.pid],
+                })
+                root = case.python_root if producer == harness.python else case.rust_root
+                init_case_repository(root)
+                (root / ".gitignore").write_text(".agentctl/\n", encoding="utf-8")
+                configuration = root / ".agentctl"
+                configuration.mkdir(mode=0o700)
+                profile = configuration / "profiles.json"
+                profile.write_text(json.dumps({
+                    "schema": "agentctl-profiles/v1", "profiles": {"recovery": {
+                        "harness": "codex", "mode": "interactive", "model": "recovery-model",
+                        "reasoning_effort": "high", "argv": ["--sandbox", "read-only"], "env": {},
+                    }},
+                }), encoding="utf-8")
+                profile.chmod(0o600)
+                started = harness._invoke_one(producer, root, (
+                    "start", "worker", "--cwd", "<ROOT>", "--workspace-id", "w1",
+                    "--profile", "recovery", *common,
+                ))
+                report.require(label + "/start", started.returncode == 0,
+                               f"producer failed to create the original record: {started!r}")
+                record_path = root / "registry/worker/agent.json"
+                if started.returncode != 0 or not record_path.exists():
+                    continue
+                record = _revive_document(record_path)
+                identity = record.get("harness_identity")
+                report.require(
+                    label + "/kernel-anchor",
+                    isinstance(identity, dict) and identity.get("pid") == old_process.pid
+                    and old_process.poll() is None and new_process.pid != old_process.pid,
+                    "original harness was not pinned to the separate live fixture child",
+                )
+                _revive_pane_state(root, {"status": "working"})
+                queued = harness._invoke_one(producer, root, (
+                    "send", "worker", "old queued instruction", "--message-id", "pending-work",
+                    "--ready-timeout", "0", *common,
+                ))
+                queue = root / "registry/worker/queue"
+                report.require(
+                    label + "/queued-before-death",
+                    queued.returncode == 75 and (queue / "inbox/pending-work.json").is_file()
+                    and not _state(root).get("revive_input_calls"),
+                    f"busy target did not retain the safe pending prompt: {queued!r}",
+                )
+                if queued.returncode != 75 or not queue.exists():
+                    continue
+                artifacts = {
+                    "inflight/interrupted.json": b'{"text":"uncertain inflight instruction"}\n',
+                    "failed/uncertain.json": b'{"possibly_submitted":true,"text":"never replay"}\n',
+                    "quarantine/raw.json.error": b"opaque quarantine evidence\x00\xff\n",
+                    ".queue-audit": b"keep all private queue artifacts\n",
+                }
+                for relative, content in artifacts.items():
+                    artifact = queue / relative
+                    artifact.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+                    artifact.write_bytes(content)
+                    artifact.chmod(0o600)
+                # Fixed values expose lossy JSON float parsing instead of relying
+                # on the wall clock to happen to produce a sensitive timestamp.
+                record.update({"created_at": 1791594983.6648757,
+                               "goal": "finish the recorded task", "paused": True,
+                               "recovery_note": {"task": "last recorded instruction",
+                                   "numeric": {"precise_number": 1791594983.6648757,
+                                               "values": [1.2345678901234567, -1791594983.6648757]}}})
+                record_path.write_text(json.dumps(record, indent=2) + "\n", encoding="utf-8")
+                old_bytes = record_path.read_bytes()
+                old_queue = _revive_tree(queue)
+                old_directory = record_path.parent.stat()
+                _revive_dry_run(harness, report, root, consumer, label + "/live-dry-run",
+                                batch=False, action="skip")
+                old_process.kill()
+                old_process.wait(timeout=5)
+                report.require(label + "/actual-harness-death", old_process.returncode == -9,
+                               "the fixture did not kill and reap its original pinned harness")
+                _revive_pane_state(root, {
+                    "empty_shell": True, "terminal_id": "restored-old-terminal", "label": "",
+                })
+                _revive_dry_run(harness, report, root, producer, label + "/dead-dry-run",
+                                batch=False, action="revive")
+                _revive_dry_run(harness, report, root, consumer, label + "/all-dry-run",
+                                batch=True, action="revive")
+                state = _state(root)
+                state["revive_fail_old_read_once" if phase == "ready"
+                      else "revive_fail_old_close_once"] = True
+                (root / "state.json").write_text(json.dumps(state, sort_keys=True), encoding="utf-8")
+                old_token = record.get("token")
+                if not isinstance(old_token, str):
+                    raise AssertionError("producer record has no generation token")
+                interrupted = harness._invoke_one(producer, root, (
+                    "revive", "worker", "--expected-token", old_token, *common,
+                ))
+                journal_path = root / "registry/.revives" / f"{old_token}.json"
+                report.require(
+                    label + "/interruption", interrupted.returncode == 75 and journal_path.is_file(),
+                    f"producer did not retain a recovery journal after interruption: {interrupted!r}",
+                )
+                if not journal_path.is_file():
+                    continue
+                journal = _revive_document(journal_path)
+                report.require(label + "/durable-phase", journal.get("phase") == phase,
+                               f"expected {phase} journal, got {journal.get('phase')!r}")
+                operation = journal_path.parent / old_token
+                archive = root / "registry/archive" / f"worker-{old_token}"
+                candidate_path = operation / "new/agent.json" if phase == "ready" else record_path
+                if not candidate_path.is_file():
+                    report.require(label + "/candidate-present", False,
+                                   "interruption lost the staged or published candidate")
+                    continue
+                ready_bytes = candidate_path.read_bytes()
+                candidate = _revive_document(candidate_path)
+                stopped_bytes = (operation / "stopped.json").read_bytes()
+                expected_stopped = {**record, "lifecycle": "stopped"}
+                report.require(
+                    label + "/stopped-only-lifecycle",
+                    json.loads(stopped_bytes) == expected_stopped,
+                    "prepared stopped record changed original metadata beyond its lifecycle",
+                )
+                report.require(
+                    label + "/candidate-unknown-numeric-metadata",
+                    candidate.get("recovery_note") == record.get("recovery_note"),
+                    "candidate changed the saved task or nested unknown numeric metadata",
+                )
+                report.require(
+                    label + "/producer-byte-digests",
+                    journal.get("schema") == "agentctl-revive/v1"
+                    and journal.get("old_record_sha256") == hashlib.sha256(old_bytes).hexdigest()
+                    and journal.get("ready_record_sha256") == hashlib.sha256(ready_bytes).hexdigest()
+                    and journal.get("stopped_record_sha256") == hashlib.sha256(stopped_bytes).hexdigest()
+                    and journal.get("old_directory_device") == old_directory.st_dev
+                    and journal.get("old_directory_inode") == old_directory.st_ino,
+                    "journal hashes or directory anchors do not cover the actual producer bytes",
+                )
+                report.require(
+                    label + "/fresh-candidate",
+                    candidate.get("token") == journal.get("new_token") != old_token
+                    and candidate.get("pane_id") == "w1:p2"
+                    and candidate.get("terminal_id") == "term-2"
+                    and _state(root).get("revive_launch_count") == 2
+                    and new_process.poll() is None,
+                    "recovery reused the old generation or failed to pin a separate replacement",
+                )
+                if phase == "ready":
+                    report.require(label + "/old-preserved-before-publication",
+                                   record_path.read_bytes() == old_bytes and not archive.exists()
+                                   and _revive_tree(queue) == old_queue,
+                                   "producer retired the old generation before its candidate was publishable")
+                else:
+                    report.require(label + "/old-archived-before-cleanup",
+                                   archive.is_dir() and not (operation / "new").exists(),
+                                   "published interruption did not preserve both generation directories")
+                    new_process.kill()
+                    new_process.wait(timeout=5)
+                    report.require(label + "/published-candidate-dead", new_process.returncode == -9,
+                                   "the published replacement was not actually killed before cleanup")
+                _revive_dry_run(harness, report, root, consumer, label + "/pending-dry-run",
+                                batch=False, action="recover")
+                recovery_arguments = (("revive", "--all", *common) if phase == "published"
+                                      else ("revive", "worker", "--expected-token", old_token, *common))
+                recovered = harness._invoke_one(consumer, root, recovery_arguments)
+                try:
+                    result: object = json.loads(recovered.stdout)
+                except ValueError:
+                    result = None
+                if phase == "published":
+                    report.require(
+                        label + "/batch-completion",
+                        isinstance(result, dict) and result.get("dry_run") is False
+                        and result.get("revived") == 1 and result.get("blocked") == 0,
+                        f"batch did not complete the pending old generation: {recovered!r}",
+                    )
+                    agents = result.get("agents") if isinstance(result, dict) else None
+                    result = agents[0] if isinstance(agents, list) and len(agents) == 1 else None
+                report.require(
+                    label + "/cross-edition-completion",
+                    recovered.returncode == 0 and isinstance(result, dict)
+                    and result.get("revived") is True and result.get("previous_token") == old_token
+                    and result.get("tab_closed") is True,
+                    f"other edition could not complete the saved transaction: {recovered!r}",
+                )
+                final_state = _state(root)
+                launches = final_state.get("revive_launch_arguments")
+                report.require(
+                    label + "/no-relaunch-or-input",
+                    final_state.get("revive_launch_count") == 2
+                    and isinstance(launches, list) and len(launches) == 2
+                    and launches[-1] == expected_arguments
+                    and not final_state.get("revive_input_calls") and not final_state.get("submitted"),
+                    "recovery relaunched a candidate, changed its recorded policy or replayed old work",
+                )
+                report.require(
+                    label + "/exact-stale-pane-cleanup",
+                    final_state.get("closed_panes") == ["w1:p1"]
+                    and not journal_path.exists() and not (operation / "new").exists(),
+                    "cleanup closed another generation or retained a completed journal",
+                )
+                report.require(
+                    label + "/complete-archive",
+                    archive.is_dir() and (archive / "agent.json").read_bytes() == stopped_bytes
+                    and _revive_tree(archive / "queue") == old_queue
+                    and (archive / "output.json").is_file()
+                    and _revive_document(archive / "output.json").get("text") == "preserved old terminal output\n",
+                    "archive omitted or rewrote producer bytes, output, queue, binding or quarantine artifacts",
+                )
+                report.require(
+                    label + "/published-byte-and-task-preservation",
+                    record_path.read_bytes() == ready_bytes
+                    and candidate.get("profile") == "recovery" and candidate.get("model") == "recovery-model"
+                    and candidate.get("cwd") == str(root) and candidate.get("resume") == "session-1"
+                    and candidate.get("goal") == "finish the recorded task" and candidate.get("paused") is True
+                    and candidate.get("revived_from") == old_token
+                    and not (record_path.parent / "queue").exists(),
+                    "published candidate bytes, saved task, policy or absence of a new queue changed",
+                )
+            finally:
+                for process in processes:
+                    if process.poll() is None:
+                        process.kill()
+                    process.wait(timeout=5)
 
 
 def _bootstrap(harness: Harness, report: Report) -> None:

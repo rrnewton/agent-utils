@@ -184,6 +184,16 @@ def parser() -> argparse.ArgumentParser:
     wait = command("wait", "Wait for readiness; readiness does not mean the goal is complete.",
         "agentctl wait reviewer --timeout 60", named=True)
     wait.add_argument("--timeout", type=_ascii_float, default=900.0, metavar="SECONDS", help="readiness deadline (default: 900 seconds)")
+    revive = command("revive", "Resume a running record whose owned interactive harness is positively dead, in a fresh tab. "
+        "Preserves the old queue and quarantine in its archive; never replays queued prompts.",
+        "agentctl revive reviewer\n  agentctl revive --all --dry-run")
+    revive.add_argument("name", nargs="?", metavar="NAME", help="registered session name; required unless --all is used")
+    revive.add_argument("--all", action="store_true", help="consider every registered name; continue past blocked records")
+    revive.add_argument("--dry-run", action="store_true", help="print recovery plans without changing registry files, locks, tabs, or processes")
+    revive.add_argument("--expected-token", metavar="TOKEN", help="require this old record generation; applies only with NAME")
+    revive.add_argument("--startup-timeout", type=_ascii_float, default=30.0, metavar="SECONDS",
+        help="replacement harness startup deadline, greater than 0 and at most 300 seconds (default: 30)")
+
     stop = command("stop", "Stop an owned runtime, or unregister an adopted runtime without closing it, and archive state.",
         "agentctl stop reviewer", named=True)
     stop.add_argument("--expected-token", metavar="TOKEN",
@@ -399,6 +409,19 @@ def main(argv: Sequence[str] | None = None) -> int:
             result = sessions.goal(name, _text(args, optional=True), goal_command=_goal_command(args), **options)
         elif args.command == "rename":
             result = sessions.rename(name, args.new_name)
+        elif args.command == "revive":
+            if args.startup_timeout > 300:
+                raise ValueError("startup-timeout must be greater than 0 and at most 300 seconds")
+            if bool(name) == args.all:
+                raise ValueError("revive requires either NAME or --all")
+            if args.all and args.expected_token is not None:
+                raise ValueError("--expected-token requires NAME, not --all")
+            if args.all:
+                result = sessions.revive_all(dry_run=args.dry_run, startup_timeout=args.startup_timeout)
+                print(json.dumps(result, indent=2, sort_keys=True))
+                return 75 if result["blocked"] and not args.dry_run else 0
+            result = sessions.revive(name, dry_run=args.dry_run, expected_token=args.expected_token,
+                                     startup_timeout=args.startup_timeout)
         elif args.command == "anchor":
             result = sessions.anchor(name, replace=args.replace)
         elif args.command == "doctor":

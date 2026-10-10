@@ -69,6 +69,8 @@ class Sessions(ManagedAgents):
             result.append("move")
         if record.adapter in ("herdr", "herdr-foreign"):
             result.extend(("anchor", "rename"))
+        if record.mode == "interactive" and record.adapter in ("herdr", "herdr-pane", "herdr-relay"):
+            result.append("revive")
         return result
 
     def start_session(self, name: str, *, cwd: str, mode: str = "interactive",

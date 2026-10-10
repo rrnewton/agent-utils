@@ -580,6 +580,7 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
             .duration_since(UNIX_EPOCH)
             .map_err(|error| fail(error.to_string()))?;
         let mut record = AgentRecord {
+            storage_directory: None,
             adapter: CLOUD_HARNESS.to_owned(),
             mode: interactive_mode(),
             backend: herdr_adapter(),

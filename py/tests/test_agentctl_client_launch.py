@@ -2,8 +2,10 @@
 from __future__ import annotations
 
 import errno
+import io
 import json
 import os
+import select
 import shutil
 import shlex
 import signal
@@ -33,7 +35,7 @@ from agentctl.client import (
     muse_verified_process_prompt_transcript_count,
 )
 from agentctl.errors import HerdrUnavailable
-from agentctl.procstat import parse_process_stat
+from agentctl.procstat import ProcessStat, parse_process_stat
 import pytest
 
 
@@ -550,6 +552,255 @@ def test_process_identity_maps_pidfd_close_failure_to_unavailable(
     finally:
         process.terminate()
         process.wait(timeout=5)
+
+
+_LivenessFixture = tuple[HerdrClient, CustomProcessIdentity, ProcessStat]
+
+
+def _liveness_identity() -> CustomProcessIdentity:
+    return CustomProcessIdentity(1, "00000000-0000-0000-0000-000000000000", 4242, 99, 10, 11)
+
+
+@pytest.fixture
+def liveness_probe(monkeypatch: pytest.MonkeyPatch) -> _LivenessFixture:
+    identity = _liveness_identity()
+    observed = ProcessStat(pid=4242, starttime=99, ppid=1, pgrp=4242, session=4242, state="S")
+    client = HerdrClient(herdr_bin="fixture-herdr", run=Runner({}))
+    monkeypatch.setattr("agentctl.client.os.pidfd_open", lambda _pid: os.open(os.devnull, os.O_RDONLY), raising=False)
+    monkeypatch.setattr(client, "_liveness_boot_identity", lambda: identity.boot_id)
+    monkeypatch.setattr(client, "_liveness_process_stat", lambda _pid: observed)
+    monkeypatch.setattr(client, "_liveness_executable_identity", lambda _pid: (10, 11))
+    monkeypatch.setattr(client, "_pidfd_exited", lambda _descriptor: False)
+    return client, identity, observed
+
+
+@pytest.mark.skipif(not hasattr(os, "pidfd_open"), reason="Linux pidfd identity required")
+def test_process_liveness_tracks_a_real_child_before_and_after_kill() -> None:
+    runner = Runner({})
+    client = HerdrClient(herdr_bin="fixture-herdr", run=runner)
+    process = subprocess.Popen([os.path.realpath("/usr/bin/sleep"), "30"])
+    descriptor = os.pidfd_open(process.pid)
+    try:
+        observed = client._process_identity(process.pid)
+        assert observed is not None
+        identity = observed[0]
+        assert client.process_liveness(identity) == "alive"
+        process.kill()
+        poller = select.poll()
+        poller.register(descriptor, select.POLLIN)
+        assert poller.poll(2000), "the owned child did not exit"
+        # Do not reap yet: the pidfd proves death even while /proc still has a zombie.
+        assert client.process_liveness(identity) == "dead"
+        process.wait(timeout=5)
+        assert client.process_liveness(identity) == "dead"
+        assert runner.calls == []
+    finally:
+        os.close(descriptor)
+        if process.poll() is None:
+            process.kill()
+        process.wait(timeout=5)
+
+
+@pytest.mark.parametrize(
+    ("identity", "outcome"),
+    [
+        (replace(_liveness_identity(), boot_id="ffffffff-ffff-ffff-ffff-ffffffffffff"), "dead"),
+        (replace(_liveness_identity(), starttime_ticks=98), "dead"),
+        (replace(_liveness_identity(), executable_device=9), "unknown"),
+        (replace(_liveness_identity(), executable_inode=12), "unknown"),
+        (replace(_liveness_identity(), version=0), "unknown"),
+        (replace(_liveness_identity(), boot_id="invalid"), "unknown"),
+        (replace(_liveness_identity(), pid=0), "unknown"),
+        (replace(_liveness_identity(), pid=2_147_483_648), "unknown"),
+        (replace(_liveness_identity(), starttime_ticks=0), "unknown"),
+        (replace(_liveness_identity(), executable_inode=0), "unknown"),
+    ],
+)
+def test_process_liveness_distinguishes_generations_from_live_image_changes(
+    liveness_probe: _LivenessFixture, identity: CustomProcessIdentity, outcome: str,
+) -> None:
+    client, _recorded, _observed = liveness_probe
+    assert client.process_liveness(identity) == outcome
+
+
+@pytest.mark.parametrize("state", ["Z", "X", "x"])
+def test_process_liveness_does_not_require_a_dead_process_executable(
+    liveness_probe: _LivenessFixture, monkeypatch: pytest.MonkeyPatch, state: str,
+) -> None:
+    client, identity, observed = liveness_probe
+    monkeypatch.setattr(client, "_liveness_process_stat", lambda _pid: replace(observed, state=state))
+
+    def no_executable(_pid: int) -> None:
+        raise AssertionError("a dead process has no readable executable")
+
+    monkeypatch.setattr(client, "_liveness_executable_identity", no_executable)
+    assert client.process_liveness(identity) == "dead"
+
+
+@pytest.mark.parametrize(
+    ("error_number", "outcome"),
+    [(errno.ESRCH, "dead"), *[(value, "unknown") for value in (
+        errno.EPERM, errno.EACCES, errno.ENOSYS, errno.EINVAL, errno.EIO, errno.EINTR,
+    )]],
+)
+def test_process_liveness_requires_a_positive_pidfd_absence_error(
+    liveness_probe: _LivenessFixture, monkeypatch: pytest.MonkeyPatch,
+    error_number: int, outcome: str,
+) -> None:
+    client, identity, _observed = liveness_probe
+    attempts = 0
+
+    def unavailable(_pid: int) -> int:
+        nonlocal attempts
+        attempts += 1
+        raise OSError(error_number, "injected pidfd error")
+
+    monkeypatch.setattr("agentctl.client.os.pidfd_open", unavailable)
+    assert client.process_liveness(identity) == outcome
+    assert attempts == (4 if error_number == errno.EINTR else 1)
+
+
+def test_process_liveness_without_pidfds_is_unknown(
+    liveness_probe: _LivenessFixture, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client, identity, _observed = liveness_probe
+    monkeypatch.delattr("agentctl.client.os.pidfd_open")
+    assert client.process_liveness(identity) == "unknown"
+
+
+def test_process_liveness_keeps_pidfd_close_failure_unknown(
+    liveness_probe: _LivenessFixture, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client, identity, _observed = liveness_probe
+    close = os.close
+
+    def close_then_fail(descriptor: int) -> None:
+        close(descriptor)
+        raise OSError(errno.EIO, "injected close failure")
+
+    monkeypatch.setattr("agentctl.client.os.close", close_then_fail)
+    assert client.process_liveness(identity) == "unknown"
+
+
+def test_process_liveness_retries_interrupted_pidfd_open(
+    liveness_probe: _LivenessFixture, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client, identity, _observed = liveness_probe
+    calls = 0
+
+    def interrupted(_pid: int) -> int:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise InterruptedError(errno.EINTR, "injected interrupt")
+        return os.open(os.devnull, os.O_RDONLY)
+
+    monkeypatch.setattr("agentctl.client.os.pidfd_open", interrupted)
+    assert client.process_liveness(identity) == "alive"
+    assert calls == 2
+
+
+@pytest.mark.parametrize("method", [
+    "_liveness_boot_identity", "_liveness_process_stat", "_liveness_executable_identity", "_pidfd_exited",
+])
+@pytest.mark.parametrize("failure", [errno.EPERM, errno.EIO, errno.ENOENT, None])
+def test_process_liveness_keeps_probe_errors_unknown(
+    liveness_probe: _LivenessFixture, monkeypatch: pytest.MonkeyPatch,
+    method: str, failure: int | None,
+) -> None:
+    client, identity, _observed = liveness_probe
+
+    def unavailable(*_args: int) -> None:
+        if failure is None:
+            raise ValueError("injected malformed probe")
+        raise OSError(failure, "injected unreadable probe")
+
+    monkeypatch.setattr(client, method, unavailable)
+    assert client.process_liveness(identity) == "unknown"
+
+
+@pytest.mark.parametrize("changed", ["boot", "stat", "image", "reused-stat", "zombie-stat"])
+def test_process_liveness_refuses_changing_probe_snapshots(
+    liveness_probe: _LivenessFixture, monkeypatch: pytest.MonkeyPatch, changed: str,
+) -> None:
+    client, identity, observed = liveness_probe
+    if changed == "boot":
+        boot_ids = iter([identity.boot_id, "ffffffff-ffff-ffff-ffff-ffffffffffff"])
+        monkeypatch.setattr(client, "_liveness_boot_identity", lambda: next(boot_ids))
+    elif changed == "image":
+        images = iter([(10, 11), (10, 12)])
+        monkeypatch.setattr(client, "_liveness_executable_identity", lambda _pid: next(images))
+    else:
+        if changed == "reused-stat":
+            first, second = replace(observed, starttime=98), observed
+        elif changed == "zombie-stat":
+            first, second = replace(observed, state="Z"), observed
+        else:
+            first, second = observed, replace(observed, starttime=100)
+        snapshots = iter([first, second])
+        monkeypatch.setattr(client, "_liveness_process_stat", lambda _pid: next(snapshots))
+    assert client.process_liveness(identity) == "unknown"
+
+
+@pytest.mark.parametrize("raw", ["", "invalid", "x" * 129, "00000000-0000-0000-0000-000000000000\0"])
+def test_process_liveness_refuses_malformed_boot_reads(
+    liveness_probe: _LivenessFixture, monkeypatch: pytest.MonkeyPatch, raw: str,
+) -> None:
+    client, identity, _observed = liveness_probe
+
+    def boot_file(path: str, *, encoding: str) -> io.StringIO:
+        assert path == "/proc/sys/kernel/random/boot_id" and encoding == "ascii"
+        return io.StringIO(raw)
+
+    monkeypatch.setattr(client_module, "open", boot_file, raising=False)
+    monkeypatch.setattr(client, "_liveness_boot_identity", HerdrClient._liveness_boot_identity)
+    assert client.process_liveness(identity) == "unknown"
+
+
+@pytest.mark.parametrize("raw", [
+    b"", b"4242 (unterminated S 1 2 3", b"4242 (x) S 1 2 3", b"x" * 8193,
+    b"4241 (x) S 1 1 1 " + b"0 " * 15 + b"99",
+    b"4242 (x) S 1 1 1 " + b"0 " * 16,
+])
+def test_process_liveness_refuses_malformed_stat_reads(
+    liveness_probe: _LivenessFixture, monkeypatch: pytest.MonkeyPatch, raw: bytes,
+) -> None:
+    client, identity, _observed = liveness_probe
+
+    def stat_file(path: str, mode: str) -> io.BytesIO:
+        assert path == "/proc/4242/stat" and mode == "rb"
+        return io.BytesIO(raw)
+
+    monkeypatch.setattr(client_module, "open", stat_file, raising=False)
+    monkeypatch.setattr(client, "_liveness_process_stat", HerdrClient._liveness_process_stat)
+    assert client.process_liveness(identity) == "unknown"
+
+
+@pytest.mark.parametrize(
+    ("flags", "outcome"),
+    [(select.POLLIN, "dead"), (select.POLLIN | select.POLLHUP, "dead"),
+     (select.POLLERR, "unknown"), (select.POLLNVAL, "unknown"),
+     (select.POLLHUP, "unknown"), (select.POLLIN | select.POLLERR, "unknown")],
+)
+def test_process_liveness_requires_a_valid_pidfd_exit_event(
+    liveness_probe: _LivenessFixture, monkeypatch: pytest.MonkeyPatch, flags: int, outcome: str,
+) -> None:
+    client, identity, _observed = liveness_probe
+
+    class Poller:
+        descriptor: int = -1
+
+        def register(self, descriptor: int, events: int) -> None:
+            assert events == select.POLLIN
+            self.descriptor = descriptor
+
+        def poll(self, timeout: int) -> list[tuple[int, int]]:
+            assert timeout == 0
+            return [(self.descriptor, flags)]
+
+    monkeypatch.setattr("agentctl.client.select.poll", Poller)
+    monkeypatch.setattr(client, "_pidfd_exited", HerdrClient._pidfd_exited)
+    assert client.process_liveness(identity) == outcome
 
 
 @pytest.mark.skipif(not hasattr(os, "pidfd_open"), reason="Linux pidfd identity required")

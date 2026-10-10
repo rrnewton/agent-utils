@@ -7,18 +7,19 @@ import json
 import os
 import stat
 import threading
+from collections.abc import Callable, Sequence
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
-from typing import cast
+from typing import Literal, cast
 
 import pytest
 
 from agentctl import agent
 import agentctl.subagents as subagents_module
-from agentctl.client import AgentPaneInfo, HerdrClient, Pane, PaneShellProof
+from agentctl.client import AgentPaneInfo, CustomProcessIdentity, HerdrClient, Pane, PaneShellProof
 from agentctl.errors import AgentDeliveryError, HerdrUnavailable
-from agentctl.subagents import ManagedAgents
+from agentctl.subagents import AgentRecord, ManagedAgents
 from .test_agentctl_adopt import prepare_legacy_dead, setup_foreign
 from .test_herdr_subagents import FakeManagedClient, setup
 
@@ -1639,3 +1640,836 @@ def test_stop_refuses_native_identity_replacement_during_output_capture(tmp_path
         manager.stop("worker")
     assert not fake.closed
     assert manager.get("worker").lifecycle == "running"
+
+
+def prepare_revive(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *, harness: str = "codex",
+    profile: str | None = None, model: str | None = None,
+    harness_args: tuple[str, ...] = (), environment: tuple[str, ...] = (),
+) -> tuple[ManagedAgents, FakeManagedClient, AgentRecord]:
+    """Model two distinct runtimes and positive old-process death, not a failed probe."""
+    manager, fake = setup(tmp_path, monkeypatch)
+    if harness == "muse":
+        original_custom = fake.start_pane_agent
+
+        def custom(
+            name: str, kind: str, pane_id: str, arguments: tuple[str, ...], *, timeout: float,
+            on_observed: Callable[[CustomProcessIdentity], None] | None = None,
+        ) -> CustomProcessIdentity:
+            fake.custom_identity = replace(fake.custom_identity, pid=200 + fake.serial,
+                                           starttime_ticks=200 + fake.serial)
+            identity = original_custom(name, kind, pane_id, arguments, timeout=timeout, on_observed=on_observed)
+            conversation = arguments[-1] if len(arguments) >= 2 and arguments[-2] == "resume" else "muse-native"
+            fake.infos[pane_id] = replace(fake.infos[pane_id], session_agent="muse", session_value=conversation)
+            return identity
+
+        monkeypatch.setattr(fake, "start_pane_agent", custom)
+    manager.start("worker", cwd=str(tmp_path), harness=harness, profile=profile,
+                  model=model, harness_args=harness_args, environment=environment)
+    old = manager.get("worker")
+    assert old.native_session is not None and old.pane_id is not None
+    process = old.harness_anchor if old.adapter == "herdr" else old.custom_process_identity
+    assert process is not None
+
+    def liveness(expected: CustomProcessIdentity) -> Literal["alive", "dead", "unknown"]:
+        return "dead" if expected == process else "alive"
+
+    monkeypatch.setattr(fake, "process_liveness", liveness, raising=False)
+    original_info = fake.pane_info
+
+    def info(pane_id: str) -> AgentPaneInfo:
+        if not any(pane.pane_id == pane_id for pane in fake.presentations):
+            raise HerdrUnavailable('pane get: {"error":{"code":"pane_not_found"}}')
+        return original_info(pane_id)
+
+    monkeypatch.setattr(fake, "pane_info", info)
+    fake.infos[old.pane_id] = replace(fake.infos[old.pane_id], agent=None, status="unknown",
+                                      session_agent=None, session_value=None)
+    fake.custom_running = False
+    return manager, fake, old
+
+
+def registry_bytes(registry: Path) -> dict[str, bytes]:
+    return {str(path.relative_to(registry)): path.read_bytes()
+            for path in registry.rglob("*") if path.is_file()}
+
+
+@pytest.mark.parametrize("harness", ["codex", "claude", "muse"])
+def test_revive_resumes_exact_conversation_and_archives_without_replaying(
+    harness: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager, fake, old = prepare_revive(tmp_path, monkeypatch, harness=harness, model="chosen")
+    old.goal, old.goal_message_id, old.goal_delivery = "finish the review", "old-task", "old-delivery"
+    old.goal_session_id, old.goal_messages = old.native_session["value"] if old.native_session else None, {"old-task": "old-delivery"}
+    old.paused = True
+    old._unknown["future_metadata"] = {"preserve": True}
+    manager._save(old)
+    queue = manager._directory("worker") / "queue"
+    agent.enqueue(str(queue), "must never be replayed", message_id="pending-task")
+    quarantine = queue / "quarantine"
+    quarantine.mkdir(mode=0o700)
+    agent._atomic_json(str(quarantine / "uncertain.json"), {"state": "possibly_submitted", "text": "ambiguous old input"})
+    old_files = registry_bytes(manager._directory("worker"))
+
+    result = manager.revive("worker", expected_token=old.token)
+
+    new = manager.get("worker")
+    archive = Path(str(result["archive"]))
+    assert result["revived"] is True and result["previous_token"] == old.token
+    assert result["pane_closed"] is True and result["tab_closed"] is True
+    assert old.native_session is not None
+    assert new.token != old.token and new.resume == old.native_session["value"]
+    assert new.native_session is not None and new.native_session["value"] == new.resume
+    assert new.model == old.model and new.paused is True and new.goal == old.goal
+    assert new.goal_message_id is None and new.goal_delivery is None and new.goal_messages == {} and new.goal_session_id is None
+    assert new._unknown["future_metadata"] == {"preserve": True} and new._unknown["revived_from"] == old.token
+    assert new.pane_id != old.pane_id and fake.closed == [old.tab_id]
+    assert len(fake.launched) == 2 and fake.submitted == [] and fake.keys_sent == []
+    assert not (manager._directory("worker") / "queue").exists()
+    for path, content in old_files.items():
+        if path != "agent.json":
+            assert (archive / path).read_bytes() == content
+    archived = json.loads((archive / "agent.json").read_text())
+    expected = json.loads(old_files["agent.json"])
+    expected["lifecycle"] = "stopped"
+    assert archived == expected
+    assert not list((manager.registry / ".revives").glob("*.json"))
+    arguments = tuple(new.arguments)
+    if harness == "claude":
+        assert arguments[:2] == ("--resume", new.resume) and "--session-id" not in arguments
+    elif harness == "muse":
+        assert arguments[-2:] == ("resume", new.resume)
+
+
+def test_revive_dry_run_is_byte_pure_and_does_not_create_locks_or_tabs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager, fake, old = prepare_revive(tmp_path, monkeypatch)
+    before = registry_bytes(manager.registry)
+    result = manager.revive_all(dry_run=True)
+    assert result["dry_run"] is True and result["blocked"] == 0
+    rows = cast(list[dict[str, object]], result["agents"])
+    assert rows[0]["action"] == "revive" and rows[0]["token"] == old.token
+    assert registry_bytes(manager.registry) == before
+    assert len(fake.launched) == 1 and fake.closed == [] and fake.submitted == []
+    assert not (manager.registry / ".revives").exists()
+
+
+@pytest.mark.parametrize("liveness", ["alive", "unknown"])
+def test_revive_never_launches_for_live_or_unverifiable_process(
+    liveness: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager, fake, old = prepare_revive(tmp_path, monkeypatch)
+    monkeypatch.setattr(fake, "process_liveness", lambda _identity: liveness)
+    before = registry_bytes(manager.registry)
+    assert manager.revive("worker", dry_run=True)["action"] == ("skip" if liveness == "alive" else "blocked")
+    with pytest.raises(AgentDeliveryError, match="death cannot be proved"):
+        manager.revive("worker", expected_token=old.token)
+    assert registry_bytes(manager.registry) == before and len(fake.launched) == 1 and fake.closed == []
+
+
+def test_revive_distinguishes_explicit_missing_pane_from_server_outage(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager, fake, old = prepare_revive(tmp_path, monkeypatch)
+    fake.offline = True
+    before = registry_bytes(manager.registry)
+    assert manager.revive("worker", dry_run=True)["action"] == "blocked"
+    assert registry_bytes(manager.registry) == before and fake.closed == []
+    fake.offline = False
+    fake.presentations.clear()
+    result = manager.revive("worker")
+    assert result["revived"] is True and result["pane_closed"] is False
+    assert fake.closed == [] and len(fake.launched) == 2 and manager.get("worker").pane_id != old.pane_id
+
+
+@pytest.mark.parametrize("change", ["session", "agent", "sibling", "shell", "name", "archive", "token"])
+def test_revive_preflight_refuses_conflicting_ownership_without_launch(
+    change: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager, fake, old = prepare_revive(tmp_path, monkeypatch)
+    assert old.pane_id is not None and old.tab_id is not None
+    if change == "session":
+        fake.infos[old.pane_id] = replace(fake.infos[old.pane_id], session_agent="codex", session_value="unrelated")
+    elif change == "agent":
+        fake.infos[old.pane_id] = replace(fake.infos[old.pane_id], agent="claude")
+    elif change == "sibling":
+        fake.presentations.append(Pane("w1:human", old.tab_id, "w1"))
+    elif change == "shell":
+        fake.custom_at_idle_shell = False
+    elif change == "name":
+        fake.moved_named_panes["worker"] = "w1:unrelated"
+    elif change == "archive":
+        archive = manager.registry / "archive"
+        archive.mkdir(mode=0o700)
+        (archive / f"worker-{old.token}").mkdir(mode=0o700)
+    before = registry_bytes(manager.registry)
+    token = "replacement" if change == "token" else old.token
+    with pytest.raises(AgentDeliveryError):
+        manager.revive("worker", expected_token=token)
+    assert len(fake.launched) == 1 and fake.closed == [] and registry_bytes(manager.registry) == before
+
+
+@pytest.mark.parametrize("phase", ["launched", "archived", "published", "close-unknown", "close-lost-ack"])
+def test_revive_retry_reconciles_each_transaction_boundary_without_second_launch(
+    phase: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from agentctl import revive as recovery
+    manager, fake, old = prepare_revive(tmp_path, monkeypatch)
+    fired = False
+    real_write = recovery._write_journal
+    real_archive = manager._publish_pinned_directory
+    real_close = fake.close_pane
+
+    def write(journal_manager: ManagedAgents, journal: dict[str, object]) -> None:
+        nonlocal fired
+        if not fired and (phase == "launched" and journal["phase"] == "ready"
+                          or phase == "published" and journal["phase"] == "published"):
+            fired = True
+            raise AgentDeliveryError("injected interrupted phase publication")
+        real_write(journal_manager, journal)
+
+    def archive(pinned: subagents_module._PinnedAgentDirectory, destination: Path, *, expected_record: bytes) -> None:
+        nonlocal fired
+        real_archive(pinned, destination, expected_record=expected_record)
+        if phase == "archived" and not fired:
+            fired = True
+            raise AgentDeliveryError("injected interrupted old archival")
+
+    def close(pane_id: str) -> None:
+        nonlocal fired
+        if phase in ("close-unknown", "close-lost-ack") and not fired:
+            fired = True
+            if phase == "close-lost-ack":
+                real_close(pane_id)
+            raise HerdrUnavailable("injected lost close reply")
+        real_close(pane_id)
+
+    monkeypatch.setattr(recovery, "_write_journal", write)
+    monkeypatch.setattr(manager, "_publish_pinned_directory", archive)
+    monkeypatch.setattr(fake, "close_pane", close)
+    if phase == "close-lost-ack":
+        assert manager.revive("worker")["revived"] is True
+    else:
+        with pytest.raises(AgentDeliveryError):
+            manager.revive("worker")
+        before = registry_bytes(manager.registry)
+        assert manager.revive("worker", dry_run=True)["action"] == "recover"
+        assert registry_bytes(manager.registry) == before
+        result = manager.revive("worker", expected_token=old.token)
+        assert result["revived"] is True
+    assert fired is True and len(fake.launched) == 2 and fake.closed == [old.tab_id]
+    assert manager.get("worker").token != old.token
+    assert not list((manager.registry / ".revives").glob("*.json"))
+
+
+def test_revive_published_cleanup_does_not_require_replacement_still_alive(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager, fake, old = prepare_revive(tmp_path, monkeypatch)
+    real_close = fake.close_pane
+    monkeypatch.setattr(fake, "close_pane", lambda _pane: (_ for _ in ()).throw(HerdrUnavailable("close unavailable")))
+    with pytest.raises(AgentDeliveryError):
+        manager.revive("worker")
+    assert len(fake.launched) == 2
+    latest = fake.launched[-1][2]
+    fake.infos[latest] = replace(fake.infos[latest], agent=None, session_agent=None, session_value=None, status="unknown")
+    monkeypatch.setattr(fake, "process_liveness", lambda _identity: "dead")
+    monkeypatch.setattr(fake, "close_pane", real_close)
+    result = manager.revive("worker", expected_token=old.token)
+    assert result["revived"] is True and len(fake.launched) == 2 and fake.closed == [old.tab_id]
+    assert manager.get("worker").lifecycle == "running"
+
+
+@pytest.mark.parametrize("change", ["shell", "pane", "stage-record", "stage-directory", "old-directory"])
+def test_revive_refuses_changed_generation_after_launch_and_retains_evidence(
+    change: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager, fake, old = prepare_revive(tmp_path, monkeypatch)
+    real_launch = manager._launch_interactive
+
+    def launch(
+        record: AgentRecord, workspace_id: str | None, environment: Sequence[str],
+        project_workspace: str | None, startup_timeout: float, slot_command: str | None, relay_command: str | None,
+    ) -> None:
+        real_launch(record, workspace_id, environment, project_workspace, startup_timeout, slot_command, relay_command)
+        assert record._storage is not None and old.pane_id is not None
+        stage = record._storage[0]
+        if change == "shell":
+            fake.foreign_shell_identity = replace(fake.foreign_shell_identity, starttime_ticks=999)
+        elif change == "pane":
+            fake.infos[old.pane_id] = replace(fake.infos[old.pane_id], terminal_id="human-replacement")
+        elif change == "stage-record":
+            document = json.loads((stage / "agent.json").read_text())
+            document["token"] = "replacement-stage"
+            agent._atomic_json(str(stage / "agent.json"), document)
+        elif change == "stage-directory":
+            stage.rename(stage.parent / "held-candidate")
+            stage.mkdir(mode=0o700)
+            agent._atomic_json(str(stage / "agent.json"), record.to_document())
+        else:
+            active = manager._directory("worker")
+            active.rename(manager.registry / ".held-old")
+            active.mkdir(mode=0o700)
+            agent._atomic_json(str(active / "agent.json"), old.to_document())
+
+    monkeypatch.setattr(manager, "_launch_interactive", launch)
+    with pytest.raises(AgentDeliveryError):
+        manager.revive("worker")
+    assert len(fake.launched) == 2 and fake.closed == []
+    assert list((manager.registry / ".revives").glob("*.json"))
+    with pytest.raises(AgentDeliveryError, match="incomplete"):
+        manager.send("worker", "must not reach either generation")
+    assert fake.submitted == []
+
+
+def test_revive_failed_allocation_is_reserved_and_never_relaunched(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager, fake, old = prepare_revive(tmp_path, monkeypatch)
+    fake.fail_start = True
+    with pytest.raises(AgentDeliveryError, match="revive launch failed"):
+        manager.revive("worker")
+    assert len(fake.launched) == 2
+    fake.fail_start = False
+    with pytest.raises(AgentDeliveryError, match="no second harness"):
+        manager.revive("worker", expected_token=old.token)
+    assert len(fake.launched) == 2 and fake.closed == []
+    with pytest.raises(AgentDeliveryError, match="incomplete"):
+        manager.stop("worker")
+
+
+def test_revive_recovers_saved_live_pin_after_lifecycle_commit_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager, fake, old = prepare_revive(tmp_path, monkeypatch)
+    real_launch = manager._launch_interactive
+
+    def launch(
+        record: AgentRecord, workspace_id: str | None, environment: Sequence[str],
+        project_workspace: str | None, startup_timeout: float, slot_command: str | None, relay_command: str | None,
+    ) -> None:
+        real_launch(record, workspace_id, environment, project_workspace, startup_timeout, slot_command, relay_command)
+        raise HerdrUnavailable("temporary outage after durable pin")
+
+    monkeypatch.setattr(manager, "_launch_interactive", launch)
+    with pytest.raises(AgentDeliveryError):
+        manager.revive("worker")
+    result = manager.revive("worker", expected_token=old.token)
+    assert result["revived"] is True and len(fake.launched) == 2 and fake.closed == [old.tab_id]
+
+
+@pytest.mark.parametrize("phase", ["operation", "new", "stopped", "candidate", "temporary", "rust-temporary"])
+def test_revive_quarantines_only_unlaunched_prejournal_setup_before_retry(
+    phase: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from agentctl import revive as recovery
+    manager, fake, old = prepare_revive(tmp_path, monkeypatch)
+    parent = manager.registry / ".revives"
+    parent.mkdir(mode=0o700)
+    operation = parent / old.token
+    operation.mkdir(mode=0o700)
+    if phase in ("new", "candidate", "temporary", "rust-temporary"):
+        stage = operation / "new"
+        stage.mkdir(mode=0o700)
+        if phase in ("temporary", "rust-temporary"):
+            partial = stage / (".agent.json-recovery-1-00000000000000000000000000000000" if phase == "temporary"
+                              else ".agent.json-recovery-1-1234567890123456789-0")
+            partial.write_bytes(b'{"schema":')
+            partial.chmod(0o600)
+        elif phase == "candidate":
+            candidate = recovery._new_candidate(old, "unlaunched-candidate", recovery._policy(manager, old))
+            agent._atomic_json(str(stage / "agent.json"), candidate.to_document())
+    elif phase == "stopped":
+        stopped = old.to_document()
+        stopped["lifecycle"] = "stopped"
+        agent._atomic_json(str(operation / "stopped.json"), stopped)
+    evidence = registry_bytes(operation)
+    assert manager.revive("worker", dry_run=True)["action"] == "revive"
+    assert registry_bytes(operation) == evidence
+
+    assert manager.revive("worker")["revived"] is True
+
+    orphans = list(parent.glob(".orphan-*"))
+    assert len(orphans) == 1 and registry_bytes(orphans[0]) == evidence
+    assert len(fake.launched) == 2 and fake.closed == [old.tab_id]
+
+
+def test_revive_preserves_prejournal_save_when_journal_write_is_interrupted(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from agentctl import revive as recovery
+    manager, fake, old = prepare_revive(tmp_path, monkeypatch)
+    real_write = recovery._write_journal
+    fired = False
+
+    def write(controller: ManagedAgents, journal: dict[str, object]) -> None:
+        nonlocal fired
+        if not fired:
+            fired = True
+            raise AgentDeliveryError("journal publication failed before runtime allocation")
+        real_write(controller, journal)
+
+    monkeypatch.setattr(recovery, "_write_journal", write)
+    with pytest.raises(AgentDeliveryError):
+        manager.revive("worker")
+    operation = manager.registry / ".revives" / old.token
+    evidence = registry_bytes(operation)
+    assert len(fake.launched) == 1
+    assert manager.revive("worker")["revived"] is True
+    orphan = next((manager.registry / ".revives").glob(".orphan-*"))
+    assert registry_bytes(orphan) == evidence and len(fake.launched) == 2
+
+
+@pytest.mark.parametrize("claim", ["pane", "unexpected"])
+def test_revive_does_not_disarm_conflicting_orphan_claims(
+    claim: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from agentctl import revive as recovery
+    manager, fake, old = prepare_revive(tmp_path, monkeypatch)
+    parent = manager.registry / ".revives"
+    parent.mkdir(mode=0o700)
+    operation = parent / old.token
+    operation.mkdir(mode=0o700)
+    if claim == "pane":
+        stage = operation / "new"
+        stage.mkdir(mode=0o700)
+        candidate = recovery._new_candidate(old, "candidate", recovery._policy(manager, old))
+        candidate.pane_id = "w1:possibly-live"
+        agent._atomic_json(str(stage / "agent.json"), candidate.to_document())
+    else:
+        agent._atomic_json(str(operation / "foreign.json"), {"claim": "unknown"})
+    evidence = registry_bytes(operation)
+    with pytest.raises(AgentDeliveryError):
+        manager.revive("worker")
+    assert registry_bytes(operation) == evidence and len(fake.launched) == 1 and fake.closed == []
+
+
+@pytest.mark.parametrize("field,value", [("mode", "headless"), ("backend", "tmux")])
+def test_revive_does_not_publish_changed_mode_or_backend_on_retry(
+    field: str, value: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from agentctl import revive as recovery
+    manager, fake, old = prepare_revive(tmp_path, monkeypatch)
+    real_write = recovery._write_journal
+
+    def write(controller: ManagedAgents, journal: dict[str, object]) -> None:
+        if journal["phase"] == "ready":
+            raise AgentDeliveryError("interrupted before ready publication")
+        real_write(controller, journal)
+
+    monkeypatch.setattr(recovery, "_write_journal", write)
+    with pytest.raises(AgentDeliveryError):
+        manager.revive("worker")
+    candidate_path = manager.registry / ".revives" / old.token / "new" / "agent.json"
+    document = json.loads(candidate_path.read_text())
+    document[field] = value
+    agent._atomic_json(str(candidate_path), document)
+    assert manager.revive("worker", dry_run=True)["action"] == "blocked"
+    with pytest.raises(AgentDeliveryError):
+        manager.revive("worker")
+    assert len(fake.launched) == 2 and fake.closed == []
+
+
+def test_revive_all_skips_live_and_nonrunning_but_continues_past_blocked_records(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager, fake, old = prepare_revive(tmp_path, monkeypatch)
+    manager.start("live", cwd=str(tmp_path))
+    manager.start("blocked", cwd=str(tmp_path))
+    blocked = manager.get("blocked")
+    manager._save(replace(blocked, harness_identity=None, anchor_rule=None))
+    manager.start("failed", cwd=str(tmp_path))
+    manager._save(replace(manager.get("failed"), lifecycle="launch_failed"))
+    result = manager.revive_all()
+    rows = cast(list[dict[str, object]], result["agents"])
+    assert result["revived"] == 1 and result["blocked"] == 1
+    assert {row["name"]: row.get("action", "revived") for row in rows} == {
+        "worker": "revived", "live": "skip", "blocked": "blocked", "failed": "skip"}
+    assert len(fake.launched) == 5 and fake.closed == [old.tab_id]
+
+
+@pytest.mark.parametrize("change", [None, "model", "argv", "missing"])
+def test_revive_reloads_matching_private_profile_and_preserves_literal_policy(
+    change: str | None, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from .test_agentctl_sessions import _write_profiles
+    configuration = tmp_path / ".agentctl"
+    profile: dict[str, object] = {"harness": "claude", "mode": "interactive", "model": "chosen",
+        "argv": ["--dangerously-skip-permissions"], "env": {"RECOVERY_MODE": "value=with spaces"}}
+    path = configuration / "profiles.json"
+    _write_profiles(tmp_path, {"owner-policy": profile})
+    manager, fake, old = prepare_revive(tmp_path, monkeypatch, harness="claude", profile="owner-policy", model="chosen",
+        harness_args=("--dangerously-skip-permissions",), environment=("RECOVERY_MODE=value=with spaces",))
+    if change == "missing":
+        path.rename(configuration / "profiles-held.json")
+    elif change is not None:
+        profile[change] = "different" if change == "model" else []
+        agent._atomic_json(str(path), {"schema": "agentctl-profiles/v1", "profiles": {"owner-policy": profile}})
+    if change is not None:
+        assert manager.revive("worker", dry_run=True)["action"] == "blocked"
+        with pytest.raises(AgentDeliveryError):
+            manager.revive("worker")
+        assert len(fake.launched) == 1 and fake.closed == []
+        return
+    result = manager.revive("worker")
+    assert result["revived"] is True and result["profile"] == "owner-policy" and result["model"] == "chosen"
+    assert fake.environments == [("RECOVERY_MODE=value=with spaces",)] * 2
+    record = manager.get("worker")
+    assert record.environment_names == ["RECOVERY_MODE"]
+    assert record.arguments == ["--resume", old.native_session["value"] if old.native_session else "", "--model", "chosen", "--dangerously-skip-permissions"]
+    assert all(b"value=with spaces" not in content for content in registry_bytes(manager.registry).values())
+
+
+def test_revive_literal_environment_without_profile_is_unrecoverable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager, fake, _old = prepare_revive(tmp_path, monkeypatch, environment=("RECOVERY_MODE=private",))
+    assert manager.revive("worker", dry_run=True)["action"] == "blocked"
+    with pytest.raises(AgentDeliveryError):
+        manager.revive("worker")
+    assert len(fake.launched) == 1 and fake.closed == []
+
+
+@pytest.mark.parametrize("changed", [False, True])
+def test_revive_rechecks_slot_mapping_and_reuses_recorded_boxing(
+    changed: bool, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from agentctl import revive as recovery
+    manager, fake, old = prepare_revive(tmp_path, monkeypatch)
+    old.slot, old.slot_project, old.slot_isolation = "worker-slot", str(tmp_path), "userns"
+    manager._save(old)
+    calls: list[tuple[str, str]] = []
+    monkeypatch.setattr(recovery, "_slot_shell_command",
+        lambda *_args, **_kwargs: ("boxed-shell-command", str(tmp_path / "changed") if changed else str(tmp_path), "userns"))
+
+    def sandbox(pane: str, command: str, *, timeout: float) -> None:
+        assert timeout == 30
+        calls.append((pane, command))
+
+    monkeypatch.setattr(fake, "enter_slot_sandbox", sandbox, raising=False)
+    if changed:
+        with pytest.raises(AgentDeliveryError, match="mapping or isolation changed"):
+            manager.revive("worker")
+        assert calls == [] and len(fake.launched) == 1
+    else:
+        assert manager.revive("worker")["revived"] is True
+        assert calls == [("w1:p2", "boxed-shell-command")]
+        record = manager.get("worker")
+        assert (record.slot, record.slot_project, record.slot_isolation) == (old.slot, old.slot_project, old.slot_isolation)
+
+
+def test_revive_cli_dry_run_and_batch_blocked_exit_are_reviewable_json(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+) -> None:
+    from agentctl import cli
+    manager, fake, _old = prepare_revive(tmp_path, monkeypatch)
+    monkeypatch.setattr(cli, "Sessions", lambda *_args, **_kwargs: manager)
+    assert cli.main(["revive", "worker", "--dry-run"]) == 0
+    assert json.loads(capsys.readouterr().out)["action"] == "revive"
+    monkeypatch.setattr(fake, "process_liveness", lambda _identity: "unknown")
+    before = registry_bytes(manager.registry)
+    assert cli.main(["revive", "--all", "--dry-run"]) == 0
+    assert json.loads(capsys.readouterr().out)["blocked"] == 1
+    assert cli.main(["revive", "--all"]) == 75
+    assert json.loads(capsys.readouterr().out)["blocked"] == 1
+    assert registry_bytes(manager.registry) == before and len(fake.launched) == 1
+
+
+@pytest.mark.parametrize("arguments", [[], ["worker", "--all"], ["--all", "--expected-token", "old"],
+    ["worker", "--startup-timeout", "301"], ["worker", "--startup-timeout", "0"]])
+def test_revive_cli_rejects_invalid_selection_before_persistent_changes(
+    arguments: list[str], tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+) -> None:
+    from agentctl import cli
+    manager, fake, _old = prepare_revive(tmp_path, monkeypatch)
+    monkeypatch.setattr(cli, "Sessions", lambda *_args, **_kwargs: manager)
+    before = registry_bytes(manager.registry)
+    assert cli.main(["revive", *arguments]) == 2
+    assert capsys.readouterr().err.startswith("agentctl:")
+    assert registry_bytes(manager.registry) == before and len(fake.launched) == 1
+
+
+@pytest.mark.parametrize("metadata", ["legacy-observed", "second-generation", "anchored-failure"])
+def test_revive_preserves_conversation_provenance_and_unknown_metadata_across_retries(
+    metadata: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager, fake, old = prepare_revive(tmp_path, monkeypatch)
+    old._unknown["future_metadata"] = {"retained": "across-recovery"}
+    if metadata == "legacy-observed":
+        old.native_session = None
+    manager._save(old)
+    if metadata == "anchored-failure":
+        real_launch = manager._launch_interactive
+
+        def launch(
+            record: AgentRecord, workspace_id: str | None, environment: Sequence[str],
+            project_workspace: str | None, startup_timeout: float, slot_command: str | None, relay_command: str | None,
+        ) -> None:
+            real_launch(record, workspace_id, environment, project_workspace, startup_timeout, slot_command, relay_command)
+            raise HerdrUnavailable("lost final launch response")
+
+        monkeypatch.setattr(manager, "_launch_interactive", launch)
+        with pytest.raises(AgentDeliveryError):
+            manager.revive("worker")
+    assert manager.revive("worker")["revived"] is True
+    if metadata == "second-generation":
+        newest = manager.get("worker")
+        assert newest.pane_id is not None
+        fake.infos[newest.pane_id] = replace(fake.infos[newest.pane_id], agent=None, session_agent=None, session_value=None)
+        process = newest.harness_anchor
+        assert process is not None
+        monkeypatch.setattr(fake, "process_liveness", lambda expected: "dead" if expected == process else "alive")
+        assert manager.revive("worker")["revived"] is True
+        assert len(fake.launched) == 3
+    record = manager.get("worker")
+    assert record._unknown["future_metadata"] == {"retained": "across-recovery"}
+    assert record.native_session is not None and record.native_session["value"] == old.session_value
+
+
+@pytest.mark.parametrize("operation", ["start", "adopt"])
+def test_revive_candidate_retains_identity_claims_during_active_name_gap(
+    operation: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager, fake, old = prepare_revive(tmp_path, monkeypatch)
+    real_archive = manager._publish_pinned_directory
+
+    def archive(pinned: subagents_module._PinnedAgentDirectory, destination: Path, *, expected_record: bytes) -> None:
+        real_archive(pinned, destination, expected_record=expected_record)
+        raise AgentDeliveryError("interrupted in active-name gap")
+
+    monkeypatch.setattr(manager, "_publish_pinned_directory", archive)
+    with pytest.raises(AgentDeliveryError):
+        manager.revive("worker")
+    assert not manager._directory("worker").exists() and old.native_session is not None
+    pane = fake.launched[-1][2]
+    with pytest.raises(AgentDeliveryError, match="already registered"):
+        if operation == "start":
+            manager.start("other", cwd=str(tmp_path), resume=old.native_session["value"])
+        else:
+            manager.adopt("other", pane_id=pane, expected_workspace="subagents", expected_cwd=str(tmp_path),
+                          harness="codex", session=old.native_session["value"])
+    assert len(fake.launched) == 2 and fake.closed == [] and fake.submitted == []
+
+
+@pytest.mark.parametrize("change", ["wrong-provider", "partial-session", "duplicate-census", "native-stale-report"])
+def test_revive_rejects_ambiguous_native_identity_or_census(
+    change: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager, fake, old = prepare_revive(tmp_path, monkeypatch)
+    assert old.pane_id is not None
+    if change in ("wrong-provider", "partial-session"):
+        old.native_session = None
+        old.session_agent = "claude" if change == "wrong-provider" else None
+        manager._save(old)
+    elif change == "duplicate-census":
+        fake.presentations.extend([Pane("w1:unrelated", "w1:other", "w1")] * 2)
+    else:
+        fake.infos[old.pane_id] = replace(fake.infos[old.pane_id], agent="codex",
+                                         session_agent=old.session_agent, session_value=old.session_value)
+    before = registry_bytes(manager.registry)
+    assert manager.revive("worker", dry_run=True)["action"] == "blocked"
+    with pytest.raises(AgentDeliveryError):
+        manager.revive("worker")
+    assert registry_bytes(manager.registry) == before and len(fake.launched) == 1 and fake.closed == []
+
+
+@pytest.mark.parametrize("owned_report", [False, True])
+def test_revive_limits_stale_custom_reports_to_saved_report_ownership(
+    owned_report: bool, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager, fake, old = prepare_revive(tmp_path, monkeypatch, harness="muse")
+    assert old.pane_id is not None
+    old.pane_reported_by_agentctl = owned_report
+    manager._save(old)
+    fake.infos[old.pane_id] = replace(fake.infos[old.pane_id], agent="muse",
+                                     session_agent=old.session_agent, session_value=old.session_value)
+    if owned_report:
+        assert manager.revive("worker")["revived"] is True
+        assert len(fake.launched) == 2
+    else:
+        with pytest.raises(AgentDeliveryError):
+            manager.revive("worker")
+        assert len(fake.launched) == 1 and fake.closed == []
+
+
+@pytest.mark.parametrize("value", [123, [], {}, "relative-shell"])
+def test_revive_malformed_persisted_shell_proof_refuses_without_uncaught_type_error(
+    value: object, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from agentctl import revive as recovery
+    manager, fake, old = prepare_revive(tmp_path, monkeypatch)
+    proof = recovery._proof(manager, old)
+    proof["shell_executable"] = value
+    with pytest.raises(AgentDeliveryError, match="invalid revive"):
+        recovery._validate_proof(proof)
+    assert len(fake.launched) == 1 and fake.closed == []
+
+
+def test_revive_keeps_old_pane_reserved_until_published_cleanup_finishes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager, fake, old = prepare_revive(tmp_path, monkeypatch)
+    assert old.pane_id is not None
+    monkeypatch.setattr(fake, "close_pane", lambda _pane: (_ for _ in ()).throw(HerdrUnavailable("close unavailable")))
+    with pytest.raises(AgentDeliveryError):
+        manager.revive("worker")
+    assert manager._directory("worker").exists()
+    assert (manager.registry / "archive" / f"worker-{old.token}").exists()
+    fake.infos[old.pane_id] = replace(fake.infos[old.pane_id], agent="codex", status="idle")
+    fake.harness_pids[old.pane_id] = 999
+    with pytest.raises(AgentDeliveryError, match="already registered"):
+        manager.adopt("other", pane_id=old.pane_id, expected_workspace="subagents", expected_cwd=str(tmp_path), harness="codex")
+    assert not manager._directory("other").exists() and len(fake.launched) == 2 and fake.closed == []
+
+
+def test_revive_dry_run_blocks_an_archive_restored_to_the_original_running_record(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager, fake, old = prepare_revive(tmp_path, monkeypatch)
+    assert old.pane_id is not None
+    original = (manager._directory("worker") / "agent.json").read_bytes()
+    close = fake.close_pane
+    monkeypatch.setattr(fake, "close_pane", lambda _pane: (_ for _ in ()).throw(HerdrUnavailable("close unavailable")))
+    with pytest.raises(AgentDeliveryError):
+        manager.revive("worker")
+    close(old.pane_id)
+    (manager.registry / "archive" / f"worker-{old.token}" / "agent.json").write_bytes(original)
+    before = registry_bytes(manager.registry)
+    result = manager.revive("worker", dry_run=True)
+    assert result["action"] == "blocked" and "prepared stopped record" in str(result["reason"])
+    with pytest.raises(AgentDeliveryError, match="prepared stopped record"):
+        manager.revive("worker")
+    assert registry_bytes(manager.registry) == before and len(fake.launched) == 2
+
+
+def test_revive_oversized_journal_timestamp_refuses_control_without_a_traceback(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager, fake, old = prepare_revive(tmp_path, monkeypatch)
+    monkeypatch.setattr(fake, "close_pane", lambda _pane: (_ for _ in ()).throw(HerdrUnavailable("close unavailable")))
+    with pytest.raises(AgentDeliveryError):
+        manager.revive("worker")
+    journal_path = manager.registry / ".revives" / f"{old.token}.json"
+    journal = json.loads(journal_path.read_bytes())
+    journal["started_at"] = 10 ** 400
+    journal_path.write_text(json.dumps(journal), encoding="utf-8")
+    before = registry_bytes(manager.registry)
+    with pytest.raises(AgentDeliveryError, match="invalid revive journal"):
+        manager.revive("worker", dry_run=True)
+    with pytest.raises(AgentDeliveryError, match="invalid revive journal"):
+        manager.stop("worker")
+    assert registry_bytes(manager.registry) == before and len(fake.launched) == 2 and fake.closed == []
+
+
+def test_revive_retries_a_stale_native_report_without_relaxing_ordinary_session_routing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from agentctl import agent, revive as recovery
+    manager, fake, old = prepare_revive(tmp_path, monkeypatch, harness="muse")
+    assert old.pane_id is not None
+    fake.infos[old.pane_id] = replace(fake.infos[old.pane_id], agent="muse",
+                                     session_agent=old.session_agent, session_value=old.session_value)
+    write = recovery._write_journal
+
+    def interrupt(journal_manager: ManagedAgents, journal: dict[str, object]) -> None:
+        if journal["phase"] == "ready":
+            raise AgentDeliveryError("interrupted before ready publication")
+        write(journal_manager, journal)
+
+    monkeypatch.setattr(recovery, "_write_journal", interrupt)
+    with pytest.raises(AgentDeliveryError, match="interrupted before ready publication"):
+        manager.revive("worker")
+    assert len(fake.launched) == 2 and fake.closed == []
+    with pytest.raises(AgentDeliveryError, match="exactly one live pane"):
+        agent.resolve_target(manager.client, agent.Target(session_agent=old.session_agent, session_value=old.session_value))
+    before = registry_bytes(manager.registry)
+    assert manager.revive("worker", dry_run=True)["action"] == "recover"
+    assert registry_bytes(manager.registry) == before
+    monkeypatch.setattr(recovery, "_write_journal", write)
+    assert manager.revive("worker", expected_token=old.token)["revived"] is True
+    assert len(fake.launched) == 2 and fake.closed == [old.tab_id]
+
+
+@pytest.mark.parametrize("change", ["third-session", "old-shell", "old-alive"])
+def test_revive_stale_session_exclusion_requires_the_same_dead_generation(
+    change: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from agentctl import revive as recovery
+    manager, fake, old = prepare_revive(tmp_path, monkeypatch, harness="muse")
+    assert old.pane_id is not None
+    fake.infos[old.pane_id] = replace(fake.infos[old.pane_id], agent="muse",
+                                     session_agent=old.session_agent, session_value=old.session_value)
+    proof = recovery._proof(manager, old)
+    guarded = recovery._candidate_manager(manager, old, proof).client
+    if change == "third-session":
+        fake.presentations.append(Pane("w1:third", "w1:third-tab", "w1"))
+        fake.infos["w1:third"] = replace(fake.infos[old.pane_id], pane_id="w1:third", agent="muse", status="idle")
+        with pytest.raises(AgentDeliveryError):
+            manager.revive("worker")
+        assert not (manager.registry / "archive" / f"worker-{old.token}").exists()
+    else:
+        if change == "old-shell":
+            fake.foreign_shell_identity = replace(fake.foreign_shell_identity,
+                                                   starttime_ticks=fake.foreign_shell_identity.starttime_ticks + 1)
+        else:
+            monkeypatch.setattr(fake, "process_liveness", lambda _identity: "alive")
+        with pytest.raises(AgentDeliveryError):
+            guarded.panes()
+        assert len(fake.launched) == 1
+    assert fake.closed == [] and fake.submitted == []
+
+
+@pytest.mark.parametrize("change", ["duplicate", "tab", "workspace", "missing"])
+def test_revive_exclusion_validates_the_exact_filtered_census(
+    change: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from agentctl import revive as recovery
+    manager, fake, old = prepare_revive(tmp_path, monkeypatch, harness="muse")
+    assert old.pane_id is not None
+    fake.infos[old.pane_id] = replace(fake.infos[old.pane_id], agent="muse",
+                                     session_agent=old.session_agent, session_value=old.session_value)
+    proof = recovery._proof(manager, old)
+    guarded = recovery._candidate_manager(manager, old, proof).client
+    census = fake.panes()
+    if change == "duplicate":
+        census = (*census, census[0])
+    elif change == "missing":
+        census = ()
+    else:
+        census = (replace(census[0], **{f"{change}_id": "changed"}),)
+    monkeypatch.setattr(recovery, "_proof", lambda _manager, _record: proof)
+    monkeypatch.setattr(fake, "panes", lambda: census)
+    with pytest.raises(AgentDeliveryError, match="census"):
+        guarded.panes()
+    assert len(fake.launched) == 1 and fake.closed == []
+
+
+def test_revive_retry_rechecks_native_uniqueness_in_other_workspaces(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager, fake, old = prepare_revive(tmp_path, monkeypatch, harness="muse")
+    assert old.pane_id is not None
+    fake.infos[old.pane_id] = replace(fake.infos[old.pane_id], agent="muse",
+                                     session_agent=old.session_agent, session_value=old.session_value)
+
+    def interrupt(_pinned: subagents_module._PinnedAgentDirectory, _destination: Path, *, expected_record: bytes) -> None:
+        raise AgentDeliveryError("interrupted before archival")
+
+    monkeypatch.setattr(manager, "_publish_pinned_directory", interrupt)
+    with pytest.raises(AgentDeliveryError, match="interrupted before archival"):
+        manager.revive("worker")
+    fake.presentations.append(Pane("w2:third", "w2:third-tab", "w2"))
+    fake.infos["w2:third"] = replace(fake.infos[old.pane_id], pane_id="w2:third", workspace_id="w2",
+                                     agent="muse", status="idle")
+
+    def census(workspace: str | None = None) -> tuple[Pane, ...]:
+        return tuple(pane for pane in fake.presentations if workspace is None or pane.workspace_id == workspace)
+
+    monkeypatch.setattr(fake, "panes", census)
+    before = registry_bytes(manager.registry)
+    plan = manager.revive("worker", dry_run=True)
+    assert plan["action"] == "blocked" and "exactly one live pane" in str(plan["reason"])
+    with pytest.raises(AgentDeliveryError):
+        manager.revive("worker", expected_token=old.token)
+    assert registry_bytes(manager.registry) == before and len(fake.launched) == 2 and fake.closed == []

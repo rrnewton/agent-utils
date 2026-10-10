@@ -649,9 +649,17 @@ fn enqueue_internal(
     let filename = format!("{identifier}.json");
     let path = directories.inbox.join(&filename);
     let _lock = if serialize {
+        let directory_identity = queue_directory_identity(root)?;
         let lock_path = root.join(".delivery.lock");
         let lock = open_private_lock(&lock_path, "queue delivery lock")?;
         lock_exclusive_with_runtime(&lock, &lock_path, "queue delivery", runtime)?;
+        verify_queue_lock(
+            root,
+            directory_identity,
+            &lock_path,
+            &lock,
+            "queue delivery lock",
+        )?;
         Some(lock)
     } else {
         None
@@ -749,11 +757,19 @@ fn drain_with_runtime_binding<A: AgentApi + ?Sized>(
     runtime: &dyn AgentRuntime,
     allow_legacy_workspace_binding: bool,
 ) -> AgentResult<QueueResult> {
-    bind_queue_with_runtime(root, target, runtime, allow_legacy_workspace_binding)?;
-    let directories = prepare(root)?;
+    let directory_identity =
+        bind_queue_with_runtime(root, target, runtime, allow_legacy_workspace_binding)?;
+    let directories = QueueDirectories::new(root);
     let queue_lock_path = root.join(".delivery.lock");
     let queue_lock = open_private_lock(&queue_lock_path, "queue delivery lock")?;
     lock_exclusive_with_runtime(&queue_lock, &queue_lock_path, "queue delivery", runtime)?;
+    verify_queue_lock(
+        root,
+        directory_identity,
+        &queue_lock_path,
+        &queue_lock,
+        "queue delivery lock",
+    )?;
     let mut delivered = Vec::new();
     let mut quarantined = recover_inflight(&directories)?;
     let mut blocked = None;
@@ -1551,6 +1567,73 @@ fn prepare(root: &Path) -> AgentResult<QueueDirectories> {
     Ok(directories)
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct QueueDirectoryIdentity {
+    device: u64,
+    inode: u64,
+}
+
+fn queue_directory_identity(root: &Path) -> AgentResult<QueueDirectoryIdentity> {
+    let metadata = fs::symlink_metadata(root)
+        .map_err(|error| io_error("inspect queue directory", root, error))?;
+    let uid = unsafe { libc::getuid() };
+    if !metadata.file_type().is_dir() || metadata.uid() != uid {
+        return Err(AgentError::delivery(format!(
+            "unsafe queue directory: {}",
+            root.display()
+        )));
+    }
+    if metadata.permissions().mode() & 0o077 != 0 {
+        return Err(AgentError::delivery(format!(
+            "queue directory is not private: {}",
+            root.display()
+        )));
+    }
+    Ok(QueueDirectoryIdentity {
+        device: metadata.dev(),
+        inode: metadata.ino(),
+    })
+}
+
+fn verify_queue_lock(
+    root: &Path,
+    directory_identity: QueueDirectoryIdentity,
+    path: &Path,
+    lock: &File,
+    purpose: &str,
+) -> AgentResult<()> {
+    if queue_directory_identity(root)? != directory_identity {
+        return Err(AgentError::delivery(format!(
+            "queue directory changed while waiting for {purpose}: {}",
+            root.display()
+        )));
+    }
+    let current = fs::symlink_metadata(path)
+        .map_err(|error| io_error(&format!("inspect {purpose} after locking"), path, error))?;
+    let opened = lock
+        .metadata()
+        .map_err(|error| io_error(&format!("inspect {purpose} after locking"), path, error))?;
+    let uid = unsafe { libc::getuid() };
+    for metadata in [&current, &opened] {
+        if !metadata.file_type().is_file()
+            || metadata.uid() != uid
+            || metadata.permissions().mode() & 0o077 != 0
+        {
+            return Err(AgentError::delivery(format!(
+                "unsafe {purpose}: {}",
+                path.display()
+            )));
+        }
+    }
+    if (current.dev(), current.ino()) != (opened.dev(), opened.ino()) {
+        return Err(AgentError::delivery(format!(
+            "{purpose} changed while waiting: {}",
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
 pub(crate) fn create_private_directory(
     path: &Path,
     purpose: &str,
@@ -1680,7 +1763,7 @@ fn binding_identity_matches(
 
 #[cfg(test)]
 fn bind_queue(root: &Path, target: &Target) -> AgentResult<()> {
-    bind_queue_with_runtime(root, target, &SystemRuntime::default(), false)
+    bind_queue_with_runtime(root, target, &SystemRuntime::default(), false).map(|_| ())
 }
 
 fn bind_queue_with_runtime(
@@ -1688,13 +1771,21 @@ fn bind_queue_with_runtime(
     target: &Target,
     runtime: &dyn AgentRuntime,
     allow_legacy_workspace_binding: bool,
-) -> AgentResult<()> {
+) -> AgentResult<QueueDirectoryIdentity> {
     validate_target_authority(target)?;
     prepare(root)?;
+    let directory_identity = queue_directory_identity(root)?;
     let lock_path = root.join(".binding.lock");
     let binding_path = root.join("target.json");
     let lock = open_private_lock(&lock_path, "queue binding lock")?;
     lock_exclusive_with_runtime(&lock, &lock_path, "queue binding", runtime)?;
+    verify_queue_lock(
+        root,
+        directory_identity,
+        &lock_path,
+        &lock,
+        "queue binding lock",
+    )?;
     let expected = binding(target)?;
     match fs::symlink_metadata(&binding_path) {
         Ok(_) => {
@@ -1717,7 +1808,7 @@ fn bind_queue_with_runtime(
             ))
         }
     }
-    Ok(())
+    Ok(directory_identity)
 }
 
 /// Replace one queue's exact target binding after a verified pane move.
@@ -1735,6 +1826,7 @@ pub(crate) fn rebind_queue(
     validate_target_authority(previous)?;
     validate_target_authority(replacement)?;
     prepare(root)?;
+    let directory_identity = queue_directory_identity(root)?;
 
     let delivery_path = root.join(".delivery.lock");
     let delivery = open_private_lock(&delivery_path, "queue delivery lock")?;
@@ -1744,6 +1836,13 @@ pub(crate) fn rebind_queue(
         "queue delivery",
         &SystemRuntime::default(),
     )?;
+    verify_queue_lock(
+        root,
+        directory_identity,
+        &delivery_path,
+        &delivery,
+        "queue delivery lock",
+    )?;
 
     let binding_lock_path = root.join(".binding.lock");
     let binding_lock = open_private_lock(&binding_lock_path, "queue binding lock")?;
@@ -1752,6 +1851,13 @@ pub(crate) fn rebind_queue(
         &binding_lock_path,
         "queue binding",
         &SystemRuntime::default(),
+    )?;
+    verify_queue_lock(
+        root,
+        directory_identity,
+        &binding_lock_path,
+        &binding_lock,
+        "queue binding lock",
     )?;
 
     let path = root.join("target.json");
@@ -1788,6 +1894,7 @@ where
 {
     validate_target_authority(previous)?;
     prepare(root)?;
+    let directory_identity = queue_directory_identity(root)?;
     let delivery_path = root.join(".delivery.lock");
     let delivery = open_private_lock(&delivery_path, "queue delivery lock")?;
     lock_exclusive_with_runtime(
@@ -1796,6 +1903,13 @@ where
         "queue delivery",
         &SystemRuntime::default(),
     )?;
+    verify_queue_lock(
+        root,
+        directory_identity,
+        &delivery_path,
+        &delivery,
+        "queue delivery lock",
+    )?;
     let binding_lock_path = root.join(".binding.lock");
     let binding_lock = open_private_lock(&binding_lock_path, "queue binding lock")?;
     lock_exclusive_with_runtime(
@@ -1803,6 +1917,13 @@ where
         &binding_lock_path,
         "queue binding",
         &SystemRuntime::default(),
+    )?;
+    verify_queue_lock(
+        root,
+        directory_identity,
+        &binding_lock_path,
+        &binding_lock,
+        "queue binding lock",
     )?;
     let path = root.join("target.json");
     let old = binding(previous)?;
@@ -4369,6 +4490,190 @@ mod tests {
         assert!(error.to_string().contains("queue delivery lock"));
         assert_eq!(fs::read(&victim).unwrap(), b"unchanged");
         assert!(fake.runs().is_empty());
+    }
+
+    fn queue_artifacts(root: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
+        fn visit(root: &Path, path: &Path, files: &mut BTreeMap<PathBuf, Vec<u8>>) {
+            for entry in fs::read_dir(path).expect("read fixture directory") {
+                let path = entry.expect("fixture entry").path();
+                if path.is_dir() {
+                    visit(root, &path, files);
+                } else {
+                    files.insert(
+                        path.strip_prefix(root).unwrap().to_owned(),
+                        fs::read(&path).expect("read fixture artifact"),
+                    );
+                }
+            }
+        }
+        let mut files = BTreeMap::new();
+        visit(root, root, &mut files);
+        files
+    }
+
+    #[test]
+    fn queue_waiter_refuses_archived_directory_or_replaced_lock() {
+        struct OnLockWait<F> {
+            clock: FakeRuntime,
+            operation: Mutex<Option<F>>,
+        }
+        impl<F: FnOnce()> AgentRuntime for OnLockWait<F> {
+            fn monotonic(&self) -> Duration {
+                self.clock.monotonic()
+            }
+
+            fn sleep(&self, duration: Duration) {
+                if let Some(operation) = self.operation.lock().expect("wait operation").take() {
+                    operation();
+                }
+                self.clock.sleep(duration);
+            }
+        }
+
+        for operation in ["enqueue", "drain", "drain-binding"] {
+            for replacement in ["directory", "directory-reused-lock", "lock"] {
+                let parent = TestDirectory::new("queue-generation-waiter");
+                let active = parent.path().join("worker");
+                let queue = active.join("queue");
+                let archive = parent.path().join("archive/worker-old");
+                create_private_directory(archive.parent().unwrap(), "test archive", false, false)
+                    .unwrap();
+                enqueue(&queue, "old pending prompt", Some("old")).unwrap();
+                bind_queue(&queue, &target()).unwrap();
+                fs::write(active.join("agent.json"), b"old lifetime\n").unwrap();
+                for folder in ["inflight", "failed", "processed"] {
+                    atomic_json(
+                        &queue.join(folder).join("retained.json"),
+                        &json!({"text": folder}),
+                    )
+                    .unwrap();
+                }
+                let lock_name = if operation == "drain-binding" {
+                    ".binding.lock"
+                } else {
+                    ".delivery.lock"
+                };
+                let holder =
+                    open_private_lock(&queue.join(lock_name), "test queue holder").unwrap();
+                holder.lock_exclusive().unwrap();
+                let attempted = AtomicBool::new(false);
+                let expected = Mutex::new(BTreeMap::new());
+                let runtime = OnLockWait {
+                    clock: FakeRuntime::default(),
+                    operation: Mutex::new(Some(|| {
+                        attempted.store(true, AtomicOrdering::SeqCst);
+                        if replacement == "lock" {
+                            let path = queue.join(lock_name);
+                            fs::rename(&path, queue.join(format!(".retired{lock_name}"))).unwrap();
+                            drop(open_private_lock(&path, "replacement queue lock").unwrap());
+                            expected
+                                .lock()
+                                .unwrap()
+                                .insert(active.clone(), queue_artifacts(&active));
+                        } else {
+                            fs::rename(&active, &archive).unwrap();
+                            enqueue(&queue, "new lifetime prompt", Some("new")).unwrap();
+                            let mut next_target = target();
+                            next_target.session_value = Some("session-2".to_owned());
+                            bind_queue(&queue, &next_target).unwrap();
+                            fs::write(active.join("agent.json"), b"new lifetime\n").unwrap();
+                            if replacement == "directory-reused-lock" {
+                                let path = queue.join(lock_name);
+                                fs::rename(&path, queue.join(format!(".replacement{lock_name}")))
+                                    .unwrap();
+                                fs::hard_link(archive.join("queue").join(lock_name), &path)
+                                    .unwrap();
+                            }
+                            let mut snapshots = expected.lock().unwrap();
+                            snapshots.insert(archive.clone(), queue_artifacts(&archive));
+                            snapshots.insert(active.clone(), queue_artifacts(&active));
+                        }
+                        FileExt::unlock(&holder).unwrap();
+                    })),
+                };
+                let fake = FakeAgent::new(&["idle", "working", "idle"]);
+                let result = if operation == "enqueue" {
+                    enqueue_internal(&queue, "stale writer prompt", Some("stale"), true, &runtime)
+                        .map(|_| ())
+                } else {
+                    drain_with_runtime(&fake, &target(), &queue, DrainOptions::default(), &runtime)
+                        .map(|_| ())
+                };
+                let error = result.expect_err("a stale waiter must refuse the reused path");
+                assert!(
+                    attempted.load(AtomicOrdering::SeqCst),
+                    "{operation}/{replacement}"
+                );
+                assert!(matches!(error, AgentError::Delivery(_)), "{error}");
+                assert!(
+                    error.to_string().contains("changed while waiting"),
+                    "{error}"
+                );
+                assert!(fake.runs().is_empty());
+                let snapshots = expected.lock().unwrap();
+                assert!(!snapshots.is_empty());
+                for (root, snapshot) in snapshots.iter() {
+                    assert_eq!(
+                        &queue_artifacts(root),
+                        snapshot,
+                        "{operation}/{replacement}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn drain_keeps_queue_generation_from_binding_until_delivery() {
+        let parent = TestDirectory::new("queue-generation-between-locks");
+        let active = parent.path().join("worker");
+        let candidate = parent.path().join("candidate");
+        let archive = parent.path().join("old-worker");
+        let queue = active.join("queue");
+        enqueue(&queue, "old pending prompt", Some("old")).unwrap();
+        let next_queue = candidate.join("queue");
+        enqueue(&next_queue, "new pending prompt", Some("new")).unwrap();
+        let mut next_target = target();
+        next_target.session_value = Some("session-2".to_owned());
+        bind_queue(&next_queue, &next_target).unwrap();
+        let expected_new = queue_artifacts(&candidate);
+        let swapped = Arc::new(AtomicBool::new(false));
+        let noticed = Arc::clone(&swapped);
+        let observed_queue = queue.clone();
+        let observed_active = active.clone();
+        let observed_archive = archive.clone();
+        struct ClearSyncHook;
+        impl Drop for ClearSyncHook {
+            fn drop(&mut self) {
+                DIRECTORY_SYNC_HOOK.with(|hook| *hook.borrow_mut() = None);
+            }
+        }
+        let _clear_hook = ClearSyncHook;
+        DIRECTORY_SYNC_HOOK.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move |path| {
+                if path == observed_queue
+                    && observed_queue.join("target.json").exists()
+                    && !noticed.swap(true, AtomicOrdering::SeqCst)
+                {
+                    fs::rename(&observed_active, &observed_archive)?;
+                    fs::rename(&candidate, &observed_active)?;
+                }
+                Ok(())
+            }));
+        });
+        let fake = FakeAgent::new(&["idle", "working", "idle"]);
+        let error = drain(&fake, &target(), &queue, DrainOptions::default()).unwrap_err();
+        assert!(swapped.load(AtomicOrdering::SeqCst));
+        assert!(
+            error
+                .to_string()
+                .contains("queue directory changed while waiting"),
+            "{error}"
+        );
+        assert!(fake.runs().is_empty());
+        assert_eq!(queue_artifacts(&active), expected_new);
+        let old = read_private_json(&archive.join("queue/inbox/old.json")).unwrap();
+        assert_eq!(old["delivery_attempts"], 0);
     }
 
     #[test]

@@ -19,11 +19,11 @@ import subprocess
 import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
-from typing import Protocol
+from typing import Literal, Protocol
 
 from agentctl.errors import HerdrUnavailable, InputExpectationFailed
 from agentctl.jsonx import as_mapping, as_sequence, get_int, get_str, opt_str
-from agentctl.procstat import parse_process_stat
+from agentctl.procstat import ProcessStat, parse_process_stat
 from agentctl.submission import (
     SCREEN_LINES as SUBMISSION_SCREEN_LINES,
     VERIFIED_HARNESSES,
@@ -940,6 +940,125 @@ class HerdrClient:
             return os.path.realpath(os.readlink(f"/proc/{pid}/exe"))
         except OSError:
             return None
+
+    def process_liveness(
+        self, expected: CustomProcessIdentity,
+    ) -> Literal["alive", "dead", "unknown"]:
+        """Inspect a recorded local process without confusing probe failure with death.
+
+        Only a changed boot or process generation, or a positive kernel exit
+        indication, establishes death. A live process with a different image
+        remains unknown. This proof authorizes no input or signal on its own.
+        """
+        numbers = (expected.version, expected.pid, expected.starttime_ticks,
+                   expected.executable_device, expected.executable_inode)
+        if (not hasattr(os, "pidfd_open")
+                or any(type(value) is not int for value in numbers)
+                or expected.version != 1
+                or not isinstance(expected.boot_id, str)
+                or _BOOT_ID.fullmatch(expected.boot_id) is None
+                or not 1 <= expected.pid <= _MAX_PROCESS_ID
+                or any(not 1 <= value <= _MAX_U64 for value in numbers[2:])):
+            return "unknown"
+        try:
+            boot = self._liveness_boot_identity()
+            if boot != expected.boot_id:
+                return "dead" if self._liveness_boot_identity() == boot else "unknown"
+            descriptor: int | None = None
+            for _attempt in range(4):
+                try:
+                    descriptor = os.pidfd_open(expected.pid)
+                    break
+                except InterruptedError:
+                    continue
+                except OSError as exc:
+                    if exc.errno == errno.ESRCH:
+                        return "dead" if self._liveness_boot_identity() == boot else "unknown"
+                    return "unknown"
+            if descriptor is None:
+                return "unknown"
+            try:
+                return self._pinned_process_liveness(expected, descriptor, boot)
+            finally:
+                os.close(descriptor)
+        except (OSError, UnicodeError, ValueError, TypeError):
+            return "unknown"
+
+    @staticmethod
+    def _liveness_boot_identity() -> str:
+        with open("/proc/sys/kernel/random/boot_id", encoding="ascii") as stream:
+            value = stream.read(129)
+        boot = value.strip()
+        if not value or len(value) > 128 or _BOOT_ID.fullmatch(boot) is None:
+            raise ValueError("invalid Linux boot identity")
+        return boot
+
+    @staticmethod
+    def _liveness_process_stat(pid: int) -> ProcessStat:
+        with open(f"/proc/{pid}/stat", "rb") as stream:
+            value = stream.read(8193)
+        parsed = parse_process_stat(value)
+        if not value or len(value) > 8192 or parsed is None or parsed.pid != pid or parsed.starttime < 1:
+            raise ValueError("invalid Linux process generation")
+        return parsed
+
+    @staticmethod
+    def _liveness_executable_identity(pid: int) -> tuple[int, int]:
+        metadata = os.stat(f"/proc/{pid}/exe")
+        if (not stat.S_ISREG(metadata.st_mode)
+                or not 1 <= metadata.st_dev <= _MAX_U64
+                or not 1 <= metadata.st_ino <= _MAX_U64):
+            raise ValueError("invalid Linux executable identity")
+        return metadata.st_dev, metadata.st_ino
+
+    @staticmethod
+    def _pidfd_exited(descriptor: int) -> bool:
+        poller = select.poll()
+        poller.register(descriptor, select.POLLIN)
+        for _attempt in range(4):
+            try:
+                events = poller.poll(0)
+                break
+            except InterruptedError:
+                continue
+        else:
+            raise InterruptedError("pidfd inspection interrupted repeatedly")
+        if not events:
+            return False
+        if (len(events) != 1 or events[0][0] != descriptor
+                or not events[0][1] & select.POLLIN
+                or events[0][1] & ~(select.POLLIN | select.POLLHUP)):
+            raise ValueError("invalid pidfd exit indication")
+        return True
+
+    def _pinned_process_liveness(
+        self, expected: CustomProcessIdentity, descriptor: int, boot: str,
+    ) -> Literal["alive", "dead", "unknown"]:
+        if self._pidfd_exited(descriptor):
+            return "dead" if self._liveness_boot_identity() == boot else "unknown"
+        first = self._liveness_process_stat(expected.pid)
+        dead_states = ("Z", "X", "x")
+        if first.starttime != expected.starttime_ticks or first.state in dead_states:
+            second = self._liveness_process_stat(expected.pid)
+            stable_boot = self._liveness_boot_identity() == boot
+            self._pidfd_exited(descriptor)
+            if (stable_boot and first.starttime == second.starttime
+                    and (first.starttime != expected.starttime_ticks
+                         or second.state in dead_states)):
+                return "dead"
+            return "unknown"
+        image_before = self._liveness_executable_identity(expected.pid)
+        second = self._liveness_process_stat(expected.pid)
+        image_after = self._liveness_executable_identity(expected.pid)
+        stable_boot = self._liveness_boot_identity() == boot
+        exited = self._pidfd_exited(descriptor)
+        if not stable_boot or first.starttime != second.starttime or image_before != image_after:
+            return "unknown"
+        if exited:
+            return "dead"
+        if second.state in dead_states:
+            return "unknown"
+        return "alive" if image_before == (expected.executable_device, expected.executable_inode) else "unknown"
 
     @staticmethod
     def _process_identity(

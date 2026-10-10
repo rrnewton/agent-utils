@@ -24,6 +24,16 @@ while keeping their terminals available for direct inspection.
    agentctl status reviewer
    ```
 
+   If a running record's harness was killed, preview recovery and resume its
+   recorded conversation in a fresh tab. The old queue and quarantine are
+   archived without replaying prompts:
+
+   ```sh
+   agentctl revive reviewer --dry-run
+   agentctl revive reviewer
+   agentctl revive --all --dry-run
+   ```
+
    A project can keep owner-specific launch choices in the private, ignored
    `.agentctl/profiles.json` file. Inspect safe profile metadata, then select
    one without restating its model, environment, or permission arguments:
