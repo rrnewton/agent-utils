@@ -92,7 +92,7 @@ not scrape.
 
 ## Tests
 
-`cargo test -p agent-usage`: 33 unit tests (burn arithmetic including resets, proration and
+`cargo test -p agent-usage`: 34 unit tests (burn arithmetic including resets, proration and
 short histories; both reply parsers on fixtures; transcript parsing, incremental scan,
 duplicate lines and binary search; paths; argument parsing) and 5 end-to-end tests that drive
 the binary against a fake `curl`, a fake `codex app-server` and a fake `sqlite3`, including a

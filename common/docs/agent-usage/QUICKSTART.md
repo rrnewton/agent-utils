@@ -36,6 +36,7 @@ install -m 0755 rs/target/release/agent-usage ~/bin/agent-usage
 ```bash
 agent-usage                 # report; polls a provider whose newest reading is over 2 minutes old
 agent-usage --json          # the same, for scripts and agents
+agent-usage --line          # one line: meters, burn per hour, resets, 1 h tokens
 agent-usage --cached        # never poll; report from the history only
 agent-usage daemon --detach # poll every 15 minutes in the background so burn rates have data
 agent-usage daemon status   # is it running, how fresh is the history

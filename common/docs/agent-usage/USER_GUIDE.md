@@ -7,7 +7,7 @@ host has used recently. It covers the Claude Code and Codex CLIs.
 ## Commands
 
 ```text
-agent-usage [status] [--json] [--provider P] [--max-age DUR | --cached] [--no-tokens]
+agent-usage [status] [--json | --line] [--provider P] [--max-age DUR | --cached] [--no-tokens]
 agent-usage poll [--json] [--provider P]
 agent-usage daemon [--interval DUR] [--once] [--detach]
 agent-usage daemon status [--json] | stop
@@ -19,7 +19,12 @@ agent-usage quickstart | userguide | help | --version
 - `status` (the default) prints the report. For each selected provider it reuses the newest
   sample in the history when that sample is younger than `--max-age` (default 120 s), and
   otherwise takes a new reading first. `--max-age 0` always reads; `--cached` never does.
-  `--no-tokens` skips the Claude transcript scan.
+  `--no-tokens` skips the Claude transcript scan. `--line` prints the gist on one line, for a
+  status line or an agent that wants it in few tokens:
+  `claude[max] 5h 34% +8.0/h reset 1h25m, wk 22% +1.0/h reset 1d03h, wk:Fable 5% +0.4/h reset 1d03h | codex no-plan | 1h tokens: claude 304M (977 req), codex 52M`.
+  `5h` is the session window, `wk` the weekly one, `+N/h` the projection's rate in points per
+  hour, and `FULL-BEFORE-RESET` marks a window that would fill before it resets; `no-plan` is
+  `unavailable` and `UNKNOWN` is `error`.
 - `poll` reads every selected provider now, appends the samples, and prints one line each.
 - `daemon` polls every `--interval` (default 15 minutes, at least 60 s) in the foreground until
   SIGTERM, SIGINT or SIGHUP. Only one daemon runs per cache directory; a second exits with 75.

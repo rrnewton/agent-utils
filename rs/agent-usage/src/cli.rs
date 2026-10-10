@@ -31,7 +31,7 @@ Local token use is reported too, from Claude Code transcripts and Codex's thread
 including on hosts that have no plan limits (API keys, cloud providers, gateways).
 
 USAGE
-  agent-usage [status] [--json] [--provider P] [--max-age DUR | --cached] [--no-tokens]
+  agent-usage [status] [--json | --line] [--provider P] [--max-age DUR | --cached] [--no-tokens]
   agent-usage poll [--json] [--provider P]
   agent-usage daemon [--interval DUR] [--once] [--detach]
   agent-usage daemon status | stop
@@ -51,6 +51,8 @@ SUBCOMMANDS
 
 OPTIONS
   --json          Machine-readable output (status, poll, history, daemon status).
+  --line          status: one line (meters, burn per hour, reset, 1 h tokens), for status
+                  lines and agents that want the gist in few tokens.
   --provider P    claude, codex or all (default all). Repeatable.
   --max-age DUR   status: reuse a sample younger than DUR instead of polling. Default 120s.
                   0 always polls.
@@ -86,6 +88,7 @@ struct Args {
     command: String,
     sub: Option<String>,
     json: bool,
+    line: bool,
     providers: Vec<&'static str>,
     max_age: Option<i64>,
     tokens: bool,
@@ -100,6 +103,7 @@ fn parse(args: Vec<String>) -> Result<Args, String> {
         command: "status".into(),
         sub: None,
         json: false,
+        line: false,
         providers: Vec::new(),
         max_age: Some(DEFAULT_MAX_AGE),
         tokens: true,
@@ -114,6 +118,7 @@ fn parse(args: Vec<String>) -> Result<Args, String> {
         let mut value = |name: &str| it.next().ok_or_else(|| format!("{name} needs a value"));
         match arg.as_str() {
             "--json" => out.json = true,
+            "--line" => out.line = true,
             "--cached" => out.max_age = None,
             "--no-tokens" => out.tokens = false,
             "--once" => out.once = true,
@@ -252,6 +257,8 @@ fn run(args: &Args) -> Result<i32, String> {
                     "{}",
                     serde_json::to_string_pretty(&rep).map_err(|e| e.to_string())?
                 );
+            } else if args.line {
+                println!("{}", report::render_line(&rep));
             } else {
                 print!("{}", report::render(&rep));
                 if rep.providers.is_empty() {
@@ -419,6 +426,7 @@ mod tests {
         assert!(a.json);
         assert_eq!(a.providers, ["claude"]);
         assert_eq!(a.max_age, Some(0));
+        assert!(p(&["--line"]).unwrap().line);
         let a = p(&["status", "--cached", "--no-tokens"]).unwrap();
         assert_eq!(a.max_age, None);
         assert!(!a.tokens);
