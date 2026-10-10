@@ -2192,6 +2192,7 @@ function setSearchOpen(open) {
   renderChannelFreshness();
   // Both columns: there is one search bar. `#229 desktop-two-column`.
   eachColumn(renderScrollTools);
+  if (columnsShown) filterSideCards();
   if (open) {
     el("search-field").focus();
   }
@@ -10254,7 +10255,7 @@ async function changeChannelView(view, threadId = null, summary = null) {
   // `#229 desktop-two-column`. Not in two columns, though: the left column is Main there because of
   // the layout, not by the reader's choice, and the right column's thread is not a view the channel
   // opens in. Leaving two columns goes back to the choice made in one.
-  if (!columnsShown && !sideActive) {
+  if (!columnsShown && !sideActive && !columnsRestoring) {
     const chosen = viewOnScreen();
     if (chosen) rememberChosenView(chosen);
     // The Threads list is not a view a channel opens in: picked, it leaves the channel to its default.
@@ -20827,6 +20828,12 @@ let columnsChosen = storedColumnsChoice();
 let columnsShown = false;
 
 /**
+ * True while leaving two columns puts back the view last chosen in one: that is the reader's choice
+ * already, and recording it again would turn a channel's default into a choice nobody made.
+ */
+let columnsRestoring = false;
+
+/**
  * By channel, the thread the right column shows, as `{id, summary}`, for this session: two columns
  * left and come back to, or a channel left and come back to, find it selected again.
  *
@@ -21076,7 +21083,19 @@ function enterColumns() {
   const open = channelView === "thread" && selectedThreadId
     ? { id: String(selectedThreadId), summary: selectedThread }
     : sideThreads.get(channel) || null;
-  if (channelView !== "main") guardQuietly(() => changeChannelView("main"))();
+  if (channelView !== "main") {
+    if (clientConfigApplied) {
+      guardQuietly(() => changeChannelView("main"))();
+    } else {
+      // A reopen, before sign-in has answered: Main drawn from what this device saved, with no read.
+      // Nothing is read on a token nobody has proved; the reopen's own read comes once it is.
+      channelView = "main";
+      selectedThreadId = null;
+      selectedThread = null;
+      hydrateChannelScope();
+      restoreChannelComposer();
+    }
+  }
   renderThreadSelect();
   if (open) guardQuietly(() => selectSideThread(open.id, open.summary))();
   else showSideList();
@@ -21099,7 +21118,12 @@ function leaveColumns() {
   renderThreadSelect();
   const opening = openingChannelView();
   if (opening.view !== channelView || (opening.thread || null) !== (selectedThreadId || null)) {
-    guardQuietly(() => changeChannelView(opening.view, opening.thread, opening.summary))();
+    columnsRestoring = true;
+    try {
+      guardQuietly(() => changeChannelView(opening.view, opening.thread, opening.summary))();
+    } finally {
+      columnsRestoring = false;
+    }
   }
 }
 
@@ -21186,11 +21210,25 @@ function renderSideCards() {
     sideCardsDrawn = signature;
     list.replaceChildren(...cards.map(sideCard));
   }
+  filterSideCards();
   const state = cards.length === 0 ? "No threads in this channel yet." : "";
   setTextIfChanged(leftEl("side-list-state"), state);
   if (leftEl("side-list-state").hidden !== (state === "")) leftEl("side-list-state").hidden = state === "";
   const more = olderThreadsOnServer();
   if (leftEl("side-more-threads").hidden === more) leftEl("side-more-threads").hidden = !more;
+}
+
+/**
+ * The search text over the cards, as over the Threads list's (`#129 message-search`): a card the
+ * text does not match goes while the search is open. Links leaves them: a card has no links of its
+ * own, and its thread's are in its messages.
+ */
+function filterSideCards() {
+  const terms = searchOpen ? searchTerms(searchQuery) : [];
+  for (const row of leftEl("side-cards").children) {
+    const text = row.getAttribute("data-search") || "";
+    setClassWord(row, "search-hidden", !terms.every((term) => text.includes(term)));
+  }
 }
 
 /** One card. Every string is text; nothing from the chat service is parsed as markup. */
@@ -21229,7 +21267,8 @@ function sideCard({ choice, text, age, replies, unread }) {
 function showSideList() {
   columns.side.mode = "list";
   renderSideMode();
-  guardQuietly(refreshThreadDirectory)();
+  // Not before sign-in has answered: the reopen's read reads the list behind the cards then.
+  if (clientConfigApplied) guardQuietly(refreshThreadDirectory)();
 }
 
 /**
@@ -24257,6 +24296,7 @@ el("search-field").addEventListener("input", () => {
   const wasEmptied = listEmptied();
   searchQuery = el("search-field").value;
   eachColumn(renderScrollTools);
+  if (columnsShown) filterSideCards();
   // `#212 link-filter`, from review: text that matches nothing takes the reader to the sentence
   // saying so, and text that matches again to the newest line.
   placeForFilter(wasEmptied);

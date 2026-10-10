@@ -35790,9 +35790,10 @@ test("`#229 desktop-two-column`: pressed in a narrow window it waits for a wide 
   assert.equal(page.el("thread-select").value, "flat", "one column again is not the view last chosen in one");
   assert.deepStrictEqual(shownIds(page), ["200", "201", "202", "203", "204"]);
   assert.equal(page.storage.get(COLUMNS_STORAGE), "two", "narrowing the window forgot the choice");
-  // Main in two columns was the layout's, not a choice: the record still opens the channel in All.
-  assert.equal(JSON.parse(page.storage.get(UI_STATE_KEY)).channels[0].channelView, "flat",
-    "two columns recorded Main as the reader's choice of view");
+  // Main in two columns was the layout's, not a choice, and All put back was not one either: the
+  // reader chose no view here, so the channel still opens in its default.
+  assert.deepStrictEqual(JSON.parse(page.storage.get(UI_STATE_KEY)).channels, [],
+    "two columns recorded a view the reader did not choose");
 
   await page.setDesk(true);
   assert.ok(inTwoColumns(page));
@@ -36144,4 +36145,108 @@ test("`#229 desktop-two-column`: leaving two columns returns to the view last ch
   assert.deepStrictEqual(sideIds(page), ["203", "204"], "the thread selected was forgotten");
   // Named as one column named it.
   assert.equal(page.el("side-title").textContent, name);
+});
+
+test("`#229 desktop-two-column`: a thread selected on the right lands on its first unread message, unfolded, at the head of its column", async () => {
+  const page = newPage();
+  const messages = runThread(page, { tail: RUN_TAIL });
+  await signIn(page);
+  await showDiscord(page, messages);
+  await twoColumns(page);
+  const leftTop = page.el("scroll-area").scrollTop;
+  await threadBadge(rowWithId(page, runId(0))).click();
+  await page.settle();
+  const answer = sideRow(page, runId(500));
+  assert.ok(answer, "the thread was not drawn on the right");
+  assert.equal(answer.getAttribute("data-collapsed"), "false", "the answer the reader came for is folded on the right");
+  const top = answer.getBoundingClientRect().top;
+  const head = page.el("side-scroll").getBoundingClientRect().top;
+  assert.ok(top >= head && top <= head + LINE_PX + 8, `the answer landed at ${top}px, not at the head of the right column`);
+  // The left column was not moved by a landing on the right.
+  assert.equal(page.el("scroll-area").scrollTop, leftTop, "the landing on the right scrolled the left column");
+  assert.deepStrictEqual(shownIds(page), [runId(0)], "the left column is not Main");
+});
+
+test("`#229 desktop-two-column`: a pin made in either column is drawn in both", async () => {
+  const page = await threadPage();
+  await twoColumns(page);
+  await threadBadge(rowWithId(page, "201")).click();
+  await page.settle();
+  await tapPin(page, sideRow(page, "201"));
+  assert.equal(page.pinCalls.length, 1);
+  assert.equal(pinChip(sideRow(page, "201")).hidden, false, "the pin is not shown where it was made");
+  assert.equal(pinChip(rowWithId(page, "201")).hidden, false, "the pin is not shown on Main's row for the same message");
+  await tapPin(page, rowWithId(page, "201"));
+  assert.equal(pinChip(rowWithId(page, "201")).hidden, true);
+  assert.equal(pinChip(sideRow(page, "201")).hidden, true, "an unpin on Main did not reach the right column");
+});
+
+test("`#229 desktop-two-column`: the search narrows the cards as it narrows the Threads list", async () => {
+  const page = await threadPage();
+  await twoColumns(page);
+  const [first, second] = threadData().threads;
+  await page.el("search-toggle").click();
+  await page.el("search-field").setValue("second");
+  await page.settle();
+  const shown = () => page.el("side-cards").children.filter((li) => !li.hasClass("search-hidden")).map((li) => li.getAttribute("data-id"));
+  assert.deepStrictEqual(shown(), [second.id], "the search did not reach the cards");
+  await page.el("search-toggle").click();
+  await page.settle();
+  assert.deepStrictEqual(shown(), [second.id, first.id], "closing the search left a card hidden");
+});
+
+test("`#229 desktop-two-column`: another channel shows its own threads on the right, and coming back finds the thread selected there", async () => {
+  const page = newPage();
+  const data = threadData();
+  const other = { id: "1110000000000000002", label: "second team", writable: true };
+  page.channels = [{ ...CHANNEL }, other];
+  page.threadingSupported = true;
+  page.threads = data.threads;
+  await signIn(page);
+  await showDiscord(page, data.messages);
+  await twoColumns(page);
+  await threadBadge(rowWithId(page, "201")).click();
+  await page.settle();
+  assert.deepStrictEqual(sideIds(page), ["201", "202"]);
+  page.el("discord-channel").value = other.id;
+  await page.el("discord-channel").dispatch("change");
+  await page.settle();
+  assert.ok(inTwoColumns(page), "changing channel left two columns");
+  assert.equal(page.el("side-list").hidden, false, "the new channel did not open on its cards");
+  assert.deepStrictEqual(sideIds(page), [], "the last channel's thread is still drawn on the right");
+  page.el("discord-channel").value = CHANNEL.id;
+  await page.el("discord-channel").dispatch("change");
+  await page.settle();
+  assert.deepStrictEqual(sideIds(page), ["201", "202"], "coming back did not find the thread selected there");
+  assert.deepStrictEqual(shownIds(page), ["200", "201", "203"]);
+});
+
+test("`#229 desktop-two-column`: a reopen in two columns reads nothing before sign-in has answered", async () => {
+  const first = await threadPage();
+  await twoColumns(first);
+  const data = threadData();
+  let answer = null;
+  const page = reloadWith(first.storage, data.messages, (p) => {
+    p.threadingSupported = true;
+    p.threads = data.threads;
+    p.wideDesk = true;
+    const config = p.clientConfig;
+    p.clientConfig = (...args) => new Promise((resolve) => {
+      answer = () => resolve(config(...args));
+    });
+  });
+  await page.settle();
+  await page.settle();
+  assert.equal(page.tab(), "discord");
+  assert.ok(inTwoColumns(page), "the reopen did not draw two columns from what the device saved");
+  assert.deepStrictEqual(shownIds(page), ["200", "201", "203"], "the left column is not Main, drawn from the device");
+  assert.deepStrictEqual(page.timelineCalls, [], "a read went out on a token nobody has proved yet");
+  assert.ok(answer, "sign-in never asked for the client configuration");
+  answer();
+  await page.settle();
+  await page.settle();
+  await page.settle();
+  const views = page.timelineCalls.map(viewOf);
+  assert.ok(views.includes("main"), `the reopen did not read Main once sign-in answered: ${JSON.stringify(views)}`);
+  assert.equal(views.filter((view) => view === "main").length, 1, `Main was read more than once: ${JSON.stringify(views)}`);
 });
