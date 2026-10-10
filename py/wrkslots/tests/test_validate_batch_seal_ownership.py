@@ -455,3 +455,104 @@ def test_host_context_recover_retires_a_seal_from_a_coordinator_outside_its_ance
     else:
         assert "recovered validation-batch seals: restored=1 resolved=1" in captured.out
         assert stat.S_IMODE(slot_path.stat().st_mode) == original_mode
+
+
+# A seal its actor can no longer retire (https://github.com/rrnewton/agent-utils/issues/236).
+
+
+def _crashed_seal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> tuple[Path, Path, Path, int]:
+    """A removal killed after it sealed its target, as a killed publisher leaves it."""
+    project, target, seal = _prepare(tmp_path, monkeypatch)
+    original = target.stat().st_mode & 0o777
+    crashed = raw_command_with_census_authority_stub(
+        project,
+        *_remove_command(),
+        env={"WRKSLOTS_TEST_INTERRUPT": "after-validate-batch-seal-target"},
+    )
+    assert crashed.returncode == 86, crashed.stderr
+    assert seal.is_file()
+    assert target.stat().st_mode & 0o777 != original
+    return project, target, seal, original
+
+
+def _rewrite_actor(seal: Path, **fields: object) -> None:
+    raw = json.loads(seal.read_text())
+    raw["actor"].update(fields)
+    seal.write_text(json.dumps(raw, indent=2, sort_keys=True) + "\n")
+
+
+def _classify(project: Path, slot: str) -> subprocess.CompletedProcess[str]:
+    return raw_command_with_census_authority_stub(
+        project,
+        "classify-create-journals",
+        slot,
+        "--slot-type",
+        "validate",
+        "--agent",
+        f"validate-{slot}",
+        "--format",
+        "json",
+    )
+
+
+@pytest.mark.parametrize("actor", ("exited", "pid-reused"))
+def test_a_dead_actors_seal_is_retired_by_the_next_create(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, actor: str
+) -> None:
+    """Classification passes a proven-dead actor's seal; create retires it.
+
+    The seal records the process that authorized the removal, which in
+    production is the killed publisher itself. "exited" records a process that
+    has since exited; "pid-reused" names a live PID with another start time,
+    so the recorded generation exited.
+    """
+    project, target, seal, original = _crashed_seal(tmp_path, monkeypatch)
+    if actor == "exited":
+        child = subprocess.Popen(["sleep", "60"])
+        try:
+            exited = wrkslots._read_process_identity(child.pid)
+        finally:
+            child.kill()
+            child.wait()
+        _rewrite_actor(seal, **dataclasses.asdict(exited))
+    else:
+        live = wrkslots._read_process_identity(os.getpid())
+        _rewrite_actor(seal, pid=live.pid, start_ticks=live.start_ticks + 1)
+
+    classified = _classify(project, "next")
+    assert classified.returncode == 0, classified.stderr
+
+    made = create(project, slot="next", slot_type="validate", branch=None)
+    assert made.returncode == 0, made.stderr
+    assert "recovered the validation-batch seal" in made.stderr
+    assert not seal.exists()
+    assert target.stat().st_mode & 0o777 == original
+
+
+@pytest.mark.parametrize("actor", ("live", "other-boot", "other-host"))
+def test_a_seal_whose_actor_is_not_proven_dead_here_still_binds(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, actor: str
+) -> None:
+    """A live actor, or one from another boot or machine, still needs recover."""
+    project, target, seal, _original = _crashed_seal(tmp_path, monkeypatch)
+    if actor == "live":
+        _rewrite_actor(
+            seal, **dataclasses.asdict(wrkslots._read_process_identity(os.getpid()))
+        )
+    elif actor == "other-boot":
+        _rewrite_actor(seal, boot_id="00000000-0000-4000-8000-000000000000")
+    else:
+        _rewrite_actor(seal, host_id="0" * 32)
+    sealed = seal.read_bytes()
+    mode = target.stat().st_mode & 0o777
+
+    classified = _classify(project, "next")
+    assert classified.returncode != 0
+    assert "interrupted validation-batch seal recorded" in classified.stderr
+
+    made = create(project, slot="next", slot_type="validate", branch=None)
+    assert "recovered the validation-batch seal" not in made.stderr
+    assert seal.read_bytes() == sealed
+    assert target.stat().st_mode & 0o777 == mode

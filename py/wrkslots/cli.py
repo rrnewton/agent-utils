@@ -20627,8 +20627,81 @@ def _validate_batch_seal_journals(config: Config) -> list[Path]:
     return sorted(config.control.glob("VALIDATE-BATCH-SEAL.*.journal"))
 
 
+def _validate_batch_seal_orphaned(config: Config, path: Path) -> tuple[bool, str]:
+    """Whether the seal journal at ``path`` was left by a process proven dead.
+
+    True only when the seal's actor ran on this machine identity and this
+    boot, its pid is absent or now names another process generation
+    (``_process_state``), and no finish journal is paired with the seal. A
+    live or indeterminate actor, an actor from another machine or an earlier
+    boot, an unreadable journal, or a paired finish all keep the seal binding.
+    Such an orphan is what a validate-batch removal leaves when its process is
+    killed before its ``finally`` retires the seal: nothing can still be using
+    it (https://github.com/rrnewton/agent-utils/issues/236).
+    """
+    try:
+        _raw, targets = _validate_batch_seal_journal(
+            config, path, _read_json(path, "validation-batch seal journal")
+        )
+        identity = _identity_from_obj(
+            _raw["actor"], "validation-batch seal journal.actor"
+        )
+        if identity is None:
+            return False, "the seal records no actor"
+        host_id = _host_id()
+        boot_id = _boot_id(Path("/proc"))
+        if identity.host_id != host_id:
+            return False, "the seal's actor belongs to another machine identity"
+        if identity.boot_id != boot_id:
+            return False, "the seal's actor ran in an earlier boot"
+        state, reason = _process_state(identity)
+        if state != "dead":
+            return False, f"the seal's actor is {state}: {reason}"
+        if _validate_batch_seal_paired_finish(config, targets) is not None:
+            return False, "a finish journal is paired with the seal"
+    except (Refusal, StateError) as exc:
+        return False, f"the seal cannot be judged: {exc}"
+    return True, f"its actor PID {identity.pid} is dead: {reason}"
+
+
+def _recover_orphaned_validate_batch_seal(config: Config) -> None:
+    """Retire this machine's seal journal when its actor is proven dead.
+
+    Called only under the mutation locks of ``create``. The recovery is the
+    seal-only one ``wrkslots recover`` performs: it restores each sealed
+    directory's mode, or resolves a target that is already gone. A failed
+    recovery leaves the seal in place and does not stop the create, which
+    already proceeds beside a seal whose paths it does not overlap.
+    """
+    path = _validate_batch_seal_journal_path(config)
+    if not path.is_file():
+        return
+    orphaned, reason = _validate_batch_seal_orphaned(config, path)
+    if not orphaned:
+        return
+    try:
+        _recover_validate_batch_seal_journal(
+            config,
+            recovery_kind=_ValidateBatchSealRecoveryKind.SEAL_ONLY,
+            emit=False,
+        )
+    except (Refusal, StateError) as exc:
+        print(
+            f"wrkslots: left the validation-batch seal {path.name} in place: {exc}",
+            file=sys.stderr,
+        )
+        return
+    print(
+        f"wrkslots: recovered the validation-batch seal {path.name}; {reason}",
+        file=sys.stderr,
+    )
+
+
 def _refuse_partial_state(
-    config: Config, *, allow_validate_batch_seals: bool = False
+    config: Config,
+    *,
+    allow_validate_batch_seals: bool = False,
+    allow_orphaned_validate_batch_seals: bool = False,
 ) -> None:
     leftovers = sorted(config.control.glob("ACTIVE.*.json.tmp.*"))
     leftovers += sorted(config.control.glob("ARCHIVED.*.json.tmp.*"))
@@ -20648,10 +20721,19 @@ def _refuse_partial_state(
         )
     seal_journals = _validate_batch_seal_journals(config)
     if seal_journals and not allow_validate_batch_seals:
-        raise Refusal(
-            f"interrupted validation-batch seal recorded in {seal_journals[0]}; "
-            "run 'wrkslots recover' first"
-        )
+        if allow_orphaned_validate_batch_seals:
+            # A seal its dead actor left is retired by the next create, under
+            # its lock; it need not block a read-only classification first.
+            seal_journals = [
+                path
+                for path in seal_journals
+                if not _validate_batch_seal_orphaned(config, path)[0]
+            ]
+        if seal_journals:
+            raise Refusal(
+                f"interrupted validation-batch seal recorded in {seal_journals[0]}; "
+                "run 'wrkslots recover' first"
+            )
 
 
 def _outstanding_journals(config: Config) -> list[Path]:
@@ -21806,6 +21888,7 @@ def _cmd_create(args: argparse.Namespace) -> int:
         # outage. The disjointness check below still rejects reuse or overlap
         # with every sealed path before this create writes anything.
         _refuse_partial_state(config, allow_validate_batch_seals=True)
+        _recover_orphaned_validate_batch_seal(config)
         states, archives = _validate_global_state(config)
         paired_finish_path = _validate_batch_paired_finish_path(config)
         cleanup_exclusions = (
@@ -22091,7 +22174,7 @@ def _cmd_classify_create_journals(args: argparse.Namespace) -> int:
     slot_type = _require_slot_type(args, "create-journal classification")
     slot = _validate_name(args.slot, "slot")
     agent = _validate_name(args.agent, "agent")
-    _refuse_partial_state(config)
+    _refuse_partial_state(config, allow_orphaned_validate_batch_seals=True)
     before_states, before_archives = _validate_global_state(config)
     before_rows = _global_rows(before_states, before_archives)
     before_paths = tuple(_outstanding_journals(config))
