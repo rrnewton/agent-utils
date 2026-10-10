@@ -452,6 +452,78 @@
           </div>
 
           <!--
+            `#229 desktop-two-column`. The RIGHT COLUMN of the desk's two-column layout: Main stays in
+            #scroll-area on the left, and this column shows one thread of the channel or, with none
+            selected, a card for each thread to choose one from. The owner: "the right column contains
+            the messages from the selected thread. When no thread is selected it contains a list of
+            threads ... We need a button on the right hand side thread column to 'exit' (deselect) the
+            thread and go back to the list."
+
+            The stylesheet ALONE decides whether it is on screen: web/voice.css draws it only inside the
+            desktop block, at 1000px and wider, while #screen-main carries `data-columns="two"`. Every
+            other window, and every phone, never shows it, so nothing about the one-column page changes.
+            web/voice.js learns whether two columns are in force by asking whether this has a box.
+
+            The thread is drawn by the SAME code that draws a thread in #scroll-area. Each `side-` id
+            below stands in for one of that pane's while web/voice.js works on this column
+            (`COLUMN_IDS`), so the read modes, the landing on the first unread, the reply arrows, Done,
+            pins, older history and the composer are one implementation, not two. Every id is in this
+            markup, because the page suite builds its DOM from this file.
+          -->
+          <div id="side-column" role="region" aria-label="Thread">
+            <div id="side-heading">
+              <span id="side-facts" class="thread-facts" hidden></span>
+              <span id="side-title">Threads</span>
+              <button id="side-close" class="icon-button" type="button" aria-label="Close thread" title="Back to the list of threads" hidden>
+                <svg class="icon" viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round">
+                  <path d="M6 6l12 12M18 6 6 18" />
+                </svg>
+              </button>
+            </div>
+            <div id="side-scroll" tabindex="-1" role="region" aria-label="Threads">
+              <p id="side-search-empty" class="search-empty" role="status" hidden>
+                Nothing in the messages loaded so far matches that search.
+              </p>
+              <!-- No thread selected: one card per thread, newest activity first. -->
+              <div id="side-list">
+                <p id="side-list-state" class="hint" role="status" aria-live="polite"></p>
+                <ul id="side-cards" class="side-cards" aria-label="Threads in this channel"></ul>
+                <button id="side-more-threads" class="secondary" type="button" hidden>Older threads…</button>
+              </div>
+              <!-- A thread selected: the thread, exactly as #pane-discord draws one. -->
+              <div id="side-pane" hidden>
+                <ol id="side-summary" class="messages"></ol>
+                <p id="side-summary-note" class="hint" hidden></p>
+                <p id="side-inbox-note" class="hint" hidden></p>
+                <button id="side-clear-backlog" class="chip" type="button" hidden>Clear the backlog</button>
+                <button id="side-older" class="chip" type="button" hidden>Older messages</button>
+                <p id="side-notice" class="hint" hidden></p>
+                <p id="side-loading" class="channel-loading hint" role="status" aria-live="polite" hidden>
+                  Loading thread…
+                </p>
+                <ol id="side-thread-list" class="messages" hidden></ol>
+                <ol id="side-log" class="messages"></ol>
+                <ol id="side-pinned-log" class="messages" aria-label="Pinned messages" hidden></ol>
+                <ol id="side-outgoing-log" class="messages" aria-label="Outgoing messages" hidden></ol>
+                <div id="side-composer">
+                  <textarea id="side-compose-text" rows="3" placeholder="Reply in this thread…" aria-label="Reply in this thread" aria-describedby="side-compose-state"></textarea>
+                  <button id="side-send" type="button">Send</button>
+                  <p id="side-compose-state" class="hint" role="status" aria-live="polite"></p>
+                </div>
+              </div>
+            </div>
+            <div id="side-tools">
+              <button id="side-jump-newest" class="chip" type="button" aria-label="Jump to the newest message" hidden>
+                <svg class="chip-icon" viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round">
+                  <path d="M12 5v13" />
+                  <path d="M6 12.5 12 19l6-6.5" />
+                </svg>
+                <span id="side-jump-newest-label">Newest</span>
+              </button>
+            </div>
+          </div>
+
+          <!--
             `#68 pull-to-refresh`. What the gesture SAYS while it is happening: armed, and then in
             flight. A refresh that is silent is indistinguishable from no refresh at all, which is
             the complaint the issue opens with.
@@ -1769,6 +1841,26 @@
             -->
             <select id="thread-select" class="bar-select" aria-label="thread"
                     title="Which part of the channel to read: Main, All, or one thread."></select>
+
+            <!--
+              `#229 desktop-two-column`. One column or two: Main on the left and a thread on the
+              right, as other chat clients' desktop apps lay a channel out. Beside the view picker,
+              because in two columns that picker has nothing to choose and greys out. A toggle with a
+              fixed name and `aria-pressed`, so a screen reader says "Two columns, pressed" once
+              rather than a name that changes and a state as well; the tooltip names what a press does.
+
+              ONLY ON A DESK WIDE ENOUGH FOR TWO COLUMNS: web/voice.css draws it inside the desktop
+              block at 1000px and wider and nowhere else, so a phone and a narrow window never see it.
+              The choice is kept on this device, and a window narrowed below that width shows one
+              column without forgetting it.
+            -->
+            <button id="column-toggle" class="bar-button" type="button" aria-pressed="false"
+                    aria-label="Two columns" title="Show Main and a thread side by side" hidden>
+              <svg class="mini-icon" viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
+                <rect x="3.5" y="5" width="17" height="14" rx="2" />
+                <path d="M12 5v14" />
+              </svg>
+            </button>
 
             <!--
               `#59 text-entry-button`. Typing costs ONE small button's worth of the bar, not a

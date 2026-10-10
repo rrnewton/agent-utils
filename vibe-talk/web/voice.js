@@ -42,9 +42,67 @@ const MARKER_KEY = "vibe-talk.voice.place-marker";
 const COMBINE_KEY = "vibe-talk.voice.combine";
 const ACTIVE_CHANNEL_KEY = "vibe-talk.voice.active-channel";
 
-// The element with this id. Form controls are typed by their tag in voice.html, so the checker
-// knows `.value` and `.checked` exist; tests/js/contract.test.mjs keeps these lists equal to the
-// page's real controls.
+// --- two columns on a desk: which column the code is working on -------------------------------
+//
+// `#229 desktop-two-column`. On a desk wide enough, the channel can be read in two columns: Main in
+// #scroll-area on the left, and one thread, or the list of threads, in #side-column on the right.
+// The thread on the right is drawn by the same code that draws a thread on the left, and that code
+// keeps what it is showing in module state and in the elements of one pane. So the right column has
+// elements of its own (each `side-` id standing in for one of the pane's, `COLUMN_IDS`) and state of
+// its own (`COLUMN_STATE`, further down), and the code works on one column at a time: the LEFT ONE,
+// except inside `inColumn(columns.side, ...)`, which loads the right column's state, runs, and puts
+// the left column's back before it returns. Nothing is left pointing at the right column between
+// one event and the next, so code that never heard of a second column keeps meaning the left one.
+
+/** The elements of the channel's pane, and the right column's that stand in for each. */
+const COLUMN_IDS = {
+  "scroll-area": "side-scroll",
+  "pane-discord": "side-pane",
+  "channel-summary": "side-summary",
+  "summary-note": "side-summary-note",
+  "inbox-note": "side-inbox-note",
+  "clear-backlog": "side-clear-backlog",
+  "load-older": "side-older",
+  "timeline-notice": "side-notice",
+  "channel-loading": "side-loading",
+  "thread-list": "side-thread-list",
+  "discord-log": "side-log",
+  "pinned-log": "side-pinned-log",
+  "outgoing-log": "side-outgoing-log",
+  "channel-composer": "side-composer",
+  "channel-compose-text": "side-compose-text",
+  "channel-send": "side-send",
+  "channel-compose-state": "side-compose-state",
+  "search-empty": "side-search-empty",
+  "scroll-tools": "side-tools",
+  "jump-newest": "side-jump-newest",
+  "jump-newest-label": "side-jump-newest-label",
+};
+
+/**
+ * The two columns. `state` holds a column's share of `COLUMN_STATE` while the other column's is
+ * loaded; `mode` is what the right column shows: the list of threads, or one thread.
+ *
+ * `searched` is what the column's last pass of the search counted (`applySearch`), for the count in
+ * the bar, which speaks for every column on screen.
+ *
+ * @typedef {{matched: number, loaded: number, tally: any, pinned: boolean}} SearchCount
+ * @type {{main: {name: string, state: unknown[] | null, searched: SearchCount | null},
+ *   side: {name: string, state: unknown[] | null, searched: SearchCount | null, mode: "list" | "thread"}}}
+ */
+const columns = {
+  main: { name: "main", state: null, searched: null },
+  side: { name: "side", state: null, searched: null, mode: "list" },
+};
+/** The column the code is working on now. The left one, except inside `inColumn`. */
+let activeColumn = columns.main;
+/** Whether that is the right column, for `el`, which asks on every call. */
+let sideActive = false;
+
+// The element with this id: in the column being worked on, for the ids of the channel's pane (see
+// `COLUMN_IDS`). Form controls are typed by their tag in voice.html, so the checker knows `.value`
+// and `.checked` exist; tests/js/contract.test.mjs keeps these lists equal to the page's real
+// controls.
 /**
  * @overload
  * @param {"api-token" | "channel-alias" | "channel-directory-search" | "combine-messages"
@@ -56,7 +114,8 @@ const ACTIVE_CHANNEL_KEY = "vibe-talk.voice.active-channel";
  */
 /**
  * @overload
- * @param {"channel-compose-text" | "prompt-blockers" | "prompt-summary" | "reply-text"} id
+ * @param {"channel-compose-text" | "prompt-blockers" | "prompt-summary" | "reply-text"
+ *   | "side-compose-text"} id
  * @returns {HTMLTextAreaElement}
  */
 /**
@@ -72,6 +131,7 @@ const ACTIVE_CHANNEL_KEY = "vibe-talk.voice.active-channel";
  *   | "channel-directory-more" | "channel-directory-retry" | "channel-send"
  *   | "channel-view-flat" | "channel-view-main" | "channel-view-threads" | "clear-alias"
  *   | "clear-backlog" | "clear-view" | "close-browse-channels" | "close-help" | "close-reply"
+ *   | "column-toggle"
  *   | "close-settings" | "close-threads" | "collapse-all" | "dismiss-banner" | "dismiss-error"
  *   | "dismiss-status" | "expand-all" | "forget-conversations" | "forget-token" | "hang-up"
  *   | "help-link-auto-read" | "help-link-canned-prompts" | "help-link-channel-alias"
@@ -86,9 +146,10 @@ const ACTIVE_CHANNEL_KEY = "vibe-talk.voice.active-channel";
  *   | "pinned-filter" | "post-confirm-cancel" | "post-confirm-send" | "prompts-open" | "read-aloud" | "read-new" | "read-speed" | "remove-channel"
  *   | "rename-channel" | "reply-cancel" | "reply-context-more" | "reply-send" | "save-alias"
  *   | "save-token"
- *   | "search-toggle" | "send-text" | "speaker" | "summarise" | "talk" | "text-entry"
- *   | "thread-back" | "thread-directory-more" | "thread-directory-retry" | "todo-filter"
- *   | "undo-dismiss" | "view-switch"} id
+ *   | "search-toggle" | "send-text" | "side-clear-backlog" | "side-close" | "side-jump-newest"
+ *   | "side-more-threads" | "side-older" | "side-send" | "speaker" | "summarise" | "talk"
+ *   | "text-entry" | "thread-back" | "thread-directory-more" | "thread-directory-retry"
+ *   | "todo-filter" | "undo-dismiss" | "view-switch"} id
  * @returns {HTMLButtonElement}
  */
 /**
@@ -98,6 +159,19 @@ const ACTIVE_CHANNEL_KEY = "vibe-talk.voice.active-channel";
  */
 /** @param {string} id */
 function el(id) {
+  const standIn = sideActive ? COLUMN_IDS[id] : undefined;
+  return document.getElementById(standIn || id);
+}
+
+/**
+ * The element with this id in the LEFT column whichever column is being worked on: for the few
+ * things that belong to the left column alone (the call's pane beside the channel's, the chips and
+ * the pull gesture over #scroll-area, the keyboard's pane for it) and may be asked about from inside
+ * `inColumn`.
+ *
+ * @param {string} id
+ */
+function leftEl(id) {
   return document.getElementById(id);
 }
 
@@ -1047,10 +1121,10 @@ function foldable(li, meta, body, text, messageId, alsoIds = []) {
   setFolded(entry, !(entry.id !== null && expandedIds.has(entry.id)));
   // Toggling changes the height of something that may be far above the viewport, which is the one
   // case the browser's own scroll anchoring does not cover.
-  fold.addEventListener("click", () => {
+  fold.addEventListener("click", inThisColumn(() => {
     preservingScroll(() => setFolded(entry, !isFolded(entry)));
     renderScrollTools();
-  });
+  }));
   meta.append(fold);
   foldables.push(entry);
   return fold;
@@ -1669,6 +1743,14 @@ function renderScrollTools() {
     return;
   }
   scrollToolsOwed = false;
+  // `#229 desktop-two-column`. The right column's chip is its jump to the newest message. The rest
+  // float over the left column and act on it.
+  if (sideActive) {
+    applySearch();
+    renderJumpNewest();
+    keepSelection();
+    return;
+  }
   // ONE snapshot for all three chips, so they cannot disagree about a list that changed between
   // two queries.
   const folds = visibleFolds();
@@ -1879,6 +1961,8 @@ function applySearch() {
     matching: new Map(LINK_KINDS.map(({ kind }) => [kind, 0])),
   };
   for (const id of SEARCH_LISTS) {
+    // The call's transcript is the left column's. `#229 desktop-two-column`.
+    if (sideActive && id === "transcript") continue;
     const list = el(id);
     const counts = scope.includes(id);
     for (const row of list.children) {
@@ -1915,31 +1999,24 @@ function applySearch() {
       }
     }
   }
-  if (links) {
-    renderLinkKindCounts(tally.matching);
-  }
   // `#214 reply-arrow`. What the reader can see directly above a reply is what its arrow is drawn
   // against, and the pass above has just decided that.
   renderReplyLinks();
-  // `#206 pin-message`. Over the Pinned filter the denominator is the channel's PINS, all of them,
-  // and the count says so even before anything is typed: the filter is in force, and the bar is
-  // where it says what it is doing.
-  if (pinnedOnly && currentView === "discord") {
-    el("search-count").textContent =
-      terms.length === 0 && !links ? `${loaded} pinned` : `${matched} of ${loaded} pinned`;
+  // `#206 pin-message`. Over the Pinned filter the denominator is the channel's PINS, all of them.
+  const pinned = pinnedOnly && currentView === "discord";
+  activeColumn.searched = { matched, loaded, tally, pinned };
+  renderSearchCount(terms.length > 0, links);
+  if (pinned) {
     const sentence = pinnedEmptySentence(loaded, matched, terms.length > 0, links ? tally : null);
     el("search-empty").textContent = sentence;
     el("search-empty").hidden = sentence === "";
     return;
   }
-  // "of N loaded", never "of N". The denominator is what this page has, not what the server has,
-  // and after `#128 transcript-history` those are routinely different numbers. Links is a filter
-  // in force with nothing typed, so it is counted with nothing typed, as Pinned is.
-  el("search-count").textContent = terms.length === 0 && !links ? "" : `${matched} of ${loaded} loaded`;
   // Nothing matched is a RESULT, and it has to be stated where the messages were. Every row is
   // still in the list, so neither pane's own empty state fires, and without this the reader gets
   // a blank screen whose only explanation is a 0.75rem count at the far end of the search bar.
-  // Not raised over a list that was empty to begin with: there the pane already says why.
+  // Not raised over a list that was empty to begin with: there the pane already says why. Each
+  // column says it over its own list (`#229 desktop-two-column`).
   if (links) {
     const sentence = linksEmptySentence(loaded, tally, matched);
     el("search-empty").textContent = sentence;
@@ -1948,6 +2025,30 @@ function applySearch() {
   }
   el("search-empty").textContent = SEARCH_EMPTY_LOADED;
   el("search-empty").hidden = terms.length === 0 || matched > 0 || loaded === 0;
+}
+
+/**
+ * The count at the end of the search bar, and the count on each kind of link under Links, from what
+ * each column's last pass counted. `#229 desktop-two-column`: there is one bar, so it speaks for both
+ * columns while two are up. Over the Pinned filter it speaks for the pins: the left column's list.
+ */
+function renderSearchCount(typed, links) {
+  const left = columns.main.searched;
+  if (!left) return;
+  const counted = [left, ...(sideShowing() && columns.side.searched && !left.pinned ? [columns.side.searched] : [])];
+  if (links) {
+    renderLinkKindCounts(new Map(LINK_KINDS.map(({ kind }) =>
+      [kind, counted.reduce((sum, one) => sum + (one.tally.matching.get(kind) || 0), 0)])));
+  }
+  const matched = counted.reduce((sum, one) => sum + one.matched, 0);
+  const loaded = counted.reduce((sum, one) => sum + one.loaded, 0);
+  // "of N loaded", never "of N". The denominator is what this page has, not what the server has,
+  // and after `#128 transcript-history` those are routinely different numbers. Links is a filter
+  // in force with nothing typed, so it is counted with nothing typed, as Pinned is — which says its
+  // count even before anything is typed: the filter is in force, and the bar is where it says so.
+  el("search-count").textContent = left.pinned
+    ? (!typed && !links ? `${loaded} pinned` : `${matched} of ${loaded} pinned`)
+    : (!typed && !links ? "" : `${matched} of ${loaded} loaded`);
 }
 
 /**
@@ -3576,19 +3677,21 @@ const isComposer = (node) => Boolean(node) && COMPOSER_FIELDS.includes(String(no
  */
 const channelPane = {
   name: "channel",
-  scroller: () => el("scroll-area"),
-  list: () => (currentScreen === "main" && currentView === "discord" && (pinnedOnly || channelView !== "threads")
-    ? shownChannelList() : null),
-  head: () => floatingClearance(el("scroll-area")),
+  // The left column's, whichever column the code is working on when it asks. `#229 desktop-two-column`.
+  scroller: () => leftEl("scroll-area"),
+  list: () => inColumn(columns.main, () =>
+    (currentScreen === "main" && currentView === "discord" && (pinnedOnly || channelView !== "threads")
+      ? shownChannelList() : null)),
+  head: () => floatingClearance(leftEl("scroll-area")),
   // The chips float over the foot of the list, and the status line floats over them: a row under
   // either is under something.
   foot: () => {
-    const area = el("scroll-area");
+    const area = leftEl("scroll-area");
     const over = ["scroll-tools", "status-line"].reduce((room, id) =>
-      room + (el(id).hidden ? 0 : el(id).getBoundingClientRect().height), 0);
+      room + (leftEl(id).hidden ? 0 : leftEl(id).getBoundingClientRect().height), 0);
     return area.getBoundingClientRect().top + (area.clientHeight || 0) - over;
   },
-  context: () => JSON.stringify([channelContextKey(), pinnedOnly]),
+  context: () => inColumn(columns.main, () => JSON.stringify([channelContextKey(), pinnedOnly])),
   // Session-only and one short entry per list visited, for the reason `expandedIds` gives.
   marks: new Map(),
   row: null,
@@ -9190,6 +9293,9 @@ function setChannelFreshness(state) {
  * pull up from the newest line puts that pill at the foot of the list, and this one stays.
  */
 function renderChannelFreshness() {
+  // The pill floats over the left column and speaks for it. `#229 desktop-two-column`: the right
+  // column's freshness is its own, and nothing floats over it.
+  if (sideActive) return;
   const pill = el("channel-freshness");
   const gesture = el("pull-refresh");
   const at = stamp(channelFreshAt);
@@ -9532,6 +9638,8 @@ const placeKey = () => JSON.stringify([String(el("discord-channel").value), view
  * list has no boxes left to measure.
  */
 function holdChannelPlace() {
+  // A reopen comes back to one list: the left column's. `#229 desktop-two-column`.
+  if (sideActive) return;
   if (currentScreen !== "main" || currentView !== "discord" || !REOPENED_VIEWS.includes(channelView)) return;
   const mark = captureScroll();
   const anchor = mark.anchor;
@@ -9570,6 +9678,8 @@ function viewOnScreen() {
  * they are looking at; the place is the one last measured, if it is a place in this view.
  */
 function saveUiState() {
+  // What is on screen is recorded from the left column, whichever column asked. `#229`.
+  if (sideActive) return inColumn(columns.main, saveUiState);
   const identity = tokenFingerprint(token());
   if (!uiStateSettled || !identity) return;
   const channel = String(el("discord-channel").value);
@@ -9680,7 +9790,10 @@ function payReopenRead() {
 // --- channel views, threads and the channel composer ------------------------------------------
 
 function channelContextKey() {
-  return JSON.stringify([el("discord-channel").value, channelView, selectedThreadId]);
+  const key = [el("discord-channel").value, channelView, selectedThreadId];
+  // `#229 desktop-two-column`. The right column's views are its own: a thread shown there and the
+  // same thread shown in one column are two lists of rows, never one held context moved between them.
+  return JSON.stringify(sideActive ? [...key, "side"] : key);
 }
 
 function channelComposerKey() {
@@ -9808,6 +9921,13 @@ function threadCount(count, exact) {
 }
 
 function renderChannelNavigation() {
+  // `#229 desktop-two-column`. The right column names its thread in a heading of its own; what is
+  // this pass's there is which of its lists is up and where its box posts.
+  if (sideActive) {
+    renderColumnLists();
+    renderSideColumn();
+    return;
+  }
   const inChannel = currentView === "discord";
   // `gchat-thread-selector`. Choosing Main, All, or a thread is the bar's thread picker now, so the
   // tabs that used to sit over the list stay hidden; the heading still names an open thread.
@@ -9822,6 +9942,11 @@ function renderChannelNavigation() {
   // `#200 reply-context`. The reply screen names its thread from the same store, so a read that
   // names the thread, or places the message being answered, redraws it as well.
   followReplyStore();
+  renderColumnLists();
+}
+
+/** Which of the column's lists is up, and where its box posts. */
+function renderColumnLists() {
   // `#206 pin-message`. The Pinned filter's list stands in for whichever of these is up.
   el("thread-list").hidden = channelView !== "threads" || pinnedOnly;
   el("discord-log").hidden = channelView === "threads" || pinnedOnly;
@@ -10001,10 +10126,15 @@ async function changeChannelView(view, threadId = null, summary = null) {
   // `#189 restore-ui-state`. The reader's own choice: it outranks the default from here on, and it
   // is what a reopen comes back to — and, `#205 channel-view-memory`, what this channel opens in
   // whenever the reader comes back to it. All too: what was picked, not whatever the default is.
-  const chosen = viewOnScreen();
-  if (chosen) rememberChosenView(chosen);
-  // The Threads list is not a view a channel opens in: picked, it leaves the channel to its default.
-  else forgetChosenViews((channel) => channel === String(el("discord-channel").value));
+  // `#229 desktop-two-column`. Not in two columns, though: the left column is Main there because of
+  // the layout, not by the reader's choice, and the right column's thread is not a view the channel
+  // opens in. Leaving two columns goes back to the choice made in one.
+  if (!columnsShown && !sideActive) {
+    const chosen = viewOnScreen();
+    if (chosen) rememberChosenView(chosen);
+    // The Threads list is not a view a channel opens in: picked, it leaves the channel to its default.
+    else forgetChosenViews((channel) => channel === String(el("discord-channel").value));
+  }
   uiStateSettled = true;
   saveUiState();
   // Main and All are one conversation, so a switch between them — or into one from a thread no place
@@ -10952,7 +11082,7 @@ function threadCard(summary) {
   meta.className = "meta";
   meta.textContent = threadCount(summary.reply_count, summary.reply_count_exact);
   button.append(title, meta);
-  button.addEventListener("click", () => guardQuietly(() => openThread(summary.id, summary))());
+  button.addEventListener("click", inThisColumn(() => guardQuietly(() => openThread(summary.id, summary))()));
   row.append(button);
   // `#129 message-search`. A thread card is what stands in this list where messages stand in the
   // others, so the filter has to reach it or searching on the threads tab silently does nothing.
@@ -11041,7 +11171,7 @@ function addThreadDecoration(meta, message, row, everyThread = false) {
   const replies = threadReplyCount(id, message);
   badge.textContent = replies ? `Thread(${replies})` : "Thread";
   if (replies) badge.setAttribute("aria-label", `Open this thread, ${threadCount(replies, true)}`);
-  badge.addEventListener("click", () => guardQuietly(() => openThread(id))());
+  badge.addEventListener("click", inThisColumn(() => guardQuietly(() => openThread(id))()));
   // `#224 keyboard-shortcuts`. → on the selected message presses it.
   sayRowShortcut(badge, "thread-badge");
   meta.append(badge);
@@ -11059,7 +11189,7 @@ function addThreadDecoration(meta, message, row, everyThread = false) {
     gather.setAttribute("aria-pressed", "false");
     gather.style.setProperty("--thread-hue", threadHue(id));
     gather.textContent = threadCount(count, exact);
-    gather.addEventListener("click", () => guardQuietly(() => toggleGathered(String(message.id), row))());
+    gather.addEventListener("click", inThisColumn(() => guardQuietly(() => toggleGathered(String(message.id), row))()));
     row.append(gather);
   }
 }
@@ -11349,7 +11479,7 @@ function drawThreadChips(row, tally, inMain) {
     chip.className = "thread-unread";
     chip.setAttribute("type", "button");
     chip.setAttribute("title", "Open this thread at its first unread reply");
-    chip.addEventListener("click", () => guardQuietly(() => openThread(id))());
+    chip.addEventListener("click", inThisColumn(() => guardQuietly(() => openThread(id))()));
     // After N replies, the last thing on the row, so the two read as one line: "12 replies  3 unread".
     row.append(chip);
   }
@@ -12107,6 +12237,8 @@ function landedAnswer(pages) {
 
 async function loadTimeline(options) {
   const generation = ++discordLoadGeneration;
+  // `#229 desktop-two-column`. The column this read is for: its work after every wait is done there.
+  const steps = columnSteps();
   const context = channelContextKey();
   const channel = String(el("discord-channel").value);
   const [view, thread, canon] = [channelView, selectedThreadId, channelCanon];
@@ -12136,7 +12268,8 @@ async function loadTimeline(options) {
   let sent = forwardCursor(options && options.reason);
   const sameStore = () => canon === channelCanon && canon.channel === channel &&
     String(el("discord-channel").value) === channel;
-  const stillCurrent = () => generation === discordLoadGeneration && context === channelContextKey();
+  const stillCurrent = () =>
+    inColumn(steps.column, () => generation === discordLoadGeneration && context === channelContextKey());
   // `#220 view-switch-instant`. Rows a switch drew from the store for a view no page has covered,
   // read behind them (`drawHeldRows`): the newest page replaces them, and the message the reader is
   // on may be older than that page reaches.
@@ -12168,6 +12301,8 @@ async function loadTimeline(options) {
     requestVisibleSummaries();
     if (entryReadOwed === context) entryReadOwed = null;
     payThreadEntry();
+    // What it changed in the store may show in the other column too. `#229 desktop-two-column`.
+    followInOtherColumn();
   };
   try {
     for (;;) {
@@ -12175,9 +12310,12 @@ async function loadTimeline(options) {
       /** @type {VibeTalk.TimelineResponse} */
       let payload;
       try {
+        steps.pause();
         payload = await within(CHANNEL_READ_TIMEOUT_MS,
           (signal) => readTimeline(path, { signal }));
+        steps.resume();
       } catch (error) {
+        steps.resume();
         // A cursor the server can no longer continue is not a failed refresh. Forget it and read
         // the newest page now, in the same hold: the pill says "refreshing…" and nothing else.
         if (sent && isCursorRefusal(error) && sameStore()) {
@@ -12212,6 +12350,7 @@ async function loadTimeline(options) {
           }
           // A read of All or of a thread brings replies, and their read state, that Main counts.
           syncUnreadReplies();
+          followInOtherColumn();
           saveChannelScope();
           return;
         }
@@ -12242,9 +12381,12 @@ async function loadTimeline(options) {
       const anchored = behindHeld && current && !position.wasAtNewest && position.anchorId
         ? timelineMessages.find((message) => String(message.id) === position.anchorId) : null;
       const placeAt = timeOf(anchored, "timestamp");
-      const older = Number.isFinite(placeAt) ? await pagesBackTo(payload, placeAt, stillCurrent) : [];
+      steps.pause();
+      const older = Number.isFinite(placeAt)
+        ? await inColumn(steps.column, () => pagesBackTo(payload, placeAt, stillCurrent)) : [];
+      steps.resume();
       if (!current || !stillCurrent()) {
-        foldLateTimelinePage(payload, { context, channel, view, thread, canon });
+        foldLateTimelinePage(payload, { context, channel, view, thread, canon, column: steps.column });
         return;
       }
       // Remove the in-flow indicator before measuring or restoring scroll. In
@@ -12284,6 +12426,7 @@ async function loadTimeline(options) {
       if (owed) entryReadOwed = null;
       if (landing) keepEntryLanding(landing);
       payThreadEntry();
+      followInOtherColumn();
       return;
     }
   } catch (error) {
@@ -12298,7 +12441,8 @@ async function loadTimeline(options) {
     }
   } finally {
     settleReplays(read, landedAnswer(landed));
-    await finishDiscordLoad();
+    steps.pause();
+    await finishDiscordLoad(steps.column);
   }
 }
 
@@ -12311,6 +12455,11 @@ async function loadTimeline(options) {
 function foldLateTimelinePage(payload, read) {
   if (!threadingSupported || channelCanon !== read.canon || read.canon.channel !== read.channel ||
       String(el("discord-channel").value) !== read.channel) return;
+  // Asked in the column the read was for, which is the one whose view it may be. `#229`.
+  if (read.column && read.column !== activeColumn) {
+    inColumn(read.column, () => foldLateTimelinePage(payload, read));
+    return;
+  }
   foldTimelinePage(payload, false, read.view, read.thread);
   channelCanon.views.get(viewKey(read.view, read.thread)).landedHidden = true;
   if (read.context === channelContextKey()) {
@@ -12328,11 +12477,13 @@ function foldLateTimelinePage(payload, read) {
     if (landing) keepEntryLanding(landing);
     payThreadEntry();
   } else if (read.view === "flat") {
-    // All's page answers for Main, and for a thread drawn from All, now on screen.
+    // All's page answers for Main, and for a thread drawn from All, now on screen — in either column.
     catchUpFromAll();
+    inOtherColumn(catchUpFromAll);
   }
   // A read of All or of a thread brings replies, and their read state, that Main counts.
   syncUnreadReplies();
+  if (read.view !== "flat") followInOtherColumn();
   saveChannelScope();
 }
 
@@ -12348,21 +12499,29 @@ function foldLateTimelinePage(payload, read) {
  * @returns {Promise<VibeTalk.TimelineResponse[]>}
  */
 async function pagesBackTo(payload, placeAt, current) {
+  const steps = columnSteps();
   /** @type {VibeTalk.TimelineResponse[]} */
   const pages = [];
   let last = payload;
-  while (pages.length < REPLY_JUMP_PAGES && last.has_more === true && last.next_before &&
-      !(timeOf((last.messages || [])[0], "timestamp") <= placeAt)) {
-    const path = timelinePath(last.next_before);
-    try {
-      last = await within(CHANNEL_READ_TIMEOUT_MS, (signal) => readTimeline(path, { signal }));
-    } catch (_error) {
-      break;
+  try {
+    while (pages.length < REPLY_JUMP_PAGES && last.has_more === true && last.next_before &&
+        !(timeOf((last.messages || [])[0], "timestamp") <= placeAt)) {
+      const path = timelinePath(last.next_before);
+      try {
+        steps.pause();
+        last = await within(CHANNEL_READ_TIMEOUT_MS, (signal) => readTimeline(path, { signal }));
+        steps.resume();
+      } catch (_error) {
+        steps.resume();
+        break;
+      }
+      if (!current()) break;
+      pages.push(last);
     }
-    if (!current()) break;
-    pages.push(last);
+    return pages;
+  } finally {
+    steps.pause();
   }
-  return pages;
 }
 
 /**
@@ -12371,15 +12530,20 @@ async function pagesBackTo(payload, placeAt, current) {
  * way meanwhile, as for any step. `#220 view-switch-instant`.
  */
 async function readWalkCursor() {
+  const steps = columnSteps();
   olderFetchInFlight = true;
   renderOlderControl();
   try {
+    steps.pause();
     await loadDiscord({ keepPosition: true, quiet: true, reason: "enter" });
+    steps.resume();
   } catch (error) {
+    steps.resume();
     if (!(error && error.shownInPill)) throw error;
   } finally {
     olderFetchInFlight = false;
     renderOlderControl();
+    steps.pause();
   }
 }
 
@@ -12389,12 +12553,21 @@ async function loadOlderTimeline() {
     return;
   }
   if (!discordMoreAbove || !discordOlderCursor || olderFetchInFlight) return;
+  // `#229 desktop-two-column`. The column this step is for, which its work after the wait is done in.
+  const steps = columnSteps();
   const context = channelContextKey();
   const generation = discordLoadGeneration;
   olderFetchInFlight = true;
   renderOlderControl();
   try {
-    const payload = await readTimeline(timelinePath(discordOlderCursor));
+    const path = timelinePath(discordOlderCursor);
+    steps.pause();
+    let payload;
+    try {
+      payload = await readTimeline(path);
+    } finally {
+      steps.resume();
+    }
     if (context !== channelContextKey() || generation !== discordLoadGeneration) return;
     olderFetchInFlight = false;
     preservingScroll(() => applyTimelinePage(payload, true));
@@ -12407,7 +12580,12 @@ async function loadOlderTimeline() {
       olderFetchInFlight = false;
       discordOlderCursor = null;
       discordMoreAbove = false;
-      await loadTimeline({ keepPosition: false, reason: "expired" });
+      steps.pause();
+      try {
+        await inColumn(steps.column, () => loadTimeline({ keepPosition: false, reason: "expired" }));
+      } finally {
+        steps.resume();
+      }
       if (context === channelContextKey()) {
         setStatus("This history snapshot expired. Refreshed the newest messages; scroll up to load older history again.");
       }
@@ -12417,6 +12595,7 @@ async function loadOlderTimeline() {
   } finally {
     olderFetchInFlight = false;
     renderOlderControl();
+    steps.pause();
   }
 }
 
@@ -12576,7 +12755,7 @@ function renderOutgoingMessages() {
       thread.setAttribute("type", "button");
       thread.style.setProperty("--thread-hue", threadHue(entry.threadId));
       thread.textContent = "Thread";
-      thread.addEventListener("click", guardQuietly(() => openThread(entry.threadId)));
+      thread.addEventListener("click", inThisColumn(guardQuietly(() => openThread(entry.threadId))));
       meta.append(thread);
     }
     const body = document.createElement("div");
@@ -12614,19 +12793,19 @@ function renderOutgoingMessages() {
       retry.setAttribute("type", "button");
       retry.textContent = waiting ? "Retry now" : entry.postedCount ? "Retry unsent text" : "Retry";
       retry.disabled = !entry.remaining || knownChannel(entry.channel)?.writable === false;
-      retry.addEventListener("click", guardQuietly(() => retryOutgoingMessage(entry.id)));
+      retry.addEventListener("click", inThisColumn(guardQuietly(() => retryOutgoingMessage(entry.id))));
       const dismiss = document.createElement("button");
       dismiss.className = "outgoing-dismiss";
       dismiss.setAttribute("type", "button");
       dismiss.textContent = "Dismiss";
       dismiss.setAttribute("title", "Discard this local send record. This does not delete a message from the chat service.");
-      dismiss.addEventListener("click", () => {
+      dismiss.addEventListener("click", inThisColumn(() => {
         cancelOutgoingRetry(entry.id);
         outgoingMessages.delete(entry.id);
         outgoingObservations.delete(entry.id);
         persistOutgoingMessages();
         renderOutgoingMessages();
-      });
+      }));
       actions.append(retry, dismiss);
       row.append(actions);
     }
@@ -14205,16 +14384,16 @@ function replyArrow(li) {
   // `#228 reply-visible`. On the row, for the pass that asks which replies are joined to the row
   // above by this arrow (`renderReplyCounts`), without walking the row for it.
   li.replyArrowButton = arrow;
-  arrow.addEventListener("click", (event) => {
+  arrow.addEventListener("click", inThisColumn((event) => {
     // The row's own tap handler would fold the row, or start reading it aloud in reading mode. It
     // already ignores a click on a button, and this does not rely on that: the click ends here.
     if (event) event.stopPropagation();
     if (replyTapsSettling !== null) return;
     if (replyArrowTap && replyArrowTap.arrow === arrow) {
       dropReplyArrowTap();
-      replyTapsSettling = setTimeout(() => {
+      replyTapsSettling = setTimeout(inThisColumn(() => {
         replyTapsSettling = null;
-      }, REPLY_DOUBLE_TAP_MS);
+      }), REPLY_DOUBLE_TAP_MS);
       guardQuietly(() => gatherFromReply(li))();
       return;
     }
@@ -14226,16 +14405,17 @@ function replyArrow(li) {
       replyArrowTap = null;
       waiting.jump();
     }
+    // Both bound to this column: the wait ends in a later task. `#229 desktop-two-column`.
     const tap = {
       arrow,
-      jump: () => guardQuietly(() => jumpToAnswered(li))(),
-      timer: setTimeout(() => {
+      jump: inThisColumn(() => guardQuietly(() => jumpToAnswered(li))()),
+      timer: setTimeout(inThisColumn(() => {
         if (replyArrowTap === tap) replyArrowTap = null;
         tap.jump();
-      }, REPLY_DOUBLE_TAP_MS),
+      }), REPLY_DOUBLE_TAP_MS),
     };
     replyArrowTap = tap;
-  });
+  }));
   return arrow;
 }
 
@@ -14251,6 +14431,8 @@ function rowHolding(id) {
  */
 function floatingClearance(area) {
   let clear = area.getBoundingClientRect().top;
+  // `#229 desktop-two-column`. The pill and the glass float over the left column only.
+  if (area !== leftEl("scroll-area")) return clear;
   for (const id of ["channel-freshness", "search-float"]) {
     const node = el(id);
     if (node.hidden) continue;
@@ -14285,10 +14467,10 @@ function revealRow(row) {
   row.setAttribute("data-landed", "true");
   const landed = {
     row,
-    timer: setTimeout(() => {
+    timer: setTimeout(inThisColumn(() => {
       row.removeAttribute("data-landed");
       if (replyLanded === landed) replyLanded = null;
-    }, REPLY_LANDED_MS),
+    }), REPLY_LANDED_MS),
   };
   replyLanded = landed;
 }
@@ -14383,77 +14565,96 @@ async function jumpToAnswered(reply) {
  * takes a ticket, so a later tap, on either control, ends a walk still under way.
  */
 async function seekMessage(target, arrive, openAll) {
-  const ticket = ++replyJumpTicket;
-  const channel = String(el("discord-channel").value);
-  if (arrive()) return;
-  // The reader's own filter, said plainly rather than walked past: the message is loaded, read,
-  // and Hide read is the reason it is not drawn. No walk would find it. Asked again wherever the
-  // list has just changed, because All, or an older page, may be what brings the message in.
-  const hiddenAsRead = () => {
-    if (!(todoMode && threadingSupported && !rowHolding(target) &&
-        timelineMessages.some((message) => String(message.id) === target))) {
-      return false;
+  // `#229 desktop-two-column`. The column the walk is in, which its work after every wait is done in,
+  // given back before the walk's promise settles, whichever way it ends.
+  const steps = columnSteps();
+  try {
+    const ticket = ++replyJumpTicket;
+    const channel = String(el("discord-channel").value);
+    if (arrive()) return;
+    // The reader's own filter, said plainly rather than walked past: the message is loaded, read,
+    // and Hide read is the reason it is not drawn. No walk would find it. Asked again wherever the
+    // list has just changed, because All, or an older page, may be what brings the message in.
+    const hiddenAsRead = () => {
+      if (!(todoMode && threadingSupported && !rowHolding(target) &&
+          timelineMessages.some((message) => String(message.id) === target))) {
+        return false;
+      }
+      setStatus("Hide read is hiding that message.");
+      return true;
+    };
+    if (hiddenAsRead()) return;
+    // Never in two columns, whose left column is Main by the layout, and whose right column is a thread
+    // a reply's arrow or a gathering does not leave. `#229 desktop-two-column`.
+    if (!columnsShown && openAll()) {
+      setStatus("Not in this view — opening All…");
+      // The reader went somewhere else while All was being read: the tap is over.
+      const stillAll = () =>
+        ticket === replyJumpTicket && String(el("discord-channel").value) === channel && channelView === "flat";
+      try {
+        const opening = changeChannelView("flat");
+        steps.pause();
+        await opening;
+        steps.resume();
+      } catch (error) {
+        steps.resume();
+        // As for a step back that fails, below: reported where every failed read is, and the status
+        // line no longer says All is being opened.
+        if (stillAll()) setStatus("Could not read All — try again.");
+        throw error;
+      }
+      // All not held by this page nor covered by the store, and another read — a poll of Main, say —
+      // on the wire when the tap came: All's read is queued behind it, and `changeChannelView`
+      // returned with nothing drawn. Waited for, as a pull up waits for a read already in flight,
+      // because until All has landed an empty list says nothing about where the message is.
+      while (discordFetchInFlight && !channelCanon.views.has(viewKey()) && stillAll()) {
+        steps.pause();
+        await new Promise((resolve) => setTimeout(resolve, PULL_WAIT_MS));
+        steps.resume();
+      }
+      if (!stillAll()) return;
+      if (arrive() || hiddenAsRead()) return;
+      if (!channelCanon.views.has(viewKey())) {
+        // All's read failed, and that is reported where every failed read is. Nothing was learned
+        // about the message, so nothing is said about it either — whether or not the rows the page
+        // already held for All are up (`#220 view-switch-instant`): those are not All read.
+        setStatus("Could not read All — try again.");
+        return;
+      }
     }
-    setStatus("Hide read is hiding that message.");
-    return true;
-  };
-  if (hiddenAsRead()) return;
-  if (openAll()) {
-    setStatus("Not in this view — opening All…");
-    // The reader went somewhere else while All was being read: the tap is over.
-    const stillAll = () =>
-      ticket === replyJumpTicket && String(el("discord-channel").value) === channel && channelView === "flat";
-    try {
-      await changeChannelView("flat");
-    } catch (error) {
-      // As for a step back that fails, below: reported where every failed read is, and the status
-      // line no longer says All is being opened.
-      if (stillAll()) setStatus("Could not read All — try again.");
-      throw error;
+    let walked = 0;
+    // Main drawn from All takes its first step from its own read (`walkCursorOwed`, `#220`).
+    while (walked < REPLY_JUMP_PAGES && discordMoreAbove === true && (discordOlderCursor || walkCursorOwed())) {
+      walked += 1;
+      const context = channelContextKey();
+      setStatus(`Looking further back: page ${walked} of ${REPLY_JUMP_PAGES}…`);
+      try {
+        const step = loadOlder();
+        steps.pause();
+        await step;
+        steps.resume();
+      } catch (error) {
+        steps.resume();
+        // The failure itself is reported where every failed read is; this only stops the status
+        // line from going on saying a walk is under way.
+        if (ticket === replyJumpTicket) setStatus("Could not look further back.");
+        throw error;
+      }
+      // Another tap, another channel or another view: this walk is nobody's any more.
+      if (ticket !== replyJumpTicket || context !== channelContextKey()) return;
+      if (arrive() || hiddenAsRead()) return;
     }
-    // All not held by this page nor covered by the store, and another read — a poll of Main, say —
-    // on the wire when the tap came: All's read is queued behind it, and `changeChannelView`
-    // returned with nothing drawn. Waited for, as a pull up waits for a read already in flight,
-    // because until All has landed an empty list says nothing about where the message is.
-    while (discordFetchInFlight && !channelCanon.views.has(viewKey()) && stillAll()) {
-      await new Promise((resolve) => setTimeout(resolve, PULL_WAIT_MS));
+    if (todoMode && !threadingSupported) {
+      setStatus("Not in this list — Hide read is on.");
+    } else if (historyReadToStart()) {
+      setStatus("Not in this channel's history.");
+    } else if (walked > 0) {
+      setStatus(`Further back than ${walked} page${walked === 1 ? "" : "s"} — scroll up.`);
+    } else {
+      setStatus("Older than what is loaded.");
     }
-    if (!stillAll()) return;
-    if (arrive() || hiddenAsRead()) return;
-    if (!channelCanon.views.has(viewKey())) {
-      // All's read failed, and that is reported where every failed read is. Nothing was learned
-      // about the message, so nothing is said about it either — whether or not the rows the page
-      // already held for All are up (`#220 view-switch-instant`): those are not All read.
-      setStatus("Could not read All — try again.");
-      return;
-    }
-  }
-  let walked = 0;
-  // Main drawn from All takes its first step from its own read (`walkCursorOwed`, `#220`).
-  while (walked < REPLY_JUMP_PAGES && discordMoreAbove === true && (discordOlderCursor || walkCursorOwed())) {
-    walked += 1;
-    const context = channelContextKey();
-    setStatus(`Looking further back: page ${walked} of ${REPLY_JUMP_PAGES}…`);
-    try {
-      await loadOlder();
-    } catch (error) {
-      // The failure itself is reported where every failed read is; this only stops the status
-      // line from going on saying a walk is under way.
-      if (ticket === replyJumpTicket) setStatus("Could not look further back.");
-      throw error;
-    }
-    // Another tap, another channel or another view: this walk is nobody's any more.
-    if (ticket !== replyJumpTicket || context !== channelContextKey()) return;
-    if (arrive() || hiddenAsRead()) return;
-  }
-  if (todoMode && !threadingSupported) {
-    setStatus("Not in this list — Hide read is on.");
-  } else if (historyReadToStart()) {
-    setStatus("Not in this channel's history.");
-  } else if (walked > 0) {
-    setStatus(`Further back than ${walked} page${walked === 1 ? "" : "s"} — scroll up.`);
-  } else {
-    setStatus("Older than what is loaded.");
+  } finally {
+    steps.pause();
   }
 }
 
@@ -14618,9 +14819,11 @@ function holdingReplyArrows(draw) {
   } finally {
     replyArrowsHeld -= 1;
     if (replyArrowsHeld === 0 && replyArrowsOwed) {
-      Promise.resolve().then(() => {
+      // In the column whose rows were drawn: the end of this task is in the left one. `#229`.
+      const measure = inThisColumn(() => {
         if (replyArrowsHeld === 0 && replyArrowsOwed && !document.hidden) measureReplyArrows();
       });
+      Promise.resolve().then(measure);
     }
   }
 }
@@ -15104,13 +15307,13 @@ function ungatherButton() {
   mark.className = "reply-ungather-mark";
   mark.setAttribute("aria-hidden", "true");
   button.append(mark);
-  button.addEventListener("click", (event) => {
+  button.addEventListener("click", inThisColumn((event) => {
     // The row's own tap would fold the reply or read it aloud; this tap is the X's.
     if (event) event.stopPropagation();
     // ...unless it is the end of the taps on an arrow that put the X here (`replyTapsSettling`).
     if (replyTapsSettling !== null) return;
     scatterReplies();
-  });
+  }));
   return button;
 }
 
@@ -15398,7 +15601,7 @@ function replyMarker(row) {
   const marker = document.createElement("button");
   marker.className = "reply-marker";
   marker.setAttribute("type", "button");
-  marker.addEventListener("click", (event) => {
+  marker.addEventListener("click", inThisColumn((event) => {
     // The row's own tap would fold it or read it aloud: this tap is the circle's.
     if (event && typeof event.stopPropagation === "function") event.stopPropagation();
     const held = replyMarkerTargets.get(marker);
@@ -15408,7 +15611,7 @@ function replyMarker(row) {
     replyMarkerVisited.set(held.parent, target);
     labelReplyMarker(marker);
     guardQuietly(() => jumpToReply(target, next + 1, held.ids.length))();
-  });
+  }));
   row.append(marker);
   row.replyMarker = marker;
   return marker;
@@ -16586,7 +16789,7 @@ async function readAloud(ids) {
  * tabs to it gets the same act the tap performs.
  */
 function tapRow(li, fold) {
-  li.addEventListener("click", (event) => {
+  li.addEventListener("click", inThisColumn((event) => {
     if (suppressNextRowClick) {
       suppressNextRowClick = false;
       return;
@@ -16609,7 +16812,7 @@ function tapRow(li, fold) {
       return;
     }
     actOnRow(li, fold);
-  });
+  }));
 }
 
 /**
@@ -16672,7 +16875,7 @@ function swipeable(li, messages) {
     active = false;
   };
 
-  li.addEventListener("pointerdown", (event) => {
+  li.addEventListener("pointerdown", inThisColumn((event) => {
     // `#221 read-modes`. While the row is the line of a collapsed run it IS that line, and a finger
     // on it is pressing the line: neither archiving the message under it nor opening its details.
     if (li.getAttribute("data-read-run") === "head") {
@@ -16718,9 +16921,9 @@ function swipeable(li, messages) {
       suppressNextRowClick = true;
       toggleMessageDetails(li, messages);
     }, HOLD_MS);
-  });
+  }));
 
-  li.addEventListener("pointermove", (event) => {
+  li.addEventListener("pointermove", inThisColumn((event) => {
     if (!active) {
       return;
     }
@@ -16744,7 +16947,7 @@ function swipeable(li, messages) {
       dragging = true;
     }
     li.style.transform = `translateX(${dx}px)`;
-  });
+  }));
 
   const finish = (event) => {
     if (!active) {
@@ -16772,8 +16975,8 @@ function swipeable(li, messages) {
     }
   };
 
-  li.addEventListener("pointerup", finish);
-  li.addEventListener("pointercancel", reset);
+  li.addEventListener("pointerup", inThisColumn(finish));
+  li.addEventListener("pointercancel", inThisColumn(reset));
 }
 
 /**
@@ -17238,7 +17441,7 @@ function discordNode(messages) {
   //
   // THE ANSWER GOES TO THE FIRST CONSTITUENT. A glommed row is a primary message with a tail
   // hanging off it, and threading a reply under the tail would put the answer under a fragment.
-  reply.addEventListener("click", () => openReply(messages));
+  reply.addEventListener("click", inThisColumn(() => openReply(messages)));
   sayRowShortcut(reply, "reply-button");
   meta.append(reply);
   // `#228 reply-visible`. Held on the row, as its messages are, so that the pass which says how many
@@ -17301,12 +17504,12 @@ function discordNode(messages) {
     }
   };
   const closeMenu = () => setMenu(false);
-  moreButton.addEventListener("click", () => setMenu(menu.hidden));
+  moreButton.addEventListener("click", inThisColumn(() => setMenu(menu.hidden)));
   sayRowShortcut(moreButton, "row-more-button");
-  upstreamRead.addEventListener("click", () => {
+  upstreamRead.addEventListener("click", inThisColumn(() => {
     setMenu(false);
     guardQuietly(() => markReadUpstream(String(upstreamBoundary.id)))();
-  });
+  }));
   // `#198 copy-message-text`. The row's whole text as written — every constituent of a combined
   // row, in order, which is what the reader sees as one message — so it can be pasted elsewhere.
   // The source text rather than what the row draws: a pasted message should keep its own markup.
@@ -17316,10 +17519,10 @@ function discordNode(messages) {
   copy.setAttribute("title", "Copy this message's text to the clipboard");
   copy.textContent = "Copy text";
   sayRowShortcut(copy, "row-copy-button");
-  copy.addEventListener("click", () => {
+  copy.addEventListener("click", inThisColumn(() => {
     setMenu(false);
     guardQuietly(() => copyMessageText(content))();
-  });
+  }));
   // `#202 read-through-here`. What the owner reached for the read marker to do: grey everything up
   // to and including this row IN THIS APP — the same Done a row's own button records — so that with
   // Hide read on, doing it on the newest row leaves an empty list. Where the provider's own marker
@@ -17338,10 +17541,10 @@ function discordNode(messages) {
       (upstreamReadMarkSupported ? `, and move ${service}'s own read marker for the whole space.` : ".")
   );
   sayRowShortcut(readThrough, "row-read-through-button");
-  readThrough.addEventListener("click", () => {
+  readThrough.addEventListener("click", inThisColumn(() => {
     setMenu(false);
     guardQuietly(() => markReadThroughHere(li, String(upstreamBoundary.id)))();
-  });
+  }));
   // `#206 pin-message`. Pin or unpin EVERY message the row stands for, as Done archives every one:
   // pinning half of a split post would keep the half that stops mid-sentence. Its word is set by
   // `renderChannelRows`, with the chip, so the two cannot disagree.
@@ -17355,10 +17558,10 @@ function discordNode(messages) {
   );
   pinItem.textContent = messages.some((m) => isPinnedId(m.id)) ? "Unpin message" : "Pin message";
   sayRowShortcut(pinItem, "row-pin-button");
-  pinItem.addEventListener("click", () => {
+  pinItem.addEventListener("click", inThisColumn(() => {
     setMenu(false);
     guardQuietly(() => togglePin(messages))();
-  });
+  }));
   // The two that mark read, as ONE group: a caption, and the items under it. `role="group"` with the
   // caption's words as its name, so a screen reader announces the grouping the eye sees.
   const readGroup = document.createElement("span");
@@ -17395,7 +17598,7 @@ function discordNode(messages) {
   // EVERY constituent, not the row's identity: archiving a row that leaves half of itself in the
   // queue is the failure mode a display-layer grouping has to be built against.
   const ids = messages.map((m) => String(m.id));
-  done.addEventListener("click", () => guardQuietly(() => toggleArchived(ids))());
+  done.addEventListener("click", inThisColumn(() => guardQuietly(() => toggleArchived(ids))()));
   sayRowShortcut(done, "done-button");
   // `#196 auto-read-noise`. The rescue for a rule that caught a message by mistake: ONE message,
   // recorded on the server, leaving the rule to go on catching the placeholders it is right about.
@@ -17410,7 +17613,7 @@ function discordNode(messages) {
   );
   rescue.textContent = "Not noise";
   rescue.hidden = !messages.every(isNoise);
-  rescue.addEventListener("click", () => guardQuietly(() => markNotNoise(ids))());
+  rescue.addEventListener("click", inThisColumn(() => guardQuietly(() => markNotNoise(ids))()));
   meta.append(rescue);
   meta.append(done);
   // `#84 reply-aware-dismissal`. THE SWIPE `#50` deferred, and it drives the same act the Done button does
@@ -17715,9 +17918,10 @@ let olderStep = null;
  */
 function loadOlder() {
   if (olderStep === null) {
-    olderStep = (threadingSupported ? loadOlderTimeline() : loadOlderPage()).finally(() => {
+    // The step is this column's, and so is forgetting it, in the task it ends in. `#229`.
+    olderStep = (threadingSupported ? loadOlderTimeline() : loadOlderPage()).finally(inThisColumn(() => {
       olderStep = null;
-    });
+    }));
   }
   return olderStep;
 }
@@ -18602,7 +18806,7 @@ function readRunLine(row) {
   line.setAttribute("type", "button");
   // No `aria-expanded`: the line is not a disclosure that stays to say it is open. It goes, and the
   // run is drawn in its place.
-  line.addEventListener("click", (event) => {
+  line.addEventListener("click", inThisColumn((event) => {
     // The row's own tap would fold it or read it aloud; this tap is the line's alone.
     if (event) event.stopPropagation();
     // A keyboard on the line is left on nothing as it goes, and falls back to the start of the page.
@@ -18615,7 +18819,7 @@ function readRunLine(row) {
       row.setAttribute("tabindex", "-1");
       row.focus({ preventScroll: true });
     }
-  });
+  }));
   row.replaceChildren(line, ...row.children);
   row.readRunLine = line;
   return line;
@@ -20329,6 +20533,578 @@ function followReplyStore() {
   holdingReplyMessage(renderReplyContext);
 }
 
+// --- two columns on a desk ------------------------------------------------------------------------
+//
+// `#229 desktop-two-column`. The owner, 2026-10-09: he likes the two-column view other chat clients'
+// desktop apps give and uses it a lot, and asked for "a layout button that toggles between single
+// column and double column. When in double column the thread selector greys out because it has a
+// fixed view where main is in the left column and the right column contains the messages from the
+// selected thread. When no thread is selected it contains a list of threads with fixed sized ~3
+// line previews of the 1st message text in EACH thread OR (even better) the 'descriptive-slug: short
+// description from summarization' ... We already have a button for clicking on a message to go into
+// the thread containing it. So we can use that to 'select' different threads from the left column
+// view. We need a button on the right hand side thread column to 'exit' (deselect) the thread and go
+// back to the list."
+//
+// WHERE. Only on a desk (the desktop block of web/voice.css: a fine pointer) in a window at least
+// 1000px wide. At 1000px each column is about 490px, which after a row's insets is about 45
+// characters: the narrowest reading width the width setting itself allows. Narrower than that, one
+// of the two columns would be narrower than the page lets a reader make its only column, so the
+// button is not offered and a window narrowed below it shows one column, keeping the choice for
+// when it is wide again. A phone never sees any of it. The stylesheet decides all of that, and the
+// script asks it, by whether the right column has a box (`renderColumns`): `voice.js` reads no media
+// query and no user agent, which the page suite holds it to.
+//
+// WHAT EACH COLUMN SHOWS. The left is Main, always, so the view picker has nothing to choose and
+// greys out, saying why. The right is the thread selected, read and drawn exactly as a thread is in
+// one column (read modes, the landing on its first unread, reply arrows, reactions, Done, pins, the
+// walk back and its own composer at its foot), with a heading naming it and an X that deselects it.
+// With none selected it is a card per thread, newest activity first, as the Threads screen orders
+// them: "display_name: summary" where the summariser has named the thread and summed it up, else the
+// text of its first message, three lines at most.
+//
+// SELECTING. Every way into a thread selects it on the right instead of leaving Main: its Thread(N)
+// tag, the "N unread" on a root, the root's "N replies" (which in one column gathers the replies
+// under the root, and here would show them twice, side by side), the Threads screen, and a card. A
+// plain tap on a message does not: a tap folds and unfolds it, and replacing the right column on
+// every fold would throw away the reader's place in the thread they are reading.
+//
+// THE FILTERS. One search bar, so the search and the Links filter apply to both columns and the
+// count speaks for both: a filter that silently skipped half the screen is the defect `#129` names
+// for the Threads tab. The Pinned filter is a list of the channel's pins, and stands in for the left
+// column's list, as it does in one column. One read mode, for both.
+//
+// THE COST. No timer of its own. The poll that reads Main reads the thread on the right behind it:
+// two different views, one delta each, never the same view twice; with the cards up it asks for the
+// thread list, at most once a minute (`refreshThreadDirectory`). A refresh that brings nothing draws
+// nothing in either column. A live reply in the thread on the right is read once, as the thread.
+//
+// LEAVING. One column again shows the view last chosen in one column: in two, the view picker is not
+// the reader's to change, so nothing here touches that choice. The thread selected on the right is
+// kept per channel for the session, and selected again when two columns come back.
+//
+// HOW. See `COLUMN_IDS` at the head of this file: the code works on one column at a time, the left
+// one except inside `inColumn`. Everything that starts in the right column gets there first: its
+// rows' controls and its own buttons are bound to it when they are made (`inThisColumn`), the keys
+// by the pane the focus is in, and a read, a step back or a seek that waits comes back to it after
+// each wait (`columnSteps`). What changes in one column and shows in both — a Done, a pin, a mode,
+// a filter — is drawn in each (`eachColumn`).
+
+/** The device's choice of one column or two: "two", or anything else for one. */
+const COLUMNS_KEY = "vibe-talk.voice.columns";
+
+/** Whether two columns are what the reader chose, kept on this device. */
+function storedColumnsChoice() {
+  try {
+    return localStorage.getItem(COLUMNS_KEY) === "two";
+  } catch (_error) {
+    return false;
+  }
+}
+
+/** Whether the reader chose two columns. Applied only where they are offered and the window is wide enough. */
+let columnsChosen = storedColumnsChoice();
+
+/** Whether two columns are on screen now. */
+let columnsShown = false;
+
+/**
+ * By channel, the thread the right column shows, as `{id, summary}`, for this session: two columns
+ * left and come back to, or a channel left and come back to, find it selected again.
+ *
+ * @type {Map<string, {id: string, summary: any}>}
+ */
+const sideThreads = new Map();
+
+/**
+ * Everything the page keeps about the view a column shows, as `[get, set, fresh]`: saved and loaded
+ * by `useColumn`, and `fresh()` what the right column starts with. The channel's store, the reads on
+ * the wire, the read mode, the filters' settings, pins, summaries and the outbox are the channel's
+ * and the page's, shared by both columns, and are not here.
+ *
+ * @type {Array<[() => any, (value: any) => void, () => any]>}
+ */
+const COLUMN_STATE = [
+  [() => channelView, (value) => { channelView = value; }, () => "thread"],
+  [() => selectedThreadId, (value) => { selectedThreadId = value; }, () => null],
+  [() => selectedThread, (value) => { selectedThread = value; }, () => null],
+  [() => threadOrigin, (value) => { threadOrigin = value; }, () => "main"],
+  [() => timelineMessages, (value) => { timelineMessages = value; }, () => []],
+  [() => timelineThreads, (value) => { timelineThreads = value; }, () => []],
+  [() => activeComposerKey, (value) => { activeComposerKey = value; }, () => ""],
+  [() => channelFreshness, (value) => { channelFreshness = value; }, () => "fresh"],
+  [() => channelFreshAt, (value) => { channelFreshAt = value; }, () => 0],
+  [() => channelRefreshing, (value) => { channelRefreshing = value; }, () => false],
+  [() => loadingLineTimer, (value) => { loadingLineTimer = value; }, () => null],
+  [() => discordLoadGeneration, (value) => { discordLoadGeneration = value; }, () => 0],
+  [() => threadEntryOwed, (value) => { threadEntryOwed = value; }, () => null],
+  [() => threadEntryAwaitsRead, (value) => { threadEntryAwaitsRead = value; }, () => false],
+  [() => entryReadOwed, (value) => { entryReadOwed = value; }, () => null],
+  [() => entryLanding, (value) => { entryLanding = value; }, () => null],
+  [() => replyReturn, (value) => { replyReturn = value; }, () => null],
+  [() => replyLanded, (value) => { replyLanded = value; }, () => null],
+  [() => replyArrowTap, (value) => { replyArrowTap = value; }, () => null],
+  [() => replyTapsSettling, (value) => { replyTapsSettling = value; }, () => null],
+  [() => replyArrowsHeld, (value) => { replyArrowsHeld = value; }, () => 0],
+  [() => replyArrowsOwed, (value) => { replyArrowsOwed = value; }, () => false],
+  [() => replyCountsDrawn, (value) => { replyCountsDrawn = value; }, () => false],
+  [() => countedOutgoingKey, (value) => { countedOutgoingKey = value; }, () => ""],
+  [() => gathered, (value) => { gathered = value; }, () => null],
+  [() => rowsGathered, (value) => { rowsGathered = value; }, () => false],
+  [() => discordMoreAbove, (value) => { discordMoreAbove = value; }, () => false],
+  [() => discordOlderCursor, (value) => { discordOlderCursor = value; }, () => null],
+  [() => olderFetchInFlight, (value) => { olderFetchInFlight = value; }, () => false],
+  [() => olderStep, (value) => { olderStep = value; }, () => null],
+  [() => olderDeferred, (value) => { olderDeferred = value; }, () => false],
+  [() => discordNewestId, (value) => { discordNewestId = value; }, () => null],
+  [() => collapsedRunRows, (value) => { collapsedRunRows = value; }, () => 0],
+  [() => archivedIds, (value) => { archivedIds = value; }, () => new Set()],
+  [() => backlogSize, (value) => { backlogSize = value; }, () => 0],
+  [() => pinnedOnly, (value) => { pinnedOnly = value; }, () => false],
+  [() => placeBeforePinned, (value) => { placeBeforePinned = value; }, () => null],
+  [() => pinnedListDrawn, (value) => { pinnedListDrawn = value; }, () => ""],
+  [() => placeBeforeLinks, (value) => { placeBeforeLinks = value; }, () => null],
+  [() => scrollToolsHeld, (value) => { scrollToolsHeld = value; }, () => 0],
+  [() => scrollToolsOwed, (value) => { scrollToolsOwed = value; }, () => false],
+  [() => jumpNewestWanted.discord, (value) => { jumpNewestWanted.discord = value; }, () => false],
+  [() => inScrollback.discord, (value) => { inScrollback.discord = value; }, () => false],
+  [() => threadBackGesture, (value) => { threadBackGesture = value; }, () => null],
+];
+
+/** Work on column `column` from now on: its state into the module's, the other's put aside. */
+function useColumn(column) {
+  if (column === activeColumn) return;
+  activeColumn.state = COLUMN_STATE.map(([get]) => get());
+  const state = column.state || COLUMN_STATE.map(([, , fresh]) => fresh());
+  COLUMN_STATE.forEach(([, set], at) => set(state[at]));
+  column.state = null;
+  activeColumn = column;
+  sideActive = column === columns.side;
+}
+
+/**
+ * Run `fn` working on column `column`, and work on the one before again however it returns. What
+ * `fn` returns is returned: a promise from an `async` function, whose work after its first wait is
+ * no longer in here (see `columnSteps`).
+ *
+ * @template T
+ * @param {typeof activeColumn} column
+ * @param {() => T} fn
+ * @returns {T}
+ */
+function inColumn(column, fn) {
+  const was = activeColumn;
+  if (column === was) return fn();
+  useColumn(column);
+  try {
+    return fn();
+  } finally {
+    useColumn(was);
+  }
+}
+
+/**
+ * `fn`, bound to the column being worked on now: a control made while a column is drawn acts in that
+ * column whenever it is pressed. The left column's controls work as they always did.
+ *
+ * @param {(...args: any[]) => any} fn
+ * @returns {(...args: any[]) => any}
+ */
+function inThisColumn(fn) {
+  const column = activeColumn;
+  return (...args) => inColumn(column, () => fn(...args));
+}
+
+/**
+ * The column an asynchronous step was asked for in, kept across its waits.
+ *
+ * A wait ends in a later task, and every task starts in the left column, since `inColumn` always puts
+ * it back. So a step asked for in the right column that waits — a read, a step back, the seek a
+ * reply's arrow makes — would go on in the left one, and draw a thread's page into Main's list. Such a
+ * step says `resume()` as the first thing after each wait, which brings its own column back, and
+ * `pause()` just before each wait after that and on its way out, which gives whatever runs next the
+ * left column again. Before its first wait it is still in the code that called it, in that code's
+ * column, and `pause()` leaves it there. Only the `await` of an `async` function's promise, which
+ * always waits, may stand between the two.
+ */
+function columnSteps() {
+  const column = activeColumn;
+  let resumed = false;
+  return {
+    column,
+    resume() {
+      resumed = true;
+      useColumn(column);
+    },
+    pause() {
+      if (resumed) useColumn(columns.main);
+    },
+  };
+}
+
+/** Whether the right column is showing a thread now. */
+const sideShowing = () => columnsShown && columns.side.mode === "thread";
+
+/**
+ * Run `fn` in every column showing the channel's messages: the left, and the right while it shows a
+ * thread. For what is the same in both — a mode, a filter, a Done, a pin — drawn in each.
+ *
+ * @param {() => unknown} fn
+ */
+function eachColumn(fn) {
+  inColumn(columns.main, fn);
+  if (sideShowing()) inColumn(columns.side, fn);
+}
+
+/**
+ * Run `fn` in the column that is not the one being worked on, when both are showing messages: what
+ * one column changed in the channel, caught up in the other.
+ *
+ * @param {() => unknown} fn
+ */
+function inOtherColumn(fn) {
+  if (!sideShowing()) return;
+  inColumn(sideActive ? columns.main : columns.side, fn);
+}
+
+/**
+ * Bring the other column up to date with the store after something in this one changed it — a read
+ * that landed, a reply that arrived — as a refresh of its own would: its rows caught up, the newest
+ * line followed or the reader's place kept, and on Main the roots' counts of unread replies redrawn.
+ */
+function followInOtherColumn() {
+  inOtherColumn(() => {
+    if (catchUpHeldView()) {
+      const keeps = readFilterKeeps();
+      settleAfterRead(timelineMessages.filter((message) => !todoMode || keeps(message)),
+        { keepPosition: true, area: el("scroll-area"), ...channelReadPosition(el("scroll-area")) });
+    } else {
+      syncUnreadReplies();
+    }
+  });
+}
+
+/**
+ * Whether two columns are offered: the channel on the main screen, a provider with threads, and a
+ * channel that is not itself one thread, which has no others to show beside it. How wide the window
+ * is, and whether this is a desk, the stylesheet decides (`#column-toggle` is drawn only in the
+ * desktop block at 1000px and wider).
+ */
+function columnsOffered() {
+  const channel = String(el("discord-channel").value || "");
+  return currentScreen === "main" && currentView === "discord" && threadingSupported && channel !== "" &&
+    !(channelCanon.channel === channel && channelCanon.scope);
+}
+
+/** The layout button: whether it is offered, and whether it is pressed. */
+function renderColumnToggle() {
+  const button = leftEl("column-toggle");
+  const offered = columnsOffered();
+  if (button.hidden === offered) button.hidden = !offered;
+  button.setAttribute("aria-pressed", columnsChosen ? "true" : "false");
+  const title = columnsChosen ? "Back to one column" : "Show Main and a thread side by side";
+  if (button.title !== title) button.title = title;
+}
+
+/** Whether the right column has a box, which only web/voice.css can give it. */
+function sideHasBox() {
+  const side = leftEl("side-column");
+  return typeof side.getClientRects === "function" && side.getClientRects().length > 0;
+}
+
+/**
+ * Decide again whether two columns are on screen, and go into them or out of them. Asked on the
+ * changes that can move the answer — the toggle, the window resized, the view, the channel, the
+ * screen — and never per scroll: asking whether the right column has a box lays the page out.
+ * Off the main screen nothing is decided, so a visit to Settings or Reply comes back to both columns
+ * as they were.
+ */
+function renderColumns() {
+  if (currentScreen !== "main") return;
+  renderColumnToggle();
+  const screen = leftEl("screen-main");
+  const want = columnsChosen && columnsOffered();
+  if (screen.hasAttribute("data-columns") !== want) {
+    if (want) screen.setAttribute("data-columns", "two");
+    else screen.removeAttribute("data-columns");
+  }
+  const shown = want && sideHasBox();
+  if (shown === columnsShown) return;
+  if (shown) enterColumns();
+  else leaveColumns();
+}
+
+/** The reader pressed the layout button. */
+function toggleColumns() {
+  columnsChosen = !columnsChosen;
+  try {
+    localStorage.setItem(COLUMNS_KEY, columnsChosen ? "two" : "one");
+  } catch (_error) {
+    // A browser that refuses storage still honours the choice for this session.
+  }
+  renderColumns();
+  settleFocus();
+}
+
+/**
+ * Into two columns: Main on the left, drawn from what the page holds, and on the right the thread the
+ * left column was showing, else the one selected there earlier in this session, else the cards.
+ */
+function enterColumns() {
+  columnsShown = true;
+  const channel = String(el("discord-channel").value);
+  const open = channelView === "thread" && selectedThreadId
+    ? { id: String(selectedThreadId), summary: selectedThread }
+    : sideThreads.get(channel) || null;
+  if (channelView !== "main") guardQuietly(() => changeChannelView("main"))();
+  renderThreadSelect();
+  if (open) guardQuietly(() => selectSideThread(open.id, open.summary))();
+  else showSideList();
+}
+
+/**
+ * Out of two columns, to the view last chosen in one column. The right column keeps what it shows,
+ * held, so two columns come back to it at once.
+ */
+function leaveColumns() {
+  columnsShown = false;
+  if (columns.side.mode === "thread") {
+    inColumn(columns.side, () => {
+      dropReplyArrowTap();
+      putRepliesBack();
+      rememberChannelDraft();
+      rememberChannelContext();
+    });
+  }
+  renderThreadSelect();
+  const opening = openingChannelView();
+  if (opening.view !== channelView || (opening.thread || null) !== (selectedThreadId || null)) {
+    guardQuietly(() => changeChannelView(opening.view, opening.thread, opening.summary))();
+  }
+}
+
+/** Show what the right column is showing — the cards or the thread — and say so in its heading. */
+function renderSideMode() {
+  const thread = columns.side.mode === "thread";
+  if (leftEl("side-list").hidden === !thread) leftEl("side-list").hidden = thread;
+  if (leftEl("side-pane").hidden === thread) leftEl("side-pane").hidden = !thread;
+  if (leftEl("side-close").hidden === thread) leftEl("side-close").hidden = !thread;
+  leftEl("side-scroll").setAttribute("aria-label", thread ? "Thread" : "Threads");
+  renderSideColumn();
+}
+
+/** The right column's heading, and with no thread selected its cards. Drawn only where they changed. */
+function renderSideColumn() {
+  if (!columnsShown) return;
+  if (columns.side.mode === "list") {
+    setTextIfChanged(leftEl("side-title"), "Threads");
+    const facts = leftEl("side-facts");
+    if (!facts.hidden) facts.hidden = true;
+    renderSideCards();
+    return;
+  }
+  inColumn(columns.side, () => {
+    const open = openThreadChoice();
+    setTextIfChanged(leftEl("side-title"), open ? threadName(open, Infinity) : "Thread");
+    const said = open ? threadFacts(open) : "";
+    const facts = leftEl("side-facts");
+    setTextIfChanged(facts, said);
+    if (facts.hidden !== (said === "")) facts.hidden = said === "";
+  });
+}
+
+/** Set `node`'s text, unless it already says that. */
+function setTextIfChanged(node, text) {
+  if (node.textContent !== text) node.textContent = text;
+}
+
+/**
+ * What a card says of its thread: "display_name: summary" when the summariser has named it and summed
+ * it up, else the text of its first message, else its name. Whitespace is folded, so three lines show
+ * three lines of words rather than a paragraph break.
+ */
+function sideCardText(choice) {
+  const summary = choice.summary;
+  const named = summary && typeof summary.display_name === "string" ? summary.display_name.trim() : "";
+  const said = summary && typeof summary.summary === "string" ? summary.summary.trim() : "";
+  if (named && said) return `${named}: ${said}`;
+  const first = choice.root ? messageText(choice.root).replace(/\s+/g, " ").trim() : "";
+  return first || threadName(choice, Infinity);
+}
+
+/** What a card says of its thread's unread replies, as a root on Main says it ("3 unread", "1 new"), or "". */
+function sideCardUnread(choice, tally) {
+  const entry = tally.threads.get(choice.id);
+  const unread = entry ? entry.unread : 0;
+  const unseen = unseenReplies(choice.id, choice.root, tally, choice.summary);
+  if (unread > 0) return `${unread}${repliesPartlyHeld(choice.id, choice.root, entry.held, tally) ? "+" : ""} unread`;
+  return unseen > 0 ? `${unseen} new` : "";
+}
+
+/** What the cards were last drawn from, so a pass that changes nothing draws nothing. */
+let sideCardsDrawn = "";
+
+/**
+ * One card per thread the channel's store knows, newest activity first — the Threads screen's order
+ * and source — each a fixed three lines of what the thread is about, then how long since it moved,
+ * how many replies it has and how many of them are unread. Choosing one selects it. Redrawn only when
+ * what it would draw has changed, so a refresh with nothing new draws nothing here either.
+ */
+function renderSideCards() {
+  const list = leftEl("side-cards");
+  const tally = replyTally();
+  const cards = threadChoices().map((choice) => ({
+    choice,
+    text: sideCardText(choice),
+    age: briefAge(Number.isFinite(choice.at) ? choice.at : choice.started),
+    replies: typeof choice.count === "number" && choice.count > 0 ? threadCount(choice.count, true) : "",
+    unread: sideCardUnread(choice, tally),
+  }));
+  const signature = JSON.stringify(cards.map(({ choice, text, age, replies, unread }) =>
+    [choice.id, text, age, replies, unread]));
+  if (signature !== sideCardsDrawn) {
+    sideCardsDrawn = signature;
+    list.replaceChildren(...cards.map(sideCard));
+  }
+  const state = cards.length === 0 ? "No threads in this channel yet." : "";
+  setTextIfChanged(leftEl("side-list-state"), state);
+  if (leftEl("side-list-state").hidden !== (state === "")) leftEl("side-list-state").hidden = state === "";
+  const more = olderThreadsOnServer();
+  if (leftEl("side-more-threads").hidden === more) leftEl("side-more-threads").hidden = !more;
+}
+
+/** One card. Every string is text; nothing from the chat service is parsed as markup. */
+function sideCard({ choice, text, age, replies, unread }) {
+  const row = document.createElement("li");
+  row.className = "side-card-row";
+  // `data-id` and `data-card`: the keys move through the cards as through messages, and know them apart.
+  row.setAttribute("data-id", choice.id);
+  row.setAttribute("data-card", "");
+  const button = document.createElement("button");
+  button.className = "side-card";
+  button.setAttribute("type", "button");
+  button.style.setProperty("--thread-hue", threadHue(choice.id));
+  const body = document.createElement("span");
+  body.className = "side-card-text";
+  body.textContent = text;
+  const facts = document.createElement("span");
+  facts.className = "side-card-facts";
+  facts.textContent = [age, replies].filter((part) => part !== "").join(" · ");
+  if (unread) {
+    const chip = document.createElement("span");
+    chip.className = "side-card-unread";
+    chip.textContent = unread;
+    facts.append(chip);
+  }
+  button.append(body, facts);
+  button.addEventListener("click", () => guardQuietly(() => selectSideThread(choice.id, choice.summary))());
+  row.append(button);
+  // `#129 message-search`. A card stands in this list where messages stand in the others, so the
+  // search reaches it, as it reaches the cards of the Threads list.
+  searchable(row, text, threadName(choice, Infinity));
+  return row;
+}
+
+/** The right column with no thread selected: its cards, and the thread list read behind them. */
+function showSideList() {
+  columns.side.mode = "list";
+  renderSideMode();
+  guardQuietly(refreshThreadDirectory)();
+}
+
+/**
+ * Select thread `id` on the right, from wherever the reader asked for it: its tag on a row, a count
+ * of unread replies, a card, the Threads screen. Drawn at once from what the page holds and read
+ * behind, landing on its first unread, exactly as a thread opens in one column.
+ */
+function selectSideThread(id, summary = null) {
+  const thread = String(id);
+  const channel = String(el("discord-channel").value);
+  if (!columnsShown || !channel) return undefined;
+  const known = summary || channelCanon.threads.find((held) => String(held.id) === thread) || null;
+  sideThreads.set(channel, { id: thread, summary: known });
+  const was = columns.side.mode;
+  columns.side.mode = "thread";
+  renderSideMode();
+  return inColumn(columns.side, () => {
+    if (was === "thread" && channelView === "thread" && String(selectedThreadId) === thread) return undefined;
+    return changeChannelView("thread", thread, known);
+  });
+}
+
+/** The X: the thread goes, and the cards come back. Its rows are held, so selecting it again is instant. */
+function closeSideThread() {
+  const channel = String(el("discord-channel").value);
+  sideThreads.delete(channel);
+  if (columns.side.mode === "thread") {
+    inColumn(columns.side, () => {
+      dropReplyArrowTap();
+      putRepliesBack();
+      rememberChannelDraft();
+      rememberChannelContext();
+      ++discordLoadGeneration;
+    });
+  }
+  showSideList();
+}
+
+/**
+ * Forget what the right column shows, for another channel or another credential, and show that
+ * channel's thread selected there earlier in this session, or its cards.
+ */
+function resetSideColumn() {
+  inColumn(columns.side, () => {
+    dropReplyArrowTap();
+    gathered = null;
+    rowsGathered = false;
+    ++discordLoadGeneration;
+  });
+  columns.side.state = null;
+  for (const id of ["side-log", "side-thread-list", "side-summary", "side-pinned-log", "side-outgoing-log"]) {
+    leftEl(id).replaceChildren();
+  }
+  leftEl("side-notice").hidden = true;
+  leftEl("side-older").hidden = true;
+  leftEl("side-loading").hidden = true;
+  sideCardsDrawn = "";
+  leftEl("side-cards").replaceChildren();
+  if (!columnsShown) {
+    columns.side.mode = "list";
+    return;
+  }
+  const open = sideThreads.get(String(el("discord-channel").value));
+  if (open) {
+    columns.side.mode = "list";
+    guardQuietly(() => selectSideThread(open.id, open.summary))();
+  } else {
+    showSideList();
+  }
+}
+
+/**
+ * Read the right column's thread behind its rows, or the thread list behind its cards: the poll's
+ * second read, and coming back to the page. Nothing while one column is up.
+ *
+ * @param {string} reason
+ */
+async function readSideColumn(reason) {
+  if (!columnsShown) return;
+  if (columns.side.mode === "thread") {
+    await inColumn(columns.side, () => loadDiscord({ keepPosition: true, reason }));
+  } else {
+    await refreshThreadDirectory();
+  }
+}
+
+/** Whether a message belongs to the thread the right column is showing. */
+function inSideThread(message) {
+  if (!sideShowing()) return false;
+  return inColumn(columns.side, () => channelView === "thread" && threadOf(message) === String(selectedThreadId));
+}
+
+/** Where the right column's list was, put aside while another screen hides it. */
+let sideMark = null;
+
 // --- keeping the channel view fresh -----------------------------------------------------------
 //
 // The channel used to be fetched exactly ONCE, on the first switch into the view, because the
@@ -20356,7 +21132,13 @@ let timelineReadContext = null;
 // is in flight. Only the newest generation may draw. The newest blocked request is queued so a
 // channel switch cannot be swallowed by a refresh of the channel the reader just left.
 let discordLoadGeneration = 0;
-let discordQueuedLoad = null;
+/**
+ * The read queued behind the one on the wire, by the column it is for: one each, so a read of the
+ * thread on the right never stands in for a refresh of Main or the other way round. `#229`.
+ *
+ * @type {Map<typeof activeColumn, {options: any}>}
+ */
+const discordQueuedLoads = new Map();
 // How many timeline reads have gone on the wire, the newest of them that landed, that count when
 // the live stream last attached, and the replayed events waiting on a read that may not have seen
 // them, each with the count as it stood when the server had it. A read begun after that answers
@@ -20386,28 +21168,35 @@ const replaysAwaitingRead = new Map();
  * @param {{keepPosition?: boolean, quiet?: boolean, ownAct?: boolean, reason?: string | (string | undefined)[]}} [options]
  */
 function queueDiscordLoad(options) {
-  if (!discordQueuedLoad) {
-    discordQueuedLoad = { options };
+  const queued = discordQueuedLoads.get(activeColumn);
+  if (!queued) {
+    discordQueuedLoads.set(activeColumn, { options });
     return;
   }
   /** @param {{reason?: string | (string | undefined)[]} | undefined} opts */
   const reasons = (opts) => (opts && Array.isArray(opts.reason) ? opts.reason : [opts ? opts.reason : undefined]);
-  const all = [...new Set([...reasons(discordQueuedLoad.options), ...reasons(options)])];
-  const quiet = Boolean(discordQueuedLoad.options && discordQueuedLoad.options.quiet) || Boolean(options && options.quiet);
-  discordQueuedLoad = { options: { ...(options || {}), reason: all.length === 1 ? all[0] : all, ...(quiet ? { quiet } : {}) } };
+  const all = [...new Set([...reasons(queued.options), ...reasons(options)])];
+  const quiet = Boolean(queued.options && queued.options.quiet) || Boolean(options && options.quiet);
+  discordQueuedLoads.set(activeColumn,
+    { options: { ...(options || {}), reason: all.length === 1 ? all[0] : all, ...(quiet ? { quiet } : {}) } });
 }
 
-/** Release the fetch lock, then perform the newest read that was requested while it was held. */
-async function finishDiscordLoad() {
+/**
+ * Release the fetch lock, then perform the newest read that was requested while it was held: the
+ * left column's first, in its own column. `column` is the column of the read that has just ended,
+ * whose loading line goes when nothing is queued behind it.
+ */
+async function finishDiscordLoad(column = activeColumn) {
   discordFetchInFlight = false;
   timelineReadContext = null;
-  const queued = discordQueuedLoad;
-  discordQueuedLoad = null;
-  if (queued) {
-    await loadDiscord(queued.options);
+  const next = [columns.main, columns.side].find((one) => discordQueuedLoads.has(one));
+  if (next) {
+    const queued = discordQueuedLoads.get(next);
+    discordQueuedLoads.delete(next);
+    await inColumn(next, () => loadDiscord(queued.options));
     return;
   }
-  renderChannelLoading(false);
+  inColumn(column, () => renderChannelLoading(false));
 }
 
 /** Whether a completed read still describes the channel and mode currently selected. */
@@ -21341,7 +22130,7 @@ function receiveLiveMessage(message, selfPosted, replayed, fromTail) {
     // even when the event's ID is already visible from a POST acknowledgement; otherwise it
     // could erase the row after this event retired its durable send receipt.
     ++discordLoadGeneration;
-    if (!discordQueuedLoad) queueDiscordLoad({ keepPosition: true });
+    if (!discordQueuedLoads.has(columns.main)) queueDiscordLoad({ keepPosition: true });
   }
   if (threadingSupported) {
     // A replayed copy is from when it was published, so the store's copy is at least as new — its
@@ -21480,8 +22269,9 @@ function settleReplays(read, page) {
       replaysAwaitingRead.delete(key);
     }
   }
-  if (page && replaysAwaitingRead.size && currentView === "discord" && !discordQueuedLoad) {
-    queueDiscordLoad({ keepPosition: true, reason: "replay" });
+  // The stream's replay is answered by a read of the left column's view. `#229 desktop-two-column`.
+  if (page && replaysAwaitingRead.size && currentView === "discord" && !discordQueuedLoads.has(columns.main)) {
+    inColumn(columns.main, () => queueDiscordLoad({ keepPosition: true, reason: "replay" }));
   }
 }
 

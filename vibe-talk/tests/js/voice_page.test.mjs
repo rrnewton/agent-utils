@@ -20356,8 +20356,14 @@ test("every list of messages is a list the filter reaches", () => {
   // It is EXCLUDED BY NAME rather than by a rule about what it contains, so that a fifth list
   // added to the page still fails here until somebody says which of the two kinds it is.
   const NOT_MESSAGES = ["channel-summary"];
-  const inMarkup = [...HTML.matchAll(/<ol id="([^"]+)" class="messages"/g)]
-    .map((m) => m[1])
+  // `#229 desktop-two-column`. The right column's lists stand in for the channel pane's, by
+  // `COLUMN_IDS`, and the filter reaches them the way everything else does: it runs once in each
+  // column, and `el()` gives it that column's list for each id. So each counts as its counterpart.
+  const table = /const COLUMN_IDS = \{([\s\S]*?)\n\};/.exec(SCRIPT_CODE);
+  assert.ok(table, "web/voice.js no longer declares COLUMN_IDS");
+  const standsFor = new Map([...table[1].matchAll(/"([^"]+)": "([^"]+)"/g)].map((m) => [m[2], m[1]]));
+  const inMarkup = [...new Set([...HTML.matchAll(/<ol id="([^"]+)" class="messages"/g)]
+    .map((m) => standsFor.get(m[1]) || m[1]))]
     .filter((id) => !NOT_MESSAGES.includes(id));
   assert.ok(inMarkup.length >= 4, "the markup scan stopped finding the lists it is about");
   assert.deepStrictEqual(
@@ -30333,8 +30339,8 @@ test("a queued read standing for triggers that read differently is a delta only 
   // waiting reads a delta; neither outranks the other, so the read standing for both is full.
   const probe = `${SCRIPT}\n;el("scroll-area").queueProbe = {\n` +
     "  queue: queueDiscordLoad,\n" +
-    "  cursor: () => forwardCursor(discordQueuedLoad && discordQueuedLoad.options && discordQueuedLoad.options.reason),\n" +
-    "  clear: () => { discordQueuedLoad = null; },\n};\n";
+    "  cursor: () => { const held = discordQueuedLoads.get(columns.main); return forwardCursor(held && held.options && held.options.reason); },\n" +
+    "  clear: () => { discordQueuedLoads.clear(); },\n};\n";
   const { page, server } = await forwardPage({ complete: false }, null, probe);
   const arriving = server.post(message({ id: "385", content: "learns what the deltas carry" }));
   await deliver(page, page.stream(), sseMessage(arriving));
