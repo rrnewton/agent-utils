@@ -111,6 +111,31 @@ def _session_matches(record: AgentRecord, info: AgentPaneInfo) -> bool:
             and info.session_agent == (record.session_agent or record.harness))
 
 
+def _native_session(agent_kind: str, value: str, source: str) -> dict[str, str]:
+    """Recovery provenance, separate from the pane's observed routing anchor."""
+    return {"schema": "agentctl-native-session/v1", "agent": agent_kind,
+            "value": value, "source": source}
+
+
+def _capture_native_session(record: AgentRecord, info: AgentPaneInfo) -> None:
+    """Keep a supplied conversation and reject contradictory harness reports."""
+    if (info.session_agent is None) != (info.session_value is None):
+        raise AgentDeliveryError("started agent reported an incomplete native session identity")
+    if any(value is not None and (not value or "\0" in value)
+           for value in (info.session_agent, info.session_value)):
+        raise AgentDeliveryError("started agent reported an invalid native session identity")
+    if info.session_value is None:
+        return
+    provider = info.session_agent or record.harness
+    if provider != record.harness:
+        raise AgentDeliveryError("started agent reported a different native session provider")
+    if record.native_session is not None:
+        if record.native_session["value"] != info.session_value:
+            raise AgentDeliveryError("started agent reported a different native conversation")
+    else:
+        record.native_session = _native_session(provider, info.session_value, "observed")
+
+
 def _validate_rename_journal(value: object, path: Path) -> dict[str, object]:
     """Validate one rename journal written by either edition."""
     keys = {"schema", "token", "old", "new", "adapter", "pane_id", "tab_id",
@@ -364,6 +389,15 @@ class AgentRecord:
     anchor_rule: int | None = None
     #: Earlier names evicted from the capped ``name_history``, kept for liveness lookups.
     former_names: list[str] = field(default_factory=list)
+    #: A reported or explicitly selected native conversation; never a routing anchor.
+    native_session: dict[str, str] | None = None
+    profile: str | None = None
+    reasoning_effort: str | None = None
+    slot: str | None = None
+    slot_project: str | None = None
+    slot_isolation: str | None = None
+    #: Names only; environment values stay in the owner's private profile.
+    environment_names: list[str] = field(default_factory=list)
 
     @property
     def harness_anchor(self) -> CustomProcessIdentity | None:
@@ -499,7 +533,7 @@ class AgentRecord:
         for key in ("name", "token", "harness", "cwd", "lifecycle"):
             if not isinstance(document.get(key), str) or not document[key]:
                 raise AgentDeliveryError(f"invalid agent record field {key}: {path}")
-        for key in ("workspace_id", "tab_id", "pane_id", "session_agent", "session_value", "model", "resume", "startup_warning", "effective_reasoning_effort", "error", "goal", "goal_delivery", "goal_session_id", "goal_message_id"):
+        for key in ("workspace_id", "tab_id", "pane_id", "session_agent", "session_value", "model", "resume", "startup_warning", "effective_reasoning_effort", "error", "goal", "goal_delivery", "goal_session_id", "goal_message_id", "profile", "reasoning_effort", "slot", "slot_project", "slot_isolation"):
             if document.get(key) is not None and not isinstance(document[key], str):
                 raise AgentDeliveryError(f"invalid agent record field {key}: {path}")
         created = document.get("created_at")
@@ -604,6 +638,37 @@ class AgentRecord:
                 or len(set(former)) != len(former)):
             raise AgentDeliveryError(f"invalid former names in {path}")
         fields["former_names"] = list(former)
+        selected_profile = document.get("profile")
+        if selected_profile is not None and (not isinstance(selected_profile, str) or not _NAME.fullmatch(selected_profile)):
+            raise AgentDeliveryError(f"invalid profile in {path}")
+        slot_name = document.get("slot")
+        if slot_name is not None and (not isinstance(slot_name, str) or not slot_name or "\0" in slot_name):
+            raise AgentDeliveryError(f"invalid slot in {path}")
+        project = document.get("slot_project")
+        if project is not None and (not isinstance(project, str) or not Path(project).is_absolute() or "\0" in project):
+            raise AgentDeliveryError(f"invalid slot project in {path}")
+        if document.get("slot_isolation") not in (None, "userns", "cgroup", "root"):
+            raise AgentDeliveryError(f"invalid slot isolation in {path}")
+        if document.get("reasoning_effort") not in (None, "none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"):
+            raise AgentDeliveryError(f"invalid reasoning effort in {path}")
+        names = document.get("environment_names", [])
+        if (not isinstance(names, list) or any(not isinstance(item, str) or not _ENVIRONMENT_NAME.fullmatch(item) for item in names)
+                or len(set(names)) != len(names)):
+            raise AgentDeliveryError(f"invalid environment names in {path}")
+        fields["environment_names"] = list(names)
+        native = document.get("native_session")
+        if native is not None:
+            if (not isinstance(native, dict) or set(native) != {"schema", "agent", "value", "source"}
+                    or native.get("schema") != "agentctl-native-session/v1"
+                    or native.get("agent") != document["harness"]
+                    or native.get("source") not in ("observed", "asserted")
+                    or not isinstance(native.get("value"), str) or not native["value"] or "\0" in native["value"]):
+                raise AgentDeliveryError(f"invalid native session in {path}")
+            if (document.get("resume") not in (None, native["value"])
+                    or document.get("session_value") not in (None, native["value"])
+                    or document.get("session_agent") not in (None, document["harness"])):
+                raise AgentDeliveryError(f"conflicting native session in {path}")
+            fields["native_session"] = dict(native)
         if (custom_identity is not None
                 and ((document.get("adapter", "herdr"), document.get("harness"))
                      not in (("herdr-pane", "muse"), ("herdr-relay", "claude"), ("herdr-relay", "codex"))
@@ -784,6 +849,8 @@ class AgentRecord:
             "resume": launch.get("resume"),
             "arguments": list(argv[1:]),
             "runtime_home": launch.get("runtime_home"),
+            "profile": launch.get("profile"),
+            "environment_names": list(environment_names),
         })
         if schema == "agentctl-session/v3":
             native = document.get("native_session")
@@ -804,6 +871,7 @@ class AgentRecord:
                     "session_agent": native.get("agent"),
                     "session_value": native.get("value"),
                     "goal_session_id": native.get("value"),
+                    "native_session": dict(native),
                 })
             else:
                 raise AgentDeliveryError(f"invalid agent record native session: {path}")
@@ -2302,7 +2370,8 @@ class ManagedAgents:
                 continue
             other = self._load(path.name)
             if ((other.session_agent or other.harness) == session_agent
-                    and session_value in (other.session_value, other.goal_session_id)):
+                    and session_value in (other.resume, other.session_value, other.goal_session_id,
+                                          None if other.native_session is None else other.native_session["value"])):
                 return other
         return None
 
@@ -2316,6 +2385,7 @@ class ManagedAgents:
         working_timeout: float = 30.0, max_attempts: int = 3,
         slot: str | None = None, slot_isolation: str | None = None,
         slot_project: str | None = None,
+        profile: str | None = None,
     ) -> dict[str, object]:
         """Create one new tab and start its interactive harness without stealing focus.
 
@@ -2334,12 +2404,24 @@ class ManagedAgents:
             raise AgentDeliveryError(f"cwd is not a directory: {root}")
         if not math.isfinite(startup_timeout) or not 0 < startup_timeout <= 300:
             raise AgentDeliveryError("startup timeout must be between 0 and 300 seconds")
+        if profile is not None and not _NAME.fullmatch(profile):
+            raise AgentDeliveryError("invalid launch profile name")
+        if resume is not None and (not resume or "\0" in resume):
+            raise AgentDeliveryError("native session id must be nonempty and contain no NUL")
         if isinstance(harness_args, (str, bytes)) or any(
             not isinstance(item, str) or not item or "\0" in item
             for item in harness_args
         ):
             raise AgentDeliveryError(
                 "harness arguments must be a sequence of nonempty NUL-free strings"
+            )
+        if harness == "claude" and any(
+            item.split("=", 1)[0] in ("--session-id", "--resume", "--continue", "--fork-session", "-r", "-c")
+            or item.startswith(("-r", "-c")) and not item.startswith("--")
+            for item in harness_args
+        ):
+            raise AgentDeliveryError(
+                "Claude conversation selectors must use --resume; agentctl assigns --session-id for new conversations"
             )
         if harness in ("codex", "claude", "muse"):
             validate_structured_harness_argument_conflicts(
@@ -2353,6 +2435,10 @@ class ManagedAgents:
             harness, model=model, resume=resume,
             extra=(*structured_effort, *harness_args),
         )
+        conversation = resume
+        if harness == "claude" and resume is None:
+            conversation = str(uuid.uuid4())
+            arguments = ("--session-id", conversation, *arguments)
         environment = environment_entries(environment)
         if brief is not None and not brief:
             raise AgentDeliveryError("brief must not be empty")
@@ -2366,10 +2452,13 @@ class ManagedAgents:
                 )
         slot_command: str | None = None
         relay_command: str | None = None
+        launch_project: str | None = None
+        effective_isolation: str | None = None
         if slot is not None:
             # The agent works in the slot: its record and pane cwd are the slot
             # directory, which is where the boxed shell starts.
             project = slot_project or root
+            launch_project = str(Path(project).expanduser().resolve())
             slot_command, root, effective_isolation = _slot_shell_command(
                 slot, isolation=slot_isolation, project=project,
                 explicit_project=slot_project is not None,
@@ -2408,6 +2497,11 @@ class ManagedAgents:
                 agent._fsync_dir(str(self.registry))
                 record = AgentRecord(name, uuid.uuid4().hex, harness, root, time.time(),
                                      model=model, resume=resume, arguments=list(arguments),
+                                     native_session=None if conversation is None else _native_session(harness, conversation, "asserted"),
+                                     profile=profile, reasoning_effort=reasoning_effort,
+                                     slot=slot, slot_project=launch_project,
+                                     slot_isolation=effective_isolation,
+                                     environment_names=sorted({entry.partition("=")[0] for entry in environment}),
                                      adapter="herdr-relay" if relay_command is not None
                                      else "herdr-pane" if harness == "muse" else "herdr")
                 self._save(record)
@@ -2452,6 +2546,7 @@ class ManagedAgents:
                     info = self._checked(record, ready=True, enforce_policy=True)
                     if info.workspace_id != record.workspace_id:
                         raise AgentDeliveryError("started agent moved to another workspace")
+                    _capture_native_session(record, info)
                     record.session_agent = info.session_agent
                     record.session_value = info.session_value
                     if info.session_agent is not None and info.session_value is not None:
@@ -2495,6 +2590,7 @@ class ManagedAgents:
                         raise AgentDeliveryError(
                             "started agent native session changed during identity commit"
                         )
+                    _capture_native_session(record, final_info)
                 except (HerdrRunError, ValueError, OSError) as exc:
                     record.lifecycle = "launch_failed"
                     record.error = (
@@ -2638,7 +2734,8 @@ class ManagedAgents:
                                 and (other.session_agent or other.harness)
                                     == info.session_agent
                                 and info.session_value in (
-                                    other.session_value, other.goal_session_id,
+                                    other.resume, other.session_value, other.goal_session_id,
+                                    None if other.native_session is None else other.native_session["value"],
                                 ))
                 same_terminal = (info.terminal_id is not None
                                  and other.terminal_id == info.terminal_id)
@@ -2684,6 +2781,7 @@ class ManagedAgents:
             tab_id=presentation.tab_id, pane_id=info.pane_id,
             session_agent=info.session_agent,
             session_value=info.session_value,
+            native_session=None if info.session_value is None else _native_session(harness, info.session_value, "observed"),
             adapter="herdr-foreign", mode="interactive", backend="herdr",
             foreign_shell_identity=shell_identity,
             terminal_id=info.terminal_id, harness_identity=harness_identity,
@@ -3210,7 +3308,8 @@ class ManagedAgents:
             with self._identity_transaction():
                 record = self._load(name)
                 info = self._checked(record)
-                for existing in (record.goal_session_id, record.session_value, info.session_value):
+                for existing in (record.resume, record.goal_session_id, record.session_value, info.session_value,
+                                 None if record.native_session is None else record.native_session["value"]):
                     if existing is not None and existing != session_id:
                         raise AgentDeliveryError("refusing to replace an already bound native session")
                 owner = self._identity_owner(record.harness, session_id, exclude=name)
@@ -3241,6 +3340,8 @@ class ManagedAgents:
                     record._session_source = "asserted"
                 else:
                     record.goal_session_id = session_id
+                if record.native_session is None:
+                    record.native_session = _native_session(record.harness, session_id, "asserted")
                 if goal_command is not None:
                     record.goal_command = list(goal_command)
                 self._save(record)

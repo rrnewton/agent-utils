@@ -7,6 +7,7 @@ import os
 import re
 import subprocess
 import sys
+from collections.abc import Callable
 from dataclasses import replace
 from pathlib import Path
 from subprocess import CompletedProcess
@@ -15,7 +16,7 @@ from typing import cast
 import pytest
 
 from agentctl import cli, mcp
-from agentctl.client import HerdrClient, Pane
+from agentctl.client import CustomProcessIdentity, HerdrClient, Pane
 from agentctl.errors import AgentDeliveryError
 from agentctl.profiles import (
     configuration_root,
@@ -42,6 +43,197 @@ def setup(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[Sessions, Fa
 
     monkeypatch.setattr(sessions, "_worker", worker)
     return sessions, fake, calls
+
+
+def test_claude_conversation_is_saved_before_launch_without_a_herdr_report(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import uuid
+    sessions, fake, _calls = setup(tmp_path, monkeypatch)
+    original_start = fake.start_agent
+    selected: list[str] = []
+
+    def start(name: str, kind: str, pane_id: str, arguments: tuple[str, ...], *, timeout: float) -> None:
+        saved = sessions.get(name)
+        assert saved.native_session is not None
+        conversation = saved.native_session["value"]
+        assert str(uuid.UUID(conversation)) == conversation
+        assert arguments[:2] == ("--session-id", conversation)
+        assert arguments.count("--session-id") == 1 and "--resume" not in arguments
+        selected.append(conversation)
+        original_start(name, kind, pane_id, arguments, timeout=timeout)
+        fake.infos[pane_id] = replace(fake.infos[pane_id], session_agent=None, session_value=None)
+
+    monkeypatch.setattr(fake, "start_agent", start)
+    result = sessions.start_session("worker", cwd=str(tmp_path), harness="claude", model="chosen", profile="owner-policy")
+    native = {"schema": "agentctl-native-session/v1", "agent": "claude", "value": selected[0], "source": "asserted"}
+    assert result["native_session"] == native
+    assert result["session_value"] is None
+    assert result["profile"] == "owner-policy" and result["model"] == "chosen"
+    fake.offline = True
+    assert sessions.status("worker")["native_session"] == native
+    assert sessions.list()[0]["native_session"] == native
+
+
+@pytest.mark.parametrize("harness", ["codex", "claude"])
+def test_resume_keeps_the_selected_conversation_and_rejects_a_conflicting_report(
+    harness: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sessions, fake, _calls = setup(tmp_path, monkeypatch)
+    original_start = fake.start_agent
+
+    def start(name: str, kind: str, pane_id: str, arguments: tuple[str, ...], *, timeout: float) -> None:
+        original_start(name, kind, pane_id, arguments, timeout=timeout)
+        fake.infos[pane_id] = replace(fake.infos[pane_id], session_value="wrong-conversation")
+
+    monkeypatch.setattr(fake, "start_agent", start)
+    with pytest.raises(AgentDeliveryError, match="different native conversation"):
+        sessions.start_session("worker", cwd=str(tmp_path), harness=harness, resume="chosen-conversation", brief="must never arrive")
+    record = sessions.get("worker")
+    assert record.lifecycle == "launch_failed" and record.resume == "chosen-conversation"
+    assert record.native_session is not None and record.native_session["value"] == "chosen-conversation"
+    assert fake.submitted == [] and "--session-id" not in fake.launched[0][3]
+
+
+@pytest.mark.parametrize("harness", ["codex", "muse"])
+def test_native_conversation_is_captured_only_from_the_launched_harness(
+    harness: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sessions, fake, _calls = setup(tmp_path, monkeypatch)
+    if harness == "muse":
+        original_start = fake.start_pane_agent
+
+        def start(name: str, kind: str, pane_id: str, arguments: tuple[str, ...], *, timeout: float,
+                  on_observed: Callable[[CustomProcessIdentity], None] | None = None) -> CustomProcessIdentity:
+            # The fake's custom launcher reports no conversation unless the test supplies one.
+            identity = original_start(name, kind, pane_id, arguments, timeout=timeout, on_observed=on_observed)
+            fake.infos[pane_id] = replace(fake.infos[pane_id], session_agent=kind, session_value="reported-conversation")
+            return identity
+
+        monkeypatch.setattr(fake, "start_pane_agent", start)
+    result = sessions.start_session("worker", cwd=str(tmp_path), harness=harness)
+    assert result["native_session"] == {
+        "schema": "agentctl-native-session/v1", "agent": harness,
+        "value": "reported-conversation" if harness == "muse" else "session-1", "source": "observed",
+    }
+
+
+@pytest.mark.parametrize("arguments", [("--session-id", "foreign"), ("--session-id=foreign",), ("--continue",), ("-rforeign",), ("-cforeign",), ("--fork-session",)])
+@pytest.mark.parametrize("resume", [None, "chosen-conversation"])
+def test_claude_raw_conversation_selectors_refuse_before_allocation(
+    arguments: tuple[str, ...], resume: str | None, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sessions, fake, _calls = setup(tmp_path, monkeypatch)
+    with pytest.raises(AgentDeliveryError, match="conversation selectors must use --resume"):
+        sessions.start_session("worker", cwd=str(tmp_path), harness="claude", harness_args=arguments, resume=resume)
+    assert fake.launched == [] and not (sessions.registry / "worker").exists()
+
+
+def test_flat_launch_metadata_validates_and_survives_rename_and_archival(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sessions, fake, _calls = setup(tmp_path, monkeypatch)
+    result = sessions.start_session("worker", cwd=str(tmp_path), profile="local", model="chosen",
+                                    reasoning_effort="high", environment=("SETTING=private-value",))
+    assert result["environment_names"] == ["SETTING"] and "private-value" not in json.dumps(result)
+    sessions.rename("worker", "reviewer")
+    renamed = sessions.get("reviewer")
+    assert renamed.native_session == result["native_session"] and renamed.profile == "local"
+    stopped = sessions.stop("reviewer")
+    archived = json.loads((Path(str(stopped["archive"])) / "agent.json").read_text())
+    assert archived["native_session"] == result["native_session"]
+    assert archived["profile"] == "local" and archived["reasoning_effort"] == "high"
+    legacy = dict(archived)
+    for key in ("native_session", "profile", "reasoning_effort", "slot", "slot_project", "slot_isolation", "environment_names"):
+        legacy.pop(key)
+    legacy["future_field"] = {"keep": True}
+    restored = AgentRecord._from_value(legacy, tmp_path / "agent.json", "reviewer")
+    assert restored.native_session is None and restored.to_document()["future_field"] == {"keep": True}
+    conflicting = dict(archived)
+    conflicting["native_session"] = {**cast(dict[str, str], archived["native_session"]), "value": "another-conversation"}
+    with pytest.raises(AgentDeliveryError, match="conflicting native session"):
+        AgentRecord._from_value(conflicting, tmp_path / "agent.json", "reviewer")
+
+
+@pytest.mark.parametrize("resume", ["", "bad\0session"])
+def test_invalid_resume_refuses_before_allocating_a_record(
+    resume: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sessions, fake, _calls = setup(tmp_path, monkeypatch)
+    with pytest.raises(AgentDeliveryError, match="native session id must be nonempty"):
+        sessions.start_session("worker", cwd=str(tmp_path), resume=resume)
+    assert fake.launched == [] and not (sessions.registry / "worker").exists()
+
+
+def test_legacy_resume_cannot_be_rebound_to_a_different_conversation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sessions, fake, _calls = setup(tmp_path, monkeypatch)
+    sessions.start_session("worker", cwd=str(tmp_path), resume="original-conversation")
+    record = sessions.get("worker")
+    record.native_session = None
+    record.session_agent = record.session_value = None
+    sessions._save(record)
+    fake.infos["w1:p1"] = replace(fake.infos["w1:p1"], session_agent=None, session_value=None)
+    path = sessions.registry / "worker/agent.json"
+    before = path.read_bytes()
+    with pytest.raises(AgentDeliveryError, match="already bound"):
+        sessions.bind_session("worker", "replacement-conversation")
+    assert path.read_bytes() == before and sessions.get("worker").resume == "original-conversation"
+
+
+@pytest.mark.parametrize("provider,value", [("codex", ""), ("codex", "bad\0id"), ("claude", None), (None, "incomplete")])
+def test_malformed_native_reports_leave_a_loadable_failed_launch(
+    provider: str | None, value: str | None, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sessions, fake, _calls = setup(tmp_path, monkeypatch)
+    original_start = fake.start_agent
+
+    def start(name: str, kind: str, pane_id: str, arguments: tuple[str, ...], *, timeout: float) -> None:
+        original_start(name, kind, pane_id, arguments, timeout=timeout)
+        fake.infos[pane_id] = replace(fake.infos[pane_id], session_agent=provider, session_value=value)
+
+    monkeypatch.setattr(fake, "start_agent", start)
+    with pytest.raises(AgentDeliveryError, match="native session identity"):
+        sessions.start_session("worker", cwd=str(tmp_path), resume="selected", brief="never send")
+    record = sessions.get("worker")
+    assert record.lifecycle == "launch_failed" and record.session_value is None
+    assert record.native_session is not None and record.native_session["value"] == "selected"
+    assert fake.submitted == []
+
+
+def test_headless_reset_clears_the_recovery_conversation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sessions, _fake, _calls = setup(tmp_path, monkeypatch)
+    sessions.start_session("worker", cwd=str(tmp_path), mode="headless")
+    assert sessions.get("worker").native_session is not None
+
+    def worker(record: AgentRecord, action: str, **options: object) -> dict[str, object]:
+        assert action == "reset"
+        return {"record": {"mode": "headless", "session_id": None}, "result": {"reset": True}}
+
+    monkeypatch.setattr(sessions, "_worker", worker)
+    sessions.runtime_operation("worker", "reset")
+    record = sessions.get("worker")
+    assert record.native_session is None and record.session_value is None
+
+
+def test_asserted_recovery_conversation_cannot_authorize_input_without_anchors(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sessions, fake, _calls = setup(tmp_path, monkeypatch)
+    sessions.start_session("worker", cwd=str(tmp_path), harness="claude")
+    record = sessions.get("worker")
+    assert record.native_session is not None and record.native_session["source"] == "asserted"
+    record.session_agent = record.session_value = None
+    record.harness_identity = None
+    record.anchor_rule = None
+    sessions._save(record)
+    fake.infos["w1:p1"] = replace(fake.infos["w1:p1"], session_agent=None, session_value=None)
+    with pytest.raises(AgentDeliveryError, match="anchor|pinned"):
+        sessions.send_session("worker", "must stay pending", ready_timeout=0)
+    assert fake.submitted == []
 
 
 def _write_project_configuration(tmp_path: Path, workspace: object) -> Path:
@@ -619,6 +811,8 @@ def test_slot_start_boxes_the_pane_before_the_harness(tmp_path: Path, monkeypatc
     )
     assert [line for _pane, line in entered] == ["exec boxed-shell"]
     assert status["cwd"] == str(tmp_path)
+    assert status["slot"] == "s1" and status["slot_isolation"] == "cgroup"
+    assert status["slot_project"] == str(project.resolve())
     argv = (tmp_path / "argv-ok").read_text(encoding="utf-8").splitlines()
     assert Path(argv[0]).resolve() == project.resolve()
     assert argv[1:] == [

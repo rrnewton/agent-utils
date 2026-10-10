@@ -26,6 +26,16 @@ safe plugin discovery.** It does not ship a provider executable: an operator
 installs an inbound plugin and separately selects any outbound helper. Headless
 workers and MCP remain bundled capabilities of the Python distribution.
 
+`list` and `status NAME` retain the launch profile name, requested model and
+reasoning effort, starting directory, and any slot, project and isolation
+settings even when Herdr is unavailable. `native_session` records the native
+conversation separately from the observed pane identity. New Claude launches
+receive a generated UUID through `--session-id`; resumed launches retain the
+explicit conversation. Codex and Muse record a conversation when their harness
+reports it. Agentcloud retains its existing session ID. An unreported ID stays
+unknown; agentctl does not guess from nearby transcripts or the current directory.
+Environment metadata contains names only; values remain in private profiles.
+
 | Mode or service | What it controls | Additional dependency |
 | --- | --- | --- |
 | Interactive | A native Codex, Claude, or Muse TUI that remains directly accessible | Herdr |

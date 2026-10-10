@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import math
 import os
+import re
 import subprocess
 import sys
 import time
@@ -21,7 +22,7 @@ from agentctl.profiles import (
     validate_muse_headless_arguments,
     validate_structured_harness_argument_conflicts,
 )
-from agentctl.subagents import AgentRecord, ManagedAgents, _name
+from agentctl.subagents import AgentRecord, ManagedAgents, _name, _native_session
 
 
 class Sessions(ManagedAgents):
@@ -79,9 +80,12 @@ class Sessions(ManagedAgents):
                       ready_timeout: float = 900.0, working_timeout: float = 30.0,
                       max_attempts: int = 3, slot: str | None = None,
                       slot_isolation: str | None = None,
-                      slot_project: str | None = None) -> dict[str, object]:
+                      slot_project: str | None = None,
+                      profile: str | None = None) -> dict[str, object]:
         """Create a native interactive terminal or a persistent headless runner."""
         _name(name)
+        if profile is not None and re.fullmatch(r"[a-z][a-z0-9-]{0,31}", profile) is None:
+            raise AgentDeliveryError("invalid launch profile name")
         if mode == "interactive":
             if backend != "herdr":
                 raise AgentDeliveryError("interactive sessions require Herdr; tmux supports headless runners")
@@ -93,6 +97,7 @@ class Sessions(ManagedAgents):
                 ready_timeout=ready_timeout, working_timeout=working_timeout,
                 max_attempts=max_attempts, slot=slot, slot_isolation=slot_isolation,
                 slot_project=slot_project,
+                profile=profile,
             )
         if slot is not None:
             raise AgentDeliveryError("--slot is supported for interactive Herdr sessions only")
@@ -132,6 +137,7 @@ class Sessions(ManagedAgents):
                     raise AgentDeliveryError(f"agent {name!r} already registered; stop it before reusing the name")
                 directory.mkdir(mode=0o700)
                 record = AgentRecord(name, uuid.uuid4().hex, harness, root, time.time(), model=model,
+                    profile=profile, reasoning_effort=reasoning_effort,
                     adapter="turn-runner", mode=mode, backend=backend, runtime_home=str(directory / "runtime"))
                 self._save(record)
                 try:
@@ -172,7 +178,11 @@ class Sessions(ManagedAgents):
             record.mode = "interactive" if runtime.get("mode") == "tui" else "headless"
             record.backend = str(runtime.get("backend", record.backend))
             session = runtime.get("session_id")
+            if isinstance(session, str) and (not session or "\0" in session):
+                raise AgentDeliveryError("worker reported an invalid native session identity")
             record.session_value = session if isinstance(session, str) else None
+            record.native_session = (None if record.session_value is None
+                                     else _native_session(record.harness, record.session_value, "observed"))
             pane = runtime.get("presentation_pane")
             record.pane_id = pane if isinstance(pane, str) else None
         if save:

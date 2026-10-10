@@ -593,6 +593,13 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
             name_history: Vec::new(),
             anchor_rule: None,
             former_names: Vec::new(),
+            native_session: None,
+            profile: options.profile.clone(),
+            slot: None,
+            slot_project: None,
+            slot_isolation: None,
+            reasoning_effort: reasoning_effort.map(str::to_owned),
+            environment_names: environment_names(&options.environment),
             agentcloud: Some(CloudRecord {
                 launch,
                 agentterm: agentterm.display().to_string(),
@@ -649,6 +656,8 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
             (_, Some(session)) => {
                 record.session_agent = Some(CLOUD_HARNESS.to_owned());
                 record.session_value = Some(session.to_owned());
+                record.native_session =
+                    Some(NativeSession::new(CLOUD_HARNESS, session, "observed"));
                 let message = format!(
                     "{} after printing session ID {session}",
                     failure("create", &run)
@@ -670,6 +679,7 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
         let session = session.expect("matched session");
         record.session_agent = Some(CLOUD_HARNESS.to_owned());
         record.session_value = Some(session.clone());
+        record.native_session = Some(NativeSession::new(CLOUD_HARNESS, &session, "observed"));
         let cloud = record.agentcloud.as_mut().expect("cloud record");
         cloud.create_exit = run.code;
         cloud.verified = Some(verified);
@@ -2053,6 +2063,17 @@ exit 0
         assert_eq!(status["lifecycle"], "running");
         assert_eq!(status["adapter"], "agentcloud");
         assert_eq!(status["session_id"], SESSION);
+        assert_eq!(
+            status["native_session"],
+            json!({
+                "schema": "agentctl-native-session/v1",
+                "agent": CLOUD_HARNESS,
+                "value": SESSION,
+                "source": "observed",
+            })
+        );
+        assert_eq!(status["reasoning_effort"], "high");
+        assert_eq!(status["environment_names"], json!(["TAB_ONLY"]));
         assert_eq!(status["agent_status"], "working");
         assert_eq!(status["cloud"]["attached_nodes"], json!(["node-a"]));
         assert!(status["cloud"].get("tokens").is_none());

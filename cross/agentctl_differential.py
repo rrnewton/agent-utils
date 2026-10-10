@@ -38,9 +38,27 @@ _SHELL_IDENTITY_FIELDS = {
 }
 
 
-def _normalize(value: object) -> object:
+def _generated_conversations(value: object) -> set[str]:
+    """Only UUIDs selected by the recorded Claude launch, never process boot IDs."""
     if isinstance(value, list):
-        return [_normalize(item) for item in value]
+        return set().union(*(_generated_conversations(item) for item in value))
+    if isinstance(value, dict):
+        native, arguments = value.get("native_session"), value.get("arguments")
+        if (isinstance(native, dict) and native.get("agent") == "claude"
+                and isinstance(arguments, list) and len(arguments) >= 2
+                and arguments[0] == "--session-id" and arguments[1] == native.get("value")
+                and isinstance(arguments[1], str)):
+            return {arguments[1]}
+    return set()
+
+
+def _normalize(value: object, conversations: set[str] | None = None) -> object:
+    if conversations is None:
+        conversations = _generated_conversations(value)
+    if isinstance(value, str) and value in conversations:
+        return "<CONVERSATION_UUID>"
+    if isinstance(value, list):
+        return [_normalize(item, conversations) for item in value]
     if isinstance(value, dict):
         return {str(key): ("<TOKEN>" if key == "token" else 0 if key == "created_at"
                           else "<PROCESS_IDENTITY>" if key == "custom_process_identity"
@@ -54,7 +72,7 @@ def _normalize(value: object) -> object:
                           else "<ARCHIVE>" if key == "archive"
                           # Native identity diagnostics use edition-specific quote styles.
                           else re.sub(r'"([a-z][a-z0-9-]*)"', r"'\1'", item)
-                          if key == "probe_error" and isinstance(item, str) else _normalize(item))
+                          if key == "probe_error" and isinstance(item, str) else _normalize(item, conversations))
                 for key, item in value.items()}
     return value
 
@@ -264,6 +282,57 @@ def _lifecycle(harness: Harness, report: Report) -> None:
     ))
 
 
+def _conversations(harness: Harness, report: Report) -> None:
+    case = harness.case("primary-claude-conversation")
+    _change(case, {"sessionless": True})
+    outcomes = _pair(harness, report, case, "primary/conversation/claude/start", (
+        "start", "worker", "--cwd", "<ROOT>", "--workspace-id", "w1", "--harness", "claude", *_COMMON,
+    ))
+    for edition, root, outcome in zip(("python", "rust"), (case.python_root, case.rust_root), outcomes, strict=True):
+        if outcome.returncode:
+            continue
+        value = json.loads(outcome.stdout)
+        native = value.get("native_session")
+        arguments = _state(root).get("launch_arguments")
+        report.require(f"primary/conversation/claude/provenance/{edition}",
+                       isinstance(native, dict) and set(native) == {"schema", "agent", "value", "source"}
+                       and native.get("schema") == "agentctl-native-session/v1"
+                       and native.get("agent") == "claude" and native.get("source") == "asserted"
+                       and isinstance(native.get("value"), str)
+                       and re.fullmatch(r"[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}", native["value"]) is not None
+                       and arguments == ["--session-id", native["value"]]
+                       and value.get("session_value") is None,
+                       f"generated conversation not retained separately from routing identity: {value!r}")
+    _pair(harness, report, case, "primary/conversation/claude/status", ("status", "worker", *_COMMON))
+    _pair(harness, report, case, "primary/conversation/claude/list", ("list", *_COMMON))
+    _pair(harness, report, case, "primary/conversation/claude/stop", ("stop", "worker", *_COMMON))
+    for selector in ("--session-id=foreign", "--continue", "-rforeign", "-cforeign", "--fork-session"):
+        rejected = harness.case(f"primary-claude-conversation-conflict-{selector}")
+        _pair(harness, report, rejected, f"primary/conversation/claude/refuse-{selector}", (
+            "start", "worker", "--cwd", "<ROOT>", "--harness", "claude", f"--harness-arg={selector}", *_COMMON,
+        ), 75)
+        report.require(f"primary/conversation/claude/no-allocation-{selector}",
+                       all(not (root / "registry/worker").exists() for root in (rejected.python_root, rejected.rust_root)),
+                       "conflicting conversation allocated a runtime")
+    forked = harness.case("primary-claude-resume-fork")
+    _pair(harness, report, forked, "primary/conversation/claude/refuse-resume-fork", (
+        "start", "worker", "--cwd", "<ROOT>", "--harness", "claude", "--resume", "chosen-conversation",
+        "--harness-arg=--fork-session", *_COMMON,
+    ), 75)
+    report.require("primary/conversation/claude/no-allocation-resume-fork",
+                   all(not (root / "registry/worker").exists() for root in (forked.python_root, forked.rust_root)),
+                   "fork selector allocated a replacement conversation")
+    mismatch = harness.case("primary-resume-conversation-mismatch")
+    _change(mismatch, {"session_value_override": "wrong-conversation"})
+    _pair(harness, report, mismatch, "primary/conversation/resume/mismatch", (
+        "start", "worker", "--cwd", "<ROOT>", "--workspace-id", "w1", "--harness", "codex",
+        "--resume", "chosen-conversation", "--brief", "must never arrive", *_COMMON,
+    ), 75)
+    report.require("primary/conversation/resume/no-brief",
+                   all(not _state(root).get("submitted") for root in (mismatch.python_root, mismatch.rust_root)),
+                   "brief reached a contradictory conversation")
+
+
 def _profiles(harness: Harness, report: Report) -> None:
     document = {
         "schema": "agentctl-profiles/v1",
@@ -377,6 +446,9 @@ def _profiles(harness: Harness, report: Report) -> None:
             "--profile", profile, *_COMMON,
         ))
         status = _json(python)
+        report.require(f"primary/profile/{profile}/recorded-policy", isinstance(status, dict)
+                       and status.get("profile") == profile,
+                       f"launch profile was not retained: {status!r}")
         report.require(f"primary/profile/{profile}/argv", all(
             _state(root).get("launch_arguments") == expected[profile]
             for root in (case.python_root, case.rust_root)
@@ -2011,6 +2083,7 @@ def build_report(python_command: Sequence[str], rust_command: Sequence[str]) -> 
         try:
             _orientation(harness, report)
             _lifecycle(harness, report)
+            _conversations(harness, report)
             _profiles(harness, report)
             _workspace_policy(harness, report)
             _skill_install(harness, report)

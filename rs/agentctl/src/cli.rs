@@ -1166,6 +1166,7 @@ fn run(args: Cli, environment: &dyn Fn(&str) -> Option<String>) -> Result<i32, F
             };
             let options = StartOptions {
                 workspace_id: value.workspace_id,
+                profile: value.profile,
                 harness,
                 model,
                 resume: value.resume,

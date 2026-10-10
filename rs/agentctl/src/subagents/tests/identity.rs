@@ -152,6 +152,7 @@ fn start_refuses_a_pane_another_record_already_claims() {
     // Only the pane and terminal claims remain; the native-session check is separate.
     other["session_agent"] = Value::Null;
     other["session_value"] = Value::Null;
+    other["native_session"] = Value::Null;
     // The live record moves away, so only the claim on pane `owned` remains.
     fs::rename(
         registry(&fixture).join("worker"),

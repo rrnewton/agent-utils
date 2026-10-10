@@ -370,7 +370,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 startup_timeout=args.startup_timeout, ready_timeout=args.ready_timeout,
                 working_timeout=args.working_timeout, max_attempts=args.max_attempts,
                 slot=args.slot, slot_isolation=args.slot_isolation,
-                slot_project=args.slot_project)
+                slot_project=args.slot_project, profile=args.profile)
         elif args.command == "adopt":
             result = sessions.adopt(name, pane_id=args.pane,
                 expected_workspace=args.workspace, expected_cwd=args.cwd,

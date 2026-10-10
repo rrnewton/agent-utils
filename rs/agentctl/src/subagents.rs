@@ -680,6 +680,50 @@ fn new_journal_id() -> Result<String> {
     Ok(bytes.iter().map(|byte| format!("{byte:02x}")).collect())
 }
 
+/// A Claude conversation id is a hyphenated UUID4, assigned before launch.
+fn new_conversation_id() -> Result<String> {
+    let hex = new_journal_id()?;
+    Ok(format!(
+        "{}-{}-{}-{}-{}",
+        &hex[..8],
+        &hex[8..12],
+        &hex[12..16],
+        &hex[16..20],
+        &hex[20..],
+    ))
+}
+
+fn valid_metadata_text(value: &str) -> bool {
+    !value.is_empty() && !value.contains('\0')
+}
+
+fn valid_environment_name(value: &str) -> bool {
+    value
+        .as_bytes()
+        .first()
+        .is_some_and(|byte| byte.is_ascii_alphabetic() || *byte == b'_')
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+}
+
+fn environment_names(environment: &[String]) -> Vec<String> {
+    environment
+        .iter()
+        .filter_map(|entry| entry.split_once('=').map(|(name, _)| name.to_owned()))
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
+}
+
+fn claude_conversation_selector(argument: &str) -> bool {
+    let key = argument.split_once('=').map_or(argument, |(key, _)| key);
+    matches!(
+        key,
+        "--session-id" | "--resume" | "--continue" | "--fork-session" | "-r" | "-c"
+    ) || (!argument.starts_with("--") && (argument.starts_with("-r") || argument.starts_with("-c")))
+}
+
 #[cfg(test)]
 thread_local! {
     /// Makes the next rename fail after publishing the renamed record inside the old directory
@@ -1498,6 +1542,46 @@ impl ManagedApi for HerdrClient {
     }
 }
 
+/// Recovery provenance, separate from the observed live-routing identity.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct NativeSession {
+    schema: String,
+    agent: String,
+    value: String,
+    source: String,
+}
+
+impl NativeSession {
+    fn new(agent: &str, value: &str, source: &str) -> Self {
+        Self {
+            schema: "agentctl-native-session/v1".to_owned(),
+            agent: agent.to_owned(),
+            value: value.to_owned(),
+            source: source.to_owned(),
+        }
+    }
+
+    fn valid_for(&self, record: &AgentRecord) -> bool {
+        self.schema == "agentctl-native-session/v1"
+            && self.agent == record.harness
+            && valid_metadata_text(&self.value)
+            && matches!(self.source.as_str(), "observed" | "asserted")
+            && record
+                .session_agent
+                .as_deref()
+                .is_none_or(|agent| agent == self.agent)
+            && record
+                .session_value
+                .as_deref()
+                .is_none_or(|value| value == self.value)
+            && record
+                .resume
+                .as_deref()
+                .is_none_or(|value| value == self.value)
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 struct AgentRecord {
     #[serde(default = "herdr_adapter")]
@@ -1531,6 +1615,25 @@ struct AgentRecord {
     /// Earlier names evicted from the capped `name_history`, kept for liveness lookups.
     #[serde(default)]
     former_names: Vec<String>,
+    /// Native conversation to recover, which is never an asserted routing anchor.
+    #[serde(default)]
+    native_session: Option<NativeSession>,
+    /// Owner-configured launch profile, when selected.
+    #[serde(default)]
+    profile: Option<String>,
+    /// Slot boxing policy, when this launch used a wrkslots slot.
+    #[serde(default)]
+    slot: Option<String>,
+    #[serde(default)]
+    slot_project: Option<String>,
+    #[serde(default)]
+    slot_isolation: Option<String>,
+    /// Requested structured effort, separate from a harness's effective fallback.
+    #[serde(default)]
+    reasoning_effort: Option<String>,
+    /// Names only; literal environment values are not recovery metadata.
+    #[serde(default)]
+    environment_names: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     agentcloud: Option<cloud::CloudRecord>,
     #[serde(flatten)]
@@ -1640,6 +1743,32 @@ impl AgentRecord {
         }
     }
 
+    /// Capture only the native identity the launched pane reports, and reject a different
+    /// conversation before any startup brief can be delivered.
+    fn capture_native_session(&mut self, info: &AgentPaneInfo) -> Result<()> {
+        let (agent, value) = match (&info.session_agent, &info.session_value) {
+            (None, None) => return Ok(()),
+            (Some(agent), Some(value)) if agent == &self.harness && valid_metadata_text(value) => {
+                (agent, value)
+            }
+            _ => {
+                return Err(fail(
+                    "started agent reports an invalid or different native session provider",
+                ))
+            }
+        };
+        if let Some(native) = self.native_session.as_ref() {
+            if &native.agent != agent || &native.value != value {
+                return Err(fail(
+                    "started agent reports a different native conversation than requested",
+                ));
+            }
+        } else {
+            self.native_session = Some(NativeSession::new(agent, value, "observed"));
+        }
+        Ok(())
+    }
+
     fn validate_loaded(&self, path: &Path, agent_name: &str) -> Result<()> {
         if self.name != agent_name
             || self.schema != 1
@@ -1732,6 +1861,50 @@ impl AgentRecord {
         }
         if !valid_name_history(&self.name_history) {
             return Err(fail(format!("invalid name history in {}", path.display())));
+        }
+        if self
+            .native_session
+            .as_ref()
+            .is_some_and(|native| !native.valid_for(self))
+        {
+            return Err(fail(format!(
+                "invalid or conflicting native session recovery metadata in {}",
+                path.display()
+            )));
+        }
+        if self
+            .profile
+            .as_deref()
+            .is_some_and(|value| !name_pattern(value))
+            || self
+                .slot
+                .as_deref()
+                .is_some_and(|value| !valid_metadata_text(value))
+            || self
+                .slot_project
+                .as_deref()
+                .is_some_and(|value| !valid_metadata_text(value) || !Path::new(value).is_absolute())
+            || self
+                .slot_isolation
+                .as_deref()
+                .is_some_and(|value| !SLOT_ISOLATIONS.contains(&value))
+            || self.reasoning_effort.as_deref().is_some_and(|value| {
+                !matches!(
+                    value,
+                    "none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max" | "ultra"
+                )
+            })
+            || self
+                .environment_names
+                .iter()
+                .any(|value| !valid_environment_name(value))
+            || self.environment_names.iter().collect::<BTreeSet<_>>().len()
+                != self.environment_names.len()
+        {
+            return Err(fail(format!(
+                "invalid launch recovery metadata in {}",
+                path.display()
+            )));
         }
         Ok(())
     }
@@ -3530,6 +3703,8 @@ impl<A: ManagedApi + ?Sized> AgentApi for WorkspaceClient<'_, A> {
 pub struct StartOptions {
     /// Existing workspace ID, or the current workspace / shared `subagents` default.
     pub workspace_id: Option<String>,
+    /// Owner-configured launch profile selected by the caller, retained for recovery.
+    pub profile: Option<String>,
     /// Herdr agent kind.
     pub harness: String,
     /// Optional model override for Codex or Claude.
@@ -3748,6 +3923,7 @@ impl Default for StartOptions {
     fn default() -> Self {
         Self {
             workspace_id: None,
+            profile: None,
             harness: "codex".to_owned(),
             model: None,
             resume: None,
@@ -5273,9 +5449,13 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
                 continue;
             }
             let other = self.load(&existing_name)?;
-            if other.session_agent.as_deref().unwrap_or(&other.harness) == session_agent
+            if (other.session_agent.as_deref().unwrap_or(&other.harness) == session_agent
                 && (other.session_value.as_deref() == Some(session_value)
-                    || other.goal_session_id.as_deref() == Some(session_value))
+                    || other.goal_session_id.as_deref() == Some(session_value)
+                    || other.resume.as_deref() == Some(session_value)))
+                || other.native_session.as_ref().is_some_and(|native| {
+                    native.agent == session_agent && native.value == session_value
+                })
             {
                 return Ok(Some(other));
             }
@@ -5335,6 +5515,13 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
         if options.brief.as_deref().is_some_and(str::is_empty) {
             return Err(fail("brief must not be empty"));
         }
+        if options
+            .profile
+            .as_deref()
+            .is_some_and(|value| !name_pattern(value))
+        {
+            return Err(fail("profile must match [a-z][a-z0-9-]{0,31}"));
+        }
         if options.harness == cloud::CLOUD_HARNESS {
             if options.slot.is_some() {
                 return Err(fail("--slot does not apply to harness agentcloud"));
@@ -5344,6 +5531,25 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
         if options.cloud.is_some() {
             return Err(fail(
                 "agentcloud settings apply only with harness agentcloud (--harness agentcloud)",
+            ));
+        }
+        if options.harness == "claude"
+            && options
+                .harness_args
+                .iter()
+                .any(|argument| claude_conversation_selector(argument))
+        {
+            return Err(fail(
+                "Claude conversation selectors must use --resume; agentctl assigns --session-id for new conversations",
+            ));
+        }
+        if options
+            .resume
+            .as_deref()
+            .is_some_and(|value| !valid_metadata_text(value))
+        {
+            return Err(fail(
+                "native session id must be nonempty and contain no NUL",
             ));
         }
         if matches!(options.harness.as_str(), "codex" | "claude" | "muse") {
@@ -5359,12 +5565,33 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
         let mut structured_arguments =
             crate::profiles::reasoning_arguments(&options.harness, reasoning_effort)?;
         structured_arguments.extend_from_slice(&options.harness_args);
-        let arguments = harness_arguments(
+        let native_session = match options.resume.as_deref() {
+            Some(value) => Some(NativeSession::new(&options.harness, value, "asserted")),
+            None if options.harness == "claude" => Some(NativeSession::new(
+                "claude",
+                &new_conversation_id()?,
+                "asserted",
+            )),
+            None => None,
+        };
+        let mut arguments = harness_arguments(
             &options.harness,
             options.model.as_deref(),
             options.resume.as_deref(),
             &structured_arguments,
         )?;
+        if options.harness == "claude" && options.resume.is_none() {
+            let mut assigned_arguments = vec![
+                "--session-id".to_owned(),
+                native_session
+                    .as_ref()
+                    .expect("assigned Claude session")
+                    .value
+                    .clone(),
+            ];
+            assigned_arguments.extend(arguments);
+            arguments = assigned_arguments;
+        }
         options.environment = environment_entries(&options.environment)?;
         // Placement policy is an input/start concern. Load it before creating
         // the generation so a configuration error cannot leave the name taken.
@@ -5372,9 +5599,21 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
         // The agent works in the slot: its record and pane cwd are the slot
         // directory, which is where the boxed shell starts.
         let mut relay_command = None;
+        let mut slot_project = None;
+        let mut slot_isolation = None;
+        let mut launch_extra = BTreeMap::new();
         let (cwd, slot_command) = match options.slot.as_ref() {
             Some(launch) => {
+                if !valid_metadata_text(&launch.slot) {
+                    return Err(fail("slot must be nonempty and contain no NUL"));
+                }
                 let project = launch.project.clone().unwrap_or_else(|| cwd.clone());
+                let project = fs::canonicalize(&project).map_err(|_| {
+                    fail(format!(
+                        "slot project is not a directory: {}",
+                        project.display()
+                    ))
+                })?;
                 let mut launch = launch.clone();
                 if launch.project_box && launch.box_cwd.is_none() {
                     // A coordinator box starts where the agent was asked to work.
@@ -5382,6 +5621,21 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
                 }
                 let launch = &launch;
                 let (line, slot_path, isolation) = slot_shell_command(launch, &project, &[])?;
+                if launch.project_box {
+                    launch_extra.insert(
+                        "project_box".to_owned(),
+                        json!({
+                            "name": launch.slot,
+                            "project": project,
+                            "isolation": isolation,
+                            "writable": launch.box_writable,
+                            "cwd": launch.box_cwd,
+                        }),
+                    );
+                } else {
+                    slot_project = Some(project.display().to_string());
+                    slot_isolation = Some(isolation.clone());
+                }
                 let slot_path = fs::canonicalize(&slot_path).map_err(|_| {
                     fail(format!(
                         "slot directory is not a directory: {}",
@@ -5462,8 +5716,19 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
             name_history: Vec::new(),
             anchor_rule: None,
             former_names: Vec::new(),
+            native_session,
+            profile: options.profile.clone(),
+            slot: options
+                .slot
+                .as_ref()
+                .filter(|launch| !launch.project_box)
+                .map(|launch| launch.slot.clone()),
+            slot_project,
+            slot_isolation,
+            reasoning_effort: reasoning_effort.map(str::to_owned),
+            environment_names: environment_names(&options.environment),
             agentcloud: None,
-            extra: BTreeMap::new(),
+            extra: launch_extra,
             name: agent_name.to_owned(),
             token: format!("{}-{}", now.as_nanos(), std::process::id()),
             harness: options.harness.clone(),
@@ -5655,10 +5920,15 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
             }
             let other = self.load(&existing_name)?;
             let same_session = info.session_value.is_some()
-                && other.session_agent.as_deref().unwrap_or(&other.harness)
+                && ((other.session_agent.as_deref().unwrap_or(&other.harness)
                     == info.session_agent.as_deref().unwrap_or("")
-                && (other.session_value == info.session_value
-                    || other.goal_session_id == info.session_value);
+                    && (other.session_value == info.session_value
+                        || other.goal_session_id == info.session_value
+                        || other.resume == info.session_value))
+                    || other.native_session.as_ref().is_some_and(|native| {
+                        Some(&native.agent) == info.session_agent.as_ref()
+                            && Some(&native.value) == info.session_value.as_ref()
+                    }));
             let same_terminal = info.terminal_id.is_some() && other.terminal_id == info.terminal_id;
             if other.pane_id.as_ref() == Some(&info.pane_id) || same_session || same_terminal {
                 return Err(fail(format!(
@@ -5741,6 +6011,16 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
             harness_identity,
             name_history: Vec::new(),
             former_names: Vec::new(),
+            native_session: info
+                .session_value
+                .as_deref()
+                .map(|value| NativeSession::new(&options.harness, value, "observed")),
+            profile: None,
+            slot: None,
+            slot_project: None,
+            slot_isolation: None,
+            reasoning_effort: None,
+            environment_names: Vec::new(),
             agentcloud: None,
             extra: BTreeMap::new(),
             name: agent_name.to_owned(),
@@ -5906,6 +6186,7 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
             },
             &self.target(record)?,
         )?;
+        record.capture_native_session(&info)?;
         let terminal_id = info.terminal_id;
         record.session_agent = info.session_agent;
         record.session_value = info.session_value;
@@ -6993,10 +7274,16 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
         let _identity_lock = self.identity_lock()?;
         let mut record = self.load(agent_name)?;
         let info = self.checked(&record)?;
+        let recovery_session = record
+            .native_session
+            .as_ref()
+            .map(|native| native.value.clone());
         for existing in [
             &record.goal_session_id,
             &record.session_value,
             &info.session_value,
+            &record.resume,
+            &recovery_session,
         ]
         .into_iter()
         .flatten()
@@ -7030,6 +7317,10 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
         // Session metadata is optional in Herdr. This is an explicit caller
         // assertion anchored to the independently verified live name and pane.
         record.goal_session_id = Some(session_id.to_owned());
+        if record.native_session.is_none() {
+            record.native_session =
+                Some(NativeSession::new(&record.harness, session_id, "asserted"));
+        }
         if let Some(command) = goal_command {
             record.goal_command = Some(command.to_vec());
         }
@@ -8550,6 +8841,8 @@ pub(crate) mod tests {
                     add_sibling_on_read: AtomicBool::new(false),
                     require_start_lock: AtomicBool::new(false),
                     started: AtomicBool::new(false),
+                    launches: Mutex::new(BTreeMap::new()),
+                    session_override: Mutex::new(None),
                     report_session: AtomicBool::new(true),
                     duplicate_session: AtomicBool::new(false),
                     change_session_after_save: AtomicBool::new(false),
@@ -8727,6 +9020,8 @@ pub(crate) mod tests {
         add_sibling_on_read: AtomicBool,
         require_start_lock: AtomicBool,
         started: AtomicBool,
+        launches: Mutex<BTreeMap<String, (String, Vec<String>)>>,
+        session_override: Mutex<Option<(Option<String>, Option<String>)>>,
         report_session: AtomicBool,
         duplicate_session: AtomicBool,
         change_session_after_save: AtomicBool,
@@ -8950,12 +9245,47 @@ pub(crate) mod tests {
             let report_session = self.report_session.load(Ordering::Relaxed)
                 || changed_after_save
                 || pane == "reported";
-            let kind = if self.custom_reported.load(Ordering::Relaxed) {
-                "muse"
-            } else if pane == "claude" {
-                "claude"
+            let launch = self.launches.lock().unwrap().get(pane).cloned();
+            let kind = launch
+                .as_ref()
+                .map(|(kind, _)| kind.as_str())
+                .unwrap_or_else(|| {
+                    if self.custom_reported.load(Ordering::Relaxed) {
+                        "muse"
+                    } else if pane == "claude" {
+                        "claude"
+                    } else {
+                        "codex"
+                    }
+                });
+            let session_override = self.session_override.lock().unwrap().clone();
+            let requested_session = launch.as_ref().and_then(|(_, arguments)| {
+                arguments.windows(2).find_map(|pair| {
+                    matches!(pair[0].as_str(), "--session-id" | "--resume" | "resume")
+                        .then(|| pair[1].clone())
+                })
+            });
+            let reported_agent = if report_session {
+                session_override
+                    .as_ref()
+                    .map_or_else(|| Some(kind.to_owned()), |(agent, _)| agent.clone())
             } else {
-                "codex"
+                None
+            };
+            let reported_value = if !report_session {
+                None
+            } else if changed_after_save {
+                Some("replacement-thread".to_owned())
+            } else if let Some((_, value)) = session_override {
+                value
+            } else if let Some(value) = requested_session {
+                Some(value)
+            } else if matches!(pane, "owned" | "claude" | "reported" | "project-pane")
+                || self.duplicate_session.load(Ordering::Relaxed)
+            {
+                Some("thread".to_owned())
+            } else {
+                Some("human-thread".to_owned())
             };
             let workspace_id = self
                 .panes
@@ -8989,19 +9319,8 @@ pub(crate) mod tests {
                     .unwrap()
                     .clone()
                     .unwrap_or_else(|| "idle".to_owned()),
-                session_agent: report_session.then(|| kind.to_owned()),
-                session_value: report_session.then(|| {
-                    if changed_after_save {
-                        "replacement-thread"
-                    } else if matches!(pane, "owned" | "claude" | "reported" | "project-pane")
-                        || self.duplicate_session.load(Ordering::Relaxed)
-                    {
-                        "thread"
-                    } else {
-                        "human-thread"
-                    }
-                    .to_owned()
-                }),
+                session_agent: reported_agent,
+                session_value: reported_value,
                 scroll: *self.scroll.lock().unwrap(),
                 terminal_id: Some(self.terminal(pane)),
                 tab_id: self
@@ -9501,11 +9820,15 @@ pub(crate) mod tests {
         fn start_agent(
             &self,
             name: &str,
-            _: &str,
+            kind: &str,
             pane: &str,
-            _: &[String],
+            arguments: &[String],
             _: Duration,
         ) -> AdapterResult<()> {
+            self.launches
+                .lock()
+                .unwrap()
+                .insert(pane.to_owned(), (kind.to_owned(), arguments.to_vec()));
             self.herdr_names
                 .lock()
                 .unwrap()
@@ -9527,12 +9850,16 @@ pub(crate) mod tests {
         fn start_pane_agent(
             &self,
             _: &str,
-            _: &str,
-            _: &str,
-            _: &[String],
+            kind: &str,
+            pane: &str,
+            arguments: &[String],
             _: Duration,
             persist_identity: &mut dyn FnMut(CustomProcessIdentity) -> AdapterResult<()>,
         ) -> AdapterResult<()> {
+            self.launches
+                .lock()
+                .unwrap()
+                .insert(pane.to_owned(), (kind.to_owned(), arguments.to_vec()));
             self.started.store(true, Ordering::Relaxed);
             self.custom_alive.store(true, Ordering::Relaxed);
             persist_identity(Self::custom_identity())?;
@@ -9850,6 +10177,12 @@ pub(crate) mod tests {
         assert_eq!(commands[0].1, "exec boxed-shell");
         let canonical_slot = fs::canonicalize(&slot_path).unwrap();
         assert_eq!(status["cwd"], json!(canonical_slot.display().to_string()));
+        assert_eq!(status["slot"], "s1");
+        assert_eq!(
+            status["slot_project"],
+            fs::canonicalize(&project).unwrap().display().to_string()
+        );
+        assert_eq!(status["slot_isolation"], "cgroup");
         let argv = fs::read_to_string(fixture.root.join("argv-ok")).unwrap();
         let lines: Vec<&str> = argv.lines().collect();
         assert_eq!(
@@ -9899,6 +10232,14 @@ pub(crate) mod tests {
         let commands = fixture.client.slot_commands.lock().unwrap().clone();
         assert_eq!(commands.len(), 1);
         assert_eq!(commands[0].1, "exec boxed-shell");
+        assert_eq!(status["slot"], Value::Null);
+        assert_eq!(status["project_box"]["name"], "planner");
+        assert_eq!(
+            status["project_box"]["project"],
+            fixture.root.display().to_string()
+        );
+        assert_eq!(status["project_box"]["isolation"], "userns");
+        assert_eq!(status["project_box"]["writable"], "project");
         let argv = fs::read_to_string(fixture.root.join("argv-ok")).unwrap();
         assert_eq!(
             argv.lines().skip(1).collect::<Vec<_>>(),
@@ -13528,6 +13869,7 @@ pub(crate) mod tests {
             .client
             .custom_reported
             .store(false, Ordering::Relaxed);
+        fixture.client.launches.lock().unwrap().remove("owned");
         let error = manager.stop("worker").unwrap_err();
         assert!(error.to_string().contains("foreground process"));
         assert!(fixture.client.closed.lock().unwrap().is_empty());
@@ -14280,4 +14622,6 @@ pub(crate) mod tests {
 
     /// Recipient checks around input, anchors, rename transactions and doctor.
     mod identity;
+    /// Recorded conversation and launch policy, with no status-time mutation.
+    mod recovery_metadata;
 }

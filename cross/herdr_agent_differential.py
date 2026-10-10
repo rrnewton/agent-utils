@@ -21,6 +21,7 @@ import time
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import cast
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 TIMEOUT_SECONDS = 30
@@ -203,7 +204,7 @@ elif args[:2] == ["pane", "get"]:
         "cwd": root,
         "agent": None if human or state.get("empty_shell") or (state.get("custom_harness") and not state.get("custom_reported")) else state.get("harness", "codex"),
         "agent_status": "unknown" if human or state.get("empty_shell") or (state.get("custom_harness") and not state.get("custom_reported")) else state.get("status", "idle"),
-        "agent_session": None if human or state.get("empty_shell") or state.get("sessionless") or state.get("custom_harness") else {"agent": state.get("harness", "codex"), "value": "session-1"},
+        "agent_session": None if human or state.get("empty_shell") or state.get("sessionless") or state.get("custom_harness") else {"agent": state.get("harness", "codex"), "value": state.get("session_value_override", state.get("session_value", "session-1"))},
         "terminal_id": "term-human" if human else current_terminal,
         "tab_id": current_tab,
     }})
@@ -277,6 +278,10 @@ elif args[:2] == ["agent", "start"]:
     state["name"] = args[2]
     state["harness"] = args[args.index("--kind") + 1]
     state["launch_arguments"] = args[args.index("--") + 1:]
+    for selector in ("--session-id", "--resume", "resume"):
+        if selector in state["launch_arguments"]:
+            state["session_value"] = state["launch_arguments"][state["launch_arguments"].index(selector) + 1]
+            break
     # A real process stands in for the harness so its kernel identity can be pinned.
     harness = subprocess.Popen(
         ["/bin/sleep", "60"], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
@@ -1693,7 +1698,8 @@ def _managed_lifecycle(harness: Harness, report: Report) -> None:
         case = harness.case(f"managed-{kind}")
         common: tuple[str, ...] = ("--herdr-bin", "<HERDR>", "--registry", "<ROOT>/registry", "--goal-command-json", '["<HERDR>","goal-rpc"]')
         start = ("start", "worker", "--cwd", "<ROOT>", "--workspace-id", "w1",
-                 "--harness", kind, "--model", "selected-model", "--harness-arg=--extra", *common)
+                 "--harness", kind, "--model", "selected-model", "--harness-arg=--extra",
+                 *(("--resume", "session-1") if kind == "claude" else ()), *common)
         python, rust = harness.invoke(case, start)
         report.require(f"managed/{kind}/start", python.returncode == rust.returncode == 0 and normalized(python) == normalized(rust),
                        f"start diverged: {python!r} {rust!r}")
@@ -1745,7 +1751,8 @@ def _managed_lifecycle(harness: Harness, report: Report) -> None:
             f"managed/compatibility/{label}",
             all(outcome.returncode == 0 for outcome in outcomes)
             and all(
-                _state(root).get("launch_arguments") == expected_arguments
+                (cast(list[object], _state(root).get("launch_arguments"))[2:] if label == "claude-unstructured-effort"
+                 else _state(root).get("launch_arguments")) == expected_arguments
                 for root in (case.python_root, case.rust_root)
             ),
             f"legacy raw launch policy regressed: {outcomes!r}",

@@ -178,7 +178,11 @@ class FakeManagedClient:
         self.launched.append((name, kind, pane_id, arguments))
         if self.fail_start:
             raise HerdrUnavailable("trust prompt needs attention")
-        self.infos[pane_id] = replace(self.infos[pane_id], agent=kind, status="idle", session_agent=kind, session_value=f"session-{self.serial}")
+        conversation = (arguments[arguments.index("--session-id") + 1] if "--session-id" in arguments
+                        else arguments[arguments.index("--resume") + 1] if "--resume" in arguments
+                        else arguments[arguments.index("resume") + 1] if "resume" in arguments
+                        else f"session-{self.serial}")
+        self.infos[pane_id] = replace(self.infos[pane_id], agent=kind, status="idle", session_agent=kind, session_value=conversation)
 
     def start_pane_agent(
         self, name: str, kind: str, pane_id: str, arguments: tuple[str, ...], *, timeout: float,
@@ -380,7 +384,7 @@ def test_named_workers_share_workspace_but_never_reuse_tabs(tmp_path: Path, monk
     assert first["pane_id"] != second["pane_id"]
     assert fake.submitted == ["start here"]
     assert fake.launched[0][3] == ("--no-alt-screen",)
-    assert fake.launched[1][3] == ("--model", "selected-model")
+    assert fake.launched[1][3] == ("--session-id", cast(dict[str, str], second["native_session"])["value"], "--model", "selected-model")
     assert [item["name"] for item in manager.list()] == ["one", "two"]
     with pytest.raises(AgentDeliveryError, match="already registered"):
         manager.start("one", cwd=str(tmp_path))
@@ -1236,7 +1240,8 @@ def test_direct_start_preserves_unstructured_raw_policy_and_nonoverriding_codex_
         "codex-worker", cwd=str(tmp_path), harness="codex", model="structured",
         harness_args=("-c", "sandbox_mode=read-only"),
     )
-    assert fake.launched[0][3] == ("--effort=high",)
+    assert fake.launched[0][3][0] == "--session-id"
+    assert fake.launched[0][3][2:] == ("--effort=high",)
     assert fake.launched[1][3] == (
         "--no-alt-screen", "--model", "structured", "-c", "sandbox_mode=read-only",
     )
@@ -1677,6 +1682,7 @@ def test_explicit_session_binding_preserves_existing_queue_authority(tmp_path: P
     manager.start("worker", cwd=str(tmp_path))
     record = manager.get("worker")
     record.session_agent = record.session_value = None
+    record.native_session = None
     manager._save(record)
     fake.infos["w1:p1"] = replace(fake.infos["w1:p1"], session_agent=None, session_value=None)
     manager.send("worker", "before native binding")
