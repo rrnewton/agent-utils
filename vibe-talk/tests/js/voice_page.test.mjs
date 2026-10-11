@@ -10657,6 +10657,13 @@ test("message text is styled as one block family: bullets, hanging indent, parag
   assert.match(cssBlock(".md ul"), /list-style-type:\s*disc/, "a list has no round bullets");
   assert.match(cssBlock(".md ul ul"), /list-style-type:\s*circle/);
   assert.match(cssBlock(".md ul ul ul"), /list-style-type:\s*square/, "a third level reuses the second's marker");
+  // `#237 nested-lists`: a numbered list is a level too, as in a browser's own sheet, so the steps
+  // under a numbered item are circles and theirs squares; and its gutter holds `10.`.
+  assert.match(cssBlock(".md ol ul"), /list-style-type:\s*circle/, "steps under a number keep the top level's disc");
+  for (const third of [".md ol ul ul", ".md ul ol ul", ".md ol ol ul"]) {
+    assert.match(cssBlock(third), /list-style-type:\s*square/, `${third} reuses the second level's marker`);
+  }
+  assert.match(cssBlock(".md ol"), /padding-left:\s*2em/, "a two-digit number would stick out of its gutter");
   // An item is not a row: the shared sheet's `.messages li` panel must not reach it.
   assert.match(cssRules(SHARED_CSS, ".messages li").join("\n"), /padding:/, "the row rule this resets moved");
   const item = cssBlock(".md li");
