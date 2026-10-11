@@ -139,15 +139,13 @@ fn a_vertex_section_needs_a_project_a_region_and_some_credential() {
         "[summaries.llm]\ndialect = \"vertex\"\nproject = \"p\"\nregion = \"global\"\n\
          base_url = \"https://gateway.example/v1\"\nclient_identity_file = \"/etc/identity.pem\"\n\
          ca_bundle_file = \"/etc/private-root.pem\"\n\
-         [summaries.llm.extra_headers]\nX-Calling-Product = \"vibe-talk\"\n",
+         [summaries.llm.extra_headers]\nX-Client-Name = \"vibe-talk\"\n",
     )
     .expect("valid");
     let llm = mtls.summaries.llm.expect("read");
     assert_eq!(llm.base_url, "https://gateway.example/v1");
     assert_eq!(
-        llm.extra_headers
-            .get("x-calling-product")
-            .map(String::as_str),
+        llm.extra_headers.get("x-client-name").map(String::as_str),
         Some("vibe-talk"),
         "header names are lowercased"
     );

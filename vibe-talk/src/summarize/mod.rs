@@ -482,7 +482,7 @@ mod tests {
                 "extra_headers",
                 with_llm(|l| {
                     l.extra_headers
-                        .insert("x-calling-product".to_owned(), "vibe-talk".to_owned());
+                        .insert("x-client-name".to_owned(), "vibe-talk".to_owned());
                 }),
             ),
         ] {

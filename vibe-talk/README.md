@@ -1199,7 +1199,7 @@ client_identity_file = "/path/to/identity.pem"     # certificate chain + private
 ca_bundle_file = "/path/to/private-root.pem"       # only if the gateway chains to a private root
 
 [summaries.llm.extra_headers]
-x-calling-product = "vibe-talk"                    # only if the gateway asks callers to identify themselves
+x-client-name = "vibe-talk"                    # only if the gateway asks callers to identify themselves
 ```
 
 The identity file is **re-read whenever its modification time changes**, so a short-lived

@@ -363,7 +363,7 @@ enabled = true
 # client_identity_file = "/path/to/identity.pem"   # cert chain + key; re-read when it changes
 # ca_bundle_file = "/path/to/private-root.pem"     # if it chains to a private root
 # [summaries.llm.extra_headers]
-# x-calling-product = "vibe-talk"                  # not for secrets
+# x-client-name = "vibe-talk"                  # not for secrets
 
 [replay]
 # RESUMING A CONVERSATION ACROSS A HANG-UP. The vendor cannot resume a closed conversation, so
