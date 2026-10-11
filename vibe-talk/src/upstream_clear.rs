@@ -174,6 +174,9 @@ pub struct Candidates {
     channels: Mutex<BTreeMap<ChannelId, Runtime>>,
     next_generation: Mutex<u64>,
     wake: Notify,
+    /// Held across a change to the store's settings and the matching change here; see
+    /// [`Candidates::changing`].
+    changes: tokio::sync::Mutex<()>,
 }
 
 fn lock<T>(cell: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -253,6 +256,29 @@ impl Candidates {
         drop(channels);
         self.wake.notify_one();
         true
+    }
+
+    /// Hold this while changing settings in the store and then here, and let it go before any
+    /// provider call.
+    ///
+    /// The store is what Settings shows; this set is what the loop acts on. Two changes that
+    /// interleave (a save and an erase of the store, or two saves from two devices) could
+    /// otherwise leave this set acting on a mode the store no longer holds, which is the loop
+    /// marking messages read while Settings says Off.
+    pub async fn changing(&self) -> tokio::sync::MutexGuard<'_, ()> {
+        self.changes.lock().await
+    }
+
+    /// Forget every channel, as when the store's settings were erased: nothing more is pushed
+    /// until a channel is set again. A push already in flight finishes and is logged, and changes
+    /// nothing here. Returns how many channels were forgotten.
+    pub fn forget_all(&self) -> usize {
+        let mut channels = lock(&self.channels);
+        let forgotten = channels.len();
+        channels.clear();
+        drop(channels);
+        self.wake.notify_one();
+        forgotten
     }
 
     /// Put a channel in `mode`, with `floor` the position its provider cursor is already known to
@@ -434,8 +460,14 @@ impl Candidates {
                 runtime.retry_at_ms = Some(
                     now_ms().saturating_add(i64::try_from(wait.as_millis()).unwrap_or(i64::MAX)),
                 );
-                // The newest message wins: put this one back only if nothing newer arrived.
-                if runtime.pending.is_none() {
+                // The newest message wins: put this one back unless something newer arrived while
+                // it was in flight. An OLDER one that arrived meanwhile (a late poll) is replaced,
+                // because this one covers it.
+                if runtime
+                    .pending
+                    .as_ref()
+                    .is_none_or(|pending| pending.position < job.position)
+                {
                     runtime.pending = Some(Pending {
                         immediate: false,
                         ..job.pending.clone()
@@ -454,8 +486,29 @@ fn unavailable_reason(error: &ChatError) -> String {
         ChatError::Status { body, .. } if body.contains("thread_channel") => {
             THREAD_CHANNEL_REASON.to_owned()
         }
+        ChatError::Refused(reason) => reason.clone(),
         _ => error.to_string(),
     }
+}
+
+/// A provider that answered a dry run as a real push, or the other way round, does not keep the
+/// contract, and the loop stops for that channel rather than trust it again: one that ignores a
+/// dry run may already have marked messages read, and every retry would mark more.
+#[must_use]
+pub fn dry_run_ignored(asked_dry_run: bool, outcome: &UpstreamClearOutcome) -> ChatError {
+    let previous = outcome.previous.as_deref().unwrap_or("none");
+    ChatError::Refused(if asked_dry_run {
+        format!(
+            "the bridge answered a dry run as a real push, so it may have marked messages read \
+             (it reports its read marker at {previous}, target {}); nothing more is pushed until \
+             the setting is saved again, and the bridge needs fixing",
+            outcome.target
+        )
+    } else {
+        "the bridge answered a push as a dry run, so nothing was marked read; nothing more is \
+         pushed until the setting is saved again, and the bridge needs fixing"
+            .to_owned()
+    })
 }
 
 /// A failure in words for the log and for Settings.
@@ -481,7 +534,11 @@ pub fn classify(answer: &Result<UpstreamClearOutcome, ChatError>) -> UpstreamCle
         Ok(outcome) if outcome.advanced => UpstreamClearResult::Advanced,
         Ok(_) => UpstreamClearResult::AlreadyRead,
         Err(error) => match error.cause() {
-            ChatError::Status { status: 409, .. } => UpstreamClearResult::Unavailable,
+            // Refused by this server or the provider client, not by a passing fault: trying the
+            // same thing again cannot help.
+            ChatError::Status { status: 409, .. } | ChatError::Refused(_) => {
+                UpstreamClearResult::Unavailable
+            }
             ChatError::Status { status: 404, .. } => UpstreamClearResult::Skipped,
             _ => UpstreamClearResult::Failed,
         },
@@ -559,15 +616,23 @@ impl Clearer {
     /// The store's, when it cannot be read. [`StoreError::Unavailable`] means no store is
     /// configured, and nothing can be enabled.
     pub async fn seed(&self) -> Result<usize, StoreError> {
-        let settings = self.store.upstream_clear_settings().await?;
-        let mut enabled = 0;
-        for setting in settings {
-            if setting.mode == UpstreamClearMode::Off || !(self.eligible)(&setting.channel) {
-                continue;
-            }
-            enabled += 1;
-            self.candidates
-                .set_mode(&setting.channel, setting.mode, stored_floor(&setting));
+        // The settings are read and taken in as one change, so a save landing meanwhile is
+        // neither lost nor overwritten by an older reading; the provider is asked afterwards.
+        let enabled: Vec<UpstreamClearSetting> = {
+            let _changing = self.candidates.changing().await;
+            let settings = self.store.upstream_clear_settings().await?;
+            settings
+                .into_iter()
+                .filter(|setting| {
+                    setting.mode != UpstreamClearMode::Off && (self.eligible)(&setting.channel)
+                })
+                .inspect(|setting| {
+                    self.candidates
+                        .set_mode(&setting.channel, setting.mode, stored_floor(setting));
+                })
+                .collect()
+        };
+        for setting in &enabled {
             tracing::info!(
                 channel = %setting.channel,
                 mode = setting.mode.as_str(),
@@ -590,7 +655,7 @@ impl Clearer {
                 ),
             }
         }
-        Ok(enabled)
+        Ok(enabled.len())
     }
 
     fn label_of(&self, channel: &ChannelId) -> String {
@@ -612,10 +677,15 @@ impl Clearer {
             return true;
         }
         let dry_run = job.mode == UpstreamClearMode::DryRun;
-        let answer = self
+        let answer = match self
             .chat
             .clear_upstream_through(&job.channel, &job.message, dry_run)
-            .await;
+            .await
+        {
+            Ok(outcome) if outcome.dry_run != dry_run => Err(dry_run_ignored(dry_run, &outcome)),
+            answer => answer,
+        };
+        let would_advance = answer.as_ref().is_ok_and(|outcome| outcome.advanced);
         let result = classify(&answer);
         self.candidates
             .finish(&job, result, answer.as_ref().err(), &self.timing);
@@ -631,7 +701,7 @@ impl Clearer {
                 .and_then(|outcome| outcome.previous.clone()),
             error: answer.as_ref().err().map(failure_words),
         };
-        self.log(&job, &attempt);
+        self.log(&job, &attempt, would_advance);
         if let Err(error) = self
             .store
             .record_upstream_clear(&job.channel, &attempt)
@@ -646,7 +716,9 @@ impl Clearer {
         true
     }
 
-    fn log(&self, job: &Job, attempt: &UpstreamClearAttempt) {
+    /// `advanced` is the provider's own word: in a dry run, whether a real push would have moved
+    /// its marker.
+    fn log(&self, job: &Job, attempt: &UpstreamClearAttempt, advanced: bool) {
         let head = format!(
             "upstream-clear: {} channel {} ({}) through {} at {}",
             job.mode.as_str(),
@@ -666,10 +738,15 @@ impl Clearer {
                 channel = %job.channel,
                 "{head}: already-read (the provider's read marker was already at {previous})"
             ),
-            UpstreamClearResult::DryRun => tracing::info!(
+            UpstreamClearResult::DryRun if advanced => tracing::info!(
                 channel = %job.channel,
                 "{head}: dry-run (would move the provider's read marker from {previous} to \
                  {target}; nothing was written)"
+            ),
+            UpstreamClearResult::DryRun => tracing::info!(
+                channel = %job.channel,
+                "{head}: dry-run (would leave the provider's read marker at {previous}, already \
+                 at or past {target}; nothing was written)"
             ),
             UpstreamClearResult::Skipped => tracing::info!(
                 channel = %job.channel,
@@ -792,6 +869,13 @@ mod tests {
         assert_eq!(
             classify(&Err(ChatError::Transport("reset".to_owned()))),
             UpstreamClearResult::Failed
+        );
+        // Refused before or instead of a provider write: trying again cannot help.
+        assert_eq!(
+            classify(&Err(
+                ChatError::Refused("cannot".to_owned()).with_provider("Google Chat")
+            )),
+            UpstreamClearResult::Unavailable
         );
     }
 
@@ -1042,11 +1126,98 @@ mod tests {
             "the line names no target time: {line}"
         );
         assert!(line.contains("dry-run"), "{line}");
+        assert!(
+            line.contains("would move the provider's read marker from none to"),
+            "{line}"
+        );
         let setting = &store.upstream_clear_settings().await.expect("read")[0];
         assert_eq!(setting.pushed, None, "a dry run is not a push");
         assert_eq!(
             setting.last.as_ref().map(|last| last.result),
             Some(UpstreamClearResult::DryRun)
+        );
+        // The owner has read further natively: the line says a real push would move nothing,
+        // rather than claiming it would move the marker from where it is to somewhere earlier.
+        fake.set_upstream_cursor(&agents(), "2026-10-01T00:00:00Z");
+        let later = arrive(&fake, &agents(), 60);
+        clearer.candidates.offer(&agents(), &later);
+        pass(60).await;
+        assert_eq!(fake.upstream_clears().len(), 2);
+        let text = logs.text();
+        let line = text
+            .lines()
+            .find(|line| line.contains(later.id.as_str()) && line.contains("dry-run"))
+            .unwrap_or_else(|| panic!("no second dry-run line in {text}"));
+        assert!(
+            line.contains(
+                "would leave the provider's read marker at 2026-10-01T00:00:00Z, already at or past"
+            ),
+            "{line}"
+        );
+        assert!(!line.contains("would move"), "{line}");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_bridge_that_mistakes_a_dry_run_for_a_push_is_stopped_rather_than_trusted_again() {
+        let logs = crate::testing::LogCapture::info_only();
+        let fake = Arc::new(FakeDiscord::new());
+        fake.enable_upstream_clear();
+        fake.flip_upstream_dry_run_answers();
+        let store = Arc::new(FakeStore::new());
+        let clearer = clearer(&fake, &store);
+        let people = ChannelId(PEOPLE.to_owned());
+        on(&clearer, &agents(), UpstreamClearMode::DryRun).await;
+        on(&clearer, &people, UpstreamClearMode::On).await;
+        tokio::spawn(clearer.clone().run());
+        clearer
+            .candidates
+            .offer(&agents(), &arrive(&fake, &agents(), 1));
+        clearer
+            .candidates
+            .offer(&people, &arrive(&fake, &people, 2));
+        pass(10).await;
+        assert_eq!(fake.upstream_clears().len(), 2);
+        let ignored = clearer.candidates.status(&agents()).unavailable;
+        assert!(
+            ignored
+                .as_deref()
+                .is_some_and(|why| why.contains("answered a dry run as a real push")),
+            "{ignored:?}"
+        );
+        let flipped = clearer.candidates.status(&people).unavailable;
+        assert!(
+            flipped
+                .as_deref()
+                .is_some_and(|why| why.contains("answered a push as a dry run")),
+            "{flipped:?}"
+        );
+        // Neither is asked again, however much arrives.
+        assert!(!clearer
+            .candidates
+            .offer(&agents(), &arrive(&fake, &agents(), 60)));
+        assert!(!clearer
+            .candidates
+            .offer(&people, &arrive(&fake, &people, 61)));
+        pass(600).await;
+        assert_eq!(
+            fake.upstream_clears().len(),
+            2,
+            "a bridge that broke the dry-run contract was asked again"
+        );
+        for setting in store.upstream_clear_settings().await.expect("read") {
+            assert_eq!(
+                setting.pushed, None,
+                "a broken answer was recorded as a push"
+            );
+            assert_eq!(
+                setting.last.as_ref().map(|last| last.result),
+                Some(UpstreamClearResult::Unavailable)
+            );
+        }
+        assert!(
+            logs.text().contains("answered a dry run as a real push"),
+            "{}",
+            logs.text()
         );
     }
 
@@ -1123,6 +1294,67 @@ mod tests {
         let calls = fake.upstream_clears();
         assert_eq!(calls.len(), 2, "{calls:?}");
         assert_eq!(calls[1].1, newer.id, "the retry pushed the older message");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_failed_push_is_retried_for_its_own_message_when_an_older_one_arrived_meanwhile() {
+        let fake = Arc::new(FakeDiscord::new());
+        fake.enable_upstream_clear();
+        let store = Arc::new(FakeStore::new());
+        let clearer = clearer(&fake, &store);
+        on(&clearer, &agents(), UpstreamClearMode::On).await;
+        let older = arrive(&fake, &agents(), 10);
+        let newer = arrive(&fake, &agents(), 20);
+        let gate = fake.hold_upstream_clears();
+        fake.fail_upstream_clear_next(ChatError::Transport("bridge restarting".to_owned()));
+        tokio::spawn(clearer.clone().run());
+        clearer.candidates.offer(&agents(), &newer);
+        pass(10).await;
+        assert_eq!(
+            fake.upstream_clears().len(),
+            1,
+            "the push should be in flight"
+        );
+        // A late poll delivers an older message while the push is in flight, and the push fails.
+        assert!(clearer.candidates.offer(&agents(), &older));
+        gate.add_permits(10);
+        pass(120).await;
+        let calls = fake.upstream_clears();
+        assert_eq!(calls.len(), 2, "{calls:?}");
+        assert_eq!(
+            calls[1].1, newer.id,
+            "the retry pushed the older message, leaving the newer one unread"
+        );
+        assert_eq!(
+            fake.upstream_cursor(&agents()),
+            Some(newer.timestamp.clone())
+        );
+        assert_eq!(clearer.candidates.status(&agents()), LiveStatus::default());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn forgetting_every_channel_stops_a_waiting_push_and_every_later_one() {
+        let fake = Arc::new(FakeDiscord::new());
+        fake.enable_upstream_clear();
+        let store = Arc::new(FakeStore::new());
+        let clearer = clearer(&fake, &store);
+        on(&clearer, &agents(), UpstreamClearMode::On).await;
+        tokio::spawn(clearer.clone().run());
+        pass(1).await;
+        clearer
+            .candidates
+            .offer(&agents(), &arrive(&fake, &agents(), 1));
+        assert!(clearer.candidates.status(&agents()).pending);
+        // What the erase route does: the store's settings go, then the loop's.
+        store.purge_everything().await.expect("purge");
+        assert_eq!(clearer.candidates.forget_all(), 1);
+        assert_eq!(clearer.candidates.mode(&agents()), UpstreamClearMode::Off);
+        assert!(!clearer
+            .candidates
+            .offer(&agents(), &arrive(&fake, &agents(), 2)));
+        pass(120).await;
+        assert!(fake.upstream_clears().is_empty());
+        assert_eq!(clearer.candidates.forget_all(), 0);
     }
 
     #[tokio::test(start_paused = true)]

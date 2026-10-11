@@ -290,8 +290,9 @@ pub fn upstream_clear_request(
 ///
 /// # Errors
 ///
-/// [`ChatError::Shape`] when `target` or `advanced` is missing, or `previous` is neither a string
-/// nor null. `scope` defaults to `space` and `dry_run` to false.
+/// [`ChatError::Shape`] when `target`, `advanced` or `dry_run` is missing, or `previous` is neither
+/// a string nor null. `scope` defaults to `space`. `dry_run` is required because the loop checks it
+/// against what it asked: a bridge that does not say cannot be trusted with a dry run.
 pub fn parse_upstream_clear(
     value: &serde_json::Value,
 ) -> Result<crate::chat::UpstreamClearOutcome, ChatError> {
@@ -322,7 +323,7 @@ pub fn parse_upstream_clear(
         dry_run: value
             .get("dry_run")
             .and_then(serde_json::Value::as_bool)
-            .unwrap_or(false),
+            .ok_or_else(|| shape("does not say whether it was a dry run"))?,
     })
 }
 
@@ -1509,7 +1510,10 @@ mod tests {
             serde_json::json!({ "advanced": true }),
             serde_json::json!({ "target": "", "advanced": true }),
             serde_json::json!({ "target": "2026-10-11T10:42:00Z" }),
-            serde_json::json!({ "target": "2026-10-11T10:42:00Z", "advanced": true, "previous": 7 }),
+            serde_json::json!({ "target": "2026-10-11T10:42:00Z", "advanced": true, "previous": 7, "dry_run": false }),
+            // A bridge that does not say whether it ran dry cannot be trusted with a dry run.
+            serde_json::json!({ "target": "2026-10-11T10:42:00Z", "advanced": true }),
+            serde_json::json!({ "target": "2026-10-11T10:42:00Z", "advanced": true, "dry_run": "no" }),
             serde_json::Value::Null,
         ] {
             assert!(

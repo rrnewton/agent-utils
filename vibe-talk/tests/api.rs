@@ -1837,7 +1837,13 @@ async fn the_purge_route_erases_all_three_records_and_leaves_the_store_usable() 
     assert_eq!(status, StatusCode::OK, "{payload}");
     assert_eq!(
         payload["purged"],
-        serde_json::json!(["conversations", "read_marks", "summaries", "dismissals"]),
+        serde_json::json!([
+            "conversations",
+            "read_marks",
+            "summaries",
+            "dismissals",
+            "upstream_clear"
+        ]),
         "the answer has to name what it erased: {payload}"
     );
 

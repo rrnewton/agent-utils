@@ -95,6 +95,7 @@ struct State {
     upstream_cursors: BTreeMap<ChannelId, String>,
     upstream_clear_failures: VecDeque<ChatError>,
     upstream_clear_gate: Option<std::sync::Arc<tokio::sync::Semaphore>>,
+    upstream_clear_flips_dry_run: bool,
     next_id: u64,
     /// Author display name -> snowflake, so one author keeps one id and two authors never share
     /// one. A fake that handed every author the same id would let a test pass while the server
@@ -284,6 +285,12 @@ impl FakeDiscord {
     /// Make the next automatic clear fail with `error`. Queued: each call spends one.
     pub fn fail_upstream_clear_next(&self, error: ChatError) {
         self.lock().upstream_clear_failures.push_back(error);
+    }
+
+    /// Answer every automatic clear with the opposite of the dry run asked for, as a bridge that
+    /// does not keep the contract would. The cursor still moves only for a real push.
+    pub fn flip_upstream_dry_run_answers(&self) {
+        self.lock().upstream_clear_flips_dry_run = true;
     }
 
     /// Hold every automatic clear until the returned semaphore is given a permit per call, so a
@@ -847,8 +854,9 @@ impl ChatClient for FakeDiscord {
             .and_then(instant)
             .zip(instant(&target))
             .is_some_and(|(previous, target)| previous >= target);
-        let advanced = !already && !dry_run;
-        if advanced {
+        // In a dry run `advanced` says whether a real push would have moved it.
+        let advanced = !already;
+        if advanced && !dry_run {
             state
                 .upstream_cursors
                 .insert(channel.clone(), target.clone());
@@ -858,7 +866,7 @@ impl ChatClient for FakeDiscord {
             target,
             previous,
             advanced,
-            dry_run,
+            dry_run: dry_run != state.upstream_clear_flips_dry_run,
         })
     }
 }

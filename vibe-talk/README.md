@@ -1445,8 +1445,9 @@ No Content`. Direct Discord deployments must leave the setting off.
 some of the owner's channels, and those are mostly coding agents posting updates; in the service's
 own client those updates bury the messages from people. With the same bridge opt-in, Settings offers
 **Clear unread in** *the service* for each channel whose provider can do it: off (the default), a
-dry run, or on. On, the SERVER marks every message it receives in that channel read in the service's
-own client too, so that client's unread list keeps the people and vibe-talk keeps the agents.
+dry run, or on. On, the SERVER moves the service's own read marker for that channel forward to the
+newest message it has seen there (live, or at startup and on "clear now" the channel's newest), so
+that client's unread list keeps the people and vibe-talk keeps the agents.
 vibe-talk's own read marks and Done state are not touched, and nothing is ever read back.
 
 * **The setting is the server's.** It is kept in the store (one row per channel set, `off` when there
@@ -1468,8 +1469,11 @@ vibe-talk's own read marks and Done state are not touched, and nothing is ever r
   marked before turning it on.
 * **What it cannot do.** The provider's marker covers the whole channel, so people's messages there
   are marked read too, and Settings says so beside the switch. A provider whose threads have their
-  own read state keeps replies inside threads unread. The first push also clears the backlog.
-* **Undo.** Turning it off stops all further pushes at once. Settings shows where the provider's
+  own read state keeps replies inside threads unread. The first push also clears the backlog,
+  whether or not "clear now" was ticked, and the warning in Settings says that too: ticking it only
+  makes it happen at once rather than at the next message.
+* **Undo.** Turning it off stops all further pushes at once, and so does `DELETE /api/v1/storage`,
+  which turns every channel back to off in the running server as well as in the store. Settings shows where the provider's
   marker was before vibe-talk first moved it; moving it back is a manual act in the provider's own
   tools, not a button here, because it would also mark unread whatever the owner has read since.
 
@@ -1477,7 +1481,10 @@ The bridge implements `POST /channels/{id}/upstream-clear` with exactly
 `{"message_id":"...","dry_run":true|false}`. It reads its provider's current cursor, moves it through
 that message only if the cursor is behind (never in a dry run), and answers
 `{"scope":"space","channel_id":"...","message_id":"...","target":"<instant>","previous":"<instant>|null","advanced":bool,"dry_run":bool}`.
-It should serve this behind reads and the owner's own actions. `404` means it no longer holds the
+`advanced` says whether the cursor moved, and in a dry run whether it would have. `dry_run` is
+required and must echo the request: a bridge that answers a dry run as a real push (or the other way
+round) is not asked again for that channel until the setting is saved, because it may already have
+marked messages read. It should serve this without making the owner's own actions wait long. `404` means it no longer holds the
 message, and vibe-talk waits for a newer one; `409` with `"code":"thread_channel"` means the channel
 cannot be cleared at all (for example one thread of a larger space, where the provider's marker would
 also clear messages vibe-talk never received), and vibe-talk stops until the setting is saved again;
@@ -1518,7 +1525,8 @@ version, and an orphan is under the live one.
 ### How an operator purges it
 
 Three ways, all of which erase everything — transcripts, read marks, "dealt with" marks,
-cached summaries, channel aliases, and the noise rules (back to the default) alike:
+cached summaries, channel aliases, the noise rules (back to the default), and every channel's
+clear-unread setting (back to off, in the running server too) alike:
 
 1. `DELETE /api/v1/storage` with the **write** token, on a running server. This is the only
    complete erase over HTTP: `DELETE /api/v1/conversations` clears transcripts and deliberately

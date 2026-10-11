@@ -290,3 +290,89 @@ async fn a_message_ingested_for_an_enabled_channel_reaches_the_provider_and_othe
     );
     assert_eq!(discord.upstream_cursor(&other), None);
 }
+
+#[tokio::test(start_paused = true)]
+async fn erasing_the_store_turns_every_channel_off_in_the_running_loop_too() {
+    // `DELETE /api/v1/storage` erases the setting with everything else. Settings then reads Off
+    // from the store, so the running loop must stop as well: a server that went on marking
+    // messages read in the owner's own app while Settings said Off is the one thing this setting
+    // must never do.
+    let (state, discord, store) = vibe_talk::testing::state_with_store();
+    discord.enable_upstream_clear();
+    for (channel, mode) in [(WRITE_CHANNEL, "on"), (READ_CHANNEL, "dry_run")] {
+        let (status, view) = call(
+            &state,
+            "PUT",
+            &path(channel),
+            WRITE_TOKEN,
+            Some(json!({ "mode": mode })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{view}");
+    }
+    let enabled = ChannelId(WRITE_CHANNEL.to_owned());
+    let dry = ChannelId(READ_CHANNEL.to_owned());
+    // One message is waiting to be pushed when the store is erased.
+    let waiting = discord.seed(&enabled, "agent", "build started");
+    state
+        .live
+        .publish(&enabled, discord.message(&waiting).expect("seeded"));
+    assert!(state.live.upstream_clear().status(&enabled).pending);
+
+    let (status, payload) = call(&state, "DELETE", "/api/v1/storage", WRITE_TOKEN, None).await;
+    assert_eq!(status, StatusCode::OK, "{payload}");
+    assert!(
+        payload["purged"]
+            .as_array()
+            .is_some_and(|purged| purged.contains(&json!("upstream_clear"))),
+        "the answer does not say the setting was erased: {payload}"
+    );
+    assert!(store
+        .upstream_clear_settings()
+        .await
+        .expect("read")
+        .is_empty());
+    for channel in [&enabled, &dry] {
+        assert_eq!(
+            state.live.upstream_clear().mode(channel),
+            UpstreamClearMode::Off,
+            "the running loop still clears {channel} after the erase"
+        );
+        let (_, view) = call(&state, "GET", &path(channel.as_str()), READ_TOKEN, None).await;
+        assert_eq!(view["mode"], "off", "{view}");
+        assert_eq!(view["pending"], false, "{view}");
+    }
+
+    // Neither the waiting message nor a later one reaches the provider.
+    let later = discord.seed(&enabled, "agent", "build green");
+    state
+        .live
+        .publish(&enabled, discord.message(&later).expect("seeded"));
+    let clearer = Clearer::for_state(&state);
+    tokio::time::advance(std::time::Duration::from_secs(120)).await;
+    assert!(
+        !clearer.push_due().await,
+        "a push was still due after the erase"
+    );
+    assert!(
+        discord.upstream_clears().is_empty(),
+        "marked read upstream after the setting was erased: {:?}",
+        discord.upstream_clears()
+    );
+    assert_eq!(discord.upstream_cursor(&enabled), None);
+
+    // Turning it on again afterwards works as on a fresh store.
+    let (status, view) = call(
+        &state,
+        "PUT",
+        &path(WRITE_CHANNEL),
+        WRITE_TOKEN,
+        Some(json!({ "mode": "on" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{view}");
+    assert_eq!(
+        state.live.upstream_clear().mode(&enabled),
+        UpstreamClearMode::On
+    );
+}

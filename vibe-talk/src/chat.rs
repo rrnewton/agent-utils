@@ -214,8 +214,8 @@ pub struct UpstreamClearOutcome {
     pub target: String,
     /// The provider's cursor before this call, when it could be read. `None` means it had none.
     pub previous: Option<String>,
-    /// Whether the cursor actually moved. False when it was already at or past `target`, and
-    /// always false in a dry run.
+    /// Whether the cursor moved, or in a dry run whether it WOULD have: false when it was already
+    /// at or past `target`. A dry run never writes, whatever this says.
     pub advanced: bool,
     /// Whether this was a dry run, so nothing was written at the provider.
     pub dry_run: bool,

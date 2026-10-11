@@ -2700,13 +2700,28 @@ pub async fn forget_conversations(
 /// Write scope, obviously. It exists because [`crate::store::StateStore::purge_everything`] was
 /// otherwise trait surface with three implementations and no caller: an erase nobody can invoke
 /// is not an erase, it is a claim in a document.
+///
+/// It also turns every channel's clear-unread setting back to off (`#232 upstream-mark-read`), in
+/// the running loop as well as in the store, so nothing more is marked read at a provider once
+/// Settings says Off.
 pub async fn purge_storage(
     State(state): State<AppState>,
     _scope: WriteScope,
 ) -> Result<Response, ApiError> {
+    let clearing = state.live.upstream_clear();
+    let changing = clearing.changing().await;
     state.store.purge_everything().await?;
+    let forgotten = clearing.forget_all();
+    drop(changing);
+    if forgotten > 0 {
+        tracing::info!(
+            channels = forgotten,
+            "upstream-clear: the store was erased, so every channel is off and nothing more is \
+             marked read at its provider"
+        );
+    }
     Ok(no_store(Json(serde_json::json!({
-        "purged": ["conversations", "read_marks", "summaries", "dismissals"],
+        "purged": ["conversations", "read_marks", "summaries", "dismissals", "upstream_clear"],
         "detail": "every durable record this server holds has been erased; the store is still \
                    open and usable",
     }))))
@@ -2880,6 +2895,9 @@ pub async fn set_upstream_clear(
         .into());
     }
     let at_ms = jiff::Timestamp::now().as_millisecond();
+    // The store and the running loop change together, never interleaved with another save or an
+    // erase; see `Candidates::changing`.
+    let changing = state.live.upstream_clear().changing().await;
     let setting = state
         .store
         .set_upstream_clear_mode(&channel.id, request.mode, at_ms)
@@ -2889,6 +2907,7 @@ pub async fn set_upstream_clear(
         setting.mode,
         crate::upstream_clear::stored_floor(&setting),
     );
+    drop(changing);
     tracing::info!(
         channel = %channel.id,
         mode = setting.mode.as_str(),
