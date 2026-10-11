@@ -298,6 +298,13 @@ fn routes(state: AppState) -> Router {
             "/api/v1/channels/{channel_id}/upstream-read",
             post(api::mark_read_upstream),
         )
+        // `#232 upstream-mark-read`. Whether this server clears the channel's unread state at its
+        // provider as it ingests messages. READ scope to see it, WRITE scope to change it, and NO
+        // MCP TOOL: on, it marks people's messages read in the owner's own client too.
+        .route(
+            "/api/v1/channels/{channel_id}/upstream-clear",
+            get(api::upstream_clear).put(api::set_upstream_clear),
+        )
         // `#39 channel-alias`. The operator's own local name for a channel. WRITE scope both
         // ways, because it outlives the process — and NO MCP TOOL at all, which is the part that
         // actually keeps a model from renaming the channels it reports on. See `api::set_alias`

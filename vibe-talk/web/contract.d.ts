@@ -226,6 +226,14 @@ declare namespace VibeTalk {
      */
     token_scope: TokenScope;
     /**
+     * Whether the selected provider can clear its own unread state as this server ingests
+     * messages, for a channel the owner turns that on for. `#232 upstream-mark-read`.
+     *
+     * Settings offers the per-channel control only when this is true. Sent only when true:
+     * absent, from this server or an older one, means false.
+     */
+    upstream_clear_supported?: boolean;
+    /**
      * Whether the selected provider exposes a write-through read cursor.
      */
     upstream_read_mark_supported: boolean;
@@ -787,6 +795,11 @@ declare namespace VibeTalk {
      */
     threading_supported: boolean;
     /**
+     * Whether this provider can clear its own unread state as this server ingests messages.
+     * `#232 upstream-mark-read`. Sent only when true.
+     */
+    upstream_clear_supported?: boolean;
+    /**
      * Whether this provider exposes a write-through read cursor.
      */
     upstream_read_mark_supported: boolean;
@@ -1027,6 +1040,115 @@ declare namespace VibeTalk {
   type TranscriptRole = "user" | "assistant";
 
   /**
+   * One push, as Settings shows it. `#232 upstream-mark-read`.
+   */
+  interface UpstreamClearAttemptView {
+    /**
+     * When it was made, in milliseconds since the Unix epoch.
+     */
+    at_ms: number;
+    /**
+     * Why it failed, in words.
+     */
+    error?: string | null;
+    /**
+     * That message's instant, in milliseconds since the Unix epoch.
+     */
+    message_at_ms: number;
+    /**
+     * The newest ingested message it was for.
+     */
+    message_id: MessageId;
+    /**
+     * The provider's cursor before it, as the provider wrote it.
+     */
+    previous?: string | null;
+    /**
+     * What it came to.
+     */
+    result: UpstreamClearResult;
+    /**
+     * Where the provider's cursor was moved to, or would have been, as the provider wrote it.
+     */
+    target?: string | null;
+  }
+
+  /**
+   * Whether the server clears one channel's unread state at its chat provider as it ingests
+   * messages. `#232 upstream-mark-read`.
+   *
+   * The ONE exception to "read state is ours" above, and it is one-way and opt-in per channel: with
+   * it on, every message this server receives in that channel is also marked read in the provider's
+   * own client, so a channel the owner reads here stops crowding his unread list there. Nothing is
+   * ever read back, and this server's own read marks and Done state are not touched.
+   */
+  type UpstreamClearMode = "off" | "dry_run" | "on";
+
+  /**
+   * What one automatic upstream clear came to. `#232 upstream-mark-read`.
+   */
+  type UpstreamClearResult = "advanced" | "already_read" | "dry_run" | "failed" | "skipped" | "unavailable";
+
+  /**
+   * Whether this server clears one channel's unread state at its chat provider, and what it last
+   * did: `GET` and `PUT /api/v1/channels/{id}/upstream-clear`. `#232 upstream-mark-read`.
+   *
+   * Everything here is the server's own record. The provider's cursor is never read back except
+   * as the answer to a push, so `pushed` and `last` say what this server did, not what the owner
+   * has since read in the provider's own client.
+   */
+  interface UpstreamClearState {
+    /**
+     * The channel it is about.
+     */
+    channel: ChannelInfo;
+    /**
+     * When it was turned on or to a dry run, in milliseconds since the Unix epoch, while it is.
+     */
+    enabled_at_ms?: number | null;
+    /**
+     * Failed attempts in a row.
+     */
+    failures: number;
+    /**
+     * The most recent attempt of any kind.
+     */
+    last?: UpstreamClearAttemptView | null;
+    /**
+     * What the owner chose. Off unless set.
+     */
+    mode: UpstreamClearMode;
+    /**
+     * Whether a message is waiting to be pushed.
+     */
+    pending: boolean;
+    /**
+     * The provider's cursor before this server first moved it, for a manual undo.
+     */
+    previous_cursor?: string | null;
+    /**
+     * The name of the channel's chat provider, for the words on the control.
+     */
+    provider_name: string;
+    /**
+     * The newest push the provider's cursor is known to cover because of this server.
+     */
+    pushed?: UpstreamClearAttemptView | null;
+    /**
+     * When the next retry is due, in milliseconds since the Unix epoch, after a failure.
+     */
+    retry_at_ms?: number | null;
+    /**
+     * Whether the channel's provider can do this at all. When false the mode is always off.
+     */
+    supported: boolean;
+    /**
+     * Why the provider cannot do this for this channel, once it has said so.
+     */
+    unavailable?: string | null;
+  }
+
+  /**
    * A Discord user snowflake, as a string.
    *
    * Kept distinct from [`MessageId`] and [`ChannelId`] so the three cannot be passed for one
@@ -1179,6 +1301,7 @@ declare namespace VibeTalk {
     ThreadSummary: ThreadSummary;
     PinsResponse: PinsResponse;
     PinChangeResponse: PinChangeResponse;
+    UpstreamClearState: UpstreamClearState;
   }
 
   /** A contract type a peer may extend with new `type` tags. */

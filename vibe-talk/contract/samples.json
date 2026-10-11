@@ -75,6 +75,7 @@
           "owner_author_id": "7",
           "self_author_id": "9",
           "threading_supported": true,
+          "upstream_clear_supported": true,
           "upstream_read_mark_supported": false
         },
         {
@@ -101,6 +102,7 @@
       "speech_prep_enabled": true,
       "threading_supported": true,
       "token_scope": "write",
+      "upstream_clear_supported": true,
       "upstream_read_mark_supported": true,
       "version": "0.0.0"
     },
@@ -956,6 +958,80 @@
       ],
       "untrusted_content_notice": "third-party text",
       "view": "threads"
+    }
+  ],
+  "UpstreamClearState": [
+    {
+      "channel": {
+        "added": false,
+        "alias": null,
+        "id": "100",
+        "label": "general",
+        "provider": "discord",
+        "writable": true
+      },
+      "failures": 0,
+      "mode": "off",
+      "pending": false,
+      "provider_name": "Google Chat",
+      "supported": true
+    },
+    {
+      "channel": {
+        "added": false,
+        "alias": null,
+        "id": "100",
+        "label": "general",
+        "provider": "discord",
+        "writable": true
+      },
+      "enabled_at_ms": 1790000000000,
+      "failures": 1,
+      "last": {
+        "at_ms": 1790000060000,
+        "error": "Google Chat returned HTTP 502: mark-read failed",
+        "message_at_ms": 1790000050000,
+        "message_id": "301",
+        "result": "failed"
+      },
+      "mode": "on",
+      "pending": true,
+      "previous_cursor": "2026-09-25T11:00:00Z",
+      "provider_name": "Google Chat",
+      "pushed": {
+        "at_ms": 1790000010000,
+        "message_at_ms": 1790000005000,
+        "message_id": "300",
+        "previous": "2026-09-25T11:00:00Z",
+        "result": "advanced",
+        "target": "2026-09-25T12:00:00Z"
+      },
+      "retry_at_ms": 1790000090000,
+      "supported": true
+    },
+    {
+      "channel": {
+        "added": false,
+        "alias": null,
+        "id": "100",
+        "label": "general",
+        "provider": "discord",
+        "writable": true
+      },
+      "enabled_at_ms": 1790000000000,
+      "failures": 0,
+      "last": {
+        "at_ms": 1790000010000,
+        "error": "one thread of a larger space",
+        "message_at_ms": 1790000005000,
+        "message_id": "300",
+        "result": "unavailable"
+      },
+      "mode": "dry_run",
+      "pending": false,
+      "provider_name": "Google Chat",
+      "supported": true,
+      "unavailable": "one thread of a larger space"
     }
   ],
   "VibeTalkV1ClientFrame": [

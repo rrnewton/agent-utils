@@ -103,6 +103,13 @@ pub struct ClientConfigResponse {
     pub channel_discovery_supported: bool,
     /// Whether the selected provider exposes a write-through read cursor.
     pub upstream_read_mark_supported: bool,
+    /// Whether the selected provider can clear its own unread state as this server ingests
+    /// messages, for a channel the owner turns that on for. `#232 upstream-mark-read`.
+    ///
+    /// Settings offers the per-channel control only when this is true. Sent only when true:
+    /// absent, from this server or an older one, means false.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub upstream_clear_supported: bool,
     /// Whether the backend supports channel, thread-list, and flattened timelines.
     pub threading_supported: bool,
     /// Whether a post sent again under the same `idempotency_key` is posted at most once.
@@ -225,6 +232,82 @@ pub struct ReplyDismissals {
     pub messages: Vec<MessageId>,
 }
 
+/// Whether this server clears one channel's unread state at its chat provider, and what it last
+/// did: `GET` and `PUT /api/v1/channels/{id}/upstream-clear`. `#232 upstream-mark-read`.
+///
+/// Everything here is the server's own record. The provider's cursor is never read back except
+/// as the answer to a push, so `pushed` and `last` say what this server did, not what the owner
+/// has since read in the provider's own client.
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct UpstreamClearState {
+    /// The channel it is about.
+    pub channel: ChannelInfo,
+    /// The name of the channel's chat provider, for the words on the control.
+    pub provider_name: String,
+    /// Whether the channel's provider can do this at all. When false the mode is always off.
+    pub supported: bool,
+    /// What the owner chose. Off unless set.
+    pub mode: crate::store::UpstreamClearMode,
+    /// When it was turned on or to a dry run, in milliseconds since the Unix epoch, while it is.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enabled_at_ms: Option<i64>,
+    /// The newest push the provider's cursor is known to cover because of this server.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pushed: Option<UpstreamClearAttemptView>,
+    /// The provider's cursor before this server first moved it, for a manual undo.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub previous_cursor: Option<String>,
+    /// The most recent attempt of any kind.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last: Option<UpstreamClearAttemptView>,
+    /// Failed attempts in a row.
+    pub failures: u32,
+    /// Whether a message is waiting to be pushed.
+    pub pending: bool,
+    /// When the next retry is due, in milliseconds since the Unix epoch, after a failure.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry_at_ms: Option<i64>,
+    /// Why the provider cannot do this for this channel, once it has said so.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unavailable: Option<String>,
+}
+
+/// One push, as Settings shows it. `#232 upstream-mark-read`.
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct UpstreamClearAttemptView {
+    /// When it was made, in milliseconds since the Unix epoch.
+    pub at_ms: i64,
+    /// The newest ingested message it was for.
+    pub message_id: MessageId,
+    /// That message's instant, in milliseconds since the Unix epoch.
+    pub message_at_ms: i64,
+    /// What it came to.
+    pub result: crate::store::UpstreamClearResult,
+    /// Where the provider's cursor was moved to, or would have been, as the provider wrote it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target: Option<String>,
+    /// The provider's cursor before it, as the provider wrote it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub previous: Option<String>,
+    /// Why it failed, in words.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+impl From<&crate::store::UpstreamClearAttempt> for UpstreamClearAttemptView {
+    fn from(attempt: &crate::store::UpstreamClearAttempt) -> Self {
+        Self {
+            at_ms: attempt.at_ms,
+            message_id: attempt.message.clone(),
+            message_at_ms: attempt.message_ms,
+            result: attempt.result,
+            target: attempt.target.clone(),
+            previous: attempt.previous.clone(),
+            error: attempt.error.clone(),
+        }
+    }
+}
+
 /// One channel's pins: `GET /api/v1/channels/{id}/pins`. `#206 pin-message`.
 #[derive(Debug, Serialize, JsonSchema)]
 pub struct PinsResponse {
@@ -341,6 +424,10 @@ pub struct ProviderDescription {
     pub channel_discovery_supported: bool,
     /// Whether this provider exposes a write-through read cursor.
     pub upstream_read_mark_supported: bool,
+    /// Whether this provider can clear its own unread state as this server ingests messages.
+    /// `#232 upstream-mark-read`. Sent only when true.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub upstream_clear_supported: bool,
     /// Whether this provider supports channel, thread-list, and flattened timelines.
     pub threading_supported: bool,
     /// Whether this provider posts a message sent again under the same key at most once. Sent
@@ -520,6 +607,8 @@ fn roots(generator: &mut schemars::SchemaGenerator) -> Vec<schemars::Schema> {
         // `#206 pin-message`. Appended, so the roots before them keep their places.
         generator.subschema_for::<PinsResponse>(),
         generator.subschema_for::<PinChangeResponse>(),
+        // `#232 upstream-mark-read`. Appended, for the same reason.
+        generator.subschema_for::<UpstreamClearState>(),
     ]
 }
 

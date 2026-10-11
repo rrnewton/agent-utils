@@ -735,6 +735,7 @@ pub async fn client_config(
             channel_registration_supported: entry.client.supports_channel_registration(),
             channel_discovery_supported: entry.client.supports_channel_discovery(),
             upstream_read_mark_supported: entry.client.supports_upstream_read_mark(),
+            upstream_clear_supported: entry.client.supports_upstream_clear(),
             threading_supported: entry.client.supports_threading(),
             idempotent_posts_supported: entry.client.supports_idempotent_posts(),
             live_delivery: live_delivery(&state, entry.live_poll_seconds),
@@ -761,6 +762,7 @@ pub async fn client_config(
         channel_registration_supported: state.chat.supports_channel_registration(),
         channel_discovery_supported: state.chat.supports_channel_discovery(),
         upstream_read_mark_supported: state.chat.supports_upstream_read_mark(),
+        upstream_clear_supported: state.chat.supports_upstream_clear(),
         threading_supported: state.chat.supports_threading(),
         idempotent_posts_supported: state.chat.supports_idempotent_posts(),
         speech_prep_enabled: state.config.speakable.enabled,
@@ -2784,6 +2786,137 @@ pub async fn mark_read_upstream(
         through,
         upstream_read_notice: UPSTREAM_READ_NOTICE,
     })))
+}
+
+/// What the owner chose for clearing a channel's unread state at its provider.
+/// `#232 upstream-mark-read`.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UpstreamClearRequest {
+    /// Off, a dry run, or on.
+    pub mode: crate::store::UpstreamClearMode,
+    /// Also push the channel's newest message now, rather than at the next one that arrives.
+    #[serde(default)]
+    pub clear_now: bool,
+}
+
+/// Whether `channel`'s own provider can clear its unread state.
+fn upstream_clear_supported(state: &AppState, channel: &ChannelId) -> bool {
+    state
+        .providers
+        .client_for(channel)
+        .is_some_and(|client| client.supports_upstream_clear())
+}
+
+/// One channel's upstream-clear state, from the store and the running loop.
+async fn upstream_clear_view(
+    state: &AppState,
+    channel: ChannelInfo,
+) -> Result<crate::contract::UpstreamClearState, ApiError> {
+    let supported = upstream_clear_supported(state, &channel.id);
+    let setting = state
+        .store
+        .upstream_clear_settings()
+        .await?
+        .into_iter()
+        .find(|setting| setting.channel == channel.id)
+        .unwrap_or_else(|| crate::store::UpstreamClearSetting::unset(channel.id.clone()));
+    let live = state.live.upstream_clear().status(&channel.id);
+    let provider_name = state
+        .providers
+        .client_for(&channel.id)
+        .map_or_else(
+            || state.chat.provider_name().to_owned(),
+            |client| client.provider_name().to_owned(),
+        );
+    Ok(crate::contract::UpstreamClearState {
+        channel,
+        provider_name,
+        supported,
+        mode: if supported {
+            setting.mode
+        } else {
+            crate::store::UpstreamClearMode::Off
+        },
+        enabled_at_ms: setting.enabled_at_ms,
+        pushed: setting.pushed.as_ref().map(Into::into),
+        previous_cursor: setting.previous_cursor,
+        last: setting.last.as_ref().map(Into::into),
+        failures: setting.failures,
+        pending: live.pending,
+        retry_at_ms: live.retry_at_ms,
+        unavailable: live.unavailable,
+    })
+}
+
+/// `GET /api/v1/channels/{channel_id}/upstream-clear` — whether this server clears the channel's
+/// unread state at its provider, and what it last did. `#232 upstream-mark-read`.
+pub async fn upstream_clear(
+    State(state): State<AppState>,
+    _scope: ReadScope,
+    Path(channel_id): Path<String>,
+) -> Result<Response, ApiError> {
+    let channel = state.channel(&channel_id).ok_or(OpError::UnknownChannel)?;
+    Ok(no_store(Json(upstream_clear_view(&state, channel).await?)))
+}
+
+/// `PUT /api/v1/channels/{channel_id}/upstream-clear` — turn clearing the channel's unread state
+/// at its provider off, to a dry run, or on. `#232 upstream-mark-read`.
+///
+/// WRITE scope, and NO MCP TOOL: on, it marks every message in the channel read in the owner's
+/// own client, people's messages included, which is a decision about his attention that only he
+/// makes. With `clear_now` the channel's newest message is pushed at once instead of waiting for
+/// the next one; the push itself happens in the background, never inside this request.
+pub async fn set_upstream_clear(
+    State(state): State<AppState>,
+    _scope: WriteScope,
+    Path(channel_id): Path<String>,
+    Json(request): Json<UpstreamClearRequest>,
+) -> Result<Response, ApiError> {
+    let channel = state.channel(&channel_id).ok_or(OpError::UnknownChannel)?;
+    if request.mode != crate::store::UpstreamClearMode::Off
+        && !upstream_clear_supported(&state, &channel.id)
+    {
+        return Err(ChatError::Refused(
+            "this channel's chat provider cannot clear its unread state automatically".to_owned(),
+        )
+        .into());
+    }
+    let at_ms = jiff::Timestamp::now().as_millisecond();
+    let setting = state
+        .store
+        .set_upstream_clear_mode(&channel.id, request.mode, at_ms)
+        .await?;
+    state.live.upstream_clear().set_mode(
+        &channel.id,
+        setting.mode,
+        crate::upstream_clear::stored_floor(&setting),
+    );
+    tracing::info!(
+        channel = %channel.id,
+        mode = setting.mode.as_str(),
+        clear_now = request.clear_now,
+        "upstream-clear: channel {} ({}) set to {} in Settings",
+        channel.id,
+        channel.alias.as_deref().unwrap_or(&channel.label),
+        setting.mode.as_str(),
+    );
+    if request.clear_now && setting.mode != crate::store::UpstreamClearMode::Off {
+        match state.chat.fetch_recent(&channel.id, 1).await {
+            Ok(messages) => {
+                if let Some(newest) = messages.last() {
+                    state.live.upstream_clear().offer_now(&channel.id, newest);
+                }
+            }
+            Err(error) => tracing::warn!(
+                channel = %channel.id,
+                %error,
+                "upstream-clear: could not read the newest message to clear now; the next \
+                 message that arrives is pushed instead"
+            ),
+        }
+    }
+    Ok(no_store(Json(upstream_clear_view(&state, channel).await?)))
 }
 
 /// `POST /api/v1/channels/{channel_id}/read`

@@ -591,6 +591,11 @@ async fn main() -> anyhow::Result<()> {
             ));
         }
     }
+    // `#232 upstream-mark-read`. Only a provider that can clear its own unread state gets the
+    // loop; it is off for every channel until the owner sets one in Settings.
+    if state.chat.supports_upstream_clear() {
+        tokio::spawn(vibe_talk::upstream_clear::Clearer::for_state(&state).run());
+    }
     let app = vibe_talk::http::router(state);
 
     let listener = tokio::net::TcpListener::bind(bind)

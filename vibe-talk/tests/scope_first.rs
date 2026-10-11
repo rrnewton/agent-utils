@@ -303,6 +303,19 @@ fn inventory() -> Vec<Route> {
             Write,
             Json(r#"{"message_id":"3333333333"}"#),
         ),
+        // `#232 upstream-mark-read`: seen at read scope, changed at write.
+        route(
+            "GET",
+            "/api/v1/channels/{channel_id}/upstream-clear",
+            Read,
+            Nothing,
+        ),
+        route(
+            "PUT",
+            "/api/v1/channels/{channel_id}/upstream-clear",
+            Write,
+            Json(r#"{"mode":"off"}"#),
+        ),
         route(
             "PUT",
             "/api/v1/channels/{channel_id}/alias",

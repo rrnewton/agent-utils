@@ -180,6 +180,10 @@
           "$ref": "#/$defs/TokenScope",
           "description": "The scope of the token that asked.\n\nThe caller's own scope, so it discloses nothing it did not already hold. The page needs it\nto avoid asking for what this token cannot have: stored conversations are write-only (see\nthe conversation routes), and a read-scope page that probed them anyway got a 403 and a\nconsole error on every load. `#38 read-token-conversation-probe`."
         },
+        "upstream_clear_supported": {
+          "description": "Whether the selected provider can clear its own unread state as this server ingests\nmessages, for a channel the owner turns that on for. `#232 upstream-mark-read`.\n\nSettings offers the per-channel control only when this is true. Sent only when true:\nabsent, from this server or an older one, means false.",
+          "type": "boolean"
+        },
         "upstream_read_mark_supported": {
           "description": "Whether the selected provider exposes a write-through read cursor.",
           "type": "boolean"
@@ -840,6 +844,10 @@
           "description": "Whether this provider supports channel, thread-list, and flattened timelines.",
           "type": "boolean"
         },
+        "upstream_clear_supported": {
+          "description": "Whether this provider can clear its own unread state as this server ingests messages.\n`#232 upstream-mark-read`. Sent only when true.",
+          "type": "boolean"
+        },
         "upstream_read_mark_supported": {
           "description": "Whether this provider exposes a write-through read cursor.",
           "type": "boolean"
@@ -1210,6 +1218,204 @@
         }
       ]
     },
+    "UpstreamClearAttemptView": {
+      "description": "One push, as Settings shows it. `#232 upstream-mark-read`.",
+      "properties": {
+        "at_ms": {
+          "description": "When it was made, in milliseconds since the Unix epoch.",
+          "format": "int64",
+          "type": "integer"
+        },
+        "error": {
+          "description": "Why it failed, in words.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "message_at_ms": {
+          "description": "That message's instant, in milliseconds since the Unix epoch.",
+          "format": "int64",
+          "type": "integer"
+        },
+        "message_id": {
+          "$ref": "#/$defs/MessageId",
+          "description": "The newest ingested message it was for."
+        },
+        "previous": {
+          "description": "The provider's cursor before it, as the provider wrote it.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "result": {
+          "$ref": "#/$defs/UpstreamClearResult",
+          "description": "What it came to."
+        },
+        "target": {
+          "description": "Where the provider's cursor was moved to, or would have been, as the provider wrote it.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "at_ms",
+        "message_id",
+        "message_at_ms",
+        "result"
+      ],
+      "type": "object"
+    },
+    "UpstreamClearMode": {
+      "description": "Whether the server clears one channel's unread state at its chat provider as it ingests\nmessages. `#232 upstream-mark-read`.\n\nThe ONE exception to \"read state is ours\" above, and it is one-way and opt-in per channel: with\nit on, every message this server receives in that channel is also marked read in the provider's\nown client, so a channel the owner reads here stops crowding his unread list there. Nothing is\never read back, and this server's own read marks and Done state are not touched.",
+      "oneOf": [
+        {
+          "const": "off",
+          "description": "Nothing is written to the provider. The default, and what no row means.",
+          "type": "string"
+        },
+        {
+          "const": "dry_run",
+          "description": "Everything is decided and logged as if it were on, and nothing is written to the provider.",
+          "type": "string"
+        },
+        {
+          "const": "on",
+          "description": "The provider's read cursor is moved through each newest ingested message.",
+          "type": "string"
+        }
+      ]
+    },
+    "UpstreamClearResult": {
+      "description": "What one automatic upstream clear came to. `#232 upstream-mark-read`.",
+      "oneOf": [
+        {
+          "const": "advanced",
+          "description": "The provider's cursor moved forward to the message.",
+          "type": "string"
+        },
+        {
+          "const": "already_read",
+          "description": "The provider's cursor was already at or past the message, so nothing moved.",
+          "type": "string"
+        },
+        {
+          "const": "dry_run",
+          "description": "A dry run: the server worked out where the cursor would move and wrote nothing.",
+          "type": "string"
+        },
+        {
+          "const": "failed",
+          "description": "The provider or the bridge failed; the server retries with a growing wait.",
+          "type": "string"
+        },
+        {
+          "const": "skipped",
+          "description": "The bridge no longer holds that message; the server waits for a newer one.",
+          "type": "string"
+        },
+        {
+          "const": "unavailable",
+          "description": "The provider cannot clear this channel at all, such as one thread of a larger space.",
+          "type": "string"
+        }
+      ]
+    },
+    "UpstreamClearState": {
+      "description": "Whether this server clears one channel's unread state at its chat provider, and what it last\ndid: `GET` and `PUT /api/v1/channels/{id}/upstream-clear`. `#232 upstream-mark-read`.\n\nEverything here is the server's own record. The provider's cursor is never read back except\nas the answer to a push, so `pushed` and `last` say what this server did, not what the owner\nhas since read in the provider's own client.",
+      "properties": {
+        "channel": {
+          "$ref": "#/$defs/ChannelInfo",
+          "description": "The channel it is about."
+        },
+        "enabled_at_ms": {
+          "description": "When it was turned on or to a dry run, in milliseconds since the Unix epoch, while it is.",
+          "format": "int64",
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "failures": {
+          "description": "Failed attempts in a row.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "last": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/UpstreamClearAttemptView"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The most recent attempt of any kind."
+        },
+        "mode": {
+          "$ref": "#/$defs/UpstreamClearMode",
+          "description": "What the owner chose. Off unless set."
+        },
+        "pending": {
+          "description": "Whether a message is waiting to be pushed.",
+          "type": "boolean"
+        },
+        "previous_cursor": {
+          "description": "The provider's cursor before this server first moved it, for a manual undo.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "provider_name": {
+          "description": "The name of the channel's chat provider, for the words on the control.",
+          "type": "string"
+        },
+        "pushed": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/UpstreamClearAttemptView"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The newest push the provider's cursor is known to cover because of this server."
+        },
+        "retry_at_ms": {
+          "description": "When the next retry is due, in milliseconds since the Unix epoch, after a failure.",
+          "format": "int64",
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "supported": {
+          "description": "Whether the channel's provider can do this at all. When false the mode is always off.",
+          "type": "boolean"
+        },
+        "unavailable": {
+          "description": "Why the provider cannot do this for this channel, once it has said so.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "channel",
+        "provider_name",
+        "supported",
+        "mode",
+        "failures",
+        "pending"
+      ],
+      "type": "object"
+    },
     "UserId": {
       "description": "A Discord user snowflake, as a string.\n\nKept distinct from [`MessageId`] and [`ChannelId`] so the three cannot be passed for one\nanother: they are all decimal snowflakes, and a wrong one is silently plausible.",
       "type": "string"
@@ -1537,6 +1743,9 @@
     },
     {
       "$ref": "#/$defs/PinChangeResponse"
+    },
+    {
+      "$ref": "#/$defs/UpstreamClearState"
     }
   ],
   "description": "Generated from vibe-talk/src/contract.rs by `make -C vibe-talk contract`. Do not edit.",

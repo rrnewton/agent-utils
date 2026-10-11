@@ -17,12 +17,13 @@ use vibe_talk::contract::{
     ApiErrorBody, ClientConfigResponse, CommittedPostResponse, LiveDeleteEvent, LiveDelivery,
     LiveMessageEvent, LiveResetEvent, NoiseRules, PendingPost, PendingPostResponse,
     PinChangeResponse, PinsResponse, ProviderDescription, ReplyDismissals, TimelineResponse,
-    TokenScope, TranscriptRole, VibeTalkV1ClientFrame, VibeTalkV1ServerFrame,
+    TokenScope, TranscriptRole, UpstreamClearAttemptView, UpstreamClearState,
+    VibeTalkV1ClientFrame, VibeTalkV1ServerFrame,
 };
 use vibe_talk::conversation::{VoiceDescription, VoiceSession};
 use vibe_talk::model::{ChannelId, ChannelInfo, Message, MessageId, Reaction, UserId};
 use vibe_talk::speech::{Description, Playback};
-use vibe_talk::store::{Pin, PinSnapshot};
+use vibe_talk::store::{Pin, PinSnapshot, UpstreamClearMode, UpstreamClearResult};
 use vibe_talk::threads::{MessageThread, ThreadSummary, TimelineDelta, TimelinePage, TimelineView};
 
 fn contract_dir() -> PathBuf {
@@ -183,6 +184,7 @@ fn client_config(
         channel_registration_supported: full,
         channel_discovery_supported: full,
         upstream_read_mark_supported: full,
+        upstream_clear_supported: full,
         threading_supported: full,
         idempotent_posts_supported: full,
         speech_prep_enabled: full,
@@ -193,6 +195,7 @@ fn client_config(
                 channel_registration_supported: false,
                 channel_discovery_supported: false,
                 upstream_read_mark_supported: false,
+                upstream_clear_supported: full,
                 threading_supported: full,
                 idempotent_posts_supported: full,
                 live_delivery,
@@ -206,6 +209,7 @@ fn client_config(
                 channel_registration_supported: full,
                 channel_discovery_supported: full,
                 upstream_read_mark_supported: false,
+                upstream_clear_supported: false,
                 threading_supported: true,
                 idempotent_posts_supported: false,
                 live_delivery: LiveDelivery::Poll,
@@ -484,6 +488,76 @@ fn samples() -> Value {
                 unpinned: Vec::new(),
                 revision: 1_790_000_000_001,
                 pins_notice: "pins are this server's own",
+            }),
+        ],
+        // `#232 upstream-mark-read`: a channel never set, one that pushed and is failing now, and
+        // one its provider refused, so every optional field is seen present and absent.
+        "UpstreamClearState": [
+            to(&UpstreamClearState {
+                channel: channel(),
+                provider_name: "Google Chat".into(),
+                supported: true,
+                mode: UpstreamClearMode::Off,
+                enabled_at_ms: None,
+                pushed: None,
+                previous_cursor: None,
+                last: None,
+                failures: 0,
+                pending: false,
+                retry_at_ms: None,
+                unavailable: None,
+            }),
+            to(&UpstreamClearState {
+                channel: channel(),
+                provider_name: "Google Chat".into(),
+                supported: true,
+                mode: UpstreamClearMode::On,
+                enabled_at_ms: Some(1_790_000_000_000),
+                pushed: Some(UpstreamClearAttemptView {
+                    at_ms: 1_790_000_010_000,
+                    message_id: MessageId("300".into()),
+                    message_at_ms: 1_790_000_005_000,
+                    result: UpstreamClearResult::Advanced,
+                    target: Some("2026-09-25T12:00:00Z".into()),
+                    previous: Some("2026-09-25T11:00:00Z".into()),
+                    error: None,
+                }),
+                previous_cursor: Some("2026-09-25T11:00:00Z".into()),
+                last: Some(UpstreamClearAttemptView {
+                    at_ms: 1_790_000_060_000,
+                    message_id: MessageId("301".into()),
+                    message_at_ms: 1_790_000_050_000,
+                    result: UpstreamClearResult::Failed,
+                    target: None,
+                    previous: None,
+                    error: Some("Google Chat returned HTTP 502: mark-read failed".into()),
+                }),
+                failures: 1,
+                pending: true,
+                retry_at_ms: Some(1_790_000_090_000),
+                unavailable: None,
+            }),
+            to(&UpstreamClearState {
+                channel: channel(),
+                provider_name: "Google Chat".into(),
+                supported: true,
+                mode: UpstreamClearMode::DryRun,
+                enabled_at_ms: Some(1_790_000_000_000),
+                pushed: None,
+                previous_cursor: None,
+                last: Some(UpstreamClearAttemptView {
+                    at_ms: 1_790_000_010_000,
+                    message_id: MessageId("300".into()),
+                    message_at_ms: 1_790_000_005_000,
+                    result: UpstreamClearResult::Unavailable,
+                    target: None,
+                    previous: None,
+                    error: Some("one thread of a larger space".into()),
+                }),
+                failures: 0,
+                pending: false,
+                retry_at_ms: None,
+                unavailable: Some("one thread of a larger space".into()),
             }),
         ],
         "VibeTalkV1ClientFrame": [
