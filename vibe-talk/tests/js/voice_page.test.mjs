@@ -36416,6 +36416,11 @@ test("THE WARNING is in the markup beside the choice, never hidden, and says wha
     assert.fail("no warning in web/voice.html"))[1].replace(/<[^>]+>/g, " ").replace(/\s+/g, " ");
   assert.match(warning, /EVERY message in this channel read/);
   assert.match(warning, /including messages from people/);
+  // The service's marker covers the whole channel, so the first push clears the backlog whether
+  // or not "clear now" is ticked. An owner who leaves it unticked to keep his unread messages from
+  // people must be told, here, that they go anyway.
+  assert.match(warning,
+    /The first message vibe-talk receives after it is on also marks everything already unread there read, people's messages too\./);
   assert.match(warning, /Replies inside threads .* not cleared/);
   assert.match(warning, /vibe-talk's own unread and Done state are not changed/);
   assert.ok(markupHolds("upstream-clear", "upstream-clear-warning"));
@@ -36448,7 +36453,9 @@ test("TURNING IT ON is a deliberate Save, can clear what is unread now, and draw
   await page.el("upstream-clear-mode").dispatch("change");
   assert.deepEqual(page.upstreamClearCalls, [`GET ${CHANNEL.id}`], "choosing a mode saved it by itself");
   assert.equal(page.el("upstream-clear-now-row").hidden, false, "clear-now is not offered when turning it on");
-  assert.match(page.el("upstream-clear-now-label").textContent, /mark what is unread there now/);
+  // The box is about WHEN the backlog is cleared, never WHETHER: unticked, the next message clears it.
+  assert.equal(page.el("upstream-clear-now-label").textContent,
+    "Mark what is unread there now, instead of at the next message");
   assert.equal(page.el("upstream-clear-save").disabled, false);
   await page.el("upstream-clear-now").setChecked(true);
   await page.el("upstream-clear-save").click();
@@ -36457,7 +36464,8 @@ test("TURNING IT ON is a deliberate Save, can clear what is unread now, and draw
   assert.equal(page.el("upstream-clear-mode").value, "on");
   assert.equal(page.el("upstream-clear-now").checked, false, "clear-now stayed ticked for the next save");
   assert.equal(page.el("upstream-clear-save").disabled, true);
-  assert.match(page.el("upstream-clear-state").textContent, /newest message is marked read in Google Chat shortly/);
+  assert.match(page.el("upstream-clear-state").textContent,
+    /newest message, and everything before it, is marked read in Google Chat shortly/);
 
   // The push is the server's, in the background; the box asks again shortly to show what it did.
   page.upstreamClear.set(CHANNEL.id, {
@@ -36507,8 +36515,10 @@ test("the status line says a dry run wrote nothing, a failure and its retry, and
       /^Failing since .*: Google Chat returned HTTP 502: mark-read failed\. Trying again at /],
     [{ mode: "on", unavailable: "this channel is one thread of a larger space" },
       /^Not available for this channel: this channel is one thread of a larger space\.$/],
-    [{ mode: "on", pending: true }, /^On\. The newest message is marked read in Google Chat shortly\.$/],
-    [{ mode: "on" }, /^On\. The next message vibe-talk receives here is marked read in Google Chat\.$/],
+    [{ mode: "on", pending: true },
+      /^On\. The newest message, and everything before it, is marked read in Google Chat shortly\.$/],
+    [{ mode: "on" },
+      /^On\. When the next message arrives here, it and everything before it are marked read in Google Chat\.$/],
   ];
   for (const [state, said] of cases) {
     const page = await clearingPage((page) => {

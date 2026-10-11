@@ -23420,8 +23420,8 @@ function upstreamClearSentence(view, service) {
   }
   if (pushed) return `On. ${through}${waiting}${undo}`;
   return view.pending
-    ? `On. The newest message is marked read in ${service} shortly.`
-    : `On. The next message vibe-talk receives here is marked read in ${service}.`;
+    ? `On. The newest message, and everything before it, is marked read in ${service} shortly.`
+    : `On. When the next message arrives here, it and everything before it are marked read in ${service}.`;
 }
 
 /** Whether Save would change anything: another mode, or a clear-now asked for. */
@@ -23437,7 +23437,9 @@ function renderUpstreamClearChoice() {
   const chosen = el("upstream-clear-mode").value;
   const stored = upstreamClear && upstreamClear.view ? upstreamClear.view.mode : "off";
   // Offered when turning it on or to a dry run from another mode, and on the mode in force, as a
-  // way to do it now for what is already there.
+  // way to do it now for what is already there. It is about WHEN, never whether: the service's
+  // marker covers the whole channel, so the first push clears what is already unread either way,
+  // and the label must not suggest that leaving it unticked keeps anything unread.
   el("upstream-clear-now-row").hidden = chosen === "off";
   if (chosen === "off") el("upstream-clear-now").checked = false;
   el("upstream-clear-now-label").textContent =
@@ -23445,7 +23447,7 @@ function renderUpstreamClearChoice() {
       ? "Also try it now on the newest message"
       : stored === "on"
         ? "Also mark the newest message read there now"
-        : "Also mark what is unread there now";
+        : "Mark what is unread there now, instead of at the next message";
   el("upstream-clear-save").disabled = !upstreamClearChanged();
 }
 

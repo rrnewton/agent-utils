@@ -967,9 +967,10 @@
                 <p id="upstream-clear-warning" class="hint">
                   Marks EVERY message in this channel read in
                   <span id="upstream-clear-warning-provider">the chat service</span> as soon as
-                  vibe-talk receives it, including messages from people. Replies inside threads
-                  keep their own unread state there and are not cleared. vibe-talk's own unread
-                  and Done state are not changed.
+                  vibe-talk receives it, including messages from people. The first message
+                  vibe-talk receives after it is on also marks everything already unread there
+                  read, people's messages too. Replies inside threads keep their own unread state
+                  there and are not cleared. vibe-talk's own unread and Done state are not changed.
                 </p>
                 <label id="upstream-clear-now-row" class="row" for="upstream-clear-now" hidden>
                   <input id="upstream-clear-now" type="checkbox" />
