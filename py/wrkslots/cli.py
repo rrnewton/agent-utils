@@ -36993,13 +36993,18 @@ def _validation_recovery_target(
 # private copy of exactly these files. dev-hermit's run_registry.py has imported
 # reverie_node since 2026-09-20 (dev-hermit 01991d70); without it every frozen
 # handle was refused with ModuleNotFoundError, and frozen validation checkouts
-# were never removed (94 GB across nine of them on 2026-10-11).
+# were never removed (94 GB across nine of them on 2026-10-11). Each file is
+# copied to its tracked path under the private root: reverie_node.py imports
+# bounded_capture from ../lib relative to itself, so a flat copy still failed
+# with "No module named 'bounded_capture'" once reverie_node.py was present.
 _FROZEN_VALIDATION_PARSER_FILES = (
     "ci-hub/validate/run_registry.py",
     "ci-hub/validate/service_result.py",
     "ci-hub/validate/final_validate_status.py",
     "ci-hub/validate/reverie_node.py",
+    "ci-hub/lib/bounded_capture.py",
 )
+_FROZEN_VALIDATION_PARSER_ENTRY = "ci-hub/validate/run_registry.py"
 _FROZEN_VALIDATION_PARSER_BOOTSTRAP = (
     "import runpy,sys\n"
     "script=sys.argv.pop(1)\n"
@@ -37429,9 +37434,14 @@ def _canonical_frozen_validation_record(
         parser_root = Path(raw_temp)
         parser_root.chmod(0o700)
         snapshot = parser_root / "record.json"
-        parser_inputs = tuple(
-            (Path(relative).name, payload) for relative, payload in blobs.items()
-        ) + ((snapshot.name, contents),)
+        parser_inputs = tuple(blobs.items()) + ((snapshot.name, contents),)
+        directories = sorted(
+            {parent for relative in blobs for parent in Path(relative).parents
+             if parent != Path(".")},
+            key=lambda directory: len(directory.parts),
+        )
+        for directory in directories:
+            (parser_root / directory).mkdir(mode=0o700)
         for name, payload in parser_inputs:
             destination = parser_root / name
             descriptor = os.open(
@@ -37448,7 +37458,8 @@ def _canonical_frozen_validation_record(
                 os.fsync(descriptor)
             finally:
                 os.close(descriptor)
-        parser_root.chmod(0o500)
+        for directory in (*directories, Path(".")):
+            (parser_root / directory).chmod(0o500)
         try:
             returncode, stdout, stderr = _run_bounded_read_only_command(
                 (
@@ -37457,7 +37468,7 @@ def _canonical_frozen_validation_record(
                     "-B",
                     "-c",
                     _FROZEN_VALIDATION_PARSER_BOOTSTRAP,
-                    str(parser_root / "run_registry.py"),
+                    str(parser_root / _FROZEN_VALIDATION_PARSER_ENTRY),
                     "inspect",
                     "--path",
                     str(snapshot),
@@ -37470,7 +37481,8 @@ def _canonical_frozen_validation_record(
         except Refusal as exc:
             command_error = exc
         finally:
-            parser_root.chmod(0o700)
+            for directory in (Path("."), *directories):
+                (parser_root / directory).chmod(0o700)
 
     _authenticated_frozen_parser_blobs(
         config,

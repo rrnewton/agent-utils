@@ -509,9 +509,19 @@ FINAL_VALIDATE_STATUS_EXIT_CODES = {"PASSED": 0, "FAILED": 1, "COULD_NOT_RUN": 7
 
 # The fixture parser imports this module as dev-hermit's run_registry.py imports
 # reverie_node, so a parser copy without it fails here as it failed in
-# production (2026-10-11).
+# production (2026-10-11). Like dev-hermit's reverie_node.py, it imports
+# bounded_capture from ../lib relative to its own file, so a copy that is not
+# laid out at the tracked paths fails as the flat copy did in production.
 _FROZEN_REVERIE_NODE = """\
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
+import bounded_capture  # noqa: E402
 COUNT_CONTEXT_FIELDS = ()
+"""
+
+_FROZEN_BOUNDED_CAPTURE = """\
+CAPTURE_LIMIT = 1
 """
 
 
@@ -532,6 +542,11 @@ def install_frozen_validation_parser(
         textwrap.dedent(_FROZEN_FINAL_VALIDATE_STATUS), encoding="utf-8"
     )
     (parser_directory / "reverie_node.py").write_text(_FROZEN_REVERIE_NODE, encoding="utf-8")
+    library_directory = project / "ci-hub" / "lib"
+    library_directory.mkdir(parents=True, exist_ok=True)
+    (library_directory / "bounded_capture.py").write_text(
+        _FROZEN_BOUNDED_CAPTURE, encoding="utf-8"
+    )
     if not (project / ".git").exists():
         git(project, "init", "--initial-branch=main")
         git(project, "config", "user.name", "Wrkslots Test")
