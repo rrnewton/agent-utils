@@ -201,6 +201,26 @@ pub enum SourceClaim {
     Never,
 }
 
+/// What one automatic upstream clear did, or in a dry run would have done. `#232 upstream-mark-read`.
+///
+/// The provider's own answer, carried through unchanged: the server logs it and shows it in
+/// Settings, and never infers a cursor the provider did not report.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UpstreamClearOutcome {
+    /// What the cursor covers at the provider, such as `space`.
+    pub scope: String,
+    /// The instant the cursor was moved to (or would have been, in a dry run), as the provider
+    /// wrote it.
+    pub target: String,
+    /// The provider's cursor before this call, when it could be read. `None` means it had none.
+    pub previous: Option<String>,
+    /// Whether the cursor actually moved. False when it was already at or past `target`, and
+    /// always false in a dry run.
+    pub advanced: bool,
+    /// Whether this was a dry run, so nothing was written at the provider.
+    pub dry_run: bool,
+}
+
 /// Read and post access to configured chat channels.
 #[async_trait]
 pub trait ChatClient: Send + Sync {
@@ -483,6 +503,39 @@ pub trait ChatClient: Send + Sync {
     ) -> Result<(), ChatError> {
         Err(ChatError::Refused(
             "the configured chat provider does not support upstream read marks".to_owned(),
+        ))
+    }
+
+    /// Whether this provider can clear its own unread state automatically, as vibe-talk ingests
+    /// messages. `#232 upstream-mark-read`.
+    ///
+    /// Separate from [`ChatClient::supports_upstream_read_mark`], the owner's own manual mark:
+    /// the automatic path runs with nobody watching, so it needs a provider endpoint that yields
+    /// to the owner's actions, supports a dry run, and refuses a channel where a provider-wide
+    /// cursor would clear messages this server never received. False by default.
+    fn supports_upstream_clear(&self) -> bool {
+        false
+    }
+
+    /// Move the provider's read cursor through `through`, or in a dry run report where it would
+    /// move. `#232 upstream-mark-read`.
+    ///
+    /// Never moves the cursor backwards: the provider compares with its current cursor first.
+    /// vibe-talk's own read marks and Done state are not touched.
+    ///
+    /// # Errors
+    ///
+    /// [`ChatError::Refused`] when unsupported; otherwise the provider's failure. A provider
+    /// answers HTTP 409 for a channel the cursor cannot be moved for, and HTTP 404 when it no
+    /// longer holds the message.
+    async fn clear_upstream_through(
+        &self,
+        _channel: &ChannelId,
+        _through: &MessageId,
+        _dry_run: bool,
+    ) -> Result<UpstreamClearOutcome, ChatError> {
+        Err(ChatError::Refused(
+            "the configured chat provider cannot clear its unread state automatically".to_owned(),
         ))
     }
 }

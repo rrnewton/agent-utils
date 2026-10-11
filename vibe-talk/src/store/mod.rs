@@ -373,6 +373,213 @@ pub struct ChannelAlias {
     pub set_at_ms: i64,
 }
 
+/// Whether the server clears one channel's unread state at its chat provider as it ingests
+/// messages. `#232 upstream-mark-read`.
+///
+/// The ONE exception to "read state is ours" above, and it is one-way and opt-in per channel: with
+/// it on, every message this server receives in that channel is also marked read in the provider's
+/// own client, so a channel the owner reads here stops crowding his unread list there. Nothing is
+/// ever read back, and this server's own read marks and Done state are not touched.
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum UpstreamClearMode {
+    /// Nothing is written to the provider. The default, and what no row means.
+    #[default]
+    Off,
+    /// Everything is decided and logged as if it were on, and nothing is written to the provider.
+    DryRun,
+    /// The provider's read cursor is moved through each newest ingested message.
+    On,
+}
+
+impl UpstreamClearMode {
+    /// The stored and logged spelling, the same as the wire's.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::DryRun => "dry_run",
+            Self::On => "on",
+        }
+    }
+
+    /// The mode with this stored spelling.
+    #[must_use]
+    pub fn parse(text: &str) -> Option<Self> {
+        match text {
+            "off" => Some(Self::Off),
+            "dry_run" => Some(Self::DryRun),
+            "on" => Some(Self::On),
+            _ => None,
+        }
+    }
+}
+
+/// What one automatic upstream clear came to. `#232 upstream-mark-read`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum UpstreamClearResult {
+    /// The provider's cursor moved forward to the message.
+    Advanced,
+    /// The provider's cursor was already at or past the message, so nothing moved.
+    AlreadyRead,
+    /// A dry run: the server worked out where the cursor would move and wrote nothing.
+    DryRun,
+    /// The provider or the bridge failed; the server retries with a growing wait.
+    Failed,
+    /// The bridge no longer holds that message; the server waits for a newer one.
+    Skipped,
+    /// The provider cannot clear this channel at all, such as one thread of a larger space.
+    Unavailable,
+}
+
+impl UpstreamClearResult {
+    /// The stored and logged spelling, the same as the wire's.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Advanced => "advanced",
+            Self::AlreadyRead => "already_read",
+            Self::DryRun => "dry_run",
+            Self::Failed => "failed",
+            Self::Skipped => "skipped",
+            Self::Unavailable => "unavailable",
+        }
+    }
+
+    /// The result with this stored spelling.
+    #[must_use]
+    pub fn parse(text: &str) -> Option<Self> {
+        [
+            Self::Advanced,
+            Self::AlreadyRead,
+            Self::DryRun,
+            Self::Failed,
+            Self::Skipped,
+            Self::Unavailable,
+        ]
+        .into_iter()
+        .find(|result| result.as_str() == text)
+    }
+
+    /// Whether the provider's cursor is now at or past the message.
+    #[must_use]
+    pub fn covers(self) -> bool {
+        matches!(self, Self::Advanced | Self::AlreadyRead)
+    }
+}
+
+/// One attempt to clear a channel's unread state upstream, as the server records it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UpstreamClearAttempt {
+    /// When it was made, in milliseconds since the Unix epoch.
+    pub at_ms: i64,
+    /// The newest ingested message it was for.
+    pub message: MessageId,
+    /// That message's own instant, in milliseconds since the Unix epoch: with its numeric id, the
+    /// position a later attempt must be past.
+    pub message_ms: i64,
+    /// What it came to.
+    pub result: UpstreamClearResult,
+    /// The provider's cursor target, as the provider wrote it, when it answered.
+    pub target: Option<String>,
+    /// The provider's cursor before the attempt, when it answered with one.
+    pub previous: Option<String>,
+    /// Why it failed, in words, when it did.
+    pub error: Option<String>,
+}
+
+/// One channel's upstream-clear setting and what the server last did with it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UpstreamClearSetting {
+    /// The channel.
+    pub channel: ChannelId,
+    /// What the owner chose.
+    pub mode: UpstreamClearMode,
+    /// When the mode was last set, in milliseconds since the Unix epoch.
+    pub set_at_ms: i64,
+    /// When it was last turned on or to a dry run from off, while it is not off.
+    pub enabled_at_ms: Option<i64>,
+    /// The newest message the provider's cursor is known to cover because of this server: an
+    /// attempt that advanced or found it already read. It only moves forward, and survives the
+    /// mode being turned off, so turning it on again never moves the cursor back.
+    pub pushed: Option<UpstreamClearAttempt>,
+    /// The provider's cursor as it was before this server first moved it, for a manual undo.
+    pub previous_cursor: Option<String>,
+    /// The most recent attempt of any kind.
+    pub last: Option<UpstreamClearAttempt>,
+    /// Failed attempts in a row since the last one that was not a failure.
+    pub failures: u32,
+}
+
+impl UpstreamClearAttempt {
+    /// Where its message sits in the channel: its instant, then its numeric id for two messages
+    /// in the same millisecond.
+    #[must_use]
+    pub fn position(&self) -> (i64, u64) {
+        (self.message_ms, self.message.numeric().unwrap_or(0))
+    }
+}
+
+impl UpstreamClearSetting {
+    /// A channel's setting before anything was ever stored for it.
+    #[must_use]
+    pub fn unset(channel: ChannelId) -> Self {
+        Self {
+            channel,
+            mode: UpstreamClearMode::Off,
+            set_at_ms: 0,
+            enabled_at_ms: None,
+            pushed: None,
+            previous_cursor: None,
+            last: None,
+            failures: 0,
+        }
+    }
+
+    /// Change the mode, as [`StateStore::set_upstream_clear_mode`] describes. Both stores call
+    /// this, so they cannot disagree about the rule.
+    pub fn change_mode(&mut self, mode: UpstreamClearMode, at_ms: i64) {
+        if mode == UpstreamClearMode::Off {
+            self.enabled_at_ms = None;
+        } else if self.mode == UpstreamClearMode::Off || self.enabled_at_ms.is_none() {
+            self.enabled_at_ms = Some(at_ms);
+        }
+        if mode != self.mode {
+            self.failures = 0;
+        }
+        self.mode = mode;
+        self.set_at_ms = at_ms;
+    }
+
+    /// Fold in one attempt, as [`StateStore::record_upstream_clear`] describes. Both stores call
+    /// this, so they cannot disagree about the rule.
+    pub fn record(&mut self, attempt: &UpstreamClearAttempt) {
+        match attempt.result {
+            UpstreamClearResult::Failed => self.failures = self.failures.saturating_add(1),
+            UpstreamClearResult::Advanced
+            | UpstreamClearResult::AlreadyRead
+            | UpstreamClearResult::DryRun => self.failures = 0,
+            UpstreamClearResult::Skipped | UpstreamClearResult::Unavailable => {}
+        }
+        if attempt.result.covers() {
+            match &self.pushed {
+                None => {
+                    self.previous_cursor.clone_from(&attempt.previous);
+                    self.pushed = Some(attempt.clone());
+                }
+                Some(pushed) if attempt.position() > pushed.position() => {
+                    self.pushed = Some(attempt.clone());
+                }
+                Some(_) => {}
+            }
+        }
+        self.last = Some(attempt.clone());
+    }
+}
+
 /// A channel the owner added from inside the app.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AddedChannel {
@@ -1224,6 +1431,53 @@ pub trait StateStore: Send + Sync {
     /// [`StoreError::Unavailable`] when no store is configured; [`StoreError::Backend`] on a
     /// write failure.
     async fn forget_summaries_except(&self, version: &str) -> Result<u64, StoreError>;
+
+    /// Every channel's upstream-clear setting, off ones included, in channel order.
+    /// `#232 upstream-mark-read`.
+    ///
+    /// **Not covered by [`Retention`]**: one row per channel at most, which the owner sets.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Unavailable`] when no store is configured; [`StoreError::Backend`] on a read
+    /// failure.
+    async fn upstream_clear_settings(&self) -> Result<Vec<UpstreamClearSetting>, StoreError>;
+
+    /// Set one channel's upstream-clear mode, returning the setting as stored.
+    ///
+    /// Moving from off to either other mode stamps `enabled_at_ms`; any change of mode resets the
+    /// failure count, because it is a fresh decision. What was pushed, and the cursor from before
+    /// the first push, are kept whatever the mode: they are what keeps a later push from moving
+    /// the provider's cursor backwards, and what an undo needs.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Unavailable`] when no store is configured; [`StoreError::Backend`] on a
+    /// write failure.
+    async fn set_upstream_clear_mode(
+        &self,
+        channel: &ChannelId,
+        mode: UpstreamClearMode,
+        at_ms: i64,
+    ) -> Result<UpstreamClearSetting, StoreError>;
+
+    /// Record one attempt against a channel that has a setting. A channel with none is left
+    /// without one: an attempt never creates a setting.
+    ///
+    /// A failure adds one to the failure count; an attempt that advanced, found the message
+    /// already read, or was a dry run resets it. An attempt that covers its message moves
+    /// `pushed` forward, never back, and the first one also records the provider's previous
+    /// cursor.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Unavailable`] when no store is configured; [`StoreError::Backend`] on a
+    /// write failure.
+    async fn record_upstream_clear(
+        &self,
+        channel: &ChannelId,
+        attempt: &UpstreamClearAttempt,
+    ) -> Result<(), StoreError>;
 
     /// Erase everything this store holds.
     ///

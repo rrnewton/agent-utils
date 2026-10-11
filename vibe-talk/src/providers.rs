@@ -208,6 +208,14 @@ impl ChatRouter {
             .map(|index| self.entries[index].key.clone())
     }
 
+    /// The provider that owns `channel`, when it is known, for a question about that channel's
+    /// own capabilities rather than the deployment's. `#232 upstream-mark-read`.
+    #[must_use]
+    pub fn client_for(&self, channel: &ChannelId) -> Option<&Arc<dyn ChatClient>> {
+        self.index_for(channel)
+            .map(|index| &self.entries[index].client)
+    }
+
     /// Replace the channel routes with those `channels` declare.
     ///
     /// Called with every channel the server answers for whenever that list changes, so a removed
@@ -668,6 +676,24 @@ impl ChatClient for ChatRouter {
         self.route(channel)?
             .client
             .mark_read_upstream(channel, through)
+            .await
+    }
+
+    fn supports_upstream_clear(&self) -> bool {
+        self.entries
+            .iter()
+            .any(|entry| entry.client.supports_upstream_clear())
+    }
+
+    async fn clear_upstream_through(
+        &self,
+        channel: &ChannelId,
+        through: &MessageId,
+        dry_run: bool,
+    ) -> Result<crate::chat::UpstreamClearOutcome, ChatError> {
+        self.route(channel)?
+            .client
+            .clear_upstream_through(channel, through, dry_run)
             .await
     }
 }

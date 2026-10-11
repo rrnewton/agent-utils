@@ -29,7 +29,8 @@ use async_trait::async_trait;
 use super::{
     now_ms, ChannelAlias, ConversationId, ConversationSummary, Pin, PinChange, PinSnapshot, Pins,
     ReadMark, RecordedTurn, Retention, StateStore, StoreError, SummaryKey, TranscriptCursor,
-    TranscriptPage, Turn, MAX_PINS_PER_CHANNEL, MAX_TRANSCRIPT_PAGE, MAX_TURN_CHARS,
+    TranscriptPage, Turn, UpstreamClearAttempt, UpstreamClearMode, UpstreamClearSetting,
+    MAX_PINS_PER_CHANNEL, MAX_TRANSCRIPT_PAGE, MAX_TURN_CHARS,
 };
 use crate::model::{ChannelId, MessageId};
 
@@ -74,6 +75,8 @@ struct State {
     next_pin_seq: u64,
     /// Channel to its pin revision; absent is `0`, as a missing row is in the real store.
     pin_revisions: BTreeMap<String, i64>,
+    /// Channel to its upstream-clear setting. `#232 upstream-mark-read`.
+    upstream_clear: BTreeMap<String, UpstreamClearSetting>,
     next_summary_seq: u64,
     fail_next: Option<String>,
     appended: usize,
@@ -879,9 +882,45 @@ impl StateStore for FakeStore {
         Ok((before - state.summaries.len()) as u64)
     }
 
+    async fn upstream_clear_settings(&self) -> Result<Vec<UpstreamClearSetting>, StoreError> {
+        let mut state = self.lock();
+        armed(&mut state)?;
+        Ok(state.upstream_clear.values().cloned().collect())
+    }
+
+    async fn set_upstream_clear_mode(
+        &self,
+        channel: &ChannelId,
+        mode: UpstreamClearMode,
+        at_ms: i64,
+    ) -> Result<UpstreamClearSetting, StoreError> {
+        let mut state = self.lock();
+        armed(&mut state)?;
+        let setting = state
+            .upstream_clear
+            .entry(channel.as_str().to_owned())
+            .or_insert_with(|| UpstreamClearSetting::unset(channel.clone()));
+        setting.change_mode(mode, at_ms);
+        Ok(setting.clone())
+    }
+
+    async fn record_upstream_clear(
+        &self,
+        channel: &ChannelId,
+        attempt: &UpstreamClearAttempt,
+    ) -> Result<(), StoreError> {
+        let mut state = self.lock();
+        armed(&mut state)?;
+        if let Some(setting) = state.upstream_clear.get_mut(channel.as_str()) {
+            setting.record(attempt);
+        }
+        Ok(())
+    }
+
     async fn purge_everything(&self) -> Result<(), StoreError> {
         let mut state = self.lock();
         armed(&mut state)?;
+        state.upstream_clear.clear();
         state.conversations.clear();
         state.marks.clear();
         state.summaries.clear();

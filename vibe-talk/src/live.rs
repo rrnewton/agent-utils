@@ -229,6 +229,10 @@ pub struct LiveHub {
     self_posted: Mutex<(VecDeque<MessageId>, BTreeSet<MessageId>)>,
     hinted: Mutex<BTreeMap<Option<String>, BTreeSet<ChannelId>>>,
     hint_generation: watch::Sender<u64>,
+    /// The newest created message per channel the owner set to clear unread at its provider.
+    /// `#232 upstream-mark-read`. Fed on every publish, never waited on: see
+    /// [`crate::upstream_clear`].
+    upstream_clear: std::sync::Arc<crate::upstream_clear::Candidates>,
 }
 
 impl Default for LiveHub {
@@ -239,6 +243,7 @@ impl Default for LiveHub {
             self_posted: Mutex::new((VecDeque::new(), BTreeSet::new())),
             hinted: Mutex::new(BTreeMap::new()),
             hint_generation,
+            upstream_clear: std::sync::Arc::new(crate::upstream_clear::Candidates::new()),
         }
     }
 }
@@ -248,6 +253,12 @@ impl LiveHub {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// The messages waiting to be cleared at their provider. `#232 upstream-mark-read`.
+    #[must_use]
+    pub fn upstream_clear(&self) -> &std::sync::Arc<crate::upstream_clear::Candidates> {
+        &self.upstream_clear
     }
 
     /// Queue one content-free request to poll `channel` now.
@@ -343,6 +354,20 @@ impl LiveHub {
     }
 
     fn publish_inner(&self, channel: &ChannelId, live: LiveMessage, deduplicate: bool) -> bool {
+        // Both producers reach this, so it is where a created message is noted for clearing at
+        // its provider: one map update and a wake-up, after the feed lock is released.
+        let created = (live.kind == LiveKind::Create)
+            .then(|| (live.message.id.clone(), live.message.timestamp.clone()));
+        if !self.publish_to_feed(channel, live, deduplicate) {
+            return false;
+        }
+        if let Some((id, timestamp)) = created {
+            self.upstream_clear.offer_parts(channel, &id, &timestamp);
+        }
+        true
+    }
+
+    fn publish_to_feed(&self, channel: &ChannelId, live: LiveMessage, deduplicate: bool) -> bool {
         let mut feeds = lock(&self.feeds);
         let feed = feeds.entry(channel.clone()).or_insert_with(new_feed);
         if deduplicate {

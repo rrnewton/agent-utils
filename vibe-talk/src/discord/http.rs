@@ -261,6 +261,71 @@ pub fn mark_read_request(
     }
 }
 
+/// Build the optional bridge request that clears its provider's unread state through one message,
+/// automatically, as vibe-talk ingests it. `#232 upstream-mark-read`.
+///
+/// A separate route from [`mark_read_request`], which is the owner's own action: this one runs
+/// with nobody waiting on it, so the bridge serves it behind reads and the owner's actions,
+/// answers a dry run, and refuses a channel where moving the provider's cursor would clear
+/// messages vibe-talk never received.
+#[must_use]
+pub fn upstream_clear_request(
+    api_base: &str,
+    channel: &ChannelId,
+    through: &MessageId,
+    dry_run: bool,
+) -> PreparedRequest {
+    PreparedRequest {
+        method: "POST",
+        url: format!(
+            "{}/channels/{}/upstream-clear",
+            api_base.trim_end_matches('/'),
+            channel.as_str()
+        ),
+        body: Some(serde_json::json!({ "message_id": through.as_str(), "dry_run": dry_run })),
+    }
+}
+
+/// Read the bridge's answer to [`upstream_clear_request`].
+///
+/// # Errors
+///
+/// [`ChatError::Shape`] when `target` or `advanced` is missing, or `previous` is neither a string
+/// nor null. `scope` defaults to `space` and `dry_run` to false.
+pub fn parse_upstream_clear(
+    value: &serde_json::Value,
+) -> Result<crate::chat::UpstreamClearOutcome, ChatError> {
+    let shape = |what: &str| ChatError::Shape(format!("upstream clear answer {what}"));
+    let target = value
+        .get("target")
+        .and_then(serde_json::Value::as_str)
+        .filter(|target| !target.is_empty())
+        .ok_or_else(|| shape("has no target"))?;
+    let advanced = value
+        .get("advanced")
+        .and_then(serde_json::Value::as_bool)
+        .ok_or_else(|| shape("does not say whether the cursor advanced"))?;
+    let previous = match value.get("previous") {
+        None | Some(serde_json::Value::Null) => None,
+        Some(serde_json::Value::String(previous)) => Some(previous.clone()),
+        Some(_) => return Err(shape("has a previous cursor that is not a string")),
+    };
+    Ok(crate::chat::UpstreamClearOutcome {
+        scope: value
+            .get("scope")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("space")
+            .to_owned(),
+        target: target.to_owned(),
+        previous,
+        advanced,
+        dry_run: value
+            .get("dry_run")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false),
+    })
+}
+
 /// Read a [`BotIdentity`] out of Discord's answer to [`identity_request`].
 ///
 /// # Errors
@@ -999,6 +1064,39 @@ impl ChatClient for HttpDiscordClient {
         .await
         .map_err(|error| error.with_provider(self.provider_name()))
     }
+
+    /// The same bridge opt-in as the manual mark, and never against Discord itself, which has no
+    /// such route and no user read state for a bot. `#232 upstream-mark-read`.
+    fn supports_upstream_clear(&self) -> bool {
+        self.upstream_read_marks && !crate::config::is_official_discord_api_base(&self.api_base)
+    }
+
+    async fn clear_upstream_through(
+        &self,
+        channel: &ChannelId,
+        through: &MessageId,
+        dry_run: bool,
+    ) -> Result<crate::chat::UpstreamClearOutcome, ChatError> {
+        async {
+            if !self.supports_upstream_clear() {
+                return Err(ChatError::Refused(
+                    "automatic upstream clearing needs a bridge with upstream read marks enabled"
+                        .to_owned(),
+                ));
+            }
+            let value = self
+                .send(upstream_clear_request(
+                    &self.api_base,
+                    channel,
+                    through,
+                    dry_run,
+                ))
+                .await?;
+            parse_upstream_clear(&value)
+        }
+        .await
+        .map_err(|error| error.with_provider(self.provider_name()))
+    }
 }
 
 #[cfg(test)]
@@ -1320,6 +1418,164 @@ mod tests {
             .await
             .expect("an empty 204 is a successful write");
         server.await.expect("mock server");
+    }
+
+    fn bridge_client(api_base: String, upstream_read_marks: bool) -> HttpDiscordClient {
+        HttpDiscordClient {
+            thread_api: crate::threads::ThreadApi::Off,
+            thread_inventory: threading::InventoryCache::default(),
+            provider_name: "Google Chat".to_owned(),
+            client: reqwest::Client::new(),
+            api_base,
+            bot_token: Secret::new("abc"),
+            request_timeout: std::time::Duration::from_secs(20),
+            channel_registration: false,
+            upstream_read_marks,
+            owner_user_id: None,
+            limiter: RateLimiter::new(),
+        }
+    }
+
+    /// Answer one request on a loopback socket with `response`, handing back what was asked.
+    async fn answer_once(
+        response: &'static str,
+    ) -> (String, tokio::task::JoinHandle<String>) {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind loopback");
+        let address = listener.local_addr().expect("listener address");
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("accept request");
+            let mut request = vec![0_u8; 4096];
+            let read = socket.read(&mut request).await.expect("read request");
+            socket
+                .write_all(response.as_bytes())
+                .await
+                .expect("write response");
+            String::from_utf8_lossy(&request[..read]).into_owned()
+        });
+        (format!("http://{address}"), server)
+    }
+
+    #[test]
+    fn upstream_clear_request_names_the_message_and_whether_it_is_a_dry_run() {
+        // `#232 upstream-mark-read`.
+        let request = upstream_clear_request(
+            "https://bridge.example/api/v10/",
+            &channel(),
+            &MessageId("999".to_owned()),
+            true,
+        );
+        assert_eq!(request.method, "POST");
+        assert_eq!(
+            request.url,
+            "https://bridge.example/api/v10/channels/123/upstream-clear"
+        );
+        assert_eq!(
+            request.body,
+            Some(serde_json::json!({ "message_id": "999", "dry_run": true }))
+        );
+    }
+
+    #[test]
+    fn upstream_clear_answer_is_read_exactly_and_refused_when_it_names_no_target() {
+        let outcome = parse_upstream_clear(&serde_json::json!({
+            "scope": "space",
+            "channel_id": "123",
+            "message_id": "999",
+            "target": "2026-10-11T10:42:00.123000Z",
+            "previous": "2026-10-11T09:00:00Z",
+            "advanced": true,
+            "dry_run": false,
+        }))
+        .expect("a full answer");
+        assert_eq!(
+            outcome,
+            crate::chat::UpstreamClearOutcome {
+                scope: "space".to_owned(),
+                target: "2026-10-11T10:42:00.123000Z".to_owned(),
+                previous: Some("2026-10-11T09:00:00Z".to_owned()),
+                advanced: true,
+                dry_run: false,
+            }
+        );
+        let never_read = parse_upstream_clear(&serde_json::json!({
+            "target": "2026-10-11T10:42:00Z", "previous": null, "advanced": false, "dry_run": true,
+        }))
+        .expect("a space with no cursor yet");
+        assert_eq!(never_read.previous, None);
+        assert!(never_read.dry_run);
+        for broken in [
+            serde_json::json!({ "advanced": true }),
+            serde_json::json!({ "target": "", "advanced": true }),
+            serde_json::json!({ "target": "2026-10-11T10:42:00Z" }),
+            serde_json::json!({ "target": "2026-10-11T10:42:00Z", "advanced": true, "previous": 7 }),
+            serde_json::Value::Null,
+        ] {
+            assert!(
+                matches!(parse_upstream_clear(&broken), Err(ChatError::Shape(_))),
+                "{broken} was accepted"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn upstream_clear_posts_to_the_bridge_and_reads_its_answer() {
+        let (base, server) = answer_once(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\n\
+             Content-Length: 135\r\n\r\n\
+             {\"scope\":\"space\",\"channel_id\":\"123\",\"message_id\":\"999\",\"target\":\"2026-10-11T10:42:00Z\",\"previous\":null,\"advanced\":false,\"dry_run\":true}",
+        )
+        .await;
+        let client = bridge_client(base, true);
+        assert!(client.supports_upstream_clear());
+        let outcome = client
+            .clear_upstream_through(&channel(), &MessageId("999".to_owned()), true)
+            .await
+            .expect("the bridge answered");
+        assert!(outcome.dry_run);
+        assert!(!outcome.advanced);
+        assert_eq!(outcome.target, "2026-10-11T10:42:00Z");
+        let request = server.await.expect("mock server");
+        assert!(
+            request.starts_with("POST /channels/123/upstream-clear HTTP/1.1"),
+            "{request}"
+        );
+        assert!(request.contains(r#""dry_run":true"#), "{request}");
+        assert!(request.contains(r#""message_id":"999""#), "{request}");
+    }
+
+    #[tokio::test]
+    async fn upstream_clear_carries_a_bridge_refusal_through_as_its_status() {
+        let (base, server) = answer_once(
+            "HTTP/1.1 409 Conflict\r\nContent-Type: application/json\r\nConnection: close\r\n\
+             Content-Length: 26\r\n\r\n{\"code\":\"thread_channel\"}\n",
+        )
+        .await;
+        let error = bridge_client(base, true)
+            .clear_upstream_through(&channel(), &MessageId("999".to_owned()), false)
+            .await
+            .expect_err("409 is a refusal");
+        assert!(
+            matches!(error.cause(), ChatError::Status { status: 409, body } if body.contains("thread_channel")),
+            "{error:?}"
+        );
+        server.await.expect("mock server");
+    }
+
+    #[tokio::test]
+    async fn upstream_clear_is_never_offered_against_discord_itself_or_without_the_opt_in() {
+        let official = bridge_client(BASE.to_owned(), true);
+        assert!(!official.supports_upstream_clear());
+        let error = official
+            .clear_upstream_through(&channel(), &MessageId("999".to_owned()), false)
+            .await
+            .expect_err("refused before any request");
+        assert!(matches!(error.cause(), ChatError::Refused(_)), "{error:?}");
+        let not_opted_in = bridge_client("https://bridge.example/api/v10".to_owned(), false);
+        assert!(!not_opted_in.supports_upstream_clear());
     }
 
     #[tokio::test]

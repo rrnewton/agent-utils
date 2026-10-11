@@ -36,7 +36,8 @@ use rusqlite::{Connection, OptionalExtension as _};
 use super::{
     now_ms, ChannelAlias, ConversationId, ConversationSummary, Pin, PinChange, PinSnapshot, Pins,
     ReadMark, RecordedTurn, Retention, Speaker, StateStore, StoreError, SummaryKey,
-    TranscriptCursor, TranscriptPage, Turn, MAX_PINS_PER_CHANNEL, MAX_TRANSCRIPT_PAGE,
+    TranscriptCursor, TranscriptPage, Turn, UpstreamClearAttempt, UpstreamClearMode,
+    UpstreamClearResult, UpstreamClearSetting, MAX_PINS_PER_CHANNEL, MAX_TRANSCRIPT_PAGE,
     MAX_TURN_CHARS,
 };
 use crate::model::{ChannelId, MessageId, UserId};
@@ -236,6 +237,39 @@ pub const MIGRATIONS: &[&str] = &[
     CREATE TABLE pin_revisions (
         channel_id TEXT    PRIMARY KEY NOT NULL,
         revision   INTEGER NOT NULL
+    ) STRICT;
+    ",
+    // v11 — clearing a channel's unread state at its chat provider. `#232 upstream-mark-read`.
+    //
+    // ONE new table and nothing else, for the reason v10 gives. One row per channel at most, and
+    // only for a channel the owner has set, so `Retention` does not reach it; no row is `off`.
+    //
+    // `pushed_*` is the newest message the provider's cursor is known to cover because of this
+    // server, and it outlives the mode being turned off: it is what stops a later push from moving
+    // the provider's cursor backwards. `previous_cursor` is the provider's cursor from before the
+    // first push, kept for a manual undo. `last_*` is the most recent attempt of any kind, for the
+    // status line in Settings. No message text is kept, only ids and instants.
+    "
+    CREATE TABLE upstream_clear (
+        channel_id         TEXT    PRIMARY KEY NOT NULL,
+        mode               TEXT    NOT NULL CHECK (mode IN ('off', 'dry_run', 'on')),
+        set_at_ms          INTEGER NOT NULL,
+        enabled_at_ms      INTEGER,
+        pushed_message_id  TEXT,
+        pushed_message_ms  INTEGER,
+        pushed_result      TEXT,
+        pushed_target      TEXT,
+        pushed_previous    TEXT,
+        pushed_at_ms       INTEGER,
+        previous_cursor    TEXT,
+        last_message_id    TEXT,
+        last_message_ms    INTEGER,
+        last_result        TEXT,
+        last_target        TEXT,
+        last_previous      TEXT,
+        last_error         TEXT,
+        last_at_ms         INTEGER,
+        failures           INTEGER NOT NULL DEFAULT 0
     ) STRICT;
     ",
 ];
@@ -527,6 +561,119 @@ fn bump_pin_revision(
         )
         .map_err(backend)?;
     Ok(next)
+}
+
+/// The columns of `upstream_clear`, in the order [`upstream_clear_row`] reads them.
+const UPSTREAM_CLEAR_COLUMNS: &str = "channel_id, mode, set_at_ms, enabled_at_ms, \
+     pushed_message_id, pushed_message_ms, pushed_result, pushed_target, pushed_previous, \
+     pushed_at_ms, previous_cursor, last_message_id, last_message_ms, last_result, last_target, \
+     last_previous, last_error, last_at_ms, failures";
+
+/// One attempt out of five columns, or `None` when the row has none.
+fn upstream_clear_attempt(
+    row: &rusqlite::Row<'_>,
+    first: usize,
+    error: Option<String>,
+) -> rusqlite::Result<Option<UpstreamClearAttempt>> {
+    let message: Option<String> = row.get(first)?;
+    let message_ms: Option<i64> = row.get(first + 1)?;
+    let result: Option<String> = row.get(first + 2)?;
+    let (Some(message), Some(message_ms), Some(result)) = (message, message_ms, result) else {
+        return Ok(None);
+    };
+    let Some(result) = UpstreamClearResult::parse(&result) else {
+        return Ok(None);
+    };
+    Ok(Some(UpstreamClearAttempt {
+        at_ms: 0,
+        message: MessageId(message),
+        message_ms,
+        result,
+        target: row.get(first + 3)?,
+        previous: row.get(first + 4)?,
+        error,
+    }))
+}
+
+/// One `upstream_clear` row, read in [`UPSTREAM_CLEAR_COLUMNS`] order.
+fn upstream_clear_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<UpstreamClearSetting> {
+    let mode: String = row.get(1)?;
+    let pushed = upstream_clear_attempt(row, 4, None)?.map(|attempt| UpstreamClearAttempt {
+        at_ms: row.get::<_, Option<i64>>(9).ok().flatten().unwrap_or(0),
+        ..attempt
+    });
+    let last_error: Option<String> = row.get(16)?;
+    let last = upstream_clear_attempt(row, 11, last_error)?.map(|attempt| UpstreamClearAttempt {
+        at_ms: row.get::<_, Option<i64>>(17).ok().flatten().unwrap_or(0),
+        ..attempt
+    });
+    Ok(UpstreamClearSetting {
+        channel: ChannelId(row.get(0)?),
+        // The CHECK constraint admits nothing else; an unknown spelling reads as off, the safe
+        // answer, rather than failing every read of every channel's setting.
+        mode: UpstreamClearMode::parse(&mode).unwrap_or_default(),
+        set_at_ms: row.get(2)?,
+        enabled_at_ms: row.get(3)?,
+        pushed,
+        previous_cursor: row.get(10)?,
+        last,
+        failures: u32::try_from(row.get::<_, i64>(18)?).unwrap_or(u32::MAX),
+    })
+}
+
+/// One channel's setting inside the caller's connection or transaction, or `None` without a row.
+fn upstream_clear_setting(
+    connection: &Connection,
+    channel: &str,
+) -> Result<Option<UpstreamClearSetting>, StoreError> {
+    connection
+        .query_row(
+            &format!("SELECT {UPSTREAM_CLEAR_COLUMNS} FROM upstream_clear WHERE channel_id = ?1"),
+            [channel],
+            upstream_clear_row,
+        )
+        .optional()
+        .map_err(backend)
+}
+
+/// Write one channel's whole setting, inside the caller's transaction.
+fn write_upstream_clear(
+    transaction: &rusqlite::Transaction<'_>,
+    setting: &UpstreamClearSetting,
+) -> Result<(), StoreError> {
+    let pushed = setting.pushed.as_ref();
+    let last = setting.last.as_ref();
+    transaction
+        .execute(
+            &format!(
+                "INSERT OR REPLACE INTO upstream_clear ({UPSTREAM_CLEAR_COLUMNS})
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16,
+                         ?17, ?18, ?19)"
+            ),
+            rusqlite::params![
+                setting.channel.as_str(),
+                setting.mode.as_str(),
+                setting.set_at_ms,
+                setting.enabled_at_ms,
+                pushed.map(|attempt| attempt.message.as_str()),
+                pushed.map(|attempt| attempt.message_ms),
+                pushed.map(|attempt| attempt.result.as_str()),
+                pushed.and_then(|attempt| attempt.target.as_deref()),
+                pushed.and_then(|attempt| attempt.previous.as_deref()),
+                pushed.map(|attempt| attempt.at_ms),
+                setting.previous_cursor.as_deref(),
+                last.map(|attempt| attempt.message.as_str()),
+                last.map(|attempt| attempt.message_ms),
+                last.map(|attempt| attempt.result.as_str()),
+                last.and_then(|attempt| attempt.target.as_deref()),
+                last.and_then(|attempt| attempt.previous.as_deref()),
+                last.and_then(|attempt| attempt.error.as_deref()),
+                last.map(|attempt| attempt.at_ms),
+                i64::from(setting.failures),
+            ],
+        )
+        .map_err(backend)?;
+    Ok(())
 }
 
 #[async_trait]
@@ -1510,9 +1657,66 @@ impl StateStore for SqliteStore {
         .await
     }
 
+    async fn upstream_clear_settings(&self) -> Result<Vec<UpstreamClearSetting>, StoreError> {
+        self.with_connection(|connection| {
+            let mut statement = connection
+                .prepare(&format!(
+                    "SELECT {UPSTREAM_CLEAR_COLUMNS} FROM upstream_clear ORDER BY channel_id ASC"
+                ))
+                .map_err(backend)?;
+            let rows = statement
+                .query_map([], upstream_clear_row)
+                .map_err(backend)?;
+            rows.collect::<Result<Vec<_>, _>>().map_err(backend)
+        })
+        .await
+    }
+
+    async fn set_upstream_clear_mode(
+        &self,
+        channel: &ChannelId,
+        mode: UpstreamClearMode,
+        at_ms: i64,
+    ) -> Result<UpstreamClearSetting, StoreError> {
+        let channel = channel.clone();
+        self.with_connection(move |connection| {
+            let transaction = connection.transaction().map_err(backend)?;
+            let mut setting = upstream_clear_setting(&transaction, channel.as_str())?
+                .unwrap_or_else(|| UpstreamClearSetting::unset(channel.clone()));
+            setting.change_mode(mode, at_ms);
+            write_upstream_clear(&transaction, &setting)?;
+            transaction.commit().map_err(backend)?;
+            Ok(setting)
+        })
+        .await
+    }
+
+    async fn record_upstream_clear(
+        &self,
+        channel: &ChannelId,
+        attempt: &UpstreamClearAttempt,
+    ) -> Result<(), StoreError> {
+        let channel = channel.clone();
+        let attempt = attempt.clone();
+        self.with_connection(move |connection| {
+            let transaction = connection.transaction().map_err(backend)?;
+            let Some(mut setting) = upstream_clear_setting(&transaction, channel.as_str())? else {
+                return Ok(());
+            };
+            setting.record(&attempt);
+            write_upstream_clear(&transaction, &setting)?;
+            transaction.commit().map_err(backend)
+        })
+        .await
+    }
+
     async fn purge_everything(&self) -> Result<(), StoreError> {
         self.with_connection(|connection| {
             let transaction = connection.transaction().map_err(backend)?;
+            // Every channel back to off, which is the shipped default and what no row means.
+            transaction
+                .execute("DELETE FROM upstream_clear", [])
+                .map_err(backend)?;
             transaction
                 .execute("DELETE FROM conversations", [])
                 .map_err(backend)?;
@@ -3239,7 +3443,7 @@ mod tests {
             let version: i64 = guard
                 .pragma_query_value(None, "user_version", |row| row.get(0))
                 .expect("version");
-            assert_eq!(version, 10);
+            assert_eq!(version, i64::try_from(MIGRATIONS.len()).expect("small"));
         }
         let channel = ChannelId("1111111111".to_owned());
         assert!(
@@ -3270,6 +3474,182 @@ mod tests {
         drop(store);
         let reopened = SqliteStore::open(&file, Retention::default()).expect("reopen");
         assert_eq!(reopened.pins(&channel).await.expect("read").pins.len(), 1);
+    }
+
+    fn clear_attempt(
+        id: &str,
+        message_ms: i64,
+        result: UpstreamClearResult,
+        previous: Option<&str>,
+    ) -> UpstreamClearAttempt {
+        UpstreamClearAttempt {
+            at_ms: message_ms + 5_000,
+            message: MessageId(id.to_owned()),
+            message_ms,
+            result,
+            target: Some(format!("target-{message_ms}")),
+            previous: previous.map(str::to_owned),
+            error: (result == UpstreamClearResult::Failed).then(|| "bridge said no".to_owned()),
+        }
+    }
+
+    #[tokio::test]
+    async fn upstream_clear_arrives_on_an_existing_file_outlasts_a_restart_and_a_purge_turns_it_off()
+    {
+        // `#232 upstream-mark-read`. The file in the wild is a v10 file holding an owner's state.
+        let dir = TempDir::new("sqlite-upstream-clear");
+        let file = dir.path().join("vibe-talk.sqlite3");
+        {
+            let connection = Connection::open(&file).expect("open old database");
+            for migration in &MIGRATIONS[..10] {
+                connection
+                    .execute_batch(migration)
+                    .expect("apply old schema");
+            }
+            connection
+                .execute_batch(
+                    "INSERT INTO read_marks VALUES ('1111111111', '1000000000000000100',
+                                                    1000000000000000100, 5);
+                     INSERT INTO hidden_channels VALUES ('3333333333', 10);",
+                )
+                .expect("an owner's state");
+            connection
+                .pragma_update(None, "user_version", 10_i64)
+                .expect("stamp old schema");
+        }
+        let channel = ChannelId("1111111111".to_owned());
+        let other = ChannelId("2222222222".to_owned());
+        {
+            let store = SqliteStore::open(&file, Retention::default()).expect("migrate");
+            assert!(
+                store.upstream_clear_settings().await.expect("read").is_empty(),
+                "an upgraded file must clear nothing upstream that the owner did not ask for"
+            );
+            assert_eq!(store.read_marks().await.expect("read").len(), 1);
+            // An attempt never creates a setting.
+            store
+                .record_upstream_clear(
+                    &other,
+                    &clear_attempt("1000000000000000300", 3_000, UpstreamClearResult::Advanced, None),
+                )
+                .await
+                .expect("record without a setting");
+            let set = store
+                .set_upstream_clear_mode(&channel, UpstreamClearMode::DryRun, 100)
+                .await
+                .expect("dry run");
+            assert_eq!(set.mode, UpstreamClearMode::DryRun);
+            assert_eq!(set.enabled_at_ms, Some(100));
+            store
+                .record_upstream_clear(
+                    &channel,
+                    &clear_attempt("1000000000000000200", 2_000, UpstreamClearResult::DryRun, Some("p0")),
+                )
+                .await
+                .expect("dry run attempt");
+            let on = store
+                .set_upstream_clear_mode(&channel, UpstreamClearMode::On, 200)
+                .await
+                .expect("on");
+            assert_eq!(on.enabled_at_ms, Some(100), "dry run to on is not a fresh enable");
+            assert_eq!(on.pushed, None, "a dry run pushed nothing");
+            for attempt in [
+                clear_attempt("1000000000000000210", 2_100, UpstreamClearResult::Failed, None),
+                clear_attempt("1000000000000000210", 2_100, UpstreamClearResult::Failed, None),
+            ] {
+                store
+                    .record_upstream_clear(&channel, &attempt)
+                    .await
+                    .expect("failure");
+            }
+            store
+                .record_upstream_clear(
+                    &channel,
+                    &clear_attempt("1000000000000000220", 2_200, UpstreamClearResult::Advanced, Some("before-any")),
+                )
+                .await
+                .expect("advanced");
+            // An older attempt arriving late never moves `pushed` back.
+            store
+                .record_upstream_clear(
+                    &channel,
+                    &clear_attempt("1000000000000000215", 2_150, UpstreamClearResult::AlreadyRead, Some("target-2200")),
+                )
+                .await
+                .expect("late");
+        }
+        let reopened = SqliteStore::open(&file, Retention::default()).expect("reopen");
+        let settings = reopened.upstream_clear_settings().await.expect("reload");
+        assert_eq!(settings.len(), 1, "{settings:?}");
+        let setting = &settings[0];
+        assert_eq!(setting.channel, channel);
+        assert_eq!(setting.mode, UpstreamClearMode::On);
+        assert_eq!(setting.failures, 0, "a success resets the failure count");
+        let pushed = setting.pushed.as_ref().expect("pushed");
+        assert_eq!(pushed.message, MessageId("1000000000000000220".to_owned()));
+        assert_eq!(pushed.message_ms, 2_200);
+        assert_eq!(pushed.target.as_deref(), Some("target-2200"));
+        assert_eq!(pushed.at_ms, 7_200);
+        assert_eq!(setting.previous_cursor.as_deref(), Some("before-any"));
+        let last = setting.last.as_ref().expect("last");
+        assert_eq!(last.result, UpstreamClearResult::AlreadyRead);
+        assert_eq!(last.message, MessageId("1000000000000000215".to_owned()));
+
+        // Off keeps what was pushed, so turning it on again cannot move the cursor back.
+        let off = reopened
+            .set_upstream_clear_mode(&channel, UpstreamClearMode::Off, 300)
+            .await
+            .expect("off");
+        assert_eq!(off.enabled_at_ms, None);
+        assert_eq!(off.pushed.as_ref().map(|p| p.message_ms), Some(2_200));
+
+        reopened.purge_everything().await.expect("purge");
+        assert!(
+            reopened.upstream_clear_settings().await.expect("after purge").is_empty(),
+            "the purge erases the setting, which leaves every channel off"
+        );
+        assert_eq!(reopened.hidden_channels().await.expect("read").len(), 1);
+    }
+
+    #[tokio::test]
+    async fn upstream_clear_failures_count_up_and_a_mode_change_resets_them() {
+        let dir = TempDir::new("sqlite-upstream-clear-failures");
+        let store = store(&dir, Retention::default());
+        let channel = ChannelId("1111111111".to_owned());
+        store
+            .set_upstream_clear_mode(&channel, UpstreamClearMode::On, 1)
+            .await
+            .expect("on");
+        for _ in 0..3 {
+            store
+                .record_upstream_clear(
+                    &channel,
+                    &clear_attempt("1000000000000000200", 2_000, UpstreamClearResult::Failed, None),
+                )
+                .await
+                .expect("failure");
+        }
+        let setting = &store.upstream_clear_settings().await.expect("read")[0];
+        assert_eq!(setting.failures, 3);
+        assert_eq!(
+            setting.last.as_ref().and_then(|last| last.error.as_deref()),
+            Some("bridge said no")
+        );
+        assert_eq!(setting.pushed, None);
+        // A skipped message neither counts as a failure nor clears the count.
+        store
+            .record_upstream_clear(
+                &channel,
+                &clear_attempt("1000000000000000201", 2_001, UpstreamClearResult::Skipped, None),
+            )
+            .await
+            .expect("skipped");
+        assert_eq!(store.upstream_clear_settings().await.expect("read")[0].failures, 3);
+        let dry = store
+            .set_upstream_clear_mode(&channel, UpstreamClearMode::DryRun, 2)
+            .await
+            .expect("dry run");
+        assert_eq!(dry.failures, 0);
     }
 
     #[test]

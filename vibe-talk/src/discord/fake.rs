@@ -87,6 +87,14 @@ struct State {
     directory_calls: Vec<DirectoryRequest>,
     upstream_read_marks_enabled: bool,
     upstream_read_marks: Vec<(ChannelId, MessageId)>,
+    /// `#232 upstream-mark-read`: whether automatic clearing is offered, every call in order as
+    /// `(channel, through, dry_run)`, each channel's provider cursor, queued failures, and an
+    /// optional gate a test holds to keep a call in flight.
+    upstream_clear_enabled: bool,
+    upstream_clears: Vec<(ChannelId, MessageId, bool)>,
+    upstream_cursors: BTreeMap<ChannelId, String>,
+    upstream_clear_failures: VecDeque<ChatError>,
+    upstream_clear_gate: Option<std::sync::Arc<tokio::sync::Semaphore>>,
     next_id: u64,
     /// Author display name -> snowflake, so one author keeps one id and two authors never share
     /// one. A fake that handed every author the same id would let a test pass while the server
@@ -236,6 +244,54 @@ impl FakeDiscord {
     #[must_use]
     pub fn upstream_read_marks(&self) -> Vec<(ChannelId, MessageId)> {
         self.lock().upstream_read_marks.clone()
+    }
+
+    /// A seeded message, as this fake would answer for it, or `None` when it holds none by that id.
+    #[must_use]
+    pub fn message(&self, id: &MessageId) -> Option<Message> {
+        self.lock()
+            .messages
+            .iter()
+            .find(|message| &message.id == id)
+            .cloned()
+    }
+
+    /// Offer automatic upstream clearing. `#232 upstream-mark-read`.
+    pub fn enable_upstream_clear(&self) {
+        self.lock().upstream_clear_enabled = true;
+    }
+
+    /// Every automatic clear asked of this fake, in call order, as `(channel, through, dry_run)`.
+    /// Failed and dry-run calls included: this is what was ASKED.
+    #[must_use]
+    pub fn upstream_clears(&self) -> Vec<(ChannelId, MessageId, bool)> {
+        self.lock().upstream_clears.clone()
+    }
+
+    /// The provider's read cursor for `channel`, as an instant, when it has one.
+    #[must_use]
+    pub fn upstream_cursor(&self, channel: &ChannelId) -> Option<String> {
+        self.lock().upstream_cursors.get(channel).cloned()
+    }
+
+    /// Put the provider's read cursor somewhere, as the owner reading natively would.
+    pub fn set_upstream_cursor(&self, channel: &ChannelId, at: &str) {
+        self.lock()
+            .upstream_cursors
+            .insert(channel.clone(), at.to_owned());
+    }
+
+    /// Make the next automatic clear fail with `error`. Queued: each call spends one.
+    pub fn fail_upstream_clear_next(&self, error: ChatError) {
+        self.lock().upstream_clear_failures.push_back(error);
+    }
+
+    /// Hold every automatic clear until the returned semaphore is given a permit per call, so a
+    /// test can keep one in flight while it does something else.
+    pub fn hold_upstream_clears(&self) -> std::sync::Arc<tokio::sync::Semaphore> {
+        let gate = std::sync::Arc::new(tokio::sync::Semaphore::new(0));
+        self.lock().upstream_clear_gate = Some(std::sync::Arc::clone(&gate));
+        gate
     }
 
     /// Seed a message into a channel, registering the channel as a side effect. Returns its
@@ -730,6 +786,80 @@ impl ChatClient for FakeDiscord {
             .upstream_read_marks
             .push((channel.clone(), through.clone()));
         Ok(())
+    }
+
+    fn supports_upstream_clear(&self) -> bool {
+        self.lock().upstream_clear_enabled
+    }
+
+    /// The bridge's contract, kept: a cursor that only moves forward, a dry run that writes
+    /// nothing, 404 for a message it does not hold. `#232 upstream-mark-read`.
+    async fn clear_upstream_through(
+        &self,
+        channel: &ChannelId,
+        through: &MessageId,
+        dry_run: bool,
+    ) -> Result<crate::chat::UpstreamClearOutcome, ChatError> {
+        let gate = {
+            let mut state = self.lock();
+            if !state.upstream_clear_enabled {
+                return Err(ChatError::Refused(
+                    "the configured chat provider cannot clear its unread state automatically"
+                        .to_owned(),
+                ));
+            }
+            state
+                .upstream_clears
+                .push((channel.clone(), through.clone(), dry_run));
+            state.upstream_clear_gate.clone()
+        };
+        if let Some(gate) = gate {
+            gate.acquire()
+                .await
+                .expect("the test keeps the gate open")
+                .forget();
+        }
+        let mut state = self.lock();
+        if let Some(failure) = state.upstream_clear_failures.pop_front() {
+            return Err(failure);
+        }
+        if !state.known.contains(channel) {
+            return Err(ChatError::Status {
+                status: 404,
+                body: "Unknown Channel".to_owned(),
+            });
+        }
+        let Some(target) = state
+            .messages
+            .iter()
+            .find(|message| &message.channel_id == channel && &message.id == through)
+            .map(|message| message.timestamp.clone())
+        else {
+            return Err(ChatError::Status {
+                status: 404,
+                body: r#"{"message": "unknown message cursor"}"#.to_owned(),
+            });
+        };
+        let previous = state.upstream_cursors.get(channel).cloned();
+        let instant = |text: &str| text.parse::<jiff::Timestamp>().ok();
+        let already = previous
+            .as_deref()
+            .and_then(instant)
+            .zip(instant(&target))
+            .is_some_and(|(previous, target)| previous >= target);
+        let advanced = !already && !dry_run;
+        if advanced {
+            state
+                .upstream_cursors
+                .insert(channel.clone(), target.clone());
+        }
+        Ok(crate::chat::UpstreamClearOutcome {
+            scope: "space".to_owned(),
+            target,
+            previous,
+            advanced,
+            dry_run,
+        })
     }
 }
 

@@ -16,6 +16,7 @@ use async_trait::async_trait;
 use super::{
     ChannelAlias, ConversationId, ConversationSummary, PinChange, PinSnapshot, Pins, ReadMark,
     StateStore, StoreError, SummaryKey, TranscriptCursor, TranscriptPage, Turn,
+    UpstreamClearAttempt, UpstreamClearMode, UpstreamClearSetting,
 };
 use crate::model::{ChannelId, MessageId};
 
@@ -191,6 +192,29 @@ impl StateStore for DisabledStore {
         refuse()
     }
 
+    async fn upstream_clear_settings(&self) -> Result<Vec<UpstreamClearSetting>, StoreError> {
+        // A refusal, not an empty list: Settings must not offer a switch this server cannot keep,
+        // and the server cannot act on a setting it would forget at the next restart.
+        refuse()
+    }
+
+    async fn set_upstream_clear_mode(
+        &self,
+        _: &ChannelId,
+        _: UpstreamClearMode,
+        _: i64,
+    ) -> Result<UpstreamClearSetting, StoreError> {
+        refuse()
+    }
+
+    async fn record_upstream_clear(
+        &self,
+        _: &ChannelId,
+        _: &UpstreamClearAttempt,
+    ) -> Result<(), StoreError> {
+        refuse()
+    }
+
     async fn purge_everything(&self) -> Result<(), StoreError> {
         refuse()
     }
@@ -282,6 +306,29 @@ mod tests {
                 .await
                 .expect_err("pin"),
             store.unpin(&channel, &message).await.expect_err("unpin"),
+            store
+                .upstream_clear_settings()
+                .await
+                .expect_err("upstream clear settings"),
+            store
+                .set_upstream_clear_mode(&channel, UpstreamClearMode::On, 1)
+                .await
+                .expect_err("set upstream clear mode"),
+            store
+                .record_upstream_clear(
+                    &channel,
+                    &UpstreamClearAttempt {
+                        at_ms: 1,
+                        message: message.clone(),
+                        message_ms: 1,
+                        result: super::super::UpstreamClearResult::Advanced,
+                        target: None,
+                        previous: None,
+                        error: None,
+                    },
+                )
+                .await
+                .expect_err("record upstream clear"),
             store.purge_everything().await.expect_err("purge"),
         ];
         for error in errors {
