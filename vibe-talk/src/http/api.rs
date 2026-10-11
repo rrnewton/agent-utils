@@ -1299,7 +1299,7 @@ pub struct TimelineQuery {
 /// `GET /api/v1/channels/{channel_id}/timeline` — all views share one allowlist boundary.
 pub async fn timeline(
     State(state): State<AppState>,
-    _scope: ReadScope,
+    ReadScope(caller): ReadScope,
     Path(channel_id): Path<String>,
     Query(query): Query<TimelineQuery>,
 ) -> Result<Response, ApiError> {
@@ -1348,6 +1348,19 @@ pub async fn timeline(
     // `#217 markdown-blocks`. Here and not in `ops::timeline`: this route's only reader is the
     // page, and the operation under it is shared with paths toward a model.
     crate::render::fill_page(&state.config, &channel, &mut page);
+    // `#182 thread-display-names`. Known names and sentences ride along on every thread list and
+    // thread heading; due threads are queued for the background, and only for a caller with write
+    // scope, because a read token never spends the model or fills the cache.
+    state
+        .thread_names
+        .annotate(
+            &crate::summarize::threads::ThreadDeps::from_state(&state),
+            &channel.id,
+            &request,
+            &mut page,
+            caller >= crate::auth::Scope::Write,
+        )
+        .await;
     // `#222 unread-replies`. Main's newest page and its deltas also say which replies in its threads
     // are Done, which its own rows cannot: Main shows a root and none of its replies. Not on a step
     // back, whose roots are older than anything the reader is waiting on; not in a channel scoped

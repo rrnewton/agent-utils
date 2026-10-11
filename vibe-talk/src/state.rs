@@ -52,6 +52,9 @@ pub struct AppState {
     /// [`crate::summarize::policy_version`], because recomputing it per request is how the two
     /// halves of a cache key drift apart.
     pub summary_version: Arc<str>,
+    /// Thread display names and sentences, and the background queue that produces them.
+    /// `#182 thread-display-names`, `#233 llm-summarizer`. See [`crate::summarize::threads`].
+    pub thread_names: Arc<crate::summarize::threads::ThreadNames>,
     /// The one place this server keeps anything between restarts.
     ///
     /// Reached only through the trait, never as a concrete database, so the backend can be

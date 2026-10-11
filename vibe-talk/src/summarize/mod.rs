@@ -1,17 +1,24 @@
 //! Turning one long channel message into one short line, behind a trait — and a cache key that
 //! knows when it has gone stale.
 //!
-//! There is ONE shipped summariser, [`agent::AgentSummarizer`], and it asks the deployment's
-//! ElevenLabs conversational agent. A truncating stand-in used to live here beside it and has been
-//! deleted: it comprehended nothing — a wall of text became the first 160 characters of a wall of
-//! text — and the page already shows a clamped prefix under the collapsed state, so it produced
-//! nothing the reader did not already have while making "summarised" mean two different things.
-//! Without ElevenLabs credentials there is therefore no summary at all: every request fails,
-//! loudly and by name, and the page paints those rows as failed. See [`summarizer_for`].
+//! There are TWO shipped summarisers, and [`summarizer_for`] picks one:
 //!
-//! The trait survives the deletion for the reason [`crate::store::StateStore`] does — a second
-//! backend must be substitutable without a call site changing, and the tests need one that counts
-//! (see [`fake::FakeSummarizer`]).
+//! * [`messages_api::MessagesApiSummarizer`], when `[summaries.llm]` is configured: one plain
+//!   Messages API call per summary, with no agent harness and no tools, in the Anthropic API's
+//!   dialect or Google Vertex's. It also names threads. `#233 llm-summarizer`.
+//! * otherwise [`agent::AgentSummarizer`], which asks the deployment's ElevenLabs conversational
+//!   agent.
+//!
+//! A truncating stand-in used to live here beside them and has been deleted: it comprehended
+//! nothing — a wall of text became the first 160 characters of a wall of text — and the page
+//! already shows a clamped prefix under the collapsed state, so it produced nothing the reader did
+//! not already have while making "summarised" mean two different things. With neither backend
+//! configured there is therefore no summary at all: every request fails, loudly and by name, and
+//! the page paints those rows as failed.
+//!
+//! The trait exists for the reason [`crate::store::StateStore`] does — a backend must be
+//! substitutable without a call site changing, and the tests need one that counts (see
+//! [`fake::FakeSummarizer`]).
 //!
 //! # The trap this module exists to close
 //!
@@ -33,12 +40,15 @@
 //! held is structural rather than by convention: [`SummaryRequest`] has a PRIVATE `prompt` field
 //! and only [`SummaryRequest::new`] can fill it, so there is no way to construct the value a
 //! summariser is handed without building the prompt through [`crate::untrusted::fenced`] on the
-//! way. The shipped backend sends [`SummaryRequest::prompt`]; the counting fake used by the tests
-//! ignores it. Either way the fence is not something a call site can forget. A summary is still
-//! third-party text when it comes back.
+//! way. [`threads::ThreadRequest`] is built the same way. The shipped backends send the prompt;
+//! the counting fake used by the tests ignores it. Either way the fence is not something a call
+//! site can forget. A summary is still third-party text when it comes back.
 
 pub mod agent;
 pub mod fake;
+pub mod messages_api;
+pub mod rate_limit;
+pub mod threads;
 
 use std::sync::Arc;
 
@@ -51,21 +61,25 @@ use crate::model::Message;
 /// Build the summariser this server actually runs.
 ///
 /// **The one construction point**, called by `main` and by the tests that have to reproduce what
-/// `main` built. There is no choice to make — the deployment's ElevenLabs agent is the only
-/// summariser — and the reason this is a function rather than three lines at the call site is the
-/// cache key: [`policy_version_for`] takes both of its halves off the summariser, so a test that
-/// rebuilt the summariser by hand and got one detail wrong would compute a key the binary never
-/// writes and then fail as though the sweep were broken.
+/// `main` built. `[summaries.llm]`, when present, selects the direct Messages API summariser;
+/// otherwise it is the deployment's ElevenLabs agent, which fails per request, by name, when its
+/// credentials are absent. The reason this is a function rather than a few lines at the call site
+/// is the cache key: [`policy_version_for`] takes both of its halves off the summariser, so a test
+/// that rebuilt the summariser by hand and got one detail wrong would compute a key the binary
+/// never writes and then fail as though the sweep were broken.
 ///
-/// Builds no connection and reads no credential, so a deployment with an empty `[elevenlabs]`
-/// section still starts. It fails per request instead, with
-/// [`SummaryError::NotConfigured`] naming the absent setting.
+/// Builds no connection and reads no credential, so a deployment whose key file is not in place
+/// yet, or whose `[elevenlabs]` section is empty, still starts. It fails per request instead,
+/// with [`SummaryError::NotConfigured`] naming the absent setting.
 #[must_use]
 pub fn summarizer_for(
     elevenlabs: &ElevenLabsConfig,
     summaries: &SummariesConfig,
     chats: Arc<dyn TextChatProvider>,
 ) -> Arc<dyn Summarizer> {
+    if let Some(llm) = &summaries.llm {
+        return Arc::new(messages_api::MessagesApiSummarizer::new(llm.clone()));
+    }
     Arc::new(agent::AgentSummarizer::new(
         chats,
         elevenlabs.clone(),
@@ -208,6 +222,28 @@ pub trait Summarizer: Send + Sync {
         None
     }
 
+    /// Whether this backend can name threads with [`Summarizer::name_thread`].
+    ///
+    /// `false` by default, and then nothing asks: a thread list served by a backend that cannot
+    /// name threads shows each thread under its first message, as it always has.
+    fn names_threads(&self) -> bool {
+        false
+    }
+
+    /// Name a thread and say in one sentence what it is about. `#182 thread-display-names`.
+    ///
+    /// # Errors
+    ///
+    /// [`SummaryError`] as for [`Summarizer::summarize`]; by default
+    /// [`SummaryError::NotConfigured`], naming the section that adds a backend that can.
+    async fn name_thread(
+        &self,
+        request: &threads::ThreadRequest<'_>,
+    ) -> Result<threads::ThreadNaming, SummaryError> {
+        let _ = request;
+        Err(SummaryError::NotConfigured("summaries.llm"))
+    }
+
     /// Summarise one message.
     ///
     /// # Errors
@@ -269,6 +305,13 @@ pub fn policy_version_of(prompt: &str, config: &SummariesConfig, backend: &str) 
         // down where the next person adding a field would read it; a rare extra cache miss when
         // an operator retunes a timeout is a much smaller cost than that.
         &config.reply_timeout_seconds.to_string(),
+        // `[summaries.llm]`: only what changes the WORDING — see `LlmConfig` for why endpoints,
+        // credentials, timeouts and the rate limit are deliberately not here. The running
+        // summariser folds the same three in again through its `policy_input`; here they cover
+        // `policy_version`, which has no summariser to ask.
+        &config.llm.as_ref().map_or_else(String::new, |llm| {
+            format!("{}|{}|{}", llm.dialect.as_str(), llm.model, llm.max_tokens)
+        }),
     ] {
         hash = fnv1a64(hash, part.as_bytes());
         // A separator, so ("ab", "c") and ("a", "bc") do not hash the same.
@@ -307,6 +350,36 @@ mod tests {
 
     fn config() -> SummariesConfig {
         SummariesConfig::default()
+    }
+
+    /// A complete `[summaries.llm]`, as the loader would resolve one.
+    pub(crate) fn llm() -> crate::config::LlmConfig {
+        crate::config::LlmConfig {
+            dialect: crate::config::LlmDialect::Anthropic,
+            base_url: crate::config::DEFAULT_ANTHROPIC_BASE_URL.to_owned(),
+            model: crate::config::DEFAULT_LLM_MODEL.to_owned(),
+            project: None,
+            region: None,
+            api_key_file: Some("/run/secrets/model-key".into()),
+            bearer_token_file: None,
+            bearer_token_command: None,
+            client_identity_file: None,
+            ca_bundle_file: None,
+            extra_headers: std::collections::BTreeMap::new(),
+            max_tokens: crate::config::DEFAULT_LLM_MAX_TOKENS,
+            timeout_secs: crate::config::DEFAULT_LLM_TIMEOUT_SECS,
+            requests_per_minute: crate::config::DEFAULT_LLM_REQUESTS_PER_MINUTE,
+            burst: crate::config::DEFAULT_LLM_BURST,
+        }
+    }
+
+    fn with_llm(change: impl FnOnce(&mut crate::config::LlmConfig)) -> SummariesConfig {
+        let mut llm = llm();
+        change(&mut llm);
+        SummariesConfig {
+            llm: Some(llm),
+            ..config()
+        }
     }
 
     #[test]
@@ -357,6 +430,7 @@ mod tests {
                 policy_version(&longer_deadline, agent::BACKEND),
             ),
             ("backend", policy_version(&config(), "http")),
+            ("llm", policy_version(&with_llm(|_| {}), agent::BACKEND)),
         ] {
             assert_ne!(
                 base, changed,
@@ -364,6 +438,70 @@ mod tests {
                  keep being served"
             );
         }
+    }
+
+    #[test]
+    fn the_llm_settings_that_change_the_wording_change_the_version_and_transport_does_not() {
+        // `#233 llm-summarizer`. The three that decide what the model is and how much it may say
+        // move the key; the rest is how the call travels, and moving the key for it would throw
+        // every summary away on a key rotation.
+        let base = policy_version(&with_llm(|_| {}), messages_api::BACKEND);
+        for (what, changed) in [
+            (
+                "dialect",
+                with_llm(|l| l.dialect = crate::config::LlmDialect::Vertex),
+            ),
+            (
+                "model",
+                with_llm(|l| l.model = "claude-sonnet-5-5".to_owned()),
+            ),
+            ("max_tokens", with_llm(|l| l.max_tokens += 1)),
+        ] {
+            assert_ne!(
+                base,
+                policy_version(&changed, messages_api::BACKEND),
+                "changing llm.{what} left the cache key unchanged"
+            );
+        }
+        for (what, changed) in [
+            (
+                "base_url",
+                with_llm(|l| l.base_url = "https://gateway.example".to_owned()),
+            ),
+            (
+                "api_key_file",
+                with_llm(|l| l.api_key_file = Some("/elsewhere".into())),
+            ),
+            ("timeout_secs", with_llm(|l| l.timeout_secs += 1)),
+            (
+                "requests_per_minute",
+                with_llm(|l| l.requests_per_minute += 1),
+            ),
+            ("burst", with_llm(|l| l.burst += 1)),
+            (
+                "extra_headers",
+                with_llm(|l| {
+                    l.extra_headers
+                        .insert("x-calling-product".to_owned(), "vibe-talk".to_owned());
+                }),
+            ),
+        ] {
+            assert_eq!(
+                base,
+                policy_version(&changed, messages_api::BACKEND),
+                "changing llm.{what} moved the cache key, though it cannot change a summary"
+            );
+        }
+        // ...and the RUNNING summariser's key moves with the model too, through `policy_input`.
+        let haiku = messages_api::MessagesApiSummarizer::new(llm());
+        let other = messages_api::MessagesApiSummarizer::new(crate::config::LlmConfig {
+            model: "claude-sonnet-5-5".to_owned(),
+            ..llm()
+        });
+        assert_ne!(
+            policy_version_for(&with_llm(|_| {}), &haiku),
+            policy_version_for(&with_llm(|_| {}), &other)
+        );
     }
 
     #[test]

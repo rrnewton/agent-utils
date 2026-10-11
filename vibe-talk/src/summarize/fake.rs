@@ -9,6 +9,7 @@ use std::sync::Mutex;
 
 use async_trait::async_trait;
 
+use super::threads::{ThreadNaming, ThreadRequest};
 use super::{Summarizer, SummaryError, SummaryRequest};
 
 /// What one call was asked to summarise.
@@ -36,6 +37,8 @@ pub struct FakeSummarizer {
 struct State {
     requests: Vec<RecordedRequest>,
     fail_next: Option<String>,
+    names_threads: bool,
+    threads: Vec<String>,
 }
 
 impl FakeSummarizer {
@@ -55,6 +58,24 @@ impl FakeSummarizer {
     #[must_use]
     pub fn requests(&self) -> Vec<RecordedRequest> {
         self.lock().requests.clone()
+    }
+
+    /// A fake that also names threads, answering `thread-N` and `thread summary #N`.
+    ///
+    /// Separate from [`FakeSummarizer::new`] on purpose: a backend that names threads makes every
+    /// write-scope thread-list read queue background work that reads the chat provider, and the
+    /// many tests that count provider reads must not inherit that.
+    #[must_use]
+    pub fn naming_threads() -> Self {
+        let fake = Self::default();
+        fake.lock().names_threads = true;
+        fake
+    }
+
+    /// The prompt of every thread it was asked to name, in order.
+    #[must_use]
+    pub fn thread_prompts(&self) -> Vec<String> {
+        self.lock().threads.clone()
     }
 
     /// Make the next call fail. One-shot, so recovery is testable too.
@@ -84,6 +105,26 @@ impl Summarizer for FakeSummarizer {
     // is, is pinned by `policy_version_for`'s own tests and by the startup sweep test, not here.
     fn backend(&self) -> &'static str {
         super::agent::BACKEND
+    }
+
+    fn names_threads(&self) -> bool {
+        self.lock().names_threads
+    }
+
+    async fn name_thread(&self, request: &ThreadRequest<'_>) -> Result<ThreadNaming, SummaryError> {
+        let mut state = self.lock();
+        if !state.names_threads {
+            return Err(SummaryError::NotConfigured("summaries.llm"));
+        }
+        if let Some(why) = state.fail_next.take() {
+            return Err(SummaryError::Transport(why));
+        }
+        state.threads.push(request.prompt().to_owned());
+        let n = state.threads.len();
+        Ok(ThreadNaming {
+            slug: format!("thread-{n}"),
+            sentence: format!("thread summary #{n}"),
+        })
     }
 
     async fn summarize(&self, request: &SummaryRequest<'_>) -> Result<String, SummaryError> {

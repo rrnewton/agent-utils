@@ -269,6 +269,12 @@ pub struct SummariesConfig {
     pub socket_idle_seconds: u64,
     /// How long one turn with the agent, or one opening handshake, may take.
     pub reply_timeout_seconds: u64,
+    /// A direct Messages API summariser, when `[summaries.llm]` is present. `#233 llm-summarizer`.
+    ///
+    /// When present it is THE summariser, and it is also the one that names threads; see
+    /// [`crate::summarize::summarizer_for`]. Only the parts of it that change what a summary says
+    /// (dialect, model, output budget) reach the cache key; see [`LlmConfig`].
+    pub llm: Option<LlmConfig>,
 }
 
 impl Default for SummariesConfig {
@@ -281,7 +287,110 @@ impl Default for SummariesConfig {
             max_per_socket: crate::summarize::agent::DEFAULT_MAX_PER_SOCKET,
             socket_idle_seconds: crate::summarize::agent::DEFAULT_SOCKET_IDLE_SECONDS,
             reply_timeout_seconds: crate::summarize::agent::DEFAULT_REPLY_TIMEOUT_SECONDS,
+            llm: None,
         }
+    }
+}
+
+/// Which wire dialect of the Messages API a [`LlmConfig`] speaks. `#233 llm-summarizer`.
+///
+/// One request body, two ways of addressing it: see [`crate::summarize::messages_api`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum LlmDialect {
+    /// `POST {base_url}/v1/messages`, authenticated with an `x-api-key` read from a file.
+    Anthropic,
+    /// `POST {base_url}/projects/{project}/locations/{region}/publishers/anthropic/models/{model}:rawPredict`,
+    /// authenticated with an optional bearer token and/or an mTLS client identity.
+    Vertex,
+}
+
+impl LlmDialect {
+    /// The spelling used in the configuration file, the startup log and the cache key.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Anthropic => "anthropic",
+            Self::Vertex => "vertex",
+        }
+    }
+}
+
+/// `[summaries.llm]`: summaries from one plain Messages API call, with no agent harness and no
+/// tools. `#233 llm-summarizer`.
+///
+/// **No secret is ever written in this section.** The API key and the bearer token are read from
+/// FILES (or, for the bearer token, from a command's output) at call time, so a key rotated on
+/// disk is picked up without a restart and nothing secret sits in a file that is shared, copied
+/// into a ticket or printed by `--help`. A key written inline is refused by name at load.
+///
+/// Only [`LlmConfig::dialect`], [`LlmConfig::model`] and [`LlmConfig::max_tokens`] change what a
+/// summary SAYS, and only they are folded into the cache key (through the summariser's
+/// [`crate::summarize::Summarizer::policy_input`]). Everything else here is transport: endpoints,
+/// credentials, timeouts and the rate limit. Folding those in would throw every cached summary
+/// away on a key rotation, and would write a deployment's file layout into a cache key on disk.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LlmConfig {
+    /// Which wire dialect to speak.
+    pub dialect: LlmDialect,
+    /// Where the API lives, without a trailing slash. Defaults per dialect: the Anthropic API, or
+    /// the public Google Vertex endpoint for [`LlmConfig::region`].
+    pub base_url: String,
+    /// The model to ask. Default [`DEFAULT_LLM_MODEL`], which is a valid name in both dialects.
+    pub model: String,
+    /// Google Cloud project. Vertex only, and required there.
+    pub project: Option<String>,
+    /// Google Cloud region, or `global`. Vertex only, and required there.
+    pub region: Option<String>,
+    /// File holding the API key sent as `x-api-key`. Required for the Anthropic dialect; on the
+    /// Vertex dialect it is sent only when it is configured here explicitly.
+    pub api_key_file: Option<PathBuf>,
+    /// File holding a bearer token, re-read on every call. Vertex only.
+    pub bearer_token_file: Option<PathBuf>,
+    /// A command (argv, no shell) whose standard output is a bearer token, cached briefly.
+    /// Vertex only, and not together with `bearer_token_file`.
+    pub bearer_token_command: Option<Vec<String>>,
+    /// PEM file holding a client certificate chain and its private key, for a gateway that
+    /// authenticates by client certificate. Re-read whenever its modification time changes,
+    /// because such identities are short-lived and rotate on disk.
+    pub client_identity_file: Option<PathBuf>,
+    /// PEM bundle of extra root certificates to trust, for a gateway that chains to a private
+    /// root. Added to the bundled public roots, never replacing them.
+    pub ca_bundle_file: Option<PathBuf>,
+    /// Extra request headers, sent on every call. NOT for secrets: they are written inline.
+    pub extra_headers: BTreeMap<String, String>,
+    /// The output budget of one call, in tokens.
+    pub max_tokens: u32,
+    /// How long one call may take, in seconds.
+    pub timeout_secs: u64,
+    /// Client-side ceiling on calls per minute, across every summary and thread name.
+    pub requests_per_minute: u32,
+    /// How many calls may go out back to back before the per-minute pace applies.
+    pub burst: u32,
+}
+
+/// The model `[summaries.llm]` asks when none is named: a small, fast model whose alias is
+/// valid on both the Anthropic API and Google Vertex.
+pub const DEFAULT_LLM_MODEL: &str = "claude-haiku-4-5";
+/// Where the Anthropic dialect sends requests by default.
+pub const DEFAULT_ANTHROPIC_BASE_URL: &str = "https://api.anthropic.com";
+/// Default output budget: a slug and a sentence, or one sentence, with room to spare.
+pub const DEFAULT_LLM_MAX_TOKENS: u32 = 120;
+/// Default ceiling on one call, in seconds.
+pub const DEFAULT_LLM_TIMEOUT_SECS: u64 = 30;
+/// Default client-side rate limit: conservative, because a thread list can ask for dozens of
+/// names at once and the model provider's own limit is the operator's to spend, not ours.
+pub const DEFAULT_LLM_REQUESTS_PER_MINUTE: u32 = 15;
+/// Default burst before the per-minute pace applies.
+pub const DEFAULT_LLM_BURST: u32 = 3;
+
+/// The public Google Vertex endpoint for `region`.
+#[must_use]
+pub fn vertex_base_url(region: &str) -> String {
+    if region == "global" {
+        "https://aiplatform.googleapis.com/v1".to_owned()
+    } else {
+        format!("https://{region}-aiplatform.googleapis.com/v1")
     }
 }
 
@@ -782,6 +891,33 @@ struct FileSummaries {
     max_per_socket: Option<usize>,
     socket_idle_seconds: Option<u64>,
     reply_timeout_seconds: Option<u64>,
+    llm: Option<FileLlm>,
+}
+
+/// `[summaries.llm]` as written. See [`LlmConfig`].
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FileLlm {
+    dialect: Option<LlmDialect>,
+    base_url: Option<String>,
+    model: Option<String>,
+    project: Option<String>,
+    region: Option<String>,
+    api_key_file: Option<String>,
+    bearer_token_file: Option<String>,
+    bearer_token_command: Option<Vec<String>>,
+    client_identity_file: Option<String>,
+    ca_bundle_file: Option<String>,
+    extra_headers: Option<BTreeMap<String, String>>,
+    max_tokens: Option<u32>,
+    timeout_secs: Option<u64>,
+    requests_per_minute: Option<u32>,
+    burst: Option<u32>,
+    /// Declared only to be REFUSED by name: a secret does not belong inline. Typed as a raw value
+    /// so the refusal never has to parse, hold or print it.
+    api_key: Option<toml::Value>,
+    /// As `api_key`.
+    bearer_token: Option<toml::Value>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -1197,6 +1333,17 @@ fn summaries_config(
     if let Some(raw) = backend_from_env {
         deprecated_backend(raw)?;
     }
+    let llm = file
+        .llm
+        .map(|llm| {
+            llm_config(
+                llm,
+                model_from_env
+                    .map(str::to_owned)
+                    .or_else(|| file.model.clone()),
+            )
+        })
+        .transpose()?;
     let summaries = SummariesConfig {
         threshold_chars: file.threshold_chars.unwrap_or(defaults.threshold_chars),
         target_chars: file.target_chars.unwrap_or(defaults.target_chars),
@@ -1213,6 +1360,7 @@ fn summaries_config(
         reply_timeout_seconds: file
             .reply_timeout_seconds
             .unwrap_or(defaults.reply_timeout_seconds),
+        llm,
     };
     if summaries.max_per_socket == 0 {
         // Zero is not "unlimited" and must not read as it. A conversation that may serve no
@@ -1252,6 +1400,348 @@ fn summaries_config(
         });
     }
     Ok(summaries)
+}
+
+/// Request headers `[summaries.llm].extra_headers` may not set, because this server sets them
+/// itself and a second copy would either be ignored or override a credential.
+const RESERVED_LLM_HEADERS: &[&str] = &[
+    "anthropic-version",
+    "authorization",
+    "content-length",
+    "content-type",
+    "host",
+    "x-api-key",
+];
+
+/// Resolve `[summaries.llm]`. `#233 llm-summarizer`.
+///
+/// `fallback_model` is `summaries.model` (or `VIBE_TALK_SUMMARY_MODEL`), used when this section
+/// names no model of its own.
+fn llm_config(file: FileLlm, fallback_model: Option<String>) -> Result<LlmConfig, ConfigError> {
+    let invalid = |field: &str, detail: String| ConfigError::Invalid {
+        field: format!("summaries.llm.{field}"),
+        detail,
+    };
+    for (written, field, instead) in [
+        (file.api_key.is_some(), "api_key", "api_key_file"),
+        (
+            file.bearer_token.is_some(),
+            "bearer_token",
+            "bearer_token_file or bearer_token_command",
+        ),
+    ] {
+        if written {
+            return Err(invalid(
+                field,
+                format!(
+                    "a secret must not be written in the configuration file; put it in a file \
+                     readable only by this server and name that file with {instead}"
+                ),
+            ));
+        }
+    }
+    let dialect = file.dialect.unwrap_or(LlmDialect::Anthropic);
+    let text = |value: Option<String>| value.map(|v| v.trim().to_owned()).filter(|v| !v.is_empty());
+    let model = text(file.model)
+        .or_else(|| text(fallback_model))
+        .unwrap_or_else(|| DEFAULT_LLM_MODEL.to_owned());
+    // Each of these is spliced into a URL path on the Vertex dialect, so each is held to the
+    // characters its real values use. Anything else is a typo at best and a path injection at worst.
+    let identifier = |field: &str, value: &str, extra: &str| -> Result<(), ConfigError> {
+        if value.len() > 128
+            || !value
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-' || extra.contains(c))
+        {
+            return Err(invalid(
+                field,
+                format!(
+                    "{value:?} is not a {field} name: use letters, digits, '-' and {extra:?}, at \
+                     most 128 characters"
+                ),
+            ));
+        }
+        Ok(())
+    };
+    identifier("model", &model, "._@")?;
+    let project = text(file.project);
+    let region = text(file.region);
+    if let Some(project) = &project {
+        identifier("project", project, "._:")?;
+    }
+    if let Some(region) = &region {
+        identifier("region", region, "")?;
+    }
+    let path = |field: &str, value: Option<String>| -> Result<Option<PathBuf>, ConfigError> {
+        let Some(value) = text(value) else {
+            return Ok(None);
+        };
+        let path = PathBuf::from(value);
+        if !path.is_absolute() {
+            // The `storage.path` rule, for the same reason: a relative path is resolved against
+            // whatever directory the process happened to start in.
+            return Err(invalid(
+                field,
+                format!("{} is relative; give an absolute path", path.display()),
+            ));
+        }
+        Ok(Some(path))
+    };
+    let api_key_file = path("api_key_file", file.api_key_file)?;
+    let bearer_token_file = path("bearer_token_file", file.bearer_token_file)?;
+    let client_identity_file = path("client_identity_file", file.client_identity_file)?;
+    let ca_bundle_file = path("ca_bundle_file", file.ca_bundle_file)?;
+    let bearer_token_command = match file.bearer_token_command {
+        Some(argv) if argv.first().is_none_or(|program| program.trim().is_empty()) => {
+            return Err(invalid(
+                "bearer_token_command",
+                "must name a program, as an argument list such as [\"gcloud\", \"auth\", \
+                 \"print-access-token\"]; it is run without a shell"
+                    .to_owned(),
+            ))
+        }
+        other => other,
+    };
+
+    match dialect {
+        LlmDialect::Anthropic => {
+            for (field, set) in [
+                ("project", project.is_some()),
+                ("region", region.is_some()),
+                ("bearer_token_file", bearer_token_file.is_some()),
+                ("bearer_token_command", bearer_token_command.is_some()),
+            ] {
+                if set {
+                    return Err(invalid(
+                        field,
+                        "is a Vertex setting and this section says dialect = \"anthropic\""
+                            .to_owned(),
+                    ));
+                }
+            }
+            if api_key_file.is_none() {
+                return Err(ConfigError::Missing(
+                    "summaries.llm.api_key_file (the anthropic dialect authenticates with an API \
+                     key read from a file)"
+                        .to_owned(),
+                ));
+            }
+        }
+        LlmDialect::Vertex => {
+            if project.is_none() {
+                return Err(ConfigError::Missing(
+                    "summaries.llm.project (the vertex dialect addresses a Google Cloud project)"
+                        .to_owned(),
+                ));
+            }
+            if region.is_none() {
+                return Err(ConfigError::Missing(
+                    "summaries.llm.region (the vertex dialect addresses a region, or \"global\")"
+                        .to_owned(),
+                ));
+            }
+            if bearer_token_file.is_some() && bearer_token_command.is_some() {
+                return Err(invalid(
+                    "bearer_token_command",
+                    "set bearer_token_file OR bearer_token_command, not both: two sources for one \
+                     credential is a question about which one won"
+                        .to_owned(),
+                ));
+            }
+            if bearer_token_file.is_none()
+                && bearer_token_command.is_none()
+                && client_identity_file.is_none()
+                && api_key_file.is_none()
+            {
+                return Err(ConfigError::Missing(
+                    "a credential for summaries.llm: bearer_token_file, bearer_token_command, \
+                     client_identity_file or api_key_file"
+                        .to_owned(),
+                ));
+            }
+        }
+    }
+
+    let base_url = match text(file.base_url) {
+        Some(url) => url.trim_end_matches('/').to_owned(),
+        None => match dialect {
+            LlmDialect::Anthropic => DEFAULT_ANTHROPIC_BASE_URL.to_owned(),
+            LlmDialect::Vertex => vertex_base_url(region.as_deref().unwrap_or("global")),
+        },
+    };
+    let parsed = reqwest::Url::parse(&base_url)
+        .map_err(|error| invalid("base_url", format!("{base_url:?} is not a URL ({error})")))?;
+    let loopback = matches!(
+        parsed.host(),
+        Some(url::Host::Ipv4(ip)) if ip.is_loopback()
+    ) || matches!(parsed.host(), Some(url::Host::Ipv6(ip)) if ip.is_loopback())
+        || parsed.host_str() == Some("localhost");
+    match parsed.scheme() {
+        "https" => {}
+        // Plain HTTP only to this machine, which is what a local mock or a sidecar is. Anywhere
+        // else it would carry the credential and other people's channel text in the clear.
+        "http" if loopback => {}
+        other => {
+            return Err(invalid(
+                "base_url",
+                format!(
+                    "{base_url:?} uses {other:?}; use https (plain http is accepted only for a \
+                     loopback address)"
+                ),
+            ))
+        }
+    }
+    if parsed.query().is_some() || parsed.fragment().is_some() || !parsed.username().is_empty() {
+        return Err(invalid(
+            "base_url",
+            "must be a plain base URL, with no credentials, query or fragment".to_owned(),
+        ));
+    }
+
+    let mut extra_headers = BTreeMap::new();
+    for (name, value) in file.extra_headers.unwrap_or_default() {
+        let lower = name.trim().to_ascii_lowercase();
+        if RESERVED_LLM_HEADERS.contains(&lower.as_str()) {
+            return Err(invalid(
+                "extra_headers",
+                format!("{name:?} is set by this server and cannot be overridden here"),
+            ));
+        }
+        if reqwest::header::HeaderName::from_bytes(lower.as_bytes()).is_err()
+            || reqwest::header::HeaderValue::from_str(&value).is_err()
+        {
+            // The value is not echoed: it is not meant to be a secret, but a header is exactly
+            // where somebody would paste one.
+            return Err(invalid(
+                "extra_headers",
+                format!("{name:?} is not a valid header name, or its value is not a valid value"),
+            ));
+        }
+        extra_headers.insert(lower, value);
+    }
+
+    let max_tokens = file.max_tokens.unwrap_or(DEFAULT_LLM_MAX_TOKENS);
+    if !(1..=4096).contains(&max_tokens) {
+        return Err(invalid(
+            "max_tokens",
+            format!("{max_tokens} is outside 1 to 4096; a summary is one sentence"),
+        ));
+    }
+    let timeout_secs = file.timeout_secs.unwrap_or(DEFAULT_LLM_TIMEOUT_SECS);
+    if !(1..=600).contains(&timeout_secs) {
+        return Err(invalid(
+            "timeout_secs",
+            format!("{timeout_secs} is outside 1 to 600 seconds"),
+        ));
+    }
+    let requests_per_minute = file
+        .requests_per_minute
+        .unwrap_or(DEFAULT_LLM_REQUESTS_PER_MINUTE);
+    let burst = file.burst.unwrap_or(DEFAULT_LLM_BURST);
+    if requests_per_minute == 0 || burst == 0 {
+        return Err(invalid(
+            if requests_per_minute == 0 {
+                "requests_per_minute"
+            } else {
+                "burst"
+            },
+            "must be at least 1. Zero is not 'unlimited'; it is a summariser that never calls"
+                .to_owned(),
+        ));
+    }
+    Ok(LlmConfig {
+        dialect,
+        base_url,
+        model,
+        project,
+        region,
+        api_key_file,
+        bearer_token_file,
+        bearer_token_command,
+        client_identity_file,
+        ca_bundle_file,
+        extra_headers,
+        max_tokens,
+        timeout_secs,
+        requests_per_minute,
+        burst,
+    })
+}
+
+/// Environment variable naming configuration OVERLAY files, separated by `:`, applied after any
+/// `--config-overlay` flags. See [`merge_overlays`].
+pub const ENV_CONFIG_OVERLAY: &str = "VIBE_TALK_CONFIG_OVERLAY";
+
+/// Lay overlay TOML documents over a base document, table by table, and return the merged text.
+///
+/// The problem it solves: one configuration file shared by two hosts, where one host needs its own
+/// `[summaries.llm]` (a different credential path, a different gateway) without editing the shared
+/// file. Each overlay is a TOML document whose tables MERGE into the base: a key it sets replaces
+/// the base's value, a table it names is merged key by key, and everything it does not mention is
+/// left as the base has it. An ARRAY is a value like any other and is replaced whole, so an
+/// overlay that writes `[[channels]]` replaces the channel list rather than appending to it.
+///
+/// Overlays apply in order, each over the result of the last. Each is parsed on its own first, so
+/// a syntax error is reported against the file that has it.
+///
+/// # Errors
+///
+/// [`ConfigError::Parse`] when any document does not parse; [`ConfigError::Invalid`] when the
+/// merged document cannot be written back out.
+pub fn merge_overlays(base: &str, overlays: &[(String, String)]) -> Result<String, ConfigError> {
+    let mut merged: toml::Table = toml::from_str(base)?;
+    for (label, text) in overlays {
+        let overlay: toml::Table = toml::from_str(text).map_err(|error| ConfigError::Invalid {
+            field: format!("configuration overlay {label}"),
+            detail: format!("did not parse: {error}"),
+        })?;
+        merge_table(&mut merged, overlay);
+    }
+    toml::to_string(&merged).map_err(|error| ConfigError::Invalid {
+        field: "configuration overlay".to_owned(),
+        detail: format!("the merged configuration could not be written back out: {error}"),
+    })
+}
+
+fn merge_table(base: &mut toml::Table, overlay: toml::Table) {
+    for (key, value) in overlay {
+        match (base.get_mut(&key), value) {
+            (Some(toml::Value::Table(into)), toml::Value::Table(from)) => merge_table(into, from),
+            (_, value) => {
+                base.insert(key, value);
+            }
+        }
+    }
+}
+
+impl Config {
+    /// [`Config::load`], with overlay files laid over the base before anything is resolved.
+    ///
+    /// `base` is `None` for a deployment configured from the environment alone. See
+    /// [`merge_overlays`] for the merge rule.
+    ///
+    /// # Errors
+    ///
+    /// [`ConfigError::Read`] when a file cannot be read, and anything [`Config::from_toml_and_env`]
+    /// or [`merge_overlays`] refuses.
+    pub fn load_layered(base: Option<&Path>, overlays: &[PathBuf]) -> Result<Self, ConfigError> {
+        let read = |path: &Path| {
+            std::fs::read_to_string(path).map_err(|source| ConfigError::Read {
+                path: path.display().to_string(),
+                source,
+            })
+        };
+        let text = base.map(read).transpose()?.unwrap_or_default();
+        let mut layers = Vec::new();
+        for overlay in overlays {
+            layers.push((overlay.display().to_string(), read(overlay)?));
+        }
+        let env: BTreeMap<String, String> = std::env::vars().collect();
+        if layers.is_empty() {
+            return Self::from_toml_and_env(&text, &env);
+        }
+        Self::from_toml_and_env(&merge_overlays(&text, &layers)?, &env)
+    }
 }
 
 /// Resolve the `[storage]` section.

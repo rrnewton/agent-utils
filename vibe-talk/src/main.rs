@@ -8,7 +8,7 @@ use std::time::Duration;
 use anyhow::Context as _;
 use vibe_talk::agent_backend::NoAgentBackend;
 use vibe_talk::chat::ChatClient;
-use vibe_talk::config::{Config, ReadAloudBackend, ENV_CONFIG_PATH};
+use vibe_talk::config::{Config, ReadAloudBackend, ENV_CONFIG_OVERLAY, ENV_CONFIG_PATH};
 use vibe_talk::discord::fake::FakeDiscord;
 use vibe_talk::elevenlabs::http::HttpElevenLabsClient;
 use vibe_talk::elevenlabs::SignedUrlProvider;
@@ -29,10 +29,17 @@ const USAGE: &str = "\
 vibe-talk — a chat bridge for a voice agent
 
 USAGE:
-    vibe-talk [--config PATH] [--fake-discord] [--skip-startup-probe]
+    vibe-talk [--config PATH] [--config-overlay PATH]... [--fake-discord] [--skip-startup-probe]
 
 OPTIONS:
     --config PATH         configuration file (default: $VIBE_TALK_CONFIG, else ./vibe-talk.toml)
+    --config-overlay PATH a TOML file laid over the configuration file, for settings one host
+                          needs and a shared file must not carry (for example its own
+                          [summaries.llm]). Repeatable; applied in order. Its tables MERGE into the
+                          configuration key by key; a key or an array it sets replaces the base's,
+                          so an overlay that writes [[channels]] replaces the whole channel list.
+                          Also settable as VIBE_TALK_CONFIG_OVERLAY=PATH[:PATH...], applied after
+                          the flags. A named overlay must exist.
     --fake-discord        run against an in-memory Discord with seeded messages, for local
                           development
     --skip-startup-probe  do not check at startup that each configured channel is readable.
@@ -173,6 +180,7 @@ const SEEDED_BACKLOG: &[(&str, &str)] = &[
 
 struct Args {
     config: Option<PathBuf>,
+    overlays: Vec<PathBuf>,
     fake_discord: bool,
     skip_startup_probe: bool,
 }
@@ -180,6 +188,7 @@ struct Args {
 fn parse_args() -> anyhow::Result<Option<Args>> {
     let mut args = Args {
         config: None,
+        overlays: Vec::new(),
         fake_discord: false,
         skip_startup_probe: false,
     };
@@ -197,6 +206,10 @@ fn parse_args() -> anyhow::Result<Option<Args>> {
             "--config" => {
                 let value = argv.next().context("--config needs a path")?;
                 args.config = Some(PathBuf::from(value));
+            }
+            "--config-overlay" => {
+                let value = argv.next().context("--config-overlay needs a path")?;
+                args.overlays.push(PathBuf::from(value));
             }
             "--fake-discord" => args.fake_discord = true,
             "--skip-startup-probe" => args.skip_startup_probe = true,
@@ -228,9 +241,21 @@ async fn main() -> anyhow::Result<()> {
         .config
         .or_else(|| std::env::var_os(ENV_CONFIG_PATH).map(PathBuf::from))
         .unwrap_or_else(|| PathBuf::from("vibe-talk.toml"));
+    // Overlays: the flags in order, then the environment's. Every one is named in the log, because
+    // a setting that came from a file the operator forgot about is the hardest kind to find.
+    let mut overlays = args.overlays;
+    if let Some(listed) = std::env::var_os(ENV_CONFIG_OVERLAY) {
+        overlays.extend(std::env::split_paths(&listed).filter(|path| !path.as_os_str().is_empty()));
+    }
+    for overlay in &overlays {
+        if !overlay.exists() {
+            anyhow::bail!("configuration overlay {} does not exist", overlay.display());
+        }
+        tracing::info!(path = %overlay.display(), "laying a configuration overlay over the base");
+    }
     let config = if config_path.exists() {
         tracing::info!(path = %config_path.display(), "reading configuration file");
-        Config::load(&config_path)
+        Config::load_layered(Some(&config_path), &overlays)
             .with_context(|| format!("loading configuration from {}", config_path.display()))?
     } else if explicit {
         anyhow::bail!(
@@ -242,7 +267,7 @@ async fn main() -> anyhow::Result<()> {
             path = %config_path.display(),
             "no configuration file found; taking the ENTIRE configuration from the environment"
         );
-        Config::from_toml_and_env("", &std::env::vars().collect())
+        Config::load_layered(None, &overlays)
             .context("assembling configuration from the environment alone")?
     };
 
@@ -397,9 +422,10 @@ async fn main() -> anyhow::Result<()> {
         Arc::new(HttpElevenLabsClient::new().context("building the ElevenLabs client")?);
 
     // ONE summariser, built in ONE place — `summarize::summarizer_for`, which the tests call too,
-    // so nothing here can drift from what a test believes the binary built. Say which it is and
-    // under which policy version: the version is what a person with a shell greps the cache by
-    // when they suspect a stale entry.
+    // so nothing here can drift from what a test believes the binary built: the direct Messages
+    // API call when `[summaries.llm]` is configured, else the ElevenLabs agent. Say which it is
+    // and under which policy version: the version is what a person with a shell greps the cache
+    // by when they suspect a stale entry.
     let summarizer = vibe_talk::summarize::summarizer_for(
         &config.elevenlabs,
         &config.summaries,
@@ -411,17 +437,43 @@ async fn main() -> anyhow::Result<()> {
         ),
     );
     // Unconfigured is a warning here and a per-request refusal there, never a refusal to start:
-    // the Discord half of this server is useful on its own, and a deployment that mistyped a key
-    // should still come up far enough to say so. It is unconditional because there is no longer a
-    // summariser that needs no vendor — this IS the path that produces the failed rows.
-    let summaries_possible = vibe_talk::elevenlabs::credentials(&config.elevenlabs);
-    if let Err(error) = &summaries_possible {
-        tracing::warn!(
-            %error,
-            "this deployment has NO ElevenLabs credentials, so EVERY summary will fail and /voice \
-             will draw those rows as failed. There is no summariser that needs no vendor: the \
-             extractive one was removed. Set elevenlabs.api_key and elevenlabs.agent_id to turn \
-             summaries on."
+    // the chat half of this server is useful on its own, and a deployment that mistyped a key
+    // should still come up far enough to say so. There is no summariser that needs no vendor —
+    // this IS the path that produces the failed rows.
+    let summaries_unavailable = summarizer.unavailable_reason();
+    if let Some(error) = &summaries_unavailable {
+        if config.summaries.llm.is_some() {
+            tracing::warn!(
+                %error,
+                "the [summaries.llm] summariser cannot work as configured, so EVERY summary will \
+                 fail and /voice will draw those rows as failed, and no thread will be named. Fix \
+                 the setting named here; nothing else needs to change."
+            );
+        } else {
+            tracing::warn!(
+                %error,
+                "this deployment has NO summariser it can use: no [summaries.llm] section and no \
+                 ElevenLabs credentials. EVERY summary will fail and /voice will draw those rows \
+                 as failed. Configure [summaries.llm] (see the README's Summaries section), or set \
+                 elevenlabs.api_key and elevenlabs.agent_id."
+            );
+        }
+    }
+    let summaries_possible = summaries_unavailable.is_none();
+    // `#233 llm-summarizer`. Which provider, which dialect and which model — never a credential,
+    // and never a credential's path, which says more about a host than this line needs to.
+    if let Some(llm) = &config.summaries.llm {
+        tracing::info!(
+            dialect = llm.dialect.as_str(),
+            model = %llm.model,
+            base_url = %llm.base_url,
+            max_tokens = llm.max_tokens,
+            requests_per_minute = llm.requests_per_minute,
+            burst = llm.burst,
+            client_identity = llm.client_identity_file.is_some(),
+            bearer_token = llm.bearer_token_file.is_some() || llm.bearer_token_command.is_some(),
+            "summaries and thread names come from one Messages API call apiece, with NO tools; the \
+             text of the messages being summarised is sent to this model provider"
         );
     }
     let summary_version =
@@ -433,7 +485,7 @@ async fn main() -> anyhow::Result<()> {
         target_chars = config.summaries.target_chars,
         // Said here as well as three lines above, because a reader who greps for the backend line
         // should not also have to find the warning above it to learn that it cannot work.
-        summaries_available = summaries_possible.is_ok(),
+        summaries_available = summaries_possible,
         // The prose deliberately does NOT repeat the field's rendered form. It used to say
         // `summaries_available=false` in words, which meant a test asserting on that string
         // passed while the field itself had been deleted — the assertion was reading the
@@ -548,6 +600,7 @@ async fn main() -> anyhow::Result<()> {
         live: Arc::clone(&live),
         summarizer,
         summary_version: summary_version.into(),
+        thread_names: Arc::new(vibe_talk::summarize::threads::ThreadNames::new()),
     };
     // CHANNELS THE OWNER ADDED FROM INSIDE THE APP, brought back into the allowlist before the
     // server answers anything. They were probed when they were added; they are not probed again
