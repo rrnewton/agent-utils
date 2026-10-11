@@ -850,9 +850,11 @@ def test_wrkslots_lifecycle_partitions_are_disjoint_and_complete() -> None:
     # unmarked match is still refused) are mapped.
     # The user-systemd per-listing bound regression test of
     # https://github.com/rrnewton/agent-utils/issues/235 is mapped.
-    assert len(all_tests) == 1876
-    assert len(ordinary) == 290
-    assert len(mapped) == 1586
+    # The 14 frozen-validation-parser cases of 88039882, 7ae34255 and 73cdf9c4
+    # are 8 ordinary and 6 mapped, all parametrized cases of tests named above.
+    assert len(all_tests) == 1890
+    assert len(ordinary) == 298
+    assert len(mapped) == 1592
     assert {
         node.split("::", 1)[1].split("[", 1)[0] for node in ordinary
     } == {
