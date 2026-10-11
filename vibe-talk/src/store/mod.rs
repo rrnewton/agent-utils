@@ -662,6 +662,22 @@ pub struct SummaryKey {
     pub version: String,
 }
 
+/// The [`SummaryKey::version`] of a summary-cache entry that belongs to NO summary policy, and is
+/// therefore KEPT when the policy changes. `#233 llm-summarizer`.
+///
+/// A thread's display name is the one such entry: it is chosen once and must not change because a
+/// prompt was edited, a model was swapped or an unrelated message was summarised, since the reader
+/// finds the thread by it. An entry under this version is:
+///
+/// * left alone by [`StateStore::forget_summaries_except`], whatever version it is told to keep;
+/// * counted against [`Retention::max_summaries`] SEPARATELY from ordinary summaries, so a day of
+///   summary traffic never evicts one, and they never crowd out a summary;
+/// * still collected by the age limit, `retain_days`, like every other cached entry — its writer
+///   refreshes it while it is in use — and by the purge.
+///
+/// No policy version can be spelled this way: those all start `v1-`.
+pub const KEPT_VERSION: &str = "kept";
+
 /// Bounds on how much the store keeps.
 ///
 /// Unbounded retention is the failure this exists to prevent: a store that grows forever is both
@@ -685,6 +701,9 @@ pub struct Retention {
     pub max_turns_per_conversation: u16,
     /// How many cached summaries to keep. The least recently written are dropped first. At
     /// least 1.
+    ///
+    /// Entries under [`KEPT_VERSION`] (thread names) are counted separately, against the same
+    /// ceiling, so neither kind can evict the other.
     pub max_summaries: u32,
     /// How many "dealt with" marks to keep, across all channels. The oldest are dropped first.
     ///
@@ -1419,7 +1438,7 @@ pub trait StateStore: Send + Sync {
     async fn cache_summary(&self, key: &SummaryKey, summary: &str) -> Result<(), StoreError>;
 
     /// Delete every cached summary produced under a policy other than `version`, returning how
-    /// many went.
+    /// many went. Entries under [`KEPT_VERSION`] belong to no policy and are never deleted here.
     ///
     /// Run at startup. Without it a changed policy leaves the old entries on disk forever:
     /// unreachable, invisible, and still a copy of other people's text at rest. It collects

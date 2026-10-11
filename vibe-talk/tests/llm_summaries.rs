@@ -14,8 +14,12 @@ use tower::ServiceExt as _;
 use vibe_talk::chat::{ChatClient, ChatError, ChatIdentity};
 use vibe_talk::model::{ChannelId, Message, MessageId, UserId};
 use vibe_talk::state::AppState;
+use vibe_talk::store::fake::FakeStore;
+use vibe_talk::store::{StateStore as _, SummaryKey};
 use vibe_talk::summarize::fake::FakeSummarizer;
-use vibe_talk::summarize::threads::{record_key, ThreadNames, ThreadRecord};
+use vibe_talk::summarize::threads::{
+    name_key, sentence_key, FiledName, FiledSentence, ThreadDeps, ThreadNames,
+};
 use vibe_talk::testing::{self, READ_TOKEN, WRITE_CHANNEL, WRITE_TOKEN};
 use vibe_talk::threads::{ThreadSummary, TimelinePage, TimelineRequest, TimelineView};
 
@@ -235,6 +239,8 @@ async fn a_host_overlay_moving_to_vertex_sends_none_of_the_shared_files_key() {
 struct Threads {
     replies: Mutex<[u64; 2]>,
     thread_reads: Mutex<Vec<String>>,
+    /// When set, every thread's `updated_at`.
+    updated: Mutex<Option<String>>,
 }
 
 const THREADS: [&str; 2] = ["spaces/A/threads/runner", "spaces/A/threads/cache"];
@@ -269,7 +275,12 @@ impl Threads {
             title: format!("thread {n} starts here"),
             reply_count: Some(self.replies.lock().unwrap()[n]),
             reply_count_exact: true,
-            updated_at: format!("2026-10-11T08:0{n}:00Z"),
+            updated_at: self
+                .updated
+                .lock()
+                .unwrap()
+                .clone()
+                .unwrap_or_else(|| format!("2026-10-11T08:0{n}:00Z")),
             display_name: None,
             summary: None,
         }
@@ -355,11 +366,12 @@ struct Harness {
     threads: Arc<Threads>,
     summarizer: Arc<FakeSummarizer>,
     names: Arc<ThreadNames>,
+    store: Arc<FakeStore>,
 }
 
 fn harness() -> Harness {
     let summarizer = Arc::new(FakeSummarizer::naming_threads());
-    let (mut state, _discord, _store) =
+    let (mut state, _discord, store) =
         testing::state_with_backend(&testing::config_toml(), summarizer.clone());
     let threads = Arc::new(Threads::default());
     state.replace_chat(threads.clone());
@@ -369,7 +381,36 @@ fn harness() -> Harness {
         state,
         threads,
         summarizer,
+        store,
     }
+}
+
+fn channel() -> ChannelId {
+    ChannelId("2222222222".to_owned())
+}
+
+/// The thread list as the provider answers it, before any name is attached.
+async fn thread_page(threads: &Threads) -> (TimelineRequest, TimelinePage) {
+    let request = TimelineRequest {
+        view: TimelineView::Threads,
+        thread_id: None,
+        before: None,
+        after: None,
+        limit: 50,
+    };
+    let page = threads
+        .fetch_timeline(&channel(), &request)
+        .await
+        .expect("a page");
+    (request, page)
+}
+
+/// Each thread's id and display name, from an annotated page.
+fn page_names(page: &TimelinePage) -> Vec<(String, Option<String>)> {
+    page.threads
+        .iter()
+        .map(|thread| (thread.id.clone(), thread.display_name.clone()))
+        .collect()
 }
 
 const THREAD_LIST: &str = "/api/v1/channels/2222222222/timeline?view=threads";
@@ -437,20 +478,30 @@ async fn a_thread_list_read_by_the_owner_names_its_threads_in_the_background() {
         assert!(prompt.contains("starts here"), "{prompt}");
     }
 
-    // ...and the record is filed, under the summary policy version.
-    let filed = h
+    // ...and both halves are filed: the name under the version no policy change removes, the
+    // sentence under the summary policy version.
+    let name = h
         .state
         .store
-        .cached_summary(&record_key(
+        .cached_summary(&name_key(&channel(), THREADS[0]))
+        .await
+        .expect("readable")
+        .expect("filed");
+    let name: FiledName = serde_json::from_str(&name).expect("a name row");
+    assert!(name.name.starts_with("thread-"), "{name:?}");
+    let sentence = h
+        .state
+        .store
+        .cached_summary(&sentence_key(
             &h.state.summary_version,
-            &ChannelId(WRITE_CHANNEL.to_owned()),
+            &channel(),
             THREADS[0],
         ))
         .await
         .expect("readable")
         .expect("filed");
-    let record: ThreadRecord = serde_json::from_str(&filed).expect("a record");
-    assert_eq!(record.at, 1, "named at one message: the root");
+    let sentence: FiledSentence = serde_json::from_str(&sentence).expect("a sentence row");
+    assert_eq!(sentence.at, 1, "named at one message: the root");
 
     // A read with nothing due asks nothing.
     let (_, _) = call(&h.app, THREAD_LIST, WRITE_TOKEN).await;
@@ -557,6 +608,222 @@ async fn names_survive_a_restart_through_the_store() {
     tokio::time::sleep(Duration::from_millis(50)).await;
     assert_eq!(names.named(), 0, "nothing was renamed after the restart");
     assert_eq!(h.summarizer.thread_prompts().len(), 2);
+}
+
+#[tokio::test]
+async fn a_name_survives_a_policy_change_and_a_flood_of_newer_summaries() {
+    // The display name is chosen ONCE. Filed under the summary policy version, it used to be
+    // swept by any policy change and evicted by ordinary summary traffic, and the thread was then
+    // given a different name.
+    let h = harness();
+    call(&h.app, THREAD_LIST, WRITE_TOKEN).await;
+    until_named(&h.names, 2).await;
+    let (_, before) = call(&h.app, THREAD_LIST, WRITE_TOKEN).await;
+    let names_before: Vec<_> = names_of(&before)
+        .into_iter()
+        .map(|(id, name, _)| (id, name))
+        .collect();
+    assert!(names_before.iter().all(|(_, name)| name.is_some()));
+
+    // A restart under a CHANGED policy: the startup sweep runs, as `main` runs it...
+    let version: Arc<str> = Arc::from("v1-messages-api-w3-c160-0000000000000001");
+    assert_ne!(version, h.state.summary_version);
+    h.state
+        .store
+        .forget_summaries_except(&version)
+        .await
+        .expect("the sweep");
+    // ...and then more ordinary summaries than the cache's whole ceiling.
+    let ceiling = vibe_talk::store::Retention::default().max_summaries;
+    for n in 0..=u64::from(ceiling) {
+        h.state
+            .store
+            .cache_summary(
+                &SummaryKey {
+                    channel: channel(),
+                    message: MessageId(format!("1{n:018}")),
+                    content_hash: n,
+                    version: version.to_string(),
+                },
+                "an ordinary summary",
+            )
+            .await
+            .expect("cache");
+    }
+    let restarted = AppState {
+        thread_names: Arc::new(ThreadNames::new()),
+        summary_version: Arc::clone(&version),
+        ..h.state.clone()
+    };
+    let names = Arc::clone(&restarted.thread_names);
+    let app = vibe_talk::http::router(restarted);
+    let (_, after) = call(&app, THREAD_LIST, WRITE_TOKEN).await;
+    let names_after: Vec<_> = names_of(&after)
+        .into_iter()
+        .map(|(id, name, _)| (id, name))
+        .collect();
+    assert_eq!(
+        names_after, names_before,
+        "a policy change and {ceiling} newer summaries renamed a thread"
+    );
+
+    // The SENTENCES belonged to the old policy, so they are asked for again; the names stay.
+    until_named(&names, 2).await;
+    let (_, later) = call(&app, THREAD_LIST, WRITE_TOKEN).await;
+    let later = names_of(&later);
+    assert!(later.iter().all(|(_, _, sentence)| sentence.is_some()));
+    assert_eq!(
+        later
+            .into_iter()
+            .map(|(id, name, _)| (id, name))
+            .collect::<Vec<_>>(),
+        names_before
+    );
+}
+
+#[tokio::test]
+async fn a_store_that_cannot_be_read_never_gives_a_thread_a_second_name() {
+    let h = harness();
+    call(&h.app, THREAD_LIST, WRITE_TOKEN).await;
+    until_named(&h.names, 2).await;
+    let deps = ThreadDeps::from_state(&h.state);
+    let (request, mut page) = thread_page(&h.threads).await;
+    h.names
+        .annotate(&deps, &channel(), &request, &mut page, true)
+        .await;
+    let names_before = page_names(&page);
+
+    // A restart, so nothing is in memory, and the store's next read fails.
+    let names = Arc::new(ThreadNames::new());
+    h.store.fail_next("the disk is busy");
+    let (request, mut page) = thread_page(&h.threads).await;
+    names
+        .annotate(&deps, &channel(), &request, &mut page, true)
+        .await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(
+        page_names(&page)[0].1,
+        None,
+        "the name that could not be read is not invented"
+    );
+    assert_eq!(
+        names.pending() + names.named(),
+        0,
+        "a thread whose name could not be READ was queued for a new one"
+    );
+    assert_eq!(
+        h.summarizer.thread_prompts().len(),
+        2,
+        "the model was asked again"
+    );
+
+    // Once the store answers, the name it held is the name shown.
+    let (request, mut page) = thread_page(&h.threads).await;
+    names
+        .annotate(&deps, &channel(), &request, &mut page, true)
+        .await;
+    assert_eq!(page_names(&page), names_before);
+}
+
+#[tokio::test]
+async fn a_naming_queued_on_stale_knowledge_keeps_the_name_already_filed() {
+    // One instance learns, through a read token, that the threads have no name, and remembers it.
+    // Another then names them. When the first is finally read by the owner, its memory still says
+    // "unnamed" and it queues both — and the naming must re-read the store and keep the names.
+    let h = harness();
+    let deps = ThreadDeps::from_state(&h.state);
+    let stale = Arc::new(ThreadNames::new());
+    let (request, mut page) = thread_page(&h.threads).await;
+    stale
+        .annotate(&deps, &channel(), &request, &mut page, false)
+        .await;
+    assert!(page_names(&page).iter().all(|(_, name)| name.is_none()));
+
+    call(&h.app, THREAD_LIST, WRITE_TOKEN).await;
+    until_named(&h.names, 2).await;
+    let (request, mut page) = thread_page(&h.threads).await;
+    h.names
+        .annotate(&deps, &channel(), &request, &mut page, false)
+        .await;
+    let filed = page_names(&page);
+
+    let (request, mut page) = thread_page(&h.threads).await;
+    stale
+        .annotate(&deps, &channel(), &request, &mut page, true)
+        .await;
+    until_named(&stale, 2).await;
+    let (request, mut page) = thread_page(&h.threads).await;
+    stale
+        .annotate(&deps, &channel(), &request, &mut page, false)
+        .await;
+    assert_eq!(page_names(&page), filed, "a filed name was replaced");
+}
+
+#[tokio::test]
+async fn an_active_thread_keeps_its_name_row_fresh_without_asking_the_model() {
+    // The age limit counts from a row's last write. A thread that stays active but between
+    // sentence refreshes must not age its name out, so a read that sees it active rewrites the
+    // row, at most daily, with no model call.
+    let h = harness();
+    let deps = ThreadDeps::from_state(&h.state);
+    let now = jiff::Timestamp::now().as_second();
+    let old = now - 2 * 24 * 60 * 60;
+    *h.threads.updated.lock().unwrap() = Some(
+        jiff::Timestamp::from_second(now - 3_600)
+            .unwrap()
+            .to_string(),
+    );
+    for thread in THREADS {
+        h.store
+            .cache_summary(
+                &name_key(&channel(), thread),
+                &serde_json::to_string(&FiledName {
+                    name: "runner-wedged".to_owned(),
+                    touched: old,
+                })
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        h.store
+            .cache_summary(
+                &sentence_key(&h.state.summary_version, &channel(), thread),
+                &serde_json::to_string(&FiledSentence {
+                    summary: "It is stuck.".to_owned(),
+                    at: 1,
+                })
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+    }
+    let (request, mut page) = thread_page(&h.threads).await;
+    h.names
+        .annotate(&deps, &channel(), &request, &mut page, true)
+        .await;
+    let touched = || async {
+        let text = h
+            .store
+            .cached_summary(&name_key(&channel(), THREADS[0]))
+            .await
+            .unwrap()
+            .unwrap();
+        serde_json::from_str::<FiledName>(&text).unwrap()
+    };
+    for _ in 0..100 {
+        if touched().await.touched > old {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let row = touched().await;
+    assert!(row.touched >= now, "the row was not rewritten: {row:?}");
+    assert_eq!(row.name, "runner-wedged", "the name itself is unchanged");
+    assert!(
+        h.summarizer.thread_prompts().is_empty(),
+        "keeping a name fresh asked the model"
+    );
+    assert_eq!(h.names.pending() + h.names.named(), 0);
 }
 
 #[tokio::test]

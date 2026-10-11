@@ -22,13 +22,23 @@
 //!
 //! # Where it is kept
 //!
-//! In the summary cache ([`crate::store::StateStore::cache_summary`]), under the summary policy
-//! version, as one JSON record per thread: the name, the sentence, and how many messages the
-//! thread had when the sentence was written. That makes it subject to the same rules as every
-//! cached summary — a changed summary policy (model, prompt, budget) re-derives it, and
-//! [`crate::store::Retention`] collects a record that has not been rewritten within
-//! `retain_days`, which for a thread means one that has been quiet that long. With no store
-//! configured, names are remembered for the life of the process.
+//! In the summary cache ([`crate::store::StateStore::cache_summary`]), as two rows per thread,
+//! because the two halves live by different rules:
+//!
+//! * the NAME, under [`crate::store::KEPT_VERSION`] rather than the summary policy version. No
+//!   change of policy (model, prompt, budget, any summary setting) removes it, and ordinary
+//!   summary traffic cannot evict it: kept rows are counted separately. The age limit,
+//!   `retain_days`, still applies, so the row is rewritten whenever the thread is named or
+//!   re-sentenced and, at most daily, when a write-scope read sees the thread active since it was
+//!   last written ([`TOUCH_AFTER`]). A thread quiet (or unread) for longer than `retain_days` loses
+//!   its name, and is named afresh when it is next listed.
+//! * the SENTENCE, with the message count it was written at, under the summary policy version
+//!   like any summary: a changed policy re-derives the sentence, and keeps the name.
+//!
+//! A name is chosen once in a stronger sense too: a store that cannot be read is never taken to
+//! mean "no name". Nothing is queued for such a thread, and a naming re-reads the filed name
+//! before it writes, so a hiccup cannot give a thread a second name. With no store configured,
+//! names are remembered for the life of the process.
 //!
 //! # Untrusted input
 //!
@@ -86,9 +96,16 @@ pub const RETRY_AFTER_FAILURE: Duration = Duration::from_secs(10 * 60);
 const MAX_PENDING: usize = 256;
 /// The most thread records held in memory before the cache is dropped and re-read from the store.
 const MAX_KNOWN: usize = 10_000;
-/// What a thread record's id is prefixed with in the summary cache. No provider's message id
-/// starts this way, so a record cannot collide with a message summary.
-pub const RECORD_PREFIX: &str = "thread-name:";
+/// What a thread NAME row's id is prefixed with in the summary cache. No provider's message id
+/// starts this way, so a name cannot collide with a message summary.
+pub const NAME_PREFIX: &str = "thread-name:";
+/// What a thread SENTENCE row's id is prefixed with in the summary cache.
+pub const SENTENCE_PREFIX: &str = "thread-sentence:";
+/// How old a name row may get before a write-scope read that sees its thread active since then
+/// rewrites it. The age limit (`storage.retain_days`) counts from a row's last write, so without
+/// this a thread that stays active but between sentence refreshes for that long — nine messages
+/// after its eighth, say — would lose its name. Once a day per thread at most, and no model call.
+pub const TOUCH_AFTER: Duration = Duration::from_secs(24 * 60 * 60);
 
 /// One thread to name, and the prompt that says so.
 ///
@@ -264,28 +281,67 @@ fn strip_label(line: &str) -> &str {
     line
 }
 
-/// One thread's name and sentence, as filed.
+/// A thread's display name as filed: under [`crate::store::KEPT_VERSION`], so no change of
+/// summary policy and no amount of summary traffic removes it.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ThreadRecord {
+pub struct FiledName {
     /// The display name, chosen once.
     pub name: String,
-    /// The sentence, as of `at` messages.
+    /// When the row was last written, in Unix seconds. The age limit counts from the row's write,
+    /// so the row is rewritten while its thread stays active; see [`TOUCH_AFTER`].
+    pub touched: i64,
+}
+
+/// A thread's sentence as filed: under the summary policy version, like any summary, so a changed
+/// policy re-derives it (the name is kept regardless).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FiledSentence {
+    /// The sentence.
     pub summary: String,
     /// How many messages the thread had when the sentence was written.
     pub at: u64,
 }
 
-/// Where a thread record is filed in the summary cache.
+/// One thread's name and sentence, as this server knows them.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ThreadRecord {
+    /// The display name, chosen once.
+    pub name: String,
+    /// When the name's row was last written, in Unix seconds.
+    pub touched: i64,
+    /// The sentence, when there is one under the current policy.
+    pub sentence: Option<FiledSentence>,
+}
+
+/// Where a thread's NAME is filed in the summary cache: under [`crate::store::KEPT_VERSION`], not
+/// under the summary policy, because the name outlives every policy.
 #[must_use]
-pub fn record_key(version: &str, channel: &ChannelId, thread: &str) -> SummaryKey {
+pub fn name_key(channel: &ChannelId, thread: &str) -> SummaryKey {
     SummaryKey {
         channel: channel.clone(),
-        message: MessageId(format!("{RECORD_PREFIX}{thread}")),
-        // The record is replaced in place as the sentence is refreshed; there is no content to
-        // hash, because WHICH messages it was written from is `at`, inside the record.
+        message: MessageId(format!("{NAME_PREFIX}{thread}")),
+        // Replaced in place; there is no content to hash.
+        content_hash: 0,
+        version: crate::store::KEPT_VERSION.to_owned(),
+    }
+}
+
+/// Where a thread's SENTENCE is filed in the summary cache: under the summary policy `version`.
+#[must_use]
+pub fn sentence_key(version: &str, channel: &ChannelId, thread: &str) -> SummaryKey {
+    SummaryKey {
+        channel: channel.clone(),
+        message: MessageId(format!("{SENTENCE_PREFIX}{thread}")),
+        // Replaced in place as the sentence is refreshed; WHICH messages it was written from is
+        // `at`, inside the record.
         content_hash: 0,
         version: version.to_owned(),
     }
+}
+
+/// Now, in Unix seconds.
+fn now_seconds() -> i64 {
+    jiff::Timestamp::now().as_second()
 }
 
 /// What naming a thread needs from the server, gathered so the background work holds no
@@ -298,7 +354,7 @@ pub struct ThreadDeps {
     pub store: Arc<dyn StateStore>,
     /// Who names the thread.
     pub summarizer: Arc<dyn Summarizer>,
-    /// The summary policy version records are filed under.
+    /// The summary policy version sentences are filed under.
     pub version: Arc<str>,
     /// How long the sentence should be: `summaries.target_chars`.
     pub sentence_chars: usize,
@@ -320,12 +376,23 @@ impl ThreadDeps {
 
 type Key = (ChannelId, String);
 
+/// What is known about one thread's record.
+enum Lookup {
+    /// What the store holds; `None` when the thread has no name yet.
+    Known(Option<ThreadRecord>),
+    /// The store could not be read. A name already read is still shown, but NOTHING is queued:
+    /// "could not read the name" is not "has no name", and treating it as one would give the
+    /// thread a second name the moment the store hiccupped.
+    Unknown(Option<String>),
+}
+
 /// The thread names this server knows, and the queue of threads waiting for one.
 #[derive(Debug)]
 pub struct ThreadNames {
     state: Mutex<NamesState>,
     /// One naming at a time: the summariser's limiter paces the model calls, and this paces the
-    /// chat-provider reads that come before them, which nothing else would.
+    /// chat-provider reads that come before them, which nothing else would. It also makes the
+    /// re-read of a filed name in [`name_one`] and the write after it one step.
     turn: tokio::sync::Semaphore,
 }
 
@@ -386,6 +453,7 @@ impl ThreadNames {
     /// Does nothing at all when the summariser cannot name threads. Queues nothing for a caller
     /// without write scope (`may_write` false): a read token may be served what the cache holds and
     /// never spends the model or fills the cache, the rule [`crate::ops::summarize_message`] keeps.
+    /// Queues nothing, either, for a thread whose record could not be read.
     pub async fn annotate(
         self: &Arc<Self>,
         deps: &ThreadDeps,
@@ -400,14 +468,31 @@ impl ThreadNames {
         let mut answered = HashSet::new();
         for summary in page.threads.iter_mut().chain(page.thread.iter_mut()) {
             answered.insert(summary.id.clone());
-            let record = self.record(deps, channel, &summary.id).await;
-            if let Some(record) = &record {
-                summary.display_name = Some(record.name.clone());
-                summary.summary = Some(record.summary.clone());
-            }
-            self.refresh_recent(channel, summary);
-            if may_write && due(summary, record.as_ref()) {
-                self.enqueue(deps, channel, summary.clone(), record);
+            match self.lookup(deps, channel, &summary.id).await {
+                Lookup::Known(record) => {
+                    if let Some(record) = &record {
+                        summary.display_name = Some(record.name.clone());
+                        summary.summary = record
+                            .sentence
+                            .as_ref()
+                            .map(|sentence| sentence.summary.clone());
+                    }
+                    self.refresh_recent(channel, summary);
+                    if !may_write {
+                        continue;
+                    }
+                    if due(summary, record.as_ref()) {
+                        self.enqueue(deps, channel, summary.clone(), record);
+                    } else if let Some(record) = record {
+                        if needs_touch(summary, &record, now_seconds()) {
+                            self.touch(deps, channel, &summary.id, record);
+                        }
+                    }
+                }
+                Lookup::Unknown(name) => {
+                    summary.display_name = name;
+                    self.refresh_recent(channel, summary);
+                }
             }
         }
         if request.view == TimelineView::Threads && request.after.is_some() {
@@ -426,41 +511,52 @@ impl ThreadNames {
     }
 
     /// The record for one thread: memory first, then the store.
-    async fn record(
-        &self,
-        deps: &ThreadDeps,
-        channel: &ChannelId,
-        thread: &str,
-    ) -> Option<ThreadRecord> {
+    async fn lookup(&self, deps: &ThreadDeps, channel: &ChannelId, thread: &str) -> Lookup {
         let key = (channel.clone(), thread.to_owned());
         if let Some(known) = self.lock().known.get(&key) {
-            return known.clone();
+            return Lookup::Known(known.clone());
         }
-        let filed = match deps
-            .store
-            .cached_summary(&record_key(&deps.version, channel, thread))
-            .await
-        {
-            Ok(Some(text)) => match serde_json::from_str::<ThreadRecord>(&text) {
-                Ok(record) if valid_thread_slug(&record.name) => Some(record),
-                _ => {
-                    tracing::warn!("a filed thread name is unreadable; the thread will be renamed");
-                    None
-                }
-            },
-            Ok(None) | Err(StoreError::Unavailable(_)) => None,
+        let filed = match filed_name(deps, channel, thread).await {
+            Ok(filed) => filed,
             Err(error) => {
                 // Not remembered as "nothing": a store that failed once may answer next time.
-                tracing::warn!(%error, "thread names could not be read from the store");
-                return None;
+                tracing::warn!(%error, "a thread name could not be read from the store");
+                return Lookup::Unknown(None);
+            }
+        };
+        let record = match filed {
+            None => None,
+            Some(name) => {
+                let sentence = match deps
+                    .store
+                    .cached_summary(&sentence_key(&deps.version, channel, thread))
+                    .await
+                {
+                    Ok(Some(text)) => serde_json::from_str::<FiledSentence>(&text).ok(),
+                    Ok(None) | Err(StoreError::Unavailable(_)) => None,
+                    Err(error) => {
+                        tracing::warn!(%error, "a thread sentence could not be read from the store");
+                        return Lookup::Unknown(Some(name.name));
+                    }
+                };
+                Some(ThreadRecord {
+                    name: name.name,
+                    touched: name.touched,
+                    sentence,
+                })
             }
         };
         let mut state = self.lock();
         if state.known.len() >= MAX_KNOWN {
-            state.known.clear();
+            // "Holds nothing" markers go first: they are cheap to learn again. A name goes only
+            // when names alone fill the map, and then it is read back from the store.
+            state.known.retain(|_, record| record.is_some());
+            if state.known.len() >= MAX_KNOWN {
+                state.known.clear();
+            }
         }
-        state.known.insert(key, filed.clone());
-        filed
+        state.known.insert(key, record.clone());
+        Lookup::Known(record)
     }
 
     /// Keep a renamed thread's snapshot as current as the newest read of it.
@@ -490,6 +586,33 @@ impl ThreadNames {
             .filter(|recent| recent.channel == *channel && !answered.contains(&recent.thread.id))
             .map(|recent| recent.thread.clone())
             .collect()
+    }
+
+    /// Rewrite an active thread's name row, so the age limit counts from its latest activity
+    /// rather than from when it was named. No model call: the name is the one already filed.
+    fn touch(
+        self: &Arc<Self>,
+        deps: &ThreadDeps,
+        channel: &ChannelId,
+        thread: &str,
+        record: ThreadRecord,
+    ) {
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        let touched = ThreadRecord {
+            touched: now_seconds(),
+            ..record
+        };
+        self.lock()
+            .known
+            .insert((channel.clone(), thread.to_owned()), Some(touched.clone()));
+        let deps = deps.clone();
+        let channel = channel.clone();
+        let thread = thread.to_owned();
+        runtime.spawn(async move {
+            file_name(&deps, &channel, &thread, &touched.name, touched.touched).await;
+        });
     }
 
     fn enqueue(
@@ -530,7 +653,10 @@ impl ThreadNames {
                     state.named += 1;
                     let mut renamed = snapshot;
                     renamed.display_name = Some(record.name.clone());
-                    renamed.summary = Some(record.summary.clone());
+                    renamed.summary = record
+                        .sentence
+                        .as_ref()
+                        .map(|sentence| sentence.summary.clone());
                     state
                         .recent
                         .retain(|recent| !(recent.channel == key.0 && recent.thread.id == key.1));
@@ -564,11 +690,74 @@ impl ThreadNames {
 /// Whether a thread needs a name, or a fresh sentence.
 fn due(summary: &ThreadSummary, record: Option<&ThreadRecord>) -> bool {
     let messages = summary.reply_count.map(|replies| replies.saturating_add(1));
-    match (record, messages) {
+    let Some(record) = record else {
+        return true;
+    };
+    match (&record.sentence, messages) {
+        // Named, but with no sentence under the current policy: a policy change swept it, or it
+        // was evicted. The name is kept; only the sentence is asked for again.
         (None, _) => true,
-        (Some(record), Some(messages)) => thread_summary_due(messages, Some(record.at)),
+        (Some(sentence), Some(messages)) => thread_summary_due(messages, Some(sentence.at)),
         // Nothing says the thread grew, so nothing says the sentence is stale.
         (Some(_), None) => false,
+    }
+}
+
+/// Whether a named thread's row should be rewritten so the age limit does not collect a name in
+/// use: it was last written at least [`TOUCH_AFTER`] ago, and the thread has been active since.
+fn needs_touch(summary: &ThreadSummary, record: &ThreadRecord, now: i64) -> bool {
+    let Ok(active) = summary.updated_at.parse::<jiff::Timestamp>() else {
+        return false;
+    };
+    let stale = now.saturating_sub(record.touched) >= TOUCH_AFTER.as_secs() as i64;
+    stale && active.as_second() > record.touched
+}
+
+/// The name filed for a thread, if any.
+///
+/// # Errors
+///
+/// [`SummaryError::Transport`] when the store could not be read: the caller must not take that as
+/// "no name", or a store hiccup would rename the thread.
+async fn filed_name(
+    deps: &ThreadDeps,
+    channel: &ChannelId,
+    thread: &str,
+) -> Result<Option<FiledName>, SummaryError> {
+    match deps.store.cached_summary(&name_key(channel, thread)).await {
+        Ok(Some(text)) => match serde_json::from_str::<FiledName>(&text) {
+            Ok(filed) if valid_thread_slug(&filed.name) => Ok(Some(filed)),
+            _ => {
+                tracing::warn!("a filed thread name is unreadable; the thread will be renamed");
+                Ok(None)
+            }
+        },
+        Ok(None) | Err(StoreError::Unavailable(_)) => Ok(None),
+        Err(error) => Err(SummaryError::Transport(format!(
+            "the thread's filed name could not be read, so nothing was changed: {error}"
+        ))),
+    }
+}
+
+/// File a thread's name row, as of `touched`. A failure is logged and the name kept in memory.
+async fn file_name(deps: &ThreadDeps, channel: &ChannelId, thread: &str, name: &str, touched: i64) {
+    let filed = FiledName {
+        name: name.to_owned(),
+        touched,
+    };
+    let Ok(text) = serde_json::to_string(&filed) else {
+        return;
+    };
+    match deps
+        .store
+        .cache_summary(&name_key(channel, thread), &text)
+        .await
+    {
+        Ok(()) | Err(StoreError::Unavailable(_)) => {}
+        Err(error) => tracing::warn!(
+            %error,
+            "a thread name could not be filed; it is kept in memory until the server restarts"
+        ),
     }
 }
 
@@ -579,6 +768,15 @@ async fn name_one(
     snapshot: &ThreadSummary,
     prior: Option<&ThreadRecord>,
 ) -> Result<ThreadRecord, SummaryError> {
+    // Chosen ONCE. What this naming was queued with is not the last word: the store is asked
+    // again, so a name filed earlier is kept even if the queue was fed from stale or missing
+    // knowledge — and if the store cannot say, nothing is changed and no model call is made.
+    let kept = match prior {
+        Some(prior) => Some(prior.name.clone()),
+        None => filed_name(deps, channel, &snapshot.id)
+            .await?
+            .map(|filed| filed.name),
+    };
     let page = deps
         .chat
         .fetch_timeline(
@@ -618,34 +816,42 @@ async fn name_one(
     let request = ThreadRequest::new(&messages, deps.sentence_chars);
     let began = std::time::Instant::now();
     let naming = deps.summarizer.name_thread(&request).await?;
+    let renamed = kept.is_none();
     let record = ThreadRecord {
-        // Chosen ONCE: a thread that already has a name keeps it, whatever the model offered.
-        name: prior.map_or(naming.slug, |prior| prior.name.clone()),
-        summary: naming.sentence,
-        at: snapshot
-            .reply_count
-            .map_or(messages.len() as u64, |replies| replies.saturating_add(1)),
+        // A thread that already has a name keeps it, whatever the model offered this time.
+        name: kept.unwrap_or(naming.slug),
+        touched: now_seconds(),
+        sentence: Some(FiledSentence {
+            summary: naming.sentence,
+            at: snapshot
+                .reply_count
+                .map_or(messages.len() as u64, |replies| replies.saturating_add(1)),
+        }),
     };
     tracing::info!(
         backend = deps.summarizer.backend(),
         elapsed_ms = began.elapsed().as_millis(),
-        messages = record.at,
-        renamed = prior.is_none(),
+        messages = record.sentence.as_ref().map_or(0, |sentence| sentence.at),
+        renamed,
         "named a thread"
     );
-    let filed = serde_json::to_string(&record).map_err(|error| {
-        SummaryError::Shape(format!("the thread record would not encode: {error}"))
-    })?;
-    match deps
-        .store
-        .cache_summary(&record_key(&deps.version, channel, &snapshot.id), &filed)
-        .await
-    {
-        Ok(()) | Err(StoreError::Unavailable(_)) => {}
-        Err(error) => tracing::warn!(
-            %error,
-            "a thread name could not be filed; it is kept in memory until the server restarts"
-        ),
+    // The name row is rewritten every time, which also restarts its age.
+    file_name(deps, channel, &snapshot.id, &record.name, record.touched).await;
+    if let Some(sentence) = &record.sentence {
+        let filed = serde_json::to_string(sentence).map_err(|error| {
+            SummaryError::Shape(format!("the thread sentence would not encode: {error}"))
+        })?;
+        match deps
+            .store
+            .cache_summary(&sentence_key(&deps.version, channel, &snapshot.id), &filed)
+            .await
+        {
+            Ok(()) | Err(StoreError::Unavailable(_)) => {}
+            Err(error) => tracing::warn!(
+                %error,
+                "a thread sentence could not be filed; it is kept in memory until the server restarts"
+            ),
+        }
     }
     Ok(record)
 }
@@ -790,8 +996,11 @@ mod tests {
         };
         let record = |at| ThreadRecord {
             name: "runner-wedged".to_owned(),
-            summary: "It is stuck.".to_owned(),
-            at,
+            touched: 0,
+            sentence: Some(FiledSentence {
+                summary: "It is stuck.".to_owned(),
+                at,
+            }),
         };
         assert!(due(&thread(Some(0)), None), "an unnamed thread is due");
         assert!(due(&thread(None), None), "even with no count");
@@ -809,5 +1018,49 @@ mod tests {
             !due(&thread(None), Some(&record(8))),
             "no count, no evidence it grew"
         );
+        // A name whose sentence was swept by a policy change: due, for the sentence alone.
+        let nameless_sentence = ThreadRecord {
+            sentence: None,
+            ..record(8)
+        };
+        assert!(due(&thread(Some(8)), Some(&nameless_sentence)));
+    }
+
+    #[test]
+    fn a_name_row_is_rewritten_only_when_it_is_old_and_its_thread_was_active_since() {
+        let day = TOUCH_AFTER.as_secs() as i64;
+        let named_at = 1_790_000_000;
+        let record = ThreadRecord {
+            name: "runner-wedged".to_owned(),
+            touched: named_at,
+            sentence: None,
+        };
+        let active_at = |seconds: i64| ThreadSummary {
+            id: "t".to_owned(),
+            root: None,
+            title: String::new(),
+            reply_count: Some(9),
+            reply_count_exact: true,
+            updated_at: jiff::Timestamp::from_second(seconds).unwrap().to_string(),
+            display_name: None,
+            summary: None,
+        };
+        assert!(
+            needs_touch(&active_at(named_at + 3_600), &record, named_at + day),
+            "a day old, and active since"
+        );
+        assert!(
+            !needs_touch(&active_at(named_at + 3_600), &record, named_at + day - 1),
+            "not a day old yet"
+        );
+        assert!(
+            !needs_touch(&active_at(named_at - 60), &record, named_at + 5 * day),
+            "quiet since it was written: left to age"
+        );
+        let unparseable = ThreadSummary {
+            updated_at: "yesterday".to_owned(),
+            ..active_at(0)
+        };
+        assert!(!needs_touch(&unparseable, &record, named_at + 5 * day));
     }
 }

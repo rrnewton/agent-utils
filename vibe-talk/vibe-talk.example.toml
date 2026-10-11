@@ -251,7 +251,8 @@ enabled = true
 # bounded: an unbounded one is both a disk problem and a privacy problem, and the second is worse.
 # max_conversations = 50            # oldest dropped first; at least 1
 # max_turns_per_conversation = 1000 # further turns are refused with 413; at least 1
-# max_summaries = 2000              # least recently written dropped first; at least 1
+# max_summaries = 2000              # least recently written dropped first; at least 1. Thread
+#                                   # names are counted separately against the same number
 # max_dismissals = 10000            # "dealt with" marks, oldest dropped first; at least 1
 # retain_days = 30                  # 0 means no age limit. Applies to conversations (since the
 #                                   # last turn) AND to cached summaries (since they were made) —

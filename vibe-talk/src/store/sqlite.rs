@@ -444,14 +444,25 @@ fn prune_summaries(
             .execute("DELETE FROM summaries WHERE made_at_ms < ?1", [cutoff])
             .map_err(backend)?;
     }
-    transaction
-        .execute(
-            "DELETE FROM summaries WHERE rowid NOT IN (
-                 SELECT rowid FROM summaries ORDER BY made_at_ms DESC, rowid DESC LIMIT ?1
-             )",
-            [i64::from(retention.max_summaries)],
-        )
-        .map_err(backend)?;
+    // The count bound, on each kind separately: ordinary summaries, and the entries kept across
+    // policies (`super::KEPT_VERSION`, thread names). A flood of one never evicts the other.
+    for statement in [
+        "DELETE FROM summaries WHERE version <> ?2 AND rowid NOT IN (
+             SELECT rowid FROM summaries WHERE version <> ?2
+             ORDER BY made_at_ms DESC, rowid DESC LIMIT ?1
+         )",
+        "DELETE FROM summaries WHERE version = ?2 AND rowid NOT IN (
+             SELECT rowid FROM summaries WHERE version = ?2
+             ORDER BY made_at_ms DESC, rowid DESC LIMIT ?1
+         )",
+    ] {
+        transaction
+            .execute(
+                statement,
+                rusqlite::params![i64::from(retention.max_summaries), super::KEPT_VERSION],
+            )
+            .map_err(backend)?;
+    }
     Ok(())
 }
 
@@ -1650,7 +1661,10 @@ impl StateStore for SqliteStore {
         let version = version.to_owned();
         self.with_connection(move |connection| {
             let removed = connection
-                .execute("DELETE FROM summaries WHERE version <> ?1", [&version])
+                .execute(
+                    "DELETE FROM summaries WHERE version <> ?1 AND version <> ?2",
+                    [version.as_str(), super::KEPT_VERSION],
+                )
                 .map_err(backend)?;
             Ok(removed as u64)
         })
@@ -2599,6 +2613,85 @@ mod tests {
                 "the newest entries must be the ones kept"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn a_kept_entry_outlives_the_policy_sweep_and_a_flood_of_summaries_and_is_bounded_alone()
+    {
+        // `#233 llm-summarizer`. A thread's display name is chosen once. Filed in this table, it
+        // used to be evicted by ordinary summary traffic and swept by any policy change, and the
+        // thread was then given a different name.
+        let dir = TempDir::new("sqlite-summary-kept");
+        let store = store(
+            &dir,
+            Retention {
+                max_summaries: 3,
+                retain_days: 0,
+                ..Retention::default()
+            },
+        );
+        let kept = SummaryKey {
+            version: super::super::KEPT_VERSION.to_owned(),
+            ..summary_key("thread-name:spaces/A/threads/runner", 0)
+        };
+        store
+            .cache_summary(&kept, "runner-wedged")
+            .await
+            .expect("cache");
+        tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        for n in 0..10_u64 {
+            store
+                .cache_summary(
+                    &summary_key(&format!("100000000000000000{n}"), n),
+                    &format!("summary {n}"),
+                )
+                .await
+                .expect("cache");
+            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        }
+        assert_eq!(
+            store.cached_summary(&kept).await.expect("read").as_deref(),
+            Some("runner-wedged"),
+            "ten newer summaries under a ceiling of three evicted the kept entry"
+        );
+        assert_eq!(
+            summary_rows(&store),
+            4,
+            "three summaries plus the kept entry"
+        );
+        assert_eq!(
+            store
+                .forget_summaries_except("a-new-policy")
+                .await
+                .expect("sweep"),
+            3,
+            "the sweep collects the summaries of the old policy..."
+        );
+        assert_eq!(
+            store.cached_summary(&kept).await.expect("read").as_deref(),
+            Some("runner-wedged"),
+            "...and never the entry that belongs to no policy"
+        );
+        // Kept entries are bounded too, on their own.
+        for n in 0..5_u64 {
+            store
+                .cache_summary(
+                    &SummaryKey {
+                        version: super::super::KEPT_VERSION.to_owned(),
+                        ..summary_key(&format!("thread-name:{n}"), 0)
+                    },
+                    &format!("name-{n}"),
+                )
+                .await
+                .expect("cache");
+            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        }
+        assert_eq!(
+            summary_rows(&store),
+            3,
+            "kept entries grew past their own ceiling"
+        );
+        assert_eq!(store.cached_summary(&kept).await.expect("read"), None);
     }
 
     #[tokio::test]

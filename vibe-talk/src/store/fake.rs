@@ -858,17 +858,27 @@ impl StateStore for FakeStore {
             let cutoff = now_ms() - i64::from(self.retention.retain_days) * 86_400_000;
             state.summaries.retain(|_, held| held.made_at_ms >= cutoff);
         }
-        while state.summaries.len() > self.retention.max_summaries as usize {
-            let oldest = state
-                .summaries
-                .iter()
-                .min_by_key(|(_, held)| (held.made_at_ms, held.seq))
-                .map(|(slot, _)| slot.clone());
-            match oldest {
-                Some(slot) => {
-                    state.summaries.remove(&slot);
+        // Counted per kind, as the real store counts them: ordinary summaries, and the entries kept
+        // across policies (`super::KEPT_VERSION`).
+        for kept in [false, true] {
+            let of_kind = |(version, _, _, _): &(String, String, String, String)| {
+                (version == super::KEPT_VERSION) == kept
+            };
+            while state.summaries.keys().filter(|slot| of_kind(slot)).count()
+                > self.retention.max_summaries as usize
+            {
+                let oldest = state
+                    .summaries
+                    .iter()
+                    .filter(|(slot, _)| of_kind(slot))
+                    .min_by_key(|(_, held)| (held.made_at_ms, held.seq))
+                    .map(|(slot, _)| slot.clone());
+                match oldest {
+                    Some(slot) => {
+                        state.summaries.remove(&slot);
+                    }
+                    None => break,
                 }
-                None => break,
             }
         }
         Ok(())
@@ -878,7 +888,9 @@ impl StateStore for FakeStore {
         let mut state = self.lock();
         armed(&mut state)?;
         let before = state.summaries.len();
-        state.summaries.retain(|(held, _, _, _), _| held == version);
+        state
+            .summaries
+            .retain(|(held, _, _, _), _| held == version || held == super::KEPT_VERSION);
         Ok((before - state.summaries.len()) as u64)
     }
 
@@ -1078,6 +1090,65 @@ mod tests {
                 .as_deref(),
             Some("summary 2")
         );
+    }
+
+    #[tokio::test]
+    async fn the_fake_keeps_an_entry_of_no_policy_exactly_as_the_real_store_does() {
+        // `#233 llm-summarizer`: parity with the real store's kept class, which every thread-name
+        // test runs against.
+        let store = FakeStore::with_retention(Retention {
+            max_summaries: 2,
+            retain_days: 0,
+            ..Retention::default()
+        });
+        let key = |message: &str, version: &str| SummaryKey {
+            channel: ChannelId("1111111111".to_owned()),
+            message: MessageId(message.to_owned()),
+            content_hash: 0,
+            version: version.to_owned(),
+        };
+        let kept = key("thread-name:t", super::super::KEPT_VERSION);
+        store
+            .cache_summary(&kept, "runner-wedged")
+            .await
+            .expect("cache");
+        tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        for n in 0..5 {
+            store
+                .cache_summary(&key(&format!("10000000000000000{n}"), "current"), "s")
+                .await
+                .expect("cache");
+            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        }
+        assert_eq!(
+            store.cached_summaries(),
+            3,
+            "two summaries and the kept entry"
+        );
+        assert_eq!(
+            store.forget_summaries_except("next").await.expect("sweep"),
+            2
+        );
+        assert_eq!(
+            store.cached_summary(&kept).await.expect("read").as_deref(),
+            Some("runner-wedged")
+        );
+        for n in 0..3 {
+            store
+                .cache_summary(
+                    &key(&format!("thread-name:{n}"), super::super::KEPT_VERSION),
+                    "name",
+                )
+                .await
+                .expect("cache");
+            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        }
+        assert_eq!(
+            store.cached_summaries(),
+            2,
+            "kept entries are bounded on their own"
+        );
+        assert_eq!(store.cached_summary(&kept).await.expect("read"), None);
     }
 
     #[tokio::test]

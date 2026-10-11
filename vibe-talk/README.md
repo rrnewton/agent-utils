@@ -1227,9 +1227,11 @@ reported in the failure.
 | `burst` | `3` | calls that may go out back to back before the pace applies; at least `1` |
 
 Every path must be absolute. **Secrets are only ever read from files or a command, at call time,
-and never logged**; writing `api_key` or `bearer_token` inline is refused at startup by name. Only
-`dialect`, `model` and `max_tokens` are part of the summary cache key: changing one re-derives
-every summary and thread name, while rotating a credential or moving an endpoint does not.
+and never logged**; writing `api_key` or `bearer_token` inline is refused at startup by name. Of
+this section, only `dialect`, `model` and `max_tokens` are part of the summary cache key: changing
+one re-derives every summary and thread sentence (thread names are kept; see below), while
+rotating a credential or moving an endpoint does not. As before, every other `[summaries]` setting
+is part of the key too.
 
 ### No tools, by construction
 
@@ -1264,10 +1266,21 @@ refresh, a forward delta included. A thread whose naming failed is left alone fo
 model must answer a name of two to four lowercase hyphenated words (`[a-z0-9-]`, at most 40
 characters); any other answer fails that naming by name rather than being cut into shape.
 
-Records live in the summary cache, under the same policy version and the same retention: they
-survive a restart, a changed summary policy re-derives them, and a thread quiet for longer than
-`storage.retain_days` is renamed when it wakes. With no `storage.path`, names last for the life of
-the process.
+**A name is chosen once and kept.** Both halves live in the summary cache, by different rules:
+
+* The **name** is filed outside every summary policy. Changing the model, a prompt, `max_tokens` or
+  any other summary setting keeps it, and ordinary summary traffic cannot evict it — names are
+  counted separately against `storage.max_summaries`. A store that cannot be read is never taken
+  to mean "no name": nothing is queued for that thread, and a naming re-reads the filed name before
+  writing, so a hiccup cannot give a thread a second name.
+* The **sentence** is filed under the summary policy like any summary, so a policy change asks for
+  a fresh sentence — and keeps the name.
+
+Names are still subject to `storage.retain_days`, counted from the last time the name was written:
+on every naming and sentence refresh, and at most daily when a thread list read with the write
+token shows the thread active since. A thread that stays quiet, or unread, for longer than that
+gets a new name when it is next listed. The purge removes names with everything else. With no
+`storage.path`, names last for the life of the process.
 
 ### What leaves this server
 
@@ -1689,9 +1702,10 @@ is worse than state that was never promised.
 Retention is enforced **on every write**, not by a sweeper that might never run: at most
 `max_conversations` conversations (least recently active dropped first), at most
 `max_turns_per_conversation` turns in one of them (further turns are refused, not silently
-dropped), at most `max_summaries` cached summaries (least recently written dropped first), and
-nothing older than `retain_days` days — since its last turn for a conversation, since it was made
-for a summary. The defaults are 50, 1000, 2000 and 30.
+dropped), at most `max_summaries` cached summaries (least recently written dropped first; thread
+names are counted separately against the same number), and nothing older than `retain_days` days —
+since its last turn for a conversation, since it was made for a summary. The defaults are 50,
+1000, 2000 and 30.
 
 Two tables are deliberately outside all of it: the "dealt with" marks, which an age bound would
 put back into the to-do list purely because time passed, and the **channel aliases**, which an age
