@@ -18,11 +18,13 @@
 //!
 //! # The pipeline
 //!
-//! 1. The provider's own link syntax becomes Markdown ([`Markup::prepare`]).
+//! 1. The provider's own link syntax becomes Markdown, and where the provider ends a list at an
+//!    unindented line, so does the text ([`Markup::prepare`]).
 //! 2. comrak parses GFM — tables, strikethrough, task lists, bare-URL autolinks — with chat's two
 //!    line rules: a single newline is a line break, and a blank line separates paragraphs.
-//! 3. The parsed tree is adjusted ([`adjust`]): mentions become chips, an image becomes a link to
-//!    it, a deep heading is held at the fourth level, where the service writes bold with one
+//! 3. The parsed tree is adjusted ([`adjust`]): a list the writer indented under an item is nested
+//!    in it ([`nest_lists`], `#237 nested-lists`), mentions become chips, an image becomes a link
+//!    to it, a deep heading is held at the fourth level, where the service writes bold with one
 //!    asterisk, an asterisk emphasis is bold, and a link whose text is its own address is drawn
 //!    with a short label made from it, `widgets#123` (`#227 github-link-abbrev`, see
 //!    [`crate::link_labels`]).
@@ -83,7 +85,7 @@ use std::ops::Range;
 use std::sync::LazyLock;
 
 use comrak::arena_tree::NodeEdge;
-use comrak::nodes::{AstNode, NodeValue};
+use comrak::nodes::{AstNode, ListType, NodeList, NodeValue};
 use comrak::{Arena, Options};
 
 use crate::config::Config;
@@ -128,20 +130,58 @@ impl Markup {
         matches!(self, Self::GoogleChat | Self::Slack)
     }
 
+    /// Whether a line written at the left margin straight after a list item ends the list.
+    ///
+    /// CommonMark says it does not: an unindented line of prose after an item, with no blank line
+    /// between, is a LAZY continuation of the item's paragraph, so `- c\nIn review:` draws
+    /// "In review:" inside the last bullet. Google Chat draws it on its own line under the list —
+    /// its API guide's own example of a received message is `* 5 pm\nWhat time works for you?`,
+    /// shown as a list and then a sentence — and Slack draws every line of such a message as the
+    /// line it is, never indented under an item's text. Discord's client is not documented either
+    /// way, so Discord keeps CommonMark's reading. `#237 nested-lists`, and see
+    /// [`end_lists_at_unindented_lines`].
+    #[must_use]
+    pub fn list_ends_at_unindented_line(self) -> bool {
+        matches!(self, Self::GoogleChat | Self::Slack)
+    }
+
+    /// Whether bullets written at the left margin straight under a numbered line are its items.
+    ///
+    /// Google Chat's own syntax has bulleted lists and NO numbered ones: `1. Goal` is a line of
+    /// text there, and the bullets under it are drawn as a list indented beneath it — so an agent's
+    /// outline, `1. Goal\n- step\n- step\n\n2. Goal`, reads as steps under each goal. CommonMark
+    /// reads the same text as a one-item numbered list, then a bulleted list level with it, which
+    /// is the flat outline the owner photographed in `#237 nested-lists`. Only Google Chat: Discord
+    /// draws both as lists, and Slack draws both as lines, at the same margin.
+    #[must_use]
+    pub fn bullets_under_numbered_line_nest(self) -> bool {
+        matches!(self, Self::GoogleChat)
+    }
+
     /// The text as Markdown, before it is parsed.
+    ///
+    /// Where a chat service ends a list at an unindented line, a blank line is put before that
+    /// line ([`end_lists_at_unindented_lines`]), which is how CommonMark is told the same thing.
     ///
     /// A labelled link is rewritten only OUTSIDE code. Inside a code span or a code block it is
     /// text the writer meant to show as written, and comrak, not this module, says where code is:
     /// the text is parsed once as it stands to find out, and only when it holds a link to rewrite
     /// at all, which almost no message does.
     fn prepare<'t>(self, text: &'t str, options: &Options) -> Cow<'t, str> {
+        let text = if self.list_ends_at_unindented_line() {
+            end_lists_at_unindented_lines(text)
+        } else {
+            Cow::Borrowed(text)
+        };
         match self {
-            Self::Discord => Cow::Borrowed(text),
+            Self::Discord => text,
             Self::GoogleChat | Self::Slack => {
                 use crate::slack::mrkdwn::angle_links_outside;
-                match angle_links_outside(text, &[]) {
-                    Cow::Borrowed(text) => Cow::Borrowed(text),
-                    Cow::Owned(_) => angle_links_outside(text, &code_ranges(text, options)),
+                match angle_links_outside(&text, &[]) {
+                    Cow::Borrowed(_) => text,
+                    Cow::Owned(_) => Cow::Owned(
+                        angle_links_outside(&text, &code_ranges(&text, options)).into_owned(),
+                    ),
                 }
             }
         }
@@ -227,6 +267,10 @@ pub fn to_html(text: &str, markup: Markup) -> String {
         return plain_html(text);
     }
     adjust(&arena, root, &source, markup);
+    // Measured again: nesting the lists the writer indented makes the tree deeper than it parsed.
+    if deeper_than(root, MAX_DEPTH) {
+        return plain_html(text);
+    }
     let mut html = String::new();
     comrak::format_html(root, &options, &mut html).expect("formatting into a String cannot fail");
     let html = SANITIZER.clean(&html).to_string();
@@ -496,6 +540,15 @@ static SANITIZER: LazyLock<ammonia::Builder<'static>> = LazyLock::new(|| {
 /// are checked, and a block of raw HTML is text by the time mentions are looked for.
 fn adjust<'a>(arena: &'a Arena<'a>, root: &'a AstNode<'a>, source: &str, markup: Markup) {
     let lines = line_starts(source);
+    nest_lists(
+        arena,
+        root,
+        &Lines {
+            source,
+            starts: &lines,
+        },
+        markup,
+    );
     for node in root.descendants().collect::<Vec<_>>() {
         let mut ast = node.data.borrow_mut();
         match &mut ast.value {
@@ -757,6 +810,499 @@ fn line_starts(source: &str) -> Vec<usize> {
 fn offset(lines: &[usize], line: usize, column: usize) -> Option<usize> {
     let start = *lines.get(line.checked_sub(1)?)?;
     Some(start + column.checked_sub(1)?)
+}
+
+// --- lists as a chat client draws them: `#237 nested-lists` -----------------------------------
+
+/// How many columns `text` spans, as CommonMark counts them: a tab reaches the next multiple of
+/// four.
+fn columns(text: &str) -> usize {
+    text.chars().fold(0, |column, character| {
+        if character == '\t' {
+            column + 4 - column % 4
+        } else {
+            column + 1
+        }
+    })
+}
+
+/// The kind of list a marker starts: which bullet, or which delimiter after the number. CommonMark
+/// never puts items of two kinds in one list.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ListKind {
+    Bullet(u8),
+    Ordered(u8),
+}
+
+/// A list marker at the start of a line's text, read the way CommonMark reads one.
+#[derive(Clone, Copy, Debug)]
+struct LineMarker {
+    kind: ListKind,
+    /// The number written before an ordered marker's delimiter.
+    number: Option<u64>,
+    /// Whether nothing follows the marker on its line.
+    empty: bool,
+    /// Columns from the marker to the item's text: where the item's own lines must start.
+    width: usize,
+}
+
+impl LineMarker {
+    /// Whether this item may start a new list straight after a line of prose, which it would
+    /// otherwise continue: in CommonMark only a bullet with text, or a numbered item at `1`.
+    fn may_interrupt_prose(self) -> bool {
+        !self.empty
+            && match self.kind {
+                ListKind::Bullet(_) => true,
+                ListKind::Ordered(_) => self.number == Some(1),
+            }
+    }
+}
+
+/// The list marker `text` starts with, if it starts with one: `-`, `*` or `+`, or up to nine digits
+/// and `.` or `)`, followed by a space, a tab or the end of the line — and not a rule, which `---`
+/// and `* * *` are although they start like bullets.
+fn line_marker(text: &str) -> Option<LineMarker> {
+    let bytes = text.as_bytes();
+    let (kind, number, length) = match *bytes.first()? {
+        bullet @ (b'-' | b'*' | b'+') => (ListKind::Bullet(bullet), None, 1),
+        b'0'..=b'9' => {
+            let digits = bytes.iter().take_while(|byte| byte.is_ascii_digit()).count();
+            let delimiter = *bytes.get(digits).filter(|byte| matches!(byte, b'.' | b')'))?;
+            if digits > 9 {
+                return None;
+            }
+            (
+                ListKind::Ordered(delimiter),
+                text[..digits].parse().ok(),
+                digits + 1,
+            )
+        }
+        _ => return None,
+    };
+    let rest = &text[length..];
+    if !(rest.is_empty() || rest.starts_with([' ', '\t'])) {
+        return None;
+    }
+    if matches!(kind, ListKind::Bullet(b'-' | b'*')) && is_rule(text) {
+        return None;
+    }
+    let empty = rest.trim_matches([' ', '\t']).is_empty();
+    let gap = rest.len() - rest.trim_start_matches(' ').len();
+    let width = length + if empty || gap == 0 || gap > 4 { 1 } else { gap };
+    Some(LineMarker {
+        kind,
+        number,
+        empty,
+        width,
+    })
+}
+
+/// Whether `text` is a thematic break: three or more of one of `-`, `*` and `_`, and nothing else
+/// but spaces and tabs.
+fn is_rule(text: &str) -> bool {
+    let mut marks = text.chars().filter(|character| !matches!(character, ' ' | '\t'));
+    let Some(first) = marks.next() else {
+        return false;
+    };
+    matches!(first, '-' | '*' | '_') && marks.clone().all(|mark| mark == first) && marks.count() >= 2
+}
+
+/// The fence a line's text opens, as its character and length: three or more backticks or
+/// tildes, where a backtick fence's info string holds no backtick (` ```a``` ` is a code span).
+fn fence_opened(text: &str) -> Option<(char, usize)> {
+    let mark = text.chars().next().filter(|mark| matches!(mark, '`' | '~'))?;
+    let length = text.len() - text.trim_start_matches(mark).len();
+    let info = &text[length..];
+    (length >= 3 && !(mark == '`' && info.contains('`'))).then_some((mark, length))
+}
+
+/// Whether `line` closes a fence of `length` `mark`s: at least as many, and nothing after them.
+fn closes_fence(line: &str, mark: char, length: usize) -> bool {
+    let text = line.trim_start_matches([' ', '\t']);
+    let run = text.len() - text.trim_start_matches(mark).len();
+    run >= length && text[run..].trim_matches([' ', '\t']).is_empty()
+}
+
+/// Whether a line's text may open a block of raw HTML, in which CommonMark sees no list until a
+/// blank line: a tag, a closing tag, a comment or a declaration. An address in angle brackets and
+/// a mention are not tags.
+fn opens_html(text: &str) -> bool {
+    let Some(rest) = text.strip_prefix('<') else {
+        return false;
+    };
+    if rest.starts_with(['!', '?']) {
+        return true;
+    }
+    let rest = rest.strip_prefix('/').unwrap_or(rest);
+    let name = rest
+        .bytes()
+        .take_while(|byte| byte.is_ascii_alphanumeric() || *byte == b'-')
+        .count();
+    name > 0
+        && rest.as_bytes()[0].is_ascii_alphabetic()
+        && (rest.len() == name || rest[name..].starts_with([' ', '\t', '>', '/']))
+}
+
+/// Put a blank line before each line a chat service draws as the end of a list and CommonMark
+/// reads as more of its last item: prose at the left margin, straight after a line of the list.
+/// See [`Markup::list_ends_at_unindented_line`].
+///
+/// Read line by line with as much of CommonMark as that one decision needs — whether a list is
+/// open, the kind of its outer items, where their text starts, and which lines are code or raw
+/// HTML — and no more. No line is changed or moved; one is only given a blank line before it, and
+/// never inside a fenced code block. A line that merely looks like an item and that CommonMark
+/// reads as prose, such as `2.` straight under a bulleted list, ends the list as prose does — and,
+/// after the blank line, is the numbered item it was written as.
+fn end_lists_at_unindented_lines(text: &str) -> Cow<'_, str> {
+    /// The outermost item of the open list: its kind, and the column its text starts at.
+    #[derive(Clone, Copy)]
+    struct Outer {
+        kind: ListKind,
+        content: usize,
+    }
+    let mut out = String::new();
+    let mut copied = 0;
+    let mut fence = None;
+    let mut outer: Option<Outer> = None;
+    let mut raw_html = false;
+    let mut previous_blank = true;
+    let mut previous_prose = false;
+    let mut at = 0;
+    for line in text.split_inclusive('\n') {
+        let start = at;
+        at += line.len();
+        let content = line.trim_end_matches(['\n', '\r']);
+        if let Some((mark, length)) = fence {
+            if closes_fence(content, mark, length) {
+                fence = None;
+            }
+            (previous_blank, previous_prose) = (false, false);
+            continue;
+        }
+        let rest = content.trim_start_matches([' ', '\t']);
+        let indent = columns(&content[..content.len() - rest.len()]);
+        if rest.is_empty() {
+            (previous_blank, previous_prose, raw_html) = (true, false, false);
+            continue;
+        }
+        if raw_html {
+            (previous_blank, previous_prose) = (false, true);
+            continue;
+        }
+        let inside_item = outer.is_some_and(|open| indent >= open.content);
+        if let Some(opened) = fence_opened(rest) {
+            // A fence outside the open item's text ends the list, as CommonMark already reads it.
+            if !inside_item {
+                outer = None;
+            }
+            fence = Some(opened);
+            (previous_blank, previous_prose) = (false, false);
+            continue;
+        }
+        if outer.is_none() && indent <= 3 && opens_html(rest) {
+            raw_html = true;
+            (previous_blank, previous_prose) = (false, true);
+            continue;
+        }
+        let item = line_marker(rest);
+        match outer {
+            Some(_) if inside_item => {}
+            Some(open) => match item {
+                // At the list's own level: the next item, or the first of a new list.
+                Some(marker)
+                    if marker.kind == open.kind
+                        || !previous_prose
+                        || marker.may_interrupt_prose() =>
+                {
+                    outer = Some(Outer {
+                        kind: marker.kind,
+                        content: indent + marker.width,
+                    });
+                }
+                // Prose, or a marker CommonMark reads as prose here.
+                _ if previous_blank => outer = None,
+                _ if indent == 0 => {
+                    out.push_str(&text[copied..start]);
+                    out.push('\n');
+                    copied = start;
+                    outer = None;
+                }
+                // Indented a little: still the item's, lazily, as the writer meant.
+                _ => {}
+            },
+            None => {
+                if let Some(marker) = item.filter(|marker| {
+                    indent <= 3 && (!previous_prose || marker.may_interrupt_prose())
+                }) {
+                    outer = Some(Outer {
+                        kind: marker.kind,
+                        content: indent + marker.width,
+                    });
+                }
+            }
+        }
+        previous_blank = false;
+        previous_prose = item.is_none_or(|marker| !marker.empty);
+    }
+    if copied == 0 {
+        return Cow::Borrowed(text);
+    }
+    out.push_str(&text[copied..]);
+    Cow::Owned(out)
+}
+
+/// The source a tree was parsed from, and where each of its lines begins.
+struct Lines<'s> {
+    source: &'s str,
+    starts: &'s [usize],
+}
+
+impl Lines<'_> {
+    /// The text of 1-based `line`, without its line ending.
+    fn line(&self, line: usize) -> Option<&str> {
+        let start = *self.starts.get(line.checked_sub(1)?)?;
+        let end = self.starts.get(line).copied().unwrap_or(self.source.len());
+        Some(self.source.get(start..end)?.trim_end_matches(['\n', '\r']))
+    }
+}
+
+/// What a list item's marker says, read back from the source at the item's own position.
+#[derive(Clone, Copy, Debug)]
+struct Marker {
+    /// The marker's column, counted from the start of its line, so that two items in one
+    /// container compare however that container is written.
+    indent: usize,
+    /// The number an ordered item was written with.
+    number: Option<u64>,
+}
+
+/// The [`Marker`] of a list item.
+fn marker(item: &AstNode<'_>, lines: &Lines<'_>) -> Option<Marker> {
+    let start = item.data.borrow().sourcepos.start;
+    let line = lines.line(start.line)?;
+    let at = start.column.checked_sub(1)?;
+    let (before, rest) = (line.get(..at)?, line.get(at..)?);
+    let digits = rest.bytes().take_while(u8::is_ascii_digit).count();
+    Some(Marker {
+        indent: columns(before),
+        number: rest[..digits].parse().ok(),
+    })
+}
+
+/// The list data of a list node.
+fn list_of(node: &AstNode<'_>) -> Option<NodeList> {
+    match node.data.borrow().value {
+        NodeValue::List(list) => Some(list),
+        _ => None,
+    }
+}
+
+/// Nest each list the writer indented under an item in that item, where CommonMark reads it as
+/// the item's sibling. `#237 nested-lists`.
+///
+/// CommonMark nests a line only when it is indented as far as the item's TEXT: three columns
+/// under `1. `, four under `10. `, two under `- `. People and agents writing chat indent a level
+/// by two spaces, or one, whatever the marker above it — Discord's own guide says to indent a
+/// list "by adding 2 spaces" — so `1. Goal\n  - step` reached the page as a numbered list and a
+/// bulleted list level with it, and `1. Goal\n  1. step\n  2. step\n2. Goal` as ONE list numbered
+/// one to four. Here, an item or a list whose marker is further in than the item before it goes
+/// under that item:
+///
+/// - within one list, an item further in than the one before it — except a numbered item that
+///   counts on from the one before it (`8.` then ` 9.`, a column of right-aligned numbers);
+/// - a list straight after another, its first marker further in than the other's last item;
+/// - and in Google Chat, a bulleted list on the line straight after a numbered one, whatever its
+///   indent ([`Markup::bullets_under_numbered_line_nest`]).
+///
+/// On the parsed tree rather than the text, so no line is ever read as something else: a code
+/// block moves with the item it is in, untouched, and every list keeps the numbers CommonMark gave
+/// it. A list that arrives where one of its kind already ends the item joins it when it carries
+/// its numbering on, so an item's steps stay one list.
+fn nest_lists<'a>(
+    arena: &'a Arena<'a>,
+    container: &'a AstNode<'a>,
+    lines: &Lines<'_>,
+    markup: Markup,
+) {
+    let mut child = container.first_child();
+    while let Some(node) = child {
+        if list_of(node).is_some() {
+            absorb_following_lists(node, lines, markup);
+            nest_items(arena, node, lines);
+        }
+        child = node.next_sibling();
+        if !node.data.borrow().value.contains_inlines() {
+            nest_lists(arena, node, lines, markup);
+        }
+    }
+}
+
+/// Move into `list` each list straight after it that belongs under its last item.
+fn absorb_following_lists<'a>(list: &'a AstNode<'a>, lines: &Lines<'_>, markup: Markup) {
+    let ordered = |list: NodeList| list.list_type == ListType::Ordered;
+    while let Some(next) = list.next_sibling() {
+        let Some(next_data) = list_of(next) else {
+            break;
+        };
+        let (Some(last), Some(first)) = (list.last_child(), next.first_child()) else {
+            break;
+        };
+        let (Some(above), Some(below)) = (marker(last, lines), marker(first, lines)) else {
+            break;
+        };
+        let indented = below.indent > above.indent;
+        let under_numbered_line = markup.bullets_under_numbered_line_nest()
+            && list_of(list).is_some_and(ordered)
+            && !ordered(next_data)
+            && !blank_line_before(next, lines);
+        if !indented && !under_numbered_line {
+            break;
+        }
+        attach_list(innermost_open_item(last, below.indent, lines), next);
+    }
+}
+
+/// Whether a blank line, or the start of the text, comes straight before `node`'s first line. A
+/// quote's `>` alone is a blank line inside the quote.
+fn blank_line_before(node: &AstNode<'_>, lines: &Lines<'_>) -> bool {
+    let line = node.data.borrow().sourcepos.start.line;
+    line.checked_sub(1)
+        .and_then(|before| lines.line(before))
+        .is_none_or(|text| text.chars().all(|c| matches!(c, ' ' | '\t' | '>')))
+}
+
+/// The item a list or an item whose marker is at `indent` belongs under: `item`, or the last item
+/// of the list that ends it, and so on down, for as long as that item's marker is further out than
+/// `indent`.
+fn innermost_open_item<'a>(
+    item: &'a AstNode<'a>,
+    indent: usize,
+    lines: &Lines<'_>,
+) -> &'a AstNode<'a> {
+    let mut target = item;
+    while let Some(inner) = target
+        .last_child()
+        .filter(|node| list_of(node).is_some())
+        .and_then(|list| list.last_child())
+    {
+        if !marker(inner, lines).is_some_and(|inner| inner.indent < indent) {
+            break;
+        }
+        target = inner;
+    }
+    target
+}
+
+/// Put `list` at the end of `item`: as more of the list already ending it, when it carries that
+/// list on, or as a list of its own.
+fn attach_list<'a>(item: &'a AstNode<'a>, list: &'a AstNode<'a>) {
+    if let Some(trailing) = item.last_child().filter(|trailing| carries_on(trailing, list)) {
+        for moved in list.children().collect::<Vec<_>>() {
+            trailing.append(moved);
+        }
+        list.detach();
+        mark_task_list(trailing);
+    } else {
+        item.append(list);
+    }
+}
+
+/// Whether `list` after `earlier` would carry it on: both bulleted, or both numbered with one
+/// delimiter and `list` starting at the number after `earlier`'s last, so joining renumbers
+/// nothing.
+fn carries_on<'a>(earlier: &'a AstNode<'a>, list: &AstNode<'_>) -> bool {
+    let (Some(a), Some(b)) = (list_of(earlier), list_of(list)) else {
+        return false;
+    };
+    match (a.list_type, b.list_type) {
+        (ListType::Bullet, ListType::Bullet) => true,
+        (ListType::Ordered, ListType::Ordered) => {
+            a.delimiter == b.delimiter && b.start == a.start + earlier.children().count()
+        }
+        _ => false,
+    }
+}
+
+/// Move each item of `list` that is further in than the item before it under that item.
+fn nest_items<'a>(arena: &'a Arena<'a>, list: &'a AstNode<'a>, lines: &Lines<'_>) {
+    let Some(data) = list_of(list) else {
+        return;
+    };
+    let mut previous: Option<(&AstNode<'_>, Marker)> = None;
+    for item in list.children().collect::<Vec<_>>() {
+        let Some(mark) = marker(item, lines) else {
+            previous = None;
+            continue;
+        };
+        if let Some((above, above_mark)) = previous {
+            if mark.indent > above_mark.indent && !counts_on(above, above_mark, mark, lines) {
+                adopt(
+                    arena,
+                    innermost_open_item(above, mark.indent, lines),
+                    item,
+                    data,
+                    mark,
+                );
+                continue;
+            }
+        }
+        previous = Some((item, mark));
+    }
+    mark_task_list(list);
+}
+
+/// Whether a numbered item further in than the item above it is that list's next item all the
+/// same: it counts on from the item above, and not from a list of steps already under that item
+/// at the step's own indent.
+fn counts_on(above: &AstNode<'_>, above_mark: Marker, mark: Marker, lines: &Lines<'_>) -> bool {
+    let next_after = |marker: Marker| marker.number.and_then(|number| number.checked_add(1));
+    if mark.number.is_none() || mark.number != next_after(above_mark) {
+        return false;
+    }
+    let step = above
+        .last_child()
+        .filter(|node| list_of(node).is_some_and(|list| list.list_type == ListType::Ordered))
+        .and_then(|steps| steps.last_child())
+        .and_then(|step| marker(step, lines));
+    !step.is_some_and(|step| next_after(step) == mark.number && mark.indent >= step.indent)
+}
+
+/// Move `item` to the end of `target`: into the list already ending it when that is a list of
+/// `like`'s kind, or into a new one like it, starting at the item's own number.
+fn adopt<'a>(
+    arena: &'a Arena<'a>,
+    target: &'a AstNode<'a>,
+    item: &'a AstNode<'a>,
+    like: NodeList,
+    mark: Marker,
+) {
+    let same_kind = |node: &&AstNode<'_>| list_of(node).is_some_and(|list| list.list_type == like.list_type);
+    if let Some(trailing) = target.last_child().filter(same_kind) {
+        trailing.append(item);
+        mark_task_list(trailing);
+        return;
+    }
+    let mut data = like;
+    data.start = mark
+        .number
+        .and_then(|number| usize::try_from(number).ok())
+        .unwrap_or(1);
+    let sublist = arena.alloc(NodeValue::List(data).into());
+    sublist.data.borrow_mut().sourcepos = item.data.borrow().sourcepos;
+    target.append(sublist);
+    sublist.append(item);
+    mark_task_list(sublist);
+}
+
+/// Keep a list's task flag true to its items, so the stylesheet drops the bullets only of a list
+/// that has checkboxes in it.
+fn mark_task_list<'a>(list: &'a AstNode<'a>) {
+    let tasks = list
+        .children()
+        .any(|item| matches!(item.data.borrow().value, NodeValue::TaskItem(_)));
+    if let NodeValue::List(data) = &mut list.data.borrow_mut().value {
+        data.is_task_list = tasks;
+    }
 }
 
 #[cfg(test)]
