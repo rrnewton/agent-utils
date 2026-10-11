@@ -1230,6 +1230,11 @@ fn absorb_following_lists<'a>(list: &'a AstNode<'a>, lines: &Lines<'_>, markup: 
             {
                 item.append(next);
                 item.append(more);
+                // A loose list draws each paragraph of an item as a paragraph, so the heading
+                // stands clear of the bullets above it, as after the blank line it stands for.
+                if let NodeValue::List(data) = &mut list.data.borrow_mut().value {
+                    data.tight = false;
+                }
                 absorbed = true;
                 continue;
             }
@@ -2602,9 +2607,9 @@ mod tests {
                     2. Better docs: no work.";
         assert_eq!(
             to_html(text, Markup::GoogleChat),
-            "<p>Goals:</p>\n<ol>\n<li>Faster builds. Most of the work went here:\n<ul>\n\
+            "<p>Goals:</p>\n<ol>\n<li>\n<p>Faster builds. Most of the work went here:</p>\n<ul>\n\
              <li>cache keyed by target</li>\n<li>warm machines kept warm</li>\n</ul>\n\
-             Still open:\n<ul>\n<li>the flaky test</li>\n</ul>\n</li>\n</ol>\n\
+             <p>Still open:</p>\n<ul>\n<li>the flaky test</li>\n</ul>\n</li>\n</ol>\n\
              <ol start=\"2\">\n<li>Better docs: no work.</li>\n</ol>\n"
         );
         // Each further heading and its bullets join too, and a goal after them with no blank line
@@ -2615,9 +2620,9 @@ mod tests {
                 "1. a\n- x\nDone:\n- y\nOpen:\n- z\n2. b\n- w\nThanks.",
                 Markup::GoogleChat
             ),
-            "<ol>\n<li>a\n<ul>\n<li>x</li>\n</ul>\nDone:\n<ul>\n<li>y</li>\n</ul>\n\
-             Open:\n<ul>\n<li>z</li>\n</ul>\n</li>\n<li>b\n<ul>\n<li>w</li>\n</ul>\n</li>\n\
-             </ol>\n<p>Thanks.</p>\n"
+            "<ol>\n<li>\n<p>a</p>\n<ul>\n<li>x</li>\n</ul>\n<p>Done:</p>\n<ul>\n<li>y</li>\n</ul>\n\
+             <p>Open:</p>\n<ul>\n<li>z</li>\n</ul>\n</li>\n<li>\n<p>b</p>\n<ul>\n<li>w</li>\n</ul>\n\
+             </li>\n</ol>\n<p>Thanks.</p>\n"
         );
         // A blank line the writer put before the heading keeps it, and its bullets, apart.
         assert_eq!(

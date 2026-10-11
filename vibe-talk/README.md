@@ -3095,11 +3095,16 @@ live stream, a post's answer and the pins — and sends it beside the text as `c
    that item, with the numbers it was written with; a numbered item that counts on from the one
    above it, ` 9.` under `8.`, stays beside it. Two shapes are drawn as the service draws them. On
    Google Chat and Slack, a line of prose at the left margin straight after an item starts a new
-   paragraph, where CommonMark would run it into the item. On Google Chat, which has no numbered
+   paragraph, where CommonMark would run it into the item — when it reads as a line of its own. A
+   line that starts in lower case, that a code span, emphasis or a link runs on to, or that follows
+   a line of 60 characters or more stopping mid-sentence is the rest of an item an editor wrapped,
+   and stays in it, unless it ends in a colon; and no line is set apart where that would change any
+   other block, such as the next `2.` of a numbered list. On Google Chat, which has no numbered
    lists — `1. Goal` is a line of text there, and the bullets after it a list indented beneath it —
-   bullets at the margin on the line straight after a numbered item are that item's. A marker
-   CommonMark has already read as part of an item's text, such as `    1. c` four columns in under
-   `  1. b`, stays that text.
+   bullets at the margin on the line straight after a numbered item are that item's, and so are a
+   heading line after them and the bullets under it, `In review:`, so every bullet of such an
+   outline is drawn at one indent. A marker CommonMark has already read as part of an item's text,
+   such as `    1. c` four columns in under `  1. b`, stays that text.
 5. An image is drawn as a link to it, so no phone fetches it from wherever the message pointed. A
    link to anything but a well-formed `http` or `https` address is drawn as its text with the
    address after it, so the reader still sees what the message pointed at.
