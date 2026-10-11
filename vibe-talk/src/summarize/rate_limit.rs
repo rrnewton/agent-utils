@@ -14,8 +14,8 @@
 //! # A 429 is obeyed by everyone
 //!
 //! When the provider answers 429 with `Retry-After`, [`RateLimiter::pause_for`] stops EVERY caller
-//! until then and empties the bucket, so the moment the pause ends calls resume at the steady pace
-//! rather than as a burst that would earn the next 429.
+//! until then and leaves exactly one call for the moment it ends, so calls resume at the steady
+//! pace rather than as a burst that would earn the next 429.
 //!
 //! # Interactive work goes first
 //!
@@ -119,12 +119,15 @@ impl RateLimiter {
         let mut bucket = self.bucket.lock().await;
         let now = Instant::now();
         self.refill(&mut bucket, now);
-        let until = now + wait;
-        bucket.paused_until = Some(bucket.paused_until.map_or(until, |held| held.max(until)));
-        bucket.tokens = 0.0;
-        // Refill is counted from the END of the pause: tokens that "accrued" while the provider
-        // was refusing us are not tokens we may spend.
-        bucket.updated = until.max(bucket.updated);
+        let until = bucket
+            .paused_until
+            .map_or(now + wait, |held| held.max(now + wait));
+        bucket.paused_until = Some(until);
+        // ONE call may go the moment the pause ends — the retry the provider invited — and after
+        // it the steady pace. Refill is counted from the END of the pause: tokens that "accrued"
+        // while the provider was refusing us are not tokens we may spend.
+        bucket.tokens = 1.0;
+        bucket.updated = until;
     }
 
     fn refill(&self, bucket: &mut Bucket, now: Instant) {
@@ -233,13 +236,17 @@ mod tests {
             first >= Duration::from_secs(30),
             "the pause was not obeyed: {first:?}"
         );
+        assert!(
+            first < Duration::from_millis(30_100),
+            "the retry the provider invited should go the moment the pause ends: {first:?}"
+        );
         limiter
             .acquire(Priority::Interactive, Duration::from_secs(120))
             .await
             .expect("admitted");
         assert!(
             start.elapsed() - first >= Duration::from_millis(900),
-            "the bucket was not emptied, so the pause ended in a burst"
+            "the pause ended in a burst rather than at the steady pace"
         );
     }
 

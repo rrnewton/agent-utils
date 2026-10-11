@@ -551,6 +551,9 @@ impl ThreadNames {
                         retry_after_seconds = RETRY_AFTER_FAILURE.as_secs(),
                         "a thread could not be named"
                     );
+                    state
+                        .failed
+                        .retain(|_, at| at.elapsed() < RETRY_AFTER_FAILURE);
                     state.failed.insert(key, Instant::now());
                 }
             }

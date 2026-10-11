@@ -470,8 +470,9 @@ async fn a_provider_that_keeps_refusing_is_given_up_on_after_a_bounded_number_of
     };
     let mock = Mock::start(vec![busy.clone(), busy.clone(), busy.clone(), busy]).await;
     let files = Files::new("llm-overloaded");
+    // A fast pace, so the test does not sit out the default four seconds between retries.
     let under = MessagesApiSummarizer::new(LlmConfig {
-        burst: 10,
+        requests_per_minute: 6_000,
         ..anthropic(&mock, &files)
     });
     let error = summarise(&under, "x").await.expect_err("gives up");

@@ -318,7 +318,7 @@ fn layered_loading_reads_the_overlay_files_from_disk() {
     .expect("write");
     // The environment of the test process is read too, as `load` reads it; nothing in it can
     // name a summaries setting this test depends on, because none has an environment form.
-    let cfg = Config::load_layered(Some(&base), &[overlay.clone()]).expect("valid");
+    let cfg = Config::load_layered(Some(&base), std::slice::from_ref(&overlay)).expect("valid");
     assert_eq!(
         cfg.summaries.llm.expect("the overlay applied").dialect,
         LlmDialect::Anthropic
