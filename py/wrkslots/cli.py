@@ -36990,8 +36990,8 @@ def _validation_recovery_target(
 
 
 # The producer parser and every local module it imports: the parser runs from a
-# private copy of exactly these files. dev-hermit's run_registry.py has imported
-# reverie_node since 2026-09-20 (dev-hermit 01991d70); without it every frozen
+# private copy of exactly these files. a consuming project's run_registry.py has imported
+# reverie_node since 2026-09-20 (consumer commit 01991d70); without it every frozen
 # handle was refused with ModuleNotFoundError, and frozen validation checkouts
 # were never removed (94 GB across nine of them on 2026-10-11). Each file is
 # copied to its tracked path under the private root: reverie_node.py imports
@@ -37776,7 +37776,7 @@ def _current_validation_result_is_terminal(
         if writeback == {"status": "completed"}:
             pass
         elif schema == 6 and writeback == {"status": "delegated"}:
-            # Schema 6 (dev-hermit 25d2537a, 2026-10-05) names a write-back
+            # Schema 6 (consumer commit 25d2537a, 2026-10-05) names a write-back
             # the launcher owns; it means what null meant before it.
             pass
         elif (

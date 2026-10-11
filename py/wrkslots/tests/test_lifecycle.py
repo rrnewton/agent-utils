@@ -507,9 +507,9 @@ FINAL_VALIDATE_STATUS_EXIT_CODES = {"PASSED": 0, "FAILED": 1, "COULD_NOT_RUN": 7
 '''
 
 
-# The fixture parser imports this module as dev-hermit's run_registry.py imports
+# The fixture parser imports this module as a consuming project's run_registry.py imports
 # reverie_node, so a parser copy without it fails here as it failed in
-# production (2026-10-11). Like dev-hermit's reverie_node.py, it imports
+# production (2026-10-11). Like that project's reverie_node.py, it imports
 # bounded_capture from ../lib relative to its own file, so a copy that is not
 # laid out at the tracked paths fails as the flat copy did in production.
 _FROZEN_REVERIE_NODE = """\
@@ -10112,7 +10112,7 @@ def test_schema_five_terminal_record_requires_status_appropriate_detail() -> Non
 def test_schema_six_terminal_record_accepts_delegated_writeback(
     target_kind: str, status: str
 ) -> None:
-    # dev-hermit 25d2537a (2026-10-05) writes service-result schema 6: the
+    # A consumer (commit 25d2537a, 2026-10-05) writes service-result schema 6: the
     # schema-5 fields plus a {"status": "delegated"} write-back when the
     # launcher owns publication. Until 2026-10-11 every such frozen record was
     # refused as having no evidenced terminal result, so five frozen
