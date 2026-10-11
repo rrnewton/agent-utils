@@ -1482,7 +1482,7 @@ message, and vibe-talk waits for a newer one; `409` with `"code":"thread_channel
 cannot be cleared at all (for example one thread of a larger space, where the provider's marker would
 also clear messages vibe-talk never received), and vibe-talk stops until the setting is saved again;
 `429` with `retry_after` in seconds is waited out; anything else is a failure and is retried. An older
-bridge answers `405`, which Settings reports as a failure. Direct Discord is never offered it.
+bridge answers `405`, which Settings reports as a failure saying the bridge needs updating. Direct Discord is never offered it.
 
 ### Where it lives
 

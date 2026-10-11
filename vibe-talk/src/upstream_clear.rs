@@ -458,6 +458,21 @@ fn unavailable_reason(error: &ChatError) -> String {
     }
 }
 
+/// A failure in words for the log and for Settings.
+///
+/// A bridge older than this feature answers the route with 405, as it does one with mark-read
+/// turned off; both are said as what to do about it rather than as a bare status.
+#[must_use]
+pub fn failure_words(error: &ChatError) -> String {
+    match error.cause() {
+        ChatError::Status { status: 405, .. } => format!(
+            "{error}; the bridge does not offer automatic clearing, so it needs updating or its \
+             mark-read is turned off"
+        ),
+        _ => error.to_string(),
+    }
+}
+
 /// What one provider answer comes to.
 #[must_use]
 pub fn classify(answer: &Result<UpstreamClearOutcome, ChatError>) -> UpstreamClearResult {
@@ -614,7 +629,7 @@ impl Clearer {
                 .as_ref()
                 .ok()
                 .and_then(|outcome| outcome.previous.clone()),
-            error: answer.as_ref().err().map(ToString::to_string),
+            error: answer.as_ref().err().map(failure_words),
         };
         self.log(&job, &attempt);
         if let Err(error) = self
@@ -778,6 +793,23 @@ mod tests {
             classify(&Err(ChatError::Transport("reset".to_owned()))),
             UpstreamClearResult::Failed
         );
+    }
+
+    #[test]
+    fn a_bridge_without_the_route_is_said_as_one_that_needs_updating() {
+        let old = ChatError::Status {
+            status: 405,
+            body: r#"{"message":"method not allowed"}"#.to_owned(),
+        }
+        .with_provider("Google Chat");
+        let words = failure_words(&old);
+        assert!(
+            words.starts_with("Google Chat returned HTTP 405"),
+            "{words}"
+        );
+        assert!(words.contains("needs updating"), "{words}");
+        let other = ChatError::Transport("reset".to_owned());
+        assert_eq!(failure_words(&other), other.to_string());
     }
 
     #[test]
