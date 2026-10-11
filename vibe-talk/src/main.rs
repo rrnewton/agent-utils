@@ -148,6 +148,20 @@ const SEEDED_BACKLOG: &[(&str, &str)] = &[
          - nothing else is open\n\n\n\
          I will push the tag when you say so.\n\nThanks!",
     ),
+    // `#237 nested-lists`: numbered steps with their sub-steps indented two spaces, as chat writes
+    // them, three levels deep in one place and with two-digit numbers. CommonMark nests only at an
+    // item's text — three columns in under `9. `, four under `10. ` — so this was drawn with every
+    // sub-step level with the steps, and the second step's own `1.` and `2.` numbered eleven and
+    // twelve. Photographed in `46-nested-lists`. Under the summary threshold, and older than the
+    // long entry below, which must stay the newest.
+    (
+        "claude-integ",
+        "seeded: steps 9 to 11 of the release checklist, and where each stands:\n\n\
+         9. finish the key rewrite\n  - fold in the feature set\n  - version the key\n    \
+         - old entries age out within the week\n\
+         10. land it behind the flag\n  1. one machine first\n  2. then all four\n\
+         11. write the release notes\n  - needs the maintainer's sign-off",
+    ),
     // OVER `summaries.threshold_chars`, which is 400 by default, and it is the only entry here
     // that is. Everything above is between 140 and 350 characters, so against this backlog every
     // summary the page asked for came back `below_threshold` and `#49 cached-summaries` could not

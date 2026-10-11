@@ -2086,6 +2086,29 @@ def _act_message_blocks(driver: Driver) -> None:
     driver.settle(300)
 
 
+# `#237 nested-lists`. The seeded checklist: numbered steps 9 to 11, their sub-steps indented two
+# spaces as chat writes them, one of them three levels deep, and the second step's own steps
+# numbered from one. CommonMark drew every level at one margin and numbered those steps 11 and 12.
+NESTED_LISTS_PROBE = "steps 9 to 11 of the release checklist"
+
+
+def _act_nested_lists(driver: Driver) -> None:
+    """`#237 nested-lists`: the server-nested checklist, opened in full and in view.
+
+    Opened and centred the way `41-message-blocks` opens its message, so the picture is the whole
+    list at once.
+    """
+    _act_open_channel(driver)
+    driver.js(
+        "(() => { const row = [...document.querySelectorAll('#discord-log > li')].find((n) => "
+        f"(n.textContent || '').includes({json.dumps(NESTED_LISTS_PROBE)})); "
+        "if (!row) return false; row.id = 'nested-lists-probe'; "
+        "if (row.getAttribute('data-collapsed') === 'true') row.querySelector('.fold').click(); "
+        "row.scrollIntoView({ block: 'center' }); return true; })()"
+    )
+    driver.settle(300)
+
+
 def _act_reply_view(driver: Driver) -> None:
     _act_whole_channel(driver)
     # Park in the middle of the channel, and record it. The round trip below is then a MEASURED
@@ -4236,6 +4259,72 @@ SCENES: tuple[Scene, ...] = (
                 "document.activeElement === document.getElementById('msg-scale-smaller') "
                 "&& document.activeElement.matches(':focus-visible') "
                 "&& getComputedStyle(document.activeElement).outlineStyle === 'solid'",
+            ),
+        ),
+    ),
+    Scene(
+        name="46-nested-lists",
+        what="numbered steps with sub-steps indented two spaces, as chat writes them: nested, indented, numbered as written",
+        act=_act_nested_lists,
+        profiles=("android-412", "laptop-1280"),
+        expect=(
+            ("the Discord pane is up", "window.__visible('pane-discord')"),
+            (
+                "the probed message is on screen, opened in full",
+                "(() => { const r = document.getElementById('nested-lists-probe'); "
+                "if (!r) return false; const b = r.getBoundingClientRect(); "
+                "return r.getAttribute('data-collapsed') !== 'true' && b.top >= 0 "
+                "&& b.bottom <= innerHeight; })()",
+            ),
+            (
+                # The server's nesting: one numbered list from 9, each step holding its own steps.
+                "its body is a paragraph and ONE list from 9 whose steps hold their sub-steps",
+                "(() => { const md = document.querySelector('#nested-lists-probe .md'); "
+                "if ([...md.children].map((n) => n.tagName).join(' ') !== 'P OL') return false; "
+                "const ol = md.children[1], steps = [...ol.children]; "
+                "const count = (n, s) => n.querySelectorAll(s).length; "
+                "return ol.getAttribute('start') === '9' && steps.length === 3 "
+                "&& count(steps[0], ':scope > ul > li') === 2 "
+                "&& count(steps[0], ':scope > ul > li > ul > li') === 1 "
+                "&& count(steps[1], ':scope > ol > li') === 2 "
+                "&& count(steps[2], ':scope > ul > li') === 1; })()",
+            ),
+            (
+                # THE layout claim the unit tests cannot make: each level's text starts clear to the
+                # right of the text of the level above it.
+                "each level is indented clear of the one above it",
+                "(() => { const md = document.querySelector('#nested-lists-probe .md'); "
+                "const left = (n) => n.getBoundingClientRect().left; "
+                "const step = md.querySelector(':scope > ol > li'); "
+                "const sub = step.querySelector(':scope > ul > li'); "
+                "const third = sub.parentElement.querySelector(':scope > li > ul > li'); "
+                "return left(sub) - left(step) >= 12 && left(third) - left(sub) >= 12; })()",
+            ),
+            (
+                # Depth marked as a browser's own sheet marks it, counting numbered lists too.
+                "the markers say the depth: a circle under a number, a square below it",
+                "(() => { const md = document.querySelector('#nested-lists-probe .md'); "
+                "const type = (s) => getComputedStyle(md.querySelector(s)).listStyleType; "
+                "return type(':scope > ol') === 'decimal' "
+                "&& type(':scope > ol > li > ul') === 'circle' "
+                "&& type(':scope > ol > li > ul > li > ul') === 'square' "
+                "&& type(':scope > ol > li > ol') === 'decimal' "
+                "&& !md.querySelector(':scope > ol > li > ol').hasAttribute('start'); })()",
+            ),
+            (
+                # A two-digit number is wider than a bullet, and hangs in the same kind of gutter:
+                # `10.` has to fit in it rather than stick out past the text above.
+                "the widest number fits inside its list's gutter",
+                "(() => { const ol = document.querySelector('#nested-lists-probe .md > ol'); "
+                "const c = document.createElement('canvas').getContext('2d'); "
+                "c.font = getComputedStyle(ol.children[1]).font; "
+                "return c.measureText('10. ').width "
+                "<= parseFloat(getComputedStyle(ol).paddingLeft) + 0.5; })()",
+            ),
+            (
+                "no Markdown is left on screen",
+                "!/(^|\\n)\\s*(- |\\d+\\. )/.test("
+                "document.querySelector('#nested-lists-probe .body').innerText)",
             ),
         ),
     ),

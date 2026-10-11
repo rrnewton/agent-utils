@@ -3088,10 +3088,22 @@ live stream, a post's answer and the pins — and sends it beside the text as `c
    bold, and backticks keep it literal anywhere. That is the provider's `markup` setting
    ([Configuration](#configuration)): a Slack provider is always Slack's, and a Discord-protocol
    bridge says `markup = "google-chat"` when it serves Google Chat.
-4. An image is drawn as a link to it, so no phone fetches it from wherever the message pointed. A
+4. **A list is nested the way its writer indented it** (`#237 nested-lists`). CommonMark nests a
+   line only when it is indented as far as the item's text — three columns under `1. `, four under
+   `10. ` — while chat indents a level by two spaces, one, or a tab, whatever the marker. A list, an
+   item, a fenced code block or a quote written further in than the item above it is drawn under
+   that item, with the numbers it was written with; a numbered item that counts on from the one
+   above it, ` 9.` under `8.`, stays beside it. Two shapes are drawn as the service draws them. On
+   Google Chat and Slack, a line of prose at the left margin straight after an item starts a new
+   paragraph, where CommonMark would run it into the item. On Google Chat, which has no numbered
+   lists — `1. Goal` is a line of text there, and the bullets after it a list indented beneath it —
+   bullets at the margin on the line straight after a numbered item are that item's. A marker
+   CommonMark has already read as part of an item's text, such as `    1. c` four columns in under
+   `  1. b`, stays that text.
+5. An image is drawn as a link to it, so no phone fetches it from wherever the message pointed. A
    link to anything but a well-formed `http` or `https` address is drawn as its text with the
    address after it, so the reader still sees what the message pointed at.
-5. A link whose text is its own address — a bare address, `<https://…>`, or a chat service's
+6. A link whose text is its own address — a bare address, `<https://…>`, or a chat service's
    address labelled with itself — is drawn with a **short label** when it is a GitHub page that has
    one (`#227 github-link-abbrev`): `widgets#123` for a pull request, an issue or a discussion,
    `widgets#123 (comment)` for a comment in one, `widgets@4f21ab0` for a commit,
@@ -3105,7 +3117,7 @@ live stream, a post's answer and the pins — and sends it beside the text as `c
    GitHub's own that no account may take, such as an organisation's `/orgs/NAME/discussions/3`.
    Copy text and every voice still have the address as it was written. The rules are a table in `src/link_labels.rs`, where another
    host can be added.
-6. Raw HTML written in a message is shown as the characters it is, and
+7. Raw HTML written in a message is shown as the characters it is, and
    [ammonia](https://github.com/rust-ammonia/ammonia) then keeps only a short allowlist of
    elements and attributes; see [Security](#security).
 

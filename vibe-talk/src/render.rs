@@ -1076,7 +1076,7 @@ fn list_of(node: &AstNode<'_>) -> Option<NodeList> {
 ///
 /// - within one list, an item further in than the one before it — except a numbered item that
 ///   counts on from the one before it (`8.` then ` 9.`, a column of right-aligned numbers);
-/// - a list straight after another, its first marker further in than the other's last item;
+/// - a list, a fenced code block or a quote straight after a list, further in than its last item;
 /// - and in Google Chat, a bulleted list on the line straight after a numbered one, whatever its
 ///   indent ([`Markup::bullets_under_numbered_line_nest`]).
 ///
@@ -1084,6 +1084,12 @@ fn list_of(node: &AstNode<'_>) -> Option<NodeList> {
 /// block moves with the item it is in, untouched, and every list keeps the numbers CommonMark gave
 /// it. A list that arrives where one of its kind already ends the item joins it when it carries
 /// its numbering on, so an item's steps stay one list.
+///
+/// The price of not rewriting the text: a marker CommonMark has already read as part of an item's
+/// text stays that text. That is a marker four or more columns past its container's margin under
+/// an item whose own text starts further in still — `    1. c` under `  1. b` — or one that may
+/// not interrupt the item's paragraph, `  2. b` under `- a`. A week of the messages this was
+/// written for held neither shape.
 fn nest_lists<'a>(
     arena: &'a Arena<'a>,
     container: &'a AstNode<'a>,
