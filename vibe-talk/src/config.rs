@@ -1668,6 +1668,9 @@ fn llm_config(file: FileLlm, fallback_model: Option<String>) -> Result<LlmConfig
     })
 }
 
+#[cfg(test)]
+mod llm_tests;
+
 /// Environment variable naming configuration OVERLAY files, separated by `:`, applied after any
 /// `--config-overlay` flags. See [`merge_overlays`].
 pub const ENV_CONFIG_OVERLAY: &str = "VIBE_TALK_CONFIG_OVERLAY";
