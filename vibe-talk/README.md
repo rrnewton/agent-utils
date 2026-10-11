@@ -1222,7 +1222,7 @@ reported in the failure.
 | `ca_bundle_file` | — | PEM roots to trust in addition to the public ones |
 | `extra_headers` | none | a table of headers sent on every call; **not for secrets**, and the headers this server sets itself (`x-api-key`, `authorization`, `anthropic-version`, `content-type`, …) are refused |
 | `max_tokens` | `120` | output budget per call, `1`–`4096` |
-| `timeout_secs` | `30` | per call, `1`–`600`; also how long a summary waits for a rate-limit slot |
+| `timeout_secs` | `30` | per HTTP request, `1`–`600`; also how long, in all, a summary may wait for rate-limit slots |
 | `requests_per_minute` | `15` | client-side ceiling across summaries and thread names; at least `1` |
 | `burst` | `3` | calls that may go out back to back before the pace applies; at least `1` |
 
@@ -1242,11 +1242,17 @@ in the instruction. A model offered no tool cannot call one, whatever the channe
 ### The rate limit
 
 Every call — summaries and thread names alike — goes through one client-side token bucket:
-`burst` at once, then `requests_per_minute`. Calls over the limit **queue**; a summary someone is
-waiting for gives up after `timeout_secs` and says it was rate-limited, and background thread
-naming always leaves one token for such a summary. A `429` from the provider pauses **every**
-caller for its `Retry-After` (at most fifteen minutes) and resumes at the steady pace; a `429`,
-`503` or `529` is tried at most three times in all.
+`burst` at once, then `requests_per_minute`. Calls over the limit **queue, first come first
+served**. A summary someone is waiting for has `timeout_secs` in all to get a slot, retries
+included; when its place in the queue is further away than that, it is turned away at once and
+says it was rate-limited. Background thread naming queues separately, behind every waiting summary,
+and leaves one token spare for the next one.
+
+A `429` from the provider pauses **every** caller for its `Retry-After` (at most fifteen minutes)
+and then resumes at the steady pace. A pause only ever takes allowance away — nothing accrues
+while the provider is refusing — so even a provider that answers everything with `429` and
+`Retry-After: 0` is called no faster than the configured limit. A `429`, `503` or `529` is tried at
+most three times in all.
 
 ### Thread names
 

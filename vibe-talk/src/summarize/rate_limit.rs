@@ -7,30 +7,43 @@
 //! ask for a dozen summaries at once. The provider's own rate limit is the operator's to spend,
 //! shared with whatever else uses the same key, and a 429 storm from this server would spend it on
 //! retries. So calls are paced HERE, before they leave: at most `burst` back to back, then one per
-//! `60 / requests_per_minute` seconds. A caller over the limit WAITS its turn rather than being
-//! refused, up to a deadline it chooses; only a caller whose turn is past that deadline is turned
-//! away, and it is told how long it would have waited.
+//! `60 / requests_per_minute` seconds.
 //!
-//! # A 429 is obeyed by everyone
+//! # A line, served in order
+//!
+//! A caller over the limit WAITS its turn rather than being refused, in a first-come first-served
+//! line: only the caller at the head of the line watches the bucket, and the next one moves up
+//! when it has been served (or has given up). Each caller brings a deadline. One whose turn, as
+//! the line stands when it joins, is past that deadline is turned away at once and told how long
+//! it would have waited; one that joins and then runs out of patience leaves the line without
+//! taking anything, so a refused caller costs the others nothing.
+//!
+//! # A 429 is obeyed by everyone, and never spends more than the limit
 //!
 //! When the provider answers 429 with `Retry-After`, [`RateLimiter::pause_for`] stops EVERY caller
-//! until then and leaves exactly one call for the moment it ends, so calls resume at the steady
-//! pace rather than as a burst that would earn the next 429.
+//! until then. A pause only ever TAKES allowance away: the bucket keeps at most one call (the retry
+//! the provider invited, when the bucket still had it), and nothing accrues while the provider is
+//! refusing us. So a provider answering 429 to everything — even with `Retry-After: 0` — is still
+//! called no more often than `burst` plus the steady pace allows.
 //!
 //! # Interactive work goes first
 //!
 //! Thread names are produced in the background; a message summary is produced while somebody
-//! waits for it. [`Priority::Background`] therefore takes a token only when one more would still be
-//! left for an interactive caller (when the burst allows a spare at all), so a backlog of thread
-//! names never makes a reader wait behind it for a whole refill.
+//! waits for it. They queue in separate lines, and [`Priority::Background`] takes a token only
+//! when nobody is waiting in the interactive line AND one more token would still be left for an
+//! interactive caller (when the burst allows a spare at all), so a backlog of thread names never
+//! makes a reader wait behind it.
 //!
 //! Time is `tokio::time`, so a test with a paused clock can assert exactly when each call went.
 
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Mutex;
 use std::time::Duration;
 
 use tokio::time::Instant;
 
-/// Who is asking, which decides whether a token must be left over for somebody else.
+/// Who is asking, which decides which line it waits in and whether a token must be left over
+/// for somebody else.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Priority {
     /// Somebody is waiting for this answer.
@@ -39,19 +52,45 @@ pub enum Priority {
     Background,
 }
 
-/// The pace, and the burst before it applies.
+impl Priority {
+    fn line(self) -> usize {
+        match self {
+            Self::Interactive => 0,
+            Self::Background => 1,
+        }
+    }
+}
+
+/// The pace, the burst before it applies, and the two lines of callers waiting for it.
 #[derive(Debug)]
 pub struct RateLimiter {
     per_second: f64,
     burst: f64,
-    bucket: tokio::sync::Mutex<Bucket>,
+    bucket: Mutex<Bucket>,
+    /// One per [`Priority`]. Holding a line's lock is being at its head; `tokio`'s mutex hands
+    /// itself over in the order it was asked for, which is what makes the line first-come
+    /// first-served.
+    lines: [tokio::sync::Mutex<()>; 2],
+    /// How many callers are in each line, the head included.
+    waiting: [AtomicUsize; 2],
 }
 
 #[derive(Debug)]
 struct Bucket {
     tokens: f64,
+    /// When `tokens` was last brought up to date. Never earlier than the end of a pause, so no
+    /// token accrues during one.
     updated: Instant,
     paused_until: Option<Instant>,
+}
+
+/// A place in a line, given up however the caller leaves it: served, refused or dropped.
+struct Place<'a>(&'a AtomicUsize);
+
+impl Drop for Place<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
 }
 
 impl RateLimiter {
@@ -64,12 +103,20 @@ impl RateLimiter {
         Self {
             per_second: f64::from(per_minute.max(1)) / 60.0,
             burst,
-            bucket: tokio::sync::Mutex::new(Bucket {
+            bucket: Mutex::new(Bucket {
                 tokens: burst,
                 updated: Instant::now(),
                 paused_until: None,
             }),
+            lines: [tokio::sync::Mutex::new(()), tokio::sync::Mutex::new(())],
+            waiting: [AtomicUsize::new(0), AtomicUsize::new(0)],
         }
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, Bucket> {
+        self.bucket
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     /// Wait for a turn, for at most `max_wait`.
@@ -79,31 +126,38 @@ impl RateLimiter {
     /// The wait that WOULD have been needed, when it is longer than `max_wait`. Nothing is
     /// reserved in that case, so a refused caller costs the others nothing.
     pub async fn acquire(&self, priority: Priority, max_wait: Duration) -> Result<(), Duration> {
-        let deadline = Instant::now() + max_wait;
+        let joined = Instant::now();
+        let deadline = joined + max_wait;
+        let line = priority.line();
+        let ahead = self.waiting[line].fetch_add(1, Ordering::SeqCst);
+        let _place = Place(&self.waiting[line]);
+        // Everybody ahead is served first, so this caller needs the bucket to hold one call for
+        // each of them as well as its own. Said now, not at the deadline, when the answer is no.
+        let estimate = {
+            let mut bucket = self.lock();
+            self.refill(&mut bucket, joined);
+            self.wait_for(&bucket, joined, priority, ahead)
+        };
+        if estimate > max_wait {
+            return Err(estimate);
+        }
+        let Ok(_head) = tokio::time::timeout_at(deadline, self.lines[line].lock()).await else {
+            // The line moved slower than it looked: callers ahead were held up by a pause.
+            return Err(estimate
+                .saturating_sub(joined.elapsed())
+                .max(Duration::from_secs(1)));
+        };
         loop {
             let wait = {
-                let mut bucket = self.bucket.lock().await;
+                let mut bucket = self.lock();
                 let now = Instant::now();
                 self.refill(&mut bucket, now);
-                let reserve = match priority {
-                    Priority::Interactive => 0.0,
-                    Priority::Background if self.burst >= 2.0 => 1.0,
-                    Priority::Background => 0.0,
-                };
-                let paused = bucket
-                    .paused_until
-                    .filter(|until| *until > now)
-                    .map_or(Duration::ZERO, |until| until - now);
-                if paused.is_zero() && bucket.tokens >= 1.0 + reserve {
+                let wait = self.wait_for(&bucket, now, priority, 0);
+                if wait.is_zero() {
                     bucket.tokens -= 1.0;
                     return Ok(());
                 }
-                let deficit = (1.0 + reserve - bucket.tokens).max(0.0);
-                // Rounded UP to the millisecond, so a waiter never wakes a hair early, finds the
-                // bucket a fraction short and has to sleep again for nothing.
-                let refill =
-                    Duration::from_millis((deficit / self.per_second * 1000.0).ceil() as u64);
-                paused.max(refill)
+                wait
             };
             if Instant::now() + wait > deadline {
                 return Err(wait);
@@ -112,22 +166,56 @@ impl RateLimiter {
         }
     }
 
+    /// How long until the bucket can serve a caller of `priority` with `ahead` callers in its own
+    /// line in front of it. Zero means now.
+    fn wait_for(
+        &self,
+        bucket: &Bucket,
+        now: Instant,
+        priority: Priority,
+        ahead: usize,
+    ) -> Duration {
+        let needed = match priority {
+            Priority::Interactive => ahead as f64 + 1.0,
+            // Behind everybody in the interactive line, and leaving a spare for the next one.
+            Priority::Background => {
+                let interactive = self.waiting[Priority::Interactive.line()].load(Ordering::SeqCst);
+                let spare = if self.burst >= 2.0 { 1.0 } else { 0.0 };
+                ahead as f64 + 1.0 + interactive as f64 + spare
+            }
+        };
+        let paused = bucket
+            .paused_until
+            .filter(|until| *until > now)
+            .map_or(Duration::ZERO, |until| until - now);
+        // Nothing accrues during a pause (`updated` is its end), so the refill starts after it.
+        let deficit = (needed - bucket.tokens).max(0.0);
+        // Rounded UP to the millisecond, so a waiter never wakes a hair early, finds the bucket a
+        // fraction short and has to sleep again for nothing.
+        let refill = Duration::from_millis((deficit / self.per_second * 1000.0).ceil() as u64);
+        paused + refill
+    }
+
     /// Stop every caller for `wait`, and start again at the steady pace rather than with a burst.
     ///
     /// What a 429's `Retry-After` turns into. A pause already longer than this one is kept.
-    pub async fn pause_for(&self, wait: Duration) {
-        let mut bucket = self.bucket.lock().await;
+    ///
+    /// A pause NEVER adds allowance. The bucket keeps at most ONE call for the moment the pause
+    /// ends — the retry the provider invited, if the bucket still had a call to give — and refill
+    /// is counted from the END of the pause: tokens that "accrued" while the provider was refusing
+    /// us are not tokens we may spend. A provider that answers every call with 429 therefore
+    /// paces this server exactly as the configured limit does, and no faster, whatever its
+    /// `Retry-After` says, zero included.
+    pub fn pause_for(&self, wait: Duration) {
+        let mut bucket = self.lock();
         let now = Instant::now();
         self.refill(&mut bucket, now);
         let until = bucket
             .paused_until
             .map_or(now + wait, |held| held.max(now + wait));
         bucket.paused_until = Some(until);
-        // ONE call may go the moment the pause ends — the retry the provider invited — and after
-        // it the steady pace. Refill is counted from the END of the pause: tokens that "accrued"
-        // while the provider was refusing us are not tokens we may spend.
-        bucket.tokens = 1.0;
-        bucket.updated = until;
+        bucket.tokens = bucket.tokens.min(1.0);
+        bucket.updated = bucket.updated.max(until);
     }
 
     fn refill(&self, bucket: &mut Bucket, now: Instant) {
@@ -161,6 +249,13 @@ mod tests {
                      {grants:?}"
                 );
             }
+        }
+    }
+
+    /// Let every runnable task run, so tasks spawned one after another join the line in order.
+    async fn settle() {
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
         }
     }
 
@@ -198,6 +293,36 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn waiting_callers_are_served_in_the_order_they_arrived() {
+        let limiter = Arc::new(RateLimiter::new(60, 1));
+        limiter
+            .acquire(Priority::Interactive, Duration::ZERO)
+            .await
+            .expect("the first is free");
+        let order = Arc::new(Mutex::new(Vec::new()));
+        let mut tasks = Vec::new();
+        for n in 0..6 {
+            let limiter = Arc::clone(&limiter);
+            let order = Arc::clone(&order);
+            tasks.push(tokio::spawn(async move {
+                limiter
+                    .acquire(Priority::Interactive, Duration::from_secs(3600))
+                    .await
+                    .expect("admitted");
+                order.lock().unwrap().push(n);
+            }));
+            settle().await;
+            // Arrivals spread over time, so a later one would be due sooner if each computed its
+            // own wait and raced for the token.
+            tokio::time::advance(Duration::from_millis(150)).await;
+        }
+        for task in tasks {
+            task.await.unwrap();
+        }
+        assert_eq!(*order.lock().unwrap(), vec![0, 1, 2, 3, 4, 5]);
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn a_caller_whose_turn_is_past_its_deadline_is_told_how_long_it_would_have_waited() {
         let limiter = RateLimiter::new(6, 1);
         limiter
@@ -223,10 +348,42 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn a_caller_is_judged_by_its_place_in_the_line_and_refused_at_once() {
+        let limiter = Arc::new(RateLimiter::new(60, 1));
+        limiter
+            .acquire(Priority::Interactive, Duration::ZERO)
+            .await
+            .expect("the first is free");
+        let mut tasks = Vec::new();
+        for _ in 0..3 {
+            let limiter = Arc::clone(&limiter);
+            tasks.push(tokio::spawn(async move {
+                limiter
+                    .acquire(Priority::Interactive, Duration::from_secs(3600))
+                    .await
+                    .expect("admitted");
+            }));
+            settle().await;
+        }
+        // Three ahead at one a second: this caller's turn is about four seconds away, and it will
+        // wait two. It is told so now, rather than after two seconds of waiting for nothing.
+        let start = Instant::now();
+        let refused = limiter
+            .acquire(Priority::Interactive, Duration::from_secs(2))
+            .await
+            .expect_err("its turn is past its deadline");
+        assert_eq!(start.elapsed(), Duration::ZERO, "refused at once");
+        assert!(refused >= Duration::from_secs(3), "{refused:?}");
+        for task in tasks {
+            task.await.unwrap();
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn a_429_pause_holds_everyone_and_resumes_at_the_steady_pace() {
         let limiter = RateLimiter::new(60, 5);
         let start = Instant::now();
-        limiter.pause_for(Duration::from_secs(30)).await;
+        limiter.pause_for(Duration::from_secs(30));
         limiter
             .acquire(Priority::Interactive, Duration::from_secs(120))
             .await
@@ -250,6 +407,61 @@ mod tests {
         );
     }
 
+    /// A provider that answers EVERY call with 429 and `retry_after`, against `callers` callers
+    /// each retrying as the summariser does. Returns when each call went out.
+    async fn storm(
+        per_minute: u32,
+        burst: u32,
+        retry_after: Duration,
+        callers: usize,
+    ) -> Vec<Duration> {
+        let limiter = Arc::new(RateLimiter::new(per_minute, burst));
+        let start = Instant::now();
+        let grants = Arc::new(Mutex::new(Vec::new()));
+        let mut tasks = Vec::new();
+        for _ in 0..callers {
+            let limiter = Arc::clone(&limiter);
+            let grants = Arc::clone(&grants);
+            tasks.push(tokio::spawn(async move {
+                for _ in 0..10 {
+                    limiter
+                        .acquire(Priority::Interactive, Duration::from_secs(3600))
+                        .await
+                        .expect("a long deadline admits everyone eventually");
+                    grants.lock().unwrap().push(start.elapsed());
+                    // ...and the answer is a 429.
+                    limiter.pause_for(retry_after);
+                }
+            }));
+        }
+        for task in tasks {
+            task.await.unwrap();
+        }
+        let mut grants = grants.lock().unwrap().clone();
+        grants.sort();
+        grants
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_429_storm_never_spends_more_than_the_limit_whatever_retry_after_says() {
+        // The regression: a pause used to REFILL the bucket to one call, so every 429 bought the
+        // next call, and `Retry-After: 1` became one call a second against a limit of one every
+        // four, while `Retry-After: 0` took the pacing away entirely.
+        for (retry_after, callers) in [
+            (Duration::from_secs(1), 1),
+            (Duration::ZERO, 1),
+            (Duration::from_secs(1), 4),
+            (Duration::ZERO, 4),
+        ] {
+            let grants = storm(15, 1, retry_after, callers).await;
+            assert_eq!(grants.len(), 10 * callers);
+            assert_within_limit(&grants, 15, 1);
+        }
+        // With a burst to spend, too.
+        let grants = storm(15, 3, Duration::ZERO, 3).await;
+        assert_within_limit(&grants, 15, 3);
+    }
+
     #[tokio::test(start_paused = true)]
     async fn background_work_leaves_a_token_for_somebody_who_is_waiting() {
         let limiter = RateLimiter::new(60, 2);
@@ -265,5 +477,40 @@ mod tests {
             .acquire(Priority::Interactive, Duration::ZERO)
             .await
             .expect("the kept token is there for an interactive caller");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn background_work_waits_behind_every_interactive_caller() {
+        let limiter = Arc::new(RateLimiter::new(60, 1));
+        limiter
+            .acquire(Priority::Interactive, Duration::ZERO)
+            .await
+            .expect("the first is free");
+        let order = Arc::new(Mutex::new(Vec::new()));
+        let mut tasks = Vec::new();
+        for (who, priority) in [
+            ("background", Priority::Background),
+            ("interactive-1", Priority::Interactive),
+            ("interactive-2", Priority::Interactive),
+        ] {
+            let limiter = Arc::clone(&limiter);
+            let order = Arc::clone(&order);
+            tasks.push(tokio::spawn(async move {
+                limiter
+                    .acquire(priority, Duration::from_secs(3600))
+                    .await
+                    .expect("admitted");
+                order.lock().unwrap().push(who);
+            }));
+            settle().await;
+        }
+        for task in tasks {
+            task.await.unwrap();
+        }
+        assert_eq!(
+            *order.lock().unwrap(),
+            vec!["interactive-1", "interactive-2", "background"],
+            "a thread name that arrived first still waits for the summaries somebody is reading"
+        );
     }
 }

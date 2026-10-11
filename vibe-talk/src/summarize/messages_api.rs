@@ -350,14 +350,18 @@ impl MessagesApiSummarizer {
         system: &str,
         prompt: &str,
     ) -> Result<String, SummaryError> {
+        // ONE deadline for every wait this call does for a slot, retries included: a reader is
+        // not asked to sit through `timeout_secs` of queueing once per attempt.
         let max_wait = match priority {
             Priority::Interactive => Duration::from_secs(self.config.timeout_secs),
             Priority::Background => BACKGROUND_MAX_WAIT,
         };
         let began = Instant::now();
+        let deadline = began + max_wait;
         let mut last = String::new();
         for attempt in 0..MAX_ATTEMPTS {
-            if let Err(wait) = self.limiter.acquire(priority, max_wait).await {
+            let patience = deadline.saturating_duration_since(Instant::now());
+            if let Err(wait) = self.limiter.acquire(priority, patience).await {
                 return Err(SummaryError::Transport(format!(
                     "the summariser's rate limit ({} a minute, burst {}) has no free call for \
                      another {}s{}",
@@ -394,7 +398,7 @@ impl MessagesApiSummarizer {
                         %detail,
                         "the model provider asked us to slow down; every summariser call now waits"
                     );
-                    self.limiter.pause_for(wait).await;
+                    self.limiter.pause_for(wait);
                     self.note(|s| s.retried += 1);
                     last = detail;
                 }
