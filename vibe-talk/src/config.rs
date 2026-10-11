@@ -1407,6 +1407,23 @@ const RESERVED_LLM_HEADERS: &[&str] = &[
     "x-api-key",
 ];
 
+/// Fragments that mark a request header as one that carries a credential. An `extra_headers` value
+/// is written INLINE in the configuration file — a file that is shared, copied and pasted — so a
+/// header whose name contains one of these is refused rather than trusted to hold no secret.
+/// Credentials have their own settings, which read files.
+const SECRET_HEADER_FRAGMENTS: &[&str] = &[
+    "auth",
+    "cookie",
+    "credential",
+    "key",
+    "passwd",
+    "password",
+    "secret",
+    "session",
+    "signature",
+    "token",
+];
+
 /// Resolve `[summaries.llm]`. `#233 llm-summarizer`.
 fn llm_config(file: FileLlm) -> Result<LlmConfig, ConfigError> {
     let invalid = |field: &str, detail: String| ConfigError::Invalid {
@@ -1594,6 +1611,21 @@ fn llm_config(file: FileLlm) -> Result<LlmConfig, ConfigError> {
             return Err(invalid(
                 "extra_headers",
                 format!("{name:?} is set by this server and cannot be overridden here"),
+            ));
+        }
+        if let Some(fragment) = SECRET_HEADER_FRAGMENTS
+            .iter()
+            .find(|fragment| lower.contains(*fragment))
+        {
+            // The value is not echoed: by the header's own name, it may be a credential.
+            return Err(invalid(
+                "extra_headers",
+                format!(
+                    "{name:?} looks like a header that carries a credential (its name contains \
+                     {fragment:?}), and a value here is written in the configuration file itself. \
+                     Put credentials in a file and name it with api_key_file, bearer_token_file or \
+                     bearer_token_command"
+                ),
             ));
         }
         if reqwest::header::HeaderName::from_bytes(lower.as_bytes()).is_err()

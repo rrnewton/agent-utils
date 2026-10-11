@@ -284,6 +284,15 @@ pub fn policy_version_for(config: &SummariesConfig, summarizer: &dyn Summarizer)
 /// change every version equally and be invisible.
 #[must_use]
 pub fn policy_version_of(prompt: &str, config: &SummariesConfig, backend: &str) -> String {
+    // `[summaries.llm]`: only what changes the WORDING — see `LlmConfig` for why endpoints,
+    // credentials, timeouts and the rate limit are deliberately not here. The running summariser
+    // folds the same three in again through its `policy_input`; here they cover `policy_version`,
+    // which has no summariser to ask. Hashed ONLY when the section is present, so a deployment
+    // without it keeps the exact version it had before the section existed, and its cache.
+    let llm = config
+        .llm
+        .as_ref()
+        .map(|llm| format!("{}|{}|{}", llm.dialect.as_str(), llm.model, llm.max_tokens));
     let mut hash = FNV_OFFSET;
     for part in [
         prompt,
@@ -305,14 +314,10 @@ pub fn policy_version_of(prompt: &str, config: &SummariesConfig, backend: &str) 
         // down where the next person adding a field would read it; a rare extra cache miss when
         // an operator retunes a timeout is a much smaller cost than that.
         &config.reply_timeout_seconds.to_string(),
-        // `[summaries.llm]`: only what changes the WORDING — see `LlmConfig` for why endpoints,
-        // credentials, timeouts and the rate limit are deliberately not here. The running
-        // summariser folds the same three in again through its `policy_input`; here they cover
-        // `policy_version`, which has no summariser to ask.
-        &config.llm.as_ref().map_or_else(String::new, |llm| {
-            format!("{}|{}|{}", llm.dialect.as_str(), llm.model, llm.max_tokens)
-        }),
-    ] {
+    ]
+    .into_iter()
+    .chain(llm.as_deref())
+    {
         hash = fnv1a64(hash, part.as_bytes());
         // A separator, so ("ab", "c") and ("a", "bc") do not hash the same.
         hash = fnv1a64(hash, &[0x1f]);
@@ -438,6 +443,41 @@ mod tests {
                  keep being served"
             );
         }
+    }
+
+    #[test]
+    fn without_an_llm_section_the_version_is_exactly_what_it_was_before_the_section_existed() {
+        // An upgrade must not empty an ElevenLabs-only deployment's cache: the version is the hash
+        // of precisely the parts it hashed before `#233 llm-summarizer`, in the same order, with
+        // nothing appended — not even an empty part and its separator.
+        let config = SummariesConfig {
+            model: Some("some-model".to_owned()),
+            ..config()
+        };
+        let mut hash = FNV_OFFSET;
+        for part in [
+            PROMPT,
+            agent::BACKEND,
+            "some-model",
+            &config.target_chars.to_string(),
+            &config.context_messages.to_string(),
+            &config.threshold_chars.to_string(),
+            &config.max_per_socket.to_string(),
+            &config.socket_idle_seconds.to_string(),
+            &config.reply_timeout_seconds.to_string(),
+        ] {
+            hash = fnv1a64(hash, part.as_bytes());
+            hash = fnv1a64(hash, &[0x1f]);
+        }
+        assert_eq!(
+            policy_version_of(PROMPT, &config, agent::BACKEND),
+            format!(
+                "v1-{}-w{}-c{}-{hash:016x}",
+                agent::BACKEND,
+                config.context_messages,
+                config.target_chars
+            )
+        );
     }
 
     #[test]

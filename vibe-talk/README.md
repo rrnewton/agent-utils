@@ -1220,7 +1220,7 @@ reported in the failure.
 | `bearer_token_command` | — | Vertex only; an argument list, run without a shell, 20-second limit; not with `bearer_token_file` |
 | `client_identity_file` | — | PEM certificate chain and private key; re-read when it changes |
 | `ca_bundle_file` | — | PEM roots to trust in addition to the public ones |
-| `extra_headers` | none | a table of headers sent on every call; **not for secrets**, and the headers this server sets itself (`x-api-key`, `authorization`, `anthropic-version`, `content-type`, …) are refused |
+| `extra_headers` | none | a table of headers sent on every call; **not for secrets**: the headers this server sets itself (`x-api-key`, `authorization`, `anthropic-version`, `content-type`, …) are refused, and so is any name containing `auth`, `cookie`, `credential`, `key`, `passwd`, `password`, `secret`, `session`, `signature` or `token` |
 | `max_tokens` | `120` | output budget per call, `1`–`4096` |
 | `timeout_secs` | `30` | per HTTP request, `1`–`600`; also how long, in all, a summary may wait for rate-limit slots |
 | `requests_per_minute` | `15` | client-side ceiling across summaries and thread names; at least `1` |

@@ -451,3 +451,38 @@ fn a_mistake_in_any_layer_is_reported_against_that_file_at_its_own_line() {
         "{err}"
     );
 }
+
+#[test]
+fn an_extra_header_named_like_a_credential_is_refused_and_its_value_never_repeated() {
+    for name in [
+        "cookie",
+        "proxy-authorization",
+        "x-goog-api-key",
+        "x-auth-token",
+        "x-client-secret",
+        "X-Session-Id",
+    ] {
+        let text = format!(
+            "[summaries.llm]\napi_key_file = \"/k\"\n[summaries.llm.extra_headers]\n\"{name}\" = \"hunter2-value\"\n"
+        );
+        let err = load(&text).expect_err(name);
+        let said = err.to_string();
+        assert!(
+            said.contains("summaries.llm.extra_headers"),
+            "{name}: {said}"
+        );
+        assert!(
+            !said.contains("hunter2-value"),
+            "{name}: the value was repeated: {said}"
+        );
+    }
+    // A header that only identifies the caller is fine.
+    let cfg = load(
+        "[summaries.llm]\napi_key_file = \"/k\"\n[summaries.llm.extra_headers]\nx-client-name = \"vibe-talk\"\n",
+    )
+    .expect("valid");
+    assert_eq!(
+        cfg.summaries.llm.expect("read").extra_headers["x-client-name"],
+        "vibe-talk"
+    );
+}
