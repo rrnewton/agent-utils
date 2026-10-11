@@ -2822,13 +2822,10 @@ async fn upstream_clear_view(
         .find(|setting| setting.channel == channel.id)
         .unwrap_or_else(|| crate::store::UpstreamClearSetting::unset(channel.id.clone()));
     let live = state.live.upstream_clear().status(&channel.id);
-    let provider_name = state
-        .providers
-        .client_for(&channel.id)
-        .map_or_else(
-            || state.chat.provider_name().to_owned(),
-            |client| client.provider_name().to_owned(),
-        );
+    let provider_name = state.providers.client_for(&channel.id).map_or_else(
+        || state.chat.provider_name().to_owned(),
+        |client| client.provider_name().to_owned(),
+    );
     Ok(crate::contract::UpstreamClearState {
         channel,
         provider_name,

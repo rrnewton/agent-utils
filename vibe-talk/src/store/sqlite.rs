@@ -3494,8 +3494,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn upstream_clear_arrives_on_an_existing_file_outlasts_a_restart_and_a_purge_turns_it_off()
-    {
+    async fn upstream_clear_arrives_on_an_existing_file_outlasts_a_restart_and_a_purge_turns_it_off(
+    ) {
         // `#232 upstream-mark-read`. The file in the wild is a v10 file holding an owner's state.
         let dir = TempDir::new("sqlite-upstream-clear");
         let file = dir.path().join("vibe-talk.sqlite3");
@@ -3522,7 +3522,11 @@ mod tests {
         {
             let store = SqliteStore::open(&file, Retention::default()).expect("migrate");
             assert!(
-                store.upstream_clear_settings().await.expect("read").is_empty(),
+                store
+                    .upstream_clear_settings()
+                    .await
+                    .expect("read")
+                    .is_empty(),
                 "an upgraded file must clear nothing upstream that the owner did not ask for"
             );
             assert_eq!(store.read_marks().await.expect("read").len(), 1);
@@ -3530,7 +3534,12 @@ mod tests {
             store
                 .record_upstream_clear(
                     &other,
-                    &clear_attempt("1000000000000000300", 3_000, UpstreamClearResult::Advanced, None),
+                    &clear_attempt(
+                        "1000000000000000300",
+                        3_000,
+                        UpstreamClearResult::Advanced,
+                        None,
+                    ),
                 )
                 .await
                 .expect("record without a setting");
@@ -3543,7 +3552,12 @@ mod tests {
             store
                 .record_upstream_clear(
                     &channel,
-                    &clear_attempt("1000000000000000200", 2_000, UpstreamClearResult::DryRun, Some("p0")),
+                    &clear_attempt(
+                        "1000000000000000200",
+                        2_000,
+                        UpstreamClearResult::DryRun,
+                        Some("p0"),
+                    ),
                 )
                 .await
                 .expect("dry run attempt");
@@ -3551,11 +3565,25 @@ mod tests {
                 .set_upstream_clear_mode(&channel, UpstreamClearMode::On, 200)
                 .await
                 .expect("on");
-            assert_eq!(on.enabled_at_ms, Some(100), "dry run to on is not a fresh enable");
+            assert_eq!(
+                on.enabled_at_ms,
+                Some(100),
+                "dry run to on is not a fresh enable"
+            );
             assert_eq!(on.pushed, None, "a dry run pushed nothing");
             for attempt in [
-                clear_attempt("1000000000000000210", 2_100, UpstreamClearResult::Failed, None),
-                clear_attempt("1000000000000000210", 2_100, UpstreamClearResult::Failed, None),
+                clear_attempt(
+                    "1000000000000000210",
+                    2_100,
+                    UpstreamClearResult::Failed,
+                    None,
+                ),
+                clear_attempt(
+                    "1000000000000000210",
+                    2_100,
+                    UpstreamClearResult::Failed,
+                    None,
+                ),
             ] {
                 store
                     .record_upstream_clear(&channel, &attempt)
@@ -3565,7 +3593,12 @@ mod tests {
             store
                 .record_upstream_clear(
                     &channel,
-                    &clear_attempt("1000000000000000220", 2_200, UpstreamClearResult::Advanced, Some("before-any")),
+                    &clear_attempt(
+                        "1000000000000000220",
+                        2_200,
+                        UpstreamClearResult::Advanced,
+                        Some("before-any"),
+                    ),
                 )
                 .await
                 .expect("advanced");
@@ -3573,7 +3606,12 @@ mod tests {
             store
                 .record_upstream_clear(
                     &channel,
-                    &clear_attempt("1000000000000000215", 2_150, UpstreamClearResult::AlreadyRead, Some("target-2200")),
+                    &clear_attempt(
+                        "1000000000000000215",
+                        2_150,
+                        UpstreamClearResult::AlreadyRead,
+                        Some("target-2200"),
+                    ),
                 )
                 .await
                 .expect("late");
@@ -3605,7 +3643,11 @@ mod tests {
 
         reopened.purge_everything().await.expect("purge");
         assert!(
-            reopened.upstream_clear_settings().await.expect("after purge").is_empty(),
+            reopened
+                .upstream_clear_settings()
+                .await
+                .expect("after purge")
+                .is_empty(),
             "the purge erases the setting, which leaves every channel off"
         );
         assert_eq!(reopened.hidden_channels().await.expect("read").len(), 1);
@@ -3624,7 +3666,12 @@ mod tests {
             store
                 .record_upstream_clear(
                     &channel,
-                    &clear_attempt("1000000000000000200", 2_000, UpstreamClearResult::Failed, None),
+                    &clear_attempt(
+                        "1000000000000000200",
+                        2_000,
+                        UpstreamClearResult::Failed,
+                        None,
+                    ),
                 )
                 .await
                 .expect("failure");
@@ -3640,11 +3687,19 @@ mod tests {
         store
             .record_upstream_clear(
                 &channel,
-                &clear_attempt("1000000000000000201", 2_001, UpstreamClearResult::Skipped, None),
+                &clear_attempt(
+                    "1000000000000000201",
+                    2_001,
+                    UpstreamClearResult::Skipped,
+                    None,
+                ),
             )
             .await
             .expect("skipped");
-        assert_eq!(store.upstream_clear_settings().await.expect("read")[0].failures, 3);
+        assert_eq!(
+            store.upstream_clear_settings().await.expect("read")[0].failures,
+            3
+        );
         let dry = store
             .set_upstream_clear_mode(&channel, UpstreamClearMode::DryRun, 2)
             .await

@@ -177,7 +177,8 @@ pub struct Candidates {
 }
 
 fn lock<T>(cell: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
-    cell.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+    cell.lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 fn now_ms() -> i64 {
@@ -328,7 +329,8 @@ impl Candidates {
         let mut due = if pending.immediate {
             pending.first_seen
         } else {
-            let burst = (pending.last_seen + timing.quiet).min(pending.first_seen + timing.max_wait);
+            let burst =
+                (pending.last_seen + timing.quiet).min(pending.first_seen + timing.max_wait);
             runtime
                 .last_push
                 .map_or(burst, |pushed| burst.max(pushed + timing.max_wait))
@@ -371,7 +373,13 @@ impl Candidates {
     }
 
     /// Fold a finished push back in.
-    fn finish(&self, job: &Job, result: UpstreamClearResult, error: Option<&ChatError>, timing: &Timing) {
+    fn finish(
+        &self,
+        job: &Job,
+        result: UpstreamClearResult,
+        error: Option<&ChatError>,
+        timing: &Timing,
+    ) {
         let now = Instant::now();
         let mut channels = lock(&self.channels);
         let Some(runtime) = channels.get_mut(&job.channel) else {
@@ -387,7 +395,11 @@ impl Candidates {
             UpstreamClearResult::Advanced
             | UpstreamClearResult::AlreadyRead
             | UpstreamClearResult::DryRun => {
-                runtime.floor = Some(runtime.floor.map_or(job.position, |floor| floor.max(job.position)));
+                runtime.floor = Some(
+                    runtime
+                        .floor
+                        .map_or(job.position, |floor| floor.max(job.position)),
+                );
                 runtime.failures = 0;
                 runtime.retry_at = None;
                 runtime.retry_at_ms = None;
@@ -504,9 +516,9 @@ impl Clearer {
             candidates: Arc::clone(state.live.upstream_clear()),
             timing: Timing::default(),
             label: Arc::new(move |channel| {
-                labels.channel(channel.as_str()).map(|info| {
-                    info.alias.unwrap_or(info.label)
-                })
+                labels
+                    .channel(channel.as_str())
+                    .map(|info| info.alias.unwrap_or(info.label))
             }),
             eligible: Arc::new(move |channel| {
                 eligible.channel(channel.as_str()).is_some()
@@ -592,11 +604,18 @@ impl Clearer {
             message_ms: job.position.0,
             result,
             target: answer.as_ref().ok().map(|outcome| outcome.target.clone()),
-            previous: answer.as_ref().ok().and_then(|outcome| outcome.previous.clone()),
+            previous: answer
+                .as_ref()
+                .ok()
+                .and_then(|outcome| outcome.previous.clone()),
             error: answer.as_ref().err().map(ToString::to_string),
         };
         self.log(&job, &attempt);
-        if let Err(error) = self.store.record_upstream_clear(&job.channel, &attempt).await {
+        if let Err(error) = self
+            .store
+            .record_upstream_clear(&job.channel, &attempt)
+            .await
+        {
             tracing::warn!(
                 channel = %job.channel,
                 %error,
@@ -707,7 +726,10 @@ mod tests {
         for failures in 1..=12 {
             let wait = retry_delay(&QUICK, &channel, failures);
             let base = (QUICK.retry_first * 2_u32.pow((failures - 1).min(16))).min(QUICK.retry_cap);
-            assert!(wait >= base && wait <= base.mul_f64(1.1), "{failures}: {wait:?}");
+            assert!(
+                wait >= base && wait <= base.mul_f64(1.1),
+                "{failures}: {wait:?}"
+            );
             assert!(wait >= previous, "the wait shrank at {failures}");
             previous = wait;
         }
@@ -723,11 +745,24 @@ mod tests {
             advanced,
             dry_run,
         };
-        assert_eq!(classify(&Ok(outcome(true, false))), UpstreamClearResult::Advanced);
-        assert_eq!(classify(&Ok(outcome(false, false))), UpstreamClearResult::AlreadyRead);
-        assert_eq!(classify(&Ok(outcome(false, true))), UpstreamClearResult::DryRun);
+        assert_eq!(
+            classify(&Ok(outcome(true, false))),
+            UpstreamClearResult::Advanced
+        );
+        assert_eq!(
+            classify(&Ok(outcome(false, false))),
+            UpstreamClearResult::AlreadyRead
+        );
+        assert_eq!(
+            classify(&Ok(outcome(false, true))),
+            UpstreamClearResult::DryRun
+        );
         let status = |status: u16| {
-            Err(ChatError::Status { status, body: String::new() }.with_provider("Google Chat"))
+            Err(ChatError::Status {
+                status,
+                body: String::new(),
+            }
+            .with_provider("Google Chat"))
         };
         assert_eq!(classify(&status(409)), UpstreamClearResult::Unavailable);
         assert_eq!(classify(&status(404)), UpstreamClearResult::Skipped);
@@ -762,6 +797,448 @@ mod tests {
             label: Arc::new(|_| Some("agents".to_owned())),
             eligible: Arc::new(|_| true),
         }
+    }
+
+    const AGENTS: &str = "1111111111";
+    const PEOPLE: &str = "2222222222";
+
+    fn agents() -> ChannelId {
+        ChannelId(AGENTS.to_owned())
+    }
+
+    /// Seed one message `seconds` after a fixed instant and hand it back as the hub would see it.
+    fn arrive(fake: &FakeDiscord, channel: &ChannelId, seconds: i64) -> Message {
+        let id = fake.seed_at(
+            channel,
+            "agent",
+            "working",
+            1_790_000_000_000 + seconds * 1000,
+        );
+        fake.message(&id).expect("seeded")
+    }
+
+    /// Let the loop do whatever is due within `seconds`, with time standing still otherwise.
+    async fn pass(seconds: u64) {
+        tokio::time::sleep(Duration::from_secs(seconds)).await;
+    }
+
+    async fn on(clearer: &Clearer, channel: &ChannelId, mode: UpstreamClearMode) {
+        let setting = clearer
+            .store
+            .set_upstream_clear_mode(channel, mode, 1)
+            .await
+            .expect("store");
+        clearer
+            .candidates
+            .set_mode(channel, mode, stored_floor(&setting));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_burst_is_pushed_once_with_its_newest_message_after_the_channel_goes_quiet() {
+        let fake = Arc::new(FakeDiscord::new());
+        fake.enable_upstream_clear();
+        let store = Arc::new(FakeStore::new());
+        let clearer = clearer(&fake, &store);
+        on(&clearer, &agents(), UpstreamClearMode::On).await;
+        tokio::spawn(clearer.clone().run());
+        pass(1).await;
+        let mut newest = None;
+        for second in 0..3 {
+            let message = arrive(&fake, &agents(), second);
+            assert!(clearer.candidates.offer(&agents(), &message));
+            newest = Some(message);
+            pass(1).await;
+        }
+        assert!(
+            fake.upstream_clears().is_empty(),
+            "pushed before the burst was over"
+        );
+        pass(5).await;
+        let newest = newest.expect("three arrived");
+        assert_eq!(
+            fake.upstream_clears(),
+            vec![(agents(), newest.id.clone(), false)],
+            "one push, for the newest message"
+        );
+        assert_eq!(
+            fake.upstream_cursor(&agents()),
+            Some(newest.timestamp.clone())
+        );
+        pass(120).await;
+        assert_eq!(
+            fake.upstream_clears().len(),
+            1,
+            "a quiet channel was pushed again"
+        );
+        let setting = &store.upstream_clear_settings().await.expect("read")[0];
+        let pushed = setting.pushed.as_ref().expect("recorded");
+        assert_eq!(pushed.message, newest.id);
+        assert_eq!(pushed.result, UpstreamClearResult::Advanced);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn steady_traffic_is_pushed_at_most_once_per_spacing() {
+        let fake = Arc::new(FakeDiscord::new());
+        fake.enable_upstream_clear();
+        let store = Arc::new(FakeStore::new());
+        let clearer = clearer(&fake, &store);
+        on(&clearer, &agents(), UpstreamClearMode::On).await;
+        tokio::spawn(clearer.clone().run());
+        // A message every two seconds for three minutes never goes quiet for five.
+        for second in (0..180).step_by(2) {
+            clearer
+                .candidates
+                .offer(&agents(), &arrive(&fake, &agents(), second));
+            pass(2).await;
+        }
+        let pushes = fake.upstream_clears().len();
+        assert!(
+            (5..=7).contains(&pushes),
+            "three minutes of steady traffic took {pushes} pushes, not about one per 30 s"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_marker_never_moves_backwards() {
+        let fake = Arc::new(FakeDiscord::new());
+        fake.enable_upstream_clear();
+        let store = Arc::new(FakeStore::new());
+        let clearer = clearer(&fake, &store);
+        on(&clearer, &agents(), UpstreamClearMode::On).await;
+        tokio::spawn(clearer.clone().run());
+        let older = arrive(&fake, &agents(), 10);
+        let newer = arrive(&fake, &agents(), 20);
+        clearer.candidates.offer(&agents(), &newer);
+        pass(10).await;
+        assert_eq!(fake.upstream_clears().len(), 1);
+        // An older message arriving late, a retry of the same one, and a seed of it: none is
+        // pushed, because the newest pushed message is already past them.
+        assert!(!clearer.candidates.offer(&agents(), &older));
+        assert!(!clearer.candidates.offer(&agents(), &newer));
+        pass(120).await;
+        assert_eq!(
+            fake.upstream_clears().len(),
+            1,
+            "{:?}",
+            fake.upstream_clears()
+        );
+        // The owner read further natively: a newer push finds the cursor already there and the
+        // provider does not move it back.
+        let newest = arrive(&fake, &agents(), 30);
+        fake.set_upstream_cursor(&agents(), "2026-10-01T00:00:00Z");
+        clearer.candidates.offer(&agents(), &newest);
+        pass(60).await;
+        assert_eq!(fake.upstream_clears().len(), 2);
+        assert_eq!(
+            fake.upstream_cursor(&agents()).as_deref(),
+            Some("2026-10-01T00:00:00Z"),
+            "the provider's cursor moved backwards"
+        );
+        let setting = &store.upstream_clear_settings().await.expect("read")[0];
+        assert_eq!(
+            setting.last.as_ref().map(|last| last.result),
+            Some(UpstreamClearResult::AlreadyRead)
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn only_channels_set_to_clear_are_pushed() {
+        let fake = Arc::new(FakeDiscord::new());
+        fake.enable_upstream_clear();
+        let store = Arc::new(FakeStore::new());
+        let clearer = clearer(&fake, &store);
+        let people = ChannelId(PEOPLE.to_owned());
+        on(&clearer, &agents(), UpstreamClearMode::On).await;
+        on(&clearer, &people, UpstreamClearMode::On).await;
+        on(&clearer, &people, UpstreamClearMode::Off).await;
+        tokio::spawn(clearer.clone().run());
+        assert!(!clearer
+            .candidates
+            .offer(&people, &arrive(&fake, &people, 1)));
+        clearer
+            .candidates
+            .offer(&agents(), &arrive(&fake, &agents(), 2));
+        pass(60).await;
+        let pushed: Vec<ChannelId> = fake
+            .upstream_clears()
+            .into_iter()
+            .map(|(channel, _, _)| channel)
+            .collect();
+        assert_eq!(pushed, vec![agents()]);
+        assert_eq!(fake.upstream_cursor(&people), None);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_dry_run_writes_nothing_and_says_what_it_would_have_done() {
+        let logs = crate::testing::LogCapture::info_only();
+        let fake = Arc::new(FakeDiscord::new());
+        fake.enable_upstream_clear();
+        let store = Arc::new(FakeStore::new());
+        let clearer = clearer(&fake, &store);
+        on(&clearer, &agents(), UpstreamClearMode::DryRun).await;
+        tokio::spawn(clearer.clone().run());
+        let message = arrive(&fake, &agents(), 5);
+        clearer.candidates.offer(&agents(), &message);
+        pass(10).await;
+        assert_eq!(
+            fake.upstream_clears(),
+            vec![(agents(), message.id.clone(), true)]
+        );
+        assert_eq!(
+            fake.upstream_cursor(&agents()),
+            None,
+            "a dry run moved the cursor"
+        );
+        let text = logs.text();
+        let line = text
+            .lines()
+            .find(|line| {
+                line.contains("upstream-clear: dry_run channel") && line.contains(" through ")
+            })
+            .unwrap_or_else(|| panic!("no dry-run line in {text}"));
+        assert!(line.contains(AGENTS), "{line}");
+        assert!(line.contains("(agents)"), "{line}");
+        assert!(line.contains(message.id.as_str()), "{line}");
+        assert!(
+            line.contains(&message.timestamp),
+            "the line names no target time: {line}"
+        );
+        assert!(line.contains("dry-run"), "{line}");
+        let setting = &store.upstream_clear_settings().await.expect("read")[0];
+        assert_eq!(setting.pushed, None, "a dry run is not a push");
+        assert_eq!(
+            setting.last.as_ref().map(|last| last.result),
+            Some(UpstreamClearResult::DryRun)
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_failure_is_logged_recorded_and_retried_after_a_growing_wait() {
+        let logs = crate::testing::LogCapture::info_only();
+        let fake = Arc::new(FakeDiscord::new());
+        fake.enable_upstream_clear();
+        let store = Arc::new(FakeStore::new());
+        let clearer = clearer(&fake, &store);
+        on(&clearer, &agents(), UpstreamClearMode::On).await;
+        tokio::spawn(clearer.clone().run());
+        fake.fail_upstream_clear_next(ChatError::Transport("bridge restarting".to_owned()));
+        fake.fail_upstream_clear_next(ChatError::Status {
+            status: 502,
+            body: "mark-read failed".to_owned(),
+        });
+        let message = arrive(&fake, &agents(), 1);
+        clearer.candidates.offer(&agents(), &message);
+        pass(6).await;
+        assert_eq!(fake.upstream_clears().len(), 1);
+        let setting = &store.upstream_clear_settings().await.expect("read")[0];
+        assert_eq!(setting.failures, 1);
+        assert!(clearer.candidates.status(&agents()).retry_at_ms.is_some());
+        assert!(
+            logs.text()
+                .contains("failed: chat request failed: bridge restarting"),
+            "{}",
+            logs.text()
+        );
+        // The first retry waits at least 30 s, not the 5 s quiet period.
+        pass(25).await;
+        assert_eq!(fake.upstream_clears().len(), 1, "retried before the wait");
+        pass(9).await;
+        assert_eq!(
+            fake.upstream_clears().len(),
+            2,
+            "not retried after the wait"
+        );
+        assert_eq!(
+            store.upstream_clear_settings().await.expect("read")[0].failures,
+            2
+        );
+        // The second waits about twice as long.
+        pass(50).await;
+        assert_eq!(fake.upstream_clears().len(), 2, "the wait did not grow");
+        pass(20).await;
+        assert_eq!(fake.upstream_clears().len(), 3);
+        let setting = &store.upstream_clear_settings().await.expect("read")[0];
+        assert_eq!(setting.failures, 0, "a success resets the count");
+        assert_eq!(
+            setting.pushed.as_ref().map(|p| &p.message),
+            Some(&message.id)
+        );
+        assert_eq!(clearer.candidates.status(&agents()), LiveStatus::default());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_newer_message_replaces_one_waiting_to_be_retried() {
+        let fake = Arc::new(FakeDiscord::new());
+        fake.enable_upstream_clear();
+        let store = Arc::new(FakeStore::new());
+        let clearer = clearer(&fake, &store);
+        on(&clearer, &agents(), UpstreamClearMode::On).await;
+        tokio::spawn(clearer.clone().run());
+        fake.fail_upstream_clear_next(ChatError::Transport("down".to_owned()));
+        clearer
+            .candidates
+            .offer(&agents(), &arrive(&fake, &agents(), 1));
+        pass(6).await;
+        let newer = arrive(&fake, &agents(), 7);
+        clearer.candidates.offer(&agents(), &newer);
+        pass(60).await;
+        let calls = fake.upstream_clears();
+        assert_eq!(calls.len(), 2, "{calls:?}");
+        assert_eq!(calls[1].1, newer.id, "the retry pushed the older message");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_refused_channel_stops_until_its_setting_changes_and_a_missing_message_waits() {
+        let fake = Arc::new(FakeDiscord::new());
+        fake.enable_upstream_clear();
+        let store = Arc::new(FakeStore::new());
+        let clearer = clearer(&fake, &store);
+        on(&clearer, &agents(), UpstreamClearMode::On).await;
+        tokio::spawn(clearer.clone().run());
+        // 404: the bridge no longer holds it. Not retried; the next message is pushed.
+        fake.fail_upstream_clear_next(ChatError::Status {
+            status: 404,
+            body: "unknown message cursor".to_owned(),
+        });
+        clearer
+            .candidates
+            .offer(&agents(), &arrive(&fake, &agents(), 1));
+        pass(120).await;
+        assert_eq!(
+            fake.upstream_clears().len(),
+            1,
+            "a missing message was retried"
+        );
+        clearer
+            .candidates
+            .offer(&agents(), &arrive(&fake, &agents(), 130));
+        pass(60).await;
+        assert_eq!(fake.upstream_clears().len(), 2);
+        // 409: one thread of a space. Nothing more until the owner changes the setting.
+        fake.fail_upstream_clear_next(ChatError::Status {
+            status: 409,
+            body: r#"{"code":"thread_channel"}"#.to_owned(),
+        });
+        clearer
+            .candidates
+            .offer(&agents(), &arrive(&fake, &agents(), 200));
+        pass(60).await;
+        assert_eq!(fake.upstream_clears().len(), 3);
+        assert_eq!(
+            clearer.candidates.status(&agents()).unavailable.as_deref(),
+            Some(THREAD_CHANNEL_REASON)
+        );
+        assert!(!clearer
+            .candidates
+            .offer(&agents(), &arrive(&fake, &agents(), 300)));
+        pass(600).await;
+        assert_eq!(
+            fake.upstream_clears().len(),
+            3,
+            "a refused channel was pushed again"
+        );
+        // Saving the setting again is the owner asking to try again.
+        clearer
+            .candidates
+            .set_mode(&agents(), UpstreamClearMode::On, None);
+        assert!(clearer
+            .candidates
+            .offer(&agents(), &arrive(&fake, &agents(), 900)));
+        pass(60).await;
+        assert_eq!(fake.upstream_clears().len(), 4);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_push_in_flight_never_holds_up_ingest() {
+        let fake = Arc::new(FakeDiscord::new());
+        fake.enable_upstream_clear();
+        let store = Arc::new(FakeStore::new());
+        let hub = Arc::new(crate::live::LiveHub::new());
+        let clearer = Clearer {
+            candidates: Arc::clone(hub.upstream_clear()),
+            ..clearer(&fake, &store)
+        };
+        on(&clearer, &agents(), UpstreamClearMode::On).await;
+        let gate = fake.hold_upstream_clears();
+        tokio::spawn(clearer.clone().run());
+        let mut subscription = hub.subscribe(&agents(), None);
+        hub.publish(&agents(), arrive(&fake, &agents(), 1));
+        pass(10).await;
+        assert_eq!(
+            fake.upstream_clears().len(),
+            1,
+            "the push should be in flight"
+        );
+        // The provider has not answered. Publishing still lands at once, every time.
+        for second in 2..50 {
+            hub.publish(&agents(), arrive(&fake, &agents(), second));
+        }
+        let mut delivered = 0;
+        while subscription.receiver.try_recv().is_ok() {
+            delivered += 1;
+        }
+        assert_eq!(delivered, 49, "ingest waited for the provider");
+        assert!(
+            clearer.candidates.status(&agents()).pending,
+            "the newest is waiting its turn"
+        );
+        gate.add_permits(10);
+        pass(60).await;
+        let calls = fake.upstream_clears();
+        assert_eq!(calls.len(), 2, "{calls:?}");
+        assert_eq!(calls[1].1, MessageId::at_time_ms(1_790_000_049_000));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_setting_and_the_marker_outlast_a_restart() {
+        let dir = crate::testing::TempDir::new("upstream-clear-restart");
+        let file = dir.path().join("vibe-talk.sqlite3");
+        let fake = Arc::new(FakeDiscord::new());
+        fake.enable_upstream_clear();
+        let pushed;
+        {
+            let store: Arc<dyn StateStore> = Arc::new(
+                crate::store::sqlite::SqliteStore::open(&file, crate::store::Retention::default())
+                    .expect("open"),
+            );
+            let clearer = Clearer {
+                store,
+                ..clearer(&fake, &Arc::new(FakeStore::new()))
+            };
+            on(&clearer, &agents(), UpstreamClearMode::On).await;
+            pushed = arrive(&fake, &agents(), 1);
+            clearer.candidates.offer(&agents(), &pushed);
+            pass(10).await;
+            assert!(clearer.push_due().await);
+            assert_eq!(fake.upstream_clears().len(), 1);
+        }
+        // A restart with nothing new: the seed finds the pushed message and pushes nothing.
+        let restarted = |fake: &Arc<FakeDiscord>| Clearer {
+            store: Arc::new(
+                crate::store::sqlite::SqliteStore::open(&file, crate::store::Retention::default())
+                    .expect("reopen"),
+            ),
+            ..clearer(fake, &Arc::new(FakeStore::new()))
+        };
+        let again = restarted(&fake);
+        assert_eq!(again.seed().await.expect("seed"), 1);
+        assert_eq!(again.candidates.mode(&agents()), UpstreamClearMode::On);
+        pass(60).await;
+        assert!(
+            !again.push_due().await,
+            "the pushed message was pushed again"
+        );
+        // A message that arrived while the server was down is pushed after the next restart.
+        let missed = arrive(&fake, &agents(), 100);
+        let third = restarted(&fake);
+        assert_eq!(third.seed().await.expect("seed"), 1);
+        pass(10).await;
+        assert!(third.push_due().await);
+        assert_eq!(
+            fake.upstream_clears().last().map(|call| &call.1),
+            Some(&missed.id)
+        );
+        assert_ne!(pushed.id, missed.id);
     }
 
     #[tokio::test(start_paused = true)]

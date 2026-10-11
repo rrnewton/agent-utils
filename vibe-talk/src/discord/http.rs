@@ -1437,9 +1437,7 @@ mod tests {
     }
 
     /// Answer one request on a loopback socket with `response`, handing back what was asked.
-    async fn answer_once(
-        response: &'static str,
-    ) -> (String, tokio::task::JoinHandle<String>) {
+    async fn answer_once(response: &'static str) -> (String, tokio::task::JoinHandle<String>) {
         use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
