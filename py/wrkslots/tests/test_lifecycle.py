@@ -391,6 +391,7 @@ import json
 import sys
 from pathlib import Path
 
+import reverie_node
 import service_result
 
 
@@ -506,10 +507,18 @@ FINAL_VALIDATE_STATUS_EXIT_CODES = {"PASSED": 0, "FAILED": 1, "COULD_NOT_RUN": 7
 '''
 
 
+# The fixture parser imports this module as dev-hermit's run_registry.py imports
+# reverie_node, so a parser copy without it fails here as it failed in
+# production (2026-10-11).
+_FROZEN_REVERIE_NODE = """\
+COUNT_CONTEXT_FIELDS = ()
+"""
+
+
 def install_frozen_validation_parser(
     project: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Install a tracked three-module producer boundary for isolated fixture roots."""
+    """Install the tracked producer parser modules for isolated fixture roots."""
 
     parser_directory = project / "ci-hub" / "validate"
     parser_directory.mkdir(parents=True, exist_ok=True)
@@ -522,11 +531,12 @@ def install_frozen_validation_parser(
     (parser_directory / "final_validate_status.py").write_text(
         textwrap.dedent(_FROZEN_FINAL_VALIDATE_STATUS), encoding="utf-8"
     )
+    (parser_directory / "reverie_node.py").write_text(_FROZEN_REVERIE_NODE, encoding="utf-8")
     if not (project / ".git").exists():
         git(project, "init", "--initial-branch=main")
         git(project, "config", "user.name", "Wrkslots Test")
         git(project, "config", "user.email", "wrkslots@example.invalid")
-    git(project, "add", "--", "ci-hub/validate/run_registry.py", "ci-hub/validate/service_result.py", "ci-hub/validate/final_validate_status.py")
+    git(project, "add", "--", *wrkslots._FROZEN_VALIDATION_PARSER_FILES)
     if git(project, "diff", "--cached", "--quiet", check=False).returncode != 0:
         git(project, "commit", "-m", "install frozen validation parser fixture")
 

@@ -36989,10 +36989,16 @@ def _validation_recovery_target(
     return relative, target, slot
 
 
+# The producer parser and every local module it imports: the parser runs from a
+# private copy of exactly these files. dev-hermit's run_registry.py has imported
+# reverie_node since 2026-09-20 (dev-hermit 01991d70); without it every frozen
+# handle was refused with ModuleNotFoundError, and frozen validation checkouts
+# were never removed (94 GB across nine of them on 2026-10-11).
 _FROZEN_VALIDATION_PARSER_FILES = (
     "ci-hub/validate/run_registry.py",
     "ci-hub/validate/service_result.py",
     "ci-hub/validate/final_validate_status.py",
+    "ci-hub/validate/reverie_node.py",
 )
 _FROZEN_VALIDATION_PARSER_BOOTSTRAP = (
     "import runpy,sys\n"
