@@ -3099,7 +3099,8 @@ live stream, a post's answer and the pins — and sends it beside the text as `c
    line that starts in lower case, that a code span, emphasis or a link runs on to, or that follows
    a line of 60 characters or more stopping mid-sentence is the rest of an item an editor wrapped,
    and stays in it, unless it ends in a colon; and no line is set apart where that would change any
-   other block, such as the next `2.` of a numbered list. On Google Chat, which has no numbered
+   other block, such as the next `2.` of a numbered list, or any character the message shows, such
+   as a pair of backticks. On Google Chat, which has no numbered
    lists — `1. Goal` is a line of text there, and the bullets after it a list indented beneath it —
    bullets at the margin on the line straight after a numbered item are that item's, and so are a
    heading line after them and the bullets under it, `In review:`, so every bullet of such an

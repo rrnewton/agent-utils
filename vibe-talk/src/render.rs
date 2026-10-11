@@ -927,8 +927,10 @@ struct Split<'a> {
 ///
 /// That blank line may change nothing else, and the new tree is checked for it: every block that
 /// is not a paragraph or a list — every item, code block, quote, heading, rule, table and block of
-/// raw HTML — must start on the line it started on, after the lines put in, or nothing is put in at
-/// all. That is what keeps a list's next marker a marker, whatever shape is missed above.
+/// raw HTML — must start on the line it started on, after the lines put in, and the text, code and
+/// raw HTML of the whole message must be the same characters ([`shown_text`]). Otherwise nothing
+/// is put in at all. That is what keeps a list's next marker a marker, the code an item holds the
+/// same code and a pair of backticks a code span, whatever shape is missed above.
 fn end_lists_at_unindented_lines<'a>(
     arena: &'a Arena<'a>,
     root: &'a AstNode<'a>,
@@ -960,7 +962,9 @@ fn end_lists_at_unindented_lines<'a>(
     text.push_str(&source[copied..]);
     let split = comrak::parse_document(arena, &text, options);
     let moved = |line: usize| line + breaks.partition_point(|&at| at <= line);
-    if block_starts(root, moved) != block_starts(split, |line| line) {
+    if block_starts(root, moved) != block_starts(split, |line| line)
+        || shown_text(root) != shown_text(split)
+    {
         return None;
     }
     Some(Split {
@@ -996,6 +1000,26 @@ fn block_starts<'a>(
             })
         })
         .collect()
+}
+
+/// The characters a tree shows, in order and without whitespace: its text, its code and its raw
+/// HTML. A marker read as text, a fence read as indented code, or backticks or asterisks that pair
+/// up differently once a paragraph is split, change it; where one paragraph ends and the next
+/// begins does not.
+fn shown_text<'a>(root: &'a AstNode<'a>) -> String {
+    let mut shown = String::new();
+    for node in root.descendants() {
+        match &node.data.borrow().value {
+            NodeValue::Text(text) => shown.push_str(text),
+            NodeValue::Code(code) => shown.push_str(&code.literal),
+            NodeValue::CodeBlock(code) => shown.push_str(&code.literal),
+            NodeValue::HtmlBlock(html) => shown.push_str(&html.literal),
+            NodeValue::HtmlInline(html) => shown.push_str(html),
+            _ => {}
+        }
+    }
+    shown.retain(|character| !character.is_whitespace());
+    shown
 }
 
 /// The line of `node` that a chat service starts a new paragraph at, when `node` is the paragraph
@@ -2528,6 +2552,12 @@ mod tests {
             // after a list but not after a paragraph. Caught by checking the new tree, which
             // keeps every block but paragraphs and lists where it was.
             "- a.\nB.\n<custom-tag>",
+            // A fenced block in the item would be indented code at the margin, its fences code.
+            "- a.\nB.\n\n    ```\n    x\n    ```",
+            // The backticks on it would pair up differently in a paragraph of its own: CommonMark's
+            // reader leaves `` ``b`` `` as text after the lone backtick and `` ``a`` `` above it,
+            // and the characters a message shows are never changed by setting a line apart.
+            "- Use ` and ``a``.\nThen ``b`` too.",
         ] {
             in_every_markup(text);
         }
