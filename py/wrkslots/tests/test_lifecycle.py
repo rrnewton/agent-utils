@@ -10012,7 +10012,7 @@ def current_terminal_validation_record(
         "passed_tests": passed_tests,
         "scorecard_writeback": {"status": "completed"},
     }
-    if schema == 5:
+    if schema in {5, 6}:
         record["detail"] = "guest execution failed" if status == "COULD_NOT_RUN" else None
     return record
 
@@ -10024,7 +10024,7 @@ def test_current_validation_record_requires_authoritative_counts() -> None:
     mutations: tuple[tuple[str, object], ...] = (
         ("service_result_schema", 4.0),
         ("service_result_schema", True),
-        ("service_result_schema", 6),
+        ("service_result_schema", 7),
         ("exit_code", False),
         ("exit_code", 0.0),
         ("passed_tests", None),
@@ -10105,6 +10105,41 @@ def test_schema_five_terminal_record_requires_status_appropriate_detail() -> Non
     assert not wrkslots._validation_record_is_terminal(
         passed, target_kind="cargo-home"
     )
+
+
+@pytest.mark.parametrize("target_kind", ("cargo-home", "frozen-checkout"))
+@pytest.mark.parametrize("status", ("PASSED", "FAILED", "COULD_NOT_RUN"))
+def test_schema_six_terminal_record_accepts_delegated_writeback(
+    target_kind: str, status: str
+) -> None:
+    # dev-hermit 25d2537a (2026-10-05) writes service-result schema 6: the
+    # schema-5 fields plus a {"status": "delegated"} write-back when the
+    # launcher owns publication. Until 2026-10-11 every such frozen record was
+    # refused as having no evidenced terminal result, so five frozen
+    # validation checkouts were never removed.
+    record = current_terminal_validation_record(schema=6, status=status)
+    record["scorecard_writeback"] = {"status": "delegated"}
+    assert wrkslots._validation_record_is_terminal(record, target_kind=target_kind)
+    record["scorecard_writeback"] = {"status": "completed"}
+    assert wrkslots._validation_record_is_terminal(record, target_kind=target_kind)
+    record["scorecard_writeback"] = None
+    assert wrkslots._validation_record_is_terminal(record, target_kind=target_kind)
+
+    for writeback in ({"status": "delegated", "error": "x"}, {"status": "Delegated"}):
+        changed = dict(record)
+        changed["scorecard_writeback"] = writeback
+        assert not wrkslots._validation_record_is_terminal(
+            changed, target_kind=target_kind
+        ), writeback
+    missing = dict(record)
+    del missing["detail"]
+    assert not wrkslots._validation_record_is_terminal(
+        missing, target_kind=target_kind
+    )
+    # Only schema 6 can carry a delegated write-back.
+    older = current_terminal_validation_record(schema=5, status=status)
+    older["scorecard_writeback"] = {"status": "delegated"}
+    assert not wrkslots._validation_record_is_terminal(older, target_kind=target_kind)
 
 
 @pytest.mark.parametrize(

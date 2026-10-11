@@ -37775,6 +37775,10 @@ def _current_validation_result_is_terminal(
             return False
         if writeback == {"status": "completed"}:
             pass
+        elif schema == 6 and writeback == {"status": "delegated"}:
+            # Schema 6 (dev-hermit 25d2537a, 2026-10-05) names a write-back
+            # the launcher owns; it means what null meant before it.
+            pass
         elif (
             set(writeback) == {"status", "error"}
             and writeback.get("status") == "failed"
@@ -37817,7 +37821,7 @@ def _current_validation_result_is_terminal(
         passed_tests is None or passed_tests != executed_tests
     ):
         return False
-    if schema == 5:
+    if schema in {5, 6}:
         if "detail" not in record:
             return False
         detail = record.get("detail")
@@ -37937,12 +37941,12 @@ def _validation_record_is_terminal(
     if schema is not None and (
         not isinstance(schema, int)
         or isinstance(schema, bool)
-        or schema not in {1, 2, 3, 4, 5}
+        or schema not in {1, 2, 3, 4, 5, 6}
     ):
         return False
     if schema in {1, 2}:
         expected_exit = None
-    elif schema in {4, 5} and isinstance(status, str):
+    elif schema in {4, 5, 6} and isinstance(status, str):
         return _current_validation_result_is_terminal(
             record, schema=schema, status=status
         )
