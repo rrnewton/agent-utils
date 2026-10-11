@@ -265,9 +265,10 @@ pub fn mark_read_request(
 /// automatically, as vibe-talk ingests it. `#232 upstream-mark-read`.
 ///
 /// A separate route from [`mark_read_request`], which is the owner's own action: this one runs
-/// with nobody waiting on it, so the bridge serves it behind reads and the owner's actions,
-/// answers a dry run, and refuses a channel where moving the provider's cursor would clear
-/// messages vibe-talk never received.
+/// with nobody waiting on it, so the bridge serves it behind the owner's actions without making
+/// them wait long, answers a dry run (saying whether a real run would have moved the cursor), and
+/// refuses a channel where moving the provider's cursor would clear messages vibe-talk never
+/// received.
 #[must_use]
 pub fn upstream_clear_request(
     api_base: &str,
