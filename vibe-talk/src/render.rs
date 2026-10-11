@@ -140,6 +140,12 @@ impl Markup {
     /// line it is, never indented under an item's text. Discord's client is not documented either
     /// way, so Discord keeps CommonMark's reading. `#237 nested-lists`, and see
     /// [`end_lists_at_unindented_lines`].
+    ///
+    /// Only a line that reads as a line of its own. A writer whose editor wraps long lines puts
+    /// the rest of an item's sentence at the margin too, and that is more of the item in every
+    /// client: a line that starts in lower case, one that a code span, emphasis or a link runs on
+    /// to, or one after a line as long as editors wrap that stops without ending its sentence
+    /// ([`continues_item`]).
     #[must_use]
     pub fn list_ends_at_unindented_line(self) -> bool {
         matches!(self, Self::GoogleChat | Self::Slack)
@@ -151,8 +157,11 @@ impl Markup {
     /// text there, and the bullets under it are drawn as a list indented beneath it — so an agent's
     /// outline, `1. Goal\n- step\n- step\n\n2. Goal`, reads as steps under each goal. CommonMark
     /// reads the same text as a one-item numbered list, then a bulleted list level with it, which
-    /// is the flat outline the owner photographed in `#237 nested-lists`. Only Google Chat: Discord
-    /// draws both as lists, and Slack draws both as lines, at the same margin.
+    /// is the flat outline the owner photographed in `#237 nested-lists`. A heading line after a
+    /// goal's steps with more bullets straight under it, `In review:`, is more of the same goal,
+    /// so that every bullet of the outline is drawn at one indent, as Google Chat draws them
+    /// ([`more_steps_after`]). Only Google Chat: Discord draws both as lists, and Slack draws both
+    /// as lines, at the same margin.
     #[must_use]
     pub fn bullets_under_numbered_line_nest(self) -> bool {
         matches!(self, Self::GoogleChat)
@@ -160,27 +169,19 @@ impl Markup {
 
     /// The text as Markdown, before it is parsed.
     ///
-    /// Where a chat service ends a list at an unindented line, a blank line is put before that
-    /// line ([`end_lists_at_unindented_lines`]), which is how CommonMark is told the same thing.
-    ///
     /// A labelled link is rewritten only OUTSIDE code. Inside a code span or a code block it is
     /// text the writer meant to show as written, and comrak, not this module, says where code is:
     /// the text is parsed once as it stands to find out, and only when it holds a link to rewrite
     /// at all, which almost no message does.
     fn prepare<'t>(self, text: &'t str, options: &Options) -> Cow<'t, str> {
-        let text = if self.list_ends_at_unindented_line() {
-            end_lists_at_unindented_lines(text)
-        } else {
-            Cow::Borrowed(text)
-        };
         match self {
-            Self::Discord => text,
+            Self::Discord => Cow::Borrowed(text),
             Self::GoogleChat | Self::Slack => {
                 use crate::slack::mrkdwn::angle_links_outside;
-                match angle_links_outside(&text, &[]) {
-                    Cow::Borrowed(_) => text,
+                match angle_links_outside(text, &[]) {
+                    Cow::Borrowed(_) => Cow::Borrowed(text),
                     Cow::Owned(_) => Cow::Owned(
-                        angle_links_outside(&text, &code_ranges(&text, options)).into_owned(),
+                        angle_links_outside(text, &code_ranges(text, options)).into_owned(),
                     ),
                 }
             }
@@ -260,13 +261,24 @@ pub fn to_html(text: &str, markup: Markup) -> String {
         return plain_html(text);
     }
     let options = options(table_cells_bound(text) <= MAX_TABLE_CELLS);
-    let source = markup.prepare(text, &options);
+    let mut source = markup.prepare(text, &options);
     let arena = Arena::new();
-    let root = comrak::parse_document(&arena, &source, &options);
+    let mut root = comrak::parse_document(&arena, &source, &options);
     if deeper_than(root, MAX_DEPTH) {
         return plain_html(text);
     }
-    adjust(&arena, root, &source, markup);
+    // Where a chat service ends a list at a line CommonMark runs into it, the text is told so with
+    // a blank line and parsed again. `#237 nested-lists`.
+    let mut inserted = Vec::new();
+    if markup.list_ends_at_unindented_line() {
+        if let Some(split) = end_lists_at_unindented_lines(&arena, root, &source, &options) {
+            (source, inserted, root) = (Cow::Owned(split.source), split.inserted, split.root);
+            if deeper_than(root, MAX_DEPTH) {
+                return plain_html(text);
+            }
+        }
+    }
+    adjust(&arena, root, &source, &inserted, markup);
     // Measured again: nesting the lists the writer indented makes the tree deeper than it parsed.
     if deeper_than(root, MAX_DEPTH) {
         return plain_html(text);
@@ -538,7 +550,13 @@ static SANITIZER: LazyLock<ammonia::Builder<'static>> = LazyLock::new(|| {
 ///
 /// Two walks, because the second reads what the first made: an image is a link by the time links
 /// are checked, and a block of raw HTML is text by the time mentions are looked for.
-fn adjust<'a>(arena: &'a Arena<'a>, root: &'a AstNode<'a>, source: &str, markup: Markup) {
+fn adjust<'a>(
+    arena: &'a Arena<'a>,
+    root: &'a AstNode<'a>,
+    source: &str,
+    inserted: &[usize],
+    markup: Markup,
+) {
     let lines = line_starts(source);
     nest_lists(
         arena,
@@ -546,6 +564,7 @@ fn adjust<'a>(arena: &'a Arena<'a>, root: &'a AstNode<'a>, source: &str, markup:
         &Lines {
             source,
             starts: &lines,
+            inserted,
         },
         markup,
     );
@@ -833,8 +852,6 @@ struct LineMarker {
     number: Option<u64>,
     /// Whether nothing follows the marker on its line.
     empty: bool,
-    /// Columns from the marker to the item's text: where the item's own lines must start.
-    width: usize,
 }
 
 impl LineMarker {
@@ -868,13 +885,9 @@ fn line_marker(text: &str) -> Option<LineMarker> {
     if !(rest.is_empty() || rest.starts_with([' ', '\t'])) || is_rule(text) {
         return None;
     }
-    let empty = rest.trim_matches([' ', '\t']).is_empty();
-    let gap = rest.len() - rest.trim_start_matches(' ').len();
-    let width = length + if empty || gap == 0 || gap > 4 { 1 } else { gap };
     Some(LineMarker {
         number,
-        empty,
-        width,
+        empty: rest.trim_matches([' ', '\t']).is_empty(),
     })
 }
 
@@ -892,135 +905,213 @@ fn is_rule(text: &str) -> bool {
         && marks.count() >= 2
 }
 
-/// The fence a line's text opens, as its character and length: three or more backticks or
-/// tildes, where a backtick fence's info string holds no backtick (` ```a``` ` is a code span).
-fn fence_opened(text: &str) -> Option<(char, usize)> {
-    let mark = text
-        .chars()
-        .next()
-        .filter(|mark| matches!(mark, '`' | '~'))?;
-    let length = text.len() - text.trim_start_matches(mark).len();
-    let info = &text[length..];
-    (length >= 3 && !(mark == '`' && info.contains('`'))).then_some((mark, length))
-}
-
-/// Whether `line` closes a fence of `length` `mark`s: at least as many, and nothing after them.
-fn closes_fence(line: &str, mark: char, length: usize) -> bool {
-    let text = line.trim_start_matches([' ', '\t']);
-    let run = text.len() - text.trim_start_matches(mark).len();
-    run >= length && text[run..].trim_matches([' ', '\t']).is_empty()
-}
-
-/// Whether a line's text may open a block of raw HTML, in which CommonMark sees no list until a
-/// blank line: a tag, a closing tag, a comment or a declaration. An address in angle brackets and
-/// a mention are not tags.
-fn opens_html(text: &str) -> bool {
-    let Some(rest) = text.strip_prefix('<') else {
-        return false;
-    };
-    if rest.starts_with(['!', '?']) {
-        return true;
-    }
-    let rest = rest.strip_prefix('/').unwrap_or(rest);
-    let name = rest
-        .bytes()
-        .take_while(|byte| byte.is_ascii_alphanumeric() || *byte == b'-')
-        .count();
-    name > 0
-        && rest.as_bytes()[0].is_ascii_alphabetic()
-        && (rest.len() == name || rest[name..].starts_with([' ', '\t', '>', '/']))
+/// The text with a blank line put before each line a chat service draws as the end of a list, the
+/// lines that are those blank lines, and the tree parsed from it. See
+/// [`end_lists_at_unindented_lines`].
+struct Split<'a> {
+    source: String,
+    /// The 1-based lines of `source` this module put in, in order.
+    inserted: Vec<usize>,
+    root: &'a AstNode<'a>,
 }
 
 /// Put a blank line before each line a chat service draws as the end of a list and CommonMark
-/// reads as more of its last item: prose at the left margin, straight after a line of the list.
-/// See [`Markup::list_ends_at_unindented_line`].
+/// reads as more of its last item — prose at the left margin, straight after a line of the list —
+/// and parse the text again; or `None`, when there is no such line or the new text would read as
+/// anything more than that. See [`Markup::list_ends_at_unindented_line`].
 ///
-/// Read line by line with as much of CommonMark as that one decision needs — whether a list is
-/// open, where its outer items' text starts, and which lines are code or raw HTML — and no more.
-/// No line is changed or moved: one is only given a blank line before it, and never inside a
-/// fenced code block. A line indented at all is left to CommonMark, which reads it as more of the
-/// item; so is every line after a blank one, where CommonMark already ends the list itself.
-fn end_lists_at_unindented_lines(text: &str) -> Cow<'_, str> {
-    let mut out = String::new();
-    let mut copied = None;
-    let mut fence = None;
-    // While a list is open: the column its outer items' text starts at.
-    let mut list: Option<usize> = None;
-    let mut raw_html = false;
-    let mut previous_blank = true;
-    let mut previous_prose = false;
-    let mut at = 0;
-    for line in text.split_inclusive('\n') {
-        let start = at;
-        at += line.len();
-        let content = line.trim_end_matches(['\n', '\r']);
-        if let Some((mark, length)) = fence {
-            if closes_fence(content, mark, length) {
-                fence = None;
-            }
-            (previous_blank, previous_prose) = (false, false);
-            continue;
-        }
-        let rest = content.trim_start_matches([' ', '\t']);
-        let indent = columns(&content[..content.len() - rest.len()]);
-        if rest.is_empty() {
-            (previous_blank, previous_prose, raw_html) = (true, false, false);
-            continue;
-        }
-        if raw_html {
-            (previous_blank, previous_prose) = (false, true);
-            continue;
-        }
-        let inside_item = list.is_some_and(|text_column| indent >= text_column);
-        if let Some(opened) = fence_opened(rest) {
-            // Outside the open item's text, a fence ends the list: CommonMark reads it so already.
-            if !inside_item {
-                list = None;
-            }
-            fence = Some(opened);
-            (previous_blank, previous_prose) = (false, false);
-            continue;
-        }
-        if list.is_none() && indent <= 3 && opens_html(rest) {
-            raw_html = true;
-            (previous_blank, previous_prose) = (false, true);
-            continue;
-        }
-        let item = line_marker(rest).filter(|_| indent <= 3);
-        if !inside_item {
-            match (list, item) {
-                // At a list's own level, any marker is the next item or the first of a new list:
-                // only prose can be interrupted, and the list is not prose. Outside a list, a
-                // marker after prose starts one only where CommonMark lets it.
-                (Some(_), Some(marker)) => list = Some(indent + marker.width),
-                (None, Some(marker)) if !previous_prose || marker.may_interrupt_prose() => {
-                    list = Some(indent + marker.width);
-                }
-                (Some(_), None) if previous_blank => list = None,
-                (Some(_), None) if indent == 0 => {
-                    out.push_str(&text[copied.unwrap_or(0)..start]);
-                    out.push('\n');
-                    copied = Some(start);
-                    list = None;
-                }
-                // Indented a little, or not in a list: left as CommonMark reads it.
-                _ => {}
-            }
-        }
-        previous_blank = false;
-        previous_prose = item.is_none_or(|marker| !marker.empty);
-    }
-    let Some(copied) = copied else {
-        return Cow::Borrowed(text);
+/// The lines are found in the tree `root` parsed from `source`, so code, raw HTML and quotes are
+/// whatever CommonMark says they are: a candidate is a LAZY line, one at the margin inside the
+/// paragraph of a list item, which no fenced or indented code block, raw HTML or table holds
+/// ([`paragraph_break`]). No line is changed or moved; one is only given a blank line before it.
+///
+/// That blank line may change nothing else, and the new tree is checked for it: every block that
+/// is not a paragraph or a list — every item, code block, quote, heading, rule, table and block of
+/// raw HTML — must start on the line it started on, after the lines put in, or nothing is put in at
+/// all. That is what keeps a list's next marker a marker, whatever shape is missed above.
+fn end_lists_at_unindented_lines<'a>(
+    arena: &'a Arena<'a>,
+    root: &'a AstNode<'a>,
+    source: &str,
+    options: &Options,
+) -> Option<Split<'a>> {
+    let starts = line_starts(source);
+    let lines = Lines {
+        source,
+        starts: &starts,
+        inserted: &[],
     };
-    out.push_str(&text[copied..]);
-    Cow::Owned(out)
+    let mut breaks: Vec<usize> = root
+        .descendants()
+        .filter_map(|node| paragraph_break(node, &lines))
+        .collect();
+    if breaks.is_empty() {
+        return None;
+    }
+    breaks.sort_unstable();
+    let mut text = String::with_capacity(source.len() + breaks.len());
+    let mut copied = 0;
+    for &line in &breaks {
+        let at = starts[line - 1];
+        text.push_str(&source[copied..at]);
+        text.push('\n');
+        copied = at;
+    }
+    text.push_str(&source[copied..]);
+    let split = comrak::parse_document(arena, &text, options);
+    let moved = |line: usize| line + breaks.partition_point(|&at| at <= line);
+    if block_starts(root, moved) != block_starts(split, |line| line) {
+        return None;
+    }
+    Some(Split {
+        source: text,
+        inserted: breaks
+            .iter()
+            .enumerate()
+            .map(|(k, line)| line + k)
+            .collect(),
+        root: split,
+    })
+}
+
+/// Each block under `root` that is not a paragraph or a list, as its kind and the line it starts
+/// on, read through `line`.
+fn block_starts<'a>(
+    root: &'a AstNode<'a>,
+    line: impl Fn(usize) -> usize,
+) -> Vec<(std::mem::Discriminant<NodeValue>, usize)> {
+    root.descendants()
+        .filter_map(|node| {
+            let ast = node.data.borrow();
+            let counted = ast.value.block()
+                && !matches!(
+                    ast.value,
+                    NodeValue::Document | NodeValue::Paragraph | NodeValue::List(_)
+                );
+            counted.then(|| {
+                (
+                    std::mem::discriminant(&ast.value),
+                    line(ast.sourcepos.start.line),
+                )
+            })
+        })
+        .collect()
+}
+
+/// The line of `node` that a chat service starts a new paragraph at, when `node` is the paragraph
+/// of a list item and has one: the first line at the left margin — a lazy line, to CommonMark —
+/// that reads as a line of its own ([`continues_item`]) and that no inline element runs on to.
+///
+/// Not in a quote, whose every line starts with its marker, so a blank line before one would end
+/// it; and not when the line after the paragraph would join it, as the next marker of a numbered
+/// list would ([`would_join_paragraph`]): there the line at the margin is more of the item it sits
+/// in the middle of.
+fn paragraph_break<'a>(node: &'a AstNode<'a>, lines: &Lines<'_>) -> Option<usize> {
+    let (first, last) = {
+        let ast = node.data.borrow();
+        if !matches!(ast.value, NodeValue::Paragraph) {
+            return None;
+        }
+        (ast.sourcepos.start.line, ast.sourcepos.end.line)
+    };
+    if last <= first {
+        return None;
+    }
+    let mut in_item = false;
+    for container in node.ancestors().skip(1) {
+        match container.data.borrow().value {
+            NodeValue::Item(_) | NodeValue::TaskItem(_) => in_item = true,
+            NodeValue::List(_) | NodeValue::Document => {}
+            _ => return None,
+        }
+    }
+    if !in_item || lines.line(last + 1).is_some_and(would_join_paragraph) {
+        return None;
+    }
+    let crossed = crossed_lines(node, first, last);
+    (first + 1..=last).find(|&line| {
+        let (Some(previous), Some(text)) = (lines.line(line - 1), lines.line(line)) else {
+            return false;
+        };
+        text.starts_with(|character: char| !matches!(character, ' ' | '\t'))
+            && line_marker(text).is_none()
+            && !continues_item(previous, text)
+            && !crossed[line - first]
+    })
+}
+
+/// For each line of a paragraph from `first` to `last`, whether an inline element runs on to it
+/// from the line before: a code span, emphasis, a link or raw HTML written across a line break.
+/// Splitting the paragraph there would leave the backticks or asterisks as text on both sides.
+fn crossed_lines<'a>(paragraph: &'a AstNode<'a>, first: usize, last: usize) -> Vec<bool> {
+    let mut crossed = vec![false; last - first + 1];
+    for node in paragraph.descendants().skip(1) {
+        let ast = node.data.borrow();
+        if matches!(
+            ast.value,
+            NodeValue::Text(_) | NodeValue::SoftBreak | NodeValue::LineBreak
+        ) {
+            continue;
+        }
+        let (from, to) = (ast.sourcepos.start.line, ast.sourcepos.end.line);
+        for line in from.max(first) + 1..=to.min(last) {
+            crossed[line - first] = true;
+        }
+    }
+    crossed
+}
+
+/// Whether `line`, straight after a paragraph at the left margin, would be read as more of it: a
+/// line indented four columns or more, or a list marker that may not interrupt a paragraph, such
+/// as the `2.` of a numbered list that carries on after the line at the margin.
+fn would_join_paragraph(line: &str) -> bool {
+    let rest = line.trim_start_matches([' ', '\t']);
+    let indent = columns(&line[..line.len() - rest.len()]);
+    !rest.is_empty()
+        && (indent >= 4 || line_marker(rest).is_some_and(|marker| !marker.may_interrupt_prose()))
+}
+
+/// How long, in characters, a line of an item may be and still be taken to end where its writer
+/// ended it when it stops without ending a sentence. Editors and agents that wrap a long line do it
+/// at seventy to a hundred columns, or more; a short item without a full stop, `- 5 pm`, is a line
+/// that ended.
+const WRAP_COLUMNS: usize = 60;
+
+/// Whether `line`, at the margin straight after `previous`, a line of an item, is more of that
+/// item's text rather than a line of its own: it starts in lower case, carrying a sentence on, or
+/// `previous` is as long as a wrapped line and stops without ending its sentence — unless `line`
+/// ends in a colon, the heading of what comes after it.
+fn continues_item(previous: &str, line: &str) -> bool {
+    const OPENERS: [char; 7] = ['*', '_', '~', '"', '\'', '(', '['];
+    if line
+        .trim_start_matches(OPENERS)
+        .chars()
+        .next()
+        .is_some_and(char::is_lowercase)
+    {
+        return true;
+    }
+    if unclosed(line).ends_with(':') {
+        return false;
+    }
+    !unclosed(previous).ends_with(['.', '!', '?', ':', '\u{2026}'])
+        && previous.trim_end().chars().count() >= WRAP_COLUMNS
+}
+
+/// `text` without the spaces, closing brackets, quotes and emphasis marks after its last word, so
+/// that `(4061).` and `**Done.**` both end in a full stop.
+fn unclosed(text: &str) -> &str {
+    text.trim_end_matches([
+        ' ', '\t', ')', ']', '"', '\'', '*', '_', '`', '~', '\u{201d}', '\u{2019}',
+    ])
 }
 
 /// The source a tree was parsed from, and where each of its lines begins.
 struct Lines<'s> {
     source: &'s str,
     starts: &'s [usize],
+    /// The blank lines [`end_lists_at_unindented_lines`] put in, which the writer did not write.
+    inserted: &'s [usize],
 }
 
 impl Lines<'_> {
@@ -1035,8 +1126,9 @@ impl Lines<'_> {
 /// What a list item's marker says, read back from the source at the item's own position.
 #[derive(Clone, Copy, Debug)]
 struct Marker {
-    /// The marker's column, counted from the start of its line, so that two items in one
-    /// container compare however that container is written.
+    /// The marker's column, counted from the margin of the innermost quote it is in on its line
+    /// ([`indent_inside_quotes`]), or from the start of the line, so that two items in one
+    /// container compare however each line writes that container.
     indent: usize,
     /// The number an ordered item was written with.
     number: Option<u64>,
@@ -1050,9 +1142,22 @@ fn marker(item: &AstNode<'_>, lines: &Lines<'_>) -> Option<Marker> {
     let (before, rest) = (line.get(..at)?, line.get(at..)?);
     let digits = rest.bytes().take_while(u8::is_ascii_digit).count();
     Some(Marker {
-        indent: columns(before),
+        indent: indent_inside_quotes(before),
         number: rest[..digits].parse().ok(),
     })
+}
+
+/// How far in `before`, the text in front of a marker on its line, puts the marker: counted from
+/// just inside the last `>` in it and the one space a quote marker takes with it, as CommonMark
+/// counts a line in a quote. So `>- a` and `> - b` are two items of one list, as they are to
+/// CommonMark, and not the second a step of the first. A tab after the `>` gives up one column of
+/// its width to the marker, as CommonMark has it.
+fn indent_inside_quotes(before: &str) -> usize {
+    let all = columns(before);
+    match before.rfind('>') {
+        None => all,
+        Some(at) => (all - columns(&before[..=at])).saturating_sub(1),
+    }
 }
 
 /// The list data of a list node.
@@ -1078,7 +1183,8 @@ fn list_of(node: &AstNode<'_>) -> Option<NodeList> {
 ///   counts on from the one before it (`8.` then ` 9.`, a column of right-aligned numbers);
 /// - a list, a fenced code block or a quote straight after a list, further in than its last item;
 /// - and in Google Chat, a bulleted list on the line straight after a numbered one, whatever its
-///   indent ([`Markup::bullets_under_numbered_line_nest`]).
+///   indent ([`Markup::bullets_under_numbered_line_nest`]), and after those steps each heading
+///   line with more bullets straight under it ([`more_steps_after`]).
 ///
 /// On the parsed tree rather than the text, so no line is ever read as something else: a code
 /// block moves with the item it is in, untouched, and every list keeps the numbers CommonMark gave
@@ -1110,13 +1216,24 @@ fn nest_lists<'a>(
 }
 
 /// Move into `list` each list straight after it that belongs under its last item, and each fenced
-/// code block or quote the writer indented under that item — and, once something has gone under
-/// it, the list after that carries `list` on, so that `1. Goal`, what is under it and `2. Goal`,
-/// with no blank line between them, are one numbered list again.
+/// code block or quote the writer indented under that item — in Google Chat, each heading line
+/// with more of that item's steps under it as well — and, once something has gone under it, the
+/// list after that carries `list` on, so that `1. Goal`, what is under it and `2. Goal`, with no
+/// blank line between them, are one numbered list again.
 fn absorb_following_lists<'a>(list: &'a AstNode<'a>, lines: &Lines<'_>, markup: Markup) {
     let ordered = |list: NodeList| list.list_type == ListType::Ordered;
     let mut absorbed = false;
     while let Some(next) = list.next_sibling() {
+        if markup.bullets_under_numbered_line_nest() {
+            if let (Some(item), Some(more)) =
+                (list.last_child(), more_steps_after(list, next, lines))
+            {
+                item.append(next);
+                item.append(more);
+                absorbed = true;
+                continue;
+            }
+        }
         let next_list = list_of(next);
         // Where `next` starts: a list's first marker, or a fence's or a quote's first character.
         let start = match &next.data.borrow().value {
@@ -1158,12 +1275,42 @@ fn absorb_following_lists<'a>(list: &'a AstNode<'a>, lines: &Lines<'_>, markup: 
 }
 
 /// Whether a blank line, or the start of the text, comes straight before `node`'s first line. A
-/// quote's `>` alone is a blank line inside the quote.
+/// quote's `>` alone is a blank line inside the quote. A blank line this module put in was not
+/// written, so the line it is read through to is the one before it.
 fn blank_line_before(node: &AstNode<'_>, lines: &Lines<'_>) -> bool {
-    let line = node.data.borrow().sourcepos.start.line;
-    line.checked_sub(1)
-        .and_then(|before| lines.line(before))
+    let mut before = node.data.borrow().sourcepos.start.line.saturating_sub(1);
+    while before > 0 && lines.inserted.binary_search(&before).is_ok() {
+        before -= 1;
+    }
+    lines
+        .line(before)
         .is_none_or(|text| text.chars().all(|c| matches!(c, ' ' | '\t' | '>')))
+}
+
+/// In Google Chat, the bulleted list after `heading` when that is more steps of `list`'s last
+/// numbered item: `heading` is a paragraph straight after the steps already under that item, and
+/// the list comes straight after `heading` — `In review:` and the bullets under it, in the outline
+/// of `#237 nested-lists`. Google Chat draws a numbered line as text, and every bullet of such an
+/// outline at one indent below the text; once both lists are in the item, so does the page, where
+/// with only the first in it the second was drawn a level further out than the first.
+fn more_steps_after<'a>(
+    list: &'a AstNode<'a>,
+    heading: &'a AstNode<'a>,
+    lines: &Lines<'_>,
+) -> Option<&'a AstNode<'a>> {
+    let of_kind = |node: &AstNode<'_>, kind: ListType| {
+        list_of(node).is_some_and(|data| data.list_type == kind)
+    };
+    let steps_so_far = list
+        .last_child()
+        .and_then(|item| item.last_child())
+        .is_some_and(|steps| of_kind(steps, ListType::Bullet));
+    let is_heading = matches!(heading.data.borrow().value, NodeValue::Paragraph)
+        && !blank_line_before(heading, lines);
+    let more = heading
+        .next_sibling()
+        .filter(|more| of_kind(more, ListType::Bullet) && !blank_line_before(more, lines))?;
+    (of_kind(list, ListType::Ordered) && steps_so_far && is_heading).then_some(more)
 }
 
 /// The item a list or an item whose marker is at `indent` belongs under: `item`, or the last item
@@ -2334,11 +2481,117 @@ mod tests {
     }
 
     #[test]
+    fn a_hard_wrapped_item_stays_one_item_in_every_markup() {
+        // The rest of a sentence an editor wrapped to the margin is more of the item, and the
+        // numbered list goes on. Set apart, `2.` and `3.` could not start a list after the
+        // paragraph and were drawn as its text.
+        assert_eq!(
+            in_every_markup("1. first item that wraps\nonto a second line\n2. second\n3. third"),
+            "<ol>\n<li>first item that wraps<br>\nonto a second line</li>\n<li>second</li>\n\
+             <li>third</li>\n</ol>\n"
+        );
+        // A code span across the wrap stays one code span, not two backticks as text.
+        assert_eq!(
+            in_every_markup("- run `make\ncheck` now\n- next"),
+            "<ul>\n<li>run <code>make check</code> now</li>\n<li>next</li>\n</ul>\n"
+        );
+        // A line in lower case carries the sentence above it on, however short that line is.
+        assert_eq!(
+            in_every_markup("- the first half,\nand the second half.\n- next"),
+            "<ul>\n<li>the first half,<br>\nand the second half.</li>\n<li>next</li>\n</ul>\n"
+        );
+        // A line as long as editors wrap that stops mid-sentence was wrapped, whatever the next
+        // line starts with.
+        in_every_markup(
+            "- the cache now keys every build by its target and its toolchain, so\n\
+             CI never shares one between them\n- next",
+        );
+    }
+
+    #[test]
+    fn a_line_of_its_own_is_set_apart_only_where_nothing_else_changes() {
+        // Each of these lines reads as a line of its own, and stays more of its item.
+        for text in [
+            // The numbered list carries on after it, and `2.` cannot interrupt a paragraph.
+            "1. First step.\nThen check it.\n2. Second step.",
+            "- a\n  1. First.\nThen.\n  2. Second.",
+            // A link, a code span or emphasis runs on to it from the line above.
+            "- Read [the guide.\nAll of it](https://example.test/) first.\n- next",
+            "- Run `make check.\nThen` again.",
+            "- This is **done.\nReally** done.",
+            // The line after it would be read as more of it: here a tag, which starts a block
+            // after a list but not after a paragraph. Caught by checking the new tree, which
+            // keeps every block but paragraphs and lists where it was.
+            "- a.\nB.\n<custom-tag>",
+        ] {
+            in_every_markup(text);
+        }
+        // A line that ends in a colon heads what follows it, after however long a line.
+        let text = "- 4127 (changes requested in review, see the thread for the details)\n\
+                    In review, each with fixes in flight:\n- 4130";
+        for markup in [Markup::GoogleChat, Markup::Slack] {
+            assert_eq!(
+                to_html(text, markup),
+                "<ul>\n<li>4127 (changes requested in review, see the thread for the details)</li>\n\
+                 </ul>\n<p>In review, each with fixes in flight:</p>\n<ul>\n<li>4130</li>\n</ul>\n",
+                "{markup:?}"
+            );
+        }
+        // A line kept in its numbered item costs no other line its own paragraph: the check on
+        // the new tree is the last resort, and it refuses every line of the message at once.
+        let text = "1. First step.\nThen check it.\n2. Second step.\n\n- a\nIn review:\n- b";
+        for markup in [Markup::GoogleChat, Markup::Slack] {
+            assert_eq!(
+                to_html(text, markup),
+                "<ol>\n<li>First step.<br>\nThen check it.</li>\n<li>Second step.</li>\n</ol>\n\
+                 <ul>\n<li>a</li>\n</ul>\n<p>In review:</p>\n<ul>\n<li>b</li>\n</ul>\n",
+                "{markup:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn no_line_inside_code_is_set_apart_or_moved() {
+        for text in [
+            // Four columns in, ``` is indented code, and the fence the next ``` opens holds the
+            // rest of the message.
+            "    ```\n- a\n```\n- b\nfoo\n```",
+            // A fence in an item ends with the item at a line further out than the item's text,
+            // and the ``` after it opens another.
+            "- a\n  ```\nx\n```\n- b\nfoo\n```",
+            "- a\n```\n- b\nfoo\n```",
+        ] {
+            let html = in_every_markup(text);
+            assert!(
+                html.contains("<pre><code>- b\nfoo\n</code></pre>"),
+                "{text:?}: {html}"
+            );
+        }
+    }
+
+    #[test]
+    fn items_in_a_quote_compare_from_inside_the_quote() {
+        // A quote's `>` takes one space with it, so these are two items of one list, as
+        // CommonMark reads them, and not the second a step of the first.
+        assert_eq!(
+            in_every_markup(">- a\n> - b"),
+            "<blockquote>\n<ul>\n<li>a</li>\n<li>b</li>\n</ul>\n</blockquote>\n"
+        );
+        // Further in than that is a step, however the quote is written.
+        assert_eq!(
+            in_every_markup(">- a\n>  - b"),
+            "<blockquote>\n<ul>\n<li>a\n<ul>\n<li>b</li>\n</ul>\n</li>\n</ul>\n</blockquote>\n"
+        );
+    }
+
+    #[test]
     fn google_chat_draws_bullets_straight_under_a_numbered_line_as_its_steps() {
         // The shape of the message in `#237 nested-lists`, with neutral words: numbered goals,
         // each with its bullets at the margin on the next line, a heading line after them, and
         // the goals apart by blank lines. Google Chat has no numbered lists, so `1.` is a line of
-        // text there and the bullets a list indented under it.
+        // text there and the bullets a list indented under it. The heading line and the bullets
+        // under it are more of the first goal: Google Chat draws all its bullets at one indent,
+        // and so does the page once both lists are in the goal.
         let text = "Goals:\n\n\
                     1. Faster builds. Most of the work went here:\n\
                     - cache keyed by target\n\
@@ -2350,9 +2603,27 @@ mod tests {
         assert_eq!(
             to_html(text, Markup::GoogleChat),
             "<p>Goals:</p>\n<ol>\n<li>Faster builds. Most of the work went here:\n<ul>\n\
-             <li>cache keyed by target</li>\n<li>warm machines kept warm</li>\n</ul>\n</li>\n</ol>\n\
-             <p>Still open:</p>\n<ul>\n<li>the flaky test</li>\n</ul>\n\
+             <li>cache keyed by target</li>\n<li>warm machines kept warm</li>\n</ul>\n\
+             Still open:\n<ul>\n<li>the flaky test</li>\n</ul>\n</li>\n</ol>\n\
              <ol start=\"2\">\n<li>Better docs: no work.</li>\n</ol>\n"
+        );
+        // Each further heading and its bullets join too, and a goal after them with no blank line
+        // carries the list on. A line with no bullets after it heads no steps, and stays at the
+        // margin.
+        assert_eq!(
+            to_html(
+                "1. a\n- x\nDone:\n- y\nOpen:\n- z\n2. b\n- w\nThanks.",
+                Markup::GoogleChat
+            ),
+            "<ol>\n<li>a\n<ul>\n<li>x</li>\n</ul>\nDone:\n<ul>\n<li>y</li>\n</ul>\n\
+             Open:\n<ul>\n<li>z</li>\n</ul>\n</li>\n<li>b\n<ul>\n<li>w</li>\n</ul>\n</li>\n\
+             </ol>\n<p>Thanks.</p>\n"
+        );
+        // A blank line the writer put before the heading keeps it, and its bullets, apart.
+        assert_eq!(
+            to_html("1. a\n- x\n\nOpen:\n- z", Markup::GoogleChat),
+            "<ol>\n<li>a\n<ul>\n<li>x</li>\n</ul>\n</li>\n</ol>\n<p>Open:</p>\n<ul>\n\
+             <li>z</li>\n</ul>\n"
         );
         // Slack draws both as lines at one margin, so only the heading line is set apart.
         assert_eq!(
