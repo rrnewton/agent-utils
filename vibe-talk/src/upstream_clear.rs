@@ -473,6 +473,12 @@ pub fn classify(answer: &Result<UpstreamClearOutcome, ChatError>) -> UpstreamCle
     }
 }
 
+/// A channel's display name for a log line, when it has one.
+pub type LabelOf = Arc<dyn Fn(&ChannelId) -> Option<String> + Send + Sync>;
+
+/// Whether a channel is one the server answers for and whose provider can be cleared.
+pub type Eligible = Arc<dyn Fn(&ChannelId) -> bool + Send + Sync>;
+
 /// Everything the loop needs, without the whole server state, so a test can build one.
 #[derive(Clone)]
 pub struct Clearer {
@@ -485,9 +491,9 @@ pub struct Clearer {
     /// The waits.
     pub timing: Timing,
     /// The channel's display name for the log line, when it has one.
-    pub label: Arc<dyn Fn(&ChannelId) -> Option<String> + Send + Sync>,
+    pub label: LabelOf,
     /// Whether `channel` is one the server answers for and whose provider can be cleared.
-    pub eligible: Arc<dyn Fn(&ChannelId) -> bool + Send + Sync>,
+    pub eligible: Eligible,
 }
 
 impl std::fmt::Debug for Clearer {

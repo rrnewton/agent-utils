@@ -947,6 +947,41 @@
               </div>
 
               <!--
+                `#232 upstream-mark-read`. Clear this channel's unread state in its chat service's
+                own app as vibe-talk receives each message, so that app's unread list keeps the
+                people and vibe-talk keeps the agents. The SERVER does it, with no page open, so the
+                choice is the server's own, read and written through /upstream-clear and never kept
+                on this device. Shown only when the channel's service can do it, and only to a
+                token that may change it. The warning is always on screen beside the choice, because
+                what it does to the other app is the whole decision. Built by `renderUpstreamClear`
+                in web/voice.js.
+              -->
+              <div id="upstream-clear" hidden>
+                <hr class="settings-rule" />
+                <label for="upstream-clear-mode">Clear unread in <span id="upstream-clear-provider">the chat service</span></label>
+                <select id="upstream-clear-mode" aria-describedby="upstream-clear-warning upstream-clear-state">
+                  <option value="off">Off</option>
+                  <option value="dry_run">Dry run: log only, mark nothing</option>
+                  <option value="on">On</option>
+                </select>
+                <p id="upstream-clear-warning" class="hint">
+                  Marks EVERY message in this channel read in
+                  <span id="upstream-clear-warning-provider">the chat service</span> as soon as
+                  vibe-talk receives it, including messages from people. Replies inside threads
+                  keep their own unread state there and are not cleared. vibe-talk's own unread
+                  and Done state are not changed.
+                </p>
+                <label id="upstream-clear-now-row" class="row" for="upstream-clear-now" hidden>
+                  <input id="upstream-clear-now" type="checkbox" />
+                  <span id="upstream-clear-now-label">Also mark what is unread there now</span>
+                </label>
+                <div class="channel-actions">
+                  <button id="upstream-clear-save" class="secondary" type="button" disabled>Save</button>
+                </div>
+                <p id="upstream-clear-state" class="hint" aria-live="polite"></p>
+              </div>
+
+              <!--
                 WHO IS WHO, and it is IN HERE because it was always a fact about one channel and
                 was drawn as a fact about the app.
 

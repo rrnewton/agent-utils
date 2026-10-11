@@ -5561,6 +5561,15 @@ textarea {
   margin: 0.4rem 0 0;
 }
 
+/* `#232 upstream-mark-read`. The warning beside the choice that marks people's messages read in the
+   chat service's own app: in the warning colour, ruled down its edge, so it reads as a caution
+   rather than as one more hint. */
+#upstream-clear-warning {
+  color: var(--warn);
+  border-left: 3px solid var(--warn);
+  padding-left: 0.5rem;
+}
+
 /* `#19 channel-browser`. One row per channel: the name takes the width and wraps rather than
    pushing the Add button off a narrow phone, and the button keeps a finger-sized target. */
 .channel-directory {

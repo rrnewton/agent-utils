@@ -1313,6 +1313,9 @@ function newPage(store = new Map(), script = SCRIPT, arrange = null) {
         channel_discovery_supported: page.channelDiscoverySupported,
         threading_supported: page.threadingSupported,
         upstream_read_mark_supported: page.upstreamReadMarkSupported,
+        // `#232 upstream-mark-read`. Absent unless a test says the provider can clear its unread
+        // state, as the server omits it when false.
+        upstream_clear_supported: page.upstreamClearSupported,
         // Absent unless a test says the provider posts a keyed message at most once, as the server
         // omits it when false. `#195 send-resilience`.
         idempotent_posts_supported: page.idempotentPostsSupported,
@@ -1389,6 +1392,17 @@ function newPage(store = new Map(), script = SCRIPT, arrange = null) {
     addChannelConflict: false,
     /** Whether the provider can move its own read cursor. Default false, like production. */
     upstreamReadMarkSupported: false,
+    /**
+     * `#232 upstream-mark-read`. Whether the provider can clear its unread state as the server
+     * ingests; `undefined` sends nothing, as the server does when it cannot.
+     */
+    upstreamClearSupported: undefined,
+    /** The server's clear-unread state per channel id, as `UpstreamClearState` minus the channel. */
+    upstreamClear: new Map(),
+    /** Every clear-unread request, as `METHOD channel body`, so what reached the server is checkable. */
+    upstreamClearCalls: [],
+    /** Set to `{status, error, detail}` to make the clear-unread route fail that way. */
+    upstreamClearFailure: null,
     /**
      * Whether the server says a keyed send is posted at most once, so the page may retry a lost
      * answer on its own. `undefined` sends nothing, which is what a server that cannot says.
@@ -2367,6 +2381,29 @@ function newPage(store = new Map(), script = SCRIPT, arrange = null) {
           read_state_notice: INBOX_NOTICE,
         });
       }
+      const clearing = /^\/api\/v1\/channels\/([^/]+)\/upstream-clear$/.exec(String(path));
+      if (clearing) {
+        const method = (options && options.method) || "GET";
+        const id = decodeURIComponent(clearing[1]);
+        page.upstreamClearCalls.push(`${method} ${id} ${(options && options.body) || ""}`.trim());
+        if (page.upstreamClearFailure) {
+          const { status, error, detail } = page.upstreamClearFailure;
+          return json(status, { error, detail });
+        }
+        const channel = page.channels.find((c) => String(c.id) === id);
+        if (!channel) return json(404, { error: "unknown_channel", detail: "no such channel" });
+        const held = page.upstreamClear.get(id) ||
+          { provider_name: page.chatProviderName, supported: true, mode: "off", failures: 0, pending: false };
+        let next = held;
+        if (method === "PUT") {
+          const body = JSON.parse(options.body);
+          next = { ...held, mode: body.mode, pending: body.mode !== "off" && body.clear_now === true };
+          if (body.mode === "off") delete next.enabled_at_ms;
+          else if (held.mode === "off") next.enabled_at_ms = 1_790_000_000_000;
+          page.upstreamClear.set(id, next);
+        }
+        return json(200, { channel: { alias: null, added: false, ...channel }, ...next });
+      }
       if (/\/upstream-read$/.test(String(path))) {
         const body = JSON.parse((options && options.body) || "null");
         page.upstreamReadCalls.push(body);
@@ -2844,6 +2881,10 @@ const TRANSCRIPT_PAGE_LIMIT = sourceConstant("TRANSCRIPT_PAGE_LIMIT");
 // The bands are deliberately WIDE. They are not a second opinion about the tuning; they are the
 // boundary between a judgement and a different behaviour wearing the same name.
 const TUNING_BANDS = {
+  UPSTREAM_CLEAR_RECHECK_MS: [2000, 15000,
+    "how long after saving the clear-unread choice Settings asks what the server did: sooner " +
+    "reads before the server's first push could have answered, later leaves the line describing " +
+    "the moment of saving long after the push (#232 upstream-mark-read)"],
   DIRECTORY_SEARCH_DELAY_MS: [100, 1000,
     "the pause that ends a search: shorter asks the server once per keystroke, longer makes the " +
     "list feel as if it ignored what was typed (#19 channel-browser)"],
@@ -17762,6 +17803,10 @@ test("EVERY CONTROL ON SETTINGS keeps its value the moment it changes: nothing t
     "new-channel-label": "add-channel",
     "new-channel-writable": "add-channel",
     "noise-rule-new": "add-noise-rule",
+    // `#232 upstream-mark-read`. Marking every message read in the chat service's own app is a
+    // decision about the owner's attention there, so choosing a mode only shows what Save would do.
+    "upstream-clear-mode": "upstream-clear-save",
+    "upstream-clear-now": "upstream-clear-save",
   };
   const page = newPage();
   const controls = [...PAGE_ELEMENTS].filter(([id, markup]) =>
@@ -36293,3 +36338,196 @@ test("`#229 desktop-two-column`: keys for the page — another channel, the Pinn
   assert.equal(page.el("side-list").hidden, false, "the right column did not go to the new channel's cards");
   assert.equal(page.el("channel-compose-text").getAttribute("aria-label"), "Message the main channel");
 });
+
+// --- clearing unread in the chat service's own app ----------------------------------------------
+//
+// `#232 upstream-mark-read`. The server marks every message it receives in a channel read in the
+// chat service's own app, for a channel the owner turns that on for. Settings is where he does, so
+// these are about what the box offers, what it warns, what reaches the server, and what it says the
+// server did.
+
+const CLEAR_PATH = `/api/v1/channels/${CHANNEL.id}/upstream-clear`;
+
+/** A signed-in page on Settings, whose server can clear unread in Google Chat. */
+async function clearingPage(arrange = null) {
+  const page = newPage();
+  page.chatProviderName = "Google Chat";
+  page.upstreamClearSupported = true;
+  if (arrange) arrange(page);
+  await signIn(page);
+  await page.el("open-settings").click();
+  await page.settle();
+  return page;
+}
+
+/** One push, as the server reports it. */
+const clearAttempt = (fields = {}) => ({
+  at_ms: Date.UTC(2026, 9, 11, 10, 43),
+  message_id: "1110000000000000300",
+  message_at_ms: Date.UTC(2026, 9, 11, 10, 42),
+  result: "advanced",
+  target: "2026-10-11T10:42:00Z",
+  previous: "2026-10-11T09:00:00Z",
+  ...fields,
+});
+
+test("CLEARING UNREAD is not offered by a server whose chat service cannot, and nothing is asked", async () => {
+  const page = newPage();
+  await signIn(page);
+  await page.el("open-settings").click();
+  await page.settle();
+  assert.equal(page.el("upstream-clear").hidden, true, "offered by a server that cannot");
+  assert.deepEqual(page.requests.filter((request) => request.includes("/upstream-clear")), [],
+    "the page asked about a setting the server does not offer");
+});
+
+test("...nor to a read-scope token, which could not change it", async () => {
+  const page = await clearingPage((page) => { page.tokenScope = "read"; });
+  assert.equal(page.el("upstream-clear").hidden, true);
+  assert.deepEqual(page.upstreamClearCalls, []);
+});
+
+test("...nor for a channel whose own chat service cannot, when another one can", async () => {
+  const space = { id: "1110000000000000201", label: "chat space", writable: true, provider: "gchat" };
+  const team = { id: "C0123ABCDE", label: "slack team", writable: true, provider: "slack" };
+  const provider = (key, name, clear) => ({
+    key, name, threading_supported: false, live_delivery: "push", live_poll_seconds: 0,
+    channel_registration_supported: false, channel_discovery_supported: false,
+    upstream_read_mark_supported: clear, upstream_clear_supported: clear || undefined,
+    self_author_id: null, owner_author_id: null,
+  });
+  const page = await clearingPage((page) => {
+    page.channels = [team, space];
+    page.providers = [provider("gchat", "Google Chat", true), provider("slack", "Slack", false)];
+  });
+  assert.equal(page.el("settings-channel").value, team.id);
+  assert.equal(page.el("upstream-clear").hidden, true, "offered for a channel whose service cannot");
+  page.el("settings-channel").value = space.id;
+  await page.el("settings-channel").dispatch("change");
+  await page.settle();
+  assert.equal(page.el("upstream-clear").hidden, false, "not offered for the channel whose service can");
+  assert.equal(page.el("upstream-clear-provider").textContent, "Google Chat");
+  assert.deepEqual(page.upstreamClearCalls, [`GET ${space.id}`]);
+});
+
+test("THE WARNING is in the markup beside the choice, never hidden, and says what it does to people's messages", async () => {
+  assert.equal(PAGE_ELEMENTS.get("upstream-clear-warning").hidden, false);
+  const warning = (/<p id="upstream-clear-warning"[^>]*>([\s\S]*?)<\/p>/.exec(HTML) ||
+    assert.fail("no warning in web/voice.html"))[1].replace(/<[^>]+>/g, " ").replace(/\s+/g, " ");
+  assert.match(warning, /EVERY message in this channel read/);
+  assert.match(warning, /including messages from people/);
+  assert.match(warning, /Replies inside threads .* not cleared/);
+  assert.match(warning, /vibe-talk's own unread and Done state are not changed/);
+  assert.ok(markupHolds("upstream-clear", "upstream-clear-warning"));
+  assert.ok(markupHolds("upstream-clear", "upstream-clear-mode"));
+  assert.match(
+    (/<select id="upstream-clear-mode"[^>]*>/.exec(HTML) || [""])[0],
+    /aria-describedby="upstream-clear-warning upstream-clear-state"/,
+    "the choice is not described by its warning, so a screen reader reaches it without one"
+  );
+  const page = await clearingPage();
+  assert.equal(page.el("upstream-clear-warning-provider").textContent, "Google Chat",
+    "the warning does not name the service it marks messages read in");
+});
+
+test("the box shows the server's own state for the channel: off, and the server's words for it", async () => {
+  const page = await clearingPage();
+  assert.equal(page.el("upstream-clear").hidden, false);
+  assert.deepEqual(page.upstreamClearCalls, [`GET ${CHANNEL.id}`]);
+  assert.equal(page.el("upstream-clear-mode").value, "off");
+  assert.equal(page.el("upstream-clear-now-row").hidden, true);
+  assert.equal(page.el("upstream-clear-save").disabled, true, "Save offered with nothing to save");
+  assert.match(page.el("upstream-clear-state").textContent, /^Off\. Nothing here is marked read in Google Chat\.$/);
+  // Nothing about it is kept on this device: it is the server's.
+  assert.deepEqual([...page.storage.keys()].filter((key) => /upstream|clear/i.test(key)), []);
+});
+
+test("TURNING IT ON is a deliberate Save, can clear what is unread now, and draws what the server stored", async () => {
+  const page = await clearingPage();
+  page.el("upstream-clear-mode").value = "on";
+  await page.el("upstream-clear-mode").dispatch("change");
+  assert.deepEqual(page.upstreamClearCalls, [`GET ${CHANNEL.id}`], "choosing a mode saved it by itself");
+  assert.equal(page.el("upstream-clear-now-row").hidden, false, "clear-now is not offered when turning it on");
+  assert.match(page.el("upstream-clear-now-label").textContent, /mark what is unread there now/);
+  assert.equal(page.el("upstream-clear-save").disabled, false);
+  await page.el("upstream-clear-now").setChecked(true);
+  await page.el("upstream-clear-save").click();
+  await page.settle();
+  assert.equal(page.upstreamClearCalls.at(-1), `PUT ${CHANNEL.id} {"mode":"on","clear_now":true}`);
+  assert.equal(page.el("upstream-clear-mode").value, "on");
+  assert.equal(page.el("upstream-clear-now").checked, false, "clear-now stayed ticked for the next save");
+  assert.equal(page.el("upstream-clear-save").disabled, true);
+  assert.match(page.el("upstream-clear-state").textContent, /newest message is marked read in Google Chat shortly/);
+
+  // The push is the server's, in the background; the box asks again shortly to show what it did.
+  page.upstreamClear.set(CHANNEL.id, {
+    provider_name: "Google Chat", supported: true, mode: "on", failures: 0, pending: false,
+    pushed: clearAttempt(), last: clearAttempt(), previous_cursor: "2026-10-11T09:00:00Z",
+  });
+  assert.equal(page.expireTimers(4000), 1, "nothing was armed to ask again");
+  await page.settle();
+  assert.equal(page.upstreamClearCalls.at(-1), `GET ${CHANNEL.id}`);
+  const said = page.el("upstream-clear-state").textContent;
+  assert.match(said, /^On\. vibe-talk marked it read in Google Chat through the message from /);
+  assert.match(said, /Before vibe-talk first marked it, Google Chat's read marker was at /,
+    "the box does not say where the marker was before, which is what an undo needs");
+});
+
+test("...turning it off sends off and nothing else, and a failed save says so and keeps the choice", async () => {
+  const page = await clearingPage((page) => {
+    page.upstreamClear.set(CHANNEL.id, {
+      provider_name: "Google Chat", supported: true, mode: "on", failures: 0, pending: false,
+      pushed: clearAttempt(), last: clearAttempt(), previous_cursor: "2026-10-11T09:00:00Z",
+    });
+  });
+  page.el("upstream-clear-mode").value = "off";
+  await page.el("upstream-clear-mode").dispatch("change");
+  assert.equal(page.el("upstream-clear-now-row").hidden, true, "clear-now offered when turning it off");
+  page.upstreamClearFailure = { status: 503, error: "storage_not_configured", detail: "set storage.path" };
+  await page.el("upstream-clear-save").click();
+  await page.settle();
+  assert.match(page.el("upstream-clear-state").textContent, /^Not saved: set storage\.path/);
+  assert.equal(page.el("upstream-clear-mode").value, "off", "the choice was thrown away by a failed save");
+  assert.equal(page.el("upstream-clear-save").disabled, false, "a failed save cannot be tried again");
+  page.upstreamClearFailure = null;
+  await page.el("upstream-clear-save").click();
+  await page.settle();
+  assert.equal(page.upstreamClearCalls.at(-1), `PUT ${CHANNEL.id} {"mode":"off","clear_now":false}`);
+  assert.match(page.el("upstream-clear-state").textContent, /^Off\. Earlier, vibe-talk marked it read/);
+  assert.equal(page.expireTimers(4000), 0, "asked again after turning it off");
+});
+
+test("the status line says a dry run wrote nothing, a failure and its retry, and a channel it cannot clear", async () => {
+  const cases = [
+    [{ mode: "dry_run", last: clearAttempt({ result: "dry_run" }) },
+      /^Dry run: would mark it read in Google Chat through the message from .*\. Nothing was written\.$/],
+    [{ mode: "on", failures: 2, retry_at_ms: Date.UTC(2026, 9, 11, 11, 0),
+      last: clearAttempt({ result: "failed", target: undefined, previous: undefined,
+        error: "Google Chat returned HTTP 502: mark-read failed" }) },
+      /^Failing since .*: Google Chat returned HTTP 502: mark-read failed\. Trying again at /],
+    [{ mode: "on", unavailable: "this channel is one thread of a larger space" },
+      /^Not available for this channel: this channel is one thread of a larger space\.$/],
+    [{ mode: "on", pending: true }, /^On\. The newest message is marked read in Google Chat shortly\.$/],
+    [{ mode: "on" }, /^On\. The next message vibe-talk receives here is marked read in Google Chat\.$/],
+  ];
+  for (const [state, said] of cases) {
+    const page = await clearingPage((page) => {
+      page.upstreamClear.set(CHANNEL.id, {
+        provider_name: "Google Chat", supported: true, failures: 0, pending: false, ...state,
+      });
+    });
+    assert.equal(page.el("upstream-clear-mode").value, state.mode);
+    assert.match(page.el("upstream-clear-state").textContent, said);
+  }
+});
+
+test("opening Settings again reads the server's state again, and a read failure is said, not guessed", async () => {
+  const page = await clearingPage();
+  await page.el("close-settings").click();
+  page.upstreamClearFailure = { status: 502, error: "chat_error", detail: "the bridge is restarting" };
+  await page.el("open-settings").click();
+  await page.settle();
+  assert.deepEqual(page.upstreamClearCalls, [`GET ${CHANNEL.id}`, `GET ${CHANNEL.id}`]);
+  assert.match(page.el("upstream-clear-state").textContent, /^Could not read this setting: the bridge is restarting/);
+});
+
