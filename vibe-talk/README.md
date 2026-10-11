@@ -1441,6 +1441,49 @@ not write vibe-talk's local read mark and does not archive the message. Thread-l
 defined by the provider. The bridge may return JSON or an empty successful response such as `204
 No Content`. Direct Discord deployments must leave the setting off.
 
+**Clearing unread automatically, per channel** (`#232 upstream-mark-read`). vibe-talk reads only
+some of the owner's channels, and those are mostly coding agents posting updates; in the service's
+own client those updates bury the messages from people. With the same bridge opt-in, Settings offers
+**Clear unread in** *the service* for each channel whose provider can do it: off (the default), a
+dry run, or on. On, the SERVER marks every message it receives in that channel read in the service's
+own client too, so that client's unread list keeps the people and vibe-talk keeps the agents.
+vibe-talk's own read marks and Done state are not touched, and nothing is ever read back.
+
+* **The setting is the server's.** It is kept in the store (one row per channel set, `off` when there
+  is none), because the server acts with no page open. Write scope to change it, read scope to see
+  it, and no MCP tool. A server without a store cannot offer it.
+* **Ingest never waits for it.** Every created message, polled or pushed by an adapter, is noted in
+  memory as its channel's newest. One push per burst: after 5 seconds with nothing newer, or after
+  30 seconds of steady traffic, and never sooner than 30 seconds after that channel's last push.
+  Pushes run one at a time, in the background.
+* **Never backwards.** A message at or before the newest one already covered is never pushed, and
+  that floor survives a restart and the setting being turned off. At startup each enabled channel is
+  checked against its newest message, so one that arrived while the server was down is still cleared.
+* **Failures retry** after 30 seconds, doubling to 15 minutes, plus up to a tenth more per channel.
+  A newer message replaces one waiting to be retried. The status line in Settings shows the last
+  push, a failure and its retry time, or why the channel cannot be cleared.
+* **Every attempt is logged on one line** beginning `upstream-clear:`, naming the mode, the channel,
+  the message and its time, and the outcome (`advanced`, `already-read`, `dry-run`, `skipped`, or
+  `failed`). A dry run decides everything and writes nothing, so an operator can check what would be
+  marked before turning it on.
+* **What it cannot do.** The provider's marker covers the whole channel, so people's messages there
+  are marked read too, and Settings says so beside the switch. A provider whose threads have their
+  own read state keeps replies inside threads unread. The first push also clears the backlog.
+* **Undo.** Turning it off stops all further pushes at once. Settings shows where the provider's
+  marker was before vibe-talk first moved it; moving it back is a manual act in the provider's own
+  tools, not a button here, because it would also mark unread whatever the owner has read since.
+
+The bridge implements `POST /channels/{id}/upstream-clear` with exactly
+`{"message_id":"...","dry_run":true|false}`. It reads its provider's current cursor, moves it through
+that message only if the cursor is behind (never in a dry run), and answers
+`{"scope":"space","channel_id":"...","message_id":"...","target":"<instant>","previous":"<instant>|null","advanced":bool,"dry_run":bool}`.
+It should serve this behind reads and the owner's own actions. `404` means it no longer holds the
+message, and vibe-talk waits for a newer one; `409` with `"code":"thread_channel"` means the channel
+cannot be cleared at all (for example one thread of a larger space, where the provider's marker would
+also clear messages vibe-talk never received), and vibe-talk stops until the setting is saved again;
+`429` with `retry_after` in seconds is waited out; anything else is a failure and is retried. An older
+bridge answers `405`, which Settings reports as a failure. Direct Discord is never offered it.
+
 ### Where it lives
 
 One SQLite file at `storage.path`, which **must be absolute**. A relative path resolves against
@@ -1726,6 +1769,8 @@ own adapter-only token; every other route uses the read/write tokens described a
 | POST | `/api/v1/channels/{id}/read` | **write** | move this server's read mark forward |
 | DELETE | `/api/v1/channels/{id}/read` | **write** | drop this server's read mark |
 | POST | `/api/v1/channels/{id}/upstream-read` | **write** | `{message_id:"…"}` — ask an explicitly capable provider to move its monotone read cursor through that message; thread behavior is provider-defined |
+| GET | `/api/v1/channels/{id}/upstream-clear` | read | whether this server clears the channel's unread state in the provider's own client as it ingests messages, and what it last did; see "Clearing unread automatically" |
+| PUT | `/api/v1/channels/{id}/upstream-clear` | **write** | `{mode:"off"\|"dry_run"\|"on", clear_now?:bool}` — set it; `clear_now` pushes the channel's newest message at once, in the background. Refused for a channel whose provider cannot do it |
 | PUT | `/api/v1/channels/{id}/alias` | **write** | `{alias:"…"}` — what THIS app calls the channel; see "What to call a channel" |
 | DELETE | `/api/v1/channels/{id}/alias` | **write** | drop it, putting the configured label back |
 | PUT | `/api/v1/noise-rules` | **write** | `{rules:["…"]}` — replace the whole list of messages read automatically; answers what was stored. Read through client-config's `noise_rules`; see "Messages read automatically" |
@@ -1733,7 +1778,7 @@ own adapter-only token; every other route uses the read/write tokens described a
 | GET | `/api/v1/channels/{id}/pins` | read | this app's pinned messages in the channel, oldest message first, each with the snapshot kept of it, and the list's `revision`; see "Pinned messages" |
 | PUT | `/api/v1/channels/{id}/pins/{message_id}` | **write** | `{author, author_id, author_is_bot?, content, timestamp, thread_id?, thread_root?}` — pin it, keeping that much of the row; idempotent. At 100 pins in the channel the oldest is unpinned and named in `unpinned` |
 | DELETE | `/api/v1/channels/{id}/pins/{message_id}` | **write** | unpin it; idempotent, `changed: false` when it was not pinned |
-| DELETE | `/api/v1/storage` | **write** | erase EVERYTHING durable: transcripts, read marks, "dealt with" marks, cached summaries, channel aliases, pins |
+| DELETE | `/api/v1/storage` | **write** | erase EVERYTHING durable: transcripts, read marks, "dealt with" marks, cached summaries, channel aliases, pins, and every channel's clear-unread setting (back to off) |
 | POST | `/mcp` | read, or **write** per tool | MCP over Streamable HTTP — see below |
 | GET/DELETE | `/mcp` | none | `405`; this endpoint is stateless and has nothing to push |
 
@@ -1754,7 +1799,8 @@ read is the thing the voice agent has to be able to say out loud.
 **`/api/v1/inbox` carries `read_state_notice` on every answer**, including the local mutating ones,
 saying that this read state is vibe-talk's own and is synchronised with Discord in neither
 direction. `/upstream-read` is a separate provider write, advertised to the web app through
-`upstream_read_mark_supported` in `/client-config`. See **Durable state** above.
+`upstream_read_mark_supported` in `/client-config`, and `/upstream-clear` is advertised through
+`upstream_clear_supported`, per provider as well. See **Durable state** above.
 
 **Every message this API renders carries `author_id` next to `author`** — in the scrollback, in
 one-message reads, in `resolve` results, in the posted message echoed back by `reply`, and as a
