@@ -512,6 +512,9 @@ fn elevenlabs_voice(state: &AppState, profile: Option<&AgentProfile>, agent: &Di
 
 /// Can this deployment summarise anything at all?
 ///
+/// With `[summaries.llm]` configured, the answer is about that section's files; otherwise it is
+/// about the ElevenLabs agent, as below.
+///
 /// No vendor call of its own — the key and the agent already have rows above, and asking a third
 /// time would spend a request to learn the same thing. What this row adds is the CONSEQUENCE,
 /// which neither of those rows states: there is exactly one summariser and it is the ElevenLabs
@@ -523,6 +526,23 @@ fn elevenlabs_voice(state: &AppState, profile: Option<&AgentProfile>, agent: &Di
 /// [`crate::elevenlabs::credentials`] rather than `speech_key`: a summary needs the agent id as
 /// well as the account key, and read-aloud does not.
 fn summaries(state: &AppState) -> Check {
+    // `#233 llm-summarizer`. With `[summaries.llm]` the ElevenLabs credentials are irrelevant to
+    // summaries, and judging them here would paint a working deployment red. What can be known
+    // without a model call is whether the files it reads are there.
+    if let Some(llm) = &state.config.summaries.llm {
+        let diagnosis = match crate::summarize::messages_api::unusable_file(llm) {
+            Some((setting, _why)) => Diagnosis::NotConfigured(setting),
+            None => Diagnosis::Confirmed(format!(
+                "summaries and thread names are produced by {} ({}, model {}), under policy \
+                 version {}",
+                state.summarizer.describe(),
+                llm.dialect.as_str(),
+                llm.model,
+                state.summary_version
+            )),
+        };
+        return Check::new("summaries", "Message summaries", diagnosis);
+    }
     let diagnosis = match crate::elevenlabs::credentials(&state.config.elevenlabs) {
         Err(SignedUrlError::NotConfigured(setting)) => Diagnosis::NotConfigured(setting),
         // `credentials` returns exactly one variant on failure. Anything else is a change in that

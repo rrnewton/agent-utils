@@ -453,8 +453,14 @@ impl MessagesApiSummarizer {
                         self.config.timeout_secs
                     )
                 } else {
-                    format!("the model provider could not be reached: {error}")
-                }))
+                    // The whole chain: reqwest's own line is "error sending request", and the
+                    // reason — refused, unresolvable, a TLS handshake the gateway rejected — is
+                    // underneath it.
+                    format!(
+                        "the model provider could not be reached: {}",
+                        causes(&error)
+                    )
+                }));
             }
         };
         let status = response.status();
@@ -528,6 +534,36 @@ impl MessagesApiSummarizer {
         self.note(|s| s.answered += 1);
         Attempt::Answered(text)
     }
+}
+
+/// The first configured credential or TLS file that is not there, as the setting naming it and
+/// what is wrong with it. Existence only: the contents are read, and judged, per call.
+///
+/// For the startup log, `client-config` and diagnostics, which all want to say what is broken
+/// before anybody asks for a summary.
+#[must_use]
+pub fn unusable_file(config: &LlmConfig) -> Option<(&'static str, String)> {
+    [
+        (&config.api_key_file, "summaries.llm.api_key_file"),
+        (&config.bearer_token_file, "summaries.llm.bearer_token_file"),
+        (
+            &config.client_identity_file,
+            "summaries.llm.client_identity_file",
+        ),
+        (&config.ca_bundle_file, "summaries.llm.ca_bundle_file"),
+    ]
+    .into_iter()
+    .find_map(|(path, setting)| {
+        let path = path.as_ref()?;
+        match std::fs::metadata(path) {
+            Ok(metadata) if metadata.is_file() => None,
+            Ok(_) => Some((setting, format!("{} is not a file", path.display()))),
+            Err(error) => Some((
+                setting,
+                format!("{} cannot be read: {error}", path.display()),
+            )),
+        }
+    })
 }
 
 /// A header value that never reaches a debug print.
@@ -802,31 +838,7 @@ impl Summarizer for MessagesApiSummarizer {
     }
 
     fn unavailable_reason(&self) -> Option<String> {
-        // Existence only: the contents are read, and judged, per call.
-        [
-            (&self.config.api_key_file, "summaries.llm.api_key_file"),
-            (
-                &self.config.bearer_token_file,
-                "summaries.llm.bearer_token_file",
-            ),
-            (
-                &self.config.client_identity_file,
-                "summaries.llm.client_identity_file",
-            ),
-            (&self.config.ca_bundle_file, "summaries.llm.ca_bundle_file"),
-        ]
-        .into_iter()
-        .find_map(|(path, setting)| {
-            let path = path.as_ref()?;
-            match std::fs::metadata(path) {
-                Ok(metadata) if metadata.is_file() => None,
-                Ok(_) => Some(format!("{setting} {} is not a file", path.display())),
-                Err(error) => Some(format!(
-                    "{setting} {} cannot be read: {error}",
-                    path.display()
-                )),
-            }
-        })
+        unusable_file(&self.config).map(|(setting, why)| format!("{setting} {why}"))
     }
 
     fn names_threads(&self) -> bool {

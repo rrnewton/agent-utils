@@ -513,3 +513,115 @@ fn urlencode(raw: &str) -> String {
         })
         .collect()
 }
+
+#[tokio::test]
+async fn diagnostics_judge_the_llm_section_and_not_the_absent_elevenlabs_credentials() {
+    let dir = testing::TempDir::new("llm-diagnostics");
+    let key = dir.path().join("model-key");
+    let text = format!(
+        "{}\n[summaries.llm]\napi_key_file = \"{}\"\n",
+        testing::config_toml_without_elevenlabs(),
+        key.display()
+    );
+    let config = vibe_talk::config::Config::from_toml_and_env(&text, &Default::default())
+        .expect("valid configuration");
+    let summarizer = vibe_talk::summarize::summarizer_for(
+        &config.elevenlabs,
+        &config.summaries,
+        Arc::new(vibe_talk::elevenlabs::fake::FakeElevenLabs::new()),
+    );
+    let (state, _discord, _store) = testing::state_with_backend(&text, summarizer);
+    let row = |report: &vibe_talk::diagnostics::DiagnosticsReport| {
+        report
+            .checks
+            .iter()
+            .find(|check| check.id == "summaries")
+            .cloned()
+            .expect("a summaries row")
+    };
+
+    // The key file is not there yet: red, unconfigured, and naming the setting.
+    let missing = row(&vibe_talk::diagnostics::run(&state).await);
+    assert_eq!(
+        missing.status,
+        vibe_talk::diagnostics::Status::Fail,
+        "{missing:#?}"
+    );
+    assert!(missing.unconfigured, "{missing:#?}");
+    assert!(
+        missing
+            .remedy
+            .as_deref()
+            .is_some_and(|remedy| remedy.contains("summaries.llm.api_key_file")),
+        "{missing:#?}"
+    );
+
+    // With it in place: green, saying which dialect and model, though ElevenLabs has no key.
+    std::fs::write(&key, "sk-diagnostics-test-key").unwrap();
+    let present = row(&vibe_talk::diagnostics::run(&state).await);
+    assert_eq!(
+        present.status,
+        vibe_talk::diagnostics::Status::Pass,
+        "{present:#?}"
+    );
+    let said = format!("{present:?}");
+    assert!(
+        said.contains("anthropic") && said.contains("claude-haiku-4-5"),
+        "{said}"
+    );
+    assert!(!said.contains("sk-diagnostics-test-key"), "{said}");
+}
+
+/// Every `[summaries.llm]` example an operator might copy, from the README's Summaries section and
+/// from the shipped example file, uncommented.
+fn documented_examples() -> Vec<String> {
+    let mut examples = Vec::new();
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let readme = std::fs::read_to_string(root.join("README.md")).expect("the README");
+    let section = readme
+        .split("\n## Summaries\n")
+        .nth(1)
+        .and_then(|rest| rest.split("\n## ").next())
+        .expect("the README has a Summaries section");
+    let mut fenced = section.split("```toml\n").skip(1);
+    for block in fenced.by_ref() {
+        examples.push(block.split("```").next().unwrap_or_default().to_owned());
+    }
+    let example =
+        std::fs::read_to_string(root.join("vibe-talk.example.toml")).expect("the example file");
+    let mut current: Option<String> = None;
+    for line in example.lines() {
+        let uncommented = line.strip_prefix("# ").or_else(|| line.strip_prefix('#'));
+        match (&mut current, uncommented) {
+            (None, Some(text)) if text.trim() == "[summaries.llm]" => {
+                current = Some(format!("{text}\n"));
+            }
+            (Some(block), Some(text)) if !text.trim().is_empty() => {
+                if text.starts_with('[') || text.contains(" = ") {
+                    block.push_str(text);
+                    block.push('\n');
+                }
+            }
+            (Some(_), _) => examples.extend(current.take()),
+            _ => {}
+        }
+    }
+    examples.extend(current);
+    examples
+}
+
+#[test]
+fn every_documented_example_is_one_this_server_would_accept() {
+    let examples = documented_examples();
+    assert!(
+        examples.len() >= 6,
+        "the README and the example file document at least six sections; found {}: {examples:#?}",
+        examples.len()
+    );
+    for example in examples {
+        let text = format!("{}\n{example}", testing::config_toml_without_elevenlabs());
+        let cfg = vibe_talk::config::Config::from_toml_and_env(&text, &Default::default())
+            .unwrap_or_else(|error| panic!("{error}\n{example}"));
+        assert!(cfg.summaries.llm.is_some(), "{example}");
+    }
+}
