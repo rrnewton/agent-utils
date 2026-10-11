@@ -192,9 +192,9 @@ enabled = true
 # never falls back to an unsigned URL, because that failure would surface later, in a browser, in
 # a car, as a conversation that silently will not start.
 #
-# These two now also decide whether MESSAGE SUMMARIES work at all: the summariser under [summaries]
-# is this same agent, so a deployment without them shows every long message as a failed summary.
-# See [summaries] below.
+# Without a [summaries.llm] section, these two also decide whether MESSAGE SUMMARIES work at all:
+# the summariser is then this same agent, so a deployment with neither shows every long message as
+# a failed summary. See [summaries] below.
 # Environment: VIBE_TALK_ELEVENLABS_AGENT_ID / VIBE_TALK_ELEVENLABS_API_KEY
 #              VIBE_TALK_ELEVENLABS_VOICE_ID
 #
@@ -279,20 +279,20 @@ enabled = true
 # target_chars = 160
 # context_messages = 3        # how many preceding messages ride along as context
 #
-# The model to ask. NOTE: nothing reads this — the summariser asks whichever model the ElevenLabs
-# agent is configured with — so today it does exactly one thing: it is folded into the cache key,
-# so setting it invalidates every summary produced without it.
+# The model [summaries.llm] asks when it names none of its own. The ElevenLabs agent ignores it
+# (it runs whatever model the agent is configured with). Folded into the cache key either way.
 # Environment: VIBE_TALK_SUMMARY_MODEL
-# model = "..."
+# model = "claude-haiku-4-5"
 
-# THERE IS NO SUMMARISER TO CHOOSE, AND NO `backend` KEY. There used to be one: an "extractive"
-# summariser that truncated, cost nothing, and was the default. It has been DELETED. It never
-# comprehended anything — it handed you the opening of the message it claimed to summarise, which
-# the collapsed row already shows you — so it earned its keep only as a step on the way here.
+# WHICH SUMMARISER: [summaries.llm] below when it is present, else the ElevenLabs agent. There is
+# no `backend` key. There used to be one, and an "extractive" summariser that truncated, cost
+# nothing, and was the default. It has been DELETED. It never comprehended anything — it handed you
+# the opening of the message it claimed to summarise, which the collapsed row already shows you.
 #
-# Summaries now always come from the conversational agent named in [elevenlabs], asked in TEXT over
-# its own WebSocket with audio generation suppressed. That makes elevenlabs.agent_id and
-# elevenlabs.api_key load-bearing for summaries: WITHOUT THEM THERE IS NO SUMMARISER AT ALL. The
+# Without [summaries.llm], summaries come from the conversational agent named in [elevenlabs],
+# asked in TEXT over its own WebSocket with audio generation suppressed. That makes
+# elevenlabs.agent_id and elevenlabs.api_key load-bearing for summaries: WITHOUT THEM AND WITHOUT
+# [summaries.llm] THERE IS NO SUMMARISER AT ALL. The
 # server still starts, and says so; every summary request then refuses by name, and the /voice page
 # draws those rows RED. It does not fall back to truncation, because a silent fallback is
 # indistinguishable from the agent working badly.
@@ -305,8 +305,8 @@ enabled = true
 # did not get, and generated_in_ms, so a deployment can see what a round trip to the agent actually
 # costs without instrumenting anything.
 #
-# NOTHING IN THE AGENT SUMMARISER HAS BEEN RUN AGAINST LIVE ELEVENLABS, and it is now the only
-# path. The protocol was read out of the vendor's SDK and is exercised offline against this
+# NOTHING IN THE AGENT SUMMARISER HAS BEEN RUN AGAINST LIVE ELEVENLABS, and it is the path when
+# [summaries.llm] is absent. The protocol was read out of the vendor's SDK and is exercised offline against this
 # repository's own mock, which was written from the same reading. The first real conversation is
 # the experiment.
 
@@ -322,6 +322,48 @@ enabled = true
 # max_per_socket = 8            # summaries one conversation serves before it is recycled; min 1
 # socket_idle_seconds = 30      # quiet after which a held conversation is closed
 # reply_timeout_seconds = 30    # ceiling on one turn, and on one opening handshake; min 1
+
+# [summaries.llm] — SUMMARIES AND THREAD NAMES FROM ONE PLAIN MESSAGES API CALL APIECE.
+# No agent harness and NO TOOLS: the request type cannot carry one. Each long message becomes one
+# sentence, and each thread gets a short hyphenated name (chosen once, then kept) and a sentence
+# refreshed at 1, 2, 4 and 8 messages and then every 10. Thread names are made in the background
+# after a thread list is read with the write token, never on the read itself.
+#
+# THE TEXT OF THE MESSAGES BEING SUMMARISED IS SENT TO THE MODEL PROVIDER CONFIGURED HERE.
+#
+# Secrets come ONLY from files (or, for a bearer token, a command's output), read at call time and
+# never logged; `api_key = "..."` inline is refused. Every path must be absolute. Only dialect,
+# model and max_tokens reach the cache key. The full list of keys is in the README's Summaries
+# section. A host that shares this file with another can keep its own [summaries.llm] in an
+# overlay: `--config-overlay /etc/vibe-talk/this-host.toml` (or VIBE_TALK_CONFIG_OVERLAY).
+#
+# The Anthropic API:
+# [summaries.llm]
+# dialect = "anthropic"
+# api_key_file = "/run/secrets/anthropic-api-key"
+# model = "claude-haiku-4-5"         # the default
+# max_tokens = 120                   # output budget per call
+# timeout_secs = 30                  # per call; also how long a summary waits for a slot
+# requests_per_minute = 15           # client-side ceiling, summaries and thread names together
+# burst = 3                          # calls allowed back to back before that pace applies
+#
+# Google Vertex:
+# [summaries.llm]
+# dialect = "vertex"
+# project = "my-gcp-project"
+# region = "global"                  # or "us-east5", ...
+# bearer_token_command = ["gcloud", "auth", "print-access-token"]   # or bearer_token_file = "..."
+#
+# A gateway that speaks the Vertex path and authenticates by client certificate:
+# [summaries.llm]
+# dialect = "vertex"
+# base_url = "https://models.gateway.example/v1"
+# project = "my-project"
+# region = "global"
+# client_identity_file = "/path/to/identity.pem"   # cert chain + key; re-read when it changes
+# ca_bundle_file = "/path/to/private-root.pem"     # if it chains to a private root
+# [summaries.llm.extra_headers]
+# x-calling-product = "vibe-talk"                  # not for secrets
 
 [replay]
 # RESUMING A CONVERSATION ACROSS A HANG-UP. The vendor cannot resume a closed conversation, so

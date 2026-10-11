@@ -417,7 +417,8 @@ Two things are worth knowing before you begin, because they shape everything els
 | Discord read + post behind a trait | **written, unit-tested; never run against live Discord** |
 | In-memory Discord for tests and `--fake-discord` | **works** |
 | Digest (`/digest`) | **works**, extractive and deterministic (no model call). This is the whole-channel digest, not the per-message summary below. |
-| Per-message summaries, from the ElevenLabs agent | **written, unit- and integration-tested offline, NEVER RUN AGAINST LIVE ELEVENLABS — and it is now the only summariser there is.** Asks the configured conversational agent in text over its own WebSocket, on a pooled conversation recycled every eight summaries. The frames were read out of the vendor's SDK; the offline tests drive the real socket client against this repository's own mock, which was written from the same reading, so the two agree with each other and not yet with ElevenLabs. The extractive truncating summariser that used to be the default has been **deleted**, so there is nothing to fall back to: a deployment without ElevenLabs credentials still starts, and shows every long message as a **failed** summary — a red row — instead of handing you its opening lines and calling that a summary. |
+| **Per-message summaries and thread names, from one Messages API call** (`[summaries.llm]`) | **written, tested against a local mock Messages API only; never yet run against a live model provider.** One plain HTTP request per summary or thread name, with no agent harness and no tools, in the Anthropic API's dialect or Google Vertex's. See [Summaries](#summaries). |
+| Per-message summaries, from the ElevenLabs agent | **written, unit- and integration-tested offline, NEVER RUN AGAINST LIVE ELEVENLABS — and it is what runs when `[summaries.llm]` is absent.** Asks the configured conversational agent in text over its own WebSocket, on a pooled conversation recycled every eight summaries. The frames were read out of the vendor's SDK; the offline tests drive the real socket client against this repository's own mock, which was written from the same reading, so the two agree with each other and not yet with ElevenLabs. The extractive truncating summariser that used to be the default has been **deleted**, so there is nothing to fall back to: a deployment without ElevenLabs credentials still starts, and shows every long message as a **failed** summary — a red row — instead of handing you its opening lines and calling that a summary. |
 | Semantic random access (`resolve`) | **works**, lexical ranking behind a `Ranker` trait |
 | Web app: text tab, digest, find-a-message, local speech | **works** |
 | Device speech for the message view's Read control | **prototype.** Uses browser-reported local voices without ElevenLabs credentials. Playback, cancellation, and failures have automated browser coverage; physical-phone audio and background playback remain device checks. |
@@ -1128,6 +1129,169 @@ Four properties are the point of it:
 in-memory fakes, never against live Discord or live ElevenLabs.** The classification is the same
 code path the startup probe uses, which is itself in the same position — see **Known gaps**.
 
+## Summaries
+
+**The problem.** The messages this project exists for are long, and threads pile up faster than
+anyone reads them. On a phone, and above all by ear, you need one line per long message and, for
+each thread, a short name you can find it by and one sentence on where it stands.
+
+**What you get.** With a summariser configured, a long message (over `summaries.threshold_chars`)
+can be collapsed to one plain sentence, and every thread in the thread list gets a **display name**
+such as `runner-wedged` — chosen once and then kept, even as the thread drifts, so you always find
+it under the name you first learned — and a **sentence** that is refreshed as the thread grows, at
+1, 2, 4 and 8 messages and then every 10.
+
+**What it depends on.** A model provider you can reach over HTTPS: the Anthropic API, Google
+Vertex, or a gateway that speaks the Vertex path. Nothing else — no SDK, no plugin, no agent
+framework. The default model is `claude-haiku-4-5`, a small fast model whose name is valid on both.
+
+### Choosing the summariser
+
+* **`[summaries.llm]` present** — summaries and thread names come from **one plain Messages API
+  call apiece**. This is the recommended setup.
+* **absent** — summaries come from the ElevenLabs conversational agent in `[elevenlabs]`, and
+  threads are not named. Without ElevenLabs credentials either, every summary fails visibly
+  (a red row, `503 summarizer_not_configured`) rather than falling back to truncation.
+
+The startup log names the summariser, the dialect and the model, never a credential.
+
+### The Anthropic API
+
+```toml
+[summaries.llm]
+dialect = "anthropic"
+api_key_file = "/run/secrets/anthropic-api-key"   # the key alone, in a file only this server can read
+# model = "claude-haiku-4-5"                       # the default
+```
+
+Sent as `POST https://api.anthropic.com/v1/messages` with `x-api-key` and
+`anthropic-version: 2023-06-01`.
+
+### Google Vertex
+
+```toml
+[summaries.llm]
+dialect = "vertex"
+project = "my-gcp-project"
+region = "global"                                  # or a region such as "us-east5"
+bearer_token_command = ["gcloud", "auth", "print-access-token"]   # run without a shell
+# bearer_token_file = "/run/secrets/vertex-token"  # instead: a token some other process refreshes
+```
+
+Sent as `POST https://aiplatform.googleapis.com/v1/projects/{project}/locations/{region}/publishers/anthropic/models/{model}:rawPredict`
+(or `https://{region}-aiplatform.googleapis.com/v1/...` for a named region), with the model in the
+URL and `"anthropic_version": "vertex-2023-10-16"` in the body. A command's token is reused for five
+minutes and dropped early on a 401. **No `x-api-key` is sent on this dialect** unless you set
+`api_key_file` here yourself.
+
+### A gateway that speaks the Vertex path
+
+Some organisations put models behind an HTTPS gateway that serves the Vertex path and
+authenticates callers by **client certificate**:
+
+```toml
+[summaries.llm]
+dialect = "vertex"
+base_url = "https://models.gateway.example/v1"
+project = "my-project"
+region = "global"
+client_identity_file = "/path/to/identity.pem"     # certificate chain + private key (PKCS#8, RSA or SEC1)
+ca_bundle_file = "/path/to/private-root.pem"       # only if the gateway chains to a private root
+
+[summaries.llm.extra_headers]
+x-calling-product = "vibe-talk"                    # only if the gateway asks callers to identify themselves
+```
+
+The identity file is **re-read whenever its modification time changes**, so a short-lived
+certificate rotated on disk is picked up without a restart. The CA bundle is added to the bundled
+public roots, never instead of them. A gateway's plain-text error, and its error-code header, are
+reported in the failure.
+
+### Every setting
+
+| Setting | Default | Notes |
+|---|---|---|
+| `dialect` | `anthropic` | `anthropic` or `vertex` |
+| `base_url` | per dialect | `https://` only; plain `http://` is accepted for a loopback address (a local mock or sidecar). No credentials, query or fragment |
+| `model` | `summaries.model`, else `claude-haiku-4-5` | letters, digits, `-`, `.`, `_`, `@` |
+| `project`, `region` | — | Vertex only, and required there |
+| `api_key_file` | — | **required for `anthropic`**; on `vertex`, sent only when set |
+| `bearer_token_file` | — | Vertex only; re-read on every call |
+| `bearer_token_command` | — | Vertex only; an argument list, run without a shell, 20-second limit; not with `bearer_token_file` |
+| `client_identity_file` | — | PEM certificate chain and private key; re-read when it changes |
+| `ca_bundle_file` | — | PEM roots to trust in addition to the public ones |
+| `extra_headers` | none | a table of headers sent on every call; **not for secrets**, and the headers this server sets itself (`x-api-key`, `authorization`, `anthropic-version`, `content-type`, …) are refused |
+| `max_tokens` | `120` | output budget per call, `1`–`4096` |
+| `timeout_secs` | `30` | per call, `1`–`600`; also how long a summary waits for a rate-limit slot |
+| `requests_per_minute` | `15` | client-side ceiling across summaries and thread names; at least `1` |
+| `burst` | `3` | calls that may go out back to back before the pace applies; at least `1` |
+
+Every path must be absolute. **Secrets are only ever read from files or a command, at call time,
+and never logged**; writing `api_key` or `bearer_token` inline is refused at startup by name. Only
+`dialect`, `model` and `max_tokens` are part of the summary cache key: changing one re-derives
+every summary and thread name, while rotating a credential or moving an endpoint does not.
+
+### No tools, by construction
+
+Summarising is "here is some text, say what it is", so the request is one system instruction and
+one user turn — and the request type in `src/summarize/messages_api.rs` **has no `tools` or
+`tool_choice` field at all**, so nothing can attach one, and a test asserts the serialized body
+carries neither. Everything another person wrote travels inside the untrusted-content fence, never
+in the instruction. A model offered no tool cannot call one, whatever the channel text asks of it.
+
+### The rate limit
+
+Every call — summaries and thread names alike — goes through one client-side token bucket:
+`burst` at once, then `requests_per_minute`. Calls over the limit **queue**; a summary someone is
+waiting for gives up after `timeout_secs` and says it was rate-limited, and background thread
+naming always leaves one token for such a summary. A `429` from the provider pauses **every**
+caller for its `Retry-After` (at most fifteen minutes) and resumes at the steady pace; a `429`,
+`503` or `529` is tried at most three times in all.
+
+### Thread names
+
+Names are produced **in the background, never on the read path**: a thread-list read by a
+write-scope token queues the threads that are due, and they are named one at a time — read the
+thread's root and newest messages, one call, file the result. A read token is shown names that
+exist but never causes a call. A name produced after a page was read reaches it on its next
+refresh, a forward delta included. A thread whose naming failed is left alone for ten minutes. The
+model must answer a name of two to four lowercase hyphenated words (`[a-z0-9-]`, at most 40
+characters); any other answer fails that naming by name rather than being cut into shape.
+
+Records live in the summary cache, under the same policy version and the same retention: they
+survive a restart, a changed summary policy re-derives them, and a thread quiet for longer than
+`storage.retain_days` is renamed when it wakes. With no `storage.path`, names last for the life of
+the process.
+
+### What leaves this server
+
+**The text of every message being summarised, and of every thread being named, is sent to the
+model provider you configured**, together with its authors' display names. Nothing else is: no
+read state, no tokens, no other channel. Choose the provider accordingly, and leave
+`[summaries.llm]` out where that is not acceptable.
+
+### One config file, two hosts
+
+A configuration file shared between hosts cannot carry one host's credential paths or gateway. Give
+that host an **overlay** instead:
+
+```sh
+vibe-talk --config /etc/vibe-talk/shared.toml --config-overlay /etc/vibe-talk/this-host.toml
+# or
+VIBE_TALK_CONFIG_OVERLAY=/etc/vibe-talk/this-host.toml vibe-talk --config /etc/vibe-talk/shared.toml
+```
+
+where `this-host.toml` holds just the `[summaries.llm]` section. An overlay's tables **merge** into
+the configuration key by key; a key it sets replaces the shared file's, and everything it does not
+mention is left alone. An array is replaced whole, so an overlay that writes `[[channels]]`
+replaces the channel list. `--config-overlay` repeats and applies in order;
+`VIBE_TALK_CONFIG_OVERLAY` takes `:`-separated paths applied after the flags. A named overlay that
+does not exist stops the server; each one in use is named in the startup log.
+
+**Honesty note.** All of this is tested against a local mock Messages API that records what it is
+sent — the URL, every header, and the body — and answers text, plain-text gateway errors, `429`s
+and overloads. It has not yet been run against a live model provider.
+
 ## Configuration
 
 | Setting | File | Environment | Notes |
@@ -1170,8 +1334,9 @@ code path the startup probe uses, which is itself in the same position — see *
 | Summary threshold | `summaries.threshold_chars` | — | below this nothing is summarised, default `400` |
 | Summary width | `summaries.target_chars` | — | default `160` |
 | Summary context | `summaries.context_messages` | — | preceding messages shown as context, default `3` |
-| Summary model | `summaries.model` | `VIBE_TALK_SUMMARY_MODEL` | nothing reads it; it only moves the cache key |
-| Summariser | — | — | **not a setting.** Summaries always come from the ElevenLabs agent in `[elevenlabs]`. `summaries.backend` / `VIBE_TALK_SUMMARY_BACKEND` were removed with the extractive summariser: `extractive` is now refused at startup by name, `elevenlabs_agent` starts with a loud warning that it selects nothing, and anything else is refused as unknown. Delete the line |
+| Summary model | `summaries.model` | `VIBE_TALK_SUMMARY_MODEL` | the model `[summaries.llm]` asks when it names none; the ElevenLabs agent ignores it. Always part of the cache key |
+| Summariser | `[summaries.llm]` | — | present: one Messages API call per summary and thread name, see [Summaries](#summaries); absent: the ElevenLabs agent in `[elevenlabs]`. `summaries.backend` / `VIBE_TALK_SUMMARY_BACKEND` were removed with the extractive summariser: `extractive` is now refused at startup by name, `elevenlabs_agent` starts with a loud warning that it selects nothing, and anything else is refused as unknown. Delete the line |
+| Messages API summariser | `summaries.llm.*` | — | dialect, endpoint, model, credentials **from files only**, timeout and rate limit; every key is in [Summaries](#summaries) |
 | Agent conversation budget | `summaries.max_per_socket` | — | summaries one conversation serves before it is recycled, default `8`, minimum 1 |
 | Agent conversation idle close | `summaries.socket_idle_seconds` | — | default `30` |
 | Agent turn deadline | `summaries.reply_timeout_seconds` | — | one turn, and one opening handshake, default `30`, minimum 1 |
@@ -1179,6 +1344,7 @@ code path the startup probe uses, which is itself in the same position — see *
 | Replay budget | `replay.max_chars` / `replay.max_turns` | `VIBE_TALK_REPLAY_MAX_CHARS` / `_TURNS` | default `6000` / `40`; oldest dropped first; `0` is refused, not "unlimited" |
 | Replay transport | `replay.transport` | `VIBE_TALK_REPLAY_TRANSPORT` | `contextual_update` (default) or `client_data` |
 | Config file path | — | `VIBE_TALK_CONFIG` | or `--config` |
+| Config overlays | — | `VIBE_TALK_CONFIG_OVERLAY` | or `--config-overlay`, repeatable; TOML laid over the config file table by table, see [One config file, two hosts](#one-config-file-two-hosts) |
 
 Environment wins over file. An empty environment variable is treated as unset, so a runtime that
 renders unset variables as `""` cannot blank out a configured value. An unknown key in the file is
@@ -1555,11 +1721,11 @@ plus Discord text written by third parties.
 
 ### Cached summaries
 
-`src/summarize/` is a second trait over the same store. **One** implementation ships — the
-conversational agent named in `[elevenlabs]`, asked in text — and there is no setting that chooses
-it, because there is nothing to choose between. The server says what is running at startup, and
-every summary answer carries the summariser's name, so a page can never imply a model summary it
-did not get.
+`src/summarize/` is a second trait over the same store. **Two** implementations ship: one plain
+Messages API call per summary when `[summaries.llm]` is configured (see [Summaries](#summaries)),
+and otherwise the conversational agent named in `[elevenlabs]`, asked in text. The server says what
+is running at startup, and every summary answer carries the summariser's name, so a page can never
+imply a model summary it did not get.
 
 There used to be a second one, `extractive`, and it was the default: truncation, no model, no
 network, no cost. It has been **deleted**. It never comprehended anything — what it returned was
@@ -1574,8 +1740,9 @@ therefore sitting in live configuration files — still boots, with a loud warni
 dead and should be deleted; refusing it would stop those servers for no behavioural gain, since it
 names exactly what they now get anyway. Anything else is refused as unknown.
 
-The consequence is worth stating plainly rather than leaving to be found: **the ElevenLabs
-credentials are now load-bearing for summaries.** Without them there is no summariser at all. The
+The consequence is worth stating plainly rather than leaving to be found: **without
+`[summaries.llm]`, the ElevenLabs credentials are load-bearing for summaries.** Without either there
+is no summariser at all. The
 server still starts and says so; `/summary` then answers `503 summarizer_not_configured`, and
 `/voice` states the reason once above the list and turns the rows it asked about red. It does not
 fall back to truncation, because a silent fallback is indistinguishable from the agent answering

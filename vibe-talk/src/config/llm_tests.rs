@@ -334,3 +334,53 @@ fn layered_loading_reads_the_overlay_files_from_disk() {
         Err(ConfigError::Read { .. })
     ));
 }
+
+/// Every `[summaries.llm]` example an operator might copy, from the README's Summaries section and
+/// from the shipped example file, uncommented.
+fn documented_examples() -> Vec<String> {
+    let mut examples = Vec::new();
+    let readme = include_str!("../../README.md");
+    let section = readme
+        .split("\n## Summaries\n")
+        .nth(1)
+        .and_then(|rest| rest.split("\n## ").next())
+        .expect("the README has a Summaries section");
+    let mut fenced = section.split("```toml\n").skip(1);
+    for block in fenced.by_ref() {
+        examples.push(block.split("```").next().unwrap_or_default().to_owned());
+    }
+    let example = include_str!("../../vibe-talk.example.toml");
+    let mut current: Option<String> = None;
+    for line in example.lines() {
+        let uncommented = line.strip_prefix("# ").or_else(|| line.strip_prefix('#'));
+        match (&mut current, uncommented) {
+            (None, Some(text)) if text.trim() == "[summaries.llm]" => {
+                current = Some(format!("{text}\n"));
+            }
+            (Some(block), Some(text)) if !text.trim().is_empty() => {
+                if text.starts_with('[') || text.contains(" = ") {
+                    block.push_str(text);
+                    block.push('\n');
+                }
+            }
+            (Some(_), _) => examples.extend(current.take()),
+            _ => {}
+        }
+    }
+    examples.extend(current);
+    examples
+}
+
+#[test]
+fn every_documented_example_is_one_this_server_would_accept() {
+    let examples = documented_examples();
+    assert!(
+        examples.len() >= 6,
+        "the README and the example file document at least six sections; found {}: {examples:#?}",
+        examples.len()
+    );
+    for example in examples {
+        let cfg = load(&example).unwrap_or_else(|error| panic!("{error}\n{example}"));
+        assert!(cfg.summaries.llm.is_some(), "{example}");
+    }
+}
