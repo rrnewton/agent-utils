@@ -1318,7 +1318,10 @@ exist stops the server; each one in use is named in the startup log.
 
 **Honesty note.** All of this is tested against a local mock Messages API that records what it is
 sent — the URL, every header, and the body — and answers text, plain-text gateway errors, `429`s
-and overloads. It has not yet been run against a live model provider.
+and overloads. The client certificate is tested in a real TLS handshake against a loopback server
+that requires one: the configured identity is the one presented, a rotated one is presented after
+it changes on disk, and a client without one is refused. It has not yet been run against a live
+model provider or a real gateway.
 
 ## Configuration
 

@@ -599,8 +599,25 @@ fn pem(label: &str, bytes: &[u8]) -> String {
     )
 }
 
+/// A fresh key and a self-signed certificate for it.
+struct Throwaway {
+    /// The certificate, then the key, as one PEM: what `client_identity_file` holds.
+    pem: String,
+    /// The certificate, DER.
+    certificate: Vec<u8>,
+    /// The key, PKCS#8 DER.
+    pkcs8: Vec<u8>,
+}
+
 /// A fresh key and a self-signed certificate for it, as one PEM: the certificate, then the key.
 fn throwaway_identity(common_name: &str) -> (String, Vec<u8>) {
+    let made = throwaway(common_name, None);
+    (made.pem, made.certificate)
+}
+
+/// A fresh key and a self-signed certificate, with `ip` as its one subject alternative name when
+/// given: what a TLS server needs for a client to accept it at that address.
+fn throwaway(common_name: &str, ip: Option<[u8; 4]>) -> Throwaway {
     use ring::rand::SystemRandom;
     use ring::signature::{EcdsaKeyPair, KeyPair as _, ECDSA_P256_SHA256_ASN1_SIGNING};
 
@@ -608,6 +625,7 @@ fn throwaway_identity(common_name: &str) -> (String, Vec<u8>) {
     const EC_PUBLIC_KEY: &[u8] = &[0x2a, 0x86, 0x48, 0xce, 0x3d, 0x02, 0x01];
     const PRIME256V1: &[u8] = &[0x2a, 0x86, 0x48, 0xce, 0x3d, 0x03, 0x01, 0x07];
     const COMMON_NAME: &[u8] = &[0x55, 0x04, 0x03];
+    const SUBJECT_ALT_NAME: &[u8] = &[0x55, 0x1d, 0x11];
 
     let rng = SystemRandom::new();
     let pkcs8 = EcdsaKeyPair::generate_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, &rng).unwrap();
@@ -623,7 +641,7 @@ fn throwaway_identity(common_name: &str) -> (String, Vec<u8>) {
         sequence(&[der(0x06, EC_PUBLIC_KEY), der(0x06, PRIME256V1)]),
         der(0x03, &[&[0_u8][..], public].concat()),
     ]);
-    let tbs = sequence(&[
+    let mut tbs = vec![
         der(0xa0, &der(0x02, &[2])),
         der(0x02, &[0x01]),
         algorithm.clone(),
@@ -631,21 +649,33 @@ fn throwaway_identity(common_name: &str) -> (String, Vec<u8>) {
         sequence(&[der(0x17, b"250101000000Z"), der(0x17, b"491231235959Z")]),
         name,
         spki,
-    ]);
+    ];
+    if let Some(ip) = ip {
+        // [3] { Extension { subjectAltName, OCTET STRING { GeneralNames { [7] iPAddress } } } }
+        tbs.push(der(
+            0xa3,
+            &sequence(&[sequence(&[
+                der(0x06, SUBJECT_ALT_NAME),
+                der(0x04, &sequence(&[der(0x87, &ip)])),
+            ])]),
+        ));
+    }
+    let tbs = sequence(&tbs);
     let signature = pair.sign(&rng, &tbs).unwrap();
     let certificate = sequence(&[
         tbs,
         algorithm,
         der(0x03, &[&[0_u8][..], signature.as_ref()].concat()),
     ]);
-    (
-        format!(
+    Throwaway {
+        pem: format!(
             "{}{}",
             pem("CERTIFICATE", &certificate),
             pem("PRIVATE KEY", pkcs8.as_ref())
         ),
         certificate,
-    )
+        pkcs8: pkcs8.as_ref().to_vec(),
+    }
 }
 
 fn set_mtime(path: &std::path::Path, seconds: u64) {
@@ -748,4 +778,230 @@ async fn a_ca_bundle_is_added_and_an_empty_one_is_refused() {
             .expect_err("an empty bundle trusts nothing extra"),
         SummaryError::NotConfigured("summaries.llm.ca_bundle_file")
     ));
+}
+
+// --- a real handshake ---------------------------------------------------------------------------
+//
+// The tests above count client rebuilds; this one proves what a gateway would see. A loopback TLS
+// server REQUIRES a client certificate, checks the client's handshake signature against it (so the
+// key really is the certificate's), records which certificate it was shown, and answers one
+// Messages API reply per connection.
+
+mod handshake {
+    use std::sync::{Arc, Mutex};
+
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+    use tokio_rustls::rustls;
+    use tokio_rustls::rustls::client::danger::HandshakeSignatureValid;
+    use tokio_rustls::rustls::crypto::CryptoProvider;
+    use tokio_rustls::rustls::pki_types::{
+        CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, UnixTime,
+    };
+    use tokio_rustls::rustls::server::danger::{ClientCertVerified, ClientCertVerifier};
+    use tokio_rustls::rustls::{DigitallySignedStruct, DistinguishedName, SignatureScheme};
+
+    /// Accepts any client certificate whose holder can sign with its key, and remembers it.
+    #[derive(Debug)]
+    struct Recording {
+        seen: Arc<Mutex<Vec<Vec<u8>>>>,
+        provider: Arc<CryptoProvider>,
+    }
+
+    impl ClientCertVerifier for Recording {
+        fn root_hint_subjects(&self) -> &[DistinguishedName] {
+            &[]
+        }
+
+        fn verify_client_cert(
+            &self,
+            end_entity: &CertificateDer<'_>,
+            _intermediates: &[CertificateDer<'_>],
+            _now: UnixTime,
+        ) -> Result<ClientCertVerified, rustls::Error> {
+            self.seen.lock().unwrap().push(end_entity.as_ref().to_vec());
+            Ok(ClientCertVerified::assertion())
+        }
+
+        fn verify_tls12_signature(
+            &self,
+            message: &[u8],
+            cert: &CertificateDer<'_>,
+            dss: &DigitallySignedStruct,
+        ) -> Result<HandshakeSignatureValid, rustls::Error> {
+            rustls::crypto::verify_tls12_signature(
+                message,
+                cert,
+                dss,
+                &self.provider.signature_verification_algorithms,
+            )
+        }
+
+        fn verify_tls13_signature(
+            &self,
+            message: &[u8],
+            cert: &CertificateDer<'_>,
+            dss: &DigitallySignedStruct,
+        ) -> Result<HandshakeSignatureValid, rustls::Error> {
+            rustls::crypto::verify_tls13_signature(
+                message,
+                cert,
+                dss,
+                &self.provider.signature_verification_algorithms,
+            )
+        }
+
+        fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+            self.provider
+                .signature_verification_algorithms
+                .supported_schemes()
+        }
+    }
+
+    /// A loopback HTTPS server that requires a client certificate.
+    pub(super) struct Gateway {
+        pub(super) base_url: String,
+        seen: Arc<Mutex<Vec<Vec<u8>>>>,
+    }
+
+    impl Gateway {
+        pub(super) async fn start(certificate: Vec<u8>, pkcs8: Vec<u8>) -> Self {
+            let provider = Arc::new(rustls::crypto::ring::default_provider());
+            let seen = Arc::new(Mutex::new(Vec::new()));
+            let config = rustls::ServerConfig::builder_with_provider(Arc::clone(&provider))
+                .with_safe_default_protocol_versions()
+                .expect("protocol versions")
+                .with_client_cert_verifier(Arc::new(Recording {
+                    seen: Arc::clone(&seen),
+                    provider,
+                }))
+                .with_single_cert(
+                    vec![CertificateDer::from(certificate)],
+                    PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(pkcs8)),
+                )
+                .expect("the server identity");
+            let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(config));
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("a loopback port");
+            let base_url = format!("https://{}", listener.local_addr().unwrap());
+            tokio::spawn(async move {
+                loop {
+                    let Ok((socket, _)) = listener.accept().await else {
+                        return;
+                    };
+                    let acceptor = acceptor.clone();
+                    tokio::spawn(async move {
+                        // A refused handshake is the point of one test: it just ends here.
+                        let Ok(mut tls) = acceptor.accept(socket).await else {
+                            return;
+                        };
+                        let mut request = Vec::new();
+                        let mut chunk = [0_u8; 4096];
+                        let body_from = loop {
+                            let Ok(read) = tls.read(&mut chunk).await else {
+                                return;
+                            };
+                            if read == 0 {
+                                return;
+                            }
+                            request.extend_from_slice(&chunk[..read]);
+                            if let Some(at) =
+                                request.windows(4).position(|window| window == b"\r\n\r\n")
+                            {
+                                break at + 4;
+                            }
+                        };
+                        let head = String::from_utf8_lossy(&request[..body_from]).to_lowercase();
+                        let length: usize = head
+                            .lines()
+                            .find_map(|line| line.strip_prefix("content-length:"))
+                            .and_then(|value| value.trim().parse().ok())
+                            .unwrap_or(0);
+                        while request.len() < body_from + length {
+                            match tls.read(&mut chunk).await {
+                                Ok(0) | Err(_) => return,
+                                Ok(read) => request.extend_from_slice(&chunk[..read]),
+                            }
+                        }
+                        let body = serde_json::json!({
+                            "content": [{"type": "text", "text": "Answered over mutual TLS."}],
+                            "stop_reason": "end_turn"
+                        })
+                        .to_string();
+                        let response = format!(
+                            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\n\
+                             content-length: {}\r\nconnection: close\r\n\r\n{body}",
+                            body.len()
+                        );
+                        let _ = tls.write_all(response.as_bytes()).await;
+                        let _ = tls.shutdown().await;
+                    });
+                }
+            });
+            Self { base_url, seen }
+        }
+
+        /// Every client certificate shown so far, oldest first.
+        pub(super) fn seen(&self) -> Vec<Vec<u8>> {
+            self.seen.lock().unwrap().clone()
+        }
+    }
+}
+
+#[tokio::test]
+async fn the_client_identity_is_presented_in_a_real_handshake_and_a_rotated_one_after_it() {
+    let files = Files::new("llm-mtls");
+    let server = throwaway("127.0.0.1", Some([127, 0, 0, 1]));
+    let gateway = handshake::Gateway::start(server.certificate.clone(), server.pkcs8).await;
+    let ca = files.write("gateway-root.pem", &pem("CERTIFICATE", &server.certificate));
+    let first = throwaway("vibe-talk client one", None);
+    let identity = files.write("identity.pem", &first.pem);
+    set_mtime(&identity, 1_700_000_000);
+    let config = LlmConfig {
+        dialect: LlmDialect::Vertex,
+        base_url: gateway.base_url.clone(),
+        project: Some("example-project".to_owned()),
+        region: Some("global".to_owned()),
+        api_key_file: None,
+        client_identity_file: Some(identity.clone()),
+        ca_bundle_file: Some(ca.clone()),
+        ..crate::summarize::tests::llm()
+    };
+
+    // The control: the gateway really does refuse a client with no certificate, so what follows
+    // is not passing against a server that never asked.
+    let anonymous = MessagesApiSummarizer::new(LlmConfig {
+        client_identity_file: None,
+        ..config.clone()
+    });
+    let refused = summarise(&anonymous, "x")
+        .await
+        .expect_err("no client certificate, no answer");
+    assert!(matches!(refused, SummaryError::Transport(_)), "{refused:?}");
+    assert!(gateway.seen().is_empty());
+
+    let under = MessagesApiSummarizer::new(config);
+    let summary = summarise(&under, "a wall of text")
+        .await
+        .expect("answers over mutual TLS");
+    assert_eq!(summary, "Answered over mutual TLS.");
+    assert_eq!(
+        gateway.seen().last(),
+        Some(&first.certificate),
+        "the gateway was not shown the configured identity"
+    );
+
+    // Rotated on disk under the running summariser: the NEXT handshake presents the new one.
+    let second = throwaway("vibe-talk client two", None);
+    std::fs::write(&identity, &second.pem).unwrap();
+    set_mtime(&identity, 1_700_000_600);
+    summarise(&under, "another wall of text")
+        .await
+        .expect("answers with the rotated identity");
+    assert_ne!(first.certificate, second.certificate);
+    assert_eq!(
+        gateway.seen().last(),
+        Some(&second.certificate),
+        "the rotated identity was loaded but not presented"
+    );
 }
