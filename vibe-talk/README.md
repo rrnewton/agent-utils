@@ -1213,7 +1213,7 @@ reported in the failure.
 |---|---|---|
 | `dialect` | `anthropic` | `anthropic` or `vertex` |
 | `base_url` | per dialect | `https://` only; plain `http://` is accepted for a loopback address (a local mock or sidecar). No credentials, query or fragment |
-| `model` | `summaries.model`, else `claude-haiku-4-5` | letters, digits, `-`, `.`, `_`, `@` |
+| `model` | `claude-haiku-4-5` | letters, digits, `-`, `.`, `_`, `@`. Never taken from `summaries.model` |
 | `project`, `region` | — | Vertex only, and required there |
 | `api_key_file` | — | **required for `anthropic`**; on `vertex`, sent only when set |
 | `bearer_token_file` | — | Vertex only; re-read on every call |
@@ -1290,9 +1290,18 @@ VIBE_TALK_CONFIG_OVERLAY=/etc/vibe-talk/this-host.toml vibe-talk --config /etc/v
 where `this-host.toml` holds just the `[summaries.llm]` section. An overlay's tables **merge** into
 the configuration key by key; a key it sets replaces the shared file's, and everything it does not
 mention is left alone. An array is replaced whole, so an overlay that writes `[[channels]]`
-replaces the channel list. `--config-overlay` repeats and applies in order;
-`VIBE_TALK_CONFIG_OVERLAY` takes `:`-separated paths applied after the flags. A named overlay that
-does not exist stops the server; each one in use is named in the startup log.
+replaces the channel list.
+
+**`[summaries.llm]` is replaced whole, not merged.** An overlay that names it carries the complete
+section and inherits nothing from the shared file's. That is deliberate: a host moving from the
+shared file's `dialect = "anthropic"` to its own Vertex gateway must not inherit the shared
+`api_key_file`, or the Anthropic key would be sent as `x-api-key` to the gateway. A partial section
+in an overlay is checked on its own and refused by name if it cannot stand alone.
+
+`--config-overlay` repeats and applies in order; `VIBE_TALK_CONFIG_OVERLAY` takes `:`-separated
+paths applied after the flags. Every file is checked on its own before anything is merged, so a
+mistake is reported against the file that has it, at its own line. A named overlay that does not
+exist stops the server; each one in use is named in the startup log.
 
 **Honesty note.** All of this is tested against a local mock Messages API that records what it is
 sent — the URL, every header, and the body — and answers text, plain-text gateway errors, `429`s
@@ -1340,7 +1349,7 @@ and overloads. It has not yet been run against a live model provider.
 | Summary threshold | `summaries.threshold_chars` | — | below this nothing is summarised, default `400` |
 | Summary width | `summaries.target_chars` | — | default `160` |
 | Summary context | `summaries.context_messages` | — | preceding messages shown as context, default `3` |
-| Summary model | `summaries.model` | `VIBE_TALK_SUMMARY_MODEL` | the model `[summaries.llm]` asks when it names none; the ElevenLabs agent ignores it. Always part of the cache key |
+| Summary model | `summaries.model` | `VIBE_TALK_SUMMARY_MODEL` | nothing reads it (`[summaries.llm]` names its own `model`); it only moves the cache key |
 | Summariser | `[summaries.llm]` | — | present: one Messages API call per summary and thread name, see [Summaries](#summaries); absent: the ElevenLabs agent in `[elevenlabs]`. `summaries.backend` / `VIBE_TALK_SUMMARY_BACKEND` were removed with the extractive summariser: `extractive` is now refused at startup by name, `elevenlabs_agent` starts with a loud warning that it selects nothing, and anything else is refused as unknown. Delete the line |
 | Messages API summariser | `summaries.llm.*` | — | dialect, endpoint, model, credentials **from files only**, timeout and rate limit; every key is in [Summaries](#summaries) |
 | Agent conversation budget | `summaries.max_per_socket` | — | summaries one conversation serves before it is recycled, default `8`, minimum 1 |

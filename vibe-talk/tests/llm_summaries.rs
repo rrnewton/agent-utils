@@ -157,6 +157,77 @@ async fn a_configured_llm_section_is_the_summariser_the_summary_route_uses() {
     assert_eq!(mock.seen.lock().unwrap().len(), 1);
 }
 
+#[tokio::test]
+async fn a_host_overlay_moving_to_vertex_sends_none_of_the_shared_files_key() {
+    // The two-host case end to end: the SHARED file says anthropic with a real key file, and this
+    // host's overlay moves to a Vertex gateway (here, the local mock) with its own token. Nothing
+    // of the shared section may reach the gateway, the Anthropic key above all.
+    let (mock, base) = model_mock().await;
+    let dir = testing::TempDir::new("llm-overlay-vertex");
+    let shared_key = dir.path().join("anthropic-key");
+    std::fs::write(&shared_key, "sk-shared-anthropic-key\n").unwrap();
+    let token = dir.path().join("vertex-token");
+    std::fs::write(&token, "vertex-bearer-token\n").unwrap();
+    let shared = dir.path().join("shared.toml");
+    std::fs::write(
+        &shared,
+        format!(
+            "{}\n[summaries.llm]\ndialect = \"anthropic\"\napi_key_file = \"{}\"\n",
+            testing::config_toml_without_elevenlabs(),
+            shared_key.display()
+        ),
+    )
+    .unwrap();
+    let overlay = dir.path().join("this-host.toml");
+    std::fs::write(
+        &overlay,
+        format!(
+            "[summaries.llm]\ndialect = \"vertex\"\nbase_url = \"{base}\"\nproject = \"my-project\"\n\
+             region = \"global\"\nbearer_token_file = \"{}\"\n",
+            token.display()
+        ),
+    )
+    .unwrap();
+    let config =
+        vibe_talk::config::Config::load_layered(Some(&shared), std::slice::from_ref(&overlay))
+            .expect("valid layered configuration");
+    let llm = config.summaries.llm.clone().expect("the overlay's section");
+    assert_eq!(llm.api_key_file, None, "the shared key file was inherited");
+    let summarizer = vibe_talk::summarize::summarizer_for(
+        &config.elevenlabs,
+        &config.summaries,
+        Arc::new(vibe_talk::elevenlabs::fake::FakeElevenLabs::new()),
+    );
+    let target = message("1", &"A long message about the runner pool. ".repeat(20));
+    summarizer
+        .summarize(&vibe_talk::summarize::SummaryRequest::new(
+            &target,
+            &[],
+            160,
+        ))
+        .await
+        .expect("the gateway answers");
+
+    let seen = mock.seen.lock().unwrap().clone();
+    assert_eq!(seen.len(), 1);
+    let (path, headers, _) = &seen[0];
+    assert!(
+        path.ends_with("/projects/my-project/locations/global/publishers/anthropic/models/claude-haiku-4-5:rawPredict"),
+        "{path}"
+    );
+    assert!(
+        headers.get("x-api-key").is_none(),
+        "the shared file's Anthropic key went to the vertex gateway: {headers:?}"
+    );
+    assert_eq!(headers["authorization"], "Bearer vertex-bearer-token");
+    for value in headers.values() {
+        assert!(
+            !value.to_str().unwrap_or_default().contains("sk-shared"),
+            "{headers:?}"
+        );
+    }
+}
+
 // --- thread names -------------------------------------------------------------------------------
 
 /// A provider with two threads whose reply counts a test can move.

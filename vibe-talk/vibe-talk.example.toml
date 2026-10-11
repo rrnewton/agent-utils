@@ -279,10 +279,12 @@ enabled = true
 # target_chars = 160
 # context_messages = 3        # how many preceding messages ride along as context
 #
-# The model [summaries.llm] asks when it names none of its own. The ElevenLabs agent ignores it
-# (it runs whatever model the agent is configured with). Folded into the cache key either way.
+# The model to ask. NOTE: nothing reads this — the ElevenLabs agent runs whichever model it is
+# configured with, and [summaries.llm] below names its own `model` and never falls back to this
+# one — so today it does exactly one thing: it is folded into the cache key, so setting it
+# invalidates every summary produced without it.
 # Environment: VIBE_TALK_SUMMARY_MODEL
-# model = "claude-haiku-4-5"
+# model = "..."
 
 # WHICH SUMMARISER: [summaries.llm] below when it is present, else the ElevenLabs agent. There is
 # no `backend` key. There used to be one, and an "extractive" summariser that truncated, cost
@@ -335,7 +337,9 @@ enabled = true
 # never logged; `api_key = "..."` inline is refused. Every path must be absolute. Only dialect,
 # model and max_tokens reach the cache key. The full list of keys is in the README's Summaries
 # section. A host that shares this file with another can keep its own [summaries.llm] in an
-# overlay: `--config-overlay /etc/vibe-talk/this-host.toml` (or VIBE_TALK_CONFIG_OVERLAY).
+# overlay: `--config-overlay /etc/vibe-talk/this-host.toml` (or VIBE_TALK_CONFIG_OVERLAY). An
+# overlay that names [summaries.llm] REPLACES this section whole — nothing here, a key file
+# included, is inherited — so write the complete section there.
 #
 # The Anthropic API:
 # [summaries.llm]
@@ -343,7 +347,7 @@ enabled = true
 # api_key_file = "/run/secrets/anthropic-api-key"
 # model = "claude-haiku-4-5"         # the default
 # max_tokens = 120                   # output budget per call
-# timeout_secs = 30                  # per call; also how long a summary waits for a slot
+# timeout_secs = 30                  # per request; also how long, in all, a summary waits for slots
 # requests_per_minute = 15           # client-side ceiling, summaries and thread names together
 # burst = 3                          # calls allowed back to back before that pace applies
 #

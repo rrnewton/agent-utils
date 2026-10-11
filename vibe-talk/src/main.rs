@@ -38,8 +38,10 @@ OPTIONS:
                           [summaries.llm]). Repeatable; applied in order. Its tables MERGE into the
                           configuration key by key; a key or an array it sets replaces the base's,
                           so an overlay that writes [[channels]] replaces the whole channel list.
-                          Also settable as VIBE_TALK_CONFIG_OVERLAY=PATH[:PATH...], applied after
-                          the flags. A named overlay must exist.
+                          [summaries.llm] is replaced WHOLE: an overlay naming it inherits none of
+                          the base's keys, a key file included. Also settable as
+                          VIBE_TALK_CONFIG_OVERLAY=PATH[:PATH...], applied after the flags. A named
+                          overlay must exist.
     --fake-discord        run against an in-memory Discord with seeded messages, for local
                           development
     --skip-startup-probe  do not check at startup that each configured channel is readable.

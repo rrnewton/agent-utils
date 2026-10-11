@@ -1333,17 +1333,11 @@ fn summaries_config(
     if let Some(raw) = backend_from_env {
         deprecated_backend(raw)?;
     }
-    let llm = file
-        .llm
-        .map(|llm| {
-            llm_config(
-                llm,
-                model_from_env
-                    .map(str::to_owned)
-                    .or_else(|| file.model.clone()),
-            )
-        })
-        .transpose()?;
+    // `summaries.model` is NOT a fallback for `summaries.llm.model`. It was documented for a long
+    // time as read by nothing, so a deployment may still hold a value from an older summariser
+    // that no Messages API provider knows; inheriting it would fail every call. The section names
+    // its own model or takes the default.
+    let llm = file.llm.map(llm_config).transpose()?;
     let summaries = SummariesConfig {
         threshold_chars: file.threshold_chars.unwrap_or(defaults.threshold_chars),
         target_chars: file.target_chars.unwrap_or(defaults.target_chars),
@@ -1414,10 +1408,7 @@ const RESERVED_LLM_HEADERS: &[&str] = &[
 ];
 
 /// Resolve `[summaries.llm]`. `#233 llm-summarizer`.
-///
-/// `fallback_model` is `summaries.model` (or `VIBE_TALK_SUMMARY_MODEL`), used when this section
-/// names no model of its own.
-fn llm_config(file: FileLlm, fallback_model: Option<String>) -> Result<LlmConfig, ConfigError> {
+fn llm_config(file: FileLlm) -> Result<LlmConfig, ConfigError> {
     let invalid = |field: &str, detail: String| ConfigError::Invalid {
         field: format!("summaries.llm.{field}"),
         detail,
@@ -1442,9 +1433,7 @@ fn llm_config(file: FileLlm, fallback_model: Option<String>) -> Result<LlmConfig
     }
     let dialect = file.dialect.unwrap_or(LlmDialect::Anthropic);
     let text = |value: Option<String>| value.map(|v| v.trim().to_owned()).filter(|v| !v.is_empty());
-    let model = text(file.model)
-        .or_else(|| text(fallback_model))
-        .unwrap_or_else(|| DEFAULT_LLM_MODEL.to_owned());
+    let model = text(file.model).unwrap_or_else(|| DEFAULT_LLM_MODEL.to_owned());
     // Each of these is spliced into a URL path on the Vertex dialect, so each is held to the
     // characters its real values use. Anything else is a typo at best and a path injection at worst.
     let identifier = |field: &str, value: &str, extra: &str| -> Result<(), ConfigError> {
@@ -1675,6 +1664,15 @@ mod llm_tests;
 /// `--config-overlay` flags. See [`merge_overlays`].
 pub const ENV_CONFIG_OVERLAY: &str = "VIBE_TALK_CONFIG_OVERLAY";
 
+/// Tables an overlay REPLACES whole instead of merging into, as paths from the document root.
+///
+/// `[summaries.llm]` is one because its keys only make sense together: a host that moves from the
+/// shared file's `dialect = "anthropic"` to its own Vertex gateway must not inherit the shared
+/// file's `api_key_file`, or that key would be sent as `x-api-key` to a gateway it was never
+/// meant for. A merge has no way to say "and drop that key", so the section is taken from the
+/// last layer that names it, exactly as written there.
+pub const OVERLAY_REPLACES_WHOLE: &[&[&str]] = &[&["summaries", "llm"]];
+
 /// Lay overlay TOML documents over a base document, table by table, and return the merged text.
 ///
 /// The problem it solves: one configuration file shared by two hosts, where one host needs its own
@@ -1682,23 +1680,31 @@ pub const ENV_CONFIG_OVERLAY: &str = "VIBE_TALK_CONFIG_OVERLAY";
 /// file. Each overlay is a TOML document whose tables MERGE into the base: a key it sets replaces
 /// the base's value, a table it names is merged key by key, and everything it does not mention is
 /// left as the base has it. An ARRAY is a value like any other and is replaced whole, so an
-/// overlay that writes `[[channels]]` replaces the channel list rather than appending to it.
+/// overlay that writes `[[channels]]` replaces the channel list rather than appending to it. A
+/// table in [`OVERLAY_REPLACES_WHOLE`] — `[summaries.llm]` — is replaced whole too: an overlay that
+/// names it carries the whole section.
 ///
-/// Overlays apply in order, each over the result of the last. Each is parsed on its own first, so
-/// a syntax error is reported against the file that has it.
+/// Overlays apply in order, each over the result of the last. Every document is parsed AND checked
+/// against the configuration's shape on its own first, so a syntax error, a mistyped value or an
+/// unknown key is reported against the file that has it, at its own line and column, rather than
+/// against the merged text, which nobody has seen.
 ///
 /// # Errors
 ///
-/// [`ConfigError::Parse`] when any document does not parse; [`ConfigError::Invalid`] when the
-/// merged document cannot be written back out.
+/// [`ConfigError::Parse`] when the base does not parse or does not fit the configuration's shape;
+/// [`ConfigError::Invalid`] naming the overlay when one does not, or when the merged document
+/// cannot be written back out.
 pub fn merge_overlays(base: &str, overlays: &[(String, String)]) -> Result<String, ConfigError> {
+    toml::from_str::<FileConfig>(base)?;
     let mut merged: toml::Table = toml::from_str(base)?;
     for (label, text) in overlays {
-        let overlay: toml::Table = toml::from_str(text).map_err(|error| ConfigError::Invalid {
+        let refuse = |error: toml::de::Error| ConfigError::Invalid {
             field: format!("configuration overlay {label}"),
             detail: format!("did not parse: {error}"),
-        })?;
-        merge_table(&mut merged, overlay);
+        };
+        toml::from_str::<FileConfig>(text).map_err(refuse)?;
+        let overlay: toml::Table = toml::from_str(text).map_err(refuse)?;
+        merge_table(&mut merged, overlay, &mut Vec::new());
     }
     toml::to_string(&merged).map_err(|error| ConfigError::Invalid {
         field: "configuration overlay".to_owned(),
@@ -1706,14 +1712,21 @@ pub fn merge_overlays(base: &str, overlays: &[(String, String)]) -> Result<Strin
     })
 }
 
-fn merge_table(base: &mut toml::Table, overlay: toml::Table) {
+fn merge_table(base: &mut toml::Table, overlay: toml::Table, path: &mut Vec<String>) {
     for (key, value) in overlay {
+        path.push(key.clone());
+        let whole = OVERLAY_REPLACES_WHOLE
+            .iter()
+            .any(|table| table.iter().copied().eq(path.iter().map(String::as_str)));
         match (base.get_mut(&key), value) {
-            (Some(toml::Value::Table(into)), toml::Value::Table(from)) => merge_table(into, from),
+            (Some(toml::Value::Table(into)), toml::Value::Table(from)) if !whole => {
+                merge_table(into, from, path);
+            }
             (_, value) => {
                 base.insert(key, value);
             }
         }
+        path.pop();
     }
 }
 

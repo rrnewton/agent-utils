@@ -221,7 +221,9 @@ fn settings_that_cannot_work_together_or_at_all_are_refused() {
 }
 
 #[test]
-fn the_model_falls_back_to_the_summaries_model_and_its_environment_override() {
+fn the_section_names_its_own_model_and_never_inherits_the_summaries_model() {
+    // `summaries.model` was long documented as read by nothing, so it may hold a value from an
+    // older summariser that no Messages API provider knows. Inheriting it would fail every call.
     let text = format!(
         "{BASE}\n[summaries.llm]\napi_key_file = \"/k\"\n",
         BASE = BASE.replace(
@@ -230,11 +232,11 @@ fn the_model_falls_back_to_the_summaries_model_and_its_environment_override() {
         )
     );
     let cfg = Config::from_toml_and_env(&text, &BTreeMap::new()).expect("valid");
-    assert_eq!(cfg.summaries.llm.expect("read").model, "from-file");
+    assert_eq!(cfg.summaries.llm.expect("read").model, DEFAULT_LLM_MODEL);
     let env = BTreeMap::from([(ENV_SUMMARY_MODEL.to_owned(), "from-env".to_owned())]);
     let cfg = Config::from_toml_and_env(&text, &env).expect("valid");
-    assert_eq!(cfg.summaries.llm.expect("read").model, "from-env");
-    // The section's own model wins over both.
+    assert_eq!(cfg.summaries.llm.expect("read").model, DEFAULT_LLM_MODEL);
+    // The section's own model is the one used.
     let own = text.replace(
         "api_key_file = \"/k\"",
         "api_key_file = \"/k\"\nmodel = \"own\"",
@@ -331,4 +333,121 @@ fn layered_loading_reads_the_overlay_files_from_disk() {
         Config::load_layered(Some(&base), &[missing]),
         Err(ConfigError::Read { .. })
     ));
+}
+
+#[test]
+fn an_overlay_that_names_the_llm_section_replaces_it_whole_and_inherits_no_key() {
+    // The two-host case the overlay exists for: the shared file says anthropic with a key file,
+    // and this host's overlay moves to a Vertex gateway. A key-by-key merge would have kept the
+    // shared `api_key_file`, and the Anthropic key would have gone out as `x-api-key` to the
+    // gateway on every call.
+    let shared = format!(
+        "{BASE}\n[summaries.llm]\ndialect = \"anthropic\"\n\
+         api_key_file = \"/run/secrets/anthropic-api-key\"\nmax_tokens = 200\n"
+    );
+    let overlay = "[summaries.llm]\ndialect = \"vertex\"\n\
+                   base_url = \"https://models.gateway.example/v1\"\nproject = \"my-project\"\n\
+                   region = \"global\"\nclient_identity_file = \"/etc/vibe-talk/identity.pem\"\n";
+    let merged = merge_overlays(
+        &shared,
+        &[("this-host.toml".to_owned(), overlay.to_owned())],
+    )
+    .expect("merges");
+    let cfg = Config::from_toml_and_env(&merged, &BTreeMap::new()).expect("valid");
+    let llm = cfg.summaries.llm.expect("the overlay's section");
+    assert_eq!(llm.dialect, LlmDialect::Vertex);
+    assert_eq!(
+        llm.api_key_file, None,
+        "the shared file's key was inherited by a section that never named one"
+    );
+    assert_eq!(
+        llm.max_tokens, DEFAULT_LLM_MAX_TOKENS,
+        "nothing of the shared section survives, not even what would have been harmless"
+    );
+    assert_eq!(llm.base_url, "https://models.gateway.example/v1");
+    // Only that one table is taken whole: the rest of [summaries] still merges key by key.
+    assert_eq!(cfg.summaries.threshold_chars, 500);
+
+    // An overlay that writes PART of the section gets that part alone, and a part that cannot
+    // stand alone is refused by name rather than quietly completed from the shared file.
+    let merged = merge_overlays(
+        &shared,
+        &[(
+            "this-host.toml".to_owned(),
+            "[summaries.llm]\nmodel = \"claude-sonnet-4-5\"\n".to_owned(),
+        )],
+    )
+    .expect("merges");
+    let err = Config::from_toml_and_env(&merged, &BTreeMap::new()).expect_err("no key file");
+    assert!(
+        matches!(&err, ConfigError::Missing(what) if what.contains("api_key_file")),
+        "{err}"
+    );
+
+    // ...and an overlay that does not mention the section leaves the shared one exactly as it is.
+    let merged = merge_overlays(
+        &shared,
+        &[(
+            "this-host.toml".to_owned(),
+            "[summaries]\ntarget_chars = 120\n".to_owned(),
+        )],
+    )
+    .expect("merges");
+    let llm = Config::from_toml_and_env(&merged, &BTreeMap::new())
+        .expect("valid")
+        .summaries
+        .llm
+        .expect("the shared section");
+    assert_eq!(llm.dialect, LlmDialect::Anthropic);
+    assert_eq!(llm.max_tokens, 200);
+}
+
+#[test]
+fn a_mistake_in_any_layer_is_reported_against_that_file_at_its_own_line() {
+    // A value of the wrong type in an overlay: named, with the overlay's own line, not a line of
+    // the merged text nobody has seen.
+    let err = merge_overlays(
+        BASE,
+        &[(
+            "this-host.toml".to_owned(),
+            "# this host\n\n[summaries]\ntarget_chars = \"wide\"\n".to_owned(),
+        )],
+    )
+    .expect_err("a string where a number goes");
+    let ConfigError::Invalid { field, detail } = &err else {
+        panic!("expected the overlay to be named: {err}");
+    };
+    assert!(field.contains("this-host.toml"), "{field}");
+    assert!(detail.contains("line 4"), "{detail}");
+
+    // An unknown key in an overlay is caught the same way.
+    let err = merge_overlays(
+        BASE,
+        &[(
+            "this-host.toml".to_owned(),
+            "[summaries.llm]\napi_key_flie = \"/k\"\n".to_owned(),
+        )],
+    )
+    .expect_err("a misspelt key");
+    assert!(err.to_string().contains("api_key_flie"), "{err}");
+
+    // And one in the base keeps the base's own line, though an overlay is in use.
+    let broken = BASE.replace("threshold_chars = 500", "threshold_chars = \"many\"");
+    let line = broken
+        .lines()
+        .position(|text| text.contains("\"many\""))
+        .expect("the broken line")
+        + 1;
+    let err = merge_overlays(
+        &broken,
+        &[(
+            "this-host.toml".to_owned(),
+            "[summaries]\ntarget_chars = 120\n".to_owned(),
+        )],
+    )
+    .expect_err("the base is broken");
+    assert!(
+        matches!(&err, ConfigError::Parse(_)) && err.to_string().contains(&format!("line {line}")),
+        "{err}"
+    );
 }
