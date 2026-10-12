@@ -4776,7 +4776,7 @@ SCENES: tuple[Scene, ...] = (
     ),
     Scene(
         name="50-done-feedback",
-        what="a message just marked Done: ringed grey at the read strength, the next unread selected in the accent",
+        what="a message just marked Done: ringed in dashed grey at the read strength, the next unread selected in the solid accent",
         act=_act_done_feedback,
         after=_undo_done_feedback,
         profiles=("android-412", "laptop-1280"),
@@ -4792,20 +4792,37 @@ SCENES: tuple[Scene, ...] = (
             ),
             (
                 # THE claim only a browser can make: what the two rings are drawn in.
-                "it is ringed grey; the next unread message is selected and ringed in the accent",
+                "it is ringed in dashed grey; the next unread message is selected and ringed solid in the accent",
                 "(() => { " + RESOLVE_COLOUR_JS + "; "
                 "const r = [...document.querySelectorAll('#discord-log > li')].find((n) => "
                 "n.getAttribute('data-id') === window.__doneProbe); "
                 "const next = document.querySelector('#discord-log > li[data-selected=\"true\"]'); "
                 "if (!next || next === r || next.getAttribute('data-archived') === 'true') return false; "
                 "const a = getComputedStyle(r), b = getComputedStyle(next); "
-                "return a.outlineStyle === 'solid' && a.outlineColor === window.__colour('--muted') "
+                "return a.outlineStyle === 'dashed' && a.outlineColor === window.__colour('--read-ring') "
                 "&& b.outlineStyle === 'solid' && b.outlineColor === window.__colour('--accent'); })()",
             ),
             (
                 "the Undo chip is up, and names the message it would put back",
                 "window.__visible('undo-dismiss') && "
                 "/^Undo \u201c.+\u201d$/.test(document.getElementById('undo-dismiss-label').textContent)",
+            ),
+            (
+                # From review: named, the chip wrapped the row of chips at 412px. The name gives way:
+                # the chip's words stay inside it, cut short inside the quotes where they do not fit,
+                # and no chip overlaps another or the screen's edge. tests/done_feedback_browser.py
+                # measures at 360 and 412px that the name takes no line a bare "Undo" did not.
+                "the chips overlap nothing, and the Undo chip's words stay inside it",
+                "(() => { const chips = [...document.querySelectorAll('#scroll-tools > .chip')]"
+                ".filter((c) => c.getClientRects().length).map((c) => c.getBoundingClientRect()); "
+                "const apart = (c, d) => c.right <= d.left || d.right <= c.left || c.bottom <= d.top "
+                "|| d.bottom <= c.top; "
+                "const label = document.getElementById('undo-dismiss-label'); "
+                "const name = document.querySelector('#undo-dismiss .undo-name'); "
+                "return chips.length > 0 && chips.every((c) => c.left >= 0 && c.right <= innerWidth) "
+                "&& chips.every((c, i) => chips.slice(i + 1).every((d) => apart(c, d))) && !!name "
+                "&& label.scrollWidth <= label.clientWidth + 1 "
+                "&& getComputedStyle(name).textOverflow === 'ellipsis'; })()",
             ),
         ),
     ),

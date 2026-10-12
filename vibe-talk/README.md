@@ -3868,17 +3868,28 @@ turns, and requires one.
 surface and full strength when it is selected, so it is easy to read again, and a lit read message
 used to look exactly like a lit unread one: marking the selected message Done with `e`, whose
 selection then moves on to the next unread message, changed nothing the eye could find. So the ring
-says which it is, by one rule wherever a row is selected: the accent for unread, grey for read (Done,
-your own when that setting is on, or noise), on the same lit surface. The moment of marking is drawn
-on the row that was marked, though the selection has left it: its ring turns from the accent to grey
-over a quarter of a second while the row fades to the read look, holds for most of a second, then
-lets go. The Done button, a swipe, `e` and Done through here (on the row it was asked from) all draw
-it. It is an animation from the selected look rather than a transition, because on a threaded
-channel a Done redraws the row as a new element; under `prefers-reduced-motion` the grey ring and
-the read look arrive at once. The way back is the Undo chip that was already there, which now names
-the message it would put back (`Undo “seeded: filed two issues…”`, or `Undo Done (12)` after Done
-through here). `tests/done_feedback_browser.py` reads both rings and the running animation by
-computed style in Chromium, and `50-done-feedback` photographs the moment.
+says which it is, by one rule wherever a row is selected: a **solid** ring in the accent for unread, a
+**dashed**, lighter grey one for read (Done, your own when that setting is on, or noise), on the same
+lit surface. Dashed and not merely grey because in the light scheme the grey ink and the blue are both
+dark and differ only a little in hue; the light scheme's read ring has its own lighter grey that still
+stands at 3:1 against the lit surface. The moment of marking is drawn on the row that was marked,
+though the selection has left it: its ring turns from the solid accent to the dashed grey over a
+quarter of a second while the row fades to the read look, holds for most of a second, then lets go.
+The Done button, a swipe, `e` and Done through here (on the row it was asked from) all draw it, and
+every way back ends it at once: a Done the server refused, the Undo chip, `z`, the row's own button,
+or another device putting the message back — a row drawn unread never wears the grey ring. It is an
+animation from the selected look rather than a transition, because on a threaded channel a Done
+redraws the row as a new element; under `prefers-reduced-motion` the grey ring and the read look
+arrive at once. The way back is the Undo chip that was already there, which now names the message it
+would put back (`Undo “seeded: filed two issues…”`, or `Undo Done (12)` after Done through here).
+The name gives way, not the row of chips: the chip goes onto the row at the width of `Undo “…”`, a
+couple of characters wider than a bare "Undo", grows into what the row has spare, and cuts the name
+short with its own ellipsis inside the quotation marks; the tooltip and a screen reader have the
+whole of it. Measured: at 412 pixels Newest, Summaries, the named Undo and Expand all share one line,
+and at 360 the four take two lines with or without the name. `tests/done_feedback_browser.py`
+reads both rings, their contrast in both schemes and the running animation by computed style in
+Chromium, takes an Undo inside the hold, and measures the row of chips at 360 and 412 pixels;
+`50-done-feedback` photographs the moment.
 
 ### Replying from the page
 

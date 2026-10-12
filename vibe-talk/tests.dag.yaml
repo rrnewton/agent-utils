@@ -482,23 +482,27 @@ steps:
       classification: latency-bound
       rss_baseline_bytes: 1073741824
 
-  # `#245 done-feedback` in the browser engine: on a threaded channel at 1280x800, a selected unread
-  # message is ringed in the accent and a selected read one in grey on the same lit surface, by
-  # computed style; e draws the moment on the row it left (the done-marking animation running, a grey
-  # ring at the read strength, then neither); the Undo chip names the message and puts it back; and
-  # under reduced motion the same look arrives with no animation. Served through Playwright's request
-  # routing, so it opens no port. Measured on 2026-10-12: about 4s wall.
+  # `#245 done-feedback` in the browser engine: on a threaded channel at 1280x800, in the dark scheme and
+  # the light one, a selected unread message is ringed solid in the accent and a selected read one
+  # dashed in grey on the same lit surface, each at 3:1 or more against it, by computed style; e draws
+  # the moment on the row it left (the done-marking animation running, the dashed grey ring at the read
+  # strength, then neither); the Undo chip names the message and puts it back, and an Undo inside the
+  # hold takes the ring away at once; under reduced motion the same look arrives with no animation; at
+  # 412x915 and 1280x800 in both schemes the moment and a selected read message, measured; and on a
+  # 360px and a 412px phone the named Undo chip adds no line to the row of chips, cut short with an
+  # ellipsis, and the row keeps clear of Send. Served through Playwright's request routing, so it opens
+  # no port. Measured on 2026-10-12: about 20s wall.
   - group: check
     job: done-feedback-browser
-    desc: selected read ringed grey and selected unread in the accent, the moment of a Done, its Undo, and reduced motion, in current Chromium at 1280x800
+    desc: selected read ringed dashed grey and selected unread solid in the accent in both schemes, the moment of a Done and every Undo, reduced motion, and the named Undo chip on one line at 360 and 412px, in current Chromium
     labels: [validation-vibe-talk]
     cmd: cd vibe-talk && python3 tests/done_feedback_browser.py
     jobs_flag: ""
-    timeout: 90
-    cpu_timeout: 45
+    timeout: 120
+    cpu_timeout: 60
     hint:
       resources: {browser: 1}
-      est_duration_s: 5
+      est_duration_s: 20
       classification: latency-bound
       rss_baseline_bytes: 1073741824
 

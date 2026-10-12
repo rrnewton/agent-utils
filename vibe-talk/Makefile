@@ -230,11 +230,13 @@ reply-continuity-browser:
 thread-button-browser:
 	python3 tests/thread_button_browser.py $(if $(WEB_ROOT),--web-root $(WEB_ROOT)) $(if $(SCREENSHOTS),--screenshots $(SCREENSHOTS))
 
-# `#245 done-feedback` in a real Chromium at 1280x800: a selected unread message ringed in the accent
-# and a selected read one in grey on the same lit surface, by computed style; e draws the moment on the
-# row it left and lets it go; the Undo chip names the message; reduced motion gets the look with no
-# animation. Pass WEB_ROOT=dir to run it against another copy of the page, and SCREENSHOTS=dir to keep
-# a PNG of each step.
+# `#245 done-feedback` in a real Chromium: at 1280x800 in both schemes, a selected unread message ringed
+# solid in the accent and a selected read one dashed in grey on the same lit surface, each at 3:1 or
+# more against it; e draws the moment on the row it left and lets it go; the Undo chip names the
+# message, and an Undo inside the hold takes the ring away at once; reduced motion gets the look with
+# no animation; at 412x915 and 1280x800 in both schemes, the pictures; on a 360px and a 412px phone the
+# named chip adds no line to the row of chips and keeps clear of Send. Pass WEB_ROOT=dir to run it
+# against another copy of the page, and SCREENSHOTS=dir to keep a PNG of each step.
 done-feedback-browser:
 	python3 tests/done_feedback_browser.py $(if $(WEB_ROOT),--web-root $(WEB_ROOT)) $(if $(SCREENSHOTS),--screenshots $(SCREENSHOTS))
 

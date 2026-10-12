@@ -3093,9 +3093,10 @@ const TUNING_BANDS = {
   DONE_FLASH_FADE_MS: [150, 1000,
     "how long the ring takes to let go: shorter is a ring switched off, longer is a ghost of a " +
     "selection trailing the list (#245 done-feedback)"],
-  UNDO_NAME_CHARS: [12, 40,
-    "how much of a message the Undo chip names: under a dozen characters names nothing, past forty " +
-    "the chip crowds the row of chips on a phone (#245 done-feedback)"],
+  UNDO_NAME_CHARS: [40, 160,
+    "how much of a message the Undo chip's name holds, all of it in the tooltip and as much as fits " +
+    "on the chip: under forty the tooltip says no more than the chip, past a hundred and sixty it is " +
+    "a paragraph (#245 done-feedback)"],
   CLEAR_ARMED_MS: [1000, 20000,
     "the second tap that really clears: under a second the confirmation cannot be reached, over " +
     "twenty and a stray later tap still destroys the view"],
@@ -19376,19 +19377,46 @@ test("THE UNDO CHIP NAMES THE MESSAGE it would put back, and counts a Done throu
   await pressHere(page, "e");
   assert.equal(page.el("undo-dismiss").hidden, false, "there is no way back after a Done");
   // tallChannel's first message reads "message 1: a sentence about the overnight run. …": its words
-  // to twenty-four characters, cut at a word.
-  assert.equal(page.el("undo-dismiss-label").textContent, "Undo “message 1: a sentence…”",
-    `the Undo chip says "${page.el("undo-dismiss-label").textContent}", not which message it would put back`);
+  // to eighty characters, cut at a word.
+  const name = "message 1: a sentence about the overnight run. a sentence about the overnight…";
+  assert.equal(page.el("undo-dismiss-label").text(), `Undo “${name}”`,
+    `the Undo chip says "${page.el("undo-dismiss-label").text()}", not which message it would put back`);
+  // The name in a span of its own, which the stylesheet cuts short to the room the chips leave, the
+  // quotation marks outside it; the whole of it in the text a screen reader reads and in the tooltip.
+  const span = page.el("undo-dismiss-label").children.find((node) => node.className === "undo-name");
+  assert.ok(span, "the name is not in a span the stylesheet can cut short");
+  assert.equal(span.textContent, name);
+  assert.equal(page.el("undo-dismiss").getAttribute("title"), `Undo “${name}”`, "the tooltip does not carry the whole name");
+  assert.ok(!page.createdTags.includes("img") && !/</.test(span.textContent), "the name was drawn as markup");
   await page.el("undo-dismiss").click();
   await page.settle();
   assert.equal(channelRow(page, "1").getAttribute("data-archived"), "false", "the chip put nothing back");
   assert.equal(page.el("undo-dismiss").hidden, true, "the chip outlived what it undid");
-  assert.equal(page.el("undo-dismiss-label").textContent, "Undo");
+  assert.equal(page.el("undo-dismiss-label").text(), "Undo");
+  assert.equal(page.el("undo-dismiss-label").children.length, 0, "the name outlived the dismissal it named");
   // Several rows at once are counted, not named after one of them.
   for (let i = 0; i < 3; i += 1) await pressHere(page, "j");
   await pressHere(page, "E", { shiftKey: true });
   assert.match(page.el("undo-dismiss-label").textContent, /^Undo Done \(\d+\)$/);
-  assert.equal(page.el("undo-dismiss-label").textContent, `Undo Done (${page.dismissCalls.at(-1).messages.length})`);
+  assert.equal(page.el("undo-dismiss-label").textContent, `Undo Done (${page.dismissCalls.at(-1).messages.length})`);  assert.equal(page.el("undo-dismiss").getAttribute("title"), page.el("undo-dismiss-label").textContent);
+});
+
+test("THE UNDO CHIP'S NAME GIVES WAY, NEVER THE ROW OF CHIPS: cut short with its own ellipsis inside the quotation marks (#245)", () => {
+  // From review: the named chip is about three times as wide as "Undo", and at 412px it wrapped the
+  // row of chips up over the list and out over the Send button. tests/done_feedback_browser.py
+  // measures the row at 360px and 412px; this pins the rules that let the name, not the row, give way.
+  const chip = cssBlock("#undo-dismiss:has(.undo-name)");
+  assert.match(chip, /flex:\s*1 1 0;/, "the chip goes onto its line at the whole name's width, so the name wraps the row");
+  assert.match(chip, /min-width:\s*\d+(\.\d+)?em;/, "the chip's least width is the whole name's, so the name wraps the row");
+  assert.match(chip, /max-width:\s*max-content;/, "the chip grows past its name");
+  const label = cssBlock("#undo-dismiss-label");
+  assert.match(label, /display:\s*flex;/);
+  assert.match(label, /min-width:\s*0;/);
+  assert.match(label, /white-space:\s*nowrap;/, "the chip's words can wrap inside it");
+  const name = cssBlock("#undo-dismiss .undo-name");
+  for (const rule of [/overflow:\s*hidden;/, /text-overflow:\s*ellipsis;/, /max-width:\s*\d+(\.\d+)?em;/, /min-width:\s*\d+(\.\d+)?em;/]) {
+    assert.match(name, rule, `the name is not cut short with an ellipsis: ${rule}`);
+  }
 });
 
 test("SELECTED AND READ IS RINGED GREY, selected and unread in the accent, and marking animates between them (#245)", () => {
@@ -19396,8 +19424,11 @@ test("SELECTED AND READ IS RINGED GREY, selected and unread in the accent, and m
   // the running animations); what this pins is that the rules saying it are where they have to be.
   const readSelected = /#discord-log li\.discord-message\[data-selected="true"\]:is\(\[data-archived="true"\], \[data-own-read="true"\], \[data-noise="true"\]\)[^{]*\{([^}]*)\}/.exec(CSS_CODE);
   assert.ok(readSelected, "nothing draws a selected read message differently from a selected unread one");
-  assert.match(readSelected[1], /outline-color:\s*var\(--muted\)/, "a selected read message's ring is not grey");
-  assert.match(readSelected[1], /border-color:\s*var\(--muted\)/, "a selected read message's edge is not grey");
+  assert.match(readSelected[1], /outline-color:\s*var\(--read-ring\)/, "a selected read message's ring is not grey");
+  // From review: in the light scheme the grey and the blue are both dark inks a little apart in hue.
+  // A dashed ring against a solid one is told apart in either scheme, and without the hue.
+  assert.match(readSelected[1], /outline-style:\s*dashed/, "a selected read message's ring is told from the blue by hue alone");
+  assert.match(readSelected[1], /border-color:\s*transparent/, "the row's edge fills the gaps between the dashes");
   assert.match(cssBlock('#discord-log li.discord-message[data-selected="true"]'), /outline:\s*2px solid var\(--accent\)/,
     "a selected unread message lost its accent ring");
   // The moment of marking is an animation FROM the selected unread look, so it runs on a row the Done
@@ -19411,7 +19442,10 @@ test("SELECTED AND READ IS RINGED GREY, selected and unread in the accent, and m
   assert.match(cssBlock('#discord-log li.discord-message[data-done-flash="marking"]'), /animation:\s*done-marking 0\.25s/,
     "the row just marked does not change over a quarter of a second");
   assert.match(cssBlock('#discord-log li.discord-message[data-done-flash="marking"]:not([data-selected="true"])'),
-    /outline-color:\s*var\(--muted\)/, "the row just marked is not ringed grey");
+    /outline-color:\s*var\(--read-ring\)/, "the row just marked is not ringed grey");
+  assert.match(cssBlock('#discord-log li.discord-message[data-done-flash]:not([data-selected="true"])'),
+    /outline:\s*2px dashed transparent/, "the ring just marked is not the dashed ring of a read message");
+  assert.match(from[1], /outline-style:\s*solid;/, "marking does not start from the solid ring of an unread message");
   assert.match(cssBlock('#discord-log li.discord-message[data-done-flash="fading"]:not([data-selected="true"])'),
     /animation:\s*done-fading 0\.3s/, "the grey ring is switched off rather than let go");
   assert.equal(DONE_FLASH_FADE_MS, 300, "the fade's timer and its animation are different lengths");
@@ -19419,6 +19453,76 @@ test("SELECTED AND READ IS RINGED GREY, selected and unread in the accent, and m
     "under reduced motion the marking still animates");
   const plain = cssRules(CSS, '#discord-log li.discord-message[data-selected="true"]').join("");
   assert.equal(/transition|animation/.test(plain), false, "every selected row animates, so the ring lags behind j and k");
+});
+
+test("THE READ RING HAS A VALUE IN EACH SCHEME, and in the light one it is lighter than the dark grey ink (#245)", () => {
+  // `--muted` and `--accent` are both dark inks in the light scheme; the read ring there is a lighter
+  // grey that still stands at 3:1 against the lit surface. tests/done_feedback_browser.py reads the
+  // contrast off the page in both schemes.
+  const dark = /:root \{[^}]*--read-ring:\s*(#[0-9a-f]{6});/.exec(CSS_CODE);
+  const light = /@media \(prefers-color-scheme: light\) \{\s*:root \{[^}]*--read-ring:\s*(#[0-9a-f]{6});/.exec(CSS_CODE);
+  assert.ok(dark && light, "the read ring is declared for one scheme only, and draws as nothing in the other");
+  const luminance = (hex) => {
+    const [r, g, b] = [1, 3, 5].map((i) => parseInt(hex.slice(i, i + 2), 16) / 255)
+      .map((c) => (c <= 0.03928 ? c / 12.92 : ((c + 0.055) / 1.055) ** 2.4));
+    return 0.2126 * r + 0.7152 * g + 0.0722 * b;
+  };
+  const contrast = (a, b) => (Math.max(luminance(a), luminance(b)) + 0.05) / (Math.min(luminance(a), luminance(b)) + 0.05);
+  const lightHover = /@media \(prefers-color-scheme: light\) \{\s*:root \{[^}]*--row-hover:\s*(#[0-9a-f]{6});/.exec(CSS_CODE)[1];
+  assert.ok(contrast(light[1], lightHover) >= 3, `the light read ring is ${contrast(light[1], lightHover).toFixed(2)}:1 on the lit surface`);
+  assert.ok(luminance(light[1]) > luminance("#5d6674"), "the light read ring is as dark as the grey ink it was told apart from");
+});
+
+test("EVERY WAY BACK TAKES THE MOMENT AWAY AT ONCE: the Undo chip, z, the row's own button, another device (#245)", async () => {
+  // From review: an Undo pressed within the hold left the grey ring on a row that was unread again.
+  const ways = {
+    "the Undo chip": async (page) => {
+      await page.el("undo-dismiss").click();
+      await page.settle();
+    },
+    z: (page) => pressHere(page, "z"),
+    "the row's own button": async (page) => {
+      await doneButton(channelRow(page, "1")).click();
+      await page.settle();
+    },
+    // The read after the put back speaks for the message, and says it is not Done.
+    "another device": async (page) => {
+      page.dealtWith.delete("1");
+      await reReadChannel(page);
+    },
+  };
+  for (const [way, putBack] of Object.entries(ways)) {
+    const page = await keyboardPageAtTop();
+    await press(page, page.el("scroll-area"), "ArrowDown");
+    await pressHere(page, "e");
+    await page.settle();
+    assert.equal(flashOf(page, "1"), "marking", `${way}: the fixture drew no moment to take back`);
+    assert.ok(page.dealtWith.has("1"), `${way}: the Done did not reach the fixture's server`);
+    await putBack(page);
+    assert.equal(channelRow(page, "1").getAttribute("data-archived"), "false", `${way} did not put the message back`);
+    assert.equal(flashOf(page, "1"), null, `${way}: a row that is unread again still wears the grey ring`);
+    assert.equal(page.expireTimers(DONE_FLASH_HOLD_MS), 0, `${way}: a timer was left to draw a Done that was taken back`);
+    assert.equal(flashOf(page, "1"), null);
+  }
+});
+
+test("A RICH HEADER'S ROW is drawn marked Done like any other (#245, #242)", async () => {
+  const lead = "[build-bot coordinator] Backup check, 10:52 PM ET. ";
+  const page = newPage();
+  await signIn(page);
+  await showDiscord(page, [
+    message({ id: "1", content: `${lead}${longMessage("rich")}`,
+      heading: { tag: "build-bot coordinator", time: "10:52 PM ET", title: "Backup check", cut: lead.length } }),
+    message({ id: "2", content: "the next one" }),
+  ]);
+  assert.ok(textOfRow(channelRow(page, "1")).children[0].hasAttribute("data-rh"), "the fixture's heading was not shown");
+  await doneButton(channelRow(page, "1")).click();
+  assert.equal(flashOf(page, "1"), "marking", "a rich header's row was marked Done and drew nothing");
+  assert.equal(page.expireTimers(DONE_FLASH_HOLD_MS), 1);
+  assert.equal(flashOf(page, "1"), "fading");
+  assert.equal(page.expireTimers(DONE_FLASH_FADE_MS), 1);
+  assert.equal(flashOf(page, "1"), null);
+  assert.ok(elidedOf(channelRow(page, "1")), "a rich header's long row has no count under it");
 });
 
 test("UNDER HIDE READ, the row e takes away hands the selection to the next unread message", async () => {

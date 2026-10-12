@@ -22042,10 +22042,11 @@ let lastDismissal = null;
 
 /**
  * `#245 done-feedback`. What the Undo chip calls the message it would put back: the message's first
- * words, cut at a word to about this many characters. The chip floats over the list beside the other
- * chips, so it has the width of a few words on a phone and no more.
+ * words, cut at a word to about this many characters — the whole of what its tooltip says. The chip
+ * itself floats over the list beside the other chips and shows only what fits there, ending what it
+ * cuts with an ellipsis of its own (web/voice.css, `#undo-dismiss .undo-name`).
  */
-const UNDO_NAME_CHARS = 24;
+const UNDO_NAME_CHARS = 80;
 
 /**
  * The opening words of `text`, to `UNDO_NAME_CHARS` and cut at a word with an ellipsis, for the
@@ -22077,13 +22078,34 @@ function dismissalName(ids) {
 
 /**
  * The Undo chip's words. Not a bare "Undo": after a Done the reader's eye is already on the next
- * message, and an Undo that does not say WHICH message it would put back is a guess. In words, not in
- * an attribute: the name is channel text.
+ * message, and an Undo that does not say WHICH message it would put back is a guess.
  */
 function undoLabel(dismissal) {
   if (dismissal === null) return "Undo";
   if (dismissal.name) return `Undo “${dismissal.name}”`;
   return `Undo Done (${dismissal.messages.length})`;
+}
+
+/**
+ * Draw the Undo chip's words. The name is in a span of its own, which web/voice.css cuts short with
+ * an ellipsis to the width the row of chips has left, so a long name does not wrap the row up over
+ * the list and out over the dock; the quotation marks stay outside it, so the cut reads as a cut. Its
+ * text is the whole name, so a screen reader hears it all, and so does the tooltip: set as an
+ * attribute, never as markup, as a link's address is (`linkList`).
+ */
+function drawUndoLabel(dismissal) {
+  const label = el("undo-dismiss-label");
+  const words = undoLabel(dismissal);
+  el("undo-dismiss").setAttribute("title", words);
+  label.replaceChildren();
+  if (dismissal === null || !dismissal.name) {
+    label.textContent = words;
+    return;
+  }
+  const name = document.createElement("span");
+  name.className = "undo-name";
+  name.textContent = dismissal.name;
+  label.replaceChildren(document.createTextNode("Undo “"), name, document.createTextNode("”"));
 }
 
 /** How many the backlog control is about to clear, so it can say so before it does it. */
@@ -22103,7 +22125,7 @@ function renderTodoControls() {
     : `Clear the backlog (${backlogSize})`;
   clear.className = backlogIsArmed() ? "chip armed" : "chip";
   el("undo-dismiss").hidden = lastDismissal === null;
-  el("undo-dismiss-label").textContent = undoLabel(lastDismissal);
+  drawUndoLabel(lastDismissal);
 }
 
 // Bulk and destructive, so it asks twice — the same armed idiom the Clear control on the dock
@@ -22402,6 +22424,9 @@ async function toggleArchived(ids, row = null) {
 //     fading phase lets go only of a ring the selection is not drawing anyway.
 //   * Every way of marking comes through it: the Done button, the e key and a swipe through
 //     `toggleArchived`, Done through here (Shift+E, or the ⋯ menu) on the row it was asked from.
+//   * EVERY WAY BACK ENDS IT AT ONCE, though its timers have most of a second to run: a Done the
+//     server refused, the Undo chip, z, the row's own button, or another device putting the message
+//     back. A row drawn unread never wears the grey ring (`drawDoneFlash`).
 //   * UNDER REDUCED MOTION the change is instant (web/voice.css); the grey ring still holds, so the
 //     reader still sees which row it was.
 //   * The way back is the Undo chip that was already there, and it now names the message it would
@@ -22421,12 +22446,49 @@ const DONE_FLASH_FADE_MS = 300;
  */
 const doneFlashing = new Map();
 
-/** The timer each flashing message is waiting on, so a second Done on it starts it again. */
-const doneFlashTimers = new Map();
+/**
+ * Each flashing row's messages and the timer its phase is waiting on, under the row's first id: a
+ * second Done on the row starts it again, and a put back finds it by any of its messages.
+ *
+ * @type {Map<string, {ids: string[], timer: any}>}
+ */
+const doneFlashGroups = new Map();
 
-/** Draw `row`'s phase, or nothing: what `renderChannelRows` does for every row it draws. */
+/**
+ * Forget the moment of every Done that marked any of `ids`, and its timers. Answers whether there was
+ * one. Draws nothing; see `drawDoneFlashes`.
+ *
+ * @param {string[]} ids
+ */
+function forgetDoneFlash(ids) {
+  const named = new Set(ids.map(String));
+  let found = false;
+  for (const [key, group] of [...doneFlashGroups]) {
+    if (!group.ids.some((id) => named.has(id))) continue;
+    clearTimeout(group.timer);
+    doneFlashGroups.delete(key);
+    for (const id of group.ids) doneFlashing.delete(id);
+    found = true;
+  }
+  for (const id of named) found = doneFlashing.delete(id) || found;
+  return found;
+}
+
+/**
+ * Draw `row`'s phase, or nothing: what `renderChannelRows` does for every row it draws.
+ *
+ * A ROW DRAWN UNREAD IS NEVER DRAWN AS JUST MARKED DONE, whatever the timers still say: its message
+ * was put back — by the Undo chip, z, the row's own button, a Done the server refused, or another
+ * device, whose put back arrives with a read — and a grey ring would say it is read. Its moment is
+ * forgotten there and then.
+ */
 function drawDoneFlash(row) {
-  const phase = idsOf(row).map((id) => doneFlashing.get(id)).find(Boolean);
+  const ids = idsOf(row);
+  let phase = ids.map((id) => doneFlashing.get(id)).find(Boolean);
+  if (phase && row.getAttribute("data-archived") !== "true") {
+    forgetDoneFlash(ids);
+    phase = undefined;
+  }
   if (phase) row.setAttribute("data-done-flash", phase);
   else if (row.hasAttribute("data-done-flash")) row.removeAttribute("data-done-flash");
 }
@@ -22440,24 +22502,26 @@ function drawDoneFlashes() {
 }
 
 /**
- * Take the moment back: the Done it drew did not reach the server, the row is unread again, and a
- * grey ring on it would say otherwise.
+ * Take the moment back from messages that are unread again — a Done the server refused, or any put
+ * back (`restoreMessages`) — and from every row drawing it, at once rather than at the next redraw.
+ *
+ * @param {string[]} ids
  */
+function unflashIds(ids) {
+  if (forgetDoneFlash(ids)) drawDoneFlashes();
+}
+
+/** ...the messages of `row`. */
 function unflashDone(row) {
-  const ids = row ? idsOf(row) : [];
-  if (ids.length === 0) return;
-  clearTimeout(doneFlashTimers.get(ids[0]));
-  doneFlashTimers.delete(ids[0]);
-  for (const id of ids) doneFlashing.delete(id);
-  drawDoneFlashes();
+  if (row) unflashIds(idsOf(row));
 }
 
 /** Draw the moment `row` was marked Done; see the section note. Nothing without a row. */
 function flashDone(row) {
   const ids = row ? idsOf(row) : [];
   if (ids.length === 0) return;
-  const key = ids[0];
-  clearTimeout(doneFlashTimers.get(key));
+  forgetDoneFlash(ids);
+  const group = { ids, timer: null };
   const phase = (value) => {
     for (const id of ids) {
       if (value) doneFlashing.set(id, value);
@@ -22465,18 +22529,20 @@ function flashDone(row) {
     }
   };
   phase("marking");
+  doneFlashGroups.set(ids[0], group);
   // On the row as it is NOW as well, before the Done redraws it: where the row is kept, the change
-  // to the read look then happens under the attribute rather than a frame before it.
-  drawDoneFlash(row);
-  doneFlashTimers.set(key, setTimeout(() => {
+  // to the read look then happens under the attribute rather than a frame before it. Set directly,
+  // because the row is still drawn unread, which `drawDoneFlash` takes for a put back.
+  row.setAttribute("data-done-flash", "marking");
+  group.timer = setTimeout(() => {
     phase("fading");
     drawDoneFlashes();
-    doneFlashTimers.set(key, setTimeout(() => {
+    group.timer = setTimeout(() => {
       phase(null);
-      doneFlashTimers.delete(key);
+      doneFlashGroups.delete(ids[0]);
       drawDoneFlashes();
-    }, DONE_FLASH_FADE_MS));
-  }, DONE_FLASH_HOLD_MS));
+    }, DONE_FLASH_FADE_MS);
+  }, DONE_FLASH_HOLD_MS);
 }
 
 /**
@@ -22658,6 +22724,9 @@ async function restoreMessages(ids) {
   for (const id of restored) {
     archivedIds.delete(id);
   }
+  // `#245 done-feedback`. Unread again, so no longer being drawn as just marked Done: the Undo chip
+  // and z (`undoDismissal`) and the row's own button (`toggleArchived`) all come through here.
+  unflashIds(restored);
   const held = markHeldDone(restored, false);
   // `#229 desktop-two-column`. Put back in the other column as well.
   const column = activeColumn;

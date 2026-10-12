@@ -150,6 +150,12 @@
      subtly to indicate the shift." Mixed here per scheme, not with a colour function at the use
      site, for the reason the tokens above give. */
   --reply-tint: #181e25;
+  /* `#245 done-feedback`. The dashed ring of a selected READ message, beside the solid `--accent`
+     ring of a selected unread one. In dark it is `--muted`, as light as the accent and plainly not
+     blue. In light it has its own value: `--muted` is a dark ink there, as dark as the accent, so
+     this is a lighter grey that still stands at 3:1 against the lit surface (`--row-hover`), the
+     least a ring needs to be seen at all. */
+  --read-ring: #99a1b0;
 }
 
 @media (prefers-color-scheme: light) {
@@ -178,6 +184,7 @@
     --pin-bg: #fbf0d2;
     /* The same six parts of the light scheme's accent in its page colour. */
     --reply-tint: #e9eef3;
+    --read-ring: #7f8896;
   }
 }
 
@@ -3926,6 +3933,38 @@ body {
   box-shadow: 0 1px 6px rgb(0 0 0 / 35%);
 }
 
+/*
+ * `#245 done-feedback`. The Undo chip names the message it would put back — "Undo “Backup check
+ * finished on…”" — and a name is several times the width of "Undo". Laid out at that width it wrapped
+ * the row of chips on a 412px phone, up over the list and out over the dock. So the NAME GIVES WAY,
+ * never the row: a named chip goes onto its line at the width of "Undo “…”" (its basis is nothing and
+ * its least width that, stated — measured in Chromium at 6.6em of the chip's type, padding included —
+ * because the least width of its content would be the whole name), about two characters wider than
+ * the bare "Undo" it replaced; then it grows into whatever the line has spare, to the whole name or
+ * the name's `max-width`, before the auto margin beside the jump to the newest message takes the
+ * rest. The ellipsis is the chip's own, INSIDE the quotation marks:
+ * it shortens a label, never the message, and the tooltip and a screen reader have the whole name
+ * (`drawUndoLabel`). A chip that counts ("Undo Done (12)") or says only "Undo" keeps its own width.
+ */
+#undo-dismiss:has(.undo-name) {
+  flex: 1 1 0;
+  min-width: 6.8em;
+  max-width: max-content;
+}
+
+#undo-dismiss-label {
+  display: flex;
+  min-width: 0;
+  white-space: nowrap;
+}
+
+#undo-dismiss .undo-name {
+  min-width: 1em;
+  max-width: 14em;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
 .chip-icon {
   width: 0.9rem;
   height: 0.9rem;
@@ -4275,19 +4314,26 @@ body {
 }
 
 /*
- * `#245 done-feedback`. SELECTED AND READ IS RINGED GREY; selected and unread keeps the accent. A
- * selected read message still comes all the way back to the lit surface and full strength (the rule
- * above, and the archived one further up), because it is being read; what the grey says is that it
- * has been dealt with. Before this a lit read row and a lit unread one were the same picture, so
- * marking the selected message Done changed nothing the eye could find. Read is what `stillToDo`
- * says it is: archived, the owner's own when that setting is on, or noise. The run line stands for
- * read messages only, so its ring is grey too, and so are the edges of the row's own controls.
+ * `#245 done-feedback`. SELECTED AND READ IS RINGED GREY AND DASHED; selected and unread keeps the
+ * solid accent. A selected read message still comes all the way back to the lit surface and full
+ * strength (the rule above, and the archived one further up), because it is being read; what the
+ * grey says is that it has been dealt with. Before this a lit read row and a lit unread one were the
+ * same picture, so marking the selected message Done changed nothing the eye could find. Read is what
+ * `stillToDo` says it is: archived, the owner's own when that setting is on, or noise. The run line
+ * stands for read messages only, so its ring is grey too, and so are the edges of the row's controls.
+ *
+ * DASHED, AND A LIGHTER GREY (`--read-ring`), NOT HUE ALONE. In the light scheme `--muted` and
+ * `--accent` are both dark inks that differ only a little in hue, so a grey ring and a blue one read
+ * as the same ring there; a broken line against a solid one is told apart in either scheme and by a
+ * reader who does not see the hue. The row's own edge goes transparent under it, so the gaps between
+ * the dashes are gaps, not a thin solid line.
  */
 #side-log li.discord-message[data-selected="true"]:is([data-archived="true"], [data-own-read="true"], [data-noise="true"]),
 #discord-log li.discord-message[data-selected="true"]:is([data-archived="true"], [data-own-read="true"], [data-noise="true"]),
 #pinned-log li.discord-message[data-selected="true"]:is([data-archived="true"], [data-own-read="true"], [data-noise="true"]) {
-  border-color: var(--muted);
-  outline-color: var(--muted);
+  border-color: transparent;
+  outline-style: dashed;
+  outline-color: var(--read-ring);
 }
 
 #side-log li.discord-message[data-selected="true"]:is([data-archived="true"], [data-own-read="true"], [data-noise="true"]) :is(.reply-button, .done-button, .not-noise-button, .upstream-read-button),
@@ -4298,13 +4344,15 @@ body {
 
 #side-log li.discord-message[data-read-run="head"][data-selected="true"] > .read-run,
 #discord-log li.discord-message[data-read-run="head"][data-selected="true"] > .read-run {
-  outline-color: var(--muted);
+  outline-style: dashed;
+  outline-color: var(--read-ring);
 }
 
 /*
  * ...AND THE MOMENT OF MARKING IS DRAWN ON THE ROW THAT WAS MARKED, though the selection has moved on
- * to the next unread message. web/voice.js puts `data-done-flash` on it: "marking" holds a grey ring
- * while the row goes from the selected unread look to the read look over a quarter of a second, and
+ * to the next unread message. web/voice.js puts `data-done-flash` on it: "marking" holds the dashed
+ * grey ring while the row goes from the selected unread look to the read look over a quarter of a
+ * second (the solid accent ring giving way to the dashed grey one half way through), and
  * "fading" then lets the ring and the edge go back to the row's own, unless the row is still
  * selected, whose grey ring is the rule above.
  *
@@ -4315,6 +4363,7 @@ body {
  */
 @keyframes done-marking {
   from {
+    outline-style: solid;
     outline-color: var(--accent);
     border-color: var(--accent);
     background-color: var(--row-hover);
@@ -4325,8 +4374,8 @@ body {
 
 @keyframes done-fading {
   from {
-    outline-color: var(--muted);
-    border-color: var(--muted);
+    outline-color: var(--read-ring);
+    border-color: transparent;
   }
 }
 
@@ -4338,21 +4387,22 @@ body {
   }
 }
 
-/* The ring is solid throughout, so letting go is a colour fading out rather than a ring switched
-   off; and only on a row the selection is not drawing, so it never hides a ring the selection is. */
+/* The ring stays dashed while it lets go, so letting go is a colour fading out rather than a ring
+   switched off; and only on a row the selection is not drawing, so it never hides a ring the
+   selection is. */
 #side-log li.discord-message[data-done-flash]:not([data-selected="true"]),
 #discord-log li.discord-message[data-done-flash]:not([data-selected="true"]),
 #pinned-log li.discord-message[data-done-flash]:not([data-selected="true"]) {
-  outline: 2px solid transparent;
+  outline: 2px dashed transparent;
   outline-offset: -2px;
 }
 
-/* The grey ring itself. A row still selected has it from the selected-and-read rule above. */
+/* The grey ring itself, the selected read row's. A row still selected has it from the rule above. */
 #side-log li.discord-message[data-done-flash="marking"]:not([data-selected="true"]),
 #discord-log li.discord-message[data-done-flash="marking"]:not([data-selected="true"]),
 #pinned-log li.discord-message[data-done-flash="marking"]:not([data-selected="true"]) {
-  border-color: var(--muted);
-  outline-color: var(--muted);
+  border-color: transparent;
+  outline-color: var(--read-ring);
 }
 
 #side-log li.discord-message[data-done-flash="marking"],
@@ -4672,6 +4722,15 @@ body {
   font-size: calc(0.88rem * var(--msg-scale));
 }
 
+/* `#244 elision-word-count`. The line under a folded body is measured in em of the body's text, so it
+   is at the body's size; the label in it keeps its own small size (`.elided > span`). */
+#reply-context .elided,
+#pinned-log .elided,
+#side-log .elided,
+#discord-log .elided {
+  font-size: calc(0.88rem * var(--msg-scale));
+}
+
 /*
  * THE FOLD CONTROL IS NOT PRINTED ON THE ROW ANY MORE. Tapping the message toggles it.
  *
@@ -4702,15 +4761,6 @@ body {
   height: auto;
   overflow: visible;
   clip-path: none;
-}
-
-/* `#244 elision-word-count`. The line under a folded body is measured in em of the body's text, so it
-   is at the body's size; the label in it keeps its own small size (`.elided > span`). */
-#reply-context .elided,
-#pinned-log .elided,
-#side-log .elided,
-#discord-log .elided {
-  font-size: calc(0.88rem * var(--msg-scale));
 }
 
 /*
