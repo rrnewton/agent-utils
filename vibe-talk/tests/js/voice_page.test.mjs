@@ -30053,6 +30053,8 @@ function forwardTimeline(page, { complete = true, olderCursor = null } = {}) {
       view, has_threads: page.threads.length > 0,
       thread: (view === "thread" && page.threads.find((thread) => thread.id === threadId)) || null,
       ...(server.asOf ? { as_of: server.asOf } : {}),
+      // `#240 reading-bookmark`: on every read, deltas included, when a test serves it.
+      ...(page.serveBookmark ? { bookmark: page.servedBookmark() } : {}),
     };
     const dismissed = (rows) => rows.map((m) => String(m.id)).filter((id) => page.dealtWith.has(id));
     if (after) {
@@ -37355,7 +37357,7 @@ test("`#240 reading-bookmark`: reply, and b goes back to where you were reading"
   assert.equal(selectedId(page), "4", "b did not go back to the bookmark after the reply");
 });
 
-test("`#240 reading-bookmark`: a long Done through here is ONE request", async () => {
+test("`#240 reading-bookmark`: a long Done through here is ONE request, and past the server's ceiling it and its undo go in batches it accepts", async () => {
   const page = newPage();
   await signIn(page);
   const many = Array.from({ length: 150 }, (_unused, i) => message({ id: String(10000 + i), content: `message ${i}` }));
@@ -37363,6 +37365,18 @@ test("`#240 reading-bookmark`: a long Done through here is ONE request", async (
   await throughHere(page, String(10000 + 149));
   assert.equal(page.dismissCalls.length, 1, `${page.dismissCalls.length} requests for one Done through here`);
   assert.equal(page.dismissCalls[0].messages.length, 150);
+  // Over a thousand: two requests each way, none over the ceiling, and the undo puts back every one.
+  const huge = newPage();
+  await signIn(huge);
+  const lots = Array.from({ length: 1100 }, (_unused, i) => message({ id: String(100000 + i), content: `m ${i}` }));
+  await showDiscord(huge, lots);
+  await throughHere(huge, String(100000 + 1099));
+  assert.deepStrictEqual(huge.dismissCalls.map((call) => call.messages.length), [1000, 100]);
+  await huge.el("undo-dismiss").click();
+  await huge.settle();
+  assert.deepStrictEqual(huge.restoreCalls.map((call) => call.messages.length), [1000, 100],
+    "the undo of a long Done through here went out in one request the server refuses");
+  assert.equal(huge.dealtWith.size, 0, "the undo did not put every message back");
 });
 
 test("`#240 reading-bookmark`: THE SWEEP ORACLE — Done through here marks exactly the rows above, not yet Done, under random Done, put-back and arrivals", async () => {
@@ -37410,4 +37424,29 @@ test("`#240 reading-bookmark`: THE SWEEP ORACLE — Done through here marks exac
     const want = start < shown.length ? { id: shown[start], place: "above" } : { id: shown[shown.length - 1], place: "below" };
     assert.deepStrictEqual(bookmarkAt(page), want, `step ${step}: the line is not where the bookmark puts it`);
   }
+});
+
+test("`#240 reading-bookmark`: in a channel with threads, a delta read carries a move made on the other device", async () => {
+  const { page, server } = await forwardPage({}, (p) => {
+    p.serveBookmark = true;
+  });
+  assert.equal(bookmarkAt(page), null);
+  page.moveBookmarkElsewhere({ message_id: "203", place: "above", timestamp: page.messages[3].timestamp,
+    thread_id: "spaces/A/threads/another" });
+  await pollOnce(page);
+  assert.notEqual(server.reads.at(-1).after, null, "the refresh was not a delta read");
+  assert.deepStrictEqual(bookmarkAt(page), { id: "203", place: "above" }, "a delta carrying the other device's move drew nothing");
+});
+
+test("`#240 reading-bookmark`: a Done in the thread on the right slides the line there, keeping its thread", async () => {
+  const { page } = await twoColumnServer();
+  await threadBadge(rowWithId(page, "203")).click();
+  await page.settle();
+  await bookmarkRow(page, "203", "side-log");
+  assert.deepStrictEqual(bookmarkAt(page, "side-log"), { id: "203", place: "above" });
+  await doneButton(sideRow(page, "203")).click();
+  await page.settle();
+  assert.deepStrictEqual(bookmarkAt(page, "side-log"), { id: "204", place: "above" }, "the Done in the thread did not slide the line");
+  assert.equal(page.bookmark.anchor.message_id, "204");
+  assert.equal(page.bookmark.anchor.thread_id, "spaces/A/threads/another", "the slide lost the thread");
 });

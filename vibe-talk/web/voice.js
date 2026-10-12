@@ -20329,10 +20329,16 @@ async function restoreMessages(ids) {
   setStatus(`Restoring ${restored.length} message${restored.length === 1 ? "" : "s"}…`);
   let settled = false;
   try {
-    await queueInboxWrite(() => api(`/api/v1/channels/${encodeURIComponent(channel)}/restore`, {
-      method: "POST",
-      body: { messages: restored },
-    }));
+    // In batches the server accepts, as the dismissal that made them went: the undo of a long Done
+    // through here names more ids than one request may carry. `#240 reading-bookmark`.
+    await queueInboxWrite(async () => {
+      for (let start = 0; start < restored.length; start += DISMISS_BATCH) {
+        await api(`/api/v1/channels/${encodeURIComponent(channel)}/restore`, {
+          method: "POST",
+          body: { messages: restored.slice(start, start + DISMISS_BATCH) },
+        });
+      }
+    });
     // Settled before the read below, which then speaks for these messages.
     settleHeldDone(held, true);
     settled = true;
