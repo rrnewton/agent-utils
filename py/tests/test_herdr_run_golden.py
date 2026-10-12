@@ -5,6 +5,9 @@ that changes in one edition fails the other edition's suite until both agree aga
 
 - ``text_cases.json``: the quoting rule, numeric text, the exit-marker grammar, float text,
   run IDs;
+- ``name_verdicts.json``: the name rule's verdict on every code point, U+0000..U+10FFFF, written
+  by this module (run it with ``--write-name-verdicts``) and checked code point by code point by
+  both suites;
 - ``yaml_cases.json``: the configuration YAML subset, accepted values and positioned refusals;
 - ``readiness_cases.json``: prompt verdicts and prompt tails inferred from rc files;
 - ``protocol_cases.json``: Herdr protocol calls through both brokers, their argv, and their
@@ -12,7 +15,8 @@ that changes in one edition fails the other edition's suite until both agree aga
 - ``record_cases.json``: reap scope, evidence folded from run records, session-cache loading
   and the exact bytes a cache store writes;
 - ``policy_cases.json``: configuration loading and command admission, including ``~`` expanded
-  before the policy judges an argument, names refused for holding an invisible character, the
+  before the policy judges an argument, names refused for holding an invisible character or any
+  other character a name may not contain, the
   warning a deny list that leaves out a built-in entry draws, and every configuration an earlier
   release wrote: what it admits, what it is warned about, and what ``init --upgrade`` makes of it.
 """
@@ -22,6 +26,8 @@ from __future__ import annotations
 import json
 import re
 import subprocess
+import sys
+import unicodedata
 from collections.abc import Sequence
 from pathlib import Path
 from typing import cast
@@ -46,9 +52,15 @@ from herdr_run.runner import make_run_id
 from herdr_run.session import Target, _load_cache, _store_cache
 from herdr_run.sweep import _scope_of
 from herdr_run.textfmt import (
+    FORMAT_CHARACTER_RANGES,
     JSON_MAX_DEPTH,
-    json_text,
+    UNICODE_VERSION,
     display,
+    is_invisible,
+    is_noncharacter,
+    is_private_use,
+    is_unassigned,
+    json_text,
     name_violation,
     number_text,
     parse_exit_marker,
@@ -114,6 +126,151 @@ def test_display(row: list[object]) -> None:
 def test_name_violation(row: list[object]) -> None:
     value, expected = row
     assert name_violation(cast(str, value)) == expected
+
+
+
+@pytest.mark.parametrize(
+    "code,noncharacter,private_use,unassigned",
+    [
+        (0xFDCF, False, False, False),
+        (0xFDD0, True, False, True),
+        (0xFDEF, True, False, True),
+        (0xFDF0, False, False, False),
+        (0xFFFD, False, False, False),
+        (0xFFFE, True, False, True),
+        (0x1FFFE, True, False, True),
+        (0xE000, False, True, False),
+        (0xF8FF, False, True, False),
+        (0xF900, False, False, False),
+        (0xEFFFD, False, False, True),
+        (0xF0000, False, True, False),
+        (0xFFFFD, False, True, False),
+        (0xFFFFE, True, False, True),
+        (0x100000, False, True, False),
+        (0x10FFFD, False, True, False),
+        (0x10FFFF, True, False, True),
+        (0x0377, False, False, False),
+        (0x0378, False, False, True),
+        (0x1C89, False, False, False),
+    ],
+    ids=lambda value: str(value) if isinstance(value, bool) else f"U+{value:04X}",
+)
+def test_the_name_classes_at_their_edges(
+    code: int, noncharacter: bool, private_use: bool, unassigned: bool
+) -> None:
+    character = chr(code)
+    assert is_noncharacter(character) == noncharacter
+    assert is_private_use(character) == private_use
+    assert is_unassigned(character) == unassigned
+
+
+def test_the_blank_characters_are_invisible_and_the_most_specific_description_wins() -> None:
+    # The two assigned characters that draw nothing are invisible, so JSON escapes them too.
+    assert is_invisible("\U0001d159") and is_invisible("\U00016fe4")
+    assert not is_invisible("\U0001d158") and not is_invisible("\U00016fe3")
+    assert json_text(["\U0001d159\ue000"]) == '["\\ud834\\udd59\ue000"]'
+    # U+FDD0 and U+E0000 are unassigned too.
+    assert name_violation("\ufdd0") == "noncharacter U+FDD0"
+    assert name_violation("\U000e0000") == "invisible character U+E0000"
+
+_NAME_VERDICTS = "name_verdicts.json"
+
+_NAME_VERDICTS_ABOUT = (
+    "The name rule both editions share (name_violation in textfmt.py / textfmt.rs), on every code "
+    "point: runs [first, last, what] in hexadecimal, in order, covering U+0000..U+10FFFF, where "
+    "what is the description name_violation gives a name made of that one character, less its "
+    "' U+XXXX', or null when that name is accepted. Only the Python edition can hold a surrogate; "
+    "the Rust edition checks that it cannot. Written from the Python edition by "
+    "'PYTHONPATH=py python3 py/tests/test_herdr_run_golden.py --write-name-verdicts'; both "
+    "unit-test suites check every code point against it."
+)
+
+
+def _name_verdict(code: int) -> str | None:
+    """What :func:`name_violation` says of a name that is the one character ``code``, less where."""
+    violation = name_violation(chr(code))
+    if violation is None:
+        return None
+    what, _, where = violation.rpartition(" ")
+    assert where == f"U+{code:04X}", violation
+    return what
+
+
+def _name_verdict_runs() -> list[list[str | None]]:
+    """Every code point's verdict, as maximal runs ``[first, last, what]`` in hexadecimal."""
+    runs: list[tuple[int, int, str | None]] = []
+    for code in range(0x110000):
+        what = _name_verdict(code)
+        if runs and runs[-1][2] == what:
+            runs[-1] = (runs[-1][0], code, what)
+        else:
+            runs.append((code, code, what))
+    return [[f"{first:04X}", f"{last:04X}", what] for first, last, what in runs]
+
+
+def _name_verdicts_text(runs: list[list[str | None]]) -> str:
+    """The corpus file's exact text: one run per line, so a change reads as a short diff."""
+    rows = ",\n".join(f"    {json.dumps(run)}" for run in runs)
+    return (
+        "{\n"
+        f'  "_about": {json.dumps(_NAME_VERDICTS_ABOUT)},\n'
+        f'  "unicode_version": {json.dumps(UNICODE_VERSION)},\n'
+        f'  "verdicts": [\n{rows}\n  ]\n'
+        "}\n"
+    )
+
+
+def write_name_verdicts() -> None:
+    """Write ``name_verdicts.json`` from this edition's rule."""
+    (_TESTDATA / _NAME_VERDICTS).write_text(
+        _name_verdicts_text(_name_verdict_runs()), encoding="utf-8"
+    )
+
+
+def test_every_code_point_has_the_shared_name_verdict() -> None:
+    """Each of the 1,114,112 code points gets the verdict the corpus, and so the other edition,
+    gives it; the file is exactly what :func:`write_name_verdicts` writes."""
+    text = (_TESTDATA / _NAME_VERDICTS).read_text(encoding="utf-8")
+    document = cast(dict[str, object], json.loads(text))
+    assert document["unicode_version"] == UNICODE_VERSION
+    expected = cast(list[list[str | None]], document["verdicts"])
+    actual = _name_verdict_runs()
+    for index, (have, want) in enumerate(zip(actual, expected)):
+        assert have == want, f"run {index}: this edition says {have}, the corpus {want}"
+    assert len(actual) == len(expected)
+    assert text == _name_verdicts_text(actual)
+
+
+def _version(text: str) -> tuple[int, ...]:
+    return tuple(int(part) for part in text.split("."))
+
+
+def test_the_written_out_tables_agree_with_this_interpreters_unicode() -> None:
+    """The tables are written out, not borrowed, but this interpreter's own database can still
+    vouch for them as far as its Unicode version allows.
+
+    Private use has not changed since Unicode 2.0, and a noncharacter is never assigned. Unicode
+    never unassigns a code point, so a database older than the tables leaves unassigned at least
+    everything they call unassigned, a newer one at most that, and one of the same version exactly
+    that. Category Cf is the same in Unicode 15.0 and 16.0.
+    """
+    interpreter = _version(unicodedata.unidata_version)
+    tables = _version(UNICODE_VERSION)
+    format_codes = {code for low, high in FORMAT_CHARACTER_RANGES for code in range(low, high + 1)}
+    for code in range(0x110000):
+        character = chr(code)
+        category = unicodedata.category(character)
+        assert (category == "Co") == is_private_use(character), f"U+{code:04X}"
+        if is_noncharacter(character):
+            assert category == "Cn", f"U+{code:04X}"
+        if interpreter == tables:
+            assert (category == "Cn") == is_unassigned(character), f"U+{code:04X}"
+        elif interpreter < tables:
+            assert category == "Cn" or not is_unassigned(character), f"U+{code:04X}"
+        else:
+            assert category != "Cn" or is_unassigned(character), f"U+{code:04X}"
+        if interpreter in ((15, 0, 0), tables):
+            assert (category == "Cf") == (code in format_codes), f"U+{code:04X}"
 
 
 def _read_json(text: str) -> str | None:
@@ -510,3 +667,9 @@ def test_python_and_rust_packages_share_one_version() -> None:
     python_project = _manifest_version(_REPOSITORY / "py" / "herdr_run" / "pyproject.toml", "project")
     rust_package = _manifest_version(_REPOSITORY / "rs" / "herdr-run" / "Cargo.toml", "package")
     assert __version__ == python_project == rust_package
+
+
+if __name__ == "__main__":
+    if sys.argv[1:] != ["--write-name-verdicts"]:
+        sys.exit(f"usage: {sys.argv[0]} --write-name-verdicts")
+    write_name_verdicts()

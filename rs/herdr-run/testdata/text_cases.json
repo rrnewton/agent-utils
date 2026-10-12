@@ -752,6 +752,30 @@
     [
       "\u2801",
       "\u2801"
+    ],
+    [
+      "x\ue000",
+      "\"x\\u{e000}\""
+    ],
+    [
+      "\u0378",
+      "\"\\u{378}\""
+    ],
+    [
+      "a\ufdd0",
+      "\"a\\u{fdd0}\""
+    ],
+    [
+      "\ud834\udd59",
+      "\"\\u{1d159}\""
+    ],
+    [
+      "dir\ud81b\udfe4",
+      "\"dir\\u{16fe4}\""
+    ],
+    [
+      "\u1c89",
+      "\u1c89"
     ]
   ],
   "name_violation": [
@@ -921,10 +945,94 @@
     ],
     [
       "x\udb44\udc00",
-      null
+      "unassigned code point U+E1000"
     ],
     [
       "x\u17b6",
+      null
+    ],
+    [
+      "x\ud834\udd59",
+      "invisible character U+1D159"
+    ],
+    [
+      "x\ud81b\udfe4",
+      "invisible character U+16FE4"
+    ],
+    [
+      "x\ud834\udd58",
+      null
+    ],
+    [
+      "x\ud81b\udfe3",
+      null
+    ],
+    [
+      "x\ufdd0",
+      "noncharacter U+FDD0"
+    ],
+    [
+      "x\ufdef",
+      "noncharacter U+FDEF"
+    ],
+    [
+      "\ufffe",
+      "noncharacter U+FFFE"
+    ],
+    [
+      "x\uffff",
+      "noncharacter U+FFFF"
+    ],
+    [
+      "x\ud83f\udfff",
+      "noncharacter U+1FFFF"
+    ],
+    [
+      "x\udbbf\udffe",
+      "noncharacter U+FFFFE"
+    ],
+    [
+      "x\udbff\udfff",
+      "noncharacter U+10FFFF"
+    ],
+    [
+      "x\ue000",
+      "private-use character U+E000"
+    ],
+    [
+      "x\uf8ff",
+      "private-use character U+F8FF"
+    ],
+    [
+      "x\udb80\udc00",
+      "private-use character U+F0000"
+    ],
+    [
+      "x\udbff\udffd",
+      "private-use character U+10FFFD"
+    ],
+    [
+      "git\u0378",
+      "unassigned code point U+0378"
+    ],
+    [
+      "x\ud888\udfb0",
+      "unassigned code point U+323B0"
+    ],
+    [
+      "x\ud87f\udffd",
+      "unassigned code point U+2FFFD"
+    ],
+    [
+      "\u0378\ue000",
+      "unassigned code point U+0378"
+    ],
+    [
+      "\u1c89",
+      null
+    ],
+    [
+      "x\ud833\udc00",
       null
     ]
   ],
@@ -1148,6 +1256,14 @@
     [
       "[\"\\ud83d\\ude00 \\u2801\"]",
       "[\"\ud83d\ude00 \u2801\"]"
+    ],
+    [
+      "[\"\\ud834\\udd59\\ud81b\\udfe4\"]",
+      "[\"\\ud834\\udd59\\ud81b\\udfe4\"]"
+    ],
+    [
+      "[\"\\ue000\\u0378\\ufdd0\"]",
+      "[\"\ue000\u0378\ufdd0\"]"
     ]
   ],
   "agent": [
@@ -1381,6 +1497,36 @@
       "\u00a0",
       {
         "error": "argument --agent: an agent name may not contain invisible character U+00A0"
+      }
+    ],
+    [
+      {},
+      "agent\ue000",
+      {
+        "error": "argument --agent: an agent name may not contain private-use character U+E000"
+      }
+    ],
+    [
+      {
+        "HERDR_RUN_AGENT": "a\u0378"
+      },
+      null,
+      {
+        "error": "environment variable HERDR_RUN_AGENT: an agent name may not contain unassigned code point U+0378"
+      }
+    ],
+    [
+      {},
+      "x\ud834\udd59",
+      {
+        "error": "argument --agent: an agent name may not contain invisible character U+1D159"
+      }
+    ],
+    [
+      {},
+      "\u1c89",
+      {
+        "agent": "\u1c89"
       }
     ]
   ]

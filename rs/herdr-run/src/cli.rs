@@ -878,8 +878,9 @@ fn dispatch(invocation: Invocation) -> Result<i32> {
 
 /// The agent this invocation speaks for: `--agent`, else [`default_agent`].
 ///
-/// An agent name, from either source, may hold no control character and no invisible character
-/// ([`name_violation`]): it names a tab somebody will read, and is printed.
+/// An agent name, from either source, may hold no character a name may not contain
+/// ([`name_violation`]): no control, no invisible character, no noncharacter, no private-use
+/// character, and no unassigned code point. It names a tab somebody will read, and is printed.
 fn resolve_agent(globals: &Globals) -> Result<String> {
     resolve_agent_from(globals.agent.as_deref(), |key| std::env::var_os(key))
 }
@@ -904,10 +905,10 @@ where
 ///
 /// The first of the three variables that is set and non-empty once Unicode `White_Space` is
 /// trimmed from both ends (the explicit table in [`crate::textfmt`], so a value of only U+3000 or
-/// U+00A0 counts as empty and the next variable is consulted). A value that still holds a control
-/// or invisible character after trimming is an error rather than a tab label. A variable that is
-/// not valid UTF-8 is an error too: skipping it would make this invocation speak for whoever the
-/// NEXT variable names.
+/// U+00A0 counts as empty and the next variable is consulted). A value that still holds a
+/// character a name may not contain after trimming is an error rather than a tab label. A
+/// variable that is not valid UTF-8 is an error too: skipping it would make this invocation speak
+/// for whoever the NEXT variable names.
 fn default_agent<F>(lookup: F) -> Result<String>
 where
     F: Fn(&str) -> Option<OsString>,

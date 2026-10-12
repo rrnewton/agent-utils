@@ -789,8 +789,10 @@ def _print_subcommand_help(name: str) -> None:
 def _resolve_agent(globals_: _Globals, environ: Mapping[str, str]) -> str:
     """The agent this invocation speaks for: ``--agent``, else :func:`_default_agent`.
 
-    An agent name, from either source, may hold no control character and no invisible character
-    (:func:`herdr_run.textfmt.name_violation`): it names a tab somebody will read, and is printed.
+    An agent name, from either source, may hold no character a name may not contain
+    (:func:`herdr_run.textfmt.name_violation`): no control, no invisible character, no
+    noncharacter, no private-use character, and no unassigned code point. It names a tab somebody
+    will read, and is printed.
     """
     if globals_.agent:
         violation = name_violation(globals_.agent)
@@ -806,9 +808,9 @@ def _default_agent(environ: Mapping[str, str]) -> str:
     The first of the three variables that is set and non-empty once Unicode ``White_Space`` is
     trimmed from both ends (the explicit table in :mod:`herdr_run.textfmt`, so a value of only
     U+3000 or U+00A0 counts as empty and the next variable is consulted). A value that still holds
-    a control or invisible character after trimming is an error rather than a tab label. A variable
-    that is not valid UTF-8 is an error too: skipping it would make this invocation speak for
-    whoever the NEXT variable names.
+    a character a name may not contain after trimming is an error rather than a tab label. A
+    variable that is not valid UTF-8 is an error too: skipping it would make this invocation speak
+    for whoever the NEXT variable names.
     """
     for key in ("HERDR_RUN_AGENT", "DG_AGENT_NAME", "ORC_AGENT_NAME"):
         raw = environ.get(key)

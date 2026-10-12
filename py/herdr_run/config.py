@@ -412,6 +412,9 @@ def _policy_name(raw: object, what: str) -> str:
     zero-width space, a byte-order mark, or a bidirectional override, or a non-ASCII space such as
     U+00A0 or U+2028 -- because a name holding one looks exactly like the name without it, and a
     deny entry that looks like ``-c`` but is not would never match the ``-c`` it appears to deny.
+    Nor may it hold a noncharacter, a private-use character, or a code point Unicode 16.0 leaves
+    unassigned, which draw as whatever the font in use makes of them, often nothing
+    (:func:`herdr_run.textfmt.name_violation`).
     """
     value = _text(raw, what)
     if not value:

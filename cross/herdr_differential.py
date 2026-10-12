@@ -1230,7 +1230,8 @@ def _policy(harness: Harness, report: Report) -> None:
     report.exact("policy/custom-narrowed", python, rust, expected_rc=77)
 
     # A deny entry ending in an invisible character used to be accepted, and then never matched:
-    # `git -c core.pager=evil log` was ALLOWED. The configuration is refused instead.
+    # `git -c core.pager=evil log` was ALLOWED. The configuration is refused instead, and so is
+    # one ending in a character that draws as whatever the font makes of it.
     for label, entry in (
         ("combining-grapheme-joiner", "-c\u034f"),
         ("variation-selector", "-c\ufe0f"),
@@ -1238,6 +1239,13 @@ def _policy(harness: Harness, report: Report) -> None:
         ("braille-blank", "-c\u2800"),
         ("supplementary-variation-selector", "-c\U000e0100"),
         ("unassigned-tag-block", "-c\U000e0080"),
+        ("null-notehead", "-c\U0001d159"),
+        ("khitan-filler", "-c\U00016fe4"),
+        ("noncharacter", "-c\ufdd0"),
+        ("private-use", "-c\ue000"),
+        ("supplementary-private-use", "-c\U00100000"),
+        ("unassigned", "-c\u0378"),
+        ("unassigned-supplementary", "-c\U000323b0"),
     ):
         case = harness.case(
             f"policy-invisible-deny-{label}",
@@ -1389,6 +1397,11 @@ def _agents(harness: Harness, report: Report) -> None:
         ("bidi-override", "a\u202eb"),
         ("no-break-space", "\u00a0"),
         ("word-joiner", "x\u2060y"),
+        ("private-use", "agent\ue000"),
+        ("unassigned", "a\u0378"),
+        ("noncharacter", "a\ufdd0"),
+        ("null-notehead", "x\U0001d159"),
+        ("unicode-16-letter", "\u1c89"),
     ):
         python, rust = harness.invoke(case, ("--agent", value, "config"))
         report.same(f"agents/flag/{label}", python, rust, allowed=frozenset({0, 2, 78}))

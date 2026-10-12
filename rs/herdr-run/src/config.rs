@@ -596,6 +596,9 @@ fn require_text(value: &Yaml, what: &str) -> Result<String> {
 /// zero-width space, a byte-order mark, or a bidirectional override, or a non-ASCII space such as
 /// U+00A0 or U+2028 -- because a name holding one looks exactly like the name without it, and a
 /// deny entry that looks like `-c` but is not would never match the `-c` it appears to deny.
+/// Nor may it hold a noncharacter, a private-use character, or a code point Unicode 16.0 leaves
+/// unassigned, which draw as whatever the font in use makes of them, often nothing
+/// ([`name_violation`]).
 fn require_policy_name(value: &Yaml, what: &str) -> Result<String> {
     let text = require_text(value, what)?;
     if text.is_empty() {
@@ -1433,5 +1436,72 @@ mod tests {
         assert_eq!(config.workspace, "café");
         assert_eq!(config.prompt_tail.as_deref(), Some("\u{a0}$ "));
         assert_eq!(config.spool_dir, "out\u{a0}dir");
+    }
+
+    /// A noncharacter, a private-use character, or an unassigned code point draws as whatever the
+    /// font makes of it, often nothing; U+1D159 and U+16FE4 are assigned but draw nothing at all.
+    #[test]
+    fn a_character_with_no_settled_appearance_in_a_policy_name_is_refused() {
+        for (document, place, what) in [
+            (
+                "allow: [git, \"git\\ufdd0\"]\n",
+                "allow[1]",
+                "noncharacter U+FDD0",
+            ),
+            (
+                "deny_anywhere: [\"--upload-pack\\U0010FFFF\"]\n",
+                "deny_anywhere[0]",
+                "noncharacter U+10FFFF",
+            ),
+            (
+                "prefixes: [\"with-proxy\\ue000\"]\n",
+                "prefixes[0]",
+                "private-use character U+E000",
+            ),
+            (
+                "workspace: \"w\\U000F0000\"\n",
+                "workspace",
+                "private-use character U+F0000",
+            ),
+            (
+                "allow: [git]\ndeny_global:\n  git: [\"-c\\u0378\", --exec-path]\n",
+                "deny_global.git[0]",
+                "unassigned code point U+0378",
+            ),
+            (
+                "value_options:\n  git: [\"-C\\U000E1000\"]\n",
+                "value_options.git[0]",
+                "unassigned code point U+E1000",
+            ),
+            (
+                "tab_name: \"{agent}\\U0001D159\"\n",
+                "tab_name",
+                "invisible character U+1D159",
+            ),
+            (
+                "deny_subcommand:\n  git: [\"daemon\\U00016FE4\"]\n",
+                "deny_subcommand.git[0]",
+                "invisible character U+16FE4",
+            ),
+        ] {
+            let error = parse_text(document).expect_err(document);
+            let message = error.message();
+            assert!(message.contains(&format!(".{place}: ")), "{message}");
+            assert!(
+                message.contains(&format!(" contains {what}; ")),
+                "{message}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_letter_unicode_16_assigned_is_a_name_and_odd_text_outside_names_is_accepted() {
+        let config = parse_text(
+            "workspace: \"\\u1C89\"\nprompt_tail: \"\\ue000$ \"\nspool_dir: \"out\\u0378\"\n",
+        )
+        .unwrap();
+        assert_eq!(config.workspace, "\u{1c89}");
+        assert_eq!(config.prompt_tail.as_deref(), Some("\u{e000}$ "));
+        assert_eq!(config.spool_dir, "out\u{378}");
     }
 }

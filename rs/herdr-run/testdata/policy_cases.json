@@ -836,6 +836,109 @@
       }
     },
     {
+      "name": "noncharacter in allow",
+      "config": "allow: [git, \"git\\uFDD0\"]\n",
+      "home": null,
+      "command": "git status",
+      "expect": {
+        "config_error": "<config>.allow[1]: \"git\\u{fdd0}\" contains noncharacter U+FDD0; a name may not contain one, because it would look like a name it is not"
+      }
+    },
+    {
+      "name": "plane-end noncharacter in deny_anywhere",
+      "config": "deny_anywhere: [\"--upload-pack\\U0001FFFF\"]\n",
+      "home": null,
+      "command": "git fetch --upload-pack=/tmp/evil",
+      "expect": {
+        "config_error": "<config>.deny_anywhere[0]: \"--upload-pack\\u{1ffff}\" contains noncharacter U+1FFFF; a name may not contain one, because it would look like a name it is not"
+      }
+    },
+    {
+      "name": "private-use character in prefixes",
+      "config": "prefixes: [\"with-proxy\\uE000\"]\n",
+      "home": null,
+      "command": "git status",
+      "expect": {
+        "config_error": "<config>.prefixes[0]: \"with-proxy\\u{e000}\" contains private-use character U+E000; a name may not contain one, because it would look like a name it is not"
+      }
+    },
+    {
+      "name": "raw private-use character in shells",
+      "config": "shells: [bash\ue000]\n",
+      "home": null,
+      "command": "git status",
+      "expect": {
+        "config_error": "<config>.shells[0]: \"bash\\u{e000}\" contains private-use character U+E000; a name may not contain one, because it would look like a name it is not"
+      }
+    },
+    {
+      "name": "supplementary private-use character in workspace",
+      "config": "workspace: \"w\\U00100000\"\n",
+      "home": null,
+      "command": "git status",
+      "expect": {
+        "config_error": "<config>.workspace: \"w\\u{100000}\" contains private-use character U+100000; a name may not contain one, because it would look like a name it is not"
+      }
+    },
+    {
+      "name": "unassigned code point ends a deny entry",
+      "config": "allow: [git]\ndeny_global:\n  git: [\"-c\\u0378\", --exec-path]\n",
+      "home": null,
+      "command": "git -c core.pager=evil log",
+      "expect": {
+        "config_error": "<config>.deny_global.git[0]: \"-c\\u{378}\" contains unassigned code point U+0378; a name may not contain one, because it would look like a name it is not"
+      }
+    },
+    {
+      "name": "unassigned supplementary code point in value_options",
+      "config": "value_options:\n  git: [\"-C\\U000323B0\"]\n",
+      "home": null,
+      "command": "git -C daemon log",
+      "expect": {
+        "config_error": "<config>.value_options.git[0]: \"-C\\u{323b0}\" contains unassigned code point U+323B0; a name may not contain one, because it would look like a name it is not"
+      }
+    },
+    {
+      "name": "unassigned code point in a subcommand key",
+      "config": "allow_subcommand:\n  \"carg\\u0378\": [fetch]\n",
+      "home": null,
+      "command": "git status",
+      "expect": {
+        "config_error": "<config>.allow_subcommand key: \"carg\\u{378}\" contains unassigned code point U+0378; a name may not contain one, because it would look like a name it is not"
+      }
+    },
+    {
+      "name": "musical symbol null notehead in tab_name",
+      "config": "tab_name: \"{agent}\\U0001D159\"\n",
+      "home": null,
+      "command": "git status",
+      "expect": {
+        "config_error": "<config>.tab_name: \"{agent}\\u{1d159}\" contains invisible character U+1D159; a name may not contain one, because it would look like a name it is not"
+      }
+    },
+    {
+      "name": "khitan small script filler in deny_subcommand",
+      "config": "deny_subcommand:\n  git: [\"daemon\\U00016FE4\"]\n",
+      "home": null,
+      "command": "git daemon",
+      "expect": {
+        "config_error": "<config>.deny_subcommand.git[0]: \"daemon\\u{16fe4}\" contains invisible character U+16FE4; a name may not contain one, because it would look like a name it is not"
+      }
+    },
+    {
+      "name": "a letter Unicode 16.0 assigned is a name",
+      "config": "workspace: \"\\u1C89\"\n",
+      "home": null,
+      "command": "git status",
+      "expect": {
+        "allowed": {
+          "program": "git",
+          "subcommand": "status",
+          "rendered": "git status"
+        }
+      }
+    },
+    {
       "name": "attr-source hides daemon",
       "config": null,
       "home": null,

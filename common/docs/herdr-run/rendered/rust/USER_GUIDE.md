@@ -95,7 +95,7 @@ herdr-run userguide                # this document
 | Option | Effect |
 | --- | --- |
 | `--config PATH` | Use an explicit configuration file instead of the discovered one. Refused by `init`, `quickstart`, and `userguide`, which take no configuration file: `init` works on the one in the current directory, and the other two print a packaged document. |
-| `--agent NAME` | The agent this invocation speaks for; names its tab. Otherwise the first of `$HERDR_RUN_AGENT`, `$DG_AGENT_NAME`, and `$ORC_AGENT_NAME` that is non-empty once Unicode white space is trimmed from both ends (so a variable holding only U+3000 or U+00A0 is skipped like an empty one), else `unknown-agent`. An agent name, from the option or a variable, may contain no control character and no invisible character (a format character such as U+200B or U+202E, a default-ignorable code point such as U+034F or U+FE0F, a blank such as U+2800 or U+3164, or a space other than U+0020, as listed for policy names under the configuration file); one that does is a configuration error (78). So is a variable that is not valid UTF-8, rather than being skipped, so an invocation never speaks for the next variable's agent by accident. Refused by `check`, `init`, `reap`, `quickstart`, and `userguide`, which name no tab. |
+| `--agent NAME` | The agent this invocation speaks for; names its tab. Otherwise the first of `$HERDR_RUN_AGENT`, `$DG_AGENT_NAME`, and `$ORC_AGENT_NAME` that is non-empty once Unicode white space is trimmed from both ends (so a variable holding only U+3000 or U+00A0 is skipped like an empty one), else `unknown-agent`. An agent name, from the option or a variable, may contain no control character, no invisible character (a format character such as U+200B or U+202E, a default-ignorable code point such as U+034F or U+FE0F, a blank such as U+2800 or U+3164, or a space other than U+0020), and no noncharacter, private-use character, or code point Unicode 16.0 leaves unassigned, as listed for policy names under the configuration file; one that does is a configuration error (78). So is a variable that is not valid UTF-8, rather than being skipped, so an invocation never speaks for the next variable's agent by accident. Refused by `check`, `init`, `reap`, `quickstart`, and `userguide`, which name no tab. |
 | `--json` | Emit machine-readable output where the subcommand has one. Refused by `net-doctor`, `quickstart`, and `userguide`, whose only output is prose. `config`, `target`, and `reap` print JSON with or without it. |
 | `--version` | Print the version and exit. |
 | `--dump-surface` | Print every subcommand and option, with the value each option takes, as JSON, and exit. Meant for tools that check the command-line surface. |
@@ -170,11 +170,12 @@ no `#!` line, is reported as `Exec format error (os error 8)`, never run through
 Quoted values in diagnostics (`program "curl" is not allowlisted`, `got "maybe"`) are written with
 printable ASCII as is, `\n`, `\r`, and `\t` as escapes, and every other character as `\u{hex}`,
 so a message never writes a bidirectional override or a line separator to the terminal raw. What
-Herdr says when a call fails is quoted the same way whenever it holds a line break, a control, or
-an invisible character. JSON output, from `config`, `--json`, and the files `herdr-run` writes,
-escapes DEL, the C1 controls, and every invisible character as `\uXXXX` too, although JSON does
-not require it, so a project path holding U+009B or U+202E cannot reach a terminal through
-`herdr-run config`; any JSON reader gets the same strings back.
+Herdr says when a call fails, and a path or a name that a message otherwise shows as it is, is
+quoted the same way as soon as it holds a line break, a control, or any other character a name may
+not contain (listed under the configuration file below). JSON output, from `config`, `--json`, and
+the files `herdr-run` writes, escapes DEL, the C1 controls, and every invisible character as
+`\uXXXX` too, although JSON does not require it, so a project path holding U+009B or U+202E cannot
+reach a terminal through `herdr-run config`; any JSON reader gets the same strings back.
 
 ---
 
@@ -210,7 +211,7 @@ Two things in that file are worth naming here, because they are decisions rather
 
 Unknown or duplicate keys, merge keys, non-finite/excessive/sub-millisecond timeouts,
 fractional/negative retention days, retention beyond 365,000 days, a fractional/negative/oversized
-`max_panes`, control characters, invisible characters in names, and unsupported tab placeholders
+`max_panes`, control characters, characters a name may not contain, and unsupported tab placeholders
 are hard errors (exit 78). A typo'd policy key must not silently fall back to defaults. Keys are checked in the order the
 generated file lists them, so a file with two mistakes reports the first; type names in messages
 use the JSON vocabulary (`null`, `bool`, `number`, `string`, `array`, `object`).
@@ -250,11 +251,18 @@ right-to-left override, and the rest of Unicode category Cf); every default-igno
 variation selectors U+FE00..U+FE0F and U+E0100..U+E01EF, the Mongolian free variation selectors,
 the Khmer inherent vowels U+17B4 and U+17B5, and the code points reserved for more of the same,
 such as U+2065 and the unassigned rest of U+E0000..U+E0FFF); the characters that draw as blank
-space, U+2800 braille pattern blank and the Hangul fillers U+115F, U+1160, U+3164, and U+FFA0; and
-every space other than U+0020 (U+00A0, U+2028, U+3000, and the rest). A deny entry that looks like
-`-c` but ends in an invisible character would never match the `-c` it appears to deny, so it is a
-configuration error (78) instead. Visible non-ASCII names such as `café` are fine, and so is an
-invisible character in a value that is not a name, such as `prompt_tail`.
+space, U+2800 braille pattern blank, the Hangul fillers U+115F, U+1160, U+3164, and U+FFA0,
+U+16FE4 Khitan small script filler, and U+1D159 musical symbol null notehead; and every space
+other than U+0020 (U+00A0, U+2028, U+3000, and the rest). A deny entry that looks like `-c` but
+ends in an invisible character would never match the `-c` it appears to deny, so it is a
+configuration error (78) instead. So is a name holding a character that draws as whatever the
+font in use makes of it, often nothing: a noncharacter (U+FDD0..U+FDEF and the last two code
+points of every plane, such as U+FFFE and U+10FFFF), a private-use character (U+E000..U+F8FF and
+planes 15 and 16), or a code point Unicode 16.0 leaves unassigned. That last list is written out
+too, so a character a later Unicode version assigns is refused until herdr-run's tables are
+brought forward. Visible non-ASCII names such as `café` are fine, and so is any of these
+characters in a value that is not a name, such as `prompt_tail`. The same rule applies to an
+agent name.
 
 How a deny entry matches. A denied option is refused written out, with an attached value
 (`--upload-pack=CMD`), and in two more spellings, wherever its rule applies:
