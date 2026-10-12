@@ -3029,6 +3029,21 @@ const TUNING_BANDS = {
   OUTGOING_RETRY_ATTEMPTS: [1, 4,
     "automatic tries before a person decides. None is the incident this exists for; past a few, a " +
     "service that is down is asked again and again by a page nobody is watching"],
+  SEND_UNDO_MS: [8000, 30000,
+    "how long the Undo chip offers to take back a Dismiss in the outbox (#193 compose-draft-loss). " +
+    "Under eight seconds a reader who has just seen what they did is still finding the chip; past " +
+    "thirty it sits over the list long after anyone would think of it as the way back"],
+  DISMISSED_SENDS_LIMIT: [3, 25,
+    "how many dismissed sends Settings keeps (#193 compose-draft-loss). Fewer, and a morning of " +
+    "failed sends cleared in one go pushes out the one wanted back; more, and the list is a second " +
+    "outbox nobody reads, holding text on the device long after it mattered"],
+  DISMISSED_SENDS_DAYS: [1, 14,
+    "how many days a dismissed send is kept (#193 compose-draft-loss). Under a day it is gone " +
+    "before the reader is back at the same device; past two weeks it is text kept for no reason"],
+  SEND_SNIPPET_CHARS: [16, 48,
+    "how much of a message the Undo chip and Put back quote to name it (#193 compose-draft-loss). " +
+    "Under sixteen characters two messages read the same; past forty-eight the chip wraps the row " +
+    "of chips on a phone"],
   CHANNEL_READ_TIMEOUT_MS: [15000, 45000,
     "how long a read of the newest messages is waited for (#195 send-resilience). A slow service " +
     "ordinarily answers in ten to twelve seconds, so under fifteen every slow read fails; past " +
@@ -27597,6 +27612,413 @@ test("dismissing an unconfirmed local message removes it durably without posting
   await reopenedChannel(again);
   assert.equal(outgoingRows(again).length, 0);
   assert.equal(again.repliesPosted.length, 0);
+});
+
+// --- `#193 compose-draft-loss`: taking a send back, and a reply draft on its row ------------------
+//
+// The owner's audit: where can typing still be lost? A failed send kept its text but could only be
+// retried or thrown away, with one tap and no way back, and a saved reply draft left no trace on the
+// message it answered. These walk the rendered controls and the device's storage, never the
+// implementation.
+
+const outgoingEdit = (row) => row.descendants().find((node) => node.hasClass("outgoing-edit"));
+const outgoingActions = (row) =>
+  row.descendants().filter((node) => node.tagName === "button").map((node) => node.textContent);
+const savedDismissed = (page) => JSON.parse(page.storage.get("vibe-talk.dismissed-sends") || "[]");
+const dismissedItems = (page) => page.el("dismissed-sends").children;
+const putBackOf = (item) => item.descendants().find((node) => node.hasClass("dismissed-send-restore"));
+const draftMarkerOf = (row) => row.descendants().find((node) => node.className === "draft-marker");
+const SEND_UNDO_MS = sourceConstant("SEND_UNDO_MS");
+const DAY_MS = 24 * 60 * 60 * 1000;
+
+/** Send `text` from the box on screen into a refusal (403) or a lost answer (502), and its row. */
+async function failedSend(page, text, status = 403, box = "channel-compose-text", send = "channel-send") {
+  page.replyResponse = status >= 500
+    ? errorResponse(status, "chat_error", "Google Chat returned HTTP 502")
+    : errorResponse(status, "refused", "You cannot post to this channel.");
+  await page.el(box).setValue(text);
+  await page.el(send).click();
+  await page.settle();
+  const rows = page.el(box === "side-compose-text" ? "side-outgoing-log" : "outgoing-log").children;
+  return rows[rows.length - 1];
+}
+
+test("`#193 compose-draft-loss`: Edit puts a failed message back in the channel's box, under a draft typed since, and takes it out of the outbox", async () => {
+  const page = newPage();
+  await signIn(page);
+  await showDiscord(page, []);
+  const failed = await failedSend(page, "the words that did not go");
+  assert.equal(failed.getAttribute("data-send-state"), "failed");
+  assert.deepEqual(outgoingActions(failed), ["Retry", "Edit", "Dismiss"], "a failed send's actions");
+  const edit = outgoingEdit(failed);
+  // Named by what it says: no label of its own to drift from the word on screen.
+  assert.equal(edit.getAttribute("aria-label"), null);
+  assert.equal(edit.disabled, false);
+
+  // An empty box takes the text as it was.
+  await edit.click();
+  await page.settle();
+  assert.equal(page.el("channel-compose-text").value, "the words that did not go");
+  assert.equal(page.el("channel-compose-state").textContent, "");
+  assert.equal(focused(page), page.el("channel-compose-text"), "the box was not handed the focus");
+  assert.equal(outgoingRows(page).length, 0, "the edited send stayed in the outbox");
+  assert.deepEqual(savedOutgoing(page), []);
+  assert.equal(page.repliesPosted.length, 1, "Edit sent something");
+
+  // A box with a draft in it keeps the draft, and the text goes under it.
+  await page.el("channel-send").click();
+  await page.settle();
+  assert.equal(page.el("channel-compose-text").value, "");
+  await page.el("channel-compose-text").setValue("a newer thought");
+  await outgoingEdit(outgoingRows(page)[0]).click();
+  await page.settle();
+  const both = "a newer thought\n\nthe words that did not go";
+  assert.equal(page.el("channel-compose-text").value, both, "Edit lost or overwrote the draft in the box");
+  assert.match(page.el("channel-compose-state").textContent, /under the draft that was already here/);
+  assert.equal(outgoingRows(page).length, 0);
+  assert.equal(JSON.parse(page.storage.get("vibe-talk.channel-drafts"))[JSON.stringify([CHANNEL.id, null])], both,
+    "the box's text is not kept as its draft");
+
+  // ...and it is the box's draft after a reload, as anything typed there is.
+  const again = reloadWith(new Map(page.storage), []);
+  await signIn(again);
+  await reopenedChannel(again);
+  assert.equal(again.el("channel-compose-text").value, both);
+  assert.equal(outgoingRows(again).length, 0);
+  assert.equal(again.repliesPosted.length, 0);
+});
+
+test("`#193 compose-draft-loss`: Edit on a send whose delivery is unconfirmed says to check the channel before sending it again", async () => {
+  const page = newPage();
+  await signIn(page);
+  await showDiscord(page, []);
+  const unconfirmed = await failedSend(page, "this may already be there", 502);
+  assert.equal(unconfirmed.getAttribute("data-send-state"), "unconfirmed");
+  await outgoingEdit(unconfirmed).click();
+  await page.settle();
+  assert.equal(page.el("channel-compose-text").value, "this may already be there");
+  assert.match(page.el("channel-compose-state").textContent, /unconfirmed.*check before you send it again/);
+});
+
+test("`#193 compose-draft-loss`: Edit on a thread's failed message puts it in that thread's box, opening the thread when it is pressed in All", async () => {
+  const page = await threadPage();
+  const thread = "spaces/A/threads/one & two";
+  await pickThread(page, `thread:${thread}`);
+  const failed = await failedSend(page, "an answer in the thread");
+  assert.equal(page.repliesPosted[0].body.thread_id, thread);
+  // In the thread, its own box: nothing moves.
+  await outgoingEdit(failed).click();
+  await page.settle();
+  assert.equal(page.el("thread-select").value, `thread:${thread}`);
+  assert.equal(page.el("channel-compose-text").value, "an answer in the thread");
+
+  // Sent again and refused again, and found from All, whose box is the main channel's.
+  await page.el("channel-send").click();
+  await page.settle();
+  await pickThread(page, "flat");
+  assert.equal(page.el("channel-compose-text").value, "", "All's box holds the thread's text");
+  const shown = outgoingRows(page)[0];
+  assert.ok(shown, "All does not show the thread's failed send");
+  await outgoingEdit(shown).click();
+  await page.settle();
+  assert.equal(page.el("thread-select").value, `thread:${thread}`, "the thread was not opened for its message");
+  assert.equal(page.el("channel-compose-text").value, "an answer in the thread");
+  assert.equal(focused(page), page.el("channel-compose-text"));
+  assert.equal(outgoingRows(page).length, 0);
+  await pickThread(page, "flat");
+  assert.equal(page.el("channel-compose-text").value, "", "the thread's text was put in All's box as well");
+});
+
+test("`#193 compose-draft-loss`: in two columns, Edit on the right column's failed send puts it back in the right column's box", async () => {
+  const { page } = await twoColumnServer();
+  await threadBadge(rowWithId(page, "201")).click();
+  await page.settle();
+  const failed = await failedSend(page, "from the right column", 403, "side-compose-text", "side-send");
+  assert.ok(failed, "the right column shows no failed send");
+  assert.equal(page.el("channel-compose-text").value, "");
+  await outgoingEdit(failed).click();
+  await page.settle();
+  assert.equal(page.el("side-compose-text").value, "from the right column");
+  assert.equal(page.el("channel-compose-text").value, "", "the left column's box took the right column's text");
+  assert.equal(focused(page), page.el("side-compose-text"));
+  assert.equal(page.el("side-outgoing-log").children.length, 0);
+});
+
+test("`#193 compose-draft-loss`: Edit on a failed reply opens Reply on the message it answers, under the draft started since, and sends to that message", async () => {
+  const page = newPage();
+  await signIn(page);
+  const messages = [message({ id: "9310", content: "the question" }), message({ id: "9311", content: "something else" })];
+  await openReplyOn(page, messages);
+  page.replyResponse = errorResponse(403, "refused", "You cannot post to this channel.");
+  await page.el("reply-text").setValue("my first answer");
+  await page.el("reply-send").click();
+  await page.settle();
+  assert.equal(page.screen(), "main");
+  assert.equal(outgoingEdit(outgoingRows(page)[0]).getAttribute("title"),
+    "Put this text back in Reply on the message it answers, and take it out of the outbox.");
+  // A second thought on the same question, left as a draft.
+  await openReplyOn(page, messages);
+  await page.el("reply-text").setValue("and a second thought");
+  await page.el("close-reply").click();
+
+  await outgoingEdit(outgoingRows(page)[0]).click();
+  await page.settle();
+  assert.equal(page.screen(), "reply", "Edit did not open Reply");
+  assert.match(page.el("reply-target-meta").textContent, /id 9310/, "Reply opened on another message");
+  const both = "and a second thought\n\nmy first answer";
+  assert.equal(page.el("reply-text").value, both, "Edit lost or overwrote the reply draft");
+  assert.match(page.el("reply-state").textContent, /under the draft that was already here/);
+  assert.equal(focused(page), page.el("reply-text"));
+  assert.equal(outgoingRows(page).length, 0);
+  assert.equal(JSON.parse(page.storage.get("vibe-talk.voice.drafts"))["9310"], both);
+
+  distinctReplies(page);
+  await page.el("reply-send").click();
+  await page.settle();
+  assert.deepEqual(page.repliesPosted.at(-1).body, { text: both, reply_to: "9310" });
+});
+
+test("`#193 compose-draft-loss`: a failed reply that started a new thread comes back to Reply with that choice ticked", async () => {
+  const page = newPage();
+  page.threadingSupported = true;
+  const data = threadData();
+  page.threads = data.threads;
+  const lone = { id: "spaces/A/threads/lone", root_message_id: "210", is_root: true,
+    reply_count: 0, reply_count_exact: true };
+  await signIn(page);
+  await showDiscord(page, [...data.messages, message({ id: "210", content: "nobody has answered this", thread: lone })]);
+  await replyButton(rowOf(page, "210")).click();
+  page.el("reply-branch").checked = true;
+  await page.el("reply-branch").dispatch("change");
+  page.replyResponse = errorResponse(403, "refused", "You cannot post to this channel.");
+  await page.el("reply-text").setValue("starting a thread on it");
+  await page.el("reply-send").click();
+  await page.settle();
+  assert.equal(savedOutgoing(page)[0].threadId, lone.id);
+
+  await outgoingEdit(outgoingRows(page)[0]).click();
+  await page.settle();
+  assert.equal(page.screen(), "reply");
+  assert.equal(page.el("reply-branch").checked, true, "the new thread it was sent to start was forgotten");
+  assert.match(page.el("reply-destination").textContent, /new thread/);
+  distinctReplies(page);
+  await page.el("reply-send").click();
+  await page.settle();
+  assert.deepEqual(page.repliesPosted.at(-1).body,
+    { text: "starting a thread on it", reply_to: "210", thread_id: lone.id });
+});
+
+test("`#193 compose-draft-loss`: Dismiss is taken back by a chip that names the message, and the text comes back as it was", async () => {
+  const page = newPage();
+  await signIn(page);
+  await showDiscord(page, []);
+  const failed = await failedSend(page, "keep this in case I want it after all");
+  const id = failed.getAttribute("data-outgoing-id");
+  const chip = page.el("undo-send-dismiss");
+  assertMarkupContains("scroll-tools", "undo-send-dismiss");
+  assert.equal(chip.hidden, true, "the chip is up before anything was dismissed");
+  assert.match(outgoingDismiss(failed).getAttribute("title"), /Undo brings it back/);
+
+  await outgoingDismiss(failed).click();
+  assert.equal(outgoingRows(page).length, 0);
+  assert.deepEqual(savedOutgoing(page), []);
+  assert.equal(chip.hidden, false, "no way back from the Dismiss");
+  // The chip's words are its name: the message it puts back, in its first few words.
+  assert.equal(chip.textContent, "Undo dismiss: “keep this in case I want it…”");
+  assert.equal(chip.getAttribute("aria-label"), null);
+  assert.equal(page.el("status").textContent, "Dismissed. Undo it, or find it in Settings.");
+  assert.equal(savedDismissed(page).length, 1, "the dismissed text is not kept while Undo is offered");
+
+  await chip.click();
+  await page.settle();
+  assert.equal(chip.hidden, true, "the chip stayed after its Undo");
+  const back = outgoingRows(page)[0];
+  assert.ok(back, "Undo did not bring the message back");
+  assert.equal(back.getAttribute("data-outgoing-id"), id, "Undo made a new send of it");
+  assert.equal(back.getAttribute("data-send-state"), "failed");
+  assert.match(back.text(), /keep this in case I want it after all/);
+  assert.match(back.text(), /You cannot post to this channel/, "its reason was lost");
+  assert.equal(savedOutgoing(page)[0].text, "keep this in case I want it after all");
+  assert.deepEqual(savedDismissed(page), []);
+  assert.equal(page.repliesPosted.length, 1, "Undo sent it");
+
+  // Past the window the chip goes, and the text is still kept, in Settings.
+  await outgoingDismiss(back).click();
+  assert.ok(page.expireTimers(SEND_UNDO_MS) >= 1, "the chip was never timed to go");
+  assert.equal(chip.hidden, true, "the chip outlived its window");
+  assert.equal(savedDismissed(page).length, 1, "the window took the text with it");
+  const item = dismissedItems(page)[0];
+  assert.equal(page.el("dismissed-sends").hidden, false);
+  assert.match(item.text(), /keep this in case I want it after all/);
+  assert.match(item.text(), /dismissed just now/);
+  assert.equal(putBackOf(item).getAttribute("aria-label"), "Put back “keep this in case I want it…”");
+  assert.match(page.el("dismissed-sends-state").textContent, /kept on this device for 7 days/);
+
+  // ...and after a reload, where no Undo is offered for a dismissal the page did not see.
+  const again = reloadWith(new Map(page.storage), []);
+  await signIn(again);
+  await reopenedChannel(again);
+  assert.equal(outgoingRows(again).length, 0);
+  assert.equal(again.el("undo-send-dismiss").hidden, true);
+  // Settings names where it was going by the channel's name, once the channels are known.
+  await again.el("open-settings").click();
+  assert.match(dismissedItems(again)[0].text(), /^lead team · dismissed just now/);
+  await again.el("close-settings").click();
+  await putBackOf(dismissedItems(again)[0]).click();
+  await again.settle();
+  assert.equal(outgoingRows(again)[0].getAttribute("data-outgoing-id"), id);
+  assert.equal(outgoingRows(again)[0].getAttribute("data-send-state"), "failed");
+  assert.equal(dismissedItems(again).length, 0);
+  assert.equal(again.el("dismissed-sends").hidden, true);
+  assert.match(again.el("dismissed-sends-state").textContent, /^Nothing dismissed in the last 7 days/);
+  assert.equal(again.repliesPosted.length, 0, "putting it back sent it");
+});
+
+test("`#193 compose-draft-loss`: Recently dismissed keeps the newest ten, for seven days, and forgets them when asked", async () => {
+  assert.equal(sourceConstant("DISMISSED_SENDS_LIMIT"), 10);
+  assert.equal(sourceConstant("DISMISSED_SENDS_DAYS"), 7);
+  const page = newPage();
+  await signIn(page);
+  await showDiscord(page, []);
+  for (let n = 1; n <= 12; n += 1) {
+    const row = await failedSend(page, `dismissed message number ${n}`);
+    await outgoingDismiss(row).click();
+    page.setClock(page.clock() + 60000);
+  }
+  const texts = savedDismissed(page).map((held) => held.entry.text);
+  assert.equal(texts.length, 10, "more than the newest ten were kept");
+  assert.equal(texts[0], "dismissed message number 12", "the newest is not first");
+  assert.equal(texts[9], "dismissed message number 3");
+  assert.equal(dismissedItems(page).length, 10);
+  assert.match(dismissedItems(page)[0].text(), /dismissed message number 12/);
+
+  // Six days on, all ten are there after a reload; eight days on, none, on screen or on the device.
+  const sixDays = reloadWith(new Map(page.storage), [], (p) => p.setClock(page.clock() + 6 * DAY_MS));
+  await signIn(sixDays);
+  assert.equal(dismissedItems(sixDays).length, 10, "kept for less than seven days");
+  assert.match(dismissedItems(sixDays)[0].text(), /dismissed 6d ago/);
+  const eightDays = reloadWith(new Map(page.storage), [], (p) => p.setClock(page.clock() + 8 * DAY_MS));
+  await signIn(eightDays);
+  assert.equal(dismissedItems(eightDays).length, 0, "kept for more than seven days");
+  assert.equal(eightDays.storage.has("vibe-talk.dismissed-sends"), false, "expired text stayed on the device");
+  assert.equal(eightDays.el("forget-dismissed-sends").hidden, true);
+
+  // Forget these now, at once.
+  assert.equal(sixDays.el("forget-dismissed-sends").hidden, false);
+  await sixDays.el("forget-dismissed-sends").click();
+  assert.equal(dismissedItems(sixDays).length, 0);
+  assert.equal(sixDays.storage.has("vibe-talk.dismissed-sends"), false);
+  assert.equal(sixDays.el("forget-dismissed-sends").hidden, true);
+});
+
+test("`#193 compose-draft-loss`: a row with a saved reply draft says Draft beside Reply, which opens the draft, until it is sent or emptied", async () => {
+  const page = newPage();
+  await signIn(page);
+  await showDiscord(page, [message({ id: "9410", content: "answer me later" }),
+    message({ id: "9411", content: "nothing to say to this" })]);
+  const marker = (id) => draftMarkerOf(rowOf(page, id));
+  assert.equal(marker("9410").hidden, true, "a row with no draft is marked");
+  assert.equal(marker("9410").tagName, "button");
+  assert.equal(marker("9410").getAttribute("aria-label"), "Draft reply");
+  assert.equal(marker("9410").textContent, "Draft");
+  // Directly before Reply, among the row's controls.
+  const reply = replyButton(rowOf(page, "9410"));
+  const siblings = reply.parentNode.children;
+  assert.equal(siblings[siblings.indexOf(reply) - 1], marker("9410"), "Draft is not beside Reply");
+
+  await reply.click();
+  await page.el("reply-text").setValue("half an answer");
+  await page.el("close-reply").click();
+  assert.equal(marker("9410").hidden, false, "the row whose reply was left unsent is not marked");
+  assert.equal(marker("9411").hidden, true, "another row was marked");
+
+  await marker("9410").click();
+  assert.equal(page.screen(), "reply", "Draft did not open Reply");
+  assert.match(page.el("reply-target-meta").textContent, /id 9410/);
+  assert.equal(page.el("reply-text").value, "half an answer");
+  // Emptied, it goes.
+  await page.el("reply-text").setValue("");
+  await page.el("close-reply").click();
+  assert.equal(marker("9410").hidden, true, "an emptied draft left its mark");
+
+  // Written again and sent, it goes too.
+  await replyButton(rowOf(page, "9410")).click();
+  await page.el("reply-text").setValue("the whole answer");
+  await page.el("close-reply").click();
+  assert.equal(marker("9410").hidden, false);
+  distinctReplies(page);
+  await marker("9410").click();
+  await page.el("reply-send").click();
+  await page.settle();
+  assert.equal(marker("9410").hidden, true, "a sent draft left its mark");
+});
+
+test("`#193 compose-draft-loss`: the Draft mark comes back with its draft after a reload, and after a sign-in the page was sent away to", async () => {
+  const first = newPage();
+  await signIn(first);
+  const answered = message({ id: "1311", content: "answer this after signing in again" });
+  await showDiscord(first, [answered]);
+  await replyButton(rowOf(first, "1311")).click();
+  await first.el("reply-text").setValue("what I had written");
+  await first.el("close-reply").click();
+  await first.setVisibility("hidden");
+
+  const reloaded = reloadWith(new Map(first.storage), [answered]);
+  await signIn(reloaded);
+  await reopenedChannel(reloaded);
+  assert.equal(draftMarkerOf(rowOf(reloaded, "1311")).hidden, false, "a reload lost the mark");
+
+  // The token is refused at the reopen, and the reader signs in again.
+  const revoked = errorResponse(401, "unauthorized", "token revoked");
+  const page = reloadPage(new Map(first.storage), (p) => {
+    p.onlineConfig = p.clientConfig;
+    p.clientConfig = revoked;
+    p.channelPage = revoked;
+  });
+  await page.settle();
+  await page.settle();
+  assert.equal(page.screen(), "signin");
+  page.clientConfig = page.onlineConfig;
+  page.channelPage = async () => json(200, { channel: CHANNEL, messages: [answered] });
+  await signIn(page);
+  await page.settle();
+  assert.equal(page.tab(), "discord");
+  const marker = draftMarkerOf(rowOf(page, "1311"));
+  assert.equal(marker.hidden, false, "signing in again lost the mark");
+  await marker.click();
+  assert.equal(page.screen(), "reply");
+  assert.equal(page.el("reply-text").value, "what I had written");
+});
+
+test("`#193 compose-draft-loss`: the Draft mark is on its message's row in All, Main, the thread, and both columns", async () => {
+  const page = await threadPage();
+  assert.equal(page.el("thread-select").value, "flat");
+  await replyButton(rowOf(page, "201")).click();
+  await page.el("reply-text").setValue("a reply to the first thread's root");
+  await page.el("close-reply").click();
+  assert.equal(draftMarkerOf(rowOf(page, "201")).hidden, false, "not marked in All");
+  assert.equal(draftMarkerOf(rowOf(page, "200")).hidden, true);
+  await pickThread(page, "main");
+  assert.equal(draftMarkerOf(rowOf(page, "201")).hidden, false, "not marked in Main");
+  await pickThread(page, "thread:spaces/A/threads/one & two");
+  assert.equal(draftMarkerOf(rowOf(page, "201")).hidden, false, "not marked in its thread");
+  assert.equal(draftMarkerOf(rowOf(page, "202")).hidden, true);
+  await pickThread(page, "flat");
+  assert.equal(draftMarkerOf(rowOf(page, "201")).hidden, false, "not marked in All once it was shown again");
+
+  await twoColumns(page);
+  await threadBadge(rowWithId(page, "201")).click();
+  await page.settle();
+  assert.equal(draftMarkerOf(sideRow(page, "201")).hidden, false, "not marked in the right column");
+  assert.equal(draftMarkerOf(rowWithId(page, "201")).hidden, false, "not marked in the left column");
+  // Sent from the right, it goes from both.
+  distinctReplies(page);
+  await draftMarkerOf(sideRow(page, "201")).click();
+  assert.equal(page.el("reply-text").value, "a reply to the first thread's root");
+  await page.el("reply-send").click();
+  await page.settle();
+  assert.equal(draftMarkerOf(sideRow(page, "201")).hidden, true, "the right column kept the mark of a sent draft");
+  assert.equal(draftMarkerOf(rowWithId(page, "201")).hidden, true, "the left column kept the mark of a sent draft");
 });
 
 test("a send timeout stops spinning and a late acknowledgement cannot silently retry or rewrite it", async () => {

@@ -23,6 +23,8 @@ interface HTMLLIElement {
   replyArrowButton?: HTMLButtonElement;
   /** `#228 reply-visible`. The circle on the row's lower-left corner, while it has one: the way down to a reply. */
   replyMarker?: HTMLButtonElement | null;
+  /** `#193 compose-draft-loss`. A channel row's Draft, shown while a reply to it is saved unsent. */
+  draftMarker?: HTMLButtonElement;
 }
 
 interface HTMLElement {

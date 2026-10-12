@@ -921,6 +921,44 @@ body {
   min-height: 2.5rem;
 }
 
+/* `#193 compose-draft-loss`. Settings' Recently dismissed: each unsent message dismissed from the
+   outbox, where it was going and how long ago, its first lines, and Put back. */
+.dismissed-sends {
+  display: grid;
+  gap: 0.5rem;
+  margin: 0 0 0.5rem;
+  padding: 0;
+  list-style: none;
+}
+
+.dismissed-send {
+  display: grid;
+  gap: 0.3rem;
+  padding: 0.5rem 0.6rem;
+  border: 1px solid var(--edge);
+  border-radius: 0.4rem;
+  background: var(--panel);
+}
+
+.dismissed-send-meta {
+  color: var(--muted);
+  font-size: 0.78rem;
+}
+
+.dismissed-send-text {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 3;
+  line-clamp: 3;
+  overflow: hidden;
+}
+
+.dismissed-send-restore {
+  justify-self: start;
+}
+
 @keyframes outgoing-spin {
   to { transform: rotate(360deg); }
 }
@@ -1173,6 +1211,45 @@ body {
   min-height: 0;
   touch-action: manipulation;
   -webkit-tap-highlight-color: transparent;
+}
+
+/* `#193 compose-draft-loss`. A reply saved unsent to this message: a pencil and "Draft", in the
+   accent, directly left of Reply, which it opens as Reply does. It takes Reply's place at the right
+   edge, so the two stay together on whichever line the row's controls wrap to. Every row has one,
+   and `[hidden]` keeps it out of every row without a draft. */
+.draft-marker {
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  gap: 0.25rem;
+  margin-left: auto;
+  padding: 0.05rem 0.5rem 0.05rem 0.4rem;
+  background: none;
+  border: 1px solid var(--accent);
+  border-radius: 999px;
+  color: var(--accent);
+  font: inherit;
+  font-size: 0.72rem;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  min-height: 0;
+  touch-action: manipulation;
+  -webkit-tap-highlight-color: transparent;
+}
+
+.draft-marker:not([hidden]) + .reply-button {
+  margin-left: 0.35rem;
+}
+
+/* The pencil, a mask filled with the chip's ink, as the pin chip draws its pin. */
+.draft-marker::before {
+  content: "";
+  width: 0.8rem;
+  height: 0.8rem;
+  background: currentColor;
+  -webkit-mask: var(--pencil-mask) center / contain no-repeat;
+  mask: var(--pencil-mask) center / contain no-repeat;
+  --pencil-mask: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='2.2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M4 20h4L19 9l-4-4L4 16z'/%3E%3Cpath d='M13 7l4 4'/%3E%3C/svg%3E");
 }
 
 /* ----------------------------------------------------------------- who is speaking, in the channel */

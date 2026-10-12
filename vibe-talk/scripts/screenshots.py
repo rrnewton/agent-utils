@@ -115,7 +115,7 @@ from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
 if TYPE_CHECKING:
-    from playwright.sync_api import Browser, Page, Playwright
+    from playwright.sync_api import Browser, Page, Playwright, Route
 
 EXIT_OK = 0
 EXIT_USAGE = 2
@@ -922,6 +922,12 @@ class Driver:
             # `#230 text-size-buttons`. `45-settings-text-size` presses +, and the message text of
             # every later frame must be at its usual size, not a step larger.
             "  localStorage.removeItem('vibe-talk.voice.msg-scale');\n"
+            # `#193 compose-draft-loss`. `49-failed-send-and-draft` leaves a refused send in the
+            # outbox and `50-send-dismissed` one among the recently dismissed: no later frame may
+            # carry either, or what was typed in a channel's box.
+            "  localStorage.removeItem('vibe-talk.outgoing-messages');\n"
+            "  localStorage.removeItem('vibe-talk.dismissed-sends');\n"
+            "  localStorage.removeItem('vibe-talk.channel-drafts');\n"
             "} catch (e) {}\n"
         )
         # `#58 control-bar`. Where the control bar sits is a stored preference, so it is cleared
@@ -2740,6 +2746,75 @@ def _act_settings_text_size(driver: Driver) -> None:
     driver.settle(300)
 
 
+# `#193 compose-draft-loss`. What the refused send and the unsent reply say, written to be read in
+# the picture rather than to be pithy.
+REFUSED_SEND_TEXT = "the arm64 runner is back; rerunning the release job now"
+DRAFT_REPLY_TEXT = "half an answer about the cache rebuild, to finish after lunch"
+REFUSED_SEND_ANSWER = json.dumps(
+    {"error": "refused", "detail": "This bot is not allowed to post in this channel."}
+)
+
+
+def _refuse_send(route: Route) -> None:
+    route.fulfill(status=403, content_type="application/json", body=REFUSED_SEND_ANSWER)
+
+
+def _act_failed_send_and_draft(driver: Driver) -> None:
+    """`#193 compose-draft-loss`: a send the chat service refused, in the outbox with Retry, Edit and
+    Dismiss, and the newest message with Draft beside Reply, for a reply left unsent.
+
+    The refusal is this state's one faked answer: the reply route answers 403 while the message is
+    sent, so nothing is posted to the throwaway server. The draft is typed into Reply and left there
+    by its Back, as a reader leaves one.
+    """
+    _act_open_channel(driver)
+    driver.page.route("**/api/v1/channels/*/reply", _refuse_send)
+    try:
+        driver.page.fill("#channel-compose-text", REFUSED_SEND_TEXT)
+        driver.click("channel-send")
+        driver.page.wait_for_function(
+            "() => document.querySelector('#outgoing-log > li[data-send-state=\"failed\"]') !== null",
+            timeout=10_000,
+        )
+    finally:
+        driver.page.unroute("**/api/v1/channels/*/reply", _refuse_send)
+    driver.js(
+        "(() => { const rows = document.querySelectorAll('#discord-log > li'); "
+        "rows[rows.length - 1].id = 'draft-probe'; return true; })()"
+    )
+    driver.page.click("#draft-probe .reply-button")
+    driver.page.wait_for_function("() => window.__visible('screen-reply')", timeout=5_000)
+    driver.page.fill("#reply-text", DRAFT_REPLY_TEXT)
+    driver.click("close-reply")
+    driver.page.wait_for_function("() => window.__visible('pane-discord')", timeout=5_000)
+    driver.js(
+        "(() => { const a = document.getElementById('scroll-area'); a.scrollTop = a.scrollHeight; "
+        "if (window.__visible('status-line')) document.getElementById('dismiss-status').click(); "
+        "return true; })()"
+    )
+    driver.settle(300)
+
+
+def _act_send_dismissed(driver: Driver) -> None:
+    """`#193 compose-draft-loss`: the refused send dismissed, and the Undo chip that names it."""
+    _act_failed_send_and_draft(driver)
+    driver.page.click("#outgoing-log .outgoing-dismiss")
+    driver.page.wait_for_function("() => window.__visible('undo-send-dismiss')", timeout=5_000)
+    driver.settle(300)
+
+
+def _act_recently_dismissed(driver: Driver) -> None:
+    """`#193 compose-draft-loss`: Settings' Recently dismissed, holding the send just dismissed."""
+    _act_send_dismissed(driver)
+    driver.click("open-settings")
+    driver.page.wait_for_function("() => window.__visible('close-settings')", timeout=5_000)
+    driver.js(
+        "(() => { document.getElementById('dismissed-sends').closest('.settings-group')"
+        ".scrollIntoView({ block: 'center' }); return true; })()"
+    )
+    driver.settle(300)
+
+
 # Where the head of the arrow from the row under `parent` is, from what is drawn as elements: the
 # point and the box of the triangle, in CSS pixels. A head under the foot is centred on the shaft,
 # the span's left border; one at the side has its point on the row's left edge, raised where the
@@ -4452,6 +4527,101 @@ SCENES: tuple[Scene, ...] = (
             ),
         ),
     ),
+    Scene(
+        name="49-failed-send-and-draft",
+        what="a refused send in the outbox with Retry, Edit and Dismiss, and Draft beside Reply on the newest message",
+        act=_act_failed_send_and_draft,
+        profiles=("android-412", "laptop-1280"),
+        expect=(
+            ("the Discord pane is up", "window.__visible('pane-discord')"),
+            (
+                "the refused send is in the outbox, says it was not sent, and offers Retry, Edit and "
+                "Dismiss, all of it on screen",
+                "(() => { const row = document.querySelector('#outgoing-log > li[data-send-state=\"failed\"]'); "
+                "if (!row) return false; const r = row.getBoundingClientRect(); "
+                "const area = document.getElementById('scroll-area').getBoundingClientRect(); "
+                "const names = [...row.querySelectorAll('.outgoing-actions button')].map((b) => b.textContent); "
+                "return names.join(',') === 'Retry,Edit,Dismiss' && /Not sent/.test(row.textContent) "
+                "&& r.top >= area.top && r.bottom <= area.bottom; })()",
+            ),
+            (
+                "each of the three is a target a thumb can use",
+                "[...document.querySelectorAll('#outgoing-log .outgoing-actions button')]"
+                ".every((b) => b.getBoundingClientRect().height >= 40)",
+            ),
+            (
+                # THE claim the page suite cannot make: the mark is drawn, beside Reply, on its line.
+                "the newest message says Draft directly left of its Reply, on the same line, on screen",
+                "(() => { const m = document.querySelector('#draft-probe .draft-marker'); "
+                "if (!m || m.hidden || !m.getClientRects().length) return false; "
+                "const reply = m.nextElementSibling; if (!reply || !reply.classList.contains('reply-button')) return false; "
+                "const r = m.getBoundingClientRect(); const p = reply.getBoundingClientRect(); "
+                "const area = document.getElementById('scroll-area').getBoundingClientRect(); "
+                "return m.getAttribute('aria-label') === 'Draft reply' && r.right <= p.left "
+                "&& Math.abs((r.top + r.bottom) / 2 - (p.top + p.bottom) / 2) < 3 "
+                "&& r.top >= area.top && r.bottom <= area.bottom; })()",
+            ),
+            (
+                "no other message is marked",
+                "[...document.querySelectorAll('#discord-log .draft-marker')]"
+                ".filter((m) => m.getClientRects().length).length === 1",
+            ),
+            (
+                "nothing runs off the side of the screen",
+                "document.scrollingElement.scrollWidth <= innerWidth",
+            ),
+        ),
+    ),
+    Scene(
+        name="50-send-dismissed",
+        what="the refused send dismissed: gone from the outbox, and an Undo chip that names it",
+        act=_act_send_dismissed,
+        profiles=("android-412", "laptop-1280"),
+        expect=(
+            ("the Discord pane is up", "window.__visible('pane-discord')"),
+            ("the outbox is empty", "!window.__visible('outgoing-log')"),
+            (
+                "the Undo chip is on screen and names the message by its first words",
+                "(() => { const c = document.getElementById('undo-send-dismiss'); "
+                "const b = c.getBoundingClientRect(); "
+                "return window.__visible('undo-send-dismiss') "
+                "&& c.textContent === 'Undo dismiss: “the arm64 runner is back;…”' "
+                "&& b.top >= 0 && b.bottom <= innerHeight && b.left >= 0 && b.right <= innerWidth; })()",
+            ),
+            (
+                "the strip says it was dismissed and where to get it back, in words a phone shows whole",
+                "window.__text('status') === 'Dismissed. Undo it, or find it in Settings.'",
+            ),
+            (
+                "nothing runs off the side of the screen",
+                "document.scrollingElement.scrollWidth <= innerWidth",
+            ),
+        ),
+    ),
+    Scene(
+        name="51-recently-dismissed",
+        what="Settings, Recently dismissed: the send just dismissed, where it was going, and Put back",
+        act=_act_recently_dismissed,
+        profiles=("android-412", "laptop-1280"),
+        expect=(
+            ("the settings screen is up", "window.__visible('screen-settings')"),
+            (
+                "the dismissed send is listed with its text, its age and Put back, on screen",
+                "(() => { const item = document.querySelector('#dismissed-sends > li'); "
+                "if (!item) return false; const b = item.getBoundingClientRect(); "
+                "const put = item.querySelector('.dismissed-send-restore'); "
+                "return /the arm64 runner is back/.test(item.textContent) "
+                "&& /dismissed just now/.test(item.textContent) && put !== null "
+                "&& put.getAttribute('aria-label') === 'Put back “the arm64 runner is back;…”' "
+                "&& b.top >= 0 && b.bottom <= innerHeight; })()",
+            ),
+            ("Forget these now is offered", "window.__visible('forget-dismissed-sends')"),
+            (
+                "nothing runs off the side of the screen",
+                "document.scrollingElement.scrollWidth <= innerWidth",
+            ),
+        ),
+    ),
     # LAST IN THE WALK, and not by accident: it empties the server's durable store on the way in,
     # so that the summary the state above cached is really regenerated and can really fail. Nothing
     # after it in this profile would miss what it deletes, and the next profile purges anyway.
@@ -5234,6 +5404,14 @@ def check_scene_storage_isolation_controls() -> list[str]:
             "A scene that walks to the beginning then makes the older-page and pull scenes "
             "unreachable, because they restore a channel with no history left above it."
         ]
+    # `#193 compose-draft-loss`. A refused send, or one dismissed, outlives the scene that made it
+    # unless the reload clears it: every later channel frame would carry it at the foot of the list.
+    for key in ("vibe-talk.outgoing-messages", "vibe-talk.dismissed-sends"):
+        if f"localStorage.removeItem('{key}')" not in script:
+            return [
+                f"a screenshot-scene reload keeps {key}, so the refused send one scene leaves "
+                "behind is drawn in every later channel frame."
+            ]
     return []
 
 

@@ -235,6 +235,30 @@ partially sent messages retain the remaining text. When delivery is unconfirmed,
 before retrying because the chat service may have received the message. Reopening the app restores
 unfinished sends without sending them again automatically.
 
+**Nothing you typed is lost to one tap** (`#193 compose-draft-loss`). What you type in the channel's
+box, a thread's, Reply and the call's box is saved as you type and comes back after a reload or a
+sign-in. A failed or unconfirmed send offers three actions:
+
+- **Edit** puts the unsent text back in the box it came from: the channel's or the thread's, or Reply
+  on the message it answered, with "Start a new thread" ticked if that is how it was sent. The send
+  leaves the outbox. If that box already holds a draft, the text goes under it after a blank line,
+  and the box says so. Nothing is overwritten. Edit on a thread's message in All opens the thread.
+  Edit on an unconfirmed send says to check the channel first, because the message may already be
+  there.
+- **Dismiss** takes the send out of the outbox, and an **Undo dismiss** chip naming the message
+  brings it back for 15 seconds. After that the message is still kept on this device for 7 days (the
+  newest 10) under **Settings → Recently dismissed**. **Put back** there returns it to its channel's
+  outbox as it was, and **Forget these now** clears the list.
+- **Retry** sends it again, as before.
+
+A message with a saved reply draft shows **Draft**, with a pencil, just left of its Reply. This
+works in Main, All, a thread and either column. Tap it to reopen Reply with the draft. It goes away
+when the draft is sent or emptied.
+
+**Drafts stay on the device you typed them on.** They are kept in this browser's storage and are
+not synced, so a draft started on the phone is not on the laptop. Syncing drafts between devices
+is not supported yet.
+
 ## Installing the reader
 
 Serve vibe-talk over HTTPS, open `/voice` in Chrome on Android, and choose **Install app** from the

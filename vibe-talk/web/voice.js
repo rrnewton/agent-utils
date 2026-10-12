@@ -134,7 +134,8 @@ let sideActive = false;
  *   | "channel-view-flat" | "channel-view-main" | "channel-view-threads" | "clear-alias"
  *   | "clear-backlog" | "clear-view" | "close-browse-channels" | "close-help" | "close-reply"
  *   | "close-settings" | "close-threads" | "collapse-all" | "column-toggle" | "dismiss-banner"
- *   | "dismiss-error" | "dismiss-status" | "expand-all" | "forget-conversations" | "forget-token"
+ *   | "dismiss-error" | "dismiss-status" | "expand-all" | "forget-conversations"
+ *   | "forget-dismissed-sends" | "forget-token"
  *   | "hang-up"
  *   | "help-link-auto-read" | "help-link-canned-prompts" | "help-link-channel-alias"
  *   | "help-link-combining" | "help-link-connection" | "help-link-control-bar"
@@ -152,7 +153,7 @@ let sideActive = false;
  *   | "search-toggle" | "send-text" | "side-clear-backlog" | "side-close" | "side-jump-newest"
  *   | "side-more-threads" | "side-older" | "side-send" | "speaker" | "summarise" | "talk"
  *   | "thread-back" | "thread-directory-more" | "thread-directory-retry"
- *   | "todo-filter" | "undo-dismiss" | "upstream-clear-save" | "view-switch"} id
+ *   | "todo-filter" | "undo-dismiss" | "undo-send-dismiss" | "upstream-clear-save" | "view-switch"} id
  * @returns {HTMLButtonElement}
  */
 /**
@@ -529,6 +530,8 @@ function showScreen(name) {
   if (main) renderColumns();
   // `#232 upstream-mark-read`. The server may have pushed since the box was last drawn.
   if (name === "settings" && previous !== "settings") refreshUpstreamClear();
+  // `#193 compose-draft-loss`. Its ages and channel names as they are now, and none past its days.
+  if (name === "settings" && previous !== "settings") renderDismissedSends();
   if (name !== previous || focusLost()) settleFocus();
 }
 
@@ -674,6 +677,29 @@ const outgoingJobs = new Map();
 const outgoingRetries = new Map();
 let outgoingSequence = 0;
 let outgoingStorageOkay = true;
+
+// `#193 compose-draft-loss`. A send dismissed from the outbox, kept for Undo and then for a while
+// longer. See "taking a send back".
+const DISMISSED_SENDS_KEY = "vibe-talk.dismissed-sends";
+/** How long the Undo chip offers to take a Dismiss back. */
+const SEND_UNDO_MS = 15000;
+/** How many dismissed sends are kept, newest first, and for how many days. */
+const DISMISSED_SENDS_LIMIT = 10;
+const DISMISSED_SENDS_DAYS = 7;
+const DISMISSED_SENDS_MAX_AGE_MS = DISMISSED_SENDS_DAYS * 24 * 60 * 60 * 1000;
+/** How much of a message a control quotes to name it. */
+const SEND_SNIPPET_CHARS = 28;
+const CHANNEL_DRAFT_REFUSED = "This browser could not save the draft. Keep this page open until you send it.";
+const UNCONFIRMED_EDIT_NOTE =
+  "Delivery of this was unconfirmed, so it may already be in the channel: check before you send it again.";
+/**
+ * The sends dismissed from the outbox, newest first, each with when it was dismissed.
+ *
+ * @type {Array<{entry: any, at: number}>}
+ */
+let dismissedSends = [];
+/** The dismissal the Undo chip takes back while it is up: the entry's id, and the chip's timer. */
+let sendUndo = null;
 
 /** Whether the last `showView` put the reader back rather than taking them to the newest. */
 let viewRestored = false;
@@ -1799,6 +1825,8 @@ function renderScrollTools() {
     : "Show a one-line summary in place of each long message.";
   // `#204 reply-arrow`. The other way back: to the reply a jump left, while it is off screen.
   el("back-to-reply").hidden = currentView !== "discord" || replyReturnRow() === null;
+  // `#193 compose-draft-loss`. The way back from a Dismiss in the outbox, on the channel only.
+  renderSendUndo();
   // `#129 message-search`. Re-derived from the lists, exactly like everything above it: whatever
   // just changed a list has to leave the filter true of it. See `applySearch` for why this hangs
   // off the one function every mutation already ends with rather than off its own call sites.
@@ -11168,7 +11196,7 @@ function rememberChannelDraft() {
   if (text) channelDrafts.set(activeComposerKey, text);
   else channelDrafts.delete(activeComposerKey);
   if (!saveChannelDrafts()) {
-    el("channel-compose-state").textContent = "This browser could not save the draft. Keep this page open until you send it.";
+    el("channel-compose-state").textContent = CHANNEL_DRAFT_REFUSED;
   }
 }
 
@@ -13974,40 +14002,48 @@ function persistOutgoingMessages() {
   return outgoingStorageOkay;
 }
 
+/**
+ * An outbox entry as it was saved — in the outbox, or among the recently dismissed (`#193
+ * compose-draft-loss`) — or null for anything that is not one.
+ */
+function outgoingFromSaved(held) {
+  if (!held || typeof held.id !== "string" || typeof held.channel !== "string" ||
+      !held.channel || typeof held.text !== "string" ||
+      !["sending", "sent", "failed", "unconfirmed"].includes(held.state)) return null;
+  const interrupted = held.state === "sending";
+  // The rule signing out goes by: only a POST that had started can have been delivered. One
+  // still waiting its turn, or still finding out where its reply goes, was posted nowhere.
+  const attempted = interrupted && !["queued", "placing"].includes(held.phase);
+  return {
+    id: held.id, channel: held.channel,
+    threadId: typeof held.threadId === "string" ? held.threadId : null,
+    // A reply whose destination was still to be found out keeps finding it out on Retry.
+    placement: held.placement === "unknown" ? "unknown" : null,
+    replyTo: typeof held.replyTo === "string" ? held.replyTo : null,
+    originView: ["main", "threads", "thread", "flat"].includes(held.originView) ? held.originView : "main",
+    text: held.text,
+    remaining: typeof held.remaining === "string" ? held.remaining : held.text.trim(),
+    state: attempted ? "unconfirmed" : interrupted ? "failed" : held.state,
+    phase: "", createdAt: Number(held.createdAt) || Date.now(),
+    postedCount: Math.max(0, Number(held.postedCount) || 0),
+    parts: Array.isArray(held.parts) ? held.parts.filter((part) =>
+      part && typeof part.id === "string" && typeof part.content === "string") : [],
+    observedParts: Array.isArray(held.observedParts)
+      ? held.observedParts.filter((id) => typeof id === "string") : [],
+    // Absent from an entry saved before keys were sent: its attempts went without one.
+    keyedOnly: held.keyedOnly === true,
+    detail: attempted ? "This page closed before delivery was confirmed."
+      : interrupted ? "This page closed before this message was sent." : String(held.detail || ""),
+  };
+}
+
 function loadOutgoingMessages() {
   try {
     const saved = JSON.parse(localStorage.getItem(OUTGOING_KEY) || "[]");
     if (!Array.isArray(saved)) return;
     for (const held of saved) {
-      if (!held || typeof held.id !== "string" || typeof held.channel !== "string" ||
-          !held.channel || typeof held.text !== "string" ||
-          !["sending", "sent", "failed", "unconfirmed"].includes(held.state)) continue;
-      const interrupted = held.state === "sending";
-      // The rule signing out goes by: only a POST that had started can have been delivered. One
-      // still waiting its turn, or still finding out where its reply goes, was posted nowhere.
-      const attempted = interrupted && !["queued", "placing"].includes(held.phase);
-      const entry = {
-        id: held.id, channel: held.channel,
-        threadId: typeof held.threadId === "string" ? held.threadId : null,
-        // A reply whose destination was still to be found out keeps finding it out on Retry.
-        placement: held.placement === "unknown" ? "unknown" : null,
-        replyTo: typeof held.replyTo === "string" ? held.replyTo : null,
-        originView: ["main", "threads", "thread", "flat"].includes(held.originView) ? held.originView : "main",
-        text: held.text,
-        remaining: typeof held.remaining === "string" ? held.remaining : held.text.trim(),
-        state: attempted ? "unconfirmed" : interrupted ? "failed" : held.state,
-        phase: "", createdAt: Number(held.createdAt) || Date.now(),
-        postedCount: Math.max(0, Number(held.postedCount) || 0),
-        parts: Array.isArray(held.parts) ? held.parts.filter((part) =>
-          part && typeof part.id === "string" && typeof part.content === "string") : [],
-        observedParts: Array.isArray(held.observedParts)
-          ? held.observedParts.filter((id) => typeof id === "string") : [],
-        // Absent from an entry saved before keys were sent: its attempts went without one.
-        keyedOnly: held.keyedOnly === true,
-        detail: attempted ? "This page closed before delivery was confirmed."
-          : interrupted ? "This page closed before this message was sent." : String(held.detail || ""),
-      };
-      outgoingMessages.set(entry.id, entry);
+      const entry = outgoingFromSaved(held);
+      if (entry) outgoingMessages.set(entry.id, entry);
     }
     // In particular, never replay a POST merely because Android reopened this page.
     if (outgoingMessages.size) persistOutgoingMessages();
@@ -14152,19 +14188,25 @@ function renderOutgoingMessages() {
       retry.textContent = waiting ? "Retry now" : entry.postedCount ? "Retry unsent text" : "Retry";
       retry.disabled = !entry.remaining || knownChannel(entry.channel)?.writable === false;
       retry.addEventListener("click", inThisColumn(guardQuietly(() => retryOutgoingMessage(entry.id))));
+      // `#193 compose-draft-loss`. Back into the box it was written in, and out of the outbox.
+      const edit = document.createElement("button");
+      edit.className = "outgoing-edit";
+      edit.setAttribute("type", "button");
+      edit.textContent = "Edit";
+      edit.setAttribute("title", entry.replyTo
+        ? "Put this text back in Reply on the message it answers, and take it out of the outbox."
+        : "Put this text back in the message box it came from, and take it out of the outbox.");
+      edit.disabled = !unsentText(entry).trim();
+      edit.addEventListener("click", inThisColumn(guardQuietly(() => editOutgoingMessage(entry.id))));
       const dismiss = document.createElement("button");
       dismiss.className = "outgoing-dismiss";
       dismiss.setAttribute("type", "button");
       dismiss.textContent = "Dismiss";
-      dismiss.setAttribute("title", "Discard this local send record. This does not delete a message from the chat service.");
-      dismiss.addEventListener("click", inThisColumn(() => {
-        cancelOutgoingRetry(entry.id);
-        outgoingMessages.delete(entry.id);
-        outgoingObservations.delete(entry.id);
-        persistOutgoingMessages();
-        renderOutgoingMessages();
-      }));
-      actions.append(retry, dismiss);
+      dismiss.setAttribute("title",
+        "Take this out of the outbox. This does not delete a message from the chat service. Undo " +
+          `brings it back, and Settings keeps it under Recently dismissed for ${DISMISSED_SENDS_DAYS} days.`);
+      dismiss.addEventListener("click", inThisColumn(() => dismissOutgoingMessage(entry.id)));
+      actions.append(retry, edit, dismiss);
       row.append(actions);
     }
     // `#129 message-search`. What the reader WROTE, under the word the row prints for them: a
@@ -14639,6 +14681,272 @@ function stopOutgoingSends() {
   }
   persistOutgoingMessages();
   renderOutgoingEverywhere();
+}
+
+// --- taking a send back -----------------------------------------------------------------------------
+//
+// `#193 compose-draft-loss`. The owner's audit asked where typing could still be lost. A send that
+// failed kept its text, but the only ways out of the outbox were Retry, and a Dismiss that threw the
+// text away with one tap and nothing to take it back. So:
+//
+//   * EDIT puts a failed or unconfirmed send's unsent text back in the box it was written in — the
+//     channel's, the thread's, or Reply on the message it answers, with the new-thread choice it was
+//     sent with — and takes it out of the outbox. A draft already in that box is kept: the text goes
+//     under it, after a blank line, and the box says so. Asking first would put a question between
+//     the reader and their own words, and appending loses nothing that editing cannot put right.
+//   * DISMISS can be taken back. The Undo chip names the message for SEND_UNDO_MS; after that a copy
+//     is still kept on this device for DISMISSED_SENDS_DAYS days, the newest DISMISSED_SENDS_LIMIT of
+//     them, under Recently dismissed in Settings, where Put back returns one to the outbox as it was.
+//
+// Every draft, and this copy, is this device's alone: nothing here is synced to another device. The
+// constants and the state are with the outbox's, at the head of the file.
+
+/** What a send has not delivered: all of it, or what a partial post left unsent. */
+function unsentText(entry) {
+  return entry.postedCount ? entry.remaining : entry.text;
+}
+
+/** `text` under `draft`, after a blank line, or `text` alone where there is no draft. */
+function underDraft(draft, text) {
+  const kept = String(draft || "").replace(/\s+$/, "");
+  return kept.trim() ? `${kept}\n\n${text}` : text;
+}
+
+/** The first few words of a message, on one line, for a control that has to name it. */
+function sendSnippet(text) {
+  const words = String(text).replace(/\s+/g, " ").trim();
+  if (words.length <= SEND_SNIPPET_CHARS) return words;
+  let cut = words.slice(0, SEND_SNIPPET_CHARS - 1);
+  // At the end of a word, where one ends in the second half, rather than in the middle of one.
+  const end = words[cut.length] === " " ? cut.length : cut.lastIndexOf(" ");
+  if (end > SEND_SNIPPET_CHARS / 2) cut = cut.slice(0, end);
+  return `${cut.trimEnd()}…`;
+}
+
+/** Take an entry out of the outbox, durably, in every column. */
+function dropOutgoing(id) {
+  cancelOutgoingRetry(id);
+  outgoingMessages.delete(id);
+  outgoingObservations.delete(id);
+  persistOutgoingMessages();
+  renderOutgoingEverywhere();
+}
+
+/** Focus a message box with the caret after its last character, where the reader goes on writing. */
+function focusAtEnd(box) {
+  box.focus();
+  const end = box.value.length;
+  if (typeof box.setSelectionRange === "function") box.setSelectionRange(end, end);
+}
+
+/**
+ * Edit: a failed or unconfirmed send's unsent text back in the box it was written in, and out of the
+ * outbox. Written into that box's draft store before it leaves the outbox, so there is no moment at
+ * which neither holds it.
+ */
+async function editOutgoingMessage(id) {
+  const entry = outgoingMessages.get(id);
+  if (!entry || (entry.state !== "failed" && entry.state !== "unconfirmed")) return;
+  const text = unsentText(entry);
+  if (!text.trim()) return;
+  const note = entry.state === "unconfirmed" ? UNCONFIRMED_EDIT_NOTE : "";
+  if (entry.replyTo) {
+    editOutgoingReply(entry, text, note);
+    return;
+  }
+  const key = JSON.stringify([entry.channel, entry.threadId || null]);
+  // The column whose box that is now, if one is showing it: this one first, then the other.
+  const boxShown = () => String(el("discord-channel").value) === entry.channel && activeComposerKey === key;
+  const showing = () => [activeColumn, activeColumn === columns.main ? columns.side : columns.main]
+    .find((column) => (column === columns.main || sideShowing()) && inColumn(column, boxShown)) || null;
+  let column = showing();
+  const before = column ? inColumn(column, () => el("channel-compose-text").value) : channelDrafts.get(key) || "";
+  channelDrafts.set(key, underDraft(before, text));
+  const kept = saveChannelDrafts();
+  dropOutgoing(entry.id);
+  // A thread's message, edited from All: its box is the thread's, so the thread opens, with it.
+  if (!column && entry.threadId) {
+    await openThread(entry.threadId);
+    column = showing();
+  }
+  if (!column) {
+    setStatus("Your message is back in its message box, as a draft.");
+    return;
+  }
+  inColumn(column, () => {
+    const box = el("channel-compose-text");
+    box.value = channelDrafts.get(key) || "";
+    el("channel-compose-state").textContent = !kept ? CHANNEL_DRAFT_REFUSED
+      : note || (before.trim() ? "Your message is back, under the draft that was already here." : "");
+    focusAtEnd(box);
+  });
+}
+
+/**
+ * Edit, for a reply: the text back in Reply on the message it answers, under a draft already written
+ * to it, and the new-thread choice as it was sent. The message is the row's on screen, or the store's;
+ * one this page no longer holds keeps the draft for when it is drawn again (`draftMarker`).
+ */
+function editOutgoingReply(entry, text, note) {
+  const id = String(entry.replyTo);
+  const before = drafts.get(id) || "";
+  drafts.set(id, underDraft(before, text));
+  const kept = persistDrafts();
+  dropOutgoing(entry.id);
+  renderDraftMarkers();
+  const row = /** @type {HTMLLIElement | null} */ ([...el("discord-log").children].find((li) => idsOf(li)[0] === id) || null);
+  const messages = row ? rowMessages(row) : [heldMessage(id)].filter(Boolean);
+  if (messages.length === 0) {
+    setStatus("Your reply is a draft again, on the message it answers: Draft on that message opens it.");
+    return;
+  }
+  openReply(messages, row);
+  if (entry.threadId && replyRouting.branch === entry.threadId) {
+    el("reply-branch").checked = true;
+    renderReplyDestination();
+  }
+  el("reply-state").textContent = !kept ? REPLY_DRAFT_REFUSED
+    : note || (before.trim() ? "Your reply is back, under the draft that was already here." : "");
+  focusAtEnd(el("reply-text"));
+}
+
+/** Dismiss: out of the outbox, into the recently dismissed, with Undo offered for a while. */
+function dismissOutgoingMessage(id) {
+  const entry = outgoingMessages.get(id);
+  if (!entry) return;
+  dismissedSends = [{ entry: { ...entry, phase: "" }, at: Date.now() },
+    ...dismissedSends.filter((held) => held.entry.id !== id)];
+  const kept = persistDismissedSends();
+  dropOutgoing(id);
+  if (sendUndo) clearTimeout(sendUndo.timer);
+  sendUndo = { id, timer: setTimeout(endSendUndo, SEND_UNDO_MS) };
+  renderSendUndo();
+  renderDismissedSends();
+  setStatus(kept
+    ? "Dismissed. Undo it, or find it in Settings."
+    : "Dismissed. This browser could not keep a copy, so Undo works only until this page is reloaded.");
+}
+
+function endSendUndo() {
+  if (sendUndo) clearTimeout(sendUndo.timer);
+  sendUndo = null;
+  renderSendUndo();
+}
+
+/** The Undo chip: up while a Dismiss can be taken back from it, naming the message dismissed. */
+function renderSendUndo() {
+  const chip = el("undo-send-dismiss");
+  const held = sendUndo ? dismissedSends.find((item) => item.entry.id === sendUndo.id) : null;
+  chip.hidden = !held || currentView !== "discord";
+  const label = held ? `Undo dismiss: “${sendSnippet(unsentText(held.entry))}”` : "Undo dismiss";
+  if (chip.textContent !== label) chip.textContent = label;
+}
+
+/** Put a dismissed send back in the outbox as it was: what Undo does, and Put back in Settings. */
+function putBackDismissedSend(id) {
+  const held = dismissedSends.find((item) => item.entry.id === id);
+  if (!held) return;
+  const entry = outgoingFromSaved(held.entry);
+  if (entry && !outgoingMessages.has(entry.id)) {
+    // In the order it was written among the sends still there, as it was before it was dismissed.
+    const all = [...outgoingMessages.values(), entry].sort((a, b) => a.createdAt - b.createdAt);
+    outgoingMessages.clear();
+    for (const one of all) outgoingMessages.set(one.id, one);
+  }
+  // The outbox holds it again before the copy goes.
+  persistOutgoingMessages();
+  dismissedSends = dismissedSends.filter((item) => item !== held);
+  persistDismissedSends();
+  if (sendUndo && sendUndo.id === id) endSendUndo();
+  renderOutgoingEverywhere();
+  renderDismissedSends();
+  if (!entry) return;
+  setStatus(entry.channel === String(el("discord-channel").value)
+    ? `Put back: “${sendSnippet(unsentText(entry))}”.`
+    : `Put back in the outbox of ${channelLabel(entry.channel)}.`);
+}
+
+/** Forget every dismissed send now, rather than when its days are up. */
+function forgetDismissedSends() {
+  dismissedSends = [];
+  persistDismissedSends();
+  endSendUndo();
+  renderDismissedSends();
+  setStatus("Forgot the dismissed messages.");
+}
+
+/** Only the newest DISMISSED_SENDS_LIMIT, and none older than DISMISSED_SENDS_DAYS. */
+function pruneDismissedSends() {
+  const oldest = Date.now() - DISMISSED_SENDS_MAX_AGE_MS;
+  dismissedSends = dismissedSends.filter((held) => held.at > oldest).slice(0, DISMISSED_SENDS_LIMIT);
+}
+
+/** Save the recently dismissed, giving up the saved channel rows first where the quota is full. */
+function persistDismissedSends() {
+  pruneDismissedSends();
+  try {
+    if (dismissedSends.length === 0) {
+      localStorage.removeItem(DISMISSED_SENDS_KEY);
+      return true;
+    }
+    const encoded = JSON.stringify(dismissedSends);
+    if (storedExactly(DISMISSED_SENDS_KEY, encoded)) return true;
+    dropMessageCache();
+    return storedExactly(DISMISSED_SENDS_KEY, encoded);
+  } catch (_error) {
+    return false;
+  }
+}
+
+function loadDismissedSends() {
+  try {
+    const saved = JSON.parse(localStorage.getItem(DISMISSED_SENDS_KEY) || "[]");
+    if (!Array.isArray(saved)) return;
+    dismissedSends = saved
+      .map((held) => ({ entry: held && outgoingFromSaved(held.entry), at: Number(held && held.at) }))
+      .filter((held) => held.entry && Number.isFinite(held.at))
+      .sort((a, b) => b.at - a.at);
+    const before = dismissedSends.length;
+    pruneDismissedSends();
+    if (dismissedSends.length !== before) persistDismissedSends();
+  } catch (_error) {
+    dismissedSends = [];
+  }
+}
+
+/** Settings' Recently dismissed: each send's place, its age and its text, and Put back. */
+function renderDismissedSends() {
+  pruneDismissedSends();
+  const items = dismissedSends.map((held) => {
+    const entry = held.entry;
+    const item = document.createElement("li");
+    item.className = "dismissed-send";
+    const age = briefAge(held.at);
+    const when = age === "now" ? "just now" : `${age} ago`;
+    const where = [channelLabel(entry.channel), entry.replyTo ? "Reply" : entry.threadId ? "Thread" : "",
+      `dismissed ${when}`];
+    const restore = document.createElement("button");
+    restore.className = "secondary dismissed-send-restore";
+    restore.setAttribute("type", "button");
+    restore.textContent = "Put back";
+    restore.setAttribute("aria-label", `Put back “${sendSnippet(unsentText(entry))}”`);
+    restore.setAttribute("title", "Back in the outbox of its channel, where Edit, Retry and Dismiss are.");
+    restore.addEventListener("click", () => putBackDismissedSend(entry.id));
+    item.append(
+      styled("div", "dismissed-send-meta", where.filter(Boolean).join(" · ")),
+      styled("div", "dismissed-send-text", unsentText(entry)),
+      restore
+    );
+    return item;
+  });
+  el("dismissed-sends").replaceChildren(...items);
+  el("dismissed-sends").hidden = items.length === 0;
+  el("forget-dismissed-sends").hidden = items.length === 0;
+  el("dismissed-sends-state").textContent = items.length
+    ? `Messages you dismissed from the outbox unsent, kept on this device for ${DISMISSED_SENDS_DAYS} days ` +
+      `(the newest ${DISMISSED_SENDS_LIMIT}). Put back returns one to the outbox of its channel.`
+    : `Nothing dismissed in the last ${DISMISSED_SENDS_DAYS} days. A message you dismiss from the ` +
+      "outbox unsent is kept here that long, in case you want it back.";
 }
 
 async function sendChannelMessage() {
@@ -19521,7 +19829,8 @@ function discordNode(messages) {
   // hanging off it, and threading a reply under the tail would put the answer under a fragment.
   reply.addEventListener("click", inThisColumn(() => openReply(messages, li)));
   sayRowShortcut(reply, "reply-button");
-  meta.append(reply);
+  // `#193 compose-draft-loss`. Beside it, the reply still being written to this message, if any.
+  meta.append(draftMarker(messages, li), reply);
   // `#228 reply-visible`. Held on the row, as its messages are, so that the pass which says how many
   // replies each row has (`renderReplyCounts`) finds the button without walking the row's text.
   li.replyButton = reply;
@@ -22335,16 +22644,25 @@ let replyColumn = columns.main;
  */
 let replyFromTop = null;
 
+const REPLY_DRAFT_REFUSED =
+  "This browser refused to store the draft, so it will be lost if you reload (private " +
+  "browsing does this). It is still here until then.";
+
 function rememberDraft() {
   if (!replyTarget) {
     return;
   }
+  // By the id as a string, the key a reload reads them back under and `draftMarker` asks by.
+  const id = String(replyTarget.id);
+  const had = drafts.has(id);
   const text = el("reply-text").value;
   if (text.trim()) {
-    drafts.set(replyTarget.id, text);
+    drafts.set(id, text);
   } else {
-    drafts.delete(replyTarget.id);
+    drafts.delete(id);
   }
+  // `#193 compose-draft-loss`. The row's Draft comes and goes with the draft.
+  if (drafts.has(id) !== had) renderDraftMarkers();
   // ...and SAY SO when the browser refuses. The read-back was here from the start and its answer
   // was thrown away, which made it a comment: a reader in private browsing was told a draft was
   // kept by the fact that nothing said otherwise, and lost it on reload. Same idiom as the reading
@@ -22353,9 +22671,56 @@ function rememberDraft() {
   // On failure only. This line also carries "Not posted: …", and typing after a failed send is not
   // a reason to take the reason away.
   if (!persistDrafts()) {
-    el("reply-state").textContent =
-      "This browser refused to store the draft, so it will be lost if you reload (private " +
-      "browsing does this). It is still here until then.";
+    el("reply-state").textContent = REPLY_DRAFT_REFUSED;
+  }
+}
+
+// --- a reply still being written, on its message's row ------------------------------------------
+//
+// `#193 compose-draft-loss`. A draft is kept per message, but nothing on the list said which message
+// had one: after a reload, or a sign-in that sent the reader away and back, they had to remember which
+// message they were answering. So a row with a saved reply draft carries Draft — a pencil and the word,
+// in the accent, beside Reply — which opens Reply with the draft, as Reply itself does. It goes when
+// the draft is sent or emptied. One button on every row, hidden where there is no draft, so marking a
+// row never has to find a place among its controls.
+
+/**
+ * A row's Draft. `messages` are the row's, and the draft is its first constituent's, the one Reply
+ * answers.
+ *
+ * Named "Draft reply" to a screen reader, which hears the button without the row beside it, and
+ * never with the draft's text: the row already says what the message is.
+ *
+ * @param {Array<object>} messages
+ * @param {HTMLLIElement} li
+ */
+function draftMarker(messages, li) {
+  const marker = document.createElement("button");
+  marker.className = "draft-marker";
+  marker.setAttribute("type", "button");
+  marker.setAttribute("aria-label", "Draft reply");
+  marker.setAttribute("title", "You started a reply to this message and have not sent it. Open it in Reply.");
+  marker.textContent = "Draft";
+  marker.hidden = !drafts.has(String(/** @type {any} */ (messages[0]).id));
+  marker.addEventListener("click", inThisColumn(() => openReply(messages, li)));
+  li.draftMarker = marker;
+  return marker;
+}
+
+/**
+ * Every row's Draft, after a draft was started, sent or emptied: the rows on screen in each column,
+ * and the rows a view keeps for when it is shown again.
+ */
+function renderDraftMarkers() {
+  /** @type {HTMLLIElement[]} */
+  const rows = [];
+  eachColumn(() => rows.push(.../** @type {HTMLLIElement[]} */ ([...el("discord-log").children, ...el("pinned-log").children])));
+  for (const held of channelContexts.values()) rows.push(...(held.rows || []));
+  for (const row of rows) {
+    const first = rowMessages(row)[0];
+    if (!row.draftMarker || !first) continue;
+    const hidden = !drafts.has(String(first.id));
+    if (row.draftMarker.hidden !== hidden) row.draftMarker.hidden = hidden;
   }
 }
 
@@ -22395,7 +22760,7 @@ function openReply(messages, from = null) {
   el("reply-target-meta").textContent = `to ${
     message.author_is_bot ? `${message.author} (bot)` : String(message.author)
   } · id ${message.id}`;
-  el("reply-text").value = drafts.get(message.id) || "";
+  el("reply-text").value = drafts.get(String(message.id)) || "";
   el("reply-state").textContent = "";
   resetReplyContext();
   renderReplyContext();
@@ -22522,8 +22887,9 @@ async function sendReply() {
     // Not where to post yet: the send reads the channel first. See `placeReplyTarget`.
     ...(route.unknown ? { placement: "unknown" } : {}),
   });
-  drafts.delete(target.id);
+  drafts.delete(String(target.id));
   if (outgoingStorageOkay) persistDrafts();
+  renderDraftMarkers();
   el("reply-text").value = "";
   el("reply-state").textContent = "";
   // Do not call closeReply: its draft save would overwrite the fallback retained after a storage
@@ -26519,6 +26885,13 @@ for (const topic of HELP_TOPICS) {
 // the one that forgets to put the reader back where they were reading.
 loadDrafts();
 loadOutgoingMessages();
+// `#193 compose-draft-loss`. What was dismissed from the outbox in the last days, for Settings.
+loadDismissedSends();
+renderDismissedSends();
+el("undo-send-dismiss").addEventListener("click", () => {
+  if (sendUndo) putBackDismissedSend(sendUndo.id);
+});
+el("forget-dismissed-sends").addEventListener("click", forgetDismissedSends);
 try {
   const saved = JSON.parse(localStorage.getItem(CHANNEL_DRAFTS_KEY) || "{}");
   for (const [key, value] of Object.entries(saved || {})) {

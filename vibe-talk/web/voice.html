@@ -657,6 +657,12 @@
             <button id="undo-dismiss" class="chip" type="button" hidden>
               <span id="undo-dismiss-label">Undo</span>
             </button>
+            <!--
+              `#193 compose-draft-loss`. The way back from dismissing an unsent message in the outbox,
+              for a few seconds after, naming the message it puts back. Settings keeps it for days
+              longer, under Recently dismissed.
+            -->
+            <button id="undo-send-dismiss" class="chip" type="button" hidden>Undo dismiss</button>
             <!-- The pair. Collapse all shipped alone, which made the fold a one-way door at the
                  list level: you could put every message away and then had to open them one at a
                  time. Each is present only when it has work to do, so at rest neither is here, in a
@@ -818,6 +824,20 @@
                 Enter to send
               </label>
               <p id="enter-sends-hint" class="hint" aria-live="polite"></p>
+            </section>
+
+            <!--
+              `#193 compose-draft-loss`. A send dismissed from the outbox unsent is not gone at one
+              tap: it is kept here, on this device only, for a week (the newest ten), and Put back
+              returns it to its channel's outbox. web/voice.js writes the list and the line above it.
+            -->
+            <section class="settings-group">
+              <div class="group-head">
+                <h2>Recently dismissed</h2>
+              </div>
+              <p id="dismissed-sends-state" class="hint" aria-live="polite"></p>
+              <ol id="dismissed-sends" class="dismissed-sends" aria-label="Recently dismissed messages" hidden></ol>
+              <button id="forget-dismissed-sends" class="secondary" type="button" hidden>Forget these now</button>
             </section>
 
             <section class="settings-group">
