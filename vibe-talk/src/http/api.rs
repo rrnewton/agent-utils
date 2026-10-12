@@ -1765,13 +1765,21 @@ pub struct PartialReplyResponse {
     /// that sending `unsent` again later could succeed. False for a refusal, which would only be
     /// refused again. `#195 send-resilience`; see [`crate::chat::ChatError::is_transient`].
     pub retryable: bool,
-    /// Whether sending `unsent` again — with the same `idempotency_key`, thread and reply target
-    /// — asks the provider for the part that failed under the very words and key it had, and
-    /// for nothing already posted. Only then can a provider that honours the key recognise a
-    /// retry of the part whose arrival nobody knows, so only then may a caller retry on its own
-    /// or say a retry cannot post twice. When nothing posted, `unsent` is the request's own text
-    /// and this is always true. `#195 send-resilience`; see `ops::unsent_remainder`.
+    /// Whether sending `unsent` again — with the same `idempotency_key`, to `thread_id`, and with
+    /// the reply target only when `thread_id` is the request's own thread or absent — asks the
+    /// provider for the part that failed under the very words and key it had, and for nothing
+    /// already posted. Only then can a provider that honours the key recognise a retry of the
+    /// part whose arrival nobody knows, so only then may a caller retry on its own or say a retry
+    /// cannot post twice. When nothing posted, `unsent` is the request's own text and this is
+    /// always true. `#195 send-resilience`; see `ops::unsent_remainder`.
     pub resumable: bool,
+    /// The thread `unsent` belongs in, when that is not the conversation itself: the request's
+    /// own `thread_id`, or the thread the first part started when the provider continues a long
+    /// post under its first part (`#263 post-split-per-provider`). Sending `unsent` there, and
+    /// without the reply target when it is not the request's own thread, puts the rest where the
+    /// parts already posted went. Absent for the conversation itself.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thread_id: Option<String>,
 }
 
 /// `POST /api/v1/channels/{channel_id}/reply` — the only route that speaks in the owner's name.
@@ -1811,6 +1819,7 @@ pub async fn reply(
             cause,
             retryable,
             resumable,
+            thread_id,
         }) => Ok((
             StatusCode::MULTI_STATUS,
             Json(PartialReplyResponse {
@@ -1820,6 +1829,7 @@ pub async fn reply(
                 unsent,
                 retryable,
                 resumable,
+                thread_id,
             }),
         )
             .into_response()),
@@ -2018,6 +2028,7 @@ pub async fn commit_post(
             cause,
             retryable,
             resumable,
+            thread_id,
         })) => Ok((
             StatusCode::MULTI_STATUS,
             Json(PartialReplyResponse {
@@ -2027,6 +2038,7 @@ pub async fn commit_post(
                 unsent,
                 retryable,
                 resumable,
+                thread_id,
             }),
         )
             .into_response()),

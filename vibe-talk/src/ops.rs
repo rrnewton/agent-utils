@@ -82,10 +82,15 @@ pub enum OpError {
         cause: String,
         /// Whether that failure was a moment rather than an answer; see [`ChatError::is_transient`].
         retryable: bool,
-        /// Whether sending `unsent` again, with the same key, thread and reply target, asks the
-        /// provider for the part that failed under the very words and key it had, and for
-        /// nothing already posted. See [`unsent_remainder`].
+        /// Whether sending `unsent` again, with the same key, to `thread_id`, and with the reply
+        /// target only when `thread_id` is the request's own, asks the provider for the part that
+        /// failed under the very words and key it had, and for nothing already posted. See
+        /// [`unsent_remainder`].
         resumable: bool,
+        /// The thread `unsent` belongs in: the request's own, or — `#263
+        /// post-split-per-provider` — the thread the first part started, where the rest of a
+        /// post to the conversation was going. `None` for the conversation itself.
+        thread_id: Option<String>,
     },
 
     /// A catch-up's deadline passed before this channel was read, and nothing earlier is held.
@@ -1374,7 +1379,7 @@ pub async fn propose_reply(
     if !info.writable {
         return Err(OpError::ChannelNotWritable);
     }
-    if crate::discord::split::split_for_discord(text).is_empty() {
+    if text.trim().is_empty() {
         return Err(OpError::Chat(ChatError::Refused(
             "message content is empty".to_owned(),
         )));
@@ -1563,8 +1568,7 @@ fn log_gate_step(
 /// # Errors
 ///
 /// [`OpError::UnknownChannel`], [`OpError::ChannelNotWritable`], or [`OpError::Chat`] — which
-/// also covers the length and emptiness refusals the Discord layer makes before any request is
-/// sent.
+/// also covers the emptiness refusal made before any request is sent.
 pub async fn reply(
     state: &AppState,
     channel_id: &str,
@@ -1576,13 +1580,23 @@ pub async fn reply(
 
 /// Post to the channel or to one of its threads, preserving write policy and partial progress.
 ///
+/// A post longer than the channel's provider accepts in one message
+/// ([`ChatClient::post_limit`]) is cut into parts that each fit, and one that fits goes whole.
+/// `#263 post-split-per-provider`: the parts of a post to the conversation itself go where the
+/// provider continues a long message ([`ChatClient::continuation_thread`]) — the first in the
+/// conversation and the rest in the thread under it, for Google Chat and Slack — and one after
+/// another in the conversation for Discord. A post to a thread stays in that thread, every part.
+///
 /// `idempotency_key` names this post across attempts — `#195 send-resilience`. A caller that
 /// lost an answer sends the same text again under the same key, and every part goes upstream
 /// under the same per-part key it had the first time ([`part_key`]); a provider for which
 /// [`ChatClient::supports_idempotent_posts`] holds then posts it at most once. After a 207 the
-/// same holds for the unsent text only where the 207 says `resumable`; see [`unsent_remainder`].
+/// same holds for the unsent text, sent to the thread the 207 names, only where the 207 says
+/// `resumable`; see [`unsent_remainder`].
 ///
 /// [`ChatClient::supports_idempotent_posts`]: crate::chat::ChatClient::supports_idempotent_posts
+/// [`ChatClient::post_limit`]: crate::chat::ChatClient::post_limit
+/// [`ChatClient::continuation_thread`]: crate::chat::ChatClient::continuation_thread
 pub async fn reply_scoped(
     state: &AppState,
     channel_id: &str,
@@ -1603,10 +1617,13 @@ pub async fn reply_scoped(
     }
     let reply_to = reply_to.map(|id| MessageId(id.to_owned()));
 
-    // LONGER THAN DISCORD ACCEPTS IS NOT A REFUSAL ANY MORE. A reply somebody typed on a phone came
+    // LONGER THAN THE PROVIDER ACCEPTS IS NOT A REFUSAL. A reply somebody typed on a phone came
     // back as an error and stayed stuck in the box; coding agents posting into the channel already
-    // split their own long messages. See `crate::discord::split`.
-    let parts = crate::discord::split::split_for_discord(text);
+    // split their own long messages. See `crate::discord::split`. And it is the PROVIDER's limit,
+    // not Discord's: cut at Discord's 2000 characters, a long message to Google Chat, which takes
+    // sixteen times that, arrived as three. `#263 post-split-per-provider`.
+    let limit = state.chat.post_limit(&info.id);
+    let parts = crate::discord::split::split_within(text, &limit);
     if parts.is_empty() {
         return Err(OpError::Chat(ChatError::Refused(
             "message content is empty".to_owned(),
@@ -1615,13 +1632,18 @@ pub async fn reply_scoped(
 
     let keys = idempotency_key.map(|key| part_keys(key, &parts));
     let mut posted: Vec<Message> = Vec::new();
+    // Where the parts after the first go, for a post to the conversation itself: the thread under
+    // the first part, where the provider continues a long message there. Learned from the first
+    // part's own answer, so it is only ever a thread this post started or joined.
+    let mut continuation: Option<String> = None;
     for (index, part) in parts.iter().enumerate() {
         // Only the FIRST part answers the message. Discord threads a reply from one message, and
         // pointing every part at the same parent would render as several separate answers to the
         // same thing rather than as one answer that ran long.
         let parent = if index == 0 { reply_to.as_ref() } else { None };
         let key = keys.as_ref().map(|keys| keys[index].as_str());
-        let sent = match thread_id {
+        let into = thread_id.or(continuation.as_deref());
+        let sent = match into {
             Some(thread) => {
                 state
                     .chat
@@ -1642,6 +1664,20 @@ pub async fn reply_scoped(
                 // the poller will see it in a few seconds, and relaying it into the live
                 // conversation would make the agent hear its own reply as new information.
                 state.live.note_self_posted(&one.id);
+                if index == 0 && thread_id.is_none() && parts.len() > 1 {
+                    continuation = state.chat.continuation_thread(&info.id, &one);
+                    if let (Some(thread), None) = (&continuation, &one.thread) {
+                        // It roots that thread now, whether or not the provider's answer for a
+                        // message that had no replies yet said so; the page draws it as one.
+                        one.thread = Some(crate::threads::MessageThread {
+                            id: thread.clone(),
+                            root_message_id: Some(one.id.clone()),
+                            is_root: true,
+                            reply_count: None,
+                            reply_count_exact: false,
+                        });
+                    }
+                }
                 posted.push(one);
             }
             Err(cause) => {
@@ -1649,13 +1685,16 @@ pub async fn reply_scoped(
                 // failure here would be a lie the reader acts on: they would send the whole thing
                 // again and post the first half twice. So the caller is told exactly how much
                 // landed AND handed back the text that did not, which is the only copy of it left
-                // once their draft is cleared.
-                let (unsent, resumable) = unsent_remainder(text, &parts, index, reply_to.is_some());
+                // once their draft is cleared — and where it belongs, which after the first part
+                // of a continued post is that part's thread rather than the conversation.
+                let replying = reply_to.is_some() && continuation.is_none();
+                let (unsent, resumable) = unsent_remainder(text, &parts, index, replying, &limit);
                 return Err(OpError::PartiallyPosted {
                     posted: posted.len(),
                     unsent,
                     retryable: cause.is_transient(),
                     resumable,
+                    thread_id: into.map(str::to_owned),
                     cause: cause.to_string(),
                 });
             }
@@ -1747,15 +1786,26 @@ pub fn part_keys(key: &str, parts: &[String]) -> Vec<String> {
 ///   each request, so such a part would be keyed as its posted twin and silently collapse into
 ///   it — and the part that failed, if it is one, would not be keyed as it was.
 /// - **A reply.** Only the first part of the first attempt answered the message; the remainder
-///   sent again with the reply target makes its first part a different request.
+///   sent again with the reply target makes its first part a different request. Not so for a
+///   remainder continuing in the first part's thread (`#263 post-split-per-provider`): that goes
+///   to the thread the 207 names, without the reply target, exactly as the part that failed did,
+///   so the caller passes `replying` false for it.
+///
+/// `limit` is the one the post was cut to, so the remainder is cut the same way.
 ///
 /// False here leaves the 207 to the reader, which is what every 207 was before keys existed.
-fn unsent_remainder(text: &str, parts: &[String], index: usize, replying: bool) -> (String, bool) {
+fn unsent_remainder(
+    text: &str,
+    parts: &[String],
+    index: usize,
+    replying: bool,
+    limit: &crate::chat::PostLimit,
+) -> (String, bool) {
     if index == 0 {
         return (text.to_owned(), true);
     }
     let unsent = parts[index..].join("");
-    let again = crate::discord::split::split_for_discord(&unsent);
+    let again = crate::discord::split::split_within(&unsent, limit);
     let resumable = !replying
         && again.first() == Some(&parts[index])
         && !again.iter().any(|part| parts[..index].contains(part));
@@ -3316,7 +3366,8 @@ mod tests {
     /// provider honouring keys would silently drop.
     #[test]
     fn a_resumable_remainder_asks_for_the_failed_part_as_the_same_request() {
-        use crate::discord::split::split_for_discord;
+        use crate::chat::{PostEscaping, PostLimit};
+        use crate::discord::split::split_within;
 
         let prose = |n: usize| -> String {
             (0..n)
@@ -3343,13 +3394,24 @@ mod tests {
             ),
             ("repeated parts", format!("{block}\n{block}\n{block}")),
         ];
+        // Discord's limit, and — `#263 post-split-per-provider` — the other shapes a provider's
+        // limit takes: bytes, and characters counted after escaping.
+        let discord = PostLimit::chars(crate::discord::http::DISCORD_MAX_CONTENT_LEN);
+        let limits = [
+            discord,
+            PostLimit::bytes(3_000),
+            PostLimit::chars(2_500).escaped(PostEscaping::HtmlEntities),
+        ];
         let mut refused = Vec::new();
-        for (name, text) in &texts {
-            let parts = split_for_discord(text);
+        for (limit, (name, text)) in limits
+            .iter()
+            .flat_map(|limit| texts.iter().map(move |text| (limit, text)))
+        {
+            let parts = split_within(text, limit);
             assert!(parts.len() > 2, "{name}: the fixture did not split");
             let keys = part_keys("outgoing-key", &parts);
             for index in 0..parts.len() {
-                let (unsent, resumable) = unsent_remainder(text, &parts, index, false);
+                let (unsent, resumable) = unsent_remainder(text, &parts, index, false, limit);
                 if index == 0 {
                     assert_eq!(
                         &unsent, text,
@@ -3358,10 +3420,12 @@ mod tests {
                     assert!(resumable, "{name}: the same request was called unsafe");
                 }
                 if !resumable {
-                    refused.push((*name, index));
+                    if *limit == discord {
+                        refused.push((*name, index));
+                    }
                     continue;
                 }
-                let retry = split_for_discord(&unsent);
+                let retry = split_within(&unsent, limit);
                 let again = part_keys("outgoing-key", &retry);
                 assert_eq!(
                     retry[0], parts[index],
@@ -3390,9 +3454,9 @@ mod tests {
         assert!(refused.contains(&("repeated parts", 1)), "{refused:?}");
         // A reply's remainder would go again with the reply target on its first part.
         let text = prose(700);
-        let parts = split_for_discord(&text);
-        assert!(!unsent_remainder(&text, &parts, 1, true).1);
-        assert!(unsent_remainder(&text, &parts, 0, true).1);
+        let parts = split_within(&text, &discord);
+        assert!(!unsent_remainder(&text, &parts, 1, true, &discord).1);
+        assert!(unsent_remainder(&text, &parts, 0, true, &discord).1);
     }
 
     // --- `#190 voice-agent-tools` ----------------------------------------------------------------
