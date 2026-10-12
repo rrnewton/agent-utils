@@ -503,8 +503,13 @@
             (`COLUMN_IDS`), so the read modes, the landing on the first unread, the reply arrows, Done,
             pins, older history and the composer are one implementation, not two. Every id is in this
             markup, because the page suite builds its DOM from this file.
+
+            `#231 two-column-polish`. ONE named region, the scroller, as #scroll-area is the left
+            column's: the keys hand the focus to it, and a screen reader landing there hears what the
+            column shows, "Thread: its name" or "Threads", rather than the list read out. The column
+            around it used to be a second region named "Thread", so every way in said "Thread" twice.
           -->
-          <div id="side-column" role="region" aria-label="Thread">
+          <div id="side-column">
             <div id="side-heading">
               <span id="side-facts" class="thread-facts" hidden></span>
               <span id="side-title">Threads</span>

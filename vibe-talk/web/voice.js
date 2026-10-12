@@ -23821,15 +23821,21 @@ function renderSideMode() {
   if (leftEl("side-list").hidden === !thread) leftEl("side-list").hidden = thread;
   if (leftEl("side-pane").hidden === thread) leftEl("side-pane").hidden = !thread;
   if (leftEl("side-close").hidden === thread) leftEl("side-close").hidden = !thread;
-  leftEl("side-scroll").setAttribute("aria-label", thread ? "Thread" : "Threads");
   renderSideColumn();
 }
 
-/** The right column's heading, and with no thread selected its cards. Drawn only where they changed. */
+/**
+ * The right column's heading, and with no thread selected its cards. Drawn only where they changed.
+ *
+ * `#231 two-column-polish`. The scroller is the column's one named region, and its name is the
+ * heading's: "Threads", or "Thread: " and the thread's name, so a screen reader landing in it says
+ * which thread it is in, once.
+ */
 function renderSideColumn() {
   if (!columnsShown) return;
   if (columns.side.mode === "list") {
     setTextIfChanged(leftEl("side-title"), "Threads");
+    nameSideRegion("Threads");
     const facts = leftEl("side-facts");
     if (!facts.hidden) facts.hidden = true;
     renderSideCards();
@@ -23837,12 +23843,20 @@ function renderSideColumn() {
   }
   inColumn(columns.side, () => {
     const open = openThreadChoice();
-    setTextIfChanged(leftEl("side-title"), open ? threadName(open, Infinity) : "Thread");
+    const name = open ? threadName(open, Infinity) : "Thread";
+    setTextIfChanged(leftEl("side-title"), name);
+    nameSideRegion(open ? `Thread: ${name}` : "Thread");
     const said = open ? threadFacts(open) : "";
     const facts = leftEl("side-facts");
     setTextIfChanged(facts, said);
     if (facts.hidden !== (said === "")) facts.hidden = said === "";
   });
+}
+
+/** Name the right column's region `name`, unless it is already called that. */
+function nameSideRegion(name) {
+  const region = leftEl("side-scroll");
+  if (region.getAttribute("aria-label") !== name) region.setAttribute("aria-label", name);
 }
 
 /** Set `node`'s text, unless it already says that. */
@@ -23873,6 +23887,22 @@ function sideCardUnread(choice, tally) {
   return unseen > 0 ? `${unseen} new` : "";
 }
 
+/**
+ * What a card says of its thread's replies, "3 replies" or "about 3 replies", or "" with none.
+ *
+ * `#231 two-column-polish`. By the rule of the thread's tag on a root in Main (`drawThreadChips`):
+ * the count reported, never fewer than the replies the store holds nor than an exact count the
+ * store's copy of the root gives. A reply that came in on the stream is in the store at once, and
+ * the card's unread chip counted it then, while the count the thread list reported waited up to a
+ * minute for that list's next read.
+ */
+function sideCardReplies(choice, tally) {
+  const entry = tally.threads.get(choice.id);
+  const reported = typeof choice.count === "number" ? choice.count : 0;
+  const count = Math.max(reported, entry ? entry.held : 0, exactReplyCount(choice.id, choice.root, tally) || 0);
+  return count > 0 ? threadCount(count, choice.summary ? choice.summary.reply_count_exact : true) : "";
+}
+
 /** What the cards were last drawn from, so a pass that changes nothing draws nothing. */
 let sideCardsDrawn = "";
 
@@ -23889,8 +23919,7 @@ function renderSideCards() {
     choice,
     text: sideCardText(choice),
     age: briefAge(Number.isFinite(choice.at) ? choice.at : choice.started),
-    replies: typeof choice.count === "number" && choice.count > 0
-      ? threadCount(choice.count, choice.summary ? choice.summary.reply_count_exact : true) : "",
+    replies: sideCardReplies(choice, tally),
     unread: sideCardUnread(choice, tally),
   }));
   const signature = JSON.stringify(cards.map(({ choice, text, age, replies, unread }) =>
@@ -24051,9 +24080,6 @@ function inSideThread(message) {
   if (!sideShowing()) return false;
   return inColumn(columns.side, () => channelView === "thread" && threadOf(message) === String(selectedThreadId));
 }
-
-/** Where the right column's list was, put aside while another screen hides it. */
-let sideMark = null;
 
 // --- keeping the channel view fresh -----------------------------------------------------------
 //

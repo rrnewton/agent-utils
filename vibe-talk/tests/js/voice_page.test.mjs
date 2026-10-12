@@ -38828,6 +38828,83 @@ test("`#229 desktop-two-column`: keys for the page — another channel, the Pinn
   assert.equal(page.el("channel-compose-text").getAttribute("aria-label"), "Message the main channel");
 });
 
+// --- two columns, the review's follow-ups (#231 two-column-polish) ------------------------------
+//
+// What the review of `#229 desktop-two-column` found and did not hold it for: a card's reply count
+// that lagged the reply its unread chip had counted, a right column whose failed refresh said
+// nothing, two regions both called "Thread", a greyed picker that explained itself only to a
+// hovering mouse, a thread read twice when it was selected under a poll, no guard on the cards'
+// no-op refresh, and a dead declaration.
+
+/** A card's facts without its unread chip: how long since its thread moved, and its reply count. */
+const cardFacts = (page, id) => {
+  const facts = cardPart(page, id, "side-card-facts") || "";
+  const chip = cardPart(page, id, "side-card-unread") || "";
+  return chip && facts.endsWith(chip) ? facts.slice(0, -chip.length) : facts;
+};
+
+test("`#231 two-column-polish`: a live reply counts on its thread's card at once, with its unread chip, and not a minute later at the thread list's next read", async () => {
+  const { page, server, data } = await twoColumnServer();
+  const [first, second] = data.threads;
+  assert.match(cardFacts(page, first.id), / · 1 reply$/);
+  const reads = server.reads.length;
+  // Into the thread whose count is exact, and into the one whose count the provider estimates.
+  for (const [id, root] of [["205", data.messages[1]], ["206", data.messages[3]]]) {
+    const reply = server.post(message({ id, content: `a live answer ${id}`, thread: { ...root.thread, is_root: false } }));
+    await deliver(page, page.stream(), sseMessage(reply));
+    await page.settle();
+  }
+  assert.deepStrictEqual(server.reads.slice(reads).filter((read) => read.view === "threads"), [],
+    "the thread list was read again, so this does not show the card counting the reply by itself");
+  assert.match(cardFacts(page, first.id), / · 2 replies$/,
+    "the card still gives the count the thread list last reported, one short of the reply it counts as unread");
+  assert.match(cardFacts(page, second.id), / · about 2 replies$/,
+    "an estimated count did not take the live reply, or stopped saying it is an estimate");
+  assert.ok(cardPart(page, first.id, "side-card-unread"), "the live reply was not counted as unread on its card");
+  // Main's root says the same count, by the same rule.
+  assert.equal(threadBadge(rowWithId(page, "201")).textContent, "Thread(2)");
+});
+
+test("`#231 two-column-polish`: the right column is one named region, called what it shows — Threads, or Thread: and its name", async () => {
+  // The scroller is the region, as #scroll-area is the left column's, and the column round it is not
+  // a second one: two nested regions both called "Thread" were said twice on every way in.
+  const column = HTML_CODE.slice(HTML_CODE.indexOf('id="side-column"'), HTML_CODE.indexOf('id="pull-refresh"'));
+  assert.equal((column.match(/role="region"/g) || []).length, 1, "the right column holds more than one region");
+  assert.doesNotMatch(/<div\s+id="side-column"[^>]*>/.exec(HTML_CODE)[0], /role=|aria-label=/,
+    "the right column is a region round its own region");
+  assert.match(/<div\s+id="side-scroll"[^>]*>/.exec(HTML_CODE)[0], /role="region"/);
+  const page = await threadPage();
+  await twoColumns(page);
+  const region = page.el("side-scroll");
+  assert.equal(region.getAttribute("aria-label"), "Threads");
+  await threadBadge(rowWithId(page, "201")).click();
+  await page.settle();
+  assert.equal(region.getAttribute("aria-label"), "Thread: First discussion", "the region does not name the thread it shows");
+  assert.equal(page.el("side-title").textContent, "First discussion", "the region and the heading name the thread apart");
+  await threadBadge(rowWithId(page, "203")).click();
+  await page.settle();
+  assert.equal(region.getAttribute("aria-label"), "Thread: Second discussion");
+  await page.el("side-close").click();
+  await page.settle();
+  assert.equal(region.getAttribute("aria-label"), "Threads", "the X left the region naming a thread it no longer shows");
+});
+
+/** The top-level bindings of `code` that nothing else in it names: declared, and never used. */
+function unusedBindings(code) {
+  return [...code.matchAll(/^(?:let|const|var) ([A-Za-z_$][\w$]*)/gm)].map((found) => found[1]).filter((name) => {
+    // A use is the name standing alone, or spread (`...name`); `.name` is someone else's property.
+    const uses = code.match(new RegExp(`(?:^|[^\\w$.]|\\.\\.\\.)${name.replace(/\$/g, "\\$")}(?![\\w$])`, "gm")) || [];
+    return uses.length < 2;
+  });
+}
+
+test("`#231 two-column-polish`: no top-level binding of web/voice.js is declared and never used", () => {
+  assert.deepStrictEqual(unusedBindings(SCRIPT_CODE), [], "web/voice.js declares something nothing uses");
+  // The control: one more such declaration, `#229`'s `let sideMark = null` as it was, is found.
+  assert.deepStrictEqual(unusedBindings(`${SCRIPT_CODE}\nlet sideMark = null;\n`), ["sideMark"],
+    "the check does not find a declaration nothing uses, so it proves nothing");
+});
+
 // --- clearing unread in the chat service's own app ----------------------------------------------
 //
 // `#232 upstream-mark-read`. The server marks every message it receives in a channel read in the
