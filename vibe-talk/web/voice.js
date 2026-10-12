@@ -11927,11 +11927,19 @@ function threadChoices() {
 /**
  * The thread on screen, named from the store like any other — or, before the store knows it, from
  * the summary it was opened with. Null outside a thread.
+ *
+ * `#252 thread-button-state`. A thread nobody has answered is in no list of threads, and opened from
+ * its grey tag it has no summary either: it goes by its message, as a new thread does on the reply
+ * screen, rather than by the bare word "Thread".
  */
 function openThreadChoice() {
   if (channelView !== "thread" || !selectedThreadId) return null;
   const id = String(selectedThreadId);
-  return threadIndex().get(id) || threadChoice(id, selectedThread);
+  const listed = threadIndex().get(id);
+  if (listed) return listed;
+  const root = channelCanon.channel === String(el("discord-channel").value)
+    ? channelCanon.messages.find((message) => threadOf(message) === id && message.thread.is_root === true) : null;
+  return threadChoice(id, selectedThread, root || null);
 }
 
 /** What the seam over an open thread calls it: the selector's name, until there is none to give. */

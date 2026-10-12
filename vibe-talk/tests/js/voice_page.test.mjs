@@ -40277,6 +40277,9 @@ test("`#252 thread-button-state`: the grey Thread opens the empty thread with no
   await threadBadge(rowOf(page, "210")).click();
   assert.equal(page.el("thread-heading").hidden, false, "the grey Thread opened nothing");
   assert.equal(page.el("thread-select").value, `thread:${data.lone.id}`);
+  // Named by its message, as a new thread is on the reply screen: there is no summary to name it.
+  assert.equal(page.el("thread-title").textContent, "a brand-new message nobody has answered",
+    "the empty thread is called by no name of its own");
   assert.deepStrictEqual(shownIds(page), ["210"], "the empty thread is not the message alone");
   assert.equal(focused(page), page.el("channel-compose-text"), `the thread's box was not focused: ${focusName(page)}`);
   assert.equal(page.el("channel-compose-text").getAttribute("aria-label"), "Reply in this thread");

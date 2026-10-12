@@ -55,8 +55,18 @@ longer configured, the app selects the first available channel.
 Tap a root's reply count or a thread-list entry to open its history. **Back**, or a swipe right,
 returns to the view and scroll position you came from. The selected thread has its own history,
 draft, and posting destination. Reply counts marked approximate come from the provider's estimate.
-A thread nobody has answered yet — Google Chat names one for every message — is tagged plain
-**Thread** on **All**, gets no reply-count button, and is not offered in the picker.
+A thread nobody has answered yet — Google Chat names one for every message — is not a thread yet:
+its tag is a plain grey **Thread**, drawn like **Reply** beside it with no thread colour, it gets no
+reply-count button, and it is not offered in the picker. Tapping it **starts the thread**: the thread
+opens with only that message in it (on the right, in two columns) and its message box focused, and
+the first reply you send from there is posted into the message's thread. The first reply — yours,
+or anyone's arriving on a read or the live stream — turns the tag into the thread's coloured
+**Thread(1)** without a reload. A thread can only be started where the chat service has named one for
+the message: every message on Google Chat, a Discord thread somebody made that nobody has written in
+yet. A Slack message nobody has answered has no thread to name, and Discord threads are created in
+Discord, so a message heading none has no tag there; on Slack, **Reply** starts the message's thread
+instead. On a read-only channel the grey tag is not shown, since nothing could be posted to start the
+thread.
 
 **Reply answers a message where it is.** Replying to a thread message posts in that thread, from
 any view, including **All**. Replying to a main-channel message posts in the main channel as a reply
