@@ -3594,12 +3594,13 @@ function onComposerKey(event, send, singleLine = false) {
 //     drawn by web/voice.css as the ring and the tint together, whichever put it there; a row lit by
 //     `:hover` alone no longer exists. A key that moves the selection takes it from wherever the mouse
 //     put it, and a REAL mouse move over a row takes it to that row, the focus with it while the focus
-//     is on a list or on a control a click focused (`pointRow`, `focusFollowsSelection`). A move is real when the pointer itself moved: a list scrolled under a
-//     pointer standing still, by a key or a new message, takes nothing (`mouseMoved`). A click selects
-//     the row too, drawn; a tap on a touch screen selects SILENTLY, with no focus and nothing drawn,
-//     because a touch screen has no hover and a lit row there could not be put out. The row a jump
-//     lands on (`revealRow`) becomes the selection, so the flash that says "here" is on the message
-//     every key now acts on, and goes out when the selection moves on.
+//     is on a list or on a control a click focused (`pointRow`, `focusFollowsSelection`). A move is
+//     real when the pointer itself moved: a list scrolled under a pointer standing still, by a key or
+//     a new message, takes nothing (`mouseMoved`). A click selects the row too, drawn; a tap on a
+//     touch screen selects SILENTLY, with no focus and nothing drawn, because a touch screen has no
+//     hover and a lit row there could not be put out. The row a jump lands on (`revealRow`) becomes
+//     the selection, so the flash that says "here" is on the message every key now acts on, and goes
+//     out when the selection moves on.
 //   * PER LIST, NOT PER PAGE. A list the keys move through is a `KeyPane` (its scroller, its rows,
 //     and the room its floating line and its chips take) and nothing below names #scroll-area except
 //     the channel pane. A second column is a second entry in `KEY_PANES`; the pane holding the focus
