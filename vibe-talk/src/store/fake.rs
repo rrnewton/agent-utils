@@ -27,10 +27,11 @@ use std::sync::Mutex;
 use async_trait::async_trait;
 
 use super::{
-    now_ms, ChannelAlias, ConversationId, ConversationSummary, Pin, PinChange, PinSnapshot, Pins,
-    ReadMark, RecordedTurn, Retention, StateStore, StoreError, SummaryKey, TranscriptCursor,
-    TranscriptPage, Turn, UpstreamClearAttempt, UpstreamClearMode, UpstreamClearSetting,
-    MAX_PINS_PER_CHANNEL, MAX_TRANSCRIPT_PAGE, MAX_TURN_CHARS,
+    now_ms, Bookmark, BookmarkAnchor, BookmarkChange, ChannelAlias, ConversationId,
+    ConversationSummary, Pin, PinChange, PinSnapshot, Pins, ReadMark, RecordedTurn, Retention,
+    StateStore, StoreError, SummaryKey, TranscriptCursor, TranscriptPage, Turn,
+    UpstreamClearAttempt, UpstreamClearMode, UpstreamClearSetting, MAX_PINS_PER_CHANNEL,
+    MAX_TRANSCRIPT_PAGE, MAX_TURN_CHARS,
 };
 use crate::model::{ChannelId, MessageId};
 
@@ -77,6 +78,9 @@ struct State {
     pin_revisions: BTreeMap<String, i64>,
     /// Channel to its upstream-clear setting. `#232 upstream-mark-read`.
     upstream_clear: BTreeMap<String, UpstreamClearSetting>,
+    /// Channel to its bookmark, cleared ones included, as the real table keeps a row for a cleared
+    /// bookmark so its revision goes on growing. `#240 reading-bookmark`.
+    bookmarks: BTreeMap<String, Bookmark>,
     next_summary_seq: u64,
     fail_next: Option<String>,
     appended: usize,
@@ -820,6 +824,43 @@ impl StateStore for FakeStore {
         })
     }
 
+    async fn bookmark(&self, channel: &ChannelId) -> Result<Bookmark, StoreError> {
+        let mut state = self.lock();
+        armed(&mut state)?;
+        Ok(state
+            .bookmarks
+            .get(channel.as_str())
+            .cloned()
+            .unwrap_or_else(Bookmark::unset))
+    }
+
+    async fn set_bookmark(
+        &self,
+        channel: &ChannelId,
+        anchor: Option<&BookmarkAnchor>,
+        if_revision: Option<i64>,
+    ) -> Result<BookmarkChange, StoreError> {
+        // Validated BEFORE `armed`, as a pin is: a fake that kept an anchor the real store refuses
+        // would certify a bug.
+        if let Some(anchor) = anchor {
+            super::validate_bookmark(anchor)?;
+        }
+        let mut state = self.lock();
+        armed(&mut state)?;
+        let held = state
+            .bookmarks
+            .get(channel.as_str())
+            .cloned()
+            .unwrap_or_else(Bookmark::unset);
+        let change = super::decide_bookmark(&held, anchor, if_revision, now_ms());
+        if change.changed {
+            state
+                .bookmarks
+                .insert(channel.as_str().to_owned(), change.bookmark.clone());
+        }
+        Ok(change)
+    }
+
     async fn cached_summary(&self, key: &SummaryKey) -> Result<Option<String>, StoreError> {
         let mut state = self.lock();
         armed(&mut state)?;
@@ -942,6 +983,7 @@ impl StateStore for FakeStore {
         state.noise_exemptions.clear();
         state.pins.clear();
         state.pin_revisions.clear();
+        state.bookmarks.clear();
         state.purges += 1;
         Ok(())
     }
@@ -1149,6 +1191,65 @@ mod tests {
             "kept entries are bounded on their own"
         );
         assert_eq!(store.cached_summary(&kept).await.expect("read"), None);
+    }
+
+    #[tokio::test]
+    async fn the_fake_bookmark_follows_the_shared_rule_refuses_and_can_fail() {
+        // `#240 reading-bookmark`. The fake answers a bookmark write as the real store does — a
+        // stale revision refused, a repeat unchanged, a bad anchor refused before anything — and
+        // can be made to fail, so a caller's error path is testable against it.
+        use super::super::{BookmarkAnchor, BookmarkPlace};
+        let store = FakeStore::new();
+        let channel = ChannelId("1111111111".to_owned());
+        let at = |id: &str| BookmarkAnchor {
+            message_id: MessageId(id.to_owned()),
+            place: BookmarkPlace::Above,
+            timestamp: "2026-10-12T12:00:00Z".to_owned(),
+            thread_id: None,
+        };
+        let first = store
+            .set_bookmark(&channel, Some(&at("100")), None)
+            .await
+            .expect("set");
+        assert!(first.applied && first.changed);
+        let stale = store
+            .set_bookmark(
+                &channel,
+                Some(&at("200")),
+                Some(first.bookmark.revision - 1),
+            )
+            .await
+            .expect("an answer");
+        assert!(!stale.applied);
+        assert_eq!(
+            store.bookmark(&channel).await.expect("read"),
+            first.bookmark
+        );
+        let repeat = store
+            .set_bookmark(&channel, Some(&at("100")), Some(first.bookmark.revision))
+            .await
+            .expect("repeat");
+        assert!(repeat.applied && !repeat.changed);
+        let error = store
+            .set_bookmark(&channel, Some(&at("")), None)
+            .await
+            .expect_err("a bad anchor");
+        assert_eq!(error.code(), "bad_id");
+        store.fail_next("the disk is full");
+        store
+            .set_bookmark(&channel, None, None)
+            .await
+            .expect_err("the armed failure fires");
+        assert_eq!(
+            store.bookmark(&channel).await.expect("read"),
+            first.bookmark,
+            "a failed write changed the bookmark"
+        );
+        store.purge_everything().await.expect("purge");
+        assert_eq!(
+            store.bookmark(&channel).await.expect("read"),
+            super::super::Bookmark::unset()
+        );
     }
 
     #[tokio::test]

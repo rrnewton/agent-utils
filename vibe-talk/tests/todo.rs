@@ -280,7 +280,8 @@ async fn dismissing_the_same_message_twice_is_not_an_error_and_changes_nothing()
 #[tokio::test]
 async fn an_unknown_channel_and_an_unbounded_batch_cannot_grow_the_store() {
     // Explicit dismissals are intentionally local and do not re-read the provider. The channel
-    // allowlist and one-page batch ceiling are therefore the two synchronous bounds.
+    // allowlist and the batch ceiling are therefore the two synchronous bounds. The ceiling is a
+    // thousand ids (`#240 reading-bookmark`), so a long "Done through here" is one request.
     let server = Server::with(2);
     assert_eq!(
         ops::dismiss(
@@ -293,13 +294,21 @@ async fn an_unknown_channel_and_an_unbounded_batch_cannot_grow_the_store() {
         .code(),
         "unknown_channel"
     );
-    let too_many = (0..=usize::from(ops::MAX_PAGE))
+    assert_eq!(ops::MAX_DISMISS_BATCH, 1_000);
+    let too_many = (0..=ops::MAX_DISMISS_BATCH)
         .map(|n| MessageId(format!("1000000000001{n:06}")))
         .collect::<Vec<_>>();
     assert_eq!(
         ops::dismiss(&server.state, READ_CHANNEL, &too_many)
             .await
             .expect_err("must refuse")
+            .code(),
+        "invalid_range"
+    );
+    assert_eq!(
+        ops::restore(&server.state, READ_CHANNEL, &too_many)
+            .await
+            .expect_err("an undo is bounded the same way")
             .code(),
         "invalid_range"
     );
@@ -324,6 +333,39 @@ async fn an_unknown_channel_and_an_unbounded_batch_cannot_grow_the_store() {
             .is_empty(),
         "a refused request wrote to the store anyway"
     );
+}
+
+#[tokio::test]
+async fn a_thousand_ids_are_one_dismissal_and_one_undo() {
+    // `#240 reading-bookmark`. "Done through here" over a long backlog used to go out in batches of
+    // 99, each its own transaction and its own pass of the retention prune. A thousand is the
+    // ceiling, and it is accepted whole, counted exactly, and undone whole.
+    let server = Server::with(2);
+    let many = (0..ops::MAX_DISMISS_BATCH)
+        .map(|n| MessageId(format!("1000000000002{n:06}")))
+        .collect::<Vec<_>>();
+    let change = ops::dismiss(&server.state, READ_CHANNEL, &many)
+        .await
+        .expect("a full batch is one request");
+    assert_eq!(change.messages.len(), ops::MAX_DISMISS_BATCH);
+    assert_eq!(
+        server
+            .store
+            .dismissals(&server.channel)
+            .await
+            .expect("reads")
+            .len(),
+        ops::MAX_DISMISS_BATCH
+    );
+    ops::restore(&server.state, READ_CHANNEL, &many)
+        .await
+        .expect("and so is its undo");
+    assert!(server
+        .store
+        .dismissals(&server.channel)
+        .await
+        .expect("reads")
+        .is_empty());
 }
 
 #[tokio::test]

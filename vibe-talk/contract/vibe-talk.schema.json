@@ -18,6 +18,105 @@
       ],
       "type": "object"
     },
+    "Bookmark": {
+      "description": "One channel's bookmark and the revision it is at. `#240 reading-bookmark`.\n\n`anchor` is `null` when no bookmark is set, which is a different answer from the field being\nabsent on a read: absent means the server could not say. The revision is `0` for a channel that\nnever had one, and otherwise only grows (through [`next_pin_revision`]), so a page can send it\nback as `if_revision` and be refused when another device moved the bookmark since.",
+      "properties": {
+        "anchor": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/BookmarkAnchor"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Where it is, or `null` when there is none."
+        },
+        "revision": {
+          "description": "Moves on every change. See [`StateStore::set_bookmark`].",
+          "format": "int64",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "revision",
+        "anchor"
+      ],
+      "type": "object"
+    },
+    "BookmarkAnchor": {
+      "description": "Where one channel's bookmark is: next to which message, on which side, and enough about that\nmessage to draw the line in a list that does not hold it. `#240 reading-bookmark`.\n\n`timestamp` and `thread_id` are copied from the message as the page was served it, so Main can\nplace the line for a thread reply it never shows, by time. Ids and an instant, and no text: a\nbookmark is not a second copy of anybody's words.",
+      "properties": {
+        "message_id": {
+          "$ref": "#/$defs/MessageId",
+          "description": "The message the line is drawn next to, in the provider-neutral namespace it was served in."
+        },
+        "place": {
+          "$ref": "#/$defs/BookmarkPlace",
+          "description": "Which side of that message the line is on."
+        },
+        "thread_id": {
+          "description": "The thread that message is in, when it is in one.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "timestamp": {
+          "description": "When that message was sent, ISO-8601, exactly as the provider reported it.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "message_id",
+        "place",
+        "timestamp"
+      ],
+      "type": "object"
+    },
+    "BookmarkPlace": {
+      "description": "Which side of its message a bookmark is on. `#240 reading-bookmark`.",
+      "oneOf": [
+        {
+          "const": "above",
+          "description": "Just above the message: \"start reading here\". The usual case, and what setting one makes.",
+          "type": "string"
+        },
+        {
+          "const": "below",
+          "description": "Just below it. Only when the newest message has been marked Done with the line on it, so the\nline ends up under every message there is and above whatever arrives next.",
+          "type": "string"
+        }
+      ]
+    },
+    "BookmarkResponse": {
+      "description": "One channel's bookmark, read or written: `GET`, `PUT` and `DELETE /api/v1/channels/{id}/bookmark`.\n`#240 reading-bookmark`.\n\nA conditional write that lost to a move made elsewhere answers 409 with this same body and an\n[`ApiErrorBody`]'s two fields beside it, so the page takes where the bookmark is now from the\nrefusal itself.",
+      "properties": {
+        "bookmark": {
+          "$ref": "#/$defs/Bookmark",
+          "description": "The bookmark as stored after the call."
+        },
+        "bookmark_notice": {
+          "description": "The standing statement that the bookmark is this server's own and marks nothing read.",
+          "type": "string"
+        },
+        "changed": {
+          "description": "Whether the call changed what is stored: false for a read, a repeat, and a refusal.",
+          "type": "boolean"
+        },
+        "channel": {
+          "$ref": "#/$defs/ChannelInfo",
+          "description": "The channel, as configured here."
+        }
+      },
+      "required": [
+        "channel",
+        "bookmark",
+        "changed",
+        "bookmark_notice"
+      ],
+      "type": "object"
+    },
     "ChannelId": {
       "description": "A Discord channel snowflake, as a string, exactly as Discord renders it.",
       "type": "string"
@@ -1029,6 +1128,17 @@
             "null"
           ]
         },
+        "bookmark": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Bookmark"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "This channel's bookmark and its revision. `#240 reading-bookmark`.\n\nOn every read, newest page and delta alike, as `pins_revision` is, and for its reason: a\nrefresh that already happens is how a page learns the owner moved the bookmark on his other\ndevice. ONE small row, so it rides inline rather than as a revision and a second read.\nAbsent when the store cannot say, and the page keeps what it has; `anchor: null` inside it\nis the different answer that no bookmark is set."
+        },
         "channel": {
           "$ref": "#/$defs/ChannelInfo",
           "description": "Configured parent channel, including its local alias and write policy."
@@ -1746,6 +1856,9 @@
     },
     {
       "$ref": "#/$defs/UpstreamClearState"
+    },
+    {
+      "$ref": "#/$defs/BookmarkResponse"
     }
   ],
   "description": "Generated from vibe-talk/src/contract.rs by `make -C vibe-talk contract`. Do not edit.",

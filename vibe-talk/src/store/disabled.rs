@@ -14,9 +14,9 @@
 use async_trait::async_trait;
 
 use super::{
-    ChannelAlias, ConversationId, ConversationSummary, PinChange, PinSnapshot, Pins, ReadMark,
-    StateStore, StoreError, SummaryKey, TranscriptCursor, TranscriptPage, Turn,
-    UpstreamClearAttempt, UpstreamClearMode, UpstreamClearSetting,
+    Bookmark, BookmarkAnchor, BookmarkChange, ChannelAlias, ConversationId, ConversationSummary,
+    PinChange, PinSnapshot, Pins, ReadMark, StateStore, StoreError, SummaryKey, TranscriptCursor,
+    TranscriptPage, Turn, UpstreamClearAttempt, UpstreamClearMode, UpstreamClearSetting,
 };
 use crate::model::{ChannelId, MessageId};
 
@@ -180,6 +180,21 @@ impl StateStore for DisabledStore {
         refuse()
     }
 
+    async fn bookmark(&self, _: &ChannelId) -> Result<Bookmark, StoreError> {
+        // A refusal, not "no bookmark", for the pins' reason: a page told there is none would offer
+        // to set one that cannot be kept. `#240 reading-bookmark`.
+        refuse()
+    }
+
+    async fn set_bookmark(
+        &self,
+        _: &ChannelId,
+        _: Option<&BookmarkAnchor>,
+        _: Option<i64>,
+    ) -> Result<BookmarkChange, StoreError> {
+        refuse()
+    }
+
     async fn cached_summary(&self, _: &SummaryKey) -> Result<Option<String>, StoreError> {
         refuse()
     }
@@ -306,6 +321,24 @@ mod tests {
                 .await
                 .expect_err("pin"),
             store.unpin(&channel, &message).await.expect_err("unpin"),
+            store.bookmark(&channel).await.expect_err("bookmark"),
+            store
+                .set_bookmark(
+                    &channel,
+                    Some(&super::super::BookmarkAnchor {
+                        message_id: message.clone(),
+                        place: super::super::BookmarkPlace::Above,
+                        timestamp: "2026-10-04T12:00:00Z".to_owned(),
+                        thread_id: None,
+                    }),
+                    None,
+                )
+                .await
+                .expect_err("set bookmark"),
+            store
+                .set_bookmark(&channel, None, Some(0))
+                .await
+                .expect_err("clear bookmark"),
             store
                 .upstream_clear_settings()
                 .await

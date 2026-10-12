@@ -933,6 +933,155 @@ fn pin_identifier(what: &str, raw: &str, ceiling: usize) -> Result<(), StoreErro
     Ok(())
 }
 
+/// Which side of its message a bookmark is on. `#240 reading-bookmark`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum BookmarkPlace {
+    /// Just above the message: "start reading here". The usual case, and what setting one makes.
+    Above,
+    /// Just below it. Only when the newest message has been marked Done with the line on it, so the
+    /// line ends up under every message there is and above whatever arrives next.
+    Below,
+}
+
+impl BookmarkPlace {
+    /// The word the store keeps.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Above => "above",
+            Self::Below => "below",
+        }
+    }
+
+    /// The place a stored word names, or `None` for a word no version of this server wrote.
+    #[must_use]
+    pub fn parse(text: &str) -> Option<Self> {
+        match text {
+            "above" => Some(Self::Above),
+            "below" => Some(Self::Below),
+            _ => None,
+        }
+    }
+}
+
+/// Where one channel's bookmark is: next to which message, on which side, and enough about that
+/// message to draw the line in a list that does not hold it. `#240 reading-bookmark`.
+///
+/// `timestamp` and `thread_id` are copied from the message as the page was served it, so Main can
+/// place the line for a thread reply it never shows, by time. Ids and an instant, and no text: a
+/// bookmark is not a second copy of anybody's words.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct BookmarkAnchor {
+    /// The message the line is drawn next to, in the provider-neutral namespace it was served in.
+    pub message_id: MessageId,
+    /// Which side of that message the line is on.
+    pub place: BookmarkPlace,
+    /// When that message was sent, ISO-8601, exactly as the provider reported it.
+    pub timestamp: String,
+    /// The thread that message is in, when it is in one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thread_id: Option<String>,
+}
+
+/// One channel's bookmark and the revision it is at. `#240 reading-bookmark`.
+///
+/// `anchor` is `null` when no bookmark is set, which is a different answer from the field being
+/// absent on a read: absent means the server could not say. The revision is `0` for a channel that
+/// never had one, and otherwise only grows (through [`next_pin_revision`]), so a page can send it
+/// back as `if_revision` and be refused when another device moved the bookmark since.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct Bookmark {
+    /// Moves on every change. See [`StateStore::set_bookmark`].
+    pub revision: i64,
+    /// Where it is, or `null` when there is none.
+    pub anchor: Option<BookmarkAnchor>,
+}
+
+impl Bookmark {
+    /// A channel that has never had a bookmark.
+    #[must_use]
+    pub fn unset() -> Self {
+        Self {
+            revision: 0,
+            anchor: None,
+        }
+    }
+}
+
+/// What one bookmark write did. `#240 reading-bookmark`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BookmarkChange {
+    /// Whether the write was carried out. False only when its `if_revision` was not the revision
+    /// stored: another device moved the bookmark first, and `bookmark` is where it is now.
+    pub applied: bool,
+    /// Whether the write changed what is stored. False for a refused write and for a repeat.
+    pub changed: bool,
+    /// The bookmark as it is stored after the call.
+    pub bookmark: Bookmark,
+}
+
+/// Check a bookmark's anchor: the message id, the timestamp and the thread id each present, within
+/// the bounds a pin's snapshot has, and free of control characters. Refused rather than trimmed,
+/// for [`validate_pin`]'s reason: no provider served such an id. `#240 reading-bookmark`.
+///
+/// # Errors
+///
+/// [`StoreError::BadId`] naming the first field that is not usable.
+pub fn validate_bookmark(anchor: &BookmarkAnchor) -> Result<(), StoreError> {
+    bookmark_identifier("message id", anchor.message_id.as_str(), MAX_PIN_ID_BYTES)?;
+    bookmark_identifier("timestamp", &anchor.timestamp, MAX_PIN_TIMESTAMP_BYTES)?;
+    if let Some(thread) = &anchor.thread_id {
+        bookmark_identifier("thread id", thread, MAX_PIN_ID_BYTES)?;
+    }
+    Ok(())
+}
+
+/// One identifier of a bookmark: present, within `ceiling` bytes, and free of control characters.
+fn bookmark_identifier(what: &str, raw: &str, ceiling: usize) -> Result<(), StoreError> {
+    if raw.is_empty() || raw.len() > ceiling || raw.chars().any(char::is_control) {
+        return Err(StoreError::BadId(format!(
+            "a bookmark's {what} must be 1 to {ceiling} bytes with no control characters"
+        )));
+    }
+    Ok(())
+}
+
+/// The outcome of one bookmark write against `held`, the bookmark stored now, decided by the rule
+/// every backend shares, so two of them cannot answer one request differently: refused when
+/// `if_revision` is given and is not `held`'s revision; a repeat, which changes nothing and keeps
+/// the revision, when `anchor` is what is held; otherwise the new anchor at the next revision.
+#[must_use]
+pub fn decide_bookmark(
+    held: &Bookmark,
+    anchor: Option<&BookmarkAnchor>,
+    if_revision: Option<i64>,
+    now_ms: i64,
+) -> BookmarkChange {
+    if if_revision.is_some_and(|expected| expected != held.revision) {
+        return BookmarkChange {
+            applied: false,
+            changed: false,
+            bookmark: held.clone(),
+        };
+    }
+    if held.anchor.as_ref() == anchor {
+        return BookmarkChange {
+            applied: true,
+            changed: false,
+            bookmark: held.clone(),
+        };
+    }
+    BookmarkChange {
+        applied: true,
+        changed: true,
+        bookmark: Bookmark {
+            revision: next_pin_revision(held.revision, now_ms),
+            anchor: anchor.cloned(),
+        },
+    }
+}
+
 /// The next revision after `previous`, at `now_ms`.
 ///
 /// Strictly greater than `previous`, and at least the current instant, so a revision is never
@@ -1413,6 +1562,39 @@ pub trait StateStore: Send + Sync {
         message: &MessageId,
     ) -> Result<PinChange, StoreError>;
 
+    /// This channel's bookmark and the revision it is at. `#240 reading-bookmark`.
+    ///
+    /// [`Bookmark::unset`] for a channel that never had one. One row per channel at most, bounded
+    /// by the allowlist the way [`StateStore::read_marks`] is, so **not covered by [`Retention`]**:
+    /// an age limit would take the owner's place away behind his back. The purge erases it.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Unavailable`] when no store is configured; [`StoreError::Backend`] on a read
+    /// failure.
+    async fn bookmark(&self, channel: &ChannelId) -> Result<Bookmark, StoreError>;
+
+    /// Put this channel's bookmark at `anchor`, or take it away with `None`.
+    ///
+    /// With `if_revision`, only when that is the revision stored now: the page's automatic moves
+    /// (a Done on the message under the line, an undo) send it, so they can never overwrite a move
+    /// made on another device meanwhile, and a refused write answers `applied: false` with the
+    /// bookmark as it is. Without it the write is carried out whatever is stored: the owner's own
+    /// Shift+B. The rule is [`decide_bookmark`]'s, shared by every backend. Validated by
+    /// [`validate_bookmark`] before anything is read or written.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::BadId`] for an anchor [`validate_bookmark`] refuses;
+    /// [`StoreError::Unavailable`] when no store is configured; [`StoreError::Backend`] on a
+    /// write failure.
+    async fn set_bookmark(
+        &self,
+        channel: &ChannelId,
+        anchor: Option<&BookmarkAnchor>,
+        if_revision: Option<i64>,
+    ) -> Result<BookmarkChange, StoreError>;
+
     /// The summary already produced for this exact key, if there is one.
     ///
     /// A miss is `Ok(None)`, never an error: not having summarised something yet is the normal
@@ -1745,6 +1927,81 @@ mod tests {
         assert_eq!(next_pin_revision(1_000, 1_000), 1_001);
         // A clock that went backwards does not reissue a revision.
         assert_eq!(next_pin_revision(5_000, 1_000), 5_001);
+    }
+
+    fn anchor(id: &str) -> BookmarkAnchor {
+        BookmarkAnchor {
+            message_id: MessageId(id.to_owned()),
+            place: BookmarkPlace::Above,
+            timestamp: "2026-10-12T12:00:00Z".to_owned(),
+            thread_id: None,
+        }
+    }
+
+    #[test]
+    fn a_bookmark_write_is_refused_on_a_stale_revision_and_a_repeat_keeps_the_revision() {
+        // `#240 reading-bookmark`. The rule every backend shares.
+        let unset = Bookmark::unset();
+        let first = decide_bookmark(&unset, Some(&anchor("100")), None, 5_000);
+        assert!(first.applied && first.changed);
+        assert_eq!(
+            first.bookmark.revision, 5_000,
+            "the first revision starts at the clock"
+        );
+        let held = first.bookmark;
+
+        let repeat = decide_bookmark(&held, Some(&anchor("100")), Some(5_000), 6_000);
+        assert!(repeat.applied && !repeat.changed);
+        assert_eq!(repeat.bookmark, held, "a repeat moved the revision");
+
+        let stale = decide_bookmark(&held, Some(&anchor("200")), Some(4_999), 6_000);
+        assert!(!stale.applied && !stale.changed);
+        assert_eq!(stale.bookmark, held, "a refused write changed the answer");
+
+        // A write without a condition is the owner's own act and wins whatever is stored.
+        let moved = decide_bookmark(&held, Some(&anchor("200")), None, 5_000);
+        assert!(moved.applied && moved.changed);
+        assert_eq!(
+            moved.bookmark.revision, 5_001,
+            "two changes in one millisecond are two revisions"
+        );
+
+        let cleared = decide_bookmark(&moved.bookmark, None, Some(5_001), 7_000);
+        assert!(cleared.applied && cleared.changed);
+        assert_eq!(cleared.bookmark.anchor, None);
+        let cleared_again = decide_bookmark(&cleared.bookmark, None, None, 8_000);
+        assert!(!cleared_again.changed, "clearing nothing is not a change");
+        // Clearing a channel that never had one changes nothing either, revision 0 and all.
+        assert_eq!(
+            decide_bookmark(&unset, None, Some(0), 9_000).bookmark,
+            unset
+        );
+    }
+
+    #[test]
+    fn a_bookmark_place_round_trips_and_its_anchor_is_held_to_a_pins_bounds() {
+        for place in [BookmarkPlace::Above, BookmarkPlace::Below] {
+            assert_eq!(BookmarkPlace::parse(place.as_str()), Some(place));
+        }
+        assert_eq!(BookmarkPlace::parse("beside"), None);
+        assert!(validate_bookmark(&anchor("spaces/A/messages/B")).is_ok());
+        let long = "x".repeat(MAX_PIN_ID_BYTES + 1);
+        for broken in [
+            anchor(""),
+            anchor(&long),
+            BookmarkAnchor {
+                timestamp: String::new(),
+                ..anchor("100")
+            },
+            BookmarkAnchor {
+                thread_id: Some("a\u{7}b".to_owned()),
+                ..anchor("100")
+            },
+        ] {
+            let error = validate_bookmark(&broken).expect_err("refused");
+            assert_eq!(error.code(), "bad_id", "{error}");
+            assert!(error.to_string().contains("bookmark"), "{error}");
+        }
     }
 
     #[test]

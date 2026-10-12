@@ -209,6 +209,15 @@ pub struct TimelineResponse {
     /// storage configured, or a failing one — and from an older server.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pins_revision: Option<i64>,
+    /// This channel's bookmark and its revision. `#240 reading-bookmark`.
+    ///
+    /// On every read, newest page and delta alike, as `pins_revision` is, and for its reason: a
+    /// refresh that already happens is how a page learns the owner moved the bookmark on his other
+    /// device. ONE small row, so it rides inline rather than as a revision and a second read.
+    /// Absent when the store cannot say, and the page keeps what it has; `anchor: null` inside it
+    /// is the different answer that no bookmark is set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bookmark: Option<crate::store::Bookmark>,
     /// Channel content remains untrusted data in every view.
     pub untrusted_content_notice: &'static str,
 }
@@ -348,6 +357,24 @@ pub struct PinChangeResponse {
     pub revision: i64,
     /// The standing statement that these pins are this server's own.
     pub pins_notice: &'static str,
+}
+
+/// One channel's bookmark, read or written: `GET`, `PUT` and `DELETE /api/v1/channels/{id}/bookmark`.
+/// `#240 reading-bookmark`.
+///
+/// A conditional write that lost to a move made elsewhere answers 409 with this same body and an
+/// [`ApiErrorBody`]'s two fields beside it, so the page takes where the bookmark is now from the
+/// refusal itself.
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct BookmarkResponse {
+    /// The channel, as configured here.
+    pub channel: ChannelInfo,
+    /// The bookmark as stored after the call.
+    pub bookmark: crate::store::Bookmark,
+    /// Whether the call changed what is stored: false for a read, a repeat, and a refusal.
+    pub changed: bool,
+    /// The standing statement that the bookmark is this server's own and marks nothing read.
+    pub bookmark_notice: &'static str,
 }
 
 /// A post waiting for the owner's confirmation. `#34 voice-chat-write-confirm`.
@@ -609,6 +636,8 @@ fn roots(generator: &mut schemars::SchemaGenerator) -> Vec<schemars::Schema> {
         generator.subschema_for::<PinChangeResponse>(),
         // `#232 upstream-mark-read`. Appended, for the same reason.
         generator.subschema_for::<UpstreamClearState>(),
+        // `#240 reading-bookmark`. Appended, for the same reason.
+        generator.subschema_for::<BookmarkResponse>(),
     ]
 }
 

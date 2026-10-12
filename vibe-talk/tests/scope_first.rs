@@ -356,6 +356,26 @@ fn inventory() -> Vec<Route> {
             Write,
             Nothing,
         ),
+        // `#240 reading-bookmark`: the owner's place in a channel, seen at read scope and moved or
+        // cleared at write.
+        route(
+            "GET",
+            "/api/v1/channels/{channel_id}/bookmark",
+            Read,
+            Nothing,
+        ),
+        route(
+            "PUT",
+            "/api/v1/channels/{channel_id}/bookmark",
+            Write,
+            Json(r#"{"message_id":"3333333333","timestamp":"2026-10-12T12:00:00Z"}"#),
+        ),
+        route(
+            "DELETE",
+            "/api/v1/channels/{channel_id}/bookmark",
+            Write,
+            Query("?if_revision=5", "?if_revision=soon"),
+        ),
     ]
 }
 

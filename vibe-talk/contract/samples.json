@@ -5,6 +5,65 @@
       "error": "bad_request"
     }
   ],
+  "BookmarkResponse": [
+    {
+      "bookmark": {
+        "anchor": {
+          "message_id": "301",
+          "place": "above",
+          "thread_id": "t1",
+          "timestamp": "2026-09-25T12:00:00+00:00"
+        },
+        "revision": 1790000000002
+      },
+      "bookmark_notice": "the bookmark is this server's own",
+      "changed": true,
+      "channel": {
+        "added": false,
+        "alias": null,
+        "id": "100",
+        "label": "general",
+        "provider": "discord",
+        "writable": true
+      }
+    },
+    {
+      "bookmark": {
+        "anchor": {
+          "message_id": "301",
+          "place": "below",
+          "timestamp": "2026-09-25T12:00:00+00:00"
+        },
+        "revision": 1790000000002
+      },
+      "bookmark_notice": "the bookmark is this server's own",
+      "changed": false,
+      "channel": {
+        "added": false,
+        "alias": null,
+        "id": "100",
+        "label": "general",
+        "provider": "discord",
+        "writable": true
+      }
+    },
+    {
+      "bookmark": {
+        "anchor": null,
+        "revision": 0
+      },
+      "bookmark_notice": "the bookmark is this server's own",
+      "changed": true,
+      "channel": {
+        "added": false,
+        "alias": null,
+        "id": "100",
+        "label": "general",
+        "provider": "discord",
+        "writable": true
+      }
+    }
+  ],
   "ClientConfigResponse": [
     {
       "channel_discovery_supported": true,
@@ -805,6 +864,15 @@
       "view": "flat"
     },
     {
+      "bookmark": {
+        "anchor": {
+          "message_id": "301",
+          "place": "above",
+          "thread_id": "t1",
+          "timestamp": "2026-09-25T12:00:00+00:00"
+        },
+        "revision": 1790000000002
+      },
       "channel": {
         "added": false,
         "alias": null,
@@ -843,6 +911,10 @@
       "view": "main"
     },
     {
+      "bookmark": {
+        "anchor": null,
+        "revision": 0
+      },
       "channel": {
         "added": false,
         "alias": null,

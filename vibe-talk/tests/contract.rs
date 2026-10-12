@@ -14,8 +14,8 @@ use std::path::PathBuf;
 
 use serde_json::{json, Value};
 use vibe_talk::contract::{
-    ApiErrorBody, ClientConfigResponse, CommittedPostResponse, LiveDeleteEvent, LiveDelivery,
-    LiveMessageEvent, LiveResetEvent, NoiseRules, PendingPost, PendingPostResponse,
+    ApiErrorBody, BookmarkResponse, ClientConfigResponse, CommittedPostResponse, LiveDeleteEvent,
+    LiveDelivery, LiveMessageEvent, LiveResetEvent, NoiseRules, PendingPost, PendingPostResponse,
     PinChangeResponse, PinsResponse, ProviderDescription, ReplyDismissals, TimelineResponse,
     TokenScope, TranscriptRole, UpstreamClearAttemptView, UpstreamClearState,
     VibeTalkV1ClientFrame, VibeTalkV1ServerFrame,
@@ -23,7 +23,10 @@ use vibe_talk::contract::{
 use vibe_talk::conversation::{VoiceDescription, VoiceSession};
 use vibe_talk::model::{ChannelId, ChannelInfo, Message, MessageId, Reaction, UserId};
 use vibe_talk::speech::{Description, Playback};
-use vibe_talk::store::{Pin, PinSnapshot, UpstreamClearMode, UpstreamClearResult};
+use vibe_talk::store::{
+    Bookmark, BookmarkAnchor, BookmarkPlace, Pin, PinSnapshot, UpstreamClearMode,
+    UpstreamClearResult,
+};
 use vibe_talk::threads::{MessageThread, ThreadSummary, TimelineDelta, TimelinePage, TimelineView};
 
 fn contract_dir() -> PathBuf {
@@ -237,7 +240,26 @@ fn timeline(view: TimelineView, page: TimelinePage) -> TimelineResponse {
         dismissed: vec![MessageId("150".into())],
         reply_dismissals: None,
         pins_revision: None,
+        bookmark: None,
         untrusted_content_notice: "third-party text",
+    }
+}
+
+/// A bookmark above a message in a thread, below one that is not, or none at all.
+/// `#240 reading-bookmark`.
+fn bookmark(place: Option<BookmarkPlace>) -> Bookmark {
+    Bookmark {
+        revision: if place.is_some() {
+            1_790_000_000_002
+        } else {
+            0
+        },
+        anchor: place.map(|place| BookmarkAnchor {
+            message_id: MessageId("301".into()),
+            place,
+            timestamp: "2026-09-25T12:00:00+00:00".into(),
+            thread_id: (place == BookmarkPlace::Above).then(|| "t1".into()),
+        }),
     }
 }
 
@@ -351,8 +373,11 @@ fn samples() -> Value {
             // more and that the backend could not bring it up to date just now.
             // `#206 pin-message`: this one carries the pins' revision, as every read from a
             // server with a store does; the others leave it out, as a store-less server does.
+            // `#240 reading-bookmark`: and the bookmark, as every read from a server with a store
+            // does: here one is set, on the next none is, and the rest leave the field out.
             to(&TimelineResponse {
                 pins_revision: Some(1_790_000_000_000),
+                bookmark: Some(bookmark(Some(BookmarkPlace::Above))),
                 ..timeline(TimelineView::Main, TimelinePage {
                     messages: vec![plain.clone()],
                     next_after: Some("forward".into()),
@@ -362,6 +387,7 @@ fn samples() -> Value {
             // `#222 unread-replies`: Main's delta in a channel with threads says which of its
             // threads' replies are Done, from its oldest row up.
             to(&TimelineResponse {
+                bookmark: Some(bookmark(None)),
                 reply_dismissals: Some(ReplyDismissals {
                     from: MessageId("150".into()),
                     messages: vec![MessageId("299".into()), MessageId("150".into())],
@@ -558,6 +584,28 @@ fn samples() -> Value {
                 pending: false,
                 retry_at_ms: None,
                 unavailable: Some("one thread of a larger space".into()),
+            }),
+        ],
+        // `#240 reading-bookmark`: set above a message in a thread, set below one that is not,
+        // and cleared, so `anchor` is seen as an object, with and without `thread_id`, and null.
+        "BookmarkResponse": [
+            to(&BookmarkResponse {
+                channel: channel(),
+                bookmark: bookmark(Some(BookmarkPlace::Above)),
+                changed: true,
+                bookmark_notice: "the bookmark is this server's own",
+            }),
+            to(&BookmarkResponse {
+                channel: channel(),
+                bookmark: bookmark(Some(BookmarkPlace::Below)),
+                changed: false,
+                bookmark_notice: "the bookmark is this server's own",
+            }),
+            to(&BookmarkResponse {
+                channel: channel(),
+                bookmark: bookmark(None),
+                changed: true,
+                bookmark_notice: "the bookmark is this server's own",
             }),
         ],
         "VibeTalkV1ClientFrame": [

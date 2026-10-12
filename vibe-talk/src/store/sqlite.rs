@@ -34,11 +34,11 @@ use async_trait::async_trait;
 use rusqlite::{Connection, OptionalExtension as _};
 
 use super::{
-    now_ms, ChannelAlias, ConversationId, ConversationSummary, Pin, PinChange, PinSnapshot, Pins,
-    ReadMark, RecordedTurn, Retention, Speaker, StateStore, StoreError, SummaryKey,
-    TranscriptCursor, TranscriptPage, Turn, UpstreamClearAttempt, UpstreamClearMode,
-    UpstreamClearResult, UpstreamClearSetting, MAX_PINS_PER_CHANNEL, MAX_TRANSCRIPT_PAGE,
-    MAX_TURN_CHARS,
+    now_ms, Bookmark, BookmarkAnchor, BookmarkChange, BookmarkPlace, ChannelAlias, ConversationId,
+    ConversationSummary, Pin, PinChange, PinSnapshot, Pins, ReadMark, RecordedTurn, Retention,
+    Speaker, StateStore, StoreError, SummaryKey, TranscriptCursor, TranscriptPage, Turn,
+    UpstreamClearAttempt, UpstreamClearMode, UpstreamClearResult, UpstreamClearSetting,
+    MAX_PINS_PER_CHANNEL, MAX_TRANSCRIPT_PAGE, MAX_TURN_CHARS,
 };
 use crate::model::{ChannelId, MessageId, UserId};
 
@@ -270,6 +270,28 @@ pub const MIGRATIONS: &[&str] = &[
         last_error         TEXT,
         last_at_ms         INTEGER,
         failures           INTEGER NOT NULL DEFAULT 0
+    ) STRICT;
+    ",
+    // v12 — the owner's reading bookmark, one per channel. `#240 reading-bookmark`.
+    //
+    // ONE new table and nothing else, for the reason v10 gives. One row per channel at most, and
+    // only for a channel the owner has set one in, so `Retention` does not reach it: the allowlist
+    // bounds it, as it bounds `read_marks`. A cleared bookmark KEEPS its row, with the anchor
+    // columns NULL, so its revision goes on growing and a page holding an older one is refused;
+    // only the purge deletes rows, and the next revision then starts from the clock
+    // (`super::next_pin_revision`). Ids and an instant, and no message text.
+    "
+    CREATE TABLE bookmarks (
+        channel_id TEXT    PRIMARY KEY NOT NULL,
+        message_id TEXT,
+        place      TEXT    CHECK (place IN ('above', 'below')),
+        sent_at    TEXT,
+        thread_id  TEXT,
+        set_at_ms  INTEGER NOT NULL,
+        revision   INTEGER NOT NULL,
+        CHECK ((message_id IS NULL) = (place IS NULL)),
+        CHECK ((message_id IS NULL) = (sent_at IS NULL)),
+        CHECK (message_id IS NOT NULL OR thread_id IS NULL)
     ) STRICT;
     ",
 ];
@@ -572,6 +594,44 @@ fn bump_pin_revision(
         )
         .map_err(backend)?;
     Ok(next)
+}
+
+/// This channel's bookmark, inside the caller's connection or transaction. `#240 reading-bookmark`.
+fn bookmark_row(connection: &Connection, channel: &str) -> Result<Bookmark, StoreError> {
+    let row = connection
+        .query_row(
+            "SELECT message_id, place, sent_at, thread_id, revision FROM bookmarks
+             WHERE channel_id = ?1",
+            [channel],
+            |row| {
+                Ok((
+                    row.get::<_, Option<String>>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                    row.get::<_, i64>(4)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(backend)?;
+    let Some((message, place, sent_at, thread_id, revision)) = row else {
+        return Ok(Bookmark::unset());
+    };
+    let anchor = match (message, place, sent_at) {
+        (Some(message), Some(place), Some(sent_at)) => Some(BookmarkAnchor {
+            message_id: MessageId(message),
+            place: BookmarkPlace::parse(&place).ok_or_else(|| {
+                StoreError::Backend(format!(
+                    "a bookmark's place is {place:?}, which no version wrote"
+                ))
+            })?,
+            timestamp: sent_at,
+            thread_id,
+        }),
+        _ => None,
+    };
+    Ok(Bookmark { revision, anchor })
 }
 
 /// The columns of `upstream_clear`, in the order [`upstream_clear_row`] reads them.
@@ -1604,6 +1664,59 @@ impl StateStore for SqliteStore {
         .await
     }
 
+    async fn bookmark(&self, channel: &ChannelId) -> Result<Bookmark, StoreError> {
+        let channel = channel.clone();
+        self.with_connection(move |connection| bookmark_row(connection, channel.as_str()))
+            .await
+    }
+
+    async fn set_bookmark(
+        &self,
+        channel: &ChannelId,
+        anchor: Option<&BookmarkAnchor>,
+        if_revision: Option<i64>,
+    ) -> Result<BookmarkChange, StoreError> {
+        if let Some(anchor) = anchor {
+            super::validate_bookmark(anchor)?;
+        }
+        let channel = channel.clone();
+        let anchor = anchor.cloned();
+        self.with_connection(move |connection| {
+            // The read, the decision and the write under one transaction and one connection lock,
+            // so a conditional write cannot pass its check against a row another write replaces.
+            let transaction = connection.transaction().map_err(backend)?;
+            let held = bookmark_row(&transaction, channel.as_str())?;
+            let now = now_ms();
+            let change = super::decide_bookmark(&held, anchor.as_ref(), if_revision, now);
+            if change.changed {
+                let stored = change.bookmark.anchor.as_ref();
+                transaction
+                    .execute(
+                        "INSERT INTO bookmarks (channel_id, message_id, place, sent_at, thread_id,
+                                                set_at_ms, revision)
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                         ON CONFLICT(channel_id) DO UPDATE SET
+                            message_id = excluded.message_id, place = excluded.place,
+                            sent_at = excluded.sent_at, thread_id = excluded.thread_id,
+                            set_at_ms = excluded.set_at_ms, revision = excluded.revision",
+                        rusqlite::params![
+                            channel.as_str(),
+                            stored.map(|held| held.message_id.as_str()),
+                            stored.map(|held| held.place.as_str()),
+                            stored.map(|held| held.timestamp.as_str()),
+                            stored.and_then(|held| held.thread_id.as_deref()),
+                            now,
+                            change.bookmark.revision,
+                        ],
+                    )
+                    .map_err(backend)?;
+            }
+            transaction.commit().map_err(backend)?;
+            Ok(change)
+        })
+        .await
+    }
+
     async fn cached_summary(&self, key: &SummaryKey) -> Result<Option<String>, StoreError> {
         let key = key.clone();
         self.with_connection(move |connection| {
@@ -1762,6 +1875,11 @@ impl StateStore for SqliteStore {
                 .map_err(backend)?;
             transaction
                 .execute("DELETE FROM pin_revisions", [])
+                .map_err(backend)?;
+            // The bookmarks, revisions and all, for the pins' reason: the next one starts from the
+            // clock, past every revision a page may still hold. `#240 reading-bookmark`.
+            transaction
+                .execute("DELETE FROM bookmarks", [])
                 .map_err(backend)?;
             transaction.commit().map_err(backend)
         })
@@ -3798,6 +3916,345 @@ mod tests {
             .await
             .expect("dry run");
         assert_eq!(dry.failures, 0);
+    }
+
+    // --- `#240 reading-bookmark` ---------------------------------------------------------------
+
+    fn mark_at(id: &str, place: BookmarkPlace) -> BookmarkAnchor {
+        BookmarkAnchor {
+            message_id: MessageId(id.to_owned()),
+            place,
+            timestamp: "2026-10-12T12:00:00Z".to_owned(),
+            thread_id: (place == BookmarkPlace::Above).then(|| "spaces/A/threads/B".to_owned()),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_bookmark_survives_a_restart_and_a_cleared_one_keeps_its_revision_growing() {
+        let dir = TempDir::new("sqlite-bookmark-restart");
+        let channel = ChannelId("1111111111".to_owned());
+        let other = ChannelId("2222222222".to_owned());
+        let first;
+        {
+            let store = store(&dir, Retention::default());
+            assert_eq!(
+                store.bookmark(&channel).await.expect("read"),
+                Bookmark::unset()
+            );
+            let set = store
+                .set_bookmark(
+                    &channel,
+                    Some(&mark_at("1000000000000000100", BookmarkPlace::Above)),
+                    None,
+                )
+                .await
+                .expect("set");
+            assert!(set.applied && set.changed);
+            first = set.bookmark.revision;
+            assert!(first > 0);
+        }
+        let store = store(&dir, Retention::default());
+        let held = store
+            .bookmark(&channel)
+            .await
+            .expect("read after a restart");
+        assert_eq!(held.revision, first);
+        assert_eq!(
+            held.anchor,
+            Some(mark_at("1000000000000000100", BookmarkPlace::Above)),
+            "the anchor came back changed: its thread or its place was lost"
+        );
+        assert_eq!(
+            store.bookmark(&other).await.expect("read"),
+            Bookmark::unset(),
+            "one channel's bookmark showed up in another"
+        );
+        let cleared = store
+            .set_bookmark(&channel, None, Some(first))
+            .await
+            .expect("clear");
+        assert!(cleared.applied && cleared.changed);
+        assert_eq!(cleared.bookmark.anchor, None);
+        assert!(cleared.bookmark.revision > first);
+        drop(store);
+        let store = super::SqliteStore::open(
+            &dir.path().join("state").join("vibe-talk.sqlite3"),
+            Retention::default(),
+        )
+        .expect("reopen");
+        assert_eq!(
+            store.bookmark(&channel).await.expect("read"),
+            cleared.bookmark,
+            "a cleared bookmark lost its revision across a restart, so an old page's write would pass"
+        );
+        let stale = store
+            .set_bookmark(
+                &channel,
+                Some(&mark_at("1000000000000000200", BookmarkPlace::Below)),
+                Some(first),
+            )
+            .await
+            .expect("a stale write is an answer, not an error");
+        assert!(!stale.applied && !stale.changed);
+        assert_eq!(stale.bookmark, cleared.bookmark);
+    }
+
+    #[tokio::test]
+    async fn the_purge_erases_every_bookmark_and_the_next_revision_starts_past_the_old_ones() {
+        let dir = TempDir::new("sqlite-bookmark-purge");
+        let store = store(&dir, Retention::default());
+        let channel = ChannelId("1111111111".to_owned());
+        let set = store
+            .set_bookmark(
+                &channel,
+                Some(&mark_at("1000000000000000100", BookmarkPlace::Above)),
+                None,
+            )
+            .await
+            .expect("set");
+        store.purge_everything().await.expect("purge");
+        assert_eq!(
+            store.bookmark(&channel).await.expect("read"),
+            Bookmark::unset()
+        );
+        let again = store
+            .set_bookmark(
+                &channel,
+                Some(&mark_at("1000000000000000100", BookmarkPlace::Above)),
+                None,
+            )
+            .await
+            .expect("set again");
+        assert!(
+            again.bookmark.revision > set.bookmark.revision,
+            "a revision was issued twice across a purge"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_bookmark_table_arrives_on_a_file_at_the_previous_schema_with_everything_kept() {
+        let dir = TempDir::new("sqlite-bookmark-migrate");
+        let file = dir.path().join("vibe-talk.sqlite3");
+        {
+            let connection = Connection::open(&file).expect("open old database");
+            for migration in &MIGRATIONS[..11] {
+                connection
+                    .execute_batch(migration)
+                    .expect("apply old schema");
+            }
+            connection
+                .execute_batch(
+                    "INSERT INTO read_marks VALUES ('1111111111', '1000000000000000100',
+                                                    1000000000000000100, 5);
+                     INSERT INTO dismissals VALUES ('1111111111', '1000000000000000100',
+                                                    1000000000000000100, 6);",
+                )
+                .expect("an owner's state");
+            connection
+                .pragma_update(None, "user_version", 11_i64)
+                .expect("stamp old schema");
+        }
+        let store = SqliteStore::open(&file, Retention::default()).expect("migrate");
+        let channel = ChannelId("1111111111".to_owned());
+        assert_eq!(store.read_marks().await.expect("read").len(), 1);
+        assert_eq!(store.dismissals(&channel).await.expect("read").len(), 1);
+        assert_eq!(
+            store.bookmark(&channel).await.expect("read"),
+            Bookmark::unset(),
+            "an upgraded file arrived with a bookmark nobody set"
+        );
+        store
+            .set_bookmark(
+                &channel,
+                Some(&mark_at("1000000000000000100", BookmarkPlace::Above)),
+                None,
+            )
+            .await
+            .expect("the new table takes a row");
+    }
+
+    #[tokio::test]
+    async fn an_anchor_no_provider_could_have_served_is_refused_before_anything_is_written() {
+        let dir = TempDir::new("sqlite-bookmark-refuse");
+        let store = store(&dir, Retention::default());
+        let channel = ChannelId("1111111111".to_owned());
+        for (what, broken) in [
+            (
+                "an empty id",
+                BookmarkAnchor {
+                    message_id: MessageId(String::new()),
+                    ..mark_at("1", BookmarkPlace::Above)
+                },
+            ),
+            (
+                "a control character",
+                BookmarkAnchor {
+                    message_id: MessageId("12\n34".to_owned()),
+                    ..mark_at("1", BookmarkPlace::Above)
+                },
+            ),
+            (
+                "an oversized timestamp",
+                BookmarkAnchor {
+                    timestamp: "2".repeat(super::super::MAX_PIN_TIMESTAMP_BYTES + 1),
+                    ..mark_at("1", BookmarkPlace::Above)
+                },
+            ),
+            (
+                "an empty thread id",
+                BookmarkAnchor {
+                    thread_id: Some(String::new()),
+                    ..mark_at("1", BookmarkPlace::Above)
+                },
+            ),
+        ] {
+            let error = store
+                .set_bookmark(&channel, Some(&broken), None)
+                .await
+                .expect_err(what);
+            assert_eq!(error.code(), "bad_id", "{what}: {error}");
+        }
+        assert_eq!(
+            store.bookmark(&channel).await.expect("read"),
+            Bookmark::unset()
+        );
+    }
+
+    /// A small deterministic generator, so a property test is the same test on every run and a
+    /// failure names the seed and the step that reproduce it.
+    struct Steps(u64);
+
+    impl Steps {
+        fn next(&mut self) -> u64 {
+            // xorshift64*: plenty for choosing operations, and no dependency for it.
+            self.0 ^= self.0 >> 12;
+            self.0 ^= self.0 << 25;
+            self.0 ^= self.0 >> 27;
+            self.0.wrapping_mul(0x2545_f491_4f6c_dd1d)
+        }
+
+        fn below(&mut self, n: u64) -> u64 {
+            self.next() % n
+        }
+    }
+
+    #[tokio::test]
+    async fn the_bookmark_agrees_with_a_one_slot_model_under_random_writes_and_restarts() {
+        // `#240 reading-bookmark`. Property-style: random set, conditional set (with the revision
+        // held, and with a stale one) and clear, across two channels, with the store closed and
+        // reopened now and then, against the simplest model there is: one optional anchor and one
+        // number per channel. The model's rule is written out here rather than borrowed from
+        // `decide_bookmark`, so the two have to agree rather than being the same code.
+        for seed in [1_u64, 7, 42, 2_026, 99_991] {
+            let dir = TempDir::new("sqlite-bookmark-property");
+            let path = dir.path().join("state").join("vibe-talk.sqlite3");
+            let mut store = SqliteStore::open(&path, Retention::default()).expect("open");
+            let channels = [
+                ChannelId("1111111111".to_owned()),
+                ChannelId("2222222222".to_owned()),
+            ];
+            let mut model: [(i64, Option<BookmarkAnchor>); 2] = [(0, None), (0, None)];
+            let mut steps = Steps(seed);
+            for step in 0..300 {
+                let which = usize::try_from(steps.below(2)).expect("small");
+                let channel = &channels[which];
+                let (held_revision, held_anchor) = model[which].clone();
+                let anchor = (steps.below(4) != 0).then(|| {
+                    mark_at(
+                        &format!("10000000000000{:05}", steps.below(6)),
+                        if steps.below(3) == 0 {
+                            BookmarkPlace::Below
+                        } else {
+                            BookmarkPlace::Above
+                        },
+                    )
+                });
+                let condition = match steps.below(3) {
+                    0 => None,
+                    1 => Some(held_revision),
+                    _ => Some(held_revision - 1 - i64::try_from(steps.below(3)).expect("small")),
+                };
+                let change = store
+                    .set_bookmark(channel, anchor.as_ref(), condition)
+                    .await
+                    .expect("write");
+                let context = format!("seed {seed}, step {step}");
+                let refused = condition.is_some_and(|c| c != held_revision);
+                assert_eq!(change.applied, !refused, "{context}");
+                if refused || anchor == held_anchor {
+                    assert!(!change.changed, "{context}: nothing should have changed");
+                    assert_eq!(change.bookmark.revision, held_revision, "{context}");
+                } else {
+                    assert!(change.changed, "{context}");
+                    assert!(change.bookmark.revision > held_revision, "{context}");
+                    model[which] = (change.bookmark.revision, anchor.clone());
+                }
+                assert_eq!(change.bookmark.anchor, model[which].1, "{context}");
+                if steps.below(25) == 0 {
+                    drop(store);
+                    store = SqliteStore::open(&path, Retention::default()).expect("reopen");
+                }
+                for (at, held) in channels.iter().enumerate() {
+                    let read = store.bookmark(held).await.expect("read");
+                    assert_eq!(
+                        (read.revision, read.anchor),
+                        model[at].clone(),
+                        "{context}: channel {at} disagrees with the model"
+                    );
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn done_marks_agree_with_a_set_model_under_random_batches_and_restarts() {
+        // `#240 reading-bookmark` raised one batch to a thousand ids. Property-style: random
+        // dismissals and restorations of up to a thousand ids at once, overlapping, across
+        // restarts, against a set; each answer's count is how many really changed.
+        for seed in [3_u64, 11, 4_096] {
+            let dir = TempDir::new("sqlite-dismiss-property");
+            let path = dir.path().join("state").join("vibe-talk.sqlite3");
+            let mut store = SqliteStore::open(&path, Retention::default()).expect("open");
+            let channel = ChannelId("1111111111".to_owned());
+            let mut model = std::collections::BTreeSet::new();
+            let mut steps = Steps(seed);
+            for step in 0..40 {
+                let size = if steps.below(5) == 0 {
+                    1_000
+                } else {
+                    1 + steps.below(60)
+                };
+                let start = steps.below(1_500);
+                let ids: Vec<MessageId> = (start..start + size)
+                    .map(|n| MessageId(format!("{}", 1_000_000_000_000_000_000_u64 + n)))
+                    .collect();
+                let context = format!("seed {seed}, step {step}");
+                if steps.below(3) == 0 {
+                    let expected = ids.iter().filter(|id| model.remove(id.as_str())).count();
+                    let removed = store.restore(&channel, &ids).await.expect("restore");
+                    assert_eq!(removed, expected as u64, "{context}");
+                } else {
+                    let expected = ids
+                        .iter()
+                        .filter(|id| model.insert(id.as_str().to_owned()))
+                        .count();
+                    let added = store.dismiss(&channel, &ids).await.expect("dismiss");
+                    assert_eq!(added, expected as u64, "{context}");
+                }
+                if steps.below(8) == 0 {
+                    drop(store);
+                    store = SqliteStore::open(&path, Retention::default()).expect("reopen");
+                }
+                let held: std::collections::BTreeSet<String> = store
+                    .dismissals(&channel)
+                    .await
+                    .expect("read")
+                    .into_iter()
+                    .map(|id| id.0)
+                    .collect();
+                assert_eq!(held, model, "{context}");
+            }
+        }
     }
 
     #[test]

@@ -1237,6 +1237,9 @@ pub struct PageResponse {
     /// The revision this channel's pins are at, as on a timeline read. `#206 pin-message`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pins_revision: Option<i64>,
+    /// This channel's bookmark, as on a timeline read. `#240 reading-bookmark`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bookmark: Option<crate::store::Bookmark>,
     /// Standing reminder that the content is third-party text.
     pub untrusted_content_notice: &'static str,
 }
@@ -1265,8 +1268,10 @@ pub async fn page(
     }
     let dismissed = ops::dismissed_within(&state, &step.channel.id, &step.messages).await?;
     let pins_revision = ops::pins_revision(&state, &step.channel.id).await;
+    let bookmark = ops::bookmark_state(&state, &step.channel.id).await;
     Ok(Json(PageResponse {
         pins_revision,
+        bookmark,
         returned: step.returned(),
         channel: step.channel,
         messages: step.messages,
@@ -1374,8 +1379,12 @@ pub async fn timeline(
     // `#206 pin-message`. One indexed lookup on every read, delta included: this is how a refresh
     // that is happening anyway tells the page whether another device changed the pins.
     let pins_revision = ops::pins_revision(&state, &channel.id).await;
+    // `#240 reading-bookmark`. One indexed lookup too, for the same reason: this is how a page
+    // learns the owner moved the bookmark on his other device.
+    let bookmark = ops::bookmark_state(&state, &channel.id).await;
     Ok(no_store(Json(TimelineResponse {
         pins_revision,
+        bookmark,
         returned: page.messages.len() + page.threads.len(),
         channel,
         view: request.view,
@@ -2994,6 +3003,9 @@ pub struct TodoResponse {
     /// The revision this channel's pins are at, as on a timeline read. `#206 pin-message`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pins_revision: Option<i64>,
+    /// This channel's bookmark, as on a timeline read. `#240 reading-bookmark`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bookmark: Option<crate::store::Bookmark>,
     /// The messages are somebody else's words, exactly as on every other read.
     pub untrusted_content_notice: &'static str,
 }
@@ -3008,8 +3020,10 @@ pub async fn todo(
     let mut todo = ops::todo(&state, &channel_id, query.limit).await?;
     crate::render::fill(&state.config, &todo.channel, &mut todo.messages);
     let pins_revision = ops::pins_revision(&state, &todo.channel.id).await;
+    let bookmark = ops::bookmark_state(&state, &todo.channel.id).await;
     Ok(no_store(Json(TodoResponse {
         pins_revision,
+        bookmark,
         todo,
         read_state_notice: crate::store::INBOX_NOTICE,
         untrusted_content_notice: untrusted::NOTICE,
@@ -3229,6 +3243,126 @@ pub async fn unpin_message(
         revision: change.revision,
         pins_notice: PINS_NOTICE,
     })))
+}
+
+// --- the reading bookmark ------------------------------------------------------------------------
+//
+// `#240 reading-bookmark`. READ scope to see it, WRITE scope to move or clear it, and NO MCP TOOL,
+// for the `#39` reason the pins give: the scope is not what keeps a voice agent out.
+
+/// The standing statement that the bookmark is this server's own and marks nothing read.
+pub const BOOKMARK_NOTICE: &str = "The bookmark is vibe-talk's own. It is kept on this server \
+                                   and shown on every device signed in to it; setting it marks \
+                                   nothing read, and nothing is sent to the source chat service.";
+
+/// Where to put a channel's bookmark. See [`crate::store::BookmarkAnchor`] for each field.
+#[derive(Debug, Deserialize)]
+pub struct BookmarkRequest {
+    /// The message the line is drawn next to.
+    pub message_id: String,
+    /// Which side of it; above unless said.
+    #[serde(default = "above")]
+    pub place: crate::store::BookmarkPlace,
+    /// When that message was sent, ISO-8601, as the page was served it.
+    pub timestamp: String,
+    /// The thread that message is in, when it is in one.
+    #[serde(default)]
+    pub thread_id: Option<String>,
+    /// Only if this is the revision stored now; a stale one is answered 409. Absent: whatever is
+    /// stored, which is the owner's own act.
+    #[serde(default)]
+    pub if_revision: Option<i64>,
+}
+
+fn above() -> crate::store::BookmarkPlace {
+    crate::store::BookmarkPlace::Above
+}
+
+/// The condition a clear may carry, in the query string because a DELETE has no body.
+#[derive(Debug, Default, Deserialize)]
+pub struct BookmarkClearQuery {
+    /// Only if this is the revision stored now, as on a PUT.
+    #[serde(default)]
+    pub if_revision: Option<i64>,
+}
+
+/// A conditional write that lost: [`crate::contract::BookmarkResponse`] with an
+/// [`ApiErrorBody`]'s two fields beside it.
+#[derive(Debug, Serialize)]
+struct BookmarkConflict {
+    error: &'static str,
+    detail: &'static str,
+    #[serde(flatten)]
+    answer: crate::contract::BookmarkResponse,
+}
+
+/// The answer to a bookmark write: 200 with where it is, or 409 with where it is when the write's
+/// `if_revision` was stale.
+fn bookmark_answered(channel: ChannelInfo, change: crate::store::BookmarkChange) -> Response {
+    let answer = crate::contract::BookmarkResponse {
+        channel,
+        bookmark: change.bookmark,
+        changed: change.changed,
+        bookmark_notice: BOOKMARK_NOTICE,
+    };
+    if change.applied {
+        return no_store(Json(answer));
+    }
+    let mut response = no_store(Json(BookmarkConflict {
+        error: "bookmark_moved",
+        detail: "the bookmark was moved since the revision this write named; the answer says \
+                 where it is now",
+        answer,
+    }));
+    *response.status_mut() = StatusCode::CONFLICT;
+    response
+}
+
+/// `GET /api/v1/channels/{channel_id}/bookmark`
+pub async fn bookmark(
+    State(state): State<AppState>,
+    _scope: ReadScope,
+    Path(channel_id): Path<String>,
+) -> Result<Response, ApiError> {
+    let (channel, bookmark) = ops::bookmark(&state, &channel_id).await?;
+    Ok(no_store(Json(crate::contract::BookmarkResponse {
+        channel,
+        bookmark,
+        changed: false,
+        bookmark_notice: BOOKMARK_NOTICE,
+    })))
+}
+
+/// `PUT /api/v1/channels/{channel_id}/bookmark` — put the bookmark next to a message.
+///
+/// PUT because the act is "make the bookmark be here": sent twice it leaves the same state, and the
+/// second answers `changed: false` at the same revision.
+pub async fn set_bookmark(
+    State(state): State<AppState>,
+    _scope: WriteScope,
+    Path(channel_id): Path<String>,
+    Json(request): Json<BookmarkRequest>,
+) -> Result<Response, ApiError> {
+    let anchor = crate::store::BookmarkAnchor {
+        message_id: MessageId(request.message_id),
+        place: request.place,
+        timestamp: request.timestamp,
+        thread_id: request.thread_id,
+    };
+    let (channel, change) =
+        ops::set_bookmark(&state, &channel_id, Some(&anchor), request.if_revision).await?;
+    Ok(bookmark_answered(channel, change))
+}
+
+/// `DELETE /api/v1/channels/{channel_id}/bookmark` — take the bookmark away. Idempotent.
+pub async fn clear_bookmark(
+    State(state): State<AppState>,
+    _scope: WriteScope,
+    Path(channel_id): Path<String>,
+    Query(query): Query<BookmarkClearQuery>,
+) -> Result<Response, ApiError> {
+    let (channel, change) = ops::set_bookmark(&state, &channel_id, None, query.if_revision).await?;
+    Ok(bookmark_answered(channel, change))
 }
 
 /// One message, summarised.

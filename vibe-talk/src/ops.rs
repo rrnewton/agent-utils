@@ -1901,11 +1901,20 @@ pub struct InboxChange {
     pub messages: Vec<MessageId>,
 }
 
+/// The most ids one dismissal or one restoration may name. `#240 reading-bookmark`.
+///
+/// "Done through here" on a long backlog names every unread message above the row, and at one page
+/// (99) a request that was 11 requests and 11 passes of the retention prune for a thousand
+/// messages. At a thousand it is one transaction and one prune. Storage is bounded by the
+/// retention cap ([`crate::store::Retention::max_dismissals`]) on every write whatever the batch,
+/// and a thousand ids is about thirty kilobytes of JSON, far under the body limit.
+pub const MAX_DISMISS_BATCH: usize = 1_000;
+
 /// Mark messages as dealt with here. Write scope.
 ///
 /// The configured-channel allowlist is checked without fetching the provider. The ids came from
-/// an authenticated page's loaded snapshot and are bounded to one maximum page per request. This
-/// keeps a local archive action local even when the source provider is slow or unavailable.
+/// an authenticated page's loaded snapshot and are bounded to [`MAX_DISMISS_BATCH`] per request.
+/// This keeps a local archive action local even when the source provider is slow or unavailable.
 ///
 /// # Errors
 ///
@@ -1922,7 +1931,7 @@ pub async fn dismiss(
     // burst of 20-second 502s. The channel allowlist remains the authority boundary; the batch
     // ceiling bounds storage growth from a malformed authenticated client.
     let channel = allowed(state, channel_id).await?;
-    if wanted.len() > usize::from(MAX_PAGE) {
+    if wanted.len() > MAX_DISMISS_BATCH {
         return Err(OpError::InvalidRange);
     }
     state.store.dismiss(&channel.id, wanted).await?;
@@ -2002,15 +2011,22 @@ pub async fn declare_bankruptcy(
 /// messages has since scrolled out of the window would make an undo fail exactly when the reader
 /// most needs it.
 ///
+/// Bounded to [`MAX_DISMISS_BATCH`] like a dismissal, so the undo of the largest batch one
+/// dismissal may carry is one request too.
+///
 /// # Errors
 ///
-/// [`OpError::UnknownChannel`] outside the allowlist; [`OpError::Store`].
+/// [`OpError::UnknownChannel`] outside the allowlist, [`OpError::InvalidRange`] for an oversized
+/// batch, or [`OpError::Store`].
 pub async fn restore(
     state: &AppState,
     channel_id: &str,
     wanted: &[MessageId],
 ) -> Result<InboxChange, OpError> {
     let channel = allowed(state, channel_id).await?;
+    if wanted.len() > MAX_DISMISS_BATCH {
+        return Err(OpError::InvalidRange);
+    }
     state.store.restore(&channel.id, wanted).await?;
     Ok(InboxChange {
         channel,
@@ -2145,6 +2161,73 @@ pub async fn pins_revision(state: &AppState, channel: &ChannelId) -> Option<i64>
         Err(crate::store::StoreError::Unavailable(_)) => None,
         Err(error) => {
             tracing::warn!(%error, "could not read the pin revision for a channel read");
+            None
+        }
+    }
+}
+
+// --- the reading bookmark --------------------------------------------------------------------
+//
+// `#240 reading-bookmark`. One place per channel the owner keeps while working down a backlog: a
+// line drawn above one message. Kept here so it follows him between his phone and his desk, and,
+// like `#206 pin-message`, the owner's act alone: no MCP tool reads or moves it. Setting it marks
+// nothing read; the page moves it on its own only after a Done the owner made on the message under
+// it, and then conditionally (`if_revision`), so a move made on the other device is never undone.
+
+/// One channel's bookmark. Read scope.
+///
+/// # Errors
+///
+/// [`OpError::UnknownChannel`] outside the allowlist; [`OpError::Store`] when no store is
+/// configured or the read fails.
+pub async fn bookmark(
+    state: &AppState,
+    channel_id: &str,
+) -> Result<(ChannelInfo, crate::store::Bookmark), OpError> {
+    let channel = allowed(state, channel_id).await?;
+    let bookmark = state.store.bookmark(&channel.id).await?;
+    Ok((channel, bookmark))
+}
+
+/// Put one channel's bookmark at `anchor`, or clear it with `None`; with `if_revision`, only when
+/// that is the revision stored. Write scope.
+///
+/// Checked against the allowlist and NOT against a fresh fetch, for the reason [`pin`] is not: the
+/// anchor came from the page the owner is looking at. A refused conditional write is not an error
+/// here; [`crate::store::BookmarkChange::applied`] says so and the caller answers 409.
+///
+/// # Errors
+///
+/// [`OpError::UnknownChannel`] outside the allowlist; [`OpError::Store`] for an anchor the store
+/// refuses, when no store is configured, or when the write fails.
+pub async fn set_bookmark(
+    state: &AppState,
+    channel_id: &str,
+    anchor: Option<&crate::store::BookmarkAnchor>,
+    if_revision: Option<i64>,
+) -> Result<(ChannelInfo, crate::store::BookmarkChange), OpError> {
+    let channel = allowed(state, channel_id).await?;
+    let change = state
+        .store
+        .set_bookmark(&channel.id, anchor, if_revision)
+        .await?;
+    Ok((channel, change))
+}
+
+/// A channel's bookmark for a read to carry, or `None` when it cannot be said.
+///
+/// SOFT, for [`pins_revision`]'s reason: a channel read must not fail because a marker could not be
+/// read. `None` tells the page to keep the bookmark it has, which is why the payload's field is
+/// absent rather than `null` then: `null` would say there is none.
+pub async fn bookmark_state(
+    state: &AppState,
+    channel: &ChannelId,
+) -> Option<crate::store::Bookmark> {
+    match state.store.bookmark(channel).await {
+        Ok(bookmark) => Some(bookmark),
+        Err(crate::store::StoreError::Unavailable(_)) => None,
+        Err(error) => {
+            tracing::warn!(%error, "could not read the bookmark for a channel read");
             None
         }
     }

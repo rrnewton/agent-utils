@@ -336,6 +336,16 @@ fn routes(state: AppState) -> Router {
             "/api/v1/channels/{channel_id}/pins/{message_id}",
             axum::routing::put(api::pin_message).delete(api::unpin_message),
         )
+        // `#240 reading-bookmark`. The owner's place in a channel's backlog, one per channel. READ
+        // scope to see it, WRITE scope to move or clear it — a PUT or DELETE that may carry
+        // `if_revision`, refused 409 when another device moved it first — and NO MCP TOOL, for the
+        // `#39` reason above. Every channel read carries it too, so this GET is seldom needed.
+        .route(
+            "/api/v1/channels/{channel_id}/bookmark",
+            get(api::bookmark)
+                .put(api::set_bookmark)
+                .delete(api::clear_bookmark),
+        )
         // One path, three methods: POST carries the whole protocol, and GET/DELETE — which exist
         // in the spec for server-initiated streams and session teardown — are refused plainly
         // because this endpoint is stateless and has nothing to push.

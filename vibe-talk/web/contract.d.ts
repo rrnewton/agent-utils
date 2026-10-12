@@ -20,6 +20,84 @@ declare namespace VibeTalk {
   }
 
   /**
+   * One channel's bookmark and the revision it is at. `#240 reading-bookmark`.
+   *
+   * `anchor` is `null` when no bookmark is set, which is a different answer from the field being
+   * absent on a read: absent means the server could not say. The revision is `0` for a channel that
+   * never had one, and otherwise only grows (through [`next_pin_revision`]), so a page can send it
+   * back as `if_revision` and be refused when another device moved the bookmark since.
+   */
+  interface Bookmark {
+    /**
+     * Where it is, or `null` when there is none.
+     */
+    anchor: BookmarkAnchor | null;
+    /**
+     * Moves on every change. See [`StateStore::set_bookmark`].
+     */
+    revision: number;
+  }
+
+  /**
+   * Where one channel's bookmark is: next to which message, on which side, and enough about that
+   * message to draw the line in a list that does not hold it. `#240 reading-bookmark`.
+   *
+   * `timestamp` and `thread_id` are copied from the message as the page was served it, so Main can
+   * place the line for a thread reply it never shows, by time. Ids and an instant, and no text: a
+   * bookmark is not a second copy of anybody's words.
+   */
+  interface BookmarkAnchor {
+    /**
+     * The message the line is drawn next to, in the provider-neutral namespace it was served in.
+     */
+    message_id: MessageId;
+    /**
+     * Which side of that message the line is on.
+     */
+    place: BookmarkPlace;
+    /**
+     * The thread that message is in, when it is in one.
+     */
+    thread_id?: string | null;
+    /**
+     * When that message was sent, ISO-8601, exactly as the provider reported it.
+     */
+    timestamp: string;
+  }
+
+  /**
+   * Which side of its message a bookmark is on. `#240 reading-bookmark`.
+   */
+  type BookmarkPlace = "above" | "below";
+
+  /**
+   * One channel's bookmark, read or written: `GET`, `PUT` and `DELETE /api/v1/channels/{id}/bookmark`.
+   * `#240 reading-bookmark`.
+   *
+   * A conditional write that lost to a move made elsewhere answers 409 with this same body and an
+   * [`ApiErrorBody`]'s two fields beside it, so the page takes where the bookmark is now from the
+   * refusal itself.
+   */
+  interface BookmarkResponse {
+    /**
+     * The bookmark as stored after the call.
+     */
+    bookmark: Bookmark;
+    /**
+     * The standing statement that the bookmark is this server's own and marks nothing read.
+     */
+    bookmark_notice: string;
+    /**
+     * Whether the call changed what is stored: false for a read, a repeat, and a refusal.
+     */
+    changed: boolean;
+    /**
+     * The channel, as configured here.
+     */
+    channel: ChannelInfo;
+  }
+
+  /**
    * A Discord channel snowflake, as a string, exactly as Discord renders it.
    */
   type ChannelId = string;
@@ -935,6 +1013,16 @@ declare namespace VibeTalk {
      */
     as_of?: string | null;
     /**
+     * This channel's bookmark and its revision. `#240 reading-bookmark`.
+     *
+     * On every read, newest page and delta alike, as `pins_revision` is, and for its reason: a
+     * refresh that already happens is how a page learns the owner moved the bookmark on his other
+     * device. ONE small row, so it rides inline rather than as a revision and a second read.
+     * Absent when the store cannot say, and the page keeps what it has; `anchor: null` inside it
+     * is the different answer that no bookmark is set.
+     */
+    bookmark?: Bookmark | null;
+    /**
      * Configured parent channel, including its local alias and write policy.
      */
     channel: ChannelInfo;
@@ -1302,6 +1390,7 @@ declare namespace VibeTalk {
     PinsResponse: PinsResponse;
     PinChangeResponse: PinChangeResponse;
     UpstreamClearState: UpstreamClearState;
+    BookmarkResponse: BookmarkResponse;
   }
 
   /** A contract type a peer may extend with new `type` tags. */
