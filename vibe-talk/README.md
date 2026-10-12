@@ -1970,7 +1970,7 @@ own adapter-only token; every other route uses the read/write tokens described a
 | POST | `/api/v1/conversations/{id}/turns` | **write** | record one turn |
 | GET | `/api/v1/conversations/{id}/replay` | **write** | that transcript, budgeted and fenced, for a new call — see "Resuming" |
 | GET | `/api/v1/inbox` | read | how far this server thinks each channel has been read |
-| GET | `/api/v1/channels/{id}/todo?limit=` | read | the recent window MINUS what has been dealt with |
+| GET | `/api/v1/channels/{id}/todo?limit=` | read | the recent window MINUS what has been dealt with; `window` and `complete` say how big the window was and whether it is the whole channel, and `window_from` when its oldest message was sent |
 | POST | `/api/v1/channels/{id}/dismiss` | **write** | `{messages:[…]}` (at most 1,000 ids), or `{through:id, limit:n}` — mark as dealt with; answers the exact set it changed. Send back the `limit` you read `/todo` with, or `through` is resolved against the default window and clears more than you displayed |
 | POST | `/api/v1/channels/{id}/restore` | **write** | `{messages:[…]}` (at most 1,000 ids) — the undo, restoring exactly that set |
 | POST | `/api/v1/channels/{id}/read` | **write** | move this server's read mark forward |
@@ -3802,19 +3802,29 @@ with the word *Bookmark* in it, drawn just above one message.
   messages already Done to the next one still to read, the one `e` selects next; below the newest
   message when everything after it is Done. *Done through here* (Shift+E) at or below the line
   lands it below that message. Undo puts it back. New messages, putting a message back, and reads
-  never move it.
+  never move it. A Done in a thread view slides along the thread's rows, but never past a message of
+  Main's still to read: the line then goes above that message, where Main's reader left off.
+- **A long Done through here** goes out in batches of up to 1,000. If a later batch fails, what the
+  server took stays Done (and is what Undo puts back), and only the rest is shown unread again.
 - **Kept on the server**, so it follows you between your phone and your desk: every channel read
   carries it, and a move made on the other device shows at this page's next read. Moving it from a
   Done is conditional on the revision the page last heard, so it can never undo a move made on the
   other device meanwhile. `GET`/`PUT`/`DELETE /api/v1/channels/{id}/bookmark` (read scope to see,
-  write scope to change; `if_revision` answers 409 with where the bookmark is now). There is no MCP
-  tool for it.
+  write scope to change; `if_revision` answers 409 with where the bookmark is now). The anchor's
+  `timestamp` must be an RFC 3339 instant, such as `2026-10-12T12:00:00Z`, because a page places
+  the line by it where its list does not hold the message. There is no MCP tool for it. The device's
+  saved copy of a channel keeps the bookmark too, so a page opened offline still draws the line.
 
 Where the line is drawn: in Main and All above the first message shown at or after its message (a
 thread reply is placed in Main by its time), in a thread only when its message is in that thread,
 and not in the thread list, the Pinned or Links filters, or while a search is choosing messages.
 Under Collapse read or Hide read it drops to the next message shown, since everything it passes is
-read. In two columns the left column draws it, and the right column only on its thread.
+read. Without threads, Hide read is the server's to-do list, which leaves read messages out: there
+a bookmark older than every message shown goes above the first one when the list's window reaches
+its message (the to-do answer's `window_from`), and draws nothing when it is older than the window.
+A combined row is one box, so the line goes above the row holding any message at or after the
+bookmark, never inside it. In two columns the left column draws it, and the right column only on its
+thread.
 
 `make -C vibe-talk bookmark-browser` walks this in a real Chromium at 1280x800 and 412x915: set,
 scroll away, jump back, reply, jump back again, and a Done advancing the line, measuring where the
