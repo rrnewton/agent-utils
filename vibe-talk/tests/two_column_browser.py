@@ -27,16 +27,27 @@ desk size, with a mouse:
   the right -> the window narrowed to 900px: one column, as the channel was in one, the button not
   drawn; widened again: two columns, the same thread selected -> the keys, pressed for real: ] gives
   them to the right column, Esc there is its X, j rings the first card, Enter selects its thread and
-  [ gives them back to Main -> at a phone's width the button is not drawn. No horizontal overflow
-  and no page error at any step.
+  [ gives them back to Main -> at a phone's width the button is not drawn -> back at the desk's width
+  over the cards, the links between the columns (`#261 two-column-connectors`): with Main scrolled to
+  its foot, its head and two places between, the links drawn are exactly the pairs whose root's tag
+  and card both show, each leaving its root's right edge level with its tag, arriving at its card's
+  left edge with its arrowhead's point on that edge, its lane in the gap between them, and in the
+  colour Chromium draws the card's edge and the tag in -> the mouse on a card whose root is above
+  Main's top: its link drawn, pointing up at the columns' top edge, and after 1.5 s Main glides —
+  through many scroll positions, not one jump — until the root is level with the card and the link
+  whole -> a card whose root is below, and the reader scrolling Main a little before 1.5 s: nothing
+  glides -> with reduced motion emulated, the same glide is one step. No horizontal overflow and no
+  page error at any step.
 
-Pass --screenshots DIR to keep a PNG of each state (the list and a selected thread, at each size) for
-review; --web-root DIR to run the same walk against another copy of the page.
+Pass --screenshots DIR to keep a PNG of each state (the list, a selected thread, the links, the
+selection's link off screen and after its glide, at each size) for review; --web-root DIR to run the
+same walk against another copy of the page.
 """
 
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import tempfile
 import threading
@@ -208,6 +219,7 @@ def walk(chromium: BrowserType, args: argparse.Namespace, label: str, width: int
             desk = Desk(page, args.screenshots, label, width, height)
             page.goto(f"http://127.0.0.1:{server.server_port}/voice", wait_until="load")
             columns_walk(desk)
+            links_walk(desk)
             check(not errors, f"{label}: the page threw: {errors}")
             context.close()
             return f"{version} at {width}x{height}: " + "; ".join(desk.notes)
@@ -489,6 +501,270 @@ def columns_walk(desk: Desk) -> None:
     desk.check(not phone.drawn("right"), "the right column is drawn at 412px")
     desk.check(float(str(phone.value("overflow"))) <= 0, "the page scrolls sideways at 412px")
     desk.notes.append("at 412px neither the button nor the right column is drawn")
+
+
+# `#261 two-column-connectors`. The links between the columns, measured where Chromium draws them: each
+# link's points converted from the SVG's corner to the viewport, with the boxes it should touch.
+LINKS_JS = """() => {
+    const box = (node) => { const r = node.getBoundingClientRect();
+        return {left: r.left, right: r.right, top: r.top, bottom: r.bottom}; };
+    const view = (node) => { const r = node.getBoundingClientRect(); return {top: r.top, bottom: r.top + node.clientHeight}; };
+    const svg = document.getElementById('column-links');
+    const corner = svg.getBoundingClientRect();
+    const numbers = (path) => path.getAttribute('d').match(/-?\\d+(?:\\.\\d+)?/g).map(Number);
+    const links = [...svg.querySelectorAll('path.column-link')].map((path) => ({
+        thread: path.getAttribute('data-thread'), clip: path.getAttribute('data-link'),
+        selected: path.hasAttribute('data-selected'), line: numbers(path), marks: numbers(path.nextElementSibling),
+        stroke: getComputedStyle(path).stroke, fill: getComputedStyle(path.nextElementSibling).fill}));
+    const ends = {};
+    for (const card of document.querySelectorAll('#side-cards > li[data-card]')) {
+        const id = card.getAttribute('data-id');
+        const button = card.querySelector('.side-card');
+        const root = [...document.querySelectorAll('#discord-log > li[data-id]')].find((row) => row.getAttribute('data-id') === ROOTS[id]);
+        const badge = root ? root.querySelector('.thread-badge') : null;
+        ends[id] = {card: box(card), edge: getComputedStyle(button).borderLeftColor,
+                    root: root ? box(root) : null, badge: badge ? box(badge) : null,
+                    tag: badge ? getComputedStyle(badge).borderTopColor : null};
+    }
+    return {corner: {left: corner.left, top: corner.top}, left: view(document.getElementById('scroll-area')),
+            right: view(document.getElementById('side-scroll')), links, ends};
+}"""
+
+# The root each thread's card should link to.
+ROOTS = {RUNNER: "202", REPLICA: "209", CANARY: "215"}
+
+# How long the page waits on a selection before gliding to its other end (web/voice.js `COLUMN_GLIDE_MS`).
+GLIDE_MS = 1500
+
+
+def measure_links(desk: Desk) -> Json:
+    found: Json = desk.page.evaluate(LINKS_JS.replace("ROOTS[id]", f"({{...{json.dumps(ROOTS)}}})[id]"))
+    return found
+
+
+def frame(desk: Desk) -> None:
+    """Let a scroll's frame draw the links: two frames, the one asked for and the one after it."""
+    desk.settled()
+    desk.settled()
+
+
+def numbers(link: Json, key: str) -> list[float]:
+    """A link's path, `line` or `marks`, as its numbers."""
+    values = link[key]
+    assert isinstance(values, list)
+    return [float(value) for value in values]
+
+
+def links_of(found: Json) -> list[Json]:
+    """The links `measure_links` found."""
+    links = found["links"]
+    assert isinstance(links, list)
+    return [link for link in links if isinstance(link, dict)]
+
+
+def selected_links(found: Json) -> list[Json]:
+    """The selection's link, if it is drawn: one at most."""
+    return [link for link in links_of(found) if link["selected"]]
+
+
+def ends_of(found: Json, thread: str) -> Json:
+    """The boxes the link of `thread` should touch."""
+    ends = found["ends"]
+    assert isinstance(ends, dict)
+    end = ends[thread]
+    assert isinstance(end, dict)
+    return end
+
+
+def link_points(found: Json, link: Json) -> tuple[float, float, float, float, float]:
+    """A whole link's leaving point, lane, arriving height and arrowhead point, in the viewport."""
+    corner = found["corner"]
+    assert isinstance(corner, dict)
+    line = numbers(link, "line")
+    marks = numbers(link, "marks")
+    left, top = float(corner["left"]), float(corner["top"])
+    # M fx fy H lane V ty H end; the arrowhead's point is the first point of its triangle.
+    return line[0] + left, line[1] + top, line[2] + left, line[3] + top, marks[-6] + left
+
+
+def pairs_on_screen(found: Json) -> tuple[list[str], list[str]]:
+    """The threads whose root's tag and card both show, by the middles a link meets, and those drawn whole:
+    the selection's among them, which is drawn whole when both its ends show too."""
+    ends = found["ends"]
+    left, right = found["left"], found["right"]
+    assert isinstance(ends, dict) and isinstance(left, dict) and isinstance(right, dict)
+    # Both columns from where the right one's list starts, under its heading, as the page takes them.
+    top = max(float(left["top"]), float(right["top"]))
+    shown = []
+    for thread, end in ends.items():
+        assert isinstance(end, dict)
+        if not end["badge"]:
+            continue
+        badge, card = end["badge"], end["card"]
+        assert isinstance(badge, dict) and isinstance(card, dict)
+        from_y = (float(badge["top"]) + float(badge["bottom"])) / 2
+        to_y = (float(card["top"]) + float(card["bottom"])) / 2
+        if top <= from_y <= float(left["bottom"]) and top <= to_y <= float(right["bottom"]):
+            shown.append(str(thread))
+    links = found["links"]
+    assert isinstance(links, list)
+    return sorted(shown), sorted(str(link["thread"]) for link in links if link["clip"] == "both")
+
+
+def settled_links(desk: Desk, seconds: float = 3) -> Json:
+    """The links once they are the pairs on screen: a scroll can bring a summary in, and rows move under it."""
+    deadline = time.monotonic() + seconds
+    found = measure_links(desk)
+    while time.monotonic() < deadline:
+        shown, drawn = pairs_on_screen(found)
+        if shown == drawn:
+            break
+        desk.page.wait_for_timeout(50)
+        found = measure_links(desk)
+    return found
+
+
+def check_whole_links(desk: Desk, found: Json, where: str) -> list[str]:
+    """Every link drawn is a pair with both ends on screen, every such pair is drawn, and each touches its boxes."""
+    ends = found["ends"]
+    assert isinstance(ends, dict)
+    shown, drawn = pairs_on_screen(found)
+    desk.check(drawn == shown, f"{where}: the links drawn {drawn} are not the pairs on screen {shown}")
+    links = found["links"]
+    assert isinstance(links, list)
+    for link in links:
+        assert isinstance(link, dict)
+        if link["clip"] != "both":
+            continue
+        end = ends[str(link["thread"])]
+        assert isinstance(end, dict)
+        root, badge, card = end["root"], end["badge"], end["card"]
+        assert isinstance(root, dict) and isinstance(badge, dict) and isinstance(card, dict)
+        fx, fy, lane, ty, tip = link_points(found, link)
+        desk.check(abs(fx - float(root["right"])) <= 1, f"{where}: a link leaves at x {fx}, not its root's right edge {root['right']}")
+        desk.check(float(badge["top"]) <= fy <= float(badge["bottom"]), f"{where}: a link leaves its root at y {fy}, not level with its tag {badge}")
+        desk.check(abs(tip - float(card["left"])) <= 1, f"{where}: a link's arrowhead is at x {tip}, not its card's left edge {card['left']}")
+        desk.check(float(card["top"]) <= ty <= float(card["bottom"]), f"{where}: a link arrives at y {ty}, outside its card {card}")
+        desk.check(float(root["right"]) < lane < float(card["left"]), f"{where}: a link's lane at {lane} is not in the gap")
+        desk.check(link["stroke"] == end["edge"] == end["tag"] and link["fill"] == end["edge"],
+                   f"{where}: a link is {link['stroke']}, its card's edge {end['edge']} and its tag {end['tag']}")
+    return drawn
+
+
+def scroll_to(desk: Desk, element_id: str, where: str) -> None:
+    """Scroll a column as a reader's wheel would end up: `where` is "top", "bottom" or a pixel offset."""
+    target = {"top": "0", "bottom": "node.scrollHeight"}.get(where, where)
+    desk.page.evaluate(f"() => {{ const node = document.getElementById('{element_id}'); node.scrollTop = {target}; }}")
+    frame(desk)
+
+
+def hover(desk: Desk, selector: str) -> None:
+    """Move the mouse onto the middle of `selector`'s box, a real move, which selects what is under it."""
+    box = desk.page.locator(selector).bounding_box()
+    desk.check(box is not None, f"{selector} is not drawn")
+    assert box is not None
+    desk.page.mouse.move(box["x"] + box["width"] / 2 - 4, box["y"] + box["height"] / 2 - 4)
+    desk.page.mouse.move(box["x"] + box["width"] / 2, box["y"] + box["height"] / 2, steps=3)
+    frame(desk)
+
+
+def watch_scrolls(desk: Desk, element_id: str) -> None:
+    """Record each scroll position `element_id` passes through, to tell a glide from a jump."""
+    desk.page.evaluate(f"""() => {{ const node = document.getElementById('{element_id}'); window.__glide = [];
+        node.addEventListener('scroll', () => window.__glide.push(node.scrollTop), {{passive: true}}); }}""")
+
+
+def links_walk(desk: Desk) -> None:
+    """`#261 two-column-connectors`: the links over the cards, the selection's off screen, and its glide."""
+    page = desk.page
+    page.set_viewport_size({"width": desk.width, "height": desk.height})
+    desk.wait_for("() => document.getElementById('side-column').getClientRects().length > 0"
+                  " && document.getElementById('thread-select').getAttribute('aria-disabled') === 'true'",
+                  "two columns did not come back for the links")
+    page.click("#side-close")
+    desk.wait_for("() => !document.getElementById('side-list').hidden", "the X did not go back to the cards")
+    page.mouse.move(5, desk.height - 5)
+
+    # Whole links: every pair with both ends on screen, and only those, wherever Main is scrolled.
+    seen: set[str] = set()
+    for where in ("bottom", "top", "600", "1200"):
+        scroll_to(desk, "scroll-area", where)
+        seen.update(check_whole_links(desk, settled_links(desk), f"Main at {where}"))
+    desk.check(len(seen) >= 2, f"so few links were ever drawn ({sorted(seen)}) that this proves little")
+    scroll_to(desk, "scroll-area", "bottom")
+    desk.shot("3-links")
+    desk.notes.append(f"links drawn for exactly the pairs on screen, Main scrolled four ways, touching their boxes ({len(seen)} threads)")
+
+    # The runner's card, its root (202) above Main's top: its link drawn up to Main's edge, pointing up.
+    hover(desk, f"#side-cards > li[data-id='{RUNNER}'] .side-card")
+    found = measure_links(desk)
+    selected = selected_links(found)
+    desk.check(len(selected) == 1 and selected[0]["thread"] == RUNNER and selected[0]["clip"] == "up",
+               f"the selected card's link is not drawn up to its root off screen: {selected}")
+    left, right = found["left"], found["right"]
+    assert isinstance(left, dict) and isinstance(right, dict)
+    marks = numbers(selected[0], "marks")
+    corner = found["corner"]
+    assert isinstance(corner, dict)
+    # The marks of a link whose card shows: the arrowhead pointing the way to its root first, its point
+    # first of all, then the one into the card. It points at the columns' shared top, under the right
+    # one's heading, so it crosses no heading.
+    edge = max(float(left["top"]), float(right["top"])) + 2
+    desk.check(abs(marks[1] + float(corner["top"]) - edge) <= 1,
+               f"the arrowhead does not point up at the columns' top edge {edge}: {marks[1]}")
+    desk.shot("4-selected-off-screen")
+    # Left selected, Main glides — smoothly, through positions between — until the root is level with it.
+    watch_scrolls(desk, "scroll-area")
+    before = scroll_top(page, "scroll-area")
+    page.wait_for_timeout(GLIDE_MS + 900)
+    frame(desk)
+    passed = [float(value) for value in page.evaluate("() => window.__glide")]
+    desk.check(scroll_top(page, "scroll-area") < before - 100, "Main did not glide up to the card's root")
+    desk.check(len(set(passed)) >= 3, f"Main jumped rather than glided: {passed}")
+    found = settled_links(desk)
+    selected = selected_links(found)
+    desk.check(len(selected) == 1 and selected[0]["clip"] == "both", f"the link is not whole after the glide: {selected}")
+    check_whole_links(desk, found, "after the glide")
+    end = ends_of(found, RUNNER)
+    badge, card = end["badge"], end["card"]
+    assert isinstance(badge, dict) and isinstance(card, dict)
+    level = abs((float(badge["top"]) + float(badge["bottom"])) / 2 - (float(card["top"]) + float(card["bottom"])) / 2)
+    # Within a few pixels: a smooth scroll ends on a whole pixel, and the tag's middle need not be on one.
+    desk.check(level <= 4, f"the root was not brought level with its card: {level:.1f}px apart")
+    desk.shot("5-after-glide")
+    desk.notes.append(f"the selected card's link pointed up off screen, then Main glided {len(passed)} steps to level")
+
+    # The reader's own scroll of Main while the selection waits — a little, its root still off screen,
+    # and not to the top, which reads older messages — and nothing glides.
+    hover(desk, f"#side-cards > li[data-id='{CANARY}'] .side-card")
+    found = measure_links(desk)
+    selected = selected_links(found)
+    desk.check(len(selected) == 1 and selected[0]["clip"] == "down", f"the canary's root is on screen, so this proves nothing: {selected}")
+    scroll_to(desk, "scroll-area", str(scroll_top(page, "scroll-area") + 60))
+    put = scroll_top(page, "scroll-area")
+    page.wait_for_timeout(GLIDE_MS + 500)
+    desk.check(abs(scroll_top(page, "scroll-area") - put) < 1, "Main glided after the reader scrolled it")
+    selected = selected_links(measure_links(desk))
+    desk.check(len(selected) == 1 and selected[0]["clip"] == "down", f"the canary's root came on screen anyway: {selected}")
+
+    # Reduced motion: the same glide, in one step. Main at its foot, the replica's root (209) above it.
+    page.emulate_media(reduced_motion="reduce")
+    scroll_to(desk, "scroll-area", "bottom")
+    hover(desk, f"#side-cards > li[data-id='{REPLICA}'] .side-card")
+    found = measure_links(desk)
+    selected = selected_links(found)
+    desk.check(len(selected) == 1 and selected[0]["clip"] == "up", f"the replica's link does not point up to its root: {selected}")
+    watch_scrolls(desk, "scroll-area")
+    page.wait_for_timeout(GLIDE_MS + 600)
+    frame(desk)
+    passed = [float(value) for value in page.evaluate("() => window.__glide")]
+    desk.check(len(set(passed)) == 1, f"with reduced motion Main did not jump in one step: {passed}")
+    found = settled_links(desk)
+    selected = selected_links(found)
+    desk.check(len(selected) == 1 and selected[0]["clip"] == "both", f"the link is not whole after the jump: {selected}")
+    check_whole_links(desk, found, "after the jump")
+    page.emulate_media(reduced_motion="no-preference")
+    desk.notes.append("a reader's scroll cancelled a glide, and reduced motion jumped in one step")
 
 
 if __name__ == "__main__":

@@ -5140,6 +5140,9 @@ function drawSelection() {
     }
     pane.lit = row;
   }
+  // `#261 two-column-connectors`. The selection's link is drawn whatever is on screen, and every redraw
+  // of the lists ends here (`keepSelection`), so the links are drawn again from here too.
+  noteLinkedSelection();
 }
 
 /**
@@ -13185,6 +13188,9 @@ function addThreadDecoration(meta, message, row, everyThread = false) {
   // `#224 keyboard-shortcuts`. → on the selected message presses it.
   sayRowShortcut(badge, "thread-badge");
   meta.append(badge);
+  // `#261 two-column-connectors`. Held on the row, as its reply button is, so that the link from a root
+  // to its card leaves level with its tag without the row's parts being walked.
+  /** @type {any} */ (row).threadBadge = badge;
   if (message.thread.is_root) {
     // A thread with no replies gets no chip at all — "0 replies" offered to gather nothing.
     const { count, exact } = gatherCount(id, message);
@@ -24757,11 +24763,15 @@ function renderColumns() {
     else screen.removeAttribute("data-columns");
   }
   // The call's view is one list. Two columns wait behind it, as they were, for the channel.
-  if (currentView !== "discord") return;
-  const shown = want && sideHasBox();
-  if (shown === columnsShown) return;
-  if (shown) enterColumns();
-  else leaveColumns();
+  if (currentView === "discord") {
+    const shown = want && sideHasBox();
+    if (shown !== columnsShown) {
+      if (shown) enterColumns();
+      else leaveColumns();
+    }
+  }
+  // `#261 two-column-connectors`. The links between the columns, drawn or taken away with them.
+  scheduleColumnLinks();
 }
 
 /** Ctrl/Cmd+\: the layout button. */
@@ -24847,6 +24857,7 @@ function renderSideMode() {
   if (leftEl("side-close").hidden === thread) leftEl("side-close").hidden = !thread;
   renderSideUnreadToggle();
   renderSideColumn();
+  scheduleColumnLinks();
 }
 
 /**
@@ -25105,6 +25116,8 @@ function filterSideCards() {
   const state = sideListState(rows.length, unread, shown);
   setTextIfChanged(leftEl("side-list-state"), state);
   if (leftEl("side-list-state").hidden !== (state === "")) leftEl("side-list-state").hidden = state === "";
+  // `#261 two-column-connectors`. The cards shown are what the links go to.
+  scheduleColumnLinks();
 }
 
 /**
@@ -25337,6 +25350,407 @@ function answeredSince(since, reason) {
 function inSideThread(message) {
   if (!sideShowing()) return false;
   return inColumn(columns.side, () => channelView === "thread" && threadOf(message) === String(selectedThreadId));
+}
+
+// --- the links between Main's roots and their cards ------------------------------------------------
+//
+// `#261 two-column-connectors`. The owner, 2026-10-12: "In two column view we get a list of threads on
+// the right. The main channel view on the left contains the root message of ALL those threads, but
+// there is no easy way to see how they match up. Some git diff style tools show connections between
+// hunks on the left and the right with connector arrows (the kind with only right angle bends that
+// leave the box on the left, travel through the middle vertical gap, and connect to the right side)."
+//
+// WHAT IS DRAWN, in one SVG over the main screen (#column-links), while two columns show the cards:
+//
+//   * For each root on Main whose thread has a card shown on the right, with both ends on screen, a
+//     path in the thread's colour — the colour of its Thread(N) tag and of the card's left edge — out
+//     of the root's right edge level with that tag, across to a lane in the gap between the columns,
+//     up or down it, and into the card's left edge at its middle: a dot where it leaves, an arrowhead
+//     where it arrives. Pairs with an end off screen are not drawn. Each link has a lane of its own,
+//     in the order that crosses the fewest others (`laneOrder`).
+//   * The SELECTED message or card, in either column (`#239 single-selection`), draws its link even
+//     when the other end is off screen: from the end on screen to the gap, then up or down to the edge
+//     of the other column, where an arrowhead points the way to it. Drawn over the others, heavier.
+//   * And if it stays selected for COLUMN_GLIDE_MS with the other end off screen, the other column
+//     scrolls smoothly until that end is level with it (`glideToCounterpart`) — unless the selection
+//     moves or the reader scrolls that column first. Where the reader's system asks for reduced
+//     motion (the stylesheet's `--column-glide`), it jumps instead.
+//
+// WHAT IT COSTS (`#226 page-energy-profile`). Nothing in one column, on a phone, over a thread on the
+// right, or while the page is hidden. Otherwise one pass per animation frame at most, asked for by a
+// scroll of either column (passive listeners), a resize, a redraw of either list or a new selection:
+// every rectangle it needs is read before anything is written, and only what changed is written, so a
+// frame in which nothing moved writes nothing. Nothing is measured outside that pass but the one read
+// a glide makes when its wait is up.
+
+/** How long a selection stays with its other end off screen before that column scrolls to it, in ms. */
+const COLUMN_GLIDE_MS = 1500;
+
+/** The most room between two lanes in the gap, in px. */
+const LINK_LANE_PX = 7;
+
+/** How long an arrowhead is, in px; it is as wide again, a little more. */
+const LINK_HEAD_PX = 7;
+
+/** The radius of the dot where a link leaves its root, in px. */
+const LINK_DOT_PX = 3;
+
+/** How far below a row's top its link leaves it, at most, when the row draws no tag to be level with, in px. */
+const LINK_ROW_INSET_PX = 18;
+
+/** How far inside the other column a glide brings the end it goes to, at least, in px. */
+const LINK_GLIDE_MARGIN_PX = 24;
+
+/** Whether the links have a place: two columns, the cards on the right, the channel on the main screen. */
+function columnLinksShown() {
+  return columnsShown && columns.side.mode === "list" && currentScreen === "main" && currentView === "discord";
+}
+
+/** The thread whose root `row` draws on Main as itself, or null: not a row of a collapsed run. */
+function linkedRootThread(row) {
+  if (!row || row.hasAttribute("data-read-run") || !rowShown(row)) return null;
+  const first = rowMessages(row)[0];
+  return first && first.thread && first.thread.is_root ? threadOf(first) : null;
+}
+
+/**
+ * Every root drawn on Main whose thread has a card shown on the right, with that card, in Main's order.
+ * Read from the lists alone: nothing is laid out.
+ *
+ * @returns {{thread: string, row: HTMLElement, card: HTMLElement}[]}
+ */
+function columnLinkPairs() {
+  /** @type {Map<string, HTMLElement>} */
+  const cards = new Map();
+  for (const card of /** @type {HTMLElement[]} */ ([...leftEl("side-cards").children])) {
+    if (card.hasAttribute("data-card") && rowShown(card)) cards.set(String(card.getAttribute("data-id")), card);
+  }
+  const list = channelPane.list();
+  const pairs = [];
+  if (!list || cards.size === 0) return pairs;
+  for (const row of /** @type {HTMLElement[]} */ ([...list.children])) {
+    const thread = linkedRootThread(row);
+    const card = thread === null ? undefined : cards.get(thread);
+    if (thread !== null && card) pairs.push({ thread, row, card });
+  }
+  return pairs;
+}
+
+/**
+ * The pair whose end is the selection drawn on the page — a root on Main, or a card — or null.
+ *
+ * @param {{thread: string, row: HTMLElement, card: HTMLElement}[]} pairs
+ */
+function selectedLinkPair(pairs) {
+  const pane = activePane();
+  const lit = pane ? pane.lit : null;
+  if (!lit) return null;
+  return pairs.find((pair) => (pane === sidePane ? pair.card : pair.row) === lit) || null;
+}
+
+/**
+ * Where a link meets Main's row `row`, whose box is `box`: level with the middle of its Thread(N), the
+ * tag in the thread's colour, or a little below its top when it draws none.
+ *
+ * @param {HTMLElement & {threadBadge?: HTMLElement}} row
+ * @param {DOMRect} box
+ */
+function rowLinkY(row, box) {
+  const badge = row.threadBadge;
+  if (badge && badge.parentNode) {
+    const tag = badge.getBoundingClientRect();
+    if (tag.height > 0 && tag.top >= box.top && tag.bottom <= box.bottom) return (tag.top + tag.bottom) / 2;
+  }
+  return box.top + Math.min(box.height / 2, LINK_ROW_INSET_PX);
+}
+
+/**
+ * Where each pair's ends are now, read in one go and nothing written: `from` on the root's right edge
+ * and `to` on the card's left edge, each with whether it shows in its column; what each column shows,
+ * top to bottom; the gap between Main's list and the cards; and the SVG's own corner, which every
+ * point it draws is measured from.
+ *
+ * Both columns are taken to start where the right one's list does, under its heading: the gap the
+ * lanes run in is the two columns' edge, and a link drawn above that would cross the heading. Main's
+ * list starts higher, under the pill and the search glass floating over its head, so a root up there
+ * is under them too.
+ *
+ * @param {{thread: string, row: HTMLElement, card: HTMLElement}[]} pairs
+ */
+function measureColumnLinks(pairs) {
+  const corner = leftEl("column-links").getBoundingClientRect();
+  const leftArea = leftEl("scroll-area");
+  const rightArea = leftEl("side-scroll");
+  const leftTop = leftArea.getBoundingClientRect().top;
+  const rightTop = rightArea.getBoundingClientRect().top;
+  const top = Math.max(leftTop, rightTop);
+  const left = { top, bottom: leftTop + (leftArea.clientHeight || 0) };
+  const right = { top, bottom: rightTop + (rightArea.clientHeight || 0) };
+  const list = channelPane.list();
+  const gap = {
+    from: list ? list.getBoundingClientRect().right : 0,
+    to: leftEl("side-cards").getBoundingClientRect().left,
+  };
+  const ends = pairs.map((pair) => {
+    const row = pair.row.getBoundingClientRect();
+    const card = pair.card.getBoundingClientRect();
+    const from = { x: row.right, y: rowLinkY(pair.row, row) };
+    const to = { x: card.left, y: (card.top + card.bottom) / 2 };
+    return {
+      pair,
+      from,
+      to,
+      fromSeen: from.y >= left.top && from.y <= left.bottom,
+      toSeen: to.y >= right.top && to.y <= right.bottom,
+    };
+  });
+  return { corner, left, right, gap, ends };
+}
+
+/**
+ * The order of `links` across the gap, left to right, that crosses the fewest of them: the links rising
+ * from their root to their card first, the higher root further left, then the falling ones, the higher
+ * root further right. Of two links whose stretches of the gap overlap, both rising or both falling and
+ * neither inside the other, that is the order in which neither crosses the other; a rising and a
+ * falling one, or one inside the other, cross once whatever the order.
+ *
+ * @param {{from: {y: number}, to: {y: number}}[]} links
+ */
+function laneOrder(links) {
+  const rising = links.filter((link) => link.to.y < link.from.y).sort((a, b) => a.from.y - b.from.y);
+  const falling = links.filter((link) => link.to.y >= link.from.y).sort((a, b) => b.from.y - a.from.y);
+  return [...rising, ...falling];
+}
+
+/** A coordinate for a path, to the half pixel, measured from `origin`. */
+const linkAt = (value, origin) => Math.round((value - origin) * 2) / 2;
+
+/**
+ * What the links are, from what `measureColumnLinks` read, as the paths to draw: for each, its thread,
+ * its colour, whether it is the selection's, which way it is clipped ("up" or "down", or "both" ends
+ * shown), the line and the marks at its ends. The selection's is last, so it is drawn over the rest.
+ *
+ * @param {ReturnType<typeof measureColumnLinks>} measured
+ * @param {{thread: string, row: HTMLElement, card: HTMLElement} | null} chosen
+ */
+function planColumnLinks(measured, chosen) {
+  const { corner, left, right, gap, ends } = measured;
+  const links = [];
+  for (const end of ends) {
+    const selected = chosen !== null && end.pair === chosen;
+    if (end.fromSeen && end.toSeen) {
+      links.push({ end, selected, from: end.from, to: end.to, clip: "both", edge: 0 });
+    } else if (selected && (end.fromSeen || end.toSeen)) {
+      // To the edge of the column the other end is out of, on the side it is out of: in the gap, which
+      // is both columns' edge, no lower than either column's foot.
+      const span = end.fromSeen ? right : left;
+      const far = end.fromSeen ? end.to : end.from;
+      const clip = far.y < span.top ? "up" : "down";
+      const edge = clip === "up" ? span.top + 2 : Math.min(left.bottom, right.bottom) - 2;
+      const from = end.fromSeen ? end.from : { x: end.from.x, y: edge };
+      const to = end.fromSeen ? { x: end.to.x, y: edge } : end.to;
+      links.push({ end, selected, from, to, clip, edge });
+    }
+  }
+  if (links.length === 0) return [];
+  // The lanes: in the gap between Main's list (or the furthest root, if one reaches past it) and the
+  // cards, less an arrowhead's room before the cards.
+  const reach = Math.max(gap.from, ...links.map((link) => link.end.from.x));
+  let low = reach + 3;
+  let high = gap.to - LINK_HEAD_PX - 3;
+  if (high - low < 4) {
+    const middle = (low + high) / 2;
+    low = middle - 2;
+    high = middle + 2;
+  }
+  const order = laneOrder(links);
+  const step = order.length > 1 ? Math.min(LINK_LANE_PX, (high - low) / (order.length - 1)) : 0;
+  const middle = (low + high) / 2;
+  const lane = new Map(order.map((link, at) => [link, middle + (at - (order.length - 1) / 2) * step]));
+  const x = (/** @type {number} */ value) => linkAt(value, corner.left);
+  const y = (/** @type {number} */ value) => linkAt(value, corner.top);
+  const head = LINK_HEAD_PX;
+  const half = LINK_HEAD_PX * 0.6;
+  const dot = (/** @type {number} */ cx, /** @type {number} */ cy) =>
+    `M ${cx - LINK_DOT_PX} ${cy} a ${LINK_DOT_PX} ${LINK_DOT_PX} 0 1 0 ${2 * LINK_DOT_PX} 0 a ${LINK_DOT_PX} ${LINK_DOT_PX} 0 1 0 ${-2 * LINK_DOT_PX} 0 Z`;
+  const into = (/** @type {number} */ tx, /** @type {number} */ ty) =>
+    `M ${tx} ${ty} L ${tx - head} ${ty - half} L ${tx - head} ${ty + half} Z`;
+  const pointing = (/** @type {number} */ lx, /** @type {number} */ ey, /** @type {string} */ way) => {
+    const back = way === "up" ? head : -head;
+    return `M ${lx} ${ey} L ${lx - half} ${ey + back} L ${lx + half} ${ey + back} Z`;
+  };
+  const plan = links.map((link) => {
+    const lx = x(/** @type {number} */ (lane.get(link)));
+    const fx = x(link.from.x);
+    const fy = y(link.from.y);
+    const tx = x(link.to.x);
+    const ty = y(link.to.y);
+    const back = link.clip === "up" ? head : -head;
+    let line;
+    let marks;
+    if (link.clip === "both") {
+      line = `M ${fx} ${fy} H ${lx} V ${ty} H ${tx - head}`;
+      marks = `${dot(fx, fy)} ${into(tx, ty)}`;
+    } else if (link.end.fromSeen) {
+      line = `M ${fx} ${fy} H ${lx} V ${ty + back}`;
+      marks = `${dot(fx, fy)} ${pointing(lx, ty, link.clip)}`;
+    } else {
+      line = `M ${lx} ${fy + back} V ${ty} H ${tx - head}`;
+      marks = `${pointing(lx, fy, link.clip)} ${into(tx, ty)}`;
+    }
+    return { thread: link.end.pair.thread, hue: threadHue(link.end.pair.thread), selected: link.selected,
+      clip: link.clip, line, marks };
+  });
+  return [...plan.filter((link) => !link.selected), ...plan.filter((link) => link.selected)];
+}
+
+/** What #column-links last drew, so a frame that would draw the same writes nothing. */
+let columnLinksDrawn = "[]";
+
+/**
+ * Draw `plan` in #column-links: two paths a link, its line and the marks at its ends, reused in place,
+ * each attribute written only where it changed.
+ *
+ * @param {ReturnType<typeof planColumnLinks>} plan
+ */
+function renderColumnLinks(plan) {
+  const signature = JSON.stringify(plan);
+  if (signature === columnLinksDrawn) return;
+  columnLinksDrawn = signature;
+  const svg = leftEl("column-links");
+  const want = plan.length * 2;
+  while (svg.children.length > want) svg.removeChild(svg.children[svg.children.length - 1]);
+  // In the SVG's own namespace, which the markup gave it: this file names no address, not even that one.
+  while (svg.children.length < want) svg.append(document.createElementNS(svg.namespaceURI, "path"));
+  plan.forEach((link, at) => {
+    drawLinkPath(/** @type {SVGElement} */ (svg.children[2 * at]), "column-link", link, link.line);
+    drawLinkPath(/** @type {SVGElement} */ (svg.children[2 * at + 1]), "column-link-marks", link, link.marks);
+  });
+}
+
+/**
+ * One path of a link, written only where it changed.
+ *
+ * @param {SVGElement} path
+ * @param {string} kind
+ * @param {ReturnType<typeof planColumnLinks>[number]} link
+ * @param {string} d
+ */
+function drawLinkPath(path, kind, link, d) {
+  for (const [name, value] of [["class", kind], ["d", d], ["data-thread", link.thread], ["data-link", link.clip]]) {
+    if (path.getAttribute(name) !== value) path.setAttribute(name, value);
+  }
+  if (path.hasAttribute("data-selected") !== link.selected) {
+    if (link.selected) path.setAttribute("data-selected", "true");
+    else path.removeAttribute("data-selected");
+  }
+  if (path.style.getPropertyValue("--thread-hue") !== String(link.hue)) path.style.setProperty("--thread-hue", String(link.hue));
+}
+
+/** Whether a frame has been asked for to draw the links in. */
+let columnLinksDue = false;
+
+/**
+ * Ask for the links to be drawn again at the next animation frame: one frame however often it is asked
+ * before then. Where they have no place, they go at once, and nothing is asked; while the page is
+ * hidden, nothing at all, and coming back asks.
+ */
+function scheduleColumnLinks() {
+  if (!columnLinksShown()) {
+    renderColumnLinks([]);
+    return;
+  }
+  if (document.hidden || columnLinksDue || typeof requestAnimationFrame !== "function") return;
+  columnLinksDue = true;
+  requestAnimationFrame(() => {
+    columnLinksDue = false;
+    if (document.hidden) return;
+    if (!columnLinksShown()) {
+      renderColumnLinks([]);
+      return;
+    }
+    const pairs = columnLinkPairs();
+    renderColumnLinks(pairs.length ? planColumnLinks(measureColumnLinks(pairs), selectedLinkPair(pairs)) : []);
+  });
+}
+
+/** The selection the links were last told of, as "pane:id", or "". */
+let linkedSelection = "";
+
+/** The wait before a glide, while one is armed: the selection it is for, the column, and where that column was. */
+let columnGlide = /** @type {{key: string, other: HTMLElement, at: number, timer: any} | null} */ (null);
+
+/**
+ * The selection was drawn again (`drawSelection`): the links follow it, and a selection that is new
+ * arms the wait before its other end is brought on screen, which the old one's no longer is.
+ */
+function noteLinkedSelection() {
+  const pane = activePane();
+  const lit = pane ? pane.lit : null;
+  const key = pane && lit ? `${pane.name}:${lit.getAttribute("data-id")}` : "";
+  if (key !== linkedSelection) {
+    linkedSelection = key;
+    armColumnGlide(pane, lit);
+  }
+  scheduleColumnLinks();
+}
+
+/**
+ * Wait COLUMN_GLIDE_MS on the selection `lit` in `pane`, when it is a root with a card or a card, and
+ * note where the other column is, which the reader scrolling it in the meantime changes.
+ *
+ * @param {KeyPane | null} pane
+ * @param {HTMLElement | null} lit
+ */
+function armColumnGlide(pane, lit) {
+  if (columnGlide !== null) {
+    clearTimeout(columnGlide.timer);
+    columnGlide = null;
+  }
+  if (!pane || !lit || !columnLinksShown()) return;
+  const linked = pane === sidePane ? lit.hasAttribute("data-card") : linkedRootThread(lit) !== null;
+  if (!linked) return;
+  const other = leftEl(pane === sidePane ? "scroll-area" : "side-scroll");
+  columnGlide = { key: linkedSelection, other, at: other.scrollTop, timer: setTimeout(glideToCounterpart, COLUMN_GLIDE_MS) };
+}
+
+/**
+ * The wait is up: if the selection is the same, its end on screen and the other end off it, and the
+ * reader has not scrolled the other column since, scroll that column until the other end is level with
+ * the selection — kept inside it — smoothly, or at once where the reader's system asks for less motion.
+ */
+function glideToCounterpart() {
+  const glide = columnGlide;
+  columnGlide = null;
+  if (!glide || glide.key !== linkedSelection || document.hidden || !columnLinksShown()) return;
+  if (Math.abs(glide.other.scrollTop - glide.at) > 1) return;
+  const pairs = columnLinkPairs();
+  const chosen = selectedLinkPair(pairs);
+  if (!chosen) return;
+  const measured = measureColumnLinks([chosen]);
+  const [end] = measured.ends;
+  const onMain = glide.other === leftEl("side-scroll");
+  const [own, far, ownSeen, farSeen] = onMain
+    ? [end.from, end.to, end.fromSeen, end.toSeen] : [end.to, end.from, end.toSeen, end.fromSeen];
+  if (!ownSeen || farSeen) return;
+  const span = onMain ? measured.right : measured.left;
+  const level = Math.max(span.top + LINK_GLIDE_MARGIN_PX, Math.min(span.bottom - LINK_GLIDE_MARGIN_PX, own.y));
+  const top = glide.other.scrollTop + far.y - level;
+  const behavior = glideBehavior();
+  if (typeof glide.other.scrollTo === "function") glide.other.scrollTo({ top, behavior });
+  else glide.other.scrollTop = top;
+}
+
+/**
+ * How a glide moves: "smooth", or "auto" — at once — where the stylesheet says so, which it does for a
+ * reader whose system asks for reduced motion (`--column-glide` on #screen-main). The stylesheet's to
+ * say, as everything about the layout is: the script never asks a media query itself.
+ *
+ * @returns {ScrollBehavior}
+ */
+function glideBehavior() {
+  const style = typeof window.getComputedStyle === "function" ? window.getComputedStyle(leftEl("screen-main")) : null;
+  return style && String(style.getPropertyValue("--column-glide")).trim() === "auto" ? "auto" : "smooth";
 }
 
 // --- keeping the channel view fresh -----------------------------------------------------------
@@ -28625,6 +29039,8 @@ if (typeof window.ResizeObserver === "function") {
       // `#245 done-feedback`. The message box moves without a scroll too: the window, a view or
       // screen changing, the box itself resized.
       placeChipsOverComposer();
+      // `#261 two-column-connectors`. A row folded or opened moves the roots below it with no scroll.
+      scheduleColumnLinks();
     }, 0);
   });
   for (const box of [el("scroll-area"), ...el("scroll-area").children]) geometry.observe(box);
@@ -28636,6 +29052,7 @@ if (typeof window.ResizeObserver === "function") {
     setTimeout(() => {
       sideDue = false;
       if (sideShowing()) inColumn(columns.side, renderJumpNewest);
+      scheduleColumnLinks();
     }, 0);
   });
   for (const box of [leftEl("side-scroll"), ...leftEl("side-scroll").children]) sideGeometry.observe(box);
@@ -28747,6 +29164,12 @@ el("scroll-area").addEventListener("touchend", guardQuietly(pullEnd), PASSIVE);
 // A cancel is the browser taking the gesture away — a phone call arriving, a system gesture
 // winning. It must not leave the affordance standing on the screen saying "release to refresh".
 el("scroll-area").addEventListener("touchcancel", pullCancel, PASSIVE);
+// `#261 two-column-connectors`. Each column's scroll moves the links' ends: one frame per burst, asked
+// for by listeners that only read (`scheduleColumnLinks`), and nothing at all in one column. Coming back
+// to the page draws them again, as a hidden page draws none.
+leftEl("scroll-area").addEventListener("scroll", scheduleColumnLinks, PASSIVE);
+leftEl("side-scroll").addEventListener("scroll", scheduleColumnLinks, PASSIVE);
+document.addEventListener("visibilitychange", scheduleColumnLinks);
 
 /**
  * Like `guard`, but for things that are not a call: it reports, and it does NOT tear down a live

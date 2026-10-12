@@ -835,6 +835,16 @@ class FakeElement {
   }
 
   /**
+   * `Element.scrollTo({ top, behavior })`, kept in `glides` so a test knows what was asked — smoothly or
+   * at once — and applied at once: this fixture has no frames to animate a scroll over. `#261
+   * two-column-connectors` scrolls a column this way when a link's other end is off screen.
+   */
+  scrollTo(options) {
+    this.glides = [...(this.glides || []), { top: options.top, behavior: options.behavior }];
+    this.scrollTop = options.top;
+  }
+
+  /**
    * Take the focus, as the document reports it in `activeElement`, and keep what was asked of it.
    * Nothing is laid out, so `preventScroll` changes nothing here; a test reads it back to know the
    * page asked for it. Focus moved by the page is drawn as the focus it moved from was, as a browser
@@ -1871,6 +1881,13 @@ function newPage(store = new Map(), script = SCRIPT, arrange = null) {
       node.textContent = String(data);
       return node;
     },
+    // `#261 two-column-connectors` draws the links between the columns as SVG paths.
+    createElementNS: (namespace, tag) => {
+      page.createdTags.push(String(tag).toLowerCase());
+      const node = new FakeElement("", String(tag));
+      node.namespaceURI = namespace;
+      return node;
+    },
   };
   page.document = document;
   /** Fire a document-level event (a tap's `pointerdown`, a `keydown`) at the page's listeners. */
@@ -2006,6 +2023,8 @@ function newPage(store = new Map(), script = SCRIPT, arrange = null) {
     for (const fn of windowListeners.get("resize") || []) {
       await fn();
     }
+    // With frames (`enableAnimationFrames`), the page decides the columns at the next one.
+    if (page.frames) await page.nextFrame();
     await page.settle();
   };
   /**
@@ -2832,6 +2851,37 @@ function newPage(store = new Map(), script = SCRIPT, arrange = null) {
       }
     };
   };
+  /**
+   * `#261 two-column-connectors`. Animation frames the TEST runs. Left out of the ordinary fixture, as the
+   * ResizeObserver is, so the rest of the suite runs as it always has: without them the page decides the
+   * columns at once on a resize and draws no links between them, which are drawn only in a frame. A test
+   * that wants them calls this from `arrange`; `nextFrame()` runs every frame asked for so far, as a
+   * browser does before it paints, and `frames` holds those still waiting.
+   */
+  page.enableAnimationFrames = () => {
+    page.frames = [];
+    context.requestAnimationFrame = (fn) => {
+      page.frames.push(fn);
+      return page.frames.length;
+    };
+  };
+  page.nextFrame = async () => {
+    const due = page.frames.splice(0);
+    for (const fn of due) fn(0);
+    await page.settle();
+    return due.length;
+  };
+  /**
+   * `#261 two-column-connectors`. A reader whose system asks for reduced motion: the stylesheet then says
+   * `--column-glide: auto` on #screen-main, which is what the page reads. Its root font size is the
+   * default, as the page assumes where it cannot read one.
+   */
+  page.preferReducedMotion = () => {
+    context.window.getComputedStyle = () => ({
+      fontSize: "16px",
+      getPropertyValue: (name) => (name === "--column-glide" ? "auto" : ""),
+    });
+  };
   page.resized = (target) => {
     for (const observer of page.resizeObservers) {
       if (observer.targets.includes(target)) {
@@ -3382,6 +3432,27 @@ const TUNING_BANDS = {
     "how long Send is held after a card appears or a newer proposal replaces it. Under a second, " +
     "a tap already under way when the text appeared still lands on words the owner never read; " +
     "past three, an owner who did read them waits on a button that looks broken"],
+  // `#261 two-column-connectors`. The links between Main's roots and their cards.
+  COLUMN_GLIDE_MS: [800, 3000,
+    "how long a selection waits with its link's other end off screen before that column scrolls to " +
+    "it (the owner: 'after say a 1.5 second delay'). Under a second the other column moves under a " +
+    "reader still moving the mouse down the rows; past three the reader has scrolled it themselves"],
+  LINK_LANE_PX: [3, 12,
+    "the most room between two links' lanes in the gap between the columns. Under three, two lanes " +
+    "read as one thick line; past twelve, a few links spread wider than the gap and over the cards"],
+  LINK_HEAD_PX: [4, 10,
+    "an arrowhead's length. Under four it reads as the line's ragged end, not a point; past ten it " +
+    "covers the coloured edge of the card it points at, and leaves no gap for lanes"],
+  LINK_DOT_PX: [2, 5,
+    "the radius of the dot where a link leaves its root. Under two it vanishes against the row's " +
+    "border; past five it is a button-sized blob beside the row's own buttons"],
+  LINK_ROW_INSET_PX: [8, 40,
+    "how far below a root's top its link leaves where the row draws no tag. Under eight it leaves " +
+    "along the box's rounded corner; past forty it leaves below a one-line message"],
+  LINK_GLIDE_MARGIN_PX: [8, 80,
+    "how far inside a column a glide brings the end it goes to, at least. Under eight the end lands " +
+    "under the column's edge, as if still off screen; past eighty a selection near the edge has its " +
+    "counterpart brought well away from level with it"],
 };
 test("every number this page is tuned by stays inside a band that says what would be wrong", () => {
   for (const [name, [low, high, why]] of Object.entries(TUNING_BANDS)) {
@@ -40444,6 +40515,368 @@ test("`#259 thread-list-unread-filter` x `#243 filter-keeps-selection`: the card
   assert.equal(kept.off, 0, `turning Unread only off moved the card selected by ${kept.off}px`);
   const loose = await run(brokenScript("  change();\n  placeCardAnchor(anchor);\n", "  change();\n"));
   assert.notEqual(loose.on, 0, "the negative control kept the card in place, so the check above proves nothing");
+});
+
+// --- the links between Main's roots and their cards (#261 two-column-connectors) ---------------------
+//
+// The owner, 2026-10-12: "Some git diff style tools show connections between hunks on the left and the
+// right with connector arrows (the kind with only right angle bends that leave the box on the left,
+// travel through the middle vertical gap, and connect to the right side). I want such connectors": in
+// the thread's colour; drawn where both ends are on screen; the highlighted message or card drawing
+// its own even off screen; and, left highlighted, "after say a 1.5 second delay start scrolling the
+// other column smoothly to bring its counterpart onto the screen". This fixture lays nothing out across
+// the page, so the tests below give the columns a 1440px desk's horizontal places (`layColumnsOut`),
+// and real Chromium measures the drawing itself (tests/two_column_browser.py).
+
+const COLUMN_GLIDE_MS = sourceConstant("COLUMN_GLIDE_MS");
+const LINK_HEAD_PX = sourceConstant("LINK_HEAD_PX");
+
+/**
+ * Give every box the horizontal place a 1440px desk gives it in two columns, as measured in Chromium:
+ * the left column 0-720 with Main's list 12-708 and its rows 12-612, a tag inside a row 420-510, the
+ * right column 721-1440 with its cards 753-1428, and the links' SVG over the whole screen. Vertical
+ * places are the fixture's own. Returns the function that puts the fixture's own back.
+ */
+function layColumnsOut() {
+  const read = FakeElement.prototype.getBoundingClientRect;
+  const within = (node, id) => {
+    for (let at = node; at; at = at.parentNode) if (at.id === id) return true;
+    return false;
+  };
+  const across = (node) => {
+    if (node.id === "column-links" || node.id === "screen-main") return [0, 1440];
+    if (node.id === "scroll-area") return [0, 720];
+    if (node.id === "side-scroll") return [721, 1440];
+    if (node.id === "discord-log" || node.id === "pinned-log") return [12, 708];
+    if (within(node, "side-cards")) return [753, 1428];
+    if (node.parentNode && (node.parentNode.id === "discord-log" || node.parentNode.id === "pinned-log")) return [12, 612];
+    if (within(node, "discord-log") || within(node, "pinned-log")) return [420, 510];
+    return [0, 0];
+  };
+  FakeElement.prototype.getBoundingClientRect = function rect() {
+    const box = read.call(this);
+    const [left, right] = across(this);
+    return { ...box, left, right, width: right - left };
+  };
+  return () => {
+    FakeElement.prototype.getBoundingClientRect = read;
+  };
+}
+
+/** The links drawn, each as its thread, how it ends, whether it is the selection's, its colour and its path's numbers. */
+const drawnLinks = (page) => {
+  const paths = page.el("column-links").children;
+  return paths.filter((path) => path.getAttribute("class") === "column-link").map((path) => {
+    const marks = paths[paths.indexOf(path) + 1];
+    return {
+      thread: path.getAttribute("data-thread"),
+      clip: path.getAttribute("data-link"),
+      selected: path.hasAttribute("data-selected"),
+      hue: path.style.getPropertyValue("--thread-hue"),
+      line: path.getAttribute("d").match(/-?\d+(?:\.\d+)?/g).map(Number),
+      marks: marks.getAttribute("d").match(/-?\d+(?:\.\d+)?/g).map(Number),
+      marksHue: marks.style.getPropertyValue("--thread-hue"),
+    };
+  });
+};
+
+/** Main's row of the root of thread `t<i>`, and that thread's card. */
+const rootRow = (page, i) => rowWithId(page, String(300 + 2 * i));
+const threadCard = (page, i) => page.el("side-cards").children.find((li) => li.getAttribute("data-id") === `spaces/A/threads/t${i}`);
+
+/** Where a link meets a root: level with the middle of its Thread(N). */
+const rootLinkY = (row) => {
+  const tag = threadBadge(row).getBoundingClientRect();
+  return (tag.top + tag.bottom) / 2;
+};
+const cardLinkY = (card) => {
+  const box = card.getBoundingClientRect();
+  return (box.top + box.bottom) / 2;
+};
+/** Whether viewport y `y` shows in the column scrolled by `area`. */
+const inColumnView = (area, y) => y >= area.getBoundingClientRect().top && y <= area.getBoundingClientRect().top + area.clientHeight;
+
+const LINK_GLIDE_MARGIN_PX = sourceConstant("LINK_GLIDE_MARGIN_PX");
+
+/** Scroll Main until the tag of thread `t<i>`'s root is at viewport y `y`, as the reader would. */
+async function rootAt(page, i, y) {
+  const left = page.el("scroll-area");
+  left.scrollTop += rootLinkY(rootRow(page, i)) - y;
+  await left.dispatch("scroll");
+  await page.nextFrame();
+  assert.equal(rootLinkY(rootRow(page, i)), y, "Main cannot be scrolled to put the root there");
+}
+
+/** Where a glide in the column `area` brings an end, to be level with `y`: as near as its margins allow. */
+const glideLevel = (area, y) => {
+  const top = area.getBoundingClientRect().top;
+  return Math.max(top + LINK_GLIDE_MARGIN_PX, Math.min(top + area.clientHeight - LINK_GLIDE_MARGIN_PX, y));
+};
+
+/** Two columns over `count` threads, with frames, laid out across a desk; `arrange` as `newPage`'s. */
+async function linkedColumns(count, arrange = null, script = SCRIPT) {
+  const columns = await manyThreadColumns(count, (p) => {
+    p.enableAnimationFrames();
+    if (arrange) arrange(p);
+  }, script);
+  await columns.page.nextFrame();
+  return columns;
+}
+
+test("`#261 two-column-connectors`: the links are one SVG over the main screen, drawn only in two columns, hidden from assistive technology, never in the way of a press", () => {
+  assertMarkupContains("screen-main", "column-links");
+  const tag = /<svg\s+id="column-links"[^>]*>/.exec(HTML_CODE)[0];
+  assert.match(tag, /aria-hidden="true"/, "the links are not hidden from assistive technology");
+  assert.match(cssBlockOutside(TWO_COLUMN_QUERY, "#column-links"), /display:\s*none/, "the links can be drawn in one column");
+  const drawn = cssBlockIn(TWO_COLUMN_QUERY, '#screen-main[data-columns="two"] > #column-links');
+  assert.match(drawn, /pointer-events:\s*none/, "the links can take a press meant for a row or a card");
+  assert.match(drawn, /position:\s*absolute/);
+  assert.match(cssBlockIn(TWO_COLUMN_QUERY, "#column-links .column-link"), /stroke:\s*hsl\(var\(--thread-hue, 210\) 55% 50%\)/,
+    "a link is not drawn in its thread's colour, as the card's edge is");
+  assert.match(cssBlockIn(TWO_COLUMN_QUERY, ".side-card"), /border-left:\s*3px solid hsl\(var\(--thread-hue, 210\) 55% 50%\)/,
+    "the card's edge is no longer the colour a link is drawn in");
+  // A reduced-motion reader's glide is a jump: the stylesheet says so, and the script reads it.
+  assert.match(CSS_CODE, /@media \(prefers-reduced-motion: reduce\) \{\s*#screen-main \{\s*--column-glide: auto;/,
+    "the stylesheet does not tell the page a reduced-motion reader's glide should jump");
+  assert.doesNotMatch(SCRIPT_CODE, /matchMedia|prefers-reduced-motion/, "web/voice.js grew a second opinion about motion");
+});
+
+test("`#261 two-column-connectors`: a root on Main and its thread's card are joined while both are on screen, out of the root's right edge level with its tag and into the card's left edge, in the thread's colour", async () => {
+  const restore = layColumnsOut();
+  try {
+    const run = async (script) => {
+      const { page } = await linkedColumns(16, null, script);
+      const left = page.el("scroll-area");
+      const right = page.el("side-scroll");
+      /** The threads whose root and card both show, by where each link meets them. */
+      const bothShown = () => [...Array(16).keys()].filter((i) =>
+        inColumnView(left, rootLinkY(rootRow(page, i))) && inColumnView(right, cardLinkY(threadCard(page, i))))
+        .map((i) => `spaces/A/threads/t${i}`);
+      const snapshots = [];
+      for (const [leftTop, rightTop] of [[left.scrollHeight, right.scrollHeight], [0, right.scrollHeight], [0, 0], [300, 120]]) {
+        left.scrollTop = leftTop;
+        right.scrollTop = rightTop;
+        await left.dispatch("scroll");
+        await right.dispatch("scroll");
+        await page.nextFrame();
+        snapshots.push({ expected: bothShown(), drawn: drawnLinks(page) });
+      }
+      return { page, snapshots };
+    };
+    const { page, snapshots } = await run(SCRIPT);
+    assert.ok(snapshots[0].expected.length > 0 && snapshots[2].expected.length > 0, "no pair is on screen, so this proves nothing");
+    assert.deepStrictEqual(snapshots[1].expected, [], "a pair is on screen with Main at the top and the cards at the foot, so this proves less");
+    for (const { expected, drawn } of snapshots) {
+      assert.deepStrictEqual(drawn.map((link) => link.thread).sort(), [...expected].sort(),
+        "the links are not exactly the pairs with both ends on screen");
+      for (const link of drawn) assert.equal(link.clip, "both");
+    }
+    // The last place: each link's ends on the boxes it joins, its lane in the gap, its colour the thread's.
+    for (const link of snapshots[3].drawn) {
+      const i = Number(link.thread.replace(/^.*t/, ""));
+      const row = rootRow(page, i).getBoundingClientRect();
+      const card = threadCard(page, i).getBoundingClientRect();
+      const [fx, fy, lane, ty, end] = link.line;
+      assert.equal(fx, row.right, "a link does not leave its root's right edge");
+      assert.equal(fy, rootLinkY(rootRow(page, i)), "a link does not leave its root level with its tag");
+      assert.ok(fy >= row.top && fy <= row.bottom);
+      assert.equal(end + LINK_HEAD_PX, card.left, "a link's arrowhead does not reach its card's left edge");
+      assert.equal(link.marks[link.marks.length - 6], card.left, "the arrowhead's point is not on the card's edge");
+      assert.equal(ty, cardLinkY(threadCard(page, i)), "a link does not arrive at its card's middle");
+      assert.ok(lane > 708 && lane < card.left - LINK_HEAD_PX, `a link's lane at ${lane} is not in the gap between the columns`);
+      const hue = threadCard(page, i).children[0].style.getPropertyValue("--thread-hue");
+      assert.equal(link.hue, hue, "a link is not the colour of its card's edge");
+      assert.equal(link.marksHue, hue);
+      assert.equal(threadBadge(rootRow(page, i)).style.getPropertyValue("--thread-hue"), hue, "a link is not the colour of its root's tag");
+    }
+    const lanes = snapshots[3].drawn.map((link) => link.line[2]);
+    assert.equal(new Set(lanes).size, lanes.length, "two links share a lane");
+    // The control: drawn whatever is on screen, the links are more than the pairs on screen.
+    const loose = await run(brokenScript("    if (end.fromSeen && end.toSeen) {", "    if (true) {"));
+    assert.notDeepStrictEqual(loose.snapshots[1].drawn.map((link) => link.thread), [],
+      "the negative control drew nothing either, so the check above proves nothing");
+  } finally {
+    restore();
+  }
+});
+
+test("`#261 two-column-connectors`: the selected root or card draws its link with the other end off screen, clipped at the other column's edge and pointing up or down to it", async () => {
+  const restore = layColumnsOut();
+  try {
+    const { page } = await linkedColumns(16);
+    const left = page.el("scroll-area");
+    const right = page.el("side-scroll");
+    left.scrollTop = 0;
+    await left.dispatch("scroll");
+    await page.nextFrame();
+    assert.deepStrictEqual(drawnLinks(page), [], "a pair is on screen, so this proves less");
+    // A root on Main, its card above the right column's top: drawn, pointing up, ending at that edge.
+    await mouseTo(page, rootRow(page, 0), 300, 40);
+    assert.deepStrictEqual(litRows(page), ["discord-log:300"]);
+    await page.nextFrame();
+    let [link] = drawnLinks(page);
+    assert.ok(link, "the selected root's link was not drawn with its card off screen");
+    assert.equal(link.thread, "spaces/A/threads/t0");
+    assert.equal(link.clip, "up", "the link does not point up to a card above the column");
+    assert.equal(link.selected, true);
+    assert.ok(cardLinkY(threadCard(page, 0)) < right.getBoundingClientRect().top, "the card is on screen, so this proves nothing");
+    const top = right.getBoundingClientRect().top;
+    assert.equal(link.line[link.line.length - 1], top + 2 + LINK_HEAD_PX, "the line does not stop at the arrowhead under the column's edge");
+    assert.equal(link.marks[link.marks.length - 5], top + 2, "the arrowhead does not point at the column's top edge");
+    // A card at the foot, its root below Main's foot: pointing down.
+    await mouseTo(page, threadCard(page, 15), 900, 300);
+    assert.deepStrictEqual(litRows(page), ["side-cards:spaces/A/threads/t15"]);
+    await page.nextFrame();
+    [link] = drawnLinks(page);
+    assert.equal(link.thread, "spaces/A/threads/t15");
+    assert.equal(link.clip, "down", "the link does not point down to a root below the column");
+    assert.ok(rootLinkY(rootRow(page, 15)) > left.clientHeight, "the root is on screen, so this proves nothing");
+    // Moved on to another root, its link takes the last one's place.
+    await mouseTo(page, rootRow(page, 1), 300, 200);
+    await page.nextFrame();
+    assert.deepStrictEqual(drawnLinks(page).map((one) => [one.thread, one.clip]), [["spaces/A/threads/t1", "up"]]);
+  } finally {
+    restore();
+  }
+});
+
+test("`#261 two-column-connectors`: left selected for 1.5 s with its other end off screen, the other column scrolls that end level with it, smoothly, and the link is whole", async () => {
+  const restore = layColumnsOut();
+  try {
+    const { page } = await linkedColumns(16);
+    const left = page.el("scroll-area");
+    const right = page.el("side-scroll");
+    await rootAt(page, 8, 120);
+    await mouseTo(page, rootRow(page, 8), 300, 120);
+    await page.nextFrame();
+    assert.deepStrictEqual(drawnLinks(page).filter((link) => link.selected).map((link) => link.clip), ["up"],
+      "the card is on screen already, so this proves nothing");
+    assert.equal([...page.timers.values()].filter((timer) => timer.ms === COLUMN_GLIDE_MS).length, 1, "no wait was armed for the glide");
+    assert.equal(COLUMN_GLIDE_MS, 1500);
+    assert.equal(page.expireTimers(COLUMN_GLIDE_MS), 1);
+    assert.deepStrictEqual((right.glides || []).map((glide) => glide.behavior), ["smooth"], "the right column did not glide, smoothly");
+    assert.equal(cardLinkY(threadCard(page, 8)), glideLevel(right, rootLinkY(rootRow(page, 8))),
+      "the card was not brought level with its root");
+    assert.equal(left.glides, undefined, "the column the selection is in was scrolled");
+    await right.dispatch("scroll");
+    await page.nextFrame();
+    assert.deepStrictEqual(drawnLinks(page).filter((link) => link.selected).map((link) => link.clip), ["both"],
+      "the link is not whole once its card is on screen");
+    // From the right: a card whose root is below Main's foot brings the root up, level with it.
+    right.scrollTop = right.scrollHeight;
+    await right.dispatch("scroll");
+    await mouseTo(page, threadCard(page, 15), 900, 300);
+    page.expireTimers(COLUMN_GLIDE_MS);
+    assert.deepStrictEqual((left.glides || []).map((glide) => glide.behavior), ["smooth"], "Main did not glide to the card's root");
+    assert.ok(inColumnView(left, rootLinkY(rootRow(page, 15))), "the root was not brought on screen");
+    // Already whole, nothing moves: a root whose card is on screen arms no glide that scrolls.
+    const glides = right.glides.length;
+    await mouseTo(page, rootRow(page, 15), 300, 200);
+    page.expireTimers(COLUMN_GLIDE_MS);
+    assert.equal(right.glides.length, glides, "a column was scrolled to an end already on screen");
+  } finally {
+    restore();
+  }
+});
+
+test("`#261 two-column-connectors`: the glide waits for nothing once the selection moves or the reader scrolls that column, and jumps for a reader who asks for reduced motion", async () => {
+  const restore = layColumnsOut();
+  try {
+    // The selection moves on before the wait is up: the wait is for the new one, never the old.
+    let { page } = await linkedColumns(16);
+    await rootAt(page, 7, 40);
+    await mouseTo(page, rootRow(page, 7), 300, 40);
+    await mouseTo(page, rootRow(page, 8), 300, 300);
+    assert.deepStrictEqual(litRows(page), ["discord-log:316"]);
+    assert.equal([...page.timers.values()].filter((timer) => timer.ms === COLUMN_GLIDE_MS).length, 1, "the old wait is still armed beside the new one");
+    page.expireTimers(COLUMN_GLIDE_MS);
+    assert.equal(cardLinkY(threadCard(page, 8)), glideLevel(page.el("side-scroll"), rootLinkY(rootRow(page, 8))),
+      "the glide did not bring the new selection's card level with it");
+    // The reader scrolls the other column while it waits: theirs to move, and it stays where they put it.
+    ({ page } = await linkedColumns(16));
+    const right = page.el("side-scroll");
+    page.el("scroll-area").scrollTop = 0;
+    await mouseTo(page, rootRow(page, 0), 300, 40);
+    right.scrollTop -= 60;
+    await right.dispatch("scroll");
+    const put = right.scrollTop;
+    page.expireTimers(COLUMN_GLIDE_MS);
+    assert.equal(right.glides, undefined, "the column the reader scrolled was glided anyway");
+    assert.equal(right.scrollTop, put);
+    // A thread on the right instead of the cards: no links, and no glide.
+    ({ page } = await linkedColumns(16));
+    page.el("scroll-area").scrollTop = 0;
+    await mouseTo(page, rootRow(page, 0), 300, 40);
+    await threadCard(page, 3).children[0].click();
+    await page.settle();
+    await page.nextFrame();
+    page.expireTimers(COLUMN_GLIDE_MS);
+    assert.equal(page.el("side-scroll").glides, undefined, "a glide ran with a thread on the right");
+    assert.deepStrictEqual(page.el("column-links").children, [], "the links stayed with a thread on the right");
+    // Reduced motion: the same glide, at once.
+    ({ page } = await linkedColumns(16, (p) => p.preferReducedMotion()));
+    page.el("scroll-area").scrollTop = 0;
+    await mouseTo(page, rootRow(page, 0), 300, 40);
+    page.expireTimers(COLUMN_GLIDE_MS);
+    assert.deepStrictEqual(page.el("side-scroll").glides.map((glide) => glide.behavior), ["auto"],
+      "a reader who asks for reduced motion was given a smooth glide");
+  } finally {
+    restore();
+  }
+});
+
+test("`#261 two-column-connectors` x `#226 page-energy-profile`: one frame for a burst of scrolls, nothing written when nothing moved, and nothing at all hidden, in one column or with a thread on the right", async () => {
+  const restore = layColumnsOut();
+  try {
+    const { page } = await linkedColumns(16);
+    const left = page.el("scroll-area");
+    const right = page.el("side-scroll");
+    assert.ok(drawnLinks(page).length > 0, "no links are drawn, so this proves nothing");
+    for (let i = 0; i < 5; i += 1) {
+      await left.dispatch("scroll");
+      await right.dispatch("scroll");
+    }
+    assert.equal(page.frames.length, 1, "a burst of scrolls asked for more than one frame");
+    // A frame in which nothing moved writes nothing, and makes nothing.
+    const write = FakeElement.prototype.setAttribute;
+    let writes = 0;
+    FakeElement.prototype.setAttribute = function counted(name, value) {
+      if (this.tagName === "path") writes += 1;
+      return write.call(this, name, value);
+    };
+    const made = page.createdTags.length;
+    try {
+      await page.nextFrame();
+    } finally {
+      FakeElement.prototype.setAttribute = write;
+    }
+    assert.equal(writes, 0, "a frame in which nothing moved wrote to the links");
+    assert.equal(page.createdTags.length, made);
+    // Hidden: a scroll asks for no frame; shown again, one, and the links are drawn as they are now.
+    await page.setVisibility("hidden");
+    left.scrollTop = 0;
+    await left.dispatch("scroll");
+    assert.equal(page.frames.length, 0, "a hidden page asked for a frame to draw links in");
+    await page.setVisibility("visible");
+    assert.equal(page.frames.length, 1, "coming back to the page did not draw the links again");
+    await page.nextFrame();
+    assert.deepStrictEqual(drawnLinks(page), [], "the links were not drawn again for where the columns are now");
+    // One column: the links go at once, and a scroll asks for nothing.
+    left.scrollTop = left.scrollHeight;
+    await left.dispatch("scroll");
+    await page.nextFrame();
+    assert.ok(drawnLinks(page).length > 0);
+    await page.el("column-toggle").click();
+    await page.settle();
+    assert.deepStrictEqual(page.el("column-links").children, [], "the links stayed in one column");
+    await left.dispatch("scroll");
+    assert.equal(page.frames.length, 0, "a scroll in one column asked for a frame");
+    // Without frames at all — the fixture's ordinary page — nothing is measured for links.
+    const plain = await manyThreadColumns(4);
+    assert.deepStrictEqual(plain.page.el("column-links").children, []);
+  } finally {
+    restore();
+  }
 });
 
 // --- clearing unread in the chat service's own app ----------------------------------------------

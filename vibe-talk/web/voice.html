@@ -584,6 +584,16 @@
           </div>
 
           <!--
+            `#261 two-column-connectors`. The links between the columns: from each root on Main to its
+            thread's card on the right, right-angled through the gap between them, in the thread's
+            colour, as a diff tool joins a hunk on the left to its counterpart on the right. Empty, and
+            drawn by web/voice.js only while two columns show the cards; web/voice.css draws it only in
+            the two-column block, over the main screen, and lets every press through. A picture of what
+            the tags and the cards already say, so it is hidden from assistive technology.
+          -->
+          <svg id="column-links" aria-hidden="true" focusable="false"></svg>
+
+          <!--
             `#68 pull-to-refresh`. What the gesture SAYS while it is happening: armed, and then in
             flight. A refresh that is silent is indistinguishable from no refresh at all, which is
             the complaint the issue opens with.
@@ -1710,7 +1720,11 @@
                 activity at the bottom as in the channel, each as its name and summary when they have
                 been summarised, or else its first message; <strong>Unread only</strong> beside its
                 heading narrows the list to the threads with unread replies, and is remembered on this
-                device. A thread's <strong>Thread(N)</strong>, its <strong>N
+                device. A line in each thread's colour joins its first message on the left to its card
+                on the right while both are on screen; the message or card you select draws its line
+                even when the other end is off screen, pointing up or down to it, and if you stay on it
+                for a moment and a half the other column scrolls that end into view. A thread's
+                <strong>Thread(N)</strong>, its <strong>N
                 replies</strong> or <strong>M unread</strong>, the Threads screen and a card in that
                 list each select the thread on the right; a tap on a message still only opens or folds
                 it. The <strong>×</strong> at the top of the right column goes back to the list. The

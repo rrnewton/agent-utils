@@ -6135,8 +6135,22 @@ textarea {
 /* `#229 desktop-two-column`. Never drawn outside the block below: not on a phone, not in a narrow
    window, not in one column. First, so the block's rules for the same elements are the later ones. */
 #side-column,
+#column-links,
 #column-toggle {
   display: none;
+}
+
+/* `#261 two-column-connectors`. How a glide to a link's other end moves the column it scrolls: smoothly,
+   or at once for a reader whose system asks for less motion. The script reads this, and never the
+   query itself. */
+#screen-main {
+  --column-glide: smooth;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  #screen-main {
+    --column-glide: auto;
+  }
 }
 
 /*
@@ -6217,6 +6231,44 @@ textarea {
 
   #screen-main[data-columns="two"] > #width-grip {
     display: none;
+  }
+
+  /* `#261 two-column-connectors`. The links, over the whole main screen and in front of both lists, but
+     behind the chips and the menus, and never in the way of a press. web/voice.js draws them in the gap
+     between the columns alone, so no row is drawn over. */
+  #screen-main[data-columns="two"] > #column-links {
+    display: block;
+    position: absolute;
+    inset: 0;
+    width: 100%;
+    height: 100%;
+    overflow: hidden;
+    pointer-events: none;
+    z-index: 1;
+  }
+
+  /* In the thread's own colour, the tag's and the card edge's. Quiet, all but the selection's. */
+  #column-links .column-link {
+    fill: none;
+    stroke: hsl(var(--thread-hue, 210) 55% 50%);
+    stroke-width: 2px;
+    stroke-linejoin: round;
+    stroke-linecap: round;
+    opacity: 0.8;
+  }
+
+  #column-links .column-link-marks {
+    fill: hsl(var(--thread-hue, 210) 55% 50%);
+    stroke: none;
+    opacity: 0.8;
+  }
+
+  #column-links [data-selected] {
+    opacity: 1;
+  }
+
+  #column-links .column-link[data-selected] {
+    stroke-width: 3px;
   }
 
   /* The chips over the foot of the LEFT list: the left half's centre, as wide as its column. */
@@ -6342,10 +6394,12 @@ textarea {
   /* The threads, one card each, every card the same height: three lines of what the thread is
      about, clamped with an ellipsis, then its facts — save the card the reader is on, which shows
      all of it (below). Edged in the thread's own colour, as its tag. */
+  /* `#261 two-column-connectors`. A little further from the divider than the column's own inset, so
+     that a few of the links' lanes fit in the gap beside their arrowheads. */
   .side-cards {
     display: grid;
     gap: 0.45rem;
-    margin: 0.2rem 0 0.6rem;
+    margin: 0.2rem 0 0.6rem 1.25rem;
     padding: 0;
     list-style: none;
   }
