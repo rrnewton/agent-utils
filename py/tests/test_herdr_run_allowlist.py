@@ -416,3 +416,43 @@ def test_project_can_grant_cargo_build_explicitly() -> None:
         allow=("git", "gh", "cargo"), allow_subcommand={"cargo": ("fetch", "build")}
     )
     assert admit("cargo build", config).subcommand == "build"
+
+
+# --- HOME cannot carry an argument past the policy ---------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "home,command,named",
+    [
+        # Each of these was ALLOWED while the policy judged the token before `~` expansion and the
+        # pane ran it after: the policy saw a path, the shell ran an option or a subcommand.
+        ("--exec-path=/tmp/evil", "git ~ foo", "--exec-path"),
+        ("daemon", "git ~ foo", "git daemon"),
+        ("--upload-pack=/tmp/evil", "git fetch ~", "--upload-pack"),
+        ("-c", "git ~ core.pager=evil log", '"-c"'),
+        ("git", "~ status", "not a path"),
+        ("with-proxy", "~ git status", "not a path"),
+    ],
+)
+def test_home_cannot_smuggle_an_option_or_subcommand_past_the_policy(
+    config: Config, home: str, command: str, named: str
+) -> None:
+    with pytest.raises(Refused) as caught:
+        admit(command, config, home=home)
+    assert named in str(caught.value)
+
+
+def test_the_admitted_argv_is_the_rendered_argv(config: Config) -> None:
+    admission = admit("git -C ~/repo status", config, home="/home/u")
+    assert admission.rendered == "git -C /home/u/repo status"
+    assert admission.subcommand == "status"
+    assert admission.argv == ("git", "-C", "~/repo", "status")
+    # The expansion feeds the value-option rule as it feeds every other: `-C` takes `/tmp`.
+    admission = admit("git ~ /tmp log", config, home="-C")
+    assert admission.rendered == "git -C /tmp log"
+    assert admission.subcommand == "log"
+
+
+def test_a_home_holding_a_terminal_control_is_refused(config: Config) -> None:
+    with pytest.raises(Refused, match="terminal control U[+]001B"):
+        admit("git -C ~ log", config, home="/a\x1bb")

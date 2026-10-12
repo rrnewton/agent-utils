@@ -1,6 +1,12 @@
 //! Command admission and safe shell rendering.
+//!
+//! A leading `~` in an argument is expanded BEFORE the policy looks at it, so the policy judges the
+//! argument exactly as it will run: `git ~ foo` with `HOME=--exec-path=/tmp/evil` is judged as
+//! `git --exec-path=/tmp/evil foo` and refused, rather than admitted as a harmless-looking path and
+//! then executed as an option. The wrapper prefixes and the program are never expanded; a program
+//! spelled with a leading `~` is refused outright.
 
-use std::ffi::{CStr, CString};
+use std::ffi::{CStr, CString, OsStr, OsString};
 
 use crate::config::Config;
 use crate::error::{HerdrRunError, Result};
@@ -9,7 +15,7 @@ use crate::textfmt::quote;
 /// An admitted command together with the policy facts used to admit it.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Admission {
-    /// Full argv, including any allowed wrapper prefixes.
+    /// Full argv as split, including any allowed wrapper prefixes, before `~` expansion.
     pub argv: Vec<String>,
     /// Allowed wrapper chain preceding the program.
     pub prefix: Vec<String>,
@@ -135,7 +141,16 @@ fn control_refusal(value: &str, what: &str) -> Option<HerdrRunError> {
 }
 
 /// Admit `command` under `config`, or return a typed refusal before any pane interaction.
+///
+/// Every argument after the program is `~`-expanded first, with `HOME` read from this process's
+/// environment, and every rule judges the expanded argument, which is exactly what is rendered and
+/// run.
 pub fn admit(command: &str, config: &Config) -> Result<Admission> {
+    admit_with_home(command, config, std::env::var_os("HOME").as_deref())
+}
+
+/// [`admit`] with an explicit value for `HOME` (`None` when it is unset).
+pub fn admit_with_home(command: &str, config: &Config, home: Option<&OsStr>) -> Result<Admission> {
     if let Some(error) = control_refusal(command, "command") {
         return Err(error);
     }
@@ -184,7 +199,18 @@ pub fn admit(command: &str, config: &Config) -> Result<Admission> {
         )));
     }
 
-    let args = &rest[1..];
+    // Expanded BEFORE any rule reads them: `git ~ foo` with HOME=daemon is `git daemon foo`, and
+    // must be judged as that. A HOME that is not valid UTF-8 is a configuration error, and a home
+    // holding a control character is refused like any other argument that holds one.
+    let mut expanded_args = Vec::with_capacity(rest.len() - 1);
+    for token in &rest[1..] {
+        let expanded = expand_tilde_with(token, home)?;
+        if let Some(error) = control_refusal(&expanded, "command argument") {
+            return Err(error);
+        }
+        expanded_args.push(expanded);
+    }
+    let args = expanded_args.as_slice();
     for token in args {
         let base = token
             .split_once('=')
@@ -286,7 +312,13 @@ pub fn admit(command: &str, config: &Config) -> Result<Admission> {
             )));
         }
     }
-    let rendered = render(&argv)?;
+    let rendered = prefix
+        .iter()
+        .chain(std::iter::once(&program))
+        .chain(args)
+        .map(|token| quote_word(token))
+        .collect::<Vec<_>>()
+        .join(" ");
     Ok(Admission {
         argv,
         prefix,
@@ -335,6 +367,11 @@ fn sorted_join(values: &[String]) -> String {
 /// directory that is not valid UTF-8, leaves the token literal. Trailing slashes are dropped from
 /// the home, and an empty home expands to the remainder of the token, or `/`.
 pub fn expand_tilde(token: &str) -> Result<String> {
+    expand_tilde_with(token, std::env::var_os("HOME").as_deref())
+}
+
+/// [`expand_tilde`] with an explicit value for `HOME` (`None` when it is unset).
+pub fn expand_tilde_with(token: &str, home: Option<&OsStr>) -> Result<String> {
     if !token.starts_with('~') {
         return Ok(token.to_owned());
     }
@@ -342,11 +379,11 @@ pub fn expand_tilde(token: &str) -> Result<String> {
     let user = &token[1..slash];
     let suffix = &token[slash..];
     let home = if user.is_empty() {
-        match std::env::var_os("HOME") {
-            Some(value) => Some(value.into_string().map_err(|raw| {
+        match home.map(OsStr::to_os_string) {
+            Some(value) => Some(OsString::into_string(value).map_err(|raw| {
                 HerdrRunError::config(format!(
                     "HOME is not valid UTF-8: {}",
-                    raw.to_string_lossy()
+                    quote(&raw.to_string_lossy())
                 ))
             })?),
             None => account_home_text(None),
@@ -445,11 +482,13 @@ fn account_home_text(user: Option<&str>) -> Option<String> {
     }
 }
 
-/// Quote one argv as the exact POSIX shell word list admitted by policy.
+/// Expand a leading `~` in every token and quote each, refusing terminal controls.
 ///
-/// Rendering is fallible because a tilde expansion can introduce terminal control characters
-/// through ambient account data even when the original argv was clean, and because a `HOME` that
-/// is not valid UTF-8 is refused rather than converted lossily.
+/// [`admit`] does not call this: it expands only the arguments after the program, and judges them
+/// expanded. This is the same rendering for an argv that needs no policy. Rendering is fallible
+/// because a tilde expansion can introduce terminal control characters through ambient account
+/// data even when the original argv was clean, and because a `HOME` that is not valid UTF-8 is
+/// refused rather than converted lossily.
 pub fn render<S: AsRef<str>>(argv: &[S]) -> Result<String> {
     let mut quoted = Vec::with_capacity(argv.len());
     for token in argv {
@@ -834,6 +873,77 @@ mod tests {
 
             let error = render(&["git", command.as_str()]).expect_err("render must fail");
             assert_eq!(error.exit_code(), crate::error::EXIT_REFUSED);
+        }
+    }
+
+    /// `HOME` can no longer carry an option, a subcommand, or a program past the policy: every
+    /// argument is judged after `~` expansion, as it will run. Each repro below was ALLOWED before.
+    #[test]
+    fn home_cannot_smuggle_an_option_or_subcommand_past_the_policy() {
+        let config = Config::default();
+        let refused = |home: &str, command: &str| {
+            admit_with_home(command, &config, Some(OsStr::new(home)))
+                .expect_err("the expanded argv must be judged")
+        };
+        let error = refused("--exec-path=/tmp/evil", "git ~ foo");
+        assert_eq!(error.exit_code(), crate::error::EXIT_REFUSED);
+        assert!(error.to_string().contains("--exec-path"), "{error}");
+        let error = refused("daemon", "git ~ foo");
+        assert!(error.to_string().contains("git daemon"), "{error}");
+        let error = refused("--upload-pack=/tmp/evil", "git fetch ~");
+        assert!(error.to_string().contains("--upload-pack"), "{error}");
+        let error = refused("-c", "git ~ core.pager=evil log");
+        assert!(error.to_string().contains("\"-c\""), "{error}");
+        for home in ["git", "with-proxy"] {
+            let error = refused(home, "~ status");
+            assert!(error.to_string().contains("not a path"), "{error}");
+        }
+        // And what is admitted is exactly what is rendered.
+        let admission =
+            admit_with_home("git -C ~/repo status", &config, Some(OsStr::new("/home/u"))).unwrap();
+        assert_eq!(admission.rendered(), "git -C /home/u/repo status");
+        assert_eq!(admission.subcommand.as_deref(), Some("status"));
+        assert_eq!(admission.argv, vec!["git", "-C", "~/repo", "status"]);
+    }
+
+    /// The shared configuration-and-admission corpus, which the other edition's suite loads too.
+    #[test]
+    fn golden_policy_cases() {
+        let document: serde_json::Value =
+            serde_json::from_str(include_str!("../testdata/policy_cases.json")).expect("corpus");
+        for case in document["cases"].as_array().expect("cases") {
+            let name = case["name"].as_str().unwrap();
+            let config = match case["config"].as_str() {
+                None => Ok(Config::default()),
+                Some(text) => match crate::yaml::core_load(text) {
+                    Err(error) => Err(format!("invalid YAML: {error}")),
+                    Ok(document) => crate::config::parse_config(&document, None, "/".to_owned())
+                        .map_err(|error| error.message().to_owned()),
+                },
+            };
+            let outcome = match config {
+                Err(message) => serde_json::json!({ "config_error": message }),
+                Ok(config) => {
+                    let home = case["home"].as_str().map(OsStr::new);
+                    match admit_with_home(case["command"].as_str().unwrap(), &config, home) {
+                        Ok(admission) => serde_json::json!({ "allowed": {
+                            "program": admission.program,
+                            "subcommand": admission.subcommand,
+                            "rendered": admission.rendered(),
+                        }}),
+                        Err(error) => match error.kind() {
+                            crate::error::ErrorKind::Refused => {
+                                serde_json::json!({ "refused": error.message() })
+                            }
+                            crate::error::ErrorKind::Config => {
+                                serde_json::json!({ "config_error": error.message() })
+                            }
+                            other => panic!("{name}: unexpected {other:?}: {error}"),
+                        },
+                    }
+                }
+            };
+            assert_eq!(outcome, case["expect"], "{name}");
         }
     }
 }

@@ -11,6 +11,12 @@ Two separate jobs, deliberately not conflated:
    shell metacharacters is a proxy for "cannot start a second command"; re-quoting is the property
    itself.
 
+A leading ``~`` in an argument is expanded BEFORE the policy looks at it, so the policy judges the
+argument exactly as it will run: ``git ~ foo`` with ``HOME=--exec-path=/tmp/evil`` is judged as
+``git --exec-path=/tmp/evil foo`` and refused, rather than admitted as a harmless-looking path and
+then executed as an option. The wrapper prefixes and the program are never expanded; a program
+spelled with a leading ``~`` is refused outright.
+
 The remaining privilege is whatever the allowlisted program can do on its own. The user guide also
 explains why same-user access to Herdr makes this a safety rail rather than a containment boundary.
 """
@@ -26,7 +32,17 @@ from herdr_run.config import Config
 from herdr_run.errors import ConfigError, Refused
 from herdr_run.textfmt import quote
 
-__all__ = ["Admission", "admit", "render", "expand_tilde", "reject_terminal_controls"]
+__all__ = [
+    "Admission",
+    "admit",
+    "expand_tilde",
+    "quote_word",
+    "reject_terminal_controls",
+    "render",
+]
+
+#: Stands for "read ``HOME`` from this process's environment" where a caller may also pass a value.
+_FROM_ENVIRONMENT = object()
 
 
 def reject_terminal_controls(value: str, what: str) -> None:
@@ -44,7 +60,7 @@ def reject_terminal_controls(value: str, what: str) -> None:
 class Admission:
     """A command the policy accepted, with the reasoning kept for the audit record."""
 
-    #: Full argv as split, including any allowed prefix wrappers.
+    #: Full argv as split, including any allowed prefix wrappers, before ``~`` expansion.
     argv: tuple[str, ...]
     #: The allowed wrapper chain that preceded the program (e.g. ``("with-proxy",)``).
     prefix: tuple[str, ...]
@@ -52,7 +68,8 @@ class Admission:
     program: str
     #: The program's first non-option argument, when it has one (e.g. ``"ls-remote"``).
     subcommand: str | None
-    #: Validated shell text safe to embed in the POSIX result-capture wrapper.
+    #: Validated shell text safe to embed in the POSIX result-capture wrapper: the argv the policy
+    #: judged, after ``~`` expansion, each token quoted.
     rendered: str
 
 
@@ -72,7 +89,7 @@ def _account_home_text(user: str | None) -> str | None:
     return home
 
 
-def expand_tilde(token: str) -> str:
+def expand_tilde(token: str, home: object = _FROM_ENVIRONMENT) -> str:
     """Expand a LEADING ``~`` / ``~user`` in one token, the way a shell would.
 
     Quoting every token is what makes injection impossible, but it also suppresses the one
@@ -87,6 +104,9 @@ def expand_tilde(token: str) -> str:
     that is not valid UTF-8, leaves the token literal. Trailing slashes are dropped from the home,
     and an empty home expands to the remainder of the token, or ``/``. A tilde anywhere but the
     start is an ordinary character.
+
+    ``home`` is the value of ``HOME`` to use (``None`` when it is unset); by default it is read from
+    this process's environment.
     """
     if not token.startswith("~"):
         return token
@@ -95,31 +115,48 @@ def expand_tilde(token: str) -> str:
         slash = len(token)
     user = token[1:slash]
     suffix = token[slash:]
-    home: str | None
+    resolved: str | None
     if not user:
-        home = os.environ.get("HOME")
-        if home is None:
-            home = _account_home_text(None)
-        elif _has_surrogates(home):
-            lossy = os.fsencode(home).decode("utf-8", errors="replace")
-            raise ConfigError(f"HOME is not valid UTF-8: {lossy}")
+        value = os.environ.get("HOME") if home is _FROM_ENVIRONMENT else home
+        if value is None:
+            resolved = _account_home_text(None)
+        elif not isinstance(value, str):
+            raise TypeError("home must be a string or None")
+        elif _has_surrogates(value):
+            lossy = os.fsencode(value).decode("utf-8", errors="replace")
+            raise ConfigError(f"HOME is not valid UTF-8: {quote(lossy)}")
+        else:
+            resolved = value
     else:
-        home = _account_home_text(user)
-    if home is None:
+        resolved = _account_home_text(user)
+    if resolved is None:
         return token
-    trimmed = home.rstrip("/")
+    trimmed = resolved.rstrip("/")
     if not trimmed:
         return suffix or "/"
     return trimmed + suffix
 
 
-def render(argv: tuple[str, ...]) -> str:
-    """Quote every token so the resulting shell word list is exactly ``argv``."""
+def quote_word(token: str) -> str:
+    """Quote one word for a POSIX shell, by the rule both editions share.
+
+    A non-empty word made only of ASCII letters, digits, and ``_@%+=:,./-`` is returned unchanged;
+    anything else is wrapped in single quotes, with each ``'`` written as ``'"'"'``.
+    """
+    return shlex.quote(token)
+
+
+def render(argv: tuple[str, ...], *, home: object = _FROM_ENVIRONMENT) -> str:
+    """Expand a leading ``~`` in every token and quote each, refusing terminal controls.
+
+    :func:`admit` does not call this: it expands only the arguments after the program, and judges
+    them expanded. This is the same rendering for an argv that needs no policy.
+    """
     rendered: list[str] = []
     for token in argv:
-        expanded = expand_tilde(token)
+        expanded = expand_tilde(token, home)
         reject_terminal_controls(expanded, "command argument")
-        rendered.append(shlex.quote(expanded))
+        rendered.append(quote_word(expanded))
     return " ".join(rendered)
 
 
@@ -157,10 +194,12 @@ def _matches_denied_option(token: str, denied: str) -> bool:
     )
 
 
-def admit(command: str, config: Config) -> Admission:
+def admit(command: str, config: Config, *, home: object = _FROM_ENVIRONMENT) -> Admission:
     """Admit ``command`` under ``config``, or raise :class:`Refused` explaining exactly why.
 
-    Raises before any pane is touched, so a refusal never leaves partial state anywhere.
+    Raises before any pane is touched, so a refusal never leaves partial state anywhere. Every
+    argument after the program is ``~``-expanded first (``home`` as for :func:`expand_tilde`), and
+    every rule below judges the expanded argument, which is exactly what is rendered and run.
     """
     reject_terminal_controls(command, "command")
     argv = _split(command)
@@ -205,7 +244,14 @@ def admit(command: str, config: Config) -> Admission:
             hint = f" ({quote(program)} is a wrapper prefix, not a program)"
         raise Refused(f"program {quote(program)} is not allowlisted{hint}. Allowed: {allowed}")
 
-    args = rest[1:]
+    # Expanded BEFORE any rule reads them: `git ~ foo` with HOME=daemon is `git daemon foo`, and
+    # must be judged as that. A HOME that is not valid UTF-8 is a configuration error, and a home
+    # holding a control character is refused like any other argument that holds one.
+    args: list[str] = []
+    for token in rest[1:]:
+        expanded = expand_tilde(token, home)
+        reject_terminal_controls(expanded, "command argument")
+        args.append(expanded)
 
     for token in args:
         # Match on the option NAME so `--upload-pack=/tmp/evil` is caught as well as the
@@ -296,5 +342,5 @@ def admit(command: str, config: Config) -> Admission:
         prefix=tuple(prefix),
         program=program,
         subcommand=subcommand,
-        rendered=render(argv),
+        rendered=" ".join(quote_word(token) for token in (*prefix, program, *args)),
     )

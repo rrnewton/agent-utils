@@ -15,7 +15,7 @@ use std::sync::OnceLock;
 use regex::Regex;
 use serde_json::{json, Map, Value};
 
-use crate::allowlist::{admit, quote_word, render, Admission};
+use crate::allowlist::{admit, quote_word, Admission};
 use crate::audit;
 use crate::client::{bounded_output, exit_status_code, HerdrClient};
 use crate::config::{load_config, Config, MAX_TIMEOUT_SECONDS};
@@ -1275,8 +1275,12 @@ fn command_net_doctor(config: &Config, agent: &str) -> Result<i32> {
         argv.insert(0, "with-proxy".to_owned());
     }
     output::stdout(&format!(
-        "herdr-run net-doctor  (agent={agent}, config={})\n\n{NET_DOCTOR_SCOPE}\n",
-        config.source_path.as_deref().unwrap_or("defaults")
+        "herdr-run net-doctor  (agent={}, config={})\n\n{NET_DOCTOR_SCOPE}\n",
+        display(agent),
+        config
+            .source_path
+            .as_deref()
+            .map_or_else(|| "defaults".to_owned(), display)
     ))?;
     let log = audit::audit_path(
         Path::new(&config.project_root),
@@ -1286,34 +1290,21 @@ fn command_net_doctor(config: &Config, agent: &str) -> Result<i32> {
         Path::new(&config.project_root),
         Path::new(&config.spool_dir),
     );
-    // Rendered exactly as `run` renders a command, so the probe that is printed, audited, and
-    // executed is the probe the policy admitted, with `~` expanded the same way.
-    let probe = match render(&argv) {
-        Ok(probe) => probe,
-        Err(error) => {
-            let unexpanded = argv
-                .iter()
-                .map(|token| quote_word(token))
-                .collect::<Vec<_>>()
-                .join(" ");
-            record_audit(
-                &log,
-                agent,
-                &unexpanded,
-                error_verdict(error.kind()),
-                error.message(),
-                net_doctor_error_fields(None),
-            );
-            return Err(error);
-        }
-    };
-    let admission = match admit(&probe, config) {
+    // Admitted exactly as `run` admits a command: its words quoted as written, `~` expanded by the
+    // admission and judged expanded, so the probe that is printed, audited, and executed is the
+    // rendered line the policy admitted.
+    let command = argv
+        .iter()
+        .map(|token| quote_word(token))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let admission = match admit(&command, config) {
         Ok(admission) => admission,
         Err(error) => {
             record_audit(
                 &log,
                 agent,
-                &probe,
+                &command,
                 error_verdict(error.kind()),
                 error.message(),
                 net_doctor_error_fields(None),
@@ -1321,6 +1312,7 @@ fn command_net_doctor(config: &Config, agent: &str) -> Result<i32> {
             return Err(error);
         }
     };
+    let probe = admission.rendered().to_owned();
     let mut admitted_fields = Map::new();
     admitted_fields.insert("net_doctor".to_owned(), json!(true));
     admitted_fields.insert("rendered".to_owned(), json!(admission.rendered()));

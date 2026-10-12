@@ -1,0 +1,395 @@
+{
+  "_about": "Golden cases for configuration loading and command admission (config/allowlist in both editions). Each case is a configuration document (null for the built-in defaults), the value of HOME (null when the command does not use ~), and a command; the expectation is the admission, the refusal, or the configuration error. Configuration errors name the file <config>; YAML errors are prefixed 'invalid YAML: '. Both unit-test suites load this file.",
+  "cases": [
+    {
+      "name": "home names a denied global option",
+      "config": null,
+      "home": "--exec-path=/tmp/evil",
+      "command": "git ~ foo",
+      "expect": {
+        "refused": "global option \"--exec-path\" is denied for git: it can make git execute arbitrary code"
+      }
+    },
+    {
+      "name": "home names a denied subcommand",
+      "config": null,
+      "home": "daemon",
+      "command": "git ~ foo",
+      "expect": {
+        "refused": "subcommand \"git daemon\" is denied: it defines or runs arbitrary code"
+      }
+    },
+    {
+      "name": "home names an option denied anywhere",
+      "config": null,
+      "home": "--upload-pack=/tmp/evil",
+      "command": "git fetch ~",
+      "expect": {
+        "refused": "option \"--upload-pack=/tmp/evil\" is denied: it names a program for git to execute"
+      }
+    },
+    {
+      "name": "home names a denied option for another program",
+      "config": null,
+      "home": "--upload-pack=x",
+      "command": "gh pr view ~",
+      "expect": {
+        "refused": "option \"--upload-pack=x\" is denied: it names a program for gh to execute"
+      }
+    },
+    {
+      "name": "home names the git config option",
+      "config": null,
+      "home": "-c",
+      "command": "git ~ core.pager=evil log",
+      "expect": {
+        "refused": "global option \"-c\" is denied for git: it can make git execute arbitrary code"
+      }
+    },
+    {
+      "name": "home names cargo --config",
+      "config": "allow: [git, cargo]\nallow_subcommand:\n  cargo: [fetch]\n",
+      "home": "--config=build.rustc-wrapper=/tmp/evil",
+      "command": "cargo fetch ~",
+      "expect": {
+        "refused": "option \"--config\" is denied everywhere for cargo: it can make cargo execute arbitrary code"
+      }
+    },
+    {
+      "name": "home names cargo -Z",
+      "config": "allow: [git, cargo]\nallow_subcommand:\n  cargo: [fetch]\n",
+      "home": "-Zunstable-options",
+      "command": "cargo fetch ~",
+      "expect": {
+        "refused": "option \"-Z\" is denied everywhere for cargo: it can make cargo execute arbitrary code"
+      }
+    },
+    {
+      "name": "home names a wrapper in the program position",
+      "config": null,
+      "home": "with-proxy",
+      "command": "~ git status",
+      "expect": {
+        "refused": "program must be a bare command name resolved from PATH, not a path: \"~\""
+      }
+    },
+    {
+      "name": "home names a program in the program position",
+      "config": null,
+      "home": "git",
+      "command": "~ status",
+      "expect": {
+        "refused": "program must be a bare command name resolved from PATH, not a path: \"~\""
+      }
+    },
+    {
+      "name": "home holds a control character",
+      "config": null,
+      "home": "/a\u001bb",
+      "command": "git -C ~ log",
+      "expect": {
+        "refused": "command argument contains terminal control U+001B; control characters cannot be injected into a shared pane"
+      }
+    },
+    {
+      "name": "home names a value option",
+      "config": null,
+      "home": "-C",
+      "command": "git ~ /tmp log",
+      "expect": {
+        "allowed": {
+          "program": "git",
+          "subcommand": "log",
+          "rendered": "git -C /tmp log"
+        }
+      }
+    },
+    {
+      "name": "home after the subcommand is judged where it lands",
+      "config": null,
+      "home": "--exec-path=/x",
+      "command": "git log ~",
+      "expect": {
+        "allowed": {
+          "program": "git",
+          "subcommand": "log",
+          "rendered": "git log --exec-path=/x"
+        }
+      }
+    },
+    {
+      "name": "home path",
+      "config": null,
+      "home": "/home/u",
+      "command": "git -C ~/repo status",
+      "expect": {
+        "allowed": {
+          "program": "git",
+          "subcommand": "status",
+          "rendered": "git -C /home/u/repo status"
+        }
+      }
+    },
+    {
+      "name": "home path behind a wrapper",
+      "config": null,
+      "home": "/home/u",
+      "command": "with-proxy git -C ~ log",
+      "expect": {
+        "allowed": {
+          "program": "git",
+          "subcommand": "log",
+          "rendered": "with-proxy git -C /home/u log"
+        }
+      }
+    },
+    {
+      "name": "home trailing slashes are dropped",
+      "config": null,
+      "home": "/home/u//",
+      "command": "git -C ~ log",
+      "expect": {
+        "allowed": {
+          "program": "git",
+          "subcommand": "log",
+          "rendered": "git -C /home/u log"
+        }
+      }
+    },
+    {
+      "name": "root home",
+      "config": null,
+      "home": "/",
+      "command": "git -C ~/x log",
+      "expect": {
+        "allowed": {
+          "program": "git",
+          "subcommand": "log",
+          "rendered": "git -C /x log"
+        }
+      }
+    },
+    {
+      "name": "empty home",
+      "config": null,
+      "home": "",
+      "command": "git -C ~ log",
+      "expect": {
+        "allowed": {
+          "program": "git",
+          "subcommand": "log",
+          "rendered": "git -C / log"
+        }
+      }
+    },
+    {
+      "name": "home that needs quoting",
+      "config": null,
+      "home": "/srv/it's",
+      "command": "git log ~/x",
+      "expect": {
+        "allowed": {
+          "program": "git",
+          "subcommand": "log",
+          "rendered": "git log '/srv/it'\"'\"'s/x'"
+        }
+      }
+    },
+    {
+      "name": "tilde inside a word is literal",
+      "config": null,
+      "home": "/home/u",
+      "command": "git log a~b x/~",
+      "expect": {
+        "allowed": {
+          "program": "git",
+          "subcommand": "log",
+          "rendered": "git log 'a~b' 'x/~'"
+        }
+      }
+    },
+    {
+      "name": "default allows git",
+      "config": null,
+      "home": null,
+      "command": "git status",
+      "expect": {
+        "allowed": {
+          "program": "git",
+          "subcommand": "status",
+          "rendered": "git status"
+        }
+      }
+    },
+    {
+      "name": "default refuses curl",
+      "config": null,
+      "home": null,
+      "command": "curl https://example.invalid",
+      "expect": {
+        "refused": "program \"curl\" is not allowlisted. Allowed: gh, git"
+      }
+    },
+    {
+      "name": "default refuses git -c",
+      "config": null,
+      "home": null,
+      "command": "git -c alias.x='!sh' x",
+      "expect": {
+        "refused": "global option \"-c\" is denied for git: it can make git execute arbitrary code"
+      }
+    },
+    {
+      "name": "default refuses git daemon",
+      "config": null,
+      "home": null,
+      "command": "git daemon",
+      "expect": {
+        "refused": "subcommand \"git daemon\" is denied: it defines or runs arbitrary code"
+      }
+    },
+    {
+      "name": "default refuses a path program",
+      "config": null,
+      "home": null,
+      "command": "/bin/git status",
+      "expect": {
+        "refused": "program must be a bare command name resolved from PATH, not a path: \"/bin/git\""
+      }
+    },
+    {
+      "name": "value option skips its value",
+      "config": null,
+      "home": null,
+      "command": "git -C daemon log",
+      "expect": {
+        "allowed": {
+          "program": "git",
+          "subcommand": "log",
+          "rendered": "git -C daemon log"
+        }
+      }
+    },
+    {
+      "name": "wildcard still refuses a tilde program",
+      "config": "allow: [\"*\"]\nprefixes: []\n",
+      "home": null,
+      "command": "~root x",
+      "expect": {
+        "refused": "program must be a bare command name resolved from PATH, not a path: \"~root\""
+      }
+    },
+    {
+      "name": "escaped line separator in a deny entry",
+      "config": "allow: [git]\ndeny_global:\n  git: [\"-c\\L\", --exec-path]\n",
+      "home": null,
+      "command": "git -c core.pager=evil log",
+      "expect": {
+        "config_error": "<config>.deny_global.git[0]: \"-c\\u{2028}\" contains invisible character U+2028; a name may not contain one, because it would look like a name it is not"
+      }
+    },
+    {
+      "name": "raw line separators in deny entries",
+      "config": "allow: [git]\ndeny_global:\n  git: [-c\u2028, --exec-path\u2029]\n",
+      "home": null,
+      "command": "git -c core.pager=evil log",
+      "expect": {
+        "config_error": "invalid YAML: U+2028 is not allowed: YAML 1.1 reads it as a line break and YAML 1.2 does not at line 3 column 11"
+      }
+    },
+    {
+      "name": "zero-width space in deny_anywhere",
+      "config": "deny_anywhere: [\"--upload-pack\\u200b\"]\n",
+      "home": null,
+      "command": "git fetch --upload-pack=/tmp/evil",
+      "expect": {
+        "config_error": "<config>.deny_anywhere[0]: \"--upload-pack\\u{200b}\" contains invisible character U+200B; a name may not contain one, because it would look like a name it is not"
+      }
+    },
+    {
+      "name": "byte-order mark in value_options",
+      "config": "value_options:\n  git: [\"-C\\ufeff\"]\n",
+      "home": null,
+      "command": "git -C daemon log",
+      "expect": {
+        "config_error": "<config>.value_options.git[0]: \"-C\\u{feff}\" contains invisible character U+FEFF; a name may not contain one, because it would look like a name it is not"
+      }
+    },
+    {
+      "name": "no-break space in allow",
+      "config": "allow: [\"git\\u00a0\"]\n",
+      "home": null,
+      "command": "git status",
+      "expect": {
+        "config_error": "<config>.allow[0]: \"git\\u{a0}\" contains invisible character U+00A0; a name may not contain one, because it would look like a name it is not"
+      }
+    },
+    {
+      "name": "bidi override in prefixes",
+      "config": "prefixes: [\"with-proxy\\u202e\"]\n",
+      "home": null,
+      "command": "git status",
+      "expect": {
+        "config_error": "<config>.prefixes[0]: \"with-proxy\\u{202e}\" contains invisible character U+202E; a name may not contain one, because it would look like a name it is not"
+      }
+    },
+    {
+      "name": "bidi override in workspace",
+      "config": "workspace: \"a\\u202eb\"\n",
+      "home": null,
+      "command": "git status",
+      "expect": {
+        "config_error": "<config>.workspace: \"a\\u{202e}b\" contains invisible character U+202E; a name may not contain one, because it would look like a name it is not"
+      }
+    },
+    {
+      "name": "word joiner in tab_name",
+      "config": "tab_name: \"{agent}\\u2060\"\n",
+      "home": null,
+      "command": "git status",
+      "expect": {
+        "config_error": "<config>.tab_name: \"{agent}\\u{2060}\" contains invisible character U+2060; a name may not contain one, because it would look like a name it is not"
+      }
+    },
+    {
+      "name": "soft hyphen in a subcommand key",
+      "config": "allow_subcommand:\n  \"car\\u00adgo\": [fetch]\n",
+      "home": null,
+      "command": "git status",
+      "expect": {
+        "config_error": "<config>.allow_subcommand key: \"car\\u{ad}go\" contains invisible character U+00AD; a name may not contain one, because it would look like a name it is not"
+      }
+    },
+    {
+      "name": "ideographic space in deny_subcommand",
+      "config": "deny_subcommand:\n  git: [\"daemon\\u3000\"]\n",
+      "home": null,
+      "command": "git daemon",
+      "expect": {
+        "config_error": "<config>.deny_subcommand.git[0]: \"daemon\\u{3000}\" contains invisible character U+3000; a name may not contain one, because it would look like a name it is not"
+      }
+    },
+    {
+      "name": "tag character in shells",
+      "config": "shells: [\"bash\\U000E0041\"]\n",
+      "home": null,
+      "command": "git status",
+      "expect": {
+        "config_error": "<config>.shells[0]: \"bash\\u{e0041}\" contains invisible character U+E0041; a name may not contain one, because it would look like a name it is not"
+      }
+    },
+    {
+      "name": "visible non-ASCII names are accepted",
+      "config": "workspace: caf\u00e9\nallow: [git, caf\u00e9]\n",
+      "home": null,
+      "command": "caf\u00e9 x",
+      "expect": {
+        "allowed": {
+          "program": "caf\u00e9",
+          "subcommand": "x",
+          "rendered": "'caf\u00e9' x"
+        }
+      }
+    }
+  ]
+}

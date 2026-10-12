@@ -17,7 +17,6 @@ import json
 import math
 import os
 import re
-import shlex
 import signal
 import subprocess
 import sys
@@ -25,7 +24,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
 
 from herdr_run import __version__
-from herdr_run.allowlist import Admission, admit, render
+from herdr_run.allowlist import Admission, admit, quote_word
 from herdr_run.audit import audit_path, record, warn_if_spool_is_tracked
 from herdr_run.client import HerdrClient, bounded_control_command
 from herdr_run.config import MAX_TIMEOUT_SECONDS, Config, load_config, whole_milliseconds
@@ -1130,34 +1129,26 @@ def _cmd_net_doctor(config: Config, agent: str, environ: Mapping[str, str]) -> i
     argv = ["git", "ls-remote", config.probe_remote, "HEAD"]
     if "with-proxy" in config.prefixes:
         argv.insert(0, "with-proxy")
+    source = display(config.source_path) if config.source_path else "defaults"
     output.stdout(
-        f"herdr-run net-doctor  (agent={agent}, config={config.source_path or 'defaults'})\n"
+        f"herdr-run net-doctor  (agent={display(agent)}, config={source})\n"
         f"\n{NET_DOCTOR_SCOPE}\n"
     )
 
     log = audit_path(config.project_root, config.spool_dir)
     warn_if_spool_is_tracked(config.project_root, config.spool_dir)
-    # Rendered exactly as `run` renders a command, so the probe that is printed, audited, and
-    # executed is the probe the policy admitted, with `~` expanded the same way.
+    # Admitted exactly as `run` admits a command: its words quoted as written, `~` expanded by the
+    # admission and judged expanded, so the probe that is printed, audited, and executed is the
+    # rendered line the policy admitted.
+    command = " ".join(quote_word(token) for token in argv)
     try:
-        probe = render(tuple(argv))
+        admission = admit(command, config)
     except HerdrRunError as exc:
         _record_audit(
-            log,
-            agent,
-            shlex.join(argv),
-            type(exc).__name__.upper(),
-            str(exc),
-            _net_doctor_error_fields(),
+            log, agent, command, type(exc).__name__.upper(), str(exc), _net_doctor_error_fields()
         )
         raise
-    try:
-        admission = admit(probe, config)
-    except HerdrRunError as exc:
-        _record_audit(
-            log, agent, probe, type(exc).__name__.upper(), str(exc), _net_doctor_error_fields()
-        )
-        raise
+    probe = admission.rendered
     _record_audit(
         log,
         agent,

@@ -10,7 +10,9 @@ that changes in one edition fails the other edition's suite until both agree aga
 - ``protocol_cases.json``: Herdr protocol calls through both brokers, their argv, and their
   values or errors, including server start-up;
 - ``record_cases.json``: reap scope, evidence folded from run records, session-cache loading
-  and the exact bytes a cache store writes.
+  and the exact bytes a cache store writes;
+- ``policy_cases.json``: configuration loading and command admission, including ``~`` expanded
+  before the policy judges an argument, and names refused for holding an invisible character.
 """
 
 from __future__ import annotations
@@ -25,15 +27,25 @@ from typing import cast
 import pytest
 
 from herdr_run import __version__
+from herdr_run.allowlist import admit
+from herdr_run.cli import _Globals, _resolve_agent
 from herdr_run.client import HerdrClient
-from herdr_run.config import Config
-from herdr_run.errors import HerdrRunError
+from herdr_run.config import Config, parse_config
+from herdr_run.errors import ConfigError, HerdrRunError, Refused
 from herdr_run.readiness import assess_prompt, infer_prompt_tail
 from herdr_run.reap import evidence_from_runs
 from herdr_run.runner import make_run_id
 from herdr_run.session import Target, _load_cache, _store_cache
 from herdr_run.sweep import _scope_of
-from herdr_run.textfmt import number_text, parse_exit_marker, quote
+from herdr_run.textfmt import (
+    JSON_MAX_DEPTH,
+    display,
+    name_violation,
+    number_text,
+    parse_exit_marker,
+    quote,
+    strict_json_loads,
+)
 from herdr_run.yamlcore import YamlError, core_load
 
 _REPOSITORY = Path(__file__).resolve().parents[2]
@@ -49,6 +61,7 @@ YAML = _load("yaml_cases.json")
 READINESS = _load("readiness_cases.json")
 PROTOCOL = _load("protocol_cases.json")
 RECORDS = _load("record_cases.json")
+POLICY = _load("policy_cases.json")
 
 
 def _rows(document: dict[str, object], key: str) -> list[list[object]]:
@@ -82,10 +95,108 @@ def test_float_text(row: list[object]) -> None:
     assert repr(cast(float, value)) == expected
 
 
+@pytest.mark.parametrize("row", _rows(TEXT, "display"), ids=ascii)
+def test_display(row: list[object]) -> None:
+    value, expected = row
+    assert display(cast(str, value)) == expected
+
+
+@pytest.mark.parametrize("row", _rows(TEXT, "name_violation"), ids=ascii)
+def test_name_violation(row: list[object]) -> None:
+    value, expected = row
+    assert name_violation(cast(str, value)) == expected
+
+
+def _read_json(text: str) -> str | None:
+    try:
+        value = strict_json_loads(text)
+    except ValueError:
+        return None
+    return json.dumps(value, sort_keys=True, ensure_ascii=False)
+
+
+@pytest.mark.parametrize("row", _rows(TEXT, "json"), ids=lambda row: ascii(row)[:60])
+def test_strict_json(row: list[object]) -> None:
+    """A document read strictly and written back in the shared one-line form, or refused."""
+    text, expected = row
+    assert _read_json(cast(str, text)) == expected
+
+
+def test_strict_json_depth_limit_and_no_other_exception() -> None:
+    def nested(depth: int) -> str:
+        return "[" * depth + "]" * depth
+
+    def objects(depth: int) -> str:
+        return '{"a": ' * depth + "1" + "}" * depth
+
+    assert _read_json(nested(JSON_MAX_DEPTH - 1)) is not None
+    assert _read_json(nested(JSON_MAX_DEPTH)) is None
+    assert _read_json(objects(JSON_MAX_DEPTH - 1)) is not None
+    assert _read_json(objects(JSON_MAX_DEPTH)) is None
+    # Deep enough for the interpreter's own recursion limit, and integers too large for a float:
+    # each must be a plain refusal, never RecursionError or OverflowError.
+    assert _read_json(nested(50_000)) is None
+    for digits in (309, 310, 1000, 4300, 4301, 10_000):
+        _read_json("9" * digits)
+
+
+@pytest.mark.parametrize("row", _rows(TEXT, "agent"), ids=ascii)
+def test_agent(row: list[object]) -> None:
+    """Agent inference: one variable order, Unicode White_Space trimmed, names checked."""
+    environ, flag, expected = row
+    try:
+        outcome: dict[str, str] = {
+            "agent": _resolve_agent(
+                _Globals(agent=cast("str | None", flag)), cast(dict[str, str], environ)
+            )
+        }
+    except ConfigError as exc:
+        outcome = {"error": str(exc)}
+    assert outcome == expected
+
+
 @pytest.mark.parametrize("row", _rows(TEXT, "run_id"), ids=repr)
 def test_run_id(row: list[object]) -> None:
     agent, now, pid, expected = row
     assert make_run_id(cast(str, agent), now=float(cast(int, now)), pid=cast(int, pid)) == expected
+
+
+# --- configuration loading and admission ----------------------------------------------------------
+
+
+def _policy_outcome(config_text: str | None, home: str | None, command: str) -> dict[str, object]:
+    try:
+        document = None if config_text is None else core_load(config_text)
+        config = parse_config(document, source_path=None, project_root="/")
+    except YamlError as exc:
+        return {"config_error": f"invalid YAML: {exc}"}
+    except ConfigError as exc:
+        return {"config_error": str(exc)}
+    try:
+        admission = admit(command, config, home=home)
+    except Refused as exc:
+        return {"refused": str(exc)}
+    except ConfigError as exc:
+        return {"config_error": str(exc)}
+    return {
+        "allowed": {
+            "program": admission.program,
+            "subcommand": admission.subcommand,
+            "rendered": admission.rendered,
+        }
+    }
+
+
+@pytest.mark.parametrize(
+    "case", cast(list[dict[str, object]], POLICY["cases"]), ids=lambda case: case["name"]
+)
+def test_policy(case: dict[str, object]) -> None:
+    outcome = _policy_outcome(
+        cast("str | None", case["config"]),
+        cast("str | None", case["home"]),
+        cast(str, case["command"]),
+    )
+    assert outcome == case["expect"]
 
 
 # --- the configuration YAML subset ----------------------------------------------------------------
