@@ -1,10 +1,11 @@
 ---
 title: 'compose-draft-loss: never lose a half-typed message to a screen change or a killed app'
-status: open
+status: closed
 priority: 1
 issue_type: bug
 created_at: 2026-10-04T10:17:42.349350643+00:00
-updated_at: 2026-10-04T10:17:42.349350643+00:00
+updated_at: 2026-10-12T23:36:19.912110250+00:00
+closed_at: 2026-10-12T23:36:19.912110120+00:00
 ---
 
 # Description

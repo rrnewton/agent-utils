@@ -1,10 +1,11 @@
 ---
 title: 'two-column-polish: follow-ups from the #229 desktop-two-column review'
-status: open
+status: closed
 priority: 2
 issue_type: task
 created_at: 2026-10-10T02:34:59.748116360+00:00
-updated_at: 2026-10-10T02:34:59.748116360+00:00
+updated_at: 2026-10-12T23:36:19.916171501+00:00
+closed_at: 2026-10-12T23:36:19.916171391+00:00
 ---
 
 # Description
