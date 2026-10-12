@@ -78,15 +78,29 @@ pub fn exit_status_code(status: ExitStatus) -> i32 {
 /// tries to prompt on `/dev/tty` fails at once instead of stopping in the background until the
 /// bound expires, and killing the session's process group on timeout also reaches descendants
 /// that inherited the captured pipes.
+///
+/// The bound covers the PIPES as well as the child: a command whose own process has exited while
+/// a descendant still holds stdout or stderr open has not finished, and at the deadline the whole
+/// process group is killed exactly as for a child that is still running. The child is reaped only
+/// once both pipes have closed, so its process-group ID cannot be reused by an unrelated group
+/// before that kill. This is how the other edition's `communicate(timeout=...)` behaves.
+///
+/// The child also starts with SIGXFSZ at its default action, as the other edition's children do:
+/// this process ignores SIGXFSZ (see [`crate::cli::prepare_process`]), and an ignored disposition
+/// would otherwise be inherited across `exec`.
 pub(crate) fn bounded_output(
     command: &mut Command,
     timeout: Duration,
 ) -> io::Result<BoundedOutput> {
     command.stdout(Stdio::piped()).stderr(Stdio::piped());
-    // SAFETY: `setsid` is async-signal-safe and is the only call made between fork and exec.
+    // SAFETY: `setsid` and `signal` are async-signal-safe, and they are the only calls made
+    // between fork and exec.
     unsafe {
         command.pre_exec(|| {
             if libc::setsid() < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            if libc::signal(libc::SIGXFSZ, libc::SIG_DFL) == libc::SIG_ERR {
                 return Err(io::Error::last_os_error());
             }
             Ok(())
@@ -111,22 +125,39 @@ pub(crate) fn bounded_output(
         stderr.read_to_end(&mut bytes).map(|_| bytes)
     });
     let deadline = Instant::now().checked_add(timeout);
+    let expired = || deadline.is_some_and(|value| Instant::now() >= value);
+    let kill_and_fail = |child: &mut std::process::Child| {
+        // The child leads a fresh session and process group. Killing the group also closes pipes
+        // inherited by descendants, so reader threads cannot keep this path blocked.
+        // SAFETY: `kill` has no pointer arguments; the group is the unreaped child's own.
+        let _ = unsafe { libc::kill(-(child_pid as i32), libc::SIGKILL) };
+        let _ = child.kill();
+        let _ = child.wait();
+        io::Error::new(
+            io::ErrorKind::TimedOut,
+            format!("control command timed out after {}s", timeout.as_secs()),
+        )
+    };
+    // Both pipes to end of file first, with the child left unreaped.
+    while !(stdout_reader.is_finished() && stderr_reader.is_finished()) {
+        if expired() {
+            let error = kill_and_fail(&mut child);
+            let _ = stdout_reader.join();
+            let _ = stderr_reader.join();
+            return Err(error);
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    // Then the exit status, within the same deadline.
     let status = loop {
         if let Some(status) = child.try_wait()? {
             break status;
         }
-        if deadline.is_some_and(|value| Instant::now() >= value) {
-            // The child leads a fresh session and process group. Killing the group also closes
-            // pipes inherited by descendants, so reader threads cannot keep this path blocked.
-            let _ = unsafe { libc::kill(-(child_pid as i32), libc::SIGKILL) };
-            let _ = child.kill();
-            let _ = child.wait();
+        if expired() {
+            let error = kill_and_fail(&mut child);
             let _ = stdout_reader.join();
             let _ = stderr_reader.join();
-            return Err(io::Error::new(
-                io::ErrorKind::TimedOut,
-                format!("control command timed out after {}s", timeout.as_secs()),
-            ));
+            return Err(error);
         }
         thread::sleep(Duration::from_millis(10));
     };
@@ -1088,6 +1119,62 @@ mod tests {
     use std::sync::Mutex;
 
     use super::*;
+
+    /// The direct child exiting is not the command finishing while a descendant holds its output:
+    /// the deadline covers the pipes, and the whole group is killed at it, descendant included.
+    #[test]
+    fn the_deadline_covers_a_descendant_holding_the_pipes() {
+        let directory = std::env::temp_dir().join(format!(
+            "herdr-run-pipe-holder-{}-{:?}",
+            std::process::id(),
+            thread::current().id()
+        ));
+        fs::create_dir_all(&directory).unwrap();
+        let pid_path = directory.join("holder.pid");
+        let mut command = Command::new("/bin/sh");
+        command
+            .arg("-c")
+            .arg("/usr/bin/sleep 60 & printf '%s' \"$!\" > \"$1\"; exit 0")
+            .arg("pipe-holder")
+            .arg(&pid_path);
+        let started = Instant::now();
+        let error = bounded_output(&mut command, Duration::from_millis(500))
+            .err()
+            .expect("a held pipe must time out");
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert!(started.elapsed() < Duration::from_secs(10));
+        let holder: i32 = fs::read_to_string(&pid_path).unwrap().parse().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            // Gone, or a zombie waiting for its reaper: either way it is no longer running.
+            let finished =
+                fs::read_to_string(format!("/proc/{holder}/stat")).map_or(true, |stat| {
+                    stat.rsplit_once(") ")
+                        .is_some_and(|(_, rest)| rest.starts_with('Z'))
+                });
+            if finished {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the descendant {holder} is still running"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// A child starts with SIGXFSZ at its default action even when this process ignores it.
+    #[test]
+    fn a_child_gets_the_default_sigxfsz_action() {
+        let mut command = Command::new("/bin/sh");
+        command.arg("-c").arg("grep '^SigIgn:' /proc/self/status");
+        let output = bounded_output(&mut command, Duration::from_secs(10)).unwrap();
+        let line = String::from_utf8(output.stdout).unwrap();
+        let mask =
+            u64::from_str_radix(line.trim().trim_start_matches("SigIgn:").trim(), 16).unwrap();
+        assert_eq!(mask & (1 << (libc::SIGXFSZ - 1)), 0, "{line}");
+    }
 
     static TEMPORARY_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 

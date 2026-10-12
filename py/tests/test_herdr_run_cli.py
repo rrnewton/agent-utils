@@ -1134,3 +1134,116 @@ def test_explicit_empty_cwd_means_the_project_root() -> None:
     from herdr_run.config import Config
 
     assert _resolved_cwd(Config(project_root="/project", cwd="configured"), "") == "/project"
+
+
+# --- the process the interpreter hands over ---------------------------------------------------
+
+
+def test_the_utf8_restart_takes_the_command_line_and_environment_from_proc(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The restart passes the original bytes on; nothing the locale decoded is encoded back.
+
+    Under a multibyte locale such as ja_JP.eucJP, encoding ``sys.argv`` back raised
+    UnicodeEncodeError for an argument holding UTF-8 text, before any output.
+    """
+    command = [b"/usr/bin/python3", b"-m", b"herdr_run", b"check", "git 日本".encode(), b"\xff", b""]
+    environment = [b"LC_ALL=ja_JP.eucJP", b"HOME=/h", b"NOEQUALS", b"HOME=/second"]
+    captured: dict[str, object] = {}
+
+    def strings(name: str) -> list[bytes]:
+        return command if name == "cmdline" else environment
+
+    def execve(path: str, argv: list[object], env: dict[bytes, bytes]) -> None:
+        captured.update(path=path, argv=argv, env=env)
+
+    monkeypatch.setattr(cli_module, "_proc_self_strings", strings)
+    monkeypatch.setattr(os, "execve", execve)
+    # What the locale made of the arguments must not matter: these cannot be encoded back at all.
+    monkeypatch.setattr(sys, "argv", ["herdr-run", "check", "git \udc80\ud800"])
+    cli_module._restart_in_utf8_mode(["-m", "herdr_run"])
+    assert captured["argv"] == [command[0], b"-X", b"utf8", *command[1:]]
+    # The first of two entries with one name wins, and an entry without '=' is skipped, as for
+    # os.environ; nothing is added, so PEP 538's LC_CTYPE cannot reach the restarted process.
+    assert captured["env"] == {b"LC_ALL": b"ja_JP.eucJP", b"HOME": b"/h"}
+
+
+def test_the_utf8_restart_is_skipped_when_the_command_line_turns_utf8_mode_off(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    for disabled in ([b"python3", b"-X", b"utf8=0", b"-m", b"herdr_run"], [b"python3", b"-Xutf8=0"]):
+        monkeypatch.setattr(cli_module, "_proc_self_strings", lambda name, d=disabled: d)
+        monkeypatch.setattr(os, "execve", lambda *args: pytest.fail("restarted into a loop"))
+        cli_module._restart_in_utf8_mode(["-m", "herdr_run"])
+
+
+def test_the_environment_is_put_back_to_the_one_executed_with(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("LC_CTYPE", "C.UTF-8")
+    monkeypatch.setenv("HERDR_RUN_TEST_KEPT", "changed")
+    monkeypatch.delenv("HERDR_RUN_TEST_GONE", raising=False)
+    original = dict(os.environb)
+    del original[b"LC_CTYPE"]
+    original[b"HERDR_RUN_TEST_KEPT"] = b"original"
+    original[b"HERDR_RUN_TEST_GONE"] = b"\xffback"
+    cli_module._restore_environment(original)
+    assert "LC_CTYPE" not in os.environ
+    assert os.environ["HERDR_RUN_TEST_KEPT"] == "original"
+    assert os.environb[b"HERDR_RUN_TEST_GONE"] == b"\xffback"
+    assert dict(os.environb) == original
+
+
+def test_proc_strings_keep_empty_arguments_and_an_empty_environment(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: object
+) -> None:
+    payloads = {"cmdline": b"python3\0-m\0herdr_run\0check\0\0", "environ": b""}
+
+    class Handle(io.BytesIO):
+        def __enter__(self) -> "Handle":
+            return self
+
+        def __exit__(self, *exc: object) -> None:
+            self.close()
+
+    def fake_open(path: str, mode: str = "r", *args: object, **kwargs: object) -> Handle:
+        assert mode == "rb"
+        return Handle(payloads[path.rsplit("/", 1)[1]])
+
+    monkeypatch.setattr("builtins.open", fake_open)
+    assert cli_module._proc_self_strings("cmdline") == [b"python3", b"-m", b"herdr_run", b"check", b""]
+    assert cli_module._proc_self_strings("environ") == []
+
+
+def test_a_short_buffered_write_is_retried_until_it_fails_or_completes() -> None:
+    """A buffer may report fewer bytes than it was given without raising; the rest is retried."""
+
+    class ShortBuffer:
+        def __init__(self, failure: OSError | None) -> None:
+            self.written = b""
+            self.failure = failure
+
+        def write(self, data: memoryview) -> int:
+            if self.written and self.failure is not None:
+                raise self.failure
+            chunk = bytes(data[:3])
+            self.written += chunk
+            return len(chunk)
+
+        def flush(self) -> None:
+            pass
+
+    class Stream:
+        def __init__(self, buffer: ShortBuffer) -> None:
+            self.buffer = buffer
+
+        def flush(self) -> None:
+            pass
+
+    complete = ShortBuffer(None)
+    output_module._write(cast("io.TextIOWrapper", Stream(complete)), 1, b"0123456789")
+    assert complete.written == b"0123456789"
+
+    full = ShortBuffer(OSError(27, "File too large"))
+    with pytest.raises(OSError, match="File too large"):
+        output_module._write(cast("io.TextIOWrapper", Stream(full)), 1, b"0123456789")

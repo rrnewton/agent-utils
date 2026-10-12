@@ -112,6 +112,35 @@ def test_control_timeout_terminates_descendants(
     pytest.fail(f"timed-out descendant {descendant_pid} is still running")
 
 
+def test_control_timeout_covers_a_descendant_holding_the_pipes(tmp_path: object) -> None:
+    """The direct child exiting is not the command finishing while a descendant holds its output.
+
+    The bound covers the pipes: at the deadline the process group is killed, the descendant with
+    it, and the call times out rather than waiting for the descendant to let go.
+    """
+    pid_path = os.path.join(str(tmp_path), "holder.pid")
+    program = '/usr/bin/sleep 60 & printf "%s" "$!" > "$1"; exit 0'
+    started = time.monotonic()
+    with pytest.raises(subprocess.TimeoutExpired):
+        client_module.bounded_control_command(
+            ("/bin/sh", "-c", program, "pipe-holder", pid_path), timeout=0.5
+        )
+    assert time.monotonic() - started < 10
+    with open(pid_path, encoding="ascii") as handle:
+        holder = int(handle.read())
+    deadline = time.monotonic() + 2.0
+    while time.monotonic() < deadline:
+        try:
+            with open(f"/proc/{holder}/stat", encoding="ascii") as handle:
+                state = handle.read().rpartition(") ")[2][:1]
+        except (FileNotFoundError, ProcessLookupError):
+            return
+        if state == "Z":
+            return
+        time.sleep(0.01)
+    pytest.fail(f"the descendant {holder} holding the pipes is still running")
+
+
 def test_fixed_candidate_ignores_a_planted_caller_path(
     tmp_path: object, monkeypatch: pytest.MonkeyPatch
 ) -> None:

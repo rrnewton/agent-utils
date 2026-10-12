@@ -1456,39 +1456,154 @@ def _dispatch(invocation: _Invocation, environ: Mapping[str, str]) -> int:
     raise AssertionError(f"unhandled subcommand {invocation.subcommand!r}")
 
 
+def _proc_self_strings(name: str) -> list[bytes] | None:
+    """The NUL-separated byte strings of ``/proc/self/<name>``, or ``None`` when it is unreadable.
+
+    ``cmdline`` and ``environ`` hold exactly what this process was executed with, as bytes: no
+    locale has decoded them, and nothing the interpreter did at start-up has changed them.
+    """
+    try:
+        with open(f"/proc/self/{name}", "rb") as handle:
+            payload = handle.read()
+    except OSError:
+        return None
+    if not payload:
+        return []
+    if payload.endswith(b"\0"):
+        payload = payload[:-1]
+    return payload.split(b"\0")
+
+
+def _original_environment() -> dict[bytes, bytes] | None:
+    """The environment this process was executed with, read the way ``os.environ`` reads it.
+
+    ``None`` when ``/proc/self/environ`` cannot be read. An entry without ``=`` (or with an empty
+    name) is skipped and the first of two entries with one name wins, as for ``os.environ``.
+    """
+    entries = _proc_self_strings("environ")
+    if entries is None:
+        return None
+    environment: dict[bytes, bytes] = {}
+    for entry in entries:
+        key, separator, value = entry.partition(b"=")
+        if separator and key:
+            environment.setdefault(key, value)
+    return environment
+
+
+def _restore_environment(original: Mapping[bytes, bytes]) -> None:
+    """Make this process's environment, and so every child's, the one it was executed with.
+
+    The interpreter may have changed it before any of this code ran: PEP 538 locale coercion adds
+    ``LC_CTYPE=C.UTF-8`` when the locale is ``C``, and children would inherit that. The native
+    edition passes its caller's environment on unchanged, so this one does too.
+    """
+    current = os.environb
+    for key in list(current):
+        if key not in original:
+            try:
+                del current[key]
+            except (OSError, ValueError):
+                pass
+    for key, value in original.items():
+        if current.get(key) != value:
+            try:
+                current[key] = value
+            except (OSError, ValueError):
+                pass
+
+
+def _utf8_mode_disabled(command: Sequence[bytes]) -> bool:
+    """True when the command line itself turns UTF-8 mode off, which a restart could not undo."""
+    for index, argument in enumerate(command):
+        if argument == b"-Xutf8=0":
+            return True
+        if argument == b"-X" and index + 1 < len(command) and command[index + 1] == b"utf8=0":
+            return True
+    return False
+
+
+def _restart_in_utf8_mode(reexec: Sequence[str]) -> None:
+    """Re-execute this interpreter once with ``-X utf8``, exactly as it was started otherwise.
+
+    The command line and the environment are taken from ``/proc/self`` as bytes. Rebuilding them
+    from ``sys.argv`` would mean encoding back what the locale decoded, which a multibyte locale
+    such as ``ja_JP.eucJP`` cannot always do: it raised UnicodeEncodeError for an argument holding
+    UTF-8 text. When ``/proc`` is unavailable, the fallback rebuilds the command from ``sys.argv``
+    and ``reexec`` and keeps running in the locale's encoding if that cannot be encoded.
+    """
+    executable = sys.executable
+    command = _proc_self_strings("cmdline")
+    environment = _original_environment()
+    if command:
+        if _utf8_mode_disabled(command):
+            return
+        argv: list[bytes | str] = [command[0], b"-X", b"utf8", *command[1:]]
+    else:
+        try:
+            argv = [
+                os.fsencode(executable),
+                b"-X",
+                b"utf8",
+                *(os.fsencode(argument) for argument in (*reexec, *sys.argv[1:])),
+            ]
+        except (UnicodeError, ValueError):
+            return
+    try:
+        if environment is None:
+            os.execv(executable, argv)
+        else:
+            os.execve(executable, argv, environment)
+    except (OSError, ValueError):
+        return
+
+
 def _prepare_process(reexec: Sequence[str]) -> None:
     """Make this interpreter behave as the native edition's runtime does, before anything runs.
 
     * A closed standard descriptor is reopened on ``/dev/null``, as the native runtime does before
-      ``main``: output to it is discarded, never an error and never a write into a file that
-      happened to receive the descriptor number.
+      ``main``, and left inheritable as it leaves it: output to it is discarded, never an error and
+      never a write into a file that happened to receive the descriptor number, and a child finds
+      ``/dev/null`` there too rather than a closed descriptor.
     * When the locale selected a filesystem encoding other than UTF-8, the process re-executes
-      once with ``-X utf8``: arguments, environment values, paths, and output are then UTF-8
-      whatever the locale, as they are in the native edition, and bytes that are not UTF-8 are
-      visible and refusable rather than silently reinterpreted.
-    * SIGINT keeps its default action, so an interrupt ends the process BY the signal, which is
-      what lets a calling loop stop instead of carrying on.
+      once with ``-X utf8`` (:func:`_restart_in_utf8_mode`): arguments, environment values, paths,
+      and output are then UTF-8 whatever the locale, as they are in the native edition, and bytes
+      that are not UTF-8 are visible and refusable rather than silently reinterpreted.
+    * The environment is put back to the one this process was executed with
+      (:func:`_restore_environment`), so children see the caller's environment unchanged.
+    * SIGINT gets its default action when the interpreter installed its own handler, so an
+      interrupt ends the process BY the signal, which is what lets a calling loop stop instead of
+      carrying on. A SIGINT the caller ignored stays ignored, as it does in the native edition.
+
+    SIGXFSZ stays ignored, as the interpreter set it (and the native edition sets it), and the
+    children ``subprocess`` starts get it, and SIGPIPE, back at their default actions and inherit
+    no descriptor above 2.
     """
     for descriptor in (0, 1, 2):
         try:
             os.fstat(descriptor)
         except OSError:
             try:
-                os.open(os.devnull, os.O_RDWR)
+                reopened = os.open(os.devnull, os.O_RDWR)
+                os.set_inheritable(reopened, True)
             except OSError:
                 pass
     encoding = sys.getfilesystemencoding().lower().replace("-", "").replace("_", "")
     if encoding != "utf8" and not sys.flags.utf8_mode and sys.executable:
-        os.execv(sys.executable, [sys.executable, "-X", "utf8", *reexec, *sys.argv[1:]])
-    signal.signal(signal.SIGINT, signal.SIG_DFL)
+        _restart_in_utf8_mode(reexec)
+    original = _original_environment()
+    if original is not None:
+        _restore_environment(original)
+    if signal.getsignal(signal.SIGINT) is signal.default_int_handler:
+        signal.signal(signal.SIGINT, signal.SIG_DFL)
 
 
 def main(argv: Sequence[str] | None = None, *, reexec: Sequence[str] | None = None) -> int:
     """Entry point. Return the wrapped status or the documented code for a wrapper failure.
 
     ``reexec`` is what follows the interpreter to run this same entry point again (a script path,
-    or ``-m herdr_run``) when the process must restart in UTF-8 mode; it defaults to the script
-    the interpreter was started with.
+    or ``-m herdr_run``) when the process must restart in UTF-8 mode and ``/proc/self/cmdline``
+    cannot be read; it defaults to the script the interpreter was started with.
     """
     if argv is None:
         _prepare_process(reexec if reexec is not None else [sys.argv[0]])

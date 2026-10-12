@@ -34,12 +34,24 @@ def _encode(text: str) -> bytes:
 
 
 def _write(stream: TextIO | None, descriptor: int, payload: bytes) -> None:
-    """Write ``payload`` through ``stream``'s buffer, or straight to the descriptor without one."""
+    """Write all of ``payload`` through ``stream``'s buffer, or to the descriptor without one.
+
+    A buffered write can be SHORT without raising: past ``RLIMIT_FSIZE`` (SIGXFSZ is ignored, so
+    the write fails with EFBIG instead of killing the process), or when a disk fills mid-write, the
+    buffer reports the bytes it did write and drops the rest. So the remainder is written again
+    until it is all written or the retry raises the error, as the native edition's ``write_all``
+    does; a write that makes no progress at all fails as ``write_all`` reports it.
+    """
     buffer = getattr(stream, "buffer", None) if stream is not None else None
     if buffer is not None:
         assert stream is not None
         stream.flush()
-        buffer.write(payload)
+        view = memoryview(payload)
+        while view:
+            written = buffer.write(view)
+            if not written:
+                raise OSError("failed to write whole buffer")
+            view = view[written:]
         buffer.flush()
         return
     if stream is not None:
@@ -52,6 +64,8 @@ def _write(stream: TextIO | None, descriptor: int, payload: bytes) -> None:
             written = os.write(descriptor, view)
         except InterruptedError:
             continue
+        if not written:
+            raise OSError("failed to write whole buffer")
         view = view[written:]
 
 

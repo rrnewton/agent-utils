@@ -152,6 +152,63 @@ impl From<HerdrRunError> for ParseFailure {
 
 type Parsed<T> = std::result::Result<T, ParseFailure>;
 
+/// Make this process behave as the other edition's runtime does, before anything runs.
+///
+/// Called by the executable before [`main`]; tests that drive [`main`] in-process do not call it.
+///
+/// * SIGXFSZ is ignored, as CPython ignores it at start-up: a write past `RLIMIT_FSIZE` then fails
+///   with EFBIG and is reported as `cannot write stdout: File too large (os error 27)` instead of
+///   killing the process. Children get the default action back in
+///   [`crate::client::bounded_output`].
+/// * Every descriptor above 2 inherited from the caller is marked close-on-exec, so no child
+///   inherits it, just as the other edition's children (started with `close_fds`) do not. Every
+///   descriptor this process opens itself is close-on-exec already.
+///
+/// SIGINT is left as it was inherited, and closed standard descriptors were already reopened on
+/// `/dev/null` (inheritably) by the runtime before `main`.
+pub fn prepare_process() {
+    // SAFETY: `signal` with a constant disposition has no pointer arguments.
+    unsafe {
+        libc::signal(libc::SIGXFSZ, libc::SIG_IGN);
+    }
+    mark_inherited_descriptors_close_on_exec();
+}
+
+fn mark_inherited_descriptors_close_on_exec() {
+    #[cfg(target_os = "linux")]
+    {
+        // SAFETY: `close_range` takes plain integers; with CLOSE_RANGE_CLOEXEC it closes nothing.
+        let marked = unsafe {
+            libc::syscall(
+                libc::SYS_close_range,
+                3 as libc::c_uint,
+                libc::c_uint::MAX,
+                libc::CLOSE_RANGE_CLOEXEC,
+            )
+        } == 0;
+        if marked {
+            return;
+        }
+    }
+    // Kernels before 5.11: list the descriptors, then mark each one.
+    let Ok(entries) = std::fs::read_dir("/proc/self/fd") else {
+        return;
+    };
+    let descriptors: Vec<libc::c_int> = entries
+        .filter_map(|entry| entry.ok()?.file_name().to_str()?.parse().ok())
+        .filter(|descriptor| *descriptor > 2)
+        .collect();
+    for descriptor in descriptors {
+        // SAFETY: `fcntl` on a descriptor number; one that has closed meanwhile returns EBADF.
+        unsafe {
+            let flags = libc::fcntl(descriptor, libc::F_GETFD);
+            if flags >= 0 {
+                libc::fcntl(descriptor, libc::F_SETFD, flags | libc::FD_CLOEXEC);
+            }
+        }
+    }
+}
+
 /// Run the CLI over an argument iterator and return the desired process status.
 pub fn main<I>(arguments: I) -> i32
 where
