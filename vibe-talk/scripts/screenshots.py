@@ -2123,12 +2123,23 @@ def _act_nested_lists(driver: Driver) -> None:
 # `#244 elision-word-count`. The folded messages on screen, each tagged with the count under it, the
 # largest and the smallest of them named so the expectations can say which is which.
 ELISION_PROBES_JS = (
-    "(() => { const rows = [...document.querySelectorAll('#discord-log > li')].filter((n) => "
-    "n.getAttribute('data-collapsed') === 'true' && n.querySelector(':scope > .elided')); "
-    "const count = (n) => Number((/\\d+/.exec(n.querySelector(':scope > .elided').textContent) "
-    "|| ['0'])[0]); "
-    "if (rows.length < 2) return false; rows.sort((a, b) => count(a) - count(b)); "
-    "rows[0].id = 'elision-probe-small'; rows[rows.length - 1].id = 'elision-probe-large'; "
+    # The label the stylesheet shows for the row's width: the line carries one per width class.
+    "(() => { window.__elided = (n) => { const line = n && n.querySelector(':scope > .elided'); "
+    "const shown = line ? [...line.children].filter((s) => getComputedStyle(s).display !== 'none') : []; "
+    "return shown.length === 1 ? shown[0].textContent : ''; }; "
+    "const rows = [...document.querySelectorAll('#discord-log > li')].filter((n) => "
+    "n.getAttribute('data-collapsed') === 'true' && window.__elided(n)); "
+    "const count = (n) => Number((/\\d+/.exec(window.__elided(n)) || ['0'])[0]); "
+    "if (rows.length < 2) return false; "
+    # The wall, and the labelled message hiding least of those that can share the screen with it.
+    "const large = rows.reduce((a, b) => (count(b) > count(a) ? b : a)); "
+    "const room = document.getElementById('scroll-area').clientHeight - 48; "
+    "const l = large.getBoundingClientRect(); "
+    "const near = rows.filter((n) => { const r = n.getBoundingClientRect(); "
+    "return n !== large && Math.max(r.bottom, l.bottom) - Math.min(r.top, l.top) <= room; }); "
+    "if (near.length === 0) return false; "
+    "const small = near.reduce((a, b) => (count(b) < count(a) ? b : a)); "
+    "small.id = 'elision-probe-small'; large.id = 'elision-probe-large'; "
     "return true; })()"
 )
 
@@ -2142,9 +2153,15 @@ def _act_elision_word_count(driver: Driver) -> None:
     """
     _act_open_channel(driver)
     driver.js(ELISION_PROBES_JS)
+    # The upper of the two a little below the top of the list, so both are on the screen together:
+    # not flush with it, where a phone's fractional scroll can leave its edge a fraction above.
     driver.js(
-        "(() => { const small = document.getElementById('elision-probe-small'); "
-        "if (small) small.scrollIntoView({ block: 'start' }); return true; })()"
+        "(() => { const pair = ['elision-probe-small', 'elision-probe-large']"
+        ".map((id) => document.getElementById(id)).filter(Boolean); "
+        "if (pair.length < 2) return false; pair.sort((a, b) => a.getBoundingClientRect().top - "
+        "b.getBoundingClientRect().top); const area = document.getElementById('scroll-area'); "
+        "area.scrollTop += pair[0].getBoundingClientRect().top - area.getBoundingClientRect().top - 24; "
+        "return true; })()"
     )
     driver.settle(300)
 
@@ -4731,16 +4748,16 @@ SCENES: tuple[Scene, ...] = (
                 "const b = r.getBoundingClientRect(); return b.top >= 0 && b.bottom <= innerHeight; }); })()",
             ),
             (
-                "each says how many words it hides, in the form '(~N more words)'",
+                "each says how many words it hides, in the form '(~N more words)', one label for its width",
                 "['elision-probe-small', 'elision-probe-large'].every((id) => "
-                "/^\\(~\\d+ more words?\\)$/.test(document.querySelector(`#${id} > .elided`).textContent))",
+                "/^\\(~\\d+ more words\\)$/.test(window.__elided(document.getElementById(id))))",
             ),
             (
                 # The difference the owner could not see: tens of words under one, hundreds under the
                 # other.
                 "the counts tell a few hidden words from a wall of them",
-                "(() => { const n = (id) => Number(/\\d+/.exec(document.querySelector(`#${id} > .elided`)"
-                ".textContent)[0]); return n('elision-probe-small') < 60 && n('elision-probe-large') >= 100; })()",
+                "(() => { const n = (id) => Number(/\\d+/.exec(window.__elided(document.getElementById(id)))[0]); "
+                "return n('elision-probe-small') < 60 && n('elision-probe-large') >= 100; })()",
             ),
             (
                 # THE layout claim the page suite cannot make: the count is drawn, on one line, under

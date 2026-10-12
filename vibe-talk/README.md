@@ -3073,14 +3073,29 @@ again brings it back. It is under the message text in the transcript and in the 
 combined from several messages, and on a body the server rendered, where the words counted are the
 ones on the screen (a link counts as its text, never as its address).
 
-The number is an **estimate**, and the `~` says so. The fold is a three-line CSS clamp, so where the
-cut falls depends on the row's width, the text size and the browser's line breaking; asking the
-layout engine row by row would put a forced layout per long message back into every redraw. The page
-instead works the count out once, when the row is built, from the text and a phone's line length:
-about fifty characters to a line, each paragraph or list item starting a line of its own. That was
-measured in Chromium at 393 to 412 pixels, where it is within a few words; a desk's column holds more
-per line, so there the count can run high by up to about twenty. It is rounded as an estimate is:
-exact under twenty, then to five, ten, and a hundred.
+The number is a **floor**, and the `~` says it is an estimate. The fold is a three-line CSS clamp, so
+where the cut falls depends on the row's width, the text size and the browser's line breaking; asking
+the layout engine row by row would put a forced layout per long message back into every redraw. So
+the page works the count out once, when the row is built, from the text alone — for **every width a
+line can be**, twenty classes from a narrow phone at the largest text size to a wide desk — and the
+line under the text, a CSS size container as wide as the text and at its size, shows the label for the
+class the row is drawn in: a phone, a desk's column, one of two columns, a reply's inset, the reader's
+text size. Each count is taken at the widest line of its class with every character at the narrow end
+of the common interface fonts, so it can say fewer words than are hidden and never more; under ten it
+says nothing at all. Rounded down: exact under twenty, then to five, ten and a hundred. The first
+version used a phone's line everywhere, and on a desk said words were hidden under a message three
+desk lines held whole.
+
+**Text poor in spaces is counted in characters.** Chinese or Japanese has no spaces to count words
+by, and a long bare address is one word, so a clamp hiding most of either would have hidden "no
+words". Where what is hidden runs to more than twelve characters a word, the line says
+`(~400 more characters)` instead (and nothing under sixty). On a row with a rich header (`#242
+rich-headers`) the words the header restates are counted out while it shows them, and back in with the
+switch off.
+
+`tests/elision_browser.py` (DAG step `elision-browser`) holds every label to what the clamp really
+hides, found by the rects of the characters in Chromium, in seven layouts: phones at 360 and 412 pixels,
+412 at 80% and 150% text, a 1280 desk, the widest reading column, and two columns.
 
 ### A long message can be read as a summary of itself
 

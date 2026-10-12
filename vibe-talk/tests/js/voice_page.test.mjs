@@ -629,6 +629,11 @@ class FakeElement {
     if (fixed !== null) {
       return fixed;
     }
+    // `#244 elision-word-count`. The line under a folded message carries a label for every width
+    // class and web/voice.css shows one of them, so it is one line however many it carries.
+    if (this.hasClass("elided")) {
+      return this.children.length ? LINE_PX : 0;
+    }
     if (this.hasClass("clamped")) {
       return Math.min(this.contentHeight(), CLAMP_LINES * LINE_PX);
     }
@@ -3071,10 +3076,17 @@ const TUNING_BANDS = {
   FOLD_LINES: [3, 3,
     "the lines the hidden-word count assumes a fold shows: anything but the clamp's three counts " +
     "words the reader can see, or misses ones they cannot (#244 elision-word-count)"],
-  FOLD_LINE_CHARS: [36, 72,
-    "the characters a folded line holds in the count's phone model: under about forty a phone's " +
-    "line is undercounted, past seventy it is a desk's, and the count runs low where it is read " +
-    "most (#244 elision-word-count)"],
+  ELIDED_MIN_WORDS: [5, 20,
+    "the fewest hidden words a fold's label claims: under five the floor is too near nothing to " +
+    "say anything is hidden, past twenty a fold over a paragraph says nothing (#244 elision-word-count)"],
+  ELIDED_MIN_CHARS: [30, 120,
+    "the same for text counted in characters, about as much as the fewest words (#244 elision-word-count)"],
+  ELISION_COUNTED_TEXTS: [100, 5000,
+    "the texts whose fold labels are kept for the next redraw: under a hundred a long channel is " +
+    "counted again on every Done, past a few thousand it is a store of old messages (#244 elision-word-count)"],
+  SPACE_POOR_CHARS: [8, 30,
+    "characters to a hidden word past which the label counts characters: under eight ordinary prose " +
+    "with long words is counted in characters, past thirty an address hides in a word count (#244 elision-word-count)"],
   DONE_FLASH_HOLD_MS: [400, 2000,
     "how long the grey ring holds on a message just marked Done: under the quarter-second change " +
     "itself nothing is seen to hold, past two seconds it reads as a second selection (#245 done-feedback)"],
@@ -6705,104 +6717,211 @@ test("the collapsed height is really three LINES, and the chips are outside the 
 
 // --- `#244 elision-word-count` -------------------------------------------------------------------
 //
-// A folded message says under its last line how many words the fold keeps back. The fold is a CSS
-// clamp, so the count is the page's own estimate from the text, at a phone's line length — and these
-// tests hold it to that model EXACTLY, with texts whose cut is known: words of one length, so a line
-// holds a known number of them.
+// A folded message says under its last line how much the fold keeps back. The fold is a CSS clamp,
+// so the count is the page's own floor, worked out from the text at every width class a line can be
+// in, one label per class; web/voice.css shows the one for the width the row is drawn at. These tests
+// hold each label to that model EXACTLY, with texts whose cut is known — words of one letter repeated,
+// so a line of a class holds a known number of them — and tests/elision_browser.py holds the labels a
+// real Chromium shows to the words it really hides.
 
 const FOLD_LINES = sourceConstant("FOLD_LINES");
-const FOLD_LINE_CHARS = sourceConstant("FOLD_LINE_CHARS");
-/** The words a line of the model holds when every word is `letters` long. */
-const wordsPerLine = (letters) => Math.floor((FOLD_LINE_CHARS + 1) / (letters + 1));
-/** `count` words of `letters` letters each, on one line. */
-const wordsOfLength = (count, letters) => Array(count).fill("w".repeat(letters)).join(" ");
+const ELIDED_MIN_WORDS = sourceConstant("ELIDED_MIN_WORDS");
+const FOLD_WIDTHS_EM = JSON.parse(
+  /^const FOLD_WIDTHS_EM = (\[[\d.,\s]*\]);$/m.exec(SCRIPT_CODE)?.[1] ??
+    assert.fail("web/voice.js no longer states its FOLD_WIDTHS_EM"));
+/** The width class of a phone at the default text size, 393 to 412px: its widest line, in em. */
+const PHONE_CLASS = FOLD_WIDTHS_EM.indexOf(28.5);
+/** ...and of a desk's default 72ch column. */
+const DESK_CLASS = FOLD_WIDTHS_EM.indexOf(45);
+/** `count` words of `letters` n's each, on one line: "n" is the model's ordinary lowercase letter. */
+const wordsOfLength = (count, letters) => Array(count).fill("n".repeat(letters)).join(" ");
+/** How many such words a line of `widthEm` holds, by the model's own glyph widths. */
+const wordsPerLine = (page, letters, widthEm) => {
+  const letter = page.pure('glyphEm("n")');
+  const space = page.pure("SPACE_EM");
+  return Math.floor((widthEm + space) / (letters * letter + space) + 1e-9);
+};
+/** What a floor of `count` hidden words or characters says, rounded down as the page rounds it. */
+const saysHidden = (count, noun = "words") => {
+  if (count < (noun === "words" ? ELIDED_MIN_WORDS : sourceConstant("ELIDED_MIN_CHARS"))) return "";
+  const step = count < 20 ? 1 : count < 100 ? 5 : count < 1000 ? 10 : 100;
+  return `(~${Math.floor(count / step) * step} more ${noun})`;
+};
 const elidedOf = (li) => li.children.find((node) => node.hasClass("elided"));
 const textOfRow = (li) => li.children.find((node) => node.hasClass("body"));
+/** The label a row's line carries for width class `at` (and, on a rich header's row, `rh`), or "". */
+const labelAt = (li, at, rh = null) => {
+  const line = elidedOf(li);
+  const span = line && line.children.find((one) =>
+    String(one.getAttribute("data-w")).split(" ").includes(String(at)) && one.getAttribute("data-rh") === rh);
+  return span ? span.textContent : "";
+};
 
-test("A FOLDED MESSAGE ENDS WITH THE WORDS IT HIDES, by the model's exact cut, in both lists (#244)", async () => {
+test("A FOLDED MESSAGE ENDS WITH WHAT IT HIDES, counted at every width class, in both lists (#244)", async () => {
   assert.equal(FOLD_LINES, 3, "the model's line count is not the clamp's three lines");
-  const shown = wordsPerLine(4) * FOLD_LINES;
-  const text = wordsOfLength(shown + 30, 4);
+  const text = wordsOfLength(200, 4);
   assert.ok(text.length > COLLAPSE_OVER_CHARS, "the text would not fold");
   const page = newPage();
   await startTalking(page);
   assistantSays(page, text);
   const spoken = page.el("transcript").children.at(-1);
   const posted = (await showDiscord(page, [message({ id: "7440000000000000001", content: text })]))[0];
+  const expected = FOLD_WIDTHS_EM.map((widthEm) => saysHidden(200 - FOLD_LINES * wordsPerLine(page, 4, widthEm)));
+  assert.equal(expected[PHONE_CLASS], "(~160 more words)", "the fixture's phone cut moved; recount it");
   for (const [where, li] of [["the transcript", spoken], ["the channel", posted]]) {
-    const label = elidedOf(li);
-    assert.ok(label, `${where} folded a long message with no count under it`);
-    assert.equal(label.textContent, "(~30 more words)", `${where} miscounted the hidden words`);
-    assert.equal(label.hidden, false, `${where} hid the count on a folded message`);
+    const line = elidedOf(li);
+    assert.ok(line, `${where} folded a long message with no count under it`);
+    assert.equal(line.hidden, false, `${where} hid the count on a folded message`);
+    assert.deepStrictEqual(FOLD_WIDTHS_EM.map((_width, at) => labelAt(li, at)), expected,
+      `${where} miscounted the hidden words at some width`);
+    // One label for each class at most, and each class it names is a class there is.
+    const named = line.children.flatMap((span) => String(span.getAttribute("data-w")).split(" ").map(Number));
+    assert.deepStrictEqual([...named].sort((a, b) => a - b), [...new Set(named)].sort((a, b) => a - b),
+      `${where} has two labels for one width`);
+    assert.ok(named.every((at) => Number.isInteger(at) && at >= 0 && at < FOLD_WIDTHS_EM.length));
     // Straight after the text it is about, before anything else the row carries.
-    const body = textOfRow(li);
-    assert.equal(li.children.indexOf(label), li.children.indexOf(body) + 1,
+    assert.equal(li.children.indexOf(line), li.children.indexOf(textOfRow(li)) + 1,
       `${where} put the count somewhere other than straight under the text`);
   }
 });
 
-test("the count is exact under twenty, says '1 word' alone, and rounds a large one (#244)", async () => {
-  const cases = [
-    // Nine-letter words: five to a line, fifteen shown, so fourteen of twenty-nine are hidden.
-    [wordsOfLength(wordsPerLine(9) * FOLD_LINES + 14, 9), "(~14 more words)"],
-    // One word longer than three lines starts inside them and is shown; the next one is not.
-    [`${"x".repeat(FOLD_LINE_CHARS * FOLD_LINES)} ${"y".repeat(140)}`, "(~1 more word)"],
-    // 313 hidden, said to the nearest ten.
-    [wordsOfLength(wordsPerLine(4) * FOLD_LINES + 313, 4), "(~310 more words)"],
-  ];
+test("EACH COUNT IS A FLOOR: fewer at a wider line, rounded down, and nothing under ten words (#244)", async () => {
   const page = newPage();
+  const says = (words, chars = words * 6) => page.pure("elisionLabel")({ words, chars });
+  assert.equal(says(ELIDED_MIN_WORDS - 1), "", "a floor of a few words claims that words are hidden");
+  assert.equal(says(ELIDED_MIN_WORDS), `(~${ELIDED_MIN_WORDS} more words)`);
+  assert.equal(says(19), "(~19 more words)", "under twenty the count is not exact");
+  assert.equal(says(24), "(~20 more words)", "a floor was rounded up past what it counted");
+  assert.equal(says(99), "(~95 more words)");
+  assert.equal(says(313), "(~310 more words)");
+  assert.equal(says(1999), "(~1900 more words)");
+  // At every class: never more at a wider line than at a narrower one.
   await signIn(page);
-  const rows = await showDiscord(page, cases.map(([content], i) =>
-    message({ id: `744000000000000010${i}`, content })));
-  cases.forEach(([content, said], i) => {
-    assert.ok(content.length > COLLAPSE_OVER_CHARS, `case ${i} would not fold`);
-    assert.equal(elidedOf(rows[i]).textContent, said, `case ${i}`);
-  });
+  const rows = await showDiscord(page, [message({ id: "7440000000000000101", content: wordsOfLength(400, 7) })]);
+  const counts = FOLD_WIDTHS_EM.map((_width, at) => Number((/\d+/.exec(labelAt(rows[0], at)) || ["0"])[0]));
+  counts.slice(1).forEach((count, at) => assert.ok(count <= counts[at],
+    `${FOLD_WIDTHS_EM[at + 1]}em says ${count} hidden, more than ${counts[at]} at ${FOLD_WIDTHS_EM[at]}em`));
+  assert.ok(counts[0] > counts.at(-1), "the count does not depend on the width at all");
 });
 
-test("a short message has no count, and an open one hides it until it folds again (#244)", async () => {
+test("A MESSAGE THAT FITS A DESK'S THREE LINES SAYS NOTHING THERE, and still counts on a phone (#244)", async () => {
+  // From review: a phone's model on a desk claimed hidden words under a 300-character message that
+  // three desk lines hold. Forty-five words of five letters: a phone's class hides most of them, a
+  // desk's three lines hold them all.
   const page = newPage();
   await signIn(page);
-  const long = wordsOfLength(wordsPerLine(4) * FOLD_LINES + 30, 4);
+  const text = wordsOfLength(50, 5);
+  assert.ok(text.length > COLLAPSE_OVER_CHARS && text.length < 320, "the fixture is not the review's message");
+  const rows = await showDiscord(page, [message({ id: "7440000000000000151", content: text })]);
+  assert.ok(FOLD_LINES * wordsPerLine(page, 5, FOLD_WIDTHS_EM[DESK_CLASS]) >= 50, "a desk line would not hold it");
+  assert.equal(labelAt(rows[0], DESK_CLASS), "", "a desk's line says words are hidden under a message it holds whole");
+  assert.equal(labelAt(rows[0], FOLD_WIDTHS_EM.length - 1), "");
+  assert.equal(labelAt(rows[0], PHONE_CLASS), saysHidden(50 - FOLD_LINES * wordsPerLine(page, 5, 28.5)));
+  assert.notEqual(labelAt(rows[0], PHONE_CLASS), "", "a phone's three lines hide most of it, and say nothing");
+});
+
+test("a short message has no count, a width that hides under ten words has none, and an open one hides it until it folds again (#244)", async () => {
+  const page = newPage();
+  await signIn(page);
+  // Just over the fold: a phone's three lines hide fifteen of its words, a line of 33em only nine.
+  const barely = wordsOfLength(48, 5);
+  const wider = FOLD_WIDTHS_EM.indexOf(33);
+  const hidden = (at) => 48 - FOLD_LINES * wordsPerLine(page, 5, FOLD_WIDTHS_EM[at]);
+  assert.ok(barely.length > COLLAPSE_OVER_CHARS);
+  assert.ok(hidden(wider) > 0 && hidden(wider) < ELIDED_MIN_WORDS && hidden(PHONE_CLASS) >= ELIDED_MIN_WORDS,
+    `the fixture hides ${hidden(wider)} words at 33em and ${hidden(PHONE_CLASS)} on a phone`);
+  const long = wordsOfLength(200, 4);
   const rows = await showDiscord(page, [
     message({ id: "7440000000000000201", content: SHORT_MESSAGE }),
-    message({ id: "7440000000000000202", content: long }),
+    message({ id: "7440000000000000202", content: barely }),
+    message({ id: "7440000000000000203", content: long }),
   ]);
   assert.equal(elidedOf(rows[0]), undefined, "a short message, which hides nothing, carries a count");
-  const label = elidedOf(rows[1]);
-  await foldButton(rows[1]).click();
-  assert.equal(rows[1].getAttribute("data-collapsed"), "false");
+  assert.equal(rows[1].getAttribute("data-collapsed"), "true", "the fixture did not fold");
+  assert.equal(labelAt(rows[1], wider), "", "a fold hiding a few words claims that some are hidden");
+  assert.equal(labelAt(rows[1], FOLD_WIDTHS_EM.length - 1), "");
+  assert.equal(labelAt(rows[1], PHONE_CLASS), `(~${hidden(PHONE_CLASS)} more words)`);
+  const label = elidedOf(rows[2]);
+  await foldButton(rows[2]).click();
+  assert.equal(rows[2].getAttribute("data-collapsed"), "false");
   assert.equal(label.hidden, true, "an open message still says words are hidden");
-  await foldButton(rows[1]).click();
+  await foldButton(rows[2]).click();
   assert.equal(label.hidden, false, "folded again, the count did not come back");
-  assert.equal(label.textContent, "(~30 more words)");
+  assert.equal(labelAt(rows[2], PHONE_CLASS), saysHidden(200 - FOLD_LINES * wordsPerLine(page, 4, 28.5)));
   // Under the Links filter the row shows its links instead of its text, and the count goes with it.
   assert.match(CSS, /\.messages li\[data-links-view="true"\] > \.elided,[^{]*\{\s*display:\s*none !important;/,
     "the Links filter leaves a count under a row whose text it took away");
-  assert.match(cssBlock(".elided"), /white-space:\s*nowrap/, "a narrow bubble can break the count from its word");
+});
+
+test("THE STYLESHEET SHOWS THE LABEL OF THE WIDTH CLASS THE LINE IS IN, measured in em of the text (#244)", () => {
+  // The line is a size container as wide as the text and at the text's size, so `em` in its queries is
+  // the text's em: one rule per class, edge to edge, the same edges as FOLD_WIDTHS_EM, and none past
+  // the last. tests/elision_browser.py checks that Chromium really measures it so.
+  assert.match(cssBlock(".elided"), /container:\s*elided \/ inline-size;/, "the line is not a size container");
+  const span = cssBlock(".elided > span");
+  assert.match(span, /display:\s*none;/, "every label shows unless its class's rule shows it");
+  assert.match(span, /white-space:\s*nowrap/, "a narrow bubble can break the count from its word");
+  const rules = [...CSS_CODE.matchAll(/@container elided \(([^)]*)\) \{\s*\.elided > \[data-w~="(\d+)"\] \{\s*display: inline;\s*\}\s*\}/g)];
+  assert.equal(rules.length, FOLD_WIDTHS_EM.length, "a width class has no rule, or a rule no class");
+  rules.forEach(([, condition, at], i) => {
+    assert.equal(Number(at), i, `the rules are out of order at ${condition}`);
+    const lower = i === 0 ? "" : `${FOLD_WIDTHS_EM[i - 1]}em <= `;
+    assert.equal(condition, `${lower}width < ${FOLD_WIDTHS_EM[i]}em`, `class ${i} is not the line widths it was counted for`);
+  });
+  for (const list of ["#reply-context", "#pinned-log", "#side-log", "#discord-log"]) {
+    assert.match(CSS_CODE, new RegExp(`${list} \\.elided[,\\s][^{]*\\{\\s*font-size: calc\\(0\\.88rem \\* var\\(--msg-scale\\)\\);`),
+      `in ${list} the line is not at the text's size, so its em is not the text's`);
+  }
+  assert.match(cssBlock(':root[data-rich-headers="off"] .elided > [data-rh="on"]'), /display:\s*none;/);
+  assert.match(cssBlock(':root:not([data-rich-headers="off"]) .elided > [data-rh="off"]'), /display:\s*none;/);
+});
+
+test("TEXT POOR IN SPACES IS COUNTED IN CHARACTERS: Chinese, a long bare address — and prose is not (#244)", async () => {
+  const page = newPage();
+  await signIn(page);
+  const ideograph = "漢";
+  const wide = page.pure(`glyphEm("${ideograph}")`);
+  const letter = page.pure('glyphEm("x")');
+  const chinese = ideograph.repeat(300);
+  const address = `x${"x".repeat(419)}`;
+  const rows = await showDiscord(page, [
+    message({ id: "7440000000000000501", content: chinese }),
+    message({ id: "7440000000000000502", content: address }),
+    message({ id: "7440000000000000503", content: `${wordsOfLength(60, 5)} https://example.com/${"x".repeat(60)}` }),
+  ]);
+  const perLine = (em, widthEm) => Math.floor(widthEm / em + 1e-9);
+  for (const at of [0, PHONE_CLASS, DESK_CLASS]) {
+    const widthEm = FOLD_WIDTHS_EM[at];
+    assert.equal(labelAt(rows[0], at), saysHidden(300 - FOLD_LINES * perLine(wide, widthEm), "characters"),
+      `Chinese at ${widthEm}em is not counted in the characters its clamp hides`);
+    assert.equal(labelAt(rows[1], at), saysHidden(420 - FOLD_LINES * perLine(letter, widthEm), "characters"),
+      `an address at ${widthEm}em is not counted in characters`);
+  }
+  assert.match(labelAt(rows[2], PHONE_CLASS), /^\(~\d+ more words\)$/, "prose with an address in it is counted in characters");
 });
 
 test("a combined row is counted as it is drawn, each message from a line of its own (#244)", async () => {
-  // Twenty-five words fill two and a half lines; the second message starts the fourth line, so all
-  // of it is hidden. Read as one run of text, five of its words would fit on the third line instead.
+  // At 25em a line holds twelve four-letter words, so the first message's twenty-five fill three lines
+  // and the second starts the fourth: all thirty-five of its words are hidden. Read as one run of text,
+  // eleven of them would fit on the third line instead.
   const first = wordsOfLength(25, 4);
   const second = wordsOfLength(35, 4);
   assert.ok(first.length <= COLLAPSE_OVER_CHARS && second.length <= COLLAPSE_OVER_CHARS,
     "each message alone would fold, which is not the case under test");
   const page = newPage();
   await signIn(page);
+  const at = FOLD_WIDTHS_EM.indexOf(25);
+  assert.equal(wordsPerLine(page, 4, 25), 12, "the fixture's line moved; recount it");
   const rows = await showDiscord(page, [
     message({ id: "7440000000000000301", content: first, timestamp: "2026-08-19T14:00:00Z" }),
     message({ id: "7440000000000000302", content: second, timestamp: "2026-08-19T14:00:01Z" }),
   ]);
   assert.equal(rows.length, 1, "the two messages were not combined");
-  assert.equal(elidedOf(rows[0]).textContent, "(~35 more words)");
+  assert.equal(labelAt(rows[0], at), "(~35 more words)");
 });
 
 test("a body the server rendered is counted by the words it shows, a link by its text (#244)", async () => {
-  // Twenty-seven nine-letter words and a link reading "the run log": thirty words, fifteen shown. Its
-  // two-hundred-character address is not on the screen, and is not counted.
-  const words = wordsOfLength(27, 9);
+  const words = wordsOfLength(60, 9);
   const href = `https://example.com/${"x".repeat(200)}`;
   const page = newPage();
   await signIn(page);
@@ -6812,7 +6931,35 @@ test("a body the server rendered is counted by the words it shows, a link by its
     content_html: `<p>${words} <a href="${href}" target="_blank" rel="noopener noreferrer nofollow">the run log</a></p>\n`,
   })]);
   assert.equal(rows[0].getAttribute("data-collapsed"), "true", "the rendered message did not fold");
-  assert.equal(elidedOf(rows[0]).textContent, "(~15 more words)");
+  // Spread into this realm's arrays: the page's run in a context of their own.
+  const labels = (text) => [...page.pure("elisionLabels")(text)];
+  const shown = labels(`${words} the run log`);
+  assert.deepStrictEqual(FOLD_WIDTHS_EM.map((_width, at) => labelAt(rows[0], at)), shown,
+    "the rendered body is not counted by the words on the screen");
+  assert.notDeepStrictEqual(shown, labels(`${words} ${href}`), "the fixture cannot tell a link's text from its address");
+});
+
+test("A RICH HEADER'S ROW counts its text without the words the header restates, and with them when the switch is off (#244)", async () => {
+  // `#242 rich-headers`. The words the header shows are hidden from the body while it shows them, so
+  // the clamp shows the body's next words in their place.
+  const lead = "[build-bot coordinator] Backup check, 10:52 PM ET. ";
+  const rest = wordsOfLength(120, 5);
+  const page = newPage();
+  await signIn(page);
+  const rows = await showDiscord(page, [
+    message({ id: "7440000000000000601", content: `${lead}${rest}`,
+      heading: { tag: "build-bot coordinator", time: "10:52 PM ET", title: "Backup check", cut: lead.length } }),
+    message({ id: "7440000000000000602", content: `${lead}${rest}` }),
+  ]);
+  assert.ok(textOfRow(rows[0]).children[0].hasAttribute("data-rh"), "the fixture's heading was not shown");
+  const labels = (text) => [...page.pure("elisionLabels")(text)];
+  assert.deepStrictEqual(FOLD_WIDTHS_EM.map((_width, at) => labelAt(rows[0], at, "on")), labels(rest),
+    "with the header showing, the row is not counted by the text under it");
+  assert.deepStrictEqual(FOLD_WIDTHS_EM.map((_width, at) => labelAt(rows[0], at, "off")), labels(`${lead}${rest}`),
+    "with the switch off, the row is not counted by its text as written");
+  assert.notEqual(labelAt(rows[0], 0, "on"), labelAt(rows[0], 0, "off"), "the fixture cannot tell the two apart");
+  // A row with no header has one label per class, for either state of the switch.
+  assert.ok(elidedOf(rows[1]).children.every((span) => !span.hasAttribute("data-rh")));
 });
 
 // --- the raw Discord view --------------------------------------------------------------------------
@@ -41313,17 +41460,23 @@ test("`#243 filter-keeps-selection`: and nothing else moves it afterwards — no
   assert.ok(Math.abs(yOf(followed, "40") - before) > 1, "the test cannot see a read move the message");
 });
 
-/** The pinned place channel with pin 30 at 290px in the Pinned list, chosen there by the mouse, and Pinned turned off. */
+/**
+ * Where pin 30 stands: far enough down that message 28, two rows above it, is on screen whole. 310px
+ * since `#244 elision-word-count`, whose line under a folded message made 28 a line taller.
+ */
+const PIN_THIRTY_Y = 310;
+
+/** The pinned place channel with pin 30 at `PIN_THIRTY_Y` in the Pinned list, chosen there by the mouse, and Pinned turned off. */
 async function pinThirtyKept(script = SCRIPT) {
   const { page, messages } = pinnedPlacePage(["16", "18", "20", "22", "24", "26", "27", "30", "33", "38"], script);
   await signIn(page);
   await showDiscord(page, messages);
   await showPinned(page);
-  parkAt(page, "30", 290, "pinned-log");
+  parkAt(page, "30", PIN_THIRTY_Y, "pinned-log");
   await clickRow(page, "30", "pinned-log");
   await page.el("pinned-filter").click();
   await page.settle();
-  keptAt(page, "30", 290, "turning Pinned off over the pin chosen");
+  keptAt(page, "30", PIN_THIRTY_Y, "turning Pinned off over the pin chosen");
   return page;
 }
 
@@ -41336,7 +41489,7 @@ test("`#243 filter-keeps-selection`: the reader's own act ends what the change h
     const row = placeRow(page, "28");
     const before = yOf(page, "28");
     const height = row.height();
-    assert.ok(before >= 0 && before + height <= 290, `message 28 is not on screen whole above the pin (${before}px, ${height}px tall)`);
+    assert.ok(before >= 0 && before + height <= PIN_THIRTY_Y, `message 28 is not on screen whole above the pin (${before}px, ${height}px tall)`);
     // A mouse's press comes first in a browser; a key on the focused fold is the click alone.
     if (pressFirst) await page.documentEvent("pointerdown", { target: foldButton(row), pointerType: "mouse" });
     await foldButton(row).click();

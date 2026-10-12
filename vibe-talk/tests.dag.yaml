@@ -502,6 +502,27 @@ steps:
       classification: latency-bound
       rss_baseline_bytes: 1073741824
 
+  # `#244 elision-word-count` in the browser engine, in seven layouts — phones at 360 and 412px, at 80%
+  # and 150% text, a 1280 desk, the widest reading column, two columns: every folded row's one label
+  # claims no more words or characters than its clamp really hides, found by the rects of its
+  # characters, on a line as wide as the text and at its size; a wall is labelled with at least half of
+  # what it hides; a 300-character message says nothing on a desk; Chinese and a bare address are
+  # counted in characters; a rich header's row holds with the switch on and off. Served through
+  # Playwright's request routing, so it opens no port. Measured on 2026-10-12: about 6s wall.
+  - group: check
+    job: elision-browser
+    desc: every folded message's label claims no more than its clamp hides, in seven layouts, in current Chromium
+    labels: [validation-vibe-talk]
+    cmd: cd vibe-talk && python3 tests/elision_browser.py
+    jobs_flag: ""
+    timeout: 120
+    cpu_timeout: 60
+    hint:
+      resources: {browser: 1}
+      est_duration_s: 6
+      classification: latency-bound
+      rss_baseline_bytes: 1073741824
+
   # ---- the build everything else needs ----------------------------------------------------------
   - group: build
     job: release

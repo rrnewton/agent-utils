@@ -1191,68 +1191,228 @@ const FOLD_LESS = "Less";
 //
 // `#244 elision-word-count`. The owner: "when messages are collapsed I have no idea if they're big
 // huge messages or just barely over the limit". So a folded message says, under its last line, how
-// many words the fold is keeping back: "(~240 more words)".
+// much the fold is keeping back: "(~240 more words)".
 //
-//   * AN ESTIMATE, AND IT SAYS SO WITH THE "~". The fold is a CSS clamp of three lines, so where the
-//     cut falls depends on the width of the row, the text size, and how the browser breaks lines —
-//     none of which this file knows without asking the layout engine, row by row. Asking would be
-//     a forced layout per long message on every redraw, and `#226` spent real work taking exactly
-//     that kind of read out of the redraw path. Moving to a cut this file makes itself would give
-//     an exact number at the price of the three-LINE fold `#47` chose on purpose (a wall is a
-//     number of lines, not of characters), so the count is worked out once, when the row is built,
-//     from the text alone.
-//   * CALIBRATED ON THE PHONE, where this is read most. A clamped line at 393-412px holds about
-//     fifty characters (measured in Chromium: three lines show 26 to 30 words of ordinary prose on
-//     an agent's full-width row, a few fewer in a person's narrower bubble). A desk's column holds
-//     more, so there the number runs high by up to about twenty words; it is still the difference
-//     between "barely over" and "a wall", which is the question asked.
-//   * ROUNDED as an estimate should be: exact under twenty, to five under a hundred, to ten under a
-//     thousand, to a hundred above. "~312" would claim a precision the number does not have.
+//   * NEVER MORE THAN IS HIDDEN. The fold is a CSS clamp of three lines, so where the cut falls
+//     depends on how wide the row's lines are, the text size, and how the browser breaks them. This
+//     file asks the layout engine none of that: a read per long row on every redraw is the forced
+//     layout `#226` took out of the redraw path. It works the count out once, when the row is built,
+//     from the text alone, AT EVERY WIDTH A LINE CAN BE (`FOLD_WIDTHS_EM`), and the stylesheet shows
+//     the one for the width the row has. The label is a size container of its own, as wide as the
+//     text above it and in that text's em, so its container query picks the class from the row as
+//     drawn — a phone, a desk's column, one of two columns, a reply's inset, the reader's text size —
+//     and nothing is measured (web/voice.css, `.elided`). An earlier count assumed a phone's line
+//     everywhere, and on a desk said words were hidden under a message that fitted in three lines.
+//   * EACH COUNT IS A FLOOR: worked out at the WIDEST line of its class, with every character at the
+//     narrow end of what the common interface fonts draw (`glyphEm`). So it may say fewer words than
+//     are hidden, and never more; and under `ELIDED_MIN_WORDS` it says nothing, because a floor that
+//     close to nothing cannot say that anything at all is hidden. The "~" says it is an estimate.
+//   * ROUNDED DOWN as such a floor should be: exact under twenty, to five under a hundred, to ten
+//     under a thousand, to a hundred above. "~312" would claim a precision the number does not have.
 //   * WORDS ARE WHAT THE ROW SHOWS, split on white space: the drawn text of a channel row (never
 //     its markup, and a link counts as the words it shows), the spoken text of a transcript turn.
+//     On a row with a rich header (`#242 rich-headers`) the words the header restates are hidden
+//     from the text while it shows, so they are counted out, and back in where the switch is off.
+//   * TEXT POOR IN SPACES IS COUNTED IN CHARACTERS. Chinese or Japanese has no spaces to count words
+//     by, and a long bare address is one "word": counted in words, a clamp hiding most of either
+//     would hide nothing. Where what is hidden runs to more than `SPACE_POOR_CHARS` characters a
+//     word, the label counts its characters instead — "(~400 more characters)" — and says nothing
+//     under `ELIDED_MIN_CHARS`. A character of those scripts is a place a line may break, as the
+//     browser breaks there.
 //   * "MORE", and no "…" of its own: the clamp has already ended the last line with one, and the
 //     label continues it. "More" is what says these are the words still hidden, not the total.
 const FOLD_LINES = 3;
-const FOLD_LINE_CHARS = 50;
 
 /**
- * How many words of `text` fall past the three lines a fold shows, by the phone-width model above.
- *
- * Each line of the text starts a line of its own (a paragraph, a list item, a blank line in a spoken
- * turn), and words fill a line greedily up to `FOLD_LINE_CHARS`; a word longer than a line breaks
- * across lines, as `overflow-wrap: anywhere` breaks it. A word that STARTS inside the three lines is
- * shown, because the reader can see that it is there.
+ * The line widths the count is worked out at, in em of the message text: the upper edge of each
+ * width class `.elided`'s container query picks between (web/voice.css says the same list), from a
+ * narrow phone at the largest text size to a wide desk. Past the last there is no count, because
+ * there is no floor. Measured in Chromium: a phone at the default size is 24 to 30em (360 to 430px),
+ * a desk's 72ch column 44em; the edges sit just above those, so the floor is close where it is read
+ * most.
  */
-function wordsPastFold(text) {
-  let line = 0;
-  let shown = 0;
-  let total = 0;
+const FOLD_WIDTHS_EM = [14, 16, 18, 20, 22, 23.5, 25, 27, 28.5, 30, 33, 36, 40, 45, 50, 56, 63, 72, 84, 100];
+
+/** The fewest hidden words a label says: under that, a floor cannot say any are hidden. */
+const ELIDED_MIN_WORDS = 10;
+
+/** ...and the fewest characters, for text counted in characters: about as much as ten words. */
+const ELIDED_MIN_CHARS = 60;
+
+/** Characters to a hidden word past which the text is counted in characters rather than words. */
+const SPACE_POOR_CHARS = 12;
+
+/** CJK ideographs, kana, Hangul and full-width forms: as wide as the type is tall, and breakable. */
+const WIDE_SCRIPT = /[\u1100-\u115f\u2e80-\u303e\u3041-\u33ff\u3400-\u4dbf\u4e00-\u9fff\ua000-\ua4cf\uac00-\ud7a3\uf900-\ufaff\ufe30-\ufe4f\uff00-\uff60\uffe0-\uffe6\u{20000}-\u{3fffd}]/u;
+
+/** An emoji, drawn at least as wide as an ideograph. */
+const PICTOGRAPH = /\p{Extended_Pictographic}/u;
+
+/**
+ * How wide one character is, in em, at the NARROW end of the common interface fonts (Roboto, the
+ * San Francisco and Segoe faces, DejaVu and Noto Sans): narrower than any of them draws it, so a
+ * line of the model holds at least as much as a real line does. A space is the space's width; the
+ * thin letters and stops the thinnest; then the slim letters and brackets; the ordinary lowercase
+ * of every alphabet; capitals, figures and symbols; the widest letters; and the wide scripts.
+ */
+function glyphWidth(ch) {
+  if (/\s/.test(ch)) return 0.24;
+  if (/[.,:;'`|!ijlI-]/.test(ch)) return 0.19;
+  if (/[ftr()[\]{}"/\\*]/.test(ch)) return 0.28;
+  if (/[mwMW@%]/.test(ch)) return 0.72;
+  if (/[A-Z0-9#$&?+=<>~^_]/.test(ch)) return 0.52;
+  if (WIDE_SCRIPT.test(ch) || PICTOGRAPH.test(ch)) return 0.9;
+  return 0.46;
+}
+
+/** `glyphWidth` for ASCII, looked up rather than matched: it is most of every message. */
+const ASCII_EM = Array.from({ length: 128 }, (_unused, code) => glyphWidth(String.fromCharCode(code)));
+
+/** How wide one character is, in em; see `glyphWidth`. */
+function glyphEm(ch) {
+  const code = ch.charCodeAt(0);
+  return ch.length === 1 && code < 128 ? ASCII_EM[code] : glyphWidth(ch);
+}
+
+/** The width of the space between two words, in em, at the same narrow end. */
+const SPACE_EM = glyphEm(" ");
+
+/**
+ * `text` as the model lays it out: its lines (each line of the text starts a line of its own — a
+ * paragraph, a list item, a blank line in a spoken turn), each a list of PIECES a line may break
+ * between. A piece is a word, or the run of it between two characters of a wide script, each of
+ * which is a piece of its own. Counted once per text, and laid out at every width from these.
+ */
+function foldPieces(text) {
+  const lines = [];
+  let words = 0;
+  let chars = 0;
   for (const part of String(text === null || text === undefined ? "" : text).split("\n")) {
-    const words = part.split(/\s+/).filter(Boolean);
-    total += words.length;
-    line += 1;
-    let column = 0;
-    for (const word of words) {
-      if (column > 0 && column + 1 + word.length > FOLD_LINE_CHARS) {
-        line += 1;
-        column = 0;
+    const pieces = [];
+    for (const word of part.split(/\s+/).filter(Boolean)) {
+      words += 1;
+      let piece = null;
+      for (const ch of word) {
+        const wide = WIDE_SCRIPT.test(ch);
+        if (!piece || wide || piece.wide) {
+          piece = { em: 0, glyphs: [], wide, word: piece === null };
+          pieces.push(piece);
+        }
+        const em = glyphEm(ch);
+        piece.em += em;
+        piece.glyphs.push(em);
+        chars += 1;
       }
-      if (line <= FOLD_LINES) shown += 1;
-      column += (column > 0 ? 1 : 0) + word.length;
-      while (column > FOLD_LINE_CHARS) {
+    }
+    lines.push(pieces);
+  }
+  return { lines, words, chars };
+}
+
+/**
+ * How many words and characters of `laid` (see `foldPieces`) a fold shows when a line is `widthEm`
+ * wide. Words fill a line greedily, a piece too long for a line breaks inside itself as
+ * `overflow-wrap: anywhere` breaks it, and a word that STARTS inside the three lines is shown,
+ * because the reader can see that it is there.
+ */
+function foldShows(laid, widthEm) {
+  let line = 0;
+  let words = 0;
+  let chars = 0;
+  for (const pieces of laid.lines) {
+    line += 1;
+    if (line > FOLD_LINES) break;
+    let at = 0;
+    for (const piece of pieces) {
+      const gap = piece.word && at > 0 ? SPACE_EM : 0;
+      if (at > 0 && at + gap + piece.em > widthEm) {
         line += 1;
-        column -= FOLD_LINE_CHARS;
+        at = 0;
+        if (line > FOLD_LINES) return { words, chars };
+      } else {
+        at += gap;
+      }
+      if (piece.word) words += 1;
+      for (const em of piece.glyphs) {
+        if (at > 0 && at + em > widthEm) {
+          line += 1;
+          at = 0;
+          if (line > FOLD_LINES) return { words, chars };
+        }
+        at += em;
+        chars += 1;
       }
     }
   }
-  return total - shown;
+  return { words, chars };
 }
 
-/** The label under a folded message: "(~240 more words)", "(~1 more word)", or "" for none. */
+/**
+ * The label for what a fold hides, `{words, chars}`: "(~240 more words)", "(~400 more characters)"
+ * for text poor in spaces, or "" when it is too little to say anything is hidden.
+ */
 function elisionLabel(hidden) {
-  const step = hidden < 20 ? 1 : hidden < 100 ? 5 : hidden < 1000 ? 10 : 100;
-  const about = Math.max(1, Math.round(hidden / step) * step);
-  return hidden > 0 ? `(~${about} more word${about === 1 ? "" : "s"})` : "";
+  const spacePoor = hidden.chars > SPACE_POOR_CHARS * Math.max(1, hidden.words);
+  const count = spacePoor ? hidden.chars : hidden.words;
+  if (count < (spacePoor ? ELIDED_MIN_CHARS : ELIDED_MIN_WORDS)) return "";
+  const step = count < 20 ? 1 : count < 100 ? 5 : count < 1000 ? 10 : 100;
+  return `(~${Math.floor(count / step) * step} more ${spacePoor ? "characters" : "words"})`;
+}
+
+/**
+ * The labels of texts already counted. A redraw builds every row again from the same text — on a
+ * threaded channel every Done does — and the count is the same each time. Bounded, and forgotten
+ * whole when full, which costs one recount of what is on screen.
+ */
+const elisionCounted = new Map();
+
+/** How many texts `elisionCounted` holds before it starts again. */
+const ELISION_COUNTED_TEXTS = 500;
+
+/** The label for `text` at each of `FOLD_WIDTHS_EM`, in order. Shared: read it, never change it. */
+function elisionLabels(text) {
+  const key = String(text === null || text === undefined ? "" : text);
+  const held = elisionCounted.get(key);
+  if (held) return held;
+  const laid = foldPieces(key);
+  const labels = FOLD_WIDTHS_EM.map((widthEm) => {
+    const shown = foldShows(laid, widthEm);
+    return elisionLabel({ words: laid.words - shown.words, chars: laid.chars - shown.chars });
+  });
+  if (elisionCounted.size >= ELISION_COUNTED_TEXTS) elisionCounted.clear();
+  elisionCounted.set(key, labels);
+  return labels;
+}
+
+/**
+ * The line under a folded message: one span per label, each saying the width classes it is for
+ * (`data-w`, indexes into `FOLD_WIDTHS_EM`) and, on a rich header's row, whether it counts the text
+ * with the header showing or without (`data-rh`). web/voice.css shows the one that applies. Null when
+ * no width has anything to say.
+ *
+ * @param {Array<{text: string, rh: string|null}>} versions the text as the row can show it
+ */
+function elisionLine(versions) {
+  const spans = new Map();
+  for (const { text, rh } of versions) {
+    elisionLabels(text).forEach((label, at) => {
+      if (!label) return;
+      const key = `${rh || ""}|${label}`;
+      if (!spans.has(key)) spans.set(key, { label, rh, at: [] });
+      spans.get(key).at.push(at);
+    });
+  }
+  if (spans.size === 0) return null;
+  const line = document.createElement("div");
+  line.className = "elided";
+  for (const { label, rh, at } of spans.values()) {
+    const span = document.createElement("span");
+    span.setAttribute("data-w", at.join(" "));
+    if (rh) span.setAttribute("data-rh", rh);
+    span.textContent = label;
+    line.append(span);
+  }
+  return line;
 }
 
 // Every message that has a fold control, in the order it was rendered. Kept rather than re-queried
@@ -1368,16 +1528,16 @@ function foldable(li, meta, body, text, messageId, alsoIds = []) {
     said: null,
     elided: null,
   };
-  // `#244 elision-word-count`. Counted once, here, from the text the row shows; see `wordsPastFold`.
+  // `#244 elision-word-count`. Counted once, here, from the text the row shows; see `elisionLine`.
   // Straight after the text, ahead of the summary line below and of the reactions the channel row
-  // moves under both, so it reads as the end of the folded message.
-  const hidden = wordsPastFold(text);
-  if (hidden > 0) {
-    entry.elided = document.createElement("div");
-    entry.elided.className = "elided";
-    entry.elided.textContent = elisionLabel(hidden);
-    li.append(entry.elided);
-  }
+  // moves under both, so it reads as the end of the folded message. A rich header's row (`#242
+  // rich-headers`) shows its text without the words the header restates while the header shows.
+  const first = body.children[0];
+  const headed = Boolean(first && first.hasAttribute && first.hasAttribute("data-rh"));
+  entry.elided = elisionLine(headed
+    ? [{ text: renderedText(body, RESTATED_CLASS), rh: "on" }, { text, rh: "off" }]
+    : [{ text, rh: null }]);
+  if (entry.elided) li.append(entry.elided);
   if (entry.id) {
     entry.note = document.createElement("div");
     entry.note.className = "summary";
@@ -15552,9 +15712,10 @@ const TEXT_BLOCKS = new Set([
 /**
  * What a drawn body SAYS, as text: what the reader sees, with a line end at each line break and at
  * the edge of each block. What search matches and a thread is named by — not the Markdown source,
- * whose asterisks and link targets are not on the screen.
+ * whose asterisks and link targets are not on the screen. With `skipClass`, the elements of exactly
+ * that class are left out.
  */
-function renderedText(node) {
+function renderedText(node, skipClass = "") {
   let out = "";
   const walk = (at) => {
     for (const kid of at.childNodes) {
@@ -15563,6 +15724,8 @@ function renderedText(node) {
         continue;
       }
       if (kid.nodeType !== 1) continue;
+      // What a stylesheet hides, when asked: the words a rich header restates (`elisionLine`).
+      if (skipClass && kid.className === skipClass) continue;
       const tag = String(kid.tagName).toLowerCase();
       if (tag === "br") {
         out += "\n";

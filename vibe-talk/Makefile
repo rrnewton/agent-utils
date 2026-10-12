@@ -10,7 +10,7 @@
 # tool's lightweight unboxed gate. The root includes `tests.dag.yaml` directly so vibe-talk shares
 # one scheduler and browser cap with the other repository fragments.
 
-.PHONY: validate validate-boxed dag-check fmt check scripts-check contract contract-check typecheck test page pwa-installability enter-to-send-browser offline-cache-browser reactions-browser rich-headers-browser read-aloud-browser post-confirm-browser view-switch-browser read-modes-browser keyboard-browser two-column-browser bookmark-browser reply-continuity-browser voice-read-acceptance-self-test android-speech-self-test live-hint-adapter-self-test container-smoke filter-place-browser voice-composer-browser thread-button-browser done-feedback-browser clean
+.PHONY: validate validate-boxed dag-check fmt check scripts-check contract contract-check typecheck test page pwa-installability enter-to-send-browser offline-cache-browser reactions-browser rich-headers-browser read-aloud-browser post-confirm-browser view-switch-browser read-modes-browser keyboard-browser two-column-browser bookmark-browser reply-continuity-browser voice-read-acceptance-self-test android-speech-self-test live-hint-adapter-self-test container-smoke filter-place-browser voice-composer-browser thread-button-browser done-feedback-browser elision-browser clean
 
 # The whole gate for this tool, cheapest and most likely to fail first.
 #
@@ -237,6 +237,14 @@ thread-button-browser:
 # a PNG of each step.
 done-feedback-browser:
 	python3 tests/done_feedback_browser.py $(if $(WEB_ROOT),--web-root $(WEB_ROOT)) $(if $(SCREENSHOTS),--screenshots $(SCREENSHOTS))
+
+# `#244 elision-word-count` in a real Chromium, in seven layouts (phones at 360 and 412px, at 80% and
+# 150% text, a desk, the widest reading column, two columns): every folded row's one label claims no
+# more than its clamp really hides, by the rects of its characters; Chinese and a bare address are
+# counted in characters; a rich header's row holds with the switch on and off. Pass WEB_ROOT=dir to run
+# it against another copy of the page, and SCREENSHOTS=dir to keep a PNG of each layout.
+elision-browser:
+	python3 tests/elision_browser.py $(if $(WEB_ROOT),--web-root $(WEB_ROOT)) $(if $(SCREENSHOTS),--screenshots $(SCREENSHOTS))
 
 # The live #47 read-aloud-overlong check is opt-in and may consume provider time. Its transcript
 # reconciliation, PCM-duration metric, re-answer separation, privacy boundaries, threshold edges,
