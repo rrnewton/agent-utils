@@ -61,7 +61,9 @@ read by its own YAML-subset parser), and installs the `herdr-run` binary.
 Policy is per project, in the nearest `.herdr-run.yaml`. `herdr-run init` writes an annotated one
 into the current directory with every knob present, commented, and set to the value already in
 force -- so adopting it changes nothing until you edit something, and that file, rather than any
-documentation, is the reference for what is configurable.
+documentation, is the reference for what is configurable. A file an earlier release wrote keeps
+that release's deny lists; herdr-run warns about each built-in entry it leaves out, and
+`herdr-run init --upgrade` brings it up to date.
 
 `allow` is a **human-only knob**: an agent that can widen its own allowlist does not have one.
 Keep `.herdr-run.yaml` at the top of the project, outside whatever directory the agents write in.
@@ -73,6 +75,7 @@ a trust boundary at all.
 ```
 herdr-run status                 what configuration, policy, and session are in effect
 herdr-run init                   write an annotated .herdr-run.yaml in this directory
+herdr-run init --upgrade         bring the .herdr-run.yaml here up to date with this release
 herdr-run run '<command>'        run the command; exits with the command's own exit code
 herdr-run check '<command>'      policy only: allowed or refused. Touches no pane.
 herdr-run target                 resolve/bring up the pane; print ids and readiness

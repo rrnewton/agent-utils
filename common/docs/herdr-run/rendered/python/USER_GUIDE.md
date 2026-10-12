@@ -82,6 +82,7 @@ herdr-run run '<command>'          # run it; exits with the command's own exit c
 herdr-run check '<command>'        # policy only: allowed or refused. Touches no pane.
 herdr-run status                   # what is in effect here. Changes nothing.
 herdr-run init                     # write an annotated .herdr-run.yaml in this directory
+herdr-run init --upgrade           # bring the one here up to date with this release
 herdr-run target                   # resolve/bring up the pane; print ids and readiness
 herdr-run config                   # print the effective configuration as JSON
 herdr-run reap                     # report which command tabs are provably finished. Closes nothing.
@@ -93,7 +94,7 @@ herdr-run userguide                # this document
 
 | Option | Effect |
 | --- | --- |
-| `--config PATH` | Use an explicit configuration file instead of the discovered one. Refused by `init`, `quickstart`, and `userguide`, which read no configuration file at all. |
+| `--config PATH` | Use an explicit configuration file instead of the discovered one. Refused by `init`, `quickstart`, and `userguide`, which take no configuration file: `init` works on the one in the current directory, and the other two print a packaged document. |
 | `--agent NAME` | The agent this invocation speaks for; names its tab. Otherwise the first of `$HERDR_RUN_AGENT`, `$DG_AGENT_NAME`, and `$ORC_AGENT_NAME` that is non-empty once Unicode white space is trimmed from both ends (so a variable holding only U+3000 or U+00A0 is skipped like an empty one), else `unknown-agent`. An agent name, from the option or a variable, may contain no control character and no invisible character (a format character such as U+200B or U+202E, a default-ignorable code point such as U+034F or U+FE0F, a blank such as U+2800 or U+3164, or a space other than U+0020, as listed for policy names under the configuration file); one that does is a configuration error (78). So is a variable that is not valid UTF-8, rather than being skipped, so an invocation never speaks for the next variable's agent by accident. Refused by `check`, `init`, `reap`, `quickstart`, and `userguide`, which name no tab. |
 | `--json` | Emit machine-readable output where the subcommand has one. Refused by `net-doctor`, `quickstart`, and `userguide`, whose only output is prose. `config`, `target`, and `reap` print JSON with or without it. |
 | `--version` | Print the version and exit. |
@@ -109,8 +110,8 @@ herdr-run userguide                # this document
 | `--cwd PATH` | Working directory for the command. An absolute path is used exactly as written; a relative one is resolved against the project root. |
 | `--no-cache` | Ignore the session cache and re-resolve the pane from labels. |
 
-`init` takes `--force`, and `target` also takes `--no-cache`. Every other subcommand takes no
-options of its own.
+`init` takes `--force` or `--upgrade` (not both), and `target` also takes `--no-cache`. Every other
+subcommand takes no options of its own.
 Offering an option at the wrong level is an error that says which level it belongs to, so
 `herdr-run --cwd /tmp run …` tells you to write `herdr-run run --cwd /tmp …` rather than failing
 as an unrecognized argument. Run `herdr-run <subcommand> --help` for one subcommand's own options;
@@ -189,7 +190,8 @@ writes an annotated `.herdr-run.yaml` into the current directory, the way `git i
 the current directory. **That file is the reference for what is configurable.** Every key is in
 it, commented, set to the value already in force — so adopting it changes nothing until you edit
 something, and this guide does not restate the list and then drift from it. `herdr-run init`
-refuses to overwrite an existing configuration; `--force` overrides that.
+refuses to overwrite an existing configuration; `--force` overrides that, and `--upgrade` brings
+an existing one up to date instead (see "When the file is older than the tool" below).
 
 The nearest `.herdr-run.yaml` (or `.herdr-run.yml`) found by searching upward from the working
 directory wins, `.gitignore`-style. With no configuration file at all the built-in defaults apply,
@@ -281,9 +283,56 @@ generated `.herdr-run.yaml` lists the defaults, among them `--exec` (the older s
 that takes the next argument as its value (`--attr-source`, `--shallow-file`, and
 `--super-prefix` among them), so that `git --attr-source HEAD daemon` is read as `git daemon`.
 
+`value_options` is the one list that adds to its built-in table rather than replacing it. Which
+options take the next argument is each program's own syntax, not a policy choice, and leaving one
+out could only make the policy misread a command, so a configuration can add an option, for any
+program, but cannot take a built-in one away; `herdr-run config` prints the table in force.
+
 The directory a command runs from, `HOME` when a command uses `~`, and the agent variables must be
 valid UTF-8; otherwise herdr-run stops with a configuration error rather than converting them
 lossily and writing its spool, audit log, or session cache somewhere else.
+
+### When the file is older than the tool
+
+Every list set in `.herdr-run.yaml` except `value_options` replaces the built-in one, and `init`
+writes every list out in full. So a file keeps the defaults of the release that wrote it: an entry a later release
+adds to a built-in deny list does not reach a file written earlier. A file written by
+`herdr-run init` in 0.2.0 or 0.3.0, or copied from the example the 0.1.0 and 0.2.0 user guides
+printed, leaves `--exec` out of `deny_anywhere`, for instance, and so admits `git push --exec=CMD`.
+
+herdr-run says so rather than letting it pass. Every subcommand that reads the configuration prints
+one line on stderr naming the file and every built-in deny entry its lists leave out:
+
+```text
+herdr-run: WARNING: /project/.herdr-run.yaml leaves out built-in deny entries, so they are not enforced: deny_anywhere "--exec". To adopt them, run 'herdr-run init --upgrade' in /project or add them by hand.
+```
+
+The line is the same every time for the same file, so it can be recognised. Entries for a program
+the allowlist can never admit are not counted, and neither are Cargo's `--config` and `-Z`, which
+are refused whatever the file says. `herdr-run status` lists the same entries on its `deny lists`
+line, and as `missing_defaults` with `--json`. A file that leaves an entry out on purpose keeps
+drawing the warning: a built-in deny entry can be removed, but not silently. A file that `init`
+cannot work on, one named by `--config` with another name, is told to add the entries by hand.
+
+To bring the file up to date, run this in the directory that holds it:
+
+```
+herdr-run init --upgrade
+```
+
+It rewrites each setting the file still holds exactly as an earlier release wrote it, line for line,
+into what this release writes, and leaves every other byte alone: comments, settings you changed,
+and lists you reformatted are untouched. It prints each setting it rewrote and the entries that
+added, then any built-in deny entry still left out, in a list it did not recognise, for you to add
+by hand. Before writing, it loads the rewritten file and checks that it reads exactly as the old
+one did, with entries added and nothing else changed; otherwise it writes nothing and says so. The
+file is written in place, so its mode, its owner, and a symbolic link to it are kept, and it is not
+written at all when there is nothing to rewrite. `--json` gives the same report as one object. A
+file that does not load is refused, as is a directory with no `.herdr-run.yaml` or `.herdr-run.yml`.
+
+`value_options` is right in an older file without an upgrade, because it adds to the built-in table
+(above). `init --upgrade` rewrites the older, shorter git list anyway, so the file reads as what is
+in force.
 
 ---
 
@@ -307,6 +356,7 @@ herdr-run status
   policy
     allow         git, gh
     prefixes      with-proxy
+    deny lists    every built-in entry is in force
 
   session
     agent         release-agent
@@ -323,6 +373,10 @@ command that brought those up in order to describe them would be reporting on it
 effects, and the next reader could not tell the difference. Anything it could not observe is
 reported as unknown, with the reason, rather than guessed at. `--json` gives the same facts as one
 object.
+
+`deny lists` names every built-in deny entry the configuration's lists leave out, the same entries
+the warning names (see "When the file is older than the tool"), or says that every built-in entry
+is in force.
 
 ---
 

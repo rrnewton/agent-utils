@@ -17,6 +17,9 @@ The installed CLI is the source of truth:
 - `herdr-run config` to inspect the fully resolved policy
 - `herdr-run init` to write an annotated `.herdr-run.yaml` -- but note that `allow` inside it is a
   human-only knob: do not add programs to it on your own initiative
+- a `herdr-run: WARNING: ... leaves out built-in deny entries` line means the project's file is
+  older than the tool and those entries are not enforced; tell the owner, whose fix is
+  `herdr-run init --upgrade` in the directory holding the file
 - `herdr-run check '<command>'`
 - `herdr-run --agent NAME run --dry-run '<command>'` to validate and render without touching a pane
 - `herdr-run net-doctor`

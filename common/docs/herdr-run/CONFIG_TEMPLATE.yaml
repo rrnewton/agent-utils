@@ -4,6 +4,11 @@
 # anyway, so deleting this whole file changes nothing: it exists so the policy is reviewable in the
 # project's own history and so there is one place to look. Delete any line whose default suits you.
 #
+# A list set here REPLACES the built-in one, so a deny entry a later herdr-run adds to its defaults
+# does not reach this file by itself. herdr-run then prints a warning naming every built-in entry
+# the file leaves out, and `herdr-run init --upgrade` rewrites each setting still exactly as `init`
+# wrote it, leaving the rest of the file alone.
+#
 # The nearest `.herdr-run.yaml` (or `.herdr-run.yml`) found by searching upward from the working
 # directory wins, the way `.gitignore` does. `herdr-run status` says which file is actually in
 # effect, and `herdr-run config` prints every value it resolved to.
@@ -81,7 +86,9 @@ deny_subcommand_option:
 # Global options that consume the FOLLOWING token as their value. Needed so that the first real
 # argument is recognised as the subcommand and not mistaken for an option's value: a missing entry
 # lets `git --attr-source HEAD daemon` pass for a `HEAD` subcommand. Git's entries are the
-# top-level options git.c hands the next argument to.
+# top-level options git.c hands the next argument to. These are each program's own syntax, not
+# policy, so unlike every other list here this one ADDS to the built-in table: an entry can be
+# added for a program, never taken away.
 value_options:
   git: ["-C", "-c", "--git-dir", "--work-tree", "--namespace", "--exec-path", "--config-env",
         "--super-prefix", "--shallow-file", "--attr-source"]
