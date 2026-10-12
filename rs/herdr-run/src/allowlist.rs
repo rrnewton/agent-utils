@@ -163,7 +163,9 @@ pub fn admit(command: &str, config: &Config) -> Result<Admission> {
         )));
     }
     let program = rest[0].clone();
-    if program.contains('/') {
+    // A leading `~` counts as a path too: rendering expands it (`~root` becomes `/root`), so it
+    // would pass this check as a name and run as a path.
+    if program.contains('/') || program.starts_with('~') {
         return Err(HerdrRunError::refused(format!(
             "program must be a bare command name resolved from PATH, not a path: {}",
             quote(&program)
@@ -616,6 +618,8 @@ mod tests {
         for (command, fragment) in [
             ("/bin/curl x", "bare command name"),
             ("./curl x", "bare command name"),
+            ("~root x", "bare command name"),
+            ("~ x", "bare command name"),
             ("curl x\u{0007}", "terminal control U+0007"),
             ("with-proxy with-proxy curl x", "repeated"),
             ("git --exec-path=/tmp/evil status", "is denied for git"),

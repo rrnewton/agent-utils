@@ -503,8 +503,9 @@ the admitted argument vector. There is no
 metacharacter blocklist, deliberately: a list of `;`, `&&`, backticks, `$()`, newlines… is a *proxy*
 for "cannot start a second command", whereas re-quoting is the property itself.
 
-Also enforced: the program must be a **bare name** resolved from the pane's `PATH` (so `./git` or
-`/tmp/gh` cannot masquerade), and each wrapper prefix may appear at most once.
+Also enforced: the program must be a **bare name** resolved from the pane's `PATH` (so `./git`,
+`/tmp/gh`, or `~user/gh`, which `~` expansion would turn into a path, cannot masquerade), and each
+wrapper prefix may appear at most once.
 
 **`cargo` is a special case and is not allowed by default.** Even `fetch` and `metadata` can execute
 ambiently configured compiler wrappers, credential providers, or fetch helpers, so calling those

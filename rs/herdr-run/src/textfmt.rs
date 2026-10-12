@@ -356,4 +356,64 @@ mod tests {
         assert_eq!(parse_exit_marker("0\u{a0}".as_bytes()), None);
         assert_eq!(parse_exit_marker(b"0000000000000007"), Some(7));
     }
+
+    /// The text rules shared with the Python edition, from the corpus both test suites load.
+    const CASES: &str = include_str!("../testdata/text_cases.json");
+
+    fn rows(key: &str) -> Vec<Vec<Value>> {
+        let document: Value = serde_json::from_str(CASES).expect("golden text cases");
+        serde_json::from_value(document[key].clone()).expect("rows")
+    }
+
+    #[test]
+    fn golden_quote() {
+        for row in rows("quote") {
+            assert_eq!(quote(row[0].as_str().unwrap()), row[1], "{row:?}");
+        }
+    }
+
+    #[test]
+    fn golden_number_text() {
+        for row in rows("number_text") {
+            assert_eq!(number_text(row[0].as_f64().unwrap()), row[1], "{row:?}");
+        }
+    }
+
+    #[test]
+    fn golden_exit_marker() {
+        for row in rows("exit_marker") {
+            let payload: Vec<u8> = serde_json::from_value(row[0].clone()).unwrap();
+            let expected = row[1].as_i64().map(|code| i32::try_from(code).unwrap());
+            assert_eq!(parse_exit_marker(&payload), expected, "{row:?}");
+        }
+    }
+
+    #[test]
+    fn golden_float_text() {
+        for row in rows("float_repr") {
+            assert_eq!(
+                python_float_repr(row[0].as_f64().unwrap()),
+                row[1],
+                "{row:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn json_writer_sorts_keys_whatever_the_insertion_order() {
+        let mut forward = serde_json::Map::new();
+        forward.insert("b".to_owned(), Value::from(1));
+        forward.insert("a".to_owned(), serde_json::json!({"z": 0.5, "y": [1.0]}));
+        let mut backward = serde_json::Map::new();
+        backward.insert("a".to_owned(), serde_json::json!({"y": [1.0], "z": 0.5}));
+        backward.insert("b".to_owned(), Value::from(1));
+        let forward = Value::Object(forward);
+        let backward = Value::Object(backward);
+        assert_eq!(json_line(&forward), json_line(&backward));
+        assert_eq!(
+            json_line(&forward),
+            r#"{"a": {"y": [1.0], "z": 0.5}, "b": 1}"#
+        );
+        assert_eq!(json_pretty(&forward), json_pretty(&backward));
+    }
 }

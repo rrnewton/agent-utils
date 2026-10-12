@@ -188,7 +188,9 @@ def admit(command: str, config: Config) -> Admission:
     # A bare name only. An explicit path (`/bin/sh`, `./git`, `../x/gh`) would let any binary be
     # presented under an allowlisted-looking basename, so the name must be resolved by the pane's
     # PATH rather than chosen by the caller.
-    if "/" in program:
+    # A leading `~` counts as a path too: rendering expands it (`~root` becomes `/root`), so it
+    # would pass this check as a name and run as a path.
+    if "/" in program or program.startswith("~"):
         raise Refused(
             f"program must be a bare command name resolved from PATH, not a path: {quote(program)}"
         )

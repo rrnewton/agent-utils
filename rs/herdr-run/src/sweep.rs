@@ -413,6 +413,39 @@ mod tests {
 
     use super::*;
 
+    /// Reap scope and recorded evidence shared with the Python edition.
+    #[test]
+    fn golden_scope_and_evidence() {
+        let document: Value = serde_json::from_str(include_str!("../testdata/record_cases.json"))
+            .expect("golden record cases");
+        let settings = &document["scope_config"];
+        let config = Config {
+            workspace: settings["workspace"].as_str().unwrap().to_owned(),
+            tab_name: settings["tab_name"].as_str().unwrap().to_owned(),
+            project_root: "/p".to_owned(),
+            ..Config::default()
+        };
+        for row in document["scope"].as_array().expect("scope rows") {
+            let records = row[1].as_array().unwrap();
+            let (in_scope, tab_id, tab_label, workspace_label) =
+                scope_of(row[0].as_str().unwrap(), records, &config);
+            assert_eq!(
+                json!([in_scope, tab_id, tab_label, workspace_label]),
+                row[2],
+                "{row:?}"
+            );
+        }
+        for row in document["evidence"].as_array().expect("evidence rows") {
+            let (flags, identity) =
+                evidence_from_runs(row[0].as_str().unwrap(), row[1].as_array().unwrap());
+            assert_eq!(json!(flags), row[2], "{row:?}");
+            let shown = identity.map_or(Value::Null, |identity| {
+                json!([identity.pid, identity.boot_id, identity.start_ticks])
+            });
+            assert_eq!(shown, row[3], "{row:?}");
+        }
+    }
+
     const BOOT: &str = "3f2b1c8e-0000-4000-8000-000000000001";
 
     static SEQUENCE: AtomicUsize = AtomicUsize::new(0);

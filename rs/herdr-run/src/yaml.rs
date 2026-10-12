@@ -1547,7 +1547,55 @@ pub fn core_load(text: &str) -> std::result::Result<Yaml, YamlError> {
 
 #[cfg(test)]
 mod tests {
+    use serde_json::Value;
+
     use super::*;
+    use crate::textfmt::{python_float_repr, quote};
+
+    /// The corpus's canonical rendering, written out the same way in the Python golden test.
+    fn render(value: &Yaml) -> String {
+        match value {
+            Yaml::Null => "null".to_owned(),
+            Yaml::Bool(true) => "true".to_owned(),
+            Yaml::Bool(false) => "false".to_owned(),
+            Yaml::Int(number) => number.to_string(),
+            Yaml::Float(number) => python_float_repr(*number),
+            Yaml::Str(text) => quote(text),
+            Yaml::Seq(items) => format!(
+                "[{}]",
+                items.iter().map(render).collect::<Vec<_>>().join(", ")
+            ),
+            Yaml::Map(entries) => format!(
+                "{{{}}}",
+                entries
+                    .iter()
+                    .map(|(key, item)| format!("{}: {}", quote(key), render(item)))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+        }
+    }
+
+    #[test]
+    fn golden_yaml_subset() {
+        let document: Value =
+            serde_json::from_str(include_str!("../testdata/yaml_cases.json")).expect("cases");
+        for case in document["cases"].as_array().expect("case list") {
+            let name = case["name"].as_str().expect("name");
+            let loaded = core_load(case["text"].as_str().expect("text"));
+            match (loaded, case.get("error").and_then(Value::as_str)) {
+                (Err(error), Some(expected)) => assert_eq!(error.to_string(), expected, "{name}"),
+                (Ok(value), None) => assert_eq!(render(&value), case["value"], "{name}"),
+                (Ok(value), Some(expected)) => {
+                    panic!(
+                        "{name}: accepted {} but expected {expected}",
+                        render(&value)
+                    )
+                }
+                (Err(error), None) => panic!("{name}: refused with {error}"),
+            }
+        }
+    }
 
     #[test]
     fn integers_are_clamped_and_leading_zeros_are_strings() {

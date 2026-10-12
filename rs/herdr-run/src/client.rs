@@ -1091,6 +1091,96 @@ mod tests {
 
     static TEMPORARY_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
+    fn protocol_value(client: &HerdrClient, method: &str, args: &[String]) -> Result<Value> {
+        Ok(match method {
+            "workspace_id_for_label" => serde_json::json!(client.workspace_id_for_label(&args[0])?),
+            "tab_id_for_label" => serde_json::json!(client.tab_id_for_label(&args[0], &args[1])?),
+            "panes" => {
+                let panes = client.panes(args.first().map(String::as_str))?;
+                let shown = panes
+                    .iter()
+                    .map(|pane| serde_json::json!([pane.pane_id, pane.tab_id, pane.workspace_id]))
+                    .collect::<Vec<_>>();
+                Value::Array(shown)
+            }
+            "process_info" => {
+                let info = client.process_info(&args[0])?;
+                let foreground = info
+                    .foreground
+                    .iter()
+                    .map(|(pid, name, cmdline)| serde_json::json!([pid, name, cmdline]))
+                    .collect::<Vec<_>>();
+                serde_json::json!([
+                    info.pane_id,
+                    info.shell_pid,
+                    info.foreground_pgid,
+                    foreground
+                ])
+            }
+            "create_workspace" => {
+                let (workspace, tab, pane) = client.create_workspace(&args[0], &args[1])?;
+                serde_json::json!([workspace, tab, pane])
+            }
+            "create_tab" => serde_json::json!(client.create_tab(&args[0], &args[1], &args[2])?),
+            "read" => serde_json::json!(client.read(&args[0], "recent-unwrapped", None)?),
+            "run" => {
+                client.run(&args[0], &args[1])?;
+                Value::Null
+            }
+            "pane_exists" => serde_json::json!(client.pane_exists(&args[0])),
+            "rename_tab" => {
+                client.rename_tab(&args[0], &args[1])?;
+                Value::Null
+            }
+            "close_tab" => {
+                client.close_tab(&args[0])?;
+                Value::Null
+            }
+            other => panic!("unknown protocol method {other}"),
+        })
+    }
+
+    /// Herdr protocol calls shared with the Python edition: argv sent, value or error returned.
+    #[test]
+    fn golden_protocol() {
+        let document: Value = serde_json::from_str(include_str!("../testdata/protocol_cases.json"))
+            .expect("golden protocol cases");
+        assert_eq!(document["herdr"], "/opt/herdr/bin/herdr");
+        for case in document["cases"].as_array().expect("case list") {
+            let outputs = case["responses"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|response| {
+                    output(
+                        i32::try_from(response[0].as_i64().unwrap()).unwrap(),
+                        response[1].as_str().unwrap(),
+                        response[2].as_str().unwrap(),
+                    )
+                })
+                .collect();
+            let runner = FakeRunner::with_outputs(outputs);
+            let client = client("direct", runner.clone());
+            let args = case["args"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter_map(|argument| argument.as_str().map(str::to_owned))
+                .collect::<Vec<_>>();
+            let method = case["method"].as_str().unwrap();
+            match (protocol_value(&client, method, &args), case.get("error")) {
+                (Ok(value), None) => assert_eq!(value, case["ok"], "{case}"),
+                (Err(error), Some(expected)) => assert_eq!(error.to_string(), *expected, "{case}"),
+                (got, _) => panic!("{case}: got {got:?}"),
+            }
+            assert_eq!(serde_json::json!(runner.calls()), case["calls"], "{case}");
+            assert!(
+                runner.outputs.lock().expect("outputs lock").is_empty(),
+                "{case}"
+            );
+        }
+    }
+
     #[derive(Default)]
     struct FakeRunner {
         calls: Mutex<Vec<Vec<String>>>,

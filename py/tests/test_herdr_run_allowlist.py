@@ -91,7 +91,7 @@ def test_refuses_prefix_used_as_program(config: Config) -> None:
         admit("with-proxy with-proxy git status", config)
 
 
-@pytest.mark.parametrize("program", ["/bin/git", "./git", "../bin/gh", "/usr/bin/gh"])
+@pytest.mark.parametrize("program", ["/bin/git", "./git", "../bin/gh", "/usr/bin/gh", "~git", "~"])
 def test_refuses_pathed_program(config: Config, program: str) -> None:
     # An explicit path would let any binary be presented under an allowlisted-looking basename.
     with pytest.raises(Refused, match="bare command name"):
@@ -238,6 +238,8 @@ def test_the_allow_wildcard_admits_any_program_and_keeps_every_other_rule() -> N
     for command, fragment in (
         ("/bin/curl x", "bare command name"),
         ("./curl x", "bare command name"),
+        ("~root x", "bare command name"),
+        ("~ x", "bare command name"),
         ("curl x\x07", "terminal control U+0007"),
         ("with-proxy with-proxy curl x", "repeated"),
         ("git --exec-path=/tmp/evil status", "is denied for git"),

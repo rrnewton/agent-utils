@@ -422,6 +422,31 @@ mod tests {
 
     use super::*;
 
+    /// Session-cache entries shared with the Python edition: which load, and as what.
+    #[test]
+    fn golden_session_cache_entries() {
+        let document: serde_json::Value =
+            serde_json::from_str(include_str!("../testdata/record_cases.json"))
+                .expect("golden record cases");
+        let root = temporary_root("golden-cache");
+        let path = root.join("session-cache.json");
+        for row in document["cache"].as_array().expect("cache rows") {
+            fs::write(&path, serde_json::to_string(&row[0]).unwrap()).unwrap();
+            let shown =
+                load_cache(&path, "agent-cmds\u{0}a").map_or(serde_json::Value::Null, |record| {
+                    serde_json::json!([
+                        record.workspace_id,
+                        record.tab_id,
+                        record.pane_id,
+                        record.workspace_label,
+                        record.tab_label
+                    ])
+                });
+            assert_eq!(shown, row[1], "{row:?}");
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+
     #[derive(Clone)]
     struct FakeHerdr {
         state: Arc<Mutex<FakeState>>,

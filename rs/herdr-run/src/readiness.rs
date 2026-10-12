@@ -363,6 +363,36 @@ mod tests {
 
     use super::*;
 
+    /// Prompt verdicts and rc-file prompt tails shared with the Python edition.
+    #[test]
+    fn golden_readiness() {
+        let document: serde_json::Value =
+            serde_json::from_str(include_str!("../testdata/readiness_cases.json"))
+                .expect("golden readiness cases");
+        for row in document["prompt"].as_array().expect("prompt rows") {
+            let signal = assess_prompt(row[0].as_str().unwrap(), row[1].as_str());
+            assert_eq!(signal.verdict, row[2], "{row:?}");
+            assert_eq!(signal.reason, row[3], "{row:?}");
+            assert_eq!(signal.last_line.as_deref(), row[4].as_str(), "{row:?}");
+        }
+        for row in document["rc_files"].as_array().expect("rc rows") {
+            let payload: Vec<u8> = serde_json::from_value(row[0].clone()).unwrap();
+            let root = std::env::temp_dir().join(format!(
+                "herdr-run-readiness-golden-{}-{}",
+                std::process::id(),
+                TEMPORARY_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+            ));
+            fs::create_dir_all(&root).unwrap();
+            fs::write(root.join(".bashrc"), payload).unwrap();
+            assert_eq!(
+                infer_prompt_tail(&Config::default(), Some(&root)).as_deref(),
+                row[1].as_str(),
+                "{row:?}"
+            );
+            fs::remove_dir_all(root).unwrap();
+        }
+    }
+
     static TEMPORARY_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
     fn config() -> Config {
