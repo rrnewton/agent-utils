@@ -19,12 +19,15 @@ from decimal import Decimal
 
 __all__ = [
     "ASCII_WHITESPACE",
+    "BLANK_CHARACTERS",
+    "DEFAULT_IGNORABLE_RANGES",
     "FORMAT_CHARACTER_RANGES",
     "JSON_MAX_DEPTH",
     "UNICODE_WHITESPACE",
     "display",
     "format_round3",
     "is_blank",
+    "is_default_ignorable",
     "is_format_character",
     "is_invisible",
     "name_violation",
@@ -84,21 +87,72 @@ FORMAT_CHARACTER_RANGES: tuple[tuple[int, int], ...] = (
 )
 
 
+#: Unicode ``Default_Ignorable_Code_Point``, written out as of Unicode 16.0: characters a renderer
+#: shows as nothing at all unless it supports them specially. Besides most format characters it
+#: holds the combining grapheme joiner (U+034F), the Khmer inherent vowels (U+17B4, U+17B5), the
+#: Mongolian free variation selectors (U+180B..U+180D, U+180F), the variation selectors
+#: (U+FE00..U+FE0F, U+E0100..U+E01EF), the Hangul fillers, and code points reserved for more of
+#: the same (U+2065, U+FFF0..U+FFF8, and the unassigned rest of U+E0000..U+E0FFF), so a
+#: character a later Unicode version assigns there is refused too.
+DEFAULT_IGNORABLE_RANGES: tuple[tuple[int, int], ...] = (
+    (0x00AD, 0x00AD),
+    (0x034F, 0x034F),
+    (0x061C, 0x061C),
+    (0x115F, 0x1160),
+    (0x17B4, 0x17B5),
+    (0x180B, 0x180F),
+    (0x200B, 0x200F),
+    (0x202A, 0x202E),
+    (0x2060, 0x206F),
+    (0x3164, 0x3164),
+    (0xFE00, 0xFE0F),
+    (0xFEFF, 0xFEFF),
+    (0xFFA0, 0xFFA0),
+    (0xFFF0, 0xFFF8),
+    (0x1BCA0, 0x1BCA3),
+    (0x1D173, 0x1D17A),
+    (0xE0000, 0xE0FFF),
+)
+
+#: Assigned, ordinary characters that nevertheless draw as empty space: the Hangul fillers
+#: (U+115F, U+1160, U+3164, U+FFA0, which are also default-ignorable) and U+2800 BRAILLE PATTERN
+#: BLANK, which is neither default-ignorable nor white space and so needs naming on its own.
+BLANK_CHARACTERS: frozenset[str] = frozenset("\u115f\u1160\u2800\u3164\uffa0")
+
+
 def is_format_character(character: str) -> bool:
     """True for a character in :data:`FORMAT_CHARACTER_RANGES`."""
     code = ord(character)
     return any(low <= code <= high for low, high in FORMAT_CHARACTER_RANGES)
 
 
-def is_invisible(character: str) -> bool:
-    """True for a format character or a non-ASCII ``White_Space`` character.
+def is_default_ignorable(character: str) -> bool:
+    """True for a character in :data:`DEFAULT_IGNORABLE_RANGES`."""
+    code = ord(character)
+    return any(low <= code <= high for low, high in DEFAULT_IGNORABLE_RANGES)
 
-    These are the characters a reader cannot see: a no-break space looks like a space, a line
-    separator like a line break or nothing, a zero-width space or a byte-order mark like nothing at
-    all, and a bidirectional override reorders what follows it.
+
+def is_invisible(character: str) -> bool:
+    """True for a character a reader cannot see.
+
+    That is a format character, a default-ignorable code point, a blank character
+    (:data:`BLANK_CHARACTERS`), or a non-ASCII ``White_Space`` character: a no-break space looks
+    like a space, a line separator like a line break or nothing, a zero-width space, a byte-order
+    mark, a variation selector, or a Hangul filler like nothing at all, and a bidirectional
+    override reorders what follows it.
     """
-    return is_format_character(character) or (
-        character in UNICODE_WHITESPACE and ord(character) > 0x7F
+    return (
+        is_format_character(character)
+        or is_default_ignorable(character)
+        or character in BLANK_CHARACTERS
+        or (character in UNICODE_WHITESPACE and ord(character) > 0x7F)
+    )
+
+
+def _character_class(ranges: list[tuple[int, int]]) -> str:
+    return "".join(
+        re.escape(chr(low)) if low == high else f"{re.escape(chr(low))}-{re.escape(chr(high))}"
+        for low, high in ranges
     )
 
 

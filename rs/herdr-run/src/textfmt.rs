@@ -52,23 +52,69 @@ pub const FORMAT_CHARACTER_RANGES: &[(u32, u32)] = &[
 /// Longest completion marker accepted.
 pub const MAX_EXIT_MARKER_BYTES: usize = 128;
 
-/// True for a character in [`FORMAT_CHARACTER_RANGES`].
-#[must_use]
-pub fn is_format_character(character: char) -> bool {
+/// Unicode `Default_Ignorable_Code_Point`, written out as of Unicode 16.0: characters a renderer
+/// shows as nothing at all unless it supports them specially. Besides most format characters it
+/// holds the combining grapheme joiner (U+034F), the Khmer inherent vowels (U+17B4, U+17B5), the
+/// Mongolian free variation selectors (U+180B..U+180D, U+180F), the variation selectors
+/// (U+FE00..U+FE0F, U+E0100..U+E01EF), the Hangul fillers, and code points reserved for more of
+/// the same (U+2065, U+FFF0..U+FFF8, and the unassigned rest of U+E0000..U+E0FFF), so a
+/// character a later Unicode version assigns there is refused too.
+pub const DEFAULT_IGNORABLE_RANGES: &[(u32, u32)] = &[
+    (0x00AD, 0x00AD),
+    (0x034F, 0x034F),
+    (0x061C, 0x061C),
+    (0x115F, 0x1160),
+    (0x17B4, 0x17B5),
+    (0x180B, 0x180F),
+    (0x200B, 0x200F),
+    (0x202A, 0x202E),
+    (0x2060, 0x206F),
+    (0x3164, 0x3164),
+    (0xFE00, 0xFE0F),
+    (0xFEFF, 0xFEFF),
+    (0xFFA0, 0xFFA0),
+    (0xFFF0, 0xFFF8),
+    (0x1BCA0, 0x1BCA3),
+    (0x1D173, 0x1D17A),
+    (0xE0000, 0xE0FFF),
+];
+
+/// Assigned, ordinary characters that nevertheless draw as empty space: the Hangul fillers
+/// (U+115F, U+1160, U+3164, U+FFA0, which are also default-ignorable) and U+2800 BRAILLE PATTERN
+/// BLANK, which is neither default-ignorable nor white space and so needs naming on its own.
+pub const BLANK_CHARACTERS: &[char] = &['\u{115f}', '\u{1160}', '\u{2800}', '\u{3164}', '\u{ffa0}'];
+
+fn in_ranges(ranges: &[(u32, u32)], character: char) -> bool {
     let code = u32::from(character);
-    FORMAT_CHARACTER_RANGES
+    ranges
         .iter()
         .any(|&(low, high)| (low..=high).contains(&code))
 }
 
-/// True for a format character or a non-ASCII `White_Space` character.
+/// True for a character in [`FORMAT_CHARACTER_RANGES`].
+#[must_use]
+pub fn is_format_character(character: char) -> bool {
+    in_ranges(FORMAT_CHARACTER_RANGES, character)
+}
+
+/// True for a character in [`DEFAULT_IGNORABLE_RANGES`].
+#[must_use]
+pub fn is_default_ignorable(character: char) -> bool {
+    in_ranges(DEFAULT_IGNORABLE_RANGES, character)
+}
+
+/// True for a character a reader cannot see.
 ///
-/// These are the characters a reader cannot see: a no-break space looks like a space, a line
-/// separator like a line break or nothing, a zero-width space or a byte-order mark like nothing at
-/// all, and a bidirectional override reorders what follows it.
+/// That is a format character, a default-ignorable code point, a blank character
+/// ([`BLANK_CHARACTERS`]), or a non-ASCII `White_Space` character: a no-break space looks like a
+/// space, a line separator like a line break or nothing, a zero-width space, a byte-order mark, a
+/// variation selector, or a Hangul filler like nothing at all, and a bidirectional override
+/// reorders what follows it.
 #[must_use]
 pub fn is_invisible(character: char) -> bool {
     is_format_character(character)
+        || is_default_ignorable(character)
+        || BLANK_CHARACTERS.contains(&character)
         || (!character.is_ascii() && UNICODE_WHITESPACE.contains(&character))
 }
 

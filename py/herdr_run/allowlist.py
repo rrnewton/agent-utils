@@ -174,16 +174,26 @@ def _split(command: str) -> tuple[str, ...]:
 
 
 def _matches_denied_option(token: str, denied: str) -> bool:
-    """Match long ``=value`` and Cargo/clap-style attached short-option forms.
+    """Whether ``token`` spells the denied option ``denied``. Every ``deny_*`` option rule uses this.
 
-    Cargo accepts global options after its subcommand and accepts ``-Zfoo``, ``-Z=foo``, and
-    clustered forms such as ``-qZfoo``. Looking only at ``token.split("=")[0]`` therefore leaves a
-    policy bypass. Matching a denied one-letter short option anywhere in a short-option cluster is
-    intentionally fail-closed; dependency-oriented Cargo commands have no positional argument for
-    which a leading-dash token containing ``Z`` is required.
+    Three spellings match:
+
+    * the option itself, or with an attached value: ``--upload-pack``, ``--upload-pack=CMD``;
+    * for a long option (``--`` and at least one more character), any abbreviation of it, with or
+      without a value: ``--upload-pac=CMD``, ``--u``. Git's option parser accepts any prefix that
+      is unambiguous among the options of the subcommand at hand, and which prefixes those are
+      depends on the subcommand and the Git version, so every prefix is refused. A full option
+      that merely starts the same way (``--exec-path`` against ``--exec``) is a different option;
+    * for a one-letter short option, the letter anywhere in a short-option cluster: ``-qu/tmp/x``,
+      ``-Zfoo``, ``-Z=foo``, ``-qZfoo``. Git and Cargo both read clusters and attached values, so
+      looking only at ``token.split("=")[0]`` would leave a bypass. This is intentionally
+      fail-closed: a value that starts with ``-`` and holds the letter is refused too.
     """
     if token == denied or token.startswith(f"{denied}="):
         return True
+    if denied.startswith("--"):
+        name = token.split("=", 1)[0]
+        return len(denied) > 2 and len(name) > 2 and name.startswith("--") and denied.startswith(name)
     return (
         len(denied) == 2
         and denied.startswith("-")
@@ -254,9 +264,9 @@ def admit(command: str, config: Config, *, home: object = _FROM_ENVIRONMENT) -> 
         args.append(expanded)
 
     for token in args:
-        # Match on the option NAME so `--upload-pack=/tmp/evil` is caught as well as the
-        # space-separated `--upload-pack /tmp/evil`.
-        if token.split("=", 1)[0] in config.deny_anywhere:
+        # `--upload-pack=/tmp/evil`, the space-separated `--upload-pack /tmp/evil`, and the
+        # abbreviation `--upload-pac=/tmp/evil` all name the option.
+        if any(_matches_denied_option(token, denied) for denied in config.deny_anywhere):
             raise Refused(
                 f"option {quote(token)} is denied: it names a program for {program} to execute"
             )
@@ -283,8 +293,9 @@ def admit(command: str, config: Config, *, home: object = _FROM_ENVIRONMENT) -> 
                 )
 
     subcommand: str | None = None
+    subcommand_index = len(args)
     expect_value = False
-    for token in args:
+    for index, token in enumerate(args):
         if expect_value:
             # This token is the VALUE of the preceding option (`git -C <path>`), not the
             # subcommand. Without this, `git -C /tmp/repo log` would read `/tmp/repo` as the
@@ -293,6 +304,7 @@ def admit(command: str, config: Config, *, home: object = _FROM_ENVIRONMENT) -> 
             continue
         if not token.startswith("-"):
             subcommand = token
+            subcommand_index = index
             break
         base = token.split("=", 1)[0]
         denied = next(
@@ -336,6 +348,17 @@ def admit(command: str, config: Config, *, home: object = _FROM_ENVIRONMENT) -> 
             f"subcommand {quote(program + ' ' + subcommand)} is denied: it defines or runs "
             "arbitrary code"
         )
+
+    # Options that are harmless elsewhere but name a program after this one subcommand
+    # (`git clone -u CMD`). Every token after the subcommand is judged.
+    if subcommand is not None:
+        scoped = config.deny_subcommand_option.get(program, {}).get(subcommand, ())
+        for token in args[subcommand_index + 1 :]:
+            if any(_matches_denied_option(token, denied) for denied in scoped):
+                raise Refused(
+                    f"option {quote(token)} is denied for {quote(program + ' ' + subcommand)}: "
+                    f"it names a program for {program} to execute"
+                )
 
     return Admission(
         argv=argv,

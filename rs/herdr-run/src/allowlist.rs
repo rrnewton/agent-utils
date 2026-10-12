@@ -212,10 +212,13 @@ pub fn admit_with_home(command: &str, config: &Config, home: Option<&OsStr>) -> 
     }
     let args = expanded_args.as_slice();
     for token in args {
-        let base = token
-            .split_once('=')
-            .map_or(token.as_str(), |(name, _)| name);
-        if config.deny_anywhere.iter().any(|denied| denied == base) {
+        // `--upload-pack=/tmp/evil`, the space-separated `--upload-pack /tmp/evil`, and the
+        // abbreviation `--upload-pac=/tmp/evil` all name the option.
+        if config
+            .deny_anywhere
+            .iter()
+            .any(|denied| matches_denied_option(token, denied))
+        {
             return Err(HerdrRunError::refused(format!(
                 "option {} is denied: it names a program for {program} to execute",
                 quote(token)
@@ -253,14 +256,16 @@ pub fn admit_with_home(command: &str, config: &Config, home: Option<&OsStr>) -> 
     }
 
     let mut subcommand = None;
+    let mut subcommand_index = args.len();
     let mut expect_value = false;
-    for token in args {
+    for (index, token) in args.iter().enumerate() {
         if expect_value {
             expect_value = false;
             continue;
         }
         if !token.starts_with('-') {
             subcommand = Some(token.clone());
+            subcommand_index = index;
             break;
         }
         let (base, has_inline_value) = token
@@ -311,6 +316,25 @@ pub fn admit_with_home(command: &str, config: &Config, home: Option<&OsStr>) -> 
                 quote(&format!("{program} {candidate}"))
             )));
         }
+        // Options that are harmless elsewhere but name a program after this one subcommand
+        // (`git clone -u CMD`). Every token after the subcommand is judged.
+        let scoped = config
+            .deny_subcommand_option
+            .get(&program)
+            .and_then(|entries| entries.get(candidate))
+            .map_or(&[][..], Vec::as_slice);
+        for token in &args[subcommand_index + 1..] {
+            if scoped
+                .iter()
+                .any(|denied| matches_denied_option(token, denied))
+            {
+                return Err(HerdrRunError::refused(format!(
+                    "option {} is denied for {}: it names a program for {program} to execute",
+                    quote(token),
+                    quote(&format!("{program} {candidate}"))
+                )));
+            }
+        }
     }
     let rendered = prefix
         .iter()
@@ -328,6 +352,15 @@ pub fn admit_with_home(command: &str, config: &Config, home: Option<&OsStr>) -> 
     })
 }
 
+/// Whether `token` spells the denied option `denied`. Every `deny_*` option rule uses this.
+///
+/// Three spellings match: the option itself or with an attached value (`--upload-pack=CMD`); for
+/// a long option (`--` and at least one more character), any abbreviation of it with or without a
+/// value (`--upload-pac=CMD`, `--u`), because Git's option parser accepts any prefix that is
+/// unambiguous among the subcommand's options and which those are depends on the subcommand and
+/// the Git version; and for a one-letter short option, the letter anywhere in a short-option
+/// cluster (`-qu/tmp/x`, `-Zfoo`, `-Z=foo`, `-qZfoo`), which is intentionally fail-closed. A full
+/// option that merely starts the same way (`--exec-path` against `--exec`) is a different option.
 fn matches_denied_option(token: &str, denied: &str) -> bool {
     if token == denied
         || token
@@ -335,6 +368,13 @@ fn matches_denied_option(token: &str, denied: &str) -> bool {
             .is_some_and(|rest| rest.starts_with('='))
     {
         return true;
+    }
+    if denied.starts_with("--") {
+        let name = token.split_once('=').map_or(token, |(name, _)| name);
+        return denied.len() > 2
+            && name.len() > 2
+            && name.starts_with("--")
+            && denied.starts_with(name);
     }
     let mut denied_chars = denied.chars();
     let Some('-') = denied_chars.next() else {

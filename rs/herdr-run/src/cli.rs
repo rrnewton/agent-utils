@@ -942,6 +942,7 @@ fn command_config(config: &Config, agent: &str) -> Result<i32> {
         "deny_anywhere": config.deny_anywhere,
         "deny_global": config.deny_global,
         "deny_subcommand": config.deny_subcommand,
+        "deny_subcommand_option": config.deny_subcommand_option,
         "max_panes": config.max_panes,
         "prefixes": config.prefixes,
         "probe_remote": config.probe_remote,

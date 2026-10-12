@@ -68,6 +68,11 @@ pub struct Config {
     pub deny_subcommand: BTreeMap<String, Vec<String>>,
     /// Options denied wherever they occur after the program.
     pub deny_anywhere: Vec<String>,
+    /// Options denied after one subcommand: program, then subcommand, then options.
+    ///
+    /// For an option that names a program only there, while the same letters are harmless
+    /// elsewhere: `git clone -u CMD` is `--upload-pack`, `git push -u` is not.
+    pub deny_subcommand_option: BTreeMap<String, BTreeMap<String, Vec<String>>>,
     /// Programs whose subcommand must appear in the corresponding positive list.
     pub allow_subcommand: BTreeMap<String, Vec<String>>,
     /// Global options whose value occupies the following token.
@@ -129,7 +134,19 @@ impl Default for Config {
                 ("git", &["filter-branch", "daemon", "instaweb"]),
                 ("gh", &["alias", "extension", "ext", "codespace", "cs"]),
             ]),
-            deny_anywhere: strings(&["--upload-pack", "--receive-pack"]),
+            // `--exec` is the older spelling of `--upload-pack`/`--receive-pack` (push, ls-remote,
+            // fetch-pack, send-pack) and names the program `git archive --remote` runs.
+            deny_anywhere: strings(&["--upload-pack", "--receive-pack", "--exec"]),
+            // `git clone -u CMD` is `--upload-pack`; `git rebase -x CMD` runs CMD after each
+            // commit; `git difftool -x CMD` (`--extcmd`) runs CMD as the diff tool.
+            deny_subcommand_option: BTreeMap::from([(
+                "git".to_owned(),
+                string_map(&[
+                    ("clone", &["-u"]),
+                    ("difftool", &["-x", "--extcmd"]),
+                    ("rebase", &["-x"]),
+                ]),
+            )]),
             allow_subcommand: string_map(&[(
                 "cargo",
                 &[
@@ -142,6 +159,9 @@ impl Default for Config {
                     "search",
                 ],
             )]),
+            // Git's own list: the top-level options `handle_options` in git.c gives the next
+            // argument to. `--super-prefix` was removed in Git 2.41 and is still read by older
+            // Gits; `--exec-path` takes a value only as `--exec-path=PATH` and is denied anyway.
             value_options: string_map(&[
                 (
                     "git",
@@ -153,6 +173,9 @@ impl Default for Config {
                         "--namespace",
                         "--exec-path",
                         "--config-env",
+                        "--super-prefix",
+                        "--shallow-file",
+                        "--attr-source",
                     ],
                 ),
                 ("gh", &["-R", "--repo"]),
@@ -189,7 +212,7 @@ impl Default for Config {
 /// Public because it is also the definition of "every knob", which the generated
 /// `.herdr-run.yaml` has to cover for the user guide to be able to point at that file instead of
 /// restating it.
-pub const KNOWN_KEYS: [&str; 20] = [
+pub const KNOWN_KEYS: [&str; 21] = [
     "workspace",
     "tab_name",
     "cwd",
@@ -198,6 +221,7 @@ pub const KNOWN_KEYS: [&str; 20] = [
     "deny_global",
     "deny_subcommand",
     "deny_anywhere",
+    "deny_subcommand_option",
     "allow_subcommand",
     "value_options",
     "spool_dir",
@@ -433,6 +457,22 @@ fn require_policy_map(value: &Yaml, what: &str) -> Result<BTreeMap<String, Vec<S
     Ok(out)
 }
 
+fn require_policy_map_map(
+    value: &Yaml,
+    what: &str,
+) -> Result<BTreeMap<String, BTreeMap<String, Vec<String>>>> {
+    let entries = require_object(value, what)?;
+    let mut out = BTreeMap::new();
+    for (key, item) in entries {
+        require_policy_name(&Yaml::Str(key.clone()), &format!("{what} key"))?;
+        out.insert(
+            key.clone(),
+            require_policy_map(item, &format!("{what}.{key}"))?,
+        );
+    }
+    Ok(out)
+}
+
 fn require_seconds(value: &Yaml, what: &str) -> Result<f64> {
     let number = match value {
         Yaml::Int(integer) => {
@@ -657,6 +697,9 @@ pub fn parse_config(
             "deny_global" => config.deny_global = require_policy_map(value, &where_)?,
             "deny_subcommand" => config.deny_subcommand = require_policy_map(value, &where_)?,
             "deny_anywhere" => config.deny_anywhere = require_policy_list(value, &where_)?,
+            "deny_subcommand_option" => {
+                config.deny_subcommand_option = require_policy_map_map(value, &where_)?;
+            }
             "allow_subcommand" => config.allow_subcommand = require_policy_map(value, &where_)?,
             "value_options" => config.value_options = require_policy_map(value, &where_)?,
             "spool_dir" => config.spool_dir = require_text(value, &where_)?,

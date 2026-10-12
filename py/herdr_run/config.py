@@ -138,12 +138,31 @@ _DEFAULT_DENY_SUBCOMMAND: dict[str, tuple[str, ...]] = {
 }
 
 #: Options that are dangerous wherever they appear. ``--upload-pack``/``--receive-pack`` name a
-#: program to execute for the "remote" side, which for a local path is simply local execution.
-_DEFAULT_DENY_ANYWHERE: tuple[str, ...] = ("--upload-pack", "--receive-pack")
+#: program to execute for the "remote" side, which for a local path is simply local execution, and
+#: ``--exec`` is the older spelling of the same thing (``git push --exec``, ``git ls-remote
+#: --exec``, ``git fetch-pack --exec``, ``git send-pack --exec``) and also names the program
+#: ``git archive --remote`` runs. Every rule also refuses an abbreviation of a long option it
+#: names (``--upload-pac``), because Git's option parser accepts one.
+_DEFAULT_DENY_ANYWHERE: tuple[str, ...] = ("--upload-pack", "--receive-pack", "--exec")
+
+#: Options denied after one particular subcommand, where the same letters mean something harmless
+#: elsewhere: ``git clone -u CMD`` is ``--upload-pack``, ``git rebase -x CMD`` runs ``CMD`` after
+#: each commit, and ``git difftool -x CMD`` (``--extcmd``) runs ``CMD`` as the diff tool, while
+#: ``git push -u``, ``git add -u``, and ``git cherry-pick -x`` are ordinary options that must stay
+#: usable.
+_DEFAULT_DENY_SUBCOMMAND_OPTION: dict[str, dict[str, tuple[str, ...]]] = {
+    "git": {"clone": ("-u",), "difftool": ("-x", "--extcmd"), "rebase": ("-x",)},
+}
 
 #: Global options that CONSUME the following token as their value, when written space-separated.
 #: Needed to find the subcommand correctly: in ``git -C /tmp/repo log``, ``/tmp/repo`` is a value,
-#: not the subcommand, and misreading it would point every subcommand-level rule at the wrong token.
+#: not the subcommand, and misreading it would point every subcommand-level rule at the wrong token
+#: -- ``git --attr-source HEAD daemon`` read ``HEAD`` as the subcommand and so ran a denied one.
+#: Git's list is the set of top-level options its own ``handle_options`` (``git.c``) gives the
+#: next argument to: ``-C``, ``-c``, ``--git-dir``, ``--work-tree``, ``--namespace``,
+#: ``--config-env``, ``--super-prefix`` (removed from Git 2.41, still read by older Gits),
+#: ``--shallow-file``, and ``--attr-source``. ``--exec-path`` takes its value only as
+#: ``--exec-path=PATH`` and is listed for the sake of older configurations; it is denied anyway.
 _DEFAULT_VALUE_OPTIONS: dict[str, tuple[str, ...]] = {
     "git": (
         "-C",
@@ -153,6 +172,9 @@ _DEFAULT_VALUE_OPTIONS: dict[str, tuple[str, ...]] = {
         "--namespace",
         "--exec-path",
         "--config-env",
+        "--super-prefix",
+        "--shallow-file",
+        "--attr-source",
     ),
     "gh": ("-R", "--repo"),
     "cargo": ("--manifest-path", "--config", "-Z", "-p", "--package", "--target-dir"),
@@ -187,6 +209,13 @@ class Config:
         default_factory=lambda: dict(_DEFAULT_DENY_SUBCOMMAND)
     )
     deny_anywhere: tuple[str, ...] = _DEFAULT_DENY_ANYWHERE
+    #: Options denied after one subcommand: program -> subcommand -> options.
+    deny_subcommand_option: dict[str, dict[str, tuple[str, ...]]] = field(
+        default_factory=lambda: {
+            program: dict(entries)
+            for program, entries in _DEFAULT_DENY_SUBCOMMAND_OPTION.items()
+        }
+    )
     allow_subcommand: dict[str, tuple[str, ...]] = field(
         default_factory=lambda: dict(_DEFAULT_ALLOW_SUBCOMMAND)
     )
@@ -257,6 +286,7 @@ KNOWN_KEYS: tuple[str, ...] = (
     "deny_global",
     "deny_subcommand",
     "deny_anywhere",
+    "deny_subcommand_option",
     "allow_subcommand",
     "value_options",
     "spool_dir",
@@ -391,6 +421,15 @@ def _str_tuple_map(raw: object, what: str) -> dict[str, tuple[str, ...]]:
     for key, value in mapping.items():
         _policy_name(key, f"{what} key")
         out[key] = _str_tuple(value, f"{what}.{key}")
+    return out
+
+
+def _str_tuple_map_map(raw: object, what: str) -> dict[str, dict[str, tuple[str, ...]]]:
+    mapping = _object(raw, what)
+    out: dict[str, dict[str, tuple[str, ...]]] = {}
+    for key, value in mapping.items():
+        _policy_name(key, f"{what} key")
+        out[key] = _str_tuple_map(value, f"{what}.{key}")
     return out
 
 
@@ -545,6 +584,8 @@ def _parse_config(
             config = replace(config, deny_subcommand=_str_tuple_map(raw, where))
         elif key == "deny_anywhere":
             config = replace(config, deny_anywhere=_str_tuple(raw, where))
+        elif key == "deny_subcommand_option":
+            config = replace(config, deny_subcommand_option=_str_tuple_map_map(raw, where))
         elif key == "allow_subcommand":
             config = replace(config, allow_subcommand=_str_tuple_map(raw, where))
         elif key == "value_options":

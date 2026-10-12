@@ -54,6 +54,11 @@ allow_subcommand:
 
 # Defence in depth, NOT the boundary: these remove the best-known ways an allowlisted program can
 # be talked into running something else. Do not mistake a full deny list for containment.
+#
+# Every option rule below refuses the option written out, with an attached value (`--exec=CMD`),
+# and, for a long option, any abbreviation of it (`--upload-pac`, `--ex`), because Git accepts an
+# abbreviation that is unambiguous for the subcommand at hand; a denied one-letter short option is
+# also refused anywhere in a cluster of short options (`-qu`).
 deny_global:
   git: ["-c", "--config-env", "--exec-path", "--namespace"]
   gh: []
@@ -62,12 +67,24 @@ deny_global:
 deny_subcommand:
   git: ["filter-branch", "daemon", "instaweb"]
   gh: ["alias", "extension", "ext", "codespace", "cs"]
-deny_anywhere: ["--upload-pack", "--receive-pack"]
+# `--exec` is the older spelling of the other two, and names the program `git archive --remote` runs.
+deny_anywhere: ["--upload-pack", "--receive-pack", "--exec"]
+# Options denied after one particular subcommand, where the same letters are harmless elsewhere:
+# `git clone -u CMD` is `--upload-pack` and `git rebase -x CMD` runs CMD, while `git push -u` and
+# `git cherry-pick -x` do neither.
+deny_subcommand_option:
+  git:
+    clone: ["-u"]
+    difftool: ["-x", "--extcmd"]
+    rebase: ["-x"]
 
 # Global options that consume the FOLLOWING token as their value. Needed so that the first real
-# argument is recognised as the subcommand and not mistaken for an option's value.
+# argument is recognised as the subcommand and not mistaken for an option's value: a missing entry
+# lets `git --attr-source HEAD daemon` pass for a `HEAD` subcommand. Git's entries are the
+# top-level options git.c hands the next argument to.
 value_options:
-  git: ["-C", "-c", "--git-dir", "--work-tree", "--namespace", "--exec-path", "--config-env"]
+  git: ["-C", "-c", "--git-dir", "--work-tree", "--namespace", "--exec-path", "--config-env",
+        "--super-prefix", "--shallow-file", "--attr-source"]
   gh: ["-R", "--repo"]
   cargo: ["--manifest-path", "--config", "-Z", "-p", "--package", "--target-dir"]
 

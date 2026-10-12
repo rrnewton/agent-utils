@@ -728,6 +728,30 @@
     [
       "\u3000",
       "\"\\u{3000}\""
+    ],
+    [
+      "a\u034fb",
+      "\"a\\u{34f}b\""
+    ],
+    [
+      "\u3164",
+      "\"\\u{3164}\""
+    ],
+    [
+      "dir\u2800",
+      "\"dir\\u{2800}\""
+    ],
+    [
+      "x\ufe0f",
+      "\"x\\u{fe0f}\""
+    ],
+    [
+      "x\udb40\udd00",
+      "\"x\\u{e0100}\""
+    ],
+    [
+      "\u2801",
+      "\u2801"
     ]
   ],
   "name_violation": [
@@ -802,6 +826,106 @@
     [
       "\u061c",
       "invisible character U+061C"
+    ],
+    [
+      "-c\u034f",
+      "invisible character U+034F"
+    ],
+    [
+      "\u115fx",
+      "invisible character U+115F"
+    ],
+    [
+      "x\u1160",
+      "invisible character U+1160"
+    ],
+    [
+      "\u3164",
+      "invisible character U+3164"
+    ],
+    [
+      "a\uffa0",
+      "invisible character U+FFA0"
+    ],
+    [
+      "\u17b4",
+      "invisible character U+17B4"
+    ],
+    [
+      "\u17b5",
+      "invisible character U+17B5"
+    ],
+    [
+      "x\u180b",
+      "invisible character U+180B"
+    ],
+    [
+      "x\u180d",
+      "invisible character U+180D"
+    ],
+    [
+      "x\u180f",
+      "invisible character U+180F"
+    ],
+    [
+      "x\ufe00",
+      "invisible character U+FE00"
+    ],
+    [
+      "x\ufe0f",
+      "invisible character U+FE0F"
+    ],
+    [
+      "x\udb40\udd00",
+      "invisible character U+E0100"
+    ],
+    [
+      "x\udb40\uddef",
+      "invisible character U+E01EF"
+    ],
+    [
+      "x\udb40\udc80",
+      "invisible character U+E0080"
+    ],
+    [
+      "x\udb43\udfff",
+      "invisible character U+E0FFF"
+    ],
+    [
+      "x\udb40\udc00",
+      "invisible character U+E0000"
+    ],
+    [
+      "x\u2065",
+      "invisible character U+2065"
+    ],
+    [
+      "x\ufff0",
+      "invisible character U+FFF0"
+    ],
+    [
+      "x\u2800",
+      "invisible character U+2800"
+    ],
+    [
+      "x\u034e",
+      null
+    ],
+    [
+      "x\u2801",
+      null
+    ],
+    [
+      "x\ufe10",
+      null
+    ],
+    [
+      "x\udb44\udc00",
+      null
+    ],
+    [
+      "x\u17b6",
+      null
     ]
   ],
   "json": [

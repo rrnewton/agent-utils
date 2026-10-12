@@ -910,6 +910,10 @@ def _cmd_config(config: Config, agent: str) -> int:
             key: list(value) for key, value in config.deny_subcommand.items()
         },
         "deny_anywhere": list(config.deny_anywhere),
+        "deny_subcommand_option": {
+            program: {subcommand: list(options) for subcommand, options in entries.items()}
+            for program, entries in config.deny_subcommand_option.items()
+        },
         "allow_subcommand": {
             key: list(value) for key, value in config.allow_subcommand.items()
         },
