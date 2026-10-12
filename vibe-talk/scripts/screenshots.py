@@ -846,6 +846,10 @@ class Scene:
     # no pointer to drag its edge -- so running the scene there would either fail confusingly or,
     # far worse, PASS and be filed as evidence that a phone has a desktop layout.
     profiles: tuple[str, ...] | None = None
+    # Run after the capture, to put back what the walk changed ON THE SERVER. The profiles share one
+    # server, so a message one profile's walk marked Done would be drawn read in every later
+    # profile's pictures, under names that do not say so. `#245 done-feedback` added it for its Done.
+    after: Callable[["Driver"], None] | None = None
 
 
 class Driver:
@@ -2143,6 +2147,50 @@ def _act_elision_word_count(driver: Driver) -> None:
         "if (small) small.scrollIntoView({ block: 'start' }); return true; })()"
     )
     driver.settle(300)
+
+
+
+def _act_done_feedback(driver: Driver) -> None:
+    """`#245 done-feedback`: a message marked Done from the keyboard, caught while its grey ring holds.
+
+    The list takes the focus, a message is selected and e is pressed: the selection moves on to the
+    next unread message, ringed in the accent, and the message just marked keeps a grey ring at the
+    read strength for most of a second. The shutter opens inside that second; the animation into it
+    is finished by the capture, so the picture is the look the eye is left with. The message is found
+    again by its id, since the Done may draw its row afresh.
+    """
+    _act_open_channel(driver)
+    driver.page.mouse.move(1, 1)
+    driver.js("(() => { document.getElementById('scroll-area').focus(); return true; })()")
+    # n, not an arrow: the first UNREAD message below the top of the screen, so e marks it Done
+    # rather than putting back a message something before this state left read.
+    driver.page.keyboard.press("n")
+    driver.settle(150)
+    driver.js(
+        "(() => { const row = document.querySelector('#discord-log > li[data-selected=\"true\"]'); "
+        "if (!row) return false; window.__doneProbe = row.getAttribute('data-id'); return true; })()"
+    )
+    driver.page.keyboard.press("e")
+    driver.settle(250)
+
+
+def _undo_done_feedback(driver: Driver) -> None:
+    """After `50-done-feedback`'s capture: its Undo, so later pictures do not draw that message read."""
+    driver.click("undo-dismiss")
+    driver.page.wait_for_function(
+        "() => { const r = [...document.querySelectorAll('#discord-log > li')].find((n) => "
+        "n.getAttribute('data-id') === window.__doneProbe); return !!r && r.getAttribute('data-archived') "
+        "=== 'false'; }",
+        timeout=5_000,
+    )
+
+
+# The colour a CSS custom property resolves to, as the browser computes a colour from it.
+RESOLVE_COLOUR_JS = (
+    "window.__colour = (name) => { const s = document.createElement('span'); "
+    "s.style.color = `var(${name})`; document.body.append(s); "
+    "const c = getComputedStyle(s).color; s.remove(); return c; }"
+)
 
 
 def _act_reply_view(driver: Driver) -> None:
@@ -4693,6 +4741,41 @@ SCENES: tuple[Scene, ...] = (
             ),
         ),
     ),
+    Scene(
+        name="50-done-feedback",
+        what="a message just marked Done: ringed grey at the read strength, the next unread selected in the accent",
+        act=_act_done_feedback,
+        after=_undo_done_feedback,
+        profiles=("android-412", "laptop-1280"),
+        expect=(
+            ("the Discord pane is up", "window.__visible('pane-discord')"),
+            (
+                "the message e marked is Done, and drawn as just marked",
+                "(() => { const r = [...document.querySelectorAll('#discord-log > li')].find((n) => "
+                "n.getAttribute('data-id') === window.__doneProbe); "
+                "return !!r && r.getAttribute('data-archived') === 'true' "
+                "&& r.getAttribute('data-done-flash') === 'marking' "
+                "&& r.getAttribute('data-selected') !== 'true'; })()",
+            ),
+            (
+                # THE claim only a browser can make: what the two rings are drawn in.
+                "it is ringed grey; the next unread message is selected and ringed in the accent",
+                "(() => { " + RESOLVE_COLOUR_JS + "; "
+                "const r = [...document.querySelectorAll('#discord-log > li')].find((n) => "
+                "n.getAttribute('data-id') === window.__doneProbe); "
+                "const next = document.querySelector('#discord-log > li[data-selected=\"true\"]'); "
+                "if (!next || next === r || next.getAttribute('data-archived') === 'true') return false; "
+                "const a = getComputedStyle(r), b = getComputedStyle(next); "
+                "return a.outlineStyle === 'solid' && a.outlineColor === window.__colour('--muted') "
+                "&& b.outlineStyle === 'solid' && b.outlineColor === window.__colour('--accent'); })()",
+            ),
+            (
+                "the Undo chip is up, and names the message it would put back",
+                "window.__visible('undo-dismiss') && "
+                "/^Undo \u201c.+\u201d$/.test(document.getElementById('undo-dismiss-label').textContent)",
+            ),
+        ),
+    ),
     # LAST IN THE WALK, and not by accident: it empties the server's durable store on the way in,
     # so that the summary the state above cached is really regenerated and can really fail. Nothing
     # after it in this profile would miss what it deletes, and the next profile purges anyway.
@@ -4954,6 +5037,8 @@ def run_captures(
                                 str(error).strip().splitlines()[0] if str(error).strip() else "",
                             ) from error
                         driver.capture(scene)
+                        if scene.after is not None:
+                            scene.after(driver)
                         name, path, verdict = driver.results[-1]
                         print(f"  ok    {name:<30} {verdict.describe()}")
                     everything.extend(driver.results)

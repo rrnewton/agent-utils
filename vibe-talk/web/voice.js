@@ -5366,7 +5366,7 @@ function doneFromKeyboard(target) {
   const rows = paneRows(pane);
   const at = rows.indexOf(row);
   const next = marking ? unreadAfter(rows, at) : null;
-  guardQuietly(() => toggleArchived(ids))();
+  guardQuietly(() => toggleArchived(ids, row))();
   landAfterDone(pane, next && next.getAttribute("data-id"), ids[0], at);
   return true;
 }
@@ -16215,6 +16215,8 @@ function renderChannelRows() {
     // and the whole point of the archive is that it says what is left.
     const isArchived = ids.length > 0 && ids.every((one) => archivedIds.has(one));
     row.setAttribute("data-archived", isArchived ? "true" : "false");
+    // `#245 done-feedback`. The moment of a Done, on whichever row now stands for the message.
+    drawDoneFlash(row);
     // `#206 pin-message`. Pinned when ANY message the row stands for is — the `every` reading would
     // hide a pin behind its row's unpinned half — and Unpin then acts on every one of them. The
     // chip says it in words, and says when what is shown is the copy the pin kept.
@@ -19745,7 +19747,7 @@ function swipeable(li, messages) {
       // the reader is looking at. Symmetric deliberately: a gesture that only ever went one way
       // would make the greyed rows a trap.
       if (channelView === "thread" && dx > 0) guardQuietly(closeThread)();
-      else guardQuietly(() => toggleArchived(ids))();
+      else guardQuietly(() => toggleArchived(ids, li))();
     }
   };
 
@@ -20395,7 +20397,7 @@ function discordNode(messages) {
   // EVERY constituent, not the row's identity: archiving a row that leaves half of itself in the
   // queue is the failure mode a display-layer grouping has to be built against.
   const ids = messages.map((m) => String(m.id));
-  done.addEventListener("click", inThisColumn(() => guardQuietly(() => toggleArchived(ids))()));
+  done.addEventListener("click", inThisColumn(() => guardQuietly(() => toggleArchived(ids, li))()));
   sayRowShortcut(done, "done-button");
   // `#196 auto-read-noise`. The rescue for a rule that caught a message by mistake: ONE message,
   // recorded on the server, leaving the rule to go on catching the placeholders it is right about.
@@ -20490,6 +20492,8 @@ async function markReadThroughHere(row, upstreamId) {
   const at = rows.indexOf(row);
   if (at < 0) return;
   const ids = rows.slice(0, at + 1).flatMap(idsOf).filter((id) => !archivedIds.has(id));
+  // `#245 done-feedback`. Drawn on the row it was asked from: the boundary is the row the reader is on.
+  if (ids.length) flashDone(row);
   // `#240 reading-bookmark`. A bookmark at or above the row slides below it, with the Done.
   if (ids.length) await dismissMessages({ messages: ids }, throughBump(row));
   let upstream = false;
@@ -21821,6 +21825,52 @@ function noteArchived(payload, replace) {
  */
 let lastDismissal = null;
 
+/**
+ * `#245 done-feedback`. What the Undo chip calls the message it would put back: the message's first
+ * words, cut at a word to about this many characters. The chip floats over the list beside the other
+ * chips, so it has the width of a few words on a phone and no more.
+ */
+const UNDO_NAME_CHARS = 24;
+
+/**
+ * The opening words of `text`, to `UNDO_NAME_CHARS` and cut at a word with an ellipsis, for the
+ * Undo chip. A first word longer than that is cut inside itself rather than dropped.
+ */
+function undoName(text) {
+  let out = "";
+  for (const word of String(text === null || text === undefined ? "" : text).split(/\s+/).filter(Boolean)) {
+    const next = out ? `${out} ${word}` : word;
+    if (next.length > UNDO_NAME_CHARS) return `${out || word.slice(0, UNDO_NAME_CHARS)}…`;
+    out = next;
+  }
+  return out;
+}
+
+/**
+ * The name a dismissal of `ids` gives its Undo: the message's opening words when the ids are ONE
+ * row's (a Done, a swipe), or null when they span rows (Done through here, Clear the backlog), which
+ * the chip then counts instead. Read off the row while it is still drawn: under Hide read it is gone
+ * the moment the dismissal lands.
+ */
+function dismissalName(ids) {
+  const rows = [...el("discord-log").children, ...el("pinned-log").children];
+  const row = rows.find((one) => idsOf(one).includes(ids[0]));
+  if (!row || !ids.every((id) => idsOf(row).includes(id))) return null;
+  const [first] = rowMessages(row);
+  return first ? undoName(messageText(first)) || null : null;
+}
+
+/**
+ * The Undo chip's words. Not a bare "Undo": after a Done the reader's eye is already on the next
+ * message, and an Undo that does not say WHICH message it would put back is a guess. In words, not in
+ * an attribute: the name is channel text.
+ */
+function undoLabel(dismissal) {
+  if (dismissal === null) return "Undo";
+  if (dismissal.name) return `Undo “${dismissal.name}”`;
+  return `Undo Done (${dismissal.messages.length})`;
+}
+
 /** How many the backlog control is about to clear, so it can say so before it does it. */
 let backlogSize = 0;
 
@@ -21838,6 +21888,7 @@ function renderTodoControls() {
     : `Clear the backlog (${backlogSize})`;
   clear.className = backlogIsArmed() ? "chip armed" : "chip";
   el("undo-dismiss").hidden = lastDismissal === null;
+  el("undo-dismiss-label").textContent = undoLabel(lastDismissal);
 }
 
 // Bulk and destructive, so it asks twice — the same armed idiom the Clear control on the dock
@@ -22096,7 +22147,7 @@ function appendToColumns(arriving, live = false, replayed = false) {
  * Both the swipe and the row's button come through here, so the two cannot drift into two notions
  * of what the gesture means.
  */
-async function toggleArchived(ids) {
+async function toggleArchived(ids, row = null) {
   const all = ids.map(String);
   // The row's own reading of itself, and it has to be the SAME `every` the row is drawn with:
   // a half-archived row shows as unread, so the act it offers is Done, and Done must archive the
@@ -22104,8 +22155,95 @@ async function toggleArchived(ids) {
   if (all.length > 0 && all.every((id) => archivedIds.has(id))) {
     await restoreMessages(all);
   } else {
+    // `#245 done-feedback`. BEFORE the dismissal redraws the row as read, so the change is one the
+    // browser can animate rather than a jump.
+    flashDone(row);
     await dismissMessages({ messages: all });
   }
+}
+
+// --- what marking a message Done looks like ------------------------------------------------------
+//
+// `#245 done-feedback`. The owner likes that a read message lights up again when it is selected, and
+// asked for "SOME indication of what just happened" when he marks the selected one read: the keys
+// move the selection straight on to the next unread message (`#224`), so the row he acted on went
+// from lit to greyed out of the corner of his eye, and a lit read row looked exactly like a lit
+// unread one.
+//
+//   * ONE RULE WHEREVER A ROW IS SELECTED (web/voice.css): a selected unread message is ringed in the
+//     accent, a selected read one in grey, on the same lit surface so it is still easy to read. The
+//     ring is the state, so it is the same after a Done, after a reload, and under the mouse.
+//   * THE MOMENT OF MARKING is drawn on the row that was marked, even though the selection has moved
+//     on: its ring turns from blue to grey over a quarter of a second while the row fades to the
+//     read look, holds there, then lets the ring go. That is `data-done-flash`, "marking" and then
+//     "fading", which web/voice.css animates FROM the selected unread look; an animation rather than
+//     a transition, because on a threaded channel the Done redraws the row as a new element, which a
+//     transition has no earlier style to start from. A row still selected keeps its grey ring: the
+//     fading phase lets go only of a ring the selection is not drawing anyway.
+//   * Every way of marking comes through it: the Done button, the e key and a swipe through
+//     `toggleArchived`, Done through here (Shift+E, or the ⋯ menu) on the row it was asked from.
+//   * UNDER REDUCED MOTION the change is instant (web/voice.css); the grey ring still holds, so the
+//     reader still sees which row it was.
+//   * The way back is the Undo chip that was already there, and it now names the message it would
+//     put back (`undoLabel`). There is no second Undo.
+
+/** How long the grey ring stays on a row just marked Done, the quarter-second change included. */
+const DONE_FLASH_HOLD_MS = 900;
+
+/** ...and how long its letting go takes, after which the row is an ordinary read row. */
+const DONE_FLASH_FADE_MS = 300;
+
+/**
+ * Which messages are being drawn as just marked Done, and in which phase: "marking" or "fading".
+ * Kept BY ID, not on the row, because on a threaded channel the Done redraws every row from the store
+ * (`renderCachedTimeline`), and the row that was marked is a new element by the time it is drawn
+ * read. `renderChannelRows` puts the phase on whichever row now stands for the message.
+ */
+const doneFlashing = new Map();
+
+/** The timer each flashing message is waiting on, so a second Done on it starts it again. */
+const doneFlashTimers = new Map();
+
+/** Draw `row`'s phase, or nothing: what `renderChannelRows` does for every row it draws. */
+function drawDoneFlash(row) {
+  const phase = idsOf(row).map((id) => doneFlashing.get(id)).find(Boolean);
+  if (phase) row.setAttribute("data-done-flash", phase);
+  else if (row.hasAttribute("data-done-flash")) row.removeAttribute("data-done-flash");
+}
+
+/** Every drawn row of every list brought into line with `doneFlashing`, after a phase changes. */
+function drawDoneFlashes() {
+  for (const id of ["discord-log", "side-log", "pinned-log"]) {
+    const list = document.getElementById(id);
+    for (const row of list ? [...list.children] : []) drawDoneFlash(row);
+  }
+}
+
+/** Draw the moment `row` was marked Done; see the section note. Nothing without a row. */
+function flashDone(row) {
+  const ids = row ? idsOf(row) : [];
+  if (ids.length === 0) return;
+  const key = ids[0];
+  clearTimeout(doneFlashTimers.get(key));
+  const phase = (value) => {
+    for (const id of ids) {
+      if (value) doneFlashing.set(id, value);
+      else doneFlashing.delete(id);
+    }
+  };
+  phase("marking");
+  // On the row as it is NOW as well, before the Done redraws it: where the row is kept, the change
+  // to the read look then happens under the attribute rather than a frame before it.
+  drawDoneFlash(row);
+  doneFlashTimers.set(key, setTimeout(() => {
+    phase("fading");
+    drawDoneFlashes();
+    doneFlashTimers.set(key, setTimeout(() => {
+      phase(null);
+      doneFlashTimers.delete(key);
+      drawDoneFlashes();
+    }, DONE_FLASH_FADE_MS));
+  }, DONE_FLASH_HOLD_MS));
 }
 
 /**
@@ -22189,7 +22327,9 @@ async function dismissMessages(body, bump = body.messages ? singleDoneBump(body.
   // would undo what reads folded meanwhile (`#222 unread-replies`).
   const added = requested.filter((id) => !archivedIds.has(id));
   const previousDismissal = lastDismissal;
-  lastDismissal = { channel, messages: requested, bump };
+  // `#245 done-feedback`. Named now, while the row is still drawn; see `dismissalName`.
+  const name = dismissalName(requested);
+  lastDismissal = { channel, messages: requested, bump, name };
   for (const id of requested) {
     archivedIds.add(id);
   }
@@ -22243,7 +22383,7 @@ async function dismissMessages(body, bump = body.messages ? singleDoneBump(body.
   }
   settleHeldDone(held, true);
   const stored = (payload.messages || requested).map(String);
-  lastDismissal = { channel, messages: stored, bump };
+  lastDismissal = { channel, messages: stored, bump, name };
   const count = stored.length;
   setStatus(
     `${count} message${count === 1 ? "" : "s"} marked as dealt with here — not in the source chat service.`

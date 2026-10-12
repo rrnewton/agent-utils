@@ -10,7 +10,7 @@
 # tool's lightweight unboxed gate. The root includes `tests.dag.yaml` directly so vibe-talk shares
 # one scheduler and browser cap with the other repository fragments.
 
-.PHONY: validate validate-boxed dag-check fmt check scripts-check contract contract-check typecheck test page pwa-installability enter-to-send-browser offline-cache-browser reactions-browser rich-headers-browser read-aloud-browser post-confirm-browser view-switch-browser read-modes-browser keyboard-browser two-column-browser bookmark-browser reply-continuity-browser voice-read-acceptance-self-test android-speech-self-test live-hint-adapter-self-test container-smoke filter-place-browser voice-composer-browser thread-button-browser clean
+.PHONY: validate validate-boxed dag-check fmt check scripts-check contract contract-check typecheck test page pwa-installability enter-to-send-browser offline-cache-browser reactions-browser rich-headers-browser read-aloud-browser post-confirm-browser view-switch-browser read-modes-browser keyboard-browser two-column-browser bookmark-browser reply-continuity-browser voice-read-acceptance-self-test android-speech-self-test live-hint-adapter-self-test container-smoke filter-place-browser voice-composer-browser thread-button-browser done-feedback-browser clean
 
 # The whole gate for this tool, cheapest and most likely to fail first.
 #
@@ -229,6 +229,14 @@ reply-continuity-browser:
 # another copy of the page, and SCREENSHOTS=dir to keep a PNG of each state.
 thread-button-browser:
 	python3 tests/thread_button_browser.py $(if $(WEB_ROOT),--web-root $(WEB_ROOT)) $(if $(SCREENSHOTS),--screenshots $(SCREENSHOTS))
+
+# `#245 done-feedback` in a real Chromium at 1280x800: a selected unread message ringed in the accent
+# and a selected read one in grey on the same lit surface, by computed style; e draws the moment on the
+# row it left and lets it go; the Undo chip names the message; reduced motion gets the look with no
+# animation. Pass WEB_ROOT=dir to run it against another copy of the page, and SCREENSHOTS=dir to keep
+# a PNG of each step.
+done-feedback-browser:
+	python3 tests/done_feedback_browser.py $(if $(WEB_ROOT),--web-root $(WEB_ROOT)) $(if $(SCREENSHOTS),--screenshots $(SCREENSHOTS))
 
 # The live #47 read-aloud-overlong check is opt-in and may consume provider time. Its transcript
 # reconciliation, PCM-duration metric, re-answer separation, privacy boundaries, threshold edges,

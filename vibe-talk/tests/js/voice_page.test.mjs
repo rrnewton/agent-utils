@@ -3075,6 +3075,15 @@ const TUNING_BANDS = {
     "the characters a folded line holds in the count's phone model: under about forty a phone's " +
     "line is undercounted, past seventy it is a desk's, and the count runs low where it is read " +
     "most (#244 elision-word-count)"],
+  DONE_FLASH_HOLD_MS: [400, 2000,
+    "how long the grey ring holds on a message just marked Done: under the quarter-second change " +
+    "itself nothing is seen to hold, past two seconds it reads as a second selection (#245 done-feedback)"],
+  DONE_FLASH_FADE_MS: [150, 1000,
+    "how long the ring takes to let go: shorter is a ring switched off, longer is a ghost of a " +
+    "selection trailing the list (#245 done-feedback)"],
+  UNDO_NAME_CHARS: [12, 40,
+    "how much of a message the Undo chip names: under a dozen characters names nothing, past forty " +
+    "the chip crowds the row of chips on a phone (#245 done-feedback)"],
   CLEAR_ARMED_MS: [1000, 20000,
     "the second tap that really clears: under a second the confirmation cannot be reached, over " +
     "twenty and a stray later tap still destroys the view"],
@@ -19051,6 +19060,128 @@ test("e MARKS THE SELECTED MESSAGE DONE and moves on to the next unread below; e
   const through = page.dismissCalls[page.dismissCalls.length - 1];
   assert.ok(through && (through.through || (through.messages || []).length > 1),
     `Shift+E did not mark through the selected message: ${JSON.stringify(through)}`);
+});
+
+// --- `#245 done-feedback` ------------------------------------------------------------------------
+
+const DONE_FLASH_HOLD_MS = sourceConstant("DONE_FLASH_HOLD_MS");
+const DONE_FLASH_FADE_MS = sourceConstant("DONE_FLASH_FADE_MS");
+const flashOf = (page, id) => channelRow(page, id).getAttribute("data-done-flash");
+
+test("e DRAWS THE MOMENT ON THE ROW IT MARKED, though the selection moves on: marking, fading, gone (#245)", async () => {
+  const page = await keyboardPageAtTop();
+  await press(page, page.el("scroll-area"), "ArrowDown");
+  assert.equal(selectedId(page), "1");
+  await pressHere(page, "e");
+  assert.equal(selectedId(page), "2", "the selection did not move on to the next unread message");
+  assert.equal(channelRow(page, "1").getAttribute("data-archived"), "true");
+  // The row it left, not the row it went to, carries the change.
+  assert.equal(flashOf(page, "1"), "marking", "the row just marked Done shows nothing of it");
+  assert.equal(flashOf(page, "2"), null, "the next message was drawn as if it had been marked");
+  assert.equal(page.expireTimers(DONE_FLASH_HOLD_MS), 1, "nothing ends the grey ring's hold");
+  assert.equal(flashOf(page, "1"), "fading", "the ring was not let go after its hold");
+  assert.equal(page.expireTimers(DONE_FLASH_FADE_MS), 1, "nothing ends the ring's letting go");
+  assert.equal(flashOf(page, "1"), null, "the row never became an ordinary read row again");
+  // Putting a message back is not marking it: no flash.
+  await pressHere(page, "k");
+  await pressHere(page, "e");
+  assert.equal(channelRow(page, "1").getAttribute("data-archived"), "false");
+  assert.equal(flashOf(page, "1"), null, "putting a message back drew it as marked Done");
+});
+
+test("ON A THREADED CHANNEL, where a Done redraws every row, the new row carries the moment (#245)", async () => {
+  // The store redraws the list as new elements (`renderCachedTimeline`), so a flag put on the row
+  // that was pressed would be thrown away with it. The moment is kept by message, and drawn again.
+  const page = newPage();
+  page.threadingSupported = true;
+  await signIn(page);
+  await showDiscord(page, tallChannel(12));
+  const pressed = channelRow(page, "3");
+  await doneButton(pressed).click();
+  const drawn = channelRow(page, "3");
+  assert.notEqual(drawn, pressed, "the fixture did not redraw the row, so this proves nothing new");
+  assert.equal(drawn.getAttribute("data-archived"), "true");
+  assert.equal(drawn.getAttribute("data-done-flash"), "marking", "the redrawn row lost the moment of marking");
+  assert.equal(page.expireTimers(DONE_FLASH_HOLD_MS), 1);
+  assert.equal(channelRow(page, "3").getAttribute("data-done-flash"), "fading");
+  assert.equal(page.expireTimers(DONE_FLASH_FADE_MS), 1);
+  assert.equal(channelRow(page, "3").hasAttribute("data-done-flash"), false, "the moment outlived its timers");
+});
+
+test("the Done button, a swipe and Done through here draw it too, on the row they acted on (#245)", async () => {
+  const page = await keyboardPageAtTop();
+  await doneButton(channelRow(page, "4")).click();
+  assert.equal(flashOf(page, "4"), "marking", "the Done button marked a row and drew nothing");
+  const commit = sourceConstant("SWIPE_COMMIT_PX") + 10;
+  const touch = (x) => ({ pointerId: 1, pointerType: "touch", clientX: x, clientY: 40 });
+  const swiped = channelRow(page, "6");
+  await swiped.dispatch("pointerdown", touch(300));
+  await swiped.dispatch("pointermove", touch(300 - commit));
+  await swiped.dispatch("pointerup", touch(300 - commit));
+  await page.settle();
+  assert.equal(channelRow(page, "6").getAttribute("data-archived"), "true", "the swipe marked nothing");
+  assert.equal(flashOf(page, "6"), "marking", "a swipe marked a row and drew nothing");
+  // Shift+E from row 9: every row above it is marked, and the one the reader is on is the one drawn.
+  page.el("scroll-area").scrollTop = 0;
+  await press(page, page.el("scroll-area"), "ArrowDown");
+  for (let i = 0; i < 8; i += 1) await pressHere(page, "j");
+  const boundary = selectedId(page);
+  await pressHere(page, "E", { shiftKey: true });
+  assert.equal(channelRow(page, "7").getAttribute("data-archived"), "true", "Done through here marked nothing");
+  assert.equal(flashOf(page, boundary), "marking", "Done through here drew nothing on the row it was asked from");
+  assert.equal(flashOf(page, "7"), null, "every row Done through here marked was flashed, not the one asked from");
+});
+
+test("THE UNDO CHIP NAMES THE MESSAGE it would put back, and counts a Done through here (#245)", async () => {
+  const page = await keyboardPageAtTop();
+  assert.equal(page.el("undo-dismiss").hidden, true);
+  await press(page, page.el("scroll-area"), "ArrowDown");
+  await pressHere(page, "e");
+  assert.equal(page.el("undo-dismiss").hidden, false, "there is no way back after a Done");
+  // tallChannel's first message reads "message 1: a sentence about the overnight run. …": its words
+  // to twenty-four characters, cut at a word.
+  assert.equal(page.el("undo-dismiss-label").textContent, "Undo “message 1: a sentence…”",
+    `the Undo chip says "${page.el("undo-dismiss-label").textContent}", not which message it would put back`);
+  await page.el("undo-dismiss").click();
+  await page.settle();
+  assert.equal(channelRow(page, "1").getAttribute("data-archived"), "false", "the chip put nothing back");
+  assert.equal(page.el("undo-dismiss").hidden, true, "the chip outlived what it undid");
+  assert.equal(page.el("undo-dismiss-label").textContent, "Undo");
+  // Several rows at once are counted, not named after one of them.
+  for (let i = 0; i < 3; i += 1) await pressHere(page, "j");
+  await pressHere(page, "E", { shiftKey: true });
+  assert.match(page.el("undo-dismiss-label").textContent, /^Undo Done \(\d+\)$/);
+  assert.equal(page.el("undo-dismiss-label").textContent, `Undo Done (${page.dismissCalls.at(-1).messages.length})`);
+});
+
+test("SELECTED AND READ IS RINGED GREY, selected and unread in the accent, and marking animates between them (#245)", () => {
+  // The look is the browser's to prove (tests/done_feedback_browser.py reads the computed styles and
+  // the running animations); what this pins is that the rules saying it are where they have to be.
+  const readSelected = /#discord-log li\.discord-message\[data-selected="true"\]:is\(\[data-archived="true"\], \[data-own-read="true"\], \[data-noise="true"\]\)[^{]*\{([^}]*)\}/.exec(CSS_CODE);
+  assert.ok(readSelected, "nothing draws a selected read message differently from a selected unread one");
+  assert.match(readSelected[1], /outline-color:\s*var\(--muted\)/, "a selected read message's ring is not grey");
+  assert.match(readSelected[1], /border-color:\s*var\(--muted\)/, "a selected read message's edge is not grey");
+  assert.match(cssBlock('#discord-log li.discord-message[data-selected="true"]'), /outline:\s*2px solid var\(--accent\)/,
+    "a selected unread message lost its accent ring");
+  // The moment of marking is an animation FROM the selected unread look, so it runs on a row the Done
+  // redrew as a new element as well as on one it kept: a transition has no earlier style there.
+  const from = /@keyframes done-marking \{\s*from \{([^}]*)\}\s*\}/.exec(CSS_CODE);
+  assert.ok(from, "nothing animates the row just marked from the look it had");
+  for (const [property, value] of [["outline-color", "var\\(--accent\\)"], ["background-color", "var\\(--row-hover\\)"],
+    ["opacity", "1"], ["filter", "none"]]) {
+    assert.match(from[1], new RegExp(`${property}:\\s*${value};`), `marking does not start from the selected ${property}`);
+  }
+  assert.match(cssBlock('#discord-log li.discord-message[data-done-flash="marking"]'), /animation:\s*done-marking 0\.25s/,
+    "the row just marked does not change over a quarter of a second");
+  assert.match(cssBlock('#discord-log li.discord-message[data-done-flash="marking"]:not([data-selected="true"])'),
+    /outline-color:\s*var\(--muted\)/, "the row just marked is not ringed grey");
+  assert.match(cssBlock('#discord-log li.discord-message[data-done-flash="fading"]:not([data-selected="true"])'),
+    /animation:\s*done-fading 0\.3s/, "the grey ring is switched off rather than let go");
+  assert.equal(DONE_FLASH_FADE_MS, 300, "the fade's timer and its animation are different lengths");
+  assert.match(CSS_CODE, /@media \(prefers-reduced-motion: reduce\) \{\s*#side-log li\.discord-message\[data-done-flash\],[^{]*#discord-log li\.discord-message\[data-done-flash\],[^{]*\{\s*animation:\s*none;/,
+    "under reduced motion the marking still animates");
+  const plain = cssRules(CSS, '#discord-log li.discord-message[data-selected="true"]').join("");
+  assert.equal(/transition|animation/.test(plain), false, "every selected row animates, so the ring lags behind j and k");
 });
 
 test("UNDER HIDE READ, the row e takes away hands the selection to the next unread message", async () => {

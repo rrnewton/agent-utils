@@ -3849,6 +3849,22 @@ it was reviewed in both schemes because a tint that reads on white can vanish on
 `tests/keyboard_browser.py` counts the rows Chromium draws lit while a real mouse and real keys take
 turns, and requires one.
 
+**Selected and read is ringed grey** (`#245 done-feedback`). A read message comes back to the lit
+surface and full strength when it is selected, so it is easy to read again, and a lit read message
+used to look exactly like a lit unread one: marking the selected message Done with `e`, whose
+selection then moves on to the next unread message, changed nothing the eye could find. So the ring
+says which it is, by one rule wherever a row is selected: the accent for unread, grey for read (Done,
+your own when that setting is on, or noise), on the same lit surface. The moment of marking is drawn
+on the row that was marked, though the selection has left it: its ring turns from the accent to grey
+over a quarter of a second while the row fades to the read look, holds for most of a second, then
+lets go. The Done button, a swipe, `e` and Done through here (on the row it was asked from) all draw
+it. It is an animation from the selected look rather than a transition, because on a threaded
+channel a Done redraws the row as a new element; under `prefers-reduced-motion` the grey ring and
+the read look arrive at once. The way back is the Undo chip that was already there, which now names
+the message it would put back (`Undo “seeded: filed two issues…”`, or `Undo Done (12)` after Done
+through here). `tests/done_feedback_browser.py` reads both rings and the running animation by
+computed style in Chromium, and `50-done-feedback` photographs the moment.
+
 ### Replying from the page
 
 `POST /api/v1/channels/{id}/reply` existed from the start and, until now, had exactly one caller:

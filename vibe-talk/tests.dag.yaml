@@ -482,6 +482,26 @@ steps:
       classification: latency-bound
       rss_baseline_bytes: 1073741824
 
+  # `#245 done-feedback` in the browser engine: on a threaded channel at 1280x800, a selected unread
+  # message is ringed in the accent and a selected read one in grey on the same lit surface, by
+  # computed style; e draws the moment on the row it left (the done-marking animation running, a grey
+  # ring at the read strength, then neither); the Undo chip names the message and puts it back; and
+  # under reduced motion the same look arrives with no animation. Served through Playwright's request
+  # routing, so it opens no port. Measured on 2026-10-12: about 4s wall.
+  - group: check
+    job: done-feedback-browser
+    desc: selected read ringed grey and selected unread in the accent, the moment of a Done, its Undo, and reduced motion, in current Chromium at 1280x800
+    labels: [validation-vibe-talk]
+    cmd: cd vibe-talk && python3 tests/done_feedback_browser.py
+    jobs_flag: ""
+    timeout: 90
+    cpu_timeout: 45
+    hint:
+      resources: {browser: 1}
+      est_duration_s: 5
+      classification: latency-bound
+      rss_baseline_bytes: 1073741824
+
   # ---- the build everything else needs ----------------------------------------------------------
   - group: build
     job: release

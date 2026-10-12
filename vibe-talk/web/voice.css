@@ -4101,6 +4101,115 @@ body {
 }
 
 /*
+ * `#245 done-feedback`. SELECTED AND READ IS RINGED GREY; selected and unread keeps the accent. A
+ * selected read message still comes all the way back to the lit surface and full strength (the rule
+ * above, and the archived one further up), because it is being read; what the grey says is that it
+ * has been dealt with. Before this a lit read row and a lit unread one were the same picture, so
+ * marking the selected message Done changed nothing the eye could find. Read is what `stillToDo`
+ * says it is: archived, the owner's own when that setting is on, or noise. The run line stands for
+ * read messages only, so its ring is grey too, and so are the edges of the row's own controls.
+ */
+#side-log li.discord-message[data-selected="true"]:is([data-archived="true"], [data-own-read="true"], [data-noise="true"]),
+#discord-log li.discord-message[data-selected="true"]:is([data-archived="true"], [data-own-read="true"], [data-noise="true"]),
+#pinned-log li.discord-message[data-selected="true"]:is([data-archived="true"], [data-own-read="true"], [data-noise="true"]) {
+  border-color: var(--muted);
+  outline-color: var(--muted);
+}
+
+#side-log li.discord-message[data-selected="true"]:is([data-archived="true"], [data-own-read="true"], [data-noise="true"]) :is(.reply-button, .done-button, .not-noise-button, .upstream-read-button),
+#discord-log li.discord-message[data-selected="true"]:is([data-archived="true"], [data-own-read="true"], [data-noise="true"]) :is(.reply-button, .done-button, .not-noise-button, .upstream-read-button),
+#pinned-log li.discord-message[data-selected="true"]:is([data-archived="true"], [data-own-read="true"], [data-noise="true"]) :is(.reply-button, .done-button, .not-noise-button, .upstream-read-button) {
+  border-color: var(--muted);
+}
+
+#side-log li.discord-message[data-read-run="head"][data-selected="true"] > .read-run,
+#discord-log li.discord-message[data-read-run="head"][data-selected="true"] > .read-run {
+  outline-color: var(--muted);
+}
+
+/*
+ * ...AND THE MOMENT OF MARKING IS DRAWN ON THE ROW THAT WAS MARKED, though the selection has moved on
+ * to the next unread message. web/voice.js puts `data-done-flash` on it: "marking" holds a grey ring
+ * while the row goes from the selected unread look to the read look over a quarter of a second, and
+ * "fading" then lets the ring and the edge go back to the row's own, unless the row is still
+ * selected, whose grey ring is the rule above.
+ *
+ * ANIMATIONS, NOT TRANSITIONS. On a threaded channel the Done redraws every row from the store, so
+ * the row drawn read is a new element with no earlier style for a transition to start from. An
+ * animation runs FROM a stated look TO whatever the row now is, on a new element as on a kept one:
+ * from the accent ring, the lit surface and full strength, to the read row with its grey ring.
+ */
+@keyframes done-marking {
+  from {
+    outline-color: var(--accent);
+    border-color: var(--accent);
+    background-color: var(--row-hover);
+    opacity: 1;
+    filter: none;
+  }
+}
+
+@keyframes done-fading {
+  from {
+    outline-color: var(--muted);
+    border-color: var(--muted);
+  }
+}
+
+/* A reply recedes by a veil over its box rather than by its opacity (see the section on replies),
+   so the veil comes in with it. */
+@keyframes done-veil {
+  from {
+    background-color: transparent;
+  }
+}
+
+/* The ring is solid throughout, so letting go is a colour fading out rather than a ring switched
+   off; and only on a row the selection is not drawing, so it never hides a ring the selection is. */
+#side-log li.discord-message[data-done-flash]:not([data-selected="true"]),
+#discord-log li.discord-message[data-done-flash]:not([data-selected="true"]),
+#pinned-log li.discord-message[data-done-flash]:not([data-selected="true"]) {
+  outline: 2px solid transparent;
+  outline-offset: -2px;
+}
+
+/* The grey ring itself. A row still selected has it from the selected-and-read rule above. */
+#side-log li.discord-message[data-done-flash="marking"]:not([data-selected="true"]),
+#discord-log li.discord-message[data-done-flash="marking"]:not([data-selected="true"]),
+#pinned-log li.discord-message[data-done-flash="marking"]:not([data-selected="true"]) {
+  border-color: var(--muted);
+  outline-color: var(--muted);
+}
+
+#side-log li.discord-message[data-done-flash="marking"],
+#discord-log li.discord-message[data-done-flash="marking"],
+#pinned-log li.discord-message[data-done-flash="marking"] {
+  animation: done-marking 0.25s ease-out;
+}
+
+#side-log li.discord-message[data-done-flash="marking"]::after,
+#discord-log li.discord-message[data-done-flash="marking"]::after {
+  animation: done-veil 0.25s ease-out;
+}
+
+#side-log li.discord-message[data-done-flash="fading"]:not([data-selected="true"]),
+#discord-log li.discord-message[data-done-flash="fading"]:not([data-selected="true"]),
+#pinned-log li.discord-message[data-done-flash="fading"]:not([data-selected="true"]) {
+  animation: done-fading 0.3s ease-out;
+}
+
+/* No motion asked for: the same grey ring, held, and the same read look, at once. */
+@media (prefers-reduced-motion: reduce) {
+  #side-log li.discord-message[data-done-flash],
+  #discord-log li.discord-message[data-done-flash],
+  #pinned-log li.discord-message[data-done-flash],
+  #side-log li.discord-message[data-done-flash]::after,
+  #discord-log li.discord-message[data-done-flash]::after {
+    animation: none;
+  }
+}
+
+/*
  * What a pointer resting on a CONTROL in a row lights: the disc of a reply's arrow and of the X beside
  * gathered replies (`#204 reply-arrow`, `#215 reply-coalesce`), the halo of the circle at a row's
  * corner (`#228 reply-visible`). Only where a pointer can hover, for the sticky-tap reason above, and
