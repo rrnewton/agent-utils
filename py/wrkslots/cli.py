@@ -802,6 +802,25 @@ _AGENT_REMOVE_BATCH_YIELD_SECONDS = 0.25
 # took 6.7 to 10.1 seconds and the lsof +D it replaces took 34 to 53 seconds;
 # deleting that tree with shutil.rmtree took 10.8 seconds.
 _AGENT_REMOVE_BATCH_ITEM_SECONDS = 60.0
+# Removal decides whether a clean checkout's HEAD is already published by
+# asking which of the remote's branches contain it (_GitVcs.remote_heads_
+# containing).  That question used to be answered by fetching every branch the
+# remote advertised into the checkout's object store, under the registry lock,
+# three times per checkout; for a remote whose branches carry large files that
+# downloaded gigabytes (10+ GiB for one data repository whose branch had
+# moved since the slot last fetched) while every validate admission waited.
+# Now one ls-remote lists the branches; a branch whose tip is already in the
+# local object store is compared locally; only when none contains HEAD are
+# the other tips fetched, commits only, into an empty temporary object store
+# inside the checkout's own Git directory.  When the slot's owner is already
+# gone, removal asks before it takes the registry lock and the answer is
+# reused under the lock for at most this many seconds, so the lock is not held
+# across that network I/O (see _prefetch_remote_containment).  The local facts
+# (HEAD, status, remote URL) are always re-read under the lock.
+_REMOTE_CONTAINMENT_EVIDENCE_MAX_AGE_SECONDS = 300.0
+# Bounds on the ls-remote and on the commits-only fetch of that check.
+_REMOTE_CONTAINMENT_LIST_SECONDS = 60.0
+_REMOTE_CONTAINMENT_FETCH_SECONDS = 300.0
 # The bound on one in-process /proc scan, which is also held to the remaining
 # item budget.
 _AGENT_REMOVE_BATCH_SCAN_SECONDS = 30.0
@@ -10422,6 +10441,55 @@ _ITEM_DEADLINE: contextvars.ContextVar[_ItemDeadline | None] = contextvars.Conte
 )
 
 
+@dataclasses.dataclass(frozen=True)
+class _RemoteContainmentEvidence:
+    """Remote branches seen to contain one commit, and when (time.monotonic()).
+
+    ``refusal`` is the refusal the question ended in instead, if it did; it is
+    raised again rather than asking the remote a second time.
+    """
+
+    refs: tuple[str, ...]
+    observed_at: float
+    refusal: Refusal | None = None
+
+
+# Set only while one agent-slot removal runs (see
+# _REMOTE_CONTAINMENT_EVIDENCE_MAX_AGE_SECONDS).  Maps (object directory,
+# remote URL, commit) to the containment answer that removal obtained before
+# it took the registry lock, so the checks made under the lock reuse it
+# instead of contacting the remote.  An empty answer is reused too: it leads
+# only to a salvage push or a local archive, which keep the work either way.
+# So is a refusal, which removal reports exactly as if it were asked again (a
+# transport outage still gets its redirect-free confirmation under the lock).
+_REMOTE_CONTAINMENT_MEMO: contextvars.ContextVar[
+    dict[tuple[str, str, str], _RemoteContainmentEvidence] | None
+] = contextvars.ContextVar("wrkslots_remote_containment_memo", default=None)
+
+
+# Set only while one agent-slot removal runs: the (archive ref and commit,
+# sha256, size) of each local salvage bundle it has already restored into a fresh
+# bare clone and checked with a full fsck. Removal rechecks a bundle several
+# times before it deletes the slot; a recheck of the very same bytes (the
+# sha256 and size are always recomputed) need not clone and fsck them again.
+_VERIFIED_SALVAGE_BUNDLES: contextvars.ContextVar[
+    set[tuple[str, str, int]] | None
+] = contextvars.ContextVar("wrkslots_verified_salvage_bundles", default=None)
+
+
+@contextlib.contextmanager
+def _remote_containment_scope() -> Iterator[None]:
+    """Keep remote containment answers and bundle verifications for one removal."""
+
+    token = _REMOTE_CONTAINMENT_MEMO.set({})
+    bundles = _VERIFIED_SALVAGE_BUNDLES.set(set())
+    try:
+        yield
+    finally:
+        _VERIFIED_SALVAGE_BUNDLES.reset(bundles)
+        _REMOTE_CONTAINMENT_MEMO.reset(token)
+
+
 def _item_budget_refusal(what: str) -> Refusal:
     deadline = _ITEM_DEADLINE.get()
     seconds = _AGENT_REMOVE_BATCH_ITEM_SECONDS if deadline is None else deadline.seconds
@@ -14816,12 +14884,15 @@ class _GitVcs:
         *,
         own_objects: bool = False,
         alternates: Sequence[Path] = (),
+        parent: Path | None = None,
     ) -> Iterator[tuple[Path, Mapping[str, str]]]:
         """Yield a temporary bare repository whose only configuration is _NETWORK_CONFIG.
 
         Its objects are ``objects``, or, with ``own_objects``, a store of its
         own that starts empty and has no alternates. Each of ``alternates``
-        is added as an alternate object directory, read-only.
+        is added as an alternate object directory, read-only. The temporary
+        repository is made in ``parent`` when given, otherwise in the
+        system temporary directory.
         """
 
         if objects.is_symlink() or not objects.is_dir():
@@ -14833,7 +14904,11 @@ class _GitVcs:
                 raise Refusal(f"Git object directory is absent or unsafe: {alternate}")
             if os.pathsep in str(alternate):
                 raise Refusal(f"Git object directory cannot be an alternate: {alternate}")
-        with tempfile.TemporaryDirectory(prefix="wrkslots-remote-") as temporary:
+        if parent is not None and (parent.is_symlink() or not parent.is_dir()):
+            raise Refusal(f"temporary repository parent is absent or unsafe: {parent}")
+        with tempfile.TemporaryDirectory(
+            prefix="wrkslots-remote-", dir=None if parent is None else str(parent)
+        ) as temporary:
             root = Path(temporary)
             isolated = root / "network.git"
             for directory in (
@@ -14862,15 +14937,23 @@ class _GitVcs:
             }
 
     def confirm_remote_unreachable(
-        self, checkout: Path, remote: str, authority: _RemoteAuthority
+        self,
+        checkout: Path,
+        remote: str,
+        authority: _RemoteAuthority,
+        *,
+        network_authority: _RemoteAuthority | None = None,
     ) -> _RemoteTransportUnavailable:
         """Ask the recorded URL again, without redirects, and return the outage.
 
         An HTTP remote that redirects elsewhere reports the other host's
         connection failure as its own. Asked without following redirects, the
         same remote answers with its redirect instead, which refuses.
+        ``network_authority``, when given, is the URL that was asked (see
+        remote_heads_containing); ``authority`` is still the checkout's own.
         """
 
+        target = authority if network_authority is None else network_authority
         with self._isolated_remote(checkout, remote, authority) as (
             isolated,
             object_env,
@@ -14880,7 +14963,7 @@ class _GitVcs:
                 # environment without GIT_CONFIG_* (see _ISOLATED_HISTORY_ENV).
                 self._ls_remote_inventory(
                     isolated,
-                    authority.url,
+                    target.url,
                     heads_only=True,
                     env_overrides=object_env,
                     config=(("http.followRedirects", "false"),),
@@ -14935,6 +15018,301 @@ class _GitVcs:
         )
         refs = tuple(line for line in result.stdout.splitlines() if line)
         return refs
+
+    def remote_heads_containing(
+        self,
+        checkout: Path,
+        remote: str,
+        head: str,
+        authority: _RemoteAuthority,
+        *,
+        network_authority: _RemoteAuthority | None = None,
+    ) -> tuple[str, ...]:
+        """Return refs/remotes/``remote``/<branch> for each remote branch containing ``head``.
+
+        ``authority`` is the checkout's own recorded remote and is rechecked
+        first, every time. The branches are listed at ``network_authority``
+        when it is given (a submodule whose remote is its source repository's
+        own Git directory; see _submodule_network_authority), otherwise at
+        ``authority``.
+
+        This is the cheap form of fetch_remote followed by
+        remote_refs_containing, and it gives the same answer: one ls-remote
+        lists the remote's branches; a branch whose tip is already a commit
+        in the checkout's object store is compared there; only when none of
+        those contains ``head`` are the remaining tips fetched, and then only
+        their commits (--filter=tree:0 where the remote supports filtering),
+        into an empty temporary object store inside the checkout's own Git
+        directory, never the system temporary directory. No ref of the
+        checkout, including refs/remotes/*, is read or written. The answer is
+        kept for _REMOTE_CONTAINMENT_EVIDENCE_MAX_AGE_SECONDS while a removal
+        runs (_remote_containment_scope) and returned again without
+        contacting the remote.
+        """
+
+        _validate_remote(remote)
+        if not SHA_RE.fullmatch(head):
+            raise Refusal(f"cannot search the remote for invalid commit {head!r}")
+        self.assert_remote_authority(checkout, remote, authority)
+        target = authority if network_authority is None else network_authority
+        expected_digest = hashlib.sha256(target.url.encode("utf-8")).hexdigest()
+        if target.sha256 != expected_digest:
+            raise StateError("remote authority URL and digest disagree")
+        if target.url.startswith("-"):
+            raise Refusal(
+                f"remote {remote!r} URL cannot begin with '-' for isolated transport"
+            )
+        common = self.common_directory(checkout)
+        objects = common / "objects"
+        memo = _REMOTE_CONTAINMENT_MEMO.get()
+        key = (str(objects.resolve()), target.url, head)
+        if memo is not None:
+            cached = memo.get(key)
+            if (
+                cached is not None
+                and time.monotonic() - cached.observed_at
+                <= _REMOTE_CONTAINMENT_EVIDENCE_MAX_AGE_SECONDS
+            ):
+                if cached.refusal is not None:
+                    raise cached.refusal
+                return cached.refs
+        try:
+            refs = self._remote_heads_containing_uncached(
+                checkout, remote, head, target, common
+            )
+        except Refusal as exc:
+            if memo is not None:
+                memo[key] = _RemoteContainmentEvidence((), time.monotonic(), exc)
+            raise
+        if memo is not None:
+            memo[key] = _RemoteContainmentEvidence(refs, time.monotonic())
+        return refs
+
+    def _remote_heads_containing_uncached(
+        self,
+        checkout: Path,
+        remote: str,
+        head: str,
+        target: _RemoteAuthority,
+        common: Path,
+    ) -> tuple[str, ...]:
+        """Ask the remote at ``target``; see remote_heads_containing."""
+
+        objects = common / "objects"
+        heads_prefix = "refs/heads/"
+        with self._isolated_repository(objects) as (isolated, object_env):
+            advertised = self._ls_remote_inventory(
+                isolated,
+                target.url,
+                heads_only=True,
+                env_overrides=object_env,
+                timeout_seconds=_REMOTE_CONTAINMENT_LIST_SECONDS,
+            )
+            for ref in advertised:
+                if not ref.startswith(heads_prefix):
+                    raise Refusal(f"Git listed a non-head ref as a branch: {ref}")
+            present = self._present_commits(
+                isolated, set(advertised.values()), object_env
+            )
+            local = {ref: tip for ref, tip in advertised.items() if tip in present}
+            containing = self._isolated_refs_containing(
+                isolated, local, head, object_env
+            )
+        if not containing:
+            missing = {
+                ref: tip for ref, tip in advertised.items() if tip not in present
+            }
+            if missing:
+                containing = self._fetched_commits_containing(
+                    common,
+                    self._private_git_directory(checkout),
+                    target,
+                    missing,
+                    head,
+                )
+        prefix = f"refs/remotes/{remote}/"
+        refs = tuple(
+            sorted(prefix + ref.removeprefix(heads_prefix) for ref in containing)
+        )
+        for ref in refs:
+            _validate_full_ref(ref, "remote-tracking ref")
+        return refs
+
+    def _private_git_directory(self, checkout: Path) -> Path:
+        """Return ``checkout``'s own Git directory (a linked worktree's, not the shared one)."""
+
+        result = self._run(checkout, ["rev-parse", "--path-format=absolute", "--git-dir"])
+        directory = Path(result.stdout.strip()).absolute()
+        if directory.is_symlink() or not directory.is_dir():
+            raise Refusal(f"Git reported an unsafe Git directory: {directory}")
+        return directory
+
+    def _present_commits(
+        self,
+        isolated: Path,
+        candidates: AbstractSet[str],
+        object_env: Mapping[str, str],
+    ) -> frozenset[str]:
+        """Return those of ``candidates`` that are commits in the isolated object store."""
+
+        if not candidates:
+            return frozenset()
+        result = self._run(
+            isolated,
+            ["cat-file", "--batch-check=%(objectname) %(objecttype)"],
+            input_text="".join(f"{tip}\n" for tip in sorted(candidates)),
+            env_overrides=object_env,
+        )
+        found: set[str] = set()
+        for line in result.stdout.splitlines():
+            fields = line.split()
+            if len(fields) == 2 and fields[1] == "commit" and fields[0] in candidates:
+                found.add(fields[0])
+        return frozenset(found)
+
+    def _isolated_refs_containing(
+        self,
+        isolated: Path,
+        tips: Mapping[str, str],
+        head: str,
+        object_env: Mapping[str, str],
+    ) -> list[str]:
+        """Return the names in ``tips`` whose commit contains ``head``, in that store.
+
+        Each tip is named by a temporary ref in the isolated repository only;
+        ``head`` and every tip must already be commits in its object store.
+        """
+
+        if not tips:
+            return []
+        names = sorted(tips)
+        check_root = "refs/wrkslots-check/"
+        self._run(
+            isolated,
+            ["update-ref", "--stdin"],
+            input_text="".join(
+                f"update {check_root}{index} {tips[name]}\n"
+                for index, name in enumerate(names)
+            ),
+            env_overrides=object_env,
+        )
+        result = self._run(
+            isolated,
+            ["for-each-ref", "--format=%(refname)", "--contains", head, check_root],
+            env_overrides={**object_env, "GIT_NO_LAZY_FETCH": "1"},
+        )
+        containing: list[str] = []
+        for line in result.stdout.splitlines():
+            if not line:
+                continue
+            suffix = line.removeprefix(check_root)
+            if suffix == line or not suffix.isdigit() or int(suffix) >= len(names):
+                raise Refusal(f"Git returned an unexpected containment ref: {line}")
+            containing.append(names[int(suffix)])
+        return containing
+
+    def _fetched_commits_containing(
+        self,
+        common: Path,
+        git_directory: Path,
+        authority: _RemoteAuthority,
+        missing: Mapping[str, str],
+        head: str,
+    ) -> list[str]:
+        """Fetch the commits of ``missing`` into an empty store; return those containing ``head``.
+
+        Every commit walked was sent by the remote, as in
+        _assert_remote_sends_history: the store starts empty, has no
+        alternates, and GIT_NO_LAZY_FETCH makes a missing commit an error
+        rather than another download. Trees and blobs are not requested.
+        The temporary repository is made inside ``git_directory``, the
+        checkout's own Git directory, which removal deletes with the slot,
+        so even a remote that ignores the filter writes nothing to the
+        system temporary directory.
+        """
+
+        names = sorted(missing)
+        proof_root = "refs/wrkslots-proof/"
+        proof_config = (
+            _NETWORK_CONFIG
+            + b'[remote "proof"]\n\turl = '
+            + _git_config_quoted(authority.url, "remote URL")
+            + b"\n"
+        )
+        # With own_objects the first argument names no store that is used;
+        # it only has to be a real object directory, and a linked worktree's
+        # own Git directory has none, so the shared one is named.
+        with self._isolated_repository(
+            common / "objects", own_objects=True, parent=git_directory
+        ) as (isolated, object_env):
+            (isolated / "config").write_bytes(proof_config)
+            fetched = self._run_bytes(
+                isolated,
+                [
+                    "fetch",
+                    "--filter=tree:0",
+                    "--no-tags",
+                    "--no-write-fetch-head",
+                    "--no-auto-maintenance",
+                    "--force",
+                    "--no-recurse-submodules",
+                    "--stdin",
+                    "--",
+                    "proof",
+                ],
+                input_bytes="".join(
+                    f"+{name}:{proof_root}{index}\n" for index, name in enumerate(names)
+                ).encode("utf-8"),
+                env_overrides={
+                    **object_env,
+                    _NETWORK_CONFIG_SHA256_ENV: hashlib.sha256(proof_config).hexdigest(),
+                },
+                timeout_seconds=_REMOTE_CONTAINMENT_FETCH_SECONDS,
+                timeout_refusal=(
+                    f"Git did not fetch the commits of {len(names)} remote branch(es) "
+                    f"within {_REMOTE_CONTAINMENT_FETCH_SECONDS:g} seconds; the fetch "
+                    "was stopped and no ref of the checkout was read or written. "
+                    "remedy: rerun when the remote answers faster"
+                ),
+            )
+            (isolated / "config").write_bytes(_NETWORK_CONFIG)
+            if fetched.returncode != 0:
+                raise Refusal(
+                    f"Git could not fetch the commits of {len(names)} remote branch(es) "
+                    f"into an empty object store{_git_bytes_failure_detail(fetched)}. "
+                    "No ref of the checkout was read or written. remedy: rerun when "
+                    "the remote answers"
+                )
+            self._refuse_shallow_fetch(isolated, len(names))
+            expected = {
+                f"{proof_root}{index}": missing[name] for index, name in enumerate(names)
+            }
+            if (
+                self._direct_ref_inventory(
+                    isolated, proof_root, env_overrides=object_env
+                )
+                != expected
+            ):
+                raise Refusal(
+                    "Git fetched a different ref inventory than the remote advertised"
+                )
+            lazy_off = {**object_env, "GIT_NO_LAZY_FETCH": "1"}
+            if head not in self._present_commits(isolated, {head}, lazy_off):
+                return []
+            result = self._run(
+                isolated,
+                ["for-each-ref", "--format=%(refname)", "--contains", head, proof_root],
+                env_overrides=lazy_off,
+            )
+        containing: list[str] = []
+        for line in result.stdout.splitlines():
+            if not line:
+                continue
+            suffix = line.removeprefix(proof_root)
+            if suffix == line or not suffix.isdigit() or int(suffix) >= len(names):
+                raise Refusal(f"Git returned an unexpected containment ref: {line}")
+            containing.append(names[int(suffix)])
+        return containing
 
     def ref_exists(self, checkout: Path, ref: str) -> bool:
         _validate_full_ref(ref, "remote ref")
@@ -18851,7 +19229,16 @@ def _verify_local_salvage_bundle(
     observed_digest, observed_size = _sha256_regular_file(bundle, "local salvage bundle")
     if (observed_digest, observed_size) != (expected_sha256, expected_size):
         raise Refusal(f"local salvage bundle changed after publication: {bundle}")
-    with tempfile.TemporaryDirectory(prefix="wrkslots-archive-verify-") as temporary:
+    verified = _VERIFIED_SALVAGE_BUNDLES.get()
+    # The same bytes verify the same way wherever they are linked.
+    key = (f"{archive_ref}\0{commit}", observed_digest, observed_size)
+    if verified is not None and key in verified:
+        return
+    # Restored beside the bundle, never in the system temporary directory:
+    # a bundle holds a checkout's complete history, which can be gigabytes.
+    with tempfile.TemporaryDirectory(
+        prefix=".wrkslots-archive-verify-", dir=str(bundle.parent)
+    ) as temporary:
         root = Path(temporary)
         restored = root / "restored.git"
         vcs._run(root, ["clone", "--bare", "--", str(bundle), str(restored)])
@@ -18864,6 +19251,8 @@ def _verify_local_salvage_bundle(
             )
         vcs._run(restored, ["cat-file", "-e", f"{commit}^{{tree}}"])
         vcs._run(restored, ["fsck", "--full", "--strict", "--no-dangling"])
+    if verified is not None:
+        verified.add(key)
 
 
 def _local_salvage_receipt_payload(
@@ -18905,7 +19294,7 @@ def _local_salvage_receipt_payload(
     }
 
 
-def _archive_salvage_locally(
+def _ensure_local_salvage_bundle(
     config: Config,
     machine: str,
     slot: str,
@@ -18914,14 +19303,12 @@ def _archive_salvage_locally(
     path: Path,
     facts: _SalvageCandidate,
     archive_root: Path,
-    remote_failure: Refusal | None,
     vcs: _GitVcs,
-) -> dict[str, object]:
-    """Create and read back a self-contained bundle instead of a remote push.
+) -> tuple[Path, Path, Path, str]:
+    """Create, unless it exists, and verify the self-contained bundle of ``facts.commit``.
 
-    ``remote_failure`` is None when the remote is not in salvage_push_remotes,
-    so nothing was pushed; otherwise it is the refused push, or the initial
-    fetch's transport failure, so remote salvage did not complete.
+    Returns the checked archive root, the bundle, its receipt path, and the
+    archive ref. No receipt is written here; see _archive_salvage_locally.
     """
     checked_root = _local_salvage_archive_root(config, str(archive_root))
     assert checked_root is not None
@@ -18973,6 +19360,30 @@ def _archive_salvage_locally(
             finally:
                 with contextlib.suppress(FileNotFoundError):
                     temp_bundle.unlink()
+    return checked_root, bundle, receipt_path, archive_ref
+
+
+def _archive_salvage_locally(
+    config: Config,
+    machine: str,
+    slot: str,
+    generation: int | None,
+    checkout: Checkout,
+    path: Path,
+    facts: _SalvageCandidate,
+    archive_root: Path,
+    remote_failure: Refusal | None,
+    vcs: _GitVcs,
+) -> dict[str, object]:
+    """Create and read back a self-contained bundle instead of a remote push.
+
+    ``remote_failure`` is None when the remote is not in salvage_push_remotes,
+    so nothing was pushed; otherwise it is the refused push, or the initial
+    fetch's transport failure, so remote salvage did not complete.
+    """
+    checked_root, bundle, receipt_path, archive_ref = _ensure_local_salvage_bundle(
+        config, machine, slot, generation, checkout, path, facts, archive_root, vcs
+    )
 
     bundle_digest, bundle_size = _sha256_regular_file(bundle, "local salvage bundle")
     _verify_local_salvage_bundle(
@@ -19129,6 +19540,18 @@ class _SalvageCandidate:
     commit: str
     dirty: bool
     remote_authority: _RemoteAuthority
+    # Where publication is judged when that is not remote_authority: a
+    # submodule whose remote is its source repository's own Git directory is
+    # judged at that source's remote (see _submodule_network_authority).
+    network_authority: _RemoteAuthority | None = None
+
+    @property
+    def aliased(self) -> bool:
+        """Whether publication is judged at a remote other than the checkout's own."""
+        return (
+            self.network_authority is not None
+            and self.network_authority != self.remote_authority
+        )
 
 
 def _salvage_candidate(
@@ -19196,6 +19619,13 @@ def _salvage_candidate(
             f"checkout {checkout.name} remote {checkout.remote} URL changed; restore the "
             "recorded remote before reclaim so salvage cannot be sent elsewhere"
         )
+    # Only a submodule candidate is detached (see _submodule_salvage_checkouts);
+    # its repository is the source submodule, never the managed checkout.
+    network_authority = (
+        _submodule_network_authority(config, checkout, path, vcs, remote_authority)
+        if allow_detached
+        else None
+    )
     status = vcs.status(
         path,
         _cache_globs_for(config, checkout.name),
@@ -19209,6 +19639,7 @@ def _salvage_candidate(
             commit=head,
             dirty=False,
             remote_authority=remote_authority,
+            network_authority=network_authority,
         )
 
     with tempfile.TemporaryDirectory(prefix="wrkslots-salvage-") as temporary:
@@ -19251,6 +19682,7 @@ def _salvage_candidate(
                 commit=head,
                 dirty=False,
                 remote_authority=remote_authority,
+                network_authority=network_authority,
             )
         if record is None:
             if ownerless_slot is None or ownerless_recorded_at is None:
@@ -19290,6 +19722,7 @@ def _salvage_candidate(
         commit=commit,
         dirty=True,
         remote_authority=remote_authority,
+        network_authority=network_authority,
     )
 
 
@@ -19321,35 +19754,146 @@ def _submodule_salvage_checkouts(
         if vcs.repository_root(source) != source.absolute():
             raise Refusal(f"source submodule is not a Git root: {source}")
         remote = config.default_remote
-        source_authority = vcs.remote_authority(source, remote)
         managed_authority = vcs.remote_authority(managed, remote)
-        if not _same_repository_remote(source_authority.url, managed_authority.url):
-            raise Refusal(
-                f"submodule {checkout.name}/{relative_value} remote {remote} differs "
-                "from its configured source; preserve the slot for inspection"
-            )
         head = vcs.head(managed)
         stored_path = (Path(checkout.path) / relative).as_posix()
         source_relative = source.relative_to(config.root).as_posix()
-        result.append(
-            (
-                Checkout(
-                    name=f"{checkout.name}/{relative_value}",
-                    path=stored_path,
-                    repository=source_relative,
-                    branch="",
-                    start_point=head,
-                    remote=remote,
-                    # The source checkout may change transport independently.
-                    # Salvage still uses and rechecks the slot's own URL.
-                    remote_url_sha256=managed_authority.sha256,
-                    landed_ref=_landed_ref_for_remote(config, remote),
-                    head=head,
-                ),
-                managed,
-            )
+        submodule = Checkout(
+            name=f"{checkout.name}/{relative_value}",
+            path=stored_path,
+            repository=source_relative,
+            branch="",
+            start_point=head,
+            remote=remote,
+            # The source checkout may change transport independently.
+            # Salvage still uses and rechecks the slot's own URL.
+            remote_url_sha256=managed_authority.sha256,
+            landed_ref=_landed_ref_for_remote(config, remote),
+            head=head,
         )
+        # Refuses unless the slot's remote is the source's remote, or is the
+        # source repository itself (the layout a linked worktree's submodule
+        # update produces).
+        _submodule_network_authority(config, submodule, managed, vcs, managed_authority)
+        result.append((submodule, managed))
     return tuple(result)
+
+
+def _submodule_network_authority(
+    config: Config,
+    submodule: Checkout,
+    managed: Path,
+    vcs: _GitVcs,
+    managed_authority: _RemoteAuthority,
+) -> _RemoteAuthority:
+    """Return the remote at which a submodule checkout's publication is judged.
+
+    ``submodule`` is a checkout made by _submodule_salvage_checkouts: its
+    repository is the source submodule and ``managed`` is the slot's copy,
+    whose remote is ``managed_authority``. Two layouts are accepted:
+
+    * the slot's remote names the same repository as the source's remote
+      (_same_repository_remote); it is judged at the slot's own remote;
+    * the slot's remote is a local absolute path naming a local mirror of the
+      source's remote: the source submodule's own Git directory, or another
+      local repository whose own remote names the same repository as the
+      source's remote. A linked worktree shares its superproject's
+      configuration, so when that configuration names such a local module
+      directory as submodule.<name>.url (as a superproject that keeps local
+      module mirrors does), `git submodule update` in the slot clones from
+      it and records that path as origin. Removing the slot deletes neither
+      repository, but neither is where work is published, so the commit is
+      judged at the source's own remote. That remote must lead elsewhere: a
+      network remote, or an absolute local path to a repository other than
+      the source, the mirror and the slot's copy. Salvage never pushes
+      through this alias; unpublished work is archived locally (see
+      _salvage_one_checkout).
+
+    Anything else refuses, exactly as before.
+    """
+
+    _relative, source = _stored_repository_path(config, submodule.repository)
+    source_authority = vcs.remote_authority(source, submodule.remote)
+    if _same_repository_remote(source_authority.url, managed_authority.url):
+        return managed_authority
+    mirror = _absolute_local_remote_directory(managed, managed_authority)
+    if mirror is not None and _mirrors_source_remote(
+        vcs, submodule.remote, mirror, source, managed, source_authority
+    ):
+        return source_authority
+    raise Refusal(
+        f"submodule {submodule.name} remote {submodule.remote} differs "
+        "from its configured source; preserve the slot for inspection"
+    )
+
+
+def _mirrors_source_remote(
+    vcs: _GitVcs,
+    remote: str,
+    mirror: Path,
+    source: Path,
+    managed: Path,
+    source_authority: _RemoteAuthority,
+) -> bool:
+    """Whether ``mirror`` is a local mirror of ``source``'s remote.
+
+    See _submodule_network_authority.
+    """
+
+    try:
+        mirror_identity = _directory_device_inode(mirror)
+        source_identity = _directory_device_inode(
+            vcs.common_directory(source).resolve(strict=True)
+        )
+        managed_identity = _directory_device_inode(
+            vcs.common_directory(managed).resolve(strict=True)
+        )
+    except OSError:
+        return False
+    if mirror_identity == managed_identity:
+        return False
+    if mirror_identity != source_identity:
+        try:
+            mirror_authority = vcs.remote_authority(mirror, remote)
+        except Refusal:
+            return False
+        if not _same_repository_remote(mirror_authority.url, source_authority.url):
+            return False
+    # The source's own remote must lead elsewhere.
+    if _local_remote_url_path(source, source_authority.url) is None:
+        return True
+    onward = _absolute_local_remote_directory(source, source_authority)
+    if onward is None:
+        return False
+    try:
+        onward_identity = _directory_device_inode(onward)
+    except OSError:
+        return False
+    return onward_identity not in (source_identity, managed_identity, mirror_identity)
+
+
+def _directory_device_inode(directory: Path) -> tuple[int, int]:
+    observed = directory.stat()
+    return observed.st_dev, observed.st_ino
+
+
+def _absolute_local_remote_directory(
+    repository: Path, authority: _RemoteAuthority
+) -> Path | None:
+    """Return the resolved directory an absolute local remote URL names.
+
+    None for a network remote, a relative local remote, or a path that does
+    not resolve to an existing directory.
+    """
+
+    candidate = _local_remote_url_path(repository, authority.url)
+    if candidate is None or not _local_remote_url_is_absolute(authority.url):
+        return None
+    try:
+        resolved = candidate.resolve(strict=True)
+    except OSError:
+        return None
+    return resolved if resolved.is_dir() else None
 
 
 def _github_repository_identity(url: str) -> tuple[str, str] | None:
@@ -19363,6 +19907,62 @@ def _github_repository_identity(url: str) -> tuple[str, str] | None:
         if match is not None:
             return match.group(1).lower(), match.group(2).lower()
     return None
+
+
+def _github_url_spellings(url: str) -> tuple[str, ...]:
+    """Return the GitHub URL spellings _github_repository_identity equates with ``url``.
+
+    Empty when ``url`` is not a GitHub repository URL. Both the owner/repo
+    case of ``url`` and lower case are spelled.
+    """
+
+    patterns = (
+        r"https://github\.com/([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+?)(?:\.git)?/?",
+        r"git@github\.com:([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+?)(?:\.git)?",
+        r"ssh://git@github\.com/([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+?)(?:\.git)?/?",
+    )
+    for pattern in patterns:
+        match = re.fullmatch(pattern, url)
+        if match is None:
+            continue
+        spellings: list[str] = []
+        for owner, name in (
+            (match.group(1), match.group(2)),
+            (match.group(1).lower(), match.group(2).lower()),
+        ):
+            for suffix in ("", ".git"):
+                spellings.extend(
+                    (
+                        f"https://github.com/{owner}/{name}{suffix}",
+                        f"https://github.com/{owner}/{name}{suffix}/",
+                        f"git@github.com:{owner}/{name}{suffix}",
+                        f"ssh://git@github.com/{owner}/{name}{suffix}",
+                        f"ssh://git@github.com/{owner}/{name}{suffix}/",
+                    )
+                )
+        return tuple(dict.fromkeys(spellings))
+    return ()
+
+
+def _recorded_remote_names_same_repository(
+    recorded_sha256: str, authority: _RemoteAuthority
+) -> bool:
+    """Whether a recorded remote URL digest names the repository ``authority`` names.
+
+    True for the exact URL, or when the digest is that of another GitHub
+    transport spelling of the same owner/repo (_same_repository_remote), as
+    when a source repository's remote moved from git@github.com: to https://.
+    Only the digest was recorded, so each spelling is hashed and compared.
+    """
+
+    if authority.sha256 == recorded_sha256:
+        return True
+    return any(
+        hmac.compare_digest(
+            hashlib.sha256(spelling.encode("utf-8")).hexdigest(), recorded_sha256
+        )
+        for spelling in _github_url_spellings(authority.url)
+    )
 
 
 def _same_repository_remote(left: str, right: str) -> bool:
@@ -19399,8 +19999,12 @@ def _salvage_one_checkout(
         else prepared
     )
     try:
-        vcs.fetch_remote(
-            path, checkout.remote, checkout.landed_ref, facts.remote_authority
+        containing = vcs.remote_heads_containing(
+            path,
+            checkout.remote,
+            facts.head,
+            facts.remote_authority,
+            network_authority=facts.network_authority,
         )
     except _RemoteTransportUnavailable as exc:
         if archive_root is None:
@@ -19411,7 +20015,12 @@ def _salvage_one_checkout(
         # recorded remote binding. Every other fetch refusal, including
         # authentication, host identity, and inventory disagreement, still
         # refuses, and so does a remote that answers the second time.
-        vcs.confirm_remote_unreachable(path, checkout.remote, facts.remote_authority)
+        vcs.confirm_remote_unreachable(
+            path,
+            checkout.remote,
+            facts.remote_authority,
+            network_authority=facts.network_authority,
+        )
         vcs.assert_remote_authority(path, checkout.remote, facts.remote_authority)
         return _archive_salvage_locally(
             config,
@@ -19426,7 +20035,6 @@ def _salvage_one_checkout(
             vcs,
         )
     vcs.assert_remote_authority(path, checkout.remote, facts.remote_authority)
-    containing = vcs.remote_refs_containing(path, checkout.remote, facts.head)
     if not facts.dirty and containing:
         return {
             "checkout": checkout.name,
@@ -19437,7 +20045,9 @@ def _salvage_one_checkout(
             "remote_ref": None,
             "containing_remote_refs": list(containing),
         }
-    if not _salvage_push_allowed(config, facts.remote_authority):
+    # A submodule whose remote is its source repository is never pushed
+    # through that alias (see _submodule_network_authority).
+    if facts.aliased or not _salvage_push_allowed(config, facts.remote_authority):
         return _archive_salvage_locally(
             config,
             record.machine,
@@ -19571,11 +20181,14 @@ def _salvage_ownerless_checkout(
         if prepared is None
         else prepared
     )
-    vcs.fetch_remote(
-        path, checkout.remote, checkout.landed_ref, facts.remote_authority
+    containing = vcs.remote_heads_containing(
+        path,
+        checkout.remote,
+        facts.head,
+        facts.remote_authority,
+        network_authority=facts.network_authority,
     )
     vcs.assert_remote_authority(path, checkout.remote, facts.remote_authority)
-    containing = vcs.remote_refs_containing(path, checkout.remote, facts.head)
     if not facts.dirty and containing:
         return {
             "checkout": checkout.name,
@@ -19586,7 +20199,7 @@ def _salvage_ownerless_checkout(
             "remote_ref": None,
             "containing_remote_refs": list(containing),
         }
-    if not _salvage_push_allowed(config, facts.remote_authority):
+    if facts.aliased or not _salvage_push_allowed(config, facts.remote_authority):
         return _archive_salvage_locally(
             config,
             config.machine,
@@ -19761,13 +20374,13 @@ def _assert_salvage_still_matches(
                     "preserve the checkout and restore the remote evidence before deletion"
                 )
         elif disposition == "already-published":
-            vcs.fetch_remote(
+            if not vcs.remote_heads_containing(
                 path,
                 checkout.remote,
-                checkout.landed_ref,
+                facts.head,
                 facts.remote_authority,
-            )
-            if not vcs.remote_refs_containing(path, checkout.remote, facts.head):
+                network_authority=facts.network_authority,
+            ):
                 raise Refusal(
                     f"checkout {checkout.name} is no longer present on its recorded remote; "
                     "preserve it and rerun remove to publish salvage"
@@ -32276,6 +32889,120 @@ def _cmd_remove(
     emit: bool = True,
     agent_batch: _AgentRemoveBatchContext | None = None,
 ) -> int:
+    with _remote_containment_scope():
+        return _cmd_remove_in_scope(
+            args,
+            private_cleanup=private_cleanup,
+            validation_removal_proof=validation_removal_proof,
+            emit=emit,
+            agent_batch=agent_batch,
+        )
+
+
+def _prefetch_remote_containment(
+    config: Config, slot: str, salvage_archive_root: Path | None = None
+) -> None:
+    """Do removal's slow salvage work for ``slot`` before the registry lock is taken.
+
+    See _REMOTE_CONTAINMENT_EVIDENCE_MAX_AGE_SECONDS. A lock-free read selects
+    the slot, as _single_remove_agent_batch's does, and nothing is done unless
+    its owner is already gone (dead or never recorded, heartbeat expired, no
+    hold, handoff read). Then, in the order removal itself uses, every
+    checkout and initialized submodule is first checked locally
+    (_salvage_candidate), so a local defect still refuses before any network
+    contact; only if all pass is the remote asked, for each, whether its HEAD
+    is published. The answer (or the refusal) is only an entry in
+    _REMOTE_CONTAINMENT_MEMO, which the removal under the lock may reuse for a
+    commit, object store and remote URL it has re-derived itself. A checkout
+    that removal would archive locally has its self-contained bundle made and
+    verified here too; removal under the lock finds it, rechecks its bytes,
+    and writes the receipt. Every refusal here is dropped: the removal under
+    the lock asks the same questions and reports them there.
+    """
+
+    try:
+        state = _load_active(config, require_repository=False)
+        record = next((item for item in state.slots if item.slot == slot), None)
+        if record is None or record.slot_type != "agent" or not record.checkouts:
+            return
+        owner_gone = (
+            _owner_record_is_absent(record) or _process_state(record.owner)[0] == "dead"
+        ) and _heartbeat_diagnosis(record)[1]
+        if not owner_gone:
+            return
+        _assert_not_held(config, record)
+        _assert_handoff_read(
+            config, record, _slot_directory(config, slot, record.slot_type)
+        )
+        archive_root = salvage_archive_root or _default_salvage_archive_root(config)
+        vcs = _GitVcs()
+        prepared: list[tuple[Checkout, Path, _SalvageCandidate]] = []
+        for checkout in record.checkouts:
+            path = _stored_path(config, checkout.path, "checkout path")
+            candidates: list[tuple[Checkout, Path, bool]] = [(checkout, path, False)]
+            candidates.extend(
+                (submodule, submodule_path, True)
+                for submodule, submodule_path in _submodule_salvage_checkouts(
+                    config, checkout, vcs
+                )
+            )
+            for candidate, candidate_path, detached in candidates:
+                prepared.append(
+                    (
+                        candidate,
+                        candidate_path,
+                        _salvage_candidate(
+                            config,
+                            record,
+                            candidate,
+                            vcs,
+                            path_override=candidate_path,
+                            allow_detached=detached,
+                            verify_repository_membership=not detached,
+                        ),
+                    )
+                )
+    except Refusal:
+        return
+    for candidate, candidate_path, facts in prepared:
+        try:
+            published = vcs.remote_heads_containing(
+                candidate_path,
+                candidate.remote,
+                facts.head,
+                facts.remote_authority,
+                network_authority=facts.network_authority,
+            )
+            if published and not facts.dirty:
+                continue
+            if not facts.aliased and _salvage_push_allowed(
+                config, facts.remote_authority
+            ):
+                # A push is decided, and made, under the lock as before.
+                continue
+            _ensure_local_salvage_bundle(
+                config,
+                record.machine,
+                record.slot,
+                record.generation,
+                candidate,
+                candidate_path,
+                facts,
+                archive_root,
+                vcs,
+            )
+        except Refusal:
+            continue
+
+
+def _cmd_remove_in_scope(
+    args: argparse.Namespace,
+    *,
+    private_cleanup: _PrivateCleanupContext | None,
+    validation_removal_proof: _ValidationRemovalProof | None,
+    emit: bool,
+    agent_batch: _AgentRemoveBatchContext | None,
+) -> int:
     config = _load_config(args.project_root, args.machine)
     _validate_name(args.slot, "slot")
     if agent_batch is not None and (
@@ -32357,6 +33084,9 @@ def _cmd_remove(
     scoped_validation_finish = bool(args.validate_complete) and (
         private_cleanup is None or private_cleanup.scoped_finish
     )
+    if private_cleanup is None and not bool(args.validate_complete):
+        # Network work happens here, before the registry lock, not under it.
+        _prefetch_remote_containment(config, args.slot, salvage_archive_root)
     wait_deadline = getattr(args, "_wait_deadline", None)
     lock_scope = (
         _mutation_locks(config, args.wait_lock)
@@ -41314,14 +42044,12 @@ def _assert_ownerless_salvage_still_matches(
                     f"remote salvage ref {ref} no longer preserves {facts.commit}"
                 )
         elif receipt.get("disposition") == "already-published":
-            vcs.fetch_remote(
+            if not vcs.remote_heads_containing(
                 candidate_path,
                 candidate.remote,
-                candidate.landed_ref,
+                facts.head,
                 facts.remote_authority,
-            )
-            if not vcs.remote_refs_containing(
-                candidate_path, candidate.remote, facts.head
+                network_authority=facts.network_authority,
             ):
                 raise Refusal(f"ownerless checkout {candidate.name} is no longer published")
         elif receipt.get("disposition") == "archived-local":
@@ -42262,7 +42990,10 @@ def _verify_absent_agent_module_bundle(
     observed = _sha256_regular_file(bundle, "local submodule salvage bundle")
     if observed != (expected_sha256, expected_size):
         raise Refusal(f"local submodule salvage bundle changed after publication: {bundle}")
-    with tempfile.TemporaryDirectory(prefix="wrkslots-archive-verify-") as temporary:
+    # Restored beside the bundle, never in the system temporary directory.
+    with tempfile.TemporaryDirectory(
+        prefix=".wrkslots-archive-verify-", dir=str(bundle.parent)
+    ) as temporary:
         root = Path(temporary)
         restored = root / "restored.git"
         vcs._run(root, ["clone", "--bare", "--", str(bundle), str(restored)])
@@ -43430,7 +44161,9 @@ def _absent_agent_checkout_receipts(
     for checkout, witness in zip(record.checkouts, branch_witnesses, strict=True):
         _stored, repository = _stored_repository_path(config, checkout.repository)
         authority = vcs.remote_authority(repository, checkout.remote)
-        if authority.sha256 != checkout.remote_url_sha256:
+        if not _recorded_remote_names_same_repository(
+            checkout.remote_url_sha256, authority
+        ):
             raise Refusal(
                 f"source repository remote changed for absent checkout {checkout.name}"
             )
@@ -44126,7 +44859,9 @@ def _recover_absent_agent_row(
     for checkout in recorded.checkouts:
         _stored, repository = _stored_repository_path(config, checkout.repository)
         authority = vcs.remote_authority(repository, checkout.remote)
-        if authority.sha256 != checkout.remote_url_sha256:
+        if not _recorded_remote_names_same_repository(
+            checkout.remote_url_sha256, authority
+        ):
             raise Refusal(
                 f"source repository remote changed for absent checkout {checkout.name}"
             )

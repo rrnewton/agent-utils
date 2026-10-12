@@ -15107,7 +15107,18 @@ def test_unavailable_transport_rechecks_the_remote_before_archiving(
     )
 
     assert refused.returncode == 3
-    assert "changed after authority was captured" in refused.stderr
+    # The first network command now runs before the registry lock is taken
+    # (https://github.com/rrnewton/agent-utils/issues/237), so a remote moved
+    # during it is found by the first recorded-remote check under the lock;
+    # one moved during the redirect-free recheck, which still runs under the
+    # lock, is found by the authority check that follows it.
+    expected = (
+        "checkout product remote origin URL changed"
+        if moved_during == "fetch"
+        else "changed after authority was captured"
+    )
+    assert expected in refused.stderr
+    assert "using verified local archive" not in refused.stderr
     assert tree.is_dir()
     assert len(active_slots(project)) == 1
     assert list(archive_root.iterdir()) == []
@@ -32909,6 +32920,503 @@ def test_audit_blocks_agent_slot_when_submodule_remote_differs_from_source(
         "submodule product/component remote origin differs from its configured source"
         in reason
         for reason in row["reasons"]
+    )
+
+
+def add_component_cloned_from_source_module(
+    tmp_path: Path, project: Path, repository: Path
+) -> tuple[Path, Path]:
+    """Add submodule ``component`` whose slot copies clone from the source's module directory.
+
+    A linked worktree shares its superproject's configuration. Pointing
+    submodule.component.url at the source's own module directory, as a
+    superproject with local module mirrors does, makes `git submodule update`
+    in each slot record that directory, not the configured URL, as origin.
+    Returns the component's bare remote and the source module directory.
+    """
+
+    component_remote = tmp_path / "component.git"
+    component_source = tmp_path / "component-source"
+    subprocess.run(
+        ["git", "init", "--bare", "--initial-branch=main", str(component_remote)],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    subprocess.run(
+        ["git", "clone", str(component_remote), str(component_source)],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    git(component_source, "config", "user.name", "Wrkslots Test")
+    git(component_source, "config", "user.email", "wrkslots@example.invalid")
+    (component_source / "base.txt").write_text("base\n", encoding="utf-8")
+    git(component_source, "add", "base.txt")
+    git(component_source, "commit", "-m", "component base")
+    git(component_source, "push", "-u", "origin", "main")
+    git(
+        repository,
+        "-c",
+        "protocol.file.allow=always",
+        "submodule",
+        "add",
+        str(component_remote),
+        "component",
+    )
+    git(repository, "commit", "-am", "add component")
+    git(repository, "push", "origin", "main")
+    module = Path(
+        git(repository / "component", "rev-parse", "--path-format=absolute", "--git-common-dir")
+        .stdout.strip()
+    )
+    git(repository, "config", "submodule.component.url", str(module))
+    update_configuration(
+        project,
+        post_provision_hooks=[
+            "git -c protocol.file.allow=always submodule update --init --recursive"
+        ],
+    )
+    return component_remote, module
+
+
+def test_agent_remove_accepts_submodule_cloned_from_its_source_module_directory(
+    tmp_path: Path,
+) -> None:
+    project, repository, _remote = make_project(tmp_path)
+    component_remote, module = add_component_cloned_from_source_module(
+        tmp_path, project, repository
+    )
+    made = create(project)
+    assert made.returncode == 0, made.stderr
+    tree = checkout(project)
+    nested = tree / "component"
+    # The layout under test: the slot's origin is the source repository itself.
+    assert git(nested, "config", "--get", "remote.origin.url").stdout.strip() == str(module)
+    source_origin = git(repository / "component", "config", "--get", "remote.origin.url")
+    assert source_origin.stdout.strip() == str(component_remote)
+    mark_owner_dead(project)
+    set_liveness(project, "dead")
+
+    removed = command(
+        project,
+        "remove",
+        "slot01",
+        "--coordinator-pid",
+        str(os.getpid()),
+        "--expected-generation",
+        "1",
+    )
+
+    assert removed.returncode == 0, removed.stderr
+    assert not tree.exists()
+    archive = json.loads(
+        (project / "worktrees" / "ARCHIVED.testhost.json").read_text(encoding="utf-8")
+    )
+    receipts = {
+        receipt["checkout"]: receipt for receipt in archive["records"][0]["salvage"]
+    }
+    assert receipts["product/component"]["disposition"] == "already-published"
+    assert receipts["product/component"]["containing_remote_refs"] == [
+        "refs/remotes/origin/main"
+    ]
+    # Nothing was written into the source repository the slot's remote named.
+    assert git(module, "for-each-ref", "--format=%(refname)", "refs/salvage/").stdout == ""
+
+
+def test_agent_remove_archives_unpublished_work_of_a_submodule_cloned_from_its_source(
+    tmp_path: Path,
+) -> None:
+    project, repository, _remote = make_project(tmp_path)
+    component_remote, module = add_component_cloned_from_source_module(
+        tmp_path, project, repository
+    )
+    made = create(project)
+    assert made.returncode == 0, made.stderr
+    tree = checkout(project)
+    nested = tree / "component"
+    git(nested, "config", "user.name", "Wrkslots Test")
+    git(nested, "config", "user.email", "wrkslots@example.invalid")
+    (nested / "work.txt").write_text("unpublished work\n", encoding="utf-8")
+    git(nested, "add", "work.txt")
+    git(nested, "commit", "-m", "unpublished submodule work")
+    unpublished = git(nested, "rev-parse", "HEAD").stdout.strip()
+    mark_owner_dead(project)
+    set_liveness(project, "dead")
+
+    removed = command(
+        project,
+        "remove",
+        "slot01",
+        "--coordinator-pid",
+        str(os.getpid()),
+        "--expected-generation",
+        "1",
+    )
+
+    assert removed.returncode == 0, removed.stderr
+    archive = json.loads(
+        (project / "worktrees" / "ARCHIVED.testhost.json").read_text(encoding="utf-8")
+    )
+    receipts = {
+        receipt["checkout"]: receipt for receipt in archive["records"][0]["salvage"]
+    }
+    receipt = receipts["product/component"]
+    # Never pushed through the alias, neither into the source repository nor
+    # to the source's remote: the commit is kept in a verified local bundle.
+    assert receipt["disposition"] == "archived-local"
+    assert receipt["salvage_commit"] == unpublished
+    bundle = Path(receipt["archive_bundle"])
+    assert bundle.is_file()
+    listed = subprocess.run(
+        ["git", "bundle", "list-heads", str(bundle)],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout
+    assert unpublished in listed
+    for repository_path in (module, component_remote):
+        assert (
+            git(
+                repository_path,
+                "cat-file",
+                "-e",
+                f"{unpublished}^{{commit}}",
+                check=False,
+            ).returncode
+            != 0
+        )
+
+
+def test_submodule_remote_alias_to_another_local_repository_still_refuses(
+    tmp_path: Path,
+) -> None:
+    project, repository, _remote = make_project(tmp_path)
+    component_remote, _module = add_component_cloned_from_source_module(
+        tmp_path, project, repository
+    )
+    assert create(project).returncode == 0
+    nested = checkout(project) / "component"
+    # A local repository that holds the same history but is not a mirror of
+    # the source's remote: its own origin names another repository.
+    impostor = tmp_path / "impostor.git"
+    elsewhere = tmp_path / "elsewhere.git"
+    subprocess.run(
+        ["git", "clone", "--bare", str(component_remote), str(impostor)],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    subprocess.run(
+        ["git", "init", "--bare", str(elsewhere)],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    git(impostor, "remote", "set-url", "origin", str(elsewhere))
+    git(nested, "remote", "set-url", "origin", str(impostor))
+    config = wrkslots._load_config(str(project), "testhost")
+    record = wrkslots._load_active(config).slots[0]
+
+    with pytest.raises(wrkslots.Refusal, match="differs from its configured source"):
+        wrkslots._submodule_salvage_checkouts(
+            config, record.checkouts[0], wrkslots._GitVcs()
+        )
+    # And one with no remote at all.
+    git(impostor, "remote", "remove", "origin")
+    with pytest.raises(wrkslots.Refusal, match="differs from its configured source"):
+        wrkslots._submodule_salvage_checkouts(
+            config, record.checkouts[0], wrkslots._GitVcs()
+        )
+    # The slot's own Git directory is never its own mirror.
+    own = git(nested, "rev-parse", "--path-format=absolute", "--git-common-dir").stdout.strip()
+    git(nested, "remote", "set-url", "origin", own)
+    with pytest.raises(wrkslots.Refusal, match="differs from its configured source"):
+        wrkslots._submodule_salvage_checkouts(
+            config, record.checkouts[0], wrkslots._GitVcs()
+        )
+
+
+def test_agent_remove_accepts_submodule_cloned_from_another_local_mirror(
+    tmp_path: Path,
+) -> None:
+    project, repository, _remote = make_project(tmp_path)
+    component_remote, _module = add_component_cloned_from_source_module(
+        tmp_path, project, repository
+    )
+    # The superproject names a separate local mirror of the component's
+    # remote, not the source submodule's own module directory.
+    mirror = tmp_path / "mirror" / "component.git"
+    mirror.parent.mkdir()
+    subprocess.run(
+        ["git", "clone", "--bare", str(component_remote), str(mirror)],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    git(repository, "config", "submodule.component.url", str(mirror))
+    made = create(project)
+    assert made.returncode == 0, made.stderr
+    tree = checkout(project)
+    assert git(tree / "component", "config", "--get", "remote.origin.url").stdout.strip() == str(
+        mirror
+    )
+    mark_owner_dead(project)
+    set_liveness(project, "dead")
+
+    removed = command(
+        project,
+        "remove",
+        "slot01",
+        "--coordinator-pid",
+        str(os.getpid()),
+        "--expected-generation",
+        "1",
+    )
+
+    assert removed.returncode == 0, removed.stderr
+    archive = json.loads(
+        (project / "worktrees" / "ARCHIVED.testhost.json").read_text(encoding="utf-8")
+    )
+    receipts = {
+        receipt["checkout"]: receipt for receipt in archive["records"][0]["salvage"]
+    }
+    assert receipts["product/component"]["disposition"] == "already-published"
+    assert git(mirror, "for-each-ref", "--format=%(refname)", "refs/salvage/").stdout == ""
+
+
+def _network_lock_probe_git(tmp_path: Path, lock: Path) -> tuple[Path, Path]:
+    """Return a PATH directory whose git logs whether ``lock`` is held at each slow call.
+
+    Network calls (ls-remote, fetch, push) and local salvage archive work
+    (bundle, clone, fsck) are logged, one line each, as "<command> held" or
+    "<command> free".
+    """
+
+    fake_bin = tmp_path / "probe-bin"
+    fake_bin.mkdir()
+    log = tmp_path / "network-calls.log"
+    system_git = SYSTEM_GIT if SYSTEM_GIT.exists() else Path(str(shutil.which("git")))
+    script = fake_bin / "git"
+    script.write_text(
+        "#!/bin/bash\n"
+        'for argument in "$@"; do\n'
+        '  case "$argument" in\n'
+        "    ls-remote|fetch|push|bundle|clone|fsck)\n"
+        f"      if flock -n -x {shlex.quote(str(lock))} true; then state=free; else state=held; fi\n"
+        f'      printf "%s %s\\n" "$argument" "$state" >> {shlex.quote(str(log))}\n'
+        "      break ;;\n"
+        "  esac\n"
+        "done\n"
+        f'exec {shlex.quote(str(system_git))} "$@"\n',
+        encoding="utf-8",
+    )
+    script.chmod(0o755)
+    return fake_bin, log
+
+
+@pytest.mark.skipif(shutil.which("flock") is None, reason="needs flock(1)")
+def test_agent_remove_checks_publication_without_fetching_or_holding_the_lock(
+    tmp_path: Path,
+) -> None:
+    project, repository, remote = make_project(tmp_path)
+    # Like GitHub, the remote serves commits without their trees and blobs.
+    git(remote, "config", "uploadpack.allowFilter", "true")
+    made = create(project)
+    assert made.returncode == 0, made.stderr
+    tree = checkout(project)
+    head = git(tree, "rev-parse", "HEAD").stdout.strip()
+    # The remote branch moves on after the slot last fetched, with a large
+    # file the slot never had: the slot's HEAD is published, as an ancestor.
+    other = tmp_path / "other"
+    subprocess.run(
+        ["git", "clone", str(remote), str(other)],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    git(other, "config", "user.name", "Wrkslots Test")
+    git(other, "config", "user.email", "wrkslots@example.invalid")
+    (other / "large.bin").write_bytes(os.urandom(4 * 1024 * 1024))
+    git(other, "add", "large.bin")
+    git(other, "commit", "-m", "large data")
+    git(other, "push", "origin", "main")
+    large_blob = git(other, "rev-parse", "HEAD:large.bin").stdout.strip()
+    git(remote, "merge-base", "--is-ancestor", head, "main")
+    mark_owner_dead(project)
+    set_liveness(project, "dead")
+    lock = project / "worktrees" / "ACTIVE.global.lock"
+    fake_bin, log = _network_lock_probe_git(tmp_path, lock)
+
+    removed = command(
+        project,
+        "remove",
+        "slot01",
+        "--coordinator-pid",
+        str(os.getpid()),
+        "--expected-generation",
+        "1",
+        env={"PATH": f"{fake_bin}{os.pathsep}{os.environ['PATH']}"},
+    )
+
+    assert removed.returncode == 0, removed.stderr
+    archive = json.loads(
+        (project / "worktrees" / "ARCHIVED.testhost.json").read_text(encoding="utf-8")
+    )
+    receipts = archive["records"][0]["salvage"]
+    assert [(item["checkout"], item["disposition"]) for item in receipts] == [
+        ("product", "already-published")
+    ]
+    assert receipts[0]["containing_remote_refs"] == ["refs/remotes/origin/main"]
+    # The large file was never downloaded into the repository's object store.
+    assert (
+        git(repository, "cat-file", "-e", large_blob, check=False).returncode != 0
+    )
+    calls = log.read_text(encoding="utf-8").splitlines()
+    assert calls, "removal never asked the remote"
+    assert all(line.endswith(" free") for line in calls), calls
+    assert [line.split()[0] for line in calls] == ["ls-remote", "fetch"], calls
+    # Nothing was left in the system temporary directory or the Git directory.
+    common = Path(
+        git(repository, "rev-parse", "--path-format=absolute", "--git-common-dir").stdout.strip()
+    )
+    assert not list(common.glob("wrkslots-remote-*"))
+
+
+@pytest.mark.skipif(shutil.which("flock") is None, reason="needs flock(1)")
+def test_agent_remove_builds_and_verifies_a_local_archive_before_the_lock(
+    tmp_path: Path,
+) -> None:
+    project, _repository, _remote = make_project(tmp_path, allow_salvage_push=False)
+    made = create(project)
+    assert made.returncode == 0, made.stderr
+    tree = checkout(project)
+    (tree / "unpublished.txt").write_text("keep me\n", encoding="utf-8")
+    mark_owner_dead(project)
+    set_liveness(project, "dead")
+    lock = project / "worktrees" / "ACTIVE.global.lock"
+    fake_bin, log = _network_lock_probe_git(tmp_path, lock)
+
+    removed = command(
+        project,
+        "remove",
+        "slot01",
+        "--coordinator-pid",
+        str(os.getpid()),
+        "--expected-generation",
+        "1",
+        env={"PATH": f"{fake_bin}{os.pathsep}{os.environ['PATH']}"},
+    )
+
+    assert removed.returncode == 0, removed.stderr
+    archive = json.loads(
+        (project / "worktrees" / "ARCHIVED.testhost.json").read_text(encoding="utf-8")
+    )
+    (receipt,) = archive["records"][0]["salvage"]
+    assert receipt["disposition"] == "archived-local"
+    bundle = Path(receipt["archive_bundle"])
+    shown = subprocess.run(
+        ["git", "bundle", "list-heads", str(bundle)],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout
+    assert receipt["salvage_commit"] in shown
+    calls = log.read_text(encoding="utf-8").splitlines()
+    # The bundle is made and restored into a fresh clone once, before the
+    # registry lock; the rechecks under the lock reread only its bytes.
+    assert [line for line in calls if line.split()[0] in {"bundle", "clone", "fsck"}] == [
+        "bundle free",
+        "clone free",
+        "fsck free",
+    ], calls
+    assert all(line.endswith(" free") for line in calls), calls
+    # Nothing is left beside the bundle but the bundle and its receipt.
+    assert sorted(entry.name for entry in bundle.parent.iterdir()) == [
+        "receipt.json",
+        "repository.bundle",
+    ]
+
+
+def test_remote_heads_containing_refuses_a_head_only_on_a_rewritten_branch(
+    tmp_path: Path,
+) -> None:
+    project, repository, remote = make_project(tmp_path)
+    git(remote, "config", "uploadpack.allowFilter", "true")
+    assert create(project).returncode == 0
+    tree = checkout(project)
+    git(tree, "config", "user.name", "Wrkslots Test")
+    git(tree, "config", "user.email", "wrkslots@example.invalid")
+    (tree / "work.txt").write_text("work\n", encoding="utf-8")
+    git(tree, "add", "work.txt")
+    git(tree, "commit", "-m", "work")
+    git(tree, "push", "origin", "HEAD:refs/heads/topic")
+    head = git(tree, "rev-parse", "HEAD").stdout.strip()
+    vcs = wrkslots._GitVcs()
+    authority = vcs.remote_authority(tree, "origin")
+    with wrkslots._remote_containment_scope():
+        assert vcs.remote_heads_containing(tree, "origin", head, authority) == (
+            "refs/remotes/origin/topic",
+        )
+    # The branch is rewritten on the remote to a commit the checkout lacks:
+    # the stale local tracking ref still contains HEAD, but the remote does not.
+    other = tmp_path / "other"
+    subprocess.run(
+        ["git", "clone", str(remote), str(other)],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    git(other, "config", "user.name", "Wrkslots Test")
+    git(other, "config", "user.email", "wrkslots@example.invalid")
+    git(other, "checkout", "-b", "topic", "origin/main")
+    (other / "other.txt").write_text("other\n", encoding="utf-8")
+    git(other, "add", "other.txt")
+    git(other, "commit", "-m", "replacement")
+    git(other, "push", "--force", "origin", "topic")
+    replacement = git(other, "rev-parse", "HEAD").stdout.strip()
+    git(tree, "update-ref", "refs/remotes/origin/topic", head)
+    assert git(tree, "cat-file", "-e", replacement, check=False).returncode != 0
+
+    assert vcs.remote_heads_containing(tree, "origin", head, authority) == ()
+    # Asking wrote no ref of the checkout and fetched nothing into its store.
+    assert git(tree, "rev-parse", "refs/remotes/origin/topic").stdout.strip() == head
+    assert git(tree, "cat-file", "-e", replacement, check=False).returncode != 0
+
+
+@pytest.mark.parametrize(
+    ("recorded", "current", "expected"),
+    (
+        (
+            "git@github.com:rrnewton/agent-utils.git",
+            "https://github.com/rrnewton/agent-utils.git",
+            True,
+        ),
+        (
+            "https://github.com/example-owner/Mixed-Case.git",
+            "git@github.com:example-owner/Mixed-Case.git",
+            True,
+        ),
+        (
+            "git@github.com:someone-else/agent-utils.git",
+            "https://github.com/rrnewton/agent-utils.git",
+            False,
+        ),
+        ("/srv/git/old.git", "/srv/git/new.git", False),
+        ("/srv/git/same.git", "/srv/git/same.git", True),
+    ),
+)
+def test_recorded_remote_digest_accepts_only_the_same_github_repository(
+    recorded: str, current: str, expected: bool
+) -> None:
+    authority = wrkslots._RemoteAuthority(
+        url=current, sha256=hashlib.sha256(current.encode()).hexdigest()
+    )
+    assert (
+        wrkslots._recorded_remote_names_same_repository(
+            hashlib.sha256(recorded.encode()).hexdigest(), authority
+        )
+        is expected
     )
 
 

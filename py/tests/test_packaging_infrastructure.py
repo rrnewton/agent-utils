@@ -855,9 +855,15 @@ def test_wrkslots_lifecycle_partitions_are_disjoint_and_complete() -> None:
     # The 38 result-recorded frozen removal cases (one removal, one
     # classification, one direct refusal, 23 refused gates, ten journal
     # resumptions, and two incomplete-result retentions) are ordinary.
-    assert len(all_tests) == 1928
+    # The twelve salvage cases of https://github.com/rrnewton/agent-utils/issues/237
+    # (two removals of a submodule cloned from its source's module directory,
+    # one removal of a submodule cloned from another local mirror, one alias
+    # refusal, the lock-free publication check, the archive made before the
+    # lock, the rewritten-branch check, and five recorded-remote-digest
+    # cases) are mapped.
+    assert len(all_tests) == 1940
     assert len(ordinary) == 336
-    assert len(mapped) == 1592
+    assert len(mapped) == 1604
     assert {
         node.split("::", 1)[1].split("[", 1)[0] for node in ordinary
     } == {

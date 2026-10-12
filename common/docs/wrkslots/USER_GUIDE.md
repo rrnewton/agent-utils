@@ -876,9 +876,20 @@ salvage candidate and are then the only destination used by isolated network Git
 checkout-config change can only refuse the operation; it cannot choose a new network destination.
 The isolated transport uses plumbing commands that do not apply URL rewrite configuration and
 binds the fresh repository's config bytes before execution; changing that config also refuses before
-the network command starts. Remote-ref discovery and salvage readback are metadata-only, and fetch
-transfers only commits reachable from advertised branch heads; tag-only and other unrelated history
-is not imported into the checkout's shared object store.
+the network command starts. Remote-ref discovery and salvage readback are metadata-only.
+
+Removal decides that a clean checkout is already published without importing the remote's
+branches. One `ls-remote` lists the remote's branch heads. A head whose commit is already in the
+checkout's object store is compared there. Only when none of those contains the checkout's HEAD are
+the remaining heads fetched, and then only their commits (`--filter=tree:0` where the remote supports
+it), into an empty temporary repository inside the checkout's own Git directory; no file contents,
+no tag-only history, and nothing in the system temporary directory. No ref of the checkout,
+including `refs/remotes/*`, is changed. When the slot's owner is already gone (dead or never
+recorded, heartbeat expired, no hold, handoff read), removal first checks every checkout and
+initialized submodule locally, then asks these questions before it takes the registry lock, and
+reuses each answer (or refusal) under the lock for at most 300 seconds for the same commit, object
+store, and remote URL, so the lock is not held across that network traffic. The local facts (HEAD,
+status, remote URL) are always read again under the lock.
 
 When `with-proxy` is installed on `PATH`, Wrkslots uses it for Git fetches, pushes, remote ref
 readback, and post-provision hooks. The hook's children, including recursive submodule commands,
@@ -940,9 +951,15 @@ transport failure can also happen after an earlier network step succeeded, so an
 that the remote could not be used at that moment, not that it was never reached. Each bundle has
 a schema-1 JSON receipt binding the machine, slot generation, checkout and repository identities,
 remote URL digest, source and salvage commits, status digest, archive ref, byte count, and SHA-256.
-Wrkslots clones the bundle into a fresh empty bare repository, resolves the exact archive ref, and
-runs `git fsck --full --strict --no-dangling` before recording `archived-local`. The same bundle,
-receipt, digest, and fresh-clone verification are read back again at the destructive boundary.
+Wrkslots clones the bundle into a fresh empty bare repository beside the bundle (never in the
+system temporary directory), resolves the exact archive ref, and runs
+`git fsck --full --strict --no-dangling` before recording `archived-local`. The same bundle,
+receipt, and digest are read back again at the destructive boundary; within one removal, bytes whose
+SHA-256 and size match a bundle that removal already restored and checked are not cloned and checked
+again. When the slot's owner is already gone (dead or never recorded, heartbeat expired, no hold,
+handoff read) and the checkout would be archived because its remote is not in
+`salvage_push_remotes`, removal makes and verifies the bundle before it takes the registry lock;
+under the lock it finds that bundle, rereads its bytes, and writes the receipt.
 
 An interrupted removal can be resumed with ordinary `wrkslots recover`; its finish journal carries
 the verified local receipt. If interruption occurred just before the finish journal was created,
@@ -975,6 +992,23 @@ The source checkout is allowed to switch between the recognized GitHub HTTPS, SC
 `ssh://git@github.com/` spellings only when the lowercase owner and repository components remain
 identical. Salvage continues to use and recheck the managed slot's own URL. A different host, owner,
 or repository still refuses; arbitrary local URLs and other hosting providers remain byte-exact.
+
+One kind of local URL is accepted: an absolute path naming a local mirror of the source submodule's
+remote, meaning the source submodule's own Git directory or another local repository whose own
+remote names the same repository as the source's remote. A linked worktree shares its
+superproject's configuration, so when that configuration names such a module directory as
+`submodule.<name>.url`, `git submodule update` in the slot clones from it and records that path as
+`origin`. Removing the slot deletes neither repository, but neither is where work is published, so
+the nested checkout's HEAD is judged at the source submodule's own remote, which must lead elsewhere
+(a network URL, or an absolute path to yet another repository). Salvage never pushes through that
+alias: unpublished nested work is kept in a verified local bundle. A local path to any other
+repository, including one whose remote names a different repository or no remote at all, still
+refuses.
+
+For `recover-absent-agent-row(s)`, only the digest of a checkout's remote URL was recorded. A source
+repository whose remote has since moved between the GitHub spellings above for the same owner and
+repository (for example from `git@github.com:` to `https://github.com/`) is accepted when the
+recorded digest is that of one of those spellings; any other change still refuses.
 
 ## Import older slots
 
