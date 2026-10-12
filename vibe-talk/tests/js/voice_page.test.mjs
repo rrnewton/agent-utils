@@ -26522,7 +26522,9 @@ test("a thread nobody has answered yet is tagged Thread with no number, and grow
   await page.settle();
   const badge = threadBadge(rowOf(page, "210"));
   assert.equal(badge.textContent, "Thread");
-  assert.equal(badge.getAttribute("aria-label"), null, "the tag announced a count of nothing");
+  // `#252 thread-button-state`: no count to announce, and what the tag does instead — it starts the
+  // thread nobody has answered.
+  assert.equal(badge.getAttribute("aria-label"), "Start a thread on this message", "the tag announced a count of nothing");
   assert.equal(threadButton(rowOf(page, "210")), undefined, "All offered a chip for no replies");
   assert.doesNotMatch(page.el("discord-log").text(), /Thread 0|0 replies/);
 

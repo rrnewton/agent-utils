@@ -769,6 +769,31 @@ body {
   font-size: 0.85rem;
 }
 
+/* `#252 thread-button-state`. A thread nobody has answered is not one yet: its tag is drawn as Reply
+   beside it is, a quiet control on the metadata row with no colour of its own, until the first
+   reply makes it a thread's coloured Thread(N) (web/voice.js, `paintThreadBadge`). */
+.thread-badge[data-thread-state="start"] {
+  padding: 0.05rem 0.5rem;
+  background: none;
+  border: 1px solid var(--edge);
+  border-radius: 999px;
+  color: var(--muted);
+  font: inherit;
+  font-size: 0.72rem;
+  letter-spacing: 0.02em;
+  min-height: 0;
+  touch-action: manipulation;
+  -webkit-tap-highlight-color: transparent;
+}
+
+/* ...and it gains the accent with the selected row, as Reply does. */
+#side-log li.discord-message[data-selected="true"] .thread-badge[data-thread-state="start"],
+#discord-log li.discord-message[data-selected="true"] .thread-badge[data-thread-state="start"],
+#pinned-log li.discord-message[data-selected="true"] .thread-badge[data-thread-state="start"] {
+  color: var(--ink);
+  border-color: var(--accent);
+}
+
 .thread-replies {
   display: block;
   width: fit-content;

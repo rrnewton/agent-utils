@@ -5202,7 +5202,11 @@ function threadFromKeyboard(target) {
   const { row, took } = rowForAct(target);
   const badge = row ? childByClass(row, "thread-badge") : null;
   if (!badge || badge.hidden) return took;
+  const starting = badge.getAttribute("data-thread-state") === "start";
   badge.click();
+  // `#252 thread-button-state`. A thread nobody has answered opens with the focus in its message box,
+  // for its first reply, and the keys leave it there.
+  if (starting && isComposer(document.activeElement)) return true;
   // In two columns the thread is selected on the right, and the keys go with it. `#229`.
   if (columnsShown) {
     focusList(sidePane);
@@ -10175,14 +10179,19 @@ function walkCursorOwed() {
  * up (a thread All reaches from its start is covered already, `inheritAllCover`). An old thread read
  * for itself is not joined to Main's newest page as All, nor a thread's root to its newest replies.
  * Empty when no cover vouches — and for Main, which is drawn from All or read, and the Threads list.
+ *
+ * `#252 thread-button-state`. A thread nobody has answered, whose root the store holds, is that root
+ * alone, by its own count: drawn from it when All does not reach it, so the grey Thread tag opens it
+ * at once, ready for its first reply, wherever the root was found. Its read still follows.
  */
 function heldViewRows() {
   if (!threadingSupported || (channelView !== "flat" && channelView !== "thread") ||
       channelCanon.channel !== String(el("discord-channel").value)) return [];
   const base = channelCanon.views.get(viewKey(channelView === "flat" ? "main" : "flat"));
-  if (!base || (base.more && base.floor === null)) return [];
-  return channelCanon.messages.filter((message) => inView(message, channelView, selectedThreadId) &&
-    !(base.more && timeOf(message, "timestamp") < base.floor));
+  const rows = !base || (base.more && base.floor === null) ? [] : channelCanon.messages.filter((message) =>
+    inView(message, channelView, selectedThreadId) && !(base.more && timeOf(message, "timestamp") < base.floor));
+  const root = rows.length === 0 && channelView === "thread" ? heldUnansweredRoot(selectedThreadId) : null;
+  return root ? [root] : rows;
 }
 
 /**
@@ -12339,8 +12348,6 @@ function addThreadDecoration(meta, message, row, everyThread = false) {
   const badge = document.createElement("button");
   badge.className = "thread-badge";
   badge.setAttribute("type", "button");
-  badge.setAttribute("title", "Open this thread");
-  badge.style.setProperty("--thread-hue", threadHue(id));
   // The reply count tells two tags apart at a glance, as their colours do. NOT A ZERO: a provider
   // can name a thread nobody has answered yet — every Google Chat message heads one — and
   // "Thread 0" on such a row read as a broken count. `#185 reply-new-thread`.
@@ -12350,10 +12357,18 @@ function addThreadDecoration(meta, message, row, everyThread = false) {
   // was taken for. Only the chip says it: the picker and the heading over an open thread name a
   // thread, and give its count among its facts ("13h · 12 · name"), so the `#194` rule that the
   // heading matches the picker is about the NAME and is untouched by this.
+  //
+  // `#252 thread-button-state`: a thread nobody has answered is not one yet, and its tag is grey and
+  // starts it (`paintThreadBadge`). The pass over the rows that follows every redraw paints it again
+  // with the replies the store holds (`drawThreadChips`), which is what turns it into the coloured
+  // chip when the first reply arrives.
   const replies = threadReplyCount(id, message);
-  badge.textContent = replies ? `Thread(${replies})` : "Thread";
-  if (replies) badge.setAttribute("aria-label", `Open this thread, ${threadCount(replies, true)}`);
-  badge.addEventListener("click", inThisColumn(() => guardQuietly(() => openThread(id))()));
+  paintThreadBadge(badge, id, replies, unansweredRoot(message, replies, 0, null));
+  // What the tag does is read when it is pressed, so a tag painted again since it was drawn does
+  // what it now says.
+  badge.addEventListener("click", inThisColumn(() => guardQuietly(() => (
+    badge.getAttribute("data-thread-state") === "start" ? startThread(id) : openThread(id)
+  ))()));
   // `#224 keyboard-shortcuts`. → on the selected message presses it.
   sayRowShortcut(badge, "thread-badge");
   meta.append(badge);
@@ -12388,6 +12403,99 @@ function gatherCount(id, message, held = 0) {
     ? { count: own.reply_count, exact: own.reply_count_exact }
     : threadReplies(id, message);
   return typeof count === "number" ? { count: Math.max(count, held), exact } : { count: held || null, exact: true };
+}
+
+// --- the Thread button before there is a thread ---------------------------------------------------
+//
+// `#252 thread-button-state`. The owner, 2026-10-12: "Thread button doesn't deserve a color UNLESS
+// there is a thread. Right now I send a brand new message in the main chat and it immediately has a
+// colored "(Thread)" button in the upper right even though it has zero responses. I think it should
+// be a functional button for CREATING a new thread from vibe-talk... but it should be greyed and have
+// no color yet until there is an actual thread created (at least one response)."
+//
+// Google Chat names a thread for every message, so every new message there heads a thread nobody has
+// answered, and its tag was drawn in a colour of its own, as a thread's is. Such a tag is grey now,
+// as Reply beside it is, says plain "Thread", and STARTS the thread: the thread opens as the tag
+// opens any thread — on the right, in two columns — with the message alone in it and its message box
+// focused, and what is sent from there is the thread's first reply. No hue is spent on it: the
+// colours tell threads apart, and a channel where every message heads a thread would otherwise give
+// every message one. The first reply — the reader's own, once acknowledged, or anyone's, brought by a
+// read or the stream — makes it a thread, and the next pass over the rows draws the coloured
+// Thread(1) in its place (`drawThreadChips`).
+//
+// WHERE A THREAD CAN BE STARTED. Only where the provider has named the thread the message heads, by
+// a count that says nobody has answered it: a count of zero, not a missing one, since a root whose
+// provider gives no count may well have replies, and keeps the coloured tag it had. Google Chat
+// names one for every message. Slack names a thread only once it has a reply, so a message nobody
+// has answered there has no thread record and no tag, as before — and Reply already starts its
+// thread, since Slack's server posts every reply into the message's thread. Discord's threads are
+// channels of their own, which this server does not create: a message that heads none has no tag
+// either. A Discord thread somebody made and nobody has written in yet is grey like Google Chat's,
+// and its first reply goes into it. And not on a channel that is read-only, where nothing can be
+// posted to start one: a control that cannot act is absent.
+
+/**
+ * Whether `message` heads a thread nobody has answered yet: it is the thread's root, its count
+ * (`reported`, the summary's or its own) says zero, and nothing says more — not the replies the store
+ * holds, `held`, nor the highest exact count, `exact`.
+ */
+function unansweredRoot(message, reported, held, exact) {
+  const record = message && message.thread;
+  return Boolean(record) && record.is_root === true && reported === 0 && held === 0 && !exact;
+}
+
+/**
+ * Paint a row's thread tag for its state: grey "Thread", which starts the thread (`startThread`),
+ * for a thread nobody has answered — absent on a channel that is read-only — and otherwise the
+ * thread's coloured Thread(N), which opens it. Written only where it changes: the pass over the rows
+ * paints every tag again.
+ */
+function paintThreadBadge(badge, id, replies, unanswered) {
+  const state = unanswered ? "start" : "open";
+  const text = !unanswered && replies ? `Thread(${replies})` : "Thread";
+  const title = unanswered ? "Start a thread on this message" : "Open this thread";
+  const label = unanswered ? title : replies ? `Open this thread, ${threadCount(replies, true)}` : null;
+  const hidden = unanswered && knownChannel(el("discord-channel").value)?.writable === false;
+  if (badge.getAttribute("data-thread-state") !== state) {
+    badge.setAttribute("data-thread-state", state);
+    // The colour is the thread's, and there is no thread yet; it is given when there is.
+    if (unanswered) badge.style.removeProperty("--thread-hue");
+    else badge.style.setProperty("--thread-hue", threadHue(id));
+  }
+  if (badge.textContent !== text) badge.textContent = text;
+  if (badge.getAttribute("title") !== title) badge.setAttribute("title", title);
+  if (label === null) badge.removeAttribute("aria-label");
+  else if (badge.getAttribute("aria-label") !== label) badge.setAttribute("aria-label", label);
+  if (badge.hidden !== hidden) badge.hidden = hidden;
+}
+
+/**
+ * The grey Thread tag was pressed: open thread `id`, which nobody has answered yet, as its tag opens
+ * any thread — on the right, in two columns — and put the focus in its message box, ready for its
+ * first reply. Nothing is posted until that reply is sent, and that send is what starts the thread.
+ */
+function startThread(id) {
+  const opened = openThread(id);
+  inColumn(columnsShown ? columns.side : columns.main, () => {
+    const box = el("channel-compose-text");
+    // Not `preventScroll`: the box is at the foot of the thread, and writing in it is going there.
+    if (shownNode(box) && !box.disabled) box.focus();
+  });
+  return opened;
+}
+
+/**
+ * The root of thread `id` when the store holds it and nobody has answered it — no reply held, and a
+ * count of zero (`unansweredRoot`) — or null. Such a thread is its root alone, and is drawn from it
+ * at once, with no read to wait for (`heldViewRows`).
+ */
+function heldUnansweredRoot(id) {
+  const key = String(id);
+  const thread = channelCanon.messages.filter((message) => threadOf(message) === key);
+  const root = thread.find((message) => message.thread.is_root === true);
+  if (!root || thread.length !== 1) return null;
+  const tally = replyTally();
+  return unansweredRoot(root, threadReplyCount(key, root), 0, exactReplyCount(key, root, tally)) ? root : null;
 }
 
 // --- unread replies, on Main ----------------------------------------------------------------------
@@ -12627,14 +12735,11 @@ function drawThreadChips(row, tally, inMain) {
   if (own && badge) {
     const entry = tally.threads.get(own) || { held: 0, unread: 0 };
     const reported = threadReplyCount(own, message);
-    const replies = Math.max(typeof reported === "number" ? reported : 0, entry.held,
-      exactReplyCount(own, message, tally) || 0);
-    const text = replies ? `Thread(${replies})` : "Thread";
-    if (badge.textContent !== text) {
-      badge.textContent = text;
-      if (replies) badge.setAttribute("aria-label", `Open this thread, ${threadCount(replies, true)}`);
-      else badge.removeAttribute("aria-label");
-    }
+    const exact = exactReplyCount(own, message, tally);
+    const replies = Math.max(typeof reported === "number" ? reported : 0, entry.held, exact || 0);
+    // `#252 thread-button-state`. Grey while nobody has answered; the coloured Thread(N) from the
+    // first reply on, which is this pass, the next time the rows are passed over after it arrives.
+    paintThreadBadge(badge, own, replies, unansweredRoot(message, reported, entry.held, exact));
     const gather = childByClass(row, "thread-replies");
     if (gather && message.thread.is_root) {
       const { count, exact } = gatherCount(own, message, entry.held);
