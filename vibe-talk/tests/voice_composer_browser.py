@@ -276,10 +276,26 @@ def until(page: Page, condition: Callable[[], bool], what: str, timeout_ms: int 
     raise AssertionError(f"timed out waiting for {what}")
 
 
+# The status pill floats over the foot of the list with `pointer-events: none`, so a tap passes
+# through it and `elementFromPoint` does not see it; whether it is DRAWN over the box or Send is a
+# separate question, asked here of the boxes themselves.
+CLEAR_OF_PILL_JS = """(id) => {
+  const pill = document.getElementById('status-line');
+  if (!pill || pill.hidden) return '';
+  const p = pill.getBoundingClientRect(), r = document.getElementById(id).getBoundingClientRect();
+  const overlap = Math.min(p.right, r.right) - Math.max(p.left, r.left) > 0.5 &&
+    Math.min(p.bottom, r.bottom) - Math.max(p.top, r.top) > 0.5;
+  return overlap ? `the status pill is drawn over #${id}` : '';
+}"""
+
+
 def on_screen(page: Page, where: str, *ids: str) -> None:
     for element_id in ids:
         problem = page.evaluate(ON_SCREEN_JS, element_id)
         check(problem == "", f"{where}: {problem}")
+        if element_id in ("send-text", "compose-text"):
+            problem = page.evaluate(CLEAR_OF_PILL_JS, element_id)
+            check(problem == "", f"{where}: {problem}")
 
 
 def focused_id(page: Page) -> object:
@@ -391,6 +407,45 @@ def walk(chromium: BrowserType, args: argparse.Namespace, url: str, api: FakeApi
             check(voice.audio_frames[0] == 0, f"{label}: a typed conversation sent audio")
             page.click("#compose-text")
             on_screen(page, f"{label}, a typed conversation, the box focused", "view-switch", "send-text", "hang-up")
+
+            # 4b. A conversation longer than the screen, where the box is in the list and can be half
+            #     under the dock. A real tap on the part that shows (not a locator click, which would
+            #     scroll it into view first) takes the whole box into view, Send included; on the
+            #     phone the keyboard coming up keeps it there.
+            for turn in range(2, 14):
+                voice.send(0, {"type": "transcript", "role": "assistant", "turn": turn,
+                               "text": f"Answer {turn}: " + "the nightly ran green on every target. " * 3})
+                voice.send(0, {"type": "turn_complete", "turn": turn})
+            page.wait_for_function("() => document.querySelectorAll('#transcript > li.theirs').length >= 13",
+                                   timeout=10_000)
+            page.evaluate("() => document.activeElement && document.activeElement.blur()")
+            half = page.evaluate(
+                "() => { const a = document.getElementById('scroll-area'); "
+                "const r = a.getBoundingClientRect(); "
+                "a.scrollTop += document.getElementById('compose-text').getBoundingClientRect().top - (r.bottom - 40); "
+                "const f = document.getElementById('compose-text').getBoundingClientRect(); "
+                "return [f.left + 24, Math.min(f.top + 12, r.bottom - 8), r.bottom, "
+                "document.getElementById('send-text').getBoundingClientRect().top]; }")
+            assert isinstance(half, list)
+            x, y, area_bottom, send_top = (float(value) for value in half)
+            check(send_top > area_bottom, f"{label}: the premise, Send under the dock, does not hold")
+            page.mouse.click(x, y)
+            page.wait_for_timeout(200)
+            where = f"{label}, a long typed conversation, the box tapped where it showed"
+            check(focused_id(page) == "compose-text", f"{where}: the tap did not focus the box")
+            on_screen(page, where, "send-text", "view-switch", "hang-up")
+            if mobile:
+                page.set_viewport_size({"width": width, "height": height - KEYBOARD_PX})
+                page.wait_for_timeout(300)
+                where = f"{label}, a long typed conversation, a {KEYBOARD_PX}px keyboard up"
+                check(focused_id(page) == "compose-text", f"{where}: the box lost the focus")
+                problem = page.evaluate(TYPING_LINE_JS)
+                check(problem == "", f"{where}: {problem}")
+                on_screen(page, where, "send-text", "view-switch", "hang-up")
+                if args.screenshots:
+                    page.screenshot(path=str(args.screenshots / f"{label}-keyboard-long.png"), animations="disabled")
+                page.set_viewport_size({"width": width, "height": height})
+                page.wait_for_timeout(200)
 
             # 5. The switch works from a typed conversation as it does from a call: the conversation
             #    goes on, and its end control with it.

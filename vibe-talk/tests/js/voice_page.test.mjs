@@ -17355,6 +17355,66 @@ test("THE ON-SCREEN KEYBOARD RESIZES THE FRAME, SO THE DOCK RIDES ABOVE IT", () 
   assert.match(cssBlock("body"), /height:\s*100dvh/, "the frame is no longer sized by the dynamic viewport");
 });
 
+/**
+ * A call whose transcript overflows the list, with the call's box given a height the fixture can
+ * lay out (it counts text, not a textarea's value), and the list scrolled so that only the top of
+ * the box shows: its Send is under the dock.
+ */
+async function callWithBoxHalfShowing(page) {
+  await startTalking(page);
+  const area = fillTranscript(page);
+  page.el("compose-text").textContent = "x".repeat(CHARS_PER_LINE * 4);
+  const box = page.el("voice-composer");
+  area.scrollTop = area.scrollHeight - area.clientHeight - box.height() / 2;
+  const r = box.getBoundingClientRect();
+  assert.ok(r.top < area.clientHeight && r.bottom > area.clientHeight, "the premise: the box is half under the dock");
+  return area;
+}
+
+/** Whether the whole of the call's box is inside the list's view. */
+const boxInView = (page) => {
+  const area = page.el("scroll-area");
+  const r = page.el("voice-composer").getBoundingClientRect();
+  return r.top >= 0 && r.bottom <= area.clientHeight;
+};
+
+test("A TAP ON THE PART OF THE BOX THAT SHOWS TAKES THE WHOLE BOX INTO VIEW", async () => {
+  // `#241 voice-composer`. The box is in the scrolling list, so it can be half under the dock; a
+  // browser scrolls a focused field only as far as the field, which can leave Send under the dock.
+  const page = newPage();
+  const area = await callWithBoxHalfShowing(page);
+  page.el("compose-text").focus();
+  await page.el("compose-text").dispatch("focus");
+  assert.ok(boxInView(page), "focusing the box left part of it under the dock");
+  // ...and a box already in view is not moved at all.
+  const at = area.scrollTop;
+  await page.el("compose-text").dispatch("focus");
+  assert.equal(area.scrollTop, at, "focusing a box already in view moved the list");
+});
+
+test("THE KEYBOARD COMING UP KEEPS THE BOX IN VIEW, AND LEAVES A READER WHO IS NOT WRITING WHERE THEY ARE", async () => {
+  // `#241 voice-composer`. With `interactive-widget=resizes-content` the on-screen keyboard takes
+  // its height from the list. A list that shrinks keeps its scroll position, so the foot of it — the
+  // box being typed in — slides under the dock. A reader writing in the box is kept on it; a reader
+  // who is not is left where they are, as `#207 scrollback-jump` decided for a window that shrinks.
+  const KEYBOARD = 200;
+  const run = async (writing) => {
+    const page = newPage(new Map(), SCRIPT, (p) => p.enableResizeObserver());
+    const area = await callWithBoxHalfShowing(page);
+    area.scrollTop = area.scrollHeight;
+    if (writing) page.el("compose-text").focus();
+    page.resized(area); // the first report has nothing before it
+    assert.ok(boxInView(page), "the premise: the box is in view before the keyboard");
+    const before = area.scrollTop;
+    area.clientHeight -= KEYBOARD;
+    page.resized(area);
+    page.expireTimers(0);
+    return { inView: boxInView(page), moved: area.scrollTop !== before };
+  };
+  assert.deepStrictEqual(await run(true), { inView: true, moved: true }, "the keyboard covered the box being typed in");
+  assert.deepStrictEqual(await run(false), { inView: false, moved: false }, "a reader who was not writing was moved");
+});
+
 test("THERE IS EXACTLY ONE COMPOSER FOR THE AGENT, AND IT IS IN THE CALL'S TRANSCRIPT", () => {
   // `#43 typed-input` shipped a composer as a row of its own in the dock; `#59 text-entry-button`
   // moved it into the control bar behind a Type toggle; `#241 voice-composer` moves it into the
@@ -17679,6 +17739,12 @@ test("the field states its own layout rule: the size iOS will not zoom", () => {
   assert.equal(cssBlock("#send-text"), cssBlock("#channel-send"), "the call's Send is drawn its own way");
   assert.match(cssBlock("#voice-composer"), /padding:[^;]*var\(--scroll-tools-clearance, 0px\)/,
     "the floating chips can cover the call's box at the end of the list");
+  // ...and room for the status pill too, which the call's view puts up at every turn and which
+  // floats 0.5rem off the list's foot at least 1.9rem tall. tests/voice_composer_browser.py checks
+  // in Chromium that it is not drawn over Send.
+  assert.match(cssBlock("#voice-composer"), /padding-bottom:[^;]*var\(--scroll-tools-clearance, 0px\)[^;]*\+ 2\.4rem/,
+    "the status pill lies across the call's Send after every message");
+  assert.match(cssBlock("#status-line"), /min-height:\s*1\.9rem/, "the pill's height changed under the room kept for it");
   // The pressed Type toggle and the bar's text mode are gone with the toggle.
   assert.doesNotMatch(CSS_CODE, /#text-entry|data-mode="text"/, "the Type toggle's styles outlived it");
 });

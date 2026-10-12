@@ -3938,6 +3938,34 @@ function deliverHeldTurn() {
   renderControls();
 }
 
+/**
+ * Bring the whole of the call's message box into the list's view: the box and its Send, or, when
+ * the list is shorter than the box, the box's top, where the reader types. Nothing moves when it is
+ * all in view already.
+ *
+ * The box is IN the scrolling list, so it can be partly out of view in two ways a box fixed to the
+ * screen never is. A tap on the part showing focuses it with Send still under the dock, and a
+ * browser scrolls a focused field only as far as the field itself. And the on-screen keyboard takes
+ * its height from the list (`interactive-widget=resizes-content`): a list that loses a third of its
+ * height keeps its scroll position, so the foot of it — the box being typed in — goes under the
+ * dock. So this runs when the box takes the focus, and when the list shrinks while it has it.
+ */
+function keepComposerInView() {
+  const area = leftEl("scroll-area");
+  const box = leftEl("voice-composer").getBoundingClientRect();
+  const top = box.top - area.getBoundingClientRect().top + area.scrollTop;
+  const bottom = top + box.height;
+  const view = area.clientHeight || 0;
+  if (top >= area.scrollTop && bottom <= area.scrollTop + view) return;
+  area.scrollTop = box.height <= view ? bottom - view : top;
+}
+
+/** Whether the reader is writing in the call's box on the call's view, which is when it is kept in view. */
+function writingToAgent() {
+  return currentScreen === "main" && currentView === "voice" &&
+    document.activeElement === leftEl("compose-text");
+}
+
 // --- Enter, in every message box ----------------------------------------------------------------
 //
 // `#225 enter-to-send`. The owner: "In main chat view enter is send. In reply view enter is newline
@@ -25877,6 +25905,10 @@ el("speaker").addEventListener("click", () => setSpeakerOff(!session.speakerOff)
 // starts is guarded on its own, inside `sendTyped`, exactly as Talk's is.
 el("send-text").addEventListener("click", guardQuietly(sendTyped));
 el("compose-text").value = storedComposeDraft();
+// `#241 voice-composer`. A tap on the part of the box that shows takes the whole of it into view.
+el("compose-text").addEventListener("focus", () => {
+  if (writingToAgent()) keepComposerInView();
+});
 el("compose-text").addEventListener("input", () => {
   rememberComposeDraft();
   noteComposing();
@@ -26361,6 +26393,7 @@ if (typeof window.ResizeObserver === "function") {
     const area = el("scroll-area");
     const now = { list: area.clientHeight, dock: el("dock").offsetHeight };
     const grew = seen !== null && seen.list > 0 && currentScreen === "main" ? now.dock - seen.dock : 0;
+    const shrank = seen !== null && seen.list > 0 && now.list < seen.list;
     seen = now;
     // `#221 read-modes`. Except a reader just landed on a thread's first unread who has not moved
     // since: on a desk the entry itself wrapped the dock, by putting the thread's name in the picker,
@@ -26371,6 +26404,13 @@ if (typeof window.ResizeObserver === "function") {
     }
     // `#243 filter-keeps-selection`. Nor a message a filter change holds in place, which stays put.
     if (keepFilterHold()) return;
+    // `#241 voice-composer`. The list shrinking under a reader who is writing in the call's box —
+    // the on-screen keyboard coming up, as the viewport asks the browser to lay it out — keeps the
+    // box in view rather than letting the list's foot, where the box is, slide under the dock.
+    if (shrank && writingToAgent()) {
+      keepComposerInView();
+      return;
+    }
     if (grew > 0 && atBottom(area, BOTTOM_SLACK_PX + grew)) {
       area.scrollTop = area.scrollHeight;
     }

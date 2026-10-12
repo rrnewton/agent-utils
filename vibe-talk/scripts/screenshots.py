@@ -2360,7 +2360,9 @@ def _act_voice_composer(driver: Driver) -> None:
     driver.load(with_token=True)
     driver.page.wait_for_function("() => window.__visible('control-pane')", timeout=10_000)
     driver.page.click("#compose-text")
-    driver.page.keyboard.type("summarize the last hour")
+    # `fill`, not typing: the scene before left a draft in the box (`#193 compose-draft-loss` keeps
+    # it across the reload), and keys would add to it rather than replace it.
+    driver.page.fill("#compose-text", "summarize the last hour")
     driver.settle(300)
 
 

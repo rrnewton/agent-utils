@@ -2507,6 +2507,12 @@ body {
 
 #voice-composer {
   margin-top: auto;
+  /* Room under Send for the status pill as well as for the chips. The pill floats over the foot of
+     the list (`#status-line`, `bottom: 0.5rem` over the chips' room) and the call's view says
+     something on it at every turn of a conversation — "Connected", "Sent." — so without this it lay
+     across Send for six seconds after every message. It is a single line at least 1.9rem tall,
+     0.5rem off the list's foot: 2.4rem clears it. The channel's box shares everything else. */
+  padding-bottom: calc(max(1rem, env(safe-area-inset-bottom)) + var(--scroll-tools-clearance, 0px) + 2.4rem);
 }
 
 /* The idle screen's largest area is the empty transcript, so the invitation goes there rather
