@@ -24,3 +24,11 @@ interface HTMLLIElement {
   /** `#228 reply-visible`. The circle on the row's lower-left corner, while it has one: the way down to a reply. */
   replyMarker?: HTMLButtonElement | null;
 }
+
+interface HTMLElement {
+  /**
+   * `#240 reading-bookmark`. The bookmark's line on the row it is drawn above, made once and kept on
+   * the row, as a collapsed run's line is. Set by voice.js (`bookmarkLineOf`).
+   */
+  bookmarkLine?: HTMLElement;
+}

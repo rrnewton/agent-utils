@@ -587,17 +587,25 @@
               <span id="jump-newest-label">Newest</span>
             </button>
             <!--
+              `#240 reading-bookmark`. The way back to this channel's bookmark, the line the reader keeps
+              above one message (Shift+B). DIRECTLY RIGHT of the jump to the newest message, because the
+              two are the pair a reader goes between: down to answer, back up to where they were
+              reading. Up only while the line is off the screen, its arrow pointing toward it. b does
+              the same. See `renderJumpBookmark`.
+            -->
+            <button id="jump-bookmark" class="chip" type="button" aria-label="Jump to your bookmark" hidden>
+              <svg class="chip-icon bookmark-arrow" viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M12 19V6" />
+                <path d="M6 11.5 12 5l6 6.5" />
+              </svg>
+              <span id="jump-bookmark-label">Bookmark</span>
+            </button>
+            <!--
               `#49 cached-summaries`. Summary mode is OPT-IN and it is a mode, not a per-row
               control: collapsing to a prefix stays the default and costs nothing, and a button on
               every long row would spend a model call every time a thumb slipped. It lives beside
               "Collapse all" because the two act on the same thing — what a folded message shows.
             -->
-            <!--
-              The way back to a kept place. Offered only when there IS one, and only over the
-              channel — the transcript has no message ids to mark. Press and hold a message to set
-              it; see `setPlaceMarker`.
-            -->
-            <button id="jump-marker" class="chip" type="button" hidden>My place</button>
             <!--
               `#204 reply-arrow`. The way back from a reply's arrow: offered only while the reply
               that was tapped is off the screen, because the jump took the reader away from it.

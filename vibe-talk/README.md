@@ -1971,8 +1971,8 @@ own adapter-only token; every other route uses the read/write tokens described a
 | GET | `/api/v1/conversations/{id}/replay` | **write** | that transcript, budgeted and fenced, for a new call — see "Resuming" |
 | GET | `/api/v1/inbox` | read | how far this server thinks each channel has been read |
 | GET | `/api/v1/channels/{id}/todo?limit=` | read | the recent window MINUS what has been dealt with |
-| POST | `/api/v1/channels/{id}/dismiss` | **write** | `{messages:[…]}`, or `{through:id, limit:n}` — mark as dealt with; answers the exact set it changed. Send back the `limit` you read `/todo` with, or `through` is resolved against the default window and clears more than you displayed |
-| POST | `/api/v1/channels/{id}/restore` | **write** | `{messages:[…]}` — the undo, restoring exactly that set |
+| POST | `/api/v1/channels/{id}/dismiss` | **write** | `{messages:[…]}` (at most 1,000 ids), or `{through:id, limit:n}` — mark as dealt with; answers the exact set it changed. Send back the `limit` you read `/todo` with, or `through` is resolved against the default window and clears more than you displayed |
+| POST | `/api/v1/channels/{id}/restore` | **write** | `{messages:[…]}` (at most 1,000 ids) — the undo, restoring exactly that set |
 | POST | `/api/v1/channels/{id}/read` | **write** | move this server's read mark forward |
 | DELETE | `/api/v1/channels/{id}/read` | **write** | drop this server's read mark |
 | POST | `/api/v1/channels/{id}/upstream-read` | **write** | `{message_id:"…"}` — ask an explicitly capable provider to move its monotone read cursor through that message; thread behavior is provider-defined |
@@ -1985,7 +1985,10 @@ own adapter-only token; every other route uses the read/write tokens described a
 | GET | `/api/v1/channels/{id}/pins` | read | this app's pinned messages in the channel, oldest message first, each with the snapshot kept of it, and the list's `revision`; see "Pinned messages" |
 | PUT | `/api/v1/channels/{id}/pins/{message_id}` | **write** | `{author, author_id, author_is_bot?, content, timestamp, thread_id?, thread_root?}` — pin it, keeping that much of the row; idempotent. At 100 pins in the channel the oldest is unpinned and named in `unpinned` |
 | DELETE | `/api/v1/channels/{id}/pins/{message_id}` | **write** | unpin it; idempotent, `changed: false` when it was not pinned |
-| DELETE | `/api/v1/storage` | **write** | erase EVERYTHING durable: transcripts, read marks, "dealt with" marks, cached summaries, channel aliases, pins, and every channel's clear-unread setting (back to off) |
+| GET | `/api/v1/channels/{id}/bookmark` | read | the channel's reading bookmark, `{revision, anchor}`, `anchor` null when none is set; every channel read carries it too. See "The reading bookmark" |
+| PUT | `/api/v1/channels/{id}/bookmark` | **write** | `{message_id, timestamp, place?:"above"\|"below", thread_id?, if_revision?}` — put it next to that message; a stale `if_revision` is `409` with where it is now; idempotent |
+| DELETE | `/api/v1/channels/{id}/bookmark?if_revision=` | **write** | take it away; `if_revision` as for PUT; idempotent |
+| DELETE | `/api/v1/storage` | **write** | erase EVERYTHING durable: transcripts, read marks, "dealt with" marks, cached summaries, channel aliases, pins, bookmarks, and every channel's clear-unread setting (back to off) |
 | POST | `/mcp` | read, or **write** per tool | MCP over Streamable HTTP — see below |
 | GET/DELETE | `/mcp` | none | `405`; this endpoint is stateless and has nothing to push |
 
@@ -3746,13 +3749,14 @@ from, so it cannot name a key the page does not answer.
 | `e` | Done or not Done; marked Done, the ring moves on to the next unread below |
 | Shift+E | Done through here |
 | `z` | Undo the last Done |
+| Shift+B | Put the bookmark just above the selected message; on the message right under it, take it away |
 | `r`, `p`, `s`, `.`, `i` | Reply, pin, read aloud, the ⋯ menu, the message details |
 | Ctrl+C (Cmd+C) | Copy the text of the selected message, when no text is selected |
 | `1`, `2`, `3` | Main, Threads, All |
 | `h` | Show read, Collapse read, Hide read, in turn |
 | Shift+P, Shift+L | The Pinned and Links filters |
 | `;`, `:` | Expand all, Collapse all |
-| `m` | Back to My place |
+| `b` or `m` | Back to the bookmark, with the message under it selected |
 | `c` | Write to the channel (or the thread you are in) |
 | ↑ in the empty message box | Select the newest message |
 | Alt+↓, Alt+↑ (Option on a Mac) | The next or previous channel |
@@ -3777,6 +3781,40 @@ with one exception: in a text field on a Mac, Ctrl and a letter that macOS uses 
 (Ctrl+K deletes to the end of the line, Ctrl+A and Ctrl+E go to its ends, and the rest) belong to the
 field. There, Cmd+K chooses a channel. Ctrl+S is not one of those keys, so it opens the search from a
 message box on a Mac too.
+
+### The reading bookmark
+
+`#240 reading-bookmark`. Catching up on a long backlog means keeping your place while you answer
+things further down. Each channel has **one bookmark**: a line in the accent colour across the list,
+with the word *Bookmark* in it, drawn just above one message.
+
+- **Shift+B** puts it above the selected message, moving it from wherever it was. Pressed on the
+  message right under the line, it takes the bookmark away. The row's ⋯ menu and its press-and-hold
+  details offer the same, as *Bookmark above* or *Remove bookmark*. Setting it marks nothing Done.
+- **`b`** (or `m`, the key of the place marker it replaced) goes back to it: the line at the top of
+  the list and the message under it selected. The **Bookmark** chip, directly right of *Newest*,
+  does the same, and is shown only while the line is off the screen, its arrow pointing toward it.
+  A bookmark older than what is loaded is reached by reading older pages, as a reply's arrow is.
+- **Reply, then `b`.** Sending a reply goes to the newest message as it always has; the chip and `b`
+  bring you back to where you were reading.
+- **It advances with your Done, and with nothing else.** A Done (`e`, the Done button, a swipe, or a
+  message read aloud to its end) on the message right under the line slides the line down past
+  messages already Done to the next one still to read, the one `e` selects next; below the newest
+  message when everything after it is Done. *Done through here* (Shift+E) at or below the line
+  lands it below that message. Undo puts it back. New messages, putting a message back, and reads
+  never move it.
+- **Kept on the server**, so it follows you between your phone and your desk: every channel read
+  carries it, and a move made on the other device shows at this page's next read. Moving it from a
+  Done is conditional on the revision the page last heard, so it can never undo a move made on the
+  other device meanwhile. `GET`/`PUT`/`DELETE /api/v1/channels/{id}/bookmark` (read scope to see,
+  write scope to change; `if_revision` answers 409 with where the bookmark is now). There is no MCP
+  tool for it.
+
+Where the line is drawn: in Main and All above the first message shown at or after its message (a
+thread reply is placed in Main by its time), in a thread only when its message is in that thread,
+and not in the thread list, the Pinned or Links filters, or while a search is choosing messages.
+Under Collapse read or Hide read it drops to the next message shown, since everything it passes is
+read. In two columns the left column draws it, and the right column only on its thread.
 
 ### Two ways a channel row can already have been dealt with, and only one of them hides it
 

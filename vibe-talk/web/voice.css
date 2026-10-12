@@ -138,7 +138,7 @@
      clear gap while the targets meet nothing on the bar. */
   --kinds-gap: 2px;
   /* `#206 pin-message`. A pinned row's chip and edge. GOLD, because nothing else here is: the
-     reading row is `--warn` orange, the kept place and pressed toggles are `--accent` blue, and the
+     reading row is `--warn` orange, the bookmark and pressed toggles are `--accent` blue, and the
      summary is teal — so "pinned" cannot be mistaken for "being read" or "where I left off". Judged
      in dark first, on the three speaker surfaces, as every row tint here has to be. */
   --pin-ink: #f0c75e;
@@ -1447,51 +1447,6 @@ body {
 }
 
 /*
- * THE KEPT PLACE. A quiet edge, not a state: the reader is not reading this row now, they intend
- * to come back to it. It must be findable once they are near it and must not compete with the row
- * that is actually speaking.
- */
-#side-log li.discord-message[data-marked="true"],
-#discord-log li.discord-message[data-marked="true"],
-#pinned-log li.discord-message[data-marked="true"] {
-  box-shadow: inset 0.2rem 0 0 var(--accent);
-}
-
-/*
- * THE LINE, which is the part that has to work at speed.
- *
- * An inset bar is findable once you are already looking at the row. Scrolling back through a long
- * channel with a thumb, nothing narrow registers — so the marker also draws a full-width rule
- * across the list at its top edge, which is the one shape the eye catches while everything else
- * is a blur.
- *
- * Bounded to the row rather than to the viewport. A viewport-wide negative inset would have been
- * a wider line and a horizontal scrollbar: `#scroll-area` sets `overflow-y`, which makes the other
- * axis resolve to `auto` rather than `visible`, so anything overhanging it becomes scrollable
- * width. On the coder tile — which is most of what a backlog is, and runs edge to edge — the row
- * IS the full width, so nothing is lost where it matters.
- */
-#side-log li.discord-message[data-marked="true"]::before,
-#discord-log li.discord-message[data-marked="true"]::before,
-#pinned-log li.discord-message[data-marked="true"]::before {
-  content: "";
-  position: absolute;
-  left: 0;
-  right: 0;
-  top: -0.3rem;
-  height: 2px;
-  background: var(--accent);
-  pointer-events: none;
-}
-
-/* ...except when it IS the row speaking, where the loud state wins outright. */
-#side-log li.discord-message[data-marked="true"][data-reading="true"],
-#discord-log li.discord-message[data-marked="true"][data-reading="true"],
-#pinned-log li.discord-message[data-marked="true"][data-reading="true"] {
-  box-shadow: inset 0.25rem 0 0 var(--warn);
-}
-
-/*
  * A REPLY POINTS AT WHAT IT ANSWERS. `#204 reply-arrow`.
  *
  * It used to say so with a small "↩" in the meta line, kept quiet on the reasoning that being a
@@ -1541,8 +1496,9 @@ body {
  *     does to it. The selector's extra weight keeps the layer when the hover, focus and summary
  *     rules restate the row's `background`.
  *
- * The marker line a kept place draws above its row is outside the box, and stays at full strength
- * on a reply: it is the reader's own way back, and not a state of the message.
+ * The bookmark's line above a row is outside the box, and stays at full strength on a reply: it is
+ * the reader's own way back, and not a state of the message. A row the line is drawn on recedes
+ * the same way for the same reason, whatever it is (`#240 reading-bookmark`, below).
  *
  * `#215 reply-coalesce`. A gathered reply is drawn the same way, whether or not it carries a reply
  * pointer — a thread's replies do not — because what is beside its box is the bridge, which must
@@ -1564,7 +1520,9 @@ body {
 #side-log li.discord-message[data-unread-replies][data-who],
 #discord-log li.discord-message[data-unread-replies][data-who],
 #side-log li.discord-message[data-reply-marker][data-who],
-#discord-log li.discord-message[data-reply-marker][data-who] {
+#discord-log li.discord-message[data-reply-marker][data-who],
+#side-log li.discord-message[data-bookmark][data-who],
+#discord-log li.discord-message[data-bookmark][data-who] {
   opacity: 1;
   filter: none;
   background-image: linear-gradient(rgb(128 128 128 / var(--row-grey, 0)), rgb(128 128 128 / var(--row-grey, 0)));
@@ -1578,7 +1536,9 @@ body {
 #side-log li.discord-message[data-unread-replies] > :not(.thread-unread):not(.reply-jump):not(.reply-bridge):not(.reply-ungather),
 #discord-log li.discord-message[data-unread-replies] > :not(.thread-unread):not(.reply-jump):not(.reply-bridge):not(.reply-ungather),
 #side-log li.discord-message[data-reply-marker] > :not(.reply-marker):not(.reply-jump):not(.reply-bridge):not(.reply-ungather),
-#discord-log li.discord-message[data-reply-marker] > :not(.reply-marker):not(.reply-jump):not(.reply-bridge):not(.reply-ungather) {
+#discord-log li.discord-message[data-reply-marker] > :not(.reply-marker):not(.reply-jump):not(.reply-bridge):not(.reply-ungather),
+#side-log li.discord-message[data-bookmark] > :not(.reply-jump):not(.reply-bridge):not(.reply-ungather):not(.bookmark-line),
+#discord-log li.discord-message[data-bookmark] > :not(.reply-jump):not(.reply-bridge):not(.reply-ungather):not(.bookmark-line) {
   filter: var(--row-filter, none);
 }
 
@@ -1602,7 +1562,9 @@ body {
 #side-log li.discord-message[data-unread-replies]::after,
 #discord-log li.discord-message[data-unread-replies]::after,
 #side-log li.discord-message[data-reply-marker]::after,
-#discord-log li.discord-message[data-reply-marker]::after {
+#discord-log li.discord-message[data-reply-marker]::after,
+#side-log li.discord-message[data-bookmark]::after,
+#discord-log li.discord-message[data-bookmark]::after {
   --row-veil: color-mix(in srgb, var(--bg) calc((1 - var(--row-opacity, 1)) * 100%), transparent);
   content: "";
   position: absolute;
@@ -2176,8 +2138,8 @@ body {
  * The line is drawn ON THE RUN'S FIRST ROW, which stays the message it is — every act that finds a
  * row by its ids still finds it there — and the rest of the run is `hidden`. So the row gives up
  * everything that makes it a message tile while it is the line: its speaker's tint and insets, its
- * border, the fade and the drained colour of a read row, the reply gutter and its veil, the kept
- * place's rule. `!important` for the reason `.search-hidden` has it: those are drawn by rules as
+ * border, the fade and the drained colour of a read row, the reply gutter and its veil. The
+ * bookmark's line stays (`#240 reading-bookmark`): a run can start right under it. `!important` for the reason `.search-hidden` has it: those are drawn by rules as
  * specific as this one, keyed on the very states every row in a run is in, and a line wearing a
  * speaker's tile is not a line.
  */
@@ -2210,6 +2172,13 @@ body {
 #side-log li.discord-message[data-read-run="head"] > :not(.read-run),
 #discord-log li.discord-message[data-read-run="head"] > :not(.read-run) {
   display: none !important;
+}
+
+/* ...but the bookmark's line, which a run can start right under. Equal weight and later, so it
+   wins. `#240 reading-bookmark`. */
+#side-log li.discord-message[data-read-run="head"] > .bookmark-line,
+#discord-log li.discord-message[data-read-run="head"] > .bookmark-line {
+  display: flex !important;
 }
 
 /*
@@ -2261,6 +2230,74 @@ body {
 #discord-log .read-run:focus-visible {
   outline: 2px solid var(--accent);
   outline-offset: -2px;
+}
+
+/*
+ * THE BOOKMARK. `#240 reading-bookmark`: the owner's place in a channel's backlog, "a clear coloured
+ * horizontal separator similar to our collapsed message indicator". So it is the collapsed run's
+ * shape — the word between two rules — made loud: the accent, solid, two pixels, and the word in
+ * capitals. It is the one line in the list that is the reader's own and not a message's.
+ *
+ * It is drawn IN A MARGIN the row under it keeps above its tile, positioned against the row, so the
+ * list holds nothing but message rows. The previous row's own margin collapses into this one, so
+ * the line is exactly the gap between the two. It is not a control: a stray tap cannot clear it.
+ */
+#side-log,
+#discord-log {
+  --bookmark-room: 2rem;
+}
+
+#side-log li.discord-message[data-bookmark="above"],
+#discord-log li.discord-message[data-bookmark="above"] {
+  margin-top: var(--bookmark-room);
+}
+
+/* Below the newest row, after it was marked Done with the line on it: the room is under the row. */
+#side-log li.discord-message[data-bookmark="below"],
+#discord-log li.discord-message[data-bookmark="below"] {
+  margin-bottom: var(--bookmark-room);
+}
+
+#side-log .bookmark-line,
+#discord-log .bookmark-line {
+  position: absolute;
+  left: 0;
+  right: 0;
+  height: var(--bookmark-room);
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+  color: var(--accent);
+  font-size: calc(0.74rem * var(--msg-scale));
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  white-space: nowrap;
+  pointer-events: none;
+  /* At full strength on every row: the rules that drain a receding row's parts name the line among
+     them (a reply's, say), and the line is the reader's own, not the message's state. */
+  filter: none !important;
+}
+
+/* Outside the row's border box: the row's own one-pixel border is inside 100%. */
+#side-log li.discord-message[data-bookmark="above"] > .bookmark-line,
+#discord-log li.discord-message[data-bookmark="above"] > .bookmark-line {
+  bottom: calc(100% + 1px);
+}
+
+#side-log li.discord-message[data-bookmark="below"] > .bookmark-line,
+#discord-log li.discord-message[data-bookmark="below"] > .bookmark-line {
+  top: calc(100% + 1px);
+}
+
+#side-log .bookmark-line::before,
+#discord-log .bookmark-line::before,
+#side-log .bookmark-line::after,
+#discord-log .bookmark-line::after {
+  content: "";
+  flex: 1 1 0;
+  min-width: 1rem;
+  border-top: 2px solid var(--accent);
 }
 
 
@@ -2771,8 +2808,8 @@ body {
 /*
  * `#206 pin-message`. A pinned row says so IN WORDS, in its meta line: the owner rejects a lone
  * glyph as useless, so the chip carries the word "Pinned" beside its icon, in a colour of its own,
- * and the row adds a gold edge on its RIGHT — the left edge already belongs to the row being read
- * and to the kept place, and a pin must not be mistaken for either. Every rule for a channel row in
+ * and the row adds a gold edge on its RIGHT — the left edge already belongs to the row being read,
+ * and a pin must not be mistaken for it. Every rule for a channel row in
  * this file names `#pinned-log` beside `#discord-log`, so a row in the Pinned filter is drawn
  * exactly as it is in the channel.
  */
@@ -3005,6 +3042,24 @@ body {
   margin-inline-end: auto;
 }
 
+/* `#240 reading-bookmark`. The jump to the bookmark stands DIRECTLY RIGHT of the jump to the newest
+   message, the pair a reader goes between, so while it is up it takes the auto margin and the jump
+   beside it gives it up. In the accent, as the line it goes to is; its arrow points toward it. */
+#jump-newest:has(+ #jump-bookmark:not([hidden])) {
+  margin-inline-end: 0;
+}
+
+#jump-bookmark {
+  position: relative;
+  margin-inline-end: auto;
+  color: var(--accent);
+  border-color: var(--accent);
+}
+
+#jump-bookmark[data-direction="down"] .bookmark-arrow {
+  transform: rotate(180deg);
+}
+
 /* The 44px target, drawn as nothing, the idiom `#search-toggle::after` uses: a pseudo-element is
    part of its button for hit-testing, so the chip stays the row's height while a thumb that lands
    a few pixels above or below it still lands on it. `min` with 0 because a large font can draw the
@@ -3012,7 +3067,8 @@ body {
    the chip less its two borders. The row stands 0.5rem above the dock and the square reaches less
    than that below the chip, so a tap on the dock's top edge is still the dock's. */
 #jump-newest::after,
-#side-jump-newest::after {
+#side-jump-newest::after,
+#jump-bookmark::after {
   content: "";
   position: absolute;
   inset: min(0px, calc((100% - 2.75rem) / 2));

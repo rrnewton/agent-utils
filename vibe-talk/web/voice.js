@@ -140,7 +140,7 @@ let sideActive = false;
  *   | "help-link-identities" | "help-link-keyboard"
  *   | "help-link-live-messages" | "help-link-mark-own" | "help-link-microphone"
  *   | "help-link-reading-width" | "help-link-resuming" | "help-link-speech-prep"
- *   | "help-link-storage" | "jump-marker" | "jump-newest" | "link-kind-action" | "link-kind-commit"
+ *   | "help-link-storage" | "jump-bookmark" | "jump-newest" | "link-kind-action" | "link-kind-commit"
  *   | "link-kind-pr" | "links-filter" | "load-older" | "load-older-turns"
  *   | "msg-scale-larger" | "msg-scale-smaller"
  *   | "open-add-channel" | "open-browse-channels" | "open-help" | "open-settings"
@@ -1712,6 +1712,9 @@ function renderJumpNewest() {
   if (button.hasAttribute("data-arrivals") === (arrived === false)) {
     button.toggleAttribute("data-arrivals", arrived !== false);
   }
+  // `#240 reading-bookmark`. The chip beside it, on the same occasions: every scroll, restore and
+  // screen change asks this one.
+  renderJumpBookmark();
 }
 
 /**
@@ -1757,6 +1760,8 @@ function renderScrollTools() {
   // float over the left column and act on it.
   if (sideActive) {
     applySearch();
+    // `#240 reading-bookmark`. The right column draws the line only on the anchor's thread.
+    placeBookmarkLine();
     renderJumpNewest();
     keepSelection();
     return;
@@ -1778,14 +1783,15 @@ function renderScrollTools() {
   el("summarise").title = summariesDisabledByServer
     ? `Summaries are unavailable on this server: ${summariesDisabledByServer}`
     : "Show a one-line summary in place of each long message.";
-  // The way back. Only where a marker can mean something, and only when one is set.
-  el("jump-marker").hidden = currentView !== "discord" || placeMarker === null;
   // `#204 reply-arrow`. The other way back: to the reply a jump left, while it is off screen.
   el("back-to-reply").hidden = currentView !== "discord" || replyReturnRow() === null;
   // `#129 message-search`. Re-derived from the lists, exactly like everything above it: whatever
   // just changed a list has to leave the filter true of it. See `applySearch` for why this hangs
   // off the one function every mutation already ends with rather than off its own call sites.
   applySearch();
+  // `#240 reading-bookmark`. After the filter, which decides whether the list draws the line at all,
+  // and before the jump, which says whether the line is on screen.
+  placeBookmarkLine();
   // LAST: it measures how far the list runs below the reader, and the filter just above can have
   // taken most of the list away. `#207 scrollback-jump`.
   renderJumpNewest();
@@ -4708,16 +4714,6 @@ function foldAllFromKeyboard(folded) {
   return true;
 }
 
-/** m: back to My place, and that message selected. */
-function markerFromKeyboard() {
-  if (sideActive) return inColumn(columns.main, markerFromKeyboard);
-  if (!channelOnScreen() || placeMarker === null) return false;
-  jumpToMarker();
-  const row = paneRowFor(channelPane, placeMarker);
-  if (row) selectRow(channelPane, row);
-  return true;
-}
-
 /** z: undo the last Done, as the Undo chip does. */
 function undoFromKeyboard() {
   if (!channelOnScreen()) return false;
@@ -5113,10 +5109,10 @@ const KEYMAP = [
     run: (event) => viewFromKeyboard(event),
   },
   {
-    group: KEYS_MOVING, chords: [{ key: "m" }],
-    does: "Back to My place",
-    controls: ["jump-marker"],
-    run: () => markerFromKeyboard(),
+    group: KEYS_MOVING, chords: [{ key: "b" }, { key: "m" }],
+    does: "Back to your bookmark, and the message below it selected. m is the old key for it",
+    controls: ["jump-bookmark"],
+    run: () => bookmarkJumpFromKeyboard(),
   },
   {
     group: KEYS_MESSAGE, chords: [{ key: "e" }],
@@ -5129,6 +5125,12 @@ const KEYMAP = [
     does: "Done through here: this message and every one above it",
     rowControls: ["row-read-through-button"],
     run: (event, target) => throughHereFromKeyboard(target),
+  },
+  {
+    group: KEYS_MESSAGE, chords: [{ key: "b", shift: true }],
+    does: "Bookmark: the line above this message. On the message just below it, take it away. Marks nothing Done",
+    rowControls: ["row-bookmark-button"],
+    run: (event, target) => bookmarkFromKeyboard(target),
   },
   {
     group: KEYS_MESSAGE, chords: [{ key: "z" }],
@@ -5600,6 +5602,7 @@ function setPromptsOpen(open) {
  *   timedOut?: boolean,
  *   shownInPill?: boolean,
  *   gatewayStatus?: number,
+ *   body?: unknown,
  * }} ApiRequestError
  */
 
@@ -5673,6 +5676,9 @@ async function api(path, options) {
     // status are what an operator acts on; it is the wrong thing in a standing sentence that a
     // reader is meant to understand.
     error.detail = body && body.detail ? body.detail : "";
+    // ...and the whole answer, for the one refusal that carries the state it refused against: a
+    // bookmark moved meanwhile (409), which says where it is now. `#240 reading-bookmark`.
+    error.body = payload;
     throw error;
   }
   return payload;
@@ -9611,8 +9617,9 @@ function clearChannelScreen() {
   el("thread-list").replaceChildren();
   el("channel-summary").replaceChildren();
   el("timeline-notice").hidden = true;
-  // The pins this credential read go with the rest of what it read.
+  // The pins this credential read go with the rest of what it read, and the bookmarks.
   forgetPins();
+  forgetBookmarks();
   el("pinned-log").replaceChildren();
   renderOlderControl();
   channelFreshAt = 0;
@@ -12619,6 +12626,8 @@ function noteFreshRead(payload) {
   setChannelFreshness(asOf === null ? "fresh" : "slow");
   // `#206 pin-message`. Every landed read, delta included, says what revision the pins are at.
   notePinsRevision(payload.pins_revision);
+  // `#240 reading-bookmark`. ...and where the bookmark is, which another device may have moved.
+  noteBookmark(payload);
 }
 
 /** Several delta pages of one refresh, as the one page that draws them. */
@@ -14394,10 +14403,6 @@ function renderChannelRows() {
     // is showing a different channel's list and rebuilding it would draw the same rows again.
     if (el("settings-channel").value === viewing) renderIdentityRows();
   }
-  // The kept place follows the reader down the backlog. Done BEFORE the rows are marked, so the
-  // row that ends up carrying the marker is the one this pass draws it on rather than the one the
-  // previous pass did. The left column's reader: "My place" is its chip. `#229 desktop-two-column`.
-  if (!sideActive) advanceMarkerPastRead();
   // `#222 unread-replies`. The replies the store holds, counted once for every row's thread chip.
   const tally = replyTally();
   const mainList = new Set(rows);
@@ -14467,9 +14472,6 @@ function renderChannelRows() {
     // reader can still change their mind about, and it is the only thing on screen during a wait
     // that is entirely somebody else's network.
     row.setAttribute("data-pending", pendingRead === id ? "true" : "false");
-    // The marker is set on a row and lands on its first id, but a re-read can regroup: a marker
-    // kept on what has since become a trailing constituent still means this row.
-    row.setAttribute("data-marked", ids.includes(placeMarker) ? "true" : "false");
     // IS THIS MESSAGE ITSELF AN ANSWER? The opposite direction from `data-replied`, and the more
     // reliable one: that is derived from whatever happens to be loaded and misses an answer
     // further back than the window, whereas the pointer for this is ON the message. Correct
@@ -14528,6 +14530,9 @@ function renderChannelRows() {
   // `#221 read-modes`. LAST, from the read state every row has just been given: under Collapse
   // read a message dealt with on this pass joins its run, and a run that grew says so.
   applyReadRuns();
+  // `#240 reading-bookmark`. After the runs, which decide which rows are shown: the line goes above
+  // the first row shown at or after its message.
+  placeBookmarkLine();
 }
 
 /**
@@ -14548,130 +14553,527 @@ function renderChannelRows() {
  * `textContent` throughout — an author name and a channel's own timestamp are third-party text,
  * and this is the one place they are shown in full.
  */
-/**
- * The message the reader asked to come back to, by id, or null.
- *
- * NOT called a pin. Discord already has pinned messages and they are a channel-wide, shared,
- * server-side thing; this is one reader's place in one browser, and borrowing the word would
- * promise the wrong feature. It is a PLACE MARKER, there is exactly one, and setting a new one
- * moves it — a list of them would be a second inbox to work through. vibe-talk's own pins (`#206
- * pin-message`) are the many, kept on the server for every device; this stays the one.
- *
- * Kept across reloads, because the whole point is coming back.
- */
-let placeMarker = null;
+// --- the reading bookmark -----------------------------------------------------------------------
+//
+// `#240 reading-bookmark`. The owner, catching up on a long backlog: "I want to be able to mark my
+// place, reply to messages, jump back to where I was reading in the transcript before my reply,
+// mark as done when I'm done, and advance the bookmark." So each channel has ONE bookmark: a line
+// in the accent colour drawn across the list just above one message. Shift+B puts it above the
+// selected message (and takes it away when pressed on the message right under it); b, or m, the key
+// of the place marker it replaces, goes back to it, and so does the Bookmark chip beside Newest.
+//
+// KEPT ON THE SERVER, so it follows the owner between his phone and his desk. Every channel read
+// carries it, and this page keeps a copy per channel that it changes at once and writes behind the
+// Done writes (`queueInboxWrite`). A write that fails is taken back; a conditional one that lost to a
+// move made on the other device takes where the server says the bookmark is now.
+//
+// IT MARKS NOTHING, AND ONLY THE OWNER MOVES IT. Setting it never marks a message Done. Besides his
+// Shift+B, the one thing that moves it is a Done of his own: on the message right under the line,
+// which slides it down to the next message still to read (`singleDoneBump`), or a Done through here
+// at or below it (`throughBump`). Those moves are conditional (`if_revision`), so they can never
+// undo a move made on the other device meanwhile, and Undo takes them back too. A message arriving
+// never moves it, and nor does putting one back.
+//
+// It replaces the place marker this browser kept in localStorage under `MARKER_KEY`, which moved
+// itself past read rows on every redraw. One left over is moved to the server once, the first time
+// its message is drawn in a channel with no bookmark (`adoptLegacyMarker`).
 
-function loadPlaceMarker() {
-  try {
-    placeMarker = localStorage.getItem(MARKER_KEY);
-  } catch (_error) {
-    placeMarker = null;
-  }
+/**
+ * Each channel's bookmark as this page holds it, by channel id. `revision` is the server's, as it
+ * last said; `anchor` is where the line is, null for none, and may be a change the server has not
+ * answered yet, which `token` then names; `known` is whether the server has said anything at all.
+ *
+ * @typedef {{revision: number, anchor: VibeTalk.BookmarkAnchor | null, token: object | null, known: boolean}} HeldBookmark
+ * @type {Map<string, HeldBookmark>}
+ */
+const bookmarks = new Map();
+
+/**
+ * Each channel's bookmark writes: how many are on their way, and the `readStateEpoch` the last one
+ * settled at. A read sent before that, or while one is on its way, does not speak for the bookmark:
+ * it answers for the state before the owner's own act. `readSpeaksFor` is the same rule for Done.
+ *
+ * @type {Map<string, {pending: number, from: number}>}
+ */
+const bookmarkWrites = new Map();
+
+/** The row each column draws the line on, and on which side of it, or null. */
+const bookmarkDrawn = { main: null, side: null };
+
+/** The id the old place marker left in this browser, until it is adopted or dropped. */
+let legacyMarker = null;
+try {
+  legacyMarker = localStorage.getItem(MARKER_KEY);
+} catch (_error) {
+  legacyMarker = null;
 }
 
-function setPlaceMarker(id) {
-  placeMarker = id === null ? null : String(id);
-  try {
-    if (placeMarker === null) {
-      localStorage.removeItem(MARKER_KEY);
-    } else {
-      localStorage.setItem(MARKER_KEY, placeMarker);
+/** This channel's bookmark as held, or null. */
+function heldBookmark(channel = currentChannelId()) {
+  return bookmarks.get(String(channel)) || null;
+}
+
+/** Where this channel's line is, or null when it has none. */
+function bookmarkAnchor(channel = currentChannelId()) {
+  const held = heldBookmark(channel);
+  return held ? held.anchor : null;
+}
+
+/** Whether two anchors put the line in the same place. */
+function sameAnchor(a, b) {
+  if (!a || !b) return !a && !b;
+  return String(a.message_id) === String(b.message_id) && a.place === b.place;
+}
+
+/** Whether `value` is a bookmark as the server sends one: a page or to-do read is not decoded whole. */
+function isBookmarkState(value) {
+  if (!value || typeof value !== "object" || typeof value.revision !== "number") return false;
+  const anchor = value.anchor;
+  return anchor === null || (Boolean(anchor) && typeof anchor === "object" && typeof anchor.message_id === "string" &&
+    (anchor.place === "above" || anchor.place === "below") && typeof anchor.timestamp === "string");
+}
+
+/** The anchor for the line just above `row` (`above`), or just below it (`below`). */
+function anchorOfRow(row, place) {
+  const held = rowMessages(row);
+  const message = place === "below" ? held[held.length - 1] : held[0];
+  if (!message) return null;
+  /** @type {VibeTalk.BookmarkAnchor} */
+  const anchor = { message_id: String(message.id), place, timestamp: String(message.timestamp || "") };
+  const thread = threadOf(message);
+  if (thread) anchor.thread_id = thread;
+  return anchor;
+}
+
+/** Forget every channel's bookmark: another credential. */
+function forgetBookmarks() {
+  bookmarks.clear();
+  bookmarkWrites.clear();
+  bookmarkDrawn.main = null;
+  bookmarkDrawn.side = null;
+}
+
+/** Redraw the line and the chip in every column, after the bookmark changed. */
+function redrawBookmark() {
+  eachColumn(renderScrollTools);
+}
+
+/**
+ * A read said where this channel's bookmark is. Taken as the truth unless a write of this page's is
+ * on its way, or settled after the read was sent: then the read answers for the state before it.
+ * A read with no bookmark at all (an older server, or a store that cannot say) changes nothing.
+ */
+function noteBookmark(payload) {
+  if (!payload || !isBookmarkState(payload.bookmark)) return;
+  const channel = String((payload.channel && payload.channel.id) || currentChannelId());
+  const write = bookmarkWrites.get(channel);
+  if (write && (write.pending > 0 || sentEpochOf(payload) < write.from)) return;
+  const said = payload.bookmark;
+  const held = bookmarks.get(channel);
+  const moved = !held || !sameAnchor(held.anchor, said.anchor);
+  bookmarks.set(channel, { revision: said.revision, anchor: said.anchor || null, token: null, known: true });
+  if (moved && channel === currentChannelId()) redrawBookmark();
+}
+
+/**
+ * Change this channel's bookmark here, at once, ahead of the write that tells the server: what every
+ * change starts with. Answers the change, for `sendBookmark` to write.
+ */
+function stageBookmark(channel, anchor) {
+  const held = bookmarks.get(channel) || { revision: 0, anchor: null, token: null, known: false };
+  const move = { channel, before: held.anchor, anchor, token: {} };
+  bookmarks.set(channel, { ...held, anchor, token: move.token });
+  const write = bookmarkWrites.get(channel) || { pending: 0, from: 0 };
+  write.pending += 1;
+  readStateEpoch += 1;
+  bookmarkWrites.set(channel, write);
+  return move;
+}
+
+/**
+ * Write a staged change, in order behind the Done writes. `conditional` sends the revision held when
+ * the write goes, so it is refused if another device moved the bookmark since this page last heard.
+ * `after`, when given, is the Done write this one follows: when that fails, this one is not sent and
+ * the change is taken back with it. Never throws: a failure is taken back and said.
+ *
+ * @param {{channel: string, before: VibeTalk.BookmarkAnchor | null, anchor: VibeTalk.BookmarkAnchor | null, token: object}} move
+ * @param {{conditional?: boolean, after?: Promise<boolean> | null, quiet?: boolean}} [options]
+ * @returns {Promise<"saved" | "moved" | "failed" | "cancelled">}
+ */
+function sendBookmark(move, { conditional = false, after = null, quiet = false } = {}) {
+  const { channel } = move;
+  return queueInboxWrite(async () => {
+    /** @type {"saved" | "moved" | "failed" | "cancelled"} */
+    let outcome = "failed";
+    let answer = null;
+    let problem = null;
+    try {
+      if (after && !(await after)) {
+        outcome = "cancelled";
+      } else {
+        const held = bookmarks.get(channel);
+        const revision = conditional && held ? held.revision : null;
+        const route = `/api/v1/channels/${encodeURIComponent(channel)}/bookmark`;
+        answer = move.anchor
+          ? await apiDecoded("BookmarkResponse", route, {
+            method: "PUT",
+            body: { ...move.anchor, ...(revision === null ? {} : { if_revision: revision }) },
+          })
+          : await apiDecoded("BookmarkResponse", revision === null ? route : `${route}?if_revision=${revision}`,
+            { method: "DELETE" });
+        outcome = "saved";
+      }
+    } catch (error) {
+      if (error && error.status === 409 && VibeTalkContract.is("BookmarkResponse", error.body)) {
+        answer = error.body;
+        outcome = "moved";
+      } else {
+        problem = error;
+      }
+    } finally {
+      const write = bookmarkWrites.get(channel);
+      if (write) {
+        write.pending = Math.max(0, write.pending - 1);
+        readStateEpoch += 1;
+        write.from = readStateEpoch;
+      }
     }
-  } catch (_error) {
-    // A browser that refuses storage still honours the marker for this session.
-  }
-  // On the message wherever it is drawn, and its chip over the left column. `#229 desktop-two-column`.
-  eachColumn(() => {
-    renderChannelRows();
-    renderScrollTools();
+    const held = bookmarks.get(channel);
+    const mine = Boolean(held) && held.token === move.token;
+    const shownBefore = held ? held.anchor : null;
+    if (answer) {
+      const said = answer.bookmark;
+      bookmarks.set(channel, {
+        revision: said.revision,
+        anchor: mine ? said.anchor || null : held.anchor,
+        token: mine ? null : held.token,
+        known: true,
+      });
+    } else if (mine) {
+      bookmarks.set(channel, { ...held, anchor: move.before, token: null });
+    }
+    const now = bookmarkAnchor(channel);
+    if (!sameAnchor(shownBefore, now) && channel === currentChannelId()) redrawBookmark();
+    // Short, for a phone's status line; the reason a write failed goes where every failure does.
+    if (outcome === "moved" && mine && !quiet) {
+      setStatus("Bookmark moved on another device.");
+    } else if (outcome === "failed" && problem && !quiet) {
+      setStatus("The bookmark was not saved.");
+      showError(`The bookmark could not be saved: ${problem.detail || problem.message}`);
+    }
+    return outcome;
   });
 }
 
+/** Whether the list in the column being worked on draws a bookmark at all, and if not, why not. */
+function bookmarkListRefusal(anchor) {
+  if (pinnedOnly) return "The bookmark is not in Pinned.";
+  if (readRunsSuspended()) return "Close the search to see the bookmark.";
+  if (!threadingSupported) return "";
+  if (channelView === "main" || channelView === "flat") return "";
+  if (channelView === "thread") {
+    return anchor.thread_id && String(anchor.thread_id) === String(selectedThreadId)
+      ? "" : "Your bookmark is not in this thread.";
+  }
+  return "The bookmark is in Main and All.";
+}
+
+/** The time a row was sent, in milliseconds, from its first message; NaN when it cannot be read. */
+const rowSentMs = (row) => Date.parse(String((rowMessages(row)[0] || {}).timestamp || ""));
+
 /**
- * Move the kept place forward past everything that has been dealt with.
+ * Where the column being worked on draws its bookmark line: `{row, place}`, the line going above
+ * that row, or below it when it is the last; null when the list draws none.
  *
- * The marker means "the oldest thing I still have to deal with", not "a message I bookmarked". So
- * working downward through a backlog has to carry it along: read a message, archive it, and the
- * place is now the next one — otherwise coming back takes the reader to something they finished.
- *
- * THE RULE IS "the first unread row at or after where the marker is", which is stricter than
- * "skip whatever is read below it" and deliberately so. Advancing past an UNREAD row to reach a
- * later unread one would step over the exact thing the marker exists to protect.
- *
- * When everything from the marker onward has been dealt with, it parks on the newest loaded
- * message rather than disappearing: the reader is caught up, and a marker that silently vanished
- * would look like it had been lost.
+ * ONE RULE FOR EVERY LIST. The line goes before the first row shown at or after the anchor (strictly
+ * after, for a bookmark below its message), or after the last row when none is. "At or after" is
+ * measured by the anchor's own row when the list holds it, shown or not, and otherwise by when its
+ * message was sent: so Main places a bookmark on a thread reply it never shows, and Hide read, or a
+ * collapsed run, moves the line down to the next row shown. Every row it moves past is read, which
+ * is what makes that safe. An anchor older than everything loaded draws nothing: the chip and b walk
+ * back to it.
  */
-function advanceMarkerPastRead() {
-  if (placeMarker === null) {
-    return;
+function bookmarkTarget() {
+  const anchor = bookmarkAnchor();
+  if (!anchor || bookmarkListRefusal(anchor) !== "") return null;
+  const rows = /** @type {HTMLElement[]} */ ([...el("discord-log").children])
+    .filter((row) => row.hasAttribute("data-id") && !row.hasAttribute("data-card"));
+  if (rows.length === 0) return null;
+  const id = String(anchor.message_id);
+  let start = rows.findIndex((row) => idsOf(row).includes(id));
+  if (start >= 0) {
+    if (anchor.place === "below") start += 1;
+  } else {
+    const at = Date.parse(String(anchor.timestamp));
+    if (!Number.isFinite(at)) return null;
+    const first = rowSentMs(rows[0]);
+    if (Number.isFinite(first) && at < first) return null;
+    start = rows.findIndex((row) => (anchor.place === "below" ? rowSentMs(row) > at : rowSentMs(row) >= at));
+    if (start < 0) start = rows.length;
   }
-  const rows = [...el("discord-log").children];
-  // ANY constituent, because the marker names a Discord message and combining can have put that
-  // message inside a row whose identity is a different one.
-  const at = rows.findIndex((li) => idsOf(li).includes(placeMarker));
-  // Not loaded: the marker is further back than the window, and guessing where it should go from
-  // a list that does not contain it would move it somewhere nobody chose.
-  if (at < 0) {
-    return;
-  }
-  // Read from the SOURCE, not from the row's attributes. This runs before the pass that writes
-  // them, so the attributes still describe the previous render -- and the case that matters most
-  // is the one immediately after a dismissal, where they would say the message is still unread and
-  // the marker would refuse to move past the thing the reader just dealt with.
-  //
-  // ...and EVERY message the row stands for has to be dealt with before the marker may step over
-  // it, for the same reason a half-archived row is drawn as unread.
-  const dealtWith = (li) => {
-    const who = bucketFor(
-      li.getAttribute("data-author-id"),
-      li.getAttribute("data-author-bot") === "true",
-      el("discord-channel").value
-    );
-    const ids = idsOf(li);
-    // A placeholder the server reads automatically is as dealt with as an archived message: the
-    // marker means "the oldest thing still waiting", and a placeholder is never waiting.
-    const held = rowMessages(li);
-    return ids.length > 0 && ids.every((one, index) => readAlready(one, who) || isNoise(held[index]));
+  const shown = rows.slice(start).find(rowShown);
+  if (shown) return { row: shown, place: "above" };
+  const last = rows.filter(rowShown).pop();
+  return last ? { row: last, place: "below" } : null;
+}
+
+/** The line on `row`, made once and kept on it, as a collapsed run's is (`readRunLine`). */
+function bookmarkLineOf(row) {
+  if (row.bookmarkLine) return row.bookmarkLine;
+  const line = document.createElement("div");
+  line.className = "bookmark-line";
+  line.setAttribute("role", "separator");
+  line.setAttribute("aria-label", "Bookmark");
+  line.textContent = "Bookmark";
+  row.bookmarkLine = line;
+  return line;
+}
+
+/**
+ * Draw the line where `bookmarkTarget` says, in the column being worked on, and nowhere else in it.
+ * The line is a child of the row it is drawn on, positioned in a margin that row keeps above its
+ * tile (web/voice.css), so the list still holds nothing but message rows: every caller that walks a
+ * list's rows walks only messages. Idempotent, and cheap when nothing moved, because it runs with
+ * every redraw.
+ */
+function placeBookmarkLine() {
+  const target = bookmarkTarget();
+  const list = el("discord-log");
+  const drawn = /** @type {HTMLElement[]} */ ([...list.children]).filter((row) => row.hasAttribute("data-bookmark"));
+  const settled = target && drawn.length === 1 && drawn[0] === target.row &&
+    target.row.getAttribute("data-bookmark") === target.place && target.row.bookmarkLine &&
+    target.row.bookmarkLine.parentNode === target.row;
+  bookmarkDrawn[activeColumn.name] = target;
+  if (!sideActive) adoptLegacyMarker();
+  if (settled || (!target && drawn.length === 0)) return;
+  // The row's ⋯ item says what it will do: take the line away on the row right under it.
+  const word = (row, above) => {
+    const item = childByClass(row, "row-bookmark-button");
+    const said = above ? "Remove bookmark" : "Bookmark above";
+    if (item && item.textContent !== said) item.textContent = said;
   };
-  let i = at;
-  while (i < rows.length && dealtWith(rows[i])) {
-    i += 1;
-  }
-  if (i === at) {
-    return;
-  }
-  const landing = i < rows.length ? rows[i] : rows[rows.length - 1];
-  const id = landing.getAttribute("data-id");
-  if (id && id !== placeMarker) {
-    placeMarker = id;
-    try {
-      localStorage.setItem(MARKER_KEY, placeMarker);
-    } catch (_error) {
-      // As elsewhere: a browser that refuses storage still honours it for this session.
+  const apply = () => {
+    for (const row of drawn) {
+      if (target && row === target.row) continue;
+      row.removeAttribute("data-bookmark");
+      if (row.bookmarkLine && row.bookmarkLine.parentNode === row) row.removeChild(row.bookmarkLine);
+      word(row, false);
     }
+    if (!target) return;
+    target.row.setAttribute("data-bookmark", target.place);
+    word(target.row, target.place === "above");
+    const line = bookmarkLineOf(target.row);
+    if (line.parentNode !== target.row) target.row.replaceChildren(line, ...target.row.children);
+  };
+  // The reader does not move: a line drawn or taken away above them changes the height above them.
+  if (!sideActive && currentScreen === "main" && currentView === "discord") preservingScroll(apply);
+  else apply();
+}
+
+/**
+ * The old place marker, moved to the server: the first time its message is drawn in a channel the
+ * server says has no bookmark, the bookmark goes above it, and the browser's copy is dropped. Found
+ * in a channel that has one already, it is simply dropped: the owner has a place there.
+ */
+function adoptLegacyMarker() {
+  if (legacyMarker === null) return;
+  const channel = currentChannelId();
+  const held = heldBookmark(channel);
+  const write = bookmarkWrites.get(channel);
+  if (!held || !held.known || (write && write.pending > 0)) return;
+  const row = rowHolding(legacyMarker);
+  if (!row) return;
+  const id = legacyMarker;
+  legacyMarker = null;
+  try {
+    localStorage.removeItem(MARKER_KEY);
+  } catch (_error) {
+    // A browser that refuses storage asks again next time, and the server already has it then.
+  }
+  if (held.anchor) return;
+  const messages = rowMessages(row);
+  const at = Math.max(0, messages.findIndex((message) => String(message.id) === id));
+  const message = messages[at];
+  if (!message) return;
+  /** @type {VibeTalk.BookmarkAnchor} */
+  const anchor = { message_id: id, place: "above", timestamp: String(message.timestamp || "") };
+  if (threadOf(message)) anchor.thread_id = threadOf(message);
+  const move = stageBookmark(channel, anchor);
+  redrawBookmark();
+  guardQuietly(() => sendBookmark(move, { conditional: true, quiet: true }))();
+}
+
+/**
+ * The Bookmark chip, beside Newest: shown while this channel has a bookmark and its line is off the
+ * screen, with its arrow toward the line, or up when the bookmark is older than what is loaded.
+ * Cheap, because the scroll listener calls it through `renderJumpNewest`: one rectangle. Measured
+ * against the list's own edges rather than the chips', so showing the chip cannot change the answer.
+ */
+function renderJumpBookmark() {
+  if (sideActive) return;
+  const chip = leftEl("jump-bookmark");
+  /** @type {"up" | "down" | null} */
+  let direction = null;
+  const anchor = bookmarkAnchor();
+  if (currentScreen === "main" && currentView === "discord" && anchor && bookmarkListRefusal(anchor) === "") {
+    const target = bookmarkDrawn.main;
+    if (!target) {
+      direction = [...el("discord-log").children].some((row) => row.hasAttribute("data-id")) ? "up" : null;
+    } else if (target.row.bookmarkLine) {
+      const area = leftEl("scroll-area");
+      const box = target.row.bookmarkLine.getBoundingClientRect();
+      const top = channelPane.head();
+      const bottom = area.getBoundingClientRect().top + (area.clientHeight || 0);
+      if (box.bottom <= top) direction = "up";
+      else if (box.top >= bottom) direction = "down";
+    }
+  }
+  if (chip.hidden === (direction !== null)) chip.hidden = direction === null;
+  if (direction === null) return;
+  if (chip.getAttribute("data-direction") !== direction) {
+    chip.setAttribute("data-direction", direction);
+    chip.setAttribute("aria-label", `Jump to your bookmark, ${direction === "up" ? "above" : "below"}`);
   }
 }
 
-/** Take the reader back to where they left off, if that message is still loaded. */
-function jumpToMarker() {
-  // "My place" is the left column's chip, and the place is in its list. `#229 desktop-two-column`.
-  if (sideActive) return inColumn(columns.main, jumpToMarker);
-  if (placeMarker === null) {
+/**
+ * Take the reader to the line in the left column: the line at the top of the list, under the pill,
+ * and the message below it selected. False when the list draws no line.
+ */
+function landOnBookmark() {
+  if (sideActive) return inColumn(columns.main, landOnBookmark);
+  const target = bookmarkDrawn.main;
+  if (!target || !target.row.bookmarkLine || target.row.parentNode !== el("discord-log")) return false;
+  const area = el("scroll-area");
+  const line = target.row.bookmarkLine;
+  area.scrollTop += line.getBoundingClientRect().top - channelPane.head() - REPLY_LANDING_GAP_PX;
+  takeRow(channelPane, target.row, true);
+  renderScrollTools();
+  setStatus(target.place === "below" ? "Bookmark: below the newest message." : "Back at your bookmark.");
+  return true;
+}
+
+/** b, m and the chip: back to the bookmark, walking back through older pages when it is further back. */
+async function jumpToBookmark() {
+  if (sideActive) return inColumn(columns.main, jumpToBookmark);
+  const anchor = bookmarkAnchor();
+  if (!anchor) {
+    setStatus("No bookmark here. Shift+B sets one.");
     return;
   }
-  const row = [...el("discord-log").children].find(
-    (li) => li.getAttribute("data-id") === placeMarker
-  );
-  if (!row) {
-    // Honest rather than silent: the marker is real, the message is simply not in the window yet.
-    setStatus("that message is further back than what is loaded — pull down or walk back to it.");
+  const refusal = bookmarkListRefusal(anchor);
+  if (refusal) {
+    setStatus(refusal);
     return;
   }
-  // A marker inside a collapsed run of read messages: the run opens to show it. `#221 read-modes`.
-  openReadRun(row);
-  row.scrollIntoView();
-  setStatus("back where you left off.");
+  if (landOnBookmark()) return;
+  await seekMessage(String(anchor.message_id), landOnBookmark, () => false);
+}
+
+/** b and m: `jumpToBookmark`, for the left column, whichever column the keys are in. */
+function bookmarkJumpFromKeyboard() {
+  if (sideActive) return inColumn(columns.main, bookmarkJumpFromKeyboard);
+  if (!channelOnScreen()) return false;
+  guardQuietly(jumpToBookmark)();
+  return true;
+}
+
+/** Whether the line is drawn right above `row`, in the column being worked on. */
+function bookmarkAbove(row) {
+  const target = bookmarkTarget();
+  return Boolean(target) && target.place === "above" && target.row === row;
+}
+
+/**
+ * Shift+B, the row's ⋯ item and its details sheet: the bookmark above `row`, moved there from
+ * wherever it was; or, on the row right under it, taken away. The owner's own act, so it is written
+ * whatever another device did meanwhile.
+ */
+function toggleBookmarkAt(row) {
+  const channel = currentChannelId();
+  if (!channel || !row) return;
+  const removing = row.parentNode === el("discord-log") && bookmarkAbove(row);
+  const anchor = removing ? null : anchorOfRow(row, "above");
+  if (!removing && !anchor) return;
+  const move = stageBookmark(channel, anchor);
+  redrawBookmark();
+  setStatus(removing ? "Bookmark removed." : "Bookmarked. b comes back here.");
+  guardQuietly(() => sendBookmark(move))();
+}
+
+/** Shift+B on the selected message. */
+function bookmarkFromKeyboard(target) {
+  const { pane, row, took } = rowForAct(target);
+  if (!pane || !row) return took;
+  toggleBookmarkAt(row);
+  return true;
+}
+
+/** Whether every message `row` stands for is read once `done` is Done: `rowIsRead`, looking ahead. */
+function rowReadWith(row, done) {
+  const held = rowMessages(row);
+  return held.length > 0 && held.every((message) => !stillToDo(message, done));
+}
+
+/** The anchor the line slides to past `rows[at]`: above the next row still to read, else below the last. */
+function slideTarget(rows, at, done) {
+  const next = rows.slice(at + 1).find((row) => !rowReadWith(row, done));
+  return next ? anchorOfRow(next, "above") : anchorOfRow(rows[rows.length - 1], "below");
+}
+
+/**
+ * A Done on `ids`, with the line right above the row they make Done: the line slides down past
+ * every row already read and stops above the first still to read — the row e selects next
+ * (`unreadAfter`), so the bookmark and the selection stay together — or below the last row. Null
+ * when the line is anywhere else, or the row is not wholly Done by this.
+ */
+function singleDoneBump(ids) {
+  const channel = currentChannelId();
+  const target = bookmarkTarget();
+  if (!channel || !target || target.place !== "above") return null;
+  const marking = new Set(ids.map(String));
+  const done = new Set([...archivedIds, ...marking]);
+  if (!idsOf(target.row).some((id) => marking.has(id)) || !rowReadWith(target.row, done)) return null;
+  const rows = /** @type {HTMLElement[]} */ ([...el("discord-log").children]).filter((row) => row.hasAttribute("data-id") && rowShown(row));
+  const at = rows.indexOf(target.row);
+  if (at < 0) return null;
+  const to = slideTarget(rows, at, done);
+  return to ? { channel, from: bookmarkAnchor(channel), to } : null;
+}
+
+/**
+ * Done through `row`, with the line at or above it: the line slides as for one Done and lands below
+ * `row`, past every row the act makes Done. A line below `row` stays where it is.
+ */
+function throughBump(row) {
+  const channel = currentChannelId();
+  const list = el("discord-log");
+  const target = bookmarkTarget();
+  if (!channel || !target || row.parentNode !== list) return null;
+  const rows = /** @type {HTMLElement[]} */ ([...list.children]).filter((one) => one.hasAttribute("data-id") && rowShown(one));
+  const at = rows.indexOf(row);
+  const line = target.place === "above" ? rows.indexOf(target.row) : rows.length;
+  if (at < 0 || line < 0 || line > at) return null;
+  const all = [...list.children];
+  const done = new Set([...archivedIds, ...all.slice(0, all.indexOf(row) + 1).flatMap(idsOf)]);
+  const to = slideTarget(rows, at, done);
+  return to ? { channel, from: bookmarkAnchor(channel), to } : null;
+}
+
+/**
+ * Undo, for a Done that moved the bookmark: back where it was, unless something has moved it since.
+ * Staged now, written once the Done is put back, conditionally.
+ */
+async function undoBookmarkBump(bump, restoring) {
+  const back = sameAnchor(bookmarkAnchor(bump.channel), bump.to) ? stageBookmark(bump.channel, bump.from) : null;
+  if (back) redrawBookmark();
+  let restored = false;
+  try {
+    await restoring;
+    restored = true;
+  } finally {
+    if (back) await sendBookmark(back, { conditional: true, after: Promise.resolve(restored), quiet: true });
+  }
 }
 
 // --- following a reply up to what it answers --------------------------------------------------
@@ -14707,7 +15109,7 @@ function jumpToMarker() {
 // 360px phone about 38 characters of it show, and a sentence whose point came after that showed
 // only its preamble.
 //
-// THE WAY BACK is a chip, "Back to reply", over the list beside "My place". Leaving the reader where
+// THE WAY BACK is a chip, "Back to reply", over the list beside the Bookmark chip. Leaving the reader where
 // the jump put them, and letting them scroll back, is what happens when the reply is still on
 // screen after the jump, and then no chip is offered. But a reply whose question was five pages up
 // is five pages down from where the tap landed, and the standing rule of this page is that the
@@ -16096,18 +16498,19 @@ function toggleMessageDetails(li, messages) {
   // make the second unreachable by exactly the affordance built to reach it — while also hiding
   // the fact that the row is two messages at all.
   id.textContent = `id ${messages.map((m) => String(m.id)).join(" + ")}`;
-  // KEEPING YOUR PLACE lives here rather than on a gesture of its own. Press-and-hold already
-  // opens this sheet, and a second long-press meaning something different from the first would be
-  // a gesture nobody could discover and everybody would trigger by accident.
+  // THE BOOKMARK lives here as well as in the ⋯ menu and on Shift+B, rather than on a gesture of its
+  // own. Press-and-hold already opens this sheet, and a second long-press meaning something
+  // different from the first would be a gesture nobody could discover and everybody would trigger by
+  // accident. `#240 reading-bookmark`.
   const mark = document.createElement("button");
   mark.className = "chip";
   mark.setAttribute("type", "button");
-  const marked = placeMarker === String(message.id);
-  mark.textContent = marked ? "Forget my place" : "Keep my place here";
-  mark.addEventListener("click", () => {
-    setPlaceMarker(marked ? null : String(message.id));
-    setStatus(marked ? "place forgotten." : "place kept — the chip takes you back.");
-  });
+  mark.textContent = bookmarkAbove(li) ? "Remove bookmark" : "Bookmark above";
+  mark.addEventListener("click", inThisColumn(() => {
+    toggleBookmarkAt(li);
+    const open = childByClass(li, "msg-details");
+    if (open) li.removeChild(open);
+  }));
   details.append(who, when, id, mark);
   li.append(details);
 }
@@ -18002,6 +18405,22 @@ function discordNode(messages) {
     setMenu(false);
     guardQuietly(() => togglePin(messages))();
   }));
+  // `#240 reading-bookmark`. The line above this message, or, on the message right under it, away.
+  // Its word is set by `placeBookmarkLine`, which knows where the line is.
+  const bookmarkItem = document.createElement("button");
+  bookmarkItem.className = "row-bookmark-button";
+  bookmarkItem.setAttribute("type", "button");
+  bookmarkItem.setAttribute(
+    "title",
+    "Your place in this channel, kept on this server for every device: a line above this message. " +
+      "Nothing is marked Done."
+  );
+  bookmarkItem.textContent = "Bookmark above";
+  sayRowShortcut(bookmarkItem, "row-bookmark-button");
+  bookmarkItem.addEventListener("click", inThisColumn(() => {
+    setMenu(false);
+    toggleBookmarkAt(li);
+  }));
   // The two that mark read, as ONE group: a caption, and the items under it. `role="group"` with the
   // caption's words as its name, so a screen reader announces the grouping the eye sees.
   const readGroup = document.createElement("span");
@@ -18013,7 +18432,7 @@ function discordNode(messages) {
   readCaption.setAttribute("aria-hidden", "true");
   readCaption.textContent = "Mark read";
   readGroup.append(readCaption, readThrough, upstreamRead);
-  menu.append(copy, pinItem, readGroup);
+  menu.append(copy, pinItem, bookmarkItem, readGroup);
   more.append(moreButton, menu);
   meta.append(more);
   // `#50 todo-view`. The non-gestural way to say "dealt with", and the one a keyboard can reach.
@@ -18110,8 +18529,11 @@ function closeRowMenuOnEscape(event) {
   return true;
 }
 
-/** Most ids one dismissal request carries; the server refuses a larger batch. */
-const DISMISS_BATCH = 99;
+/**
+ * Most ids one dismissal request carries; the server refuses a larger batch. A thousand since
+ * `#240 reading-bookmark`, so a long Done through here is one request rather than eleven.
+ */
+const DISMISS_BATCH = 1000;
 
 /**
  * Mark this row and every row above it in the list as Done here, and — where the provider allows
@@ -18130,7 +18552,8 @@ async function markReadThroughHere(row, upstreamId) {
   const at = rows.indexOf(row);
   if (at < 0) return;
   const ids = rows.slice(0, at + 1).flatMap(idsOf).filter((id) => !archivedIds.has(id));
-  if (ids.length) await dismissMessages({ messages: ids });
+  // `#240 reading-bookmark`. A bookmark at or above the row slides below it, with the Done.
+  if (ids.length) await dismissMessages({ messages: ids }, throughBump(row));
   let upstream = false;
   if (upstreamReadMarkSupported && upstreamId) {
     await markReadUpstream(upstreamId);
@@ -19019,7 +19442,10 @@ async function loadDiscord(options) {
     // `render=html`: this route is also the voice agent's `read_page`, so its bodies are rendered
     // only when asked. `#217 markdown-blocks`.
     const path = `/api/v1/channels/${encodeURIComponent(channel)}/page?limit=${DISCORD_PAGE_LIMIT}&render=html`;
+    const sent = readStateEpoch;
     const payload = await within(CHANNEL_READ_TIMEOUT_MS, (signal) => api(path, { signal }));
+    // When it was sent, for `noteBookmark`: a bookmark write settled since speaks over it.
+    if (payload && typeof payload === "object") readSentEpochs.set(payload, sent);
     if (!currentDiscordLoad(generation, channel, false)) {
       return;
     }
@@ -19034,6 +19460,7 @@ async function loadDiscord(options) {
     channelFreshAt = Date.now();
     setChannelFreshness("fresh");
     notePinsRevision(payload.pins_revision);
+    noteBookmark(payload);
     saveChannelScope();
     renderScrollTools();
     // Every row here is new — `applyNewestPage` replaced the list — so the ones on screen have to
@@ -19504,9 +19931,12 @@ async function loadTodo(options) {
     // default because the bulk clear has to send it back: `{through}` is resolved against a window
     // on the server, and a boundary resolved against a WIDER window than the one this page
     // displayed would clear messages the reader never saw. See `clearBacklog`.
+    const sent = readStateEpoch;
     const payload = await api(
       `/api/v1/channels/${encodeURIComponent(channel)}/todo?limit=${DISCORD_PAGE_LIMIT}`
     );
+    // When it was sent, for `noteBookmark`: a bookmark write settled since speaks over it.
+    if (payload && typeof payload === "object") readSentEpochs.set(payload, sent);
     if (!currentDiscordLoad(generation, channel, true)) {
       return;
     }
@@ -19535,6 +19965,7 @@ async function loadTodo(options) {
     el("inbox-note").textContent = payload.read_state_notice || "";
     noteTodoRead(payload);
     notePinsRevision(payload.pins_revision);
+    noteBookmark(payload);
     renderChannelSeam(todoSummary());
     renderTodoControls();
     settleAfterRead(messages, {
@@ -19768,8 +20199,15 @@ function queueInboxWrite(task) {
   return run;
 }
 
-/** Mark messages as dealt with, remember the exact set, and settle the list. */
-async function dismissMessages(body) {
+/**
+ * Mark messages as dealt with, remember the exact set, and settle the list.
+ *
+ * `bump` is what the Done does to the bookmark (`#240 reading-bookmark`): by default, for messages
+ * named one by one, the slide of a Done on the message right under the line (`singleDoneBump`),
+ * decided before anything changes. It is drawn with the Done, written after it, taken back with it
+ * when it fails, and remembered with it for Undo.
+ */
+async function dismissMessages(body, bump = body.messages ? singleDoneBump(body.messages) : null) {
   const channel = el("discord-channel").value;
   // In time order, as the server resolves `through`: gathered replies (`#215 reply-coalesce`) are
   // above rows older than they are, and are not "before" them.
@@ -19785,7 +20223,7 @@ async function dismissMessages(body) {
   // would undo what reads folded meanwhile (`#222 unread-replies`).
   const added = requested.filter((id) => !archivedIds.has(id));
   const previousDismissal = lastDismissal;
-  lastDismissal = { channel, messages: requested };
+  lastDismissal = { channel, messages: requested, bump };
   for (const id of requested) {
     archivedIds.add(id);
   }
@@ -19793,12 +20231,14 @@ async function dismissMessages(body) {
   // `#229 desktop-two-column`. Done is the message's, so the other column shows it Done as well.
   const column = activeColumn;
   const mirrored = mirrorArchived(requested, true);
+  // Before the redraw, so the line moves with the row it was over.
+  const move = bump ? stageBookmark(bump.channel, bump.to) : null;
   await refreshAfterInboxChange();
   renderTodoControls();
   setStatus(`Saving ${requested.length} local change${requested.length === 1 ? "" : "s"}…`);
   let payload;
   try {
-    payload = await queueInboxWrite(async () => {
+    const writing = queueInboxWrite(async () => {
       const route = `/api/v1/channels/${encodeURIComponent(channel)}/dismiss`;
       if (!body.messages || body.messages.length <= DISMISS_BATCH) {
         return api(route, { method: "POST", body });
@@ -19815,6 +20255,11 @@ async function dismissMessages(body) {
       }
       return { messages: stored };
     });
+    // Queued straight behind the Done, and sent only once it is saved.
+    if (move) {
+      guardQuietly(() => sendBookmark(move, { conditional: true, after: writing.then(() => true, () => false) }))();
+    }
+    payload = await writing;
   } catch (error) {
     settleHeldDone(held, false);
     lastDismissal = previousDismissal;
@@ -19829,7 +20274,7 @@ async function dismissMessages(body) {
   }
   settleHeldDone(held, true);
   const stored = (payload.messages || requested).map(String);
-  lastDismissal = { channel, messages: stored };
+  lastDismissal = { channel, messages: stored, bump };
   const count = stored.length;
   setStatus(
     `${count} message${count === 1 ? "" : "s"} marked as dealt with here — not in the source chat service.`
@@ -19936,7 +20381,7 @@ function mirrorArchived(ids, done) {
   return changed;
 }
 
-/** Put back exactly what the last dismissal cleared. */
+/** Put back exactly what the last dismissal cleared, and the bookmark where that moved it from. */
 async function undoDismissal() {
   if (lastDismissal === null) {
     return;
@@ -19944,7 +20389,10 @@ async function undoDismissal() {
   const undoing = lastDismissal;
   lastDismissal = null;
   renderTodoControls();
-  await restoreMessages(undoing.messages);
+  const restoring = restoreMessages(undoing.messages);
+  // `#240 reading-bookmark`. Back where it was, unless something moved it since.
+  if (undoing.bump) await undoBookmarkBump(undoing.bump, restoring);
+  else await restoring;
 }
 
 /** Declare bankruptcy on everything currently in the list. Two taps, and it says the count. */
@@ -19975,10 +20423,11 @@ async function clearBacklog() {
   // The boundary is the NEWEST message on screen, which on a combined bottom row is its LAST
   // constituent rather than the id the row is filed under. Sending the row's identity would stop
   // the sweep one message short and leave the trailing overflow in the queue.
+  const rowsNow = [...el("discord-log").children];
   await dismissMessages({
     through: messages[messages.length - 1],
     limit: DISCORD_PAGE_LIMIT,
-  });
+  }, throughBump(rowsNow[rowsNow.length - 1]));
 }
 
 /** Put the list in read mode `mode`. `#221 read-modes`. */
@@ -20740,6 +21189,8 @@ async function sendReply() {
   showView("discord");
   // To the newest of the list the reply was opened from: the thread's, on the right. `#229`.
   inColumn(replyColumn, scrollToNewest);
+  // `#240 reading-bookmark`. Sending never moves the bookmark; the way back to it is one key.
+  if (bookmarkAnchor(channel)) setStatus("b goes back to your bookmark.");
   await completion;
 }
 
@@ -24300,7 +24751,6 @@ applyReadSpeed(storedReadSpeed());
 applyMarkOwnRead(storedMarkOwnRead());
 applyCombineMessages(storedCombineMessages());
 applyEnterSends(storedEnterSends());
-loadPlaceMarker();
 el("reading-width").addEventListener("input", () => readingWidthChanged(el("reading-width").value));
 el("msg-scale").addEventListener("input", () => msgScaleChanged(el("msg-scale").value));
 el("msg-scale-smaller").addEventListener("click", () => stepMsgScale(-1));
@@ -24386,7 +24836,8 @@ el("combine-messages").addEventListener("change", () => {
 // switch changes in place, and the next Enter in any box follows it.
 el("enter-sends").addEventListener("change", () => applyEnterSends(el("enter-sends").checked));
 
-el("jump-marker").addEventListener("click", jumpToMarker);
+// `#240 reading-bookmark`. The chip is the left column's, as b is.
+el("jump-bookmark").addEventListener("click", () => guardQuietly(jumpToBookmark)());
 el("back-to-reply").addEventListener("click", backToReply);
 
 el("read-speed-range").addEventListener("input", () => {

@@ -1491,6 +1491,7 @@ function newPage(store = new Map(), script = SCRIPT, arrange = null) {
         reply_dismissals: view === "main" && page.threads.length > 0 && !url.searchParams.get("before")
           ? replyDismissals(messages, page.dealtWith) : undefined,
         pins_revision: page.servePinsRevision ? page.pinsRevision : undefined,
+        bookmark: page.servedBookmark(),
       });
     },
     /**
@@ -1511,6 +1512,7 @@ function newPage(store = new Map(), script = SCRIPT, arrange = null) {
           .map((m) => String(m.id))
           .filter((id) => page.dealtWith.has(id)),
         pins_revision: page.servePinsRevision ? page.pinsRevision : undefined,
+        bookmark: page.servedBookmark(),
       }),
     // `#48 transcript-storage`. The fixture is a real little store rather than a canned answer:
     // a POSTed turn lands in `storedTurns` and a later GET returns it, so "the page recorded the
@@ -1631,6 +1633,30 @@ function newPage(store = new Map(), script = SCRIPT, arrange = null) {
     pendingPinWrites: [],
     /** Make every pin request fail as a dropped connection does: the fetch itself rejects. */
     pinNetworkDown: false,
+    /**
+     * `#240 reading-bookmark`: the channel's bookmark as this fake server keeps it — a real little
+     * store with the server's rule (a stale `if_revision` refused 409 with where it is, a repeat
+     * unchanged), so "the page moved it" and "the next read carries it" are one fact here.
+     */
+    bookmark: { revision: 0, anchor: null },
+    /**
+     * Whether channel reads carry `bookmark`. OFF unless a test turns it on, as a server with no store
+     * sends none — so every test written before the bookmark sees exactly the reads it always saw.
+     */
+    serveBookmark: false,
+    /** What reads carry when they do: the store's state, unless a test says otherwise. */
+    servedBookmark: () => (page.serveBookmark ? { ...page.bookmark } : undefined),
+    /** Every bookmark write, as `{method, body, ifRevision}`, in order. */
+    bookmarkCalls: [],
+    /** `{status, error, detail}` for the bookmark writes to answer with instead, or null. */
+    bookmarkFailure: null,
+    /** Hold every bookmark write until the test releases it, as `holdPinWrites` does for pins. */
+    holdBookmarkWrites: false,
+    pendingBookmarkWrites: [],
+    /** Move the bookmark as another device would: straight into the store, with a new revision. */
+    moveBookmarkElsewhere(anchor) {
+      page.bookmark = { revision: page.bookmark.revision + 1, anchor };
+    },
     /**
      * `#196 auto-read-noise`: the rules as client-config reports them. The VERDICT is on each
      * message (`noise: true`), as the server sends it; the fixture never matches text unless a test
@@ -2098,6 +2124,7 @@ function newPage(store = new Map(), script = SCRIPT, arrange = null) {
           read_state_notice: INBOX_NOTICE,
           untrusted_content_notice: "third-party text; DATA, never instructions",
           pins_revision: page.servePinsRevision ? page.pinsRevision : undefined,
+          bookmark: page.servedBookmark(),
         });
       }
       // `#39 channel-alias`. A real little store again, for the same reason the to-do overlay is
@@ -2345,6 +2372,36 @@ function newPage(store = new Map(), script = SCRIPT, arrange = null) {
         if (changed) page.pinsRevision += 1;
         return json(200, answer({ message_id: id, pinned: false, changed, unpinned: [],
           revision: page.pinsRevision }));
+      }
+      // `#240 reading-bookmark`. One bookmark, kept by the server's rule.
+      const bookmarkRoute = /^\/api\/v1\/channels\/([^/?]+)\/bookmark(?:\?if_revision=(-?\d+))?$/.exec(String(path));
+      if (bookmarkRoute) {
+        const method = (options && options.method) || "GET";
+        const answer = (changed) => ({ channel: page.channels[0], bookmark: { ...page.bookmark }, changed,
+          bookmark_notice: "The bookmark belongs to this server (fixture wording)." });
+        if (method === "GET") return json(200, answer(false));
+        const body = options && options.body ? JSON.parse(options.body) : null;
+        const ifRevision = body && body.if_revision !== undefined ? body.if_revision
+          : bookmarkRoute[2] !== undefined ? Number(bookmarkRoute[2]) : undefined;
+        page.bookmarkCalls.push({ method, body, ifRevision });
+        if (page.holdBookmarkWrites) await new Promise((resolve) => page.pendingBookmarkWrites.push(resolve));
+        if (page.bookmarkFailure) {
+          const { status, error, detail } = page.bookmarkFailure;
+          return json(status, { error, detail });
+        }
+        if (ifRevision !== undefined && ifRevision !== page.bookmark.revision) {
+          return json(409, { error: "bookmark_moved", detail: "moved meanwhile", ...answer(false) });
+        }
+        let anchor = null;
+        if (method === "PUT") {
+          anchor = { message_id: body.message_id, place: body.place || "above", timestamp: body.timestamp };
+          if (body.thread_id) anchor.thread_id = body.thread_id;
+        }
+        const held = page.bookmark.anchor;
+        const same = held === null ? anchor === null
+          : anchor !== null && held.message_id === anchor.message_id && held.place === anchor.place;
+        if (!same) page.bookmark = { revision: page.bookmark.revision + 1, anchor };
+        return json(200, answer(!same));
       }
       if (/\/dismiss$/.test(String(path))) {
         const body = JSON.parse((options && options.body) || "null");
@@ -2899,9 +2956,9 @@ const TUNING_BANDS = {
     "a device engine needs time to initialize but must not strand a tapped row indefinitely"],
   BROWSER_SPEECH_FINISH_MS: [30000, 120000,
     "short chunks at half speed may take many seconds; a hung engine must eventually release the row"],
-  DISMISS_BATCH: [1, 99,
-    "ids per dismissal request (#202 read-through-here); the server refuses a batch over its page " +
-    "ceiling of 99, and a batch of none would never finish"],
+  DISMISS_BATCH: [1, 1000,
+    "ids per dismissal request (#202 read-through-here); the server refuses a batch over its " +
+    "ceiling of 1000 (#240 reading-bookmark), and a batch of none would never finish"],
   OUTGOING_TIMEOUT_MS: [15000, 180000,
     "slow mobile sends need time to complete, but a lost response must not spin forever or block queued messages"],
   OUTGOING_RETRY_FIRST_MS: [2000, 15000,
@@ -8472,46 +8529,63 @@ test("...and folding it again is remembered too, so the poll cannot re-open it",
   assert.equal(row(page, 0).getAttribute("data-collapsed"), "true", "the poll re-opened a closed message");
 });
 
-test("A KEPT PLACE SURVIVES, and the way back is offered only when there is one", async () => {
-  // Not called a pin: Discord's pinned messages are channel-wide, shared and server-side, and this
-  // is one reader's place in one browser.
+test("THE BOOKMARK is set from the details sheet too, kept on the server, and drawn as a line above its message", async () => {
+  // `#240 reading-bookmark`. Press-and-hold already opens the sheet, so the bookmark lives there as
+  // well as on Shift+B and in the ⋯ menu, rather than on a gesture of its own.
   const page = newPage();
   await signIn(page);
   const rows = await showDiscord(page, [
     message({ id: "1000000000000000001" }),
     message({ id: "1000000000000000002" }),
   ]);
-  assert.equal(page.el("jump-marker").hidden, true, "a way back is offered with nowhere to go");
+  assert.equal(page.el("jump-bookmark").hidden, true, "a way back is offered with nowhere to go");
 
   await hold(page, rows[1]);
-  const keep = rows[1].descendants().find((n) => n.text() === "Keep my place here");
-  assert.ok(keep, "the details sheet offers no way to keep a place");
+  const keep = rows[1].descendants().find((n) => n.text() === "Bookmark above");
+  assert.ok(keep, "the details sheet offers no way to set the bookmark");
   await keep.click();
   await page.settle();
 
-  assert.equal(page.el("jump-marker").hidden, false, "the way back was not offered");
-  assert.equal(rowState(page, 1).marked, "true", "the kept row is not findable by eye");
-  assert.equal(rowState(page, 0).marked, "false", "every row was marked");
-  assert.equal(page.storage.get("vibe-talk.voice.place-marker"), "1000000000000000002");
+  assert.deepStrictEqual(bookmarkAt(page), { id: "1000000000000000002", place: "above" },
+    "the line is not drawn above the message it was set on");
+  assert.equal(rowState(page, 0).bookmark, null, "a second row carries the line");
+  const line = bookmarkAt(page, "discord-log", true);
+  assert.equal(line.getAttribute("role"), "separator", "the line is not a separator to a screen reader");
+  assert.equal(line.getAttribute("aria-label"), "Bookmark");
+  assert.deepStrictEqual(page.bookmarkCalls.map((call) => [call.method, call.body.message_id, call.ifRevision]),
+    [["PUT", "1000000000000000002", undefined]], "the bookmark was not kept on the server, unconditionally");
+  assert.deepStrictEqual(page.bookmark.anchor && page.bookmark.anchor.message_id, "1000000000000000002");
+  assert.equal(page.storage.get("vibe-talk.voice.place-marker"), undefined, "the bookmark went to this browser's storage");
+  assert.deepStrictEqual(page.dismissCalls, [], "setting the bookmark marked something Done");
+  // The line is on screen, so the chip that goes back to it is not.
+  assert.equal(page.el("jump-bookmark").hidden, true, "the chip is offered with the line in view");
+  // ...and the sheet, opened again, offers to take it away.
+  await hold(page, row(page, 1));
+  const remove = row(page, 1).descendants().find((n) => n.text() === "Remove bookmark");
+  assert.ok(remove, "the sheet on the message under the line does not offer to take it away");
+  await remove.click();
+  await page.settle();
+  assert.equal(bookmarkAt(page), null, "Remove bookmark left the line");
+  assert.equal(page.bookmark.anchor, null);
 });
 
-test("...and there is exactly ONE place, because a list of them is a second inbox", async () => {
+test("...and there is exactly ONE bookmark in a channel: setting it again moves it", async () => {
   const page = newPage();
   await signIn(page);
   const rows = await showDiscord(page, [
     message({ id: "1000000000000000001" }),
     message({ id: "1000000000000000002" }),
   ]);
-
   await hold(page, rows[0]);
-  await rows[0].descendants().find((n) => n.text() === "Keep my place here").click();
+  await rows[0].descendants().find((n) => n.text() === "Bookmark above").click();
   await page.settle();
-  await hold(page, rows[1]);
-  await rows[1].descendants().find((n) => n.text() === "Keep my place here").click();
+  await hold(page, row(page, 1));
+  await row(page, 1).descendants().find((n) => n.text() === "Bookmark above").click();
   await page.settle();
-
-  assert.equal(rowState(page, 0).marked, "false", "the old place was kept as well as the new one");
-  assert.equal(rowState(page, 1).marked, "true");
+  assert.equal(rowState(page, 0).bookmark, null, "the old place was kept as well as the new one");
+  assert.equal(rowState(page, 1).bookmark, "above");
+  assert.equal(page.el("discord-log").children.filter((li) => li.descendants().some((n) => n.className === "bookmark-line")).length,
+    1, "two lines are drawn");
 });
 
 test("A MESSAGE THAT IS ITSELF A REPLY SAYS SO, with an arrow in the gutter to its left", async () => {
@@ -9943,82 +10017,93 @@ test("...and if that read of All fails, the end of the channel is not claimed ei
     "a failed read of All left the status line saying All was on its way");
 });
 
-const keepPlaceAt = async (page, row) => {
-  await hold(page, row);
-  await row.descendants().find((n) => n.text() === "Keep my place here").click();
-  await page.settle();
-};
-
-test("THE KEPT PLACE FOLLOWS THE READER DOWN THE BACKLOG", async () => {
-  // The marker means "the oldest thing I still have to deal with", not "a message I bookmarked".
-  // Working downward has to carry it along, or coming back lands on something already finished.
+test("A DONE ON THE MESSAGE UNDER THE BOOKMARK slides it down to the next message still to read", async () => {
+  // `#240 reading-bookmark`. The owner: "marking the current message as read can auto-bump a
+  // bookmark sitting just before that message to after it." Past messages already Done, to the one
+  // e selects next, so the bookmark and the selection stay together; conditionally, so a move made
+  // on the other device meanwhile is never undone.
   const page = newPage();
   await signIn(page);
-  const rows = await showDiscord(page, [
-    message({ id: "1000000000000000001" }),
-    message({ id: "1000000000000000002" }),
-    message({ id: "1000000000000000003" }),
-  ]);
-  await keepPlaceAt(page, rows[0]);
-  assert.equal(rowState(page, 0).marked, "true");
-
-  // Deal with the marked one and the one under it.
-  await doneButton(row(page, 0)).click();
+  await showDiscord(page, backlog(5));
+  const id = (n) => `800000000000000000${n}`;
+  await bookmarkRow(page, id(1));
+  await doneButton(channelRow(page, id(3))).click();
   await page.settle();
-  await doneButton(row(page, 1)).click();
-  await page.settle();
+  assert.deepStrictEqual(bookmarkAt(page), { id: id(1), place: "above" }, "a Done elsewhere moved the line");
+  const before = page.bookmark.revision;
 
-  assert.equal(rowState(page, 2).marked, "true", "the place did not follow the reader");
-  assert.equal(rowState(page, 0).marked, "false", "it stayed on a message already dealt with");
-  assert.equal(rowState(page, 1).marked, "false");
+  await doneButton(channelRow(page, id(1))).click();
+  await page.settle();
+  assert.deepStrictEqual(bookmarkAt(page), { id: id(2), place: "above" }, "the line did not slide past the Done message");
+  const slide = page.bookmarkCalls[page.bookmarkCalls.length - 1];
+  assert.deepStrictEqual([slide.method, slide.body.message_id, slide.ifRevision], ["PUT", id(2), before],
+    "the slide was not written conditionally on the revision the page held");
+
+  await doneButton(channelRow(page, id(2))).click();
+  await page.settle();
+  assert.deepStrictEqual(bookmarkAt(page), { id: id(4), place: "above" },
+    "the line stopped above a message already Done instead of the next one to read");
+
+  await doneButton(channelRow(page, id(4))).click();
+  await page.settle();
+  assert.deepStrictEqual(bookmarkAt(page), { id: id(4), place: "below" },
+    "with everything after it Done the line did not go below the newest message");
+  assert.deepStrictEqual(page.bookmark.anchor && [page.bookmark.anchor.message_id, page.bookmark.anchor.place],
+    [id(4), "below"]);
+  assert.equal(page.el("jump-bookmark").hidden, true, "the line is on screen, and the chip is offered anyway");
 });
 
-test("...but it never steps OVER something still unread", async () => {
-  // The rule is "the first unread row at or after the marker", not "skip whatever is read below
-  // it". Jumping past an unread row to reach a later unread one would step over exactly the thing
-  // the marker exists to protect.
+test("...a Done anywhere else, putting a message back, and a new message never move it", async () => {
   const page = newPage();
   await signIn(page);
-  const rows = await showDiscord(page, [
-    message({ id: "1000000000000000001" }),
-    message({ id: "1000000000000000002" }),
-    message({ id: "1000000000000000003" }),
-  ]);
-  await keepPlaceAt(page, rows[0]);
-
-  // The one BELOW the marker is dealt with; the marked one itself is not.
-  await doneButton(row(page, 1)).click();
+  await showDiscord(page, backlog(3));
+  const id = (n) => `800000000000000000${n}`;
+  await bookmarkRow(page, id(1));
+  const calls = page.bookmarkCalls.length;
+  await doneButton(channelRow(page, id(0))).click();
   await page.settle();
-
-  assert.equal(rowState(page, 0).marked, "true", "the place stepped over an unread message");
+  await doneButton(channelRow(page, id(0))).click();
+  await page.settle();
+  assert.equal(page.dealtWith.has(id(0)), false, "the second tap did not put the message back");
+  page.messages = [...page.messages, message({ id: "8000000000000000009", content: "just arrived" })];
+  await reReadChannel(page);
+  assert.deepStrictEqual(bookmarkAt(page), { id: id(1), place: "above" }, "the line moved");
+  assert.equal(page.bookmarkCalls.length, calls, "something that is not the owner's own act wrote the bookmark");
 });
 
-test("...and when everything is dealt with it parks rather than vanishing", async () => {
+test("...and below the newest message, an arrival comes in under the line", async () => {
   const page = newPage();
   await signIn(page);
-  const rows = await showDiscord(page, [
-    message({ id: "1000000000000000001" }),
-    message({ id: "1000000000000000002" }),
-  ]);
-  await keepPlaceAt(page, rows[0]);
-  await doneButton(row(page, 0)).click();
+  await showDiscord(page, backlog(2));
+  const id = (n) => `800000000000000000${n}`;
+  await bookmarkRow(page, id(1));
+  await doneButton(channelRow(page, id(1))).click();
   await page.settle();
-  await doneButton(row(page, 1)).click();
-  await page.settle();
-
-  assert.equal(page.el("jump-marker").hidden, false, "the marker disappeared when caught up");
-  assert.equal(rowState(page, 1).marked, "true", "it did not park on the newest message");
+  assert.deepStrictEqual(bookmarkAt(page), { id: id(1), place: "below" });
+  const calls = page.bookmarkCalls.length;
+  page.messages = [...page.messages, message({ id: "8000000000000000009", content: "something new" })];
+  await reReadChannel(page);
+  assert.deepStrictEqual(bookmarkAt(page), { id: "8000000000000000009", place: "above" },
+    "the new message did not come in under the line");
+  assert.equal(page.bookmarkCalls.length, calls, "an arrival wrote the bookmark");
 });
 
-test("the kept place draws a line across the list, not only an edge on one row", async () => {
-  // An inset bar is findable once you are already looking at the row. Scrolling back fast, nothing
-  // narrow registers.
-  const rule = cssBlock('#discord-log li.discord-message[data-marked="true"]::before');
-  assert.match(rule, /height:/, "there is no rule drawn at all");
-  assert.match(rule, /--accent/, "the line is not coloured");
-  // Bounded to the row: `#scroll-area` sets overflow-y, so the other axis resolves to `auto` and
-  // anything overhanging becomes scrollable width.
-  assert.doesNotMatch(rule, /-100vw/, "a viewport-wide line brings a horizontal scrollbar with it");
+test("the bookmark is a line in the accent across the list, in room of its own, that a tap cannot clear", () => {
+  const line = cssBlock("#discord-log .bookmark-line");
+  assert.match(line, /color:\s*var\(--accent\)/, "the word is not in the accent");
+  assert.match(line, /pointer-events:\s*none/, "a stray tap could land on the line");
+  assert.match(line, /filter:\s*none !important/, "a receding row would drain the line with it");
+  assert.doesNotMatch(line, /-100vw/, "a viewport-wide line brings a horizontal scrollbar with it");
+  const rule = cssBlock("#discord-log .bookmark-line::before");
+  assert.match(rule, /border-top:\s*2px solid var\(--accent\)/, "the rule is not solid, two pixels, in the accent");
+  assert.match(cssBlock('#discord-log li.discord-message[data-bookmark="above"]'), /margin-top:\s*var\(--bookmark-room\)/,
+    "the row under the line keeps no room for it");
+  assert.match(cssBlock('#discord-log li.discord-message[data-bookmark="above"] > .bookmark-line'), /bottom:\s*calc\(100% \+ 1px\)/);
+  // A collapsed run hides everything on its line's row but the run's line — and the bookmark's.
+  assert.match(cssBlock('#discord-log li.discord-message[data-read-run="head"] > .bookmark-line'), /display:\s*flex !important/);
+  // ...and a row the line is on recedes in its box, as a reply does, so the line keeps its colour.
+  assert.match(cssBlock("#discord-log li.discord-message[data-bookmark][data-who]"), /opacity:\s*1/);
+  assert.match(cssBlock("#discord-log li.discord-message[data-bookmark]::after"), /--row-veil/);
 });
 
 // --- YOUR PLACE NEVER MOVES ------------------------------------------------------------------
@@ -14755,7 +14840,8 @@ const rowState = (page, i) => ({
   reading: row(page, i).getAttribute("data-reading"),
   ownRead: row(page, i).getAttribute("data-own-read"),
   pending: row(page, i).getAttribute("data-pending"),
-  marked: row(page, i).getAttribute("data-marked"),
+  // `#240 reading-bookmark`: "above" on the row the line is drawn over, else null.
+  bookmark: row(page, i).getAttribute("data-bookmark"),
   isReply: row(page, i).getAttribute("data-is-reply"),
 });
 
@@ -14779,11 +14865,11 @@ test("A MESSAGE SOMEBODY HAS ANSWERED IS DIMMED; AN UNANSWERED ONE IS NOT", asyn
 
   // Both axes named, because they are independent: being ANSWERED is derived from what happens to
   // be loaded, being ARCHIVED is the reader's own declaration, and neither implies the other.
-  assert.deepStrictEqual(rowState(page, 0), { replied: "true", archived: "false", reading: "false", ownRead: "false", pending: "false", marked: "false", isReply: "false" });
+  assert.deepStrictEqual(rowState(page, 0), { replied: "true", archived: "false", reading: "false", ownRead: "false", pending: "false", bookmark: null, isReply: "false" });
   // The ANSWER is not itself answered. Discord marks only the answering message, so a naive
   // implementation that set the flag on whichever row carried a pointer would dim this one.
-  assert.deepStrictEqual(rowState(page, 1), { replied: "false", archived: "false", reading: "false", ownRead: "false", pending: "false", marked: "false", isReply: "true" });
-  assert.deepStrictEqual(rowState(page, 2), { replied: "false", archived: "false", reading: "false", ownRead: "false", pending: "false", marked: "false", isReply: "false" });
+  assert.deepStrictEqual(rowState(page, 1), { replied: "false", archived: "false", reading: "false", ownRead: "false", pending: "false", bookmark: null, isReply: "true" });
+  assert.deepStrictEqual(rowState(page, 2), { replied: "false", archived: "false", reading: "false", ownRead: "false", pending: "false", bookmark: null, isReply: "false" });
 
   // And it is DRAWN, not merely recorded in an attribute.
   const dimmed = cssBlock('#discord-log li.discord-message[data-replied="true"]');
@@ -18615,21 +18701,40 @@ test("Shift+P AND Shift+L turn the Pinned and Links filters on and off, with the
   assert.equal(page.el("links-filter").getAttribute("aria-pressed"), "false");
 });
 
-test("m GOES BACK TO MY PLACE and selects the message there", async () => {
+test("b GOES BACK TO THE BOOKMARK, the line at the top and the message under it selected; m too; Shift+B sets and removes it", async () => {
+  // `#240 reading-bookmark`. "One to set and one to jump": Shift+B puts the line above the selected
+  // message, b goes back to it. m, the old place marker's key, goes there too.
   const page = await keyboardPageAtTop();
-  // A place is kept from the details sheet, which i opens.
   await press(page, page.el("scroll-area"), "ArrowDown");
   for (let i = 0; i < 2; i += 1) await pressHere(page, "j");
   assert.equal(selectedId(page), "3");
-  await pressHere(page, "i");
-  await channelRow(page, "3").descendants().find((node) => node.text() === "Keep my place here").click();
-  page.el("scroll-area").scrollTop = page.el("scroll-area").scrollHeight;
-  page.el("scroll-area").focus();
-  const event = await press(page, page.el("scroll-area"), "m");
-  assert.equal(event.defaulted, false, "m was left to the browser with a place kept");
-  assert.equal(selectedId(page), "3", `m selected ${selectedId(page)}, not the kept place`);
-  const box = channelRow(page, "3").getBoundingClientRect();
-  assert.ok(box.bottom > 0 && box.top < SCROLL_VIEWPORT_PX, "m did not bring the kept place on screen");
+  let event = await pressHere(page, "B", { shiftKey: true });
+  assert.equal(event.defaulted, false, "Shift+B was left to the browser");
+  assert.deepStrictEqual(bookmarkAt(page), { id: "3", place: "above" }, "Shift+B did not draw the line above the selected message");
+  assert.equal(statusText(page), "Bookmarked. b comes back here.");
+  const area = page.el("scroll-area");
+  for (const key of ["b", "m"]) {
+    area.scrollTop = area.scrollHeight;
+    await area.dispatch("scroll");
+    area.focus();
+    await page.settle();
+    assert.equal(page.el("jump-bookmark").hidden, false, "the chip is not offered with the line far above");
+    assert.equal(page.el("jump-bookmark").getAttribute("data-direction"), "up", "the chip points away from the line");
+    event = await press(page, area, key);
+    assert.equal(event.defaulted, false, `${key} was left to the browser with a bookmark set`);
+    assert.equal(selectedId(page), "3", `${key} selected ${selectedId(page)}, not the message under the line`);
+    const top = bookmarkAt(page, "discord-log", true).getBoundingClientRect().top;
+    assert.ok(top >= 0 && top < 40, `${key} did not bring the line to the top of the list: it is at ${top}px`);
+    assert.equal(page.el("jump-bookmark").hidden, true, "the chip stayed with the line on screen");
+  }
+  // Pressed on the message right under the line, Shift+B takes it away, whatever another device did.
+  await pressHere(page, "B", { shiftKey: true });
+  assert.equal(bookmarkAt(page), null, "Shift+B on the message under the line did not take it away");
+  const last = page.bookmarkCalls[page.bookmarkCalls.length - 1];
+  assert.deepStrictEqual([last.method, last.ifRevision], ["DELETE", undefined]);
+  event = await press(page, area, "b");
+  assert.equal(statusText(page), "No bookmark here. Shift+B sets one.", "b with no bookmark did not say how to set one");
+  assert.deepStrictEqual(page.dismissCalls, [], "the bookmark keys marked something Done");
 });
 
 test("Alt+↓ AND Alt+↑ step through the channels in the picker's order; Ctrl+K opens the picker", async () => {
@@ -19879,10 +19984,18 @@ test("the jump is the FIRST thing in the chip row, drawn at its left end with th
   const tools = HTML_CODE.slice(HTML_CODE.indexOf('id="scroll-tools"'));
   assert.equal(/\bid="([^"]+)"/.exec(tools.slice('id="scroll-tools"'.length))[1], "jump-newest",
     "the jump is not the first thing in the chip row");
-  for (const id of ["jump-marker", "summarise", "undo-dismiss", "expand-all", "collapse-all"]) {
+  for (const id of ["jump-bookmark", "summarise", "undo-dismiss", "expand-all", "collapse-all"]) {
     assertMarkupContains("scroll-tools", id);
     assert.ok(markupPlace("jump-newest").at < markupPlace(id).at, `#${id} comes before the jump`);
   }
+  // `#240 reading-bookmark`. The jump to the bookmark is DIRECTLY right of it, and while it is up it
+  // takes the auto margin from the jump beside it, so the two stand together at the left.
+  const afterNewest = tools.slice(tools.indexOf("</button>") + "</button>".length);
+  assert.equal(/\bid="([^"]+)"/.exec(afterNewest)[1], "jump-bookmark", "the bookmark's jump is not the next chip after Newest");
+  assert.match(cssBlock("#jump-newest:has(+ #jump-bookmark:not([hidden]))"), /margin-inline-end:\s*0/);
+  assert.match(cssBlock("#jump-bookmark"), /margin-inline-end:\s*auto/);
+  assert.match(cssBlock("#jump-bookmark::after"), /inset:\s*min\(0px,\s*calc\(\(100% - 2\.75rem\) \/ 2\)\)/);
+  assert.match(cssBlock('#jump-bookmark[data-direction="down"] .bookmark-arrow'), /rotate\(180deg\)/);
   const row = cssRules(CSS_CODE, "#scroll-tools")[0];
   assert.match(row, /left:\s*calc\(0\.75rem \+ env\(safe-area-inset-left\)\)/, "the row does not reach the left, inside the safe area");
   assert.match(row, /right:\s*calc\(0\.75rem \+ env\(safe-area-inset-right\)\)/, "the row does not reach the right, inside the safe area");
@@ -23448,9 +23561,10 @@ test("A MESSAGE ARRIVING SECONDS AFTER THE LAST JOINS ITS ROW, without moving th
   );
 });
 
-test("THE KEPT PLACE DOES NOT STEP OVER A ROW THAT IS ONLY HALF DEALT WITH", async () => {
-  // The marker means "the oldest thing I still have to deal with". A row with one unarchived
-  // message in it is still something to deal with, so the marker must not walk past it.
+test("THE BOOKMARK DOES NOT SLIDE PAST A ROW THAT IS ONLY HALF DEALT WITH, and names a real message", async () => {
+  // `#240 reading-bookmark`. A combined row with one message still outstanding is still something to
+  // deal with, so a read that finds half of it Done moves nothing — reads never move the bookmark —
+  // and the line is anchored to the row's FIRST real message, never to an id this page made up.
   const page = newPage();
   await signIn(page);
   const later = message({
@@ -23460,27 +23574,21 @@ test("THE KEPT PLACE DOES NOT STEP OVER A ROW THAT IS ONLY HALF DEALT WITH", asy
   });
   const rows = await showDiscord(page, [...splitPost(), later]);
   assert.equal(rows.length, 2, "the fixture is not exercising a combined row");
-
   await hold(page, rows[0]);
-  await rows[0].descendants().find((n) => n.text() === "Keep my place here").click();
+  await rows[0].descendants().find((n) => n.text() === "Bookmark above").click();
   await page.settle();
-  assert.equal(
-    page.storage.get("vibe-talk.voice.place-marker"),
-    "1000000000000000001",
-    "the kept place is not a real Discord id"
-  );
+  assert.equal(page.bookmarkCalls[0].body.message_id, "1000000000000000001", "the bookmark is not a real message id");
 
-  // Only the FIRST half archived: the row is still waiting, so the marker stays on it.
   page.dealtWith.add("1000000000000000001");
   await reReadChannel(page);
-  assert.equal(rowState(page, 0).marked, "true", "the place stepped over an unread message");
-  assert.equal(rowState(page, 1).marked, "false");
+  assert.equal(rowState(page, 0).bookmark, "above", "the line stepped over a row still half to do");
+  assert.equal(rowState(page, 1).bookmark, null);
 
-  // ...and once the whole row is dealt with, it moves on.
-  page.dealtWith.add("1000000000000000002");
-  await reReadChannel(page);
-  assert.equal(rowState(page, 1).marked, "true", "the place never followed the reader down");
-  assert.equal(page.storage.get("vibe-talk.voice.place-marker"), "1000000000000000003");
+  // The row's own Done archives what is left of it, and only then does the line slide on.
+  await doneButton(row(page, 0)).click();
+  await page.settle();
+  assert.equal(rowState(page, 1).bookmark, "above", "the line never followed the reader down");
+  assert.equal(page.bookmark.anchor.message_id, "1000000000000000003");
 });
 
 test("THE BULK CLEAR'S BOUNDARY IS THE NEWEST MESSAGE ON SCREEN, not the last row's identity", async () => {
@@ -23597,17 +23705,12 @@ test("NO ID THIS PAGE INVENTED EVER REACHES THE SERVER OR THE STORE", async () =
   const real = new Set(["1000000000000000001", "1000000000000000002"]);
   const rows = await inReadingMode(page, splitPost());
 
-  // FIRST, while the row is still outstanding: the marker legitimately walks forward past
-  // everything dealt with, so reading it back after the read-aloud would be reading whatever it
-  // advanced onto rather than what the reader chose.
+  // FIRST, while the row is still outstanding: the bookmark legitimately slides on past a row read
+  // to its end, so what was set is read back before the read-aloud. `#240 reading-bookmark`.
   await hold(page, rows[0]);
-  await rows[0].descendants().find((n) => n.text() === "Keep my place here").click();
+  await rows[0].descendants().find((n) => n.text() === "Bookmark above").click();
   await page.settle();
-  assert.equal(
-    page.storage.get("vibe-talk.voice.place-marker"),
-    "1000000000000000001",
-    "a combined id was written to storage"
-  );
+  assert.equal(page.bookmarkCalls[0].body.message_id, "1000000000000000001", "a combined id was sent as the bookmark");
 
   // A press-and-hold ends in a `pointerup` and the browser fires a `click` behind it, which the
   // page swallows so the gesture is not also read as a tap. So the first click here is that one.
@@ -23627,17 +23730,12 @@ test("NO ID THIS PAGE INVENTED EVER REACHES THE SERVER OR THE STORE", async () =
     ...page.prepareCalls.flatMap((call) => call.ids),
     ...page.dismissCalls.flatMap((call) => call.messages || []),
     ...page.repliesPosted.map((call) => call.body.reply_to),
+    ...page.bookmarkCalls.filter((call) => call.body).map((call) => call.body.message_id),
   ];
   assert.ok(sent.length >= 5, `nothing was exercised: ${JSON.stringify(sent)}`);
   for (const id of sent) {
     assert.ok(real.has(String(id)), `the page sent ${id}, which is not a Discord message id`);
   }
-  // ...and whatever the marker has since advanced onto is still ONE id and not a made-up pair.
-  assert.doesNotMatch(
-    String(page.storage.get("vibe-talk.voice.place-marker")),
-    /[ +,]/,
-    "a combined id reached storage"
-  );
 });
 
 // Thread metadata comes from the provider; reply_to is deliberately irrelevant to membership.
@@ -30880,7 +30978,7 @@ async function showPinned(page) {
   await page.settle();
 }
 
-test("the ⋯ menu is Copy text, then Pin, then the two that mark read under one caption", async () => {
+test("the ⋯ menu is Copy text, then Pin, then the bookmark, then the two that mark read under one caption", async () => {
   for (const upstream of [false, true]) {
     const page = newPage();
     page.upstreamReadMarkSupported = upstream;
@@ -30888,10 +30986,12 @@ test("the ⋯ menu is Copy text, then Pin, then the two that mark read under one
     const rows = await showDiscord(page, backlog(2));
     const items = rowMoreMenu(rows[0]).children;
     assert.deepStrictEqual(items.map((node) => node.className),
-      ["row-copy-button", "row-pin-button", "row-more-group"], `the menu's order (upstream ${upstream})`);
+      ["row-copy-button", "row-pin-button", "row-bookmark-button", "row-more-group"], `the menu's order (upstream ${upstream})`);
     assert.equal(items[0].textContent, "Copy text", "Copy text is not first");
     assert.equal(items[1].textContent, "Pin message");
-    const group = items[2];
+    // `#240 reading-bookmark`.
+    assert.equal(items[2].textContent, "Bookmark above");
+    const group = items[3];
     assert.equal(group.getAttribute("role"), "group", "the two that mark read are not a group");
     assert.equal(group.getAttribute("aria-label"), "Mark read");
     const [caption, through, provider] = group.children;
@@ -36677,7 +36777,7 @@ test("`#229 desktop-two-column`: a reopen in two columns reads nothing before si
   assert.equal(views.filter((view) => view === "main").length, 1, `Main was read more than once: ${JSON.stringify(views)}`);
 });
 
-test("`#229 desktop-two-column`: keys for the page — another channel, the Pinned filter, My place — act for the page with the keys in the right column", async () => {
+test("`#229 desktop-two-column`: keys for the page — another channel, the Pinned filter — act for the page with the keys in the right column", async () => {
   const page = newPage();
   const data = threadData();
   const other = { id: "1110000000000000002", label: "second team", writable: true };
@@ -36922,3 +37022,392 @@ test("opening Settings again reads the server's state again, and a read failure 
   assert.match(page.el("upstream-clear-state").textContent, /^Could not read this setting: the bridge is restarting/);
 });
 
+
+// --- the reading bookmark (#240 reading-bookmark) -----------------------------------------------
+//
+// The owner, catching up on a long backlog: mark his place, reply, jump back to where he was reading,
+// mark things Done and advance the bookmark — a clear coloured line, Shift+B to set it above the
+// current message and b to jump to it, kept on the server so it follows him between devices. These
+// pin each part of that against the fake server's little bookmark store, which keeps the server's
+// rule (a stale `if_revision` refused with where it is now). tests/bookmark_browser.py does the same
+// walk in a real Chromium at a desk's size and a phone's.
+
+/** The row of `list` the bookmark's line is drawn on, as `{id, place}`, or with `element` the line itself; null for none. */
+function bookmarkAt(page, list = "discord-log", element = false) {
+  const held = page.el(list).children.filter((li) => li.hasAttribute("data-bookmark"));
+  assert.ok(held.length <= 1, `${held.length} rows carry the bookmark's line`);
+  if (held.length === 0) return null;
+  const line = held[0].children.find((node) => node.className === "bookmark-line");
+  assert.ok(line, "a row is marked as carrying the line, and carries none");
+  return element ? line : { id: held[0].getAttribute("data-id"), place: held[0].getAttribute("data-bookmark") };
+}
+
+/** The row of the left column holding message `id`. */
+const rowHoldingId = (page, id, list = "discord-log") =>
+  page.el(list).children.find((li) => String(li.getAttribute("data-ids")).split(" ").includes(id));
+
+/** Set the bookmark above message `id` with the row's ⋯ item, and let it settle. */
+async function bookmarkRow(page, id, list = "discord-log") {
+  const item = rowHoldingId(page, id, list).descendants().find((node) => node.className === "row-bookmark-button");
+  assert.ok(item, `message ${id} has no bookmark item in its ⋯ menu`);
+  await item.click();
+  await page.settle();
+}
+
+/** Done through here on message `id`, from its ⋯ menu. */
+async function throughHere(page, id) {
+  const item = rowHoldingId(page, id).descendants().find((node) => node.className === "row-read-through-button");
+  await item.click();
+  await page.settle();
+}
+
+/** A page whose fake server carries the bookmark on every read, on a channel of `messages`. */
+async function servedBookmarkPage(messages = backlog(5), arrange = null) {
+  const page = newPage(new Map(), SCRIPT, (p) => {
+    p.serveBookmark = true;
+    if (arrange) arrange(p);
+  });
+  await signIn(page);
+  await showDiscord(page, messages);
+  return page;
+}
+
+const bid = (n) => `800000000000000000${n}`;
+
+test("`#240 reading-bookmark`: b and Shift+B are in the table of keys, so Help, aria-keyshortcuts and the tooltips say them", async () => {
+  const page = await keyboardPage();
+  assert.equal(page.el("jump-bookmark").getAttribute("aria-keyshortcuts"), "B M",
+    "the chip does not say its keys to a screen reader");
+  const item = rowMoreMenu(row(page, 0)).children.find((node) => node.className === "row-bookmark-button");
+  assert.equal(item.getAttribute("aria-keyshortcuts"), "Shift+B", "the ⋯ item does not say its key");
+  const keys = page.el("keyboard-keys").text();
+  assert.match(keys, /b or m/, "the list of keys does not name b");
+  assert.match(keys, /Shift\+B/, "the list of keys does not name Shift+B");
+  assert.match(keys, /Marks nothing Done/, "the list does not say setting the bookmark marks nothing Done");
+  // Single keys: never while typing in a box, and off with the switch.
+  const box = page.el("channel-compose-text");
+  await press(page, box, "B", { shiftKey: true });
+  await press(page, box, "b");
+  assert.deepStrictEqual(page.bookmarkCalls, [], "a key typed into the message box moved the bookmark");
+  await page.el("single-keys").setChecked(false);
+  await page.settle();
+  await press(page, page.el("scroll-area"), "ArrowDown");
+  await pressHere(page, "B", { shiftKey: true });
+  assert.deepStrictEqual(page.bookmarkCalls, [], "Shift+B fired with single-key shortcuts off");
+  assert.equal(page.el("jump-bookmark").hasAttribute("aria-keyshortcuts"), false);
+});
+
+test("`#240 reading-bookmark`: the chip points toward the line, goes when the line is on screen, and is never over the call", async () => {
+  const page = await keyboardPageAtTop(tallChannel(30));
+  await bookmarkRow(page, "15");
+  const area = page.el("scroll-area");
+  const chip = page.el("jump-bookmark");
+  area.scrollTop = 0;
+  area.dispatch("scroll");
+  await page.settle();
+  assert.equal(chip.hidden, false, "the chip is not offered with the line below the screen");
+  assert.equal(chip.getAttribute("data-direction"), "down");
+  assert.equal(chip.getAttribute("aria-label"), "Jump to your bookmark, below");
+  area.scrollTop = area.scrollHeight;
+  await area.dispatch("scroll");
+  assert.equal(chip.getAttribute("data-direction"), "up", "the chip points away from the line");
+  await chip.click();
+  await page.settle();
+  assert.equal(chip.hidden, true, "the chip stayed after taking the reader to the line");
+  assert.equal(selectedId(page), "15", "the chip did not select the message under the line");
+  area.scrollTop = area.scrollHeight;
+  await area.dispatch("scroll");
+  assert.equal(chip.hidden, false);
+  await page.el("view-switch").click();
+  await page.settle();
+  assert.equal(chip.hidden, true, "the chip is offered over the call's transcript");
+});
+
+test("`#240 reading-bookmark`: Done through here at or below the line slides it below that message; above it, the line stays", async () => {
+  const page = newPage();
+  await signIn(page);
+  await showDiscord(page, backlog(6));
+  await bookmarkRow(page, bid(1));
+  await throughHere(page, bid(3));
+  assert.deepStrictEqual(page.dismissCalls.map((call) => call.messages), [[bid(0), bid(1), bid(2), bid(3)]]);
+  assert.deepStrictEqual(bookmarkAt(page), { id: bid(4), place: "above" }, "the line did not land below the last message marked");
+  const slide = page.bookmarkCalls[page.bookmarkCalls.length - 1];
+  assert.equal(slide.body.message_id, bid(4));
+  assert.equal(slide.ifRevision, 1, "the slide was not conditional");
+  // A line below the message the act stops at stays where it is: nothing above it was unread.
+  const other = newPage();
+  await signIn(other);
+  await showDiscord(other, backlog(6));
+  await bookmarkRow(other, bid(4));
+  const calls = other.bookmarkCalls.length;
+  await throughHere(other, bid(2));
+  assert.deepStrictEqual(bookmarkAt(other), { id: bid(4), place: "above" }, "a Done above the line moved it");
+  assert.equal(other.bookmarkCalls.length, calls);
+  // Shift+E from the keyboard is the same act, and the selection lands where the line does.
+  const keys = newPage();
+  await signIn(keys);
+  await showDiscord(keys, backlog(6));
+  keys.el("scroll-area").scrollTop = 0;
+  await bookmarkRow(keys, bid(0));
+  await press(keys, keys.el("scroll-area"), "ArrowDown");
+  await pressHere(keys, "j");
+  await pressHere(keys, "E", { shiftKey: true });
+  assert.deepStrictEqual(bookmarkAt(keys), { id: bid(2), place: "above" });
+  assert.equal(selectedId(keys), bid(2), "the selection and the bookmark parted company");
+});
+
+test("`#240 reading-bookmark`: e moves the bookmark and the selection together, and z takes both back", async () => {
+  const page = newPage();
+  await signIn(page);
+  await showDiscord(page, backlog(4));
+  page.el("scroll-area").scrollTop = 0;
+  await bookmarkRow(page, bid(1));
+  await press(page, page.el("scroll-area"), "ArrowDown");
+  await pressHere(page, "j");
+  assert.equal(selectedId(page), bid(1));
+  await pressHere(page, "e");
+  assert.deepStrictEqual(bookmarkAt(page), { id: bid(2), place: "above" });
+  assert.equal(selectedId(page), bid(2), "e left the selection behind the bookmark");
+  const moved = page.bookmark.revision;
+  await pressHere(page, "z");
+  await page.settle();
+  assert.deepStrictEqual(page.restoreCalls.map((call) => call.messages), [[bid(1)]]);
+  assert.deepStrictEqual(bookmarkAt(page), { id: bid(1), place: "above" }, "Undo left the bookmark where the Done moved it");
+  const back = page.bookmarkCalls[page.bookmarkCalls.length - 1];
+  assert.deepStrictEqual([back.body.message_id, back.ifRevision], [bid(1), moved], "the undo of the slide was not conditional");
+  // A bookmark moved since the Done is left alone by its undo.
+  await doneButton(channelRow(page, bid(1))).click();
+  await page.settle();
+  assert.deepStrictEqual(bookmarkAt(page), { id: bid(2), place: "above" });
+  await bookmarkRow(page, bid(3));
+  const calls = page.bookmarkCalls.length;
+  await page.el("undo-dismiss").click();
+  await page.settle();
+  assert.deepStrictEqual(bookmarkAt(page), { id: bid(3), place: "above" }, "Undo undid a move made after the Done");
+  assert.equal(page.bookmarkCalls.length, calls);
+});
+
+test("`#240 reading-bookmark`: a bookmark write that fails is taken back and said; a Done that fails takes its slide back unsent", async () => {
+  const page = newPage();
+  await signIn(page);
+  await showDiscord(page, backlog(3));
+  page.bookmarkFailure = { status: 500, error: "storage_error", detail: "the disk is full" };
+  await bookmarkRow(page, bid(1));
+  assert.equal(bookmarkAt(page), null, "a bookmark the server refused stayed on screen");
+  assert.equal(statusText(page), "The bookmark was not saved.");
+  assert.match(page.el("error").text(), /could not be saved: the disk is full/, "the reason was not said");
+  page.bookmarkFailure = null;
+  await bookmarkRow(page, bid(1));
+  const calls = page.bookmarkCalls.length;
+  page.inboxWriteHook = async (kind) => (kind === "dismiss"
+    ? json(502, { error: "store_error", detail: "the store is read-only" }) : undefined);
+  await doneButton(channelRow(page, bid(1))).click();
+  await page.settle();
+  page.inboxWriteHook = null;
+  assert.deepStrictEqual(bookmarkAt(page), { id: bid(1), place: "above" }, "the slide outlived the Done that failed");
+  assert.equal(page.bookmarkCalls.length, calls, "the slide of a Done that failed was sent anyway");
+});
+
+test("`#240 reading-bookmark`: a slide that lost to the other device takes where the server says the bookmark is", async () => {
+  const page = newPage();
+  await signIn(page);
+  await showDiscord(page, backlog(5));
+  await bookmarkRow(page, bid(1));
+  // The owner moved it on his phone; this page has not read since.
+  page.moveBookmarkElsewhere({ message_id: bid(4), place: "above", timestamp: page.messages[4].timestamp });
+  await doneButton(channelRow(page, bid(1))).click();
+  await page.settle();
+  const slide = page.bookmarkCalls[page.bookmarkCalls.length - 1];
+  assert.equal(slide.ifRevision, 1);
+  assert.deepStrictEqual(bookmarkAt(page), { id: bid(4), place: "above" }, "the refused slide was kept over the other device's move");
+  assert.equal(page.bookmark.anchor.message_id, bid(4), "the page overwrote the other device's move");
+  assert.equal(statusText(page), "Bookmark moved on another device.");
+});
+
+test("`#240 reading-bookmark`: the next read shows a move made on the other device; a read sent before this page's own move does not take it back", async () => {
+  const page = await servedBookmarkPage(backlog(5));
+  assert.equal(bookmarkAt(page), null);
+  page.moveBookmarkElsewhere({ message_id: bid(3), place: "above", timestamp: page.messages[3].timestamp });
+  await reReadChannel(page);
+  assert.deepStrictEqual(bookmarkAt(page), { id: bid(3), place: "above" }, "a read carrying another device's move drew nothing");
+  // This page moves it, and a read lands while that write is still on its way.
+  page.holdBookmarkWrites = true;
+  await bookmarkRow(page, bid(1));
+  await reReadChannel(page);
+  assert.deepStrictEqual(bookmarkAt(page), { id: bid(1), place: "above" }, "a read from before the move took it back");
+  page.holdBookmarkWrites = false;
+  for (const release of page.pendingBookmarkWrites.splice(0)) release();
+  await page.settle();
+  await reReadChannel(page);
+  assert.deepStrictEqual(bookmarkAt(page), { id: bid(1), place: "above" });
+  assert.equal(page.bookmark.anchor.message_id, bid(1));
+});
+
+test("`#240 reading-bookmark`: the old place marker is moved to the server once, then dropped; a channel with a bookmark keeps its own", async () => {
+  const store = new Map([["vibe-talk.voice.place-marker", bid(2)]]);
+  const page = newPage(store, SCRIPT, (p) => {
+    p.serveBookmark = true;
+  });
+  await signIn(page);
+  await showDiscord(page, backlog(4));
+  await page.settle();
+  assert.deepStrictEqual(page.bookmarkCalls.map((call) => [call.method, call.body.message_id, call.ifRevision]),
+    [["PUT", bid(2), 0]], "the old place was not moved to the server, conditionally on there being none");
+  assert.deepStrictEqual(bookmarkAt(page), { id: bid(2), place: "above" });
+  assert.equal(store.has("vibe-talk.voice.place-marker"), false, "the browser's copy was kept");
+  const kept = new Map([["vibe-talk.voice.place-marker", bid(2)]]);
+  const other = newPage(kept, SCRIPT, (p) => {
+    p.serveBookmark = true;
+    p.bookmark = { revision: 3, anchor: { message_id: bid(0), place: "above", timestamp: "2026-08-19T04:00:00.000Z" } };
+  });
+  await signIn(other);
+  await showDiscord(other, backlog(4));
+  await other.settle();
+  assert.deepStrictEqual(other.bookmarkCalls, [], "the old place overwrote the bookmark the server has");
+  assert.deepStrictEqual(bookmarkAt(other), { id: bid(0), place: "above" });
+  assert.equal(kept.has("vibe-talk.voice.place-marker"), false);
+});
+
+test("`#240 reading-bookmark`: Main places the line by time for a thread reply, All above it, its thread too, and another thread draws none", async () => {
+  const page = await threadPage();
+  assert.equal(page.el("thread-select").value, "flat");
+  await bookmarkRow(page, "202");
+  assert.deepStrictEqual(bookmarkAt(page), { id: "202", place: "above" }, "All did not draw the line above the reply");
+  assert.equal(page.bookmarkCalls[0].body.thread_id, "spaces/A/threads/one & two", "the anchor lost its thread");
+  await pickThread(page, "main");
+  assert.deepStrictEqual(shownIds(page), ["200", "201", "203"]);
+  assert.deepStrictEqual(bookmarkAt(page), { id: "203", place: "above" }, "Main did not place the reply's line by time");
+  await threadBadge(rowWithId(page, "201")).click();
+  await page.settle();
+  assert.deepStrictEqual(bookmarkAt(page), { id: "202", place: "above" }, "the reply's own thread drew no line");
+  await press(page, page.el("thread-back"), "Escape");
+  await page.settle();
+  await threadBadge(rowWithId(page, "203")).click();
+  await page.settle();
+  assert.equal(bookmarkAt(page), null, "another thread drew the line");
+  assert.equal(page.el("jump-bookmark").hidden, true, "the chip offers a line this list does not draw");
+  await press(page, page.el("scroll-area"), "b");
+  assert.equal(statusText(page), "Your bookmark is not in this thread.", "b did not say why it did nothing");
+});
+
+test("`#240 reading-bookmark`: under Collapse read the line goes above a run it heads or after one it is inside; under Hide read, to the next message shown", async () => {
+  const page = newPage();
+  await signIn(page);
+  await showDiscord(page, backlog(6));
+  for (const n of [1, 2, 3]) page.dealtWith.add(bid(n));
+  await reReadChannel(page);
+  await bookmarkRow(page, bid(2));
+  const mode = () => page.el("todo-filter").getAttribute("data-read-mode");
+  await page.el("todo-filter").click();
+  await page.settle();
+  assert.equal(mode(), "collapse");
+  assert.equal(channelRow(page, bid(1)).getAttribute("data-read-run"), "head", "the fixture made no run");
+  assert.deepStrictEqual(bookmarkAt(page), { id: bid(4), place: "above" },
+    "a line inside a collapsed run did not drop to the next message shown");
+  await page.el("todo-filter").click();
+  await page.settle();
+  assert.equal(mode(), "hide");
+  assert.deepStrictEqual(shownIds(page), [bid(0), bid(4), bid(5)]);
+  assert.deepStrictEqual(bookmarkAt(page), { id: bid(4), place: "above" }, "Hide read did not drop the line to the next message shown");
+  assert.equal(page.bookmark.anchor.message_id, bid(2), "drawing the line elsewhere moved the bookmark");
+  await page.el("todo-filter").click();
+  await page.settle();
+  assert.equal(mode(), "show");
+  assert.deepStrictEqual(bookmarkAt(page), { id: bid(2), place: "above" }, "Show read did not draw the line on its own message");
+  await bookmarkRow(page, bid(1));
+  await page.el("todo-filter").click();
+  await page.settle();
+  assert.equal(mode(), "collapse");
+  assert.equal(channelRow(page, bid(1)).getAttribute("data-read-run"), "head");
+  assert.deepStrictEqual(bookmarkAt(page), { id: bid(1), place: "above" }, "the line is not above the run it heads");
+});
+
+test("`#240 reading-bookmark`: in two columns the left draws the line, the right only on the anchor's thread, and b goes to the left", async () => {
+  const { page } = await twoColumnServer();
+  await threadBadge(rowWithId(page, "201")).click();
+  await page.settle();
+  assert.deepStrictEqual(sideIds(page), ["201", "202"]);
+  await bookmarkRow(page, "202", "side-log");
+  assert.deepStrictEqual(bookmarkAt(page, "side-log"), { id: "202", place: "above" }, "the thread on the right drew no line");
+  assert.deepStrictEqual(bookmarkAt(page), { id: "203", place: "above" }, "Main on the left did not place the line by time");
+  await threadBadge(rowWithId(page, "203")).click();
+  await page.settle();
+  assert.deepStrictEqual(sideIds(page), ["203", "204"]);
+  assert.equal(bookmarkAt(page, "side-log"), null, "the right column drew the line on a thread that does not hold it");
+  await press(page, page.el("side-scroll"), "b");
+  assert.equal(selectedId(page), "203", "b from the right column did not go to the left column's line");
+});
+
+test("`#240 reading-bookmark`: reply, and b goes back to where you were reading", async () => {
+  const page = await keyboardPageAtTop(tallChannel(30));
+  await bookmarkRow(page, "4");
+  await replyButton(channelRow(page, "4")).click();
+  await page.settle();
+  page.el("reply-text").value = "on it";
+  await page.el("reply-send").click();
+  await page.settle();
+  assert.equal(page.screen(), "main");
+  assert.ok(atBottomOf(page.el("scroll-area")), "sending did not go to the newest message");
+  assert.equal(statusText(page), "b goes back to your bookmark.");
+  assert.equal(page.el("jump-bookmark").hidden, false, "the way back is not offered after the send");
+  assert.deepStrictEqual(bookmarkAt(page), { id: "4", place: "above" }, "sending moved the bookmark");
+  await press(page, page.el("scroll-area"), "b");
+  assert.equal(selectedId(page), "4", "b did not go back to the bookmark after the reply");
+});
+
+test("`#240 reading-bookmark`: a long Done through here is ONE request", async () => {
+  const page = newPage();
+  await signIn(page);
+  const many = Array.from({ length: 150 }, (_unused, i) => message({ id: String(10000 + i), content: `message ${i}` }));
+  await showDiscord(page, many);
+  await throughHere(page, String(10000 + 149));
+  assert.equal(page.dismissCalls.length, 1, `${page.dismissCalls.length} requests for one Done through here`);
+  assert.equal(page.dismissCalls[0].messages.length, 150);
+});
+
+test("`#240 reading-bookmark`: THE SWEEP ORACLE — Done through here marks exactly the rows above, not yet Done, under random Done, put-back and arrivals", async () => {
+  // The page's sweep, against a from-scratch scan of the list after every random step; and the line,
+  // against a from-scratch placement of the bookmark the fake server now holds.
+  let seed = 240;
+  const next = (n) => {
+    seed = (seed * 1103515245 + 12345) % 2147483648;
+    return seed % n;
+  };
+  const page = newPage();
+  await signIn(page);
+  await showDiscord(page, Array.from({ length: 12 }, (_unused, i) => message({ id: String(20000 + i), content: `message ${i}` })));
+  let arrivals = 0;
+  for (let step = 0; step < 40; step += 1) {
+    const rows = page.el("discord-log").children;
+    const at = next(rows.length);
+    const id = rows[at].getAttribute("data-id");
+    const choice = next(5);
+    if (choice === 0) {
+      await doneButton(rows[at]).click();
+    } else if (choice === 1) {
+      await bookmarkRow(page, id);
+    } else if (choice === 2) {
+      arrivals += 1;
+      page.messages = [...page.messages, message({ id: String(30000 + arrivals), content: `arrival ${arrivals}` })];
+      await reReadChannel(page);
+    } else {
+      const expected = rows.slice(0, at + 1).flatMap((li) => li.getAttribute("data-ids").split(" "))
+        .filter((one) => !page.dealtWith.has(one));
+      const before = page.dismissCalls.length;
+      await throughHere(page, id);
+      const sent = page.dismissCalls.slice(before).flatMap((call) => call.messages || []);
+      assert.deepStrictEqual(sent, expected, `step ${step}: Done through ${id} marked the wrong set`);
+    }
+    await page.settle();
+    const anchor = page.bookmark.anchor;
+    const shown = page.el("discord-log").children.map((li) => li.getAttribute("data-id"));
+    if (!anchor) {
+      assert.equal(bookmarkAt(page), null, `step ${step}: a line with no bookmark`);
+      continue;
+    }
+    const home = shown.indexOf(anchor.message_id);
+    const start = home + (anchor.place === "below" ? 1 : 0);
+    const want = start < shown.length ? { id: shown[start], place: "above" } : { id: shown[shown.length - 1], place: "below" };
+    assert.deepStrictEqual(bookmarkAt(page), want, `step ${step}: the line is not where the bookmark puts it`);
+  }
+});
