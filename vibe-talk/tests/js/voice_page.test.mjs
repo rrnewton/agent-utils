@@ -2959,6 +2959,10 @@ const TUNING_BANDS = {
     "a device engine needs time to initialize but must not strand a tapped row indefinitely"],
   BROWSER_SPEECH_FINISH_MS: [30000, 120000,
     "short chunks at half speed may take many seconds; a hung engine must eventually release the row"],
+  LEGACY_MARKER_READS: [10, 500,
+    "channel reads the old place marker is looked for in before it is dropped unfound (#240 " +
+    "reading-bookmark): fewer drops it before the owner opens the channel it was in, more keeps a " +
+    "pass over the list in every redraw for good"],
   DISMISS_BATCH: [1, 1000,
     "ids per dismissal request (#202 read-through-here); the server refuses a batch over its " +
     "ceiling of 1000 (#240 reading-bookmark), and a batch of none would never finish"],
@@ -37295,6 +37299,25 @@ test("`#240 reading-bookmark`: the old place marker is moved to the server once,
   assert.deepStrictEqual(other.bookmarkCalls, [], "the old place overwrote the bookmark the server has");
   assert.deepStrictEqual(bookmarkAt(other), { id: bid(0), place: "above" });
   assert.equal(kept.has("vibe-talk.voice.place-marker"), false);
+});
+
+test("`#240 reading-bookmark`: an old place marker whose message is never read again is dropped after a bounded number of reads", async () => {
+  const store = new Map([["vibe-talk.voice.place-marker", "8999999999999999999"]]);
+  const page = newPage(store, SCRIPT, (p) => {
+    p.serveBookmark = true;
+  });
+  await signIn(page);
+  await showDiscord(page, backlog(4));
+  for (let read = 0; read < 3; read += 1) await reReadChannel(page);
+  assert.equal(store.get("vibe-talk.voice.place-marker"), "8999999999999999999",
+    "the old place was dropped before it had been looked for long enough");
+  for (let read = 0; read < sourceConstant("LEGACY_MARKER_READS"); read += 1) await reReadChannel(page);
+  assert.equal(store.has("vibe-talk.voice.place-marker"), false, "an old place no read brings is looked for forever");
+  // ...and its message turning up later moves nothing: it was given up on.
+  page.messages = [...page.messages, message({ id: "8999999999999999999", content: "the old place" })];
+  await reReadChannel(page);
+  assert.deepStrictEqual(page.bookmarkCalls, [], "an old place given up on was moved to the server");
+  assert.equal(bookmarkAt(page), null);
 });
 
 test("`#240 reading-bookmark`: Main places the line by time for a thread reply, All above it, its thread too, and another thread draws none", async () => {

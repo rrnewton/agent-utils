@@ -14651,6 +14651,16 @@ const bookmarkWrites = new Map();
 /** The row each column draws the line on, and on which side of it, or null. */
 const bookmarkDrawn = { main: null, side: null };
 
+/**
+ * How many channel reads the old place marker is looked for in before it is dropped unfound
+ * (`adoptLegacyMarker`): the look is a pass over the list on every redraw, and an id whose message
+ * is never loaded again would be looked for in every redraw of every session.
+ */
+const LEGACY_MARKER_READS = 50;
+
+/** The channel reads that carried a bookmark while the old place marker was still looked for. */
+let legacyMarkerReads = 0;
+
 /** The id the old place marker left in this browser, until it is adopted or dropped. */
 let legacyMarker = null;
 try {
@@ -14723,6 +14733,7 @@ function redrawBookmark() {
  */
 function noteBookmark(payload) {
   if (!payload || !isBookmarkState(payload.bookmark)) return;
+  if (legacyMarker !== null) legacyMarkerReads += 1;
   const channel = String((payload.channel && payload.channel.id) || currentChannelId());
   const write = bookmarkWrites.get(channel);
   if (write && (write.pending > 0 || sentEpochOf(payload) < write.from)) return;
@@ -14959,10 +14970,21 @@ function placeBookmarkLine() {
   else apply();
 }
 
+/** Forget the old place marker, here and in the browser's storage. */
+function dropLegacyMarker() {
+  legacyMarker = null;
+  try {
+    localStorage.removeItem(MARKER_KEY);
+  } catch (_error) {
+    // A browser that refuses storage asks again next time, and the server already has it then.
+  }
+}
+
 /**
  * The old place marker, moved to the server: the first time its message is drawn in a channel the
  * server says has no bookmark, the bookmark goes above it, and the browser's copy is dropped. Found
- * in a channel that has one already, it is simply dropped: the owner has a place there.
+ * in a channel that has one already, it is simply dropped: the owner has a place there. Not found
+ * within `LEGACY_MARKER_READS` channel reads, it is dropped too: its message is no longer read.
  */
 function adoptLegacyMarker() {
   if (legacyMarker === null) return;
@@ -14971,14 +14993,12 @@ function adoptLegacyMarker() {
   const write = bookmarkWrites.get(channel);
   if (!held || !held.known || (write && write.pending > 0)) return;
   const row = rowHolding(legacyMarker);
-  if (!row) return;
-  const id = legacyMarker;
-  legacyMarker = null;
-  try {
-    localStorage.removeItem(MARKER_KEY);
-  } catch (_error) {
-    // A browser that refuses storage asks again next time, and the server already has it then.
+  if (!row) {
+    if (legacyMarkerReads >= LEGACY_MARKER_READS) dropLegacyMarker();
+    return;
   }
+  const id = legacyMarker;
+  dropLegacyMarker();
   if (held.anchor) return;
   const messages = rowMessages(row);
   const at = Math.max(0, messages.findIndex((message) => String(message.id) === id));
