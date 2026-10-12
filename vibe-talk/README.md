@@ -4145,12 +4145,18 @@ leaves it for the list with the draft kept.
 **No mode of the agent's has to be engaged to type.** During a call a typed turn goes down the
 socket that is already open, as above. With **nothing open**, the **first send** starts a typed
 conversation (below), holds the message while the conversation opens — the text stays in the box
-and Send is disabled, so it cannot go twice — and sends it the moment the conversation is open,
-after the initiation frame. Clicking into the box, or writing a draft in it, opens no connection
-and bills nothing: the conversation starts belatedly, on the send. A message sent while a spoken
-call is still connecting is held the same way and goes when the call connects. A conversation
-that fails to open leaves the message in the box and sends it nowhere, not into the next call.
-On `vibe-talk-v1` the held message goes as a `prompt` at `session_started`. The protocol does not
+and Send is disabled, so it cannot go twice — and sends it once the server has **accepted** the
+conversation, which is later than the socket opening: at `conversation_initiation_metadata` on the
+hosted vendor's protocol (after the initiation frame, and the frame vibe-talk's own client of that
+vendor waits for before it writes), and as a `prompt` at `session_started` on `vibe-talk-v1`. Until
+then the message is still the reader's: not in the transcript, not "Sent.", and still a saved
+draft. Clicking into the box, or writing a draft in it, opens no connection and bills nothing: the
+conversation starts belatedly, on the send. A message sent while a spoken call is still starting —
+asking for its session or the microphone, or connecting — is held the same way and goes into that
+call. **One conversation starts at a time**: while one is starting the big control reads
+"Connecting…" and pressing it, or Send, starts no second one. A conversation that fails to open,
+or that closes before the server has accepted it, leaves the message in the box, says it did not
+go, and sends it nowhere, not into the next call. On `vibe-talk-v1` the protocol does not
 say whether a server greets a client that never opens an audio segment, so a typed call does not
 wait for a greeting; on a server that does greet, the greeting's `turn_complete` is taken as the
 first message's. The transcript is still right, because rows are kept per turn number, and a

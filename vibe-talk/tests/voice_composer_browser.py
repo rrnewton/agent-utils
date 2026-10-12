@@ -390,6 +390,10 @@ def walk(chromium: BrowserType, args: argparse.Namespace, url: str, api: FakeApi
             page.wait_for_function("() => document.getElementById('status-line').dataset.state === 'live'",
                                    timeout=10_000)
             check(voice.prompts(0) == [], f"{label}: a prompt went before the session started")
+            # Still the reader's until it is on the wire: a bridge that never starts its session
+            # must leave the message where it was written.
+            check(page.input_value("#compose-text") == "what landed overnight",
+                  f"{label}: the message left the box before the session started")
             voice.send(0, {"type": "session_started", "greeting": False})
             until(page, lambda: voice.prompts(0) == ["what landed overnight"], "the held message to go as a prompt")
             voice.send(0, {"type": "transcript", "role": "assistant", "turn": 1, "text": "Two merges and a revert."})
