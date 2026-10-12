@@ -40,7 +40,7 @@ When `--tool` is omitted, the harness checks `dagrun`.
 | `cpuset-alloc` | CLI surface, version, durable-ledger status and reclaim JSON, malformed and boundary arguments, reservation behavior, mutation self-test verdicts, and hard-pin fail-closed behavior. |
 | `tick-hub` | Strict JSON/YAML config loading, canonical emission, cadence state, reminder gates, freshness output, flush transitions, CLI failures, numeric boundaries, malformed documents, and randomized tick configurations. |
 | `pr-landing-planner` | Fixture collection, graphs, clusters, status and plan output in every format, exact-head/base validation, approval and gate safety decisions, ordering/conflict groups, malformed evidence, numeric boundaries, and randomized PR graphs. |
-| `herdr-run` | Both editions invoked directly: the Python package under the real interpreter and the Rust binary. Output bytes (decoded losslessly, so a byte that is not UTF-8 is still compared) for every help screen, `--version`, `quickstart`, `userguide`, and the `--dump-surface` JSON, which must also equal the promised subcommand and option surface; the YAML-subset configuration loader with every configuration message, including each document in the shared YAML corpus, raw YAML 1.1 line breaks, and names holding invisible characters; discovery and explicit paths; allow/deny policy, inert rendering, and refusal quoting, including `~` expanded from a hostile `HOME` before the policy judges it; the `--timeout`/`--wait-ready` grammar; agent inference with Unicode white space; bytes that are not UTF-8 in argv, the environment, and directory names; six locales; closed, full, and broken stdout, SIGINT mid-write (default and ignored), and a file-size limit; OS error text; dry runs, audit JSONL, spool modes, and the un-ignored spool warning; paths and names holding terminal controls or invisible characters, which must never reach the terminal raw; what each edition hands a process it starts (environment, descriptors, and signal dispositions, recorded by a stand-in `git`), and a started process whose descendant holds its output past the bound; `net-doctor` refusals; `reap` over planted, malformed, too-deep, and too-large records, and run directories ordered by raw bytes; and a deleted working directory. Live Herdr protocol, readiness, session-cache, run-record, admission, and text-rule behaviour is pinned by the golden corpora in `rs/herdr-run/testdata/`, which both editions' unit tests load, because production deliberately ignores caller-controlled executable paths. `common/bin/herdr-run` is a smoke test only; see "herdr-run and its launcher" below. |
+| `herdr-run` | Both editions invoked directly: the Python package under the real interpreter and the Rust binary. Output bytes (decoded losslessly, so a byte that is not UTF-8 is still compared) for every help screen, `--version`, `quickstart`, `userguide`, and the `--dump-surface` JSON, which must also equal the promised subcommand and option surface; the YAML-subset configuration loader with every configuration message, including each document in the shared YAML corpus, raw YAML 1.1 line breaks, flow forms that YAML readers disagree on, and names holding invisible characters (format characters, default-ignorable code points, and blanks); discovery and explicit paths; allow/deny policy, inert rendering, and refusal quoting, including `~` expanded from a hostile `HOME` before the policy judges it, abbreviated long options, `--exec`, `git clone -u`, subcommand-scoped options, and global options that take the next argument; the `--timeout`/`--wait-ready` grammar; agent inference with Unicode white space; bytes that are not UTF-8 in argv, the environment, and directory names; six locales; closed, full, and broken stdout (with and without `PYTHONUNBUFFERED`), a broken stderr, SIGINT mid-write (default and ignored), and a file-size limit; an argument that reads like the interpreter's `-X utf8=0`; OS error text; dry runs, audit JSONL, spool modes, and the un-ignored spool warning; paths and names holding terminal controls or invisible characters, which must never reach the terminal raw, in messages or in JSON; what each edition hands a process it starts (environment, descriptors, and signal dispositions, recorded by a stand-in `git`, including a caller's ignored `SIGCHLD`), a stand-in with no `#!` line, which neither edition may run through `/bin/sh`, and a started process whose descendant holds its output past the bound; `net-doctor` refusals; `reap` over planted, malformed, too-deep, and too-large records, and run directories ordered by raw bytes; a deleted working directory; and an end-to-end group (`e2e/*`) against a fake Herdr, described in "herdr-run end to end" below. The golden corpora in `rs/herdr-run/testdata/`, which both editions' unit tests load, additionally pin each protocol call, readiness rule, record format, admission, and text rule. `common/bin/herdr-run` is a smoke test only; see "herdr-run and its launcher" below. |
 | `herdr-agent` | CLI bootstrap, installed guide, exact pane and stable-session targeting, identity assertions, status/read behavior, literal multiline submission, native readiness transitions, durable FIFO state, pending versus possibly-submitted outcomes, malformed-head quarantine, and fail-closed target contradictions. Each package talks through its production client to an isolated executable Herdr protocol fixture. |
 
 ### herdr-run and its launcher
@@ -69,6 +69,53 @@ in place and are not herdr-run divergences:
 - Each engine starts behind a different number of shells, so bash's own
   warnings (about a deleted working directory, for example) can appear a
   different number of times.
+
+The herdr-run harness removes interpreter settings a developer's shell may
+carry (`PYTHONUNBUFFERED`, `PYTHONIOENCODING`, `PYTHONUTF8`, `PYTHONWARNINGS`,
+and the like) before it starts either edition, so the Python edition runs as an
+ordinary caller starts it; a case about one of them sets it explicitly. With
+`PYTHONUNBUFFERED` inherited, a failed buffered write had looked identical in
+both editions while the default buffered interpreter exited 120.
+
+### herdr-run end to end
+
+Both editions find Herdr only in fixed places under the account home that the
+account database reports, never through `PATH` or `HOME`, and neither has an
+option naming an executable. That is production behaviour, and the end-to-end
+group keeps it: it changes the account database's answer instead.
+`cross/herdr_e2e/account_home_shim.c` is compiled with the system C compiler
+(`cc`, `gcc`, or `clang`) at test time and preloaded (`LD_PRELOAD`) into both
+editions; it makes `getpwuid_r` and `getpwuid` report a temporary directory as
+the current account's home. `cross/herdr_e2e/fake_herdr.py` is installed there as
+`.local/bin/herdr`, with a stand-in `sleep` process as each pane's shell, so
+`/proc` evidence is real. Each edition then runs its production client against
+its own copy of the fake, and the harness compares every step's exit status and
+output, every argument vector the fake was called with, and every file left in
+the project and the account's state directory (with mode), byte for byte after
+normalizing roots, run IDs, times, process IDs, stand-in shells (named by pane),
+start ticks, and the durations each edition measures itself. Cases cover runs
+(exit statuses, a signal, bytes that are not UTF-8, `--cwd`, refusals, a timeout),
+`target`, `status`, the session cache (reuse, and caches that are corrupt,
+stale, hostile, or nested too deep), `reap` verdicts over live panes (SHELL_ALIVE,
+STALE, GONE, IN_FLIGHT, OUT_OF_SCOPE), `net-doctor` against a local and a missing
+repository, the pane cap evicting the least recently used idle tab and refusing
+when every tab is busy, busy and half-typed panes, every Herdr call failing with
+a hostile message, replies that are not what they claim (including a lone
+surrogate under a duplicate key), a Herdr with no `#!` line, a caller that
+ignores `SIGCHLD`, and retention. A case also pins what its key step must say,
+so two editions failing the same way cannot pass it.
+
+The shim is also a guard. It refuses (`EPERM`) to start any program named
+`systemd-run`, and any `herdr` outside the temporary account home, and logs what
+it refused; a case fails if anything was refused, and no case asks for a server
+to be started. Before any case runs, the harness proves that each edition reads
+the temporary account home (`~` with `HOME` unset is expanded from the account
+database, and `check` contacts no Herdr) and that the guard refuses a decoy named
+`systemd-run`; if either fails, no case runs and the group fails. The group is
+skipped, as a listed and required skip, only when no C compiler exists
+(`c-compiler`) or when a Herdr is installed in `/usr/local/bin` or `/usr/bin`,
+which herdr-run would find before the account home (`system-herdr`). A compiler
+that exists but cannot build the shim is a failure.
 
 Machine-oriented output is compared byte for byte where it is specified as
 canonical. YAML emitters and other intentionally idiomatic text are parsed or
@@ -192,6 +239,8 @@ cross[dagrun]: SKIPPED/UNVERIFIED 4 check(s), not counted as passes:
 | `hard-cpuset` | both engines refused a HARD cpuset pin on this host |
 | `multi-cpu` | fewer than two usable CPUs: one in the CPU affinity mask, or a cgroup CPU quota below two cores |
 | `eight-cpu` | a core budget below eight CPUs (the tighter of the CPU affinity mask and any cgroup CPU quota), so the CPA planner's memory cap cannot be shown to bind |
+| `c-compiler` | no C compiler (`cc`, `gcc`, or `clang`) to build the account-home shim the herdr-run end-to-end group preloads |
+| `system-herdr` | a Herdr installed in `/usr/local/bin` or `/usr/bin`, which herdr-run would find before the fake one in the temporary account home |
 
 By default a run claims full coverage, so any skip makes it exit nonzero with an
 `INCOMPLETE` line. A lane that is partial by design declares which kinds it

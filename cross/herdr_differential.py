@@ -18,12 +18,14 @@ tool, and its own behaviour (see ``cross/README.md``) is not herdr-run's.
 Output is compared as BYTES: both streams are decoded with ``surrogateescape``, so a byte that is
 not UTF-8 survives the comparison instead of being replaced by U+FFFD in both editions alike.
 
-Real pane execution is deliberately absent.  Both implementations resolve ``herdr`` only from
-trusted installation locations and ignore caller-controlled ``PATH``.  There is consequently no
-safe black-box way to inject a fake server without either weakening that production contract or
-overwriting a user's real installation.  The Herdr protocol, readiness, the session cache, and run
-records are instead pinned by the golden corpora under ``rs/herdr-run/testdata/``, which both
-editions' unit tests load.  The report calls this out explicitly.
+Both implementations resolve ``herdr`` only from trusted installation locations under the account
+home the account database reports, and ignore caller-controlled ``PATH`` and ``HOME``. The
+end-to-end group keeps that contract and changes the database's answer instead: a shim compiled
+here at test time and preloaded into both editions reports a temporary directory as the account
+home, a fake Herdr (``herdr_e2e/fake_herdr.py``) is installed under it, and both production
+clients run against it. The shim also refuses to start ``systemd-run`` or any other Herdr. The
+golden corpora under ``rs/herdr-run/testdata/``, which both editions' unit tests load, still pin
+each protocol call, readiness rule, and record format on their own.
 
 Only values which are intrinsically different between two processes are normalized: temporary
 roots, run IDs, timestamps, process IDs, and measured durations.  Policy text, quoting, exit codes,
@@ -77,6 +79,41 @@ _LAUNCHER_LINE = re.compile(r"^\[herdr-run\] [^\n]*\n", re.MULTILINE)
 #: session name cannot leak into a case that is about something else.
 _AGENT_VARIABLES = ("HERDR_RUN_AGENT", "DG_AGENT_NAME", "ORC_AGENT_NAME")
 
+#: Interpreter settings a developer's shell may carry that change how the Python edition behaves,
+#: not what it does: ``PYTHONUNBUFFERED`` once hid a failed-write divergence that only showed with
+#: it unset. Removed so every comparison runs the interpreter as an ordinary caller starts it; a
+#: case that is about one of them sets it explicitly.
+_INTERPRETER_VARIABLES = (
+    "PYTHONUNBUFFERED",
+    "PYTHONIOENCODING",
+    "PYTHONUTF8",
+    "PYTHONWARNINGS",
+    "PYTHONDEVMODE",
+    "PYTHONFAULTHANDLER",
+    "PYTHONINSPECT",
+    "PYTHONVERBOSE",
+    "PYTHONDEBUG",
+    "PYTHONOPTIMIZE",
+    "PYTHONMALLOC",
+    "PYTHONHASHSEED",
+    "PYTHONSAFEPATH",
+    "PYTHONSTARTUP",
+    "PYTHONBREAKPOINT",
+)
+
+
+#: Why a herdr-run check can be skipped instead of executed. ``cross/differential.py`` registers
+#: the same kinds, so a lane can allow one with ``--allow-skip``; without that a skip fails the run.
+SKIP_KINDS: dict[str, str] = {
+    "c-compiler": (
+        "needs a C compiler to build the account-home shim the herdr-run end-to-end group preloads"
+    ),
+    "system-herdr": (
+        "needs no Herdr installed in /usr/local/bin or /usr/bin, which herdr-run would find before "
+        "the fake one in the account home"
+    ),
+}
+
 
 @dataclass(frozen=True)
 class Outcome:
@@ -94,6 +131,14 @@ class Report:
     checks: int = 0
     failures: list[str] = field(default_factory=list)
     notes: list[str] = field(default_factory=list)
+    #: Checks that did NOT run, as ``(label, kind, reason)``. Never a pass; see ``SKIP_KINDS``.
+    skipped: list[tuple[str, str, str]] = field(default_factory=list)
+
+    def skip(self, label: str, kind: str, reason: str) -> None:
+        """Record a check that did not run. It is not counted in ``checks``."""
+        if kind not in SKIP_KINDS:
+            raise ValueError(f"unknown skip kind {kind!r}; expected one of {sorted(SKIP_KINDS)}")
+        self.skipped.append((label, kind, reason))
 
     def require(self, label: str, condition: bool, detail: str) -> None:
         self.checks += 1
@@ -253,7 +298,7 @@ def _prepare_command(command: Sequence[str]) -> tuple[str, ...]:
 
 def _environment(home: Path, extra: Mapping[str, str | None] | None) -> dict[str, str]:
     environment = dict(os.environ)
-    for key in _AGENT_VARIABLES:
+    for key in (*_AGENT_VARIABLES, *_INTERPRETER_VARIABLES):
         environment.pop(key, None)
     original_home = environment.get("HOME")
     existing_pythonpath = environment.get("PYTHONPATH", "")
@@ -356,7 +401,41 @@ def _run(
             os.close(writer)
     if mode == "sigint-while-writing":
         return _run_interrupted(argv, cwd, environment)
+    if mode == "broken-stderr":
+        return _run_broken_stderr(argv, cwd, environment)
+    if mode == "sigchld-ignored":
+        return _run_captured(argv, cwd, environment, preexec=_ignore_sigchld)
     raise ValueError(f"unknown invocation mode {mode}")
+
+
+def _ignore_sigchld() -> None:
+    """Start a process with SIGCHLD ignored, which a caller can hand down across ``exec``."""
+    signal.signal(signal.SIGCHLD, signal.SIG_IGN)
+
+
+def _run_broken_stderr(argv: Sequence[str], cwd: Path, environment: Mapping[str, str]) -> Outcome:
+    """Run with stderr on a pipe nobody reads; only the exit status and stdout are observed."""
+    reader, writer = os.pipe()
+    os.close(reader)
+    try:
+        completed = subprocess.run(
+            list(argv),
+            cwd=cwd,
+            env=dict(environment),
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=writer,
+            check=False,
+            start_new_session=True,
+            timeout=TIMEOUT_SECONDS,
+        )
+    except subprocess.TimeoutExpired as error:
+        return Outcome(124, _decode_output(error.stdout), "TIMEOUT\n")
+    except OSError as error:
+        return Outcome(127, "", f"could not invoke implementation: {error}\n")
+    finally:
+        os.close(writer)
+    return Outcome(completed.returncode, _decode_output(completed.stdout), "")
 
 
 def _ignore_sigint() -> None:
@@ -625,6 +704,7 @@ _CONFIG_KEYS: tuple[str, ...] = (
     "deny_anywhere",
     "deny_global",
     "deny_subcommand",
+    "deny_subcommand_option",
     "max_panes",
     "prefixes",
     "probe_remote",
@@ -966,6 +1046,15 @@ def _policy(harness: Harness, report: Report) -> None:
         # An empty subcommand is still a subcommand: allowed unless a list names it.
         ("git-empty-subcommand", "git ''"),
         ("gh-empty-subcommand", "gh '' x"),
+        # The scoped `-u` and `-x` stay usable where they name nothing, and the abbreviation rule
+        # never reaches a different full option.
+        ("push-u", "git push -u origin main"),
+        ("add-u", "git add -u"),
+        ("cherry-pick-x", "git cherry-pick -x abc123"),
+        ("rebase-strategy-option", "git rebase -X theirs main"),
+        ("clone-without-u", "git clone --depth 1 https://example.invalid/r"),
+        ("longer-option-is-not-an-abbreviation", "git fetch --upload-packs x origin"),
+        ("attr-source-log", "git --attr-source HEAD log -1"),
     )
     for label, command in allowed:
         case = harness.case(f"policy-allow-{label}")
@@ -1025,6 +1114,27 @@ def _policy(harness: Harness, report: Report) -> None:
         ("cargo-build", "cargo build --release"),
         ("cargo-unknown", "cargo something-new"),
         ("cargo-config", "cargo --config build.rustc-wrapper=/tmp/evil fetch"),
+        # Every way to name the program git runs, including the abbreviations git accepts.
+        ("upload-pack-abbreviated", "git ls-remote --upload-pac=/tmp/evil origin"),
+        ("upload-pack-abbreviated-spaced", "git fetch --upload-p /tmp/evil origin"),
+        ("upload-pack-shortest-abbreviation", "git fetch --u /tmp/evil origin"),
+        ("receive-pack-abbreviated", "git push --receive-pac=/tmp/evil origin"),
+        ("push-exec", "git push --exec=/tmp/evil origin main"),
+        ("push-exec-abbreviated", "git push --exe=/tmp/evil origin main"),
+        ("ls-remote-exec", "git ls-remote --exec=/tmp/evil origin"),
+        ("archive-remote-exec", "git archive --remote=repo --exec=/tmp/evil HEAD"),
+        ("clone-u", "git clone -u /tmp/evil https://example.invalid/r"),
+        ("clone-u-attached", "git clone -u/tmp/evil https://example.invalid/r"),
+        ("clone-u-clustered", "git clone -qu/tmp/evil https://example.invalid/r"),
+        ("clone-u-after-globals", "git -C /tmp clone -u /tmp/evil repo"),
+        ("rebase-x", "git rebase -x 'make test' main"),
+        ("rebase-exec", "git rebase --exec 'make test' main"),
+        ("difftool-extcmd-abbreviated", "git difftool --extc=/tmp/evil HEAD"),
+        # A global option that takes the next argument must not hide the subcommand behind it.
+        ("attr-source-daemon", "git --attr-source HEAD daemon --export-all"),
+        ("attr-source-attached-daemon", "git --attr-source=HEAD daemon --export-all"),
+        ("shallow-file-daemon", "git --shallow-file x daemon"),
+        ("super-prefix-instaweb", "git --super-prefix x/ instaweb"),
     )
     for label, command in refused:
         case = harness.case(f"policy-refuse-{label}")
@@ -1118,6 +1228,39 @@ def _policy(harness: Harness, report: Report) -> None:
     case = harness.case("policy-custom-narrowed", narrowed)
     python, rust = harness.invoke(case, ("check", "gh pr list"))
     report.exact("policy/custom-narrowed", python, rust, expected_rc=77)
+
+    # A deny entry ending in an invisible character used to be accepted, and then never matched:
+    # `git -c core.pager=evil log` was ALLOWED. The configuration is refused instead.
+    for label, entry in (
+        ("combining-grapheme-joiner", "-c\u034f"),
+        ("variation-selector", "-c\ufe0f"),
+        ("hangul-filler", "-c\u3164"),
+        ("braille-blank", "-c\u2800"),
+        ("supplementary-variation-selector", "-c\U000e0100"),
+        ("unassigned-tag-block", "-c\U000e0080"),
+    ):
+        case = harness.case(
+            f"policy-invisible-deny-{label}",
+            {".herdr-run.yaml": f"allow: [git]\ndeny_global:\n  git: [{entry}, --exec-path]\n"},
+        )
+        python, rust = harness.invoke(case, ("check", "git -c core.pager=evil log"))
+        report.exact(f"policy/invisible-deny/{label}", python, rust, expected_rc=78)
+
+    # A project's own option scoped to one subcommand, matched with the same abbreviation rule.
+    scoped = {
+        ".herdr-run.yaml": "allow: [gh]\nprefixes: []\n"
+        "deny_subcommand_option:\n  gh:\n    pr: [--web]\n"
+    }
+    for label, command, expected in (
+        ("denied", "gh pr view 3 --web", 77),
+        ("abbreviated", "gh pr view 3 --we", 77),
+        ("other-subcommand", "gh issue view 3 --web", 0),
+    ):
+        case = harness.case(f"policy-subcommand-option-{label}", scoped)
+        python, rust = harness.invoke(case, ("check", command))
+        report.exact(f"policy/subcommand-option/{label}", python, rust, expected_rc=expected)
+        python, rust = harness.invoke(case, ("--json", "check", command))
+        report.exact(f"policy/subcommand-option-json/{label}", python, rust, expected_rc=expected)
 
     # `~` is expanded before the policy judges an argument, so HOME cannot smuggle an option, a
     # subcommand, or a program past it. Each refused case here was ALLOWED, and then executed as
@@ -1490,6 +1633,30 @@ def _config_malformed(harness: Harness, report: Report) -> None:
         ("format-character", 'workspace: "a\\u202eb"\n'),
         ("word-joiner-in-tab-name", 'tab_name: "{agent}\\u2060"\n'),
         ("ideographic-space-in-deny-subcommand-key", 'deny_subcommand:\n  "git\\u3000": [daemon]\n'),
+        # Default-ignorable code points and blank characters are invisible too: a deny entry
+        # ending in a combining grapheme joiner never matched the `-c` it appeared to deny.
+        (
+            "combining-grapheme-joiner-in-deny",
+            "allow: [git]\ndeny_global:\n  git: [-c\u034f, --exec-path]\n",
+        ),
+        ("hangul-filler-in-allow", 'allow: [git, "\\u3164"]\n'),
+        ("halfwidth-hangul-filler-in-workspace", 'workspace: "a\\uffa0"\n'),
+        ("hangul-choseong-filler-in-deny-subcommand", 'deny_subcommand:\n  git: ["daemon\\u115f"]\n'),
+        ("khmer-inherent-vowel-in-tab-name", 'tab_name: "{agent}\\u17b4"\n'),
+        ("mongolian-variation-selector-in-key", 'allow_subcommand:\n  "git\\u180b": [status]\n'),
+        ("variation-selector-in-deny-anywhere", 'deny_anywhere: ["--exec\\ufe0f"]\n'),
+        ("supplementary-variation-selector", 'value_options:\n  git: ["-C\\U000e0100"]\n'),
+        ("unassigned-default-ignorable", 'shells: ["bash\\U000e0080"]\n'),
+        ("braille-blank-in-prefixes", 'prefixes: ["with-proxy\\u2800"]\n'),
+        (
+            "invisible-in-deny-subcommand-option",
+            'deny_subcommand_option:\n  git:\n    clone: ["-u\\u2065"]\n',
+        ),
+        ("deny-subcommand-option-not-an-object", "deny_subcommand_option:\n  git: [-u]\n"),
+        # Flow forms that YAML readers read differently are refused rather than read one way.
+        ("question-mark-in-flow-mapping", "allow: [git]\ndeny_subcommand: {?git: [log]}\n"),
+        ("question-mark-in-flow-sequence", "allow: [?git]\n"),
+        ("colon-starting-a-flow-line", "{workspace\n :elsewhere}\n"),
         ("not-utf8", b"workspace: caf\xe9\n"),
         ("not-utf8-in-comment", b"# \xff\nworkspace: x\n"),
         ("nul-byte", b"workspace: a\x00b\n"),
@@ -1702,6 +1869,11 @@ def _locales(harness: Harness, report: Report) -> None:
             ("utf8-refusal", ("check", "curl \u65e5\u672c")),
             ("help", ("--help",)),
             ("quickstart", ("quickstart",)),
+            # An argument that reads like the interpreter's own `-X utf8=0` is not one: it must
+            # not keep the Python edition in the locale's encoding, where the byte below would
+            # read as a letter instead of being refused.
+            ("utf8-option-lookalike", ("--agent", "\udce9", "run", "--dry-run", "--", "-Xutf8=0")),
+            ("utf8-option-lookalike-split", ("--agent", "\udce9", "check", "-X", "utf8=0")),
         ):
             python, rust = harness.invoke(case, args, extra_env=environment)
             report.same(
@@ -1733,6 +1905,20 @@ def _output_failures(harness: Harness, report: Report) -> None:
         for label, args in commands:
             python, rust = harness.invoke(case, args, mode=mode)
             report.same(f"output/{mode}/{label}", python, rust, allowed=allowed)
+            # The interpreter's buffering setting must not change the outcome either: a buffered
+            # write that failed used to be retried at shutdown, which printed `Exception ignored`
+            # and exited 120 unless PYTHONUNBUFFERED was set.
+            if mode != "closed-stdout":
+                python, rust = harness.invoke(
+                    case, args, mode=mode, extra_env={"PYTHONUNBUFFERED": "1"}
+                )
+                report.same(f"output/{mode}/{label}/unbuffered", python, rust, allowed=allowed)
+    # A stderr that cannot be written is ignored, and must leave nothing behind for shutdown.
+    for label, args in (("refusal", ("check", "curl x")), ("usage-error", ("--frobnicate",))):
+        python, rust = harness.invoke(case, args, mode="broken-stderr")
+        report.exact(
+            f"output/broken-stderr/{label}", python, rust, expected_rc=77 if label == "refusal" else 2
+        )
     python, rust = harness.invoke(case, ("--version",), mode="dev-full")
     report.require(
         "output/dev-full-names-the-failure",
@@ -1854,6 +2040,22 @@ def _spool(harness: Harness, report: Report) -> None:
             "is NOT git-ignored" in python.stderr,
             f"an un-ignored spool in a git work tree was not reported: {_describe(python)}",
         )
+
+    # Started with SIGCHLD ignored, every child is reaped by the kernel and its status lost: one
+    # edition read `git check-ignore`'s "not ignored" as status 0 ("ignored") and stayed silent.
+    case = harness.case("spool-tracked-sigchld-ignored", setup=work_tree)
+    python, rust = harness.invoke(
+        case,
+        ("--agent", "a", "run", "--dry-run", "git status"),
+        extra_env={"GIT_CONFIG_NOSYSTEM": "1"},
+        mode="sigchld-ignored",
+    )
+    report.exact("spool/tracked-warning/sigchld-ignored", python, rust, expected_rc=0)
+    report.require(
+        "spool/tracked-warning/sigchld-ignored/present",
+        "is NOT git-ignored" in python.stderr,
+        f"an inherited ignored SIGCHLD hid the un-ignored spool: {_describe(python)}",
+    )
 
 
 def _net_doctor(harness: Harness, report: Report) -> None:
@@ -2438,6 +2640,51 @@ exit 1
 """
 
 
+#: A stand-in ``git`` with no ``#!`` line, which the kernel refuses to execute (ENOEXEC). The C
+#: library's ``execvp`` would run it with ``/bin/sh`` instead; neither edition may.
+_NO_SHEBANG_GIT = """touch "$HERDR_PROBE_DUMP"
+exit 1
+"""
+
+
+def _exec_format(harness: Harness, report: Report) -> None:
+    """A file the kernel cannot execute is an error in both editions, never a shell script.
+
+    ``git check-ignore`` is the process a dry run starts. Before, the native edition's children
+    were started through ``execvp``, which retried a script without ``#!`` under ``/bin/sh``: the
+    stand-in ran, said "not ignored", and only that edition warned about the spool.
+    """
+    git = shutil.which("git")
+    if git is None:
+        report.notes.append("exec-format: not compared, git is not installed")
+        return
+    stand_in = _fake_bin(harness, "no-shebang-bin", _NO_SHEBANG_GIT)
+    path = f"{stand_in}{os.pathsep}{os.environ.get('PATH', '/usr/bin:/bin')}"
+
+    def work_tree(root: Path) -> None:
+        subprocess.run(
+            [git, "init", "-q", str(root)],
+            check=True,
+            capture_output=True,
+            env={**os.environ, "HOME": str(root / ".home"), "GIT_CONFIG_NOSYSTEM": "1"},
+        )
+
+    case = harness.case("exec-format", {".herdr-run.yaml": "allow: [git]\n"}, setup=work_tree)
+    python, rust = harness.invoke(
+        case,
+        ("--agent", "a", "run", "--dry-run", "git status"),
+        extra_env={"PATH": path, "HERDR_PROBE_DUMP": "<ROOT>/ran.txt"},
+    )
+    report.exact("exec-format/check-ignore", python, rust, expected_rc=0)
+    report.require(
+        "exec-format/never-run-by-a-shell",
+        not (case.python_root / "ran.txt").exists() and not (case.rust_root / "ran.txt").exists(),
+        "a stand-in without #! was executed: "
+        f"python={(case.python_root / 'ran.txt').exists()} "
+        f"rust={(case.rust_root / 'ran.txt').exists()}",
+    )
+
+
 def _fake_bin(harness: Harness, name: str, script: str) -> Path:
     directory = harness.root / name
     directory.mkdir(exist_ok=True)
@@ -2528,6 +2775,46 @@ def _child_processes(harness: Harness, report: Report) -> None:
                 mask is not None and int(mask.group(1), 16) & (1 << (signal.SIGINT - 1)) != 0,
                 f"a SIGINT the caller ignored must stay ignored: {python_probe.stdout!r}",
             )
+
+
+def _sigchld_handed_over(harness: Harness, report: Report) -> None:
+    """A caller's ignored SIGCHLD is reset before either edition starts a process.
+
+    The shell stand-in above cannot show it: a shell installs its own SIGCHLD handler as it
+    starts. This stand-in is the Python interpreter, which leaves SIGCHLD as it found it, and it
+    records the disposition it was handed before anything else runs.
+    """
+    directory = harness.root / "sigchld-bin"
+    directory.mkdir(exist_ok=True)
+    git = directory / "git"
+    git.write_text(
+        f"#!{sys.executable} -IS\n"
+        "import os\n"
+        "status = open('/proc/self/status', encoding='utf-8').read().splitlines()\n"
+        "line = next(item for item in status if item.startswith('SigIgn:'))\n"
+        "open(os.environ['HERDR_PROBE_DUMP'], 'w', encoding='utf-8').write(line + '\\n')\n"
+        "raise SystemExit(1)\n",
+        encoding="utf-8",
+    )
+    git.chmod(0o755)
+    path = f"{directory}{os.pathsep}{os.environ.get('PATH', '/usr/bin:/bin')}"
+    case = harness.case("sigchld-handed-over", {".herdr-run.yaml": "allow: [git]\n"})
+    python, rust = harness.invoke(
+        case,
+        ("--agent", "a", "run", "--dry-run", "git status"),
+        extra_env={"PATH": path, "HERDR_PROBE_DUMP": "<ROOT>/probe.txt"},
+        mode="sigchld-ignored",
+    )
+    report.exact("child/sigchld-ignored", python, rust, expected_rc=0)
+    python_probe = _read_normalized(case.python_root / "probe.txt", case.python_root)
+    rust_probe = _read_normalized(case.rust_root / "probe.txt", case.rust_root)
+    report.exact("child/sigchld-ignored/handed-over", python_probe, rust_probe, expected_rc=0)
+    mask = re.search(r"SigIgn:\s*([0-9a-f]+)", python_probe.stdout)
+    report.require(
+        "child/sigchld-ignored/reset",
+        mask is not None and int(mask.group(1), 16) & (1 << (signal.SIGCHLD - 1)) == 0,
+        f"an inherited ignored SIGCHLD must be reset before a child starts: {python_probe.stdout!r}",
+    )
 
 
 def _held_pipe(harness: Harness, report: Report) -> None:
@@ -2626,6 +2913,893 @@ def _unsafe_paths(harness: Harness, report: Report) -> None:
         )
 
 
+#: Characters JSON output must escape although JSON itself does not require it: a C1 control
+#: (CSI), a bidirectional override, a line separator, a zero-width space, and a variation selector.
+_JSON_UNSAFE_NAME = "p\u009b2Jq\u202er\u2028s\u200bt\ufe0fu"
+
+
+def _unsafe_json(harness: Harness, report: Report) -> None:
+    """JSON output escapes what a terminal acts on or a reader cannot see, as ``\\uXXXX``.
+
+    ``config`` printed the project path raw, so a directory named with U+009B or U+202E reached
+    the terminal through it. Every JSON document both editions print or store escapes DEL, the C1
+    controls, and every invisible character; a JSON reader still gets the same strings back.
+    """
+
+    def setup(root: Path) -> None:
+        project = root / _JSON_UNSAFE_NAME
+        project.mkdir()
+        (project / ".herdr-run.yaml").write_text(
+            "allow: [printf]\nprefixes: []\nspool_dir: .spool\n", encoding="utf-8"
+        )
+
+    case = harness.case("unsafe-json", setup=setup)
+    raw = ("\u009b", "\u202e", "\u2028", "\u200b", "\ufe0f")
+    for label, args in (
+        ("config", ("--agent", "a", "config")),
+        ("check-json", ("--json", "check", "printf '\u202e\u200b'")),
+        ("dry-run-json", ("--json", "--agent", "a", "run", "--dry-run", "printf '\u2028'")),
+    ):
+        python, rust = harness.invoke(case, args, cwd=_JSON_UNSAFE_NAME)
+        report.exact(f"unsafe-json/{label}", python, rust, expected_rc=0)
+        report.require(
+            f"unsafe-json/{label}/nothing-raw",
+            not any(character in python.stdout + python.stderr for character in raw),
+            f"an unsafe character reached the terminal raw through JSON: {_describe(python)}",
+        )
+        try:
+            json.loads(python.stdout)
+        except json.JSONDecodeError as error:
+            report.require(f"unsafe-json/{label}/is-json", False, f"{error}: {_describe(python)}")
+    python_audit = _read_normalized(
+        case.python_root / _JSON_UNSAFE_NAME / ".spool" / "audit.jsonl", case.python_root
+    )
+    rust_audit = _read_normalized(
+        case.rust_root / _JSON_UNSAFE_NAME / ".spool" / "audit.jsonl", case.rust_root
+    )
+    report.exact("unsafe-json/audit", python_audit, rust_audit, expected_rc=0)
+    report.require(
+        "unsafe-json/audit/nothing-raw",
+        python_audit.stdout != "(absent)\n"
+        and not any(character in python_audit.stdout for character in raw),
+        f"the audit log holds an unsafe character raw: {python_audit.stdout!r}",
+    )
+
+
+# --- end to end, against a fake Herdr -----------------------------------------------------------
+#
+# Both editions find Herdr only in fixed places under the account home the account database
+# reports; neither reads PATH or HOME for it, and neither has an option naming an executable. That
+# is production behaviour and stays so. The group below changes the one input that decides it
+# instead: a shim built here at test time and preloaded into both editions makes getpwuid_r report
+# a temporary directory as the account home, and a fake Herdr (``herdr_e2e/fake_herdr.py``) is
+# installed under it. Each edition then runs its production client -- resolution, the session
+# cache, readiness, the spool, eviction, reap -- against the same fake, and the two are compared
+# step by step, call by call, and file by file. The shim also refuses to start ``systemd-run`` or
+# any ``herdr`` outside that home, and logs what it refused; a case fails if anything was refused.
+
+_E2E_DIRECTORY = Path(__file__).resolve().parent / "herdr_e2e"
+_E2E_HOME_VARIABLE = "HERDR_RUN_E2E_ACCOUNT_HOME"
+_E2E_REFUSALS_VARIABLE = "HERDR_RUN_E2E_REFUSALS"
+#: Fixed places that precede the account home when herdr-run looks for Herdr.
+_E2E_SYSTEM_HERDR = ("/usr/local/bin/herdr", "/usr/bin/herdr")
+#: The prompt the fake panes show, and the shell configuration it is inferred from.
+_E2E_BASHRC = "PS1='\\u@\\h:\\w\\$ '\n"
+#: The fake reports a busy pane's foreground as its shell's PID plus this, so the number is never
+#: another pane's shell.
+_E2E_FOREGROUND_OFFSET = 2_000_000_000
+_E2E_TIMEOUT_SECONDS = 90
+
+_E2E_TICKS = re.compile(r'(?P<prefix>"shell_start_ticks"\s*:\s*)\d+')
+#: A process identity in a reap reason, ``(identity <boot id>:<start ticks>)``: the boot is the
+#: host's, the start ticks are the stand-in shell's and so differ between the two runs.
+_E2E_IDENTITY = re.compile(r"(?P<prefix>\(identity [0-9a-f-]+:)\d+")
+#: When a run happened (``last run 2026-10-12T08:55:41Z``).
+_E2E_ISO_TIME = re.compile(r"\b\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ\b")
+#: Durations each edition measured itself; the rest of each message is compared as written.
+_E2E_MEASURED = (
+    re.compile(r"(?P<prefix>\bexit -?\d+ in )\d+(?:\.\d+)?s"),
+    re.compile(r"(?P<prefix>\bis not ready after )\d+(?:\.\d+)?(?:e-?\d+)?s"),
+)
+
+
+@dataclass
+class _E2EEdition:
+    """One edition's side of one end-to-end case: its own account home and project."""
+
+    name: str
+    command: tuple[str, ...]
+    root: Path
+    shim: Path
+
+    @property
+    def account(self) -> Path:
+        return self.root / "account"
+
+    @property
+    def project(self) -> Path:
+        return self.root / "project"
+
+    @property
+    def state_directory(self) -> Path:
+        return self.account / "herdr-state"
+
+    @property
+    def refusals(self) -> Path:
+        return self.root / "refusals.log"
+
+    def state(self) -> dict[str, object]:
+        try:
+            loaded = json.loads((self.state_directory / "state.json").read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return {}
+        return cast(dict[str, object], loaded) if isinstance(loaded, dict) else {}
+
+    def behave(self, behaviour: Mapping[str, object]) -> None:
+        self.state_directory.mkdir(parents=True, exist_ok=True)
+        (self.state_directory / "behaviour.json").write_text(
+            json.dumps(behaviour), encoding="utf-8"
+        )
+
+    def environment(self) -> dict[str, str | None]:
+        return {
+            _E2E_HOME_VARIABLE: str(self.account),
+            _E2E_REFUSALS_VARIABLE: str(self.refusals),
+            "LD_PRELOAD": str(self.shim),
+        }
+
+    def herdr(self, *args: str) -> None:
+        """Call the fake as a person at the terminal would, e.g. to close a tab by hand."""
+        environment = {**os.environ, **cast(dict[str, str], self.environment())}
+        subprocess.run(
+            [str(self.account / ".local" / "bin" / "herdr"), *args],
+            env=environment,
+            capture_output=True,
+            check=False,
+            timeout=TIMEOUT_SECONDS,
+        )
+
+    def shells(self) -> dict[str, int]:
+        shells = self.state().get("shells", {})
+        return {str(k): int(v) for k, v in cast(dict[str, object], shells).items()}  # type: ignore[call-overload]
+
+    def kill_shell(self, pane: str) -> None:
+        pid = self.shells().get(pane)
+        if pid is not None:
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except OSError:
+                pass
+            _wait_until_gone(pid)
+
+    def end(self) -> None:
+        """End every process the fake started for this case."""
+        processes = self.state().get("processes", [])
+        for pid in cast(list[int], processes):
+            for target in (-int(pid), int(pid)):
+                try:
+                    os.kill(target, signal.SIGKILL)
+                except OSError:
+                    pass
+
+
+def _wait_until_gone(pid: int) -> None:
+    """Wait (briefly) until ``pid`` is no longer a running process; a zombie counts as gone."""
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        try:
+            stat_text = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
+        except OSError:
+            return
+        if stat_text.rsplit(") ", 1)[-1].startswith("Z"):
+            return
+        time.sleep(0.02)
+
+
+@dataclass(frozen=True)
+class _E2EStep:
+    """One step of a case: an invocation of herdr-run, or something done between invocations."""
+
+    args: tuple[str, ...] = ()
+    rc: int | None = None
+    action: Callable[[_E2EEdition], None] | None = None
+    mode: str = "capture"
+    label: str = ""
+
+
+def _run_step(*args: str, rc: int | None = None, mode: str = "capture") -> _E2EStep:
+    return _E2EStep(args=args, rc=rc, mode=mode)
+
+
+def _do(label: str, action: Callable[[_E2EEdition], None]) -> _E2EStep:
+    return _E2EStep(action=action, label=label)
+
+
+def _e2e_normalize(
+    text: str, edition: _E2EEdition, shells: Mapping[str, int] | None = None
+) -> str:
+    """Normalize what differs between two processes: roots, run IDs, times, and PIDs.
+
+    The fake's stand-in shells are named by their pane (``<SHELL:w1:p1>``), so a PID in a message
+    stays meaningful and the two editions' different numbers compare equal.
+    """
+    normalized = text
+    for pane, pid in (edition.shells() if shells is None else shells).items():
+        normalized = re.sub(rf"\b{pid + _E2E_FOREGROUND_OFFSET}\b", f"<FOREGROUND:{pane}>", normalized)
+        normalized = re.sub(rf"\b{pid}\b", f"<SHELL:{pane}>", normalized)
+    normalized = _normalize_text(normalized, edition.root)
+    normalized = _E2E_TICKS.sub(r"\g<prefix><TICKS>", normalized)
+    normalized = _E2E_IDENTITY.sub(r"\g<prefix><TICKS>", normalized)
+    normalized = _E2E_ISO_TIME.sub("<ISO-TIME>", normalized)
+    for pattern in _E2E_MEASURED:
+        normalized = pattern.sub(r"\g<prefix><MEASURED>s", normalized)
+    return normalized
+
+
+def _e2e_tree(edition: _E2EEdition) -> Outcome:
+    """Every file and directory the case left, with its mode and (normalized) content."""
+    skipped = {
+        edition.account / ".local" / "bin" / "herdr",
+        edition.state_directory / "state.json",
+        edition.state_directory / "state.json.lock",
+        edition.state_directory / "behaviour.json",
+        edition.state_directory / "calls.jsonl",
+        edition.refusals,
+    }
+    shells = edition.shells()
+    lines: list[str] = []
+    for directory, subdirectories, files in os.walk(edition.root):
+        here = Path(directory)
+        # Not herdr-run's: Git's own repositories, and the probe remote the harness creates.
+        subdirectories[:] = sorted(
+            name for name in subdirectories if name != ".git" and here / name != edition.root / "remote"
+        )
+        for name in sorted(files):
+            path = here / name
+            # The account home holds what the harness put there and what herdr-run keeps under
+            # .local/state; anything else in it (a login shell's history, say) is the host's.
+            if path in skipped or (here == edition.account and name != ".bashrc"):
+                continue
+            try:
+                content = path.read_bytes().decode("utf-8", errors="surrogateescape")
+            except OSError as error:
+                content = f"<unreadable: {error.strerror}>"
+            mode = stat.S_IMODE(path.lstat().st_mode)
+            relative = _e2e_normalize(str(path.relative_to(edition.root)), edition, shells)
+            lines.append(f"{relative} {mode:04o}\n{_e2e_normalize(content, edition, shells)}\n")
+        for name in subdirectories:
+            path = here / name
+            mode = stat.S_IMODE(path.lstat().st_mode)
+            relative = _e2e_normalize(str(path.relative_to(edition.root)), edition, shells)
+            lines.append(f"{relative}/ {mode:04o}\n")
+    return Outcome(0, "".join(sorted(lines)), "")
+
+
+def _compile_account_home_shim(directory: Path) -> tuple[Path | None, str]:
+    """Build the shim with the system C compiler; return it, or ``None`` and why not."""
+    compiler = next(
+        (found for name in ("cc", "gcc", "clang") if (found := shutil.which(name)) is not None),
+        None,
+    )
+    if compiler is None:
+        return None, "no C compiler (cc, gcc, or clang) is on PATH"
+    target = directory / "account_home_shim.so"
+    try:
+        completed = subprocess.run(
+            [
+                compiler,
+                "-shared",
+                "-fPIC",
+                "-O2",
+                "-o",
+                str(target),
+                str(_E2E_DIRECTORY / "account_home_shim.c"),
+                "-ldl",
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=120,
+        )
+    except (OSError, subprocess.SubprocessError) as error:
+        return None, f"{compiler} could not be run: {error}"
+    if completed.returncode != 0:
+        # A compiler that exists but cannot build the shim is a failure, not a reason to skip.
+        raise RuntimeError(f"{compiler} failed to build the shim: {completed.stderr.strip()}")
+    return target, compiler
+
+
+class _EndToEnd:
+    """Run end-to-end cases for both editions and compare everything they observably did."""
+
+    def __init__(self, harness: Harness, report: Report, shim: Path) -> None:
+        self.harness = harness
+        self.report = report
+        self.shim = shim
+        self.serial = 0
+
+    def _edition(self, name: str, command: tuple[str, ...], case_root: Path) -> _E2EEdition:
+        edition = _E2EEdition(name, command, case_root / name, self.shim)
+        bin_directory = edition.account / ".local" / "bin"
+        bin_directory.mkdir(parents=True)
+        herdr = bin_directory / "herdr"
+        source = (_E2E_DIRECTORY / "fake_herdr.py").read_text(encoding="utf-8")
+        herdr.write_text(f"#!{sys.executable} -I\n{source}", encoding="utf-8")
+        herdr.chmod(0o755)
+        (edition.account / ".bashrc").write_text(_E2E_BASHRC, encoding="utf-8")
+        edition.project.mkdir(parents=True)
+        return edition
+
+    def shim_is_active(self) -> bool:
+        """Prove, before any case, that each edition reads the fake account home and nothing else.
+
+        ``~`` with ``HOME`` unset is expanded from the account database, which is exactly what
+        herdr-run resolves Herdr from, and ``check`` contacts no Herdr. A shim that did not take
+        effect would leave the real account home in place, and every later case would talk to the
+        real Herdr installed there; so a failure here stops the group.
+        """
+        case_root = self.harness.root / "e2e-000-shim"
+        active = True
+        for name, command in (
+            ("python", self.harness.python_command),
+            ("rust", self.harness.rust_command),
+        ):
+            edition = self._edition(name, command, case_root)
+            outcome = _run(
+                command,
+                ("--json", "check", "git -C ~/probe status"),
+                cwd=edition.project,
+                home=edition.account,
+                extra_env={**edition.environment(), "HOME": None},
+            )
+            expected = f'"rendered": "git -C {edition.account}/probe status"'
+            ok = outcome.returncode == 0 and expected in outcome.stdout
+            self.report.require(
+                f"e2e/shim-active/{name}",
+                ok,
+                f"the preloaded shim did not make {edition.account} the account home: "
+                f"{_describe(outcome)}",
+            )
+            active = active and ok
+        # The guard itself: a program named systemd-run must be refused, and logged, not run.
+        guard = case_root / "guard"
+        guard.mkdir()
+        decoy = guard / "systemd-run"
+        decoy.write_text(f"#!/bin/sh\ntouch {guard}/ran\n", encoding="utf-8")
+        decoy.chmod(0o755)
+        refusals = guard / "refusals.log"
+        environment = {
+            **os.environ,
+            _E2E_HOME_VARIABLE: str(guard),
+            _E2E_REFUSALS_VARIABLE: str(refusals),
+            "LD_PRELOAD": str(self.shim),
+        }
+        probe = (
+            "import subprocess, sys\n"
+            "try:\n    subprocess.run([sys.argv[1]], check=False)\n"
+            "except PermissionError:\n    print('refused')\n"
+        )
+        completed = subprocess.run(
+            [sys.executable, "-I", "-c", probe, str(decoy)],
+            env=environment,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=TIMEOUT_SECONDS,
+        )
+        guarded = (
+            completed.stdout == "refused\n"
+            and not (guard / "ran").exists()
+            and refusals.exists()
+            and refusals.read_text(encoding="utf-8") == f"{decoy}\n"
+        )
+        self.report.require(
+            "e2e/shim-refuses-systemd-run",
+            guarded,
+            f"the shim let a program named systemd-run start: {completed!r}",
+        )
+        return active and guarded
+
+    def case(
+        self,
+        label: str,
+        config: str,
+        steps: Sequence[_E2EStep],
+        *,
+        behaviour: Mapping[str, object] | None = None,
+        setup: Callable[[_E2EEdition], None] | None = None,
+        expect: Sequence[tuple[int, str]] = (),
+    ) -> None:
+        """Run ``steps`` for both editions and compare them; ``expect`` pins what step N must say.
+
+        Agreement alone could be two editions failing the same way, so each ``(N, text)`` in
+        ``expect`` requires ``text`` in step N's output, which keeps a case about what it claims.
+        """
+        self.serial += 1
+        safe = re.sub(r"[^A-Za-z0-9_.-]+", "-", label).strip("-")
+        case_root = self.harness.root / f"e2e-{self.serial:03d}-{safe}"
+        observed: dict[str, tuple[list[Outcome], Outcome, Outcome, str]] = {}
+        for name, command in (
+            ("python", self.harness.python_command),
+            ("rust", self.harness.rust_command),
+        ):
+            edition = self._edition(name, command, case_root)
+            (edition.project / ".herdr-run.yaml").write_text(config, encoding="utf-8")
+            edition.behave(behaviour or {})
+            if setup is not None:
+                setup(edition)
+            outcomes: list[Outcome] = []
+            try:
+                for step in steps:
+                    if step.action is not None:
+                        step.action(edition)
+                        outcomes.append(Outcome(0, f"<{step.label}>\n", ""))
+                        continue
+                    outcome = _run(
+                        command,
+                        step.args,
+                        cwd=edition.project,
+                        home=edition.account,
+                        extra_env=edition.environment(),
+                        mode=step.mode,
+                    )
+                    outcomes.append(
+                        Outcome(
+                            outcome.returncode,
+                            _e2e_normalize(outcome.stdout, edition),
+                            _e2e_normalize(outcome.stderr, edition),
+                        )
+                    )
+                try:
+                    calls_text = (edition.state_directory / "calls.jsonl").read_bytes().decode(
+                        "utf-8", errors="surrogateescape"
+                    )
+                except OSError:
+                    calls_text = ""
+                calls = Outcome(0, _e2e_normalize(calls_text, edition), "")
+                tree = _e2e_tree(edition)
+                refused = edition.refusals.read_text(encoding="utf-8") if edition.refusals.exists() else ""
+            finally:
+                edition.end()
+            observed[name] = (outcomes, calls, tree, refused)
+        python, rust = observed["python"], observed["rust"]
+        for index, step in enumerate(steps):
+            title = step.label or " ".join(step.args)[:60]
+            name = f"e2e/{label}/{index}:{title}"
+            if step.rc is None:
+                self.report.same(
+                    name, python[0][index], rust[0][index], allowed=frozenset(range(-64, 256))
+                )
+            else:
+                self.report.exact(name, python[0][index], rust[0][index], expected_rc=step.rc)
+        for index, text in expect:
+            shown = python[0][index].stdout + python[0][index].stderr
+            self.report.require(
+                f"e2e/{label}/{index}:says:{text[:40]}",
+                text in shown,
+                f"step {index} does not say {text!r}: {_describe(python[0][index])}",
+            )
+        self.report.exact(f"e2e/{label}/herdr-calls", python[1], rust[1], expected_rc=0)
+        self.report.exact(f"e2e/{label}/files", python[2], rust[2], expected_rc=0)
+        self.report.require(
+            f"e2e/{label}/nothing-refused",
+            python[3] == "" and rust[3] == "",
+            "an edition tried to start systemd-run or a Herdr outside the fake account home: "
+            f"python={python[3]!r} rust={rust[3]!r}",
+        )
+
+
+#: The configuration every end-to-end case starts from.
+_E2E_CONFIG = """\
+allow: [printf, sh, git, ls, sleep, cat]
+prefixes: []
+spool_dir: .spool
+workspace: e2e-cmds
+retention_days: 7
+"""
+
+
+def _e2e_run_and_report(harness: Harness, report: Report, shim: Path) -> None:
+    e2e = _EndToEnd(harness, report, shim)
+    if not e2e.shim_is_active():
+        report.notes.append("e2e: the end-to-end cases did not run, because the shim check failed")
+        return
+    a = ("--agent", "alice")
+    config = _E2E_CONFIG
+
+    # Running commands, and everything they leave behind.
+    e2e.case(
+        "run-basic",
+        config,
+        [_run_step(*a, "run", "printf 'hello %s\\n' world", rc=0)],
+        expect=[(0, "hello world\n")],
+    )
+    e2e.case("run-json", config, [_run_step("--json", *a, "run", "printf 'a\\377b\\n'", rc=0)])
+    e2e.case(
+        "run-exit-status",
+        config,
+        [_run_step(*a, "run", "sh -c 'echo out; echo err >&2; exit 3'", rc=3)],
+    )
+    e2e.case("run-killed-by-a-signal", config, [_run_step(*a, "run", "sh -c 'kill -9 $$'")])
+    e2e.case("run-bytes-not-utf8", config, [_run_step(*a, "run", "printf 'a\\377b\\n'", rc=0)])
+
+    def subdirectory(edition: _E2EEdition) -> None:
+        (edition.project / "sub").mkdir()
+        (edition.project / "sub" / "file.txt").write_text("x\n", encoding="utf-8")
+
+    e2e.case(
+        "run-cwd",
+        config,
+        [_run_step(*a, "run", "--cwd", "sub", "ls", rc=0), _run_step(*a, "run", "--cwd", "/nonexistent", "ls")],
+        setup=subdirectory,
+    )
+    e2e.case("run-refused", config, [_run_step(*a, "run", "curl x", rc=77)])
+    e2e.case("run-agent-name", config, [_run_step("--agent", "caf\u00e9-\u2603", "run", "printf ok", rc=0)])
+    e2e.case(
+        "run-tab-schema",
+        config + "tab_name: '{project}--{agent}'\n",
+        [_run_step(*a, "run", "printf ok", rc=0)],
+    )
+    e2e.case(
+        "session-cache-and-status",
+        config,
+        [
+            _run_step(*a, "status", rc=0),
+            _run_step(*a, "run", "printf 1", rc=0),
+            _run_step(*a, "run", "printf 2", rc=0),
+            _run_step("--agent", "bob", "run", "printf 3", rc=0),
+            _run_step(*a, "status", rc=0),
+            _run_step("--json", *a, "status", rc=0),
+            _run_step(*a, "target", rc=0),
+            _run_step("--agent", "carol", "target", "--no-cache", rc=0),
+            _run_step("--json", "--agent", "dave", "target"),
+        ],
+    )
+
+    # Reap verdicts over a live population.
+    def tab_of(edition: _E2EEdition, label: str) -> str | None:
+        tabs = cast(list[dict[str, str]], edition.state().get("tabs", []))
+        return next((tab["id"] for tab in tabs if tab.get("label") == label), None)
+
+    def kill_bobs_shell(edition: _E2EEdition) -> None:
+        tab = tab_of(edition, "bob")
+        panes = cast(list[dict[str, str]], edition.state().get("panes", []))
+        for pane in panes:
+            if pane.get("tab") == tab:
+                edition.kill_shell(pane["id"])
+
+    def close_alice(edition: _E2EEdition) -> None:
+        tab = tab_of(edition, "alice")
+        if tab is not None:
+            edition.herdr("tab", "close", tab)
+
+    e2e.case(
+        "reap-verdicts",
+        config,
+        [
+            _run_step(*a, "run", "printf 1", rc=0),
+            _run_step("--agent", "bob", "run", "printf 2", rc=0),
+            _run_step("reap", rc=0),
+            _do("kill bob's shell", kill_bobs_shell),
+            _run_step("reap", rc=0),
+            _do("close alice's tab by hand", close_alice),
+            _run_step("--json", "reap", rc=0),
+            _run_step(*a, "status", rc=0),
+        ],
+        expect=[(2, '"SHELL_ALIVE": 2'), (4, '"STALE": 1'), (6, '"GONE": 1')],
+    )
+    e2e.case(
+        "reap-in-flight-after-a-timeout",
+        config,
+        [
+            # Three seconds, so the partial output is there even on a loaded host.
+            _run_step(*a, "run", "--timeout", "3", "sh -c 'echo partial; echo perr >&2; sleep 30'"),
+            _run_step("reap", rc=0),
+        ],
+        expect=[(0, "partial"), (1, '"IN_FLIGHT": 1')],
+    )
+
+    def other_workspace(edition: _E2EEdition) -> None:
+        (edition.project / ".herdr-run.yaml").write_text(
+            config.replace("workspace: e2e-cmds", "workspace: elsewhere"), encoding="utf-8"
+        )
+
+    e2e.case(
+        "reap-out-of-scope",
+        config,
+        [
+            _run_step(*a, "run", "printf 1", rc=0),
+            _do("move to another workspace", other_workspace),
+            _run_step("reap", rc=0),
+        ],
+        expect=[(2, '"OUT_OF_SCOPE": 1')],
+    )
+
+    # The pane cap: the least recently used idle tab makes room; a busy one never does.
+    capped = config + "max_panes: 2\n"
+    e2e.case(
+        "pane-cap-eviction",
+        capped,
+        [
+            _run_step("--agent", "a1", "run", "printf 1", rc=0),
+            _run_step("--agent", "a2", "run", "printf 2", rc=0),
+            _run_step("--agent", "a3", "run", "printf 3", rc=0),
+            _run_step("--agent", "a4", "run", "printf 4", rc=0),
+            _run_step("reap", rc=0),
+            _run_step("--agent", "a1", "status", rc=0),
+        ],
+        expect=[(2, "replaced idle tab"), (3, "replaced idle tab")],
+    )
+
+    def everything_busy(edition: _E2EEdition) -> None:
+        edition.behave({"busy": True})
+
+    e2e.case(
+        "pane-cap-all-busy",
+        capped,
+        [
+            _run_step("--agent", "a1", "run", "printf 1", rc=0),
+            _run_step("--agent", "a2", "run", "printf 2", rc=0),
+            _do("every pane is busy", everything_busy),
+            _run_step("--agent", "a3", "run", "printf 3"),
+        ],
+        expect=[(3, "could be replaced")],
+    )
+
+    # Readiness: a busy pane, a half-typed line, and prompts that cannot be judged.
+    for label, behaviour in (
+        ("busy", {"busy": True}),
+        ("half-typed-line", {"pane_text": "user@host:~$ ls -la\n"}),
+        ("no-pane-text", {"pane_text": ""}),
+        ("unrecognised-prompt", {"pane_text": "weird prompt>\n"}),
+        ("foreground-is-not-a-shell", {"fg_name": "python3"}),
+    ):
+
+        def become(edition: _E2EEdition, behaviour: Mapping[str, object] = behaviour) -> None:
+            edition.behave(behaviour)
+
+        e2e.case(
+            f"readiness-{label}",
+            config,
+            [
+                _run_step(*a, "run", "printf warm", rc=0),
+                _do(label, become),
+                _run_step(*a, "run", "--wait-ready", "0.2", "printf x"),
+                _run_step(*a, "target"),
+            ],
+        )
+
+    # Herdr failing, or answering with something that is not what it promises.
+    hostile = "boom \x1b[31m red \u202e \u2028 done"
+    for words in (
+        "workspace list",
+        "workspace create",
+        "tab list",
+        "tab create",
+        "tab rename",
+        "pane list",
+        "pane process-info",
+        "pane read",
+        "pane run",
+    ):
+        # Another agent's run first, so the workspace exists and tabs are listed and created; the
+        # calls that only a new workspace makes (creating it, renaming its first tab) run fresh.
+        fresh = words in ("workspace list", "workspace create", "tab rename")
+
+        def misbehave(edition: _E2EEdition, words: str = words) -> None:
+            edition.behave({"fail": {words: hostile}})
+
+        warm_up = [] if fresh else [_run_step("--agent", "bob", "run", "printf warm", rc=0)]
+        e2e.case(
+            f"failure-{words.replace(' ', '-')}",
+            config,
+            [
+                *warm_up,
+                _do(f"{words} fails", misbehave),
+                _run_step(*a, "run", "--wait-ready", "0.2", "--timeout", "2", "printf x"),
+            ],
+            expect=[(len(warm_up) + 1, "\\u{202e}")],
+        )
+    for label, words, reply, said in (
+        ("not-json", "workspace list", "not json", "non-JSON output"),
+        (
+            "id-not-a-string",
+            "workspace list",
+            '{"result": {"workspaces": [{"workspace_id": 5, "label": "e2e-cmds"}]}}',
+            "is not a string",
+        ),
+        (
+            "ambiguous-label",
+            "workspace list",
+            '{"result": {"workspaces": [{"workspace_id": "w", "label": "e2e-cmds"}, '
+            '{"workspace_id": "v", "label": "e2e-cmds"}]}}',
+            "is ambiguous",
+        ),
+        (
+            "surrogate-under-a-duplicate-key",
+            "workspace list",
+            '{"result": {"workspaces": [], "x": "\\ud800", "x": 1}}',
+            "non-JSON output",
+        ),
+        ("nested-too-deep", "workspace list", "[" * 200 + "]" * 200, "non-JSON output"),
+        ("bytes-not-utf8", "workspace list", "\udcff\udcfe{}", "non-JSON output"),
+        ("create-without-objects", "workspace create", '{"result": {}}', "is not an object"),
+        (
+            "process-info-for-another-pane",
+            "pane process-info",
+            '{"result": {"process_info": {"pane_id": "zz", "shell_pid": 5, '
+            '"foreground_process_group_id": 5, "foreground_processes": [{"pid": 5}]}}}',
+            'returned pane "zz"',
+        ),
+        (
+            "pane-from-another-workspace",
+            "pane list",
+            '{"result": {"panes": [{"pane_id": "p", "tab_id": "t", "workspace_id": "other"}]}}',
+            'from workspace "other"',
+        ),
+    ):
+        e2e.case(
+            f"reply-{label}",
+            config,
+            [_run_step(*a, "run", "--wait-ready", "0.2", "--timeout", "2", "printf x")],
+            behaviour={"raw": {words: reply}},
+            expect=[(0, said)],
+        )
+
+    # A Herdr the kernel cannot execute, and a caller that ignores SIGCHLD.
+    def herdr_without_shebang(edition: _E2EEdition) -> None:
+        herdr = edition.account / ".local" / "bin" / "herdr"
+        herdr.write_text('touch "$0.ran"\necho \'{"server": {"running": true}}\'\n', encoding="utf-8")
+        herdr.chmod(0o755)
+
+    # Only `status`: a command that needs a server would try to start one through systemd-run
+    # when this Herdr cannot answer, and the shim would (rightly) refuse it.
+    e2e.case(
+        "herdr-not-executable",
+        config,
+        [_run_step(*a, "status", rc=0), _run_step("--json", *a, "status", rc=0)],
+        setup=herdr_without_shebang,
+        expect=[(0, "no server is running")],
+    )
+    e2e.case(
+        "sigchld-ignored",
+        config,
+        [
+            _run_step(*a, "run", "printf x", rc=0, mode="sigchld-ignored"),
+            _run_step(*a, "run", "sh -c 'exit 4'", rc=4, mode="sigchld-ignored"),
+        ],
+    )
+    e2e.case(
+        "sigchld-ignored-failing-herdr",
+        config,
+        [_run_step(*a, "run", "--timeout", "2", "printf x", mode="sigchld-ignored")],
+        behaviour={"fail": {"pane run": "pane run refused"}},
+    )
+
+    # net-doctor through the fake pane, against a local repository and a missing one.
+    git = shutil.which("git")
+    if git is not None:
+
+        def repository(edition: _E2EEdition) -> None:
+            remote = edition.root / "remote"
+            # Fixed dates, so both editions' remotes hold the same commit and print the same hash.
+            environment = {
+                **os.environ,
+                "GIT_CONFIG_NOSYSTEM": "1",
+                "HOME": str(edition.account),
+                "GIT_AUTHOR_DATE": "2026-01-01T00:00:00Z",
+                "GIT_COMMITTER_DATE": "2026-01-01T00:00:00Z",
+            }
+            subprocess.run([git, "init", "-q", str(remote)], check=True, capture_output=True, env=environment)
+            subprocess.run(
+                [git, "-C", str(remote), "-c", "user.email=e2e@example.invalid", "-c", "user.name=e2e",
+                 "commit", "-q", "--allow-empty", "-m", "x"],
+                check=True,
+                capture_output=True,
+                env=environment,
+            )
+            (edition.project / ".herdr-run.yaml").write_text(
+                config + f"probe_remote: {remote}\n", encoding="utf-8"
+            )
+
+        e2e.case(
+            "net-doctor-local-repository",
+            config,
+            [_run_step(*a, "net-doctor")],
+            setup=repository,
+            expect=[(0, "rc=0 SUCCEEDED")],
+        )
+    e2e.case(
+        "net-doctor-missing-repository",
+        config + "probe_remote: /nonexistent/repository\n",
+        [_run_step(*a, "net-doctor")],
+    )
+
+    # Retention: completed runs older than the window go when a later run is written.
+    def plant_runs(edition: _E2EEdition) -> None:
+        runs = edition.project / ".spool" / "runs"
+        now = time.time()
+        for name, age_days, files in (
+            ("20200101T000000-old-1", 10, {"exit_code": "0\n", "stdout": "x", "meta.json": "{}"}),
+            ("20200101T000000-old-unfinished-2", 10, {"stdout": "x"}),
+            ("20260101T000000-recent-3", 1, {"exit_code": "0\n"}),
+            ("not-a-run", 10, {"exit_code": "0\n"}),
+            ("20200101T000000-bad-marker-4", 10, {"exit_code": "abc"}),
+            ("20200101T000000-just-inside-5", 6.999, {"exit_code": "0\n"}),
+            ("20200101T000000-just-outside-6", 7.001, {"exit_code": "0\n"}),
+        ):
+            directory = runs / name
+            directory.mkdir(parents=True)
+            stamp = now - age_days * 86400
+            for file_name, content in files.items():
+                path = directory / file_name
+                path.write_text(content, encoding="utf-8")
+                os.utime(path, (stamp, stamp))
+            os.utime(directory, (stamp, stamp))
+        os.symlink("/tmp", runs / "20200101T000000-link-7")
+        (runs / "20200101T000000-file-8").write_text("x", encoding="utf-8")
+
+    e2e.case("retention", config, [_run_step(*a, "run", "printf x", rc=0)], setup=plant_runs)
+
+    # A session cache that is corrupt, stale, or hostile is never trusted, and is replaced.
+    for label, content in (
+        ("garbage", "not json"),
+        ("array", "[]"),
+        (
+            "surrogate-under-a-duplicate-key",
+            '{"e2e-cmds\\u0000alice": {"pane_id": "\\ud800", "pane_id": "w9:p9", "tab_id": "w9:t9", '
+            '"tab_label": "alice", "workspace_id": "w9", "workspace_label": "e2e-cmds"}}',
+        ),
+        (
+            "stale-ids",
+            '{"e2e-cmds\\u0000alice": {"pane_id": "w9:p9", "tab_id": "w9:t9", "tab_label": "alice", '
+            '"workspace_id": "w9", "workspace_label": "e2e-cmds"}}',
+        ),
+        (
+            "wrong-types",
+            '{"e2e-cmds\\u0000alice": {"pane_id": 5, "tab_id": "w9:t9", "tab_label": "alice", '
+            '"workspace_id": "w9", "workspace_label": "e2e-cmds"}}',
+        ),
+        ("nested-too-deep", "[" * 300 + "]" * 300),
+        ("not-a-number", '{"x": NaN}'),
+        ("byte-order-mark", "\ufeff{}"),
+    ):
+
+        def plant_cache(edition: _E2EEdition, content: str = content) -> None:
+            spool = edition.project / ".spool"
+            spool.mkdir(parents=True, exist_ok=True)
+            (spool / "session-cache.json").write_text(content, encoding="utf-8")
+
+        e2e.case(
+            f"cache-{label}",
+            config,
+            [_run_step(*a, "run", "printf x", rc=0), _run_step(*a, "target", rc=0)],
+            setup=plant_cache,
+        )
+
+
+def _end_to_end(harness: Harness, report: Report) -> None:
+    """Compare both editions against one fake Herdr, through their production clients."""
+    present = [path for path in _E2E_SYSTEM_HERDR if os.path.exists(path)]
+    if present:
+        report.skip(
+            "e2e/all",
+            "system-herdr",
+            f"{present[0]} exists, and herdr-run looks there before the account home",
+        )
+        return
+    try:
+        shim, compiler = _compile_account_home_shim(harness.root)
+    except RuntimeError as error:
+        report.require("e2e/shim-builds", False, str(error))
+        return
+    if shim is None:
+        report.skip("e2e/all", "c-compiler", compiler)
+        return
+    report.notes.append(f"e2e: the account-home shim was built with {compiler}")
+    _e2e_run_and_report(harness, report, shim)
+
+
 def build_report(
     python_command: Sequence[str],
     rust_command: Sequence[str],
@@ -2656,22 +3830,24 @@ def build_report(
         _reap(harness, report)
         _deleted_cwd(harness, report)
         _child_processes(harness, report)
+        _sigchld_handed_over(harness, report)
         _held_pipe(harness, report)
         _signals_and_limits(harness, report)
         _unsafe_paths(harness, report)
+        _unsafe_json(harness, report)
+        _exec_format(harness, report)
+        _end_to_end(harness, report)
         if launchers:
             _launchers(harness, report)
     report.notes.append(
-        "Herdr protocol, readiness, session-cache, and run-record behaviour is compared through "
-        "the golden corpora in rs/herdr-run/testdata, which both editions' unit tests load: "
-        "production resolution intentionally ignores caller PATH and exposes no safe executable "
-        "override for an external fake"
+        "the live Herdr protocol is compared end to end (e2e/*) against one fake Herdr that a "
+        "preloaded account-home shim puts where production looks, without any executable "
+        "override in either edition; the golden corpora in rs/herdr-run/testdata still pin each "
+        "protocol call, readiness rule, and record format, through both editions' unit tests"
     )
     report.notes.append(
-        "reap is paired on safety-equivalent verdicts (empty spool, unresolvable or unavailable "
-        "workspace evidence, out of scope, malformed records); STALE and SHELL_ALIVE need a pane "
-        "a live Herdr server still lists, and are covered by planted-population unit tests in "
-        "each edition instead"
+        "the reap/* cases pair verdicts over planted records with no live Herdr; STALE, "
+        "SHELL_ALIVE, GONE, and IN_FLIGHT over live panes are paired in e2e/reap-*"
     )
     report.notes.append(
         "NUL cannot be represented in a POSIX argv entry; all other terminal-control classes are covered"
@@ -2699,12 +3875,21 @@ def compare_herdr_run(
     report = build_report(python_command, rust_command)
     for note in report.notes:
         print(f"NOTE [herdr-run] {note}")
+    for label, kind, reason in report.skipped:
+        print(f"  SKIPPED [{kind}; REQUIRED] {label}: {reason}")
     if report.failures:
         for failure in report.failures:
             print(f"DIVERGENCE [{failure}]")
         print(
             f"cross[herdr-run]: {len(report.failures)} divergence(s) "
             f"out of {report.checks} paired checks"
+        )
+        return 1
+    if report.skipped:
+        # Run standalone there is no way to declare a partial run: every skip is required.
+        print(
+            f"cross[herdr-run]: INCOMPLETE - {report.checks} paired checks agree, but "
+            f"{len(report.skipped)} required check(s) did not run"
         )
         return 1
     print(f"cross[herdr-run]: OK - {report.checks} paired checks agree")

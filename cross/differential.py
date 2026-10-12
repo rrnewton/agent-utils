@@ -122,7 +122,8 @@ from cpu_footprint_analysis import (
 )
 from herdr_agent_differential import compare_herdr_agent
 from agentctl_differential import compare_agentctl
-from herdr_differential import compare_herdr_run
+from herdr_differential import SKIP_KINDS as HERDR_RUN_SKIP_KINDS
+from herdr_differential import build_report as build_herdr_run_report
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -321,6 +322,9 @@ SKIP_KINDS: dict[str, str] = {
         "needs a core budget of at least eight CPUs, the tighter of the CPU affinity mask and "
         "any cgroup CPU quota"
     ),
+    # herdr-run's end-to-end group: a C compiler for its shim, and no Herdr installed where
+    # herdr-run would find it before the fake one.
+    **HERDR_RUN_SKIP_KINDS,
 }
 
 #: Comma-separated skip kinds a lane declares acceptable, in addition to ``--allow-skip``. A lane
@@ -401,7 +405,7 @@ class ToolCoverage:
     """One tool's final verdict: how many checks ran and which were skipped instead.
 
     ``checks`` is None for a tool whose differential keeps its own count and skips nothing
-    through ``Report`` (herdr-run, herdr-agent, agentctl).
+    through ``Report`` (herdr-agent, agentctl).
     """
 
     tool: str
@@ -8380,6 +8384,31 @@ def compare_dagrun(
     )
 
 
+def compare_herdr_run(
+    python_command: Sequence[str],
+    rust_command: Sequence[str],
+    *,
+    allowed_skips: frozenset[str] = frozenset(),
+) -> int:
+    """Run the herdr-run differential and end it with this harness's own verdict.
+
+    ``cross/herdr_differential.py`` keeps its own checks; reporting them here means a herdr-run
+    check that could not run (its end-to-end group without a C compiler, say) is listed, counted,
+    and allowed or refused exactly like a skipped check of any other tool.
+    """
+    tool = "herdr-run"
+    herdr = build_herdr_run_report(python_command, rust_command)
+    for note in herdr.notes:
+        print(f"NOTE [{tool}] {note}")
+    rep = Report(checks=herdr.checks, failures=list(herdr.failures))
+    for label, kind, reason in herdr.skipped:
+        rep.skip(label, kind, reason)
+    summary = f"{rep.checks} paired checks"
+    if rep.failures:
+        return divergence_verdict(tool, rep, summary, allowed_skips)
+    return coverage_verdict(tool, rep, f"{summary} agree", allowed_skips)
+
+
 def py_command_for(tool: str) -> list[str]:
     modules = {
         "dagrun": "dagrun",
@@ -12706,7 +12735,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         "tick-hub": lambda: compare_tick_hub(rand_count, seed),
         "pr-landing-planner": lambda: compare_pr_landing_planner(rand_count, seed),
         "herdr-run": lambda: compare_herdr_run(
-            py_command_for("herdr-run"), rs_command("herdr-run")
+            py_command_for("herdr-run"), rs_command("herdr-run"), allowed_skips=allowed_skips
         ),
         "herdr-agent": lambda: compare_herdr_agent(
             py_command_for("herdr-agent"), rs_command("herdr-agent")
@@ -12719,7 +12748,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         recorded = len(_COVERAGE)
         status = runners[name]()
         if len(_COVERAGE) == recorded:
-            # The herdr and agentctl differentials print their own verdict and skip nothing
+            # The herdr-agent and agentctl differentials print their own verdict and skip nothing
             # through Report, so their exit status is the whole of what they report here.
             return status, record_coverage(
                 name, "OK" if status == 0 else "FAILED", None, allowed_skips

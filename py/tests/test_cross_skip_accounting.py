@@ -213,6 +213,37 @@ def test_a_skipped_check_is_not_counted_as_a_pass() -> None:
         report.skip("typo", "boxng", "misspelled kind")
 
 
+@pytest.mark.parametrize(
+    ("allowed", "status", "verdict"),
+    [
+        (frozenset(), 1, "cross[herdr-run]: INCOMPLETE - 3 paired checks agree"),
+        (frozenset({"c-compiler"}), 0, "cross[herdr-run]: PARTIAL - 3 paired checks agree"),
+    ],
+)
+def test_a_herdr_run_skip_counts_like_any_other_tool(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    allowed: frozenset[str],
+    status: int,
+    verdict: str,
+) -> None:
+    """The herdr-run end-to-end group without a C compiler is a listed, required skip."""
+    differential = _differential()
+    herdr = SimpleNamespace(
+        checks=3,
+        failures=[],
+        notes=["a note"],
+        skipped=[("e2e/all", "c-compiler", "no C compiler (cc, gcc, or clang) is on PATH")],
+    )
+    monkeypatch.setattr(differential, "build_herdr_run_report", lambda _py, _rs: herdr)
+
+    assert differential.compare_herdr_run(["py"], ["rs"], allowed_skips=allowed) == status
+    out = capsys.readouterr().out
+    assert "NOTE [herdr-run] a note" in out
+    assert "e2e/all: no C compiler (cc, gcc, or clang) is on PATH" in out
+    assert verdict in out
+
+
 def test_full_coverage_verdict_refuses_any_skip(capsys: pytest.CaptureFixture[str]) -> None:
     differential = _differential()
     report = differential.Report()
@@ -1331,7 +1362,7 @@ def _all_tools_stubbed(
         return int(differential.coverage_verdict(tool, report, "1 checks agree", allowed_skips))
 
     def own_count(tool: str) -> Callable[[object, object], int]:
-        def compare(_py: object, _rs: object) -> int:
+        def compare(_py: object, _rs: object, **_options: object) -> int:
             ran.append(tool)
             return 1 if diverging == tool else 0
 
