@@ -11,7 +11,7 @@ use std::io;
 
 use serde_json::Value;
 
-/// The six ASCII whitespace characters an environment value is trimmed of.
+/// The six ASCII whitespace characters POSIX `isspace` names, trimmed from an exit-code marker.
 pub const ASCII_WHITESPACE: &[char] = &[' ', '\t', '\n', '\r', '\u{b}', '\u{c}'];
 
 /// The Unicode `White_Space` property, written out so it never follows a compiler's tables.
@@ -21,8 +21,89 @@ pub const UNICODE_WHITESPACE: &[char] = &[
     '\u{2009}', '\u{200a}', '\u{2028}', '\u{2029}', '\u{202f}', '\u{205f}', '\u{3000}',
 ];
 
+/// Unicode general category `Cf` (format characters), written out as of Unicode 15.0: the soft
+/// hyphen, zero-width spaces and joiners, bidirectional marks, embeddings, overrides and isolates,
+/// the byte-order mark, interlinear annotation, tag characters, and the rest. None of them draws
+/// anything, so a name that contains one looks exactly like a name that does not.
+pub const FORMAT_CHARACTER_RANGES: &[(u32, u32)] = &[
+    (0x00AD, 0x00AD),
+    (0x0600, 0x0605),
+    (0x061C, 0x061C),
+    (0x06DD, 0x06DD),
+    (0x070F, 0x070F),
+    (0x0890, 0x0891),
+    (0x08E2, 0x08E2),
+    (0x180E, 0x180E),
+    (0x200B, 0x200F),
+    (0x202A, 0x202E),
+    (0x2060, 0x2064),
+    (0x2066, 0x206F),
+    (0xFEFF, 0xFEFF),
+    (0xFFF9, 0xFFFB),
+    (0x110BD, 0x110BD),
+    (0x110CD, 0x110CD),
+    (0x13430, 0x1343F),
+    (0x1BCA0, 0x1BCA3),
+    (0x1D173, 0x1D17A),
+    (0xE0001, 0xE0001),
+    (0xE0020, 0xE007F),
+];
+
 /// Longest completion marker accepted.
 pub const MAX_EXIT_MARKER_BYTES: usize = 128;
+
+/// True for a character in [`FORMAT_CHARACTER_RANGES`].
+#[must_use]
+pub fn is_format_character(character: char) -> bool {
+    let code = u32::from(character);
+    FORMAT_CHARACTER_RANGES
+        .iter()
+        .any(|&(low, high)| (low..=high).contains(&code))
+}
+
+/// True for a format character or a non-ASCII `White_Space` character.
+///
+/// These are the characters a reader cannot see: a no-break space looks like a space, a line
+/// separator like a line break or nothing, a zero-width space or a byte-order mark like nothing at
+/// all, and a bidirectional override reorders what follows it.
+#[must_use]
+pub fn is_invisible(character: char) -> bool {
+    is_format_character(character)
+        || (!character.is_ascii() && UNICODE_WHITESPACE.contains(&character))
+}
+
+/// Describe the first character a name may not contain, or return `None`.
+///
+/// A name -- an agent, a workspace, an allowed program, a denied option -- is compared with what
+/// somebody typed and shown to somebody reading, so it may contain no terminal control (C0, DEL,
+/// C1) and no invisible character ([`is_invisible`]). (A Rust string cannot hold a surrogate.)
+#[must_use]
+pub fn name_violation(value: &str) -> Option<String> {
+    value.chars().find_map(|character| {
+        let code = u32::from(character);
+        if matches!(code, 0x00..=0x1f | 0x7f..=0x9f) {
+            Some(format!("control character U+{code:04X}"))
+        } else if is_invisible(character) {
+            Some(format!("invisible character U+{code:04X}"))
+        } else {
+            None
+        }
+    })
+}
+
+/// Show `value` in a message as it is, or [`quote`] it when it holds an unsafe character.
+///
+/// A path or a name made of ordinary characters reads best unquoted; one that holds a terminal
+/// control or an invisible character is quoted, so nothing can reach a terminal raw from a
+/// herdr-run message.
+#[must_use]
+pub fn display(value: &str) -> String {
+    if name_violation(value).is_none() {
+        value.to_owned()
+    } else {
+        quote(value)
+    }
+}
 
 /// Quote `value` for a diagnostic, escaping everything that is not printable ASCII.
 ///
@@ -90,14 +171,64 @@ pub fn is_blank(value: &str) -> bool {
 }
 
 /// Render seconds for a message: integral values with no decimals, otherwise the shortest
-/// round-trip decimal, never in exponent notation.
+/// round-trip decimal ([`shortest_digits`]), never in exponent notation.
 #[must_use]
 pub fn number_text(value: f64) -> String {
-    if value.is_finite() && value.fract() == 0.0 {
-        format!("{value:.0}")
-    } else {
-        format!("{value}")
+    if !value.is_finite() {
+        return python_float_repr(value);
     }
+    if value.fract() == 0.0 {
+        return format!("{value:.0}");
+    }
+    let (negative, digits, exponent) = shortest_digits(value);
+    let sign = if negative { "-" } else { "" };
+    let point = exponent + 1;
+    if point <= 0 {
+        let zeros = "0".repeat(usize::try_from(-point).unwrap_or(0));
+        return format!("{sign}0.{zeros}{digits}");
+    }
+    let point = usize::try_from(point).unwrap_or(0);
+    if digits.len() <= point {
+        // Unreachable for a value with a fractional part, but written out rather than assumed.
+        return format!("{sign}{digits}{}", "0".repeat(point - digits.len()));
+    }
+    format!("{sign}{}.{}", &digits[..point], &digits[point..])
+}
+
+/// The shortest decimal digits that read back as `value`, and the decimal exponent of the first.
+///
+/// Returns `(negative, digits, exponent)` with `value == ±0.d1d2d3… × 10^(exponent + 1)`. When
+/// several digit strings of the shortest length read back as `value`, the one nearest to it is
+/// chosen, and an exact tie goes to the even last digit: the rule Python's `repr` follows, so
+/// `2**-25` is `2.9802322387695312e-08` in both editions. The standard library's `{}` and `{:e}`
+/// break that tie upwards instead, which is why they are not used here. `value` must be finite.
+#[must_use]
+pub fn shortest_digits(value: f64) -> (bool, String, i32) {
+    let mut buffer = ryu::Buffer::new();
+    let text = buffer.format_finite(value);
+    let (negative, text) = text
+        .strip_prefix('-')
+        .map_or((false, text), |rest| (true, rest));
+    let (mantissa, exponent) = text.split_once(['e', 'E']).map_or((text, 0), |(m, e)| {
+        (
+            m,
+            e.parse::<i32>().expect("ryu writes an integral exponent"),
+        )
+    });
+    let (integral, fraction) = mantissa.split_once('.').unwrap_or((mantissa, ""));
+    let mut digits = format!("{integral}{fraction}");
+    let mut point = i32::try_from(integral.len()).unwrap_or(i32::MAX) + exponent;
+    while digits.len() > 1 && digits.starts_with('0') {
+        digits.remove(0);
+        point -= 1;
+    }
+    while digits.len() > 1 && digits.ends_with('0') {
+        digits.pop();
+    }
+    if digits == "0" {
+        point = 1;
+    }
+    (negative, digits, point - 1)
 }
 
 /// Round to three decimal places by correctly rounded decimal formatting.
@@ -146,8 +277,9 @@ pub fn parse_exit_marker(payload: &[u8]) -> Option<i32> {
 
 /// Format a finite `f64` by the float-text rule both editions share.
 ///
-/// Shortest round-trip digits; fixed notation when the decimal exponent is in `-4..16`, otherwise
-/// `d.ddde+XX`. JSON output uses this so every number prints identically in both editions.
+/// Shortest round-trip digits ([`shortest_digits`]); fixed notation when the decimal exponent is
+/// in `-4..16`, otherwise `d.ddde+XX`. JSON output uses this so every number prints identically in
+/// both editions.
 #[must_use]
 pub fn python_float_repr(value: f64) -> String {
     if value.is_nan() {
@@ -156,14 +288,7 @@ pub fn python_float_repr(value: f64) -> String {
     if value.is_infinite() {
         return if value > 0.0 { "Infinity" } else { "-Infinity" }.to_owned();
     }
-    let scientific = format!("{value:e}");
-    let (mantissa, exponent) = scientific
-        .split_once('e')
-        .expect("Rust {:e} always has an exponent");
-    let exponent: i32 = exponent.parse().expect("integral exponent");
-    let negative = mantissa.starts_with('-');
-    let mantissa = mantissa.trim_start_matches('-');
-    let digits: String = mantissa.chars().filter(char::is_ascii_digit).collect();
+    let (negative, digits, exponent) = shortest_digits(value);
     let sign = if negative { "-" } else { "" };
     if (-4..16).contains(&exponent) {
         let point = exponent + 1;
@@ -193,6 +318,23 @@ pub fn python_float_repr(value: f64) -> String {
         "{sign}{mantissa}e{exponent_sign}{:02}",
         exponent.unsigned_abs()
     )
+}
+
+/// Deepest JSON nesting refused: a document whose arrays and objects nest this many levels deep is
+/// not read, so 127 levels is the most accepted. This is `serde_json`'s own recursion limit, and
+/// the other edition enforces the same number.
+pub const JSON_MAX_DEPTH: usize = 128;
+
+/// Parse RFC 8259 JSON strictly, or return `None`.
+///
+/// `NaN`/`Infinity` are refused, a float that overflows is refused, an integer outside the 64-bit
+/// range becomes the nearest float (and is refused when even that overflows), a lone surrogate
+/// escape is refused, and so is nesting [`JSON_MAX_DEPTH`] levels deep. The crate enables
+/// `serde_json`'s `float_roundtrip`, so a float reads as the nearest `f64` whatever other crates
+/// in a build select, which is what the other edition's reader does.
+#[must_use]
+pub fn strict_json(text: &str) -> Option<Value> {
+    serde_json::from_str(text).ok()
 }
 
 fn write_json_string(out: &mut String, value: &str) {
@@ -377,6 +519,58 @@ mod tests {
         for row in rows("number_text") {
             assert_eq!(number_text(row[0].as_f64().unwrap()), row[1], "{row:?}");
         }
+    }
+
+    #[test]
+    fn golden_display() {
+        for row in rows("display") {
+            assert_eq!(display(row[0].as_str().unwrap()), row[1], "{row:?}");
+        }
+    }
+
+    #[test]
+    fn golden_name_violation() {
+        for row in rows("name_violation") {
+            let expected = row[1].as_str().map(str::to_owned);
+            assert_eq!(
+                name_violation(row[0].as_str().unwrap()),
+                expected,
+                "{row:?}"
+            );
+        }
+    }
+
+    /// Every JSON document in the corpus, read and written back in the shared line form, or
+    /// refused (`null`).
+    #[test]
+    fn golden_strict_json() {
+        for row in rows("json") {
+            let text = row[0].as_str().unwrap();
+            let read = strict_json(text).map(|value| json_line(&value));
+            assert_eq!(read.as_deref(), row[1].as_str(), "{text:?}");
+        }
+        // The deepest nesting accepted and the first refused, built here rather than spelled out.
+        let nested = |depth: usize| format!("{}{}", "[".repeat(depth), "]".repeat(depth));
+        assert!(strict_json(&nested(JSON_MAX_DEPTH - 1)).is_some());
+        assert!(strict_json(&nested(JSON_MAX_DEPTH)).is_none());
+        let objects = |depth: usize| format!("{}1{}", "{\"a\": ".repeat(depth), "}".repeat(depth));
+        assert!(strict_json(&objects(JSON_MAX_DEPTH - 1)).is_some());
+        assert!(strict_json(&objects(JSON_MAX_DEPTH)).is_none());
+    }
+
+    #[test]
+    fn shortest_digits_break_ties_to_even() {
+        // 2**-25 is exactly ...953125e-8: the two 17-digit neighbours are equally near.
+        assert_eq!(python_float_repr(2f64.powi(-25)), "2.9802322387695312e-08");
+        assert_eq!(number_text(2f64.powi(-25)), "0.000000029802322387695312");
+        assert_eq!(
+            python_float_repr(11.565_933_227_539_062),
+            "11.565933227539062"
+        );
+        assert_eq!(shortest_digits(0.0), (false, "0".to_owned(), 0));
+        assert_eq!(shortest_digits(-0.0), (true, "0".to_owned(), 0));
+        assert_eq!(shortest_digits(1e16), (false, "1".to_owned(), 16));
+        assert_eq!(shortest_digits(1.5e-7), (false, "15".to_owned(), -7));
     }
 
     #[test]

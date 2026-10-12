@@ -19,9 +19,15 @@ from decimal import Decimal
 
 __all__ = [
     "ASCII_WHITESPACE",
+    "FORMAT_CHARACTER_RANGES",
+    "JSON_MAX_DEPTH",
     "UNICODE_WHITESPACE",
+    "display",
     "format_round3",
     "is_blank",
+    "is_format_character",
+    "is_invisible",
+    "name_violation",
     "number_text",
     "os_error_text",
     "parse_exit_marker",
@@ -33,9 +39,9 @@ __all__ = [
     "strip_space",
 ]
 
-#: The whitespace an environment value is trimmed of: exactly the six ASCII characters POSIX
-#: ``isspace`` names. Information separators and every non-ASCII space are kept, so a control
-#: character is refused later rather than silently removed.
+#: The six ASCII whitespace characters POSIX ``isspace`` names, trimmed from an exit-code marker.
+#: Information separators and every non-ASCII space are kept, so they make a marker invalid rather
+#: than being silently removed.
 ASCII_WHITESPACE = " \t\n\r\x0b\x0c"
 
 #: The Unicode ``White_Space`` property, written out. Used where text that came from a terminal is
@@ -48,6 +54,80 @@ UNICODE_WHITESPACE = frozenset(
 )
 
 _UNICODE_WHITESPACE_TEXT = "".join(sorted(UNICODE_WHITESPACE))
+
+#: Unicode general category ``Cf`` (format characters), written out as of Unicode 15.0: the soft
+#: hyphen, zero-width spaces and joiners, bidirectional marks, embeddings, overrides and isolates,
+#: the byte-order mark, interlinear annotation, tag characters, and the rest. None of them draws
+#: anything, so a name that contains one looks exactly like a name that does not.
+FORMAT_CHARACTER_RANGES: tuple[tuple[int, int], ...] = (
+    (0x00AD, 0x00AD),
+    (0x0600, 0x0605),
+    (0x061C, 0x061C),
+    (0x06DD, 0x06DD),
+    (0x070F, 0x070F),
+    (0x0890, 0x0891),
+    (0x08E2, 0x08E2),
+    (0x180E, 0x180E),
+    (0x200B, 0x200F),
+    (0x202A, 0x202E),
+    (0x2060, 0x2064),
+    (0x2066, 0x206F),
+    (0xFEFF, 0xFEFF),
+    (0xFFF9, 0xFFFB),
+    (0x110BD, 0x110BD),
+    (0x110CD, 0x110CD),
+    (0x13430, 0x1343F),
+    (0x1BCA0, 0x1BCA3),
+    (0x1D173, 0x1D17A),
+    (0xE0001, 0xE0001),
+    (0xE0020, 0xE007F),
+)
+
+
+def is_format_character(character: str) -> bool:
+    """True for a character in :data:`FORMAT_CHARACTER_RANGES`."""
+    code = ord(character)
+    return any(low <= code <= high for low, high in FORMAT_CHARACTER_RANGES)
+
+
+def is_invisible(character: str) -> bool:
+    """True for a format character or a non-ASCII ``White_Space`` character.
+
+    These are the characters a reader cannot see: a no-break space looks like a space, a line
+    separator like a line break or nothing, a zero-width space or a byte-order mark like nothing at
+    all, and a bidirectional override reorders what follows it.
+    """
+    return is_format_character(character) or (
+        character in UNICODE_WHITESPACE and ord(character) > 0x7F
+    )
+
+
+def name_violation(value: str) -> str | None:
+    """Describe the first character a name may not contain, or return ``None``.
+
+    A name -- an agent, a workspace, an allowed program, a denied option -- is compared with what
+    somebody typed and shown to somebody reading, so it may contain no terminal control (C0, DEL,
+    C1), no surrogate, and no invisible character (:func:`is_invisible`).
+    """
+    for character in value:
+        code = ord(character)
+        if code < 0x20 or 0x7F <= code <= 0x9F:
+            return f"control character U+{code:04X}"
+        if 0xD800 <= code <= 0xDFFF:
+            return f"surrogate U+{code:04X}"
+        if is_invisible(character):
+            return f"invisible character U+{code:04X}"
+    return None
+
+
+def display(value: str) -> str:
+    """Show ``value`` in a message as it is, or :func:`quote` it when it holds an unsafe character.
+
+    A path or a name that is made of ordinary characters reads best unquoted; one that holds a
+    terminal control, a surrogate, or an invisible character is quoted, so nothing can reach a
+    terminal raw from a herdr-run message.
+    """
+    return value if name_violation(value) is None else quote(value)
 
 
 def quote(value: str) -> str:
@@ -177,7 +257,10 @@ def _parse_int(token: str) -> object:
     value = int(token)
     if -(2**63) <= value <= 2**64 - 1:
         return value
-    as_float = float(value)
+    try:
+        as_float = float(value)
+    except OverflowError:
+        raise ValueError("number out of range") from None
     if not math.isfinite(as_float):
         raise ValueError("number out of range")
     return as_float
@@ -197,17 +280,45 @@ def _reject_surrogates(value: object) -> None:
             stack.extend(current.values())
 
 
+#: Deepest JSON nesting refused: a document whose arrays and objects nest this many levels deep is
+#: not read, so 127 levels is the most accepted. The native edition's reader has exactly this limit.
+JSON_MAX_DEPTH = 128
+
+#: A JSON string (closed or not) or one bracket, so nesting can be measured without parsing.
+_JSON_DEPTH_TOKENS = re.compile(r'"[^"\\]*(?:\\.[^"\\]*)*"?|[\[\]{}]', re.DOTALL)
+
+
+def _json_too_deep(text: str) -> bool:
+    depth = 0
+    for match in _JSON_DEPTH_TOKENS.finditer(text):
+        token = match.group()
+        if token in ("[", "{"):
+            depth += 1
+            if depth >= JSON_MAX_DEPTH:
+                return True
+        elif token in ("]", "}"):
+            depth -= 1
+    return False
+
+
 def strict_json_loads(text: str) -> object:
     """Parse RFC 8259 JSON the way a strict 64-bit reader does, raising ``ValueError`` otherwise.
 
     ``NaN``/``Infinity`` are refused, a float that overflows is refused, an integer that does not
-    fit 64 bits becomes a float, and a lone surrogate escape is refused.
+    fit 64 bits becomes the nearest float (and is refused when even that overflows), a lone
+    surrogate escape is refused, and so is nesting :data:`JSON_MAX_DEPTH` levels deep. Every
+    failure is a ``ValueError``; nothing else escapes.
     """
-    document: object = json.loads(
-        text,
-        parse_constant=_reject_constant,
-        parse_float=_parse_float,
-        parse_int=_parse_int,
-    )
+    if _json_too_deep(text):
+        raise ValueError(f"JSON nested {JSON_MAX_DEPTH} or more levels deep")
+    try:
+        document: object = json.loads(
+            text,
+            parse_constant=_reject_constant,
+            parse_float=_parse_float,
+            parse_int=_parse_int,
+        )
+    except (OverflowError, RecursionError) as exc:
+        raise ValueError(str(exc)) from exc
     _reject_surrogates(document)
     return document

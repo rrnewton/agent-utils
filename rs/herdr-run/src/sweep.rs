@@ -52,7 +52,7 @@ use crate::identity::{current_boot_id, probe_process};
 use crate::reap::{plan_reap, PaneEvidence, ProcessIdentity, ReapPlan};
 use crate::retention::runs_root;
 use crate::session::tab_label_for;
-use crate::textfmt::{quote, strip_space};
+use crate::textfmt::{quote, strict_json, strip_space};
 
 /// Largest `meta.json` accepted. Run metadata is a few kilobytes; the bound keeps one corrupted
 /// spool entry from turning a sweep into an unbounded read.
@@ -89,8 +89,8 @@ pub fn load_run_records(config: &Config) -> Vec<Value> {
         let Ok(text) = fs::read_to_string(&path) else {
             continue;
         };
-        match serde_json::from_str::<Value>(&text) {
-            Ok(mut value) if value.is_object() => {
+        match strict_json(&text) {
+            Some(mut value) if value.is_object() => {
                 resolve_late_completion(&mut value, &directory);
                 records.push(value);
             }

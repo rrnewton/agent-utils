@@ -364,6 +364,7 @@ dependencies = [
  "fs2",
  "libc",
  "regex",
+ "ryu",
  "serde",
  "serde_json",
  "sha2",

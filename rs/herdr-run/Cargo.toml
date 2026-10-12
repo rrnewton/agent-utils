@@ -16,8 +16,13 @@ base64 = "0.22"
 fs2 = "0.4"
 libc = "0.2"
 regex = "1"
+# Shortest round-trip float digits with ties to even, the rule the Python edition's `repr` uses;
+# the standard library's float formatting breaks those ties upwards.
+ryu = "1"
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+# `float_roundtrip` makes every float read as the nearest `f64`, as the Python edition's reader
+# does. Without it the result would depend on whether another crate in the build enabled it.
+serde_json = { version = "1", features = ["float_roundtrip"] }
 sha2 = "0.10"
 
 [[bin]]

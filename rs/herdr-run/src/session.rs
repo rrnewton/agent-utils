@@ -19,7 +19,7 @@ use crate::config::{render_tab_name, Config};
 use crate::error::{HerdrRunError, Result};
 use crate::evict;
 use crate::state::{open_lock_file, session_lock_path};
-use crate::textfmt::{json_pretty, quote};
+use crate::textfmt::{json_pretty, quote, strict_json};
 
 static TEMPORARY_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
@@ -332,7 +332,7 @@ fn cache_still_valid<A: HerdrApi + ?Sized>(
 
 fn load_cache(path: &Path, key: &str) -> Option<CacheRecord> {
     let contents = fs::read_to_string(path).ok()?;
-    let document = serde_json::from_str::<serde_json::Value>(&contents).ok()?;
+    let document = strict_json(&contents)?;
     let value = document.as_object()?.get(key)?.clone();
     serde_json::from_value(value).ok()
 }
@@ -357,8 +357,9 @@ fn store_cache(path: &Path, key: &str, target: &Target) -> io::Result<()> {
 
     let mut entries = fs::read_to_string(path)
         .ok()
-        .and_then(|contents| {
-            serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(&contents).ok()
+        .and_then(|contents| match strict_json(&contents) {
+            Some(serde_json::Value::Object(entries)) => Some(entries),
+            _ => None,
         })
         .unwrap_or_default();
     let record = CacheRecord {

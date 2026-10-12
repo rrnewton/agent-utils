@@ -32,7 +32,7 @@ use std::time::{Duration, Instant};
 use serde_json::{Map, Value};
 
 use crate::error::{HerdrRunError, Result};
-use crate::textfmt::{os_error_text, quote, strip_space};
+use crate::textfmt::{os_error_text, quote, strict_json, strip_space};
 
 /// Transient user-systemd unit used for a server started by `herdr-run`.
 pub const SERVER_UNIT: &str = "herdr-run-server";
@@ -682,7 +682,7 @@ impl HerdrClient {
             Ok(completed) if completed.status == 0 => completed,
             _ => return false,
         };
-        let Ok(document) = serde_json::from_str::<Value>(&completed.stdout) else {
+        let Some(document) = strict_json(&completed.stdout) else {
             return false;
         };
         document
@@ -733,7 +733,7 @@ impl HerdrClient {
                 detail(&completed)
             )));
         }
-        let document = serde_json::from_str::<Value>(&completed.stdout).map_err(|_| {
+        let document = strict_json(&completed.stdout).ok_or_else(|| {
             let preview: String = strip_space(&completed.stdout).chars().take(200).collect();
             HerdrRunError::unavailable(format!(
                 "{purpose}: herdr returned non-JSON output: {}",
