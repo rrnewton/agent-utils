@@ -10,7 +10,7 @@
 # tool's lightweight unboxed gate. The root includes `tests.dag.yaml` directly so vibe-talk shares
 # one scheduler and browser cap with the other repository fragments.
 
-.PHONY: validate validate-boxed dag-check fmt check scripts-check contract contract-check typecheck test page pwa-installability enter-to-send-browser offline-cache-browser reactions-browser rich-headers-browser read-aloud-browser post-confirm-browser view-switch-browser read-modes-browser keyboard-browser two-column-browser bookmark-browser voice-read-acceptance-self-test android-speech-self-test live-hint-adapter-self-test container-smoke clean
+.PHONY: validate validate-boxed dag-check fmt check scripts-check contract contract-check typecheck test page pwa-installability enter-to-send-browser offline-cache-browser reactions-browser rich-headers-browser read-aloud-browser post-confirm-browser view-switch-browser read-modes-browser keyboard-browser two-column-browser bookmark-browser voice-read-acceptance-self-test android-speech-self-test live-hint-adapter-self-test container-smoke filter-place-browser clean
 
 # The whole gate for this tool, cheapest and most likely to fail first.
 #
@@ -193,6 +193,15 @@ two-column-browser:
 # keep a PNG of each step.
 bookmark-browser:
 	python3 tests/bookmark_browser.py $(if $(WEB_ROOT),--web-root $(WEB_ROOT)) $(if $(SCREENSHOTS),--screenshots $(SCREENSHOTS))
+
+# `#243 filter-keeps-selection` in a real Chromium at 1280x800 and 412x915, the owner's own sequence:
+# search, Pinned, a pin chosen with the mouse or a finger, the filter cleared -- the pin's row stands in
+# the channel's list where it stood in the Pinned list, within a pixel, and stays there; then an old pin,
+# two pages beyond what is loaded, walked back to under a "Loading earlier messages…" line and put where
+# it stood. Pass WEB_ROOT=dir to run it against another copy of the page, and SCREENSHOTS=dir to keep a
+# PNG of each stage.
+filter-place-browser:
+	python3 tests/filter_place_browser.py $(if $(WEB_ROOT),--web-root $(WEB_ROOT)) $(if $(SCREENSHOTS),--screenshots $(SCREENSHOTS))
 
 # The live #47 read-aloud-overlong check is opt-in and may consume provider time. Its transcript
 # reconciliation, PCM-duration metric, re-answer separation, privacy boundaries, threshold edges,

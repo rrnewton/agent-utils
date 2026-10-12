@@ -3244,8 +3244,9 @@ empty state fires and the reader would otherwise get a blank screen. That senten
 head of the list, and typing — or turning Links or a kind of link off, below — that empties the
 list takes the reader there, clear of the bar: the channel's composer still runs below an empty
 list, and a reader left at its foot had the sentence above the screen. Text that matches again, or
-a kind turned back on, opens the list at its newest line, as it opens everywhere else, and no jump
-to the newest message is offered over a list with nothing in it (`#212 link-filter`).
+a kind turned back on, puts back the message the reader was on before the list emptied (see the
+next section), and no jump to the newest message is offered over a list with nothing in it (`#212
+link-filter`).
 
 A class of its own, and not the `hidden` attribute, because `hidden` is where this page already
 records the *other* reasons a row is off screen — To do mode, dismissed, which view is up. A filter
@@ -3254,6 +3255,44 @@ that borrowed it would put archived rows back on screen when the search was clea
 Rules the page drew itself — the seam between two calls, the date rules — **go away with the rows
 they were explaining**. A seam says the agent below it never heard the words above it, and left
 standing over a filtered list it says that about two rows that are no longer adjacent.
+
+### A filter keeps your place
+
+`#243 filter-keeps-selection`. The owner: *"when you adjust the filter, the highlighted message MUST
+stay on the screen. Ideally it stays on the screen in the same Y location without a 'jump.'"* His case
+was finding a pin: search, **Pinned**, select the message — and as soon as the filter was cleared, the
+list jumped and the message he had just found was gone.
+
+So every change of what the list shows keeps the reader's message where it is on the screen: the
+search text typed or cleared, the search closed (Escape or the glass), **Pinned** and **Links** on or
+off, **PRs**, **Commits** and **Actions**, and **Show read**, **Collapse read** and **Hide read**. The
+message kept is the **selected** one while it is on screen — chosen by the keys, the mouse, or
+silently by a tap — and otherwise the one at the top of the screen, or the newest line for a reader
+on it. Afterwards it stands at the same height, as near as the ends of the list allow:
+
+- a pin that is the second part of a post the channel combined into one row stands where
+  it stood in the Pinned list, and the part above it goes above the screen's line, not below it;
+- under **Collapse read**, a message folded into a run is kept by the run's line;
+- a message the new filter hides is replaced by the **nearest one shown**, in channel order, and
+  when it was the selection the status line says why — "Not pinned", "Filtered out", "Hide read
+  hides it". Turned back without a scroll, the filter is a round trip: the message comes back where
+  it was;
+- a message older than everything loaded — a pin from earlier in the day, chosen under Pinned — is
+  **walked back to**, at most ten pages, while the head of the list says *Loading earlier
+  messages…*, and then put where it stood. A reader who scrolls, presses in the list or jumps
+  somewhere meanwhile ends the walk where it is, and is not pulled back when a page lands;
+- the selection goes with it, lit and focused as it was.
+
+Nothing else moves it afterwards until the reader scrolls or does something in the list: not a
+message arriving at the newest line, not a refresh landing behind the change, not the chips under the
+list changing height, and not a thread's landing on its first unread message. The reader's own act
+ends that — a press or a tap in the list, another message chosen by the keys, the mouse or the focus,
+a key that acts on a message, a fold opened or closed, **Collapse all** or **Expand all** — and from
+then on the page keeps their place as it does everywhere else, from where they are. So a message
+folded just above the kept one stays where the reader saw it, and a reader on the newest line who has
+moved on is followed down to new messages again. A view switch is not a filter, and keeps its own
+landing rules. At the head of the Pinned list nothing steps back through the channel's history
+behind it: older history adds no pin to that list.
 
 ### Only the links
 

@@ -585,7 +585,10 @@ class FakeElement {
 
   /** What this element occupies on screen. A hidden element occupies nothing. */
   height() {
-    if (this.hidden) {
+    // `.search-hidden` is `display: none !important` in web/voice.css: a row a filter hides takes no
+    // room, so a filter that changes which rows show moves every row below them. `#243
+    // filter-keeps-selection` measures exactly that.
+    if (this.hidden || this.hasClass("search-hidden")) {
       return 0;
     }
     if (this.hasClass("clamped")) {
@@ -3164,6 +3167,12 @@ const TUNING_BANDS = {
     "and a question asked shortly before the newest page is out of reach of the control made for " +
     "it; past about ten, a tap on a reply to a deleted message reads hundreds of messages on a " +
     "walk that cannot succeed while the reader waits"],
+  // `#243 filter-keeps-selection`: a filter turned off over a message older than anything loaded.
+  FILTER_WALK_PAGES: [3, 20,
+    "older pages a filter change may read to put back the message it is keeping, an old pin chosen " +
+    "under Pinned typically. Under three, a pin from earlier in the day is out of reach and the " +
+    "reader is left at the oldest message loaded instead of the one they chose; past about twenty, " +
+    "a thousand messages are read while the reader waits at the head of the list"],
   REPLY_LANDED_MS: [800, 5000,
     "how long the row a jump lands on stays lit. Under most of a second the light is gone before " +
     "the eye has followed the scroll; past a few seconds it is still lit after the reader has moved " +
@@ -31831,19 +31840,29 @@ test("under Links a tap on the row folds nothing, and the fold chips and summari
   assert.equal(page.el("expand-all").hidden, false, "the fold chips did not come back with the text");
 });
 
-test("turning Links on puts the reader at the newest link, and off puts them back where they were", async () => {
+test("turning Links on keeps the reader's place — the newest line, or the message at the top — and off puts them back where they were", async () => {
   const page = newPage();
   await signIn(page);
   const area = page.el("scroll-area");
   await showDiscord(page, Array.from({ length: 12 }, (_unused, i) =>
     message({ id: String(i + 1), content: i % 3 === 0 ? `${longMessage(`m${i}`)} https://example.com/${i}` : longMessage(`m${i}`) })));
-  area.scrollTop = 0;
+  // On the newest line: Links keeps the reader on it, at the newest link, and off on the newest message.
   await page.el("search-toggle").click();
   await page.settle();
-  const top = area.scrollTop;
+  assert.ok(atBottomOf(area), "the channel did not open at its newest line");
   await page.el("links-filter").click();
   await page.settle();
-  assert.ok(area.scrollHeight - area.scrollTop - area.clientHeight <= 24, "the reader was not put at the newest link");
+  assert.ok(atBottomOf(area), "a reader on the newest line was not kept at the newest link");
+  await page.el("links-filter").click();
+  await page.settle();
+  assert.ok(atBottomOf(area), "a reader at the newest link was not put back on the newest line");
+  // Up the history, with a message holding a link at the top: it stays where it is on the screen.
+  area.scrollTop = 0;
+  const top = area.scrollTop;
+  const at = rowWithId(page, "1").getBoundingClientRect().top;
+  await page.el("links-filter").click();
+  await page.settle();
+  assert.equal(rowWithId(page, "1").getBoundingClientRect().top, at, "the message at the top moved when Links came on");
   await page.el("links-filter").click();
   await page.settle();
   assert.equal(area.scrollTop, top, "turning the filter off lost the reader's place");
@@ -32300,6 +32319,12 @@ test("a list the filters empty is shown from its head, where it says why, and fi
     await showDiscord(page, Array.from({ length: 30 }, (_unused, i) =>
       message({ id: String(i + 1), content: `note ${i}: ${REPO}/pull/${i + 1}` })));
     await showLinks(page);
+    // The composer below every list keeps it overflowing a phone with all its rows gone, which is the
+    // whole reason the sentence needs the reader taken to it. A tall line under the box stands in for
+    // it here, where a filtered-out row takes no room and a short list could not be scrolled at all.
+    page.el("channel-compose-state").textContent = "a line under the message box. ".repeat(40);
+    await page.el("scroll-area").dispatch("scroll");
+    page.el("scroll-area").scrollTop = page.el("scroll-area").scrollHeight;
     return page;
   };
   const page = await run(SCRIPT);
@@ -32344,7 +32369,7 @@ test("a list the filters empty is shown from its head, where it says why, and fi
   // THE CONTROLS: each half of `placeForFilter`, and the jump, taken out, and the step above that
   // needs it fails.
   const unplaced = await run(brokenScript(
-    '  if (listEmptied()) el("scroll-area").scrollTop = 0;', '  if (listEmptied()) void 0;'));
+    "  if (listEmptied()) {\n    area.scrollTop = 0;", "  if (listEmptied()) {\n    void 0;"));
   await tapKind(unplaced, "pr");
   assert.ok(unplaced.el("scroll-area").scrollTop > 0, "the test cannot see a reader left below the sentence");
   const jumping = await run(brokenScript(
@@ -32353,7 +32378,7 @@ test("a list the filters empty is shown from its head, where it says why, and fi
   await tapKind(jumping, "pr");
   await jumping.el("scroll-area").dispatch("scroll");
   assert.equal(jumping.el("jump-newest").hidden, false, "the test cannot see a jump offered over an emptied list");
-  const unfilled = await run(brokenScript("  else if (wasEmptied) scrollToNewest();", "  else if (wasEmptied) void 0;"));
+  const unfilled = await run(brokenScript("    if (anchor || wasEmptied) scrollToNewest();", "    if (false) scrollToNewest();"));
   await tapKind(unfilled, "pr");
   await tapKind(unfilled, "pr");
   assert.ok(!atBottomOf(unfilled.el("scroll-area")), "the test cannot see links come back above the reader");
@@ -38185,4 +38210,654 @@ test("`#240 reading-bookmark`: a screen cleared under a bookmark write still on 
   await page.settle();
   assert.deepStrictEqual(bookmarkAt(page), { id: bid(1), place: "above" }, "the settled write was not shown");
   assert.equal(page.bookmark.anchor.message_id, bid(1));
+});
+
+// --- a filter changed: the selected message stays where it is (#243 filter-keeps-selection) ----------
+//
+// The owner, 2026-10-12: "jump to my last pinned message: go to search, filter for pinned, select the
+// message. But then as soon as I clear the filter, the screen jumps and I don't have the message I just
+// found. The rule here is that when you adjust the filter, the highlighted message MUST stay on the
+// screen. Ideally it stays on the screen in the same Y location without a "jump."" Each kind of filter
+// change below — the search text cleared, the search closed by Escape or the glass, Pinned, Links, the
+// kinds of link, the read modes — is measured by the selected message's id and how far below the top of
+// the list's box it stands, before and after, within a pixel. tests/filter_place_browser.py does the
+// owner's own sequence in Chromium at a desk's size and a phone's.
+
+const FILTER_WALK_PAGES = sourceConstant("FILTER_WALK_PAGES");
+
+/**
+ * Forty messages of three heights: every fifth about the deploy, every third with a link — to a pull
+ * request when its number is even, to a document when it is odd.
+ */
+function placeChannel(count = 40) {
+  return Array.from({ length: count }, (_unused, i) => {
+    const n = i + 1;
+    const words = n % 5 === 0 ? `deploy note ${n}` : `message ${n}`;
+    const link = n % 3 === 0 ? (n % 2 === 0 ? ` ${REPO}/pull/${n}` : ` https://docs.example.com/page-${n}`) : "";
+    const body = n % 4 === 0 ? longMessage(words) : `${words}: ${"a few words more. ".repeat(1 + (n % 3))}`;
+    return message({ id: String(n), content: `${body}${link}` });
+  });
+}
+
+/** The row of `list` standing for message `id`. */
+const placeRow = (page, id, list = "discord-log") =>
+  page.el(list).children.find((li) => String(li.getAttribute("data-ids")).split(" ").includes(id));
+
+/** How far below the top of `scroller`'s box the row of `list` holding message `id` stands. */
+function yOf(page, id, list = "discord-log", scroller = "scroll-area") {
+  const row = placeRow(page, id, list);
+  assert.ok(row, `no row of #${list} holds message ${id}`);
+  return row.getBoundingClientRect().top - page.el(scroller).getBoundingClientRect().top;
+}
+
+/** Scroll `scroller` so that message `id` of `list` stands `y` px below its top. */
+function parkAt(page, id, y, list = "discord-log", scroller = "scroll-area") {
+  page.el(scroller).scrollTop += yOf(page, id, list, scroller) - y;
+  assert.ok(Math.abs(yOf(page, id, list, scroller) - y) <= 1, `message ${id} cannot stand ${y}px down: the list ends`);
+}
+
+/** Select message `id` as a mouse does: a click on the list (which takes the focus), over the row and on it. */
+async function clickRow(page, id, list = "discord-log", scroller = "scroll-area") {
+  const row = placeRow(page, id, list);
+  page.el(scroller).focus();
+  await mouseTo(page, row, 100, yOf(page, id, list, scroller) + 5);
+  await pressOn(page, row, "mouse", scroller);
+}
+
+/** ...and as a finger does: a tap, which selects it silently. */
+async function tapRow(page, id, list = "discord-log", scroller = "scroll-area") {
+  await pressOn(page, placeRow(page, id, list), "touch", scroller);
+}
+
+/** Message `id` stands `y` px down, as it did, within a pixel. */
+function keptAt(page, id, y, why, list = "discord-log", scroller = "scroll-area") {
+  const now = yOf(page, id, list, scroller);
+  assert.ok(Math.abs(now - y) <= 1, `${why}: message ${id} moved from ${y.toFixed(1)}px to ${now.toFixed(1)}px down`);
+}
+
+/** The place channel with five pins, three of them more than a screen apart. */
+function pinnedPlacePage(pinnedIds = ["3", "12", "27", "33", "38"], script = SCRIPT) {
+  const page = newPage(new Map(), script);
+  const messages = placeChannel();
+  for (const id of pinnedIds) page.pinned.set(id, storedPin(messages[Number(id) - 1]));
+  page.servePinsRevision = true;
+  page.pinsRevision = 4;
+  return { page, messages };
+}
+
+test("`#243 filter-keeps-selection`: a message selected among a search's matches stays where it is when the text is cleared", async () => {
+  const run = async (script) => {
+    const page = newPage(new Map(), script);
+    await signIn(page);
+    await showDiscord(page, placeChannel());
+    await search(page, "deploy");
+    await page.settle();
+    parkAt(page, "25", 150);
+    await clickRow(page, "25");
+    const y = yOf(page, "25");
+    const top = page.el("scroll-area").scrollTop;
+    // The field's own clear button: the focus is in the field, and the text goes all at once.
+    page.el("search-field").focus();
+    await page.el("search-field").setValue("");
+    await page.settle();
+    return { page, y, top };
+  };
+  const { page, y, top } = await run(SCRIPT);
+  keptAt(page, "25", y, "clearing the search text");
+  assert.ok(page.el("scroll-area").scrollTop - top > SCROLL_VIEWPORT_PX,
+    "the fixture brought back no screenful of rows above the message, so nothing could have moved it");
+  assert.deepStrictEqual(litIds(page), ["25"], "the message is not lit as the selection once the search went");
+  assert.equal(focused(page), page.el("search-field"), "clearing the text took the focus out of the field");
+  // THE CONTROL: without the placing, the same offset in the whole list is somewhere else entirely.
+  const unplaced = await run(brokenScript(
+    "        if (!landed || currentFilterHold() !== null) placeFilterAnchor(anchor, wasEmptied);",
+    "        void anchor;"));
+  assert.ok(Math.abs(yOf(unplaced.page, "25") - unplaced.y) > 1, "the test cannot see the message jump");
+});
+
+test("`#243 filter-keeps-selection`: closing the search by Escape or by the glass leaves the selected message where it is, and Escape gives it the focus", async () => {
+  for (const close of ["Escape", "the glass"]) {
+    const page = newPage();
+    await signIn(page);
+    await showDiscord(page, placeChannel());
+    await search(page, "deploy");
+    await page.settle();
+    parkAt(page, "30", 180);
+    await clickRow(page, "30");
+    const y = yOf(page, "30");
+    if (close === "Escape") await press(page, page.el("search-field"), "Escape");
+    else await page.el("search-toggle").click();
+    await page.settle();
+    assert.equal(page.el("search-toggle").getAttribute("aria-pressed"), "false", `${close} did not close the search`);
+    keptAt(page, "30", y, `closing the search by ${close}`);
+    assert.deepStrictEqual(litIds(page), ["30"], `closed by ${close}, the message is not lit as the selection`);
+    if (close === "Escape") assert.equal(selectedId(page), "30", "Escape did not give the focus to the selected message");
+  }
+});
+
+test("`#243 filter-keeps-selection`: THE OWNER'S SEQUENCE — search, Pinned, a pin chosen, the filter cleared — leaves that message where it was", async () => {
+  for (const [how, clear] of [["touch", "Pinned"], ["mouse", "Escape"], ["mouse", "the glass"]]) {
+    const { page, messages } = pinnedPlacePage();
+    await signIn(page);
+    await showDiscord(page, messages);
+    await showPinned(page);
+    assert.deepStrictEqual(pinnedIds(page), ["3", "12", "27", "33", "38"], "the fixture's pins are not the ones listed");
+    // The pin the reader was after, on screen whole (from review: it was chosen above the list's box),
+    // and chosen as a thumb or a mouse chooses it.
+    parkAt(page, "27", 120, "pinned-log");
+    const pin = placeRow(page, "27", "pinned-log");
+    assert.ok(pin.getBoundingClientRect().bottom - page.el("scroll-area").getBoundingClientRect().top < SCROLL_VIEWPORT_PX,
+      "the pin chosen is not on screen whole");
+    if (how === "touch") await tapRow(page, "27", "pinned-log");
+    else await clickRow(page, "27", "pinned-log");
+    const y = yOf(page, "27", "pinned-log");
+    if (clear === "Pinned") await page.el("pinned-filter").click();
+    else if (clear === "Escape") await press(page, page.el("search-field"), "Escape");
+    else await page.el("search-toggle").click();
+    await page.settle();
+    const shape = `chosen by ${how}, cleared by ${clear}`;
+    assert.equal(page.el("pinned-log").hidden, true, `${shape}: the Pinned list is still up`);
+    keptAt(page, "27", y, shape);
+    if (how === "touch") {
+      assert.deepStrictEqual(litIds(page), [], `${shape}: a message a tap chose is lit`);
+      // ...and the selection came with it: the next key starts from it.
+      await press(page, page.el("scroll-area"), "ArrowDown");
+      assert.equal(selectedId(page), "28", `${shape}: ↓ did not start from the pin chosen in the Pinned list`);
+    } else {
+      assert.deepStrictEqual(litIds(page), ["27"], `${shape}: the pin chosen is not lit in the channel's list`);
+      if (clear === "Escape") assert.equal(selectedId(page), "27", `${shape}: the focus is not on the pin chosen`);
+    }
+  }
+});
+
+test("`#243 filter-keeps-selection`: turned on, Pinned keeps a selected pin where it was, and the nearest pin in place of a message that is not one", async () => {
+  const { page, messages } = pinnedPlacePage();
+  await signIn(page);
+  await showDiscord(page, messages);
+  await search(page, "");
+  await page.settle();
+  // A pin selected in the channel: it is where it was in the Pinned list.
+  parkAt(page, "33", 200);
+  await clickRow(page, "33");
+  let y = yOf(page, "33");
+  await page.el("pinned-filter").click();
+  await page.settle();
+  keptAt(page, "33", y, "turning Pinned on", "pinned-log");
+  assert.deepStrictEqual(litIds(page), ["33"], "the pin selected in the channel is not lit in the Pinned list");
+  await page.el("pinned-filter").click();
+  await page.settle();
+  keptAt(page, "33", y, "turning Pinned off again");
+  // A message that is not pinned, chosen by a tap: the pin nearest it stands where it stood, and the
+  // status line says so. Turned off without scrolling, the message is back where it was.
+  parkAt(page, "26", 160);
+  await tapRow(page, "26");
+  y = yOf(page, "26");
+  await page.el("pinned-filter").click();
+  await page.settle();
+  keptAt(page, "27", y, "turning Pinned on over a message that is not pinned", "pinned-log");
+  assert.equal(statusText(page), "Not pinned — the nearest pin is here.");
+  await page.el("pinned-filter").click();
+  await page.settle();
+  keptAt(page, "26", y, "turning Pinned on and off without a scroll");
+});
+
+test("`#243 filter-keeps-selection`: Links on and off keeps the selected message where it is; one without a link is kept by the nearest with one, and comes back", async () => {
+  const page = newPage();
+  await signIn(page);
+  await showDiscord(page, placeChannel());
+  await showLinks(page);
+  // Under Links: a message with a link, selected, and Links turned off.
+  parkAt(page, "21", 170);
+  await clickRow(page, "21");
+  let y = yOf(page, "21");
+  await page.el("links-filter").click();
+  await page.settle();
+  keptAt(page, "21", y, "turning Links off");
+  assert.deepStrictEqual(litIds(page), ["21"]);
+  await page.el("links-filter").click();
+  await page.settle();
+  keptAt(page, "21", y, "turning Links on");
+  await page.el("links-filter").click();
+  await page.settle();
+  // THE HIDDEN ANCHOR. Message 20 has no link: under Links the next message shown, 21, stands where it
+  // stood, and the status line says why. A tap chose it, so the selection stays with it, to come back.
+  parkAt(page, "20", 140);
+  await tapRow(page, "20");
+  y = yOf(page, "20");
+  await page.el("links-filter").click();
+  await page.settle();
+  keptAt(page, "21", y, "turning Links on over a message without a link");
+  assert.equal(statusText(page), "Filtered out — the nearest is here.");
+  await page.el("links-filter").click();
+  await page.settle();
+  keptAt(page, "20", y, "turning Links on and off without a scroll");
+  await press(page, page.el("scroll-area"), "ArrowDown");
+  assert.equal(selectedId(page), "21", "the selection did not stay with the message Links hid");
+});
+
+test("`#243 filter-keeps-selection`: PRs, Commits and Actions keep the selected link where it is, and a pull request hidden by PRs comes back where it was", async () => {
+  const page = newPage();
+  await signIn(page);
+  await showDiscord(page, placeChannel());
+  await showLinks(page);
+  // A document's link stays through every kind turned off and on.
+  parkAt(page, "27", 190);
+  await clickRow(page, "27");
+  const y = yOf(page, "27");
+  for (const [kind, why] of [["pr", "PRs off"], ["commit", "Commits off"], ["action", "Actions off"],
+    ["pr", "PRs on"], ["commit", "Commits on"], ["action", "Actions on"]]) {
+    await tapKind(page, kind);
+    keptAt(page, "27", y, why);
+  }
+  assert.deepStrictEqual(litIds(page), ["27"]);
+  // A pull request, selected, and PRs off: the nearest message still shown takes its place. Back on,
+  // the pull request is where it was.
+  parkAt(page, "24", 150);
+  await tapRow(page, "24");
+  const at = yOf(page, "24");
+  await tapKind(page, "pr");
+  assert.equal(placeRow(page, "24").hasClass("search-hidden"), true, "the fixture's pull request is still shown");
+  assert.equal(statusText(page), "Filtered out — the nearest is here.");
+  const standIn = page.el("discord-log").children.find((li) => !li.hasClass("search-hidden") &&
+    Math.abs(li.getBoundingClientRect().top - at) <= 1);
+  assert.ok(standIn, "no message shown stands where the pull request stood");
+  assert.ok(["21", "27"].includes(standIn.getAttribute("data-id")),
+    `the message standing in is ${standIn.getAttribute("data-id")}, not the nearest one shown`);
+  await tapKind(page, "pr");
+  keptAt(page, "24", at, "PRs off and on again without a scroll");
+});
+
+test("`#243 filter-keeps-selection`: Pinned turned on at the newest line before the pins are read says so from the head of the list, and the pins land at the newest", async () => {
+  const run = async (script) => {
+    const page = newPage(new Map(), script);
+    const messages = placeChannel();
+    for (const id of ["2", "5", "9", "14", "18", "22", "26", "30", "34", "37", "39"]) {
+      page.pinned.set(id, storedPin(messages[Number(id) - 1]));
+    }
+    await signIn(page);
+    await showDiscord(page, messages);
+    await search(page, "");
+    await page.settle();
+    // The composer below every list keeps it overflowing a phone with its rows gone (see the emptied
+    // list's test above): a tall line under the box stands in for it.
+    page.el("channel-compose-state").textContent = "a line under the message box. ".repeat(40);
+    const area = page.el("scroll-area");
+    area.scrollTop = area.scrollHeight;
+    assert.ok(atBottomOf(area), "the fixture's reader is not on the newest line");
+    // No read has carried the pins' revision, so the filter reads them now: "Loading…" first.
+    await page.el("pinned-filter").click();
+    const loading = { top: area.scrollTop, said: page.el("search-empty").textContent };
+    for (let i = 0; i < 3; i += 1) await page.settle();
+    return { page, area, loading };
+  };
+  const { page, area, loading } = await run(SCRIPT);
+  assert.equal(loading.said, "Loading this channel's pinned messages…");
+  assert.equal(loading.top, 0, "the sentence saying the pins are loading was not shown from the head of the list");
+  assert.equal(pinnedIds(page).length, 11, "the pins did not land");
+  assert.ok(atBottomOf(area), "the pins landed with the reader at the oldest of them");
+  // THE CONTROL: without the newest line kept for the pins, they land under a reader at their oldest.
+  const lost = await run(brokenScript("    filterHold = anchor\n      ? {", "    filterHold = anchor && !anchor.newest\n      ? {"));
+  assert.ok(!atBottomOf(lost.area), "the test cannot see the pins land at their oldest");
+});
+
+/** Thirty messages from the agent, of two heights: 1, 2, 5, 6, 9, 10 and so on dealt with, the rest not. */
+function readPlaceChannel(page) {
+  return Array.from({ length: 30 }, (_unused, i) => {
+    const n = i + 1;
+    const id = String(n);
+    if (n % 4 === 1 || n % 4 === 2) page.dealtWith.add(id);
+    return message({ id, content: n % 3 === 0 ? longMessage(`update ${n}`) : `update ${n}: ${"the state of it. ".repeat(2)}`,
+      ...CODER });
+  });
+}
+
+test("`#243 filter-keeps-selection`: Show read, Collapse read and Hide read each keep the selected message where it is — behind its run's line when it is collapsed", async () => {
+  const page = newPage();
+  await signIn(page);
+  await showDiscord(page, readPlaceChannel(page));
+  // An unread message, selected, through the whole cycle: Collapse read folds the runs above it into
+  // lines, Hide read reads only what is left, and Show read reads the channel again.
+  parkAt(page, "19", 200);
+  await clickRow(page, "19");
+  const y = yOf(page, "19");
+  const top = page.el("scroll-area").scrollTop;
+  await chooseReadMode(page, "Collapse read");
+  keptAt(page, "19", y, "Collapse read");
+  assert.ok(collapsedRows(page).length > 0, "Collapse read collapsed nothing above the message");
+  await chooseReadMode(page, "Hide read");
+  await page.settle();
+  keptAt(page, "19", y, "Hide read");
+  assert.ok(top - page.el("scroll-area").scrollTop > SCROLL_VIEWPORT_PX / 2,
+    "Hide read took too little away above the message for a jump to show");
+  await chooseReadMode(page, "Show read");
+  await page.settle();
+  keptAt(page, "19", y, "Show read");
+  assert.deepStrictEqual(litIds(page), ["19"], "the message is not lit as the selection after the cycle");
+  // A read message inside a run: under Collapse read the run's line stands where it stood, and is lit.
+  parkAt(page, "18", 160);
+  await clickRow(page, "18");
+  const runAt = yOf(page, "18");
+  await chooseReadMode(page, "Collapse read");
+  assert.equal(placeRow(page, "18").getAttribute("data-read-run"), "member", "the fixture's message did not join a run");
+  keptAt(page, "17", runAt, "the line of the run the selected message joined");
+  assert.deepStrictEqual(litIds(page), ["17"], "the run's line is not lit for the selected message inside it");
+  // Hide read takes it away: the nearest message left stands there, and the status line says why.
+  await chooseReadMode(page, "Hide read");
+  await page.settle();
+  assert.equal(placeRow(page, "18"), undefined, "Hide read left a read message in the list");
+  assert.equal(statusText(page), "Hide read hides it — nearest is here.");
+  const standIn = page.el("discord-log").children.find((li) => Math.abs(li.getBoundingClientRect().top - runAt) <= 1);
+  assert.ok(standIn && ["19", "16"].includes(standIn.getAttribute("data-id")),
+    `the message standing in for 18 is ${standIn ? standIn.getAttribute("data-id") : "none"}, not the nearest one left`);
+});
+
+test("`#243 filter-keeps-selection`: a pin older than anything loaded is walked back to when the filter goes, with a line saying so, and put where it was", async () => {
+  const page = newPage();
+  await signIn(page);
+  // 995..1018 in pages of six: the newest page is 1013..1018, and 997 is three pages back.
+  const all = pagedChannel(page, { steps: 4, size: 6,
+    content: (i) => (i % 2 ? longMessage(`message ${i}`) : `message ${i}: ${"short and plain. ".repeat(2)}`) });
+  for (const held of [all[2], all[20]]) page.pinned.set(held.id, storedPin(held));
+  await showDiscord(page, []);
+  assert.equal(placeRow(page, "997"), undefined, "the old pin is loaded already");
+  // Turned on before the pins were read: they land behind the filter's "Loading…".
+  await showPinned(page);
+  assert.deepStrictEqual(pinnedIds(page), ["997", "1015"]);
+  // At the head of the Pinned list nothing steps back behind it: older history adds no pin to it.
+  page.el("scroll-area").scrollTop = 0;
+  await page.el("scroll-area").dispatch("scroll");
+  await page.settle();
+  assert.equal(olderReads(page).length, 0, "the head of the Pinned list read an older page of the channel behind it");
+  await tapRow(page, "997", "pinned-log");
+  const y = yOf(page, "997", "pinned-log");
+  // What the step-back line says while each older page is read.
+  const lines = [];
+  const serve = page.channelPage;
+  page.channelPage = (path) => {
+    if (/[?&]before=/.test(String(path))) lines.push(page.el("load-older").textContent);
+    return serve(path);
+  };
+  await page.el("pinned-filter").click();
+  for (let i = 0; i < 4 * FILTER_WALK_PAGES; i += 1) await page.settle();
+  assert.equal(olderReads(page).length, 3, `the walk read ${olderReads(page).length} older pages, not the three to the pin`);
+  assert.deepStrictEqual(lines, Array(3).fill("Loading earlier messages…"), "the step-back line did not say what the walk was doing");
+  keptAt(page, "997", y, "the old pin, walked back to");
+  assert.equal(statusText(page), "Here is the selected message.");
+  assert.equal(page.el("load-older").textContent, "Older messages", "the line still says it is loading");
+  await press(page, page.el("scroll-area"), "ArrowDown");
+  assert.equal(selectedId(page), "998", "the old pin did not come back as the selection");
+});
+
+test("`#243 filter-keeps-selection`: the walk back is bounded: a pin further back than it reads leaves the oldest loaded message in its place, and says so", async () => {
+  const page = newPage();
+  await signIn(page);
+  const all = pagedChannel(page, { steps: FILTER_WALK_PAGES + 3, size: 2,
+    content: (i) => `message ${i}: ${"short and plain. ".repeat(3)}` });
+  page.pinned.set(all[0].id, storedPin(all[0]));
+  page.pinned.set(all[all.length - 1].id, storedPin(all[all.length - 1]));
+  await showDiscord(page, []);
+  await showPinned(page);
+  await tapRow(page, all[0].id, "pinned-log");
+  const y = yOf(page, all[0].id, "pinned-log");
+  await page.el("pinned-filter").click();
+  for (let i = 0; i < 4 * (FILTER_WALK_PAGES + 3); i += 1) await page.settle();
+  assert.equal(olderReads(page).length, FILTER_WALK_PAGES, "the walk back was not bounded");
+  assert.equal(placeRow(page, all[0].id), undefined);
+  const oldest = page.el("discord-log").children.find((li) => li.hasAttribute("data-id"));
+  keptAt(page, oldest.getAttribute("data-id"), y, "the oldest message loaded, in the old pin's place");
+  assert.equal(statusText(page), `Over ${FILTER_WALK_PAGES} pages back — oldest is here.`);
+});
+
+/** A channel with one long thread: twenty messages on Main, 305 its root, and twenty replies in it. */
+function columnPlaceChannel(page) {
+  const thread = { id: "spaces/A/threads/long", root_message_id: "305", is_root: true, reply_count: 20,
+    reply_count_exact: true };
+  const messages = Array.from({ length: 40 }, (_unused, i) => {
+    const n = 300 + i;
+    const words = n % 3 === 0 ? `alpha ${n}` : `message ${n}`;
+    const content = n % 2 ? longMessage(words) : `${words}: ${"a line or so of it. ".repeat(2)}`;
+    const own = n === 305 ? thread : n >= 320 ? { ...thread, is_root: false } : null;
+    return message({ id: String(n), content, ...(own ? { thread: own } : {}) });
+  });
+  page.threadingSupported = true;
+  page.threads = [{ id: thread.id, root: messages[5], title: "The long discussion", reply_count: 20,
+    reply_count_exact: true, updated_at: messages[39].timestamp }];
+  return messages;
+}
+
+test("`#243 filter-keeps-selection`: in two columns the search keeps each column's selected message where it is", async () => {
+  const page = newPage();
+  const messages = columnPlaceChannel(page);
+  await signIn(page);
+  await showDiscord(page, messages);
+  await twoColumns(page);
+  await threadBadge(rowWithId(page, "305")).click();
+  await page.settle();
+  assert.ok(sideIds(page).includes("330"), "the thread did not open on the right");
+  await search(page, "alpha");
+  await page.settle();
+  // One message selected in each column: the left's first, then the right's, which is the one lit.
+  parkAt(page, "312", 150);
+  await clickRow(page, "312");
+  parkAt(page, "330", 180, "side-log", "side-scroll");
+  await clickRow(page, "330", "side-log", "side-scroll");
+  const left = yOf(page, "312");
+  const right = yOf(page, "330", "side-log", "side-scroll");
+  const tops = [page.el("scroll-area").scrollTop, page.el("side-scroll").scrollTop];
+  await page.el("search-field").setValue("");
+  await page.settle();
+  keptAt(page, "312", left, "the left column, the search cleared");
+  keptAt(page, "330", right, "the right column, the search cleared", "side-log", "side-scroll");
+  assert.ok(page.el("scroll-area").scrollTop - tops[0] > SCROLL_VIEWPORT_PX / 2 &&
+    page.el("side-scroll").scrollTop - tops[1] > SCROLL_VIEWPORT_PX / 2,
+    "the fixture brought too few rows back above the selected messages for a jump to show");
+  assert.deepStrictEqual(litRows(page), ["side-log:330"], "the right column's message is not the one lit");
+});
+
+test("`#243 filter-keeps-selection`: and nothing else moves it afterwards — not a read bringing a new message, while the reader stays", async () => {
+  const run = async (script) => {
+    const { page, messages } = pinnedPlacePage(["12", "27", "40"], script);
+    await signIn(page);
+    await showDiscord(page, messages);
+    await showPinned(page);
+    // The newest message, pinned and chosen: in the channel's list it is at the newest line.
+    await clickRow(page, "40", "pinned-log");
+    await page.el("pinned-filter").click();
+    await page.settle();
+    return page;
+  };
+  const page = await run(SCRIPT);
+  const area = page.el("scroll-area");
+  assert.ok(atBottomOf(area), "the fixture's pin is not at the newest line once the filter goes");
+  const y = yOf(page, "40");
+  // A poll brings a message below it. On the newest line, a reader is followed down to new messages —
+  // but not one whose message a filter change has just put there.
+  page.messages = [...page.messages, message({ id: "41", content: longMessage("arrived") })];
+  await reReadChannel(page);
+  keptAt(page, "40", y, "a read bringing a new message");
+  assert.ok(jumpSaysArrived(page), "the new message below is not offered");
+  // Once the reader scrolls, the newest line is followed again as it always was.
+  area.scrollTop = area.scrollHeight;
+  await area.dispatch("scroll");
+  page.messages = [...page.messages, message({ id: "42", content: longMessage("arrived again") })];
+  await reReadChannel(page);
+  assert.ok(atBottomOf(area), "a reader on the newest line was not followed once they had scrolled");
+  // THE CONTROL: with the hold taken out, the read follows the newest line and the message moves.
+  const followed = await run(SCRIPT
+    .replace("  return atBottom(area) && heldFilterRow() === null;", "  return atBottom(area);")
+    .replace("  if (how.keepPosition && keepFilterHold()) {", "  if (false) {"));
+  const before = yOf(followed, "40");
+  followed.messages = [...followed.messages, message({ id: "41", content: longMessage("arrived") })];
+  await reReadChannel(followed);
+  assert.ok(Math.abs(yOf(followed, "40") - before) > 1, "the test cannot see a read move the message");
+});
+
+/** The pinned place channel with pin 30 at 290px in the Pinned list, chosen there by the mouse, and Pinned turned off. */
+async function pinThirtyKept(script = SCRIPT) {
+  const { page, messages } = pinnedPlacePage(["16", "18", "20", "22", "24", "26", "27", "30", "33", "38"], script);
+  await signIn(page);
+  await showDiscord(page, messages);
+  await showPinned(page);
+  parkAt(page, "30", 290, "pinned-log");
+  await clickRow(page, "30", "pinned-log");
+  await page.el("pinned-filter").click();
+  await page.settle();
+  keptAt(page, "30", 290, "turning Pinned off over the pin chosen");
+  return page;
+}
+
+test("`#243 filter-keeps-selection`: the reader's own act ends what the change held — a fold opened just above the kept message stays where the reader saw it", async () => {
+  // From review: the hold lasted until the reader scrolled, and stayed every `preservingScroll`'s
+  // anchor meanwhile. Message 28 is on screen whole just above the pin kept; opening its fold kept the
+  // pin still and pushed 28's first 140px above the screen.
+  const run = async (script, pressFirst) => {
+    const page = await pinThirtyKept(script);
+    const row = placeRow(page, "28");
+    const before = yOf(page, "28");
+    const height = row.height();
+    assert.ok(before >= 0 && before + height <= 290, `message 28 is not on screen whole above the pin (${before}px, ${height}px tall)`);
+    // A mouse's press comes first in a browser; a key on the focused fold is the click alone.
+    if (pressFirst) await page.documentEvent("pointerdown", { target: foldButton(row), pointerType: "mouse" });
+    await foldButton(row).click();
+    await page.settle();
+    assert.ok(row.height() > height, "the fold did not open");
+    return { page, before };
+  };
+  for (const pressFirst of [false, true]) {
+    const { page, before } = await run(SCRIPT, pressFirst);
+    keptAt(page, "28", before, `the message whose fold the reader opened${pressFirst ? ", pressed first" : ""}`);
+  }
+  // The press alone ends the hold, the fold's own act aside...
+  const pressed = await run(brokenScript(
+    "    readerActed();\n    preservingScroll(() => setFolded(entry, !isFolded(entry)));",
+    "    preservingScroll(() => setFolded(entry, !isFolded(entry)));"), true);
+  keptAt(pressed.page, "28", pressed.before, "the message whose fold the reader pressed and opened");
+  // THE CONTROL: with neither, the message the reader opened is pushed up by the held pin.
+  const held = await run(brokenScript(
+    "    readerActed();\n    preservingScroll(() => setFolded(entry, !isFolded(entry)));",
+    "    preservingScroll(() => setFolded(entry, !isFolded(entry)));"), false);
+  assert.ok(yOf(held.page, "28") < held.before - 1, "the test cannot see the held pin move the message opened");
+});
+
+test("`#243 filter-keeps-selection`: after the reader acts in the list — a press, a key, the mouse choosing another message, Collapse all — the newest line is followed again", async () => {
+  const kept = async (script) => {
+    const { page, messages } = pinnedPlacePage(["12", "27", "40"], script);
+    await signIn(page);
+    await showDiscord(page, messages);
+    await showPinned(page);
+    await clickRow(page, "40", "pinned-log");
+    await page.el("pinned-filter").click();
+    await page.settle();
+    assert.ok(atBottomOf(page.el("scroll-area")), "the fixture's pin is not at the newest line once the filter goes");
+    return page;
+  };
+  const acts = {
+    "a tap in the list": (page) => page.documentEvent("pointerdown", { target: placeRow(page, "39"), pointerType: "touch" }),
+    "↑ choosing the message above": (page) => press(page, page.el("scroll-area"), "ArrowUp"),
+    "the mouse moving onto another message": (page) => mouseTo(page, placeRow(page, "39"), 120, yOf(page, "39") + 5),
+    "Collapse all": (page) => page.el("collapse-all").click(),
+  };
+  let n = 41;
+  for (const [act, run] of Object.entries(acts)) {
+    const page = await kept(SCRIPT);
+    await run(page);
+    await page.settle();
+    page.messages = [...page.messages, message({ id: String(n), content: longMessage(`arrived after ${act}`) })];
+    n += 1;
+    await reReadChannel(page);
+    assert.ok(atBottomOf(page.el("scroll-area")), `after ${act}, a reader on the newest line was not followed down`);
+  }
+  // THE CONTROL: with the reader's act not ending the hold, the same tap leaves the new message unfollowed.
+  const page = await kept(brokenScript("function readerActed() {\n  filterHold = null;", "function readerActed() {\n  return;"));
+  await acts["a tap in the list"](page);
+  page.messages = [...page.messages, message({ id: String(n), content: longMessage("arrived") })];
+  await reReadChannel(page);
+  assert.ok(!atBottomOf(page.el("scroll-area")), "the test cannot see the hold outlast the reader's act");
+});
+
+/** The `.body` of a channel row, and the top of each message's block in it, below the top of `scroller`'s box. */
+function blockTops(page, row, scroller = "scroll-area") {
+  const body = row.descendants().find((node) => String(node.className).split(/\s+/).includes("body"));
+  assert.ok(body, "the row has no body");
+  const top = page.el(scroller).getBoundingClientRect().top;
+  return { body, tops: body.children.map((block) => block.getBoundingClientRect().top - top) };
+}
+
+test("`#243 filter-keeps-selection`: a pin that is the second part of a combined row stands where it stood in the Pinned list, the part above it above that", async () => {
+  const run = async (script) => {
+    const page = newPage(new Map(), script);
+    const messages = placeChannel();
+    // 30 sent two seconds after 29, by the same account: the channel draws the two as one row.
+    messages[29] = { ...messages[29], timestamp: new Date(Date.parse(messages[28].timestamp) + 2000).toISOString() };
+    for (const id of ["12", "30", "38"]) page.pinned.set(id, storedPin(messages[Number(id) - 1]));
+    page.servePinsRevision = true;
+    page.pinsRevision = 4;
+    await signIn(page);
+    await showDiscord(page, messages);
+    assert.equal(placeRow(page, "30").getAttribute("data-ids"), "29 30", "the fixture's pin is not the second part of a combined row");
+    await showPinned(page);
+    parkAt(page, "30", 220, "pinned-log");
+    await clickRow(page, "30", "pinned-log");
+    // Where the pin's text starts in the Pinned list, where it is a row of its own.
+    const [text] = blockTops(page, placeRow(page, "30", "pinned-log")).tops;
+    await page.el("pinned-filter").click();
+    await page.settle();
+    return { page, text };
+  };
+  const { page, text } = await run(SCRIPT);
+  const row = placeRow(page, "30");
+  const { body, tops } = blockTops(page, row);
+  assert.equal(body.hasClass("clamped"), false, "the combined row is folded, and its second part out of sight");
+  assert.equal(tops.length, 2, "the combined row does not draw its two messages as two blocks");
+  assert.ok(Math.abs(tops[1] - text) <= 1, `the pin's text moved from ${text.toFixed(1)}px to ${tops[1].toFixed(1)}px down`);
+  assert.ok(tops[0] < text - 1, "the part above the pin is not above where the pin stood");
+  assert.deepStrictEqual(litIds(page), ["29"], "the combined row holding the pin is not lit as the selection");
+  // THE CONTROL: placed by the row's top, the pin lands lower by the part above it.
+  const lower = await run(brokenScript("messageTop(placed, row ? id : null)", "messageTop(placed, null)"));
+  const fell = blockTops(lower.page, placeRow(lower.page, "30")).tops[1];
+  assert.ok(fell > lower.text + 1, "the test cannot see the pin land lower by the part above it");
+});
+
+test("`#243 filter-keeps-selection`: a reader who scrolls while the walk back reads a page is left where they scrolled, and a jump ends the walk and its line", async () => {
+  const walking = async (script, during) => {
+    const page = newPage(new Map(), script);
+    await signIn(page);
+    // 995..1026 in pages of eight, every message tall: the list scrolls at every step.
+    const all = pagedChannel(page, { steps: 4, size: 8, content: (i) => longMessage(`message ${i}`) });
+    for (const held of [all[2], all[30]]) page.pinned.set(held.id, storedPin(held));
+    await showDiscord(page, []);
+    await showPinned(page);
+    await tapRow(page, "997", "pinned-log");
+    const y = yOf(page, "997", "pinned-log");
+    const serve = page.channelPage;
+    let seen = 0;
+    page.channelPage = (path) => {
+      if (/[?&]before=/.test(String(path)) && seen++ === 0) during(page);
+      return serve(path);
+    };
+    await page.el("pinned-filter").click();
+    for (let i = 0; i < 4 * FILTER_WALK_PAGES; i += 1) await page.settle();
+    return { page, y };
+  };
+  const area = (page) => page.el("scroll-area");
+  const walkSaid = (page) => !page.el("status-line").hidden && page.el("status").textContent === "Loading earlier messages…";
+  // The reader scrolls down 150px while the first older page is read.
+  const scroll = (page) => { area(page).scrollTop += 150; };
+  const left = await walking(SCRIPT, scroll);
+  assert.equal(olderReads(left.page).length, 1, "the walk went on reading after the reader scrolled");
+  assert.ok(area(left.page).scrollTop > 0, "the reader was pulled back to the head of the list");
+  assert.equal(placeRow(left.page, "997"), undefined, "the walk read on to the pin");
+  assert.equal(walkSaid(left.page), false, "the status line still says the walk is loading");
+  assert.equal(left.page.el("load-older").textContent, "Older messages");
+  // The Newest chip pressed meanwhile: the reader is at the newest line, and the walk's line is gone.
+  const jumped = await walking(SCRIPT, (page) => { void page.el("jump-newest").click(); });
+  assert.equal(olderReads(jumped.page).length, 1, "the walk went on reading after the jump");
+  assert.ok(atBottomOf(area(jumped.page)), "the jump did not leave the reader at the newest line");
+  assert.equal(walkSaid(jumped.page), false, "the status line still says the walk is loading after the jump");
+  // THE CONTROL: without the walk seeing the scroll, the reader is pulled back and the walk reads on.
+  const pulled = await walking(brokenScript(
+    "      if (top && top.parentNode && Math.abs(top.getBoundingClientRect().top - was) > 1) {",
+    "      if (false) {"), scroll);
+  assert.ok(olderReads(pulled.page).length > 1, "the test cannot see the walk read on past the reader's scroll");
+  keptAt(pulled.page, "997", pulled.y, "the pin the walk pulled the reader back to");
 });

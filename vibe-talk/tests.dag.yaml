@@ -393,6 +393,27 @@ steps:
     hint:
       resources: {browser: 1}
       est_duration_s: 6
+
+  # `#243 filter-keeps-selection` in the browser engine, the owner's own sequence at 1280x800 with a
+  # mouse and at 412x915 with a finger: search, Pinned, a pin chosen, the filter cleared -- the pin's row
+  # in the channel's list stands where it stood in the Pinned list, within a pixel, and half a second
+  # later still does; then a pin two pages older than the newest page, chosen and cleared with the reads
+  # held: the head of the list says "Loading earlier messages…" on the screen, and let go, the channel is
+  # walked back and the old pin's row stands where it stood; then a pin that is the second part of a
+  # combined row, whose own text stands where it stood; then the long message just above that row,
+  # opened by the reader's click or tap, which stays where they saw it. Measured on 2026-10-12: about
+  # 7s wall.
+  - group: check
+    job: filter-place-browser
+    desc: a pin chosen under Pinned stays where it stood when the filter is cleared, an old one walked back to, a combined row's second part by its own text, and a message the reader opens next stays put, in current Chromium at 1280x800 and 412x915
+    labels: [validation-vibe-talk]
+    cmd: cd vibe-talk && python3 tests/filter_place_browser.py
+    jobs_flag: ""
+    timeout: 90
+    cpu_timeout: 45
+    hint:
+      resources: {browser: 1}
+      est_duration_s: 7
       classification: latency-bound
       rss_baseline_bytes: 1073741824
 

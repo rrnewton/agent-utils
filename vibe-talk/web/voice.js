@@ -221,7 +221,8 @@ if (typeof window.ResizeObserver === "function") {
     // `#221 read-modes`. A reader just landed on a thread's first unread is reading that, however near
     // the end of the list it is: the chips changed because the entry opened the message's fold.
     const landed = currentScreen === "main" && currentView === "discord" && entryLandingHolds();
-    const pinned = !landed && currentScreen === "main" && currentView === "discord" && atBottom(area);
+    // `#243 filter-keeps-selection`: nor one whose message a filter change holds in place.
+    const pinned = !landed && currentScreen === "main" && currentView === "discord" && followsNewest(area);
     el("frame-body").style.setProperty(
       "--scroll-tools-clearance", height > 0 ? `calc(${height}px + 0.5rem)` : "0px"
     );
@@ -800,6 +801,8 @@ function dismissBanner() {
  */
 function scrollToNewest() {
   const area = el("scroll-area");
+  // A message a filter change held in place is let go: the reader is going somewhere else. `#243`.
+  filterHold = null;
   area.scrollTop = area.scrollHeight;
   setJumpNewest(false);
 }
@@ -896,6 +899,10 @@ function holdingReader(mutate) {
  */
 function captureScroll() {
   const area = el("scroll-area");
+  // `#243 filter-keeps-selection`. While a filter change holds a message in place, that message is
+  // where the reader is, and the newest line is not followed: nothing but the reader moves it.
+  const held = heldFilterRow();
+  if (held) return { pinned: false, anchor: held, top: held.getBoundingClientRect().top };
   const anchor = scrollAnchor(area);
   return {
     pinned: atBottom(area),
@@ -1133,6 +1140,9 @@ function foldable(li, meta, body, text, messageId, alsoIds = []) {
   // Toggling changes the height of something that may be far above the viewport, which is the one
   // case the browser's own scroll anchoring does not cover.
   fold.addEventListener("click", inThisColumn(() => {
+    // The reader's own act: measured from where they are, not from a message a filter change held.
+    // `#243 filter-keeps-selection`.
+    readerActed();
     preservingScroll(() => setFolded(entry, !isFolded(entry)));
     renderScrollTools();
   }));
@@ -1698,7 +1708,7 @@ function renderJumpNewest() {
     }
     // ...and never over a list the filters emptied (`#212 link-filter`, from review). Every row in
     // it is hidden, so there is no newest message to go to: the jump would only take the reader past
-    // the sentence saying why to the composer under it, which `placeForFilter` scrolled them up from.
+    // the sentence saying why to the composer under it, which `placeFilterAnchor` scrolled them up from.
     shown = !listEmptied() && (inScrollback[currentView] || jumpNewestWanted[currentView] !== false);
   }
   // The arrival changes what the ONE control says, rather than raising a second one beside it.
@@ -1812,6 +1822,8 @@ function renderScrollTools() {
  * one-way door at the list level.
  */
 function setAllFolded(folded) {
+  // Only ever the reader's own act, by a button or a key. `#243 filter-keeps-selection`.
+  readerActed();
   preservingScroll(() => {
     for (const entry of visibleFolds()) {
       setFolded(entry, folded);
@@ -2136,33 +2148,539 @@ function listEmptied() {
   return !el("search-empty").hidden;
 }
 
+// --- a filter changed: the reader's message stays where it is on the screen ----------------------
+//
+// `#243 filter-keeps-selection`. The owner, 2026-10-12: "In long transcripts we must be very careful
+// about storing/losing our place in the scroll history and be very intentional. One of my most hated
+// features of other chat clients is that it will lose my place. When it is a very long history this
+// is like losing your place in a book or a long podcast. Here's a particular thing I just wanted to
+// do -- jump to my last pinned message: go to search, filter for pinned, select the message. But then
+// as soon as I clear the filter, the screen jumps and I don't have the message I just found. The rule
+// here is that when you adjust the filter, the highlighted message MUST stay on the screen. Ideally it
+// stays on the screen in the same Y location without a "jump.""
+//
+// Each filter used to place the reader its own way: Pinned and Links put them at the newest of what
+// was left and, turned off, back at the scroll offset they had before — an offset in a list that the
+// pins they had just found were not even part of. Now ONE RULE, applied by ONE HELPER,
+// `keepingFilterPlace`, for every change of what the list shows: the search text typed or cleared,
+// the search closed (Escape or the glass), Pinned and Links on or off, the kinds of link under Links,
+// and the read mode. A view switch is not a filter, and keeps its own landing rules.
+//
+//   * BEFORE the change, the anchor: the selected message (`#239 single-selection`; drawn, or chosen
+//     silently by a tap) while it shows; else the message the last change kept in place, while the
+//     reader has not scrolled since (`filterHold`), which makes turning a filter on and off again a
+//     round trip; else today's place-keeping — the newest line for a reader on it, or the first
+//     message showing under the floating line. Its message ids, its time and how far its top is below
+//     the top of the list's box are noted.
+//   * AFTER, its row in the list as now drawn goes back to that height, as near as the list's ends
+//     allow: the line of the collapsed run it has joined, or — when the new filter hides it — the
+//     nearest message shown, in channel order, which the status line says when it was the selection.
+//     A message older than everything loaded, as an old pin is, is walked back to, a bounded number of
+//     pages, with the step-back line saying "Loading earlier messages…", and placed when it comes. The
+//     selection goes with it, its ring and its focus as they were.
+//   * AND THEN NOTHING ELSE MOVES IT until the reader scrolls or acts in the list (`readerActed`):
+//     not following the newest line on an arrival or when the chips change height, not a read
+//     landing behind the change, and not a thread's entry landing (`#221 read-modes`), which the
+//     change spends. The reader's own act — a press in the list, another message chosen, a key on
+//     the messages, a fold — ends the hold, and is measured from where the reader is.
+
 /**
- * Put the reader where a filter they just changed has left something to read. Called last by the
- * search text, Links and the kinds of link under it, once the reader has been placed as each places
- * them; `wasEmptied` is `listEmptied()` from before the change.
+ * Where the reader was before a filter change, to put them back to after it. See the head of this
+ * section.
  *
- * `#212 link-filter`, from review. EMPTIED, the list is taken to its head, where the sentence saying
- * why is. Its rows are gone but the list is not short: the channel's composer stays below every list,
- * so with the bar's room above it the list still overflowed a phone, and a reader put at the newest
- * line had the sentence scrolled up out of the room kept for the bar and the kinds of link. At 150%
- * type on a 412px phone it sat under the three buttons it names, and with the keyboard up it was above
- * the screen — the one line saying where the links went and how to bring them back, hidden by the
- * controls it points to. At the head of a channel with more history, that takes ONE step back for
- * it, as arriving there by hand does (`maybeLoadOlder`): what is older may hold what the reader is
- * after, and the sentence says "loaded so far". Rows of it the filters hide move nothing, and so
- * take no second step.
- *
- * FILLED AGAIN from empty, the reader is put at the newest line, as a list opens: the sentence stood
- * in for the newest line while there was none, and the head of the list it was at is the oldest of
- * what came back.
- *
- * Only after something the reader did. A poll redrawing an emptied list leaves a reader who scrolled
- * down to the composer at the composer. Not Pinned, either: turning it on puts up "Loading…" before
- * the pins land, and a reader taken to the head of that would meet the pins at their oldest.
+ * @typedef {object} FilterAnchor
+ * @property {boolean} newest The reader was on the newest line, with no selection showing.
+ * @property {Element | null} row The row measured: the same element is looked for first.
+ * @property {string[]} ids Its messages, the selected one first.
+ * @property {string | null} selected The selected message's id when the anchor is the selection.
+ * @property {boolean} drawn Whether that selection was drawn, rather than chosen by a tap.
+ * @property {boolean} focused Whether the focus was in its row.
+ * @property {number} time When its first message was sent, NaN where unknown.
+ * @property {number} offset How far its top was below the top of the list's box, in px.
+ * @property {FilterAnchor | null} alternate The row last kept in place, when the anchor is the one
+ *   that change was asked to keep: tried when that one is not shown.
  */
-function placeForFilter(wasEmptied) {
-  if (listEmptied()) el("scroll-area").scrollTop = 0;
-  else if (wasEmptied) scrollToNewest();
+
+/**
+ * The message the last filter change kept in place, while the reader has neither moved nor acted in
+ * the list since (`readerActed`): `{ key, row, ids,
+ * offset, at, origin, mark }` — the list it is in, the row and its messages, its height in the list's
+ * box, the scroll position that put it there, the anchor the change was asked to keep, and the message
+ * selected in that list then. `ids` is null when the filters emptied the list, and the anchor waits
+ * for something to show. Per column.
+ */
+let filterHold = null;
+
+/** True while a filter change is under way, so a filter turned off inside another is placed once, by the outer. */
+let filterChanging = 0;
+
+/** The walk back to an anchor older than anything loaded, while it is under way: the left column's alone. */
+let filterWalk = null;
+
+/** How many older pages a filter change reads, at most, to find the message it is keeping. */
+const FILTER_WALK_PAGES = 10;
+
+/** What the status line says while a walk back is under way: put away with the walk when it ends early. */
+const FILTER_WALK_STATUS = "Loading earlier messages…";
+
+/**
+ * End the walk back for a filter change, where it is: another change, a jump, a view or channel, or the
+ * reader's own act has taken over. Its line on the status strip goes with it, unless something has
+ * said something else there since.
+ */
+function endFilterWalk() {
+  if (filterWalk === null) return;
+  filterWalk = null;
+  inColumn(columns.main, renderOlderControl);
+  if (!el("status-line").hidden && el("status").textContent === FILTER_WALK_STATUS) dismissStatus();
+}
+
+/** Which list a filter's place is in: the view on screen, and whether the Pinned list stands in for it. */
+const filterKey = () => JSON.stringify([filterPlace(), pinnedOnly]);
+
+/** Whether `row` is a message the filters judge: it declares what it is findable by (`searchable`). */
+const isMessageRow = (row) => row.getAttribute("data-search") !== null;
+
+/** The row standing for `row` on the screen — itself, or the line of its collapsed run — or null when none does. */
+function standingRow(row) {
+  const shown = row ? shownRowFor(row) : null;
+  return shown && rowShown(shown) ? shown : null;
+}
+
+/**
+ * Where message `id` stands in `row`, in the viewport, as the top of a row of its own would: the row's
+ * top, less the parts of a combined row (`glom`) drawn above it. A combined row draws each of its
+ * messages as a block of its `.body`, in order, so the second half of a long post split in two starts
+ * as far below the row's first block as the first half is tall — and, as a row of its own in the
+ * Pinned list, its text started right under the author line. The row's own top for its first message,
+ * for a row that holds no such message (a run's line, the message standing in for one a filter hides),
+ * and for a block its fold has cut off out of sight.
+ *
+ * From review: a pin found as the second part of a split post was put back by the row's top, and so
+ * lower on the screen, by the height of the part above it, than it stood in the Pinned list.
+ */
+function messageTop(row, id) {
+  const top = row.getBoundingClientRect().top;
+  const ids = idsOf(row);
+  const at = id === null ? -1 : ids.indexOf(id);
+  if (at <= 0) return top;
+  const body = childByClass(row, "body");
+  if (!body || body.children.length !== ids.length) return top;
+  const start = body.children[at].getBoundingClientRect().top;
+  if (start >= body.getBoundingClientRect().bottom) return top;
+  return top + start - body.children[0].getBoundingClientRect().top;
+}
+
+/** The anchor `row` makes, the selection's details given in `selection` when it is the selected row. */
+function anchorAt(row, selection = null) {
+  const messages = rowMessages(row);
+  const ids = idsOf(row);
+  const kept = selection ? [selection.id, ...ids.filter((id) => id !== selection.id)] : ids;
+  return {
+    newest: false,
+    row,
+    ids: kept,
+    selected: selection ? selection.id : null,
+    drawn: Boolean(selection && selection.drawn),
+    focused: Boolean(selection && nodeWithin(row, document.activeElement)),
+    time: messages.length ? timeOf(messages[0], "timestamp") : NaN,
+    // Of the message itself, which is the row's top but in a combined row (`messageTop`).
+    offset: messageTop(row, kept.length ? kept[0] : null) - el("scroll-area").getBoundingClientRect().top,
+    alternate: null,
+  };
+}
+
+/**
+ * The row holding the anchor's message in the list on screen, shown or not: the same element when
+ * the list kept it, else the row holding its selected message, else any of its messages.
+ */
+function anchorHolder(anchor) {
+  const list = visibleList();
+  if (anchor.row && anchor.row.parentNode === list) return anchor.row;
+  const rows = [...list.children];
+  for (const id of anchor.ids) {
+    const found = rows.find((row) => idsOf(row).includes(id));
+    if (found) return found;
+  }
+  return null;
+}
+
+/** The row on screen standing for the anchor's message, or null when the list does not show it. */
+const anchorRow = (anchor) => standingRow(anchorHolder(anchor));
+
+/**
+ * The message shown nearest the anchor's, for an anchor the new filter hides: in the list's own order
+ * when the list holds its row — the next one shown first, then the one before, then one further each
+ * way — and else by time, the later first when two are as near.
+ */
+function nearestShownRow(anchor) {
+  const rows = [...visibleList().children].filter(isMessageRow);
+  const holder = anchorHolder(anchor);
+  const at = holder ? rows.indexOf(holder) : -1;
+  if (at >= 0) {
+    for (let step = 1; step < rows.length; step += 1) {
+      for (const index of [at + step, at - step]) {
+        const shown = index >= 0 && index < rows.length ? standingRow(rows[index]) : null;
+        if (shown) return shown;
+      }
+    }
+    return null;
+  }
+  if (!Number.isFinite(anchor.time)) return null;
+  let best = null;
+  let bestGap = Infinity;
+  let bestLater = false;
+  for (const row of rows) {
+    const shown = standingRow(row);
+    const times = rowMessages(row).map((message) => timeOf(message, "timestamp")).filter(Number.isFinite);
+    if (!shown || times.length === 0) continue;
+    const first = Math.min(...times);
+    const last = Math.max(...times);
+    const gap = anchor.time < first ? first - anchor.time : anchor.time > last ? anchor.time - last : 0;
+    const later = first >= anchor.time;
+    if (gap < bestGap || (gap === bestGap && later && !bestLater)) {
+      best = shown;
+      bestGap = gap;
+      bestLater = later;
+    }
+  }
+  return best;
+}
+
+/**
+ * The hold of the last filter change, while it still holds — the same list on the main screen, and
+ * the reader not moved: the list where the change left it, or the kept row where the change put it —
+ * as `{ hold, row }`, `row` null for a list the filters emptied, or one its message has gone from.
+ * Null, and the hold forgotten, once the reader has moved.
+ */
+function currentFilterHold() {
+  const hold = filterHold;
+  if (hold === null) return null;
+  if (currentScreen !== "main" || hold.key !== filterKey()) {
+    filterHold = null;
+    return null;
+  }
+  if (hold.ids === null) return listEmptied() ? { hold, row: null } : null;
+  const area = el("scroll-area");
+  const row = anchorRow({ row: hold.row, ids: hold.ids });
+  const unmoved = Math.abs(area.scrollTop - hold.at) <= 1 || (row !== null &&
+    Math.abs(row.getBoundingClientRect().top - area.getBoundingClientRect().top - hold.offset) <= 1);
+  if (!unmoved) {
+    filterHold = null;
+    return null;
+  }
+  // `row` null: its message has gone from the list — a read of what Hide read leaves — under a reader
+  // who has not moved, and the anchor that change was asked to keep is placed again (`keepFilterHold`).
+  return { hold, row };
+}
+
+/** The row a filter change is holding in place now, or null. What the place-keeping below asks first. */
+function heldFilterRow() {
+  const held = currentFilterHold();
+  return held ? held.row : null;
+}
+
+/**
+ * The reader did something in the list of the column being worked on: pressed in it, chose another
+ * message, opened or closed one, pressed a key that acts on the messages. The message the last filter
+ * change held is let go, and the place-keeping measures from wherever the reader is now — their own act
+ * on a message from that message, as it would have been with no filter change before it — and a walk
+ * back still under way for that change ends where it is.
+ *
+ * From review: a hold that lasted until the reader scrolled was still every `preservingScroll`'s
+ * anchor after they had moved on, so folding a message just above the kept one, fully on screen, put
+ * the first 140px of the message folded above the screen. The reader's own act is the end of what a
+ * filter change put in place.
+ */
+function readerActed() {
+  filterHold = null;
+  if (!sideActive) endFilterWalk();
+}
+
+/**
+ * Whether the reader on the list's newest line is following it: not while a filter change holds a
+ * message in place, which nothing but the reader moves. Every "follow the newest line" asks this.
+ */
+function followsNewest(area) {
+  return atBottom(area) && heldFilterRow() === null;
+}
+
+/**
+ * Put the held row back where the filter change put it, after something below or above it changed —
+ * or, when its message has gone from the list, put the anchor that change was asked to keep in its
+ * place again, as the change would have. False, moving nothing, when nothing is held.
+ */
+function keepFilterHold() {
+  const held = currentFilterHold();
+  if (held === null || held.hold.ids === null) return false;
+  if (held.row === null) {
+    placeFilterAnchor(held.hold.origin, false, true);
+    return filterHold !== null;
+  }
+  const row = held.row;
+  const area = el("scroll-area");
+  area.scrollTop += row.getBoundingClientRect().top - area.getBoundingClientRect().top - filterHold.offset;
+  filterHold = { ...filterHold, row, ids: idsOf(row).length ? idsOf(row) : filterHold.ids, at: area.scrollTop };
+  return true;
+}
+
+/** Measure the anchor of a filter change in the column being worked on, or null with no list on screen. */
+function filterAnchor() {
+  if (currentScreen !== "main") return null;
+  const area = el("scroll-area");
+  const pane = currentView === "discord" ? (sideActive ? sidePane : channelPane) : null;
+  const mark = pane ? markOf(pane) : null;
+  const chosen = mark ? paneRowFor(pane, mark.id) : null;
+  const showing = Boolean(pane && mark && chosen && rowInView(pane, chosen));
+  const held = currentFilterHold();
+  // The anchor the last change was asked to keep, while the reader has neither moved nor chosen
+  // another message since: a filter turned on and off again is a round trip. Focused only where the
+  // focus is now.
+  if (held && (!showing || held.hold.mark === (mark ? mark.id : null))) {
+    const origin = held.hold.origin;
+    const asked = { ...origin, focused: Boolean(origin.selected !== null && held.row &&
+      nodeWithin(held.row, document.activeElement)) };
+    return held.row === null ? asked : { ...asked, alternate: anchorAt(held.row) };
+  }
+  if (showing && pane && mark && chosen) return anchorAt(chosen, mark);
+  if (atBottom(area)) {
+    return { newest: true, row: null, ids: [], selected: null, drawn: false, focused: false, time: NaN, offset: 0,
+      alternate: null };
+  }
+  const head = pane ? pane.head() : floatingClearance(area);
+  const foot = pane ? pane.foot() : area.getBoundingClientRect().top + (area.clientHeight || 0);
+  const first = [...visibleList().children].find((row) => {
+    if (!isMessageRow(row) || standingRow(row) !== row) return false;
+    const box = row.getBoundingClientRect();
+    return box.bottom > head && box.top < foot;
+  });
+  return first ? anchorAt(first) : null;
+}
+
+/**
+ * Run `change`, a change of what the list shows, keeping the reader's message where it is on the
+ * screen in every column showing messages. A `change` that returns a promise — a read — is waited
+ * for, and the reader placed when it lands. Returns what `change` returns.
+ *
+ * @template T
+ * @param {() => T} change
+ * @returns {T}
+ */
+function keepingFilterPlace(change) {
+  if (filterChanging > 0) return change();
+  /** @type {Array<[typeof activeColumn, FilterAnchor | null, boolean]>} */
+  const kept = [];
+  eachColumn(() => {
+    kept.push([activeColumn, filterAnchor(), listEmptied()]);
+    // A landing a thread's entry made, or still owes, is spent: the reader has acted since. `#221`.
+    entryLanding = null;
+    threadEntryOwed = null;
+    threadEntryAwaitsRead = false;
+  });
+  // A walk back for an earlier change is over: this one decides where the reader goes.
+  endFilterWalk();
+  filterChanging += 1;
+  let result;
+  try {
+    result = change();
+  } finally {
+    filterChanging -= 1;
+  }
+  const place = (landed = false) => {
+    for (const [column, anchor, wasEmptied] of kept) {
+      if (column === columns.side && !sideShowing()) continue;
+      inColumn(column, () => {
+        // Once a read has landed, only for a reader still where the change put them.
+        if (!landed || currentFilterHold() !== null) placeFilterAnchor(anchor, wasEmptied);
+      });
+    }
+  };
+  // At once, on the rows on screen; and for a change that reads, again on the rows the read drew.
+  place();
+  if (result && typeof (/** @type {any} */ (result)).then === "function") {
+    return /** @type {any} */ (result).then((/** @type {any} */ value) => {
+      place(true);
+      return value;
+    });
+  }
+  return result;
+}
+
+/**
+ * Put the reader back on `anchor` in the column being worked on, after a filter change. `wasEmptied`
+ * is whether the filters had emptied the list before it; `walked` that older pages were read for the
+ * anchor already, and none is read again.
+ *
+ * `#212 link-filter`, from review, still holds where nothing is left: an EMPTIED list is taken to its
+ * head, where the sentence saying why is. Its rows are gone but the list is not short — the channel's
+ * composer stays below every list — and a reader left anywhere else had that sentence under the bar
+ * or the kinds of link it names, or above the screen. The anchor is kept for the change that fills it
+ * again. A list filled again with no anchor to go back to opens at its newest line, as a list does.
+ */
+function placeFilterAnchor(anchor, wasEmptied = false, walked = false) {
+  if (currentScreen !== "main") return;
+  const area = el("scroll-area");
+  if (listEmptied()) {
+    area.scrollTop = 0;
+    // Kept for what fills the list again — the newest line too: Pinned turned on there before the pins
+    // were read shows "Loading…" until they land, and they land at the newest pin, not the oldest.
+    filterHold = anchor
+      ? { key: filterKey(), row: null, ids: null, offset: 0, at: area.scrollTop, origin: anchor, mark: null } : null;
+    renderJumpNewest();
+    return;
+  }
+  if (!anchor || anchor.newest) {
+    filterHold = null;
+    if (anchor || wasEmptied) scrollToNewest();
+    else renderJumpNewest();
+    return;
+  }
+  let row = anchorRow(anchor);
+  let offset = anchor.offset;
+  let id = anchor.ids.length ? anchor.ids[0] : null;
+  if (!row && anchor.alternate) {
+    row = anchorRow(anchor.alternate);
+    offset = anchor.alternate.offset;
+    id = anchor.alternate.ids.length ? anchor.alternate.ids[0] : null;
+  }
+  if (!row && !walked && olderThanLoaded(anchor)) {
+    filterHold = null;
+    guardQuietly(walkToFilterAnchor)(anchor);
+    return;
+  }
+  const substitute = row ? null : nearestShownRow(anchor);
+  const placed = row || substitute;
+  if (!placed) {
+    filterHold = null;
+    renderJumpNewest();
+    return;
+  }
+  // The message's own top where it is part of a combined row (`messageTop`), the row's otherwise.
+  area.scrollTop += messageTop(placed, row ? id : null) - area.getBoundingClientRect().top - offset;
+  carrySelection(anchor, placed, substitute !== null);
+  const pane = currentView === "discord" ? (sideActive ? sidePane : channelPane) : null;
+  const mark = pane ? markOf(pane) : null;
+  filterHold = {
+    key: filterKey(), row: placed, ids: idsOf(placed), at: area.scrollTop, origin: anchor,
+    offset: placed.getBoundingClientRect().top - area.getBoundingClientRect().top, mark: mark ? mark.id : null,
+  };
+  renderJumpNewest();
+  if (substitute && anchor.selected !== null) setStatus(filterHiddenSentence(anchor, walked));
+}
+
+/**
+ * The selection goes with the message a filter change kept: the selection of the list now drawn, its
+ * ring and its focus as they were (`#239 single-selection`). For a message the filter hides, the
+ * selection stays on it, to come back with it, unless the focus was in its row: then the focus and the
+ * selection go to the message shown in its place, as `keepSelection` hands them on.
+ */
+function carrySelection(anchor, row, substituted) {
+  if (anchor.selected === null || currentView !== "discord") return;
+  const pane = sideActive ? sidePane : channelPane;
+  if (rowOf(pane, row) !== row) return;
+  if (substituted) {
+    if (anchor.focused) takeRow(pane, row, true);
+    return;
+  }
+  pane.marks.set(pane.context(), { id: anchor.selected, drawn: anchor.drawn, index: paneRows(pane).indexOf(row) });
+  if (anchor.drawn) {
+    releaseRow(pane, row);
+    row.setAttribute("tabindex", "0");
+    // The focus too, when it was on the row: a change that took the row away dropped it to the page,
+    // as a redraw does (`keepSelection`). A control the reader clicked keeps it, as #239 has it.
+    if (anchor.focused) row.focus({ preventScroll: true });
+  } else {
+    releaseRow(pane);
+  }
+  drawSelection();
+}
+
+/**
+ * What the status line says when the selected message is not shown after a filter change, and the
+ * nearest message is in its place: why, in words that fit one line of a 360px phone (`setStatus`).
+ */
+function filterHiddenSentence(anchor, walked) {
+  if (pinnedOnly) return "Not pinned — the nearest pin is here.";
+  if (anchorHolder(anchor)) return "Filtered out — the nearest is here.";
+  if (walked && olderThanLoaded(anchor)) return `Over ${FILTER_WALK_PAGES} pages back — oldest is here.`;
+  // Under Hide read a channel without threads reads only what is left, so a message it hides is in
+  // no list this page holds; with threads it is held, and drawn in none.
+  if (todoMode && (!threadingSupported || timelineMessages.some((message) => anchor.ids.includes(String(message.id))))) {
+    return "Hide read hides it — nearest is here.";
+  }
+  return "Not in this view — nearest is here.";
+}
+
+/** Whether the anchor's message is older than everything the channel's list has loaded, with more above it. */
+function olderThanLoaded(anchor) {
+  if (sideActive || currentView !== "discord" || pinnedOnly || discordMoreAbove !== true ||
+      !Number.isFinite(anchor.time)) return false;
+  const loaded = threadingSupported ? timelineMessages : [...el("discord-log").children].flatMap(rowMessages);
+  const times = loaded.map((message) => timeOf(message, "timestamp")).filter(Number.isFinite);
+  return times.length === 0 || anchor.time < Math.min(...times);
+}
+
+/**
+ * Read older pages until the anchor's message is loaded, or the history reaches back past it, and put
+ * the reader on it then — at most `FILTER_WALK_PAGES` of them. Meanwhile the reader is at the head of
+ * the list, where the step-back line says "Loading earlier messages…". Another filter change, another
+ * view or another channel, a jump, the reader's own act in the list (`readerActed`), or the reader
+ * scrolling while a page is read, ends the walk where it is: it never pulls them back.
+ */
+async function walkToFilterAnchor(anchor) {
+  const walk = { context: channelContextKey() };
+  filterWalk = walk;
+  const area = el("scroll-area");
+  const current = () => filterWalk === walk && walk.context === channelContextKey() && !pinnedOnly &&
+    currentScreen === "main" && currentView === "discord";
+  area.scrollTop = 0;
+  renderOlderControl();
+  renderJumpNewest();
+  setStatus(FILTER_WALK_STATUS);
+  let pages = 0;
+  let scrolled = false;
+  try {
+    while (pages < FILTER_WALK_PAGES && current() && olderThanLoaded(anchor) &&
+        (discordOlderCursor || walkCursorOwed())) {
+      pages += 1;
+      // The row the walk left the reader on, at the head of the list. A step keeps the row the reader
+      // is on where it is (`preservingScroll`), so this one anywhere else afterwards is a reader who
+      // scrolled while the page was read. A list too short to scroll follows its newest line instead,
+      // and has nothing to scroll away in.
+      const top = atBottom(area) ? null : scrollAnchor(area);
+      const was = top ? top.getBoundingClientRect().top : 0;
+      await loadOlder();
+      if (!current()) return;
+      if (top && top.parentNode && Math.abs(top.getBoundingClientRect().top - was) > 1) {
+        scrolled = true;
+        return;
+      }
+      // The step keeps the rows the reader was looking at; the walk keeps the line saying it goes on.
+      area.scrollTop = 0;
+    }
+  } finally {
+    if (filterWalk === walk) {
+      const place = !scrolled && walk.context === channelContextKey() && !pinnedOnly;
+      endFilterWalk();
+      if (place) {
+        placeFilterAnchor(anchor, false, true);
+        if (anchorRow(anchor)) {
+          setStatus(anchor.selected !== null ? "Here is the selected message." : "Here is where you were.");
+        }
+      }
+    }
+  }
+}
+
+/**
+ * A list the filters emptied has rows again by something other than the reader — the pins landing
+ * under a Pinned filter turned on before they had — and the anchor of the change that emptied it is
+ * placed now. A filter change it waited through has placed the reader already.
+ */
+function settlePendingFilterPlace() {
+  const hold = filterHold;
+  if (hold === null || hold.ids !== null || hold.key !== filterKey() || listEmptied() || filterChanging > 0) return;
+  placeFilterAnchor(hold.origin, true);
 }
 
 /**
@@ -2170,25 +2688,29 @@ function placeForFilter(wasEmptied) {
  *
  * Closing CLEARS, rather than leaving a query parked behind a closed control. A filter still in
  * force with nothing on screen saying so is the worst state this feature can be in: the reader
- * concludes the messages are gone.
+ * concludes the messages are gone. Closing is a change of what the list shows, and keeps the
+ * reader's message where it is (`keepingFilterPlace`).
  */
 function setSearchOpen(open) {
+  if (!open) {
+    keepingFilterPlace(() => showSearchOpen(false));
+    return;
+  }
+  showSearchOpen(true);
+}
+
+/** `setSearchOpen`, without holding the reader's place. */
+function showSearchOpen(open) {
   searchOpen = open;
   if (!open) {
     searchQuery = "";
     el("search-field").value = "";
     // `#206 pin-message`. The Pinned filter lives in this bar, and goes with it for the reason the
     // query does: a filter left on behind a control that is no longer on screen is the state this
-    // feature must never be in. `#211 link-filter`: so does Links. The one turned on LAST goes
-    // first, so each puts the reader back where they were when it came on, in the list as it was
-    // then — the other filter still in the state it was in at that moment.
-    if (placeBeforePinned && placeBeforePinned.links) {
-      setPinnedOnly(false);
-      setLinksOnly(false);
-    } else {
-      setLinksOnly(false);
-      setPinnedOnly(false);
-    }
+    // feature must never be in. `#211 link-filter`: so does Links. Placed once, for the whole of
+    // closing, by `keepingFilterPlace`.
+    setLinksOnly(false);
+    setPinnedOnly(false);
   }
   el("search-toggle").setAttribute("aria-pressed", open ? "true" : "false");
   // `#197 floating-search`. The open bar floats over the top of the list, and web/voice.css keys
@@ -2244,9 +2766,6 @@ function setSearchOpen(open) {
 
 /** Whether the Links filter is on. Only while the search bar is open: closing it turns this off. */
 let linksOnly = false;
-
-/** Where the list was when the filter came on, so turning it off puts the reader back. */
-let placeBeforeLinks = null;
 
 /**
  * An address a link may be written to: http or https, and a host with a letter or digit in it. The
@@ -2582,40 +3101,23 @@ const filterPlace = () =>
   [currentView, currentChannelId(), channelView, selectedThreadId || ""].join("\u0000");
 
 /**
- * Turn the Links filter on or off. On, the reader is put at the newest of what is left, as a list
- * opens at its newest; off, the list comes back where the reader left it — when it is the same list
- * as it was then, with Pinned as it was. Otherwise that offset is a place in some other list, and
- * the newest line is where a list opens.
+ * Turn the Links filter on or off, the reader's message kept where it is on the screen — or, under
+ * Links, the nearest message with a link in its place (`keepingFilterPlace`, `#243
+ * filter-keeps-selection`). A reader on the newest line stays on it.
  */
 function setLinksOnly(on) {
   if (on === linksOnly) return;
-  const area = el("scroll-area");
-  if (on) {
-    placeBeforeLinks = {
-      top: area.scrollTop, newest: atBottom(area), pinned: pinnedOnly, list: filterPlace(),
-    };
-  }
-  linksOnly = on;
-  el("links-filter").setAttribute("aria-pressed", on ? "true" : "false");
-  // `#212 link-filter`. The kinds of link come up under it, or go, and the room the list makes for
-  // them with them — before anything below measures the list.
-  renderLinkKinds();
-  // The rows' links drawn, or taken down, BEFORE the reader is placed: placing measures them.
-  renderScrollTools();
-  if (on) {
-    scrollToNewest();
-  } else if (placeBeforeLinks) {
-    const place = placeBeforeLinks;
-    placeBeforeLinks = null;
-    if (place.newest || place.pinned !== pinnedOnly || place.list !== filterPlace()) scrollToNewest();
-    else area.scrollTop = place.top;
-  }
-  renderScrollTools();
-  // The right column's rows too: Links filters both. `#229 desktop-two-column`.
-  inOtherColumn(renderScrollTools);
-  // ...and where nothing is left to show, at the sentence saying so. Never at the newest line for
-  // an emptied list filled again: off, the place just restored is the reader's own.
-  placeForFilter(false);
+  keepingFilterPlace(() => {
+    linksOnly = on;
+    el("links-filter").setAttribute("aria-pressed", on ? "true" : "false");
+    // `#212 link-filter`. The kinds of link come up under it, or go, and the room the list makes for
+    // them with them — before anything below measures the list.
+    renderLinkKinds();
+    // The rows' links drawn, or taken down, BEFORE the reader is placed: placing measures them.
+    renderScrollTools();
+    // The right column's rows too: Links filters both. `#229 desktop-two-column`.
+    inOtherColumn(renderScrollTools);
+  });
   // Off, the rows' text is back on screen, and summary mode asks about what is in view.
   requestVisibleSummaries();
 }
@@ -2741,30 +3243,27 @@ function storedHiddenLinkKinds() {
 
 /**
  * Show or hide one kind, keep the choice, and redraw what is left. A reader at the newest line is
- * kept there, as one is when a message arrives; anywhere else the list is left where it is, as it
- * is while the search text changes under it. Where nothing is left, or something is again, see
- * `placeForFilter`.
+ * kept there, as one is when a message arrives; anywhere else the reader's message stays where it is
+ * on the screen, as it does while the search text changes under it (`keepingFilterPlace`, `#243
+ * filter-keeps-selection`), and where nothing is left the list says why from its head.
  */
 function setLinkKindShown(kind, shown) {
-  const area = el("scroll-area");
-  const newest = atBottom(area);
-  const wasEmptied = listEmptied();
-  const hidden = new Set(hiddenLinkKinds);
-  if (shown) hidden.delete(kind);
-  else hidden.add(kind);
-  hiddenLinkKinds = hidden;
-  // In the order the buttons stand, so the same choice is always written the same way.
-  const kept = LINK_KINDS.map((entry) => entry.kind).filter((one) => hidden.has(one));
-  try {
-    localStorage.setItem(LINK_KINDS_KEY, JSON.stringify(kept));
-  } catch (_error) {
-    // A browser that refuses storage still honours the choice for this page.
-  }
-  renderLinkKinds();
-  renderScrollTools();
-  inOtherColumn(renderScrollTools);
-  if (newest) scrollToNewest();
-  placeForFilter(wasEmptied);
+  keepingFilterPlace(() => {
+    const hidden = new Set(hiddenLinkKinds);
+    if (shown) hidden.delete(kind);
+    else hidden.add(kind);
+    hiddenLinkKinds = hidden;
+    // In the order the buttons stand, so the same choice is always written the same way.
+    const kept = LINK_KINDS.map((entry) => entry.kind).filter((one) => hidden.has(one));
+    try {
+      localStorage.setItem(LINK_KINDS_KEY, JSON.stringify(kept));
+    } catch (_error) {
+      // A browser that refuses storage still honours the choice for this page.
+    }
+    renderLinkKinds();
+    renderScrollTools();
+    inOtherColumn(renderScrollTools);
+  });
 }
 
 /**
@@ -3842,7 +4341,11 @@ function setMark(pane, row, drawn) {
 
 /** Note `row` as the selection of the list `pane` is showing, `pane` as the one in use, and draw it. */
 function markRow(pane, row, drawn) {
+  const was = markOf(pane);
   setMark(pane, row, drawn);
+  // Another message chosen — by the keys, the mouse, a tap, the focus or a jump — is the reader acting
+  // in the list. `#243 filter-keeps-selection`. A redraw keeping the same one (`keepSelection`) is not.
+  if (!was || was.id !== String(row.getAttribute("data-id"))) inColumn(paneColumn(pane), readerActed);
   lastPane = pane;
   drawSelection();
 }
@@ -4126,11 +4629,21 @@ function onPointerMove(event) {
   if (pane && row && rowShown(row)) pointRow(pane, row);
 }
 
-/** Every `pointerdown` on the page: which kind of pointer the click or tap after it comes from. */
+/**
+ * Every `pointerdown` on the page: which kind of pointer the click or tap after it comes from. One in
+ * a list of messages is the reader acting there, before anything the press goes on to do: a fold, a
+ * reply's arrow, a swipe, a scroll begun by a finger. `#243 filter-keeps-selection`.
+ */
 function onPointerDown(event) {
   const kind = String((event && event.pointerType) || "");
   if (kind === "mouse") mouseInUse();
   else if (kind) touchInUse();
+  const target = event && event.target;
+  if (currentScreen !== "main" || !target) return;
+  const pane = KEY_PANES.find((each) => { const list = each.list(); return list !== null && nodeWithin(list, target); });
+  if (pane) inColumn(paneColumn(pane), readerActed);
+  // The call's transcript, which no key moves through, is a list of messages a filter keeps a place in too.
+  else if (currentView !== "discord" && nodeWithin(el("transcript"), target)) inColumn(columns.main, readerActed);
 }
 
 /**
@@ -4261,8 +4774,18 @@ function pageStep(area) {
 
 /** To the end of `area`. On the main screen exactly what the Newest chip does, which End is. */
 function toNewest(area) {
-  if (area === el("scroll-area")) scrollToNewest();
+  if (area === el("scroll-area")) jumpToNewest();
   else area.scrollTop = area.scrollHeight;
+}
+
+/**
+ * The reader's own way to the newest line — the Newest chip, End — which also ends a walk back a
+ * filter change was making for a message older than anything loaded (`#243 filter-keeps-selection`):
+ * the reader has gone somewhere else, and is not brought back when it lands.
+ */
+function jumpToNewest() {
+  endFilterWalk();
+  scrollToNewest();
 }
 
 /** Move `area` for a page key, or Home or End, that the browser would have spent on something else. */
@@ -5299,6 +5822,10 @@ function dispatchKey(event, target) {
     if (!binding.chords.some((chord) => chordMatches(chord, event) && chordAllowed(binding, chord, target))) continue;
     // A held key repeats only the keys that move: a held e is one Done, not a Done on every row it passes.
     if (event.repeat && !binding.repeats) continue;
+    // A key that moves through the messages or acts on one is the reader acting in the list, measured
+    // from where they are (`readerActed`). The keys for a filter, the search and Escape are not: they
+    // ARE filter changes, and a filter turned on and off again by them is a round trip. `#243`.
+    if (binding.group === KEYS_MOVING || binding.group === KEYS_MESSAGE) readerActed();
     if (binding.run(event, target)) {
       swallow(event);
       return;
@@ -10508,8 +11035,9 @@ async function changeChannelView(view, threadId = null, summary = null) {
   const from = channelView;
   const came = { freshAt: channelFreshAt, freshness: channelFreshness };
   // `#206 pin-message`. Choosing a view is asking to see it, and the Pinned filter shows the same
-  // pins in every view — so it steps aside, as it must for a pin opened in its thread.
-  setPinnedOnly(false);
+  // pins in every view — so it steps aside, as it must for a pin opened in its thread. Placed by the
+  // switch's own rules, not as a filter change (`#243 filter-keeps-selection`).
+  setPinnedOnly(false, false);
   // `#215 reply-coalesce`. Gathered replies are an arrangement of the list on screen, and go with
   // it — back into time order BEFORE the rows are kept below, so that coming back to this view
   // finds them in the order every other read of it draws. A tap on an arrow still waiting to jump
@@ -13582,9 +14110,10 @@ async function dispatchOutgoingMessage(entry, job, placing = null) {
     entry.detail = "";
     noteSelfAuthor(parts[0].author_id);
     if (entry.channel === el("discord-channel").value) {
-      const pinned = currentView === "discord" && atBottom(el("scroll-area"));
+      // Not while a filter change holds a message in place. `#243 filter-keeps-selection`.
+      const pinned = currentView === "discord" && followsNewest(el("scroll-area"));
       // `#229 desktop-two-column`. The right column's reader on its newest line follows it too.
-      const sidePinned = sideShowing() && inColumn(columns.side, () => atBottom(el("scroll-area")));
+      const sidePinned = sideShowing() && inColumn(columns.side, () => followsNewest(el("scroll-area")));
       for (const part of entry.parts) appendToColumns(part);
       if (pinned) scrollToNewest();
       if (sidePinned) inColumn(columns.side, scrollToNewest);
@@ -15618,6 +16147,9 @@ function rowOnScreen(row) {
  */
 function revealRow(row) {
   const area = el("scroll-area");
+  // The reader asked for this message: a filter change's hold, and its walk back, give way. `#243`.
+  filterHold = null;
+  endFilterWalk();
   area.scrollTop += row.getBoundingClientRect().top - floatingClearance(area) - REPLY_LANDING_GAP_PX;
   if (replyLanded) {
     clearTimeout(replyLanded.timer);
@@ -15738,6 +16270,8 @@ async function seekMessage(target, arrive, openAll) {
   // `#229 desktop-two-column`. The column the walk is in, which its work after every wait is done in,
   // given back before the walk's promise settles, whichever way it ends.
   const steps = columnSteps();
+  // A walk back for a filter change gives way to this one, which takes the reader somewhere else. `#243`.
+  endFilterWalk();
   try {
     const ticket = ++replyJumpTicket;
     const channel = String(el("discord-channel").value);
@@ -19062,7 +19596,11 @@ function renderOlderControl() {
   // Not over the Pinned filter: its list is every pin already, and older history adds none.
   button.hidden = discordMoreAbove !== true || pinnedOnly;
   button.disabled = olderFetchInFlight;
-  button.textContent = olderFetchInFlight ? "Loading older messages…" : "Older messages";
+  // `#243 filter-keeps-selection`. A walk back to the message a filter change is keeping says what it
+  // is doing, where the reader waits for it.
+  const walking = filterWalk !== null && !sideActive;
+  button.textContent = olderFetchInFlight ? (walking ? "Loading earlier messages…" : "Loading older messages…")
+    : "Older messages";
 }
 
 /**
@@ -19196,7 +19734,10 @@ async function loadOlderPage() {
 
 /** The reader has arrived at the top of what is loaded. Take the next step for them. */
 function maybeLoadOlder() {
-  if (currentView !== "discord" || discordMoreAbove !== true || olderFetchInFlight) {
+  // Not at the head of the Pinned list, which is every pin already: older history adds none to it, and
+  // a step taken behind it reads for a list that is not on screen. A pin older than what is loaded is
+  // walked back to when the filter goes (`walkToFilterAnchor`, `#243 filter-keeps-selection`).
+  if (currentView !== "discord" || pinnedOnly || discordMoreAbove !== true || olderFetchInFlight) {
     return;
   }
   if (el("scroll-area").scrollTop > OLDER_TRIGGER_PX) {
@@ -19689,6 +20230,18 @@ function settleAfterRead(messages, how) {
   const moved = newest !== null && discordNewestId !== null && newest !== discordNewestId;
   const arrived = moved && how.ownAct !== true;
   discordNewestId = newest;
+  // `#243 filter-keeps-selection`. A message a filter change holds in place stays where that change
+  // put it, whatever this read measured when it was sent — before the change, perhaps — and whether or
+  // not the reader was on the newest line then.
+  if (how.keepPosition && keepFilterHold()) {
+    if (arrived) {
+      const at = messages.findIndex((message) => String(message.id) === previous);
+      setJumpNewest(true, "discord", at >= 0 ? messages.length - 1 - at : null);
+    } else {
+      renderJumpNewest();
+    }
+    return;
+  }
   if (how.keepPosition && !how.wasAtNewest) {
     // A pixel offset is not a place in a conversation: an edit or deletion above it changes which
     // message occupies that pixel. Prefer the same rendered message at the same viewport offset.
@@ -19728,10 +20281,12 @@ function settleAfterRead(messages, how) {
 
 /** Capture the channel row the reader is looking at before an authoritative replacement. */
 function channelReadPosition(area) {
-  const anchor = currentView === "discord" ? scrollAnchor(area) : null;
+  // A message a filter change holds in place is the one kept, and the newest line is not followed.
+  // `#243 filter-keeps-selection`.
+  const anchor = currentView === "discord" ? heldFilterRow() || scrollAnchor(area) : null;
   const anchorIds = anchor ? idsOf(anchor) : [];
   return {
-    wasAtNewest: currentView === "discord" && atBottom(area),
+    wasAtNewest: currentView === "discord" && followsNewest(area),
     previousTop: area.scrollTop,
     anchorId: anchor ? anchor.getAttribute("data-context-id") || anchorIds[0] || null : null,
     anchorTop: anchor ? anchor.getBoundingClientRect().top : 0,
@@ -20797,38 +21352,49 @@ async function clearBacklog() {
   }, throughBump(rowsNow[rowsNow.length - 1]));
 }
 
-/** Put the list in read mode `mode`. `#221 read-modes`. */
+/**
+ * Put the list in read mode `mode`. `#221 read-modes`. `#243 filter-keeps-selection`: a read mode is
+ * a filter like any other, and the whole change — the notes and controls over the list included — is
+ * made inside `keepingFilterPlace`: the reader's message stays where it is on the screen, or the line
+ * of the run it joins, or the nearest message left in its place.
+ */
 function setReadMode(mode) {
   if (!READ_MODES.includes(mode)) return;
   const wasHiding = todoMode;
-  readMode = mode;
-  todoMode = mode === "hide";
-  // Runs opened under Collapse read are a way of looking at that list, and the reader has just
-  // chosen another way: coming back to Collapse read collapses them all again.
-  openedReadRuns.clear();
-  // Kept across a reload, as the reader left it. `#189 restore-ui-state`.
-  uiStateSettled = true;
-  saveUiState();
-  disarmBacklog();
-  // An undo belongs to the act it undoes, and leaving the view is the reader moving on. Keeping
-  // it would offer to restore messages into a list they are no longer looking at. Showing or
-  // collapsing what is read leaves every message in the list, so the undo stays between those two.
-  if (todoMode !== wasHiding) lastDismissal = null;
-  if (!todoMode) {
-    backlogSize = 0;
-  }
-  renderTodoControls();
-  if (threadingSupported) {
-    // One read mode, for both columns. `#229 desktop-two-column`.
-    eachColumn(renderCachedTimeline);
-  } else if (todoMode !== wasHiding) {
-    guardQuietly(() => (todoMode ? loadTodo() : loadDiscord()))();
-  } else {
-    // Show read and Collapse read are the same read of the channel, drawn two ways.
-    applyReadRuns();
-    renderScrollTools();
-    requestVisibleSummaries();
-  }
+  const read = keepingFilterPlace(() => {
+    readMode = mode;
+    todoMode = mode === "hide";
+    // Runs opened under Collapse read are a way of looking at that list, and the reader has just
+    // chosen another way: coming back to Collapse read collapses them all again.
+    openedReadRuns.clear();
+    // Kept across a reload, as the reader left it. `#189 restore-ui-state`.
+    uiStateSettled = true;
+    saveUiState();
+    disarmBacklog();
+    // An undo belongs to the act it undoes, and leaving the view is the reader moving on. Keeping
+    // it would offer to restore messages into a list they are no longer looking at. Showing or
+    // collapsing what is read leaves every message in the list, so the undo stays between those two.
+    if (todoMode !== wasHiding) lastDismissal = null;
+    if (!todoMode) {
+      backlogSize = 0;
+    }
+    renderTodoControls();
+    if (threadingSupported) {
+      // One read mode, for both columns. `#229 desktop-two-column`.
+      eachColumn(renderCachedTimeline);
+    } else if (todoMode !== wasHiding) {
+      // A read of another route, which keeps the reader's place as a refresh does and is placed again
+      // when it lands. What it brings is the reader's own act, not something that arrived.
+      return (todoMode ? loadTodo : loadDiscord)({ keepPosition: true, ownAct: true });
+    } else {
+      // Show read and Collapse read are the same read of the channel, drawn two ways.
+      applyReadRuns();
+      renderScrollTools();
+    }
+    return undefined;
+  });
+  if (read) guardQuietly(() => read)();
+  requestVisibleSummaries();
 }
 
 // --- pinned messages ------------------------------------------------------------------------------
@@ -20874,8 +21440,6 @@ let pinsInFlight = null;
 const pinsPending = new Map();
 /** Whether the Pinned filter is on. Only while the search bar is open: closing it turns this off. */
 let pinnedOnly = false;
-/** Where the channel's list was when the filter came on, so turning it off puts the reader back. */
-let placeBeforePinned = null;
 /** What the filter's list was last drawn from, so it is rebuilt only when that changes. */
 let pinnedListDrawn = "";
 /** Rows of the filter drawn from what a pin kept, rather than from the message itself. */
@@ -20974,6 +21538,9 @@ function renderPins() {
     preservingScroll(renderChannelRows);
     renderScrollTools();
   });
+  // Pins landing under a Pinned filter turned on before they had: the pin nearest the message the
+  // reader was on is put in its place now. `#243 filter-keeps-selection`.
+  if (pinnedOnly) settlePendingFilterPlace();
 }
 
 /** What a pin keeps of `message`, as this page will show it until the server says what it kept. */
@@ -21067,35 +21634,32 @@ function syncPinnedList() {
 }
 
 /**
- * Turn the Pinned filter on or off. On, the channel's list steps aside for this channel's pins and
- * the reader is put at the newest of them, as a channel opens at its newest; off, the list comes
- * back where the reader left it.
+ * Turn the Pinned filter on or off. On, the channel's list steps aside for this channel's pins; off,
+ * it comes back. Either way the reader's message stays where it is on the screen (`#243
+ * filter-keeps-selection`): a pin selected in the Pinned list is where it was in the channel's list
+ * once the filter is off — walked back to, when it is older than anything loaded — and turned on, the
+ * pin nearest the message the reader was on is in its place. A reader on the newest line stays on it.
+ *
+ * `keepPlace` false is for a view switch, which takes the filter off on its way to a view it places
+ * the reader in by its own rules.
  */
-function setPinnedOnly(on) {
+function setPinnedOnly(on, keepPlace = true) {
   if (on === pinnedOnly) return;
-  const area = el("scroll-area");
-  // `#211 link-filter`. With whether Links was on, because the offset is a place in the list as it
-  // was then: with Links turned on or off since, it is a place in another list.
-  if (on) placeBeforePinned = { top: area.scrollTop, newest: atBottom(area), links: linksOnly };
-  pinnedOnly = on;
-  el("pinned-filter").setAttribute("aria-pressed", on ? "true" : "false");
-  if (on) el("pane-discord").setAttribute("data-pinned-only", "");
-  else el("pane-discord").removeAttribute("data-pinned-only");
-  renderChannelNavigation();
-  renderOlderControl();
-  renderChannelRows();
-  // The list's filters applied BEFORE the reader is placed — Links draws each row's links, which
-  // changes its height — so the place is measured on the list as it will be shown.
-  renderScrollTools();
-  if (on) {
-    ensurePins();
-    scrollToNewest();
-  } else if (placeBeforePinned) {
-    if (placeBeforePinned.newest || placeBeforePinned.links !== linksOnly) scrollToNewest();
-    else area.scrollTop = placeBeforePinned.top;
-    placeBeforePinned = null;
-  }
-  renderScrollTools();
+  const change = () => {
+    pinnedOnly = on;
+    el("pinned-filter").setAttribute("aria-pressed", on ? "true" : "false");
+    if (on) el("pane-discord").setAttribute("data-pinned-only", "");
+    else el("pane-discord").removeAttribute("data-pinned-only");
+    renderChannelNavigation();
+    renderOlderControl();
+    renderChannelRows();
+    // The list's filters applied BEFORE the reader is placed — Links draws each row's links, which
+    // changes its height — so the place is measured on the list as it will be shown.
+    renderScrollTools();
+    if (on) ensurePins();
+  };
+  if (keepPlace) keepingFilterPlace(change);
+  else change();
   requestVisibleSummaries();
 }
 
@@ -21995,9 +22559,8 @@ const COLUMN_STATE = [
   [() => archivedIds, (value) => { archivedIds = value; }, () => new Set()],
   [() => backlogSize, (value) => { backlogSize = value; }, () => 0],
   [() => pinnedOnly, (value) => { pinnedOnly = value; }, () => false],
-  [() => placeBeforePinned, (value) => { placeBeforePinned = value; }, () => null],
   [() => pinnedListDrawn, (value) => { pinnedListDrawn = value; }, () => ""],
-  [() => placeBeforeLinks, (value) => { placeBeforeLinks = value; }, () => null],
+  [() => filterHold, (value) => { filterHold = value; }, () => null],
   [() => scrollToolsHeld, (value) => { scrollToolsHeld = value; }, () => 0],
   [() => scrollToolsOwed, (value) => { scrollToolsOwed = value; }, () => false],
   [() => jumpNewestWanted.discord, (value) => { jumpNewestWanted.discord = value; }, () => false],
@@ -23563,7 +24126,8 @@ function receiveLiveMessage(message, selfPosted, replayed, fromTail) {
   // The SAME constructor the fetched rows go through, so the untrusted-content boundary is
   // identical on both paths. A live feed is not a reason to relax element construction.
   const area = el("scroll-area");
-  const wasAtNewest = currentView === "discord" && atBottom(area);
+  // Not while a filter change holds a message in place: nothing but the reader moves it. `#243`.
+  const wasAtNewest = currentView === "discord" && followsNewest(area);
   appendChannelRow(message, true);
   discordNewestId = id;
   if (wasAtNewest) {
@@ -25642,7 +26206,7 @@ el("todo-filter").addEventListener("click", cycleReadMode);
 el("clear-backlog").addEventListener("click", guardQuietly(clearBacklog));
 el("undo-dismiss").addEventListener("click", guardQuietly(undoDismissal));
 el("summarise").addEventListener("click", () => setSummaryMode(!summaryMode));
-el("jump-newest").addEventListener("click", scrollToNewest);
+el("jump-newest").addEventListener("click", jumpToNewest);
 // `#129 message-search`. The glass is a toggle, and the second tap is the way out: a control that
 // only ever opens leaves the reader looking for a close button that is not on a phone keyboard.
 el("search-toggle").addEventListener("click", () => setSearchOpen(!searchOpen));
@@ -25654,14 +26218,16 @@ el("links-filter").addEventListener("click", () => setLinksOnly(!linksOnly));
 for (const { kind, chip } of LINK_KINDS) {
   el(chip).addEventListener("click", () => setLinkKindShown(kind, hiddenLinkKinds.has(kind)));
 }
+// Typed or cleared — by the keyboard, the field's own clear button, or a paste — the text is a filter
+// change, and the reader's message stays where it is on the screen (`#243 filter-keeps-selection`).
+// `#212 link-filter`, from review: text that matches nothing takes the reader to the sentence saying
+// so, and text that matches again puts back the message they were on before it.
 el("search-field").addEventListener("input", () => {
-  const wasEmptied = listEmptied();
-  searchQuery = el("search-field").value;
-  eachColumn(renderScrollTools);
-  if (columnsShown) filterSideCards();
-  // `#212 link-filter`, from review: text that matches nothing takes the reader to the sentence
-  // saying so, and text that matches again to the newest line.
-  placeForFilter(wasEmptied);
+  keepingFilterPlace(() => {
+    searchQuery = el("search-field").value;
+    eachColumn(renderScrollTools);
+    if (columnsShown) filterSideCards();
+  });
 });
 // Escape closes AND clears, which is the same act — see `setSearchOpen`. It is the gesture a
 // desktop reader reaches for without being told, and the only one a keyboard has. `#224
@@ -25767,6 +26333,8 @@ if (typeof window.ResizeObserver === "function") {
       placeEntryLanding(entryLanding.row, entryLanding.first);
       return;
     }
+    // `#243 filter-keeps-selection`. Nor a message a filter change holds in place, which stays put.
+    if (keepFilterHold()) return;
     if (grew > 0 && atBottom(area, BOTTOM_SLACK_PX + grew)) {
       area.scrollTop = area.scrollHeight;
     }
@@ -25784,6 +26352,7 @@ if (typeof window.ResizeObserver === "function") {
         placeEntryLanding(entryLanding.row, entryLanding.first);
         return;
       }
+      if (keepFilterHold()) return;
       if (grew > 0 && atBottom(area, BOTTOM_SLACK_PX + grew)) area.scrollTop = area.scrollHeight;
     });
   }).observe(leftEl("side-scroll"));
