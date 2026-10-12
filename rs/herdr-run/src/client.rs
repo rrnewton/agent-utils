@@ -92,6 +92,7 @@ pub fn exit_status_code(status: ExitStatus) -> i32 {
 /// The program is executed by [`ExecPlan`], not by the standard library's `execvp`, so a file the
 /// kernel cannot execute -- a script without a `#!` line, say -- fails with `Exec format error
 /// (os error 8)` exactly as it does in the other edition, instead of being handed to `/bin/sh`.
+/// Its environment is built by [`child_environment`], the rule both editions share.
 pub(crate) fn bounded_output(
     command: &mut Command,
     timeout: Duration,
@@ -179,6 +180,68 @@ pub(crate) fn bounded_output(
     })
 }
 
+/// This process's environment as `NAME=value` entries, in its own order.
+///
+/// Read through the standard library, which skips an entry with no `=` after its first byte and
+/// splits the others at the first `=` after their first byte. Joined back, every entry it keeps is
+/// the entry as it was, and every entry it skips (no `=` at all, or only a leading one) is one the
+/// shared rule drops anyway, so [`child_environment`] makes of these exactly what it makes of the
+/// entries themselves. This process never changes its own environment.
+fn environment_entries() -> Vec<Vec<u8>> {
+    std::env::vars_os()
+        .map(|(name, value)| {
+            let mut entry = name.into_vec();
+            entry.push(b'=');
+            entry.extend_from_slice(&value.into_vec());
+            entry
+        })
+        .collect()
+}
+
+/// The environment a process herdr-run starts receives, by the rule both editions share.
+///
+/// * Each entry is split at its first `=`: the name is what precedes it and the value what
+///   follows, so a value may hold `=` and a name never does.
+/// * An entry with no `=`, or with nothing before its first `=`, is dropped. That includes `=A=1`,
+///   which the C library's `getenv` and the standard library's environment reader take for a
+///   variable named `=A`: its name here is empty, so no child receives it.
+/// * Of two entries with one name, the first is kept, where it stood.
+/// * The order is otherwise the order of `entries`.
+/// * Then each change is applied in turn: a value replaces the variable's value where it stands
+///   (`HOME` for a Herdr call keeps its place), or is added at the end when the variable is
+///   absent; `None` removes the variable (`PATH` for a Herdr call).
+///
+/// Applying the rule to its own result changes nothing.
+pub(crate) fn child_environment<E: AsRef<[u8]>>(
+    entries: impl IntoIterator<Item = E>,
+    changes: &[(&[u8], Option<&[u8]>)],
+) -> Vec<(Vec<u8>, Vec<u8>)> {
+    let mut variables: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for entry in entries {
+        let entry = entry.as_ref();
+        let Some(split) = entry.iter().position(|byte| *byte == b'=') else {
+            continue;
+        };
+        let (name, value) = (&entry[..split], &entry[split + 1..]);
+        if !name.is_empty() && seen.insert(name.to_vec()) {
+            variables.push((name.to_vec(), value.to_vec()));
+        }
+    }
+    for (name, replacement) in changes {
+        let position = variables.iter().position(|(known, _)| known == name);
+        match (replacement, position) {
+            (Some(value), Some(index)) => variables[index].1 = value.to_vec(),
+            (Some(value), None) => variables.push((name.to_vec(), value.to_vec())),
+            (None, Some(index)) => {
+                variables.remove(index);
+            }
+            (None, None) => {}
+        }
+    }
+    variables
+}
+
 /// The search path a child gets when its environment names none, as in the other edition.
 const DEFAULT_SEARCH_PATH: &[u8] = b"/bin:/usr/bin";
 
@@ -191,9 +254,11 @@ const DEFAULT_SEARCH_PATH: &[u8] = b"/bin:/usr/bin";
 /// "no such file" or "not a directory", else the last. Above all, an `Exec format error` is
 /// reported as it is, never retried through `/bin/sh` the way `execvp` retries it.
 ///
-/// The environment is the one the [`Command`] would give the child: this process's environment
-/// (the first entry wins for a repeated name, as the other edition reads it) with the command's
-/// explicit changes applied. `Command::env_clear` is not supported, and no caller uses it.
+/// The environment is [`child_environment`] applied to this process's environment, with the
+/// command's explicit changes (`Command::env`, `Command::env_remove`) as the changes, in the order
+/// `Command::get_envs` lists them. `Command::env_clear` cannot be honoured, because the standard
+/// library gives no stable way to see that it was called; this crate's `clippy.toml` refuses any
+/// call to it, so it cannot be used by accident.
 struct ExecPlan {
     candidates: Vec<CString>,
     _arguments: Vec<CString>,
@@ -215,18 +280,11 @@ impl ExecPlan {
         let nul = || io::Error::new(io::ErrorKind::InvalidInput, "argument contains a NUL byte");
         let text = |bytes: &[u8]| CString::new(bytes).map_err(|_| nul());
         let program = command.get_program().as_bytes();
-        let mut variables: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
-        for (name, value) in std::env::vars_os() {
-            if !variables.iter().any(|(known, _)| known == name.as_bytes()) {
-                variables.push((name.as_bytes().to_vec(), value.as_bytes().to_vec()));
-            }
-        }
-        for (name, value) in command.get_envs() {
-            variables.retain(|(known, _)| known != name.as_bytes());
-            if let Some(value) = value {
-                variables.push((name.as_bytes().to_vec(), value.as_bytes().to_vec()));
-            }
-        }
+        let changes = command
+            .get_envs()
+            .map(|(name, value)| (name.as_bytes(), value.map(OsStrExt::as_bytes)))
+            .collect::<Vec<_>>();
+        let variables = child_environment(environment_entries(), &changes);
         let candidates = if program.contains(&b'/') {
             vec![text(program)?]
         } else {
@@ -1300,6 +1358,92 @@ mod tests {
         let mask =
             u64::from_str_radix(line.trim().trim_start_matches("SigIgn:").trim(), 16).unwrap();
         assert_eq!(mask & (1 << (libc::SIGXFSZ - 1)), 0, "{line}");
+    }
+
+    fn child_cases() -> Value {
+        serde_json::from_str(include_str!("../testdata/child_cases.json")).expect("child cases")
+    }
+
+    /// An item of `child_cases.json`: a string read as UTF-8, or a list of byte values.
+    fn corpus_bytes(value: &Value) -> Vec<u8> {
+        match value {
+            Value::String(text) => text.as_bytes().to_vec(),
+            Value::Array(bytes) => bytes
+                .iter()
+                .map(|byte| u8::try_from(byte.as_u64().expect("a byte")).expect("a byte"))
+                .collect(),
+            other => panic!("not an environment item: {other}"),
+        }
+    }
+
+    fn joined(variables: &[(Vec<u8>, Vec<u8>)]) -> Vec<Vec<u8>> {
+        variables
+            .iter()
+            .map(|(name, value)| [name.as_slice(), b"=", value.as_slice()].concat())
+            .collect()
+    }
+
+    /// The environment rule shared with the other edition, row by row; and applying it to its own
+    /// result changes nothing.
+    #[test]
+    fn golden_child_environment() {
+        let document = child_cases();
+        for row in document["environment"].as_array().expect("rows") {
+            let entries = row[0]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(corpus_bytes)
+                .collect::<Vec<_>>();
+            let owned = row[1]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|change| {
+                    let value = (!change[1].is_null()).then(|| corpus_bytes(&change[1]));
+                    (corpus_bytes(&change[0]), value)
+                })
+                .collect::<Vec<_>>();
+            let changes = owned
+                .iter()
+                .map(|(name, value)| (name.as_slice(), value.as_deref()))
+                .collect::<Vec<_>>();
+            let expected = row[2]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(corpus_bytes)
+                .collect::<Vec<_>>();
+            let built = child_environment(&entries, &changes);
+            assert_eq!(joined(&built), expected, "{row}");
+            assert_eq!(child_environment(joined(&built), &[]), built, "{row}");
+        }
+    }
+
+    /// A child's environment is this process's own under the rule: a variable the command sets
+    /// keeps its place, one it removes is gone, and nothing else moves.
+    #[test]
+    fn a_child_receives_the_environment_the_rule_builds() {
+        let mut command = Command::new("/bin/cat");
+        command
+            .arg("/proc/self/environ")
+            .env("HOME", "/herdr-run/replaced")
+            .env_remove("PATH");
+        let output = bounded_output(&mut command, Duration::from_secs(10)).unwrap();
+        let mut received = output.stdout;
+        assert_eq!(received.pop(), Some(0), "the environment ends in a NUL");
+        let received = received
+            .split(|byte| *byte == 0)
+            .map(<[u8]>::to_vec)
+            .collect::<Vec<_>>();
+        let expected = child_environment(
+            environment_entries(),
+            &[
+                (b"HOME".as_slice(), Some(b"/herdr-run/replaced".as_slice())),
+                (b"PATH".as_slice(), None),
+            ],
+        );
+        assert_eq!(received, joined(&expected));
     }
 
     fn scratch_directory(label: &str) -> PathBuf {

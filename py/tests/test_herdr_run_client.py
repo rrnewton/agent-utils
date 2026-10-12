@@ -82,6 +82,63 @@ def test_bounded_control_command_refuses_a_nul_byte_before_spawning() -> None:
         client_module.bounded_control_command(("/bin/echo", "a\0b"))
 
 
+def test_a_child_receives_its_environment_explicitly_by_the_shared_rule() -> None:
+    """Order kept, nothing added: a real child gets exactly the entries the rule builds."""
+    completed = client_module.bounded_control_command(
+        ["/bin/cat", "/proc/self/environ"],
+        environ={"A": "1", "HOME": "/caller", "B": "x=y"},
+    )
+    assert completed.stdout == "A=1\0HOME=/caller\0B=x=y\0"
+
+
+def test_a_child_receives_this_process_environment_under_the_rule_by_default(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """With no environment given, the child's is this process's own put through the rule."""
+    captured: dict[str, object] = {}
+
+    class FakeProcess:
+        pid = 123
+        returncode = 0
+
+        def communicate(self, *, timeout: float) -> tuple[bytes, bytes]:
+            return b"", b""
+
+    def fake_popen(command: list[str], **kwargs: object) -> FakeProcess:
+        captured.update(kwargs)
+        return FakeProcess()
+
+    monkeypatch.setenv("HERDR_RUN_TEST_CHILD_ENV", "value=with=equals")
+    monkeypatch.setattr(subprocess, "Popen", fake_popen)
+    client_module.bounded_control_command(("fixture", "status"))
+    expected = client_module.child_environment(client_module.environment_entries())
+    assert captured["env"] == expected
+    assert list(expected.items()) == [
+        (name, value) for name, value in os.environb.items() if name and b"=" not in name
+    ]
+    assert expected[b"HERDR_RUN_TEST_CHILD_ENV"] == b"value=with=equals"
+
+
+def test_a_herdr_call_keeps_home_in_place_and_drops_path(monkeypatch: pytest.MonkeyPatch) -> None:
+    """HOME is replaced where it stands, PATH removed, and nothing else moves."""
+    captured: dict[str, object] = {}
+
+    def capture(command: Sequence[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        captured.update(kwargs)
+        return _completed(command, stdout='{"server": {"running": true}}')
+
+    monkeypatch.setattr(HerdrClient, "_account_home", staticmethod(lambda: "/account/home"))
+    monkeypatch.setattr(HerdrClient, "_executable", lambda self: "/opt/herdr/bin/herdr")
+    monkeypatch.setattr(client_module, "bounded_control_command", capture)
+    client = HerdrClient(
+        environ={"A": "1", "HOME": "/caller", "PATH": "/planted", "B": "2"},
+    )
+    assert client.server_running() is True
+    environ = captured["environ"]
+    assert isinstance(environ, dict)
+    assert list(environ.items()) == [(b"A", b"1"), (b"HOME", b"/account/home"), (b"B", b"2")]
+
+
 def test_control_timeout_terminates_descendants(
     tmp_path: object, monkeypatch: pytest.MonkeyPatch
 ) -> None:

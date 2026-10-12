@@ -1170,7 +1170,15 @@ def test_the_utf8_restart_takes_the_command_line_and_environment_from_proc(
     UnicodeEncodeError for an argument holding UTF-8 text, before any output.
     """
     command = [b"/usr/bin/python3", b"-m", b"herdr_run", b"check", "git 日本".encode(), b"\xff", b""]
-    environment = [b"LC_ALL=ja_JP.eucJP", b"HOME=/h", b"NOEQUALS", b"HOME=/second"]
+    environment = [
+        b"LC_ALL=ja_JP.eucJP",
+        b"=A=1",
+        b"HOME=/h",
+        b"NOEQUALS",
+        b"=empty-name",
+        b"VALUE=a=b",
+        b"HOME=/second",
+    ]
     captured: dict[str, object] = {}
 
     def strings(name: str) -> list[bytes]:
@@ -1185,9 +1193,34 @@ def test_the_utf8_restart_takes_the_command_line_and_environment_from_proc(
     monkeypatch.setattr(sys, "argv", ["herdr-run", "check", "git \udc80\ud800"])
     cli_module._restart_in_utf8_mode(["-m", "herdr_run"])
     assert captured["argv"] == [command[0], b"-X", b"utf8", *command[1:]]
-    # The first of two entries with one name wins, and an entry without '=' is skipped, as for
-    # os.environ; nothing is added, so PEP 538's LC_CTYPE cannot reach the restarted process.
-    assert captured["env"] == {b"LC_ALL": b"ja_JP.eucJP", b"HOME": b"/h"}
+    # The shared rule: the first of two entries with one name is kept where it stood, and an
+    # entry without '=' or with an empty name (``=A=1`` included) is dropped. Nothing is added, so
+    # PEP 538's LC_CTYPE cannot reach the restarted process.
+    env = captured["env"]
+    assert isinstance(env, dict)
+    assert list(env.items()) == [
+        (b"LC_ALL", b"ja_JP.eucJP"),
+        (b"HOME", b"/h"),
+        (b"VALUE", b"a=b"),
+    ]
+
+
+def test_the_utf8_restart_without_proc_passes_this_environment_under_the_rule(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Without ``/proc`` the environment is still passed explicitly, never inherited as it is."""
+    from herdr_run.client import child_environment, environment_entries
+
+    captured: dict[str, object] = {}
+    monkeypatch.setattr(sys, "_xoptions", {})
+    monkeypatch.setattr(cli_module, "_proc_self_strings", lambda name: None)
+    monkeypatch.setattr(os, "execv", lambda *args: pytest.fail("the environment was inherited"))
+    monkeypatch.setattr(os, "execve", lambda path, argv, env: captured.update(env=env))
+    monkeypatch.setenv("HERDR_RUN_TEST_RESTART", "kept=as=is")
+    cli_module._restart_in_utf8_mode(["-m", "herdr_run"])
+    assert captured["env"] == child_environment(environment_entries())
+    env = captured["env"]
+    assert isinstance(env, dict) and env[b"HERDR_RUN_TEST_RESTART"] == b"kept=as=is"
 
 
 def test_the_utf8_restart_is_skipped_when_the_interpreter_turned_utf8_mode_off(

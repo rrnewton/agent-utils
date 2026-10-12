@@ -167,6 +167,14 @@ Processes `herdr-run` starts itself (Herdr, `git check-ignore` to check the spoo
 `net-doctor` probe) are executed directly: a file the kernel cannot execute, such as a script with
 no `#!` line, is reported as `Exec format error (os error 8)`, never run through `/bin/sh`.
 
+Each of them is given an environment built from `herdr-run`'s own by one rule. Every entry is
+split at its first `=`: what precedes it is the name and what follows the value, so a value may
+hold `=` and a name never does. An entry with no `=`, or with nothing before its first `=`, is
+dropped; that includes `=A=1`, which some readers take for a variable named `=A`. Of two entries
+with one name the first is kept, where it stood, and nothing is reordered. A Herdr call then has
+`PATH` removed and `HOME` replaced, where it stands, by the home the account database reports (or
+added at the end when there was none).
+
 Quoted values in diagnostics (`program "curl" is not allowlisted`, `got "maybe"`) are written with
 printable ASCII as is, `\n`, `\r`, and `\t` as escapes, and every other character as `\u{hex}`,
 so a message never writes a bidirectional override or a line separator to the terminal raw. What

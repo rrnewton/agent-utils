@@ -25,7 +25,12 @@ from dataclasses import dataclass, replace
 from herdr_run import __version__
 from herdr_run.allowlist import Admission, admit, quote_word
 from herdr_run.audit import audit_path, record, warn_if_spool_is_tracked
-from herdr_run.client import HerdrClient, bounded_control_command
+from herdr_run.client import (
+    HerdrClient,
+    bounded_control_command,
+    child_environment,
+    environment_entries,
+)
 from herdr_run.config import (
     MAX_TIMEOUT_SECONDS,
     Config,
@@ -1594,20 +1599,16 @@ def _proc_self_strings(name: str) -> list[bytes] | None:
 
 
 def _original_environment() -> dict[bytes, bytes] | None:
-    """The environment this process was executed with, read the way ``os.environ`` reads it.
+    """The environment this process was executed with, under the rule every child's is built by.
 
-    ``None`` when ``/proc/self/environ`` cannot be read. An entry without ``=`` (or with an empty
-    name) is skipped and the first of two entries with one name wins, as for ``os.environ``.
+    ``None`` when ``/proc/self/environ`` cannot be read. The entries are put through
+    :func:`herdr_run.client.child_environment`: an entry without ``=`` or with an empty name is
+    dropped, and the first of two entries with one name is kept where it stood.
     """
     entries = _proc_self_strings("environ")
     if entries is None:
         return None
-    environment: dict[bytes, bytes] = {}
-    for entry in entries:
-        key, separator, value = entry.partition(b"=")
-        if separator and key:
-            environment.setdefault(key, value)
-    return environment
+    return child_environment(entries)
 
 
 def _restore_environment(original: Mapping[bytes, bytes]) -> None:
@@ -1615,7 +1616,7 @@ def _restore_environment(original: Mapping[bytes, bytes]) -> None:
 
     The interpreter may have changed it before any of this code ran: PEP 538 locale coercion adds
     ``LC_CTYPE=C.UTF-8`` when the locale is ``C``, and children would inherit that. The native
-    edition passes its caller's environment on unchanged, so this one does too.
+    edition builds its children's environment from its caller's alone, so this one does too.
     """
     current = os.environb
     for key in list(current):
@@ -1651,6 +1652,10 @@ def _restart_in_utf8_mode(reexec: Sequence[str]) -> None:
     such as ``ja_JP.eucJP`` cannot always do: it raised UnicodeEncodeError for an argument holding
     UTF-8 text. When ``/proc`` is unavailable, the fallback rebuilds the command from ``sys.argv``
     and ``reexec`` and keeps running in the locale's encoding if that cannot be encoded.
+
+    The restarted interpreter is a child like any other: its environment is built by
+    :func:`herdr_run.client.child_environment` and passed explicitly, from ``/proc/self/environ``
+    or, without ``/proc``, from ``os.environ``.
     """
     executable = sys.executable
     command = _proc_self_strings("cmdline")
@@ -1669,11 +1674,10 @@ def _restart_in_utf8_mode(reexec: Sequence[str]) -> None:
             ]
         except (UnicodeError, ValueError):
             return
+    if environment is None:
+        environment = child_environment(environment_entries())
     try:
-        if environment is None:
-            os.execv(executable, argv)
-        else:
-            os.execve(executable, argv, environment)
+        os.execve(executable, argv, environment)
     except (OSError, ValueError):
         return
 
@@ -1690,7 +1694,9 @@ def _prepare_process(reexec: Sequence[str]) -> None:
       and output are then UTF-8 whatever the locale, as they are in the native edition, and bytes
       that are not UTF-8 are visible and refusable rather than silently reinterpreted.
     * The environment is put back to the one this process was executed with
-      (:func:`_restore_environment`), so children see the caller's environment unchanged.
+      (:func:`_restore_environment`), so every child's environment is built from the caller's by
+      the shared rule (:func:`herdr_run.client.child_environment`), with nothing the interpreter
+      added.
     * SIGINT gets its default action when the interpreter installed its own handler, so an
       interrupt ends the process BY the signal, which is what lets a calling loop stop instead of
       carrying on. A SIGINT the caller ignored stays ignored, as it does in the native edition.

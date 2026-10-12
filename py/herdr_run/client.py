@@ -26,7 +26,7 @@ import signal
 import stat
 import subprocess
 import time
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 
 from herdr_run.errors import HerdrUnavailable
@@ -43,6 +43,8 @@ __all__ = [
     "SYSTEMD_RUN_CANDIDATES",
     "account_home",
     "bounded_control_command",
+    "child_environment",
+    "environment_entries",
 ]
 
 #: A ``subprocess.run``-shaped callable, injected so tests never spawn a real process.
@@ -93,10 +95,57 @@ class ProcessInfo:
     foreground: tuple[tuple[int, str, str], ...]
 
 
+def environment_entries(
+    environ: Mapping[str, str] | Mapping[bytes, bytes] | None = None,
+) -> list[bytes]:
+    """``environ`` as ``NAME=value`` entries, in order; this process's environment by default.
+
+    This process's environment is read as ``os.environb`` holds it: the interpreter splits each
+    entry at its first ``=``, skips one without ``=``, and keeps the first of two entries with one
+    name, in the order they came. Put through :func:`child_environment`, that gives exactly what
+    the shared rule makes of the entries themselves, because the rule drops what the interpreter
+    skips and keeps the entries it keeps.
+    """
+    source = os.environb if environ is None else environ
+    return [os.fsencode(name) + b"=" + os.fsencode(value) for name, value in source.items()]
+
+
+def child_environment(
+    entries: Iterable[bytes], changes: Iterable[tuple[bytes, bytes | None]] = ()
+) -> dict[bytes, bytes]:
+    """The environment a process herdr-run starts receives, by the rule both editions share.
+
+    * Each entry is split at its first ``=``: the name is what precedes it and the value what
+      follows, so a value may hold ``=`` and a name never does.
+    * An entry with no ``=``, or with nothing before its first ``=``, is dropped. That includes
+      ``=A=1``, which the C library's ``getenv`` and the native runtime's environment reader take
+      for a variable named ``=A``: its name here is empty, so no child receives it.
+    * Of two entries with one name, the first is kept, where it stood.
+    * The order is otherwise the order of ``entries``.
+    * Then each change is applied in turn: a value replaces the variable's value where it stands
+      (``HOME`` for a Herdr call keeps its place), or is added at the end when the variable is
+      absent; ``None`` removes the variable (``PATH`` for a Herdr call).
+
+    Applying the rule to its own result changes nothing, so a process that was itself started by
+    it (the restart in UTF-8 mode) passes the same environment on.
+    """
+    environment: dict[bytes, bytes] = {}
+    for entry in entries:
+        name, separator, value = entry.partition(b"=")
+        if separator and name:
+            environment.setdefault(name, value)
+    for name, replacement in changes:
+        if replacement is None:
+            environment.pop(name, None)
+        else:
+            environment[name] = replacement
+    return environment
+
+
 def bounded_control_command(
     command: Sequence[str],
     *,
-    environ: Mapping[str, str] | None = None,
+    environ: Mapping[str, str] | Mapping[bytes, bytes] | None = None,
     timeout: float = CONTROL_TIMEOUT_SECONDS,
 ) -> "subprocess.CompletedProcess[str]":
     """Capture one control command and kill its whole process group on timeout.
@@ -107,15 +156,20 @@ def bounded_control_command(
     as UTF-8 with replacement, with no newline translation, so a carriage return reads as one. A
     signal-killed child reports ``-N``. An argument containing a NUL byte is refused before
     anything is spawned.
+
+    The child's environment is ``environ`` (this process's environment by default) put through
+    :func:`child_environment`, always passed explicitly: a child never inherits the C library's
+    environment array as it is, with its repeated names and entries without ``=``.
     """
     argv = list(command)
     if any("\x00" in argument for argument in argv):
         raise OSError("argument contains a NUL byte")
+    environment = child_environment(environment_entries(environ))
     process = subprocess.Popen(
         argv,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
-        env=None if environ is None else dict(environ),
+        env=environment,
         start_new_session=True,
     )
     try:
@@ -376,9 +430,10 @@ class HerdrClient:
         """Run one control command; production calls discard caller PATH and pin HOME."""
         if self._run is not None:
             return self._run(command)
-        environ = dict(self._environ)
-        environ.pop("PATH", None)
-        environ["HOME"] = self._account_home()
+        environ = child_environment(
+            environment_entries(self._environ),
+            ((b"PATH", None), (b"HOME", os.fsencode(self._account_home()))),
+        )
         return bounded_control_command(
             command, environ=environ, timeout=CONTROL_TIMEOUT_SECONDS
         )

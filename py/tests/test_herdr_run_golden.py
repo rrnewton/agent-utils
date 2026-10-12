@@ -14,6 +14,8 @@ that changes in one edition fails the other edition's suite until both agree aga
   values or errors, including server start-up;
 - ``record_cases.json``: reap scope, evidence folded from run records, session-cache loading
   and the exact bytes a cache store writes;
+- ``child_cases.json``: the environment every process either edition starts is handed, built by
+  the shared rule;
 - ``policy_cases.json``: configuration loading and command admission, including ``~`` expanded
   before the policy judges an argument, names refused for holding an invisible character or any
   other character a name may not contain, the
@@ -24,6 +26,7 @@ that changes in one edition fails the other edition's suite until both agree aga
 from __future__ import annotations
 
 import json
+import os
 import re
 import subprocess
 import sys
@@ -37,7 +40,7 @@ import pytest
 from herdr_run import __version__
 from herdr_run.allowlist import admit
 from herdr_run.cli import _Globals, _resolve_agent, check_text
-from herdr_run.client import HerdrClient
+from herdr_run.client import HerdrClient, child_environment
 from herdr_run.config import (
     Config,
     missing_defaults_warning,
@@ -83,6 +86,7 @@ READINESS = _load("readiness_cases.json")
 PROTOCOL = _load("protocol_cases.json")
 RECORDS = _load("record_cases.json")
 POLICY = _load("policy_cases.json")
+CHILD = _load("child_cases.json")
 
 
 def _rows(document: dict[str, object], key: str) -> list[list[object]]:
@@ -654,6 +658,30 @@ def test_session_cache_store_bytes(row: list[object], tmp_path: Path) -> None:
     _store_cache(str(path), cast(str, key), target)
     assert path.read_bytes().decode("utf-8") == written
     assert sorted(entry.name for entry in path.parent.iterdir()) == names
+
+
+# --- what every child is handed ------------------------------------------------------------------
+
+
+def _item(value: object) -> bytes:
+    """An item of ``child_cases.json``: a string read as UTF-8, or a list of byte values."""
+    return value.encode("utf-8") if isinstance(value, str) else bytes(cast(list[int], value))
+
+
+@pytest.mark.parametrize("row", _rows(CHILD, "environment"), ids=ascii)
+def test_child_environment(row: list[object]) -> None:
+    entries, changes, expected = row
+    built = child_environment(
+        [_item(entry) for entry in cast(list[object], entries)],
+        [
+            (_item(name), None if value is None else _item(value))
+            for name, value in cast(list[list[object]], changes)
+        ],
+    )
+    joined = [name + b"=" + value for name, value in built.items()]
+    assert joined == [_item(item) for item in cast(list[object], expected)]
+    # Applying the rule to its own result changes nothing.
+    assert child_environment(joined) == built
 
 
 # --- one version for both editions ---------------------------------------------------------------
