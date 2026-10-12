@@ -1100,8 +1100,12 @@ body {
   text-align: center;
 }
 
+/* No margin of its own: its last row's, as between two rows of the channel, is the gap over the
+   message. `#247 reply-continuity`. It used to collapse into this one, until `#242 rich-headers` made
+   the list a size container, which keeps its rows' margins inside it, and the two added up to twice
+   the channel's gap. */
 #reply-context {
-  margin: 0 0 0.5rem;
+  margin: 0;
 }
 
 /* `#247 reply-continuity`. Small and quiet beside its label: who is being answered, and the id the
