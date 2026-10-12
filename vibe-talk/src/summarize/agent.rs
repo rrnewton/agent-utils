@@ -464,11 +464,20 @@ pub fn instruction(request: &SummaryRequest<'_>) -> String {
 /// Reusing [`crate::summary::condense`] rather than reimplementing the code-and-link flattening it
 /// already does is deliberate: the digest line, the collapsed row preview and this summary all end
 /// up being read aloud, and two ideas of what "speakable" means is one too many.
+///
+/// # Length
+///
+/// `requested_chars` is the length the model was ASKED for, and the answer is NOT cut there. It is
+/// cut only past [`super::hard_cap_chars`] of it — 640 for the default 160 — at a word boundary,
+/// ending "…". `#257 summary-truncation`: cutting at the requested length turned every answer that
+/// ran one word long into a sentence that stopped mid-thought. Every backend's answer, and a thread
+/// sentence too ([`super::threads::parse_thread_answer`]), passes through here, so they all agree
+/// on where that is.
 #[must_use]
-pub fn plain(reply: &str, max_chars: usize) -> String {
+pub fn plain(reply: &str, requested_chars: usize) -> String {
     let unmarked: Vec<String> = reply.lines().map(strip_line_markers).collect();
     let joined = unmarked.join(" ").replace("**", "").replace("__", "");
-    crate::summary::condense(&joined, max_chars)
+    crate::summary::condense(&joined, super::hard_cap_chars(requested_chars))
 }
 
 /// Drop a leading heading or list marker from one line.
@@ -878,6 +887,85 @@ mod tests {
             "2026 was the year it shipped"
         );
         assert_eq!(plain("a plain sentence", 160), "a plain sentence");
+    }
+
+    /// A sentence of `chars` characters, of ordinary words, ending in a full stop.
+    fn sentence_of(chars: usize) -> String {
+        let mut out = String::from("The team");
+        let words = [
+            "reviewed", "storage", "use", "in", "the", "build", "cache", "and", "found", "old",
+            "records",
+        ];
+        for word in words.iter().cycle() {
+            if out.chars().count() + 1 + word.chars().count() + 1 > chars {
+                break;
+            }
+            out.push(' ');
+            out.push_str(word);
+        }
+        while out.chars().count() + 1 < chars {
+            out.push('s');
+        }
+        out.push('.');
+        out
+    }
+
+    #[test]
+    fn an_answer_half_as_long_again_as_asked_for_is_kept_whole() {
+        // `#257 summary-truncation`. Asked for 160, a model answered 240: an ordinary overshoot,
+        // and it used to reach the page cut at 160 with "…".
+        let answer = sentence_of(240);
+        assert_eq!(answer.chars().count(), 240);
+        assert_eq!(plain(&answer, 160), answer);
+        let twice = sentence_of(320);
+        assert_eq!(
+            plain(&twice, 160),
+            twice,
+            "even twice the length is kept whole"
+        );
+        let at_the_cap = sentence_of(super::super::hard_cap_chars(160));
+        assert_eq!(
+            plain(&at_the_cap, 160),
+            at_the_cap,
+            "the cap itself is kept"
+        );
+    }
+
+    #[test]
+    fn an_answer_past_the_hard_cap_is_cut_at_a_word_boundary_with_an_ellipsis() {
+        let cap = super::super::hard_cap_chars(160);
+        let wall = "alpha bravo charlie delta echo foxtrot ".repeat(40);
+        assert!(wall.chars().count() > cap);
+        let cut = plain(&wall, 160);
+        assert!(
+            cut.chars().count() <= cap,
+            "over the cap: {}",
+            cut.chars().count()
+        );
+        assert!(
+            cut.chars().count() > cap - 12,
+            "cut far short of the cap: {}",
+            cut.chars().count()
+        );
+        let kept = cut
+            .strip_suffix('…')
+            .expect("a cut answer ends with an ellipsis");
+        assert!(
+            wall.starts_with(&format!("{kept} ")),
+            "the cut split a word: {kept:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_agent_backend_keeps_an_overlong_answer_whole_too() {
+        // The two backends agree: the ElevenLabs agent's answer goes through `plain` as the
+        // Messages API's does, so a reply one and a half times the requested length survives.
+        let vendor = Arc::new(FakeElevenLabs::new());
+        let answer = sentence_of(240);
+        vendor.answer_with(&answer);
+        let under = summarizer(&vendor, PoolPolicy::default());
+        let summary = summarise(&under, "a wall of text").await.expect("answers");
+        assert_eq!(summary, answer);
     }
 
     #[test]

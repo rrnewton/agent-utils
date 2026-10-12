@@ -536,8 +536,31 @@ impl MessagesApiSummarizer {
             )));
         }
         self.note(|s| s.answered += 1);
+        if parsed.stop_reason.as_deref() == Some("max_tokens") {
+            return Attempt::Answered(marked_as_cut(&text));
+        }
         Attempt::Answered(text)
     }
+}
+
+/// An answer the provider stopped at `max_tokens`, marked as cut the way one past
+/// [`super::hard_cap_chars`] is: at the last whole word, ending "…".
+///
+/// `max_tokens` is a second cap, applied by the provider rather than here, and it stops mid-word as
+/// readily as between words; unmarked, its cut reached the page as a sentence ending in half a word
+/// with nothing to say so. `#257 summary-truncation`. The last word is dropped unless the text
+/// already ends between words; with no whole word before it, the text is kept as it came.
+fn marked_as_cut(text: &str) -> String {
+    let trimmed = text.trim_end();
+    let whole = if trimmed.len() < text.len() {
+        trimmed
+    } else {
+        trimmed
+            .rfind(char::is_whitespace)
+            .map_or("", |at| trimmed[..at].trim_end())
+    };
+    let kept = if whole.is_empty() { trimmed } else { whole };
+    format!("{kept}…")
 }
 
 /// The first configured credential or TLS file that is not there, as the setting naming it and
@@ -857,6 +880,7 @@ impl Summarizer for MessagesApiSummarizer {
         let reply = self
             .complete(Priority::Interactive, &system, request.prompt())
             .await?;
+        // Asked for `target_chars`, cut only well past it: see `plain`. `#257 summary-truncation`.
         let summary = plain(&reply, request.target_chars);
         if summary.trim().is_empty() || summary == crate::summary::NO_TEXT {
             return Err(SummaryError::Shape(

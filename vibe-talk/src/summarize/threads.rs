@@ -213,6 +213,10 @@ pub fn valid_thread_slug(slug: &str) -> bool {
 /// that fails is a FAILED naming, by name, never truncated or patched into shape — a name is the
 /// thing the reader finds the thread by, and a mangled one is worse than none.
 ///
+/// `sentence_chars` is the length the sentence was ASKED for, not where it is cut: it is kept whole
+/// up to [`super::hard_cap_chars`] of that, as a message summary is (see [`super::agent::plain`]).
+/// `#257 summary-truncation`.
+///
 /// # Errors
 ///
 /// [`SummaryError::Shape`] when there is no usable name or no sentence. The answer itself is not
@@ -913,6 +917,47 @@ mod tests {
                 "{answer:?}"
             );
         }
+    }
+
+    #[test]
+    fn a_sentence_longer_than_asked_for_is_kept_whole_and_only_a_wall_is_cut() {
+        // `#257 summary-truncation`. Asked for 160, the model wrote a sentence of about 200: it
+        // used to reach the card cut at 160, mid-thought, with "…".
+        let sentence =
+            "The team is reviewing excessive storage use in the build cache and the docs \
+                        site, finding wasteful data formats and old historical records that no \
+                        current report still needs.";
+        assert!(
+            sentence.chars().count() > 160,
+            "{}",
+            sentence.chars().count()
+        );
+        let naming = parse_thread_answer(&format!("storage-audit-findings\n{sentence}"), 160)
+            .expect("named");
+        assert_eq!(naming.slug, "storage-audit-findings");
+        assert_eq!(naming.sentence, sentence);
+        let long = format!("{sentence} ").repeat(3);
+        let long = long.trim_end();
+        assert!(long.chars().count() < super::super::hard_cap_chars(160));
+        assert_eq!(
+            parse_thread_answer(&format!("storage-audit-findings\n{long}"), 160)
+                .expect("named")
+                .sentence,
+            long,
+            "three times the requested length is still under the cap and kept whole"
+        );
+        let wall = format!("{sentence} ").repeat(8);
+        let cut = parse_thread_answer(&format!("storage-audit-findings\n{wall}"), 160)
+            .expect("named")
+            .sentence;
+        assert!(cut.chars().count() <= super::super::hard_cap_chars(160));
+        let kept = cut
+            .strip_suffix('…')
+            .expect("a cut sentence ends with an ellipsis");
+        assert!(
+            wall.starts_with(&format!("{kept} ")),
+            "the cut split a word: {kept:?}"
+        );
     }
 
     #[test]

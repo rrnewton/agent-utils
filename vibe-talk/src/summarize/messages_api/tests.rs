@@ -561,6 +561,85 @@ async fn a_thread_is_named_by_one_call_and_a_bad_name_fails_it() {
     assert!(matches!(error, SummaryError::Shape(_)), "{error:?}");
 }
 
+#[tokio::test]
+async fn an_answer_longer_than_asked_for_is_kept_whole_and_the_request_is_unchanged() {
+    // `#257 summary-truncation`. The model is still asked for 160 characters; an answer half as
+    // long again — an ordinary overshoot — used to be cut at 160 with "…" and now arrives whole,
+    // for a summary and for a thread sentence alike.
+    let summary =
+        "The team is reviewing excessive storage use in the build cache and the docs site, \
+         finding wasteful data formats and old historical records that no current report still \
+         needs, and plans to prune the oldest of them before the next release ships.";
+    assert!(
+        summary.chars().count() >= 240,
+        "{}",
+        summary.chars().count()
+    );
+    let mock = Mock::start(vec![
+        Reply::text(summary),
+        Reply::text(&format!("storage-audit-findings\n{summary}")),
+    ])
+    .await;
+    let files = Files::new("llm-overshoot");
+    let under = MessagesApiSummarizer::new(anthropic(&mock, &files));
+    assert_eq!(
+        summarise(&under, "a wall of text").await.expect("answers"),
+        summary
+    );
+    let messages = [message("the cache is huge"), message("most of it is old")];
+    let naming = under
+        .name_thread(&ThreadRequest::new(&messages, 160))
+        .await
+        .expect("named");
+    assert_eq!(naming.slug, "storage-audit-findings");
+    assert_eq!(naming.sentence, summary);
+    let sent = mock.captured();
+    for request in &sent {
+        let system = request.body["system"]
+            .as_str()
+            .expect("a system instruction");
+        assert!(
+            system.contains("under 160 characters"),
+            "the requested length changed: {system}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn an_answer_stopped_at_max_tokens_is_marked_as_cut_at_a_whole_word() {
+    // The provider's own cap stops mid-word; the page must not show half a word with nothing to
+    // say the sentence was cut.
+    let cut = |text: &str| Reply {
+        status: 200,
+        headers: vec![],
+        body: json!({"content": [{"type": "text", "text": text}], "stop_reason": "max_tokens"})
+            .to_string(),
+    };
+    let mock = Mock::start(vec![
+        cut("The runner pool is down to one wedged mac and the arm64 jo"),
+        cut("The runner pool is down to one wedged mac and the arm64 job "),
+        cut("Unbroken"),
+    ])
+    .await;
+    let files = Files::new("llm-max-tokens");
+    let under = MessagesApiSummarizer::new(anthropic(&mock, &files));
+    assert_eq!(
+        summarise(&under, "x").await.expect("answers"),
+        "The runner pool is down to one wedged mac and the arm64…",
+        "the half word is dropped"
+    );
+    assert_eq!(
+        summarise(&under, "x").await.expect("answers"),
+        "The runner pool is down to one wedged mac and the arm64 job…",
+        "a cut that fell between words keeps every word"
+    );
+    assert_eq!(
+        summarise(&under, "x").await.expect("answers"),
+        "Unbroken…",
+        "one word and nothing before it is kept, and still marked"
+    );
+}
+
 // --- client identity ----------------------------------------------------------------------------
 //
 // A THROWAWAY identity, made fresh by each test from a key generated on the spot: a P-256 key from
