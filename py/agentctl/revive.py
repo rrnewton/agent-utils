@@ -122,12 +122,13 @@ def _validate_proof(proof: dict[str, object]) -> None:
 def refuse_pending(manager: ManagedAgents, names: tuple[str, ...]) -> None:
     """Refuse control of any name reserved by an incomplete revive."""
     for journal in journals(manager):
-        if journal["name"] in names:
+        name = journal["name"]
+        if isinstance(name, str) and name in names:
             raise _with_recovery(AgentDeliveryError(
-                f"revive of {journal['name']!r} is incomplete; rerun `agentctl revive {journal['name']}`"
+                f"revive of {name!r} is incomplete; rerun `agentctl revive {name}`"
             ), RecoveryAction(
-                "revive", name=journal["name"], token=cast(str, journal["old_token"]),
-            ), stop_reason=f"revive of {journal['name']!r} is incomplete")
+                "revive", name=name, token=cast(str, journal["old_token"]),
+            ), stop_reason=f"revive of {name!r} is incomplete")
 
 
 def _paths(manager: ManagedAgents, journal: dict[str, object]) -> tuple[Path, Path, Path]:
