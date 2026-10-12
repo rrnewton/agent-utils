@@ -14341,6 +14341,9 @@ async function dispatchOutgoingMessage(entry, job, placing = null) {
       if (pinned) scrollToNewest();
       if (sidePinned) inColumn(columns.side, scrollToNewest);
     }
+    // `#256 reply-marks-read`. Sent, so what it answers is Done. Only here: a reply that failed,
+    // or is unconfirmed, answered nothing yet.
+    if (entry.replyTo) guardQuietly(markAnsweredDone)(entry);
   } catch (error) {
     if (job.stopped) return;
     entry.state = error.status >= 400 && error.status < 500 && error.status !== 408
@@ -22403,9 +22406,90 @@ async function sendReply() {
   showView("discord");
   // To the newest of the list the reply was opened from: the thread's, on the right. `#229`.
   inColumn(replyColumn, scrollToNewest);
-  // `#240 reading-bookmark`. Sending never moves the bookmark; the way back to it is one key.
+  // `#240 reading-bookmark`. Sending never moves the bookmark; the way back to it is one key. (The
+  // Done a sent reply makes on what it answers can, as any Done can: `markAnsweredDone`.)
   if (bookmarkAnchor(channel)) setStatus("b goes back to your bookmark.");
   await completion;
+}
+
+// --- a reply that is sent marks what it answers Done ---------------------------------------------
+//
+// `#256 reply-marks-read`. The owner: "when we reply to a message the UI marks it as grey as though
+// it's read but the button in the upper right still implies it's unread! I don't like that. I think
+// we should be consistent. If reply marks as read we should actually change the state to read and
+// thus update the thread unread count."
+//
+// What the grey was: `data-replied` (`#84 reply-aware-dismissal`), the dimming of a message that some
+// loaded message answers, the outbox's acknowledged reply among them. It is an observation drawn on
+// the row and nothing more. It is not Done, so the row's Done button still offered Done, Hide read
+// kept the row, Collapse read did not fold it, the root's count of unread replies on Main went on
+// counting it (`#222 unread-replies`), and the server was never told.
+//
+// So a reply that has been SENT marks the message it answers Done, by the Done button's own act
+// (`toggleArchived`). That gives the same server write, the same greying at once, the same Undo chip,
+// the same bookmark slide, and the same counts and read filters after it, in both columns. It marks
+// the message answered, as the row standing for it, and never the rest of its thread. Nothing is
+// marked when the send fails, and nothing when the message is Done already, so the Undo chip is not
+// taken over by a Done that changed nothing. Opening Reply marks nothing.
+
+/**
+ * The row standing for message `id` and the column drawing it: the column the last reply was opened
+ * from first, then the left, then the right while it shows a thread. Null where no column draws it.
+ *
+ * @param {string} id
+ * @returns {{column: typeof activeColumn, row: HTMLElement} | null}
+ */
+function answeredRow(id) {
+  for (const column of [replyColumn, columns.main, columns.side]) {
+    if (column === columns.side && !sideShowing()) continue;
+    const row = inColumn(column, () => rowHolding(id) ||
+      [...el("pinned-log").children].find((one) => idsOf(one).includes(id)) || null);
+    if (row) return { column, row: /** @type {HTMLElement} */ (row) };
+  }
+  return null;
+}
+
+/**
+ * Whether message `id`, drawn in no column, is Done by what the page holds: the channel's store, or
+ * the left column's set. Under Hide read without threads a message not drawn has left the list, so
+ * there is nothing to mark.
+ *
+ * @param {string} id
+ */
+function doneWhereNotDrawn(id) {
+  if (threadingSupported && channelCanon.channel === String(el("discord-channel").value) &&
+      channelCanon.dismissed.has(id)) return true;
+  return inColumn(columns.main, () => archivedIds.has(id) || (todoMode && !threadingSupported));
+}
+
+/**
+ * Mark Done the message that `entry`, a reply just sent, answers. See the section note.
+ *
+ * Done in the column that draws it (mirrored into the other by `mirrorArchived`), on every message
+ * of its row, since the Done button reads a row half Done as unread and would go on offering Done.
+ * Where no column draws it any more, the message alone. A reply that went to another channel than
+ * the one on screen is marked on the server only: nothing of that channel is drawn, and an Undo here
+ * would put back a message of this one.
+ *
+ * @param {{channel: string, replyTo: string}} entry
+ */
+async function markAnsweredDone(entry) {
+  const id = String(entry.replyTo);
+  if (entry.channel !== String(el("discord-channel").value)) {
+    await queueInboxWrite(() => api(`/api/v1/channels/${encodeURIComponent(entry.channel)}/dismiss`,
+      { method: "POST", body: { messages: [id] } }));
+    return;
+  }
+  const found = answeredRow(id);
+  const marking = inColumn(found ? found.column : columns.main, () => {
+    const ids = found ? idsOf(found.row) : [id];
+    const done = found ? ids.every((one) => archivedIds.has(one)) : doneWhereNotDrawn(id);
+    return done ? null : toggleArchived(ids);
+  });
+  if (marking === null) return;
+  await marking;
+  // `#240 reading-bookmark`. Send said where the way back is, and the Done's own words took the line.
+  if (bookmarkAnchor(entry.channel)) setStatus("b goes back to your bookmark.");
 }
 
 // --- the conversation a reply goes into ---------------------------------------------------------

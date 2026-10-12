@@ -12763,13 +12763,16 @@ test("a reply posted from the to-do list is counted by the list it lands in", as
   await page.el("reply-send").click();
   await page.settle();
 
-  assert.equal(shownIds(page).length, 3, "the posted reply never landed in the list");
+  // `#256 reply-marks-read`: the message answered is Done once the reply is sent, so it leaves the
+  // list as the reply joins it. The count follows both.
+  assert.deepStrictEqual(shownIds(page), ["8000000000000000001", "9000000000000000001"],
+    "the posted reply never landed in the list, or what it answered stayed in it");
   assert.match(
     page.el("clear-backlog").textContent,
-    /\(3\)/,
-    `the control says ${page.el("clear-backlog").textContent} over three rows it would clear`
+    /\(2\)/,
+    `the control says ${page.el("clear-backlog").textContent} over two rows it would clear`
   );
-  assert.match(page.el("channel-summary").text(), /^3 of/, "the head of the list undercounts");
+  assert.match(page.el("channel-summary").text(), /^2 of/, "the head of the list miscounts");
 });
 
 test("a message arriving during a to-do POLL raises the chip, as it does in the channel", async () => {
@@ -38843,7 +38846,8 @@ test("`#240 reading-bookmark`: in two columns the left draws the line, the right
 test("`#240 reading-bookmark`: reply, and b goes back to where you were reading", async () => {
   const page = await keyboardPageAtTop(tallChannel(30));
   await bookmarkRow(page, "4");
-  await replyButton(channelRow(page, "4")).click();
+  // A message further down than the line: its Done (`#256 reply-marks-read`) leaves the line alone.
+  await replyButton(channelRow(page, "8")).click();
   await page.settle();
   page.el("reply-text").value = "on it";
   await page.el("reply-send").click();
@@ -38852,9 +38856,21 @@ test("`#240 reading-bookmark`: reply, and b goes back to where you were reading"
   assert.ok(atBottomOf(page.el("scroll-area")), "sending did not go to the newest message");
   assert.equal(statusText(page), "b goes back to your bookmark.");
   assert.equal(page.el("jump-bookmark").hidden, false, "the way back is not offered after the send");
+  assert.equal(channelRow(page, "8").getAttribute("data-archived"), "true", "the message answered is not Done");
   assert.deepStrictEqual(bookmarkAt(page), { id: "4", place: "above" }, "sending moved the bookmark");
   await press(page, page.el("scroll-area"), "b");
   assert.equal(selectedId(page), "4", "b did not go back to the bookmark after the reply");
+  // The message right under the line: the reply's Done slides the line on past it, as that Done from
+  // its button does, and b goes on to the next message still to read.
+  await replyButton(channelRow(page, "4")).click();
+  await page.settle();
+  page.el("reply-text").value = "and on this";
+  await page.el("reply-send").click();
+  await page.settle();
+  assert.equal(statusText(page), "b goes back to your bookmark.", "the Done took the way back off the status line");
+  assert.deepStrictEqual(bookmarkAt(page), { id: "5", place: "above" }, "the reply's Done did not slide the line as a Done does");
+  await press(page, page.el("scroll-area"), "b");
+  assert.equal(selectedId(page), "5", "b did not go to where the line slid");
 });
 
 test("`#240 reading-bookmark`: a long Done through here is ONE request, and past the server's ceiling it and its undo go in batches it accepts", async () => {
