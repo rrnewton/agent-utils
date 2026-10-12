@@ -2669,6 +2669,57 @@ def _act_reply_marker_beside_arrow(driver: Driver) -> None:
     driver.settle(300)
 
 
+def _set_bookmark_from_end(driver: Driver, back: int) -> None:
+    """`#240 reading-bookmark`: the bookmark above the row `back` rows from the newest, set with that
+    row's ⋯ item through the DOM (a real click would scroll the row into view), and settled: the
+    line drawn and the write answered, so the picture is of a bookmark the server holds. The whole
+    channel first: the server pages it six at a time, and the chip's picture needs a list taller than
+    two screens."""
+    _act_whole_channel(driver)
+    driver.js(
+        "(() => { const rows = [...document.querySelectorAll('#discord-log > li[data-id]')]; "
+        f"const row = rows[Math.max(0, rows.length - 1 - {back})]; row.id = 'bookmark-probe'; "
+        "row.querySelector('.row-bookmark-button').click(); return row.getAttribute('data-id'); })()"
+    )
+    driver.page.wait_for_function(
+        "() => { const r = document.getElementById('bookmark-probe'); "
+        "return r && r.getAttribute('data-bookmark') === 'above' && r.querySelector(':scope > .bookmark-line') "
+        "&& /Bookmarked/.test(window.__text('status') || ''); }",
+        timeout=10_000,
+    )
+    driver.settle(300)
+
+
+def _act_reading_bookmark(driver: Driver) -> None:
+    """`#240 reading-bookmark`: the line above a message near the foot of the channel, a third of the
+    way down the list, so the rows on either side of it are in the picture."""
+    _set_bookmark_from_end(driver, 3)
+    driver.js(
+        "(() => { const area = document.getElementById('scroll-area'); "
+        "const line = document.querySelector('#bookmark-probe > .bookmark-line'); "
+        "area.scrollTop += line.getBoundingClientRect().top - area.getBoundingClientRect().top "
+        "- area.clientHeight / 3; return true; })()"
+    )
+    driver.settle(400)
+
+
+def _act_bookmark_chip(driver: Driver) -> None:
+    """`#240 reading-bookmark`: the line scrolled away above and the newest message below, so the
+    jump to each is up at once: Newest at the left of the chips, the Bookmark chip right beside it."""
+    _set_bookmark_from_end(driver, 12)
+    driver.js(
+        "(() => { const area = document.getElementById('scroll-area'); "
+        "const line = document.querySelector('#bookmark-probe > .bookmark-line'); "
+        "const below = line.getBoundingClientRect().bottom - area.getBoundingClientRect().top; "
+        "area.scrollTop += below + 40; "
+        "area.dispatchEvent(new Event('scroll')); return true; })()"
+    )
+    driver.page.wait_for_function(
+        "() => window.__visible('jump-bookmark') && window.__visible('jump-newest')", timeout=5_000
+    )
+    driver.settle(300)
+
+
 def _act_settings_text_size(driver: Driver) -> None:
     """`#230 text-size-buttons`: the Text size group, a − and a + either side of its slider.
 
@@ -4325,6 +4376,86 @@ SCENES: tuple[Scene, ...] = (
                 "no Markdown is left on screen",
                 "!/(^|\\n)\\s*(- |\\d+\\. )/.test("
                 "document.querySelector('#nested-lists-probe .body').innerText)",
+            ),
+        ),
+    ),
+    # `#240 reading-bookmark`. Before the last state, which purges the store on the way in and so takes
+    # the bookmark these two leave behind with it.
+    Scene(
+        name="47-reading-bookmark",
+        what="the reading bookmark: a line in the accent above one message, between it and the row above",
+        act=_act_reading_bookmark,
+        profiles=("android-412", "laptop-1280"),
+        expect=(
+            ("the Discord pane is up", "window.__visible('pane-discord')"),
+            (
+                "the line is on screen, a separator that says Bookmark",
+                "(() => { const l = document.querySelector('#bookmark-probe > .bookmark-line'); "
+                "if (!l) return false; const b = l.getBoundingClientRect(); "
+                "return l.getAttribute('role') === 'separator' && /bookmark/i.test(l.textContent) "
+                "&& b.top >= 0 && b.bottom <= innerHeight && b.height >= 20; })()",
+            ),
+            (
+                # THE layout claim: the line is in the room the row keeps above itself, touching
+                # neither the message it is above nor the one before it.
+                "the line sits between the bookmarked message and the row above, clear of both",
+                "(() => { const row = document.getElementById('bookmark-probe'); "
+                "const prev = row.previousElementSibling; "
+                "const l = row.querySelector(':scope > .bookmark-line').getBoundingClientRect(); "
+                "const r = row.getBoundingClientRect(); "
+                "return prev && l.bottom <= r.top + 1 && l.top >= prev.getBoundingClientRect().bottom - 1; })()",
+            ),
+            (
+                "it is drawn in the accent, a solid rule of two pixels either side of the word",
+                "(() => { const l = document.querySelector('#bookmark-probe > .bookmark-line'); "
+                "const probe = document.createElement('span'); probe.style.color = 'var(--accent)'; "
+                "document.body.append(probe); const accent = getComputedStyle(probe).color; probe.remove(); "
+                "const rule = getComputedStyle(l, '::before'); "
+                "return getComputedStyle(l).color === accent && rule.borderTopStyle === 'solid' "
+                "&& rule.borderTopWidth === '2px' && rule.borderTopColor === accent; })()",
+            ),
+            (
+                "the way back to it is not offered while it is on screen",
+                "!window.__visible('jump-bookmark')",
+            ),
+            (
+                "nothing runs off the side of the screen",
+                "document.scrollingElement.scrollWidth <= innerWidth",
+            ),
+        ),
+    ),
+    Scene(
+        name="48-bookmark-chip",
+        what="the bookmark scrolled away above: the Bookmark chip right beside Newest, pointing up",
+        act=_act_bookmark_chip,
+        profiles=("android-412", "laptop-1280"),
+        expect=(
+            ("the Discord pane is up", "window.__visible('pane-discord')"),
+            (
+                "the line is above the screen",
+                "document.querySelector('#bookmark-probe > .bookmark-line').getBoundingClientRect().bottom "
+                "<= document.getElementById('scroll-area').getBoundingClientRect().top + 1",
+            ),
+            (
+                "the chip points up, toward the line",
+                "document.getElementById('jump-bookmark').getAttribute('data-direction') === 'up' "
+                "&& /above/.test(document.getElementById('jump-bookmark').getAttribute('aria-label'))",
+            ),
+            (
+                # On the bottom line beside Newest at a phone's width too: the two the reader goes
+                # between, and the other chips wrap upward rather than between them.
+                "the chip stands directly right of Newest, on the same line, overlapping nothing",
+                "(() => { const n = document.getElementById('jump-newest').getBoundingClientRect(); "
+                "const b = document.getElementById('jump-bookmark').getBoundingClientRect(); "
+                "const others = [...document.querySelectorAll('#scroll-tools > .chip')]"
+                ".filter((c) => c.id !== 'jump-newest' && c.id !== 'jump-bookmark' && c.getClientRects().length); "
+                "const apart = (x, y) => x.right <= y.left || y.right <= x.left || x.bottom <= y.top || y.bottom <= x.top; "
+                "return b.left >= n.right - 1 && b.left - n.right < 16 && Math.abs(b.bottom - n.bottom) < 2 "
+                "&& others.every((c) => apart(c.getBoundingClientRect(), b) && apart(c.getBoundingClientRect(), n)); })()",
+            ),
+            (
+                "nothing runs off the side of the screen",
+                "document.scrollingElement.scrollWidth <= innerWidth",
             ),
         ),
     ),
