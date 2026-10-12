@@ -1700,8 +1700,9 @@ def _prepare_process(reexec: Sequence[str]) -> None:
     * SIGINT gets its default action when the interpreter installed its own handler, so an
       interrupt ends the process BY the signal, which is what lets a calling loop stop instead of
       carrying on. A SIGINT the caller ignored stays ignored, as it does in the native edition.
-      (The entry point already did this before importing anything; it is repeated here for a
-      caller that imports :func:`main` directly.)
+      (Importing the package already did this, as its first statement -- see :mod:`herdr_run` --
+      and every entry point imports the package before anything else; it is repeated here for a
+      caller that installed its own handler afterwards.)
     * SIGCHLD gets its default action. A caller can hand an ignored SIGCHLD down across ``exec``,
       and then the kernel reaps every child at once: waiting for one fails with ECHILD, which
       ``subprocess`` reads as exit status 0, so every failed child would count as a success. The

@@ -155,9 +155,11 @@ When stdout cannot be written — a full disk, a reader that went away — `herd
 never left in a buffer to be retried at exit. A stderr that cannot be written is ignored. A
 standard descriptor that was closed before `herdr-run` started reads as `/dev/null`. An interrupt
 (Ctrl-C) ends `herdr-run` by the signal itself, even one that arrives while it is still starting,
-so a calling loop sees an interrupted process rather than an exit status. A `SIGCHLD` that the
-caller left ignored is put back to its default first, so the exit status of every process
-`herdr-run` starts is read, never assumed.
+so a calling loop sees an interrupted process rather than an exit status. Only an interrupt during
+the language runtime's own start-up, before any of `herdr-run`'s code has run, is outside its
+reach, and is reported however that runtime reports one. A `SIGCHLD` that the caller left ignored
+is put back to its default first, so the exit status of every process `herdr-run` starts is read,
+never assumed.
 
 Processes `herdr-run` starts itself (Herdr, `git check-ignore` to check the spool, the direct
 `net-doctor` probe) are executed directly: a file the kernel cannot execute, such as a script with

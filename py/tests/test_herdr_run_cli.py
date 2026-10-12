@@ -9,6 +9,7 @@ from __future__ import annotations
 import io
 import json
 import os
+import subprocess
 import sys
 from types import SimpleNamespace
 from typing import cast
@@ -1408,13 +1409,143 @@ def test_an_inherited_ignored_sigchld_is_reset_so_child_statuses_are_real(tmp_pa
     assert b"is NOT git-ignored" in completed.stderr
 
 
-def test_the_entry_point_resets_sigint_before_importing_the_package() -> None:
-    """An interrupt during start-up must end the process by the signal, not as a traceback."""
-    import subprocess
+#: What ``pip`` writes for the ``herdr-run = herdr_run.cli:main`` console script.
+_CONSOLE_SCRIPT = """\
+# -*- coding: utf-8 -*-
+import re
+import sys
+from herdr_run.cli import main
+if __name__ == '__main__':
+    sys.argv[0] = re.sub(r'(-script\\.pyw|\\.exe)?$', '', sys.argv[0])
+    sys.exit(main())
+"""
 
+#: Interrupts the process as the first package module after ``herdr_run`` itself is looked for.
+_INTERRUPT_AFTER_THE_RESET = """\
+import os, signal, sys
+
+class _Interrupt:
+    @staticmethod
+    def find_spec(name, path=None, target=None):
+        if name == "herdr_run.cli":
+            os.kill(os.getpid(), signal.SIGINT)
+        return None
+
+sys.meta_path.insert(0, _Interrupt)
+"""
+
+#: Stands in for an interrupt that arrives inside the reset itself: the first ``getsignal`` the
+#: entry point makes raises ``KeyboardInterrupt``, as the interpreter would at that instruction.
+_INTERRUPT_INSIDE_THE_RESET = """\
+import os, sys, types
+
+_real = sys.modules["_signal"]
+
+class _Signal(types.ModuleType):
+    raised = False
+
+    def __getattr__(self, name):
+        return getattr(_real, name)
+
+    def getsignal(self, number):
+        if not _Signal.raised:
+            _Signal.raised = True
+            open(os.environ["HERDR_RUN_TEST_MARKER"], "w").close()
+            raise KeyboardInterrupt
+        return _real.getsignal(number)
+
+sys.modules["_signal"] = _Signal("_signal")
+"""
+
+
+def _entry_points(directory: str) -> dict[str, list[str]]:
+    """The three ways herdr-run is started, each running ``--version``."""
+    console = os.path.join(directory, "herdr-run")
+    with open(console, "w", encoding="utf-8") as handle:
+        handle.write(_CONSOLE_SCRIPT)
+    script = os.path.join(_PACKAGE_PARENT, "bin", "herdr-run")
+    return {
+        "module": [sys.executable, "-m", "herdr_run", "--version"],
+        "console-script": [sys.executable, console, "--version"],
+        "bin-script": [sys.executable, script, "--version"],
+    }
+
+
+def _ignore_sigint() -> None:
+    import signal
+
+    signal.signal(signal.SIGINT, signal.SIG_IGN)
+
+
+def _start(
+    argv: list[str], customize: str, directory: str, *, ignore_sigint: bool = False
+) -> "subprocess.CompletedProcess[bytes]":
+    site = os.path.join(directory, "site")
+    os.makedirs(site, exist_ok=True)
+    with open(os.path.join(site, "sitecustomize.py"), "w", encoding="utf-8") as handle:
+        handle.write(customize)
+    environment = _clean_environment()
+    environment["PYTHONPATH"] = os.pathsep.join((site, _PACKAGE_PARENT))
+    environment["HERDR_RUN_TEST_MARKER"] = os.path.join(directory, "raised")
+    return subprocess.run(
+        argv,
+        env=environment,
+        capture_output=True,
+        check=False,
+        timeout=60,
+        preexec_fn=_ignore_sigint if ignore_sigint else None,
+    )
+
+
+@pytest.mark.parametrize("entry_point", ["module", "console-script", "bin-script"])
+def test_every_entry_point_resets_sigint_before_any_other_package_code(
+    entry_point: str, tmp_path: object
+) -> None:
+    """An interrupt once the package is importing ends the process by SIGINT, with no traceback.
+
+    The guard in ``__main__`` alone did not cover the console script, which never imports
+    ``__main__``, nor its own script form, which imported ``signal`` and ``typing`` first.
+    """
+    import signal
+
+    directory = str(tmp_path)
+    argv = _entry_points(directory)[entry_point]
+    completed = _start(argv, _INTERRUPT_AFTER_THE_RESET, directory)
+    assert completed.returncode == -signal.SIGINT, completed.stderr
+    assert completed.stderr == b""
+    assert completed.stdout == b""
+
+
+@pytest.mark.parametrize("entry_point", ["module", "console-script", "bin-script"])
+def test_an_interrupt_inside_the_reset_is_delivered_again_by_the_signal(
+    entry_point: str, tmp_path: object
+) -> None:
+    import signal
+
+    directory = str(tmp_path)
+    argv = _entry_points(directory)[entry_point]
+    completed = _start(argv, _INTERRUPT_INSIDE_THE_RESET, directory)
+    assert os.path.exists(os.path.join(directory, "raised")), "the reset never asked"
+    assert completed.returncode == -signal.SIGINT, completed.stderr
+    assert completed.stderr == b""
+
+
+@pytest.mark.parametrize("entry_point", ["module", "console-script", "bin-script"])
+def test_every_entry_point_leaves_an_ignored_sigint_ignored(
+    entry_point: str, tmp_path: object
+) -> None:
+    directory = str(tmp_path)
+    argv = _entry_points(directory)[entry_point]
+    completed = _start(argv, _INTERRUPT_AFTER_THE_RESET, directory, ignore_sigint=True)
+    assert completed.returncode == 0, completed.stderr
+    assert completed.stdout.startswith(b"herdr-run ")
+
+
+def test_importing_the_package_resets_the_interpreter_sigint_handler() -> None:
+    """The reset is the package's first statement, so it runs for any importer."""
     probe = (
-        "import signal, sys; sys.argv = ['herdr-run']; import herdr_run.__main__; "
-        "print(signal.getsignal(signal.SIGINT) == signal.SIG_DFL)"
+        "import signal, herdr_run; "
+        "print(signal.getsignal(signal.SIGINT) == signal.SIG_DFL, hasattr(herdr_run, '_signal'))"
     )
     completed = subprocess.run(
         [sys.executable, "-c", probe],
@@ -1423,7 +1554,7 @@ def test_the_entry_point_resets_sigint_before_importing_the_package() -> None:
         check=False,
         timeout=60,
     )
-    assert completed.stdout == b"True\n", completed.stderr
+    assert completed.stdout == b"True False\n", completed.stderr
 
 
 def test_every_subcommand_that_reads_the_configuration_warns_about_left_out_entries(

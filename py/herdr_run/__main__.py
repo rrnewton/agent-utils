@@ -9,32 +9,29 @@ Runnable three ways, all equivalent:
 The last case is why we fix up sys.path here: when this file is executed directly, the directory
 holding the package may not be importable yet.
 
-SIGINT is given its default action before anything else is imported. The interpreter installs a
-handler that turns an interrupt into ``KeyboardInterrupt``; one that arrived while the package was
-still importing printed a traceback and could exit 1, where the native edition simply dies by the
-signal. An interrupt that slips in before the reset is caught and re-delivered with the default
-action, so the process ends by SIGINT either way. A SIGINT the caller ignored stays ignored.
+SIGINT is given its default action as the very first statement, before anything else is imported,
+exactly as importing the package does (see ``herdr_run/__init__.py``, which also describes the
+part of the interpreter's own start-up nothing here can cover). Run as a script, this file is the
+first code that runs, and the package cannot be imported until the path is fixed up, so it cannot
+rely on the package's own reset. The interpreter's handler turns an interrupt into
+``KeyboardInterrupt``; one that arrived while the package was still importing printed a traceback
+where the native edition simply dies by the signal. An interrupt that slips in before the reset is
+caught and re-delivered with the default action, so the process ends by SIGINT either way. A SIGINT
+the caller ignored stays ignored.
 """
 
 from __future__ import annotations
 
-import os
-import signal
-import sys
-from typing import NoReturn
-
-
-def _die_by_sigint() -> NoReturn:
-    """End this process by SIGINT itself, the way an uncaught interrupt ends the native edition."""
-    signal.signal(signal.SIGINT, signal.SIG_DFL)
-    os.kill(os.getpid(), signal.SIGINT)
-    # Not reached unless SIGINT is blocked; 130 is what a shell reports for death by SIGINT.
-    os._exit(128 + signal.SIGINT)
-
-
 try:
-    if signal.getsignal(signal.SIGINT) is signal.default_int_handler:
-        signal.signal(signal.SIGINT, signal.SIG_DFL)
+    # Built in and already loaded: ``signal`` (and ``typing``) would import modules first.
+    import _signal  # type: ignore[import-not-found,unused-ignore]
+
+    if _signal.getsignal(_signal.SIGINT) is _signal.default_int_handler:
+        _signal.signal(_signal.SIGINT, _signal.SIG_DFL)
+
+    import os
+    import sys
+    from typing import NoReturn
 
     _PKG_PARENT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     if _PKG_PARENT not in sys.path:
@@ -42,7 +39,21 @@ try:
 
     from herdr_run.cli import main  # noqa: E402  (import after the sys.path fixup, by design)
 except KeyboardInterrupt:
-    _die_by_sigint()
+    import os
+    import _signal  # type: ignore[import-not-found,unused-ignore,no-redef]
+
+    _signal.signal(_signal.SIGINT, _signal.SIG_DFL)
+    _signal.raise_signal(_signal.SIGINT)
+    # Not reached unless SIGINT is blocked; 130 is what a shell reports for death by SIGINT.
+    os._exit(128 + _signal.SIGINT)
+
+
+def _die_by_sigint() -> NoReturn:
+    """End this process by SIGINT itself, the way an uncaught interrupt ends the native edition."""
+    _signal.signal(_signal.SIGINT, _signal.SIG_DFL)
+    _signal.raise_signal(_signal.SIGINT)
+    os._exit(128 + _signal.SIGINT)
+
 
 if __name__ == "__main__":
     # When the process must restart in UTF-8 mode it restarts from /proc/self/cmdline. Without
