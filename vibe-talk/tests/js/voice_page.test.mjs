@@ -27688,16 +27688,128 @@ test("`#193 compose-draft-loss`: Edit puts a failed message back in the channel'
   assert.equal(again.repliesPosted.length, 0);
 });
 
-test("`#193 compose-draft-loss`: Edit on a send whose delivery is unconfirmed says to check the channel before sending it again", async () => {
+test("`#193 compose-draft-loss`: a send that may already be in the channel offers no Edit, so taking it back can never post it twice", async () => {
+  // The `#195 send-resilience` incident: a send timed out, was left unconfirmed, and had landed after
+  // all. Its outbox id is the key that lets Retry go again without a second post; Edit would drop
+  // that key, and the same words sent again from the box would be a new message.
+  const keyed = await keyedChannel();
+  const lost = await failedSend(keyed, "this may already be there", 502);
+  const key = posted(keyed)[0].idempotency_key;
+  assert.equal(lost.getAttribute("data-send-state"), "retrying");
+  assert.deepEqual(outgoingActions(lost), ["Retry now", "Dismiss"], "Edit is offered on a send that may have landed");
+  assert.equal(outgoingEdit(lost), undefined);
+  // Its way out is Retry, as the same request.
+  keyed.replyResponse = sentOk;
+  await outgoingRetry(lost).click();
+  await settleSend(keyed);
+  assert.deepEqual(posted(keyed).map((body) => body.idempotency_key), [key, key], "the second attempt went under another key");
+  assert.equal(outgoingRows(keyed).length, 0);
+
+  // Where no provider promises one post per key, the same: the row says to check the channel, and
+  // Edit would hide that warning in a box that knows nothing of it.
   const page = newPage();
   await signIn(page);
   await showDiscord(page, []);
-  const unconfirmed = await failedSend(page, "this may already be there", 502);
+  const unconfirmed = await failedSend(page, "this may be there too", 502);
   assert.equal(unconfirmed.getAttribute("data-send-state"), "unconfirmed");
-  await outgoingEdit(unconfirmed).click();
+  assert.match(unconfirmed.text(), /Check history before retrying/);
+  assert.deepEqual(outgoingActions(unconfirmed), ["Retry", "Dismiss"]);
+
+  // Refused on its Retry, it is no less possibly in the channel from its first attempt: still no
+  // Edit, and none after a reload.
+  page.replyResponse = errorResponse(403, "refused", "You cannot post to this channel.");
+  await outgoingRetry(unconfirmed).click();
+  await settleSend(page);
+  const refused = outgoingRows(page)[0];
+  assert.equal(refused.getAttribute("data-send-state"), "failed");
+  assert.deepEqual(outgoingActions(refused), ["Retry", "Dismiss"], "a refused retry made a possibly delivered send editable");
+  assert.equal(savedOutgoing(page)[0].mayHavePosted, true);
+  const again = reloadWith(new Map(page.storage), []);
+  await signIn(again);
+  await reopenedChannel(again);
+  assert.deepEqual(outgoingActions(outgoingRows(again)[0]), ["Retry", "Dismiss"], "a reload made it editable");
+
+  // A page closed while a POST was out comes back unconfirmed, without Edit; a refused send saved
+  // before this flag existed is taken as the refusal it says it is.
+  const saved = savedOutgoing(page)[0];
+  const store = new Map(page.storage);
+  store.set("vibe-talk.outgoing-messages", JSON.stringify([
+    { ...saved, id: "outgoing-closed-1", state: "sending", phase: "posting", mayHavePosted: false, createdAt: 1 },
+    { ...saved, id: "outgoing-older-2", state: "failed", mayHavePosted: undefined, createdAt: 2 },
+  ]));
+  const reopened = reloadWith(store, []);
+  await signIn(reopened);
+  await reopenedChannel(reopened);
+  const [closed, older] = outgoingRows(reopened);
+  assert.equal(closed.getAttribute("data-send-state"), "unconfirmed");
+  assert.deepEqual(outgoingActions(closed), ["Retry", "Dismiss"]);
+  assert.deepEqual(outgoingActions(older), ["Retry", "Edit", "Dismiss"]);
+  assert.equal(reopened.repliesPosted.length, 0);
+});
+
+test("`#193 compose-draft-loss`: where the browser refuses the draft, Edit leaves the send in the outbox and says so", async () => {
+  const refuseDrafts = (page) => {
+    const set = page.storage.set.bind(page.storage);
+    page.storage.set = (key, value) => {
+      if (key === "vibe-talk.channel-drafts" || key === "vibe-talk.voice.drafts") throw new Error("QuotaExceededError");
+      return set(key, value);
+    };
+  };
+  const page = newPage();
+  await signIn(page);
+  await showDiscord(page, []);
+  const failed = await failedSend(page, "words with nowhere else to go");
+  const id = failed.getAttribute("data-outgoing-id");
+  refuseDrafts(page);
+  await page.el("channel-compose-text").setValue("a draft typed since");
+  await outgoingEdit(failed).click();
   await page.settle();
-  assert.equal(page.el("channel-compose-text").value, "this may already be there");
-  assert.match(page.el("channel-compose-state").textContent, /unconfirmed.*check before you send it again/);
+  assert.equal(page.el("status").textContent, "This browser could not save a draft, so the message stays in the outbox.");
+  assert.equal(page.el("channel-compose-text").value, "a draft typed since", "the box was changed although nothing moved");
+  assert.equal(outgoingRows(page).length, 1, "the send left the outbox for a draft that was never saved");
+  assert.equal(outgoingRows(page)[0].getAttribute("data-outgoing-id"), id);
+  assert.deepEqual(savedOutgoing(page).map((entry) => entry.id), [id], "the only saved copy of the text was dropped");
+  const again = reloadWith(new Map(page.storage), []);
+  await signIn(again);
+  await reopenedChannel(again);
+  assert.match(outgoingRows(again)[0].text(), /words with nowhere else to go/, "a reload lost the text");
+
+  // A reply, likewise: Reply does not open, and the send stays where it is.
+  const replying = newPage();
+  await signIn(replying);
+  await openReplyOn(replying, [message({ id: "9320", content: "the question" })]);
+  replying.replyResponse = errorResponse(403, "refused", "You cannot post to this channel.");
+  await replying.el("reply-text").setValue("an answer with nowhere else to go");
+  await replying.el("reply-send").click();
+  await replying.settle();
+  refuseDrafts(replying);
+  await outgoingEdit(outgoingRows(replying)[0]).click();
+  await replying.settle();
+  assert.equal(replying.screen(), "main", "Reply opened on a draft that was never saved");
+  assert.equal(replying.el("status").textContent, "This browser could not save a draft, so the message stays in the outbox.");
+  assert.equal(outgoingRows(replying).length, 1);
+  assert.equal(savedOutgoing(replying)[0].text, "an answer with nowhere else to go");
+  assert.equal(draftMarkerOf(rowOf(replying, "9320")).hidden, true, "a draft that was never saved is marked");
+
+  // A full quota is not a refusal: the saved channel rows give their space to the reply's draft.
+  const full = newPage();
+  await signIn(full);
+  await openReplyOn(full, [message({ id: "9321", content: "another question" })]);
+  full.replyResponse = errorResponse(403, "refused", "You cannot post to this channel.");
+  await full.el("reply-text").setValue("an answer that needs room");
+  await full.el("reply-send").click();
+  await full.settle();
+  assert.ok(full.storage.has(MESSAGE_CACHE_KEY));
+  const set = full.storage.set.bind(full.storage);
+  full.storage.set = (key, value) => {
+    if (key === "vibe-talk.voice.drafts" && full.storage.has(MESSAGE_CACHE_KEY)) throw new Error("QuotaExceededError");
+    return set(key, value);
+  };
+  await outgoingEdit(outgoingRows(full)[0]).click();
+  await full.settle();
+  assert.equal(full.screen(), "reply", "a full quota kept the reply from its draft");
+  assert.equal(JSON.parse(full.storage.get("vibe-talk.voice.drafts"))["9321"], "an answer that needs room");
+  assert.equal(outgoingRows(full).length, 0);
 });
 
 test("`#193 compose-draft-loss`: Edit on a thread's failed message puts it in that thread's box, opening the thread when it is pressed in All", async () => {
@@ -27872,6 +27984,51 @@ test("`#193 compose-draft-loss`: Dismiss is taken back by a chip that names the 
   assert.equal(again.el("dismissed-sends").hidden, true);
   assert.match(again.el("dismissed-sends-state").textContent, /^Nothing dismissed in the last 7 days/);
   assert.equal(again.repliesPosted.length, 0, "putting it back sent it");
+});
+
+test("`#193 compose-draft-loss`: Undo puts back a send's wait to go again on its own; Put back later leaves it to Retry", async () => {
+  const page = await keyedChannel();
+  const lost = await failedSend(page, "going again by itself", 502);
+  const key = posted(page)[0].idempotency_key;
+  assert.match(lost.text(), /Retrying in 5 s\./);
+  await outgoingDismiss(lost).click();
+  assert.equal(page.expireTimers(RETRY_FIRST_MS), 0, "a dismissed send went again on its own");
+  await page.el("undo-send-dismiss").click();
+  await page.settle();
+  const back = outgoingRows(page)[0];
+  assert.equal(back.getAttribute("data-send-state"), "retrying", "Undo put it back without its wait");
+  assert.match(back.text(), /Retrying in 5 s\./);
+  page.replyResponse = sentOk;
+  assert.equal(page.expireTimers(RETRY_FIRST_MS), 1, "the wait Undo put back never ran out");
+  await settleSend(page);
+  assert.deepEqual(posted(page).map((body) => body.idempotency_key), [key, key]);
+  assert.equal(outgoingRows(page).length, 0);
+
+  // Written offline, dismissed, and taken back: it waits for the connection again.
+  const offline = newPage();
+  await signIn(offline);
+  await showDiscord(offline, []);
+  await offline.setOnline(false);
+  await sendChannel(offline, "written in a tunnel");
+  await outgoingDismiss(outgoingRows(offline)[0]).click();
+  await offline.el("undo-send-dismiss").click();
+  assert.match(outgoingRows(offline)[0].text(), /Offline\. Will send when online\./);
+  await offline.setOnline(true);
+  await settleSend(offline);
+  assert.deepEqual(posted(offline), [{ text: "written in a tunnel" }]);
+  assert.equal(outgoingRows(offline).length, 0);
+
+  // Put back once the chip has gone is a decision of the reader's for later: Retry, not a wait.
+  const later = await keyedChannel();
+  await outgoingDismiss(await failedSend(later, "left to the reader", 502)).click();
+  later.expireTimers(SEND_UNDO_MS);
+  await putBackOf(dismissedItems(later)[0]).click();
+  await later.settle();
+  const put = outgoingRows(later)[0];
+  assert.equal(put.getAttribute("data-send-state"), "unconfirmed");
+  assert.deepEqual(outgoingActions(put), ["Retry", "Dismiss"]);
+  assert.equal(later.expireTimers(RETRY_FIRST_MS), 0, "Put back armed an automatic send");
+  assert.equal(later.repliesPosted.length, 1);
 });
 
 test("`#193 compose-draft-loss`: Recently dismissed keeps the newest ten, for seven days, and forgets them when asked", async () => {

@@ -690,15 +690,16 @@ const DISMISSED_SENDS_MAX_AGE_MS = DISMISSED_SENDS_DAYS * 24 * 60 * 60 * 1000;
 /** How much of a message a control quotes to name it. */
 const SEND_SNIPPET_CHARS = 28;
 const CHANNEL_DRAFT_REFUSED = "This browser could not save the draft. Keep this page open until you send it.";
-const UNCONFIRMED_EDIT_NOTE =
-  "Delivery of this was unconfirmed, so it may already be in the channel: check before you send it again.";
 /**
  * The sends dismissed from the outbox, newest first, each with when it was dismissed.
  *
  * @type {Array<{entry: any, at: number}>}
  */
 let dismissedSends = [];
-/** The dismissal the Undo chip takes back while it is up: the entry's id, and the chip's timer. */
+/**
+ * The dismissal the Undo chip takes back while it is up: the entry's id, its wait for an automatic
+ * send if it had one, and the chip's timer.
+ */
 let sendUndo = null;
 
 /** Whether the last `showView` put the reader back rather than taking them to the newest. */
@@ -14032,6 +14033,8 @@ function outgoingFromSaved(held) {
       ? held.observedParts.filter((id) => typeof id === "string") : [],
     // Absent from an entry saved before keys were sent: its attempts went without one.
     keyedOnly: held.keyedOnly === true,
+    // `#193 compose-draft-loss`. See `editableSend`.
+    mayHavePosted: held.mayHavePosted === true || held.state === "unconfirmed" || attempted,
     detail: attempted ? "This page closed before delivery was confirmed."
       : interrupted ? "This page closed before this message was sent." : String(held.detail || ""),
   };
@@ -14188,7 +14191,8 @@ function renderOutgoingMessages() {
       retry.textContent = waiting ? "Retry now" : entry.postedCount ? "Retry unsent text" : "Retry";
       retry.disabled = !entry.remaining || knownChannel(entry.channel)?.writable === false;
       retry.addEventListener("click", inThisColumn(guardQuietly(() => retryOutgoingMessage(entry.id))));
-      // `#193 compose-draft-loss`. Back into the box it was written in, and out of the outbox.
+      // `#193 compose-draft-loss`. Back into the box it was written in, and out of the outbox: only
+      // where none of it can be in the channel already (`editableSend`).
       const edit = document.createElement("button");
       edit.className = "outgoing-edit";
       edit.setAttribute("type", "button");
@@ -14206,7 +14210,7 @@ function renderOutgoingMessages() {
         "Take this out of the outbox. This does not delete a message from the chat service. Undo " +
           `brings it back, and Settings keeps it under Recently dismissed for ${DISMISSED_SENDS_DAYS} days.`);
       dismiss.addEventListener("click", inThisColumn(() => dismissOutgoingMessage(entry.id)));
-      actions.append(retry, edit, dismiss);
+      actions.append(...(editableSend(entry) ? [retry, edit, dismiss] : [retry, dismiss]));
       row.append(actions);
     }
     // `#129 message-search`. What the reader WROTE, under the word the row prints for them: a
@@ -14279,7 +14283,7 @@ function queueOutgoingMessage(request) {
   const entry = {
     id, ...request, originView: channelView, createdAt: Date.now(),
     remaining: request.text.trim(), state: "sending", phase: "queued",
-    parts: [], observedParts: [], postedCount: 0, detail: "", keyedOnly: true,
+    parts: [], observedParts: [], postedCount: 0, detail: "", keyedOnly: true, mayHavePosted: false,
   };
   outgoingMessages.set(id, entry);
   return scheduleOutgoingMessage(entry);
@@ -14474,6 +14478,7 @@ async function dispatchOutgoingMessage(entry, job, placing = null) {
       // last attempted part failed to arrive; its unsent suffix is the ONLY safe retry candidate.
       entry.remaining = typeof payload.unsent === "string" ? payload.unsent : "";
       entry.state = "unconfirmed";
+      entry.mayHavePosted = true;
       outgoingObservations.delete(entry.id);
       entry.detail = redact(payload.detail
         ? readableCause(payload.detail, chatServiceOf(entry.channel))
@@ -14520,6 +14525,7 @@ async function dispatchOutgoingMessage(entry, job, placing = null) {
     if (job.stopped) return;
     entry.state = error.status >= 400 && error.status < 500 && error.status !== 408
       ? "failed" : "unconfirmed";
+    if (entry.state === "unconfirmed") entry.mayHavePosted = true;
     outgoingObservations.delete(entry.id);
     // The page's own network sentence tells the reader to retry when the connection recovers,
     // which a row that may retry by itself must not say.
@@ -14673,6 +14679,7 @@ function stopOutgoingSends() {
     job.stopped = true;
     const attempted = entry.phase === "posting";
     entry.state = attempted ? "unconfirmed" : "failed";
+    if (attempted) entry.mayHavePosted = true;
     outgoingObservations.delete(entry.id);
     entry.detail = attempted ? "Sign-in changed before delivery was confirmed."
       : "Sign-in changed before this message was sent.";
@@ -14689,14 +14696,17 @@ function stopOutgoingSends() {
 // failed kept its text, but the only ways out of the outbox were Retry, and a Dismiss that threw the
 // text away with one tap and nothing to take it back. So:
 //
-//   * EDIT puts a failed or unconfirmed send's unsent text back in the box it was written in — the
-//     channel's, the thread's, or Reply on the message it answers, with the new-thread choice it was
-//     sent with — and takes it out of the outbox. A draft already in that box is kept: the text goes
-//     under it, after a blank line, and the box says so. Asking first would put a question between
-//     the reader and their own words, and appending loses nothing that editing cannot put right.
-//   * DISMISS can be taken back. The Undo chip names the message for SEND_UNDO_MS; after that a copy
-//     is still kept on this device for DISMISSED_SENDS_DAYS days, the newest DISMISSED_SENDS_LIMIT of
-//     them, under Recently dismissed in Settings, where Put back returns one to the outbox as it was.
+//   * EDIT puts a failed send's unsent text back in the box it was written in — the channel's, the
+//     thread's, or Reply on the message it answers, with the new-thread choice it was sent with — and
+//     takes it out of the outbox. A draft already in that box is kept: the text goes under it, after
+//     a blank line, and the box says so. Asking first would put a question between the reader and
+//     their own words, and appending loses nothing that editing cannot put right. Only where none of
+//     the text can be in the channel already (`editableSend`), and only once that box's draft store
+//     holds it: where the browser refuses the write, the send stays in the outbox and nothing moves.
+//   * DISMISS can be taken back. The Undo chip names the message for SEND_UNDO_MS, and puts it back
+//     as it was, waiting to go again on its own if it was; after that a copy is still kept on this
+//     device for DISMISSED_SENDS_DAYS days, the newest DISMISSED_SENDS_LIMIT of them, under Recently
+//     dismissed in Settings, where Put back returns one to the outbox for Retry, Edit or Dismiss.
 //
 // Every draft, and this copy, is this device's alone: nothing here is synced to another device. The
 // constants and the state are with the outbox's, at the head of the file.
@@ -14705,6 +14715,21 @@ function stopOutgoingSends() {
 function unsentText(entry) {
   return entry.postedCount ? entry.remaining : entry.text;
 }
+
+/**
+ * Whether Edit may take `entry` back: refused, or never sent, so that none of its unsent text can be
+ * in the channel already. Not a send whose delivery is unconfirmed, or ever was (`mayHavePosted`, kept
+ * through a later refusal): its outbox id is the idempotency key that lets Retry go again without
+ * posting it twice, and Edit would drop it, so the same words sent again from the box would be a
+ * second message wherever the first had landed after all — the `#195 send-resilience` incident.
+ * Retry and Dismiss are its ways out.
+ */
+function editableSend(entry) {
+  return entry.state === "failed" && entry.mayHavePosted !== true;
+}
+
+/** Said where Edit could not save the text as a draft, and so left the send where it was. */
+const EDIT_DRAFT_REFUSED = "This browser could not save a draft, so the message stays in the outbox.";
 
 /** `text` under `draft`, after a blank line, or `text` alone where there is no draft. */
 function underDraft(draft, text) {
@@ -14740,18 +14765,17 @@ function focusAtEnd(box) {
 }
 
 /**
- * Edit: a failed or unconfirmed send's unsent text back in the box it was written in, and out of the
- * outbox. Written into that box's draft store before it leaves the outbox, so there is no moment at
- * which neither holds it.
+ * Edit: a failed send's unsent text back in the box it was written in, and out of the outbox. Written
+ * into that box's draft store first, and taken out of the outbox only once the store holds it, so
+ * there is no moment at which neither holds it; where the store refuses it, nothing moves.
  */
 async function editOutgoingMessage(id) {
   const entry = outgoingMessages.get(id);
-  if (!entry || (entry.state !== "failed" && entry.state !== "unconfirmed")) return;
+  if (!entry || !editableSend(entry)) return;
   const text = unsentText(entry);
   if (!text.trim()) return;
-  const note = entry.state === "unconfirmed" ? UNCONFIRMED_EDIT_NOTE : "";
   if (entry.replyTo) {
-    editOutgoingReply(entry, text, note);
+    editOutgoingReply(entry, text);
     return;
   }
   const key = JSON.stringify([entry.channel, entry.threadId || null]);
@@ -14759,11 +14783,18 @@ async function editOutgoingMessage(id) {
   const boxShown = () => String(el("discord-channel").value) === entry.channel && activeComposerKey === key;
   const showing = () => [activeColumn, activeColumn === columns.main ? columns.side : columns.main]
     .find((column) => (column === columns.main || sideShowing()) && inColumn(column, boxShown)) || null;
-  let column = showing();
-  const before = column ? inColumn(column, () => el("channel-compose-text").value) : channelDrafts.get(key) || "";
+  // From the store, which every keystroke in the box writes, and which holds the draft of a box no
+  // column is showing.
+  const before = channelDrafts.get(key);
   channelDrafts.set(key, underDraft(before, text));
-  const kept = saveChannelDrafts();
+  if (!saveChannelDrafts()) {
+    if (before === undefined) channelDrafts.delete(key);
+    else channelDrafts.set(key, before);
+    setStatus(EDIT_DRAFT_REFUSED);
+    return;
+  }
   dropOutgoing(entry.id);
+  let column = showing();
   // A thread's message, edited from All: its box is the thread's, so the thread opens, with it.
   if (!column && entry.threadId) {
     await openThread(entry.threadId);
@@ -14776,8 +14807,8 @@ async function editOutgoingMessage(id) {
   inColumn(column, () => {
     const box = el("channel-compose-text");
     box.value = channelDrafts.get(key) || "";
-    el("channel-compose-state").textContent = !kept ? CHANNEL_DRAFT_REFUSED
-      : note || (before.trim() ? "Your message is back, under the draft that was already here." : "");
+    el("channel-compose-state").textContent = before && before.trim()
+      ? "Your message is back, under the draft that was already here." : "";
     focusAtEnd(box);
   });
 }
@@ -14787,11 +14818,16 @@ async function editOutgoingMessage(id) {
  * to it, and the new-thread choice as it was sent. The message is the row's on screen, or the store's;
  * one this page no longer holds keeps the draft for when it is drawn again (`draftMarker`).
  */
-function editOutgoingReply(entry, text, note) {
+function editOutgoingReply(entry, text) {
   const id = String(entry.replyTo);
-  const before = drafts.get(id) || "";
+  const before = drafts.get(id);
   drafts.set(id, underDraft(before, text));
-  const kept = persistDrafts();
+  if (!persistDrafts()) {
+    if (before === undefined) drafts.delete(id);
+    else drafts.set(id, before);
+    setStatus(EDIT_DRAFT_REFUSED);
+    return;
+  }
   dropOutgoing(entry.id);
   renderDraftMarkers();
   const row = /** @type {HTMLLIElement | null} */ ([...el("discord-log").children].find((li) => idsOf(li)[0] === id) || null);
@@ -14805,8 +14841,8 @@ function editOutgoingReply(entry, text, note) {
     el("reply-branch").checked = true;
     renderReplyDestination();
   }
-  el("reply-state").textContent = !kept ? REPLY_DRAFT_REFUSED
-    : note || (before.trim() ? "Your reply is back, under the draft that was already here." : "");
+  el("reply-state").textContent = before && before.trim()
+    ? "Your reply is back, under the draft that was already here." : "";
   focusAtEnd(el("reply-text"));
 }
 
@@ -14817,9 +14853,14 @@ function dismissOutgoingMessage(id) {
   dismissedSends = [{ entry: { ...entry, phase: "" }, at: Date.now() },
     ...dismissedSends.filter((held) => held.entry.id !== id)];
   const kept = persistDismissedSends();
+  // A send waiting to go again on its own, for Undo to set waiting again. Never saved, as the wait
+  // itself is not: Put back after a reload, or from Settings later, leaves it to Retry.
+  const waiting = outgoingRetries.get(id);
+  const hold = waiting ? { at: waiting.at, offline: waiting.offline, unsent: waiting.unsent,
+    identity: waiting.identity, retriesUsed: entry.retriesUsed || 0 } : null;
   dropOutgoing(id);
   if (sendUndo) clearTimeout(sendUndo.timer);
-  sendUndo = { id, timer: setTimeout(endSendUndo, SEND_UNDO_MS) };
+  sendUndo = { id, hold, timer: setTimeout(endSendUndo, SEND_UNDO_MS) };
   renderSendUndo();
   renderDismissedSends();
   setStatus(kept
@@ -14842,7 +14883,10 @@ function renderSendUndo() {
   if (chip.textContent !== label) chip.textContent = label;
 }
 
-/** Put a dismissed send back in the outbox as it was: what Undo does, and Put back in Settings. */
+/**
+ * Put a dismissed send back in the outbox: what Undo does, and Put back in Settings. Undo puts back
+ * the wait for an automatic send as well, for the credential it was armed under.
+ */
 function putBackDismissedSend(id) {
   const held = dismissedSends.find((item) => item.entry.id === id);
   if (!held) return;
@@ -14852,6 +14896,11 @@ function putBackDismissedSend(id) {
     const all = [...outgoingMessages.values(), entry].sort((a, b) => a.createdAt - b.createdAt);
     outgoingMessages.clear();
     for (const one of all) outgoingMessages.set(one.id, one);
+    const hold = sendUndo && sendUndo.id === id ? sendUndo.hold : null;
+    if (hold && hold.identity === tokenFingerprint(token())) {
+      entry.retriesUsed = hold.retriesUsed;
+      holdOutgoingMessage(entry, hold);
+    }
   }
   // The outbox holds it again before the copy goes.
   persistOutgoingMessages();
@@ -22614,15 +22663,16 @@ function loadDrafts() {
   }
 }
 
-/** Written back with the same read-after-write check `persistMicSettings` makes, for the reason. */
+/**
+ * Written back with the same read-after-write check `persistMicSettings` makes, for the reason; and,
+ * where the quota is full, given the saved channel rows' space, as the channel's drafts are: saved
+ * messages can be fetched again, and what the reader typed cannot. `#193 compose-draft-loss`.
+ */
 function persistDrafts() {
   const encoded = JSON.stringify(Object.fromEntries(drafts));
-  try {
-    localStorage.setItem(DRAFTS_KEY, encoded);
-  } catch (_error) {
-    return false;
-  }
-  return localStorage.getItem(DRAFTS_KEY) === encoded;
+  if (storedExactly(DRAFTS_KEY, encoded)) return true;
+  dropMessageCache();
+  return storedExactly(DRAFTS_KEY, encoded);
 }
 
 let replyTarget = null;
