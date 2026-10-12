@@ -403,12 +403,16 @@ def columns_walk(desk: Desk) -> None:
     desk.notes.append("at 900px one column in All with the button gone; wide again, two with the same thread")
 
     # The keys, pressed for real: ] to the right column, Esc its X, j to a card with a ring, Enter
-    # selects it, [ back to the left column. The mouse crossed the right column above, and a real move
-    # over a message selects it (`#239 single-selection`), so ] lands on that message, inside the column.
+    # selects it, [ back to the left column. The right column keeps a selected message per thread, and
+    # opening this one from Thread(N) selected its root there, so ] lands on that message: the one row
+    # lit on the page, and the focus on it (`#239 single-selection`).
     page.focus("#scroll-area")
     page.keyboard.press("]")
-    desk.wait_for("() => document.getElementById('side-scroll').contains(document.activeElement)",
-                  "] did not give the keys to the right column")
+    desk.wait_for("() => { const held = document.activeElement;"
+                  " const lit = [...document.querySelectorAll('[data-selected=\"true\"]')];"
+                  " return held && held.matches(\"#side-log > li[data-id='209']\")"
+                  " && lit.length === 1 && lit[0] === held; }",
+                  "] did not give the keys to the right column's selected message, the thread's root, the one row lit")
     page.keyboard.press("Escape")
     desk.wait_for("() => !document.getElementById('side-list').hidden", "Esc in the right column did not close its thread")
     page.keyboard.press("j")
