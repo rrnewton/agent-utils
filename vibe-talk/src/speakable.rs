@@ -381,15 +381,60 @@ fn starts_with_chars(chars: &[char], marker: &str) -> bool {
     marker.chars().all(|wanted| held.next() == Some(&wanted))
 }
 
+/// The next position at or after a cursor that holds one character, found without reading any
+/// character twice.
+///
+/// `#201 speech-prep-linear`: a search to the end of the line from every `[` in a line of them is
+/// the square of the line's length. Positions are asked for in increasing order, so the last
+/// answer stands until the cursor passes it, and the next search starts where the last one ended.
+struct NextOf {
+    wanted: char,
+    /// The last answer: the position found, or `None` when nothing is left to find.
+    found: Option<usize>,
+    /// Everything before this has been read.
+    read: usize,
+}
+
+impl NextOf {
+    fn new(wanted: char) -> Self {
+        Self {
+            wanted,
+            found: None,
+            read: 0,
+        }
+    }
+
+    /// The first position at or after `at` holding the character. `at` never decreases.
+    fn from(&mut self, chars: &[char], at: usize) -> Option<usize> {
+        if let Some(found) = self.found.filter(|&found| found >= at) {
+            return Some(found);
+        }
+        let start = at.max(self.read);
+        if start >= chars.len() {
+            self.read = chars.len();
+            self.found = None;
+            return None;
+        }
+        self.found = chars[start..]
+            .iter()
+            .position(|&c| c == self.wanted)
+            .map(|offset| start + offset);
+        self.read = self.found.map_or(chars.len(), |found| found + 1);
+        self.found
+    }
+}
+
 /// Remove inline markers, resolve links to their text, and name the things that have no sound.
 fn strip_inline(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let chars: Vec<char> = text.chars().collect();
+    let mut closes = NextOf::new(']');
+    let mut parens = NextOf::new(')');
     let mut i = 0;
     while i < chars.len() {
         // `[label](url)` reads as its label. A listener cannot use a URL and cannot write it down.
         if chars[i] == '[' {
-            if let Some((label, consumed)) = link_at(&chars[i..]) {
+            if let Some((label, consumed)) = link_at(&chars, i, &mut closes, &mut parens) {
                 out.push_str(&label);
                 i += consumed;
                 continue;
@@ -432,20 +477,25 @@ fn strip_inline(text: &str) -> String {
     out
 }
 
-/// `[label](target)` → the label, and how many characters it took.
-fn link_at(chars: &[char]) -> Option<(String, usize)> {
-    let close = chars.iter().position(|&c| c == ']')?;
+/// `[label](target)` at `start` → the label, and how many characters it took.
+fn link_at(
+    chars: &[char],
+    start: usize,
+    closes: &mut NextOf,
+    parens: &mut NextOf,
+) -> Option<(String, usize)> {
+    let close = closes.from(chars, start + 1)?;
     if chars.get(close + 1) != Some(&'(') {
         return None;
     }
-    let end = chars[close + 2..].iter().position(|&c| c == ')')? + close + 2;
-    let label: String = chars[1..close].iter().collect();
+    let end = parens.from(chars, close + 2)?;
+    let label: String = chars[start + 1..close].iter().collect();
     let said = if label.trim().is_empty() {
         "a link".to_owned()
     } else {
         label
     };
-    Some((said, end + 1))
+    Some((said, end + 1 - start))
 }
 
 /// One of Discord's `<…>` forms, and how many characters it took.
@@ -480,72 +530,100 @@ fn angle_form_at(rest: &str) -> Option<(String, usize)> {
 
 // --- times --------------------------------------------------------------------------------------
 
+/// The longest `<t:…>` form read as one, in bytes: `<t:`, an epoch in seconds, a style and `>` is
+/// far shorter. The bound keeps a line of `<t:` with no `>` from searching the rest of the line at
+/// each one.
+const DISCORD_TIMESTAMP_BYTES: usize = 40;
+
+/// The longest ISO-8601 instant read as one, in characters.
+const ISO_INSTANT_CHARS: usize = 30;
+
 /// Replace every instant we can recognise with something a listener can place.
+///
+/// `#201 speech-prep-linear`: linear in the length of `text`. It used to copy the rest of the text
+/// at every character before looking at it, so a 210,000-character line cost the square of its
+/// length — over two minutes — before a word was spoken. Each candidate is now read from a slice
+/// of the text, and only where one can start: an instant at a digit, Discord's form at a `<`.
 fn speak_times(text: &str, now_ms: i64, zone: &Zone) -> String {
     let mut out = String::with_capacity(text.len());
-    let bytes: Vec<char> = text.chars().collect();
-    let mut i = 0;
-    while i < bytes.len() {
-        let rest: String = bytes[i..].iter().collect();
-        if let Some((said, consumed)) = discord_timestamp_at(&rest, now_ms, zone) {
-            out.push_str(&said);
-            i += consumed;
-            continue;
+    let bytes = text.as_bytes();
+    let mut copied = 0;
+    let mut at = 0;
+    while at < bytes.len() {
+        // Both forms begin with an ASCII byte, which is always the start of a character, so the
+        // slice below is always on a boundary.
+        let found = match bytes[at] {
+            b'<' => discord_timestamp_at(&text[at..], now_ms, zone),
+            b'0'..=b'9' => iso_timestamp_at(&text[at..], now_ms, zone),
+            _ => None,
+        };
+        match found {
+            Some((said, consumed)) => {
+                out.push_str(&text[copied..at]);
+                out.push_str(&said);
+                at += consumed;
+                copied = at;
+            }
+            None => at += 1,
         }
-        if let Some((said, consumed)) = iso_timestamp_at(&rest, now_ms, zone) {
-            out.push_str(&said);
-            i += consumed;
-            continue;
-        }
-        out.push(bytes[i]);
-        i += 1;
     }
+    out.push_str(&text[copied..]);
     out
 }
 
-/// Discord's own `<t:1700000000:R>` form. The style suffix is ignored: this decides how to say it.
+/// Discord's own `<t:1700000000:R>` form, and how many bytes it took. The style suffix is ignored:
+/// this decides how to say it.
 fn discord_timestamp_at(rest: &str, now_ms: i64, zone: &Zone) -> Option<(String, usize)> {
     if !rest.starts_with("<t:") {
         return None;
     }
-    let end = rest.find('>')?;
+    let end = rest
+        .bytes()
+        .take(DISCORD_TIMESTAMP_BYTES)
+        .position(|byte| byte == b'>')?;
     let inner = &rest[3..end];
     let seconds: i64 = inner.split(':').next()?.parse().ok()?;
-    Some((say_instant(seconds * 1000, now_ms, zone), end + 1))
+    // An epoch past what a timestamp can hold is not a time anybody wrote on purpose, and is left
+    // as written rather than said as nothing.
+    let then_ms = seconds.checked_mul(1000)?;
+    Timestamp::from_millisecond(then_ms).ok()?;
+    Some((say_instant(then_ms, now_ms, zone), end + 1))
 }
 
-/// A bare ISO-8601 instant sitting in the text.
+/// A bare ISO-8601 instant sitting in the text, and how many bytes it took.
 fn iso_timestamp_at(rest: &str, now_ms: i64, zone: &Zone) -> Option<(String, usize)> {
-    // Cheap gate before the parse: an instant starts with four digits and a dash.
-    let head: String = rest.chars().take(10).collect();
-    if head.len() < 10 || !looks_like_a_date(&head) {
+    // Cheap gate before the parse: an instant starts with a date.
+    if !looks_like_a_date(rest.as_bytes()) {
         return None;
     }
+    // Where each of the first characters ends, so every candidate is a slice and not a copy.
+    let ends: Vec<usize> = rest
+        .char_indices()
+        .take(ISO_INSTANT_CHARS)
+        .map(|(index, character)| index + character.len_utf8())
+        .collect();
     // Longest first, so a full instant is not truncated to its date.
-    for take in (10..=30).rev() {
-        let candidate: String = rest.chars().take(take).collect();
-        if candidate.chars().count() < take {
-            continue;
-        }
+    for take in (10..=ends.len()).rev() {
+        let candidate = &rest[..ends[take - 1]];
         let trimmed = candidate.trim_end_matches(|c: char| !c.is_ascii_alphanumeric());
         if let Ok(instant) = trimmed.parse::<Timestamp>() {
             return Some((
                 say_instant(instant.as_millisecond(), now_ms, zone),
-                trimmed.chars().count(),
+                trimmed.len(),
             ));
         }
     }
     None
 }
 
-fn looks_like_a_date(head: &str) -> bool {
-    let c: Vec<char> = head.chars().collect();
-    c.len() >= 10
-        && c[0..4].iter().all(char::is_ascii_digit)
-        && c[4] == '-'
-        && c[5..7].iter().all(char::is_ascii_digit)
-        && c[7] == '-'
-        && c[8..10].iter().all(char::is_ascii_digit)
+/// Whether `head` begins with `YYYY-MM-DD`, as digits and dashes.
+fn looks_like_a_date(head: &[u8]) -> bool {
+    head.len() >= 10
+        && head[0..4].iter().all(u8::is_ascii_digit)
+        && head[4] == b'-'
+        && head[5..7].iter().all(u8::is_ascii_digit)
+        && head[7] == b'-'
+        && head[8..10].iter().all(u8::is_ascii_digit)
 }
 
 /// How to say one instant, given when "now" is.
@@ -559,7 +637,7 @@ fn looks_like_a_date(head: &str) -> bool {
 /// Those are left as they were written, which the caller can still read, rather than converted
 /// into something worse.
 fn say_instant(then_ms: i64, now_ms: i64, zone: &Zone) -> String {
-    let delta_ms = now_ms - then_ms;
+    let delta_ms = now_ms.saturating_sub(then_ms);
     let future = delta_ms < 0;
     let secs = (delta_ms / 1000).abs();
 
@@ -789,6 +867,78 @@ mod tests {
         );
     }
 
+    /// `unit` repeated to exactly `length` characters. Every unit is ASCII, so a byte is a character.
+    fn line_of(unit: &str, length: usize) -> String {
+        assert!(unit.is_ascii());
+        unit.repeat(length / unit.len() + 1)[..length].to_owned()
+    }
+
+    /// Every kind of thing preparation looks for, in one stretch of prose, and then each alone in
+    /// the shape that made one stage search the rest of the line from every place it could start.
+    const SCALING_UNITS: [&str; 9] = [
+        "the **deploy** of parse_thread_id at 2026-08-24T11:30:00Z by <@1> in <#2> \
+         <t:1787569200:R>, see [the runbook](https://example.com/x) about D1234567 \
+         12345678901 a1b2c3d4e5f6a7 ",
+        "[a",
+        "[a](",
+        "<t:1",
+        "<a",
+        "2026-08-24",
+        "1234567890",
+        "a_b*c~",
+        "word ",
+    ];
+
+    /// The least of three timings, which is the one least disturbed by whatever else the host was
+    /// doing.
+    fn least_cost(text: &str) -> std::time::Duration {
+        let zone = eastern();
+        (0..3)
+            .map(|_| {
+                let started = std::time::Instant::now();
+                std::hint::black_box(for_speech(text, NOW, &zone));
+                started.elapsed()
+            })
+            .min()
+            .unwrap_or_default()
+    }
+
+    #[test]
+    fn preparing_a_line_costs_its_length_and_not_its_square() {
+        // `#201 speech-prep-linear`: a 210,000-character line took 142 s in a debug build, because
+        // the time pass copied the rest of the line at every character and the link pass searched
+        // the rest of it from every `[`. Real messages are short; a stranger's need not be.
+        //
+        // Compared as a ratio, so a slow or busy host slows both sides alike: four times the text
+        // costs four times as much when the work is linear and sixteen times when it is quadratic,
+        // and ten sits well between them. The small allowance keeps a pair of sub-millisecond
+        // timings from failing on a scheduler's whim.
+        for unit in SCALING_UNITS {
+            let small = least_cost(&line_of(unit, 25_000));
+            let large = least_cost(&line_of(unit, 100_000));
+            assert!(
+                large <= small * 10 + std::time::Duration::from_millis(20),
+                "{unit:?}: 25,000 characters took {small:?} and 100,000 took {large:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_line_of_two_hundred_thousand_characters_is_prepared_promptly() {
+        // The absolute bound beside the ratio above: generous, so that only a cost far out of
+        // proportion to the text fails it, on a loaded host or in an unoptimised build.
+        let limit = if cfg!(debug_assertions) { 30 } else { 5 };
+        let line = line_of(SCALING_UNITS[0], 200_000);
+        let started = std::time::Instant::now();
+        let said = for_speech(&line, NOW, &eastern());
+        let took = started.elapsed();
+        assert!(said.starts_with("the deploy of parse thread id at 30 minutes ago"));
+        assert!(
+            took < std::time::Duration::from_secs(limit),
+            "200,000 characters took {took:?}"
+        );
+    }
+
     #[test]
     fn a_link_reads_as_its_words_and_never_as_its_url() {
         assert_eq!(
@@ -983,6 +1133,20 @@ mod tests {
     fn discords_own_timestamp_markup_is_resolved_too() {
         // <t:seconds:style>. The style is ignored: this decides how to say it.
         assert_eq!(say("shipped <t:1787569200:R>"), "shipped 1 hour ago");
+    }
+
+    #[test]
+    fn an_epoch_too_large_for_a_time_is_left_as_written() {
+        // Seconds that overflow when counted in milliseconds used to panic a debug build.
+        assert_eq!(
+            say("at <t:9223372036854776:R>"),
+            "at <t:9223372036854776:R>"
+        );
+        // One that fits in milliseconds but past any calendar used to be said as nothing at all.
+        assert_eq!(say("at <t:999999999999:R>"), "at <t:999999999999:R>");
+        // And a `<t:` whose `>` is past any real form is not read as one.
+        let far = format!("<t:1787569200{}>", " ".repeat(64));
+        assert_eq!(say(&far), "<t:1787569200 >");
     }
 
     #[test]
