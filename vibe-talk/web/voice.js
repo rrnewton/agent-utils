@@ -128,7 +128,7 @@ let sideActive = false;
  */
 /**
  * @overload
- * @param {"add-channel" | "add-noise-rule" | "audio-source" | "back-to-reply"
+ * @param {"add-channel" | "add-noise-rule" | "audio-source" | "author-filter" | "back-to-reply"
  *   | "cancel-add-channel" | "cancel-rename" | "canned-blockers" | "canned-summary"
  *   | "channel-directory-more" | "channel-directory-retry" | "channel-send"
  *   | "channel-view-flat" | "channel-view-main" | "channel-view-threads" | "clear-alias"
@@ -2616,10 +2616,12 @@ function applySearch() {
   applyReadRuns();
   const terms = searchOpen ? searchTerms(searchQuery) : [];
   const links = searchOpen && linksOnly;
+  // `#251 author-filter`. Whose messages, ANDed with the rest.
+  const author = authorChoosing();
   // `#215 reply-coalesce`. A filter that takes rows away shows a subset of the channel in time order,
   // and gathered replies go back to theirs before it does: a bridge to rows it hides would be a
   // bridge to nothing. See the section on gathering replies.
-  if (gatheredParent() !== null && (terms.length > 0 || links || pinnedOnly)) putRepliesBack();
+  if (gatheredParent() !== null && (terms.length > 0 || links || pinnedOnly || author !== "everyone")) putRepliesBack();
   const scope = searchScope();
   let matched = 0;
   let loaded = 0;
@@ -2649,7 +2651,7 @@ function applySearch() {
       // of the channel. It goes away while a filter is on, because it explains a neighbour that is
       // no longer beside it, and it is never counted either way.
       const said = terms.length === 0 || (text !== null && terms.every((term) => text.includes(term)));
-      const hit = said && (!links || shown > 0);
+      const hit = said && (!links || shown > 0) && authorPasses(row, author);
       setClassWord(row, "search-hidden", !hit);
       if (counts && text !== null) {
         loaded += 1;
@@ -2680,9 +2682,9 @@ function applySearch() {
   // `#206 pin-message`. Over the Pinned filter the denominator is the channel's PINS, all of them.
   const pinned = pinnedOnly && currentView === "discord";
   activeColumn.searched = { matched, loaded, tally, pinned };
-  renderSearchCount(terms.length > 0, links);
+  renderSearchCount(terms.length > 0, links, author !== "everyone");
   if (pinned) {
-    const sentence = pinnedEmptySentence(loaded, matched, terms.length > 0, links ? tally : null);
+    const sentence = pinnedEmptySentence(loaded, matched, terms.length > 0, links ? tally : null, author);
     el("search-empty").textContent = sentence;
     el("search-empty").hidden = sentence === "";
     return;
@@ -2693,7 +2695,15 @@ function applySearch() {
   // Not raised over a list that was empty to begin with: there the pane already says why. Each
   // column says it over its own list (`#229 desktop-two-column`).
   if (links) {
-    const sentence = linksEmptySentence(loaded, tally, matched);
+    const sentence = linksEmptySentence(loaded, tally, matched, author);
+    el("search-empty").textContent = sentence;
+    el("search-empty").hidden = sentence === "";
+    return;
+  }
+  if (author !== "everyone") {
+    const sentence = currentView === "discord" && channelView === "threads"
+      ? "This is a list of threads, and who wrote what is in their messages — open a thread to see it."
+      : matched > 0 || loaded === 0 ? "" : authorEmptySentence(author, terms.length > 0, false);
     el("search-empty").textContent = sentence;
     el("search-empty").hidden = sentence === "";
     return;
@@ -2707,7 +2717,7 @@ function applySearch() {
  * each column's last pass counted. `#229 desktop-two-column`: there is one bar, so it speaks for both
  * columns while two are up. Over the Pinned filter it speaks for the pins: the left column's list.
  */
-function renderSearchCount(typed, links) {
+function renderSearchCount(typed, links, author = false) {
   const left = columns.main.searched;
   if (!left) return;
   const counted = [left, ...(sideShowing() && columns.side.searched && !left.pinned ? [columns.side.searched] : [])];
@@ -2721,9 +2731,11 @@ function renderSearchCount(typed, links) {
   // and after `#128 transcript-history` those are routinely different numbers. Links is a filter
   // in force with nothing typed, so it is counted with nothing typed, as Pinned is — which says its
   // count even before anything is typed: the filter is in force, and the bar is where it says so.
+  // `#251 author-filter`: and so is whose messages.
+  const filtering = typed || links || author;
   el("search-count").textContent = left.pinned
-    ? (!typed && !links ? `${loaded} pinned` : `${matched} of ${loaded} pinned`)
-    : (!typed && !links ? "" : `${matched} of ${loaded} loaded`);
+    ? (!filtering ? `${loaded} pinned` : `${matched} of ${loaded} pinned`)
+    : (!filtering ? "" : `${matched} of ${loaded} loaded`);
 }
 
 /**
@@ -2737,14 +2749,18 @@ function renderSearchCount(typed, links) {
  * what you typed" are two more answers, and neither is "no pins". `#212 link-filter`: nor is "the
  * pins' links are all of the kinds turned off", which says how to bring them back.
  */
-function pinnedEmptySentence(loaded, matched, searching, tally = null) {
+function pinnedEmptySentence(loaded, matched, searching, tally = null, author = "everyone") {
   if (loaded > 0) {
     if (tally !== null && tally.linked === 0) return "None of this channel's pinned messages has a link.";
     if (tally !== null && tally.kept === 0) {
       return `None of this channel's pinned messages has a link left once ${hiddenKindNames(tally.everywhere)} ` +
         "are hidden — turn them back on under the Links button.";
     }
-    if (matched > 0 || !searching) return "";
+    if (matched > 0) return "";
+    // `#251 author-filter`. Whose they are is the filter that emptied the list unless text is typed
+    // or Links is on, which keep their own sentences.
+    if (author !== "everyone" && tally === null) return authorEmptySentence(author, searching, true);
+    if (!searching) return "";
     if (tally === null) return "None of this channel's pinned messages match that search.";
     return tally.saidLinked > 0
       ? "None of this channel's pinned messages with a link match that search once " +
@@ -2766,7 +2782,7 @@ function pinnedEmptySentence(loaded, matched, searching, tally = null) {
  * page remembered: every link loaded is of those kinds, or every message the text matches links
  * only to them. The first says where the buttons are that bring them back.
  */
-function linksEmptySentence(loaded, tally, matched) {
+function linksEmptySentence(loaded, tally, matched, author = "everyone") {
   // The Threads list is a list of THREADS. Its rows have no text of their own to hold a link, so an
   // empty list there is not "no links" — it is the wrong list to look in, and the reader is told
   // where the links are.
@@ -2780,6 +2796,12 @@ function linksEmptySentence(loaded, tally, matched) {
     return `No links left once ${hiddenKindNames(tally.everywhere)} are hidden — turn them back on under the Links button.`;
   }
   if (matched > 0) return "";
+  // `#251 author-filter`. With nothing typed, a link is still shown and none is left: whose messages
+  // took them away.
+  if (author !== "everyone" && searchTerms(searchQuery).length === 0) {
+    return author === "mine" ? "None of your messages loaded so far has a link." :
+      "None of the messages from anyone else loaded so far has a link.";
+  }
   // Some link is still shown, so this is the text: what it matched links only to hidden kinds, or
   // holds no link at all.
   return tally.saidLinked > 0
@@ -3355,6 +3377,8 @@ function showSearchOpen(open) {
     // closing, by `keepingFilterPlace`.
     setLinksOnly(false);
     setPinnedOnly(false);
+    // `#251 author-filter`. And whose messages.
+    setAuthorFilter("everyone");
   }
   el("search-toggle").setAttribute("aria-pressed", open ? "true" : "false");
   // `#197 floating-search`. The open bar floats over the top of the list, and web/voice.css keys
@@ -3764,6 +3788,129 @@ function setLinksOnly(on) {
   });
   // Off, the rows' text is back on screen, and summary mode asks about what is in view.
   requestVisibleSummaries();
+}
+
+// --- whose messages: the author filter -----------------------------------------------------------
+//
+// `#251 author-filter`. The owner: "When we search we can filter on pinned, I would like to likewise
+// filter on prompts vs agent responses (me vs them). Opening search bar and filtering prompts (with no
+// search term) should give me a full view of all my prompts."
+//
+// ONE BUTTON IN THE BAR, left of Links, that cycles Everyone → Mine → Theirs, as the read mode's
+// button cycles its three. Two toggles would be a fifth and a sixth square on a 360px line that holds
+// the field, the count, Links, Pinned and the glass, and two that must never be on together are one
+// control with three states anyway.
+//
+// MINE is what the page draws as the owner's: a channel row it puts in the `me` bucket (`bucketFor`:
+// the bridge's own account, the accounts configured or chosen as his), a message of his still being
+// sent, and the call's "you". THEIRS is every other message — "me vs them", in his words — people and
+// agents alike: the coding agent's bucket is a guess that changes once a second bot speaks, and a
+// filter named for agents would hide the other people in the channel without saying so.
+//
+// ANDED with the search text, Links, Pinned and the read mode, in the one pass that applies them all
+// (`applySearch`). It chooses rows, as the text and Links do: collapsed runs open under it, the
+// bookmark is not drawn, and gathered replies go back to their places. It goes when the bar closes,
+// as the other filters in it do.
+
+/** The author filter's states, in the order a press cycles them. */
+const AUTHOR_FILTERS = ["everyone", "mine", "theirs"];
+
+/** What the button says in each state: the state it is in, and where a press goes next. */
+const AUTHOR_FILTER_LABELS = {
+  everyone: "Everyone's messages. Press for only yours",
+  mine: "Only your messages. Press for only everyone else's",
+  theirs: "Only everyone else's messages. Press for everyone's",
+};
+
+const AUTHOR_FILTER_TITLES = {
+  everyone: "Everyone's messages — press for only yours",
+  mine: "Only your messages — press for only everyone else's",
+  theirs: "Only everyone else's messages — press for everyone's",
+};
+
+/** Whose messages the list shows: one of `AUTHOR_FILTERS`. Only while the search bar is open. */
+let authorFilter = "everyone";
+
+/** The author filter in force: "everyone" while the bar is shut, whatever was last chosen. */
+const authorChoosing = () => (searchOpen ? authorFilter : "everyone");
+
+/**
+ * Whether `row` is a message the owner wrote, by what the page draws: a channel row in the `me` bucket
+ * (or one still being sent, which is his), and the call's "you".
+ */
+function rowIsMine(row) {
+  if (row.getAttribute("data-who") === "me") return true;
+  return String(row.className).split(/\s+/).includes("mine");
+}
+
+/**
+ * Whether `row` passes the author filter `author`. Only a message passes Mine or Theirs: a row that is
+ * not one (a notice, a seam, a card of the Threads list, which is a thread and not a message anybody
+ * wrote) goes, as it does under Links.
+ */
+function authorPasses(row, author) {
+  if (author === "everyone") return true;
+  if (row.getAttribute("data-search") === null || String(row.className).split(/\s+/).includes("thread-card")) {
+    return false;
+  }
+  return rowIsMine(row) === (author === "mine");
+}
+
+/** The button, saying the state: its icon (drawn by web/voice.css off `data-author`), pressed, and named. */
+function renderAuthorFilter() {
+  const button = el("author-filter");
+  const said = {
+    "data-author": authorFilter,
+    "aria-pressed": authorFilter === "everyone" ? "false" : "true",
+    "aria-label": AUTHOR_FILTER_LABELS[authorFilter],
+    title: AUTHOR_FILTER_TITLES[authorFilter],
+  };
+  for (const [name, value] of Object.entries(said)) {
+    if (button.getAttribute(name) !== value) button.setAttribute(name, value);
+  }
+}
+
+/**
+ * Choose whose messages the list shows, the reader's message kept where it is on the screen — or,
+ * when the new choice hides it, the nearest message shown in its place (`keepingFilterPlace`, `#243
+ * filter-keeps-selection`). Both columns, as Links: there is one bar.
+ */
+function setAuthorFilter(mode) {
+  const next = AUTHOR_FILTERS.includes(mode) ? mode : "everyone";
+  if (next === authorFilter) return;
+  keepingFilterPlace(() => {
+    authorFilter = next;
+    renderAuthorFilter();
+    renderScrollTools();
+    inOtherColumn(renderScrollTools);
+  });
+  requestVisibleSummaries();
+}
+
+/** The button's press: the next state round the cycle. */
+function cycleAuthorFilter() {
+  setAuthorFilter(AUTHOR_FILTERS[(AUTHOR_FILTERS.indexOf(authorFilter) + 1) % AUTHOR_FILTERS.length]);
+}
+
+/**
+ * What the list says where its rows would be when the author filter has left none of the messages
+ * loaded, or "" when it has not. `searching` is whether text is typed too, and `pinned` whether the
+ * list is the Pinned filter's. With "my own messages count as read" on, Hide read leaves out every
+ * message of the owner's, so Mine under it is empty by design, and the sentence says how to see them.
+ */
+function authorEmptySentence(author, searching, pinned) {
+  if (author === "mine" && !pinned && currentView === "discord" && todoMode && markOwnRead) {
+    return "Your own messages count as read, so Hide read leaves them out — press h for Show read.";
+  }
+  const whose = author === "mine" ? "yours" : "from anyone else";
+  if (pinned) {
+    return searching
+      ? `None of this channel's pinned messages ${author === "mine" ? "of yours" : "from anyone else"} match that search.`
+      : `None of this channel's pinned messages are ${whose}.`;
+  }
+  return searching
+    ? `None of the messages ${author === "mine" ? "of yours" : "from anyone else"} loaded so far match that search.`
+    : `None of the messages loaded so far are ${whose}.`;
 }
 
 // --- the kinds of link under Links ----------------------------------------------------------------
@@ -5992,6 +6139,7 @@ function filterFromKeyboard(which) {
   if (!channelOnScreen()) return false;
   if (!searchOpen) setSearchOpen(true);
   if (which === "pinned") setPinnedOnly(!pinnedOnly);
+  else if (which === "author") cycleAuthorFilter();
   else setLinksOnly(!linksOnly);
   focusList(channelPane);
   return true;
@@ -6523,6 +6671,12 @@ const KEYMAP = [
     does: "Only the links, or the messages again",
     controls: ["links-filter"],
     run: () => filterFromKeyboard("links"),
+  },
+  {
+    group: KEYS_VIEW, chords: [{ key: "m", shift: true }],
+    does: "Only your messages, then only everyone else's, then everyone's again",
+    controls: ["author-filter"],
+    run: () => filterFromKeyboard("author"),
   },
   {
     group: KEYS_VIEW, chords: [{ key: ";" }],
@@ -8182,6 +8336,9 @@ function renderControlBar() {
   // `#211 link-filter`. Beside Pinned while the bar is open, and over the call view as well: it
   // filters what the search filters, and a turn can hold a link as a channel message can.
   el("links-filter").hidden = el("search-field").hidden;
+  // `#251 author-filter`. Whose messages, left of Links, over the call view as well: a turn is yours
+  // or the agent's as a channel message is.
+  el("author-filter").hidden = el("search-field").hidden;
   // `#212 link-filter`. The kinds of link under it go with it.
   renderLinkKinds();
   // The bar used to yield the header row to an open search field when the reader had moved it up
@@ -22334,7 +22491,7 @@ function openThreadRootId() {
 
 /** Whether a filter is choosing rows: then every match is shown, and no run hides one behind a line. */
 function readRunsSuspended() {
-  return searchOpen && (linksOnly || searchTerms(searchQuery).length > 0);
+  return searchOpen && (linksOnly || authorFilter !== "everyone" || searchTerms(searchQuery).length > 0);
 }
 
 /**
@@ -29297,6 +29454,8 @@ el("search-toggle").addEventListener("click", () => setSearchOpen(!searchOpen));
 el("pinned-filter").addEventListener("click", () => setPinnedOnly(!pinnedOnly));
 // `#211 link-filter`. The same, for links.
 el("links-filter").addEventListener("click", () => setLinksOnly(!linksOnly));
+// `#251 author-filter`. Everyone, Mine, Theirs, in turn.
+el("author-filter").addEventListener("click", cycleAuthorFilter);
 // `#212 link-filter`. And each kind of link under it, a toggle of its own.
 for (const { kind, chip } of LINK_KINDS) {
   el(chip).addEventListener("click", () => setLinkKindShown(kind, hiddenLinkKinds.has(kind)));

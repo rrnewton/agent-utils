@@ -250,6 +250,29 @@
               />
               <span id="search-count" class="search-count" role="status" aria-live="polite" hidden></span>
               <!--
+                `#251 author-filter`. Whose messages: everyone's, only yours, or only everyone else's,
+                in turn, as the owner asked — "filter on prompts vs agent responses (me vs them)". One
+                button that cycles, as the read mode's does, because the bar already holds the field,
+                the count, two filters and the glass on a 360px line. Yours are the messages the page
+                draws as yours (the right-hand tiles, and the call's "you"); theirs is every other
+                message, people and agents alike. With nothing typed, "only yours" is every prompt you
+                wrote among the messages loaded. Over the call view too, as Links is, and it goes with
+                the bar as the other filters do. Each state draws its own icon: a speech bubble whose
+                tail is on the side the messages it keeps are drawn on.
+              -->
+              <button id="author-filter" class="icon-button" type="button" data-author="everyone" aria-pressed="false" aria-label="Everyone's messages. Press for only yours" title="Everyone's messages — press for only yours" hidden>
+                <svg class="icon author-icon" data-author="everyone" viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round">
+                  <path d="M4 3.5h8a1.8 1.8 0 0 1 1.8 1.8v4.4A1.8 1.8 0 0 1 12 11.5H8l-3 2.8v-2.8H4a1.8 1.8 0 0 1-1.8-1.8V5.3A1.8 1.8 0 0 1 4 3.5z" />
+                  <path d="M16.6 9.5H20a1.8 1.8 0 0 1 1.8 1.8v4.4A1.8 1.8 0 0 1 20 17.5h-1v2.8l-3-2.8h-4a1.8 1.8 0 0 1-1.8-1.8v-1.2" />
+                </svg>
+                <svg class="icon author-icon" data-author="mine" viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round">
+                  <path d="M6 4.5h12a2 2 0 0 1 2 2v7a2 2 0 0 1-2 2v4l-4-4H6a2 2 0 0 1-2-2v-7a2 2 0 0 1 2-2z" />
+                </svg>
+                <svg class="icon author-icon" data-author="theirs" viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round">
+                  <path d="M18 4.5H6a2 2 0 0 0-2 2v7a2 2 0 0 0 2 2v4l4-4h8a2 2 0 0 0 2-2v-7a2 2 0 0 0-2-2z" />
+                </svg>
+              </button>
+              <!--
                 `#211 link-filter`. The Links filter, immediately beside Pinned and only while the bar
                 is open, as the owner asked: "another little icon next to it with a hyperlink symbol".
                 On, the list keeps only the messages that hold a link, and each of those shows its
@@ -1699,8 +1722,18 @@
                 so nothing they match is behind a line.
               </p>
               <p class="hint">
+                <strong>Yours, or theirs.</strong> The speech bubble left of Links in the search bar
+                shows only your messages — with nothing typed, every prompt you wrote among the
+                messages loaded — then only everyone else's, people and agents alike, then everyone's
+                again; <kbd>Shift</kbd>+<kbd>M</kbd> does the same. Your messages are the ones drawn as
+                yours, on the right. A message has to pass every filter in the bar: the search text,
+                Links, Pinned, whose it is, and the read mode — so with your own messages counted as
+                read, Hide read leaves none of yours to show.
+              </p>
+              <p class="hint">
                 <strong>A filter keeps your place.</strong> Typing or clearing a search, closing it,
-                turning <strong>Pinned</strong> or <strong>Links</strong> on or off, the kinds of link
+                turning <strong>Pinned</strong> or <strong>Links</strong> on or off, whose messages,
+                the kinds of link
                 under Links, and the read mode each leave the message you selected where it is on the
                 screen — with nothing selected, the message at the top. So a pin found under
                 <strong>Pinned</strong> and selected is still in front of you when the filter goes, among

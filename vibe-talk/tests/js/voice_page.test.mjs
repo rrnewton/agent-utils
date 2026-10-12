@@ -43691,3 +43691,310 @@ test("`#252 thread-button-state`: → on a message nobody has answered opens its
     assert.deepStrictEqual(page.repliesPosted.at(-1).body, { text: "typed straight after →", thread_id: data.lone.id });
   }
 });
+
+// --- whose messages: the author filter (#251 author-filter) -------------------------------------------
+//
+// The owner: "When we search we can filter on pinned, I would like to likewise filter on prompts vs
+// agent responses (me vs them). Opening search bar and filtering prompts (with no search term) should
+// give me a full view of all my prompts." One button in the bar, left of Links, cycling Everyone, Mine
+// and Theirs; ANDed with everything else the bar filters by, and placed by `keepingFilterPlace`.
+
+/** The author filter's state, as the button says it: [data-author, aria-pressed]. */
+const authorState = (page) =>
+  [page.el("author-filter").getAttribute("data-author"), page.el("author-filter").getAttribute("aria-pressed")];
+
+/** Open the bar if it is shut, and press the author filter until it says `mode`. */
+async function chooseAuthor(page, mode) {
+  if (page.el("search-field").hidden) await page.el("search-toggle").click();
+  for (let presses = 0; presses < 3 && authorState(page)[0] !== mode; presses += 1) {
+    await page.el("author-filter").click();
+    await page.settle();
+  }
+  assert.equal(authorState(page)[0], mode, `the author filter never reached ${mode}`);
+}
+
+/** The ids of the rows `list` is letting through. */
+const passing = (page, list = "discord-log") => unfiltered(page, list).map((li) => li.getAttribute("data-id"));
+
+/** Twelve messages: every third the owner's, the rest the coding agent's, three about the deploy. */
+function authorChannel() {
+  return Array.from({ length: 12 }, (_unused, i) => {
+    const n = i + 1;
+    const mine = n % 3 === 0;
+    const words = n % 4 === 0 ? `deploy step ${n}` : `message ${n}`;
+    return message({ id: String(n), content: `${words}${n === 6 || n === 7 ? " https://docs.example.com/x" : ""}`,
+      ...(mine ? OWN : CODER) });
+  });
+}
+
+test("`#251 author-filter`: the author filter sits left of Links, only while the bar is open, in the house style, and says each state", async () => {
+  assertMarkupContains("search-float", "author-filter");
+  const bar = HTML_CODE.slice(HTML_CODE.indexOf('id="search-float"'));
+  const at = (id) => bar.indexOf(`id="${id}"`);
+  assert.ok(at("search-count") < at("author-filter") && at("author-filter") < at("links-filter"),
+    "the author filter is not between the count and Links");
+  assert.equal(bar.slice(bar.indexOf("</button>", at("author-filter")) + "</button>".length, at("links-filter")).trim(),
+    "<button", "something stands between the author filter and Links");
+  // An icon per state, each in the house style, and each named for its state.
+  const button = bar.slice(at("author-filter"), bar.indexOf("</button>", at("author-filter")));
+  for (const mode of ["everyone", "mine", "theirs"]) {
+    const from = button.indexOf(`data-author="${mode}" viewBox`);
+    assert.ok(from > 0, `the author filter has no icon for ${mode}`);
+    const svg = button.slice(button.lastIndexOf("<svg", from), button.indexOf(">", from));
+    for (const attribute of ['class="icon author-icon"', 'stroke-width="1.9"', 'stroke-linecap="round"', 'aria-hidden="true"']) {
+      assert.ok(svg.includes(attribute), `the ${mode} icon does not share ${attribute} with the pin`);
+    }
+    assert.match(cssBlock(`#author-filter[data-author="${mode}"] .author-icon[data-author="${mode}"]`), /display:\s*block/,
+      `the ${mode} icon is never drawn`);
+  }
+  assert.match(cssBlock("#author-filter .author-icon"), /display:\s*none/, "every state's icon is drawn at once");
+  // The same square as Links and Pinned, drawn by the same rules, abutting Links.
+  for (const selector of ["#author-filter", "#author-filter::before", "#author-filter .icon"]) {
+    assert.deepStrictEqual(cssRules(CSS, selector), cssRules(CSS, selector.replace("author", "pinned")).slice(0, 1),
+      `${selector} is not drawn by the rule that draws Pinned`);
+  }
+  assert.match(cssBlock("#author-filter + #links-filter"), /margin-left:\s*calc\(-1 \* var\(--bar-gap\)\)/);
+  assert.match(cssBlock("#author-filter[aria-pressed=\"true\"]"), /color: var\(--accent\)/, "a filtering state does not say so");
+
+  const page = newPage();
+  await signIn(page);
+  await showDiscord(page, authorChannel());
+  const filter = page.el("author-filter");
+  assert.equal(filter.hidden, true, "the filter is offered before the search bar is open");
+  await page.el("search-toggle").click();
+  assert.equal(filter.hidden, false, "the open bar has no author filter");
+  const said = [];
+  for (let presses = 0; presses < 3; presses += 1) {
+    await filter.click();
+    await page.settle();
+    said.push([...authorState(page), filter.getAttribute("aria-label")]);
+  }
+  assert.deepStrictEqual(said, [
+    ["mine", "true", "Only your messages. Press for only everyone else's"],
+    ["theirs", "true", "Only everyone else's messages. Press for everyone's"],
+    ["everyone", "false", "Everyone's messages. Press for only yours"],
+  ], "a press does not go round Everyone, Mine and Theirs, saying each");
+  // Over the call view too, where Pinned is not offered; and gone with the bar.
+  await filter.click();
+  await page.el("view-switch").click();
+  await page.settle();
+  assert.equal(filter.hidden, false, "the author filter is not offered over the call view");
+  assert.deepStrictEqual(authorState(page), ["mine", "true"], "switching views changed whose messages are shown");
+  await page.el("view-switch").click();
+  await page.settle();
+  await page.el("search-toggle").click();
+  await page.settle();
+  assert.deepStrictEqual(authorState(page), ["everyone", "false"], "the author filter outlived the bar");
+  assert.equal(filter.hidden, true);
+  assert.equal(unfiltered(page, "discord-log").length, 12, "a row stayed hidden after the filter went");
+  await chooseAuthor(page, "theirs");
+  await page.el("search-field").dispatch("keydown", { key: "Escape" });
+  await page.settle();
+  assert.deepStrictEqual(authorState(page), ["everyone", "false"], "Escape left the author filter on");
+});
+
+test("`#251 author-filter`: Mine with nothing typed is every message of the owner's loaded, Theirs every other, counted", async () => {
+  const page = newPage();
+  await signIn(page);
+  await showDiscord(page, authorChannel());
+  await chooseAuthor(page, "mine");
+  assert.deepStrictEqual(passing(page), ["3", "6", "9", "12"], "Mine is not exactly the owner's messages");
+  assert.equal(page.el("search-count").textContent, "4 of 12 loaded", "Mine with nothing typed says no count");
+  assert.equal(page.el("search-empty").hidden, true);
+  await chooseAuthor(page, "theirs");
+  assert.deepStrictEqual(passing(page), ["1", "2", "4", "5", "7", "8", "10", "11"], "Theirs is not every other message");
+  assert.equal(page.el("search-count").textContent, "8 of 12 loaded");
+  // A person is "them" as much as an agent is.
+  page.messages = [...authorChannel(), message({ id: "13", content: "a person", ...ALICE })];
+  await reReadChannel(page);
+  await page.settle();
+  assert.ok(passing(page).includes("13"), "Theirs left out a message from another person");
+  await chooseAuthor(page, "mine");
+  assert.ok(!passing(page).includes("13"));
+  // A channel where none is the owner's says so, in words that say the list is only what is loaded.
+  page.messages = authorChannel().filter((m) => m.author_id !== OWN.author_id);
+  await reReadChannel(page);
+  await page.settle();
+  assert.deepStrictEqual(passing(page), []);
+  assert.equal(page.el("search-empty").hidden, false, "an empty Mine says nothing about why");
+  assert.equal(page.el("search-empty").textContent, "None of the messages loaded so far are yours.");
+  // THE CONTROL: without the author test in the pass, Mine filters nothing.
+  const unwired = newPage(new Map(), brokenScript(
+    "      const hit = said && (!links || shown > 0) && authorPasses(row, author);",
+    "      const hit = said && (!links || shown > 0);"));
+  await signIn(unwired);
+  await showDiscord(unwired, authorChannel());
+  await chooseAuthor(unwired, "mine");
+  assert.equal(passing(unwired).length, 12, "the test cannot see Mine take anything away");
+});
+
+test("`#251 author-filter`: ANDed with the search text, Links and Pinned, the count speaking for all of them", async () => {
+  const page = newPage();
+  const messages = authorChannel();
+  for (const n of [3, 4, 6]) page.pinned.set(String(n), storedPin(messages[n - 1], n));
+  page.servePinsRevision = true;
+  page.pinsRevision = 3;
+  await signIn(page);
+  await showDiscord(page, messages);
+  await chooseAuthor(page, "mine");
+  await page.el("search-field").setValue("deploy");
+  assert.deepStrictEqual(passing(page), ["12"], "the text and Mine are not both required");
+  assert.equal(page.el("search-count").textContent, "1 of 12 loaded");
+  await page.el("search-field").setValue("step 4");
+  assert.deepStrictEqual(passing(page), []);
+  assert.equal(page.el("search-empty").textContent, "None of the messages of yours loaded so far match that search.");
+  await chooseAuthor(page, "theirs");
+  assert.deepStrictEqual(passing(page), ["4"]);
+  await page.el("search-field").setValue("");
+  // Links: the links of the owner's messages, and of everyone else's.
+  await page.el("links-filter").click();
+  await page.settle();
+  assert.deepStrictEqual(passing(page), ["7"], "Links and Theirs are not both required");
+  await chooseAuthor(page, "mine");
+  assert.deepStrictEqual(passing(page), ["6"], "Links and Mine are not both required");
+  assert.equal(page.el("search-count").textContent, "1 of 12 loaded");
+  await page.el("links-filter").click();
+  await page.settle();
+  // Pinned: the owner's pins, and then everyone else's.
+  await page.el("pinned-filter").click();
+  await page.settle();
+  await page.settle();
+  assert.deepStrictEqual(passing(page, "pinned-log"), ["3", "6"], "Pinned and Mine are not both required");
+  assert.equal(page.el("search-count").textContent, "2 of 3 pinned");
+  await chooseAuthor(page, "theirs");
+  assert.deepStrictEqual(passing(page, "pinned-log"), ["4"]);
+  assert.equal(page.el("search-count").textContent, "1 of 3 pinned");
+  await page.el("search-field").setValue("message");
+  assert.deepStrictEqual(passing(page, "pinned-log"), []);
+  assert.equal(page.el("search-empty").textContent, "None of this channel's pinned messages from anyone else match that search.");
+});
+
+test("`#251 author-filter`: it chooses rows, so Collapse read's runs open under it, and Hide read says why Mine is empty when the owner's own count as read", async () => {
+  const page = newPage();
+  await signIn(page);
+  // The agent's messages read, the owner's own read by the setting: everything but 10 and 11 is read.
+  const messages = authorChannel();
+  for (const m of messages) if (!["10", "11"].includes(m.id) && m.author_id !== OWN.author_id) page.dealtWith.add(m.id);
+  await showDiscord(page, messages);
+  await chooseReadMode(page, "Collapse read");
+  assert.ok(collapsedRows(page).length > 0, "the fixture collapsed nothing");
+  await chooseAuthor(page, "mine");
+  assert.deepStrictEqual(collapsedRows(page), [], "a run stayed collapsed under the author filter");
+  assert.deepStrictEqual(passing(page), ["3", "6", "9", "12"]);
+  await chooseAuthor(page, "everyone");
+  assert.ok(collapsedRows(page).length > 0, "the runs did not collapse again once the filter was off");
+  // Hide read with the owner's messages counted as read: Mine is empty, and says why and how out.
+  await chooseReadMode(page, "Hide read");
+  await page.settle();
+  await chooseAuthor(page, "mine");
+  assert.deepStrictEqual(passing(page), []);
+  assert.equal(page.el("search-empty").hidden, false);
+  assert.equal(page.el("search-empty").textContent,
+    "Your own messages count as read, so Hide read leaves them out — press h for Show read.");
+  await chooseAuthor(page, "theirs");
+  assert.deepStrictEqual(passing(page), ["10", "11"], "Hide read and Theirs are not both applied");
+});
+
+test("`#251 author-filter`: every change keeps the selected message where it is, and one Theirs hides is held by the nearest shown", async () => {
+  const run = async (script) => {
+    const page = newPage(new Map(), script);
+    await signIn(page);
+    await showDiscord(page, placeChannel().map((m, i) => ({ ...m, ...((i + 1) % 3 === 0 ? OWN : CODER) })));
+    await search(page, "");
+    await page.settle();
+    parkAt(page, "24", 170);
+    await clickRow(page, "24");
+    const y = yOf(page, "24");
+    await page.el("author-filter").click();
+    await page.settle();
+    return { page, y };
+  };
+  const { page, y } = await run(SCRIPT);
+  assert.deepStrictEqual(authorState(page)[0], "mine");
+  keptAt(page, "24", y, "Mine on");
+  assert.deepStrictEqual(litIds(page), ["24"]);
+  // THE CONTROL: the same change, not placed, moves the message.
+  const unplaced = await run(brokenScript("  keepingFilterPlace(() => {\n    authorFilter = next;",
+    "  ((change) => change())(() => {\n    authorFilter = next;"));
+  assert.ok(Math.abs(yOf(unplaced.page, "24") - unplaced.y) > 1, "the test cannot see the message jump");
+  // Theirs hides it: the nearest message shown stands where it stood, and the status line says so.
+  await page.el("author-filter").click();
+  await page.settle();
+  const stand = page.el("discord-log").children.find((li) => rowShownHere(li) && Math.abs(yOf(page, li.getAttribute("data-id")) - y) <= 1);
+  assert.ok(stand && ["25", "23"].includes(stand.getAttribute("data-id")),
+    `the message standing in for 24 is ${stand ? stand.getAttribute("data-id") : "none"}`);
+  assert.equal(statusText(page), "Filtered out — the nearest is here.");
+  // ...and Everyone, without a scroll, puts it back where it was.
+  await page.el("author-filter").click();
+  await page.settle();
+  keptAt(page, "24", y, "Everyone again, after Theirs hid it");
+});
+
+/** Whether a row of a list is shown: neither hidden nor filtered out. */
+const rowShownHere = (li) => !li.hidden && !li.hasClass("search-hidden");
+
+test("`#251 author-filter`: Shift+M goes round the states with the bar that holds them, and gives the list back the focus", async () => {
+  const page = await keyboardPage();
+  await press(page, page.el("scroll-area"), "M", { shiftKey: true });
+  assert.deepStrictEqual(authorState(page), ["mine", "true"], "Shift+M did not show only the owner's messages");
+  assert.equal(page.el("search-field").hidden, false, "a filter came on with the bar that holds it shut");
+  assert.equal(focused(page), page.el("scroll-area"), `after Shift+M the focus is on ${focusName(page)}`);
+  await press(page, page.el("scroll-area"), "M", { shiftKey: true });
+  assert.deepStrictEqual(authorState(page), ["theirs", "true"]);
+  await press(page, page.el("scroll-area"), "M", { shiftKey: true });
+  assert.deepStrictEqual(authorState(page), ["everyone", "false"]);
+  // m alone is still the bookmark's.
+  await press(page, page.el("scroll-area"), "m");
+  assert.deepStrictEqual(authorState(page), ["everyone", "false"], "a plain m changed the author filter");
+  assert.ok(KEYMAP_SOURCE_HAS("author-filter"), "the list of keys does not name the author filter's key");
+});
+
+/** Whether the page's table of keys names a control. */
+const KEYMAP_SOURCE_HAS = (id) => SCRIPT_CODE.slice(SCRIPT_CODE.indexOf("const KEYMAP = ["),
+  SCRIPT_CODE.indexOf("];", SCRIPT_CODE.indexOf("const KEYMAP = ["))).includes(`controls: ["${id}"]`);
+
+test("`#251 author-filter`: over the call view Mine is what you said and Theirs what the agent said", async () => {
+  const page = newPage();
+  await signIn(page);
+  await startTalking(page);
+  youSay(page, "is the runner wedged");
+  assistantSays(page, "it restarted at noon");
+  youSay(page, "thanks");
+  await page.settle();
+  await chooseAuthor(page, "mine");
+  assert.deepStrictEqual(unfiltered(page, "transcript").map((li) => li.className), ["mine", "mine"]);
+  assert.equal(page.el("search-count").textContent, "2 of 3 loaded");
+  await chooseAuthor(page, "theirs");
+  assert.deepStrictEqual(unfiltered(page, "transcript").map((li) => li.className), ["theirs"]);
+  assistantSays(page, "anything else?");
+  await page.settle();
+  assert.equal(unfiltered(page, "transcript").length, 2, "a turn arriving under Theirs arrived unfiltered");
+});
+
+test("`#251 author-filter`: in two columns it filters both, and the count speaks for both", async () => {
+  const page = newPage();
+  const data = threadData();
+  // The first thread's answer, and the second thread's root, are the owner's.
+  data.messages[2] = { ...data.messages[2], ...OWN };
+  data.messages[3] = { ...data.messages[3], ...OWN };
+  page.threadingSupported = true;
+  page.threads = data.threads;
+  await signIn(page);
+  await showDiscord(page, data.messages);
+  await twoColumns(page);
+  await threadBadge(rowWithId(page, "201")).click();
+  await page.settle();
+  await chooseAuthor(page, "mine");
+  const visible = (list) => unfiltered(page, list).map((li) => li.getAttribute("data-id"));
+  assert.deepStrictEqual(visible("side-log"), ["202"], "Mine did not reach the right column");
+  assert.deepStrictEqual(visible("discord-log"), ["203"], "Mine did not reach the left column");
+  assert.equal(page.el("search-count").textContent, `2 of ${messageRows(page, "discord-log").length + 2} loaded`,
+    "the count does not speak for both columns");
+  for (const list of ["discord-log", "side-log"]) {
+    const rows = messageRows(page, list);
+    assert.ok(rows.length > 0, `#${list} holds no messages`);
+    for (const li of rows) {
+      assert.equal(rowShownHere(li), li.getAttribute("data-who") === "me", `#${list} shows a row Mine does not keep, or hides one it does`);
+    }
+  }
+});

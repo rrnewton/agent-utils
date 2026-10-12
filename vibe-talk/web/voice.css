@@ -3742,6 +3742,7 @@ body {
    fall off — and what is drawn inside it is the glass's own disc size, so the three read as a set
    on the line. The squares abut: the discs drawn inside them are what the eye separates, and the
    width the gap would have cost is the field's. */
+#author-filter,
 #links-filter,
 #pinned-filter {
   position: relative;
@@ -3757,6 +3758,7 @@ body {
   margin-left: calc(-1 * var(--bar-gap));
 }
 
+#author-filter::before,
 #links-filter::before,
 #pinned-filter::before {
   content: "";
@@ -3766,6 +3768,7 @@ body {
   pointer-events: none;
 }
 
+#author-filter .icon,
 #links-filter .icon,
 #pinned-filter .icon {
   position: relative;
@@ -3786,6 +3789,33 @@ body {
 
 #pinned-filter[aria-pressed="true"] .pin-head {
   fill: currentColor;
+}
+
+/* `#251 author-filter`. Whose messages, left of Links: its square abuts Links' as Pinned's does, on
+   the call view as on the channel, because the two are always up together. Each state draws its own
+   icon, a speech bubble with its tail on the side the messages it keeps are drawn on, both for
+   everyone's; and a state that keeps only some messages is on, in the accent, as Links on is. */
+#author-filter + #links-filter {
+  margin-left: calc(-1 * var(--bar-gap));
+}
+
+#author-filter .author-icon {
+  display: none;
+}
+
+#author-filter[data-author="everyone"] .author-icon[data-author="everyone"],
+#author-filter[data-author="mine"] .author-icon[data-author="mine"],
+#author-filter[data-author="theirs"] .author-icon[data-author="theirs"] {
+  display: block;
+}
+
+#author-filter[aria-pressed="true"] {
+  color: var(--accent);
+}
+
+#author-filter[aria-pressed="true"]::before {
+  background: color-mix(in srgb, var(--accent) 18%, transparent);
+  box-shadow: inset 0 0 0 1px var(--accent);
 }
 
 /* `#211 link-filter`. Links ON in the accent, the colour every other pressed toggle here wears and
