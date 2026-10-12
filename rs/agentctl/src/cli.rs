@@ -1706,6 +1706,7 @@ fn capabilities_document(
             "capabilities": CLOUD_CAPABILITIES
         },
         "headless": null,
+        "build": crate::build_info::document(),
         "services": [{
             "name": "chat-bridge",
             "origin": "built_in",

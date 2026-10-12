@@ -4,6 +4,7 @@
 //! Chat and headless adapters are supplied by the optional runtime extensions.
 
 pub mod agent;
+pub(crate) mod build_info;
 pub(crate) mod chat_events;
 pub mod chat_runtime;
 pub mod chat_service;
