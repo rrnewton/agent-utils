@@ -922,7 +922,7 @@ async fn a_message_nobody_has_answered_heads_its_own_empty_thread_which_its_firs
         .fetch_timeline(&channel(), &request)
         .await
         .expect("the empty thread");
-    assert_eq!(ts_list(&page.messages), [fresh.clone()]);
+    assert_eq!(ts_list(&page.messages), std::slice::from_ref(&fresh));
     assert_eq!(page.messages[0].thread, lone.thread);
     let summary = page.thread.expect("the thread is named");
     assert_eq!(
