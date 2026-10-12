@@ -25018,25 +25018,28 @@ function cardAnchor() {
 
 /**
  * Put the reader back on `anchor` in the cards: the foot, or that card at its height — or, where the
- * filters now hide it, the nearest card shown, in the list's order. Nothing for a card that has gone.
+ * filters now hide it, the nearest card shown, in the list's order. Whether the reader was placed:
+ * not for a card that has gone, nor where no card is shown.
  *
  * @param {{newest: boolean, id: string | null, offset: number} | null} anchor
  */
 function placeCardAnchor(anchor) {
-  if (!anchor) return;
+  if (!anchor) return false;
   const area = leftEl("side-scroll");
   if (anchor.newest) {
     area.scrollTop = area.scrollHeight;
-    return;
+    return true;
   }
   const rows = /** @type {HTMLElement[]} */ ([...leftEl("side-cards").children]);
   const at = rows.findIndex((row) => row.getAttribute("data-id") === anchor.id);
-  if (at < 0) return;
+  if (at < 0) return false;
   let row = rowShown(rows[at]) ? rows[at] : null;
   for (let step = 1; !row && step < rows.length; step += 1) {
     row = [rows[at + step], rows[at - step]].find((one) => one && rowShown(one)) || null;
   }
-  if (row) area.scrollTop += row.getBoundingClientRect().top - area.getBoundingClientRect().top - anchor.offset;
+  if (!row) return false;
+  area.scrollTop += row.getBoundingClientRect().top - area.getBoundingClientRect().top - anchor.offset;
+  return true;
 }
 
 /**
@@ -25086,7 +25089,8 @@ function openSideCards() {
 function placeOpenedCards() {
   const anchor = sideCardPlaces.get(String(el("discord-channel").value));
   sideCardPlaces.delete(String(el("discord-channel").value));
-  placeCardAnchor(anchor && !anchor.newest ? anchor : { newest: true, id: null, offset: 0 });
+  // The foot, too, when the card the reader was on has gone.
+  if (!(anchor && !anchor.newest && placeCardAnchor(anchor))) placeCardAnchor({ newest: true, id: null, offset: 0 });
 }
 
 /**
