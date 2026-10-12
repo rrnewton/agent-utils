@@ -1747,15 +1747,24 @@ fn add_capabilities(value: &mut serde_json::Value) {
         for value in values {
             add_capabilities(value);
         }
-    } else if value.get("adapter").is_some() && value.get("name").is_some() {
-        let adapter = value["adapter"].as_str();
+    } else if value.get("name").is_some()
+        && (value.get("adapter").is_some() || value.get("launch").is_some_and(Value::is_object))
+    {
+        // A nested agentctl-session/v2 or v3 row keeps its launch fields under `launch`.
+        let launch = if value.get("adapter").is_some() {
+            &*value
+        } else {
+            &value["launch"]
+        };
+        let interactive = launch["mode"] == "interactive" && launch["backend"] == "herdr";
+        let adapter = launch["adapter"].as_str().map(str::to_owned);
+        let adapter = adapter.as_deref();
         value["capabilities"] = if adapter == Some("agentcloud") {
             json!(CLOUD_CAPABILITIES)
         } else if matches!(
             adapter,
             Some("herdr" | "herdr-pane" | "herdr-foreign" | "herdr-relay")
-        ) && value["mode"] == "interactive"
-            && value["backend"] == "herdr"
+        ) && interactive
         {
             let mut capabilities = vec![
                 "send",

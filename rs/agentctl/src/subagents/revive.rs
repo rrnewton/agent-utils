@@ -337,8 +337,10 @@ fn artifact_bytes(pinned: &PinnedAgentDirectory, file_name: &str) -> Result<Vec<
 fn read_record_at(path: &Path, name: &str) -> Result<(PinnedAgentDirectory, AgentRecord, Vec<u8>)> {
     let pinned = pin_directory(path, name)?;
     let bytes = artifact_bytes(&pinned, "agent.json")?;
-    let record: AgentRecord =
-        serde_json::from_slice(&bytes).map_err(|_| fail("invalid staged revive record"))?;
+    let record = match nested::decode_bytes(&bytes, &path.join("agent.json")) {
+        Some(record) => record?,
+        None => serde_json::from_slice(&bytes).map_err(|_| fail("invalid staged revive record"))?,
+    };
     record.validate_loaded(&path.join("agent.json"), name)?;
     Ok((pinned, record, bytes))
 }
@@ -441,8 +443,11 @@ fn stopped_artifact(registry: &Path, journal: &Journal) -> Result<(AgentRecord, 
     if digest(&bytes) != journal.stopped_record_sha256 {
         return Err(fail("prepared stopped revive record changed"));
     }
-    let record: AgentRecord = serde_json::from_slice(&bytes)
-        .map_err(|_| fail("invalid prepared stopped revive record"))?;
+    let record = match nested::decode_bytes(&bytes, &operation.path.join("stopped.json")) {
+        Some(record) => record?,
+        None => serde_json::from_slice(&bytes)
+            .map_err(|_| fail("invalid prepared stopped revive record"))?,
+    };
     record.validate_loaded(&operation.path.join("stopped.json"), &journal.name)?;
     if record.token != journal.old_token
         || record.lifecycle != "stopped"
@@ -525,11 +530,12 @@ struct LaunchPlan {
 }
 
 fn conversation(record: &AgentRecord) -> Result<NativeSession> {
-    if record.session_agent.is_some() != record.session_value.is_some()
-        || record
-            .session_agent
-            .as_deref()
-            .is_some_and(|agent| agent != record.harness)
+    if !record.session_asserted()
+        && (record.session_agent.is_some() != record.session_value.is_some()
+            || record
+                .session_agent
+                .as_deref()
+                .is_some_and(|agent| agent != record.harness))
     {
         return Err(fail(
             "recorded native conversation provider is incomplete or conflicts with the harness",
@@ -1334,8 +1340,12 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
             artifacts.insert(entry.clone(), artifact_bytes(&held, entry)?);
         }
         if let Some(bytes) = artifacts.get("stopped.json") {
-            let stopped: AgentRecord = serde_json::from_slice(bytes)
-                .map_err(|_| fail("invalid orphaned stopped record"))?;
+            let stopped: AgentRecord =
+                match nested::decode_bytes(bytes, &operation.join("stopped.json")) {
+                    Some(record) => record?,
+                    None => serde_json::from_slice(bytes)
+                        .map_err(|_| fail("invalid orphaned stopped record"))?,
+                };
             stopped.validate_loaded(&operation.join("stopped.json"), &old.name)?;
             let mut expected = old.clone();
             expected.lifecycle = "stopped".to_owned();
@@ -1558,7 +1568,11 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
         let pinned = self.pinned_agent_directory(agent_name)?;
         let original = self.record_bytes(&pinned)?;
         let snapshot: AgentRecord =
-            serde_json::from_slice(&original).map_err(|_| fail("invalid revive source record"))?;
+            match nested::decode_bytes(&original, &pinned.path.join("agent.json")) {
+                Some(record) => record?,
+                None => serde_json::from_slice(&original)
+                    .map_err(|_| fail("invalid revive source record"))?,
+            };
         if snapshot != record {
             return Err(fail("revive source record changed during preflight"));
         }
@@ -1612,6 +1626,8 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
             .as_secs_f64();
         let new_token = new_journal_id()?;
         let mut candidate = record.clone();
+        // The new generation is a flat schema-1 record whatever form the old one had.
+        candidate.nested = None;
         candidate.storage_directory = Some(StorageDirectory {
             path: new_path,
             device: new_directory.device,

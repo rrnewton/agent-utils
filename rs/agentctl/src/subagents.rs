@@ -32,6 +32,7 @@ use crate::error::{AdapterError, AdapterErrorKind};
 use crate::submission::{GuardedInput, GuardedPrompt, Submission, SubmitTimeouts};
 
 mod cloud;
+mod nested;
 mod revive;
 mod stop_advice;
 
@@ -1600,6 +1601,9 @@ struct AgentRecord {
     /// Private launch storage; serialized records cannot request another write directory.
     #[serde(skip)]
     storage_directory: Option<StorageDirectory>,
+    /// The nested v2/v3 row this record was decoded from and is written back as.
+    #[serde(skip)]
+    nested: Option<nested::NestedRecord>,
     #[serde(default = "herdr_adapter")]
     adapter: String,
     #[serde(default = "interactive_mode")]
@@ -1982,10 +1986,11 @@ impl AgentRecord {
                 self.name
             )));
         }
+        let (session_agent, session_value) = self.routing_session();
         Ok(Target {
             pane_id: self.pane_id.clone(),
-            session_agent: self.session_agent.clone(),
-            session_value: self.session_value.clone(),
+            session_agent,
+            session_value,
             expected_agent: Some(self.harness.clone()),
             expected_cwd: Some(PathBuf::from(&self.cwd)),
             expected_workspace: None,
@@ -2319,7 +2324,7 @@ impl<'a, A: ManagedApi + ?Sized> WorkspaceClient<'a, A> {
             }
             return Ok(());
         }
-        if record.session_value.is_some() {
+        if record.observed_session_value().is_some() {
             return Ok(());
         }
         Err(AdapterError::recipient_changed(format!(
@@ -2345,7 +2350,7 @@ impl<'a, A: ManagedApi + ?Sized> WorkspaceClient<'a, A> {
 /// Does the pane still report the observed native session, provider and id, this record
 /// holds? A record without one has nothing to compare.
 fn session_matches(record: &AgentRecord, info: &AgentPaneInfo) -> bool {
-    let Some(recorded) = record.session_value.as_deref() else {
+    let Some(recorded) = record.observed_session_value() else {
         return true;
     };
     info.session_value.as_deref() == Some(recorded)
@@ -4481,18 +4486,12 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
         agent::validate_private_directory(&directory, "agent directory", false)?;
         let path = directory.join("agent.json");
         let document = agent::read_private_json(&path)?;
-        if let Some(schema) = document
-            .get("schema")
-            .and_then(Value::as_str)
-            .filter(|schema| schema.starts_with("agentctl-session/"))
-        {
-            return Err(fail(format!(
-                "agent record {} uses the nested {schema} format, which only the Python edition of agentctl reads; inspect or stop it with that edition",
-                path.display()
-            )));
-        }
-        let record: AgentRecord = serde_json::from_value(document)
-            .map_err(|error| fail(format!("invalid agent record {}: {error}", path.display())))?;
+        let record = match nested::decode(&document, &path) {
+            Some(record) => record?,
+            None => serde_json::from_value(document).map_err(|error| {
+                fail(format!("invalid agent record {}: {error}", path.display()))
+            })?,
+        };
         record.validate_loaded(&path, agent_name)?;
         Ok(record)
     }
@@ -4554,8 +4553,12 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
     ) -> Result<ManagedRecordSnapshot> {
         let path = pinned.path.join("agent.json");
         let content = self.record_bytes(pinned)?;
-        let record: AgentRecord = serde_json::from_slice(&content)
-            .map_err(|error| fail(format!("invalid agent record {}: {error}", path.display())))?;
+        let record = match nested::decode_bytes(&content, &path) {
+            Some(record) => record?,
+            None => serde_json::from_slice(&content).map_err(|error| {
+                fail(format!("invalid agent record {}: {error}", path.display()))
+            })?,
+        };
         record.validate_loaded(&path, &pinned.name)?;
         if record.token != expected_token {
             return Err(fail(format!(
@@ -4578,8 +4581,12 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
     ) -> Result<DeadAdoptionSnapshot> {
         let (content, record_identity) = self.record_bytes_with_identity(pinned, true)?;
         let path = pinned.path.join("agent.json");
-        let record: AgentRecord = serde_json::from_slice(&content)
-            .map_err(|error| fail(format!("invalid agent record {}: {error}", path.display())))?;
+        let record = match nested::decode_bytes(&content, &path) {
+            Some(record) => record?,
+            None => serde_json::from_slice(&content).map_err(|error| {
+                fail(format!("invalid agent record {}: {error}", path.display()))
+            })?,
+        };
         record.validate_loaded(&path, &pinned.name)?;
         if record.token != expected_token {
             return Err(fail(format!(
@@ -4626,7 +4633,7 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
         }
         agent::atomic_json(
             &self.directory(&record.name)?.join("agent.json"),
-            &json!(record),
+            &record.document()?,
         )
     }
 
@@ -5120,6 +5127,8 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
         let _lock = self.lock(agent_name)?;
         let _identity_lock = self.identity_lock()?;
         let mut record = self.load(agent_name)?;
+        // Anchors live only in flat schema-1 records, so a nested row is rewritten in that form.
+        let migrated_from = record.migrate_nested_to_flat();
         if !matches!(record.adapter.as_str(), "herdr" | "herdr-foreign") {
             return Err(fail(
                 "anchor applies to native and adopted Herdr agents; custom panes pin their process at launch",
@@ -5171,8 +5180,7 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
             "harness_pid": harness.pid,
             "replaced": changed,
             "previous": previous,
-            // This edition reads only schema-1 records, so it never migrates one.
-            "migrated_from": Value::Null,
+            "migrated_from": migrated_from,
         }))
     }
 
@@ -5203,6 +5211,7 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
             return self.finish_rename(found, true);
         }
         let record = self.load(old)?;
+        record.refuse_nested_rename()?;
         if !matches!(record.adapter.as_str(), "herdr" | "herdr-foreign")
             || record.lifecycle != "running"
         {
@@ -5714,7 +5723,7 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
                 findings.push("harness-replaced");
             }
         } else if matches!(record.adapter.as_str(), "herdr" | "herdr-foreign")
-            && record.session_value.is_none()
+            && record.observed_session_value().is_none()
         {
             findings.push("unanchored");
         }
@@ -6047,6 +6056,7 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
             .map_err(|error| fail(error.to_string()))?;
         let mut record = AgentRecord {
             storage_directory: None,
+            nested: None,
             adapter: if relay_command.is_some() {
                 "herdr-relay".to_owned()
             } else if options.harness == "muse" {
@@ -6409,6 +6419,7 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
             .map_err(|error| fail(error.to_string()))?;
         let mut record = AgentRecord {
             storage_directory: None,
+            nested: None,
             adapter: "herdr-foreign".to_owned(),
             mode: interactive_mode(),
             backend: herdr_adapter(),
@@ -7314,7 +7325,7 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
             return self.cloud_status_record(record, &mut cloud::FleetCache::new());
         }
         let agent_name = &record.name;
-        let mut result = json!(record);
+        let mut result = record.document()?;
         result["queue"] = json!(self.queue(agent_name)?);
         result["output"] = json!(self.directory(agent_name)?.join("output.json"));
         result["goal_source"] = if record.goal.is_some() {
@@ -7827,7 +7838,7 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
         }
         // Session metadata is optional in Herdr. This is an explicit caller
         // assertion anchored to the independently verified live name and pane.
-        record.goal_session_id = Some(session_id.to_owned());
+        record.bind_asserted_session(session_id);
         if record.native_session.is_none() {
             record.native_session =
                 Some(NativeSession::new(&record.harness, session_id, "asserted"));
@@ -9103,8 +9114,7 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
         }
         let mut final_record = final_snapshot.record;
         final_record.lifecycle = "stopped".to_owned();
-        let mut stopped_bytes = serde_json::to_vec_pretty(&final_record)
-            .map_err(|error| fail(format!("cannot serialize agent record: {error}")))?;
+        let mut stopped_bytes = final_record.document_pretty_bytes()?;
         stopped_bytes.push(b'\n');
         if stopped_bytes.len() > MAX_AGENT_RECORD_BYTES {
             return Err(fail(format!(
@@ -9276,7 +9286,9 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
             None
         };
         let confirmed_record = self.load_with_stop_advice(agent_name, Some(&mut *recovery))?;
-        if confirmed_record.token != record.token || json!(confirmed_record) != json!(record) {
+        if confirmed_record.token != record.token
+            || confirmed_record.document()? != record.document()?
+        {
             return Err(fail(format!(
                 "agent {agent_name:?} record changed before stop"
             )));
@@ -14300,7 +14312,7 @@ pub(crate) mod tests {
         assert!(row["probe_error"]
             .as_str()
             .unwrap()
-            .contains("nested agentctl-session/v3 format"));
+            .contains("invalid agent record agentctl-session/v3 fields"));
     }
 
     #[test]
@@ -15590,6 +15602,8 @@ pub(crate) mod tests {
     mod identity;
     /// Muse 1.4 paused, idle, staged and working status, and the input each one admits.
     mod muse_status;
+    /// Nested agentctl-session/v2 and v3 rows: decode, write-back and anchor migration.
+    mod nested;
     /// Recorded conversation and launch policy, with no status-time mutation.
     mod recovery_metadata;
     /// Resume recovery, immutable planning, exact publication and crash reconciliation.

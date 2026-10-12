@@ -1004,6 +1004,7 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
             .map_err(|error| fail(error.to_string()))?;
         let record = AgentRecord {
             storage_directory: None,
+            nested: None,
             adapter: CLOUD_HARNESS.to_owned(),
             mode: interactive_mode(),
             backend: herdr_adapter(),
