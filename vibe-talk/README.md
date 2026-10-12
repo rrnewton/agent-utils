@@ -447,6 +447,24 @@ another message or leaving Read aborts the fetch, and closing that response is w
 server to interrupt the agent. A browser without streamed `fetch` bodies or Web Audio falls back to
 `<audio>`. `make -C vibe-talk read-aloud-browser` times tap to audible in a real Chromium against
 audio streamed at speaking pace, with that `<audio>` fallback as its negative control.
+
+A tap never waits for the whole screen to be prepared (`#191 read-aloud-first-lag`). Turning Read
+on prepares every visible message in the background. A tap on a row that is not ready yet sends a
+prepare request for that row alone and starts reading it, and the rest of the screen keeps
+preparing behind it.
+
+On the server, preparation first looks at messages fetched for the page in the last 30 seconds,
+kept in memory. It fetches only what is missing:
+
+- outside a thread, one window per channel, shared by preparations that miss at the same time;
+- in a thread, the missing messages, four at a time.
+
+The provider warm-up starts at the top of a preparation and is not awaited. Each preparation logs
+one content-free `read-aloud preparation` line with its phases (`lookup_ms`, `fetch_ms`,
+`normalize_ms`, `preparation_ms`, and whether it started the warm-up). The warm-up logs its own
+`warm_up_ms` when it ends. A read's audio opens with silence, which `playing` already counts as
+audible. So where the page plays through Web Audio, its playback report also carries
+`tap_to_speech_ms`: the time to the first sample loud enough to be speech.
 `GET /api/v1/client-config` reports the selected backend and playback mode. Rust handlers depend on
 `speech::SpeechProvider`; vendor credentials and API details stay in its adapter.
 
@@ -1565,7 +1583,11 @@ How a deployment with several providers behaves:
 ## Durable state
 
 Almost nothing in this server is remembered. A channel is never cached as a channel: every
-question is a fresh Discord fetch, and it stays that way. There is exactly one store,
+question is a fresh Discord fetch, and it stays that way. The one short-lived exception is not
+durable at all. Messages fetched for the page in the last 30 seconds are kept in memory, so that
+preparing them for read-aloud does not fetch them again (`#191 read-aloud-first-lag`,
+`src/read_ahead.rs`). Nothing else reads them, a restart forgets them, and the storage purge clears
+them. There is exactly one store,
 `src/store/`, and it holds these:
 
 * the `/voice` **conversation transcript** — what you said and what the agent said back;
@@ -5398,7 +5420,9 @@ Beyond the security list above:
   warns, and it says so on the page — but the cache stays empty forever and there is no reduced
   service to fall back on. `summaries.model` is still recorded in the cache key and read by
   nothing, which is the last vestige of a selector that no longer exists.
-* No caching of channel content: every question is a fresh Discord fetch. Obeying `Retry-After`
+* No caching of channel content: every question is a fresh Discord fetch. The one exception is
+  thirty seconds long. Read-aloud preparation reuses, from memory, messages the page fetched in
+  the last 30 seconds (`#191 read-aloud-first-lag`). Obeying `Retry-After`
   does not change that — it buys time, not quota, so a poll interval still spends one request per
   channel whether or not anybody is listening. That is why `discord.live_poll_seconds` still
   defaults to OFF and why an interval under five seconds is still refused outright rather than

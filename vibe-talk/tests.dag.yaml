@@ -250,7 +250,8 @@ steps:
 
   # `#7 read-aloud-latency` in the browser engine: a prepared read audible within a second of the
   # tap while its audio arrives at speaking pace, a switch and a stop closing the response, and
-  # only a read heard to its end archived. The `<audio src>` control must take seconds.
+  # only a read heard to its end archived. The `<audio src>` control must take seconds. A read that
+  # opens with silence reports when speech began as well (`#191 read-aloud-first-lag`).
   - group: check
     job: read-aloud-browser
     desc: read-aloud tap to audible in current Chromium, with an <audio> negative control
