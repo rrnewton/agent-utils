@@ -1223,7 +1223,6 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn a_failure_is_logged_recorded_and_retried_after_a_growing_wait() {
-        let logs = crate::testing::LogCapture::info_only();
         let fake = Arc::new(FakeDiscord::new());
         fake.enable_upstream_clear();
         let store = Arc::new(FakeStore::new());
@@ -1242,11 +1241,20 @@ mod tests {
         let setting = &store.upstream_clear_settings().await.expect("read")[0];
         assert_eq!(setting.failures, 1);
         assert!(clearer.candidates.status(&agents()).retry_at_ms.is_some());
+        // The failure is checked where it is recorded, not in a captured log. A per-thread log
+        // capture loses events when another test thread registers the same callsite first
+        // (`tracing` caches each callsite's interest process-wide), so under the full suite's
+        // parallel load the log line was missing about half the time though the push had failed.
+        // The recorded attempt is what Settings shows and what the log line is written from.
+        let last = setting
+            .last
+            .as_ref()
+            .expect("the failed attempt is recorded");
         assert!(
-            logs.text()
-                .contains("failed: chat request failed: bridge restarting"),
-            "{}",
-            logs.text()
+            last.error
+                .as_deref()
+                .is_some_and(|error| error.contains("bridge restarting")),
+            "{last:?}"
         );
         // The first retry waits at least 30 s, not the 5 s quiet period.
         pass(25).await;
