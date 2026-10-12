@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "herdr-run"
-version = "0.3.0"
+version = "0.4.0"
 description = "Run allowlisted shell commands through Herdr panes and collect audited results."
 readme = "README.md"
 requires-python = ">=3.10"

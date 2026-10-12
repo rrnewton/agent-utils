@@ -94,7 +94,7 @@ herdr-run userguide                # this document
 | Option | Effect |
 | --- | --- |
 | `--config PATH` | Use an explicit configuration file instead of the discovered one. Refused by `init`, `quickstart`, and `userguide`, which read no configuration file at all. |
-| `--agent NAME` | The agent this invocation speaks for; names its tab. Otherwise the first of `$HERDR_RUN_AGENT`, `$DG_AGENT_NAME`, and `$ORC_AGENT_NAME` that is non-empty once Unicode white space is trimmed from both ends (so a variable holding only U+3000 or U+00A0 is skipped like an empty one), else `unknown-agent`. An agent name, from the option or a variable, may contain no control character and no invisible character (a format character such as U+200B or U+202E, or a space other than U+0020); one that does is a configuration error (78). So is a variable that is not valid UTF-8, rather than being skipped, so an invocation never speaks for the next variable's agent by accident. Refused by `check`, `init`, `reap`, `quickstart`, and `userguide`, which name no tab. |
+| `--agent NAME` | The agent this invocation speaks for; names its tab. Otherwise the first of `$HERDR_RUN_AGENT`, `$DG_AGENT_NAME`, and `$ORC_AGENT_NAME` that is non-empty once Unicode white space is trimmed from both ends (so a variable holding only U+3000 or U+00A0 is skipped like an empty one), else `unknown-agent`. An agent name, from the option or a variable, may contain no control character and no invisible character (a format character such as U+200B or U+202E, a default-ignorable code point such as U+034F or U+FE0F, a blank such as U+2800 or U+3164, or a space other than U+0020, as listed for policy names under the configuration file); one that does is a configuration error (78). So is a variable that is not valid UTF-8, rather than being skipped, so an invocation never speaks for the next variable's agent by accident. Refused by `check`, `init`, `reap`, `quickstart`, and `userguide`, which name no tab. |
 | `--json` | Emit machine-readable output where the subcommand has one. Refused by `net-doctor`, `quickstart`, and `userguide`, whose only output is prose. `config`, `target`, and `reap` print JSON with or without it. |
 | `--version` | Print the version and exit. |
 | `--dump-surface` | Print every subcommand and option, with the value each option takes, as JSON, and exit. Meant for tools that check the command-line surface. |
@@ -154,13 +154,26 @@ value from overflowing a platform clock into an accidental unbounded wait. On th
 (`10`, `2.5`, `1e3`). Whitespace, underscores, and other scripts' digits are refused.
 
 When stdout cannot be written — a full disk, a reader that went away — `herdr-run` says
-`herdr-run: cannot write stdout: <reason>` on stderr and exits `1`. A standard descriptor that was
-closed before `herdr-run` started reads as `/dev/null`. An interrupt (Ctrl-C) ends `herdr-run` by
-the signal itself, so a calling loop sees an interrupted process rather than an exit status.
+`herdr-run: cannot write stdout: <reason>` on stderr and exits `1`, and nothing else: output is
+never left in a buffer to be retried at exit. A stderr that cannot be written is ignored. A
+standard descriptor that was closed before `herdr-run` started reads as `/dev/null`. An interrupt
+(Ctrl-C) ends `herdr-run` by the signal itself, even one that arrives while it is still starting,
+so a calling loop sees an interrupted process rather than an exit status. A `SIGCHLD` that the
+caller left ignored is put back to its default first, so the exit status of every process
+`herdr-run` starts is read, never assumed.
+
+Processes `herdr-run` starts itself (Herdr, `git check-ignore` to check the spool, the direct
+`net-doctor` probe) are executed directly: a file the kernel cannot execute, such as a script with
+no `#!` line, is reported as `Exec format error (os error 8)`, never run through `/bin/sh`.
 
 Quoted values in diagnostics (`program "curl" is not allowlisted`, `got "maybe"`) are written with
 printable ASCII as is, `\n`, `\r`, and `\t` as escapes, and every other character as `\u{hex}`,
-so a message never writes a bidirectional override or a line separator to the terminal raw.
+so a message never writes a bidirectional override or a line separator to the terminal raw. What
+Herdr says when a call fails is quoted the same way whenever it holds a line break, a control, or
+an invisible character. JSON output, from `config`, `--json`, and the files `herdr-run` writes,
+escapes DEL, the C1 controls, and every invisible character as `\uXXXX` too, although JSON does
+not require it, so a project path holding U+009B or U+202E cannot reach a terminal through
+`herdr-run config`; any JSON reader gets the same strings back.
 
 ---
 
@@ -215,7 +228,10 @@ float (`.inf` and `.nan` are refused); everything else is a string. So `yes`, `o
 schema has no form for. `!!int`, `!!bool`, and `!!null` accept exactly those spellings, `!!float`
 any decimal number (`!!float 007` is 7.0), and `!!str` anything. Refused, each with its own
 message and a line and column (`<file>: invalid YAML: <what> at line L column C`): anchors and
-aliases, block scalars (`|`, `>`), explicit `?` keys, plain or quoted scalars that continue onto
+aliases, block scalars (`|`, `>`), explicit `?` keys (and, inside a flow collection, any plain
+scalar starting with `?`, which YAML 1.1 reads as an explicit key and YAML 1.2 as text), a `:`
+followed by text at the start of a later line than its plain flow-mapping key (`{x` then `:y` on
+the next line, which readers split differently), plain or quoted scalars that continue onto
 another line, any other tag or directive, a second document, keys that are not strings, merge keys,
 non-finite numbers, a tab outside a quoted scalar or a comment, a raw U+0085, U+2028, or U+2029
 anywhere in the file (YAML 1.1 reads each as a line break and YAML 1.2 does not, so the file would
@@ -223,13 +239,47 @@ mean different things to different readers; write `\N`, `\L`, or `\P` in a doubl
 to mean one), and collections nested more than 128 levels deep.
 
 Every name the policy compares with what is typed -- `workspace`, `tab_name`, and every entry and
-key of `allow`, `prefixes`, `deny_global`, `deny_subcommand`, `deny_anywhere`, `allow_subcommand`,
-`value_options`, and `shells` -- may contain no invisible character: no format character (U+200B
-zero-width space, U+FEFF byte-order mark, U+202E right-to-left override, and the rest of Unicode
-category Cf) and no space other than U+0020 (U+00A0, U+2028, U+3000, and the rest). A deny entry
-that looks like `-c` but ends in an invisible character would never match the `-c` it appears to
-deny, so it is a configuration error (78) instead. Visible non-ASCII names such as `café` are
-fine, and so is an invisible character in a value that is not a name, such as `prompt_tail`.
+key of `allow`, `prefixes`, `deny_global`, `deny_subcommand`, `deny_anywhere`,
+`deny_subcommand_option`, `allow_subcommand`, `value_options`, and `shells` -- may contain no
+invisible character. That is, written out in both editions rather than taken from a Unicode
+library: every format character (U+200B zero-width space, U+FEFF byte-order mark, U+202E
+right-to-left override, and the rest of Unicode category Cf); every default-ignorable code point
+(Unicode 16.0's `Default_Ignorable_Code_Point`: the combining grapheme joiner U+034F, the
+variation selectors U+FE00..U+FE0F and U+E0100..U+E01EF, the Mongolian free variation selectors,
+the Khmer inherent vowels U+17B4 and U+17B5, and the code points reserved for more of the same,
+such as U+2065 and the unassigned rest of U+E0000..U+E0FFF); the characters that draw as blank
+space, U+2800 braille pattern blank and the Hangul fillers U+115F, U+1160, U+3164, and U+FFA0; and
+every space other than U+0020 (U+00A0, U+2028, U+3000, and the rest). A deny entry that looks like
+`-c` but ends in an invisible character would never match the `-c` it appears to deny, so it is a
+configuration error (78) instead. Visible non-ASCII names such as `café` are fine, and so is an
+invisible character in a value that is not a name, such as `prompt_tail`.
+
+How a deny entry matches. A denied option is refused written out, with an attached value
+(`--upload-pack=CMD`), and in two more spellings, wherever its rule applies:
+
+- **A long option also matches every abbreviation of it**: `--upload-pac=CMD`, `--upload-p CMD`,
+  even `--u`. Git's option parser accepts any prefix of a long option that is unambiguous among the
+  options of the subcommand at hand, and which prefixes those are depends on the subcommand and the
+  Git version, so herdr-run refuses every prefix rather than guess. An option that merely starts
+  the same way is a different option and is not refused for it: `--exec-path` is not `--exec`, and
+  `--upload-packs` is not `--upload-pack`. Spell an option out in full if its abbreviation happens
+  to be refused.
+- **A one-letter short option also matches anywhere in a cluster of short options**, with or
+  without an attached value: a denied `-u` refuses `-qu/tmp/x`, and a denied `-Z` refuses `-Zfoo`,
+  `-Z=foo`, and `-qZfoo`. This is deliberately fail-closed: an argument after the subcommand that
+  starts with `-` and holds the letter is refused too.
+
+Where a rule applies: `deny_global` among the options before the program's subcommand (for
+`cargo`, which accepts them on either side, everywhere); `deny_anywhere` in every argument;
+`deny_subcommand_option` (program, then subcommand, then options) in every argument after that
+one subcommand, for an option that names a program only there -- `git clone -u CMD` is
+`--upload-pack`, while `git push -u` is not; and `deny_subcommand` on the subcommand itself, which
+is the first argument that is not an option or the value of a `value_options` entry. The
+generated `.herdr-run.yaml` lists the defaults, among them `--exec` (the older spelling of
+`--upload-pack` and `--receive-pack`, and the program `git archive --remote` runs) anywhere,
+`git clone -u`, `git rebase -x`, and `git difftool -x`/`--extcmd`, and every top-level Git option
+that takes the next argument as its value (`--attr-source`, `--shallow-file`, and
+`--super-prefix` among them), so that `git --attr-source HEAD daemon` is read as `git daemon`.
 
 The directory a command runs from, `HOME` when a command uses `~`, and the agent variables must be
 valid UTF-8; otherwise herdr-run stops with a configuration error rather than converting them
