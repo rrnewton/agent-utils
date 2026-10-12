@@ -394,6 +394,7 @@ body {
 .messages li[data-links-view="true"] > .msg-text,
 .messages li[data-links-view="true"] > .summary,
 .messages li[data-links-view="true"] > .reactions,
+.messages li[data-links-view="true"] > .elided,
 .messages li[data-links-view="true"] .fold {
   display: none !important;
 }
@@ -2773,6 +2774,19 @@ body {
   -webkit-line-clamp: 3;
   line-clamp: 3;
   overflow: hidden;
+}
+
+/* `#244 elision-word-count`. What the fold is keeping back, "(~240 more words)", on the line under
+   the clamped text: the clamp ends that text with its own ellipsis, and this continues it. Quiet,
+   like the fold control it belongs with — it is a measure of the message, not a part of it — and
+   never wrapped, so a narrow bubble cannot break the count from its word. web/voice.js hides it
+   whenever the message is open or a summary stands in for its lines. */
+.elided {
+  margin-top: 0.1rem;
+  color: var(--muted);
+  font-size: 0.75rem;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
 }
 
 /* Sized like `.seam-info` and `.chip`: a quiet control on the metadata row, not a second action

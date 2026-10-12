@@ -2115,6 +2115,36 @@ def _act_nested_lists(driver: Driver) -> None:
     driver.settle(300)
 
 
+
+# `#244 elision-word-count`. The folded messages on screen, each tagged with the count under it, the
+# largest and the smallest of them named so the expectations can say which is which.
+ELISION_PROBES_JS = (
+    "(() => { const rows = [...document.querySelectorAll('#discord-log > li')].filter((n) => "
+    "n.getAttribute('data-collapsed') === 'true' && n.querySelector(':scope > .elided')); "
+    "const count = (n) => Number((/\\d+/.exec(n.querySelector(':scope > .elided').textContent) "
+    "|| ['0'])[0]); "
+    "if (rows.length < 2) return false; rows.sort((a, b) => count(a) - count(b)); "
+    "rows[0].id = 'elision-probe-small'; rows[rows.length - 1].id = 'elision-probe-large'; "
+    "return true; })()"
+)
+
+
+def _act_elision_word_count(driver: Driver) -> None:
+    """`#244 elision-word-count`: the channel as it opens, its long messages folded with a count.
+
+    The seeded backlog's newest page holds a message barely over the fold and the long one this
+    project exists for, so the picture is the difference the owner asked to see: a handful of words
+    hidden under one, a wall under the other. Both are brought onto the screen together.
+    """
+    _act_open_channel(driver)
+    driver.js(ELISION_PROBES_JS)
+    driver.js(
+        "(() => { const small = document.getElementById('elision-probe-small'); "
+        "if (small) small.scrollIntoView({ block: 'start' }); return true; })()"
+    )
+    driver.settle(300)
+
+
 def _act_reply_view(driver: Driver) -> None:
     _act_whole_channel(driver)
     # Park in the middle of the channel, and record it. The round trip below is then a MEASURED
@@ -4619,6 +4649,47 @@ SCENES: tuple[Scene, ...] = (
             (
                 "nothing runs off the side of the screen",
                 "document.scrollingElement.scrollWidth <= innerWidth",
+            ),
+        ),
+    ),
+    Scene(
+        name="49-elision-word-count",
+        what="folded messages ending with how many words the fold hides: a few under one, a wall under another",
+        act=_act_elision_word_count,
+        profiles=("android-412", "laptop-1280"),
+        expect=(
+            ("the Discord pane is up", "window.__visible('pane-discord')"),
+            (
+                "a message barely over the fold and a long one are both on screen, folded",
+                "(() => { const ids = ['elision-probe-small', 'elision-probe-large']; "
+                "return ids.every((id) => { const r = document.getElementById(id); "
+                "if (!r || r.getAttribute('data-collapsed') !== 'true') return false; "
+                "const b = r.getBoundingClientRect(); return b.top >= 0 && b.bottom <= innerHeight; }); })()",
+            ),
+            (
+                "each says how many words it hides, in the form '(~N more words)'",
+                "['elision-probe-small', 'elision-probe-large'].every((id) => "
+                "/^\\(~\\d+ more words?\\)$/.test(document.querySelector(`#${id} > .elided`).textContent))",
+            ),
+            (
+                # The difference the owner could not see: tens of words under one, hundreds under the
+                # other.
+                "the counts tell a few hidden words from a wall of them",
+                "(() => { const n = (id) => Number(/\\d+/.exec(document.querySelector(`#${id} > .elided`)"
+                ".textContent)[0]); return n('elision-probe-small') < 60 && n('elision-probe-large') >= 100; })()",
+            ),
+            (
+                # THE layout claim the page suite cannot make: the count is drawn, on one line, under
+                # the clamped text and inside its row.
+                "the count is one line under the clamped text, inside its row",
+                "['elision-probe-small', 'elision-probe-large'].every((id) => { "
+                "const row = document.getElementById(id); const label = row.querySelector(':scope > .elided'); "
+                "const body = row.querySelector(':scope > .body').getBoundingClientRect(); "
+                "const l = label.getBoundingClientRect(), r = row.getBoundingClientRect(); "
+                "const line = parseFloat(getComputedStyle(label).lineHeight) || 1.6 * parseFloat("
+                "getComputedStyle(label).fontSize); "
+                "return l.height > 0 && l.height <= line + 1 && l.top >= body.bottom - 0.5 "
+                "&& l.left >= r.left - 0.5 && l.right <= r.right + 0.5 && l.bottom <= r.bottom + 0.5; })",
             ),
         ),
     ),

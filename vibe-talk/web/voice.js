@@ -1142,6 +1142,74 @@ const COLLAPSE_OVER_CHARS = 280;
 const FOLD_MORE = "More";
 const FOLD_LESS = "Less";
 
+// --- how much a fold is hiding --------------------------------------------------------------------
+//
+// `#244 elision-word-count`. The owner: "when messages are collapsed I have no idea if they're big
+// huge messages or just barely over the limit". So a folded message says, under its last line, how
+// many words the fold is keeping back: "(~240 more words)".
+//
+//   * AN ESTIMATE, AND IT SAYS SO WITH THE "~". The fold is a CSS clamp of three lines, so where the
+//     cut falls depends on the width of the row, the text size, and how the browser breaks lines —
+//     none of which this file knows without asking the layout engine, row by row. Asking would be
+//     a forced layout per long message on every redraw, and `#226` spent real work taking exactly
+//     that kind of read out of the redraw path. Moving to a cut this file makes itself would give
+//     an exact number at the price of the three-LINE fold `#47` chose on purpose (a wall is a
+//     number of lines, not of characters), so the count is worked out once, when the row is built,
+//     from the text alone.
+//   * CALIBRATED ON THE PHONE, where this is read most. A clamped line at 393-412px holds about
+//     fifty characters (measured in Chromium: three lines show 26 to 30 words of ordinary prose on
+//     an agent's full-width row, a few fewer in a person's narrower bubble). A desk's column holds
+//     more, so there the number runs high by up to about twenty words; it is still the difference
+//     between "barely over" and "a wall", which is the question asked.
+//   * ROUNDED as an estimate should be: exact under twenty, to five under a hundred, to ten under a
+//     thousand, to a hundred above. "~312" would claim a precision the number does not have.
+//   * WORDS ARE WHAT THE ROW SHOWS, split on white space: the drawn text of a channel row (never
+//     its markup, and a link counts as the words it shows), the spoken text of a transcript turn.
+//   * "MORE", and no "…" of its own: the clamp has already ended the last line with one, and the
+//     label continues it. "More" is what says these are the words still hidden, not the total.
+const FOLD_LINES = 3;
+const FOLD_LINE_CHARS = 50;
+
+/**
+ * How many words of `text` fall past the three lines a fold shows, by the phone-width model above.
+ *
+ * Each line of the text starts a line of its own (a paragraph, a list item, a blank line in a spoken
+ * turn), and words fill a line greedily up to `FOLD_LINE_CHARS`; a word longer than a line breaks
+ * across lines, as `overflow-wrap: anywhere` breaks it. A word that STARTS inside the three lines is
+ * shown, because the reader can see that it is there.
+ */
+function wordsPastFold(text) {
+  let line = 0;
+  let shown = 0;
+  let total = 0;
+  for (const part of String(text === null || text === undefined ? "" : text).split("\n")) {
+    const words = part.split(/\s+/).filter(Boolean);
+    total += words.length;
+    line += 1;
+    let column = 0;
+    for (const word of words) {
+      if (column > 0 && column + 1 + word.length > FOLD_LINE_CHARS) {
+        line += 1;
+        column = 0;
+      }
+      if (line <= FOLD_LINES) shown += 1;
+      column += (column > 0 ? 1 : 0) + word.length;
+      while (column > FOLD_LINE_CHARS) {
+        line += 1;
+        column -= FOLD_LINE_CHARS;
+      }
+    }
+  }
+  return total - shown;
+}
+
+/** The label under a folded message: "(~240 more words)", "(~1 more word)", or "" for none. */
+function elisionLabel(hidden) {
+  const step = hidden < 20 ? 1 : hidden < 100 ? 5 : hidden < 1000 ? 10 : 100;
+  const about = Math.max(1, Math.round(hidden / step) * step);
+  return hidden > 0 ? `(~${about} more word${about === 1 ? "" : "s"})` : "";
+}
+
 // Every message that has a fold control, in the order it was rendered. Kept rather than re-queried
 // so that "collapse all" is one pass over what exists; `liveFolds` drops the entries whose <li> has
 // left the document, which is what a cleared transcript and a re-read channel both do.
@@ -1217,6 +1285,9 @@ function setFolded(entry, folded) {
   }
   entry.fold.textContent = folded ? FOLD_MORE : FOLD_LESS;
   entry.fold.setAttribute("aria-expanded", folded ? "false" : "true");
+  // `#244 elision-word-count`. Under the clamped lines only: an open message hides nothing, and a
+  // summary standing in for the lines is not the text the count is about.
+  if (entry.elided) entry.elided.hidden = !folded || summarised;
 }
 
 const isFolded = (entry) => entry.li.getAttribute("data-collapsed") === "true";
@@ -1250,7 +1321,18 @@ function foldable(li, meta, body, text, messageId, alsoIds = []) {
     note: null,
     mark: null,
     said: null,
+    elided: null,
   };
+  // `#244 elision-word-count`. Counted once, here, from the text the row shows; see `wordsPastFold`.
+  // Straight after the text, ahead of the summary line below and of the reactions the channel row
+  // moves under both, so it reads as the end of the folded message.
+  const hidden = wordsPastFold(text);
+  if (hidden > 0) {
+    entry.elided = document.createElement("div");
+    entry.elided.className = "elided";
+    entry.elided.textContent = elisionLabel(hidden);
+    li.append(entry.elided);
+  }
   if (entry.id) {
     entry.note = document.createElement("div");
     entry.note.className = "summary";

@@ -3064,6 +3064,24 @@ read, where the read question is kept by its four unread replies and says **4 un
 replies**, on one line and in the accent, and a real tap on that count opens the thread at the first
 of them. Pass `SCREENSHOTS=/tmp/shots` to keep a PNG of each step.
 
+### A folded message says how much it is hiding
+
+`#244 elision-word-count`. A long message arrives folded to its first three lines, and those lines
+alone do not say whether it is barely over the fold or a wall. So the line under them says how many
+words the fold keeps back: `(~240 more words)`. Opening the message takes the line away; folding it
+again brings it back. It is under the message text in the transcript and in the channel, on a row
+combined from several messages, and on a body the server rendered, where the words counted are the
+ones on the screen (a link counts as its text, never as its address).
+
+The number is an **estimate**, and the `~` says so. The fold is a three-line CSS clamp, so where the
+cut falls depends on the row's width, the text size and the browser's line breaking; asking the
+layout engine row by row would put a forced layout per long message back into every redraw. The page
+instead works the count out once, when the row is built, from the text and a phone's line length:
+about fifty characters to a line, each paragraph or list item starting a line of its own. That was
+measured in Chromium at 393 to 412 pixels, where it is within a few words; a desk's column holds more
+per line, so there the count can run high by up to about twenty. It is rounded as an estimate is:
+exact under twenty, then to five, ten, and a hundred.
+
 ### A long message can be read as a summary of itself
 
 `#49 cached-summaries` landed as a **server half with no caller**: the endpoint answered, the store

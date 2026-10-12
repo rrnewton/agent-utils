@@ -3068,6 +3068,13 @@ const TUNING_BANDS = {
   COLLAPSE_OVER_CHARS: [120, 4000,
     "below about a hundred characters ordinary sentences fold, and above a few thousand nothing " +
     "ever does — either way the fold control stops meaning anything"],
+  FOLD_LINES: [3, 3,
+    "the lines the hidden-word count assumes a fold shows: anything but the clamp's three counts " +
+    "words the reader can see, or misses ones they cannot (#244 elision-word-count)"],
+  FOLD_LINE_CHARS: [36, 72,
+    "the characters a folded line holds in the count's phone model: under about forty a phone's " +
+    "line is undercounted, past seventy it is a desk's, and the count runs low where it is read " +
+    "most (#244 elision-word-count)"],
   CLEAR_ARMED_MS: [1000, 20000,
     "the second tap that really clears: under a second the confirmation cannot be reached, over " +
     "twenty and a stray later tap still destroys the view"],
@@ -6685,6 +6692,118 @@ test("the collapsed height is really three LINES, and the chips are outside the 
     "the chips are inside the scrolling element, where the mask fades them"
   );
   assert.match(cssBlock("#screen-main"), /position:\s*relative/, "the chips have nothing to sit on");
+});
+
+// --- `#244 elision-word-count` -------------------------------------------------------------------
+//
+// A folded message says under its last line how many words the fold keeps back. The fold is a CSS
+// clamp, so the count is the page's own estimate from the text, at a phone's line length — and these
+// tests hold it to that model EXACTLY, with texts whose cut is known: words of one length, so a line
+// holds a known number of them.
+
+const FOLD_LINES = sourceConstant("FOLD_LINES");
+const FOLD_LINE_CHARS = sourceConstant("FOLD_LINE_CHARS");
+/** The words a line of the model holds when every word is `letters` long. */
+const wordsPerLine = (letters) => Math.floor((FOLD_LINE_CHARS + 1) / (letters + 1));
+/** `count` words of `letters` letters each, on one line. */
+const wordsOfLength = (count, letters) => Array(count).fill("w".repeat(letters)).join(" ");
+const elidedOf = (li) => li.children.find((node) => node.hasClass("elided"));
+const textOfRow = (li) => li.children.find((node) => node.hasClass("body"));
+
+test("A FOLDED MESSAGE ENDS WITH THE WORDS IT HIDES, by the model's exact cut, in both lists (#244)", async () => {
+  assert.equal(FOLD_LINES, 3, "the model's line count is not the clamp's three lines");
+  const shown = wordsPerLine(4) * FOLD_LINES;
+  const text = wordsOfLength(shown + 30, 4);
+  assert.ok(text.length > COLLAPSE_OVER_CHARS, "the text would not fold");
+  const page = newPage();
+  await startTalking(page);
+  assistantSays(page, text);
+  const spoken = page.el("transcript").children.at(-1);
+  const posted = (await showDiscord(page, [message({ id: "7440000000000000001", content: text })]))[0];
+  for (const [where, li] of [["the transcript", spoken], ["the channel", posted]]) {
+    const label = elidedOf(li);
+    assert.ok(label, `${where} folded a long message with no count under it`);
+    assert.equal(label.textContent, "(~30 more words)", `${where} miscounted the hidden words`);
+    assert.equal(label.hidden, false, `${where} hid the count on a folded message`);
+    // Straight after the text it is about, before anything else the row carries.
+    const body = textOfRow(li);
+    assert.equal(li.children.indexOf(label), li.children.indexOf(body) + 1,
+      `${where} put the count somewhere other than straight under the text`);
+  }
+});
+
+test("the count is exact under twenty, says '1 word' alone, and rounds a large one (#244)", async () => {
+  const cases = [
+    // Nine-letter words: five to a line, fifteen shown, so fourteen of twenty-nine are hidden.
+    [wordsOfLength(wordsPerLine(9) * FOLD_LINES + 14, 9), "(~14 more words)"],
+    // One word longer than three lines starts inside them and is shown; the next one is not.
+    [`${"x".repeat(FOLD_LINE_CHARS * FOLD_LINES)} ${"y".repeat(140)}`, "(~1 more word)"],
+    // 313 hidden, said to the nearest ten.
+    [wordsOfLength(wordsPerLine(4) * FOLD_LINES + 313, 4), "(~310 more words)"],
+  ];
+  const page = newPage();
+  await signIn(page);
+  const rows = await showDiscord(page, cases.map(([content], i) =>
+    message({ id: `744000000000000010${i}`, content })));
+  cases.forEach(([content, said], i) => {
+    assert.ok(content.length > COLLAPSE_OVER_CHARS, `case ${i} would not fold`);
+    assert.equal(elidedOf(rows[i]).textContent, said, `case ${i}`);
+  });
+});
+
+test("a short message has no count, and an open one hides it until it folds again (#244)", async () => {
+  const page = newPage();
+  await signIn(page);
+  const long = wordsOfLength(wordsPerLine(4) * FOLD_LINES + 30, 4);
+  const rows = await showDiscord(page, [
+    message({ id: "7440000000000000201", content: SHORT_MESSAGE }),
+    message({ id: "7440000000000000202", content: long }),
+  ]);
+  assert.equal(elidedOf(rows[0]), undefined, "a short message, which hides nothing, carries a count");
+  const label = elidedOf(rows[1]);
+  await foldButton(rows[1]).click();
+  assert.equal(rows[1].getAttribute("data-collapsed"), "false");
+  assert.equal(label.hidden, true, "an open message still says words are hidden");
+  await foldButton(rows[1]).click();
+  assert.equal(label.hidden, false, "folded again, the count did not come back");
+  assert.equal(label.textContent, "(~30 more words)");
+  // Under the Links filter the row shows its links instead of its text, and the count goes with it.
+  assert.match(CSS, /\.messages li\[data-links-view="true"\] > \.elided,[^{]*\{\s*display:\s*none !important;/,
+    "the Links filter leaves a count under a row whose text it took away");
+  assert.match(cssBlock(".elided"), /white-space:\s*nowrap/, "a narrow bubble can break the count from its word");
+});
+
+test("a combined row is counted as it is drawn, each message from a line of its own (#244)", async () => {
+  // Twenty-five words fill two and a half lines; the second message starts the fourth line, so all
+  // of it is hidden. Read as one run of text, five of its words would fit on the third line instead.
+  const first = wordsOfLength(25, 4);
+  const second = wordsOfLength(35, 4);
+  assert.ok(first.length <= COLLAPSE_OVER_CHARS && second.length <= COLLAPSE_OVER_CHARS,
+    "each message alone would fold, which is not the case under test");
+  const page = newPage();
+  await signIn(page);
+  const rows = await showDiscord(page, [
+    message({ id: "7440000000000000301", content: first, timestamp: "2026-08-19T14:00:00Z" }),
+    message({ id: "7440000000000000302", content: second, timestamp: "2026-08-19T14:00:01Z" }),
+  ]);
+  assert.equal(rows.length, 1, "the two messages were not combined");
+  assert.equal(elidedOf(rows[0]).textContent, "(~35 more words)");
+});
+
+test("a body the server rendered is counted by the words it shows, a link by its text (#244)", async () => {
+  // Twenty-seven nine-letter words and a link reading "the run log": thirty words, fifteen shown. Its
+  // two-hundred-character address is not on the screen, and is not counted.
+  const words = wordsOfLength(27, 9);
+  const href = `https://example.com/${"x".repeat(200)}`;
+  const page = newPage();
+  await signIn(page);
+  const rows = await showDiscord(page, [message({
+    id: "7440000000000000401",
+    content: `${words} [the run log](${href})`,
+    content_html: `<p>${words} <a href="${href}" target="_blank" rel="noopener noreferrer nofollow">the run log</a></p>\n`,
+  })]);
+  assert.equal(rows[0].getAttribute("data-collapsed"), "true", "the rendered message did not fold");
+  assert.equal(elidedOf(rows[0]).textContent, "(~15 more words)");
 });
 
 // --- the raw Discord view --------------------------------------------------------------------------
@@ -11295,6 +11414,8 @@ test("a summarised row shows the summary in place of its opening lines, and More
   assert.equal(row.getAttribute("data-collapsed"), "true", "a long row did not arrive folded");
   assert.equal(summaryLine(row).hidden, false, "the summary is not on screen");
   assert.equal(bodyOf(row).hidden, true, "the summary is stacked on top of the clamped message");
+  // `#244 elision-word-count`. The count is about the clamped lines, which the summary replaced.
+  assert.equal(elidedOf(row).hidden, true, "a summarised row still counts the words of lines it hides");
   assert.equal(summaryText(row), "a short line about 7000000000000000020");
   assert.match(row.text(), /summary/, "nothing on the row says this line is not the message");
 
@@ -11304,6 +11425,7 @@ test("a summarised row shows the summary in place of its opening lines, and More
   assert.equal(summaryLine(row).hidden, true, "the summary stayed up over the opened message");
   assert.equal(bodyOf(row).hidden, false, "opening a summarised row showed nothing");
   assert.match(bodyOf(row).text(), /overnight/, "the opened row is not the original message");
+  assert.equal(elidedOf(row).hidden, true, "an opened message still says words are hidden");
 });
 
 test("PRESSING SUMMARISE CHANGES NOTHING UNTIL A SUMMARY ACTUALLY ARRIVES", async () => {
