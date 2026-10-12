@@ -28017,6 +28017,19 @@ test("`#193 compose-draft-loss`: Undo puts back a send's wait to go again on its
   await settleSend(offline);
   assert.deepEqual(posted(offline), [{ text: "written in a tunnel" }]);
   assert.equal(outgoingRows(offline).length, 0);
+  // ...and one whose connection came back while it was dismissed goes at once, not on an `online`
+  // that has already fired.
+  await offline.setOnline(false);
+  await sendChannel(offline, "written in the next tunnel");
+  await outgoingDismiss(outgoingRows(offline)[0]).click();
+  await offline.setOnline(true);
+  await settleSend(offline);
+  assert.equal(offline.repliesPosted.length, 1, "a dismissed send went when the connection came back");
+  await offline.el("undo-send-dismiss").click();
+  assert.equal(offline.expireTimers(0), 1, "the send taken back was left waiting for a connection it has");
+  await settleSend(offline);
+  assert.deepEqual(posted(offline)[1], { text: "written in the next tunnel" });
+  assert.equal(outgoingRows(offline).length, 0);
 
   // Put back once the chip has gone is a decision of the reader's for later: Retry, not a wait.
   const later = await keyedChannel();

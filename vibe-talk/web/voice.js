@@ -14899,7 +14899,9 @@ function putBackDismissedSend(id) {
     const hold = sendUndo && sendUndo.id === id ? sendUndo.hold : null;
     if (hold && hold.identity === tokenFingerprint(token())) {
       entry.retriesUsed = hold.retriesUsed;
-      holdOutgoingMessage(entry, hold);
+      // Waiting for the connection by what the browser says now: one that came back while the send
+      // was dismissed fired its `online` with nothing waiting, and will not fire it again.
+      holdOutgoingMessage(entry, { ...hold, offline: navigator.onLine === false });
     }
   }
   // The outbox holds it again before the copy goes.
