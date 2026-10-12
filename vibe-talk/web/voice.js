@@ -12397,6 +12397,50 @@ function settleHeldDone(mark, ok) {
   }
 }
 
+/**
+ * The part of `mark` that names `ids`: for a write sent in batches, some of which the server took
+ * before one failed. Each of Done's settlings goes with the part holding its thread's root.
+ *
+ * @param {HeldDoneMark} mark
+ * @param {string[]} ids
+ * @returns {HeldDoneMark}
+ */
+function heldDonePart(mark, ids) {
+  const wanted = new Set(ids);
+  /** @param {[string, number]} entry */
+  const rootIn = ([thread]) => mark.canon !== null && mark.canon.messages.some((/** @type {any} */ message) =>
+    threadOf(message) === thread && message.thread.is_root === true && wanted.has(String(message.id)));
+  return {
+    ...mark,
+    ids: mark.ids.filter((id) => wanted.has(id)),
+    flipped: mark.flipped.filter((id) => wanted.has(id)),
+    settled: mark.settled.filter(rootIn),
+    unsettled: mark.unsettled.filter(rootIn),
+  };
+}
+
+/**
+ * Send `ids` to a dismiss or restore `route` in batches the server accepts (`DISMISS_BATCH`), one
+ * after another, adding the ids of each batch to `landed` as the server takes it: when one fails, the
+ * batches before it stand on the server, and the caller takes back only the rest. Answers the ids
+ * the server says it stored.
+ *
+ * @param {string} route
+ * @param {string[]} ids
+ * @param {string[]} landed
+ * @returns {Promise<string[]>}
+ */
+async function writeInBatches(route, ids, landed) {
+  const stored = [];
+  for (let start = 0; start < ids.length; start += DISMISS_BATCH) {
+    const batch = ids.slice(start, start + DISMISS_BATCH);
+    const part = await api(route, { method: "POST", body: { messages: batch } });
+    landed.push(...batch);
+    stored.push(...((part && part.messages) || batch).map(String));
+  }
+  return stored;
+}
+
 function timelinePath(before = null, after = null) {
   let path = `/api/v1/channels/${encodeURIComponent(el("discord-channel").value)}/timeline` +
     `?view=${channelView}&limit=${DISCORD_PAGE_LIMIT}`;
@@ -15141,6 +15185,12 @@ async function undoBookmarkBump(bump, restoring) {
   try {
     await restoring;
     restored = true;
+  } catch (error) {
+    // Some of it put back: those messages are to read again, above the line where the Done moved
+    // it, so the line goes back above them as well. Above messages still Done is safe; below
+    // messages to read is not.
+    restored = Boolean(error && error.landed > 0);
+    throw error;
   } finally {
     if (back) await sendBookmark(back, { conditional: true, after: Promise.resolve(restored), quiet: true });
   }
@@ -20309,6 +20359,8 @@ async function dismissMessages(body, bump = body.messages ? singleDoneBump(body.
   renderTodoControls();
   setStatus(`Saving ${requested.length} local change${requested.length === 1 ? "" : "s"}…`);
   let payload;
+  /** The ids of the batches the server has taken, when there are several. */
+  const landed = [];
   try {
     const writing = queueInboxWrite(async () => {
       const route = `/api/v1/channels/${encodeURIComponent(channel)}/dismiss`;
@@ -20317,15 +20369,7 @@ async function dismissMessages(body, bump = body.messages ? singleDoneBump(body.
       }
       // `#202 read-through-here`: "through here" over a long list names more ids than one request
       // may carry, so it goes in batches, and the undo covers all of them.
-      const stored = [];
-      for (let start = 0; start < body.messages.length; start += DISMISS_BATCH) {
-        const part = await api(route, {
-          method: "POST",
-          body: { messages: body.messages.slice(start, start + DISMISS_BATCH) },
-        });
-        stored.push(...(part.messages || []));
-      }
-      return { messages: stored };
+      return { messages: await writeInBatches(route, body.messages.map(String), landed) };
     });
     // Queued straight behind the Done, and sent only once it is saved.
     if (move) {
@@ -20333,15 +20377,22 @@ async function dismissMessages(body, bump = body.messages ? singleDoneBump(body.
     }
     payload = await writing;
   } catch (error) {
-    settleHeldDone(held, false);
-    lastDismissal = previousDismissal;
+    // Only what the server did not take is taken back: the batches before the one that failed are
+    // Done there, so they stay Done here, and are what Undo puts back. The bookmark's move, sent only
+    // after the whole write, is taken back, which leaves the line above them all.
+    const kept = new Set(landed);
+    const failed = requested.filter((id) => !kept.has(id));
+    if (landed.length > 0) settleHeldDone(heldDonePart(held, landed), true);
+    settleHeldDone(landed.length > 0 ? heldDonePart(held, failed) : held, false);
+    lastDismissal = landed.length > 0 ? { channel, messages: landed.slice(), bump: null } : previousDismissal;
     // Taken back in the column it was made in, and in the other. `#229 desktop-two-column`.
     inColumn(column, () => {
-      for (const id of added) archivedIds.delete(id);
-      mirrorArchived(mirrored, false);
+      for (const id of added) if (!kept.has(id)) archivedIds.delete(id);
+      mirrorArchived(mirrored.filter((id) => !kept.has(id)), false);
       guardQuietly(refreshAfterInboxChange)();
     });
     renderTodoControls();
+    if (landed.length > 0) error.landed = landed.length;
     throw error;
   }
   settleHeldDone(held, true);
@@ -20400,17 +20451,13 @@ async function restoreMessages(ids) {
   renderTodoControls();
   setStatus(`Restoring ${restored.length} message${restored.length === 1 ? "" : "s"}…`);
   let settled = false;
+  /** The ids of the batches the server has taken. */
+  const landed = [];
   try {
     // In batches the server accepts, as the dismissal that made them went: the undo of a long Done
     // through here names more ids than one request may carry. `#240 reading-bookmark`.
-    await queueInboxWrite(async () => {
-      for (let start = 0; start < restored.length; start += DISMISS_BATCH) {
-        await api(`/api/v1/channels/${encodeURIComponent(channel)}/restore`, {
-          method: "POST",
-          body: { messages: restored.slice(start, start + DISMISS_BATCH) },
-        });
-      }
-    });
+    await queueInboxWrite(() => writeInBatches(`/api/v1/channels/${encodeURIComponent(channel)}/restore`,
+      restored, landed));
     // Settled before the read below, which then speaks for these messages.
     settleHeldDone(held, true);
     settled = true;
@@ -20418,14 +20465,28 @@ async function restoreMessages(ids) {
       await loadTodo({ keepPosition: true, ownAct: true });
     }
   } catch (error) {
-    if (!settled) settleHeldDone(held, false);
-    lastDismissal = previousDismissal;
+    // Only what the server did not put back is Done again: the batches before the one that failed
+    // are back there, so they stay back here, and are no longer the last dismissal's. A read of the
+    // to-do list that failed after every batch landed takes nothing back.
+    const kept = new Set(landed);
+    const failed = restored.filter((id) => !kept.has(id));
+    if (!settled) {
+      if (landed.length > 0) settleHeldDone(heldDonePart(held, landed), true);
+      settleHeldDone(landed.length > 0 ? heldDonePart(held, failed) : held, false);
+    }
+    if (previousDismissal === null) {
+      lastDismissal = null;
+    } else {
+      const left = previousDismissal.messages.filter((id) => !kept.has(id));
+      lastDismissal = left.length === 0 ? null : { ...previousDismissal, messages: left };
+    }
     inColumn(column, () => {
-      for (const id of removed) archivedIds.add(id);
-      mirrorArchived(mirrored, true);
+      for (const id of removed) if (!kept.has(id)) archivedIds.add(id);
+      mirrorArchived(mirrored.filter((id) => !kept.has(id)), true);
       guardQuietly(refreshAfterInboxChange)();
     });
     renderTodoControls();
+    if (landed.length > 0) error.landed = landed.length;
     throw error;
   }
   const count = restored.length;

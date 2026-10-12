@@ -37379,6 +37379,70 @@ test("`#240 reading-bookmark`: a long Done through here is ONE request, and past
   assert.equal(huge.dealtWith.size, 0, "the undo did not put every message back");
 });
 
+/** A page of 1,100 messages, more than one batch, with the bookmark above the first. */
+async function overOneBatch() {
+  const page = newPage();
+  await signIn(page);
+  await showDiscord(page, Array.from({ length: 1100 }, (_unused, i) => message({ id: String(100000 + i), content: `m ${i}` })));
+  await bookmarkRow(page, "100000");
+  return page;
+}
+
+/** Fail the `nth` write of `kind` ("dismiss" or "restore") from now on, and let every other through. */
+function failNthWrite(page, kind, nth) {
+  let seen = 0;
+  page.inboxWriteHook = async (asked) => {
+    if (asked !== kind) return undefined;
+    seen += 1;
+    return seen === nth ? json(502, { error: "store_error", detail: "the store is read-only" }) : undefined;
+  };
+}
+
+test("`#240 reading-bookmark`: a Done through here whose second batch fails keeps the first Done, takes back only the rest, and Undo puts back what landed", async () => {
+  const page = await overOneBatch();
+  const calls = page.bookmarkCalls.length;
+  failNthWrite(page, "dismiss", 2);
+  await throughHere(page, "101099");
+  page.inboxWriteHook = null;
+  assert.deepStrictEqual(page.dismissCalls.map((call) => call.messages.length), [1000, 100]);
+  assert.equal(page.dealtWith.size, 1000, "the fake server did not take the first batch");
+  assert.equal(channelRow(page, "100999").getAttribute("data-archived"), "true",
+    "a message the server has Done was shown to read again");
+  assert.equal(channelRow(page, "101000").getAttribute("data-archived"), "false",
+    "a message the server never took stayed Done");
+  assert.match(page.el("error").text(), /read-only/, "the failure was not said");
+  // The line moves only once the whole Done is saved, so it stays above the first, now Done.
+  assert.deepStrictEqual(bookmarkAt(page), { id: "100000", place: "above" }, "the line moved for a Done that did not all land");
+  assert.equal(page.bookmarkCalls.length, calls, "the slide of a Done that did not all land was sent");
+  assert.equal(page.el("undo-dismiss").hidden, false, "what the server did take cannot be undone");
+  await page.el("undo-dismiss").click();
+  await page.settle();
+  assert.deepStrictEqual(page.restoreCalls.map((call) => call.messages.length), [1000],
+    "the undo did not put back exactly the batch the server took");
+  assert.equal(page.dealtWith.size, 0);
+  assert.equal(channelRow(page, "100999").getAttribute("data-archived"), "false");
+});
+
+test("`#240 reading-bookmark`: an Undo whose second batch fails leaves what was put back to read, and the line above it again", async () => {
+  const page = await overOneBatch();
+  await throughHere(page, "101099");
+  assert.deepStrictEqual(bookmarkAt(page), { id: "101099", place: "below" }, "Done through here did not move the line");
+  failNthWrite(page, "restore", 2);
+  await page.el("undo-dismiss").click();
+  await page.settle();
+  page.inboxWriteHook = null;
+  assert.deepStrictEqual(page.restoreCalls.map((call) => call.messages.length), [1000, 100]);
+  assert.equal(page.dealtWith.size, 100, "the fake server did not put back the first batch");
+  assert.equal(channelRow(page, "100999").getAttribute("data-archived"), "false",
+    "a message the server put back was shown Done again");
+  assert.equal(channelRow(page, "101000").getAttribute("data-archived"), "true",
+    "a message the server never put back was shown to read");
+  // Messages to read again are above where the Done moved the line, so it goes back above them.
+  assert.deepStrictEqual(bookmarkAt(page), { id: "100000", place: "above" }, "the line stayed below messages put back to read");
+  assert.equal(page.bookmark.anchor.message_id, "100000", "the server's bookmark stayed below messages put back to read");
+  assert.match(page.el("error").text(), /read-only/, "the failure was not said");
+});
+
 test("`#240 reading-bookmark`: THE SWEEP ORACLE — Done through here marks exactly the rows above, not yet Done, under random Done, put-back and arrivals", async () => {
   // The page's sweep, against a from-scratch scan of the list after every random step; and the line,
   // against a from-scratch placement of the bookmark the fake server now holds.
