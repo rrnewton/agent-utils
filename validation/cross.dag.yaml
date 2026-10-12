@@ -143,10 +143,12 @@ steps:
     cmd: python3 cross/differential.py --tool agentctl
     jobs_flag: ""
     labels: [validation-cross, component-agentctl]
-    timeout: 600
-    cpu_timeout: 1200
+    # The Rust port (#238 agentctl-rust-only) adds cross groups; 552 s was measured on a loaded
+    # host (load average about 35) with the Muse 1.4 and nested-record groups.
+    timeout: 1200
+    cpu_timeout: 2400
     hint:
-      est_duration_s: 180
+      est_duration_s: 300
       classification: latency-bound
       preferred_inner_jobs: 4
       # Successful runs peaked as high as 2229.57 MiB. A 2560 MiB authored floor yields a
