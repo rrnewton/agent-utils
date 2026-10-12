@@ -24918,8 +24918,8 @@ test("ON THE CALL'S VIEW TOO, the chips' room growing under the box keeps a foll
   assert.equal(await run(SCRIPT), true, "the chips' room grew and left the following reader short of the foot");
   // THE CONTROL: the re-pin as it was, for the channel only. The reader is left short.
   const control = await run(brokenScript(
-    'const pinned = !landed && currentScreen === "main" && atBottom(area);',
-    'const pinned = !landed && currentScreen === "main" && currentView === "discord" && atBottom(area);'
+    'const pinned = !landed && currentScreen === "main" && followsNewest(area);',
+    'const pinned = !landed && currentScreen === "main" && currentView === "discord" && followsNewest(area);'
   ));
   assert.equal(control, false, "the model does not grow the room, so this test says nothing");
 });
