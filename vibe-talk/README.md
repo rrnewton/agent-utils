@@ -68,6 +68,17 @@ without saying which thread it is in, and that no read has placed since, is plac
 **All** before the reply is posted; if that read fails, nothing is posted and the reply keeps its
 text for **Retry**. Until it is placed, whatever you send next in that channel waits for it.
 
+**A reply you send marks what it answers Done.** Once the chat service has taken the reply, the
+message you answered is marked Done exactly as its **Done** button would mark it: on the server, at
+once on screen in both columns, with the **Undo** chip to take it back, and with the bookmark line
+sliding on if it was right above that message. Its button then reads **Unarchive**, **Hide read**
+leaves it out, **Collapse read** folds it, and a thread's count of unread replies on Main stops
+counting it. Only that message is marked, never the rest of its thread. Opening Reply marks nothing,
+and nor does a send that fails or is only partly posted; the **Retry** that sends it does. A message
+already Done is left as it is, and the **Undo** chip keeps offering the last Done. A reply that
+finishes sending after you have moved to another channel marks its message Done on the server only,
+with no **Undo** here. `#256 reply-marks-read`.
+
 **The reply screen says where the reply goes, and shows what came before.** Its title bar names
 the thread the reply posts into as the thread picker and the heading over a thread name it (age and
 replies, then the name, which gets a line of its own so a phone does not cut it away), or **Main**
@@ -114,7 +125,8 @@ what the read modes call unread: not Done, not your own words, not a placeholder
 Such a message stays in the list under **Hide read**, and is never folded into a run under **Collapse
 read**, although it is still drawn as read itself. The count follows replies as they arrive, as they
 are marked Done here or on another device — Main's own refresh says which, with no read of All or
-the thread — and as you answer in the thread, your own words counting as read. It counts the replies
+the thread — and as you answer in the thread, your own words counting as read and the reply you
+answered marked Done. It counts the replies
 the page holds — from **All**, from threads you have opened, and from the live stream — with their
 Done state. While you stay on Main only Main is read, and Slack's live stream carries no thread reply
 at all, so an answer can exist before the page has it: Main's refresh still reports each message's
@@ -3925,14 +3937,16 @@ with the word *Bookmark* in it, drawn just above one message.
   does the same, and is shown only while the line is off the screen, its arrow pointing toward it.
   A bookmark older than what is loaded is reached by reading older pages, as a reply's arrow is.
 - **Reply, then `b`.** Sending a reply goes to the newest message as it always has; the chip and `b`
-  bring you back to where you were reading.
-- **It advances with your Done, and with nothing else.** A Done (`e`, the Done button, a swipe, or a
-  message read aloud to its end) on the message right under the line slides the line down past
-  messages already Done to the next one still to read, the one `e` selects next; below the newest
-  message when everything after it is Done. *Done through here* (Shift+E) at or below the line
-  lands it below that message. Undo puts it back. New messages, putting a message back, and reads
-  never move it. A Done in a thread view slides along the thread's rows, but never past a message of
-  Main's still to read: the line then goes above that message, where Main's reader left off.
+  bring you back to where you were reading. The message you answered is Done once the reply is sent,
+  so a line right above it slides on past it, as below.
+- **It advances with your Done, and with nothing else.** A Done (`e`, the Done button, a swipe, a
+  message read aloud to its end, or a reply you sent to it) on the message right under the line
+  slides the line down past messages already Done to the next one still to read, the one `e` selects
+  next; below the newest message when everything after it is Done. *Done through here* (Shift+E) at
+  or below the line lands it below that message. Undo puts it back. New messages, putting a message
+  back, and reads never move it. A Done in a thread view slides along the thread's rows, but never
+  past a message of Main's still to read: the line then goes above that message, where Main's reader
+  left off.
 - **A long Done through here** goes out in batches of up to 1,000. If a later batch fails, what the
   server took stays Done (and is what Undo puts back), and only the rest is shown unread again.
 - **Kept on the server**, so it follows you between your phone and your desk: every channel read
@@ -3999,7 +4013,9 @@ second way in, never the only one, and a horizontal *mouse* drag is left alone b
 a person selects the text of a message they want to quote.
 
 Replying from the page closes the loop on the spot: the reply carries a `message_reference`, so what
-it answers dims immediately rather than at the next forty-five-second re-read.
+it answers dims immediately rather than at the next forty-five-second re-read, and once the reply is
+sent the message it answers is marked Done through the Done button's own act (`#256
+reply-marks-read`).
 
 ### Settings is controls; Help is the paragraphs that used to be in the way
 

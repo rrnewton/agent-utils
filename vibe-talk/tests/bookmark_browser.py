@@ -20,10 +20,11 @@ the row's own menu and buttons), the walk is:
   scroll to the newest message: the Bookmark chip is up, pointing up; part way back, Newest and the
   Bookmark chip stand side by side on the bottom line, overlapping nothing -> jump (b, or a tap on
   the chip): the line at the top of the list under the floating pill, the message under it selected
-  on a desk, and the chip gone -> reply to that message: the reply screen, Send, and the page goes to
-  the newest message, says b goes back, and offers the chip -> jump back -> mark the message Done (e,
-  or its Done button): the line slides to the next message, the server holds that, and on a desk the
-  selection moves with it. No horizontal overflow and no page error at any step.
+  on a desk, and the chip gone -> reply to a message further down: the reply screen, Send, and the
+  page goes to the newest message, marks the message answered Done (`#256 reply-marks-read`) without
+  moving the line, says b goes back, and offers the chip -> jump back -> mark the message under the
+  line Done (e, or its Done button): the line slides to the next message, the server holds that, and
+  on a desk the selection moves with it. No horizontal overflow and no page error at any step.
 
 Pass --screenshots DIR to keep a PNG of each step for review; --web-root DIR to run the same walk
 against another copy of the page.
@@ -58,6 +59,8 @@ PEER = {"author": "alice", "author_id": "1000000000000000005", "author_is_bot": 
 COUNT = 40
 # The message the walk bookmarks: near the top, so the newest is several screens below it.
 MARKED = 6
+# The message the walk replies to: a little further down, short, and not the next one to read.
+ANSWERED = MARKED + 3
 Json = dict[str, object]
 
 FILLER = ("The overnight run is still going: the integration shard has been retried twice and the "
@@ -523,10 +526,14 @@ def bookmark_walk(walk: Walk) -> None:
     walk.shot("3-jumped")
     walk.notes.append(("the chip" if walk.touch else "b") + " took the reader to the line under the pill")
 
-    # Reply to the message, from the reply screen, and come back.
+    # Reply to a message further down, from the reply screen, and come back. The message answered is
+    # Done once the reply is sent (`#256 reply-marks-read`); the line, above another message, stays.
+    answered = message_id(ANSWERED)
+    answered_row = f"#discord-log > li[data-id='{answered}']"
     if walk.touch:
-        walk.press(f"{row} .reply-button")
+        walk.press(f"{answered_row} .reply-button")
     else:
+        walk.press(f"{answered_row} .msg-author, {answered_row} .meta")
         page.keyboard.press("r")
     walk.wait_for("() => !document.getElementById('screen-reply').hidden", "the reply screen did not open")
     page.fill("#reply-text", "On it: I will check the cache and report back.")
@@ -534,17 +541,23 @@ def bookmark_walk(walk: Walk) -> None:
     walk.wait_for("() => !document.getElementById('screen-main').hidden", "sending did not come back to the channel")
     walk.wait_for(f"() => document.querySelectorAll('#discord-log > li[data-id]').length === {COUNT + 1}",
                   "the reply was not drawn at the foot of the channel")
+    walk.wait_for("(id) => { const li = [...document.querySelectorAll('#discord-log > li')]"
+                  ".find((n) => n.dataset.id === id); return li && li.getAttribute('data-archived') === 'true'; }",
+                  "the message answered was not drawn Done", answered)
+    walk.wait_for("() => document.getElementById('status').textContent === 'b goes back to your bookmark.'",
+                  "the page did not say b goes back after the reply")
     walk.settled()
     m = walk.measure(marked)
     walk.check(m.found["atEnd"] is True, "sending did not go to the newest message")
-    walk.check(m.found["status"] == "b goes back to your bookmark.", f"the page said {m.found['status']!r}")
     walk.check(m.chip("jump-bookmark") is not None, "the way back is not offered after the reply")
-    walk.check(len(walk.api.replies) == 1 and walk.api.replies[0].get("reply_to") == marked,
-               f"the reply did not answer the bookmarked message: {walk.api.replies}")
+    walk.check(len(walk.api.replies) == 1 and walk.api.replies[0].get("reply_to") == answered,
+               f"the reply did not answer the message it was opened on: {walk.api.replies}")
+    walk.check(answered in walk.api.dismissed and marked not in walk.api.dismissed,
+               f"the server holds {sorted(walk.api.dismissed)} as Done, not the message answered alone")
     walk.check(walk.api.anchor_id() == marked, "sending moved the bookmark")
     walk.shot("4-replied")
     jump("the jump back after the reply")
-    walk.notes.append("replied, and went back to the line")
+    walk.notes.append("replied further down, which marked that message Done, and went back to the line")
 
     # Done on the message under the line: the line slides to the next, and the server holds it.
     if walk.touch:

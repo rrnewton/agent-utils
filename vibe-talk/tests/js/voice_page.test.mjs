@@ -39948,3 +39948,215 @@ test("`#243 filter-keeps-selection`: a reader who scrolls while the walk back re
   assert.ok(olderReads(pulled.page).length > 1, "the test cannot see the walk read on past the reader's scroll");
   keptAt(pulled.page, "997", pulled.y, "the pin the walk pulled the reader back to");
 });
+
+// --- a sent reply marks what it answers Done -----------------------------------------------------
+//
+// `#256 reply-marks-read`. The owner: replying to a message greyed it as though it were read, while
+// its Done button still offered Done. The grey was `data-replied`, an observation drawn on the row
+// and nothing more, so the button, the read filters and the unread counts never heard of it. A
+// reply that is SENT now marks the message it answers Done by the Done button's own act, and all of
+// them agree. These drive the page through its own controls and read the fake server's record.
+
+/** Open Reply on the row of `list` holding message `id`, type `text`, press Send, and let it settle. */
+async function replyAndSend(page, id, text = "on it", list = "discord-log") {
+  await replyButton(rowHoldingId(page, id, list)).click();
+  assert.equal(page.screen(), "reply", `Reply on ${id} did not open the reply screen`);
+  await page.el("reply-text").setValue(text);
+  await page.el("reply-send").click();
+  await page.settle();
+}
+
+const ANSWERED_HOOK = "    if (entry.replyTo) guardQuietly(markAnsweredDone)(entry);\n";
+
+test("`#256 reply-marks-read`: a SENT reply marks the message it answers Done — the button, the look, the server and the Undo chip agree, and Undo puts it back", async () => {
+  const run = async (script) => {
+    const page = newPage(new Map(), script);
+    await signIn(page);
+    await showDiscord(page, conversation());
+    return page;
+  };
+  const target = "1000000000000000003";
+  const page = await run(SCRIPT);
+  assert.equal(doneButton(rowWithId(page, target)).text(), "Done", "the premise is an unread message");
+  // Opening Reply marks nothing, and nor does leaving it.
+  await replyButton(rowWithId(page, target)).click();
+  await page.el("reply-cancel").click();
+  assert.deepStrictEqual(page.dismissCalls, [], "opening Reply marked the message");
+  assert.equal(rowWithId(page, target).getAttribute("data-archived"), "false");
+
+  await replyAndSend(page, target, "answering the open one");
+  assert.equal(page.repliesPosted.at(-1).body.reply_to, target, "the reply did not answer the message");
+  assert.deepStrictEqual(page.dismissCalls, [{ messages: [target] }], "the reply's Done was not written to the server");
+  assert.ok(page.dealtWith.has(target), "the server does not hold the message as Done");
+  const row = rowWithId(page, target);
+  assert.equal(row.getAttribute("data-archived"), "true", "the message answered is not drawn as read");
+  assert.equal(doneButton(row).text(), "Unarchive", "the button still offers Done on a message the reply marked read");
+  // Only the message answered: the one somebody else answered stays as it was, dimmed and unread.
+  const other = rowWithId(page, "1000000000000000001");
+  assert.equal(other.getAttribute("data-replied"), "true");
+  assert.equal(other.getAttribute("data-archived"), "false", "a message this reply did not answer was marked");
+  assert.equal(page.el("undo-dismiss").hidden, false, "the reply's Done offers no Undo");
+
+  await page.el("undo-dismiss").click();
+  await page.settle();
+  assert.deepStrictEqual(page.restoreCalls, [{ messages: [target] }], "Undo did not put the message back on the server");
+  assert.equal(rowWithId(page, target).getAttribute("data-archived"), "false", "Undo left the message read");
+  assert.equal(doneButton(rowWithId(page, target)).text(), "Done");
+  assert.ok(!page.dealtWith.has(target));
+  assert.equal(page.el("undo-dismiss").hidden, true);
+
+  // THE CONTROL, which is the owner's report: without the reply's Done the message is dimmed as
+  // answered while its button still offers Done, and nothing reaches the server.
+  const control = await run(brokenScript(ANSWERED_HOOK, ""));
+  await replyAndSend(control, target, "answering the open one");
+  const dimmed = rowWithId(control, target);
+  assert.equal(dimmed.getAttribute("data-replied"), "true", "the control did not even dim the message");
+  assert.equal(dimmed.getAttribute("data-archived"), "false",
+    "with the reply's Done taken out the message still went read, so this test cannot see it");
+  assert.equal(doneButton(dimmed).text(), "Done");
+  assert.deepStrictEqual(control.dismissCalls, []);
+});
+
+test("`#256 reply-marks-read`: the reply's Done is the Done button's own act, called only where a send has succeeded", () => {
+  assert.match(SCRIPT_CODE, /async function markAnsweredDone\([\s\S]*?toggleArchived\(/,
+    "the reply's Done does not go through the act the Done button and the swipe use");
+  // Once, in the send's success, after the posted parts are drawn and before anything can fail it.
+  assert.equal(SCRIPT_CODE.split("markAnsweredDone)(").length - 1, 1, "the reply's Done is called from more than one place");
+  const send = SCRIPT_CODE.slice(SCRIPT_CODE.indexOf("async function dispatchOutgoingMessage("));
+  const success = send.indexOf('entry.state = "sent";');
+  const call = send.indexOf("markAnsweredDone)(entry)");
+  assert.ok(success > 0 && call > success && call < send.indexOf("} catch (error) {", success),
+    "the reply's Done is not in the send's success");
+});
+
+test("`#256 reply-marks-read`: Hide read leaves the message out and Collapse read folds it, once the reply is sent", async () => {
+  const page = newPage();
+  await signIn(page);
+  const ids = backlog(4).map((m) => m.id);
+  await showDiscord(page, backlog(4));
+  await doneButton(rowWithId(page, ids[0])).click();
+  await page.settle();
+  await chooseReadMode(page, "Collapse read");
+  assert.equal(rowWithId(page, ids[1]).hasAttribute("data-read-run"), false, "the premise is an unread message out of any run");
+  await replyAndSend(page, ids[1]);
+  assert.ok(rowWithId(page, ids[1]).hasAttribute("data-read-run"),
+    "Collapse read did not fold the message the reply marked read in with the read one above it");
+  assert.equal(rowWithId(page, ids[2]).hasAttribute("data-read-run"), false, "Collapse read folded an unread message");
+  await chooseReadMode(page, "Hide read");
+  assert.ok(!shownIds(page).includes(ids[1]), "Hide read kept the message the reply marked read");
+  assert.ok(shownIds(page).includes(ids[2]), "Hide read lost an unread message");
+});
+
+test("`#256 reply-marks-read`: a send that fails marks nothing, and the Retry that sends it marks the message", async () => {
+  const page = newPage();
+  await signIn(page);
+  await showDiscord(page, backlog(2));
+  const target = backlog(2)[0].id;
+  const succeeds = page.replyResponse;
+  page.replyResponse = errorResponse(400, "bad_request", "the chat service refused the message");
+  await replyAndSend(page, target, "this one is refused");
+  assert.equal(outgoingRows(page)[0].getAttribute("data-send-state"), "failed", "the premise is a refused send");
+  assert.deepStrictEqual(page.dismissCalls, [], "a reply that was not sent marked the message");
+  assert.equal(rowWithId(page, target).getAttribute("data-archived"), "false");
+  assert.equal(doneButton(rowWithId(page, target)).text(), "Done");
+  assert.equal(page.el("undo-dismiss").hidden, true, "a failed send offered an Undo");
+  // A partial post is not a sent reply either: the rest of it is still to go.
+  page.replyResponse = async () => json(207, { error: "partially_posted", posted: 1, unsent: "the rest", detail: "Google Chat returned HTTP 502" });
+  await outgoingRetry(outgoingRows(page)[0]).click();
+  await page.settle();
+  assert.deepStrictEqual(page.dismissCalls, [], "a partly posted reply marked the message");
+  page.replyResponse = succeeds;
+  await outgoingRetry(outgoingRows(page)[0]).click();
+  await page.settle();
+  assert.deepStrictEqual(page.dismissCalls, [{ messages: [target] }], "the Retry that sent the reply did not mark the message");
+  assert.equal(doneButton(rowWithId(page, target)).text(), "Unarchive");
+});
+
+test("`#256 reply-marks-read`: a reply to a message already Done changes nothing, and the Undo chip keeps the last Done", async () => {
+  const page = newPage();
+  await signIn(page);
+  const [first, second] = backlog(3).map((m) => m.id);
+  await showDiscord(page, backlog(3));
+  await doneButton(rowWithId(page, first)).click();
+  await page.settle();
+  await doneButton(rowWithId(page, second)).click();
+  await page.settle();
+  assert.equal(page.dismissCalls.length, 2);
+  await replyAndSend(page, first, "an afterthought");
+  assert.equal(page.repliesPosted.length, 1, "the reply was not sent");
+  assert.equal(page.dismissCalls.length, 2, "a reply to a message already Done wrote it Done again");
+  assert.deepStrictEqual(page.restoreCalls, [], "a reply to a message already Done put it back");
+  assert.equal(doneButton(rowWithId(page, first)).text(), "Unarchive");
+  // The Undo chip is still the last Done's, the second message, and not taken over by the reply.
+  await page.el("undo-dismiss").click();
+  await page.settle();
+  assert.deepStrictEqual(page.restoreCalls, [{ messages: [second] }], "the Undo chip no longer puts back the last Done");
+  assert.equal(rowWithId(page, first).getAttribute("data-archived"), "true");
+});
+
+test("`#256 reply-marks-read`: a reply in a thread marks the message it answers and only it, and the root's count of unread replies on Main follows", async () => {
+  const page = newPage();
+  const messages = inboxChannel(page);
+  await signIn(page);
+  await showDiscord(page, messages);
+  await pickThread(page, "main");
+  assert.deepStrictEqual(unreadSaid(page), { 2: "1 unread", 5: null, 7: "2 unread" }, "the premise");
+  await pickThread(page, "flat");
+  await replyAndSend(page, inboxId(8), "thanks, reviewing it");
+  assert.deepStrictEqual(page.dismissCalls, [{ messages: [inboxId(8)] }], "the reply marked more than the message it answers");
+  assert.equal(rowWithId(page, inboxId(8)).getAttribute("data-archived"), "true");
+  for (const n of [7, 9]) {
+    assert.equal(rowWithId(page, inboxId(n)).getAttribute("data-archived"), "false", `the reply marked ${n} of the same thread`);
+  }
+  await pickThread(page, "main");
+  assert.deepStrictEqual(unreadSaid(page), { 2: "1 unread", 5: null, 7: "1 unread" },
+    "the root still counts the reply the owner answered as unread");
+  // Undo, and the count is back.
+  await page.el("undo-dismiss").click();
+  await page.settle();
+  assert.deepStrictEqual(unreadSaid(page), { 2: "1 unread", 5: null, 7: "2 unread" }, "Undo did not bring the count back");
+});
+
+test("`#256 reply-marks-read`: in two columns the reply's Done is drawn in both, from whichever column Reply was opened", async () => {
+  const { page } = await twoColumnServer();
+  await threadBadge(rowWithId(page, "201")).click();
+  await page.settle();
+  assert.deepStrictEqual(sideIds(page), ["201", "202"]);
+  assert.ok(unreadChip(page, "201"), "the premise is a root on Main counting an unread reply");
+  // From the right: the thread's reply.
+  await replyAndSend(page, "202", "agreed", "side-log");
+  assert.deepStrictEqual(page.dismissCalls, [{ messages: ["202"] }]);
+  assert.equal(sideRow(page, "202").getAttribute("data-archived"), "true", "the right column did not draw the reply's Done");
+  assert.equal(doneButton(sideRow(page, "202")).text(), "Unarchive");
+  assert.equal(unreadChip(page, "201"), null, "Main still counts the reply answered on the right as unread");
+  assert.equal(sideRow(page, "201").getAttribute("data-archived"), "false", "the reply marked the thread's root as well");
+  // From the left: the root, which the right column draws too.
+  await replyAndSend(page, "201", "and the whole thread");
+  assert.deepStrictEqual(page.dismissCalls.at(-1), { messages: ["201"] });
+  assert.equal(rowWithId(page, "201").getAttribute("data-archived"), "true");
+  assert.equal(sideRow(page, "201").getAttribute("data-archived"), "true", "the right column did not draw Done made on the left");
+});
+
+test("`#256 reply-marks-read`: a reply sent after you moved to another channel is marked Done on the server, and nothing here is", async () => {
+  const page = newPage();
+  page.channels = [{ ...CHANNEL }, { ...OTHER_CHANNEL }];
+  const here = message({ id: "3100000000000000001", channel_id: CHANNEL.id, content: "answer me" });
+  const there = message({ id: "3100000000000000002", channel_id: OTHER_CHANNEL.id, content: "elsewhere" });
+  serveByChannel(page, { [CHANNEL.id]: [here], [OTHER_CHANNEL.id]: [there] });
+  await signIn(page);
+  await showDiscord(page, []);
+  const finish = delayedReply(page);
+  await replyButton(rowWithId(page, here.id)).click();
+  await page.el("reply-text").setValue("on it");
+  const sending = page.el("reply-send").click();
+  await readChannel(page, OTHER_CHANNEL.id);
+  assert.deepStrictEqual(shownIds(page), [there.id]);
+  finish(json(200, { posted: message({ id: "3100000000000000003", channel_id: CHANNEL.id, content: "on it", reply_to: here.id }) }));
+  await sending;
+  await page.settle();
+  assert.deepStrictEqual(page.dismissCalls, [{ messages: [here.id] }], "the message answered was not marked");
+  assert.ok(page.requests.includes(`POST /api/v1/channels/${encodeURIComponent(CHANNEL.id)}/dismiss`),
+    "the Done went to another channel than the reply's");
+  assert.equal(rowWithId(page, there.id).getAttribute("data-archived"), "false", "a message of this channel was marked");
+  assert.equal(page.el("undo-dismiss").hidden, true, "an Undo here would put back a message of this channel");
+});
