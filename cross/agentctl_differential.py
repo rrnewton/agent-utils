@@ -1637,6 +1637,59 @@ def _muse_adoption(harness: Harness, report: Report) -> None:
         _retire_fixture_processes(case)
 
 
+def _muse14_status(harness: Harness, report: Report) -> None:
+    """Muse 1.4 frames read as paused, idle, staged or working alike; only idle takes input."""
+    case = harness.case("primary-muse14-status", {
+        "harness": "muse", "custom_reported": True, "report_custom_session": True,
+        "foreground_argv_mode": "missing",
+    })
+    for root in (case.python_root, case.rust_root):
+        subprocess.run([
+            str(root / "fake-herdr"), "pane", "run", "w1:p1",
+            shlex.join([str(root / "fake-muse-runtime")]),
+        ], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    adopted, _ = _pair(harness, report, case, "primary/muse14/adopt", (
+        "adopt", "foreign", "--pane", "w1:p1", "--workspace", "project",
+        "--cwd", "<ROOT>", "--harness", "muse", "--session", "session-1", *_COMMON,
+    ))
+    if adopted.returncode != 0:
+        _retire_fixture_processes(case)
+        return
+    divider, footer = "─" * 40 + "\n", "kiki · xhigh · /work · YOLO\n"
+    idle = f"old transcript\n{divider}❯\n{divider}{footer}"
+    staged, paused = idle.replace("❯\n", "❯ owner draft\n"), idle.replace(footer, "Goal (paused)\n" + footer)
+    headed = "Muse Code 1.4.0\n" + paused.replace("YOLO", "Auto-review")
+    headed_staged = "Muse Code 1.4.0\n" + staged.replace("YOLO", "Auto-review")
+    frames = (("idle", "done", idle, "idle"), ("staged", "done", staged, "staged"),
+              ("paused", "done", paused, "paused"), ("echo", "done", "Goal (paused)\n" + idle, "idle"),
+              ("busy-headerless", "working", paused, "working"), ("busy-headed", "working", headed, "idle"),
+              ("headed-paused", "done", headed, "paused"), ("headed-staged", "idle", headed_staged, "staged"))
+    for label, status, screen, expected in frames:
+        _change(case, {"status": status, "screen": screen})
+        outcomes = _pair(harness, report, case, f"primary/muse14/{label}/status",
+                         ("status", "foreign", *_COMMON))
+        report.require(f"primary/muse14/{label}/agent-status", all(
+            isinstance(value := _json(outcome), dict) and value.get("agent_status") == expected
+            for outcome in outcomes), f"expected {expected}: {outcomes!r}")
+    for label, screen in (("paused", headed), ("staged", headed_staged)):
+        _change(case, {"status": "done", "screen": screen})
+        _pair(harness, report, case, f"primary/muse14/{label}/held", (
+            "send", "foreign", f"held while {label}", "--message-id", f"muse14-{label}",
+            "--ready-timeout", "0", *_COMMON,
+        ), 75)
+    report.require("primary/muse14/held-without-input", all(
+        not any(call[:2] in (["agent", "prompt"], ["pane", "send-text"], ["pane", "send-keys"])
+                for call in _fixture_calls(root))
+        and len(list((root / "registry/foreign/queue/inbox").glob("*.json"))) == 2
+        for root in (case.python_root, case.rust_root)), "a paused or staged Muse editor took input")
+    _change(case, {"status": "idle", "screen": ""})
+    _pair(harness, report, case, "primary/muse14/resumed-drain", ("drain", "foreign", *_COMMON))
+    report.require("primary/muse14/delivered-once-in-order", all(
+        _state(root).get("submitted") == ["held while paused", "held while staged"]
+        for root in (case.python_root, case.rust_root)), "held Muse input was lost, repeated or reordered")
+    _retire_fixture_processes(case)
+
+
 def _handoff_and_pending(harness: Harness, report: Report) -> None:
     case = harness.case("primary-handoff")
     if not _start(harness, report, case, "primary/handoff/start"):
@@ -2799,6 +2852,7 @@ def build_report(python_command: Sequence[str], rust_command: Sequence[str]) -> 
             _profile_refusals(harness, report)
             _herdr_093_compatibility(harness, report)
             _muse_adoption(harness, report)
+            _muse14_status(harness, report)
             _handoff_and_pending(harness, report)
             _registry_and_interop(harness, report)
             _legacy_adopted_registry_and_queue(harness, report)
