@@ -3750,6 +3750,31 @@ anchor-and-offset mechanism the fold control uses rather than a saved `scrollTop
 element is allowed to reset its scroll position to zero, and a restore expressed as a delta against
 an anchor is correct either way.
 
+**The reply screen keeps the message where it was** (`#247 reply-continuity`). The owner found it
+jarring that Reply changed the font size and moved the message, and asked for the same visual
+continuity as other transitions. Now:
+
+- **The message is drawn as the list draws its row.** It uses the same renderer, the reader's
+  Settings text size, the speaker's tint and insets, and a reply's gutter or a gathered reply's
+  indent where the row had one. It sits in the same column on a desk, so its lines break in the same
+  places. It is unfolded, and an accent edge marks it as the one being answered. Who it answers and
+  the id the answer goes to sit beside "Your reply", not above the message.
+- **Its top stays where the row's top was.** The conversation scrolls to put it there, and ends at
+  the message's foot, so the box comes up directly under it and nothing that came after it on the
+  list is shown. The earlier messages are above it as before. A row whose top was above the screen
+  (under the list's edge, or where the title bar now is) opens at the top.
+- **It is never pushed under the box.** If the message ends lower than the box leaves room for, it
+  moves up only as far as needed to show all of it above the box. A message taller than the screen
+  keeps its top, with the rest a scroll down, as long as its first third of a screen shows;
+  otherwise it moves up just enough to show that. Where too little came before the message to fill
+  the space above it, an empty room at the head of the conversation holds it in place.
+- **A subtle tint**, the page colour with a little of the accent in it (one value per scheme), says
+  this is Reply. Nothing else changes.
+
+Cancel, Back and Esc come back to exactly where the list was. Send still goes to the newest message,
+and `b` or the Bookmark chip brings you back. `make -C vibe-talk reply-continuity-browser` measures
+all of this in Chromium at 1280x800 and 412x915, at three text sizes.
+
 ### Enter sends, in every message box, until you say otherwise
 
 Enter used to mean three things. The channel's box (and so a thread's, which is the same box) sent on

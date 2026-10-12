@@ -487,6 +487,9 @@ function showScreen(name) {
   if (destination) {
     el("topbar-title").textContent = SCREEN_TITLES[name];
   }
+  // `#247 reply-continuity`. Which screen is up, where the stylesheet can see it: the reply screen
+  // tints the frame behind it.
+  el("frame-body").setAttribute("data-screen", name);
   // The control pane is a grid ROW inside the dock. Hiding it collapses the row, so the body grows
   // to fill the frame rather than leaving a band of empty pane under a sign-in form.
   //
@@ -19357,7 +19360,7 @@ function discordNode(messages) {
   //
   // THE ANSWER GOES TO THE FIRST CONSTITUENT. A glommed row is a primary message with a tail
   // hanging off it, and threading a reply under the tail would put the answer under a fragment.
-  reply.addEventListener("click", inThisColumn(() => openReply(messages)));
+  reply.addEventListener("click", inThisColumn(() => openReply(messages, li)));
   sayRowShortcut(reply, "reply-button");
   meta.append(reply);
   // `#228 reply-visible`. Held on the row, as its messages are, so that the pass which says how many
@@ -22194,14 +22197,20 @@ function rememberDraft() {
 /**
  * Open the reply screen on one specific row.
  *
- * THE ANSWER GOES TO THE FIRST CONSTITUENT, and the meta line says which id that is. The quoted
- * text above it is the whole row, because that is what the reader tapped Reply on — showing only
- * the primary would read as the app having lost the rest of the message.
+ * THE ANSWER GOES TO THE FIRST CONSTITUENT, and the line beside "Your reply" says which id that is.
+ * The message drawn is the whole row, because that is what the reader tapped Reply on — showing
+ * only the primary would read as the app having lost the rest of the message.
  *
  * `#200 reply-context`. Above it, the messages that came before it where it is, and in the title
  * bar, the thread the reply goes into. See `renderReplyContext` and `renderReplyTitle`.
+ *
+ * `#247 reply-continuity`. `from` is the row Reply was pressed on, when it was pressed on one: the
+ * message is drawn as that row is, and its top is put where that row's was (`placeReplyMessage`).
+ *
+ * @param {Array<object>} messages
+ * @param {HTMLElement | null} [from]
  */
-function openReply(messages) {
+function openReply(messages, from = null) {
   const message = messages[0];
   replyTarget = message;
   replyChannelId = el("discord-channel").value;
@@ -22211,15 +22220,14 @@ function openReply(messages) {
   el("reply-branch").checked = false;
   el("reply-branch-row").hidden = !replyRouting.branch;
   // BEFORE the screen changes: once #screen-main is hidden nothing in it has a rectangle, so the
-  // anchor has to be taken while the reader can still see it.
+  // anchor has to be taken while the reader can still see it — and so does where the row stood.
   replyScrollMark = captureScroll();
   replyColumn = activeColumn;
-  const target = el("reply-target");
-  target.replaceChildren();
-  // The same bodies the channel list draws, through the same function, so the same guarantee: the
-  // server's sanitized rendering or the text as text, and no second path.
-  renderBodyInto(target, messages);
-  el("reply-target-meta").textContent = `${
+  const fromTop = from && from.parentNode && shownNode(from) ? from.getBoundingClientRect().top : null;
+  // The channel's own row, through the channel's own renderer, so the same guarantee: the server's
+  // sanitized rendering or the text as text, and no second path.
+  el("reply-target").replaceChildren(replyTargetRow(messages, from));
+  el("reply-target-meta").textContent = `to ${
     message.author_is_bot ? `${message.author} (bot)` : String(message.author)
   } · id ${message.id}`;
   el("reply-text").value = drafts.get(message.id) || "";
@@ -22228,9 +22236,49 @@ function openReply(messages) {
   renderReplyContext();
   showScreen("reply");
   // AFTER: the title bar is the screen's to name only once it is up, and only a pane on screen has
-  // a height to open at.
+  // a height to open at. The title and the destination line can each take a second line, so they are
+  // drawn before the message is placed against them.
   renderReplyDestination();
-  showReplyMessage();
+  placeReplyMessage(fromTop);
+}
+
+/**
+ * A row of the reply screen: the channel's frame (`channelRowFrame`), with the speaker treatment the
+ * channel gives it, from the same census: the two principals told apart by colour, everyone else
+ * named. Nothing on it acts.
+ */
+function replyRowFrame(messages) {
+  const frame = channelRowFrame(messages);
+  const message = messages[0];
+  const who = bucketFor(message.author_id, message.author_is_bot, replyChannelId);
+  frame.li.setAttribute("data-who", who);
+  const named = childByClass(frame.li, "msg-author");
+  if (named) named.hidden = who === "me" || who === "coder";
+  return frame;
+}
+
+/**
+ * The message being answered, drawn as the channel drew it, never folded: answering it is the reason
+ * for the screen. `#247 reply-continuity`.
+ *
+ * Where the row it was opened on was set in from the left — a reply's gutter, a gathered reply's
+ * indent — this one is set in by as much, because a message that is wider or narrower than it was
+ * breaks its lines in other places, and the reader sees the text move. Only a row of the channel's
+ * own lists has those; a row of the Pinned filter is drawn without them.
+ *
+ * @param {Array<object>} messages
+ * @param {HTMLElement | null} from
+ */
+function replyTargetRow(messages, from) {
+  const { li } = replyRowFrame(messages);
+  const list = from && from.parentNode ? String(/** @type {HTMLElement} */ (from.parentNode).id || "") : "";
+  if (from && (list === "discord-log" || list === "side-log")) {
+    for (const name of ["data-is-reply", "data-stack-under"]) {
+      const value = from.getAttribute(name);
+      if (value !== null) li.setAttribute(name, value);
+    }
+  }
+  return li;
 }
 
 /**
@@ -22485,14 +22533,8 @@ function renderReplyContext() {
  * summarised.
  */
 function replyContextRow(messages) {
-  const { li, meta, body, text } = channelRowFrame(messages);
+  const { li, meta, body, text } = replyRowFrame(messages);
   const message = messages[0];
-  // The speaker treatment the channel gives the row, from the same census: the two principals are
-  // told apart by colour, and everyone else is named.
-  const who = bucketFor(message.author_id, message.author_is_bot, replyChannelId);
-  li.setAttribute("data-who", who);
-  const named = childByClass(li, "msg-author");
-  if (named) named.hidden = who === "me" || who === "coder";
   if (text.length <= COLLAPSE_OVER_CHARS) return li;
   const id = String(message.id);
   const fold = document.createElement("button");
@@ -22527,25 +22569,94 @@ function replyContextRow(messages) {
  * Change what is above the message being answered without moving it. Rows added over a reader at
  * the top of the context would otherwise push down what they were reading by their own height,
  * and the message with it.
+ *
+ * `#247 reply-continuity`. Rows that arrive above the message take the place of the room
+ * `placeReplyMessage` was keeping for them, so the earlier messages close up under nothing rather
+ * than sit under a gap that is no longer holding anything in place.
  */
 function holdingReplyMessage(mutate) {
   const pane = el("reply-scroll");
-  const anchor = el("reply-target-meta");
+  const anchor = el("reply-target");
   const before = anchor.getBoundingClientRect().top;
   mutate();
   pane.scrollTop += anchor.getBoundingClientRect().top - before;
+  const lead = el("reply-lead");
+  const room = parseFloat(String(lead.style.height || "")) || 0;
+  const spare = Math.min(room, pane.scrollTop);
+  if (spare > 0) {
+    lead.style.height = room - spare > 0 ? `${room - spare}px` : "";
+    pane.scrollTop -= spare;
+  }
 }
 
 /**
- * Open at the message being answered: all of it in view with as much of what came before as fits
- * above it, or — when it is taller than the pane — its first line at the top. The composer is
- * below the pane, so it is in view either way.
+ * How much of a message being answered that is taller than the conversation's room is kept on screen
+ * above the box at the least, in percent of that room: its opening lines, where its top on the list
+ * was too low for more. A message the room can hold is always shown whole.
  */
-function showReplyMessage() {
+const REPLY_SHOWN_PERCENT = 33;
+
+/**
+ * Put the message being answered where the reader's eye already is. `#247 reply-continuity`.
+ *
+ * The owner: "I'd rather the top of the message I press Reply on to stay still on the screen.
+ * Expand it below and truncate below that (moving up the text entry box underneath)... but the
+ * visual consistency of keeping the top of the target-message still would be great."
+ *
+ *   * ITS TOP GOES WHERE THE ROW'S WAS, `fromTop`, measured in the window before the screen
+ *     changed; or to the top of the conversation, where the row's top was above that (scrolled
+ *     under the edge of the list, or where the title bar now is).
+ *   * IT IS DRAWN WHOLE BELOW THAT, and the conversation ends at its foot: it is given exactly that
+ *     height, so the box comes up directly under the message and nothing that came after it on the
+ *     list is on screen. What came before it is above, as it was, and a scroll up reads further.
+ *   * IT IS NEVER PUSHED UNDER THE BOX. Where the message does not end inside the room there is,
+ *     the conversation takes all of that room and the box stays on screen under it, and the message
+ *     moves up by just as much as shows all of it above the box: the least scroll that keeps the
+ *     box and the message both in view. A message taller than the room keeps its top where it was,
+ *     the rest of it a scroll down, as long as its opening lines (a third of the room) are above the
+ *     box, and moves up only as far as shows them.
+ *   * WITH TOO LITTLE ABOVE IT to reach that place — the first message of a thread, say — the
+ *     room over the earlier messages (#reply-lead) is what holds it there.
+ *
+ * With no row to measure (`fromTop` null), the message opens all in view at the foot of the room,
+ * with as much of what came before as fits above it, or, taller than the room, at its first line.
+ *
+ * @param {number | null} fromTop
+ */
+function placeReplyMessage(fromTop) {
   const pane = el("reply-scroll");
-  const top = el("reply-target-meta").getBoundingClientRect().top - pane.getBoundingClientRect().top +
-    pane.scrollTop;
-  pane.scrollTop = Math.min(top, pane.scrollHeight - pane.clientHeight);
+  const lead = el("reply-lead");
+  const row = el("reply-target").children[0];
+  // From the screen's own default, which is all the room the block under the conversation leaves.
+  pane.removeAttribute("data-fit");
+  pane.style.height = "";
+  pane.style.removeProperty("--reply-fit");
+  lead.style.height = "";
+  if (!row) return;
+  const room = pane.clientHeight;
+  const paneTop = pane.getBoundingClientRect().top;
+  const box = row.getBoundingClientRect();
+  const offset = box.top - paneTop + pane.scrollTop;
+  const wanted = fromTop === null ? room - box.height : fromTop - paneTop;
+  const shown = box.height <= room ? box.height : (room * REPLY_SHOWN_PERCENT) / 100;
+  const at = Math.max(0, Math.min(wanted, room - shown));
+  const extra = Math.max(0, at - offset);
+  if (extra > 0) lead.style.height = `${extra}px`;
+  const fit = (height) => {
+    // The height, and for the stylesheet the floor it may shrink to: a one-line message at the top
+    // is shorter than the 4rem the conversation keeps otherwise.
+    pane.setAttribute("data-fit", "message");
+    pane.style.height = `${height}px`;
+    pane.style.setProperty("--reply-fit", `${height}px`);
+  };
+  if (at + box.height < room) fit(at + box.height);
+  pane.scrollTop = offset + extra - at;
+  // A scroll position is whole pixels and a row's edges need not be: the part of a pixel the scroll
+  // left the message lower by is given to the conversation, rather than clipping the message's edge.
+  if (pane.hasAttribute("data-fit")) {
+    const over = row.getBoundingClientRect().bottom - pane.getBoundingClientRect().bottom;
+    if (over > 0 && over < 2) fit(at + box.height + over);
+  }
 }
 
 /**

@@ -686,31 +686,48 @@
                It opens at the message, so the context is above it and reached by scrolling up,
                and the composer below it stays on screen. Contained: reading back must not move
                the channel behind it, and a flick that reaches the end must not become a page
-               gesture. The rows are built by `renderReplyContext` in web/voice.js. -->
+               gesture. The rows are built by `renderReplyContext` in web/voice.js.
+
+               `#247 reply-continuity`. The message is drawn as the channel draws its row, at the
+               same size and in the same place: its top stays where it was on the list, and the
+               scroll ends at its foot, so the box sits directly under it. #reply-lead is the room
+               that puts it there when too little came before it to fill the space above. See
+               `placeReplyMessage`. -->
           <div id="reply-scroll" tabindex="-1" role="region" aria-label="The conversation being answered">
+            <div id="reply-lead" aria-hidden="true"></div>
             <button id="reply-context-more" class="secondary" type="button" hidden>Load earlier messages</button>
             <p id="reply-context-state" class="hint" aria-live="polite" hidden></p>
             <ul id="reply-context" class="messages" aria-label="Earlier messages"></ul>
-            <p id="reply-target-meta" class="hint"></p>
-            <div id="reply-target"></div>
+            <ul id="reply-target" class="messages" aria-label="The message being answered"></ul>
           </div>
-          <label for="reply-text">Your reply</label>
-          <textarea id="reply-text" rows="4" placeholder="write a reply"></textarea>
-          <!-- `#185 reply-new-thread`. Where Send will post, said before it does: a reply goes
-               where the message it answers is, and starting a new thread from a main-channel
-               message is a choice offered only where the chat service can do it. -->
-          <label id="reply-branch-row" class="toggle" hidden>
-            <input id="reply-branch" type="checkbox" />
-            Start a new thread from this message
-          </label>
-          <p id="reply-destination" class="hint" hidden></p>
-          <div class="row">
-            <button id="reply-cancel" class="secondary" type="button">Cancel</button>
-            <button id="reply-send" type="button">Send reply</button>
+          <!-- `#247 reply-continuity`. Everything under the conversation, as one block: on a desk it
+               is held to the reading column the rows above it are, in the type that column is
+               measured in. -->
+          <div class="reply-compose">
+            <!-- Who is being answered, and the id the answer goes to, on the label's line: under the
+                 message rather than between it and the earlier ones, so that the message itself is
+                 drawn exactly as the channel draws it. -->
+            <div class="reply-label-row">
+              <label for="reply-text">Your reply</label>
+              <p id="reply-target-meta" class="hint"></p>
+            </div>
+            <textarea id="reply-text" rows="4" placeholder="write a reply"></textarea>
+            <!-- `#185 reply-new-thread`. Where Send will post, said before it does: a reply goes
+                 where the message it answers is, and starting a new thread from a main-channel
+                 message is a choice offered only where the chat service can do it. -->
+            <label id="reply-branch-row" class="toggle" hidden>
+              <input id="reply-branch" type="checkbox" />
+              Start a new thread from this message
+            </label>
+            <p id="reply-destination" class="hint" hidden></p>
+            <div class="row">
+              <button id="reply-cancel" class="secondary" type="button">Cancel</button>
+              <button id="reply-send" type="button">Send reply</button>
+            </div>
+            <!-- A send that failed says so HERE, next to the text it did not send, and the text
+                 stays in the box. -->
+            <p id="reply-state" class="hint" aria-live="polite"></p>
           </div>
-          <!-- A send that failed says so HERE, next to the text it did not send, and the text
-               stays in the box. -->
-          <p id="reply-state" class="hint" aria-live="polite"></p>
         </section>
 
         <!-- ------------------------------------------------------------------ threads screen -->

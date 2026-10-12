@@ -439,6 +439,27 @@ steps:
       classification: latency-bound
       rss_baseline_bytes: 1073741824
 
+  # `#247 reply-continuity` in the browser engine, at 1280x800 with a mouse and at 412x915 by touch, at
+  # 80%, 100% and 130% text: Reply on a message in the middle of the list, just under where the title
+  # bar goes, half under the list's top edge, low on the screen, a reply in its gutter, and one taller
+  # than the screen. Its words are the list's computed size and width, its top stays where the row's was
+  # (within 1px) or is clamped to the top, the box comes up directly under it, a low one moves up only as
+  # far as shows it whole, a tall one keeps its top, and Cancel comes back to the pixel; the reply screen
+  # is tinted in the dark scheme and the light. Measured on 2026-10-12: about 18s wall.
+  - group: check
+    job: reply-continuity-browser
+    desc: the replied message kept at the list's size and place, the box under it, and the tint, in current Chromium at 1280x800 and 412x915
+    labels: [validation-vibe-talk]
+    cmd: cd vibe-talk && python3 tests/reply_continuity_browser.py
+    jobs_flag: ""
+    timeout: 150
+    cpu_timeout: 75
+    hint:
+      resources: {browser: 1}
+      est_duration_s: 18
+      classification: latency-bound
+      rss_baseline_bytes: 1073741824
+
   # ---- the build everything else needs ----------------------------------------------------------
   - group: build
     job: release

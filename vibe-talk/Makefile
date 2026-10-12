@@ -10,7 +10,7 @@
 # tool's lightweight unboxed gate. The root includes `tests.dag.yaml` directly so vibe-talk shares
 # one scheduler and browser cap with the other repository fragments.
 
-.PHONY: validate validate-boxed dag-check fmt check scripts-check contract contract-check typecheck test page pwa-installability enter-to-send-browser offline-cache-browser reactions-browser rich-headers-browser read-aloud-browser post-confirm-browser view-switch-browser read-modes-browser keyboard-browser two-column-browser bookmark-browser voice-read-acceptance-self-test android-speech-self-test live-hint-adapter-self-test container-smoke filter-place-browser voice-composer-browser clean
+.PHONY: validate validate-boxed dag-check fmt check scripts-check contract contract-check typecheck test page pwa-installability enter-to-send-browser offline-cache-browser reactions-browser rich-headers-browser read-aloud-browser post-confirm-browser view-switch-browser read-modes-browser keyboard-browser two-column-browser bookmark-browser reply-continuity-browser voice-read-acceptance-self-test android-speech-self-test live-hint-adapter-self-test container-smoke filter-place-browser voice-composer-browser clean
 
 # The whole gate for this tool, cheapest and most likely to fail first.
 #
@@ -210,6 +210,16 @@ bookmark-browser:
 # PNG of each stage.
 filter-place-browser:
 	python3 tests/filter_place_browser.py $(if $(WEB_ROOT),--web-root $(WEB_ROOT)) $(if $(SCREENSHOTS),--screenshots $(SCREENSHOTS))
+
+# `#247 reply-continuity` in a real Chromium at 1280x800 (mouse) and 412x915 (touch), at 80%, 100% and
+# 130% text: Reply on a message in the middle of the list, just under where the title bar goes, half
+# under the list's top edge, low on the screen, a reply in its gutter, and one taller than the screen.
+# The words are the list's size and width, the message's top stays where the row's was (within 1px) or
+# at the top, the box comes up directly under it, a low one moves up only as far as shows it, and
+# Cancel comes back to the pixel; the reply screen is tinted in the dark scheme and the light. Pass
+# WEB_ROOT=dir to run it against another copy of the page, and SCREENSHOTS=dir to keep a PNG of each.
+reply-continuity-browser:
+	python3 tests/reply_continuity_browser.py $(if $(WEB_ROOT),--web-root $(WEB_ROOT)) $(if $(SCREENSHOTS),--screenshots $(SCREENSHOTS))
 
 # The live #47 read-aloud-overlong check is opt-in and may consume provider time. Its transcript
 # reconciliation, PCM-duration metric, re-answer separation, privacy boundaries, threshold edges,

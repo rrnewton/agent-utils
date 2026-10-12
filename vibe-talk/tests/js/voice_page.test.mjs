@@ -379,7 +379,9 @@ const FIXTURE_TREE = {
   "control-bar": ["open-settings", "bar-pack", "prompts-tray", "view-switch"],
   // `#200 reply-context`. The reply screen's one scroll: the earlier messages, oldest at the top,
   // then the message being answered. The SECOND element the model scrolls — see `SCROLLERS`.
-  "reply-scroll": ["reply-context-more", "reply-context-state", "reply-context", "reply-target-meta", "reply-target"],
+  // `#247 reply-continuity` put the room that holds the message in place at its head, and moved the
+  // line naming the message beside the box's label, out of the scroll.
+  "reply-scroll": ["reply-lead", "reply-context-more", "reply-context-state", "reply-context", "reply-target"],
   // `#229 desktop-two-column`. The right column of the desk's two-column layout: its heading, its
   // one scrolling element (the THIRD the model scrolls, see `SCROLLERS`) holding the cards and the
   // thread pane, which nests exactly as #pane-discord does, and its jump over the foot.
@@ -484,6 +486,12 @@ function assertMarkupContains(parent, child) {
   );
 }
 
+/** An inline CSS length in px as a number, or null for anything else (unset, auto, a percentage). */
+function inlinePx(value) {
+  const match = /^(-?\d+(?:\.\d+)?)px$/.exec(String(value || ""));
+  return match ? Number(match[1]) : null;
+}
+
 class FakeElement {
   constructor(id, tagName = "") {
     this.id = id;
@@ -505,8 +513,9 @@ class FakeElement {
     this.scrollPosition = 0;
     // A real browser clamps scrollTop to scrollHeight - clientHeight, so the page cannot ask
     // "is the reader at the bottom?" without a viewport height. Zero everywhere except the one
-    // element that has one; `newPage` gives #scroll-area SCROLL_VIEWPORT_PX.
-    this.clientHeight = 0;
+    // element that has one; `newPage` gives #scroll-area SCROLL_VIEWPORT_PX. See the accessor below
+    // for what an inline height does to it.
+    this.baseClientHeight = 0;
     // Width is not modelled the way height is — nothing in this fixture lays anything out
     // horizontally — but two things the page does read one: the reading-column handle converts a
     // pointer position into characters using the pane's measured width, and it centres the drag on
@@ -562,6 +571,22 @@ class FakeElement {
     this.scrollPosition = Math.max(0, Math.min(Number(value) || 0, furthest));
   }
 
+  /**
+   * The viewport height: the one `newPage` gave a scroller, or, where the page has set an inline
+   * height in px (`#247 reply-continuity` sizes the reply screen's conversation to end at the message
+   * being answered), that height — never more than the room the scroller was given, because a flex
+   * item in a column the screen's height shrinks to fit it.
+   */
+  get clientHeight() {
+    const fixed = inlinePx(this.style.height);
+    if (fixed === null) return this.baseClientHeight;
+    return this.baseClientHeight > 0 ? Math.min(fixed, this.baseClientHeight) : fixed;
+  }
+
+  set clientHeight(value) {
+    this.baseClientHeight = Number(value) || 0;
+  }
+
   /** Whether this element's class list contains a word — `className` here is a plain string. */
   hasClass(name) {
     return this.className.split(/\s+/).includes(name);
@@ -588,13 +613,21 @@ class FakeElement {
     return this.children.reduce((total, kid) => total + kid.height(), own);
   }
 
-  /** What this element occupies on screen. A hidden element occupies nothing. */
+  /**
+   * What this element occupies on screen. A hidden element occupies nothing, and one the page gave an
+   * inline height in px occupies that (the reply screen's room over its earlier messages,
+   * `#247 reply-continuity`): the one piece of the page's own layout this model takes from it.
+   */
   height() {
     // `.search-hidden` is `display: none !important` in web/voice.css: a row a filter hides takes no
     // room, so a filter that changes which rows show moves every row below them. `#243
     // filter-keeps-selection` measures exactly that.
     if (this.hidden || this.hasClass("search-hidden")) {
       return 0;
+    }
+    const fixed = inlinePx(this.style.height);
+    if (fixed !== null) {
+      return fixed;
     }
     if (this.hasClass("clamped")) {
       return Math.min(this.contentHeight(), CLAMP_LINES * LINE_PX);
@@ -3166,6 +3199,12 @@ const TUNING_BANDS = {
     "earlier messages the reply screen draws before 'Load earlier messages'. Under about four the " +
     "question being answered is often already off the top; past a few dozen the screen builds a " +
     "long history on every Reply, most of it never scrolled to"],
+  // `#247 reply-continuity`: how much of the message being answered shows above the box at least.
+  REPLY_SHOWN_PERCENT: [20, 50,
+    "percent of the reply screen's conversation a message taller than it keeps above the box when " +
+    "its top on the list was lower than that. Under a fifth it can open as a line or two above the " +
+    "box, which reads as the message having gone; past a half the message jumps up the screen for " +
+    "any row in the lower half of the list, which is the move the owner asked the screen not to make"],
   // `#204 reply-arrow`: the tap on a reply's arrow, and where it lands.
   REPLY_JUMP_PAGES: [2, 10,
     "older pages one tap on a reply's arrow may read looking for what it answers. Fewer than two " +
@@ -26723,39 +26762,231 @@ test("a long earlier message is folded as on the channel, and the message opens 
   assert.equal(body.className, "body clamped");
 });
 
-test("the reply screen opens at the message being answered, with what came before it above", async () => {
-  const run = async (script) => {
-    const page = newPage(new Map(), script);
-    await signIn(page);
-    const lines = await showDiscord(page, [...tallChannel(6), message({ id: "99", content: "the question" })]);
-    await replyButton(lines[lines.length - 1]).click();
+// --- the reply screen keeps the message where it was (#247 reply-continuity) ------------------------
+//
+// The owner: "Reply jumps to a different view with different FONT SIZE. This is jarring ... I'd
+// rather the top of the message I press Reply on to stay still on the screen. Expand it below and
+// truncate below that (moving up the text entry box underneath)." This fixture lays nothing out but
+// heights, and gives the list and the reply screen's conversation the same origin, y = 0, so "where
+// it was" is the row's top on the list and "where it is" the message's top in the conversation.
+// tests/reply_continuity_browser.py measures the same in Chromium, where the two origins differ.
+
+/** A channel of short messages and one long one, `long`, at the newest end unless placed. */
+function continuityChannel(count = 24, long = null) {
+  return Array.from({ length: count }, (_unused, i) => {
+    const id = String(i + 1);
+    return message({ id, content: id === long ? longMessage(`message ${id}`).repeat(2) : `message ${id}: short` });
+  });
+}
+
+/** The message being answered, as drawn on the reply screen. */
+const replyRow = (page) => page.el("reply-target").children[0];
+
+/**
+ * Scroll the list so the row of message `id` has its top at `y`, and press its Reply. Returns where
+ * the row's top really was, which a list at either of its ends may not let be `y`.
+ */
+async function replyFromRowAt(page, id, y) {
+  const area = page.el("scroll-area");
+  area.scrollTop += channelRow(page, id).getBoundingClientRect().top - y;
+  const was = channelRow(page, id).getBoundingClientRect().top;
+  await replyButton(channelRow(page, id)).click();
+  assert.equal(page.screen(), "reply", "Reply did not open the reply screen");
+  return was;
+}
+
+/** A page on a channel of `messages`. */
+async function continuityPage(messages = continuityChannel()) {
+  const page = newPage();
+  await signIn(page);
+  await showDiscord(page, messages);
+  return page;
+}
+
+test("`#247 reply-continuity`: Reply keeps the message's top where it was on the list, and the box comes up under it", async () => {
+  const room = REPLY_VIEWPORT_PX;
+  // In the middle of the screen, and at its top.
+  for (const y of [60, 0]) {
+    const page = await continuityPage();
+    const was = await replyFromRowAt(page, "12", y);
+    assert.equal(was, y, "this fixture could not put the row where the test asks");
+    const box = replyRow(page).getBoundingClientRect();
+    assert.ok(Math.abs(box.top - was) <= 1, `the message's top moved from ${was} to ${box.top}`);
+    // The conversation ends at the message's foot: the box is directly under it, and nothing that came
+    // after it on the list is on the screen.
     const pane = page.el("reply-scroll");
-    assert.ok(pane.scrollHeight > pane.clientHeight * 2, "the reply screen does not overflow, so this asks nothing");
-    return { page, pane };
-  };
-  const { page, pane } = await run();
-  assert.equal(contextIds(page).length, 6);
-  // The whole message is in view, and the earlier ones are above it: reached by scrolling up.
-  const meta = page.el("reply-target-meta").getBoundingClientRect();
-  const target = page.el("reply-target").getBoundingClientRect();
-  assert.ok(meta.top >= 0 && target.bottom <= pane.clientHeight,
-    `the message is not in view: ${meta.top}..${target.bottom} in ${pane.clientHeight}`);
-  assert.ok(pane.scrollTop > 0, "the screen opened at the top of the context, not at the message");
-  assert.ok(page.el("reply-context").children[0].getBoundingClientRect().bottom <= 0,
-    "the oldest earlier message is on screen, so the message is not where the screen opened");
+    assert.equal(pane.getAttribute("data-fit"), "message", "the conversation was not sized to end at the message");
+    assert.ok(Math.abs(pane.clientHeight - box.bottom) <= 1, `the conversation ends at ${pane.clientHeight}, the message at ${box.bottom}`);
+    assert.ok(pane.clientHeight < room, "the conversation still fills the screen, so the box is not under the message");
+    assert.equal(page.el("reply-target").text().includes("message 13"), false, "a later message is on the reply screen");
+    // What came before it is above it, as it was: the earlier messages, newest last.
+    assert.deepEqual(contextIds(page).slice(-2), ["10", "11"]);
+    assert.ok(page.el("reply-context").children.at(-1).getBoundingClientRect().bottom <= box.top);
+  }
+});
 
-  // THE CONTROL: without the scroll, the screen opens on the oldest earlier message instead.
-  const control = await run(brokenScript(
-    "  pane.scrollTop = Math.min(top, pane.scrollHeight - pane.clientHeight);", "  void top;"));
-  assert.ok(control.page.el("reply-target-meta").getBoundingClientRect().top >= control.pane.clientHeight,
-    "with the scroll deleted the message was still in view, so this test cannot tell the two apart");
+test("`#247 reply-continuity`: a message whose top was above the list's edge opens at the top", async () => {
+  const page = await continuityPage();
+  const was = await replyFromRowAt(page, "12", -15);
+  assert.equal(was, -15, "this fixture could not put the row half off the top");
+  assert.equal(replyRow(page).getBoundingClientRect().top, 0, "the message was not clamped to the top of the screen");
+  assert.equal(page.el("reply-scroll").getAttribute("data-fit"), "message");
+});
 
-  // A message taller than the screen opens at its first line.
-  const tall = newPage();
-  await signIn(tall);
-  const tallLines = await showDiscord(tall, [...tallChannel(3), message({ id: "98", content: longMessage("x").repeat(4) })]);
-  await replyButton(tallLines[tallLines.length - 1]).click();
-  assert.equal(tall.el("reply-target-meta").getBoundingClientRect().top, 0, "a tall message did not open at its start");
+test("`#247 reply-continuity`: low on the screen the message moves up only as far as shows it, or a tall one's opening, above the box", async () => {
+  const room = REPLY_VIEWPORT_PX;
+  const shown = sourceConstant("REPLY_SHOWN_PERCENT") / 100;
+  // A short message near the foot of the list, lower than the reply screen's conversation reaches.
+  const page = await continuityPage();
+  const was = await replyFromRowAt(page, "12", SCROLL_VIEWPORT_PX - 60);
+  const box = replyRow(page).getBoundingClientRect();
+  const pane = page.el("reply-scroll");
+  assert.ok(box.height < room, "this message is taller than the room, so this asks something else");
+  // All of it shows, directly over the box, and it is moved up by no more than that takes.
+  assert.ok(Math.abs(box.bottom - pane.clientHeight) <= 1, `the message ends at ${box.bottom}, the conversation at ${pane.clientHeight}`);
+  assert.ok(Math.abs(box.top - (room - box.height)) <= 1, `the message moved further up than it had to: ${box.top}`);
+  assert.ok(box.top < was);
+  // Lower in the room than its opening third allows, a tall message keeps that much in view.
+  const tall = await continuityPage(continuityChannel(24, "12"));
+  const tallWas = await replyFromRowAt(tall, "12", room - 20);
+  const tallBox = replyRow(tall).getBoundingClientRect();
+  assert.ok(tallBox.height > room, "the message is not taller than the screen");
+  assert.ok(Math.abs(tallBox.top - room * (1 - shown)) <= 1, `a tall message low on the list opened at ${tallBox.top}, not with its opening third shown`);
+  assert.ok(tallBox.top < tallWas);
+  assert.equal(tall.el("reply-scroll").hasAttribute("data-fit"), false,
+    "a message that does not fit shrank the conversation, so the box is not at the foot of the screen");
+});
+
+test("`#247 reply-continuity`: a message taller than the screen keeps its top, the rest a scroll down", async () => {
+  const room = REPLY_VIEWPORT_PX;
+  const page = await continuityPage(continuityChannel(24, "12"));
+  const was = await replyFromRowAt(page, "12", 40);
+  assert.equal(was, 40);
+  const pane = page.el("reply-scroll");
+  const box = replyRow(page).getBoundingClientRect();
+  assert.ok(box.height > room, "the message is not taller than the screen, so this asks nothing");
+  assert.ok(Math.abs(box.top - was) <= 1, `a tall message's top moved from ${was} to ${box.top}`);
+  assert.equal(pane.hasAttribute("data-fit"), false, "the conversation does not take all the room there is");
+  assert.equal(pane.clientHeight, room);
+  assert.ok(pane.scrollHeight - pane.scrollTop > pane.clientHeight, "the rest of the message cannot be scrolled to");
+  // Never folded: answering it is the reason for the screen.
+  const body = replyRow(page).descendants().find((node) => node.hasClass("body"));
+  assert.equal(body.className, "body", "the message being answered was folded");
+});
+
+test("`#247 reply-continuity`: with too little above it, the room over the earlier messages holds the message in place", async () => {
+  // The second message of the channel has one before it, shorter on the reply screen than the space
+  // above its row on the list.
+  const page = await continuityPage(continuityChannel(6));
+  const was = await replyFromRowAt(page, "2", 100);
+  assert.equal(was, 100, "this fixture could not put the row where the test asks");
+  assert.ok(page.el("reply-context").height() < was, "the earlier message fills the space, so this asks nothing");
+  const box = replyRow(page).getBoundingClientRect();
+  assert.ok(Math.abs(box.top - was) <= 1, `the message's top moved from ${was} to ${box.top}`);
+  const lead = page.el("reply-lead");
+  assert.ok(lead.height() > 0, "nothing holds the message in place");
+  assert.equal(page.el("reply-scroll").scrollTop, 0);
+
+  // THE CONTROL: without the room, the message is drawn under the one earlier message, not where it was.
+  const control = newPage(new Map(), brokenScript(
+    "  if (extra > 0) lead.style.height = `${extra}px`;", "  void lead;"));
+  await signIn(control);
+  await showDiscord(control, continuityChannel(6));
+  await replyFromRowAt(control, "2", 100);
+  assert.ok(Math.abs(replyRow(control).getBoundingClientRect().top - was) > 1,
+    "with the room deleted the message was still where it was, so this test cannot tell the two apart");
+});
+
+test("`#247 reply-continuity`: the message is the channel's row, at the reader's text size, with the accent edge", async () => {
+  // The fixture lays out no type, so this holds the RULES to it; tests/reply_continuity_browser.py
+  // measures the computed sizes in Chromium at several text sizes.
+  const list = cssBlock("#discord-log .body");
+  assert.match(list, /font-size:\s*calc\(0\.88rem \* var\(--msg-scale\)\)/);
+  assert.equal(cssBlock("#reply-target .body"), list, "the message being answered is not drawn at the list's size");
+  // No other rule gives the message's words a size of their own.
+  for (const rule of CSS_CODE.matchAll(/([^{}]+)\{([^{}]*)\}/g)) {
+    const selectors = rule[1].split(",").map((part) => part.trim());
+    if (!selectors.some((one) => /#reply-target(?![-\w])/.test(one) && !/\.meta\b/.test(one))) continue;
+    if (!/font-size/.test(rule[2])) continue;
+    assert.ok(selectors.includes("#discord-log .body"), `${rule[1].trim()} sizes the message being answered apart from the list`);
+  }
+  // The speaker rules, the reply gutter and a gathered reply's indent name it beside the channel's list.
+  for (const selector of ['#reply-target li.discord-message[data-who="me"]', '#reply-target li.discord-message[data-who="coder"]',
+    '#reply-target li.discord-message[data-who="human"]', '#reply-target li.discord-message[data-is-reply="true"][data-who]',
+    '#reply-target li.discord-message[data-stack-under="me"][data-who]']) {
+    const twin = selector.replace("#reply-target", "#discord-log");
+    const rules = cssRules(CSS, selector);
+    assert.ok(rules.length > 0, `no rule draws ${selector}`);
+    // Every rule that draws it draws the list's row too: one rule, two lists, as for #side-log.
+    const twins = cssRules(CSS, twin);
+    for (const rule of rules) assert.ok(twins.includes(rule), `${selector} is drawn by a rule ${twin} is not`);
+  }
+  assert.match(cssBlock("#screen-reply #reply-target li.discord-message[data-who]"), /border-color:\s*var\(--accent\)/);
+  // At each text size Settings offers, the size is the reader's and the message's words are in a `.body`.
+  for (const pct of [80, 100, 130, 150]) {
+    const page = await continuityPage();
+    page.el("msg-scale").value = String(pct);
+    await page.el("msg-scale").dispatch("input", {});
+    assert.equal(page.documentElement.style.getPropertyValue("--msg-scale"), String(pct / 100));
+    await replyFromRowAt(page, "12", 60);
+    const row = replyRow(page);
+    assert.equal(row.className, "discord-message", "the message being answered is not the channel's row");
+    assert.equal(row.getAttribute("data-who"), "coder");
+    const body = row.descendants().find((node) => node.hasClass("body"));
+    assert.ok(body && body.className === "body", `at ${pct}% the message's words are not in an unfolded .body`);
+    assert.match(body.text(), /message 12: short/);
+    // Nothing on it acts: no Reply, Done, more options or thread tag.
+    for (const control of ["reply-button", "done-button", "row-more", "thread-badge"]) {
+      assert.equal(row.descendants().find((node) => node.hasClass(control)), undefined, `the message carries a ${control}`);
+    }
+  }
+});
+
+test("`#247 reply-continuity`: a reply keeps the gutter it had on the list, so its lines break where they did", async () => {
+  const messages = continuityChannel(12);
+  messages[9] = message({ id: "10", content: "an answer to the third", reply_to: "3" });
+  const page = await continuityPage(messages);
+  assert.equal(channelRow(page, "10").getAttribute("data-is-reply"), "true");
+  await replyFromRowAt(page, "10", 60);
+  assert.equal(replyRow(page).getAttribute("data-is-reply"), "true", "the reply lost its gutter on the reply screen");
+  assert.equal(replyRow(page).descendants().find((node) => node.hasClass("reply-jump")), undefined,
+    "the arrow came with it, and on this screen it would navigate away from the reply being written");
+});
+
+test("`#247 reply-continuity`: the reply screen is tinted, in both schemes, and only while it is up", async () => {
+  const page = await continuityPage();
+  assert.equal(page.el("frame-body").getAttribute("data-screen"), "main");
+  await replyFromRowAt(page, "12", 60);
+  assert.equal(page.el("frame-body").getAttribute("data-screen"), "reply", "nothing says the reply screen is up");
+  assert.match(cssBlock('#frame-body[data-screen="reply"]'), /background:\s*var\(--reply-tint\)/);
+  const tint = (text) => (/--reply-tint:\s*(#[0-9a-f]{6})/i.exec(text) || [])[1];
+  const page_bg = (text) => (/--bg:\s*(#[0-9a-f]{6})/i.exec(text) || [])[1];
+  const lightAt = CSS_CODE.indexOf("@media (prefers-color-scheme: light)");
+  const sharedLightAt = SHARED_CSS.indexOf("@media (prefers-color-scheme: light)");
+  const dark = tint(CSS_CODE.slice(0, lightAt));
+  const light = tint(mediaBody("(prefers-color-scheme: light)"));
+  assert.ok(dark && light, "the tint is not declared for both schemes");
+  assert.notEqual(dark, page_bg(SHARED_CSS.slice(0, sharedLightAt)), "the dark tint is the page's own colour");
+  assert.notEqual(light, page_bg(SHARED_CSS.slice(sharedLightAt)), "the light tint is the page's own colour");
+  await page.el("reply-cancel").click();
+  assert.equal(page.el("frame-body").getAttribute("data-screen"), "main", "the tint outlived the reply screen");
+});
+
+test("`#247 reply-continuity`: Cancel, Back and Esc come back to exactly where the list was", async () => {
+  for (const leave of ["reply-cancel", "close-reply", "Escape"]) {
+    const page = await continuityPage();
+    const area = page.el("scroll-area");
+    area.scrollTop += channelRow(page, "12").getBoundingClientRect().top - 60;
+    const top = area.scrollTop;
+    assert.ok(top > 0 && top < area.scrollHeight - area.clientHeight - BOTTOM_SLACK_PX, "the list is not mid-scroll");
+    const anchor = channelRow(page, "11").getBoundingClientRect().top;
+    await replyButton(channelRow(page, "12")).click();
+    if (leave === "Escape") await press(page, page.el("reply-scroll"), "Escape");
+    else await page.el(leave).click();
+    assert.equal(page.screen(), "main", `${leave} did not leave the reply screen`);
+    assert.ok(Math.abs(area.scrollTop - top) <= 1, `after ${leave} the list is at ${area.scrollTop}, not ${top}`);
+    assert.equal(channelRow(page, "11").getBoundingClientRect().top, anchor, `after ${leave} the rows are not where they were`);
+  }
 });
 
 test("the earlier messages start at REPLY_CONTEXT_LIMIT, and Load earlier shows the rest the page holds without asking", async () => {
@@ -26769,7 +27000,7 @@ test("the earlier messages start at REPLY_CONTEXT_LIMIT, and Load earlier shows 
   assert.deepEqual(contextIds(page), held.slice(-limit), "the newest earlier messages are not the ones shown");
   const more = page.el("reply-context-more");
   assert.equal(more.hidden, false, "nothing offers the earlier messages the page holds");
-  const meta = page.el("reply-target-meta");
+  const meta = page.el("reply-target");
   const before = meta.getBoundingClientRect().top;
   const asked = page.requests.length;
   await more.click();
@@ -26831,7 +27062,7 @@ test("Load earlier pages the thread back from the server on its cursor, with a G
 
   const writes = () => page.requests.filter((request) => !request.startsWith("GET")).length;
   const writesBefore = writes();
-  const meta = page.el("reply-target-meta");
+  const meta = page.el("reply-target");
   const before = meta.getBoundingClientRect().top;
   await more.click();
   await page.settle();
