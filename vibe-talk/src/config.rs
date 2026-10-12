@@ -2653,7 +2653,6 @@ provider = "slack"
             ),
             "providers.gchat.upstream_clear",
         );
-
         invalid(
             MULTI.replace(
                 "live_poll_seconds = 15",
