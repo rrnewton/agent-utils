@@ -151,7 +151,7 @@ def test_the_report_names_the_configuration_the_policy_and_the_session() -> None
         "    workspace     agent-cmds\n",
         "    tab label     kvm (not created yet)\n",
         "    herdr         installed; server is running\n",
-        "    panes         3 in workspace 'agent-cmds'\n",
+        "    panes         3 in workspace \"agent-cmds\"\n",
         "\nNothing was changed: status only reads.\n",
     ):
         assert line in text, f"status omitted {line!r}:\n{text}"
@@ -159,7 +159,7 @@ def test_the_report_names_the_configuration_the_policy_and_the_session() -> None
     document = status_document(config, "kvm", "kvm", session)
     assert document["panes"] == {
         "count": 3,
-        "detail": "3 in workspace 'agent-cmds'",
+        "detail": '3 in workspace "agent-cmds"',
         "workspace_exists": True,
     }
     assert document["tab"] == {"exists": False, "label": "kvm"}
@@ -219,7 +219,7 @@ def test_status_reads_and_creates_nothing_on_disk(
     assert main(["--agent", "fixture-agent", "status"]) == 0
     out = capsys.readouterr().out
     assert out.startswith("herdr-run status\n")
-    assert "    panes         2 in workspace 'cross-fixture'\n" in out
+    assert "    panes         2 in workspace \"cross-fixture\"\n" in out
     assert "Nothing was changed: status only reads.\n" in out
 
     assert main(["--json", "--agent", "fixture-agent", "status"]) == 0

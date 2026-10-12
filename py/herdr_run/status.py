@@ -15,6 +15,7 @@ from typing import Protocol
 from herdr_run.client import Pane
 from herdr_run.config import ALLOW_ANY_PROGRAM, Config
 from herdr_run.errors import HerdrRunError
+from herdr_run.textfmt import display, quote
 
 __all__ = [
     "Session",
@@ -98,45 +99,51 @@ def _panes_detail(session: Session, workspace: str) -> str:
     if session.state == "failed":
         return f"unknown ({session.reason})"
     if session.view is None:
-        return f"no workspace labelled '{workspace}' exists yet"
-    return f"{session.view.panes} in workspace '{workspace}'"
+        return f"no workspace labelled {quote(workspace)} exists yet"
+    return f"{session.view.panes} in workspace {quote(workspace)}"
 
 
 def _tab_detail(session: Session, tab_label: str) -> str:
+    shown = display(tab_label)
     if session.state != "running":
-        return tab_label
+        return shown
     if session.view is not None and session.view.tab_exists:
-        return f"{tab_label} (exists)"
-    return f"{tab_label} (not created yet)"
+        return f"{shown} (exists)"
+    return f"{shown} (not created yet)"
 
 
 def _allow_detail(config: Config) -> str:
     if config.allows_any_program():
         return f'any program ("{ALLOW_ANY_PROGRAM}")'
-    return ", ".join(config.allow)
+    return ", ".join(display(name) for name in config.allow)
 
 
 def _list_or_none(values: tuple[str, ...]) -> str:
-    return ", ".join(values) if values else "(none)"
+    return ", ".join(display(value) for value in values) if values else "(none)"
 
 
 def status_text(config: Config, agent: str, tab_label: str, session: Session) -> str:
-    """Render the human-readable report, in the shape ``git status`` set the expectation for."""
+    """Render the human-readable report, in the shape ``git status`` set the expectation for.
+
+    Every value goes through :func:`herdr_run.textfmt.display`, so a path or a name holding a
+    terminal control or an invisible character is shown quoted rather than raw.
+    """
+    source = display(config.source_path) if config.source_path else "(built-in defaults)"
     return (
         "herdr-run status\n"
         "\n"
         "  configuration\n"
-        f"    file          {config.source_path or '(built-in defaults)'}\n"
-        f"    project root  {config.project_root}\n"
-        f"    spool dir     {config.spool_dir}\n"
+        f"    file          {source}\n"
+        f"    project root  {display(config.project_root)}\n"
+        f"    spool dir     {display(config.spool_dir)}\n"
         "\n"
         "  policy\n"
         f"    allow         {_allow_detail(config)}\n"
         f"    prefixes      {_list_or_none(config.prefixes)}\n"
         "\n"
         "  session\n"
-        f"    agent         {agent}\n"
-        f"    workspace     {config.workspace}\n"
+        f"    agent         {display(agent)}\n"
+        f"    workspace     {display(config.workspace)}\n"
         f"    tab label     {_tab_detail(session, tab_label)}\n"
         f"    herdr         {_herdr_detail(session)}\n"
         f"    panes         {_panes_detail(session, config.workspace)}\n"

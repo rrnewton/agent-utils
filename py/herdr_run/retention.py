@@ -113,7 +113,9 @@ def prune_runs(
         return PruneResult((), 0, (absolute_root,))
 
     try:
-        entries = sorted(os.listdir(absolute_root))
+        # By raw bytes, as the native edition sorts: a name that is not UTF-8 is held as surrogate
+        # escapes here, and code-point order would place it differently.
+        entries = sorted(os.listdir(absolute_root), key=os.fsencode)
     except OSError:
         return PruneResult((), 0, ())
 

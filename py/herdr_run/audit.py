@@ -19,7 +19,7 @@ import time
 from collections.abc import Callable
 
 from herdr_run.client import bounded_control_command
-from herdr_run.textfmt import quote
+from herdr_run.textfmt import display, quote
 
 __all__ = [
     "audit_path",
@@ -118,8 +118,8 @@ def warn_if_spool_is_tracked(
         return False
     message = (
         f"herdr-run: WARNING: spool directory {quote(spool_dir)} is NOT git-ignored in "
-        f"{project_root}. Command output and the audit log will be written into a tracked tree. "
-        f"Add '{spool_dir.rstrip('/')}/' to .gitignore."
+        f"{quote(project_root)}. Command output and the audit log will be written into a tracked "
+        f"tree. Add '{display(spool_dir.rstrip('/'))}/' to .gitignore."
     )
     if stream is not None:
         print(message, file=stream)  # type: ignore[call-overload]

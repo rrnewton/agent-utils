@@ -11,7 +11,7 @@ use serde_json::{Map, Number, Value};
 
 use crate::client::bounded_output;
 use crate::output;
-use crate::textfmt::{json_line, quote};
+use crate::textfmt::{display, json_line, quote};
 use crate::timefmt;
 
 /// Return the audit-log path for one project and spool setting.
@@ -56,11 +56,11 @@ pub fn warn_if_spool_is_tracked(project_root: &Path, spool_dir: &Path) -> bool {
     let spool_text = spool_dir.to_string_lossy();
     output::diagnostic(&format!(
         "herdr-run: WARNING: spool directory {} is NOT git-ignored in {}. \
-         Command output and the audit log will be written into a tracked tree. \
-         Add '{}/' to .gitignore.",
+         Command output and the audit log will be written into a tracked \
+         tree. Add '{}/' to .gitignore.",
         quote(&spool_text),
-        project_root.display(),
-        spool_text.trim_end_matches('/')
+        quote(&project_root.to_string_lossy()),
+        display(spool_text.trim_end_matches('/'))
     ));
     true
 }

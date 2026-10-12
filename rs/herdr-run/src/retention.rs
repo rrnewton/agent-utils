@@ -93,6 +93,8 @@ fn prune_runs_at(root: &Path, retention_days: u64, now: SystemTime) -> PruneResu
     let mut entries = read_dir
         .filter_map(std::result::Result::ok)
         .collect::<Vec<_>>();
+    // By the raw bytes of each name (`OsString` orders by bytes), which is the order the other
+    // edition sorts in too.
     entries.sort_by_key(fs::DirEntry::file_name);
 
     let retention = retention_days

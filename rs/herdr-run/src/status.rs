@@ -10,6 +10,7 @@ use serde_json::{json, Value};
 
 use crate::client::HerdrApi;
 use crate::config::{Config, ALLOW_ANY_PROGRAM};
+use crate::textfmt::{display, quote};
 
 /// What could be learned about this project's live Herdr session.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -71,37 +72,49 @@ fn panes_detail(session: &Session, workspace: &str) -> String {
         Session::Unreachable(_) => "unknown (herdr is not reachable)".to_owned(),
         Session::NotRunning => "unknown (no server is running)".to_owned(),
         Session::Failed(reason) => format!("unknown ({reason})"),
-        Session::Running(None) => format!("no workspace labelled '{workspace}' exists yet"),
+        Session::Running(None) => format!("no workspace labelled {} exists yet", quote(workspace)),
         Session::Running(Some(view)) => {
-            format!("{} in workspace '{workspace}'", view.panes)
+            format!("{} in workspace {}", view.panes, quote(workspace))
         }
     }
 }
 
 fn tab_detail(session: &Session, tab_label: &str) -> String {
+    let shown = display(tab_label);
     match session {
-        Session::Running(Some(view)) if view.tab_exists => format!("{tab_label} (exists)"),
-        Session::Running(_) => format!("{tab_label} (not created yet)"),
-        _ => tab_label.to_owned(),
+        Session::Running(Some(view)) if view.tab_exists => format!("{shown} (exists)"),
+        Session::Running(_) => format!("{shown} (not created yet)"),
+        _ => shown,
     }
+}
+
+fn display_join(values: &[String]) -> String {
+    values
+        .iter()
+        .map(|value| display(value))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 fn allow_detail(config: &Config) -> String {
     if config.allows_any_program() {
         return format!("any program ({ALLOW_ANY_PROGRAM:?})");
     }
-    config.allow.join(", ")
+    display_join(&config.allow)
 }
 
 fn list_or_none(values: &[String]) -> String {
     if values.is_empty() {
         "(none)".to_owned()
     } else {
-        values.join(", ")
+        display_join(values)
     }
 }
 
 /// Render the human-readable report, in the shape `git status` set the expectation for.
+///
+/// Every value goes through [`display`], so a path or a name holding a terminal control or an
+/// invisible character is shown quoted rather than raw.
 #[must_use]
 pub fn status_text(config: &Config, agent: &str, tab_label: &str, session: &Session) -> String {
     let mut text = String::from("herdr-run status\n\n");
@@ -111,10 +124,16 @@ pub fn status_text(config: &Config, agent: &str, tab_label: &str, session: &Sess
         config
             .source_path
             .as_deref()
-            .unwrap_or("(built-in defaults)")
+            .map_or_else(|| "(built-in defaults)".to_owned(), display)
     ));
-    text.push_str(&format!("    project root  {}\n", config.project_root));
-    text.push_str(&format!("    spool dir     {}\n", config.spool_dir));
+    text.push_str(&format!(
+        "    project root  {}\n",
+        display(&config.project_root)
+    ));
+    text.push_str(&format!(
+        "    spool dir     {}\n",
+        display(&config.spool_dir)
+    ));
     text.push_str("\n  policy\n");
     text.push_str(&format!("    allow         {}\n", allow_detail(config)));
     text.push_str(&format!(
@@ -122,8 +141,11 @@ pub fn status_text(config: &Config, agent: &str, tab_label: &str, session: &Sess
         list_or_none(&config.prefixes)
     ));
     text.push_str("\n  session\n");
-    text.push_str(&format!("    agent         {agent}\n"));
-    text.push_str(&format!("    workspace     {}\n", config.workspace));
+    text.push_str(&format!("    agent         {}\n", display(agent)));
+    text.push_str(&format!(
+        "    workspace     {}\n",
+        display(&config.workspace)
+    ));
     text.push_str(&format!(
         "    tab label     {}\n",
         tab_detail(session, tab_label)
@@ -367,7 +389,7 @@ mod tests {
             "    workspace     agent-cmds\n",
             "    tab label     kvm (not created yet)\n",
             "    herdr         installed; server is running\n",
-            "    panes         3 in workspace 'agent-cmds'\n",
+            "    panes         3 in workspace \"agent-cmds\"\n",
             "\nNothing was changed: status only reads.\n",
         ] {
             assert!(text.contains(line), "status omitted {line:?}:\n{text}");

@@ -42,6 +42,7 @@
 
 use std::collections::BTreeSet;
 use std::fs;
+use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 
 use serde_json::Value;
@@ -76,7 +77,11 @@ pub fn load_run_records(config: &Config) -> Vec<Value> {
     let mut names: Vec<PathBuf> = entries
         .filter_map(|entry| Some(entry.ok()?.path()))
         .collect();
-    names.sort();
+    // By the raw bytes of each name, which is the order the other edition sorts in too.
+    names.sort_by(|left, right| {
+        let bytes = |path: &PathBuf| path.file_name().map(|name| name.as_bytes().to_vec());
+        bytes(left).cmp(&bytes(right))
+    });
     let mut records = Vec::new();
     for directory in names {
         let path = directory.join("meta.json");

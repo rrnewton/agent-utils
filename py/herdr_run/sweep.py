@@ -73,7 +73,9 @@ def load_run_records(config: Config) -> tuple[dict[str, object], ...]:
     """
     root = runs_root(config.spool_dir, config.project_root)
     try:
-        entries = sorted(os.listdir(root))
+        # By raw bytes, as the native edition sorts: a name that is not UTF-8 is held as surrogate
+        # escapes here, and code-point order would place it differently.
+        entries = sorted(os.listdir(root), key=os.fsencode)
     except OSError:
         return ()
     records: list[dict[str, object]] = []
