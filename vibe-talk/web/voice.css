@@ -5923,7 +5923,8 @@ textarea {
   }
 
   /* The threads, one card each, every card the same height: three lines of what the thread is
-     about, clamped with an ellipsis, then its facts. Edged in the thread's own colour, as its tag. */
+     about, clamped with an ellipsis, then its facts — save the card the reader is on, which shows
+     all of it (below). Edged in the thread's own colour, as its tag. */
   .side-cards {
     display: grid;
     gap: 0.45rem;
@@ -5972,6 +5973,22 @@ textarea {
     height: calc(3 * 1.35em);
     line-height: 1.35;
     overflow-wrap: anywhere;
+  }
+
+  /* `#257 summary-truncation`. The card the reader is on shows its whole text. Three lines keep the
+     list even, but a name and a summary longer than three lines of this column were cut by the clamp
+     with no way to read the rest short of opening the thread, whose heading gives only the name. The
+     card under the mouse is the selected one (`#239 single-selection`), and so is the card the keys
+     are on, so this one rule is both "on hover" and "when selected". Still three lines at least, so
+     a short card does not shrink as it is lit. */
+  .side-card-row[data-selected="true"] > .side-card > .side-card-text,
+  .side-card:focus-visible > .side-card-text {
+    display: block;
+    -webkit-line-clamp: none;
+    line-clamp: none;
+    overflow: visible;
+    height: auto;
+    min-height: calc(3 * 1.35em);
   }
 
   .side-card-facts {

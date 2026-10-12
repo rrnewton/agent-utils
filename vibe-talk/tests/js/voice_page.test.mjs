@@ -38377,6 +38377,17 @@ test("`#229 desktop-two-column`: with no thread selected, a card per thread, new
   assert.match(text, /-webkit-line-clamp:\s*3/);
   assert.match(text, /overflow:\s*hidden/);
   assert.match(text, /height:\s*calc\(3 \* 1\.35em\)/, "a card is not a fixed three lines tall");
+  // `#257 summary-truncation`: save the card the reader is on — under the mouse or the keys, which is
+  // the selected one — which shows its whole text, three lines tall at least, so nothing the clamp
+  // cuts is out of reach.
+  for (const lit of ['.side-card-row[data-selected="true"] > .side-card > .side-card-text',
+    ".side-card:focus-visible > .side-card-text"]) {
+    const whole = cssBlockIn(TWO_COLUMN_QUERY, lit);
+    assert.match(whole, /-webkit-line-clamp:\s*none/, `${lit} is still clamped`);
+    assert.match(whole, /overflow:\s*visible/, `${lit} still hides what runs over`);
+    assert.match(whole, /(^|[^-])height:\s*auto/, `${lit} is still a fixed three lines tall`);
+    assert.match(whole, /min-height:\s*calc\(3 \* 1\.35em\)/, `${lit} shrinks a short card as it is lit`);
+  }
   // A long first message is given whole, its line breaks folded, for the clamp to cut.
   page.threads = [];
   const long = message({ id: "210", content: "a long first message\n\nthat runs over several lines " + "and on ".repeat(40),

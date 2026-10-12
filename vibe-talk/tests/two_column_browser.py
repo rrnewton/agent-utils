@@ -19,9 +19,10 @@ desk size, with a mouse:
   focus, and a real down arrow and a real click on it choose nothing and say why (`#231
   two-column-polish`); the right column is one region, named "Threads" -> the right column lists the
   threads as cards, newest activity first, every card the same height, the summarised one saying its
-  name and summary, the long first message cut to three lines -> a card selects its thread: its rows
-  in the right column under a heading naming it, its region "Thread: " and that name, with the X, and
-  no line saying it is stale -> each column scrolls on its own, under the
+  name and summary, the long first message cut to three lines, and shown whole on the card under the
+  mouse (`#257 summary-truncation`) -> a card selects its thread: its rows in the right column under a
+  heading naming it, its region "Thread: " and that name, with the X, and no line saying it is stale
+  -> each column scrolls on its own, under the
   wheel over it -> the X goes back to the cards, and a Main message's Thread(N) selects its thread on
   the right -> the window narrowed to 900px: one column, as the channel was in one, the button not
   drawn; widened again: two columns, the same thread selected -> the keys, pressed for real: ] gives
@@ -360,6 +361,23 @@ def columns_walk(desk: Desk) -> None:
                f"the long question is not cut to three lines: {replica}")
     desk.shot("1-list")
     desk.notes.append(f"three cards {heights.pop()}px each, newest first, the long one cut to three lines")
+
+    # `#257 summary-truncation`: what the clamp cuts is not out of reach. The card under the mouse is
+    # the selected one, and it shows its whole text; the others keep their three lines.
+    replica_box = page.locator(f"#side-cards > li[data-id='{REPLICA}']").bounding_box()
+    assert replica_box is not None
+    page.mouse.move(replica_box["x"] + replica_box["width"] / 2, replica_box["y"] + 12)
+    desk.wait_for(f"() => document.querySelector(\"#side-cards > li[data-id='{REPLICA}']\")"
+                  ".getAttribute('data-selected') === 'true'", "the card under the mouse is not the selected one")
+    desk.settled()
+    lit = {str(card["id"]): card for card in desk.cards()}
+    desk.check(not lit[REPLICA]["clamped"] and int(str(lit[REPLICA]["lines"])) > 3,
+               f"the card under the mouse does not show its whole text: {lit[REPLICA]}")
+    unlit = next(card for card in cards if card["id"] == CANARY)
+    desk.check(round(float(str(lit[CANARY]["height"]))) == round(float(str(unlit["height"]))),
+               f"a card the mouse is not on changed height: {lit[CANARY]}")
+    desk.shot("1-list-lit")
+    desk.notes.append(f"the card under the mouse showed its whole text in {lit[REPLICA]['lines']} lines")
 
     # A card selects its thread on the right, under a heading naming it, with the X.
     page.click(f"#side-cards > li[data-id='{RUNNER}'] .side-card")
