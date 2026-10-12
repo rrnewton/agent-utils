@@ -45,8 +45,11 @@ from bookmark_browser import AGENT, CHANNEL, TOKEN, FakeApi, Json, check, serve
 if TYPE_CHECKING:
     from playwright.sync_api import BrowserContext, Page, Playwright
 
-# The two sizes the issues name: (label, width, height, touch).
-SIZES = (("desk", 1280, 800, False), ("phone", 412, 915, True))
+# The two sizes the issues name, and the narrow phone where the author filter hangs under the bar:
+# (label, width, height, touch).
+SIZES = (("desk", 1280, 800, False), ("phone", 412, 915, True), ("phone-360", 360, 800, True))
+# Up to this width the author filter hangs under the bar's left end rather than standing on its line.
+HANGS_UNDER_PX = 400
 # The reader's zone, and the moment the browser's clock is fixed at: Monday 12 October 2026, noon there.
 ZONE = "America/New_York"
 NOW = datetime(2026, 10, 12, 12, 0, tzinfo=ZoneInfo(ZONE))
@@ -171,6 +174,18 @@ PARK_JS = """([id, fraction]) => {
 PRESS_AT_JS = """(id) => {
     const r = document.querySelector(`#discord-log > li[data-id='${id}']`).getBoundingClientRect();
     return [r.left + Math.min(40, r.width / 4), r.top + Math.min(18, r.height / 2)];
+}"""
+# The open bar, its field, the author filter and the first row shown, as boxes.
+BAR_JS = """() => {
+    const box = (node) => { const r = node.getBoundingClientRect();
+        return {top: r.top, bottom: r.bottom, left: r.left, right: r.right, width: r.width, height: r.height}; };
+    const first = [...document.querySelectorAll('#discord-log > li[data-id]')].find((li) => li.getClientRects().length);
+    const author = document.getElementById('author-filter');
+    const at = box(author);
+    const hit = document.elementFromPoint((at.left + at.right) / 2, (at.top + at.bottom) / 2);
+    return {bar: box(document.getElementById('search-float')), field: box(document.getElementById('search-field')),
+        author: at, links: box(document.getElementById('links-filter')), first: first ? box(first) : null,
+        pressable: Boolean(hit && author.contains(hit)), width: window.innerWidth};
 }"""
 TOP_JS = """(id) => {
     const row = document.querySelector(`#discord-log > li[data-id='${id}']`);
@@ -323,6 +338,30 @@ def lines_between(walk: Walk, rows: list[Json], why: str) -> int:
     return count
 
 
+def bar_geometry(walk: Walk) -> None:
+    """The author filter is a whole 44px target a tap reaches, on the screen: on the bar's line left of
+    Links where the bar has the room, and hanging under the bar's left end on a narrow phone, over none
+    of the first row, so the field keeps 140px either way."""
+    found = walk.page.evaluate(BAR_JS)
+    measured: Json = {str(name): value for name, value in found.items()} if isinstance(found, dict) else {}
+    author, bar, field = measured.get("author"), measured.get("bar"), measured.get("field")
+    walk.check(number(author, "width") >= 43.5 and number(author, "height") >= 43.5,
+               f"the author filter's target is {number(author, 'width'):.1f}x{number(author, 'height'):.1f}px")
+    walk.check(bool(measured.get("pressable")), "a tap at the author filter's centre lands on something else")
+    walk.check(number(author, "left") >= 0 and number(author, "right") <= number(measured, "width") + 0.5,
+               "the author filter is off the screen")
+    walk.check(number(field, "width") >= 140, f"the field is {number(field, 'width'):.0f}px wide beside the filters")
+    if number(measured, "width") <= HANGS_UNDER_PX:
+        walk.check(number(author, "top") >= number(bar, "bottom") - 0.5, "on a narrow phone the author filter is on the bar's line")
+        first = measured.get("first")
+        walk.check(first is None or number(first, "top") >= number(author, "bottom") - 0.5,
+                   "the author filter hangs over the first row")
+    else:
+        walk.check(abs(number(author, "right") - number(measured.get("links"), "left")) <= 0.5 and
+                   number(author, "top") >= number(bar, "top") - 0.5 and number(author, "bottom") <= number(bar, "bottom") + 0.5,
+                   "the author filter is not on the bar's line, right beside Links")
+
+
 def walk_through(walk: Walk) -> None:
     page = walk.page
     page.fill("#api-token", TOKEN)
@@ -382,6 +421,9 @@ def walk_through(walk: Walk) -> None:
     walk.until(f"() => document.querySelectorAll('#discord-log > li[data-id]:not(.search-hidden)').length === {len(SCRIPT)}",
                "clearing the text did not bring the week back")
     walk.settled()
+    page.evaluate("() => { document.getElementById('scroll-area').scrollTop = 0; }")
+    walk.settled()
+    bar_geometry(walk)
     chosen = message_id(CHOSEN)
     page.evaluate(PARK_JS, [chosen, 0.45])
     walk.settled()

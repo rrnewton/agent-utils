@@ -4184,6 +4184,41 @@ a.search-hit-link {
   padding-top: calc(var(--float-line) + var(--search-bar) / 2 + var(--kinds-gap) + var(--toggle-hit) + 0.35rem);
 }
 
+/* `#251 author-filter`, on a NARROW phone. A third 44px square on the bar's line would take the field
+   under 100px at 360px and leave it a few letters at 313px or under a larger font — the room `#211
+   link-filter` fought for. So up to 400px the author filter hangs UNDER the bar's left end, a disc on
+   the bar's panel, as the kinds of link hang under Links, and the list makes room for it at its head as
+   it does for them; with the kinds up as well it hangs under their row, so the two never meet. Wider,
+   it stays on the line, left of Links. */
+@media (max-width: 400px) {
+  #screen-main[data-searching] #author-filter {
+    position: absolute;
+    top: calc(100% + 1px + var(--kinds-gap));
+    left: 3px;
+  }
+
+  #screen-main[data-searching][data-link-kinds] #author-filter {
+    top: calc(100% + 1px + 2 * var(--kinds-gap) + var(--toggle-hit));
+  }
+
+  #author-filter + #links-filter {
+    margin-left: 0;
+  }
+
+  #author-filter:not([aria-pressed="true"])::before {
+    background: var(--panel);
+    box-shadow: inset 0 0 0 1px var(--edge), 0 1px 6px rgb(0 0 0 / 35%);
+  }
+
+  #screen-main[data-searching] #scroll-area {
+    padding-top: calc(var(--float-line) + var(--search-bar) / 2 + var(--kinds-gap) + var(--toggle-hit) + 0.35rem);
+  }
+
+  #screen-main[data-searching][data-link-kinds] #scroll-area {
+    padding-top: calc(var(--float-line) + var(--search-bar) / 2 + 2 * (var(--kinds-gap) + var(--toggle-hit)) + 0.35rem);
+  }
+}
+
 /* Armed reads differently from merely being dragged, because the difference is the whole of what
    the reader has to know before letting go. Same accent idiom the pressed Type toggle uses. */
 #pull-refresh[data-state="armed"] {

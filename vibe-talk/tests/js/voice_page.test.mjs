@@ -43805,6 +43805,13 @@ test("`#251 author-filter`: the author filter sits left of Links, only while the
       `${selector} is not drawn by the rule that draws Pinned`);
   }
   assert.match(cssBlock("#author-filter + #links-filter"), /margin-left:\s*calc\(-1 \* var\(--bar-gap\)\)/);
+  // ...except on a narrow phone, where a third square on the line would take the field's room: there it
+  // hangs under the bar's left end, and the list makes room for it at its head.
+  const narrow = mediaBody("(max-width: 400px)");
+  assert.match(narrow, /#screen-main\[data-searching\] #author-filter\s*\{[^}]*position:\s*absolute[^}]*top:\s*calc\(100% \+ 1px \+ var\(--kinds-gap\)\)/,
+    "on a narrow phone the author filter does not hang under the bar");
+  assert.match(narrow, /#screen-main\[data-searching\] #scroll-area\s*\{[^}]*var\(--toggle-hit\)/,
+    "on a narrow phone the list makes no room for the author filter under the bar");
   assert.match(cssBlock("#author-filter[aria-pressed=\"true\"]"), /color: var\(--accent\)/, "a filtering state does not say so");
 
   const page = newPage();
