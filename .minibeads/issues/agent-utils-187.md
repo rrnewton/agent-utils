@@ -1,12 +1,13 @@
 ---
 title: 'speakable-ids-urls: say diff numbers and URLs the way a listener needs them'
-status: open
+status: closed
 priority: 1
 issue_type: feature
 labels:
 - vibe-talk
 created_at: 2026-10-04T10:09:55.495750874+00:00
-updated_at: 2026-10-04T10:09:55.495750874+00:00
+updated_at: 2026-10-12T22:11:39.665036293+00:00
+closed_at: 2026-10-12T22:11:39.665036152+00:00
 ---
 
 # Description

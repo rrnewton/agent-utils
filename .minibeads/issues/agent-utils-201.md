@@ -1,10 +1,11 @@
 ---
 title: 'speech-prep-linear: spoken-text preparation is super-linear on very long lines'
-status: open
+status: closed
 priority: 3
 issue_type: bug
 created_at: 2026-10-04T14:01:18.899331331+00:00
-updated_at: 2026-10-04T14:01:18.899331331+00:00
+updated_at: 2026-10-12T22:11:39.667932244+00:00
+closed_at: 2026-10-12T22:11:39.667932104+00:00
 ---
 
 # Description
