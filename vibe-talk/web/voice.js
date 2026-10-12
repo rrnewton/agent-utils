@@ -10061,8 +10061,19 @@ function deltaSideState(thread) {
  *
  * `live` is a copy from the stream. One without a record, of a message no page has placed, is
  * `unplaced` until one does; an acknowledged send is the server's own answer and is placed.
+ *
+ * A NEW REPLY IS ONE MORE ON ITS THREAD'S COUNTS. `#231 two-column-polish`. A reply the store did
+ * not hold, from the stream as it was posted or acknowledged as sent from here, is counted on its
+ * thread's summary — when that summary's last activity is older than the reply, so its count did not
+ * count it — and on the store's copy of the root, as the next read that brings either will count it.
+ * Main's Thread(N), a root's N replies and a card's count used to wait up to a minute for that read,
+ * while the unread chip beside them counted the reply at once: they gave the reported count, or the
+ * replies held where those were more, and on a thread whose older replies are not held — the usual
+ * case behind Main — they never were. Not a `replayed` copy: the stream replays what it had before it
+ * attached, and a read since may have counted it already. Not a root's count of none, which needs
+ * nothing: the reply is all its thread's replies, and is held.
  */
-function foldLiveMessage(message, live = false) {
+function foldLiveMessage(message, live = false, replayed = false) {
   const channel = String(el("discord-channel").value);
   if (channelCanon.channel !== channel) loadCanon(channel);
   const id = String(message.id);
@@ -10079,9 +10090,22 @@ function foldLiveMessage(message, live = false) {
   if (!live || threadOf(kept)) channelCanon.unplaced.delete(id);
   else if (!held) channelCanon.unplaced.add(id);
   const thread = threadOf(kept);
+  const fresh = !held && !replayed && thread !== null && kept.thread.is_root !== true && thread !== channelCanon.scope;
+  /** @param {any} record a summary or a root's thread record: its count with this reply, or null */
+  const withReply = (record) => (fresh && typeof record.reply_count === "number" && record.reply_count > 0
+    ? record.reply_count + 1 : null);
   const summary = thread && channelCanon.threads.find((candidate) => String(candidate.id) === thread);
   if (summary && timeOf(kept, "timestamp") > timeOf(summary, "updated_at")) {
-    upsertThreadSummary({ ...summary, updated_at: kept.timestamp });
+    const count = withReply(summary);
+    upsertThreadSummary({ ...summary, updated_at: kept.timestamp, ...(count === null ? {} : { reply_count: count }) });
+  }
+  const root = fresh
+    ? channelCanon.messages.find((candidate) => threadOf(candidate) === thread && candidate.thread.is_root === true)
+    : undefined;
+  const count = root ? withReply(root.thread) : null;
+  if (root && count !== null) {
+    channelCanon.messages = channelCanon.messages.map((candidate) =>
+      candidate === root ? { ...root, thread: { ...root.thread, reply_count: count } } : candidate);
   }
   return kept;
 }
@@ -21864,10 +21888,11 @@ function appendChannelRow(arriving, live = false, folded = false) {
 
 /**
  * A message that arrived, or was sent from here: into the store once, and onto each column showing
- * messages it belongs in. `#229 desktop-two-column`. Answers the copy the store kept.
+ * messages it belongs in. `#229 desktop-two-column`. Answers the copy the store kept. `replayed`, a
+ * copy the stream replayed (`foldLiveMessage`).
  */
-function appendToColumns(arriving, live = false) {
-  const message = threadingSupported ? foldLiveMessage(arriving, live) : arriving;
+function appendToColumns(arriving, live = false, replayed = false) {
+  const message = threadingSupported ? foldLiveMessage(arriving, live, replayed) : arriving;
   inColumn(columns.main, () => appendChannelRow(message, live, true));
   if (sideShowing()) inColumn(columns.side, () => appendChannelRow(message, live, true));
   return message;
@@ -24021,9 +24046,9 @@ function sideCardUnread(choice, tally) {
  *
  * `#231 two-column-polish`. By the rule of the thread's tag on a root in Main (`drawThreadChips`):
  * the count reported, never fewer than the replies the store holds nor than an exact count the
- * store's copy of the root gives. A reply that came in on the stream is in the store at once, and
- * the card's unread chip counted it then, while the count the thread list reported waited up to a
- * minute for that list's next read.
+ * store's copy of the root gives. A reply that comes in on the stream is counted on its thread's
+ * summary and root as it is folded in (`foldLiveMessage`), so the card counts it with its unread
+ * chip, not up to a minute later at the thread list's next read.
  */
 function sideCardReplies(choice, tally) {
   const entry = tally.threads.get(choice.id);
@@ -25297,14 +25322,14 @@ function receiveLiveMessage(message, selfPosted, replayed, fromTail) {
       // `#226 page-energy-profile`. Into the store, for coming back to draw and read behind; no row
       // and no read for a page nobody can see. A call's agent is told as ever.
       if (!held) {
-        foldLiveMessage(message, true);
+        foldLiveMessage(message, true, replayed);
         liveArrivedHidden = true;
       }
       renderOutgoingEverywhere();
       relayToAgent(message, selfPosted, replayed);
       return;
     }
-    if (!held) appendToColumns(message, true);
+    if (!held) appendToColumns(message, true, replayed);
     renderOutgoingEverywhere();
     relayToAgent(message, selfPosted, replayed);
     // The server owns thread membership, counts and activity ordering. Re-read the active

@@ -38871,6 +38871,75 @@ test("`#231 two-column-polish`: a live reply counts on its thread's card at once
   assert.equal(threadBadge(rowWithId(page, "201")).textContent, "Thread(2)");
 });
 
+/**
+ * The channel in two columns, each thread reporting three replies of which the store holds one: the
+ * usual case behind Main, where All's newest page holds a busy thread's latest replies only. The
+ * first thread's count is exact, the second's the provider's estimate.
+ */
+const twoColumnsWithOlderReplies = (script = SCRIPT) => twoColumnServer((_page, data) => {
+  for (const summary of data.threads) {
+    summary.reply_count = 3;
+    for (const held of data.messages.filter((m) => m.thread && m.thread.id === summary.id)) {
+      held.thread = { ...held.thread, reply_count: 3 };
+    }
+  }
+}, script);
+
+test("`#231 two-column-polish`: a live reply counts on its thread's card and on Main's root when the store does not hold the thread's older replies, and a replayed one is not counted twice", async () => {
+  /** Two live replies, one into each thread, and a replay of one more no read has brought. */
+  const replies = async (script) => {
+    const { page, server, data } = await twoColumnsWithOlderReplies(script);
+    const [first, second] = data.threads;
+    // Main is read as what changed from the poll's first round on, which brings no root that did not
+    // change: the fixture's server does not count a reply on its root, as no read here may.
+    await pollOnce(page);
+    const before = { first: cardFacts(page, first.id), second: cardFacts(page, second.id) };
+    const reads = server.reads.length;
+    for (const [id, root] of [["205", data.messages[1]], ["206", data.messages[3]]]) {
+      const reply = server.post(message({ id, content: `a live answer ${id}`, thread: { ...root.thread, is_root: false } }));
+      await deliver(page, page.stream(), sseMessage(reply));
+      await page.settle();
+    }
+    const live = {
+      first: cardFacts(page, first.id), second: cardFacts(page, second.id),
+      unread: cardPart(page, first.id, "side-card-unread"),
+      badge: threadBadge(rowWithId(page, "201")).textContent,
+      replies: threadButton(rowWithId(page, "201")) ? threadButton(rowWithId(page, "201")).textContent : null,
+    };
+    // A copy the stream replays, of a reply posted before it attached: a read since may have counted
+    // it, so the page leaves the count to the next read that brings one.
+    const replayed = server.post(message({ id: "207", content: "a replayed answer",
+      thread: { ...data.messages[1].thread, is_root: false } }));
+    await deliver(page, page.stream(), sseMessage(replayed, { replayed: true }));
+    await page.settle();
+    assert.deepStrictEqual(server.reads.slice(reads).filter((read) => read.view === "threads" || read.view === "thread"), [],
+      "the thread list or a thread was read, which brings counts, so this does not show the page counting the replies");
+    return { before, live, afterReplay: cardFacts(page, first.id), replayBadge: threadBadge(rowWithId(page, "201")).textContent };
+  };
+  const { before, live, afterReplay, replayBadge } = await replies(SCRIPT);
+  assert.match(before.first, / · 3 replies$/);
+  assert.match(before.second, / · about 3 replies$/);
+  assert.match(live.first, / · 4 replies$/,
+    "the card still gives the count the thread list last reported, a reply short of what its unread chip counts");
+  assert.match(live.second, / · about 4 replies$/, "an estimated count did not take the live reply");
+  assert.equal(live.unread, "2+ unread");
+  assert.equal(live.badge, "Thread(4)", "Main's root did not count the live reply");
+  assert.equal(live.replies, "4 replies", "the root's N replies did not count the live reply");
+  assert.match(afterReplay, / · 4 replies$/, "a replayed reply was counted on top of a count that may hold it");
+  assert.equal(replayBadge, "Thread(4)");
+
+  // The controls. Without the count a live reply adds, the card and the root stay where the reads left
+  // them; counting a replayed copy too counts it on the card.
+  const uncounted = await replies(brokenScript("  const fresh = !held && !replayed && thread !== null",
+    "  const fresh = false && thread !== null"));
+  assert.match(uncounted.live.first, / · 3 replies$/, "the negative control counted the reply, so the check above proves nothing");
+  assert.equal(uncounted.live.badge, "Thread(3)");
+  const replayCounted = await replies(brokenScript("  const fresh = !held && !replayed && thread !== null",
+    "  const fresh = !held && thread !== null"));
+  assert.match(replayCounted.afterReplay, / · 5 replies$/,
+    "the negative control did not count the replayed reply, so the check above proves nothing");
+});
+
 test("`#231 two-column-polish`: the right column is one named region, called what it shows — Threads, or Thread: and its name", async () => {
   // The scroller is the region, as #scroll-area is the left column's, and the column round it is not
   // a second one: two nested regions both called "Thread" were said twice on every way in.
