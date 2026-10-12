@@ -8794,7 +8794,8 @@ test("...and the arrow does not recede with its row: a reply's state is drawn on
   assert.match(reply, new RegExp(`${own}filter:\\s*none`), "a reply is still greyed as a whole row, arrow and all");
   // Each state SAYS how far a row recedes, rather than fading the row itself, so a reply can draw it
   // elsewhere; every other row draws it as before, on the whole row.
-  for (const [state, amount] of [["data-replied", "0.55"], ["data-own-read", "0.42"], ["data-archived", "0.42"],
+  // `#256 reply-marks-read`: being answered no longer recedes on its own (a reply marks the message Done).
+  for (const [state, amount] of [["data-own-read", "0.42"], ["data-archived", "0.42"],
     ["data-noise", "0.32"]]) {
     const rule = cssBlock(`#discord-log li.discord-message[${state}="true"]`);
     assert.match(rule, new RegExp(`--row-opacity:\\s*${amount.replace(".", "\\.")}`), `${state} no longer says how far it recedes`);
@@ -14937,7 +14938,7 @@ function conversation() {
   ];
 }
 
-test("A MESSAGE SOMEBODY HAS ANSWERED IS DIMMED; AN UNANSWERED ONE IS NOT", async () => {
+test("A MESSAGE SOMEBODY HAS ANSWERED IS RECORDED AS ANSWERED, BUT ONLY DONE DRAWS IT GREY", async () => {
   const page = newPage();
   await signIn(page);
   await showDiscord(page, conversation());
@@ -14950,9 +14951,9 @@ test("A MESSAGE SOMEBODY HAS ANSWERED IS DIMMED; AN UNANSWERED ONE IS NOT", asyn
   assert.deepStrictEqual(rowState(page, 1), { replied: "false", archived: "false", reading: "false", ownRead: "false", pending: "false", bookmark: null, isReply: "true" });
   assert.deepStrictEqual(rowState(page, 2), { replied: "false", archived: "false", reading: "false", ownRead: "false", pending: "false", bookmark: null, isReply: "false" });
 
-  // And it is DRAWN, not merely recorded in an attribute.
-  const dimmed = cssBlock('#discord-log li.discord-message[data-replied="true"]');
-  assert.match(dimmed, /opacity/, "an answered row looks exactly like an unanswered one");
+  // `#256 reply-marks-read`: recorded, NOT drawn. Grey means read (Done); a separate "answered" grey left a
+  // message looking read while its Done button said unread, which is the mismatch the owner reported.
+  assert.ok(!CSS_CODE.includes('li.discord-message[data-replied="true"]'), "being answered draws its own grey again");
 });
 
 test("the replied state is re-derived over the WHOLE list, not decided when a row is built", async () => {

@@ -1335,11 +1335,12 @@ body {
   filter: var(--row-filter, none);
 }
 
-#side-log li.discord-message[data-replied="true"],
-#discord-log li.discord-message[data-replied="true"],
-#pinned-log li.discord-message[data-replied="true"] {
-  --row-opacity: 0.55;
-}
+/*
+ * `#256 reply-marks-read`. An answered message is no longer dimmed on its own: a reply marks it Done, and Done
+ * draws the read look. A separate "answered" grey left a message looking read while its Done button said
+ * unread (after an Undo, or a reply the page saw but did not send), which is the mismatch the owner
+ * reported. `data-replied` stays on the row as data for the code that reads it.
+ */
 
 /*
  * `#50 todo-view`. A row the reader has ARCHIVED is greyed, and stays on screen.
