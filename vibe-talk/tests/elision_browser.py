@@ -12,8 +12,10 @@ words under a message three desk lines held whole.
 
 For each layout — a 360px and a 412px phone, a 412px phone at 80% and at 150% text, a 1280x800 desk,
 a 1440px desk with the widest reading column, and a 1200px desk in two columns — it opens a channel of
-prose of three lengths, a 300-character message, Chinese text, a long bare address, and an agent's
-message whose first line its rich header restates, and for every folded row:
+prose of three lengths, a 300-character message, Chinese text, a long bare address, an agent's message
+whose first line its rich header restates, and four bodies as the server renders them that are not
+wrapped prose: a table alone, a table with prose under it, a line of prose over a code block, and a
+list of short items. For every folded row it:
 
   * finds, by the rects of the characters, how many words start and how many characters stand below
     the clamped box: what the fold really hides;
@@ -24,8 +26,13 @@ message whose first line its rich header restates, and for every folded row:
     is hidden: a floor that said almost nothing would be safe and useless.
 
 At 1280 the 300-character message is about three lines (whole in some faces, a few words over in a
-wide one) and says nothing; on the phones it hides more than a line and is labelled; Chinese and the address are counted in characters. With the rich-headers switch
-turned off, the agent's row is labelled from its text as written, still within what is hidden.
+wide one) and says nothing; on the phones it hides more than a line and is labelled; Chinese and the
+address are counted in characters. From review: the clamp draws a TABLE whole, in a box of its own, so
+a table hides nothing and must say nothing — counted a line per cell it said "(~95 more words)" with
+every word on the screen; under prose the table is counted as shown and the prose below its clamp as
+hidden. The code block and the list are labelled on every phone, within what they hide. With the
+rich-headers switch turned off, the agent's row is labelled from its text as written, still within
+what is hidden.
 
 It serves the checked-out page and a small fake API through Playwright's request routing, so no port
 is opened. Pass --web-root DIR to run it against another copy of the page, --screenshots DIR to keep a
@@ -75,6 +82,25 @@ TEXTS: dict[str, str] = {
     "headed": LEAD + PROSE,
 }
 HEADING: Json = {"tag": "build-bot coordinator", "time": "10:52 PM ET", "title": "Backup check", "cut": len(LEAD)}
+
+
+def table_html(rows: int) -> str:
+    """A table as the server's renderer writes one: a header row and `rows` rows of three cells."""
+    def row(tag: str, cells: list[str]) -> str:
+        return "<tr>\n" + "".join(f"<{tag}>{cell}</{tag}>\n" for cell in cells) + "</tr>\n"
+    body = "".join(row("td", [f"shard {r} value {c}" for c in range(3)]) for r in range(rows))
+    return f"<table>\n<thead>\n{row('th', ['Shard', 'Status', 'Checked'])}</thead>\n<tbody>\n{body}</tbody>\n</table>\n"
+
+
+STEPS = "".join(f"step {i}: ok  checksum=abc{i}\n" + ("\n" if i == 6 else "") for i in range(14))
+# Bodies the server renders that are not wrapped prose, sent as `content_html` beside their text.
+RENDERED: dict[str, str] = {
+    "table": table_html(8),
+    "table-prose": table_html(4) + f"<p>{PROSE}</p>\n",
+    "code": f"<p>Here is where things stand after the run:</p>\n<pre><code>{STEPS}</code></pre>\n",
+    "list": "<ul>\n" + "".join(f"<li>shard {i} synced</li>\n" for i in range(24)) + "</ul>\n",
+}
+TEXTS.update({name: f"{name} as written" for name in RENDERED})
 IDS = {name: f"244000000000000{n:04d}" for n, name in enumerate(TEXTS)}
 
 
@@ -86,6 +112,8 @@ def messages() -> list[Json]:
                      "spoken_time": "", "reply_to": None, "content": text}
         if name == "headed":
             one["heading"] = HEADING
+        if name in RENDERED:
+            one["content_html"] = RENDERED[name]
         out.append(one)
     return out
 
@@ -335,6 +363,13 @@ def main() -> int:
                           f"{layout}: the address is not counted in characters: {claims.get('address')}")
                 if layout in ("phone-360", "phone-412"):
                     check(claims.get("brief") is not None, f"{layout}: the 300-character message hides a line and says nothing")
+                # From review: the clamp draws a table whole, so a table alone hides nothing.
+                table = next(row for row in rows if row["id"] == IDS["table"])
+                check(number(table["hiddenWords"]) == 0, f"{layout}: the clamp hid part of a table: {table}")
+                check(claims.get("table") is None, f"{layout}: a table the clamp draws whole says {claims.get('table')}")
+                if layout.startswith("phone"):
+                    for name in ("table-prose", "code", "list"):
+                        check(claims.get(name) is not None, f"{layout}: the {name} row hides words and says nothing")
                 if args.screenshots:
                     page.screenshot(path=str(args.screenshots / f"elision-{layout}.png"))
                 # The switch off: the agent's row is counted from its text as written.
@@ -351,8 +386,9 @@ def main() -> int:
     print(f"Chromium {version}: in seven layouts every folded row's one label claimed no more than its clamp"
           " hides, on a line as wide as the text and at its size; the wall was labelled with at least half of"
           " what it hides; at 1280 the 300-character message, about three lines, said nothing; Chinese and"
-          " a bare address were counted in characters; with rich headers off the agent's row still held."
-          " (label/hidden per row:)")
+          " a bare address were counted in characters; a table the clamp draws whole said nothing, and a table"
+          " under prose, a code block and a list of short items were labelled on the phones within what they"
+          " hide; with rich headers off the agent's row still held. (label/hidden per row:)")
     for note in notes:
         print(f"  {note}")
     return 0

@@ -1197,12 +1197,13 @@ const FOLD_LESS = "Less";
 //     depends on how wide the row's lines are, the text size, and how the browser breaks them. This
 //     file asks the layout engine none of that: a read per long row on every redraw is the forced
 //     layout `#226` took out of the redraw path. It works the count out once, when the row is built,
-//     from the text alone, AT EVERY WIDTH A LINE CAN BE (`FOLD_WIDTHS_EM`), and the stylesheet shows
-//     the one for the width the row has. The label is a size container of its own, as wide as the
-//     text above it and in that text's em, so its container query picks the class from the row as
-//     drawn — a phone, a desk's column, one of two columns, a reply's inset, the reader's text size —
-//     and nothing is measured (web/voice.css, `.elided`). An earlier count assumed a phone's line
-//     everywhere, and on a desk said words were hidden under a message that fitted in three lines.
+//     from what the row draws, AT EVERY WIDTH A LINE CAN BE (`FOLD_WIDTHS_EM`), and the stylesheet
+//     shows the one for the width the row has. The label is a size container of its own, as wide as
+//     the text above it and in that text's em, so its container query picks the class from the row
+//     as drawn — a phone, a desk's column, one of two columns, a reply's inset, the reader's text
+//     size — and nothing is measured (web/voice.css, `.elided`). An earlier count assumed a phone's
+//     line everywhere, and on a desk said words were hidden under a message that fitted in three
+//     lines.
 //   * EACH COUNT IS A FLOOR: worked out at the WIDEST line of its class, with every character at the
 //     narrow end of what the common interface fonts draw (`glyphEm`). So it may say fewer words than
 //     are hidden, and never more; and under `ELIDED_MIN_WORDS` it says nothing, because a floor that
@@ -1213,6 +1214,18 @@ const FOLD_LESS = "Less";
 //     its markup, and a link counts as the words it shows), the spoken text of a transcript turn.
 //     On a row with a rich header (`#242 rich-headers`) the words the header restates are hidden
 //     from the text while it shows, so they are counted out, and back in where the switch is off.
+//   * NOT EVERYTHING IN A MESSAGE IS PROSE, and the clamp does not treat it all as lines
+//     (`foldRuns`). A TABLE scrolls sideways in a box of its own (web/voice.css, `.md table`), and
+//     the clamp counts no line inside such a box: it draws the table whole and goes on counting
+//     below it, so a table counts as shown, all of it, when it starts inside the three lines, and
+//     hidden when it starts below them. From review: counted as a line per cell, a folded table said
+//     "(~95 more words)" with every word of it on the screen. A CODE BLOCK's lines are its own, in a
+//     monospaced face at its smaller size (`MONO_EM`), and where the clamp's last line is one of
+//     them the block's own padding shows the top of the next, which the reader can see, so it counts
+//     as shown. A list is lines like any other, each item starting one. Anything the model has no
+//     rule for gets NO label at all: what it takes up cannot be known without laying it out, and a
+//     guess is a label that can claim words the reader is looking at. (An image never reaches here:
+//     the server sends a message's image as a link, its words.)
 //   * TEXT POOR IN SPACES IS COUNTED IN CHARACTERS. Chinese or Japanese has no spaces to count words
 //     by, and a long bare address is one "word": counted in words, a clamp hiding most of either
 //     would hide nothing. Where what is hidden runs to more than `SPACE_POOR_CHARS` characters a
@@ -1278,34 +1291,157 @@ function glyphEm(ch) {
 const SPACE_EM = glyphEm(" ");
 
 /**
- * `text` as the model lays it out: its lines (each line of the text starts a line of its own — a
- * paragraph, a list item, a blank line in a spoken turn), each a list of PIECES a line may break
- * between. A piece is a word, or the run of it between two characters of a wide script, each of
- * which is a piece of its own. Counted once per text, and laid out at every width from these.
+ * One character of code, inline or in a block, in em of the message text: every character of a
+ * monospaced face is one width, and code is drawn at 0.85 of the text's size (web/voice.css,
+ * `.md code` and `.md pre`). The narrowest common face is Consolas, at 0.55em, so 0.47 of the text's
+ * em; this is a little under that. Not the proportional widths: an "m" there is 0.72, and a line of
+ * them in code would be counted as wrapping where it does not.
  */
-function foldPieces(text) {
+const MONO_EM = 0.45;
+
+/** ...and a character of a wide script or an emoji in code, drawn from a fallback face at 0.85. */
+const MONO_WIDE_EM = 0.76;
+
+/** How wide one character of code is, in em of the message text; see `MONO_EM`. */
+const monoEm = (ch) => (WIDE_SCRIPT.test(ch) || PICTOGRAPH.test(ch) ? MONO_WIDE_EM : MONO_EM);
+
+/** Elements whose words flow on the line they are on: their text is the line's. */
+const FOLD_INLINE = new Set(["a", "code", "del", "em", "input", "s", "span", "strong"]);
+
+/** Elements that start a line and end one, whose own text flows in lines the clamp counts. */
+const FOLD_FLOW_BLOCKS = new Set(["blockquote", "div", "h1", "h2", "h3", "h4", "hr", "li", "ol", "p", "ul"]);
+
+/** The text of `node`'s text nodes, in order, joined with `between`: what a code block holds, as written. */
+function textNodesOf(node, between = "") {
+  const parts = [];
+  const walk = (at) => {
+    for (const kid of at.childNodes) {
+      if (kid.nodeType === 3) parts.push(kid.textContent);
+      else if (kid.nodeType === 1) walk(kid);
+    }
+  };
+  walk(node);
+  return parts.join(between);
+}
+
+/**
+ * What a drawn body holds, as the fold's model reads it: RUNS, `[kind, text]`, in order. `t` is text
+ * that flows, "\n" in it a line end the browser draws (a `<br>`, the edge of a block), any other
+ * white space a space; `m` the same in code's face (inline code); `p` one code block's text, a line
+ * of the block for each of its lines; `w` the words of a block drawn WHOLE, whose lines the clamp
+ * does not count (a table). Null when the body holds an element there is no rule for here. With
+ * `skipClass`, the elements of exactly that class are left out, as `renderedText` leaves them.
+ */
+function foldRuns(node, skipClass = "") {
+  const runs = [];
+  const add = (kind, text) => {
+    const last = runs[runs.length - 1];
+    if (last && last[0] === kind) last[1] += text;
+    else runs.push([kind, text]);
+  };
+  let known = true;
+  const walk = (at, mono) => {
+    for (const kid of at.childNodes) {
+      if (!known) return;
+      if (kid.nodeType === 3) {
+        add(mono ? "m" : "t", String(kid.textContent).replace(/\s/g, " "));
+        continue;
+      }
+      if (kid.nodeType !== 1) continue;
+      if (skipClass && kid.className === skipClass) continue;
+      const tag = String(kid.tagName).toLowerCase();
+      if (tag === "br") {
+        add(mono ? "m" : "t", "\n");
+      } else if (FOLD_INLINE.has(tag)) {
+        walk(kid, mono || tag === "code");
+      } else if (FOLD_FLOW_BLOCKS.has(tag)) {
+        add("t", "\n");
+        walk(kid, mono);
+        add("t", "\n");
+      } else if (tag === "pre") {
+        runs.push(["p", textNodesOf(kid)]);
+      } else if (tag === "table") {
+        // Every word of it, a space between one cell's and the next.
+        runs.push(["w", textNodesOf(kid, " ")]);
+      } else {
+        known = false;
+      }
+    }
+  };
+  walk(node, false);
+  return known ? runs : null;
+}
+
+/**
+ * What the model lays out at every width, from `runs` (see `foldRuns`; a string is a spoken turn's
+ * text, every line of it a line, blank ones too, as `white-space: pre-wrap` draws them): its LINES,
+ * each a list of PIECES a line may break between, and the blocks drawn whole. A piece is a word, or
+ * the run of it between two characters of a wide script, each of which is a piece of its own. A
+ * line of a code block says which block (`pre`, counted from 1) for the padding that shows the top
+ * of its next line. Counted once per text, and laid out at every width from these.
+ */
+function foldPieces(source) {
+  const runs = typeof source === "string" ? [["s", source]] : source;
   const lines = [];
   let words = 0;
   let chars = 0;
-  for (const part of String(text === null || text === undefined ? "" : text).split("\n")) {
-    const pieces = [];
-    for (const word of part.split(/\s+/).filter(Boolean)) {
-      words += 1;
-      let piece = null;
-      for (const ch of word) {
-        const wide = WIDE_SCRIPT.test(ch);
-        if (!piece || wide || piece.wide) {
-          piece = { em: 0, glyphs: [], wide, word: piece === null };
-          pieces.push(piece);
-        }
-        const em = glyphEm(ch);
-        piece.em += em;
-        piece.glyphs.push(em);
-        chars += 1;
+  let blocks = 0;
+  let line = null;
+  let piece = null;
+  let inWord = false;
+  const endLine = () => {
+    if (line && (line.keep || line.pieces.length > 0)) lines.push(line);
+    line = null;
+    piece = null;
+    inWord = false;
+  };
+  const feed = (part, mono) => {
+    for (const ch of part) {
+      if (/\s/.test(ch)) {
+        inWord = false;
+        piece = null;
+        continue;
       }
+      const wide = WIDE_SCRIPT.test(ch);
+      if (!piece || wide || piece.wide) {
+        piece = { em: 0, glyphs: [], wide, word: !inWord };
+        line.pieces.push(piece);
+      }
+      if (!inWord) words += 1;
+      inWord = true;
+      const em = mono ? monoEm(ch) : glyphEm(ch);
+      piece.em += em;
+      piece.glyphs.push(em);
+      chars += 1;
     }
-    lines.push(pieces);
+  };
+  for (const [kind, text] of runs) {
+    if (kind === "w") {
+      endLine();
+      const found = String(text).split(/\s+/).filter(Boolean);
+      const count = found.reduce((sum, word) => sum + [...word].length, 0);
+      lines.push({ whole: true, words: found.length, chars: count });
+      words += found.length;
+      chars += count;
+    } else if (kind === "p") {
+      endLine();
+      blocks += 1;
+      const rows = String(text).split("\n");
+      if (rows.length > 1 && rows[rows.length - 1] === "") rows.pop();
+      for (const row of rows) {
+        line = { pieces: [], pre: blocks, keep: true };
+        feed(row, true);
+        endLine();
+      }
+    } else {
+      String(text).split("\n").forEach((part, at) => {
+        if (at > 0) endLine();
+        if (!line) line = { pieces: [], pre: 0, keep: kind === "s" };
+        feed(part, kind === "m");
+      });
+    }
   }
+  endLine();
   return { lines, words, chars };
 }
 
@@ -1313,31 +1449,43 @@ function foldPieces(text) {
  * How many words and characters of `laid` (see `foldPieces`) a fold shows when a line is `widthEm`
  * wide. Words fill a line greedily, a piece too long for a line breaks inside itself as
  * `overflow-wrap: anywhere` breaks it, and a word that STARTS inside the three lines is shown,
- * because the reader can see that it is there.
+ * because the reader can see that it is there. A block drawn whole that starts inside the three
+ * lines is shown, all of it, and takes none of them; and where the third line is a code block's,
+ * the next line of that block is shown too, its top in the block's padding.
  */
 function foldShows(laid, widthEm) {
   let line = 0;
   let words = 0;
   let chars = 0;
-  for (const pieces of laid.lines) {
+  // The code block the clamp's last line is in, or 0.
+  let edge = 0;
+  const start = (pre) => {
     line += 1;
-    if (line > FOLD_LINES) break;
+    if (line === FOLD_LINES) edge = pre;
+    return line <= FOLD_LINES || (line === FOLD_LINES + 1 && pre !== 0 && pre === edge);
+  };
+  for (const entry of laid.lines) {
+    if (entry.whole) {
+      if (line >= FOLD_LINES) break;
+      words += entry.words;
+      chars += entry.chars;
+      continue;
+    }
+    if (!start(entry.pre)) break;
     let at = 0;
-    for (const piece of pieces) {
+    for (const piece of entry.pieces) {
       const gap = piece.word && at > 0 ? SPACE_EM : 0;
       if (at > 0 && at + gap + piece.em > widthEm) {
-        line += 1;
+        if (!start(entry.pre)) return { words, chars };
         at = 0;
-        if (line > FOLD_LINES) return { words, chars };
       } else {
         at += gap;
       }
       if (piece.word) words += 1;
       for (const em of piece.glyphs) {
         if (at > 0 && at + em > widthEm) {
-          line += 1;
+          if (!start(entry.pre)) return { words, chars };
           at = 0;
-          if (line > FOLD_LINES) return { words, chars };
         }
         at += em;
         chars += 1;
@@ -1369,12 +1517,21 @@ const elisionCounted = new Map();
 /** How many texts `elisionCounted` holds before it starts again. */
 const ELISION_COUNTED_TEXTS = 500;
 
-/** The label for `text` at each of `FOLD_WIDTHS_EM`, in order. Shared: read it, never change it. */
-function elisionLabels(text) {
-  const key = String(text === null || text === undefined ? "" : text);
+/** No label at any width: for a body holding something the model cannot lay out (`foldRuns`). */
+const NO_ELISION_LABELS = Object.freeze(FOLD_WIDTHS_EM.map(() => ""));
+
+/**
+ * The label for `source` at each of `FOLD_WIDTHS_EM`, in order: a spoken turn's text, a drawn body's
+ * runs (`foldRuns`), or null for a body the model cannot lay out, which says nothing. Shared: read
+ * it, never change it.
+ */
+function elisionLabels(source) {
+  if (source === null) return NO_ELISION_LABELS;
+  const runs = typeof source === "string" ? [["s", source]] : source === undefined ? [["s", ""]] : source;
+  const key = JSON.stringify(runs);
   const held = elisionCounted.get(key);
   if (held) return held;
-  const laid = foldPieces(key);
+  const laid = foldPieces(runs);
   const labels = FOLD_WIDTHS_EM.map((widthEm) => {
     const shown = foldShows(laid, widthEm);
     return elisionLabel({ words: laid.words - shown.words, chars: laid.chars - shown.chars });
@@ -1390,12 +1547,13 @@ function elisionLabels(text) {
  * with the header showing or without (`data-rh`). web/voice.css shows the one that applies. Null when
  * no width has anything to say.
  *
- * @param {Array<{text: string, rh: string|null}>} versions the text as the row can show it
+ * @param {Array<{runs: Array<[string, string]>|string|null, rh: string|null}>} versions what the row
+ *   can show, as `elisionLabels` takes it
  */
 function elisionLine(versions) {
   const spans = new Map();
-  for (const { text, rh } of versions) {
-    elisionLabels(text).forEach((label, at) => {
+  for (const { runs, rh } of versions) {
+    elisionLabels(runs).forEach((label, at) => {
       if (!label) return;
       const key = `${rh || ""}|${label}`;
       if (!spans.has(key)) spans.set(key, { label, rh, at: [] });
@@ -1528,15 +1686,18 @@ function foldable(li, meta, body, text, messageId, alsoIds = []) {
     said: null,
     elided: null,
   };
-  // `#244 elision-word-count`. Counted once, here, from the text the row shows; see `elisionLine`.
+  // `#244 elision-word-count`. Counted once, here, from what the row shows; see `elisionLine`.
   // Straight after the text, ahead of the summary line below and of the reactions the channel row
-  // moves under both, so it reads as the end of the folded message. A rich header's row (`#242
-  // rich-headers`) shows its text without the words the header restates while the header shows.
+  // moves under both, so it reads as the end of the folded message. A channel row's body is drawn
+  // (`.md` boxes), and is read for its blocks as well as its words (`foldRuns`); a spoken turn's is
+  // its text. A rich header's row (`#242 rich-headers`) shows its text without the words the header
+  // restates while the header shows.
   const first = body.children[0];
   const headed = Boolean(first && first.hasAttribute && first.hasAttribute("data-rh"));
+  const drawn = (skipClass) => (first ? foldRuns(body, skipClass) : String(text === null || text === undefined ? "" : text));
   entry.elided = elisionLine(headed
-    ? [{ text: renderedText(body, RESTATED_CLASS), rh: "on" }, { text, rh: "off" }]
-    : [{ text, rh: null }]);
+    ? [{ runs: drawn(RESTATED_CLASS), rh: "on" }, { runs: drawn(""), rh: "off" }]
+    : [{ runs: drawn(""), rh: null }]);
   if (entry.elided) li.append(entry.elided);
   if (entry.id) {
     entry.note = document.createElement("div");
@@ -15712,10 +15873,9 @@ const TEXT_BLOCKS = new Set([
 /**
  * What a drawn body SAYS, as text: what the reader sees, with a line end at each line break and at
  * the edge of each block. What search matches and a thread is named by — not the Markdown source,
- * whose asterisks and link targets are not on the screen. With `skipClass`, the elements of exactly
- * that class are left out.
+ * whose asterisks and link targets are not on the screen.
  */
-function renderedText(node, skipClass = "") {
+function renderedText(node) {
   let out = "";
   const walk = (at) => {
     for (const kid of at.childNodes) {
@@ -15724,8 +15884,6 @@ function renderedText(node, skipClass = "") {
         continue;
       }
       if (kid.nodeType !== 1) continue;
-      // What a stylesheet hides, when asked: the words a rich header restates (`elisionLine`).
-      if (skipClass && kid.className === skipClass) continue;
       const tag = String(kid.tagName).toLowerCase();
       if (tag === "br") {
         out += "\n";

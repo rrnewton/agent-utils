@@ -511,8 +511,10 @@ steps:
   # claims no more words or characters than its clamp really hides, found by the rects of its
   # characters, on a line as wide as the text and at its size; a wall is labelled with at least half of
   # what it hides; a 300-character message says nothing on a desk; Chinese and a bare address are
-  # counted in characters; a rich header's row holds with the switch on and off. Served through
-  # Playwright's request routing, so it opens no port. Measured on 2026-10-12: about 6s wall.
+  # counted in characters; a table the clamp draws whole says nothing, and a table over prose, a code
+  # block and a list of short items say no more than they hide; a rich header's row holds with the
+  # switch on and off. Served through Playwright's request routing, so it opens no port. Measured on
+  # 2026-10-12: about 7s wall.
   - group: check
     job: elision-browser
     desc: every folded message's label claims no more than its clamp hides, in seven layouts, in current Chromium
@@ -523,7 +525,7 @@ steps:
     cpu_timeout: 60
     hint:
       resources: {browser: 1}
-      est_duration_s: 6
+      est_duration_s: 7
       classification: latency-bound
       rss_baseline_bytes: 1073741824
 

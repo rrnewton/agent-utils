@@ -3093,9 +3093,23 @@ words". Where what is hidden runs to more than twelve characters a word, the lin
 rich-headers`) the words the header restates are counted out while it shows them, and back in with the
 switch off.
 
+**Not everything in a message is prose, and the count follows what the clamp does with each block.**
+A **table** scrolls sideways in a box of its own, and the clamp counts no line inside such a box: it
+draws the table whole and goes on counting lines under it. So a table counts as shown, every word of
+it, when it starts inside the three lines, and as hidden when it starts below them; a message that is
+only a table says nothing. (Counted a line per cell, the first version said `(~95 more words)` under a
+table with every word on the screen.) A **code block** is counted in lines of its own — blank ones
+too — in code's monospaced face at its smaller size, and where the clamp's last line is one of them the
+block's padding shows the top of its next line, which counts as shown. A **list** is a line per item,
+however short. A message holding anything the count has no rule for gets **no label at all**, rather
+than one worked out from a guess; every element the server's sanitizer sends has a rule, and the page
+suite holds the two lists together. (An image never reaches the count: the server sends it as a link.)
+
 `tests/elision_browser.py` (DAG step `elision-browser`) holds every label to what the clamp really
 hides, found by the rects of the characters in Chromium, in seven layouts: phones at 360 and 412 pixels,
-412 at 80% and 150% text, a 1280 desk, the widest reading column, and two columns.
+412 at 80% and 150% text, a 1280 desk, the widest reading column, and two columns — prose, Chinese, an
+address, a rich header's row, a table alone, a table over prose, a code block and a list of short
+items.
 
 ### A long message can be read as a summary of itself
 

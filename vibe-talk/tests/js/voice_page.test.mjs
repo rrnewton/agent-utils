@@ -6963,6 +6963,116 @@ test("A RICH HEADER'S ROW counts its text without the words the header restates,
   assert.ok(elidedOf(rows[1]).children.every((span) => !span.hasAttribute("data-rh")));
 });
 
+// From review: the model read every line of the text as a line of the clamp, and the clamp does not
+// draw everything in lines. These build bodies as the server renders them (`<table>`, `<pre>`, a list)
+// and hold each label to what the clamp really does with that block; tests/elision_browser.py holds a
+// real Chromium's labels to what it really hides.
+
+/** A table as the server's renderer writes one: a header row and `rows` rows of three cells. */
+const tableHtml = (rows) => {
+  const row = (tag, cells) => `<tr>\n${cells.map((cell) => `<${tag}>${cell}</${tag}>\n`).join("")}</tr>\n`;
+  const body = Array.from({ length: rows }, (_unused, r) => row("td", [0, 1, 2].map((c) => `shard ${r} value ${c}`)));
+  return `<table>\n<thead>\n${row("th", ["Column 0", "Column 1", "Column 2"])}</thead>\n<tbody>\n${body.join("")}</tbody>\n</table>\n`;
+};
+/** The words in `tableHtml(rows)`: two to a header, four to a cell. */
+const tableWords = (rows) => 3 * 2 + rows * 3 * 4;
+
+test("A TABLE IS DRAWN WHOLE: counted as shown where it starts inside the three lines, hidden where it starts below them (#244)", async () => {
+  // From review: a folded table said "(~95 more words)" with every word of it on the screen. The table
+  // scrolls sideways in a box of its own (`.md table`), and the clamp counts no line inside such a box:
+  // it draws the table whole and goes on counting lines under it.
+  assert.match(cssBlock(".md table"), /display:\s*block;[\s\S]*overflow-x:\s*auto;/,
+    "a table is no longer a box of its own, which is what makes the clamp draw it whole");
+  const page = newPage();
+  await signIn(page);
+  const prose = (count) => `<p>${wordsOfLength(count, 4)}</p>\n`;
+  const rows = await showDiscord(page, [
+    message({ id: "7440000000000000701", content: "a table", content_html: tableHtml(8) }),
+    message({ id: "7440000000000000702", content: "a table, then prose", content_html: tableHtml(4) + prose(120) }),
+    message({ id: "7440000000000000703", content: "prose, then a table", content_html: prose(40) + tableHtml(6) }),
+  ]);
+  rows.forEach((row) => assert.equal(row.getAttribute("data-collapsed"), "true", "the fixture did not fold"));
+  assert.equal(elidedOf(rows[0]), undefined, "a table the clamp draws whole says words are hidden");
+  // The table is shown, and so are three lines of the prose under it: the rest of the prose is hidden.
+  const perLine = wordsPerLine(page, 4, 28.5);
+  assert.equal(labelAt(rows[1], PHONE_CLASS), saysHidden(120 - FOLD_LINES * perLine),
+    "the words of a table the clamp draws whole are counted as hidden");
+  // Prose a word longer than three lines: the table starts below the clamp's last line, all of it hidden.
+  assert.equal(FOLD_LINES * perLine, 39, "the fixture's phone line moved; recount it");
+  assert.equal(labelAt(rows[2], PHONE_CLASS), saysHidden(1 + tableWords(6)),
+    "a table under the clamp's last line is not counted as hidden");
+});
+
+test("A CODE BLOCK is counted in lines of its own, in code's face, and the line its padding shows (#244)", async () => {
+  const page = newPage();
+  await signIn(page);
+  // Fourteen lines of four words. Under one line of prose the clamp shows two of them, and the block's
+  // own bottom padding the top of a third, which the reader can see: eleven lines hidden.
+  const steps = Array.from({ length: 14 }, (_unused, i) => `step ${i}: ok checksum=abc${i}\n`).join("");
+  // Ten lines of fifty m's and a number. In code's face a line is 50 × MONO_EM, well inside a phone's
+  // line; at the proportional font's 0.72em an "m", each would be counted as wrapping onto two.
+  const mono = page.pure("MONO_EM");
+  assert.ok(50 * mono < 28.5 && 50 * page.pure('glyphEm("m")') > 28.5, "the fixture no longer tells the two faces apart");
+  const wide = Array.from({ length: 10 }, (_unused, i) => `${"m".repeat(50)} ${i}\n`).join("");
+  const rows = await showDiscord(page, [
+    message({ id: "7440000000000000801", content: "code",
+      content_html: `<p>Here is the run:</p>\n<pre><code>${steps}</code></pre>\n` }),
+    message({ id: "7440000000000000802", content: "wide code", content_html: `<pre><code>${wide}</code></pre>\n` }),
+  ]);
+  for (const at of [PHONE_CLASS, DESK_CLASS]) {
+    assert.equal(labelAt(rows[0], at), saysHidden(11 * 4), `at ${FOLD_WIDTHS_EM[at]}em the code block is miscounted`);
+  }
+  // Three lines and the top of a fourth shown, six hidden: 51 characters each, in two words.
+  assert.equal(labelAt(rows[1], PHONE_CLASS), saysHidden(6 * 51, "characters"),
+    "a line of code is counted at the proportional font's widths");
+});
+
+test("A LIST IS LINES, an item to each however short, and a list of short items says what it hides (#244)", async () => {
+  const page = newPage();
+  await signIn(page);
+  const items = Array.from({ length: 24 }, (_unused, i) => `<li>shard ${i} synced</li>\n`).join("");
+  const rows = await showDiscord(page, [
+    message({ id: "7440000000000000901", content: "a list", content_html: `<ul>\n${items}</ul>\n` }),
+  ]);
+  assert.equal(rows[0].getAttribute("data-collapsed"), "true", "the fixture did not fold");
+  // Three items shown at every width, however wide: each starts a line of its own.
+  assert.deepStrictEqual(FOLD_WIDTHS_EM.map((_width, at) => labelAt(rows[0], at)),
+    FOLD_WIDTHS_EM.map(() => saysHidden(21 * 3)), "a list's short items are not counted a line each");
+});
+
+test("WHAT THE MODEL HAS NO RULE FOR GETS NO LABEL, and every element the server sends has a rule (#244)", () => {
+  const page = newPage();
+  const known = new Set([...page.pure("FOLD_INLINE"), ...page.pure("FOLD_FLOW_BLOCKS"), "br", "pre", "table"]);
+  // A table's own parts are only ever inside one, which is read whole.
+  const inTables = new Set(["thead", "tbody", "tr", "th", "td"]);
+  for (const tag of SANITIZED_TAGS) {
+    assert.ok(known.has(tag) || inTables.has(tag), `src/render.rs sends <${tag}>, which the fold's model has no rule for`);
+  }
+  // Something it has no rule for: the body is not laid out from a guess, and says nothing.
+  const body = page.document.createElement("div");
+  const odd = page.document.createElement("details");
+  odd.append(page.document.createTextNode(wordsOfLength(200, 4)));
+  body.append(odd);
+  assert.equal(page.pure("foldRuns")(body), null, "an element with no rule was laid out from a guess");
+  assert.deepStrictEqual([...page.pure("elisionLabels")(null)], FOLD_WIDTHS_EM.map(() => ""));
+});
+
+test("A CHARACTER OF A WIDE SCRIPT IS A PLACE A LINE BREAKS: Chinese after a word fills the line it starts on (#244)", async () => {
+  // At 14em "Note:" and a space take 2.15em, and thirteen ideographs fill the rest of that line, then
+  // fifteen to each line after it. Read as one unbreakable run, the ideographs would start a line of
+  // their own under "Note:", and the label would claim thirteen more characters hidden than are.
+  const run = async (script) => {
+    const page = newPage(new Map(), script);
+    await signIn(page);
+    const rows = await showDiscord(page, [message({ id: "7440000000000001001", content: `Note: ${"漢".repeat(300)}` })]);
+    return labelAt(rows[0], 0);
+  };
+  const shown = 5 + 13 + 15 + 15;
+  assert.equal(await run(SCRIPT), saysHidden(305 - shown, "characters"), "Chinese after a word is not broken at its characters");
+  const control = await run(brokenScript("const wide = WIDE_SCRIPT.test(ch);", "const wide = false;"));
+  assert.notEqual(control, saysHidden(305 - shown, "characters"), "the fixture cannot tell a split script from an unsplit one");
+});
+
 // --- the raw Discord view --------------------------------------------------------------------------
 
 /** Load the Discord tab with a given set of channel messages. */
