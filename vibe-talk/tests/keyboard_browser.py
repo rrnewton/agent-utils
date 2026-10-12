@@ -35,7 +35,8 @@ which must be exactly one, holding the focus: a mouse move over a message takes 
 keys -> j moves it on, the message still under the mouse unlit -> a click with no move before it ->
 ArrowUp -> fourteen j's scrolling the list under a mouse standing still, which takes nothing -> a few
 pixels of movement, which does -> Enter opening the message the mouse moved to, not the keys' one ->
-in two columns, the mouse into either column, and [ and ] between them. Against the page from before,
+three clicks on Show read (so it is as it was), the mouse onto a message, and Enter opening that
+message, not pressing Show read again -> in two columns, the mouse into either column, and [ and ] between them. Against the page from before,
 it fails at the first mouse move, with the hovered row and the keys' row both lit.
 
 It serves the checked-out assets and a small fake API from one loopback origin, at 1280x800. Pass
@@ -844,12 +845,51 @@ def single_selection(walk: Walk, api: FakeApi) -> None:
     walk.settled()
     check(walk.page.evaluate(folded, long_id) == "true", "Enter again did not close it")
     check(keys_row != f"discord-log:{long_id}", "the keys and the mouse were on the same message; Enter proved nothing")
+
+    # A control a click focused gives the focus up to the message the mouse moves to. Found in review:
+    # Show read (or Summarise), clicked, kept the focus with no ring (a click's focus is not
+    # `:focus-visible`), the mouse lit a message ring and all, and Enter pressed the button again, the
+    # lit message untouched. Three clicks, Collapse read, Hide read and Show read again, so the list is
+    # as it was and only the focus is left behind on the button.
+    press(walk.cdp, "j")
+    keys_row = one_lit(walk, "j off the long message, before the clicks on Show read")
+    mode = "() => document.getElementById('todo-filter').getAttribute('aria-pressed')"
+    mode_was = walk.page.evaluate(mode)
+    for _ in range(3):
+        centre = walk.page.evaluate("() => { const r = document.getElementById('todo-filter').getBoundingClientRect();"
+                                    " return {x: r.left + r.width / 2, y: r.top + r.height / 2, w: r.width}; }")
+        check(float(centre["w"]) > 0, f"Show read is not on screen to be clicked: {centre}")
+        mouse_move(walk, float(centre["x"]), float(centre["y"]))
+        mouse_click(walk, float(centre["x"]), float(centre["y"]))
+        walk.settled()
+    check(walk.page.evaluate(mode) == mode_was, f"three clicks on Show read left it {walk.page.evaluate(mode)!r}, not {mode_was!r}")
+    held = walk.page.evaluate("() => document.activeElement && (document.activeElement.id || document.activeElement.tagName)")
+    check(held == "todo-filter", f"the clicks left the focus on {held!r}, not on Show read; this step proves nothing")
+    # The redraws may have moved the list: the long message back into view, by script, which moves no focus.
+    box = walk.page.evaluate("(id) => { const li = document.querySelector(`#discord-log > li[data-id='${id}']`);"
+                             " li.scrollIntoView({block: 'center'}); const r = li.getBoundingClientRect();"
+                             " return {x: r.left + r.width * 0.35, y: r.top + 20}; }", long_id)
+    walk.settled()
+    check(lit_state(walk)["lit"] != [f"discord-log:{long_id}"], "the long message was lit before the mouse reached it; this proves nothing")
+    mouse_move(walk, float(box["x"]), float(box["y"]))
+    one_lit(walk, "the mouse onto the long message after a click on Show read", f"discord-log:{long_id}")
+    press(walk.cdp, "Enter")
+    walk.settled()
+    check(walk.page.evaluate(folded, long_id) == "false",
+          "Enter after a click on Show read did not open the message the mouse lit")
+    check(walk.page.evaluate(mode) == mode_was, "Enter after a click on Show read pressed Show read again")
+    one_lit(walk, "Enter on the mouse's message after a click on Show read", f"discord-log:{long_id}")
+    walk.shot("single-enter-after-dock-click")
+    press(walk.cdp, "Enter")
+    walk.settled()
+    check(walk.page.evaluate(folded, long_id) == "true", "Enter again did not close it")
+    check(keys_row != f"discord-log:{long_id}", "the keys were on the long message before the clicks; this proves nothing")
     # Off the list, for the steps that follow: the dock is not a row.
     walk.cdp.send("Input.dispatchMouseEvent", {"type": "mouseMoved", "x": 2, "y": 790, "button": "none", "buttons": 0})
     walk.notes.append("one selection (#238): a real mouse move took it from the keys, j and ArrowUp took it back with "
                       "the hovered row unlit, a click with no move selected, 14 j's scrolled the list under a still "
-                      "mouse without it taking anything, and Enter opened the message the mouse had moved to; one row "
-                      "drawn lit, holding the focus, after every step")
+                      "mouse without it taking anything, and Enter opened the message the mouse had moved to, also "
+                      "after a click on Show read had focused it; one row drawn lit, holding the focus, after every step")
 
 
 def two_columns_single(walk: Walk) -> None:

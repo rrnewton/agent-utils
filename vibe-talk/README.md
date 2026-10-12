@@ -3603,13 +3603,19 @@ and the keys move **one** selection per list, and the selection is the only thin
 
 - A key that moves the selection takes it from wherever the mouse put it.
 - A real mouse move over a row selects that row. The focus goes with it when the focus was on a
-  list, never out of a box being typed in, a picker or an open ⋯ menu. A move is real only when the
-  pointer itself moved: a list scrolled under a still pointer, by a key or by a message arriving,
-  takes nothing.
+  list, on nothing, or on a control a click focused: a click on Summarise or Show read leaves the
+  focus on the button with no ring, and if it stayed there Enter would press the button again while
+  the message lit waited. The focus never leaves a box being typed in, a picker, an open ⋯ menu, or
+  a control Tab reached (one drawn with its ring), whose reader is working by keyboard. A move is
+  real only when the pointer itself moved: a list scrolled under a still pointer, by a key or by a
+  message arriving, takes nothing.
 - A click selects too. A tap on a touch screen selects **silently**: no focus, nothing lit. A touch
   screen has no hover, and a row lit by a tap could never be put out, which is the property the
   first version of this treatment (`#56 message-hover-highlight`) was built around. No row has a
-  `:hover` rule any more, so no phone can get one.
+  `:hover` rule any more, so no phone can get one. A touch screen keeps the tint it always had on a
+  row whose control a finger focused, and so does a touch laptop, which answers the pointer queries
+  as a desk does: `data-input="touch"` on the root element, from a tap until the mouse moves or a key
+  is pressed, gives it the same tint.
 - The row a reply's arrow or circle jumps to becomes the selection. Its flash is on the message every
   key now acts on, and goes out when the selection moves on.
 - In two columns each column keeps its own selection, and only the column in use draws its one.
@@ -3617,7 +3623,8 @@ and the keys move **one** selection per list, and the selection is the only thin
 
 What a pointer still lights inside the lists (the disc behind a reply's arrow, the circle's halo) is
 behind `@media (hover: hover) and (pointer: fine)`, and held back while the keys are in use:
-`data-input="keys"` on the root element from the key until the mouse really moves.
+`data-input="keys"` on the root element from any key (Escape out of the search too, which the field
+handles itself) until the mouse really moves.
 
 The row's actionable child is the reply control, and selecting the row picks that out too. It is not
 *revealed* by hover the way Discord's row actions are: the standing rule on this page is that a

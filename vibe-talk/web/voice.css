@@ -3864,6 +3864,23 @@ body {
   }
 }
 
+/* ...and a finger on a touch laptop, which has a mouse as well and answers the query above as a
+   desk does: `data-input="touch"` is on the root from a tap until the mouse moves or a key is
+   pressed (web/voice.js), and a tap there draws no selection of its own either. */
+:root[data-input="touch"] #side-log li.discord-message:focus-within,
+:root[data-input="touch"] #discord-log li.discord-message:focus-within,
+:root[data-input="touch"] #pinned-log li.discord-message:focus-within {
+  background: var(--row-hover);
+  border-color: var(--accent);
+}
+
+:root[data-input="touch"] #side-log li.discord-message:focus-within .reply-button,
+:root[data-input="touch"] #discord-log li.discord-message:focus-within .reply-button,
+:root[data-input="touch"] #pinned-log li.discord-message:focus-within .reply-button {
+  color: var(--ink);
+  border-color: var(--accent);
+}
+
 /* THE CHANNEL ROW'S METADATA LINE MUST WRAP, and this is not tidying.
  *
  * It carries five things — author, time, message id, the fold control and the reply control — and

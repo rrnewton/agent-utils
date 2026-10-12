@@ -3594,7 +3594,7 @@ function onComposerKey(event, send, singleLine = false) {
 //     drawn by web/voice.css as the ring and the tint together, whichever put it there; a row lit by
 //     `:hover` alone no longer exists. A key that moves the selection takes it from wherever the mouse
 //     put it, and a REAL mouse move over a row takes it to that row, the focus with it while the focus
-//     is on a list (`pointRow`). A move is real when the pointer itself moved: a list scrolled under a
+//     is on a list or on a control a click focused (`pointRow`, `focusFollowsSelection`). A move is real when the pointer itself moved: a list scrolled under a
 //     pointer standing still, by a key or a new message, takes nothing (`mouseMoved`). A click selects
 //     the row too, drawn; a tap on a touch screen selects SILENTLY, with no focus and nothing drawn,
 //     because a touch screen has no hover and a lit row there could not be put out. The row a jump
@@ -4022,6 +4022,18 @@ function mouseInUse() {
   if (root.hasAttribute("data-input")) root.removeAttribute("data-input");
 }
 
+/**
+ * A finger or a pen is in use: noted, and said on the root as `data-input="touch"` until the mouse
+ * moves or a key is pressed. A touch laptop has a mouse too, and answers the pointer media queries as
+ * a desk does, so its finger would lose the focus tint a touch screen keeps; web/voice.css gives the
+ * tint to the attribute as well.
+ */
+function touchInUse() {
+  inputKind = "touch";
+  const root = document.documentElement;
+  if (root.getAttribute("data-input") !== "touch") root.setAttribute("data-input", "touch");
+}
+
 /** Where the mouse was at its last move, in the viewport, or null before the first. */
 let mouseAt = null;
 
@@ -4044,15 +4056,36 @@ function mouseMoved(event) {
 
 /**
  * Whether a selection made by the mouse or a jump takes the focus with it: while the focus is on a
- * list (a row, a row's control, or the scroller) or on nothing. Never out of a field the reader is
- * typing in, a picker or a slider, or anywhere off the lists, such as a control in the dock.
+ * list (a row, a row's control, or the scroller), on nothing, or on a control off the lists that a
+ * click focused. Never out of a field the reader is typing in, a picker or a slider, nor from a
+ * control the keys reached (Tab to a button in the dock): the reader there is working by keyboard.
+ *
+ * A CLICKED CONTROL GIVES THE FOCUS UP. A click on Summarise or Show read focuses the button, and
+ * without a ring (it is not `:focus-visible`), so nothing on screen says it holds the keys. The
+ * mouse then moves over a message, which is drawn selected, ring and all; if the button kept the
+ * focus, Enter pressed it again and the lit message was not touched, the owner's ambiguity over
+ * again. `#239 single-selection`.
  */
 function focusFollowsSelection() {
   if (currentScreen !== "main") return false;
   if (focusLost()) return true;
   const held = document.activeElement;
   if (isTextField(held) || keepsOwnKeys(held)) return false;
-  return KEY_PANES.some((pane) => nodeWithin(pane.scroller(), held));
+  if (KEY_PANES.some((pane) => nodeWithin(pane.scroller(), held))) return true;
+  return !keyboardFocused(held);
+}
+
+/**
+ * Whether `node` holds the focus the keys gave it, as the browser says by drawing its ring
+ * (`:focus-visible`). A browser that cannot say counts as yes, which keeps the focus where it is.
+ */
+function keyboardFocused(node) {
+  if (!node || typeof node.matches !== "function") return true;
+  try {
+    return node.matches(":focus-visible");
+  } catch (_error) {
+    return true;
+  }
 }
 
 /**
@@ -4063,9 +4096,11 @@ function focusFollowsSelection() {
  */
 function pointRow(pane, row) {
   if (openRowMenu) return;
-  const mark = markOf(pane);
   const holding = nodeWithin(row, document.activeElement);
-  if (lastPane === pane && pane.lit === row && mark && mark.drawn && (holding || !focusFollowsSelection())) return;
+  // Lit is drawn selected (`drawSelection` lights only that), so a move within the row already lit
+  // asks no more: not the pane's kept selection, which in the right column swaps the column's state
+  // twice on every move to read.
+  if (lastPane === pane && pane.lit === row && (holding || !focusFollowsSelection())) return;
   takeRow(pane, row, !holding && focusFollowsSelection());
 }
 
@@ -4085,7 +4120,7 @@ function onPointerMove(event) {
 function onPointerDown(event) {
   const kind = String((event && event.pointerType) || "");
   if (kind === "mouse") mouseInUse();
-  else if (kind) inputKind = "touch";
+  else if (kind) touchInUse();
 }
 
 /**
@@ -5237,10 +5272,12 @@ function chordAllowed(binding, chord, target) {
  * @param {KeyboardEvent} event
  */
 function onPageKey(event) {
-  if (!event || event.defaultPrevented) return;
-  if (event.isComposing || event.keyCode === 229) return;
-  // `#239 single-selection`. A key moves the one selection from wherever the mouse put it.
+  if (!event || event.isComposing || event.keyCode === 229) return;
+  // `#239 single-selection`. A key moves the one selection from wherever the mouse put it. Said
+  // before a key its own element took (Escape out of the search, Enter in a message box) is left
+  // alone: the keys are in use all the same, and what a still pointer lights stays put away.
   keysInUse();
+  if (event.defaultPrevented) return;
   const target = /** @type {HTMLElement} */ (event.target || document.activeElement);
   if (macFieldEditKey(event, target)) return;
   // `#229 desktop-two-column`. In the column of the list the key is for: the one the focus is in,

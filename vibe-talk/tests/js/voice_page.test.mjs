@@ -14472,6 +14472,22 @@ test("a touch screen keeps its focus tint, and a desk draws the focused row only
   assert.match(focused, /border-color:\s*var\(--accent\)/);
   assert.doesNotMatch(cssBlockOutside(TOUCH_QUERY, selector), /background|border-color/,
     "the focus tint is ALSO declared outside the touch query, so a desk lights the focus beside the selection");
+  // A touch laptop answers that query as a desk does, and its finger keeps the tint by the root's
+  // `data-input="touch"`, which web/voice.js sets on a tap and takes off at the next real mouse move
+  // or key. On every device, and only behind that attribute.
+  for (const list of ["#side-log", "#discord-log", "#pinned-log"]) {
+    const tapped = cssRules(CSS_UNCONDITIONAL, `:root[data-input="touch"] ${list} li.discord-message:focus-within`).join("\n");
+    assert.match(tapped, /background:\s*var\(--row-hover\)/, `a finger on a touch laptop lights no row in ${list}`);
+    assert.match(tapped, /border-color:\s*var\(--accent\)/);
+  }
+  for (const rule of CSS_UNCONDITIONAL.matchAll(/([^{}]+)\{([^{}]*)\}/g)) {
+    if (!/background/.test(rule[2])) continue;
+    for (const part of rule[1].split(",").map((one) => one.trim())) {
+      if (!/li\.discord-message:focus-within$/.test(part)) continue;
+      assert.match(part, /^:root\[data-input="touch"\] /, `${part} lights the focus on a desk, beside the selection`);
+    }
+  }
+  assert.match(SCRIPT_CODE, /setAttribute\("data-input", "touch"\)/, "nothing says a finger is in use");
 });
 
 // --- replying to a channel message ---------------------------------------------------------------
@@ -18405,6 +18421,104 @@ test("`#239 single-selection`: the mouse never takes the focus out of a message 
   await mouseTo(page, channelRow(page, "4"), 110, 150);
   assert.deepStrictEqual(litIds(page), ["2"], "the mouse moved the selection from under an open menu");
   assert.equal(focused(page), item, "the mouse took the focus out of an open menu");
+});
+
+test("`#239 single-selection`: A CONTROL A CLICK FOCUSED gives the focus up to the message the mouse moves to, and Enter acts on that message; one the keys reached keeps it", async () => {
+  // Found in review, in Chromium: a click on Summarise or Show read left the focus on the button,
+  // with no ring (a click's focus is not `:focus-visible`); the mouse moved over a message, which was
+  // drawn selected, ring and all; and Enter pressed the button again, the lit message untouched.
+  for (const id of ["summarise", "todo-filter"]) {
+    const page = await keyboardPageAtTop();
+    const control = page.el(id);
+    await page.documentEvent("pointerdown", { target: control, pointerType: "mouse" });
+    control.focusFrom("pointer");
+    await mouseTo(page, channelRow(page, "2"), 100, 300);
+    assert.deepStrictEqual(litIds(page), ["2"], "the message under the mouse is not the one lit");
+    assert.equal(selectedId(page), "2", `#${id}, focused by a click, kept the focus from the message lit`);
+    assert.equal(channelRow(page, "2").getAttribute("data-collapsed"), "true", "a long message did not arrive folded");
+    await pressHere(page, "Enter");
+    assert.equal(channelRow(page, "2").getAttribute("data-collapsed"), "false", `Enter after a click on #${id} did not open the message lit`);
+  }
+  // A control the keys reached is a reader working by keyboard: a mouse nudged on the desk moves the
+  // selection, and the focus stays where Tab put it.
+  const page = await keyboardPageAtTop();
+  const summarise = page.el("summarise");
+  summarise.focusFrom("keyboard");
+  await mouseTo(page, channelRow(page, "3"), 100, 300);
+  assert.deepStrictEqual(litIds(page), ["3"]);
+  assert.equal(focused(page), summarise, "the mouse took the focus from a control the keys had reached");
+  await mouseTo(page, channelRow(page, "3"), 104, 302);
+  assert.equal(focused(page), summarise, "a second move in the lit message took the focus from the control the keys reached");
+  // Nor ever from a picker or a slider, however it was focused: a picker's keys are its own.
+  let y = 310;
+  for (const id of ["discord-channel", "read-speed-range"]) {
+    page.el(id).focusFrom("pointer");
+    y += 4;
+    await mouseTo(page, channelRow(page, "4"), 100, y);
+    assert.equal(focused(page), page.el(id), `the mouse took the focus from #${id}`);
+  }
+});
+
+test("`#239 single-selection`: a key a field took first still says the keys are in use; a finger says touch until the mouse moves or a key is pressed", async () => {
+  const page = await keyboardPageAtTop();
+  const root = page.documentElement;
+  await mouseTo(page, channelRow(page, "2"), 100, 300);
+  assert.equal(root.getAttribute("data-input"), null);
+  // Escape out of the search is the field's own, and the page's listener hears it already taken.
+  await page.el("search-toggle").click();
+  await page.settle();
+  const escape = await press(page, page.el("search-field"), "Escape");
+  assert.equal(escape.defaultPrevented, true, "the search field no longer takes its own Escape; this proves nothing");
+  assert.equal(root.getAttribute("data-input"), "keys", "Escape out of the search left a still pointer's look up");
+  // A touch laptop has a mouse as well, and its pointer queries answer as a desk's: a finger is said
+  // on the root, which web/voice.css gives the focus tint a touch screen has.
+  await page.documentEvent("pointerdown", { target: channelRow(page, "3"), pointerType: "touch" });
+  assert.equal(root.getAttribute("data-input"), "touch", "a finger did not say so");
+  await mouseTo(page, channelRow(page, "3"), 120, 310);
+  assert.equal(root.getAttribute("data-input"), null, "a real mouse move left the finger's look up");
+  await page.documentEvent("pointerdown", { target: channelRow(page, "3"), pointerType: "pen" });
+  assert.equal(root.getAttribute("data-input"), "touch", "a pen did not say so");
+  await pressHere(page, "j");
+  assert.equal(root.getAttribute("data-input"), "keys");
+});
+
+test("`#239 single-selection`: A COLLAPSED RUN'S LINE, under the mouse, is its row's selection, and j moves on past the run", async () => {
+  const page = newPage();
+  const messages = runThread(page, { tail: RUN_TAIL });
+  await enterRunThread(page, messages, () => chooseReadMode(page, "Collapse read"));
+  const rows = page.el("discord-log").children;
+  const head = rows[1];
+  assert.equal(head.getAttribute("data-read-run"), "head");
+  const line = readRunLineOf(head);
+  await mouseTo(page, line, 100, 140);
+  assert.deepStrictEqual(litIds(page), [head.getAttribute("data-id")], "the line under the mouse did not select its row");
+  assert.ok(nodeIn(head, focused(page)), `the focus is not on the run's row: ${focusName(page)}`);
+  // The run's hidden members are not rows the keys stop on: j goes to the first message after it.
+  const after = rows.find((row, at) => at > 1 && !row.hidden && row.getAttribute("data-read-run") === null);
+  await pressHere(page, "j");
+  assert.equal(selectedId(page), after.getAttribute("data-id"), `j from the run's line selected ${selectedId(page)}`);
+  assert.deepStrictEqual(litIds(page), [after.getAttribute("data-id")], "the run's line stayed lit beside the keys' message");
+  await pressHere(page, "k");
+  assert.deepStrictEqual(litIds(page), [head.getAttribute("data-id")], "k did not come back to the run's line");
+});
+
+test("`#239 single-selection`: A MESSAGE ARRIVING UNDER A STILL MOUSE takes nothing — the redraw's report from the same place selects no row", async () => {
+  const messages = tallChannel(30);
+  const page = await keyboardPageAtTop(messages);
+  const y = 200;
+  await mouseTo(page, rowAtY(page, y), 150, y);
+  const pointed = litIds(page)[0];
+  await pressHere(page, "j");
+  await pressHere(page, "j");
+  const keyed = selectedId(page);
+  assert.notEqual(keyed, pointed);
+  // A re-read that brings a new message redraws every row, and a browser that looks again at what is
+  // under the pointer reports a move from where it already was, over the new row standing there.
+  await refreshDiscord(page, [...messages, message({ id: "31", content: "a new message" })]);
+  await mouseTo(page, rowAtY(page, y), 150, y, { movementX: 0, movementY: 0 });
+  assert.equal(selectedId(page), keyed, "a redraw under a still pointer took the selection from the keys");
+  assert.deepStrictEqual(litIds(page), [keyed], "a row redrawn under a still pointer was lit");
+  assert.equal(page.documentElement.getAttribute("data-input"), "keys");
 });
 
 test("`#239 single-selection`: THE ROW A JUMP LANDS ON is the selection, and its flash goes out when the selection moves on", async () => {
