@@ -355,6 +355,28 @@ steps:
       classification: latency-bound
       rss_baseline_bytes: 1073741824
 
+  # `#240 reading-bookmark` in the browser engine, at 1280x800 with a mouse and keys and at 412x915 by
+  # touch: the bookmark set on a message (Shift+B, or the row's menu) is a solid two-pixel line in the
+  # accent in the room between that row and the one above, touching neither; scrolled away, the
+  # Bookmark chip points up at it, directly right of Newest on the bottom line and overlapping no
+  # other chip; b or a tap on the chip puts the line at the top of the list under the pill, the
+  # message under it selected; a reply goes to the newest message, says b goes back, and b does; and
+  # a Done on the message under the line slides it to the next one, conditionally, on the server too.
+  # Measured on 2026-10-12: about 6s wall.
+  - group: check
+    job: bookmark-browser
+    desc: the reading bookmark set, jumped to, kept across a reply and advanced by Done, in current Chromium at 1280x800 and 412x915
+    labels: [validation-vibe-talk]
+    cmd: cd vibe-talk && python3 tests/bookmark_browser.py
+    jobs_flag: ""
+    timeout: 90
+    cpu_timeout: 45
+    hint:
+      resources: {browser: 1}
+      est_duration_s: 6
+      classification: latency-bound
+      rss_baseline_bytes: 1073741824
+
   # ---- the build everything else needs ----------------------------------------------------------
   - group: build
     job: release

@@ -3816,6 +3816,10 @@ and not in the thread list, the Pinned or Links filters, or while a search is ch
 Under Collapse read or Hide read it drops to the next message shown, since everything it passes is
 read. In two columns the left column draws it, and the right column only on its thread.
 
+`make -C vibe-talk bookmark-browser` walks this in a real Chromium at 1280x800 and 412x915: set,
+scroll away, jump back, reply, jump back again, and a Done advancing the line, measuring where the
+line and the chip are drawn. Pass `SCREENSHOTS=/tmp/shots` to keep a PNG of each step.
+
 ### Two ways a channel row can already have been dealt with, and only one of them hides it
 
 `#84 reply-aware-dismissal` lands the two follow-ups `#50 todo-view` named for itself — the **swipe**, and the
