@@ -28,6 +28,8 @@ import time
 from collections.abc import Callable
 from dataclasses import dataclass
 
+from herdr_run.textfmt import parse_exit_marker
+
 __all__ = [
     "MAX_RETENTION_DAYS",
     "RETENTION_DAYS",
@@ -179,11 +181,8 @@ def _completion_mtime(path: str) -> float | None:
             payload = os.read(descriptor, 129)
         finally:
             os.close(descriptor)
-        if len(payload) > 128:
-            return None
-        value = int(payload.decode("ascii").strip())
-        if not -(2**31) <= value < 2**31:
+        if parse_exit_marker(payload) is None:
             return None
         return metadata.st_mtime
-    except (OSError, UnicodeError, ValueError):
+    except (OSError, ValueError):
         return None

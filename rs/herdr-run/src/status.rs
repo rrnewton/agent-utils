@@ -219,9 +219,6 @@ mod tests {
             self.calls.borrow_mut().push("workspace_id_for_label");
             Ok(self.workspace.map(str::to_owned))
         }
-        fn workspace_label_for_id(&self, _workspace_id: &str) -> Result<Option<String>> {
-            Ok(None)
-        }
         fn create_workspace(&self, _label: &str, _cwd: &str) -> Result<(String, String, String)> {
             panic!("status must never create a workspace")
         }
@@ -256,9 +253,6 @@ mod tests {
         }
         fn run(&self, _pane_id: &str, _command: &str) -> Result<()> {
             panic!("status must never type into a pane")
-        }
-        fn send_keys(&self, _pane_id: &str, _keys: &str) -> Result<()> {
-            panic!("status must never send keys to a pane")
         }
     }
 
@@ -316,9 +310,6 @@ mod tests {
             fn workspace_id_for_label(&self, _label: &str) -> Result<Option<String>> {
                 Err(HerdrRunError::unavailable("herdr workspace list timed out"))
             }
-            fn workspace_label_for_id(&self, id: &str) -> Result<Option<String>> {
-                self.0.workspace_label_for_id(id)
-            }
             fn create_workspace(&self, label: &str, cwd: &str) -> Result<(String, String, String)> {
                 self.0.create_workspace(label, cwd)
             }
@@ -345,9 +336,6 @@ mod tests {
             }
             fn run(&self, pane: &str, command: &str) -> Result<()> {
                 self.0.run(pane, command)
-            }
-            fn send_keys(&self, pane: &str, keys: &str) -> Result<()> {
-                self.0.send_keys(pane, keys)
             }
         }
         let fake = FailingWorkspace(ReadOnlyFake::running_with(Some("w1"), 0, false));

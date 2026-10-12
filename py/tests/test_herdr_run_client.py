@@ -45,34 +45,40 @@ class RecordingRunner:
         return _completed(command, returncode=returncode, stdout=stdout, stderr=stderr)
 
 
-def test_default_runner_bounds_control_subprocesses(
+def test_bounded_control_command_starts_a_session_and_captures_bytes(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     observed_timeout = 0.0
-    observed_start_new_session = False
+    observed_kwargs: dict[str, object] = {}
 
     class FakeProcess:
         pid = 123
-        returncode = 0
+        returncode = -9
 
-        def communicate(self, *, timeout: float) -> tuple[str, str]:
+        def communicate(self, *, timeout: float) -> tuple[bytes, bytes]:
             nonlocal observed_timeout
             observed_timeout = timeout
-            return "", ""
+            return b"a\r\nb\xff", b""
 
     def fake_popen(command: list[str], **kwargs: object) -> FakeProcess:
-        nonlocal observed_start_new_session
         assert command == ["fixture-herdr", "status"]
-        observed_start_new_session = kwargs.get("start_new_session") is True
-        assert kwargs.get("text") is True
-        assert kwargs.get("encoding") == "utf-8"
-        assert kwargs.get("errors") == "replace"
+        observed_kwargs.update(kwargs)
         return FakeProcess()
 
     monkeypatch.setattr(subprocess, "Popen", fake_popen)
-    client_module.default_runner(("fixture-herdr", "status"))
+    completed = client_module.bounded_control_command(("fixture-herdr", "status"))
     assert observed_timeout == CONTROL_TIMEOUT_SECONDS
-    assert observed_start_new_session is True
+    assert observed_kwargs.get("start_new_session") is True
+    # Bytes, decoded afterwards: no newline translation turns a carriage return into a line end.
+    assert "text" not in observed_kwargs and "encoding" not in observed_kwargs
+    assert completed.stdout == "a\r\nb\ufffd"
+    # A signal-killed child keeps its signal: -9, never a made-up 1.
+    assert completed.returncode == -9
+
+
+def test_bounded_control_command_refuses_a_nul_byte_before_spawning() -> None:
+    with pytest.raises(OSError, match="argument contains a NUL byte"):
+        client_module.bounded_control_command(("/bin/echo", "a\0b"))
 
 
 def test_control_timeout_terminates_descendants(
@@ -82,7 +88,7 @@ def test_control_timeout_terminates_descendants(
     pid_path = os.path.join(str(tmp_path), "descendant.pid")
     program = '/usr/bin/sleep 60 & child=$!; printf "%s" "$child" > "$1"; wait'
     with pytest.raises(subprocess.TimeoutExpired):
-        client_module._bounded_control_command(
+        client_module.bounded_control_command(
             ("/bin/sh", "-c", program, "timeout-probe", pid_path), timeout=0.5
         )
 
@@ -128,7 +134,9 @@ def test_fixed_candidate_ignores_a_planted_caller_path(
     monkeypatch.setattr(
         HerdrClient, "_account_home", staticmethod(lambda: account_home)
     )
-    monkeypatch.setattr(client_module, "default_runner", runner)
+    monkeypatch.setattr(
+        client_module, "bounded_control_command", lambda command, **_kwargs: runner(command)
+    )
 
     client = HerdrClient(
         herdr_bin=name,
@@ -153,7 +161,9 @@ def test_missing_fixed_candidate_is_typed_unavailable(
             f"missing executable unexpectedly invoked: {list(command)!r}"
         )
 
-    monkeypatch.setattr(client_module, "default_runner", must_not_run)
+    monkeypatch.setattr(
+        client_module, "bounded_control_command", lambda command, **_kwargs: must_not_run(command)
+    )
     client = HerdrClient(herdr_bin="herdr-run-definitely-absent-test-binary")
     with pytest.raises(HerdrUnavailable, match="fixed install locations") as excinfo:
         client.workspace_id_for_label("workspace")
@@ -178,9 +188,11 @@ def test_production_timeout_is_typed_unavailable(
     ) -> subprocess.CompletedProcess[str]:
         raise subprocess.TimeoutExpired(list(command), CONTROL_TIMEOUT_SECONDS)
 
-    monkeypatch.setattr(client_module, "_bounded_control_command", timeout_run)
+    monkeypatch.setattr(client_module, "bounded_control_command", timeout_run)
     client = HerdrClient(herdr_bin="fixture-herdr")
-    with pytest.raises(HerdrUnavailable, match="timed out"):
+    with pytest.raises(
+        HerdrUnavailable, match=r"^cannot invoke Herdr: control command timed out after 30s$"
+    ):
         client.workspace_id_for_label("workspace")
 
 
@@ -338,40 +350,6 @@ def test_workspace_creation_is_no_focus() -> None:
     ]
 
 
-def test_agent_status_wait_accepts_and_validates_event_envelope() -> None:
-    event = json.dumps(
-        {"result": {"agent": {"pane_id": "p1", "agent_status": "working"}}}
-    )
-    runner = RecordingRunner(((0, event, ""),))
-    client = HerdrClient(herdr_bin="fixture-herdr", run=runner)
-    client.wait_agent_status("p1", "working", 5000)
-    assert runner.calls == [
-        ("fixture-herdr", "agent", "wait", "p1", "--until", "working", "--timeout", "5000")
-    ]
-
-
-def test_agent_prompt_uses_native_paste_while_shell_run_stays_raw() -> None:
-    runner = RecordingRunner(((0, '{"result":{"type":"agent_prompted"}}', ""), (0, "", "")))
-    client = HerdrClient(herdr_bin="fixture-herdr", run=runner)
-    client.prompt_agent("p1", "literal\nmessage $(untouched)")
-    client.run("p1", "printf shell")
-    assert runner.calls == [
-        ("fixture-herdr", "agent", "prompt", "p1", "literal\nmessage $(untouched)"),
-        ("fixture-herdr", "pane", "run", "p1", "printf shell"),
-    ]
-
-
-def test_agent_status_wait_refuses_wrong_event_identity() -> None:
-    event = json.dumps(
-        {"result": {"agent": {"pane_id": "other", "agent_status": "idle"}}}
-    )
-    client = HerdrClient(
-        herdr_bin="fixture-herdr", run=RecordingRunner(((0, event, ""),))
-    )
-    with pytest.raises(HerdrUnavailable, match="event reported"):
-        client.wait_agent_status("p1", "working", 5000)
-
-
 def test_process_info_refuses_a_response_for_another_pane() -> None:
     response = json.dumps(
         {
@@ -388,7 +366,7 @@ def test_process_info_refuses_a_response_for_another_pane() -> None:
     client = HerdrClient(
         herdr_bin="fixture-herdr", run=RecordingRunner(((0, response, ""),))
     )
-    with pytest.raises(HerdrUnavailable, match="expected 'wanted'"):
+    with pytest.raises(HerdrUnavailable, match='expected "wanted"'):
         client.process_info("wanted")
 
 
@@ -475,5 +453,5 @@ def test_filtered_pane_list_refuses_another_workspace() -> None:
     client = HerdrClient(
         herdr_bin="fixture-herdr", run=RecordingRunner(((0, response, ""),))
     )
-    with pytest.raises(HerdrUnavailable, match="expected 'wanted'"):
+    with pytest.raises(HerdrUnavailable, match='expected "wanted"'):
         client.panes("wanted")

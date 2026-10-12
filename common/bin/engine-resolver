@@ -11,8 +11,13 @@
 #   * DETERMINISTIC + TRACKED default: with no override, ALWAYS the tracked Python entrypoint.
 #   * Rust is opt-in ONLY, via DAGRUN_ENGINE=rust. Its tracked launcher asks Cargo to validate the
 #     workspace cache and provenance before executing; it never silently falls back.
-#   * LOGS WHICH ENGINE WON on every invocation (one stderr line), so the resolved engine and its
-#     exact path are always visible in logs.
+#   * LOGS WHICH ENGINE WON on every invocation (one stderr line, of the same shape for both
+#     engines), so the resolved engine and its exact path are always visible in logs.
+#   * The Python engine runs on a real CPython that meets the documented minimum (3.10). The
+#     candidate (`$CI_HUB_PYTHON`, else `python3`) is asked for its own executable, and that binary
+#     is run directly, so a wrapper in front of the interpreter cannot change how arguments are
+#     decoded or how signals are delivered before the tool's own code runs.
+#   * Never changes the working directory: the tool sees the caller's directory, even a deleted one.
 #
 # The resolved tool name is this script's invocation basename. The tracked links for `dagrun`,
 # `cpuset-alloc`, `pr-landing-planner`, `tick-hub`, `wrkviz`,
@@ -22,7 +27,7 @@ set -euo pipefail
 # Locate the agent-utils root from the resolver's REAL path (follow the symlink chain), independent
 # of how the tool was invoked. common/bin/engine-resolver -> root is two levels up.
 SELF="$(readlink -f "${BASH_SOURCE[0]}")"
-ROOT="$(cd "$(dirname "$SELF")/../.." && pwd)"
+ROOT="$(dirname "$(dirname "$(dirname "$SELF")")")"
 
 TOOL="$(basename "$0")"
 if [[ "$TOOL" == "engine-resolver" ]]; then
@@ -40,8 +45,15 @@ case "$ENGINE" in
             echo "[$TOOL] engine=python: no tracked entrypoint at py/bin/$TOOL" >&2
             exit 127
         fi
+        CANDIDATE="${CI_HUB_PYTHON:-python3}"
+        INTERPRETER="$("$CANDIDATE" -I -S -c 'import sys
+print(sys.executable if sys.implementation.name == "cpython" and sys.version_info >= (3, 10) else "")' 2>/dev/null)" || INTERPRETER=""
+        if [[ -z "$INTERPRETER" || ! -x "$INTERPRETER" ]]; then
+            echo "[$TOOL] engine=python needs CPython 3.10 or newer, and '$CANDIDATE' is not one (set CI_HUB_PYTHON to one)" >&2
+            exit 127
+        fi
         echo "[$TOOL] engine=python (tracked entrypoint: py/bin/$TOOL)" >&2
-        exec "${CI_HUB_PYTHON:-python3}" "$TARGET" "$@"
+        exec "$INTERPRETER" "$TARGET" "$@"
         ;;
     rust|rs)
         # The tracked rs/bin link invokes the shared Cargo/provenance launcher. It checks the real
@@ -54,7 +66,13 @@ case "$ENGINE" in
         fi
         echo "[$TOOL] engine=rust (tracked Cargo launcher: ${TARGET#"$ROOT"/})" >&2
         unset AGENT_UTILS_RS_ENSURE_ONLY
-        exec "$TARGET" "$@"
+        # Sourced rather than executed: it ends in `exec` of the verified binary with these same
+        # arguments, and running it in this shell means one shell starts for either engine, so the
+        # two paths write the same launcher output (even bash's own warning about a deleted
+        # working directory) before the tool runs.
+        # shellcheck source=/dev/null
+        source "$TARGET"
+        exit 3
         ;;
     *)
         echo "[$TOOL] DAGRUN_ENGINE='$ENGINE' is invalid (want 'python' or 'rust')" >&2

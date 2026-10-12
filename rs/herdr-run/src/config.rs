@@ -1,15 +1,19 @@
 //! Strict per-project configuration discovery, parsing, and defaults.
+//!
+//! Every message in this module is part of a catalogue the other edition repeats word for word:
+//! type names use the JSON vocabulary (`null`, `bool`, `number`, `string`, `array`, `object`),
+//! values are quoted with [`crate::textfmt::quote`], and keys are validated in [`KNOWN_KEYS`]
+//! order, each completely at its own position, so a file with two mistakes reports the same first
+//! mistake in both editions. The file itself is read with herdr-run's own YAML-subset parser,
+//! [`crate::yaml`].
 
-use std::collections::{BTreeMap, BTreeSet};
-use std::fmt;
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Component, Path, PathBuf};
 
-use serde::de::{self, Deserialize, Deserializer, MapAccess, SeqAccess, Visitor};
-use serde_json::{Map, Value};
-
 use crate::error::{HerdrRunError, Result};
-
+use crate::textfmt::{os_error_text, quote, whole_milliseconds};
+use crate::yaml::{core_load, Yaml};
 /// Accepted configuration basenames, in preference order at each directory.
 pub const CONFIG_FILENAMES: [&str; 2] = [".herdr-run.yaml", ".herdr-run.yml"];
 
@@ -180,126 +184,33 @@ impl Default for Config {
     }
 }
 
-/// YAML value decoder that rejects duplicate keys, merge keys, and custom tags before narrowing.
-struct StrictValue(Value);
-
-impl<'de> Deserialize<'de> for StrictValue {
-    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        deserializer.deserialize_any(StrictValueVisitor)
-    }
-}
-
-struct StrictValueVisitor;
-
-impl<'de> Visitor<'de> for StrictValueVisitor {
-    type Value = StrictValue;
-
-    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str("a YAML 1.2 scalar, sequence, or string-keyed mapping")
-    }
-
-    fn visit_bool<E>(self, value: bool) -> std::result::Result<Self::Value, E> {
-        Ok(StrictValue(Value::Bool(value)))
-    }
-
-    fn visit_i64<E>(self, value: i64) -> std::result::Result<Self::Value, E> {
-        Ok(StrictValue(Value::Number(value.into())))
-    }
-
-    fn visit_u64<E>(self, value: u64) -> std::result::Result<Self::Value, E> {
-        Ok(StrictValue(Value::Number(value.into())))
-    }
-
-    fn visit_i128<E>(self, value: i128) -> std::result::Result<Self::Value, E>
-    where
-        E: de::Error,
-    {
-        if let Ok(narrow) = i64::try_from(value) {
-            return self.visit_i64(narrow);
-        }
-        self.visit_f64(value as f64)
-    }
-
-    fn visit_u128<E>(self, value: u128) -> std::result::Result<Self::Value, E>
-    where
-        E: de::Error,
-    {
-        if let Ok(narrow) = u64::try_from(value) {
-            return self.visit_u64(narrow);
-        }
-        self.visit_f64(value as f64)
-    }
-
-    fn visit_f64<E>(self, value: f64) -> std::result::Result<Self::Value, E>
-    where
-        E: de::Error,
-    {
-        let number = serde_json::Number::from_f64(value)
-            .ok_or_else(|| E::custom("non-finite YAML numbers are not allowed"))?;
-        Ok(StrictValue(Value::Number(number)))
-    }
-
-    fn visit_str<E>(self, value: &str) -> std::result::Result<Self::Value, E> {
-        Ok(StrictValue(Value::String(value.to_owned())))
-    }
-
-    fn visit_string<E>(self, value: String) -> std::result::Result<Self::Value, E> {
-        Ok(StrictValue(Value::String(value)))
-    }
-
-    fn visit_none<E>(self) -> std::result::Result<Self::Value, E> {
-        Ok(StrictValue(Value::Null))
-    }
-
-    fn visit_unit<E>(self) -> std::result::Result<Self::Value, E> {
-        Ok(StrictValue(Value::Null))
-    }
-
-    fn visit_seq<A>(self, mut sequence: A) -> std::result::Result<Self::Value, A::Error>
-    where
-        A: SeqAccess<'de>,
-    {
-        let mut output = Vec::new();
-        while let Some(item) = sequence.next_element::<StrictValue>()? {
-            output.push(item.0);
-        }
-        Ok(StrictValue(Value::Array(output)))
-    }
-
-    fn visit_map<A>(self, mut mapping: A) -> std::result::Result<Self::Value, A::Error>
-    where
-        A: MapAccess<'de>,
-    {
-        let mut output = Map::new();
-        while let Some(key) = mapping.next_key::<String>()? {
-            if key == "<<" {
-                return Err(de::Error::custom(
-                    "YAML merge keys ('<<') are not allowed in configuration",
-                ));
-            }
-            if output.contains_key(&key) {
-                return Err(de::Error::custom(format!(
-                    "duplicate YAML mapping key {key:?}"
-                )));
-            }
-            let value = mapping.next_value::<StrictValue>()?;
-            output.insert(key, value.0);
-        }
-        Ok(StrictValue(Value::Object(output)))
-    }
-
-    fn visit_enum<A>(self, _data: A) -> std::result::Result<Self::Value, A::Error>
-    where
-        A: de::EnumAccess<'de>,
-    {
-        Err(de::Error::custom(
-            "custom YAML tags are not allowed in configuration",
-        ))
-    }
-}
+/// Every configuration key the parser accepts.
+///
+/// Public because it is also the definition of "every knob", which the generated
+/// `.herdr-run.yaml` has to cover for the user guide to be able to point at that file instead of
+/// restating it.
+pub const KNOWN_KEYS: [&str; 20] = [
+    "workspace",
+    "tab_name",
+    "cwd",
+    "allow",
+    "prefixes",
+    "deny_global",
+    "deny_subcommand",
+    "deny_anywhere",
+    "allow_subcommand",
+    "value_options",
+    "spool_dir",
+    "timeout_seconds",
+    "retention_days",
+    "max_panes",
+    "ready_timeout_seconds",
+    "readiness",
+    "prompt_tail",
+    "shells",
+    "broker",
+    "probe_remote",
+];
 
 fn strings(values: &[&str]) -> Vec<String> {
     values.iter().map(|value| (*value).to_owned()).collect()
@@ -318,7 +229,10 @@ fn absolute_lexical(path: &Path) -> Result<PathBuf> {
     } else {
         std::env::current_dir()
             .map_err(|error| {
-                HerdrRunError::config(format!("cannot determine current directory: {error}"))
+                HerdrRunError::config(format!(
+                    "cannot determine current directory: {}",
+                    os_error_text(&error)
+                ))
             })?
             .join(path)
     };
@@ -359,6 +273,14 @@ pub fn find_config_file(start: &Path) -> Option<PathBuf> {
 /// Load an explicit configuration file, the nearest discovered file, or built-in defaults.
 pub fn load_config(explicit_path: Option<&Path>, start_dir: &Path) -> Result<Config> {
     let start = absolute_lexical(start_dir)?;
+    let Some(start_text) = start.to_str() else {
+        // Paths derived from this directory name the spool, the audit log, and the session cache.
+        // Converting it lossily would retarget those writes into a different directory.
+        return Err(HerdrRunError::config(format!(
+            "current directory is not valid UTF-8: {}",
+            start.to_string_lossy()
+        )));
+    };
     let path = if let Some(explicit) = explicit_path {
         if !explicit.is_file() {
             return Err(HerdrRunError::config(format!(
@@ -373,300 +295,153 @@ pub fn load_config(explicit_path: Option<&Path>, start_dir: &Path) -> Result<Con
 
     let Some(path) = path else {
         return Ok(Config {
-            project_root: start.to_string_lossy().into_owned(),
+            project_root: start_text.to_owned(),
             ..Config::default()
         });
     };
-    let text = fs::read_to_string(&path).map_err(|error| {
+    let path_text = path.to_string_lossy().into_owned();
+    let payload = fs::read(&path).map_err(|error| {
         HerdrRunError::config(format!(
-            "cannot read config file {}: {error}",
-            path.display()
+            "cannot read config file {path_text}: {}",
+            os_error_text(&error)
         ))
     })?;
-    let decoded = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        StrictValue::deserialize(serde_norway::Deserializer::from_str(&text))
-    }));
-    let document = match decoded {
-        Ok(Ok(strict)) => strict.0,
-        Ok(Err(error)) => {
-            return Err(HerdrRunError::config(format!(
-                "{}: invalid YAML: {error}",
-                path.display()
-            )));
-        }
-        Err(_) => {
-            return Err(HerdrRunError::config(format!(
-                "{}: invalid YAML: parser failed internally",
-                path.display()
-            )));
-        }
-    };
+    let text = String::from_utf8(payload).map_err(|_| {
+        HerdrRunError::config(format!(
+            "cannot read config file {path_text}: the file is not valid UTF-8"
+        ))
+    })?;
+    let document = core_load(&text)
+        .map_err(|error| HerdrRunError::config(format!("{path_text}: invalid YAML: {error}")))?;
     let root = path.parent().unwrap_or_else(|| Path::new("/"));
+    let root = if root.as_os_str().is_empty() {
+        Path::new("/")
+    } else {
+        root
+    };
     parse_config(
         &document,
-        Some(path.to_string_lossy().into_owned()),
+        Some(path_text.clone()),
         root.to_string_lossy().into_owned(),
     )
 }
 
-/// Validate an already decoded YAML/JSON value and construct a resolved configuration.
-pub fn parse_config(
-    document: &Value,
-    source_path: Option<String>,
-    project_root: String,
-) -> Result<Config> {
-    let mut config = Config {
-        source_path: source_path.clone(),
-        project_root,
-        ..Config::default()
-    };
-    if document.is_null() {
-        return Ok(config);
-    }
-    let what = source_path.as_deref().unwrap_or("<config>");
-    let mapping = require_object(document, what)?;
-    reject_unknown_keys(mapping, what)?;
-
-    if let Some(value) = mapping.get("workspace") {
-        config.workspace = require_text(value, &format!("{what}.workspace"))?;
-        require_nonempty(&config.workspace, &format!("{what}.workspace"))?;
-    }
-    if let Some(value) = mapping.get("tab_name") {
-        config.tab_name = require_text(value, &format!("{what}.tab_name"))?;
-        render_tab_name(&config.tab_name, "agent", "project")?;
-    }
-    if let Some(value) = mapping.get("cwd") {
-        config.cwd = require_optional_text(value, &format!("{what}.cwd"))?;
-    }
-    if let Some(value) = mapping.get("allow") {
-        config.allow = require_policy_list(value, &format!("{what}.allow"))?;
-    }
-    if let Some(value) = mapping.get("prefixes") {
-        config.prefixes = require_policy_list(value, &format!("{what}.prefixes"))?;
-    }
-    if let Some(value) = mapping.get("deny_global") {
-        config.deny_global = require_string_map(value, &format!("{what}.deny_global"))?;
-    }
-    if let Some(value) = mapping.get("deny_subcommand") {
-        config.deny_subcommand = require_string_map(value, &format!("{what}.deny_subcommand"))?;
-    }
-    if let Some(value) = mapping.get("deny_anywhere") {
-        config.deny_anywhere = require_policy_list(value, &format!("{what}.deny_anywhere"))?;
-    }
-    if let Some(value) = mapping.get("allow_subcommand") {
-        config.allow_subcommand = require_string_map(value, &format!("{what}.allow_subcommand"))?;
-    }
-    if let Some(value) = mapping.get("value_options") {
-        config.value_options = require_string_map(value, &format!("{what}.value_options"))?;
-    }
-    if let Some(value) = mapping.get("spool_dir") {
-        config.spool_dir = require_text(value, &format!("{what}.spool_dir"))?;
-    }
-    if let Some(value) = mapping.get("timeout_seconds") {
-        config.timeout_seconds = require_number(value, &format!("{what}.timeout_seconds"))?;
-    }
-    if let Some(value) = mapping.get("retention_days") {
-        config.retention_days =
-            require_nonnegative_integer(value, &format!("{what}.retention_days"))?;
-    }
-    if let Some(value) = mapping.get("max_panes") {
-        config.max_panes =
-            require_bounded_count(value, &format!("{what}.max_panes"), MAX_PANE_CAP)?;
-    }
-    if let Some(value) = mapping.get("ready_timeout_seconds") {
-        config.ready_timeout_seconds =
-            require_number(value, &format!("{what}.ready_timeout_seconds"))?;
-    }
-    if let Some(value) = mapping.get("readiness") {
-        config.readiness =
-            require_choice(value, &format!("{what}.readiness"), &["both", "process"])?;
-    }
-    if let Some(value) = mapping.get("prompt_tail") {
-        config.prompt_tail = require_optional_text(value, &format!("{what}.prompt_tail"))?;
-    }
-    if let Some(value) = mapping.get("shells") {
-        config.shells = require_policy_list(value, &format!("{what}.shells"))?;
-    }
-    if let Some(value) = mapping.get("probe_remote") {
-        config.probe_remote = require_text(value, &format!("{what}.probe_remote"))?;
-    }
-    if let Some(value) = mapping.get("broker") {
-        config.broker =
-            require_choice(value, &format!("{what}.broker"), &["direct", "systemd-run"])?;
-    }
-    if config.allow.is_empty() {
-        return Err(HerdrRunError::config(format!(
-            "{what}.allow: refusing an EMPTY allowlist — no command could ever run"
-        )));
-    }
-    if config.allows_any_program() && config.allow.len() > 1 {
-        return Err(HerdrRunError::config(format!(
-            "{what}.allow: {ALLOW_ANY_PROGRAM:?} already admits every program, so it must be the only entry; listing programs beside it makes the policy look narrower than it is"
-        )));
-    }
-    if config.allow.iter().any(|program| program == "cargo")
-        && !config.allow_subcommand.contains_key("cargo")
-    {
-        return Err(HerdrRunError::config(format!(
-            "{what}.allow_subcommand: cargo is allowed but has no positive subcommand list"
-        )));
-    }
-    Ok(config)
-}
-
-/// Every configuration key the parser accepts.
-///
-/// Public because it is also the definition of "every knob", which the generated
-/// `.herdr-run.yaml` has to cover for the user guide to be able to point at that file instead of
-/// restating it.
-pub const KNOWN_KEYS: [&str; 20] = [
-    "workspace",
-    "tab_name",
-    "cwd",
-    "allow",
-    "prefixes",
-    "deny_global",
-    "deny_subcommand",
-    "deny_anywhere",
-    "allow_subcommand",
-    "value_options",
-    "spool_dir",
-    "timeout_seconds",
-    "retention_days",
-    "max_panes",
-    "ready_timeout_seconds",
-    "readiness",
-    "prompt_tail",
-    "shells",
-    "broker",
-    "probe_remote",
-];
-
-fn reject_unknown_keys(mapping: &Map<String, Value>, what: &str) -> Result<()> {
-    if mapping.keys().any(|key| contains_terminal_control(key)) {
-        return Err(HerdrRunError::config(format!(
-            "{what}: control characters are not allowed in keys"
-        )));
-    }
-    let known: BTreeSet<&str> = KNOWN_KEYS.iter().copied().collect();
-    let mut unknown: Vec<&str> = mapping
-        .keys()
-        .map(String::as_str)
-        .filter(|key| !known.contains(key))
-        .collect();
-    unknown.sort_unstable();
-    if unknown.is_empty() {
-        return Ok(());
-    }
-    let known_names = known.into_iter().collect::<Vec<_>>().join(", ");
-    Err(HerdrRunError::config(format!(
-        "{what}: unknown key(s): {}. Known keys: {known_names}",
-        unknown.join(", ")
-    )))
-}
-
-fn value_type(value: &Value) -> &'static str {
+fn require_object<'a>(value: &'a Yaml, what: &str) -> Result<&'a [(String, Yaml)]> {
     match value {
-        Value::Null => "null",
-        Value::Bool(_) => "bool",
-        Value::Number(_) => "number",
-        Value::String(_) => "string",
-        Value::Array(_) => "array",
-        Value::Object(_) => "object",
+        Yaml::Map(entries) => Ok(entries),
+        other => Err(HerdrRunError::config(format!(
+            "{what}: expected an object, got {}",
+            other.type_name()
+        ))),
     }
 }
 
-fn contains_terminal_control(value: &str) -> bool {
+fn require_array<'a>(value: &'a Yaml, what: &str) -> Result<&'a [Yaml]> {
+    match value {
+        Yaml::Seq(items) => Ok(items),
+        other => Err(HerdrRunError::config(format!(
+            "{what}: expected an array, got {}",
+            other.type_name()
+        ))),
+    }
+}
+
+fn contains_control(value: &str) -> bool {
     value
         .chars()
         .any(|character| matches!(u32::from(character), 0x00..=0x1f | 0x7f..=0x9f))
 }
 
-fn require_object<'a>(value: &'a Value, what: &str) -> Result<&'a Map<String, Value>> {
-    value.as_object().ok_or_else(|| {
-        HerdrRunError::config(format!(
-            "{what}: expected an object, got {}",
-            value_type(value)
-        ))
-    })
-}
-
-fn require_text(value: &Value, what: &str) -> Result<String> {
-    let text = value.as_str().ok_or_else(|| {
-        HerdrRunError::config(format!(
-            "{what}: must be a string, got {}",
-            value_type(value)
-        ))
-    })?;
-    if contains_terminal_control(text) {
+fn reject_controls(value: &str, what: &str) -> Result<()> {
+    if contains_control(value) {
         return Err(HerdrRunError::config(format!(
-            "{what}: control characters are not allowed"
+            "{what}: control characters and Unicode surrogates are not allowed"
         )));
     }
-    Ok(text.to_owned())
+    Ok(())
 }
 
-fn require_optional_text(value: &Value, what: &str) -> Result<Option<String>> {
-    if value.is_null() {
+fn require_text(value: &Yaml, what: &str) -> Result<String> {
+    let Yaml::Str(text) = value else {
+        return Err(HerdrRunError::config(format!(
+            "{what}: must be a string, got {}",
+            value.type_name()
+        )));
+    };
+    reject_controls(text, what)?;
+    Ok(text.clone())
+}
+
+fn require_policy_name(value: &Yaml, what: &str) -> Result<String> {
+    let text = require_text(value, what)?;
+    if text.is_empty() {
+        return Err(HerdrRunError::config(format!("{what}: must not be empty")));
+    }
+    Ok(text)
+}
+
+fn require_optional_text(value: &Yaml, what: &str) -> Result<Option<String>> {
+    if matches!(value, Yaml::Null) {
         Ok(None)
     } else {
         require_text(value, what).map(Some)
     }
 }
 
-fn require_string_list(value: &Value, what: &str) -> Result<Vec<String>> {
-    let values = value.as_array().ok_or_else(|| {
-        HerdrRunError::config(format!(
-            "{what}: expected an array, got {}",
-            value_type(value)
-        ))
-    })?;
-    values
-        .iter()
-        .map(|item| match item.as_str() {
-            Some(text) if contains_terminal_control(text) => Err(HerdrRunError::config(format!(
-                "{what}: control characters are not allowed"
-            ))),
-            Some(text) => Ok(text.to_owned()),
-            None => Err(HerdrRunError::config(format!(
+fn require_policy_list(value: &Yaml, what: &str) -> Result<Vec<String>> {
+    let items = require_array(value, what)?;
+    let mut out = Vec::with_capacity(items.len());
+    for item in items {
+        if !matches!(item, Yaml::Str(_)) {
+            return Err(HerdrRunError::config(format!(
                 "{what}: every entry must be a string, got {}",
-                value_type(item)
-            ))),
-        })
-        .collect()
-}
-
-fn require_policy_list(value: &Value, what: &str) -> Result<Vec<String>> {
-    let values = require_string_list(value, what)?;
-    for item in &values {
-        require_nonempty(item, what)?;
+                item.type_name()
+            )));
+        }
+        out.push(require_policy_name(
+            item,
+            &format!("{what}[{}]", out.len()),
+        )?);
     }
-    Ok(values)
+    Ok(out)
 }
 
-fn require_string_map(value: &Value, what: &str) -> Result<BTreeMap<String, Vec<String>>> {
-    let mapping = require_object(value, what)?;
-    mapping
-        .iter()
-        .map(|(key, item)| {
-            require_nonempty(key, what)?;
-            if contains_terminal_control(key) {
+fn require_policy_map(value: &Yaml, what: &str) -> Result<BTreeMap<String, Vec<String>>> {
+    let entries = require_object(value, what)?;
+    let mut out = BTreeMap::new();
+    for (key, item) in entries {
+        require_policy_name(&Yaml::Str(key.clone()), &format!("{what} key"))?;
+        out.insert(
+            key.clone(),
+            require_policy_list(item, &format!("{what}.{key}"))?,
+        );
+    }
+    Ok(out)
+}
+
+fn require_seconds(value: &Yaml, what: &str) -> Result<f64> {
+    let number = match value {
+        Yaml::Int(integer) => {
+            if *integer < 0 {
                 return Err(HerdrRunError::config(format!(
-                    "{what}: control characters are not allowed"
+                    "{what}: must not be negative"
                 )));
             }
-            require_policy_list(item, &format!("{what}.{key}")).map(|items| (key.clone(), items))
-        })
-        .collect()
-}
-
-fn require_number(value: &Value, what: &str) -> Result<f64> {
-    let number = value.as_f64().ok_or_else(|| {
-        HerdrRunError::config(format!(
-            "{what}: must be a number, got {}",
-            value_type(value)
-        ))
-    })?;
+            if *integer > MAX_TIMEOUT_SECONDS as i128 {
+                return Err(HerdrRunError::config(format!(
+                    "{what}: must not exceed {MAX_TIMEOUT_SECONDS:.0} seconds"
+                )));
+            }
+            return Ok(*integer as f64);
+        }
+        Yaml::Float(number) => *number,
+        other => {
+            return Err(HerdrRunError::config(format!(
+                "{what}: must be a number, got {}",
+                other.type_name()
+            )))
+        }
+    };
     if !number.is_finite() {
         return Err(HerdrRunError::config(format!("{what}: must be finite")));
     }
@@ -680,120 +455,237 @@ fn require_number(value: &Value, what: &str) -> Result<f64> {
             "{what}: must not exceed {MAX_TIMEOUT_SECONDS:.0} seconds"
         )));
     }
-    Ok(number)
-}
-
-fn require_nonnegative_integer(value: &Value, what: &str) -> Result<u64> {
-    let number = value.as_u64().ok_or_else(|| {
-        HerdrRunError::config(format!(
-            "{what}: must be a non-negative integer, got {}",
-            value_type(value)
-        ))
-    })?;
-    if number > crate::retention::MAX_RETENTION_DAYS {
+    if !whole_milliseconds(number) {
         return Err(HerdrRunError::config(format!(
-            "{what}: must not exceed {} days",
-            crate::retention::MAX_RETENTION_DAYS
+            "{what}: must be a whole number of milliseconds"
         )));
     }
     Ok(number)
 }
 
-fn require_bounded_count(value: &Value, what: &str, limit: u64) -> Result<u64> {
-    let number = value.as_u64().ok_or_else(|| {
-        HerdrRunError::config(format!(
-            "{what}: must be a non-negative integer, got {}",
-            value_type(value)
-        ))
-    })?;
-    if number > limit {
+fn require_bounded_count(value: &Yaml, what: &str, limit: u64, unit: &str) -> Result<u64> {
+    let Yaml::Int(integer) = value else {
         return Err(HerdrRunError::config(format!(
-            "{what}: must not exceed {limit}"
+            "{what}: must be a non-negative integer, got {}",
+            value.type_name()
+        )));
+    };
+    if *integer < 0 {
+        return Err(HerdrRunError::config(format!(
+            "{what}: must be a non-negative integer, got number"
         )));
     }
-    Ok(number)
+    if *integer > i128::from(limit) {
+        return Err(HerdrRunError::config(format!(
+            "{what}: must not exceed {limit}{unit}"
+        )));
+    }
+    Ok(u64::try_from(*integer).unwrap_or(limit))
 }
 
-fn require_nonempty(value: &str, what: &str) -> Result<()> {
-    if value.is_empty() {
-        Err(HerdrRunError::config(format!(
-            "{what}: entries must not be empty"
-        )))
-    } else {
-        Ok(())
-    }
-}
-
-fn validate_tab_template(template: &str, what: &str) -> Result<()> {
-    require_nonempty(template, what)?;
-    let mut remainder = template;
-    while let Some(index) = remainder.find(['{', '}']) {
-        let candidate = &remainder[index..];
-        if let Some(rest) = candidate.strip_prefix("{{") {
-            remainder = rest;
-        } else if let Some(rest) = candidate.strip_prefix("}}") {
-            remainder = rest;
-        } else if let Some(rest) = candidate.strip_prefix("{agent}") {
-            remainder = rest;
-        } else if let Some(rest) = candidate.strip_prefix("{project}") {
-            remainder = rest;
-        } else {
-            return Err(HerdrRunError::config(format!(
-                "{what}: only exact {{agent}} and {{project}} placeholders are allowed"
-            )));
-        }
-    }
-    Ok(())
-}
-
-/// Render a tab-label schema restricted to literal text and plain `{agent}`/`{project}` fields.
-pub fn render_tab_name(schema: &str, agent: &str, project: &str) -> Result<String> {
-    validate_tab_template(schema, "tab_name schema")?;
-    let mut output = String::new();
-    let mut remainder = schema;
-    while let Some(index) = remainder.find(['{', '}']) {
-        output.push_str(&remainder[..index]);
-        let candidate = &remainder[index..];
-        if let Some(rest) = candidate.strip_prefix("{{") {
-            output.push('{');
-            remainder = rest;
-        } else if let Some(rest) = candidate.strip_prefix("}}") {
-            output.push('}');
-            remainder = rest;
-        } else if let Some(rest) = candidate.strip_prefix("{agent}") {
-            output.push_str(agent);
-            remainder = rest;
-        } else if let Some(rest) = candidate.strip_prefix("{project}") {
-            output.push_str(project);
-            remainder = rest;
-        } else {
-            // Validation above makes this unreachable, but return a typed configuration error if
-            // this parser and its validator ever drift rather than relying on an assertion.
-            return Err(HerdrRunError::config(
-                "tab_name schema may use only plain {agent} and {project} placeholders",
-            ));
-        }
-    }
-    output.push_str(remainder);
-    if contains_terminal_control(&output) {
-        return Err(HerdrRunError::config(
-            "rendered tab_name: control characters are not allowed",
-        ));
-    }
-    require_nonempty(&output, "rendered tab_name")?;
-    Ok(output)
-}
-
-fn require_choice(value: &Value, what: &str, allowed: &[&str]) -> Result<String> {
+fn require_choice(value: &Yaml, what: &str, allowed: &[&str]) -> Result<String> {
     let choice = require_text(value, what)?;
     if allowed.contains(&choice.as_str()) {
         Ok(choice)
     } else {
         Err(HerdrRunError::config(format!(
-            "{what}: must be one of {}; got {choice:?}",
-            allowed.join(", ")
+            "{what}: must be one of {}; got {}",
+            allowed.join(", "),
+            quote(&choice)
         )))
     }
+}
+
+enum TemplateProblem {
+    Malformed(&'static str),
+    Placeholders,
+}
+
+/// Describe what is wrong with a tab-name schema, or return `None` when it is valid.
+fn template_problem(schema: &str) -> Option<TemplateProblem> {
+    let characters: Vec<char> = schema.chars().collect();
+    let mut index = 0;
+    while index < characters.len() {
+        match characters[index] {
+            '{' => {
+                if characters.get(index + 1) == Some(&'{') {
+                    index += 2;
+                    continue;
+                }
+                let Some(offset) = characters[index + 1..].iter().position(|c| *c == '}') else {
+                    return Some(TemplateProblem::Malformed("unmatched '{'"));
+                };
+                let close = index + 1 + offset;
+                let field: String = characters[index + 1..close].iter().collect();
+                if field != "agent" && field != "project" {
+                    return Some(TemplateProblem::Placeholders);
+                }
+                index = close + 1;
+            }
+            '}' => {
+                if characters.get(index + 1) == Some(&'}') {
+                    index += 2;
+                    continue;
+                }
+                return Some(TemplateProblem::Malformed("unmatched '}'"));
+            }
+            _ => index += 1,
+        }
+    }
+    None
+}
+
+fn check_template(schema: &str, what: &str) -> Result<()> {
+    match template_problem(schema) {
+        None => Ok(()),
+        Some(TemplateProblem::Placeholders) => Err(HerdrRunError::config(format!(
+            "{what}: schema {} may use only plain {{agent}} and {{project}} placeholders",
+            quote(schema)
+        ))),
+        Some(TemplateProblem::Malformed(detail)) => Err(HerdrRunError::config(format!(
+            "{what}: schema {} is malformed: {detail}",
+            quote(schema)
+        ))),
+    }
+}
+
+/// Render a tab-label schema restricted to literal text and plain `{agent}`/`{project}` fields.
+pub fn render_tab_name(schema: &str, agent: &str, project: &str) -> Result<String> {
+    check_template(schema, "tab_name")?;
+    let characters: Vec<char> = schema.chars().collect();
+    let mut output = String::new();
+    let mut index = 0;
+    while index < characters.len() {
+        let rest = &characters[index..];
+        if rest.starts_with(&['{', '{']) {
+            output.push('{');
+            index += 2;
+        } else if rest.starts_with(&['}', '}']) {
+            output.push('}');
+            index += 2;
+        } else if rest[0] == '{' {
+            let offset = rest.iter().position(|c| *c == '}').unwrap_or(rest.len());
+            let field: String = rest[1..offset].iter().collect();
+            output.push_str(if field == "agent" { agent } else { project });
+            index += offset + 1;
+        } else {
+            output.push(rest[0]);
+            index += 1;
+        }
+    }
+    reject_controls(&output, "rendered tab_name")?;
+    if output.is_empty() {
+        return Err(HerdrRunError::config(
+            "rendered tab_name: must not be empty",
+        ));
+    }
+    Ok(output)
+}
+
+/// Validate an already decoded document and construct a resolved configuration.
+pub fn parse_config(
+    document: &Yaml,
+    source_path: Option<String>,
+    project_root: String,
+) -> Result<Config> {
+    let mut config = Config {
+        source_path: source_path.clone(),
+        project_root,
+        ..Config::default()
+    };
+    if matches!(document, Yaml::Null) {
+        return Ok(config);
+    }
+    let what = source_path.as_deref().unwrap_or("<config>");
+    let mapping = require_object(document, what)?;
+    let mut unknown: Vec<&str> = mapping
+        .iter()
+        .map(|(key, _)| key.as_str())
+        .filter(|key| !KNOWN_KEYS.contains(key))
+        .collect();
+    unknown.sort_unstable();
+    unknown.dedup();
+    if !unknown.is_empty() {
+        let mut known = KNOWN_KEYS.to_vec();
+        known.sort_unstable();
+        // Reject rather than ignore: a typo'd `allowlist:` key silently falling back to the
+        // default allowlist is exactly the kind of quiet policy failure this tool must not have.
+        return Err(HerdrRunError::config(format!(
+            "{what}: unknown key(s): {}. Known keys: {}",
+            unknown
+                .iter()
+                .map(|key| quote(key))
+                .collect::<Vec<_>>()
+                .join(", "),
+            known.join(", ")
+        )));
+    }
+    for key in KNOWN_KEYS {
+        let Some((_, value)) = mapping.iter().find(|(name, _)| name == key) else {
+            continue;
+        };
+        let where_ = format!("{what}.{key}");
+        match key {
+            "workspace" => config.workspace = require_policy_name(value, &where_)?,
+            "tab_name" => {
+                let schema = require_policy_name(value, &where_)?;
+                check_template(&schema, &where_)?;
+                config.tab_name = schema;
+            }
+            "cwd" => config.cwd = require_optional_text(value, &where_)?,
+            "allow" => config.allow = require_policy_list(value, &where_)?,
+            "prefixes" => config.prefixes = require_policy_list(value, &where_)?,
+            "deny_global" => config.deny_global = require_policy_map(value, &where_)?,
+            "deny_subcommand" => config.deny_subcommand = require_policy_map(value, &where_)?,
+            "deny_anywhere" => config.deny_anywhere = require_policy_list(value, &where_)?,
+            "allow_subcommand" => config.allow_subcommand = require_policy_map(value, &where_)?,
+            "value_options" => config.value_options = require_policy_map(value, &where_)?,
+            "spool_dir" => config.spool_dir = require_text(value, &where_)?,
+            "timeout_seconds" => config.timeout_seconds = require_seconds(value, &where_)?,
+            "retention_days" => {
+                config.retention_days = require_bounded_count(
+                    value,
+                    &where_,
+                    crate::retention::MAX_RETENTION_DAYS,
+                    " days",
+                )?;
+            }
+            "max_panes" => {
+                config.max_panes = require_bounded_count(value, &where_, MAX_PANE_CAP, "")?;
+            }
+            "ready_timeout_seconds" => {
+                config.ready_timeout_seconds = require_seconds(value, &where_)?;
+            }
+            "readiness" => {
+                config.readiness = require_choice(value, &where_, &["both", "process"])?;
+            }
+            "prompt_tail" => config.prompt_tail = require_optional_text(value, &where_)?,
+            "shells" => config.shells = require_policy_list(value, &where_)?,
+            "broker" => {
+                config.broker = require_choice(value, &where_, &["direct", "systemd-run"])?;
+            }
+            "probe_remote" => config.probe_remote = require_text(value, &where_)?,
+            _ => {}
+        }
+    }
+    if config.allow.is_empty() {
+        return Err(HerdrRunError::config(format!(
+            "{what}.allow: refusing an EMPTY allowlist — no command could ever run"
+        )));
+    }
+    if config.allows_any_program() && config.allow.len() > 1 {
+        return Err(HerdrRunError::config(format!(
+            "{what}.allow: \"{ALLOW_ANY_PROGRAM}\" already admits every program, so it must be the only entry; listing programs beside it makes the policy look narrower than it is"
+        )));
+    }
+    if config.allow.iter().any(|program| program == "cargo")
+        && !config.allow_subcommand.contains_key("cargo")
+    {
+        return Err(HerdrRunError::config(format!(
+            "{what}.allow_subcommand: cargo is allowed but has no positive subcommand list"
+        )));
+    }
+    Ok(config)
 }
 
 #[cfg(test)]
@@ -812,6 +704,11 @@ mod tests {
         ));
         fs::create_dir_all(&path).expect("create temporary directory");
         path
+    }
+
+    fn parse_text(text: &str) -> Result<Config> {
+        let document = core_load(text).map_err(|error| HerdrRunError::config(error.to_string()))?;
+        parse_config(&document, Some("x.yaml".into()), "/tmp".into())
     }
 
     #[test]
@@ -876,12 +773,6 @@ mod tests {
     }
 
     /// The guide restates two defaults in prose; those sentences must say what the code does.
-    ///
-    /// `herdr-run init` exists so the guide can point at a generated file rather than list the
-    /// knobs, and it does that everywhere except the two sentences explaining why retention and
-    /// the pane cap exist. Those name the number, which is the same duplicate-free-to-drift one
-    /// layer up. As with `max_panes` above, the number is written LITERALLY here and the constant
-    /// is READ from the defaults, so changing either one alone goes red.
     #[test]
     fn user_guide_prose_defaults_are_the_built_in_defaults() {
         let expected: &[(&str, &str, u64)] =
@@ -926,18 +817,16 @@ mod tests {
 
     #[test]
     fn parses_every_supported_key_and_replaces_maps_wholesale() {
-        let document = serde_json::json!({
-            "workspace": "cmds", "tab_name": "{project}-{agent}", "cwd": "sub",
-            "allow": ["cargo"], "prefixes": [], "deny_global": {"cargo": ["-Z"]},
-            "deny_subcommand": {"cargo": ["install"]}, "deny_anywhere": ["--evil"],
-            "allow_subcommand": {"cargo": ["fetch", "build"]},
-            "value_options": {"cargo": ["--manifest-path"]}, "spool_dir": "out",
-            "timeout_seconds": 30, "retention_days": 7,
-            "ready_timeout_seconds": 5, "readiness": "process",
-            "prompt_tail": "% ", "shells": ["zsh"], "broker": "systemd-run",
-            "probe_remote": "https://example.test/repo"
-        });
-        let config = parse_config(&document, Some("x.yaml".into()), "/tmp".into()).unwrap();
+        let config = parse_text(
+            "workspace: cmds\ntab_name: '{project}-{agent}'\ncwd: sub\nallow: [cargo]\n\
+             prefixes: []\ndeny_global: {cargo: [-Z]}\ndeny_subcommand: {cargo: [install]}\n\
+             deny_anywhere: [--evil]\nallow_subcommand: {cargo: [fetch, build]}\n\
+             value_options: {cargo: [--manifest-path]}\nspool_dir: out\ntimeout_seconds: 30\n\
+             retention_days: 7\nready_timeout_seconds: 5\nreadiness: process\n\
+             prompt_tail: '% '\nshells: [zsh]\nbroker: systemd-run\n\
+             probe_remote: https://example.test/repo\n",
+        )
+        .unwrap();
         assert_eq!(config.allow, strings(&["cargo"]));
         assert_eq!(config.deny_global.len(), 1);
         assert!(!config.deny_global.contains_key("git"));
@@ -952,60 +841,45 @@ mod tests {
 
     #[test]
     fn every_malformed_shape_is_a_typed_config_error() {
-        let cases = [
-            serde_json::json!({"allow": "git"}),
-            serde_json::json!({"allow": [1]}),
-            serde_json::json!({"workspace": 42}),
-            serde_json::json!({"timeout_seconds": true}),
-            serde_json::json!({"timeout_seconds": -1}),
-            serde_json::json!({"timeout_seconds": MAX_TIMEOUT_SECONDS + 1.0}),
-            serde_json::json!({"retention_days": -1}),
-            serde_json::json!({"retention_days": 1.5}),
-            serde_json::json!({"retention_days": "4"}),
-            serde_json::json!({"retention_days": crate::retention::MAX_RETENTION_DAYS + 1}),
-            serde_json::json!({"readiness": "maybe"}),
-            serde_json::json!({"deny_global": ["git"]}),
-            serde_json::json!({"allow": []}),
-            serde_json::json!({"allowlist": ["git"]}),
-        ];
-        for document in cases {
-            let error = parse_config(&document, Some("x.yaml".into()), "/tmp".into())
-                .expect_err("malformed config must fail");
-            assert_eq!(error.exit_code(), crate::error::EXIT_CONFIG);
+        for text in [
+            "allow: git\n",
+            "allow: [1]\n",
+            "workspace: 42\n",
+            "timeout_seconds: true\n",
+            "timeout_seconds: -1\n",
+            "timeout_seconds: 31536001\n",
+            "timeout_seconds: 0.0001\n",
+            "retention_days: -1\n",
+            "retention_days: 1.5\n",
+            "retention_days: '4'\n",
+            "retention_days: 365001\n",
+            "readiness: maybe\n",
+            "deny_global: [git]\n",
+            "allow: []\n",
+            "allowlist: [git]\n",
+        ] {
+            let error = parse_text(text).expect_err(text);
+            assert_eq!(error.exit_code(), crate::error::EXIT_CONFIG, "{text}");
         }
     }
 
     #[test]
     fn the_allow_wildcard_must_stand_alone() {
-        let error = parse_config(
-            &serde_json::json!({"allow": ["*", "git"]}),
-            Some("x.yaml".into()),
-            "/tmp".into(),
-        )
-        .expect_err("a wildcard mixed with named programs must fail");
+        let error = parse_text("allow: ['*', git]\n").expect_err("a wildcard mixed with names");
         assert_eq!(error.exit_code(), crate::error::EXIT_CONFIG);
         assert!(
             error.message().contains("must be the only entry"),
             "{error}"
         );
-
-        let wildcard = parse_config(
-            &serde_json::json!({"allow": ["*"]}),
-            Some("x.yaml".into()),
-            "/tmp".into(),
-        )
-        .expect("a lone wildcard is a valid allowlist");
+        let wildcard = parse_text("allow: ['*']\n").expect("a lone wildcard is valid");
         assert!(wildcard.allows_any_program());
         assert!(!Config::default().allows_any_program());
     }
 
     #[test]
     fn cargo_allow_requires_its_positive_subcommand_map() {
-        let document = serde_json::json!({
-            "allow": ["git", "cargo"],
-            "allow_subcommand": {"custom-tool": ["inspect"]}
-        });
-        let error = parse_config(&document, Some("x.yaml".into()), "/tmp".into()).unwrap_err();
+        let error = parse_text("allow: [git, cargo]\nallow_subcommand: {custom-tool: [inspect]}\n")
+            .unwrap_err();
         assert!(error
             .message()
             .contains("cargo is allowed but has no positive"));
@@ -1035,75 +909,42 @@ mod tests {
         );
         let invalid = root.join("invalid.yaml");
         fs::write(&invalid, "allow: [unterminated\n").unwrap();
-        assert_eq!(
-            load_config(Some(&invalid), &root).unwrap_err().exit_code(),
-            crate::error::EXIT_CONFIG
+        let error = load_config(Some(&invalid), &root).unwrap_err();
+        assert_eq!(error.exit_code(), crate::error::EXIT_CONFIG);
+        assert!(
+            error
+                .message()
+                .ends_with("invalid YAML: unterminated flow sequence at line 1 column 8"),
+            "{error}"
         );
         fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
-    fn duplicate_merge_tag_and_nonfinite_yaml_are_rejected() {
-        for (label, text) in [
-            ("duplicate", "allow: [git]\nallow: [gh]\n"),
-            (
-                "nested-duplicate",
-                "deny_global:\n  git: [-c]\n  git: [--exec-path]\n",
-            ),
-            (
-                "merge",
-                "base: &base {git: [-c]}\ndeny_global:\n  <<: *base\n",
-            ),
-            ("tag", "workspace: !custom value\n"),
-            ("infinity", "timeout_seconds: .inf\n"),
-            ("nan", "timeout_seconds: .nan\n"),
-        ] {
-            let root = temporary_directory(label);
-            let path = root.join(".herdr-run.yaml");
-            fs::write(&path, text).unwrap();
-            let error = load_config(Some(&path), &root).expect_err(label);
-            assert_eq!(
-                error.exit_code(),
-                crate::error::EXIT_CONFIG,
-                "{label}: {error}"
-            );
-            fs::remove_dir_all(root).unwrap();
-        }
-    }
-
-    #[test]
     fn yaml_uses_core_12_scalar_resolution() {
-        let root = temporary_directory("yaml-core");
-        let path = root.join(".herdr-run.yaml");
-        fs::write(
-            &path,
-            "workspace: yes\nallow: [git, on, off]\ntimeout_seconds: 0o10\n",
-        )
-        .unwrap();
-        let config = load_config(Some(&path), &root).unwrap();
+        let config =
+            parse_text("workspace: yes\nallow: [git, on, off]\ntimeout_seconds: 0o10\n").unwrap();
         assert_eq!(config.workspace, "yes");
         assert_eq!(config.allow, strings(&["git", "on", "off"]));
         assert_eq!(config.timeout_seconds, 8.0);
-        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
     fn templates_empty_policy_names_and_controls_are_rejected() {
-        for document in [
-            serde_json::json!({"tab_name": "{agent.name}"}),
-            serde_json::json!({"tab_name": "{agent!r}"}),
-            serde_json::json!({"tab_name": "{agent:>10}"}),
-            serde_json::json!({"tab_name": "{unknown}"}),
-            serde_json::json!({"tab_name": "x}"}),
-            serde_json::json!({"tab_name": "x{"}),
-            serde_json::json!({"allow": [""]}),
-            serde_json::json!({"prefixes": ["with\u{001b}proxy"]}),
-            serde_json::json!({"deny_global": {"": ["-c"]}}),
-            serde_json::json!({"shells": ["ba\u{0085}sh"]}),
+        for text in [
+            "tab_name: '{agent.name}'\n",
+            "tab_name: '{agent!r}'\n",
+            "tab_name: '{agent:>10}'\n",
+            "tab_name: '{unknown}'\n",
+            "tab_name: 'x}'\n",
+            "tab_name: 'x{'\n",
+            "allow: ['']\n",
+            "prefixes: [\"with\\eproxy\"]\n",
+            "deny_global: {'': [-c]}\n",
+            "shells: [\"ba\\Nsh\"]\n",
         ] {
-            let error = parse_config(&document, Some("x.yaml".into()), "/tmp".into())
-                .expect_err("unsafe config must fail");
-            assert_eq!(error.exit_code(), crate::error::EXIT_CONFIG);
+            let error = parse_text(text).expect_err(text);
+            assert_eq!(error.exit_code(), crate::error::EXIT_CONFIG, "{text}");
         }
         for valid in [
             "literal",
@@ -1113,12 +954,7 @@ mod tests {
             "{{literal}}-{agent}",
             "{{{agent}}}",
         ] {
-            let config = parse_config(
-                &serde_json::json!({"tab_name": valid}),
-                Some("x.yaml".into()),
-                "/tmp".into(),
-            )
-            .unwrap();
+            let config = parse_text(&format!("tab_name: '{valid}'\n")).unwrap();
             assert_eq!(config.tab_name, valid);
         }
         assert_eq!(

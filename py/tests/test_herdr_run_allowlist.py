@@ -242,7 +242,7 @@ def test_the_allow_wildcard_admits_any_program_and_keeps_every_other_rule() -> N
         ("with-proxy with-proxy curl x", "repeated"),
         ("git --exec-path=/tmp/evil status", "is denied for git"),
         ("git push --receive-pack=/tmp/evil origin", "is denied"),
-        ("cargo build --release", "subcommand 'cargo build' is not allowlisted"),
+        ("cargo build --release", 'subcommand "cargo build" is not allowlisted'),
         ("with-proxy", "no program"),
     ):
         with pytest.raises(Refused) as excinfo:

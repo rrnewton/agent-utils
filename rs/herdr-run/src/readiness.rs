@@ -14,6 +14,7 @@ use regex::Regex;
 use crate::client::{current_account_home, HerdrApi, ProcessInfo};
 use crate::config::Config;
 use crate::error::Result;
+use crate::textfmt::{is_blank, quote, rstrip_space, strip_space};
 
 /// Foreground-process evidence about whether the pane's shell is idle.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -103,7 +104,7 @@ pub fn prompt_tail_of(ps1: &str) -> Option<String> {
         };
     }
     let tail = visible[last_dynamic_end..].replace(r"\$", "$");
-    (!tail.trim().is_empty()).then_some(tail)
+    (!strip_space(&tail).is_empty()).then_some(tail)
 }
 
 /// Resolve the configured prompt tail, or infer it from account shell startup files.
@@ -127,7 +128,11 @@ pub fn infer_prompt_tail(config: &Config, home: Option<&Path>) -> Option<String>
         let Ok(bytes) = fs::read(base.join(name)) else {
             continue;
         };
-        let text = String::from_utf8_lossy(&bytes);
+        // CRLF and CR line ends read as LF, so a file saved by a Windows editor still names its
+        // prompt and the dirty-line veto keeps working.
+        let text = String::from_utf8_lossy(&bytes)
+            .replace("\r\n", "\n")
+            .replace('\r', "\n");
         let Some(ps1) = parse_ps1(&text) else {
             continue;
         };
@@ -189,7 +194,7 @@ pub fn assess_process(info: &ProcessInfo, config: &Config) -> ProcessSignal {
     if !config.shells.iter().any(|shell| shell == name) {
         return signal(
             false,
-            format!("foreground process is {name:?}, not a known shell"),
+            format!("foreground process is {}, not a known shell", quote(name)),
         );
     }
     signal(
@@ -212,9 +217,12 @@ pub fn assess_prompt(text: &str, tail: Option<&str>) -> PromptSignal {
             None,
         );
     };
+    // Lines are split on line feeds only, with a trailing carriage return dropped: a Unicode line
+    // separator inside a half-typed command must not hide the command from the veto.
     let last = text
-        .lines()
-        .rfind(|line| !line.trim().is_empty())
+        .split('\n')
+        .map(|line| line.strip_suffix('\r').unwrap_or(line))
+        .rfind(|line| !is_blank(line))
         .map(str::to_owned);
     let Some(last) = last else {
         return prompt_signal(
@@ -225,7 +233,7 @@ pub fn assess_prompt(text: &str, tail: Option<&str>) -> PromptSignal {
         );
     };
     // Herdr strips trailing spaces from rendered lines, so `$ ` must be compared as `$`.
-    let needle = tail.trim_end();
+    let needle = rstrip_space(tail);
     if needle.is_empty() {
         return prompt_signal(
             "abstain",
@@ -234,30 +242,39 @@ pub fn assess_prompt(text: &str, tail: Option<&str>) -> PromptSignal {
             Some(&last),
         );
     }
-    let occurrences = last.match_indices(needle).count();
-    if occurrences == 1 && last.trim_end().ends_with(needle) {
+    let stripped_last = rstrip_space(&last);
+    let occurrences = stripped_last.match_indices(needle).count();
+    if occurrences == 1 && stripped_last.ends_with(needle) {
         return prompt_signal(
             "clean",
-            &format!("last line ends with prompt tail {needle:?}"),
+            &format!("last line ends with prompt tail {}", quote(needle)),
             Some(tail),
             Some(&last),
         );
     }
     if occurrences > 0 {
-        let excerpt = last.trim_end().chars().rev().take(80).collect::<String>();
-        let excerpt = excerpt.chars().rev().collect::<String>();
+        let characters: Vec<char> = stripped_last.chars().collect();
+        let excerpt: String = characters[characters.len().saturating_sub(80)..]
+            .iter()
+            .collect();
         let reason = if occurrences > 1 {
             format!(
-                "prompt tail {needle:?} occurs {occurrences} times; possible text follows an earlier prompt: {excerpt:?}"
+                "prompt tail {} occurs {occurrences} times; possible text follows an earlier prompt: {}",
+                quote(needle),
+                quote(&excerpt)
             )
         } else {
-            format!("text typed after prompt tail {needle:?}: {excerpt:?}")
+            format!(
+                "text typed after prompt tail {}: {}",
+                quote(needle),
+                quote(&excerpt)
+            )
         };
         return prompt_signal("dirty", &reason, Some(tail), Some(&last));
     }
     prompt_signal(
         "abstain",
-        &format!("prompt tail {needle:?} not found in last line"),
+        &format!("prompt tail {} not found in last line", quote(needle)),
         Some(tail),
         Some(&last),
     )
@@ -331,7 +348,7 @@ fn ps1_assignment() -> &'static Regex {
     static REGEX: OnceLock<Regex> = OnceLock::new();
     REGEX.get_or_init(|| {
         Regex::new(
-            r#"(?m)^[ \t]*(?:export[ \t]+)?(?:PS1|PROMPT)=(\"(?:[^\"\\]|\\.)*\"|'[^']*'|[^\s#]+)[ \t]*(?:#.*)?$"#,
+            r#"(?m)^[ \t]*(?:export[ \t]+)?(?:PS1|PROMPT)=(\"(?:[^\"\\]|\\.)*\"|'[^']*'|[^\t\n\x0B\x0C\r \x{85}\x{A0}\x{1680}\x{2000}-\x{200A}\x{2028}\x{2029}\x{202F}\x{205F}\x{3000}#]+)[ \t]*(?:#.*)?$"#,
         )
         .expect("valid PS1-assignment regex")
     })
@@ -445,9 +462,6 @@ export PS1="\u@\h:\w\$ " # selected
         fn workspace_id_for_label(&self, _label: &str) -> Result<Option<String>> {
             unreachable!()
         }
-        fn workspace_label_for_id(&self, _workspace_id: &str) -> Result<Option<String>> {
-            unreachable!()
-        }
         fn create_workspace(&self, _label: &str, _cwd: &str) -> Result<(String, String, String)> {
             unreachable!()
         }
@@ -476,9 +490,6 @@ export PS1="\u@\h:\w\$ " # selected
         }
         fn run(&self, _pane_id: &str, _command: &str) -> Result<()> {
             Err(HerdrRunError::unavailable("unused"))
-        }
-        fn send_keys(&self, _pane_id: &str, _keys: &str) -> Result<()> {
-            unreachable!()
         }
     }
 

@@ -7,23 +7,29 @@
 //! options that level takes.
 
 use std::ffi::OsString;
-use std::io::{self, Write};
-use std::path::{Component, Path, PathBuf};
+use std::io;
+use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::OnceLock;
 
+use regex::Regex;
 use serde_json::{json, Map, Value};
 
-use crate::allowlist::{admit, render, Admission};
+use crate::allowlist::{admit, quote_word, render, Admission};
 use crate::audit;
-use crate::client::{bounded_output, HerdrClient};
+use crate::client::{bounded_output, exit_status_code, HerdrClient};
 use crate::config::{load_config, Config, MAX_TIMEOUT_SECONDS};
 use crate::error::{ErrorKind, HerdrRunError, Result, EXIT_BUSY};
 use crate::evict;
+use crate::output;
 use crate::readiness::{assess, infer_prompt_tail};
 use crate::reap::plan_reap;
 use crate::runner::{execute, result_json, write_meta, RunResult};
 use crate::session::{resolve_target, tab_label_for};
 use crate::sweep::{build_evidence, load_run_records, measure_occupancy};
+use crate::textfmt::{
+    json_pretty, os_error_text, quote, strip_ascii, strip_space, whole_milliseconds,
+};
 
 /// One subcommand and the single line describing it in `herdr-run --help`.
 struct Subcommand {
@@ -124,6 +130,28 @@ enum ParseResult {
     Exit(i32),
 }
 
+/// Why a command line was not turned into an invocation.
+enum ParseFailure {
+    /// A command line this surface cannot accept, carrying the message to print.
+    Usage(String),
+    /// Help or version output that could not be written.
+    Failed(HerdrRunError),
+}
+
+impl From<String> for ParseFailure {
+    fn from(message: String) -> Self {
+        Self::Usage(message)
+    }
+}
+
+impl From<HerdrRunError> for ParseFailure {
+    fn from(error: HerdrRunError) -> Self {
+        Self::Failed(error)
+    }
+}
+
+type Parsed<T> = std::result::Result<T, ParseFailure>;
+
 /// Run the CLI over an argument iterator and return the desired process status.
 pub fn main<I>(arguments: I) -> i32
 where
@@ -131,10 +159,14 @@ where
 {
     let parsed = match parse(arguments) {
         Ok(parsed) => parsed,
-        Err(message) => {
-            eprintln!("usage: {}", usage_line());
-            eprintln!("herdr-run: error: {message}");
+        Err(ParseFailure::Usage(message)) => {
+            output::diagnostic(&format!("usage: {}", usage_line()));
+            output::diagnostic(&format!("herdr-run: error: {message}"));
             return 2;
+        }
+        Err(ParseFailure::Failed(error)) => {
+            output::diagnostic(&format!("herdr-run: {error}"));
+            return error.exit_code();
         }
     };
     let invocation = match parsed {
@@ -143,14 +175,14 @@ where
     };
     // Printed before any configuration is read: documentation is exactly what somebody with a
     // broken configuration file needs, and refusing to show it would be perverse.
-    if let Some(document) = document_for(&invocation.selected) {
-        print!("{document}");
-        return 0;
-    }
-    match dispatch(invocation) {
+    let outcome = match document_for(&invocation.selected) {
+        Some(document) => output::stdout(document).map(|()| 0),
+        None => dispatch(invocation),
+    };
+    match outcome {
         Ok(code) => code,
         Err(error) => {
-            let _ = writeln!(io::stderr(), "herdr-run: {error}");
+            output::diagnostic(&format!("herdr-run: {error}"));
             error.exit_code()
         }
     }
@@ -180,20 +212,95 @@ fn subcommand_names() -> String {
 /// Knowing the owner is what turns "unrecognized argument" into a usable message. A caller who
 /// writes `herdr-run --cwd /tmp run ...` has the right option and the wrong level, and being told
 /// which level it belongs to is the whole difference between a typo and a dead end.
-fn local_option_owners(name: &str) -> &'static [&'static str] {
-    match name {
-        "--cwd" | "--timeout" | "--wait-ready" | "--dry-run" => &["run"],
-        "--no-cache" => &["run", "target"],
-        "--force" => &["init"],
+fn local_option_owners(name: &str) -> Vec<&'static str> {
+    if name == "--help" || name == "-h" {
+        return Vec::new();
+    }
+    SUBCOMMAND_OPTIONS
+        .iter()
+        .filter(|(_, table)| table.iter().any(|(option, _)| *option == name))
+        .map(|(subcommand, _)| *subcommand)
+        .collect()
+}
+
+/// Every option accepted before the subcommand, with the value it takes (`None` for a flag).
+///
+/// The parser, the refusal messages, and `--dump-surface` all read this one table, so the surface
+/// the tool reports is the surface it accepts.
+const GLOBAL_OPTIONS: &[(&str, Option<&str>)] = &[
+    ("--agent", Some("NAME")),
+    ("--config", Some("PATH")),
+    ("--dump-surface", None),
+    ("--help", None),
+    ("--json", None),
+    ("--version", None),
+    ("-h", None),
+];
+
+/// One option table: each option and the value it takes (`None` for a flag).
+type OptionTable = &'static [(&'static str, Option<&'static str>)];
+
+/// Every option each subcommand accepts after its name, with the value it takes.
+const SUBCOMMAND_OPTIONS: &[(&str, OptionTable)] = &[
+    ("check", &[("--help", None), ("-h", None)]),
+    ("config", &[("--help", None), ("-h", None)]),
+    ("init", &[("--force", None), ("--help", None), ("-h", None)]),
+    ("net-doctor", &[("--help", None), ("-h", None)]),
+    ("quickstart", &[("--help", None), ("-h", None)]),
+    ("reap", &[("--help", None), ("-h", None)]),
+    (
+        "run",
+        &[
+            ("--cwd", Some("PATH")),
+            ("--dry-run", None),
+            ("--help", None),
+            ("--no-cache", None),
+            ("--timeout", Some("SECONDS")),
+            ("--wait-ready", Some("SECONDS")),
+            ("-h", None),
+        ],
+    ),
+    ("status", &[("--help", None), ("-h", None)]),
+    (
+        "target",
+        &[("--help", None), ("--no-cache", None), ("-h", None)],
+    ),
+    ("userguide", &[("--help", None), ("-h", None)]),
+];
+
+/// The positional argument each subcommand takes, if any.
+fn positional_for(subcommand: &str) -> &'static [&'static str] {
+    match subcommand {
+        "run" | "check" => &["<command>"],
         _ => &[],
     }
 }
 
 fn is_global_option(name: &str) -> bool {
-    matches!(
-        name,
-        "--help" | "-h" | "--version" | "--json" | "--config" | "--agent"
-    )
+    GLOBAL_OPTIONS.iter().any(|(option, _)| *option == name)
+}
+
+/// The JSON document `--dump-surface` prints: every subcommand and option, from the tables above.
+fn surface_document() -> Value {
+    let options = |table: &[(&str, Option<&str>)]| {
+        let mut map = Map::new();
+        for (name, value) in table {
+            map.insert((*name).to_owned(), json!(value));
+        }
+        Value::Object(map)
+    };
+    let mut subcommands = Map::new();
+    for (name, table) in SUBCOMMAND_OPTIONS {
+        subcommands.insert(
+            (*name).to_owned(),
+            json!({"options": options(table), "positional": positional_for(name)}),
+        );
+    }
+    json!({
+        "global_options": options(GLOBAL_OPTIONS),
+        "subcommands": Value::Object(subcommands),
+        "version": env!("CARGO_PKG_VERSION"),
+    })
 }
 
 fn join_quoted(values: &[&str]) -> String {
@@ -217,38 +324,55 @@ fn option_value(
     index: &mut usize,
     name: &str,
     inline: Option<&str>,
-) -> std::result::Result<String, String> {
+) -> Parsed<String> {
     if let Some(value) = inline {
         return Ok(value.to_owned());
     }
-    let value = raw
-        .get(*index + 1)
-        .ok_or_else(|| format!("argument {name}: expected one value"))?;
+    let Some(value) = raw.get(*index + 1) else {
+        return Err(format!("argument {name}: expected one value").into());
+    };
     if value.starts_with('-') && value != "-" {
-        return Err(format!("argument {name}: expected one value"));
+        return Err(format!("argument {name}: expected one value").into());
     }
     *index += 1;
     Ok(value.clone())
 }
 
-fn parse_seconds(option: &str, value: &str) -> std::result::Result<f64, String> {
+/// The seconds grammar `--timeout` and `--wait-ready` accept: ASCII digits only, an optional sign,
+/// an optional fraction and exponent, or a spelling of infinity or NaN (refused afterwards as not
+/// finite). No whitespace, no underscores, no other script's digits.
+fn seconds_grammar() -> &'static Regex {
+    static GRAMMAR: OnceLock<Regex> = OnceLock::new();
+    GRAMMAR.get_or_init(|| {
+        Regex::new(
+            r"^[+-]?(?:(?:[0-9]+\.?[0-9]*|\.[0-9]+)(?:[eE][+-]?[0-9]+)?|[iI][nN][fF](?:[iI][nN][iI][tT][yY])?|[nN][aA][nN])$",
+        )
+        .expect("valid seconds grammar")
+    })
+}
+
+fn parse_seconds(option: &str, value: &str) -> Parsed<f64> {
+    if !seconds_grammar().is_match(value) {
+        return Err(format!("argument {option}: invalid numeric value: {}", quote(value)).into());
+    }
     let parsed = value
         .parse::<f64>()
-        .map_err(|_| format!("argument {option}: invalid numeric value: {value:?}"))?;
+        .map_err(|_| format!("argument {option}: invalid numeric value: {}", quote(value)))?;
     if !parsed.is_finite() || parsed < 0.0 {
-        return Err(format!(
-            "argument {option}: must be a finite non-negative number"
-        ));
+        return Err(format!("argument {option}: must be a finite non-negative number").into());
     }
     if parsed > MAX_TIMEOUT_SECONDS {
-        return Err(format!(
-            "argument {option}: must not exceed {MAX_TIMEOUT_SECONDS:.0} seconds"
-        ));
+        return Err(
+            format!("argument {option}: must not exceed {MAX_TIMEOUT_SECONDS:.0} seconds").into(),
+        );
+    }
+    if !whole_milliseconds(parsed) {
+        return Err(format!("argument {option}: must be a whole number of milliseconds").into());
     }
     Ok(parsed)
 }
 
-fn parse<I>(arguments: I) -> std::result::Result<ParseResult, String>
+fn parse<I>(arguments: I) -> Parsed<ParseResult>
 where
     I: IntoIterator<Item = OsString>,
 {
@@ -273,22 +397,27 @@ where
                     index += 1;
                     break;
                 }
-                None => return Err(unknown_subcommand(&token, &raw[index + 1..])),
+                None => return Err(unknown_subcommand(&token, &raw[index + 1..]).into()),
             }
         }
         if token == "--" {
             return Err(format!(
                 "expected a subcommand before '--'. Subcommands: {}",
                 subcommand_names()
-            ));
+            )
+            .into());
         }
         match token.as_str() {
             "--help" | "-h" => {
-                print_help();
+                print_help()?;
                 return Ok(ParseResult::Exit(0));
             }
             "--version" => {
-                println!("herdr-run {}", env!("CARGO_PKG_VERSION"));
+                output::stdout(&format!("herdr-run {}\n", env!("CARGO_PKG_VERSION")))?;
+                return Ok(ParseResult::Exit(0));
+            }
+            "--dump-surface" => {
+                output::stdout(&format!("{}\n", json_pretty(&surface_document())))?;
                 return Ok(ParseResult::Exit(0));
             }
             "--json" => globals.json = true,
@@ -302,10 +431,10 @@ where
                     "--agent" => {
                         globals.agent = Some(option_value(&raw, &mut index, name, inline)?);
                     }
-                    "--json" | "--help" | "--version" => {
-                        return Err(format!("argument {name}: takes no value"));
+                    "--json" | "--help" | "--version" | "--dump-surface" => {
+                        return Err(format!("argument {name}: takes no value").into());
                     }
-                    other => return Err(misplaced_global(other)),
+                    other => return Err(misplaced_global(other).into()),
                 }
             }
         }
@@ -314,7 +443,7 @@ where
 
     let Some(subcommand) = chosen else {
         // No subcommand at all is not an error: it is somebody asking what this command is.
-        print_help();
+        print_help()?;
         return Ok(ParseResult::Exit(0));
     };
     let rest = &raw[index..];
@@ -328,17 +457,17 @@ where
     // once reports the first of them and both editions report the same one.
     if globals.config.is_some() {
         if let Some(reason) = config_blind_reason(subcommand.name) {
-            return Err(config_blind_error(subcommand.name, reason));
+            return Err(config_blind_error(subcommand.name, reason).into());
         }
     }
     if globals.agent.is_some() {
         if let Some(reason) = agent_blind_reason(subcommand.name) {
-            return Err(agent_blind_error(subcommand.name, reason));
+            return Err(agent_blind_error(subcommand.name, reason).into());
         }
     }
     if globals.json {
         if let Some(reason) = json_blind_reason(subcommand.name) {
-            return Err(json_blind_error(subcommand.name, reason));
+            return Err(json_blind_error(subcommand.name, reason).into());
         }
     }
     Ok(ParseResult::Invocation(Box::new(Invocation {
@@ -348,7 +477,7 @@ where
 }
 
 /// Parse one subcommand's own arguments; `None` means its `--help` was printed.
-fn parse_subcommand(name: &str, rest: &[String]) -> std::result::Result<Option<Selected>, String> {
+fn parse_subcommand(name: &str, rest: &[String]) -> Parsed<Option<Selected>> {
     match name {
         "run" => parse_run(rest),
         "check" => {
@@ -356,9 +485,9 @@ fn parse_subcommand(name: &str, rest: &[String]) -> std::result::Result<Option<S
                 return Ok(None);
             };
             match positional.len() {
-                0 => Err("check: needs a command to check".to_owned()),
+                0 => Err("check: needs a command to check".to_owned().into()),
                 1 => Ok(Some(Selected::Check(positional[0].clone()))),
-                _ => Err(one_argument_error("check", &positional)),
+                _ => Err(one_argument_error("check", &positional).into()),
             }
         }
         "status" | "config" | "reap" | "net-doctor" | "quickstart" | "userguide" => {
@@ -369,7 +498,8 @@ fn parse_subcommand(name: &str, rest: &[String]) -> std::result::Result<Option<S
                 return Err(format!(
                     "{name}: takes no positional arguments; got {}",
                     positional.len()
-                ));
+                )
+                .into());
             }
             Ok(Some(match name {
                 "status" => Selected::Status,
@@ -380,48 +510,36 @@ fn parse_subcommand(name: &str, rest: &[String]) -> std::result::Result<Option<S
                 _ => Selected::Userguide,
             }))
         }
-        "init" => {
-            let mut force = false;
-            let mut index = 0;
-            while index < rest.len() {
-                let token = &rest[index];
+        "init" | "target" => {
+            let flag = if name == "init" {
+                "--force"
+            } else {
+                "--no-cache"
+            };
+            let mut present = false;
+            for token in rest {
                 if token == "--help" || token == "-h" {
-                    print_subcommand_help(name);
+                    print_subcommand_help(name)?;
                     return Ok(None);
                 }
-                if token == "--force" {
-                    force = true;
-                    index += 1;
+                if token == flag {
+                    present = true;
                     continue;
                 }
-                return Err(local_argument_error(name, token));
+                return Err(local_argument_error(name, token).into());
             }
-            Ok(Some(Selected::Init { force }))
+            Ok(Some(if name == "init" {
+                Selected::Init { force: present }
+            } else {
+                Selected::Target { no_cache: present }
+            }))
         }
-        "target" => {
-            let mut no_cache = false;
-            let mut index = 0;
-            while index < rest.len() {
-                let token = &rest[index];
-                if token == "--help" || token == "-h" {
-                    print_subcommand_help(name);
-                    return Ok(None);
-                }
-                if token == "--no-cache" {
-                    no_cache = true;
-                    index += 1;
-                    continue;
-                }
-                return Err(local_argument_error(name, token));
-            }
-            Ok(Some(Selected::Target { no_cache }))
-        }
-        _ => Err(format!("unknown subcommand '{name}'")),
+        _ => Err(format!("unknown subcommand '{name}'").into()),
     }
 }
 
 /// Parse a subcommand that takes no options, returning its positional arguments.
-fn parse_bare(name: &str, rest: &[String]) -> std::result::Result<Option<Vec<String>>, String> {
+fn parse_bare(name: &str, rest: &[String]) -> Parsed<Option<Vec<String>>> {
     let mut positional = Vec::new();
     let mut options = true;
     for token in rest {
@@ -430,18 +548,18 @@ fn parse_bare(name: &str, rest: &[String]) -> std::result::Result<Option<Vec<Str
             continue;
         }
         if options && (token == "--help" || token == "-h") {
-            print_subcommand_help(name);
+            print_subcommand_help(name)?;
             return Ok(None);
         }
         if options && token.starts_with('-') {
-            return Err(local_argument_error(name, token));
+            return Err(local_argument_error(name, token).into());
         }
         positional.push(token.clone());
     }
     Ok(Some(positional))
 }
 
-fn parse_run(rest: &[String]) -> std::result::Result<Option<Selected>, String> {
+fn parse_run(rest: &[String]) -> Parsed<Option<Selected>> {
     let mut options = RunOptions::default();
     let mut positional = Vec::new();
     let mut parsing = true;
@@ -460,7 +578,7 @@ fn parse_run(rest: &[String]) -> std::result::Result<Option<Selected>, String> {
         }
         match token.as_str() {
             "--help" | "-h" => {
-                print_subcommand_help("run");
+                print_subcommand_help("run")?;
                 return Ok(None);
             }
             "--no-cache" => options.no_cache = true,
@@ -479,19 +597,19 @@ fn parse_run(rest: &[String]) -> std::result::Result<Option<Selected>, String> {
                         let value = option_value(rest, &mut index, name, inline)?;
                         options.wait_ready = Some(parse_seconds(name, &value)?);
                     }
-                    other => return Err(local_argument_error("run", other)),
+                    other => return Err(local_argument_error("run", other).into()),
                 }
             }
         }
         index += 1;
     }
     match positional.len() {
-        0 => Err("run: needs a command to run".to_owned()),
+        0 => Err("run: needs a command to run".to_owned().into()),
         1 => {
             options.command = positional[0].clone();
             Ok(Some(Selected::Run(options)))
         }
-        _ => Err(one_argument_error("run", &positional)),
+        _ => Err(one_argument_error("run", &positional).into()),
     }
 }
 
@@ -514,7 +632,7 @@ fn local_argument_error(subcommand: &str, token: &str) -> String {
     if !owners.is_empty() && !owners.contains(&subcommand) {
         return format!(
             "argument {name}: this is a {} option, not a '{subcommand}' option",
-            join_quoted(owners)
+            join_quoted(&owners)
         );
     }
     format!("{subcommand}: unrecognized arguments: {token}")
@@ -601,7 +719,7 @@ fn misplaced_global(name: &str) -> String {
     }
     format!(
         "argument {name}: this is a {} option; put it AFTER the subcommand:\n  herdr-run {} {name} ...",
-        join_quoted(owners),
+        join_quoted(&owners),
         owners[0]
     )
 }
@@ -633,7 +751,10 @@ fn unknown_subcommand(token: &str, following: &[String]) -> String {
 
 fn dispatch(invocation: Invocation) -> Result<i32> {
     let start = std::env::current_dir().map_err(|error| {
-        HerdrRunError::config(format!("cannot determine current directory: {error}"))
+        HerdrRunError::config(format!(
+            "cannot determine current directory: {}",
+            os_error_text(&error)
+        ))
     })?;
     if let Selected::Init { force } = invocation.selected {
         // Deliberately before load_config: the reason to reach for `init` is often that discovery
@@ -642,36 +763,55 @@ fn dispatch(invocation: Invocation) -> Result<i32> {
         return command_init(&start, force, invocation.globals.json);
     }
     let config = load_config(invocation.globals.config.as_deref(), &start)?;
-    let agent = invocation
-        .globals
-        .agent
-        .clone()
-        .filter(|value| !value.is_empty())
-        .unwrap_or_else(default_agent);
     let json = invocation.globals.json;
+    // The agent is resolved only by the subcommands that name a tab with it, so a malformed agent
+    // variable cannot fail a `check` or a `reap` that never asks who is speaking.
     match invocation.selected {
-        Selected::Run(options) => run_command(&config, &agent, json, &options),
+        Selected::Run(options) => {
+            let agent = resolve_agent(&invocation.globals)?;
+            run_command(&config, &agent, json, &options)
+        }
         Selected::Check(command) => command_check(&config, &command, json),
-        Selected::Status => command_status(&config, &agent, json),
+        Selected::Status => command_status(&config, &resolve_agent(&invocation.globals)?, json),
         Selected::Init { .. } => unreachable!("init is handled before configuration is loaded"),
-        Selected::Config => command_config(&config, &agent),
-        Selected::Target { no_cache } => command_target(&config, &agent, !no_cache),
+        Selected::Config => command_config(&config, &resolve_agent(&invocation.globals)?),
+        Selected::Target { no_cache } => {
+            command_target(&config, &resolve_agent(&invocation.globals)?, !no_cache)
+        }
         Selected::Reap => command_reap(&config),
-        Selected::NetDoctor => command_net_doctor(&config, &agent),
+        Selected::NetDoctor => command_net_doctor(&config, &resolve_agent(&invocation.globals)?),
         Selected::Quickstart | Selected::Userguide => Ok(0),
     }
 }
 
-fn default_agent() -> String {
-    ["HERDR_RUN_AGENT", "DG_AGENT_NAME", "ORC_AGENT_NAME"]
-        .iter()
-        .find_map(|key| {
-            std::env::var(key)
-                .ok()
-                .map(|value| value.trim().to_owned())
-                .filter(|value| !value.is_empty())
-        })
-        .unwrap_or_else(|| "unknown-agent".to_owned())
+fn resolve_agent(globals: &Globals) -> Result<String> {
+    if let Some(agent) = globals.agent.as_deref().filter(|value| !value.is_empty()) {
+        return Ok(agent.to_owned());
+    }
+    default_agent()
+}
+
+/// Infer the invoking agent from the environment the orchestrator sets.
+///
+/// Values are trimmed of ASCII whitespace only, so a control character is refused when the tab
+/// label is rendered instead of being silently removed. A variable that is not valid UTF-8 is an
+/// error: skipping it would make this invocation speak for whoever the NEXT variable names.
+fn default_agent() -> Result<String> {
+    for key in ["HERDR_RUN_AGENT", "DG_AGENT_NAME", "ORC_AGENT_NAME"] {
+        let Some(raw) = std::env::var_os(key) else {
+            continue;
+        };
+        let Ok(value) = raw.into_string() else {
+            return Err(HerdrRunError::config(format!(
+                "environment variable {key} is not valid UTF-8"
+            )));
+        };
+        let trimmed = strip_ascii(&value);
+        if !trimmed.is_empty() {
+            return Ok(trimmed.to_owned());
+        }
+    }
+    Ok("unknown-agent".to_owned())
 }
 
 fn command_init(directory: &Path, force: bool, json_output: bool) -> Result<i32> {
@@ -679,10 +819,10 @@ fn command_init(directory: &Path, force: bool, json_output: bool) -> Result<i32>
     if json_output {
         print_json(&json!({"created": true, "path": path.display().to_string()}))?;
     } else {
-        println!("wrote {}", path.display());
-        println!(
-            "Every knob is in that file, set to the value in force today. The allowlist near the\ntop is a HUMAN-ONLY knob: an agent that can widen its own allowlist does not have one."
-        );
+        output::stdout(&format!(
+            "wrote {}\nEvery knob is in that file, set to the value in force today. The allowlist near the\ntop is a HUMAN-ONLY knob: an agent that can widen its own allowlist does not have one.\n",
+            path.display()
+        ))?;
     }
     Ok(0)
 }
@@ -694,17 +834,15 @@ fn command_status(config: &Config, agent: &str, json_output: bool) -> Result<i32
     let tab_label = tab_label_for(config, agent)?;
     // A resolution failure is a fact about the session worth REPORTING, not an error to exit on:
     // "herdr is not installed" is one of the most useful things status can tell somebody.
-    let session = match HerdrClient::new(&config.broker) {
-        Ok(client) => match client.preflight() {
-            Ok(()) => inspect_session(&client, config, &tab_label),
-            Err(error) => Session::Unreachable(error.message().to_owned()),
-        },
+    let client = HerdrClient::new(&config.broker)?;
+    let session = match client.preflight() {
+        Ok(()) => inspect_session(&client, config, &tab_label),
         Err(error) => Session::Unreachable(error.message().to_owned()),
     };
     if json_output {
         print_json(&status_document(config, agent, &tab_label, &session))?;
     } else {
-        print!("{}", status_text(config, agent, &tab_label, &session));
+        output::stdout(&status_text(config, agent, &tab_label, &session))?;
     }
     Ok(0)
 }
@@ -718,14 +856,14 @@ fn command_config(config: &Config, agent: &str) -> Result<i32> {
         "deny_anywhere": config.deny_anywhere,
         "deny_global": config.deny_global,
         "deny_subcommand": config.deny_subcommand,
+        "max_panes": config.max_panes,
+        "prefixes": config.prefixes,
         "probe_remote": config.probe_remote,
         "project_root": config.project_root,
         "prompt_tail": config.prompt_tail,
-        "prefixes": config.prefixes,
-        "max_panes": config.max_panes,
         "readiness": config.readiness,
-        "retention_days": config.retention_days,
         "ready_timeout_seconds": config.ready_timeout_seconds,
+        "retention_days": config.retention_days,
         "shells": config.shells,
         "source": config.source_path.as_deref().unwrap_or("(built-in defaults)"),
         "spool_dir": config.spool_dir,
@@ -750,12 +888,14 @@ fn command_check(config: &Config, command: &str, json_output: bool) -> Result<i3
                     "verdict": "allowed",
                 }))?;
             } else {
-                println!(
-                    "ALLOWED: program={} subcommand={}",
+                // `-` stands for an ABSENT subcommand only; an empty token is printed as empty,
+                // the way the JSON form distinguishes `null` from `""`.
+                output::stdout(&format!(
+                    "ALLOWED: program={} subcommand={}\nrendered: {}\n",
                     admission.program,
-                    admission.subcommand.as_deref().unwrap_or("-")
-                );
-                println!("rendered: {}", admission.rendered());
+                    admission.subcommand.as_deref().unwrap_or("-"),
+                    admission.rendered()
+                ))?;
             }
             Ok(0)
         }
@@ -766,7 +906,7 @@ fn command_check(config: &Config, command: &str, json_output: bool) -> Result<i3
                     "verdict": "refused",
                 }))?;
             } else {
-                eprintln!("REFUSED: {error}");
+                output::diagnostic(&format!("REFUSED: {error}"));
             }
             Ok(error.exit_code())
         }
@@ -807,7 +947,7 @@ fn run_command(config: &Config, agent: &str, json_output: bool, args: &RunOption
         Ok(admission) => admission,
         Err(error) if error.kind() == ErrorKind::Refused => {
             record_audit(&log, agent, command, "REFUSED", error.message(), Map::new());
-            eprintln!("herdr-run: REFUSED: {error}");
+            output::diagnostic(&format!("herdr-run: REFUSED: {error}"));
             return Ok(error.exit_code());
         }
         Err(error) => return Err(error),
@@ -828,7 +968,7 @@ fn run_command(config: &Config, agent: &str, json_output: bool, args: &RunOption
                 "verdict": "allowed",
             }))?;
         } else {
-            println!("{}", admission.rendered());
+            output::stdout(&format!("{}\n", admission.rendered()))?;
         }
         return Ok(0);
     }
@@ -870,6 +1010,8 @@ fn run_command(config: &Config, agent: &str, json_output: bool, args: &RunOption
     ) {
         Ok(result) => result,
         Err(error) if error.kind() == ErrorKind::Timeout => {
+            // Emit whatever the command managed to print BEFORE reporting the timeout: dropping it
+            // would make a partially successful run look like one that produced nothing.
             record_audit(
                 &log,
                 agent,
@@ -878,23 +1020,9 @@ fn run_command(config: &Config, agent: &str, json_output: bool, args: &RunOption
                 error.message(),
                 Map::new(),
             );
-            io::stdout()
-                .write_all(error.partial_stdout().as_bytes())
-                .map_err(|write_error| {
-                    HerdrRunError::new(
-                        ErrorKind::Other,
-                        format!("cannot write partial stdout: {write_error}"),
-                    )
-                })?;
-            io::stderr()
-                .write_all(error.partial_stderr().as_bytes())
-                .map_err(|write_error| {
-                    HerdrRunError::new(
-                        ErrorKind::Other,
-                        format!("cannot write partial stderr: {write_error}"),
-                    )
-                })?;
-            eprintln!("herdr-run: {error}");
+            output::write_labelled(1, error.partial_stdout().as_bytes(), "partial stdout")?;
+            output::write_labelled(2, error.partial_stderr().as_bytes(), "partial stderr")?;
+            output::diagnostic(&format!("herdr-run: {error}"));
             return Ok(error.exit_code());
         }
         Err(error) => return audited_error(&log, agent, command, error),
@@ -924,12 +1052,8 @@ fn run_command(config: &Config, agent: &str, json_output: bool, args: &RunOption
     if json_output {
         print_json(&result_json(&result, meta.as_deref()))?;
     } else {
-        io::stdout().write_all(&result.stdout).map_err(|error| {
-            HerdrRunError::new(ErrorKind::Other, format!("cannot write stdout: {error}"))
-        })?;
-        io::stderr().write_all(&result.stderr).map_err(|error| {
-            HerdrRunError::new(ErrorKind::Other, format!("cannot write stderr: {error}"))
-        })?;
+        output::stdout_bytes(&result.stdout)?;
+        output::stderr_bytes(&result.stderr)?;
     }
     Ok(result.exit_code)
 }
@@ -943,7 +1067,7 @@ fn audited_error(log: &Path, agent: &str, command: &str, error: HerdrRunError) -
         error.message(),
         Map::new(),
     );
-    eprintln!("herdr-run: {error}");
+    output::diagnostic(&format!("herdr-run: {error}"));
     Ok(error.exit_code())
 }
 
@@ -956,10 +1080,10 @@ fn record_audit(
     fields: Map<String, Value>,
 ) {
     if !audit::record(log, agent, command, verdict, detail, fields) {
-        eprintln!(
+        output::diagnostic(&format!(
             "herdr-run: WARNING: could not append audit record to {}",
             log.display()
-        );
+        ));
     }
 }
 
@@ -972,7 +1096,7 @@ fn write_meta_best_effort(
     match write_meta(result, admission, config, agent) {
         Ok(path) => (Some(path), None),
         Err(error) => {
-            eprintln!("herdr-run: WARNING: {}", error.message());
+            output::diagnostic(&format!("herdr-run: WARNING: {}", error.message()));
             (None, Some(error.message().to_owned()))
         }
     }
@@ -1002,9 +1126,18 @@ fn write_meta_best_effort(
 /// `replaceable` says whether that matters: the cap replaces an idle unsplit tab before it refuses,
 /// so a full workspace with an idle tab still admits the next agent. It is judged as the cap
 /// judges except for the pane lock, by [`evict::survey`], which closes nothing.
+///
+/// The three readings are taken in one fixed order in both editions: the evidence for every
+/// recorded pane first, then the occupancy listing, then the survey.
 fn command_reap(config: &Config) -> Result<i32> {
     let client = HerdrClient::new(&config.broker)?;
     let records = load_run_records(config);
+    let plan = plan_reap(&build_evidence(
+        &client,
+        config,
+        Some(records.clone()),
+        Path::new("/proc"),
+    ));
     let occupancy = measure_occupancy(&client, config, &records);
     let survey = occupancy
         .listing_error
@@ -1020,12 +1153,6 @@ fn command_reap(config: &Config) -> Result<i32> {
         Some(Err(error)) => (None, None, Some(error.to_string())),
         None => (None, None, None),
     };
-    let plan = plan_reap(&build_evidence(
-        &client,
-        config,
-        Some(records),
-        Path::new("/proc"),
-    ));
     let entry = |decision: &crate::reap::ReapDecision, with_verdict: bool| {
         let mut object = Map::new();
         object.insert("pane_id".to_owned(), json!(decision.pane_id));
@@ -1098,6 +1225,16 @@ const NET_DOCTOR_SCOPE: &str = concat!(
     "below says nothing about that reason.\n",
 );
 
+/// The first line of `text` after trimming, splitting on line feeds only.
+fn first_line(text: &str) -> &str {
+    strip_space(text).split('\n').next().unwrap_or("")
+}
+
+/// The last line of `text` after trimming, splitting on line feeds only.
+fn last_line(text: &str) -> &str {
+    strip_space(text).split('\n').next_back().unwrap_or("")
+}
+
 fn command_net_doctor(config: &Config, agent: &str) -> Result<i32> {
     let mut argv = vec![
         "git".to_owned(),
@@ -1108,12 +1245,10 @@ fn command_net_doctor(config: &Config, agent: &str) -> Result<i32> {
     if config.prefixes.iter().any(|prefix| prefix == "with-proxy") {
         argv.insert(0, "with-proxy".to_owned());
     }
-    let probe = render(&argv)?;
-    println!(
-        "herdr-run net-doctor  (agent={agent}, config={})\n",
+    output::stdout(&format!(
+        "herdr-run net-doctor  (agent={agent}, config={})\n\n{NET_DOCTOR_SCOPE}\n",
         config.source_path.as_deref().unwrap_or("defaults")
-    );
-    println!("{NET_DOCTOR_SCOPE}");
+    ))?;
     let log = audit::audit_path(
         Path::new(&config.project_root),
         Path::new(&config.spool_dir),
@@ -1122,17 +1257,37 @@ fn command_net_doctor(config: &Config, agent: &str) -> Result<i32> {
         Path::new(&config.project_root),
         Path::new(&config.spool_dir),
     );
+    // Rendered exactly as `run` renders a command, so the probe that is printed, audited, and
+    // executed is the probe the policy admitted, with `~` expanded the same way.
+    let probe = match render(&argv) {
+        Ok(probe) => probe,
+        Err(error) => {
+            let unexpanded = argv
+                .iter()
+                .map(|token| quote_word(token))
+                .collect::<Vec<_>>()
+                .join(" ");
+            record_audit(
+                &log,
+                agent,
+                &unexpanded,
+                error_verdict(error.kind()),
+                error.message(),
+                net_doctor_error_fields(None),
+            );
+            return Err(error);
+        }
+    };
     let admission = match admit(&probe, config) {
         Ok(admission) => admission,
         Err(error) => {
-            let fields = net_doctor_error_fields(None);
             record_audit(
                 &log,
                 agent,
                 &probe,
                 error_verdict(error.kind()),
                 error.message(),
-                fields,
+                net_doctor_error_fields(None),
             );
             return Err(error);
         }
@@ -1153,7 +1308,10 @@ fn command_net_doctor(config: &Config, agent: &str) -> Result<i32> {
     let direct = match bounded_output(&mut direct_command, std::time::Duration::from_secs(120)) {
         Ok(output) => output,
         Err(error) => {
-            let error = HerdrRunError::unavailable(format!("cannot run the direct probe: {error}"));
+            let error = HerdrRunError::unavailable(format!(
+                "cannot run the direct probe: {}",
+                os_error_text(&error)
+            ));
             record_audit(
                 &log,
                 agent,
@@ -1165,17 +1323,17 @@ fn command_net_doctor(config: &Config, agent: &str) -> Result<i32> {
             return Err(error);
         }
     };
-    let direct_code = direct.status.code().unwrap_or(1);
+    let direct_code = exit_status_code(direct.status);
     let direct_ok = direct_code == 0;
-    println!("[direct  ] {probe}");
-    println!(
-        "           rc={direct_code} {}",
+    let mut direct_text = format!(
+        "[direct  ] {probe}\n           rc={direct_code} {}\n",
         if direct_ok { "SUCCEEDED" } else { "failed" }
     );
     if !direct_ok {
         let stderr = String::from_utf8_lossy(&direct.stderr);
-        println!("           {}", stderr.lines().last().unwrap_or(""));
+        direct_text.push_str(&format!("           {}\n", last_line(&stderr)));
     }
+    output::stdout(&direct_text)?;
 
     // Every failure after the direct half of the diagnosis is a net-doctor result, not a raw
     // wrapper exit. Keep construction, target/cwd resolution, and execution in one result so they
@@ -1215,27 +1373,19 @@ fn command_net_doctor(config: &Config, agent: &str) -> Result<i32> {
                 &format!("net-doctor pane probe exited {}", result.exit_code),
                 fields,
             );
-            let head = result
-                .stdout_text()
-                .lines()
-                .next()
-                .unwrap_or("")
-                .chars()
-                .take(80)
-                .collect::<String>();
-            println!(
-                "[via pane] {probe}   (pane {}, tab {})",
-                target.pane_id, target.tab_label
-            );
-            println!(
-                "           rc={} {}  {head}",
+            let stdout = result.stdout_text();
+            let head: String = first_line(&stdout).chars().take(80).collect();
+            output::stdout(&format!(
+                "[via pane] {probe}   (pane {}, tab {})\n           rc={} {}  {head}\n",
+                target.pane_id,
+                target.tab_label,
                 result.exit_code,
                 if result.exit_code == 0 {
                     "SUCCEEDED"
                 } else {
                     "failed"
                 }
-            );
+            ))?;
             result.exit_code
         }
         Err(error) => {
@@ -1248,19 +1398,18 @@ fn command_net_doctor(config: &Config, agent: &str) -> Result<i32> {
                 error.message(),
                 fields,
             );
-            println!("[via pane] FAILED: {error}");
+            output::stdout(&format!("[via pane] FAILED: {error}\n"))?;
             -1
         }
     };
-    println!();
     if pane_code == 0 && !direct_ok {
-        println!("VERDICT: this scenario works — the probe is blocked directly and succeeds through the pane.");
+        output::stdout("\nVERDICT: this scenario works — the probe is blocked directly and succeeds through the pane.\n")?;
         Ok(0)
     } else if pane_code == 0 {
-        println!("VERDICT: the pane works, but so does running the probe directly. For THIS scenario the pane is buying you nothing; prefer running the command directly. Other reasons to route a command through a pane are untouched by that.");
+        output::stdout("\nVERDICT: the pane works, but so does running the probe directly. For THIS scenario the pane is buying you nothing; prefer running the command directly. Other reasons to route a command through a pane are untouched by that.\n")?;
         Ok(0)
     } else {
-        println!("VERDICT: the pane path is NOT working. Most likely the Herdr server was started from inside a confined process, so its panes inherit the confinement. Stop it ('herdr server stop') and let herdr-run restart it via systemd-run, or start it from an unconfined shell.");
+        output::stdout("\nVERDICT: the pane path is NOT working. Most likely the Herdr server was started from inside a confined process, so its panes inherit the confinement. Stop it ('herdr server stop') and let herdr-run restart it via systemd-run, or start it from an unconfined shell.\n")?;
         Ok(1)
     }
 }
@@ -1289,6 +1438,11 @@ fn resolved_cwd(config: &Config, override_cwd: Option<&str>) -> Result<PathBuf> 
     resolved_cwd_with(config, override_cwd, std::env::current_dir)
 }
 
+/// Where the command runs: `--cwd`, else the configured `cwd`, else the caller's directory.
+///
+/// An absolute path is passed through exactly as written and the pane's own `cd` resolves it:
+/// resolving `..` lexically here could pick a different directory than the shell would when a
+/// symbolic link precedes it. A relative path is resolved against the project root.
 fn resolved_cwd_with<F>(
     config: &Config,
     override_cwd: Option<&str>,
@@ -1299,19 +1453,23 @@ where
 {
     let Some(raw) = override_cwd.or(config.cwd.as_deref()) else {
         return current_dir().map_err(|error| {
-            HerdrRunError::config(format!("cannot determine current directory: {error}"))
+            HerdrRunError::config(format!(
+                "cannot determine current directory: {}",
+                os_error_text(&error)
+            ))
         });
     };
     let path = Path::new(raw);
-    let joined = if path.is_absolute() {
-        path.to_path_buf()
-    } else {
-        Path::new(&config.project_root).join(path)
-    };
-    Ok(lexical_normalize(&joined))
+    if path.is_absolute() {
+        return Ok(path.to_path_buf());
+    }
+    Ok(lexical_normalize(
+        &Path::new(&config.project_root).join(path),
+    ))
 }
 
 fn lexical_normalize(path: &Path) -> PathBuf {
+    use std::path::Component;
     let mut output = PathBuf::new();
     for component in path.components() {
         match component {
@@ -1328,11 +1486,7 @@ fn lexical_normalize(path: &Path) -> PathBuf {
 }
 
 fn print_json(value: &Value) -> Result<()> {
-    let text = serde_json::to_string_pretty(value).map_err(|error| {
-        HerdrRunError::new(ErrorKind::Other, format!("cannot encode JSON: {error}"))
-    })?;
-    println!("{text}");
-    Ok(())
+    output::stdout(&format!("{}\n", json_pretty(value)))
 }
 
 fn usage_line() -> &'static str {
@@ -1355,14 +1509,14 @@ fn help_text() -> String {
             subcommand.name, subcommand.summary
         ));
     }
-    text.push_str("\nglobal options (before the subcommand):\n  -h, --help            show this help message and exit\n  --version             show version and exit\n  --config PATH         explicit configuration file\n  --agent NAME          the agent this invocation speaks for; names its tab\n  --json                emit machine-readable output where a subcommand has it\n");
+    text.push_str("\nglobal options (before the subcommand):\n  -h, --help            show this help message and exit\n  --version             show version and exit\n  --config PATH         explicit configuration file\n  --agent NAME          the agent this invocation speaks for; names its tab\n  --json                emit machine-readable output where a subcommand has it\n  --dump-surface        print every subcommand and option as JSON and exit\n");
     text.push_str("\nEach subcommand has its own options: run 'herdr-run <subcommand> --help'.\nOptions are not shared between the two levels — '--cwd' is a 'run' option and\ngoes after 'run'; '--agent' is global and goes before it.\n");
     text.push_str("\nTwo documentation commands, and they are for different moments:\n  quickstart  one screen. What this is for, the four commands worth trying\n              first, and the five things to know before running anything real.\n  userguide   the complete reference: configuration, exit codes, readiness,\n              retention, the pane cap, and the trust model.\n");
     text
 }
 
-fn print_help() {
-    print!("{}", help_text());
+fn print_help() -> Result<()> {
+    output::stdout(&help_text())
 }
 
 /// Said by every subcommand that `config_blind_reason` names, so the refusal is never a surprise.
@@ -1450,8 +1604,8 @@ fn subcommand_help_text(name: &str) -> String {
     text
 }
 
-fn print_subcommand_help(name: &str) {
-    print!("{}", subcommand_help_text(name));
+fn print_subcommand_help(name: &str) -> Result<()> {
+    output::stdout(&subcommand_help_text(name))
 }
 
 #[cfg(test)]
@@ -1459,9 +1613,11 @@ mod tests {
     use super::*;
 
     fn parse_args(arguments: &[&str]) -> std::result::Result<Invocation, String> {
-        match parse(arguments.iter().map(OsString::from))? {
-            ParseResult::Invocation(invocation) => Ok(*invocation),
-            ParseResult::Exit(code) => Err(format!("unexpected early exit {code}")),
+        match parse(arguments.iter().map(OsString::from)) {
+            Ok(ParseResult::Invocation(invocation)) => Ok(*invocation),
+            Ok(ParseResult::Exit(code)) => Err(format!("unexpected early exit {code}")),
+            Err(ParseFailure::Usage(message)) => Err(message),
+            Err(ParseFailure::Failed(error)) => Err(error.to_string()),
         }
     }
 
@@ -1707,6 +1863,7 @@ mod tests {
                 .iter()
                 .map(OsString::from),
         )
+        .ok()
         .expect("help is not an error");
         assert!(matches!(outcome, ParseResult::Exit(0)));
 

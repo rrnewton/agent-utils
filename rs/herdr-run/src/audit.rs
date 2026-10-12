@@ -10,6 +10,8 @@ use std::time::{Duration, SystemTime};
 use serde_json::{Map, Number, Value};
 
 use crate::client::bounded_output;
+use crate::output;
+use crate::textfmt::{json_line, quote};
 use crate::timefmt;
 
 /// Return the audit-log path for one project and spool setting.
@@ -51,14 +53,15 @@ pub fn warn_if_spool_is_tracked(project_root: &Path, spool_dir: &Path) -> bool {
     if spool_is_ignored(project_root, spool_dir) != Some(false) {
         return false;
     }
-    eprintln!(
-        "herdr-run: WARNING: spool directory {:?} is NOT git-ignored in {}. \
+    let spool_text = spool_dir.to_string_lossy();
+    output::diagnostic(&format!(
+        "herdr-run: WARNING: spool directory {} is NOT git-ignored in {}. \
          Command output and the audit log will be written into a tracked tree. \
          Add '{}/' to .gitignore.",
-        spool_dir,
+        quote(&spool_text),
         project_root.display(),
-        spool_dir.display().to_string().trim_end_matches('/')
-    );
+        spool_text.trim_end_matches('/')
+    ));
     true
 }
 
@@ -104,10 +107,7 @@ fn record_at(
     document.insert("verdict".to_owned(), Value::String(verdict.to_owned()));
     document.insert("detail".to_owned(), Value::String(detail.to_owned()));
     document.extend(fields);
-    let Ok(compact) = serde_json::to_string(&Value::Object(document)) else {
-        return false;
-    };
-    let mut encoded = spaced_json_line(&compact).into_bytes();
+    let mut encoded = json_line(&Value::Object(document)).into_bytes();
     encoded.push(b'\n');
     let Some(parent) = path.parent() else {
         return false;
@@ -141,30 +141,6 @@ fn record_at(
             .is_ok_and(|written| written == encoded.len());
     }
     false
-}
-
-/// Add conventional one-line JSON separator spacing without touching strings.
-fn spaced_json_line(compact: &str) -> String {
-    let mut output = String::with_capacity(compact.len() + compact.len() / 8);
-    let mut in_string = false;
-    let mut escaped = false;
-    for character in compact.chars() {
-        output.push(character);
-        if in_string {
-            if escaped {
-                escaped = false;
-            } else if character == '\\' {
-                escaped = true;
-            } else if character == '"' {
-                in_string = false;
-            }
-        } else if character == '"' {
-            in_string = true;
-        } else if character == ',' || character == ':' {
-            output.push(' ');
-        }
-    }
-    output
 }
 
 #[cfg(test)]

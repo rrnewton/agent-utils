@@ -17,6 +17,7 @@ import pytest
 
 from herdr_run.audit import audit_path, record
 import herdr_run.cli as cli_module
+import herdr_run.output as output_module
 from herdr_run.cli import (
     SUBCOMMANDS,
     _default_agent,
@@ -626,7 +627,8 @@ def test_raw_result_streams_are_emitted_byte_exactly_once(
     monkeypatch.setattr(sys, "stdout", stdout)
     monkeypatch.setattr(sys, "stderr", stderr)
 
-    cli_module._emit_raw_output(b"A\x00\xff", b"B\r\n")
+    output_module.stdout_bytes(b"A\x00\xff")
+    output_module.stderr_bytes(b"B\r\n")
 
     assert stdout.raw.getvalue() == b"A\x00\xff"
     assert stderr.raw.getvalue() == b"B\r\n"
@@ -646,8 +648,11 @@ def test_raw_output_write_failure_is_a_typed_wrapper_error(
     stream.raw = cast(io.BytesIO, _BrokenBuffer())
     monkeypatch.setattr(sys, stream_name, stream)
 
-    with pytest.raises(HerdrRunError, match=f"cannot write {stream_name}"):
-        cli_module._emit_raw_output(b"output", b"error")
+    with pytest.raises(HerdrRunError, match=f"cannot write {stream_name}: output pipe closed"):
+        if stream_name == "stdout":
+            output_module.stdout_bytes(b"output")
+        else:
+            output_module.stderr_bytes(b"error")
 
 
 def test_timeout_partial_output_write_failure_has_no_traceback(
@@ -665,14 +670,16 @@ def test_timeout_partial_output_write_failure_has_no_traceback(
     monkeypatch.setattr(cli_module, "resolve_target", lambda *_args, **_kwargs: target)
     monkeypatch.setattr(cli_module, "execute", lambda *_args, **_kwargs: _raise(timed_out))
     monkeypatch.setattr(
-        cli_module,
-        "_emit_raw_output",
-        lambda *_args: _raise(HerdrRunError("cannot write stdout: closed")),
+        output_module,
+        "write_labelled",
+        lambda _descriptor, _payload, label: _raise(
+            output_module.OutputError(f"cannot write {label}: closed")
+        ),
     )
 
     assert main(["--agent", "agent", "run", "git status"]) == 1
     captured = capsys.readouterr()
-    assert "cannot write stdout" in captured.err
+    assert "herdr-run: cannot write partial stdout: closed" in captured.err
     assert "Traceback" not in captured.err
 
 
@@ -703,7 +710,9 @@ def test_metadata_failure_does_not_mask_completed_command(
     monkeypatch.setattr(
         cli_module,
         "write_meta",
-        lambda *_args: (_ for _ in ()).throw(OSError("read-only metadata")),
+        lambda *_args: (_ for _ in ()).throw(
+            HerdrUnavailable("cannot write run metadata /x: Read-only file system (os error 30)")
+        ),
     )
     monkeypatch.setattr(
         cli_module, "read_output_bytes", lambda _result: (b"output", b"")
@@ -758,7 +767,7 @@ def test_net_doctor_pane_failures_keep_its_output_exit_and_audit_shape(
 
     monkeypatch.setattr(
         cli_module,
-        "_bounded_control_command",
+        "bounded_control_command",
         direct_probe,
     )
     target = SimpleNamespace(pane_id="p1", tab_label="agent")
@@ -932,7 +941,7 @@ def test_spool_ignore_probe_uses_bounded_group_runner(
         assert timeout == 10
         return SimpleNamespace(returncode=1, stdout="", stderr="")
 
-    monkeypatch.setattr(audit_module, "_bounded_control_command", bounded)
+    monkeypatch.setattr(audit_module, "bounded_control_command", bounded)
     assert audit_module.spool_is_ignored("/repo", ".herdr-run") is False
 
 

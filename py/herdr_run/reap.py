@@ -88,6 +88,8 @@ from __future__ import annotations
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 
+from herdr_run.textfmt import quote, quote_optional, strip_space
+
 __all__ = [
     "PaneEvidence",
     "ProcessIdentity",
@@ -128,7 +130,7 @@ class ProcessIdentity:
             type(self.pid) is int
             and 1 <= self.pid <= 2_147_483_647
             and isinstance(self.boot_id, str)
-            and bool(self.boot_id.strip())
+            and bool(strip_space(self.boot_id))
             and type(self.start_ticks) is int
             and self.start_ticks >= 0
         )
@@ -225,6 +227,11 @@ class ReapPlan:
         return out
 
 
+def _shown(value: object) -> str:
+    """Render an identity field for a reason: the value, or ``?`` when it is unknown."""
+    return "?" if value is None else str(value)
+
+
 def _decide(evidence: PaneEvidence) -> ReapDecision:
     def decision(verdict: str, reason: str) -> ReapDecision:
         return ReapDecision(
@@ -239,8 +246,8 @@ def _decide(evidence: PaneEvidence) -> ReapDecision:
     if not evidence.in_scope:
         return decision(
             Verdict.OUT_OF_SCOPE,
-            f"tab {evidence.tab_label!r} in workspace {evidence.workspace_label!r} "
-            "is not one of ours",
+            f"tab {quote_optional(evidence.tab_label)} in workspace "
+            f"{quote_optional(evidence.workspace_label)} is not one of ours",
         )
 
     if evidence.evidence_error is not None:
@@ -274,12 +281,13 @@ def _decide(evidence: PaneEvidence) -> ReapDecision:
     # A missing recorded PID is only evidence of death within the SAME boot. Across a reboot every
     # old pid is absent by construction, which cannot authorize closing a newly-created live tab.
     current_boot = evidence.current_boot_id
-    if not isinstance(current_boot, str) or not current_boot.strip():
+    if not isinstance(current_boot, str) or not strip_space(current_boot):
         return decision(Verdict.UNKNOWN, "current boot_id is unavailable")
     if recorded.boot_id != current_boot:
         return decision(
             Verdict.UNKNOWN,
-            f"recorded shell belongs to boot {recorded.boot_id!r}, current boot is {current_boot!r}",
+            f"recorded shell belongs to boot {quote_optional(recorded.boot_id)}, current boot is "
+            f"{quote(current_boot)}",
         )
 
     live = evidence.live_shell
@@ -294,7 +302,9 @@ def _decide(evidence: PaneEvidence) -> ReapDecision:
         )
 
     if not live.is_bound():
-        return decision(Verdict.UNKNOWN, f"could not bind identity of live pid {live.pid}")
+        return decision(
+            Verdict.UNKNOWN, f"could not bind identity of live pid {_shown(live.pid)}"
+        )
 
     if recorded.same_process_as(live):
         return decision(Verdict.SHELL_ALIVE, f"pane shell {live.pid} is still the original process")
@@ -305,7 +315,8 @@ def _decide(evidence: PaneEvidence) -> ReapDecision:
         Verdict.UNKNOWN,
         f"recorded pane shell {recorded.pid} is now a DIFFERENT process identity "
         f"(recorded {recorded.boot_id}:{recorded.start_ticks}, "
-        f"live {live.pid}/{live.boot_id}:{live.start_ticks}) -- PID reuse or new pane incarnation, "
+        f"live {_shown(live.pid)}/{_shown(live.boot_id)}:{_shown(live.start_ticks)}) -- PID "
+        "reuse or new pane incarnation, "
         "refusing to guess",
     )
 
@@ -337,13 +348,15 @@ def evidence_from_runs(
         readiness = record.get("readiness")
         if isinstance(readiness, Mapping):
             shell_pid = readiness.get("shell_pid")
-            if type(shell_pid) is int:
+            # Typed exactly as a 64-bit JSON reader types them: the pid a signed 64-bit integer,
+            # the start tick an unsigned one. Anything else is not that field at all.
+            if type(shell_pid) is int and -(2**63) <= shell_pid <= 2**63 - 1:
                 boot = readiness.get("boot_id")
                 ticks = readiness.get("shell_start_ticks")
                 candidate = ProcessIdentity(
                     pid=shell_pid,
-                    boot_id=boot if isinstance(boot, str) and boot.strip() else None,
-                    start_ticks=ticks if type(ticks) is int else None,
+                    boot_id=boot if isinstance(boot, str) and strip_space(boot) else None,
+                    start_ticks=ticks if type(ticks) is int and 0 <= ticks <= 2**64 - 1 else None,
                 )
                 if identity is None:
                     identity = candidate

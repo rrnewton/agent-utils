@@ -6,7 +6,7 @@
 //! tear the document or silently discard each other's entries.
 
 use std::fs::{self, OpenOptions};
-use std::io::{self, BufWriter, Write};
+use std::io::{self, Write};
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -19,6 +19,7 @@ use crate::config::{render_tab_name, Config};
 use crate::error::{HerdrRunError, Result};
 use crate::evict;
 use crate::state::{open_lock_file, session_lock_path};
+use crate::textfmt::{json_pretty, quote};
 
 static TEMPORARY_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
@@ -218,8 +219,9 @@ fn enforce_pane_cap<A: HerdrApi + ?Sized>(
         .as_deref()
         .unwrap_or("your .herdr-run.yaml");
     let mut message = format!(
-        "workspace '{}' already holds {existing} pane(s) and max_panes is {}; refusing to open a tab for this agent. Run 'herdr-run reap' to see which tabs are provably finished and can be closed, or raise max_panes in {source} (0 disables the cap).",
-        config.workspace, config.max_panes
+        "workspace {} already holds {existing} pane(s) and max_panes is {}; refusing to open a tab for this agent. Run 'herdr-run reap' to see which tabs are provably finished and can be closed, or raise max_panes in {source} (0 disables the cap).",
+        quote(&config.workspace),
+        config.max_panes
     );
     if !skipped.is_empty() {
         message.push(' ');
@@ -228,20 +230,20 @@ fn enforce_pane_cap<A: HerdrApi + ?Sized>(
     Err(HerdrRunError::unavailable(message))
 }
 
+/// The directory a new workspace or tab starts in: the configured `cwd`, else the project root.
+///
+/// An absolute path is passed through exactly as written, and the pane's `cd` resolves it; a
+/// relative one is resolved lexically against the project root.
 fn resolved_cwd(config: &Config) -> Result<PathBuf> {
     let root = Path::new(&config.project_root);
-    if !root.is_absolute() {
-        return Err(HerdrRunError::config(format!(
-            "project_root must be absolute: {}",
-            root.display()
-        )));
-    }
-    let cwd = config.cwd.as_deref().map(Path::new).unwrap_or(root);
-    let joined = if cwd.is_absolute() {
-        cwd.to_path_buf()
-    } else {
-        root.join(cwd)
+    let cwd = match config.cwd.as_deref() {
+        Some(cwd) if !cwd.is_empty() => Path::new(cwd),
+        _ => root,
     };
+    if cwd.is_absolute() {
+        return Ok(cwd.to_path_buf());
+    }
+    let joined = root.join(cwd);
     let mut normalized = PathBuf::new();
     for component in joined.components() {
         match component {
@@ -307,18 +309,16 @@ fn cache_still_valid<A: HerdrApi + ?Sized>(
         return Ok(false);
     }
     // Resolve by the configured label, not merely by cached ID. Besides detecting ID reuse, this
-    // exercises the client's duplicate-label refusal instead of letting a cache hide ambiguity.
-    if client.workspace_id_for_label(workspace_label)?.as_deref()
-        != Some(cached.workspace_id.as_str())
-    {
-        return Ok(false);
+    // exercises the client's duplicate-label refusal instead of letting a cache hide ambiguity. A
+    // lookup that fails is a cache MISS, never a failed run: the cache is an optimisation, and the
+    // label-based path below asks the same questions again and reports its own errors.
+    match client.workspace_id_for_label(workspace_label) {
+        Ok(Some(id)) if id == cached.workspace_id => {}
+        _ => return Ok(false),
     }
-    if client
-        .tab_id_for_label(&cached.workspace_id, tab_label)?
-        .as_deref()
-        != Some(cached.tab_id.as_str())
-    {
-        return Ok(false);
+    match client.tab_id_for_label(&cached.workspace_id, tab_label) {
+        Ok(Some(id)) if id == cached.tab_id => {}
+        _ => return Ok(false),
     }
     Ok(client
         .panes(Some(&cached.workspace_id))?
@@ -398,17 +398,17 @@ fn write_cache_temporary(
     path: &Path,
     entries: &serde_json::Map<String, serde_json::Value>,
 ) -> io::Result<()> {
-    let file = OpenOptions::new()
+    let mut file = OpenOptions::new()
         .write(true)
         .create_new(true)
         .mode(0o600)
         .open(path)?;
     file.set_permissions(fs::Permissions::from_mode(0o600))?;
-    let mut writer = BufWriter::new(file);
-    serde_json::to_writer_pretty(&mut writer, entries).map_err(io::Error::other)?;
-    writer.write_all(b"\n")?;
-    writer.flush()?;
-    writer.get_ref().sync_all()
+    let mut encoded = json_pretty(&serde_json::Value::Object(entries.clone())).into_bytes();
+    encoded.push(b'\n');
+    file.write_all(&encoded)?;
+    file.flush()?;
+    file.sync_all()
 }
 
 #[cfg(test)]
@@ -525,13 +525,6 @@ mod tests {
                 .flatten())
         }
 
-        fn workspace_label_for_id(&self, workspace_id: &str) -> Result<Option<String>> {
-            let state = self.state.lock().expect("state");
-            Ok((state.workspace_id.as_deref() == Some(workspace_id))
-                .then(|| state.workspace_label.clone())
-                .flatten())
-        }
-
         fn create_workspace(&self, label: &str, _cwd: &str) -> Result<(String, String, String)> {
             if let Some(gate) = &self.create_gate {
                 gate.block_first_create();
@@ -608,10 +601,6 @@ mod tests {
         }
 
         fn run(&self, _pane_id: &str, _command: &str) -> Result<()> {
-            unreachable!()
-        }
-
-        fn send_keys(&self, _pane_id: &str, _keys: &str) -> Result<()> {
             unreachable!()
         }
     }
@@ -695,10 +684,6 @@ mod tests {
             Ok(Some("w1".to_owned()))
         }
 
-        fn workspace_label_for_id(&self, _workspace_id: &str) -> Result<Option<String>> {
-            Ok(Some("agent-cmds".to_owned()))
-        }
-
         fn create_workspace(&self, _label: &str, _cwd: &str) -> Result<(String, String, String)> {
             unreachable!("the workspace already exists")
         }
@@ -779,10 +764,6 @@ mod tests {
         }
 
         fn run(&self, _pane_id: &str, _command: &str) -> Result<()> {
-            unreachable!()
-        }
-
-        fn send_keys(&self, _pane_id: &str, _keys: &str) -> Result<()> {
             unreachable!()
         }
     }

@@ -13,19 +13,20 @@ would be a proxy for the real session state, which is precisely the failure mode
 
 from __future__ import annotations
 
+import fcntl
+import itertools
 import json
 import os
-import tempfile
-import fcntl
 from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
 
+from herdr_run.audit import make_private_dirs
 from herdr_run.client import HerdrClient
 from herdr_run.config import Config, render_tab_name
 from herdr_run.errors import HerdrUnavailable
-from herdr_run.jsonx import as_mapping, opt_str
 from herdr_run.state import open_lock_file, session_lock_path
+from herdr_run.textfmt import quote, strict_json_loads
 
 __all__ = ["Target", "resolve_target", "tab_label_for", "cache_path"]
 
@@ -54,31 +55,56 @@ def cache_path(config: Config) -> str:
     return os.path.join(config.project_root, config.spool_dir, "session-cache.json")
 
 
-def _load_cache(path: str, key: str) -> tuple[str, str, str] | None:
+@dataclass(frozen=True)
+class _CacheRecord:
+    """One cache entry: the ids it points at and the labels they were resolved from."""
+
+    workspace_id: str
+    tab_id: str
+    pane_id: str
+    workspace_label: str | None
+    tab_label: str | None
+
+
+#: Distinguishes temporary cache files written by one process, so two threads never collide.
+_TEMPORARY_SEQUENCE = itertools.count()
+
+
+def _read_cache_document(path: str) -> dict[str, object] | None:
     try:
-        with open(path, encoding="utf-8") as handle:
-            document: object = json.load(handle)
-    except (OSError, UnicodeError, json.JSONDecodeError):
+        with open(path, "rb") as handle:
+            payload = handle.read()
+        document = strict_json_loads(payload.decode("utf-8"))
+    except (OSError, UnicodeError, ValueError):
         return None
-    try:
-        entries = as_mapping(document, "session cache")
-        entry = entries.get(key)
-        if not isinstance(entry, dict):
-            return None
-        record = as_mapping(entry, "session cache entry")
-        workspace = opt_str(record, "workspace_id")
-        tab = opt_str(record, "tab_id")
-        pane = opt_str(record, "pane_id")
-    except TypeError:
+    return document if isinstance(document, dict) else None
+
+
+def _load_cache(path: str, key: str) -> _CacheRecord | None:
+    document = _read_cache_document(path)
+    if document is None:
         return None
-    if workspace is None or tab is None or pane is None:
+    entry = document.get(key)
+    if not isinstance(entry, dict):
         return None
-    return workspace, tab, pane
+    ids = [entry.get(name) for name in ("workspace_id", "tab_id", "pane_id")]
+    labels = [entry.get(name) for name in ("workspace_label", "tab_label")]
+    if not all(isinstance(value, str) for value in ids):
+        return None
+    if not all(value is None or isinstance(value, str) for value in labels):
+        return None
+    return _CacheRecord(
+        workspace_id=str(ids[0]),
+        tab_id=str(ids[1]),
+        pane_id=str(ids[2]),
+        workspace_label=labels[0] if isinstance(labels[0], str) else None,
+        tab_label=labels[1] if isinstance(labels[1], str) else None,
+    )
 
 
 def _store_cache(path: str, key: str, target: Target) -> None:
     parent = os.path.dirname(path)
-    os.makedirs(parent, mode=0o700, exist_ok=True)
+    make_private_dirs(parent)
     # Serialize the whole read/modify/write. Without this, two agents resolving different tabs can
     # both read the old document and the later rename silently loses the earlier cache entry.
     flags = (
@@ -95,14 +121,7 @@ def _store_cache(path: str, key: str, target: Target) -> None:
         raise
     with os.fdopen(lock_descriptor, "r+b") as lock:
         fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
-        entries: dict[str, object] = {}
-        try:
-            with open(path, encoding="utf-8") as handle:
-                existing: object = json.load(handle)
-            if isinstance(existing, dict):
-                entries = as_mapping(existing, "session cache")
-        except (OSError, UnicodeError, json.JSONDecodeError, TypeError):
-            entries = {}
+        entries: dict[str, object] = _read_cache_document(path) or {}
         entries[key] = {
             "workspace_id": target.workspace_id,
             "tab_id": target.tab_id,
@@ -110,29 +129,34 @@ def _store_cache(path: str, key: str, target: Target) -> None:
             "workspace_label": target.workspace_label,
             "tab_label": target.tab_label,
         }
+        encoded = (
+            json.dumps(entries, indent=2, sort_keys=True, ensure_ascii=False) + "\n"
+        ).encode("utf-8")
         # A unique temporary plus rename keeps readers from seeing a torn file, including callers
-        # in another thread of this process (a PID-only temporary name did not).
-        temporary = ""
+        # in another thread of this process. The name and the fsync match the native edition.
+        temporary = os.path.join(
+            parent, f".session-cache.{os.getpid()}.{next(_TEMPORARY_SEQUENCE)}.tmp"
+        )
         try:
-            with tempfile.NamedTemporaryFile(
-                mode="w",
-                encoding="utf-8",
-                dir=parent,
-                prefix=".session-cache.",
-                delete=False,
-            ) as handle:
-                temporary = handle.name
-                os.fchmod(handle.fileno(), 0o600)
-                json.dump(entries, handle, indent=2, sort_keys=True)
-                handle.write("\n")
+            descriptor = os.open(
+                temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0), 0o600
+            )
+            try:
+                os.fchmod(descriptor, 0o600)
+                view = memoryview(encoded)
+                while view:
+                    view = view[os.write(descriptor, view) :]
+                os.fsync(descriptor)
+            finally:
+                os.close(descriptor)
             os.replace(temporary, path)
-            os.chmod(path, 0o600)
-        finally:
-            if temporary:
-                try:
-                    os.unlink(temporary)
-                except FileNotFoundError:
-                    pass
+        except OSError:
+            try:
+                os.unlink(temporary)
+            except OSError:
+                pass
+            raise
+        os.chmod(path, 0o600)
 
 
 def _pane_of_tab(client: HerdrClient, workspace_id: str, tab_id: str) -> str:
@@ -188,7 +212,7 @@ def _enforce_pane_cap(
         return
     source = config.source_path or "your .herdr-run.yaml"
     message = (
-        f"workspace {config.workspace!r} already holds {existing} pane(s) and max_panes is "
+        f"workspace {quote(config.workspace)} already holds {existing} pane(s) and max_panes is "
         f"{config.max_panes}; refusing to open a tab for this agent. Run 'herdr-run reap' to see "
         f"which tabs are provably finished and can be closed, or raise max_panes in {source} "
         "(0 disables the cap)."
@@ -200,28 +224,32 @@ def _enforce_pane_cap(
 
 def _cache_still_valid(
     client: HerdrClient,
-    cached: tuple[str, str, str],
+    cached: _CacheRecord,
     workspace_label: str,
     tab_label: str,
 ) -> bool:
-    workspace_id, tab_id, pane_id = cached
-    if not client.pane_exists(pane_id):
+    # A recorded label that disagrees with the current one fails closed without asking Herdr.
+    if cached.workspace_label is not None and cached.workspace_label != workspace_label:
+        return False
+    if cached.tab_label is not None and cached.tab_label != tab_label:
+        return False
+    if not client.pane_exists(cached.pane_id):
         return False
     try:
         # IDs may be reused after a server restart. Validate the workspace label as well as the
-        # pane/tab relationship before trusting the cached destination.
-        if client.workspace_id_for_label(workspace_label) != workspace_id:
+        # pane/tab relationship before trusting the cached destination. A lookup that fails is a
+        # cache MISS, never a failed run: the label-based path asks the same questions again.
+        if client.workspace_id_for_label(workspace_label) != cached.workspace_id:
             return False
-        live_tab = client.tab_id_for_label(workspace_id, tab_label)
+        if client.tab_id_for_label(cached.workspace_id, tab_label) != cached.tab_id:
+            return False
     except HerdrUnavailable:
         return False
-    if live_tab != tab_id:
-        return False
     return any(
-        pane.pane_id == pane_id
-        and pane.tab_id == tab_id
-        and pane.workspace_id == workspace_id
-        for pane in client.panes(workspace_id)
+        pane.pane_id == cached.pane_id
+        and pane.tab_id == cached.tab_id
+        and pane.workspace_id == cached.workspace_id
+        for pane in client.panes(cached.workspace_id)
     )
 
 
@@ -256,9 +284,11 @@ def _resolve_target_locked(
 ) -> Target:
     """Resolve a target while the account-global session lock is held."""
     tab_label = tab_label_for(config, agent)
+    # An absolute path is passed through exactly as written, and the pane's `cd` resolves it; a
+    # relative one is resolved lexically against the project root.
     cwd = config.cwd or config.project_root
     if not os.path.isabs(cwd):
-        cwd = os.path.abspath(os.path.join(config.project_root, cwd))
+        cwd = os.path.normpath(os.path.join(config.project_root, cwd))
     key = f"{config.workspace}\x00{tab_label}"
     path = cache_path(config)
 
@@ -272,9 +302,9 @@ def _resolve_target_locked(
             client, cached, config.workspace, tab_label
         ):
             return Target(
-                workspace_id=cached[0],
-                tab_id=cached[1],
-                pane_id=cached[2],
+                workspace_id=cached.workspace_id,
+                tab_id=cached.tab_id,
+                pane_id=cached.pane_id,
                 workspace_label=config.workspace,
                 tab_label=tab_label,
                 created=(),

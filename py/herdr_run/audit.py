@@ -18,9 +18,16 @@ import os
 import time
 from collections.abc import Callable
 
-from herdr_run.client import _bounded_control_command
+from herdr_run.client import bounded_control_command
+from herdr_run.textfmt import quote
 
-__all__ = ["audit_path", "record", "spool_is_ignored", "warn_if_spool_is_tracked"]
+__all__ = [
+    "audit_path",
+    "make_private_dirs",
+    "record",
+    "spool_is_ignored",
+    "warn_if_spool_is_tracked",
+]
 
 
 def audit_path(project_root: str, spool_dir: str) -> str:
@@ -43,7 +50,7 @@ def spool_is_ignored(project_root: str, spool_dir: str) -> bool | None:
         spool_dir if os.path.isabs(spool_dir) else os.path.join(project_root, spool_dir)
     )
     try:
-        completed = _bounded_control_command(
+        completed = bounded_control_command(
             [
                 "git",
                 "-C",
@@ -65,6 +72,37 @@ def spool_is_ignored(project_root: str, spool_dir: str) -> bool | None:
     return None
 
 
+def make_private_dirs(path: str) -> None:
+    """Create ``path`` and any missing parents, each with mode 0700, like a recursive ``mkdir``.
+
+    Every directory herdr-run creates for command output is private, not only the last one:
+    ``os.makedirs(mode=...)`` applies the mode to the leaf alone. An existing directory is left as
+    it is. The algorithm (and so every error) follows the native standard library's recursive
+    directory builder, so both editions fail on the same component with the same error.
+    """
+    if not path:
+        return
+    try:
+        os.mkdir(path, 0o700)
+        return
+    except FileNotFoundError:
+        pass
+    except OSError:
+        if os.path.isdir(path):
+            return
+        raise
+    stripped = path.rstrip("/")
+    if not stripped:
+        raise OSError("failed to create whole tree")
+    make_private_dirs(os.path.dirname(stripped))
+    try:
+        os.mkdir(path, 0o700)
+    except OSError:
+        if os.path.isdir(path):
+            return
+        raise
+
+
 def warn_if_spool_is_tracked(
     project_root: str, spool_dir: str, *, stream: object = None
 ) -> bool:
@@ -74,17 +112,19 @@ def warn_if_spool_is_tracked(
     where ``git add`` can pick it up is how command output ends up committed. A warning rather than a
     refusal: an un-ignored spool is a hygiene defect, not a reason to block the run.
     """
-    import sys
+    from herdr_run import output
 
     if spool_is_ignored(project_root, spool_dir) is not False:
         return False
-    target = stream if stream is not None else sys.stderr
-    print(
-        f"herdr-run: WARNING: spool directory {spool_dir!r} is NOT git-ignored in {project_root}. "
-        "Command output and the audit log will be written into a tracked tree. "
-        f"Add '{spool_dir.rstrip('/')}/' to .gitignore.",
-        file=target,  # type: ignore[arg-type]
+    message = (
+        f"herdr-run: WARNING: spool directory {quote(spool_dir)} is NOT git-ignored in "
+        f"{project_root}. Command output and the audit log will be written into a tracked tree. "
+        f"Add '{spool_dir.rstrip('/')}/' to .gitignore."
     )
+    if stream is not None:
+        print(message, file=stream)  # type: ignore[call-overload]
+    else:
+        output.diagnostic(message)
     return True
 
 
@@ -110,8 +150,10 @@ def record(
     if fields:
         entry.update(fields)
     try:
-        parent = os.path.dirname(path) or "."
-        os.makedirs(parent, mode=0o700, exist_ok=True)
+        parent = os.path.dirname(path)
+        if not parent:
+            return False
+        make_private_dirs(parent)
         encoded = (json.dumps(entry, sort_keys=True, ensure_ascii=False) + "\n").encode(
             "utf-8"
         )

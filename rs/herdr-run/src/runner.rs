@@ -18,6 +18,7 @@ use crate::readiness::{assess, infer_prompt_tail, Readiness};
 use crate::retention::{prune_runs, runs_root};
 use crate::session::Target;
 use crate::state::{open_lock_file, pane_lock_path};
+use crate::textfmt::{json_pretty, number_text, parse_exit_marker, round3, MAX_EXIT_MARKER_BYTES};
 use crate::timefmt;
 
 /// Files holding one run's command, byte streams, and completion status.
@@ -118,10 +119,12 @@ fn create_private_file(path: &Path, contents: &[u8]) -> std::io::Result<()> {
 /// Build a readable base run ID from UTC time, agent, and process ID.
 #[must_use]
 pub fn make_run_id(agent: &str, now: SystemTime, pid: u32) -> String {
+    // ASCII letters, digits, '-' and '_' only: Unicode character properties differ between
+    // language and library versions, and a run ID names a directory both editions must agree on.
     let safe_agent: String = agent
         .chars()
         .map(|character| {
-            if character.is_alphanumeric() || matches!(character, '-' | '_') {
+            if character.is_ascii_alphanumeric() || matches!(character, '-' | '_') {
                 character
             } else {
                 '-'
@@ -280,10 +283,11 @@ fn acquire_pane_lock(target: &Target, timeout: f64) -> Result<File> {
     }
 }
 
-fn contains_terminal_control(value: &str) -> bool {
+fn first_terminal_control(value: &str) -> Option<u32> {
     value
         .chars()
-        .any(|character| matches!(u32::from(character), 0x00..=0x1f | 0x7f..=0x9f))
+        .map(u32::from)
+        .find(|codepoint| matches!(codepoint, 0x00..=0x1f | 0x7f..=0x9f))
 }
 
 fn quote_word(value: &str) -> String {
@@ -321,9 +325,9 @@ pub fn build_shell_command(
         let text = value.to_str().ok_or_else(|| {
             HerdrRunError::unavailable(format!("{description} is not valid UTF-8"))
         })?;
-        if contains_terminal_control(text) {
+        if let Some(codepoint) = first_terminal_control(text) {
             return Err(HerdrRunError::unavailable(format!(
-                "{description} contains terminal control characters"
+                "{description} contains terminal control U+{codepoint:04X}; control characters cannot be injected into a shared pane"
             )));
         }
     }
@@ -464,13 +468,16 @@ fn spool_read_error(path: &Path, error: std::io::Error) -> HerdrRunError {
     ))
 }
 
-fn read_exit_code(path: &Path) -> Option<i32> {
-    let mut text = String::new();
-    File::open(path).ok()?.read_to_string(&mut text).ok()?;
-    let stripped = text.trim();
-    (!stripped.is_empty())
-        .then(|| stripped.parse::<i32>().ok())
-        .flatten()
+/// Read a completion marker: the recorded exit code, or `None` while it is absent, incompletely
+/// written, or not a marker at all (see [`parse_exit_marker`]).
+pub(crate) fn read_exit_code(path: &Path) -> Option<i32> {
+    let mut payload = Vec::new();
+    File::open(path)
+        .ok()?
+        .take(MAX_EXIT_MARKER_BYTES as u64 + 1)
+        .read_to_end(&mut payload)
+        .ok()?;
+    parse_exit_marker(&payload)
 }
 
 /// Write the completed run's structured evidence and return its path.
@@ -544,9 +551,7 @@ fn write_meta_document(
         "tab": {"id": target.tab_id, "label": target.tab_label},
         "workspace": {"id": target.workspace_id, "label": target.workspace_label},
     });
-    let mut encoded = serde_json::to_vec_pretty(&document).map_err(|error| {
-        HerdrRunError::unavailable(format!("cannot encode run metadata: {error}"))
-    })?;
+    let mut encoded = json_pretty(&document).into_bytes();
     encoded.push(b'\n');
     create_private_file(&path, &encoded).map_err(|error| {
         HerdrRunError::unavailable(format!(
@@ -578,7 +583,7 @@ pub fn result_json(result: &RunResult, meta: Option<&Path>) -> Value {
 }
 
 fn round_three(value: f64) -> f64 {
-    (value * 1_000.0).round() / 1_000.0
+    round3(value)
 }
 
 fn seconds_duration(seconds: f64) -> Duration {
@@ -608,14 +613,6 @@ fn validate_timeout(value: f64, what: &str) -> Result<()> {
     Ok(())
 }
 
-fn number_text(value: f64) -> String {
-    if value.fract() == 0.0 {
-        format!("{value:.0}")
-    } else {
-        format!("{value}")
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::process::Command;
@@ -634,9 +631,6 @@ mod tests {
             true
         }
         fn workspace_id_for_label(&self, _label: &str) -> Result<Option<String>> {
-            Ok(None)
-        }
-        fn workspace_label_for_id(&self, _id: &str) -> Result<Option<String>> {
             Ok(None)
         }
         fn create_workspace(&self, _label: &str, _cwd: &str) -> Result<(String, String, String)> {
@@ -680,9 +674,6 @@ mod tests {
                     "fake pane failed: {status}"
                 )))
             }
-        }
-        fn send_keys(&self, _pane: &str, _keys: &str) -> Result<()> {
-            Ok(())
         }
     }
 
@@ -759,9 +750,6 @@ mod tests {
         fn workspace_id_for_label(&self, label: &str) -> Result<Option<String>> {
             FakeApi.workspace_id_for_label(label)
         }
-        fn workspace_label_for_id(&self, id: &str) -> Result<Option<String>> {
-            FakeApi.workspace_label_for_id(id)
-        }
         fn create_workspace(&self, label: &str, cwd: &str) -> Result<(String, String, String)> {
             FakeApi.create_workspace(label, cwd)
         }
@@ -794,9 +782,6 @@ mod tests {
         }
         fn run(&self, pane: &str, command: &str) -> Result<()> {
             FakeApi.run(pane, command)
-        }
-        fn send_keys(&self, pane: &str, keys: &str) -> Result<()> {
-            FakeApi.send_keys(pane, keys)
         }
     }
 
@@ -864,9 +849,6 @@ mod tests {
         fn workspace_id_for_label(&self, label: &str) -> Result<Option<String>> {
             SelfShellApi.workspace_id_for_label(label)
         }
-        fn workspace_label_for_id(&self, workspace: &str) -> Result<Option<String>> {
-            SelfShellApi.workspace_label_for_id(workspace)
-        }
         fn create_workspace(&self, label: &str, cwd: &str) -> Result<(String, String, String)> {
             SelfShellApi.create_workspace(label, cwd)
         }
@@ -893,9 +875,6 @@ mod tests {
         }
         fn run(&self, _pane: &str, _command: &str) -> Result<()> {
             Ok(())
-        }
-        fn send_keys(&self, pane: &str, keys: &str) -> Result<()> {
-            SelfShellApi.send_keys(pane, keys)
         }
     }
 

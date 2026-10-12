@@ -546,4 +546,4 @@ def test_occupancy_of_a_failed_listing_is_unknown_not_zero(tmp_path: object) -> 
 def test_occupancy_of_a_missing_workspace_names_it(tmp_path: object) -> None:
     occupancy = measure_occupancy(_client(FakeHerdrClient()), _config(str(tmp_path)), [])
     assert occupancy.with_record is None
-    assert occupancy.listing_error == "herdr has no workspace labelled 'agent-cmds'"
+    assert occupancy.listing_error == 'herdr has no workspace labelled "agent-cmds"'

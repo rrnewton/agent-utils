@@ -22,4 +22,7 @@ if _PKG_PARENT not in sys.path:
 from herdr_run.cli import main  # noqa: E402  (import after the sys.path fixup, by design)
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    # When the process must restart in UTF-8 mode it restarts the same way it was started: as the
+    # module, or as this script (through whatever symlink named it).
+    _REEXEC = ["-m", "herdr_run"] if __spec__ is not None else [os.path.abspath(sys.argv[0])]
+    raise SystemExit(main(reexec=_REEXEC))

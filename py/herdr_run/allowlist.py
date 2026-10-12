@@ -18,11 +18,13 @@ explains why same-user access to Herdr makes this a safety rail rather than a co
 from __future__ import annotations
 
 import os
+import pwd
 import shlex
 from dataclasses import dataclass
 
 from herdr_run.config import Config
-from herdr_run.errors import Refused
+from herdr_run.errors import ConfigError, Refused
+from herdr_run.textfmt import quote
 
 __all__ = ["Admission", "admit", "render", "expand_tilde", "reject_terminal_controls"]
 
@@ -54,21 +56,61 @@ class Admission:
     rendered: str
 
 
+def _has_surrogates(value: str) -> bool:
+    return any(0xD800 <= ord(character) <= 0xDFFF for character in value)
+
+
+def _account_home_text(user: str | None) -> str | None:
+    """The account database's home for ``user`` (the current uid when ``None``), if usable."""
+    try:
+        record = pwd.getpwuid(os.getuid()) if user is None else pwd.getpwnam(user)
+    except (KeyError, OSError, ValueError):
+        return None
+    home = record.pw_dir
+    if _has_surrogates(home):
+        return None
+    return home
+
+
 def expand_tilde(token: str) -> str:
     """Expand a LEADING ``~`` / ``~user`` in one token, the way a shell would.
 
     Quoting every token is what makes injection impossible, but it also suppresses the one
     expansion callers reasonably expect: ``git -C ~/work/repo`` arrived at git as a literal ``~``
     and failed with ``cannot change to '~/work/repo'``. Doing the expansion HERE keeps the security
-    property intact -- Python resolves the path and the result is still quoted, so the shell never
-    gets a chance to interpret anything.
+    property intact -- the result is still quoted, so the shell never gets a chance to interpret
+    anything.
 
-    Only a leading tilde is touched. A tilde anywhere else is an ordinary character (``a~b`` stays
-    ``a~b``), and a token that ``expanduser`` cannot resolve is returned unchanged.
+    The rules, identical in both editions: ``~`` uses ``HOME`` when it is set (refusing a ``HOME``
+    that is not valid UTF-8, because a lossy conversion would name a different directory), and the
+    account database otherwise; ``~user`` asks the account database. A lookup that fails, or a home
+    that is not valid UTF-8, leaves the token literal. Trailing slashes are dropped from the home,
+    and an empty home expands to the remainder of the token, or ``/``. A tilde anywhere but the
+    start is an ordinary character.
     """
     if not token.startswith("~"):
         return token
-    return os.path.expanduser(token)
+    slash = token.find("/")
+    if slash < 0:
+        slash = len(token)
+    user = token[1:slash]
+    suffix = token[slash:]
+    home: str | None
+    if not user:
+        home = os.environ.get("HOME")
+        if home is None:
+            home = _account_home_text(None)
+        elif _has_surrogates(home):
+            lossy = os.fsencode(home).decode("utf-8", errors="replace")
+            raise ConfigError(f"HOME is not valid UTF-8: {lossy}")
+    else:
+        home = _account_home_text(user)
+    if home is None:
+        return token
+    trimmed = home.rstrip("/")
+    if not trimmed:
+        return suffix or "/"
+    return trimmed + suffix
 
 
 def render(argv: tuple[str, ...]) -> str:
@@ -132,7 +174,7 @@ def admit(command: str, config: Config) -> Admission:
     while rest and rest[0] in config.prefixes:
         wrapper = rest.pop(0)
         if wrapper in prefix:
-            raise Refused(f"prefix {wrapper!r} repeated; each wrapper may appear at most once")
+            raise Refused(f"prefix {quote(wrapper)} repeated; each wrapper may appear at most once")
         prefix.append(wrapper)
 
     if not rest:
@@ -148,7 +190,7 @@ def admit(command: str, config: Config) -> Admission:
     # PATH rather than chosen by the caller.
     if "/" in program:
         raise Refused(
-            f"program must be a bare command name resolved from PATH, not a path: {program!r}"
+            f"program must be a bare command name resolved from PATH, not a path: {quote(program)}"
         )
 
     # The wildcard turns off THIS check and nothing else: control characters, the bare-name rule
@@ -158,8 +200,8 @@ def admit(command: str, config: Config) -> Admission:
         allowed = ", ".join(sorted(config.allow))
         hint = ""
         if program in config.prefixes:
-            hint = f" ({program!r} is a wrapper prefix, not a program)"
-        raise Refused(f"program {program!r} is not allowlisted{hint}. Allowed: {allowed}")
+            hint = f" ({quote(program)} is a wrapper prefix, not a program)"
+        raise Refused(f"program {quote(program)} is not allowlisted{hint}. Allowed: {allowed}")
 
     args = rest[1:]
 
@@ -167,7 +209,9 @@ def admit(command: str, config: Config) -> Admission:
         # Match on the option NAME so `--upload-pack=/tmp/evil` is caught as well as the
         # space-separated `--upload-pack /tmp/evil`.
         if token.split("=", 1)[0] in config.deny_anywhere:
-            raise Refused(f"option {token!r} is denied: it names a program for {program} to execute")
+            raise Refused(
+                f"option {quote(token)} is denied: it names a program for {program} to execute"
+            )
 
     # Git global options are the tokens BEFORE the first non-option token; that is where git puts
     # config/exec-path switches that turn it into an arbitrary-code runner. Cargo is scanned across
@@ -186,7 +230,7 @@ def admit(command: str, config: Config) -> Admission:
             )
             if denied is not None:
                 raise Refused(
-                    f"option {denied!r} is denied everywhere for cargo: it can make cargo execute "
+                    f"option {quote(denied)} is denied everywhere for cargo: it can make cargo execute "
                     "arbitrary code"
                 )
 
@@ -208,7 +252,7 @@ def admit(command: str, config: Config) -> Admission:
         )
         if denied is not None:
             raise Refused(
-                f"global option {denied!r} is denied for {program}: it can make {program} execute "
+                f"global option {quote(denied)} is denied for {program}: it can make {program} execute "
                 "arbitrary code"
             )
         if base in value_options and "=" not in token:
@@ -232,7 +276,7 @@ def admit(command: str, config: Config) -> Admission:
             )
         if subcommand not in allowed_subcommands:
             raise Refused(
-                f"subcommand '{program} {subcommand}' is not allowlisted. Allowed: "
+                f"subcommand {quote(program + ' ' + subcommand)} is not allowlisted. Allowed: "
                 f"{', '.join(sorted(allowed_subcommands))}. "
                 f"{program} compilation-oriented and unknown subcommands are deliberately "
                 "excluded. Cargo must also be explicitly allowlisted because even dependency "
@@ -240,7 +284,10 @@ def admit(command: str, config: Config) -> Admission:
             )
 
     if subcommand is not None and subcommand in config.deny_subcommand.get(program, ()):
-        raise Refused(f"subcommand '{program} {subcommand}' is denied: it defines or runs arbitrary code")
+        raise Refused(
+            f"subcommand {quote(program + ' ' + subcommand)} is denied: it defines or runs "
+            "arbitrary code"
+        )
 
     return Admission(
         argv=argv,

@@ -4,6 +4,7 @@ use std::ffi::{CStr, CString};
 
 use crate::config::Config;
 use crate::error::{HerdrRunError, Result};
+use crate::textfmt::quote;
 
 /// An admitted command together with the policy facts used to admit it.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -148,7 +149,7 @@ pub fn admit(command: &str, config: &Config) -> Result<Admission> {
         if prefix.contains(first) {
             return Err(HerdrRunError::refused(format!(
                 "prefix {} repeated; each wrapper may appear at most once",
-                python_repr(first)
+                quote(first)
             )));
         }
         prefix.push(first.clone());
@@ -165,21 +166,18 @@ pub fn admit(command: &str, config: &Config) -> Result<Admission> {
     if program.contains('/') {
         return Err(HerdrRunError::refused(format!(
             "program must be a bare command name resolved from PATH, not a path: {}",
-            python_repr(&program)
+            quote(&program)
         )));
     }
     if !config.allows_any_program() && !config.allow.contains(&program) {
         let hint = if config.prefixes.contains(&program) {
-            format!(
-                " ({} is a wrapper prefix, not a program)",
-                python_repr(&program)
-            )
+            format!(" ({} is a wrapper prefix, not a program)", quote(&program))
         } else {
             String::new()
         };
         return Err(HerdrRunError::refused(format!(
             "program {} is not allowlisted{hint}. Allowed: {}",
-            python_repr(&program),
+            quote(&program),
             sorted_join(&config.allow)
         )));
     }
@@ -192,7 +190,7 @@ pub fn admit(command: &str, config: &Config) -> Result<Admission> {
         if config.deny_anywhere.iter().any(|denied| denied == base) {
             return Err(HerdrRunError::refused(format!(
                 "option {} is denied: it names a program for {program} to execute",
-                python_repr(token)
+                quote(token)
             )));
         }
     }
@@ -220,7 +218,7 @@ pub fn admit(command: &str, config: &Config) -> Result<Admission> {
             {
                 return Err(HerdrRunError::refused(format!(
                     "option {} is denied everywhere for cargo: it can make cargo execute arbitrary code",
-                    python_repr(denied)
+                    quote(denied)
                 )));
             }
         }
@@ -246,7 +244,7 @@ pub fn admit(command: &str, config: &Config) -> Result<Admission> {
         {
             return Err(HerdrRunError::refused(format!(
                 "global option {} is denied for {program}: it can make {program} execute arbitrary code",
-                python_repr(denied)
+                quote(denied)
             )));
         }
         if !has_inline_value && value_options.iter().any(|option| option == base) {
@@ -268,7 +266,8 @@ pub fn admit(command: &str, config: &Config) -> Result<Admission> {
         };
         if !allowed.iter().any(|item| item == candidate) {
             return Err(HerdrRunError::refused(format!(
-                "subcommand '{program} {candidate}' is not allowlisted. Allowed: {}. {program} compilation-oriented and unknown subcommands are deliberately excluded. Cargo must also be explicitly allowlisted because even dependency commands may execute ambiently configured helpers.",
+                "subcommand {} is not allowlisted. Allowed: {}. {program} compilation-oriented and unknown subcommands are deliberately excluded. Cargo must also be explicitly allowlisted because even dependency commands may execute ambiently configured helpers.",
+                quote(&format!("{program} {candidate}")),
                 sorted_join(allowed)
             )));
         }
@@ -280,7 +279,8 @@ pub fn admit(command: &str, config: &Config) -> Result<Admission> {
             .is_some_and(|denied| denied.iter().any(|item| item == candidate))
         {
             return Err(HerdrRunError::refused(format!(
-                "subcommand '{program} {candidate}' is denied: it defines or runs arbitrary code"
+                "subcommand {} is denied: it defines or runs arbitrary code",
+                quote(&format!("{program} {candidate}"))
             )));
         }
     }
@@ -309,7 +309,11 @@ fn matches_denied_option(token: &str, denied: &str) -> bool {
     let Some(short) = denied_chars.next() else {
         return false;
     };
-    if denied_chars.next().is_some() || token.starts_with("--") || !token.starts_with('-') {
+    if short == '-'
+        || denied_chars.next().is_some()
+        || token.starts_with("--")
+        || !token.starts_with('-')
+    {
         return false;
     }
     token[1..].contains(short)
@@ -321,81 +325,61 @@ fn sorted_join(values: &[String]) -> String {
     sorted.join(", ")
 }
 
-fn python_repr(value: &str) -> String {
-    // Policy diagnostics overwhelmingly contain command-line ASCII. Matching Python's preferred
-    // quote choice and escapes here keeps those user-visible refusals byte-identical as well.
-    let delimiter = if value.contains('\'') && !value.contains('"') {
-        '"'
-    } else {
-        '\''
-    };
-    let mut output = String::from(delimiter);
-    for character in value.chars() {
-        match character {
-            '\\' => output.push_str("\\\\"),
-            '\n' => output.push_str("\\n"),
-            '\r' => output.push_str("\\r"),
-            '\t' => output.push_str("\\t"),
-            '\x08' => output.push_str("\\x08"),
-            '\x0c' => output.push_str("\\x0c"),
-            control if control.is_control() => {
-                use std::fmt::Write as _;
-                let _ = write!(output, "\\x{:02x}", u32::from(control));
-            }
-            quote if quote == delimiter => {
-                output.push('\\');
-                output.push(quote);
-            }
-            other => output.push(other),
-        }
-    }
-    output.push(delimiter);
-    output
-}
-
 /// Expand a token's leading `~` or `~user` without allowing a shell to interpret the result.
-#[must_use]
-pub fn expand_tilde(token: &str) -> String {
+///
+/// The rules, identical in both editions: `~` uses `HOME` when it is set (refusing a `HOME` that
+/// is not valid UTF-8, because a lossy conversion would name a different directory), and the
+/// account database otherwise; `~user` asks the account database. A lookup that fails, or a home
+/// directory that is not valid UTF-8, leaves the token literal. Trailing slashes are dropped from
+/// the home, and an empty home expands to the remainder of the token, or `/`.
+pub fn expand_tilde(token: &str) -> Result<String> {
     if !token.starts_with('~') {
-        return token.to_owned();
+        return Ok(token.to_owned());
     }
     let slash = token.find('/').unwrap_or(token.len());
     let user = &token[1..slash];
     let suffix = &token[slash..];
     let home = if user.is_empty() {
-        std::env::var_os("HOME")
-            .map(|value| value.to_string_lossy().into_owned())
-            .or_else(current_user_home)
+        match std::env::var_os("HOME") {
+            Some(value) => Some(value.into_string().map_err(|raw| {
+                HerdrRunError::config(format!(
+                    "HOME is not valid UTF-8: {}",
+                    raw.to_string_lossy()
+                ))
+            })?),
+            None => account_home_text(None),
+        }
     } else {
-        passwd_home(user)
+        account_home_text(Some(user))
     };
     let Some(home) = home else {
-        return token.to_owned();
+        return Ok(token.to_owned());
     };
     let trimmed = home.trim_end_matches('/');
     if trimmed.is_empty() {
-        return if suffix.is_empty() {
+        return Ok(if suffix.is_empty() {
             "/".to_owned()
         } else {
             suffix.to_owned()
-        };
+        });
     }
-    format!("{trimmed}{suffix}")
+    Ok(format!("{trimmed}{suffix}"))
 }
 
-fn current_user_home() -> Option<String> {
-    crate::client::current_account_home()
-        .ok()
-        .map(|path| path.to_string_lossy().into_owned())
-}
-
-fn passwd_home(user: &str) -> Option<String> {
+/// The account database's home directory for `user`, or for the current uid when `None`.
+///
+/// `None` when there is no such account or its home is not valid UTF-8; an empty home is
+/// returned as an empty string.
+fn account_home_text(user: Option<&str>) -> Option<String> {
     const DEFAULT_BUFFER: usize = 16 * 1024;
     const MAX_BUFFER: usize = 16 * 1024 * 1024;
 
     // Besides being invalid input to `getpwnam_r`, an interior NUL could otherwise make the NSS
     // lookup apply to a different username than the policy code inspected.
-    let name = CString::new(user).ok()?;
+    let name = match user {
+        Some(user) => Some(CString::new(user).ok()?),
+        None => None,
+    };
     // SAFETY: `sysconf` has no pointer arguments or caller-maintained invariants. A negative result
     // means that libc has no useful size recommendation, in which case the conservative default is
     // used.
@@ -412,17 +396,27 @@ fn passwd_home(user: &str) -> Option<String> {
         let mut record = std::mem::MaybeUninit::<libc::passwd>::uninit();
         let mut result = std::ptr::null_mut();
         let mut buffer = vec![0_u8; size];
-        // SAFETY: `name` is a live NUL-terminated C string. `record` points to writable storage,
-        // and `buffer` is live and writable for exactly the length passed. `result` is an out
-        // pointer. No field of `record` is read unless libc reports success and a non-null result.
+        // SAFETY: `name` (when present) is a live NUL-terminated C string. `record` points to
+        // writable storage, and `buffer` is live and writable for exactly the length passed.
+        // `result` is an out pointer. No field of `record` is read unless libc reports success and
+        // a non-null result.
         let code = unsafe {
-            libc::getpwnam_r(
-                name.as_ptr(),
-                record.as_mut_ptr(),
-                buffer.as_mut_ptr().cast(),
-                buffer.len(),
-                &mut result,
-            )
+            match &name {
+                Some(name) => libc::getpwnam_r(
+                    name.as_ptr(),
+                    record.as_mut_ptr(),
+                    buffer.as_mut_ptr().cast(),
+                    buffer.len(),
+                    &mut result,
+                ),
+                None => libc::getpwuid_r(
+                    libc::getuid(),
+                    record.as_mut_ptr(),
+                    buffer.as_mut_ptr().cast(),
+                    buffer.len(),
+                    &mut result,
+                ),
+            }
         };
         if code == libc::ERANGE {
             if size >= MAX_BUFFER {
@@ -437,17 +431,14 @@ fn passwd_home(user: &str) -> Option<String> {
         if code != 0 || result.is_null() {
             return None;
         }
-        // SAFETY: the successful non-null `getpwnam_r` result initializes `record`. `pw_dir`
-        // points into either `record` or `buffer` and is NUL-terminated by the API contract. The
-        // bytes are copied into an owned Vec/String before either backing allocation is dropped.
+        // SAFETY: the successful non-null lookup initializes `record`. `pw_dir` points into either
+        // `record` or `buffer` and is NUL-terminated by the API contract. The bytes are copied into
+        // an owned Vec/String before either backing allocation is dropped.
         let record = unsafe { record.assume_init() };
         if record.pw_dir.is_null() {
-            return None;
+            return Some(String::new());
         }
         let bytes = unsafe { CStr::from_ptr(record.pw_dir) }.to_bytes().to_vec();
-        if bytes.is_empty() {
-            return None;
-        }
         return String::from_utf8(bytes).ok();
     }
 }
@@ -455,20 +446,22 @@ fn passwd_home(user: &str) -> Option<String> {
 /// Quote one argv as the exact POSIX shell word list admitted by policy.
 ///
 /// Rendering is fallible because a tilde expansion can introduce terminal control characters
-/// through ambient account data even when the original argv was clean.
+/// through ambient account data even when the original argv was clean, and because a `HOME` that
+/// is not valid UTF-8 is refused rather than converted lossily.
 pub fn render<S: AsRef<str>>(argv: &[S]) -> Result<String> {
     let mut quoted = Vec::with_capacity(argv.len());
     for token in argv {
-        let expanded = expand_tilde(token.as_ref());
+        let expanded = expand_tilde(token.as_ref())?;
         if let Some(error) = control_refusal(&expanded, "command argument") {
             return Err(error);
         }
-        quoted.push(quote(&expanded));
+        quoted.push(quote_word(&expanded));
     }
     Ok(quoted.join(" "))
 }
 
-fn quote(token: &str) -> String {
+/// Quote one word for a POSIX shell exactly as Python's `shlex.quote` does.
+pub(crate) fn quote_word(token: &str) -> String {
     if token.is_empty() {
         return "''".to_owned();
     }
@@ -629,7 +622,7 @@ mod tests {
             ("git push --receive-pack=/tmp/evil origin", "is denied"),
             (
                 "cargo build --release",
-                "subcommand 'cargo build' is not allowlisted",
+                "subcommand \"cargo build\" is not allowlisted",
             ),
             ("with-proxy", "no program"),
         ] {
@@ -701,8 +694,8 @@ mod tests {
         assert!(rendered.contains(&home));
         assert!(rendered.contains('\''));
         assert!(!rendered.contains("~/"));
-        assert_eq!(expand_tilde("a~b"), "a~b");
-        assert_eq!(expand_tilde("--opt=~/x"), "--opt=~/x");
+        assert_eq!(expand_tilde("a~b").unwrap(), "a~b");
+        assert_eq!(expand_tilde("--opt=~/x").unwrap(), "--opt=~/x");
     }
 
     #[test]
@@ -714,15 +707,15 @@ mod tests {
         } else {
             format!("{expected_home}/probe")
         };
-        assert_eq!(expand_tilde(&format!("~{user}/probe")), expected);
+        assert_eq!(expand_tilde(&format!("~{user}/probe")).unwrap(), expected);
     }
 
     #[test]
     fn unknown_or_interior_nul_user_is_left_literal() {
         let unknown = format!("~__herdr_run_missing_user_{}/probe", std::process::id());
-        assert_eq!(expand_tilde(&unknown), unknown);
+        assert_eq!(expand_tilde(&unknown).unwrap(), unknown);
         let nul = "~bad\0user/probe";
-        assert_eq!(expand_tilde(nul), nul);
+        assert_eq!(expand_tilde(nul).unwrap(), nul);
     }
 
     #[test]

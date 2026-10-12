@@ -29,14 +29,29 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 
 from herdr_run.allowlist import Admission, reject_terminal_controls
+from herdr_run.audit import make_private_dirs
 from herdr_run.client import HerdrClient
 from herdr_run.config import MAX_TIMEOUT_SECONDS, Config
-from herdr_run.errors import ConfigError, HerdrUnavailable, PaneBusy, RunTimeout
+from herdr_run.errors import (
+    ConfigError,
+    HerdrRunError,
+    HerdrUnavailable,
+    PaneBusy,
+    Refused,
+    RunTimeout,
+)
 from herdr_run.identity import current_boot_id, process_start_ticks
 from herdr_run.readiness import Readiness, assess, infer_prompt_tail
 from herdr_run.retention import prune_runs, runs_root
 from herdr_run.session import Target
 from herdr_run.state import open_lock_file, pane_lock_path
+from herdr_run.textfmt import (
+    MAX_EXIT_MARKER_BYTES,
+    format_round3,
+    number_text,
+    os_error_text,
+    parse_exit_marker,
+)
 
 __all__ = ["RunResult", "execute", "wait_ready", "spool_paths", "read_output_bytes"]
 
@@ -87,7 +102,7 @@ def _spool_root(config: Config) -> str:
 
 
 def _ensure_private_directory(path: str) -> None:
-    os.makedirs(path, mode=0o700, exist_ok=True)
+    make_private_dirs(path)
     metadata = os.lstat(path)
     if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode):
         raise NotADirectoryError(f"run spool path is not a real directory: {path}")
@@ -117,7 +132,14 @@ def _create_private_file(path: str, contents: bytes = b"") -> None:
 def make_run_id(agent: str, *, now: float, pid: int) -> str:
     """A per-run identifier that is unique per (time, process) and readable in a directory listing."""
     stamp = time.strftime("%Y%m%dT%H%M%S", time.gmtime(now))
-    safe_agent = "".join(char if char.isalnum() or char in "-_" else "-" for char in agent) or "agent"
+    # ASCII letters, digits, '-' and '_' only: Unicode character properties differ between
+    # language and library versions, and a run ID names a directory both editions must agree on.
+    safe_agent = (
+        "".join(
+            char if (char.isascii() and char.isalnum()) or char in "-_" else "-" for char in agent
+        )
+        or "agent"
+    )
     return f"{stamp}-{safe_agent}-{pid}"
 
 
@@ -132,9 +154,16 @@ def _allocate_spool(config: Config, base_run_id: str) -> tuple[str, SpoolPaths]:
     runs = os.path.join(root, "runs")
     try:
         _ensure_private_directory(root)
+    except OSError as exc:
+        raise HerdrUnavailable(
+            f"cannot create private run spool root {root}: {os_error_text(exc)}"
+        ) from exc
+    try:
         _ensure_private_directory(runs)
     except OSError as exc:
-        raise HerdrUnavailable(f"cannot create private run spool parent {runs}: {exc}") from exc
+        raise HerdrUnavailable(
+            f"cannot create private run spool parent {runs}: {os_error_text(exc)}"
+        ) from exc
     for collision in range(10_000):
         run_id = base_run_id if collision == 0 else f"{base_run_id}-{collision}"
         spool = spool_paths(config, run_id)
@@ -143,7 +172,9 @@ def _allocate_spool(config: Config, base_run_id: str) -> tuple[str, SpoolPaths]:
         except FileExistsError:
             continue
         except OSError as exc:
-            raise HerdrUnavailable(f"cannot create run spool {spool.directory}: {exc}") from exc
+            raise HerdrUnavailable(
+                f"cannot create run spool {spool.directory}: {os_error_text(exc)}"
+            ) from exc
         return run_id, spool
     raise HerdrUnavailable(
         f"could not allocate a unique run spool after 10000 collisions for {base_run_id}"
@@ -176,7 +207,9 @@ def _pane_lock(
                     )
                 sleep(poll_interval)
             except OSError as exc:
-                raise HerdrUnavailable(f"cannot lock pane {target.pane_id}: {exc}") from exc
+                raise HerdrUnavailable(
+                    f"cannot lock pane {target.pane_id}: {os_error_text(exc)}"
+                ) from exc
         yield
     finally:
         # Closing releases `flock` even when readiness, launch, or collection raised.
@@ -228,10 +261,12 @@ def wait_ready(
         # Ran out of time while the pane looked ready but had not yet been ready long enough.
         raise PaneBusy(
             f"pane {target.pane_id} ({target.tab_label}) looked idle but not for "
-            f"{required_consecutive} consecutive checks within {timeout:g}s: {last.describe()}"
+            f"{required_consecutive} consecutive checks within {number_text(timeout)}s: "
+            f"{last.describe()}"
         )
     raise PaneBusy(
-        f"pane {target.pane_id} ({target.tab_label}) is not ready after {timeout:g}s: {last.describe()}. "
+        f"pane {target.pane_id} ({target.tab_label}) is not ready after {number_text(timeout)}s: "
+        f"{last.describe()}. "
         "Nothing was executed."
     )
 
@@ -252,7 +287,7 @@ def build_shell_command(admission: Admission, spool: SpoolPaths, cwd: str) -> st
     ):
         try:
             reject_terminal_controls(value, description)
-        except Exception as exc:
+        except Refused as exc:
             raise HerdrUnavailable(str(exc)) from exc
 
     inner = (
@@ -265,20 +300,16 @@ def build_shell_command(admission: Admission, spool: SpoolPaths, cwd: str) -> st
     return f"command sh -c {shlex.quote(inner)}"
 
 
-def _read_exit_code(path: str) -> int | None:
-    """Return the recorded exit code, or ``None`` while it is absent or incompletely written."""
+def read_exit_code(path: str) -> int | None:
+    """Read a completion marker: the recorded exit code, or ``None`` while it is absent,
+    incompletely written, or not a marker at all (see :func:`herdr_run.textfmt.parse_exit_marker`).
+    """
     try:
-        with open(path, encoding="utf-8") as handle:
-            text = handle.read()
+        with open(path, "rb") as handle:
+            payload = handle.read(MAX_EXIT_MARKER_BYTES + 1)
     except OSError:
         return None
-    stripped = text.strip()
-    if not stripped:
-        return None
-    try:
-        return int(stripped)
-    except ValueError:
-        return None
+    return parse_exit_marker(payload)
 
 
 def _read_bytes(path: str) -> bytes:
@@ -286,7 +317,9 @@ def _read_bytes(path: str) -> bytes:
         with open(path, "rb") as handle:
             return handle.read()
     except OSError as exc:
-        raise HerdrUnavailable(f"cannot read run spool output {path}: {exc}") from exc
+        raise HerdrUnavailable(
+            f"cannot read run spool output {path}: {os_error_text(exc)}"
+        ) from exc
 
 
 def _read_text_best_effort(path: str) -> str:
@@ -309,7 +342,7 @@ def _validate_timeout(value: float, what: str) -> None:
     if value < 0:
         raise ConfigError(f"{what}: must not be negative")
     if value > MAX_TIMEOUT_SECONDS:
-        raise ConfigError(f"{what}: must not exceed {MAX_TIMEOUT_SECONDS:g} seconds")
+        raise ConfigError(f"{what}: must not exceed {MAX_TIMEOUT_SECONDS:.0f} seconds")
 
 
 def execute(
@@ -371,14 +404,16 @@ def execute(
                 (admission.rendered + "\n").encode("utf-8"),
             )
         except OSError as exc:
-            raise HerdrUnavailable(f"cannot initialize run spool {spool.directory}: {exc}") from exc
+            raise HerdrUnavailable(
+                f"cannot initialize run spool {spool.directory}: {os_error_text(exc)}"
+            ) from exc
 
         started = monotonic()
         client.run(target.pane_id, build_shell_command(admission, spool, cwd))
 
         deadline = started + max(timeout, 0.0)
         while True:
-            code = _read_exit_code(spool.exit_code)
+            code = read_exit_code(spool.exit_code)
             if code is not None:
                 stdout_bytes = _read_bytes(spool.stdout)
                 stderr_bytes = _read_bytes(spool.stderr)
@@ -417,7 +452,7 @@ def execute(
         # Carry partial output with the typed failure. A bare message would make a timed-out run
         # look falsely empty to a caller that does not inspect the spool directory.
         timed_out = RunTimeout(
-            f"command did not finish within {timeout:g}s. It is STILL RUNNING in pane "
+            f"command did not finish within {number_text(timeout)}s. It is STILL RUNNING in pane "
             f"{target.pane_id} ({target.tab_label}) and was not killed. Partial output is in "
             f"{spool.directory}; the exit code will appear in {spool.exit_code} when it finishes."
         )
@@ -472,7 +507,7 @@ def _write_meta(
         "subcommand": admission.subcommand,
         "rendered": admission.rendered,
         "exit_code": exit_code,
-        "duration_seconds": round(duration_seconds, 3),
+        "duration_seconds": format_round3(duration_seconds),
         "workspace": {"label": target.workspace_label, "id": target.workspace_id},
         "tab": {"label": target.tab_label, "id": target.tab_id},
         "pane_id": target.pane_id,
@@ -494,7 +529,10 @@ def _write_meta(
     encoded = (json.dumps(document, indent=2, sort_keys=True, ensure_ascii=False) + "\n").encode(
         "utf-8"
     )
-    _create_private_file(path, encoded)
+    try:
+        _create_private_file(path, encoded)
+    except OSError as exc:
+        raise HerdrUnavailable(f"cannot write run metadata {path}: {os_error_text(exc)}") from exc
     return path
 
 
@@ -528,5 +566,5 @@ def _write_unfinished_meta(
             exit_code=None,
             duration_seconds=duration_seconds,
         )
-    except OSError:
+    except HerdrRunError:
         return

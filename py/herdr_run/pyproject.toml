@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "herdr-run"
-version = "0.2.0"
+version = "0.3.0"
 description = "Run allowlisted shell commands through Herdr panes and collect audited results."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -16,11 +16,11 @@ classifiers = [
   "Programming Language :: Python :: 3",
   "Operating System :: POSIX :: Linux",
 ]
-# Imported lazily so bootstrap help still diagnoses a damaged installation cleanly.
-dependencies = ["pyyaml>=6"]
+# No runtime dependencies: the configuration file is read by herdr-run's own YAML-subset parser.
+dependencies = []
 
 [project.optional-dependencies]
-dev = ["mypy", "pytest", "types-PyYAML"]
+dev = ["mypy", "pytest"]
 
 [project.urls]
 Repository = "https://github.com/rrnewton/agent-utils"

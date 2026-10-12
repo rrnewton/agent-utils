@@ -152,7 +152,8 @@ PROJECTS: tuple[Project, ...] = (
             "config_template.yaml",
             "py.typed",
         ),
-        required_dependencies=("pyyaml",),
+        # The configuration file is read by the package's own YAML-subset parser.
+        required_dependencies=(),
     ),
     Project(
         directory="agentctl", distribution="agentctl", package="agentctl",

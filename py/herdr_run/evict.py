@@ -26,17 +26,17 @@ from __future__ import annotations
 
 import fcntl
 import os
-import sys
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 
-from herdr_run import audit
+from herdr_run import audit, output
 from herdr_run.client import HerdrClient, Pane
 from herdr_run.config import Config
 from herdr_run.errors import HerdrRunError, HerdrUnavailable
 from herdr_run.readiness import ProcessSignal, assess_process
 from herdr_run.state import open_lock_file, pane_lock_path
 from herdr_run.sweep import load_run_records
+from herdr_run.textfmt import os_error_text, quote
 
 __all__ = [
     "Candidate",
@@ -235,7 +235,7 @@ def _try_evict(client: HerdrClient, config: Config, candidate: Candidate, proc_r
         except BlockingIOError:
             return "another herdr-run holds the pane lock"
         except OSError as exc:
-            return f"cannot lock the pane: {exc}"
+            return f"cannot lock the pane: {os_error_text(exc)}"
         # Judged now, under the lock, and closed at once: never from an earlier survey.
         idle, reason = _judge_shell(client, config, candidate, proc_root)
         if not idle:
@@ -309,18 +309,17 @@ def survey_workspace(
     """:func:`survey` the workspace ``config`` names, listed as the cap path lists it."""
     workspace_id = client.workspace_id_for_label(config.workspace)
     if workspace_id is None:
-        raise HerdrUnavailable(f"herdr has no workspace labelled {config.workspace!r}")
+        raise HerdrUnavailable(f"herdr has no workspace labelled {quote(config.workspace)}")
     return survey(client, config, client.panes(workspace_id), records, proc_root)
 
 
 def _log_eviction(config: Config, workspace_id: str, agent: str, eviction: Eviction) -> None:
     candidate = eviction.candidate
     last_run_at = run_time(candidate.last_run) if candidate.last_run is not None else None
-    print(
+    output.diagnostic(
         f"herdr-run: replaced idle tab {candidate.tab_id} (pane {candidate.pane_id}, agent "
         f"{candidate.agent or 'unknown'}, last run {last_run_at or 'none recorded'}) to make room "
-        f"for '{agent}'",
-        file=sys.stderr,
+        f"for '{agent}'"
     )
     path = audit.audit_path(config.project_root, config.spool_dir)
     if not audit.record(
@@ -338,7 +337,7 @@ def _log_eviction(config: Config, workspace_id: str, agent: str, eviction: Evict
             "last_run_at": last_run_at,
         },
     ):
-        print(f"herdr-run: WARNING: could not append audit record to {path}", file=sys.stderr)
+        output.diagnostic(f"herdr-run: WARNING: could not append audit record to {path}")
 
 
 def describe_skipped(skipped: Sequence[tuple[str, str]]) -> str:

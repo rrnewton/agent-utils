@@ -30,9 +30,11 @@ use crate::audit;
 use crate::client::{HerdrApi, Pane};
 use crate::config::Config;
 use crate::error::{HerdrRunError, Result};
+use crate::output;
 use crate::readiness::{assess_process, ProcessSignal};
 use crate::state::{open_lock_file, pane_lock_path};
 use crate::sweep::load_run_records;
+use crate::textfmt::quote;
 
 /// How many skipped tabs a refusal names before summarising the rest as a count.
 const REFUSAL_DETAIL_LIMIT: usize = 3;
@@ -121,8 +123,10 @@ pub fn parse_session_id(stat_text: &str) -> Option<i64> {
 }
 
 fn read_session_id(pid: i64, proc_root: &Path) -> Option<i64> {
-    let text = std::fs::read_to_string(proc_root.join(pid.to_string()).join("stat")).ok()?;
-    parse_session_id(&text)
+    // Decoded lossily: a command name that is not UTF-8 must not drop its process out of the
+    // session scan, because a process missing from the scan is one the tab could be closed over.
+    let bytes = std::fs::read(proc_root.join(pid.to_string()).join("stat")).ok()?;
+    parse_session_id(&String::from_utf8_lossy(&bytes))
 }
 
 /// Find every other process in the session `shell_pid` leads.
@@ -344,8 +348,8 @@ pub fn survey_workspace<A: HerdrApi + ?Sized>(
 ) -> Result<Survey> {
     let Some(workspace_id) = client.workspace_id_for_label(&config.workspace)? else {
         return Err(HerdrRunError::unavailable(format!(
-            "herdr has no workspace labelled '{}'",
-            config.workspace
+            "herdr has no workspace labelled {}",
+            quote(&config.workspace)
         )));
     };
     let panes = client.panes(Some(&workspace_id))?;
@@ -355,13 +359,17 @@ pub fn survey_workspace<A: HerdrApi + ?Sized>(
 fn log_eviction(config: &Config, workspace_id: &str, agent: &str, eviction: &Eviction) {
     let candidate = &eviction.candidate;
     let last_run_at = candidate.last_run.as_deref().and_then(run_time);
-    eprintln!(
+    output::diagnostic(&format!(
         "herdr-run: replaced idle tab {} (pane {}, agent {}, last run {}) to make room for '{agent}'",
         candidate.tab_id,
         candidate.pane_id,
-        candidate.agent.as_deref().unwrap_or("unknown"),
+        candidate
+            .agent
+            .as_deref()
+            .filter(|name| !name.is_empty())
+            .unwrap_or("unknown"),
         last_run_at.as_deref().unwrap_or("none recorded"),
-    );
+    ));
     let mut fields = Map::new();
     fields.insert("pane_id".to_owned(), Value::from(candidate.pane_id.clone()));
     fields.insert("tab_id".to_owned(), Value::from(candidate.tab_id.clone()));
@@ -381,10 +389,10 @@ fn log_eviction(config: &Config, workspace_id: &str, agent: &str, eviction: &Evi
         &eviction.reason,
         fields,
     ) {
-        eprintln!(
+        output::diagnostic(&format!(
             "herdr-run: WARNING: could not append audit record to {}",
             log.display()
-        );
+        ));
     }
 }
 
@@ -513,9 +521,6 @@ mod tests {
         fn workspace_id_for_label(&self, _label: &str) -> Result<Option<String>> {
             Ok(Some("w1".to_owned()))
         }
-        fn workspace_label_for_id(&self, _workspace_id: &str) -> Result<Option<String>> {
-            Ok(Some("agent-cmds".to_owned()))
-        }
         fn create_workspace(&self, _label: &str, _cwd: &str) -> Result<(String, String, String)> {
             unreachable!()
         }
@@ -577,9 +582,6 @@ mod tests {
             unreachable!()
         }
         fn run(&self, _pane_id: &str, _command: &str) -> Result<()> {
-            unreachable!()
-        }
-        fn send_keys(&self, _pane_id: &str, _keys: &str) -> Result<()> {
             unreachable!()
         }
     }

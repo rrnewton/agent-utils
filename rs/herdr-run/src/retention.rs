@@ -151,11 +151,7 @@ fn completion_modified(path: &Path) -> Option<SystemTime> {
     if payload.len() > 128 {
         return None;
     }
-    std::str::from_utf8(&payload)
-        .ok()?
-        .trim()
-        .parse::<i32>()
-        .ok()?;
+    crate::textfmt::parse_exit_marker(&payload)?;
     metadata.modified().ok()
 }
 

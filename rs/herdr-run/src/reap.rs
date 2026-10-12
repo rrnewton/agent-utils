@@ -82,6 +82,8 @@
 
 use std::collections::BTreeMap;
 
+use crate::textfmt::{quote_optional, strip_space};
+
 /// Why a pane was or was not selected. Rendered as strings so they survive into JSON and logs.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub enum Verdict {
@@ -151,7 +153,7 @@ impl ProcessIdentity {
             && self
                 .boot_id
                 .as_deref()
-                .is_some_and(|boot| !boot.trim().is_empty())
+                .is_some_and(|boot| !strip_space(boot).is_empty())
             && self.start_ticks.is_some()
     }
 
@@ -277,8 +279,8 @@ fn decide(evidence: &PaneEvidence) -> ReapDecision {
             Verdict::OutOfScope,
             format!(
                 "tab {} in workspace {} is not one of ours",
-                quoted(evidence.tab_label.as_deref()),
-                quoted(evidence.workspace_label.as_deref())
+                quote_optional(evidence.tab_label.as_deref()),
+                quote_optional(evidence.workspace_label.as_deref())
             ),
         );
     }
@@ -327,7 +329,7 @@ fn decide(evidence: &PaneEvidence) -> ReapDecision {
     let Some(current_boot) = evidence
         .current_boot_id
         .as_deref()
-        .filter(|boot| !boot.trim().is_empty())
+        .filter(|boot| !strip_space(boot).is_empty())
     else {
         return build(
             Verdict::Unknown,
@@ -339,8 +341,8 @@ fn decide(evidence: &PaneEvidence) -> ReapDecision {
             Verdict::Unknown,
             format!(
                 "recorded shell belongs to boot {}, current boot is {}",
-                quoted(recorded.boot_id.as_deref()),
-                quoted(Some(current_boot))
+                quote_optional(recorded.boot_id.as_deref()),
+                quote_optional(Some(current_boot))
             ),
         );
     }
@@ -393,11 +395,6 @@ fn decide(evidence: &PaneEvidence) -> ReapDecision {
             display_ticks(live.start_ticks),
         ),
     )
-}
-
-/// Render an optional label as `'value'` or `None`, so a reason reads the same everywhere.
-fn quoted(value: Option<&str>) -> String {
-    value.map_or_else(|| "None".to_owned(), |text| format!("'{text}'"))
 }
 
 fn display_pid(pid: Option<i64>) -> String {

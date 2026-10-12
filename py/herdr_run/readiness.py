@@ -33,12 +33,13 @@ signal must hold for two consecutive polls.
 from __future__ import annotations
 
 import os
-import pwd
 import re
 from dataclasses import dataclass
 
-from herdr_run.client import HerdrClient, ProcessInfo
+from herdr_run.client import HerdrClient, ProcessInfo, account_home
 from herdr_run.config import Config
+from herdr_run.errors import HerdrUnavailable
+from herdr_run.textfmt import is_blank, quote, rstrip_space, strip_space
 
 __all__ = ["ProcessSignal", "PromptSignal", "Readiness", "assess", "infer_prompt_tail", "parse_ps1"]
 
@@ -53,8 +54,12 @@ _DYNAMIC = re.compile(r"\\.|\$\([^)]*\)|\$\{[^}]*\}|\$[A-Za-z_][A-Za-z0-9_]*")
 
 #: ``PS1='...'`` / ``PS1="..."`` / ``PROMPT=...`` assignment at the start of a line (optionally
 #: `export`ed). Deliberately anchored so a commented-out example (`# PS1=...`) is not picked up.
+#: The unquoted form stops at whitespace, spelled out as the Unicode ``White_Space`` list rather
+#: than ``\s``, whose meaning differs between regular-expression engines.
 _PS1_ASSIGN = re.compile(
-    r"^[ \t]*(?:export[ \t]+)?(?:PS1|PROMPT)=(\"(?:[^\"\\]|\\.)*\"|'[^']*'|[^\s#]+)[ \t]*(?:#.*)?$",
+    r"^[ \t]*(?:export[ \t]+)?(?:PS1|PROMPT)=(\"(?:[^\"\\]|\\.)*\"|'[^']*'"
+    r"|[^\t\n\x0b\x0c\r \x85\xa0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000#]+)"
+    r"[ \t]*(?:#.*)?$",
     re.MULTILINE,
 )
 
@@ -132,7 +137,7 @@ def prompt_tail_of(ps1: str) -> str | None:
         last_dynamic_end = match.end()
     tail = visible[last_dynamic_end:]
     tail = tail.replace(r"\$", "$")
-    return tail if tail.strip() else None
+    return tail if strip_space(tail) else None
 
 
 def infer_prompt_tail(config: Config, *, home: str | None = None) -> str | None:
@@ -143,16 +148,21 @@ def infer_prompt_tail(config: Config, *, home: str | None = None) -> str | None:
         base = home
     else:
         try:
-            base = pwd.getpwuid(os.getuid()).pw_dir
-        except (KeyError, OSError):
+            base = account_home()
+        except HerdrUnavailable:
             return None
     for name in (".bashrc", ".zshrc", ".bash_profile", ".profile"):
         path = os.path.join(base, name)
         try:
-            with open(path, encoding="utf-8", errors="replace") as handle:
-                text = handle.read()
+            with open(path, "rb") as handle:
+                payload = handle.read()
         except OSError:
             continue
+        # CRLF and CR line ends read as LF, so a file saved by a Windows editor still names its
+        # prompt and the dirty-line veto keeps working.
+        text = (
+            payload.decode("utf-8", errors="replace").replace("\r\n", "\n").replace("\r", "\n")
+        )
         ps1 = parse_ps1(text)
         if ps1 is None:
             continue
@@ -187,7 +197,9 @@ def assess_process(info: ProcessInfo, config: Config) -> ProcessSignal:
     if name not in config.shells:
         # A pane whose shell slot is occupied by something else (an editor, an agent TUI, a REPL) is
         # not a shell prompt, whatever its process group says.
-        return _with_reason(common, False, f"foreground process is {name!r}, not a known shell")
+        return _with_reason(
+            common, False, f"foreground process is {quote(name)}, not a known shell"
+        )
     return _with_reason(common, True, f"shell {name} ({info.shell_pid}) owns the foreground group")
 
 
@@ -205,23 +217,39 @@ def assess_prompt(text: str, tail: str | None) -> PromptSignal:
     """Judge the last rendered line: ``clean``, ``dirty``, or ``abstain`` when it is unreadable."""
     if tail is None:
         return PromptSignal("abstain", "no prompt tail configured or inferable", None, None)
-    lines = [line for line in text.splitlines() if line.strip()]
+    # Lines are split on line feeds only, with a trailing carriage return dropped: a Unicode line
+    # separator inside a half-typed command must not hide the command from the veto.
+    lines = [
+        line[:-1] if line.endswith("\r") else line for line in text.split("\n")
+    ]
+    lines = [line for line in lines if not is_blank(line)]
     if not lines:
         return PromptSignal("abstain", "pane has no rendered output yet", tail, None)
     last = lines[-1]
     # `herdr pane read` strips trailing whitespace from each line, so compare against the stripped
     # tail; an idle prompt of "$ " renders as the line "$".
-    needle = tail.rstrip()
+    needle = rstrip_space(tail)
     if not needle:
         return PromptSignal("abstain", "prompt tail is whitespace only", tail, last)
-    stripped_last = last.rstrip()
-    if stripped_last.endswith(needle) and stripped_last.count(needle) == 1:
-        return PromptSignal("clean", f"last line ends with prompt tail {needle!r}", tail, last)
-    if needle in last:
+    stripped_last = rstrip_space(last)
+    occurrences = stripped_last.count(needle)
+    if occurrences == 1 and stripped_last.endswith(needle):
         return PromptSignal(
-            "dirty", f"text typed after prompt tail {needle!r}: {stripped_last[-80:]!r}", tail, last
+            "clean", f"last line ends with prompt tail {quote(needle)}", tail, last
         )
-    return PromptSignal("abstain", f"prompt tail {needle!r} not found in last line", tail, last)
+    if occurrences:
+        excerpt = stripped_last[-80:]
+        if occurrences > 1:
+            reason = (
+                f"prompt tail {quote(needle)} occurs {occurrences} times; possible text follows "
+                f"an earlier prompt: {quote(excerpt)}"
+            )
+        else:
+            reason = f"text typed after prompt tail {quote(needle)}: {quote(excerpt)}"
+        return PromptSignal("dirty", reason, tail, last)
+    return PromptSignal(
+        "abstain", f"prompt tail {quote(needle)} not found in last line", tail, last
+    )
 
 
 def assess(

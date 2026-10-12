@@ -52,6 +52,7 @@ use crate::identity::{current_boot_id, probe_process};
 use crate::reap::{plan_reap, PaneEvidence, ProcessIdentity, ReapPlan};
 use crate::retention::runs_root;
 use crate::session::tab_label_for;
+use crate::textfmt::{quote, strip_space};
 
 /// Largest `meta.json` accepted. Run metadata is a few kilobytes; the bound keeps one corrupted
 /// spool entry from turning a sweep into an unbounded read.
@@ -110,10 +111,7 @@ fn resolve_late_completion(record: &mut Value, directory: &Path) {
     if !matches!(record.get("exit_code"), None | Some(Value::Null)) {
         return;
     }
-    let Ok(text) = fs::read_to_string(directory.join("exit_code")) else {
-        return;
-    };
-    let Ok(code) = text.trim().parse::<i64>() else {
+    let Some(code) = crate::runner::read_exit_code(&directory.join("exit_code")) else {
         return;
     };
     if let Some(object) = record.as_object_mut() {
@@ -170,7 +168,7 @@ pub fn evidence_from_runs(
             boot_id: readiness
                 .get("boot_id")
                 .and_then(Value::as_str)
-                .filter(|boot| !boot.trim().is_empty())
+                .filter(|boot| !strip_space(boot).is_empty())
                 .map(ToOwned::to_owned),
             start_ticks: readiness.get("shell_start_ticks").and_then(Value::as_u64),
         };
@@ -198,12 +196,31 @@ fn scope_of(
     else {
         return (false, None, None, None);
     };
-    let text = |value: Option<&Value>| value.and_then(Value::as_str).map(ToOwned::to_owned);
-    let tab_id = text(latest.pointer("/tab/id"));
-    let tab_label = text(latest.pointer("/tab/label"));
-    let workspace_label = text(latest.pointer("/workspace/label"));
-    let agent = text(latest.get("agent"));
-
+    // Fail closed on shape: `tab` and `workspace` must be objects and every label a string (or
+    // absent). Any other shape is out of scope with no labels shown, because a record that does
+    // not say clearly which tab it ran in cannot authorise anything about one.
+    let malformed = (false, None, None, None);
+    let (Some(Value::Object(tab)), Some(Value::Object(workspace))) =
+        (latest.get("tab"), latest.get("workspace"))
+    else {
+        return malformed;
+    };
+    let text = |object: &serde_json::Map<String, Value>, key: &str| match object.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(value)) => Ok(Some(value.clone())),
+        Some(_) => Err(()),
+    };
+    let Some(record) = latest.as_object() else {
+        return malformed;
+    };
+    let (Ok(tab_id), Ok(tab_label), Ok(workspace_label), Ok(agent)) = (
+        text(tab, "id"),
+        text(tab, "label"),
+        text(workspace, "label"),
+        text(record, "agent"),
+    ) else {
+        return malformed;
+    };
     let matches_schema = match (&workspace_label, &tab_label, &agent) {
         (Some(workspace), Some(label), Some(agent)) if *workspace == config.workspace => {
             tab_label_for(config, agent).is_ok_and(|expected| expected == *label)
@@ -243,8 +260,8 @@ pub fn build_evidence<A: HerdrApi + ?Sized>(
             // the opposite of what happened.
             Ok(None) => {
                 listing_error = Some(format!(
-                    "herdr has no workspace labelled '{}'",
-                    config.workspace
+                    "herdr has no workspace labelled {}",
+                    quote(&config.workspace)
                 ));
             }
             Err(error) => listing_error = Some(error.to_string()),
@@ -359,8 +376,8 @@ pub fn measure_occupancy<A: HerdrApi + ?Sized>(
         },
         Ok(None) => {
             return failed(format!(
-                "herdr has no workspace labelled '{}'",
-                config.workspace
+                "herdr has no workspace labelled {}",
+                quote(&config.workspace)
             ))
         }
         Err(error) => return failed(error.to_string()),
@@ -446,10 +463,6 @@ mod tests {
             Ok(self.workspace_exists.then(|| "w1".to_owned()))
         }
 
-        fn workspace_label_for_id(&self, _workspace_id: &str) -> Result<Option<String>> {
-            Ok(Some("agent-cmds".to_owned()))
-        }
-
         fn create_workspace(&self, _label: &str, _cwd: &str) -> Result<(String, String, String)> {
             unreachable!()
         }
@@ -499,10 +512,6 @@ mod tests {
         }
 
         fn run(&self, _pane_id: &str, _command: &str) -> Result<()> {
-            unreachable!()
-        }
-
-        fn send_keys(&self, _pane_id: &str, _keys: &str) -> Result<()> {
             unreachable!()
         }
     }
@@ -1042,7 +1051,7 @@ mod tests {
         assert_eq!(occupancy.with_record, None);
         assert_eq!(
             occupancy.listing_error.as_deref(),
-            Some("herdr has no workspace labelled 'agent-cmds'")
+            Some("herdr has no workspace labelled \"agent-cmds\"")
         );
     }
 }

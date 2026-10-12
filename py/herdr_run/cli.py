@@ -16,16 +16,19 @@ import base64
 import json
 import math
 import os
+import re
 import shlex
+import signal
+import subprocess
 import sys
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
 
 from herdr_run import __version__
-from herdr_run.allowlist import Admission, admit
+from herdr_run.allowlist import Admission, admit, render
 from herdr_run.audit import audit_path, record, warn_if_spool_is_tracked
-from herdr_run.client import HerdrClient, _bounded_control_command
-from herdr_run.config import MAX_TIMEOUT_SECONDS, Config, load_config
+from herdr_run.client import HerdrClient, bounded_control_command
+from herdr_run.config import MAX_TIMEOUT_SECONDS, Config, load_config, whole_milliseconds
 from herdr_run.errors import (
     EXIT_BUSY,
     ConfigError,
@@ -35,12 +38,14 @@ from herdr_run.errors import (
     RunTimeout,
 )
 from herdr_run.evict import describe_skipped, survey_workspace
+from herdr_run import output
 from herdr_run.readiness import assess, infer_prompt_tail
 from herdr_run.runner import RunResult, execute, read_output_bytes, write_meta
 from herdr_run.session import resolve_target, tab_label_for
 from herdr_run.sweep import load_run_records, measure_occupancy, sweep
+from herdr_run.textfmt import format_round3, os_error_text, quote, strip_ascii, strip_space
 
-__all__ = ["main", "help_text", "subcommand_help_text", "usage_line"]
+__all__ = ["main", "help_text", "subcommand_help_text", "surface_document", "usage_line"]
 
 
 #: Every subcommand, in the order ``herdr-run --help`` lists them, with its one-line summary.
@@ -69,7 +74,46 @@ _DOCUMENTS: dict[str, str] = {
     "userguide": "USER_GUIDE.md",
 }
 
-_GLOBAL_OPTIONS = ("--help", "-h", "--version", "--json", "--config", "--agent")
+#: Every option accepted before the subcommand, with the value it takes (``None`` for a flag).
+#:
+#: The parser, the refusal messages, and ``--dump-surface`` all read this one table, so the surface
+#: the tool reports is the surface it accepts.
+GLOBAL_OPTIONS: tuple[tuple[str, str | None], ...] = (
+    ("--agent", "NAME"),
+    ("--config", "PATH"),
+    ("--dump-surface", None),
+    ("--help", None),
+    ("--json", None),
+    ("--version", None),
+    ("-h", None),
+)
+
+_HELP_OPTIONS: tuple[tuple[str, str | None], ...] = (("--help", None), ("-h", None))
+
+#: Every option each subcommand accepts after its name, with the value it takes.
+SUBCOMMAND_OPTIONS: tuple[tuple[str, tuple[tuple[str, str | None], ...]], ...] = (
+    ("check", _HELP_OPTIONS),
+    ("config", _HELP_OPTIONS),
+    ("init", (("--force", None), ("--help", None), ("-h", None))),
+    ("net-doctor", _HELP_OPTIONS),
+    ("quickstart", _HELP_OPTIONS),
+    ("reap", _HELP_OPTIONS),
+    (
+        "run",
+        (
+            ("--cwd", "PATH"),
+            ("--dry-run", None),
+            ("--help", None),
+            ("--no-cache", None),
+            ("--timeout", "SECONDS"),
+            ("--wait-ready", "SECONDS"),
+            ("-h", None),
+        ),
+    ),
+    ("status", _HELP_OPTIONS),
+    ("target", (("--help", None), ("--no-cache", None), ("-h", None))),
+    ("userguide", _HELP_OPTIONS),
+)
 
 #: Subcommands that never load a configuration file, and the reason each one does not.
 #:
@@ -112,6 +156,18 @@ _JSON_BLIND: dict[str, str] = {
     "quickstart": "it prints a packaged document",
     "userguide": "it prints a packaged document",
 }
+
+#: Subcommands that name a tab, and so resolve which agent this invocation speaks for.
+_AGENT_SIGHTED = frozenset({"run", "status", "config", "target", "net-doctor"})
+
+#: The seconds grammar ``--timeout`` and ``--wait-ready`` accept: ASCII digits only, an optional
+#: sign, an optional fraction and exponent, or a spelling of infinity or NaN (refused afterwards as
+#: not finite). No whitespace, no underscores, no other script's digits -- ``float`` alone would
+#: accept all three, and which digits count would depend on the interpreter's Unicode tables.
+_SECONDS_GRAMMAR = re.compile(
+    r"[+-]?(?:(?:[0-9]+\.?[0-9]*|\.[0-9]+)(?:[eE][+-]?[0-9]+)?"
+    r"|[iI][nN][fF](?:[iI][nN][iI][tT][yY])?|[nN][aA][nN])"
+)
 
 
 class _UsageError(Exception):
@@ -165,17 +221,36 @@ def _local_option_owners(name: str) -> tuple[str, ...]:
     writes ``herdr-run --cwd /tmp run ...`` has the right option and the wrong level, and being
     told which level it belongs to is the whole difference between a typo and a dead end.
     """
-    if name in ("--cwd", "--timeout", "--wait-ready", "--dry-run"):
-        return ("run",)
-    if name == "--no-cache":
-        return ("run", "target")
-    if name == "--force":
-        return ("init",)
-    return ()
+    if name in ("--help", "-h"):
+        return ()
+    return tuple(
+        subcommand
+        for subcommand, table in SUBCOMMAND_OPTIONS
+        if any(option == name for option, _value in table)
+    )
 
 
 def _is_global_option(name: str) -> bool:
-    return name in _GLOBAL_OPTIONS
+    return any(option == name for option, _value in GLOBAL_OPTIONS)
+
+
+def _positional_for(subcommand: str) -> list[str]:
+    return ["<command>"] if subcommand in ("run", "check") else []
+
+
+def surface_document() -> dict[str, object]:
+    """The JSON document ``--dump-surface`` prints: every subcommand and option, from the tables."""
+    return {
+        "global_options": {option: value for option, value in GLOBAL_OPTIONS},
+        "subcommands": {
+            subcommand: {
+                "options": {option: value for option, value in table},
+                "positional": _positional_for(subcommand),
+            }
+            for subcommand, table in SUBCOMMAND_OPTIONS
+        },
+        "version": __version__,
+    }
 
 
 def _find_subcommand(name: str) -> bool:
@@ -194,27 +269,6 @@ def _split_option(token: str) -> tuple[str, str | None]:
     """Split ``--name=value`` into its parts; a bare ``--name`` yields no inline value."""
     name, separator, value = token.partition("=")
     return (name, value if separator else None)
-
-
-def _debug_repr(value: str) -> str:
-    """Quote a string the way both editions quote an unparseable option value."""
-    out = ['"']
-    for character in value:
-        code = ord(character)
-        if character in ('"', "\\"):
-            out.append("\\" + character)
-        elif character == "\n":
-            out.append("\\n")
-        elif character == "\r":
-            out.append("\\r")
-        elif character == "\t":
-            out.append("\\t")
-        elif code < 0x20 or code == 0x7F:
-            out.append(f"\\u{{{code:x}}}")
-        else:
-            out.append(character)
-    out.append('"')
-    return "".join(out)
 
 
 # --- parsing ------------------------------------------------------------------------------------
@@ -242,15 +296,13 @@ def _option_value(
 
 
 def _parse_seconds(option: str, value: str) -> float:
-    if value != value.strip() or "_" in value:
-        raise _UsageError(
-            f"argument {option}: invalid numeric value: {_debug_repr(value)}"
-        )
+    if not _SECONDS_GRAMMAR.fullmatch(value):
+        raise _UsageError(f"argument {option}: invalid numeric value: {quote(value)}")
     try:
         parsed = float(value)
     except (OverflowError, ValueError):
         raise _UsageError(
-            f"argument {option}: invalid numeric value: {_debug_repr(value)}"
+            f"argument {option}: invalid numeric value: {quote(value)}"
         ) from None
     if not math.isfinite(parsed) or parsed < 0:
         raise _UsageError(f"argument {option}: must be a finite non-negative number")
@@ -258,6 +310,8 @@ def _parse_seconds(option: str, value: str) -> float:
         raise _UsageError(
             f"argument {option}: must not exceed {MAX_TIMEOUT_SECONDS:.0f} seconds"
         )
+    if not whole_milliseconds(parsed):
+        raise _UsageError(f"argument {option}: must be a whole number of milliseconds")
     return parsed
 
 
@@ -477,7 +531,10 @@ def _parse(raw: Sequence[str]) -> _Invocation:
             _print_help()
             raise _EarlyExit()
         if token == "--version":
-            print(f"herdr-run {__version__}")
+            output.stdout(f"herdr-run {__version__}\n")
+            raise _EarlyExit()
+        if token == "--dump-surface":
+            _emit_json(surface_document())
             raise _EarlyExit()
         if token == "--json":
             globals_ = replace(globals_, json=True)
@@ -489,7 +546,7 @@ def _parse(raw: Sequence[str]) -> _Invocation:
             elif name == "--agent":
                 value, index = _option_value(raw, index, name, inline)
                 globals_ = replace(globals_, agent=value)
-            elif name in ("--json", "--help", "--version"):
+            elif name in ("--json", "--help", "--version", "--dump-surface"):
                 raise _UsageError(f"argument {name}: takes no value")
             else:
                 raise _UsageError(_misplaced_global(name))
@@ -533,6 +590,7 @@ def help_text() -> str:
         "  --config PATH         explicit configuration file\n"
         "  --agent NAME          the agent this invocation speaks for; names its tab\n"
         "  --json                emit machine-readable output where a subcommand has it\n"
+        "  --dump-surface        print every subcommand and option as JSON and exit\n"
     )
     lines.append(
         "\nEach subcommand has its own options: run 'herdr-run <subcommand> --help'.\n"
@@ -678,32 +736,57 @@ def subcommand_help_text(name: str) -> str:
 
 
 def _print_help() -> None:
-    sys.stdout.write(help_text())
+    output.stdout(help_text())
 
 
 def _print_subcommand_help(name: str) -> None:
-    sys.stdout.write(subcommand_help_text(name))
+    output.stdout(subcommand_help_text(name))
+
 
 
 # --- shared helpers -----------------------------------------------------------------------------
 
 
-def _default_agent(environ: dict[str, str]) -> str:
-    """Infer the invoking agent from the environment ORC actually sets."""
+def _resolve_agent(globals_: _Globals, environ: Mapping[str, str]) -> str:
+    if globals_.agent:
+        return globals_.agent
+    return _default_agent(environ)
+
+
+def _default_agent(environ: Mapping[str, str]) -> str:
+    """Infer the invoking agent from the environment the orchestrator sets.
+
+    Values are trimmed of ASCII whitespace only, so a control character is refused when the tab
+    label is rendered instead of being silently removed. A variable that is not valid UTF-8 is an
+    error: skipping it would make this invocation speak for whoever the NEXT variable names.
+    """
     for key in ("HERDR_RUN_AGENT", "DG_AGENT_NAME", "ORC_AGENT_NAME"):
-        value = environ.get(key, "").strip()
+        raw = environ.get(key)
+        if raw is None:
+            continue
+        if any(0xD800 <= ord(character) <= 0xDFFF for character in raw):
+            raise ConfigError(f"environment variable {key} is not valid UTF-8")
+        value = strip_ascii(raw)
         if value:
             return value
     return "unknown-agent"
 
 
-def _client(config: Config, environ: dict[str, str]) -> HerdrClient:
+def _client(config: Config, environ: Mapping[str, str]) -> HerdrClient:
     return HerdrClient(broker=config.broker, environ=environ)
 
 
 def _emit_json(document: object) -> None:
-    json.dump(document, sys.stdout, indent=2, sort_keys=True, ensure_ascii=False)
-    sys.stdout.write("\n")
+    output.stdout(
+        json.dumps(document, indent=2, sort_keys=True, ensure_ascii=False) + "\n"
+    )
+
+
+def _current_directory() -> str:
+    try:
+        return os.getcwd()
+    except OSError as exc:
+        raise ConfigError(f"cannot determine current directory: {os_error_text(exc)}") from exc
 
 
 def _resolved_cwd(config: Config, override: str | None) -> str:
@@ -715,15 +798,16 @@ def _resolved_cwd(config: Config, override: str | None) -> str:
     instead of in the slot the caller was standing in. It did not look like an error; it looked like
     the wrong repository answering. "Where the policy lives" and "where the command runs" are
     different questions, and only the first is anchored to the config file.
+
+    An absolute path is passed through exactly as written and the pane's own ``cd`` resolves it:
+    resolving ``..`` lexically here could pick a different directory than the shell would when a
+    symbolic link precedes it. A relative path is resolved against the project root.
     """
     cwd = override if override is not None else config.cwd
     if cwd is None:
-        try:
-            return os.getcwd()
-        except OSError as exc:
-            raise ConfigError(f"cannot determine current directory: {exc}") from exc
+        return _current_directory()
     if not os.path.isabs(cwd):
-        cwd = os.path.abspath(os.path.join(config.project_root, cwd))
+        cwd = os.path.normpath(os.path.join(config.project_root, cwd))
     return cwd
 
 
@@ -734,12 +818,11 @@ def _print_document(subcommand: str) -> int:
 
         text = (files("herdr_run") / resource).read_text(encoding="utf-8")
     except (OSError, ModuleNotFoundError):
-        print(
-            f"herdr-run: the {subcommand} document is not available in this installation",
-            file=sys.stderr,
+        output.diagnostic(
+            f"herdr-run: the {subcommand} document is not available in this installation"
         )
         return 1
-    sys.stdout.write(text)
+    output.stdout(text)
     return 0
 
 
@@ -753,16 +836,16 @@ def _cmd_init(directory: str, *, force: bool, json_output: bool) -> int:
     if json_output:
         _emit_json({"created": True, "path": path})
     else:
-        print(f"wrote {path}")
-        print(
+        output.stdout(
+            f"wrote {path}\n"
             "Every knob is in that file, set to the value in force today. The allowlist near the\n"
-            "top is a HUMAN-ONLY knob: an agent that can widen its own allowlist does not have one."
+            "top is a HUMAN-ONLY knob: an agent that can widen its own allowlist does not have one.\n"
         )
     return 0
 
 
 def _cmd_status(
-    config: Config, agent: str, environ: dict[str, str], *, json_output: bool
+    config: Config, agent: str, environ: Mapping[str, str], *, json_output: bool
 ) -> int:
     """Report what is in effect here, and change nothing while doing it."""
     from herdr_run.status import (
@@ -775,10 +858,8 @@ def _cmd_status(
     tab_label = tab_label_for(config, agent)
     # A resolution failure is a fact about the session worth REPORTING, not an error to exit on:
     # "herdr is not installed" is one of the most useful things status can tell somebody.
+    client = _client(config, environ)
     try:
-        client = _client(config, environ)
-        # Resolve the executables eagerly, the way the Rust edition's constructor does, so an
-        # absent Herdr is reported as "not reachable" rather than as "no server is running".
         client.preflight()
     except HerdrUnavailable as exc:
         session = unreachable(str(exc))
@@ -787,7 +868,7 @@ def _cmd_status(
     if json_output:
         _emit_json(status_document(config, agent, tab_label, session))
     else:
-        sys.stdout.write(status_text(config, agent, tab_label, session))
+        output.stdout(status_text(config, agent, tab_label, session))
     return 0
 
 
@@ -835,7 +916,7 @@ def _cmd_check(config: Config, command: str, *, json_output: bool) -> int:
         if json_output:
             _emit_json({"reason": str(exc), "verdict": "refused"})
         else:
-            print(f"REFUSED: {exc}", file=sys.stderr)
+            output.diagnostic(f"REFUSED: {exc}")
         return Refused.exit_code
     if json_output:
         _emit_json(
@@ -847,15 +928,18 @@ def _cmd_check(config: Config, command: str, *, json_output: bool) -> int:
             }
         )
     else:
-        print(
-            f"ALLOWED: program={admission.program} subcommand={admission.subcommand or '-'}"
+        # `-` stands for an ABSENT subcommand only; an empty token is printed as empty, the way
+        # the JSON form distinguishes `null` from `""`.
+        subcommand = "-" if admission.subcommand is None else admission.subcommand
+        output.stdout(
+            f"ALLOWED: program={admission.program} subcommand={subcommand}\n"
+            f"rendered: {admission.rendered}\n"
         )
-        print(f"rendered: {admission.rendered}")
     return 0
 
 
 def _cmd_target(
-    config: Config, agent: str, environ: dict[str, str], *, use_cache: bool
+    config: Config, agent: str, environ: Mapping[str, str], *, use_cache: bool
 ) -> int:
     client = _client(config, environ)
     target = resolve_target(client, config, agent, use_cache=use_cache)
@@ -886,7 +970,7 @@ OCCUPANCY_NOTE = (
 )
 
 
-def _cmd_reap(config: Config, environ: dict[str, str]) -> int:
+def _cmd_reap(config: Config, environ: Mapping[str, str]) -> int:
     """Report which command tabs are PROVABLY finished with. Closes nothing.
 
     Report-only is the point, not a limitation. The expensive mistake is closing a tab whose agent
@@ -911,6 +995,9 @@ def _cmd_reap(config: Config, environ: dict[str, str]) -> int:
     ``replaceable`` says whether that matters: the cap replaces an idle unsplit tab before it
     refuses, so a full workspace with an idle tab still admits the next agent. It is judged as the
     cap judges except for the pane lock, by :func:`herdr_run.evict.survey`, which closes nothing.
+
+    The three readings are taken in one fixed order in both editions: the evidence for every
+    recorded pane first, then the occupancy listing, then the survey.
     """
     client = _client(config, environ)
     records = load_run_records(config)
@@ -998,7 +1085,17 @@ def _net_doctor_error_fields(direct_exit_code: int | None = None) -> dict[str, o
     return fields
 
 
-def _cmd_net_doctor(config: Config, agent: str, environ: dict[str, str]) -> int:
+def _first_line(text: str) -> str:
+    """The first line of ``text`` after trimming, splitting on line feeds only."""
+    return strip_space(text).split("\n")[0]
+
+
+def _last_line(text: str) -> str:
+    """The last line of ``text`` after trimming, splitting on line feeds only."""
+    return strip_space(text).split("\n")[-1]
+
+
+def _cmd_net_doctor(config: Config, agent: str, environ: Mapping[str, str]) -> int:
     """Bracket ONE scenario in both directions instead of asserting it.
 
     Positive: the probe through the pane must succeed. Negative: run directly, under whatever
@@ -1006,57 +1103,71 @@ def _cmd_net_doctor(config: Config, agent: str, environ: dict[str, str]) -> int:
     scenario; if both fail the pane path is broken. Reporting one side only would leave "the pane is
     outside the caller's confinement" as an inference rather than an observation.
     """
-    import subprocess
-
-    probe = shlex.join(("git", "ls-remote", config.probe_remote, "HEAD"))
-    prefixed = (
-        shlex.join(("with-proxy", *shlex.split(probe)))
-        if "with-proxy" in config.prefixes
-        else probe
+    argv = ["git", "ls-remote", config.probe_remote, "HEAD"]
+    if "with-proxy" in config.prefixes:
+        argv.insert(0, "with-proxy")
+    output.stdout(
+        f"herdr-run net-doctor  (agent={agent}, config={config.source_path or 'defaults'})\n"
+        f"\n{NET_DOCTOR_SCOPE}\n"
     )
-    print(
-        f"herdr-run net-doctor  (agent={agent}, config={config.source_path or 'defaults'})"
-    )
-    print()
-    print(NET_DOCTOR_SCOPE)
 
     log = audit_path(config.project_root, config.spool_dir)
     warn_if_spool_is_tracked(config.project_root, config.spool_dir)
+    # Rendered exactly as `run` renders a command, so the probe that is printed, audited, and
+    # executed is the probe the policy admitted, with `~` expanded the same way.
     try:
-        admission = admit(prefixed, config)
-    except Refused as exc:
+        probe = render(tuple(argv))
+    except HerdrRunError as exc:
         _record_audit(
-            log, agent, prefixed, "REFUSED", str(exc), _net_doctor_error_fields()
+            log,
+            agent,
+            shlex.join(argv),
+            type(exc).__name__.upper(),
+            str(exc),
+            _net_doctor_error_fields(),
+        )
+        raise
+    try:
+        admission = admit(probe, config)
+    except HerdrRunError as exc:
+        _record_audit(
+            log, agent, probe, type(exc).__name__.upper(), str(exc), _net_doctor_error_fields()
         )
         raise
     _record_audit(
         log,
         agent,
-        prefixed,
+        probe,
         "ADMITTED",
         "net-doctor probe accepted; target resolution and launch have not yet completed",
         {"net_doctor": True, "rendered": admission.rendered},
     )
 
     try:
-        direct = _bounded_control_command(["/bin/bash", "-lc", prefixed], timeout=120)
-    except (OSError, subprocess.SubprocessError) as exc:
-        error = HerdrUnavailable(f"cannot run the direct probe: {exc}")
+        direct = bounded_control_command(["/bin/bash", "-lc", probe], timeout=120)
+    except subprocess.TimeoutExpired as exc:
+        error = HerdrUnavailable(
+            "cannot run the direct probe: control command timed out after 120s"
+        )
         _record_audit(
-            log,
-            agent,
-            prefixed,
-            "HERDRUNAVAILABLE",
-            str(error),
-            _net_doctor_error_fields(),
+            log, agent, probe, "HERDRUNAVAILABLE", str(error), _net_doctor_error_fields()
         )
         raise error from exc
-    direct_ok = direct.returncode == 0
-    print(f"[direct  ] {prefixed}")
-    print(f"           rc={direct.returncode} {'SUCCEEDED' if direct_ok else 'failed'}")
+    except (OSError, ValueError) as exc:
+        error = HerdrUnavailable(f"cannot run the direct probe: {os_error_text(exc)}")
+        _record_audit(
+            log, agent, probe, "HERDRUNAVAILABLE", str(error), _net_doctor_error_fields()
+        )
+        raise error from exc
+    direct_code = direct.returncode
+    direct_ok = direct_code == 0
+    direct_text = (
+        f"[direct  ] {probe}\n"
+        f"           rc={direct_code} {'SUCCEEDED' if direct_ok else 'failed'}\n"
+    )
     if not direct_ok:
-        stderr_lines = (direct.stderr or "").splitlines()
-        print(f"           {stderr_lines[-1] if stderr_lines else ''}")
+        direct_text += f"           {_last_line(direct.stderr)}\n"
+    output.stdout(direct_text)
 
     pane_rc = -1
     try:
@@ -1072,9 +1183,20 @@ def _cmd_net_doctor(config: Config, agent: str, environ: dict[str, str]) -> int:
             ready_timeout=max(config.ready_timeout_seconds, 30.0),
             timeout=min(config.timeout_seconds, 180.0),
         )
+    except HerdrRunError as exc:
+        _record_audit(
+            log,
+            agent,
+            probe,
+            type(exc).__name__.upper(),
+            str(exc),
+            _net_doctor_error_fields(direct_code),
+        )
+        output.stdout(f"[via pane] FAILED: {exc}\n")
+    else:
         pane_rc = result.exit_code
         meta, meta_error = _write_meta_best_effort(result, admission, config, agent)
-        fields = _net_doctor_error_fields(direct.returncode)
+        fields = _net_doctor_error_fields(direct_code)
         fields.update(
             {
                 "exit_code": pane_rc,
@@ -1088,46 +1210,35 @@ def _cmd_net_doctor(config: Config, agent: str, environ: dict[str, str]) -> int:
         _record_audit(
             log,
             agent,
-            prefixed,
+            probe,
             "RAN",
             f"net-doctor pane probe exited {pane_rc}",
             fields,
         )
-        head = (result.stdout.strip().splitlines() or [""])[0]
-        print(f"[via pane] {prefixed}   (pane {target.pane_id}, tab {target.tab_label})")
-        print(
-            f"           rc={pane_rc} {'SUCCEEDED' if pane_rc == 0 else 'failed'}  {head[:80]}"
+        head = _first_line(result.stdout)[:80]
+        output.stdout(
+            f"[via pane] {probe}   (pane {target.pane_id}, tab {target.tab_label})\n"
+            f"           rc={pane_rc} {'SUCCEEDED' if pane_rc == 0 else 'failed'}  {head}\n"
         )
-    except HerdrRunError as exc:
-        _record_audit(
-            log,
-            agent,
-            prefixed,
-            type(exc).__name__.upper(),
-            str(exc),
-            _net_doctor_error_fields(direct.returncode),
-        )
-        print(f"[via pane] FAILED: {exc}")
 
-    print()
     if pane_rc == 0 and not direct_ok:
-        print(
-            "VERDICT: this scenario works — the probe is blocked directly and succeeds "
-            "through the pane."
+        output.stdout(
+            "\nVERDICT: this scenario works — the probe is blocked directly and succeeds "
+            "through the pane.\n"
         )
         return 0
     if pane_rc == 0:
-        print(
-            "VERDICT: the pane works, but so does running the probe directly. For THIS scenario "
+        output.stdout(
+            "\nVERDICT: the pane works, but so does running the probe directly. For THIS scenario "
             "the pane is buying you nothing; prefer running the command directly. Other reasons "
-            "to route a command through a pane are untouched by that."
+            "to route a command through a pane are untouched by that.\n"
         )
         return 0
-    print(
-        "VERDICT: the pane path is NOT working. Most likely the Herdr server was started from "
+    output.stdout(
+        "\nVERDICT: the pane path is NOT working. Most likely the Herdr server was started from "
         "inside a confined process, so its panes inherit the confinement. Stop it "
         "('herdr server stop') and let herdr-run restart it via systemd-run, or start it from an "
-        "unconfined shell."
+        "unconfined shell.\n"
     )
     return 1
 
@@ -1136,7 +1247,7 @@ def _run_command(
     config: Config,
     agent: str,
     options: _RunOptions,
-    environ: dict[str, str],
+    environ: Mapping[str, str],
     *,
     json_output: bool,
 ) -> int:
@@ -1148,7 +1259,7 @@ def _run_command(
         admission: Admission = admit(command, config)
     except Refused as exc:
         _record_audit(log, agent, command, "REFUSED", str(exc))
-        print(f"herdr-run: REFUSED: {exc}", file=sys.stderr)
+        output.diagnostic(f"herdr-run: REFUSED: {exc}")
         return Refused.exit_code
 
     if options.dry_run:
@@ -1162,7 +1273,7 @@ def _run_command(
                 }
             )
         else:
-            print(admission.rendered)
+            output.stdout(admission.rendered + "\n")
         return 0
 
     _record_audit(
@@ -1199,14 +1310,13 @@ def _run_command(
         # make a partially-successful run look like one that produced nothing, and a caller cannot
         # distinguish a false empty result from a real one.
         _record_audit(log, agent, command, "RUNTIMEOUT", str(exc))
-        _emit_raw_output(
-            exc.partial_stdout.encode("utf-8"), exc.partial_stderr.encode("utf-8")
-        )
-        print(f"herdr-run: {exc}", file=sys.stderr)
+        output.write_labelled(1, exc.partial_stdout.encode("utf-8"), "partial stdout")
+        output.write_labelled(2, exc.partial_stderr.encode("utf-8"), "partial stderr")
+        output.diagnostic(f"herdr-run: {exc}")
         return exc.exit_code
     except HerdrRunError as exc:
         _record_audit(log, agent, command, type(exc).__name__.upper(), str(exc))
-        print(f"herdr-run: {exc}", file=sys.stderr)
+        output.diagnostic(f"herdr-run: {exc}")
         return exc.exit_code
 
     meta, meta_error = _write_meta_best_effort(result, admission, config, agent)
@@ -1242,13 +1352,14 @@ def _run_command(
                 "pane_id": result.target.pane_id,
                 "tab": result.target.tab_label,
                 "created": list(result.target.created),
-                "duration_seconds": round(result.duration_seconds, 3),
+                "duration_seconds": format_round3(result.duration_seconds),
                 "spool_dir": result.spool.directory,
                 "meta": meta,
             }
         )
     else:
-        _emit_raw_output(stdout_bytes, stderr_bytes)
+        output.stdout_bytes(stdout_bytes)
+        output.stderr_bytes(stderr_bytes)
     return result.exit_code
 
 
@@ -1269,10 +1380,7 @@ def _record_audit(
         detail=detail,
         fields=fields,
     ):
-        print(
-            f"herdr-run: WARNING: could not append audit record to {path}",
-            file=sys.stderr,
-        )
+        output.diagnostic(f"herdr-run: WARNING: could not append audit record to {path}")
 
 
 def _write_meta_best_effort(
@@ -1281,42 +1389,16 @@ def _write_meta_best_effort(
     """Write supplemental metadata without replacing an already-completed command result."""
     try:
         return write_meta(result, admission, config, agent), None
-    except (OSError, UnicodeError) as exc:
-        error = f"cannot write run metadata: {exc}"
-        print(f"herdr-run: WARNING: {error}", file=sys.stderr)
-        return None, error
-
-
-def _emit_raw_output(stdout_bytes: bytes, stderr_bytes: bytes) -> None:
-    """Write each captured byte stream exactly once, without newline or text translation."""
-    stdout_buffer = getattr(sys.stdout, "buffer", None)
-    stderr_buffer = getattr(sys.stderr, "buffer", None)
-    try:
-        if stdout_buffer is not None:
-            stdout_buffer.write(stdout_bytes)
-            stdout_buffer.flush()
-        else:  # pragma: no cover - only nonstandard embedded text streams lack .buffer
-            sys.stdout.write(stdout_bytes.decode("utf-8", errors="replace"))
-    except (OSError, UnicodeError) as exc:
-        raise HerdrRunError(f"cannot write stdout: {exc}") from exc
-    try:
-        if stderr_buffer is not None:
-            stderr_buffer.write(stderr_bytes)
-            stderr_buffer.flush()
-        else:  # pragma: no cover - only nonstandard embedded text streams lack .buffer
-            sys.stderr.write(stderr_bytes.decode("utf-8", errors="replace"))
-    except (OSError, UnicodeError) as exc:
-        raise HerdrRunError(f"cannot write stderr: {exc}") from exc
+    except HerdrRunError as exc:
+        output.diagnostic(f"herdr-run: WARNING: {exc}")
+        return None, str(exc)
 
 
 # --- dispatch -----------------------------------------------------------------------------------
 
 
-def _dispatch(invocation: _Invocation, environ: dict[str, str]) -> int:
-    try:
-        start_dir = os.getcwd()
-    except OSError as exc:
-        raise ConfigError(f"cannot determine current directory: {exc}") from exc
+def _dispatch(invocation: _Invocation, environ: Mapping[str, str]) -> int:
+    start_dir = _current_directory()
 
     if invocation.subcommand == "init":
         # Deliberately before load_config: the reason to reach for `init` is often that discovery
@@ -1327,10 +1409,14 @@ def _dispatch(invocation: _Invocation, environ: dict[str, str]) -> int:
         )
 
     config = load_config(explicit_path=invocation.globals.config, start_dir=start_dir)
-    agent = invocation.globals.agent or ""
-    if not agent:
-        agent = _default_agent(environ)
     json_output = invocation.globals.json
+    # The agent is resolved only by the subcommands that name a tab with it, so a malformed agent
+    # variable cannot fail a `check` or a `reap` that never asks who is speaking.
+    agent = (
+        _resolve_agent(invocation.globals, environ)
+        if invocation.subcommand in _AGENT_SIGHTED
+        else ""
+    )
 
     if invocation.subcommand == "run":
         assert invocation.run is not None
@@ -1355,39 +1441,62 @@ def _dispatch(invocation: _Invocation, environ: dict[str, str]) -> int:
     raise AssertionError(f"unhandled subcommand {invocation.subcommand!r}")
 
 
-def main(argv: Sequence[str] | None = None) -> int:
-    """Entry point. Return the wrapped status or the documented code for a wrapper failure."""
+def _prepare_process(reexec: Sequence[str]) -> None:
+    """Make this interpreter behave as the native edition's runtime does, before anything runs.
+
+    * A closed standard descriptor is reopened on ``/dev/null``, as the native runtime does before
+      ``main``: output to it is discarded, never an error and never a write into a file that
+      happened to receive the descriptor number.
+    * When the locale selected a filesystem encoding other than UTF-8, the process re-executes
+      once with ``-X utf8``: arguments, environment values, paths, and output are then UTF-8
+      whatever the locale, as they are in the native edition, and bytes that are not UTF-8 are
+      visible and refusable rather than silently reinterpreted.
+    * SIGINT keeps its default action, so an interrupt ends the process BY the signal, which is
+      what lets a calling loop stop instead of carrying on.
+    """
+    for descriptor in (0, 1, 2):
+        try:
+            os.fstat(descriptor)
+        except OSError:
+            try:
+                os.open(os.devnull, os.O_RDWR)
+            except OSError:
+                pass
+    encoding = sys.getfilesystemencoding().lower().replace("-", "").replace("_", "")
+    if encoding != "utf8" and not sys.flags.utf8_mode and sys.executable:
+        os.execv(sys.executable, [sys.executable, "-X", "utf8", *reexec, *sys.argv[1:]])
+    signal.signal(signal.SIGINT, signal.SIG_DFL)
+
+
+def main(argv: Sequence[str] | None = None, *, reexec: Sequence[str] | None = None) -> int:
+    """Entry point. Return the wrapped status or the documented code for a wrapper failure.
+
+    ``reexec`` is what follows the interpreter to run this same entry point again (a script path,
+    or ``-m herdr_run``) when the process must restart in UTF-8 mode; it defaults to the script
+    the interpreter was started with.
+    """
+    if argv is None:
+        _prepare_process(reexec if reexec is not None else [sys.argv[0]])
     raw = list(argv) if argv is not None else sys.argv[1:]
     try:
-        invocation = _parse(raw)
-    except _EarlyExit:
-        return 0
-    except _UsageError as exc:
-        print(f"usage: {usage_line()}", file=sys.stderr)
-        print(f"herdr-run: error: {exc}", file=sys.stderr)
-        return 2
+        try:
+            invocation = _parse(raw)
+        except _EarlyExit:
+            return 0
+        except _UsageError as exc:
+            output.diagnostic(f"usage: {usage_line()}")
+            output.diagnostic(f"herdr-run: error: {exc}")
+            return 2
 
-    # Printed before any configuration is read: documentation is exactly what somebody with a
-    # broken configuration file needs, and refusing to show it would be perverse.
-    if invocation.subcommand in _DOCUMENTS:
-        return _print_document(invocation.subcommand)
+        # Printed before any configuration is read: documentation is exactly what somebody with a
+        # broken configuration file needs, and refusing to show it would be perverse.
+        if invocation.subcommand in _DOCUMENTS:
+            return _print_document(invocation.subcommand)
 
-    try:
         return _dispatch(invocation, dict(os.environ))
     except HerdrRunError as exc:
-        _safe_diagnostic(f"herdr-run: {exc}")
+        output.diagnostic(f"herdr-run: {exc}")
         return exc.exit_code
-    except KeyboardInterrupt:  # pragma: no cover - interactive only
-        _safe_diagnostic("herdr-run: interrupted")
-        return 130
-
-
-def _safe_diagnostic(message: str) -> None:
-    """Best-effort stderr diagnostic for paths already handling a broken output stream."""
-    try:
-        print(message, file=sys.stderr)
-    except (OSError, UnicodeError):
-        pass
 
 
 if __name__ == "__main__":  # pragma: no cover

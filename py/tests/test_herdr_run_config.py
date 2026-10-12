@@ -206,7 +206,7 @@ def test_null_optional_fields_are_accepted() -> None:
 def test_tab_name_rejects_everything_except_plain_named_placeholders(
     schema: str,
 ) -> None:
-    with pytest.raises(ConfigError, match="tab_name schema"):
+    with pytest.raises(ConfigError, match=r"\.tab_name: schema "):
         parse_config(
             {"tab_name": schema}, source_path="/tmp/x.yaml", project_root="/tmp"
         )
@@ -223,7 +223,6 @@ def test_tab_name_allows_literal_braces_and_both_named_placeholders() -> None:
 
 def test_yaml_uses_core_12_scalar_resolution(tmp_path: object) -> None:
     """The YAML-1.1 words yes/on/off stay strings; 0o10 is the YAML-1.2 octal spelling."""
-    pytest.importorskip("yaml")
     root = str(tmp_path)
     path = os.path.join(root, ".herdr-run.yaml")
     with open(path, "w", encoding="utf-8") as handle:
@@ -245,17 +244,17 @@ def test_yaml_uses_core_12_scalar_resolution(tmp_path: object) -> None:
         ),
         (
             "defaults: &defaults\n  workspace: inherited\n<<: *defaults\n",
-            "merge keys are not supported",
+            "anchors and aliases are not supported at line 1 column 11",
         ),
-        ("timeout_seconds: .inf\n", "non-finite YAML numbers"),
-        ("timeout_seconds: -.Inf\n", "non-finite YAML numbers"),
-        ("ready_timeout_seconds: .nan\n", "non-finite YAML numbers"),
+        ("<<: {workspace: inherited}\n", "YAML merge keys are not supported at line 1 column 1"),
+        ("timeout_seconds: .inf\n", "non-finite numbers are not supported"),
+        ("timeout_seconds: -.Inf\n", "non-finite numbers are not supported"),
+        ("ready_timeout_seconds: .nan\n", "non-finite numbers are not supported"),
     ],
 )
 def test_strict_yaml_rejects_ambiguous_policy_documents(
     tmp_path: object, document: str, pattern: str
 ) -> None:
-    pytest.importorskip("yaml")
     root = str(tmp_path)
     path = os.path.join(root, ".herdr-run.yaml")
     with open(path, "w", encoding="utf-8") as handle:
@@ -274,20 +273,18 @@ def test_decoded_nonfinite_timeouts_are_rejected(value: float) -> None:
 
 
 def test_huge_yaml_integer_is_a_typed_config_error(tmp_path: object) -> None:
-    pytest.importorskip("yaml")
     path = os.path.join(str(tmp_path), ".herdr-run.yaml")
     with open(path, "w", encoding="utf-8") as handle:
         handle.write("timeout_seconds: " + "9" * 5_000 + "\n")
-    with pytest.raises(ConfigError, match="invalid YAML"):
+    with pytest.raises(ConfigError, match="must not exceed 31536000 seconds"):
         load_config(explicit_path=path, start_dir=str(tmp_path))
 
 
 def test_yaml_unicode_surrogate_is_a_typed_config_error(tmp_path: object) -> None:
-    pytest.importorskip("yaml")
     path = os.path.join(str(tmp_path), ".herdr-run.yaml")
     with open(path, "w", encoding="utf-8") as handle:
         handle.write('workspace: "\\uD800"\n')
-    with pytest.raises(ConfigError, match="surrogate"):
+    with pytest.raises(ConfigError, match="is not a valid Unicode scalar value at line 1"):
         load_config(explicit_path=path, start_dir=str(tmp_path))
 
 

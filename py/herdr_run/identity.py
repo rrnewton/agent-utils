@@ -26,6 +26,8 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass
 
+from herdr_run.textfmt import os_error_text, strip_space
+
 __all__ = [
     "BOOT_ID_PATH",
     "ShellProbe",
@@ -89,8 +91,8 @@ def parse_start_ticks(stat_text: str) -> int | None:
 def current_boot_id(*, proc_root: str = "/proc") -> str | None:
     """Read this boot's identifier, or ``None`` when it cannot be established."""
     try:
-        with open(os.path.join(proc_root, BOOT_ID_PATH), encoding="utf-8") as handle:
-            value = handle.read(256).strip()
+        with open(os.path.join(proc_root, BOOT_ID_PATH), "rb") as handle:
+            value = strip_space(handle.read().decode("utf-8"))
     except (OSError, UnicodeError):
         return None
     return value or None
@@ -113,7 +115,9 @@ def probe_process(pid: int, *, proc_root: str = "/proc") -> ShellProbe:
         # The ONE reading that may authorise reaping: the kernel says there is no such process.
         return ShellProbe(gone=True, start_ticks=None, error=None)
     except (OSError, ValueError) as exc:
-        return ShellProbe(gone=False, start_ticks=None, error=f"cannot read {path}: {exc}")
+        return ShellProbe(
+            gone=False, start_ticks=None, error=f"cannot read {path}: {os_error_text(exc)}"
+        )
     if len(payload) > _MAX_STAT_BYTES:
         return ShellProbe(gone=False, start_ticks=None, error=f"{path} is implausibly long")
     ticks = parse_start_ticks(payload.decode("utf-8", errors="replace"))

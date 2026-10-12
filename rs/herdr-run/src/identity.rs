@@ -70,7 +70,7 @@ pub fn parse_start_ticks(stat_text: &str) -> Option<u64> {
 #[must_use]
 pub fn current_boot_id(proc_root: &Path) -> Option<String> {
     let text = fs::read_to_string(proc_root.join(BOOT_ID_PATH)).ok()?;
-    let trimmed = text.trim();
+    let trimmed = crate::textfmt::strip_space(&text);
     if trimmed.is_empty() {
         None
     } else {

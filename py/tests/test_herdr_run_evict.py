@@ -354,7 +354,7 @@ def test_surveying_an_all_busy_workspace_yields_the_cap_refusal(tmp_path: Path) 
 def test_surveying_a_missing_workspace_raises_unavailable(tmp_path: Path) -> None:
     world = World(tmp_path, ["a"])
     config = dataclasses.replace(world.config, workspace="nowhere")
-    with pytest.raises(HerdrUnavailable, match="herdr has no workspace labelled 'nowhere'"):
+    with pytest.raises(HerdrUnavailable, match='herdr has no workspace labelled "nowhere"'):
         survey_workspace(cast(HerdrClient, world.fake), config, [], str(world.proc))
 
 

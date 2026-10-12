@@ -85,7 +85,7 @@ workspace: agent-cmds
 tab_name: "{agent}"
 
 # Working directory for commands. null means the caller's own directory; a relative path is
-# resolved against the directory holding this file.
+# resolved against the directory holding this file, and an absolute one is used as written.
 cwd: null
 
 # Process names accepted as an interactive shell when judging whether a pane is idle.
@@ -100,8 +100,9 @@ broker: direct
 # TIMING AND SAFETY AROUND A SHARED PANE
 # ===========================================================================
 
-# How long to wait for a command's exit code before giving up on it. The command is NOT killed:
-# it is running in a terminal this process does not own.
+# How long to wait for a command's exit code before giving up on it, in seconds (a whole number
+# of milliseconds). The command is NOT killed: it is running in a terminal this process does not
+# own.
 timeout_seconds: 900
 
 # How long to wait for the pane to become idle. 0 refuses immediately when it is busy, which is the

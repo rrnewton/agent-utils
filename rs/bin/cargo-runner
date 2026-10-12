@@ -7,13 +7,25 @@
 # can execute. This is deliberately not rust-script: rust-script 0.36 invalidates its executable
 # cache from the entrypoint script, but these entrypoints delegate into library crates whose source
 # can change without main.rs changing.
+#
+# The launcher never changes its own working directory: the tool it starts must see the caller's
+# real directory, including one that has since been deleted (the tool, not the launcher, decides
+# what that means). Every path below is absolute, and Cargo and the helpers run from `/` through
+# `env -C /`, which changes directory without asking the shell for the current one.
+#
+# It prints nothing on success: the engine resolver's one `engine=` line is the whole record of a
+# launch. Set AGENT_UTILS_RS_VERBOSE=1 to also see the cache verdict and rebuild notices.
 set -euo pipefail
 
-CALLER_CWD="$PWD"
 SELF="$(readlink -f "${BASH_SOURCE[0]}")"
-ROOT="$(cd "$(dirname "$SELF")/../.." && pwd)"
+ROOT="$(dirname "$(dirname "$(dirname "$SELF")")")"
 TOOL="$(basename "$0")"
-cd "$ROOT"
+
+verbose() {
+  if [[ "${AGENT_UTILS_RS_VERBOSE:-}" == "1" ]]; then
+    echo "$@" >&2
+  fi
+}
 
 case "$TOOL" in
   dagrun|cpuset-alloc)
@@ -46,7 +58,7 @@ case "$TOOL" in
     ;;
 esac
 
-for required in cargo cp flock mktemp sha256sum; do
+for required in cargo cp env flock mktemp sha256sum; do
   if ! command -v "$required" >/dev/null 2>&1; then
     echo "[$TOOL] Rust source launcher requires '$required'" >&2
     exit 127
@@ -66,12 +78,21 @@ absolute_command_path() {
   printf '%s\n' "$resolved"
 }
 
+# An explicit relative path is relative to the checkout, as it was when this launcher ran there.
+checkout_command_path() {
+  local requested="$1"
+  if [[ "$requested" == */* && "$requested" != /* ]]; then
+    requested="$ROOT/$requested"
+  fi
+  absolute_command_path "$requested"
+}
+
 CARGO_BIN="$(absolute_command_path cargo)" || {
   echo "[$TOOL] Rust source launcher could not resolve the Cargo executable" >&2
   exit 127
 }
 RUSTC_REQUESTED="${RUSTC:-rustc}"
-RUSTC_BIN="$(absolute_command_path "$RUSTC_REQUESTED")" || {
+RUSTC_BIN="$(checkout_command_path "$RUSTC_REQUESTED")" || {
   echo "[$TOOL] Rust source launcher requires Rust compiler '$RUSTC_REQUESTED'" >&2
   exit 127
 }
@@ -84,7 +105,7 @@ fi
 # Match Cargo's neutral configuration/toolchain discovery below. Otherwise an enclosing consumer
 # rust-toolchain.toml could select one compiler for this target path while Cargo, launched from /,
 # selects another. Explicit RUSTC/RUSTUP_TOOLCHAIN environment choices remain authoritative.
-HOST_TARGET="$(cd / && "$RUSTC_BIN" -vV | sed -n 's/^host: //p')"
+HOST_TARGET="$(env -C / "$RUSTC_BIN" -vV | sed -n 's/^host: //p')"
 if [[ ! "$HOST_TARGET" =~ ^[A-Za-z0-9_.-]+$ ]]; then
   echo "[$TOOL] could not determine a safe host target from '$RUSTC_BIN -vV'" >&2
   exit 3
@@ -115,17 +136,19 @@ run_cargo() {
   # .cargo/config.toml may require a different nightly feature, linker, target, or rustc.  Run the
   # frontend from filesystem root so only system/root and the caller's normal CARGO_HOME settings
   # apply; every workspace and output path below is absolute.  The built utility still starts in
-  # CALLER_CWD, preserving its public cwd behavior.
-  (
-    cd /
-    env -u AGENT_UTILS_RS_ENSURE_ONLY -u CARGO_BUILD_TARGET -u CARGO_TARGET_DIR \
-      "$CARGO_BIN" "$@"
-  )
+  # the caller's directory, because this script never leaves it.
+  env -C / -u AGENT_UTILS_RS_ENSURE_ONLY -u CARGO_BUILD_TARGET -u CARGO_TARGET_DIR \
+    "$CARGO_BIN" "$@"
 }
 
 cache_state="missing"
 before_binary=""
-source_before="$("$FINGERPRINT")"
+fingerprint() {
+  # From a neutral directory, so the helper's own shell starts cleanly whatever the caller's cwd.
+  env -C / "$FINGERPRINT"
+}
+
+source_before="$(fingerprint)"
 if [[ -f "$TARGET" && -x "$TARGET" && -f "$PROVENANCE" ]]; then
   stamped_source="$(sed -n 's/^source_fp=//p' "$PROVENANCE")"
   stamped_binary="$(sed -n 's/^binary_sha256=//p' "$PROVENANCE")"
@@ -163,13 +186,13 @@ refresh_package() {
 
 # Never let Cargo's timestamp cache bless absent, replaced, non-executable, or source-stale bytes.
 if [[ "$cache_state" != "verified" ]]; then
-  echo "[$TOOL] discarding $cache_state cached Rust artifact(s) for $PACKAGE" >&2
+  verbose "[$TOOL] discarding $cache_state cached Rust artifact(s) for $PACKAGE"
   refresh_package
 fi
 
 attempt=1
 while ((attempt <= 3)); do
-  source_before="$("$FINGERPRINT")"
+  source_before="$(fingerprint)"
   build_targets=(--bin "$TOOL")
   if [[ "$force_refresh" == "1" ]]; then
     build_targets=(--bins)
@@ -180,7 +203,7 @@ while ((attempt <= 3)); do
     echo "[$TOOL] Cargo build failed; no cached Rust artifact was executed" >&2
     exit 3
   fi
-  source_after="$("$FINGERPRINT")"
+  source_after="$(fingerprint)"
   if [[ "$source_before" != "$source_after" ]]; then
     echo "[$TOOL] Rust source changed during build; retrying ($attempt/3)" >&2
     refresh_package
@@ -217,7 +240,7 @@ while ((attempt <= 3)); do
   fi
 
   # Close the source-change window before publishing this executable to the caller.
-  if [[ "$("$FINGERPRINT")" != "$source_after" ]]; then
+  if [[ "$(fingerprint)" != "$source_after" ]]; then
     refresh_package
     echo "[$TOOL] Rust source changed while stamping; retrying ($attempt/3)" >&2
     attempt=$((attempt + 1))
@@ -259,7 +282,7 @@ while ((attempt <= 3)); do
     fi
 
     # Snapshotting may take long enough for an editor to advance source after the earlier check.
-    if [[ "$("$FINGERPRINT")" != "$source_after" ]]; then
+    if [[ "$(fingerprint)" != "$source_after" ]]; then
       refresh_package
       echo "[$TOOL] Rust source changed while snapshotting; retrying ($attempt/3)" >&2
       attempt=$((attempt + 1))
@@ -268,9 +291,9 @@ while ((attempt <= 3)); do
   fi
 
   if [[ "$cache_state" == "verified" && "$before_binary" == "$binary_sha" ]]; then
-    echo "[$TOOL] rust cache=verified source=${source_after:0:12} binary=${binary_sha:0:12}" >&2
+    verbose "[$TOOL] rust cache=verified source=${source_after:0:12} binary=${binary_sha:0:12}"
   else
-    echo "[$TOOL] rust cache=refreshed source=${source_after:0:12} binary=${binary_sha:0:12}" >&2
+    verbose "[$TOOL] rust cache=refreshed source=${source_after:0:12} binary=${binary_sha:0:12}"
   fi
   break
 done
@@ -283,13 +306,11 @@ fi
 if [[ "${AGENT_UTILS_RS_ENSURE_ONLY:-}" == "1" ]]; then
   flock -u 9
   exec 9>&-
-  cd "$CALLER_CWD"
   printf '%s\n' "$TARGET"
   exit 0
 fi
 
 flock -u 9
 exec 9>&-
-cd "$CALLER_CWD"
 unset AGENT_UTILS_RS_ENSURE_ONLY
 exec "$SNAPSHOT" "$@"

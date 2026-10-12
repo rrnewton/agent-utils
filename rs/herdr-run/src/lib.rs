@@ -18,6 +18,7 @@ pub mod error;
 pub mod evict;
 pub mod identity;
 pub mod init;
+pub mod output;
 pub mod readiness;
 pub mod reap;
 pub mod retention;
@@ -25,6 +26,8 @@ pub mod runner;
 pub mod session;
 pub mod status;
 pub mod sweep;
+pub mod textfmt;
+pub mod yaml;
 
 mod state;
 mod timefmt;

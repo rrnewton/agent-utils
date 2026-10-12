@@ -18,11 +18,9 @@ of keystroke-injection calls.
 
 ## Installation
 
-```sh
-python3 -m pip install herdr-run
-```
-
-Python 3.10 or newer is required. Configuration-file support is included in the normal install.
+This guide is printed by `herdr-run userguide`, so the command is already installed wherever you
+are reading it this way; the package's README describes installing it elsewhere. Reading a
+`.herdr-run.yaml` needs nothing further: the configuration parser is built in.
 
 ### Prerequisites
 
@@ -96,9 +94,10 @@ herdr-run userguide                # this document
 | Option | Effect |
 | --- | --- |
 | `--config PATH` | Use an explicit configuration file instead of the discovered one. Refused by `init`, `quickstart`, and `userguide`, which read no configuration file at all. |
-| `--agent NAME` | The agent this invocation speaks for; names its tab. Otherwise `$HERDR_RUN_AGENT`, `$DG_AGENT_NAME`, or `$ORC_AGENT_NAME`. Refused by `check`, `init`, `reap`, `quickstart`, and `userguide`, which name no tab. |
+| `--agent NAME` | The agent this invocation speaks for; names its tab. Otherwise the first of `$HERDR_RUN_AGENT`, `$DG_AGENT_NAME`, and `$ORC_AGENT_NAME` that is non-empty once ASCII whitespace is trimmed (other characters, including control characters, are kept and then refused in the tab label), else `unknown-agent`. A variable that is not valid UTF-8 is a configuration error (78) rather than skipped, so an invocation never speaks for the next variable's agent by accident. Refused by `check`, `init`, `reap`, `quickstart`, and `userguide`, which name no tab. |
 | `--json` | Emit machine-readable output where the subcommand has one. Refused by `net-doctor`, `quickstart`, and `userguide`, whose only output is prose. `config`, `target`, and `reap` print JSON with or without it. |
 | `--version` | Print the version and exit. |
+| `--dump-surface` | Print every subcommand and option, with the value each option takes, as JSON, and exit. Meant for tools that check the command-line surface. |
 
 **`run` options** only mean something to `run`, and go **after** it:
 
@@ -106,8 +105,8 @@ herdr-run userguide                # this document
 | --- | --- |
 | `--dry-run` | Admit the command and print the exact rendered line; execute nothing. |
 | `--wait-ready S` | Wait up to `S` seconds for the pane to go idle instead of refusing at once. |
-| `--timeout S` | Override the command timeout. |
-| `--cwd PATH` | Working directory for the command. |
+| `--timeout S` | Override the command timeout, in seconds. |
+| `--cwd PATH` | Working directory for the command. An absolute path is used exactly as written; a relative one is resolved against the project root. |
 | `--no-cache` | Ignore the session cache and re-resolve the pane from labels. |
 
 `init` takes `--force`, and `target` also takes `--no-cache`. Every other subcommand takes no
@@ -147,9 +146,21 @@ A wrapped command can itself return one of those numbers, so the number alone is
 mode. With `--json`, a completed wrapped command emits a result object (even when nonzero), while a
 wrapper failure emits no result object and writes a `herdr-run:` diagnostic to stderr.
 
-Timeout values must be finite, non-negative, and no greater than 31,536,000 seconds (one year).
-That shared upper bound prevents a very large finite value from overflowing a platform clock into
-an accidental unbounded wait.
+Timeout values, from the command line or the configuration file, must be finite, non-negative,
+no greater than 31,536,000 seconds (one year), and a whole number of milliseconds (at most three
+decimal places): a finer wait means nothing. That shared upper bound prevents a very large finite
+value from overflowing a platform clock into an accidental unbounded wait. On the command line,
+`S` is written with ASCII digits only: an optional sign, digits, an optional fraction and exponent
+(`10`, `2.5`, `1e3`). Whitespace, underscores, and other scripts' digits are refused.
+
+When stdout cannot be written — a full disk, a reader that went away — `herdr-run` says
+`herdr-run: cannot write stdout: <reason>` on stderr and exits `1`. A standard descriptor that was
+closed before `herdr-run` started reads as `/dev/null`. An interrupt (Ctrl-C) ends `herdr-run` by
+the signal itself, so a calling loop sees an interrupted process rather than an exit status.
+
+Quoted values in diagnostics (`program "curl" is not allowlisted`, `got "maybe"`) are written with
+printable ASCII as is, `\n`, `\r`, and `\t` as escapes, and every other character as `\u{hex}`,
+so a message never writes a bidirectional override or a line separator to the terminal raw.
 
 ---
 
@@ -182,10 +193,28 @@ Two things in that file are worth naming here, because they are decisions rather
   resolved from the pane's `PATH`, wrapper prefixes must still be declared, and every `deny_*` rule
   still bites. `"*"` must be the only entry, because `["*", "git"]` reads narrower than it is.
 
-Unknown or duplicate keys, merge keys, non-finite/excessive timeouts, fractional/negative retention
-days, retention beyond 365,000 days, a fractional/negative/oversized `max_panes`, control
-characters, and unsupported tab placeholders are hard errors. A typo'd policy key must not silently
-fall back to defaults.
+Unknown or duplicate keys, merge keys, non-finite/excessive/sub-millisecond timeouts,
+fractional/negative retention days, retention beyond 365,000 days, a fractional/negative/oversized
+`max_panes`, control characters, and unsupported tab placeholders are hard errors (exit 78). A
+typo'd policy key must not silently fall back to defaults. Keys are checked in the order the
+generated file lists them, so a file with two mistakes reports the first; type names in messages
+use the JSON vocabulary (`null`, `bool`, `number`, `string`, `array`, `object`).
+
+The file is read with herdr-run's own parser for a plain subset of YAML, so it means the same thing
+to every reader. Accepted: comments; one document, optionally with `---`, `...`, and a `%YAML 1.1`
+or `%YAML 1.2` directive; block mappings and sequences (including `key:` followed by `- item` at
+the same indentation); flow collections such as `[a, b]` and `{a: [b]}`, which may span lines;
+single-line plain, single-quoted, and double-quoted scalars; the core tags `!!str`, `!!int`,
+`!!float`, `!!bool`, `!!null`, `!!seq`, and `!!map`. Plain scalars resolve by the YAML 1.2 core
+schema, so `yes`, `on`, and `007` are strings. Refused, each with its own message and a line and
+column (`<file>: invalid YAML: <what> at line L column C`): anchors and aliases, block scalars
+(`|`, `>`), explicit `?` keys, plain or quoted scalars that continue onto another line, any other
+tag or directive, a second document, keys that are not strings, merge keys, non-finite numbers, a
+tab outside a quoted scalar or a comment, and collections nested more than 128 levels deep.
+
+The directory a command runs from, `HOME` when a command uses `~`, and the agent variables must be
+valid UTF-8; otherwise herdr-run stops with a configuration error rather than converting them
+lossily and writing its spool, audit log, or session cache somewhere else.
 
 ---
 
@@ -282,9 +311,13 @@ but has not run: the shell is genuinely idle, yet typing would concatenate onto 
 last rendered line is checked against the prompt's trailing literal, inferred from `PS1` in the shell
 rc file (a `PS1` ending `...\n\$ ` yields `"$ "`):
 
-- line ends with the tail → `clean`
-- tail appears earlier in the line → `dirty` → **refuse**
+- line ends with the tail, and it appears once → `clean`
+- tail appears earlier in the line, or more than once → `dirty` → **refuse**
 - tail not found, or not inferable → `abstain`
+
+The last line is the last non-blank one, split on line feeds only (a trailing carriage return is
+dropped), so a Unicode line separator in a half-typed command cannot hide it. The `PS1` is read
+with CRLF and CR line ends treated as LF.
 
 `abstain` does not veto an otherwise idle pane. Set `prompt_tail` explicitly for an exotic prompt,
 or `readiness: process` to disable this secondary check.
@@ -304,7 +337,10 @@ into a newly and exclusively created `<spool_dir>/runs/<run_id>/`, and the calle
 directly. Scraping the terminal would inherit hard-wrapping mid-token,
 silent scrollback truncation, ANSI/progress-bar corruption, and — decisively — **no exit code
 anywhere on screen**. The appearance of `exit_code` is both the completion signal and the result; a
-value that does not parse as an integer is treated as "still being written", not as corrupt.
+value that is not a complete marker is treated as "still being written", not as corrupt. A
+marker is at most 128 ASCII bytes: optional surrounding ASCII whitespace around an optional sign
+and decimal digits, within the signed 32-bit range. The same rule decides completion for a run,
+for `reap`, and for retention, so nothing is deleted on a marker anything else would not accept.
 
 Raw mode writes `stdout` and `stderr` back without decoding. JSON mode includes `stdout_base64` and
 `stderr_base64` for byte-exact consumers and readable `stdout`/`stderr` decoded as UTF-8 with invalid

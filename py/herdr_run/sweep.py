@@ -42,7 +42,6 @@ because only positive absence may authorise closing a tab.
 
 from __future__ import annotations
 
-import json
 import os
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
@@ -51,10 +50,11 @@ from herdr_run.client import HerdrClient
 from herdr_run.config import Config
 from herdr_run.errors import HerdrRunError
 from herdr_run.identity import current_boot_id, probe_process
-from herdr_run.jsonx import as_mapping, opt_str
 from herdr_run.reap import PaneEvidence, ProcessIdentity, ReapPlan, evidence_from_runs, plan_reap
 from herdr_run.retention import runs_root
+from herdr_run.runner import read_exit_code
 from herdr_run.session import tab_label_for
+from herdr_run.textfmt import quote, strict_json_loads
 
 __all__ = ["load_run_records", "pane_ids_in", "build_evidence", "sweep"]
 
@@ -84,10 +84,12 @@ def load_run_records(config: Config) -> tuple[dict[str, object], ...]:
                 payload = handle.read(_MAX_META_BYTES + 1)
             if len(payload) > _MAX_META_BYTES:
                 continue
-            document: object = json.loads(payload.decode("utf-8"))
-            record = as_mapping(document, path)
-        except (OSError, UnicodeError, TypeError, json.JSONDecodeError):
+            document: object = strict_json_loads(payload.decode("utf-8"))
+        except (OSError, UnicodeError, ValueError):
             continue
+        if not isinstance(document, dict):
+            continue
+        record: dict[str, object] = document
         _resolve_late_completion(record, os.path.join(root, name))
         records.append(record)
     return tuple(records)
@@ -104,15 +106,11 @@ def _resolve_late_completion(record: dict[str, object], directory: str) -> None:
     """
     if record.get("exit_code") is not None:
         return
-    try:
-        with open(os.path.join(directory, "exit_code"), encoding="utf-8") as handle:
-            text = handle.read(64).strip()
-    except OSError:
-        return
-    try:
-        record["exit_code"] = int(text)
-    except ValueError:
-        return
+    # The same marker rule the runner and retention use: an unreadable or undecodable marker means
+    # "not completed", never a crash.
+    code = read_exit_code(os.path.join(directory, "exit_code"))
+    if code is not None:
+        record["exit_code"] = code
 
 
 def pane_ids_in(records: Iterable[dict[str, object]]) -> tuple[str, ...]:
@@ -139,15 +137,19 @@ def _scope_of(
             latest = record
     if latest is None:
         return False, None, None, None
-    try:
-        tab = as_mapping(latest.get("tab"), "meta.json tab")
-        workspace = as_mapping(latest.get("workspace"), "meta.json workspace")
-        tab_id = opt_str(tab, "id")
-        tab_label = opt_str(tab, "label")
-        workspace_label = opt_str(workspace, "label")
-        agent = opt_str(latest, "agent")
-    except TypeError:
+    # Fail closed on shape: `tab` and `workspace` must be objects and every label a string (or
+    # absent). Any other shape is out of scope with no labels shown, because a record that does
+    # not say clearly which tab it ran in cannot authorise anything about one.
+    tab = latest.get("tab")
+    workspace = latest.get("workspace")
+    if not isinstance(tab, dict) or not isinstance(workspace, dict):
         return False, None, None, None
+    fields = (tab.get("id"), tab.get("label"), workspace.get("label"), latest.get("agent"))
+    if not all(value is None or isinstance(value, str) for value in fields):
+        return False, None, None, None
+    tab_id, tab_label, workspace_label, agent = (
+        value if isinstance(value, str) else None for value in fields
+    )
     if workspace_label != config.workspace or agent is None or tab_label is None:
         return False, tab_id, tab_label, workspace_label
     try:
@@ -179,7 +181,7 @@ def build_evidence(
                 # No workspace by that label means no listing was obtained. Saying nothing here
                 # would leave every pane GONE, telling an operator the tabs are already closed --
                 # the opposite of what happened.
-                listing_error = f"herdr has no workspace labelled {config.workspace!r}"
+                listing_error = f"herdr has no workspace labelled {quote(config.workspace)}"
             else:
                 live_pane_ids = frozenset(pane.pane_id for pane in client.panes(workspace_id))
         except HerdrRunError as exc:
@@ -262,7 +264,9 @@ def measure_occupancy(
     try:
         workspace_id = client.workspace_id_for_label(config.workspace)
         if workspace_id is None:
-            return Occupancy(None, None, f"herdr has no workspace labelled {config.workspace!r}")
+            return Occupancy(
+                None, None, f"herdr has no workspace labelled {quote(config.workspace)}"
+            )
         panes = client.panes(workspace_id)
     except HerdrRunError as exc:
         return Occupancy(None, None, str(exc))
