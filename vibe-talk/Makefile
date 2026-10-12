@@ -10,7 +10,7 @@
 # tool's lightweight unboxed gate. The root includes `tests.dag.yaml` directly so vibe-talk shares
 # one scheduler and browser cap with the other repository fragments.
 
-.PHONY: validate validate-boxed dag-check fmt check scripts-check contract contract-check typecheck test page pwa-installability enter-to-send-browser offline-cache-browser reactions-browser rich-headers-browser read-aloud-browser post-confirm-browser view-switch-browser read-modes-browser keyboard-browser two-column-browser bookmark-browser voice-read-acceptance-self-test android-speech-self-test live-hint-adapter-self-test container-smoke filter-place-browser clean
+.PHONY: validate validate-boxed dag-check fmt check scripts-check contract contract-check typecheck test page pwa-installability enter-to-send-browser offline-cache-browser reactions-browser rich-headers-browser read-aloud-browser post-confirm-browser view-switch-browser read-modes-browser keyboard-browser two-column-browser bookmark-browser voice-read-acceptance-self-test android-speech-self-test live-hint-adapter-self-test container-smoke filter-place-browser voice-composer-browser clean
 
 # The whole gate for this tool, cheapest and most likely to fail first.
 #
@@ -144,6 +144,14 @@ read-aloud-browser:
 # WEB_ROOT=dir to run it against another copy of the page.
 post-confirm-browser:
 	python3 tests/post_confirm_browser.py $(if $(WEB_ROOT),--web-root $(WEB_ROOT))
+
+# `#241 voice-composer` in a real Chromium at 412x915 and 1280x800: the call's message box and the
+# view switch on screen and uncovered while the box has the focus -- at idle, in a typed
+# conversation, in a call, and on the phone with the on-screen keyboard's share of the screen taken
+# away -- focus and typing opening nothing, and the first send opening one typed conversation. Pass
+# WEB_ROOT=dir to run it against another copy of the page, and SCREENSHOTS=dir to keep PNGs.
+voice-composer-browser:
+	python3 tests/voice_composer_browser.py $(if $(WEB_ROOT),--web-root $(WEB_ROOT)) $(if $(SCREENSHOTS),--screenshots $(SCREENSHOTS))
 
 # `#220 view-switch-instant` in a real Chromium: All to Main and back with every timeline request
 # intercepted -- no read, never an empty list or the loading line, the reader's message kept -- All
