@@ -1,10 +1,11 @@
 ---
 title: 'rich-headers: lift an agent''s [who-am-i] tag, its stated time and a title from a message''s first line into the header row'
-status: open
+status: closed
 priority: 2
 issue_type: task
 created_at: 2026-10-12T14:16:16.075142499+00:00
-updated_at: 2026-10-12T14:16:16.075142499+00:00
+updated_at: 2026-10-12T17:00:37.794356643+00:00
+closed_at: 2026-10-12T17:00:37.794356522+00:00
 ---
 
 # Description
