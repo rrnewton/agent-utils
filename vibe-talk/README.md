@@ -3589,28 +3589,45 @@ means staying at the oldest thing loaded. **Refresh** (`#refresh-discord`) is pr
 you are reading, so it keeps you there — and it stays, because a desktop has no gesture and a
 keyboard reaches a button.
 
-### One channel row at a time, but only where a pointer exists
+### One channel row at a time, and one look for it
 
-A long channel is a wall of blocks, and Discord picks out the row under the pointer because a mouse
-gives it something to pick out **with**. That is the whole justification and also the whole limit:
-on a touch screen a `:hover` rule fires on tap and then stays lit until you tap something else — a
-row that looks selected when nothing is.
+A long channel is a wall of blocks, and the row the reader is on is picked out: its surface turns
+`--row-hover`, its edge and a ring take the accent, its controls come up to full contrast, and a
+dimmed row comes back to full strength.
 
-So the tint sits behind `@media (hover: hover) and (pointer: fine)`, which asks the two questions
-that matter: can this device hover at all, and is its pointer precise. Not a width query — a
-touchscreen laptop is wide and must not get it — and not a user-agent string. It is deliberately a
-*second* query rather than being folded into the desktop regime above, because a narrow window with
-a mouse should still pick out its rows.
+That row used to be lit two ways, by `:hover` under the mouse and by the focus when the keyboard
+selected a message, and on a desk the two parted: a message lit by the mouse, then ↓, left two
+messages lit, with nothing to say which one Enter would open (`#239 single-selection`). So the mouse
+and the keys move **one** selection per list, and the selection is the only thing that lights a row:
+`data-selected`, on one row of the page at most, drawn the same whoever chose it.
 
-The keyboard's equivalent, `:focus-within`, is **ungated**: a keyboard is not a pointer, and
-somebody tabbing through the channel needs the same "you are here" on any device. The row's
-actionable child is the reply control, and hovering or focusing the row picks that out too. It is
-not *revealed* by hover the way Discord's row actions are — the standing rule on this page is that
-a control which cannot act is absent, so a control that can act must not be invisible.
+- A key that moves the selection takes it from wherever the mouse put it.
+- A real mouse move over a row selects that row. The focus goes with it when the focus was on a
+  list, never out of a box being typed in, a picker or an open ⋯ menu. A move is real only when the
+  pointer itself moved: a list scrolled under a still pointer, by a key or by a message arriving,
+  takes nothing.
+- A click selects too. A tap on a touch screen selects **silently**: no focus, nothing lit. A touch
+  screen has no hover, and a row lit by a tap could never be put out, which is the property the
+  first version of this treatment (`#56 message-hover-highlight`) was built around. No row has a
+  `:hover` rule any more, so no phone can get one.
+- The row a reply's arrow or circle jumps to becomes the selection. Its flash is on the message every
+  key now acts on, and goes out when the selection moves on.
+- In two columns each column keeps its own selection, and only the column in use draws its one.
+  Moving the mouse into the other column takes the selection, and the keys, there.
+
+What a pointer still lights inside the lists (the disc behind a reply's arrow, the circle's halo) is
+behind `@media (hover: hover) and (pointer: fine)`, and held back while the keys are in use:
+`data-input="keys"` on the root element from the key until the mouse really moves.
+
+The row's actionable child is the reply control, and selecting the row picks that out too. It is not
+*revealed* by hover the way Discord's row actions are: the standing rule on this page is that a
+control which cannot act is absent, so a control that can act must not be invisible.
 
 Contrast is the real deliverable here and no test can judge it, which is why `20-discord-hover`
 sits beside `10-discord-view` in the screenshot set: the pair is the with-and-without evidence, and
 it was reviewed in both schemes because a tint that reads on white can vanish on `#1d2026`.
+`tests/keyboard_browser.py` counts the rows Chromium draws lit while a real mouse and real keys take
+turns, and requires one.
 
 ### Replying from the page
 
