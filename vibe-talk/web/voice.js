@@ -14570,7 +14570,8 @@ function renderChannelRows() {
 // IT MARKS NOTHING, AND ONLY THE OWNER MOVES IT. Setting it never marks a message Done. Besides his
 // Shift+B, the one thing that moves it is a Done of his own: on the message right under the line,
 // which slides it down to the next message still to read (`singleDoneBump`), or a Done through here
-// at or below it (`throughBump`). Those moves are conditional (`if_revision`), so they can never
+// at or below it (`throughBump`); in a thread, never past a message of Main's still to read
+// (`heldBackByMain`). Those moves are conditional (`if_revision`), so they can never
 // undo a move made on the other device meanwhile, and Undo takes them back too. A message arriving
 // never moves it, and nor does putting one back.
 //
@@ -14633,16 +14634,20 @@ function isBookmarkState(value) {
     (anchor.place === "above" || anchor.place === "below") && typeof anchor.timestamp === "string");
 }
 
-/** The anchor for the line just above `row` (`above`), or just below it (`below`). */
-function anchorOfRow(row, place) {
-  const held = rowMessages(row);
-  const message = place === "below" ? held[held.length - 1] : held[0];
-  if (!message) return null;
+/** The anchor for the line just above `message` (`above`), or just below it (`below`). */
+function anchorOfMessage(message, place) {
   /** @type {VibeTalk.BookmarkAnchor} */
   const anchor = { message_id: String(message.id), place, timestamp: String(message.timestamp || "") };
   const thread = threadOf(message);
   if (thread) anchor.thread_id = thread;
   return anchor;
+}
+
+/** The anchor for the line just above `row` (`above`), or just below it (`below`). */
+function anchorOfRow(row, place) {
+  const held = rowMessages(row);
+  const message = place === "below" ? held[held.length - 1] : held[0];
+  return message ? anchorOfMessage(message, place) : null;
 }
 
 /** Forget every channel's bookmark: another credential. */
@@ -14897,10 +14902,7 @@ function adoptLegacyMarker() {
   const at = Math.max(0, messages.findIndex((message) => String(message.id) === id));
   const message = messages[at];
   if (!message) return;
-  /** @type {VibeTalk.BookmarkAnchor} */
-  const anchor = { message_id: id, place: "above", timestamp: String(message.timestamp || "") };
-  if (threadOf(message)) anchor.thread_id = threadOf(message);
-  const move = stageBookmark(channel, anchor);
+  const move = stageBookmark(channel, anchorOfMessage(message, "above"));
   redrawBookmark();
   guardQuietly(() => sendBookmark(move, { conditional: true, quiet: true }))();
 }
@@ -15024,10 +15026,66 @@ function slideTarget(rows, at, done) {
 }
 
 /**
+ * From when the page holds every message Main shows: by Main's own cover, or All's, which holds
+ * Main's messages too. -Infinity for the whole history; Infinity when no cover says.
+ */
+function mainHeldFrom() {
+  let from = Infinity;
+  for (const key of [viewKey("main"), viewKey("flat")]) {
+    const cover = channelCanon.views.get(key);
+    if (!cover) continue;
+    if (!cover.more) return -Infinity;
+    if (cover.floor !== null) from = Math.min(from, cover.floor);
+  }
+  return from;
+}
+
+/**
+ * A slide worked out in a THREAD, held back so it never carries Main's line past a message of Main's
+ * still to read. Null when the store cannot say what Main holds there; `to` itself everywhere else.
+ *
+ * A thread is not the channel. Its rows skip every message posted to the channel itself between
+ * them, and Main draws the same line among those by time (`bookmarkTarget`): a Done on a root in its
+ * thread that slid the line to a reply posted an hour later put Main's line an hour on, past every
+ * unread message of that hour, which the Done in Main would have stopped at. So the slide stops at
+ * the first message of Main's, from the line to where the thread's rows took it, that is still to
+ * read — Main's read state is the store's (`replyTally`), with the Done itself — and the line goes
+ * above it, which takes it out of the thread and leaves it where the reader of Main left off. When
+ * none is, the slide stands and the thread keeps its line. Main and All need nothing of the sort:
+ * All holds every message, and Main is the list the others are measured against.
+ *
+ * @param {VibeTalk.BookmarkAnchor | null} to the slide over the thread's own rows
+ * @param {{row: HTMLElement, place: string}} target where the line is drawn in the thread now
+ * @param {HTMLElement[]} rows the thread's rows
+ * @param {Set<string>} done the read state the slide was worked out with
+ * @returns {VibeTalk.BookmarkAnchor | null}
+ */
+function heldBackByMain(to, target, rows, done) {
+  if (!to || !threadingSupported || channelView !== "thread") return to;
+  if (channelCanon.channel !== currentChannelId()) return null;
+  const anchor = bookmarkAnchor();
+  const times = [Date.parse(String(anchor ? anchor.timestamp : "")), rowSentMs(target.row)].filter(Number.isFinite);
+  const until = Date.parse(String(to.timestamp));
+  if (times.length === 0 || !Number.isFinite(until)) return null;
+  const from = Math.min(...times);
+  // Messages of Main's older than its covers reach may be missing from the store, unread or not.
+  if (from < mainHeldFrom()) return null;
+  const thread = String(selectedThreadId);
+  const mine = new Set(rows.flatMap(idsOf));
+  const read = new Set([...channelCanon.dismissed, ...done]);
+  const passed = (at) => at >= from && (to.place === "below" ? at <= until : at < until);
+  const stop = channelCanon.messages.find((message) => inView(message, "main", null) &&
+    threadOf(message) !== thread && !mine.has(String(message.id)) &&
+    passed(timeOf(message, "timestamp")) && stillToDo(message, read));
+  return stop ? anchorOfMessage(stop, "above") : to;
+}
+
+/**
  * A Done on `ids`, with the line right above the row they make Done: the line slides down past
  * every row already read and stops above the first still to read — the row e selects next
- * (`unreadAfter`), so the bookmark and the selection stay together — or below the last row. Null
- * when the line is anywhere else, or the row is not wholly Done by this.
+ * (`unreadAfter`), so the bookmark and the selection stay together — or below the last row; in a
+ * thread, no further than Main's next message still to read (`heldBackByMain`). Null when the line
+ * is anywhere else, or the row is not wholly Done by this.
  */
 function singleDoneBump(ids) {
   const channel = currentChannelId();
@@ -15039,13 +15097,14 @@ function singleDoneBump(ids) {
   const rows = /** @type {HTMLElement[]} */ ([...el("discord-log").children]).filter((row) => row.hasAttribute("data-id") && rowShown(row));
   const at = rows.indexOf(target.row);
   if (at < 0) return null;
-  const to = slideTarget(rows, at, done);
+  const to = heldBackByMain(slideTarget(rows, at, done), target, rows, done);
   return to ? { channel, from: bookmarkAnchor(channel), to } : null;
 }
 
 /**
  * Done through `row`, with the line at or above it: the line slides as for one Done and lands below
- * `row`, past every row the act makes Done. A line below `row` stays where it is.
+ * `row`, past every row the act makes Done — in a thread, no further than Main's next message still
+ * to read, which it does not mark (`heldBackByMain`). A line below `row` stays where it is.
  */
 function throughBump(row) {
   const channel = currentChannelId();
@@ -15058,7 +15117,7 @@ function throughBump(row) {
   if (at < 0 || line < 0 || line > at) return null;
   const all = [...list.children];
   const done = new Set([...archivedIds, ...all.slice(0, all.indexOf(row) + 1).flatMap(idsOf)]);
-  const to = slideTarget(rows, at, done);
+  const to = heldBackByMain(slideTarget(rows, at, done), target, rows, done);
   return to ? { channel, from: bookmarkAnchor(channel), to } : null;
 }
 
@@ -20233,8 +20292,10 @@ async function dismissMessages(body, bump = body.messages ? singleDoneBump(body.
   // `#229 desktop-two-column`. Done is the message's, so the other column shows it Done as well.
   const column = activeColumn;
   const mirrored = mirrorArchived(requested, true);
-  // Before the redraw, so the line moves with the row it was over.
+  // Before the redraw, so the line moves with the row it was over; and in the other column, whose own
+  // redraw (`mirrorArchived`) came before it, or never came, when it draws none of these messages.
   const move = bump ? stageBookmark(bump.channel, bump.to) : null;
+  if (move) inOtherColumn(renderScrollTools);
   await refreshAfterInboxChange();
   renderTodoControls();
   setStatus(`Saving ${requested.length} local change${requested.length === 1 ? "" : "s"}…`);

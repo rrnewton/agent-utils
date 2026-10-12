@@ -37449,4 +37449,119 @@ test("`#240 reading-bookmark`: a Done in the thread on the right slides the line
   assert.deepStrictEqual(bookmarkAt(page, "side-log"), { id: "204", place: "above" }, "the Done in the thread did not slide the line");
   assert.equal(page.bookmark.anchor.message_id, "204");
   assert.equal(page.bookmark.anchor.thread_id, "spaces/A/threads/another", "the slide lost the thread");
+  // Nothing of Main's lies between the root and its reply, so Main on the left goes past both, by time.
+  assert.deepStrictEqual(bookmarkAt(page), { id: "203", place: "below" }, "the left column did not follow the slide");
+});
+
+/**
+ * `#240 reading-bookmark`. A channel whose thread T, rooted at 301, has its reply 304 posted after
+ * two messages to the channel itself, 302 and 303: Main is 300, 301, 302, 303, 305, and T is 301,
+ * 304. `extra(t)`, given T's record, makes messages to go on the end, later than those.
+ */
+function lateReplyThread(extra = () => []) {
+  const t = { id: "spaces/A/threads/late", root_message_id: "301", is_root: true, reply_count: 1, reply_count_exact: true };
+  const messages = [
+    message({ id: "300", content: "main a" }),
+    message({ id: "301", content: "the root", thread: t }),
+    message({ id: "302", content: "main b, between the root and its reply" }),
+    message({ id: "303", content: "main c" }),
+    message({ id: "304", content: "the late reply", thread: { ...t, is_root: false } }),
+    message({ id: "305", content: "main d" }),
+  ];
+  messages.push(...extra(t));
+  const threads = [{ id: t.id, root: messages[1], title: "Late", reply_count: 1, reply_count_exact: true,
+    updated_at: messages[4].timestamp }];
+  return { messages, threads, thread: t };
+}
+
+/** A one-column page on `lateReplyThread`, in Main. */
+async function lateReplyPage(extra = () => []) {
+  const page = newPage();
+  const data = lateReplyThread(extra);
+  page.threadingSupported = true;
+  page.threads = data.threads;
+  await signIn(page);
+  await showDiscord(page, data.messages);
+  await pickThread(page, "main");
+  assert.deepStrictEqual(shownIds(page), ["300", "301", "302", "303", "305"]);
+  return { page, data };
+}
+
+test("`#240 reading-bookmark`: a Done on a root in its own thread stops the line at Main's next unread message, not the thread's late reply", async () => {
+  const { page } = await lateReplyPage();
+  await bookmarkRow(page, "301");
+  await threadBadge(rowWithId(page, "301")).click();
+  await page.settle();
+  assert.deepStrictEqual(shownIds(page), ["301", "304"]);
+  assert.deepStrictEqual(bookmarkAt(page), { id: "301", place: "above" }, "the root's thread drew no line");
+  await doneButton(rowWithId(page, "301")).click();
+  await page.settle();
+  assert.equal(page.bookmark.anchor.message_id, "302",
+    "a Done in the thread carried the bookmark past Main's unread messages to the thread's late reply");
+  assert.equal(page.bookmark.anchor.thread_id, undefined, "a message of Main's took a thread");
+  assert.equal(bookmarkAt(page), null, "the thread draws a line that is now in Main");
+  await press(page, page.el("thread-back"), "Escape");
+  await page.settle();
+  assert.deepStrictEqual(shownIds(page), ["300", "301", "302", "303", "305"]);
+  assert.deepStrictEqual(bookmarkAt(page), { id: "302", place: "above" },
+    "Main's line is not where the same Done in Main would have put it");
+});
+
+test("`#240 reading-bookmark`: ...Main's messages already Done are stepped over, and the line stays in the thread", async () => {
+  const { page } = await lateReplyPage();
+  page.dealtWith.add("302");
+  page.dealtWith.add("303");
+  await reReadChannel(page);
+  await bookmarkRow(page, "301");
+  await threadBadge(rowWithId(page, "301")).click();
+  await page.settle();
+  await doneButton(rowWithId(page, "301")).click();
+  await page.settle();
+  assert.deepStrictEqual(bookmarkAt(page), { id: "304", place: "above" }, "the line did not slide on in the thread past read messages of Main's");
+  assert.equal(page.bookmark.anchor.thread_id, "spaces/A/threads/late");
+  await press(page, page.el("thread-back"), "Escape");
+  await page.settle();
+  assert.deepStrictEqual(bookmarkAt(page), { id: "305", place: "above" }, "Main did not place the reply's line by time");
+});
+
+test("`#240 reading-bookmark`: ...nor does a Done on a reply in the thread, or Done through here there, carry Main's line past Main's unread", async () => {
+  // T is now 301, 304, 306: Main's 305 lies between its two replies.
+  const { page } = await lateReplyPage((t) => [message({ id: "306", content: "a later reply", thread: { ...t, is_root: false } })]);
+  await threadBadge(rowWithId(page, "301")).click();
+  await page.settle();
+  assert.deepStrictEqual(shownIds(page), ["301", "304", "306"]);
+  await bookmarkRow(page, "304");
+  await doneButton(rowWithId(page, "304")).click();
+  await page.settle();
+  assert.equal(page.bookmark.anchor.message_id, "305", "a Done on a reply carried the line past Main's unread message");
+  assert.equal(bookmarkAt(page), null);
+  // Done through here, from the root at the line, is held back the same way: at Main's first unread.
+  await bookmarkRow(page, "301");
+  await throughHere(page, "306");
+  assert.equal(page.bookmark.anchor.message_id, "302", "Done through here in the thread carried the line past Main's unread");
+  await press(page, page.el("thread-back"), "Escape");
+  await page.settle();
+  assert.deepStrictEqual(bookmarkAt(page), { id: "302", place: "above" });
+  assert.equal(page.dealtWith.has("302"), false, "Done through here in a thread marked a message of Main's");
+});
+
+test("`#240 reading-bookmark`: in two columns, a Done on the root in the thread on the right leaves the left's line at Main's next unread", async () => {
+  const { page } = await twoColumnServer((p, data) => {
+    const late = lateReplyThread();
+    p.threads = late.threads;
+    p.messages = late.messages;
+    data.threads = late.threads;
+    data.messages = late.messages;
+  });
+  assert.deepStrictEqual(shownIds(page), ["300", "301", "302", "303", "305"], "the left column is not Main");
+  await bookmarkRow(page, "301");
+  await threadBadge(rowWithId(page, "301")).click();
+  await page.settle();
+  assert.deepStrictEqual(sideIds(page), ["301", "304"]);
+  assert.deepStrictEqual(bookmarkAt(page, "side-log"), { id: "301", place: "above" });
+  await doneButton(sideRow(page, "301")).click();
+  await page.settle();
+  assert.equal(page.bookmark.anchor.message_id, "302", "the Done on the right carried the bookmark past Main's unread");
+  assert.deepStrictEqual(bookmarkAt(page), { id: "302", place: "above" }, "the left column's line skipped Main's unread messages");
+  assert.equal(bookmarkAt(page, "side-log"), null, "the right column kept a line that is now in Main");
 });
