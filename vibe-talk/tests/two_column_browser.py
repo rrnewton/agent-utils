@@ -403,10 +403,11 @@ def columns_walk(desk: Desk) -> None:
     desk.notes.append("at 900px one column in All with the button gone; wide again, two with the same thread")
 
     # The keys, pressed for real: ] to the right column, Esc its X, j to a card with a ring, Enter
-    # selects it, [ back to the left column.
+    # selects it, [ back to the left column. The mouse crossed the right column above, and a real move
+    # over a message selects it (`#239 single-selection`), so ] lands on that message, inside the column.
     page.focus("#scroll-area")
     page.keyboard.press("]")
-    desk.wait_for("() => document.activeElement === document.getElementById('side-scroll')",
+    desk.wait_for("() => document.getElementById('side-scroll').contains(document.activeElement)",
                   "] did not give the keys to the right column")
     page.keyboard.press("Escape")
     desk.wait_for("() => !document.getElementById('side-list').hidden", "Esc in the right column did not close its thread")
