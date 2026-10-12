@@ -18,7 +18,7 @@ under a person's fingers, and measures the list that is on screen:
   list has the focus again -> `#248 composer-key`: Ctrl+S goes to the message box from the list,
   from the search field while typing in it, and from Settings, the browser's own Save page refused
   every time, and Ctrl+Enter off any box goes there too, a held one sending nothing from the box it
-  reached, from the list or from Reply ->
+  reached, from the list or from Reply; on the call's view Ctrl+S goes to the agent's box ->
   "," opens Settings with its screen focused, PgDn scrolls Settings, Escape returns to the list
   where the reader was; Ctrl+, does the same -> in the channel's message box, PgUp pages the list
   while the box keeps the focus and the draft, Home and End move the caret, and Ctrl+Home and
@@ -596,6 +596,24 @@ def held_send_key(walk: Walk, api: FakeApi) -> None:
                       "Reply, and sent neither draft")
 
 
+def call_view_write_keys(walk: Walk) -> None:
+    """`#248 composer-key` with `#241 voice-composer`: on the call's view Ctrl+S goes to the agent's box."""
+    first_row = '#discord-log > li[data-id]'
+    walk.page.click("#view-switch")
+    walk.page.wait_for_function("() => document.getElementById('view-switch').getAttribute('aria-checked') === 'false'")
+    walk.page.focus("#scroll-area")
+    state = walk.key("Control+s")
+    check(walk.last_key()["prevented"] is True, "Ctrl+S on the call's view reached the browser's Save page")
+    check(state["view"] == "voice", f"Ctrl+S on the call's view left it for {state['view']!r}")
+    check(state["focus"] == "compose-text", f"Ctrl+S on the call's view left the focus on {state['focus']!r}")
+    walk.shot("ctrl-s-on-the-call")
+    walk.page.click("#view-switch")
+    walk.page.wait_for_selector(first_row, state="visible", timeout=10_000)
+    back = walk.settled()
+    check(back["view"] == "discord" and on_list(back), f"back on the channel the focus is on {back['focus']!r}")
+    walk.notes.append("on the call's view Ctrl+S went to the agent's message box, the Save page refused")
+
+
 def settings_keys(walk: Walk) -> None:
     """"," and Ctrl+, open Settings with its screen focused; PgDn scrolls it; Escape returns to the list unmoved."""
     walk.key("PageUp")
@@ -1127,6 +1145,7 @@ def main() -> int:
             search_keys(walk)
             write_keys(walk)
             held_send_key(walk, api)
+            call_view_write_keys(walk)
             settings_keys(walk)
             composer_keys(walk)
             keymap_keys(walk, api)

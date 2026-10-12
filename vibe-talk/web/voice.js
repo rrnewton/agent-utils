@@ -5362,10 +5362,21 @@ function undoFromKeyboard() {
   return true;
 }
 
-/** c: the box to write in: the channel's (a thread's, in a thread), or the reply's on Reply. */
+/**
+ * c: the box to write in: the channel's (a thread's, in a thread), the reply's on Reply, or on the
+ * call's view the agent's, under the transcript (`#241 voice-composer`). Going to the agent's box
+ * opens nothing: a conversation starts only when something is sent from it.
+ */
 function composeFromKeyboard() {
   if (currentScreen === "reply") {
     el("reply-text").focus();
+    return true;
+  }
+  if (currentScreen === "main" && currentView === "voice") {
+    const agent = leftEl("compose-text");
+    if (!shownNode(agent)) return false;
+    // Its own focus listener brings the whole box into view (`keepComposerInView`).
+    agent.focus();
     return true;
   }
   const box = el("channel-compose-text");
@@ -5383,10 +5394,10 @@ function composeFromKeyboard() {
  * in it)."
  *
  * The box is the one c chooses (`composeFromKeyboard`): the channel's, the thread's the reader is in
- * (on the right, in two columns, when the keys are there), or the reply's on Reply. Settings and Help
- * are left first, as their Back leaves them, because the box is on the screen they cover. The call's
- * view has no box this reaches yet, so there the chord does nothing. Returns whether it did anything;
- * the bindings that call it keep the browser's own default for the chord shut either way.
+ * (on the right, in two columns, when the keys are there), the reply's on Reply, or the agent's on
+ * the call's view. Settings and Help are left first, as their Back leaves them, because the box is on
+ * the screen they cover. Returns whether it did anything; the bindings that call it keep the
+ * browser's own default for the chord shut either way.
  */
 function writeFromKeyboard() {
   if (currentScreen === "settings" || currentScreen === "help") closeSettings();
@@ -5867,15 +5878,15 @@ const KEYMAP = [
   },
   {
     group: KEYS_WRITING, chords: [{ key: "c" }],
-    does: "Write to the channel, or in the thread you are in; on Reply, the reply",
-    controls: ["channel-compose-text", "reply-text"],
+    does: "Write to the channel, or in the thread you are in; on Reply, the reply; in the call view, to the agent",
+    controls: ["channel-compose-text", "reply-text", "compose-text"],
     run: () => composeFromKeyboard(),
   },
   {
     group: KEYS_WRITING, chords: [{ key: "s", mod: true }],
     does: "The message box c goes to, from anywhere: typing in the search, on Settings or on Help too. " +
       "Never the Save page of the browser",
-    controls: ["channel-compose-text", "reply-text"],
+    controls: ["channel-compose-text", "reply-text", "compose-text"],
     // Repeats so that a held chord's repeats are taken as well: each is the browser's Save page too.
     // The box is focused once.
     repeats: true,

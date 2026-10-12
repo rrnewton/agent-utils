@@ -3874,7 +3874,7 @@ from, so it cannot name a key the page does not answer.
 | Shift+P, Shift+L | The Pinned and Links filters |
 | `;`, `:` | Expand all, Collapse all |
 | `b` or `m` | Back to the bookmark, with the message under it selected |
-| `c` | Write to the channel (or the thread you are in); on Reply, the reply |
+| `c` | Write to the channel (or the thread you are in); on Reply, the reply; in the call view, to the agent |
 | Ctrl+S (Cmd+S) | The same box from anywhere: typing in the search, on Settings or Help too. The browser's "Save page" never opens |
 | Ctrl+Enter (Cmd+Enter) | In a message box, send; anywhere else, the message box, as Ctrl+S |
 | ↑ in the empty message box | Select the newest message |
@@ -3903,10 +3903,10 @@ from anywhere on a Mac too.
 
 `#248 composer-key`. Ctrl+S (Cmd+S) opened the search from `#224 keyboard-shortcuts` until the owner
 asked for it to do what it does in other chat clients: "When I'm using keyboard, I want to jump to text
-entry and start typing." It now goes to the box `c` goes to (the channel's, the thread's you are in, or
-the reply's on the Reply screen), from anywhere, including while you are typing in the search, and
-leaves Settings or Help first. The call's view has no box it reaches yet, so there it only keeps the
-browser's "Save page" shut. Ctrl+Enter (Cmd+Enter) does the same when the focus is not in a text box;
+entry and start typing." It now goes to the box `c` goes to (the channel's, the thread's you are in,
+the reply's on the Reply screen, or on the call's view the agent's box under the transcript), from
+anywhere, including while you are typing in the search, and leaves Settings or Help first. Going to
+the agent's box starts nothing: a conversation starts only when you send. Ctrl+Enter (Cmd+Enter) does the same when the focus is not in a text box;
 in a message box it sends, as before. Held down from outside a box, it goes to the box and leaves the
 draft there unsent: its repeats arrive in the box, and a repeat never sends. The search keeps `/` and
 the magnifying glass, and the Help list says where Ctrl+S went.

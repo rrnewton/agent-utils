@@ -18439,13 +18439,23 @@ test("Ctrl+S AND Cmd+S GO TO THE MESSAGE BOX from the list, the search field and
   event = await press(reply, reply.el("reply-scroll"), "/");
   assert.equal(event.defaulted, true, "\"/\" on Reply, where there is nothing to search, was taken anyway");
   assert.equal(reply.screen(), "reply", "\"/\" left the reply screen");
-  // On the call's view there is no box it reaches yet: nothing moves, and the Save page stays shut.
+  // On the call's view, the agent's box under the transcript (`#241 voice-composer`), in a call and
+  // with none: going there starts nothing.
   const call = newPage();
   await startTalking(call);
   call.el("scroll-area").focus();
   event = await press(call, call.el("scroll-area"), "s", { ctrlKey: true });
   assert.equal(event.defaulted, false, "Ctrl+S on the call's view was left to the browser's Save page");
-  assert.equal(focused(call), call.el("scroll-area"), `Ctrl+S on the call's view moved the focus to ${focusName(call)}`);
+  assert.equal(focused(call), call.el("compose-text"), `Ctrl+S on the call's view left the focus on ${focusName(call)}`);
+  const idle = newPage();
+  await signIn(idle);
+  assert.equal(idle.tab(), "voice", "a fresh page did not open on the call's view");
+  const writes = () => idle.requests.filter((request) => !request.startsWith("GET")).length;
+  const before = writes();
+  event = await press(idle, idle.el("scroll-area"), "s", { ctrlKey: true });
+  assert.equal(event.defaulted, false, "Ctrl+S on the call's view, with no call, was left to the browser's Save page");
+  assert.equal(focused(idle), idle.el("compose-text"), `Ctrl+S with no call left the focus on ${focusName(idle)}`);
+  assert.equal(writes(), before, "going to the agent's box started something");
   // Not with Shift's own chord or Alt, and not a bare "s", which reads the selected message aloud.
   for (const [key, fields] of [["s", { ctrlKey: true, altKey: true }], ["s", {}]]) {
     const other = await keyboardPage();
@@ -18531,6 +18541,36 @@ test("a HELD Ctrl+Enter outside a box goes to the box and sends NOTHING: its rep
     assert.equal(reply.repliesPosted.length, 0, `a held ${chord} on Reply sent the reply's draft`);
     assert.equal(reply.screen(), "reply", `a held ${chord} on Reply left the Reply screen`);
     assert.equal(reply.el("reply-text").value, draft, `a held ${chord} on Reply emptied the reply box`);
+
+    // On the call's view, in a call, with a draft waiting in the agent's box (`#241 voice-composer`).
+    const call = newPage();
+    const socket = await startTalking(call);
+    await compose(call, draft);
+    event = await press(call, call.el("scroll-area"), "Enter", fields);
+    assert.equal(focused(call), call.el("compose-text"), `a held ${chord} on the call's view left the focus on ${focusName(call)}`);
+    for (let i = 0; i < 3; i += 1) {
+      event = await press(call, focused(call), "Enter", { ...fields, repeat: true });
+      assert.equal(event.defaulted, false, `a held ${chord}'s repeat typed a new line in the agent's box`);
+    }
+    assert.equal(typedFrames(socket).length, 0, `a held ${chord} on the call's view sent the draft to the agent`);
+    assert.equal(call.el("compose-text").value, draft, `a held ${chord} on the call's view emptied the agent's box`);
+  }
+});
+
+test("c and Ctrl+Enter on the call's view go to the agent's box, as Ctrl+S does, and start nothing", async () => {
+  // `#248 composer-key` with `#241 voice-composer`: the box c goes to on the call's view is the agent's.
+  for (const [key, fields] of [["c", {}], ["Enter", { ctrlKey: true }], ["Enter", { metaKey: true }]]) {
+    const page = newPage();
+    await signIn(page);
+    assert.equal(page.tab(), "voice", "a fresh page did not open on the call's view");
+    const writes = () => page.requests.filter((request) => !request.startsWith("GET")).length;
+    const before = writes();
+    const what = `${Object.keys(fields).filter((f) => fields[f] === true).concat([key]).join("+")}`;
+    const event = await press(page, page.el("scroll-area"), key, fields);
+    assert.equal(event.defaulted, false, `${what} on the call's view was left to the browser`);
+    assert.equal(focused(page), page.el("compose-text"), `${what} on the call's view left the focus on ${focusName(page)}`);
+    assert.equal(page.el("compose-text").value, "", `${what} typed into the agent's box`);
+    assert.equal(writes(), before, `${what} on the call's view started something`);
   }
 });
 
@@ -19721,6 +19761,7 @@ test("aria-keyshortcuts names each control's key, from the same table, and drops
     [page.el("search-toggle"), "/"],
     [page.el("channel-compose-text"), "C Control+S Meta+S"],
     [page.el("reply-text"), "C Control+S Meta+S"],
+    [page.el("compose-text"), "C Control+S Meta+S"],
     [page.el("open-settings"), ", Control+, Meta+,"],
     [page.el("close-settings"), "Escape"],
     [page.el("thread-back"), "Escape ArrowLeft"],
