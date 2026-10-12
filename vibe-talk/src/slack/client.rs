@@ -607,6 +607,7 @@ impl Raw {
             content_html: String::new(),
             noise: false,
             reactions: None,
+            heading: None,
         })
     }
 }

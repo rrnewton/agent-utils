@@ -861,6 +861,8 @@ const SANITIZED_ATTRIBUTES = new Map([
   ["ul", new Set(["class"])],
   ["li", new Set(["class"])],
   ["span", new Set(["class"])],
+  // `#242 rich-headers`: `rh-src`, on a first paragraph the heading restates whole.
+  ["p", new Set(["class"])],
   ["input", new Set(["class", "type", "checked", "disabled"])],
   ["th", new Set(["align"])],
   ["td", new Set(["align"])],
@@ -32511,6 +32513,277 @@ test("the reaction strip wraps inside a phone's width and is drawn as labels in 
   assert.match(cssBlock(".reaction-count"), /color: var\(--muted\)/);
   assert.doesNotMatch(CSS_CODE, /\.reaction[\w-]*:hover/, "a chip changes under the pointer, as a control does");
   assert.equal(cssRules(CSS, ".meta .reactions").length, 0);
+});
+
+// `#242 rich-headers`. Agents posting through one shared account open with who they are, and the
+// server lifts the tag, time and title out of the first line as `heading`, with `cut`, how much of
+// the text they restate. The fixture's messages are in the shape the server sends: the plain bodies
+// carry no `content_html`, and the rendered ones carry the mark src/render.rs writes.
+
+const HEALTH = "[build-bot coordinator] Backup check, 10:52 PM ET. All 4 shards are synced.";
+const HEALTH_HEADING = { tag: "build-bot coordinator", time: "10:52 PM ET", title: "Backup check", cut: 51 };
+const metaOf = (li) => li.children.find((node) => node.className === "meta");
+const headOf = (li) => metaOf(li).children.find((node) => node.className === "rh-head");
+const boxesOf = (li) => li.children.find((node) => node.className === "body").children;
+/** A row's header pieces as `[class, text]`, or null when it has none. */
+const piecesOf = (li) => {
+  const head = headOf(li);
+  return head ? head.children.map((piece) => [piece.className, piece.textContent]) : null;
+};
+/** One drawn body as markup, so a test can say exactly what was built. */
+function markupOf(node) {
+  if (node.nodeType === 3) return node.textContent;
+  const tag = String(node.tagName).toLowerCase();
+  const cls = node.className ? ` class="${node.className}"` : "";
+  const inner = node.children.map(markupOf).join("");
+  return tag === "br" ? "<br>" : `<${tag}${cls}>${inner}</${tag}>`;
+}
+const bodyMarkup = (li, index = 0) => boxesOf(li)[index].children.map(markupOf).join("");
+
+test("an agent's heading is drawn in the row's header as text, and the words it restates are marked", async () => {
+  const page = newPage();
+  await signIn(page);
+  const rows = await showDiscord(page, [message({ id: "100", content: HEALTH, heading: HEALTH_HEADING })]);
+  assert.deepStrictEqual(piecesOf(rows[0]), [
+    ["rh-tag", "build-bot coordinator"], ["rh-title", "Backup check"], ["rh-time", "@10:52 PM ET"],
+  ]);
+  // After the time and before the row's buttons, and built of nothing but spans of text.
+  const meta = metaOf(rows[0]).children.map((node) => node.className);
+  assert.ok(meta.indexOf("rh-head") > meta.indexOf("msg-time"), `the header is not after the time: ${meta}`);
+  assert.ok(meta.indexOf("rh-head") < meta.indexOf("reply-button"), `the header is not before Reply: ${meta}`);
+  for (const node of headOf(rows[0]).descendants()) assert.equal(node.tagName, "span");
+  // The body is NOT cut: the restated words stay in it, in a span the stylesheet hides.
+  assert.equal(
+    bodyMarkup(rows[0]),
+    '<p><span class="rh-src">[build-bot coordinator] Backup check, 10:52 PM ET. </span>All 4 shards are synced.</p>'
+  );
+  assert.equal(boxesOf(rows[0])[0].getAttribute("data-rh"), "");
+  assert.equal(rows[0].getAttribute("data-rh-len"), "48", "45 characters of tag, title and time");
+  // Search and the text a row says read the message as written.
+  await search(page, "Backup check, 10:52");
+  await page.settle();
+  assert.ok(!rows[0].hasClass("search-hidden"), "the restated words stopped being searchable");
+});
+
+test("a rendered body's mark is the server's, and a heading whose words are not marked is not shown", async () => {
+  const page = newPage();
+  await signIn(page);
+  const list = "[build-bot] Status, 9:05 AM ET:\n- one\n- two";
+  const heading = { tag: "build-bot", time: "9:05 AM ET", title: "Status", cut: 31 };
+  const rows = await showDiscord(page, [
+    message({
+      id: "100", content: list, heading,
+      content_html: '<p class="rh-src">[build-bot] Status, 9:05 AM ET:</p>\n<ul>\n<li>one</li>\n<li>two</li>\n</ul>\n',
+    }),
+    // A body whose HTML carries no mark: an older copy, or anything else. Drawn as written.
+    message({
+      id: "101", content: list, heading,
+      content_html: "<p>[build-bot] Status, 9:05 AM ET:</p>\n<ul>\n<li>one</li>\n<li>two</li>\n</ul>\n",
+    }),
+  ]);
+  assert.deepStrictEqual(piecesOf(rows[0]).map(([, text]) => text), ["build-bot", "Status", "@9:05 AM ET"]);
+  assert.ok(boxesOf(rows[0])[0].hasAttribute("data-rh"));
+  assert.equal(piecesOf(rows[1]), null, "a heading was shown over words nothing marks for hiding");
+  assert.ok(!boxesOf(rows[1])[0].hasAttribute("data-rh"));
+  assert.ok(!rows[1].hasAttribute("data-rh-len"));
+});
+
+test("a plain body is marked as the server marks a rendered one, line break and paragraph included", async () => {
+  const page = newPage();
+  await signIn(page);
+  const heading = (cut) => ({ tag: "build-bot", title: "Status", cut });
+  const rows = await showDiscord(page, [
+    // The words use up the line and the paragraph goes on: the line break is theirs.
+    message({ id: "100", content: "[build-bot] Status:\nAll green.\nNothing else.", heading: heading(19) }),
+    // The line is the whole paragraph: the paragraph carries the mark.
+    message({ id: "101", content: "[build-bot] Status:\n\nAll green.", heading: heading(19) }),
+    // CRLF: the carriage return is in the cut, so the line is used up.
+    message({ id: "102", content: "[build-bot] Status:\r\nAll green.", heading: heading(20) }),
+  ]);
+  assert.equal(bodyMarkup(rows[0]), '<p><span class="rh-src">[build-bot] Status:<br></span>All green.<br>Nothing else.</p>');
+  assert.equal(bodyMarkup(rows[1]), '<p class="rh-src">[build-bot] Status:</p><p>All green.</p>');
+  assert.equal(bodyMarkup(rows[2]), '<p><span class="rh-src">[build-bot] Status:\r<br></span>All green.</p>');
+  // Marking adds no character and moves none: the row says what it said.
+  for (const li of rows) {
+    assert.equal(boxesOf(li)[0].text(), li.messages[0].content.replace(/\n+/g, ""));
+  }
+});
+
+test("a heading the page cannot draw is ignored, and the body drawn exactly as before", async () => {
+  const page = newPage();
+  await signIn(page);
+  const content = "[build-bot] Status:\nAll green.";
+  const rows = await showDiscord(page, [
+    message({ id: "100", content, heading: { tag: "build-bot", cut: 40 } }), // past the first line
+    message({ id: "101", content, heading: { tag: "build-bot", cut: 0 } }),
+    message({ id: "102", content, heading: { cut: 12 } }), // nothing to show
+    message({ id: "103", content, heading: "build-bot" }),
+    message({ id: "104", content }),
+  ]);
+  for (const li of rows) {
+    assert.equal(piecesOf(li), null, `row ${li.getAttribute("data-id")} drew a header`);
+    assert.equal(bodyMarkup(li), "<p>[build-bot] Status:<br>All green.</p>");
+  }
+});
+
+test("a heading's pieces are text, whatever they say", async () => {
+  const page = newPage();
+  await signIn(page);
+  const hostile = "<img src=x onerror=alert(1)>";
+  const rows = await showDiscord(page, [message({
+    id: "100", content: `[x] ${hostile}: body`, heading: { tag: hostile, title: hostile, time: hostile, cut: 4 },
+  })]);
+  assert.deepStrictEqual(piecesOf(rows[0]).map(([, text]) => text), [hostile, hostile, `@${hostile}`]);
+  assert.ok(!page.createdTags.includes("img"), "a heading's text became markup");
+});
+
+test("a combined row is headed by its first message, and the second keeps its first line as written", async () => {
+  const page = newPage();
+  await signIn(page);
+  const rows = await showDiscord(page, splitPost(
+    { content: "[build-bot] Release notes: three fixes", heading: { tag: "build-bot", title: "Release notes", cut: 27 } },
+    { content: "[build-bot] Follow-up: one new flag", heading: { tag: "build-bot", title: "Follow-up", cut: 23 } }
+  ));
+  assert.equal(rows.length, 1, "the fixture did not produce one combined row");
+  assert.deepStrictEqual(piecesOf(rows[0]).map(([, text]) => text), ["build-bot", "Release notes"]);
+  const [first, second] = boxesOf(rows[0]);
+  assert.ok(first.hasAttribute("data-rh"));
+  assert.ok(!second.hasAttribute("data-rh"), "the second message's first line would be hidden");
+  // Marked as the server would mark it, but nothing hides it without the box's attribute.
+  assert.equal(bodyMarkup(rows[0], 1), '<p><span class="rh-src">[build-bot] Follow-up: </span>one new flag</p>');
+});
+
+test("RICH HEADERS ARE ON BY DEFAULT, and the switch moves them without a redraw or a read, kept across a reload", async () => {
+  const page = newPage();
+  await signIn(page);
+  assert.equal(page.el("rich-headers").checked, true, "the default is not on");
+  assert.equal(page.documentElement.getAttribute("data-rich-headers"), "on");
+  const rows = await showDiscord(page, [message({ id: "100", content: HEALTH, heading: HEALTH_HEADING })]);
+  const row = rows[0];
+  const before = row.text();
+  const reads = page.pageReads;
+
+  await page.el("rich-headers").setChecked(false);
+  await page.settle();
+  assert.equal(page.documentElement.getAttribute("data-rich-headers"), "off");
+  assert.equal(page.storage.get("vibe-talk.voice.rich-headers"), "0", "the choice was not kept");
+  assert.equal(page.pageReads, reads, "flipping a display switch cost a round trip to the server");
+  assert.equal(page.el("discord-log").children[0], row, "the switch rebuilt the rows");
+  assert.equal(row.text(), before, "the switch changed what the row holds rather than what is drawn");
+
+  await page.el("rich-headers").setChecked(true);
+  assert.equal(page.documentElement.getAttribute("data-rich-headers"), "on");
+  assert.equal(page.storage.get("vibe-talk.voice.rich-headers"), "1");
+
+  await page.el("rich-headers").setChecked(false);
+  const again = reloadWith(page.storage, [message({ id: "100", content: HEALTH, heading: HEALTH_HEADING })]);
+  await signIn(again);
+  assert.equal(again.el("rich-headers").checked, false, "the switch came back on by itself");
+  assert.equal(again.documentElement.getAttribute("data-rich-headers"), "off");
+});
+
+test("off draws exactly the old row: the header hidden, the restated words shown, nothing cut short anywhere", () => {
+  assert.match(cssBlock(':root[data-rich-headers="off"] .rh-head'), /display: none/);
+  assert.match(cssBlock(':root:not([data-rich-headers="off"]) .md[data-rh] .rh-src'), /display: none/);
+  // Nothing else hides the restated words: off, they are an ordinary span and paragraph.
+  const hiding = [...CSS_CODE.matchAll(/([^{}]+)\{([^{}]*)\}/g)]
+    .filter((rule) => /\.rh-src/.test(rule[1]) && /display:\s*none/.test(rule[2]))
+    .map((rule) => rule[1].trim());
+  assert.deepStrictEqual(hiding, [':root:not([data-rich-headers="off"]) .md[data-rh] .rh-src']);
+  // The header is never cut short: no ellipsis, no clipping, no forced single line.
+  const rules = [...CSS_CODE.matchAll(/([^{}]+)\{([^{}]*)\}/g)].filter((rule) => /\.rh-/.test(rule[1]));
+  assert.ok(rules.length >= 5, "the header's rules are missing");
+  for (const [, selector, body] of rules) {
+    assert.doesNotMatch(body, /text-overflow|overflow:\s*hidden|white-space:\s*nowrap/, `${selector.trim()} can cut words`);
+  }
+  // A header that is not promoted is a line of its own, and wraps.
+  const head = cssBlock(".rh-head");
+  assert.match(head, /order: 99/);
+  assert.match(head, /flex-basis: 100%/);
+  assert.match(head, /flex-wrap: wrap/);
+  // A piece that is one long unbroken token (a commit hash) breaks inside the row, as a body does,
+  // rather than holding its whole width and pushing the header off a phone's screen.
+  const piece = cssBlock(".rh-head > span");
+  assert.match(piece, /overflow-wrap: anywhere/, "a long token in a title spills out of its row");
+  assert.match(piece, /min-width: 0/, "a piece cannot be narrower than its longest token");
+  assert.match(cssBlock(".rh-tag"), /font-style: italic/);
+  assert.match(cssBlock(".rh-title"), /font-weight: 650/);
+  assert.match(cssBlock(".rh-time"), /color: var\(--muted\)/);
+});
+
+test("where a header goes is the stylesheet's, by list width and length class, from no layout read", () => {
+  // Each list is a size container, and every length class the page sets is promoted by exactly one
+  // container query, wider for a longer class. `long` never is.
+  assert.match(cssBlock("#discord-log"), /container: rows \/ inline-size/);
+  let previous = 0;
+  for (let length = 16; length <= 96; length += 8) {
+    const selector = `li.discord-message[data-rh-len="${length}"] > .meta > .rh-head`;
+    const blocks = cssRules(CSS_CODE, selector);
+    assert.equal(blocks.length, 1, `${selector} is promoted ${blocks.length} times`);
+    assert.match(blocks[0], /order: 0/);
+    assert.match(blocks[0], /flex-basis: auto/);
+    const query = new RegExp(`@container rows \\(min-width: ([\\d.]+)rem\\) \\{\\s*li\\.discord-message\\[data-rh-len="${length}"\\]`);
+    const width = Number((query.exec(CSS_CODE) || assert.fail(`no container query promotes ${length}`))[1]);
+    assert.ok(width > previous, `class ${length} is promoted at ${width}rem, not wider than the class before`);
+    previous = width;
+  }
+  assert.equal(cssRules(CSS_CODE, 'li.discord-message[data-rh-len="long"] > .meta > .rh-head').length, 0);
+  // Decided without reading layout: the length class comes from the strings.
+  const lengthClass = SCRIPT_CODE.slice(SCRIPT_CODE.indexOf("function headingLength"));
+  assert.doesNotMatch(lengthClass.slice(0, lengthClass.indexOf("\n}\n")), /getBoundingClientRect|offset|clientWidth|scrollWidth/);
+});
+
+test("a pin older than anything loaded is drawn with the heading the server found in its snapshot", async () => {
+  const page = newPage();
+  const loaded = message({ id: "300", content: "something newer" });
+  const old = message({ id: "150", content: HEALTH, author: "build-bot",
+    timestamp: new Date(Date.parse(loaded.timestamp) - 3_600_000).toISOString() });
+  page.pinned.set("150", { ...storedPin(old), heading: HEALTH_HEADING });
+  await signIn(page);
+  await showDiscord(page, [loaded]);
+  await showPinned(page);
+  assert.deepStrictEqual(pinnedIds(page), ["150"], "the fixture's pin is not drawn from its snapshot");
+  const row = page.el("pinned-log").children[0];
+  assert.deepStrictEqual(piecesOf(row).map(([, text]) => text), ["build-bot coordinator", "Backup check", "@10:52 PM ET"]);
+  assert.ok(boxesOf(row)[0].hasAttribute("data-rh"));
+});
+
+test("a heading that arrives with a later read redraws the Pinned list and the reply screen's earlier messages", async () => {
+  // Both lists are rebuilt only when what they draw changed, and a plain body's HTML is "" with or
+  // without a heading: a paren tag confirmed by a later read, or after a restart, brings a heading to
+  // a message whose text did not change. The heading has to be part of what they compare.
+  const plain = message({ id: "100", content: HEALTH, author: "build-bot" });
+  const later = message({ id: "101", content: "and so?" });
+  const headed = { ...plain, heading: HEALTH_HEADING };
+  const pieces = ["build-bot coordinator", "Backup check", "@10:52 PM ET"];
+
+  const page = newPage();
+  page.pinned.set("100", storedPin(plain));
+  await signIn(page);
+  await showDiscord(page, [plain, later]);
+  await showPinned(page);
+  assert.deepStrictEqual(pinnedIds(page), ["100"], "the fixture's pin is not drawn");
+  assert.equal(piecesOf(page.el("pinned-log").children[0]), null, "the fixture's pin already has a heading");
+  await refreshDiscord(page, [headed, later]);
+  await page.settle();
+  const pinned = page.el("pinned-log").children[0];
+  assert.deepStrictEqual((piecesOf(pinned) || []).map(([, text]) => text), pieces,
+    "the Pinned list kept the row drawn before its heading arrived");
+  assert.ok(boxesOf(pinned)[0].hasAttribute("data-rh"));
+
+  // The reply screen follows the store on a threaded channel's reads (`followReplyStore`).
+  const replying = newPage();
+  replying.threadingSupported = true;
+  replying.threads = [];
+  await signIn(replying);
+  await openReplyOn(replying, [plain, later], 1);
+  assert.deepStrictEqual(contextIds(replying), ["100"], "the fixture's earlier message is not drawn");
+  assert.equal(piecesOf(replying.el("reply-context").children[0]), null);
+  await refreshDiscord(replying, [headed, later]);
+  await replying.settle();
+  const earlier = replying.el("reply-context").children[0];
+  assert.deepStrictEqual((piecesOf(earlier) || []).map(([, text]) => text), pieces,
+    "the reply screen kept the earlier message drawn before its heading arrived");
 });
 
 /** A threaded channel in All whose first message, and a thread's root, carry reactions. */

@@ -524,7 +524,7 @@ pub fn events(
                     Some(crate::noise::filter_for(&state.app, &state.channel).await);
             }
             if let Some(noise) = &state.replay_noise {
-                judge(noise, state.markup, &mut held);
+                judge(noise, &state.app, &state.channel, state.markup, &mut held);
             }
             return Some((Ok(message_event(&held, true)), state));
         }
@@ -534,7 +534,7 @@ pub fn events(
         match state.receiver.recv().await {
             Ok(mut live) => {
                 let noise = crate::noise::filter_for(&state.app, &state.channel).await;
-                judge(&noise, state.markup, &mut live);
+                judge(&noise, &state.app, &state.channel, state.markup, &mut live);
                 Some((Ok(message_event(&live, false)), state))
             }
             Err(broadcast::error::RecvError::Lagged(missed)) => {
@@ -546,15 +546,31 @@ pub fn events(
     })
 }
 
-/// Decide whether one outgoing event's message is noise, and render its body for the page. A
-/// delete carries no text to judge.
+/// Decide whether one outgoing event's message is noise, and render its body and find its heading
+/// for the page. A delete carries no text to judge.
 ///
 /// Rendered on the way OUT, like the noise verdict, rather than when it was published: the tail is
-/// shared by every subscriber, and only this stream's reader is the page.
-fn judge(noise: &crate::noise::NoiseFilter, markup: crate::render::Markup, live: &mut LiveMessage) {
+/// shared by every subscriber, and only this stream's reader is the page. Its paren tag is recorded
+/// first, as a read records a window's (`#242 rich-headers`): the stream is how a new message
+/// reaches the page, and the next one from the same agent should not wait for a re-read.
+fn judge(
+    noise: &crate::noise::NoiseFilter,
+    app: &AppState,
+    channel: &ChannelId,
+    markup: crate::render::Markup,
+    live: &mut LiveMessage,
+) {
     if live.kind != LiveKind::Delete {
         noise.mark(std::slice::from_mut(&mut live.message));
-        live.message.content_html = crate::render::body_html(&live.message.content, markup);
+        let message = &mut live.message;
+        if let Some(tag) = crate::heading::paren_candidate(&message.content, message.author_is_bot)
+        {
+            app.headings
+                .record(channel, &message.author_id, &message.id, tag);
+        }
+        let confirmed = |tag: &str| app.headings.confirmed(channel, &message.author_id, tag);
+        (message.content_html, message.heading) =
+            crate::render::headed_body(&message.content, markup, message.author_is_bot, &confirmed);
     }
 }
 
@@ -1971,6 +1987,7 @@ mod tests {
             content_html: String::new(),
             noise: false,
             reactions: None,
+            heading: None,
         }
     }
 }

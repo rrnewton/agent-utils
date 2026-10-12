@@ -229,6 +229,25 @@ steps:
       classification: latency-bound
       rss_baseline_bytes: 1073741824
 
+  # `#242 rich-headers` in the browser engine: each headed row's tag, title and time drawn whole —
+  # beside the time and the buttons where the list is wide enough, as the row's first line where it
+  # is not — the words they restate hidden and every one of them in the header, a combined row's
+  # second message as written, the ⋯ menu over the row below, and the Settings switch drawing every
+  # first line as written across a reload, at a phone and a desk, in one column and two.
+  - group: check
+    job: rich-headers-browser
+    desc: rich headers laid out in current Chromium at a 412x915 Android viewport and a 1280x800 desk, one column and two
+    labels: [validation-vibe-talk]
+    cmd: cd vibe-talk && python3 tests/rich_headers_browser.py
+    jobs_flag: ""
+    timeout: 60
+    cpu_timeout: 30
+    hint:
+      resources: {browser: 1}
+      est_duration_s: 5
+      classification: latency-bound
+      rss_baseline_bytes: 1073741824
+
   # `#7 read-aloud-latency` in the browser engine: a prepared read audible within a second of the
   # tap while its audio arrives at speaking pace, a switch and a stop closing the response, and
   # only a read heard to its end archived. The `<audio src>` control must take seconds.

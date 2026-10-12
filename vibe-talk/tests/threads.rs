@@ -38,6 +38,7 @@ fn message(id: &str, content: &str, thread: bool) -> Message {
             reply_count_exact: true,
         }),
         reactions: None,
+        heading: None,
     }
 }
 

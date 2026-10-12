@@ -933,6 +933,7 @@ mod tests {
                     content_html: String::new(),
                     noise: false,
                     reactions: None,
+                    heading: None,
                 }])
             }
             async fn post_message(

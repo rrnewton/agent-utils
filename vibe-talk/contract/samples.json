@@ -384,8 +384,14 @@
         "author_id": "7",
         "author_is_bot": false,
         "channel_id": "100",
-        "content": "hello",
+        "content": "[build-bot] Status, 15:05Z. hello",
         "content_html": "<p><em>hello</em></p>\n",
+        "heading": {
+          "cut": 28,
+          "tag": "build-bot",
+          "time": "15:05Z",
+          "title": "Status"
+        },
         "id": "301",
         "noise": true,
         "reactions": [
@@ -440,8 +446,14 @@
       "author_id": "7",
       "author_is_bot": false,
       "channel_id": "100",
-      "content": "hello",
+      "content": "[build-bot] Status, 15:05Z. hello",
       "content_html": "<p><em>hello</em></p>\n",
+      "heading": {
+        "cut": 28,
+        "tag": "build-bot",
+        "time": "15:05Z",
+        "title": "Status"
+      },
       "id": "301",
       "noise": true,
       "reactions": [
@@ -524,8 +536,12 @@
         "author": "someone",
         "author_id": "7",
         "author_is_bot": true,
-        "content": "hello",
+        "content": "(ops2) hello",
         "content_html": "<p><strong>hello</strong></p>\n",
+        "heading": {
+          "cut": 7,
+          "tag": "ops2"
+        },
         "message_id": "301",
         "pinned_at_ms": 1790000000000,
         "thread_id": "t1",
@@ -585,8 +601,12 @@
           "author": "someone",
           "author_id": "7",
           "author_is_bot": true,
-          "content": "hello",
+          "content": "(ops2) hello",
           "content_html": "<p><strong>hello</strong></p>\n",
+          "heading": {
+            "cut": 7,
+            "tag": "ops2"
+          },
           "message_id": "301",
           "pinned_at_ms": 1790000000000,
           "thread_id": "t1",
@@ -676,8 +696,14 @@
           "author_id": "7",
           "author_is_bot": false,
           "channel_id": "100",
-          "content": "hello",
+          "content": "[build-bot] Status, 15:05Z. hello",
           "content_html": "<p><em>hello</em></p>\n",
+          "heading": {
+            "cut": 28,
+            "tag": "build-bot",
+            "time": "15:05Z",
+            "title": "Status"
+          },
           "id": "301",
           "noise": true,
           "reactions": [
@@ -785,8 +811,14 @@
           "author_id": "7",
           "author_is_bot": false,
           "channel_id": "100",
-          "content": "hello",
+          "content": "[build-bot] Status, 15:05Z. hello",
           "content_html": "<p><em>hello</em></p>\n",
+          "heading": {
+            "cut": 28,
+            "tag": "build-bot",
+            "time": "15:05Z",
+            "title": "Status"
+          },
           "id": "301",
           "noise": true,
           "reactions": [
@@ -943,8 +975,14 @@
           "author_id": "7",
           "author_is_bot": false,
           "channel_id": "100",
-          "content": "hello",
+          "content": "[build-bot] Status, 15:05Z. hello",
           "content_html": "<p><em>hello</em></p>\n",
+          "heading": {
+            "cut": 28,
+            "tag": "build-bot",
+            "time": "15:05Z",
+            "title": "Status"
+          },
           "id": "301",
           "noise": true,
           "reactions": [

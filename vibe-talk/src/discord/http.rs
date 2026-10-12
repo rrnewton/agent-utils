@@ -518,6 +518,7 @@ pub fn parse_message(value: &serde_json::Value) -> Result<Message, ChatError> {
         content_html: String::new(),
         noise: false,
         reactions: parse_reactions(value.get("reactions")),
+        heading: None,
     })
 }
 

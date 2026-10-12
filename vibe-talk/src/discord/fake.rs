@@ -339,6 +339,7 @@ impl FakeDiscord {
             reply_to: None,
             content: content.to_owned(),
             reactions: None,
+            heading: None,
         });
         id
     }

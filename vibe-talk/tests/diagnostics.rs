@@ -415,6 +415,7 @@ async fn a_channel_whose_messages_come_back_blank_warns_about_the_message_conten
                 content_html: String::new(),
                 noise: false,
                 reactions: None,
+                heading: None,
             }])
         }
         async fn post_message(

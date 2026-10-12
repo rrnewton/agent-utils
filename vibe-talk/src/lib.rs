@@ -45,6 +45,7 @@ pub mod diagnostics;
 pub mod directory;
 pub mod discord;
 pub mod elevenlabs;
+pub mod heading;
 pub mod http;
 pub mod link_labels;
 pub mod live;

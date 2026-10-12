@@ -257,6 +257,37 @@ pub struct Message {
     /// written by whoever made it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reactions: Option<Vec<Reaction>>,
+    /// The tag, time and title the message's first line states, for the page to show in the row's
+    /// header. `#242 rich-headers`; see [`crate::heading`].
+    ///
+    /// Filled where `content_html` is, on the routes only the page reads, and absent everywhere
+    /// else, including from a message nothing could be read from. When it is set, the part of the
+    /// first line it restates is marked in `content_html` (or, for a plain body, is
+    /// `content[..cut]`), so the page can hide those words while it shows the heading and draw them
+    /// exactly as before when it does not.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub heading: Option<Heading>,
+}
+
+/// What a message's first line says about it, lifted out for the row's header. `#242
+/// rich-headers`.
+///
+/// Every piece is UNTRUSTED plain text out of `content`, to be drawn as text. Flat and optional
+/// throughout, so the contract can grow without an older page refusing the row.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct Heading {
+    /// Who the message says wrote it: `build-bot coordinator`, `ops2`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tag: Option<String>,
+    /// The clock time the message states, exactly as written: `10:52 PM ET`, `15:05Z`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub time: Option<String>,
+    /// The short title it opens with, emphasis markers removed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    /// How much of `content`, from its start, the heading restates, in UTF-16 code units: the
+    /// length a page's string indexes by. Always within the first line.
+    pub cut: u32,
 }
 
 /// One emoji's tally on one message. `#219 emoji-reactions`.
@@ -399,6 +430,7 @@ mod tests {
             content_html: String::new(),
             noise: false,
             reactions: None,
+            heading: None,
         }
     }
 

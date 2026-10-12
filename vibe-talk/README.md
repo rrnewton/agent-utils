@@ -192,6 +192,15 @@ between colons. A post combined from several messages shows one row of chips, ea
 over all of them. Reactions reach the page with the next read, so they can trail the message by a
 refresh. Discord and a compatible bridge report them; the Slack backend does not yet.
 
+**An agent's own heading moves into the header.** Agents posting through one shared account often
+open a message with who they are, a title and a time — `[build-bot coordinator] Backup check, 10:52
+PM ET. All shards are synced.` That first line is drawn in the row's header instead: the tag in quiet
+italics, the title in bold and the time after an `@`, beside the row's own time where a wide screen
+has room, and as the row's first line under the buttons where it does not, as on a phone. Nothing is
+dropped either way, and copying, searching and reading aloud use the message as written. **Rich
+headers** in Settings turns it off, and every first line is drawn as written. See
+[Rich headers](#rich-headers).
+
 **A normal text box at the bottom.** Scroll below the newest message to write to the channel or
 selected thread. **Send** posts without requiring a message to reply to. Drafts are kept separately
 for each channel and thread. This composer scrolls with history.
@@ -3158,6 +3167,41 @@ to it — which is why `content` still travels beside `content_html`.
 The page, its script and its JSON travel **compressed** — brotli or gzip, as the browser offers —
 and the live stream and read-aloud audio do not: an event has to reach the page when it happens,
 not when a compressor's buffer fills, and audio is compressed already.
+
+### Rich headers
+
+`#242 rich-headers`. The server looks at the first line of every message it renders for the page
+(`src/heading.rs`) for a heading an agent wrote, and sends what it finds as `heading`: `tag`, `time`
+and `title`, each optional and each plain text, and `cut`, how much of `content` they restate, in
+UTF-16 units. A message it is not sure of has no `heading`, and is drawn as it always was.
+
+- **A tag is required**: a leading `[tag]` of one to four words, or a one-word `(tag)` — leading, or,
+  from a bot account only, trailing a title as in `Release notes (ops2):` — that the same author has
+  opened at least two messages in the channel with. A paren tag needs that second message because a
+  parenthesis opens plenty of ordinary sentences; the server remembers recent paren tags per channel
+  and author, in memory and bounded, from every read, the live stream and the pins it serves. A
+  link, a checkbox, a footnote, `[1/3]`, `(edited)`, `(cont.)` or an aside such as `(thanks)` is
+  never a tag.
+- **The title** is the rest of the first sentence, up to `:`, `.`, `?` or `!`, with emphasis around
+  the whole of it unwrapped. It is left out when it is over 80 characters, holds any other markup
+  (an emoji shortcode such as `:tada:` included), or ends mid-line in a full stop with no time, as a
+  reply's `Yes. The run…` does.
+- **The time** is one clock, `10:52 PM ET`, `15:05Z`, kept as written, and only from just after the
+  tag, the end of the sentence, or parentheses inside it. A time anywhere else means no time and no
+  title; another parenthesised aside stays in the title, times and all.
+
+**The body is not cut.** The restated words stay in it, marked: in a rendered body the server wraps
+them in `<span class="rh-src">` (or gives the class to a first paragraph they fill), only when the
+body provably begins with their own rendering, and the sanitizer keeps that one class; a plain body
+stays empty and the page marks `content[..cut]` itself. The page hides the marked words while it
+shows the heading, so turning **Rich headers** off draws every row exactly as before, and nothing
+that reads the text — Copy text, speech, search, the Links filter — sees a difference.
+
+**Where the heading goes is decided by the stylesheet.** Each headed row carries a length class from
+its strings alone, and each list is a CSS size container: a class joins the header line only where
+the list is wide enough for it beside the row's buttons, and is otherwise the row's first line. No
+layout is read, and nothing is cut short with an ellipsis. Like `content_html`, `heading` is sent
+only on the routes the page reads.
 
 ### Finding something in what is on screen
 

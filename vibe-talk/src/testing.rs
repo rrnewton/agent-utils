@@ -268,6 +268,7 @@ fn state_pieces_with(
         hidden_channels: Arc::new(std::sync::RwLock::new(std::collections::BTreeSet::new())),
         channel_registration_lock: Arc::new(tokio::sync::Mutex::new(())),
         voice_health_budget: Arc::new(crate::voice_health::LogBudget::new()),
+        headings: Arc::new(crate::heading::HeadingTags::new()),
         speech_tickets: Arc::new(crate::speech_tickets::SpeechTickets::new()),
         post_gate: Arc::new(crate::post_gate::PostGate::new()),
         spoken_names: Arc::new(crate::speakable::SharedNames::new()),

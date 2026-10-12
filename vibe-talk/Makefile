@@ -10,7 +10,7 @@
 # tool's lightweight unboxed gate. The root includes `tests.dag.yaml` directly so vibe-talk shares
 # one scheduler and browser cap with the other repository fragments.
 
-.PHONY: validate validate-boxed dag-check fmt check scripts-check contract contract-check typecheck test page pwa-installability enter-to-send-browser offline-cache-browser reactions-browser read-aloud-browser post-confirm-browser view-switch-browser read-modes-browser keyboard-browser two-column-browser bookmark-browser voice-read-acceptance-self-test android-speech-self-test live-hint-adapter-self-test container-smoke clean
+.PHONY: validate validate-boxed dag-check fmt check scripts-check contract contract-check typecheck test page pwa-installability enter-to-send-browser offline-cache-browser reactions-browser rich-headers-browser read-aloud-browser post-confirm-browser view-switch-browser read-modes-browser keyboard-browser two-column-browser bookmark-browser voice-read-acceptance-self-test android-speech-self-test live-hint-adapter-self-test container-smoke clean
 
 # The whole gate for this tool, cheapest and most likely to fail first.
 #
@@ -124,6 +124,13 @@ offline-cache-browser:
 # SCREENSHOTS=dir to keep PNGs.
 reactions-browser:
 	python3 tests/reactions_browser.py $(if $(SCREENSHOTS),--screenshots $(SCREENSHOTS))
+
+# `#242 rich-headers` in a real Chromium: each agent's tag, title and time drawn whole in the row's
+# header where it fits and as its first line where it does not, the words they restate hidden and
+# none lost, at 412px and a desk (and two columns), and the Settings switch drawing every first line
+# as written, kept across a reload. Pass SCREENSHOTS=dir to keep PNGs.
+rich-headers-browser:
+	python3 tests/rich_headers_browser.py $(if $(SCREENSHOTS),--screenshots $(SCREENSHOTS))
 
 # `#7 read-aloud-latency` in a real Chromium: tap to audible against audio streamed at speaking
 # pace, a switch and a stop closing the response, and only a read heard to its end archived. Its

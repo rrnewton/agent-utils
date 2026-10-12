@@ -369,6 +369,42 @@
       ],
       "type": "object"
     },
+    "Heading": {
+      "description": "What a message's first line says about it, lifted out for the row's header. `#242\nrich-headers`.\n\nEvery piece is UNTRUSTED plain text out of `content`, to be drawn as text. Flat and optional\nthroughout, so the contract can grow without an older page refusing the row.",
+      "properties": {
+        "cut": {
+          "description": "How much of `content`, from its start, the heading restates, in UTF-16 code units: the\nlength a page's string indexes by. Always within the first line.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "tag": {
+          "description": "Who the message says wrote it: `build-bot coordinator`, `ops2`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "time": {
+          "description": "The clock time the message states, exactly as written: `10:52 PM ET`, `15:05Z`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "title": {
+          "description": "The short title it opens with, emphasis markers removed.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "cut"
+      ],
+      "type": "object"
+    },
     "LiveDeleteEvent": {
       "description": "The data of a live stream `message_delete` event: only the ids, never the removed text.",
       "properties": {
@@ -496,6 +532,17 @@
         "content_html": {
           "description": "The body as the page draws it: `content` rendered from Markdown and SANITIZED, by\n[`crate::render`]. `#217 markdown-blocks`.\n\nA third field for the same body, and it answers a third question: not what was written\n(`content`, which a copy keeps and the speech path falls back to) nor what a voice should\nsay (`spoken_content`), but what the reader should SEE — lists with bullets, paragraphs with\nspace between them, a link that is a link. HTML the server's sanitizer has already cut to a\nsmall allowlist, so the page inserts it as it stands and builds no markup of its own from\nchannel text.\n\nEMPTY means \"draw `content` as plain paragraphs\", by the convention `spoken_content`\nfollows: it is what a message carries before anything renders it — on every path toward a\nmodel, which has no use for HTML — and what it carries when rendering changed nothing,\nwhich is most chat. Filled only on the routes the page reads.",
           "type": "string"
+        },
+        "heading": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Heading"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The tag, time and title the message's first line states, for the page to show in the row's\nheader. `#242 rich-headers`; see [`crate::heading`].\n\nFilled where `content_html` is, on the routes only the page reads, and absent everywhere\nelse, including from a message nothing could be read from. When it is set, the part of the\nfirst line it restates is marked in `content_html` (or, for a plain body, is\n`content[..cut]`), so the page can hide those words while it shows the heading and draw them\nexactly as before when it does not."
         },
         "id": {
           "$ref": "#/$defs/MessageId",
@@ -731,6 +778,17 @@
         "content_html": {
           "description": "The snapshot's text as the page draws it, rendered and sanitized when the pin is SERVED,\nnever stored. It follows [`crate::model::Message::content_html`]'s convention: empty means\n\"draw the text as plain paragraphs\". `#217 markdown-blocks`.",
           "type": "string"
+        },
+        "heading": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Heading"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The snapshot's heading, found when the pin is SERVED and never stored, by\n[`crate::model::Message::heading`]'s rules. `#242 rich-headers`."
         },
         "message_id": {
           "$ref": "#/$defs/MessageId",

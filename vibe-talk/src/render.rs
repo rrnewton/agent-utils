@@ -89,6 +89,7 @@ use comrak::nodes::{AstNode, ListType, NodeList, NodeValue};
 use comrak::{Arena, Options};
 
 use crate::config::Config;
+use crate::heading::HeadingTags;
 use crate::model::{ChannelInfo, Message};
 
 /// How one provider writes message text, where that differs from GitHub-flavoured Markdown.
@@ -201,44 +202,157 @@ pub fn markup_for(config: &Config, channel: &ChannelInfo) -> Markup {
         .unwrap_or_default()
 }
 
-/// Fill [`Message::content_html`] for a batch read from `channel`.
+/// Fill [`Message::content_html`] and [`Message::heading`] for a batch read from `channel`.
 ///
 /// Called by the routes whose only reader is the page, and never by a path toward a model: the
 /// voice agent, the digest and the MCP tools read `content`, and HTML would be bytes in their
 /// context that say nothing to them.
-pub fn fill(config: &Config, channel: &ChannelInfo, messages: &mut [Message]) {
+///
+/// Every message's paren tag is recorded in `headings` BEFORE any heading is found, so a window
+/// that holds two of an author's `(tag)` messages confirms the tag for both. `#242 rich-headers`.
+pub fn fill(
+    config: &Config,
+    headings: &HeadingTags,
+    channel: &ChannelInfo,
+    messages: &mut [Message],
+) {
     let markup = markup_for(config, channel);
+    for message in messages.iter() {
+        if let Some(tag) = crate::heading::paren_candidate(&message.content, message.author_is_bot)
+        {
+            headings.record(&channel.id, &message.author_id, &message.id, tag);
+        }
+    }
     for message in messages {
-        message.content_html = body_html(&message.content, markup);
+        let confirmed = |tag: &str| headings.confirmed(&channel.id, &message.author_id, tag);
+        (message.content_html, message.heading) =
+            headed_body(&message.content, markup, message.author_is_bot, &confirmed);
     }
 }
 
 /// [`fill`] for a timeline page: its messages, and the first message of every thread it lists.
-pub fn fill_page(config: &Config, channel: &ChannelInfo, page: &mut crate::threads::TimelinePage) {
-    fill(config, channel, &mut page.messages);
+pub fn fill_page(
+    config: &Config,
+    headings: &HeadingTags,
+    channel: &ChannelInfo,
+    page: &mut crate::threads::TimelinePage,
+) {
+    fill(config, headings, channel, &mut page.messages);
     for summary in page.threads.iter_mut().chain(page.thread.iter_mut()) {
         if let Some(root) = &mut summary.root {
-            fill(config, channel, std::slice::from_mut(root));
+            fill(config, headings, channel, std::slice::from_mut(root));
         }
     }
 }
 
 /// [`fill`] for pins, whose text is the snapshot the store kept: cut to its bound and marked, in
 /// which case the ellipsis the page shows after it is rendered with it.
+///
+/// A pin is a message the server holds for the channel, so its paren tag is recorded as a read's
+/// are, before any heading is found: pins alone confirm a tag, with no read of the channel since
+/// this process started. The record counts message ids, so a pin of a message a read also served
+/// is still one message.
 pub fn fill_pins<'p>(
     config: &Config,
+    headings: &HeadingTags,
     channel: &ChannelInfo,
     pins: impl IntoIterator<Item = &'p mut crate::store::Pin>,
 ) {
     let markup = markup_for(config, channel);
+    let pins: Vec<&mut crate::store::Pin> = pins.into_iter().collect();
+    for pin in &pins {
+        let snapshot = &pin.snapshot;
+        if let Some(tag) =
+            crate::heading::paren_candidate(&snapshot.content, snapshot.author_is_bot)
+        {
+            headings.record(&channel.id, &snapshot.author_id, &snapshot.message_id, tag);
+        }
+    }
     for pin in pins {
         let snapshot = &pin.snapshot;
-        pin.content_html = if snapshot.truncated {
-            body_html(&format!("{}\u{2026}", snapshot.content), markup)
+        let text: Cow<'_, str> = if snapshot.truncated {
+            Cow::Owned(format!("{}\u{2026}", snapshot.content))
         } else {
-            body_html(&snapshot.content, markup)
+            Cow::Borrowed(&snapshot.content)
         };
+        let confirmed = |tag: &str| headings.confirmed(&channel.id, &snapshot.author_id, tag);
+        (pin.content_html, pin.heading) =
+            headed_body(&text, markup, snapshot.author_is_bot, &confirmed);
     }
+}
+
+/// [`body_html`] together with the heading the text opens with, when one is found and its words
+/// can be marked in the body. `#242 rich-headers`. `bot` and `confirmed` are
+/// [`crate::heading::extract`]'s: whether the author is a bot account, and whether a paren tag
+/// counts.
+///
+/// THE BODY IS NOT CUT. The words the heading restates, `text[..cut]`, stay in it, so a page that
+/// does not show the heading draws exactly what it drew before. They are marked instead, so a page
+/// that does show it can hide them:
+///
+/// - **A rendered body** has them wrapped in `<span class="rh-src">` — with the space after them,
+///   and with the line break after them when the heading uses the whole first line — or, when the
+///   first line is the whole first paragraph, carries the class on that `<p>`. Only when the body
+///   begins with a paragraph that begins with exactly what those words render to on their own; any
+///   other shape, and the message has no heading ([`mark_restated`]).
+/// - **A plain body** stays empty, as every plain body is, and the page marks `content[..cut]`
+///   itself as it draws the paragraphs. The same shape, from the same rule, so a plain body is not
+///   sent as HTML only to carry a class.
+#[must_use]
+pub fn headed_body(
+    text: &str,
+    markup: Markup,
+    bot: bool,
+    confirmed: &dyn Fn(&str) -> bool,
+) -> (String, Option<crate::model::Heading>) {
+    let html = to_html(text, markup);
+    let plain = html == plain_html(text);
+    let Some(found) = crate::heading::extract(text, bot, confirmed) else {
+        return (if plain { String::new() } else { html }, None);
+    };
+    let heading = found.wire(text);
+    if plain {
+        return (String::new(), Some(heading));
+    }
+    match mark_restated(&html, &text[..found.cut], markup) {
+        Some(marked) => (marked, Some(heading)),
+        None => (html, None),
+    }
+}
+
+/// The class on the words a heading restates. The page hides them while it shows the heading.
+pub const RESTATED_CLASS: &str = "rh-src";
+
+/// `html`, the rendering of a whole body, with the part that renders `prefix` marked as restated;
+/// `None` when the body does not begin that way.
+///
+/// The prefix is rendered on its own, and must be, character for character, the start of the body's
+/// first paragraph: that is the proof that the marked part draws exactly those words and nothing
+/// else. What follows it must be the rest of the line (a space), the line's end (a line break), or
+/// the paragraph's end. The marked string is then put through the sanitizer again and must come out
+/// unchanged, so nothing reaches the page that the sanitizer did not write.
+fn mark_restated(html: &str, prefix: &str, markup: Markup) -> Option<String> {
+    let alone = to_html(prefix, markup);
+    let words = alone.strip_prefix("<p>")?.strip_suffix("</p>\n")?;
+    if words.contains("<p>") || words.contains("</p>") {
+        return None;
+    }
+    let rest = html.strip_prefix("<p>")?.strip_prefix(words)?;
+    let open = format!("<span class=\"{RESTATED_CLASS}\">");
+    let marked = if rest.starts_with("</p>") {
+        format!("<p class=\"{RESTATED_CLASS}\">{words}{rest}")
+    } else {
+        let spaces = rest.len() - rest.trim_start_matches([' ', '\t']).len();
+        let (gap, after) = rest.split_at(spaces);
+        if let Some(after) = after.strip_prefix("<br>\n") {
+            format!("<p>{open}{words}{gap}<br>\n</span>{after}")
+        } else if spaces > 0 {
+            format!("<p>{open}{words}{gap}</span>{after}")
+        } else {
+            return None;
+        }
+    };
+    (SANITIZER.clean(&marked).to_string() == marked).then_some(marked)
 }
 
 /// The sanitized HTML for one body, or EMPTY when drawing `text` as plain paragraphs is the same
@@ -489,8 +603,8 @@ pub const TAGS: [&str; 26] = [
     "ul",
 ];
 
-/// The class a mention chip carries. The page styles it, and it is the only class a `span` may
-/// keep.
+/// The class a mention chip carries. The page styles it. The only other class a `span` may keep is
+/// [`RESTATED_CLASS`].
 pub const MENTION_CLASS: &str = "mention";
 
 /// The sanitizer, built once.
@@ -529,8 +643,13 @@ static SANITIZER: LazyLock<ammonia::Builder<'static>> = LazyLock::new(|| {
             ("a", HashMap::from([("target", "_blank")])),
             ("input", HashMap::from([("disabled", "")])),
         ]))
+        // `rh-src` marks the words a message's heading restates (`#242 rich-headers`, see
+        // `mark_restated`). Message text cannot write it: raw HTML in the source is escaped by
+        // comrak before the sanitizer sees anything, so the only markup that reaches it is markup
+        // this module made.
         .allowed_classes(HashMap::from([
-            ("span", HashSet::from([MENTION_CLASS])),
+            ("span", HashSet::from([MENTION_CLASS, RESTATED_CLASS])),
+            ("p", HashSet::from([RESTATED_CLASS])),
             ("ul", HashSet::from(["contains-task-list"])),
             ("ol", HashSet::from(["contains-task-list"])),
             ("li", HashSet::from(["task-list-item"])),
@@ -1733,10 +1852,12 @@ mod tests {
                  <h5>five</h5><u>u</u><svg><circle/></svg>",
             )
             .to_string();
+        // A paragraph may keep one class, `rh-src`, which only `mark_restated` writes (`#242
+        // rich-headers`); any other class it arrives with is emptied, as a span's is.
         assert_eq!(
             cleaned,
             format!(
-                "<p>a</p>\
+                "<p class=\"\">a</p>\
                  <a {LINK}>j</a><a {LINK}>d</a><a {LINK}>r</a>\
                  <a href=\"https://ok.test/\" {LINK}>ok</a><span class=\"mention\">@1</span>\
                  <input disabled=\"\">bfiveu"
@@ -2710,5 +2831,135 @@ mod tests {
             to_html(&stairs(6), Markup::Discord).matches("<ul>").count(),
             6
         );
+    }
+
+    // ---- `#242 rich-headers`: the words a heading restates, marked --------------------------
+
+    fn headed(text: &str, markup: Markup) -> (String, Option<crate::model::Heading>) {
+        super::headed_body(text, markup, true, &|_| true)
+    }
+
+    /// `html` with the restated words unmarked: what the page draws with rich headers off.
+    fn unmarked(html: &str) -> String {
+        let open = r#"<span class="rh-src">"#;
+        let mut out = html.replacen(r#"<p class="rh-src">"#, "<p>", 1);
+        if let Some(at) = out.find(open) {
+            out.replace_range(at..at + open.len(), "");
+            let close = out[at..].find("</span>").expect("the mark closes") + at;
+            out.replace_range(close..close + "</span>".len(), "");
+        }
+        out
+    }
+
+    #[test]
+    fn a_rendered_body_marks_the_words_its_heading_restates_and_changes_nothing_else() {
+        for (text, markup, expected) in [
+            // The rest of the line goes on: the words and the space after them.
+            (
+                "[build-bot] **Status, 9:05 AM ET.** All `green`.\nSecond line",
+                Markup::Discord,
+                "<p><span class=\"rh-src\">[build-bot] <strong>Status, 9:05 AM ET.</strong> \
+                 </span>All <code>green</code>.<br>\nSecond line</p>\n",
+            ),
+            // The line is the whole paragraph: the paragraph is marked.
+            (
+                "[build-bot] Status, 9:05 AM ET:\n- one\n- two",
+                Markup::Discord,
+                "<p class=\"rh-src\">[build-bot] Status, 9:05 AM ET:</p>\n\
+                 <ul>\n<li>one</li>\n<li>two</li>\n</ul>\n",
+            ),
+            // The line is used up and the paragraph goes on: the line break is marked with it.
+            (
+                "[build-bot] Status:\n**bold** next",
+                Markup::Discord,
+                "<p><span class=\"rh-src\">[build-bot] Status:<br>\n</span>\
+                 <strong>bold</strong> next</p>\n",
+            ),
+            // The same over CRLF, whose carriage return the cut counts.
+            (
+                "[build-bot] Status, 9:05 AM ET:\r\n**bold** next",
+                Markup::Discord,
+                "<p><span class=\"rh-src\">[build-bot] Status, 9:05 AM ET:<br>\n</span>\
+                 <strong>bold</strong> next</p>\n",
+            ),
+            // A tag alone: only the tag is marked.
+            (
+                "[build-bot] Fixed the `parser` crash: details",
+                Markup::Discord,
+                "<p><span class=\"rh-src\">[build-bot] </span>Fixed the <code>parser</code> \
+                 crash: details</p>\n",
+            ),
+            // A link after the words: the sanitizer's second pass leaves it as the first wrote it.
+            (
+                "[build-bot] Status: see https://example.com/run",
+                Markup::Discord,
+                "<p><span class=\"rh-src\">[build-bot] Status: </span>see <a \
+                 href=\"https://example.com/run\" target=\"_blank\" \
+                 rel=\"noopener noreferrer nofollow\">https://example.com/run</a></p>\n",
+            ),
+            // One asterisk is bold where the provider says so, and is unwrapped from the title.
+            (
+                "(ops2) *Midday summary, 15:05Z.* Nothing is stuck.",
+                Markup::GoogleChat,
+                "<p><span class=\"rh-src\">(ops2) <strong>Midday summary, 15:05Z.</strong> \
+                 </span>Nothing is stuck.</p>\n",
+            ),
+        ] {
+            let (html, heading) = headed(text, markup);
+            assert!(heading.is_some(), "{text:?}");
+            assert_eq!(html, expected, "{text:?}");
+            assert_eq!(unmarked(&html), to_html(text, markup), "{text:?}");
+        }
+    }
+
+    #[test]
+    fn a_plain_body_stays_empty_and_carries_its_heading() {
+        let text = "[build-bot] Status, 9:05 AM ET. All green.\nNothing else.";
+        let (html, heading) = headed(text, Markup::Discord);
+        assert_eq!(html, "");
+        let heading = heading.expect("a heading");
+        assert_eq!(heading.tag.as_deref(), Some("build-bot"));
+        assert_eq!(heading.time.as_deref(), Some("9:05 AM ET"));
+        assert_eq!(heading.title.as_deref(), Some("Status"));
+        assert_eq!(heading.cut, 32);
+        assert_eq!(&text[..32], "[build-bot] Status, 9:05 AM ET. ");
+    }
+
+    #[test]
+    fn a_body_that_does_not_begin_with_the_words_has_no_heading() {
+        // The tag is a link here, because a reference definition later in the message names it:
+        // the words alone render as text, the body does not begin with them, and the message is
+        // drawn as it always was.
+        let text = "[build-bot] Status: body\n\n[build-bot]: https://example.com";
+        let (html, heading) = headed(text, Markup::Discord);
+        assert_eq!(heading, None);
+        assert_eq!(html, to_html(text, Markup::Discord));
+        assert!(!html.contains("rh-src"));
+        // No heading at all: exactly `body_html`.
+        for text in [
+            "plain words",
+            "**bold** words",
+            "Backup check, 10:52 PM ET. All good.",
+        ] {
+            assert_eq!(
+                headed(text, Markup::Discord),
+                (body_html(text, Markup::Discord), None)
+            );
+        }
+    }
+
+    #[test]
+    fn message_text_cannot_write_the_mark() {
+        for text in [
+            "[build-bot] Status: <span class=\"rh-src\">hidden</span> and **more**",
+            "<p class=\"rh-src\">hidden</p>\n\n**more**",
+            "plain <span class=\"rh-src\">hidden</span> **more**",
+        ] {
+            let (html, _) = headed(text, Markup::Discord);
+            let marks = html.matches("<span class=\"rh-src\">").count()
+                + html.matches("<p class=\"rh-src\">").count();
+            let expected = usize::from(text.starts_with('['));
+            assert_eq!(marks, expected, "{text:?}: {html}");
+        }
     }
 }

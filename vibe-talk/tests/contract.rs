@@ -21,7 +21,7 @@ use vibe_talk::contract::{
     VibeTalkV1ClientFrame, VibeTalkV1ServerFrame,
 };
 use vibe_talk::conversation::{VoiceDescription, VoiceSession};
-use vibe_talk::model::{ChannelId, ChannelInfo, Message, MessageId, Reaction, UserId};
+use vibe_talk::model::{ChannelId, ChannelInfo, Heading, Message, MessageId, Reaction, UserId};
 use vibe_talk::speech::{Description, Playback};
 use vibe_talk::store::{
     Bookmark, BookmarkAnchor, BookmarkPlace, Pin, PinSnapshot, UpstreamClearMode,
@@ -76,6 +76,7 @@ fn message(id: &str) -> Message {
         content_html: String::new(),
         noise: false,
         reactions: None,
+        heading: None,
     }
 }
 
@@ -112,6 +113,15 @@ fn threaded_message(id: &str) -> Message {
                 count: 2,
             },
         ]),
+        // `#242 rich-headers`: every piece here, none on the plain sample, and a tag alone on the
+        // threaded pin.
+        content: "[build-bot] Status, 15:05Z. hello".into(),
+        heading: Some(Heading {
+            tag: Some("build-bot".into()),
+            time: Some("15:05Z".into()),
+            title: Some("Status".into()),
+            cut: 28,
+        }),
         ..message(id)
     }
 }
@@ -271,7 +281,7 @@ fn pin(id: &str, threaded: bool) -> Pin {
             author: "someone".into(),
             author_id: UserId("7".into()),
             author_is_bot: threaded,
-            content: "hello".into(),
+            content: if threaded { "(ops2) hello" } else { "hello" }.into(),
             truncated: threaded,
             timestamp: "2026-09-25T12:00:00+00:00".into(),
             thread_id: threaded.then(|| "t1".into()),
@@ -284,6 +294,12 @@ fn pin(id: &str, threaded: bool) -> Pin {
         } else {
             String::new()
         },
+        heading: threaded.then(|| Heading {
+            tag: Some("ops2".into()),
+            time: None,
+            title: None,
+            cut: 7,
+        }),
     }
 }
 
@@ -472,6 +488,7 @@ fn samples() -> Value {
             to(&threaded),
             to(&Message {
                 reactions: Some(Vec::new()),
+                heading: None,
                 ..message("302")
             }),
         ],

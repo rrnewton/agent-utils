@@ -114,6 +114,10 @@ pub struct AppState {
     /// Caps the lines `POST /api/v1/voice-health` writes, across every caller. Per process rather
     /// than per call because the server has no call id to count by, by design.
     pub voice_health_budget: Arc<crate::voice_health::LogBudget>,
+    /// The paren tags each author has started messages with, per channel: what confirms a
+    /// `(tag)` heading. `#242 rich-headers`; see [`crate::heading::HeadingTags`]. In memory and
+    /// bounded, shared by every read and the live stream.
+    pub headings: Arc<crate::heading::HeadingTags>,
 }
 
 fn added_channel_info(row: &AddedChannel, providers: &ChatRouter) -> ChannelInfo {

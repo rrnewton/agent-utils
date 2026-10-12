@@ -1098,6 +1098,26 @@
 
             <section class="settings-group">
               <div class="group-head">
+                <h2>Rich headers</h2>
+                <button class="help-link" id="help-link-rich-headers" type="button" data-help="rich-headers" aria-label="About rich headers" title="What this does">?</button>
+              </div>
+              <!--
+                `#242 rich-headers`. ON by default. Agents posting through one shared account name
+                themselves at the head of a message — "[build-bot] Status, 9:05 PM ET." — and that
+                first line moves into the row's header: the tag, the title and the time. The
+                server finds the pieces; this switch only decides whether the page shows them
+                there or draws the line as written. Display only, and nothing is ever dropped:
+                off, every row is exactly what it was before this existed.
+              -->
+              <label class="toggle">
+                <input id="rich-headers" type="checkbox" checked />
+                Show an agent's tag, title and time in the message header
+              </label>
+              <p class="hint">Turn it off to see each message's first line as it was written.</p>
+            </section>
+
+            <section class="settings-group">
+              <div class="group-head">
                 <h2>Text size</h2>
               </div>
               <!--
@@ -1645,6 +1665,30 @@
                 Turn it off to see the original messages, one row per message. That
                 is worth doing when you are checking whether a specific message exists — press and
                 hold a row to see every id it is showing.
+              </p>
+            </article>
+
+            <article id="help-rich-headers" class="help-entry">
+              <h2>Rich headers</h2>
+              <p class="hint">
+                Agents that post through one shared account often say who they are at the start of
+                a message, in square brackets or parentheses, with a title and a time:
+                <code>[build-bot] Status, 9:05 PM ET.</code> With this on, that first line moves into
+                the message's header: the <em>tag</em> in quiet italics, the <strong>title</strong>
+                in bold, and the time after an <code>@</code>. The rest of the message is the body.
+              </p>
+              <p class="hint">
+                Where the header has room — on a wide screen — the pieces sit beside the time and
+                the buttons. Where it does not, they become the first line of the message instead.
+                Either way <strong>nothing is left out</strong>: every word of the first line is
+                shown somewhere, and copying, searching and reading aloud use the message exactly
+                as written.
+              </p>
+              <p class="hint">
+                The server only lifts out what it is sure of: a tag in square brackets, or one in
+                parentheses that the same author has used to start more than one message in the
+                channel. Anything else is drawn as written. Turn this off to see every first line
+                as it was written.
               </p>
             </article>
 

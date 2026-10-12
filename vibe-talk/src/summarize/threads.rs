@@ -955,6 +955,7 @@ mod tests {
             spoken_time: String::new(),
             reply_to: None,
             reactions: None,
+            heading: None,
         };
         let mut messages = vec![message("0", "THE ROOT: the runner pool is down to one mac")];
         for n in 1..40 {

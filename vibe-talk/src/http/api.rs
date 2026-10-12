@@ -450,6 +450,7 @@ pub async fn ingest_event(
                 content_html: String::new(),
                 noise: false,
                 reactions: None,
+                heading: None,
             };
             (crate::live::LiveKind::Delete, channel_id, tombstone)
         }
@@ -489,7 +490,10 @@ pub async fn ingest_event(
     // matters most: it is HTML the page inserts as it stands, so only this server's renderer and
     // sanitizer may write it. Cleared here, for every kind, and rendered again on the way out to
     // each page by `live::judge`; no subscriber of the hub ever sees what an adapter put there.
+    // The heading goes with it: it names the words of `content_html` the page hides (`#242
+    // rich-headers`).
     message.content_html = String::new();
+    message.heading = None;
     if kind == crate::live::LiveKind::Delete {
         message.spoken_time = String::new();
         message.spoken_content = String::new();
@@ -1264,7 +1268,12 @@ pub async fn page(
     )
     .await?;
     if query.render == Some(RenderQuery::Html) {
-        crate::render::fill(&state.config, &step.channel, &mut step.messages);
+        crate::render::fill(
+            &state.config,
+            &state.headings,
+            &step.channel,
+            &mut step.messages,
+        );
     }
     let dismissed = ops::dismissed_within(&state, &step.channel.id, &step.messages).await?;
     let pins_revision = ops::pins_revision(&state, &step.channel.id).await;
@@ -1352,7 +1361,7 @@ pub async fn timeline(
     let (channel, mut page) = ops::timeline(&state, &channel_id, &request).await?;
     // `#217 markdown-blocks`. Here and not in `ops::timeline`: this route's only reader is the
     // page, and the operation under it is shared with paths toward a model.
-    crate::render::fill_page(&state.config, &channel, &mut page);
+    crate::render::fill_page(&state.config, &state.headings, &channel, &mut page);
     // `#182 thread-display-names`. Known names and sentences ride along on every thread list and
     // thread heading; due threads are queued for the background, and only for a caller with write
     // scope, because a read token never spends the model or fills the cache.
@@ -1756,8 +1765,13 @@ pub async fn reply(
     {
         Ok((channel, mut posted, mut parts)) => {
             // The page draws the acknowledged parts before any read brings them back.
-            crate::render::fill(&state.config, &channel, std::slice::from_mut(&mut posted));
-            crate::render::fill(&state.config, &channel, &mut parts);
+            crate::render::fill(
+                &state.config,
+                &state.headings,
+                &channel,
+                std::slice::from_mut(&mut posted),
+            );
+            crate::render::fill(&state.config, &state.headings, &channel, &mut parts);
             Ok(Json(ReplyResponse { posted, parts }).into_response())
         }
         // 207, not 200 and not 502. A machine caller reading only the status must not conclude
@@ -1954,8 +1968,13 @@ pub async fn commit_post(
     match ops::commit_proposal(&state, &request.handle, &restated, request.confirmed_by).await {
         Ok((serial, mut posted, mut parts)) => {
             if let Some(channel) = state.channel(&restated.channel_id) {
-                crate::render::fill(&state.config, &channel, std::slice::from_mut(&mut posted));
-                crate::render::fill(&state.config, &channel, &mut parts);
+                crate::render::fill(
+                    &state.config,
+                    &state.headings,
+                    &channel,
+                    std::slice::from_mut(&mut posted),
+                );
+                crate::render::fill(&state.config, &state.headings, &channel, &mut parts);
             }
             Ok(Json(crate::contract::CommittedPostResponse {
                 serial,
@@ -3018,7 +3037,12 @@ pub async fn todo(
     Query(query): Query<LimitQuery>,
 ) -> Result<Response, ApiError> {
     let mut todo = ops::todo(&state, &channel_id, query.limit).await?;
-    crate::render::fill(&state.config, &todo.channel, &mut todo.messages);
+    crate::render::fill(
+        &state.config,
+        &state.headings,
+        &todo.channel,
+        &mut todo.messages,
+    );
     let pins_revision = ops::pins_revision(&state, &todo.channel.id).await;
     let bookmark = ops::bookmark_state(&state, &todo.channel.id).await;
     Ok(no_store(Json(TodoResponse {
@@ -3178,7 +3202,7 @@ pub async fn pins(
     Path(channel_id): Path<String>,
 ) -> Result<Response, ApiError> {
     let (channel, mut pins) = ops::pins(&state, &channel_id).await?;
-    crate::render::fill_pins(&state.config, &channel, &mut pins.pins);
+    crate::render::fill_pins(&state.config, &state.headings, &channel, &mut pins.pins);
     Ok(no_store(Json(crate::contract::PinsResponse {
         channel,
         pins: pins.pins,
@@ -3212,7 +3236,7 @@ pub async fn pin_message(
         thread_root: request.thread_root,
     };
     let (channel, mut change) = ops::pin(&state, &channel_id, &snapshot).await?;
-    crate::render::fill_pins(&state.config, &channel, &mut change.pin);
+    crate::render::fill_pins(&state.config, &state.headings, &channel, &mut change.pin);
     Ok(no_store(Json(crate::contract::PinChangeResponse {
         channel,
         message_id: snapshot.message_id,

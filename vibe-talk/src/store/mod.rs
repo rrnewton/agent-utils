@@ -850,6 +850,10 @@ pub struct Pin {
     /// "draw the text as plain paragraphs". `#217 markdown-blocks`.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub content_html: String,
+    /// The snapshot's heading, found when the pin is SERVED and never stored, by
+    /// [`crate::model::Message::heading`]'s rules. `#242 rich-headers`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub heading: Option<crate::model::Heading>,
 }
 
 /// A channel's pins, and the revision they are at.

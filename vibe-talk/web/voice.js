@@ -40,6 +40,7 @@ const READ_SPEED_KEY = "vibe-talk.voice.read-speed";
 const MARK_OWN_KEY = "vibe-talk.voice.mark-own-read";
 const MARKER_KEY = "vibe-talk.voice.place-marker";
 const COMBINE_KEY = "vibe-talk.voice.combine";
+const RICH_HEADERS_KEY = "vibe-talk.voice.rich-headers";
 const ACTIVE_CHANNEL_KEY = "vibe-talk.voice.active-channel";
 
 // --- two columns on a desk: which column the code is working on -------------------------------
@@ -109,7 +110,7 @@ let sideActive = false;
  *   | "compose-text" | "enter-sends" | "mark-own-read" | "mic-auto-gain" | "mic-echo-cancellation"
  *   | "mic-noise-suppression" | "msg-scale" | "new-channel-id" | "new-channel-label"
  *   | "new-channel-writable" | "noise-rule-new" | "read-speed-range" | "reading-width"
- *   | "reply-branch" | "resume-toggle" | "search-field" | "single-keys"
+ *   | "reply-branch" | "resume-toggle" | "rich-headers" | "search-field" | "single-keys"
  *   | "upstream-clear-now"} id
  * @returns {HTMLInputElement}
  */
@@ -139,7 +140,8 @@ let sideActive = false;
  *   | "help-link-combining" | "help-link-connection" | "help-link-control-bar"
  *   | "help-link-identities" | "help-link-keyboard"
  *   | "help-link-live-messages" | "help-link-mark-own" | "help-link-microphone"
- *   | "help-link-reading-width" | "help-link-resuming" | "help-link-speech-prep"
+ *   | "help-link-reading-width" | "help-link-resuming" | "help-link-rich-headers"
+ *   | "help-link-speech-prep"
  *   | "help-link-storage" | "jump-bookmark" | "jump-newest" | "link-kind-action" | "link-kind-commit"
  *   | "link-kind-pr" | "links-filter" | "load-older" | "load-older-turns"
  *   | "msg-scale-larger" | "msg-scale-smaller"
@@ -563,6 +565,7 @@ const HELP_TOPICS = [
   "mark-own",
   "auto-read",
   "combining",
+  "rich-headers",
   "reading-width",
   "resuming",
   "live-messages",
@@ -13825,22 +13828,50 @@ const rawTextOf = (message) =>
  * it are separated by line breaks. Exactly the shape the server compares against before it decides
  * a body needs no HTML (`plain_html` in src/render.rs), so a message drawn this way looks as it
  * would have with its rendering. Every line through a text node.
+ *
+ * `#242 rich-headers`. With a `cut`, the first `cut` characters of the first line are the words a
+ * heading restates, and are marked as the server marks them in a rendered body (`mark_restated` in
+ * src/render.rs): in a `span.rh-src`, which also holds the line break after them when they are the
+ * whole line, or as the paragraph's own class when that line is the whole paragraph. Marking adds
+ * no character and moves none, so the body reads the same with the mark as without it.
  */
-function plainParagraphs(parent, text) {
+function plainParagraphs(parent, text, cut = 0) {
   let paragraph = null;
-  for (const line of String(text).split("\n")) {
+  // The restated words, while they are the whole of the paragraph so far.
+  let lead = null;
+  // The paragraph ends while it is only the restated line: the paragraph carries the mark itself.
+  const close = () => {
+    if (lead && paragraph) {
+      paragraph.className = RESTATED_CLASS;
+      paragraph.replaceChildren(...lead.childNodes);
+    }
+    lead = null;
+    paragraph = null;
+  };
+  String(text).split("\n").forEach((line, index) => {
     if (/^[ \t]*$/.test(line)) {
-      paragraph = null;
-      continue;
+      close();
+      return;
     }
     if (paragraph) {
-      paragraph.append(document.createElement("br"));
+      (lead || paragraph).append(document.createElement("br"));
+      lead = null;
     } else {
       paragraph = document.createElement("p");
       parent.append(paragraph);
     }
+    if (index === 0 && cut > 0) {
+      const words = document.createElement("span");
+      words.className = RESTATED_CLASS;
+      words.append(document.createTextNode(line.slice(0, cut)));
+      paragraph.append(words);
+      if (line.length > cut) paragraph.append(document.createTextNode(line.slice(cut)));
+      else lead = words;
+      return;
+    }
     paragraph.append(document.createTextNode(line));
-  }
+  });
+  close();
 }
 
 /**
@@ -13854,7 +13885,8 @@ function messageBody(message) {
   if (html !== "") {
     insertSanitizedHtml(box, html);
   } else {
-    plainParagraphs(box, rawTextOf(message));
+    const heading = headingOf(message);
+    plainParagraphs(box, rawTextOf(message), heading ? heading.cut : 0);
   }
   return box;
 }
@@ -13954,6 +13986,111 @@ function messageLinks(message) {
 function renderBodyInto(parent, messages) {
   for (const message of messages) parent.append(messageBody(message));
   return parent;
+}
+
+// --- rich headers ---------------------------------------------------------------------------------
+//
+// `#242 rich-headers`. The owner: "we have a lot of wasted space in the header of each message", and
+// his agents open their messages with who they are — "[build-bot coordinator] Backup check, 10:52 PM
+// ET. All 4 shards are synced." — because every agent posts through the one bot account. The server
+// finds those pieces (src/heading.rs) and sends them as `heading`: a tag, a time and a title, and
+// `cut`, how much of the message's text they restate. This page shows them in the row's header line
+// and hides the words they came from.
+//
+//   * NOTHING IS LOST, EITHER WAY. The body is never cut. The restated words stay in it, marked
+//     `rh-src` (by the server in a rendered body, by `plainParagraphs` in a plain one), and the
+//     stylesheet hides them only while it shows the heading. With the setting off, the heading is
+//     hidden and the words are drawn where they always were: the row is exactly what it was. The
+//     switch is one attribute on the root, so flipping it redraws nothing and asks for nothing.
+//   * THE TEXT IS UNTOUCHED. Copy, speech, search and a thread's name read the message as written,
+//     or the drawn body as a whole, marked words included.
+//   * WHERE IT GOES IS DECIDED BY THE STYLESHEET, from the list's width and a length class this page
+//     sets from the strings alone — no layout is read (`#226`). A header that would not fit beside
+//     the row's buttons is drawn as the first line of the message instead, in full: never cut short
+//     with an ellipsis, which would drop words.
+//   * ONLY THE ROW'S FIRST MESSAGE. A combined row (see `glom`) is headed by its first message; the
+//     later ones keep their first lines as written.
+
+/** The class on the words a heading restates. The server writes it too: `RESTATED_CLASS` in src/render.rs. */
+const RESTATED_CLASS = "rh-src";
+
+/**
+ * Show headings in the header, or draw every first line as written, and remember which. The root's
+ * attribute is the whole of the switch: nothing else here asks whether it is on.
+ */
+function applyRichHeaders(on) {
+  const shown = Boolean(on);
+  el("rich-headers").checked = shown;
+  document.documentElement.setAttribute("data-rich-headers", shown ? "on" : "off");
+  try {
+    localStorage.setItem(RICH_HEADERS_KEY, shown ? "1" : "0");
+  } catch (_error) {
+    // A browser that refuses storage still honours the choice for this session.
+  }
+}
+
+/** What was stored. ABSENT MEANS ON: the default is the behaviour, not merely the initial value. */
+function storedRichHeaders() {
+  try {
+    return localStorage.getItem(RICH_HEADERS_KEY) !== "0";
+  } catch (_error) {
+    return true;
+  }
+}
+
+/**
+ * A message's heading as `{tag, time, title, cut}`, or null when it has none this page can draw: no
+ * piece to show, or a `cut` that is not inside the first line of the text it is cut from.
+ */
+function headingOf(message) {
+  const heading = message && message.heading;
+  if (!heading || typeof heading !== "object") return null;
+  const piece = (value) => (typeof value === "string" ? value : "");
+  const [tag, time, title] = [piece(heading.tag), piece(heading.time), piece(heading.title)];
+  const cut = heading.cut;
+  if (!(tag || time || title) || !Number.isInteger(cut) || cut <= 0) return null;
+  const content = rawTextOf(message);
+  if (cut > content.length || content.slice(0, cut).includes("\n")) return null;
+  return { tag, time, title, cut };
+}
+
+/**
+ * Whether a drawn body begins with the mark on the words its heading restates: its first paragraph
+ * marked, or that paragraph's first child. A heading whose words are not marked is not shown, so a
+ * body can never lose words to a heading that does not restate them.
+ */
+function restatedMarked(box) {
+  const first = box.childNodes[0];
+  if (!first || first.nodeType !== 1 || String(first.tagName).toLowerCase() !== "p") return false;
+  if (first.className === RESTATED_CLASS) return true;
+  const lead = first.childNodes[0];
+  return Boolean(lead && lead.nodeType === 1 && String(lead.tagName).toLowerCase() === "span" &&
+    lead.className === RESTATED_CLASS);
+}
+
+/**
+ * How long a heading reads, as the stylesheet's length class: its characters of tag, title and time,
+ * rounded up to a multiple of eight from 16 to 96, or `long` past that. Counted from the strings,
+ * never measured on the screen; web/voice.css says how wide a list each class needs.
+ */
+function headingLength(heading) {
+  const characters = [...`${heading.tag}${heading.title}${heading.time ? `@${heading.time}` : ""}`].length;
+  const bucket = Math.max(16, Math.ceil(characters / 8) * 8);
+  return bucket <= 96 ? String(bucket) : "long";
+}
+
+/**
+ * The heading's pieces for the row's header line: the tag, the title, and the time after an `@`,
+ * each a span of its own and every one of them text. No separators: the gap between them is the
+ * stylesheet's.
+ */
+function headingPieces(heading) {
+  const head = document.createElement("span");
+  head.className = "rh-head";
+  if (heading.tag) head.append(styled("span", "rh-tag", heading.tag));
+  if (heading.title) head.append(styled("span", "rh-title", heading.title));
+  if (heading.time) head.append(styled("span", "rh-time", `@${heading.time}`));
+  return head;
 }
 
 // --- who is speaking in the channel -------------------------------------------------------------
@@ -18340,6 +18477,15 @@ function channelRowFrame(messages) {
   // mid-sentence, and the block edge is the seam that keeps it from reading as one mangled
   // sentence.
   renderBodyInto(body, messages);
+  // `#242 rich-headers`. The first message's heading, beside the time and ahead of the row's
+  // buttons, and the words it restates marked for hiding — only when they really are marked.
+  const heading = headingOf(message);
+  const firstBody = body.children[0];
+  if (heading && firstBody && restatedMarked(firstBody)) {
+    firstBody.setAttribute("data-rh", "");
+    li.setAttribute("data-rh-len", headingLength(heading));
+    meta.append(headingPieces(heading));
+  }
   li.append(meta, body);
   // Two forms of the same words, for two different jobs: `content` is the SOURCE, which a copy
   // keeps (`#198 copy-message-text`), and `text` is what the row SAYS, which is what the fold
@@ -20840,6 +20986,7 @@ function provisionalPin(message) {
     content: String(message.content === null || message.content === undefined ? "" : message.content),
     // Drawn as the message is until the server's own copy of the pin arrives; never sent.
     content_html: renderedHtmlOf(message),
+    ...(message.heading ? { heading: message.heading } : {}),
     truncated: false,
     timestamp: String(message.timestamp || ""),
     thread_id: threadOf(message),
@@ -20865,6 +21012,8 @@ function keptMessage(pin, channel) {
     content: pin.truncated ? `${pin.content}…` : pin.content,
   };
   if (renderedHtmlOf(pin) !== "") message.content_html = pin.content_html;
+  // `#242 rich-headers`. Found by the server in the same text, ellipsis and all.
+  if (pin.heading) message.heading = pin.heading;
   if (pin.thread_id) {
     message.thread = {
       id: pin.thread_id, root_message_id: null, is_root: pin.thread_root, reply_count: null, reply_count_exact: false,
@@ -20902,9 +21051,11 @@ function syncPinnedList() {
     return;
   }
   const messages = pinnedMessages();
+  // The heading too (`#242 rich-headers`): a plain body's HTML is "" with or without one, and a paren
+  // tag confirmed by a later read brings a heading to a message whose text has not changed.
   const drawn = JSON.stringify([combineMessages, channelCanon.scope, threadingSupported,
     ...messages.map((m) => [m.id, m.timestamp, m.content, renderedHtmlOf(m), m.author, threadOf(m), isNoise(m),
-      keptByPin.has(m), reactionsDrawn(m)])]);
+      keptByPin.has(m), reactionsDrawn(m), m.heading || null])]);
   if (drawn === pinnedListDrawn) return;
   pinnedListDrawn = drawn;
   drawingPinnedRows = true;
@@ -21543,8 +21694,9 @@ function renderReplyContext() {
   const list = el("reply-context");
   const { earlier, more } = replyTarget ? replyContextPool() : { earlier: [], more: false };
   const shown = earlier.slice(Math.max(0, earlier.length - replyContext.shown));
+  // The heading as well as the body, as the Pinned list keys it (`#242 rich-headers`).
   const drawn = JSON.stringify(shown.map((message) =>
-    [String(message.id), message.content, renderedHtmlOf(message), reactionsDrawn(message)]));
+    [String(message.id), message.content, renderedHtmlOf(message), reactionsDrawn(message), message.heading || null]));
   if (drawn !== replyContext.drawn) {
     list.replaceChildren(...glom(shown).map(replyContextRow));
     replyContext.drawn = drawn;
@@ -24971,6 +25123,7 @@ applyMsgScale(storedMsgScale());
 applyReadSpeed(storedReadSpeed());
 applyMarkOwnRead(storedMarkOwnRead());
 applyCombineMessages(storedCombineMessages());
+applyRichHeaders(storedRichHeaders());
 applyEnterSends(storedEnterSends());
 el("reading-width").addEventListener("input", () => readingWidthChanged(el("reading-width").value));
 el("msg-scale").addEventListener("input", () => msgScaleChanged(el("msg-scale").value));
@@ -25050,6 +25203,17 @@ el("combine-messages").addEventListener("change", () => {
     el("combine-messages").checked
       ? "messages sent seconds apart are shown as one."
       : "every source message is shown as its own row."
+  );
+});
+
+// `#242 rich-headers`. Nothing to redraw: the root's attribute moves every heading between the header
+// and the words it came from at once, in both columns.
+el("rich-headers").addEventListener("change", () => {
+  applyRichHeaders(el("rich-headers").checked);
+  setStatus(
+    el("rich-headers").checked
+      ? "an agent's tag, title and time are shown in the message header."
+      : "every message's first line is shown as it was written."
   );
 });
 

@@ -181,6 +181,7 @@ fn message(content: &str) -> Message {
         spoken_time: "midnight".to_owned(),
         reply_to: None,
         reactions: None,
+        heading: None,
     }
 }
 

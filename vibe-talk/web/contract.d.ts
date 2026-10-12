@@ -363,6 +363,33 @@ declare namespace VibeTalk {
   }
 
   /**
+   * What a message's first line says about it, lifted out for the row's header. `#242
+   * rich-headers`.
+   *
+   * Every piece is UNTRUSTED plain text out of `content`, to be drawn as text. Flat and optional
+   * throughout, so the contract can grow without an older page refusing the row.
+   */
+  interface Heading {
+    /**
+     * How much of `content`, from its start, the heading restates, in UTF-16 code units: the
+     * length a page's string indexes by. Always within the first line.
+     */
+    cut: number;
+    /**
+     * Who the message says wrote it: `build-bot coordinator`, `ops2`.
+     */
+    tag?: string | null;
+    /**
+     * The clock time the message states, exactly as written: `10:52 PM ET`, `15:05Z`.
+     */
+    time?: string | null;
+    /**
+     * The short title it opens with, emphasis markers removed.
+     */
+    title?: string | null;
+  }
+
+  /**
    * The data of a live stream `message_delete` event: only the ids, never the removed text.
    */
   interface LiveDeleteEvent {
@@ -489,6 +516,17 @@ declare namespace VibeTalk {
      * which is most chat. Filled only on the routes the page reads.
      */
     content_html?: string;
+    /**
+     * The tag, time and title the message's first line states, for the page to show in the row's
+     * header. `#242 rich-headers`; see [`crate::heading`].
+     *
+     * Filled where `content_html` is, on the routes only the page reads, and absent everywhere
+     * else, including from a message nothing could be read from. When it is set, the part of the
+     * first line it restates is marked in `content_html` (or, for a plain body, is
+     * `content[..cut]`), so the page can hide those words while it shows the heading and draw them
+     * exactly as before when it does not.
+     */
+    heading?: Heading | null;
     /**
      * Snowflake of this message.
      */
@@ -723,6 +761,11 @@ declare namespace VibeTalk {
      * "draw the text as plain paragraphs". `#217 markdown-blocks`.
      */
     content_html?: string;
+    /**
+     * The snapshot's heading, found when the pin is SERVED and never stored, by
+     * [`crate::model::Message::heading`]'s rules. `#242 rich-headers`.
+     */
+    heading?: Heading | null;
     /**
      * The message pinned, in the provider-neutral namespace the page was served it in.
      */

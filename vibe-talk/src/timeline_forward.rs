@@ -566,6 +566,7 @@ mod tests {
             thread: None,
             noise: false,
             reactions: None,
+            heading: None,
         }
     }
 

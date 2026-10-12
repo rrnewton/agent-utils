@@ -46,6 +46,7 @@ fn message(id: &str) -> Message {
         content_html: String::new(),
         noise: false,
         reactions: None,
+        heading: None,
     }
 }
 
