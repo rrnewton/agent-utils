@@ -250,7 +250,10 @@ def main() -> int:
             page.goto(url, wait_until="load")
             page.fill("#api-token", TOKEN)
             page.click("#save-token")
-            page.click("#text-entry")
+            # A typed call, opened as the page opens one since `#241 voice-composer`: the first
+            # message sent from the call's box with nothing open.
+            page.fill("#compose-text", "anything for me to post?")
+            page.click("#send-text")
             deadline = time.monotonic() + 10
             while api.watches < 2:
                 check(time.monotonic() < deadline, "the typed call never started watching for proposals")

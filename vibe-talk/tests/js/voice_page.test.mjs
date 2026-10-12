@@ -316,7 +316,11 @@ const SCROLL_VIEWPORT_PX = 400;
  */
 const FIXTURE_TREE = {
   "scroll-area": ["pane-voice", "pane-discord"],
-  "pane-voice": ["empty-state", "transcript"],
+  // `#241 voice-composer`. The call's message box is the last thing in its pane, inside the
+  // scrolling element, as the channel's box is in its own; its height is part of what "the reader is
+  // at the bottom" means on the call's view, exactly as the channel's is there.
+  "pane-voice": ["empty-state", "transcript", "voice-composer"],
+  "voice-composer": ["compose-text", "send-text"],
   // In markup order: the walk-back control sits ABOVE the log and inside the scrolling element, so
   // it scrolls away with the top of the history rather than standing on the screen. Its height is
   // part of what the anchoring model measures against. `#65 scrollback-paging`.
@@ -360,18 +364,19 @@ const FIXTURE_TREE = {
   //
   // `read-new` is last, and it is on the strip at all because the tray gave a slot back. It is a
   // BUTTON rather than a select for the same reason: see `memberPx` — a `.bar-select` is 5rem
-  // before its own padding, which the call view does not have once Type and Prompts are on it.
-  "bar-pack": ["audio-source", "discord-channel", "text-entry", "prompts-open", "read-new"],
+  // before its own padding, which the call view did not have while Type and Prompts were on it.
+  //
+  // `#241 voice-composer` took Type off the strip: the message box is in the transcript now.
+  "bar-pack": ["audio-source", "discord-channel", "prompts-open", "read-new"],
   // The tray of canned prompts. A child of the BAR and not of the pack, and both halves of that
   // matter: of the bar because the bar is what moves between the two mounts, and not of the pack
   // because the pack scrolls sideways and a menu that can scroll out from under its own opener is
   // not a menu. It costs the strip no width — see `barCostPx`, which skips it for that reason.
   "prompts-tray": ["canned-summary", "canned-blockers"],
-  // ...and the bar itself, in markup order, because "the toggle is the leftmost thing on the bar
-  // once the gear has gone" is an ordering claim and a fixture that held the members in a flat
-  // list could not check it. It is also what `setPlacement` re-parents, so the move has something
-  // real to move.
-  "control-bar": ["open-settings", "bar-pack", "prompts-tray", "compose-text", "send-text", "view-switch"],
+  // ...and the bar itself, in markup order, because "the gear is leftmost and the switch
+  // rightmost" is an ordering claim and a fixture that held the members in a flat list could not
+  // check it. It is also what `setPlacement` re-parents, so the move has something real to move.
+  "control-bar": ["open-settings", "bar-pack", "prompts-tray", "view-switch"],
   // `#200 reply-context`. The reply screen's one scroll: the earlier messages, oldest at the top,
   // then the message being answered. The SECOND element the model scrolls — see `SCROLLERS`.
   "reply-scroll": ["reply-context-more", "reply-context-state", "reply-context", "reply-target-meta", "reply-target"],
@@ -4241,7 +4246,7 @@ test("THE CHANNEL PICKER IS ON THE BAR, AND OUT OF THE SCROLLING ELEMENT ENTIREL
   // is the one on screen without scrolling anything — and being unreachable is the whole defect.
   const pack = HTML.indexOf('id="bar-pack"');
   const picker = HTML.indexOf('id="discord-channel"');
-  for (const later of ["text-entry", "read-new", "canned-summary", "canned-blockers"]) {
+  for (const later of ["prompts-open", "read-new", "canned-summary", "canned-blockers"]) {
     assert.ok(
       picker < HTML.indexOf(`id="${later}"`),
       `#${later} is packed before the channel picker, so the picker is what scrolls off the bar`
@@ -4483,7 +4488,7 @@ test("EVERY MEMBER OF THE BAR SAYS WHICH VIEWS IT BELONGS ON, AND NONE IS LEFT T
   }
 });
 
-test("THE BAR FITS ON THE OWNER'S 375px PHONE, ON EVERY VIEW AND IN BOTH MODES", async () => {
+test("THE BAR FITS ON THE OWNER'S 375px PHONE, ON EVERY VIEW", async () => {
   // The measurement `#83` skipped. Six controls went onto one strip and the only thing that had an
   // opinion about whether they fit was a screenshot scene that runs on the CALL view — where the
   // picker is hidden, so it could not see the case that matters.
@@ -4513,24 +4518,19 @@ test("THE BAR FITS ON THE OWNER'S 375px PHONE, ON EVERY VIEW AND IN BOTH MODES",
   assert.ok(channel.shown.includes("discord-channel"), "this is not the channel view's bar");
   assert.ok(channel.cost <= budget, report("the channel view", channel));
 
-  // Text entry, where the bar converts into a field. The field itself is deliberately allowed to
-  // shrink to nothing (`min-width: 0`, so a long message never pushes Send away), so what this
-  // costs is the toggle and the Send beside it — the two that must survive on any screen.
-  await page.el("view-switch").click();
-  await page.el("text-entry").click();
-  const typing = barCostPx(page);
-  assert.ok(typing.shown.includes("send-text"), "text entry is not open");
-  assert.ok(typing.cost <= budget, report("text entry", typing));
+  // `#241 voice-composer`. There is no second mode to price any more: writing to the agent happens
+  // in a box in the transcript, and the bar is the same strip while you write as before.
 
   // ...and the arithmetic is not vacuous: the bar as it stood BEFORE the tray — the picker, the
-  // toggle, and every canned prompt a member in its own right, all on one view — really does
-  // overflow. That is the measurement the tray was built for, and stating it here is what stops a
-  // later prompt from being put back on the strip on the grounds that one more cannot hurt.
+  // Type toggle (a `.bar-button`, until `#241` took it off the strip), and every canned prompt a
+  // member in its own right, all on one view — really does overflow. That is the measurement the
+  // tray was built for, and stating it here is what stops a later prompt from being put back on
+  // the strip on the grounds that one more cannot hurt.
   const packGap = lengthPx(cssValue(cssBlock("#bar-pack"), "gap"));
   const eachOnTheStrip =
     memberPx("open-settings") +
     memberPx("discord-channel") +
-    memberPx("text-entry") +
+    minBoxPx(".bar-button") +
     CANNED.length * minBoxPx(".bar-button") +
     memberPx("view-switch") +
     packGap * (1 + CANNED.length) +
@@ -4597,30 +4597,20 @@ test("the picker is offered where there is a channel to pick, and nowhere else",
   await showDiscord(page, [message({ content: "hi" })]);
   assert.equal(page.el("discord-channel").hidden, false, "the picker is missing from its own view");
 
-  // The bar's other rule still applies to it: text entry takes the bar, and every member that is
-  // not the way back out of the mode gets out of the way. Entered from the view text entry lives
-  // on, because that is now the only place it can be entered from — the picker and the field can
-  // never be on the strip together, which is the claim, and it is checked on BOTH views rather
-  // than on the one where the mode happens to be reachable.
+  // `#241 voice-composer`. A draft in the call's message box changes nothing about the bar: the
+  // box is in the call's transcript, so it goes when its view goes, and the picker comes back with
+  // the channel exactly as it would have without one.
   await page.el("view-switch").click();
   assert.equal(page.tab(), "voice");
-  await page.el("text-entry").click();
-  assert.equal(page.el("compose-text").hidden, false, "text entry did not open where it lives");
-  assert.equal(page.el("discord-channel").hidden, true, "the picker crowded the text field");
-
-  // The reader cannot ordinarily leave the view while typing — the switch is one of the members
-  // that gets out of the way of the field — so the next click is the DEFENSIVE path: whatever
-  // moves the view, the field must not arrive on a view whose bar has no way back out of the mode.
-  assert.equal(page.el("view-switch").hidden, true, "the switch is on the bar during text entry");
+  await compose(page, "half a thought");
+  assert.equal(page.el("discord-channel").hidden, true, "a channel picker over the call view");
+  assert.equal(page.el("view-switch").hidden, false, "a draft took the switch off the bar");
   await page.el("view-switch").click();
   assert.equal(page.tab(), "discord");
-  assert.equal(page.el("compose-text").hidden, true, "the composer followed the reader off its view");
+  assert.equal(page.el("pane-voice").hidden, true, "the call's box followed the reader off its view");
   assert.equal(page.el("discord-channel").hidden, false, "the picker is missing from its own view");
-
-  // ...and leaving the mode where it lives puts the call view back the way it was.
   await page.el("view-switch").click();
-  await page.el("text-entry").click();
-  assert.equal(page.el("compose-text").hidden, true, "the toggle stopped closing the field");
+  assert.equal(page.el("compose-text").value, "half a thought", "switching views lost the draft");
   await page.el("view-switch").click();
   assert.equal(page.el("discord-channel").hidden, false);
 
@@ -4907,10 +4897,15 @@ test("on a desktop both lists are held to a reading column, and the phone is lef
     const desktop = cssBlockIn(DESKTOP_QUERY, pane);
     assert.match(desktop, /max-width:\s*var\(--reading-width\)/, `${pane} is not held to a column`);
     assert.match(desktop, /margin-inline:\s*auto/, `${pane} is capped but not centred`);
-    assert.equal(
-      cssRulesElsewhere(DESKTOP_QUERY, pane),
-      0,
-      `${pane} is also styled outside the desktop query, so the phone gets the column too`
+    // The COLUMN, outside the desktop query, is what must not happen. `#241 voice-composer` gave the
+    // call's pane a rule of its own on every screen — a flex column at least as tall as the list, so
+    // its message box can sit at the foot — and that is not a column; a width or an inline margin
+    // there would be.
+    const elsewhere = cssRules(cssWithout(DESKTOP_QUERY), pane).join("\n");
+    assert.doesNotMatch(
+      elsewhere,
+      /(?:^|[;\s])(?:max-width|width|margin-inline|margin-left|margin-right|margin)\s*:/,
+      `${pane} is given a width or a margin outside the desktop query, so the phone gets the column too`
     );
   }
   // The dock follows the column rather than spanning the desk — never by being pinned. The frame
@@ -15965,11 +15960,11 @@ const session_lines = (page) =>
 
 // --- typing to the agent (#43 typed-input) --------------------------------------------------------
 
-/** Enter text entry if it is not already on, and put text in the field, the way a finger does. */
+/**
+ * Put text in the call's message box, the way a finger does. The box is always there since `#241
+ * voice-composer`: there is no mode to enter first.
+ */
 async function compose(page, text) {
-  if (page.el("compose-text").hidden) {
-    await page.el("text-entry").click();
-  }
   await page.el("compose-text").setValue(text);
 }
 
@@ -16604,8 +16599,12 @@ test("a greeting that never comes and then completes silently is logged as both,
   assert.deepStrictEqual(page.healthPosts.map((r) => r.cause), ["no_reply", "silent_greeting", "silent_turns"]);
 });
 
-test("a typed call's greeting is judged as an ordinary turn and is not timed", async () => {
-  const page = newPage();
+/**
+ * Open a typed `vibe-talk-v1` conversation the only way the page offers one since `#241
+ * voice-composer`: write `first` in the call's box with nothing open and press Send. The message is
+ * held while the conversation opens, and goes at `session_started`.
+ */
+async function startTypedNeutralCall(page, greeting, first = "hello") {
   await signIn(page);
   page.setFetch(async () =>
     json(200, {
@@ -16616,29 +16615,8 @@ test("a typed call's greeting is judged as an ordinary turn and is not timed", a
       output_sample_rate: 24000,
     })
   );
-  await page.el("text-entry").click();
-  await page.settle();
-  const socket = page.sockets[0];
-  socket.onopen();
-  socket.onmessage({ data: JSON.stringify({ type: "session_started", greeting: true }) });
-  assert.equal(page.expireTimers(NO_REPLY_MS), 0, "a typed greeting was timed");
-  agentTurn(page, socket, 0, { text: null });
-  await page.settle();
-  assert.deepStrictEqual(page.healthPosts, [], "one silent typed turn was reported as a silent greeting");
-});
-
-async function startTypedNeutralCall(page, greeting) {
-  await signIn(page);
-  page.setFetch(async () =>
-    json(200, {
-      websocket_url: "wss://example.invalid/private-voice",
-      protocol: "vibe-talk-v1",
-      provider: "Internal voice preview",
-      input_sample_rate: 24000,
-      output_sample_rate: 24000,
-    })
-  );
-  await page.el("text-entry").click();
+  await compose(page, first);
+  await page.el("send-text").click();
   await page.settle();
   const socket = page.sockets[0];
   socket.onopen();
@@ -16651,56 +16629,72 @@ const promptsSent = (socket) =>
     .filter((frame) => typeof frame === "string" && JSON.parse(frame).type === "prompt")
     .map((frame) => JSON.parse(frame).text);
 
-test("a typed call holds its prompts behind a greeting that is already arriving", async () => {
-  // Sent into the greeting, a prompt's reply could not be told from it: the greeting's
-  // turn_complete would be taken as the prompt's and release the next prompt early.
+test("a typed call's greeting is judged as an ordinary turn and is not timed", async () => {
+  // A voice call times a promised greeting and reports one that comes silent after ONE turn,
+  // because a greeting is supposed to speak. A typed call does neither: the protocol does not say
+  // whether a server greets a client that never opens an audio segment.
   const page = newPage();
   const socket = await startTypedNeutralCall(page, true);
-  speech(socket, "assistant", 0, "Hello, what would you like", false);
-  await compose(page, "first");
-  await page.el("send-text").click();
+  assert.deepStrictEqual(promptsSent(socket), ["hello"]);
+  agentTurn(page, socket, 0, { text: null });
+  await page.settle();
+  assert.deepStrictEqual(page.healthPosts, [], "one silent typed turn was reported as a silent greeting");
+});
+
+test("a typed call holds a prompt behind a reply it did not ask for that is already arriving", async () => {
+  // Sent into a reply that is still arriving, a prompt's own reply could not be told from it: that
+  // reply's turn_complete would be taken as the prompt's and release the next prompt early. Since
+  // `#241 voice-composer` a typed call opens with its first message already sent, so on a server
+  // that greets, the greeting's turn_complete is taken as that message's (the documented limitation
+  // pinned below), and the message's real reply is the one the page did not ask for.
+  const page = newPage();
+  const socket = await startTypedNeutralCall(page, true, "first");
+  agentTurn(page, socket, 0, { text: "Hello, what would you like to know?" });
+  speech(socket, "assistant", 1, "The first", false);
   await compose(page, "second");
   await page.el("send-text").click();
-  assert.deepStrictEqual(promptsSent(socket), [], "a prompt was sent into the greeting");
-  agentTurn(page, socket, 0, { text: "Hello, what would you like to know?" });
-  assert.deepStrictEqual(promptsSent(socket), ["first"], "the greeting's end did not release exactly one prompt");
+  await compose(page, "third");
+  await page.el("send-text").click();
+  assert.deepStrictEqual(promptsSent(socket), ["first"], "a prompt was sent into an arriving reply");
   agentTurn(page, socket, 1, { text: "The first answer." });
-  assert.deepStrictEqual(promptsSent(socket), ["first", "second"]);
+  assert.deepStrictEqual(promptsSent(socket), ["first", "second"], "the reply's end did not release exactly one prompt");
   agentTurn(page, socket, 2, { text: "The second answer." });
+  assert.deepStrictEqual(promptsSent(socket), ["first", "second", "third"]);
+  agentTurn(page, socket, 3, { text: "The third answer." });
   await page.settle();
   assert.deepStrictEqual(page.healthPosts, []);
 });
 
-test("a greeting heard only as PCM holds a typed prompt too, and a greeting that stalls is bounded", async () => {
+test("a reply heard only as PCM holds a typed prompt too, and a reply that stalls is bounded", async () => {
   const page = newPage();
-  const socket = await startTypedNeutralCall(page, true);
+  const socket = await startTypedNeutralCall(page, true, "first");
+  agentTurn(page, socket, 0, { text: "Hello." });
   socket.onmessage({ data: page.pcmFrame(2400, SPEECH) }); // a typed call plays none of it
   await compose(page, "anyone there");
   await page.el("send-text").click();
-  assert.deepStrictEqual(promptsSent(socket), [], "a prompt was sent into the greeting");
+  assert.deepStrictEqual(promptsSent(socket), ["first"], "a prompt was sent into an arriving reply");
   const bounds = () => [...page.timers].filter(([, t]) => t.ms === NO_REPLY_MS).map(([id]) => id);
   const held = bounds();
   assert.equal(held.length, 1, "a held prompt was given no bound");
-  // Every further piece of the greeting restarts the bound rather than ending it: it measures the
-  // greeting going quiet without completing. Text used to end it, and PCM never restarted it.
+  // Every further piece of the reply restarts the bound rather than ending it: it measures the
+  // reply going quiet without completing. Text used to end it, and PCM never restarted it.
   socket.onmessage({ data: page.pcmFrame(2400, SPEECH) });
   const afterAudio = bounds();
   assert.equal(afterAudio.length, 1);
-  assert.notEqual(afterAudio[0], held[0], "more greeting audio did not restart the bound");
-  speech(socket, "assistant", 0, "Hello", false);
-  assert.equal(bounds().length, 1, "greeting text ended the held prompt's bound");
-  assert.equal(page.expireTimers(NO_REPLY_MS), 1, "a greeting that stopped mid-way was not bounded");
+  assert.notEqual(afterAudio[0], held[0], "more of the reply's audio did not restart the bound");
+  speech(socket, "assistant", 1, "Yes", false);
+  assert.equal(bounds().length, 1, "the reply's text ended the held prompt's bound");
+  assert.equal(page.expireTimers(NO_REPLY_MS), 1, "a reply that stopped mid-way was not bounded");
   await page.settle();
   assert.deepStrictEqual(page.healthPosts.map((r) => r.cause), ["no_reply"]);
 });
 
 test("a typed prompt sent before any greeting arrives is not held: the documented limitation", async () => {
   // Pinned so that closing it is a deliberate change: the page cannot know whether a greeting
-  // is coming to a client that never opened an audio segment.
+  // is coming to a client that never opened an audio segment. Since `#241 voice-composer` this is
+  // every typed call's FIRST message, which is held only until `session_started`.
   const page = newPage();
-  const socket = await startTypedNeutralCall(page, true);
-  await compose(page, "first");
-  await page.el("send-text").click();
+  const socket = await startTypedNeutralCall(page, true, "first");
   assert.deepStrictEqual(promptsSent(socket), ["first"]);
 });
 
@@ -16739,21 +16733,7 @@ test("an error frame is logged by cause alone, without the text it carried", asy
 
 test("a typed call judges by text alone, because it plays no audio", async () => {
   const page = newPage();
-  await signIn(page);
-  page.setFetch(async () =>
-    json(200, {
-      websocket_url: "wss://example.invalid/private-voice",
-      protocol: "vibe-talk-v1",
-      provider: "Internal voice preview",
-      input_sample_rate: 24000,
-      output_sample_rate: 24000,
-    })
-  );
-  await page.el("text-entry").click();
-  await page.settle();
-  const socket = page.sockets[0];
-  socket.onopen();
-  socket.onmessage({ data: JSON.stringify({ type: "session_started", greeting: false }) });
+  const socket = await startTypedNeutralCall(page, false);
   agentTurn(page, socket, 1, { amplitude: SPEECH });
   agentTurn(page, socket, 2, { amplitude: SPEECH });
   await page.settle();
@@ -16797,7 +16777,8 @@ test("TYPING A MESSAGE SENDS user_message, AND NOTHING ELSE", async () => {
 test("a half-typed message to the agent survives a trip to Settings and a reload", async () => {
   // `#193 compose-draft-loss`. The channel and reply composers already kept their drafts; this one
   // kept nothing, and folded the field away whenever the reader left the call screen, so a long
-  // message looked lost on the way back and WAS lost if the phone killed the app.
+  // message looked lost on the way back and WAS lost if the phone killed the app. Since `#241
+  // voice-composer` the box does not fold away at all.
   const store = new Map();
   const page = newPage(store);
   await signIn(page);
@@ -16822,10 +16803,11 @@ test("a half-typed message to the agent survives a trip to Settings and a reload
   assert.equal(typedFrames(socket).length, 1);
   assert.equal(store.get("vibe-talk.voice.compose-draft"), undefined, "a sent message stayed a draft");
 
-  // ...and an empty field closes as it always did.
+  // ...and the empty box is still there for the next one.
   await page.el("open-settings").click();
   await page.el("close-settings").click();
-  assert.equal(page.el("compose-text").hidden, true, "an empty field stayed open off its screen");
+  assert.equal(page.el("compose-text").hidden, false, "the box folded away once it was empty");
+  assert.equal(page.el("compose-text").value, "");
 });
 
 test("a typed turn and a spoken turn land in the SAME transcript", async () => {
@@ -16878,26 +16860,188 @@ test("THE VENDOR ECHOING A TYPED MESSAGE BACK DOES NOT RENDER IT TWICE", async (
   assert.equal(session_lines(page).length, 2, "a genuinely repeated sentence was swallowed");
 });
 
-test("sending with no call SAYS SO instead of silently doing nothing", async () => {
+// --- `#241 voice-composer`: the first send with nothing open -------------------------------------
+//
+// The owner: "Can we just have a message box at the BOTTOM of the scroll history? ... do we need to
+// explicitly engage some alternate mode of the remote voice agent? ... we could always do that
+// belatedly either when you start typing or when you send a text message." Belatedly, and on the
+// SEND: a box that opened a billed conversation whenever somebody clicked into it would be a
+// surprise with a price on it.
+
+/** How many voice sessions the page has asked the server for. Each one is a conversation opened. */
+const sessionsAsked = (page) => page.requests.filter((r) => r.startsWith("GET /api/v1/voice-session")).length;
+
+test("CLICKING INTO THE BOX, OR TYPING IN IT, OPENS NOTHING", async () => {
   const page = newPage();
   await signIn(page);
-  page.el("status-line").hidden = true;
+  page.setFetch(MINTED);
+  page.el("compose-text").focus();
+  await compose(page, "a draft I have not decided to send");
+  await compose(page, "a draft I have not decided to send, longer");
+  await page.settle();
+  assert.equal(sessionsAsked(page), 0, "focusing or typing asked the server for a voice session");
+  assert.equal(page.sockets.length, 0, "focusing or typing opened a conversation");
+  assert.deepStrictEqual(page.micRequests, [], "focusing or typing asked for the microphone");
+  assert.equal(page.el("send-text").disabled, false, "Send is dead at idle, so a typed conversation cannot start");
+});
 
+test("THE FIRST SEND WITH NOTHING OPEN STARTS ONE TYPED CONVERSATION AND DELIVERS THE MESSAGE ONCE", async () => {
+  const page = newPage();
+  await signIn(page);
+  page.setFetch(MINTED);
+  await compose(page, "what landed overnight");
+  await page.el("send-text").click();
+  await page.settle();
+
+  assert.equal(sessionsAsked(page), 1, "the first send did not ask for exactly one voice session");
+  assert.equal(page.sockets.length, 1, "the first send did not open exactly one conversation");
+  assert.deepStrictEqual(page.micRequests, [], "a typed conversation asked for the microphone");
+  // HELD, not lost and not sent into a socket that is not open: the text is still in the box, Send
+  // is dead so it cannot be sent twice, and the status says what is happening.
+  const socket = page.sockets[0];
+  assert.equal(typedFrames(socket).length, 0, "the message went before the conversation was open");
+  assert.equal(page.el("compose-text").value, "what landed overnight", "the held message left the box early");
+  assert.equal(page.el("send-text").disabled, true, "Send is live while a message waits, so it can go twice");
+  assert.match(page.el("status").textContent, /goes as soon as it is open/);
+  assert.equal(session_lines(page).length, 0, "the transcript shows a message that has not gone");
+
+  // A second press, by Enter or Send, while it waits: refused out loud, and no second conversation.
+  await page.el("compose-text").dispatch("keydown", enterKey({}));
+  await page.el("send-text").click();
+  await page.settle();
+  assert.equal(page.sockets.length, 1, "a second press opened a second conversation");
+  assert.equal(sessionsAsked(page), 1);
+  assert.match(page.el("status").textContent, /Still opening the conversation/);
+
+  socket.onopen();
+  await page.settle();
+  const frames = socket.sent.map((raw) => JSON.parse(raw));
+  const typed = frames.filter((f) => f.type === "user_message");
+  assert.deepStrictEqual(typed, [{ type: "user_message", text: "what landed overnight" }],
+    "the held message was not delivered exactly once");
+  // AFTER the initiation frame: the agent has to know what kind of conversation this is first.
+  const initiation = frames.findIndex((f) => f.type === "conversation_initiation_client_data");
+  assert.ok(initiation >= 0 && initiation < frames.indexOf(typed[0]), "the message went before the initiation");
+  const said = session_lines(page);
+  assert.equal(said.length, 1, "the delivered message is not in the transcript exactly once");
+  assert.match(said[0].text(), /what landed overnight/);
+  assert.equal(page.el("compose-text").value, "", "the delivered message stayed in the box");
+  assert.equal(page.el("send-text").disabled, false, "Send stayed dead once the message had gone");
+  assert.equal(page.el("status").textContent, "Sent.");
+
+  // ...and the next send goes straight down the open socket.
+  await compose(page, "and the nightly");
+  await page.el("send-text").click();
+  assert.equal(typedFrames(socket).length, 2);
+  assert.equal(page.sockets.length, 1, "a send in an open typed conversation opened another");
+});
+
+test("a message written while the first one waits stays in the box: what went is what was sent", async () => {
+  const page = newPage();
+  await signIn(page);
+  page.setFetch(MINTED);
+  await compose(page, "first");
+  await page.el("send-text").click();
+  await page.settle();
+  await compose(page, "first, and a second thought");
+  page.sockets[0].onopen();
+  await page.settle();
+  assert.deepStrictEqual(typedFrames(page.sockets[0]).map((f) => JSON.parse(f).text), ["first"]);
+  assert.equal(page.el("compose-text").value, "first, and a second thought", "the box lost what was written while waiting");
+});
+
+test("a typed conversation that fails to open keeps the message in the box and sends it nowhere", async () => {
+  const page = newPage();
+  await signIn(page);
+  page.setFetch(async () => json(502, { error: "upstream", detail: "the voice provider refused" }));
   await compose(page, "are you there");
   await page.el("send-text").click();
+  await page.settle();
+  assert.equal(page.el("error").hidden, false, "the failure was silent");
+  assert.equal(page.sockets.length, 0);
+  assert.equal(page.el("compose-text").value, "are you there", "a failed start ate the message");
+  assert.equal(page.el("send-text").disabled, false, "Send stayed dead after the start failed");
 
-  assert.equal(page.sockets.length, 0, "a typed message opened a conversation by itself");
-  assert.equal(page.el("status-line").hidden, false, "the refusal was silent");
-  assert.match(
-    page.el("status").textContent,
-    /call/i,
-    "the refusal does not name the thing that would fix it"
+  // The next conversation is a new decision: the message that failed does not ride into it.
+  page.setFetch(MINTED);
+  await page.el("talk").click();
+  page.sockets[0].onopen();
+  await page.settle();
+  assert.equal(typedFrames(page.sockets[0]).length, 0, "a message from a failed start went into the next call");
+});
+
+test("a message sent while a CALL is still connecting goes the moment it connects", async () => {
+  const page = newPage();
+  await signIn(page);
+  page.setFetch(MINTED);
+  await page.el("talk").click();
+  assert.equal(page.sockets.length, 1);
+  await compose(page, "while it rings");
+  await page.el("send-text").click();
+  assert.equal(page.sockets.length, 1, "a send during the connect window opened a second conversation");
+  assert.equal(typedFrames(page.sockets[0]).length, 0);
+  assert.match(page.el("status").textContent, /goes as soon as the call is connected/);
+  page.sockets[0].onopen();
+  await page.settle();
+  assert.deepStrictEqual(typedFrames(page.sockets[0]).map((f) => JSON.parse(f).text), ["while it rings"]);
+  assert.equal(page.micRequests.length, 1, "the call stopped being a spoken one");
+});
+
+test("ENTER AND CTRL+ENTER START A TYPED CONVERSATION AS SEND DOES, AS THE SETTING SAYS", async () => {
+  for (const on of [true, false]) {
+    for (const [name, fields, sends] of [
+      ["Enter", {}, on],
+      ["Shift+Enter", { shiftKey: true }, false],
+      ["Ctrl+Enter", { ctrlKey: true }, true],
+    ]) {
+      const page = newPage();
+      await signIn(page);
+      page.setFetch(MINTED);
+      await page.el("enter-sends").setChecked(on);
+      await compose(page, `${name} at idle`);
+      await page.el("compose-text").dispatch("keydown", enterKey(fields));
+      await page.settle();
+      const where = `${name} with Enter to send ${on ? "on" : "off"}`;
+      assert.equal(page.sockets.length, sends ? 1 : 0, `${where} ${sends ? "did not start" : "started"} a conversation`);
+      if (sends) {
+        page.sockets[0].onopen();
+        await page.settle();
+        assert.deepStrictEqual(typedFrames(page.sockets[0]).map((f) => JSON.parse(f).text), [`${name} at idle`], where);
+      } else {
+        assert.equal(page.el("compose-text").value, `${name} at idle`, `${where} emptied the box`);
+      }
+    }
+  }
+});
+
+test("on the neutral protocol the first message waits for session_started, then goes as a prompt", async () => {
+  // The deployed path speaks `vibe-talk-v1`: no initiation frame and no text-only override exist
+  // there, and a typed turn is a `prompt`. The page's `user_message` becomes one in
+  // `sendClientEvent`, held in `pendingPrompts` until the server has started the session.
+  const page = newPage();
+  await signIn(page);
+  page.setFetch(async () =>
+    json(200, {
+      websocket_url: "/ws?mode=voice",
+      protocol: "vibe-talk-v1",
+      provider: "Internal voice preview",
+      input_sample_rate: 24000,
+      output_sample_rate: 24000,
+    })
   );
-  // AND IT KEEPS THE TEXT. Losing what somebody typed because there was nowhere to send it is a
-  // second failure on top of the first.
-  assert.equal(page.el("compose-text").value, "are you there", "the refusal ate the message");
-  // The control also SHOWS that it cannot act, rather than looking live and doing nothing.
-  assert.equal(page.el("send-text").disabled, true, "a dead Send looks exactly like a live one");
+  await compose(page, "summarize the last hour");
+  await page.el("send-text").click();
+  await page.settle();
+  const socket = page.sockets[0];
+  socket.onopen();
+  await page.settle();
+  assert.deepStrictEqual(promptsSent(socket), [], "a prompt went before the session started");
+  assert.equal(session_lines(page).length, 1, "the message is not in the transcript once it is on its way");
+  socket.onmessage({ data: JSON.stringify({ type: "session_started", greeting: false }) });
+  assert.deepStrictEqual(promptsSent(socket), ["summarize the last hour"]);
+  const kinds = socket.sent.filter((f) => typeof f === "string").map((f) => JSON.parse(f).type);
+  assert.deepStrictEqual(kinds, ["prompt"], "a typed call put something other than its prompt on the wire");
+  assert.deepStrictEqual(page.micRequests, [], "a typed call asked for the microphone");
 });
 
 test("COMPOSING TELLS THE AGENT SOMEONE IS THERE, AT MOST ONCE EVERY THIRTY SECONDS", async () => {
@@ -16952,50 +17096,65 @@ test("a fresh call pings on its FIRST keystroke, not thirty seconds in", async (
   assert.equal(activityFrames(page.sockets[1]).length, 1, "the new call inherited the old throttle");
 });
 
-test("PRESSING TYPE CONVERTS THE BAR, AND PRESSING IT AGAIN RESTORES IT", async () => {
-  // `#59 text-entry-button`, and the owner's whole interaction model: one button both enters and
-  // leaves text entry, and its own state is what tells you which mode you are in. A permanent text
-  // field is what this refuses to be — at rest, typing costs one small button's worth of a bar
-  // that was already there.
-  //
-  // Both ends ship hidden in the MARKUP, so their appearance really is the signal.
-  assert.equal(PAGE_ELEMENTS.get("compose-text").hidden, true, "the field ships open");
-  assert.equal(PAGE_ELEMENTS.get("send-text").hidden, true, "Send ships open");
+test("THE BOX IS IN THE CALL'S TRANSCRIPT IN EVERY STATE, AND THE SWITCH NEVER LEAVES THE BAR", async () => {
+  // `#241 voice-composer`, and the owner's report it answers: "Type mode on voice agent takes away
+  // my Voice/Channel toggle ... when I press Type to type to the agent... then the UI shifts and I
+  // lose the toggle." There is no mode now. The box ships VISIBLE in the markup, as the last thing
+  // in the call's pane, and nothing on the bar is decided by whether somebody is writing.
+  assert.equal(PAGE_ELEMENTS.get("compose-text").hidden, false, "the box ships hidden");
+  assert.equal(PAGE_ELEMENTS.get("send-text").hidden, false, "Send ships hidden");
+  assert.equal(PAGE_ELEMENTS.get("compose-text").tag, "textarea", "the call's box is not the channel's kind of box");
+  assert.equal(PAGE_IDS.has("text-entry"), false, "the Type toggle is still in the page");
 
-  const page = newPage();
-  await signIn(page);
-  const showing = () =>
-    ["text-entry", "compose-text", "send-text", "view-switch", "open-settings"].filter(
-      (id) => !page.el(id).hidden
-    );
-  assert.deepStrictEqual(showing(), ["text-entry", "view-switch", "open-settings"]);
-  assert.equal(page.el("text-entry").getAttribute("aria-pressed"), "false");
-  assert.equal(page.el("control-bar").getAttribute("data-mode"), "buttons");
+  const bar = (page) => ["open-settings", "view-switch", ...page.el("bar-pack").children.map((m) => m.id)]
+    .filter((id) => !page.el(id).hidden);
+  const check = (page, where) => {
+    assert.equal(page.tab(), "voice", where);
+    assert.equal(page.el("pane-voice").hidden, false, `${where}: the call's pane is not up`);
+    assert.equal(page.el("voice-composer").hidden, false, `${where}: the box is not there`);
+    assert.equal(page.el("compose-text").hidden, false, `${where}: the box is not there`);
+    assert.equal(page.el("send-text").hidden, false, `${where}: Send is not there`);
+    assert.equal(page.el("view-switch").hidden, false, `${where}: the switch left the bar`);
+    assert.equal(page.el("voice-composer").parentNode, page.el("pane-voice"), `${where}: the box left the pane`);
+  };
 
-  await page.el("text-entry").click();
+  // Idle.
+  const idle = newPage();
+  await signIn(idle);
+  check(idle, "idle");
+  const resting = bar(idle);
+  // Writing changes nothing on the bar.
+  idle.el("compose-text").focus();
+  await compose(idle, "half a thought");
+  check(idle, "idle, writing");
+  assert.deepStrictEqual(bar(idle), resting, "writing changed the bar");
 
-  // THE BAR IS NOW THE FIELD: the toggle stays, the field and its Send are up, and everything
-  // else on the bar has got out of the way.
-  assert.deepStrictEqual(showing(), ["text-entry", "compose-text", "send-text"]);
-  assert.equal(page.el("text-entry").getAttribute("aria-pressed"), "true", "the toggle is not ON");
-  assert.equal(page.el("control-bar").getAttribute("data-mode"), "text");
-  // And the toggle is now the LEFTMOST thing on the bar, which is the "slides to the left" in the
-  // issue: the gear that was to its left is gone, so flex closes the gap. There is no second
-  // mechanism, no animation and nothing to keep in step.
-  const order = page.el("control-bar").children.flatMap((member) =>
-    member.id === "bar-pack" ? member.children : [member]
-  );
-  const visible = order.filter((member) => !member.hidden);
-  assert.equal(visible[0].id, "text-entry", "something is still to the left of the toggle");
-  assert.equal(visible[visible.length - 1].id, "send-text", "Send is not on the right");
+  // A typed conversation: opening, and open.
+  idle.setFetch(MINTED);
+  await idle.el("send-text").click();
+  await idle.settle();
+  check(idle, "a typed conversation opening");
+  idle.sockets[0].onopen();
+  await idle.settle();
+  check(idle, "a typed conversation");
+  assert.equal(idle.el("hang-up").hidden, false, "a typed conversation has no way to end it");
+  // ...and the switch WORKS from there, as it does from a call: the conversation goes on.
+  await idle.el("view-switch").click();
+  assert.equal(idle.tab(), "discord");
+  assert.equal(idle.el("hang-up").hidden, false, "switching to the channel lost the typed conversation's end control");
+  await idle.el("view-switch").click();
+  check(idle, "a typed conversation, back from the channel");
 
-  // Pressing it again restores EXACTLY the bar that was there before.
-  page.el("compose-text").value = "half a thought";
-  await page.el("text-entry").click();
-  assert.deepStrictEqual(showing(), ["text-entry", "view-switch", "open-settings"]);
-  assert.equal(page.el("text-entry").getAttribute("aria-pressed"), "false");
-  // ...and keeps what was typed. Leaving the mode is not the same act as discarding a message.
-  assert.equal(page.el("compose-text").value, "half a thought", "leaving text entry ate the draft");
+  // A voice call.
+  const call = newPage();
+  await startTalking(call);
+  check(call, "a call");
+  call.el("compose-text").focus();
+  await compose(call, "a commit hash");
+  check(call, "a call, writing");
+  assert.equal(call.el("talk").hidden, false, "writing during a call lost the microphone control");
+  assert.equal(call.el("speaker").hidden, false, "writing during a call lost Sound");
+  assert.equal(call.el("hang-up").hidden, false, "writing during a call lost Hang up");
 });
 
 // --- chat mode: a TYPED conversation, with no microphone ---------------------------------------
@@ -17007,15 +17166,19 @@ test("PRESSING TYPE CONVERTS THE BAR, AND PRESSING IT AGAIN RESTORES IT", async 
 // The fix is not a fourth switch. A typed conversation is a different kind of conversation, decided
 // when the socket opens: `start({chat: true})`. What these assert is the part that is entirely on
 // this side of the socket and therefore actually guaranteeable — THE MICROPHONE IS NEVER OPENED.
+//
+// Since `#241 voice-composer` it is started by the call's message box: the first send with nothing
+// open starts it, and the message goes once it is open.
 
-/** Press Type with nothing open, which is what starts a typed conversation. */
-async function startChatting(page) {
+/** Send `first` from the call's box with nothing open, which is what starts a typed conversation. */
+async function startChatting(page, first = "hello") {
   page.el("api-token").value = "write-token-aaaaaaaaaaaaaaaa";
   await page.el("save-token").click();
   await page.settle();
   page.setFetch(MINTED);
 
-  await page.el("text-entry").click();
+  await compose(page, first);
+  await page.el("send-text").click();
   await page.settle();
 
   assert.equal(
@@ -17029,7 +17192,7 @@ async function startChatting(page) {
   return page.sockets[0];
 }
 
-test("PRESSING TYPE WITH NOTHING OPEN NEVER ASKS FOR THE MICROPHONE", async () => {
+test("THE FIRST SEND WITH NOTHING OPEN NEVER ASKS FOR THE MICROPHONE", async () => {
   const page = newPage();
   await startChatting(page);
 
@@ -17054,6 +17217,10 @@ test("the typed conversation ASKS the vendor for text-only, on the initiation fr
   assert.deepStrictEqual(initiation[0].conversation_config_override, {
     conversation: { text_only: true },
   });
+  // FIRST on the wire, before the message that started the conversation: the response mode is
+  // settled at initiation, and the message is the first turn of the conversation it settles.
+  assert.equal(frames[0].type, "conversation_initiation_client_data", "the initiation is not the first frame");
+  assert.deepStrictEqual(frames.filter((f) => f.type === "user_message"), [{ type: "user_message", text: "hello" }]);
   // And nothing that would only make sense with a microphone behind it.
   assert.equal(
     frames.some((f) => Object.prototype.hasOwnProperty.call(f, "user_audio_chunk")),
@@ -17093,6 +17260,7 @@ test("in a typed conversation the microphone controls are ABSENT, not merely ine
   // ...and the controls a typed conversation IS driven by are live.
   assert.equal(page.el("compose-text").hidden, false, "the composer is not up");
   assert.equal(page.el("send-text").disabled, false, "Send is dead in a live chat");
+  assert.equal(page.el("view-switch").hidden, false, "a typed conversation took the switch off the bar");
   assert.equal(page.el("canned-summary").getAttribute("aria-disabled"), "false");
 });
 
@@ -17156,73 +17324,74 @@ test("chat does not STICK: after a typed conversation, Talk still opens a spoken
   );
 });
 
-test("pressing Type DURING a voice call still just opens the field", async () => {
-  // The auto-start is only for "there is nothing open". A second conversation started underneath a
-  // live one would be the worst possible reading of this button.
+test("a send DURING a voice call starts nothing: it goes into the call", async () => {
+  // The typed conversation is only for "there is nothing open". A second conversation started
+  // underneath a live one would be the worst possible reading of the box.
   const page = newPage();
-  await startTalking(page);
+  const socket = await startTalking(page);
   assert.equal(page.sockets.length, 1);
 
-  await page.el("text-entry").click();
+  await compose(page, "and the nightly");
+  await page.el("send-text").click();
   await page.settle();
 
   assert.equal(page.sockets.length, 1, "typing during a call opened a second conversation");
-  assert.equal(page.el("compose-text").hidden, false, "the field did not open");
+  assert.equal(sessionsAsked(page), 1, "typing during a call asked for a second voice session");
+  assert.equal(typedFrames(socket).length, 1, "the message did not go into the call");
   assert.equal(page.el("talk").hidden, false, "a live voice call lost its microphone control");
 });
 
-test("THERE IS EXACTLY ONE COMPOSER, AND IT IS IN THE BAR", () => {
-  // `#43 typed-input` shipped a composer as a row of its own in the dock so the send path could be
-  // built and tested; `#59 text-entry-button` MOVES it. Adding the bar version beside the dock
-  // version would be two text fields racing to be the one somebody types in, so the old row's ids
-  // are asserted GONE rather than merely unused.
-  for (const dead of ["composer", "composer-row", "composer-toggle", "composer-input", "composer-send"]) {
-    assert.equal(PAGE_IDS.has(dead), false, `the dock composer's #${dead} is still in the page`);
-  }
-  const dock = HTML.slice(HTML.indexOf('id="dock"'));
-  // TEXT inputs, not every input. The claim is that there is one place to TYPE — a range slider
-  // for the reading pace lives in the dock too and is not a second composer. Counting every
-  // `<input>` made this test fail for a control nobody could type into, which would have pushed
-  // the next person to weaken the assertion rather than sharpen it.
-  const typeable = (dock.match(/<input[^>]*>/g) || []).filter(
-    (tag) => !/type="(range|checkbox|radio|button)"/.test(tag)
-  );
-  assert.equal(
-    typeable.length,
-    1,
-    `the dock holds more than one text input, so there are two composers: ${typeable}`
-  );
-  // The one that is left is inside the bar, between the pack and the switch.
-  const bar = barSlice();
-  assert.ok(bar.indexOf('id="bar-pack"') < bar.indexOf('id="compose-text"'));
-  assert.ok(bar.indexOf('id="compose-text"') < bar.indexOf('id="send-text"'));
-  assert.ok(bar.indexOf('id="send-text"') < bar.indexOf('id="view-switch"'));
-  // And the toggle is a member of the PACK, which is what makes it sit beside the buttons `#60`
-  // adds rather than in a place of its own.
-  assertMarkupContains("bar-pack", "text-entry");
+test("THE ON-SCREEN KEYBOARD RESIZES THE FRAME, SO THE DOCK RIDES ABOVE IT", () => {
+  // `#241 voice-composer`. The frame is a fixed 100dvh grid with the dock as its last row. Left to
+  // Chrome on Android's default, the keyboard opens OVER the layout and the dock — the switch, Hang
+  // up, Talk — sits under it while a box has the focus. Asking the browser to resize the content
+  // makes the grid lay itself out above the keyboard. tests/voice_composer_browser.py measures it.
+  const viewport = /<meta name="viewport" content="([^"]*)"/.exec(HTML);
+  assert.ok(viewport, "the page declares no viewport");
+  const keys = viewport[1].split(",").map((part) => part.trim());
+  assert.ok(keys.includes("interactive-widget=resizes-content"),
+    `the viewport does not ask for the content to be resized under the keyboard: ${viewport[1]}`);
+  assert.ok(keys.includes("viewport-fit=cover"), "the safe-area insets lost their viewport");
+  assert.match(cssBlock("body"), /height:\s*100dvh/, "the frame is no longer sized by the dynamic viewport");
 });
 
-test("text entry is not offered on the sign-in or settings screens", async () => {
+test("THERE IS EXACTLY ONE COMPOSER FOR THE AGENT, AND IT IS IN THE CALL'S TRANSCRIPT", () => {
+  // `#43 typed-input` shipped a composer as a row of its own in the dock; `#59 text-entry-button`
+  // moved it into the control bar behind a Type toggle; `#241 voice-composer` moves it into the
+  // call's pane, the last thing in the scrolling list, as the channel's box is in its own. Each old
+  // home's ids are asserted GONE rather than merely unused: two boxes racing to be the one somebody
+  // types in is worse than either.
+  for (const dead of ["composer", "composer-row", "composer-toggle", "composer-input", "composer-send", "text-entry", "text-entry-label"]) {
+    assert.equal(PAGE_IDS.has(dead), false, `the old composer's #${dead} is still in the page`);
+  }
+  // Nothing typeable is left in the dock at all: the bar does not convert into a field any more.
+  const dock = HTML.slice(HTML.indexOf('id="dock"'));
+  const typeable = [...(dock.match(/<input[^>]*>/g) || []), ...(dock.match(/<textarea[^>]*>/g) || [])].filter(
+    (tag) => !/type="(range|checkbox|radio|button)"/.test(tag)
+  );
+  assert.deepStrictEqual(typeable, [], "the dock still holds a text field, so there are two composers");
+  // The one that is left is in the call's pane, inside the scrolling element, after the turns.
+  assertMarkupContains("pane-voice", "voice-composer");
+  assertMarkupContains("voice-composer", "compose-text");
+  assertMarkupContains("voice-composer", "send-text");
+  assert.ok(markupHolds("scroll-area", "compose-text"), "the box is not in the scrolling list");
+  assert.ok(HTML.indexOf('id="transcript"') < HTML.indexOf('id="voice-composer"'), "the box is above the turns");
+  assert.equal((HTML_CODE.match(/id="compose-text"/g) || []).length, 1);
+});
+
+test("the box is on the main screen and nowhere else", async () => {
   const page = newPage();
-  assert.equal(page.el("text-entry").hidden, true, "typing is offered before anyone has signed in");
+  assert.equal(page.screen(), "signin");
+  assert.ok(markupHolds("screen-main", "compose-text"), "the box is not on the main screen");
+  assert.equal(markupHolds("dock", "compose-text"), false, "the box is in the dock, which every screen shares");
 
   await signIn(page);
-  assert.equal(page.el("text-entry").hidden, false);
-  await page.el("text-entry").click();
-  assert.equal(page.el("compose-text").hidden, false);
-
+  await compose(page, "half a thought");
   await page.el("open-settings").click();
-  assert.equal(page.el("compose-text").hidden, true, "the field followed you into Settings");
-  assert.equal(page.el("text-entry").hidden, true);
-
+  assert.equal(page.el("screen-main").hidden, true, "the box followed you into Settings");
   await page.el("close-settings").click();
-  assert.equal(page.el("text-entry").hidden, false);
-  assert.equal(
-    page.el("compose-text").hidden,
-    true,
-    "coming back from Settings left the bar in text mode"
-  );
-  assert.equal(page.el("text-entry").getAttribute("aria-pressed"), "false");
+  assert.equal(page.el("screen-main").hidden, false);
+  assert.equal(page.el("compose-text").value, "half a thought", "a trip to Settings lost the draft");
 });
 
 test("whitespace-only text sends nothing at all", async () => {
@@ -17314,8 +17483,10 @@ const ENTER_COMPOSERS = {
     const page = newPage();
     const socket = await startTalking(page);
     await page.el("enter-sends").setChecked(on);
+    // A textarea since `#241 voice-composer`, as the channel's box is: with the setting off, an
+    // Enter is a new line here too.
     return {
-      page, field: "compose-text", singleLine: true,
+      page, field: "compose-text",
       ready: (text) => compose(page, text),
       sent: () => typedFrames(socket).length,
       went: (text) => assert.equal(JSON.parse(typedFrames(socket).at(-1)).text, text),
@@ -17327,7 +17498,7 @@ const ENTER_COMPOSERS = {
     await showDiscord(page, [message({ id: "300", content: "history" })]);
     await page.el("enter-sends").setChecked(on);
     return {
-      page, field: "channel-compose-text", singleLine: false,
+      page, field: "channel-compose-text",
       ready: (text) => page.el("channel-compose-text").setValue(text),
       sent: () => page.repliesPosted.length,
       went: (text) => assert.deepEqual(page.repliesPosted.at(-1).body, { text }),
@@ -17344,7 +17515,7 @@ const ENTER_COMPOSERS = {
     assert.equal(page.el("thread-heading").hidden, false, "the thread did not open");
     await page.el("enter-sends").setChecked(on);
     return {
-      page, field: "channel-compose-text", singleLine: false,
+      page, field: "channel-compose-text",
       ready: (text) => page.el("channel-compose-text").setValue(text),
       sent: () => page.repliesPosted.length,
       went: (text) =>
@@ -17358,7 +17529,7 @@ const ENTER_COMPOSERS = {
     await openReplyOn(page, messages);
     await page.el("enter-sends").setChecked(on);
     return {
-      page, field: "reply-text", singleLine: false,
+      page, field: "reply-text",
       ready: async (text) => {
         if (page.screen() !== "reply") await openReplyOn(page, messages);
         await page.el("reply-text").setValue(text);
@@ -17388,12 +17559,10 @@ for (const [name, open] of Object.entries(ENTER_COMPOSERS)) {
         } else {
           assert.equal(box.sent(), before, `${key.name} sent from the ${name} box`);
           assert.equal(box.page.el(box.field).value, text, `${key.name} emptied the ${name} box`);
-          // A new line is the box's own default, so it is left alone — except in the call's one-line
-          // box, whose default is a form submission. An input method's Enter is the method's, always.
-          const swallowed = box.singleLine && !key.ime;
-          assert.equal(event.defaulted, !swallowed, swallowed
-            ? `${key.name} in the one-line call box was handed to the browser, which submits and reloads`
-            : `${key.name} had its default taken away, so the ${name} box gets no new line`);
+          // A new line is the box's own default, so it is left alone. Every box is a textarea since
+          // `#241 voice-composer`, the call's included. An input method's Enter is the method's, always.
+          assert.equal(event.defaulted, true,
+            `${key.name} had its default taken away, so the ${name} box gets no new line`);
         }
       }
       // ...and an ordinary key is nobody's business but the box's.
@@ -17496,24 +17665,22 @@ test("the field states its own layout rule: the size iOS will not zoom", () => {
   // NOT VERIFIABLE BY SCREENSHOT. Chromium under automation has no iOS text-zoom behaviour at all,
   // so the declaration is the only part checkable here.
   //
-  // 16px, not a rem: iOS Safari zooms the whole frame when a smaller input takes focus, and this
-  // page is a fixed 100dvh grid — the zoom pushes the dock off a viewport that cannot scroll back.
+  // Never under 16px, not a rem alone: iOS Safari zooms the whole frame when a smaller input takes
+  // focus, and this page is a fixed 100dvh grid — the zoom pushes the dock off a viewport that
+  // cannot scroll back.
   assert.match(
     cssBlock("#compose-text"),
-    /font-size:\s*16px/,
+    /font-size:\s*max\(1rem,\s*16px\)/,
     "the field is small enough that iOS Safari will zoom the frame when it takes focus"
   );
-  // It takes the width the bar has left, and it can shrink: a flex item without `min-width: 0`
-  // refuses to go below its content and pushes Send off the end of a 375px phone.
-  assert.match(cssBlock("#compose-text"), /flex:\s*1 1 auto/);
-  assert.match(cssBlock("#compose-text"), /min-width:\s*0/);
-  // ...and in text mode the PACK gives that width up. Without this the field is squeezed to
-  // nothing beside a toggle that has grown to fill the bar.
-  assert.match(cssBlock('#control-bar[data-mode="text"] #bar-pack'), /flex:\s*0 0 auto/);
-  // The toggle's ON state is drawn, not merely recorded — the same accent idiom `.control-mini.on`
-  // uses. A toggle that looks identical in both modes is not a mode indicator.
-  const pressed = cssBlock('#text-entry[aria-pressed="true"]');
-  assert.match(pressed, /var\(--accent\)/, "the pressed toggle looks exactly like the unpressed one");
+  // `#241 voice-composer`. The SAME box as the channel's — one rule, so the two cannot come to look
+  // different — and the same Send.
+  assert.equal(cssBlock("#compose-text"), cssBlock("#channel-compose-text"), "the call's box is drawn its own way");
+  assert.equal(cssBlock("#send-text"), cssBlock("#channel-send"), "the call's Send is drawn its own way");
+  assert.match(cssBlock("#voice-composer"), /padding:[^;]*var\(--scroll-tools-clearance, 0px\)/,
+    "the floating chips can cover the call's box at the end of the list");
+  // The pressed Type toggle and the bar's text mode are gone with the toggle.
+  assert.doesNotMatch(CSS_CODE, /#text-entry|data-mode="text"/, "the Type toggle's styles outlived it");
 });
 
 // --- the keyboard (#224 keyboard-shortcuts) -------------------------------------------------------
@@ -18297,6 +18464,30 @@ test("ESC IN A MESSAGE BOX leaves the box and keeps the draft; the next Esc goes
   assert.equal(reply.screen(), "main", "the second Esc did not leave the reply screen");
   await replyButton(reply.el("discord-log").children[1]).click();
   assert.equal(reply.el("reply-text").value, "not sent yet", "the draft did not survive Esc");
+});
+
+test("THE CALL'S BOX IS A TEXT FIELD TO THE KEYMAP: no single key fires in it, and Esc leaves it", async () => {
+  // `#241 voice-composer` put a message box in the call's view, inside the scrolling list. The
+  // keymap's rules for a field are the ones it already has (`#224 keyboard-shortcuts`): a key that
+  // types a character is the box's, and Esc leaves the box for the list, keeping the draft.
+  const page = newPage();
+  await signIn(page);
+  assert.equal(page.tab(), "voice");
+  const box = page.el("compose-text");
+  box.focus();
+  await box.setValue("a commit hash, 9c07d3e");
+  for (const key of [",", "/", "?", "j", "k", "e"]) {
+    const event = await press(page, box, key);
+    assert.equal(event.defaulted, true, `${key} in the call's box was taken from the box`);
+    assert.equal(page.screen(), "main", `${key} in the call's box left the main screen`);
+    assert.equal(page.el("search-field").hidden, true, `${key} in the call's box opened the search`);
+  }
+  const event = await press(page, box, "Escape");
+  assert.equal(event.defaulted, false, "Esc in the call's box was left to the browser");
+  assert.equal(focused(page), page.el("scroll-area"), `after Esc the focus is on ${focusName(page)}`);
+  assert.equal(box.value, "a commit hash, 9c07d3e", "Esc lost the draft");
+  assert.equal(page.screen(), "main");
+  assert.equal(page.sockets.length, 0, "a key in the call's box opened a conversation");
 });
 
 test("ESC NEVER MARKS ANYTHING READ, from the list, a selected message, or a thread", async () => {
@@ -19321,21 +19512,20 @@ test("starting a call brings the canned buttons back to life, tooltip and all", 
   assert.equal(page.el("canned-summary").getAttribute("aria-disabled"), "true");
 });
 
-test("the prompts opener gets out of the way of the text field, like everything else in the pack", async () => {
-  // `#59 text-entry-button` hides pack members by ITERATING the pack rather than by name, which is
-  // the whole reason this behaviour came for free. It is only checkable now that the pack has a
-  // member the loop's one exception does not cover.
+test("writing in the call's box leaves the prompts opener, and the rest of the pack, where they are", async () => {
+  // `#59 text-entry-button` hid every pack member but its own toggle while you typed, the opener
+  // included. `#241 voice-composer` moved writing into the transcript, so nothing on the strip
+  // gets out of the way of it any more: the canned prompts are one tap away while you write.
   const page = newPage();
   await startTalking(page);
-  assert.equal(page.el("prompts-open").hidden, false);
-
-  await page.el("text-entry").click();
-
-  assert.equal(page.el("prompts-open").hidden, true, "the prompts opener crowded the text field");
-  assert.equal(page.el("text-entry").hidden, false, "the way back out of the mode went away");
-
-  await page.el("text-entry").click();
-  assert.equal(page.el("prompts-open").hidden, false, "leaving text entry did not bring it back");
+  const shown = () => page.el("bar-pack").children.filter((member) => !member.hidden).map((member) => member.id);
+  const before = shown();
+  assert.ok(before.includes("prompts-open"), "the prompts opener is not on the call view's strip");
+  page.el("compose-text").focus();
+  await compose(page, "half a thought");
+  assert.deepStrictEqual(shown(), before, "writing changed what is on the strip");
+  assert.equal(page.el("view-switch").hidden, false, "writing took the switch off the strip");
+  assert.equal(page.el("open-settings").hidden, false, "writing took the gear off the strip");
 });
 
 test("A TRAY LEFT OPEN CANNOT OUTLIVE THE BUTTON THAT OPENED IT", async () => {
@@ -19347,15 +19537,8 @@ test("A TRAY LEFT OPEN CANNOT OUTLIVE THE BUTTON THAT OPENED IT", async () => {
   await page.el("prompts-open").click();
   assert.equal(page.el("prompts-tray").hidden, false, "the tray did not open");
 
-  // Text entry takes the opener off the strip...
-  await page.el("text-entry").click();
-  assert.equal(page.el("prompts-open").hidden, true, "the opener is still on the strip");
-  assert.equal(page.el("prompts-tray").hidden, true, "an orphaned tray is hanging over the page");
-
-  // ...and so does the channel view, which is a different route to the same hiding.
-  await page.el("text-entry").click();
-  await page.el("prompts-open").click();
-  assert.equal(page.el("prompts-tray").hidden, false);
+  // The channel view takes the opener off the strip, and the tray has to go with it. (Text entry
+  // used to be a second route to the same hiding; `#241 voice-composer` removed that mode.)
   await page.el("view-switch").click();
   assert.equal(page.el("prompts-open").hidden, true, "the opener belongs to the call view");
   assert.equal(page.el("prompts-tray").hidden, true, "the tray followed the opener onto a view it is not on");
@@ -19375,8 +19558,7 @@ test("the tray opens on a tap, closes on the next one, and closes when a prompt 
     "the opener does not tell a screen reader it opened anything"
   );
 
-  // Tapping the opener again is the way back out — the same control both opens and closes it, which
-  // is the model `#text-entry` already uses on this strip.
+  // Tapping the opener again is the way back out — the same control both opens and closes it.
   await page.el("prompts-open").click();
   assert.equal(page.el("prompts-tray").hidden, true, "the opener does not close what it opened");
   assert.equal(page.el("prompts-open").getAttribute("aria-expanded"), "false");
@@ -21081,7 +21263,6 @@ test("the settings screen states which control erases the record and which does 
 test("A CANNED PROMPT DOES NOT DESTROY WHAT YOU WERE HALF-WAY THROUGH TYPING", async () => {
   const page = newPage();
   await startTalking(page);
-  await page.el("text-entry").click();
   page.el("compose-text").value = "half a thought I have not finished";
 
   await page.el("canned-summary").click();
@@ -21098,7 +21279,6 @@ test("A CANNED PROMPT DOES NOT DESTROY WHAT YOU WERE HALF-WAY THROUGH TYPING", a
 test("and the composer's OWN send still clears it, because that text did come from there", async () => {
   const page = newPage();
   await startTalking(page);
-  await page.el("text-entry").click();
   page.el("compose-text").value = "did the retry-budget branch land";
   await page.el("send-text").click();
   assert.equal(page.el("compose-text").value, "", "the composer kept the message it just sent");
@@ -21107,7 +21287,6 @@ test("and the composer's OWN send still clears it, because that text did come fr
 test("TWO typed turns in a row are BOTH protected from the vendor echoing them back", async () => {
   const page = newPage();
   const socket = await startTalking(page);
-  await page.el("text-entry").click();
 
   for (const said of ["first question", "second question"]) {
     page.el("compose-text").value = said;

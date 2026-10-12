@@ -4035,25 +4035,24 @@ function renderEnterSends() {
  *     message with that word still uncommitted. `isComposing` is the standard signal, and keyCode
  *     229 is what Safari and older Chromium report for the same keystroke instead.
  *
- * `singleLine` is the call's box, an `<input>`. It cannot hold a new line, and a bare Enter in a
- * lone text input is a form submission that reloads the page under the call — so there an Enter
- * that does not send is swallowed rather than handed to the browser. It still does not send: with
- * the setting off, the call's box answers to the same keys as the others.
+ * Every box is a textarea, the call's included since `#241 voice-composer`. The call's used to be a
+ * one-line `<input>`, whose bare Enter is a form submission, so an Enter that did not send was
+ * swallowed there; a textarea's own Enter is a new line, which is what the setting being off asks
+ * for, so nothing is swallowed anywhere now.
  *
  * Returns what `send` returned, or undefined when nothing was sent. A browser ignores a listener's
  * return value; the page suite awaits it, so a send is finished before the next assertion reads it.
  *
  * @param {KeyboardEvent} event
  * @param {() => unknown} send
- * @param {boolean} [singleLine]
  * @returns {unknown}
  */
-function onComposerKey(event, send, singleLine = false) {
+function onComposerKey(event, send) {
   if (!event || event.key !== "Enter") return undefined;
   if (event.isComposing || event.keyCode === 229) return undefined;
   const chord = Boolean(event.ctrlKey || event.metaKey);
   const sends = chord || (enterSends && !event.shiftKey && !event.altKey);
-  if ((sends || singleLine) && event.preventDefault) {
+  if (sends && event.preventDefault) {
     event.preventDefault();
   }
   return sends ? send() : undefined;
