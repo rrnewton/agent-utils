@@ -3162,6 +3162,16 @@ const TUNING_BANDS = {
     "how much of a message the Undo chip's name holds, all of it in the tooltip and as much as fits " +
     "on the chip: under forty the tooltip says no more than the chip, past a hundred and sixty it is " +
     "a paragraph (#245 done-feedback)"],
+  EXCERPT_SURELY_SHOWN: [30, 120,
+    "how much of a folded message's first paragraph is taken to be on screen, so a search's hit in " +
+    "it is not repeated under the fold (#249 search-highlight): under a phone line's worth a hit the " +
+    "reader can see is said twice, past three narrow lines one the fold hides is never said at all"],
+  EXCERPT_CONTEXT: [10, 80,
+    "characters shown either side of a hit under a folded message (#249 search-highlight): under a " +
+    "couple of words a hit has no sense around it, past a line's worth three places fill the row"],
+  EXCERPT_PLACES: [1, 6,
+    "places under a folded message before it says how many more (#249 search-highlight): none says " +
+    "nothing, and many grow the line into a second copy of the message"],
   CLEAR_ARMED_MS: [1000, 20000,
     "the second tap that really clears: under a second the confirmation cannot be reached, over " +
     "twenty and a stray later tap still destroys the view"],
@@ -22162,8 +22172,10 @@ const spokenRows = (page) =>
 const ruledRows = (page) => page.el("transcript").children.filter((li) => li.className === "seam");
 // Matched on the FIRST class, because a row long enough to scroll is a row long enough to fold,
 // and a folded body is `body clamped`.
+// All of its text, as a browser's `textContent` reads it: the search's marks (`#249 search-highlight`)
+// split a body's text into pieces, and this fixture keeps an element's own text apart from theirs.
 const said = (li) =>
-  li.descendants().find((n) => String(n.className || "").split(" ")[0] === "body").textContent;
+  li.descendants().find((n) => String(n.className || "").split(" ")[0] === "body").text();
 
 const RECORD_EPOCH = 1_700_000_000_000;
 
@@ -43997,4 +44009,393 @@ test("`#251 author-filter`: in two columns it filters both, and the count speaks
       assert.equal(rowShownHere(li), li.getAttribute("data-who") === "me", `#${list} shows a row Mine does not keep, or hides one it does`);
     }
   }
+});
+
+// --- the hits, drawn where they are (#249 search-highlight) ----------------------------------------
+//
+// The owner: "if I search for the word "engine" let's say, it's still weird that we don't highlight
+// where the word hits within the filtered messages that have the word." Each hit is a `<mark>` built
+// from text nodes, never from markup; the row says exactly what it said; and a folded message whose
+// hit is beyond its fold says where under it.
+
+/** A node as markup, its own text and its text nodes included, so a test can say exactly what is drawn. */
+function drawnMarkup(node) {
+  if (node.nodeType === 3) return node.textContent;
+  const tag = String(node.tagName).toLowerCase();
+  const cls = node.className ? ` class="${node.className}"` : "";
+  return `<${tag}${cls}>${node.textContent}${node.children.map(drawnMarkup).join("")}</${tag}>`;
+}
+
+/** The text of every hit marked in `li`'s text, in order (the line under a fold left out). */
+const hitsIn = (li) => li.children.filter((kid) => !kid.hasClass("search-excerpt"))
+  .flatMap((kid) => kid.descendants()).filter((node) => node.tagName === "mark").map((node) => node.text());
+
+/** The line a search put under a folded row, or undefined. */
+const excerptOf = (li) => li.children.find((kid) => kid.hasClass("search-excerpt"));
+
+/** What a row says, the lines drawn between rows (`#249`, `#250`) left out. */
+const rowWords = (li) => li.children.filter((kid) => !kid.hasClass("row-seam")).map((kid) => kid.text()).join("");
+
+test("`#249 search-highlight`: every hit of every term is marked where it is, whatever its case, and the row says what it said", async () => {
+  const page = newPage();
+  await signIn(page);
+  const rows = await showDiscord(page, [
+    message({ id: "1", content: "The Engine stalled; restart the ENGINE and the engine room." }),
+    message({ id: "2", content: "nothing about it here" }),
+    // A word half in bold is one word on screen, and one hit.
+    message({ id: "3", content: "**en**gine notes", content_html: "<p><strong>en</strong>gine notes</p>\n" }),
+  ]);
+  const before = rows.map(rowWords);
+  await search(page, "engine");
+  await page.settle();
+  assert.deepStrictEqual(hitsIn(rows[0]), ["Engine", "ENGINE", "engine"], "a hit is unmarked, or marked in the wrong case");
+  assert.deepStrictEqual(hitsIn(rows[1]), [], "a row the search hides was marked");
+  assert.equal(drawnMarkup(boxesOf(rows[2])[0]),
+    '<div class="md"><p><strong><mark class="search-hit">en</mark></strong><mark class="search-hit">gine</mark> notes</p>\n</div>',
+    `a word half in bold is not marked whole, in its two pieces: ${drawnMarkup(boxesOf(rows[2])[0])}`);
+  assert.deepStrictEqual(rows.map(rowWords), before, "marking the hits changed what a row says");
+  // Two terms, and a quoted phrase: each term's hits; a phrase's only where it is whole.
+  await page.el("search-field").setValue("restart engine");
+  assert.deepStrictEqual(hitsIn(rows[0]), ["Engine", "restart", "ENGINE", "engine"]);
+  await page.el("search-field").setValue("\"engine room\"");
+  assert.deepStrictEqual(hitsIn(rows[0]), ["engine room"], "a phrase was marked word by word");
+  // Overlapping hits of two terms are one mark.
+  await page.el("search-field").setValue("engi gine");
+  assert.deepStrictEqual(hitsIn(rows[0]), ["Engine", "ENGINE", "engine"], "overlapping hits were marked twice");
+  // Cleared, every mark goes and the text is whole again, a text node as it was.
+  await page.el("search-field").setValue("");
+  assert.deepStrictEqual(rows.flatMap(hitsIn), [], "a mark outlived the search");
+  assert.equal(drawnMarkup(boxesOf(rows[2])[0]), '<div class="md"><p><strong>en</strong>gine notes</p>\n</div>');
+  assert.deepStrictEqual(rows.map(rowWords), before);
+  await search(page, "engine");
+  await page.el("search-toggle").click();
+  await page.settle();
+  assert.deepStrictEqual(rows.flatMap(hitsIn), [], "closing the search left its marks");
+});
+
+test("`#249 search-highlight`: hits in code, in a link's words, a link's address alone, the author and a rich header's pieces are all shown", async () => {
+  const page = newPage();
+  await signIn(page);
+  const rows = await showDiscord(page, [
+    message({ id: "1", content: "run `engine --check` first",
+      content_html: "<p>run <code>engine --check</code> first</p>\n" }),
+    message({ id: "2", content: "see [the engine docs](https://example.com/manual) and [this](https://example.com/engine)",
+      content_html: `<p>see <a href="https://example.com/manual" ${LINK_ATTRS}>the engine docs</a> and ` +
+        `<a href="https://example.com/engine" ${LINK_ATTRS}>this</a></p>\n` }),
+    message({ id: "3", content: "an engine report", ...ALICE, author: "engineer" }),
+    message({ id: "4", content: "[engine-bot] Engine check, 9:05 AM ET. All green.",
+      heading: { tag: "engine-bot", time: "9:05 AM ET", title: "Engine check", cut: 39 } }),
+  ]);
+  await search(page, "engine");
+  await page.settle();
+  assert.deepStrictEqual(hitsIn(rows[0]), ["engine"], "a hit in code is not marked");
+  assert.deepStrictEqual(hitsIn(rows[1]), ["engine"], "a hit in a link's words is not marked");
+  const anchors = rows[1].descendants().filter((node) => node.tagName === "a");
+  assert.deepStrictEqual(anchors.map((a) => a.hasClass("search-hit-link")), [false, true],
+    "only the link whose address alone holds the word is outlined");
+  const author = rows[2].descendants().find((node) => node.hasClass("msg-author"));
+  assert.equal(author.getAttribute("data-search-hit"), "", "an author whose name holds the word is not lit");
+  assert.equal(author.text(), "engineer", "lighting the author changed its name");
+  // The header's pieces, each on its own; and the words they restate, hidden while the header shows.
+  const head = headOf(rows[3]);
+  assert.deepStrictEqual(head.children.map((piece) => [piece.className, piece.text(), hitsIn({ children: [piece] }).length]),
+    [["rh-tag", "engine-bot", 1], ["rh-title", "Engine check", 1], ["rh-time", "@9:05 AM ET", 0]]);
+  // Under Links, the links drawn in place of the text.
+  await page.el("links-filter").click();
+  await page.settle();
+  const list = rows[1].children.find((node) => node.className === "row-links");
+  assert.deepStrictEqual(list.descendants().filter((node) => node.tagName === "mark").map((node) => node.text()), ["engine"],
+    "a hit in the Links view's list is not marked");
+  assert.ok(list.children[1].hasClass("search-hit-link"), "the Links view does not outline the link found by its address");
+  await page.el("search-toggle").click();
+  await page.settle();
+  assert.equal(author.getAttribute("data-search-hit"), null, "the author stayed lit after the search");
+  assert.deepStrictEqual(anchors.map((a) => a.hasClass("search-hit-link")), [false, false]);
+});
+
+test("`#249 search-highlight`: markup in a message stays text, and a mark is built of text nodes, never parsed", async () => {
+  const page = newPage();
+  await signIn(page);
+  const rows = await showDiscord(page, [
+    message({ id: "1", content: "<b>engine</b> & <script>engine()</script>" }),
+  ]);
+  const templates = page.templatesParsed;
+  await search(page, "engine");
+  await page.settle();
+  assert.deepStrictEqual(hitsIn(rows[0]), ["engine", "engine"]);
+  assert.equal(rows[0].text().includes("<b>engine</b> & <script>engine()</script>"), true, "the text is not what was written");
+  for (const tag of ["b", "script"]) assert.ok(!page.createdTags.includes(tag), `the text became a <${tag}>`);
+  assert.equal(page.templatesParsed, templates, "marking parsed something as HTML");
+  // The page has one HTML sink, and marking added none.
+  assert.equal((SCRIPT_CODE.match(/\.innerHTML\s*=/g) || []).length, 1, "a second place parses HTML");
+});
+
+test("`#249 search-highlight`: a combined row is marked in each of its messages, and a turn of the call is marked too", async () => {
+  const page = newPage();
+  await signIn(page);
+  const first = message({ id: "1", content: "the engine part one" });
+  const second = message({ id: "2", content: "and the engine part two",
+    timestamp: new Date(Date.parse(first.timestamp) + 1500).toISOString() });
+  const rows = await showDiscord(page, [first, second]);
+  assert.equal(rows.length, 1, "the fixture made no combined row");
+  await search(page, "engine");
+  await page.settle();
+  assert.deepStrictEqual(boxesOf(rows[0]).map((box) => box.descendants().filter((n) => n.tagName === "mark").length), [1, 1]);
+  // The call's transcript.
+  await page.el("search-toggle").click();
+  await startTalking(page);
+  assistantSays(page, "the engine is warm");
+  await page.settle();
+  await search(page, "warm");
+  await page.settle();
+  const turn = unfiltered(page, "transcript").find((li) => li.text().includes("engine is warm"));
+  assert.deepStrictEqual(hitsIn(turn), ["warm"], "a turn of the call was not marked");
+  assert.equal(said(turn), "the engine is warm");
+});
+
+test("`#249 search-highlight`: a folded message whose hit is past its fold says where, under it, until it is opened", async () => {
+  const page = newPage();
+  await signIn(page);
+  const late = `${"plain words without it. ".repeat(14)}Then the engine stalled at noon, and later the engine ` +
+    `restarted. ${"more plain words here. ".repeat(4)}`;
+  const early = `The engine first. ${"plain words without it. ".repeat(14)}`;
+  const many = Array.from({ length: 5 }, (_unused, i) => `${"filler words go on here. ".repeat(4)}engine ${i}.`).join(" ");
+  const rows = await showDiscord(page, [
+    message({ id: "1", content: late }),
+    message({ id: "2", content: early }),
+    message({ id: "3", content: many }),
+    message({ id: "4", content: "a short engine note" }),
+  ]);
+  assert.equal(rows[0].getAttribute("data-collapsed"), "true", "the fixture's long message is not folded");
+  await search(page, "engine");
+  await page.settle();
+  const line = excerptOf(rows[0]);
+  assert.ok(line, "a folded message with a hit past its fold says nothing about it");
+  assert.equal(line.hidden, false);
+  assert.match(line.text(), /^Further down: …plain words without it\. Then the engine stalled at noon, and later the engine restarted\. more plain words here\.…$/,
+    `the line does not show the hits with words either side: ${line.text()}`);
+  assert.deepStrictEqual(line.descendants().filter((n) => n.tagName === "mark").map((n) => n.text()), ["engine", "engine"]);
+  // After the text, before what follows it; and gone from sight while the message is open.
+  const order = rows[0].children.map((kid) => kid.className);
+  assert.ok(order.indexOf("search-excerpt") === order.indexOf("body clamped") + 1, `the line is not straight after the text: ${order}`);
+  await foldButton(rows[0]).click();
+  await page.settle();
+  assert.equal(line.hidden, true, "the line stayed under an open message, whose hits are in its text");
+  await foldButton(rows[0]).click();
+  await page.settle();
+  assert.equal(line.hidden, false);
+  // A hit in the opening words is on screen already, and is not repeated.
+  assert.equal(excerptOf(rows[1]), undefined, "a hit the fold shows was repeated under it");
+  // Past three places, it says how many more.
+  assert.match(excerptOf(rows[2]).text(), /\+2 more$/, `the line does not say how many more: ${excerptOf(rows[2]).text()}`);
+  // A message too short to fold has no line.
+  assert.equal(excerptOf(rows[3]), undefined);
+  // Under Links the row shows its links, and the line goes with its text; cleared, it goes.
+  assert.match(cssBlock('.messages li[data-links-view="true"] > .search-excerpt'), /display:\s*none !important/);
+  await page.el("search-field").setValue("");
+  assert.equal(excerptOf(rows[0]), undefined, "the line outlived the search");
+  // A tap on it is a tap on the row, which opens the message.
+  await page.el("search-field").setValue("engine");
+  await tapRowAt(page, excerptOf(rows[0]));
+  assert.equal(rows[0].getAttribute("data-collapsed"), "false", "a tap on the line did not open the message");
+});
+
+/** A tap on `node`, inside a row, as a finger makes it: on the row it is in. */
+async function tapRowAt(page, node) {
+  let row = node;
+  while (row && !row.hasClass("discord-message")) row = row.parentNode;
+  await row.dispatch("click", { target: node });
+  await page.settle();
+}
+
+test("`#249 search-highlight`: a redraw with the same search writes nothing, and reads no row's layout", async () => {
+  const page = newPage();
+  await signIn(page);
+  await showDiscord(page, Array.from({ length: 12 }, (_unused, i) =>
+    message({ id: String(i + 1), content: i % 2 ? `engine report ${i}` : `${"long words. ".repeat(30)}engine at the end ${i}` })));
+  await search(page, "engine");
+  await page.settle();
+  const marks = page.el("discord-log").descendants().filter((n) => n.tagName === "mark").length;
+  assert.ok(marks >= 12, `the fixture marked ${marks} hits`);
+  const made = page.createdTags.length;
+  const replace = FakeElement.prototype.replaceChildren;
+  const rect = FakeElement.prototype.getBoundingClientRect;
+  let replaced = 0;
+  let measured = 0;
+  const list = page.el("discord-log");
+  FakeElement.prototype.replaceChildren = function counted(...kids) {
+    if (nodeWithinFixture(list, this)) replaced += 1;
+    return replace.apply(this, kids);
+  };
+  FakeElement.prototype.getBoundingClientRect = function counted() {
+    if (nodeWithinFixture(list, this)) measured += 1;
+    return rect.call(this);
+  };
+  try {
+    // The same query again — a redraw, as a poll's or a keystroke's — and the same rows.
+    await page.el("search-field").setValue("engine");
+    await page.settle();
+  } finally {
+    FakeElement.prototype.replaceChildren = replace;
+    FakeElement.prototype.getBoundingClientRect = rect;
+  }
+  assert.equal(builtSince(page, made, "mark"), 0, "the same search marked its hits again");
+  assert.equal(replaced, 0, "the same search wrote into a row");
+  assert.ok(measured <= 4, `the same search read the layout of ${measured} rows`);
+});
+
+/** Whether `node` is `root` or inside it, in the fixture's tree. */
+function nodeWithinFixture(root, node) {
+  for (let at = node; at; at = at.parentNode) if (at === root) return true;
+  return false;
+}
+
+// The owner, of the same search: "as we filter out all the other messages I would like to use the same
+// idiom as the "4 read messages" collapsed indicators. We should show gaps and say "N unmatched
+// messages"." A line in each gap a filter choosing rows leaves, counting messages as a run does.
+
+/** Each row's lines as `[id, above, below]`, the words of each or null, for the rows drawing any. */
+function seamsOf(page, list = "discord-log") {
+  return page.el(list).children.map((li) => {
+    const line = (below) => li.children.find((kid) => kid.hasClass("row-seam") && kid.hasClass("row-seam-below") === below);
+    const above = line(false);
+    const under = line(true);
+    return [li.getAttribute("data-id"), above ? above.textContent : null, under ? under.textContent : null];
+  }).filter(([, above, below]) => above !== null || below !== null);
+}
+
+test("`#249 search-highlight`: a search draws a line in each gap it leaves, counting the messages in it, before the first match and after the last", async () => {
+  const page = newPage();
+  await signIn(page);
+  const messages = authorChannel();
+  // 4 and 5 are one combined row: a gap counts messages, not rows.
+  messages[4] = { ...messages[4], timestamp: new Date(Date.parse(messages[3].timestamp) + 1500).toISOString(), ...CODER };
+  const rows = await showDiscord(page, messages);
+  assert.ok(rows.some((li) => li.getAttribute("data-ids") === "4 5"), "the fixture made no combined row");
+  assert.deepStrictEqual(seamsOf(page), [], "a line was drawn with no filter on");
+  await search(page, "deploy");
+  await page.settle();
+  // deploy is in 4 (with 5), 8 and 12; 1-3 lead, 6-7 between, 9-11 between, nothing trails.
+  assert.deepStrictEqual(seamsOf(page), [
+    ["4", "… 3 unmatched messages …", null],
+    ["8", "… 2 unmatched messages …", null],
+    ["12", "… 3 unmatched messages …", null],
+  ]);
+  const line = rows.find((li) => li.getAttribute("data-id") === "8").children[0];
+  assert.equal(line.className, "row-seam", "the line is not the row's first child, ahead of its message");
+  assert.equal(line.getAttribute("role"), "separator", "the line is not a separator to a screen reader");
+  assert.equal(line.getAttribute("aria-label"), "2 unmatched messages");
+  assert.equal(rows.find((li) => li.getAttribute("data-id") === "8").getAttribute("data-seam"), "gap");
+  // A trailing gap is drawn below the last match; one message is said as one.
+  await page.el("search-field").setValue("step 8");
+  assert.deepStrictEqual(seamsOf(page), [["8", "… 7 unmatched messages …", "… 4 unmatched messages …"]]);
+  await page.el("search-field").setValue("message 11");
+  assert.deepStrictEqual(seamsOf(page), [["11", "… 10 unmatched messages …", "… 1 unmatched message …"]]);
+  assert.equal(rows.find((li) => li.getAttribute("data-id") === "11").getAttribute("data-seam-below"), "gap");
+  // Cleared, every line goes, and its row's attribute with it.
+  await page.el("search-field").setValue("");
+  assert.deepStrictEqual(seamsOf(page), [], "a line outlived the search");
+  assert.ok(rows.every((li) => !li.hasAttribute("data-seam") && !li.hasAttribute("data-seam-below")));
+  // Whose messages and Links choose rows too, and draw their gaps; Pinned alone is its own list.
+  await chooseAuthor(page, "mine");
+  assert.deepStrictEqual(seamsOf(page), [
+    ["3", "… 2 unmatched messages …", null], ["6", "… 2 unmatched messages …", null],
+    ["9", "… 2 unmatched messages …", null], ["12", "… 2 unmatched messages …", null],
+  ]);
+  await chooseAuthor(page, "everyone");
+  await page.el("links-filter").click();
+  await page.settle();
+  assert.deepStrictEqual(seamsOf(page), [["6", "… 5 unmatched messages …", null], ["7", null, "… 5 unmatched messages …"]]);
+});
+
+test("`#249 search-highlight`: the Pinned list draws gaps only while a filter chooses among the pins", async () => {
+  const page = newPage();
+  const messages = authorChannel();
+  for (const n of [2, 3, 4, 8, 11]) page.pinned.set(String(n), storedPin(messages[n - 1], n));
+  page.servePinsRevision = true;
+  page.pinsRevision = 5;
+  await signIn(page);
+  await showDiscord(page, messages);
+  await showPinned(page);
+  assert.deepStrictEqual(seamsOf(page, "pinned-log"), [], "the pins drew a gap where nothing is hidden");
+  await page.el("search-field").setValue("deploy");
+  assert.deepStrictEqual(seamsOf(page, "pinned-log"), [
+    ["4", "… 2 unmatched messages …", null], ["8", null, "… 1 unmatched message …"],
+  ]);
+});
+
+test("`#249 search-highlight`: a gap never meets a collapsed run, and the lines are drawn in room of their own, quietly, never as a control", async () => {
+  const page = newPage();
+  await signIn(page);
+  const messages = authorChannel();
+  for (const m of messages) if (Number(m.id) < 10) page.dealtWith.add(m.id);
+  await showDiscord(page, messages);
+  await chooseReadMode(page, "Collapse read");
+  assert.ok(collapsedRows(page).length > 0, "the fixture collapsed nothing");
+  assert.deepStrictEqual(seamsOf(page), [], "Collapse read drew a gap");
+  await search(page, "deploy");
+  await page.settle();
+  assert.deepStrictEqual(collapsedRows(page), [], "a run stayed collapsed beside a gap");
+  assert.deepStrictEqual(seamsOf(page).map(([id]) => id), ["4", "8", "12"]);
+  // The stylesheet: fixed room above the row, the line in it, the run's quiet dashed shape.
+  assert.match(cssBlock('#discord-log li.discord-message[data-seam="gap"]'), /--seam-room:\s*var\(--gap-room\)/);
+  assert.match(cssBlock("#discord-log li.discord-message[data-seam]"), /margin-top:\s*var\(--seam-room\)/);
+  assert.match(cssBlock("#discord-log li.discord-message[data-seam-below]"), /margin-bottom:\s*var\(--gap-room\)/);
+  const line = cssBlock("#discord-log .row-seam");
+  assert.match(line, /position:\s*absolute/);
+  assert.match(line, /bottom:\s*calc\(100% \+ 1px\)/);
+  assert.match(line, /pointer-events:\s*none/, "a stray tap could land on the line");
+  assert.match(line, /color:\s*var\(--muted\)/);
+  assert.match(line, /filter:\s*none !important/, "a receding row would drain the line with it");
+  assert.match(cssBlock("#discord-log .row-seam::before"), /border-top:\s*1px dashed var\(--edge\)/);
+  assert.match(cssBlock("#pinned-log .row-seam"), /position:\s*absolute/, "the Pinned list draws no lines");
+  // A row the line is drawn on recedes in its box, as the bookmark's does, so the line keeps its colour.
+  assert.match(cssBlock("#discord-log li.discord-message[data-seam][data-who]"), /opacity:\s*1/);
+  assert.match(cssBlock("#discord-log li.discord-message[data-seam]::after"), /--row-veil/);
+  // ...and the bookmark's line, when it is on the same row, nearer the row, above it.
+  assert.match(cssBlock('#discord-log li.discord-message[data-seam][data-bookmark="above"]'),
+    /margin-top:\s*calc\(var\(--seam-room\) \+ var\(--bookmark-room\)\)/);
+});
+
+test("`#249 search-highlight`: a redraw that changes nothing writes no line, and the lines move with the search", async () => {
+  const page = newPage();
+  await signIn(page);
+  await showDiscord(page, authorChannel());
+  await search(page, "deploy");
+  await page.settle();
+  const lines = page.el("discord-log").descendants().filter((node) => node.hasClass("row-seam"));
+  assert.equal(lines.length, 3);
+  const set = FakeElement.prototype.setAttribute;
+  let written = 0;
+  FakeElement.prototype.setAttribute = function counted(name, value) {
+    if (name === "data-seam" || name === "data-seam-below" || (lines.includes(this) && name === "aria-label")) written += 1;
+    return set.call(this, name, value);
+  };
+  try {
+    await page.el("search-field").setValue("deploy");
+    await page.settle();
+  } finally {
+    FakeElement.prototype.setAttribute = set;
+  }
+  assert.equal(written, 0, "a redraw that changed nothing wrote the lines again");
+  assert.equal(builtSince(page, 0, "div") > 0, true);
+  assert.deepStrictEqual(page.el("discord-log").descendants().filter((node) => node.hasClass("row-seam")), lines,
+    "the same search made its lines again");
+});
+
+test("`#249 search-highlight`: the cards of the right column are marked where the search finds them", async () => {
+  const page = await threadPage();
+  await twoColumns(page);
+  await search(page, "root");
+  await page.settle();
+  const cards = page.el("side-cards").children.filter((li) => !li.hasClass("search-hidden"));
+  assert.ok(cards.length > 0, "no card matched the fixture's search");
+  for (const card of cards) {
+    const text = card.descendants().find((node) => node.hasClass("side-card-text"));
+    assert.deepStrictEqual(text.descendants().filter((node) => node.tagName === "mark").map((node) => node.text()), ["root"],
+      `a card's text is not marked: ${text.text()}`);
+  }
+  await page.el("search-toggle").click();
+  await page.settle();
+  assert.equal(page.el("side-cards").descendants().filter((node) => node.tagName === "mark").length, 0, "a card kept its mark");
 });

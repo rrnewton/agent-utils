@@ -1715,6 +1715,10 @@ function setFolded(entry, folded) {
   // `#244 elision-word-count`. Under the clamped lines only: an open message hides nothing, and a
   // summary standing in for the lines is not the text the count is about.
   if (entry.elided) entry.elided.hidden = !folded || summarised;
+  // `#249 search-highlight`. The search's line of hits beyond the fold, while it is folded: open, they
+  // are in the text.
+  const marked = entry.li.searchMarks;
+  if (marked && marked.excerpt) marked.excerpt.hidden = !folded;
 }
 
 const isFolded = (entry) => entry.li.getAttribute("data-collapsed") === "true";
@@ -1776,6 +1780,8 @@ function foldable(li, meta, body, text, messageId, alsoIds = []) {
     li.append(entry.note);
     applySummaryState(entry);
   }
+  // `#249 search-highlight`. The row's fold, for the line the search puts under a folded message.
+  li.foldEntry = entry;
   // Folded UNLESS the reader had already opened this message. The rebuild is invisible to them;
   // a message that was open before the poll is open after it.
   setFolded(entry, !(entry.id !== null && expandedIds.has(entry.id)));
@@ -2653,6 +2659,8 @@ function applySearch() {
       const said = terms.length === 0 || (text !== null && terms.every((term) => text.includes(term)));
       const hit = said && (!links || shown > 0) && authorPasses(row, author);
       setClassWord(row, "search-hidden", !hit);
+      // `#249 search-highlight`. Where each term is, in the rows it lets through.
+      markSearchHits(row, hit && text !== null ? terms : []);
       if (counts && text !== null) {
         loaded += 1;
         const held = links ? heldLinks(row) : [];
@@ -2676,6 +2684,10 @@ function applySearch() {
       }
     }
   }
+  // `#249 search-highlight`. The lines between the rows of the channel's lists, from what the pass
+  // above has just shown — before the arrows, which reach across them.
+  drawSeams(el("discord-log"));
+  drawSeams(el("pinned-log"));
   // `#214 reply-arrow`. What the reader can see directly above a reply is what its arrow is drawn
   // against, and the pass above has just decided that.
   renderReplyLinks();
@@ -2812,6 +2824,494 @@ function linksEmptySentence(loaded, tally, matched, author = "everyone") {
 /** Whether the filters have emptied the list on screen, and `#search-empty` is saying why. */
 function listEmptied() {
   return !el("search-empty").hidden;
+}
+
+// --- the hits, drawn where they are ----------------------------------------------------------------
+//
+// `#249 search-highlight`. The owner: "if I search for the word "engine" let's say, it's still weird
+// that we don't highlight where the word hits within the filtered messages that have the word." So
+// every hit of every term is drawn, in each message the search lets through, where it is.
+//
+// IN THE PAGE, because the search is the page's own: what it matches is the text each row declared
+// (`searchable`), and the same words are drawn in the row. A hit is marked by splitting the text node
+// it is in and putting the hit in a `<mark>` — built with `createElement` and `createTextNode`, never
+// from a string, so `insertSanitizedHtml` stays the one place this page parses HTML, and a message
+// holding "<b>" holds those three characters, marked or not. The marks change no character: copy,
+// speech and every count read the same text.
+//
+//   * WHERE: the words the reader reads — the message's text (code included, which the search
+//     matches too), a rich header's tag, title and time, each on its own, and under Links the links
+//     drawn in its place. Never a button, a time or a chip. The author's name is lit whole, by an
+//     attribute, because the pass that says who wrote a row writes its name again on every redraw.
+//   * HOW: case-insensitive, as the match is; across the pieces one block of text is drawn in, so a
+//     word half in bold is lit whole, but never across two blocks, which the search never joins
+//     either. Where two terms' hits overlap they are one mark. A term found only in a link's address,
+//     which is matched but not drawn, outlines that link instead.
+//   * A FOLDED MESSAGE WHOSE HIT IS BEYOND ITS FOLD says so under it: the hits in a line of their
+//     own, each with a few words either side, and how many more there are — rather than opening
+//     every match as the reader types, which would turn a common word into a wall and move the list
+//     under every keystroke. A tap opens it, as a tap on the row does.
+//   * ONCE A ROW, PER QUERY: each row keeps what it was marked for, so a redraw that changes nothing
+//     writes nothing (`#226 page-energy-profile`), and a row a read rebuilds is new and marked once.
+
+/** The class of a hit drawn in a row's text. */
+const SEARCH_HIT_CLASS = "search-hit";
+
+/** The class on a link whose address alone holds a term. */
+const SEARCH_HIT_LINK_CLASS = "search-hit-link";
+
+/** How many characters of a message's first paragraph are surely inside its fold at any width. */
+const EXCERPT_SURELY_SHOWN = 60;
+
+/** How many characters a hit is shown with either side of it, in the line under a folded message. */
+const EXCERPT_CONTEXT = 30;
+
+/** How many places the line under a folded message shows before it says how many more there are. */
+const EXCERPT_PLACES = 3;
+
+/** An element's class words. */
+const classWords = (node) => String((node && node.className) || "").split(/\s+/);
+
+/**
+ * Where each term is in `lower`, a lower-cased text, as `[start, end]` pairs in order: overlapping
+ * and touching hits of different terms joined into one.
+ */
+function hitRanges(lower, terms) {
+  const found = [];
+  for (const term of terms) {
+    for (let at = lower.indexOf(term); at >= 0; at = lower.indexOf(term, at + term.length)) {
+      found.push([at, at + term.length]);
+    }
+  }
+  found.sort((a, b) => a[0] - b[0]);
+  const joined = [];
+  for (const range of found) {
+    const last = joined[joined.length - 1];
+    if (last && range[0] <= last[1]) last[1] = Math.max(last[1], range[1]);
+    else joined.push([range[0], range[1]]);
+  }
+  return joined;
+}
+
+/**
+ * The hits of `terms` in `text`, as `[start, end]` pairs in `text`'s own offsets. Matched in the
+ * lower case the search matches in; where lower-casing changes a character's length, the offsets are
+ * mapped back one character at a time.
+ */
+function textHits(text, terms) {
+  const whole = text.toLowerCase();
+  if (whole.length === text.length) return hitRanges(whole, terms);
+  let lower = "";
+  const back = [];
+  for (let at = 0; at < text.length;) {
+    const character = String.fromCodePoint(/** @type {number} */ (text.codePointAt(at)));
+    const folded = character.toLowerCase();
+    for (let unit = 0; unit < folded.length; unit += 1) back.push(at);
+    lower += folded;
+    at += character.length;
+  }
+  back.push(text.length);
+  return hitRanges(lower, terms)
+    .map(([start, end]) => [back[start], back[end]])
+    .filter(([start, end]) => end > start);
+}
+
+/** A `<mark>` holding `text`, as a hit. */
+function hitMark(text) {
+  const mark = document.createElement("mark");
+  mark.className = SEARCH_HIT_CLASS;
+  mark.textContent = text;
+  return mark;
+}
+
+/**
+ * The runs of text in `part`, each a list of the text nodes one block of it is drawn in, in order: a
+ * block's edge, a line break or a control ends a run. An element holding its text without a text node
+ * of its own stands for one (`own`); no browser builds one, but the page's test fixture does.
+ *
+ * @returns {Array<Array<{node: any, own: boolean}>>}
+ */
+function textRunsOf(part) {
+  const runs = [];
+  let run = [];
+  const end = () => {
+    if (run.length) runs.push(run);
+    run = [];
+  };
+  const walk = (at) => {
+    const kids = at.childNodes;
+    if (kids.length === 0 && at.nodeType === 1 && at.textContent) {
+      run.push({ node: at, own: true });
+      return;
+    }
+    for (const kid of [...kids]) {
+      if (kid.nodeType === 3) {
+        if (kid.textContent) run.push({ node: kid, own: false });
+        continue;
+      }
+      if (kid.nodeType !== 1) continue;
+      const tag = String(kid.tagName).toLowerCase();
+      if (tag === "br" || tag === "button" || tag === "input") {
+        end();
+        continue;
+      }
+      const block = TEXT_BLOCKS.has(tag);
+      if (block) end();
+      walk(kid);
+      if (block) end();
+    }
+  };
+  walk(part);
+  end();
+  return runs;
+}
+
+/**
+ * Mark every hit of `terms` in `part`, and answer the marks made. Each run of text is matched as one,
+ * and each piece of a hit is marked in the text node it is in.
+ */
+function markHitsIn(part, terms) {
+  const marks = [];
+  for (const run of textRunsOf(part)) {
+    const texts = run.map((piece) => String(piece.node.textContent));
+    const ranges = textHits(texts.join(""), terms);
+    if (ranges.length === 0) continue;
+    let from = 0;
+    run.forEach((piece, index) => {
+      const text = texts[index];
+      const to = from + text.length;
+      const pieces = [];
+      let cursor = 0;
+      for (const [start, end] of ranges) {
+        if (end <= from || start >= to) continue;
+        const a = Math.max(start, from) - from;
+        const b = Math.min(end, to) - from;
+        if (a > cursor) pieces.push(document.createTextNode(text.slice(cursor, a)));
+        const mark = hitMark(text.slice(a, b));
+        pieces.push(mark);
+        marks.push(mark);
+        cursor = b;
+      }
+      from = to;
+      if (pieces.length === 0) return;
+      if (cursor < text.length) pieces.push(document.createTextNode(text.slice(cursor)));
+      if (piece.own) {
+        piece.node.replaceChildren(...pieces);
+        return;
+      }
+      const parent = piece.node.parentNode;
+      parent.replaceChildren(...[...parent.childNodes].flatMap((kid) => (kid === piece.node ? pieces : [kid])));
+    });
+  }
+  return marks;
+}
+
+/**
+ * Put back the text the marks in `marks` split: each mark becomes its text again, and the text nodes
+ * either side of it are one again — or, where that leaves an element holding nothing but text, the
+ * element holds it as its text, as it did.
+ */
+function unmarkHits(marks) {
+  const parents = new Set();
+  for (const mark of marks) {
+    const parent = mark.parentNode;
+    if (!parent) continue;
+    parents.add(parent);
+    const text = document.createTextNode(String(mark.textContent));
+    parent.replaceChildren(...[...parent.childNodes].map((kid) => (kid === mark ? text : kid)));
+  }
+  for (const parent of parents) {
+    const kids = [...parent.childNodes];
+    if (kids.every((kid) => kid.nodeType === 3)) {
+      const text = kids.map((kid) => kid.textContent).join("");
+      parent.replaceChildren();
+      parent.textContent = text;
+      continue;
+    }
+    const merged = [];
+    for (const kid of kids) {
+      const last = merged[merged.length - 1];
+      if (kid.nodeType === 3 && last && last.nodeType === 3) {
+        merged[merged.length - 1] = document.createTextNode(`${last.textContent}${kid.textContent}`);
+      } else {
+        merged.push(kid);
+      }
+    }
+    if (merged.length !== kids.length) parent.replaceChildren(...merged);
+  }
+}
+
+/**
+ * The parts of `row` a hit is drawn in, and its author's name, which is lit whole. See the head of
+ * this section for which and why.
+ */
+function findableParts(row) {
+  const parts = [];
+  let author = null;
+  const fromMeta = (meta) => {
+    for (const piece of meta.children) {
+      const words = classWords(piece);
+      if (words.includes("msg-author") || words.includes("who")) author = piece;
+      // A rich header's pieces each on their own: `#242 rich-headers`.
+      else if (words.includes("rh-head")) parts.push(...piece.children);
+    }
+  };
+  for (const kid of row.children) {
+    const words = classWords(kid);
+    if (words.includes("meta")) fromMeta(kid);
+    else if (words.includes("body") || words.includes("msg-text") || words.includes("row-links")) parts.push(kid);
+    else if (words.includes("thread-open")) parts.push(...[...kid.children].filter((one) => String(one.tagName).toLowerCase() === "strong"));
+    else if (words.includes("side-card")) parts.push(...[...kid.children].filter((one) => classWords(one).includes("side-card-text")));
+  }
+  return { parts, author };
+}
+
+/** The anchors in `parts`, the drawn links among the row's words. */
+function anchorsAmong(parts) {
+  const found = [];
+  const walk = (at) => {
+    for (const kid of at.children) {
+      if (String(kid.tagName).toLowerCase() === "a") found.push(kid);
+      else walk(kid);
+    }
+  };
+  for (const part of parts) walk(part);
+  return found;
+}
+
+/** What the line under a folded message is read from: its messages' text, or a turn's. */
+function excerptSource(row) {
+  const messages = rowMessages(row);
+  if (messages.length) return messages.map(messageText).join("\n");
+  return typeof row.linkText === "string" ? row.linkText : "";
+}
+
+/**
+ * The line under a folded message with a hit beyond its fold, or null: up to `EXCERPT_PLACES` places,
+ * each the hits with `EXCERPT_CONTEXT` characters either side cut at a word's edge, and how many hits
+ * are in the rest. A hit inside the first `EXCERPT_SURELY_SHOWN` characters of the first paragraph is
+ * on screen at every width, and is not repeated here.
+ */
+function searchExcerpt(text, terms) {
+  const hits = textHits(text, terms);
+  const firstBreak = text.indexOf("\n");
+  const shown = Math.min(firstBreak < 0 ? text.length : firstBreak, EXCERPT_SURELY_SHOWN);
+  const late = hits.filter(([, end]) => end > shown);
+  if (late.length === 0) return null;
+  // A place starts and ends at a word's edge, within a few characters of where the context would.
+  const edge = (at, step) => {
+    let to = at;
+    for (let moved = 0; moved < 12 && to > 0 && to < text.length && !/\s/.test(text[step < 0 ? to - 1 : to]); moved += 1) {
+      to += step;
+    }
+    return /\s/.test(text[step < 0 ? to - 1 : to] || " ") ? to : at;
+  };
+  const places = [];
+  for (const [start, end] of late) {
+    const from = start - EXCERPT_CONTEXT <= 0 ? 0 : edge(start - EXCERPT_CONTEXT, -1);
+    const to = end + EXCERPT_CONTEXT >= text.length ? text.length : edge(end + EXCERPT_CONTEXT, 1);
+    const last = places[places.length - 1];
+    if (last && from <= last.to) last.to = Math.max(last.to, to);
+    else places.push({ from, to });
+  }
+  const line = document.createElement("div");
+  line.className = "search-excerpt";
+  const lead = document.createElement("span");
+  lead.className = "sr-only";
+  lead.textContent = "Further down: ";
+  line.append(lead);
+  places.slice(0, EXCERPT_PLACES).forEach((place, index) => {
+    if (index > 0) line.append(document.createTextNode(" · "));
+    const words = text.slice(place.from, place.to).replace(/\s+/g, " ");
+    const said = document.createElement("span");
+    said.className = "search-excerpt-place";
+    said.textContent = `${place.from > 0 ? "…" : ""}${words.trim()}${place.to < text.length ? "…" : ""}`;
+    line.append(said);
+  });
+  const more = places.slice(EXCERPT_PLACES).reduce((sum, place) =>
+    sum + hits.filter(([start, end]) => start >= place.from && end <= place.to).length, 0);
+  if (more > 0) {
+    const tail = document.createElement("span");
+    tail.className = "search-excerpt-more";
+    tail.textContent = ` +${more} more`;
+    line.append(tail);
+  }
+  for (const said of [...line.children].filter((kid) => classWords(kid).includes("search-excerpt-place"))) {
+    markHitsIn(said, terms);
+  }
+  return line;
+}
+
+/**
+ * Draw the hits of `terms` in `row`, or take them away when `terms` is empty. Kept on the row as
+ * `searchMarks`: the terms it was marked for, the links drawn under Links that it marked, and what it
+ * made. The same again writes nothing.
+ */
+function markSearchHits(row, terms) {
+  const key = terms.join("\u0000");
+  const links = row.linkView && row.linkView.node && row.linkView.node.parentNode === row ? row.linkView.node : null;
+  const held = row.searchMarks;
+  if (held ? held.key === key && held.links === links : key === "") return;
+  if (held) {
+    unmarkHits(held.marks);
+    for (const anchor of held.outlined) setClassWord(anchor, SEARCH_HIT_LINK_CLASS, false);
+    if (held.author && held.author.hasAttribute("data-search-hit")) held.author.removeAttribute("data-search-hit");
+    if (held.excerpt && held.excerpt.parentNode === row) row.removeChild(held.excerpt);
+    row.searchMarks = null;
+  }
+  if (key === "") return;
+  const { parts, author } = findableParts(row);
+  // The addresses the search matched and the screen does not show: their links are outlined. Read
+  // before any text is split.
+  const outlined = anchorsAmong(parts).filter((anchor) => {
+    const href = String(anchor.getAttribute("href") || "").toLowerCase();
+    const words = (anchor.childNodes.length ? renderedText(anchor) : String(anchor.textContent)).toLowerCase();
+    return terms.some((term) => href.includes(term) && !words.includes(term));
+  });
+  for (const anchor of outlined) setClassWord(anchor, SEARCH_HIT_LINK_CLASS, true);
+  const marks = parts.flatMap((part) => markHitsIn(part, terms));
+  const named = author && terms.some((term) => String(author.textContent).toLowerCase().includes(term)) ? author : null;
+  if (named) named.setAttribute("data-search-hit", "");
+  // The line under a folded message, after its text and #244's count of what the fold hides.
+  const entry = row.foldEntry;
+  const excerpt = entry ? searchExcerpt(excerptSource(row), terms) : null;
+  if (excerpt) {
+    excerpt.hidden = !isFolded(entry);
+    const kids = [...row.children];
+    const after = kids.find((kid) => classWords(kid).includes("elided")) || entry.body;
+    row.replaceChildren(...kids.flatMap((kid) => (kid === after ? [kid, excerpt] : [kid])));
+  }
+  row.searchMarks = { key, links, marks, outlined, author: named, excerpt };
+}
+
+// --- the lines between rows -----------------------------------------------------------------------
+//
+// `#249 search-highlight`. The owner, of a search: "as we filter out all the other messages I would
+// like to use the same idiom as the "4 read messages" collapsed indicators. We should show gaps and
+// say "N unmatched messages"." So where a filter choosing rows — the search text, Links, whose
+// messages — takes messages out from between two it shows, a line stands in the gap, the collapsed
+// run's line in shape: "… 12 unmatched messages …", counting messages as a run does.
+//
+// ONE PASS DRAWS EVERY SUCH LINE, `drawSeams`, at the end of the search's pass and after the read
+// runs, which decide what is shown; the bookmark's line is placed after it. It looks at each row
+// shown and at the STRETCH before it: the messages hidden between it and the row shown before. A
+// stretch is either a collapsed run — drawn on the run's own first row, as `#221 read-modes` draws it
+// — or, while a filter chooses rows, an unmatched gap, drawn above the row after it. The two never
+// meet: a filter choosing rows opens every run. Nor does a gap meet the bookmark, which is not drawn
+// while a filter chooses rows.
+//
+// DRAWN AS THE BOOKMARK'S LINE IS: a child of the row it stands above (`.row-seam`), placed in a
+// margin that row keeps above its tile, so the list still holds nothing but messages and every walk
+// over its rows walks only messages. A gap after the last row shown is drawn below that row. The
+// margins are fixed heights in the stylesheet, so nothing is measured (`#226`), and each row keeps
+// the words it was drawn with, so a pass that changes nothing writes nothing.
+//
+// IN THE CHANNEL'S LISTS ONLY — Main, All, a thread, in either column, and the Pinned list — which
+// are in time order. Not the Threads list or the cards, which are threads; not the call's transcript,
+// whose turns stand at its two sides; not the messages still being sent.
+
+/** Whether a filter is choosing rows: the search text, Links, or whose messages. */
+const rowsChosen = () => readRunsSuspended();
+
+/** What a gap's line says. */
+const gapWords = (count) => `… ${count} unmatched message${count === 1 ? "" : "s"} …`;
+
+/** The line on `row` above it (`below` false) or below it, made once and kept on it. */
+function seamLineOf(row, below) {
+  const held = below ? row.seamBelowLine : row.seamLine;
+  if (held) return held;
+  const line = document.createElement("div");
+  line.className = below ? "row-seam row-seam-below" : "row-seam";
+  line.setAttribute("role", "separator");
+  if (below) row.seamBelowLine = line;
+  else row.seamLine = line;
+  return line;
+}
+
+/** Whether `row` has, above it (`below` false) or below it, exactly the line `seam` says — or none, for null. */
+function seamDrawn(row, seam, below) {
+  const held = below ? row.seamBelowLine : row.seamLine;
+  const drawn = Boolean(held && held.parentNode === row);
+  if (!seam) return !drawn;
+  return drawn && held.textContent === seam.words && row.getAttribute(below ? "data-seam-below" : "data-seam") === seam.kind;
+}
+
+/** Put `row`'s line above it, or below it, as `seam` says: `{kind, words}`, or null for none. */
+function placeSeam(row, seam, below) {
+  if (seamDrawn(row, seam, below)) return;
+  const attribute = below ? "data-seam-below" : "data-seam";
+  if (!seam) {
+    const held = below ? row.seamBelowLine : row.seamLine;
+    if (held && held.parentNode === row) row.removeChild(held);
+    row.removeAttribute(attribute);
+    return;
+  }
+  const line = seamLineOf(row, below);
+  if (line.textContent !== seam.words) {
+    line.textContent = seam.words;
+    line.setAttribute("aria-label", seam.words.replace(/…/g, "").trim());
+  }
+  row.setAttribute(attribute, seam.kind);
+  if (line.parentNode !== row) {
+    // Above: first, ahead of the bookmark's line, which sits nearer the row. Below: last.
+    if (below) row.append(line);
+    else row.replaceChildren(line, ...row.children);
+  }
+}
+
+/**
+ * The rows of `list` that lines are drawn between, and what each shown row has above and below it:
+ * `{above, below}`, each `{kind, words}` or null.
+ *
+ * @typedef {{kind: string, words: string}} Seam
+ */
+function seamsFor(list) {
+  const rows = /** @type {HTMLElement[]} */ ([...list.children]).filter((row) => isMessageRow(row) && !row.hasAttribute("data-card"));
+  const gaps = rowsChosen();
+  /** @type {Map<HTMLElement, {above: Seam | null, below: Seam | null}>} */
+  const wanted = new Map();
+  let hidden = 0;
+  let last = null;
+  for (const row of rows) {
+    // A row hidden in a collapsed run is counted by its run's line.
+    if (row.getAttribute("data-read-run") === "member") continue;
+    if (!rowShown(row)) {
+      hidden += idsOf(row).length;
+      continue;
+    }
+    wanted.set(row, { above: gaps && hidden > 0 ? { kind: "gap", words: gapWords(hidden) } : null, below: null });
+    hidden = 0;
+    last = row;
+  }
+  if (last && gaps && hidden > 0) wanted.get(last).below = { kind: "gap", words: gapWords(hidden) };
+  return { rows, wanted };
+}
+
+/**
+ * Draw the lines between the rows of `list`, and take away every one no longer wanted. Under
+ * `preservingScroll` for the list on screen, as the bookmark's line is, outside a filter change, which
+ * places the reader itself once the list is drawn (`keepingFilterPlace`).
+ */
+function drawSeams(list) {
+  const { rows, wanted } = seamsFor(list);
+  const none = { above: null, below: null };
+  const changed = rows.some((row) => {
+    const want = wanted.get(row) || none;
+    return !seamDrawn(row, want.above, false) || !seamDrawn(row, want.below, true);
+  });
+  if (!changed) return;
+  const apply = () => {
+    for (const row of rows) {
+      const want = wanted.get(row) || none;
+      placeSeam(row, want.above, false);
+      placeSeam(row, want.below, true);
+    }
+  };
+  if (!sideActive && filterChanging === 0 && currentScreen === "main" && currentView === "discord" && list === visibleList()) {
+    preservingScroll(apply);
+  } else {
+    apply();
+  }
 }
 
 // --- a filter changed: the reader's message stays where it is on the screen ----------------------
@@ -25559,6 +26059,8 @@ function filterSideCards() {
     if (row.hidden === kept) row.hidden = !kept;
     setClassWord(row, "search-hidden", !said);
     markReplyMatch(row, inReplies);
+    // `#249 search-highlight`. And where: the card's own words, whatever its replies matched.
+    markSearchHits(row, said ? terms : []);
     if (fresh) unread += 1;
     if (kept && said) shown += 1;
   }

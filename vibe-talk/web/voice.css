@@ -144,6 +144,11 @@
   --pin-ink: #f0c75e;
   --pin-edge: #d4a63a;
   --pin-bg: #3a3017;
+  /* `#249 search-highlight`. A search's hits in the text: a highlighter's yellow, deep in dark and
+     pale in light, with the words in a colour of their own over it, so a hit reads as marked text and
+     never as a pin's chip or the bookmark's accent. */
+  --hit-bg: #6b5410;
+  --hit-ink: #fff4c7;
   /* `#247 reply-continuity`. Behind the reply screen: the page's own colour with six parts in a
      hundred of the accent in it, so the screen reads as a mode of the list rather than a page of its
      own, and every row on it keeps its own surface. The owner: "MAYBE change the background color
@@ -182,6 +187,8 @@
     --pin-ink: #7a5300;
     --pin-edge: #c08b14;
     --pin-bg: #fbf0d2;
+    --hit-bg: #ffe066;
+    --hit-ink: #1a1d22;
     /* The same six parts of the light scheme's accent in its page colour. */
     --reply-tint: #e9eef3;
     --read-ring: #7f8896;
@@ -402,8 +409,43 @@ body {
 .messages li[data-links-view="true"] > .summary,
 .messages li[data-links-view="true"] > .reactions,
 .messages li[data-links-view="true"] > .elided,
+.messages li[data-links-view="true"] > .search-excerpt,
 .messages li[data-links-view="true"] .fold {
   display: none !important;
+}
+
+/* `#249 search-highlight`. Each hit of the search, where it is in the text: marked as a highlighter
+   marks a page, in its own colours over whatever the row is drawn in. The author's name is lit whole
+   when it holds a term, and a link whose ADDRESS alone holds one — matched, but not on the screen —
+   is outlined in the same colour. */
+mark.search-hit,
+.msg-author[data-search-hit],
+.who[data-search-hit] {
+  background: var(--hit-bg);
+  color: var(--hit-ink);
+  border-radius: 0.2em;
+  box-shadow: 0 0 0 1px var(--hit-bg);
+}
+
+a.search-hit-link {
+  outline: 2px solid var(--hit-bg);
+  outline-offset: 1px;
+  border-radius: 0.2em;
+}
+
+/* Under a folded message whose hit is beyond its fold: the hits, each with a few words either side,
+   in a quiet line of their own, so the reader sees where the word is without the message opening
+   under every keystroke. A tap opens the message, as a tap on the row does. */
+.search-excerpt {
+  margin-top: 0.3rem;
+  color: var(--muted);
+  font-size: calc(0.82rem * var(--msg-scale));
+  line-height: 1.4;
+  overflow-wrap: anywhere;
+}
+
+.search-excerpt-more {
+  white-space: nowrap;
 }
 
 /* One link per line, each the width of the row and tall enough to be a target on its own: these
@@ -1754,7 +1796,13 @@ body {
 #side-log li.discord-message[data-reply-marker][data-who],
 #discord-log li.discord-message[data-reply-marker][data-who],
 #side-log li.discord-message[data-bookmark][data-who],
-#discord-log li.discord-message[data-bookmark][data-who] {
+#discord-log li.discord-message[data-bookmark][data-who],
+#side-log li.discord-message[data-seam][data-who],
+#discord-log li.discord-message[data-seam][data-who],
+#pinned-log li.discord-message[data-seam][data-who],
+#side-log li.discord-message[data-seam-below][data-who],
+#discord-log li.discord-message[data-seam-below][data-who],
+#pinned-log li.discord-message[data-seam-below][data-who] {
   opacity: 1;
   filter: none;
   background-image: linear-gradient(rgb(128 128 128 / var(--row-grey, 0)), rgb(128 128 128 / var(--row-grey, 0)));
@@ -1769,8 +1817,14 @@ body {
 #discord-log li.discord-message[data-unread-replies] > :not(.thread-unread):not(.reply-jump):not(.reply-bridge):not(.reply-ungather),
 #side-log li.discord-message[data-reply-marker] > :not(.reply-marker):not(.reply-jump):not(.reply-bridge):not(.reply-ungather),
 #discord-log li.discord-message[data-reply-marker] > :not(.reply-marker):not(.reply-jump):not(.reply-bridge):not(.reply-ungather),
-#side-log li.discord-message[data-bookmark] > :not(.reply-jump):not(.reply-bridge):not(.reply-ungather):not(.bookmark-line),
-#discord-log li.discord-message[data-bookmark] > :not(.reply-jump):not(.reply-bridge):not(.reply-ungather):not(.bookmark-line) {
+#side-log li.discord-message[data-bookmark] > :not(.reply-jump):not(.reply-bridge):not(.reply-ungather):not(.bookmark-line):not(.row-seam),
+#discord-log li.discord-message[data-bookmark] > :not(.reply-jump):not(.reply-bridge):not(.reply-ungather):not(.bookmark-line):not(.row-seam),
+#side-log li.discord-message[data-seam] > :not(.reply-jump):not(.reply-bridge):not(.reply-ungather):not(.bookmark-line):not(.row-seam),
+#discord-log li.discord-message[data-seam] > :not(.reply-jump):not(.reply-bridge):not(.reply-ungather):not(.bookmark-line):not(.row-seam),
+#pinned-log li.discord-message[data-seam] > :not(.reply-jump):not(.reply-bridge):not(.reply-ungather):not(.bookmark-line):not(.row-seam),
+#side-log li.discord-message[data-seam-below] > :not(.reply-jump):not(.reply-bridge):not(.reply-ungather):not(.bookmark-line):not(.row-seam),
+#discord-log li.discord-message[data-seam-below] > :not(.reply-jump):not(.reply-bridge):not(.reply-ungather):not(.bookmark-line):not(.row-seam),
+#pinned-log li.discord-message[data-seam-below] > :not(.reply-jump):not(.reply-bridge):not(.reply-ungather):not(.bookmark-line):not(.row-seam) {
   filter: var(--row-filter, none);
 }
 
@@ -1796,7 +1850,13 @@ body {
 #side-log li.discord-message[data-reply-marker]::after,
 #discord-log li.discord-message[data-reply-marker]::after,
 #side-log li.discord-message[data-bookmark]::after,
-#discord-log li.discord-message[data-bookmark]::after {
+#discord-log li.discord-message[data-bookmark]::after,
+#side-log li.discord-message[data-seam]::after,
+#discord-log li.discord-message[data-seam]::after,
+#pinned-log li.discord-message[data-seam]::after,
+#side-log li.discord-message[data-seam-below]::after,
+#discord-log li.discord-message[data-seam-below]::after,
+#pinned-log li.discord-message[data-seam-below]::after {
   --row-veil: color-mix(in srgb, var(--bg) calc((1 - var(--row-opacity, 1)) * 100%), transparent);
   content: "";
   position: absolute;
@@ -2416,7 +2476,9 @@ body {
 /* ...but the bookmark's line, which a run can start right under. Equal weight and later, so it
    wins. `#240 reading-bookmark`. */
 #side-log li.discord-message[data-read-run="head"] > .bookmark-line,
-#discord-log li.discord-message[data-read-run="head"] > .bookmark-line {
+#discord-log li.discord-message[data-read-run="head"] > .bookmark-line,
+#side-log li.discord-message[data-read-run="head"] > .row-seam,
+#discord-log li.discord-message[data-read-run="head"] > .row-seam {
   display: flex !important;
 }
 
@@ -2539,6 +2601,94 @@ body {
   border-top: 2px solid var(--accent);
 }
 
+
+/*
+ * THE LINES BETWEEN ROWS. `#249 search-highlight`: where a filter choosing rows takes messages out
+ * from between two it shows, a line stands in the gap, "… 12 unmatched messages …", in the collapsed
+ * run's shape — the words between two dashed hairlines, quiet — because it is the same idea: messages
+ * that are here, not shown. Unlike the run's it is not a control: the filter, not a tap, brings those
+ * messages back, and the message the reader selects is kept where it is when it goes.
+ *
+ * Drawn as the bookmark's line is, in a margin the row under it keeps above its tile, so the list
+ * holds nothing but messages; a gap after the last row shown is in a margin under that row. Fixed
+ * heights per kind, so the page measures nothing. With the bookmark on the same row — it is not drawn
+ * while a filter chooses rows, but a line of another kind may meet it — the bookmark's line is nearer
+ * the row, and both margins are kept.
+ */
+#side-log,
+#discord-log,
+#pinned-log {
+  --gap-room: 2.25rem;
+}
+
+#side-log li.discord-message[data-seam="gap"],
+#discord-log li.discord-message[data-seam="gap"],
+#pinned-log li.discord-message[data-seam="gap"] {
+  --seam-room: var(--gap-room);
+}
+
+#side-log li.discord-message[data-seam],
+#discord-log li.discord-message[data-seam],
+#pinned-log li.discord-message[data-seam] {
+  margin-top: var(--seam-room);
+}
+
+#side-log li.discord-message[data-seam][data-bookmark="above"],
+#discord-log li.discord-message[data-seam][data-bookmark="above"] {
+  margin-top: calc(var(--seam-room) + var(--bookmark-room));
+}
+
+#side-log li.discord-message[data-seam-below],
+#discord-log li.discord-message[data-seam-below],
+#pinned-log li.discord-message[data-seam-below] {
+  margin-bottom: var(--gap-room);
+}
+
+#side-log .row-seam,
+#discord-log .row-seam,
+#pinned-log .row-seam {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: calc(100% + 1px);
+  height: var(--seam-room);
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+  color: var(--muted);
+  font-size: calc(0.82rem * var(--msg-scale));
+  letter-spacing: 0.02em;
+  white-space: nowrap;
+  pointer-events: none;
+  /* At full strength on every row, as the bookmark's line is: it says something about the list, not
+     the state of the message under it. */
+  filter: none !important;
+}
+
+#side-log li.discord-message[data-seam][data-bookmark="above"] > .row-seam:not(.row-seam-below),
+#discord-log li.discord-message[data-seam][data-bookmark="above"] > .row-seam:not(.row-seam-below) {
+  bottom: calc(100% + 1px + var(--bookmark-room));
+}
+
+#side-log .row-seam-below,
+#discord-log .row-seam-below,
+#pinned-log .row-seam-below {
+  top: calc(100% + 1px);
+  bottom: auto;
+  height: var(--gap-room);
+}
+
+#side-log .row-seam::before,
+#discord-log .row-seam::before,
+#pinned-log .row-seam::before,
+#side-log .row-seam::after,
+#discord-log .row-seam::after,
+#pinned-log .row-seam::after {
+  content: "";
+  flex: 1 1 0;
+  min-width: 1rem;
+  border-top: 1px dashed var(--edge);
+}
 
 /*
  * Available to a screen reader and to nothing else.
