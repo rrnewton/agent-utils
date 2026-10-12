@@ -10569,7 +10569,15 @@ function renderSideFreshness() {
   }
   setTextIfChanged(line, text);
   if (line.getAttribute("data-state") !== state) line.setAttribute("data-state", state);
-  if (line.hidden !== (text === "")) line.hidden = text === "";
+  const hide = text === "";
+  if (line.hidden === hide) return;
+  // The line's height comes out of the list's below it, which browser scroll anchoring does not
+  // hold: a reader of the thread keeps the line they are on, or the newest line (`holdingReader`).
+  const toggle = () => {
+    line.hidden = hide;
+  };
+  if (columnsShown && columns.side.mode === "thread") inColumn(columns.side, () => holdingReader(toggle));
+  else toggle();
 }
 
 /**
@@ -23952,8 +23960,8 @@ function renderSideMode() {
  */
 function renderSideColumn() {
   if (!columnsShown) return;
-  renderSideFreshness();
   if (columns.side.mode === "list") {
+    renderSideFreshness();
     setTextIfChanged(leftEl("side-title"), "Threads");
     nameSideRegion("Threads");
     const facts = leftEl("side-facts");
@@ -23962,6 +23970,7 @@ function renderSideColumn() {
     return;
   }
   inColumn(columns.side, () => {
+    renderSideFreshness();
     const open = openThreadChoice();
     const name = open ? threadName(open, Infinity) : "Thread";
     setTextIfChanged(leftEl("side-title"), name);
