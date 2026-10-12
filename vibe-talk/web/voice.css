@@ -4083,7 +4083,8 @@ body {
 #side-log,
 #discord-log,
 #pinned-log,
-#reply-context {
+#reply-context,
+#reply-target {
   container: rows / inline-size;
 }
 
