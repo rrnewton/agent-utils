@@ -94,7 +94,7 @@ herdr-run userguide                # this document
 | Option | Effect |
 | --- | --- |
 | `--config PATH` | Use an explicit configuration file instead of the discovered one. Refused by `init`, `quickstart`, and `userguide`, which read no configuration file at all. |
-| `--agent NAME` | The agent this invocation speaks for; names its tab. Otherwise the first of `$HERDR_RUN_AGENT`, `$DG_AGENT_NAME`, and `$ORC_AGENT_NAME` that is non-empty once ASCII whitespace is trimmed (other characters, including control characters, are kept and then refused in the tab label), else `unknown-agent`. A variable that is not valid UTF-8 is a configuration error (78) rather than skipped, so an invocation never speaks for the next variable's agent by accident. Refused by `check`, `init`, `reap`, `quickstart`, and `userguide`, which name no tab. |
+| `--agent NAME` | The agent this invocation speaks for; names its tab. Otherwise the first of `$HERDR_RUN_AGENT`, `$DG_AGENT_NAME`, and `$ORC_AGENT_NAME` that is non-empty once Unicode white space is trimmed from both ends (so a variable holding only U+3000 or U+00A0 is skipped like an empty one), else `unknown-agent`. An agent name, from the option or a variable, may contain no control character and no invisible character (a format character such as U+200B or U+202E, or a space other than U+0020); one that does is a configuration error (78). So is a variable that is not valid UTF-8, rather than being skipped, so an invocation never speaks for the next variable's agent by accident. Refused by `check`, `init`, `reap`, `quickstart`, and `userguide`, which name no tab. |
 | `--json` | Emit machine-readable output where the subcommand has one. Refused by `net-doctor`, `quickstart`, and `userguide`, whose only output is prose. `config`, `target`, and `reap` print JSON with or without it. |
 | `--version` | Print the version and exit. |
 | `--dump-surface` | Print every subcommand and option, with the value each option takes, as JSON, and exit. Meant for tools that check the command-line surface. |
@@ -195,8 +195,8 @@ Two things in that file are worth naming here, because they are decisions rather
 
 Unknown or duplicate keys, merge keys, non-finite/excessive/sub-millisecond timeouts,
 fractional/negative retention days, retention beyond 365,000 days, a fractional/negative/oversized
-`max_panes`, control characters, and unsupported tab placeholders are hard errors (exit 78). A
-typo'd policy key must not silently fall back to defaults. Keys are checked in the order the
+`max_panes`, control characters, invisible characters in names, and unsupported tab placeholders
+are hard errors (exit 78). A typo'd policy key must not silently fall back to defaults. Keys are checked in the order the
 generated file lists them, so a file with two mistakes reports the first; type names in messages
 use the JSON vocabulary (`null`, `bool`, `number`, `string`, `array`, `object`).
 
@@ -205,12 +205,31 @@ to every reader. Accepted: comments; one document, optionally with `---`, `...`,
 or `%YAML 1.2` directive; block mappings and sequences (including `key:` followed by `- item` at
 the same indentation); flow collections such as `[a, b]` and `{a: [b]}`, which may span lines;
 single-line plain, single-quoted, and double-quoted scalars; the core tags `!!str`, `!!int`,
-`!!float`, `!!bool`, `!!null`, `!!seq`, and `!!map`. Plain scalars resolve by the YAML 1.2 core
-schema, so `yes`, `on`, and `007` are strings. Refused, each with its own message and a line and
-column (`<file>: invalid YAML: <what> at line L column C`): anchors and aliases, block scalars
-(`|`, `>`), explicit `?` keys, plain or quoted scalars that continue onto another line, any other
-tag or directive, a second document, keys that are not strings, merge keys, non-finite numbers, a
-tab outside a quoted scalar or a comment, and collections nested more than 128 levels deep.
+`!!float`, `!!bool`, `!!null`, `!!seq`, and `!!map`. Plain scalars resolve by herdr-run's own
+rule, which is close to the YAML 1.2 core schema but not the same, and this is all of it: empty,
+`~`, `null`, `Null`, and `NULL` are null; `true`/`True`/`TRUE` and `false`/`False`/`FALSE` are
+booleans; `[-+]?(0|[1-9][0-9]*)` (decimal without leading zeros), `[-+]?0o[0-7]+`,
+`[-+]?0x[0-9a-fA-F]+`, and `[-+]?0b[01]+` are integers; a decimal with a `.` or an exponent is a
+float (`.inf` and `.nan` are refused); everything else is a string. So `yes`, `on`, `1_000`, and
+`007` are strings, where the core schema would read `007` as 7, and `0b101` is 5, which the core
+schema has no form for. `!!int`, `!!bool`, and `!!null` accept exactly those spellings, `!!float`
+any decimal number (`!!float 007` is 7.0), and `!!str` anything. Refused, each with its own
+message and a line and column (`<file>: invalid YAML: <what> at line L column C`): anchors and
+aliases, block scalars (`|`, `>`), explicit `?` keys, plain or quoted scalars that continue onto
+another line, any other tag or directive, a second document, keys that are not strings, merge keys,
+non-finite numbers, a tab outside a quoted scalar or a comment, a raw U+0085, U+2028, or U+2029
+anywhere in the file (YAML 1.1 reads each as a line break and YAML 1.2 does not, so the file would
+mean different things to different readers; write `\N`, `\L`, or `\P` in a double-quoted string
+to mean one), and collections nested more than 128 levels deep.
+
+Every name the policy compares with what is typed -- `workspace`, `tab_name`, and every entry and
+key of `allow`, `prefixes`, `deny_global`, `deny_subcommand`, `deny_anywhere`, `allow_subcommand`,
+`value_options`, and `shells` -- may contain no invisible character: no format character (U+200B
+zero-width space, U+FEFF byte-order mark, U+202E right-to-left override, and the rest of Unicode
+category Cf) and no space other than U+0020 (U+00A0, U+2028, U+3000, and the rest). A deny entry
+that looks like `-c` but ends in an invisible character would never match the `-c` it appears to
+deny, so it is a configuration error (78) instead. Visible non-ASCII names such as `café` are
+fine, and so is an invisible character in a value that is not a name, such as `prompt_tail`.
 
 The directory a command runs from, `HOME` when a command uses `~`, and the agent variables must be
 valid UTF-8; otherwise herdr-run stops with a configuration error rather than converting them
@@ -244,7 +263,7 @@ herdr-run status
     workspace     agent-cmds
     tab label     release-agent (not created yet)
     herdr         installed; server is running
-    panes         3 in workspace 'agent-cmds'
+    panes         3 in workspace "agent-cmds"
 
 Nothing was changed: status only reads.
 ```
@@ -506,6 +525,12 @@ for "cannot start a second command", whereas re-quoting is the property itself.
 Also enforced: the program must be a **bare name** resolved from the pane's `PATH` (so `./git`,
 `/tmp/gh`, or `~user/gh`, which `~` expansion would turn into a path, cannot masquerade), and each
 wrapper prefix may appear at most once.
+
+A leading `~` in an argument after the program is expanded **before** the policy judges it, and the
+policy judges the expanded argument, which is exactly what runs. So `HOME` cannot carry anything
+past a rule: with `HOME=--exec-path=/tmp/evil`, `git ~ foo` is judged as
+`git --exec-path=/tmp/evil foo` and refused, and with `HOME=daemon` it is judged as `git daemon foo`
+and refused. The wrapper prefixes and the program are never expanded.
 
 **`cargo` is a special case and is not allowed by default.** Even `fetch` and `metadata` can execute
 ambiently configured compiler wrappers, credential providers, or fetch helpers, so calling those
