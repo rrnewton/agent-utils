@@ -1,10 +1,11 @@
 ---
 title: 'filter-keeps-selection: changing or clearing a filter keeps the selected message on screen at the same height'
-status: open
+status: closed
 priority: 2
 issue_type: task
 created_at: 2026-10-12T14:22:03.498369046+00:00
-updated_at: 2026-10-12T14:22:03.498369046+00:00
+updated_at: 2026-10-12T17:33:42.241393572+00:00
+closed_at: 2026-10-12T17:33:42.241393462+00:00
 ---
 
 # Description
