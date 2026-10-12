@@ -74,6 +74,9 @@ pub struct FakeState {
     pub not_member: Vec<String>,
     /// Every `conversations.mark`, in order: conversation and `ts`.
     pub marks: Vec<(String, String)>,
+    /// `chat.postMessage` calls, numbered from 1, answered with HTTP 502, as a gateway that timed
+    /// out waiting for Slack would. Nothing is posted for them.
+    pub fail_posts: Vec<usize>,
 }
 
 impl FakeState {
@@ -364,6 +367,9 @@ fn handle(shared: &Mutex<FakeState>, uri: &Uri, headers: &HeaderMap, body: &[u8]
             )
                 .into_response();
         }
+    }
+    if method == "chat.postMessage" && state.fail_posts.contains(&state.calls[&method]) {
+        return (StatusCode::BAD_GATEWAY, "upstream send timed out").into_response();
     }
     if let Some(error) = state.fail.get(&method) {
         let mut answer = json!({"ok": false, "error": error});

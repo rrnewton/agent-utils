@@ -2093,6 +2093,66 @@ mod tests {
         assert_eq!(body["message_reference"]["message_id"], "999");
     }
 
+    /// `#263 post-split-per-provider`. Only a bridge continues a long post in the thread its
+    /// first part is in; Discord itself keeps consecutive messages, threads or not. And a
+    /// bridge's post is held to the size it was configured with, not to Discord's.
+    #[test]
+    fn only_a_bridge_continues_a_long_post_and_each_is_held_to_its_own_size() {
+        let first = parse_message(&serde_json::json!({
+            "id": "1000000000000000002", "channel_id": "123", "content": "part one",
+            "timestamp": "2026-10-12T12:00:00.000000+00:00",
+            "author": { "id": "7", "username": "bridge", "bot": true },
+            "thread": { "id": "t_1", "root_message_id": "1000000000000000002", "is_root": true,
+                        "reply_count": null, "reply_count_exact": false },
+        }))
+        .expect("message");
+        let mut config = client_config("https://bridge.example/v1", true);
+        for (thread_api, expected) in [
+            (crate::threads::ThreadApi::Bridge, Some("t_1")),
+            (crate::threads::ThreadApi::Native, None),
+            (crate::threads::ThreadApi::Off, None),
+        ] {
+            config.thread_api = thread_api;
+            let client = HttpDiscordClient::new(&config).expect("client");
+            assert_eq!(
+                client.continuation_thread(&channel(), &first).as_deref(),
+                expected,
+                "{thread_api:?}"
+            );
+        }
+        let native = HttpDiscordClient::new(&client_config(BASE, false)).expect("client");
+        assert_eq!(native.continuation_thread(&channel(), &first), None);
+        assert_eq!(
+            native.post_limit(&channel()),
+            crate::chat::PostLimit::chars(DISCORD_MAX_CONTENT_LEN)
+        );
+
+        config.max_post_bytes = Some(30_000);
+        let bridge = HttpDiscordClient::new(&config).expect("client");
+        let long = "y".repeat(10_000);
+        let request = post_request_with_nonce(
+            "https://bridge.example/v1",
+            &channel(),
+            &long,
+            None,
+            None,
+            &bridge.post_limit(&channel()),
+        );
+        assert!(request.is_ok(), "a bridge was refused a post it takes");
+        let too_long = "y".repeat(30_001);
+        assert!(matches!(
+            post_request_with_nonce(
+                "https://bridge.example/v1",
+                &channel(),
+                &too_long,
+                None,
+                None,
+                &bridge.post_limit(&channel()),
+            ),
+            Err(DiscordError::Refused(detail)) if detail.contains("30000")
+        ));
+    }
+
     #[test]
     fn empty_and_oversized_posts_are_refused_before_discord_sees_them() {
         assert!(matches!(

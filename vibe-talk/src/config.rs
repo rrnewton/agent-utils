@@ -517,7 +517,7 @@ impl DiscordConfig {
             None if official || !stated => Some(DISCORD_MAX_CONTENT_LEN),
             None => None,
         };
-        let max_bytes = if self.markup == crate::render::Markup::GoogleChat {
+        let max_bytes = if !official && self.markup == crate::render::Markup::GoogleChat {
             Some(
                 self.max_post_bytes
                     .map_or(GOOGLE_CHAT_MAX_MESSAGE_BYTES, |max| {
