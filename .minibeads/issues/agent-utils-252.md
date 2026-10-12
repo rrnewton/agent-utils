@@ -1,10 +1,11 @@
 ---
 title: 'thread-button-state: the Thread button is grey until a thread exists, and starts one from vibe-talk'
-status: open
+status: closed
 priority: 2
 issue_type: task
 created_at: 2026-10-12T19:29:13.013255704+00:00
-updated_at: 2026-10-12T19:29:13.013255704+00:00
+updated_at: 2026-10-12T23:04:36.314722838+00:00
+closed_at: 2026-10-12T23:04:36.314722718+00:00
 ---
 
 # Description
