@@ -39013,6 +39013,50 @@ test("`#231 two-column-polish`: a thread selected while the poll's read of Main 
     "the next poll did not read the thread on the right as a delta");
 });
 
+test("`#231 two-column-polish`: on a channel whose changes carry additions alone, an edit's read of the thread on the right is not collapsed into a read of what changed", async () => {
+  /**
+   * An edit to a reply in the thread on the right, with Main's read for it on the wire, and a live
+   * reply into that thread meanwhile, whose read of what changed goes out once Main's lands: the
+   * edit's own read of the thread comes after it, and that one only adds.
+   */
+  const edited = async (script) => {
+    const { page, server, data } = await twoColumnServer(null, script);
+    await threadBadge(rowWithId(page, "201")).click();
+    await page.settle();
+    // The server sees creations only, and the page learns so from the poll's first round.
+    server.complete = false;
+    await pollOnce(page);
+    const reads = server.reads.length;
+    const release = holdView(server, "main");
+    server.edit("202", { content: "first thread answer, corrected" });
+    await deliver(page, page.stream(), sseUpdate("edit-202", page.messages.find((m) => m.id === "202")));
+    await page.settle();
+    const reply = server.post(message({ id: "205", content: "a live answer meanwhile",
+      thread: { ...data.messages[1].thread, is_root: false } }));
+    await deliver(page, page.stream(), sseMessage(reply));
+    await page.settle();
+    release();
+    for (let i = 0; i < 4; i += 1) await page.settle();
+    const row = sideRow(page, "202");
+    return {
+      reads: server.reads.slice(reads).map((read) => `${read.view}${read.after === null ? "" : " delta"}`),
+      text: row ? row.text() : "",
+      ids: sideIds(page),
+    };
+  };
+  const { reads, text, ids } = await edited(SCRIPT);
+  assert.deepStrictEqual(reads, ["main", "thread delta", "thread"],
+    "the edit's read of the thread on the right was not a read in full after the live reply's delta");
+  assert.match(text, /first thread answer, corrected/, "the edit to the thread on the right was never read");
+  assert.ok(ids.includes("205"), "the live reply left the thread on the right");
+  // The control: any read of the thread since counts, a read of what changed too. The edit's read is
+  // then collapsed into one that could not carry it, and the edit is never shown.
+  const control = await edited(brokenScript("    (sent.full || forwardCursor(reason) !== null);", "    true;"));
+  assert.deepStrictEqual(control.reads, ["main", "thread delta"],
+    "the negative control still read the thread in full, so the check above proves nothing");
+  assert.doesNotMatch(control.text, /corrected/);
+});
+
 const THREAD_DIRECTORY_REFRESH_MS = sourceConstant("THREAD_DIRECTORY_REFRESH_MS");
 
 /** Answer every read of `view` on `server` with a gateway error, and every other read as it would be. */

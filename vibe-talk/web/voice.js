@@ -24241,9 +24241,13 @@ async function readSideColumn(reason, since = null) {
 }
 
 /**
- * The newest timeline read each column sent and that has not failed: the view it was for
- * (`channelContextKey`), its number among `timelineReadsStarted`, and whether it read the view in
- * full rather than as what changed. `#231 two-column-polish`.
+ * The newest timeline read each column sent and that has not failed before landing a page: the view
+ * it was for (`channelContextKey`), its number among `timelineReadsStarted`, and whether it read the
+ * view in full rather than as what changed. `#231 two-column-polish`. One still on the wire counts,
+ * as the read a refresh would send would only queue behind it; if it then fails, the right column's
+ * line says so (`renderSideFreshness`) and the next poll reads the view again. A chain of what
+ * changed that fails after its first page keeps its record, which no refresh begun before it can
+ * act on: the chain ran queued behind that refresh's read of Main, and its failure is that read's.
  *
  * @type {Map<typeof activeColumn, {context: string, read: number, full: boolean}>}
  */
