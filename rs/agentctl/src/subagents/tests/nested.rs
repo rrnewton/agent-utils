@@ -583,3 +583,47 @@ fn revive_starts_a_flat_generation_and_archives_the_nested_row() {
     expected["lifecycle"] = json!("stopped");
     assert_eq!(agent::read_private_json(&archive).unwrap(), expected);
 }
+
+#[test]
+fn a_v2_row_without_a_session_queues_until_anchored_then_drains() {
+    // The other edition's test_anchor_migrates_a_nested_record_to_schema_1.
+    let fixture = Fixture::new();
+    fixture.start(None);
+    let mut flat = stored(&fixture);
+    for key in ["terminal_id", "harness_identity", "name_history"] {
+        flat.as_object_mut().unwrap().remove(key);
+    }
+    let mut nested = nested_v2_record(&flat);
+    nested["session_agent"] = Value::Null;
+    nested["session_value"] = Value::Null;
+    store(&fixture, &nested);
+    *fixture.client.session_override.lock().unwrap() = Some((None, None));
+
+    let error = fixture
+        .manager()
+        .send("worker", "queued until anchored", DrainOptions::default())
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("agentctl anchor worker"),
+        "{error}"
+    );
+    let anchored = fixture.manager().anchor("worker", false).unwrap();
+    assert_eq!(anchored["migrated_from"], "agentctl-session/v2");
+    let migrated = stored(&fixture);
+    assert_eq!(migrated["schema"], 1);
+    assert!(!migrated["harness_identity"].is_null(), "{migrated}");
+    fixture
+        .manager()
+        .drain("worker", DrainOptions::default())
+        .unwrap();
+    assert_eq!(
+        fixture
+            .client
+            .runs
+            .lock()
+            .unwrap()
+            .last()
+            .map(String::as_str),
+        Some("queued until anchored")
+    );
+}
