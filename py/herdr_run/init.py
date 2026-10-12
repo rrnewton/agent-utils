@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import os
 
-from herdr_run.config import CONFIG_FILENAMES
+from herdr_run.config import CONFIG_FILENAMES, _has_surrogates, _lossy
 from herdr_run.errors import ConfigError
 from herdr_run.textfmt import os_error_text
 
@@ -39,7 +39,12 @@ def write_config_template(directory: str, *, force: bool) -> str:
     Refuses to overwrite an existing configuration unless ``force``. It also refuses when only the
     ``.yml`` spelling exists, because the ``.yaml`` this would write silently takes precedence over
     it: a caller who ends up with two files and no warning has been given a puzzle, not a config.
+
+    A directory whose name is not valid UTF-8 is refused, as every other subcommand refuses it: the
+    file written there could never be loaded.
     """
+    if _has_surrogates(directory):
+        raise ConfigError(f"current directory is not valid UTF-8: {_lossy(directory)}")
     destination = os.path.join(directory, CONFIG_FILENAMES[0])
     if not force:
         for filename in CONFIG_FILENAMES:

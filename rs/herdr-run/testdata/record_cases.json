@@ -540,5 +540,87 @@
       ],
       null
     ]
+  ],
+  "stored": [
+    [
+      null,
+      "agent-cmds\u0000a",
+      [
+        "w1",
+        "w1:t1",
+        "w1:p1",
+        "cmds",
+        "a"
+      ],
+      "{\n  \"agent-cmds\\u0000a\": {\n    \"pane_id\": \"w1:p1\",\n    \"tab_id\": \"w1:t1\",\n    \"tab_label\": \"a\",\n    \"workspace_id\": \"w1\",\n    \"workspace_label\": \"cmds\"\n  }\n}\n",
+      [
+        "session-cache.json",
+        "session-cache.json.lock"
+      ]
+    ],
+    [
+      "{\"other\u0000b\": {\"workspace_id\": \"w\", \"tab_id\": \"t\", \"pane_id\": \"p\"}}",
+      "agent-cmds\u0000a",
+      [
+        "w1",
+        "w1:t1",
+        "w1:p1",
+        "cmds",
+        "caf\u00e9 \u202e"
+      ],
+      "{\n  \"agent-cmds\\u0000a\": {\n    \"pane_id\": \"w1:p1\",\n    \"tab_id\": \"w1:t1\",\n    \"tab_label\": \"caf\u00e9 \u202e\",\n    \"workspace_id\": \"w1\",\n    \"workspace_label\": \"cmds\"\n  }\n}\n",
+      [
+        "session-cache.json",
+        "session-cache.json.lock"
+      ]
+    ],
+    [
+      "not json",
+      "k",
+      [
+        "w",
+        "t",
+        "p",
+        "it's",
+        "\"q\""
+      ],
+      "{\n  \"k\": {\n    \"pane_id\": \"p\",\n    \"tab_id\": \"t\",\n    \"tab_label\": \"\\\"q\\\"\",\n    \"workspace_id\": \"w\",\n    \"workspace_label\": \"it's\"\n  }\n}\n",
+      [
+        "session-cache.json",
+        "session-cache.json.lock"
+      ]
+    ],
+    [
+      "{\"k\": 5, \"z\": [1.5, -0.0, 10000000000000000.0]}",
+      "k",
+      [
+        "w",
+        "t",
+        "p",
+        "l",
+        "m"
+      ],
+      "{\n  \"k\": {\n    \"pane_id\": \"p\",\n    \"tab_id\": \"t\",\n    \"tab_label\": \"m\",\n    \"workspace_id\": \"w\",\n    \"workspace_label\": \"l\"\n  },\n  \"z\": [\n    1.5,\n    -0.0,\n    1e+16\n  ]\n}\n",
+      [
+        "session-cache.json",
+        "session-cache.json.lock"
+      ]
+    ],
+    [
+      "[1]",
+      "k\u0001",
+      [
+        "w",
+        "t",
+        "p",
+        "l",
+        "\ud83d\ude00"
+      ],
+      "{\n  \"k\\u0001\": {\n    \"pane_id\": \"p\",\n    \"tab_id\": \"t\",\n    \"tab_label\": \"\ud83d\ude00\",\n    \"workspace_id\": \"w\",\n    \"workspace_label\": \"l\"\n  }\n}\n",
+      [
+        "session-cache.json",
+        "session-cache.json.lock"
+      ]
+    ]
   ]
 }

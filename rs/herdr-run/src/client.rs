@@ -1091,8 +1091,17 @@ mod tests {
 
     static TEMPORARY_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
-    fn protocol_value(client: &HerdrClient, method: &str, args: &[String]) -> Result<Value> {
+    fn protocol_value(
+        client: &HerdrClient,
+        method: &str,
+        args: &[String],
+        attempts: Option<usize>,
+    ) -> Result<Value> {
         Ok(match method {
+            "server_running" => serde_json::json!(client.server_running()),
+            "ensure_server" => serde_json::json!(
+                client.ensure_server_with(attempts.expect("attempts"), Duration::ZERO)?
+            ),
             "workspace_id_for_label" => serde_json::json!(client.workspace_id_for_label(&args[0])?),
             "tab_id_for_label" => serde_json::json!(client.tab_id_for_label(&args[0], &args[1])?),
             "panes" => {
@@ -1160,7 +1169,11 @@ mod tests {
                 })
                 .collect();
             let runner = FakeRunner::with_outputs(outputs);
-            let client = client("direct", runner.clone());
+            let client = client(case["broker"].as_str().expect("broker"), runner.clone());
+            let attempts = case["args"]
+                .get(0)
+                .and_then(Value::as_u64)
+                .map(|count| usize::try_from(count).unwrap());
             let args = case["args"]
                 .as_array()
                 .unwrap()
@@ -1168,7 +1181,10 @@ mod tests {
                 .filter_map(|argument| argument.as_str().map(str::to_owned))
                 .collect::<Vec<_>>();
             let method = case["method"].as_str().unwrap();
-            match (protocol_value(&client, method, &args), case.get("error")) {
+            match (
+                protocol_value(&client, method, &args, attempts),
+                case.get("error"),
+            ) {
                 (Ok(value), None) => assert_eq!(value, case["ok"], "{case}"),
                 (Err(error), Some(expected)) => assert_eq!(error.to_string(), *expected, "{case}"),
                 (got, _) => panic!("{case}: got {got:?}"),

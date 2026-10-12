@@ -3,11 +3,14 @@
 Every file under ``rs/herdr-run/testdata/`` is loaded here and by the Rust unit tests, so a rule
 that changes in one edition fails the other edition's suite until both agree again:
 
-- ``text_cases.json``: the quoting rule, numeric text, the exit-marker grammar, float text;
+- ``text_cases.json``: the quoting rule, numeric text, the exit-marker grammar, float text,
+  run IDs;
 - ``yaml_cases.json``: the configuration YAML subset, accepted values and positioned refusals;
 - ``readiness_cases.json``: prompt verdicts and prompt tails inferred from rc files;
-- ``protocol_cases.json``: Herdr protocol calls, their argv, and their values or errors;
-- ``record_cases.json``: reap scope, evidence folded from run records, session-cache loading.
+- ``protocol_cases.json``: Herdr protocol calls through both brokers, their argv, and their
+  values or errors, including server start-up;
+- ``record_cases.json``: reap scope, evidence folded from run records, session-cache loading
+  and the exact bytes a cache store writes.
 """
 
 from __future__ import annotations
@@ -27,7 +30,8 @@ from herdr_run.config import Config
 from herdr_run.errors import HerdrRunError
 from herdr_run.readiness import assess_prompt, infer_prompt_tail
 from herdr_run.reap import evidence_from_runs
-from herdr_run.session import _load_cache
+from herdr_run.runner import make_run_id
+from herdr_run.session import Target, _load_cache, _store_cache
 from herdr_run.sweep import _scope_of
 from herdr_run.textfmt import number_text, parse_exit_marker, quote
 from herdr_run.yamlcore import YamlError, core_load
@@ -76,6 +80,12 @@ def test_exit_marker(row: list[object]) -> None:
 def test_float_text(row: list[object]) -> None:
     value, expected = row
     assert repr(cast(float, value)) == expected
+
+
+@pytest.mark.parametrize("row", _rows(TEXT, "run_id"), ids=repr)
+def test_run_id(row: list[object]) -> None:
+    agent, now, pid, expected = row
+    assert make_run_id(cast(str, agent), now=float(cast(int, now)), pid=cast(int, pid)) == expected
 
 
 # --- the configuration YAML subset ----------------------------------------------------------------
@@ -134,7 +144,22 @@ def test_prompt_tail_from_rc_file(row: list[object], tmp_path: Path) -> None:
 # --- the Herdr protocol --------------------------------------------------------------------------
 
 
+class _CorpusClient(HerdrClient):
+    """The fixed account home and systemd-run path the Rust test client is built with."""
+
+    @staticmethod
+    def _account_home() -> str:
+        return "/home/account"
+
+    def _systemd_executable(self) -> str:
+        return "/usr/bin/systemd-run"
+
+
 def _protocol_value(client: HerdrClient, method: str, args: list[object]) -> object:
+    if method == "server_running":
+        return client.server_running()
+    if method == "ensure_server":
+        return client.ensure_server(attempts=cast(int, args[0]), delay=0.0)
     text = [cast(str, item) for item in args if item is not None]
     if method == "workspace_id_for_label":
         return client.workspace_id_for_label(text[0])
@@ -180,9 +205,16 @@ def test_protocol(case: dict[str, object]) -> None:
         calls.append(list(command))
         assert responses, f"unexpected call {command}"
         status, stdout, stderr = responses.pop(0)
-        return subprocess.CompletedProcess(list(command), cast(int, status), stdout, stderr)
+        return subprocess.CompletedProcess(
+            list(command), cast(int, status), cast(str, stdout), cast(str, stderr)
+        )
 
-    client = HerdrClient(herdr_bin=cast(str, PROTOCOL["herdr"]), run=runner)
+    client = _CorpusClient(
+        herdr_bin=cast(str, PROTOCOL["herdr"]),
+        broker=cast(str, case["broker"]),
+        run=runner,
+        sleep=lambda _seconds: None,
+    )
     method = cast(str, case["method"])
     args = cast(list[object], case["args"])
     if "error" in case:
@@ -243,6 +275,28 @@ def test_session_cache_entry(row: list[object], tmp_path: Path) -> None:
         ]
     )
     assert shown == expected
+
+
+@pytest.mark.parametrize("row", _rows(RECORDS, "stored"), ids=repr)
+def test_session_cache_store_bytes(row: list[object], tmp_path: Path) -> None:
+    existing, key, fields, written, names = row
+    path = tmp_path / "spool" / "session-cache.json"
+    if existing is not None:
+        path.parent.mkdir()
+        path.write_text(cast(str, existing), encoding="utf-8")
+    workspace_id, tab_id, pane_id, workspace_label, tab_label = cast(list[str], fields)
+    target = Target(
+        workspace_id=workspace_id,
+        tab_id=tab_id,
+        pane_id=pane_id,
+        workspace_label=workspace_label,
+        tab_label=tab_label,
+        created=(),
+        from_cache=False,
+    )
+    _store_cache(str(path), cast(str, key), target)
+    assert path.read_bytes().decode("utf-8") == written
+    assert sorted(entry.name for entry in path.parent.iterdir()) == names
 
 
 # --- one version for both editions ---------------------------------------------------------------

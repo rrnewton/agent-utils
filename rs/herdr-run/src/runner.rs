@@ -621,6 +621,23 @@ mod tests {
     use crate::allowlist::admit;
     use crate::client::{Pane, ProcessInfo};
 
+    /// Run IDs shared with the Python edition.
+    #[test]
+    fn golden_run_ids() {
+        let document: serde_json::Value =
+            serde_json::from_str(include_str!("../testdata/text_cases.json"))
+                .expect("golden text cases");
+        for row in document["run_id"].as_array().expect("run id rows") {
+            let now = SystemTime::UNIX_EPOCH + Duration::from_secs(row[1].as_u64().unwrap());
+            let pid = u32::try_from(row[2].as_u64().unwrap()).unwrap();
+            assert_eq!(
+                make_run_id(row[0].as_str().unwrap(), now, pid),
+                row[3],
+                "{row:?}"
+            );
+        }
+    }
+
     struct FakeApi;
 
     impl HerdrApi for FakeApi {

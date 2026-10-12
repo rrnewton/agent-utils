@@ -422,6 +422,41 @@ mod tests {
 
     use super::*;
 
+    /// The exact bytes and files a cache store leaves, shared with the Python edition.
+    #[test]
+    fn golden_session_cache_store_bytes() {
+        let document: serde_json::Value =
+            serde_json::from_str(include_str!("../testdata/record_cases.json"))
+                .expect("golden record cases");
+        for row in document["stored"].as_array().expect("stored rows") {
+            let root = temporary_root("golden-store");
+            let path = root.join("spool").join("session-cache.json");
+            if let Some(existing) = row[0].as_str() {
+                fs::create_dir_all(path.parent().unwrap()).unwrap();
+                fs::write(&path, existing).unwrap();
+            }
+            let field = |index: usize| row[2][index].as_str().unwrap().to_owned();
+            let target = Target {
+                workspace_id: field(0),
+                tab_id: field(1),
+                pane_id: field(2),
+                workspace_label: field(3),
+                tab_label: field(4),
+                created: Vec::new(),
+                from_cache: false,
+            };
+            store_cache(&path, row[1].as_str().unwrap(), &target).unwrap();
+            assert_eq!(fs::read_to_string(&path).unwrap(), row[3], "{row:?}");
+            let mut names = fs::read_dir(path.parent().unwrap())
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+                .collect::<Vec<_>>();
+            names.sort();
+            assert_eq!(serde_json::json!(names), row[4], "{row:?}");
+            fs::remove_dir_all(root).unwrap();
+        }
+    }
+
     /// Session-cache entries shared with the Python edition: which load, and as what.
     #[test]
     fn golden_session_cache_entries() {

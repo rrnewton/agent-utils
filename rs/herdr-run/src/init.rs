@@ -20,7 +20,16 @@ pub const CONFIG_TEMPLATE: &str = include_str!("config_template.yaml");
 /// Refuses to overwrite an existing configuration unless `force`. It also refuses when only the
 /// `.yml` spelling exists, because the `.yaml` this would write silently takes precedence over it:
 /// a caller who ends up with two files and no warning has been given a puzzle, not a config.
+///
+/// A directory whose name is not valid UTF-8 is refused, as every other subcommand refuses it: the
+/// file written there could never be loaded.
 pub fn write_config_template(directory: &Path, force: bool) -> Result<PathBuf> {
+    if directory.to_str().is_none() {
+        return Err(HerdrRunError::config(format!(
+            "current directory is not valid UTF-8: {}",
+            directory.to_string_lossy()
+        )));
+    }
     let destination = directory.join(CONFIG_FILENAMES[0]);
     if !force {
         for filename in CONFIG_FILENAMES {
