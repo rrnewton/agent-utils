@@ -40879,6 +40879,57 @@ test("`#261 two-column-connectors` x `#226 page-energy-profile`: one frame for a
   }
 });
 
+// --- the search over the cards reaches the replies the page holds -----------------------------------
+//
+// The owner asked whether the right column's search should find a thread by what was said in it, not
+// only by its card. The cheap part: the replies the page already holds for each thread are searched
+// with the card's own words, and a card found only with its replies says "in replies".
+
+/** The "in replies" hint on a card, or null. */
+const replyHint = (page, id) => cardPart(page, id, "side-card-hint");
+
+test("the search over the cards finds a thread by the replies the page holds, each term in the card or its replies, and says \"in replies\"", async () => {
+  const { page, server, data } = await twoColumnServer();
+  const [first, second] = data.threads;
+  const shown = () => page.el("side-cards").children.filter((li) => !li.hidden && !li.hasClass("search-hidden"))
+    .map((li) => li.getAttribute("data-id"));
+  await page.el("search-toggle").click();
+  // In every card's own words: found, nothing more said.
+  await page.el("search-field").setValue("root");
+  await page.settle();
+  assert.deepStrictEqual(shown(), [first.id, second.id]);
+  assert.equal(replyHint(page, first.id), null, "a card found by its own words says it was found in its replies");
+  // In no card's own words, in both threads' replies: both, each saying where.
+  await page.el("search-field").setValue("answer");
+  await page.settle();
+  assert.deepStrictEqual(shown(), [first.id, second.id], "the search did not reach the replies the page holds");
+  assert.equal(replyHint(page, first.id), "in replies");
+  assert.equal(replyHint(page, second.id), "in replies");
+  assert.equal(page.el("side-cards").children[0].getAttribute("data-search-in"), "replies");
+  // One term in the card, one in a reply: found; one in neither: not.
+  await page.el("search-field").setValue("first answer");
+  await page.settle();
+  assert.deepStrictEqual(shown(), [first.id], "a term in the card and one in its replies did not find it together");
+  assert.equal(replyHint(page, first.id), "in replies");
+  assert.equal(replyHint(page, second.id), null, "a card the search hides still says it was found");
+  // A reply that arrives is searched once it is held.
+  await page.el("search-field").setValue("deploy");
+  await page.settle();
+  assert.deepStrictEqual(shown(), [], "a reply the page does not hold yet was found");
+  const reply = server.post(message({ id: "205", content: "the deploy went out", thread: { ...data.messages[3].thread, is_root: false } }));
+  await deliver(page, page.stream(), sseMessage(reply));
+  await page.settle();
+  assert.deepStrictEqual(shown(), [second.id], "a reply the page now holds was not searched");
+  assert.equal(replyHint(page, second.id), "in replies");
+  // Closed, every card is back and none says it was found.
+  await page.el("search-toggle").click();
+  await page.settle();
+  assert.deepStrictEqual(shown(), [first.id, second.id]);
+  assert.equal(replyHint(page, first.id), null);
+  assert.equal(replyHint(page, second.id), null, "closing the search left a card saying it was found in its replies");
+  assert.equal(page.el("side-cards").children[1].hasAttribute("data-search-in"), false);
+});
+
 // --- clearing unread in the chat service's own app ----------------------------------------------
 //
 // `#232 upstream-mark-read`. The server marks every message it receives in a channel read in the

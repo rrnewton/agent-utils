@@ -6475,6 +6475,11 @@ textarea {
     font-weight: 600;
   }
 
+  /* Found by the search in the thread's replies rather than the card's own words: said quietly. */
+  .side-card-hint {
+    font-style: italic;
+  }
+
   #side-more-threads {
     margin: 0 auto 0.6rem;
     display: block;

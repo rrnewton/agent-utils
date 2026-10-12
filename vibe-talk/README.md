@@ -4600,7 +4600,10 @@ the list kept on their card; closing a thread comes back to the card it was chos
 only**, a toggle beside the column's "Threads" heading (`#259 thread-list-unread-filter`), narrows the
 cards to the threads with unread replies, by the rule of the card's "N unread" or "N new" chip; it is
 kept per device, works with the search, keeps the selected card where it was as it goes on and off,
-and says "No unread threads." over a list it empties. Over the cards, **links** join each root on
+and says "No unread threads." over a list it empties. The search over the cards also reads the
+replies the page already holds for each thread — each term in the card's words or in its replies —
+and a card found only with its replies says "in replies"; nothing is fetched for it. Over the cards,
+**links** join each root on
 Main to its thread's card (`#261 two-column-connectors`), as a diff tool joins a hunk on the left to
 its counterpart on the right: a right-angled line in the thread's colour (its Thread(N) tag's and
 the card's edge's), out of the root's right edge level with its tag, through a lane of its own in the

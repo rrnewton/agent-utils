@@ -25097,19 +25097,29 @@ function placeOpenedCards() {
  * `#259 thread-list-unread-filter`. And with Unread only pressed, a card whose thread has no unread
  * reply goes too: one with no "N unread" or "N new" chip (`data-unread`, `sideCardUnread`). The two
  * are ANDed, and a list they empty says why, over where the cards were (`sideListState`).
+ *
+ * The owner asked whether the search should reach a thread's replies too. What is cheap is done: the
+ * replies the page already holds for each thread are searched with the card's own words — each term
+ * in one or the other — and a card found only with its replies says so, "in replies", beside its
+ * facts (`markReplyMatch`). Nothing is read for it: a reply the page does not hold is not found.
  */
 function filterSideCards() {
   const terms = searchOpen ? searchTerms(searchQuery) : [];
   const rows = /** @type {HTMLElement[]} */ ([...leftEl("side-cards").children]);
+  const replies = terms.length > 0 ? heldReplyText() : null;
   let unread = 0;
   let shown = 0;
   for (const row of rows) {
     const text = row.getAttribute("data-search") || "";
     const fresh = row.hasAttribute("data-unread");
     const kept = !sideUnreadOnly || fresh;
-    const said = terms.every((term) => text.includes(term));
+    const own = terms.every((term) => text.includes(term));
+    const theirs = !own && replies ? replies.get(String(row.getAttribute("data-id"))) || "" : "";
+    const inReplies = theirs !== "" && terms.every((term) => text.includes(term) || theirs.includes(term));
+    const said = own || inReplies;
     if (row.hidden === kept) row.hidden = !kept;
     setClassWord(row, "search-hidden", !said);
+    markReplyMatch(row, inReplies);
     if (fresh) unread += 1;
     if (kept && said) shown += 1;
   }
@@ -25118,6 +25128,46 @@ function filterSideCards() {
   if (leftEl("side-list-state").hidden !== (state === "")) leftEl("side-list-state").hidden = state === "";
   // `#261 two-column-connectors`. The cards shown are what the links go to.
   scheduleColumnLinks();
+}
+
+/**
+ * The words of the replies the page holds, by thread, lower-cased as `searchable` lower-cases a row's:
+ * each reply's author and what it says, as its row would be found by. For the search over the cards.
+ */
+function heldReplyText() {
+  /** @type {Map<string, string>} */
+  const byThread = new Map();
+  if (channelCanon.channel !== String(el("discord-channel").value)) return byThread;
+  for (const message of channelCanon.messages) {
+    const id = threadOf(message);
+    if (!id || message.thread.is_root) continue;
+    const said = `${message.author || ""} ${messageText(message)}`.toLowerCase();
+    byThread.set(id, byThread.has(id) ? `${byThread.get(id)} ${said}` : said);
+  }
+  return byThread;
+}
+
+/**
+ * Say on card `row`, or stop saying, that the search found it only with its thread's replies: "in
+ * replies", at the end of its facts, made when it is wanted and gone when it is not.
+ *
+ * @param {HTMLElement & {cardFacts?: HTMLElement, replyHint?: HTMLElement | null}} row
+ * @param {boolean} on
+ */
+function markReplyMatch(row, on) {
+  if (Boolean(row.replyHint) === on || !row.cardFacts) return;
+  if (on) {
+    const hint = document.createElement("span");
+    hint.className = "side-card-hint";
+    hint.textContent = "in replies";
+    row.cardFacts.append(hint);
+    row.replyHint = hint;
+    row.setAttribute("data-search-in", "replies");
+  } else if (row.replyHint) {
+    row.cardFacts.removeChild(row.replyHint);
+    row.replyHint = null;
+    row.removeAttribute("data-search-in");
+  }
 }
 
 /**
@@ -25208,6 +25258,8 @@ function sideCard({ choice, text, age, replies, unread }) {
     row.setAttribute("data-unread", "");
   }
   button.append(body, facts);
+  // Where the search says it found the card in its replies (`markReplyMatch`).
+  /** @type {any} */ (row).cardFacts = facts;
   button.addEventListener("click", () => guardQuietly(() => selectSideThread(choice.id, choice.summary))());
   row.append(button);
   // `#129 message-search`. A card stands in this list where messages stand in the others, so the
