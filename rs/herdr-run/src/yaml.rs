@@ -1552,7 +1552,7 @@ mod tests {
     use super::*;
     use crate::textfmt::{python_float_repr, quote};
 
-    /// The corpus's canonical rendering, written out the same way in the Python golden test.
+    /// The corpus's canonical rendering, written out the same way in the other edition's test.
     fn render(value: &Yaml) -> String {
         match value {
             Yaml::Null => "null".to_owned(),

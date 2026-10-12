@@ -422,7 +422,7 @@ mod tests {
 
     use super::*;
 
-    /// The exact bytes and files a cache store leaves, shared with the Python edition.
+    /// The exact bytes and files a cache store leaves, shared with the other edition.
     #[test]
     fn golden_session_cache_store_bytes() {
         let document: serde_json::Value =
@@ -457,7 +457,7 @@ mod tests {
         }
     }
 
-    /// Session-cache entries shared with the Python edition: which load, and as what.
+    /// Session-cache entries shared with the other edition: which load, and as what.
     #[test]
     fn golden_session_cache_entries() {
         let document: serde_json::Value =

@@ -1149,7 +1149,7 @@ mod tests {
         })
     }
 
-    /// Herdr protocol calls shared with the Python edition: argv sent, value or error returned.
+    /// Herdr protocol calls shared with the other edition: argv sent, value or error returned.
     #[test]
     fn golden_protocol() {
         let document: Value = serde_json::from_str(include_str!("../testdata/protocol_cases.json"))

@@ -462,7 +462,10 @@ pub fn render<S: AsRef<str>>(argv: &[S]) -> Result<String> {
     Ok(quoted.join(" "))
 }
 
-/// Quote one word for a POSIX shell exactly as Python's `shlex.quote` does.
+/// Quote one word for a POSIX shell, by the rule both editions share.
+///
+/// A non-empty word made only of ASCII letters, digits, and `_@%+=:,./-` is returned unchanged;
+/// anything else is wrapped in single quotes, with each `'` written as `'"'"'`.
 pub(crate) fn quote_word(token: &str) -> String {
     if token.is_empty() {
         return "''".to_owned();

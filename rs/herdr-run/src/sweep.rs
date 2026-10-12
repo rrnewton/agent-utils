@@ -413,7 +413,7 @@ mod tests {
 
     use super::*;
 
-    /// Reap scope and recorded evidence shared with the Python edition.
+    /// Reap scope and recorded evidence shared with the other edition.
     #[test]
     fn golden_scope_and_evidence() {
         let document: Value = serde_json::from_str(include_str!("../testdata/record_cases.json"))

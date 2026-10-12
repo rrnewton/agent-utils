@@ -144,7 +144,7 @@ pub fn parse_exit_marker(payload: &[u8]) -> Option<i32> {
     i32::try_from(value).ok()
 }
 
-/// Format a finite `f64` exactly as Python's `repr(float)` does.
+/// Format a finite `f64` by the float-text rule both editions share.
 ///
 /// Shortest round-trip digits; fixed notation when the decimal exponent is in `-4..16`, otherwise
 /// `d.ddde+XX`. JSON output uses this so every number prints identically in both editions.
@@ -293,9 +293,9 @@ fn write_json(out: &mut String, value: &Value, indent: Option<usize>, level: usi
     }
 }
 
-/// Serialize `value` the way `json.dumps(value, indent=2, sort_keys=True, ensure_ascii=False)`
-/// does: keys sorted at every level whatever `serde_json` features are enabled, floats in Python
-/// `repr` form, and only `"`, `\`, and C0 controls escaped.
+/// Serialize `value` in the JSON text form both editions share: two-space indentation, keys
+/// sorted at every level whatever `serde_json` features are enabled, floats as
+/// [`python_float_repr`] writes them, and only `"`, `\`, and C0 controls escaped.
 #[must_use]
 pub fn json_pretty(value: &Value) -> String {
     let mut out = String::new();
@@ -303,7 +303,7 @@ pub fn json_pretty(value: &Value) -> String {
     out
 }
 
-/// Serialize `value` on one line, as `json.dumps(value, sort_keys=True, ensure_ascii=False)`.
+/// Serialize `value` on one line in the same form, with `, ` and `: ` separators.
 #[must_use]
 pub fn json_line(value: &Value) -> String {
     let mut out = String::new();
@@ -357,7 +357,7 @@ mod tests {
         assert_eq!(parse_exit_marker(b"0000000000000007"), Some(7));
     }
 
-    /// The text rules shared with the Python edition, from the corpus both test suites load.
+    /// The text rules shared with the other edition, from the corpus both test suites load.
     const CASES: &str = include_str!("../testdata/text_cases.json");
 
     fn rows(key: &str) -> Vec<Vec<Value>> {

@@ -6,8 +6,8 @@ depends on the language, or on the version of the language's Unicode tables: ``r
 information separators U+001C..U+001F as whitespace, ``int()`` accepts underscores and every
 script's decimal digits, and ``json.loads`` accepts ``NaN``. Each function here states its rule
 explicitly so the same input produces the same bytes on every interpreter, and the native edition
-implements the identical rule in ``textfmt.rs``. The golden cases in
-``rs/herdr-run/testdata/text_cases.json`` hold the two to it.
+implements the identical rule. Shared golden cases, loaded by both editions' unit tests, hold the
+two to it.
 """
 
 from __future__ import annotations

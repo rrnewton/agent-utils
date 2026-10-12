@@ -621,7 +621,7 @@ mod tests {
     use crate::allowlist::admit;
     use crate::client::{Pane, ProcessInfo};
 
-    /// Run IDs shared with the Python edition.
+    /// Run IDs shared with the other edition.
     #[test]
     fn golden_run_ids() {
         let document: serde_json::Value =

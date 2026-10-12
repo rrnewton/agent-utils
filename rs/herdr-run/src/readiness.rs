@@ -363,7 +363,7 @@ mod tests {
 
     use super::*;
 
-    /// Prompt verdicts and rc-file prompt tails shared with the Python edition.
+    /// Prompt verdicts and rc-file prompt tails shared with the other edition.
     #[test]
     fn golden_readiness() {
         let document: serde_json::Value =

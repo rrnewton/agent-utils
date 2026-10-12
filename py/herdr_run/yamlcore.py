@@ -3,8 +3,8 @@
 A policy file must mean the same thing to every reader. Two general-purpose YAML libraries do not
 agree with each other -- on tabs, directives, tags, explicit-tag semantics, aliases, nesting depth,
 and every error message -- so herdr-run reads its configuration with this small parser, and the
-native edition implements the identical rules in ``yaml.rs``. The golden cases in
-``rs/herdr-run/testdata/yaml_cases.json`` are run by both editions' unit tests.
+native edition implements the identical rules. Shared golden cases are run by both editions'
+unit tests.
 
 What is accepted
 ----------------
