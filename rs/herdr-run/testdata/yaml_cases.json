@@ -470,6 +470,66 @@
       "name": "yaml 1.1 booleans are strings",
       "text": "a: [yes, no, on, off, y, n]\n",
       "value": "{\"a\": [\"yes\", \"no\", \"on\", \"off\", \"y\", \"n\"]}"
+    },
+    {
+      "name": "question mark key in a flow mapping",
+      "text": "a: {?x}\n",
+      "error": "explicit mapping keys (?) are not supported at line 1 column 5"
+    },
+    {
+      "name": "question mark key with a value in a flow mapping",
+      "text": "a: {?x: 1}\n",
+      "error": "explicit mapping keys (?) are not supported at line 1 column 5"
+    },
+    {
+      "name": "question mark after another flow entry",
+      "text": "a: {x: 1, ?y}\n",
+      "error": "explicit mapping keys (?) are not supported at line 1 column 11"
+    },
+    {
+      "name": "question mark in a flow sequence",
+      "text": "a: [?x]\n",
+      "error": "explicit mapping keys (?) are not supported at line 1 column 5"
+    },
+    {
+      "name": "question mark in a flow value",
+      "text": "a: {k: ?x}\n",
+      "error": "explicit mapping keys (?) are not supported at line 1 column 8"
+    },
+    {
+      "name": "question mark inside a block plain scalar",
+      "text": "a: ?x\n",
+      "value": "{\"a\": \"?x\"}"
+    },
+    {
+      "name": "colon starting the line after a plain flow key",
+      "text": "a: {x\n :y}\n",
+      "error": "a ':' on a later line than its plain key must be followed by a space: YAML readers disagree on whether it starts the value or continues the key at line 2 column 2"
+    },
+    {
+      "name": "colon starting the line after a plain flow key, unindented",
+      "text": "a: {x\n:y}\n",
+      "error": "a ':' on a later line than its plain key must be followed by a space: YAML readers disagree on whether it starts the value or continues the key at line 2 column 1"
+    },
+    {
+      "name": "spaced colon on the line after a plain flow key",
+      "text": "a: {x\n : y}\n",
+      "value": "{\"a\": {\"x\": \"y\"}}"
+    },
+    {
+      "name": "colon closing the line after a plain flow key",
+      "text": "a: {x\n :}\n",
+      "value": "{\"a\": {\"x\": null}}"
+    },
+    {
+      "name": "adjacent colon after a quoted flow key on a later line",
+      "text": "a: {\"x\"\n :y}\n",
+      "value": "{\"a\": {\"x\": \"y\"}}"
+    },
+    {
+      "name": "colon inside a flow plain key",
+      "text": "a: {x :y}\n",
+      "value": "{\"a\": {\"x :y\": null}}"
     }
   ]
 }

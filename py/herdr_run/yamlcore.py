@@ -110,6 +110,12 @@ _HEX_ESCAPES = {"x": 2, "u": 4, "U": 8}
 
 _TAB_MESSAGE = "tab characters are only allowed inside quoted scalars and comments"
 
+#: A ``:`` that starts a later line than its plain flow-mapping key and is followed by text.
+_SPLIT_COLON_MESSAGE = (
+    "a ':' on a later line than its plain key must be followed by a space: YAML readers "
+    "disagree on whether it starts the value or continues the key"
+)
+
 #: NEXT LINE, LINE SEPARATOR, and PARAGRAPH SEPARATOR. YAML 1.1 breaks a line at each of them and
 #: YAML 1.2 at none, so a file holding one raw means different things to different readers: a deny
 #: entry written ``-c<U+2028>`` is ``-c`` to one and a longer name nothing matches to the other.
@@ -327,7 +333,9 @@ class _Parser:
             raise self.error("anchors and aliases are not supported", line, column)
         if character in "|>":
             raise self.error("block scalars (| and >) are not supported", line, column)
-        if character == "?" and not safe_follow:
+        # In a flow collection `?x` is a plain scalar to a YAML 1.2 reader and an explicit key `x`
+        # to a YAML 1.1 reader, so it is refused there rather than read one way.
+        if character == "?" and (flow or not safe_follow):
             raise self.error("explicit mapping keys (?) are not supported", line, column)
         if (
             character in ",[]{}#%@`!"
@@ -810,6 +818,16 @@ class _Parser:
             character = self.char(line, column)
             value: object = None
             if character == ":":
+                following = self.char(line, column + 1)
+                if (
+                    plain
+                    and line != key_line
+                    and following not in ("", " ", "\t")
+                    and following not in _FLOW_INDICATORS
+                ):
+                    # `{x\n :y}`: other readers continue the plain key (`x :y`); refused rather
+                    # than read as `x: y`.
+                    raise self.error(_SPLIT_COLON_MESSAGE, line, column)
                 line, column = self.skip_flow(line, column + 1, opener)
                 if self.char(line, column) not in ",}":
                     value, end_line, end_column, plain = self.parse_flow_node(

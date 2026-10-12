@@ -53,6 +53,8 @@ pub const INTEGER_CLAMP: i128 = 100_000_000_000_000_000_000_000_000_000_000_000_
 
 const TAB_MESSAGE: &str = "tab characters are only allowed inside quoted scalars and comments";
 const FLOW_INDICATORS: &[char] = &[',', '[', ']', '{', '}'];
+/// A `:` that starts a later line than its plain flow-mapping key and is followed by text.
+const SPLIT_COLON_MESSAGE: &str = "a ':' on a later line than its plain key must be followed by a space: YAML readers disagree on whether it starts the value or continues the key";
 const SCALAR_TAGS: &[&str] = &["!!str", "!!int", "!!float", "!!bool", "!!null"];
 const ALL_TAGS: &[&str] = &[
     "!!str", "!!int", "!!float", "!!bool", "!!null", "!!seq", "!!map",
@@ -565,7 +567,9 @@ impl Parser {
                 column,
             ));
         }
-        if character == '?' && !safe_follow {
+        // In a flow collection `?x` is a plain scalar to a YAML 1.2 reader and an explicit key `x`
+        // to a YAML 1.1 reader, so it is refused there rather than read one way.
+        if character == '?' && (flow || !safe_follow) {
             return Err(Self::error(
                 "explicit mapping keys (?) are not supported",
                 line,
@@ -1411,6 +1415,15 @@ impl Parser {
             let mut value = Yaml::Null;
             match self.char_at(line, column) {
                 Some(':') => {
+                    let text_follows = match self.char_at(line, column + 1) {
+                        None | Some(' ' | '\t') => false,
+                        Some(next) => !FLOW_INDICATORS.contains(&next),
+                    };
+                    if plain && line != last_line && text_follows {
+                        // `{x\n :y}`: other readers continue the plain key (`x :y`); refused
+                        // rather than read as `x: y`.
+                        return Err(Self::error(SPLIT_COLON_MESSAGE, line, column));
+                    }
                     (line, column) = self.skip_flow(line, column + 1, opener)?;
                     if matches!(self.char_at(line, column), Some(',' | '}')) {
                         plain = false;
