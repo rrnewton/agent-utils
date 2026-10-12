@@ -1,6 +1,6 @@
 ---
 title: 'thread-display-names: name and summarise threads with an inexpensive model'
-status: open
+status: closed
 priority: 2
 issue_type: feature
 labels:
@@ -8,7 +8,8 @@ labels:
 - threads
 - summaries
 created_at: 2026-10-04T09:37:34.191747041+00:00
-updated_at: 2026-10-04T09:37:34.191747041+00:00
+updated_at: 2026-10-12T19:31:37.432138825+00:00
+closed_at: 2026-10-12T19:31:37.432138715+00:00
 ---
 
 # Description

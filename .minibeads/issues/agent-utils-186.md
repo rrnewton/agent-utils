@@ -1,12 +1,13 @@
 ---
 title: 'message-links: render URLs in messages as real hyperlinks'
-status: open
+status: closed
 priority: 1
 issue_type: feature
 labels:
 - vibe-talk
 created_at: 2026-10-04T10:09:55.482322054+00:00
-updated_at: 2026-10-04T10:09:55.482322054+00:00
+updated_at: 2026-10-12T19:31:37.426789076+00:00
+closed_at: 2026-10-12T19:31:37.426788956+00:00
 ---
 
 # Description
