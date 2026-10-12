@@ -500,10 +500,13 @@ async fn an_anchor_the_store_cannot_keep_is_refused_naming_the_field() {
     long_time["timestamp"] = json!("2".repeat(65));
     let mut long_thread = above("1000000000000000100");
     long_thread["thread_id"] = json!(oversized.clone());
+    let mut no_time = above("1000000000000000100");
+    no_time["timestamp"] = json!("yesterday");
     for (what, body) in [
         ("an empty message id", above("")),
         ("an oversized message id", above(&oversized)),
         ("an oversized timestamp", long_time),
+        ("a timestamp that is no instant", no_time),
         ("an oversized thread id", long_thread),
     ] {
         let (status, answer) = harness.put(READ_CHANNEL, body).await;

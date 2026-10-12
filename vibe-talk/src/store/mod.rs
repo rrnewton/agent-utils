@@ -1022,8 +1022,9 @@ pub struct BookmarkChange {
 }
 
 /// Check a bookmark's anchor: the message id, the timestamp and the thread id each present, within
-/// the bounds a pin's snapshot has, and free of control characters. Refused rather than trimmed,
-/// for [`validate_pin`]'s reason: no provider served such an id. `#240 reading-bookmark`.
+/// the bounds a pin's snapshot has, and free of control characters; and the timestamp an RFC 3339
+/// instant. Refused rather than trimmed, for [`validate_pin`]'s reason: no provider served such an
+/// id. `#240 reading-bookmark`.
 ///
 /// # Errors
 ///
@@ -1031,8 +1032,24 @@ pub struct BookmarkChange {
 pub fn validate_bookmark(anchor: &BookmarkAnchor) -> Result<(), StoreError> {
     bookmark_identifier("message id", anchor.message_id.as_str(), MAX_PIN_ID_BYTES)?;
     bookmark_identifier("timestamp", &anchor.timestamp, MAX_PIN_TIMESTAMP_BYTES)?;
+    bookmark_instant(&anchor.timestamp)?;
     if let Some(thread) = &anchor.thread_id {
         bookmark_identifier("thread id", thread, MAX_PIN_ID_BYTES)?;
+    }
+    Ok(())
+}
+
+/// A bookmark's timestamp: an RFC 3339 instant with its offset, `T` between date and time and no
+/// annotation, as every provider here serves a message's. A page places the line by this time
+/// wherever its list does not hold the message (Main, for a thread reply), and a time it cannot
+/// read there (`Date.parse`) would draw no line at all.
+fn bookmark_instant(raw: &str) -> Result<(), StoreError> {
+    let shaped = raw.as_bytes().get(10) == Some(&b'T') && !raw.contains('[');
+    if !shaped || raw.parse::<jiff::Timestamp>().is_err() {
+        return Err(StoreError::BadId(
+            "a bookmark's timestamp must be an RFC 3339 instant, such as 2026-10-12T12:00:00Z"
+                .to_owned(),
+        ));
     }
     Ok(())
 }
@@ -1999,6 +2016,35 @@ mod tests {
             },
         ] {
             let error = validate_bookmark(&broken).expect_err("refused");
+            assert_eq!(error.code(), "bad_id", "{error}");
+            assert!(error.to_string().contains("bookmark"), "{error}");
+        }
+        // The timestamp is an instant a page can place the line by.
+        for served in [
+            "2026-10-12T12:00:00Z",
+            "2026-08-18T12:00:00.000000+00:00",
+            "2026-10-12T12:00:00.123456789-07:00",
+        ] {
+            let at = BookmarkAnchor {
+                timestamp: served.to_owned(),
+                ..anchor("100")
+            };
+            assert!(validate_bookmark(&at).is_ok(), "{served} was refused");
+        }
+        for unreadable in [
+            "yesterday",
+            "1760270400",
+            "2026-10-12",
+            "2026-10-12T12:00:00",
+            "2026-10-12 12:00:00Z",
+            "2026-10-12T12:00:00Z[UTC]",
+            "2026-13-12T12:00:00Z",
+        ] {
+            let broken = BookmarkAnchor {
+                timestamp: unreadable.to_owned(),
+                ..anchor("100")
+            };
+            let error = validate_bookmark(&broken).expect_err(unreadable);
             assert_eq!(error.code(), "bad_id", "{error}");
             assert!(error.to_string().contains("bookmark"), "{error}");
         }
