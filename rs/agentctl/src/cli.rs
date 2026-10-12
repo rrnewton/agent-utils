@@ -97,7 +97,7 @@ enum Commands {
     Doctor(Doctor),
     /// Stop an owned runtime, or safely unregister an adopted one, and archive state
     #[command(
-        after_help = "Examples:\n  agentctl stop reviewer\n  agentctl stop sub-cloud-worker\n  agentctl stop reviewer --retire-dead-adoption --expected-token TOKEN --expected-record-sha256 SHA256\n\nFor an agentcloud agent, stop runs `agentcloudctl halt` (the open run is interrupted and no new\nrun starts), closes the recorded agentterm pane, runs `agentcloudctl archive`, and archives the\nregistry record. A halt failure changes nothing locally. stop does not release the node\nreservation; the orchestrator releases it on its own schedule after the halted session goes\nidle (check `agentcloudctl inspect -s SESSION_ID`)."
+        after_help = "Examples:\n  agentctl stop reviewer\n  agentctl stop sub-cloud-worker\n  agentctl stop reviewer --retire-dead-adoption --expected-token TOKEN --expected-record-sha256 SHA256\n\nFor an agentcloud agent, stop runs `agentcloudctl halt` (the open run is interrupted and no new\nrun starts), closes the recorded agentterm pane, runs `agentcloudctl archive`, and archives the\nregistry record. A halt failure changes nothing locally. stop does not release the node\nreservation; the orchestrator releases it on its own schedule after the halted session goes\nidle (check `agentcloudctl inspect -s SESSION_ID`).\n\nA headless turn-runner worker is retired only when every process its runtime recorded has\nprovably exited: stop --expected-token then archives the record with its runtime home and leaves\nthe tmux window or Herdr tab in place. A live or unprovable runner exits 69 and changes nothing."
     )]
     Stop(Stop),
     /// Relaunch a dead owned local agent from its recorded conversation and launch policy, preserving its old queue in the archive
@@ -228,7 +228,7 @@ struct Doctor {
 struct Stop {
     #[command(flatten)]
     agent: Named,
-    /// Require this exact current registry generation; mandatory for dead managed or adopted recovery
+    /// Require this exact current registry generation; mandatory for dead managed, adopted, or headless turn-runner recovery
     #[arg(long, value_name = "TOKEN")]
     expected_token: Option<String>,
     /// Recover an identity-less dead adopted row without changing its pane; requires --expected-token and --expected-record-sha256

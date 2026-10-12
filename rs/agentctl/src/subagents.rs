@@ -35,6 +35,7 @@ mod cloud;
 mod nested;
 mod revive;
 mod stop_advice;
+mod turn_runner;
 
 pub(crate) use cloud::{
     validate_create_arguments as validate_cloud_create_arguments, CLOUD_DRIVERS,
@@ -1963,10 +1964,7 @@ impl AgentRecord {
         ) || self.mode != "interactive"
             || self.backend != "herdr"
         {
-            return Err(fail(format!(
-                "agent {:?} uses adapter {:?}, mode {:?}, backend {:?}, which this agentctl does not run. Headless workers and other non-Herdr runtimes exist only in the Python edition of agentctl; inspect or stop this record with it",
-                self.name, self.adapter, self.mode, self.backend
-            )));
+            return Err(fail(turn_runner::unsupported_message(self)));
         }
         Ok(())
     }
@@ -9260,6 +9258,9 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
                 "--retire-dead-adoption and --recover-legacy-adoption are mutually exclusive",
             ));
         }
+        if record.adapter == turn_runner::ADAPTER {
+            return self.retire_turn_runner(record, options, recovery);
+        }
         if options.retire_dead_adoption {
             Self::dead_adoption_anchor(&record)?;
         }
@@ -15588,7 +15589,7 @@ pub(crate) mod tests {
         assert!(status["probe_error"]
             .as_str()
             .unwrap()
-            .contains("only in the Python edition of agentctl"));
+            .contains("is a headless turn-runner worker"));
         assert_eq!(manager.list().unwrap().len(), 1);
         assert!(manager.stop("worker").is_err());
         assert!(fixture.client.closed.lock().unwrap().is_empty());
@@ -15610,4 +15611,6 @@ pub(crate) mod tests {
     mod revive;
     /// Trusted stop refusals and generation-bound recovery advice.
     mod stop_advice;
+    /// Retirement of headless turn-runner records whose runner is provably dead.
+    mod turn_runner;
 }

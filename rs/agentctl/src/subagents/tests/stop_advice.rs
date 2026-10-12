@@ -359,7 +359,8 @@ fn unavailable_and_unsupported_stop_refusals_keep_their_codes_and_use_doctor() {
             let mut document = agent::read_private_json(&path).unwrap();
             document["adapter"] = json!("turn-runner");
             document["mode"] = json!("headless");
-            document["runtime_home"] = json!("/tmp/worker-runtime");
+            // A runtime home that does not exist cannot prove its runner dead.
+            document["runtime_home"] = json!(fixture.root.join("missing-runtime"));
             agent::atomic_json(&path, &document).unwrap();
         }
         let failure = fixture
@@ -369,7 +370,8 @@ fn unavailable_and_unsupported_stop_refusals_keep_their_codes_and_use_doctor() {
         assert_eq!(failure.recovery, RecoveryAction::Doctor, "{case}");
         assert_eq!(
             failure.error.exit_code(),
-            if case == "unavailable" { 69 } else { 75 }
+            if case == "unknown" { 75 } else { 69 },
+            "{case}"
         );
         assert!(!stop_reason(&failure).is_empty(), "{case}");
         assert!(fixture.client.closed.lock().unwrap().is_empty(), "{case}");
