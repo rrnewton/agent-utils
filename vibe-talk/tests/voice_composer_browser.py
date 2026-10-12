@@ -419,16 +419,25 @@ def walk(chromium: BrowserType, args: argparse.Namespace, url: str, api: FakeApi
             page.wait_for_function("() => document.querySelectorAll('#transcript > li.theirs').length >= 13",
                                    timeout=10_000)
             page.evaluate("() => document.activeElement && document.activeElement.blur()")
-            half = page.evaluate(
+            page.evaluate(
                 "() => { const a = document.getElementById('scroll-area'); "
                 "const r = a.getBoundingClientRect(); "
-                "a.scrollTop += document.getElementById('compose-text').getBoundingClientRect().top - (r.bottom - 40); "
+                "a.scrollTop += document.getElementById('compose-text').getBoundingClientRect().top - (r.bottom - 40); }")
+            # Let what a scroll back brings up settle first — the jump to the newest message floats
+            # over the list's lower left — and then tap the middle of the box's showing strip, after
+            # checking that a finger there lands on the box and not on a chip.
+            page.wait_for_timeout(400)
+            half = page.evaluate(
+                "() => { const r = document.getElementById('scroll-area').getBoundingClientRect(); "
                 "const f = document.getElementById('compose-text').getBoundingClientRect(); "
-                "return [f.left + 24, Math.min(f.top + 12, r.bottom - 8), r.bottom, "
-                "document.getElementById('send-text').getBoundingClientRect().top]; }")
+                "const x = f.left + f.width / 2, y = Math.min(f.top + 12, r.bottom - 8); "
+                "const hit = document.elementFromPoint(x, y); "
+                "return [x, y, r.bottom, document.getElementById('send-text').getBoundingClientRect().top, "
+                "hit ? (hit.id || hit.tagName) : '']; }")
             assert isinstance(half, list)
-            x, y, area_bottom, send_top = (float(value) for value in half)
+            x, y, area_bottom, send_top = (float(value) for value in half[:4])
             check(send_top > area_bottom, f"{label}: the premise, Send under the dock, does not hold")
+            check(half[4] == "compose-text", f"{label}: the point to tap on the half-showing box is on {half[4]!r}")
             page.mouse.click(x, y)
             page.wait_for_timeout(200)
             where = f"{label}, a long typed conversation, the box tapped where it showed"
