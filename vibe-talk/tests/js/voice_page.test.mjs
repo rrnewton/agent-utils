@@ -37320,6 +37320,42 @@ test("`#240 reading-bookmark`: an old place marker whose message is never read a
   assert.equal(bookmarkAt(page), null);
 });
 
+test("`#240 reading-bookmark`: the device's copy of a channel keeps the bookmark, so a page opened before any read draws the line, and the first read says where it is now", async () => {
+  for (const threads of [false, true]) {
+    const mode = threads ? "timeline mode" : "page mode";
+    const first = newPage(new Map(), SCRIPT, (p) => {
+      p.serveBookmark = true;
+      p.threadingSupported = threads;
+    });
+    await signIn(first);
+    await showDiscord(first, backlog(5));
+    await bookmarkRow(first, bid(2));
+    let reads = null;
+    const page = reloadPage(first.storage, (p) => {
+      p.serveBookmark = true;
+      p.threadingSupported = threads;
+      p.messages = first.messages;
+      p.bookmark = { ...first.bookmark };
+      const route = threads ? "timeline" : "channelPage";
+      reads = gate(p[route]);
+      p[route] = reads.respond;
+    });
+    // Synchronously, from the device: nothing has answered.
+    assert.deepStrictEqual(shownIds(page), [0, 1, 2, 3, 4].map(bid), `${mode}: the saved rows were not drawn`);
+    assert.deepStrictEqual(bookmarkAt(page), { id: bid(2), place: "above" }, `${mode}: a page opened from the device's copy drew no line`);
+    await page.settle();
+    assert.deepStrictEqual(bookmarkAt(page), { id: bid(2), place: "above" }, `${mode}: sign-in took the saved line away`);
+    // Moved on the other device meanwhile: the first read says so, over the saved copy.
+    page.bookmark = { revision: page.bookmark.revision + 1,
+      anchor: { message_id: bid(4), place: "above", timestamp: page.messages[4].timestamp } };
+    reads.open();
+    await page.settle();
+    await page.settle();
+    assert.deepStrictEqual(bookmarkAt(page), { id: bid(4), place: "above" }, `${mode}: the saved line outlived the read`);
+    assert.deepStrictEqual(page.bookmarkCalls, [], `${mode}: drawing the saved line wrote the bookmark`);
+  }
+});
+
 test("`#240 reading-bookmark`: Main places the line by time for a thread reply, All above it, its thread too, and another thread draws none", async () => {
   const page = await threadPage();
   assert.equal(page.el("thread-select").value, "flat");

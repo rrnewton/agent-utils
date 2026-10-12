@@ -9346,6 +9346,7 @@ function loadCanon(channel) {
     if (!trusted && key === viewKey("flat")) continue;
     channelCanon.views.set(key, { ...cover, live: false, cursor: null });
   }
+  restoreSavedBookmark(channel, entry.bookmark);
   entry.usedAt = Date.now();
   writeMessageCache(cache, String(channel));
 }
@@ -9507,6 +9508,7 @@ function saveChannelScope() {
       replyGaps: Object.fromEntries([...channelCanon.replyGaps].filter(([id]) => heldThreads.has(id))),
       passedOver: [...channelCanon.passedOver].filter((id) => heldThreads.has(id)),
       settledByDone: Object.fromEntries([...channelCanon.settledByDone].filter(([id]) => heldThreads.has(id))),
+      bookmark: bookmarkToSave(key),
     };
   } else {
     // In time order, gathered replies or not (`#215 reply-coalesce`): a reload draws these as they
@@ -9522,6 +9524,7 @@ function saveChannelScope() {
       more: discordMoreAbove !== false,
       cursor: null,
       dismissed: [...archivedIds].filter((id) => shown.has(id)),
+      bookmark: bookmarkToSave(key),
     };
   }
   trimCacheEntry(entry, MESSAGE_CACHE_ROWS);
@@ -9548,6 +9551,7 @@ function hydrateChannelScope() {
   if (!entry || entry.mode !== "page") return false;
   entry.usedAt = Date.now();
   writeMessageCache(cache, key);
+  restoreSavedBookmark(key, entry.bookmark);
   const payload = {
     channel: knownChannel(channel),
     messages: entry.messages,
@@ -14745,6 +14749,27 @@ function noteBookmark(payload) {
 }
 
 /**
+ * This channel's bookmark for the device's saved copy of the channel (`saveChannelScope`), so a page
+ * opened offline draws the line before any read: the server's last word, or a move of the owner's
+ * on its way. Undefined, and so not saved, while the server has said nothing of it.
+ */
+function bookmarkToSave(channel) {
+  const held = heldBookmark(channel);
+  return held && held.known ? { revision: held.revision, anchor: held.anchor } : undefined;
+}
+
+/**
+ * A saved copy's bookmark (`bookmarkToSave`), for a channel drawn from the device before any read:
+ * shown until the first read says where it is now. Never over one this page holds already, which
+ * is newer: a read's, or the owner's own move. Not `known`: it is not the server speaking now.
+ */
+function restoreSavedBookmark(channel, saved) {
+  const key = String(channel);
+  if (bookmarks.has(key) || !isBookmarkState(saved)) return;
+  bookmarks.set(key, { revision: saved.revision, anchor: saved.anchor || null, token: null, known: false });
+}
+
+/**
  * Change this channel's bookmark here, at once, ahead of the write that tells the server: what every
  * change starts with. Answers the change, for `sendBookmark` to write.
  */
@@ -14825,6 +14850,8 @@ function sendBookmark(move, { conditional = false, after = null, quiet = false }
     }
     const now = bookmarkAnchor(channel);
     if (!sameAnchor(shownBefore, now) && channel === currentChannelId()) redrawBookmark();
+    // Kept with the device's copy of the channel, for a page opened offline.
+    if (channel === currentChannelId() && !sideActive) saveChannelScope();
     // Short, for a phone's status line; the reason a write failed goes where every failure does.
     if (outcome === "moved" && mine && !quiet) {
       setStatus("Bookmark moved on another device.");
