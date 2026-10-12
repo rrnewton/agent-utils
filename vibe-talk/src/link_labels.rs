@@ -16,8 +16,8 @@
 //! bare address, `<address>`, and the chat services' forms of the same. A link its writer named,
 //! `[the fix](address)`, keeps the name it was given; code is never a link at all. The address is
 //! untouched — only the words on the screen change — and the full address goes in the link's
-//! `title`, so a pointer resting on it still says where it goes. This is the HTML path only: the
-//! text a voice reads ([`crate::speakable`]) and the text Copy copies are the message as written.
+//! `title`, so a pointer resting on it still says where it goes. The text Copy copies is the
+//! message as written. A voice says the same pages in words of its own ([`spoken_label`], below).
 //!
 //! # The labels
 //!
@@ -27,20 +27,20 @@
 //! and a word names a run. A suffix in parentheses tells apart two links into the same thread, as
 //! GitHub's own `(comment)` does.
 //!
-//! | Address, under `github.com/OWNER/REPO` | Label |
-//! |---|---|
-//! | `/pull/N`, `/issues/N`, `/discussions/N` | `REPO#N` |
-//! | the same `#issuecomment-…`, `#discussion_r…`, `#discussioncomment-…` | `REPO#N (comment)` |
-//! | the same `#pullrequestreview-…` | `REPO#N (review)` |
-//! | `/pull/N/files`, `/commits`, `/checks` | `REPO#N (files)`, `(commits)`, `(checks)` |
-//! | `/commit/SHA`, `/pull/N/commits/SHA` | `REPO@abc1234` |
-//! | `/commit/SHA#commitcomment-…` | `REPO@abc1234 (comment)` |
-//! | `/compare/A...B`, `/compare/A..B` | `REPO@A...B`, a commit id in it cut to seven |
-//! | `/releases/tag/T` | `REPO@T` |
-//! | `/tree/REF` | `REPO@REF` |
-//! | `/actions/runs/ID` | `REPO run ID` |
-//! | `/actions/runs/ID/job/J`, `/attempts/N` | `REPO run ID (job)`, `(attempt N)` |
-//! | `/blob/REF/…/FILE`, with `#L10` or `#L10-L20` | `REPO:FILE`, with the same fragment |
+//! | Address, under `github.com/OWNER/REPO` | Label | Spoken |
+//! |---|---|---|
+//! | `/pull/N`, `/issues/N`, `/discussions/N` | `REPO#N` | REPO pull request N, REPO issue N, REPO discussion N |
+//! | the same `#issuecomment-…`, `#discussion_r…`, `#discussioncomment-…` | `REPO#N (comment)` | a comment on REPO pull request N |
+//! | the same `#pullrequestreview-…` | `REPO#N (review)` | a review of REPO pull request N |
+//! | `/pull/N/files`, `/commits`, `/checks` | `REPO#N (files)`, `(commits)`, `(checks)` | the files of REPO pull request N, the commits of …, the checks of … |
+//! | `/commit/SHA`, `/pull/N/commits/SHA` | `REPO@abc1234` | REPO commit A B C 1 |
+//! | `/commit/SHA#commitcomment-…` | `REPO@abc1234 (comment)` | a comment on REPO commit A B C 1 |
+//! | `/compare/A...B`, `/compare/A..B` | `REPO@A...B`, a commit id in it cut to seven | a comparison in REPO |
+//! | `/releases/tag/T` | `REPO@T` | REPO release T |
+//! | `/tree/REF` | `REPO@REF` | REPO branch REF, or REPO commit A B C 1 for a commit id |
+//! | `/actions/runs/ID` | `REPO run ID` | REPO run ID |
+//! | `/actions/runs/ID/job/J`, `/attempts/N` | `REPO run ID (job)`, `(attempt N)` | a job in REPO run ID, attempt N of REPO run ID |
+//! | `/blob/REF/…/FILE`, with `#L10` or `#L10-L20` | `REPO:FILE`, with the same fragment | REPO file FILE, line 10, lines 10 to 20 |
 //!
 //! Anything else is left as it is written: another host, a repository's own page, a user's page, a
 //! gist, `/tree/REF/PATH` — where a branch name with a slash in it cannot be told from a
@@ -62,6 +62,18 @@
 //! `github.com/octo/widgets/blob/main/../../../../other/repo/pull/5` opens a pull request in
 //! ANOTHER repository. An address holding any of these, or a control character or a space a
 //! browser would drop or trip over, is left as written.
+//!
+//! # Spoken
+//!
+//! `#187 speakable-ids-urls`. Read aloud, an address is a minute of "h t t p s colon slash slash"
+//! that a listener can neither use nor write down, so [`crate::speakable`] says what it is instead,
+//! and for these pages [`spoken_label`] says it: the third column above. The words a label's signs
+//! stand for are said rather than the signs — "pull request" and "issue" for the `#` that serves
+//! both — and nothing is spelled that a listener cannot use. A number long enough to be an
+//! identifier, as a run's is, is said by its last three digits, "run ending in 901", and a commit by
+//! its first four hex digits one at a time, enough to find it among the seven the screen shows. An
+//! address is said this way only where it is labelled, after every check a label passes, so a voice
+//! is never less careful about an address than the page is.
 //!
 //! # Other hosts
 //!
@@ -91,14 +103,20 @@ struct Host {
     /// repository's owner and its third is not a repository.
     reserved: &'static [&'static str],
     /// The label for an address on it, from its parts.
-    label: fn(&Address<'_>) -> Option<String>,
+    label: Writer,
+    /// How a voice says an address on it, from its parts: only where `label` has a label.
+    spoken: Writer,
 }
+
+/// What a host's label, or its spoken form, is written by.
+type Writer = fn(&Address<'_>) -> Option<String>;
 
 /// Every host that has short labels. See the module note on adding one.
 const HOSTS: [Host; 1] = [Host {
     names: &["github.com", "www.github.com"],
     reserved: &GITHUB_RESERVED,
     label: github,
+    spoken: github_spoken,
 }];
 
 /// GitHub's top-level words that no account may take, under which a path is GitHub's own and not
@@ -139,6 +157,18 @@ struct Address<'u> {
 /// The short label for `address`, or `None` when it is not one this knows. See the module note.
 #[must_use]
 pub fn short_label(address: &str) -> Option<String> {
+    read(address, |host| host.label)
+}
+
+/// How a voice says `address`, or `None` when it is not one [`short_label`] labels: the same page
+/// in words, `widgets pull request 41` for `widgets#41`. See "Spoken" in the module note.
+#[must_use]
+pub fn spoken_label(address: &str) -> Option<String> {
+    read(address, |host| host.spoken)
+}
+
+/// `address` cut into its parts and given to the writer `pick` chooses from its host's row.
+fn read(address: &str, pick: fn(&Host) -> Writer) -> Option<String> {
     if address.len() > MAX_ADDRESS || address.bytes().any(unresolved) {
         return None;
     }
@@ -180,7 +210,7 @@ pub fn short_label(address: &str) -> Option<String> {
     }) {
         return None;
     }
-    (entry.label)(&Address {
+    pick(entry)(&Address {
         segments,
         query,
         fragment,
@@ -347,6 +377,25 @@ const GITHUB_ROUTES: [Route; 15] = {
 
 /// The label for an address on GitHub.
 fn github(address: &Address<'_>) -> Option<String> {
+    github_page(address, |route, repo, captures, fragment| {
+        written(route.shape, repo, captures, fragment)
+    })
+}
+
+/// How a voice says an address on GitHub.
+fn github_spoken(address: &Address<'_>) -> Option<String> {
+    github_page(address, |route, repo, captures, fragment| {
+        // Said only where it is drawn, so a voice is never less careful than the page.
+        written(route.shape, repo, captures, fragment)?;
+        said(route, repo, captures, fragment)
+    })
+}
+
+/// The page an address on GitHub names, written by `write` from its route and what it captured.
+fn github_page(
+    address: &Address<'_>,
+    write: impl Fn(&Route, &str, &[String], Option<&str>) -> Option<String>,
+) -> Option<String> {
     let [owner, repo, route @ ..] = address.segments.as_slice() else {
         return None;
     };
@@ -358,7 +407,7 @@ fn github(address: &Address<'_>) -> Option<String> {
     }
     GITHUB_ROUTES.iter().find_map(|candidate| {
         let captures = captured(candidate.path, route)?;
-        written(candidate.shape, repo, &captures, address.fragment)
+        write(candidate, repo, &captures, address.fragment)
     })
 }
 
@@ -429,21 +478,122 @@ fn written(
     })
 }
 
+/// How a voice says the page of `route`: what it is, in words, with nothing a listener would have
+/// to hear spelled out. `#187 speakable-ids-urls`; the module note's table gives each.
+///
+/// A number long enough to be an identifier is said by its last three digits, as
+/// [`crate::speakable`] says one in prose, and a commit by its first four hex digits one at a
+/// time — enough to find it among the commits on the screen, which show seven.
+fn said(route: &Route, repo: &str, captures: &[String], fragment: Option<&str>) -> Option<String> {
+    let first = captures.first()?;
+    let last = captures.last()?;
+    let section = match route.path.first() {
+        Some(Segment::Word(word)) => *word,
+        _ => "",
+    };
+    // An underscore in a name is a pause, as it is in prose; said, it is a word of its own.
+    let repo = repo.replace('_', " ");
+    let commit_said = |id: &str| format!("{repo} commit {}", spelled_commit(id));
+    Some(match route.shape {
+        Shape::Thread => {
+            let noun = match section {
+                "pull" => "pull request",
+                "issues" => "issue",
+                _ => "discussion",
+            };
+            let page = format!("{repo} {noun} {}", spoken_number(first));
+            match thread_note(fragment) {
+                Some("review") => format!("a review of {page}"),
+                Some(note) => format!("a {note} on {page}"),
+                None => page,
+            }
+        }
+        Shape::ThreadPart(part) => {
+            format!("the {part} of {repo} pull request {}", spoken_number(first))
+        }
+        Shape::Commit => {
+            if fragment.is_some_and(|f| numbered(f, "commitcomment-")) {
+                format!("a comment on {}", commit_said(last))
+            } else {
+                commit_said(last)
+            }
+        }
+        Shape::Compare => format!("a comparison in {repo}"),
+        Shape::Ref if section == "releases" => format!("{repo} release {last}"),
+        // A commit id where a branch would be is said as the commit it is.
+        Shape::Ref if abbreviated_ref(last) != *last => commit_said(last),
+        Shape::Ref => format!("{repo} branch {last}"),
+        Shape::Run => format!("{repo} run {}", spoken_number(first)),
+        Shape::RunJob => format!("a job in {repo} run {}", spoken_number(first)),
+        Shape::RunAttempt => format!(
+            "attempt {} of {repo} run {}",
+            spoken_number(captures.get(1)?),
+            spoken_number(first)
+        ),
+        Shape::File => {
+            let file = last.rsplit('/').next()?;
+            match fragment.filter(|f| line_fragment(f)) {
+                Some(lines) => format!("{repo} file {file} {}", spoken_lines(lines)),
+                None => format!("{repo} file {file}"),
+            }
+        }
+    })
+}
+
+/// A number as a voice says it: whole, or by its last three digits once it is long enough to be an
+/// identifier rather than a quantity.
+fn spoken_number(digits: &str) -> String {
+    if digits.len() >= crate::speakable::BIG_NUMBER_MIN_DIGITS {
+        format!("ending in {}", &digits[digits.len() - 3..])
+    } else {
+        digits.to_owned()
+    }
+}
+
+/// A commit id's first four hex digits, one at a time and in capitals, so that a voice spells them
+/// rather than reading `4f21` as a number with a letter in it.
+fn spelled_commit(id: &str) -> String {
+    id.chars()
+        .take(4)
+        .map(|digit| digit.to_ascii_uppercase().to_string())
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// `L10` → `line 10`, `L10-L20` → `lines 10 to 20`. Columns are left out: nobody listens for one.
+fn spoken_lines(fragment: &str) -> String {
+    let line = |part: &str| {
+        let rest = part.strip_prefix('L').unwrap_or(part);
+        rest.split_once('C')
+            .map_or(rest, |(line, _)| line)
+            .to_owned()
+    };
+    match fragment.split_once('-') {
+        Some((from, to)) => format!("lines {} to {}", line(from), line(to)),
+        None => format!("line {}", line(fragment)),
+    }
+}
+
 /// What a fragment on an issue, a pull request or a discussion says it points at, as a suffix.
 /// One this does not know points somewhere on the same page, and the label is the thread's.
-fn thread_suffix(fragment: Option<&str>) -> &'static str {
-    let Some(fragment) = fragment else {
-        return "";
-    };
+fn thread_suffix(fragment: Option<&str>) -> String {
+    thread_note(fragment)
+        .map(|note| format!(" ({note})"))
+        .unwrap_or_default()
+}
+
+/// What a fragment on a thread points at: `comment`, `review`, or `None` for the thread itself.
+fn thread_note(fragment: Option<&str>) -> Option<&'static str> {
+    let fragment = fragment?;
     if ["issuecomment-", "discussion_r", "discussioncomment-"]
         .iter()
         .any(|prefix| numbered(fragment, prefix))
     {
-        " (comment)"
+        Some("comment")
     } else if numbered(fragment, "pullrequestreview-") {
-        " (review)"
+        Some("review")
     } else {
-        ""
+        None
     }
 }
 
@@ -557,7 +707,7 @@ fn ref_name(text: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{short_label, strip_scheme, MAX_ADDRESS};
+    use super::{short_label, spoken_label, strip_scheme, MAX_ADDRESS};
 
     const REPO: &str = "https://github.com/octo/widgets";
     const SHA: &str = "4f21ab0c9d8e7f6a5b4c3d2e1f0a9b8c7d6e5f4a";
@@ -945,6 +1095,56 @@ mod tests {
                 "orgs#3",
             ),
         ]);
+    }
+
+    #[test]
+    fn a_page_is_said_only_where_it_is_labelled() {
+        // `#187 speakable-ids-urls`: a voice is never less careful about an address than the page,
+        // so every address with no label, however close to one, has no spoken form either.
+        let addresses = [
+            format!("{REPO}/pull/41"),
+            format!("{REPO}/pull/41#pullrequestreview-777"),
+            format!("{REPO}/commit/{SHA}"),
+            format!("{REPO}/compare/main...feature"),
+            format!("{REPO}/releases/tag/v1.2.0"),
+            format!("{REPO}/tree/main"),
+            format!("{REPO}/actions/runs/123456/attempts/2"),
+            format!("{REPO}/blob/main/src/a.rs#L3C5-L4C1"),
+            REPO.to_owned(),
+            format!("{REPO}/pull/41?notification_referrer_id=x"),
+            format!("{REPO}/compare/main...a b"),
+            format!("{REPO}/releases/tag/v1%2F2"),
+            format!("{REPO}/tree/main/docs"),
+            format!("{REPO}/blob/main/docs/My%20Notes.md"),
+            format!("{REPO}/blob/main/docs/a\u{202e}dm.exe"),
+            format!("{REPO}/blob/main/../../../../evil/repo/pull/5"),
+            format!("{REPO}/blob/%2e%2e/%2e%2e/%2e%2e/evil/repo/blob/main/x.rs"),
+            format!("{REPO}\\pull\\41"),
+            "https://github.com/orgs/octo/discussions/3".to_owned(),
+            "https://github.com/octo/wid%67ets/pull/41".to_owned(),
+            "https://github.com.example.com/octo/widgets/pull/41".to_owned(),
+            "github.com/octo/widgets/pull/41".to_owned(),
+            format!("{REPO}/blob/main/{}/x.rs", "d/".repeat(MAX_ADDRESS)),
+        ];
+        for address in &addresses {
+            assert_eq!(
+                spoken_label(address).is_some(),
+                label(address).is_some(),
+                "{address}"
+            );
+        }
+        assert_eq!(
+            spoken_label(&format!("{REPO}/pull/41#pullrequestreview-777")).as_deref(),
+            Some("a review of widgets pull request 41")
+        );
+        assert_eq!(
+            spoken_label(&format!("{REPO}/blob/main/src/a.rs#L3C5-L4C1")).as_deref(),
+            Some("widgets file a.rs lines 3 to 4")
+        );
+        assert_eq!(
+            spoken_label(&format!("{REPO}/compare/{SHA}...v2")).as_deref(),
+            Some("a comparison in widgets")
+        );
     }
 
     #[test]

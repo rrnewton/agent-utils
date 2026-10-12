@@ -2081,12 +2081,16 @@ local. `src/clock.rs` records what that trades away.
 time: `content` is what was typed and what the screen shows, `spoken_content` is what a voice says,
 and the rewrite happens once, in `src/ops.rs`, so nothing downstream computes one. `src/speakable.rs`
 does three things to it, in an order that matters. Markdown comes off, because read aloud
-`**deploy**` is *"asterisk asterisk deploy asterisk asterisk"*. Timestamps become *"three hours
-ago"*, because an ISO string is read out character by character. And long numeric ids and hash
-codes get short spoken names. A long numeric identifier becomes *"UID ending in 009"*, and a diff
-tag such as `D1234567890` becomes *"Diff ending in 890"*. Hashes still get letters, so the same
-hash is the same letter every time it appears. Times are resolved before ids because a Unix epoch
-and a snowflake are both long runs of digits and only one of them is a time.
+`**deploy**` is *"asterisk asterisk deploy asterisk asterisk"*; a link reads as its words, and an
+address is said as what it is rather than spelled (`#187 speakable-ids-urls`) — a GitHub page as
+the page, *"widgets pull request 41"* for the address the screen shows as `widgets#41`, and any
+other address by its host, *"a link on example.com"*, never *"https"*. Timestamps become *"three
+hours ago"*, because an ISO string is read out character by character. And long numeric ids and
+hash codes get short spoken names. A long numeric identifier becomes *"UID ending in 009"*, a diff
+such as `D1234567890` becomes *"diff ending in 890"*, and a task `T1234567` *"task ending in
+567"*. Hashes still get letters, so the same hash is the same letter every time it appears. Times
+are resolved before ids because a Unix epoch and a snowflake are both long runs of digits and only
+one of them is a time. `src/speakable.rs` and `src/link_labels.rs` give every spoken form.
 
 The hash-letter table lives on the server for as long as the server does, shared by every reader,
 and is bounded at 4096 names — past that a value is spoken as *"a hash code"* with no letter,
@@ -3145,8 +3149,10 @@ live stream, a post's answer and the pins — and sends it beside the text as `c
    would open somewhere other than its label says: one whose path holds a `.` or `..` segment
    (spelled with `%2e` or not), a backslash or a control character, and one under a word of
    GitHub's own that no account may take, such as an organisation's `/orgs/NAME/discussions/3`.
-   Copy text and every voice still have the address as it was written. The rules are a table in `src/link_labels.rs`, where another
-   host can be added.
+   Copy text still has the address as it was written. A voice says the same page in words —
+   *"widgets pull request 123"* — only where the page shows a label, and any other address by its
+   host, *"a link on example.com"* (`#187 speakable-ids-urls`). The rules are a table in
+   `src/link_labels.rs`, where another host can be added.
 7. Raw HTML written in a message is shown as the characters it is, and
    [ammonia](https://github.com/rust-ammonia/ammonia) then keeps only a short allowlist of
    elements and attributes; see [Security](#security).

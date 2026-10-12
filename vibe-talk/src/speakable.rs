@@ -3,8 +3,9 @@
 //! # Why this exists
 //!
 //! Read-aloud sent the message's raw text to the vendor, so the voice said "asterisk asterisk
-//! deploy asterisk asterisk", spelled out nineteen-digit snowflakes, and read ISO timestamps
-//! character by character. All three are noise that a listener cannot use and cannot skip.
+//! deploy asterisk asterisk", spelled out nineteen-digit snowflakes, read ISO timestamps character
+//! by character, and began every address with "h t t p s colon slash slash". All of it is noise
+//! that a listener cannot use and cannot skip.
 //!
 //! # Why it is code and not a prompt
 //!
@@ -14,14 +15,27 @@
 //! # The three jobs, in order
 //!
 //! 1. **Markdown comes off.** Discord's flavour: fences, inline code, bold, italic, underline,
-//!    strikethrough, spoilers, headers, quotes, links, mentions and custom emoji.
+//!    strikethrough, spoilers, headers, quotes, links, mentions and custom emoji. A link reads as
+//!    its words, and an address with none is said as what it is (`#187 speakable-ids-urls`): a
+//!    page with a short label as that page, "widgets pull request 41"; anything else by its host,
+//!    "a link on example.com". Never "https", and never "colon slash slash".
 //! 2. **Times become relative.** A listener wants "three hours ago", not "2026-08-24T04:31:00Z".
 //! 3. **Opaque strings become useful short names.** A hash is not information when spoken; it is
 //!    forty seconds of alphabet, so it becomes "hash code A". A long numeric identifier becomes
-//!    "UID ending in 009", while `D1234567890` becomes "Diff ending in 890".
+//!    "UID ending in 009", while a diff `D1234567890` becomes "diff ending in 890" and a task
+//!    `T1234567` "task ending in 567".
 //!
-//! Order matters and is not arbitrary. Times are resolved BEFORE opaque strings, because a Unix
-//! epoch and a snowflake are both long runs of digits and only one of them is a time.
+//! Only what is SAID changes: the text a reader sees and the text Copy copies are the message as
+//! written.
+//!
+//! Order matters and is not arbitrary. Addresses are said BEFORE emphasis comes off, which would
+//! otherwise take the underscores out of the middle of one, and before times and opaque strings,
+//! which would otherwise find a date or a commit inside one. Times are resolved BEFORE opaque
+//! strings, because a Unix epoch and a snowflake are both long runs of digits and only one of them
+//! is a time.
+//!
+//! Every pass is linear in the length of the message (`#201 speech-prep-linear`): a stranger's
+//! text must not cost the square of its length before a word of it is spoken.
 
 use std::collections::BTreeMap;
 
@@ -40,7 +54,13 @@ const HASH_MIN_CHARS: usize = 12;
 ///
 /// Ten covers a Unix epoch and a Discord snowflake. It deliberately does NOT cover a year, a port,
 /// a build number or a count of anything — those are quantities a listener wants to hear.
-const BIG_NUMBER_MIN_DIGITS: usize = 10;
+pub(crate) const BIG_NUMBER_MIN_DIGITS: usize = 10;
+
+/// Digits after the `D` of a diff or the `T` of a task before it is said by its ending.
+///
+/// Six: a reference that short is one somebody can say, and `D42` or `T3` in prose may be
+/// anything at all. The ids a tracker of any size hands out are seven digits and more.
+const TRACKER_ID_MIN_DIGITS: usize = 6;
 
 /// Past this, a message is old enough that a relative reading stops helping.
 const RELATIVE_LIMIT_DAYS: i64 = 365;
@@ -424,7 +444,8 @@ impl NextOf {
     }
 }
 
-/// Remove inline markers, resolve links to their text, and name the things that have no sound.
+/// Remove inline markers, resolve links to their text, say addresses as what they are, and name
+/// the things that have no sound.
 fn strip_inline(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let chars: Vec<char> = text.chars().collect();
@@ -440,15 +461,30 @@ fn strip_inline(text: &str) -> String {
                 continue;
             }
         }
-        // Discord's angle-bracket forms: `<@123>`, `<#123>`, `<@&123>`, `<:name:123>`, `<t:…>`.
-        // `<t:…>` is a TIME and is left for `speak_times`; the rest have no useful sound.
         if chars[i] == '<' {
+            // `<https://…>`, and a chat service's `<https://…|label>`, however long the address.
+            if let Some((said, consumed)) = angle_address_at(&chars, i) {
+                out.push_str(&said);
+                i += consumed;
+                continue;
+            }
+            // Discord's angle-bracket forms: `<@123>`, `<#123>`, `<@&123>`, `<:name:123>`,
+            // `<t:…>`. `<t:…>` is a TIME and is left for `speak_times`; the rest have no useful
+            // sound.
             let rest: String = chars[i..].iter().take(ANGLE_FORM_CHARS).collect();
             if let Some((said, consumed)) = angle_form_at(&rest) {
                 out.push_str(&said);
                 i += consumed;
                 continue;
             }
+        }
+        // A bare web address is said as what it is. Before the emphasis markers, which would
+        // otherwise take the underscores out of the middle of it.
+        if let Some(end) = address_at(&chars, i) {
+            let address: String = chars[i..end].iter().collect();
+            out.push_str(&say_address(&address));
+            i = end;
+            continue;
         }
         // Emphasis markers, in descending length so `***` is not read as `*` twice. Spoilers and
         // strikethrough go the same way: the words inside them are still the message.
@@ -491,18 +527,61 @@ fn link_at(
     let end = parens.from(chars, close + 2)?;
     let label: String = chars[start + 1..close].iter().collect();
     let said = if label.trim().is_empty() {
-        "a link".to_owned()
+        // Nothing to say but where it goes: `[](https://…)`, or Discord's `[](<https://…>)`.
+        let target: String = chars[close + 2..end].iter().collect();
+        let target = target.split_whitespace().next().unwrap_or_default();
+        let target = target.trim_start_matches('<').trim_end_matches('>');
+        let chars: Vec<char> = target.chars().collect();
+        if address_prefix_at(&chars, 0).is_some() {
+            say_address(target)
+        } else {
+            "a link".to_owned()
+        }
     } else {
-        label
+        // The label wins over the address, and is prose like any other: emphasis comes off it,
+        // and an address written as the label is said as what it is.
+        strip_inline(&label)
     };
     Some((said, end + 1 - start))
+}
+
+/// `<https://…>`, or a chat service's `<https://…|label>`, at `start`: what to say for it, and how
+/// many characters it took. A label wins; an address alone is said as what it is.
+///
+/// Its `>` is looked for only as far as the next `<` or the end of the line, so a line of
+/// `<https://` with no `>` is read once, not once per bracket.
+fn angle_address_at(chars: &[char], start: usize) -> Option<(String, usize)> {
+    let inside = start + 1;
+    scheme_at(chars, inside)?;
+    let close = inside
+        + chars[inside..]
+            .iter()
+            .position(|&c| matches!(c, '<' | '>' | '\n'))?;
+    if chars[close] != '>' {
+        return None;
+    }
+    let inner: String = chars[inside..close].iter().collect();
+    let (address, label) = match inner.split_once('|') {
+        Some((address, label)) => (address, label.trim()),
+        None => (inner.as_str(), ""),
+    };
+    if address.chars().any(char::is_whitespace) {
+        return None;
+    }
+    let said = if label.is_empty() {
+        say_address(address)
+    } else {
+        strip_inline(label)
+    };
+    Some((said, close + 1 - start))
 }
 
 /// One of Discord's `<…>` forms, and how many characters it took.
 fn angle_form_at(rest: &str) -> Option<(String, usize)> {
     let end = rest.find('>')?;
     let inner = &rest[1..end];
-    let consumed = end + 1;
+    // Characters, not bytes: the caller steps through characters.
+    let consumed = rest[..=end].chars().count();
     // A timestamp is a TIME, not chrome. Left exactly as it is for the next pass.
     if inner.starts_with("t:") {
         return None;
@@ -526,6 +605,137 @@ fn angle_form_at(rest: &str) -> Option<(String, usize)> {
         return None;
     };
     Some((said, consumed))
+}
+
+// --- addresses ----------------------------------------------------------------------------------
+
+/// How a web address is said: what it is, and never how it is spelled. `#187 speakable-ids-urls`.
+///
+/// Read aloud, an address is "h t t p s colon slash slash" and a minute of path that a listener
+/// can neither use nor write down. So a page [`crate::link_labels`] has a label for is said as that
+/// page, "widgets pull request 41"; a diff or a task alone under a host is said as that id, "diff
+/// ending in 567"; an address that is nothing but a host is said as the host, "example.com"; and
+/// any other is said by its host alone, "a link on example.com". `www.` is dropped from a host,
+/// as is a port, and the name and password an address may carry before its host are never said.
+fn say_address(address: &str) -> String {
+    let with_scheme;
+    let address = if crate::link_labels::strip_scheme(address).is_some() {
+        address
+    } else {
+        with_scheme = format!("https://{address}");
+        &with_scheme
+    };
+    if let Some(said) = crate::link_labels::spoken_label(address) {
+        return said;
+    }
+    let rest = crate::link_labels::strip_scheme(address).unwrap_or(address);
+    let (authority, path) = rest.split_at(rest.find(['/', '?', '#']).unwrap_or(rest.len()));
+    let host = authority.rsplit('@').next().unwrap_or(authority);
+    let host = host.split(':').next().unwrap_or(host).to_ascii_lowercase();
+    let host = host.strip_prefix("www.").unwrap_or(&host);
+    if !plausible_host(host) {
+        return "a link".to_owned();
+    }
+    if path.is_empty() || path == "/" {
+        return host.to_owned();
+    }
+    lone_tracker_id(path).unwrap_or_else(|| format!("a link on {host}"))
+}
+
+/// A host name as a voice may say it: ASCII labels of letters, digits and hyphens, joined by dots,
+/// and short enough to be one.
+fn plausible_host(host: &str) -> bool {
+    host.len() <= 253
+        && host.split('.').all(|label| {
+            !label.is_empty()
+                && !label.starts_with('-')
+                && label
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+        })
+}
+
+/// A path that is one diff or one task and nothing else, `/D1234567`, said as that id.
+fn lone_tracker_id(path: &str) -> Option<String> {
+    let rest = path.strip_prefix('/')?;
+    let (segment, after) = rest.split_at(rest.find(['/', '?', '#']).unwrap_or(rest.len()));
+    let alone = after.is_empty() || after == "/" || after.starts_with(['?', '#']);
+    alone.then(|| say_tracker_id(segment)).flatten()
+}
+
+/// Whether `chars` holds `prefix` at `at`, in any case.
+fn holds_at(chars: &[char], at: usize, prefix: &str) -> bool {
+    let mut held = chars.get(at..).unwrap_or_default().iter();
+    prefix
+        .chars()
+        .all(|wanted| held.next().is_some_and(|c| c.eq_ignore_ascii_case(&wanted)))
+}
+
+/// The length of `http://` or `https://` at `at`, in any case.
+fn scheme_at(chars: &[char], at: usize) -> Option<usize> {
+    ["https://", "http://"]
+        .into_iter()
+        .find(|scheme| holds_at(chars, at, scheme))
+        .map(str::len)
+}
+
+/// The length of what begins a web address at `at`: a scheme, or `www.` or `github.com/` written
+/// without one. Any other name followed by a path is too often a file to be read as an address.
+fn address_prefix_at(chars: &[char], at: usize) -> Option<usize> {
+    if let Some(length) = scheme_at(chars, at) {
+        return Some(length);
+    }
+    ["www.", "github.com/"]
+        .into_iter()
+        .find(|prefix| holds_at(chars, at, prefix))
+        .map(str::len)
+}
+
+/// Where a bare web address that begins at `start` ends, or `None` when none begins there.
+///
+/// One begins only at the start of a word, so `user@www.example.com` and `xhttps://` are left as
+/// written. It runs to whitespace or to a character no address holds unescaped, and then gives
+/// back what prose put after it rather than the address itself: a sentence's full stop, closing
+/// emphasis, and a bracket it did not open — `(see https://example.com/a_(b))` keeps its own pair.
+fn address_at(chars: &[char], start: usize) -> Option<usize> {
+    if !matches!(chars[start], 'h' | 'H' | 'w' | 'W' | 'g' | 'G') {
+        return None;
+    }
+    let follows_word = start
+        .checked_sub(1)
+        .and_then(|before| chars.get(before))
+        .is_some_and(|&c| c.is_alphanumeric() || matches!(c, '.' | '@' | '/' | '-' | '+' | '%'));
+    if follows_word {
+        return None;
+    }
+    let prefix = address_prefix_at(chars, start)?;
+    let mut end = start;
+    let (mut parens, mut brackets) = (0_isize, 0_isize);
+    while end < chars.len() && !ends_address(chars[end]) {
+        match chars[end] {
+            '(' => parens += 1,
+            ')' => parens -= 1,
+            '[' => brackets += 1,
+            ']' => brackets -= 1,
+            _ => {}
+        }
+        end += 1;
+    }
+    while end > start + prefix {
+        match chars[end - 1] {
+            '.' | ',' | ':' | ';' | '!' | '?' | '\'' | '*' | '_' | '~' => {}
+            ')' if parens < 0 => parens += 1,
+            ']' if brackets < 0 => brackets += 1,
+            _ => break,
+        }
+        end -= 1;
+    }
+    (end > start + prefix).then_some(end)
+}
+
+/// A character that ends a bare address: whitespace, or one an address never holds unescaped.
+fn ends_address(c: char) -> bool {
+    c.is_whitespace() || matches!(c, '<' | '>' | '"' | '`')
 }
 
 // --- times --------------------------------------------------------------------------------------
@@ -716,8 +926,8 @@ fn name_opaque_strings(text: &str, names: &mut Names) -> String {
             out.push_str(&token);
             continue;
         }
-        let replacement = if is_diff_tag(word) {
-            Some(format!("Diff ending in {}", ending(word)))
+        let replacement = if let Some(said) = say_tracker_id(word) {
+            Some(said)
         } else if is_big_number(word) {
             Some(format!("UID ending in {}", ending(word)))
         } else if is_hashlike(word) {
@@ -769,14 +979,23 @@ fn is_big_number(word: &str) -> bool {
     word.len() >= BIG_NUMBER_MIN_DIGITS && word.chars().all(|c| c.is_ascii_digit())
 }
 
-/// A Phabricator diff tag, including its leading `D`.
-fn is_diff_tag(word: &str) -> bool {
-    word.strip_prefix('D').is_some_and(is_big_number)
+/// A Phabricator-style reference — `D` and a diff's number, `T` and a task's — said as its kind and
+/// its last three digits: `D1234567890` is "diff ending in 890". `#187 speakable-ids-urls`.
+///
+/// Only with [`TRACKER_ID_MIN_DIGITS`] digits or more, so a short one in prose is left as written.
+fn say_tracker_id(word: &str) -> Option<String> {
+    let kind = match word.as_bytes().first()? {
+        b'D' => "diff",
+        b'T' => "task",
+        _ => return None,
+    };
+    let digits = &word[1..];
+    (digits.len() >= TRACKER_ID_MIN_DIGITS && digits.bytes().all(|byte| byte.is_ascii_digit()))
+        .then(|| format!("{kind} ending in {}", ending(digits)))
 }
 
-/// The short, speakable part of a numeric identifier.
-fn ending(word: &str) -> &str {
-    let digits = word.strip_prefix('D').unwrap_or(word);
+/// The short, speakable part of a numeric identifier: its last three digits.
+fn ending(digits: &str) -> &str {
     &digits[digits.len().saturating_sub(3)..]
 }
 
@@ -875,7 +1094,7 @@ mod tests {
 
     /// Every kind of thing preparation looks for, in one stretch of prose, and then each alone in
     /// the shape that made one stage search the rest of the line from every place it could start.
-    const SCALING_UNITS: [&str; 9] = [
+    const SCALING_UNITS: [&str; 13] = [
         "the **deploy** of parse_thread_id at 2026-08-24T11:30:00Z by <@1> in <#2> \
          <t:1787569200:R>, see [the runbook](https://example.com/x) about D1234567 \
          12345678901 a1b2c3d4e5f6a7 ",
@@ -887,6 +1106,10 @@ mod tests {
         "1234567890",
         "a_b*c~",
         "word ",
+        "https://",
+        "<https://a",
+        "(https://x.test/a_b)",
+        "[](https://x.test/",
     ];
 
     /// The least of three timings, which is the one least disturbed by whatever else the host was
@@ -947,6 +1170,285 @@ mod tests {
         );
         assert_eq!(say("<@123456789012345678> look"), "a mention look");
         assert_eq!(say("in <#987654321098765432>"), "in a channel");
+    }
+
+    #[test]
+    fn a_diff_or_a_task_is_said_by_its_ending() {
+        // `#187 speakable-ids-urls`, the owner's own example.
+        assert_eq!(say("landed D1234456789"), "landed diff ending in 789");
+        assert_eq!(say("see D123456"), "see diff ending in 456");
+        assert_eq!(say("filed T98765432."), "filed task ending in 432.");
+        assert_eq!(
+            say("(D1234567, T7654321)"),
+            "(diff ending in 567, task ending in 321)"
+        );
+    }
+
+    #[test]
+    fn a_short_id_or_a_word_like_one_is_left_as_written() {
+        for text in [
+            "D42 and T7 and D12345 and T99999",
+            "Dx1234567 d1234567 t1234567 D1234567a TODO T-1000000",
+            "in 2026 on port 8080, 42 times",
+        ] {
+            assert_eq!(say(text), text);
+        }
+    }
+
+    const WIDGETS: &str = "https://github.com/octo/widgets";
+    const SHA: &str = "4f21ab0c9d8e7f6a5b4c3d2e1f0a9b8c7d6e5f4a";
+
+    #[test]
+    fn a_github_address_is_said_as_the_page_it_names() {
+        // Each row of the `#227 github-link-abbrev` table, in words.
+        for (address, said) in [
+            (format!("{WIDGETS}/pull/3871"), "widgets pull request 3871"),
+            (format!("{WIDGETS}/issues/12"), "widgets issue 12"),
+            (format!("{WIDGETS}/discussions/5"), "widgets discussion 5"),
+            (
+                format!("{WIDGETS}/pull/41#issuecomment-1234567"),
+                "a comment on widgets pull request 41",
+            ),
+            (
+                format!("{WIDGETS}/pull/41#pullrequestreview-7"),
+                "a review of widgets pull request 41",
+            ),
+            (
+                format!("{WIDGETS}/pull/41/files"),
+                "the files of widgets pull request 41",
+            ),
+            (
+                format!("{WIDGETS}/pull/41/checks"),
+                "the checks of widgets pull request 41",
+            ),
+            (format!("{WIDGETS}/commit/{SHA}"), "widgets commit 4 F 2 1"),
+            (
+                format!("{WIDGETS}/commit/{SHA}#commitcomment-3"),
+                "a comment on widgets commit 4 F 2 1",
+            ),
+            (
+                format!("{WIDGETS}/pull/41/commits/{SHA}"),
+                "widgets commit 4 F 2 1",
+            ),
+            (
+                format!("{WIDGETS}/compare/main...feature"),
+                "a comparison in widgets",
+            ),
+            (
+                format!("{WIDGETS}/releases/tag/v1.2.0"),
+                "widgets release v1.2.0",
+            ),
+            (format!("{WIDGETS}/tree/main"), "widgets branch main"),
+            (format!("{WIDGETS}/tree/{SHA}"), "widgets commit 4 F 2 1"),
+            (
+                format!("{WIDGETS}/actions/runs/12345678901"),
+                "widgets run ending in 901",
+            ),
+            (
+                format!("{WIDGETS}/actions/runs/123456"),
+                "widgets run 123456",
+            ),
+            (
+                format!("{WIDGETS}/actions/runs/12345678901/job/98765432101"),
+                "a job in widgets run ending in 901",
+            ),
+            (
+                format!("{WIDGETS}/actions/runs/12345678901/attempts/2"),
+                "attempt 2 of widgets run ending in 901",
+            ),
+            (
+                format!("{WIDGETS}/blob/main/src/render.rs#L10"),
+                "widgets file render.rs line 10",
+            ),
+            (
+                format!("{WIDGETS}/blob/main/src/render.rs#L10-L20"),
+                "widgets file render.rs lines 10 to 20",
+            ),
+            (
+                format!("{WIDGETS}/blob/main/README.md"),
+                "widgets file README.md",
+            ),
+            // Either scheme, `www.`, the host's case and a trailing slash change nothing, and the
+            // host may be written with no scheme at all.
+            (
+                "HTTP://WWW.GitHub.com/octo/widgets/pull/41/".to_owned(),
+                "widgets pull request 41",
+            ),
+            (
+                "github.com/octo/widgets/issues/12".to_owned(),
+                "widgets issue 12",
+            ),
+            // An underscore in a name is a pause, as in prose.
+            (
+                "https://github.com/octo/my_widgets/pull/3".to_owned(),
+                "my widgets pull request 3",
+            ),
+        ] {
+            assert_eq!(say(&address), said, "{address}");
+        }
+    }
+
+    #[test]
+    fn any_other_address_is_said_by_its_host_and_a_bare_host_as_itself() {
+        for (address, said) in [
+            (
+                "https://example.com/some/long/path?q=1#part",
+                "a link on example.com",
+            ),
+            ("https://www.foo-bar.com/a/b/c", "a link on foo-bar.com"),
+            // The underscores inside an address are not emphasis, nor a pause.
+            (
+                "https://docs.example.org/a_b_c/d_e",
+                "a link on docs.example.org",
+            ),
+            ("http://Example.COM:8080/x", "a link on example.com"),
+            ("www.example.com/docs/start", "a link on example.com"),
+            ("https://example.com", "example.com"),
+            ("https://www.example.com/", "example.com"),
+            // GitHub, but no page with a short form: said like any other address.
+            ("https://github.com/octo/widgets", "a link on github.com"),
+            (
+                "https://github.com/octo/widgets/pull/41?notification_referrer_id=x",
+                "a link on github.com",
+            ),
+            // A diff or a task alone on its host is said as the id it is.
+            (
+                "https://phabricator.example.com/D1234567",
+                "diff ending in 567",
+            ),
+            (
+                "https://tasks.example.com/T7654321?view=1",
+                "task ending in 321",
+            ),
+            // A host a voice could not say is not said.
+            ("https://[::1]:8080/status", "a link"),
+            ("https://ex%61mple.com/x", "a link"),
+        ] {
+            let spoken = say(address);
+            assert_eq!(spoken, said, "{address}");
+            assert!(
+                !spoken.contains("http") && !spoken.contains("//"),
+                "{spoken}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_credentials_an_address_carries_are_never_said() {
+        assert_eq!(
+            say("try http://deploy:hunter2@example.com:8080/x now"),
+            "try a link on example.com now"
+        );
+        assert_eq!(say("https://token@example.com"), "example.com");
+    }
+
+    #[test]
+    fn emails_paths_and_short_bare_domains_are_left_as_written() {
+        for text in [
+            "mail octo@example.com about example.com",
+            "see foo-bar.com and docs.example.org today",
+            "edit src/speech.rs and docs/guide.md",
+            "write to octo@www.example.com",
+            "a git@github.com:octo/widgets.git remote",
+            "the scheme is https:// alone",
+        ] {
+            assert_eq!(say(text), text);
+        }
+    }
+
+    #[test]
+    fn an_address_keeps_the_prose_around_it() {
+        for (text, said) in [
+            (
+                "Fixed in https://github.com/octo/widgets/pull/41.",
+                "Fixed in widgets pull request 41.",
+            ),
+            (
+                "(see https://example.com/a_(b))",
+                "(see a link on example.com)",
+            ),
+            ("**https://example.com/x**", "a link on example.com"),
+            ("_https://example.com/x_", "a link on example.com"),
+            ("\"https://example.com/x\"", "\"a link on example.com\""),
+            (
+                "https://example.com/x, https://example.org/y; done",
+                "a link on example.com, a link on example.org; done",
+            ),
+            (
+                "> quoted https://github.com/octo/widgets/issues/7",
+                "quoted widgets issue 7",
+            ),
+        ] {
+            assert_eq!(say(text), said, "{text}");
+        }
+    }
+
+    #[test]
+    fn markdown_link_text_wins_over_its_address() {
+        for (text, said) in [
+            (
+                "[the fix](https://github.com/octo/widgets/pull/41)",
+                "the fix",
+            ),
+            ("[the **real** fix](https://x.test/a)", "the real fix"),
+            // A link whose text is its own address says the address as what it is.
+            (
+                "[https://github.com/octo/widgets/pull/41](https://github.com/octo/widgets/pull/41)",
+                "widgets pull request 41",
+            ),
+            // With no text, where it goes is all there is to say.
+            (
+                "[](https://github.com/octo/widgets/issues/7)",
+                "widgets issue 7",
+            ),
+            ("[](<https://example.com/x>)", "a link on example.com"),
+            ("[ ](relative/page)", "a link"),
+            // Angle brackets, and a chat service's labelled form.
+            (
+                "<https://github.com/octo/widgets/pull/41>",
+                "widgets pull request 41",
+            ),
+            ("<https://example.com/x|the runbook>", "the runbook"),
+            ("<https://example.com/x|https://example.com/x>", "a link on example.com"),
+        ] {
+            assert_eq!(say(text), said, "{text}");
+        }
+        // An address in angle brackets is said whatever its length.
+        let long = format!("open <https://example.com/{}> now", "a".repeat(300));
+        assert_eq!(say(&long), "open a link on example.com now");
+    }
+
+    #[test]
+    fn a_code_span_keeps_its_words_and_still_never_spells_an_address() {
+        // The words in code are the point of it, and are said as they were.
+        assert_eq!(
+            say("run `make validate` in `octo/widgets` on `src/speech.rs`"),
+            "run make validate in octo/widgets on src/speech.rs"
+        );
+        // An address or an id in code is said as it is in prose: agents put both in backticks,
+        // and code is no reason to hear "h t t p s".
+        assert_eq!(
+            say("`curl https://example.com/api/v1` for `D1234567`"),
+            "curl a link on example.com for diff ending in 567"
+        );
+        assert_eq!(
+            say("```\ncurl https://example.com/api\n```"),
+            "curl a link on example.com"
+        );
+    }
+
+    #[test]
+    fn a_message_mixing_them_reads_as_one_sentence() {
+        let message = "**Landed** D1234456789 (https://github.com/octo/widgets/pull/3871) at \
+                       2026-08-24T11:30:00Z; see [the runbook](https://wiki.example.com/x/y) or \
+                       https://www.foo-bar.com/a/b/c, and a1b2c3d4e5f6a7. Ping octo@example.com \
+                       about T1234567 or <https://github.com/octo/widgets/issues/12>.";
+        assert_eq!(
+            say(message),
+            "Landed diff ending in 789 (widgets pull request 3871) at 30 minutes ago; see the \
+             runbook or a link on foo-bar.com, and hash code A. Ping octo@example.com about task \
+             ending in 567 or widgets issue 12."
+        );
     }
 
     #[test]
@@ -1089,7 +1591,7 @@ mod tests {
     #[test]
     fn long_identifiers_and_diff_tags_have_useful_endings() {
         assert_eq!(say("id 1000000000000000009"), "id UID ending in 009");
-        assert_eq!(say("review D1234567890"), "review Diff ending in 890");
+        assert_eq!(say("review D1234567890"), "review diff ending in 890");
         // A year, a port and a count are quantities somebody wants to hear.
         assert_eq!(
             say("in 2026 on port 8080, 42 times"),
