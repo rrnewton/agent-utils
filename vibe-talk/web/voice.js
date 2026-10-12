@@ -11028,9 +11028,12 @@ function replyRoute(message) {
     return { ...route, thread: String(record.id), note: "Posts in the thread this message belongs to." };
   }
   // The count the thread tag goes by, a summary's before the record's: ticking the box on a thread
-  // that has replies after all would post into it while saying it starts one.
+  // that has replies after all would post into it while saying it starts one. And not where a reply
+  // IS a thread reply (Slack, `channelRepliesInThread`): there the reply starts the message's thread
+  // already, and a box whose two states post the same thing would say one of them goes to Main.
   if (record) {
-    return { ...route, branch: threadReplyCount(record.id, { thread: record }) === 0 ? String(record.id) : null };
+    const empty = threadReplyCount(record.id, { thread: record }) === 0;
+    return { ...route, branch: empty && !channelRepliesInThread(el("discord-channel").value) ? String(record.id) : null };
   }
   if (!channelCanon.unplaced.has(String(message.id))) return route;
   return {
@@ -11038,6 +11041,20 @@ function replyRoute(message) {
     note: "This message came in live and the channel has not been read since, so whether it is " +
       "in a thread is not known yet. Send finds out first, then posts your reply where it is.",
   };
+}
+
+/**
+ * Whether a reply to a main-channel message of `channel` is posted in that message's thread, as
+ * its provider's server says (`replies_in_thread`): Slack, which has no reply pointer, so its
+ * server threads every reply. `#252 thread-button-state`. With several providers each channel
+ * answers for its own, as in `channelPostsOnce`.
+ */
+function channelRepliesInThread(channel) {
+  if (providerDescriptions.size) {
+    const provider = providerOfChannel(channel);
+    return Boolean(provider && provider.replies_in_thread === true);
+  }
+  return deploymentCapabilities.repliesInThread;
 }
 
 /** How many replies a thread has, from its summary or the message's own thread record. */
@@ -12434,13 +12451,13 @@ function gatherCount(id, message, held = 0) {
 // WHERE A THREAD CAN BE STARTED. Only where the provider has named the thread the message heads, by
 // a count that says nobody has answered it: a count of zero, not a missing one, since a root whose
 // provider gives no count may well have replies, and keeps the coloured tag it had. Google Chat
-// names one for every message. Slack names a thread only once it has a reply, so a message nobody
-// has answered there has no thread record and no tag, as before — and Reply already starts its
-// thread, since Slack's server posts every reply into the message's thread. Discord's threads are
-// channels of their own, which this server does not create: a message that heads none has no tag
-// either. A Discord thread somebody made and nobody has written in yet is grey like Google Chat's,
-// and its first reply goes into it. And not on a channel that is read-only, where nothing can be
-// posted to start one: a control that cannot act is absent.
+// names one for every message, and so does this server's Slack backend: Slack lets any message on
+// the channel head a thread, whose id is the message's ts, though Slack itself writes the thread
+// down only at its first reply (src/slack/client.rs). Discord's threads are channels of their own,
+// which this server does not create: a message that heads none has no tag. A Discord thread
+// somebody made and nobody has written in yet is grey like Google Chat's, and its first reply goes
+// into it. And not on a channel that is read-only, where nothing can be posted to start one: a
+// control that cannot act is absent.
 
 /**
  * Whether `message` heads a thread nobody has answered yet: it is the thread's root, its count
@@ -25042,6 +25059,7 @@ let deploymentCapabilities = {
   upstreamReadMark: false,
   upstreamClear: false,
   idempotentPosts: false,
+  repliesInThread: false,
   liveDelivery: "off",
   livePollSeconds: 0,
 };
@@ -26042,6 +26060,8 @@ function applyClientConfig(config) {
   deploymentCapabilities.upstreamClear = config.upstream_clear_supported === true;
   // `#195 send-resilience`. Read per channel, by `channelPostsOnce`, when a send fails.
   deploymentCapabilities.idempotentPosts = config.idempotent_posts_supported === true;
+  // `#252 thread-button-state`. Read per channel, by `channelRepliesInThread`, on the reply screen.
+  deploymentCapabilities.repliesInThread = config.replies_in_thread === true;
   summariesDisabledByServer =
     typeof config.summaries_unavailable === "string" ? config.summaries_unavailable.trim() : "";
   if (summariesDisabledByServer && summaryMode) setSummaryMode(false);

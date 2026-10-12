@@ -253,6 +253,10 @@
           "description": "Whether the operator has allowed an earlier transcript to be replayed into a new call.\n\nThe page needs it BEFORE it has anything to replay: the Settings screen has to describe\nwhat resuming will do, and the control's own note has to say what the next call will be —\nboth of which are questions asked while there is no conversation to fetch.",
           "type": "boolean"
         },
+        "replies_in_thread": {
+          "description": "Whether a reply to a main-channel message is posted in that message's thread, starting one\nwhen it has none, because the provider has no reply pointer of its own (Slack).\n\n`#252 thread-button-state`. Such a reply already starts the message's thread, so the reply\nscreen offers no separate \"start a new thread\" choice when this is true. Sent only when\ntrue: absent, from this server or an older one, means false.",
+          "type": "boolean"
+        },
         "self_author_id": {
           "description": "The Discord account this bridge posts as, when it can be known.\n\nNOT a secret: a bot's user id is visible on every message it has ever sent. It is here so\nthe channel view can tell the owner's own words -- posted on his behalf by this bridge --\nfrom everybody else's, on the FIRST render rather than only after he has replied from the\napp. `None` when the token is not in the shape ids can be read from; the page then falls\nback to learning it the old way.",
           "type": [
@@ -989,6 +993,10 @@
             "string",
             "null"
           ]
+        },
+        "replies_in_thread": {
+          "description": "Whether a reply to a main-channel message is posted in that message's thread, starting one\nwhen it has none, because this provider has no reply pointer of its own (Slack).\n`#252 thread-button-state`. Sent only when true.",
+          "type": "boolean"
         },
         "self_author_id": {
           "description": "The account this server posts as at this provider, when known.",

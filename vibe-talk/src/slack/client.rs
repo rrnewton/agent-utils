@@ -608,16 +608,21 @@ impl Raw {
         let author_is_bot = self.str_field("bot_id").is_some()
             || self.str_field("subtype") == Some("bot_message")
             || looked_up.is_some_and(|(_, is_bot)| *is_bot);
-        let thread = self.thread_ts().map(|thread_ts| {
-            let is_root = thread_ts == self.ts;
-            let reply_count = is_root.then(|| self.reply_count());
-            MessageThread {
-                root_message_id: ids::message_id_from_ts(&thread_ts),
-                id: thread_ts,
-                is_root,
-                reply_count,
-                reply_count_exact: reply_count.is_some(),
-            }
+        // A message with no `thread_ts` is on the conversation's own timeline, and Slack lets any
+        // such message head a thread: posting with `thread_ts` = its `ts` starts one. So it is
+        // named as the root of its own thread with no replies, as a message nobody has answered on
+        // Google Chat is, and the page can offer to start that thread (`#252 thread-button-state`).
+        // Slack only writes `thread_ts` and `reply_count` once there is a reply, which makes the
+        // count of nothing exact.
+        let thread_ts = self.thread_ts().unwrap_or_else(|| self.ts.clone());
+        let is_root = thread_ts == self.ts;
+        let reply_count = is_root.then(|| self.reply_count());
+        let thread = Some(MessageThread {
+            root_message_id: ids::message_id_from_ts(&thread_ts),
+            id: thread_ts,
+            is_root,
+            reply_count,
+            reply_count_exact: reply_count.is_some(),
         });
         Some(Message {
             thread,
@@ -689,6 +694,11 @@ impl ChatClient for HttpSlackClient {
     }
 
     fn supports_threading(&self) -> bool {
+        true
+    }
+
+    /// Slack has no reply pointer: a reply is posted in the target's thread (`timeline::post`).
+    fn replies_in_thread(&self) -> bool {
         true
     }
 

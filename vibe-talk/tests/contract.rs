@@ -199,6 +199,7 @@ fn client_config(
         upstream_read_mark_supported: full,
         upstream_clear_supported: full,
         threading_supported: full,
+        replies_in_thread: full,
         idempotent_posts_supported: full,
         speech_prep_enabled: full,
         providers: vec![
@@ -210,6 +211,7 @@ fn client_config(
                 upstream_read_mark_supported: false,
                 upstream_clear_supported: full,
                 threading_supported: full,
+                replies_in_thread: false,
                 idempotent_posts_supported: full,
                 live_delivery,
                 live_poll_seconds: 5,
@@ -224,6 +226,7 @@ fn client_config(
                 upstream_read_mark_supported: false,
                 upstream_clear_supported: false,
                 threading_supported: true,
+                replies_in_thread: true,
                 idempotent_posts_supported: false,
                 live_delivery: LiveDelivery::Poll,
                 live_poll_seconds: 30,

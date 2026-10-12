@@ -145,6 +145,7 @@
           "live_poll_seconds": 30,
           "name": "Slack",
           "owner_author_id": null,
+          "replies_in_thread": true,
           "self_author_id": "U0SELF0001",
           "threading_supported": true,
           "upstream_read_mark_supported": false
@@ -157,6 +158,7 @@
         "playback": "audio"
       },
       "replay_enabled": true,
+      "replies_in_thread": true,
       "self_author_id": "9",
       "speech_prep_enabled": true,
       "threading_supported": true,
@@ -223,6 +225,7 @@
           "live_poll_seconds": 30,
           "name": "Slack",
           "owner_author_id": null,
+          "replies_in_thread": true,
           "self_author_id": null,
           "threading_supported": true,
           "upstream_read_mark_supported": false
@@ -301,6 +304,7 @@
           "live_poll_seconds": 30,
           "name": "Slack",
           "owner_author_id": null,
+          "replies_in_thread": true,
           "self_author_id": null,
           "threading_supported": true,
           "upstream_read_mark_supported": false

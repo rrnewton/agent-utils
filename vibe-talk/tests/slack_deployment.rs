@@ -238,3 +238,82 @@ async fn clearing_unread_in_slack_is_offered_only_when_the_deployment_turns_it_o
         "a dry run marks nothing"
     );
 }
+
+/// `#252 thread-button-state`, through the routes the page uses. A Slack message nobody has
+/// answered heads its own thread, named by its `ts` with no replies; the thread opens with the
+/// message alone in it; and the page's first send from that thread's box posts into it with
+/// `thread_ts` = the message's `ts`, which is what starts the thread at Slack. The page is also told
+/// that a Slack reply is a thread reply, so its reply screen offers no separate "new thread" box.
+#[tokio::test]
+async fn a_slack_message_nobody_has_answered_can_have_its_thread_started_from_the_page() {
+    let fake = Fake::start(fixture(), 20).await;
+    let state = deployment(&fake).await;
+
+    let (status, config) = call(&state, "GET", "/api/v1/client-config", None).await;
+    assert_eq!(status, StatusCode::OK, "{config}");
+    assert_eq!(config["replies_in_thread"], true, "{config}");
+
+    let (status, main) = call(
+        &state,
+        "GET",
+        &format!("/api/v1/channels/{TEAM}/timeline?view=main"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{main}");
+    let first = ts(10, 0);
+    let message = main["messages"]
+        .as_array()
+        .expect("messages")
+        .iter()
+        .find(|message| message["content"] == "first")
+        .expect("the message nobody has answered")
+        .clone();
+    assert_eq!(
+        message["thread"],
+        json!({"id": first, "root_message_id": message["id"], "is_root": true,
+            "reply_count": 0, "reply_count_exact": true}),
+        "{message}"
+    );
+
+    let (status, thread) = call(
+        &state,
+        "GET",
+        &format!("/api/v1/channels/{TEAM}/timeline?view=thread&thread_id={first}"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{thread}");
+    let ids: Vec<&Value> = thread["messages"]
+        .as_array()
+        .expect("messages")
+        .iter()
+        .map(|message| &message["id"])
+        .collect();
+    assert_eq!(
+        ids,
+        [&message["id"]],
+        "the empty thread is not the message alone"
+    );
+    assert_eq!(thread["thread"]["id"], first);
+    assert_eq!(thread["thread"]["reply_count"], 0);
+
+    let (status, sent) = call(
+        &state,
+        "POST",
+        &format!("/api/v1/channels/{TEAM}/reply"),
+        Some(json!({"text": "the first reply", "thread_id": first})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{sent}");
+    let posts = fake.requests("chat.postMessage");
+    assert_eq!(posts.len(), 1);
+    assert_eq!(
+        posts[0]["thread_ts"], first,
+        "the first reply did not start the message's thread"
+    );
+    assert_eq!(posts[0]["channel"], TEAM);
+    assert_eq!(sent["posted"]["thread"]["id"], first);
+    assert_eq!(sent["posted"]["thread"]["is_root"], false);
+    assert_eq!(sent["posted"]["thread"]["root_message_id"], message["id"]);
+}

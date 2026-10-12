@@ -15,7 +15,7 @@ use vibe_talk::live::{poll_once, LiveHub};
 use vibe_talk::model::{ChannelId, ChannelInfo, Message, MessageId};
 use vibe_talk::probe::{classify, Diagnosis};
 use vibe_talk::slack::{message_id_from_ts, ts_from_message_id, HttpSlackClient};
-use vibe_talk::threads::{TimelineRequest, TimelineView};
+use vibe_talk::threads::{MessageThread, TimelineRequest, TimelineView};
 
 const CH: &str = "C0000MAIN1";
 
@@ -857,6 +857,102 @@ async fn thread_posts_and_lookups_verify_the_thread_first() {
         .fetch_thread_message(&channel(), &r3, &mid(&ts(900, 0)))
         .await
         .is_err());
+}
+
+/// `#252 thread-button-state`. Slack lets any message on a conversation's own timeline head a
+/// thread, and writes `thread_ts` only once somebody has answered. So a message nobody has answered
+/// is named as the root of its own thread, by its `ts`, with an exact count of nothing — as every
+/// message nobody has answered on Google Chat is — and that thread can be opened and posted into
+/// before it has a reply: the first post is what starts it.
+#[tokio::test]
+async fn a_message_nobody_has_answered_heads_its_own_empty_thread_which_its_first_post_starts() {
+    let (mut state, [r1, _, _]) = three_threads();
+    let fresh = ts(3000, 250);
+    state
+        .history
+        .get_mut(CH)
+        .expect("the conversation")
+        .push(profiled(
+            &fresh,
+            "UADA00001",
+            "Ada",
+            "nobody has answered this",
+        ));
+    let fake = Fake::start(state, 20).await;
+    let client = fake.client();
+    assert!(
+        client.replies_in_thread(),
+        "a Slack reply is a thread reply"
+    );
+
+    let messages = client.fetch_recent(&channel(), 50).await.expect("read");
+    let lone = messages
+        .iter()
+        .find(|message| message.id == mid(&fresh))
+        .expect("the new message");
+    assert_eq!(
+        lone.thread,
+        Some(MessageThread {
+            id: fresh.clone(),
+            root_message_id: Some(mid(&fresh)),
+            is_root: true,
+            reply_count: Some(0),
+            reply_count_exact: true,
+        }),
+        "a message nobody has answered names no thread to start"
+    );
+    let answered = messages
+        .iter()
+        .find(|message| message.id == mid(&r1))
+        .and_then(|message| message.thread.as_ref())
+        .expect("an answered root");
+    assert_eq!(
+        (answered.id.as_str(), answered.is_root, answered.reply_count),
+        (r1.as_str(), true, Some(2))
+    );
+    // Every message on the conversation's own timeline heads a thread or is in one.
+    assert!(messages.iter().all(|message| message.thread.is_some()));
+
+    // Its thread is the message alone, with no reply yet, and opens without one.
+    let request = TimelineRequest {
+        thread_id: Some(fresh.clone()),
+        ..page_request(TimelineView::Thread, 25)
+    };
+    let page = client
+        .fetch_timeline(&channel(), &request)
+        .await
+        .expect("the empty thread");
+    assert_eq!(ts_list(&page.messages), [fresh.clone()]);
+    assert_eq!(page.messages[0].thread, lone.thread);
+    let summary = page.thread.expect("the thread is named");
+    assert_eq!(
+        (summary.id.as_str(), summary.reply_count),
+        (fresh.as_str(), Some(0))
+    );
+
+    // The first post into it goes into the message's thread, and is a reply in it.
+    let posted = client
+        .post_in_thread(&channel(), &fresh, "the first reply", None)
+        .await
+        .expect("the first reply");
+    assert_eq!(fake.requests("chat.postMessage")[0]["thread_ts"], fresh);
+    let membership = posted.thread.expect("the reply's thread");
+    assert_eq!(
+        (
+            membership.id.as_str(),
+            membership.is_root,
+            membership.root_message_id
+        ),
+        (fresh.as_str(), false, Some(mid(&fresh)))
+    );
+    let page = client
+        .fetch_timeline(&channel(), &request)
+        .await
+        .expect("the thread, answered");
+    assert_eq!(
+        ts_list(&page.messages),
+        [fresh.clone(), ts_from_message_id(&posted.id).expect("ts")]
+    );
 }
 
 #[tokio::test]

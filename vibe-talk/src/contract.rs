@@ -112,6 +112,14 @@ pub struct ClientConfigResponse {
     pub upstream_clear_supported: bool,
     /// Whether the backend supports channel, thread-list, and flattened timelines.
     pub threading_supported: bool,
+    /// Whether a reply to a main-channel message is posted in that message's thread, starting one
+    /// when it has none, because the provider has no reply pointer of its own (Slack).
+    ///
+    /// `#252 thread-button-state`. Such a reply already starts the message's thread, so the reply
+    /// screen offers no separate "start a new thread" choice when this is true. Sent only when
+    /// true: absent, from this server or an older one, means false.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub replies_in_thread: bool,
     /// Whether a post sent again under the same `idempotency_key` is posted at most once.
     ///
     /// `#195 send-resilience`. The page retries a send whose answer it lost — a timeout, a 502 —
@@ -457,6 +465,11 @@ pub struct ProviderDescription {
     pub upstream_clear_supported: bool,
     /// Whether this provider supports channel, thread-list, and flattened timelines.
     pub threading_supported: bool,
+    /// Whether a reply to a main-channel message is posted in that message's thread, starting one
+    /// when it has none, because this provider has no reply pointer of its own (Slack).
+    /// `#252 thread-button-state`. Sent only when true.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub replies_in_thread: bool,
     /// Whether this provider posts a message sent again under the same key at most once. Sent
     /// only when true.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]

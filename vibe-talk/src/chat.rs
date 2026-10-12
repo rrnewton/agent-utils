@@ -256,6 +256,15 @@ pub trait ChatClient: Send + Sync {
         false
     }
 
+    /// Whether a reply to a message on a channel's own timeline is posted in that message's
+    /// thread, starting one when it has none, because the provider has no reply pointer of its
+    /// own: Slack. Such a reply and a post into the message's thread are then the same act, so
+    /// the page does not offer starting a thread from Reply as a separate choice.
+    /// `#252 thread-button-state`. False by default.
+    fn replies_in_thread(&self) -> bool {
+        false
+    }
+
     /// Read one backward page of a channel view, with backend-owned opaque cursors.
     ///
     /// The backend must verify thread membership before any thread-specific read. Discovery that

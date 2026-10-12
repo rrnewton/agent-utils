@@ -409,6 +409,14 @@ impl ChatClient for ChatRouter {
             .any(|entry| entry.client.supports_threading())
     }
 
+    /// Like the other deployment-wide flags, whether ANY provider does; the page reads each
+    /// channel's own provider's answer from its description.
+    fn replies_in_thread(&self) -> bool {
+        self.entries
+            .iter()
+            .any(|entry| entry.client.replies_in_thread())
+    }
+
     async fn fetch_timeline(
         &self,
         channel: &ChannelId,

@@ -263,6 +263,15 @@ declare namespace VibeTalk {
      */
     replay_enabled: boolean;
     /**
+     * Whether a reply to a main-channel message is posted in that message's thread, starting one
+     * when it has none, because the provider has no reply pointer of its own (Slack).
+     *
+     * `#252 thread-button-state`. Such a reply already starts the message's thread, so the reply
+     * screen offers no separate "start a new thread" choice when this is true. Sent only when
+     * true: absent, from this server or an older one, means false.
+     */
+    replies_in_thread?: boolean;
+    /**
      * The Discord account this bridge posts as, when it can be known.
      *
      * NOT a secret: a bot's user id is visible on every message it has ever sent. It is here so
@@ -907,6 +916,12 @@ declare namespace VibeTalk {
      * The owner's own account at this provider, when configured.
      */
     owner_author_id: string | null;
+    /**
+     * Whether a reply to a main-channel message is posted in that message's thread, starting one
+     * when it has none, because this provider has no reply pointer of its own (Slack).
+     * `#252 thread-button-state`. Sent only when true.
+     */
+    replies_in_thread?: boolean;
     /**
      * The account this server posts as at this provider, when known.
      */

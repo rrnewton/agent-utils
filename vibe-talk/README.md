@@ -55,25 +55,26 @@ longer configured, the app selects the first available channel.
 Tap a root's reply count or a thread-list entry to open its history. **Back**, or a swipe right,
 returns to the view and scroll position you came from. The selected thread has its own history,
 draft, and posting destination. Reply counts marked approximate come from the provider's estimate.
-A thread nobody has answered yet — Google Chat names one for every message — is not a thread yet:
+A thread nobody has answered yet — Google Chat and Slack name one for every message — is not a thread yet:
 its tag is a plain grey **Thread**, drawn like **Reply** beside it with no thread colour, it gets no
 reply-count button, and it is not offered in the picker. Tapping it **starts the thread**: the thread
 opens with only that message in it (on the right, in two columns) and its message box focused, and
 the first reply you send from there is posted into the message's thread. The first reply — yours,
 or anyone's arriving on a read or the live stream — turns the tag into the thread's coloured
 **Thread(1)** without a reload. A thread can only be started where the chat service has named one for
-the message: every message on Google Chat, a Discord thread somebody made that nobody has written in
-yet. A Slack message nobody has answered has no thread to name, and Discord threads are created in
-Discord, so a message heading none has no tag there; on Slack, **Reply** starts the message's thread
-instead. On a read-only channel the grey tag is not shown, since nothing could be posted to start the
-thread.
+the message: every message on Google Chat and on Slack (whose thread is the message's own `ts`; see
+[Slack](#slack)), a Discord thread somebody made that nobody has written in yet. Discord threads are
+created in Discord, so a Discord message heading none has no tag. On a read-only channel the grey tag
+is not shown, since nothing could be posted to start the thread.
 
 **Reply answers a message where it is.** Replying to a thread message posts in that thread, from
 any view, including **All**. Replying to a main-channel message posts in the main channel as a reply
 to it: a quote on Google Chat, a reply link on Discord. (Slack has neither, so its backend posts
 such a reply in the message's thread; see [Slack](#slack).) Where the chat service has already named
 an empty thread for the message, as Google Chat does, the reply screen also offers **Start a new
-thread from this message**, unticked each time it opens. A message that arrived on the live stream
+thread from this message**, unticked each time it opens. Slack does not get that box: its reply
+already starts the message's thread, which the server says with `replies_in_thread` in
+`/api/v1/client-config`. A message that arrived on the live stream
 without saying which thread it is in, and that no read has placed since, is placed by one read of
 **All** before the reply is posted; if that read fails, nothing is posted and the reply keeps its
 text for **Retry**. Until it is placed, whatever you send next in that channel waits for it.
@@ -919,7 +920,10 @@ millisecond, and decodes back exactly. A message from before 2015 cannot be enco
 shown. A thread's id is its root's `ts`.
 
 **Replies.** Slack has no reply pointer; its only reply is a thread reply. Replying to a message in
-a whole conversation posts in that message's thread, starting one when it has none. Only user
+a whole conversation posts in that message's thread, starting one when it has none. Since any
+message can head a thread, a message nobody has answered is given a thread of its own — its `ts`,
+with no replies — as Slack itself writes one down at the first reply; that is what lets the app's
+grey **Thread** start it, by posting with `thread_ts` set to the message's `ts`. Only user
 mentions (`<@U…>`) in a posted message notify anyone: `<!here>`, `<!channel>` and the like are
 escaped, as `@everyone` is suppressed on Discord.
 

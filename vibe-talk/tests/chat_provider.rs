@@ -275,6 +275,12 @@ async fn a_keyed_reply_reaches_a_bridge_under_the_same_nonce_on_every_attempt() 
         config_body["idempotent_posts_supported"], true,
         "{config_body}"
     );
+    // A bridge has a reply pointer of its own: its replies are not thread replies, and the flag
+    // that says so is not sent. `#252 thread-button-state`.
+    assert!(
+        config_body.get("replies_in_thread").is_none(),
+        "{config_body}"
+    );
 
     let (status, first) = call("POST", reply.clone(), Some(keyed("the same words"))).await;
     assert_eq!(status, StatusCode::MULTI_STATUS, "{first}");

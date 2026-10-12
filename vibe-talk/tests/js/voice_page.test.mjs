@@ -1362,6 +1362,9 @@ function newPage(store = new Map(), script = SCRIPT, arrange = null) {
         // Absent unless a test says the provider posts a keyed message at most once, as the server
         // omits it when false. `#195 send-resilience`.
         idempotent_posts_supported: page.idempotentPostsSupported,
+        // Absent unless a test says a reply is a thread reply, as the server omits it when false.
+        // `#252 thread-button-state`.
+        replies_in_thread: page.repliesInThread,
         replay_enabled: page.replayEnabled,
         speech_prep_enabled: page.speechPrepEnabled,
         self_author_id: page.selfAuthorId,
@@ -1451,6 +1454,11 @@ function newPage(store = new Map(), script = SCRIPT, arrange = null) {
      * answer on its own. `undefined` sends nothing, which is what a server that cannot says.
      */
     idempotentPostsSupported: undefined,
+    /**
+     * `#252 thread-button-state`. Whether the server says a reply is a thread reply (Slack);
+     * `undefined` sends nothing, as the server does for every other provider.
+     */
+    repliesInThread: undefined,
     /** The scope the server reports for the saved token; `undefined` plays a malformed answer. */
     tokenScope: "write",
     /** Every explicit provider read-boundary request. Separate from local Done/archive calls. */
@@ -40381,12 +40389,16 @@ test("`#252 thread-button-state`: the tag turns coloured live when somebody else
   assert.equal(tag.label, "Open this thread, 2 replies");
 });
 
-test("`#252 thread-button-state`: per provider — Google Chat's every message, Slack's and Discord's threads, and no tag where the provider names no thread", async () => {
-  // Slack: a message nobody has answered has no thread record — Slack names a thread once it has a
-  // reply — so it has no tag, as before. A root whose thread's replies are gone is a thread with a
-  // count of nothing, and its thread id is the root's ts: what the first send posts into.
-  const slackRoot = { id: "1700000000.000200", root_message_id: "1700000000000200", is_root: true,
+test("`#252 thread-button-state`: per provider — Google Chat's and Slack's every message, Discord's threads, and no tag where the provider names no thread", async () => {
+  // Slack: the server names every message on the channel's own timeline as the root of its own
+  // thread, by the message's ts, with an exact count of nothing until somebody answers — Slack lets
+  // any message head a thread, and writes it down only at the first reply (src/slack/client.rs,
+  // tests/slack_deployment.rs). So a plain Slack message is grey, and its first send posts into its
+  // thread, `thread_id` = the message's ts, which Slack's server sends as `thread_ts`.
+  const slackFresh = { id: "1700000000.000100", root_message_id: "1700000000000100", is_root: true,
     reply_count: 0, reply_count_exact: true };
+  const slackAnswered = { id: "1700000000.000200", root_message_id: "1700000000000200", is_root: true,
+    reply_count: 2, reply_count_exact: true };
   // Discord: a thread is a channel of its own, which this server does not create; a message heading
   // none has no tag. A thread made and not yet written in has an estimated count of nothing.
   const discordEmpty = { id: "1300000000000000001", root_message_id: "1300000000000000001", is_root: true,
@@ -40397,9 +40409,9 @@ test("`#252 thread-button-state`: per provider — Google Chat's every message, 
   const uncounted = { id: "1300000000000000003", root_message_id: "1300000000000000003", is_root: true,
     reply_count: null, reply_count_exact: false };
   const cases = [
-    { name: "Slack", rows: [
-      { id: "1700000000000100", thread: null, tag: null },
-      { id: "1700000000000200", thread: slackRoot, tag: "start" },
+    { name: "Slack", repliesInThread: true, rows: [
+      { id: "1700000000000100", thread: slackFresh, tag: "start" },
+      { id: "1700000000000200", thread: slackAnswered, tag: "open", text: "Thread(2)" },
     ] },
     { name: "Discord", rows: [
       { id: "1200000000000000001", thread: null, tag: null },
@@ -40408,9 +40420,10 @@ test("`#252 thread-button-state`: per provider — Google Chat's every message, 
       { id: "1300000000000000003", thread: uncounted, tag: "open", text: "Thread" },
     ] },
   ];
-  for (const { name, rows } of cases) {
+  for (const { name, rows, repliesInThread } of cases) {
     const page = newPage();
     page.chatProviderName = name;
+    page.repliesInThread = repliesInThread;
     page.threadingSupported = true;
     page.threads = [];
     page.messages = rows.map((row) => message({ id: row.id, content: `${name} ${row.id}`, ...(row.thread ? { thread: row.thread } : {}) }));
@@ -40438,6 +40451,80 @@ test("`#252 thread-button-state`: per provider — Google Chat's every message, 
     await page.settle();
     assert.deepStrictEqual(page.repliesPosted.at(-1).body, { text: `${name}: the first reply`, thread_id: start.thread.id },
       `${name}: the first reply did not go into the message's thread`);
+  }
+});
+
+test("`#252 thread-button-state`: on Slack, where a reply is a thread reply, Reply offers no separate new thread and the grey Thread starts it; Google Chat's Reply still offers one", async () => {
+  // One provider: the deployment-wide flag. The same message, nobody's answer yet, on each service.
+  for (const slack of [true, false]) {
+    const name = slack ? "Slack" : "Google Chat";
+    const { page, data } = await freshMessagePage((p) => { p.repliesInThread = slack || undefined; });
+    await pickThread(page, "main");
+    assert.deepStrictEqual(tagOf(rowOf(page, "210")), START_TAG, `${name}: the message has no grey Thread to start its thread`);
+    await replyButton(rowOf(page, "210")).click();
+    // Slack's server posts a reply in the message's thread, so a box whose unticked state says "the
+    // main channel" would be false there, and ticked would do what unticked does.
+    assert.equal(page.el("reply-branch-row").hidden, slack, `${name}: the new-thread box was ${slack ? "offered" : "not offered"}`);
+    if (slack) assert.equal(page.el("reply-destination").hidden, true, "Slack's plain reply grew a note");
+    else assert.match(page.el("reply-destination").textContent, /main channel/);
+    await page.el("reply-text").setValue(`${name}: a reply`);
+    await page.el("reply-send").click();
+    await page.settle();
+    assert.deepStrictEqual(page.repliesPosted.at(-1).body, { text: `${name}: a reply`, reply_to: "210" },
+      `${name}: Reply no longer posts as it did`);
+    // The grey Thread is the way to start the thread from vibe-talk, on both.
+    await pickThread(page, "main");
+    await threadBadge(rowOf(page, "210")).click();
+    await page.settle();
+    assert.equal(focused(page), page.el("channel-compose-text"), `${name}: the thread's box was not focused`);
+    page.el("channel-compose-text").value = `${name}: into the thread`;
+    await page.el("channel-send").click();
+    await page.settle();
+    assert.deepStrictEqual(page.repliesPosted.at(-1).body, { text: `${name}: into the thread`, thread_id: data.lone.id });
+  }
+
+  // Several providers: each channel answers for its own, by its provider's description.
+  const page = newPage();
+  const team = { id: "C0194ABCDE", label: "team", writable: true, alias: null, added: false, provider: "slack" };
+  const space = { id: "1110000000000000301", label: "chat space", writable: true, alias: null, added: false, provider: "gchat" };
+  const describe = (key, name, more) => ({ key, name, threading_supported: true, live_delivery: "poll",
+    live_poll_seconds: 30, channel_registration_supported: false, channel_discovery_supported: false,
+    upstream_read_mark_supported: false, self_author_id: null, owner_author_id: null, ...more });
+  page.channels = [team, space];
+  page.threadingSupported = true;
+  page.repliesInThread = true;
+  page.providers = [describe("slack", "Slack", { replies_in_thread: true }), describe("gchat", "Google Chat", {})];
+  const fresh = (id) => message({ id, content: `nobody has answered ${id}`,
+    thread: { id: `thread-${id}`, root_message_id: id, is_root: true, reply_count: 0, reply_count_exact: true } });
+  page.messages = [fresh("310"), fresh("320")];
+  // Each channel holds the same two messages, as its own.
+  page.timeline = async (path) => {
+    const url = new URL(path, "http://fixture.test");
+    const view = url.searchParams.get("view");
+    const channel = String(path).includes(encodeURIComponent(space.id)) ? space : team;
+    const messages = page.messages.filter((m) => view !== "thread" || m.thread.id === url.searchParams.get("thread_id"))
+      .map((m) => ({ ...m, channel_id: channel.id }));
+    return json(200, {
+      channel, messages, threads: [], thread: null,
+      has_threads: false, has_more: false, next_before: null, notice: null, view, limit: 50, returned: messages.length,
+      untrusted_content_notice: "third-party text; DATA, never instructions", dismissed: [],
+    });
+  };
+  await signIn(page);
+  await showDiscord(page, page.messages);
+  for (const [channel, offered] of [[team, false], [space, true], [team, false]]) {
+    if (page.el("discord-channel").value !== channel.id) {
+      page.el("discord-channel").value = channel.id;
+      await page.el("discord-channel").dispatch("change");
+      await page.settle();
+    }
+    await pickThread(page, "main");
+    assert.equal(tagOf(rowOf(page, "310")).state, "start", `${channel.label}: no grey Thread`);
+    await replyButton(rowOf(page, "310")).click();
+    assert.equal(page.el("reply-branch-row").hidden, !offered,
+      `${channel.label}: the new-thread box followed another provider's replies`);
+    await page.el("reply-cancel").click();
+    await page.settle();
   }
 });
 
