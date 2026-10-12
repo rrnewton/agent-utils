@@ -513,6 +513,14 @@
             <div id="side-heading">
               <span id="side-facts" class="thread-facts" hidden></span>
               <span id="side-title">Threads</span>
+              <!--
+                `#259 thread-list-unread-filter`. The owner: "Some have "N unread" and others are fully
+                read... I would like a toggle at the top in the banner that says "Threads" in the upper
+                left to filter it to unread only." Beside that heading, and only while it heads the
+                cards: pressed, the cards are the threads with unread replies, by the rule of the chip
+                that says "N unread" or "N new" on a card. Kept on this device.
+              -->
+              <button id="side-unread-only" class="chip" type="button" aria-pressed="false" title="Show only the threads with unread replies" hidden>Unread only</button>
               <button id="side-close" class="icon-button" type="button" aria-label="Close thread" title="Back to the list of threads" hidden>
                 <svg class="icon" viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round">
                   <path d="M6 6l12 12M18 6 6 18" />
@@ -1699,8 +1707,10 @@
                 button with two panes beside the view picker puts <strong>Main</strong> on the left and
                 a thread on the right. The view picker greys out: there is nothing left for it to
                 choose. With no thread selected, the right column lists the channel's threads, newest
-                activity first, each as its name and summary when they have been summarised, or else
-                its first message. A thread's <strong>Thread(N)</strong>, its <strong>N
+                activity at the bottom as in the channel, each as its name and summary when they have
+                been summarised, or else its first message; <strong>Unread only</strong> beside its
+                heading narrows the list to the threads with unread replies, and is remembered on this
+                device. A thread's <strong>Thread(N)</strong>, its <strong>N
                 replies</strong> or <strong>M unread</strong>, the Threads screen and a card in that
                 list each select the thread on the right; a tap on a message still only opens or folds
                 it. The <strong>×</strong> at the top of the right column goes back to the list. The

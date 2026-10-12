@@ -386,7 +386,7 @@ const FIXTURE_TREE = {
   // one scrolling element (the THIRD the model scrolls, see `SCROLLERS`) holding the cards and the
   // thread pane, which nests exactly as #pane-discord does, and its jump over the foot.
   "side-column": ["side-heading", "side-freshness", "side-scroll", "side-tools"],
-  "side-heading": ["side-facts", "side-title", "side-close"],
+  "side-heading": ["side-facts", "side-title", "side-unread-only", "side-close"],
   "side-scroll": ["side-search-empty", "side-list", "side-pane"],
   "side-list": ["side-list-state", "side-more-threads", "side-cards"],
   "side-pane": [
@@ -40297,6 +40297,153 @@ test("`#261 two-column-connectors`: closing a thread comes back to the card it w
   assert.ok(html.indexOf('id="side-more-threads"') < html.indexOf('id="side-cards"'),
     "the way to older threads is not above the oldest card");
   assert.ok(data.threads.length === 16);
+});
+
+// --- Unread only, on the right column's heading (#259 thread-list-unread-filter) --------------------
+//
+// The owner, 2026-10-12: "In two column view we get a big list of threads. Some have "N unread" and
+// others are fully read... I would like a toggle at the top in the banner that says "Threads" in the
+// upper left to filter it to unread only."
+
+const SIDE_UNREAD_STORAGE = "vibe-talk.voice.side-unread-only";
+
+/** The ids of the cards the filters leave on screen, in order. */
+const shownCardIds = (page) => page.el("side-cards").children
+  .filter((li) => !li.hidden && !li.hasClass("search-hidden")).map((li) => li.getAttribute("data-id"));
+
+/** The ids of the cards saying their thread has unread replies, by their chip. */
+const unreadCardIds = (page) => page.el("side-cards").children
+  .filter((li) => cardPart(page, li.getAttribute("data-id"), "side-card-unread")).map((li) => li.getAttribute("data-id"));
+
+/** `manyThreadColumns`, with the answers of the threads numbered in `read` marked Done on the server. */
+const readThreadColumns = (count, read, script = SCRIPT, store = null) =>
+  manyThreadColumns(count, (p) => {
+    for (const i of read) p.dealtWith.add(String(301 + 2 * i));
+    if (store) for (const [key, value] of store) p.storage.set(key, value);
+  }, script);
+
+test("`#259 thread-list-unread-filter`: Unread only is a toggle on the right column's heading, offered over the cards and not over a thread", async () => {
+  assertMarkupContains("side-heading", "side-unread-only");
+  const tag = /<button\s+id="side-unread-only"[^>]*>/.exec(HTML_CODE)[0];
+  assert.match(tag, /aria-pressed="false"/, "the toggle does not say whether it is pressed");
+  assert.match(tag, /type="button"/);
+  assert.match(tag, /title="Show only the threads with unread replies"/);
+  assert.match(tag, /(?:^|\s)hidden(?=[\s>])/, "the toggle ships on screen, before the cards are");
+  assert.match(HTML_CODE, /id="side-unread-only"[^>]*>Unread only<\/button>/, "the toggle does not name itself");
+  const head = HTML_CODE.slice(HTML_CODE.indexOf('id="side-heading"'));
+  assert.ok(head.indexOf('id="side-title"') < head.indexOf('id="side-unread-only"'),
+    "the toggle is not beside the heading it filters");
+  assert.match(cssBlockIn(TWO_COLUMN_QUERY, '#side-unread-only[aria-pressed="true"]'), /border-color:\s*var\(--accent\)/,
+    "pressed, the toggle is not drawn as the bar's filters are");
+
+  const { page } = await readThreadColumns(4, [0, 2]);
+  const toggle = page.el("side-unread-only");
+  assert.equal(toggle.hidden, false, "the toggle is not offered over the cards");
+  assert.equal(toggle.getAttribute("aria-pressed"), "false");
+  await cardOf(page, "spaces/A/threads/t1").click();
+  await page.settle();
+  assert.equal(toggle.hidden, true, "the toggle is offered over a thread, where it filters nothing");
+  await page.el("side-close").click();
+  await page.settle();
+  assert.equal(toggle.hidden, false, "the toggle did not come back with the cards");
+});
+
+test("`#259 thread-list-unread-filter`: pressed, the cards are the threads with unread replies, by the rule of their chip; kept on the device across a reload", async () => {
+  const { page, server, data: held } = await readThreadColumns(6, [0, 2, 3]);
+  const unread = ["spaces/A/threads/t1", "spaces/A/threads/t4", "spaces/A/threads/t5"];
+  assert.deepStrictEqual(unreadCardIds(page), unread, "the fixture's read and unread threads are not what this test is about");
+  assert.equal(shownCardIds(page).length, 6);
+  await page.el("side-unread-only").click();
+  await page.settle();
+  assert.equal(page.el("side-unread-only").getAttribute("aria-pressed"), "true", "the toggle does not say it is pressed");
+  assert.deepStrictEqual(shownCardIds(page), unread, "Unread only did not keep exactly the cards with an unread chip");
+  assert.equal(page.storage.get(SIDE_UNREAD_STORAGE), "on", "the choice was not kept on the device");
+  assert.equal(page.el("side-list-state").hidden, true, "a list with cards in it says it is empty");
+  // A reply arriving in a read thread brings its card back, with its chip, at the foot.
+  await liveReply(page, server, held.messages[0], "400");
+  assert.deepStrictEqual(shownCardIds(page), [...unread, "spaces/A/threads/t0"],
+    "a read thread that a reply came into did not come back under Unread only");
+  // Reloaded, the toggle is still pressed and the filter in force.
+  const data = manyThreads(6);
+  const again = reloadWith(page.storage, data.messages, (p) => {
+    p.threadingSupported = true;
+    p.threads = data.threads;
+    p.wideDesk = true;
+    for (const i of [0, 2, 3]) p.dealtWith.add(String(301 + 2 * i));
+  });
+  await reopenedChannel(again);
+  await again.settle();
+  assert.ok(inTwoColumns(again));
+  assert.equal(again.el("side-unread-only").getAttribute("aria-pressed"), "true", "the reload forgot Unread only");
+  // The device's saved copy holds the live reply too, so the thread it came into is still unread.
+  assert.ok(unreadCardIds(again).length < 6, "every thread is unread after the reload, so this proves nothing");
+  assert.deepStrictEqual(shownCardIds(again), unreadCardIds(again), "the reload did not filter the cards");
+  // Off again: every card, and the device remembers that too.
+  await again.el("side-unread-only").click();
+  await again.settle();
+  assert.equal(again.el("side-unread-only").getAttribute("aria-pressed"), "false");
+  assert.equal(shownCardIds(again).length, 6);
+  assert.equal(again.storage.get(SIDE_UNREAD_STORAGE), "off");
+});
+
+test("`#259 thread-list-unread-filter`: with nothing unread it says so, and with the search it keeps the unread cards the text matches", async () => {
+  const { page } = await readThreadColumns(4, [0, 1, 2, 3]);
+  assert.deepStrictEqual(unreadCardIds(page), [], "a thread is still unread, so this proves nothing");
+  await page.el("side-unread-only").click();
+  await page.settle();
+  assert.deepStrictEqual(shownCardIds(page), []);
+  assert.equal(page.el("side-list-state").hidden, false, "an emptied list says nothing");
+  assert.equal(page.el("side-list-state").textContent, "No unread threads.");
+  await page.el("side-unread-only").click();
+  await page.settle();
+  assert.equal(page.el("side-list-state").hidden, true, "the empty state stayed with the cards back");
+
+  const searched = (await readThreadColumns(5, [0, 2])).page;
+  await searched.el("side-unread-only").click();
+  await searched.el("search-toggle").click();
+  await searched.el("search-field").setValue("thread 3");
+  await searched.settle();
+  assert.deepStrictEqual(shownCardIds(searched), ["spaces/A/threads/t3"], "the search and Unread only are not both applied");
+  await searched.el("search-field").setValue("thread 2");
+  await searched.settle();
+  assert.deepStrictEqual(shownCardIds(searched), [], "a read thread the search matches was kept under Unread only");
+  assert.equal(searched.el("side-list-state").textContent, "No unread threads match that search.");
+  await searched.el("side-unread-only").click();
+  await searched.settle();
+  assert.deepStrictEqual(shownCardIds(searched), ["spaces/A/threads/t2"]);
+  await searched.el("search-field").setValue("nothing like this");
+  await searched.settle();
+  assert.equal(searched.el("side-list-state").textContent, "No threads match that search.");
+});
+
+test("`#259 thread-list-unread-filter` x `#243 filter-keeps-selection`: the card selected stays where it was as Unread only goes on and off", async () => {
+  const run = async (script) => {
+    // Every other thread read, so the cards left still run past the column's foot.
+    const read = Array.from({ length: 15 }, (_, i) => 2 * i);
+    const { page } = await readThreadColumns(30, read, script);
+    const area = page.el("side-scroll");
+    area.scrollTop = 600;
+    // The keys into the right column, onto an unread card in view: the selection the filter keeps.
+    const card = page.el("side-cards").children.find((li) => {
+      const box = li.getBoundingClientRect();
+      return li.hasAttribute("data-unread") && box.top > 40 && box.bottom < area.clientHeight - 40;
+    });
+    assert.ok(card, "no unread card in view, so this proves nothing");
+    await mouseTo(page, card, 900, 100);
+    assert.deepStrictEqual(litRows(page), [`side-cards:${card.getAttribute("data-id")}`]);
+    const at = card.getBoundingClientRect().top;
+    await page.el("side-unread-only").click();
+    await page.settle();
+    const on = card.getBoundingClientRect().top - at;
+    await page.el("side-unread-only").click();
+    await page.settle();
+    return { on, off: card.getBoundingClientRect().top - at, foot: sideAtFoot(page) };
+  };
+  const kept = await run(SCRIPT);
+  assert.equal(kept.on, 0, `Unread only moved the card selected by ${kept.on}px`);
+  assert.equal(kept.off, 0, `turning Unread only off moved the card selected by ${kept.off}px`);
+  const loose = await run(brokenScript("  change();\n  placeCardAnchor(anchor);\n", "  change();\n"));
+  assert.notEqual(loose.on, 0, "the negative control kept the card in place, so the check above proves nothing");
 });
 
 // --- clearing unread in the chat service's own app ----------------------------------------------

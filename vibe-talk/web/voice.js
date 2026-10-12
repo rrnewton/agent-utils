@@ -151,7 +151,7 @@ let sideActive = false;
  *   | "rename-channel" | "reply-cancel" | "reply-context-more" | "reply-send" | "save-alias"
  *   | "save-token"
  *   | "search-toggle" | "send-text" | "side-clear-backlog" | "side-close" | "side-jump-newest"
- *   | "side-more-threads" | "side-older" | "side-send" | "speaker" | "summarise" | "talk"
+ *   | "side-more-threads" | "side-older" | "side-send" | "side-unread-only" | "speaker" | "summarise" | "talk"
  *   | "thread-back" | "thread-directory-more" | "thread-directory-retry"
  *   | "todo-filter" | "undo-dismiss" | "undo-send-dismiss" | "upstream-clear-save" | "view-switch"} id
  * @returns {HTMLButtonElement}
@@ -24845,6 +24845,7 @@ function renderSideMode() {
   if (leftEl("side-list").hidden === !thread) leftEl("side-list").hidden = thread;
   if (leftEl("side-pane").hidden === thread) leftEl("side-pane").hidden = !thread;
   if (leftEl("side-close").hidden === thread) leftEl("side-close").hidden = !thread;
+  renderSideUnreadToggle();
   renderSideColumn();
 }
 
@@ -25081,17 +25082,86 @@ function placeOpenedCards() {
  * The search text over the cards, as over the Threads list's (`#129 message-search`): a card the
  * text does not match goes while the search is open. Links leaves them: a card has no links of its
  * own, and its thread's are in its messages.
+ *
+ * `#259 thread-list-unread-filter`. And with Unread only pressed, a card whose thread has no unread
+ * reply goes too: one with no "N unread" or "N new" chip (`data-unread`, `sideCardUnread`). The two
+ * are ANDed, and a list they empty says why, over where the cards were (`sideListState`).
  */
 function filterSideCards() {
   const terms = searchOpen ? searchTerms(searchQuery) : [];
-  const rows = leftEl("side-cards").children;
+  const rows = /** @type {HTMLElement[]} */ ([...leftEl("side-cards").children]);
+  let unread = 0;
+  let shown = 0;
   for (const row of rows) {
     const text = row.getAttribute("data-search") || "";
-    setClassWord(row, "search-hidden", !terms.every((term) => text.includes(term)));
+    const fresh = row.hasAttribute("data-unread");
+    const kept = !sideUnreadOnly || fresh;
+    const said = terms.every((term) => text.includes(term));
+    if (row.hidden === kept) row.hidden = !kept;
+    setClassWord(row, "search-hidden", !said);
+    if (fresh) unread += 1;
+    if (kept && said) shown += 1;
   }
-  const state = rows.length === 0 ? "No threads in this channel yet." : "";
+  const state = sideListState(rows.length, unread, shown);
   setTextIfChanged(leftEl("side-list-state"), state);
   if (leftEl("side-list-state").hidden !== (state === "")) leftEl("side-list-state").hidden = state === "";
+}
+
+/**
+ * What the right column says over its cards, or "" while it shows some: none in the channel, none
+ * unread with Unread only pressed, or none the search matches. `#259 thread-list-unread-filter`.
+ *
+ * @param {number} cards How many cards there are.
+ * @param {number} unread How many of them have unread replies.
+ * @param {number} shown How many the filters leave.
+ */
+function sideListState(cards, unread, shown) {
+  if (cards === 0) return "No threads in this channel yet.";
+  if (shown > 0) return "";
+  if (sideUnreadOnly && unread === 0) return "No unread threads.";
+  return sideUnreadOnly ? "No unread threads match that search." : "No threads match that search.";
+}
+
+/** The device's choice of the cards with unread replies only: "on", or anything else for every card. */
+const SIDE_UNREAD_KEY = "vibe-talk.voice.side-unread-only";
+
+/** Whether Unread only is pressed, kept on this device. `#259 thread-list-unread-filter`. */
+function storedSideUnreadOnly() {
+  try {
+    return localStorage.getItem(SIDE_UNREAD_KEY) === "on";
+  } catch (_error) {
+    return false;
+  }
+}
+
+/** Whether the cards are the threads with unread replies only. */
+let sideUnreadOnly = storedSideUnreadOnly();
+
+/** Unread only: offered while the cards are up, and pressed as the reader left it. */
+function renderSideUnreadToggle() {
+  const button = leftEl("side-unread-only");
+  const offered = columns.side.mode === "list";
+  if (button.hidden === offered) button.hidden = !offered;
+  const pressed = sideUnreadOnly ? "true" : "false";
+  if (button.getAttribute("aria-pressed") !== pressed) button.setAttribute("aria-pressed", pressed);
+}
+
+/**
+ * The reader pressed Unread only. A filter, so the card the reader is on stays where it is, or the
+ * nearest card left when it goes (`keepingCardPlace`, as `#243 filter-keeps-selection` keeps a list
+ * of messages); kept on this device, as the layout button's choice is.
+ *
+ * @param {boolean} on
+ */
+function setSideUnreadOnly(on) {
+  sideUnreadOnly = on;
+  try {
+    localStorage.setItem(SIDE_UNREAD_KEY, on ? "on" : "off");
+  } catch (_error) {
+    // A browser that refuses storage still honours the choice for this session.
+  }
+  renderSideUnreadToggle();
+  refilterSideCards();
 }
 
 /** `filterSideCards`, the reader's place in the cards kept: the search typed, opened or closed. */
@@ -25121,6 +25191,8 @@ function sideCard({ choice, text, age, replies, unread }) {
     chip.className = "side-card-unread";
     chip.textContent = unread;
     facts.append(chip);
+    // `#259 thread-list-unread-filter`: what Unread only keeps.
+    row.setAttribute("data-unread", "");
   }
   button.append(body, facts);
   button.addEventListener("click", () => guardQuietly(() => selectSideThread(choice.id, choice.summary))());
@@ -28226,6 +28298,7 @@ el("side-close").addEventListener("click", () => {
   if (document.activeElement === el("side-close") || focusLost()) focusList(sidePane);
 });
 el("side-more-threads").addEventListener("click", guardQuietly(openThreadDirectory));
+leftEl("side-unread-only").addEventListener("click", () => setSideUnreadOnly(!sideUnreadOnly));
 inColumn(columns.side, () => {
   el("channel-compose-text").addEventListener("input", inThisColumn(rememberChannelDraft));
   el("channel-send").addEventListener("click", inThisColumn(guardQuietly(sendChannelMessage)));

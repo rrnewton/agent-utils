@@ -4596,7 +4596,11 @@ composer; with none selected, a card per thread, saying the summariser's `displa
 else the thread's first message, three lines at most. The cards run as the channel's lists do
 (`#261 two-column-connectors`): the newest activity at the foot, opened scrolled to it, a thread
 that moves going to the foot and followed there only by a reader already at the foot, and a reader up
-the list kept on their card; closing a thread comes back to the card it was chosen from. Thread(N), the
+the list kept on their card; closing a thread comes back to the card it was chosen from. **Unread
+only**, a toggle beside the column's "Threads" heading (`#259 thread-list-unread-filter`), narrows the
+cards to the threads with unread replies, by the rule of the card's "N unread" or "N new" chip; it is
+kept per device, works with the search, keeps the selected card where it was as it goes on and off,
+and says "No unread threads." over a list it empties. Thread(N), the
 unread count, N replies, the Threads screen and the cards select a thread there, and a plain tap on
 a message still only folds it. Search, Links and the read mode apply to both columns; Pinned stands
 in for the left column's list. The poll reads Main and the selected thread (two views, one delta

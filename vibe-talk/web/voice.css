@@ -6274,6 +6274,19 @@ textarea {
     margin-inline-start: auto;
   }
 
+  /* `#259 thread-list-unread-filter`. The cards' own filter, at the far end of the heading it narrows,
+     where the X stands over a thread: a quiet chip at rest, and pressed as the bar's filters are, ringed
+     and tinted in the accent with its words in the ink. */
+  #side-unread-only {
+    margin-inline-start: auto;
+  }
+
+  #side-unread-only[aria-pressed="true"] {
+    border-color: var(--accent);
+    color: var(--ink);
+    background: color-mix(in srgb, var(--accent) 18%, var(--panel));
+  }
+
   /* `#231 two-column-polish`. The right column's freshness: the pill's words, the pill's size and its
      warning colour, but a line of the column rather than a pill floating over it — quiet, and never
      over a row. Centred under the heading, cut with an ellipsis rather than wrapped. */
