@@ -385,7 +385,7 @@ const FIXTURE_TREE = {
   // `#229 desktop-two-column`. The right column of the desk's two-column layout: its heading, its
   // one scrolling element (the THIRD the model scrolls, see `SCROLLERS`) holding the cards and the
   // thread pane, which nests exactly as #pane-discord does, and its jump over the foot.
-  "side-column": ["side-heading", "side-scroll", "side-tools"],
+  "side-column": ["side-heading", "side-freshness", "side-scroll", "side-tools"],
   "side-heading": ["side-facts", "side-title", "side-close"],
   "side-scroll": ["side-search-empty", "side-list", "side-pane"],
   "side-list": ["side-list-state", "side-cards", "side-more-threads"],
@@ -38942,6 +38942,73 @@ test("`#231 two-column-polish`: a thread selected while the poll's read of Main 
 });
 
 const THREAD_DIRECTORY_REFRESH_MS = sourceConstant("THREAD_DIRECTORY_REFRESH_MS");
+
+/** Answer every read of `view` on `server` with a gateway error, and every other read as it would be. */
+function failView(server, view) {
+  const failed = errorResponse(502, "chat_error", "the chat service refused the read");
+  server.hold = { respond: (path) => (viewOf(path) === view ? failed() : server.answer(path)) };
+}
+
+test("`#231 two-column-polish`: a failed refresh of the thread on the right says so on its own line, in the pill's words, and the next read that lands takes it away", async () => {
+  // The line is part of the right column, under its heading, and hidden until it has something to say.
+  assertMarkupContains("side-column", "side-freshness");
+  const tag = /<p\s+id="side-freshness"[^>]*>/.exec(HTML_CODE)[0];
+  assert.match(tag, /role="status"/);
+  assert.match(tag, /(?:^|\s)hidden(?=[\s>])/, "the line ships on screen, before anything has been read");
+  assert.match(cssBlockIn(TWO_COLUMN_QUERY, "#side-freshness"), /grid-row:\s*2/);
+  assert.match(cssBlockIn(TWO_COLUMN_QUERY, "#side-scroll"), /grid-row:\s*3/,
+    "the list is not placed below the line, so the line hidden would leave the list in the wrong row");
+  const { page, server } = await twoColumnServer();
+  await threadBadge(rowWithId(page, "201")).click();
+  await page.settle();
+  const line = page.el("side-freshness");
+  assert.equal(line.hidden, true, "a thread drawn from a read that succeeded says it is stale");
+  failView(server, "thread");
+  await pollOnce(page);
+  assert.equal(line.hidden, false, "a failed refresh of the right column said nothing");
+  assert.equal(line.getAttribute("data-state"), "failed");
+  assert.match(line.textContent, /^Refresh failed · showing messages from \d{2}:\d{2}$/);
+  assert.deepStrictEqual(sideIds(page), ["201", "202"], "the failure took the thread's rows away");
+  // Said over the rows it is about, so not again in the error panel; and the left column, which read
+  // its own view, is current, and says so.
+  assert.equal(page.el("error-wrap").hidden, true, "a failed refresh of the right column raised the error panel");
+  assertCurrent(page, "the right column's failure was said for the left column");
+  server.hold = null;
+  await pollOnce(page);
+  assert.equal(line.hidden, true, "the next read that landed left the right column saying its refresh failed");
+  assert.equal(line.getAttribute("data-state"), "fresh");
+});
+
+test("`#231 two-column-polish`: a failed read of the thread list behind the cards says so on the right column's line, until one lands", async () => {
+  const { page, server } = await twoColumnServer();
+  const line = page.el("side-freshness");
+  assert.equal(page.el("side-list").hidden, false, "the cards are not up");
+  assert.equal(line.hidden, true);
+  failView(server, "threads");
+  page.setClock(page.clock() + THREAD_DIRECTORY_REFRESH_MS + 1000);
+  const calls = page.timelineCalls.length;
+  await pollOnce(page);
+  assert.ok(page.timelineCalls.slice(calls).map(viewOf).includes("threads"), "the poll did not read the thread list");
+  assert.equal(line.hidden, false, "a failed read of the thread list behind the cards said nothing");
+  assert.match(line.textContent, /^Refresh failed · showing threads from \d{2}:\d{2}$/);
+  assert.ok(cardIds(page).length > 0, "the failure took the cards away");
+  assert.equal(page.el("error-wrap").hidden, true);
+  // A failed read is asked again at the next poll, not a minute later, and its landing ends the line.
+  server.hold = null;
+  await pollOnce(page);
+  assert.equal(line.hidden, true, "the thread list's next read landed, and the line still says it failed");
+  // Selecting a thread speaks for the thread; closing it again, for the cards.
+  failView(server, "threads");
+  page.setClock(page.clock() + THREAD_DIRECTORY_REFRESH_MS + 1000);
+  await pollOnce(page);
+  assert.equal(line.hidden, false);
+  await cardOf(page, cardIds(page)[0]).click();
+  await page.settle();
+  assert.equal(line.hidden, true, "the thread on the right says the thread list's failure");
+  await page.el("side-close").click();
+  await page.settle();
+  assert.equal(line.hidden, false, "back on the cards, the thread list's failure is no longer said");
+});
 
 test("`#231 two-column-polish` x `#226 page-energy-profile`: with the cards up, a refresh that brings nothing draws nothing, in the cards as in Main", async () => {
   /** A poll with the cards up, late enough that the thread list is read again, which brings nothing. */

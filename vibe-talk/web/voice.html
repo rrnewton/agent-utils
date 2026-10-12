@@ -519,6 +519,15 @@
                 </svg>
               </button>
             </div>
+            <!--
+              `#231 two-column-polish`. How old the right column's rows are, whenever they are not a
+              read that just succeeded: in the freshness pill's own words — "Refresh failed · showing
+              messages from 07:23" — on one quiet line under the heading, and gone with the next read
+              that lands. The pill floats over the left column alone, so a failed refresh of this one
+              used to say nothing at all. A current column says nothing here: the pill says how
+              current the channel is. A status, spoken once when it changes, as the pill is.
+            -->
+            <p id="side-freshness" data-state="fresh" role="status" aria-live="polite" hidden></p>
             <div id="side-scroll" tabindex="-1" role="region" aria-label="Threads">
               <p id="side-search-empty" class="search-empty" role="status" hidden>
                 Nothing in the messages loaded so far matches that search.

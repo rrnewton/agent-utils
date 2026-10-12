@@ -10495,8 +10495,11 @@ function setChannelFreshness(state) {
  */
 function renderChannelFreshness() {
   // The pill floats over the left column and speaks for it. `#229 desktop-two-column`: the right
-  // column's freshness is its own, and nothing floats over it.
-  if (sideActive) return;
+  // column's freshness is its own, said on a line of that column (`#231 two-column-polish`).
+  if (sideActive) {
+    renderSideFreshness();
+    return;
+  }
   const pill = el("channel-freshness");
   const gesture = el("pull-refresh");
   const at = stamp(channelFreshAt);
@@ -10507,16 +10510,7 @@ function renderChannelFreshness() {
     ? `${liveAttached && liveDelivery !== "off" ? "Live · updated" : "Updated"} ${at}` +
       (refreshing ? " · refreshing…" : "")
     : "";
-  const text = channelFreshness === "saved"
-    ? (refreshing ? `Saved ${at} · refreshing…` : `Showing messages saved ${at}`)
-    : channelFreshness === "offline"
-      ? `Offline · showing messages saved ${at}`
-      : channelFreshness === "failed"
-        ? `Refresh failed · showing messages from ${at}`
-        : channelFreshness === "slow"
-          ? `${sentenceStart(chatServiceOf(el("discord-channel").value))} is slow to answer · ` +
-            `showing messages from ${at}`
-          : current;
+  const text = staleWords(channelFreshness, channelFreshAt, refreshing) || current;
   pill.textContent = text;
   pill.setAttribute("data-state", channelFreshness);
   // It gives way to a pull at the TOP, which draws in the same place (a pull up at the foot leaves
@@ -10526,6 +10520,56 @@ function renderChannelFreshness() {
   pill.hidden = text === "" || currentView !== "discord" ||
     (!gesture.hidden && gesture.getAttribute("data-edge") !== "end") || searchOpen;
   reserveFreshnessRoom(text !== "");
+}
+
+/**
+ * What a freshness pill says of rows that are not a read that just succeeded, in `state` — saved on
+ * this device, kept after a refresh that failed, from a service slow to answer — and last current at
+ * `atMs`; "" for rows that are current, which each pill says in its own way. `noun` is what the rows
+ * are. The left column's pill and, since `#231 two-column-polish`, the right column's line, in one
+ * set of words.
+ *
+ * @param {string} state
+ * @param {number} atMs
+ * @param {boolean} refreshing
+ * @param {string} [noun]
+ */
+function staleWords(state, atMs, refreshing, noun = "messages") {
+  const at = stamp(atMs);
+  if (state === "saved") return refreshing ? `Saved ${at} · refreshing…` : `Showing ${noun} saved ${at}`;
+  if (state === "offline") return `Offline · showing ${noun} saved ${at}`;
+  if (state === "failed") return `Refresh failed · showing ${noun} from ${at}`;
+  if (state === "slow") {
+    return `${sentenceStart(chatServiceOf(el("discord-channel").value))} is slow to answer · showing ${noun} from ${at}`;
+  }
+  return "";
+}
+
+/**
+ * The right column's line saying how old its rows are: drawn only when it changed, and only when
+ * they are not current. `#231 two-column-polish`. A thread says what its own reads have said, as
+ * the pill says Main's; the cards say what the thread list's reads have said, by the newest that
+ * landed — else by the left column's, whose store the cards are drawn from — and nothing once one
+ * lands again.
+ */
+function renderSideFreshness() {
+  const line = leftEl("side-freshness");
+  let state = "fresh";
+  let text = "";
+  if (columnsShown && columns.side.mode === "thread") {
+    [state, text] = inColumn(columns.side, () =>
+      [channelFreshness, staleWords(channelFreshness, channelFreshAt, channelRefreshing)]);
+  } else if (columnsShown) {
+    const channel = String(el("discord-channel").value);
+    state = threadListFailures.get(channel) || "fresh";
+    const at = threadListLandedAt.get(channel) || inColumn(columns.main, () => channelFreshAt);
+    // With no time to give, the state alone, rather than a time nothing was read at.
+    text = state === "fresh" ? "" : at ? staleWords(state, at, false, "threads")
+      : state === "offline" ? "Offline" : "Refresh failed";
+  }
+  setTextIfChanged(line, text);
+  if (line.getAttribute("data-state") !== state) line.setAttribute("data-state", state);
+  if (line.hidden !== (text === "")) line.hidden = text === "";
 }
 
 /**
@@ -11836,6 +11880,22 @@ const OLDER_THREADS_OPTION = "older";
 
 const threadDirectoryReadAt = new Map();
 let threadDirectoryInFlight = null;
+/**
+ * `#231 two-column-polish`. By channel, how the thread list's newest read failed, "offline" or
+ * "failed", until one lands; and when the newest that landed did. What the right column's line says
+ * over its cards (`renderSideFreshness`): a failed read of the list behind them used to say nothing.
+ *
+ * @type {Map<string, string>}
+ */
+const threadListFailures = new Map();
+/** @type {Map<string, number>} */
+const threadListLandedAt = new Map();
+
+/** The thread list's newest page for `channel` landed: current from now, whatever failed before. */
+function noteThreadListLanded(channel) {
+  threadListFailures.delete(channel);
+  threadListLandedAt.set(channel, Date.now());
+}
 
 /** The first line of `text` that says anything, cut to `chars` with an ellipsis; "" when none. */
 function firstLineOf(text, chars) {
@@ -12117,13 +12177,20 @@ async function refreshThreadDirectory() {
     } else {
       foldTimelinePage(payload, false, "threads", null);
     }
+    noteThreadListLanded(channel);
     renderThreadSelect();
     renderThreadHeading();
     // Its summaries carry counts Main's roots are kept and counted by (`#222 unread-replies`).
     syncUnreadReplies();
-  } catch (_error) {
-    // The selector keeps offering what the store already knew; the next touch may ask again.
+  } catch (error) {
+    // The selector keeps offering what the store already knew; the next touch may ask again — in
+    // two columns the next poll, the right column's line saying meanwhile that the cards are as
+    // they were. `#231 two-column-polish`.
     threadDirectoryReadAt.delete(channel);
+    if (String(el("discord-channel").value) === channel) {
+      threadListFailures.set(channel, error && error.network ? "offline" : "failed");
+      renderSideFreshness();
+    }
   } finally {
     if (threadDirectoryInFlight === channel) threadDirectoryInFlight = null;
   }
@@ -12241,7 +12308,10 @@ async function loadThreadDirectory(older) {
   }
   foldTimelinePage(payload, older, "threads", null);
   // The newest page is the selector's background read as well; it need not ask again this minute.
-  if (!older) threadDirectoryReadAt.set(channel, Date.now());
+  if (!older) {
+    threadDirectoryReadAt.set(channel, Date.now());
+    noteThreadListLanded(channel);
+  }
   const next = payload.has_more === true ? payload.next_before || null : null;
   // A REOPENED screen re-reads the newest page, but the older pages already loaded are still in
   // the store and on screen: Load older continues from the deepest one rather than walking the
@@ -23839,6 +23909,7 @@ function renderSideMode() {
  */
 function renderSideColumn() {
   if (!columnsShown) return;
+  renderSideFreshness();
   if (columns.side.mode === "list") {
     setTextIfChanged(leftEl("side-title"), "Threads");
     nameSideRegion("Threads");

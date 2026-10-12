@@ -5791,11 +5791,13 @@ textarea {
     grid-column: 1;
   }
 
+  /* Its heading, the line saying how old its rows are when they are not current (`#231
+     two-column-polish`; hidden, it is no box, and its row is none), and its list. */
   #screen-main[data-columns="two"] > #side-column {
     display: grid;
     grid-column: 2;
     grid-row: 1 / -1;
-    grid-template-rows: auto minmax(0, 1fr);
+    grid-template-rows: auto auto minmax(0, 1fr);
     grid-template-columns: minmax(0, 1fr);
     min-height: 0;
     position: relative;
@@ -5824,6 +5826,7 @@ textarea {
 
   /* The heading names the thread as the picker does — "13h · 16 · its name" — and holds the X. */
   #side-heading {
+    grid-row: 1;
     display: flex;
     align-items: center;
     gap: 0.5rem;
@@ -5860,8 +5863,34 @@ textarea {
     margin-inline-start: auto;
   }
 
+  /* `#231 two-column-polish`. The right column's freshness: the pill's words, the pill's size and its
+     warning colour, but a line of the column rather than a pill floating over it — quiet, and never
+     over a row. Centred under the heading, cut with an ellipsis rather than wrapped. */
+  #side-freshness {
+    grid-row: 2;
+    box-sizing: border-box;
+    width: 100%;
+    max-width: var(--reading-width);
+    margin: 0 auto;
+    padding: 0.25rem 0.75rem;
+    color: var(--muted);
+    font-size: 0.75rem;
+    line-height: var(--freshness-line);
+    text-align: center;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+
+  #side-freshness[data-state="offline"],
+  #side-freshness[data-state="failed"],
+  #side-freshness[data-state="slow"] {
+    color: var(--warn);
+  }
+
   /* The right column's one scrolling element, built as #scroll-area is: its size is its cell's. */
   #side-scroll {
+    grid-row: 3;
     contain: size layout;
     min-height: 0;
     overflow-y: auto;
