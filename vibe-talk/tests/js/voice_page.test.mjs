@@ -31908,6 +31908,58 @@ test("after part of a message posted, the rest goes again on its own only if it 
   assert.equal(replied.repliesPosted.length, 1, "a reply's remainder was retried on its own");
 });
 
+test("the rest of a post cut in parts goes into the thread the server names, without the reply target", async () => {
+  // `#263 post-split-per-provider`. Where a provider threads a long message under its first part,
+  // the 207 names that thread, and the unsent text goes there: the parts after the first never
+  // carried the reply target, so the remainder goes without it, as the part that failed did.
+  const page = await keyedChannel();
+  page.replyResponse = async () => json(207, {
+    error: "partially_posted", posted: 1, unsent: "the second part", detail: SLOW_SEND, retryable: true,
+    resumable: true, thread_id: "t_first",
+  });
+  await sendChannel(page, "the first part. the second part");
+  assert.match(outgoingRows(page)[0].text(), /1 part confirmed\. Sending… .*Retrying in 5 s\./);
+  assert.equal(savedOutgoing(page)[0].continueIn, "t_first", "a reload would send the rest elsewhere");
+  page.replyResponse = sentOk;
+  page.expireTimers(RETRY_FIRST_MS);
+  await settleSend(page);
+  assert.deepEqual(posted(page)[1],
+    { text: "the second part", thread_id: "t_first", idempotency_key: posted(page)[0].idempotency_key },
+    "the rest did not go to the first part's thread under the same key");
+  assert.equal(outgoingRows(page).length, 0);
+
+  // A reply's remainder continuing in that thread is not a second answer, so it goes on its own.
+  const replied = await keyedChannel();
+  replied.messages = [message({ id: "1945", content: "a question" })];
+  await reReadChannel(replied);
+  await openReplyOn(replied, replied.messages);
+  replied.replyResponse = async () => json(207, {
+    error: "partially_posted", posted: 1, unsent: "the rest of the answer", detail: SLOW_SEND, retryable: true,
+    resumable: true, thread_id: "t_answer",
+  });
+  await replied.el("reply-text").setValue("an answer. the rest of the answer");
+  await replied.el("reply-send").click();
+  await replied.settle();
+  assert.equal(posted(replied)[0].reply_to, "1945");
+  assert.match(outgoingRows(replied)[0].text(), /Retrying in 5 s\./, "a continued reply was left to the reader");
+  replied.replyResponse = sentOk;
+  replied.expireTimers(RETRY_FIRST_MS);
+  await settleSend(replied);
+  assert.equal(replied.repliesPosted.length, 2, "the rest of the answer did not go again");
+  assert.deepEqual(posted(replied)[1], {
+    text: "the rest of the answer", thread_id: "t_answer", idempotency_key: posted(replied)[0].idempotency_key,
+  }, "the rest went with the reply target, or outside the thread");
+
+  // Nothing posted yet means nothing to continue: the whole text goes where it was going.
+  const unposted = await keyedChannel();
+  unposted.replyResponse = async () => json(207, {
+    error: "partially_posted", posted: 0, unsent: "not yet anywhere", detail: SLOW_SEND, retryable: true,
+    resumable: true, thread_id: "t_elsewhere",
+  });
+  await sendChannel(unposted, "not yet anywhere");
+  assert.equal(savedOutgoing(unposted)[0].continueIn, null, "nothing posted, yet the destination moved");
+});
+
 test("a remainder the server cannot resend as the same request waits for the reader and promises nothing", async () => {
   // The server says `resumable: false` where sending the unsent text again would not repeat the
   // part that failed under its own words and key — a code block cut across it, say. The provider

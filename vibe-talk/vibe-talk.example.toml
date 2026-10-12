@@ -31,6 +31,12 @@ provider_name = "Discord"
 # How the service writes message text, for the page's renderer: "discord", or "google-chat" for a
 # bridge serving Google Chat, where *a* is bold and a link may arrive as <https://...|label>.
 # markup = "discord"
+# The most one message may hold. A longer one is cut into parts. Discord itself takes 2000
+# characters and never more. A bridge takes what is set here, and 2000 characters when neither is
+# set; with markup = "google-chat" it is also held to Google Chat's 32,000 bytes. Under 500 is
+# refused. Set what the bridge itself accepts in one request.
+# max_post_chars = 2000
+# max_post_bytes = 30000
 # Thread protocol: "native" for Discord, "bridge" for compatible normalized thread endpoints,
 # or "off" for an older bridge without thread support. Thread ids and cursors are opaque.
 thread_api = "native"

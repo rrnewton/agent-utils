@@ -15916,6 +15916,8 @@ function outgoingFromSaved(held) {
     keyedOnly: held.keyedOnly === true,
     // `#193 compose-draft-loss`. See `editableSend`.
     mayHavePosted: held.mayHavePosted === true || held.state === "unconfirmed" || attempted,
+    // `#263 post-split-per-provider`: where the rest of a post cut in parts goes.
+    continueIn: typeof held.continueIn === "string" && held.continueIn ? held.continueIn : null,
     detail: attempted ? "This page closed before delivery was confirmed."
       : interrupted ? "This page closed before this message was sent." : String(held.detail || ""),
   };
@@ -16165,6 +16167,7 @@ function queueOutgoingMessage(request) {
     id, ...request, originView: channelView, createdAt: Date.now(),
     remaining: request.text.trim(), state: "sending", phase: "queued",
     parts: [], observedParts: [], postedCount: 0, detail: "", keyedOnly: true, mayHavePosted: false,
+    continueIn: null,
   };
   outgoingMessages.set(id, entry);
   return scheduleOutgoingMessage(entry);
@@ -16324,8 +16327,12 @@ async function dispatchOutgoingMessage(entry, job, placing = null) {
     persistOutgoingMessages();
     renderOutgoingEverywhere();
     const body = { text: entry.remaining };
-    if (entry.replyTo) body.reply_to = entry.replyTo;
-    if (entry.threadId) body.thread_id = entry.threadId;
+    // `#263 post-split-per-provider`. The rest of a post whose first part went to the conversation
+    // continues where the server said the parts after it went — the first part's thread, for a
+    // provider that threads a long message under its first part — and without the reply target,
+    // which only the first part carries.
+    if (entry.replyTo && !entry.continueIn) body.reply_to = entry.replyTo;
+    if (entry.continueIn || entry.threadId) body.thread_id = entry.continueIn || entry.threadId;
     // The entry's id names this post on every attempt, across reloads, so the server can tell a
     // retry from a second message. Sent only where it is honoured; one attempt without it and the
     // entry can never again prove a retry safe.
@@ -16355,6 +16362,12 @@ async function dispatchOutgoingMessage(entry, job, placing = null) {
     if (job.stopped) return;
     if (payload && payload.error === "partially_posted") {
       entry.postedCount += Math.max(0, Number(payload.posted) || 0);
+      // Where the unsent text belongs, when the server says: the thread the parts already posted
+      // went into. Absent means the conversation, or an older server, and changes nothing.
+      if (typeof payload.thread_id === "string" && payload.thread_id && entry.postedCount > 0 &&
+          payload.thread_id !== entry.threadId) {
+        entry.continueIn = payload.thread_id;
+      }
       // An adapter can lose an acknowledgement after delivery. Even a 207 is not proof that the
       // last attempted part failed to arrive; its unsent suffix is the ONLY safe retry candidate.
       entry.remaining = typeof payload.unsent === "string" ? payload.unsent : "";
@@ -16474,11 +16487,13 @@ function channelPostsOnce(channel) {
  * Not for a remainder that starts with the reply, though. After a 207 the unsent text goes again
  * with the reply target, which makes its first part a different request from the part that failed
  * — and that part is exactly the one whose arrival nobody knows. (The server's 207 says so as well,
- * by not calling that remainder `resumable`; this does not depend on it.)
+ * by not calling that remainder `resumable`; this does not depend on it.) A remainder continuing in
+ * the first part's thread goes without the reply target, as the part that failed did, so it is not
+ * one of those. `#263 post-split-per-provider`.
  */
 function retriesItself(entry) {
   return entry.keyedOnly === true && channelPostsOnce(entry.channel) &&
-    !(entry.postedCount > 0 && entry.replyTo);
+    !(entry.postedCount > 0 && entry.replyTo && !entry.continueIn);
 }
 
 /** After a transient failure: arm the next automatic attempt, or leave the row to the reader. */

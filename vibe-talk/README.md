@@ -276,6 +276,16 @@ when the draft is sent or emptied.
 not synced, so a draft started on the phone is not on the laptop. Syncing drafts between devices
 is not supported yet.
 
+**A long message stays one message where it can.** A message is cut into parts only when it is
+longer than the chat service accepts in one message, and each service is measured its own way:
+Discord takes 2,000 characters, Google Chat 32,000 bytes, and Slack 40,000 characters, with a bridge
+in front of a service taking what its operator configured (see `max_post_chars` and `max_post_bytes`
+under [Configuration](#configuration)). When a message to the channel itself still has to be cut,
+Google Chat and Slack post the first part in the channel and the rest as replies in that part's
+thread; Discord posts the parts one after another, and only the first answers the message you
+replied to. A message sent into a thread keeps every part in that thread. If a part fails, the
+unsent rest is retried into the same thread (`#263 post-split-per-provider`).
+
 ## Installing the reader
 
 Serve vibe-talk over HTTPS, open `/voice` in Chrome on Android, and choose **Install app** from the
@@ -1488,6 +1498,7 @@ model provider or a real gateway.
 | Channel registration | `discord.channel_registration` | — | **off by default**; enable only when `discord.api_base` is a compatible bridge implementing `POST /channels` and `DELETE /channels/{id}` |
 | Upstream read marks | `discord.upstream_read_marks` | — | **off by default**; enable only when `discord.api_base` is a compatible bridge implementing `POST /channels/{id}/read` |
 | Chat service name | `discord.provider_name` | — | `Discord`; set to the source service's name (for example, `Google Chat`) when using a compatible HTTP bridge |
+| Post size | `discord.max_post_chars` / `discord.max_post_bytes` | — | the most one message may hold, in characters and in UTF-8 bytes; a longer one is cut into parts. Discord itself: 2,000 characters, never more. A bridge: what you set, and 2,000 characters when you set neither, so an upgrade never sends a bridge a longer message than it has accepted before. A bridge with `markup = "google-chat"` is also held to Google Chat's 32,000 bytes and refuses a larger setting; set `max_post_bytes` to what the bridge itself accepts, up to that. Under `500` is refused. Also accepted on every `[[providers]]` entry; see "A long message stays one message where it can" under [What it does in v0](#what-it-does-in-v0) |
 | Message markup | `discord.markup` | — | how the service writes message text, for the page's renderer: `discord` (default), `google-chat` for a bridge serving Google Chat, where `*a*` is bold and a link may arrive as `<https://…\|label>`, or `slack` for a bridge passing Slack's text through. A Slack provider is always `slack` and refuses the key. See [How message text is drawn](#how-message-text-is-drawn) |
 | Thread protocol | `discord.thread_api` | — | `native` (default) for Discord, `bridge` for the normalized endpoints below, or `off` to disable child-thread timelines; an added source that identifies one upstream conversation remains an ordinary channel-picker entry in every mode |
 | Discord bot token | `discord.bot_token` | `VIBE_TALK_DISCORD_BOT_TOKEN` | **secret** |
@@ -1574,10 +1585,17 @@ provider = "slack"
 Keys common to both kinds: `key` (1–32 lowercase letters, digits, or hyphens), `kind` (`discord`
 or `slack`), `name` (display name; defaults to `Discord` or `Slack`), `api_base`, `token`,
 `owner_user_id`, `request_timeout_seconds` (default `20`, range `1`–`120`), `live_poll_seconds`
-(default `0`, off; at least `5`), and `channel_registration`. Discord-protocol providers also take
+(default `0`, off; at least `5`), `channel_registration`, and `max_post_chars` / `max_post_bytes`
+(the most one message may hold; see the configuration table). Discord-protocol providers also take
 `thread_api`, `upstream_read_marks` and `markup`, with the same meaning as in `[discord]`. Slack providers
 also take `registered_channels_writable`, `channel_discovery` and `upstream_clear`; see [Slack](#slack). A key that
 does not apply to the provider's kind is refused by name.
+
+A Slack provider measures a message as Slack is sent it, after `&`, `<` and `>` become `&amp;`,
+`&lt;` and `&gt;`. Pointed at Slack itself it takes 39,000 characters unless configured, a margin
+under the 40,000 past which Slack truncates, and refuses a `max_post_chars` above 40,000. Pointed
+at a bridge it takes what `max_post_chars` and `max_post_bytes` say, and 2,000 characters when
+neither is set.
 
 How a deployment with several providers behaves:
 
@@ -2190,7 +2208,7 @@ own adapter-only token; every other route uses the read/write tokens described a
 | GET | `/api/v1/channels/{id}/timeline?view=&thread_id=&limit=&before=&after=` | read | main channel, thread list, flattened history, or one thread; opaque backward cursor, or `after=` for what changed since a newest read: `400 cursor_mismatch` for a cursor from another channel, view or thread, `410 cursor_expired` for one the backend can no longer continue — read the newest page again (`#203 incremental-refresh`) |
 | GET | `/api/v1/channels/{id}/count?since=&hours=&cap=` | read | a bounded, honest count |
 | POST | `/api/v1/channels/{id}/resolve` | read | **semantic random access** |
-| POST | `/api/v1/channels/{id}/reply` | **write** | `{text, thread_id?, reply_to?, idempotency_key?}` — post to the channel or selected thread; quoting a message is optional. A split post that fails part-way answers `207` with `{posted, unsent, retryable, resumable}`; `idempotency_key` (1–64 of `A-Z a-z 0-9 - _`) names the post across attempts, and where client-config reports `idempotent_posts_supported` the same key and text are posted at most once (`#195 send-resilience`). `unsent` is the request's own text when nothing posted; `resumable` says whether sending `unsent` again repeats the failed part under the same words and key, which a split code block can prevent |
+| POST | `/api/v1/channels/{id}/reply` | **write** | `{text, thread_id?, reply_to?, idempotency_key?}` — post to the channel or selected thread; quoting a message is optional. A post longer than the channel's provider takes in one message is cut into parts; one to the channel itself continues in the first part's thread where the provider threads a long message (Google Chat, Slack) and as consecutive messages on Discord (`#263 post-split-per-provider`). A split post that fails part-way answers `207` with `{posted, unsent, retryable, resumable, thread_id?}`, where `thread_id` names the thread `unsent` belongs in — send it there, and without `reply_to` when that is not the request's own thread; `idempotency_key` (1–64 of `A-Z a-z 0-9 - _`) names the post across attempts, and where client-config reports `idempotent_posts_supported` the same key and text are posted at most once (`#195 send-resilience`). `unsent` is the request's own text when nothing posted; `resumable` says whether sending `unsent` again repeats the failed part under the same words and key, which a split code block can prevent |
 | POST | `/api/v1/channels/{id}/ask` | **write** | slow path — answers 501 in v0 |
 | GET | `/api/v1/post-proposals?wait=&seen=` | **write** | the one post waiting for the owner's confirmation, or `null`; `wait` (seconds, at most 25) holds the request until it changes from serial `seen` — see "Posting is two-phase" |
 | POST | `/api/v1/post-proposals` | **write** | `{channel_id, text, reply_to?}` — propose a post, as `post_reply` does; supersedes any pending one; answers `{sent: false, serial, result}`, where `result` is `post_reply`'s sentence, and no handle |
