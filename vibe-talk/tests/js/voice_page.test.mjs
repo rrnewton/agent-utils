@@ -19188,6 +19188,16 @@ test("ON A THREADED CHANNEL, where a Done redraws every row, the new row carries
   assert.equal(channelRow(page, "3").hasAttribute("data-done-flash"), false, "the moment outlived its timers");
 });
 
+test("A DONE THE SERVER REFUSED takes the moment back, so an unread row never wears the grey ring (#245)", async () => {
+  const page = await keyboardPageAtTop();
+  page.inboxWriteHook = async (kind) => (kind === "dismiss" ? providerDown() : null);
+  await doneButton(channelRow(page, "2")).click();
+  await page.settle();
+  assert.equal(channelRow(page, "2").getAttribute("data-archived"), "false", "the refused Done stayed");
+  assert.equal(channelRow(page, "2").hasAttribute("data-done-flash"), false, "a refused Done still drew the row as marked");
+  assert.equal(page.expireTimers(DONE_FLASH_HOLD_MS), 0, "a timer was left to draw a Done that never happened");
+});
+
 test("the Done button, a swipe and Done through here draw it too, on the row they acted on (#245)", async () => {
   const page = await keyboardPageAtTop();
   await doneButton(channelRow(page, "4")).click();

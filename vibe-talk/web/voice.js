@@ -20538,9 +20538,16 @@ async function markReadThroughHere(row, upstreamId) {
   if (at < 0) return;
   const ids = rows.slice(0, at + 1).flatMap(idsOf).filter((id) => !archivedIds.has(id));
   // `#245 done-feedback`. Drawn on the row it was asked from: the boundary is the row the reader is on.
-  if (ids.length) flashDone(row);
-  // `#240 reading-bookmark`. A bookmark at or above the row slides below it, with the Done.
-  if (ids.length) await dismissMessages({ messages: ids }, throughBump(row));
+  if (ids.length) {
+    flashDone(row);
+    try {
+      // `#240 reading-bookmark`. A bookmark at or above the row slides below it, with the Done.
+      await dismissMessages({ messages: ids }, throughBump(row));
+    } catch (error) {
+      unflashDone(row);
+      throw error;
+    }
+  }
   let upstream = false;
   if (upstreamReadMarkSupported && upstreamId) {
     await markReadUpstream(upstreamId);
@@ -22201,9 +22208,14 @@ async function toggleArchived(ids, row = null) {
     await restoreMessages(all);
   } else {
     // `#245 done-feedback`. BEFORE the dismissal redraws the row as read, so the change is one the
-    // browser can animate rather than a jump.
+    // browser can animate rather than a jump; taken back if the Done did not take.
     flashDone(row);
-    await dismissMessages({ messages: all });
+    try {
+      await dismissMessages({ messages: all });
+    } catch (error) {
+      unflashDone(row);
+      throw error;
+    }
   }
 }
 
@@ -22262,6 +22274,19 @@ function drawDoneFlashes() {
     const list = document.getElementById(id);
     for (const row of list ? [...list.children] : []) drawDoneFlash(row);
   }
+}
+
+/**
+ * Take the moment back: the Done it drew did not reach the server, the row is unread again, and a
+ * grey ring on it would say otherwise.
+ */
+function unflashDone(row) {
+  const ids = row ? idsOf(row) : [];
+  if (ids.length === 0) return;
+  clearTimeout(doneFlashTimers.get(ids[0]));
+  doneFlashTimers.delete(ids[0]);
+  for (const id of ids) doneFlashing.delete(id);
+  drawDoneFlashes();
 }
 
 /** Draw the moment `row` was marked Done; see the section note. Nothing without a row. */
