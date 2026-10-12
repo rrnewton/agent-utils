@@ -886,7 +886,7 @@ def single_selection(walk: Walk, api: FakeApi) -> None:
     check(keys_row != f"discord-log:{long_id}", "the keys were on the long message before the clicks; this proves nothing")
     # Off the list, for the steps that follow: the dock is not a row.
     walk.cdp.send("Input.dispatchMouseEvent", {"type": "mouseMoved", "x": 2, "y": 790, "button": "none", "buttons": 0})
-    walk.notes.append("one selection (#238): a real mouse move took it from the keys, j and ArrowUp took it back with "
+    walk.notes.append("one selection (#239 single-selection): a real mouse move took it from the keys, j and ArrowUp took it back with "
                       "the hovered row unlit, a click with no move selected, 14 j's scrolled the list under a still "
                       "mouse without it taking anything, and Enter opened the message the mouse had moved to, also "
                       "after a click on Show read had focused it; one row drawn lit, holding the focus, after every step")

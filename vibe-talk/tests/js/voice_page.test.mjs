@@ -18287,7 +18287,7 @@ const rowAtY = (page, y) => page.el("discord-log").children.find((li) => {
 });
 
 test("A TAP SELECTS SILENTLY: no focus, nothing lit, and the next key starts from the message tapped", async () => {
-  // A touch screen has no hover, and a row lit by a tap could not be put out: as before `#238`.
+  // A touch screen has no hover, and a row lit by a tap could not be put out: as before `#239 single-selection`.
   const page = await keyboardPageAtTop();
   const area = page.el("scroll-area");
   area.focus();
