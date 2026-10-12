@@ -19460,6 +19460,16 @@ test("1, 2 AND 3 choose Main, the Threads screen and All; h cycles the read mode
   assert.equal(folded(), 0, "; did not expand every message");
   await press(tall, tall.el("scroll-area"), ":");
   assert.ok(folded() > 0, ": did not collapse them again");
+  // On Dvorak ";" is typed on the key QWERTY calls Z (code KeyZ). It is ";", Expand all, and never z, Undo:
+  // a key typing ASCII punctuation is read by its character, only a non-Latin letter by its place.
+  const dvorak = await keyboardPage();
+  const shut = () => dvorak.el("discord-log").children.filter((li) => li.getAttribute("data-collapsed") === "true").length;
+  assert.ok(shut() > 0);
+  await press(dvorak, dvorak.el("scroll-area"), ";", { code: "KeyZ" });
+  assert.equal(shut(), 0, "; typed on Dvorak's KeyZ did not expand every message");
+  assert.notEqual(dvorak.el("status").textContent, "Nothing to undo.", "; typed on Dvorak's KeyZ was read as z, Undo");
+  await press(dvorak, dvorak.el("scroll-area"), ":", { code: "KeyZ", shiftKey: true });
+  assert.ok(shut() > 0, ": typed on Dvorak's KeyZ did not collapse them again");
 });
 
 test("Shift+P AND Shift+L turn the Pinned and Links filters on and off, with the search bar that holds them", async () => {
@@ -37562,6 +37572,30 @@ async function twoColumns(page) {
   assert.ok(inTwoColumns(page), "pressing the layout button on a wide desk did not give two columns");
   return page;
 }
+
+test("Ctrl+\\ AND Cmd+\\ turn two columns on and off like the layout button, and say when the window is too narrow", async () => {
+  for (const fields of [{ ctrlKey: true }, { metaKey: true }]) {
+    const page = newPage();
+    const data = threadData();
+    page.threadingSupported = true;
+    page.threads = data.threads;
+    page.messages = data.messages;
+    await signIn(page);
+    await showDiscord(page, data.messages);
+    page.wideDesk = true;
+    await press(page, page.el("scroll-area"), "\\", fields);
+    await page.settle();
+    assert.ok(inTwoColumns(page), `${JSON.stringify(fields)} \\ did not give two columns on a wide desk`);
+    await press(page, page.el("scroll-area"), "\\", fields);
+    await page.settle();
+    assert.ok(!inTwoColumns(page), `${JSON.stringify(fields)} \\ did not go back to one column`);
+    page.wideDesk = false;
+    await press(page, page.el("scroll-area"), "\\", fields);
+    await page.settle();
+    assert.ok(!inTwoColumns(page), "two columns appeared in a narrow window");
+    assert.match(page.el("status").textContent, /wider window/, "a narrow window did not say why nothing changed");
+  }
+});
 
 /** The channel of `threadData`, on a server with a change record, read in All and then in two columns. */
 async function twoColumnServer(arrange = null) {

@@ -5607,6 +5607,10 @@ function swallow(event) {
 function isLetterKey(event, letter) {
   const key = String(event.key || "");
   if (/^[a-z]$/i.test(key)) return key.toLowerCase() === letter;
+  // A key that types ASCII punctuation or a digit means that character, never the letter its place
+  // would type on QWERTY: on Dvorak ";" sits where QWERTY has Z, and read by its place it was z, Undo.
+  // Only a key that types no ASCII at all (a layout for another script) is read by its place.
+  if (/^[\x21-\x7e]$/.test(key)) return false;
   return event.code === `Key${letter.toUpperCase()}`;
 }
 
@@ -5758,6 +5762,12 @@ const KEYMAP = [
     does: "Out of a thread, back where you came from. In two columns, from the right column back to Main",
     controls: ["thread-back"],
     run: () => threadOutFromKeyboard(),
+  },
+  {
+    group: KEYS_VIEW, chords: [{ key: "\\", mod: true }],
+    does: "Two columns on or off, on a wide enough desk",
+    controls: ["column-toggle"],
+    run: () => columnsFromKeyboard(),
   },
   {
     group: KEYS_MOVING, chords: [{ key: "[" }, { key: "]" }],
@@ -23096,6 +23106,15 @@ function renderColumns() {
   if (shown === columnsShown) return;
   if (shown) enterColumns();
   else leaveColumns();
+}
+
+/** Ctrl/Cmd+\: the layout button. */
+function columnsFromKeyboard() {
+  if (!channelOnScreen()) return false;
+  toggleColumns();
+  // The choice is kept as the button keeps it; a window too narrow to show it says so.
+  if (columnsChosen && !columnsShown) setStatus("Two columns need a wider window; they come back when it is wider.");
+  return true;
 }
 
 /** The reader pressed the layout button. */
