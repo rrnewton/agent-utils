@@ -1044,11 +1044,14 @@ body {
   border-color: var(--accent);
 }
 
-/* The channel's row has its Reply, ⋯ and Done on this line, and they are a little taller than its
-   words; this one has none, and keeps their height, so the message's text starts where it did. */
+/* The channel's row has its Reply, ⋯ and Done at the far end of this line, and they are a little
+   taller than its words. The rows here have none: they keep the line's height, so a row's text starts
+   where it did on the list, and the author and the time stay at the start of the line, where those
+   buttons left them, rather than being spread to its two ends (`.messages li .meta`, the call's). */
+#reply-context .meta,
 #reply-target .meta {
+  justify-content: flex-start;
   min-height: calc(0.72rem * 1.45 + 0.1rem + 2px);
-  align-items: center;
 }
 
 /* `#200 reply-context`. The title bar names the thread a reply goes into, and a thread's name can

@@ -234,6 +234,8 @@ MEASURE_JS = """(id) => {
   return {
     screen: shown('reply') ? 'reply' : shown('main') ? 'main' : null,
     row: box(row), rowSize: size(row), rowWords: box(words(row)),
+    above: box(row ? row.previousElementSibling : null),
+    contextAbove: box(document.querySelector('#reply-context > li:last-child')),
     target: box(target), targetSize: size(target), targetWords: box(words(target)),
     targetId: target ? target.dataset.id : null,
     targetClamped: target ? !!target.querySelector('.body.clamped') : null,
@@ -388,6 +390,11 @@ def reply_case(walk: Walk, index: int, y: float, case: str, scale: int) -> None:
                    f"{case}: the conversation does not end at the message's foot: {target} {pane} {after.found['fit']}")
         walk.check(abs(after.box("targetWords")["top"] - before.box("rowWords")["top"] - (target["top"] - row["top"])) <= 1,
                    f"{case}: the words moved inside the message: {after.box('targetWords')} {before.box('rowWords')}")
+    if case == "middle":
+        # What came before it is where it was too: the earlier message over it, drawn as the list drew it.
+        above, context_above = before.box("above"), after.box("contextAbove")
+        walk.check(abs(context_above["top"] - above["top"]) <= 1 and abs(context_above["height"] - above["height"]) <= 1,
+                   f"{case}: the message above moved from {above} to {context_above}")
     walk.check(after.number("overflow") <= 0, f"{case}: the page scrolls sideways")
     walk.shot(f"{scale}-{case}")
     moved = target["top"] - row["top"]
