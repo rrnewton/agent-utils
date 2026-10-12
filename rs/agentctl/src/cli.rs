@@ -137,6 +137,9 @@ enum Commands {
     /// Bind an explicitly known native conversation ID to a verified agent pane
     #[command(after_help = "Example: agentctl bind-session reviewer THREAD_ID")]
     BindSession(BindSession),
+    /// Read, set, or clear a native Codex goal through the app-server protocol, without resuming or prompting its thread
+    #[command(after_help = crate::codex_goal::command::AFTER_HELP)]
+    CodexGoal(crate::codex_goal::command::CodexGoalArgs),
     /// Verify and focus the agent pane for human interaction; does not pause automation
     #[command(after_help = "Example: agentctl pause reviewer && agentctl attach reviewer")]
     Attach(Named),
@@ -1153,6 +1156,20 @@ fn run(args: Cli, environment: &dyn Fn(&str) -> Option<String>) -> Result<i32, F
             .map_err(Failure::Output)?;
             return Ok(0);
         }
+        Commands::CodexGoal(value) => {
+            if args.registry != Path::new(".agentctl")
+                || args.herdr_bin != Path::new("herdr")
+                || args.agentcloudctl_bin != Path::new("agentcloudctl")
+                || args.agentterm_bin != Path::new("agentterm")
+                || args.from_session.is_some()
+                || args.agentcloud_url.is_some()
+            {
+                return Err(Failure::Usage(
+                    "--registry, --herdr-bin, --agentcloudctl-bin, --agentterm-bin, --agentcloud-url, and --from-session do not apply to codex-goal".to_owned(),
+                ));
+            }
+            return crate::codex_goal::command::run(&value).map_err(Failure::Output);
+        }
         _ => {}
     }
     let client =
@@ -1486,7 +1503,8 @@ fn run(args: Cli, environment: &dyn Fn(&str) -> Option<String>) -> Result<i32, F
         | Commands::Chat(_)
         | Commands::Inbox(_)
         | Commands::Profiles(_)
-        | Commands::Skill(_) => {
+        | Commands::Skill(_)
+        | Commands::CodexGoal(_) => {
             unreachable!()
         }
     };
