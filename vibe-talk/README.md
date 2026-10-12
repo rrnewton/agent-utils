@@ -3422,9 +3422,10 @@ width the pack holds for the buttons beside it.
 
 **Every member of the pack says which views it belongs on**, in one table (`PACK_VIEWS` in
 web/voice.js) rather than in a branch. The rule is where the member's effect lands: the picker
-names what the channel view is reading; Type and Prompts go out through `sendUserMessage`, which
-draws the line into the **transcript** and needs a live call, so on the channel view they are
-controls whose whole result appears on a screen you are not looking at; and Read new decides what
+names what the channel view is reading; Prompts goes out through `sendUserMessage`, which draws
+the line into the **transcript** and needs a live call, so on the channel view it is a control
+whose whole result appears on a screen you are not looking at (writing to the agent is not on the
+bar at all since `#241 voice-composer`: its box is in the transcript); and Read new decides what
 happens to an arriving message *during a call*, so it belongs where the call is. A member with no
 line in the table is hidden everywhere and the page suite names it; there is no default, because a
 default is how a control ends up on a view nobody chose for it.
@@ -4124,24 +4125,49 @@ name it will never get right — so `/voice` has a text composer, and it is deli
 second mode or a second connection. `{"type": "user_message", "text": "…"}` is a client event on
 the conversation socket that is already open, documented by the vendor as processed exactly like
 speech. A typed turn and a spoken turn are therefore the same thing to the conversation, they land
-in the same transcript, and the agent answers either one out loud.
+in the same transcript, and the agent answers either one out loud. On the provider-neutral
+`vibe-talk-v1` protocol the same turn is a `prompt` frame, sent once the spoken turn in progress has
+been closed — see "Conversational voice providers" — and still no second connection or mode.
 
-**It costs one small button, and only while it is in use.** Type is a toggle in the control bar:
-pressing it CONVERTS the bar into a text field — the toggle stays, the gear and the switch get out
-of the way, the field takes the width and a Send appears on the right — and pressing it again
-converts the bar back. One control both enters and leaves the mode, and its own pressed state is
-what says which mode you are in. A permanent text field would be a whole extra band of dock on a
-375x667 phone, competing with the transcript on every frame — the rent "The status line is a
-message, not a fixture" above just stopped paying. A half-typed message survives leaving the mode.
+**It is a box at the foot of the call's transcript, and it is always there** (`#241
+voice-composer`). The owner: "Type mode on voice agent takes away my Voice/Channel toggle ... I'd
+actually like to move over to the same metaphor as the channels view. Can we just have a message
+box at the BOTTOM of the scroll history?" So the call's view has the channel's composer — the same
+box and the same Send, drawn by the same rule, the last thing in the scrolling list — at idle, in
+a typed conversation and in a call alike. Writing changes nothing on the control bar: the
+Voice/Channel switch, the gear and the rest of the strip stay where they rest, and so do Talk,
+Sound and Hang up under it. While the list is shorter than the screen the box sits at its foot,
+where a chat's box is; once the turns fill the screen it is simply the last thing in the list. A
+half-typed message survives leaving the screen and a reload, and leaves the box only when it is
+sent. The keymap treats it as the text field it is: no single-key shortcut fires in it, and Esc
+leaves it for the list with the draft kept.
 
-The toggle appearing to *slide left* is the gear ceasing to exist beside it, not an animation:
-flex simply closes the gap. There is no second mechanism to keep in step, and the only transition
-is the colour.
+**No mode of the agent's has to be engaged to type.** During a call a typed turn goes down the
+socket that is already open, as above. With **nothing open**, the **first send** starts a typed
+conversation (below), holds the message while the conversation opens — the text stays in the box
+and Send is disabled, so it cannot go twice — and sends it the moment the conversation is open,
+after the initiation frame. Clicking into the box, or writing a draft in it, opens no connection
+and bills nothing: the conversation starts belatedly, on the send. A message sent while a spoken
+call is still connecting is held the same way and goes when the call connects. A conversation
+that fails to open leaves the message in the box and sends it nowhere, not into the next call.
+
+**The on-screen keyboard resizes the page.** The frame is a fixed `100dvh` grid with the dock as
+its last row, and Chrome on Android by default opens the keyboard over the layout: `100dvh` does
+not shrink, the browser pans to the focused box, and the dock — the switch with it — sits under the
+keyboard. That was already true of the channel's box. The viewport now carries
+`interactive-widget=resizes-content`, which has Chrome lay the page out in what is left above the
+keyboard, so the dock rides directly above it with the switch in it and the list, which holds the
+box, is what gets shorter. `tests/voice_composer_browser.py` checks it at 412x915 by taking a
+keyboard's share of the screen away, which is exactly what that key asks of the browser; headless
+Chromium has no keyboard to open. Safari does not read the key yet, so on an iPhone the keyboard
+still pans.
 
 `#43 typed-input` first shipped this composer as a row of its own in the dock, which was the
-honest way to build and test the send path before there was a bar to put it in. That row is
-**deleted**, not left standing beside the new one — two text fields racing to be the one somebody
-types in is worse than either.
+honest way to build and test the send path before there was a bar to put it in, and `#59
+text-entry-button` then moved it into the control bar behind a Type toggle that converted the bar
+into a text field — which is what took the switch away. Both homes are **deleted**, not left
+standing beside the box: two text fields racing to be the one somebody types in is worse than
+either.
 
 **Composing pings the agent.** `{"type": "user_activity"}` is documented as resetting the turn
 timeout without touching conversation content, and it is sent at most once every thirty seconds
@@ -4157,8 +4183,10 @@ was sent, and once when the echo arrived — so a typed turn is remembered for t
 matching transcript inside that window is dropped. The window is a guess; settling it costs one
 billed `scripts/run.sh --smoke-agent` run, whose `converse()` already sends `user_message`, and
 **that run has not been made**. The second is the on-screen keyboard: the dock is a grid row of a
-`100dvh` frame, so the composer should ride above an iOS keyboard, but Chromium under Playwright
-has no soft keyboard and no screenshot in this repository can prove it.
+`100dvh` frame, so with `interactive-widget=resizes-content` the box and the dock should ride
+above Chrome's on-screen keyboard on Android, but Chromium under Playwright has no soft keyboard:
+the browser check simulates the resize the key asks for, and no screenshot in this repository can
+prove what a phone's keyboard really does.
 
 **Sound silences the agent's voice by receiving the audio and throwing it away**, and this is the
 decision `#43 typed-input` asks to have recorded, because the alternative — renegotiating into a
@@ -4232,7 +4260,8 @@ periods but does not stop the meter. This makes a long mute quieter, not free.
 ### A typed conversation is a different conversation, not a call with the switches thrown
 
 Because a text-only mode is settled *at initiation*, it can be **chosen** there — and that is what
-**Type** does when it is pressed with nothing open. It answers a real report: reaching a text
+the call's message box does when its first message is sent with nothing open (`#241
+voice-composer`; it was the Type toggle's press until then). It answers a real report: reaching a text
 interface used to mean starting a voice call, muting it, and silencing it. Two of
 those three controls exist to manage a microphone you did not want open, and mute deliberately does
 not close one — it withholds frames from a live capture graph so that unmuting keeps the agent's

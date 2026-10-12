@@ -2297,21 +2297,20 @@ def _act_restored_conversation(driver: Driver) -> None:
 
 
 def _act_typed_turn(driver: Driver) -> None:
-    """`#43 typed-input`, through `#59 text-entry-button`'s bar: a turn that was TYPED, not spoken.
+    """`#43 typed-input`, through `#241 voice-composer`'s box: a turn that was TYPED, not spoken.
 
-    Entered from a real live call, because a typed message is a client event on the conversation
-    socket and a composer with no call behind it is a picture of the refusal, not of the feature.
+    Entered from a real live call, because this scene is about a typed message being a client event
+    on the conversation socket that is already open — the box during a call, not the typed
+    conversation a first send with nothing open starts.
 
-    This scene is about the TRANSCRIPT — that a typed turn lands in it beside the spoken ones, and
-    that the bar carrying the field still sits above the big controls rather than over them. What
-    the converted bar itself looks like is `26-text-entry-open`.
+    This scene is about the TRANSCRIPT — that a typed turn lands in it beside the spoken ones, with
+    the box under it and the bar, switch and all, still above the big controls rather than over
+    them. What the box looks like at idle, focused, is `26-voice-composer`.
     """
     driver.click("talk")
     driver.page.wait_for_function(
         "() => window.__text('talk-label') === 'Listening'", timeout=10_000
     )
-    driver.click("text-entry")
-    driver.page.wait_for_function("() => window.__visible('compose-text')", timeout=5_000)
     driver.page.fill("#compose-text", "and 9c07d3e — did that land on integration")
     driver.click("send-text")
     driver.page.wait_for_function(
@@ -2349,37 +2348,34 @@ def _act_control_bar_bottom(driver: Driver) -> None:
     driver.settle(300)
 
 
-def _act_text_entry_open(driver: Driver) -> None:
-    """`#59 text-entry-button`: the bar CONVERTED into a text field.
+def _act_voice_composer(driver: Driver) -> None:
+    """`#241 voice-composer`: the call's view with its message box focused and a draft in it.
 
-    The subject here is the bar itself, not the transcript — whether one strip really holds a
-    usable field, a Send, and the toggle that got you here, on a 375px phone. The call underneath
-    is incidental and is started only because the field refuses to send without one.
+    The owner's report was that typing took the Voice/Channel switch away: `#59 text-entry-button`
+    converted the whole bar into a text field. The subject here is the replacement — the box at the
+    foot of the transcript, as the channel's is, with the bar left exactly as it rests. Taken at
+    IDLE and with the box focused, because clicking into it and writing must open nothing: the
+    typed conversation starts on the first send, not on the focus.
     """
     driver.load(with_token=True)
     driver.page.wait_for_function("() => window.__visible('control-pane')", timeout=10_000)
-    driver.click("talk")
-    driver.page.wait_for_function(
-        "() => window.__text('talk-label') === 'Listening'", timeout=10_000
-    )
-    driver.click("text-entry")
-    driver.page.wait_for_function("() => window.__visible('compose-text')", timeout=5_000)
-    driver.page.fill("#compose-text", "summarize the last hour")
+    driver.page.click("#compose-text")
+    driver.page.keyboard.type("summarize the last hour")
     driver.settle(300)
 
 
 def _act_canned_prompts(driver: Driver) -> None:
     """`#60 canned-prompt-buttons`: the bar packed, with the tray of prompts open above it.
 
-    Leaves text entry first, because the scene before this one is in it. The subject is PACKING —
-    gear, Type, Prompts and the switch on one strip, and the tray hanging above it — and the
-    iphone-se profile is the frame that answers whether that survives a short, narrow phone.
+    The subject is PACKING — gear, Prompts, Read new and the switch on one strip, and the tray
+    hanging above it — and the iphone-se profile is the frame that answers whether that survives a
+    short, narrow phone. (Type was on the strip too until `#241 voice-composer` moved writing into
+    the transcript.)
 
     The tray is opened here rather than left shut because it is the half no fake DOM can check: it
     is absolutely positioned, and whether an out-of-flow panel lands over the transcript or off the
     side of a 375px screen is a question only a layout engine has an answer to.
     """
-    driver.click("text-entry")
     driver.page.wait_for_function("() => window.__visible('view-switch')", timeout=5_000)
     driver.click("prompts-open")
     driver.page.wait_for_function("() => window.__visible('canned-blockers')", timeout=5_000)
@@ -2452,7 +2448,7 @@ DESK_SWITCH_CORNER = (
 
 
 def _act_desktop_dock_call(driver: Driver) -> None:
-    """`#218 desktop-dock`: the dock during a live call on a desk — Type, Prompts and Gist on the bar,
+    """`#218 desktop-dock`: the dock during a live call on a desk — Prompts and Gist on the bar,
     Sound, Clear, Hang up and Listening beside it."""
     driver.load(with_token=True)
     driver.page.wait_for_function("() => window.__visible('control-pane')", timeout=10_000)
@@ -3390,11 +3386,11 @@ SCENES: tuple[Scene, ...] = (
     ),
     Scene(
         name="23-typed-turn",
-        what="a turn typed into the control bar during a live call, beside the spoken ones",
+        what="a turn typed into the call's message box during a live call, beside the spoken ones",
         act=_act_typed_turn,
         expect=(
             (
-                "the field and its Send are really on screen",
+                "the box and its Send are really on screen",
                 "window.__visible('compose-text') && window.__visible('send-text')",
             ),
             (
@@ -3402,15 +3398,17 @@ SCENES: tuple[Scene, ...] = (
                 "[...document.querySelectorAll('#transcript > li.mine .body')]"
                 ".some((n) => (n.textContent || '').includes('9c07d3e'))",
             ),
-            # THE claim no fixture can make. A fourth band in the dock competes with the transcript
-            # on a 375x667 phone, and the failure mode is not "it looks cramped" -- it is the
-            # bar overlapping the controls the reader is trying to hit. Measured, not eyeballed.
+            # THE claim no fixture can make. The box is in the transcript now, and the failure mode
+            # is not "it looks cramped" -- it is the box under the dock, or the bar overlapping the
+            # controls the reader is trying to hit. Measured, not eyeballed.
             (
-                "the bar carrying the field sits ABOVE the big controls (on a desk, beside them), "
-                "not over them",
+                "the box sits above the big controls, and the bar, switch and all, above them too "
+                "(on a desk, beside them), not over them",
                 "(() => { const b = document.getElementById('control-bar').getBoundingClientRect(); "
                 "const p = document.getElementById('control-pane').getBoundingClientRect(); "
-                f"return b.height > 0 && {BAR_CLEAR_OF_PANE_JS}; }})()",
+                "const f = document.getElementById('compose-text').getBoundingClientRect(); "
+                "return f.bottom <= Math.min(b.top, p.top) + 1 && window.__visible('view-switch') "
+                f"&& b.height > 0 && {BAR_CLEAR_OF_PANE_JS}; }})()",
             ),
             (
                 "...and it did not push the transcript off the screen",
@@ -3481,53 +3479,46 @@ SCENES: tuple[Scene, ...] = (
         ),
     ),
     Scene(
-        name="26-text-entry-open",
-        what="the control bar converted into a text field, with the Type toggle ON",
-        act=_act_text_entry_open,
+        name="26-voice-composer",
+        what="the call's view with its message box focused and a draft in it, and the bar as it rests",
+        act=_act_voice_composer,
         expect=(
             (
-                "the bar became a field with a Send beside it",
-                "window.__visible('compose-text') && window.__visible('send-text')",
-            ),
-            # The conversion, stated as the disappearance it is: the switch and the gear are not
-            # squeezed or scrolled out of sight, they are gone for as long as the mode is on.
-            (
-                "the rest of the bar got out of the way",
-                "!window.__visible('view-switch') && !window.__visible('open-settings')",
-            ),
-            (
-                "the toggle is ON and is the way back out",
-                "window.__visible('text-entry') && "
-                "document.getElementById('text-entry').getAttribute('aria-pressed') === 'true'",
-            ),
-            # THE geometry claim, and the reason this is a photograph rather than a fixture test:
-            # the whole composer has to fit INSIDE the one strip the bar already occupied, on a
-            # 375px phone. A field that overflows it is a second band by another name.
-            (
-                "the whole composer fits inside the bar it converted",
-                "(() => { const b = document.getElementById('control-bar').getBoundingClientRect(); "
+                "the box and its Send are on screen, at the foot of the transcript",
+                "(() => { const s = document.getElementById('scroll-area').getBoundingClientRect(); "
                 "const f = document.getElementById('compose-text').getBoundingClientRect(); "
-                "const s = document.getElementById('send-text').getBoundingClientRect(); "
-                "return f.width > 60 && f.left >= b.left - 1 && s.right <= b.right + 1 && "
-                "f.top >= b.top - 1 && s.bottom <= b.bottom + 1; })()",
+                "const b = document.getElementById('send-text').getBoundingClientRect(); "
+                "return window.__visible('compose-text') && window.__visible('send-text') && "
+                "f.top >= s.top - 1 && b.bottom <= s.bottom + 1; })()",
             ),
             (
-                "the call is untouched by the mode change",
-                "window.__text('talk-label') === 'Listening'",
+                "the box has the focus and the draft",
+                "document.activeElement === document.getElementById('compose-text') && "
+                "document.getElementById('compose-text').value === 'summarize the last hour'",
+            ),
+            # The owner's report, stated as the thing that must not happen: the switch and the gear
+            # going away while you write. They are on the bar, where they rest.
+            (
+                "the switch and the gear are still on the bar while the box is focused",
+                "window.__visible('view-switch') && window.__visible('open-settings')",
+            ),
+            (
+                "clicking into the box and writing opened nothing",
+                "!window.__visible('hang-up') && window.__text('talk-label') !== 'Listening'",
             ),
         ),
     ),
     Scene(
         name="27-canned-prompts",
         what=(
-            "the control bar packed: gear, Type, Prompts, Read new and the view switch, "
+            "the control bar packed: gear, Prompts, Read new and the view switch, "
             "tray open above it"
         ),
         act=_act_canned_prompts,
         expect=(
             (
                 "every button the bar has is on it at once",
-                "['open-settings', 'text-entry', 'prompts-open', 'read-new', "
+                "['open-settings', 'prompts-open', 'read-new', "
                 "'view-switch'].every((id) => window.__visible(id))",
             ),
             (
@@ -4052,7 +4043,7 @@ SCENES: tuple[Scene, ...] = (
     ),
     Scene(
         name="40-desktop-dock-call",
-        what="the dock on a desk during a live call: Type and Prompts beside Sound, Clear, Hang up, Listening",
+        what="the dock on a desk during a live call: Prompts and Gist beside Sound, Clear, Hang up, Listening",
         act=_act_desktop_dock_call,
         profiles=DESKTOP_PROFILES,
         expect=(
@@ -4061,9 +4052,9 @@ SCENES: tuple[Scene, ...] = (
             DESK_CONTROL_SIZES,
             DESK_SWITCH_CORNER,
             (
-                "Sound, Clear, Hang up and Listening, left to right, with Type and Prompts on the bar",
+                "Sound, Clear, Hang up and Listening, left to right, with Prompts on the bar",
                 pane_reads_js("speaker,clear-view,hang-up,talk")
-                + " && window.__visible('text-entry') && window.__visible('prompts-open')",
+                + " && window.__visible('prompts-open') && window.__visible('read-new')",
             ),
             (
                 "the dock's controls are inside the transcript's column and overlap nothing",
@@ -4872,9 +4863,11 @@ def check_state_controls() -> list[str]:
             "transcript or overlapping the controls' can be answered at all. `#58 control-bar` "
             "added the bar in BOTH of its homes, because 'directly above the big buttons' is a "
             "measurement and nothing without a layout engine has an opinion about it, and `#59 "
-            "text-entry-button` added the bar converted into a text field, and `#60 "
+            "text-entry-button` added the bar converted into a text field (which `#241 "
+            "voice-composer` replaced with the call's view and its message box focused, the switch "
+            "still on the bar), and `#60 "
             "canned-prompt-buttons` added the bar with every button it has on it at once -- "
-            "whether a whole composer, or five controls, fit inside one strip on a 375px phone "
+            "whether a box and its switch, or five controls, fit on a 375px phone "
             "is the same kind of question, and no fixture can answer it. `#44 live-push` added "
             "the one where a row appears because the SERVER said so rather than because the page "
             "asked, and `#46 conversation-replay` the one where a resumed call admits its "
@@ -5018,9 +5011,10 @@ def check_state_controls() -> list[str]:
         # of, and `topbar` is the row that is supposed to disappear underneath it.
         "24-control-bar-top": ("scroll-area", "topbar"),
         "25-control-bar-bottom": ("control-pane", "topbar"),
-        # `#59 text-entry-button`. `view-switch` is the conversion -- the rest of the bar getting
-        # out of the way -- and `send-text` is the geometry: the composer inside the bar's own box.
-        "26-text-entry-open": ("view-switch", "send-text"),
+        # `#241 voice-composer`. `view-switch` is the owner's report -- the switch must stay on the
+        # bar while the box is focused -- and `send-text` is the geometry: the box at the foot of the
+        # transcript, inside the list rather than under the dock.
+        "26-voice-composer": ("view-switch", "send-text"),
         # `#60 canned-prompt-buttons`. `prompts-tray` is the tray really being open, `control-bar`
         # is the geometry -- nothing clipped past the edge, still one strip rather than two rows,
         # and the panel above it rather than in it.
@@ -5126,6 +5120,7 @@ def check_state_controls() -> list[str]:
         "Call ended": "the seam is labelled 'new conversation'",
         "conversation-state": "the state moved onto #status-line as a data attribute",
         "hangup-label": "Hang up is absent, not relabelled, when there is no call",
+        "text-entry": "`#241 voice-composer` replaced the Type toggle with a box in the transcript",
     }
     for scene in SCENES:
         for description, expression in scene.expect:
@@ -5556,7 +5551,7 @@ SELF_TEST_CHECKS = (
     "the older-step state is pinned to the anchor holding, not to the list being longer",
     "the typed-turn state is pinned to the dock geometry, not just to the field being up",
     "both control-bar states are pinned to where the bar IS, not to the bar existing",
-    "the text-entry state is pinned to the composer fitting inside the bar it converted",
+    "the voice-composer state is pinned to the switch staying on the bar beside the focused box",
     "the packed-bar state is pinned to nothing being clipped, not to the buttons existing",
     "the armed-pull state is pinned to the channel still having history above the reader",
     "dark is the default theme, and both schemes stay capturable",

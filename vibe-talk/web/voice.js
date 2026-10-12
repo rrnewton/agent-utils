@@ -214,6 +214,9 @@ let statusTimer = null;
 // itself (see `#channel-composer` in web/voice.css), so the chips float over that room and not over
 // the box being typed in. That room is at the foot of the scrolled content, so a reader parked at
 // the newest line would be left short of it whenever it grew: keep that reader at the foot.
+// `#241 voice-composer` gave the call's message box the same room, so the same holds on the call's
+// view: a long turn arriving folded brings up "Expand all", the room grows by the chip, and a
+// reader following the call would otherwise be left a chip short of the foot and stop following.
 if (typeof window.ResizeObserver === "function") {
   new window.ResizeObserver(([entry]) => {
     const height = entry.contentRect.height;
@@ -221,8 +224,9 @@ if (typeof window.ResizeObserver === "function") {
     // `#221 read-modes`. A reader just landed on a thread's first unread is reading that, however near
     // the end of the list it is: the chips changed because the entry opened the message's fold.
     const landed = currentScreen === "main" && currentView === "discord" && entryLandingHolds();
-    // `#243 filter-keeps-selection`: nor one whose message a filter change holds in place.
-    const pinned = !landed && currentScreen === "main" && currentView === "discord" && followsNewest(area);
+    // `#243 filter-keeps-selection`: nor one whose message a filter change holds in place. `#241 voice-composer`:
+    // the call's transcript follows too, not only the channel.
+    const pinned = !landed && currentScreen === "main" && followsNewest(area);
     el("frame-body").style.setProperty(
       "--scroll-tools-clearance", height > 0 ? `calc(${height}px + 0.5rem)` : "0px"
     );
@@ -3905,7 +3909,11 @@ function sendTyped() {
   heldTurn = said;
   renderControls();
   if (session.socket) {
-    setStatus("Your message goes as soon as the call is connected.");
+    setStatus(
+      session.chat
+        ? "Opening a typed conversation — your message goes as soon as it is open."
+        : "Your message goes as soon as the call is connected."
+    );
     return false;
   }
   return guard(start)({ chat: true }).then(() => {

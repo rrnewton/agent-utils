@@ -24555,6 +24555,42 @@ test("the floating chips keep their height clear under the composer, so they nev
     "nothing measures the chips any more");
 });
 
+test("ON THE CALL'S VIEW TOO, the chips' room growing under the box keeps a following reader at the foot", async () => {
+  // `#241 voice-composer`. The call's box keeps the same room for the chips as the channel's does,
+  // at the foot of the scrolled content. A long turn arrives folded and brings up "Expand all"; the
+  // room grows by the chip; a reader following the call is left a chip short of the foot, past the
+  // slack, and stops following — the next turns are counted as "new" instead of followed. The page
+  // re-pins a reader who was at the foot when the room changes, as it already did on the channel.
+  // The fixture lays out no CSS, so the room is modelled where the browser makes it: the moment the
+  // page writes `--scroll-tools-clearance`, the box grows by that much.
+  const run = async (script) => {
+    const page = newPage(new Map(), script, (p) => p.enableResizeObserver());
+    await startTalking(page);
+    const area = fillTranscript(page);
+    assert.ok(atBottomOf(area), "the premise: the reader is following the call");
+    const box = page.el("voice-composer");
+    const style = page.el("frame-body").style;
+    const write = style.setProperty;
+    style.setProperty = (name, value) => {
+      write(name, value);
+      if (name === "--scroll-tools-clearance" && value !== "0px") box.textContent = "room ".repeat(CHARS_PER_LINE * 3);
+    };
+    // The chip row with a chip in it: the fixture nests nothing inside #scroll-tools, so its own
+    // text is its height.
+    page.el("scroll-tools").textContent = "Expand all";
+    page.resized(page.el("scroll-tools"));
+    assert.notEqual(style.getPropertyValue("--scroll-tools-clearance"), "0px", "the premise: the chips' room grew");
+    return atBottomOf(area);
+  };
+  assert.equal(await run(SCRIPT), true, "the chips' room grew and left the following reader short of the foot");
+  // THE CONTROL: the re-pin as it was, for the channel only. The reader is left short.
+  const control = await run(brokenScript(
+    'const pinned = !landed && currentScreen === "main" && atBottom(area);',
+    'const pinned = !landed && currentScreen === "main" && currentView === "discord" && atBottom(area);'
+  ));
+  assert.equal(control, false, "the model does not grow the room, so this test says nothing");
+});
+
 test("a thread opened from All is a filter of what All holds, with no request, and Back restores All", async () => {
   const page = await threadPage();
   page.el("channel-view-flat").click();
