@@ -22174,6 +22174,12 @@ let replyRouting = { thread: null, branch: null, unknown: false, note: "" };
 let replyScrollMark = null;
 /** The column the reply was opened from, whose list that place is in. `#229 desktop-two-column`. */
 let replyColumn = columns.main;
+/**
+ * Where the top of the row Reply was pressed on stood in the window, or null where there was no row
+ * to measure: where `placeReplyMessage` puts the message, on opening and on every resize after it.
+ * `#247 reply-continuity`.
+ */
+let replyFromTop = null;
 
 function rememberDraft() {
   if (!replyTarget) {
@@ -22244,6 +22250,7 @@ function openReply(messages, from = null) {
   // a height to open at. The title and the destination line can each take a second line, so they are
   // drawn before the message is placed against them.
   renderReplyDestination();
+  replyFromTop = fromTop;
   placeReplyMessage(fromTop);
 }
 
@@ -22654,13 +22661,47 @@ function placeReplyMessage(fromTop) {
     pane.style.height = `${height}px`;
     pane.style.setProperty("--reply-fit", `${height}px`);
   };
-  if (at + box.height < room) fit(at + box.height);
+  // A message that ends exactly at the room's foot is fitted too, to the room's own height. Nothing
+  // changes on screen, but a window that grows later then does not grow the conversation under it,
+  // which would have the browser pull the message down to the new foot before `refitReplyMessage`
+  // could keep its top.
+  if (at + box.height <= room + 0.5) fit(at + box.height);
   pane.scrollTop = offset + extra - at;
   // A scroll position is whole pixels and a row's edges need not be: the part of a pixel the scroll
   // left the message lower by is given to the conversation, rather than clipping the message's edge.
   if (pane.hasAttribute("data-fit")) {
     const over = row.getBoundingClientRect().bottom - pane.getBoundingClientRect().bottom;
     if (over > 0 && over < 2) fit(at + box.height + over);
+  }
+}
+
+/**
+ * The window changed size while Reply is up: made taller or shorter, or a phone turned, which also
+ * rewraps the message. The height `placeReplyMessage` gave the conversation was measured against
+ * the old room and the old wrapping, so left alone it would clip a message that grew, keep a
+ * conversation short of a room that grew, or leave the message under the foot of one that shrank.
+ * `#247 reply-continuity`.
+ *
+ * So the message is placed again, by the same rules and from the same place: where the row's top
+ * stood when Reply was pressed (`replyFromTop`). Its top goes back there whenever the room allows,
+ * the conversation ends at its foot with the box under it, and a room too short for that moves it
+ * up only as far as shows it. A phone turned on its side and back, or a window made shorter and
+ * then as it was, therefore ends where it began rather than wherever the short room left it. A
+ * reader who had scrolled back up the conversation away from it is brought back to it the same
+ * way: the message being answered is what a changed screen shows.
+ *
+ * A message taller than the room, with no height given, is left as the reader has it unless its top
+ * is in view: they may be part way down it, and nothing there was measured against the old room.
+ */
+function refitReplyMessage() {
+  if (currentScreen !== "reply") return;
+  const pane = el("reply-scroll");
+  const row = el("reply-target").children[0];
+  if (!row) return;
+  const paneTop = pane.getBoundingClientRect().top;
+  const top = row.getBoundingClientRect().top;
+  if (pane.hasAttribute("data-fit") || (top >= paneTop - 1 && top < paneTop + pane.clientHeight)) {
+    placeReplyMessage(replyFromTop);
   }
 }
 
@@ -26321,6 +26362,8 @@ if (typeof window.addEventListener === "function") {
     const decide = () => {
       columnsResizeDue = false;
       renderColumns();
+      // `#247 reply-continuity`. The reply screen's conversation was sized to the room it had.
+      refitReplyMessage();
     };
     if (typeof requestAnimationFrame === "function") requestAnimationFrame(decide);
     else decide();

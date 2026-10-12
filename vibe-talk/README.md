@@ -3768,12 +3768,20 @@ continuity as other transitions. Now:
   keeps its top, with the rest a scroll down, as long as its first third of a screen shows;
   otherwise it moves up just enough to show that. Where too little came before the message to fill
   the space above it, an empty room at the head of the conversation holds it in place.
+- **A resize places it again, from the same place.** A window made shorter or taller, or a phone
+  turned on its side and back, re-runs the same rules from where the row's top was when Reply was
+  pressed: in a short room the message moves up only as far as shows it over the box, and back at
+  the size Reply opened at it is where it began. A reader who had scrolled back up the conversation
+  is brought back to the message the same way. A phone's on-screen keyboard is not a resize in
+  Chrome on Android or Safari on iOS: there it pans the whole page over the screen, and the message
+  moves with everything else.
 - **A subtle tint**, the page colour with a little of the accent in it (one value per scheme), says
   this is Reply. Nothing else changes.
 
 Cancel, Back and Esc come back to exactly where the list was. Send still goes to the newest message,
 and `b` or the Bookmark chip brings you back. `make -C vibe-talk reply-continuity-browser` measures
-all of this in Chromium at 1280x800 and 412x915, at three text sizes.
+all of this in Chromium at 1280x800 and 412x915, at three text sizes, then resizes the window (and
+turns the phone) with Reply up, and sends a reply.
 
 ### Enter sends, in every message box, until you say otherwise
 

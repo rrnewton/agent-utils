@@ -26952,6 +26952,85 @@ test("`#247 reply-continuity`: with too little above it, the room over the earli
     "with the room deleted the message was still where it was, so this test cannot tell the two apart");
 });
 
+/** The window resized: the reply screen's conversation given `room`, and the resize event a browser fires. */
+async function resizeReplyRoom(page, room) {
+  page.el("reply-scroll").clientHeight = room;
+  await page.setDesk(page.wideDesk);
+}
+
+test("`#247 reply-continuity`: a resize while Reply is up places the message again where Reply put it", async () => {
+  // tests/reply_continuity_browser.py turns a phone on its side and back, and resizes a desk window,
+  // in Chromium.
+  const page = await continuityPage();
+  await replyFromRowAt(page, "12", 60);
+  const pane = page.el("reply-scroll");
+  let box = replyRow(page).getBoundingClientRect();
+  assert.equal(pane.getAttribute("data-fit"), "message", "the message did not fit to begin with, so this asks something else");
+  // A taller window: nothing moves, and the box stays under the message.
+  await resizeReplyRoom(page, REPLY_VIEWPORT_PX + 100);
+  let now = replyRow(page).getBoundingClientRect();
+  assert.ok(Math.abs(now.top - box.top) <= 1 && Math.abs(pane.clientHeight - now.bottom) <= 1,
+    `a taller window moved the message from ${box.top} to ${now.top}, or left a gap over the box`);
+  // Rewrapped longer, as a phone turned to a narrower width rewraps it: the top stays, and the
+  // conversation ends at the new foot rather than clipping it.
+  const words = replyRow(page).descendants().find((node) => String(node.textContent).startsWith("message 12: short"));
+  words.textContent = `${words.textContent} ${"and more words, rewrapped. ".repeat(4)}`;
+  const taller = replyRow(page).getBoundingClientRect();
+  assert.ok(taller.height > box.height, "the message did not grow, so this asks nothing");
+  await resizeReplyRoom(page, REPLY_VIEWPORT_PX + 100);
+  now = replyRow(page).getBoundingClientRect();
+  assert.ok(Math.abs(now.top - box.top) <= 1, `the rewrapped message's top moved from ${box.top} to ${now.top}`);
+  assert.equal(pane.getAttribute("data-fit"), "message");
+  assert.ok(Math.abs(pane.clientHeight - now.bottom) <= 1, `the conversation ends at ${pane.clientHeight}, the rewrapped message at ${now.bottom}`);
+  // A room made shorter than the message's foot: it moves up only as far as shows it over the box.
+  box = now;
+  await resizeReplyRoom(page, box.bottom - 10);
+  now = replyRow(page).getBoundingClientRect();
+  assert.ok(now.bottom <= pane.clientHeight + 1, `after the room shrank the message ends at ${now.bottom}, under the box at ${pane.clientHeight}`);
+  assert.ok(Math.abs(now.top - (pane.clientHeight - box.height)) <= 1, `the message moved further up than it had to: ${now.top}`);
+  // ...and the room as it was again, as a phone turned back is: back where Reply put it, not left
+  // where the short room had to.
+  await resizeReplyRoom(page, REPLY_VIEWPORT_PX + 100);
+  now = replyRow(page).getBoundingClientRect();
+  assert.ok(Math.abs(now.top - box.top) <= 1, `the room as it was left the message at ${now.top}, not back at ${box.top}`);
+  assert.equal(pane.getAttribute("data-fit"), "message");
+  assert.ok(Math.abs(pane.clientHeight - now.bottom) <= 1, `the conversation ends at ${pane.clientHeight}, the message at ${now.bottom}`);
+
+  // A message too tall for the room it opened in, in a room grown to hold it: its top where it was,
+  // and the box directly under it.
+  const tall = await continuityPage(continuityChannel(24, "12"));
+  await replyFromRowAt(tall, "12", 40);
+  const tallPane = tall.el("reply-scroll");
+  assert.equal(tallPane.hasAttribute("data-fit"), false, "the message fitted to begin with, so this asks nothing");
+  await resizeReplyRoom(tall, Math.ceil(replyRow(tall).getBoundingClientRect().bottom) + 100);
+  const tallBox = replyRow(tall).getBoundingClientRect();
+  assert.ok(Math.abs(tallBox.top - 40) <= 1, `the grown room moved the message's top from 40 to ${tallBox.top}`);
+  assert.ok(Math.abs(tallPane.clientHeight - tallBox.bottom) <= 1,
+    `the grown room left the box at ${tallPane.clientHeight}, under the message's foot at ${tallBox.bottom}`);
+
+  // Read back up the conversation, the message out of view: a changed screen shows the message being
+  // answered again, where Reply put it, with the box under it.
+  const away = await continuityPage();
+  await replyFromRowAt(away, "12", 60);
+  const awayPane = away.el("reply-scroll");
+  awayPane.scrollTop = 0;
+  assert.ok(replyRow(away).getBoundingClientRect().top >= awayPane.clientHeight, "the message is still in view, so this asks nothing");
+  await resizeReplyRoom(away, REPLY_VIEWPORT_PX + 100);
+  const awayBox = replyRow(away).getBoundingClientRect();
+  assert.ok(Math.abs(awayBox.top - 60) <= 1 && Math.abs(awayPane.clientHeight - awayBox.bottom) <= 1,
+    `the message out of view was not brought back over the box: it is at ${awayBox.top}-${awayBox.bottom}, the conversation ends at ${awayPane.clientHeight}`);
+
+  // THE CONTROL: without the refit, the shorter room clips the message under the box.
+  const control = newPage(new Map(), brokenScript("      refitReplyMessage();\n", ""));
+  await signIn(control);
+  await showDiscord(control, continuityChannel());
+  await replyFromRowAt(control, "12", 60);
+  const before = replyRow(control).getBoundingClientRect().bottom;
+  await resizeReplyRoom(control, before - 10);
+  assert.ok(replyRow(control).getBoundingClientRect().bottom > control.el("reply-scroll").clientHeight + 1,
+    "with the refit deleted the message still showed whole, so this test cannot tell the two apart");
+});
+
 test("`#247 reply-continuity`: the message is the channel's row, at the reader's text size, with the accent edge", async () => {
   // The fixture lays out no type, so this holds the RULES to it; tests/reply_continuity_browser.py
   // measures the computed sizes in Chromium at several text sizes.

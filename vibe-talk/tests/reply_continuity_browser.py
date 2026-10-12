@@ -23,6 +23,13 @@ title bar will be, half under the list's top edge, low on the screen, and taller
   screen it keeps its top and the box is still on screen -> Cancel, and the list is back where it
   was, to the pixel.
 
+Then, at 100%: Reply up while the phone is turned and turned back, or the desk window is made
+shorter, taller, narrower and as it was, and after each the message is placed again where
+Reply put it (never above the conversation, the box directly under it where it fits, its top back
+where the row's was at the height Reply opened at, never moved down when the window shrinks) ->
+Reply and Send, and the reply leaves with its
+reference and the list is at its newest, untinted.
+
 Then once more in the light scheme, to measure the tint there and keep a picture of it. No
 horizontal overflow and no page error at any step.
 
@@ -435,6 +442,92 @@ def continuity_walk(walk: Walk, scales: tuple[int, ...]) -> None:
         reply_case(walk, TALL, top + height * 0.2, "tall", scale)
 
 
+def open_reply(walk: Walk, index: int, y: float, case: str) -> Measured:
+    """Scroll message `index`'s row to `y` and press its Reply by the button itself; the reply screen, measured."""
+    walk.place(index, y)
+    walk.page.evaluate("(selector) => document.querySelector(selector).click()",
+                       f"#discord-log > li[data-id='{message_id(index)}'] .reply-button")
+    walk.wait_for("() => !document.getElementById('screen-reply').hidden", f"{case}: the reply screen did not open")
+    walk.settled()
+    return walk.measure(index)
+
+
+def resize_case(walk: Walk, sizes: tuple[tuple[int, int], ...]) -> None:
+    """A window resized, or a phone turned and back, while Reply is up: the message placed again where Reply put it.
+
+    After each size the message is never above the conversation's top; where it fits, the
+    conversation ends at its foot with the box directly under it (nothing clipped, no gap); at a
+    height at least the one Reply opened at, its top is back where the row's was; and a window made
+    shorter never moves it down.
+    """
+    index = 30
+    list_box = walk.measure(index).box("list")
+    before = open_reply(walk, index, list_box["top"] + list_box["height"] * 0.4, "resize")
+    walk.check(before.found["fit"] == "message", f"resize: the message did not fit to begin with: {before.found}")
+    opened = walk.page.viewport_size
+    assert opened is not None
+    first = before.box("target")["top"]
+    path: list[str] = []
+    for width, height in sizes:
+        was = walk.page.viewport_size
+        assert was is not None
+        walk.page.set_viewport_size({"width": width, "height": height})
+        walk.settled()
+        walk.page.wait_for_timeout(120)
+        after = walk.measure(index)
+        target, pane, text = after.box("target"), after.box("pane"), after.box("text")
+        old_target, old_pane = before.box("target"), before.box("pane")
+        size = f"{was['width']}x{was['height']} -> {width}x{height}"
+        walk.check(target["top"] >= pane["top"] - 1, f"resize {size}: the message is above the conversation: {target} {pane}")
+        if after.found["fit"] == "message":
+            walk.check(abs(target["bottom"] - pane["bottom"]) <= 1,
+                       f"resize {size}: the conversation does not end at the message's foot: {target} {pane}")
+        else:
+            walk.check(target["height"] > pane["height"],
+                       f"resize {size}: a message the room holds was left unfitted: {target} {pane}")
+        walk.check(text["top"] >= pane["bottom"] - 1, f"resize {size}: the box is not under the conversation: {text} {pane}")
+        offset, old_offset = target["top"] - pane["top"], old_target["top"] - old_pane["top"]
+        if height >= opened["height"] and after.found["fit"] == "message":
+            walk.check(abs(target["top"] - first) <= 1,
+                       f"resize {size}: the message is at {target['top']:.1f}, not back where Reply put it ({first:.1f})")
+        if height < was["height"]:
+            walk.check(offset <= old_offset + 1, f"resize {size}: a shorter window moved the message down: {old_offset:.1f} -> {offset:.1f}")
+        walk.check(after.number("overflow") <= 0, f"resize {size}: the page scrolls sideways")
+        path.append(f"{width}x{height} top {target['top']:.1f} ({target['top'] - first:+.1f})")
+        before = after
+    walk.shot("resized")
+    walk.press("#reply-cancel")
+    walk.wait_for("() => !document.getElementById('screen-main').hidden", "resize: Cancel did not go back")
+    walk.settled()
+    walk.notes.append(f"resized on Reply, opened with the top at {first:.1f}: " + ", ".join(path))
+
+
+def send_case(walk: Walk) -> None:
+    """Send behaves as it did: the reply leaves with its reference, and the list is at its newest, untinted."""
+    index = 31
+    list_box = walk.measure(index).box("list")
+    open_reply(walk, index, list_box["top"] + list_box["height"] * 0.4, "send")
+    words = "on it, from the reply continuity check"
+    walk.page.fill("#reply-text", words)
+    sent = len(walk.api.replies)
+    walk.press("#reply-send")
+    walk.wait_for("() => !document.getElementById('screen-main').hidden", "send: Send did not go back to the list")
+    walk.wait_for(f"() => document.querySelectorAll('#discord-log > li[data-id]').length === {COUNT + 1}",
+                  "send: the sent reply never reached the list")
+    walk.settled()
+    walk.page.wait_for_timeout(200)
+    with walk.api.lock:
+        posted = list(walk.api.replies[sent:])
+    walk.check(len(posted) == 1 and posted[0].get("text") == words and posted[0].get("reply_to") == message_id(index),
+               f"send: what left the browser was {posted}")
+    after = walk.measure(index)
+    walk.check(after.number("listTop") >= after.number("listMax") - 2,
+               f"send: the list is at {after.number('listTop')}, not its newest ({after.number('listMax')})")
+    walk.check(after.text("tint") == after.text("page") or after.text("tint") == "rgba(0, 0, 0, 0)",
+               f"send: the tint outlived the reply screen: {after.text('tint')}")
+    walk.notes.append("Send posted the reply to its message and left the list at its newest")
+
+
 def light_walk(walk: Walk) -> None:
     """The light scheme: the tint is there too, and differs from the page; a picture of it."""
     page = walk.page
@@ -524,6 +617,15 @@ def main() -> int:
                     walk = Walk(page, api, phone, label, args.screenshots)
                     if scheme == "dark":
                         continuity_walk(walk, (100, 80, 130))
+                        # Back at the reader's own size for the rest: a phone turned and back, a
+                        # desk window made shorter, narrower and as it was.
+                        page.evaluate("() => { const s = document.getElementById('msg-scale'); s.value = '100'; "
+                                      "s.dispatchEvent(new Event('input', {bubbles: true})); }")
+                        walk.settled()
+                        turns = (((height, width), (width, height)) if phone else
+                                 ((width, height - 220), (width, height), (720, height), (width, height)))
+                        resize_case(walk, turns)
+                        send_case(walk)
                     else:
                         light_walk(walk)
                     check(not errors, f"{label}: the page threw: {errors}")
