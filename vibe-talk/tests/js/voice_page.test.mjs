@@ -37434,6 +37434,27 @@ test("`#240 reading-bookmark`: under Hide read, a bookmark on a read message old
   assert.equal(statusText(page), "Not in this list — Hide read is on.");
 });
 
+test("`#240 reading-bookmark`: Shift+B on a thread's card, in the Threads list or on the right, is left alone and writes nothing", async () => {
+  // A card is a thread, not a message, and holds none: there is nothing to put the line above, so the
+  // key is not taken, as Pin's is not.
+  const page = await threadPage();
+  await page.el("channel-view-threads").click();
+  await page.settle();
+  const card = page.el("thread-list").children[0];
+  await card.descendants().find((node) => node.className === "thread-open").focus();
+  const status = statusText(page);
+  let event = await press(page, focused(page), "B", { shiftKey: true });
+  assert.equal(event.defaulted, true, "Shift+B on a card in the Threads list was taken");
+  assert.equal(statusText(page), status, "Shift+B on a card said something");
+  const two = await threadPage();
+  await twoColumns(two);
+  const side = two.el("side-cards").children[0];
+  side.focus();
+  event = await press(two, side, "B", { shiftKey: true });
+  assert.equal(event.defaulted, true, "Shift+B on a card on the right was taken");
+  assert.deepStrictEqual([...page.bookmarkCalls, ...two.bookmarkCalls], [], "Shift+B on a card wrote a bookmark");
+});
+
 test("`#240 reading-bookmark`: in two columns the left draws the line, the right only on the anchor's thread, and b goes to the left", async () => {
   const { page } = await twoColumnServer();
   await threadBadge(rowWithId(page, "201")).click();
