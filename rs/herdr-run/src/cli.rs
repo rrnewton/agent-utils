@@ -170,9 +170,15 @@ type Parsed<T> = std::result::Result<T, ParseFailure>;
 ///   child a success -- and this one as an error; with the default action restored both read the
 ///   real status, and so do the processes either edition starts.
 ///
+/// * Which signals the caller left ignored is recorded, before anything changes a disposition and
+///   before any thread exists, so every child gets them ignored again (see
+///   [`crate::client::bounded_output`]): the C library takes signal 33 for itself when the first
+///   thread starts, and the other edition, which starts no thread, hands it on as it found it.
+///
 /// SIGINT is left as it was inherited, and closed standard descriptors were already reopened on
 /// `/dev/null` (inheritably) by the runtime before `main`.
 pub fn prepare_process() {
+    crate::client::record_inherited_ignored_signals();
     // SAFETY: `signal` with a constant disposition has no pointer arguments.
     unsafe {
         libc::signal(libc::SIGXFSZ, libc::SIG_IGN);

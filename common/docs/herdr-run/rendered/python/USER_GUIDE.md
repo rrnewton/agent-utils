@@ -173,7 +173,9 @@ hold `=` and a name never does. An entry with no `=`, or with nothing before its
 dropped; that includes `=A=1`, which some readers take for a variable named `=A`. Of two entries
 with one name the first is kept, where it stood, and nothing is reordered. A Herdr call then has
 `PATH` removed and `HOME` replaced, where it stands, by the home the account database reports (or
-added at the end when there was none).
+added at the end when there was none). A signal `herdr-run` was started with ignored is still
+ignored in each of them, except `SIGPIPE`, `SIGXFSZ`, and `SIGCHLD`, which start at their default
+actions.
 
 Quoted values in diagnostics (`program "curl" is not allowlisted`, `got "maybe"`) are written with
 printable ASCII as is, `\n`, `\r`, and `\t` as escapes, and every other character as `\u{hex}`,

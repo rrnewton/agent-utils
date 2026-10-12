@@ -160,6 +160,11 @@ def bounded_control_command(
     The child's environment is ``environ`` (this process's environment by default) put through
     :func:`child_environment`, always passed explicitly: a child never inherits the C library's
     environment array as it is, with its repeated names and entries without ``=``.
+
+    Signal dispositions are handed on as the interpreter holds them. It starts no thread, so the C
+    library never takes over a signal for its own use, and a signal herdr-run was started with
+    ignored is still ignored in the child -- except SIGPIPE and SIGXFSZ, which ``subprocess``
+    gives back their default actions, and SIGCHLD, which herdr-run itself resets at start-up.
     """
     argv = list(command)
     if any("\x00" in argument for argument in argv):

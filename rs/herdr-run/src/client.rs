@@ -25,6 +25,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -93,14 +94,31 @@ pub fn exit_status_code(status: ExitStatus) -> i32 {
 /// kernel cannot execute -- a script without a `#!` line, say -- fails with `Exec format error
 /// (os error 8)` exactly as it does in the other edition, instead of being handed to `/bin/sh`.
 /// Its environment is built by [`child_environment`], the rule both editions share.
+///
+/// Every signal this process was started with ignored is ignored again in the child, except
+/// SIGPIPE, SIGXFSZ, and SIGCHLD (see [`signals_kept_ignored`]). The C library takes signal 33 for
+/// its own use as soon as this process starts a thread, and a handler is reset to the default
+/// action across `exec`; without this, every child started after the first reader thread got
+/// signal 33 at its default action where the other edition's children keep it ignored.
 pub(crate) fn bounded_output(
     command: &mut Command,
     timeout: Duration,
 ) -> io::Result<BoundedOutput> {
+    let kept_ignored = signals_kept_ignored(INHERITED_IGNORED_SIGNALS.load(Ordering::Relaxed));
+    bounded_output_keeping(command, timeout, kept_ignored)
+}
+
+/// [`bounded_output`], with the signals the child gets ignored again given as a mask.
+fn bounded_output_keeping(
+    command: &mut Command,
+    timeout: Duration,
+    kept_ignored: u64,
+) -> io::Result<BoundedOutput> {
     command.stdout(Stdio::piped()).stderr(Stdio::piped());
     let plan = ExecPlan::new(command)?;
-    // SAFETY: `setsid`, `signal`, and `execve` are async-signal-safe, and `ExecPlan::exec` makes
-    // no other call and allocates nothing: everything it passes was built before the fork.
+    // SAFETY: `setsid`, `signal`, `rt_sigaction`, and `execve` are async-signal-safe, and neither
+    // `ignore_signals` nor `ExecPlan::exec` makes any other call or allocates: everything they
+    // pass was built before the fork.
     unsafe {
         command.pre_exec(move || {
             if libc::setsid() < 0 {
@@ -109,6 +127,7 @@ pub(crate) fn bounded_output(
             if libc::signal(libc::SIGXFSZ, libc::SIG_DFL) == libc::SIG_ERR {
                 return Err(io::Error::last_os_error());
             }
+            ignore_signals(kept_ignored);
             Err(plan.exec())
         });
     }
@@ -240,6 +259,138 @@ pub(crate) fn child_environment<E: AsRef<[u8]>>(
         }
     }
     variables
+}
+
+/// Signals this process was started with ignored, as a mask (bit `N - 1` for signal `N`).
+///
+/// Recorded once by [`record_inherited_ignored_signals`], before any thread exists, and read by
+/// every child started afterwards. Zero until then, so a test that drives [`crate::cli::main`]
+/// in-process restores nothing.
+static INHERITED_IGNORED_SIGNALS: AtomicU64 = AtomicU64::new(0);
+
+/// The highest signal number on Linux.
+const LAST_SIGNAL: libc::c_int = 64;
+
+/// Which signals ignored at start-up a child gets ignored again, as a mask.
+///
+/// Every one of them, except the three every child of either edition gets at its default action:
+/// SIGPIPE and SIGXFSZ, which both runtimes ignore for themselves and reset for their children,
+/// and SIGCHLD, which herdr-run resets for itself at start-up. SIGKILL and SIGSTOP can never be
+/// ignored.
+#[must_use]
+pub(crate) fn signals_kept_ignored(ignored_at_start: u64) -> u64 {
+    let reset = [
+        libc::SIGPIPE,
+        libc::SIGXFSZ,
+        libc::SIGCHLD,
+        libc::SIGKILL,
+        libc::SIGSTOP,
+    ]
+    .iter()
+    .fold(0_u64, |mask, signal| mask | signal_bit(*signal));
+    ignored_at_start & !reset
+}
+
+fn signal_bit(signal: libc::c_int) -> u64 {
+    1_u64 << (signal - 1)
+}
+
+/// Record which signals this process was started with ignored; called before any thread exists.
+///
+/// The C library refuses to report or change the signals it keeps for itself (32 and 33 on glibc),
+/// so they are read with the `rt_sigaction` system call directly.
+pub(crate) fn record_inherited_ignored_signals() {
+    let mut mask = 0_u64;
+    for signal in 1..=LAST_SIGNAL {
+        if disposition_is_ignored(signal) {
+            mask |= signal_bit(signal);
+        }
+    }
+    INHERITED_IGNORED_SIGNALS.store(mask, Ordering::Relaxed);
+}
+
+/// The kernel's `struct sigaction` on the architectures whose layout this declares.
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+#[repr(C)]
+struct KernelSigaction {
+    handler: libc::sighandler_t,
+    flags: libc::c_ulong,
+    restorer: libc::sighandler_t,
+    mask: u64,
+}
+
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+fn disposition_is_ignored(signal: libc::c_int) -> bool {
+    let mut current = KernelSigaction {
+        handler: libc::SIG_DFL,
+        flags: 0,
+        restorer: 0,
+        mask: 0,
+    };
+    // SAFETY: a query: no new action, and `current` is a valid kernel `struct sigaction` whose
+    // signal set is the eight bytes the size argument names.
+    let status = unsafe {
+        libc::syscall(
+            libc::SYS_rt_sigaction,
+            signal,
+            std::ptr::null::<KernelSigaction>(),
+            &mut current as *mut KernelSigaction,
+            std::mem::size_of::<u64>(),
+        )
+    };
+    status == 0 && current.handler == libc::SIG_IGN
+}
+
+/// Elsewhere through the C library, which cannot see the signals it keeps for itself.
+#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+fn disposition_is_ignored(signal: libc::c_int) -> bool {
+    // SAFETY: a query through a zeroed, valid `sigaction`.
+    unsafe {
+        let mut current: libc::sigaction = std::mem::zeroed();
+        libc::sigaction(signal, std::ptr::null(), &mut current) == 0
+            && current.sa_sigaction == libc::SIG_IGN
+    }
+}
+
+/// Ignore every signal in `mask`; called in the child between `fork` and `exec`.
+///
+/// Async-signal-safe: one `rt_sigaction` (or `sigaction`) per signal and nothing else. A signal
+/// that cannot be ignored is left as it is.
+fn ignore_signals(mask: u64) {
+    for signal in 1..=LAST_SIGNAL {
+        if mask & signal_bit(signal) != 0 {
+            ignore_signal(signal);
+        }
+    }
+}
+
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+fn ignore_signal(signal: libc::c_int) {
+    let action = KernelSigaction {
+        handler: libc::SIG_IGN,
+        flags: 0,
+        restorer: 0,
+        mask: 0,
+    };
+    // SAFETY: `action` is a valid kernel `struct sigaction` with an eight-byte signal set; the
+    // old action is not asked for.
+    unsafe {
+        libc::syscall(
+            libc::SYS_rt_sigaction,
+            signal,
+            &action as *const KernelSigaction,
+            std::ptr::null_mut::<KernelSigaction>(),
+            std::mem::size_of::<u64>(),
+        );
+    }
+}
+
+#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+fn ignore_signal(signal: libc::c_int) {
+    // SAFETY: `signal` with a constant disposition has no pointer arguments.
+    unsafe {
+        libc::signal(signal, libc::SIG_IGN);
+    }
 }
 
 /// The search path a child gets when its environment names none, as in the other edition.
@@ -1444,6 +1595,60 @@ mod tests {
             ],
         );
         assert_eq!(received, joined(&expected));
+    }
+
+    fn signal_mask(row: &Value) -> u64 {
+        row.as_array()
+            .expect("signal numbers")
+            .iter()
+            .map(|signal| libc::c_int::try_from(signal.as_i64().unwrap()).unwrap())
+            .fold(0, |mask, signal| mask | signal_bit(signal))
+    }
+
+    /// Which signals ignored at start-up a child gets ignored again, row by row.
+    #[test]
+    fn golden_child_signals() {
+        let document = child_cases();
+        for row in document["signals"].as_array().expect("rows") {
+            assert_eq!(
+                signals_kept_ignored(signal_mask(&row[0])),
+                signal_mask(&row[1]),
+                "{row}"
+            );
+        }
+    }
+
+    fn child_ignored_mask(kept_ignored: u64) -> u64 {
+        let mut command = Command::new("/bin/cat");
+        command.arg("/proc/self/status");
+        let output =
+            bounded_output_keeping(&mut command, Duration::from_secs(10), kept_ignored).unwrap();
+        let status = String::from_utf8(output.stdout).unwrap();
+        let line = status
+            .lines()
+            .find(|line| line.starts_with("SigIgn:"))
+            .expect("a SigIgn line");
+        u64::from_str_radix(line.trim_start_matches("SigIgn:").trim(), 16).unwrap()
+    }
+
+    /// A signal recorded as ignored at start-up is ignored again in the child, signal 33
+    /// included, whatever this process holds it with by then: the C library took 33 for itself
+    /// when this test process started its threads.
+    #[test]
+    fn a_child_gets_the_recorded_ignored_signals_back() {
+        let wanted = signal_bit(libc::SIGHUP) | signal_bit(33) | signal_bit(libc::SIGUSR2);
+        assert_eq!(child_ignored_mask(wanted) & wanted, wanted);
+        // Nothing recorded, nothing added: the child holds 33 as this process hands it on.
+        if !disposition_is_ignored(33) {
+            assert_eq!(child_ignored_mask(0) & signal_bit(33), 0);
+        }
+    }
+
+    /// The query sees what the runtime set: the standard library ignores SIGPIPE for itself.
+    #[test]
+    fn dispositions_are_read_from_the_kernel() {
+        assert!(disposition_is_ignored(libc::SIGPIPE));
+        assert!(!disposition_is_ignored(libc::SIGTERM));
     }
 
     fn scratch_directory(label: &str) -> PathBuf {

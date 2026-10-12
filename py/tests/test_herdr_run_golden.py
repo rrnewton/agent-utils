@@ -14,8 +14,8 @@ that changes in one edition fails the other edition's suite until both agree aga
   values or errors, including server start-up;
 - ``record_cases.json``: reap scope, evidence folded from run records, session-cache loading
   and the exact bytes a cache store writes;
-- ``child_cases.json``: the environment every process either edition starts is handed, built by
-  the shared rule;
+- ``child_cases.json``: what every process either edition starts is handed: its environment,
+  built by the shared rule, and which signals the caller left ignored stay ignored in it;
 - ``policy_cases.json``: configuration loading and command admission, including ``~`` expanded
   before the policy judges an argument, names refused for holding an invisible character or any
   other character a name may not contain, the
@@ -31,7 +31,7 @@ import re
 import subprocess
 import sys
 import unicodedata
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from pathlib import Path
 from typing import cast
 
@@ -682,6 +682,73 @@ def test_child_environment(row: list[object]) -> None:
     assert joined == [_item(item) for item in cast(list[object], expected)]
     # Applying the rule to its own result changes nothing.
     assert child_environment(joined) == built
+
+
+#: ``rt_sigaction`` on the two architectures whose kernel ``struct sigaction`` is four eight-byte
+#: words (handler, flags, restorer, mask), which is all the helper below declares.
+_RT_SIGACTION = {"x86_64": 13, "aarch64": 134}
+
+
+def _handing_over(signals: Sequence[int]) -> Callable[[], None]:
+    """A ``preexec_fn`` that starts the child with exactly ``signals`` ignored, as a caller can.
+
+    Every other signal is first given its default action, so nothing this test process was
+    itself handed leaks into the case. Through the system call: the C library refuses to touch 32
+    and 33, which it keeps for itself, but a caller is free to leave them ignored, and ``exec``
+    keeps them so.
+    """
+    import ctypes
+
+    libc = ctypes.CDLL(None, use_errno=True)
+    number = _RT_SIGACTION[os.uname().machine]
+    default = (ctypes.c_uint64 * 4)(0, 0, 0, 0)  # SIG_DFL, no flags, no restorer, empty mask
+    ignore = (ctypes.c_uint64 * 4)(1, 0, 0, 0)  # SIG_IGN
+
+    def hand_over() -> None:
+        for signal_number in range(1, 65):
+            if signal_number not in (9, 19):
+                libc.syscall(number, signal_number, default, None, 8)
+        for signal_number in signals:
+            if libc.syscall(number, signal_number, ignore, None, 8) != 0:
+                os._exit(97)
+
+    return hand_over
+
+
+@pytest.mark.skipif(
+    os.uname().machine not in _RT_SIGACTION, reason="the raw sigaction layout is not declared here"
+)
+@pytest.mark.parametrize("row", _rows(CHILD, "signals"), ids=repr)
+def test_child_signals(row: list[object]) -> None:
+    """Started with ``row[0]`` ignored, this edition's children have exactly ``row[1]`` ignored.
+
+    The interpreter starts no thread, so nothing takes a signal over; ``subprocess`` gives SIGPIPE
+    and SIGXFSZ back their default actions and start-up resets SIGCHLD. The other edition records
+    what it was started with and ignores it again in each child.
+    """
+    started_with, expected = (cast(list[int], value) for value in row)
+    probe = (
+        "import sys\n"
+        "from herdr_run.cli import _prepare_process\n"
+        "_prepare_process([])\n"
+        "from herdr_run.client import bounded_control_command\n"
+        "sys.stdout.write(bounded_control_command(['/bin/cat', '/proc/self/status']).stdout)\n"
+    )
+    environment = {key: value for key, value in os.environ.items() if not key.startswith("PYTHON")}
+    environment.update(PYTHONPATH=str(_REPOSITORY / "py"), LC_ALL="C.UTF-8")
+    completed = subprocess.run(
+        [sys.executable, "-c", probe],
+        env=environment,
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=60,
+        preexec_fn=_handing_over(started_with),
+    )
+    assert completed.returncode == 0, completed.stderr
+    line = next(text for text in completed.stdout.splitlines() if text.startswith("SigIgn:"))
+    mask = int(line.split(":", 1)[1], 16)
+    assert sorted(n for n in range(1, 65) if mask & (1 << (n - 1))) == sorted(expected), line
 
 
 # --- one version for both editions ---------------------------------------------------------------
