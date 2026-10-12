@@ -673,14 +673,44 @@ body {
 /* One entry per settings group, and the target of its `?`. `scroll-margin-top` is what makes the
    deep link land with the heading visible rather than jammed under the top edge of the scroller. */
 .help-entry {
-  margin: 0 0 1rem;
-  padding-bottom: 0.75rem;
+  margin: 0;
   border-bottom: 1px solid var(--edge);
   scroll-margin-top: 0.75rem;
 }
 
 .help-entry:last-child {
   border-bottom: none;
+}
+
+/* `#246 help-sections`. Each entry is a <details>, folded to its heading, so the screen is a list of
+   headings and the one a ? opened. The heading is the <summary>: a whole row to tap, at least the
+   44px target everything else here is, with the browser's own triangle in front of it saying which
+   way it will go. An open entry keeps the space under its text that every entry used to have. */
+.help-entry > summary {
+  box-sizing: border-box;
+  min-height: 2.75rem;
+  padding: 0.6rem 0;
+  cursor: pointer;
+  touch-action: manipulation;
+  -webkit-tap-highlight-color: transparent;
+}
+
+.help-entry > summary::marker {
+  color: var(--muted);
+}
+
+#screen-help .help-entry > summary > h2 {
+  display: inline;
+  margin: 0;
+}
+
+.help-entry[open] {
+  padding-bottom: 0.75rem;
+}
+
+/* Expand all / Fold all: above the first heading, where it is met before any of them. */
+#fold-help {
+  margin: 0 0 0.5rem;
 }
 
 #screen-main {

@@ -4183,6 +4183,19 @@ is, what audio format it negotiated, why the last one closed — and it was stan
 screen, in the position a reader arrives at, when what they arrive wanting is a switch. "Connection"
 also read as somewhere you configure one.
 
+**Help is folded** (`#246 help-sections`). A `?` used to land in the middle of one long page. Each
+entry is now a native `<details>` whose heading is its `<summary>`, all folded, so the screen reads
+as a list of headings, and the way in decides which one is open: a settings group's `?` opens its
+own entry and folds the rest, every time (entries opened on an earlier visit do not pile up); `?`
+and Ctrl+/ (Cmd+/) open Keyboard, the list of keys; **Open help** at the foot of Settings opens
+none. **Expand all** at the top opens every entry and then reads **Fold all**. Because the
+disclosure is the browser's own, a heading is a button to a screen reader and to Enter and Space,
+and the browser's find (Ctrl+F) still searches folded entries and opens the one it lands in where
+the browser supports that: Chromium does (the same mechanism opens a folded entry for a text
+fragment, which was checked in Chromium 151), and so does current Firefox; a browser that does not
+cannot find text in a folded entry until Expand all. `51-help-sections` photographs Help opened from
+a `?`.
+
 ### A conversation can end three ways, and they are three different sentences
 
 A WebSocket close is one event, and the page used to have two things to say about it. That is one

@@ -134,7 +134,7 @@ let sideActive = false;
  *   | "channel-view-flat" | "channel-view-main" | "channel-view-threads" | "clear-alias"
  *   | "clear-backlog" | "clear-view" | "close-browse-channels" | "close-help" | "close-reply"
  *   | "close-settings" | "close-threads" | "collapse-all" | "column-toggle" | "dismiss-banner"
- *   | "dismiss-error" | "dismiss-status" | "expand-all" | "forget-conversations"
+ *   | "dismiss-error" | "dismiss-status" | "expand-all" | "fold-help" | "forget-conversations"
  *   | "forget-dismissed-sends" | "forget-token"
  *   | "hang-up"
  *   | "help-link-auto-read" | "help-link-canned-prompts" | "help-link-channel-alias"
@@ -595,6 +595,10 @@ const HELP_TOPICS = [
  */
 function showHelp(slug) {
   showScreen("help");
+  // `#246 help-sections`. EVERY TIME, not only the first: Help is reached to read one thing, and the
+  // entries opened on an earlier visit would put the screen back to the one long page this replaces.
+  for (const entry of helpEntries()) entry.open = Boolean(slug) && entry.id === `help-${slug}`;
+  renderHelpFolds();
   if (!slug) {
     return;
   }
@@ -603,6 +607,47 @@ function showHelp(slug) {
     entry.scrollIntoView({ block: "start" });
   }
 }
+
+// --- Help, folded ---------------------------------------------------------------------------------
+//
+// `#246 help-sections`. The owner: "when I press "?" I jump to one section of one giant help page.
+// ... make them collapsable and all folded except the one that we click on to jump to help."
+//
+//   * EACH ENTRY IS A NATIVE <details> (web/voice.html), its heading the <summary>: a button to a
+//     screen reader, Enter and Space from the keyboard, a tap on a phone, with nothing written here
+//     to make it one.
+//   * FOLDED, EXCEPT THE ONE ASKED FOR. A settings group's ? opens its entry; "?" and Ctrl+/ (Cmd+/)
+//     open Keyboard, the entry about the keys (`#224`); Open help at the foot of Settings is about
+//     nothing in particular and opens none, so the screen is a list of what there is to read.
+//   * ONE BUTTON AT THE TOP opens every entry, and once they are all open folds them all. It names
+//     what it will do, like every toggle on this page that is an act rather than a mode.
+//   * FIND STILL FINDS. A browser that searches folded <details> (Chromium does, and so does Firefox)
+//     opens the entry its match is in and fires `toggle`, which keeps the button's word right. One
+//     that does not cannot find text in a folded entry: Expand all first.
+
+/**
+ * Every entry of the Help screen: the ones a ? reaches, and the two read from the screen itself. By id,
+ * as everything on this page is found, from the list the suite holds to the markup in both directions.
+ */
+function helpEntries() {
+  return ["controls", "channel", ...HELP_TOPICS].map(
+    (slug) => /** @type {HTMLDetailsElement} */ (document.getElementById(`help-${slug}`))
+  );
+}
+
+/** The button at the top: Expand all while any entry is folded, Fold all once none is. */
+function renderHelpFolds() {
+  const entries = helpEntries();
+  el("fold-help").textContent = entries.some((entry) => !entry.open) ? "Expand all" : "Fold all";
+}
+
+el("fold-help").addEventListener("click", () => {
+  const entries = helpEntries();
+  const open = entries.some((entry) => !entry.open);
+  for (const entry of entries) entry.open = open;
+  renderHelpFolds();
+});
+for (const entry of helpEntries()) entry.addEventListener("toggle", renderHelpFolds);
 
 let currentView = "voice";
 

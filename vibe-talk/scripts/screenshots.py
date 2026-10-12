@@ -2193,6 +2193,22 @@ RESOLVE_COLOUR_JS = (
 )
 
 
+
+def _act_help_sections(driver: Driver) -> None:
+    """`#246 help-sections`: Help as a ? on Settings opens it, its own entry open and the rest folded.
+
+    The reading width's ?, whose entry is short, so the picture holds the open entry and the folded
+    headings after it. A fresh load, Settings, and the ? really clicked.
+    """
+    driver.load(with_token=True)
+    driver.page.wait_for_function("() => window.__visible('control-pane')", timeout=10_000)
+    driver.click("open-settings")
+    driver.page.wait_for_function("() => window.__visible('close-settings')", timeout=5_000)
+    driver.click("help-link-reading-width")
+    driver.page.wait_for_function("() => window.__visible('close-help')", timeout=5_000)
+    driver.settle(300)
+
+
 def _act_reply_view(driver: Driver) -> None:
     _act_whole_channel(driver)
     # Park in the middle of the channel, and record it. The round trip below is then a MEASURED
@@ -4773,6 +4789,45 @@ SCENES: tuple[Scene, ...] = (
                 "the Undo chip is up, and names the message it would put back",
                 "window.__visible('undo-dismiss') && "
                 "/^Undo \u201c.+\u201d$/.test(document.getElementById('undo-dismiss-label').textContent)",
+            ),
+        ),
+    ),
+    Scene(
+        name="51-help-sections",
+        what="Help opened from a ? on Settings: that entry open at the top, every other one folded to its heading",
+        act=_act_help_sections,
+        profiles=("android-412", "laptop-1280"),
+        expect=(
+            ("the Help screen is up", "window.__visible('screen-help')"),
+            (
+                "the entry the ? is about is the one open",
+                "(() => { const open = [...document.querySelectorAll('#screen-help details.help-entry')]"
+                ".filter((d) => d.open).map((d) => d.id); "
+                "return open.length === 1 && open[0] === 'help-reading-width'; })()",
+            ),
+            (
+                # At the top where the screen can scroll that far; on a desk the folded list is too
+                # short to, so what is claimed is that it is on the screen with its text.
+                "it is on the screen, heading and text",
+                "(() => { const d = document.getElementById('help-reading-width'); "
+                "const screen = document.getElementById('screen-help').getBoundingClientRect(); "
+                "const b = d.getBoundingClientRect(), p = d.querySelector('p').getBoundingClientRect(); "
+                "return b.top >= screen.top - 1 && p.height > 0 && p.bottom <= screen.bottom + 1; })()",
+            ),
+            (
+                # THE layout claim: a folded entry is its heading alone, a full-size target, with the
+                # browser's triangle in front of it.
+                "every folded entry is one heading at least 44px tall, with its disclosure triangle",
+                "(() => { const folded = [...document.querySelectorAll('#screen-help details.help-entry')]"
+                ".filter((d) => !d.open); "
+                "return folded.length >= 14 && folded.every((d) => { const s = d.querySelector(':scope > summary'); "
+                "const sb = s.getBoundingClientRect(), db = d.getBoundingClientRect(); "
+                "return sb.height >= 43.5 && db.height <= sb.height + 2 "
+                "&& getComputedStyle(s).display === 'list-item'; }); })()",
+            ),
+            (
+                "the button at the top offers to open them all",
+                "document.getElementById('fold-help').textContent.trim() === 'Expand all'",
             ),
         ),
     ),

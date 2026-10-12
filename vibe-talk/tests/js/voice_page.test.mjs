@@ -434,11 +434,11 @@ function settingsGroup(heading) {
   return HTML.slice(opens, closes);
 }
 
-/** The markup of one help entry, `<article id="help-<slug>">` .. `</article>`. */
+/** The markup of one help entry, `<details id="help-<slug>">` .. `</details>`. */
 function helpEntry(slug) {
   const at = HTML.indexOf(`id="help-${slug}"`);
   assert.ok(at > 0, `web/voice.html has no help entry "help-${slug}"`);
-  return HTML.slice(at, HTML.indexOf("</article>", at));
+  return HTML.slice(at, HTML.indexOf("</details>", at));
 }
 
 function markupPlace(id) {
@@ -15400,6 +15400,86 @@ test("a ? opens Help, and the way back goes to Settings rather than out of it", 
   // ...and Settings still leaves to where the reader actually was, rather than back into Help.
   await page.el("close-settings").click();
   assert.equal(page.screen(), "main");
+});
+
+// --- `#246 help-sections` ------------------------------------------------------------------------
+
+/** Every Help entry's slug, from the markup: the ones a ? reaches and the two read on the screen. */
+const HELP_SLUGS = [...HTML.matchAll(/id="help-(?!link-)([a-z-]+)"/g)].map((m) => m[1]);
+/** The slugs of the entries open on the Help screen now. */
+const openHelp = (page) => HELP_SLUGS.filter((slug) => page.el(`help-${slug}`).open === true);
+
+test("EVERY HELP ENTRY IS A FOLDED DISCLOSURE, its heading the summary, under one Expand all (#246)", () => {
+  assert.ok(HELP_SLUGS.length >= 15, `the Help screen has only ${HELP_SLUGS.length} entries`);
+  for (const slug of HELP_SLUGS) {
+    const tag = new RegExp(`<([a-z]+) id="help-${slug}"([^>]*)>\\s*<summary><h2>[^<]+</h2></summary>`).exec(HTML_CODE);
+    assert.ok(tag, `help-${slug} is not a disclosure whose summary is its heading`);
+    assert.equal(tag[1], "details", `help-${slug} is a <${tag[1]}>, which does not fold natively`);
+    assert.doesNotMatch(tag[2], /\bopen\b/, `help-${slug} is served open`);
+  }
+  // Above the first entry, inside the Help screen's column.
+  const button = HTML_CODE.indexOf('id="fold-help"');
+  assert.ok(button > HTML_CODE.indexOf('id="screen-help"') && button < HTML_CODE.indexOf(`id="help-${HELP_SLUGS[0]}"`),
+    "Expand all is not at the top of Help");
+  assert.equal(PAGE_ELEMENTS.get("fold-help").tag, "button");
+  assert.match(cssBlock(".help-entry > summary"), /min-height:\s*2\.75rem/, "a folded heading is a small target");
+});
+
+test("A ? OPENS ITS OWN ENTRY AND FOLDS THE REST, every time; Open help opens none (#246)", async () => {
+  const page = newPage();
+  await signIn(page);
+  await page.el("open-settings").click();
+  const topics = [...HTML.matchAll(/data-help="([a-z-]+)"/g)].map((m) => m[1]);
+  assert.ok(topics.length >= 10, "the settings screen links to too few help entries to test");
+  for (const topic of topics) {
+    if (page.screen() !== "settings") await page.el("close-help").click();
+    const scrolled = page.el(`help-${topic}`).scrolledIntoView;
+    await page.el(`help-link-${topic}`).click();
+    assert.equal(page.screen(), "help");
+    assert.deepStrictEqual(openHelp(page), [topic], `the ? for ${topic} opened ${openHelp(page).join(", ") || "nothing"}`);
+    assert.equal(page.el(`help-${topic}`).scrolledIntoView, scrolled + 1, `the ? for ${topic} did not go to its entry`);
+    assert.equal(page.el("fold-help").textContent, "Expand all");
+  }
+  // The reader opens a second entry by hand, leaves, and comes back through another ?: only that one.
+  page.el("help-storage").open = true;
+  await page.el("help-storage").dispatch("toggle");
+  await page.el("close-help").click();
+  await page.el("help-link-microphone").click();
+  assert.deepStrictEqual(openHelp(page), ["microphone"], "entries opened on an earlier visit stayed open");
+  await page.el("close-help").click();
+  await page.el("open-help").click();
+  assert.deepStrictEqual(openHelp(page), [], "Open help, which is about nothing in particular, opened an entry");
+});
+
+test("? AND Ctrl+/ OPEN ONLY THE KEYBOARD ENTRY (#246)", async () => {
+  for (const [key, fields] of [["?", { shiftKey: true }], ["/", { ctrlKey: true }]]) {
+    const page = await keyboardPage();
+    await press(page, page.el("scroll-area"), key, fields);
+    assert.equal(page.screen(), "help");
+    assert.deepStrictEqual(openHelp(page), ["keyboard"], `${key} opened ${openHelp(page).join(", ") || "nothing"}`);
+  }
+});
+
+test("EXPAND ALL OPENS EVERY ENTRY AND THEN FOLDS THEM ALL, its word following the entries (#246)", async () => {
+  const page = newPage();
+  await signIn(page);
+  await page.el("open-settings").click();
+  await page.el("open-help").click();
+  const all = page.el("fold-help");
+  assert.equal(all.textContent, "Expand all");
+  await all.click();
+  assert.deepStrictEqual(openHelp(page), HELP_SLUGS, "Expand all left entries folded");
+  assert.equal(all.textContent, "Fold all");
+  // One folded by hand (or by the browser's find opening one, which fires the same event).
+  page.el("help-keyboard").open = false;
+  await page.el("help-keyboard").dispatch("toggle");
+  assert.equal(all.textContent, "Expand all", "with an entry folded the button still offers to fold");
+  page.el("help-keyboard").open = true;
+  await page.el("help-keyboard").dispatch("toggle");
+  assert.equal(all.textContent, "Fold all");
+  await all.click();
+  assert.deepStrictEqual(openHelp(page), [], "Fold all left entries open");
+  assert.equal(all.textContent, "Expand all");
 });
 
 test("both documents are held to a column, so a checkbox is not a metre from its label", () => {

@@ -1416,16 +1416,24 @@
           Each entry's id is `help-<slug>`, matching the `data-help` on its `?`. Both are declared
           in the MARKUP: the page suite derives its element set from this file and refuses an id
           invented at runtime.
+
+          `#246 help-sections`. Each entry is a <details>, FOLDED, so the screen reads as a list of
+          headings. The ? that opened Help opens its own entry and folds the rest (`showHelp`), and
+          the button at the top opens or folds them all. Native disclosure, so a summary is a
+          button to a screen reader and the keyboard, and the browser's own find (Ctrl+F) searches
+          folded entries and opens the one it lands in, where the browser does that (Chromium and
+          Firefox do).
         -->
         <section id="screen-help" class="screen" tabindex="-1" aria-label="Help" hidden>
           <div class="settings-column">
             <p class="hint">
               What each control does, and what it costs. Every entry here is reachable from the
-              matching <strong>?</strong> on the settings screen.
+              matching <strong>?</strong> on the settings screen; tap a heading to open it.
             </p>
+            <button id="fold-help" class="secondary" type="button">Expand all</button>
 
-            <article id="help-controls" class="help-entry">
-              <h2>What the controls do</h2>
+            <details id="help-controls" class="help-entry">
+              <summary><h2>What the controls do</h2></summary>
               <p id="continuity-note" class="hint">
                 <strong>Mute</strong> keeps the call open and keeps the agent's context; it only
                 stops sending it your audio. Your phone will still show the microphone as in use,
@@ -1472,7 +1480,7 @@
                 back the next time you sign in — <strong>Forget stored conversations</strong> is the
                 only control that erases that, and it leaves the screen alone in return.
               </p>
-            </article>
+            </details>
 
             <!--
               `#224 keyboard-shortcuts`. Every key the page answers. The list is written by
@@ -1480,8 +1488,8 @@
               say a key the page does not answer, or miss one it does; and in the words on the
               reader's own keyboard, Cmd and Option on an Apple one, Ctrl and Alt elsewhere.
             -->
-            <article id="help-keyboard" class="help-entry">
-              <h2>Keyboard</h2>
+            <details id="help-keyboard" class="help-entry">
+              <summary><h2>Keyboard</h2></summary>
               <p class="hint">
                 On a computer the messages can be read and dealt with from the keyboard. The arrows,
                 or j and k, move a ring from message to message; what a key does to "the selected
@@ -1499,10 +1507,10 @@
                 open the search, which / and the magnifying glass still do.
               </p>
               <div id="keyboard-keys" role="group" aria-label="Keyboard shortcuts"></div>
-            </article>
+            </details>
 
-            <article id="help-microphone" class="help-entry">
-              <h2>Microphone</h2>
+            <details id="help-microphone" class="help-entry">
+              <summary><h2>Microphone</h2></summary>
               <p class="hint">
                 These are asked of the browser when the microphone opens, so a change applies to
                 your <strong>next</strong> call, not the one in progress.
@@ -1522,10 +1530,10 @@
                 speech threshold and get transcribed as words. Turn it <strong>off</strong> if you
                 are getting phantom transcripts.
               </p>
-            </article>
+            </details>
 
-            <article id="help-control-bar" class="help-entry">
-              <h2>Control bar</h2>
+            <details id="help-control-bar" class="help-entry">
+              <summary><h2>Control bar</h2></summary>
               <p class="hint">
                 The strip carrying the gear and the Voice/Channel switch. It can sit under the title
                 at the top of the screen, or in the dock directly above the big buttons —
@@ -1533,10 +1541,10 @@
                 and because the header then costs no row at all. The gear is deliberately at the far
                 <strong>left</strong> of it: it is the control you least want to hit by accident.
               </p>
-            </article>
+            </details>
 
-            <article id="help-canned-prompts" class="help-entry">
-              <h2>Canned prompts</h2>
+            <details id="help-canned-prompts" class="help-entry">
+              <summary><h2>Canned prompts</h2></summary>
               <p class="hint">
                 What the prompt buttons say. <strong>Prompts</strong> in the control bar opens a
                 tray of them above the bar; tapping one sends exactly this text into the live
@@ -1557,10 +1565,10 @@
                 drawn as an ordinary button rather than a warning: the cost is real, but a control
                 that looks like a fault report is worse than one whose cost is stated here.
               </p>
-            </article>
+            </details>
 
-            <article id="help-identities" class="help-entry">
-              <h2>Who is who in this channel</h2>
+            <details id="help-identities" class="help-entry">
+              <summary><h2>Who is who in this channel</h2></summary>
               <p class="hint">
                 The call transcript tells its two speakers apart by side, colour and corner. The
                 channel can do the same, but only once it knows which account is which. A display
@@ -1585,10 +1593,10 @@
                 here is sent anywhere: it is stored in this browser and affects only how the channel
                 is drawn.
               </p>
-            </article>
+            </details>
 
-            <article id="help-channel" class="help-entry">
-              <h2>The channel, and the inbox</h2>
+            <details id="help-channel" class="help-entry">
+              <summary><h2>The channel, and the inbox</h2></summary>
               <p class="hint">
                 The channel view shows messages from <span id="chat-provider-help">Chat</span>,
                 rendered from a small, fixed markdown subset. Message text is written by other
@@ -1703,10 +1711,10 @@
                 own app shows it as read. Read markers only move forward. This does not archive
                 anything here; <strong>Done</strong> remains local and undoable.
               </p>
-            </article>
+            </details>
 
-            <article id="help-mark-own" class="help-entry">
-              <h2>Your own messages</h2>
+            <details id="help-mark-own" class="help-entry">
+              <summary><h2>Your own messages</h2></summary>
               <p class="hint">
                 A message posted on your behalf is one you dictated moments earlier, so it is
                 already read by the only definition that matters. Leaving it in the queue would
@@ -1720,10 +1728,10 @@
                 server, there is nothing to undo, and turning it off brings every one of them
                 straight back. Nothing here changes anything in the source chat service.
               </p>
-            </article>
+            </details>
 
-            <article id="help-auto-read" class="help-entry">
-              <h2>Read automatically</h2>
+            <details id="help-auto-read" class="help-entry">
+              <summary><h2>Read automatically</h2></summary>
               <p class="hint">
                 Some messages are only placeholders — a coding agent posting <em>Working…</em>
                 while it works, with the real answer arriving later as a separate message. A
@@ -1750,10 +1758,10 @@
                 agent cannot change them. Like <strong>Done</strong>, this is this app's own read
                 state and changes nothing in the source chat service.
               </p>
-            </article>
+            </details>
 
-            <article id="help-combining" class="help-entry">
-              <h2>Combining messages</h2>
+            <details id="help-combining" class="help-entry">
+              <summary><h2>Combining messages</h2></summary>
               <p class="hint">
                 Chat services limit message length, so a client sending a long one may
                 <strong>split it into parts</strong>. The next part can begin mid-sentence — often
@@ -1775,10 +1783,10 @@
                 is worth doing when you are checking whether a specific message exists — press and
                 hold a row to see every id it is showing.
               </p>
-            </article>
+            </details>
 
-            <article id="help-rich-headers" class="help-entry">
-              <h2>Rich headers</h2>
+            <details id="help-rich-headers" class="help-entry">
+              <summary><h2>Rich headers</h2></summary>
               <p class="hint">
                 Agents that post through one shared account often say who they are at the start of
                 a message, in square brackets or parentheses, with a title and a time:
@@ -1799,10 +1807,10 @@
                 channel. Anything else is drawn as written. Turn this off to see every first line
                 as it was written.
               </p>
-            </article>
+            </details>
 
-            <article id="help-channel-alias" class="help-entry">
-              <h2>Channels</h2>
+            <details id="help-channel-alias" class="help-entry">
+              <summary><h2>Channels</h2></summary>
               <p class="hint">
                 Everything in this group is about <strong>one channel</strong> — the one chosen at
                 the top of it. Every other setting on the screen applies to the whole app.
@@ -1844,10 +1852,10 @@
                 name and cannot choose it, because a model that renames the channels it also
                 reports on can make its own reports unrecognisable.
               </p>
-            </article>
+            </details>
 
-            <article id="help-reading-width" class="help-entry">
-              <h2>Reading width</h2>
+            <details id="help-reading-width" class="help-entry">
+              <summary><h2>Reading width</h2></summary>
               <p class="hint">
                 On a wide screen with a mouse, the transcript and the channel are held to a column
                 rather than filling the window: a line of text stops being readable somewhere past
@@ -1855,10 +1863,10 @@
                 column, or use the slider — they set the same thing. On a phone it does nothing,
                 because there is no room for a column and no margin to put beside it.
               </p>
-            </article>
+            </details>
 
-            <article id="help-resuming" class="help-entry">
-              <h2>Resuming</h2>
+            <details id="help-resuming" class="help-entry">
+              <summary><h2>Resuming</h2></summary>
               <p class="hint">
                 The vendor cannot resume a conversation once the connection closes. What this does
                 instead is hand the new call a written record of the earlier one, so it can carry on
@@ -1872,10 +1880,10 @@
                 capped by the server; when it does not all fit, the oldest lines are dropped and
                 both you and the agent are told the reconstruction is partial.
               </p>
-            </article>
+            </details>
 
-            <article id="help-live-messages" class="help-entry">
-              <h2>Live messages</h2>
+            <details id="help-live-messages" class="help-entry">
+              <summary><h2>Live messages</h2></summary>
               <p class="hint">
                 When this server is set to watch the channel, new messages appear on their own
                 rather than at the next refresh. A deployment can use bounded polling or push
@@ -1911,10 +1919,10 @@
                 worse than not hearing them at all. Anything that landed while the feed was
                 reconnecting is on screen but was not spoken.
               </p>
-            </article>
+            </details>
 
-            <article id="help-speech-prep" class="help-entry">
-              <h2>How messages are said</h2>
+            <details id="help-speech-prep" class="help-entry">
+              <summary><h2>How messages are said</h2></summary>
               <p class="hint">
                 Before a message is read out — by the agent during a call, or by the tap-to-listen
                 button — this server rewrites it for the ear. Markdown comes off, so
@@ -1937,10 +1945,10 @@
                 the control arm for tuning the agent's prompt: it makes every difference between
                 two runs the prompt rather than this.
               </p>
-            </article>
+            </details>
 
-            <article id="help-storage" class="help-entry">
-              <h2>Stored conversations</h2>
+            <details id="help-storage" class="help-entry">
+              <summary><h2>Stored conversations</h2></summary>
               <p class="hint">
                 This server keeps the transcript of each call in a database file on the machine it
                 runs on, so a reload no longer loses the conversation. It is not encrypted: anyone
@@ -1948,17 +1956,17 @@
                 speech and any channel text the assistant read out to you. Older conversations are
                 dropped automatically once the server's retention limit is reached.
               </p>
-            </article>
+            </details>
 
-            <article id="help-connection" class="help-entry">
-              <h2>Connection status</h2>
+            <details id="help-connection" class="help-entry">
+              <summary><h2>Connection status</h2></summary>
               <p class="hint">
                 What the current conversation is, what audio format it negotiated, and why the last
                 one closed — including the close code, which is the one thing on this page written
                 for whoever is debugging it rather than for you. It is a readout, not a setting,
                 which is why it sits at the end.
               </p>
-            </article>
+            </details>
           </div>
         </section>
       </div>
