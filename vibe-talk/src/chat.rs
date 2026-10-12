@@ -60,7 +60,10 @@ impl RateLimitExhausted {
 }
 
 /// A chat-provider read or post failure.
-#[derive(Debug, thiserror::Error)]
+///
+/// `Clone` so one failed read can be reported to every caller waiting on it: a channel's refresh
+/// is shared, and so is its failure. `#210 voice-catchup-speed`.
+#[derive(Clone, Debug, thiserror::Error)]
 pub enum ChatError {
     /// The request never completed.
     #[error("chat request failed: {0}")]

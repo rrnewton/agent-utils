@@ -454,7 +454,8 @@ prepare request for that row alone and starts reading it, and the rest of the sc
 preparing behind it.
 
 On the server, preparation first looks at messages fetched for the page in the last 30 seconds,
-kept in memory. It fetches only what is missing:
+kept in memory (`src/read_ahead.rs`, apart from the voice catch-up's windows in `src/recent.rs`).
+It fetches only what is missing:
 
 - outside a thread, one window per channel, shared by preparations that miss at the same time
   (a preparation joins another's fetch only when that window was at least as wide as its own);
@@ -1589,12 +1590,15 @@ How a deployment with several providers behaves:
 
 ## Durable state
 
-Almost nothing in this server is remembered. A channel is never cached as a channel: every
-question is a fresh Discord fetch, and it stays that way. The one short-lived exception is not
-durable at all. Messages fetched for the page in the last 30 seconds are kept in memory, so that
-preparing them for read-aloud does not fetch them again (`#191 read-aloud-first-lag`,
-`src/read_ahead.rs`). Nothing else reads them, a restart forgets them, and the storage purge clears
-them. There is exactly one store,
+Almost nothing in this server is remembered. Nothing about a channel is written to disk, and
+the page and the tools read channels from the chat provider. Two short-lived copies are the
+exceptions. Both are in MEMORY only, they are kept apart, and both are gone when the process
+restarts. Messages fetched for the page in the last 30 seconds are kept so that preparing them
+for read-aloud does not fetch them again (`#191 read-aloud-first-lag`, `src/read_ahead.rs`).
+Nothing else reads them, a pushed edit or deletion drops the message, and the storage purge clears
+them. Each channel's newest window is kept so the voice agent's catch-up can answer while the
+provider is slow (`#210 voice-catchup-speed`, `src/recent.rs`): the last read of each listed
+channel plus the changes pushed to it since. There is exactly one store,
 `src/store/`, and it holds these:
 
 * the `/voice` **conversation transcript** — what you said and what the agent said back;
@@ -2042,13 +2046,18 @@ have spoken.
 ```text
 INFO vibe_talk::access: request method="POST" path="/mcp" credential="write" status=200 millis=12
 INFO vibe_talk::access: mcp rpc_method="tools/call" credential="write" is_notification=false
-INFO vibe_talk::access: tool tool="post_reply" channel="123…" credential="write" outcome="ok" reason="-" text_len=48
+INFO vibe_talk::access: tool tool="post_reply" channel="123…" credential="write" outcome="ok" reason="-" text_len=48 millis=9
 INFO vibe_talk::access: post_gate event="proposed" proposal=4 channel="123…" text_len=48 reason="-" confirmed_by="-"
 INFO vibe_talk::access: post_gate event="committed" proposal=4 channel="123…" text_len=48 reason="-" confirmed_by="ui"
 ```
 
 Filter for just these: `RUST_LOG=vibe_talk::access=info`. Three lines answer the question that
 started this: *did the agent call, which tool, which channel, and was it allowed?*
+
+A tool call the caller stopped waiting for — a voice runtime gives a tool fifteen seconds and then
+drops the request — writes `tool tool="…" outcome="abandoned" millis=…` from the moment its handler
+is dropped. Before `#210 voice-catchup-speed` such a call left no `tool` line and no `request`
+line at all, so the one call that most needed explaining was invisible here.
 
 What a line never contains:
 
@@ -4727,6 +4736,23 @@ Each channel is still one ordinary fetch with the same noise rules and spoken ti
 is capped at about 8 KB, dropping the oldest lines first and saying so, and one channel that
 cannot be read is named as such rather than failing the rest.
 
+**It answers by a deadline, not when the slowest read ends** (`#210 voice-catchup-speed`). Behind
+a provider bridge that runs one command at a time, three channels cost three reads in series —
+five to nine seconds measured — and one stalled command blocked every tool past the voice
+runtime's fifteen-second limit. So the server keeps each channel's newest window in memory
+(`src/recent.rs`, apart from read-aloud's 30-second memory in `src/read_ahead.rs`): whatever the
+page or a tool last read, kept current by the live feed. A
+catch-up starts one read per channel — shared with a read of that channel already running, and
+finished even if the caller gives up — and waits 2.5 seconds for channels it holds a copy of, 8
+for channels it does not. A channel read in time is current; one that was not is answered from
+the held copy and its block says `NOT CURRENT`, how old the copy is, and that it may be missing
+newer messages; one with nothing held says it was not read in time and to ask again in a moment.
+A window read within the last 15 seconds — 60 when a live producer feeds it — is used without a
+read at all, and opening a voice session (`GET /api/v1/voice-session`) starts the reads in the
+background, so the greeting covers them. The access log's `tool` line carries `millis=`, each
+catch-up writes `recent_activity current= held= unread= millis=`, and a call the caller abandoned
+writes `outcome="abandoned"` instead of nothing.
+
 **No model-facing text calls this server a "bridge"** — not a tool description, not the
 initialize instructions, not the channel listing. A speech runtime may have a filler call of its
 own by that name, and text that also called the chat server a bridge blurred the two. That was
@@ -5427,9 +5453,10 @@ Beyond the security list above:
   warns, and it says so on the page — but the cache stays empty forever and there is no reduced
   service to fall back on. `summaries.model` is still recorded in the cache key and read by
   nothing, which is the last vestige of a selector that no longer exists.
-* No caching of channel content: every question is a fresh Discord fetch. The one exception is
-  thirty seconds long. Read-aloud preparation reuses, from memory, messages the page fetched in
-  the last 30 seconds (`#191 read-aloud-first-lag`). Obeying `Retry-After`
+* No caching of channel content on disk. Two short-lived copies are kept in memory:
+  read-aloud preparation reuses messages the page fetched in the last 30 seconds
+  (`#191 read-aloud-first-lag`), and the voice catch-up answers from each channel's newest window
+  when the provider is slow (`#210 voice-catchup-speed`; see "The eight tools"). Obeying `Retry-After`
   does not change that — it buys time, not quota, so a poll interval still spends one request per
   channel whether or not anybody is listening. That is why `discord.live_poll_seconds` still
   defaults to OFF and why an interval under five seconds is still refused outright rather than

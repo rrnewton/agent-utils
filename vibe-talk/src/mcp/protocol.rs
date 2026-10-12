@@ -368,7 +368,32 @@ fn hours_phrase(hours: u64) -> String {
     }
 }
 
+/// Writes [`access::tool_abandoned`] for a tool call dropped before it answered: the caller went
+/// away, and the handler future went with it. `#210 voice-catchup-speed`.
+struct Unanswered {
+    tool: &'static str,
+    channel: Option<String>,
+    credential: Credential,
+    started: std::time::Instant,
+    answered: bool,
+}
+
+impl Drop for Unanswered {
+    fn drop(&mut self) {
+        if !self.answered {
+            access::tool_abandoned(
+                self.tool,
+                self.channel.as_deref(),
+                self.credential,
+                self.started.elapsed().as_millis(),
+            );
+        }
+    }
+}
+
 async fn call_tool(state: &AppState, scope: Scope, id: Value, params: Option<Value>) -> Outcome {
+    let started = std::time::Instant::now();
+    let millis = || started.elapsed().as_millis();
     let credential = Credential::from(scope);
     let params = params.unwrap_or_else(|| json!({}));
     let Some(name) = params.get("name").and_then(Value::as_str) else {
@@ -379,6 +404,7 @@ async fn call_tool(state: &AppState, scope: Scope, id: Value, params: Option<Val
             ToolOutcome::Refused,
             Some("missing_tool_name"),
             None,
+            millis(),
         );
         return Outcome::Reply(Box::new(RpcResponse::err(
             id,
@@ -428,6 +454,7 @@ async fn call_tool(state: &AppState, scope: Scope, id: Value, params: Option<Val
             ToolOutcome::Refused,
             Some("unknown_tool"),
             text_len,
+            millis(),
         );
         return Outcome::Reply(Box::new(RpcResponse::err(
             id,
@@ -446,6 +473,7 @@ async fn call_tool(state: &AppState, scope: Scope, id: Value, params: Option<Val
             ToolOutcome::Refused,
             Some("forbidden_scope"),
             text_len,
+            millis(),
         );
         return Outcome::Forbidden(Box::new(RpcResponse::err(
             id,
@@ -453,6 +481,13 @@ async fn call_tool(state: &AppState, scope: Scope, id: Value, params: Option<Val
         )));
     }
 
+    let mut unanswered = Unanswered {
+        tool: tool.name,
+        channel: channel.clone(),
+        credential,
+        started,
+        answered: false,
+    };
     let outcome = match tool.name {
         "list_channels" => Ok(list_channels_text(state).await),
         "recent_activity" => run_activity(state, &args).await,
@@ -463,6 +498,7 @@ async fn call_tool(state: &AppState, scope: Scope, id: Value, params: Option<Val
         "read_message" => run_read(state, &args).await,
         "post_reply" => run_post(state, &args).await,
         other => {
+            unanswered.answered = true;
             access::tool_call(
                 other,
                 channel.as_deref(),
@@ -470,6 +506,7 @@ async fn call_tool(state: &AppState, scope: Scope, id: Value, params: Option<Val
                 ToolOutcome::Refused,
                 Some("unknown_tool"),
                 text_len,
+                millis(),
             );
             return Outcome::Reply(Box::new(RpcResponse::err(
                 id,
@@ -478,6 +515,7 @@ async fn call_tool(state: &AppState, scope: Scope, id: Value, params: Option<Val
         }
     };
 
+    unanswered.answered = true;
     match outcome {
         Ok(text) => {
             access::tool_call(
@@ -487,6 +525,7 @@ async fn call_tool(state: &AppState, scope: Scope, id: Value, params: Option<Val
                 ToolOutcome::Ok,
                 None,
                 text_len,
+                millis(),
             );
             Outcome::Reply(Box::new(RpcResponse::ok(id, text_result(text, false))))
         }
@@ -501,6 +540,7 @@ async fn call_tool(state: &AppState, scope: Scope, id: Value, params: Option<Val
                 ToolOutcome::Refused,
                 Some(error.code()),
                 text_len,
+                millis(),
             );
             let mut text = format!("{}: {error}", error.code());
             // A model that named a channel wrongly needs the right names to try again, not a
@@ -836,6 +876,7 @@ async fn run_activity(state: &AppState, args: &Value) -> Result<String, OpError>
         Ok(hours) => (hours, false),
         Err(_) => (None, true),
     };
+    let started = std::time::Instant::now();
     let activity = ops::activity(
         state,
         ops::ActivityRequest {
@@ -845,7 +886,28 @@ async fn run_activity(state: &AppState, args: &Value) -> Result<String, OpError>
         },
     )
     .await?;
+    // `#210 voice-catchup-speed`. How each channel was answered, as counts: the line that says
+    // whether a slow catch-up was the chat service or this server, with no channel text in it.
+    let sources = activity.sources();
+    tracing::info!(
+        target: "vibe_talk::access",
+        current = sources.current,
+        held = sources.held,
+        unread = sources.unread,
+        millis = started.elapsed().as_millis(),
+        "recent_activity"
+    );
     Ok(activity_text(&activity, unreadable, MAX_ACTIVITY_BYTES))
+}
+
+/// How long ago a held copy was read, in words: "40 seconds ago", "3 minutes ago".
+fn held_age(elapsed: std::time::Duration) -> String {
+    let seconds = elapsed.as_secs();
+    match seconds {
+        0..=1 => "a moment ago".to_owned(),
+        2..=59 => format!("{seconds} seconds ago"),
+        _ => age(i64::try_from(elapsed.as_millis()).unwrap_or(i64::MAX), 0),
+    }
 }
 
 /// How long ago, in words a listener wants: "12 minutes ago", "about 3 hours ago".
@@ -883,6 +945,15 @@ fn activity_block(block: &ActivityBlock<'_>, span: &str) -> String {
     let channel = &block.part.channel;
     let (label, id) = (channel.display_name(), &channel.id);
     let read = match &block.part.read {
+        // `#210 voice-catchup-speed`. Its read is still running, and digest_channel would only
+        // queue behind it; the next catch-up is answered from what that read brings.
+        Err(OpError::NotReadInTime) => {
+            return format!(
+                "{label} (id {id}): not read — the chat service did not answer in time, and this \
+                 server holds no earlier copy. It is still being read: call recent_activity again \
+                 in a moment.\n"
+            );
+        }
         Err(error) => {
             return format!(
                 "{label} (id {id}): could not be read just now ({}). Try digest_channel for this \
@@ -892,12 +963,26 @@ fn activity_block(block: &ActivityBlock<'_>, span: &str) -> String {
         }
         Ok(read) => read,
     };
+    // Said BEFORE the count, so a model that stops reading early still knows not to present it
+    // as the latest.
+    let held = match block.part.currency {
+        ops::Currency::Current => String::new(),
+        ops::Currency::Held { age, failed } => format!(
+            " NOT CURRENT: {}, so this is the copy this server read {}; say it may be missing \
+             newer messages.",
+            match failed {
+                Some(code) => format!("the latest read of it failed ({code})"),
+                None => "the chat service did not answer in time".to_owned(),
+            },
+            held_age(age)
+        ),
+    };
     if read.counted == 0 {
         return if read.noise == 0 {
-            format!("{label} (id {id}): no messages in the last {span}.\n")
+            format!("{label} (id {id}):{held} no messages in the last {span}.\n")
         } else {
             format!(
-                "{label} (id {id}): nothing to report in the last {span} — only placeholder \
+                "{label} (id {id}):{held} nothing to report in the last {span} — only placeholder \
                  messages the owner's noise rules mark as read.\n"
             )
         };
@@ -925,7 +1010,7 @@ fn activity_block(block: &ActivityBlock<'_>, span: &str) -> String {
     };
     let body = block.lines[block.lines.len() - block.shown..].concat();
     format!(
-        "{label} (id {id}): {count}{shown}.{}\n{}\n{}{}\n",
+        "{label} (id {id}):{held} {count}{shown}.{}\n{}\n{}{}\n",
         noise_note(read.noise),
         untrusted::FENCE,
         untrusted::neutralize(&body),

@@ -15,11 +15,15 @@
 //!
 //! # What is kept
 //!
-//! Almost nothing. A channel is never cached as a channel: every question is a fresh Discord
-//! fetch. The one short-lived exception is [`read_ahead`]. It keeps messages fetched in the last
-//! thirty seconds, in memory only, and only speech preparation reads them, so a tap does not wait
-//! to re-fetch what the page has just drawn. [`store`] is the single at-rest exception, and it
-//! holds three things — the `/voice` transcript,
+//! Almost nothing. Nothing about a channel is written to disk, and the page and the tools read
+//! channels from the provider, with two short-lived exceptions, held in memory only, kept apart on
+//! purpose, and gone when the process restarts. [`read_ahead`] keeps messages fetched in the last
+//! thirty seconds, and only speech preparation reads them, so a tap does not wait to re-fetch what
+//! the page has just drawn; a pushed edit or deletion drops a message from it, and the storage
+//! purge empties it. [`recent`] keeps each channel's newest window, with every change pushed to it
+//! since merged in, so the voice agent's catch-up can answer from it while the provider is slow,
+//! and says how old it is when it was not read again in time. [`store`] is the single thing kept
+//! at rest, and it holds three things — the `/voice` transcript,
 //! how far the owner has read, and one short cached SUMMARY per long message. The first two are
 //! what this server itself authored; the third is derived from somebody else's message — a
 //! model's paraphrase of one, which carries its content as surely as a quotation would — so it is
@@ -60,6 +64,7 @@ pub mod post_gate;
 pub mod probe;
 pub mod providers;
 pub mod read_ahead;
+pub mod recent;
 pub mod render;
 pub mod replay;
 pub mod retrieval;

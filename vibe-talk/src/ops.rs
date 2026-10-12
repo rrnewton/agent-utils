@@ -88,6 +88,15 @@ pub enum OpError {
         resumable: bool,
     },
 
+    /// A catch-up's deadline passed before this channel was read, and nothing earlier is held.
+    /// `#210 voice-catchup-speed`. The read carries on without the caller, so asking again in a
+    /// moment is answered from what it brings.
+    #[error(
+        "the chat service did not answer in time and this server holds no earlier copy; it is \
+         still being read, so ask again in a moment"
+    )]
+    NotReadInTime,
+
     /// The configured chat provider failed, or refused the request before it was sent.
     #[error(transparent)]
     Chat(#[from] ChatError),
@@ -113,6 +122,7 @@ impl OpError {
             Self::InvalidHours => "invalid_hours",
             Self::CursorMismatch => "cursor_mismatch",
             Self::PartiallyPosted { .. } => "partially_posted",
+            Self::NotReadInTime => "not_read_in_time",
             Self::Chat(error) if matches!(error.cause(), ChatError::Refused(_)) => "refused",
             Self::Chat(error) if matches!(error.cause(), ChatError::CursorExpired(_)) => {
                 "cursor_expired"
@@ -364,10 +374,19 @@ pub async fn messages(
     limit: Option<u16>,
 ) -> Result<Window, OpError> {
     let channel = allowed(state, channel_id).await?;
+    // Clamped once: the size fetched, the size `crate::recent` records, and the size speech
+    // preparation compares a remembered window against (`crate::read_ahead`) are one number.
     let limit = window_limit(state, limit);
-    // Before the fetch, not after: see `ReadAhead::remember`.
+    // Both before the fetch, not after: see `ReadAhead::remember` and `RecentWindows::record`.
     let fetch_began = std::time::Instant::now();
+    let started = tokio::time::Instant::now();
     let mut messages = state.chat.fetch_recent(&channel.id, limit).await?;
+    // `#210 voice-catchup-speed`. Every read of a channel's newest messages is the newest copy of
+    // it, whoever asked: kept raw, before anything below prepares it. See `crate::recent`.
+    state
+        .live
+        .recent()
+        .record(&channel.id, &messages, limit, started);
     stamp(state, &mut messages);
     // `#196 auto-read-noise`. Decided HERE, on every read, from the text as it now stands — never
     // recorded — so every caller of this function (the digest, the to-do list, a lookup by id,
@@ -605,10 +624,6 @@ pub const DEFAULT_ACTIVITY_LINES: u16 = 8;
 /// The most lines per channel [`activity`] will carry, whatever the caller asks for.
 pub const MAX_ACTIVITY_LINES: u16 = 30;
 
-/// How many channels [`activity`] reads at once. Four, like the thread fan-outs: enough that three
-/// channels cost one round trip, few enough that a long list does not burst the provider's limit.
-const ACTIVITY_CONCURRENCY: usize = 4;
-
 /// What [`activity`] should cover. Every field but the clock is optional.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct ActivityRequest {
@@ -648,6 +663,23 @@ pub struct ChannelActivity {
     pub channel: ChannelInfo,
     /// What was read, or why it could not be. One channel failing does not fail the others.
     pub read: Result<WindowActivity, OpError>,
+    /// How current `read` is. Always [`Currency::Current`] beside an error.
+    pub currency: Currency,
+}
+
+/// How current one channel's part of an [`Activity`] is. `#210 voice-catchup-speed`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Currency {
+    /// Read from the chat service during this call, or recently enough to stand for now.
+    Current,
+    /// This server's earlier copy, because the channel was not read again in time.
+    Held {
+        /// How long ago the read that produced the copy began.
+        age: std::time::Duration,
+        /// Why it was not read again: the code of the newest read's failure, or `None` when that
+        /// read is still running.
+        failed: Option<&'static str>,
+    },
 }
 
 /// What one channel holds inside an activity window.
@@ -679,6 +711,17 @@ pub struct Newest {
     pub entry: DigestEntry,
 }
 
+/// How many channels an [`Activity`] answered current, from a held copy, or not at all.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ActivitySources {
+    /// Read during the call, or recently enough to stand for now.
+    pub current: usize,
+    /// Answered from this server's earlier copy.
+    pub held: usize,
+    /// Not answered: nothing held, and the read failed or did not finish in time.
+    pub unread: usize,
+}
+
 impl Activity {
     /// The newest message any channel holds, as far as these reads saw, and its channel.
     ///
@@ -705,6 +748,32 @@ impl Activity {
     pub fn covers(&self, at_ms: i64) -> bool {
         at_ms >= self.since_ms
     }
+
+    /// How the channels were answered, for the log line. `#210 voice-catchup-speed`.
+    #[must_use]
+    pub fn sources(&self) -> ActivitySources {
+        let mut sources = ActivitySources::default();
+        for part in &self.channels {
+            match (&part.read, part.currency) {
+                (Err(_), _) => sources.unread += 1,
+                (Ok(_), Currency::Current) => sources.current += 1,
+                (Ok(_), Currency::Held { .. }) => sources.held += 1,
+            }
+        }
+        sources
+    }
+}
+
+/// How many messages [`activity`] reads of each channel to show `lines` of them: as deep as a
+/// default read goes, and always deep enough to say whether there is more than the lines shown,
+/// clamped by [`window_limit`] as [`messages`] clamps it, so a held window's recorded size and
+/// this scan compare like for like.
+#[must_use]
+pub fn activity_scan(state: &AppState, lines: u16) -> u16 {
+    window_limit(
+        state,
+        Some(state.config.chat.default_fetch_limit.max(lines + 1)),
+    )
 }
 
 /// Catch up on every listed channel in one call. Read scope. `#190 voice-agent-tools`.
@@ -716,17 +785,21 @@ impl Activity {
 /// day?" across three channels was list, clock, then one read per channel: up to five rounds, any
 /// of which could be the one that fails. This answers it in one, with no required argument.
 ///
-/// Each channel is one fetch of its most recent messages — the same fetch, noise marks and
-/// spoken times every other read gets — filtered to the window. Channels are read concurrently
-/// and fail independently.
+/// **It answers by a deadline, not when the slowest read ends.** `#210 voice-catchup-speed`. Each
+/// channel is one read of its most recent messages — the same read, noise marks and spoken times
+/// every other read gets — filtered to the window, started for every channel at once and shared
+/// with any read of that channel already running (see [`crate::recent`]). A channel read again
+/// within [`crate::recent::Timing::deadline`] is current; one that was not is answered from this
+/// server's held copy and says how old it is ([`Currency::Held`]); one with nothing held waits up
+/// to [`crate::recent::Timing::cold_deadline`] and is then [`OpError::NotReadInTime`]. A window
+/// young enough to reuse ([`crate::recent::reuse_for`]) is served without a read at all.
 ///
 /// # Errors
 ///
-/// The first channel's error when EVERY channel failed, since an answer made only of failures is
-/// a failure. An empty list is not an error: there is simply nothing to report.
+/// The first channel's error when EVERY channel failed outright, since an answer made only of
+/// failures is a failure. A channel still being read does not count as failed, and an empty list is
+/// not an error: there is simply nothing to report.
 pub async fn activity(state: &AppState, request: ActivityRequest) -> Result<Activity, OpError> {
-    use futures_util::{stream, StreamExt as _};
-
     let asked = request.hours.unwrap_or(DEFAULT_ACTIVITY_HOURS);
     let hours = asked.clamp(1, MAX_WINDOW_HOURS);
     let since_ms = hours_before(hours, request.now_ms)?;
@@ -734,19 +807,43 @@ pub async fn activity(state: &AppState, request: ActivityRequest) -> Result<Acti
         .per_channel_limit
         .unwrap_or(DEFAULT_ACTIVITY_LINES)
         .clamp(1, MAX_ACTIVITY_LINES);
-    // One fetch per channel: as deep as a default read goes, and always deep enough to say whether
-    // there is more than the lines shown. `messages` clamps it to the configured ceiling.
-    let scan = state.config.chat.default_fetch_limit.max(lines + 1);
+    let scan = activity_scan(state, lines);
     let channels = channels(state).await;
-    let mut reads: Vec<ChannelActivity> = stream::iter(channels)
-        .map(|channel| async move {
-            let read = window_activity(state, channel.id.as_str(), scan, lines, since_ms).await;
-            ChannelActivity { channel, read }
+    let recent = state.live.recent();
+    let timing = recent.timing();
+    let began = tokio::time::Instant::now();
+
+    // Every read starts before any is waited for, so their waits overlap rather than add up.
+    let waits: Vec<_> = channels
+        .iter()
+        .map(|channel| {
+            let reuse = crate::recent::reuse_for(state, &channel.id);
+            (!recent.reusable(&channel.id, scan, reuse))
+                .then(|| crate::recent::refresh(state, &channel.id, scan))
         })
-        .buffered(ACTIVITY_CONCURRENCY)
-        .collect()
-        .await;
-    if !reads.is_empty() && reads.iter().all(|c| c.read.is_err()) {
+        .collect();
+    for (channel, wait) in channels.iter().zip(waits) {
+        let Some(mut done) = wait else { continue };
+        let budget = if recent.holds(&channel.id) {
+            timing.deadline
+        } else {
+            timing.cold_deadline
+        };
+        // A deadline passing is not a failure here: what was not read in time is answered from
+        // what is held, below. Nor is a finished read's sender being gone.
+        let _ = tokio::time::timeout_at(began + budget, done.wait_for(|over| *over)).await;
+    }
+
+    let mut reads: Vec<ChannelActivity> = Vec::with_capacity(channels.len());
+    for channel in channels {
+        let reuse = crate::recent::reuse_for(state, &channel.id);
+        reads.push(channel_activity(state, channel, began, reuse, lines, since_ms).await);
+    }
+    if !reads.is_empty()
+        && reads
+            .iter()
+            .all(|c| matches!(c.read, Err(ref error) if !matches!(error, OpError::NotReadInTime)))
+    {
         // Every read failed, so this returns the first channel's reason.
         reads.swap_remove(0).read?;
     }
@@ -760,50 +857,85 @@ pub async fn activity(state: &AppState, request: ActivityRequest) -> Result<Acti
     })
 }
 
-/// One channel's part of [`activity`].
-async fn window_activity(
+/// One channel's part of [`activity`], from what this server holds once the waiting is over.
+async fn channel_activity(
     state: &AppState,
-    channel_id: &str,
-    scan: u16,
+    channel: ChannelInfo,
+    began: tokio::time::Instant,
+    reuse: std::time::Duration,
     lines: u16,
     since_ms: i64,
-) -> Result<WindowActivity, OpError> {
-    let window = messages(state, channel_id, Some(scan)).await?;
+) -> ChannelActivity {
+    let known = state.live.recent().snapshot(&channel.id);
+    let Some(held) = known.held else {
+        let error = match known.failure {
+            Some(error) if !known.refreshing => OpError::Chat(error),
+            _ => OpError::NotReadInTime,
+        };
+        return ChannelActivity {
+            channel,
+            read: Err(error),
+            currency: Currency::Current,
+        };
+    };
+    let currency = if held.read_finished >= began || held.since_finished() <= reuse {
+        Currency::Current
+    } else {
+        Currency::Held {
+            age: held.age(),
+            // Said even while another read is running: "the last read failed" is the more useful
+            // of the two things that are true.
+            failed: known.failure.map(|error| OpError::Chat(error).code()),
+        }
+    };
+    let mut messages = held.messages;
+    stamp(state, &mut messages);
+    crate::noise::filter_for(state, &channel.id)
+        .await
+        .mark(&mut messages);
+    ChannelActivity {
+        channel,
+        read: Ok(window_activity(messages, held.whole, lines, since_ms)),
+        currency,
+    }
+}
+
+/// What one channel's window holds inside an activity span. `whole` says the messages are the
+/// entire channel.
+fn window_activity(
+    messages: Vec<Message>,
+    whole: bool,
+    lines: u16,
+    since_ms: i64,
+) -> WindowActivity {
     // The count is exact only when the read reached past the start of the window: either the
     // channel ran out, or its oldest fetched message is already older than the window. Otherwise
     // there may be more inside the window than this one fetch reached.
-    let complete = window.is_whole_channel()
-        || window
-            .messages
+    let complete = whole
+        || messages
             .first()
             .and_then(message_ms)
             .is_some_and(|ms| ms < since_ms);
-    let newest = window
-        .messages
-        .iter()
-        .rev()
-        .find(|m| !m.noise)
-        .and_then(|m| {
-            message_ms(m).map(|at_ms| Newest {
-                at_ms,
-                entry: summary::digest_entry(m, DEFAULT_SUMMARY_CHARS),
-            })
-        });
+    let newest = messages.iter().rev().find(|m| !m.noise).and_then(|m| {
+        message_ms(m).map(|at_ms| Newest {
+            at_ms,
+            entry: summary::digest_entry(m, DEFAULT_SUMMARY_CHARS),
+        })
+    });
     // A message whose time cannot be read is kept, as a time-range page keeps it: dropping it
     // would make the channel sound quieter than it is.
-    let (noise, kept): (Vec<Message>, Vec<Message>) = window
-        .messages
+    let (noise, kept): (Vec<Message>, Vec<Message>) = messages
         .into_iter()
         .filter(|m| message_ms(m).is_none_or(|ms| ms >= since_ms))
         .partition(|m| m.noise);
     let skip = kept.len().saturating_sub(usize::from(lines));
-    Ok(WindowActivity {
+    WindowActivity {
         entries: summary::digest(&kept[skip..], DEFAULT_SUMMARY_CHARS),
         counted: kept.len(),
         complete,
         noise: noise.len(),
         newest,
-    })
+    }
 }
 
 /// The largest page this server will hand back in one step.
@@ -3455,6 +3587,9 @@ mod tests {
         assert!(gone.read.is_err(), "the unreadable channel says so");
         assert_eq!(summaries(part(&activity, READ_CHANNEL)), ["still here"]);
 
+        // A server that holds nothing to fall back on. One that does answers from it, and says
+        // so: see `tests/voice_catchup.rs`. `#210 voice-catchup-speed`.
+        let (state, fake, _elevenlabs) = testing::state_from_toml(&toml);
         fake.revoke_token();
         let error = super::activity(&state, request(None))
             .await

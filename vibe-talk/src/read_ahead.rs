@@ -20,6 +20,8 @@
 //!
 //! [`messages_for_speech`] puts the first two together for the prepare route.
 //!
+//! See also [`crate::recent`], the voice catch-up's separate memory of each channel's window.
+//!
 //! # What is kept, and for how long
 //!
 //! Message text from allowlisted channels, in memory only, for thirty seconds from the moment the

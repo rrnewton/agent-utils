@@ -167,10 +167,14 @@ pub fn rpc(rpc_method: &str, credential: Credential, is_notification: bool) {
     );
 }
 
-/// One line for one tool call: which tool, which channel, and whether it was allowed.
+/// One line for one tool call: which tool, which channel, whether it was allowed, and how long it
+/// took.
 ///
 /// `reason` is the machine-readable refusal code — `forbidden_scope`, `unknown_channel`,
-/// `channel_not_writable`, `unknown_tool` — never free text from a channel.
+/// `channel_not_writable`, `unknown_tool` — never free text from a channel. `millis` is measured
+/// from the moment the call was parsed. `#210 voice-catchup-speed`: without it a tool's latency
+/// could only be recovered by pairing this line with its `request` line, and that line is missing
+/// in exactly the case that matters — a call the caller gave up on.
 pub fn tool_call(
     tool: &str,
     channel: Option<&str>,
@@ -178,6 +182,7 @@ pub fn tool_call(
     outcome: ToolOutcome,
     reason: Option<&str>,
     text_len: Option<usize>,
+    millis: u128,
 ) {
     tracing::info!(
         target: "vibe_talk::access",
@@ -189,6 +194,24 @@ pub fn tool_call(
         // A LENGTH, not the text. Enough to answer "did the whole message go through?" without
         // putting a word of it in the log.
         text_len = text_len.map_or(-1_i64, |n| i64::try_from(n).unwrap_or(i64::MAX)),
+        millis,
+        "tool"
+    );
+}
+
+/// One line for a tool call the caller stopped waiting for. `#210 voice-catchup-speed`.
+///
+/// A voice runtime gives a tool a fixed time and then drops the request. The server's handler is
+/// dropped with it, mid-call, so neither [`tool_call`] nor [`request`] is ever written, and the
+/// one call that mattered most left no trace here at all. This is written from that drop.
+pub fn tool_abandoned(tool: &str, channel: Option<&str>, credential: Credential, millis: u128) {
+    tracing::info!(
+        target: "vibe_talk::access",
+        tool,
+        channel = channel.unwrap_or("-"),
+        credential = credential.as_str(),
+        outcome = "abandoned",
+        millis,
         "tool"
     );
 }

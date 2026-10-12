@@ -168,6 +168,9 @@ impl From<OpError> for ApiError {
             // would mean some other caller grew a split path without deciding what to do with the
             // remainder, so it is a loud upstream failure rather than a quiet 500.
             OpError::PartiallyPosted { .. } => StatusCode::BAD_GATEWAY,
+            // Only ever one channel's part of a catch-up, never a whole answer; a gateway timeout
+            // is what it would be if it were.
+            OpError::NotReadInTime => StatusCode::GATEWAY_TIMEOUT,
             OpError::Chat(inner) => return Self::from(inner),
             OpError::Store(inner) => return Self::from(inner),
             OpError::Summarizer(inner) => {
@@ -933,11 +936,21 @@ pub async fn signed_url(
 /// Like the compatibility signed-URL endpoint, this requires WRITE scope because a conversation
 /// may hold tools with that authority. The descriptor is never cached: some providers return a
 /// short-lived bearer URL, and a generic route must honor the strictest provider it can select.
+///
+/// A session also starts reading every listed channel, in the background. `#210
+/// voice-catchup-speed`: the agent's first question comes after its greeting, five to six seconds
+/// later, and its catch-up is answered from those reads instead of waiting for them. Single-flight
+/// and skipped for a channel read recently enough, so a burst of call starts adds no reads.
 pub async fn voice_session(
     State(state): State<AppState>,
     _scope: WriteScope,
 ) -> Result<Response, ApiError> {
     let session: VoiceSession = state.conversation.open_session().await?;
+    let warming = crate::recent::warm(&state);
+    tracing::info!(
+        channels = warming,
+        "voice session opened; reading channels ahead of the agent"
+    );
     Ok(([(header::CACHE_CONTROL, "no-store")], Json(session)).into_response())
 }
 
@@ -1576,6 +1589,10 @@ pub struct ChannelActivityResponse {
     pub at_least: bool,
     /// Placeholders inside the window that the owner's noise rules call read.
     pub noise: usize,
+    /// Present when this channel was not read again in time and is answered from this server's
+    /// earlier copy: how many seconds ago that copy's read began. `#210 voice-catchup-speed`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub held_age_seconds: Option<u64>,
 }
 
 /// Every listed channel's last few hours.
@@ -1624,6 +1641,10 @@ pub async fn activity(
                 counted: read.counted,
                 at_least: !read.complete,
                 noise: read.noise,
+                held_age_seconds: match part.currency {
+                    ops::Currency::Current => None,
+                    ops::Currency::Held { age, .. } => Some(age.as_secs()),
+                },
             },
             Err(error) => ChannelActivityResponse {
                 channel: part.channel,
@@ -1632,6 +1653,7 @@ pub async fn activity(
                 counted: 0,
                 at_least: false,
                 noise: 0,
+                held_age_seconds: None,
             },
         })
         .collect();

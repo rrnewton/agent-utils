@@ -233,18 +233,15 @@ pub struct LiveHub {
     /// `#232 upstream-mark-read`. Fed on every publish, never waited on: see
     /// [`crate::upstream_clear`].
     upstream_clear: std::sync::Arc<crate::upstream_clear::Candidates>,
+    /// Each channel's newest window, kept current by every publish. `#210 voice-catchup-speed`.
+    /// Here for the reason `upstream_clear` is: both producers reach the hub, and only the hub,
+    /// so this is the one place a change cannot bypass. See [`crate::recent`].
+    recent: std::sync::Arc<crate::recent::RecentWindows>,
 }
 
 impl Default for LiveHub {
     fn default() -> Self {
-        let (hint_generation, _receiver) = watch::channel(0);
-        Self {
-            feeds: Mutex::new(BTreeMap::new()),
-            self_posted: Mutex::new((VecDeque::new(), BTreeSet::new())),
-            hinted: Mutex::new(BTreeMap::new()),
-            hint_generation,
-            upstream_clear: std::sync::Arc::new(crate::upstream_clear::Candidates::new()),
-        }
+        Self::with_recent(std::sync::Arc::new(crate::recent::RecentWindows::new()))
     }
 }
 
@@ -253,6 +250,27 @@ impl LiveHub {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// An empty hub keeping its channel windows in `recent`. For a test that shortens the
+    /// catch-up's durations; see [`crate::recent::Timing`].
+    #[must_use]
+    pub fn with_recent(recent: std::sync::Arc<crate::recent::RecentWindows>) -> Self {
+        let (hint_generation, _receiver) = watch::channel(0);
+        Self {
+            feeds: Mutex::new(BTreeMap::new()),
+            self_posted: Mutex::new((VecDeque::new(), BTreeSet::new())),
+            hinted: Mutex::new(BTreeMap::new()),
+            hint_generation,
+            upstream_clear: std::sync::Arc::new(crate::upstream_clear::Candidates::new()),
+            recent,
+        }
+    }
+
+    /// Each channel's held window. `#210 voice-catchup-speed`.
+    #[must_use]
+    pub fn recent(&self) -> &std::sync::Arc<crate::recent::RecentWindows> {
+        &self.recent
     }
 
     /// The messages waiting to be cleared at their provider. `#232 upstream-mark-read`.
@@ -381,6 +399,7 @@ impl LiveHub {
                 }
             }
         }
+        self.recent.merge(channel, &live);
         feed.tail.push_back(live.clone());
         while feed.tail.len() > REPLAY_TAIL {
             feed.tail.pop_front();

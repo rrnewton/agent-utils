@@ -6,6 +6,7 @@
 use std::collections::BTreeMap;
 use std::io;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use crate::agent_backend::NoAgentBackend;
 use crate::config::Config;
@@ -286,6 +287,124 @@ fn state_pieces_with(
         thread_names: Arc::new(crate::summarize::threads::ThreadNames::new()),
     };
     (state, fake, elevenlabs, store)
+}
+
+/// A chat provider that takes its time, ONE READ AT A TIME: the shape of a bridge with a single
+/// command slot in front of a slow service. `#210 voice-catchup-speed`.
+///
+/// Every read of a channel's messages queues for the one slot, then waits its delay, then answers
+/// from the [`FakeDiscord`] it wraps. A channel can be stalled on its own, to stand for the one
+/// command that hangs for a minute. Time is tokio's, so a test that pauses the clock measures
+/// these waits exactly and spends none of them.
+pub struct SlowChat {
+    inner: Arc<FakeDiscord>,
+    slot: tokio::sync::Semaphore,
+    delay: Duration,
+    stalled: Mutex<BTreeMap<crate::model::ChannelId, Duration>>,
+    reads: std::sync::atomic::AtomicUsize,
+}
+
+impl SlowChat {
+    /// Wrap `inner`, every read taking `delay` once it holds the slot.
+    #[must_use]
+    pub fn new(inner: Arc<FakeDiscord>, delay: Duration) -> Self {
+        Self {
+            inner,
+            slot: tokio::sync::Semaphore::new(1),
+            delay,
+            stalled: Mutex::new(BTreeMap::new()),
+            reads: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+
+    /// Make every read of `channel` take `delay` instead, until [`SlowChat::release`].
+    pub fn stall(&self, channel: &crate::model::ChannelId, delay: Duration) {
+        lock(&self.stalled).insert(channel.clone(), delay);
+    }
+
+    /// Give `channel` the ordinary delay again.
+    pub fn release(&self, channel: &crate::model::ChannelId) {
+        lock(&self.stalled).remove(channel);
+    }
+
+    /// How many reads were asked of this provider, queued ones included.
+    #[must_use]
+    pub fn reads(&self) -> usize {
+        self.reads.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    async fn wait_turn(
+        &self,
+        channel: &crate::model::ChannelId,
+    ) -> Result<tokio::sync::SemaphorePermit<'_>, crate::chat::ChatError> {
+        self.reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let permit = self
+            .slot
+            .acquire()
+            .await
+            .map_err(|_| crate::chat::ChatError::Transport("the slot closed".to_owned()))?;
+        let delay = lock(&self.stalled)
+            .get(channel)
+            .copied()
+            .unwrap_or(self.delay);
+        tokio::time::sleep(delay).await;
+        Ok(permit)
+    }
+}
+
+fn lock<T>(cell: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    cell.lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+#[async_trait::async_trait]
+impl crate::chat::ChatClient for SlowChat {
+    fn provider_name(&self) -> &str {
+        self.inner.provider_name()
+    }
+
+    async fn identity(&self) -> Result<crate::chat::ChatIdentity, crate::chat::ChatError> {
+        self.inner.identity().await
+    }
+
+    async fn fetch_page(
+        &self,
+        channel: &crate::model::ChannelId,
+        limit: u16,
+        before: Option<&crate::model::MessageId>,
+        after: Option<&crate::model::MessageId>,
+    ) -> Result<Vec<crate::model::Message>, crate::chat::ChatError> {
+        let _turn = self.wait_turn(channel).await?;
+        self.inner.fetch_page(channel, limit, before, after).await
+    }
+
+    async fn fetch_recent(
+        &self,
+        channel: &crate::model::ChannelId,
+        limit: u16,
+    ) -> Result<Vec<crate::model::Message>, crate::chat::ChatError> {
+        let _turn = self.wait_turn(channel).await?;
+        self.inner.fetch_recent(channel, limit).await
+    }
+
+    async fn post_message(
+        &self,
+        channel: &crate::model::ChannelId,
+        content: &str,
+        reply_to: Option<&crate::model::MessageId>,
+    ) -> Result<crate::model::Message, crate::chat::ChatError> {
+        self.inner.post_message(channel, content, reply_to).await
+    }
+}
+
+/// `state` with its channel windows kept to `timing` rather than the production durations.
+/// `#210 voice-catchup-speed`. A fresh hub, so call it before anything is published.
+#[must_use]
+pub fn with_recent_timing(mut state: AppState, timing: crate::recent::Timing) -> AppState {
+    state.live = Arc::new(crate::live::LiveHub::with_recent(Arc::new(
+        crate::recent::RecentWindows::with_timing(timing),
+    )));
+    state
 }
 
 /// A directory that deletes itself, so a test can drive the real SQLite store.

@@ -990,3 +990,68 @@ async fn a_failed_read_aloud_warm_up_is_a_warning_with_its_code_and_nothing_else
         "the provider's detail reached the log:\n{text}"
     );
 }
+
+/// `#210 voice-catchup-speed`. Every tool line says how long the call took, a catch-up says how
+/// its channels were answered, and a call the caller gave up on leaves a line of its own. Before,
+/// an abandoned call left neither a tool line nor a request line: the one call that mattered most
+/// was the one the log could not see. Here rather than beside the other catch-up tests because
+/// a capture only sees a line whose call site was first reached under some capture.
+#[tokio::test(start_paused = true)]
+async fn a_tool_call_is_timed_and_an_abandoned_one_still_leaves_a_line() {
+    use std::sync::Arc;
+    use std::time::Duration;
+    use vibe_talk::mcp::protocol::{dispatch, Outcome};
+
+    let capture = LogCapture::info_only();
+    let (mut state, discord) = vibe_talk::testing::state();
+    discord.seed(
+        &ChannelId(READ_CHANNEL.to_owned()),
+        "codex-eng",
+        "secret plan",
+    );
+    let slow = Arc::new(vibe_talk::testing::SlowChat::new(
+        Arc::clone(&discord),
+        Duration::from_secs(2),
+    ));
+    let client: Arc<dyn vibe_talk::chat::ChatClient> = slow;
+    state.replace_chat(client);
+    let call = tools_call("recent_activity", json!({}));
+
+    let abandoned = tokio::time::timeout(
+        Duration::from_millis(500),
+        dispatch(&state, vibe_talk::auth::Scope::Read, &call),
+    )
+    .await;
+    assert!(abandoned.is_err(), "the caller gave up first");
+    let lines = capture.access_lines();
+    let gave_up = lines
+        .iter()
+        .find(|line| line.contains("outcome=\"abandoned\""))
+        .unwrap_or_else(|| panic!("an abandoned call left no line: {lines:#?}"));
+    assert!(gave_up.contains("tool=\"recent_activity\""), "{gave_up}");
+    assert!(gave_up.contains("millis="), "{gave_up}");
+
+    // The reads the abandoned call started land; the next call is answered from them.
+    tokio::time::sleep(Duration::from_secs(10)).await;
+    let outcome = dispatch(&state, vibe_talk::auth::Scope::Read, &call).await;
+    assert!(matches!(outcome, Outcome::Reply(_)), "{outcome:?}");
+    let lines = capture.access_lines();
+    let answered = lines
+        .iter()
+        .find(|line| line.contains("outcome=\"ok\""))
+        .unwrap_or_else(|| panic!("no answered line: {lines:#?}"));
+    assert!(answered.contains("millis="), "{answered}");
+    let sources = lines
+        .iter()
+        .find(|line| line.contains("recent_activity current="))
+        .unwrap_or_else(|| panic!("no catch-up line: {lines:#?}"));
+    assert!(
+        sources.contains("current=2") && sources.contains("held=0") && sources.contains("unread=0"),
+        "{sources}"
+    );
+    assert!(
+        !capture.text().contains("secret plan"),
+        "channel text reached the log: {}",
+        capture.text()
+    );
+}
