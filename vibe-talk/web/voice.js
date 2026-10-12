@@ -12164,13 +12164,16 @@ const pickerGreyed = () => el("thread-select").getAttribute("aria-disabled") ===
 
 /**
  * The keys that open a picker or change what it has chosen without opening it: the arrows and the
- * page keys, Space, Enter, F4, and a character, which a picker takes as a search of its options.
- * Not Tab, which leaves it, nor Escape, which goes back to the list, nor a chord, which is the page's
- * or the browser's.
+ * page keys, Space, Enter, F4, Alt+↓ and Alt+↑, and a character, which a picker takes as a search of
+ * its options — so on the greyed picker a letter is not one of the page's keys, as on a picker that
+ * chooses, which takes it too. Not Tab, which leaves it, nor Escape, which goes back to the list, nor
+ * any other chord, which is the page's or the browser's.
  *
  * @param {KeyboardEvent} event
  */
 function picksByKey(event) {
+  // Alt+↓ and Alt+↑ open a picker in Chromium and Firefox off a Mac; no other chord touches one.
+  if (event.altKey && !event.ctrlKey && !event.metaKey) return event.key === "ArrowDown" || event.key === "ArrowUp";
   if (event.ctrlKey || event.metaKey || event.altKey) return false;
   return ["ArrowDown", "ArrowUp", "ArrowLeft", "ArrowRight", "Home", "End", "PageUp", "PageDown", "Enter", "F4"]
     .includes(event.key) || String(event.key || "").length === 1;
@@ -27183,10 +27186,12 @@ el("thread-select").addEventListener("keydown", (event) => {
 el("close-threads").addEventListener("click", closeThreadDirectory);
 el("thread-directory-more").addEventListener("click", guardQuietly(() => loadThreadDirectory(true)));
 el("thread-directory-retry").addEventListener("click", guardQuietly(() => loadThreadDirectory(threadDirectory.older)));
-// Touching the picker is the cue that the reader wants the full list of threads.
+// Touching the picker is the cue that the reader wants the full list of threads. Not the greyed one
+// (`#231 two-column-polish`), which a Tab passes through and which opens nothing: the list it would
+// read is read by the poll while the cards are up, and with a thread open is wanted by nothing.
 for (const type of ["focus", "pointerdown"]) {
   el("thread-select").addEventListener(type, () => {
-    guardQuietly(refreshThreadDirectory)();
+    if (!pickerGreyed()) guardQuietly(refreshThreadDirectory)();
   });
 }
 el("channel-compose-text").addEventListener("input", rememberChannelDraft);

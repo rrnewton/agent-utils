@@ -39130,13 +39130,21 @@ test("`#231 two-column-polish`: the greyed view picker is still a stop for the k
   assert.match(note.textContent, /^Two columns: Main is on the left and the thread on the right\./,
     "the picker's description does not say why it is greyed");
   // Each key that would open it or choose with it: nothing chosen, the browser kept from it, and why.
-  for (const key of ["ArrowDown", " ", "Enter", "End", "t"]) {
+  // Alt+↓ and Alt+↑ open a picker in Chromium and Firefox off a Mac.
+  for (const [key, fields] of [["ArrowDown", {}], [" ", {}], ["Enter", {}], ["End", {}], ["t", {}],
+    ["ArrowDown", { altKey: true }], ["ArrowUp", { altKey: true }]]) {
+    const name = `${fields.altKey ? "Alt+" : ""}${JSON.stringify(key)}`;
     page.el("status").textContent = "";
-    const event = await press(page, picker, key);
-    assert.equal(event.defaulted, false, `${JSON.stringify(key)} on the greyed picker was left to the browser`);
-    assert.match(page.el("status").textContent, /^Two columns: Main is on the left/, `${JSON.stringify(key)} did not say why`);
+    const event = await press(page, picker, key, fields);
+    assert.equal(event.defaulted, false, `${name} on the greyed picker was left to the browser`);
+    assert.match(page.el("status").textContent, /^Two columns: Main is on the left/, `${name} did not say why`);
     assert.equal(picker.value, "main");
   }
+  // Another chord is the browser's, Alt+← its way back among them.
+  page.el("status").textContent = "";
+  const back = await press(page, picker, "ArrowLeft", { altKey: true });
+  assert.equal(back.defaulted, true, "Alt+← on the greyed picker was kept from the browser");
+  assert.equal(page.el("status").textContent, "", "Alt+← on the greyed picker was refused as a press of it");
   // Escape is still the way off it, back to the list.
   await press(page, picker, "Escape");
   assert.ok(focused(page) === page.el("scroll-area") || page.el("discord-log").children.includes(focused(page)),
@@ -39166,6 +39174,30 @@ test("`#231 two-column-polish`: the greyed view picker is still a stop for the k
   await showDiscord(flat, [message({ content: "no threads on this provider" })]);
   assert.equal(flat.el("thread-select").disabled, true);
   assert.match(flat.el("thread-select-note").textContent, /does not offer threads here/);
+});
+
+test("`#231 two-column-polish` x `#226 page-energy-profile`: the greyed view picker, tabbed to or pressed, reads nothing", async () => {
+  // A touch on the picker reads the thread list, for the picker to offer. The greyed one opens
+  // nothing, and with a thread open on the right nothing else wants that list.
+  const touched = async (script) => {
+    const { page, server } = await twoColumnServer(null, script);
+    await threadBadge(rowWithId(page, "201")).click();
+    await page.settle();
+    page.setClock(page.clock() + THREAD_DIRECTORY_REFRESH_MS + 1000);
+    const reads = server.reads.length;
+    const picker = page.el("thread-select");
+    assert.equal(picker.getAttribute("aria-disabled"), "true");
+    await picker.dispatch("focus");
+    await picker.dispatch("pointerdown", { pointerType: "mouse" });
+    await page.settle();
+    return server.reads.slice(reads).map((read) => read.view);
+  };
+  assert.deepStrictEqual(await touched(SCRIPT), [], "a touch on the greyed picker read something");
+  // The control: the touch read as it is on a picker that chooses. The same touch has to read the
+  // list, or the check above could not see it.
+  const control = await touched(brokenScript("    if (!pickerGreyed()) guardQuietly(refreshThreadDirectory)();",
+    "    guardQuietly(refreshThreadDirectory)();"));
+  assert.deepStrictEqual(control, ["threads"], "the negative control did not read the thread list, so the check above proves nothing");
 });
 
 /** The top-level bindings of `code` that nothing else in it names: declared, and never used. */
