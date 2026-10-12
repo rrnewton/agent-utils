@@ -1318,10 +1318,20 @@ body {
   font-size: 0.85em;
 }
 
-/* Under the pointer or the keyboard an archived row comes all the way back — it still carries a
+/* Selected, or holding the focus, an archived row comes all the way back — it still carries a
    Reply and an Unarchive, and a control nobody can read is a control that looks broken. The
    opacity half of this is handled by the shared rules below; the tint has to be restored here
-   because `filter` does not inherit that treatment. */
+   because `filter` does not inherit that treatment. `#239 single-selection`: selected is what the
+   mouse over a row is now, as well as the keys' choice. */
+#side-log li.discord-message[data-archived="true"][data-selected="true"],
+#discord-log li.discord-message[data-archived="true"][data-selected="true"],
+#pinned-log li.discord-message[data-archived="true"][data-selected="true"],
+#side-log li.discord-message[data-own-read="true"][data-selected="true"],
+#discord-log li.discord-message[data-own-read="true"][data-selected="true"],
+#pinned-log li.discord-message[data-own-read="true"][data-selected="true"],
+#side-log li.discord-message[data-noise="true"][data-selected="true"],
+#discord-log li.discord-message[data-noise="true"][data-selected="true"],
+#pinned-log li.discord-message[data-noise="true"][data-selected="true"],
 #side-log li.discord-message[data-archived="true"]:focus-within,
 #discord-log li.discord-message[data-archived="true"]:focus-within,
 #pinned-log li.discord-message[data-archived="true"]:focus-within,
@@ -2291,9 +2301,9 @@ body {
    has a Reply and an Unarchive on it, and a control at 40% opacity that somebody has tabbed to is
    a control that looks broken.
 
-   The hover half of this pair is inside the pointer query above, and the split is not cosmetic — a
-   tap on a touch screen leaves `:hover` stuck on the row it landed on, so a phone would end up with
-   one permanently undimmed row and no way to clear it. Same rule, same reason, as the row tint. */
+   The pointer's half of this pair is the selection's (`#239 single-selection`, below), and not a
+   `:hover`: a tap on a touch screen leaves `:hover` stuck on the row it landed on, so a phone would
+   end up with one permanently undimmed row and no way to clear it. */
 #side-log li.discord-message:focus-within,
 #discord-log li.discord-message:focus-within,
 #pinned-log li.discord-message:focus-within {
@@ -3750,124 +3760,108 @@ body {
 
 /* ------------------------------------------------------- one channel row at a time --------- */
 /*
- * `#56 message-hover-highlight`. A long channel is a wall of blocks; Discord delineates the row
- * under the pointer because a mouse gives it something to delineate WITH. That is the whole
- * justification, and it is also the whole limit: on a touch screen there is no pointer, and a
- * `:hover` rule fires on tap and then STAYS lit until you tap something else — a row that looks
- * selected when nothing is.
+ * `#56 message-hover-highlight`, then `#239 single-selection`. A long channel is a wall of blocks,
+ * and the row the reader is on is delineated: its surface turns `--row-hover`, its edge the accent,
+ * its controls come up to full contrast, and a dimmed row comes back to full strength.
  *
- * So the tint is behind `(hover: hover) and (pointer: fine)`, which asks the two questions that
- * actually matter: can this device hover at all, and is its pointer precise. Not a width query —
- * a touch laptop is wide and still must not get this — and not a user-agent string. This is the
- * pointer half of the same capability regime `#55 voice-desktop-app` introduced at the foot of
- * this file; they are deliberately two queries rather than one, because a narrow window with a
- * mouse should still light its rows.
+ * ONE ROW AT A TIME, AND ONE LOOK. That row used to be lit two ways: by `:hover` under the mouse,
+ * and by the focus when the keyboard selected a message. The owner, on a desk, lit a message with the
+ * mouse and pressed ↓, and two messages were lit at once, with nothing to say which one Enter would
+ * open. So the row is lit by the selection alone, `data-selected` (the keyboard section of
+ * web/voice.js): the mouse moving over a row selects it, a key moves the selection on from there,
+ * and the attribute is on one row of the page at most. The ring is part of the look whichever put it
+ * there, so a message chosen by the mouse is drawn exactly as one chosen by the keys.
+ *
+ * NOTHING HERE IS A `:hover` ON A ROW. A pointer standing still while a key scrolls the list under
+ * it, or while a message arrives, would light the row that slid beneath it, and that is the second
+ * lit message again. It also keeps the old promise of the pointer query: on a touch screen `:hover`
+ * fires on a tap and stays until the next tap somewhere else, a row that looks selected when nothing
+ * is; a tap selects silently, and draws nothing.
  *
  * NOT in web/style.css, which the phone app at `/` shares and where `.messages li.selected` means
  * something else entirely.
  */
-@media (hover: hover) and (pointer: fine) {
-  #side-log li.discord-message:hover,
-  #discord-log li.discord-message:hover,
-  #pinned-log li.discord-message:hover {
-    background: var(--row-hover);
-    border-color: var(--accent);
-  }
-
-  #side-log li.discord-message:hover .reply-button,
-  #discord-log li.discord-message:hover .reply-button,
-  #pinned-log li.discord-message:hover .reply-button,
-  #side-log li.discord-message:hover .done-button,
-  #discord-log li.discord-message:hover .done-button,
-  #pinned-log li.discord-message:hover .done-button,
-  #side-log li.discord-message:hover .not-noise-button,
-  #discord-log li.discord-message:hover .not-noise-button,
-  #pinned-log li.discord-message:hover .not-noise-button,
-  #side-log li.discord-message:hover .upstream-read-button,
-  #discord-log li.discord-message:hover .upstream-read-button,
-  #pinned-log li.discord-message:hover .upstream-read-button {
-    color: var(--ink);
-    border-color: var(--accent);
-  }
-
-  /* An answered or archived row is dimmed, and comes back to full contrast under the pointer. In
-     here rather than outside, because `:hover` sticks to the last-tapped row on a touch screen and
-     a phone would be left with exactly one permanently bright row. */
-  #side-log li.discord-message:hover,
-  #discord-log li.discord-message:hover,
-  #pinned-log li.discord-message:hover {
-    --row-opacity: 1;
-  }
-
-  /* The archived row's colour, on the same terms and for the same reason. */
-  #side-log li.discord-message[data-archived="true"]:hover,
-  #discord-log li.discord-message[data-archived="true"]:hover,
-  #pinned-log li.discord-message[data-archived="true"]:hover,
-  #side-log li.discord-message[data-own-read="true"]:hover,
-  #discord-log li.discord-message[data-own-read="true"]:hover,
-  #pinned-log li.discord-message[data-own-read="true"]:hover,
-  #side-log li.discord-message[data-noise="true"]:hover,
-  #discord-log li.discord-message[data-noise="true"]:hover,
-  #pinned-log li.discord-message[data-noise="true"]:hover {
-    --row-filter: none;
-    --row-grey: 0;
-  }
-
-  /* `#204 reply-arrow`. The arrow's disc, under the pointer, as it shows when pressed; and the X
-     beside gathered replies' bridge, `#215 reply-coalesce`. */
-  #side-log .reply-jump:hover,
-  #discord-log .reply-jump:hover,
-  #side-log .reply-ungather:hover,
-  #discord-log .reply-ungather:hover {
-    background: color-mix(in srgb, var(--accent) 18%, transparent);
-  }
-
-  /* `#228 reply-visible`. The circle's halo, under the pointer, as it shows when pressed. */
-  #side-log .reply-marker:hover::before,
-  #discord-log .reply-marker:hover::before {
-    box-shadow: 0 0 0 0.25rem color-mix(in srgb, var(--accent) 30%, transparent);
-  }
-
-  /* `#221 read-modes`. A collapsed run's line, brought up under the pointer, as when pressed. */
-  #side-log .read-run:hover,
-  #discord-log .read-run:hover {
-    color: var(--ink);
-  }
+#side-log li.discord-message[data-selected="true"],
+#discord-log li.discord-message[data-selected="true"],
+#pinned-log li.discord-message[data-selected="true"] {
+  background: var(--row-hover);
+  border-color: var(--accent);
+  /* Inside the row's own border, which the scroller's edge would otherwise clip. */
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
+  --row-opacity: 1;
 }
 
-/* The keyboard's equivalent, and deliberately UNGATED: a keyboard is not a pointer, and somebody
-   tabbing through the channel gets the same "you are here" a mouse gets, on every device. Discord's
-   principle is that the row lights up AND its actions become reachable; the actionable child is the
-   reply control `#51 reply-view` puts on the row, and `:focus-within` covers both the row and it. */
-#side-log li.discord-message:focus-within,
-#discord-log li.discord-message:focus-within,
-#pinned-log li.discord-message:focus-within {
-  background: var(--row-hover);
+/* The selected row's own controls gain the accent WITH it rather than appearing out of nothing.
+   Discord hides its row actions until hover; this page does not, and that is a decision rather than
+   an omission: the standing rule here is that a control which cannot act is ABSENT, so a control
+   that CAN act must not be invisible. A reader who has never selected a row still has to be able to
+   see that a reply is possible. */
+#side-log li.discord-message[data-selected="true"] .reply-button,
+#discord-log li.discord-message[data-selected="true"] .reply-button,
+#pinned-log li.discord-message[data-selected="true"] .reply-button,
+#side-log li.discord-message[data-selected="true"] .done-button,
+#discord-log li.discord-message[data-selected="true"] .done-button,
+#pinned-log li.discord-message[data-selected="true"] .done-button,
+#side-log li.discord-message[data-selected="true"] .not-noise-button,
+#discord-log li.discord-message[data-selected="true"] .not-noise-button,
+#pinned-log li.discord-message[data-selected="true"] .not-noise-button,
+#side-log li.discord-message[data-selected="true"] .upstream-read-button,
+#discord-log li.discord-message[data-selected="true"] .upstream-read-button,
+#pinned-log li.discord-message[data-selected="true"] .upstream-read-button {
+  color: var(--ink);
   border-color: var(--accent);
 }
 
-/* `#224 keyboard-shortcuts`. THE SELECTED MESSAGE: the row itself holds the focus (see the keyboard
-   section of web/voice.js), and the ring says so whenever the keyboard put it there — `:focus-visible`,
-   so a click on the selected row lights it as `:focus-within` above does and draws no ring. Inside
-   the row's own border, which the scroller's edge would otherwise clip. */
-#side-log li.discord-message:focus-visible,
-#discord-log li.discord-message:focus-visible,
-#pinned-log li.discord-message:focus-visible {
+/* `#221 read-modes`. A collapsed run's line gives up the row's tile, ring included, so its selection
+   is drawn on the line: the look it has when pressed, and the ring. */
+#side-log li.discord-message[data-read-run="head"][data-selected="true"] > .read-run,
+#discord-log li.discord-message[data-read-run="head"][data-selected="true"] > .read-run {
+  background: color-mix(in srgb, var(--accent) 14%, transparent);
+  color: var(--ink);
   outline: 2px solid var(--accent);
   outline-offset: -2px;
 }
 
-/* The reply control gains the accent WITH its row rather than appearing out of nothing. Discord
-   hides its row actions until hover; this page does not, and that is a decision rather than an
-   omission — the standing rule here is that a control which cannot act is ABSENT, so a control
-   that CAN act must not be invisible. A reader who has never hovered a row still has to be able to
-   see that a reply is possible. (The hover half of this pair lives inside the query above; only
-   the focus half belongs out here.) */
-#side-log li.discord-message:focus-within .reply-button,
-#discord-log li.discord-message:focus-within .reply-button,
-#pinned-log li.discord-message:focus-within .reply-button {
-  color: var(--ink);
-  border-color: var(--accent);
+/*
+ * What a pointer resting on a CONTROL in a row lights: the disc of a reply's arrow and of the X beside
+ * gathered replies (`#204 reply-arrow`, `#215 reply-coalesce`), the halo of the circle at a row's
+ * corner (`#228 reply-visible`). Only where a pointer can hover, for the sticky-tap reason above, and
+ * not while the keys are in use (`data-input="keys"` on the root, until the mouse really moves): a
+ * key scrolling the list under a still pointer lights nothing it did not select.
+ */
+@media (hover: hover) and (pointer: fine) {
+  :root:not([data-input="keys"]) #side-log .reply-jump:hover,
+  :root:not([data-input="keys"]) #discord-log .reply-jump:hover,
+  :root:not([data-input="keys"]) #side-log .reply-ungather:hover,
+  :root:not([data-input="keys"]) #discord-log .reply-ungather:hover {
+    background: color-mix(in srgb, var(--accent) 18%, transparent);
+  }
+
+  :root:not([data-input="keys"]) #side-log .reply-marker:hover::before,
+  :root:not([data-input="keys"]) #discord-log .reply-marker:hover::before {
+    box-shadow: 0 0 0 0.25rem color-mix(in srgb, var(--accent) 30%, transparent);
+  }
+}
+
+/* A touch screen keeps what it had: a row holding the focus (a finger on one of its controls focuses
+   it, on some phones) is lit as the selection is, without the ring, because a tap there draws no
+   selection of its own. Not where a mouse is: there the focus and the selection are one row, and
+   the selection draws it. */
+@media (hover: none), (pointer: coarse) {
+  #side-log li.discord-message:focus-within,
+  #discord-log li.discord-message:focus-within,
+  #pinned-log li.discord-message:focus-within {
+    background: var(--row-hover);
+    border-color: var(--accent);
+  }
+
+  #side-log li.discord-message:focus-within .reply-button,
+  #discord-log li.discord-message:focus-within .reply-button,
+  #pinned-log li.discord-message:focus-within .reply-button {
+    color: var(--ink);
+    border-color: var(--accent);
+  }
 }
 
 /* THE CHANNEL ROW'S METADATA LINE MUST WRAP, and this is not tidying.
@@ -5484,14 +5478,16 @@ textarea {
     cursor: pointer;
   }
 
-  .side-card:hover,
+  /* `#239 single-selection`. The selected card is lit as a selected message is, by `data-selected`
+     alone and whether the mouse or the keys chose it: a `:hover` here was a second lit card beside
+     the keys' one. The card's own button keeps its ring for the Tab that lands on it, in that row. */
   .side-card:focus-visible,
-  .side-card-row:focus-visible > .side-card {
+  .side-card-row[data-selected="true"] > .side-card {
     border-color: var(--accent);
     border-left-color: hsl(var(--thread-hue, 210) 55% 50%);
   }
 
-  .side-card-row:focus-visible {
+  .side-card-row[data-selected="true"] {
     outline: 2px solid var(--accent);
     outline-offset: 2px;
     border-radius: 0.6rem;

@@ -14388,26 +14388,39 @@ test("every rendered channel row carries the hook the hover rule depends on", as
   }
 });
 
-test("A TAPPED ROW CANNOT STAY LIT: the hover tint is behind a pointer query", async () => {
-  // The property. `:hover` on a touch screen fires on tap and stays until the next tap somewhere
-  // else — a row that looks selected when nothing is. Being INSIDE the query is only half of it;
-  // the other half is not being anywhere else, because a page that declares the rule twice is a
-  // page where the phone gets it.
-  const selector = "#discord-log li.discord-message:hover";
-  const tint = cssBlockIn(HOVER_QUERY, selector);
-  assert.match(tint, /background:\s*var\(--row-hover\)/);
-  assert.match(tint, /border-color:\s*var\(--accent\)/, "the tint alone is not a delineation");
-  assert.equal(
-    cssRulesElsewhere(HOVER_QUERY, selector),
-    0,
-    "the hover rule is ALSO declared outside the pointer query, so a phone gets it too"
-  );
-  // And the query asks the two questions that matter, not a width — a touch laptop is wide.
+test("ONE LOOK FOR THE SELECTED ROW, on every device, and no row lit by `:hover` anywhere", async () => {
+  // `#239 single-selection`. The row the reader is on was lit two ways: `:hover` under the mouse, and
+  // the focus when the keys selected it, and the owner had two rows lit at once. The selection is now
+  // the only thing that lights a row: `data-selected`, drawn the same whoever chose it, ring and all.
+  const selector = '#discord-log li.discord-message[data-selected="true"]';
+  const lit = cssRules(CSS_UNCONDITIONAL, selector).join("\n");
+  assert.ok(lit, "the selected row's look is behind a media query, so some device never draws it");
+  assert.match(lit, /background:\s*var\(--row-hover\)/, "the selected row is not a different surface");
+  assert.match(lit, /border-color:\s*var\(--accent\)/, "the tint alone is not a delineation");
+  assert.match(lit, /outline:\s*2px solid var\(--accent\)/, "the selected row has no ring");
+  for (const list of ["#side-log", "#pinned-log"]) {
+    assert.ok(cssRules(CSS_UNCONDITIONAL, selector.replace("#discord-log", list)).length > 0, `${list} draws no selection`);
+  }
+  // A TAPPED ROW CANNOT STAY LIT, the property `#56 message-hover-highlight` was about: a tap selects
+  // silently (below), and no rule anywhere lights a row under a pointer, which on a touch screen
+  // fires on a tap and stays. Nor a second ring for the focus beside the selection's.
+  assert.doesNotMatch(CSS_CODE, /li\.discord-message[^{},]*:hover/, "a row is still lit by `:hover`");
+  assert.doesNotMatch(CSS_CODE, /\.side-card(-row)?:hover/, "a card is still lit by `:hover`");
+  assert.doesNotMatch(CSS_CODE, /li\.discord-message:focus-visible/, "the focus draws a ring of its own beside the selection's");
+  // What a pointer still lights inside the lists, a control's disc or halo, is behind the pointer
+  // query and held back while the keys are in use.
+  const hovers = mediaBody(HOVER_QUERY).match(/[^{}]*:hover[^{}]*\{/g) || [];
+  assert.ok(hovers.length > 0, "the controls in a row lost their pointer feedback");
+  for (const rule of hovers) {
+    for (const part of rule.replace(/\{$/, "").split(",").map((one) => one.trim())) {
+      assert.match(part, /^:root:not\(\[data-input="keys"\]\) /, `${part} lights while the keys are in use`);
+    }
+  }
   assert.equal(
     (CSS_CODE.match(new RegExp(`@media ${HOVER_QUERY.replace(/[()]/g, "\\$&")}`, "g")) || []).length,
     1,
-    "the pointer regime is declared in more than one block, so `cssBlockIn` is only reading the " +
-      "first of them and everything below is about half the rules"
+    "the pointer regime is declared in more than one block, so `mediaBody` is only reading the " +
+      "first of them and everything above is about half the rules"
   );
   assert.doesNotMatch(
     mediaBody(HOVER_QUERY),
@@ -14447,17 +14460,18 @@ test("the hovered surface is really a DIFFERENT surface, in both schemes", async
   }
 });
 
-test("a keyboard gets the same affordance, on every device", async () => {
-  // Ungated on purpose: a keyboard is not a pointer. Somebody tabbing through the channel on a
-  // phone with a keyboard attached still needs to know which row they are on.
+test("a touch screen keeps its focus tint, and a desk draws the focused row only as the selection", async () => {
+  // A finger on a row's control focuses it on some phones, and the row was lit for it; that stays,
+  // for touch screens, where a tap draws no selection of its own. On a desk the focus and the
+  // selection are one row (web/voice.js moves them together), and a second rule lighting the focus
+  // would be a second lit row the moment they parted. `#239 single-selection`.
   const selector = "#discord-log li.discord-message:focus-within";
-  const focused = cssRules(CSS_UNCONDITIONAL, selector).join("\n");
-  assert.ok(
-    focused,
-    "the focus treatment is behind SOME media query, so a keyboard on the wrong device never gets it"
-  );
-  assert.match(focused, /background:\s*var\(--row-hover\)/, "focus gets no treatment at all");
+  const TOUCH_QUERY = "(hover: none), (pointer: coarse)";
+  const focused = cssBlockIn(TOUCH_QUERY, selector);
+  assert.match(focused, /background:\s*var\(--row-hover\)/, "focus gets no treatment on a touch screen");
   assert.match(focused, /border-color:\s*var\(--accent\)/);
+  assert.doesNotMatch(cssBlockOutside(TOUCH_QUERY, selector), /background|border-color/,
+    "the focus tint is ALSO declared outside the touch query, so a desk lights the focus beside the selection");
 });
 
 // --- replying to a channel message ---------------------------------------------------------------
@@ -17987,6 +18001,9 @@ test("THE SELECTION OUTLIVES A REDRAW: the new row takes the focus; a row that g
   assert.equal(focused(page).parentNode, page.el("discord-log"), "the focus is on a row no longer in the list");
   assert.equal(focused(page).getAttribute("tabindex"), "0");
   if (focused(page) !== old) assert.equal(old.getAttribute("tabindex"), null, "the row that went kept its tabindex");
+  // ...and is the one lit. `#239 single-selection`.
+  assert.deepStrictEqual(page.el("discord-log").children.filter((li) => li.getAttribute("data-selected") === "true")
+    .map((li) => li.getAttribute("data-id")), ["10"], "after the redraw the selected message is not the one lit");
   // A redraw while the reader types takes nothing from them.
   page.el("channel-compose-text").focus();
   await refreshDiscord(page, [...messages, message({ id: "31", content: "a new message" }), message({ id: "32", content: "and another" })]);
@@ -18217,16 +18234,210 @@ test("HOME AND END over the channel take the list to its ends and select the mes
   assert.equal(page.el("jump-newest").hidden, true, "End left the jump to the newest standing");
 });
 
-test("A CLICK SELECTS SILENTLY: no focus and no ring, and the next key starts from the message clicked", async () => {
+// --- one selection, the mouse's and the keys' (#239 single-selection) ----------------------------
+//
+// The owner, on a desk: "If I highlight a message with the mouse and then press up/down then I end up
+// with DOUBLE highlights, two messages at once from both mouse and keyboard." So the mouse and the keys
+// move ONE selection per list, and it is the only thing that lights a row: `data-selected`, on one row
+// of the page at most. These say which row carries it after each thing a reader does, and where the
+// focus is; tests/keyboard_browser.py moves a real mouse and presses real keys in Chromium, and counts
+// the rows the browser draws lit.
+
+/** The rows drawn lit as the selection, as `list:id`, across every list a key moves through. */
+const litRows = (page) => ["discord-log", "pinned-log", "side-log", "side-cards"].flatMap((list) =>
+  page.el(list).children.filter((li) => li.getAttribute("data-selected") === "true").map((li) => `${list}:${li.getAttribute("data-id")}`));
+
+/** The ids of the channel's rows drawn lit as the selection. */
+const litIds = (page) => litRows(page).map((row) => row.replace(/^[^:]*:/, ""));
+
+/** The mouse moved to (`x`, `y`), over `target`: the `pointermove` the document hears, a real move unless `fields` says otherwise. */
+async function mouseTo(page, target, x, y, fields = {}) {
+  await page.documentEvent("pointermove", { target, pointerType: "mouse", clientX: x, clientY: y,
+    movementX: 1, movementY: 1, buttons: 0, ...fields });
+  await page.settle();
+}
+
+/** A press by a `kind` of pointer on `node` in `scroller`'s list: its `pointerdown`, then the click the list hears. */
+async function pressOn(page, node, kind = "mouse", scroller = "scroll-area") {
+  await page.documentEvent("pointerdown", { target: node, pointerType: kind });
+  await page.el(scroller).dispatch("click", { target: node });
+  await page.settle();
+}
+
+/** The channel's row whose box takes in viewport y `y` now. */
+const rowAtY = (page, y) => page.el("discord-log").children.find((li) => {
+  const box = li.getBoundingClientRect();
+  return box.top <= y && box.bottom > y;
+});
+
+test("A TAP SELECTS SILENTLY: no focus, nothing lit, and the next key starts from the message tapped", async () => {
+  // A touch screen has no hover, and a row lit by a tap could not be put out: as before `#238`.
   const page = await keyboardPageAtTop();
   const area = page.el("scroll-area");
   area.focus();
   const row = channelRow(page, "1");
-  await area.dispatch("click", { target: row });
-  assert.equal(focused(page), area, "a click on a message gave the row the focus");
-  assert.equal(row.getAttribute("tabindex"), null, "a click on a message made the row a Tab stop");
+  await pressOn(page, row, "touch");
+  assert.equal(focused(page), area, "a tap on a message gave the row the focus");
+  assert.equal(row.getAttribute("tabindex"), null, "a tap on a message made the row a Tab stop");
+  assert.deepStrictEqual(litIds(page), [], "a tap lit the message it selected");
   await press(page, area, "ArrowDown");
-  assert.equal(selectedId(page), "2", `after a click on 1, ↓ selected ${selectedId(page)}`);
+  assert.equal(selectedId(page), "2", `after a tap on 1, ↓ selected ${selectedId(page)}`);
+  assert.deepStrictEqual(litIds(page), ["2"]);
+  // A tap elsewhere puts the keys' message out: the selection is the tapped one now, and silent.
+  await pressOn(page, channelRow(page, "5"), "touch");
+  assert.deepStrictEqual(litIds(page), [], "a tap left the keys' message lit");
+  // A finger moving over the list is not a mouse: it selects nothing.
+  await page.documentEvent("pointermove", { target: channelRow(page, "3"), pointerType: "touch", clientX: 9, clientY: 9 });
+  assert.deepStrictEqual(litIds(page), []);
+});
+
+test("`#239 single-selection`: a CLICK, then ↓ — the selection moves on from the message clicked, and one message is lit", async () => {
+  const page = await keyboardPageAtTop();
+  const area = page.el("scroll-area");
+  area.focus();
+  // The mouse arrives over message 1, and it is the one lit: the selection, drawn.
+  await mouseTo(page, channelRow(page, "1"), 100, 200);
+  assert.deepStrictEqual(litIds(page), ["1"], "the message under the mouse is not the one lit");
+  assert.equal(selectedId(page), "1", "the focus is not where the selection is");
+  await pressOn(page, channelRow(page, "1"));
+  assert.deepStrictEqual(litIds(page), ["1"], "a click on the lit message lit another");
+  // THE DEFECT: ↓ lit 2 with the ring and left 1 lit under the mouse.
+  await pressHere(page, "ArrowDown");
+  assert.equal(selectedId(page), "2");
+  assert.deepStrictEqual(litIds(page), ["2"], "↓ left the clicked message lit beside the keys' one");
+  assert.equal(page.documentElement.getAttribute("data-input"), "keys", "the root does not say the keys are in use");
+  // A click with no move before it (a touchpad's tap where the pointer already was), then j.
+  area.scrollTop = 0;
+  await pressOn(page, channelRow(page, "1"));
+  assert.deepStrictEqual(litIds(page), ["1"], "a click did not take the selection from the keys");
+  assert.equal(selectedId(page), "1");
+  assert.equal(page.documentElement.getAttribute("data-input"), null, "a mouse press left the keys' look up");
+  await pressHere(page, "j");
+  assert.deepStrictEqual(litIds(page), ["2"]);
+  const tabbed = page.el("discord-log").children.filter((li) => li.getAttribute("tabindex") === "0");
+  assert.deepStrictEqual(tabbed.map((li) => li.getAttribute("data-id")), ["2"], "more than the selected row is a Tab stop");
+});
+
+test("`#239 single-selection`: ↓, then a REAL MOUSE MOVE — the message under the mouse takes the selection, the focus with it", async () => {
+  const page = await keyboardPageAtTop();
+  await press(page, page.el("scroll-area"), "ArrowDown");
+  await pressHere(page, "j");
+  assert.deepStrictEqual(litIds(page), ["2"]);
+  assert.equal(page.documentElement.getAttribute("data-input"), "keys");
+  await mouseTo(page, channelRow(page, "1"), 120, 150);
+  assert.deepStrictEqual(litIds(page), ["1"], "the mouse did not take the selection from the keys");
+  assert.equal(selectedId(page), "1", "the focus stayed on the keys' message");
+  assert.equal(page.documentElement.getAttribute("data-input"), null, "the keys' look outlived a real mouse move");
+  assert.equal(channelRow(page, "2").getAttribute("tabindex"), null, "the keys' message is still a Tab stop");
+  // The next key moves on from where the mouse put it.
+  await pressHere(page, "j");
+  assert.deepStrictEqual(litIds(page), ["2"]);
+  // A drag, a button held, is text being selected: it chooses no message.
+  await mouseTo(page, channelRow(page, "1"), 130, 90, { buttons: 1 });
+  assert.deepStrictEqual(litIds(page), ["2"], "a drag over the list moved the selection");
+  // Within the row already selected, a move leaves the focus on the row's control it is on.
+  await mouseTo(page, channelRow(page, "2"), 131, 300);
+  const reply = replyButton(channelRow(page, "2"));
+  reply.focus();
+  await mouseTo(page, channelRow(page, "2"), 140, 305);
+  assert.equal(focused(page), reply, "a move inside the selected row took the focus off its button");
+});
+
+test("`#239 single-selection`: A LIST SCROLLED UNDER A STILL MOUSE takes nothing — the keys keep the selection as rows slide under the pointer", async () => {
+  const page = await keyboardPageAtTop();
+  const area = page.el("scroll-area");
+  const y = 200;
+  await mouseTo(page, rowAtY(page, y), 150, y);
+  assert.deepStrictEqual(litIds(page), [rowAtY(page, y).getAttribute("data-id")]);
+  for (let i = 0; i < 15; i += 1) await pressHere(page, "j");
+  const keyed = selectedId(page);
+  assert.ok(area.scrollTop > 0, "the list did not scroll, so nothing slid under the pointer");
+  // A browser that looks again at what is under a pointer that has not moved reports it from the
+  // same place, over whatever row has slid there.
+  const under = rowAtY(page, y);
+  assert.notEqual(under.getAttribute("data-id"), keyed);
+  await mouseTo(page, under, 150, y, { movementX: 0, movementY: 0 });
+  assert.equal(selectedId(page), keyed, "a list scrolled under a still pointer took the selection from the keys");
+  assert.deepStrictEqual(litIds(page), [keyed], "a row slid under a still pointer was lit");
+  assert.equal(page.documentElement.getAttribute("data-input"), "keys", "a pointer that did not move put the keys' look away");
+  // A pixel of movement is the reader reaching for the mouse.
+  await mouseTo(page, under, 151, y);
+  assert.deepStrictEqual(litIds(page), [under.getAttribute("data-id")]);
+  // The first move after the load, once the keys are in use, counts only if it says it moved: it is
+  // the one a key's scroll can make before the mouse has moved at all.
+  const fresh = await keyboardPageAtTop();
+  await press(fresh, fresh.el("scroll-area"), "ArrowDown");
+  await mouseTo(fresh, channelRow(fresh, "2"), 50, 300, { movementX: 0, movementY: 0 });
+  assert.deepStrictEqual(litIds(fresh), ["1"], "a first move that did not move took the selection from the keys");
+  await mouseTo(fresh, channelRow(fresh, "2"), 52, 300, { movementX: 2, movementY: 0 });
+  assert.deepStrictEqual(litIds(fresh), ["2"]);
+});
+
+test("`#239 single-selection`: Enter, e and the rest act on THE ONE SELECTION — the message the mouse moved to after the keys", async () => {
+  const page = await keyboardPageAtTop();
+  await press(page, page.el("scroll-area"), "ArrowDown");
+  assert.equal(selectedId(page), "1");
+  await mouseTo(page, channelRow(page, "2"), 100, 300);
+  assert.equal(channelRow(page, "2").getAttribute("data-collapsed"), "true", "a long message did not arrive folded");
+  await pressHere(page, "Enter");
+  assert.equal(channelRow(page, "2").getAttribute("data-collapsed"), "false", "Enter did not open the message the mouse selected");
+  assert.equal(channelRow(page, "1").getAttribute("data-collapsed"), "true", "Enter opened the message the keys had left");
+  await pressHere(page, "e");
+  assert.deepStrictEqual(page.dismissCalls.map((call) => call.messages), [["2"]], "e marked another message than the one lit");
+  assert.deepStrictEqual(litIds(page), ["3"], "after e the selection did not move on, lit, to the next unread");
+});
+
+test("`#239 single-selection`: the mouse never takes the focus out of a message box, and moves nothing while a ⋯ menu is open", async () => {
+  const page = await keyboardPageAtTop();
+  const box = page.el("channel-compose-text");
+  box.focus();
+  await mouseTo(page, channelRow(page, "2"), 100, 40);
+  assert.equal(focused(page), box, "a mouse move over the list took the focus out of the box being typed in");
+  assert.deepStrictEqual(litIds(page), ["2"], "the message under the mouse is not the one lit");
+  // Esc leaves the box, its draft kept, for the message lit.
+  await box.setValue("half a thought");
+  await press(page, box, "Escape");
+  assert.equal(selectedId(page), "2", `Esc from the box left the focus on ${selectedId(page)}`);
+  // A ⋯ menu open on 2 holds the focus and the arrows: the mouse over 4 moves neither.
+  await pressHere(page, ".");
+  const item = focused(page);
+  assert.ok(nodeIn(rowMoreMenu(channelRow(page, "2")), item), "the focus is not in the menu");
+  await mouseTo(page, channelRow(page, "4"), 110, 150);
+  assert.deepStrictEqual(litIds(page), ["2"], "the mouse moved the selection from under an open menu");
+  assert.equal(focused(page), item, "the mouse took the focus out of an open menu");
+});
+
+test("`#239 single-selection`: THE ROW A JUMP LANDS ON is the selection, and its flash goes out when the selection moves on", async () => {
+  const page = newPage();
+  await signIn(page);
+  await showDiscord(page, questionFarAbove());
+  const question = rowWithId(page, "1000000000000000001");
+  const reply = rowWithId(page, "1000000000000000099");
+  await mouseTo(page, reply, 100, 300);
+  assert.deepStrictEqual(litIds(page), ["1000000000000000099"]);
+  await page.documentEvent("pointerdown", { target: replyArrowOf(reply), pointerType: "mouse" });
+  await tapArrow(page, reply);
+  assert.equal(question.getAttribute("data-landed"), "true", "nothing says which row the jump was for");
+  assert.deepStrictEqual(litIds(page), ["1000000000000000001"], "the reply stayed lit beside the message the jump landed on");
+  assert.equal(selectedId(page), "1000000000000000001", "the focus is not on the message the jump landed on");
+  // The keys act on it.
+  await pressHere(page, "e");
+  assert.deepStrictEqual(page.dismissCalls.map((call) => call.messages), [["1000000000000000001"]]);
+  // The mouse moves on, and the flash goes out with the selection, not two seconds later beside it.
+  await tapArrow(page, reply);
+  assert.equal(question.getAttribute("data-landed"), "true");
+  const other = rowWithId(page, "1000000000000000010");
+  await mouseTo(page, other, 101, 100);
+  assert.deepStrictEqual(litIds(page), ["1000000000000000010"]);
+  assert.equal(question.getAttribute("data-landed"), null, "the landing's flash stayed lit beside the new selection");
+  // After a tap on a touch screen the landing is selected silently, and its flash is the only light.
+  const phone = newPage();
+  await signIn(phone);
+  await showDiscord(phone, questionFarAbove());
+  await phone.documentEvent("pointerdown", { target: replyArrowOf(rowWithId(phone, "1000000000000000099")), pointerType: "touch" });
+  await tapArrow(phone, rowWithId(phone, "1000000000000000099"));
+  assert.equal(rowWithId(phone, "1000000000000000001").getAttribute("data-landed"), "true");
+  assert.deepStrictEqual(litIds(phone), [], "a tap's landing was drawn as a selection on a touch screen");
 });
 
 test("A KEY ABOUT ONE MESSAGE never acts on one scrolled out of sight: it brings the ring to the screen instead", async () => {
@@ -33199,7 +33410,10 @@ test("a collapsed run's line is the row's only face, a thumb tall, and not somet
   const line = cssBlock("#discord-log .read-run");
   assert.match(line, /min-height:\s*2\.75rem/, "the line is not a 44px target");
   assert.match(line, /width:\s*100%/);
-  assert.match(cssBlockIn(HOVER_QUERY, "#discord-log .read-run:hover"), /color:\s*var\(--ink\)/);
+  // Its row's selection is drawn on the line, which gives up the row's tile and ring. `#239 single-selection`.
+  const selected = cssBlock('#discord-log li.discord-message[data-read-run="head"][data-selected="true"] > .read-run');
+  assert.match(selected, /color:\s*var\(--ink\)/);
+  assert.match(selected, /outline:\s*2px solid var\(--accent\)/, "a selected run's line has no ring");
   // A finger on the line presses the line: it is neither a swipe to Done nor a hold for details.
   assert.match(SCRIPT_CODE, /if \(li\.getAttribute\("data-read-run"\) === "head"\) \{\s*return;\s*\}/);
 });
@@ -36177,6 +36391,38 @@ test("`#229 desktop-two-column`: [ and ] move the keys between the columns, → 
   assert.deepStrictEqual(shownIds(page), ["200", "201", "203"], "Esc changed the left column");
   // The keys are listed, and [ and ] are not on a phone's list as if they did something there.
   assert.ok(page.el("keyboard-keys").text().includes("In two columns"), "the list of keys does not name [ and ]");
+});
+
+test("`#239 single-selection` x `#229 desktop-two-column`: one selection per column and one lit message on the page; the mouse into the other column takes the selection, and the keys, there", async () => {
+  const page = await threadPage();
+  await twoColumns(page);
+  await threadBadge(rowWithId(page, "201")).click();
+  await page.settle();
+  assert.deepStrictEqual(sideIds(page), ["201", "202"]);
+  page.el("scroll-area").focus();
+  await press(page, page.el("scroll-area"), "Home");
+  assert.deepStrictEqual(litRows(page), ["discord-log:200"]);
+  // The mouse into the right column, over the thread's reply: the selection, the focus and the keys go there.
+  await mouseTo(page, sideRow(page, "202"), 900, 60);
+  assert.deepStrictEqual(litRows(page), ["side-log:202"], "the left column's message stayed lit beside the right's");
+  assert.equal(focused(page), sideRow(page, "202"), `the focus stayed in the left column: ${focusName(page)}`);
+  await pressHere(page, "k");
+  assert.deepStrictEqual(litRows(page), ["side-log:201"], "k did not move in the column the mouse chose");
+  // Back over the left column: its message under the mouse takes it, and the right's goes out.
+  await mouseTo(page, rowWithId(page, "203"), 300, 120);
+  assert.deepStrictEqual(litRows(page), ["discord-log:203"]);
+  assert.equal(focused(page), rowWithId(page, "203"));
+  // ] and [ hand the keys across: each column's own selection is lit again, and only that one.
+  await pressHere(page, "]");
+  assert.deepStrictEqual(litRows(page), ["side-log:201"], "] did not light the right column's selection alone");
+  assert.equal(focused(page), sideRow(page, "201"));
+  await pressHere(page, "[");
+  assert.deepStrictEqual(litRows(page), ["discord-log:203"], "[ did not light the left column's selection alone");
+  // A redraw of both columns leaves the column in use as it was.
+  await page.el("search-toggle").click();
+  await page.el("search-toggle").click();
+  await page.settle();
+  assert.deepStrictEqual(litRows(page), ["discord-log:203"], "a redraw lit the other column's selection");
 });
 
 test("`#229 desktop-two-column`: leaving two columns returns to the view last chosen in one, and the thread selected comes back with two", async () => {
