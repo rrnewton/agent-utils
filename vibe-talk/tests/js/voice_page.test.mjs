@@ -16871,6 +16871,44 @@ test("THE VENDOR ECHOING A TYPED MESSAGE BACK DOES NOT RENDER IT TWICE", async (
 /** How many voice sessions the page has asked the server for. Each one is a conversation opened. */
 const sessionsAsked = (page) => page.requests.filter((r) => r.startsWith("GET /api/v1/voice-session")).length;
 
+/**
+ * The hosted vendor accepting a conversation: its `conversation_initiation_metadata`, which names
+ * the conversation. A message the box held for the conversation goes at this frame, not at `onopen`.
+ */
+function vendorAccepts(socket, conversationId = "conv_typed_0001") {
+  socket.onmessage({
+    data: JSON.stringify({
+      type: "conversation_initiation_metadata",
+      conversation_initiation_metadata_event: {
+        conversation_id: conversationId,
+        agent_output_audio_format: "pcm_16000",
+      },
+    }),
+  });
+}
+
+/**
+ * A mint the test answers when it chooses: `release()` hands every session asked for so far an
+ * ordinary answer. Until then `start()` is parked in its first await with no socket — the window in
+ * which a second press used to start a second conversation. Every request is answered, so a page
+ * that asks twice shows up as two sessions rather than as a promise left pending.
+ */
+function heldMint(page, mint = MINTED) {
+  const waiting = [];
+  const held = {
+    asked: 0,
+    release() {
+      assert.ok(waiting.length > 0, "the page never asked for a session");
+      for (const resolve of waiting.splice(0)) resolve(mint());
+    },
+  };
+  page.setFetch(() => {
+    held.asked += 1;
+    return new Promise((resolve) => waiting.push(resolve));
+  });
+  return held;
+}
+
 test("CLICKING INTO THE BOX, OR TYPING IN IT, OPENS NOTHING", async () => {
   const page = newPage();
   await signIn(page);
@@ -16913,7 +16951,27 @@ test("THE FIRST SEND WITH NOTHING OPEN STARTS ONE TYPED CONVERSATION AND DELIVER
   assert.equal(sessionsAsked(page), 1);
   assert.match(page.el("status").textContent, /Still opening the conversation/);
 
+  // The socket opens: the initiation goes, and the message STILL waits, for the vendor to accept
+  // the conversation. vibe-talk's own client of the vendor waits for the same frame before it
+  // writes (`initiate` in src/elevenlabs/socket.rs).
   socket.onopen();
+  await page.settle();
+  assert.deepStrictEqual(socket.sent.map((raw) => JSON.parse(raw).type), ["conversation_initiation_client_data"],
+    "something went before the vendor accepted the conversation");
+  assert.equal(page.el("compose-text").value, "what landed overnight", "the message left the box before it went");
+  assert.equal(page.el("send-text").disabled, true);
+  assert.equal(session_lines(page).length, 0, "the transcript shows a message that has not gone");
+  assert.match(page.el("status").textContent, /sending your message/);
+  // The socket is open, so a send now would get past a check for one: Enter must still refuse,
+  // and a canned prompt must neither overtake the message nor look as though it could.
+  await page.el("compose-text").dispatch("keydown", enterKey({}));
+  assert.match(page.el("status").textContent, /Still opening the conversation/);
+  assert.equal(page.el("canned-summary").getAttribute("aria-disabled"), "true",
+    "a canned prompt looks live while the box's message waits");
+  await page.el("canned-summary").click();
+  assert.equal(typedFrames(socket).length, 0, "a canned prompt went ahead of the waiting message");
+
+  vendorAccepts(socket, "conv_typed_0001");
   await page.settle();
   const frames = socket.sent.map((raw) => JSON.parse(raw));
   const typed = frames.filter((f) => f.type === "user_message");
@@ -16928,6 +16986,11 @@ test("THE FIRST SEND WITH NOTHING OPEN STARTS ONE TYPED CONVERSATION AND DELIVER
   assert.equal(page.el("compose-text").value, "", "the delivered message stayed in the box");
   assert.equal(page.el("send-text").disabled, false, "Send stayed dead once the message had gone");
   assert.equal(page.el("status").textContent, "Sent.");
+  assert.equal(page.el("canned-summary").getAttribute("aria-disabled"), "false");
+  // Filed under the conversation the vendor named, which only exists once it has accepted it.
+  await page.settle();
+  assert.ok(page.storeCalls.includes("POST /api/v1/conversations/conv_typed_0001/turns"),
+    `the first message was not recorded under its conversation: ${page.storeCalls.join(", ")}`);
 
   // ...and the next send goes straight down the open socket.
   await compose(page, "and the nightly");
@@ -16945,6 +17008,7 @@ test("a message written while the first one waits stays in the box: what went is
   await page.settle();
   await compose(page, "first, and a second thought");
   page.sockets[0].onopen();
+  vendorAccepts(page.sockets[0]);
   await page.settle();
   assert.deepStrictEqual(typedFrames(page.sockets[0]).map((f) => JSON.parse(f).text), ["first"]);
   assert.equal(page.el("compose-text").value, "first, and a second thought", "the box lost what was written while waiting");
@@ -16970,7 +17034,7 @@ test("a typed conversation that fails to open keeps the message in the box and s
   assert.equal(typedFrames(page.sockets[0]).length, 0, "a message from a failed start went into the next call");
 });
 
-test("a message sent while a CALL is still connecting goes the moment it connects", async () => {
+test("a message sent while a CALL is still connecting goes once the call is accepted", async () => {
   const page = newPage();
   await signIn(page);
   page.setFetch(MINTED);
@@ -16982,6 +17046,9 @@ test("a message sent while a CALL is still connecting goes the moment it connect
   assert.equal(typedFrames(page.sockets[0]).length, 0);
   assert.match(page.el("status").textContent, /goes as soon as the call is connected/);
   page.sockets[0].onopen();
+  await page.settle();
+  assert.equal(typedFrames(page.sockets[0]).length, 0, "the message went before the vendor accepted the call");
+  vendorAccepts(page.sockets[0]);
   await page.settle();
   assert.deepStrictEqual(typedFrames(page.sockets[0]).map((f) => JSON.parse(f).text), ["while it rings"]);
   assert.equal(page.micRequests.length, 1, "the call stopped being a spoken one");
@@ -17005,6 +17072,7 @@ test("ENTER AND CTRL+ENTER START A TYPED CONVERSATION AS SEND DOES, AS THE SETTI
       assert.equal(page.sockets.length, sends ? 1 : 0, `${where} ${sends ? "did not start" : "started"} a conversation`);
       if (sends) {
         page.sockets[0].onopen();
+        vendorAccepts(page.sockets[0]);
         await page.settle();
         assert.deepStrictEqual(typedFrames(page.sockets[0]).map((f) => JSON.parse(f).text), [`${name} at idle`], where);
       } else {
@@ -17017,7 +17085,8 @@ test("ENTER AND CTRL+ENTER START A TYPED CONVERSATION AS SEND DOES, AS THE SETTI
 test("on the neutral protocol the first message waits for session_started, then goes as a prompt", async () => {
   // The deployed path speaks `vibe-talk-v1`: no initiation frame and no text-only override exist
   // there, and a typed turn is a `prompt`. The page's `user_message` becomes one in
-  // `sendClientEvent`, held in `pendingPrompts` until the server has started the session.
+  // `sendClientEvent`. The box holds it until the server has started the session, and only then
+  // does it leave the box, appear in the transcript and go on the wire — in that one moment.
   const page = newPage();
   await signIn(page);
   page.setFetch(async () =>
@@ -17036,12 +17105,207 @@ test("on the neutral protocol the first message waits for session_started, then 
   socket.onopen();
   await page.settle();
   assert.deepStrictEqual(promptsSent(socket), [], "a prompt went before the session started");
-  assert.equal(session_lines(page).length, 1, "the message is not in the transcript once it is on its way");
+  assert.equal(page.el("compose-text").value, "summarize the last hour", "the message left the box before it went");
+  assert.equal(session_lines(page).length, 0, "the transcript shows a message that has not gone");
+  assert.notEqual(page.el("status").textContent, "Sent.", "the page said Sent. about a message still on the page");
+  assert.equal(page.el("send-text").disabled, true);
   socket.onmessage({ data: JSON.stringify({ type: "session_started", greeting: false }) });
   assert.deepStrictEqual(promptsSent(socket), ["summarize the last hour"]);
+  assert.equal(page.el("compose-text").value, "", "the message that went stayed in the box");
+  assert.equal(session_lines(page).length, 1, "the message that went is not in the transcript");
+  assert.equal(page.el("send-text").disabled, false);
   const kinds = socket.sent.filter((f) => typeof f === "string").map((f) => JSON.parse(f).type);
   assert.deepStrictEqual(kinds, ["prompt"], "a typed call put something other than its prompt on the wire");
   assert.deepStrictEqual(page.micRequests, [], "a typed call asked for the microphone");
+});
+
+// --- one start at a time, and nothing leaves the box before the conversation is accepted --------
+//
+// `start()` awaits a minted session, what to resume and, for a spoken call, the microphone before
+// it has a socket. The tests above pass with a mint that answers at once; these hold it open, which
+// is what a real network does, and press the other control in that window. Those presses are not
+// awaited: on a page that starts a second conversation, the press would wait on the held mint and
+// the test would hang rather than fail.
+
+const NEUTRAL_MINT = async () =>
+  json(200, {
+    websocket_url: "/ws?mode=voice",
+    protocol: "vibe-talk-v1",
+    provider: "Internal voice preview",
+    input_sample_rate: 24000,
+    output_sample_rate: 24000,
+  });
+
+test("TALK, THEN SEND WHILE THE CALL IS STILL ASKING FOR ITS SESSION: ONE CONVERSATION, AND THE MESSAGE GOES INTO IT", async () => {
+  const page = newPage();
+  await signIn(page);
+  const mint = heldMint(page);
+  page.el("talk").click();
+  await page.settle();
+  assert.equal(mint.asked, 1);
+  assert.equal(page.sockets.length, 0, "the mint is not held, so this tests nothing");
+  assert.equal(page.el("talk-label").textContent, "Connecting…", "Talk still offers to start a call while one starts");
+
+  await compose(page, "while it dials");
+  page.el("send-text").click();
+  await page.settle();
+  assert.match(page.el("status").textContent, /goes as soon as the call is connected/);
+  assert.equal(page.el("compose-text").value, "while it dials", "the held message left the box");
+  // ...and Talk again, by a finger that thinks the first press missed.
+  page.el("talk").click();
+  await page.settle();
+  assert.equal(mint.asked, 1, "a press during the start asked for a second session");
+  assert.equal(page.el("view-switch").hidden, false, "the switch left the bar while a call started");
+  assert.equal(page.el("voice-composer").hidden, false, "the box left while a call started");
+
+  mint.release();
+  await page.settle();
+  await page.settle();
+  assert.equal(page.sockets.length, 1, "the start opened more or fewer than one conversation");
+  assert.equal(page.micRequests.length, 1, "the call is not one spoken call");
+  const socket = page.sockets[0];
+  socket.onopen();
+  await page.settle();
+  assert.equal(typedFrames(socket).length, 0, "the message went before the vendor accepted the call");
+  vendorAccepts(socket);
+  await page.settle();
+  const frames = socket.sent.map((raw) => JSON.parse(raw));
+  const typed = frames.filter((f) => f.type === "user_message");
+  assert.deepStrictEqual(typed, [{ type: "user_message", text: "while it dials" }], "the held message did not go exactly once");
+  assert.ok(frames.findIndex((f) => f.type === "conversation_initiation_client_data") < frames.indexOf(typed[0]),
+    "the message went before its conversation's initiation frame");
+  assert.equal(page.el("compose-text").value, "");
+  assert.equal(page.el("talk-label").textContent, "Listening");
+});
+
+test("SEND, THEN TALK WHILE THE TYPED CONVERSATION IS STILL ASKING FOR ITS SESSION: TALK STARTS NOTHING", async () => {
+  const page = newPage();
+  await signIn(page);
+  const mint = heldMint(page);
+  await compose(page, "what landed overnight");
+  page.el("send-text").click();
+  await page.settle();
+  assert.equal(mint.asked, 1);
+  assert.equal(page.sockets.length, 0, "the mint is not held, so this tests nothing");
+  // Talk is still on the bar — the conversation that is starting is not open yet — but it says
+  // what is happening rather than offering a call, and pressing it starts nothing.
+  assert.equal(page.el("talk-label").textContent, "Connecting…");
+  page.el("talk").click();
+  await page.settle();
+  assert.equal(mint.asked, 1, "Talk during the typed start asked for a second session");
+  assert.deepStrictEqual(page.micRequests, [], "Talk during the typed start asked for the microphone");
+  assert.equal(page.el("view-switch").hidden, false, "the switch left the bar while a typed conversation started");
+
+  mint.release();
+  await page.settle();
+  await page.settle();
+  assert.equal(page.sockets.length, 1, "the start opened more or fewer than one conversation");
+  const socket = page.sockets[0];
+  socket.onopen();
+  vendorAccepts(socket);
+  await page.settle();
+  const frames = socket.sent.map((raw) => JSON.parse(raw));
+  assert.deepStrictEqual(frames[0].conversation_config_override, { conversation: { text_only: true } },
+    "the conversation that opened is not the typed one");
+  assert.deepStrictEqual(frames.filter((f) => f.type === "user_message"), [{ type: "user_message", text: "what landed overnight" }]);
+  assert.deepStrictEqual(page.micRequests, [], "the typed conversation became a spoken one");
+  assert.equal(page.el("talk").hidden, true, "a typed conversation has Talk on its bar");
+});
+
+test("both orders on the neutral protocol: one session, one socket, and the message goes after session_started", async () => {
+  for (const order of ["talk-first", "send-first"]) {
+    const page = newPage();
+    await signIn(page);
+    const mint = heldMint(page, NEUTRAL_MINT);
+    await compose(page, "summarize the last hour");
+    if (order === "talk-first") {
+      page.el("talk").click();
+      await page.settle();
+      page.el("send-text").click();
+    } else {
+      page.el("send-text").click();
+      await page.settle();
+      page.el("talk").click();
+    }
+    await page.settle();
+    mint.release();
+    await page.settle();
+    await page.settle();
+    assert.equal(mint.asked, 1, `${order}: more than one session`);
+    assert.equal(page.sockets.length, 1, `${order}: more than one conversation`);
+    assert.equal(page.micRequests.length, order === "talk-first" ? 1 : 0, `${order}: the wrong kind of conversation opened`);
+    const socket = page.sockets[0];
+    socket.onopen();
+    await page.settle();
+    assert.deepStrictEqual(promptsSent(socket), [], `${order}: a prompt went before session_started`);
+    socket.onmessage({ data: JSON.stringify({ type: "session_started", greeting: false }) });
+    if (order === "talk-first") {
+      // A spoken call closes its audio segment first and sends the prompt after that turn.
+      socket.onmessage({ data: JSON.stringify({ type: "turn_complete", turn: 0 }) });
+    }
+    assert.deepStrictEqual(promptsSent(socket), ["summarize the last hour"], `${order}: the message did not go once`);
+  }
+});
+
+test("THE NEUTRAL BRIDGE CLOSING BEFORE session_started LEAVES THE FIRST MESSAGE IN THE BOX, UNSENT", async () => {
+  // The likely failure on the deployed path: the bridge accepts the WebSocket, then cannot start
+  // its backend. The message was never on the wire, so it must not have left the box, been drawn
+  // as sent, been said to be "Sent.", or stopped being a draft (`#193 compose-draft-loss`).
+  const store = new Map();
+  const page = newPage(store);
+  await signIn(page);
+  page.setFetch(NEUTRAL_MINT);
+  await compose(page, "summarize the last hour");
+  await page.el("send-text").click();
+  await page.settle();
+  const socket = page.sockets[0];
+  socket.onopen();
+  await page.settle();
+  socket.onclose({ code: 1011, reason: "backend unavailable" });
+  await page.settle();
+
+  assert.equal(page.el("compose-text").value, "summarize the last hour", "the bridge's failure took the message with it");
+  assert.equal(store.get("vibe-talk.voice.compose-draft"), "summarize the last hour", "the message stopped being a draft");
+  assert.equal(session_lines(page).length, 0, "the transcript shows a message that never went");
+  assert.deepStrictEqual(promptsSent(socket), []);
+  assert.match(page.el("status").textContent, /Your message did not go — it is still in the box\./);
+  assert.equal(page.el("send-text").disabled, false, "Send stayed dead after the conversation closed");
+  assert.equal(
+    page.storeCalls.some((call) => call.endsWith("/turns")),
+    false,
+    "a message that never went was recorded as said"
+  );
+
+  // ...and it does not ride into the next conversation, which the reader has not asked it to.
+  await page.el("talk").click();
+  await page.settle();
+  page.sockets[1].onopen();
+  page.sockets[1].onmessage({ data: JSON.stringify({ type: "session_started", greeting: false }) });
+  assert.deepStrictEqual(promptsSent(page.sockets[1]), [], "the unsent message went into the next call");
+  // Sending it again is one press, into the call that is now open.
+  await page.el("send-text").click();
+  page.sockets[1].onmessage({ data: JSON.stringify({ type: "turn_complete", turn: 0 }) });
+  assert.deepStrictEqual(promptsSent(page.sockets[1]), ["summarize the last hour"]);
+});
+
+test("THE VENDOR CLOSING BEFORE IT ACCEPTS THE CONVERSATION LEAVES THE FIRST MESSAGE IN THE BOX, UNSENT", async () => {
+  // A close straight after the initiation frame, before the vendor has accepted the conversation:
+  // for example an agent whose settings refuse the typed conversation's text-only override, if the
+  // vendor answers that with a close rather than by ignoring it (unverified either way).
+  const page = newPage();
+  await signIn(page);
+  page.setFetch(MINTED);
+  await compose(page, "are you there");
+  await page.el("send-text").click();
+  await page.settle();
+  const socket = page.sockets[0];
+  socket.onopen();
+  socket.onclose({ code: 1008, reason: "override refused" });
+  await page.settle();
+  assert.equal(typedFrames(socket).length, 0, "the message was written to a conversation nobody accepted");
+  assert.equal(page.el("compose-text").value, "are you there", "the close took the message with it");
+  assert.equal(session_lines(page).length, 0, "the transcript shows a message that never went");
+  assert.match(page.el("status").textContent, /Your message did not go — it is still in the box\./);
 });
 
 test("COMPOSING TELLS THE AGENT SOMEONE IS THERE, AT MOST ONCE EVERY THIRTY SECONDS", async () => {
@@ -17135,6 +17399,8 @@ test("THE BOX IS IN THE CALL'S TRANSCRIPT IN EVERY STATE, AND THE SWITCH NEVER L
   await idle.settle();
   check(idle, "a typed conversation opening");
   idle.sockets[0].onopen();
+  check(idle, "a typed conversation, accepted by nobody yet");
+  vendorAccepts(idle.sockets[0]);
   await idle.settle();
   check(idle, "a typed conversation");
   assert.equal(idle.el("hang-up").hidden, false, "a typed conversation has no way to end it");
@@ -17188,6 +17454,7 @@ async function startChatting(page, first = "hello") {
   );
   assert.equal(page.sockets.length, 1, "no conversation was opened at all");
   page.sockets[0].onopen();
+  vendorAccepts(page.sockets[0]);
   await page.settle();
   return page.sockets[0];
 }

@@ -3772,6 +3772,13 @@ function sendUserMessage(text, options) {
   if (said === "") {
     return false;
   }
+  // A canned prompt pressed while the box's first message waits for its conversation. The socket
+  // may already be open, but the conversation is not accepted yet, and this would go ahead of the
+  // message the reader sent first. `deliverHeldTurn` empties the slot before it calls this.
+  if (heldTurn !== null) {
+    setStatus("Your message is still waiting for the conversation to open — send this after it.");
+    return false;
+  }
   if (!canSendText() || !sendClientEvent({ type: "user_message", text: said })) {
     setStatus("Start a call first — typed messages reach the agent in a live conversation.");
     return false;
@@ -3867,24 +3874,46 @@ function storedComposeDraft() {
 /**
  * The first message, waiting for the conversation it started to open. Null when nothing waits.
  *
- * ONE, not a queue. While it waits Send is disabled and Enter refuses with a sentence saying why
- * (`sendTyped`), and the canned prompts are greyed until a conversation is open — so nothing else can
- * join it, and a second press cannot start a second conversation underneath the first.
+ * ONE, not a queue. While it waits Send is disabled, Enter refuses with a sentence saying why
+ * (`sendTyped`), and the canned prompts are greyed and refuse (`sendUserMessage`) — so nothing else
+ * can join it or overtake it, and a second press cannot start a second conversation underneath the
+ * first.
  *
  * The text STAYS IN THE BOX while it waits, and leaves the box only when it goes: a conversation
- * that fails to open leaves the reader exactly what they wrote, with the error saying why, and a
- * send that went is what clears the box, as it always was.
+ * that fails to open, or that the server closes before it has accepted it, leaves the reader exactly
+ * what they wrote, with the status saying it did not go, and a send that went is what clears the
+ * box, as it always was. "Goes" means the server has accepted the conversation, which is later than
+ * the socket opening — see `deliverHeldTurn`.
  *
  * @type {string | null}
  */
 let heldTurn = null;
 
 /**
+ * Whether `start()` is between its first line and the socket it opens: asking vibe-talk for a
+ * session, fetching what to resume, and, for a spoken call, asking for the microphone.
+ *
+ * `session.socket` cannot answer "is a conversation starting" on its own, because it is only set
+ * once all of those awaits are over. Without this, Talk pressed during them, or Send pressed after
+ * Talk, ran a SECOND `start()` alongside the first: two minted sessions, two sockets — two billed
+ * conversations — with the first socket overwritten and never closed, its `onclose` later tearing
+ * down whichever call was live, and a held message written down the wrong socket ahead of that
+ * socket's initiation frame. So `start()` refuses while this is set, `sendTyped` treats it as a
+ * conversation already on its way and holds the message for it, and the big control reads
+ * "Connecting…" through it.
+ */
+let startInFlight = false;
+
+/**
  * The Send button and the Enter key, which must not be two different opinions about sending.
  *
+ *   * A message is already waiting for its conversation: refused, out loud. Checked FIRST, because
+ *     the socket is open before the server has accepted the conversation, and a send in that gap
+ *     would overtake the message that is waiting.
  *   * A conversation is open: the text goes down its socket now, as it always did.
- *   * One is opening — a call that has not connected yet, or the typed conversation an earlier send
- *     started: the text is held and goes the moment it is open (`deliverHeldTurn`).
+ *   * One is on its way — a start still asking for its session or the microphone, a call that has
+ *     not connected yet, or the typed conversation an earlier send started: the text is held and
+ *     goes once that conversation is accepted (`deliverHeldTurn`).
  *   * Nothing is open: the text is held, and a TYPED conversation is started for it. No microphone
  *     is asked for. See `start()` and `CHAT MODE` there.
  *
@@ -3896,19 +3925,19 @@ function sendTyped() {
   if (said === "") {
     return false;
   }
+  if (heldTurn !== null) {
+    setStatus("Still opening the conversation — your message goes as soon as it is open.");
+    return false;
+  }
   if (canSendText()) {
     const sent = sendUserMessage(said, { fromComposer: true });
     // Back in the box for the next one: a tap on Send took the focus to the button.
     if (sent) el("compose-text").focus();
     return sent;
   }
-  if (heldTurn !== null) {
-    setStatus("Still opening the conversation — your message goes as soon as it is open.");
-    return false;
-  }
   heldTurn = said;
   renderControls();
-  if (session.socket) {
+  if (session.socket || startInFlight) {
     setStatus(
       session.chat
         ? "Opening a typed conversation — your message goes as soon as it is open."
@@ -3917,15 +3946,27 @@ function sendTyped() {
     return false;
   }
   return guard(start)({ chat: true }).then(() => {
-    if (heldTurn !== null && session.socket && !session.connected) {
+    if (heldTurn !== null && session.socket) {
       setStatus("Opening a typed conversation — your message goes as soon as it is open.");
     }
   });
 }
 
 /**
- * The conversation is open: send what was held for it. Called from `socket.onopen` on both
- * protocols, once `session.connected` is true, which is what `sendClientEvent` tests.
+ * The server has accepted the conversation: send what was held for it.
+ *
+ * Called when the SERVER says the conversation has started, not when the socket opens, on both
+ * protocols:
+ *
+ *   * the hosted vendor's `conversation_initiation_metadata`. vibe-talk's own client of that vendor
+ *     waits for the same frame before it writes a message (`initiate` in src/elevenlabs/socket.rs),
+ *     because a conversation written to before it is answered with a protocol close. It is also the
+ *     frame that names the conversation, and `recordTurn` files the message under that name; sent
+ *     at `onopen` it was filed under no conversation, or the previous one.
+ *   * `vibe-talk-v1`'s `session_started`. A `prompt` sent before it waits in `pendingPrompts`, so at
+ *     `onopen` the message left the box, was drawn as sent and said "Sent." while it was still on
+ *     the page — and a bridge that accepted the socket and then failed to start its session took it
+ *     with it. In a typed conversation the prompt goes on the wire here, in this call.
  *
  * The box is cleared only if it still holds what was sent. A reader who went on writing while the
  * conversation opened keeps what they wrote; what went is what they pressed Send on.
@@ -6139,7 +6180,8 @@ const CANNED_DISABLED_TITLE =
  * so the tooltip the owner asked for actually appears.
  */
 function renderCannedPrompts() {
-  const live = canSendText();
+  // Not while the box's first message waits for the conversation it started: see `sendUserMessage`.
+  const live = canSendText() && heldTurn === null;
   for (const entry of CANNED_PROMPTS) {
     const button = el(entry.button);
     button.setAttribute("aria-disabled", live ? "false" : "true");
@@ -7868,6 +7910,24 @@ async function start(options) {
     setStatus("already connected");
     return;
   }
+  // ONE start at a time (`startInFlight`). Refused without a word of its own: the big control
+  // already reads "Connecting…", and the status line is saying what the start is waiting for —
+  // the session or the microphone prompt — which is the more useful of the two sentences.
+  if (startInFlight) {
+    return;
+  }
+  startInFlight = true;
+  try {
+    await openConversation(options);
+  } finally {
+    // Before `guard` sees a failure and tears down, and after a success has set `session.socket`,
+    // which from then on is what says a conversation exists.
+    startInFlight = false;
+  }
+}
+
+/** `start()`'s body, run only while it holds `startInFlight`. */
+async function openConversation(options) {
   const chat = Boolean(options && options.chat);
   beginStartupTiming(chat);
   beginHealth(chat);
@@ -7882,6 +7942,8 @@ async function start(options) {
   hasSuspended = false;
   setState("working");
   setStatus("Asking vibe-talk for a voice session…");
+  // "Connecting…" on the big control from here, not from the socket: see `startInFlight`.
+  renderControls();
   const minted = await openVoiceSession();
   markStartup("session_acquired");
   session.protocol = minted.protocol || "unknown";
@@ -7954,8 +8016,8 @@ async function start(options) {
       setState("live");
       setStatus("Opening the voice session…");
       renderControls();
-      // Into `pendingPrompts`, where it waits for `session_started` as any early prompt does.
-      deliverHeldTurn();
+      // A message held for this conversation is NOT sent here: it goes at `session_started`
+      // (`deliverHeldTurn`), so a session that never starts leaves it in the box.
       return;
     }
     // The initiation frame is UNCHANGED on the default path. `contextual_update` is the default
@@ -8005,14 +8067,16 @@ async function start(options) {
       announceMute(true);
     }
     setState("live");
-    setStatus(chat ? "Connected — type a message." : "Connected — say something.");
+    if (heldTurn !== null) {
+      // It goes when the vendor answers the initiation (`deliverHeldTurn`), which is a moment away.
+      setStatus("Connected — sending your message…");
+    } else {
+      setStatus(chat ? "Connected — type a message." : "Connected — say something.");
+    }
     renderControls();
     if (!chat) {
       startCapture(socket);
     }
-    // LAST: after the initiation frame and any resume, which the agent has to have first, and after
-    // the status above, so the line the reader is left with is the one saying their message went.
-    deliverHeldTurn();
   };
 
   socket.onmessage = (event) => {
@@ -8133,6 +8197,10 @@ function handle(socket, message) {
     case "conversation_initiation_metadata": {
       const meta = message.conversation_initiation_metadata_event || {};
       session.conversationId = conversationIdFrom(meta.conversation_id);
+      // The vendor has accepted the conversation, and named it: the message the box held for it
+      // goes now, filed under that name. Before the format is read, which throws for a format this
+      // page cannot PLAY — a reason to say so, not to swallow a typed message.
+      deliverHeldTurn();
       session.outputRate = outputRateFrom(meta.agent_output_audio_format);
       addDetail(
         `conversation ${meta.conversation_id || "?"} · agent audio ${
@@ -8658,6 +8726,8 @@ function handleVibeTalk(message) {
         // still right, rows being kept per turn number, and the next message waits behind the
         // reply it did not ask for (`replyArriving`) once any of that reply has arrived.
         setStatus("Connected — type a message.");
+        // The held first message: queued and, with nothing ahead of it, on the wire in this call.
+        deliverHeldTurn();
         advanceVibeTalkInput();
         break;
       }
@@ -8681,6 +8751,10 @@ function handleVibeTalk(message) {
         advanceVibeTalkInput();
         sendStartupTiming();
       }
+      // A message sent while this call was connecting. From here it is any message typed into a
+      // spoken call: it waits for the spoken turn in progress to close, as `advanceVibeTalkInput`
+      // describes.
+      deliverHeldTurn();
       break;
     }
     case "transcript": {
@@ -8912,9 +8986,15 @@ function teardown() {
   // turn from the dead conversation cannot suppress a transcript in the new one.
   lastActivityAt = 0;
   recentTyped = [];
-  // A message held for a conversation that never opened goes nowhere — not into the next one, which
-  // the reader has not asked for. Its text is still in the box, which is where they left it.
-  heldTurn = null;
+  // A message held for a conversation that never opened, or that closed before the server accepted
+  // it, goes nowhere — not into the next one, which the reader has not asked for. Its text is still
+  // in the box, which is where they left it, and the status says it did not go: after a send, a
+  // line that only said the call had ended would leave the reader to guess.
+  if (heldTurn !== null) {
+    heldTurn = null;
+    const said = el("status").textContent.replace(/[\s.]+$/u, "");
+    setStatus(`${said ? `${said}. ` : ""}Your message did not go — it is still in the box.`);
+  }
   renderControls();
 }
 
@@ -9028,6 +9108,12 @@ function renderControls() {
 
   if (!live) {
     talk.className = "control control-talk";
+    if (startInFlight) {
+      // A start is asking for its session or the microphone, and has no socket yet. Pressing this
+      // again starts nothing (`start()` refuses), so it must not offer to.
+      label.textContent = "Connecting…";
+      return;
+    }
     if (hasSuspended) {
       label.textContent = "Resume";
     } else {
