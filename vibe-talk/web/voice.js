@@ -9617,9 +9617,13 @@ function clearChannelScreen() {
   el("thread-list").replaceChildren();
   el("channel-summary").replaceChildren();
   el("timeline-notice").hidden = true;
-  // The pins this credential read go with the rest of what it read, and the bookmarks.
+  // The pins this credential read go with the rest of what it read. The bookmarks are kept: they
+  // are the server's, read again with the channel, and a write of one still on its way is kept track
+  // of for the read that follows (`noteBookmark`). Only another credential forgets them
+  // (`forgetBookmarks`). The rows the line was drawn on are gone.
   forgetPins();
-  forgetBookmarks();
+  bookmarkDrawn.main = null;
+  bookmarkDrawn.side = null;
   el("pinned-log").replaceChildren();
   renderOlderControl();
   channelFreshAt = 0;
@@ -9639,6 +9643,7 @@ function clearChannelScreen() {
 function screenBelongsToToken() {
   if (screenIdentity === tokenFingerprint(token())) return true;
   clearChannelScreen();
+  forgetBookmarks();
   // Reading the envelope deletes it when it, too, belongs to the previous token.
   readMessageCache();
   return false;
@@ -9649,6 +9654,7 @@ function forgetMessages() {
   if (sideActive) return inColumn(columns.main, forgetMessages);
   dropMessageCache();
   clearChannelScreen();
+  forgetBookmarks();
   // ...nor where the reader was in it: the record names a thread this credential read, and the
   // next one opens the channel as a first visit does. `#189 restore-ui-state`.
   forgetUiState();
@@ -14650,10 +14656,13 @@ function anchorOfRow(row, place) {
   return message ? anchorOfMessage(message, place) : null;
 }
 
-/** Forget every channel's bookmark: another credential. */
+/**
+ * Forget every channel's bookmark: another credential. The writes on their way are still counted
+ * (`bookmarkWrites`): the server keeps one bookmark whoever asks, so a read sent before one of them
+ * settles does not speak for it, whichever credential sent the read.
+ */
 function forgetBookmarks() {
   bookmarks.clear();
-  bookmarkWrites.clear();
   bookmarkDrawn.main = null;
   bookmarkDrawn.side = null;
 }

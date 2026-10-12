@@ -37565,3 +37565,29 @@ test("`#240 reading-bookmark`: in two columns, a Done on the root in the thread 
   assert.deepStrictEqual(bookmarkAt(page), { id: "302", place: "above" }, "the left column's line skipped Main's unread messages");
   assert.equal(bookmarkAt(page, "side-log"), null, "the right column kept a line that is now in Main");
 });
+
+test("`#240 reading-bookmark`: a screen cleared under a bookmark write still on its way keeps it, and the read that follows does not take it back", async () => {
+  const page = await servedBookmarkPage(backlog(5));
+  page.holdBookmarkWrites = true;
+  await bookmarkRow(page, bid(1));
+  // A read the server answers "no such channel" clears the screen (`clearChannelScreen`), with the
+  // write still held: then the channel reads again, from before the write settles.
+  const serve = page.channelPage;
+  page.channelPage = async () => {
+    page.channelPage = serve;
+    return json(404, { error: "unknown_channel", detail: "no such channel" });
+  };
+  await reReadChannel(page);
+  assert.deepStrictEqual(shownIds(page), [], "the fixture's refused read left the rows standing");
+  await page.el("view-switch").click();
+  await page.el("view-switch").click();
+  await page.settle();
+  assert.deepStrictEqual(shownIds(page), [bid(0), bid(1), bid(2), bid(3), bid(4)]);
+  assert.deepStrictEqual(bookmarkAt(page), { id: bid(1), place: "above" },
+    "a read sent before the bookmark write settled took it back, once the screen had been cleared");
+  page.holdBookmarkWrites = false;
+  for (const release of page.pendingBookmarkWrites.splice(0)) release();
+  await page.settle();
+  assert.deepStrictEqual(bookmarkAt(page), { id: bid(1), place: "above" }, "the settled write was not shown");
+  assert.equal(page.bookmark.anchor.message_id, bid(1));
+});
