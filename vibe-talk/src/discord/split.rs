@@ -1,11 +1,18 @@
-//! Cutting one long message into the several Discord will actually accept.
+//! Cutting one long message into the several a chat provider will actually accept.
 //!
 //! # Why this exists
 //!
-//! Discord refuses a message body over [`DISCORD_MAX_CONTENT_LEN`] characters. Until now this
-//! server refused it too, one layer earlier, which on a phone meant a reply somebody had spent
-//! minutes typing came back as an error and stayed stuck in the box. Coding agents posting INTO
-//! the channel already split their own long messages; the reply path did not.
+//! Every provider refuses a post over some size: Discord over
+//! [`DISCORD_MAX_CONTENT_LEN`] characters, Google Chat over 32,000 bytes, and Slack truncates past
+//! 40,000 characters. Until the reply path learned to split, this server refused a long post one
+//! layer earlier, which on a phone meant a reply somebody had spent minutes typing came back as an
+//! error and stayed stuck in the box. Coding agents posting INTO the channel already split their
+//! own long messages; the reply path did not.
+//!
+//! The size is the provider's to say ([`crate::chat::ChatClient::post_limit`]), and is counted
+//! the way that provider counts it: in characters, in UTF-8 bytes, or both, of the text as it
+//! leaves this server ([`PostLimit`]). `#263 post-split-per-provider`: it used to be Discord's
+//! 2000 characters for every provider, which cut a long Google Chat message into three.
 //!
 //! # The invariant that matters more than the formatting
 //!
@@ -26,10 +33,11 @@
 //! # Fenced code
 //!
 //! A cut inside ``` would leave the first part opening a fence it never closes and the second
-//! starting with code Discord renders as prose. So the fence is closed at the end of one part and
-//! reopened — with its language — at the start of the next.
+//! starting with code the provider renders as prose. So the fence is closed at the end of one part
+//! and reopened — with its language — at the start of the next.
 
 use super::http::DISCORD_MAX_CONTENT_LEN;
+use crate::chat::PostLimit;
 
 /// Cut `text` into pieces Discord will accept, in order.
 ///
@@ -40,14 +48,26 @@ pub fn split_for_discord(text: &str) -> Vec<String> {
     split_to(text, DISCORD_MAX_CONTENT_LEN)
 }
 
-/// The limit is a parameter so the tests can exercise boundaries without building 2000-character
-/// fixtures nobody can read in a diff.
+/// [`split_within`] a limit of `limit` characters, sent verbatim.
+///
+/// Kept as its own entry point so the tests can exercise boundaries without building
+/// 2000-character fixtures nobody can read in a diff.
 #[must_use]
 pub fn split_to(text: &str, limit: usize) -> Vec<String> {
-    if limit == 0 {
+    split_within(text, &PostLimit::chars(limit))
+}
+
+/// Cut `text` into pieces that each fit `limit`, in order.
+///
+/// Returns one part for a message that already fits — exactly the text, untouched — and never an
+/// empty vector for text that is not all whitespace. A part is never empty and never only
+/// whitespace. `#263 post-split-per-provider`.
+#[must_use]
+pub fn split_within(text: &str, limit: &PostLimit) -> Vec<String> {
+    if limit.max_chars == Some(0) || limit.max_bytes == Some(0) {
         return Vec::new();
     }
-    if text.chars().count() <= limit {
+    if limit.admits(text) {
         return if text.trim().is_empty() {
             Vec::new()
         } else {
@@ -59,17 +79,18 @@ pub fn split_to(text: &str, limit: usize) -> Vec<String> {
     let mut rest: Vec<char> = text.chars().collect();
     // The fence a previous part left open, if it did: `Some(language)`, language possibly empty.
     let mut reopen: Option<String> = None;
+    // What closing a fence at the end of a part costs: "\n```".
+    let closing = limit.measure("\n```");
 
     while !rest.is_empty() {
         let prefix = reopen
             .as_ref()
             .map(|lang| format!("```{lang}\n"))
             .unwrap_or_default();
-        let prefix_len = prefix.chars().count();
         // Room for the body of this part, once any reopened fence and the closing fence it may
-        // need are accounted for. `+ 4` is "\n```".
-        let budget = limit.saturating_sub(prefix_len);
-        if rest.len() <= budget && open_fence(&prefix, &rest).is_none() {
+        // need are accounted for.
+        let spent = limit.measure(&prefix);
+        if allowance(limit, &rest, spent) >= rest.len() && open_fence(&prefix, &rest).is_none() {
             let body: String = rest.iter().collect();
             push_part(&mut parts, format!("{prefix}{body}"));
             break;
@@ -88,9 +109,9 @@ pub fn split_to(text: &str, limit: usize) -> Vec<String> {
         // `ops::reply_scoped`), which a reservation decided by a fence in a part already posted
         // would break.
         let hard = if !prefix.is_empty() || rest.windows(3).any(|w| w == ['`', '`', '`']) {
-            budget.saturating_sub(4).max(1)
+            allowance(limit, &rest, (spent.0 + closing.0, spent.1 + closing.1)).max(1)
         } else {
-            budget
+            allowance(limit, &rest, spent)
         };
         // Half the allowance: below that a part is mostly empty, which is worse than a cut that
         // breaks a sentence.
@@ -99,10 +120,9 @@ pub fn split_to(text: &str, limit: usize) -> Vec<String> {
         let head: String = head.iter().collect();
         let mut piece = format!("{prefix}{head}");
         reopen = open_fence(&prefix, &rest[..take]);
-        if let Some(lang) = reopen.clone() {
+        if reopen.is_some() {
             // Close what this part opened, so the next one can reopen it. Without this the first
             // part renders as an unterminated fence and the second as prose.
-            let _ = &lang;
             piece.push_str("\n```");
         }
         push_part(&mut parts, piece);
@@ -114,6 +134,32 @@ pub fn split_to(text: &str, limit: usize) -> Vec<String> {
         }
     }
     parts
+}
+
+/// How many leading characters of `rest` fit in one post once `spent` — `(characters, bytes)` —
+/// is already used.
+///
+/// When all of `rest` fits, the answer runs past its end by the room still left, counted at one
+/// character and one byte apiece. That is what makes it the same number as the plain
+/// `limit - spent` this replaced for a limit in characters, so the cut search below starts from
+/// exactly where it did, and a post that was split one way before limits were per provider is
+/// still split that way.
+fn allowance(limit: &PostLimit, rest: &[char], spent: (usize, usize)) -> usize {
+    let (mut chars, mut bytes) = spent;
+    if !limit.within(chars, bytes) {
+        return 0;
+    }
+    for (index, c) in rest.iter().enumerate() {
+        let (more_chars, more_bytes) = limit.cost(*c);
+        if !limit.within(chars + more_chars, bytes + more_bytes) {
+            return index;
+        }
+        chars += more_chars;
+        bytes += more_bytes;
+    }
+    let room = |max: Option<usize>, used: usize| max.map_or(usize::MAX, |max| max - used);
+    rest.len()
+        .saturating_add(room(limit.max_chars, chars).min(room(limit.max_bytes, bytes)))
 }
 
 fn push_part(parts: &mut Vec<String>, piece: String) {
@@ -311,6 +357,106 @@ mod tests {
             for part in &parts {
                 assert!(part.chars().count() <= limit);
             }
+        }
+    }
+
+    // `#263 post-split-per-provider`: limits in bytes, and limits counted after escaping.
+
+    use crate::chat::PostEscaping;
+
+    #[test]
+    fn a_limit_in_bytes_counts_bytes_and_still_never_cuts_a_character_in_half() {
+        // Google Chat counts bytes. Three-byte characters fill a part three times as fast as
+        // ASCII does, and a cut by bytes that landed inside one would corrupt the text.
+        let text = "日本語のテキスト、そして English words. ".repeat(40);
+        for max in [24, 50, 101, 400] {
+            let limit = PostLimit::bytes(max);
+            let parts = split_within(&text, &limit);
+            assert!(parts.len() > 1, "{max}: the fixture did not split");
+            assert_eq!(rejoined(&parts), text, "{max} bytes lost or invented text");
+            for part in &parts {
+                assert!(part.len() <= max, "{max}: a part of {} bytes", part.len());
+            }
+        }
+    }
+
+    #[test]
+    fn a_post_that_fits_a_larger_limit_is_one_post_and_untouched() {
+        // The whole point of a limit per provider: a message Discord would need three posts for
+        // is one post to a provider that takes it whole.
+        let text = "a paragraph of ordinary words.\n\n".repeat(150);
+        assert!(
+            split_for_discord(&text).len() > 1,
+            "the fixture fits Discord"
+        );
+        assert_eq!(
+            split_within(&text, &PostLimit::bytes(30_000)),
+            vec![text.clone()]
+        );
+        // Both measures at once: the tighter decides.
+        let both = PostLimit {
+            max_chars: Some(10_000),
+            max_bytes: Some(1_000),
+            escaping: PostEscaping::Verbatim,
+        };
+        assert!(split_within(&text, &both)
+            .iter()
+            .all(|part| part.len() <= 1_000));
+    }
+
+    #[test]
+    fn escaped_characters_count_as_what_the_provider_is_sent() {
+        // Slack is sent `&lt;` for `<`. Cut by what the writer typed, a part of generics and
+        // arrows fits the count here and is truncated or refused upstream.
+        let limit = PostLimit::chars(60).escaped(PostEscaping::HtmlEntities);
+        let text = "Vec<Option<&str>> -> Result<(), E> & more ".repeat(20);
+        let parts = split_within(&text, &limit);
+        assert_eq!(rejoined(&parts), text);
+        for part in &parts {
+            let (chars, _) = limit.measure(part);
+            assert!(chars <= 60, "{chars} escaped characters: {part:?}");
+        }
+        assert!(
+            parts.len() > split_to(&text, 60).len(),
+            "escaping was not counted"
+        );
+    }
+
+    #[test]
+    fn a_fence_reopened_under_a_byte_limit_still_fits() {
+        let text = format!("```rust\n{}```", "let ünïcode = \"ß\";\n".repeat(60));
+        let limit = PostLimit::bytes(200);
+        let parts = split_within(&text, &limit);
+        assert!(parts.len() > 2, "the fixture did not split");
+        for (i, part) in parts.iter().enumerate() {
+            assert!(part.len() <= 200, "part {i} is {} bytes", part.len());
+            assert_eq!(
+                part.matches("```").count() % 2,
+                0,
+                "part {i} leaves a fence open"
+            );
+        }
+    }
+
+    /// `#195 send-resilience` under a byte limit: a remainder behind every fence is cut where the
+    /// whole message was, so a 207's retry asks again for the part that failed as the same words.
+    #[test]
+    fn a_remainder_under_a_byte_limit_splits_where_the_whole_message_did() {
+        let prose: Vec<String> = (0..80).map(|i| format!("wört{i} göes hëre")).collect();
+        let text = format!("```sh\nls -l\n```\n\n{}", prose.join(" "));
+        let limit = PostLimit::bytes(90);
+        let parts = split_within(&text, &limit);
+        assert!(parts.len() > 4, "the fixture did not split: {parts:?}");
+        for index in 1..parts.len() {
+            if parts[index..].iter().any(|part| part.contains("```")) {
+                continue;
+            }
+            let remainder = parts[index..].join("");
+            assert_eq!(
+                split_within(&remainder, &limit),
+                parts[index..],
+                "from part {index}"
+            );
         }
     }
 }

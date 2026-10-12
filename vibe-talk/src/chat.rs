@@ -224,6 +224,120 @@ pub struct UpstreamClearOutcome {
     pub dry_run: bool,
 }
 
+/// How much text one post may carry at a provider, counted the way that provider counts it.
+/// `#263 post-split-per-provider`.
+///
+/// A post longer than this is cut into parts that each fit ([`crate::discord::split`]); one that
+/// fits is sent whole. Until this existed every post was cut at Discord's 2000 characters whatever
+/// the provider, so a long message to a service that takes sixteen times that arrived as several.
+///
+/// Both measures are of the text **as the provider receives it**, after [`PostEscaping`]: a
+/// provider that turns `<` into `&lt;` counts four characters where the writer typed one, and a
+/// part cut to fit the writer's count could still be refused or truncated upstream.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PostLimit {
+    /// Most characters (Unicode scalar values) in one post; `None` counts no characters.
+    pub max_chars: Option<usize>,
+    /// Most UTF-8 bytes in one post; `None` counts no bytes.
+    pub max_bytes: Option<usize>,
+    /// What the provider's client does to the text before sending it.
+    pub escaping: PostEscaping,
+}
+
+/// What a provider's client does to a post's text on its way out, as far as its length goes.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum PostEscaping {
+    /// Sent exactly as written.
+    #[default]
+    Verbatim,
+    /// `&`, `<` and `>` are sent as `&amp;`, `&lt;` and `&gt;`. Slack's client does this to every
+    /// one of them but a user mention; counting a mention as escaped too only ever cuts a part
+    /// shorter than it had to be, never longer.
+    HtmlEntities,
+}
+
+impl PostLimit {
+    /// At most `max` characters, sent verbatim.
+    #[must_use]
+    pub const fn chars(max: usize) -> Self {
+        Self {
+            max_chars: Some(max),
+            max_bytes: None,
+            escaping: PostEscaping::Verbatim,
+        }
+    }
+
+    /// At most `max` UTF-8 bytes, sent verbatim.
+    #[must_use]
+    pub const fn bytes(max: usize) -> Self {
+        Self {
+            max_chars: None,
+            max_bytes: Some(max),
+            escaping: PostEscaping::Verbatim,
+        }
+    }
+
+    /// The same limit, counted after `escaping`.
+    #[must_use]
+    pub const fn escaped(self, escaping: PostEscaping) -> Self {
+        Self { escaping, ..self }
+    }
+
+    /// What one written character costs once escaped: `(characters, bytes)`.
+    #[must_use]
+    pub fn cost(&self, c: char) -> (usize, usize) {
+        match (self.escaping, c) {
+            (PostEscaping::HtmlEntities, '&') => (5, 5),
+            (PostEscaping::HtmlEntities, '<' | '>') => (4, 4),
+            _ => (1, c.len_utf8()),
+        }
+    }
+
+    /// What `text` costs once escaped: `(characters, bytes)`.
+    #[must_use]
+    pub fn measure(&self, text: &str) -> (usize, usize) {
+        text.chars().fold((0, 0), |(chars, bytes), c| {
+            let (more_chars, more_bytes) = self.cost(c);
+            (chars + more_chars, bytes + more_bytes)
+        })
+    }
+
+    /// Whether a post of `chars` characters and `bytes` bytes, as sent, is within this limit.
+    #[must_use]
+    pub fn within(&self, chars: usize, bytes: usize) -> bool {
+        self.max_chars.is_none_or(|max| chars <= max)
+            && self.max_bytes.is_none_or(|max| bytes <= max)
+    }
+
+    /// Whether `text` may go as one post.
+    #[must_use]
+    pub fn admits(&self, text: &str) -> bool {
+        let (chars, bytes) = self.measure(text);
+        self.within(chars, bytes)
+    }
+
+    /// Why `text` may not go as one post, for a refusal; `None` when it may.
+    #[must_use]
+    pub fn refusal(&self, text: &str) -> Option<String> {
+        let (chars, bytes) = self.measure(text);
+        let escaped = if self.escaping == PostEscaping::Verbatim {
+            ""
+        } else {
+            " once escaped"
+        };
+        if let Some(max) = self.max_chars.filter(|max| chars > *max) {
+            return Some(format!(
+                "message content is {chars} characters{escaped}; the chat API accepts at most {max}"
+            ));
+        }
+        self.max_bytes.filter(|max| bytes > *max).map(|max| {
+            format!(
+                "message content is {bytes} UTF-8 bytes{escaped}; the chat API accepts at most {max}"
+            )
+        })
+    }
+}
+
 /// Read and post access to configured chat channels.
 #[async_trait]
 pub trait ChatClient: Send + Sync {
@@ -502,6 +616,28 @@ pub trait ChatClient: Send + Sync {
     ) -> Result<Message, ChatError> {
         self.post_in_thread(channel, thread_id, content, reply_to)
             .await
+    }
+
+    /// The most text one post to `channel` may carry. `#263 post-split-per-provider`.
+    ///
+    /// [`crate::ops::reply_scoped`] cuts a longer post into parts that each fit, and sends one
+    /// that fits whole. The default is Discord's 2000 characters
+    /// ([`crate::discord::http::DISCORD_MAX_CONTENT_LEN`]): the limit every post was cut at before
+    /// a provider could say otherwise, so one that does not say keeps that behaviour.
+    fn post_limit(&self, _channel: &ChannelId) -> PostLimit {
+        PostLimit::chars(crate::discord::http::DISCORD_MAX_CONTENT_LEN)
+    }
+
+    /// The thread the rest of a post that had to be cut continues in, once its first part,
+    /// `first`, was posted to the conversation itself. `#263 post-split-per-provider`.
+    ///
+    /// `None`, the default, posts every part into the conversation one after another, and only the
+    /// first answers the reply target. That is Discord's behaviour: this route cannot start a
+    /// thread from a message it has just posted. A provider where any message can carry a thread
+    /// answers the thread `first` is in or now roots, and the rest is posted there, so a long post
+    /// reads as one message in the conversation with its continuation under it.
+    fn continuation_thread(&self, _channel: &ChannelId, _first: &Message) -> Option<String> {
+        None
     }
 
     /// Move the provider's read cursor through one message.
