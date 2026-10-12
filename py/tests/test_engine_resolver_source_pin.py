@@ -47,9 +47,6 @@ def _run_launcher(
         **os.environ,
         "CARGO_NET_OFFLINE": "true",
         "DAGRUN_ENGINE": "rust",
-        # The cache verdict and rebuild notices are what these tests observe; by default the
-        # launcher prints only the resolver's one engine line.
-        "AGENT_UTILS_RS_VERBOSE": "1",
     }
     if ensure_only:
         env["AGENT_UTILS_RS_ENSURE_ONLY"] = "1"
@@ -527,49 +524,3 @@ def test_build_failure_never_runs_previous_binary_or_python(tmp_path: Path) -> N
     assert "Cargo build failed; no cached Rust artifact was executed" in failed.stderr
     assert "v1" not in failed.stdout
     assert "PYTHON_FALLBACK_RAN" not in failed.stdout
-
-
-
-def test_a_quiet_launch_prints_only_the_engine_line(tmp_path: Path) -> None:
-    """Both engines announce themselves with ONE line of the same shape, and nothing else.
-
-    The cache verdict used to follow on every Rust launch, so the two engines' stderr differed on
-    every invocation; it is now behind AGENT_UTILS_RS_VERBOSE.
-    """
-    root = _build_sandbox(tmp_path)
-    warm = _run_launcher(root)
-    assert warm.returncode == 0, warm.stderr
-    quiet = _run_launcher(root, extra_env={"AGENT_UTILS_RS_VERBOSE": ""})
-    assert quiet.returncode == 0, quiet.stderr
-    assert quiet.stdout == "v1\n"
-    assert quiet.stderr == "[tick-hub] engine=rust (tracked Cargo launcher: rs/bin/tick-hub)\n"
-
-
-def test_a_deleted_working_directory_reaches_the_tool(tmp_path: Path) -> None:
-    """The launcher never changes directory, so the tool, not bash, decides about a deleted cwd."""
-    root = _build_sandbox(tmp_path)
-    warm = _run_launcher(root)
-    assert warm.returncode == 0, warm.stderr
-    gone = tmp_path / "gone"
-    gone.mkdir()
-    script = (
-        'cd "$1" && rmdir "$1" && exec "$2"'
-    )
-    launched = subprocess.run(
-        ["bash", "-c", script, "bash", str(gone), str(root / "common" / "bin" / "tick-hub")],
-        capture_output=True,
-        text=True,
-        check=False,
-        timeout=120,
-        env={
-            **os.environ,
-            "DAGRUN_ENGINE": "rust",
-            "CARGO_NET_OFFLINE": "true",
-            "AGENT_UTILS_TEST_PRINT_CWD": "1",
-        },
-    )
-    # The sandbox tool asks for its working directory and panics when it is gone: the TOOL ran,
-    # rather than the launcher failing on a `cd` back to the caller's directory.
-    assert "engine=rust" in launched.stderr, launched.stderr
-    assert "panicked" in launched.stderr, launched.stderr
-    assert "cd:" not in launched.stderr, launched.stderr

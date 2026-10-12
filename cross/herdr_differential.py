@@ -7,7 +7,13 @@ compose either implementation.  The comparison covers bootstrap behavior, every 
 document, the structured option surface, the command-policy boundary, strict configuration
 loading/discovery with every configuration message, argument grammar, agent inference, bytes that
 are not UTF-8, locales, output failures and signals, OS error text, the audited dry-run path, the
-spool, reap over planted records, and the documented launchers.
+spool, reap over planted records, paths and names a terminal must not see raw, and what the
+editions hand to the processes they start: environment, descriptors, and signal dispositions.
+
+The editions are invoked directly -- the Python package under the real interpreter, the Rust
+binary itself -- because what is compared is the TOOL. ``common/bin/herdr-run`` is exercised only
+as a smoke test whose launcher-written lines are stripped: the launcher is shared plumbing for every
+tool, and its own behaviour (see ``cross/README.md``) is not herdr-run's.
 
 Output is compared as BYTES: both streams are decoded with ``surrogateescape``, so a byte that is
 not UTF-8 survives the comparison instead of being replaced by U+FFFD in both editions alike.
@@ -63,7 +69,9 @@ _PID_VALUE = re.compile(r'(?P<prefix>"(?:pid|shell_pid)"\s*:\s*)-?\d+')
 _DURATION_VALUE = re.compile(
     r'(?P<prefix>"(?:duration|duration_seconds)"\s*:\s*)-?(?:\d+(?:\.\d*)?|\.\d+)'
 )
-_ENGINE_LINE = re.compile(r"^\[herdr-run\] engine=(?:python|rust) [^\n]*\n", re.MULTILINE)
+#: A line the documented launcher writes itself (``[herdr-run] engine=...``, the Rust cache verdict),
+#: as opposed to the tool's own ``herdr-run: ...`` diagnostics.
+_LAUNCHER_LINE = re.compile(r"^\[herdr-run\] [^\n]*\n", re.MULTILINE)
 
 #: Agent variables the editions read. Removed from the inherited environment so a developer's own
 #: session name cannot leak into a case that is about something else.
@@ -179,7 +187,7 @@ class Harness:
         args: Sequence[str],
         *,
         cwd: str = ".",
-        extra_env: Mapping[str, str] | None = None,
+        extra_env: Mapping[str, str | None] | None = None,
         mode: str = "capture",
     ) -> tuple[Outcome, Outcome]:
         return self.invoke_commands(
@@ -200,8 +208,8 @@ class Harness:
         args: Sequence[str],
         *,
         cwd: str = ".",
-        extra_env: Mapping[str, str] | None = None,
-        rust_env: Mapping[str, str] | None = None,
+        extra_env: Mapping[str, str | None] | None = None,
+        rust_env: Mapping[str, str | None] | None = None,
         mode: str = "capture",
     ) -> tuple[Outcome, Outcome]:
         outcomes: list[Outcome] = []
@@ -212,14 +220,17 @@ class Harness:
             working = root / cwd
             if mode != "deleted-cwd":
                 working.mkdir(parents=True, exist_ok=True)
-            environment = dict(extra_env or {})
+            environment: dict[str, str | None] = dict(extra_env or {})
             environment.update(own_env or {})
             outcome = _run(
                 command,
                 [_expand(argument, root) for argument in args],
                 cwd=working,
                 home=root / ".home",
-                extra_env={key: _expand(value, root) for key, value in environment.items()},
+                extra_env={
+                    key: None if value is None else _expand(value, root)
+                    for key, value in environment.items()
+                },
                 mode=mode,
             )
             outcomes.append(_normalize_outcome(outcome, root))
@@ -240,7 +251,7 @@ def _prepare_command(command: Sequence[str]) -> tuple[str, ...]:
     return tuple(prepared)
 
 
-def _environment(home: Path, extra: Mapping[str, str] | None) -> dict[str, str]:
+def _environment(home: Path, extra: Mapping[str, str | None] | None) -> dict[str, str]:
     environment = dict(os.environ)
     for key in _AGENT_VARIABLES:
         environment.pop(key, None)
@@ -269,8 +280,11 @@ def _environment(home: Path, extra: Mapping[str, str] | None) -> dict[str, str]:
         environment.setdefault("PYTHONUSERBASE", str(Path(original_home) / ".local"))
         environment.setdefault("CARGO_HOME", str(Path(original_home) / ".cargo"))
         environment.setdefault("RUSTUP_HOME", str(Path(original_home) / ".rustup"))
-    if extra is not None:
-        environment.update(extra)
+    for key, value in (extra or {}).items():
+        if value is None:
+            environment.pop(key, None)
+        else:
+            environment[key] = value
     return environment
 
 
@@ -293,13 +307,32 @@ def _run(
     *,
     cwd: Path,
     home: Path,
-    extra_env: Mapping[str, str] | None,
+    extra_env: Mapping[str, str | None] | None,
     mode: str = "capture",
 ) -> Outcome:
     environment = _environment(home, extra_env)
     argv = [*command, *args]
     if mode == "capture":
         return _run_captured(argv, cwd, environment)
+    if mode == "inherited-descriptors":
+        # Standard input closed, and descriptor 7 open on a file: what a caller hands over that the
+        # editions' children must not see (7) or must see as /dev/null (0).
+        inherited = os.open(os.devnull, os.O_RDONLY)
+        try:
+
+            def hand_over() -> None:
+                os.dup2(inherited, 7)
+                os.close(0)
+
+            return _run_captured(argv, cwd, environment, preexec=hand_over, close_fds=False)
+        finally:
+            os.close(inherited)
+    if mode == "sigint-ignored":
+        return _run_captured(argv, cwd, environment, preexec=_ignore_sigint)
+    if mode == "sigint-ignored-while-writing":
+        return _run_interrupted(argv, cwd, environment, ignore_sigint=True)
+    if mode == "file-size-limit":
+        return _run_size_limited(argv, cwd, environment)
     if mode == "closed-stdout":
         return _run_captured(argv, cwd, environment, preexec=lambda: os.close(1))
     if mode == "deleted-cwd":
@@ -326,12 +359,18 @@ def _run(
     raise ValueError(f"unknown invocation mode {mode}")
 
 
+def _ignore_sigint() -> None:
+    """Start a process with SIGINT ignored, as a caller such as ``nohup`` may start it."""
+    signal.signal(signal.SIGINT, signal.SIG_IGN)
+
+
 def _run_captured(
     argv: Sequence[str],
     cwd: Path,
     environment: Mapping[str, str],
     *,
     preexec: Callable[[], None] | None = None,
+    close_fds: bool = True,
 ) -> Outcome:
     try:
         completed = subprocess.run(
@@ -344,6 +383,7 @@ def _run_captured(
             start_new_session=True,
             timeout=TIMEOUT_SECONDS,
             preexec_fn=preexec,
+            close_fds=close_fds,
         )
     except subprocess.TimeoutExpired as error:
         return Outcome(
@@ -388,12 +428,21 @@ def _run_redirected(
 _F_SETPIPE_SZ = 1031
 
 
-def _run_interrupted(argv: Sequence[str], cwd: Path, environment: Mapping[str, str]) -> Outcome:
+def _run_interrupted(
+    argv: Sequence[str],
+    cwd: Path,
+    environment: Mapping[str, str],
+    *,
+    ignore_sigint: bool = False,
+) -> Outcome:
     """Interrupt the process while it is blocked writing a long document to a full pipe.
 
     The pipe is shrunk to one page and never read until the process has filled it, so the process
     is provably parked inside its stdout write -- long after start-up -- when SIGINT arrives. The
     observable result is the exit status and stderr; the bytes already written are discarded.
+
+    With ``ignore_sigint`` the process starts with SIGINT ignored, as a caller may start it; the
+    interrupt must then change nothing, so the pipe is drained afterwards and the write completes.
     """
     reader, writer = os.pipe()
     try:
@@ -409,6 +458,7 @@ def _run_interrupted(argv: Sequence[str], cwd: Path, environment: Mapping[str, s
             stdout=writer,
             stderr=subprocess.PIPE,
             start_new_session=True,
+            preexec_fn=_ignore_sigint if ignore_sigint else None,
         )
         os.close(writer)
         writer = -1
@@ -424,6 +474,9 @@ def _run_interrupted(argv: Sequence[str], cwd: Path, environment: Mapping[str, s
             # Give the writer a moment to be parked in write(2) on the now-full pipe.
             time.sleep(0.1)
             process.send_signal(signal.SIGINT)
+        if ignore_sigint:
+            while os.read(reader, 65536):
+                pass
         try:
             _, stderr = process.communicate(timeout=TIMEOUT_SECONDS)
         except subprocess.TimeoutExpired:
@@ -435,6 +488,38 @@ def _run_interrupted(argv: Sequence[str], cwd: Path, environment: Mapping[str, s
         os.close(reader)
         if writer >= 0:
             os.close(writer)
+
+
+def _run_size_limited(argv: Sequence[str], cwd: Path, environment: Mapping[str, str]) -> Outcome:
+    """Run with stdout on a regular file and RLIMIT_FSIZE at one page.
+
+    A write past the limit raises SIGXFSZ, whose default action kills the writer. Both editions
+    ignore it, so the write fails with EFBIG and is reported; only the exit status and stderr are
+    observed.
+    """
+    import resource
+
+    with tempfile.TemporaryFile() as sink:
+
+        def limit() -> None:
+            resource.setrlimit(resource.RLIMIT_FSIZE, (4096, 4096))
+
+        try:
+            completed = subprocess.run(
+                list(argv),
+                cwd=cwd,
+                env=dict(environment),
+                stdin=subprocess.DEVNULL,
+                stdout=sink,
+                stderr=subprocess.PIPE,
+                check=False,
+                start_new_session=True,
+                timeout=TIMEOUT_SECONDS,
+                preexec_fn=limit,
+            )
+        except subprocess.TimeoutExpired as error:
+            return Outcome(124, "", _decode_output(error.stderr) + "\nTIMEOUT\n")
+    return Outcome(completed.returncode, "", _decode_output(completed.stderr))
 
 
 def _normalize_text(text: str, root: Path) -> str:
@@ -1034,6 +1119,40 @@ def _policy(harness: Harness, report: Report) -> None:
     python, rust = harness.invoke(case, ("check", "gh pr list"))
     report.exact("policy/custom-narrowed", python, rust, expected_rc=77)
 
+    # `~` is expanded before the policy judges an argument, so HOME cannot smuggle an option, a
+    # subcommand, or a program past it. Each refused case here was ALLOWED, and then executed as
+    # the expanded argv, while the policy judged the token before expansion.
+    audited_home = {".herdr-run.yaml": "spool_dir: .audit-spool\n"}
+    for label, home, command, expected in (
+        ("exec-path", "--exec-path=/tmp/evil", "git ~ foo", 77),
+        ("daemon", "daemon", "git ~ foo", 77),
+        ("upload-pack", "--upload-pack=/tmp/evil", "git fetch ~", 77),
+        ("upload-pack-gh", "--upload-pack=/tmp/evil", "gh repo view ~", 77),
+        ("git-config", "-c", "git ~ core.pager=evil log", 77),
+        ("program", "git", "~ status", 77),
+        ("wrapper", "with-proxy", "~ git status", 77),
+        ("control", "/a\x1bb", "git -C ~ log", 77),
+        ("value-option", "-C", "git ~ /tmp log", 0),
+        ("path", "<ROOT>/.home", "git -C ~/x status", 0),
+        ("after-subcommand", "--exec-path=/x", "git log ~", 0),
+    ):
+        case = harness.case(f"policy-home-{label}", audited_home)
+        environment = {"HOME": home}
+        python, rust = harness.invoke(case, ("check", command), extra_env=environment)
+        report.exact(f"policy/home/{label}", python, rust, expected_rc=expected)
+        python, rust = harness.invoke(case, ("--json", "check", command), extra_env=environment)
+        report.exact(f"policy/home-json/{label}", python, rust, expected_rc=expected)
+        python, rust = harness.invoke(
+            case, ("--agent", "a", "run", "--dry-run", command), extra_env=environment
+        )
+        report.exact(f"policy/home-dry-run/{label}", python, rust, expected_rc=expected)
+        report.exact(
+            f"policy/home-dry-run/{label}/audit",
+            _read_normalized(case.python_root / ".audit-spool" / "audit.jsonl", case.python_root),
+            _read_normalized(case.rust_root / ".audit-spool" / "audit.jsonl", case.rust_root),
+            expected_rc=0,
+        )
+
 
 def _cli_grammar(harness: Harness, report: Report) -> None:
     """``--timeout`` and ``--wait-ready`` share one grammar: ASCII digits, whole milliseconds."""
@@ -1082,7 +1201,8 @@ def _cli_grammar(harness: Harness, report: Report) -> None:
 
 
 def _agents(harness: Harness, report: Report) -> None:
-    """Agent inference: one variable order, ASCII-whitespace trimming, non-UTF-8 refused."""
+    """Agent inference: one variable order, Unicode White_Space trimmed, names checked, non-UTF-8
+    refused."""
 
     case = harness.case("agents")
     environments: tuple[tuple[str, dict[str, str]], ...] = (
@@ -1095,6 +1215,15 @@ def _agents(harness: Harness, report: Report) -> None:
         ("separator-not-trimmed", {"HERDR_RUN_AGENT": "\x1cagent\x1c"}),
         ("ideographic-space", {"HERDR_RUN_AGENT": "\u3000agent\u3000"}),
         ("no-break-space", {"HERDR_RUN_AGENT": "\u00a0agent"}),
+        # Only Unicode White_Space: the variable is empty, and the next one names the agent.
+        ("only-ideographic-space", {"HERDR_RUN_AGENT": "\u3000", "DG_AGENT_NAME": "dg"}),
+        ("only-no-break-space", {"HERDR_RUN_AGENT": "\u00a0\u00a0", "DG_AGENT_NAME": "dg"}),
+        ("only-line-separator", {"HERDR_RUN_AGENT": "\u2028", "ORC_AGENT_NAME": "orc"}),
+        ("only-next-line", {"HERDR_RUN_AGENT": "\u0085", "DG_AGENT_NAME": "dg"}),
+        # What is left may hold no control or invisible character.
+        ("inner-no-break-space", {"HERDR_RUN_AGENT": "a\u00a0b"}),
+        ("bidi-override", {"HERDR_RUN_AGENT": "agent\u202e"}),
+        ("zero-width-space", {"HERDR_RUN_AGENT": "\u200b"}),
         ("inner-tab", {"HERDR_RUN_AGENT": "a\tb"}),
         ("non-ascii", {"HERDR_RUN_AGENT": "caf\u00e9"}),
         ("non-utf8", {"HERDR_RUN_AGENT": "\udcff"}),
@@ -1114,9 +1243,21 @@ def _agents(harness: Harness, report: Report) -> None:
         ("non-utf8", "\udcff"),
         ("non-ascii", "caf\u00e9"),
         ("brace", "{agent}"),
+        ("bidi-override", "a\u202eb"),
+        ("no-break-space", "\u00a0"),
+        ("word-joiner", "x\u2060y"),
     ):
         python, rust = harness.invoke(case, ("--agent", value, "config"))
         report.same(f"agents/flag/{label}", python, rust, allowed=frozenset({0, 2, 78}))
+    # The guide's promise: a variable holding only Unicode White_Space is skipped.
+    python, _ = harness.invoke(
+        case, ("config",), extra_env={"HERDR_RUN_AGENT": "\u3000", "DG_AGENT_NAME": "dg"}
+    )
+    report.require(
+        "agents/env/white-space-falls-through",
+        '"tab_label": "dg"' in python.stdout,
+        f"a variable of only U+3000 must fall through to the next: {_describe(python)}",
+    )
 
 
 def _config_success(harness: Harness, report: Report) -> None:
@@ -1225,14 +1366,14 @@ timeout_seconds: 0o10
 """
     case = harness.case("config-yaml-12", {".herdr-run.yaml": yaml_12})
     python, rust = harness.invoke(case, ("config",))
-    report.exact("config/yaml-1.2-scalars", python, rust, expected_rc=0)
+    report.exact("config/plain-scalar-rule", python, rust, expected_rc=0)
     report.require(
-        "config/yaml-1.2-scalar-values",
+        "config/plain-scalar-rule-values",
         '"workspace": "yes"' in python.stdout
         and '"on"' in python.stdout
         and '"off"' in python.stdout
         and '"timeout_seconds": 8.0' in python.stdout,
-        f"YAML 1.2 core scalars resolved incorrectly: {_describe(python)}",
+        f"plain scalars resolved against the documented rule: {_describe(python)}",
     )
 
     # An explicit configuration path, spelled every way a caller might spell it.
@@ -1331,6 +1472,24 @@ def _config_malformed(harness: Harness, report: Report) -> None:
         ("retention-huge", "retention_days: " + "9" * 40 + "\n"),
         ("root-sequence", "- a\n- b\n"),
         ("root-scalar", "just text\n"),
+        # A deny entry that looks like `-c` but is not would never match the `-c` it appears to
+        # deny, so every name refuses an invisible character, and a raw U+0085/U+2028/U+2029 is
+        # refused anywhere: YAML 1.1 reads it as a line break and YAML 1.2 does not.
+        (
+            "raw-line-separator-in-deny",
+            b"allow: [git]\ndeny_global:\n  git: [-c\xe2\x80\xa8, --exec-path\xe2\x80\xa9]\n",
+        ),
+        ("raw-line-separator-in-deny-anywhere", b"deny_anywhere: [--upload-pack\xe2\x80\xa8]\n"),
+        ("raw-paragraph-separator-in-value-options", b"value_options:\n  git: [-C\xe2\x80\xa9]\n"),
+        ("raw-next-line-in-comment", b"allow: [git]\n# x\xc2\x85allow: [curl]\n"),
+        ("escaped-line-separator-in-deny", 'allow: [git]\ndeny_global:\n  git: ["-c\\L", --exec-path]\n'),
+        ("zero-width-space-in-deny-anywhere", 'deny_anywhere: ["--upload-pack\\u200b"]\n'),
+        ("byte-order-mark-in-value-options", 'value_options:\n  git: ["-C\\ufeff"]\n'),
+        ("no-break-space-in-allow", 'allow: ["git\\u00a0"]\n'),
+        ("bidi-override-in-prefixes", 'prefixes: ["with-proxy\\u202e"]\n'),
+        ("format-character", 'workspace: "a\\u202eb"\n'),
+        ("word-joiner-in-tab-name", 'tab_name: "{agent}\\u2060"\n'),
+        ("ideographic-space-in-deny-subcommand-key", 'deny_subcommand:\n  "git\\u3000": [daemon]\n'),
         ("not-utf8", b"workspace: caf\xe9\n"),
         ("not-utf8-in-comment", b"# \xff\nworkspace: x\n"),
         ("nul-byte", b"workspace: a\x00b\n"),
@@ -1359,8 +1518,8 @@ def _config_malformed(harness: Harness, report: Report) -> None:
         ("zero-timeout", "timeout_seconds: 0\n"),
         ("explicit-tags", "workspace: !!str 12\nmax_panes: !!int '5'\ntimeout_seconds: !!float 1\n"),
         ("leading-zero-string", "workspace: 007\n"),
-        ("format-character", 'workspace: "a\\u202eb"\n'),
         ("non-ascii", "workspace: caf\u00e9\n"),
+        ("invisible-outside-names", 'prompt_tail: "\\u00a0$ "\nspool_dir: "out\\u00a0dir"\n'),
         ("doubled-braces", "tab_name: '{{agent}}-{agent}'\n"),
         ("cwd-absolute-dot-dot", "cwd: /a/../b\n"),
         ("cwd-relative-dot-dot", "cwd: ./x/../y\n"),
@@ -1394,6 +1553,12 @@ def _config_malformed(harness: Harness, report: Report) -> None:
         report.same(
             f"config/yaml-corpus/{entry['name']}", python, rust, allowed=frozenset({0, 78})
         )
+
+    # The reported repro: the file is refused, so the command it would have let through is not run.
+    repro = b"allow: [git]\ndeny_global:\n  git: [-c\xe2\x80\xa8, --exec-path\xe2\x80\xa9]\n"
+    case = harness.case("config-line-separator-repro", {".herdr-run.yaml": repro})
+    python, rust = harness.invoke(case, ("check", "git -c core.pager=evil log"))
+    report.exact("config/line-separator-repro/check", python, rust, expected_rc=78)
 
     case = harness.case("config-missing-explicit")
     python, rust = harness.invoke(case, ("--config", "missing.yaml", "config"))
@@ -1533,6 +1698,8 @@ def _locales(harness: Harness, report: Report) -> None:
             ("config", ("--agent", "\u00e9", "config")),
             ("status", ("--agent", "\u00e9", "status")),
             ("non-utf8-argument", ("check", "git \udce9")),
+            ("utf8-argument", ("check", "git \u65e5\u672c")),
+            ("utf8-refusal", ("check", "curl \u65e5\u672c")),
             ("help", ("--help",)),
             ("quickstart", ("quickstart",)),
         ):
@@ -1894,6 +2061,34 @@ def _reap(harness: Harness, report: Report) -> None:
         ("meta-not-utf8", {f"{run_dir}/meta.json": b'{"pane_id": "\xff"}'}),
         ("meta-nan", {f"{run_dir}/meta.json": '{"pane_id": "w1:p1", "exit_code": NaN}'}),
         ("meta-array", {f"{run_dir}/meta.json": "[]"}),
+        # Integers no float can hold, and nesting past the shared depth limit: a skipped record in
+        # both editions, never a traceback.
+        (
+            "meta-integer-past-float",
+            {f"{run_dir}/meta.json": '{"pane_id": "w1:p1", "exit_code": 1' + "0" * 400 + "}"},
+        ),
+        (
+            "meta-integer-past-digit-limit",
+            {f"{run_dir}/meta.json": '{"pane_id": "w1:p1", "exit_code": ' + "9" * 5000 + "}"},
+        ),
+        (
+            "meta-nested-too-deep",
+            {f"{run_dir}/meta.json": '{"pane_id": "w1:p1", "x": ' + "[" * 200 + "]" * 200 + "}"},
+        ),
+        (
+            "meta-nested-deep-enough-to-crash-a-recursive-reader",
+            {f"{run_dir}/meta.json": '{"pane_id": "w1:p1", "x": ' + "[" * 20000 + "]" * 20000 + "}"},
+        ),
+        (
+            "meta-nested-at-the-limit",
+            {
+                f"{run_dir}/meta.json": _reap_record("w1:p1", "elsewhere")[:-1]
+                + ', "x": '
+                + "[" * 126
+                + "]" * 126
+                + "}"
+            },
+        ),
     )
     for label, files in planted:
         case = harness.case(f"reap-planted-{label}", {".herdr-run.yaml": _REAP_CONFIG, **files})
@@ -1901,6 +2096,29 @@ def _reap(harness: Harness, report: Report) -> None:
         report.exact(f"reap/planted/{label}", python, rust, expected_rc=0)
         python, rust = harness.invoke(case, ("--json", "reap"))
         report.exact(f"reap/planted/{label}/json", python, rust, expected_rc=0)
+
+    # Run directories are read oldest first by sorting their names, and the LAST record naming a
+    # pane decides its scope. Sorted by raw bytes in both editions: by code point, a name that is
+    # not UTF-8 (held as surrogate escapes) would sort the other way round against U+E000.
+    def ordered_runs(root: Path) -> None:
+        runs = root / ".herdr-run" / "runs"
+        for name, workspace in (("\udcff", "someone-elses"), ("\ue000", _REAP_WORKSPACE)):
+            directory = runs / name
+            directory.mkdir(parents=True)
+            (directory / "meta.json").write_text(
+                _reap_record("w1:p1", workspace), encoding="utf-8"
+            )
+
+    case = harness.case(
+        "reap-byte-ordered-runs", {".herdr-run.yaml": _REAP_CONFIG}, setup=ordered_runs
+    )
+    python, rust = harness.invoke(case, ("reap",))
+    report.exact("reap/byte-ordered-runs", python, rust, expected_rc=0)
+    report.require(
+        "reap/byte-ordered-runs/last-by-bytes-wins",
+        '"OUT_OF_SCOPE": 1' in python.stdout,
+        f"the run directory named by byte 0xFF sorts last and must decide scope: {_describe(python)}",
+    )
 
 
 #: `status` fixtures name a workspace no real session would carry, so a host that happens to be
@@ -2149,50 +2367,262 @@ def _deleted_cwd(harness: Harness, report: Report) -> None:
         report.same(f"deleted-cwd/{label}", python, rust, allowed=allowed)
 
 
-def _strip_engine_line(outcome: Outcome) -> tuple[Outcome, int]:
-    stripped, count = _ENGINE_LINE.subn("", outcome.stderr)
+def _strip_launcher_lines(outcome: Outcome) -> tuple[Outcome, int]:
+    stripped, count = _LAUNCHER_LINE.subn("", outcome.stderr)
     return Outcome(outcome.returncode, outcome.stdout, stripped), count
 
 
 def _launchers(harness: Harness, report: Report) -> None:
-    """Through the documented launcher, both engines differ only in the one ``engine=`` line."""
+    """Both engines are reachable through the documented launcher, and the TOOL agrees there too.
+
+    The launcher's own lines are stripped before comparing. They differ by design (each names its
+    engine, and the Rust path reports its cache verdict), and the launcher's other behaviour --
+    under a deleted working directory, without ``HOME``, under a locale bash cannot load, and with
+    a ``python3`` on ``PATH`` that is a wrapper rather than the interpreter (which may refuse an
+    argument that is not UTF-8 before herdr-run starts) -- is shared by every tool and documented
+    in ``cross/README.md`` as launcher behaviour. Bytes that are not UTF-8 are compared on the
+    editions themselves, in ``_non_utf8``.
+    """
 
     if not LAUNCHER.exists():
         report.notes.append(f"launcher cases were not run: {LAUNCHER} is missing")
         return
     case = harness.case("launchers", {".herdr-run.yaml": "allow: [git]\nprefixes: []\n"})
     command = (str(LAUNCHER),)
-    for label, args, mode, allowed in (
-        ("version", ("--version",), "capture", frozenset({0})),
-        ("help", ("--help",), "capture", frozenset({0})),
-        ("surface", ("--dump-surface",), "capture", frozenset({0})),
-        ("refusal", ("check", "curl\u202ex"), "capture", frozenset({77})),
-        ("usage", ("--frobnicate",), "capture", frozenset({2})),
-        ("non-utf8-argument", ("check", "git \udcff"), "capture", frozenset({2})),
-        ("locale", ("check", "curl \u00e9"), "capture", frozenset({77})),
-        ("deleted-cwd-version", ("--version",), "deleted-cwd", frozenset({0})),
-        ("deleted-cwd-config", ("config",), "deleted-cwd", frozenset({78})),
-        ("dev-full", ("--version",), "dev-full", frozenset({1})),
+    for label, args, allowed in (
+        ("version", ("--version",), frozenset({0})),
+        ("help", ("--help",), frozenset({0})),
+        ("surface", ("--dump-surface",), frozenset({0})),
+        ("refusal", ("check", "curl\u202ex"), frozenset({77})),
+        ("usage", ("--frobnicate",), frozenset({2})),
+        ("dry-run", ("--agent", "a", "run", "--dry-run", "git status"), frozenset({0})),
     ):
-        environment = {"LC_ALL": "en_US", "LANG": "en_US"} if label == "locale" else None
         python, rust = harness.invoke_commands(
             case,
             command,
             command,
             args,
-            cwd="gone" if mode == "deleted-cwd" else ".",
-            extra_env=environment,
             rust_env={"DAGRUN_ENGINE": "rust"},
-            mode=mode,
         )
-        python_body, python_lines = _strip_engine_line(python)
-        rust_body, rust_lines = _strip_engine_line(rust)
+        python_body, python_lines = _strip_launcher_lines(python)
+        rust_body, rust_lines = _strip_launcher_lines(rust)
         report.same(f"launcher/{label}", python_body, rust_body, allowed=allowed)
         report.require(
-            f"launcher/{label}/one-engine-line",
-            python_lines == 1 and rust_lines == 1,
-            "each engine must announce itself in exactly one line: "
+            f"launcher/{label}/announces-the-engine",
+            python_lines >= 1 and rust_lines >= 1,
+            "each launch must name its engine: "
             f"python={_describe(python)} rust={_describe(rust)}",
+        )
+
+
+#: A stand-in ``git`` placed first on PATH. herdr-run asks git whether the spool is ignored before
+#: a dry run, so this is a process each edition starts, and it records what it was handed.
+_PROBE_GIT = """#!/bin/sh
+{
+  printf 'argv:'; for argument in "$@"; do printf ' [%s]' "$argument"; done; echo
+  env | LC_ALL=C sort | grep -v '^_='
+  grep -E '^Sig(Ign|Blk):' "/proc/$$/status"
+  for descriptor in 0 1 2 3 4 5 6 7 8 9; do
+    if [ -e "/proc/$$/fd/$descriptor" ]; then
+      echo "fd $descriptor -> $(readlink "/proc/$$/fd/$descriptor" | sed 's/:\\[[0-9]*\\]/:[N]/')"
+    fi
+  done
+} > "$HERDR_PROBE_DUMP"
+exit 1
+"""
+
+#: A stand-in ``git`` that exits at once while a descendant keeps its stdout and stderr open.
+_HOLDING_GIT = """#!/bin/sh
+/usr/bin/sleep 60 &
+exit 1
+"""
+
+
+def _fake_bin(harness: Harness, name: str, script: str) -> Path:
+    directory = harness.root / name
+    directory.mkdir(exist_ok=True)
+    git = directory / "git"
+    git.write_text(script, encoding="utf-8")
+    git.chmod(0o755)
+    return directory
+
+
+def _interpreter_coerces_c_locale(executable: str) -> bool:
+    """Whether ``executable`` is a Python that adds ``LC_CTYPE`` under the C locale (PEP 538)."""
+    try:
+        completed = subprocess.run(
+            [executable, "-c", "import os; print(os.environ.get('LC_CTYPE', ''))"],
+            env={"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "LANG": "C"},
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=TIMEOUT_SECONDS,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return completed.returncode == 0 and completed.stdout.strip() != ""
+
+
+def _child_processes(harness: Harness, report: Report) -> None:
+    """What each edition hands to a process it starts is the same: environment, descriptors, signals.
+
+    The Python interpreter changes its own process before any herdr-run code runs: PEP 538 adds
+    ``LC_CTYPE=C.UTF-8`` to the environment under the C locale, a closed descriptor reopened by
+    ``os.open`` is close-on-exec, ``subprocess`` closes every inherited descriptor above 2, and
+    SIGINT has a handler. The native runtime does none of that. Both editions now hand a child the
+    caller's environment unchanged, ``/dev/null`` for a closed standard descriptor, no inherited
+    descriptor above 2, SIGINT as the caller left it, and SIGPIPE and SIGXFSZ at their defaults.
+    """
+
+    probe = _fake_bin(harness, "probe-bin", _PROBE_GIT)
+    path = f"{probe}{os.pathsep}{os.environ.get('PATH', '/usr/bin:/bin')}"
+    config = {".herdr-run.yaml": "allow: [git]\nspool_dir: .spool\n"}
+    for label, environment, mode in (
+        ("plain", {}, "capture"),
+        ("c-locale", {"LC_ALL": None, "LANG": "C", "LC_CTYPE": None}, "capture"),
+        ("posix-locale", {"LC_ALL": None, "LANG": None, "LC_CTYPE": "POSIX"}, "capture"),
+        ("latin-1-locale", {"LC_ALL": "en_US", "LANG": "en_US"}, "capture"),
+        ("non-utf8-value", {"HERDR_RUN_TEST_BYTES": "caf\udce9"}, "capture"),
+        ("inherited-descriptors", {}, "inherited-descriptors"),
+        ("sigint-ignored", {}, "sigint-ignored"),
+    ):
+        case = harness.case(f"child-{label}", config)
+        python, rust = harness.invoke(
+            case,
+            ("--agent", "a", "run", "--dry-run", "git status"),
+            extra_env={**environment, "PATH": path, "HERDR_PROBE_DUMP": "<ROOT>/probe.txt"},
+            mode=mode,
+        )
+        report.exact(f"child/{label}", python, rust, expected_rc=0)
+        python_probe = _read_normalized(case.python_root / "probe.txt", case.python_root)
+        rust_probe = _read_normalized(case.rust_root / "probe.txt", case.rust_root)
+        report.exact(f"child/{label}/handed-over", python_probe, rust_probe, expected_rc=0)
+        report.require(
+            f"child/{label}/probe-ran",
+            python_probe.stdout.startswith("argv: [-C]"),
+            f"the stand-in git never ran: {_describe(python_probe)}",
+        )
+        if label == "c-locale":
+            report.require(
+                "child/c-locale/no-coerced-lc-ctype",
+                "\nLC_CTYPE=" not in python_probe.stdout,
+                f"PEP 538's LC_CTYPE reached a child: {python_probe.stdout!r}",
+            )
+            if not _interpreter_coerces_c_locale(harness.python_command[0]):
+                report.notes.append(
+                    "child/c-locale: this Python interpreter does not coerce the C locale "
+                    "(PEP 538), so the case cannot observe a coerced LC_CTYPE here; a stock "
+                    "CPython does, and the unit tests simulate it"
+                )
+        if label == "inherited-descriptors":
+            report.require(
+                "child/inherited-descriptors/shape",
+                "fd 0 -> /dev/null\n" in python_probe.stdout
+                and "fd 7 ->" not in python_probe.stdout,
+                f"a child must find /dev/null at 0 and nothing at 7: {python_probe.stdout!r}",
+            )
+        if label == "sigint-ignored":
+            mask = re.search(r"SigIgn:\s*([0-9a-f]+)", python_probe.stdout)
+            report.require(
+                "child/sigint-ignored/still-ignored",
+                mask is not None and int(mask.group(1), 16) & (1 << (signal.SIGINT - 1)) != 0,
+                f"a SIGINT the caller ignored must stay ignored: {python_probe.stdout!r}",
+            )
+
+
+def _held_pipe(harness: Harness, report: Report) -> None:
+    """A child that exits while a descendant holds its output is bounded like one still running.
+
+    herdr-run gives ``git check-ignore`` ten seconds. Both editions must stop waiting then, kill the
+    process group, and carry on without the answer -- not wait the descendant's full minute.
+    """
+
+    holding = _fake_bin(harness, "holding-bin", _HOLDING_GIT)
+    path = f"{holding}{os.pathsep}{os.environ.get('PATH', '/usr/bin:/bin')}"
+    case = harness.case("held-pipe", {".herdr-run.yaml": "allow: [git]\n"})
+    started = time.monotonic()
+    python, rust = harness.invoke(
+        case,
+        ("--agent", "a", "run", "--dry-run", "git status"),
+        extra_env={"PATH": path},
+    )
+    elapsed = time.monotonic() - started
+    report.exact("held-pipe/bounded", python, rust, expected_rc=0)
+    report.require(
+        "held-pipe/within-the-bound",
+        elapsed < 2 * TIMEOUT_SECONDS,
+        f"waiting on a held pipe took {elapsed:.1f}s for the two editions together",
+    )
+
+
+def _signals_and_limits(harness: Harness, report: Report) -> None:
+    """An ignored SIGINT stays ignored, and a file-size limit is an error, not a kill."""
+
+    case = harness.case("signals")
+    python, rust = harness.invoke(case, ("userguide",), mode="sigint-ignored-while-writing")
+    report.exact("signals/sigint-ignored-while-writing", python, rust, expected_rc=0)
+    python, rust = harness.invoke(case, ("userguide",), mode="file-size-limit")
+    report.exact("signals/file-size-limit", python, rust, expected_rc=1)
+    report.require(
+        "signals/file-size-limit-is-reported",
+        python.stderr == "herdr-run: cannot write stdout: File too large (os error 27)\n",
+        f"a write past RLIMIT_FSIZE must fail with EFBIG, reported: {_describe(python)}",
+    )
+
+
+#: A directory name holding an escape sequence, a bidirectional override, and a no-break space.
+_UNSAFE_NAME = "a\x1b[31mb\u202ec\u00a0d"
+
+
+def _unsafe_paths(harness: Harness, report: Report) -> None:
+    """A path or a name that holds a terminal control or an invisible character is shown quoted.
+
+    Covers the status lines, the configuration messages that start with the file's path, the path
+    ``init`` reports, and the project path in the un-ignored spool warning.
+    """
+
+    git = shutil.which("git")
+
+    def setup(root: Path) -> None:
+        good = root / _UNSAFE_NAME
+        good.mkdir()
+        (good / ".herdr-run.yaml").write_text(
+            f"workspace: {_REAP_WORKSPACE}\nallow: [git]\n", encoding="utf-8"
+        )
+        broken = root / (_UNSAFE_NAME + "-broken")
+        broken.mkdir()
+        (broken / ".herdr-run.yaml").write_text("allow: [\n", encoding="utf-8")
+        invalid = root / (_UNSAFE_NAME + "-invalid")
+        invalid.mkdir()
+        (invalid / ".herdr-run.yaml").write_text("allow: []\n", encoding="utf-8")
+        (root / (_UNSAFE_NAME + "-init")).mkdir()
+        if git is not None:
+            subprocess.run(
+                [git, "init", "-q", str(good)],
+                check=True,
+                capture_output=True,
+                env={**os.environ, "HOME": str(root / ".home"), "GIT_CONFIG_NOSYSTEM": "1"},
+            )
+
+    case = harness.case("unsafe-paths", setup=setup)
+    for label, cwd, args, allowed in (
+        ("status", _UNSAFE_NAME, ("--agent", "a", "status"), frozenset({0})),
+        ("broken-yaml", _UNSAFE_NAME + "-broken", ("check", "git status"), frozenset({78})),
+        ("invalid-config", _UNSAFE_NAME + "-invalid", ("check", "git status"), frozenset({78})),
+        ("missing-explicit", ".", ("--config", _UNSAFE_NAME + "/no.yaml", "config"), frozenset({78})),
+        ("init", _UNSAFE_NAME + "-init", ("init",), frozenset({0})),
+        ("init-again", _UNSAFE_NAME + "-init", ("init",), frozenset({78})),
+        ("spool-warning", _UNSAFE_NAME, ("--agent", "a", "run", "--dry-run", "git status"), frozenset({0})),
+    ):
+        python, rust = harness.invoke(
+            case, args, cwd=cwd, extra_env={"GIT_CONFIG_NOSYSTEM": "1"}
+        )
+        report.same(f"unsafe-paths/{label}", python, rust, allowed=allowed)
+        shown = python.stdout + python.stderr
+        report.require(
+            f"unsafe-paths/{label}/nothing-raw",
+            "\x1b" not in shown and "\u202e" not in shown and "\u00a0" not in shown,
+            f"a control or invisible character reached the terminal raw: {_describe(python)}",
         )
 
 
@@ -2225,6 +2655,10 @@ def build_report(
         _documentation(harness, report)
         _reap(harness, report)
         _deleted_cwd(harness, report)
+        _child_processes(harness, report)
+        _held_pipe(harness, report)
+        _signals_and_limits(harness, report)
+        _unsafe_paths(harness, report)
         if launchers:
             _launchers(harness, report)
     report.notes.append(
@@ -2241,6 +2675,17 @@ def build_report(
     )
     report.notes.append(
         "NUL cannot be represented in a POSIX argv entry; all other terminal-control classes are covered"
+    )
+    report.notes.append(
+        "the editions are invoked directly (the Python package under the real interpreter, the "
+        "Rust binary); common/bin/herdr-run is a smoke test with its own lines stripped, and its "
+        "launcher behaviour (deleted working directory, HOME, locale warnings) is listed in "
+        "cross/README.md rather than compared"
+    )
+    report.notes.append(
+        "a multibyte locale that is not UTF-8 (ja_JP.eucJP) is not installed on every host, so the "
+        "Python edition's restart from /proc/self/cmdline is compared under ISO-8859-1 here and "
+        "pinned by unit tests for the multibyte case"
     )
     return report
 

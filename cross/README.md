@@ -40,8 +40,35 @@ When `--tool` is omitted, the harness checks `dagrun`.
 | `cpuset-alloc` | CLI surface, version, durable-ledger status and reclaim JSON, malformed and boundary arguments, reservation behavior, mutation self-test verdicts, and hard-pin fail-closed behavior. |
 | `tick-hub` | Strict JSON/YAML config loading, canonical emission, cadence state, reminder gates, freshness output, flush transitions, CLI failures, numeric boundaries, malformed documents, and randomized tick configurations. |
 | `pr-landing-planner` | Fixture collection, graphs, clusters, status and plan output in every format, exact-head/base validation, approval and gate safety decisions, ordering/conflict groups, malformed evidence, numeric boundaries, and randomized PR graphs. |
-| `herdr-run` | Output bytes (decoded losslessly, so a byte that is not UTF-8 is still compared) for every help screen, `--version`, `quickstart`, `userguide`, and the `--dump-surface` JSON, which must also equal the promised subcommand and option surface; the YAML-subset configuration loader with every configuration message, including each document in the shared YAML corpus; discovery and explicit paths; allow/deny policy, inert rendering, and refusal quoting; the `--timeout`/`--wait-ready` grammar; agent inference; bytes that are not UTF-8 in argv, the environment, and directory names; five locales; closed, full, and broken stdout and SIGINT mid-write; OS error text; dry runs, audit JSONL, spool modes, and the un-ignored spool warning; `net-doctor` refusals; `reap` over planted and malformed records; a deleted working directory; and both engines through `common/bin/herdr-run`. Live Herdr protocol, readiness, session-cache, and run-record behaviour is pinned by the golden corpora in `rs/herdr-run/testdata/`, which both editions' unit tests load, because production deliberately ignores caller-controlled executable paths. |
+| `herdr-run` | Both editions invoked directly: the Python package under the real interpreter and the Rust binary. Output bytes (decoded losslessly, so a byte that is not UTF-8 is still compared) for every help screen, `--version`, `quickstart`, `userguide`, and the `--dump-surface` JSON, which must also equal the promised subcommand and option surface; the YAML-subset configuration loader with every configuration message, including each document in the shared YAML corpus, raw YAML 1.1 line breaks, and names holding invisible characters; discovery and explicit paths; allow/deny policy, inert rendering, and refusal quoting, including `~` expanded from a hostile `HOME` before the policy judges it; the `--timeout`/`--wait-ready` grammar; agent inference with Unicode white space; bytes that are not UTF-8 in argv, the environment, and directory names; six locales; closed, full, and broken stdout, SIGINT mid-write (default and ignored), and a file-size limit; OS error text; dry runs, audit JSONL, spool modes, and the un-ignored spool warning; paths and names holding terminal controls or invisible characters, which must never reach the terminal raw; what each edition hands a process it starts (environment, descriptors, and signal dispositions, recorded by a stand-in `git`), and a started process whose descendant holds its output past the bound; `net-doctor` refusals; `reap` over planted, malformed, too-deep, and too-large records, and run directories ordered by raw bytes; and a deleted working directory. Live Herdr protocol, readiness, session-cache, run-record, admission, and text-rule behaviour is pinned by the golden corpora in `rs/herdr-run/testdata/`, which both editions' unit tests load, because production deliberately ignores caller-controlled executable paths. `common/bin/herdr-run` is a smoke test only; see "herdr-run and its launcher" below. |
 | `herdr-agent` | CLI bootstrap, installed guide, exact pane and stable-session targeting, identity assertions, status/read behavior, literal multiline submission, native readiness transitions, durable FIFO state, pending versus possibly-submitted outcomes, malformed-head quarantine, and fail-closed target contradictions. Each package talks through its production client to an isolated executable Herdr protocol fixture. |
+
+### herdr-run and its launcher
+
+The herdr-run differential compares the two TOOLS, so it starts each edition
+itself rather than through `common/bin/herdr-run`. That launcher is shared by
+every tool here, and some of its behaviour is launcher behaviour, not tool
+behaviour. The smoke test strips the launcher's own `[herdr-run] ...` lines and
+then requires identical tool output; these launcher-level differences are left
+in place and are not herdr-run divergences:
+
+- Each engine announces itself on stderr, and the Rust path also reports its
+  Cargo cache verdict (`rust cache=verified ...`), or Cargo's own output when it
+  rebuilds.
+- Under a working directory that has been deleted, the Rust launcher fails in
+  its own `cd` back to the caller's directory before the tool starts; the Python
+  path starts the tool, which reports the missing directory itself.
+- The Rust launcher needs `HOME` (or `CARGO_HOME` and `RUSTUP_HOME`) to find the
+  toolchain; the Python path does not.
+- Under a locale the C library cannot load, bash in the launcher prints its own
+  `setlocale` warning before either engine runs.
+- The Python path runs `$CI_HUB_PYTHON`, else the first `python3` on `PATH`,
+  which may be a wrapper rather than the interpreter. A wrapper that cannot pass
+  on an argument that is not valid UTF-8 fails before herdr-run starts, where the
+  tool itself would refuse the argument with exit status 2.
+- Each engine starts behind a different number of shells, so bash's own
+  warnings (about a deleted working directory, for example) can appear a
+  different number of times.
 
 Machine-oriented output is compared byte for byte where it is specified as
 canonical. YAML emitters and other intentionally idiomatic text are parsed or
