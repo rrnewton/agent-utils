@@ -131,6 +131,7 @@ def test_an_option_at_the_wrong_level_is_refused_and_says_which_level_it_belongs
         ["--config", "x.yaml", "init"],
         ["--config=x.yaml", "init"],
         ["--config", "x.yaml", "init", "--force"],
+        ["--config", "x.yaml", "init", "--upgrade"],
         ["--config", "x.yaml", "quickstart"],
         ["--config", "x.yaml", "userguide"],
     ],
@@ -154,7 +155,7 @@ def test_config_is_refused_by_the_subcommands_that_read_no_configuration(
     assert main(argv) == 2
     captured = capsys.readouterr()
     assert "argument --config:" in captured.err, captured.err
-    assert "reads no configuration file" in captured.err, captured.err
+    assert "takes no configuration file" in captured.err, captured.err
     assert captured.out == ""
 
 
@@ -1369,3 +1370,33 @@ def test_the_entry_point_resets_sigint_before_importing_the_package() -> None:
         timeout=60,
     )
     assert completed.stdout == b"True\n", completed.stderr
+
+
+def test_every_subcommand_that_reads_the_configuration_warns_about_left_out_entries(
+    tmp_path: object,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A deny list written before a built-in entry existed must not lose that entry silently."""
+    root = str(tmp_path)
+    with open(os.path.join(root, ".herdr-run.yaml"), "w", encoding="utf-8") as handle:
+        handle.write('deny_anywhere: ["--upload-pack", "--receive-pack"]\n')
+    monkeypatch.chdir(root)
+    warning = (
+        f"herdr-run: WARNING: {os.path.join(root, '.herdr-run.yaml')} leaves out built-in deny "
+        'entries, so they are not enforced: deny_anywhere "--exec". To adopt them, run '
+        f"'herdr-run init --upgrade' in {root} or add them by hand.\n"
+    )
+    for argv, code in (
+        (["check", "git push --exec=/tmp/evil origin"], 0),
+        (["--agent", "a", "config"], 0),
+        (["--agent", "a", "run", "--dry-run", "git status"], 0),
+    ):
+        assert main(argv) == code, argv
+        captured = capsys.readouterr()
+        assert captured.err.startswith(warning), (argv, captured.err)
+        assert captured.err.count("WARNING: ") == 1 + captured.err.count("NOT git-ignored")
+
+    # Documentation and init read no configuration, so they say nothing about it.
+    assert main(["init", "--help"]) == 0
+    assert capsys.readouterr().err == ""

@@ -9,7 +9,7 @@
 use serde_json::{json, Value};
 
 use crate::client::HerdrApi;
-use crate::config::{Config, ALLOW_ANY_PROGRAM};
+use crate::config::{describe_missing, missing_defaults, Config, ALLOW_ANY_PROGRAM};
 use crate::textfmt::{display, quote};
 
 /// What could be learned about this project's live Herdr session.
@@ -103,6 +103,15 @@ fn allow_detail(config: &Config) -> String {
     display_join(&config.allow)
 }
 
+/// Whether every built-in deny entry is in force, or which ones the file leaves out.
+fn deny_detail(config: &Config) -> String {
+    let missing = missing_defaults(config);
+    if missing.is_empty() {
+        return "every built-in entry is in force".to_owned();
+    }
+    format!("leaves out built-in {}", describe_missing(&missing))
+}
+
 fn list_or_none(values: &[String]) -> String {
     if values.is_empty() {
         "(none)".to_owned()
@@ -140,6 +149,7 @@ pub fn status_text(config: &Config, agent: &str, tab_label: &str, session: &Sess
         "    prefixes      {}\n",
         list_or_none(&config.prefixes)
     ));
+    text.push_str(&format!("    deny lists    {}\n", deny_detail(config)));
     text.push_str("\n  session\n");
     text.push_str(&format!("    agent         {}\n", display(agent)));
     text.push_str(&format!(
@@ -175,6 +185,10 @@ pub fn status_document(config: &Config, agent: &str, tab_label: &str, session: &
         "allow": config.allow,
         "allow_any_program": config.allows_any_program(),
         "config_file": config.source_path,
+        "missing_defaults": missing_defaults(config)
+            .iter()
+            .map(|item| json!({"entries": item.entries, "setting": item.setting}))
+            .collect::<Vec<_>>(),
         "herdr": {
             "detail": herdr_detail(session),
             "reachable": !matches!(session, Session::Unreachable(_)),
@@ -385,6 +399,7 @@ mod tests {
             "    spool dir     .herdr-run\n",
             "    allow         git, gh\n",
             "    prefixes      with-proxy\n",
+            "    deny lists    every built-in entry is in force\n",
             "    agent         kvm\n",
             "    workspace     agent-cmds\n",
             "    tab label     kvm (not created yet)\n",
@@ -402,6 +417,35 @@ mod tests {
         assert_eq!(document["herdr"]["reachable"], json!(true));
         assert_eq!(document["herdr"]["server_running"], json!(true));
         assert_eq!(document["allow_any_program"], json!(false));
+        assert_eq!(document["missing_defaults"], json!([]));
+    }
+
+    /// A file written before an entry joined the built-in defaults does not enforce it; say so.
+    #[test]
+    fn a_deny_list_that_leaves_out_built_in_entries_is_reported() {
+        let mut config = Config {
+            source_path: Some("/project/.herdr-run.yaml".to_owned()),
+            project_root: "/project".to_owned(),
+            deny_anywhere: vec!["--upload-pack".to_owned(), "--receive-pack".to_owned()],
+            ..Config::default()
+        };
+        config
+            .deny_global
+            .insert("git".to_owned(), vec!["-c".to_owned()]);
+        let text = status_text(&config, "kvm", "kvm", &Session::NotRunning);
+        assert!(
+            text.contains(
+                "    deny lists    leaves out built-in deny_global.git \"--config-env\", \"--exec-path\", \"--namespace\"; deny_anywhere \"--exec\"\n"
+            ),
+            "{text}"
+        );
+        assert_eq!(
+            status_document(&config, "kvm", "kvm", &Session::NotRunning)["missing_defaults"],
+            json!([
+                {"entries": ["--config-env", "--exec-path", "--namespace"], "setting": "deny_global.git"},
+                {"entries": ["--exec"], "setting": "deny_anywhere"},
+            ])
+        );
     }
 
     #[test]

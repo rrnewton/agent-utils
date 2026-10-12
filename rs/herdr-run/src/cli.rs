@@ -18,7 +18,7 @@ use serde_json::{json, Map, Value};
 use crate::allowlist::{admit, quote_word, Admission};
 use crate::audit;
 use crate::client::{bounded_output, exit_status_code, HerdrClient};
-use crate::config::{load_config, Config, MAX_TIMEOUT_SECONDS};
+use crate::config::{load_config, missing_defaults_warning, Config, MAX_TIMEOUT_SECONDS};
 use crate::error::{ErrorKind, HerdrRunError, Result, EXIT_BUSY};
 use crate::evict;
 use crate::output;
@@ -109,7 +109,7 @@ enum Selected {
     Run(RunOptions),
     Check(String),
     Status,
-    Init { force: bool },
+    Init { force: bool, upgrade: bool },
     Config,
     Target { no_cache: bool },
     Reap,
@@ -308,7 +308,15 @@ type OptionTable = &'static [(&'static str, Option<&'static str>)];
 const SUBCOMMAND_OPTIONS: &[(&str, OptionTable)] = &[
     ("check", &[("--help", None), ("-h", None)]),
     ("config", &[("--help", None), ("-h", None)]),
-    ("init", &[("--force", None), ("--help", None), ("-h", None)]),
+    (
+        "init",
+        &[
+            ("--force", None),
+            ("--help", None),
+            ("--upgrade", None),
+            ("-h", None),
+        ],
+    ),
     ("net-doctor", &[("--help", None), ("-h", None)]),
     ("quickstart", &[("--help", None), ("-h", None)]),
     ("reap", &[("--help", None), ("-h", None)]),
@@ -574,29 +582,38 @@ fn parse_subcommand(name: &str, rest: &[String]) -> Parsed<Option<Selected>> {
                 _ => Selected::Userguide,
             }))
         }
-        "init" | "target" => {
-            let flag = if name == "init" {
-                "--force"
-            } else {
-                "--no-cache"
-            };
+        "init" => {
+            let (mut force, mut upgrade) = (false, false);
+            for token in rest {
+                if token == "--help" || token == "-h" {
+                    print_subcommand_help(name)?;
+                    return Ok(None);
+                }
+                match token.as_str() {
+                    "--force" => force = true,
+                    "--upgrade" => upgrade = true,
+                    _ => return Err(local_argument_error(name, token).into()),
+                }
+            }
+            if force && upgrade {
+                return Err("init: --force and --upgrade cannot be combined: --force writes a fresh file over the existing one, and --upgrade edits the existing one in place".to_owned().into());
+            }
+            Ok(Some(Selected::Init { force, upgrade }))
+        }
+        "target" => {
             let mut present = false;
             for token in rest {
                 if token == "--help" || token == "-h" {
                     print_subcommand_help(name)?;
                     return Ok(None);
                 }
-                if token == flag {
+                if token == "--no-cache" {
                     present = true;
                     continue;
                 }
                 return Err(local_argument_error(name, token).into());
             }
-            Ok(Some(if name == "init" {
-                Selected::Init { force: present }
-            } else {
-                Selected::Target { no_cache: present }
-            }))
+            Ok(Some(Selected::Target { no_cache: present }))
         }
         _ => Err(format!("unknown subcommand '{name}'").into()),
     }
@@ -702,7 +719,7 @@ fn local_argument_error(subcommand: &str, token: &str) -> String {
     format!("{subcommand}: unrecognized arguments: {token}")
 }
 
-/// Why a subcommand loads no configuration file, or `None` when it does load one.
+/// Why a subcommand takes no configuration file, or `None` when it takes one.
 ///
 /// `--config` is refused for these rather than accepted and ignored. It is not an inert flag: it
 /// reads as an instruction about which configuration file to use, and `herdr-run --config P init`
@@ -710,16 +727,18 @@ fn local_argument_error(subcommand: &str, token: &str) -> String {
 /// defect this surface exists to remove, so the answer is a refusal that says why.
 fn config_blind_reason(subcommand: &str) -> Option<&'static str> {
     match subcommand {
-        "init" => Some("it WRITES one, into the current directory"),
+        "init" => {
+            Some("it WRITES one into the current directory, or with --upgrade edits the one there")
+        }
         "quickstart" | "userguide" => Some("it prints a packaged document"),
         _ => None,
     }
 }
 
-/// Describe `--config` offered to a subcommand that reads no configuration file.
+/// Describe `--config` offered to a subcommand that takes no configuration file.
 fn config_blind_error(subcommand: &str, reason: &str) -> String {
     let message =
-        format!("argument --config: '{subcommand}' reads no configuration file; {reason}.");
+        format!("argument --config: '{subcommand}' takes no configuration file; {reason}.");
     if subcommand == "init" {
         return format!(
             "{message}\nRun it from the directory you want the file in:\n  cd DIRECTORY && herdr-run {subcommand}"
@@ -820,13 +839,22 @@ fn dispatch(invocation: Invocation) -> Result<i32> {
             os_error_text(&error)
         ))
     })?;
-    if let Selected::Init { force } = invocation.selected {
+    if let Selected::Init { force, upgrade } = invocation.selected {
         // Deliberately before load_config: the reason to reach for `init` is often that discovery
         // found nothing, or found something broken, and refusing to write a fresh template because
         // the old one will not parse would be exactly the wrong moment to be strict.
+        if upgrade {
+            return command_init_upgrade(&start, invocation.globals.json);
+        }
         return command_init(&start, force, invocation.globals.json);
     }
     let config = load_config(invocation.globals.config.as_deref(), &start)?;
+    // Every subcommand that reads the configuration says so when a deny list in it leaves out a
+    // built-in entry: the list replaces the built-in one, so the entry is not enforced, and a file
+    // written by an older release would otherwise lose each new entry without a word.
+    if let Some(warning) = missing_defaults_warning(&config) {
+        output::diagnostic(&warning);
+    }
     let json = invocation.globals.json;
     // The agent is resolved only by the subcommands that name a tab with it, so a malformed agent
     // variable cannot fail a `check` or a `reap` that never asks who is speaking.
@@ -917,6 +945,65 @@ fn command_init(directory: &Path, force: bool, json_output: bool) -> Result<i32>
             display(&path.to_string_lossy())
         ))?;
     }
+    Ok(0)
+}
+
+/// Upgrade the configuration file in `directory` and say what changed and what did not.
+fn command_init_upgrade(directory: &Path, json_output: bool) -> Result<i32> {
+    let result = crate::init::upgrade_config_file(directory)?;
+    let quoted = |entries: &[&str]| {
+        entries
+            .iter()
+            .map(|entry| quote(entry))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    if json_output {
+        print_json(&json!({
+            "missing": result.missing.iter().map(|item| json!({
+                "entries": item.entries,
+                "setting": item.setting,
+            })).collect::<Vec<_>>(),
+            "path": result.path.display().to_string(),
+            "upgraded": result.upgraded.iter().map(|upgrade| json!({
+                "added": upgrade.added,
+                "setting": upgrade.setting,
+            })).collect::<Vec<_>>(),
+        }))?;
+        return Ok(0);
+    }
+    let shown = display(&result.path.to_string_lossy());
+    let mut lines = Vec::new();
+    if result.upgraded.is_empty() {
+        lines.push(format!("nothing to rewrite in {shown}"));
+    } else {
+        lines.push(format!("upgraded {shown}"));
+        for upgrade in &result.upgraded {
+            lines.push(format!(
+                "  {}: added {}",
+                upgrade.setting,
+                quoted(upgrade.added)
+            ));
+        }
+    }
+    if result.missing.is_empty() {
+        lines.push("Every built-in deny entry is in force.".to_owned());
+    } else {
+        lines.push(
+            "Still left out, from lists that are not as an earlier herdr-run wrote them; add them by hand to adopt them:"
+                .to_owned(),
+        );
+        for item in &result.missing {
+            let entries: Vec<&str> = item.entries.iter().map(String::as_str).collect();
+            lines.push(format!("  {}: {}", item.setting, quoted(&entries)));
+        }
+    }
+    output::stdout(
+        &lines
+            .iter()
+            .map(|line| format!("{line}\n"))
+            .collect::<String>(),
+    )?;
     Ok(0)
 }
 
@@ -1606,7 +1693,7 @@ fn print_help() -> Result<()> {
 }
 
 /// Said by every subcommand that `config_blind_reason` names, so the refusal is never a surprise.
-const CONFIG_BLIND_NOTE: &str = "\nThis command reads no configuration file, so the global --config option is\nrefused here rather than accepted and ignored.\n";
+const CONFIG_BLIND_NOTE: &str = "\nThis command takes no configuration file, so the global --config option is\nrefused here rather than accepted and ignored.\n";
 
 /// Said by every subcommand that `agent_blind_reason` names.
 const AGENT_BLIND_NOTE: &str = "\nThis command names no tab, so the global --agent option is refused here rather\nthan accepted and ignored.\n";
@@ -1636,7 +1723,8 @@ fn subcommand_help_text(name: &str) -> String {
         "init" => {
             text.push_str("usage: herdr-run [GLOBAL OPTIONS] init [OPTIONS]\n");
             text.push_str("\nWrite an annotated .herdr-run.yaml into the current directory, the way 'git init'\nwrites into the current directory. Every knob is present and set to the value in\nforce today, so adopting the file changes nothing until you edit it. Refuses to\noverwrite an existing configuration.\n");
-            text.push_str("\noptions:\n  -h, --help            show this help message and exit\n  --force               overwrite an existing configuration file\n");
+            text.push_str("\nWith --upgrade, edit the .herdr-run.yaml (or .herdr-run.yml) already in the current\ndirectory instead. Each setting it still holds exactly as an earlier herdr-run wrote\nit is rewritten as this one writes it, which adopts the built-in deny entries added\nsince; nothing else in the file changes. Built-in deny entries it still leaves out,\nin lists somebody edited, are listed to be added by hand.\n");
+            text.push_str("\noptions:\n  -h, --help            show this help message and exit\n  --force               overwrite an existing configuration file\n  --upgrade             bring the settings an earlier herdr-run wrote up to date\n");
         }
         "status" => {
             text.push_str("usage: herdr-run [GLOBAL OPTIONS] status\n");
@@ -1818,13 +1906,14 @@ mod tests {
             vec!["--config", "x.yaml", "init"],
             vec!["--config=x.yaml", "init"],
             vec!["--config", "x.yaml", "init", "--force"],
+            vec!["--config", "x.yaml", "init", "--upgrade"],
             vec!["--config", "x.yaml", "quickstart"],
             vec!["--config", "x.yaml", "userguide"],
         ] {
             let error = parse_args(&arguments).expect_err(&arguments.join(" "));
             assert!(
                 error.contains("argument --config:")
-                    && error.contains("reads no configuration file"),
+                    && error.contains("takes no configuration file"),
                 "{arguments:?}: {error}"
             );
         }
@@ -2099,7 +2188,11 @@ mod tests {
                 "'run --help' documents the global option {global}"
             );
         }
-        assert!(option_block(&subcommand_help_text("init"), "options:").contains("--force"));
+        let init = option_block(&subcommand_help_text("init"), "options:");
+        assert!(
+            init.contains("--force") && init.contains("--upgrade"),
+            "{init}"
+        );
         assert!(option_block(&subcommand_help_text("target"), "options:").contains("--no-cache"));
         for bare in [
             "check",
@@ -2119,6 +2212,34 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn init_takes_force_or_upgrade_but_not_both() {
+        for (arguments, force, upgrade) in [
+            (vec!["init"], false, false),
+            (vec!["init", "--force"], true, false),
+            (vec!["init", "--upgrade"], false, true),
+            (vec!["--json", "init", "--upgrade"], false, true),
+        ] {
+            let invocation = parse_args(&arguments).expect("accepted");
+            assert_eq!(
+                invocation.selected,
+                Selected::Init { force, upgrade },
+                "{arguments:?}"
+            );
+        }
+        for arguments in [
+            vec!["init", "--force", "--upgrade"],
+            vec!["init", "--upgrade", "--force"],
+        ] {
+            assert_eq!(
+                parse_args(&arguments).expect_err("both"),
+                "init: --force and --upgrade cannot be combined: --force writes a fresh file over the existing one, and --upgrade edits the existing one in place"
+            );
+        }
+        let error = parse_args(&["--upgrade", "init"]).expect_err("before the subcommand");
+        assert!(error.contains("put it AFTER the subcommand"), "{error}");
     }
 
     /// The top-level help must say what each of the two documentation commands is FOR.

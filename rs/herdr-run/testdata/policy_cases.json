@@ -1,5 +1,5 @@
 {
-  "_about": "Golden cases for configuration loading and command admission (config/allowlist in both editions). Each case is a configuration document (null for the built-in defaults), the value of HOME (null when the command does not use ~), and a command; the expectation is the admission, the refusal, or the configuration error. Configuration errors name the file <config>; YAML errors are prefixed 'invalid YAML: '. Both unit-test suites load this file.",
+  "_about": "Golden cases for configuration loading and command admission (config/allowlist/init in both editions). Each case is a configuration document (null for the built-in defaults), the value of HOME (null when the command does not use ~), and a command; the expectation is the admission, the refusal, or the configuration error, plus the warning line the configuration draws when one of its deny lists leaves out a built-in entry (absent when it draws none). Configuration errors name the file <config>; YAML errors are prefixed 'invalid YAML: '. earlier_configs are the configurations earlier releases wrote -- the files under earlier_configs/, kept byte for byte as each release's init wrote them or its user guide printed them, and (file null) the template this release writes -- loaded as earlier_location names them: the warning each draws, the value_options in force, what each admits, which upgrades (from upgrades, the table both editions' init --upgrade apply) rewrite it, and the same after the upgrade. Both unit-test suites load this file.",
   "cases": [
     {
       "name": "home names a denied global option",
@@ -749,7 +749,8 @@
       "home": null,
       "command": "git --names=x status",
       "expect": {
-        "refused": "global option \"--namespace\" is denied for git: it can make git execute arbitrary code"
+        "refused": "global option \"--namespace\" is denied for git: it can make git execute arbitrary code",
+        "warning": "herdr-run: WARNING: <config> leaves out built-in deny entries, so they are not enforced: deny_global.git \"-c\", \"--config-env\", \"--exec-path\". To adopt them, add them to the file by hand."
       }
     },
     {
@@ -758,7 +759,8 @@
       "home": null,
       "command": "git log -nq 3",
       "expect": {
-        "refused": "option \"-nq\" is denied: it names a program for git to execute"
+        "refused": "option \"-nq\" is denied: it names a program for git to execute",
+        "warning": "herdr-run: WARNING: <config> leaves out built-in deny entries, so they are not enforced: deny_anywhere \"--upload-pack\", \"--receive-pack\", \"--exec\". To adopt them, add them to the file by hand."
       }
     },
     {
@@ -793,7 +795,8 @@
           "program": "git",
           "subcommand": "clone",
           "rendered": "git clone -u x repo"
-        }
+        },
+        "warning": "herdr-run: WARNING: <config> leaves out built-in deny entries, so they are not enforced: deny_subcommand_option.git.clone \"-u\"; deny_subcommand_option.git.difftool \"-x\", \"--extcmd\"; deny_subcommand_option.git.rebase \"-x\". To adopt them, add them to the file by hand."
       }
     },
     {
@@ -880,6 +883,910 @@
           "rendered": "git --attr-source HEAD log"
         }
       }
+    },
+    {
+      "name": "value_options adds to git's built-in options",
+      "config": "value_options:\n  git: [-C]\n",
+      "home": null,
+      "command": "git --attr-source HEAD daemon",
+      "expect": {
+        "refused": "subcommand \"git daemon\" is denied: it defines or runs arbitrary code"
+      }
+    },
+    {
+      "name": "an empty value_options keeps the built-in table",
+      "config": "value_options: {}\n",
+      "home": null,
+      "command": "git -C /tmp daemon",
+      "expect": {
+        "refused": "subcommand \"git daemon\" is denied: it defines or runs arbitrary code"
+      }
+    },
+    {
+      "name": "value_options can add an option to git",
+      "config": "value_options:\n  git: [--frobnicate]\n",
+      "home": null,
+      "command": "git --frobnicate daemon log",
+      "expect": {
+        "allowed": {
+          "program": "git",
+          "subcommand": "log",
+          "rendered": "git --frobnicate daemon log"
+        }
+      }
+    },
+    {
+      "name": "value_options can name a program the table does not know",
+      "config": "allow: [tool]\nvalue_options:\n  tool: [-f]\n",
+      "home": null,
+      "command": "tool -f build run",
+      "expect": {
+        "allowed": {
+          "program": "tool",
+          "subcommand": "run",
+          "rendered": "tool -f build run"
+        }
+      }
+    },
+    {
+      "name": "gh keeps its built-in value options",
+      "config": "value_options:\n  gh: []\n",
+      "home": null,
+      "command": "gh -R o/r alias list",
+      "expect": {
+        "refused": "subcommand \"gh alias\" is denied: it defines or runs arbitrary code"
+      }
+    },
+    {
+      "name": "cargo keeps its built-in value options",
+      "config": "allow: [cargo]\nallow_subcommand:\n  cargo: [fetch]\nvalue_options:\n  cargo: []\n",
+      "home": null,
+      "command": "cargo --manifest-path fetch build",
+      "expect": {
+        "refused": "subcommand \"cargo build\" is not allowlisted. Allowed: fetch. cargo compilation-oriented and unknown subcommands are deliberately excluded. Cargo must also be explicitly allowlisted because even dependency commands may execute ambiently configured helpers."
+      }
+    },
+    {
+      "name": "a deny_anywhere written before --exec",
+      "config": "deny_anywhere: [\"--upload-pack\", \"--receive-pack\"]\n",
+      "home": null,
+      "command": "git push --exec=/tmp/evil origin main",
+      "expect": {
+        "allowed": {
+          "program": "git",
+          "subcommand": "push",
+          "rendered": "git push --exec=/tmp/evil origin main"
+        },
+        "warning": "herdr-run: WARNING: <config> leaves out built-in deny entries, so they are not enforced: deny_anywhere \"--exec\". To adopt them, add them to the file by hand."
+      }
+    },
+    {
+      "name": "a narrowed git deny_global draws the warning",
+      "config": "deny_global:\n  git: [-c]\n",
+      "home": null,
+      "command": "git --namespace=x status",
+      "expect": {
+        "allowed": {
+          "program": "git",
+          "subcommand": "status",
+          "rendered": "git --namespace=x status"
+        },
+        "warning": "herdr-run: WARNING: <config> leaves out built-in deny entries, so they are not enforced: deny_global.git \"--config-env\", \"--exec-path\", \"--namespace\". To adopt them, add them to the file by hand."
+      }
+    },
+    {
+      "name": "a narrowed list for a program that cannot run draws no warning",
+      "config": "allow: [git]\ndeny_subcommand:\n  git: [filter-branch, daemon, instaweb]\n",
+      "home": null,
+      "command": "git status",
+      "expect": {
+        "allowed": {
+          "program": "git",
+          "subcommand": "status",
+          "rendered": "git status"
+        }
+      }
+    },
+    {
+      "name": "the allow-everything mode reports every program's entries",
+      "config": "allow: [\"*\"]\ndeny_subcommand: {}\n",
+      "home": null,
+      "command": "git daemon",
+      "expect": {
+        "allowed": {
+          "program": "git",
+          "subcommand": "daemon",
+          "rendered": "git daemon"
+        },
+        "warning": "herdr-run: WARNING: <config> leaves out built-in deny entries, so they are not enforced: deny_subcommand.gh \"alias\", \"extension\", \"ext\", \"codespace\", \"cs\"; deny_subcommand.git \"filter-branch\", \"daemon\", \"instaweb\". To adopt them, add them to the file by hand."
+      }
+    },
+    {
+      "name": "cargo's own guards are never reported as left out",
+      "config": "allow: [cargo]\nallow_subcommand:\n  cargo: [fetch]\ndeny_global: {}\n",
+      "home": null,
+      "command": "cargo fetch",
+      "expect": {
+        "allowed": {
+          "program": "cargo",
+          "subcommand": "fetch",
+          "rendered": "cargo fetch"
+        }
+      }
+    },
+    {
+      "name": "a narrowed deny_subcommand_option names each subcommand",
+      "config": "deny_subcommand_option:\n  git:\n    clone: [-u]\n",
+      "home": null,
+      "command": "git rebase -x make main",
+      "expect": {
+        "allowed": {
+          "program": "git",
+          "subcommand": "rebase",
+          "rendered": "git rebase -x make main"
+        },
+        "warning": "herdr-run: WARNING: <config> leaves out built-in deny entries, so they are not enforced: deny_subcommand_option.git.difftool \"-x\", \"--extcmd\"; deny_subcommand_option.git.rebase \"-x\". To adopt them, add them to the file by hand."
+      }
+    },
+    {
+      "name": "a deny list that only adds to the defaults draws no warning",
+      "config": "deny_anywhere: [--upload-pack, --receive-pack, --exec, --evil]\n",
+      "home": null,
+      "command": "git push --evil x",
+      "expect": {
+        "refused": "option \"--evil\" is denied: it names a program for git to execute"
+      }
+    }
+  ],
+  "upgrades": [
+    {
+      "setting": "deny_anywhere",
+      "earlier": "deny_anywhere: [\"--upload-pack\", \"--receive-pack\"]\n",
+      "current": "deny_anywhere: [\"--upload-pack\", \"--receive-pack\", \"--exec\"]\n",
+      "added": [
+        "--exec"
+      ]
+    },
+    {
+      "setting": "value_options.git",
+      "earlier": "value_options:\n  git: [\"-C\", \"-c\", \"--git-dir\", \"--work-tree\", \"--namespace\", \"--exec-path\", \"--config-env\"]\n",
+      "current": "value_options:\n  git: [\"-C\", \"-c\", \"--git-dir\", \"--work-tree\", \"--namespace\", \"--exec-path\", \"--config-env\",\n        \"--super-prefix\", \"--shallow-file\", \"--attr-source\"]\n",
+      "added": [
+        "--super-prefix",
+        "--shallow-file",
+        "--attr-source"
+      ]
+    }
+  ],
+  "earlier_location": {
+    "source_path": "/project/.herdr-run.yaml",
+    "project_root": "/project"
+  },
+  "earlier_configs": [
+    {
+      "name": "0.1.0 user guide example",
+      "written_by": "the example configuration the first user guide printed (0.1.0, d779d548)",
+      "file": "earlier_configs/0.1.0-user-guide-d779d548.yaml",
+      "warning": "herdr-run: WARNING: /project/.herdr-run.yaml leaves out built-in deny entries, so they are not enforced: deny_anywhere \"--exec\". To adopt them, run 'herdr-run init --upgrade' in /project or add them by hand.",
+      "value_options": {
+        "git": [
+          "-C",
+          "-c",
+          "--git-dir",
+          "--work-tree",
+          "--namespace",
+          "--exec-path",
+          "--config-env",
+          "--super-prefix",
+          "--shallow-file",
+          "--attr-source"
+        ],
+        "gh": [
+          "-R",
+          "--repo"
+        ],
+        "cargo": [
+          "--manifest-path",
+          "--config",
+          "-Z",
+          "-p",
+          "--package",
+          "--target-dir"
+        ]
+      },
+      "commands": [
+        {
+          "command": "git --attr-source HEAD daemon",
+          "expect": {
+            "refused": "subcommand \"git daemon\" is denied: it defines or runs arbitrary code"
+          }
+        },
+        {
+          "command": "git --shallow-file x daemon",
+          "expect": {
+            "refused": "subcommand \"git daemon\" is denied: it defines or runs arbitrary code"
+          }
+        },
+        {
+          "command": "git --super-prefix x/ instaweb",
+          "expect": {
+            "refused": "subcommand \"git instaweb\" is denied: it defines or runs arbitrary code"
+          }
+        },
+        {
+          "command": "git push --exec=/tmp/evil origin main",
+          "expect": {
+            "allowed": {
+              "program": "git",
+              "subcommand": "push",
+              "rendered": "git push --exec=/tmp/evil origin main"
+            }
+          }
+        },
+        {
+          "command": "git clone -u /tmp/evil https://example.invalid/r",
+          "expect": {
+            "refused": "option \"-u\" is denied for \"git clone\": it names a program for git to execute"
+          }
+        },
+        {
+          "command": "git fetch --upload-pack=/tmp/evil origin",
+          "expect": {
+            "refused": "option \"--upload-pack=/tmp/evil\" is denied: it names a program for git to execute"
+          }
+        },
+        {
+          "command": "git -c core.pager=evil log",
+          "expect": {
+            "refused": "global option \"-c\" is denied for git: it can make git execute arbitrary code"
+          }
+        },
+        {
+          "command": "cargo fetch --config=build.rustc-wrapper=/tmp/evil",
+          "expect": {
+            "refused": "program \"cargo\" is not allowlisted. Allowed: gh, git"
+          }
+        }
+      ],
+      "upgraded": [
+        "deny_anywhere"
+      ],
+      "warning_after_upgrade": null,
+      "commands_after_upgrade": [
+        {
+          "command": "git push --exec=/tmp/evil origin main",
+          "expect": {
+            "refused": "option \"--exec=/tmp/evil\" is denied: it names a program for git to execute"
+          }
+        },
+        {
+          "command": "git ls-remote --exe=/tmp/evil origin",
+          "expect": {
+            "refused": "option \"--exe=/tmp/evil\" is denied: it names a program for git to execute"
+          }
+        }
+      ]
+    },
+    {
+      "name": "0.1.0 user guide example allowing cargo",
+      "written_by": "the user guide's example once it allowed cargo, before it denied cargo's --config and -Z (0.1.0, 78c79a8b)",
+      "file": "earlier_configs/0.1.0-user-guide-78c79a8b.yaml",
+      "warning": "herdr-run: WARNING: /project/.herdr-run.yaml leaves out built-in deny entries, so they are not enforced: deny_anywhere \"--exec\". To adopt them, run 'herdr-run init --upgrade' in /project or add them by hand.",
+      "value_options": {
+        "git": [
+          "-C",
+          "-c",
+          "--git-dir",
+          "--work-tree",
+          "--namespace",
+          "--exec-path",
+          "--config-env",
+          "--super-prefix",
+          "--shallow-file",
+          "--attr-source"
+        ],
+        "gh": [
+          "-R",
+          "--repo"
+        ],
+        "cargo": [
+          "--manifest-path",
+          "--config",
+          "-Z",
+          "-p",
+          "--package",
+          "--target-dir"
+        ]
+      },
+      "commands": [
+        {
+          "command": "git --attr-source HEAD daemon",
+          "expect": {
+            "refused": "subcommand \"git daemon\" is denied: it defines or runs arbitrary code"
+          }
+        },
+        {
+          "command": "git --shallow-file x daemon",
+          "expect": {
+            "refused": "subcommand \"git daemon\" is denied: it defines or runs arbitrary code"
+          }
+        },
+        {
+          "command": "git --super-prefix x/ instaweb",
+          "expect": {
+            "refused": "subcommand \"git instaweb\" is denied: it defines or runs arbitrary code"
+          }
+        },
+        {
+          "command": "git push --exec=/tmp/evil origin main",
+          "expect": {
+            "allowed": {
+              "program": "git",
+              "subcommand": "push",
+              "rendered": "git push --exec=/tmp/evil origin main"
+            }
+          }
+        },
+        {
+          "command": "git clone -u /tmp/evil https://example.invalid/r",
+          "expect": {
+            "refused": "option \"-u\" is denied for \"git clone\": it names a program for git to execute"
+          }
+        },
+        {
+          "command": "git fetch --upload-pack=/tmp/evil origin",
+          "expect": {
+            "refused": "option \"--upload-pack=/tmp/evil\" is denied: it names a program for git to execute"
+          }
+        },
+        {
+          "command": "git -c core.pager=evil log",
+          "expect": {
+            "refused": "global option \"-c\" is denied for git: it can make git execute arbitrary code"
+          }
+        },
+        {
+          "command": "cargo fetch --config=build.rustc-wrapper=/tmp/evil",
+          "expect": {
+            "refused": "option \"--config\" is denied everywhere for cargo: it can make cargo execute arbitrary code"
+          }
+        }
+      ],
+      "upgraded": [
+        "deny_anywhere"
+      ],
+      "warning_after_upgrade": null,
+      "commands_after_upgrade": [
+        {
+          "command": "git push --exec=/tmp/evil origin main",
+          "expect": {
+            "refused": "option \"--exec=/tmp/evil\" is denied: it names a program for git to execute"
+          }
+        },
+        {
+          "command": "git ls-remote --exe=/tmp/evil origin",
+          "expect": {
+            "refused": "option \"--exe=/tmp/evil\" is denied: it names a program for git to execute"
+          }
+        }
+      ]
+    },
+    {
+      "name": "0.2.0 user guide example",
+      "written_by": "the last example configuration the user guide printed before init existed (0.2.0, 9a46da35)",
+      "file": "earlier_configs/0.2.0-user-guide-9a46da35.yaml",
+      "warning": "herdr-run: WARNING: /project/.herdr-run.yaml leaves out built-in deny entries, so they are not enforced: deny_anywhere \"--exec\". To adopt them, run 'herdr-run init --upgrade' in /project or add them by hand.",
+      "value_options": {
+        "git": [
+          "-C",
+          "-c",
+          "--git-dir",
+          "--work-tree",
+          "--namespace",
+          "--exec-path",
+          "--config-env",
+          "--super-prefix",
+          "--shallow-file",
+          "--attr-source"
+        ],
+        "gh": [
+          "-R",
+          "--repo"
+        ],
+        "cargo": [
+          "--manifest-path",
+          "--config",
+          "-Z",
+          "-p",
+          "--package",
+          "--target-dir"
+        ]
+      },
+      "commands": [
+        {
+          "command": "git --attr-source HEAD daemon",
+          "expect": {
+            "refused": "subcommand \"git daemon\" is denied: it defines or runs arbitrary code"
+          }
+        },
+        {
+          "command": "git --shallow-file x daemon",
+          "expect": {
+            "refused": "subcommand \"git daemon\" is denied: it defines or runs arbitrary code"
+          }
+        },
+        {
+          "command": "git --super-prefix x/ instaweb",
+          "expect": {
+            "refused": "subcommand \"git instaweb\" is denied: it defines or runs arbitrary code"
+          }
+        },
+        {
+          "command": "git push --exec=/tmp/evil origin main",
+          "expect": {
+            "allowed": {
+              "program": "git",
+              "subcommand": "push",
+              "rendered": "git push --exec=/tmp/evil origin main"
+            }
+          }
+        },
+        {
+          "command": "git clone -u /tmp/evil https://example.invalid/r",
+          "expect": {
+            "refused": "option \"-u\" is denied for \"git clone\": it names a program for git to execute"
+          }
+        },
+        {
+          "command": "git fetch --upload-pack=/tmp/evil origin",
+          "expect": {
+            "refused": "option \"--upload-pack=/tmp/evil\" is denied: it names a program for git to execute"
+          }
+        },
+        {
+          "command": "git -c core.pager=evil log",
+          "expect": {
+            "refused": "global option \"-c\" is denied for git: it can make git execute arbitrary code"
+          }
+        },
+        {
+          "command": "cargo fetch --config=build.rustc-wrapper=/tmp/evil",
+          "expect": {
+            "refused": "program \"cargo\" is not allowlisted. Allowed: gh, git"
+          }
+        }
+      ],
+      "upgraded": [
+        "deny_anywhere"
+      ],
+      "warning_after_upgrade": null,
+      "commands_after_upgrade": [
+        {
+          "command": "git push --exec=/tmp/evil origin main",
+          "expect": {
+            "refused": "option \"--exec=/tmp/evil\" is denied: it names a program for git to execute"
+          }
+        },
+        {
+          "command": "git ls-remote --exe=/tmp/evil origin",
+          "expect": {
+            "refused": "option \"--exe=/tmp/evil\" is denied: it names a program for git to execute"
+          }
+        }
+      ]
+    },
+    {
+      "name": "0.2.0 init, first",
+      "written_by": "herdr-run init as first released (0.2.0, acbc7b00)",
+      "file": "earlier_configs/0.2.0-init-acbc7b00.yaml",
+      "warning": "herdr-run: WARNING: /project/.herdr-run.yaml leaves out built-in deny entries, so they are not enforced: deny_anywhere \"--exec\". To adopt them, run 'herdr-run init --upgrade' in /project or add them by hand.",
+      "value_options": {
+        "git": [
+          "-C",
+          "-c",
+          "--git-dir",
+          "--work-tree",
+          "--namespace",
+          "--exec-path",
+          "--config-env",
+          "--super-prefix",
+          "--shallow-file",
+          "--attr-source"
+        ],
+        "gh": [
+          "-R",
+          "--repo"
+        ],
+        "cargo": [
+          "--manifest-path",
+          "--config",
+          "-Z",
+          "-p",
+          "--package",
+          "--target-dir"
+        ]
+      },
+      "commands": [
+        {
+          "command": "git --attr-source HEAD daemon",
+          "expect": {
+            "refused": "subcommand \"git daemon\" is denied: it defines or runs arbitrary code"
+          }
+        },
+        {
+          "command": "git --shallow-file x daemon",
+          "expect": {
+            "refused": "subcommand \"git daemon\" is denied: it defines or runs arbitrary code"
+          }
+        },
+        {
+          "command": "git --super-prefix x/ instaweb",
+          "expect": {
+            "refused": "subcommand \"git instaweb\" is denied: it defines or runs arbitrary code"
+          }
+        },
+        {
+          "command": "git push --exec=/tmp/evil origin main",
+          "expect": {
+            "allowed": {
+              "program": "git",
+              "subcommand": "push",
+              "rendered": "git push --exec=/tmp/evil origin main"
+            }
+          }
+        },
+        {
+          "command": "git clone -u /tmp/evil https://example.invalid/r",
+          "expect": {
+            "refused": "option \"-u\" is denied for \"git clone\": it names a program for git to execute"
+          }
+        },
+        {
+          "command": "git fetch --upload-pack=/tmp/evil origin",
+          "expect": {
+            "refused": "option \"--upload-pack=/tmp/evil\" is denied: it names a program for git to execute"
+          }
+        },
+        {
+          "command": "git -c core.pager=evil log",
+          "expect": {
+            "refused": "global option \"-c\" is denied for git: it can make git execute arbitrary code"
+          }
+        },
+        {
+          "command": "cargo fetch --config=build.rustc-wrapper=/tmp/evil",
+          "expect": {
+            "refused": "program \"cargo\" is not allowlisted. Allowed: gh, git"
+          }
+        }
+      ],
+      "upgraded": [
+        "deny_anywhere",
+        "value_options.git"
+      ],
+      "warning_after_upgrade": null,
+      "commands_after_upgrade": [
+        {
+          "command": "git push --exec=/tmp/evil origin main",
+          "expect": {
+            "refused": "option \"--exec=/tmp/evil\" is denied: it names a program for git to execute"
+          }
+        },
+        {
+          "command": "git ls-remote --exe=/tmp/evil origin",
+          "expect": {
+            "refused": "option \"--exe=/tmp/evil\" is denied: it names a program for git to execute"
+          }
+        }
+      ]
+    },
+    {
+      "name": "0.2.0 init, pane replacement",
+      "written_by": "herdr-run init once the pane cap replaced idle tabs (0.2.0, 21ccc9e5)",
+      "file": "earlier_configs/0.2.0-init-21ccc9e5.yaml",
+      "warning": "herdr-run: WARNING: /project/.herdr-run.yaml leaves out built-in deny entries, so they are not enforced: deny_anywhere \"--exec\". To adopt them, run 'herdr-run init --upgrade' in /project or add them by hand.",
+      "value_options": {
+        "git": [
+          "-C",
+          "-c",
+          "--git-dir",
+          "--work-tree",
+          "--namespace",
+          "--exec-path",
+          "--config-env",
+          "--super-prefix",
+          "--shallow-file",
+          "--attr-source"
+        ],
+        "gh": [
+          "-R",
+          "--repo"
+        ],
+        "cargo": [
+          "--manifest-path",
+          "--config",
+          "-Z",
+          "-p",
+          "--package",
+          "--target-dir"
+        ]
+      },
+      "commands": [
+        {
+          "command": "git --attr-source HEAD daemon",
+          "expect": {
+            "refused": "subcommand \"git daemon\" is denied: it defines or runs arbitrary code"
+          }
+        },
+        {
+          "command": "git --shallow-file x daemon",
+          "expect": {
+            "refused": "subcommand \"git daemon\" is denied: it defines or runs arbitrary code"
+          }
+        },
+        {
+          "command": "git --super-prefix x/ instaweb",
+          "expect": {
+            "refused": "subcommand \"git instaweb\" is denied: it defines or runs arbitrary code"
+          }
+        },
+        {
+          "command": "git push --exec=/tmp/evil origin main",
+          "expect": {
+            "allowed": {
+              "program": "git",
+              "subcommand": "push",
+              "rendered": "git push --exec=/tmp/evil origin main"
+            }
+          }
+        },
+        {
+          "command": "git clone -u /tmp/evil https://example.invalid/r",
+          "expect": {
+            "refused": "option \"-u\" is denied for \"git clone\": it names a program for git to execute"
+          }
+        },
+        {
+          "command": "git fetch --upload-pack=/tmp/evil origin",
+          "expect": {
+            "refused": "option \"--upload-pack=/tmp/evil\" is denied: it names a program for git to execute"
+          }
+        },
+        {
+          "command": "git -c core.pager=evil log",
+          "expect": {
+            "refused": "global option \"-c\" is denied for git: it can make git execute arbitrary code"
+          }
+        },
+        {
+          "command": "cargo fetch --config=build.rustc-wrapper=/tmp/evil",
+          "expect": {
+            "refused": "program \"cargo\" is not allowlisted. Allowed: gh, git"
+          }
+        }
+      ],
+      "upgraded": [
+        "deny_anywhere",
+        "value_options.git"
+      ],
+      "warning_after_upgrade": null,
+      "commands_after_upgrade": [
+        {
+          "command": "git push --exec=/tmp/evil origin main",
+          "expect": {
+            "refused": "option \"--exec=/tmp/evil\" is denied: it names a program for git to execute"
+          }
+        },
+        {
+          "command": "git ls-remote --exe=/tmp/evil origin",
+          "expect": {
+            "refused": "option \"--exe=/tmp/evil\" is denied: it names a program for git to execute"
+          }
+        }
+      ]
+    },
+    {
+      "name": "0.3.0 init",
+      "written_by": "herdr-run init in 0.3.0 (93b44b35)",
+      "file": "earlier_configs/0.3.0-init-93b44b35.yaml",
+      "warning": "herdr-run: WARNING: /project/.herdr-run.yaml leaves out built-in deny entries, so they are not enforced: deny_anywhere \"--exec\". To adopt them, run 'herdr-run init --upgrade' in /project or add them by hand.",
+      "value_options": {
+        "git": [
+          "-C",
+          "-c",
+          "--git-dir",
+          "--work-tree",
+          "--namespace",
+          "--exec-path",
+          "--config-env",
+          "--super-prefix",
+          "--shallow-file",
+          "--attr-source"
+        ],
+        "gh": [
+          "-R",
+          "--repo"
+        ],
+        "cargo": [
+          "--manifest-path",
+          "--config",
+          "-Z",
+          "-p",
+          "--package",
+          "--target-dir"
+        ]
+      },
+      "commands": [
+        {
+          "command": "git --attr-source HEAD daemon",
+          "expect": {
+            "refused": "subcommand \"git daemon\" is denied: it defines or runs arbitrary code"
+          }
+        },
+        {
+          "command": "git --shallow-file x daemon",
+          "expect": {
+            "refused": "subcommand \"git daemon\" is denied: it defines or runs arbitrary code"
+          }
+        },
+        {
+          "command": "git --super-prefix x/ instaweb",
+          "expect": {
+            "refused": "subcommand \"git instaweb\" is denied: it defines or runs arbitrary code"
+          }
+        },
+        {
+          "command": "git push --exec=/tmp/evil origin main",
+          "expect": {
+            "allowed": {
+              "program": "git",
+              "subcommand": "push",
+              "rendered": "git push --exec=/tmp/evil origin main"
+            }
+          }
+        },
+        {
+          "command": "git clone -u /tmp/evil https://example.invalid/r",
+          "expect": {
+            "refused": "option \"-u\" is denied for \"git clone\": it names a program for git to execute"
+          }
+        },
+        {
+          "command": "git fetch --upload-pack=/tmp/evil origin",
+          "expect": {
+            "refused": "option \"--upload-pack=/tmp/evil\" is denied: it names a program for git to execute"
+          }
+        },
+        {
+          "command": "git -c core.pager=evil log",
+          "expect": {
+            "refused": "global option \"-c\" is denied for git: it can make git execute arbitrary code"
+          }
+        },
+        {
+          "command": "cargo fetch --config=build.rustc-wrapper=/tmp/evil",
+          "expect": {
+            "refused": "program \"cargo\" is not allowlisted. Allowed: gh, git"
+          }
+        }
+      ],
+      "upgraded": [
+        "deny_anywhere",
+        "value_options.git"
+      ],
+      "warning_after_upgrade": null,
+      "commands_after_upgrade": [
+        {
+          "command": "git push --exec=/tmp/evil origin main",
+          "expect": {
+            "refused": "option \"--exec=/tmp/evil\" is denied: it names a program for git to execute"
+          }
+        },
+        {
+          "command": "git ls-remote --exe=/tmp/evil origin",
+          "expect": {
+            "refused": "option \"--exe=/tmp/evil\" is denied: it names a program for git to execute"
+          }
+        }
+      ]
+    },
+    {
+      "name": "this release's init",
+      "written_by": "herdr-run init in this release: the shipped template",
+      "file": null,
+      "warning": null,
+      "value_options": {
+        "git": [
+          "-C",
+          "-c",
+          "--git-dir",
+          "--work-tree",
+          "--namespace",
+          "--exec-path",
+          "--config-env",
+          "--super-prefix",
+          "--shallow-file",
+          "--attr-source"
+        ],
+        "gh": [
+          "-R",
+          "--repo"
+        ],
+        "cargo": [
+          "--manifest-path",
+          "--config",
+          "-Z",
+          "-p",
+          "--package",
+          "--target-dir"
+        ]
+      },
+      "commands": [
+        {
+          "command": "git --attr-source HEAD daemon",
+          "expect": {
+            "refused": "subcommand \"git daemon\" is denied: it defines or runs arbitrary code"
+          }
+        },
+        {
+          "command": "git --shallow-file x daemon",
+          "expect": {
+            "refused": "subcommand \"git daemon\" is denied: it defines or runs arbitrary code"
+          }
+        },
+        {
+          "command": "git --super-prefix x/ instaweb",
+          "expect": {
+            "refused": "subcommand \"git instaweb\" is denied: it defines or runs arbitrary code"
+          }
+        },
+        {
+          "command": "git push --exec=/tmp/evil origin main",
+          "expect": {
+            "refused": "option \"--exec=/tmp/evil\" is denied: it names a program for git to execute"
+          }
+        },
+        {
+          "command": "git clone -u /tmp/evil https://example.invalid/r",
+          "expect": {
+            "refused": "option \"-u\" is denied for \"git clone\": it names a program for git to execute"
+          }
+        },
+        {
+          "command": "git fetch --upload-pack=/tmp/evil origin",
+          "expect": {
+            "refused": "option \"--upload-pack=/tmp/evil\" is denied: it names a program for git to execute"
+          }
+        },
+        {
+          "command": "git -c core.pager=evil log",
+          "expect": {
+            "refused": "global option \"-c\" is denied for git: it can make git execute arbitrary code"
+          }
+        },
+        {
+          "command": "cargo fetch --config=build.rustc-wrapper=/tmp/evil",
+          "expect": {
+            "refused": "program \"cargo\" is not allowlisted. Allowed: gh, git"
+          }
+        }
+      ],
+      "upgraded": [],
+      "warning_after_upgrade": null,
+      "commands_after_upgrade": [
+        {
+          "command": "git push --exec=/tmp/evil origin main",
+          "expect": {
+            "refused": "option \"--exec=/tmp/evil\" is denied: it names a program for git to execute"
+          }
+        },
+        {
+          "command": "git ls-remote --exe=/tmp/evil origin",
+          "expect": {
+            "refused": "option \"--exe=/tmp/evil\" is denied: it names a program for git to execute"
+          }
+        }
+      ]
     }
   ]
 }

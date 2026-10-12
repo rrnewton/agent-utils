@@ -43,6 +43,13 @@ pub const DEFAULT_MAX_PANES: u64 = 32;
 /// Largest accepted `max_panes`. A shared finite bound keeps the two implementations identical.
 pub const MAX_PANE_CAP: u64 = 1_000_000;
 
+/// Cargo options refused in every argument position whatever `deny_global` says.
+///
+/// A project that opts Cargo in must not be able to configure its way past them. The admission
+/// rule ([`crate::allowlist::admit`]) adds these to Cargo's `deny_global` entries, and
+/// [`missing_defaults`] therefore never reports them as left out.
+pub const CARGO_ALWAYS_DENIED: [&str; 2] = ["--config", "-Z"];
+
 /// Largest command/readiness timeout accepted from configuration or the CLI.
 ///
 /// This deliberately stays far below platform monotonic-clock limits so a finite timeout cannot
@@ -75,7 +82,14 @@ pub struct Config {
     pub deny_subcommand_option: BTreeMap<String, BTreeMap<String, Vec<String>>>,
     /// Programs whose subcommand must appear in the corresponding positive list.
     pub allow_subcommand: BTreeMap<String, Vec<String>>,
-    /// Global options whose value occupies the following token.
+    /// Global options whose value occupies the following token: the built-in table plus whatever
+    /// the configuration adds.
+    ///
+    /// The table records how each program reads its own command line, which is a fact about the
+    /// program and not a policy choice, so a configured `value_options` ADDS to it and can never
+    /// take an entry away. Leaving an entry out could only make the policy misread a command -- and
+    /// a file written by an older `herdr-run init` lists the older, shorter table, which used to
+    /// replace this one and so reopened `git --attr-source HEAD daemon`.
     pub value_options: BTreeMap<String, Vec<String>>,
     /// Directory holding run spools, audit log, and session cache.
     pub spool_dir: String,
@@ -247,6 +261,174 @@ fn string_map(entries: &[(&str, &[&str])]) -> BTreeMap<String, Vec<String>> {
         .collect()
 }
 
+/// The built-in value-option table with `configured` added to it; nothing is taken away.
+///
+/// Each program keeps its built-in options first, in their built-in order, followed by the
+/// configured ones it did not already have, in the order they were written; a program the table
+/// does not know gets its configured options with repeats dropped.
+fn with_builtin_value_options(
+    configured: BTreeMap<String, Vec<String>>,
+) -> BTreeMap<String, Vec<String>> {
+    let mut merged = Config::default().value_options;
+    for (program, options) in configured {
+        let combined = merged.entry(program).or_default();
+        for option in options {
+            if !combined.contains(&option) {
+                combined.push(option);
+            }
+        }
+    }
+    merged
+}
+
+/// Built-in deny entries that one configured list leaves out, and so does not enforce.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MissingDefault {
+    /// The list, as a dotted path: `deny_anywhere`, `deny_global.git`,
+    /// `deny_subcommand_option.git.clone`.
+    pub setting: String,
+    /// The entries it leaves out, in built-in order.
+    pub entries: Vec<String>,
+}
+
+/// Every built-in deny entry the configuration's deny lists leave out.
+///
+/// A configured deny list REPLACES the built-in one, so a list written before an entry was added
+/// to the built-in defaults -- by an older `herdr-run init`, say -- goes on without it, and nothing
+/// about the file says so. This names each such entry, so it can be said out loud.
+///
+/// Entries for a program the allowlist can never admit are not reported, because they could never
+/// apply; nor are Cargo's [`CARGO_ALWAYS_DENIED`], which apply whatever the file says. Lists are
+/// reported in [`KNOWN_KEYS`] order, programs and subcommands in sorted order, and entries in
+/// built-in order.
+#[must_use]
+pub fn missing_defaults(config: &Config) -> Vec<MissingDefault> {
+    let defaults = Config::default();
+    let admissible = |program: &str| {
+        config.allows_any_program() || config.allow.iter().any(|allowed| allowed == program)
+    };
+    let mut found = Vec::new();
+    let mut compare =
+        |setting: String, built_in: &[String], configured: &[String], exempt: &[&str]| {
+            let absent: Vec<String> = built_in
+                .iter()
+                .filter(|entry| !configured.contains(entry) && !exempt.contains(&entry.as_str()))
+                .cloned()
+                .collect();
+            if !absent.is_empty() {
+                found.push(MissingDefault {
+                    setting,
+                    entries: absent,
+                });
+            }
+        };
+    for (program, built_in) in &defaults.deny_global {
+        if admissible(program) {
+            let exempt: &[&str] = if program == "cargo" {
+                &CARGO_ALWAYS_DENIED
+            } else {
+                &[]
+            };
+            compare(
+                format!("deny_global.{program}"),
+                built_in,
+                config
+                    .deny_global
+                    .get(program)
+                    .map_or(&[][..], Vec::as_slice),
+                exempt,
+            );
+        }
+    }
+    for (program, built_in) in &defaults.deny_subcommand {
+        if admissible(program) {
+            compare(
+                format!("deny_subcommand.{program}"),
+                built_in,
+                config
+                    .deny_subcommand
+                    .get(program)
+                    .map_or(&[][..], Vec::as_slice),
+                &[],
+            );
+        }
+    }
+    compare(
+        "deny_anywhere".to_owned(),
+        &defaults.deny_anywhere,
+        &config.deny_anywhere,
+        &[],
+    );
+    for (program, subcommands) in &defaults.deny_subcommand_option {
+        if !admissible(program) {
+            continue;
+        }
+        let configured = config.deny_subcommand_option.get(program);
+        for (subcommand, built_in) in subcommands {
+            compare(
+                format!("deny_subcommand_option.{program}.{subcommand}"),
+                built_in,
+                configured
+                    .and_then(|entries| entries.get(subcommand))
+                    .map_or(&[][..], Vec::as_slice),
+                &[],
+            );
+        }
+    }
+    found
+}
+
+/// `deny_anywhere "--exec"; deny_global.git "-c", "--namespace"`: one line, every entry.
+#[must_use]
+pub fn describe_missing(missing: &[MissingDefault]) -> String {
+    missing
+        .iter()
+        .map(|item| {
+            format!(
+                "{} {}",
+                item.setting,
+                item.entries
+                    .iter()
+                    .map(|entry| quote(entry))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
+/// The one warning line every subcommand that reads `config` prints, or `None`.
+///
+/// The line is the same every time for the same file, so it can be recognised. It names the file,
+/// every left-out entry, and the remedy: `herdr-run init --upgrade` run where the file is, when the
+/// file has a name `init` works on, and otherwise an edit by hand.
+#[must_use]
+pub fn missing_defaults_warning(config: &Config) -> Option<String> {
+    let missing = missing_defaults(config);
+    if missing.is_empty() {
+        return None;
+    }
+    let source = config.source_path.as_deref();
+    let shown = source.map_or_else(|| "<config>".to_owned(), display);
+    let named_for_init = source
+        .and_then(|path| Path::new(path).file_name())
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| CONFIG_FILENAMES.contains(&name));
+    let remedy = if named_for_init {
+        format!(
+            "run 'herdr-run init --upgrade' in {} or add them by hand",
+            display(&config.project_root)
+        )
+    } else {
+        "add them to the file by hand".to_owned()
+    };
+    Some(format!(
+        "herdr-run: WARNING: {shown} leaves out built-in deny entries, so they are not enforced: {}. To adopt them, {remedy}.",
+        describe_missing(&missing)
+    ))
+}
+
 fn absolute_lexical(path: &Path) -> Result<PathBuf> {
     let joined = if path.is_absolute() {
         path.to_path_buf()
@@ -323,32 +505,42 @@ pub fn load_config(explicit_path: Option<&Path>, start_dir: &Path) -> Result<Con
             ..Config::default()
         });
     };
-    let path_text = path.to_string_lossy().into_owned();
-    let shown = display(&path_text);
-    let payload = fs::read(&path).map_err(|error| {
-        HerdrRunError::config(format!(
-            "cannot read config file {shown}: {}",
-            os_error_text(&error)
-        ))
-    })?;
-    let text = String::from_utf8(payload).map_err(|_| {
-        HerdrRunError::config(format!(
-            "cannot read config file {shown}: the file is not valid UTF-8"
-        ))
-    })?;
-    let document = core_load(&text)
-        .map_err(|error| HerdrRunError::config(format!("{shown}: invalid YAML: {error}")))?;
+    let text = read_config_file(&path)?;
     let root = path.parent().unwrap_or_else(|| Path::new("/"));
     let root = if root.as_os_str().is_empty() {
         Path::new("/")
     } else {
         root
     };
-    parse_config(
-        &document,
-        Some(path_text.clone()),
+    parse_config_text(
+        &text,
+        path.to_string_lossy().into_owned(),
         root.to_string_lossy().into_owned(),
     )
+}
+
+/// The text of the configuration file at `path`, which must be UTF-8.
+pub fn read_config_file(path: &Path) -> Result<String> {
+    let shown = display(&path.to_string_lossy());
+    let payload = fs::read(path).map_err(|error| {
+        HerdrRunError::config(format!(
+            "cannot read config file {shown}: {}",
+            os_error_text(&error)
+        ))
+    })?;
+    String::from_utf8(payload).map_err(|_| {
+        HerdrRunError::config(format!(
+            "cannot read config file {shown}: the file is not valid UTF-8"
+        ))
+    })
+}
+
+/// Read configuration text as the file `source_path` holds it, and validate it.
+pub fn parse_config_text(text: &str, source_path: String, project_root: String) -> Result<Config> {
+    let document = core_load(text).map_err(|error| {
+        HerdrRunError::config(format!("{}: invalid YAML: {error}", display(&source_path)))
+    })?;
+    parse_config(&document, Some(source_path), project_root)
 }
 
 fn require_object<'a>(value: &'a Yaml, what: &str) -> Result<&'a [(String, Yaml)]> {
@@ -701,7 +893,10 @@ pub fn parse_config(
                 config.deny_subcommand_option = require_policy_map_map(value, &where_)?;
             }
             "allow_subcommand" => config.allow_subcommand = require_policy_map(value, &where_)?,
-            "value_options" => config.value_options = require_policy_map(value, &where_)?,
+            "value_options" => {
+                config.value_options =
+                    with_builtin_value_options(require_policy_map(value, &where_)?);
+            }
             "spool_dir" => config.spool_dir = require_text(value, &where_)?,
             "timeout_seconds" => config.timeout_seconds = require_seconds(value, &where_)?,
             "retention_days" => {
@@ -1064,6 +1259,143 @@ mod tests {
             );
         }
         fs::remove_dir_all(root).unwrap();
+    }
+
+    fn parse_at(text: &str, source: &str) -> Config {
+        let document = core_load(text).expect("valid YAML");
+        let root = Path::new(source)
+            .parent()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        parse_config(&document, Some(source.to_owned()), root).expect("valid configuration")
+    }
+
+    /// Which options take the next argument is how git reads its own command line, not policy.
+    ///
+    /// A file written by an older `herdr-run init` lists the seven git options that release knew.
+    /// It used to REPLACE the built-in table, so `git --attr-source HEAD daemon` read `HEAD` as the
+    /// subcommand and ran a denied one.
+    #[test]
+    fn value_options_add_to_the_built_in_table_and_never_take_from_it() {
+        let built_in = Config::default().value_options;
+        let older = parse_text(
+            "value_options:\n  git: [-C, -c, --git-dir, --work-tree, --namespace, --exec-path, --config-env]\n",
+        )
+        .unwrap();
+        assert_eq!(older.value_options, built_in);
+        assert_eq!(
+            parse_text("value_options: {}\n").unwrap().value_options,
+            built_in
+        );
+        assert_eq!(
+            parse_text("value_options: {gh: [], cargo: []}\n")
+                .unwrap()
+                .value_options,
+            built_in
+        );
+
+        let added =
+            parse_text("value_options:\n  git: [--frobnicate, -C, --frobnicate]\n").unwrap();
+        let mut expected = built_in["git"].clone();
+        expected.push("--frobnicate".to_owned());
+        assert_eq!(added.value_options["git"], expected);
+        assert_eq!(added.value_options["gh"], built_in["gh"]);
+        let tool = parse_text("allow: [tool]\nvalue_options:\n  tool: [-f, -f, -g]\n").unwrap();
+        assert_eq!(tool.value_options["tool"], strings(&["-f", "-g"]));
+        assert_eq!(tool.value_options["git"], built_in["git"]);
+    }
+
+    fn missing(setting: &str, entries: &[&str]) -> MissingDefault {
+        MissingDefault {
+            setting: setting.to_owned(),
+            entries: strings(entries),
+        }
+    }
+
+    #[test]
+    fn a_deny_list_that_leaves_out_a_built_in_entry_is_reported() {
+        let older = parse_text("deny_anywhere: [--upload-pack, --receive-pack]\n").unwrap();
+        assert_eq!(
+            missing_defaults(&older),
+            vec![missing("deny_anywhere", &["--exec"])]
+        );
+        assert!(missing_defaults(&Config::default()).is_empty());
+        let wider =
+            parse_text("deny_anywhere: [--upload-pack, --receive-pack, --exec, --evil]\n").unwrap();
+        assert!(missing_defaults(&wider).is_empty());
+
+        let every = parse_text(
+            "allow: ['*']\ndeny_global: {}\ndeny_subcommand: {git: [daemon]}\ndeny_anywhere: []\n\
+             deny_subcommand_option: {git: {clone: []}}\n",
+        )
+        .unwrap();
+        assert_eq!(
+            missing_defaults(&every),
+            vec![
+                // Cargo's --config and -Z apply whatever the file says, so they are never left out.
+                missing(
+                    "deny_global.git",
+                    &["-c", "--config-env", "--exec-path", "--namespace"]
+                ),
+                missing(
+                    "deny_subcommand.gh",
+                    &["alias", "extension", "ext", "codespace", "cs"]
+                ),
+                missing("deny_subcommand.git", &["filter-branch", "instaweb"]),
+                missing(
+                    "deny_anywhere",
+                    &["--upload-pack", "--receive-pack", "--exec"]
+                ),
+                missing("deny_subcommand_option.git.clone", &["-u"]),
+                missing("deny_subcommand_option.git.difftool", &["-x", "--extcmd"]),
+                missing("deny_subcommand_option.git.rebase", &["-x"]),
+            ]
+        );
+    }
+
+    #[test]
+    fn entries_for_a_program_that_can_never_run_are_not_reported() {
+        let mut narrow = parse_text(
+            "allow: [git]\ndeny_global: {git: [-c, --config-env, --exec-path, --namespace]}\n\
+             deny_subcommand: {git: [filter-branch, daemon, instaweb]}\n",
+        )
+        .unwrap();
+        assert!(missing_defaults(&narrow).is_empty());
+        narrow.allow = strings(&["git", "gh"]);
+        assert_eq!(
+            missing_defaults(&narrow),
+            vec![missing(
+                "deny_subcommand.gh",
+                &["alias", "extension", "ext", "codespace", "cs"]
+            )]
+        );
+    }
+
+    #[test]
+    fn the_warning_names_the_file_every_entry_and_the_remedy() {
+        let older = parse_at("deny_anywhere: [--upload-pack]\n", "/p/.herdr-run.yaml");
+        assert_eq!(
+            missing_defaults_warning(&older).as_deref(),
+            Some(
+                "herdr-run: WARNING: /p/.herdr-run.yaml leaves out built-in deny entries, so they are not enforced: deny_anywhere \"--receive-pack\", \"--exec\". To adopt them, run 'herdr-run init --upgrade' in /p or add them by hand."
+            )
+        );
+        let yml = parse_at("deny_anywhere: [--upload-pack]\n", "/p/.herdr-run.yml");
+        assert!(missing_defaults_warning(&yml)
+            .unwrap()
+            .contains("run 'herdr-run init --upgrade' in /p or"));
+        // `init --upgrade` works only on the two names `init` writes, so it is not offered for
+        // another.
+        let other = parse_at("deny_anywhere: [--upload-pack]\n", "/p/conf/settings.yaml");
+        assert!(missing_defaults_warning(&other)
+            .unwrap()
+            .ends_with("To adopt them, add them to the file by hand."));
+        assert_eq!(missing_defaults_warning(&Config::default()), None);
+        assert_eq!(
+            missing_defaults_warning(&parse_at("workspace: x\n", "/p/.herdr-run.yaml")),
+            None
+        );
     }
 
     #[test]

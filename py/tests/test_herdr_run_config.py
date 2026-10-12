@@ -7,6 +7,7 @@ intended conservative policy, because that is the state most consumers will run 
 from __future__ import annotations
 
 import os
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -15,8 +16,11 @@ from herdr_run.config import (
     MAX_RETENTION_DAYS,
     MAX_TIMEOUT_SECONDS,
     Config,
+    MissingDefault,
     find_config_file,
     load_config,
+    missing_defaults,
+    missing_defaults_warning,
     parse_config,
 )
 from herdr_run.errors import ConfigError
@@ -372,3 +376,100 @@ def test_visible_non_ascii_names_and_invisible_text_outside_names_are_accepted(
     assert config.workspace == "café"
     assert config.prompt_tail == "\u00a0$ "
     assert config.spool_dir == "out\u00a0dir"
+
+
+# --- configurations written by an earlier release ------------------------------------------------
+
+
+def _parse(document: dict[str, object], source: str = "/p/.herdr-run.yaml") -> Config:
+    return parse_config(document, source_path=source, project_root=os.path.dirname(source))
+
+
+def test_value_options_add_to_the_built_in_table_and_never_take_from_it() -> None:
+    """Which options take the next argument is how git reads its own command line, not policy.
+
+    A file written by an older `herdr-run init` lists the seven git options that release knew. It
+    used to REPLACE the built-in table, so `git --attr-source HEAD daemon` read `HEAD` as the
+    subcommand and ran a denied one.
+    """
+    built_in = Config().value_options
+    older = _parse(
+        {
+            "value_options": {
+                "git": [
+                    "-C", "-c", "--git-dir", "--work-tree", "--namespace", "--exec-path",
+                    "--config-env",
+                ]
+            }
+        }
+    )
+    assert older.value_options == built_in
+    assert _parse({"value_options": {}}).value_options == built_in
+    assert _parse({"value_options": {"gh": [], "cargo": []}}).value_options == built_in
+
+    added = _parse({"value_options": {"git": ["--frobnicate", "-C", "--frobnicate"]}})
+    assert added.value_options["git"] == (*built_in["git"], "--frobnicate")
+    assert added.value_options["gh"] == built_in["gh"]
+    tool = _parse({"allow": ["tool"], "value_options": {"tool": ["-f", "-f", "-g"]}})
+    assert tool.value_options["tool"] == ("-f", "-g")
+    assert tool.value_options["git"] == built_in["git"]
+
+
+def test_a_deny_list_that_leaves_out_a_built_in_entry_is_reported() -> None:
+    older = _parse({"deny_anywhere": ["--upload-pack", "--receive-pack"]})
+    assert missing_defaults(older) == (MissingDefault("deny_anywhere", ("--exec",)),)
+    assert missing_defaults(Config()) == ()
+    assert missing_defaults(_parse({"deny_anywhere": [*Config().deny_anywhere, "--evil"]})) == ()
+
+    every = _parse(
+        {
+            "allow": ["*"],
+            "deny_global": {},
+            "deny_subcommand": {"git": ["daemon"]},
+            "deny_anywhere": [],
+            "deny_subcommand_option": {"git": {"clone": []}},
+        }
+    )
+    assert missing_defaults(every) == (
+        # Cargo's --config and -Z apply whatever the file says, so they are never left out.
+        MissingDefault("deny_global.git", ("-c", "--config-env", "--exec-path", "--namespace")),
+        MissingDefault("deny_subcommand.gh", ("alias", "extension", "ext", "codespace", "cs")),
+        MissingDefault("deny_subcommand.git", ("filter-branch", "instaweb")),
+        MissingDefault("deny_anywhere", ("--upload-pack", "--receive-pack", "--exec")),
+        MissingDefault("deny_subcommand_option.git.clone", ("-u",)),
+        MissingDefault("deny_subcommand_option.git.difftool", ("-x", "--extcmd")),
+        MissingDefault("deny_subcommand_option.git.rebase", ("-x",)),
+    )
+
+
+def test_entries_for_a_program_that_can_never_run_are_not_reported() -> None:
+    narrow = _parse(
+        {
+            "allow": ["git"],
+            "deny_global": {"git": list(Config().deny_global["git"])},
+            "deny_subcommand": {"git": list(Config().deny_subcommand["git"])},
+        }
+    )
+    assert missing_defaults(narrow) == ()
+    widened = replace(narrow, allow=("git", "gh"))
+    assert missing_defaults(widened) == (
+        MissingDefault("deny_subcommand.gh", ("alias", "extension", "ext", "codespace", "cs")),
+    )
+
+
+def test_the_warning_names_the_file_every_entry_and_the_remedy() -> None:
+    older = _parse({"deny_anywhere": ["--upload-pack"]})
+    assert missing_defaults_warning(older) == (
+        "herdr-run: WARNING: /p/.herdr-run.yaml leaves out built-in deny entries, so they are not "
+        'enforced: deny_anywhere "--receive-pack", "--exec". To adopt them, run '
+        "'herdr-run init --upgrade' in /p or add them by hand."
+    )
+    yml = _parse({"deny_anywhere": ["--upload-pack"]}, "/p/.herdr-run.yml")
+    assert "run 'herdr-run init --upgrade' in /p or" in (missing_defaults_warning(yml) or "")
+    # `init --upgrade` works only on the two names `init` writes, so it is not offered for another.
+    other = _parse({"deny_anywhere": ["--upload-pack"]}, "/p/conf/settings.yaml")
+    assert (missing_defaults_warning(other) or "").endswith(
+        "To adopt them, add them to the file by hand."
+    )
+    assert missing_defaults_warning(Config()) is None
+    assert missing_defaults_warning(_parse({"workspace": "x"})) is None

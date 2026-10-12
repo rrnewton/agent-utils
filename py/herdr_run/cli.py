@@ -26,7 +26,13 @@ from herdr_run import __version__
 from herdr_run.allowlist import Admission, admit, quote_word
 from herdr_run.audit import audit_path, record, warn_if_spool_is_tracked
 from herdr_run.client import HerdrClient, bounded_control_command
-from herdr_run.config import MAX_TIMEOUT_SECONDS, Config, load_config, whole_milliseconds
+from herdr_run.config import (
+    MAX_TIMEOUT_SECONDS,
+    Config,
+    load_config,
+    missing_defaults_warning,
+    whole_milliseconds,
+)
 from herdr_run.errors import (
     EXIT_BUSY,
     ConfigError,
@@ -100,7 +106,7 @@ _HELP_OPTIONS: tuple[tuple[str, str | None], ...] = (("--help", None), ("-h", No
 SUBCOMMAND_OPTIONS: tuple[tuple[str, tuple[tuple[str, str | None], ...]], ...] = (
     ("check", _HELP_OPTIONS),
     ("config", _HELP_OPTIONS),
-    ("init", (("--force", None), ("--help", None), ("-h", None))),
+    ("init", (("--force", None), ("--help", None), ("--upgrade", None), ("-h", None))),
     ("net-doctor", _HELP_OPTIONS),
     ("quickstart", _HELP_OPTIONS),
     ("reap", _HELP_OPTIONS),
@@ -121,14 +127,14 @@ SUBCOMMAND_OPTIONS: tuple[tuple[str, tuple[tuple[str, str | None], ...]], ...] =
     ("userguide", _HELP_OPTIONS),
 )
 
-#: Subcommands that never load a configuration file, and the reason each one does not.
+#: Subcommands that take no configuration file, and the reason each one does not.
 #:
 #: ``--config`` is refused for these rather than accepted and ignored. It is not an inert flag: it
 #: reads as an instruction about which configuration file to use, and ``herdr-run --config P init``
 #: reads as an instruction to write ``P``. Accepting an instruction and then disregarding it is the
 #: defect this surface exists to remove, so the answer is a refusal that says why.
 _CONFIG_BLIND: dict[str, str] = {
-    "init": "it WRITES one, into the current directory",
+    "init": "it WRITES one into the current directory, or with --upgrade edits the one there",
     "quickstart": "it prints a packaged document",
     "userguide": "it prints a packaged document",
 }
@@ -214,6 +220,7 @@ class _Invocation:
     run: _RunOptions | None = None
     command: str | None = None
     force: bool = False
+    upgrade: bool = False
     no_cache: bool = False
 
 
@@ -339,9 +346,9 @@ def _local_argument_error(subcommand: str, token: str) -> str:
 
 
 def _config_blind_error(subcommand: str) -> str:
-    """Describe ``--config`` offered to a subcommand that reads no configuration file."""
+    """Describe ``--config`` offered to a subcommand that takes no configuration file."""
     message = (
-        f"argument --config: '{subcommand}' reads no configuration file; "
+        f"argument --config: '{subcommand}' takes no configuration file; "
         f"{_CONFIG_BLIND[subcommand]}."
     )
     if subcommand == "init":
@@ -472,6 +479,27 @@ def _parse_run(rest: Sequence[str]) -> _RunOptions:
     return replace(options, command=positional[0])
 
 
+def _parse_init(rest: Sequence[str]) -> tuple[bool, bool]:
+    """Parse ``init``'s own arguments into ``(force, upgrade)``."""
+    force = upgrade = False
+    for token in rest:
+        if token in ("--help", "-h"):
+            _print_subcommand_help("init")
+            raise _EarlyExit()
+        if token == "--force":
+            force = True
+        elif token == "--upgrade":
+            upgrade = True
+        else:
+            raise _UsageError(_local_argument_error("init", token))
+    if force and upgrade:
+        raise _UsageError(
+            "init: --force and --upgrade cannot be combined: --force writes a fresh file over "
+            "the existing one, and --upgrade edits the existing one in place"
+        )
+    return force, upgrade
+
+
 def _parse_flag_only(name: str, rest: Sequence[str], flag: str) -> bool:
     present = False
     for token in rest:
@@ -497,9 +525,8 @@ def _parse_subcommand(name: str, rest: Sequence[str], globals_: _Globals) -> _In
             raise _UsageError(_one_argument_error("check", positional))
         return _Invocation(globals_, name, command=positional[0])
     if name == "init":
-        return _Invocation(
-            globals_, name, force=_parse_flag_only(name, rest, "--force")
-        )
+        force, upgrade = _parse_init(rest)
+        return _Invocation(globals_, name, force=force, upgrade=upgrade)
     if name == "target":
         return _Invocation(
             globals_, name, no_cache=_parse_flag_only(name, rest, "--no-cache")
@@ -646,9 +673,15 @@ _SUBCOMMAND_HELP: dict[str, str] = {
         "writes into the current directory. Every knob is present and set to the value in\n"
         "force today, so adopting the file changes nothing until you edit it. Refuses to\n"
         "overwrite an existing configuration.\n"
+        "\nWith --upgrade, edit the .herdr-run.yaml (or .herdr-run.yml) already in the current\n"
+        "directory instead. Each setting it still holds exactly as an earlier herdr-run wrote\n"
+        "it is rewritten as this one writes it, which adopts the built-in deny entries added\n"
+        "since; nothing else in the file changes. Built-in deny entries it still leaves out,\n"
+        "in lists somebody edited, are listed to be added by hand.\n"
         "\noptions:\n"
         "  -h, --help            show this help message and exit\n"
         "  --force               overwrite an existing configuration file\n"
+        "  --upgrade             bring the settings an earlier herdr-run wrote up to date\n"
     ),
     "status": (
         "usage: herdr-run [GLOBAL OPTIONS] status\n"
@@ -709,7 +742,7 @@ _SUBCOMMAND_HELP: dict[str, str] = {
 
 #: Said by every subcommand ``_CONFIG_BLIND`` names, so the refusal is never a surprise.
 _CONFIG_BLIND_NOTE = (
-    "\nThis command reads no configuration file, so the global --config option is\n"
+    "\nThis command takes no configuration file, so the global --config option is\n"
     "refused here rather than accepted and ignored.\n"
 )
 
@@ -852,9 +885,11 @@ def _print_document(subcommand: str) -> int:
 # --- subcommands --------------------------------------------------------------------------------
 
 
-def _cmd_init(directory: str, *, force: bool, json_output: bool) -> int:
+def _cmd_init(directory: str, *, force: bool, upgrade: bool, json_output: bool) -> int:
     from herdr_run.init import write_config_template
 
+    if upgrade:
+        return _cmd_init_upgrade(directory, json_output=json_output)
     path = write_config_template(directory, force=force)
     if json_output:
         _emit_json({"created": True, "path": path})
@@ -864,6 +899,49 @@ def _cmd_init(directory: str, *, force: bool, json_output: bool) -> int:
             "Every knob is in that file, set to the value in force today. The allowlist near the\n"
             "top is a HUMAN-ONLY knob: an agent that can widen its own allowlist does not have one.\n"
         )
+    return 0
+
+
+def _cmd_init_upgrade(directory: str, *, json_output: bool) -> int:
+    """Upgrade the configuration file in ``directory`` and say what changed and what did not."""
+    from herdr_run.init import upgrade_config_file
+
+    result = upgrade_config_file(directory)
+    if json_output:
+        _emit_json(
+            {
+                "missing": [
+                    {"entries": list(item.entries), "setting": item.setting}
+                    for item in result.missing
+                ],
+                "path": result.path,
+                "upgraded": [
+                    {"added": list(upgrade.added), "setting": upgrade.setting}
+                    for upgrade in result.upgraded
+                ],
+            }
+        )
+        return 0
+    if result.upgraded:
+        lines = [f"upgraded {display(result.path)}"]
+        lines.extend(
+            f"  {upgrade.setting}: added {', '.join(quote(entry) for entry in upgrade.added)}"
+            for upgrade in result.upgraded
+        )
+    else:
+        lines = [f"nothing to rewrite in {display(result.path)}"]
+    if result.missing:
+        lines.append(
+            "Still left out, from lists that are not as an earlier herdr-run wrote them; add "
+            "them by hand to adopt them:"
+        )
+        lines.extend(
+            f"  {item.setting}: {', '.join(quote(entry) for entry in item.entries)}"
+            for item in result.missing
+        )
+    else:
+        lines.append("Every built-in deny entry is in force.")
+    output.stdout("".join(f"{line}\n" for line in lines))
     return 0
 
 
@@ -1424,10 +1502,19 @@ def _dispatch(invocation: _Invocation, environ: Mapping[str, str]) -> int:
         # found nothing, or found something broken, and refusing to write a fresh template because
         # the old one will not parse would be exactly the wrong moment to be strict.
         return _cmd_init(
-            start_dir, force=invocation.force, json_output=invocation.globals.json
+            start_dir,
+            force=invocation.force,
+            upgrade=invocation.upgrade,
+            json_output=invocation.globals.json,
         )
 
     config = load_config(explicit_path=invocation.globals.config, start_dir=start_dir)
+    # Every subcommand that reads the configuration says so when a deny list in it leaves out a
+    # built-in entry: the list replaces the built-in one, so the entry is not enforced, and a file
+    # written by an older release would otherwise lose each new entry without a word.
+    warning = missing_defaults_warning(config)
+    if warning is not None:
+        output.diagnostic(warning)
     json_output = invocation.globals.json
     # The agent is resolved only by the subcommands that name a tab with it, so a malformed agent
     # variable cannot fail a `check` or a `reap` that never asks who is speaking.

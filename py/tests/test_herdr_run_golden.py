@@ -12,7 +12,9 @@ that changes in one edition fails the other edition's suite until both agree aga
 - ``record_cases.json``: reap scope, evidence folded from run records, session-cache loading
   and the exact bytes a cache store writes;
 - ``policy_cases.json``: configuration loading and command admission, including ``~`` expanded
-  before the policy judges an argument, and names refused for holding an invisible character.
+  before the policy judges an argument, names refused for holding an invisible character, the
+  warning a deny list that leaves out a built-in entry draws, and every configuration an earlier
+  release wrote: what it admits, what it is warned about, and what ``init --upgrade`` makes of it.
 """
 
 from __future__ import annotations
@@ -30,8 +32,14 @@ from herdr_run import __version__
 from herdr_run.allowlist import admit
 from herdr_run.cli import _Globals, _resolve_agent
 from herdr_run.client import HerdrClient
-from herdr_run.config import Config, parse_config
+from herdr_run.config import (
+    Config,
+    missing_defaults_warning,
+    parse_config,
+    parse_config_text,
+)
 from herdr_run.errors import ConfigError, HerdrRunError, Refused
+from herdr_run.init import UPGRADES, config_template, upgrade_text
 from herdr_run.readiness import assess_prompt, infer_prompt_tail
 from herdr_run.reap import evidence_from_runs
 from herdr_run.runner import make_run_id
@@ -165,14 +173,7 @@ def test_run_id(row: list[object]) -> None:
 # --- configuration loading and admission ----------------------------------------------------------
 
 
-def _policy_outcome(config_text: str | None, home: str | None, command: str) -> dict[str, object]:
-    try:
-        document = None if config_text is None else core_load(config_text)
-        config = parse_config(document, source_path=None, project_root="/")
-    except YamlError as exc:
-        return {"config_error": f"invalid YAML: {exc}"}
-    except ConfigError as exc:
-        return {"config_error": str(exc)}
+def _admission(config: Config, home: str | None, command: str) -> dict[str, object]:
     try:
         admission = admit(command, config, home=home)
     except Refused as exc:
@@ -188,6 +189,21 @@ def _policy_outcome(config_text: str | None, home: str | None, command: str) -> 
     }
 
 
+def _policy_outcome(config_text: str | None, home: str | None, command: str) -> dict[str, object]:
+    try:
+        document = None if config_text is None else core_load(config_text)
+        config = parse_config(document, source_path=None, project_root="/")
+    except YamlError as exc:
+        return {"config_error": f"invalid YAML: {exc}"}
+    except ConfigError as exc:
+        return {"config_error": str(exc)}
+    outcome = _admission(config, home, command)
+    warning = missing_defaults_warning(config)
+    if warning is not None:
+        outcome["warning"] = warning
+    return outcome
+
+
 @pytest.mark.parametrize(
     "case", cast(list[dict[str, object]], POLICY["cases"]), ids=lambda case: case["name"]
 )
@@ -198,6 +214,68 @@ def test_policy(case: dict[str, object]) -> None:
         cast(str, case["command"]),
     )
     assert outcome == case["expect"]
+
+
+def test_the_upgrade_table_is_the_shared_one() -> None:
+    """Both editions rewrite exactly the settings the corpus lists, from and to the same text."""
+    assert [
+        {
+            "setting": upgrade.setting,
+            "earlier": upgrade.earlier,
+            "current": upgrade.current,
+            "added": list(upgrade.added),
+        }
+        for upgrade in UPGRADES
+    ] == POLICY["upgrades"]
+
+
+def _earlier_text(row: dict[str, object]) -> str:
+    """The configuration an earlier release wrote, or (``file: null``) the one this release writes."""
+    if row["file"] is None:
+        return config_template()
+    return (_TESTDATA / cast(str, row["file"])).read_text(encoding="utf-8")
+
+
+def _earlier_config(text: str) -> Config:
+    location = cast(dict[str, str], POLICY["earlier_location"])
+    return parse_config_text(
+        text, source_path=location["source_path"], project_root=location["project_root"]
+    )
+
+
+@pytest.mark.parametrize(
+    "row",
+    cast(list[dict[str, object]], POLICY["earlier_configs"]),
+    ids=lambda row: row["name"],
+)
+def test_earlier_config(row: dict[str, object]) -> None:
+    """A configuration an earlier release wrote: what it admits, the warning, and the upgrade."""
+    text = _earlier_text(row)
+    config = _earlier_config(text)
+    assert missing_defaults_warning(config) == row["warning"]
+    assert {program: list(options) for program, options in config.value_options.items()} == row[
+        "value_options"
+    ]
+    for case in cast(list[dict[str, object]], row["commands"]):
+        command = cast(str, case["command"])
+        assert _admission(config, None, command) == case["expect"], command
+
+    upgraded, applied = upgrade_text(text)
+    assert [upgrade.setting for upgrade in applied] == row["upgraded"]
+    table = {
+        entry["setting"]: entry for entry in cast(list[dict[str, str]], POLICY["upgrades"])
+    }
+    expected = text
+    for setting in cast(list[str], row["upgraded"]):
+        assert expected.count(table[setting]["earlier"]) == 1, setting
+        expected = expected.replace(table[setting]["earlier"], table[setting]["current"])
+    assert upgraded == expected
+
+    after = _earlier_config(upgraded)
+    assert missing_defaults_warning(after) == row["warning_after_upgrade"]
+    for case in cast(list[dict[str, object]], row["commands_after_upgrade"]):
+        command = cast(str, case["command"])
+        assert _admission(after, None, command) == case["expect"], command
 
 
 # --- the configuration YAML subset ----------------------------------------------------------------

@@ -9,13 +9,25 @@ from __future__ import annotations
 
 import json
 import os
+import stat
+from pathlib import Path
 
 import pytest
 
 from herdr_run.cli import main
-from herdr_run.config import CONFIG_FILENAMES, KNOWN_KEYS, Config, load_config
+from herdr_run.config import CONFIG_FILENAMES, KNOWN_KEYS, Config, load_config, parse_config
 from herdr_run.errors import EXIT_CONFIG, ConfigError
-from herdr_run.init import config_template, write_config_template
+from herdr_run.init import (
+    UPGRADES,
+    config_template,
+    upgrade_config_file,
+    upgrade_text,
+    write_config_template,
+)
+from herdr_run.yamlcore import core_load
+
+#: Configurations earlier releases wrote, byte for byte; the shared corpus describes each one.
+_EARLIER = Path(__file__).resolve().parents[2] / "rs" / "herdr-run" / "testdata" / "earlier_configs"
 
 
 def test_the_template_carries_every_configuration_key() -> None:
@@ -124,3 +136,194 @@ def test_init_writes_even_when_the_discovered_configuration_is_broken(
     assert main(["init"]) == 0
     assert capsys.readouterr().err == ""
     assert os.path.isfile(os.path.join(nested, ".herdr-run.yaml"))
+
+
+# --- init --upgrade ------------------------------------------------------------------------------
+
+
+def test_every_upgrade_only_adds_the_entries_it_names() -> None:
+    """Each rewrite must say exactly what it adds, and take nothing away."""
+    for upgrade in UPGRADES:
+        top, _, program = upgrade.setting.partition(".")
+
+        def entries(text: str) -> list[str]:
+            document = core_load(text)
+            assert isinstance(document, dict)
+            value = document[top]
+            if program:
+                assert isinstance(value, dict)
+                value = value[program]
+            assert isinstance(value, list)
+            return [str(entry) for entry in value]
+
+        earlier, current = entries(upgrade.earlier), entries(upgrade.current)
+        assert current[: len(earlier)] == earlier, upgrade.setting
+        assert tuple(current[len(earlier) :]) == upgrade.added, upgrade.setting
+        # What the rewrite produces is what this release's init writes for the same setting.
+        assert upgrade.current in config_template(), upgrade.setting
+
+
+@pytest.mark.parametrize("name", sorted(path.name for path in _EARLIER.iterdir()))
+def test_init_upgrade_brings_every_earlier_file_up_to_date(
+    name: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    original = (_EARLIER / name).read_text(encoding="utf-8")
+    target = tmp_path / ".herdr-run.yaml"
+    target.write_text(original, encoding="utf-8")
+    target.chmod(0o640)
+    monkeypatch.chdir(tmp_path)
+
+    # Before: the file loads, says what it leaves out, and leaves `--exec` admitted.
+    assert main(["check", "git push --exec=/tmp/evil origin"]) == 0
+    captured = capsys.readouterr()
+    assert captured.err.startswith(
+        f"herdr-run: WARNING: {target} leaves out built-in deny entries, so they are not "
+        'enforced: deny_anywhere "--exec". To adopt them, run '
+        f"'herdr-run init --upgrade' in {tmp_path} or add them by hand.\n"
+    )
+
+    assert main(["init", "--upgrade"]) == 0
+    captured = capsys.readouterr()
+    assert captured.err == ""
+    assert captured.out.startswith(f"upgraded {target}\n  deny_anywhere: added \"--exec\"\n")
+    assert captured.out.endswith("Every built-in deny entry is in force.\n")
+    upgraded = target.read_text(encoding="utf-8")
+    assert upgraded == upgrade_text(original)[0]
+    # Written in place: the mode is the file's own, not a fresh file's.
+    assert stat.S_IMODE(target.stat().st_mode) == 0o640
+
+    # After: nothing to warn about, and `--exec` refused.
+    assert main(["check", "git push --exec=/tmp/evil origin"]) == 77
+    assert "WARNING" not in capsys.readouterr().err
+
+    # A second upgrade finds nothing to do and writes nothing.
+    before = target.stat().st_mtime_ns
+    assert main(["init", "--upgrade"]) == 0
+    assert capsys.readouterr().out == (
+        f"nothing to rewrite in {target}\nEvery built-in deny entry is in force.\n"
+    )
+    assert target.stat().st_mtime_ns == before
+    assert target.read_text(encoding="utf-8") == upgraded
+
+
+def test_init_upgrade_leaves_an_edited_list_alone_and_says_what_it_lacks(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    original = (_EARLIER / "0.3.0-init-93b44b35.yaml").read_text(encoding="utf-8")
+    edited = original.replace(
+        'deny_anywhere: ["--upload-pack", "--receive-pack"]',
+        'deny_anywhere: ["--receive-pack", "--upload-pack"]',
+    ).replace('git: ["-c", "--config-env", "--exec-path", "--namespace"]', 'git: ["-c"]')
+    (tmp_path / ".herdr-run.yaml").write_text(edited, encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
+
+    assert main(["--json", "init", "--upgrade"]) == 0
+    document = json.loads(capsys.readouterr().out)
+    assert document == {
+        "missing": [
+            {
+                "entries": ["--config-env", "--exec-path", "--namespace"],
+                "setting": "deny_global.git",
+            },
+            {"entries": ["--exec"], "setting": "deny_anywhere"},
+        ],
+        "path": str(tmp_path / ".herdr-run.yaml"),
+        "upgraded": [
+            {
+                "added": ["--super-prefix", "--shallow-file", "--attr-source"],
+                "setting": "value_options.git",
+            }
+        ],
+    }
+    text = (tmp_path / ".herdr-run.yaml").read_text(encoding="utf-8")
+    assert 'deny_anywhere: ["--receive-pack", "--upload-pack"]\n' in text
+    assert '"--super-prefix", "--shallow-file", "--attr-source"]' in text
+
+    assert main(["init", "--upgrade"]) == 0
+    assert capsys.readouterr().out == (
+        f"nothing to rewrite in {tmp_path / '.herdr-run.yaml'}\n"
+        "Still left out, from lists that are not as an earlier herdr-run wrote them; add them by "
+        "hand to adopt them:\n"
+        '  deny_global.git: "--config-env", "--exec-path", "--namespace"\n'
+        '  deny_anywhere: "--exec"\n'
+    )
+
+
+def test_upgrade_text_matches_whole_lines_only() -> None:
+    line = UPGRADES[0].earlier
+    assert upgrade_text("# " + line)[1] == ()
+    assert upgrade_text("x" + line)[1] == ()
+    assert upgrade_text(line.replace("\n", "\r\n"))[1] == ()
+    # A last line without its line feed is still that setting, and still has no line feed after.
+    upgraded, applied = upgrade_text("workspace: w\n" + line.rstrip("\n"))
+    assert applied == (UPGRADES[0],)
+    assert upgraded == "workspace: w\n" + UPGRADES[0].current.rstrip("\n")
+
+
+def test_init_upgrade_works_on_a_yml_and_refuses_when_there_is_no_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    assert main(["init", "--upgrade"]) == EXIT_CONFIG
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err == (
+        "herdr-run: there is no .herdr-run.yaml or .herdr-run.yml in "
+        f"{tmp_path} to upgrade; run 'herdr-run init' to write one\n"
+    )
+    assert not (tmp_path / ".herdr-run.yaml").exists()
+
+    yml = tmp_path / ".herdr-run.yml"
+    yml.write_text(UPGRADES[0].earlier, encoding="utf-8")
+    result = upgrade_config_file(str(tmp_path))
+    assert result.path == str(yml)
+    assert yml.read_text(encoding="utf-8") == UPGRADES[0].current
+    assert not (tmp_path / ".herdr-run.yaml").exists()
+
+
+def test_init_upgrade_refuses_a_file_that_does_not_load(tmp_path: Path) -> None:
+    path = tmp_path / ".herdr-run.yaml"
+    path.write_text(UPGRADES[0].earlier + "allowlist: [git]\n", encoding="utf-8")
+    with pytest.raises(ConfigError, match="unknown key"):
+        upgrade_config_file(str(tmp_path))
+    assert path.read_text(encoding="utf-8") == UPGRADES[0].earlier + "allowlist: [git]\n"
+
+
+def test_init_upgrade_writes_nothing_when_the_rewrite_would_read_differently(
+    tmp_path: Path,
+) -> None:
+    """The earlier lines can appear inside another setting; rewriting them there is refused."""
+    text = "deny_global: {git: [-c],\n" + UPGRADES[0].earlier + "}\n"
+    loaded = parse_config(core_load(text), source_path=None, project_root="/")
+    assert "deny_anywhere" in loaded.deny_global
+    assert upgrade_text(text)[1] == (UPGRADES[0],)
+    path = tmp_path / ".herdr-run.yaml"
+    path.write_text(text, encoding="utf-8")
+    with pytest.raises(ConfigError, match="cannot upgrade it automatically") as caught:
+        upgrade_config_file(str(tmp_path))
+    assert "nothing was written" in str(caught.value)
+    assert path.read_text(encoding="utf-8") == text
+
+
+def test_init_upgrade_keeps_a_symbolic_link(tmp_path: Path) -> None:
+    real = tmp_path / "policy.yaml"
+    real.write_text(UPGRADES[0].earlier, encoding="utf-8")
+    (tmp_path / ".herdr-run.yaml").symlink_to("policy.yaml")
+    upgrade_config_file(str(tmp_path))
+    assert (tmp_path / ".herdr-run.yaml").is_symlink()
+    assert real.read_text(encoding="utf-8") == UPGRADES[0].current
+
+
+def test_force_and_upgrade_cannot_be_combined(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    for argv in (["init", "--force", "--upgrade"], ["init", "--upgrade", "--force"]):
+        assert main(argv) == 2
+        captured = capsys.readouterr()
+        assert captured.out == ""
+        assert captured.err.endswith(
+            "herdr-run: error: init: --force and --upgrade cannot be combined: --force writes a "
+            "fresh file over the existing one, and --upgrade edits the existing one in place\n"
+        )
+    assert not (tmp_path / ".herdr-run.yaml").exists()

@@ -30,6 +30,7 @@ from herdr_run.yamlcore import YamlError, core_load
 
 __all__ = [
     "ALLOW_ANY_PROGRAM",
+    "CARGO_ALWAYS_DENIED",
     "CONFIG_FILENAMES",
     "DEFAULT_MAX_PANES",
     "KNOWN_KEYS",
@@ -37,8 +38,14 @@ __all__ = [
     "MAX_RETENTION_DAYS",
     "MAX_TIMEOUT_SECONDS",
     "Config",
+    "MissingDefault",
+    "describe_missing",
     "find_config_file",
     "load_config",
+    "missing_defaults",
+    "missing_defaults_warning",
+    "parse_config_text",
+    "read_config_file",
     "render_tab_name",
     "type_name",
     "whole_milliseconds",
@@ -112,6 +119,12 @@ _DEFAULT_DENY_GLOBAL: dict[str, tuple[str, ...]] = {
     "cargo": ("--config", "-Z"),
 }
 
+#: Cargo options refused in every argument position whatever ``deny_global`` says, because a
+#: project that opts Cargo in must not be able to configure its way past them. The admission rule
+#: (:func:`herdr_run.allowlist.admit`) adds these to Cargo's ``deny_global`` entries, and
+#: :func:`missing_defaults` therefore never reports them as left out.
+CARGO_ALWAYS_DENIED: tuple[str, ...] = ("--config", "-Z")
+
 #: Per-program subcommand ALLOWLIST. When a program appears here its subcommand MUST be in the
 #: list; anything else -- including no subcommand at all -- is refused. This limits an explicit
 #: ``cargo`` opt-in, but does not make Cargo a no-code-execution boundary: Cargo may invoke ambient
@@ -163,6 +176,12 @@ _DEFAULT_DENY_SUBCOMMAND_OPTION: dict[str, dict[str, tuple[str, ...]]] = {
 #: ``--config-env``, ``--super-prefix`` (removed from Git 2.41, still read by older Gits),
 #: ``--shallow-file``, and ``--attr-source``. ``--exec-path`` takes its value only as
 #: ``--exec-path=PATH`` and is listed for the sake of older configurations; it is denied anyway.
+#:
+#: This table records how each program reads its own command line, which is a fact about the
+#: program and not a policy choice, so a configured ``value_options`` ADDS to it and can never take
+#: an entry away (:func:`_with_builtin_value_options`). Leaving an entry out could only make the
+#: policy misread a command -- and a file written by an older ``herdr-run init`` lists the older,
+#: shorter table, which used to replace this one and so reopened ``git --attr-source HEAD daemon``.
 _DEFAULT_VALUE_OPTIONS: dict[str, tuple[str, ...]] = {
     "git": (
         "-C",
@@ -219,6 +238,7 @@ class Config:
     allow_subcommand: dict[str, tuple[str, ...]] = field(
         default_factory=lambda: dict(_DEFAULT_ALLOW_SUBCOMMAND)
     )
+    #: The built-in table plus whatever the configuration adds; see :data:`_DEFAULT_VALUE_OPTIONS`.
     value_options: dict[str, tuple[str, ...]] = field(
         default_factory=lambda: dict(_DEFAULT_VALUE_OPTIONS)
     )
@@ -534,6 +554,25 @@ def render_tab_name(schema: str, *, agent: str, project: str) -> str:
     return rendered
 
 
+def _with_builtin_value_options(
+    configured: dict[str, tuple[str, ...]],
+) -> dict[str, tuple[str, ...]]:
+    """The built-in value-option table with ``configured`` added to it; nothing is taken away.
+
+    Each program keeps its built-in options first, in their built-in order, followed by the
+    configured ones it did not already have, in the order they were written; a program the table
+    does not know gets its configured options with repeats dropped.
+    """
+    merged = dict(_DEFAULT_VALUE_OPTIONS)
+    for program, options in configured.items():
+        combined = list(merged.get(program, ()))
+        for option in options:
+            if option not in combined:
+                combined.append(option)
+        merged[program] = tuple(combined)
+    return merged
+
+
 def _parse_config(
     document: object, *, source_path: str | None, project_root: str
 ) -> Config:
@@ -589,7 +628,9 @@ def _parse_config(
         elif key == "allow_subcommand":
             config = replace(config, allow_subcommand=_str_tuple_map(raw, where))
         elif key == "value_options":
-            config = replace(config, value_options=_str_tuple_map(raw, where))
+            config = replace(
+                config, value_options=_with_builtin_value_options(_str_tuple_map(raw, where))
+            )
         elif key == "spool_dir":
             config = replace(config, spool_dir=_text(raw, where))
         elif key == "timeout_seconds":
@@ -664,6 +705,11 @@ def load_config(*, explicit_path: str | None, start_dir: str) -> Config:
         return Config(source_path=None, project_root=start)
 
     project_root = os.path.dirname(path) or "/"
+    return parse_config_text(read_config_file(path), source_path=path, project_root=project_root)
+
+
+def read_config_file(path: str) -> str:
+    """The text of the configuration file at ``path``, which must be UTF-8."""
     try:
         with open(path, "rb") as handle:
             payload = handle.read()
@@ -672,15 +718,119 @@ def load_config(*, explicit_path: str | None, start_dir: str) -> Config:
             f"cannot read config file {display(path)}: {os_error_text(exc)}"
         ) from exc
     try:
-        text = payload.decode("utf-8")
+        return payload.decode("utf-8")
     except UnicodeDecodeError as exc:
         raise ConfigError(
             f"cannot read config file {display(path)}: the file is not valid UTF-8"
         ) from exc
 
+
+def parse_config_text(text: str, *, source_path: str, project_root: str) -> Config:
+    """Read configuration text as the file ``source_path`` holds it, and validate it."""
     try:
         document = core_load(text)
     except YamlError as exc:
-        raise ConfigError(f"{display(path)}: invalid YAML: {exc}") from exc
+        raise ConfigError(f"{display(source_path)}: invalid YAML: {exc}") from exc
+    return parse_config(document, source_path=source_path, project_root=project_root)
 
-    return parse_config(document, source_path=path, project_root=project_root)
+
+@dataclass(frozen=True)
+class MissingDefault:
+    """Built-in deny entries that one configured list leaves out, and so does not enforce."""
+
+    #: The list, as a dotted path: ``deny_anywhere``, ``deny_global.git``,
+    #: ``deny_subcommand_option.git.clone``.
+    setting: str
+    #: The entries it leaves out, in built-in order.
+    entries: tuple[str, ...]
+
+
+def missing_defaults(config: Config) -> tuple[MissingDefault, ...]:
+    """Every built-in deny entry the configuration's deny lists leave out.
+
+    A configured deny list REPLACES the built-in one, so a list written before an entry was added
+    to the built-in defaults -- by an older ``herdr-run init``, say -- goes on without it, and
+    nothing about the file says so. This names each such entry, so it can be said out loud.
+
+    Entries for a program the allowlist can never admit are not reported, because they could never
+    apply; nor are Cargo's :data:`CARGO_ALWAYS_DENIED`, which apply whatever the file says. Lists
+    are reported in :data:`KNOWN_KEYS` order, programs and subcommands in sorted order, and entries
+    in built-in order.
+    """
+    defaults = Config()
+    found: list[MissingDefault] = []
+
+    def admissible(program: str) -> bool:
+        return config.allows_any_program() or program in config.allow
+
+    def compare(
+        setting: str,
+        built_in: tuple[str, ...],
+        configured: tuple[str, ...],
+        exempt: tuple[str, ...] = (),
+    ) -> None:
+        absent = tuple(
+            entry for entry in built_in if entry not in configured and entry not in exempt
+        )
+        if absent:
+            found.append(MissingDefault(setting, absent))
+
+    for program in sorted(defaults.deny_global):
+        if admissible(program):
+            compare(
+                f"deny_global.{program}",
+                defaults.deny_global[program],
+                config.deny_global.get(program, ()),
+                CARGO_ALWAYS_DENIED if program == "cargo" else (),
+            )
+    for program in sorted(defaults.deny_subcommand):
+        if admissible(program):
+            compare(
+                f"deny_subcommand.{program}",
+                defaults.deny_subcommand[program],
+                config.deny_subcommand.get(program, ()),
+            )
+    compare("deny_anywhere", defaults.deny_anywhere, config.deny_anywhere)
+    for program in sorted(defaults.deny_subcommand_option):
+        if not admissible(program):
+            continue
+        configured = config.deny_subcommand_option.get(program, {})
+        for subcommand in sorted(defaults.deny_subcommand_option[program]):
+            compare(
+                f"deny_subcommand_option.{program}.{subcommand}",
+                defaults.deny_subcommand_option[program][subcommand],
+                configured.get(subcommand, ()),
+            )
+    return tuple(found)
+
+
+def describe_missing(missing: tuple[MissingDefault, ...]) -> str:
+    """``deny_anywhere "--exec"; deny_global.git "-c", "--namespace"``: one line, every entry."""
+    return "; ".join(
+        f"{item.setting} {', '.join(quote(entry) for entry in item.entries)}" for item in missing
+    )
+
+
+def missing_defaults_warning(config: Config) -> str | None:
+    """The one warning line every subcommand that reads ``config`` prints, or ``None``.
+
+    The line is the same every time for the same file, so it can be recognised. It names the file,
+    every left-out entry, and the remedy: ``herdr-run init --upgrade`` run where the file is, when
+    the file has a name ``init`` works on, and otherwise an edit by hand.
+    """
+    missing = missing_defaults(config)
+    if not missing:
+        return None
+    source = config.source_path
+    shown = display(source) if source is not None else "<config>"
+    if source is not None and os.path.basename(source) in CONFIG_FILENAMES:
+        remedy = (
+            f"run 'herdr-run init --upgrade' in {display(config.project_root)} "
+            "or add them by hand"
+        )
+    else:
+        remedy = "add them to the file by hand"
+    return (
+        f"herdr-run: WARNING: {shown} leaves out built-in deny entries, so they are not "
+        f"enforced: {describe_missing(missing)}. To adopt them, {remedy}."
+    )

@@ -28,7 +28,7 @@ import pwd
 import shlex
 from dataclasses import dataclass
 
-from herdr_run.config import Config
+from herdr_run.config import CARGO_ALWAYS_DENIED, Config
 from herdr_run.errors import ConfigError, Refused
 from herdr_run.textfmt import quote
 
@@ -281,7 +281,7 @@ def admit(command: str, config: Config, *, home: object = _FROM_ENVIRONMENT) -> 
     # before finding the subcommand so `cargo fetch --config ...` and attached/clustered `-Z` forms
     # cannot bypass the same checks that reject `cargo --config ... fetch`.
     if program == "cargo":
-        cargo_denied = tuple(dict.fromkeys((*deny_global, "--config", "-Z")))
+        cargo_denied = tuple(dict.fromkeys((*deny_global, *CARGO_ALWAYS_DENIED)))
         for token in args:
             denied = next(
                 (option for option in cargo_denied if _matches_denied_option(token, option)), None

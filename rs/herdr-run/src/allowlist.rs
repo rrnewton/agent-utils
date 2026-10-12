@@ -8,7 +8,7 @@
 
 use std::ffi::{CStr, CString, OsStr, OsString};
 
-use crate::config::Config;
+use crate::config::{Config, CARGO_ALWAYS_DENIED};
 use crate::error::{HerdrRunError, Result};
 use crate::textfmt::quote;
 
@@ -241,7 +241,7 @@ pub fn admit_with_home(command: &str, config: &Config, home: Option<&OsStr>) -> 
         let cargo_denied = deny_global
             .iter()
             .map(String::as_str)
-            .chain(["--config", "-Z"]);
+            .chain(CARGO_ALWAYS_DENIED);
         for token in args {
             if let Some(denied) = cargo_denied
                 .clone()
@@ -562,7 +562,7 @@ pub(crate) fn quote_word(token: &str) -> String {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     fn current_account() -> (String, String) {
@@ -965,25 +965,39 @@ mod tests {
                 Err(message) => serde_json::json!({ "config_error": message }),
                 Ok(config) => {
                     let home = case["home"].as_str().map(OsStr::new);
-                    match admit_with_home(case["command"].as_str().unwrap(), &config, home) {
-                        Ok(admission) => serde_json::json!({ "allowed": {
-                            "program": admission.program,
-                            "subcommand": admission.subcommand,
-                            "rendered": admission.rendered(),
-                        }}),
-                        Err(error) => match error.kind() {
-                            crate::error::ErrorKind::Refused => {
-                                serde_json::json!({ "refused": error.message() })
-                            }
-                            crate::error::ErrorKind::Config => {
-                                serde_json::json!({ "config_error": error.message() })
-                            }
-                            other => panic!("{name}: unexpected {other:?}: {error}"),
-                        },
+                    let mut outcome =
+                        golden_admission(&config, home, case["command"].as_str().unwrap());
+                    if let Some(warning) = crate::config::missing_defaults_warning(&config) {
+                        outcome["warning"] = serde_json::Value::String(warning);
                     }
+                    outcome
                 }
             };
             assert_eq!(outcome, case["expect"], "{name}");
+        }
+    }
+
+    /// The admission, refusal, or configuration error one command meets, as the corpus writes it.
+    pub(crate) fn golden_admission(
+        config: &Config,
+        home: Option<&OsStr>,
+        command: &str,
+    ) -> serde_json::Value {
+        match admit_with_home(command, config, home) {
+            Ok(admission) => serde_json::json!({ "allowed": {
+                "program": admission.program,
+                "subcommand": admission.subcommand,
+                "rendered": admission.rendered(),
+            }}),
+            Err(error) => match error.kind() {
+                crate::error::ErrorKind::Refused => {
+                    serde_json::json!({ "refused": error.message() })
+                }
+                crate::error::ErrorKind::Config => {
+                    serde_json::json!({ "config_error": error.message() })
+                }
+                other => panic!("{command}: unexpected {other:?}: {error}"),
+            },
         }
     }
 }

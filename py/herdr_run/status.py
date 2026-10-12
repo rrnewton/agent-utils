@@ -13,7 +13,7 @@ from dataclasses import dataclass
 from typing import Protocol
 
 from herdr_run.client import Pane
-from herdr_run.config import ALLOW_ANY_PROGRAM, Config
+from herdr_run.config import ALLOW_ANY_PROGRAM, Config, describe_missing, missing_defaults
 from herdr_run.errors import HerdrRunError
 from herdr_run.textfmt import display, quote
 
@@ -118,6 +118,14 @@ def _allow_detail(config: Config) -> str:
     return ", ".join(display(name) for name in config.allow)
 
 
+def _deny_detail(config: Config) -> str:
+    """Whether every built-in deny entry is in force, or which ones the file leaves out."""
+    missing = missing_defaults(config)
+    if not missing:
+        return "every built-in entry is in force"
+    return f"leaves out built-in {describe_missing(missing)}"
+
+
 def _list_or_none(values: tuple[str, ...]) -> str:
     return ", ".join(display(value) for value in values) if values else "(none)"
 
@@ -140,6 +148,7 @@ def status_text(config: Config, agent: str, tab_label: str, session: Session) ->
         "  policy\n"
         f"    allow         {_allow_detail(config)}\n"
         f"    prefixes      {_list_or_none(config.prefixes)}\n"
+        f"    deny lists    {_deny_detail(config)}\n"
         "\n"
         "  session\n"
         f"    agent         {display(agent)}\n"
@@ -163,6 +172,10 @@ def status_document(
         "allow": list(config.allow),
         "allow_any_program": config.allows_any_program(),
         "config_file": config.source_path,
+        "missing_defaults": [
+            {"entries": list(item.entries), "setting": item.setting}
+            for item in missing_defaults(config)
+        ],
         "herdr": {
             "detail": _herdr_detail(session),
             "reachable": session.state != "unreachable",

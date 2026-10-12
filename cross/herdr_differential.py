@@ -655,7 +655,7 @@ _LOCAL_OPTIONS: dict[str, frozenset[str]] = {
     ),
     "check": frozenset({"--help"}),
     "config": frozenset({"--help"}),
-    "init": frozenset({"--help", "--force"}),
+    "init": frozenset({"--help", "--force", "--upgrade"}),
     "status": frozenset({"--help"}),
     "target": frozenset({"--help", "--no-cache"}),
     "reap": frozenset({"--help"}),
@@ -2553,6 +2553,173 @@ def _init(harness: Harness, report: Report) -> None:
     report.exact("init/force-overwrites", python, rust, expected_rc=0)
 
 
+#: Configurations earlier releases wrote, byte for byte; ``policy_cases.json`` describes each one.
+_EARLIER_CONFIGS = REPO_ROOT / "rs" / "herdr-run" / "testdata" / "earlier_configs"
+
+#: The one ``deny_anywhere`` line every earlier release wrote, which this release extends.
+_EARLIER_DENY_ANYWHERE = 'deny_anywhere: ["--upload-pack", "--receive-pack"]\n'
+
+
+def _upgrades(harness: Harness, report: Report) -> None:
+    """A configuration an earlier release wrote reads, warns, and upgrades the same in both.
+
+    A configured deny list replaces the built-in one, so every file an earlier ``init`` wrote, and
+    every copy of an earlier user guide's example, leaves out ``--exec``. Both editions must warn
+    about it in the same words, apply git's built-in value options regardless, and rewrite the file
+    with ``init --upgrade`` to the same bytes.
+    """
+    fixtures = sorted(_EARLIER_CONFIGS.iterdir())
+    report.require(
+        "upgrade/fixtures-present",
+        len(fixtures) >= 6,
+        f"expected the earlier configurations under {_EARLIER_CONFIGS}, found {fixtures}",
+    )
+    for fixture in fixtures:
+        label = fixture.stem
+        case = harness.case(
+            f"upgrade-{label}", {".herdr-run.yaml": fixture.read_text(encoding="utf-8")}
+        )
+        for name, command, expected in (
+            ("attr-source-daemon", "git --attr-source HEAD daemon", 77),
+            ("shallow-file-daemon", "git --shallow-file x daemon", 77),
+            ("push-exec", "git push --exec=/tmp/evil origin main", 0),
+        ):
+            python, rust = harness.invoke(case, ("check", command))
+            report.exact(f"upgrade/{label}/before/{name}", python, rust, expected_rc=expected)
+        report.require(
+            f"upgrade/{label}/before/warns",
+            python.stderr.startswith(
+                "herdr-run: WARNING: <ROOT>/.herdr-run.yaml leaves out built-in deny entries, so "
+                'they are not enforced: deny_anywhere "--exec". To adopt them, run '
+                "'herdr-run init --upgrade' in <ROOT> or add them by hand.\n"
+            ),
+            f"an earlier configuration did not draw the warning: {_describe(python)}",
+        )
+        python, rust = harness.invoke(case, ("--agent", "fixture-agent", "config"))
+        report.exact(f"upgrade/{label}/before/config", python, rust, expected_rc=0)
+
+        python, rust = harness.invoke(case, ("init", "--upgrade"))
+        report.exact(f"upgrade/{label}/upgrade", python, rust, expected_rc=0)
+        report.exact(
+            f"upgrade/{label}/upgraded-bytes",
+            _read_normalized(case.python_root / ".herdr-run.yaml", case.python_root),
+            _read_normalized(case.rust_root / ".herdr-run.yaml", case.rust_root),
+            expected_rc=0,
+        )
+        report.exact(
+            f"upgrade/{label}/upgraded-mode",
+            _modes(case.python_root, (".herdr-run.yaml",)),
+            _modes(case.rust_root, (".herdr-run.yaml",)),
+            expected_rc=0,
+        )
+        python, rust = harness.invoke(case, ("check", "git push --exec=/tmp/evil origin main"))
+        report.exact(f"upgrade/{label}/after/push-exec", python, rust, expected_rc=77)
+        report.require(
+            f"upgrade/{label}/after/no-warning",
+            "WARNING" not in python.stderr,
+            f"an upgraded configuration still drew a warning: {_describe(python)}",
+        )
+        python, rust = harness.invoke(case, ("--json", "init", "--upgrade"))
+        report.exact(f"upgrade/{label}/again-json", python, rust, expected_rc=0)
+
+    # A list somebody edited is left alone, and what it lacks is listed instead.
+    edited = (_EARLIER_CONFIGS / "0.3.0-init-93b44b35.yaml").read_text(encoding="utf-8")
+    edited = edited.replace(
+        _EARLIER_DENY_ANYWHERE, 'deny_anywhere: ["--receive-pack", "--upload-pack"]\n'
+    ).replace('git: ["-c", "--config-env", "--exec-path", "--namespace"]', 'git: ["-c"]')
+    for label, json_flag in (("text", ()), ("json", ("--json",))):
+        case = harness.case(f"upgrade-edited-{label}", {".herdr-run.yaml": edited})
+        python, rust = harness.invoke(case, (*json_flag, "init", "--upgrade"))
+        report.exact(f"upgrade/edited/{label}", python, rust, expected_rc=0)
+        report.exact(
+            f"upgrade/edited/{label}/bytes",
+            _read_normalized(case.python_root / ".herdr-run.yaml", case.python_root),
+            _read_normalized(case.rust_root / ".herdr-run.yaml", case.rust_root),
+            expected_rc=0,
+        )
+
+    # What status says about it, in a workspace no real session carries.
+    narrowed = f"workspace: {_REAP_WORKSPACE}\n{_EARLIER_DENY_ANYWHERE}deny_global:\n  git: [-c]\n"
+    case = harness.case("upgrade-status", {".herdr-run.yaml": narrowed})
+    for label, args in (
+        ("text", ("--agent", "fixture-agent", "status")),
+        ("json", ("--json", "--agent", "fixture-agent", "status")),
+    ):
+        python, rust = harness.invoke(case, args)
+        report.exact(f"upgrade/status/{label}", python, rust, expected_rc=0)
+    report.require(
+        "upgrade/status/names-the-left-out-entries",
+        '"setting": "deny_global.git"' in python.stdout and '"--exec"' in python.stdout,
+        f"status JSON did not list the left-out entries: {_describe(python)}",
+    )
+
+    # A file `init --upgrade` cannot work on gets a warning that offers only a hand edit.
+    case = harness.case("upgrade-other-name", {"conf/settings.yaml": _EARLIER_DENY_ANYWHERE})
+    python, rust = harness.invoke(case, ("--config", "conf/settings.yaml", "check", "git status"))
+    report.exact("upgrade/other-name-warning", python, rust, expected_rc=0)
+
+    # git's value options are git's syntax: a configuration can add to them, never take one away.
+    for label, config, command, expected in (
+        ("seven-git-entries", "value_options:\n  git: [-C]\n", "git --attr-source HEAD daemon", 77),
+        ("emptied", "value_options: {}\n", "git -C /tmp daemon", 77),
+        ("added", "value_options:\n  git: [--frobnicate]\n", "git --frobnicate daemon log", 0),
+    ):
+        case = harness.case(f"upgrade-value-options-{label}", {".herdr-run.yaml": config})
+        python, rust = harness.invoke(case, ("check", command))
+        report.exact(f"upgrade/value-options/{label}", python, rust, expected_rc=expected)
+        python, rust = harness.invoke(case, ("config",))
+        report.exact(f"upgrade/value-options/{label}/config", python, rust, expected_rc=0)
+
+    # The ways `init --upgrade` refuses, each the same in both and each writing nothing.
+    case = harness.case("upgrade-no-file")
+    python, rust = harness.invoke(case, ("init", "--upgrade"))
+    report.exact("upgrade/no-file", python, rust, expected_rc=78)
+    report.require(
+        "upgrade/no-file-writes-nothing",
+        not (case.python_root / ".herdr-run.yaml").exists()
+        and not (case.rust_root / ".herdr-run.yaml").exists(),
+        "a refused 'init --upgrade' wrote a configuration file",
+    )
+    case = harness.case("upgrade-yml", {".herdr-run.yml": _EARLIER_DENY_ANYWHERE})
+    python, rust = harness.invoke(case, ("init", "--upgrade"))
+    report.exact("upgrade/yml", python, rust, expected_rc=0)
+    report.exact(
+        "upgrade/yml-bytes",
+        _read_normalized(case.python_root / ".herdr-run.yml", case.python_root),
+        _read_normalized(case.rust_root / ".herdr-run.yml", case.rust_root),
+        expected_rc=0,
+    )
+    refusals: tuple[tuple[str, tuple[str, ...], int], ...] = (
+        ("force-and-upgrade", ("init", "--force", "--upgrade"), 2),
+        ("config-and-upgrade", ("--config", "x.yaml", "init", "--upgrade"), 2),
+        ("agent-and-upgrade", ("--agent", "a", "init", "--upgrade"), 2),
+        ("misplaced-upgrade", ("--upgrade", "init"), 2),
+    )
+    for label, refused_args, expected in refusals:
+        case = harness.case(f"upgrade-refused-{label}", {".herdr-run.yaml": _EARLIER_DENY_ANYWHERE})
+        python, rust = harness.invoke(case, refused_args)
+        report.exact(f"upgrade/refused/{label}", python, rust, expected_rc=expected)
+        report.exact(
+            f"upgrade/refused/{label}/untouched",
+            _read_normalized(case.python_root / ".herdr-run.yaml", case.python_root),
+            _read_normalized(case.rust_root / ".herdr-run.yaml", case.rust_root),
+            expected_rc=0,
+        )
+    for label, text in (
+        ("does-not-load", _EARLIER_DENY_ANYWHERE + "allowlist: [git]\n"),
+        ("reads-differently", "deny_global: {git: [-c],\n" + _EARLIER_DENY_ANYWHERE + "}\n"),
+    ):
+        case = harness.case(f"upgrade-refused-{label}", {".herdr-run.yaml": text})
+        python, rust = harness.invoke(case, ("init", "--upgrade"))
+        report.exact(f"upgrade/refused/{label}", python, rust, expected_rc=78)
+        report.require(
+            f"upgrade/refused/{label}/untouched",
+            (case.python_root / ".herdr-run.yaml").read_text(encoding="utf-8") == text
+            and (case.rust_root / ".herdr-run.yaml").read_text(encoding="utf-8") == text,
+            "a refused 'init --upgrade' still changed the file",
+        )
+
+
 def _deleted_cwd(harness: Harness, report: Report) -> None:
     """A deleted working directory reaches both tools, and both say the same about it."""
 
@@ -3825,6 +3992,7 @@ def build_report(
         _spool(harness, report)
         _net_doctor(harness, report)
         _init(harness, report)
+        _upgrades(harness, report)
         _status(harness, report)
         _documentation(harness, report)
         _reap(harness, report)

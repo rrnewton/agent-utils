@@ -147,6 +147,7 @@ def test_the_report_names_the_configuration_the_policy_and_the_session() -> None
         "    spool dir     .herdr-run\n",
         "    allow         git, gh\n",
         "    prefixes      with-proxy\n",
+        "    deny lists    every built-in entry is in force\n",
         "    agent         kvm\n",
         "    workspace     agent-cmds\n",
         "    tab label     kvm (not created yet)\n",
@@ -169,6 +170,26 @@ def test_the_report_names_the_configuration_the_policy_and_the_session() -> None
         "server_running": True,
     }
     assert document["allow_any_program"] is False
+    assert document["missing_defaults"] == []
+
+
+def test_a_deny_list_that_leaves_out_built_in_entries_is_reported() -> None:
+    """A file written before an entry joined the built-in defaults does not enforce it; say so."""
+    config = Config(
+        source_path="/project/.herdr-run.yaml",
+        project_root="/project",
+        deny_anywhere=("--upload-pack", "--receive-pack"),
+        deny_global={"git": ("-c",), "gh": (), "cargo": ()},
+    )
+    session = Session("not-running")
+    assert (
+        '    deny lists    leaves out built-in deny_global.git "--config-env", "--exec-path", '
+        '"--namespace"; deny_anywhere "--exec"\n'
+    ) in status_text(config, "kvm", "kvm", session)
+    assert status_document(config, "kvm", "kvm", session)["missing_defaults"] == [
+        {"entries": ["--config-env", "--exec-path", "--namespace"], "setting": "deny_global.git"},
+        {"entries": ["--exec"], "setting": "deny_anywhere"},
+    ]
 
 
 def test_an_unreachable_herdr_is_said_plainly_and_leaves_the_counts_unknown() -> None:
