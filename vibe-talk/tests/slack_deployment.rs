@@ -232,5 +232,9 @@ async fn clearing_unread_in_slack_is_offered_only_when_the_deployment_turns_it_o
     assert_eq!(view["provider_name"], "Slack");
     assert_eq!(view["supported"], true);
     assert_eq!(view["mode"], "dry_run");
-    assert_eq!(fake.calls("conversations.mark"), 0, "a dry run marks nothing");
+    assert_eq!(
+        fake.calls("conversations.mark"),
+        0,
+        "a dry run marks nothing"
+    );
 }

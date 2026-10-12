@@ -83,7 +83,10 @@ async fn it_is_off_unless_the_deployment_turns_it_on_and_then_asks_slack_nothing
         UpstreamClearResult::Unavailable,
         "the loop stops rather than retrying"
     );
-    assert!(fake.with(|state| state.requests.is_empty()), "Slack was asked");
+    assert!(
+        fake.with(|state| state.requests.is_empty()),
+        "Slack was asked"
+    );
     assert!(fake.clearing_client().supports_upstream_clear());
 }
 
@@ -208,7 +211,10 @@ async fn a_channel_narrowed_to_one_thread_is_refused_before_slack_is_asked() {
         .expect_err("a thread cannot be cleared");
     let reason = refusal(&error);
     assert!(reason.contains("one thread"), "{reason}");
-    assert!(reason.contains("no way to mark one thread read"), "{reason}");
+    assert!(
+        reason.contains("no way to mark one thread read"),
+        "{reason}"
+    );
     assert_eq!(classify(&Err(error)), UpstreamClearResult::Unavailable);
     assert!(fake.with(|state| state.requests.is_empty()));
 }
@@ -254,10 +260,7 @@ async fn refusals_no_retry_can_fix_stop_the_loop_with_a_reason() {
             "{method} {code}: {}",
             refusal(error)
         );
-        assert!(
-            error.to_string().starts_with("Slack refused: "),
-            "{error}"
-        );
+        assert!(error.to_string().starts_with("Slack refused: "), "{error}");
         assert_eq!(
             classify(&answer),
             UpstreamClearResult::Unavailable,
@@ -271,9 +274,10 @@ async fn refusals_no_retry_can_fix_stop_the_loop_with_a_reason() {
 async fn a_passing_failure_is_retried_by_the_loop_and_a_rate_limit_is_not_waited_out_here() {
     let fake = fake_with_cursor(Some(ts(10, 0))).await;
     fake.with(|state| {
-        state
-            .fail
-            .insert("conversations.mark".to_owned(), "outcome_unknown".to_owned());
+        state.fail.insert(
+            "conversations.mark".to_owned(),
+            "outcome_unknown".to_owned(),
+        );
     });
     let answer = clear(&fake.clearing_client(), &ts(40, 0), false).await;
     assert_eq!(classify(&answer), UpstreamClearResult::Failed, "{answer:?}");

@@ -166,11 +166,13 @@ fn refusal(method: &str, error: ChatError) -> ChatError {
             "the Slack bridge does not offer {method} (it answered unknown_method), so it needs \
              updating before this channel can be cleared"
         ),
-        "missing_scope" => format!(
+        "missing_scope" => {
+            format!(
             "the Slack token lacks a scope {method} needs{}; marking read takes channels:write, \
              groups:write, im:write or mpim:write, by the conversation's kind",
             needed.map(|scope| format!(" ({scope})")).unwrap_or_default()
-        ),
+        )
+        }
         "not_in_channel" => {
             "the Slack account is not a member of this conversation (not_in_channel)".to_owned()
         }

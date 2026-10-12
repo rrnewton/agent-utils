@@ -854,7 +854,8 @@ link, and the channel browser.
 
    `*:history` reads messages, `*:read` lets the channel browser and registration see
    conversations, `users:read` turns user ids into names, and `chat:write` posts. Leave out
-   `chat:write` for a read-only deployment.
+   `chat:write` for a read-only deployment. Add `channels:write groups:write im:write mpim:write`
+   as **User Token Scopes** only to [clear unread in Slack](#clearing-unread-in-slack).
 3. **Install to Workspace** and copy the token.
 
 **Bot or user token.** A bot token (`xoxb-…`) posts as the app and reads only conversations the
@@ -878,6 +879,7 @@ channel_registration = true          # accept Slack links in "Add channel"
 registered_channels_writable = false # whether channels added that way may be posted to
 channel_discovery = true             # offer the channel browser
 live_poll_seconds = 30               # 0 is off; see "Live push"
+upstream_clear = false               # offer "Clear unread in Slack" in Settings; user token only
 
 [[channels]]
 id = "C0123ABCD"
@@ -937,7 +939,10 @@ group-mention markup is rewritten into the markdown the rest of the app reads.
   missed, newer creates — including bot posts — and periodic reconciliation covers a stretch with
   no emitted hint. Neither forward path detects an edit or deletion of an already-cursored
   message; change hints do not imply otherwise.
-* **No upstream read marks.** What you have read is vibe-talk's own record, as on Discord.
+* **Read state.** What you have read is vibe-talk's own record, as on Discord, and there is no
+  "Mark read in Slack" on a message. With `upstream_clear` on, Settings can clear a channel's unread
+  state in Slack as vibe-talk receives its messages, but never a thread's; see [Clearing unread in
+  Slack](#clearing-unread-in-slack).
 * **Bounded reads.** A page Slack (or a bridge) returns may hold fewer messages than were asked
   for; reads follow the cursor and stop at a fixed page budget. A walk never skips a message to
   stay inside that budget: it returns a shorter page, or none, and the next read continues from
@@ -948,6 +953,48 @@ group-mention markup is rewritten into the markdown the rest of the app reads.
   that the request fails with a message that names the limit. An author's name never waits: it
   falls back to the user id.
 
+### Clearing unread in Slack
+
+`#258 slack-clear-unread`. vibe-talk mostly reads channels where coding agents post updates, and in
+Slack's own client those updates bury the messages from people. With `upstream_clear = true` on the
+Slack provider (off by default), Settings offers **Clear unread in Slack** for each of its channels:
+the per-channel off, dry run or on switch, its timing, retries, log lines and undo described under
+[Local read state is ours; upstream read state is an optional provider
+capability](#local-read-state-is-ours-upstream-read-state-is-an-optional-provider-capability). This
+is what one push does at Slack:
+
+* **It reads the cursor first.** `conversations.info` reports `last_read`, the account's read cursor
+  in the conversation. A message at or before it is reported as already read and nothing is
+  written; a newer one is marked with `conversations.mark` at exactly that message's `ts`. A dry run
+  only reads.
+* **Never backwards.** Slack moves the cursor wherever it is told, backwards too, so that comparison
+  is the guard. A conversation whose `last_read` Slack (or a bridge) does not report is refused
+  rather than marked blind, and so is one the account is not a member of.
+* **Thread replies stay unread in Slack; only the channel is cleared.** A thread you follow keeps a
+  read cursor of its own, which `conversations.mark` does not move, and no Web API method open to an
+  OAuth token moves it: the one that does, `subscriptions.thread.mark`, is limited to the browser's
+  own session tokens. So replies inside threads stay unread in Slack's Threads view, and a channel
+  narrowed to one thread (`C…~ts`) is refused outright, because marking its conversation would also
+  clear messages vibe-talk never received.
+* **Reading and marking are two calls.** Slack has no compare-and-set. If you read further in Slack
+  in the second or two between them, the mark moves your cursor back to the message vibe-talk
+  pushed, and what you read in that moment shows as unread again. It heals by itself: every message
+  vibe-talk receives in the channel is pushed in its turn, so the next push marks those messages
+  read again. Re-reading after the mark would not help, because a re-read cannot tell that move from
+  the push's own.
+* **A refusal stops it for the channel.** `unknown_method` (a bridge without `conversations.mark`),
+  `missing_scope`, `not_in_channel`, `not_allowed_token_type`, `channel_not_found`,
+  `restricted_action` and the other permission errors stop pushes for that channel until the setting
+  is saved again, and Settings says why. Anything else, a rate limit included, is retried with the
+  usual growing wait; a rate limit is never waited out inside a push, so it cannot hold up the other
+  channels.
+* **A user token.** It moves the token's own cursor: with a user token that is yours, and it needs
+  `channels:write`, `groups:write`, `im:write` or `mpim:write` by the conversation's kind. With a bot
+  token it would move the bot's cursor, which nobody sees.
+* **Instants.** The log line's and Settings' `previous` and `target` are RFC 3339 instants with
+  microseconds, the same instant as Slack's `ts`: `2026-10-02T23:27:54.800199Z` is
+  `1790983674.800199`, which is what a manual undo in Slack's tools needs.
+
 ### A compatible bridge
 
 `api_base` may point at anything that implements exactly these Web API methods, as form-encoded
@@ -956,12 +1003,13 @@ group-mention markup is rewritten into the markdown the rest of the app reads.
 | Method | Parameters used |
 |---|---|
 | `auth.test` | — |
-| `conversations.info` | `channel` |
+| `conversations.info` | `channel`; with `upstream_clear` on, its `channel` must carry `last_read` |
 | `conversations.history` | `channel`, `limit`, `cursor`, `oldest`, `latest`, `inclusive` |
 | `conversations.replies` | `channel`, `ts`, `limit`, `cursor`, `oldest`, `latest`, `inclusive` |
 | `chat.postMessage` | `channel`, `text`, `thread_ts` |
 | `users.info` | `user` |
 | `users.conversations` | `types`, `limit`, `cursor`, `exclude_archived` |
+| `conversations.mark` | `channel`, `ts`; called only with `upstream_clear` on, and answering `{ok:true}` |
 
 A bridge may cap any page below the `limit` asked for, as long as `has_more` and
 `response_metadata.next_cursor` say so.
@@ -1447,7 +1495,7 @@ or `slack`), `name` (display name; defaults to `Discord` or `Slack`), `api_base`
 `owner_user_id`, `request_timeout_seconds` (default `20`, range `1`–`120`), `live_poll_seconds`
 (default `0`, off; at least `5`), and `channel_registration`. Discord-protocol providers also take
 `thread_api`, `upstream_read_marks` and `markup`, with the same meaning as in `[discord]`. Slack providers
-also take `registered_channels_writable` and `channel_discovery`; see [Slack](#slack). A key that
+also take `registered_channels_writable`, `channel_discovery` and `upstream_clear`; see [Slack](#slack). A key that
 does not apply to the provider's kind is refused by name.
 
 How a deployment with several providers behaves:
