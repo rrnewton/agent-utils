@@ -38203,9 +38203,12 @@ test("Ctrl+\\ AND Cmd+\\ turn two columns on and off like the layout button, and
   }
 });
 
-/** The channel of `threadData`, on a server with a change record, read in All and then in two columns. */
-async function twoColumnServer(arrange = null) {
-  const page = newPage();
+/**
+ * The channel of `threadData`, on a server with a change record, read in All and then in two columns.
+ * `script` is web/voice.js, or a copy broken on purpose for a negative control.
+ */
+async function twoColumnServer(arrange = null, script = SCRIPT) {
+  const page = newPage(new Map(), script);
   const data = threadData();
   page.threadingSupported = true;
   page.threads = data.threads;
@@ -38887,6 +38890,39 @@ test("`#231 two-column-polish`: the right column is one named region, called wha
   await page.el("side-close").click();
   await page.settle();
   assert.equal(region.getAttribute("aria-label"), "Threads", "the X left the region naming a thread it no longer shows");
+});
+
+const THREAD_DIRECTORY_REFRESH_MS = sourceConstant("THREAD_DIRECTORY_REFRESH_MS");
+
+test("`#231 two-column-polish` x `#226 page-energy-profile`: with the cards up, a refresh that brings nothing draws nothing, in the cards as in Main", async () => {
+  /** A poll with the cards up, late enough that the thread list is read again, which brings nothing. */
+  const quietPoll = async (script) => {
+    const { page, server } = await twoColumnServer(null, script);
+    assert.equal(page.el("side-list").hidden, false, "the cards are not up");
+    // The poll's first round reads Main as a delta from then on; this is the round under test.
+    await pollOnce(page);
+    page.setClock(page.clock() + THREAD_DIRECTORY_REFRESH_MS + 1000);
+    const cards = [...page.el("side-cards").children];
+    const rows = [...page.el("discord-log").children];
+    const made = page.createdTags.length;
+    const reads = server.reads.length;
+    await pollOnce(page);
+    const views = server.reads.slice(reads).map((read) => read.view).sort();
+    assert.deepStrictEqual(views, ["main", "threads"], `the poll did not read Main and the thread list: ${JSON.stringify(views)}`);
+    return { page, cards, rows, made };
+  };
+  const { page, cards, rows, made } = await quietPoll(SCRIPT);
+  assert.ok(cards.length > 0);
+  assert.equal(builtSince(page, made, "li"), 0, "a refresh that brought nothing built rows or cards");
+  assert.equal(builtSince(page, made, "button"), 0, "a refresh that brought nothing built controls");
+  assert.ok(page.el("side-cards").children.length === cards.length &&
+    page.el("side-cards").children.every((li, at) => li === cards[at]), "the cards were replaced");
+  assert.ok(page.el("discord-log").children.every((li, at) => li === rows[at]), "Main's rows were replaced");
+  // The control: the cards redrawn on every pass, as they were before they kept what they were drawn
+  // from. The same refresh has to build them again, or the check above could not see it.
+  const control = await quietPoll(brokenScript("  if (signature !== sideCardsDrawn) {", "  if (true) {"));
+  assert.ok(builtSince(control.page, control.made, "li") >= control.cards.length,
+    "the negative control did not redraw the cards, so the check above proves nothing");
 });
 
 /** The top-level bindings of `code` that nothing else in it names: declared, and never used. */
