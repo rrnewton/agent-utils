@@ -197,7 +197,7 @@ def json_text(document: object, *, indent: int | None = None) -> str:
     gets back exactly the same strings.
     """
     text = json.dumps(document, indent=indent, sort_keys=True, ensure_ascii=False)
-    if text.isascii():
+    if text.isascii() and "\x7f" not in text:
         return text
     return _JSON_UNSAFE.sub(_json_escape, text)
 
