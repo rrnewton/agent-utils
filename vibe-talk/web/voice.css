@@ -4806,6 +4806,13 @@ body {
   cursor: not-allowed;
 }
 
+/* `#231 two-column-polish`. And the view picker greyed in two columns, by the same argument: still a
+   Tab stop and a hover target, so the reason it is greyed reaches a keyboard and a screen reader. */
+.bar-select[aria-disabled="true"] {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
 .tray-icon {
   width: 1.15rem;
   height: 1.15rem;

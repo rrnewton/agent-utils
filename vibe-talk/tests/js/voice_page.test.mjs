@@ -38264,11 +38264,12 @@ test("`#229 desktop-two-column`: pressed in a narrow window it waits for a wide 
   assert.equal(page.el("screen-main").getAttribute("data-columns"), "two", "the stylesheet was not asked for two columns");
   assert.ok(!inTwoColumns(page), "a narrow window was given two columns");
   assert.equal(page.el("thread-select").disabled, false, "one column on screen, and the view picker greyed out");
+  assert.equal(page.el("thread-select").hasAttribute("aria-disabled"), false, "one column on screen, and the view picker greyed out");
   assert.deepStrictEqual(shownIds(page), ["200", "201", "202", "203", "204"], "a narrow window left All");
 
   await page.setDesk(true);
   assert.ok(inTwoColumns(page), "widening the window did not bring two columns");
-  assert.equal(page.el("thread-select").disabled, true, "the view picker did not grey out");
+  assert.equal(page.el("thread-select").getAttribute("aria-disabled"), "true", "the view picker did not grey out");
   assert.equal(page.el("thread-select").value, "main");
   assert.deepStrictEqual(shownIds(page), ["200", "201", "203"], "the left column is not Main");
   await threadBadge(rowWithId(page, "201")).click();
@@ -38278,6 +38279,7 @@ test("`#229 desktop-two-column`: pressed in a narrow window it waits for a wide 
   await page.setDesk(false);
   assert.ok(!inTwoColumns(page));
   assert.equal(page.el("thread-select").disabled, false, "one column again, and the view picker still grey");
+  assert.equal(page.el("thread-select").hasAttribute("aria-disabled"), false, "one column again, and the view picker still grey");
   assert.equal(page.el("thread-select").value, "flat", "one column again is not the view last chosen in one");
   assert.deepStrictEqual(shownIds(page), ["200", "201", "202", "203", "204"]);
   assert.equal(page.storage.get(COLUMNS_STORAGE), "two", "narrowing the window forgot the choice");
@@ -38333,7 +38335,8 @@ test("`#229 desktop-two-column`: in two columns the view picker is greyed and sa
   const page = await threadPage();
   await twoColumns(page);
   const picker = page.el("thread-select");
-  assert.equal(picker.disabled, true);
+  // Greyed, by `aria-disabled` since `#231 two-column-polish`: see its own test below.
+  assert.equal(picker.getAttribute("aria-disabled"), "true");
   assert.match(picker.title, /^Two columns: Main is on the left and the thread on the right\./);
   for (const key of ["1", "2", "3"]) {
     const event = await press(page, page.el("scroll-area"), key);
@@ -39039,6 +39042,61 @@ test("`#231 two-column-polish` x `#226 page-energy-profile`: with the cards up, 
   const control = await quietPoll(brokenScript("  if (signature !== sideCardsDrawn) {", "  if (true) {"));
   assert.ok(builtSince(control.page, control.made, "li") >= control.cards.length,
     "the negative control did not redraw the cards, so the check above proves nothing");
+});
+
+test("`#231 two-column-polish`: the greyed view picker is still a stop for the keys, says why to a screen reader, and a press on it opens nothing and says why", async () => {
+  // Described by a note outside the strip's pack, hidden: a description, not a line of the dock.
+  const tag = /<select\s+id="thread-select"[^>]*>/.exec(HTML_CODE)[0];
+  assert.match(tag, /aria-describedby="thread-select-note"/, "the picker has no description to say why it is greyed");
+  assert.match(/<p\s+id="thread-select-note"[^>]*>/.exec(HTML_CODE)[0], /(?:^|\s)hidden(?=[\s>])/);
+  assert.ok(!markupHolds("bar-pack", "thread-select-note"), "the note is a member of the strip's pack");
+  assert.match(cssBlock('.bar-select[aria-disabled="true"]'), /opacity:\s*0\.45/, "the greyed picker is not drawn greyed");
+  const page = await threadPage();
+  const picker = page.el("thread-select");
+  const note = page.el("thread-select-note");
+  assert.equal(note.textContent, "", "a picker that chooses carries a reason it is greyed");
+  await twoColumns(page);
+  assert.equal(picker.disabled, false, "the greyed picker is disabled, so the keys cannot reach it and a hover may not explain it");
+  assert.equal(picker.getAttribute("aria-disabled"), "true", "the picker does not say it is unavailable");
+  assert.match(note.textContent, /^Two columns: Main is on the left and the thread on the right\./,
+    "the picker's description does not say why it is greyed");
+  // Each key that would open it or choose with it: nothing chosen, the browser kept from it, and why.
+  for (const key of ["ArrowDown", " ", "Enter", "End", "t"]) {
+    page.el("status").textContent = "";
+    const event = await press(page, picker, key);
+    assert.equal(event.defaulted, false, `${JSON.stringify(key)} on the greyed picker was left to the browser`);
+    assert.match(page.el("status").textContent, /^Two columns: Main is on the left/, `${JSON.stringify(key)} did not say why`);
+    assert.equal(picker.value, "main");
+  }
+  // Escape is still the way off it, back to the list.
+  await press(page, picker, "Escape");
+  assert.ok(focused(page) === page.el("scroll-area") || page.el("discord-log").children.includes(focused(page)),
+    `Escape on the greyed picker did not go back to the list: ${focusName(page)}`);
+  // A press of the mouse opens nothing and says why.
+  page.el("status").textContent = "";
+  const down = { defaulted: true, preventDefault() { this.defaulted = false; } };
+  await picker.dispatch("mousedown", down);
+  assert.equal(down.defaulted, false, "a press of the mouse opened the greyed picker");
+  assert.match(page.el("status").textContent, /^Two columns: Main is on the left/);
+  // Whatever reaches it chooses nothing: the left column stays Main.
+  picker.value = "flat";
+  await picker.dispatch("change");
+  await page.settle();
+  assert.equal(picker.value, "main", "a choice reached the greyed picker and stood");
+  assert.deepStrictEqual(shownIds(page), ["200", "201", "203"], "a choice on the greyed picker changed the left column");
+  // One column again: a picker that chooses, keys and all, and no reason.
+  await page.el("column-toggle").click();
+  await page.settle();
+  assert.equal(picker.hasAttribute("aria-disabled"), false);
+  assert.equal(note.textContent, "");
+  const arrow = await press(page, picker, "ArrowDown");
+  assert.equal(arrow.defaulted, true, "↓ on a picker that chooses was kept from the browser");
+  // A channel without threads: disabled, as it always was, and its description says why.
+  const flat = newPage();
+  await signIn(flat);
+  await showDiscord(flat, [message({ content: "no threads on this provider" })]);
+  assert.equal(flat.el("thread-select").disabled, true);
+  assert.match(flat.el("thread-select-note").textContent, /does not offer threads here/);
 });
 
 /** The top-level bindings of `code` that nothing else in it names: declared, and never used. */

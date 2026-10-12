@@ -2051,8 +2051,14 @@
               belongs to and always there: Main (messages posted to the channel itself), All
               (every message, threads included), then each thread by name, most recently active
               first. A `select` for the same reason the channel picker is one.
+
+              `#231 two-column-polish`. Greyed in two columns with `aria-disabled`, not `disabled`, as
+              a bar button with nothing to act on is (see web/voice.css): a disabled control is no Tab
+              stop and not reliably a hover target, so the reason it is greyed reached nobody but a
+              mouse that waited on it. It stays a stop, says it is unavailable and why
+              (#thread-select-note), and a press on it opens nothing and says why in the status line.
             -->
-            <select id="thread-select" class="bar-select" aria-label="thread"
+            <select id="thread-select" class="bar-select" aria-label="thread" aria-describedby="thread-select-note"
                     title="Which part of the channel to read: Main, All, or one thread."></select>
 
             <!--
@@ -2374,6 +2380,16 @@
           <span id="talk-note" class="control-note" hidden></span>
         </button>
       </div>
+
+      <!--
+        `#231 two-column-polish`. Why the view picker is greyed, when it is: its description
+        (`aria-describedby`), which a screen reader says with it, focused or read. Hidden, because it
+        is a description and not a line of the dock; a description is read from the element it names
+        whether or not that is drawn. Outside #bar-pack, whose every member is a control on the
+        strip, and last in the dock, where it stands between no two things a rule of web/voice.css
+        pairs (`#control-bar-bottom + #control-pane` is one). Empty while the picker chooses.
+      -->
+      <p id="thread-select-note" hidden></p>
     </footer>
 
     <!-- The generated wire-contract validators first: voice.js checks what it receives with them. -->

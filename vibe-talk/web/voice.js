@@ -12105,10 +12105,20 @@ function renderThreadSelect() {
   // standing selected once the screen it opens is up, or has been left.
   select.value = current;
   // A provider without threads has nothing to choose; the picker stays, saying so by being inert.
-  select.disabled = !threadingSupported || twoColumns;
-  select.title = twoColumns ? TWO_COLUMNS_PICKER_TITLE : threadingSupported
+  select.disabled = !threadingSupported;
+  // `#231 two-column-polish`. In two columns, greyed but no less a control: a Tab stop that says it
+  // is unavailable, and why, and refuses a press with the reason (`refuseGreyedPicker`). See
+  // #thread-select in web/voice.html.
+  if (select.hasAttribute("aria-disabled") !== twoColumns) {
+    if (twoColumns) select.setAttribute("aria-disabled", "true");
+    else select.removeAttribute("aria-disabled");
+  }
+  const why = twoColumns ? TWO_COLUMNS_PICKER_TITLE : threadingSupported
     ? "Which part of the channel to read: Main, All, or one thread."
     : "This channel's chat service does not offer threads here, so Main is the whole channel.";
+  if (select.title !== why) select.title = why;
+  // Its description says why it is greyed, when it is; a picker that chooses needs none.
+  setTextIfChanged(leftEl("thread-select-note"), twoColumns || !threadingSupported ? why : "");
   // The right column's heading and cards name threads from the same store.
   if (columnsShown) renderSideColumn();
 }
@@ -12116,6 +12126,34 @@ function renderThreadSelect() {
 /** What the greyed picker says in two columns. `#229 desktop-two-column`. */
 const TWO_COLUMNS_PICKER_TITLE =
   "Two columns: Main is on the left and the thread on the right. Choose a thread from a message or from the list.";
+
+/** Whether the view picker is greyed, as it is in two columns. `#231 two-column-polish`. */
+const pickerGreyed = () => el("thread-select").getAttribute("aria-disabled") === "true";
+
+/**
+ * The keys that open a picker or change what it has chosen without opening it: the arrows and the
+ * page keys, Space, Enter, F4, and a character, which a picker takes as a search of its options.
+ * Not Tab, which leaves it, nor Escape, which goes back to the list, nor a chord, which is the page's
+ * or the browser's.
+ *
+ * @param {KeyboardEvent} event
+ */
+function picksByKey(event) {
+  if (event.ctrlKey || event.metaKey || event.altKey) return false;
+  return ["ArrowDown", "ArrowUp", "ArrowLeft", "ArrowRight", "Home", "End", "PageUp", "PageDown", "Enter", "F4"]
+    .includes(event.key) || String(event.key || "").length === 1;
+}
+
+/**
+ * A press on the greyed picker: it opens nothing, chooses nothing, and says why, in the status line
+ * the view keys say it in, where a reader who pressed it is looking. `#231 two-column-polish`.
+ *
+ * @param {Event} event
+ */
+function refuseGreyedPicker(event) {
+  swallow(event);
+  setStatus(TWO_COLUMNS_PICKER_TITLE);
+}
 
 /**
  * The heading over an open thread: the selector's own words for it, with the room to say more.
@@ -12133,6 +12171,11 @@ function renderThreadHeading() {
 
 /** The reader picked Main, All, a thread, or the way to the older ones. */
 function onThreadSelect() {
+  // Greyed, it chose nothing, however a choice reached it: put back on the view on screen.
+  if (pickerGreyed()) {
+    renderThreadSelect();
+    return undefined;
+  }
   const value = String(el("thread-select").value);
   if (value === OLDER_THREADS_OPTION) return openThreadDirectory();
   if (value === "main" || value === "flat") {
@@ -27095,6 +27138,13 @@ for (const view of ["main", "threads", "flat"]) {
 }
 el("thread-back").addEventListener("click", guardQuietly(closeThread));
 el("thread-select").addEventListener("change", guardQuietly(onThreadSelect));
+// `#231 two-column-polish`. Greyed in two columns: a press opens nothing, and says why.
+el("thread-select").addEventListener("mousedown", (event) => {
+  if (pickerGreyed()) refuseGreyedPicker(event);
+});
+el("thread-select").addEventListener("keydown", (event) => {
+  if (pickerGreyed() && picksByKey(event)) refuseGreyedPicker(event);
+});
 // `#194 thread-picker-polish`. The Threads screen's way back, its next page, and its second try.
 el("close-threads").addEventListener("click", closeThreadDirectory);
 el("thread-directory-more").addEventListener("click", guardQuietly(() => loadThreadDirectory(true)));
