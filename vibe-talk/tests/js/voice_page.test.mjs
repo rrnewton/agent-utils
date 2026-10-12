@@ -40163,3 +40163,327 @@ test("`#256 reply-marks-read`: a reply sent after you moved to another channel i
   assert.equal(rowWithId(page, there.id).getAttribute("data-archived"), "false", "a message of this channel was marked");
   assert.equal(page.el("undo-dismiss").hidden, true, "an Undo here would put back a message of this channel");
 });
+
+// --- `#252 thread-button-state` -----------------------------------------------------------------
+//
+// The owner, 2026-10-12: a brand-new message in the main chat had a coloured Thread tag, although
+// nobody had answered it. A thread nobody has answered is not one yet: its tag is grey, as Reply is,
+// says "Thread", and STARTS the thread — the thread opens with its message box focused, and the first
+// send from there posts into it — and the first reply makes it the coloured Thread(N), without a
+// reload.
+
+/**
+ * A Google Chat space: the channel of `threadData`, whose `201` heads a thread with a reply, and
+ * after it `210`, a new message nobody has answered. Google Chat names a thread for every message,
+ * so `210` heads one too, with a count of nothing.
+ */
+function freshMessageData() {
+  const data = threadData();
+  const lone = { id: "spaces/A/threads/lone", root_message_id: "210", is_root: true,
+    reply_count: 0, reply_count_exact: true };
+  const fresh = message({ id: "210", content: "a brand-new message nobody has answered", thread: lone });
+  return { ...data, messages: [...data.messages, fresh], lone };
+}
+
+/**
+ * The chat service, as far as a post goes. What each post named is recorded (`repliesPosted`); a
+ * post into a thread comes back as a reply in it, carrying the thread's record, as every provider's
+ * answer does; and the service keeps it, so the next read has the reply and the root's count with it.
+ */
+function threadedService(page) {
+  let sent = 0;
+  page.replyResponse = async (_path, options) => {
+    const body = JSON.parse(options.body);
+    sent += 1;
+    const root = body.thread_id
+      ? page.messages.find((held) => held.thread && held.thread.id === body.thread_id && held.thread.is_root)
+      : null;
+    const posted = message({ id: `940000000000000000${sent}`, content: body.text, reply_to: body.reply_to || null,
+      ...(body.thread_id ? { thread: { id: body.thread_id, root_message_id: root ? root.id : null, is_root: false,
+        reply_count: null, reply_count_exact: false } } : {}) });
+    page.messages = [...page.messages.map((held) => (held === root
+      ? { ...held, thread: { ...held.thread, reply_count: (held.thread.reply_count || 0) + 1 } } : held)), posted];
+    return json(200, { posted });
+  };
+}
+
+/** A page on the channel of `freshMessageData`, opened in All, its service answering posts. */
+async function freshMessagePage(arrange = null) {
+  const page = newPage();
+  const data = freshMessageData();
+  page.threadingSupported = true;
+  page.threads = data.threads;
+  page.messages = data.messages;
+  threadedService(page);
+  if (arrange) arrange(page, data);
+  await signIn(page);
+  await showDiscord(page, data.messages);
+  return { page, data };
+}
+
+/** A rule's value for one property, as written in a block of web/voice.css, or null. */
+const declaredIn = (block, property) => {
+  const found = new RegExp(`(?:^|[;{\\s])${property}:\\s*([^;]+);`).exec(block);
+  return found ? found[1].trim() : null;
+};
+
+/** What a row's thread tag says and is: its state, words, title, name and colour. */
+const tagOf = (row) => {
+  const tag = threadBadge(row);
+  return {
+    state: tag.getAttribute("data-thread-state"), text: tag.textContent, title: tag.getAttribute("title"),
+    label: tag.getAttribute("aria-label"), hue: tag.style.getPropertyValue("--thread-hue"), hidden: tag.hidden,
+  };
+};
+
+const START_TAG = { state: "start", text: "Thread", title: "Start a thread on this message",
+  label: "Start a thread on this message", hue: "", hidden: false };
+
+test("`#252 thread-button-state`: a message nobody has answered has a grey Thread that starts a thread; one with a reply keeps its coloured Thread(N)", async () => {
+  const { page } = await freshMessagePage();
+  for (const view of ["main", "flat"]) {
+    await pickThread(page, view);
+    assert.deepStrictEqual(tagOf(rowOf(page, "210")), START_TAG, `${view}: the new message's tag is not the grey one that starts a thread`);
+    const answered = tagOf(rowOf(page, "201"));
+    assert.deepStrictEqual({ ...answered, hue: undefined },
+      { state: "open", text: "Thread(1)", title: "Open this thread", label: "Open this thread, 1 reply", hue: undefined, hidden: false },
+      `${view}: the answered root's tag changed`);
+    assert.notEqual(answered.hue, "", `${view}: the answered root's tag lost its thread's colour`);
+    assert.equal(threadButton(rowOf(page, "210")), undefined, `${view}: a replies chip was offered for no replies`);
+  }
+  assert.ok(!threadOptions(page).some(([value]) => value === "thread:spaces/A/threads/lone"),
+    "the picker offered a thread nobody has started");
+
+  // DRAWN AS REPLY IS, in the stylesheet: no thread colour, the row's quiet secondary control.
+  const grey = cssBlock('.thread-badge[data-thread-state="start"]');
+  const reply = cssBlock(".reply-button");
+  for (const property of ["background", "border", "border-radius", "color", "font-size", "padding", "min-height"]) {
+    assert.equal(declaredIn(grey, property), declaredIn(reply, property),
+      `the grey Thread's ${property} is not Reply's`);
+  }
+  assert.doesNotMatch(grey, /thread-hue/, "the grey Thread is drawn in a thread's colour");
+  // ...and it gains the accent with the selected row, as Reply does.
+  for (const list of ["#discord-log", "#side-log", "#pinned-log"]) {
+    const lit = cssBlock(`${list} li.discord-message[data-selected="true"] .thread-badge[data-thread-state="start"]`);
+    assert.equal(declaredIn(lit, "border-color"), "var(--accent)", `${list}: the selected row's grey Thread is not lit`);
+    assert.equal(declaredIn(lit, "color"), "var(--ink)");
+  }
+});
+
+test("`#252 thread-button-state`: the grey Thread opens the empty thread with no read, its box focused; the first send posts into it, and the tag turns coloured without a reload", async () => {
+  const { page, data } = await freshMessagePage();
+  await pickThread(page, "main");
+  const reads = page.timelineCalls.length;
+  await threadBadge(rowOf(page, "210")).click();
+  assert.equal(page.el("thread-heading").hidden, false, "the grey Thread opened nothing");
+  assert.equal(page.el("thread-select").value, `thread:${data.lone.id}`);
+  assert.deepStrictEqual(shownIds(page), ["210"], "the empty thread is not the message alone");
+  assert.equal(focused(page), page.el("channel-compose-text"), `the thread's box was not focused: ${focusName(page)}`);
+  assert.equal(page.el("channel-compose-text").getAttribute("aria-label"), "Reply in this thread");
+  await page.settle();
+  assert.deepStrictEqual(readViewsSince(page, reads), [], "a read was made to show a thread nobody has started");
+  assert.equal(focused(page), page.el("channel-compose-text"), "the focus left the box once the thread settled");
+
+  page.el("channel-compose-text").value = "the first reply, which starts the thread";
+  await page.el("channel-send").click();
+  await page.settle();
+  assert.deepStrictEqual(page.repliesPosted.map((call) => call.body),
+    [{ text: "the first reply, which starts the thread", thread_id: data.lone.id }],
+    "the first send did not post into the message's thread");
+  assert.deepStrictEqual(shownIds(page), ["210", "9400000000000000001"], "the first reply was not drawn in the thread");
+
+  // Back on Main, with no read and no reload: the tag is the thread's now.
+  await page.el("thread-back").click();
+  await page.settle();
+  const tag = tagOf(rowOf(page, "210"));
+  assert.deepStrictEqual({ ...tag, hue: undefined },
+    { state: "open", text: "Thread(1)", title: "Open this thread", label: "Open this thread, 1 reply", hue: undefined, hidden: false },
+    "the first reply did not make the grey Thread the thread's coloured Thread(1)");
+  assert.notEqual(tag.hue, "", "the thread was given no colour with its first reply");
+  // And from now on it opens the thread, as any thread's tag does, leaving the focus where it was.
+  page.el("scroll-area").focus();
+  await threadBadge(rowOf(page, "210")).click();
+  await page.settle();
+  assert.deepStrictEqual(shownIds(page), ["210", "9400000000000000001"]);
+  assert.notEqual(focused(page), page.el("channel-compose-text"), "an answered thread still put the focus in its box");
+});
+
+test("`#252 thread-button-state`: a thread nobody has answered opens at once from its message where All does not reach, and is read behind", async () => {
+  // Opened in Main with no snapshot, All's read behind it held (`holdCountsRead`): All covers nothing.
+  const first = await freshMessagePage((p) => { p.threads = []; });
+  await pickThread(first.page, "main");
+  first.page.storage.delete(MESSAGE_CACHE_KEY);
+  const data = freshMessageData();
+  const page = reloadWith(first.page.storage, data.messages, (p) => {
+    p.threadingSupported = true;
+    p.threads = [];
+    threadedService(p);
+    holdCountsRead(p);
+  });
+  await reopenedChannel(page);
+  await page.settle();
+  assert.equal(page.el("thread-select").value, "main");
+  // The thread's own read is held: what is drawn is what the page holds.
+  const serve = page.timeline;
+  const held = gate(serve);
+  page.timeline = (path, options) => (viewOf(path) === "thread" ? held.respond(path, options) : serve(path, options));
+  const reads = page.timelineCalls.length;
+  const pressed = threadBadge(rowOf(page, "210")).click();
+  await page.settle();
+  assert.deepStrictEqual(shownIds(page), ["210"], "the thread waited on its read to show its message");
+  assert.equal(page.el("channel-loading").hidden, true, "the loading line stood over a thread the page could draw");
+  assert.equal(focused(page), page.el("channel-compose-text"), `the thread's box was not focused: ${focusName(page)}`);
+  assert.deepStrictEqual(readViewsSince(page, reads), ["thread"], "the thread drawn from its message was not read behind it");
+  held.open();
+  await pressed;
+  await page.settle();
+  assert.deepStrictEqual(shownIds(page), ["210"]);
+  assert.equal(focused(page), page.el("channel-compose-text"), "the read behind took the focus from the box");
+  page.el("channel-compose-text").value = "first";
+  await page.el("channel-send").click();
+  await page.settle();
+  assert.deepStrictEqual(page.repliesPosted.at(-1).body, { text: "first", thread_id: data.lone.id });
+});
+
+test("`#252 thread-button-state`: the tag turns coloured live when somebody else answers — on the stream in All, by a read in Main", async () => {
+  const { page, data } = await freshMessagePage();
+  await pickThread(page, "flat");
+  assert.equal(tagOf(rowOf(page, "210")).state, "start");
+  // Somebody answers it, and the stream brings the answer with its thread.
+  const answer = message({ id: "211", content: "an answer from someone else", author: "bob", author_id: "1000000000000000077",
+    author_is_bot: false, thread: { ...data.lone, is_root: false, reply_count: null, reply_count_exact: false } });
+  page.messages = [...page.messages.map((held) => (held.id === "210" ? { ...held, thread: { ...data.lone, reply_count: 1 } } : held)), answer];
+  await deliver(page, page.stream(), sseMessage(answer));
+  await page.settle();
+  for (const id of ["210", "211"]) {
+    const tag = tagOf(rowOf(page, id));
+    assert.equal(tag.state, "open", `${id}: still grey after the first reply arrived`);
+    assert.equal(tag.text, "Thread(1)", `${id}: the tag does not count the reply that arrived`);
+    assert.notEqual(tag.hue, "", `${id}: no thread colour`);
+  }
+  assert.equal(tagOf(rowOf(page, "210")).hue, tagOf(rowOf(page, "211")).hue, "the root and its reply are two colours");
+
+  // In Main, where the reply is no row: the poll's read brings the root's count, and the tag follows.
+  const second = await freshMessagePage();
+  await pickThread(second.page, "main");
+  assert.equal(tagOf(rowOf(second.page, "210")).state, "start");
+  second.page.messages = [...second.page.messages.map((held) => (held.id === "210"
+    ? { ...held, thread: { ...second.data.lone, reply_count: 2 } } : held))];
+  second.page.expireTimers(DISCORD_POLL_MS);
+  await second.page.settle();
+  await second.page.settle();
+  const tag = tagOf(rowOf(second.page, "210"));
+  assert.equal(tag.state, "open", "Main's tag stayed grey after a read said the message was answered");
+  assert.equal(tag.text, "Thread(2)");
+  assert.equal(tag.label, "Open this thread, 2 replies");
+});
+
+test("`#252 thread-button-state`: per provider — Google Chat's every message, Slack's and Discord's threads, and no tag where the provider names no thread", async () => {
+  // Slack: a message nobody has answered has no thread record — Slack names a thread once it has a
+  // reply — so it has no tag, as before. A root whose thread's replies are gone is a thread with a
+  // count of nothing, and its thread id is the root's ts: what the first send posts into.
+  const slackRoot = { id: "1700000000.000200", root_message_id: "1700000000000200", is_root: true,
+    reply_count: 0, reply_count_exact: true };
+  // Discord: a thread is a channel of its own, which this server does not create; a message heading
+  // none has no tag. A thread made and not yet written in has an estimated count of nothing.
+  const discordEmpty = { id: "1300000000000000001", root_message_id: "1300000000000000001", is_root: true,
+    reply_count: 0, reply_count_exact: false };
+  const discordBusy = { id: "1300000000000000002", root_message_id: "1300000000000000002", is_root: true,
+    reply_count: 3, reply_count_exact: false };
+  // A root whose provider gives no count may have replies: it keeps the thread's coloured tag.
+  const uncounted = { id: "1300000000000000003", root_message_id: "1300000000000000003", is_root: true,
+    reply_count: null, reply_count_exact: false };
+  const cases = [
+    { name: "Slack", rows: [
+      { id: "1700000000000100", thread: null, tag: null },
+      { id: "1700000000000200", thread: slackRoot, tag: "start" },
+    ] },
+    { name: "Discord", rows: [
+      { id: "1200000000000000001", thread: null, tag: null },
+      { id: "1300000000000000001", thread: discordEmpty, tag: "start" },
+      { id: "1300000000000000002", thread: discordBusy, tag: "open", text: "Thread(3)" },
+      { id: "1300000000000000003", thread: uncounted, tag: "open", text: "Thread" },
+    ] },
+  ];
+  for (const { name, rows } of cases) {
+    const page = newPage();
+    page.chatProviderName = name;
+    page.threadingSupported = true;
+    page.threads = [];
+    page.messages = rows.map((row) => message({ id: row.id, content: `${name} ${row.id}`, ...(row.thread ? { thread: row.thread } : {}) }));
+    threadedService(page);
+    await signIn(page);
+    await showDiscord(page, page.messages);
+    await pickThread(page, "main");
+    for (const row of rows) {
+      const tag = threadBadge(rowOf(page, row.id));
+      if (row.tag === null) {
+        assert.equal(tag, undefined, `${name}: a message heading no thread was offered a tag`);
+        continue;
+      }
+      assert.equal(tag.getAttribute("data-thread-state"), row.tag, `${name} ${row.id}: the tag's state`);
+      if (row.text) assert.equal(tag.textContent, row.text, `${name} ${row.id}: the tag's words`);
+      if (row.tag === "open") assert.notEqual(tag.style.getPropertyValue("--thread-hue"), "", `${name} ${row.id}: no colour`);
+    }
+    // The grey one starts its thread: the first send goes to the provider's own thread id.
+    const start = rows.find((row) => row.tag === "start");
+    await threadBadge(rowOf(page, start.id)).click();
+    await page.settle();
+    assert.equal(focused(page), page.el("channel-compose-text"), `${name}: the thread's box was not focused`);
+    page.el("channel-compose-text").value = `${name}: the first reply`;
+    await page.el("channel-send").click();
+    await page.settle();
+    assert.deepStrictEqual(page.repliesPosted.at(-1).body, { text: `${name}: the first reply`, thread_id: start.thread.id },
+      `${name}: the first reply did not go into the message's thread`);
+  }
+});
+
+test("`#252 thread-button-state`: on a read-only channel nothing can start a thread, so a message nobody has answered has no tag; an answered one keeps its own", async () => {
+  const { page } = await freshMessagePage((p) => { p.channels = [{ ...CHANNEL, writable: false }]; });
+  for (const view of ["main", "flat"]) {
+    await pickThread(page, view);
+    assert.equal(threadBadge(rowOf(page, "210")).hidden, true, `${view}: a thread was offered to start where nothing can be posted`);
+    assert.equal(tagOf(rowOf(page, "201")).hidden, false, `${view}: the answered thread's way in went too`);
+  }
+});
+
+test("`#252 thread-button-state` x `#229 desktop-two-column`: the grey Thread opens the empty thread on the right with its box focused, the first send posts there, and Main's tag turns coloured", async () => {
+  const { page, data } = await freshMessagePage();
+  await twoColumns(page);
+  assert.deepStrictEqual(shownIds(page), ["200", "201", "203", "210"]);
+  assert.equal(tagOf(rowWithId(page, "210")).state, "start");
+  await threadBadge(rowWithId(page, "210")).click();
+  await page.settle();
+  assert.deepStrictEqual(sideIds(page), ["210"], "the empty thread was not selected on the right");
+  assert.deepStrictEqual(shownIds(page), ["200", "201", "203", "210"], "the left column left Main");
+  assert.equal(focused(page), page.el("side-compose-text"), `the right column's box was not focused: ${focusName(page)}`);
+  page.el("side-compose-text").value = "the first reply, from the right";
+  await page.el("side-send").click();
+  await page.settle();
+  assert.deepStrictEqual(page.repliesPosted.at(-1).body, { text: "the first reply, from the right", thread_id: data.lone.id });
+  assert.deepStrictEqual(sideIds(page), ["210", "9400000000000000001"], "the first reply was not drawn on the right");
+  const tag = tagOf(rowWithId(page, "210"));
+  assert.equal(tag.state, "open", "Main's tag stayed grey after the first reply");
+  assert.equal(tag.text, "Thread(1)");
+  assert.notEqual(tag.hue, "");
+});
+
+test("`#252 thread-button-state`: → on a message nobody has answered opens its thread with the focus in the box, in one column and in two", async () => {
+  for (const two of [false, true]) {
+    const { page, data } = await freshMessagePage();
+    if (two) await twoColumns(page);
+    else await pickThread(page, "main");
+    const root = rowWithId(page, "210");
+    root.focus();
+    FakeElement.focusVisible = true;
+    await press(page, root, "ArrowRight");
+    await page.settle();
+    const box = two ? "side-compose-text" : "channel-compose-text";
+    assert.deepStrictEqual(two ? sideIds(page) : shownIds(page), ["210"], `${two ? "two columns" : "one"}: → did not open the thread`);
+    assert.equal(focused(page), page.el(box), `${two ? "two columns" : "one"}: → left the focus on ${focusName(page)}`);
+    page.el(box).value = "typed straight after →";
+    await page.el(two ? "side-send" : "channel-send").click();
+    await page.settle();
+    assert.deepStrictEqual(page.repliesPosted.at(-1).body, { text: "typed straight after →", thread_id: data.lone.id });
+  }
+});
