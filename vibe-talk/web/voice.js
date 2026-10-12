@@ -14739,8 +14739,10 @@ function sendBookmark(move, { conditional = false, after = null, quiet = false }
       }
     }
     const held = bookmarks.get(channel);
-    const mine = Boolean(held) && held.token === move.token;
-    const shownBefore = held ? held.anchor : null;
+    // Gone with the credential that made it (`forgetBookmarks`): nothing to settle, or to say.
+    if (!held) return outcome;
+    const mine = held.token === move.token;
+    const shownBefore = held.anchor;
     if (answer) {
       const said = answer.bookmark;
       bookmarks.set(channel, {

@@ -1717,7 +1717,7 @@ EMPTY_SENTENCE_JS = """() => {""" + FLOAT_HELPERS_JS + """
     return {problems, text: sentence.textContent.trim(), top: area.scrollTop};
 }"""
 
-# A row's open ⋯ menu: Copy text, Pin, then the read group under a hairline and a caption — two
+# A row's open ⋯ menu: Copy text, Pin, the bookmark (`#240 reading-bookmark`), then the read group under a hairline and a caption — two
 # items in it where the provider can move its own read marker, one where it cannot — every item at
 # least 44px tall and as wide as the others, and the whole menu ACROSS the screen wherever the "⋯"
 # that opened it sits: at a wrapping width the "⋯" lands at the start of a line, and a menu hung
@@ -1730,7 +1730,7 @@ MENU_JS = """({list, id, upstream}) => {""" + FLOAT_HELPERS_JS + """
     const menu = row && row.querySelector('.row-more-menu');
     if (!menu || !shown(menu)) return {problems: [`row ${id}'s ⋯ menu is not open`], items: []};
     const names = [...menu.children].filter(shown).map((e) => e.className);
-    if (names.join(' ') !== 'row-copy-button row-pin-button row-more-group') problems.push(`the menu holds ${names.join(', ')}`);
+    if (names.join(' ') !== 'row-copy-button row-pin-button row-bookmark-button row-more-group') problems.push(`the menu holds ${names.join(', ')}`);
     const group = menu.querySelector('.row-more-group');
     const caption = group && group.querySelector('.row-more-caption');
     if (!caption || !shown(caption) || caption.textContent !== 'Mark read') problems.push('the read group has no caption');
