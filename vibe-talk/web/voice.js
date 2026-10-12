@@ -3810,12 +3810,14 @@ function rowOf(pane, node) {
 
 /**
  * The row standing for message `id` in `pane` now: its own, the combined row holding it, or the
- * line of the collapsed run it is in (`#221 read-modes`). Null when the list does not draw it.
+ * line of the collapsed run it is in (`#221 read-modes`); in the right column's list, the card of
+ * thread `id`, which has a `data-id` and no messages. Null when the list does not draw it.
  */
 function paneRowFor(pane, id) {
   const list = pane.list();
   if (!list || !id) return null;
-  const held = /** @type {HTMLElement[]} */ ([...list.children]).find((row) => idsOf(row).includes(String(id)));
+  const held = /** @type {HTMLElement[]} */ ([...list.children]).find((row) =>
+    idsOf(row).includes(String(id)) || (row.hasAttribute("data-card") && row.getAttribute("data-id") === String(id)));
   const shown = held ? shownRowFor(held) : null;
   return shown && rowShown(shown) ? shown : null;
 }

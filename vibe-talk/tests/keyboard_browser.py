@@ -29,6 +29,15 @@ under a person's fingers, and measures the list that is on screen:
   rather than the picker -> "?" then "," leaves Help, and Help opened from Settings afterwards still
   goes back to Settings.
 
+`#239 single-selection` adds real mouse moves (CDP `Input.dispatchMouseEvent`) to the keys, and after
+every step counts the rows the browser DRAWS lit, by computed style (the selected surface or a ring),
+which must be exactly one, holding the focus: a mouse move over a message takes the selection from the
+keys -> j moves it on, the message still under the mouse unlit -> a click with no move before it ->
+ArrowUp -> fourteen j's scrolling the list under a mouse standing still, which takes nothing -> a few
+pixels of movement, which does -> Enter opening the message the mouse moved to, not the keys' one ->
+in two columns, the mouse into either column, and [ and ] between them. Against the page from before,
+it fails at the first mouse move, with the hovered row and the keys' row both lit.
+
 It serves the checked-out assets and a small fake API from one loopback origin, at 1280x800. Pass
 --web-root DIR to run the same walk against another copy of the page: against one from before the
 fix it fails at the first key after the load. --screenshots DIR keeps a PNG of each step.
@@ -273,6 +282,7 @@ NAMED_KEYS: dict[str, tuple[str, int, str]] = {
     "Escape": ("Escape", 27, ""), "Enter": ("Enter", 13, "\r"), " ": ("Space", 32, " "),
     "/": ("Slash", 191, "/"), "?": ("Slash", 191, "?"), ",": ("Comma", 188, ","),
     ";": ("Semicolon", 186, ";"), ":": ("Semicolon", 186, ":"), ".": ("Period", 190, "."),
+    "[": ("BracketLeft", 219, "["), "]": ("BracketRight", 221, "]"),
 }
 MODIFIERS = {"Alt": 1, "Control": 2, "Meta": 4, "Shift": 8}
 
@@ -636,6 +646,236 @@ def keymap_keys(walk: Walk, api: FakeApi) -> None:
                       "Enter opened and closed the long message, -> entered its thread and <- and Esc came back to it")
 
 
+# `#239 single-selection`. Every row the browser draws lit, across every list the keys move through,
+# read off the computed style: the selected surface (`--row-hover`, resolved on a probe) or a ring.
+# With them, the row under the pointer, the row holding the focus, and whether the root says the keys
+# are in use. Before the fix the hovered row and the keys' row were both lit here.
+LIT_JS = """() => {
+  const probe = document.createElement('div');
+  probe.style.background = 'var(--row-hover)';
+  document.body.append(probe);
+  const surface = getComputedStyle(probe).backgroundColor;
+  probe.remove();
+  const rows = [...document.querySelectorAll(
+    '#discord-log > li[data-id], #pinned-log > li[data-id], #side-log > li[data-id], #side-cards > li[data-id]')]
+    .filter((li) => !li.hidden && li.getClientRects().length > 0);
+  const name = (li) => `${li.parentElement.id}:${li.dataset.id}`;
+  const lit = rows.filter((li) => {
+    const s = getComputedStyle(li);
+    const card = li.querySelector(':scope > .side-card');
+    const run = li.querySelector(':scope > .read-run');
+    const ringed = (one) => { const t = getComputedStyle(one); return t.outlineStyle !== 'none' && parseFloat(t.outlineWidth) >= 1; };
+    return s.backgroundColor === surface || ringed(li) || (run && ringed(run)) || (card && getComputedStyle(card).backgroundColor === surface);
+  }).map(name);
+  const hovered = rows.filter((li) => li.matches(':hover')).map(name);
+  const held = document.activeElement;
+  const focus = held ? (rows.find((li) => li === held || li.contains(held)) || null) : null;
+  return {lit, hovered, focus: focus ? name(focus) : (held ? held.id || held.tagName.toLowerCase() : null),
+          input: document.documentElement.getAttribute('data-input')};
+}"""
+
+# The viewport centre of the `at`th row shown whole in `list`'s scroller, counted from the top (from the
+# foot when negative), clear of the floating line at the head and the chips at the foot.
+ROW_SPOT_JS = """([list, at]) => {
+  const area = document.getElementById(list).closest('#scroll-area, #side-scroll').getBoundingClientRect();
+  const rows = [...document.getElementById(list).children].filter((li) => li.dataset.id && !li.hidden).filter((li) => {
+    const box = li.getBoundingClientRect();
+    // The right column has nothing floating over its head: its heading stands above its scroller.
+    const head = list.startsWith('side-') ? 4 : 60;
+    return box.top >= area.top + head && box.bottom <= area.bottom - 90 && box.height > 0;
+  });
+  const row = rows[at < 0 ? rows.length + at : at];
+  if (!row) return null;
+  const box = row.getBoundingClientRect();
+  return {id: `${list}:${row.dataset.id}`, x: box.left + box.width * 0.35, y: box.top + Math.min(box.height / 2, 24)};
+}"""
+
+
+# The row at a viewport point, as `list:id`, or null: what has slid under a pointer standing there.
+UNDER_JS = """([x, y]) => {
+  const row = document.elementFromPoint(x, y)?.closest('#discord-log > li[data-id], #side-log > li[data-id], #side-cards > li[data-id]');
+  return row ? `${row.parentElement.id}:${row.dataset.id}` : null;
+}"""
+
+# The first point at or below (`x`, `y`), a few pixels at a time, that is over a row and not over the gap
+# between two: `[list:id, y]`, or null.
+ROW_BELOW_JS = """([x, y]) => {
+  for (let at = y; at < y + 60; at += 3) {
+    const row = document.elementFromPoint(x, at)?.closest('#discord-log > li[data-id]');
+    if (row) return [`${row.parentElement.id}:${row.dataset.id}`, at];
+  }
+  return null;
+}"""
+
+
+def lit_state(walk: Walk) -> Json:
+    walk.settled()
+    walk.page.wait_for_timeout(60)
+    value = walk.page.evaluate(LIT_JS)
+    assert isinstance(value, dict)
+    return value
+
+
+def names(state: Json, key: str) -> list[str]:
+    """The rows `LIT_JS` listed under `key`, as `list:id`."""
+    value = state[key]
+    assert isinstance(value, list)
+    return [str(one) for one in value]
+
+
+def one_lit(walk: Walk, why: str, expect: str | None = None) -> str:
+    """Exactly one row drawn lit, the focus on it, and (when given) the row `expect`; its `list:id`."""
+    state = lit_state(walk)
+    lit = names(state, "lit")
+    check(len(lit) == 1, f"{why}: {len(lit)} rows are drawn lit, not one: {state}")
+    only = lit[0]
+    check(expect is None or only == expect, f"{why}: {only} is lit, not {expect}: {state}")
+    check(state["focus"] == only, f"{why}: the focus is on {state['focus']!r}, not on the lit message {only}: {state}")
+    return only
+
+
+def mouse_move(walk: Walk, x: float, y: float) -> None:
+    """The mouse moved, as a hand moves it: through two points on the way, then to (`x`, `y`). Through CDP."""
+    for dx in (-8.0, -4.0, 0.0):
+        walk.cdp.send("Input.dispatchMouseEvent", {"type": "mouseMoved", "x": x + dx, "y": y, "button": "none", "buttons": 0})
+    walk.page.wait_for_timeout(80)
+
+
+def mouse_click(walk: Walk, x: float, y: float) -> None:
+    """A press and release of the left button at (`x`, `y`), where the pointer already is: no move before it."""
+    walk.cdp.send("Input.dispatchMouseEvent", {"type": "mousePressed", "x": x, "y": y, "button": "left", "buttons": 1, "clickCount": 1})
+    walk.cdp.send("Input.dispatchMouseEvent", {"type": "mouseReleased", "x": x, "y": y, "button": "left", "buttons": 0, "clickCount": 1})
+    walk.page.wait_for_timeout(80)
+
+
+def spot(walk: Walk, list_id: str, at: int) -> dict[str, object]:
+    walk.settled()
+    found = walk.page.evaluate(ROW_SPOT_JS, [list_id, at])
+    check(isinstance(found, dict), f"no row {at} is shown whole in #{list_id}")
+    assert isinstance(found, dict)
+    return found
+
+
+def xy(found: dict[str, object]) -> tuple[float, float]:
+    return number(found, "x"), number(found, "y")
+
+
+def single_selection(walk: Walk, api: FakeApi) -> None:
+    """`#239 single-selection`: the mouse and the keys move ONE selection, and one row is drawn lit after each step."""
+    ids = [str(m["id"]) for m in api.messages]
+    walk.key("End")
+    newest = one_lit(walk, "End", f"discord-log:{ids[-1]}")
+
+    # A real mouse move over a message: it takes the selection from the keys, the focus with it.
+    first = spot(walk, "discord-log", 1)
+    mouse_move(walk, *xy(first))
+    one_lit(walk, "a mouse moved over a message", str(first["id"]))
+    check(lit_state(walk)["input"] is None, "a real mouse move left the keys' look on the root")
+    check(str(first["id"]) != newest, "the mouse landed on the message the keys had selected; this proves nothing")
+
+    # THE DEFECT: j lit the next message and left the one under the mouse lit too.
+    press(walk.cdp, "j")
+    below = one_lit(walk, "j after the mouse")
+    check(below != str(first["id"]), f"j did not move the selection on from {first['id']}")
+    state = lit_state(walk)
+    check(str(first["id"]) in names(state, "hovered") and str(first["id"]) not in names(state, "lit"),
+          f"the message under the still mouse is lit beside the keys' one: {state}")
+    check(state["input"] == "keys", f"the root does not say the keys are in use: {state}")
+    walk.shot("single-mouse-then-j")
+
+    # A click where the pointer already stands, with no move before it (End has slid another row under
+    # it, a touchpad's tap), then ↑: one lit, each time.
+    press(walk.cdp, "End")
+    one_lit(walk, "End with the mouse standing still", newest)
+    under = names(lit_state(walk), "hovered")
+    check(len(under) == 1, f"the pointer is over no single row: {under}")
+    mouse_click(walk, number(first, "x"), number(first, "y"))
+    clicked = one_lit(walk, "a click with no move before it", str(under[0]))
+    press(walk.cdp, "ArrowUp")
+    above = one_lit(walk, "ArrowUp after the click")
+    check(above != clicked, f"ArrowUp did not move the selection on from the message clicked, {clicked}")
+
+    # A list scrolled under a still mouse takes nothing: the keys keep it as rows slide under the pointer.
+    walk.key("Home")
+    top = spot(walk, "discord-log", 2)
+    mouse_move(walk, *xy(top))
+    one_lit(walk, "the mouse over the first message", str(top["id"]))
+    start = walk.settled()
+    for step in range(14):
+        press(walk.cdp, "j")
+        keyed = one_lit(walk, f"j number {step + 1} with the mouse standing still")
+        slid = walk.page.evaluate(UNDER_JS, [number(top, "x"), number(top, "y")])
+        check(step == 0 or keyed != slid, f"j number {step + 1}: the row slid under the still mouse took the selection")
+    scrolled = walk.settled()
+    check(number(scrolled, "top") > number(start, "top") + 50, f"the list did not scroll under the pointer: {start['top']} -> {scrolled['top']}")
+    slid = walk.page.evaluate(UNDER_JS, [number(top, "x"), number(top, "y")])
+    state = lit_state(walk)
+    check(slid != str(top["id"]) and slid not in names(state, "lit"),
+          f"after the list scrolled under the still mouse, the row under it ({slid}) is lit or is the first one: {state}")
+    walk.shot("single-scrolled-under-still-mouse")
+    # ...and a few pixels of movement, onto a row rather than a gap, are the reader reaching for the mouse.
+    reach = walk.page.evaluate(ROW_BELOW_JS, [number(top, "x"), number(top, "y")])
+    check(isinstance(reach, list), f"no row near the pointer at {top}")
+    assert isinstance(reach, list)
+    mouse_move(walk, number(top, "x") + 10, float(reach[1]))
+    one_lit(walk, "the mouse moved again", str(reach[0]))
+
+    # Enter acts on the ONE selection: the long message the mouse moved to, not the one the keys left.
+    long_id = ids[MESSAGES - 8]
+    walk.key("End")
+    for _ in range(30):
+        if lit_state(walk)["lit"] == [f"discord-log:{long_id}"]:
+            break
+        press(walk.cdp, "k")
+    check(lit_state(walk)["lit"] == [f"discord-log:{long_id}"], f"the long message was not reached: {lit_state(walk)}")
+    box = walk.page.evaluate("(id) => { const r = document.querySelector(`#discord-log > li[data-id='${id}']`)"
+                             ".getBoundingClientRect(); return {x: r.left + r.width * 0.35, y: r.top + 20}; }", long_id)
+    press(walk.cdp, "j")
+    keys_row = one_lit(walk, "j off the long message")
+    mouse_move(walk, float(box["x"]), float(box["y"]))
+    one_lit(walk, "the mouse back on the long message", f"discord-log:{long_id}")
+    folded = "(id) => document.querySelector(`#discord-log > li[data-id='${id}']`).dataset.collapsed"
+    press(walk.cdp, "Enter")
+    walk.settled()
+    check(walk.page.evaluate(folded, long_id) == "false", "Enter did not open the message the mouse selected")
+    one_lit(walk, "Enter on the mouse's message", f"discord-log:{long_id}")
+    walk.shot("single-enter-on-mouse-selection")
+    press(walk.cdp, "Enter")
+    walk.settled()
+    check(walk.page.evaluate(folded, long_id) == "true", "Enter again did not close it")
+    check(keys_row != f"discord-log:{long_id}", "the keys and the mouse were on the same message; Enter proved nothing")
+    # Off the list, for the steps that follow: the dock is not a row.
+    walk.cdp.send("Input.dispatchMouseEvent", {"type": "mouseMoved", "x": 2, "y": 790, "button": "none", "buttons": 0})
+    walk.notes.append("one selection (#238): a real mouse move took it from the keys, j and ArrowUp took it back with "
+                      "the hovered row unlit, a click with no move selected, 14 j's scrolled the list under a still "
+                      "mouse without it taking anything, and Enter opened the message the mouse had moved to; one row "
+                      "drawn lit, holding the focus, after every step")
+
+
+def two_columns_single(walk: Walk) -> None:
+    """`#239 single-selection` x `#229 desktop-two-column`: one lit message across both columns, the mouse choosing the column."""
+    walk.page.click("#column-toggle")
+    walk.page.wait_for_function("() => document.getElementById('side-column').getClientRects().length > 0", timeout=5000)
+    walk.page.wait_for_selector("#side-cards > li[data-id]", state="visible", timeout=10_000)
+    left = spot(walk, "discord-log", 1)
+    mouse_move(walk, *xy(left))
+    one_lit(walk, "two columns, the mouse over the left one", str(left["id"]))
+    card = spot(walk, "side-cards", 0)
+    mouse_move(walk, *xy(card))
+    one_lit(walk, "the mouse into the right column, over a card", str(card["id"]))
+    walk.shot("single-two-columns-card")
+    press(walk.cdp, "[")
+    one_lit(walk, "[ back to the left column", str(left["id"]))
+    press(walk.cdp, "]")
+    one_lit(walk, "] to the right column", str(card["id"]))
+    mouse_move(walk, *xy(left))
+    one_lit(walk, "the mouse back over the left column", str(left["id"]))
+    walk.page.click("#column-toggle")
+    walk.page.wait_for_function("() => document.getElementById('side-column').getClientRects().length === 0", timeout=5000)
+    walk.notes.append("two columns: the mouse into either column took the one selection there, [ and ] handed it "
+                      "across, and one row was drawn lit throughout")
+
+
 PICKER_JS = "() => document.getElementById('discord-channel').value"
 
 
@@ -746,7 +986,9 @@ def main() -> int:
             settings_keys(walk)
             composer_keys(walk)
             keymap_keys(walk, api)
+            single_selection(walk, api)
             picker_and_help_keys(walk)
+            two_columns_single(walk)
 
             check(not errors, f"the page threw: {errors}")
             browser_version = context.browser.version if context.browser else "Chromium"

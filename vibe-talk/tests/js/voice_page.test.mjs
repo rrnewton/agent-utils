@@ -36396,6 +36396,20 @@ test("`#229 desktop-two-column`: [ and ] move the keys between the columns, → 
 test("`#239 single-selection` x `#229 desktop-two-column`: one selection per column and one lit message on the page; the mouse into the other column takes the selection, and the keys, there", async () => {
   const page = await threadPage();
   await twoColumns(page);
+  page.el("scroll-area").focus();
+  await press(page, page.el("scroll-area"), "Home");
+  assert.deepStrictEqual(litRows(page), ["discord-log:200"]);
+  // With no thread selected the right column's cards: the mouse over one takes the selection there,
+  // and ] after [ gives the focus back to that card, not to the column around it.
+  const card = page.el("side-cards").children[1];
+  await mouseTo(page, card, 900, 120);
+  assert.deepStrictEqual(litRows(page), [`side-cards:${card.getAttribute("data-id")}`], "the card under the mouse is not the one lit");
+  assert.equal(focused(page), card);
+  await pressHere(page, "[");
+  assert.deepStrictEqual(litRows(page), ["discord-log:200"]);
+  await pressHere(page, "]");
+  assert.deepStrictEqual(litRows(page), [`side-cards:${card.getAttribute("data-id")}`]);
+  assert.equal(focused(page), card, `] gave the focus to ${focusName(page)}, not to the card lit`);
   await threadBadge(rowWithId(page, "201")).click();
   await page.settle();
   assert.deepStrictEqual(sideIds(page), ["201", "202"]);
