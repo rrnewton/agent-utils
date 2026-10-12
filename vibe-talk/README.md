@@ -4150,6 +4150,14 @@ after the initiation frame. Clicking into the box, or writing a draft in it, ope
 and bills nothing: the conversation starts belatedly, on the send. A message sent while a spoken
 call is still connecting is held the same way and goes when the call connects. A conversation
 that fails to open leaves the message in the box and sends it nowhere, not into the next call.
+On `vibe-talk-v1` the held message goes as a `prompt` at `session_started`. The protocol does not
+say whether a server greets a client that never opens an audio segment, so a typed call does not
+wait for a greeting; on a server that does greet, the greeting's `turn_complete` is taken as the
+first message's. The transcript is still right, because rows are kept per turn number, and a
+message sent while the real reply is arriving waits for it — but one sent in the moment between the
+greeting ending and the reply starting would go while the first is still being answered. That is
+the page suite's pinned "documented limitation", and since this change it is every typed call's
+first message rather than a corner.
 
 **The on-screen keyboard resizes the page.** The frame is a fixed `100dvh` grid with the dock as
 its last row, and Chrome on Android by default opens the keyboard over the layout: `100dvh` does

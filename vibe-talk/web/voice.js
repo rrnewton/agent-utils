@@ -8653,7 +8653,10 @@ function handleVibeTalk(message) {
         // greeting arrives, including one queued before `session_started`, cannot be told apart
         // from it. The greeting's first text disarms that prompt's no-reply bound, its
         // `turn_complete` is taken as the prompt's, and a second queued prompt is sent while the
-        // first is still being answered.
+        // first is still being answered. Since `#241 voice-composer` that is every typed call's
+        // FIRST message, which is what starts the call and is held until here. The transcript is
+        // still right, rows being kept per turn number, and the next message waits behind the
+        // reply it did not ask for (`replyArriving`) once any of that reply has arrived.
         setStatus("Connected — type a message.");
         advanceVibeTalkInput();
         break;
