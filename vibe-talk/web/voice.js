@@ -20376,6 +20376,9 @@ async function refreshAfterInboxChange() {
     renderTodoControls();
     // The Pinned filter's rows are drawn from the archive too: a pin dealt with there greys there.
     if (pinnedOnly) renderChannelRows();
+    // `#240 reading-bookmark`. The line was drawn on a row this took away, and a Done right under it
+    // has just moved it: drawn again, with the chips, which no redraw of the rows does here.
+    renderScrollTools();
   } else {
     renderChannelRows();
     saveChannelScope();

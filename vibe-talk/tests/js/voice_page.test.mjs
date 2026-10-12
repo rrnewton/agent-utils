@@ -37600,6 +37600,133 @@ test("`#240 reading-bookmark`: THE SWEEP ORACLE — Done through here marks exac
   }
 });
 
+test("`#240 reading-bookmark`: under Hide read without threads, a Done right under the line, and Done through here, draw the line where it slid", async () => {
+  // Hide read without threads takes a Done row out of the list itself, with no redraw of the rows:
+  // the line went with the row it was drawn on, and its new place was drawn only at the next read.
+  const page = newPage();
+  await signIn(page);
+  await showDiscord(page, backlog(5));
+  await chooseReadMode(page, "Hide read");
+  await bookmarkRow(page, bid(1));
+  await doneButton(channelRow(page, bid(1))).click();
+  await page.settle();
+  assert.deepStrictEqual(shownIds(page), [0, 2, 3, 4].map(bid));
+  assert.equal(page.bookmark.anchor.message_id, bid(2), "the Done did not slide the bookmark");
+  assert.deepStrictEqual(bookmarkAt(page), { id: bid(2), place: "above" }, "the slid line was not drawn");
+  await throughHere(page, bid(2));
+  assert.deepStrictEqual(shownIds(page), [3, 4].map(bid));
+  assert.equal(page.bookmark.anchor.message_id, bid(3));
+  assert.deepStrictEqual(bookmarkAt(page), { id: bid(3), place: "above" }, "the line Done through here slid was not drawn");
+});
+
+/**
+ * `#240 reading-bookmark`. A channel of 12 messages, from 20000; with `threads`, every third one a
+ * root with a reply posted after the next Main message, so Main skips the replies and the line has
+ * to be placed among Main's rows by the channel's order.
+ */
+function oracleChannel(page, threads) {
+  const messages = [];
+  const summaries = [];
+  for (let i = 0; i < 12; i += 1) {
+    const id = String(20000 + i);
+    if (threads && i % 3 === 0) {
+      const thread = { id: `spaces/O/threads/${i}`, root_message_id: id, is_root: true, reply_count: 1, reply_count_exact: true };
+      messages.push(message({ id, content: `root ${i}`, thread }));
+      summaries.push({ thread, at: messages.length - 1 });
+    } else {
+      messages.push(message({ id, content: `message ${i}` }));
+    }
+    const owed = summaries.find((one) => one.reply === undefined && one.at < messages.length - 1);
+    if (owed) {
+      owed.reply = String(29000 + i);
+      messages.push(message({ id: owed.reply, content: `reply in ${owed.thread.id}`, thread: { ...owed.thread, is_root: false } }));
+    }
+  }
+  if (threads) {
+    page.threadingSupported = true;
+    page.threads = summaries.map(({ thread, at }) => ({ id: thread.id, root: messages[at], title: `Thread ${at}`,
+      reply_count: 1, reply_count_exact: true, updated_at: messages[messages.length - 1].timestamp }));
+  }
+  return messages;
+}
+
+for (const [threads, mode] of [[false, "Collapse read"], [false, "Hide read"], [true, "Show read"], [true, "Hide read"]]) {
+  const where = threads ? `a threaded Main under ${mode}` : `${mode} without threads`;
+  test(`\`#240 reading-bookmark\`: THE SWEEP ORACLE in ${where} — the sweep marks exactly the rows above not yet Done, and the line sits where a fresh placement puts it`, async () => {
+    // As above, in the read modes that leave rows out, and in a Main that leaves the thread replies
+    // out. The placement is worked out afresh from the fake server's own record: the channel's order,
+    // the Done marks and the bookmark it holds, against only which rows the list shows.
+    let seed = threads ? 2401 : mode === "Hide read" ? 2402 : 2403;
+    // The high bits: this generator's low bits repeat with a short period.
+    const next = (n) => {
+      seed = (seed * 1103515245 + 12345) % 2147483648;
+      return Math.floor((seed / 2147483648) * n);
+    };
+    const page = newPage();
+    // Threading is the deployment's, said at sign-in, so the channel is arranged before it.
+    const channel = oracleChannel(page, threads);
+    await signIn(page);
+    await showDiscord(page, channel);
+    if (threads) {
+      await pickThread(page, "main");
+      assert.equal(shownIds(page).some((id) => id.startsWith("29")), false, "Main shows thread replies: the fixture has no threads");
+    }
+    await chooseReadMode(page, mode);
+    let arrivals = 0;
+    const acts = [];
+    for (let step = 0; step < 60; step += 1) {
+      const all = page.el("discord-log").children;
+      // A collapsed run's line stands for the run: no act about one message is offered on it.
+      const pickable = all.filter((li) => !li.hidden && li.getAttribute("data-read-run") !== "head");
+      // Most of a reader's acts are Done, often on the message right under the line: the slide.
+      const under = pickable.find((li) => li.getAttribute("data-bookmark") === "above");
+      const roll = next(20);
+      const act = pickable.length === 0 || roll < 4 ? "arrive"
+        : roll < 9 ? "done-under" : roll < 12 ? "done" : roll < 15 ? "bookmark"
+          : roll < 17 && !page.el("undo-dismiss").hidden ? "undo" : "through";
+      const li = act === "done-under" && under ? under : pickable[next(Math.max(1, pickable.length))];
+      acts.push(act);
+      if (act === "arrive") {
+        arrivals += 1;
+        page.messages = [...page.messages, message({ id: String(30000 + arrivals), content: `arrival ${arrivals}` })];
+        await reReadChannel(page);
+      } else if (act === "done" || act === "done-under") {
+        await doneButton(li).click();
+      } else if (act === "bookmark") {
+        await bookmarkRow(page, li.getAttribute("data-id"));
+      } else if (act === "undo") {
+        await page.el("undo-dismiss").click();
+      } else {
+        // Done through here, from the upper half of what is shown, so the list is not emptied at once.
+        const near = pickable[next(Math.max(1, Math.ceil(pickable.length / 2)))];
+        const at = all.indexOf(near);
+        const expected = all.slice(0, at + 1).flatMap((one) => one.getAttribute("data-ids").split(" "))
+          .filter((one) => !page.dealtWith.has(one));
+        const before = page.dismissCalls.length;
+        await throughHere(page, near.getAttribute("data-id"));
+        const sent = page.dismissCalls.slice(before).flatMap((call) => call.messages || []);
+        assert.deepStrictEqual(sent, expected, `step ${step}: Done through ${near.getAttribute("data-id")} marked the wrong set`);
+      }
+      await page.settle();
+      const anchor = page.bookmark.anchor;
+      const rows = page.el("discord-log").children;
+      const order = new Map(page.messages.map((one, i) => [String(one.id), i]));
+      let want = null;
+      if (anchor && rows.length > 0) {
+        // Above the first row shown holding a message at or after the bookmark (after it, for one
+        // below its message), else below the last row shown.
+        const from = order.get(anchor.message_id) + (anchor.place === "below" ? 0.5 : 0);
+        const newest = (li) => Math.max(...li.getAttribute("data-ids").split(" ").map((one) => order.get(one)));
+        const shown = rows.filter((li) => !li.hidden);
+        const home = shown.find((li) => newest(li) >= from);
+        want = home ? { id: home.getAttribute("data-id"), place: "above" }
+          : shown.length ? { id: shown[shown.length - 1].getAttribute("data-id"), place: "below" } : null;
+      }
+      assert.deepStrictEqual(bookmarkAt(page), want, `step ${step}, after ${acts.slice(-3).join(", ")}: the line is not where the bookmark puts it`);
+    }
+  });
+}
+
 test("`#240 reading-bookmark`: in a channel with threads, a delta read carries a move made on the other device", async () => {
   const { page, server } = await forwardPage({}, (p) => {
     p.serveBookmark = true;
