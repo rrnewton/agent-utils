@@ -1168,13 +1168,30 @@ def test_the_utf8_restart_takes_the_command_line_and_environment_from_proc(
     assert captured["env"] == {b"LC_ALL": b"ja_JP.eucJP", b"HOME": b"/h"}
 
 
-def test_the_utf8_restart_is_skipped_when_the_command_line_turns_utf8_mode_off(
+def test_the_utf8_restart_is_skipped_when_the_interpreter_turned_utf8_mode_off(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    for disabled in ([b"python3", b"-X", b"utf8=0", b"-m", b"herdr_run"], [b"python3", b"-Xutf8=0"]):
-        monkeypatch.setattr(cli_module, "_proc_self_strings", lambda name, d=disabled: d)
-        monkeypatch.setattr(os, "execve", lambda *args: pytest.fail("restarted into a loop"))
-        cli_module._restart_in_utf8_mode(["-m", "herdr_run"])
+    monkeypatch.setattr(sys, "_xoptions", {"utf8": "0"})
+    monkeypatch.setattr(
+        cli_module, "_proc_self_strings", lambda name: [b"python3", b"-X", b"utf8=0", b"-m"]
+    )
+    monkeypatch.setattr(os, "execve", lambda *args: pytest.fail("restarted into a loop"))
+    cli_module._restart_in_utf8_mode(["-m", "herdr_run"])
+
+
+def test_an_argument_that_reads_like_the_utf8_option_does_not_stop_the_restart(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Only the interpreter's own ``-X`` options count; herdr-run's arguments are not options."""
+    command = [b"python3", b"-m", b"herdr_run", b"check", b"--", b"-Xutf8=0", b"-X", b"utf8=0"]
+    captured: dict[str, object] = {}
+    monkeypatch.setattr(sys, "_xoptions", {})
+    monkeypatch.setattr(
+        cli_module, "_proc_self_strings", lambda name: command if name == "cmdline" else []
+    )
+    monkeypatch.setattr(os, "execve", lambda path, argv, env: captured.update(argv=argv))
+    cli_module._restart_in_utf8_mode(["-m", "herdr_run"])
+    assert captured["argv"] == [command[0], b"-X", b"utf8", *command[1:]]
 
 
 def test_the_environment_is_put_back_to_the_one_executed_with(
@@ -1247,3 +1264,108 @@ def test_a_short_buffered_write_is_retried_until_it_fails_or_completes() -> None
     full = ShortBuffer(OSError(27, "File too large"))
     with pytest.raises(OSError, match="File too large"):
         output_module._write(cast("io.TextIOWrapper", Stream(full)), 1, b"0123456789")
+
+
+# --- the process as a caller starts it ---------------------------------------------------------
+
+_PACKAGE_PARENT = os.path.dirname(os.path.dirname(os.path.abspath(cli_module.__file__)))
+
+
+def _clean_environment() -> dict[str, str]:
+    environment = {key: value for key, value in os.environ.items() if not key.startswith("PYTHON")}
+    environment["PYTHONPATH"] = _PACKAGE_PARENT
+    return environment
+
+
+@pytest.mark.parametrize("unbuffered", [None, "1"])
+def test_a_failed_stdout_write_leaves_nothing_for_shutdown_to_retry(unbuffered: str | None) -> None:
+    """One diagnostic and exit 1, whatever PYTHONUNBUFFERED says.
+
+    A buffered write that failed kept its bytes; interpreter shutdown flushed them again, printed
+    ``Exception ignored`` and exited 120, unless PYTHONUNBUFFERED was set.
+    """
+    import subprocess
+
+    environment = _clean_environment()
+    if unbuffered is not None:
+        environment["PYTHONUNBUFFERED"] = unbuffered
+    with open("/dev/full", "wb") as full:
+        completed = subprocess.run(
+            [sys.executable, "-m", "herdr_run", "--version"],
+            env=environment,
+            stdin=subprocess.DEVNULL,
+            stdout=full,
+            stderr=subprocess.PIPE,
+            check=False,
+            timeout=60,
+        )
+    assert completed.returncode == 1
+    assert (
+        completed.stderr
+        == b"herdr-run: cannot write stdout: No space left on device (os error 28)\n"
+    )
+
+
+def test_a_stderr_nobody_reads_does_not_change_the_exit_status() -> None:
+    import subprocess
+
+    reader, writer = os.pipe()
+    os.close(reader)
+    try:
+        completed = subprocess.run(
+            [sys.executable, "-m", "herdr_run", "check", "curl x"],
+            env=_clean_environment(),
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=writer,
+            check=False,
+            timeout=60,
+        )
+    finally:
+        os.close(writer)
+    assert completed.returncode == EXIT_REFUSED
+    assert completed.stdout == b""
+
+
+def test_an_inherited_ignored_sigchld_is_reset_so_child_statuses_are_real(tmp_path: object) -> None:
+    """With SIGCHLD ignored, ``subprocess`` reads every child's status as 0.
+
+    ``git check-ignore`` then said "ignored" for a spool that is not, and the warning was lost.
+    """
+    import signal
+    import subprocess
+
+    root = str(tmp_path)
+    subprocess.run(["git", "init", "-q", root], check=True, capture_output=True)
+    environment = _clean_environment()
+    environment["GIT_CONFIG_NOSYSTEM"] = "1"
+    completed = subprocess.run(
+        [sys.executable, "-m", "herdr_run", "--agent", "a", "run", "--dry-run", "git status"],
+        cwd=root,
+        env=environment,
+        stdin=subprocess.DEVNULL,
+        capture_output=True,
+        check=False,
+        timeout=60,
+        preexec_fn=lambda: signal.signal(signal.SIGCHLD, signal.SIG_IGN),
+    )
+    assert completed.returncode == 0, completed.stderr
+    assert b"is NOT git-ignored" in completed.stderr
+
+
+def test_the_entry_point_resets_sigint_before_importing_the_package() -> None:
+    """An interrupt during start-up must end the process by the signal, not as a traceback."""
+    import subprocess
+
+    probe = (
+        "import signal, sys; sys.argv = ['herdr-run']; import herdr_run.__main__; "
+        "print(signal.getsignal(signal.SIGINT) == signal.SIG_DFL)"
+    )
+    completed = subprocess.run(
+        [sys.executable, "-c", probe],
+        env=_clean_environment(),
+        capture_output=True,
+        check=False,
+        timeout=60,
+    )
+    assert completed.stdout == b"True\n", completed.stderr

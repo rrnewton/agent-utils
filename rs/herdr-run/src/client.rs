@@ -16,7 +16,7 @@
 //! often the user systemd bus) directly.  Enforceable isolation therefore also requires a broker
 //! and sandbox policy that deny those raw control channels.
 
-use std::ffi::{CStr, OsString};
+use std::ffi::{CStr, CString, OsString};
 use std::fmt;
 use std::fs;
 use std::io::{self, Read};
@@ -88,22 +88,27 @@ pub fn exit_status_code(status: ExitStatus) -> i32 {
 /// The child also starts with SIGXFSZ at its default action, as the other edition's children do:
 /// this process ignores SIGXFSZ (see [`crate::cli::prepare_process`]), and an ignored disposition
 /// would otherwise be inherited across `exec`.
+///
+/// The program is executed by [`ExecPlan`], not by the standard library's `execvp`, so a file the
+/// kernel cannot execute -- a script without a `#!` line, say -- fails with `Exec format error
+/// (os error 8)` exactly as it does in the other edition, instead of being handed to `/bin/sh`.
 pub(crate) fn bounded_output(
     command: &mut Command,
     timeout: Duration,
 ) -> io::Result<BoundedOutput> {
     command.stdout(Stdio::piped()).stderr(Stdio::piped());
-    // SAFETY: `setsid` and `signal` are async-signal-safe, and they are the only calls made
-    // between fork and exec.
+    let plan = ExecPlan::new(command)?;
+    // SAFETY: `setsid`, `signal`, and `execve` are async-signal-safe, and `ExecPlan::exec` makes
+    // no other call and allocates nothing: everything it passes was built before the fork.
     unsafe {
-        command.pre_exec(|| {
+        command.pre_exec(move || {
             if libc::setsid() < 0 {
                 return Err(io::Error::last_os_error());
             }
             if libc::signal(libc::SIGXFSZ, libc::SIG_DFL) == libc::SIG_ERR {
                 return Err(io::Error::last_os_error());
             }
-            Ok(())
+            Err(plan.exec())
         });
     }
     let mut child = command.spawn()?;
@@ -172,6 +177,123 @@ pub(crate) fn bounded_output(
         stdout,
         stderr,
     })
+}
+
+/// The search path a child gets when its environment names none, as in the other edition.
+const DEFAULT_SEARCH_PATH: &[u8] = b"/bin:/usr/bin";
+
+/// Everything one `execve` attempt needs, built before the fork so the child allocates nothing.
+///
+/// The rule is the other edition's (`subprocess` on POSIX), not the C library's `execvp`: a
+/// program holding a `/` is executed as named; a bare name is tried in each directory of the
+/// child's `PATH` (`/bin:/usr/bin` when it has none, an empty entry meaning the bare name), the
+/// first that executes wins, and when none does the error reported is the first one that was not
+/// "no such file" or "not a directory", else the last. Above all, an `Exec format error` is
+/// reported as it is, never retried through `/bin/sh` the way `execvp` retries it.
+///
+/// The environment is the one the [`Command`] would give the child: this process's environment
+/// (the first entry wins for a repeated name, as the other edition reads it) with the command's
+/// explicit changes applied. `Command::env_clear` is not supported, and no caller uses it.
+struct ExecPlan {
+    candidates: Vec<CString>,
+    _arguments: Vec<CString>,
+    argv: Vec<*const libc::c_char>,
+    _variables: Vec<CString>,
+    envp: Vec<*const libc::c_char>,
+}
+
+// SAFETY: the raw pointers point into the `CString`s owned by the same value, which are never
+// mutated or dropped while it lives; the plan is only read, by the forked child.
+unsafe impl Send for ExecPlan {}
+// SAFETY: as above; nothing is ever written through the pointers.
+unsafe impl Sync for ExecPlan {}
+
+impl ExecPlan {
+    fn new(command: &Command) -> io::Result<Self> {
+        use std::os::unix::ffi::OsStrExt;
+
+        let nul = || io::Error::new(io::ErrorKind::InvalidInput, "argument contains a NUL byte");
+        let text = |bytes: &[u8]| CString::new(bytes).map_err(|_| nul());
+        let program = command.get_program().as_bytes();
+        let mut variables: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+        for (name, value) in std::env::vars_os() {
+            if !variables.iter().any(|(known, _)| known == name.as_bytes()) {
+                variables.push((name.as_bytes().to_vec(), value.as_bytes().to_vec()));
+            }
+        }
+        for (name, value) in command.get_envs() {
+            variables.retain(|(known, _)| known != name.as_bytes());
+            if let Some(value) = value {
+                variables.push((name.as_bytes().to_vec(), value.as_bytes().to_vec()));
+            }
+        }
+        let candidates = if program.contains(&b'/') {
+            vec![text(program)?]
+        } else {
+            let search = variables
+                .iter()
+                .find(|(name, _)| name == b"PATH")
+                .map_or(DEFAULT_SEARCH_PATH, |(_, value)| value.as_slice());
+            search
+                .split(|byte| *byte == b':')
+                .map(|directory| {
+                    let mut path = directory.to_vec();
+                    if !path.is_empty() && !path.ends_with(b"/") {
+                        path.push(b'/');
+                    }
+                    path.extend_from_slice(program);
+                    text(&path)
+                })
+                .collect::<io::Result<Vec<_>>>()?
+        };
+        let arguments = std::iter::once(program)
+            .chain(command.get_args().map(OsStrExt::as_bytes))
+            .map(text)
+            .collect::<io::Result<Vec<_>>>()?;
+        let variables = variables
+            .into_iter()
+            .map(|(mut name, value)| {
+                name.push(b'=');
+                name.extend_from_slice(&value);
+                text(&name)
+            })
+            .collect::<io::Result<Vec<_>>>()?;
+        let pointers = |strings: &[CString]| {
+            strings
+                .iter()
+                .map(|string| string.as_ptr())
+                .chain(std::iter::once(std::ptr::null()))
+                .collect::<Vec<_>>()
+        };
+        Ok(Self {
+            argv: pointers(&arguments),
+            envp: pointers(&variables),
+            candidates,
+            _arguments: arguments,
+            _variables: variables,
+        })
+    }
+
+    /// Try each candidate in turn; return only when none could be executed.
+    ///
+    /// Async-signal-safe: `execve`, `errno`, and arithmetic only.
+    fn exec(&self) -> io::Error {
+        let mut first = 0;
+        let mut last = libc::ENOENT;
+        for candidate in &self.candidates {
+            // SAFETY: every pointer is a live NUL-terminated string, and both arrays end in null.
+            unsafe {
+                libc::execve(candidate.as_ptr(), self.argv.as_ptr(), self.envp.as_ptr());
+            }
+            last = io::Error::last_os_error()
+                .raw_os_error()
+                .unwrap_or(libc::ENOENT);
+            if first == 0 && last != libc::ENOENT && last != libc::ENOTDIR {
+                first = last;
+            }
+        }
+        io::Error::from_raw_os_error(if first == 0 { last } else { first })
+    }
 }
 
 /// One terminal pane and its owning tab and workspace.
@@ -1178,6 +1300,89 @@ mod tests {
         let mask =
             u64::from_str_radix(line.trim().trim_start_matches("SigIgn:").trim(), 16).unwrap();
         assert_eq!(mask & (1 << (libc::SIGXFSZ - 1)), 0, "{line}");
+    }
+
+    fn scratch_directory(label: &str) -> PathBuf {
+        let directory = std::env::temp_dir().join(format!(
+            "herdr-run-{label}-{}-{}",
+            std::process::id(),
+            TEMPORARY_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir_all(&directory).unwrap();
+        directory
+    }
+
+    fn executable(path: &Path, text: &str) {
+        fs::write(path, text).unwrap();
+        fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    /// A script without `#!` is not executable, and is reported so: the C library's `execvp`
+    /// would have run it with `/bin/sh` instead, which the other edition never does.
+    #[test]
+    fn a_file_the_kernel_cannot_execute_is_an_exec_format_error() {
+        let directory = scratch_directory("noexec");
+        let script = directory.join("no-shebang");
+        executable(&script, "touch \"$0.ran\"\n");
+        let error = bounded_output(&mut Command::new(&script), Duration::from_secs(10))
+            .err()
+            .expect("a script without #! must not run");
+        assert_eq!(error.to_string(), "Exec format error (os error 8)");
+        assert!(!directory.join("no-shebang.ran").exists());
+        // Found through PATH it is the same error. A later directory is still tried, as the other
+        // edition tries it, and one that holds a runnable file wins.
+        let mut command = Command::new("no-shebang");
+        command.env("PATH", format!("/nonexistent-dir:{}", directory.display()));
+        let error = bounded_output(&mut command, Duration::from_secs(10))
+            .err()
+            .expect("the first error that is not ENOENT is reported");
+        assert_eq!(error.to_string(), "Exec format error (os error 8)");
+        let later = scratch_directory("noexec-later");
+        executable(&later.join("no-shebang"), "#!/bin/sh\nexit 7\n");
+        let mut command = Command::new("no-shebang");
+        command.env(
+            "PATH",
+            format!("{}:{}", directory.display(), later.display()),
+        );
+        let output = bounded_output(&mut command, Duration::from_secs(10)).unwrap();
+        assert_eq!(output.status.code(), Some(7));
+        assert!(!directory.join("no-shebang.ran").exists());
+        fs::remove_dir_all(directory).unwrap();
+        fs::remove_dir_all(later).unwrap();
+    }
+
+    /// A bare name is searched in the child's PATH, skipping directories that lack it, and the
+    /// child gets the environment the command describes.
+    #[test]
+    fn a_bare_name_is_found_in_the_child_path_with_the_commanded_environment() {
+        let empty = scratch_directory("path-empty");
+        let found = scratch_directory("path-found");
+        executable(
+            &found.join("probe-tool"),
+            "#!/bin/sh\nprintf '%s|%s|%s' \"$0\" \"$HERDR_RUN_EXEC_PLAN\" \"${HERDR_RUN_GONE-unset}\"\n",
+        );
+        let mut command = Command::new("probe-tool");
+        command
+            .env(
+                "PATH",
+                format!("/nonexistent-dir:{}:{}", empty.display(), found.display()),
+            )
+            .env("HERDR_RUN_EXEC_PLAN", "set")
+            .env_remove("HERDR_RUN_GONE");
+        let output = bounded_output(&mut command, Duration::from_secs(10)).unwrap();
+        assert!(output.status.success());
+        assert_eq!(
+            String::from_utf8(output.stdout).unwrap(),
+            format!("{}/probe-tool|set|unset", found.display())
+        );
+        let mut missing = Command::new("probe-tool");
+        missing.env("PATH", empty.display().to_string());
+        let error = bounded_output(&mut missing, Duration::from_secs(10))
+            .err()
+            .expect("absent everywhere");
+        assert_eq!(error.to_string(), "No such file or directory (os error 2)");
+        fs::remove_dir_all(empty).unwrap();
+        fs::remove_dir_all(found).unwrap();
     }
 
     static TEMPORARY_SEQUENCE: AtomicU64 = AtomicU64::new(0);

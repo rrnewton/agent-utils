@@ -1517,14 +1517,15 @@ def _restore_environment(original: Mapping[bytes, bytes]) -> None:
                 pass
 
 
-def _utf8_mode_disabled(command: Sequence[bytes]) -> bool:
-    """True when the command line itself turns UTF-8 mode off, which a restart could not undo."""
-    for index, argument in enumerate(command):
-        if argument == b"-Xutf8=0":
-            return True
-        if argument == b"-X" and index + 1 < len(command) and command[index + 1] == b"utf8=0":
-            return True
-    return False
+def _utf8_mode_disabled() -> bool:
+    """True when the interpreter was started with ``-X utf8=0``, which a restart could not undo.
+
+    Asked of the interpreter's own ``-X`` options, never of the command line: herdr-run's own
+    arguments are on that line too, and an argument that happened to read ``-Xutf8=0`` (a command
+    to check, say) must not keep the process in the locale's encoding.
+    """
+    options: dict[str, object] = getattr(sys, "_xoptions", {})
+    return options.get("utf8") == "0"
 
 
 def _restart_in_utf8_mode(reexec: Sequence[str]) -> None:
@@ -1539,9 +1540,9 @@ def _restart_in_utf8_mode(reexec: Sequence[str]) -> None:
     executable = sys.executable
     command = _proc_self_strings("cmdline")
     environment = _original_environment()
+    if _utf8_mode_disabled():
+        return
     if command:
-        if _utf8_mode_disabled(command):
-            return
         argv: list[bytes | str] = [command[0], b"-X", b"utf8", *command[1:]]
     else:
         try:
@@ -1578,6 +1579,12 @@ def _prepare_process(reexec: Sequence[str]) -> None:
     * SIGINT gets its default action when the interpreter installed its own handler, so an
       interrupt ends the process BY the signal, which is what lets a calling loop stop instead of
       carrying on. A SIGINT the caller ignored stays ignored, as it does in the native edition.
+      (The entry point already did this before importing anything; it is repeated here for a
+      caller that imports :func:`main` directly.)
+    * SIGCHLD gets its default action. A caller can hand an ignored SIGCHLD down across ``exec``,
+      and then the kernel reaps every child at once: waiting for one fails with ECHILD, which
+      ``subprocess`` reads as exit status 0, so every failed child would count as a success. The
+      native edition restores the default too, and the processes either edition starts inherit it.
 
     SIGXFSZ stays ignored, as the interpreter set it (and the native edition sets it), and the
     children ``subprocess`` starts get it, and SIGPIPE, back at their default actions and inherit
@@ -1600,6 +1607,7 @@ def _prepare_process(reexec: Sequence[str]) -> None:
         _restore_environment(original)
     if signal.getsignal(signal.SIGINT) is signal.default_int_handler:
         signal.signal(signal.SIGINT, signal.SIG_DFL)
+    signal.signal(signal.SIGCHLD, signal.SIG_DFL)
 
 
 def main(argv: Sequence[str] | None = None, *, reexec: Sequence[str] | None = None) -> int:
@@ -1610,7 +1618,13 @@ def main(argv: Sequence[str] | None = None, *, reexec: Sequence[str] | None = No
     cannot be read; it defaults to the script the interpreter was started with.
     """
     if argv is None:
-        _prepare_process(reexec if reexec is not None else [sys.argv[0]])
+        try:
+            _prepare_process(reexec if reexec is not None else [sys.argv[0]])
+        except KeyboardInterrupt:
+            # Only before the handler is reset: end by the signal, as the native edition does.
+            signal.signal(signal.SIGINT, signal.SIG_DFL)
+            os.kill(os.getpid(), signal.SIGINT)
+            raise
     raw = list(argv) if argv is not None else sys.argv[1:]
     try:
         try:

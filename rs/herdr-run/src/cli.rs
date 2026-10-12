@@ -164,12 +164,19 @@ type Parsed<T> = std::result::Result<T, ParseFailure>;
 ///   inherits it, just as the other edition's children (started with `close_fds`) do not. Every
 ///   descriptor this process opens itself is close-on-exec already.
 ///
+/// * SIGCHLD gets its default action. A caller can hand an ignored SIGCHLD down across `exec`,
+///   and then the kernel reaps every child at once: waiting for one fails with ECHILD, so no exit
+///   status can be read. The other edition's runtime would read that as status 0 -- every failed
+///   child a success -- and this one as an error; with the default action restored both read the
+///   real status, and so do the processes either edition starts.
+///
 /// SIGINT is left as it was inherited, and closed standard descriptors were already reopened on
 /// `/dev/null` (inheritably) by the runtime before `main`.
 pub fn prepare_process() {
     // SAFETY: `signal` with a constant disposition has no pointer arguments.
     unsafe {
         libc::signal(libc::SIGXFSZ, libc::SIG_IGN);
+        libc::signal(libc::SIGCHLD, libc::SIG_DFL);
     }
     mark_inherited_descriptors_close_on_exec();
 }

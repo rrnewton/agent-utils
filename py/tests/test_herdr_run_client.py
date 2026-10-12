@@ -22,6 +22,7 @@ from herdr_run.client import (
     SERVER_WORKER_THREADS,
 )
 from herdr_run.errors import EXIT_UNAVAILABLE, HerdrUnavailable
+from herdr_run.textfmt import os_error_text
 
 
 def _completed(
@@ -484,3 +485,20 @@ def test_filtered_pane_list_refuses_another_workspace() -> None:
     )
     with pytest.raises(HerdrUnavailable, match='expected "wanted"'):
         client.panes("wanted")
+
+
+def test_a_file_the_kernel_cannot_execute_is_an_exec_format_error(tmp_path: object) -> None:
+    """A script without ``#!`` is reported as ENOEXEC and never handed to a shell.
+
+    The native edition executes children the same way, rather than with the C library's
+    ``execvp``, which would run such a script with ``/bin/sh``.
+    """
+    script = os.path.join(str(tmp_path), "no-shebang")
+    with open(script, "w", encoding="utf-8") as handle:
+        handle.write('touch "$0.ran"\n')
+    os.chmod(script, 0o755)
+    with pytest.raises(OSError) as raised:
+        client_module.bounded_control_command((script,))
+    assert raised.value.errno == 8
+    assert os_error_text(raised.value) == "Exec format error (os error 8)"
+    assert not os.path.exists(script + ".ran")

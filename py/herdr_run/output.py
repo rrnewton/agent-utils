@@ -7,8 +7,12 @@ editions instead: a stdout write that fails is reported as ``herdr-run: cannot w
 that went away. Diagnostics on stderr are best effort, because there is nowhere left to report a
 failure to write them.
 
-Every write is encoded as UTF-8 and flushed at once, so output order matches the native edition's
-and nothing is left in a buffer for interpreter shutdown to fail on.
+Every write is encoded as UTF-8 and goes straight to the descriptor with ``os.write``, so output
+order matches the native edition's and nothing is ever left in a buffer. That last part is what
+makes a failed write end the same way in both editions: a buffered stream keeps the bytes it could
+not write, interpreter shutdown tries to flush them again, fails again, prints ``Exception ignored``
+and exits 120 -- unless ``PYTHONUNBUFFERED`` happened to be set. Writing directly leaves shutdown
+nothing to retry, whatever the environment says.
 """
 
 from __future__ import annotations
@@ -33,31 +37,20 @@ def _encode(text: str) -> bytes:
     return text.encode("utf-8", errors="surrogateescape")
 
 
-def _write(stream: TextIO | None, descriptor: int, payload: bytes) -> None:
-    """Write all of ``payload`` through ``stream``'s buffer, or to the descriptor without one.
+def _original_stream(descriptor: int) -> TextIO | None:
+    """The stream the interpreter opened on ``descriptor`` (1 or 2) at start-up, if any."""
+    return sys.__stdout__ if descriptor == 1 else sys.__stderr__
 
-    A buffered write can be SHORT without raising: past ``RLIMIT_FSIZE`` (SIGXFSZ is ignored, so
-    the write fails with EFBIG instead of killing the process), or when a disk fills mid-write, the
-    buffer reports the bytes it did write and drops the rest. So the remainder is written again
-    until it is all written or the retry raises the error, as the native edition's ``write_all``
-    does; a write that makes no progress at all fails as ``write_all`` reports it.
+
+def _write_descriptor(descriptor: int, payload: bytes) -> None:
+    """Write all of ``payload`` to ``descriptor`` with ``os.write``, through no buffer at all.
+
+    A write can be SHORT without failing: past ``RLIMIT_FSIZE`` (SIGXFSZ is ignored, so the write
+    fails with EFBIG instead of killing the process), or when a disk fills mid-write. So the
+    remainder is written again until it is all written or the retry raises the error, as the native
+    edition's ``write_all`` does; a write that makes no progress at all fails as ``write_all``
+    reports it.
     """
-    buffer = getattr(stream, "buffer", None) if stream is not None else None
-    if buffer is not None:
-        assert stream is not None
-        stream.flush()
-        view = memoryview(payload)
-        while view:
-            written = buffer.write(view)
-            if not written:
-                raise OSError("failed to write whole buffer")
-            view = view[written:]
-        buffer.flush()
-        return
-    if stream is not None:
-        stream.write(payload.decode("utf-8", errors="surrogateescape"))
-        stream.flush()
-        return
     view = memoryview(payload)
     while view:
         try:
@@ -67,6 +60,34 @@ def _write(stream: TextIO | None, descriptor: int, payload: bytes) -> None:
         if not written:
             raise OSError("failed to write whole buffer")
         view = view[written:]
+
+
+def _write(stream: TextIO | None, descriptor: int, payload: bytes) -> None:
+    """Write all of ``payload`` to ``descriptor``, or through ``stream`` when it was substituted.
+
+    The process's own stream (or none at all, when the descriptor was closed before the
+    interpreter started) means the real descriptor: the bytes go to it directly, so a failed write
+    leaves nothing buffered for shutdown to retry. A stream somebody put in its place -- a test
+    capturing output -- is written through, with the same retry of a short write.
+    """
+    if stream is None or stream is _original_stream(descriptor):
+        if stream is not None:
+            stream.flush()
+        _write_descriptor(descriptor, payload)
+        return
+    buffer = getattr(stream, "buffer", None)
+    if buffer is None:
+        stream.write(payload.decode("utf-8", errors="surrogateescape"))
+        stream.flush()
+        return
+    stream.flush()
+    view = memoryview(payload)
+    while view:
+        written = buffer.write(view)
+        if not written:
+            raise OSError("failed to write whole buffer")
+        view = view[written:]
+    buffer.flush()
 
 
 def write_labelled(descriptor: int, payload: bytes, label: str) -> None:
