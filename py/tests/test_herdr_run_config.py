@@ -7,6 +7,7 @@ intended conservative policy, because that is the state most consumers will run 
 from __future__ import annotations
 
 import os
+from pathlib import Path
 
 import pytest
 
@@ -308,3 +309,66 @@ def test_shipped_config_template_parses() -> None:
     )
     assert config.workspace == "agent-cmds"
     assert config.allow == ("git", "gh")
+
+
+# --- invisible characters in names --------------------------------------------------------------
+
+
+_LINE_SEPARATOR_REPRO = (
+    # The reported repro, byte for byte: a deny entry ending in U+2028, which YAML 1.1 reads as a
+    # line break and YAML 1.2 does not. It was accepted and never matched, so `git -c ...` ran.
+    b"allow: [git]\ndeny_global:\n  git: [-c\xe2\x80\xa8, --exec-path\xe2\x80\xa9]\n"
+)
+
+
+@pytest.mark.parametrize(
+    "document",
+    [
+        _LINE_SEPARATOR_REPRO,
+        b"deny_anywhere: [--upload-pack\xe2\x80\xa8]\n",
+        b"value_options:\n  git: [-C\xe2\x80\xa9]\n",
+        b"allow: [git]\n# a comment\xc2\x85allow: [curl]\n",
+    ],
+)
+def test_a_raw_yaml_1_1_line_break_is_refused(tmp_path: Path, document: bytes) -> None:
+    path = tmp_path / ".herdr-run.yaml"
+    path.write_bytes(document)
+    with pytest.raises(ConfigError, match="YAML 1.1 reads it as a line break"):
+        load_config(explicit_path=str(path), start_dir=str(tmp_path))
+
+
+@pytest.mark.parametrize(
+    "document,where",
+    [
+        ('allow: [git]\ndeny_global:\n  git: ["-c\\L", --exec-path]\n', "deny_global.git[0]"),
+        ('deny_anywhere: ["--upload-pack\\u200b"]\n', "deny_anywhere[0]"),
+        ('value_options:\n  git: ["-C\\ufeff"]\n', "value_options.git[0]"),
+        ('allow: ["git\\u00a0"]\n', "allow[0]"),
+        ('prefixes: ["with-proxy\\u202e"]\n', "prefixes[0]"),
+        ('workspace: "agent\\u2060cmds"\n', "workspace"),
+        ('deny_subcommand:\n  "git\\u3000": [daemon]\n', "deny_subcommand key"),
+    ],
+)
+def test_an_invisible_character_in_a_policy_name_is_refused(
+    tmp_path: Path, document: str, where: str
+) -> None:
+    path = tmp_path / ".herdr-run.yaml"
+    path.write_text(document, encoding="utf-8")
+    with pytest.raises(ConfigError) as caught:
+        load_config(explicit_path=str(path), start_dir=str(tmp_path))
+    assert f".{where}: " in str(caught.value)
+    assert "invisible character U+" in str(caught.value)
+
+
+def test_visible_non_ascii_names_and_invisible_text_outside_names_are_accepted(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / ".herdr-run.yaml"
+    path.write_text(
+        'workspace: café\nprompt_tail: "\\u00a0$ "\nspool_dir: "out\\u00a0dir"\n',
+        encoding="utf-8",
+    )
+    config = load_config(explicit_path=str(path), start_dir=str(tmp_path))
+    assert config.workspace == "café"
+    assert config.prompt_tail == "\u00a0$ "
+    assert config.spool_dir == "out\u00a0dir"

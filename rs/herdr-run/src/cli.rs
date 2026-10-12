@@ -28,7 +28,7 @@ use crate::runner::{execute, result_json, write_meta, RunResult};
 use crate::session::{resolve_target, tab_label_for};
 use crate::sweep::{build_evidence, load_run_records, measure_occupancy};
 use crate::textfmt::{
-    json_pretty, os_error_text, quote, strip_ascii, strip_space, whole_milliseconds,
+    display, json_pretty, name_violation, os_error_text, quote, strip_space, whole_milliseconds,
 };
 
 /// One subcommand and the single line describing it in `herdr-run --help`.
@@ -784,21 +784,44 @@ fn dispatch(invocation: Invocation) -> Result<i32> {
     }
 }
 
+/// The agent this invocation speaks for: `--agent`, else [`default_agent`].
+///
+/// An agent name, from either source, may hold no control character and no invisible character
+/// ([`name_violation`]): it names a tab somebody will read, and is printed.
 fn resolve_agent(globals: &Globals) -> Result<String> {
-    if let Some(agent) = globals.agent.as_deref().filter(|value| !value.is_empty()) {
+    resolve_agent_from(globals.agent.as_deref(), |key| std::env::var_os(key))
+}
+
+/// [`resolve_agent`] over an explicit `--agent` value and environment lookup.
+fn resolve_agent_from<F>(flag: Option<&str>, lookup: F) -> Result<String>
+where
+    F: Fn(&str) -> Option<OsString>,
+{
+    if let Some(agent) = flag.filter(|value| !value.is_empty()) {
+        if let Some(violation) = name_violation(agent) {
+            return Err(HerdrRunError::config(format!(
+                "argument --agent: an agent name may not contain {violation}"
+            )));
+        }
         return Ok(agent.to_owned());
     }
-    default_agent()
+    default_agent(lookup)
 }
 
 /// Infer the invoking agent from the environment the orchestrator sets.
 ///
-/// Values are trimmed of ASCII whitespace only, so a control character is refused when the tab
-/// label is rendered instead of being silently removed. A variable that is not valid UTF-8 is an
-/// error: skipping it would make this invocation speak for whoever the NEXT variable names.
-fn default_agent() -> Result<String> {
+/// The first of the three variables that is set and non-empty once Unicode `White_Space` is
+/// trimmed from both ends (the explicit table in [`crate::textfmt`], so a value of only U+3000 or
+/// U+00A0 counts as empty and the next variable is consulted). A value that still holds a control
+/// or invisible character after trimming is an error rather than a tab label. A variable that is
+/// not valid UTF-8 is an error too: skipping it would make this invocation speak for whoever the
+/// NEXT variable names.
+fn default_agent<F>(lookup: F) -> Result<String>
+where
+    F: Fn(&str) -> Option<OsString>,
+{
     for key in ["HERDR_RUN_AGENT", "DG_AGENT_NAME", "ORC_AGENT_NAME"] {
-        let Some(raw) = std::env::var_os(key) else {
+        let Some(raw) = lookup(key) else {
             continue;
         };
         let Ok(value) = raw.into_string() else {
@@ -806,10 +829,16 @@ fn default_agent() -> Result<String> {
                 "environment variable {key} is not valid UTF-8"
             )));
         };
-        let trimmed = strip_ascii(&value);
-        if !trimmed.is_empty() {
-            return Ok(trimmed.to_owned());
+        let trimmed = strip_space(&value);
+        if trimmed.is_empty() {
+            continue;
         }
+        if let Some(violation) = name_violation(trimmed) {
+            return Err(HerdrRunError::config(format!(
+                "environment variable {key}: an agent name may not contain {violation}"
+            )));
+        }
+        return Ok(trimmed.to_owned());
     }
     Ok("unknown-agent".to_owned())
 }
@@ -821,7 +850,7 @@ fn command_init(directory: &Path, force: bool, json_output: bool) -> Result<i32>
     } else {
         output::stdout(&format!(
             "wrote {}\nEvery knob is in that file, set to the value in force today. The allowlist near the\ntop is a HUMAN-ONLY knob: an agent that can widen its own allowlist does not have one.\n",
-            path.display()
+            display(&path.to_string_lossy())
         ))?;
     }
     Ok(0)
@@ -2105,6 +2134,25 @@ mod tests {
             resolved_cwd(&config, Some("")).unwrap(),
             Path::new("/project")
         );
+    }
+
+    #[test]
+    fn golden_agent_resolution() {
+        let document: Value =
+            serde_json::from_str(include_str!("../testdata/text_cases.json")).expect("corpus");
+        for row in document["agent"].as_array().expect("agent rows") {
+            let environment = row[0].as_object().expect("environment");
+            let lookup = |key: &str| {
+                environment
+                    .get(key)
+                    .map(|value| OsString::from(value.as_str().expect("string")))
+            };
+            let outcome = match resolve_agent_from(row[1].as_str(), lookup) {
+                Ok(agent) => json!({ "agent": agent }),
+                Err(error) => json!({ "error": error.message() }),
+            };
+            assert_eq!(outcome, row[2], "{row:?}");
+        }
     }
 
     #[test]

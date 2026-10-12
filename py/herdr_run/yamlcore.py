@@ -15,10 +15,21 @@ What is accepted
   ``key:`` followed by ``- item`` at the key's own indentation, ``- - item``, and ``- key: value``),
   and flow collections (``[a, b]``, ``{a: [b], c}``), which may span lines.
 * Single-line plain, single-quoted, and double-quoted scalars (with every YAML double-quote escape).
-* The core tags ``!!str``, ``!!int``, ``!!float``, ``!!bool``, ``!!null`` on scalars, ``!!seq`` on a
-  sequence and ``!!map`` on a mapping. Tags are applied with YAML 1.2 core-schema rules.
-* Plain scalars resolve by the YAML 1.2 core schema: ``null``/``~``/empty, ``true``/``false``,
-  decimal (without leading zeros), ``0o``, ``0x``, and ``0b`` integers, and decimal floats.
+* The tags ``!!str``, ``!!int``, ``!!float``, ``!!bool``, ``!!null`` on scalars, ``!!seq`` on a
+  sequence and ``!!map`` on a mapping. ``!!int``, ``!!bool``, and ``!!null`` accept exactly the
+  spellings plain scalars resolve to below; ``!!float`` accepts any decimal number, including an
+  integer spelling with leading zeros (``!!float 007`` is ``7.0``); ``!!str`` accepts anything.
+* Plain scalars resolve by herdr-run's own rule. It is close to the YAML 1.2 core schema but not
+  the same, and this is the whole of it:
+
+  - null: empty, ``~``, ``null``, ``Null``, ``NULL``;
+  - bool: ``true``, ``True``, ``TRUE``, ``false``, ``False``, ``FALSE``;
+  - integer: ``[-+]?(0|[1-9][0-9]*)`` (decimal WITHOUT leading zeros), ``[-+]?0o[0-7]+``,
+    ``[-+]?0x[0-9a-fA-F]+``, and ``[-+]?0b[01]+``. The core schema reads ``007`` as 7, has no
+    ``0b`` form, and does not sign ``0o``/``0x``; here ``007`` is a string and ``0b101`` is 5;
+  - float: ``[-+]?(\\.[0-9]+|[0-9]+\\.[0-9]*)([eE][-+]?[0-9]+)?`` or ``[-+]?[0-9]+[eE][-+]?[0-9]+``;
+    the ``.inf`` and ``.nan`` spellings are refused rather than read;
+  - anything else -- ``yes``, ``on``, ``1_000``, ``007`` -- is a string.
 
 What is refused, each with its own message and a line and column
 -----------------------------------------------------------------
@@ -26,7 +37,8 @@ Anchors and aliases, block scalars (``|``, ``>``), explicit keys (``?``), multi-
 quoted scalars, every other tag, ``%TAG`` and unknown directives, other ``%YAML`` versions, a second
 document, non-string and duplicate mapping keys, merge keys (``<<``), non-finite numbers, a float
 that overflows, a tab anywhere outside a quoted scalar or a comment, characters YAML does not allow
-in a stream, and collections nested more than 128 levels deep. An integer whose magnitude exceeds
+in a stream, a raw U+0085, U+2028, or U+2029 anywhere (YAML 1.1 reads each as a line break and YAML
+1.2 does not), and collections nested more than 128 levels deep. An integer whose magnitude exceeds
 10**38 reads as 10**38: it exceeds every bound the configuration checks.
 """
 
@@ -98,6 +110,19 @@ _HEX_ESCAPES = {"x": 2, "u": 4, "U": 8}
 
 _TAB_MESSAGE = "tab characters are only allowed inside quoted scalars and comments"
 
+#: NEXT LINE, LINE SEPARATOR, and PARAGRAPH SEPARATOR. YAML 1.1 breaks a line at each of them and
+#: YAML 1.2 at none, so a file holding one raw means different things to different readers: a deny
+#: entry written ``-c<U+2028>`` is ``-c`` to one and a longer name nothing matches to the other.
+#: They are refused anywhere in the file, comments included; a double-quoted escape (``\N``,
+#: ``\L``, ``\P``) still writes one explicitly, and the configuration rules then decide.
+_AMBIGUOUS_BREAKS = frozenset({0x85, 0x2028, 0x2029})
+
+
+def _ambiguous_break_message(code: int) -> str:
+    return (
+        f"U+{code:04X} is not allowed: YAML 1.1 reads it as a line break and YAML 1.2 does not"
+    )
+
 
 class YamlError(ValueError):
     """A configuration document outside the accepted subset, with a 1-based position."""
@@ -136,10 +161,11 @@ class _Parser:
         for number, line in enumerate(self.lines):
             for column, character in enumerate(line):
                 code = ord(character)
+                if code in _AMBIGUOUS_BREAKS:
+                    raise YamlError(_ambiguous_break_message(code), number + 1, column + 1)
                 if not (
                     character == "\t"
                     or 0x20 <= code <= 0x7E
-                    or code == 0x85
                     or 0xA0 <= code <= 0xD7FF
                     or 0xE000 <= code <= 0xFFFD
                     or 0x10000 <= code <= 0x10FFFF
@@ -892,7 +918,7 @@ def _clamp(value: int) -> int:
 
 
 def _integer(text: str) -> int | None:
-    """Resolve a core-schema integer, clamped to +/-10**38, or return ``None``."""
+    """Resolve an integer spelling (see the module docstring), clamped to +/-10**38, or ``None``."""
     if _RE_INT_DEC.fullmatch(text):
         sign = -1 if text.startswith("-") else 1
         digits = text.lstrip("+-")

@@ -25,7 +25,7 @@ from dataclasses import dataclass, field, replace
 
 from herdr_run.errors import ConfigError
 from herdr_run.retention import MAX_RETENTION_DAYS
-from herdr_run.textfmt import os_error_text, quote
+from herdr_run.textfmt import display, name_violation, os_error_text, quote
 from herdr_run.yamlcore import YamlError, core_load
 
 __all__ = [
@@ -355,9 +355,23 @@ def _reject_controls(value: str, what: str) -> None:
 
 
 def _policy_name(raw: object, what: str) -> str:
+    """A name the policy compares with typed text: a program, a wrapper, an option, a subcommand,
+    a workspace, a tab schema, or a shell.
+
+    Besides control characters it may hold no invisible character -- a format character such as a
+    zero-width space, a byte-order mark, or a bidirectional override, or a non-ASCII space such as
+    U+00A0 or U+2028 -- because a name holding one looks exactly like the name without it, and a
+    deny entry that looks like ``-c`` but is not would never match the ``-c`` it appears to deny.
+    """
     value = _text(raw, what)
     if not value:
         raise ConfigError(f"{what}: must not be empty")
+    violation = name_violation(value)
+    if violation is not None:
+        raise ConfigError(
+            f"{what}: {quote(value)} contains {violation}; a name may not contain one, "
+            "because it would look like a name it is not"
+        )
     return value
 
 
@@ -492,7 +506,9 @@ def _parse_config(
     if document is None:
         return Config(source_path=source_path, project_root=project_root)
 
-    what = source_path or "<config>"
+    # The path heads every message below; `display` keeps a control character in a directory name
+    # from reaching the terminal raw.
+    what = display(source_path) if source_path else "<config>"
     mapping = _object(document, what)
 
     known = set(KNOWN_KEYS)
@@ -594,11 +610,11 @@ def load_config(*, explicit_path: str | None, start_dir: str) -> Config:
     if _has_surrogates(start):
         # Paths derived from this directory name the spool, the audit log, and the session cache.
         # Converting it lossily would retarget those writes into a different directory.
-        raise ConfigError(f"current directory is not valid UTF-8: {_lossy(start)}")
+        raise ConfigError(f"current directory is not valid UTF-8: {quote(_lossy(start))}")
     path = explicit_path
     if path is not None:
         if not os.path.isfile(path):
-            raise ConfigError(f"config file not found: {path}")
+            raise ConfigError(f"config file not found: {display(path)}")
         path = _absolute(path)
     else:
         path = find_config_file(start)
@@ -611,15 +627,19 @@ def load_config(*, explicit_path: str | None, start_dir: str) -> Config:
         with open(path, "rb") as handle:
             payload = handle.read()
     except OSError as exc:
-        raise ConfigError(f"cannot read config file {path}: {os_error_text(exc)}") from exc
+        raise ConfigError(
+            f"cannot read config file {display(path)}: {os_error_text(exc)}"
+        ) from exc
     try:
         text = payload.decode("utf-8")
     except UnicodeDecodeError as exc:
-        raise ConfigError(f"cannot read config file {path}: the file is not valid UTF-8") from exc
+        raise ConfigError(
+            f"cannot read config file {display(path)}: the file is not valid UTF-8"
+        ) from exc
 
     try:
         document = core_load(text)
     except YamlError as exc:
-        raise ConfigError(f"{path}: invalid YAML: {exc}") from exc
+        raise ConfigError(f"{display(path)}: invalid YAML: {exc}") from exc
 
     return parse_config(document, source_path=path, project_root=project_root)

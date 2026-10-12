@@ -12,7 +12,7 @@ import os
 
 from herdr_run.config import CONFIG_FILENAMES, _has_surrogates, _lossy
 from herdr_run.errors import ConfigError
-from herdr_run.textfmt import os_error_text
+from herdr_run.textfmt import display, os_error_text, quote
 
 __all__ = ["config_template", "write_config_template"]
 
@@ -44,7 +44,7 @@ def write_config_template(directory: str, *, force: bool) -> str:
     file written there could never be loaded.
     """
     if _has_surrogates(directory):
-        raise ConfigError(f"current directory is not valid UTF-8: {_lossy(directory)}")
+        raise ConfigError(f"current directory is not valid UTF-8: {quote(_lossy(directory))}")
     destination = os.path.join(directory, CONFIG_FILENAMES[0])
     if not force:
         for filename in CONFIG_FILENAMES:
@@ -57,7 +57,7 @@ def write_config_template(directory: str, *, force: bool) -> str:
                 else f", and the {CONFIG_FILENAMES[0]} this would write takes precedence over it"
             )
             raise ConfigError(
-                f"{existing} already exists{precedence}; pass --force to overwrite"
+                f"{display(existing)} already exists{precedence}; pass --force to overwrite"
             )
     text = config_template()
     # "x" without --force, so a file created between the check above and this open is still not
@@ -66,5 +66,5 @@ def write_config_template(directory: str, *, force: bool) -> str:
         with open(destination, "w" if force else "x", encoding="utf-8") as handle:
             handle.write(text)
     except OSError as exc:
-        raise ConfigError(f"cannot write {destination}: {os_error_text(exc)}") from exc
+        raise ConfigError(f"cannot write {display(destination)}: {os_error_text(exc)}") from exc
     return destination

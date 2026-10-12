@@ -11,6 +11,7 @@ use std::path::{Path, PathBuf};
 
 use crate::config::CONFIG_FILENAMES;
 use crate::error::{HerdrRunError, Result};
+use crate::textfmt::{display, quote};
 
 /// The complete annotated `.herdr-run.yaml` written by `herdr-run init`.
 pub const CONFIG_TEMPLATE: &str = include_str!("config_template.yaml");
@@ -27,7 +28,7 @@ pub fn write_config_template(directory: &Path, force: bool) -> Result<PathBuf> {
     if directory.to_str().is_none() {
         return Err(HerdrRunError::config(format!(
             "current directory is not valid UTF-8: {}",
-            directory.to_string_lossy()
+            quote(&directory.to_string_lossy())
         )));
     }
     let destination = directory.join(CONFIG_FILENAMES[0]);
@@ -47,7 +48,7 @@ pub fn write_config_template(directory: &Path, force: bool) -> Result<PathBuf> {
             };
             return Err(HerdrRunError::config(format!(
                 "{} already exists{precedence}; pass --force to overwrite",
-                existing.display()
+                display(&existing.to_string_lossy())
             )));
         }
     }
@@ -59,12 +60,18 @@ pub fn write_config_template(directory: &Path, force: bool) -> Result<PathBuf> {
         options.create_new(true);
     }
     let mut file = options.open(&destination).map_err(|error| {
-        HerdrRunError::config(format!("cannot write {}: {error}", destination.display()))
+        HerdrRunError::config(format!(
+            "cannot write {}: {error}",
+            display(&destination.to_string_lossy())
+        ))
     })?;
     file.write_all(CONFIG_TEMPLATE.as_bytes())
         .and_then(|()| file.flush())
         .map_err(|error| {
-            HerdrRunError::config(format!("cannot write {}: {error}", destination.display()))
+            HerdrRunError::config(format!(
+                "cannot write {}: {error}",
+                display(&destination.to_string_lossy())
+            ))
         })?;
     Ok(destination)
 }

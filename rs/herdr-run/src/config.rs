@@ -12,7 +12,7 @@ use std::fs;
 use std::path::{Component, Path, PathBuf};
 
 use crate::error::{HerdrRunError, Result};
-use crate::textfmt::{os_error_text, quote, whole_milliseconds};
+use crate::textfmt::{display, name_violation, os_error_text, quote, whole_milliseconds};
 use crate::yaml::{core_load, Yaml};
 /// Accepted configuration basenames, in preference order at each directory.
 pub const CONFIG_FILENAMES: [&str; 2] = [".herdr-run.yaml", ".herdr-run.yml"];
@@ -278,14 +278,14 @@ pub fn load_config(explicit_path: Option<&Path>, start_dir: &Path) -> Result<Con
         // Converting it lossily would retarget those writes into a different directory.
         return Err(HerdrRunError::config(format!(
             "current directory is not valid UTF-8: {}",
-            start.to_string_lossy()
+            quote(&start.to_string_lossy())
         )));
     };
     let path = if let Some(explicit) = explicit_path {
         if !explicit.is_file() {
             return Err(HerdrRunError::config(format!(
                 "config file not found: {}",
-                explicit.display()
+                display(&explicit.to_string_lossy())
             )));
         }
         Some(absolute_lexical(explicit)?)
@@ -300,19 +300,20 @@ pub fn load_config(explicit_path: Option<&Path>, start_dir: &Path) -> Result<Con
         });
     };
     let path_text = path.to_string_lossy().into_owned();
+    let shown = display(&path_text);
     let payload = fs::read(&path).map_err(|error| {
         HerdrRunError::config(format!(
-            "cannot read config file {path_text}: {}",
+            "cannot read config file {shown}: {}",
             os_error_text(&error)
         ))
     })?;
     let text = String::from_utf8(payload).map_err(|_| {
         HerdrRunError::config(format!(
-            "cannot read config file {path_text}: the file is not valid UTF-8"
+            "cannot read config file {shown}: the file is not valid UTF-8"
         ))
     })?;
     let document = core_load(&text)
-        .map_err(|error| HerdrRunError::config(format!("{path_text}: invalid YAML: {error}")))?;
+        .map_err(|error| HerdrRunError::config(format!("{shown}: invalid YAML: {error}")))?;
     let root = path.parent().unwrap_or_else(|| Path::new("/"));
     let root = if root.as_os_str().is_empty() {
         Path::new("/")
@@ -372,10 +373,23 @@ fn require_text(value: &Yaml, what: &str) -> Result<String> {
     Ok(text.clone())
 }
 
+/// A name the policy compares with typed text: a program, a wrapper, an option, a subcommand, a
+/// workspace, a tab schema, or a shell.
+///
+/// Besides control characters it may hold no invisible character -- a format character such as a
+/// zero-width space, a byte-order mark, or a bidirectional override, or a non-ASCII space such as
+/// U+00A0 or U+2028 -- because a name holding one looks exactly like the name without it, and a
+/// deny entry that looks like `-c` but is not would never match the `-c` it appears to deny.
 fn require_policy_name(value: &Yaml, what: &str) -> Result<String> {
     let text = require_text(value, what)?;
     if text.is_empty() {
         return Err(HerdrRunError::config(format!("{what}: must not be empty")));
+    }
+    if let Some(violation) = name_violation(&text) {
+        return Err(HerdrRunError::config(format!(
+            "{what}: {} contains {violation}; a name may not contain one, because it would look like a name it is not",
+            quote(&text)
+        )));
     }
     Ok(text)
 }
@@ -596,7 +610,12 @@ pub fn parse_config(
     if matches!(document, Yaml::Null) {
         return Ok(config);
     }
-    let what = source_path.as_deref().unwrap_or("<config>");
+    // The path heads every message below; `display` keeps a control character in a directory name
+    // from reaching the terminal raw.
+    let shown = source_path
+        .as_deref()
+        .map_or_else(|| "<config>".to_owned(), display);
+    let what = shown.as_str();
     let mapping = require_object(document, what)?;
     let mut unknown: Vec<&str> = mapping
         .iter()
@@ -921,7 +940,7 @@ mod tests {
     }
 
     #[test]
-    fn yaml_uses_core_12_scalar_resolution() {
+    fn plain_scalars_resolve_by_the_documented_rule() {
         let config =
             parse_text("workspace: yes\nallow: [git, on, off]\ntimeout_seconds: 0o10\n").unwrap();
         assert_eq!(config.workspace, "yes");
@@ -977,5 +996,67 @@ mod tests {
             Some(expected_source.as_str())
         );
         fs::remove_dir_all(root).unwrap();
+    }
+
+    /// The reported repro, byte for byte: a deny entry ending in U+2028, which YAML 1.1 reads as a
+    /// line break and YAML 1.2 does not. It was accepted and never matched, so `git -c ...` ran.
+    #[test]
+    fn a_raw_yaml_1_1_line_break_is_refused() {
+        let root = temporary_directory("line-separator");
+        let path = root.join(".herdr-run.yaml");
+        for document in [
+            &b"allow: [git]\ndeny_global:\n  git: [-c\xe2\x80\xa8, --exec-path\xe2\x80\xa9]\n"[..],
+            &b"deny_anywhere: [--upload-pack\xe2\x80\xa8]\n"[..],
+            &b"value_options:\n  git: [-C\xe2\x80\xa9]\n"[..],
+            &b"allow: [git]\n# a comment\xc2\x85allow: [curl]\n"[..],
+        ] {
+            fs::write(&path, document).unwrap();
+            let error = load_config(Some(&path), &root).expect_err("must be refused");
+            assert_eq!(error.exit_code(), crate::error::EXIT_CONFIG);
+            assert!(
+                error
+                    .message()
+                    .contains("YAML 1.1 reads it as a line break"),
+                "{error}"
+            );
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn an_invisible_character_in_a_policy_name_is_refused() {
+        for (document, place) in [
+            (
+                "allow: [git]\ndeny_global:\n  git: [\"-c\\L\", --exec-path]\n",
+                "deny_global.git[0]",
+            ),
+            (
+                "deny_anywhere: [\"--upload-pack\\u200b\"]\n",
+                "deny_anywhere[0]",
+            ),
+            (
+                "value_options:\n  git: [\"-C\\ufeff\"]\n",
+                "value_options.git[0]",
+            ),
+            ("allow: [\"git\\u00a0\"]\n", "allow[0]"),
+            ("prefixes: [\"with-proxy\\u202e\"]\n", "prefixes[0]"),
+            ("workspace: \"agent\\u2060cmds\"\n", "workspace"),
+            (
+                "deny_subcommand:\n  \"git\\u3000\": [daemon]\n",
+                "deny_subcommand key",
+            ),
+        ] {
+            let error = parse_text(document).expect_err(document);
+            let message = error.message();
+            assert!(message.contains(&format!(".{place}: ")), "{message}");
+            assert!(message.contains("invisible character U+"), "{message}");
+        }
+        let config = parse_text(
+            "workspace: café\nprompt_tail: \"\\u00a0$ \"\nspool_dir: \"out\\u00a0dir\"\n",
+        )
+        .unwrap();
+        assert_eq!(config.workspace, "café");
+        assert_eq!(config.prompt_tail.as_deref(), Some("\u{a0}$ "));
+        assert_eq!(config.spool_dir, "out\u{a0}dir");
     }
 }

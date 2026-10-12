@@ -43,7 +43,14 @@ from herdr_run.readiness import assess, infer_prompt_tail
 from herdr_run.runner import RunResult, execute, read_output_bytes, write_meta
 from herdr_run.session import resolve_target, tab_label_for
 from herdr_run.sweep import load_run_records, measure_occupancy, sweep
-from herdr_run.textfmt import format_round3, os_error_text, quote, strip_ascii, strip_space
+from herdr_run.textfmt import (
+    display,
+    format_round3,
+    name_violation,
+    os_error_text,
+    quote,
+    strip_space,
+)
 
 __all__ = ["main", "help_text", "subcommand_help_text", "surface_document", "usage_line"]
 
@@ -748,7 +755,15 @@ def _print_subcommand_help(name: str) -> None:
 
 
 def _resolve_agent(globals_: _Globals, environ: Mapping[str, str]) -> str:
+    """The agent this invocation speaks for: ``--agent``, else :func:`_default_agent`.
+
+    An agent name, from either source, may hold no control character and no invisible character
+    (:func:`herdr_run.textfmt.name_violation`): it names a tab somebody will read, and is printed.
+    """
     if globals_.agent:
+        violation = name_violation(globals_.agent)
+        if violation is not None:
+            raise ConfigError(f"argument --agent: an agent name may not contain {violation}")
         return globals_.agent
     return _default_agent(environ)
 
@@ -756,9 +771,12 @@ def _resolve_agent(globals_: _Globals, environ: Mapping[str, str]) -> str:
 def _default_agent(environ: Mapping[str, str]) -> str:
     """Infer the invoking agent from the environment the orchestrator sets.
 
-    Values are trimmed of ASCII whitespace only, so a control character is refused when the tab
-    label is rendered instead of being silently removed. A variable that is not valid UTF-8 is an
-    error: skipping it would make this invocation speak for whoever the NEXT variable names.
+    The first of the three variables that is set and non-empty once Unicode ``White_Space`` is
+    trimmed from both ends (the explicit table in :mod:`herdr_run.textfmt`, so a value of only
+    U+3000 or U+00A0 counts as empty and the next variable is consulted). A value that still holds
+    a control or invisible character after trimming is an error rather than a tab label. A variable
+    that is not valid UTF-8 is an error too: skipping it would make this invocation speak for
+    whoever the NEXT variable names.
     """
     for key in ("HERDR_RUN_AGENT", "DG_AGENT_NAME", "ORC_AGENT_NAME"):
         raw = environ.get(key)
@@ -766,9 +784,15 @@ def _default_agent(environ: Mapping[str, str]) -> str:
             continue
         if any(0xD800 <= ord(character) <= 0xDFFF for character in raw):
             raise ConfigError(f"environment variable {key} is not valid UTF-8")
-        value = strip_ascii(raw)
-        if value:
-            return value
+        value = strip_space(raw)
+        if not value:
+            continue
+        violation = name_violation(value)
+        if violation is not None:
+            raise ConfigError(
+                f"environment variable {key}: an agent name may not contain {violation}"
+            )
+        return value
     return "unknown-agent"
 
 
@@ -837,7 +861,7 @@ def _cmd_init(directory: str, *, force: bool, json_output: bool) -> int:
         _emit_json({"created": True, "path": path})
     else:
         output.stdout(
-            f"wrote {path}\n"
+            f"wrote {display(path)}\n"
             "Every knob is in that file, set to the value in force today. The allowlist near the\n"
             "top is a HUMAN-ONLY knob: an agent that can widen its own allowlist does not have one.\n"
         )

@@ -405,6 +405,71 @@
       "name": "tag then scalar on next line",
       "text": "a: !!str\n  x\n",
       "error": "a tag must be on the same line as its scalar at line 1 column 4"
+    },
+    {
+      "name": "raw line separator in a deny entry",
+      "text": "allow: [git]\ndeny_global:\n  git: [-c\u2028, --exec-path\u2029]\n",
+      "error": "U+2028 is not allowed: YAML 1.1 reads it as a line break and YAML 1.2 does not at line 3 column 11"
+    },
+    {
+      "name": "raw paragraph separator in a plain scalar",
+      "text": "a: b\u2029c\n",
+      "error": "U+2029 is not allowed: YAML 1.1 reads it as a line break and YAML 1.2 does not at line 1 column 5"
+    },
+    {
+      "name": "raw next line in a comment",
+      "text": "# x\u0085allow: [curl]\na: b\n",
+      "error": "U+0085 is not allowed: YAML 1.1 reads it as a line break and YAML 1.2 does not at line 1 column 4"
+    },
+    {
+      "name": "raw line separator in a quoted scalar",
+      "text": "a: 'x\u2028y'\n",
+      "error": "U+2028 is not allowed: YAML 1.1 reads it as a line break and YAML 1.2 does not at line 1 column 6"
+    },
+    {
+      "name": "escaped separators are explicit",
+      "text": "a: \"x\\Ly\\Pz\\N\"\n",
+      "value": "{\"a\": \"x\\u{2028}y\\u{2029}z\\u{85}\"}"
+    },
+    {
+      "name": "raw no-break space is ordinary",
+      "text": "a: b\u00a0c\n",
+      "value": "{\"a\": \"b\\u{a0}c\"}"
+    },
+    {
+      "name": "raw zero-width space is ordinary",
+      "text": "a\u200b: b\n",
+      "value": "{\"a\\u{200b}\": \"b\"}"
+    },
+    {
+      "name": "decimal with a leading zero is a string",
+      "text": "a: 007\nb: -00\n",
+      "value": "{\"a\": \"007\", \"b\": \"-00\"}"
+    },
+    {
+      "name": "signed radix integers",
+      "text": "a: 0b101\nb: +0x10\nc: -0o7\nd: 0B1\n",
+      "value": "{\"a\": 5, \"b\": 16, \"c\": -7, \"d\": \"0B1\"}"
+    },
+    {
+      "name": "underscore digits are a string",
+      "text": "a: 1_000\n",
+      "value": "{\"a\": \"1_000\"}"
+    },
+    {
+      "name": "float tag reads leading zeros",
+      "text": "a: !!float 007\n",
+      "value": "{\"a\": 7.0}"
+    },
+    {
+      "name": "int tag refuses leading zeros",
+      "text": "a: !!int 007\n",
+      "error": "\"007\" is not a valid !!int value at line 1 column 10"
+    },
+    {
+      "name": "yaml 1.1 booleans are strings",
+      "text": "a: [yes, no, on, off, y, n]\n",
+      "value": "{\"a\": [\"yes\", \"no\", \"on\", \"off\", \"y\", \"n\"]}"
     }
   ]
 }
