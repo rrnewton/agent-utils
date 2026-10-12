@@ -133,6 +133,7 @@ impl ChatRouter {
                         channel_registration: slack.channel_registration,
                         registered_channels_writable: slack.registered_channels_writable,
                         channel_discovery: slack.channel_discovery,
+                        upstream_clear: slack.upstream_clear,
                     },
                 )?),
             };

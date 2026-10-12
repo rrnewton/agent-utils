@@ -2,8 +2,11 @@
 //!
 //! Deterministic data, a configurable page cap (real servers may answer with fewer messages than
 //! asked for), per-method call counters, injectable `ok:false` errors and a one-shot 429. It
-//! implements exactly the seven methods the client is allowed to call and answers
+//! implements exactly the eight methods the client is allowed to call and answers
 //! `unknown_method` for anything else, so a test fails if the client strays outside the subset.
+//!
+//! `conversations.mark` behaves as Slack's does: it moves the read cursor wherever it is told,
+//! backwards too, so a test can see whether the CLIENT kept it from going back.
 
 #![allow(dead_code)]
 
@@ -26,7 +29,7 @@ pub const SELF_USER: &str = "UBOTSELF1";
 pub const BASE_SECS: i64 = 1_700_000_000;
 
 /// The methods the fake implements, which are the only ones the client may use.
-pub const METHODS: [&str; 7] = [
+pub const METHODS: [&str; 8] = [
     "auth.test",
     "conversations.info",
     "conversations.history",
@@ -34,6 +37,7 @@ pub const METHODS: [&str; 7] = [
     "chat.postMessage",
     "users.info",
     "users.conversations",
+    "conversations.mark",
 ];
 
 /// Everything the fake knows and records.
@@ -63,6 +67,13 @@ pub struct FakeState {
     pub root_always: bool,
     /// The next posted message's microsecond offset past the newest fixture.
     pub post_counter: i64,
+    /// The account's read cursor per conversation, as `conversations.info` reports `last_read`.
+    /// A conversation with none here answers without `last_read`, as an older bridge does.
+    pub last_read: HashMap<String, String>,
+    /// `conversations.info` reports this conversation with `is_member: false`.
+    pub not_member: Vec<String>,
+    /// Every `conversations.mark`, in order: conversation and `ts`.
+    pub marks: Vec<(String, String)>,
 }
 
 impl FakeState {
@@ -119,7 +130,17 @@ impl Fake {
             channel_registration: true,
             registered_channels_writable: true,
             channel_discovery: true,
+            upstream_clear: false,
         }
+    }
+
+    /// A client against this fake with clearing unread in Slack turned on.
+    pub fn clearing_client(&self) -> HttpSlackClient {
+        HttpSlackClient::new(&SlackConfig {
+            upstream_clear: true,
+            ..self.config()
+        })
+        .expect("client")
     }
 
     /// A client against this fake.
@@ -359,10 +380,27 @@ fn handle(shared: &Mutex<FakeState>, uri: &Uri, headers: &HeaderMap, body: &[u8]
         ),
         "conversations.info" => {
             if state.history.contains_key(&channel) {
-                ok(json!({"channel": {"id": channel, "name": "general", "is_archived": false}}))
+                let mut info = json!({"id": channel, "name": "general", "is_archived": false});
+                if let Some(cursor) = state.last_read.get(&channel) {
+                    info["last_read"] = json!(cursor);
+                }
+                if state.not_member.contains(&channel) {
+                    info["is_member"] = json!(false);
+                }
+                ok(json!({ "channel": info }))
             } else {
                 err("channel_not_found")
             }
+        }
+        "conversations.mark" => {
+            if !state.history.contains_key(&channel) {
+                return err("channel_not_found");
+            }
+            let ts = params.get("ts").cloned().unwrap_or_default();
+            // Slack's own behaviour: no comparison, backwards included.
+            state.last_read.insert(channel.clone(), ts.clone());
+            state.marks.push((channel, ts));
+            ok(json!({}))
         }
         "conversations.history" => match state.history.get(&channel) {
             Some(list) => ok(window(list.clone(), &params, cap, true)),

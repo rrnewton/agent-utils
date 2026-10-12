@@ -232,6 +232,7 @@ fn offline_client() -> HttpSlackClient {
         channel_registration: true,
         registered_channels_writable: false,
         channel_discovery: false,
+        upstream_clear: false,
     })
     .expect("client")
 }
@@ -266,6 +267,10 @@ fn the_client_claims_slack_references_and_nothing_else() {
     );
     assert!(client.supports_threading());
     assert!(!client.supports_upstream_read_mark());
+    assert!(
+        !client.supports_upstream_clear(),
+        "clearing unread in Slack is off unless configured"
+    );
     assert!(client.supports_channel_registration());
     assert!(!client.supports_channel_discovery());
 }
@@ -281,6 +286,7 @@ fn a_non_http_api_base_is_refused_at_construction() {
         channel_registration: false,
         registered_channels_writable: false,
         channel_discovery: false,
+        upstream_clear: false,
     };
     assert!(HttpSlackClient::new(&config).is_err());
     config.api_base = "ftp://slack.com/api".to_owned();

@@ -13,8 +13,11 @@
 //! | `chat.postMessage` | every post, in a conversation or in a thread |
 //! | `users.info` | an author's display name when the message does not carry one |
 //! | `users.conversations` | the channel browser |
+//! | `conversations.mark` | clearing unread in Slack, only with `upstream_clear` on (`slack/clear.rs`) |
 //!
 //! Every call is a form-encoded `POST {api_base}/{method}` with `Authorization: Bearer <token>`.
+//! With `upstream_clear` on, `conversations.info` is also read for the account's cursor,
+//! `last_read`, before every mark.
 //!
 //! # Identity mapping
 //!
@@ -27,8 +30,15 @@
 //!
 //! There is no Events API or Socket Mode connection: new messages arrive through the server's
 //! ordinary bounded live polling, which reads a conversation's main timeline (thread replies are
-//! read when a thread or a thread-scoped channel is opened). There are no upstream read marks.
+//! read when a thread or a thread-scoped channel is opened).
+//!
+//! There is no manual "Mark read in Slack" on a message. The one upstream write besides posting is
+//! the automatic clear of [`crate::upstream_clear`], off unless the deployment sets
+//! `upstream_clear`: it moves the conversation's read cursor forward, never back, and cannot mark
+//! a thread read, because Slack offers no way to with this kind of token. Replies inside threads
+//! therefore stay unread in Slack, and a channel narrowed to one thread is refused.
 
+mod clear;
 mod client;
 mod history;
 pub mod ids;
@@ -61,4 +71,7 @@ pub struct SlackConfig {
     pub registered_channels_writable: bool,
     /// Whether the channel browser lists the conversations this account belongs to.
     pub channel_discovery: bool,
+    /// Whether the server may clear a conversation's unread state in Slack's own client, moving
+    /// the token's read cursor with `conversations.mark` (`slack/clear.rs`). Off by default.
+    pub upstream_clear: bool,
 }

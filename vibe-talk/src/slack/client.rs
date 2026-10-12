@@ -112,6 +112,8 @@ pub struct HttpSlackClient {
     pub(super) channel_registration: bool,
     pub(super) registered_writable: bool,
     pub(super) channel_discovery: bool,
+    /// Whether the server may move this account's Slack read cursor; see `super::clear`.
+    pub(super) upstream_clear: bool,
     /// The account this client posts as, learned from `auth.test` or from its first post.
     self_user_id: Mutex<Option<String>>,
     users: Mutex<HashMap<String, CachedUser>>,
@@ -167,6 +169,7 @@ impl HttpSlackClient {
             channel_registration: config.channel_registration,
             registered_writable: config.registered_channels_writable,
             channel_discovery: config.channel_discovery,
+            upstream_clear: config.upstream_clear,
             self_user_id: Mutex::new(None),
             users: Mutex::new(HashMap::new()),
             threaded: Mutex::new(HashSet::new()),
@@ -299,6 +302,32 @@ impl HttpSlackClient {
             status,
             body: self.redact(&body).chars().take(500).collect(),
         }
+    }
+
+    /// The Slack `error` code inside a failure `slack_error` made for `method`,
+    /// and the scope Slack said was needed, when it said one.
+    ///
+    /// `None` for any other failure: a transport fault, a rate limit, or another method's answer.
+    pub(super) fn slack_error_code<'e>(
+        error: &'e ChatError,
+        method: &str,
+    ) -> Option<(&'e str, Option<&'e str>)> {
+        let ChatError::Status { body, .. } = error.cause() else {
+            return None;
+        };
+        let rest = body.strip_prefix(method)?.strip_prefix(" answered ")?;
+        let end = rest
+            .find(|c: char| !(c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_'))
+            .unwrap_or(rest.len());
+        let (code, tail) = rest.split_at(end);
+        if code.is_empty() {
+            return None;
+        }
+        let needed = tail
+            .strip_prefix(" (needed scope: ")
+            .and_then(|scope| scope.strip_suffix(')'))
+            .filter(|scope| !scope.is_empty());
+        Some((code, needed))
     }
 
     fn redact(&self, text: &str) -> String {
@@ -735,8 +764,26 @@ impl ChatClient for HttpSlackClient {
             .map_err(|error| error.with_provider(&self.provider_name))
     }
 
+    /// The owner's manual "Mark read in" a message is not offered: only the automatic clear is.
     fn supports_upstream_read_mark(&self) -> bool {
         false
+    }
+
+    /// Only when the deployment turned on `upstream_clear` for this provider. `#258
+    /// slack-clear-unread`.
+    fn supports_upstream_clear(&self) -> bool {
+        self.upstream_clear
+    }
+
+    async fn clear_upstream_through(
+        &self,
+        channel: &ChannelId,
+        through: &MessageId,
+        dry_run: bool,
+    ) -> Result<crate::chat::UpstreamClearOutcome, ChatError> {
+        self.clear_through(channel, through, dry_run)
+            .await
+            .map_err(|error| error.with_provider(&self.provider_name))
     }
 
     async fn identity(&self) -> Result<ChatIdentity, ChatError> {
@@ -783,5 +830,58 @@ impl ChatClient for HttpSlackClient {
         self.post(channel, content, reply_to)
             .await
             .map_err(|error| error.with_provider(&self.provider_name))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn client() -> HttpSlackClient {
+        HttpSlackClient::new(&SlackConfig {
+            provider_name: "Slack".to_owned(),
+            api_base: "https://slack.example/api".to_owned(),
+            token: Secret::new("xoxp-not-a-real-token"),
+            owner_user_id: None,
+            request_timeout_seconds: 5,
+            channel_registration: false,
+            registered_channels_writable: false,
+            channel_discovery: false,
+            upstream_clear: false,
+        })
+        .expect("client")
+    }
+
+    #[test]
+    fn a_slack_error_code_is_read_back_out_of_the_failure_it_became() {
+        let client = client();
+        let scoped = client.slack_error(
+            "conversations.mark",
+            "missing_scope",
+            &serde_json::json!({"ok": false, "error": "missing_scope", "needed": "groups:write"}),
+        );
+        assert_eq!(
+            HttpSlackClient::slack_error_code(&scoped, "conversations.mark"),
+            Some(("missing_scope", Some("groups:write")))
+        );
+        let wrapped = client
+            .slack_error("conversations.info", "unknown_method", &Value::Null)
+            .with_provider("Slack");
+        assert_eq!(
+            HttpSlackClient::slack_error_code(&wrapped, "conversations.info"),
+            Some(("unknown_method", None))
+        );
+        assert_eq!(
+            HttpSlackClient::slack_error_code(&wrapped, "conversations.mark"),
+            None,
+            "another method's answer is not this one's"
+        );
+        assert_eq!(
+            HttpSlackClient::slack_error_code(
+                &ChatError::Transport("reset".to_owned()),
+                "conversations.mark"
+            ),
+            None
+        );
     }
 }

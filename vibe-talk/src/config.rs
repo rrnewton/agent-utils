@@ -534,6 +534,9 @@ pub struct SlackSettings {
     pub registered_channels_writable: bool,
     /// Whether the app may list the conversations the token's account belongs to.
     pub channel_discovery: bool,
+    /// Whether Settings may offer "Clear unread in Slack" for this provider's channels, moving the
+    /// token's own read cursor with `conversations.mark`. Off by default. `#258 slack-clear-unread`.
+    pub upstream_clear: bool,
 }
 
 /// How one provider is reached.
@@ -843,6 +846,7 @@ struct FileProvider {
     // Slack providers only.
     registered_channels_writable: Option<bool>,
     channel_discovery: Option<bool>,
+    upstream_clear: Option<bool>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -2241,6 +2245,10 @@ fn provider_entry<'e>(
             if entry.channel_discovery.is_some() {
                 return Err(refuse("channel_discovery", "discord"));
             }
+            // A Discord-protocol bridge opts in to clearing with `upstream_read_marks`.
+            if entry.upstream_clear.is_some() {
+                return Err(refuse("upstream_clear", "discord"));
+            }
             ProviderKind::Discord(discord_protocol(
                 &format!("providers.{key}"),
                 name.clone(),
@@ -2287,6 +2295,7 @@ fn provider_entry<'e>(
                 channel_registration: entry.channel_registration.unwrap_or(true),
                 registered_channels_writable: entry.registered_channels_writable.unwrap_or(false),
                 channel_discovery: entry.channel_discovery.unwrap_or(true),
+                upstream_clear: entry.upstream_clear.unwrap_or(false),
             })
         }
         other => {
