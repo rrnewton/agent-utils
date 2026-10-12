@@ -1001,6 +1001,116 @@ function stamp(atMs) {
   return `${pad(now.getHours())}:${pad(now.getMinutes())}`;
 }
 
+// --- which day a message was sent ----------------------------------------------------------------
+//
+// `#260 timestamp-hover`. The owner: "On an old thread a message says 5:25 PM but it is 3:56 PM now,
+// so it must be yesterday." A row's time is the hour and minute and nothing else, because that is all
+// a row has room for, and on its own it cannot say which day. Hovering it now says: "Yesterday,
+// Oct 11, Mon, 5:25 PM".
+//
+// `dayLabel` is THE ONE DAY FORMATTER on this page. The tooltip over every message's time and the
+// details sheet ask it, and `#250 date-separators` — the lines between days in a list, in flight
+// separately — must ask it too rather than make a second wording that drifts from this one:
+//
+//   the day the reader is in     Today, Oct 12, Mon
+//   the day before it            Yesterday, Oct 11, Mon
+//   any other day this year      Oct 9, Fri
+//   a day in another year        Oct 9, 2025, Thu
+//
+// The year appears only when it is not the reader's current year, and that holds for Today and
+// Yesterday too: on New Year's Day the evening before is "Yesterday, Dec 31, 2025, Wed".
+//
+//   * CALENDAR DAYS, NOT SPANS OF 24 HOURS. "Yesterday" is the date before today's, compared field
+//     by field in the reader's own zone, so a day that is 23 or 25 hours long because the clocks
+//     changed in it is still exactly one day. Thirty hours ago can be yesterday or the day before,
+//     and only the calendar knows which.
+//   * THE DATE GETTERS, NOT AN `Intl` FORMATTER. Every row's tooltip asks this on every redraw, and
+//     `#226 page-energy-profile` found a formatter made per row to be a twentieth of the page's work.
+//     The getters already answer in the device's zone and follow it when it moves.
+//   * FIXED ENGLISH NAMES. Every other word this page shows is English, and "Yesterday, 11 oct., lun."
+//     beside them would be a sentence in two languages.
+
+const DAY_MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+const DAY_WEEKDAYS = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+
+/** Whether two instants fall on the same calendar date in the reader's zone. */
+const sameLocalDay = (a, b) =>
+  a.getFullYear() === b.getFullYear() && a.getMonth() === b.getMonth() && a.getDate() === b.getDate();
+
+/**
+ * The day `when` falls on, as the reader says it standing at `now`: "Today, Oct 12, Mon",
+ * "Yesterday, Oct 11, Mon", "Oct 9, Fri", "Oct 9, 2025, Thu". Both are Dates, read in local time.
+ * See the section note above: this is the only place a day is worded.
+ *
+ * @param {Date} when
+ * @param {Date} [now]
+ */
+function dayLabel(when, now = new Date()) {
+  const year = when.getFullYear() === now.getFullYear() ? "" : `, ${when.getFullYear()}`;
+  const day = `${DAY_MONTHS[when.getMonth()]} ${when.getDate()}${year}, ${DAY_WEEKDAYS[when.getDay()]}`;
+  if (sameLocalDay(when, now)) return `Today, ${day}`;
+  // Built from the date's own fields, so the constructor steps back a calendar day however long that
+  // day was. Noon, because in a zone whose clocks change at midnight that midnight may not exist.
+  const yesterday = new Date(now.getFullYear(), now.getMonth(), now.getDate() - 1, 12);
+  return sameLocalDay(when, yesterday) ? `Yesterday, ${day}` : day;
+}
+
+/**
+ * What hovering a message's time says: its day, then the time exactly as it is shown —
+ * "Yesterday, Oct 11, Mon, 5:25 PM".
+ *
+ * @param {Date} at
+ * @param {string} shown
+ */
+const dayTitle = (at, shown) => `${dayLabel(at)}, ${shown}`;
+
+/** The classes of the time elements `timeNode` makes, and so the only ones `freshenDayTitle` touches. */
+const DAY_TITLED = new Set(["msg-time", "at"]);
+
+/**
+ * A message's time, as the element that shows it: `<time datetime>` holding the text `shown`, its
+ * day in the title, which the browser draws as its own tooltip on hover. A phone has no hover, and
+ * its press-and-hold opens the details sheet, which says the day in the same words. With no instant
+ * to go on — a message whose timestamp would not parse, shown by its spoken time — a plain span with
+ * no title, because there is no day to tell.
+ *
+ * @param {string} className
+ * @param {Date | null} at
+ * @param {string} shown
+ */
+function timeNode(className, at, shown) {
+  const node = document.createElement(at === null ? "span" : "time");
+  node.className = className;
+  node.textContent = shown;
+  if (at !== null) {
+    node.setAttribute("datetime", at.toISOString());
+    node.setAttribute("title", dayTitle(at, shown));
+  }
+  return node;
+}
+
+/**
+ * Every `pointerover` on the page: a time the pointer has just reached has its title worded again,
+ * now, before the browser shows it.
+ *
+ * WHY AT HOVER. A row is drawn once and then kept — `#226 page-energy-profile` stopped redrawing rows
+ * that did not change — so a title worded when the row was drawn would still say "Today" the morning
+ * after, on a page left open overnight. The browser waits a moment after the pointer arrives before
+ * it shows a title, and this rewrites it as the pointer arrives, so the day it shows is the day it
+ * is. One element, one date, no layout read, and nothing at all for a pointer over anything else.
+ *
+ * @param {Event} event
+ */
+function freshenDayTitle(event) {
+  const node = /** @type {Element | null} */ (event ? event.target : null);
+  if (!node || typeof node.getAttribute !== "function" || String(node.tagName).toLowerCase() !== "time") return;
+  if (!DAY_TITLED.has(String(node.className))) return;
+  const at = new Date(String(node.getAttribute("datetime") || ""));
+  if (Number.isNaN(at.getTime())) return;
+  const title = dayTitle(at, String(node.textContent));
+  if (node.getAttribute("title") !== title) node.setAttribute("title", title);
+}
+
 // --- long messages, folded -----------------------------------------------------------------------
 //
 // `#47 scrollback-stability`. Both lists on this page carry long messages — an assistant answers in
@@ -3359,12 +3469,12 @@ function turnNode(who, text, atMs) {
   const author = document.createElement("span");
   author.className = "who";
   author.textContent = who;
-  const at = document.createElement("span");
-  at.className = "at";
   // A RESTORED line carries the instant the server recorded, not the instant the page was
   // reloaded. Stamping a two-hour-old sentence with the current clock is the specific way a
-  // durable transcript lies about itself.
-  at.textContent = atMs === undefined ? stamp() : stamp(atMs);
+  // durable transcript lies about itself. Restored lines can be days old, so the day is on hover,
+  // as on a channel row (`#260 timestamp-hover`).
+  const when = atMs === undefined ? new Date() : new Date(atMs);
+  const at = timeNode("at", Number.isNaN(when.getTime()) ? null : when, atMs === undefined ? stamp() : stamp(atMs));
   meta.append(author, at);
   const body = document.createElement("div");
   body.className = "body";
@@ -19609,23 +19719,20 @@ function shortTimeFormat() {
   return shortTimeFormatter.format;
 }
 
-/** The whole truth, for the details sheet: date, time and zone, all local. */
+/**
+ * The whole truth, for the details sheet: day, time and zone, all local — "Yesterday, Oct 11, Mon,
+ * 05:25 PM PDT". The day is `dayLabel`'s, so the sheet a phone opens with a press-and-hold says it in
+ * the words a desk's tooltip uses (`#260 timestamp-hover`), and it is worded as the sheet opens.
+ */
 function fullLocalTime(message) {
   const at = messageDate(message);
   if (at === null) {
     return String(message.spoken_time || "unknown");
   }
-  // Explicit components, NOT `dateStyle`/`timeStyle`. ECMA-402 forbids combining those with an
-  // individual field such as `timeZoneName`, and a browser answers that with a TypeError rather
-  // than by ignoring the option — so the sheet would have thrown instead of opening.
-  return at.toLocaleString([], {
-    year: "numeric",
-    month: "short",
-    day: "numeric",
-    hour: "2-digit",
-    minute: "2-digit",
-    timeZoneName: "short",
-  });
+  // Explicit components, NOT `timeStyle`. ECMA-402 forbids combining that with an individual field
+  // such as `timeZoneName`, and a browser answers that with a TypeError rather than by ignoring the
+  // option — so the sheet would have thrown instead of opening.
+  return `${dayLabel(at)}, ${at.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", timeZoneName: "short" })}`;
 }
 
 // --- two messages that are really one -----------------------------------------------------------
@@ -19861,9 +19968,9 @@ function channelRowFrame(messages) {
   const author = document.createElement("span");
   // An author name is channel data too, and a display name can be anything at all.
   author.textContent = message.author_is_bot ? `${message.author} (bot)` : String(message.author);
-  const stamp = document.createElement("span");
-  stamp.className = "msg-time";
-  stamp.textContent = shortLocalTime(message);
+  // `#260 timestamp-hover`. The hour and minute on the row, and the day they were on in its tooltip.
+  // Every list draws its rows here — Main, All, a thread, the right column, Pinned, the reply screen.
+  const stamp = timeNode("msg-time", messageDate(message), shortLocalTime(message));
   // THE MESSAGE ID IS NOT PRINTED ON THE ROW. It is a nineteen-digit number that no reader reads,
   // on every row, on a screen 393 pixels wide. It is still the thing that lets the operator say
   // "that message does not exist", so it moved to the details sheet a press-and-hold opens — see
@@ -26960,6 +27067,8 @@ for (const pane of KEY_PANES) {
 }
 document.addEventListener("pointermove", onPointerMove);
 document.addEventListener("pointerdown", onPointerDown);
+// `#260 timestamp-hover`. A message's time says its day on hover, worded as the pointer arrives.
+document.addEventListener("pointerover", freshenDayTitle);
 // `#189 restore-ui-state`. The last moments a phone promises this page before it may reclaim it —
 // hidden, or being unloaded — are when the reader's place is written down. Hidden comes first on
 // a phone, and is the one an installed app reliably gets before it is killed.

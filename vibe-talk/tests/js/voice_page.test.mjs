@@ -7070,7 +7070,9 @@ test("PRESS AND HOLD is where the author, the full time and the id went", async 
   const text = lines[0].text();
   assert.match(text, /999888777666555444/, "the id is not reachable at all any more");
   assert.match(text, /alice/, "the details do not say who sent it");
-  assert.match(text, /2026/, "the details do not carry a full date");
+  // The day in `dayLabel`'s words (`#260 timestamp-hover`), which name the year only when it is not
+  // this one. The fixture's message is from the clock's own day or the one before, whatever the zone.
+  assert.match(text, /(Today|Yesterday), Aug \d+, [A-Z][a-z]{2}, /, "the details do not say which day it was sent");
 
   // The same gesture closes it, so the row does not accumulate a sheet per press.
   await hold(page, lines[0]);
@@ -32435,6 +32437,149 @@ test("ONE CLOCK FORMATTER FOR EVERY ROW, made again when the device's zone moves
     if (zone === undefined) delete process.env.TZ;
     else process.env.TZ = zone;
   }
+});
+
+// --- which day a message was sent -----------------------------------------------------------------
+//
+// `#260 timestamp-hover`. A row's time is the hour and minute; hovering it says the day as well, in
+// `dayLabel`'s words, which the details sheet uses too. Each test runs in one named zone, because a
+// day is a fact about where the reader is, and New York has both clock changes in it.
+
+/** Run `fn` with this process — and so the page's Date getters and its formatters — in `zone`. */
+async function inZone(zone, fn) {
+  const was = process.env.TZ;
+  process.env.TZ = zone;
+  try {
+    return await fn();
+  } finally {
+    if (was === undefined) delete process.env.TZ;
+    else process.env.TZ = was;
+  }
+}
+
+/** A local instant in the zone in force: month counted from 1, as people count it. */
+const localAt = (year, month, day, hour = 12, minute = 0) => new Date(year, month - 1, day, hour, minute);
+
+/** The time a row shows for `at`: the browser's own short time, as the row's formatter makes it. */
+const shownTime = (at) => at.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+
+test("ONE DAY FORMATTER: today, yesterday, this year, another year, across New Year, and across both clock changes", async () => {
+  const page = newPage();
+  const dayLabel = page.pure("dayLabel");
+  await inZone("America/New_York", () => {
+    const now = localAt(2026, 10, 12, 15, 56);
+    const cases = [
+      [localAt(2026, 10, 12, 0, 1), now, "Today, Oct 12, Mon"],
+      // The owner's case: 5:25 PM on a page that says 3:56 PM is yesterday's.
+      [localAt(2026, 10, 11, 17, 25), now, "Yesterday, Oct 11, Sun"],
+      [localAt(2026, 10, 10, 23, 59), now, "Oct 10, Sat"],
+      [localAt(2026, 10, 9, 8, 0), now, "Oct 9, Fri"],
+      [localAt(2025, 10, 9), now, "Oct 9, 2025, Thu"],
+      // A year ago today is not Today, nor a year and a day ago Yesterday: the year is a field too.
+      [localAt(2025, 10, 12), now, "Oct 12, 2025, Sun"],
+      [localAt(2025, 10, 11), now, "Oct 11, 2025, Sat"],
+      // A clock behind the server's: a day after the reader's is a date, not a word.
+      [localAt(2026, 10, 13, 9, 0), now, "Oct 13, Tue"],
+      // New Year: the evening before is Yesterday and says its year; the new year's first hour does not.
+      [localAt(2025, 12, 31, 23, 50), localAt(2026, 1, 1, 0, 30), "Yesterday, Dec 31, 2025, Wed"],
+      [localAt(2026, 1, 1, 0, 5), localAt(2026, 1, 1, 0, 30), "Today, Jan 1, Thu"],
+      // Spring forward: Sunday Mar 8 has 23 hours, so 24 hours before Monday 00:30 is Saturday night.
+      [localAt(2026, 3, 8, 12), localAt(2026, 3, 9, 0, 30), "Yesterday, Mar 8, Sun"],
+      [localAt(2026, 3, 7, 23, 45), localAt(2026, 3, 9, 0, 30), "Mar 7, Sat"],
+      // Fall back: Sunday Nov 1 has 25 hours, so 24 hours before its 23:30 is still Sunday.
+      [localAt(2026, 10, 31, 12), localAt(2026, 11, 1, 23, 30), "Yesterday, Oct 31, Sat"],
+      [localAt(2026, 11, 1, 0, 30), localAt(2026, 11, 1, 23, 30), "Today, Nov 1, Sun"],
+    ];
+    for (const [when, at, want] of cases) {
+      assert.equal(dayLabel(when, at), want, `${when.toString()} seen at ${at.toString()}`);
+    }
+  });
+  // The negative control: "yesterday" as 24 hours back, not a calendar day back, and both clock
+  // changes above come out wrong — so those rows of the table are what pin the calendar down.
+  const bySpan = newPage(new Map(), brokenScript(
+    "const yesterday = new Date(now.getFullYear(), now.getMonth(), now.getDate() - 1, 12);",
+    "const yesterday = new Date(now.getTime() - 86400000);"
+  )).pure("dayLabel");
+  await inZone("America/New_York", () => {
+    assert.equal(bySpan(localAt(2026, 3, 8, 12), localAt(2026, 3, 9, 0, 30)), "Mar 8, Sun",
+      "the control did not get the spring change wrong");
+    assert.equal(bySpan(localAt(2026, 10, 31, 12), localAt(2026, 11, 1, 23, 30)), "Oct 31, Sat",
+      "the control did not get the autumn change wrong");
+  });
+});
+
+test("A ROW'S TIME SAYS ITS DAY ON HOVER: yesterday's says Yesterday, and the words follow the clock past midnight", async () => {
+  await inZone("America/New_York", async () => {
+    const page = newPage();
+    await signIn(page);
+    // The fixture's clock: Wednesday Aug 19 2026, 10:05 in New York.
+    const before = localAt(2026, 8, 18, 17, 25);
+    const morning = localAt(2026, 8, 19, 9, 10);
+    await showDiscord(page, [
+      message({ id: "601", content: "from yesterday", timestamp: before.toISOString() }),
+      message({ id: "602", content: "from this morning", timestamp: morning.toISOString() }),
+    ]);
+    const time = (id) => rowWithId(page, id).descendants().find((node) => node.className === "msg-time");
+    const old = time("601");
+    assert.equal(old.tagName, "time", "a row's time is not a <time>");
+    assert.equal(old.getAttribute("datetime"), before.toISOString(), "the <time> does not say which instant it is");
+    assert.equal(old.textContent, shownTime(before), "the row's own time changed");
+    assert.equal(old.getAttribute("title"), `Yesterday, Aug 18, Tue, ${shownTime(before)}`);
+    const recent = time("602");
+    assert.equal(recent.getAttribute("title"), `Today, Aug 19, Wed, ${shownTime(morning)}`);
+
+    // Midnight passes with the page open. Nothing redraws the rows; the pointer arriving rewords them.
+    page.setClock(localAt(2026, 8, 20, 0, 5).getTime());
+    await page.documentEvent("pointerover", { target: recent });
+    assert.equal(recent.getAttribute("title"), `Yesterday, Aug 19, Wed, ${shownTime(morning)}`,
+      "a page left open past midnight still called this morning Today");
+    await page.documentEvent("pointerover", { target: old });
+    assert.equal(old.getAttribute("title"), `Aug 18, Tue, ${shownTime(before)}`);
+    assert.equal(old.textContent, shownTime(before), "the hover changed the row's own time");
+    // A pointer over anything else is passed over, and nothing is redrawn to say it.
+    await page.documentEvent("pointerover", { target: rowWithId(page, "601") });
+    await page.documentEvent("pointerover", { target: null });
+    assert.equal(time("601"), old, "a hover redrew the row");
+    assert.equal(rowWithId(page, "601").getAttribute("title"), null, "a hover over the row titled the row");
+
+    // The negative control: without the rewording on hover, the morning after still says Today.
+    const stale = newPage(new Map(), brokenScript('document.addEventListener("pointerover", freshenDayTitle);', ""));
+    await signIn(stale);
+    await showDiscord(stale, [message({ id: "602", content: "from this morning", timestamp: morning.toISOString() })]);
+    const kept = rowWithId(stale, "602").descendants().find((node) => node.className === "msg-time");
+    stale.setClock(localAt(2026, 8, 20, 0, 5).getTime());
+    await stale.documentEvent("pointerover", { target: kept });
+    assert.equal(kept.getAttribute("title"), `Today, Aug 19, Wed, ${shownTime(morning)}`,
+      "the control's title moved with the clock, so the test above does not show the hover doing it");
+  });
+});
+
+test("a restored transcript line says its day on hover too, beside the time it shows", async () => {
+  await inZone("America/New_York", async () => {
+    const page = newPage();
+    const said = localAt(2026, 8, 18, 21, 40);
+    page.storedTurns.set("conv_earlier", [{ speaker: "you", text: "what happened overnight", at_ms: said.getTime() }]);
+    await signIn(page);
+    await page.settle();
+    const [line] = page.el("transcript").children.filter((li) => li.className !== "seam");
+    const at = line.descendants().find((node) => node.className === "at");
+    assert.equal(at.tagName, "time");
+    assert.equal(at.textContent, "21:40", "the transcript's own time changed");
+    assert.equal(at.getAttribute("title"), "Yesterday, Aug 18, Tue, 21:40");
+  });
+});
+
+test("the details sheet says the day in the same words, with the time and the zone", async () => {
+  await inZone("America/New_York", async () => {
+    const page = newPage();
+    const fullLocalTime = page.pure("fullLocalTime");
+    const before = localAt(2026, 8, 18, 17, 25);
+    const zoned = before.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", timeZoneName: "short" });
+    assert.equal(fullLocalTime({ timestamp: before.toISOString() }), `Yesterday, Aug 18, Tue, ${zoned}`);
+    assert.ok(fullLocalTime({ timestamp: localAt(2025, 8, 18).toISOString() }).startsWith("Aug 18, 2025, Mon, "),
+      "another year's message did not say its year");
+    assert.equal(fullLocalTime({ timestamp: "", spoken_time: "five past ten" }), "five past ten");
+  });
 });
 
 test("the first refresh fifteen minutes after a view's last full read reads it in full", async () => {
