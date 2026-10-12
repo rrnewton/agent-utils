@@ -3145,6 +3145,21 @@ def test_direct_current_frozen_recovery_requires_removal_proof(
     assert not (control_directory(project) / "ACTIVE.testhost.journal").exists()
 
 
+def result_recorded_frozen_row(checkout: Path, target_sha: str) -> dict[str, object]:
+    """The final row a completed frozen run leaves in its durable result file."""
+
+    return {
+        "admission": "frozen-validate",
+        "commit": target_sha,
+        "cwd": str(checkout),
+        "exit_code": 1,
+        "qualifying_receipt": False,
+        "repo": "project",
+        "result": "fail",
+        "started_at": "2026-09-08T11:28:30Z",
+    }
+
+
 def prepare_result_recorded_frozen_checkout(
     project: Path,
     repository: Path,
@@ -3174,6 +3189,7 @@ def prepare_result_recorded_frozen_checkout(
             "selection_mode": "frozen",
             "scorecard_writeback": {"status": "delegated"},
             "detail": None,
+            "measured_result": "fail",
         }
     )
     value.pop("scorecard_handoff")
@@ -3182,18 +3198,10 @@ def prepare_result_recorded_frozen_checkout(
         json.dumps(value, indent=2, sort_keys=True) + "\n", encoding="utf-8"
     )
     frozen = project / "ignored" / "validate" / "frozen" / f"{record.stem}.jsonl"
+    assert value["result_record"] == str(frozen)
     frozen.parent.mkdir(parents=True, exist_ok=True)
     frozen.write_text(
-        json.dumps(
-            {
-                "admission": "frozen-validate",
-                "commit": target_sha,
-                "exit_code": 1,
-                "qualifying_receipt": False,
-                "result": "fail",
-            },
-            sort_keys=True,
-        )
+        json.dumps(result_recorded_frozen_row(checkout, target_sha), sort_keys=True)
         + "\n",
         encoding="utf-8",
     )
@@ -3310,6 +3318,88 @@ def test_result_recorded_frozen_checkout_still_refuses_direct_recovery(
     assert checkout.is_dir()
 
 
+@pytest.mark.ordinary_environment
+@pytest.mark.parametrize(
+    "boundary",
+    (
+        "after-ownerless-validate-journal",
+        "after-ownerless-validate-path-fence-before-journal",
+        "after-ownerless-validate-path-fence",
+        "after-ownerless-validate-removing",
+        "after-ownerless-validate-exclusion-directory",
+        "after-ownerless-validate-exclusion-move",
+        "after-ownerless-validate-exclusion-seal",
+        "after-ownerless-validate-remove",
+        "after-ownerless-validate-removal-event",
+        "tampered-result-before-resume",
+    ),
+)
+def test_result_recorded_frozen_removal_resumes_from_its_journal(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    boundary: str,
+) -> None:
+    project, repository, _remote = make_project(tmp_path)
+    checkout, record, frozen, target_sha = prepare_result_recorded_frozen_checkout(
+        project, repository, monkeypatch=monkeypatch, name="resume"
+    )
+    tampered = boundary == "tampered-result-before-resume"
+    stop_at = "after-ownerless-validate-journal" if tampered else boundary
+
+    class Interrupted(RuntimeError):
+        pass
+
+    def interrupt(point: str) -> None:
+        if point == stop_at:
+            raise Interrupted
+
+    monkeypatch.setattr(wrkslots, "_interrupt_for_test", interrupt)
+    with pytest.raises(Interrupted):
+        run_frozen_validation_batch(project, repository, checkout, record)
+    monkeypatch.setattr(wrkslots, "_interrupt_for_test", lambda _point: None)
+    capsys.readouterr()
+    journal = control_directory(project) / "ACTIVE.testhost.journal"
+    evidence = json.loads(journal.read_text(encoding="utf-8"))["authorization"][
+        "evidence"
+    ]
+    assert evidence["frozen_result"]["path"] == frozen.relative_to(project).as_posix()
+    assert evidence["frozen_result"]["sha256"] == hashlib.sha256(
+        frozen.read_bytes()
+    ).hexdigest()
+    if tampered:
+        row = result_recorded_frozen_row(checkout, target_sha)
+        row["result"] = "pass"
+        row["exit_code"] = 0
+        frozen.write_text(json.dumps(row) + "\n", encoding="utf-8")
+
+    resumed = wrkslots.main(
+        ["--project-root", str(project), "recover", "--coordinator-pid", str(os.getpid())]
+    )
+
+    config = wrkslots._load_config(str(project), "testhost")
+    removed = [
+        item
+        for item in wrkslots._load_events(config)
+        if item["kind"] == "ownerless-validate-path-removed"
+    ]
+    if tampered:
+        assert resumed == 3
+        assert (
+            "durable frozen validation result final row verdict disagrees with the "
+            "run-record" in capsys.readouterr().err
+        )
+        assert checkout.is_dir()
+        assert journal.is_file()
+        assert removed == []
+        return
+    assert resumed == 0
+    assert not checkout.exists()
+    assert not journal.exists()
+    assert len(removed) == 1
+    assert record.is_file() and frozen.is_file()
+
+
 _NO_PROOF_RETAINED = (
     "frozen validation has no typed removal proof; the checkout remains "
     "retained and blocks entry: "
@@ -3329,6 +3419,20 @@ _NO_PROOF_RETAINED = (
         "fresh-census-live",
         "record-changed",
         "result-changed-at-final-census",
+        "missing-result-record",
+        "other-result-record",
+        "symlinked-result-directory",
+        "forged-commit-only-row",
+        "forged-wrong-checkout-pass-row",
+        "row-other-checkout",
+        "row-without-admission",
+        "row-claims-qualifying-receipt",
+        "row-other-repository",
+        "row-predates-run",
+        "row-without-start",
+        "row-verdict-disagrees",
+        "row-fail-with-zero-exit",
+        "measured-result-disagrees",
     ),
 )
 def test_result_recorded_frozen_removal_refuses_each_unproven_gate(
@@ -3338,7 +3442,7 @@ def test_result_recorded_frozen_removal_refuses_each_unproven_gate(
     mutation: str,
 ) -> None:
     project, repository, _remote = make_project(tmp_path)
-    checkout, record, frozen, _target_sha = prepare_result_recorded_frozen_checkout(
+    checkout, record, frozen, target_sha = prepare_result_recorded_frozen_checkout(
         project, repository, monkeypatch=monkeypatch, name=f"refuse-{mutation}"
     )
     value = dict(wrkslots._strict_json_object(record.read_bytes(), "fixture record"))
@@ -3360,7 +3464,9 @@ def test_result_recorded_frozen_removal_refuses_each_unproven_gate(
         frozen.write_bytes(b"")
         expected = f"{_NO_PROOF_RETAINED}durable frozen validation result is empty: {frozen}"
     elif mutation == "other-target":
-        frozen.write_text(json.dumps({"commit": "0" * 40}) + "\n", encoding="utf-8")
+        row = result_recorded_frozen_row(checkout, target_sha)
+        row["commit"] = "0" * 40
+        frozen.write_text(json.dumps(row) + "\n", encoding="utf-8")
         expected = (
             f"{_NO_PROOF_RETAINED}durable frozen validation result final row does "
             "not name the recorded target commit"
@@ -3401,6 +3507,67 @@ def test_result_recorded_frozen_removal_refuses_each_unproven_gate(
         expected = (
             f"live process 4242 uses slot {checkout}: cwd={checkout}; stop it and retry"
         )
+    elif mutation in {"missing-result-record", "other-result-record"}:
+        if mutation == "missing-result-record":
+            value.pop("result_record")
+        else:
+            value["result_record"] = str(frozen.with_name("other.jsonl"))
+        expected = (
+            f"{_NO_PROOF_RETAINED}frozen validation run-record does not name this "
+            "durable frozen validation result"
+        )
+    elif mutation == "symlinked-result-directory":
+        elsewhere = project / "ignored" / "validate" / "elsewhere"
+        frozen.parent.rename(elsewhere)
+        frozen.parent.symlink_to(elsewhere, target_is_directory=True)
+        expected = (
+            f"{_NO_PROOF_RETAINED}durable frozen validation result crosses a "
+            f"symlink: {frozen.parent}"
+        )
+    elif mutation.startswith(("forged-", "row-")):
+        row = result_recorded_frozen_row(checkout, target_sha)
+        reason = "verdict disagrees with the run-record"
+        if mutation == "forged-commit-only-row":
+            row = {"commit": target_sha}
+            reason = "was not measured in the recorded checkout"
+        elif mutation == "forged-wrong-checkout-pass-row":
+            row.pop("admission")
+            row.update({"cwd": str(repository), "result": "pass", "exit_code": 0})
+            reason = "was not measured in the recorded checkout"
+        elif mutation == "row-other-checkout":
+            row["cwd"] = str(repository)
+            reason = "was not measured in the recorded checkout"
+        elif mutation == "row-without-admission":
+            row.pop("admission")
+            reason = "is not marked as a frozen-validate admission"
+        elif mutation == "row-claims-qualifying-receipt":
+            row["qualifying_receipt"] = True
+            reason = "does not disclaim a qualifying receipt"
+        elif mutation == "row-other-repository":
+            row["repo"] = "other-project"
+            reason = "names another repository"
+        elif mutation == "row-predates-run":
+            row["started_at"] = "2026-09-08T11:28:06+00:00"
+            reason = "predates the recorded run"
+        elif mutation == "row-without-start":
+            row.pop("started_at")
+            reason = (
+                "has no comparable start time: frozen validation start time is missing"
+            )
+        elif mutation == "row-verdict-disagrees":
+            # Without measured_result only the status mapping can refuse.
+            value.pop("measured_result")
+            row.update({"result": "pass", "exit_code": 0})
+        elif mutation == "row-fail-with-zero-exit":
+            row["exit_code"] = 0
+        frozen.write_text(json.dumps(row) + "\n", encoding="utf-8")
+        expected = f"{_NO_PROOF_RETAINED}durable frozen validation result final row {reason}"
+    elif mutation == "measured-result-disagrees":
+        value["measured_result"] = "pass"
+        expected = (
+            f"{_NO_PROOF_RETAINED}durable frozen validation result final row verdict "
+            "disagrees with the run-record"
+        )
     elif mutation == "record-changed":
 
         def append_during_census(
@@ -3438,7 +3605,14 @@ def test_result_recorded_frozen_removal_refuses_each_unproven_gate(
             "durable frozen validation result final row does not name the "
             "recorded target commit"
         )
-    if mutation in {"live-process", "not-current-result"}:
+    if mutation in {
+        "live-process",
+        "not-current-result",
+        "missing-result-record",
+        "other-result-record",
+        "measured-result-disagrees",
+        "row-verdict-disagrees",
+    }:
         record.write_text(
             json.dumps(value, indent=2, sort_keys=True) + "\n", encoding="utf-8"
         )

@@ -852,11 +852,11 @@ def test_wrkslots_lifecycle_partitions_are_disjoint_and_complete() -> None:
     # https://github.com/rrnewton/agent-utils/issues/235 is mapped.
     # The 14 frozen-validation-parser cases of 88039882, 7ae34255 and 73cdf9c4
     # are 8 ordinary and 6 mapped, all parametrized cases of tests named above.
-    # The 14 result-recorded frozen removal cases (one removal, one
-    # classification, one direct refusal, nine refused gates, and two
-    # incomplete-result retentions) are ordinary.
-    assert len(all_tests) == 1904
-    assert len(ordinary) == 312
+    # The 38 result-recorded frozen removal cases (one removal, one
+    # classification, one direct refusal, 23 refused gates, ten journal
+    # resumptions, and two incomplete-result retentions) are ordinary.
+    assert len(all_tests) == 1928
+    assert len(ordinary) == 336
     assert len(mapped) == 1592
     assert {
         node.split("::", 1)[1].split("[", 1)[0] for node in ordinary
@@ -936,6 +936,7 @@ def test_wrkslots_lifecycle_partitions_are_disjoint_and_complete() -> None:
         "test_result_recorded_frozen_checkout_is_removed_by_batch",
         "test_result_recorded_frozen_checkout_still_refuses_direct_recovery",
         "test_result_recorded_frozen_removal_refuses_each_unproven_gate",
+        "test_result_recorded_frozen_removal_resumes_from_its_journal",
         "test_root_owned_executable_accepts_host_root_helper",
         "test_run1773_historical_frozen_checkout_is_retained_without_blocking_entry",
         "test_socket_orphan_namespace_unavailable_is_an_exact_classifier",

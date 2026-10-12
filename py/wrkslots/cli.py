@@ -38065,11 +38065,21 @@ def _durable_frozen_result(
     """Prove an inactive current frozen run recorded its result outside the clone.
 
     The producer writes ``ignored/validate/frozen/<unit>.jsonl`` for the same
-    unit whose handle is ``ignored/validate/runs/<unit>.json``.  Its final row
-    names the measured commit.  Together with a dead process generation and a
-    current terminal service result, this is the removal authority for a
-    frozen checkout whose own teardown did not finish; no removal-proof
-    manifest producer exists for frozen runs.
+    unit whose handle is ``ignored/validate/runs/<unit>.json`` and names it in
+    the handle's ``result_record``.  When the run finishes it selects the row
+    measured for the target commit in the recorded checkout no earlier than
+    the run started, and marks it ``admission=frozen-validate`` and
+    ``qualifying_receipt=false``.  The final row must carry exactly those
+    facts and a verdict that agrees with the handle.  Together with a dead
+    process generation and a current terminal service result, this is the
+    removal authority for a frozen checkout whose own teardown did not
+    finish; no removal-proof manifest producer exists for frozen runs.
+
+    This proves only that the result is recorded.  It does not copy evidence
+    out of the checkout (failed-node artifacts, orphaned receipts, scorecard
+    handoffs): the validation cleanup sweep that calls the batch command owns
+    those steps and runs them before the call.  A direct batch caller must
+    preserve whatever it needs from the checkout first.
     """
 
     if _current_incomplete_frozen_result(record):
@@ -38090,9 +38100,8 @@ def _durable_frozen_result(
         raise Refusal(f"{label} does not exist: {path}") from None
     except OSError as exc:
         raise Refusal(f"cannot inspect {label} {path}: {exc}") from exc
-    recorded = record.get("result_record")
-    if recorded is not None and recorded != str(path):
-        raise Refusal(f"frozen validation run-record names another {label}")
+    if record.get("result_record") != str(path):
+        raise Refusal(f"frozen validation run-record does not name this {label}")
     contents, identity = _read_regular_file_identity(
         path, label, _VALIDATION_REMOVAL_ARTIFACT_BYTES_LIMIT
     )
@@ -38102,6 +38111,50 @@ def _durable_frozen_result(
     final = _strict_json_object(rows[-1], f"{label} final row")
     if final.get("commit") != target:
         raise Refusal(f"{label} final row does not name the recorded target commit")
+    checkout = record.get("checkout")
+    if not isinstance(checkout, str) or final.get("cwd") != checkout:
+        raise Refusal(f"{label} final row was not measured in the recorded checkout")
+    if final.get("admission") != "frozen-validate":
+        raise Refusal(f"{label} final row is not marked as a frozen-validate admission")
+    if final.get("qualifying_receipt") is not False:
+        raise Refusal(f"{label} final row does not disclaim a qualifying receipt")
+    # The producer accepts its repository's full name or its short name.
+    repo = record.get("repo")
+    if (
+        not isinstance(repo, str)
+        or not repo.strip()
+        or final.get("repo") not in {repo, repo.rsplit("/", 1)[-1]}
+    ):
+        raise Refusal(f"{label} final row names another repository")
+    row_started = final.get("started_at")
+    run_started = record.get("started_at")
+    try:
+        if not isinstance(row_started, str) or not isinstance(run_started, str):
+            raise StateError("frozen validation start time is missing")
+        predates = _parse_timestamp(
+            row_started, f"{label} final row"
+        ) < _parse_timestamp(run_started, "frozen validation run-record")
+    except StateError as exc:
+        raise Refusal(f"{label} final row has no comparable start time: {exc}") from exc
+    if predates:
+        raise Refusal(f"{label} final row predates the recorded run")
+    expected_result = {
+        "PASSED": "pass",
+        "FAILED": "fail",
+        "COULD_NOT_RUN": "no_result",
+    }.get(str(record.get("final_validate_status")))
+    row_result = final.get("result")
+    row_exit = final.get("exit_code")
+    measured = record.get("measured_result")
+    if (
+        expected_result is None
+        or row_result != expected_result
+        or type(row_exit) is not int
+        or (row_result == "pass" and row_exit != 0)
+        or (row_result == "fail" and row_exit == 0)
+        or (measured is not None and measured != row_result)
+    ):
+        raise Refusal(f"{label} final row verdict disagrees with the run-record")
     return _FrozenResultEvidence(
         path.relative_to(config.root).as_posix(), identity, target
     )
@@ -52602,7 +52655,13 @@ usage or audit gate unknown, 3 fail-closed refusal.
             "capture one shared all-process path census, and then run the ordinary durable "
             "ownerless validation recovery for each aligned checkout/record/repository triple. "
             "A fresh same-UID census is taken at every destructive recheck. Cross-UID entry is "
-            "prevented by the private-directory invariant; ambiguity retains the checkout."
+            "prevented by the private-directory invariant; ambiguity retains the checkout. "
+            "Without --validation-proof-manifest, a current frozen checkout is removed only "
+            "when its record holds a completed terminal service result, its recorded process "
+            "is gone, and the final row of ignored/validate/frozen/<unit>.jsonl matches the "
+            "record's checkout, target, repository, start time and verdict. wrkslots copies "
+            "no evidence out of the checkout: the calling cleanup sweep must first preserve "
+            "failed-node artifacts, orphaned receipts and scorecard handoffs."
         ),
         formatter_class=_HelpFormatter,
     )
