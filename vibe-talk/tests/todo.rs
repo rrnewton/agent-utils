@@ -369,6 +369,50 @@ async fn a_thousand_ids_are_one_dismissal_and_one_undo() {
 }
 
 #[tokio::test]
+async fn the_list_says_when_its_window_starts_even_once_that_message_is_dealt_with() {
+    // `#240 reading-bookmark`. Hide read draws the bookmark above the first message left when the
+    // bookmark's own message is dealt with and still inside the window, because then everything
+    // between it and the list is dealt with too. Older than the window, nothing is known. So the
+    // list says when the window's oldest message was sent, whether or not that message is left.
+    let server = Server::with(12);
+    let window = ops::messages(&server.state, READ_CHANNEL, Some(5))
+        .await
+        .expect("reads");
+    let oldest = window.messages.first().expect("a window of five");
+    assert_eq!(oldest.id, server.id(7), "the window is the newest five");
+    let view = ops::todo(&server.state, READ_CHANNEL, Some(5))
+        .await
+        .expect("reads");
+    assert!(!view.complete);
+    assert_eq!(view.window_from.as_deref(), Some(oldest.timestamp.as_str()));
+    ops::dismiss(&server.state, READ_CHANNEL, &[server.id(7), server.id(8)])
+        .await
+        .expect("dismisses");
+    let view = ops::todo(&server.state, READ_CHANNEL, Some(5))
+        .await
+        .expect("reads");
+    assert_eq!(
+        view.messages.first().map(|m| m.id.clone()),
+        Some(server.id(9))
+    );
+    assert_eq!(
+        view.window_from.as_deref(),
+        Some(oldest.timestamp.as_str()),
+        "the window's start moved with what was dealt with"
+    );
+    let empty = Server::with(0);
+    let view = ops::todo(&empty.state, READ_CHANNEL, None)
+        .await
+        .expect("reads");
+    assert_eq!(view.window_from, None);
+    let json = serde_json::to_value(&view).expect("serializes");
+    assert!(
+        json.get("window_from").is_none(),
+        "an empty window names a start: {json}"
+    );
+}
+
+#[tokio::test]
 async fn explicit_dismissal_does_not_reread_the_chat_provider() {
     // A message can scroll out between the read and the tap. The authenticated local operation
     // still succeeds without asking the provider to find it again.

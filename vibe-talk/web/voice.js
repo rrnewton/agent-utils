@@ -14841,6 +14841,25 @@ function bookmarkListRefusal(anchor) {
 /** The time a row was sent, in milliseconds, from its first message; NaN when it cannot be read. */
 const rowSentMs = (row) => Date.parse(String((rowMessages(row)[0] || {}).timestamp || ""));
 
+/** The time a row's newest message was sent, in milliseconds; NaN when it cannot be read. */
+const rowNewestMs = (row) => {
+  const held = rowMessages(row);
+  return Date.parse(String((held[held.length - 1] || {}).timestamp || ""));
+};
+
+/**
+ * Whether Hide read's list, in a channel without threads, holds every message still to do from time
+ * `at` on: the server's to-do list is the recent window less what is dealt with, so a message it
+ * leaves out from when the window starts is dealt with, and so is everything between it and the
+ * list. Older than the window, nothing is known.
+ */
+function todoWindowHolds(at) {
+  if (!todoMode || threadingSupported || String(todoView.channelId) !== String(currentChannelId())) return false;
+  if (todoView.complete) return true;
+  const from = Date.parse(String(todoView.from || ""));
+  return Number.isFinite(from) && at >= from;
+}
+
 /**
  * Where the column being worked on draws its bookmark line: `{row, place}`, the line going above
  * that row, or below it when it is the last; null when the list draws none.
@@ -14851,7 +14870,10 @@ const rowSentMs = (row) => Date.parse(String((rowMessages(row)[0] || {}).timesta
  * message was sent: so Main places a bookmark on a thread reply it never shows, and Hide read, or a
  * collapsed run, moves the line down to the next row shown. Every row it moves past is read, which
  * is what makes that safe. An anchor older than everything loaded draws nothing: the chip and b walk
- * back to it.
+ * back to it. Hide read's list without threads leaves read messages out altogether, and there an
+ * anchor older than every row still goes above the first when the list's window reaches it
+ * (`todoWindowHolds`). A row is one box, so the line never goes inside one: before the row holding
+ * any message at or after the anchor.
  */
 function bookmarkTarget() {
   const anchor = bookmarkAnchor();
@@ -14862,13 +14884,20 @@ function bookmarkTarget() {
   const id = String(anchor.message_id);
   let start = rows.findIndex((row) => idsOf(row).includes(id));
   if (start >= 0) {
-    if (anchor.place === "below") start += 1;
+    // Below its message, after that message's row only when the message ends it. A message that has
+    // joined the row since (a combined row) is newer and may be to read, and the line cannot go
+    // inside a row: it goes above it, where it passes over nothing still to read.
+    const held = idsOf(rows[start]);
+    if (anchor.place === "below" && held[held.length - 1] === id) start += 1;
   } else {
     const at = Date.parse(String(anchor.timestamp));
     if (!Number.isFinite(at)) return null;
     const first = rowSentMs(rows[0]);
-    if (Number.isFinite(first) && at < first) return null;
-    start = rows.findIndex((row) => (anchor.place === "below" ? rowSentMs(row) > at : rowSentMs(row) >= at));
+    // Older than every row is older than what is loaded, unless Hide read's list says its window
+    // reaches that far: then the message is read, and the line goes above the first row.
+    if (Number.isFinite(first) && at < first && !todoWindowHolds(at)) return null;
+    // By each row's newest message, so a combined row that only begins before the anchor is not passed.
+    start = rows.findIndex((row) => (anchor.place === "below" ? rowNewestMs(row) > at : rowNewestMs(row) >= at));
     if (start < 0) start = rows.length;
   }
   const shown = rows.slice(start).find(rowShown);
@@ -20109,7 +20138,7 @@ async function loadTodo(options) {
  * read at all, and the head of the list, the backlog count and the bulk control all have to move
  * with it or the view contradicts itself.
  */
-let todoView = { left: 0, window: 0, noise: 0, complete: false, channelId: null };
+let todoView = { left: 0, window: 0, noise: 0, complete: false, from: null, channelId: null };
 
 /** Take down what a `/todo` answer said about itself. */
 function noteTodoRead(payload) {
@@ -20121,6 +20150,9 @@ function noteTodoRead(payload) {
     // The rows are not here to count, so Settings' count comes from this in to-do mode.
     noise: typeof payload.noise === "number" ? payload.noise : 0,
     complete: payload.complete === true,
+    // When the window's oldest message was sent, left or not. `#240 reading-bookmark`: whether a
+    // message the list leaves out is in the window, so read (`todoWindowHolds`).
+    from: typeof payload.window_from === "string" ? payload.window_from : null,
     // The ID, not the name it was wearing at the time. `#39 channel-alias` lets the owner rename
     // a channel from Settings without re-reading it, and a name captured here would leave this
     // line saying what the channel used to be called.

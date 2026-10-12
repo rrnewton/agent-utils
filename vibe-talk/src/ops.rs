@@ -1735,6 +1735,12 @@ pub struct TodoView {
     pub window: usize,
     /// Whether that window is the whole channel, so a caller can avoid a confident wrong total.
     pub complete: bool,
+    /// When the window's oldest message was sent, as the provider stamped it, dealt with or not;
+    /// absent for an empty window. `#240 reading-bookmark`: a page drawing the bookmark on this
+    /// list needs to know whether a message the list leaves out is inside the window (so dealt
+    /// with, like everything between it and the list) or older than it (so nothing is known).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub window_from: Option<String>,
     /// How many messages in the window the owner's noise rules call read. `#196 auto-read-noise`.
     ///
     /// They are not in `messages` — a placeholder is not something to deal with — and they are
@@ -1770,6 +1776,10 @@ pub async fn todo(
     let dismissed: std::collections::HashSet<&str> =
         dismissed.iter().map(MessageId::as_str).collect();
     let total = window.messages.len();
+    let window_from = window
+        .messages
+        .first()
+        .map(|message| message.timestamp.clone());
     let noise = window
         .messages
         .iter()
@@ -1785,6 +1795,7 @@ pub async fn todo(
         messages: left,
         window: total,
         complete,
+        window_from,
         noise,
     })
 }
