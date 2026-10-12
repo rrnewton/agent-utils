@@ -852,8 +852,11 @@ def test_wrkslots_lifecycle_partitions_are_disjoint_and_complete() -> None:
     # https://github.com/rrnewton/agent-utils/issues/235 is mapped.
     # The 14 frozen-validation-parser cases of 88039882, 7ae34255 and 73cdf9c4
     # are 8 ordinary and 6 mapped, all parametrized cases of tests named above.
-    assert len(all_tests) == 1890
-    assert len(ordinary) == 298
+    # The 14 result-recorded frozen removal cases (one removal, one
+    # classification, one direct refusal, nine refused gates, and two
+    # incomplete-result retentions) are ordinary.
+    assert len(all_tests) == 1904
+    assert len(ordinary) == 312
     assert len(mapped) == 1592
     assert {
         node.split("::", 1)[1].split("[", 1)[0] for node in ordinary
@@ -878,6 +881,7 @@ def test_wrkslots_lifecycle_partitions_are_disjoint_and_complete() -> None:
         "test_current_incomplete_frozen_requires_pristine_recursive_checkout",
         "test_current_incomplete_frozen_retains_evidence_and_allows_stable_source_work",
         "test_current_incomplete_frozen_retention_does_not_authorize_direct_recovery",
+        "test_current_incomplete_frozen_with_durable_result_is_still_only_retained",
         "test_direct_current_frozen_recovery_refuses_lost_journal_proof",
         "test_direct_current_frozen_recovery_refuses_tampered_proof",
         "test_direct_current_frozen_recovery_requires_removal_proof",
@@ -928,6 +932,10 @@ def test_wrkslots_lifecycle_partitions_are_disjoint_and_complete() -> None:
         "test_remove_agent_batch_removes_disk_image_slots",
         "test_remove_checks_an_image_backed_agent_slot_under_the_lock",
         "test_remove_refuses_live_process_using_slot",
+        "test_result_recorded_frozen_checkout_classifies_as_terminal_and_stays",
+        "test_result_recorded_frozen_checkout_is_removed_by_batch",
+        "test_result_recorded_frozen_checkout_still_refuses_direct_recovery",
+        "test_result_recorded_frozen_removal_refuses_each_unproven_gate",
         "test_root_owned_executable_accepts_host_root_helper",
         "test_run1773_historical_frozen_checkout_is_retained_without_blocking_entry",
         "test_socket_orphan_namespace_unavailable_is_an_exact_classifier",

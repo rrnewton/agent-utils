@@ -37558,7 +37558,14 @@ def _terminal_validation_record(
     expected_target: str | None = None,
     allow_historical_service_result: bool = False,
     frozen_removal_proof_supplied: bool | None = None,
+    frozen_result: _FrozenResultEvidence | None = None,
 ) -> tuple[str, str, str | None]:
+    if frozen_result is not None and (
+        target_kind != "frozen-checkout" or frozen_removal_proof_supplied is not False
+    ):
+        raise StateError(
+            "durable frozen result authority applies only to frozen cleanup without a proof"
+        )
     relative, path = _relative_inside(config.root, raw, "terminal validation record")
     if Path(relative).parent != Path("ignored/validate/runs") or path.suffix != ".json":
         raise Refusal("terminal validation record must be an ignored/validate/runs/*.json file")
@@ -37588,6 +37595,7 @@ def _terminal_validation_record(
     if target_kind == "frozen-checkout":
         if (
             frozen_removal_proof_supplied is False
+            and frozen_result is None
             and not (
                 type(record.get("service_result_schema")) is int
                 and record.get("service_result_schema") in {1, 2, 3}
@@ -37633,6 +37641,14 @@ def _terminal_validation_record(
         ):
             raise Refusal(
                 "canonical frozen validation record projection does not bind this handle"
+            )
+        if (
+            frozen_result is not None
+            and _durable_frozen_result(config, path, record, record_target)
+            != frozen_result
+        ):
+            raise Refusal(
+                "durable frozen validation result changed after removal was authorized"
             )
     if not _validation_record_is_terminal(
         record,
@@ -37970,14 +37986,125 @@ def _validation_record_is_terminal(
 class _FrozenNoProofDisposition(enum.Enum):
     BLOCKS_ENTRY = "blocks-entry"
     CURRENT_INCOMPLETE_RETAINED = "current-incomplete-retained"
+    CURRENT_TERMINAL_REMOVABLE = "current-terminal-removable"
     HISTORICAL_NONBLOCKING = "historical-nonblocking"
     LEGACY_RECOVERY = "legacy-recovery"
+
+
+@dataclasses.dataclass(frozen=True)
+class _FrozenResultEvidence:
+    """One durable frozen-validation result row file bound to its run-record target."""
+
+    path: str
+    identity: _RegularFileIdentity
+    target: str
 
 
 @dataclasses.dataclass(frozen=True)
 class _FrozenNoProofClassification:
     disposition: _FrozenNoProofDisposition
     historical_schema: int | None = None
+    frozen_result: _FrozenResultEvidence | None = None
+    detail: str | None = None
+
+
+def _frozen_result_evidence_to_obj(value: _FrozenResultEvidence) -> dict[str, object]:
+    return {
+        "path": value.path,
+        "device": value.identity.device,
+        "inode": value.identity.inode,
+        "size": value.identity.size,
+        "sha256": value.identity.sha256,
+    }
+
+
+def _frozen_result_evidence_from_obj(
+    value: object, *, target: str | None
+) -> _FrozenResultEvidence:
+    raw = _as_mapping(value, "durable frozen validation result evidence")
+    _exact_keys(
+        raw,
+        {"path", "device", "inode", "size", "sha256"},
+        set(),
+        "durable frozen validation result evidence",
+    )
+    sha256 = _as_str(raw["sha256"], "durable frozen validation result sha256")
+    if target is None or re.fullmatch(r"[0-9a-f]{64}", sha256) is None:
+        raise StateError("durable frozen validation result evidence is incomplete")
+    return _FrozenResultEvidence(
+        path=_as_str(raw["path"], "durable frozen validation result path"),
+        identity=_RegularFileIdentity(
+            device=_as_int(raw["device"], "durable frozen validation result device"),
+            inode=_as_int(raw["inode"], "durable frozen validation result inode"),
+            size=_as_int(raw["size"], "durable frozen validation result size", minimum=1),
+            sha256=sha256,
+        ),
+        target=target,
+    )
+
+
+def _current_frozen_service_result(record: Mapping[str, object]) -> bool:
+    """Recognize a current service-result terminal result, not a lost verdict."""
+
+    schema = record.get("service_result_schema")
+    return bool(
+        type(schema) is int
+        and schema in {4, 5, 6}
+        and record.get("result_source") == "validation-service-result"
+        and record.get("state") == "completed"
+        and _validation_record_is_terminal(record, target_kind="frozen-checkout")
+    )
+
+
+def _durable_frozen_result(
+    config: Config,
+    record_path: Path,
+    record: Mapping[str, object],
+    target: str,
+) -> _FrozenResultEvidence:
+    """Prove an inactive current frozen run recorded its result outside the clone.
+
+    The producer writes ``ignored/validate/frozen/<unit>.jsonl`` for the same
+    unit whose handle is ``ignored/validate/runs/<unit>.json``.  Its final row
+    names the measured commit.  Together with a dead process generation and a
+    current terminal service result, this is the removal authority for a
+    frozen checkout whose own teardown did not finish; no removal-proof
+    manifest producer exists for frozen runs.
+    """
+
+    if _current_incomplete_frozen_result(record):
+        raise Refusal(
+            "current incomplete frozen validation is retained, never removed by its "
+            "durable result"
+        )
+    if not _current_frozen_service_result(record):
+        raise Refusal("frozen validation has no current service-result terminal result")
+    if not _validation_record_process_is_dead(record):
+        raise Refusal("frozen validation process state is live or uncertain")
+    label = "durable frozen validation result"
+    path = config.root / "ignored" / "validate" / "frozen" / f"{record_path.stem}.jsonl"
+    _ensure_no_symlink_components(config.root, path, label)
+    try:
+        os.lstat(path)
+    except FileNotFoundError:
+        raise Refusal(f"{label} does not exist: {path}") from None
+    except OSError as exc:
+        raise Refusal(f"cannot inspect {label} {path}: {exc}") from exc
+    recorded = record.get("result_record")
+    if recorded is not None and recorded != str(path):
+        raise Refusal(f"frozen validation run-record names another {label}")
+    contents, identity = _read_regular_file_identity(
+        path, label, _VALIDATION_REMOVAL_ARTIFACT_BYTES_LIMIT
+    )
+    rows = [line for line in contents.splitlines() if line.strip()]
+    if not rows:
+        raise Refusal(f"{label} is empty: {path}")
+    final = _strict_json_object(rows[-1], f"{label} final row")
+    if final.get("commit") != target:
+        raise Refusal(f"{label} final row does not name the recorded target commit")
+    return _FrozenResultEvidence(
+        path.relative_to(config.root).as_posix(), identity, target
+    )
 
 
 def _current_incomplete_frozen_result(record: Mapping[str, object]) -> bool:
@@ -38217,6 +38344,67 @@ def _current_incomplete_frozen_retention(
     return _FrozenNoProofClassification(_FrozenNoProofDisposition.CURRENT_INCOMPLETE_RETAINED)
 
 
+def _current_terminal_frozen_removal(
+    config: Config,
+    checkout: Path,
+    record_relative: str,
+    record_path: Path,
+    record_contents: bytes,
+    record_identity: _RegularFileIdentity,
+    record_digest: str,
+    repository: Path,
+    frozen_result: _FrozenResultEvidence,
+    *,
+    batch_cleanup: _OwnerlessValidationBatchContext,
+) -> _FrozenNoProofClassification:
+    """Authorize journaled removal of one inactive, result-recorded frozen clone.
+
+    The decision follows exact checkout facts, a fresh same-UID census, and a
+    second read of the run-record and durable result.  Removal itself still
+    goes through the ordinary journaled recovery, which rebinds all of it.
+    """
+
+    target = frozen_result.target
+    _validation_checkout_facts(
+        config,
+        checkout,
+        repository,
+        expected_head=target,
+        batch_cleanup=batch_cleanup,
+        fresh_same_uid=False,
+        standalone=True,
+        remote_observation_repository=repository,
+        require_remote_containment=False,
+    )
+    batch_cleanup.assert_unused(config, checkout, fresh_same_uid=True)
+    label = "current frozen validation run-record"
+    rebound, rebound_identity = _read_regular_file_identity(
+        record_path, label, _VALIDATION_REMOVAL_ARTIFACT_BYTES_LIMIT
+    )
+    _assert_regular_file_identity(record_identity, rebound_identity, label)
+    if rebound != record_contents:
+        raise Refusal(f"{label} changed during entry classification")
+    _terminal_validation_record(
+        config,
+        record_relative,
+        checkout,
+        "frozen-checkout",
+        expected_digest=record_digest,
+        repository=repository,
+        expected_target=target,
+        frozen_removal_proof_supplied=False,
+        frozen_result=frozen_result,
+    )
+    if _GitVcs().head(checkout) != target:
+        raise Refusal(
+            "current frozen validation checkout HEAD changed during entry classification"
+        )
+    return _FrozenNoProofClassification(
+        _FrozenNoProofDisposition.CURRENT_TERMINAL_REMOVABLE,
+        frozen_result=frozen_result,
+    )
+
+
 def _frozen_no_proof_disposition(
     config: Config,
     checkout: Path,
@@ -38233,9 +38421,10 @@ def _frozen_no_proof_disposition(
     fact other than deletion authority is still readable and exact.  The
     distinct legacy result-source case keeps its existing recovery behavior;
     current incomplete results have a separate stricter preservation path;
-    other current and malformed shapes block entry. This is a read-only
-    classification: it neither creates a proof nor grants authority to remove
-    the checkout or qualify the historical result.
+    an inactive current terminal result with a durable frozen result row is
+    handed to journaled removal; other current and malformed shapes block
+    entry. This classification is read-only: it neither creates a proof nor
+    qualifies the historical result.
     """
 
     record_relative, record_path = _validation_run_record_argument(
@@ -38267,7 +38456,7 @@ def _frozen_no_proof_disposition(
         or schema not in {2, 3}
         or result_source != "historical-validation-service-result"
     ):
-        _terminal_validation_record(
+        _record_relative, record_digest, record_target = _terminal_validation_record(
             config,
             record_relative,
             checkout,
@@ -38279,8 +38468,24 @@ def _frozen_no_proof_disposition(
                 config, checkout, record_path, record_contents, record_identity,
                 repository, batch_cleanup=batch_cleanup,
             )
-        return _FrozenNoProofClassification(
-            _FrozenNoProofDisposition.BLOCKS_ENTRY
+        if record_target is None:
+            raise StateError("current frozen validation has no exact target")
+        if record_digest != record_identity.sha256:
+            raise Refusal(
+                "current frozen validation run-record changed during entry classification"
+            )
+        try:
+            frozen_result = _durable_frozen_result(
+                config, record_path, record, record_target
+            )
+        except Refusal as exc:
+            return _FrozenNoProofClassification(
+                _FrozenNoProofDisposition.BLOCKS_ENTRY, detail=str(exc)
+            )
+        return _current_terminal_frozen_removal(
+            config, checkout, record_relative, record_path, record_contents,
+            record_identity, record_digest, repository, frozen_result,
+            batch_cleanup=batch_cleanup,
         )
     if (
         record.get("kind") != "frozen-validate"
@@ -38818,6 +39023,19 @@ def _ownerless_validation_journal(
         raise Refusal("--repository applies only to validation checkouts")
 
     proof_manifest = getattr(args, "validation_proof_manifest", None)
+    # Only the bounded batch supplies this, after its own read-only
+    # classification; the recover command line has no way to name it.
+    frozen_result: _FrozenResultEvidence | None = getattr(args, "frozen_result", None)
+    if frozen_result is not None and (
+        target_kind != "frozen-checkout"
+        or proof_manifest is not None
+        or batch_cleanup is None
+        or args.completed_record is None
+    ):
+        raise StateError(
+            "durable frozen result authority applies only to batch frozen cleanup "
+            "without a proof"
+        )
     record_path: str | None = None
     record_target: str | None = None
     if args.completed_record is not None:
@@ -38833,6 +39051,7 @@ def _ownerless_validation_journal(
                 if target_kind == "frozen-checkout"
                 else None
             ),
+            frozen_result=frozen_result,
         )
         evidence: Mapping[str, object] = {
             "kind": "terminal-record",
@@ -38841,6 +39060,11 @@ def _ownerless_validation_journal(
         }
         if record_target is not None:
             evidence = {**evidence, "target": record_target}
+        if frozen_result is not None:
+            evidence = {
+                **evidence,
+                "frozen_result": _frozen_result_evidence_to_obj(frozen_result),
+            }
         if args.recovery_note is not None:
             raise Refusal("--completed-record cannot be combined with --recovery-note")
     else:
@@ -39157,12 +39381,23 @@ def _ownerless_validation_inputs(
             evidence,
             {"kind", "path", "sha256"},
             (
-                {"target"}
+                {"target", "frozen_result"}
                 if authorization.target_kind == "frozen-checkout"
                 else set()
             ),
             "terminal evidence",
         )
+        frozen_result = (
+            None
+            if "frozen_result" not in evidence
+            else _frozen_result_evidence_from_obj(
+                evidence["frozen_result"], target=authorization.head
+            )
+        )
+        if frozen_result is not None and removal_proof is not None:
+            raise StateError(
+                "frozen terminal evidence cannot combine a durable result and a proof"
+            )
         if authorization.target_kind == "frozen-checkout":
             evidence_target = _as_str(
                 evidence.get("target"), "terminal evidence.target"
@@ -39198,6 +39433,7 @@ def _ownerless_validation_inputs(
                     if authorization.target_kind == "frozen-checkout"
                     else None
                 ),
+                frozen_result=frozen_result,
             )
     elif kind == "coordinator-determination":
         _exact_keys(
@@ -40206,6 +40442,25 @@ def _recheck_excluded_validation_proof(
     """Rebind every proof artifact after excluding the checkout from new use."""
 
     proof = authorization.removal_proof
+    evidence = authorization.evidence
+    if proof is None and "frozen_result" in evidence:
+        # A durable frozen result authorizes this removal in place of a proof,
+        # so its run-record and result row are rebound after the final census
+        # exactly as proof artifacts are.
+        _terminal_validation_record(
+            config,
+            _as_str(evidence.get("path"), "terminal evidence.path"),
+            canonical_slot,
+            authorization.target_kind,
+            expected_digest=_as_str(evidence.get("sha256"), "terminal evidence.sha256"),
+            repository=repository,
+            expected_target=authorization.head,
+            frozen_removal_proof_supplied=False,
+            frozen_result=_frozen_result_evidence_from_obj(
+                evidence["frozen_result"], target=authorization.head
+            ),
+        )
+        return
     if proof is None:
         return
     if authorization.head is None:
@@ -49784,6 +50039,7 @@ def _cmd_recover_ownerless_validate_batch(args: argparse.Namespace) -> int:
             shared_census.assert_slot_unused(
                 target, None, ignore_current_process=False
             )
+            frozen_result: _FrozenResultEvidence | None = None
             if frozen and proof_manifest is None:
                 classification = _frozen_no_proof_disposition(
                     config,
@@ -49800,6 +50056,15 @@ def _cmd_recover_ownerless_validate_batch(args: argparse.Namespace) -> int:
                     })
                     continue
                 if (
+                    classification.disposition
+                    is _FrozenNoProofDisposition.CURRENT_TERMINAL_REMOVABLE
+                ):
+                    frozen_result = classification.frozen_result
+                    if frozen_result is None:
+                        raise StateError(
+                            "current terminal frozen validation lost its durable result"
+                        )
+                elif (
                     classification.disposition
                     is not _FrozenNoProofDisposition.LEGACY_RECOVERY
                 ):
@@ -49822,6 +50087,11 @@ def _cmd_recover_ownerless_validate_batch(args: argparse.Namespace) -> int:
                                 if nonblocking
                                 else "frozen validation has no typed removal proof; "
                                 "the checkout remains retained and blocks entry"
+                                + (
+                                    f": {classification.detail}"
+                                    if classification.detail
+                                    else ""
+                                )
                             ),
                         }
                     )
@@ -49841,6 +50111,7 @@ def _cmd_recover_ownerless_validate_batch(args: argparse.Namespace) -> int:
                 completed_record=record,
                 repository=repository,
                 validation_proof_manifest=proof_manifest,
+                frozen_result=frozen_result,
                 recovery_note=None,
                 retry_running_hook=False,
                 abort_create=False,
@@ -50074,6 +50345,7 @@ def _cmd_classify_ownerless_validate_batch(args: argparse.Namespace) -> int:
                     raise Refusal(
                         "frozen validation has no typed removal proof and cannot "
                         "be classified as historical"
+                        + (f": {historical.detail}" if historical.detail else "")
                     )
             item_args = argparse.Namespace(
                 ownerless_validate_checkout=None if frozen else checkout,
@@ -50082,6 +50354,11 @@ def _cmd_classify_ownerless_validate_batch(args: argparse.Namespace) -> int:
                 completed_record=record,
                 repository=repository,
                 validation_proof_manifest=proof,
+                frozen_result=(
+                    historical.frozen_result
+                    if frozen and proof is None
+                    else None
+                ),
                 recovery_note=None,
             )
             _ownerless_validation_journal(

@@ -3145,6 +3145,321 @@ def test_direct_current_frozen_recovery_requires_removal_proof(
     assert not (control_directory(project) / "ACTIVE.testhost.journal").exists()
 
 
+def prepare_result_recorded_frozen_checkout(
+    project: Path,
+    repository: Path,
+    *,
+    monkeypatch: pytest.MonkeyPatch,
+    name: str = "result-recorded",
+) -> tuple[Path, Path, Path, str]:
+    """Create a schema-6 FAILED frozen run whose own teardown left its clone."""
+
+    checkout, record, target_sha = prepare_frozen_validation_checkout(
+        project, repository, monkeypatch=monkeypatch, name=name
+    )
+    value = dict(
+        wrkslots._strict_json_object(record.read_bytes(), "result-recorded fixture")
+    )
+    value.update(
+        {
+            "service_result_schema": 6,
+            "materialized_target": False,
+            "state": "completed",
+            "result": "failure",
+            "final_validate_status": "FAILED",
+            "exit_code": 1,
+            "executed_nodes": 14,
+            "executed_tests": None,
+            "passed_tests": None,
+            "selection_mode": "frozen",
+            "scorecard_writeback": {"status": "delegated"},
+            "detail": None,
+        }
+    )
+    value.pop("scorecard_handoff")
+    value.pop("scorecard_writeback_files")
+    record.write_text(
+        json.dumps(value, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    )
+    frozen = project / "ignored" / "validate" / "frozen" / f"{record.stem}.jsonl"
+    frozen.parent.mkdir(parents=True, exist_ok=True)
+    frozen.write_text(
+        json.dumps(
+            {
+                "admission": "frozen-validate",
+                "commit": target_sha,
+                "exit_code": 1,
+                "qualifying_receipt": False,
+                "result": "fail",
+            },
+            sort_keys=True,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    stub_canonical_frozen_record_parser(
+        monkeypatch, label="result-recorded frozen validation fixture"
+    )
+    stub_validate_batch_censuses(monkeypatch)
+    return checkout, record, frozen, target_sha
+
+
+@pytest.mark.ordinary_environment
+def test_result_recorded_frozen_checkout_is_removed_by_batch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    project, repository, _remote = make_project(tmp_path)
+    checkout, record, frozen, _target_sha = prepare_result_recorded_frozen_checkout(
+        project, repository, monkeypatch=monkeypatch
+    )
+    evidence = {path: path.read_bytes() for path in (record, frozen)}
+
+    rc = run_frozen_validation_batch(project, repository, checkout, record)
+
+    assert rc == 0
+    report = json.loads(capsys.readouterr().out)
+    assert report["retained"] == []
+    assert report["removed"] == [{"checkout": str(checkout)}]
+    # One fresh census decides the classification; the excluded final check
+    # of the journaled removal takes its own.
+    assert report["same_uid_process_censuses"] == 2
+    assert not checkout.exists()
+    assert not list(checkout.parent.glob(f".{checkout.name}.ownerless-validate.*"))
+    assert {path: path.read_bytes() for path in evidence} == evidence
+    config = wrkslots._load_config(str(project), "testhost")
+    assert not wrkslots._journal_path(config).exists()
+    removed = [
+        item
+        for item in wrkslots._load_events(config)
+        if item["kind"] == "ownerless-validate-path-removed"
+    ]
+    assert len(removed) == 1
+    payload = removed[0]["payload"]
+    assert isinstance(payload, dict)
+    recorded = payload["authorization"]["evidence"]["frozen_result"]
+    assert recorded["path"] == frozen.relative_to(project).as_posix()
+    assert recorded["sha256"] == hashlib.sha256(evidence[frozen]).hexdigest()
+
+
+@pytest.mark.ordinary_environment
+def test_result_recorded_frozen_checkout_classifies_as_terminal_and_stays(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    project, repository, _remote = make_project(tmp_path)
+    checkout, record, _frozen, _target_sha = prepare_result_recorded_frozen_checkout(
+        project, repository, monkeypatch=monkeypatch
+    )
+
+    rc = run_current_incomplete_batch(
+        project, repository, checkout, record, action="classify"
+    )
+
+    assert rc == 0
+    report = json.loads(capsys.readouterr().out)
+    assert report["classifications"] == [
+        {
+            "blocks_entry": False,
+            "checkout": str(checkout),
+            "reason": (
+                "terminal validation is exact and unused; read-only "
+                "classification left it retained"
+            ),
+            "state": "terminal-retained",
+        }
+    ]
+    assert checkout.is_dir()
+    assert not wrkslots._journal_path(
+        wrkslots._load_config(str(project), "testhost")
+    ).exists()
+
+
+@pytest.mark.ordinary_environment
+def test_result_recorded_frozen_checkout_still_refuses_direct_recovery(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    project, repository, _remote = make_project(tmp_path)
+    checkout, record, _frozen, _target_sha = prepare_result_recorded_frozen_checkout(
+        project, repository, monkeypatch=monkeypatch
+    )
+
+    rc = wrkslots.main(
+        [
+            "--project-root",
+            str(project),
+            "recover",
+            "--coordinator-authorized",
+            "--coordinator-pid",
+            str(os.getpid()),
+            "--frozen-validate-checkout",
+            str(checkout),
+            "--completed-record",
+            record.relative_to(project).as_posix(),
+            "--repository",
+            repository.relative_to(project).as_posix(),
+        ]
+    )
+
+    assert rc == 3
+    assert "requires --validation-proof-manifest" in capsys.readouterr().err
+    assert checkout.is_dir()
+
+
+_NO_PROOF_RETAINED = (
+    "frozen validation has no typed removal proof; the checkout remains "
+    "retained and blocks entry: "
+)
+
+
+@pytest.mark.ordinary_environment
+@pytest.mark.parametrize(
+    "mutation",
+    (
+        "live-process",
+        "missing-result",
+        "empty-result",
+        "other-target",
+        "not-current-result",
+        "head-moved",
+        "fresh-census-live",
+        "record-changed",
+        "result-changed-at-final-census",
+    ),
+)
+def test_result_recorded_frozen_removal_refuses_each_unproven_gate(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    mutation: str,
+) -> None:
+    project, repository, _remote = make_project(tmp_path)
+    checkout, record, frozen, _target_sha = prepare_result_recorded_frozen_checkout(
+        project, repository, monkeypatch=monkeypatch, name=f"refuse-{mutation}"
+    )
+    value = dict(wrkslots._strict_json_object(record.read_bytes(), "fixture record"))
+    if mutation == "live-process":
+        identity = wrkslots._read_process_identity(os.getpid())
+        value["process_identity"] = {
+            "pid": identity.pid,
+            "start_ticks": identity.start_ticks,
+            "boot_id": identity.boot_id,
+        }
+        expected = f"{_NO_PROOF_RETAINED}frozen validation process state is live or uncertain"
+    elif mutation == "missing-result":
+        frozen.unlink()
+        expected = (
+            f"{_NO_PROOF_RETAINED}durable frozen validation result does not exist: "
+            f"{frozen}"
+        )
+    elif mutation == "empty-result":
+        frozen.write_bytes(b"")
+        expected = f"{_NO_PROOF_RETAINED}durable frozen validation result is empty: {frozen}"
+    elif mutation == "other-target":
+        frozen.write_text(json.dumps({"commit": "0" * 40}) + "\n", encoding="utf-8")
+        expected = (
+            f"{_NO_PROOF_RETAINED}durable frozen validation result final row does "
+            "not name the recorded target commit"
+        )
+    elif mutation == "not-current-result":
+        value["state"] = "killed"
+        expected = (
+            f"{_NO_PROOF_RETAINED}frozen validation has no current service-result "
+            "terminal result"
+        )
+    elif mutation == "head-moved":
+        git(
+            checkout,
+            "-c",
+            "user.name=Fixture",
+            "-c",
+            "user.email=fixture@example.invalid",
+            "commit",
+            "--allow-empty",
+            "-m",
+            "clone advanced after its run",
+        )
+        expected = (
+            "validation checkout HEAD changed after recovery was authorized; "
+            "preserve the checkout and restore the recorded target before retrying"
+        )
+    elif mutation == "fresh-census-live":
+
+        def live(
+            _paths: Sequence[Path], *, budget: wrkslots._ReadOnlyCommandBudget
+        ) -> wrkslots._ProcessPathCensus:
+            del budget
+            return wrkslots._ProcessPathCensus(
+                (), ((4242, str(checkout), "cwd", str(checkout)),)
+            )
+
+        monkeypatch.setattr(wrkslots, "_capture_same_uid_process_path_census", live)
+        expected = (
+            f"live process 4242 uses slot {checkout}: cwd={checkout}; stop it and retry"
+        )
+    elif mutation == "record-changed":
+
+        def append_during_census(
+            _paths: Sequence[Path], *, budget: wrkslots._ReadOnlyCommandBudget
+        ) -> wrkslots._ProcessPathCensus:
+            del budget
+            with record.open("a", encoding="utf-8") as stream:
+                stream.write(" ")
+            return wrkslots._ProcessPathCensus((), ())
+
+        monkeypatch.setattr(
+            wrkslots, "_capture_same_uid_process_path_census", append_during_census
+        )
+        expected = "current frozen validation run-record size changed"
+    else:
+        censuses = 0
+
+        def append_during_final_census(
+            _paths: Sequence[Path], *, budget: wrkslots._ReadOnlyCommandBudget
+        ) -> wrkslots._ProcessPathCensus:
+            nonlocal censuses
+            del budget
+            censuses += 1
+            if censuses == 2:
+                with frozen.open("a", encoding="utf-8") as stream:
+                    stream.write(json.dumps({"commit": "0" * 40}) + "\n")
+            return wrkslots._ProcessPathCensus((), ())
+
+        monkeypatch.setattr(
+            wrkslots,
+            "_capture_same_uid_process_path_census",
+            append_during_final_census,
+        )
+        expected = (
+            "durable frozen validation result final row does not name the "
+            "recorded target commit"
+        )
+    if mutation in {"live-process", "not-current-result"}:
+        record.write_text(
+            json.dumps(value, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+        )
+
+    rc = run_frozen_validation_batch(project, repository, checkout, record)
+
+    assert rc == 0
+    report = json.loads(capsys.readouterr().out)
+    assert report["removed"] == []
+    assert report["retained"] == [
+        {"blocks_entry": True, "checkout": str(checkout), "reason": expected}
+    ]
+    assert checkout.is_dir()
+    config = wrkslots._load_config(str(project), "testhost")
+    assert not wrkslots._journal_path(config).exists()
+    assert not any(
+        item["kind"] == "ownerless-validate-path-removed"
+        for item in wrkslots._load_events(config)
+    )
+
+
 @pytest.mark.ordinary_environment
 def test_direct_historical_projection_cannot_use_batch_only_nonblocking_result(
     tmp_path: Path,
@@ -48467,6 +48782,29 @@ def test_current_incomplete_frozen_retention_does_not_authorize_direct_recovery(
     assert "requires --validation-proof-manifest" in capsys.readouterr().err
     assert checkout.is_dir()
     assert (record.read_bytes(), sidecar.read_bytes(), git_metadata_snapshot(checkout)) == before
+
+
+@pytest.mark.ordinary_environment
+@pytest.mark.parametrize("action", ("recover", "classify"))
+def test_current_incomplete_frozen_with_durable_result_is_still_only_retained(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str], action: str,
+) -> None:
+    project, source, checkout, record, sidecar = prepare_current_incomplete_frozen_checkout(tmp_path, monkeypatch)
+    target = json.loads(record.read_text())["target"]
+    frozen = project / "ignored" / "validate" / "frozen" / f"{record.stem}.jsonl"
+    frozen.parent.mkdir(parents=True, exist_ok=True)
+    frozen.write_text(json.dumps({"commit": target, "result": "no_result", "exit_code": 75}) + "\n")
+    before = (record.read_bytes(), sidecar.read_bytes(), frozen.read_bytes(), git_metadata_snapshot(checkout))
+    assert run_current_incomplete_batch(project, source, checkout, record, action=action) == 0
+    row = incomplete_batch_row(json.loads(capsys.readouterr().out), action)
+    assert row["blocks_entry"] is False, row
+    assert row["reason"] == "current incomplete frozen validation is exact and inactive; the checkout and no-result remain retained"
+    assert checkout.is_dir()
+    assert (record.read_bytes(), sidecar.read_bytes(), frozen.read_bytes(), git_metadata_snapshot(checkout)) == before
+    config = wrkslots._load_config(str(project), "testhost")
+    assert not wrkslots._journal_path(config).exists()
+    assert not any(item["kind"] == "ownerless-validate-path-removed" for item in wrkslots._load_events(config))
 
 
 @pytest.mark.ordinary_environment
