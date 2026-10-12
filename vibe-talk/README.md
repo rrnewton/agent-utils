@@ -3895,15 +3895,31 @@ or another device putting the message back — a row drawn unread never wears th
 animation from the selected look rather than a transition, because on a threaded channel a Done
 redraws the row as a new element; under `prefers-reduced-motion` the grey ring and the read look
 arrive at once. The way back is the Undo chip that was already there, which now names the message it
-would put back (`Undo “seeded: filed two issues…”`, or `Undo Done (12)` after Done through here).
-The name gives way, not the row of chips: the chip goes onto the row at the width of `Undo “…”`, a
-couple of characters wider than a bare "Undo", grows into what the row has spare, and cuts the name
-short with its own ellipsis inside the quotation marks; the tooltip and a screen reader have the
-whole of it. Measured: at 412 pixels Newest, Summaries, the named Undo and Expand all share one line,
-and at 360 the four take two lines with or without the name. `tests/done_feedback_browser.py`
-reads both rings, their contrast in both schemes and the running animation by computed style in
-Chromium, takes an Undo inside the hold, and measures the row of chips at 360 and 412 pixels;
-`50-done-feedback` photographs the moment.
+would put back (`Undo “seeded: filed two issues…”`, or `Undo Done (12)` after Done through here)
+where the row of chips has room for a name. On a phone it says only **Undo**: beside Newest,
+Summaries and Expand all at 412 pixels the name gave way to one letter, `Undo “B…”`, which names
+nothing. So a row of chips narrower than 30rem (every phone, and a desk's column dragged narrow)
+draws the plain word, and wider the chip shows at least a dozen characters of the name, grows into
+what the row has spare, and cuts the rest short with its own ellipsis inside the quotation marks.
+Either way the tooltip and a screen reader have the whole name.
+
+**The chips never stand on the message box.** They float over the foot of the list, and the
+channel's message box is the last thing in it, so as the list scrolled the box and its Send passed
+under them — the Undo chip stood on Send in the 412-pixel captures, the list a little short of its
+end. Now the chips stand no lower than the box's top edge: scrolled up they float at the foot of the
+list as before, and as the box comes up the screen they stand on it and rise with it, the way a
+sticky row does, and the status pill and the pull's report rise with them. At the very end they stand
+in the room the box keeps for them above itself, between the last message and the box. A channel too
+short to scroll, whose box ends above the strip they float in, leaves them at the foot, where they
+cover nothing (lifted over it they stood on its last rows and the menus those open). The call's
+message box keeps its room under itself, where the status pill it speaks on at every turn floats.
+
+`tests/done_feedback_browser.py` reads both rings, their contrast in both schemes and the running
+animation by computed style in Chromium, takes an Undo inside the hold, measures the row of chips at
+360 and 412 pixels (a plain Undo, taking no line a bare one did not) and at 1280 (named, on one line),
+and at all three walks the list up from its end a few pixels at a time through the whole message box,
+requiring that no chip and no status pill ever meets the box or its Send; `50-done-feedback`
+photographs the moment.
 
 ### Replying from the page
 

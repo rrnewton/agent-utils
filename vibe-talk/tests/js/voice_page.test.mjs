@@ -19491,12 +19491,17 @@ test("THE UNDO CHIP NAMES THE MESSAGE it would put back, and counts a Done throu
   const name = "message 1: a sentence about the overnight run. a sentence about the overnight…";
   assert.equal(page.el("undo-dismiss-label").text(), `Undo “${name}”`,
     `the Undo chip says "${page.el("undo-dismiss-label").text()}", not which message it would put back`);
-  // The name in a span of its own, which the stylesheet cuts short to the room the chips leave, the
-  // quotation marks outside it; the whole of it in the text a screen reader reads and in the tooltip.
-  const span = page.el("undo-dismiss-label").children.find((node) => node.className === "undo-name");
+  // The name and its quotation marks in a span the stylesheet leaves out on a phone's narrow row, and
+  // the name in a span of its own inside it, which the stylesheet cuts short to the room the chips
+  // leave; the whole of it in the chip's accessible name and its tooltip, whatever the chip shows.
+  const named = page.el("undo-dismiss-label").children.find((node) => node.className === "undo-named");
+  assert.ok(named, "the name is not in a span a narrow row can leave out");
+  const span = named.children.find((node) => node.className === "undo-name");
   assert.ok(span, "the name is not in a span the stylesheet can cut short");
   assert.equal(span.textContent, name);
   assert.equal(page.el("undo-dismiss").getAttribute("title"), `Undo “${name}”`, "the tooltip does not carry the whole name");
+  assert.equal(page.el("undo-dismiss").getAttribute("aria-label"), `Undo “${name}”`,
+    "a screen reader is not told the whole name where the chip shows only Undo");
   assert.ok(!page.createdTags.includes("img") && !/</.test(span.textContent), "the name was drawn as markup");
   await page.el("undo-dismiss").click();
   await page.settle();
@@ -19504,6 +19509,7 @@ test("THE UNDO CHIP NAMES THE MESSAGE it would put back, and counts a Done throu
   assert.equal(page.el("undo-dismiss").hidden, true, "the chip outlived what it undid");
   assert.equal(page.el("undo-dismiss-label").text(), "Undo");
   assert.equal(page.el("undo-dismiss-label").children.length, 0, "the name outlived the dismissal it named");
+  assert.equal(page.el("undo-dismiss").hasAttribute("aria-label"), false, "the name outlived the dismissal it named");
   // Several rows at once are counted, not named after one of them.
   for (let i = 0; i < 3; i += 1) await pressHere(page, "j");
   await pressHere(page, "E", { shiftKey: true });
@@ -19511,10 +19517,21 @@ test("THE UNDO CHIP NAMES THE MESSAGE it would put back, and counts a Done throu
   assert.equal(page.el("undo-dismiss-label").textContent, `Undo Done (${page.dismissCalls.at(-1).messages.length})`);  assert.equal(page.el("undo-dismiss").getAttribute("title"), page.el("undo-dismiss-label").textContent);
 });
 
-test("THE UNDO CHIP'S NAME GIVES WAY, NEVER THE ROW OF CHIPS: cut short with its own ellipsis inside the quotation marks (#245)", () => {
-  // From review: the named chip is about three times as wide as "Undo", and at 412px it wrapped the
-  // row of chips up over the list and out over the Send button. tests/done_feedback_browser.py
-  // measures the row at 360px and 412px; this pins the rules that let the name, not the row, give way.
+test("ON A PHONE'S NARROW ROW THE UNDO CHIP SAYS ONLY UNDO; wider, its name gives way, never the row (#245)", () => {
+  // From review: at 412px the name gave way to one letter, "Undo “B… ”". The row of chips is a size
+  // container, and narrower than 30rem — every phone — the name and its quotation marks are left out.
+  // tests/done_feedback_browser.py measures the row at 360px, 412px and 1280px; this pins the rules.
+  assert.match(cssBlock("#scroll-tools"), /container:\s*scroll-tools \/ inline-size;/, "the row of chips is not a size container");
+  const narrow = /@container scroll-tools \(width < 30rem\) \{\s*#undo-dismiss \.undo-named \{\s*display:\s*none;\s*\}\s*\}/;
+  assert.match(CSS_CODE, narrow, "a phone's narrow row still draws the name, which gives way to a letter");
+  const wide = /@container scroll-tools \(width >= 30rem\) \{\s*#undo-dismiss:has\(\.undo-name\) \{([^}]*)\}\s*\}/.exec(CSS_CODE);
+  assert.ok(wide, "the named chip's room is not decided by the row's width");
+  // A dozen characters of the name at least, where it is drawn: its least width is stated.
+  assert.match(wide[1], /min-width:\s*12em;/, "a named chip can give way to a letter of its name");
+  // The space "Undo " ends with is dropped at the end of a flex line: drawn as a margin.
+  assert.match(cssBlock("#undo-dismiss .undo-named"), /margin-inline-start:\s*0\.3em;/);
+  // From review, the first round: the named chip is about three times as wide as "Undo", and at 412px
+  // it wrapped the row up over the list and out over the Send button. Wider, the name gives way.
   const chip = cssBlock("#undo-dismiss:has(.undo-name)");
   assert.match(chip, /flex:\s*1 1 0;/, "the chip goes onto its line at the whole name's width, so the name wraps the row");
   assert.match(chip, /min-width:\s*\d+(\.\d+)?em;/, "the chip's least width is the whole name's, so the name wraps the row");
@@ -25838,20 +25855,38 @@ test("the Threads screen says when a read fails, keeps what it knew, and tries a
   assert.match(page.el("thread-directory-state").textContent, /^10 threads, newest activity first\./);
 });
 
-test("the floating chips keep their height clear under the composer, so they never cover it", () => {
+test("the floating chips keep their height clear above the composer, and never stand lower than its top edge", () => {
   // `#194 thread-picker-polish`. Scrolled to the end of a thread, Summaries, Undo, Expand all and
-  // Collapse all sat on top of the reply box. The geometry is asserted in a real browser by
-  // tests/offline_cache_browser.py; this pins the mechanism the fake DOM cannot lay out: the
-  // composer's own room is the chips' measured height, which the page writes from an observer.
-  assert.match(cssBlock("#channel-composer"), /padding:[^;]*var\(--scroll-tools-clearance, 0px\)/,
-    "the composer keeps no room for the chips under itself");
+  // Collapse all sat on top of the reply box. `#245 done-feedback`, from review: the room under the
+  // box is where the chips float only at the very end, and a little short of it the Undo chip stood
+  // on Send. The geometry is asserted in a real browser by tests/offline_cache_browser.py and
+  // tests/done_feedback_browser.py, walked up from the end; this pins the mechanism the fake DOM
+  // cannot lay out. The channel's box keeps the chips' measured height as room ABOVE itself...
+  const rules = cssRules(CSS_CODE, "#channel-composer");
+  const own = rules.find((rule) => /margin-top:/.test(rule));
+  assert.ok(own, "the channel's box has no rule of its own for the chips' room");
+  assert.match(own, /margin-top:\s*var\(--scroll-tools-clearance, 0px\);/, "the composer keeps no room for the chips above itself");
+  assert.doesNotMatch(own, /padding-bottom:[^;]*--scroll-tools-clearance/, "the room is kept under the box as well");
   assert.match(SCRIPT_CODE, /new window\.ResizeObserver\([\s\S]*?"--scroll-tools-clearance"[\s\S]*?\.observe\(el\("scroll-tools"\)\)/,
     "nothing measures the chips any more");
+  // ...and the chips, the status pill and the pull's report over them stand no lower than its top edge.
+  assert.match(cssBlock("#frame-body"), /--chips-foot:\s*max\(0\.5rem, calc\(var\(--composer-top, 0px\) \+ 0\.25rem\)\);/,
+    "the chips' foot does not follow the message box's top edge");
+  assert.match(cssRules(CSS_CODE, "#scroll-tools")[0], /bottom:\s*var\(--chips-foot, 0\.5rem\);/, "the chips stand on the foot of the list whatever is under them");
+  assert.match(cssBlock("#status-line"), /bottom:\s*calc\(var\(--chips-foot, 0\.5rem\) \+ var\(--scroll-tools-clearance, 0px\)\);/,
+    "the status pill does not rise with the chips, and stands on the box being typed in");
+  // The edge is measured where it moves: on a scroll, a change of the list's geometry, and the room.
+  assert.match(SCRIPT_CODE, /addEventListener\("scroll", \(\) => \{\s*(\/\/[^\n]*\n\s*)*placeChipsOverComposer\(\);/,
+    "a scroll moves the box under the chips and nothing moves them");
+  assert.match(SCRIPT_CODE, /renderJumpNewest\(\);\s*(\/\/[^\n]*\n\s*)*placeChipsOverComposer\(\);\s*\}, 0\);/,
+    "the box moving without a scroll leaves the chips where they were");
+  assert.match(SCRIPT_CODE, /"--composer-top", `\$\{top\}px`/, "nothing writes the box's top edge for the stylesheet");
 });
 
 test("ON THE CALL'S VIEW TOO, the chips' room growing under the box keeps a following reader at the foot", async () => {
-  // `#241 voice-composer`. The call's box keeps the same room for the chips as the channel's does,
-  // at the foot of the scrolled content. A long turn arrives folded and brings up "Expand all"; the
+  // `#241 voice-composer`. The call's box keeps room for the chips under itself, at the foot of the
+  // scrolled content (the channel's keeps it above its box since `#245 done-feedback`, still at the
+  // foot of the scrolled content). A long turn arrives folded and brings up "Expand all"; the
   // room grows by the chip; a reader following the call is left a chip short of the foot, past the
   // slack, and stops following — the next turns are counted as "new" instead of followed. The page
   // re-pins a reader who was at the foot when the room changes, as it already did on the channel.

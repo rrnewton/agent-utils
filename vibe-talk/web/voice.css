@@ -536,6 +536,12 @@ body {
   /* The anchor for #status-line, which floats over the bottom of the body area, above the dock.
      `#63 status-line-placement`. */
   position: relative;
+  /* `#245 done-feedback`. Where the floating chips stand: half a rem above the foot of the list, or
+     just above the channel's message box wherever it reaches down into the strip they float in, so
+     the box and its Send never pass under them (`placeChipsOverComposer` in web/voice.js writes
+     `--composer-top`, how far above the foot the box's top edge is, and 0 when they stay at the
+     foot). The status pill and the pull's report stand on the chips, so they rise with them. */
+  --chips-foot: max(0.5rem, calc(var(--composer-top, 0px) + 0.25rem));
   /* `min-height: 0` is the load-bearing one: without it a grid item refuses to shrink below its
      content, the body row grows past the viewport, and the document scrolls again — which is the
      exact behaviour this whole file removes. */
@@ -1021,6 +1027,20 @@ body {
      zero when no chip is showing — so at the end of the list the chips float over that room. */
   padding: 1rem 0.75rem calc(max(1rem, env(safe-area-inset-bottom)) + var(--scroll-tools-clearance, 0px));
   border-top: 1px solid var(--edge);
+}
+
+/* `#245 done-feedback`. The channel's box keeps that room ABOVE itself instead. From review: the Undo
+   chip stood on Send in the 412px captures, the list a little short of its end — a room under the box
+   is only where the chips float when the list is at its very end, and a few pixels up the box's Send
+   slides under them. So on the channel the chips never go lower than the box's top edge
+   (`--chips-foot`, above): scrolled up they float over the list at its foot, and as the box comes up
+   they stand on it and rise with it, the way a sticky row does, into this room between the last
+   message and the box at the end of the list. The call's box keeps its room under itself: its view
+   says something on the status pill at every turn, and there the pill floats in that room rather
+   than over the newest line. */
+#channel-composer {
+  margin-top: var(--scroll-tools-clearance, 0px);
+  padding-bottom: max(1rem, env(safe-area-inset-bottom));
 }
 
 #compose-text,
@@ -3428,7 +3448,8 @@ body {
   z-index: 2;
   left: calc(0.75rem + env(safe-area-inset-left));
   right: calc(0.75rem + env(safe-area-inset-right));
-  bottom: 0.5rem;
+  /* Never lower than the channel's message box: see `--chips-foot` on #frame-body. */
+  bottom: var(--chips-foot, 0.5rem);
   display: flex;
   flex-wrap: wrap-reverse;
   justify-content: flex-end;
@@ -3550,7 +3571,7 @@ body {
    same kind of thing — what was true a moment ago — and neither may cover a control. */
 #pull-refresh[data-edge="end"] {
   top: auto;
-  bottom: calc(0.5rem + var(--scroll-tools-clearance, 0px));
+  bottom: calc(var(--chips-foot, 0.5rem) + var(--scroll-tools-clearance, 0px));
   transform: translate(-50%, calc(-1 * var(--pull-rise, 0px)));
 }
 
@@ -3935,21 +3956,25 @@ body {
 
 /*
  * `#245 done-feedback`. The Undo chip names the message it would put back — "Undo “Backup check
- * finished on…”" — and a name is several times the width of "Undo". Laid out at that width it wrapped
- * the row of chips on a 412px phone, up over the list and out over the dock. So the NAME GIVES WAY,
- * never the row: a named chip goes onto its line at the width of "Undo “…”" (its basis is nothing and
- * its least width that, stated — measured in Chromium at 6.6em of the chip's type, padding included —
- * because the least width of its content would be the whole name), about two characters wider than
- * the bare "Undo" it replaced; then it grows into whatever the line has spare, to the whole name or
- * the name's `max-width`, before the auto margin beside the jump to the newest message takes the
- * rest. The ellipsis is the chip's own, INSIDE the quotation marks:
- * it shortens a label, never the message, and the tooltip and a screen reader have the whole name
- * (`drawUndoLabel`). A chip that counts ("Undo Done (12)") or says only "Undo" keeps its own width.
+ * finished on…”" — where the row of chips has room for a name, and says only "Undo" where it has
+ * not. The whole label is the chip's tooltip and what a screen reader says either way
+ * (`drawUndoLabel`).
+ *
+ *   * ON A PHONE, "UNDO". From review: at 412px, beside Newest, Summaries and Expand all, the name
+ *     gave way to one letter — "Undo “B… ”" — which names nothing, and laid out at its own width it
+ *     had wrapped the row up over the list and out over the dock. So a row narrower than 30rem (every
+ *     phone, and a desk's column dragged narrow) draws the plain word: `scroll-tools` is a size
+ *     container, the row as wide as it is drawn.
+ *   * WIDER, THE NAME GIVES WAY, NEVER THE ROW: a named chip goes onto its line at a width that shows
+ *     the opening words — its basis is nothing and its least width stated, about a dozen characters of
+ *     the name with "Undo “”" and the padding, because the least width of its content would be the
+ *     whole name — then grows into whatever the line has spare, to the whole name or the name's
+ *     `max-width`, before the auto margin beside the jump to the newest message takes the rest. The
+ *     ellipsis is the chip's own, INSIDE the quotation marks: it shortens a label, never the message.
+ *   * A chip that counts ("Undo Done (12)") or says only "Undo" keeps its own width everywhere.
  */
-#undo-dismiss:has(.undo-name) {
-  flex: 1 1 0;
-  min-width: 6.8em;
-  max-width: max-content;
+#scroll-tools {
+  container: scroll-tools / inline-size;
 }
 
 #undo-dismiss-label {
@@ -3958,11 +3983,32 @@ body {
   white-space: nowrap;
 }
 
+/* The space after "Undo" ends a line of the label's flex row, where a browser drops it: drawn here. */
+#undo-dismiss .undo-named {
+  display: flex;
+  min-width: 0;
+  margin-inline-start: 0.3em;
+}
+
 #undo-dismiss .undo-name {
   min-width: 1em;
   max-width: 14em;
   overflow: hidden;
   text-overflow: ellipsis;
+}
+
+@container scroll-tools (width >= 30rem) {
+  #undo-dismiss:has(.undo-name) {
+    flex: 1 1 0;
+    min-width: 12em;
+    max-width: max-content;
+  }
+}
+
+@container scroll-tools (width < 30rem) {
+  #undo-dismiss .undo-named {
+    display: none;
+  }
 }
 
 .chip-icon {
@@ -4829,8 +4875,10 @@ body {
   z-index: 5;
   inset-inline: 0;
   /* Follow the actual tool height, including wrapped rows and larger phone fonts. Both layers
-     stay outside the scrolling content, so showing a banner never moves the reader's place. */
-  bottom: calc(0.5rem + var(--scroll-tools-clearance, 0px));
+     stay outside the scrolling content, so showing a banner never moves the reader's place. On the
+     chips, wherever they stand: over the channel's message box they rise with it (`--chips-foot`,
+     `#245 done-feedback`), and the pill with them, so it is never over the box being typed in. */
+  bottom: calc(var(--chips-foot, 0.5rem) + var(--scroll-tools-clearance, 0px));
   width: max-content;
   max-width: calc(100% - 1.5rem);
   margin-inline: auto;

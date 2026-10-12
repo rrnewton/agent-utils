@@ -24,12 +24,18 @@ the layout, which only a browser has:
 
   At 412x915 and 1280x800, in both schemes, with motion reduced so the picture is the look the eye is
   left with: the moment of marking (the grey ring on the row marked, the accent ring on the next) and
-  a selected read message beside an unread one, both rings measured against their surface.
+  a selected read message beside an unread one, both rings measured against their surface; and in
+  each, no chip and no status pill over the message box or its Send.
 
-  On a 360px and a 412px phone, scrolled up a channel of long messages so that Newest, the named Undo
-  chip and Expand all are up together: the three stand on ONE line, overlapping nothing, the name cut
-  short inside its quotation marks with an ellipsis and whole in the tooltip; and scrolled to the
-  end, the row of chips is clear of the composer's Send button.
+  On a 360px and a 412px phone and a 1280x800 desk, scrolled up a channel of long messages so that
+  Newest, the Undo chip, Summaries and Expand all are up together. From review, at 412px the named
+  chip gave way to one letter, "Undo “B… ”": on the phones it now says only "Undo", taking no line a
+  bare "Undo" did not, the whole name in its tooltip and its accessible name; on the desk it names the
+  message, a dozen characters of it at least, all on one line. And from review, the chip stood on
+  Send in the 412px captures, the list a little short of its end: walked up from the end of the list
+  a few pixels at a time through the whole height of the message box, no chip, and no status pill,
+  ever meets the box or its Send, at any of the three widths; at the very end the chips stand in the
+  room above the box, clear of the last message.
 
 It serves the checked-out assets and a small fake API through Playwright's request routing, so no
 port is opened. Pass --web-root DIR to run the same walk against another copy of the page: against
@@ -185,24 +191,35 @@ SELECTED_JS = """() => {
   return row ? row.getAttribute('data-id') : null;
 }"""
 
-# The row of chips over the list, the Undo chip's name, and the composer's Send, as laid out.
+# The row of chips over the list, the Undo chip's name, the status pill, and the composer's box and
+# Send, as laid out. A box is null where it is not drawn, and the box and Send are null where they are
+# not on the list's screen at all.
 CHIPS_JS = """() => {
   const box = (node) => { const r = node.getBoundingClientRect();
     return { left: r.left, right: r.right, top: r.top, bottom: r.bottom }; };
+  const shown = (node) => Boolean(node) && node.getClientRects().length > 0;
   const chips = [...document.querySelectorAll('#scroll-tools > .chip')]
-    .filter((chip) => chip.getClientRects().length).map((chip) => ({ id: chip.id, ...box(chip) }));
+    .filter(shown).map((chip) => ({ id: chip.id, ...box(chip) }));
   const name = document.querySelector('#undo-dismiss .undo-name');
   const label = document.getElementById('undo-dismiss-label');
-  const send = document.getElementById('channel-send');
+  const undo = document.getElementById('undo-dismiss');
+  const list = box(document.getElementById('scroll-area'));
+  const onList = (node) => { if (!shown(node)) return null; const b = box(node);
+    return b.bottom > list.top && b.top < list.bottom ? b : null; };
+  const rows = [...document.querySelectorAll('#discord-log > li')].filter(shown);
   return {
-    chips, width: innerWidth,
-    name: name ? { text: name.textContent, scroll: name.scrollWidth, client: name.clientWidth,
+    chips, width: innerWidth, list,
+    name: shown(name) ? { text: name.textContent, scroll: name.scrollWidth, client: name.clientWidth,
       overflow: getComputedStyle(name).textOverflow } : null,
     spill: label.scrollWidth - label.clientWidth,
     labelRight: label.getBoundingClientRect().right,
-    label: document.getElementById('undo-dismiss-label').textContent,
-    title: document.getElementById('undo-dismiss').getAttribute('title'),
-    send: send && send.getClientRects().length ? box(send) : null,
+    label: label.textContent, drawn: label.innerText.replace(/\\s+/g, ' ').trim(),
+    title: undo.getAttribute('title'), aria: undo.getAttribute('aria-label'),
+    send: onList(document.getElementById('channel-send')),
+    field: onList(document.getElementById('channel-compose-text')),
+    composer: onList(document.getElementById('channel-composer')),
+    status: shown(document.getElementById('status-line')) ? box(document.getElementById('status-line')) : null,
+    lastRow: rows.length ? box(rows[rows.length - 1]) : null,
   };
 }"""
 
@@ -425,6 +442,9 @@ def walk_pictures(walk: Walk, scheme: Scheme, size: str) -> str:
     moment, nxt = walk.row(marked), walk.row(walk.selected())
     check(moment["outlineStyle"] == "dashed" and nxt["outlineStyle"] == "solid",
           f"{scheme} {size}: the moment and the next message are not told apart by the ring: {moment} / {nxt}")
+    # From review: in these captures the Undo chip stood on Send.
+    width = int(size.split("x")[0])
+    clear_of_composer(chip_layout(walk.page, width), f"{scheme} {size} after e")
     walk.shot(f"{scheme}-{size}-moment")
     walk.page.wait_for_timeout(1300)
     walk.key("ArrowUp")
@@ -459,8 +479,53 @@ def chip_lines(laid: Json, width: int) -> int:
     return 1 + sum(1 for a, b in zip(bottoms, bottoms[1:]) if b - a >= 2)
 
 
+def meets(one: object, other: object) -> bool:
+    """Whether two boxes overlap by more than half a pixel."""
+    assert isinstance(one, dict) and isinstance(other, dict)
+    return (number(one["left"]) < number(other["right"]) - 0.5 and number(other["left"]) < number(one["right"]) - 0.5
+            and number(one["top"]) < number(other["bottom"]) - 0.5 and number(other["top"]) < number(one["bottom"]) - 0.5)
+
+
+def clear_of_composer(laid: Json, where: str) -> bool:
+    """No chip and no status pill over the message box or its Send. Answers whether Send was on screen."""
+    chips = laid["chips"]
+    assert isinstance(chips, list)
+    floating = [*chips, *([{"id": "status-line", **laid["status"]}] if isinstance(laid["status"], dict) else [])]
+    for target in ("send", "field"):
+        box = laid[target]
+        if box is None:
+            continue
+        for one in floating:
+            check(not meets(one, box), f"{where}: {one['id']} covers the composer's {target}: {one} / {box}")
+    return laid["send"] is not None
+
+
+def walk_up_from_end(walk: Walk, width: int) -> int:
+    """From the end of the list up through the whole message box, a few pixels at a time: nothing floats over it."""
+    page = walk.page
+    page.evaluate("() => { const a = document.getElementById('scroll-area'); a.scrollTop = a.scrollHeight; }")
+    page.wait_for_timeout(300)
+    end = chip_layout(page, width)
+    composer = end["composer"]
+    check(isinstance(composer, dict), f"at {width}px the message box is not on screen at the end of the list")
+    assert isinstance(composer, dict)
+    span = int(number(composer["bottom"]) - number(composer["top"])) + 120
+    seen = 0
+    for offset in range(0, span, 6):
+        page.evaluate("""(offset) => { const a = document.getElementById('scroll-area');
+          a.scrollTop = a.scrollHeight - a.clientHeight - offset; }""", offset)
+        page.evaluate("() => new Promise((done) => requestAnimationFrame(() => requestAnimationFrame(done)))")
+        laid = chip_layout(page, width)
+        if clear_of_composer(laid, f"at {width}px, {offset}px up from the end"):
+            seen += 1
+        if offset == 48:
+            walk.shot(f"chips-{width}-rising")
+    check(seen >= 10, f"at {width}px Send was on screen at only {seen} of the positions walked")
+    return seen
+
+
 def walk_chip(walk: Walk, width: int) -> str:
-    """The named Undo chip beside Newest, Summaries and Expand all: it adds no line, and Send stays clear."""
+    """The Undo chip beside Newest, Summaries and Expand all: plain on a phone, named on a desk, never over Send."""
     page = walk.page
     page.evaluate("() => { const a = document.getElementById('scroll-area'); a.scrollTop = a.scrollHeight - 2.2 * a.clientHeight; }")
     page.wait_for_selector("#jump-newest", state="visible", timeout=5_000)
@@ -480,13 +545,22 @@ def walk_chip(walk: Walk, width: int) -> str:
     check({"jump-newest", "undo-dismiss", "expand-all"} <= set(ids), f"at {width}px the chips up are {ids}")
     named = chip_lines(laid, width)
     name = laid["name"]
-    check(isinstance(name, dict), "the Undo chip carries no name")
-    assert isinstance(name, dict)
-    label, title = str(laid["label"]), str(laid["title"])
+    label, title, aria = str(laid["label"]), str(laid["title"]), str(laid["aria"])
     check(label.startswith(f"Undo “Backup check {int(row[-4:])} finished"), f"the label is {label!r}")
-    check(title == label, f"the tooltip {title!r} is not the whole label {label!r}")
-    cut = number(name["scroll"]) > number(name["client"]) + 1
-    check(cut and name["overflow"] == "ellipsis", f"at {width}px the name is not cut short with an ellipsis: {name}")
+    check(title == label and aria == label, f"the tooltip {title!r} or the accessible name {aria!r} is not the whole label {label!r}")
+    phone = width < 480
+    if phone:
+        # From review: the name gave way to one letter here. A phone's row says only "Undo".
+        check(laid["drawn"] == "Undo" and name is None, f"at {width}px the Undo chip draws {laid['drawn']!r}, not a plain Undo")
+    else:
+        check(isinstance(name, dict) and str(laid["drawn"]).startswith("Undo “ Backup check"),
+              f"at {width}px the Undo chip does not name the message: {laid['drawn']!r}")
+        assert isinstance(name, dict)
+        # A dozen characters of the name at least: 6em of the chip's type is about that many.
+        check(number(name["client"]) >= 6 * 12.8 - 1 or number(name["scroll"]) <= number(name["client"]) + 1,
+              f"at {width}px the name gives way to {name['client']}px of {name['scroll']}px")
+        cut = number(name["scroll"]) > number(name["client"]) + 1
+        check(not cut or name["overflow"] == "ellipsis", f"at {width}px the name is cut short without an ellipsis: {name}")
     check(number(laid["spill"]) <= 1, f"at {width}px the chip's words spill out of it: {laid}")
     undo = next(chip for chip in chips if chip["id"] == "undo-dismiss")
     check(number(laid["labelRight"]) <= number(undo["right"]) + 0.5, f"at {width}px the words run past the chip: {laid}")
@@ -498,10 +572,12 @@ def walk_chip(walk: Walk, width: int) -> str:
     bare = chip_lines(chip_layout(page, width), width)
     page.evaluate("() => renderTodoControls()")
     page.wait_for_timeout(100)
-    check(named <= bare, f"at {width}px the named chip wraps the row onto {named} lines, a bare Undo onto {bare}")
+    check(named <= bare, f"at {width}px the Undo chip wraps the row onto {named} lines, a bare Undo onto {bare}")
     if width >= 412:
-        check(named == 1, f"at {width}px Newest, the named Undo and the rest do not stand on one line: {chips}")
-    # At the end of the list Newest goes, and the row of chips floats over the room the composer keeps.
+        check(named == 1, f"at {width}px Newest, the Undo chip and the rest do not stand on one line: {chips}")
+    # Walked up from the end of the list through the message box: nothing floats over it or its Send.
+    seen = walk_up_from_end(walk, width)
+    # At the very end Newest goes, and the chips stand in the room above the box, clear of the last row.
     page.evaluate("() => { const a = document.getElementById('scroll-area'); a.scrollTop = a.scrollHeight; }")
     page.wait_for_timeout(400)
     end = chip_layout(page, width)
@@ -510,16 +586,17 @@ def walk_chip(walk: Walk, width: int) -> str:
     end_ids = [str(chip["id"]) for chip in end_chips]
     check("undo-dismiss" in end_ids and "jump-newest" not in end_ids, f"at the end the chips up are {end_ids}")
     check(chip_lines(end, width) == 1, f"at {width}px the chips at the end of the list wrapped: {end_chips}")
-    send = end["send"]
-    check(isinstance(send, dict), f"at {width}px the composer's Send is not on screen at the end")
-    assert isinstance(send, dict)
+    check(clear_of_composer(end, f"at {width}px at the end"), f"at {width}px the composer's Send is not on screen at the end")
+    composer, last = end["composer"], end["lastRow"]
+    assert isinstance(composer, dict) and isinstance(last, dict)
     for chip in end_chips:
-        clear = (number(chip["top"]) >= number(send["bottom"]) or number(chip["bottom"]) <= number(send["top"])
-                 or number(chip["left"]) >= number(send["right"]) or number(chip["right"]) <= number(send["left"]))
-        check(clear, f"at {width}px a chip covers Send: {chip} / {send}")
+        check(number(chip["bottom"]) <= number(composer["top"]) + 0.5, f"at {width}px a chip stands below the box's top: {chip}")
+        check(not meets(chip, last), f"at {width}px at the end a chip covers the last message: {chip} / {last}")
     walk.shot(f"chips-{width}-end")
-    return (f"{width}px: {' · '.join(ids)} on {named} line{'s' if named > 1 else ''} (a bare Undo: {bare}), the name cut"
-            f" with an ellipsis; at the end {' · '.join(end_ids)} on one line, clear of Send")
+    words = "a plain Undo" if phone else "the Undo chip named"
+    return (f"{width}px: {' · '.join(ids)} on {named} line{'s' if named > 1 else ''} (a bare Undo: {bare}), {words};"
+            f" walked up from the end, Send clear at all {seen} positions it was on screen; at the end"
+            f" {' · '.join(end_ids)} on one line in the room above the box")
 
 
 def main() -> int:
@@ -556,9 +633,9 @@ def main() -> int:
                     notes.append(walk_pictures(Walk(page, args.screenshots, f"done-{scheme}-{size}"), scheme, size))
                     check(not errors, f"the page threw: {errors}")
                     page.context.close()
-            for width, height in ((360, 800), (412, 915)):
+            for width, height in ((360, 800), (412, 915), (1280, 800)):
                 page, errors = open_channel(browser, FakeApi(web_root, LONG_MESSAGES), width=width, height=height,
-                                            touch=True)
+                                            touch=width < 480)
                 notes.append(walk_chip(Walk(page, args.screenshots, f"undo-chip-{width}"), width))
                 check(not errors, f"the page threw: {errors}")
                 page.context.close()
@@ -569,8 +646,9 @@ def main() -> int:
           " dashed in grey on the same lit surface, in both schemes; e drew the moment on the row it left (the"
           " done-marking animation, the dashed grey ring at the read strength, then neither); the Undo chip named"
           " the message and put it back, and an Undo inside the hold took the ring away at once; under reduced"
-          " motion the same look arrived with no animation; the named chip stood on one line with Newest and"
-          " Expand all and clear of Send.")
+          " motion the same look arrived with no animation; the Undo chip was a plain Undo on the phones and"
+          " named on the desk, on one line with Newest and Expand all, and no chip or status pill ever stood on"
+          " the message box or its Send, walked up from the end of the list.")
     for note in notes:
         print(f"  {note}")
     return 0

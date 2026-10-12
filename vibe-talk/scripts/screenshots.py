@@ -4803,26 +4803,40 @@ SCENES: tuple[Scene, ...] = (
                 "&& b.outlineStyle === 'solid' && b.outlineColor === window.__colour('--accent'); })()",
             ),
             (
-                "the Undo chip is up, and names the message it would put back",
-                "window.__visible('undo-dismiss') && "
-                "/^Undo \u201c.+\u201d$/.test(document.getElementById('undo-dismiss-label').textContent)",
+                # From review, the second round: at 412px the name gave way to one letter. On a phone's
+                # narrow row the chip says only "Undo", and the whole name is its tooltip and its
+                # accessible name; on a desk it names the message.
+                "the Undo chip is up: named on the desk, a plain Undo on the phone, the name whole in its tooltip",
+                "(() => { const undo = document.getElementById('undo-dismiss'); "
+                "const label = document.getElementById('undo-dismiss-label'); "
+                "const drawn = label.innerText.replace(/\\s+/g, ' ').trim(); "
+                "const whole = label.textContent; "
+                "return window.__visible('undo-dismiss') && /^Undo \u201c.+\u201d$/.test(whole) "
+                "&& undo.getAttribute('title') === whole && undo.getAttribute('aria-label') === whole "
+                "&& (innerWidth < 480 ? drawn === 'Undo' : drawn.startsWith('Undo \u201c ')); })()",
             ),
             (
-                # From review: named, the chip wrapped the row of chips at 412px. The name gives way:
-                # the chip's words stay inside it, cut short inside the quotes where they do not fit,
-                # and no chip overlaps another or the screen's edge. tests/done_feedback_browser.py
-                # measures at 360 and 412px that the name takes no line a bare "Undo" did not.
-                "the chips overlap nothing, and the Undo chip's words stay inside it",
-                "(() => { const chips = [...document.querySelectorAll('#scroll-tools > .chip')]"
-                ".filter((c) => c.getClientRects().length).map((c) => c.getBoundingClientRect()); "
-                "const apart = (c, d) => c.right <= d.left || d.right <= c.left || c.bottom <= d.top "
-                "|| d.bottom <= c.top; "
+                # From review: named, the chip wrapped the row of chips at 412px, and in these captures
+                # it stood on Send. The chip's words stay inside it, no chip overlaps another or the
+                # screen's edge, and no chip and no status pill is over the message box or its Send
+                # where they are on the list's screen. tests/done_feedback_browser.py walks the list up
+                # from its end at 360, 412 and 1280px.
+                "the chips overlap nothing and stay clear of the message box, and the Undo chip's words stay inside it",
+                "(() => { const shown = (e) => !!e && e.getClientRects().length > 0; "
+                "const chips = [...document.querySelectorAll('#scroll-tools > .chip')]"
+                ".filter(shown).map((c) => c.getBoundingClientRect()); "
+                "const apart = (c, d) => c.right <= d.left + 0.5 || d.right <= c.left + 0.5 || c.bottom <= d.top + 0.5 "
+                "|| d.bottom <= c.top + 0.5; "
+                "const list = document.getElementById('scroll-area').getBoundingClientRect(); "
+                "const floating = [...chips, ...[document.getElementById('status-line')].filter(shown)"
+                ".map((s) => s.getBoundingClientRect())]; "
+                "const box = ['channel-send', 'channel-compose-text'].map((id) => document.getElementById(id))"
+                ".filter(shown).map((e) => e.getBoundingClientRect()).filter((b) => b.bottom > list.top && b.top < list.bottom); "
                 "const label = document.getElementById('undo-dismiss-label'); "
-                "const name = document.querySelector('#undo-dismiss .undo-name'); "
                 "return chips.length > 0 && chips.every((c) => c.left >= 0 && c.right <= innerWidth) "
-                "&& chips.every((c, i) => chips.slice(i + 1).every((d) => apart(c, d))) && !!name "
-                "&& label.scrollWidth <= label.clientWidth + 1 "
-                "&& getComputedStyle(name).textOverflow === 'ellipsis'; })()",
+                "&& chips.every((c, i) => chips.slice(i + 1).every((d) => apart(c, d))) "
+                "&& floating.every((f) => box.every((b) => apart(f, b))) "
+                "&& label.scrollWidth <= label.clientWidth + 1; })()",
             ),
         ),
     ),

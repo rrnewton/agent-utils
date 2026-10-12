@@ -488,21 +488,23 @@ steps:
   # the moment on the row it left (the done-marking animation running, the dashed grey ring at the read
   # strength, then neither); the Undo chip names the message and puts it back, and an Undo inside the
   # hold takes the ring away at once; under reduced motion the same look arrives with no animation; at
-  # 412x915 and 1280x800 in both schemes the moment and a selected read message, measured; and on a
-  # 360px and a 412px phone the named Undo chip adds no line to the row of chips, cut short with an
-  # ellipsis, and the row keeps clear of Send. Served through Playwright's request routing, so it opens
-  # no port. Measured on 2026-10-12: about 20s wall.
+  # 412x915 and 1280x800 in both schemes the moment and a selected read message, measured, with nothing
+  # floating over the message box; on a 360px and a 412px phone the Undo chip says only "Undo", taking no
+  # line a bare one did not, and at 1280x800 it names the message on one line; and at all three, walked
+  # up from the end of the list a few pixels at a time through the message box, no chip and no status
+  # pill ever meets the box or its Send. Served through Playwright's request routing, so it opens no port.
+  # Measured on 2026-10-12: about 40s wall.
   - group: check
     job: done-feedback-browser
-    desc: selected read ringed dashed grey and selected unread solid in the accent in both schemes, the moment of a Done and every Undo, reduced motion, and the named Undo chip on one line at 360 and 412px, in current Chromium
+    desc: selected read ringed dashed grey and selected unread solid in the accent in both schemes, the moment of a Done and every Undo, reduced motion, a plain Undo chip on phones and a named one on a desk, and nothing floating over the message box at any scroll position, in current Chromium
     labels: [validation-vibe-talk]
     cmd: cd vibe-talk && python3 tests/done_feedback_browser.py
     jobs_flag: ""
-    timeout: 120
-    cpu_timeout: 60
+    timeout: 180
+    cpu_timeout: 90
     hint:
       resources: {browser: 1}
-      est_duration_s: 20
+      est_duration_s: 40
       classification: latency-bound
       rss_baseline_bytes: 1073741824
 

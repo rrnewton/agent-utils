@@ -211,10 +211,11 @@ let statusTimer = null;
 // their measured height instead of giving both overlays the same bottom edge. Observing the tools
 // also handles font/viewport changes and their parent screen being hidden, without moving history.
 //
-// `#194 thread-picker-polish`. The same measurement is the room the channel composer keeps under
-// itself (see `#channel-composer` in web/voice.css), so the chips float over that room and not over
-// the box being typed in. That room is at the foot of the scrolled content, so a reader parked at
-// the newest line would be left short of it whenever it grew: keep that reader at the foot.
+// `#194 thread-picker-polish`. The same measurement is the room the channel composer keeps beside
+// itself (see `#channel-composer` in web/voice.css; above it since `#245 done-feedback`, which also
+// stands the chips on the box, `placeChipsOverComposer`), so the chips float over that room and not
+// over the box being typed in. That room is at the foot of the scrolled content, so a reader parked
+// at the newest line would be left short of it whenever it grew: keep that reader at the foot.
 // `#241 voice-composer` gave the call's message box the same room, so the same holds on the call's
 // view: a long turn arriving folded brings up "Expand all", the room grows by the chip, and a
 // reader following the call would otherwise be left a chip short of the foot and stop following.
@@ -233,7 +234,45 @@ if (typeof window.ResizeObserver === "function") {
     );
     if (landed) placeEntryLanding(entryLanding.row, entryLanding.first);
     if (pinned) area.scrollTop = area.scrollHeight;
+    // The room the channel's box keeps for them is above it, so it moved with them.
+    placeChipsOverComposer();
   }).observe(el("scroll-tools"));
+}
+
+// `#245 done-feedback`. The chips float over the foot of the list, and the channel's message box is
+// the last thing in the list, so as the list scrolls the box passes under them: from review, the
+// Undo chip stood on Send in the 412px captures, the list a little short of its end. So wherever the
+// box reaches down into the strip the chips and the status pill over them float in, they stand on
+// its top edge instead, never lower, as a sticky row would, and at the very end in the room the box
+// keeps above itself (`#channel-composer` in web/voice.css). A box that ends above that strip — a
+// channel too short to scroll — leaves them at the foot, where they cover nothing; lifted over it
+// they stood on the list's last rows and the menus those open. This writes `--composer-top`, how far
+// above the foot of the list the box's top edge is (0 when they stay at the foot); the stylesheet
+// stands the chips, and the status pill and the pull's report on them, on the higher of their own
+// place and that edge. On every scroll, so measured only near the end of the list: further up the
+// box is below the screen, and three numbers the jump reads already say so.
+let composerTop = 0;
+
+/** How far the status pill reaches above the chips, in rem: its gap and its least height (`#status-line`). */
+const CHIPS_PILL_REM = 2.4;
+
+function placeChipsOverComposer() {
+  let top = 0;
+  if (currentScreen === "main" && currentView === "discord") {
+    const area = leftEl("scroll-area");
+    const box = leftEl("channel-composer");
+    const below = area.scrollHeight - area.scrollTop - (area.clientHeight || 0);
+    if (below < (area.clientHeight || 0) + (box.offsetHeight || 0)) {
+      const foot = leftEl("screen-main").getBoundingClientRect().bottom;
+      const edge = box.getBoundingClientRect();
+      // The strip they float in at the foot: half a rem off it, the chips, and the pill over them.
+      const strip = rootFontPx() * (0.5 + CHIPS_PILL_REM) + leftEl("scroll-tools").getBoundingClientRect().height;
+      if (edge.bottom > foot - strip) top = Math.max(0, Math.round(foot - edge.top));
+    }
+  }
+  if (top === composerTop) return;
+  composerTop = top;
+  leftEl("frame-body").style.setProperty("--composer-top", `${top}px`);
 }
 
 const setStatus = (text) => {
@@ -517,6 +556,8 @@ function showScreen(name) {
   currentScreen = name;
   // The jump is about the list on the main screen, and is gone with it. `#207 scrollback-jump`.
   renderJumpNewest();
+  // ...and so is the channel's message box the chips stand on. `#245 done-feedback`.
+  placeChipsOverComposer();
   // LAST, and after `currentScreen` is set: the bar decides what it shows from the screen that is
   // now up, and it is also what collapses the header when nothing is left in it. `#58 control-bar`.
   renderControlBar();
@@ -814,6 +855,8 @@ function showView(name) {
   renderChannelNavigation();
   // `#229 desktop-two-column`. One column or two is the channel's layout.
   renderColumns();
+  // `#245 done-feedback`. The chips stand on the channel's message box, which only the channel has.
+  placeChipsOverComposer();
   saveUiState();
   // `#224 keyboard-shortcuts`. The list on screen takes the focus, so that the scroll keys move it.
   // Above all off the view switch: left holding the focus from the click that pressed it, it took
@@ -22202,7 +22245,8 @@ let lastDismissal = null;
  * `#245 done-feedback`. What the Undo chip calls the message it would put back: the message's first
  * words, cut at a word to about this many characters — the whole of what its tooltip says. The chip
  * itself floats over the list beside the other chips and shows only what fits there, ending what it
- * cuts with an ellipsis of its own (web/voice.css, `#undo-dismiss .undo-name`).
+ * cuts with an ellipsis of its own, and on a phone's narrow row only "Undo" (web/voice.css,
+ * `#undo-dismiss .undo-name`).
  */
 const UNDO_NAME_CHARS = 80;
 
@@ -22245,25 +22289,33 @@ function undoLabel(dismissal) {
 }
 
 /**
- * Draw the Undo chip's words. The name is in a span of its own, which web/voice.css cuts short with
- * an ellipsis to the width the row of chips has left, so a long name does not wrap the row up over
- * the list and out over the dock; the quotation marks stay outside it, so the cut reads as a cut. Its
- * text is the whole name, so a screen reader hears it all, and so does the tooltip: set as an
- * attribute, never as markup, as a link's address is (`linkList`).
+ * Draw the Undo chip's words. The name and its quotation marks are in a span of their own, which
+ * web/voice.css leaves out on a row of chips too narrow for a name, where the chip says only "Undo";
+ * inside it the name is in a span of its own again, which the stylesheet cuts short with an ellipsis
+ * to the width the row has left, the quotation marks outside it so the cut reads as a cut. Whatever
+ * the chip shows, the whole label is its accessible name and its tooltip, so a screen reader and a
+ * long press have the whole name: set as attributes, never as markup, as a link's address is
+ * (`linkList`).
  */
 function drawUndoLabel(dismissal) {
   const label = el("undo-dismiss-label");
+  const button = el("undo-dismiss");
   const words = undoLabel(dismissal);
-  el("undo-dismiss").setAttribute("title", words);
+  button.setAttribute("title", words);
   label.replaceChildren();
   if (dismissal === null || !dismissal.name) {
+    button.removeAttribute("aria-label");
     label.textContent = words;
     return;
   }
+  button.setAttribute("aria-label", words);
   const name = document.createElement("span");
   name.className = "undo-name";
   name.textContent = dismissal.name;
-  label.replaceChildren(document.createTextNode("Undo “"), name, document.createTextNode("”"));
+  const named = document.createElement("span");
+  named.className = "undo-named";
+  named.append(document.createTextNode("“"), name, document.createTextNode("”"));
+  label.replaceChildren(document.createTextNode("Undo "), named);
 }
 
 /** How many the backlog control is about to clear, so it can say so before it does it. */
@@ -28303,6 +28355,8 @@ el("search-field").addEventListener("keydown", (event) => {
 // `#207 scrollback-jump` it is offered the moment they scroll far enough up the history to want it.
 // Only the jump, not every chip: this runs on every scroll event. See `renderJumpNewest`.
 el("scroll-area").addEventListener("scroll", () => {
+  // `#245 done-feedback`. First, so the chips keep off the message box in the frame it moved in.
+  placeChipsOverComposer();
   renderJumpNewest();
   // `#204 reply-arrow`. The way back to a reply goes once the reply is on screen again, however
   // the reader brought it there: a chip offering to go where they already are is clutter.
@@ -28343,6 +28397,9 @@ if (typeof window.ResizeObserver === "function") {
     setTimeout(() => {
       decisionDue = false;
       renderJumpNewest();
+      // `#245 done-feedback`. The message box moves without a scroll too: the window, a view or
+      // screen changing, the box itself resized.
+      placeChipsOverComposer();
     }, 0);
   });
   for (const box of [el("scroll-area"), ...el("scroll-area").children]) geometry.observe(box);
