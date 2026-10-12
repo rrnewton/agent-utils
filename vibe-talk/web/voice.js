@@ -136,6 +136,7 @@ let sideActive = false;
  *   | "close-settings" | "close-threads" | "collapse-all" | "column-toggle" | "dismiss-banner"
  *   | "dismiss-error" | "dismiss-status" | "expand-all" | "fold-help" | "forget-conversations"
  *   | "forget-dismissed-sends" | "forget-token"
+ *   | "retry-start"
  *   | "hang-up"
  *   | "help-link-auto-read" | "help-link-canned-prompts" | "help-link-channel-alias"
  *   | "help-link-combining" | "help-link-connection" | "help-link-control-bar"
@@ -352,6 +353,8 @@ let errorTimer = null;
 
 function showError(text) {
   const box = el("error-wrap");
+  // Try again is offered by one error only, and it shows it after this; see `reportUnreachable`.
+  el("retry-start").hidden = true;
   holdingReader(() => {
     el("error").textContent = redact(text);
     el("error").hidden = false;
@@ -366,6 +369,8 @@ function clearError() {
   const box = el("error-wrap");
   if (errorTimer !== null) clearTimeout(errorTimer);
   errorTimer = null;
+  // `#209 voice-socket-open`. Try again belongs to the one error that offers it.
+  el("retry-start").hidden = true;
   // Most callers clear on the way into an action — Read, Talk, sign-in — whether or not anything is
   // showing. With nothing to take away there is nothing to hold, and holding anyway would snap a
   // reader within BOTTOM_SLACK_PX of the newest line down onto it.
@@ -8480,6 +8485,38 @@ const SUSPENSION_GRACE_MS = 2500;
 const FAILURE_REPORT_MS = 250;
 let failureTimer = null;
 
+/**
+ * How long the voice socket may take to open before the page stops waiting. `#209
+ * voice-socket-open`. Healthy starts opened in 0.4 to 3.1 seconds. Without a deadline, a front door
+ * that takes the connection and never answers it left the call on "Connecting…" for as long as the
+ * browser's own network timeout, which can be minutes.
+ */
+const SOCKET_OPEN_TIMEOUT_MS = 9000;
+let openTimer = null;
+
+/** What the page says when a start cannot reach the voice service. */
+const VOICE_UNREACHABLE = "The voice service is not reachable.";
+
+/**
+ * The socket the reader hung up on. Its close is the reader's act, not a failure, even when it
+ * comes before the socket ever opened.
+ */
+let hungUpSocket = null;
+
+/**
+ * Whether the last start never reached the voice service, and how it was started, so Try again
+ * can start the same kind of conversation. `#209 voice-socket-open`.
+ */
+let hasUnreachable = false;
+let lastStartChat = false;
+
+function clearOpenTimer() {
+  if (openTimer !== null) {
+    clearTimeout(openTimer);
+    openTimer = null;
+  }
+}
+
 let hiddenDuringCall = false;
 let visibleAt = 0;
 // When the page was last hidden, or 0 while it is visible. `#203 incremental-refresh`.
@@ -8617,6 +8654,69 @@ function reportFailure() {
   setStatus("The connection to the voice agent failed.");
 }
 
+/**
+ * A start that never reached the voice service: refused, closed, or silent past the deadline.
+ * `#209 voice-socket-open`.
+ *
+ * Said as what it is — the voice service, not this browser — with a Try again beside it. The old
+ * sentence ("this browser could not open its WebSocket") read like a fault in the phone, offered
+ * nothing to press, and was answered with a hand-made retry, two to four times in a row.
+ *
+ * @param {string} how what happened, as a sentence
+ * @param {string} hint what may explain it, as a sentence, or ""
+ */
+function reportUnreachable(how, hint) {
+  failureTimer = null;
+  hasUnreachable = true;
+  showError(`${VOICE_UNREACHABLE} ${how}${hint ? ` ${hint}` : ""} Try again in a moment.`);
+  el("retry-start").hidden = false;
+  setStatus(VOICE_UNREACHABLE);
+  renderControls();
+}
+
+/**
+ * Record, for the startup line, that this start's socket never opened, and how it ended. Names
+ * and numbers only, like every other startup mark.
+ *
+ * @param {number | null} code the close code the browser reported, if it reported one
+ * @param {boolean} timedOut whether the page's own deadline ended it
+ */
+function noteSocketFailure(code, timedOut) {
+  const timing = session.timing;
+  if (!timing || timing.sent) return;
+  markStartup("socket_failed");
+  timing.socket = { socket_timeout: timedOut };
+  if (typeof code === "number" && code >= 1000 && code <= 4999) {
+    timing.socket.socket_close_code = code;
+  }
+}
+
+/**
+ * Why a deployment's own voice socket may be refused, when its address says so: it names a host
+ * other than this page's. That shared configuration once refused every call on one host for two
+ * days, and nothing on the page said where the socket was going.
+ *
+ * @param {string} socketUrl the address the socket was opened on
+ * @returns {string}
+ */
+function foreignSocketHint(socketUrl) {
+  if (session.protocol !== "vibe-talk-v1") return "";
+  const host = (url) => ((/^[a-z]+:\/\/(?:[^/@?#]*@)?([^/:?#]+)/iu.exec(url) || [])[1] || "").toLowerCase();
+  const target = host(socketUrl);
+  const own = host(String(window.location.origin || ""));
+  if (!target || !own || target === own) return "";
+  return `Its address is on ${target}, not on ${own}, and that host may not accept the sign-in of this page.`;
+}
+
+/** Try again: start the same kind of conversation the failed start was. */
+function retryStart() {
+  clearError();
+  if (lastStartChat && el("compose-text").value.trim() !== "") {
+    return guardQuietly(sendTyped)();
+  }
+  return guard(start)(lastStartChat ? { chat: true } : undefined);
+}
+
 // --- the call ----------------------------------------------------------------------------------
 
 /**
@@ -8657,6 +8757,8 @@ async function openConversation(options) {
   // set would keep the large control reading "Resume" during and after the call it started.
   session.failed = false;
   session.chat = chat;
+  hasUnreachable = false;
+  lastStartChat = chat;
   session.providerName = conversationalVoice.name;
   session.vendorSentAudioInChat = false;
   hiddenDuringCall = false;
@@ -8718,13 +8820,47 @@ async function openConversation(options) {
   }
 
   setState("working");
-  const socket = new WebSocket(voiceSocketUrl(minted.websocket_url));
+  const socketUrl = voiceSocketUrl(minted.websocket_url);
+  const socket = new WebSocket(socketUrl);
   socket.binaryType = "arraybuffer";
   session.socket = socket;
   session.muted = false;
   renderControls();
+  // `#209 voice-socket-open`. Whether THIS socket ever opened: a close before it did is a start
+  // that never reached the voice service, whatever the close code says.
+  let opened = false;
+  clearOpenTimer();
+  openTimer = setTimeout(() => {
+    openTimer = null;
+    if (session.socket !== socket || opened) return;
+    // Stop listening before closing: the close this causes is the page's own, and has nothing
+    // more to report than what is reported here.
+    socket.onopen = null;
+    socket.onmessage = null;
+    socket.onerror = null;
+    socket.onclose = null;
+    if (failureTimer !== null) {
+      clearTimeout(failureTimer);
+      failureTimer = null;
+    }
+    noteSocketFailure(null, true);
+    try {
+      socket.close();
+    } catch (_error) {
+      // A socket that is already closing has nothing more to close.
+    }
+    reportUnreachable(
+      `Nothing answered at its address within ${Math.round(SOCKET_OPEN_TIMEOUT_MS / 1000)} seconds.`,
+      foreignSocketHint(socketUrl)
+    );
+    dismissBanner();
+    addDetail(`the voice socket did not open within ${Math.round(SOCKET_OPEN_TIMEOUT_MS / 1000)} s`);
+    teardown();
+  }, SOCKET_OPEN_TIMEOUT_MS);
 
   socket.onopen = () => {
+    opened = true;
+    clearOpenTimer();
     markStartup("socket_open");
     if (session.health) {
       session.health.openedAt = Date.now();
@@ -8860,7 +8996,12 @@ async function openConversation(options) {
     if (failureTimer !== null) {
       clearTimeout(failureTimer);
     }
-    failureTimer = setTimeout(reportFailure, FAILURE_REPORT_MS);
+    failureTimer = setTimeout(
+      opened
+        ? reportFailure
+        : () => reportUnreachable("Its address did not accept the connection.", foreignSocketHint(socketUrl)),
+      FAILURE_REPORT_MS
+    );
   };
 
   socket.onclose = (event) => {
@@ -8875,8 +9016,19 @@ async function openConversation(options) {
       clearTimeout(failureTimer);
       failureTimer = null;
     }
-    const cause = wasSuspended() ? "suspended" : session.failed ? "failed" : "ended";
-    if (cause === "failed") {
+    clearOpenTimer();
+    // `#209 voice-socket-open`. Closed before it ever opened, and not by the reader: the start
+    // never reached the voice service, whether or not an error came first.
+    const neverOpened = !opened && hungUpSocket !== socket;
+    const cause = wasSuspended()
+      ? "suspended"
+      : session.failed || neverOpened
+        ? "failed"
+        : "ended";
+    if (cause === "failed" && neverOpened) {
+      noteSocketFailure(event.code, false);
+      reportUnreachable("Its address did not accept the connection.", foreignSocketHint(socketUrl));
+    } else if (cause === "failed") {
       reportFailure();
     } else {
       setState(cause);
@@ -9153,7 +9305,8 @@ function settleSpoken() {
 // refuses anything else.
 
 function beginStartupTiming(chat) {
-  session.timing = { origin: Date.now(), chat, marks: {}, sent: false };
+  // `socket` stays null unless the socket never opened; see `noteSocketFailure`.
+  session.timing = { origin: Date.now(), chat, marks: {}, sent: false, socket: null };
 }
 
 /** Record a phase the FIRST time it happens in this call. Later occurrences are not startup. */
@@ -9187,7 +9340,7 @@ function sendStartupTiming() {
   // Diagnostics, not the call: a failure here is not worth a word on the screen.
   api("/api/v1/voice-timing", {
     method: "POST",
-    body: { protocol: session.protocol, chat: timing.chat, ...marks },
+    body: { protocol: session.protocol, chat: timing.chat, ...marks, ...(timing.socket || {}) },
   }).catch(() => {});
 }
 
@@ -9643,6 +9796,8 @@ function startCapture(socket) {
 }
 
 function teardown() {
+  // A start torn down for any reason is no longer waiting for its socket to open.
+  clearOpenTimer();
   // Before anything is reset: the turn in progress is stored, and a call that ended before its
   // greeting still reports how far it got.
   settleSpoken();
@@ -9729,6 +9884,7 @@ function stop() {
     sendVibeTalkFrame({ type: "audio_end" });
     sendVibeTalkFrame({ type: "quit" });
   }
+  hungUpSocket = session.socket;
   session.socket.close();
   setStatus("Call ended.");
   setState("ended");
@@ -9833,6 +9989,14 @@ function renderControls() {
       // A start is asking for its session or the microphone, and has no socket yet. Pressing this
       // again starts nothing (`start()` refuses), so it must not offer to.
       label.textContent = "Connecting…";
+      return;
+    }
+    if (hasUnreachable) {
+      // `#209 voice-socket-open`. The last start never reached the voice service, so there is no
+      // call to resume and nothing new about starting one: the offer is to try the same again.
+      label.textContent = "Try again";
+      note.textContent = "the voice service is not reachable";
+      note.hidden = false;
       return;
     }
     if (hasSuspended) {
@@ -9997,7 +10161,9 @@ function setSpeakerOff(off) {
 /** The one large control: start a call when idle, toggle mute when one is live. */
 function onTalk() {
   if (!session.socket) {
-    return guard(start)();
+    // After a start that never reached the voice service the control reads "Try again", and does
+    // that: the same kind of conversation, typed or spoken. `#209 voice-socket-open`.
+    return hasUnreachable ? retryStart() : guard(start)();
   }
   setMuted(!session.muted);
   return Promise.resolve();
@@ -28776,6 +28942,7 @@ el("post-confirm-send").addEventListener("click", sendPostProposal);
 el("post-confirm-cancel").addEventListener("click", cancelPostProposal);
 el("open-settings").addEventListener("click", () => showScreen("settings"));
 el("dismiss-error").addEventListener("click", clearError);
+el("retry-start").addEventListener("click", retryStart);
 el("audio-source").addEventListener("click", () =>
   setReadAudioSource(readAudioSource === "device" ? "agent" : "device")
 );

@@ -2862,6 +2862,23 @@ else with 400 `invalid_timing`, and logs one line such as
 `voice_startup protocol=vibe-talk-v1 chat=false session_acquired=40 … greeting_audible=4050
 slowest=provider_ready:2480`. Nothing said and no identifier is in it.
 
+**When a start never reaches the voice service** (`#209 voice-socket-open`). The page gives the
+voice socket 9 seconds to open. A socket that is refused, closed before it opens, or still not
+open at the deadline ends the start at once. The page says "The voice service is not reachable.",
+then what happened: the connection was not accepted, or nothing answered within 9 seconds. It
+offers **Try again** beside that message, the large control reads "Try again", and both start the
+same kind of conversation again, spoken or typed. When a deployment's own socket address names a
+host other than the page's, the message says so, since that host's front door may not accept this
+page's sign-in. Hanging up while the socket is still connecting is not reported as a failure. A
+call that drops after it opened keeps its own wording. The startup record of a start that never
+opened adds `socket_failed` (milliseconds since Start), `socket_close_code` (when the browser
+reported one) and `socket_timeout` (whether the page's deadline ended it). The log line then ends
+`socket_failed=460 socket_close_code=1006 socket_timeout=false`, so a refusal, a socket that hung,
+and a reader who hung up are three different lines. The record is posted as soon as the start
+fails. At startup the server also warns when `conversation.websocket_url` is an absolute URL on a
+host other than `server.public_base_url`'s. A path such as `/ws?…` is joined to the page's own
+origin and cannot go wrong that way.
+
 **When the voice service stops answering.** A `vibe-talk-v1` call can stay open, complete every
 turn, and even deliver PCM, while the listener hears nothing and sees no words. The page does not
 wait for the listener to notice. It calls a turn **silent** when its `turn_complete` arrives, not

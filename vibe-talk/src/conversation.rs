@@ -177,6 +177,44 @@ impl ConversationalVoiceProvider for WebSocketConversationProvider {
     }
 }
 
+/// What to warn about when the browser's voice socket names a host other than this server's own
+/// public one, or `None`. `#209 voice-socket-open`.
+///
+/// The page opens `conversation.websocket_url` itself, from a page served by this host. An
+/// absolute URL naming ANOTHER host sends that socket to the other host's front door, where the
+/// sign-in this host's door granted does not apply, and every call is refused before it opens. A
+/// shared configuration did exactly that for two days. A path (`/ws?…`) is joined to the page's
+/// own origin and cannot go wrong this way, so it is never warned about; nor is a URL this server
+/// cannot compare, for want of a `server.public_base_url` or of a host in either.
+#[must_use]
+pub fn foreign_socket_host(
+    conversation: &ConversationConfig,
+    public_base_url: Option<&str>,
+) -> Option<String> {
+    if conversation.backend != ConversationBackend::WebSocket {
+        return None;
+    }
+    let socket = conversation.websocket_url.as_deref()?.trim();
+    if socket.starts_with('/') && !socket.starts_with("//") {
+        return None;
+    }
+    let host = |text: &str| {
+        url::Url::parse(text)
+            .ok()
+            .and_then(|url| url.host_str().map(str::to_ascii_lowercase))
+    };
+    let named = host(socket)?;
+    let own = host(public_base_url?.trim())?;
+    (named != own).then(|| {
+        format!(
+            "conversation.websocket_url names the host {named}, but server.public_base_url is on \
+             {own}. The page opens that socket from {own}, and another host's front door may not \
+             accept this page's sign-in, so a call can fail before it connects. Give it as a path \
+             such as /ws?mode=... to use the page's own host."
+        )
+    })
+}
+
 /// Build the selected conversational provider once at startup.
 #[must_use]
 pub fn provider(
@@ -190,5 +228,53 @@ pub fn provider(
             elevenlabs_config,
         )),
         ConversationBackend::WebSocket => Arc::new(WebSocketConversationProvider::new(config)),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn websocket(url: &str) -> ConversationConfig {
+        ConversationConfig {
+            backend: ConversationBackend::WebSocket,
+            websocket_url: Some(url.to_owned()),
+            label: "voice".to_owned(),
+        }
+    }
+
+    /// `#209 voice-socket-open`. The misconfiguration that kept every call on one host from
+    /// connecting is named at startup; the shapes that cannot go wrong that way are not.
+    #[test]
+    fn a_socket_on_another_host_is_warned_about_and_nothing_else_is() {
+        let own = Some("https://alpha.example.test:8443");
+        let warning = foreign_socket_host(&websocket("wss://beta.example.test/ws?mode=x"), own)
+            .expect("another host is warned about");
+        assert!(warning.contains("beta.example.test"), "{warning}");
+        assert!(warning.contains("alpha.example.test"), "{warning}");
+        assert!(warning.contains("path"), "{warning}");
+
+        for quiet in [
+            "/ws?mode=x&tools=chat",
+            "wss://alpha.example.test/ws",
+            "wss://ALPHA.example.test:9443/ws",
+            "not a url",
+        ] {
+            assert_eq!(foreign_socket_host(&websocket(quiet), own), None, "{quiet}");
+        }
+        assert_eq!(
+            foreign_socket_host(&websocket("wss://beta.example.test/ws"), None),
+            None,
+            "nothing to compare with"
+        );
+        let hosted = ConversationConfig {
+            backend: ConversationBackend::ElevenLabs,
+            ..websocket("wss://beta.example.test/ws")
+        };
+        assert_eq!(
+            foreign_socket_host(&hosted, own),
+            None,
+            "the hosted provider does not use this URL"
+        );
     }
 }

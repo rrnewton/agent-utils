@@ -3443,6 +3443,11 @@ const TUNING_BANDS = {
   POST_EXPIRY_TICK_MS: [250, 1000,
     "how often the card's lapse countdown is redrawn. It counts whole seconds, so slower than " +
     "one a second skips numbers, and faster than a quarter second is work nobody can see"],
+  // `#209 voice-socket-open`.
+  SOCKET_OPEN_TIMEOUT_MS: [5000, 15000,
+    "how long the voice socket may take to open. Healthy starts opened in 0.4 to 3.1 s, so much " +
+    "under five fails a slow start that would have worked; past fifteen the reader has given up " +
+    "on a call that says Connecting and pressed something else"],
   POST_CHANGE_HOLD_MS: [1000, 3000,
     "how long Send is held after a card appears or a newer proposal replaces it. Under a second, " +
     "a tap already under way when the text appeared still lands on words the owner never read; " +
@@ -6336,6 +6341,179 @@ test("an error with NO close following still reaches the screen", async () => {
   assert.equal(page.el("error").hidden, false, "an error with no close was never reported at all");
   assert.match(page.el("error").textContent, /connection to Example voice provider failed/);
   assert.doesNotMatch(page.el("error").textContent, /ElevenLabs|signed URL/i);
+});
+
+// --- a start that never reaches the voice service ------------------------------------------------
+//
+// `#209 voice-socket-open`. Fifteen starts got a session and a microphone and never a socket: four
+// while the voice service was stopped, eleven while the socket's address named another host whose
+// front door refused it. The page waited for the socket with no deadline, then said "this browser
+// could not open its WebSocket" — which reads as a fault in the phone — and offered nothing to
+// press, so the owner retried by hand, two to four times in a row.
+
+const SOCKET_OPEN_TIMEOUT_MS = sourceConstant("SOCKET_OPEN_TIMEOUT_MS");
+
+/** A deployment-managed voice session whose socket is at `url`. */
+const mintNeutral = (url) => async () =>
+  json(200, {
+    websocket_url: url,
+    protocol: "vibe-talk-v1",
+    provider: "Internal voice preview",
+    input_sample_rate: 24000,
+    output_sample_rate: 24000,
+  });
+
+/** Press Talk against a deployment socket, and leave the socket unopened. */
+async function startUnopened(page, url = "/ws?mode=test&tools=chat") {
+  await signIn(page);
+  page.setFetch(mintNeutral(url));
+  await page.el("talk").click();
+  await page.settle();
+  assert.equal(page.sockets.length, 1, "Talk opened no socket");
+  return page.sockets[0];
+}
+
+test("A SOCKET THAT NEVER OPENS SAYS THE VOICE SERVICE IS NOT REACHABLE, AT THE DEADLINE", async () => {
+  const page = newPage();
+  await startUnopened(page);
+  assert.equal(page.el("error").hidden, true, "it failed before the deadline");
+  assert.equal(page.el("talk-label").textContent, "Connecting…");
+
+  assert.equal(page.expireTimers(SOCKET_OPEN_TIMEOUT_MS), 1, "no deadline was armed for the open");
+  await page.settle();
+
+  assert.equal(page.el("error").hidden, false, "a socket that never opened was never reported");
+  assert.match(page.el("error").textContent, /^The voice service is not reachable\./);
+  assert.match(page.el("error").textContent, new RegExp(`within ${SOCKET_OPEN_TIMEOUT_MS / 1000} seconds`));
+  assert.doesNotMatch(page.el("error").textContent, /this browser|WebSocket/, "it still blames the browser");
+  assert.equal(page.el("retry-start").hidden, false, "there is nothing to press");
+  assert.equal(page.el("status").textContent, "The voice service is not reachable.");
+  assert.equal(page.el("talk-label").textContent, "Try again");
+  assert.equal(page.tracks[0].stops, 1, "the microphone was left open after the start failed");
+  assert.equal(page.sockets[0].readyState, 3, "the socket the page gave up on was left open");
+
+  assert.equal(page.timingPosts.length, 1, "the failed start was not recorded");
+  const [record] = page.timingPosts;
+  assert.equal(record.socket_timeout, true);
+  assert.ok(Number.isInteger(record.socket_failed) && record.socket_failed >= 0, `${record.socket_failed}`);
+  assert.ok(!("socket_open" in record), "a socket that never opened was recorded open");
+  assert.ok(!("socket_close_code" in record), "the page's own close was recorded as the browser's");
+});
+
+test("a socket refused at once says so at once, with the close code in the record", async () => {
+  const page = newPage();
+  const socket = await startUnopened(page);
+  socket.onerror({});
+  socket.onclose({ code: 1006, reason: "" });
+  await page.settle();
+
+  assert.equal(page.el("error").hidden, false);
+  assert.match(page.el("error").textContent, /^The voice service is not reachable\. Its address did not accept/);
+  assert.equal(page.el("retry-start").hidden, false);
+  assert.equal(page.el("talk-label").textContent, "Try again");
+  assert.equal(page.expireTimers(SOCKET_OPEN_TIMEOUT_MS), 0, "the open deadline outlived the failure");
+  assert.equal(page.timingPosts.length, 1);
+  assert.equal(page.timingPosts[0].socket_close_code, 1006);
+  assert.equal(page.timingPosts[0].socket_timeout, false);
+
+  // A close with no error first is the same failure: before it opened, nothing else it can be.
+  const quiet = newPage();
+  const closed = await startUnopened(quiet);
+  closed.onclose({ code: 1006, reason: "" });
+  await quiet.settle();
+  assert.match(quiet.el("error").textContent, /^The voice service is not reachable\./);
+  assert.notEqual(state(quiet), "ended", "a start that never connected was called an ended call");
+});
+
+test("TRY AGAIN opens a fresh session and socket, and a socket that opens clears it", async () => {
+  const page = newPage();
+  await startUnopened(page);
+  page.expireTimers(SOCKET_OPEN_TIMEOUT_MS);
+  await page.settle();
+
+  await page.el("retry-start").click();
+  await page.settle();
+  assert.equal(page.sockets.length, 2, "Try again opened no second socket");
+  assert.equal(page.el("error").hidden, true, "the failure stayed up over the new attempt");
+  assert.equal(page.el("retry-start").hidden, true);
+  page.sockets[1].onopen();
+  assert.equal(state(page), "live");
+  assert.equal(page.el("talk-label").textContent, "Listening");
+  assert.equal(page.expireTimers(SOCKET_OPEN_TIMEOUT_MS), 0, "an open socket still had a deadline running");
+
+  // The big control says Try again too, and does it.
+  const again = newPage();
+  const first = await startUnopened(again);
+  first.onclose({ code: 1006, reason: "" });
+  await again.settle();
+  await again.el("talk").click();
+  await again.settle();
+  assert.equal(again.sockets.length, 2);
+  assert.equal(again.micRequests.length, 2, "a spoken start was retried as something else");
+});
+
+test("a typed start that never connects is retried as a typed start, with the message still in the box", async () => {
+  const page = newPage();
+  await signIn(page);
+  page.setFetch(mintNeutral("/ws?mode=test"));
+  await compose(page, "anything new?");
+  await page.el("send-text").click();
+  await page.settle();
+  assert.equal(page.sockets.length, 1);
+  page.sockets[0].onclose({ code: 1006, reason: "" });
+  await page.settle();
+  assert.match(page.el("error").textContent, /^The voice service is not reachable\./);
+  assert.equal(page.el("compose-text").value, "anything new?", "the message was lost with the start");
+
+  await page.el("retry-start").click();
+  await page.settle();
+  assert.equal(page.sockets.length, 2);
+  assert.equal(page.micRequests.length, 0, "a typed start was retried by opening the microphone");
+});
+
+test("a socket that opens in time is unaffected, and a drop mid-call keeps its own wording", async () => {
+  const page = newPage();
+  const socket = await startNeutralCall(page);
+  assert.equal(page.expireTimers(SOCKET_OPEN_TIMEOUT_MS), 0, "the deadline was not cleared on open");
+  assert.equal(page.el("error").hidden, true);
+  socket.onerror({});
+  socket.onclose({ code: 1006, reason: "" });
+  assert.match(page.el("error").textContent, /connection to Internal voice preview failed/);
+  assert.equal(page.el("retry-start").hidden, true, "Try again is for a start, not for a dropped call");
+  assert.equal(page.timingPosts.length, 1);
+  assert.ok(!("socket_failed" in page.timingPosts[0]), "an opened socket was recorded as failed");
+});
+
+test("hanging up while the socket is still connecting is the reader's act, not a failure", async () => {
+  const page = newPage();
+  await startUnopened(page);
+  await page.el("hang-up").click();
+  await page.settle();
+  assert.equal(page.el("error").hidden, true, "hanging up was reported as an unreachable service");
+  assert.notEqual(page.el("talk-label").textContent, "Try again");
+  assert.equal(page.expireTimers(SOCKET_OPEN_TIMEOUT_MS), 0, "the deadline outlived the hang-up");
+});
+
+test("a deployment socket on another host is named, as what may explain the refusal", async () => {
+  const page = newPage();
+  const socket = await startUnopened(page, "wss://other-host.example/ws?mode=test");
+  socket.onclose({ code: 1006, reason: "" });
+  await page.settle();
+  assert.match(page.el("error").textContent, /Its address is on other-host\.example, not on vibe\.example/);
+
+  // The page's own host, and a hosted provider that always lives elsewhere, are not suspects.
+  const own = newPage();
+  (await startUnopened(own, "/ws?mode=test")).onclose({ code: 1006, reason: "" });
+  await own.settle();
+  assert.doesNotMatch(own.el("error").textContent, /Its address is on/);
+  const hosted = newPage();
+  await signIn(hosted);
+  hosted.setFetch(MINTED);
+  await hosted.el("talk").click();
+  hosted.sockets[0].onclose({ code: 1006, reason: "" });
+  await hosted.settle();
+  assert.match(hosted.el("error").textContent, /^The voice service is not reachable\./);
+  assert.doesNotMatch(hosted.el("error").textContent, /Its address is on/);
 });
 
 // --- clearing the view ----------------------------------------------------------------------------

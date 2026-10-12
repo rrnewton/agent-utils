@@ -590,6 +590,14 @@ async fn main() -> anyhow::Result<()> {
         "message read-aloud configured independently of conversational voice mode"
     );
     let elevenlabs: Arc<dyn SignedUrlProvider> = elevenlabs_client;
+    // `#209 voice-socket-open`. A browser socket on another host's front door was what kept every
+    // call on this host from connecting for two days; it is said here, once, where it is cheap.
+    if let Some(warning) = vibe_talk::conversation::foreign_socket_host(
+        &config.conversation,
+        config.public_base_url.as_deref(),
+    ) {
+        tracing::warn!("{warning}");
+    }
     let conversation = vibe_talk::conversation::provider(
         &config.conversation,
         Arc::clone(&elevenlabs),

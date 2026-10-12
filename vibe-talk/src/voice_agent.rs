@@ -244,6 +244,17 @@ pub struct StartupTiming {
     pub greeting_audio_received: Option<u32>,
     /// The first assistant audio frame was scheduled to start playing.
     pub greeting_audible: Option<u32>,
+    /// The page gave up on the provider's WebSocket before it opened: refused, closed, or past
+    /// the page's own open deadline. `#209 voice-socket-open`. Without it a refused socket, one
+    /// that hung until the reader gave up, and a reader who pressed Stop all logged the same
+    /// `socket_open=-`.
+    pub socket_failed: Option<u32>,
+    /// The close code the browser reported for that socket, when it reported one: 1006 is a
+    /// connection refused or dropped with no close frame.
+    pub socket_close_code: Option<u16>,
+    /// Whether the page's own open deadline is what ended it, rather than the connection failing.
+    #[serde(default)]
+    pub socket_timeout: bool,
 }
 
 impl StartupTiming {
@@ -275,6 +286,20 @@ impl StartupTiming {
                 return Err(format!("{name} is longer than {MAX_PHASE_MS} ms"));
             }
         }
+        if self.socket_failed.is_some_and(|ms| ms > MAX_PHASE_MS) {
+            return Err(format!("socket_failed is longer than {MAX_PHASE_MS} ms"));
+        }
+        // The codes a WebSocket close can carry. Anything else is not a browser's report.
+        if self
+            .socket_close_code
+            .is_some_and(|code| !(1000..=4999).contains(&code))
+        {
+            return Err("socket_close_code is not a WebSocket close code".to_owned());
+        }
+        if (self.socket_close_code.is_some() || self.socket_timeout) && self.socket_failed.is_none()
+        {
+            return Err("socket_close_code and socket_timeout describe a socket_failed".to_owned());
+        }
         Ok(())
     }
 
@@ -302,6 +327,16 @@ impl StartupTiming {
         }
         if let Some((name, step)) = slowest {
             fields.push_str(&format!(" slowest={name}:{step}"));
+        }
+        // Only for a start that never opened, so a healthy call's line is unchanged.
+        if let Some(ms) = self.socket_failed {
+            let code = self
+                .socket_close_code
+                .map_or_else(|| "-".to_owned(), |code| code.to_string());
+            fields.push_str(&format!(
+                " socket_failed={ms} socket_close_code={code} socket_timeout={}",
+                self.socket_timeout
+            ));
         }
         fields
     }
@@ -528,6 +563,7 @@ mod tests {
             greeting_text: Some(4_100),
             greeting_audio_received: Some(4_000),
             greeting_audible: Some(4_050),
+            ..StartupTiming::default()
         };
         timing.validate().expect("valid");
         let line = timing.log_fields();
@@ -554,5 +590,69 @@ mod tests {
             ..StartupTiming::default()
         };
         assert!(absurd.validate().is_err());
+        for (code, failed, timeout) in [
+            (Some(999), Some(40), false),
+            (Some(5000), Some(40), false),
+            (Some(1006), None, false),
+            (None, None, true),
+        ] {
+            let odd = StartupTiming {
+                protocol: "vibe-talk-v1".to_owned(),
+                socket_failed: failed,
+                socket_close_code: code,
+                socket_timeout: timeout,
+                ..StartupTiming::default()
+            };
+            assert!(odd.validate().is_err(), "{code:?} {failed:?} {timeout}");
+        }
+    }
+
+    /// `#209 voice-socket-open`. A start that never opened says how long it tried and how it
+    /// ended, so a refusal in 40 ms, a socket that hung to the page's deadline, and a reader who
+    /// hung up are three different lines.
+    #[test]
+    fn a_start_that_never_opened_says_how_it_ended() {
+        let refused = StartupTiming {
+            protocol: "vibe-talk-v1".to_owned(),
+            session_acquired: Some(180),
+            microphone_ready: Some(420),
+            socket_failed: Some(460),
+            socket_close_code: Some(1006),
+            ..StartupTiming::default()
+        };
+        refused.validate().expect("valid");
+        assert_eq!(
+            refused.log_fields(),
+            "protocol=vibe-talk-v1 chat=false session_acquired=180 microphone_ready=420 \
+             socket_open=- provider_ready=- greeting_text=- greeting_audio_received=- \
+             greeting_audible=- slowest=microphone_ready:240 socket_failed=460 \
+             socket_close_code=1006 socket_timeout=false"
+        );
+        let hung = StartupTiming {
+            protocol: "vibe-talk-v1".to_owned(),
+            chat: true,
+            session_acquired: Some(150),
+            socket_failed: Some(9_150),
+            socket_timeout: true,
+            ..StartupTiming::default()
+        };
+        hung.validate().expect("valid");
+        assert!(
+            hung.log_fields()
+                .ends_with(" socket_failed=9150 socket_close_code=- socket_timeout=true"),
+            "{}",
+            hung.log_fields()
+        );
+        let parsed: StartupTiming = serde_json::from_value(serde_json::json!({
+            "protocol": "vibe-talk-v1",
+            "chat": false,
+            "session_acquired": 180,
+            "microphone_ready": 420,
+            "socket_failed": 460,
+            "socket_close_code": 1006,
+            "socket_timeout": false,
+        }))
+        .expect("the page's failure record parses");
+        assert_eq!(parsed, refused);
     }
 }

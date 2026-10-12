@@ -2725,6 +2725,11 @@ body {
   margin: 0.5rem 0.75rem;
 }
 
+/* `#209 voice-socket-open`. Beside the dismiss control, never squeezed by the sentence. */
+#retry-start {
+  flex: 0 0 auto;
+}
+
 /* `#241 voice-composer`. The call's pane is at least as tall as the list that scrolls it, and its
    message box is pushed to the foot of that: at idle and while a conversation is still shorter than
    the screen, the box sits at the bottom of the list, where a chat's box is and where the thumb is,
