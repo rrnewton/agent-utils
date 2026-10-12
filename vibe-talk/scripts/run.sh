@@ -118,7 +118,9 @@
 #
 #                  It starts its OWN throwaway server, native (not a container), with
 #                  --fake-discord, on port 18091 by default — never 8080, and it refuses to use it.
-#                  The mock vendor takes 18092 and 18093 beside it. It never touches the running
+#                  The mock vendor takes 18092 and 18093 beside it. --port, or the environment
+#                  variable VIBE_TALK_SHOTS_PORT when --port is absent, moves all three (P, P+1,
+#                  P+2), so several checkouts can photograph at once. It never touches the running
 #                  vibe-talk, or its config, or its logs. BOTH processes are stopped again when the
 #                  run ends, including on failure.
 #
@@ -397,7 +399,7 @@ if [ "$SCREENSHOTS" = 1 ]; then
     SHOTS_SCRIPT="$SCRIPT_DIR/screenshots.py"
     [ -x "$SHOTS_SCRIPT" ] || die "the screenshot harness is missing or not executable: $SHOTS_SCRIPT"
 
-    SHOTS_PORT="${PORT_OVERRIDE:-18091}"
+    SHOTS_PORT="${PORT_OVERRIDE:-${VIBE_TALK_SHOTS_PORT:-18091}}"
     case "$SHOTS_PORT" in
         ''|*[!0-9]*) die "--port must be a number, got: $SHOTS_PORT" ;;
     esac
