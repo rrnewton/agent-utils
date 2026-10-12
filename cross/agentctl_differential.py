@@ -2863,6 +2863,9 @@ def build_report(python_command: Sequence[str], rust_command: Sequence[str]) -> 
             _revive_interop(harness, report)
             _adoption(harness, report)
             _identity_and_rename(harness, report)
+            # Imported here: the group's module imports this one's helpers.
+            from agentctl_nested_records import nested_records
+            nested_records(harness, report)
             _invalid_cli(harness, report)
             harness.require_no_host_cli(report)
         finally:
