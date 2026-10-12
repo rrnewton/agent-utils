@@ -298,6 +298,34 @@ fn inconclusive_or_live_evidence_refuses_with_exit_69_and_changes_nothing() {
             "its runner has an unreadable start time \"0555\"",
         ),
         (
+            "row without a runner PID that may still be starting",
+            |worker| {
+                let mut row = Worker::row(None, None);
+                row["status"] = json!("starting");
+                row["created_at"] = json!("2999-01-01T00:00:00+00:00");
+                worker.write_registry(json!([row]));
+            },
+            "its runner may still be starting",
+        ),
+        (
+            "row without a runner PID and an unreadable creation time",
+            |worker| {
+                let mut row = Worker::row(None, None);
+                row["created_at"] = json!("yesterday");
+                worker.write_registry(json!([row]));
+            },
+            "a runner that is still starting cannot be ruled out",
+        ),
+        (
+            "row without a runner PID and no creation time",
+            |worker| {
+                let mut row = Worker::row(None, None);
+                row.as_object_mut().unwrap().remove("created_at");
+                worker.write_registry(json!([row]));
+            },
+            "a runner that is still starting cannot be ruled out",
+        ),
+        (
             "corrupt runtime registry",
             |worker| fs::write(worker.home.join("registry.json"), "{").unwrap(),
             "is not valid JSON",

@@ -28,6 +28,10 @@ const MAX_RUNTIME_REGISTRY_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_RUNTIME_FILE_BYTES: u64 = 64 * 1024;
 const MAX_PROCESS_STAT_BYTES: u64 = 8 * 1024;
 const MAX_PROCESS_ID: i64 = (1 << 31) - 1;
+/// A worker row younger than this whose runner has recorded no PID may still be
+/// starting: the runtime writes the row first and launches the runner outside its lock. Same
+/// window as the runtime's own reaper.
+const STARTUP_GRACE_SECONDS: i64 = 20;
 /// Linux process states that `/proc/PID/stat` can report.
 const PROCESS_STATES: [&str; 12] = ["R", "S", "D", "Z", "T", "t", "X", "x", "K", "W", "P", "I"];
 
@@ -511,6 +515,11 @@ fn inspect_runtime_inner(
         }
         gone.push(format!("{} (pid {})", process.label, process.pid));
     }
+    if let Some(row) = row {
+        if evidence.runner_pid.is_none() {
+            starting_window_closed(row)?;
+        }
+    }
     evidence.detail = if gone.is_empty() {
         if row.is_some() {
             "the runtime row records no runner process and no runner recorded a process ID"
@@ -529,6 +538,30 @@ fn inspect_runtime_inner(
         )
     };
     Ok((lock, Liveness::Dead(evidence)))
+}
+
+/// Refuse while a row without a runner PID may belong to a runner that is still starting: its
+/// `created_at` is unreadable, in the future, or under `STARTUP_GRACE_SECONDS` old.
+fn starting_window_closed(row: &Value) -> std::result::Result<(), String> {
+    let created_at = row.get("created_at").and_then(Value::as_str);
+    let Some(created) = created_at.and_then(crate::prompt_time::rfc3339_instant) else {
+        return Err(format!(
+            "the runtime row records no runner process and its created_at {} cannot be read, so a runner that is still starting cannot be ruled out",
+            created_at.map_or_else(|| "is missing and".to_owned(), |value| format!("{value:?}"))
+        ));
+    };
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| {
+            i64::try_from(elapsed.as_secs()).unwrap_or(i64::MAX)
+        });
+    let age = now.saturating_sub(created.seconds);
+    if age < STARTUP_GRACE_SECONDS {
+        return Err(format!(
+            "the runtime row was created {age} seconds ago and records no runner process yet; its runner may still be starting, so retry after {STARTUP_GRACE_SECONDS} seconds"
+        ));
+    }
+    Ok(())
 }
 
 /// Keep path receipts truthful when the containing canonical directory moves.
