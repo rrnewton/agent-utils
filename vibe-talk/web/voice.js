@@ -7970,8 +7970,9 @@ function onVisibility() {
       try {
         if (owed === "mutation") refreshAfterLiveMutation();
         else {
+          const since = timelineReadsStarted;
           await loadDiscord({ keepPosition: true, reason: "visible" });
-          await readSideColumn("visible");
+          await readSideColumn("visible", since);
         }
       } finally {
         // The stream comes back once that read has brought what it missed, so what it replays from
@@ -13653,6 +13654,9 @@ async function loadTimeline(options) {
   /** @type {VibeTalk.TimelineResponse[]} the delta pages among them, still to be drawn */
   const deltas = [];
   let sent = forwardCursor(options && options.reason);
+  // What a refresh asking for this view again soon after may count as read already. `#231`.
+  const record = { context, read, full: sent === null };
+  columnReadsSent.set(steps.column, record);
   const sameStore = () => canon === channelCanon && canon.channel === channel &&
     String(el("discord-channel").value) === channel;
   const stillCurrent = () =>
@@ -13828,6 +13832,8 @@ async function loadTimeline(options) {
     }
   } finally {
     settleReplays(read, landedAnswer(landed));
+    // A read that brought nothing back answers for nothing.
+    if (!landed.length && columnReadsSent.get(steps.column) === record) columnReadsSent.delete(steps.column);
     steps.pause();
     await finishDiscordLoad(steps.column);
   }
@@ -24064,15 +24070,47 @@ function resetSideColumn(reopen = false) {
  * Read the right column's thread behind its rows, or the thread list behind its cards: the poll's
  * second read, and coming back to the page. Nothing while one column is up.
  *
+ * `since` is `timelineReadsStarted` as it stood when the refresh asking for this began, before its
+ * read of Main. `#231 two-column-polish`. A read of the thread on the right that went on the wire
+ * after that is this read already: a thread selected while the poll's read of Main was out queued its
+ * read behind it, and that read ran before the poll got here. Reading it again brought nothing the
+ * first had not, a second request for the same rows. See `answeredSince` for which reads count.
+ *
  * @param {string} reason
+ * @param {number | null} [since]
  */
-async function readSideColumn(reason) {
+async function readSideColumn(reason, since = null) {
   if (!columnsShown) return;
   if (columns.side.mode === "thread") {
-    await inColumn(columns.side, () => loadDiscord({ keepPosition: true, reason }));
+    await inColumn(columns.side, () => (since !== null && answeredSince(since, reason)
+      ? undefined : loadDiscord({ keepPosition: true, reason })));
   } else {
     await refreshThreadDirectory();
   }
+}
+
+/**
+ * The newest timeline read each column sent and that has not failed: the view it was for
+ * (`channelContextKey`), its number among `timelineReadsStarted`, and whether it read the view in
+ * full rather than as what changed. `#231 two-column-polish`.
+ *
+ * @type {Map<typeof activeColumn, {context: string, read: number, full: boolean}>}
+ */
+const columnReadsSent = new Map();
+
+/**
+ * Whether a read this column sent of the view it shows now, after read number `since`, answers for
+ * a read for `reason`. Only one sent after: one that left BEFORE the refresh asking may have left
+ * before what that refresh reads for — an edit the stream announced, say — had happened. And only
+ * one that read as much as `reason` needs: a read in full answers anything, and a read of what
+ * changed answers a reason only where that reason may be read so too (`forwardCursor`) — on a
+ * channel whose changes carry additions alone, an edit's read is in full, and a delta read for the
+ * poll would leave the edit unread.
+ */
+function answeredSince(since, reason) {
+  const sent = columnReadsSent.get(activeColumn);
+  return Boolean(sent) && sent.read > since && sent.context === channelContextKey() &&
+    (sent.full || forwardCursor(reason) !== null);
 }
 
 /** Whether a message belongs to the thread the right column is showing. */
@@ -24227,10 +24265,12 @@ function pollDiscord() {
     let refused = false;
     try {
       refused = !clientConfigApplied && !(await signIn());
+      const since = timelineReadsStarted;
       if (!refused) await loadDiscord({ keepPosition: true, reason: "poll" });
       // `#229 desktop-two-column`. And the right column's thread, or its list of threads: another
-      // view, one delta, never Main's again.
-      if (!refused) await readSideColumn("poll");
+      // view, one delta, never Main's again — nor the thread's again, when it was selected under
+      // Main's read and read for that (`#231 two-column-polish`).
+      if (!refused) await readSideColumn("poll", since);
     } finally {
       if (currentView === "discord" && !refused) {
         scheduleDiscordPoll();
@@ -25079,9 +25119,10 @@ function refreshAfterLiveMutation() {
         while (discordFetchInFlight) {
           await new Promise((resolve) => setTimeout(resolve, 50));
         }
+        const since = timelineReadsStarted;
         await loadDiscord({ keepPosition: true, reason: "mutation" });
         // An edit may be in the thread on the right. `#229 desktop-two-column`.
-        await readSideColumn("mutation");
+        await readSideColumn("mutation", since);
       }
     } finally {
       liveMutationRefreshRunning = false;
@@ -27107,9 +27148,10 @@ function readEnteredChannel(keepPosition) {
   guardQuietly(async () => {
     try {
       // A return finds the channel's store as it was left, so it asks only for what changed.
+      const since = timelineReadsStarted;
       await loadDiscord(keepPosition ? { keepPosition: true, reason: "visible" } : { reason: "enter" });
       // ...and the right column's thread, or its list of threads. `#229 desktop-two-column`.
-      await readSideColumn(keepPosition ? "visible" : "enter");
+      await readSideColumn(keepPosition ? "visible" : "enter", since);
     } finally {
       // Armed after a failure too: offline is exactly when the reader needs the page to try again.
       if (currentView === "discord") {

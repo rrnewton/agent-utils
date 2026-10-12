@@ -38892,6 +38892,55 @@ test("`#231 two-column-polish`: the right column is one named region, called wha
   assert.equal(region.getAttribute("aria-label"), "Threads", "the X left the region naming a thread it no longer shows");
 });
 
+/**
+ * The channel in two columns, its second thread reporting an exact count of two replies while the
+ * store holds one: All's page does not hold that thread whole, so selecting it reads it behind the
+ * rows the store holds (`storeLacksReplies`).
+ */
+const twoColumnsWithAThreadToRead = (script = SCRIPT) => twoColumnServer((_page, data) => {
+  const second = data.threads[1];
+  Object.assign(second, { reply_count: 2, reply_count_exact: true });
+  for (const held of data.messages.filter((m) => m.thread && m.thread.id === second.id)) {
+    held.thread = { ...held.thread, reply_count: 2, reply_count_exact: true };
+  }
+}, script);
+
+/** Hold every read of `view` on `server` until the returned function is called. */
+function holdView(server, view) {
+  let open = () => {};
+  const opened = new Promise((resolve) => {
+    open = resolve;
+  });
+  server.hold = { respond: (path) => (viewOf(path) === view ? opened.then(() => server.answer(path)) : server.answer(path)) };
+  return () => {
+    server.hold = null;
+    open();
+  };
+}
+
+test("`#231 two-column-polish`: a thread selected while the poll's read of Main is on the wire is read once — the poll's own read of it collapses into the selection's", async () => {
+  const { page, server } = await twoColumnsWithAThreadToRead();
+  const reads = server.reads.length;
+  const release = holdView(server, "main");
+  page.expireTimers(DISCORD_POLL_MS);
+  await page.settle();
+  // Selected under the poll: drawn from the rows the store holds, its read queued behind Main's.
+  await threadBadge(rowWithId(page, "203")).click();
+  await page.settle();
+  assert.deepStrictEqual(sideIds(page), ["203", "204"], "the thread was not drawn on the right from what the page holds");
+  release();
+  for (let i = 0; i < 4; i += 1) await page.settle();
+  const views = server.reads.slice(reads).map((read) => read.view);
+  assert.equal(views.filter((view) => view === "thread").length, 1,
+    `the thread was read more than once between its selection and the end of the poll: ${JSON.stringify(views)}`);
+  assert.equal(views.filter((view) => view === "main").length, 1, `Main was not read once: ${JSON.stringify(views)}`);
+  // ...and the next poll reads it, as what changed since: collapsing a read is not losing the thread.
+  const next = server.reads.length;
+  await pollOnce(page);
+  assert.deepStrictEqual(server.reads.slice(next).filter((read) => read.view === "thread").map((read) => read.after !== null), [true],
+    "the next poll did not read the thread on the right as a delta");
+});
+
 const THREAD_DIRECTORY_REFRESH_MS = sourceConstant("THREAD_DIRECTORY_REFRESH_MS");
 
 test("`#231 two-column-polish` x `#226 page-energy-profile`: with the cards up, a refresh that brings nothing draws nothing, in the cards as in Main", async () => {
