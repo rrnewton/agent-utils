@@ -43,6 +43,7 @@ fn message(id: &str) -> Message {
         content: "the nightly build is green".to_owned(),
         spoken_content: String::new(),
         content_html: String::new(),
+        heading: None,
         noise: false,
         reactions: None,
     }
