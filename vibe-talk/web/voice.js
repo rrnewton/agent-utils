@@ -15755,6 +15755,9 @@ function landOnBookmark() {
 /** b, m and the chip: back to the bookmark, walking back through older pages when it is further back. */
 async function jumpToBookmark() {
   if (sideActive) return inColumn(columns.main, jumpToBookmark);
+  // A jump the reader asks for lets go of a filter change's held message (#243 filter-keeps-selection),
+  // as Newest and the reply arrow do, whether it came from b, m or the Bookmark chip.
+  readerActed();
   const anchor = bookmarkAnchor();
   if (!anchor) {
     setStatus("No bookmark here. Shift+B sets one.");
