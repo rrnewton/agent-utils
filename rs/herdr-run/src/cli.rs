@@ -1059,6 +1059,26 @@ fn command_config(config: &Config, agent: &str) -> Result<i32> {
     Ok(0)
 }
 
+/// The two lines `check` prints for an admitted command.
+///
+/// The program, the subcommand, and the rendered command are each shown with [`display`]: as they
+/// are, unless one holds a character a name may not contain -- an invisible or bidirectional
+/// character, a control, a noncharacter, a private-use character, or an unassigned code point --
+/// in which case that value is quoted with the character escaped, so it never reaches the
+/// terminal raw. The subcommand and every argument are whatever was typed, and under
+/// `allow: ["*"]` so is the program. `-` stands for an ABSENT subcommand only (a subcommand never
+/// starts with `-`); an empty one is printed as empty, the way the JSON form distinguishes `null`
+/// from `""`.
+#[must_use]
+pub fn check_text(program: &str, subcommand: Option<&str>, rendered: &str) -> String {
+    format!(
+        "ALLOWED: program={} subcommand={}\nrendered: {}\n",
+        display(program),
+        subcommand.map_or_else(|| "-".to_owned(), display),
+        display(rendered)
+    )
+}
+
 fn command_check(config: &Config, command: &str, json_output: bool) -> Result<i32> {
     match admit(command, config) {
         Ok(admission) => {
@@ -1070,13 +1090,10 @@ fn command_check(config: &Config, command: &str, json_output: bool) -> Result<i3
                     "verdict": "allowed",
                 }))?;
             } else {
-                // `-` stands for an ABSENT subcommand only; an empty token is printed as empty,
-                // the way the JSON form distinguishes `null` from `""`.
-                output::stdout(&format!(
-                    "ALLOWED: program={} subcommand={}\nrendered: {}\n",
-                    admission.program,
-                    admission.subcommand.as_deref().unwrap_or("-"),
-                    admission.rendered()
+                output::stdout(&check_text(
+                    &admission.program,
+                    admission.subcommand.as_deref(),
+                    admission.rendered(),
                 ))?;
             }
             Ok(0)
@@ -1718,8 +1735,10 @@ fn subcommand_help_text(name: &str) -> String {
         "check" => {
             text.push_str("usage: herdr-run [GLOBAL OPTIONS] check '<command>'\n");
             text.push_str("\nDecide whether a command would be admitted by the policy in effect. Touches no\npane and executes nothing. Exits 0 when allowed and 77 when refused.\n");
+            text.push_str("\nWhen allowed, prints 'ALLOWED: program=P subcommand=S' (S is '-' when there is\nno subcommand) and 'rendered: C', the command line as run would type it. A value\nholding an invisible or bidirectional character, or any other character a name\nmay not contain, is shown quoted with that character escaped as \\u{hex}.\n");
             text.push_str("\npositional arguments:\n  <command>             the whole command line, as a single quoted argument\n");
             text.push_str("\noptions:\n  -h, --help            show this help message and exit\n");
+            text.push_str("\nExample:\n  herdr-run check 'git push origin HEAD'\n");
         }
         "init" => {
             text.push_str("usage: herdr-run [GLOBAL OPTIONS] init [OPTIONS]\n");
@@ -2331,6 +2350,46 @@ mod tests {
                 Err(error) => json!({ "error": error.message() }),
             };
             assert_eq!(outcome, row[2], "{row:?}");
+        }
+    }
+
+    /// The subcommand and every argument are whatever was typed. `check` used to print them raw,
+    /// so a right-to-left override in the subcommand reordered the line on the terminal and a
+    /// zero-width space in an argument could not be seen at all.
+    #[test]
+    fn check_shows_an_invisible_or_bidirectional_character_escaped() {
+        let config = Config::default();
+        let shown = |command: &str| {
+            let admission = admit(command, &config).expect(command);
+            check_text(
+                &admission.program,
+                admission.subcommand.as_deref(),
+                admission.rendered(),
+            )
+        };
+        assert_eq!(
+            shown("git '\u{202e}status' 'a\u{200b}b' caf\u{e9}"),
+            "ALLOWED: program=git subcommand=\"\\u{202e}status\"\n\
+             rendered: \"git '\\u{202e}status' 'a\\u{200b}b' 'caf\\u{e9}'\"\n"
+        );
+        assert_eq!(
+            shown("git commit -m caf\u{e9}"),
+            "ALLOWED: program=git subcommand=commit\nrendered: git commit -m 'caf\u{e9}'\n"
+        );
+    }
+
+    /// What `check` prints for an admitted command, unsafe characters shown escaped.
+    #[test]
+    fn golden_check_text() {
+        let document: Value =
+            serde_json::from_str(include_str!("../testdata/text_cases.json")).expect("corpus");
+        for row in document["check_text"].as_array().expect("check_text rows") {
+            let text = check_text(
+                row[0].as_str().expect("program"),
+                row[1].as_str(),
+                row[2].as_str().expect("rendered"),
+            );
+            assert_eq!(text, row[3].as_str().expect("expected text"), "{row:?}");
         }
     }
 

@@ -1,5 +1,5 @@
 {
-  "_about": "Golden cases for the text rules both editions share (textfmt.py / textfmt.rs). Both unit-test suites load this file, so the two editions must agree on every entry. float_repr and number_text include exact 17-digit ties, which go to the even digit; json rows are a document and its strict reading written back in the shared one-line form, or null when it is refused. agent rows are an environment, an --agent value (null when absent), and the agent that invocation speaks for, or the configuration error it fails with.",
+  "_about": "Golden cases for the text rules both editions share (textfmt.py / textfmt.rs). Both unit-test suites load this file, so the two editions must agree on every entry. float_repr and number_text include exact 17-digit ties, which go to the even digit; json rows are a document and its strict reading written back in the shared one-line form, or null when it is refused. agent rows are an environment, an --agent value (null when absent), and the agent that invocation speaks for, or the configuration error it fails with. check_text rows are the program, the subcommand (null when absent), and the rendered command of an admitted command, and the two lines check prints for it.",
   "quote": [
     [
       "",
@@ -1528,6 +1528,86 @@
       {
         "agent": "\u1c89"
       }
+    ]
+  ],
+  "check_text": [
+    [
+      "git",
+      "status",
+      "git status",
+      "ALLOWED: program=git subcommand=status\nrendered: git status\n"
+    ],
+    [
+      "git",
+      null,
+      "git",
+      "ALLOWED: program=git subcommand=-\nrendered: git\n"
+    ],
+    [
+      "git",
+      "",
+      "git ''",
+      "ALLOWED: program=git subcommand=\nrendered: git ''\n"
+    ],
+    [
+      "git",
+      "commit",
+      "git commit -m 'two words'",
+      "ALLOWED: program=git subcommand=commit\nrendered: git commit -m 'two words'\n"
+    ],
+    [
+      "git",
+      "commit",
+      "git commit -m 'say \"hi\" caf\u00e9'",
+      "ALLOWED: program=git subcommand=commit\nrendered: git commit -m 'say \"hi\" caf\u00e9'\n"
+    ],
+    [
+      "git",
+      "\u202estatus",
+      "git '\u202estatus'",
+      "ALLOWED: program=git subcommand=\"\\u{202e}status\"\nrendered: \"git '\\u{202e}status'\"\n"
+    ],
+    [
+      "git",
+      "commit",
+      "git commit -m 'a\u200bb'",
+      "ALLOWED: program=git subcommand=commit\nrendered: \"git commit -m 'a\\u{200b}b'\"\n"
+    ],
+    [
+      "git",
+      "log",
+      "git log '\u2028'",
+      "ALLOWED: program=git subcommand=log\nrendered: \"git log '\\u{2028}'\"\n"
+    ],
+    [
+      "git",
+      "log",
+      "git log '\ue000'",
+      "ALLOWED: program=git subcommand=log\nrendered: \"git log '\\u{e000}'\"\n"
+    ],
+    [
+      "git",
+      "log",
+      "git log '\u0378'",
+      "ALLOWED: program=git subcommand=log\nrendered: \"git log '\\u{378}'\"\n"
+    ],
+    [
+      "git",
+      "log",
+      "git log '\ud834\udd59'",
+      "ALLOWED: program=git subcommand=log\nrendered: \"git log '\\u{1d159}'\"\n"
+    ],
+    [
+      "\u202ex",
+      null,
+      "'\u202ex'",
+      "ALLOWED: program=\"\\u{202e}x\" subcommand=-\nrendered: \"'\\u{202e}x'\"\n"
+    ],
+    [
+      "tool\u00a0",
+      "sub\u2066",
+      "'tool\u00a0' 'sub\u2066'",
+      "ALLOWED: program=\"tool\\u{a0}\" subcommand=\"sub\\u{2066}\"\nrendered: \"'tool\\u{a0}' 'sub\\u{2066}'\"\n"
     ]
   ]
 }

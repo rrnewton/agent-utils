@@ -4,7 +4,7 @@ Every file under ``rs/herdr-run/testdata/`` is loaded here and by the Rust unit 
 that changes in one edition fails the other edition's suite until both agree again:
 
 - ``text_cases.json``: the quoting rule, numeric text, the exit-marker grammar, float text,
-  run IDs;
+  run IDs, and the lines ``check`` prints for an admitted command;
 - ``name_verdicts.json``: the name rule's verdict on every code point, U+0000..U+10FFFF, written
   by this module (run it with ``--write-name-verdicts``) and checked code point by code point by
   both suites;
@@ -36,7 +36,7 @@ import pytest
 
 from herdr_run import __version__
 from herdr_run.allowlist import admit
-from herdr_run.cli import _Globals, _resolve_agent
+from herdr_run.cli import _Globals, _resolve_agent, check_text
 from herdr_run.client import HerdrClient
 from herdr_run.config import (
     Config,
@@ -319,6 +319,16 @@ def test_agent(row: list[object]) -> None:
     except ConfigError as exc:
         outcome = {"error": str(exc)}
     assert outcome == expected
+
+
+@pytest.mark.parametrize("row", _rows(TEXT, "check_text"), ids=ascii)
+def test_check_text(row: list[object]) -> None:
+    """What ``check`` prints for an admitted command, unsafe characters shown escaped."""
+    program, subcommand, rendered, expected = row
+    assert (
+        check_text(cast(str, program), cast("str | None", subcommand), cast(str, rendered))
+        == expected
+    )
 
 
 @pytest.mark.parametrize("row", _rows(TEXT, "run_id"), ids=repr)

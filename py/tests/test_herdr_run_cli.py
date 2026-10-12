@@ -451,6 +451,27 @@ def test_check_allows_an_allowlisted_command(
     assert "program=git" in out
 
 
+def test_check_shows_an_invisible_or_bidirectional_character_escaped(
+    capsys: pytest.CaptureFixture[str],
+    tmp_path: object,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The subcommand and every argument are whatever was typed. `check` used to print them raw,
+    so a right-to-left override in the subcommand reordered the line on the terminal and a
+    zero-width space in an argument could not be seen at all."""
+    monkeypatch.chdir(str(tmp_path))
+    assert main(["check", "git '\u202estatus' 'a\u200bb' caf\u00e9"]) == 0
+    out = capsys.readouterr().out
+    assert out == (
+        'ALLOWED: program=git subcommand="\\u{202e}status"\n'
+        "rendered: \"git '\\u{202e}status' 'a\\u{200b}b' 'caf\\u{e9}'\"\n"
+    )
+    assert main(["check", "git commit -m caf\u00e9"]) == 0
+    assert capsys.readouterr().out == (
+        "ALLOWED: program=git subcommand=commit\nrendered: git commit -m 'caf\u00e9'\n"
+    )
+
+
 def test_check_refuses_a_non_allowlisted_command(
     capsys: pytest.CaptureFixture[str],
     tmp_path: object,

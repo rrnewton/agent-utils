@@ -57,7 +57,14 @@ from herdr_run.textfmt import (
     strip_space,
 )
 
-__all__ = ["main", "help_text", "subcommand_help_text", "surface_document", "usage_line"]
+__all__ = [
+    "check_text",
+    "help_text",
+    "main",
+    "subcommand_help_text",
+    "surface_document",
+    "usage_line",
+]
 
 
 #: Every subcommand, in the order ``herdr-run --help`` lists them, with its one-line summary.
@@ -662,10 +669,16 @@ _SUBCOMMAND_HELP: dict[str, str] = {
         "usage: herdr-run [GLOBAL OPTIONS] check '<command>'\n"
         "\nDecide whether a command would be admitted by the policy in effect. Touches no\n"
         "pane and executes nothing. Exits 0 when allowed and 77 when refused.\n"
+        "\nWhen allowed, prints 'ALLOWED: program=P subcommand=S' (S is '-' when there is\n"
+        "no subcommand) and 'rendered: C', the command line as run would type it. A value\n"
+        "holding an invisible or bidirectional character, or any other character a name\n"
+        "may not contain, is shown quoted with that character escaped as \\u{hex}.\n"
         "\npositional arguments:\n"
         "  <command>             the whole command line, as a single quoted argument\n"
         "\noptions:\n"
         "  -h, --help            show this help message and exit\n"
+        "\nExample:\n"
+        "  herdr-run check 'git push origin HEAD'\n"
     ),
     "init": (
         "usage: herdr-run [GLOBAL OPTIONS] init [OPTIONS]\n"
@@ -1035,14 +1048,27 @@ def _cmd_check(config: Config, command: str, *, json_output: bool) -> int:
             }
         )
     else:
-        # `-` stands for an ABSENT subcommand only; an empty token is printed as empty, the way
-        # the JSON form distinguishes `null` from `""`.
-        subcommand = "-" if admission.subcommand is None else admission.subcommand
-        output.stdout(
-            f"ALLOWED: program={admission.program} subcommand={subcommand}\n"
-            f"rendered: {admission.rendered}\n"
-        )
+        output.stdout(check_text(admission.program, admission.subcommand, admission.rendered))
     return 0
+
+
+def check_text(program: str, subcommand: str | None, rendered: str) -> str:
+    """The two lines ``check`` prints for an admitted command.
+
+    The program, the subcommand, and the rendered command are each shown with
+    :func:`herdr_run.textfmt.display`: as they are, unless one holds a character a name may not
+    contain -- an invisible or bidirectional character, a control, a noncharacter, a private-use
+    character, or an unassigned code point -- in which case that value is quoted with the
+    character escaped, so it never reaches the terminal raw. The subcommand and every argument are
+    whatever was typed, and under ``allow: ["*"]`` so is the program. ``-`` stands for an ABSENT
+    subcommand only (a subcommand never starts with ``-``); an empty one is printed as empty, the
+    way the JSON form distinguishes ``null`` from ``""``.
+    """
+    shown = "-" if subcommand is None else display(subcommand)
+    return (
+        f"ALLOWED: program={display(program)} subcommand={shown}\n"
+        f"rendered: {display(rendered)}\n"
+    )
 
 
 def _cmd_target(

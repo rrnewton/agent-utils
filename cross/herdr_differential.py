@@ -1055,6 +1055,14 @@ def _policy(harness: Harness, report: Report) -> None:
         ("clone-without-u", "git clone --depth 1 https://example.invalid/r"),
         ("longer-option-is-not-an-abbreviation", "git fetch --upload-packs x origin"),
         ("attr-source-log", "git --attr-source HEAD log -1"),
+        # What `check` prints is typed text: a character a name may not contain is shown escaped,
+        # in the subcommand= field and the rendered: line alike.
+        ("bidi-subcommand", "git '\u202estatus'"),
+        ("invisible-arguments", "git commit -m 'a\u200bb' '\u2028'"),
+        ("private-use-argument", "git log '\ue000'"),
+        ("unassigned-argument", "git log '\u0378'"),
+        ("blank-argument", "git log '\U0001d159' '\U00016fe4'"),
+        ("unicode-16-letter-argument", "git log '\u1c89'"),
     )
     for label, command in allowed:
         case = harness.case(f"policy-allow-{label}")
@@ -1166,6 +1174,8 @@ def _policy(harness: Harness, report: Report) -> None:
         ("tilde-program", "~ x", 77),
         ("tilde-path-program", "~/bin/x y", 77),
         ("any-program", "curl https://example.invalid", 0),
+        ("bidi-program", "'\u202ex' y", 0),
+        ("no-break-space-program", "'tool\u00a0' 'sub\u2066'", 0),
     ):
         case = harness.case(f"policy-wildcard-{label}", wildcard)
         python, rust = harness.invoke(case, ("check", command))

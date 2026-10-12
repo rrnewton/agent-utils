@@ -170,12 +170,15 @@ no `#!` line, is reported as `Exec format error (os error 8)`, never run through
 Quoted values in diagnostics (`program "curl" is not allowlisted`, `got "maybe"`) are written with
 printable ASCII as is, `\n`, `\r`, and `\t` as escapes, and every other character as `\u{hex}`,
 so a message never writes a bidirectional override or a line separator to the terminal raw. What
-Herdr says when a call fails, and a path or a name that a message otherwise shows as it is, is
-quoted the same way as soon as it holds a line break, a control, or any other character a name may
-not contain (listed under the configuration file below). JSON output, from `config`, `--json`, and
-the files `herdr-run` writes, escapes DEL, the C1 controls, and every invisible character as
-`\uXXXX` too, although JSON does not require it, so a project path holding U+009B or U+202E cannot
-reach a terminal through `herdr-run config`; any JSON reader gets the same strings back.
+Herdr says when a call fails, and a path, a name, or a command that a message otherwise shows as
+it is -- the `program=`, `subcommand=`, and `rendered:` that `check` prints for an admitted
+command among them -- is quoted the same way as soon as it holds a line break, a control, or any
+other character a name may not contain (listed under the configuration file below), so a
+subcommand that begins with U+202E is printed as `subcommand="\u{202e}status"` rather than as a
+line the terminal reorders. JSON output, from `config`, `--json`, and the files `herdr-run`
+writes, escapes DEL, the C1 controls, and every invisible character as `\uXXXX` too, although
+JSON does not require it, so a project path holding U+009B or U+202E cannot reach a terminal
+through `herdr-run config`; any JSON reader gets the same strings back.
 
 ---
 
