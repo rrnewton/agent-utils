@@ -613,6 +613,7 @@ async fn main() -> anyhow::Result<()> {
         voice_health_budget: Arc::new(vibe_talk::voice_health::LogBudget::new()),
         headings: Arc::new(vibe_talk::heading::HeadingTags::new()),
         speech_tickets: Arc::new(vibe_talk::speech_tickets::SpeechTickets::new()),
+        read_ahead: Arc::new(vibe_talk::read_ahead::ReadAhead::new()),
         post_gate: Arc::new(vibe_talk::post_gate::PostGate::new()),
         live: Arc::clone(&live),
         summarizer,

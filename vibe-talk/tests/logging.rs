@@ -792,3 +792,116 @@ async fn the_post_gate_logs_every_step_without_a_word_of_the_message_or_its_hand
         );
     }
 }
+
+/// `#191 read-aloud-first-lag`: a read aloud leaves its phases in the log, and none of its text.
+///
+/// One line per preparation (lookup, fetch, normalization, whether the warm-up was started), one
+/// when the warm-up it started finishes, and the browser's line with the time to speech as well as
+/// to the first frame. Numbers and labels only.
+#[tokio::test]
+async fn read_aloud_logs_each_phase_and_never_the_message() {
+    const SPOKEN: &str = "the words a reader asked to hear";
+    let capture = LogCapture::info_only();
+    let harness = harness();
+    let id = harness
+        .discord
+        .seed(&ChannelId(READ_CHANNEL.to_owned()), "Reader", SPOKEN);
+    // The page draws the channel, and then asks for what it drew to be prepared.
+    assert_eq!(
+        call(
+            &harness,
+            "GET",
+            &format!("/api/v1/channels/{READ_CHANNEL}/page"),
+            Some(READ_TOKEN),
+            None,
+        )
+        .await,
+        StatusCode::OK
+    );
+    let request = Request::builder()
+        .method("POST")
+        .uri(format!("/api/v1/channels/{READ_CHANNEL}/speech/prepare"))
+        .header("authorization", format!("Bearer {READ_TOKEN}"))
+        .header("content-type", "application/json")
+        .body(Body::from(json!({ "ids": [id.0] }).to_string()))
+        .expect("request");
+    let response = harness
+        .router
+        .clone()
+        .oneshot(request)
+        .await
+        .expect("router");
+    assert_eq!(response.status(), StatusCode::OK);
+    let bytes = response
+        .into_body()
+        .collect()
+        .await
+        .expect("body")
+        .to_bytes();
+    let prepared: Value = serde_json::from_slice(&bytes).expect("prepared");
+    let url = prepared["prepared"][0]["url"]
+        .as_str()
+        .expect("ticket")
+        .to_owned();
+    // The warm-up runs beside the request; let it finish on this thread.
+    for _ in 0..20 {
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(
+        call(&harness, "GET", &url, None, None).await,
+        StatusCode::OK
+    );
+    assert_eq!(
+        call(
+            &harness,
+            "POST",
+            &format!("{url}/timing"),
+            None,
+            Some(json!({
+                "tap_to_play_ms": 3,
+                "request_to_loaded_ms": 40,
+                "loaded_to_playing_ms": 500,
+                "tap_to_audible_ms": 543,
+                "tap_to_speech_ms": 1210
+            })),
+        )
+        .await,
+        StatusCode::NO_CONTENT
+    );
+
+    let text = capture.text();
+    let line_with = |marker: &str| -> String {
+        text.lines()
+            .find(|line| line.contains(marker))
+            .unwrap_or_else(|| panic!("no {marker:?} line in:\n{text}"))
+            .to_owned()
+    };
+    let preparation = line_with("read-aloud preparation");
+    for field in [
+        "ids=1",
+        "threaded=false",
+        "recent_hits=1",
+        "fetches=0",
+        "resolved=1",
+        "lookup_ms=",
+        "fetch_ms=0",
+        "normalize_ms=",
+        "preparation_ms=",
+        "warm_up=\"started\"",
+    ] {
+        assert!(
+            preparation.contains(field),
+            "{field} missing from {preparation}"
+        );
+    }
+    let warm_up = line_with("read-aloud warm-up finished");
+    assert!(warm_up.contains("warm_up_ms="), "{warm_up}");
+    assert!(warm_up.contains("ok=true"), "{warm_up}");
+    let audible = line_with("read-aloud reached audible playback");
+    assert!(audible.contains("tap_to_speech_ms=1210"), "{audible}");
+    assert!(audible.contains("tap_to_audible_ms=543"), "{audible}");
+    assert!(
+        !text.contains(SPOKEN),
+        "message text reached the INFO log:\n{text}"
+    );
+}

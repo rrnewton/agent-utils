@@ -379,6 +379,9 @@ pub async fn messages(
     crate::noise::filter_for(state, &channel.id)
         .await
         .mark(&mut messages);
+    // `#191 read-aloud-first-lag`: a speech preparation in the next few seconds reads these
+    // rather than fetching the same window again.
+    state.read_ahead.remember(&channel.id, None, &messages);
     Ok(Window {
         channel,
         messages,
@@ -500,7 +503,18 @@ pub async fn timeline(
         if let Some(root) = &mut summary.root {
             stamp(state, std::slice::from_mut(root));
             noise.mark(std::slice::from_mut(root));
+            state
+                .read_ahead
+                .remember(&channel.id, Some(&summary.id), std::slice::from_ref(root));
         }
+    }
+    // `#191 read-aloud-first-lag`: what the page is about to draw is what it will ask to hear.
+    // A delta carries only what changed, which is exactly what has to replace an older copy.
+    state
+        .read_ahead
+        .remember(&channel.id, thread, &page.messages);
+    for gone in page.delta.iter().flat_map(|delta| &delta.deleted) {
+        state.read_ahead.forget(&channel.id, gone);
     }
     Ok((channel, page))
 }
@@ -982,6 +996,8 @@ pub async fn page(
     crate::noise::filter_for(state, &channel.id)
         .await
         .mark(&mut messages);
+    // `#191 read-aloud-first-lag`: the page draws the channel from this, and then asks to hear it.
+    state.read_ahead.remember(&channel.id, None, &messages);
 
     let (next_before, next_since) = if !has_more {
         (None, None)

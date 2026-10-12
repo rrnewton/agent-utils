@@ -76,6 +76,10 @@ pub struct AppState {
     /// a ticket. Device speech reads the text already in the browser and uses no tickets.
     /// See [`crate::speech_tickets`] for why server audio uses this authority boundary.
     pub speech_tickets: Arc<crate::speech_tickets::SpeechTickets>,
+    /// Messages fetched in the last thirty seconds, so preparing them for speech does not fetch
+    /// them again, and the provider warm-up that preparation starts without waiting for it.
+    /// `#191 read-aloud-first-lag`; see [`crate::read_ahead`].
+    pub read_ahead: Arc<crate::read_ahead::ReadAhead>,
     /// The letters standing in for the long ids and hashes in channel text.
     ///
     /// Here rather than per request because the point of a letter is that it means the same account

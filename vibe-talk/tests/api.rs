@@ -3277,6 +3277,52 @@ async fn a_speech_ticket_plays_and_reports_timing_without_a_header_and_a_wrong_o
     assert_eq!(body["error"], "unknown_speech_ticket");
 }
 
+/// `#191 read-aloud-first-lag`: the page may add when speech itself began, under the same bound
+/// as every other clock, and an older page that cannot tell still reports.
+#[tokio::test]
+async fn a_playback_report_may_say_when_speech_began_within_the_same_bound() {
+    let (harness, _store, ids) = todo_harness();
+    let (status, prepared) = call(
+        &harness,
+        "POST",
+        &format!("/api/v1/channels/{WRITE_CHANNEL}/speech/prepare"),
+        Some(READ_TOKEN),
+        Some(serde_json::json!({ "ids": [ids[0].clone()] })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{prepared}");
+    let url = prepared["prepared"][0]["url"].as_str().expect("a url");
+    let (status, _headers, _audio) = call_bytes(&harness, "GET", url, None).await;
+    assert_eq!(status, StatusCode::OK);
+    let report = |speech: serde_json::Value| {
+        let mut body = serde_json::json!({
+            "tap_to_play_ms": 1,
+            "request_to_loaded_ms": 2,
+            "loaded_to_playing_ms": 3,
+            "tap_to_audible_ms": 6
+        });
+        if !speech.is_null() {
+            body["tap_to_speech_ms"] = speech;
+        }
+        body
+    };
+    for (speech, expected) in [
+        (serde_json::json!(700), StatusCode::NO_CONTENT),
+        (serde_json::Value::Null, StatusCode::NO_CONTENT),
+        (serde_json::json!(600_001), StatusCode::BAD_REQUEST),
+    ] {
+        let (status, body) = call(
+            &harness,
+            "POST",
+            &format!("{url}/timing"),
+            None,
+            Some(report(speech.clone())),
+        )
+        .await;
+        assert_eq!(status, expected, "tap_to_speech_ms={speech}: {body}");
+    }
+}
+
 /// A message this server cannot see is left out, and does not take the batch down with it.
 #[tokio::test]
 async fn preparing_a_message_that_scrolled_away_loses_that_one_and_keeps_the_rest() {

@@ -925,6 +925,9 @@ impl SpeechProvider for IndependentSpeech {
 
 struct SlowWarmSpeech;
 
+/// Far longer than a preparation takes, so a prepare that waited for it cannot be missed.
+const SLOW_WARM_UP: Duration = Duration::from_secs(2);
+
 #[async_trait::async_trait]
 impl SpeechProvider for SlowWarmSpeech {
     fn describe(&self) -> Description {
@@ -937,7 +940,7 @@ impl SpeechProvider for SlowWarmSpeech {
     }
 
     async fn warm_up(&self) -> Result<(), SpeechError> {
-        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        tokio::time::sleep(SLOW_WARM_UP).await;
         Ok(())
     }
 
@@ -949,8 +952,11 @@ impl SpeechProvider for SlowWarmSpeech {
     }
 }
 
+/// `#191 read-aloud-first-lag`: the warm-up runs BESIDE the preparation, so neither the prepare
+/// response nor the message-preparation phase it reports waits for it. (That only one warm-up runs
+/// at a time is in `tests/read_ahead.rs`.)
 #[tokio::test]
-async fn message_preparation_timing_does_not_include_provider_warm_up() {
+async fn message_preparation_neither_waits_for_nor_includes_provider_warm_up() {
     let (mut state, chat, _provider) =
         testing::state_from_toml(&testing::config_toml_without_elevenlabs());
     state.speech = Arc::new(SlowWarmSpeech);
@@ -970,7 +976,10 @@ async fn message_preparation_timing_does_not_include_provider_warm_up() {
     .await;
     let preparation_request_ms = began.elapsed().as_millis();
     assert_eq!(status, StatusCode::OK);
-    assert!(preparation_request_ms >= 150, "warm-up did not run");
+    assert!(
+        preparation_request_ms < SLOW_WARM_UP.as_millis() / 2,
+        "the prepare took {preparation_request_ms} ms, so it waited for the {SLOW_WARM_UP:?} warm-up"
+    );
     let prepared: Value = serde_json::from_slice(&bytes).expect("prepared response");
     let url = prepared["prepared"][0]["url"].as_str().expect("ticket");
     let (status, headers, _bytes) = call_with_headers(&app, "GET", url, None).await;
@@ -983,8 +992,8 @@ async fn message_preparation_timing_does_not_include_provider_warm_up() {
         .parse()
         .expect("numeric duration");
     assert!(
-        message_preparation_ms + 100 < preparation_request_ms,
-        "message preparation ({message_preparation_ms} ms) overlapped the 150 ms provider warm-up in a {preparation_request_ms} ms request"
+        message_preparation_ms <= preparation_request_ms,
+        "message preparation ({message_preparation_ms} ms) outlasted its own {preparation_request_ms} ms request"
     );
 }
 

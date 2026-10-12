@@ -505,6 +505,10 @@ pub async fn ingest_event(
             jiff::Timestamp::now().as_millisecond(),
         );
     }
+    // `#191 read-aloud-first-lag`: a recently fetched copy no longer says what the message says.
+    if kind != crate::live::LiveKind::Create {
+        state.read_ahead.forget(&channel_id, &message.id);
+    }
     let accepted = state
         .live
         .publish_ingested(event_id, kind, historical, &channel_id, message);
@@ -2756,6 +2760,8 @@ pub async fn purge_storage(
     state.store.purge_everything().await?;
     let forgotten = clearing.forget_all();
     drop(changing);
+    // Not durable, so not in the list below, but channel text all the same.
+    state.read_ahead.clear();
     if forgotten > 0 {
         tracing::info!(
             channels = forgotten,
@@ -3519,6 +3525,15 @@ pub struct PrepareSpeechResponse {
 ///
 /// Asking the vendor for its voice here is not incidental: it is also what opens the TLS connection
 /// that the audio request then reuses.
+///
+/// `#191 read-aloud-first-lag`. THE TAP MAY BE WAITING ON THIS, so it does as little as it can:
+///
+/// - the provider warm-up starts first and is not awaited (see
+///   [`crate::read_ahead::ReadAhead::start_warm_up`]);
+/// - messages the page fetched in the last thirty seconds are read from memory rather than fetched
+///   again, and what is missing is fetched once per window, or concurrently in a thread (see
+///   [`crate::read_ahead::messages_for_speech`]);
+/// - one content-free line records how long each phase took.
 pub async fn prepare_speech(
     State(state): State<AppState>,
     _scope: ReadScope,
@@ -3529,35 +3544,41 @@ pub async fn prepare_speech(
     if state.speech.describe().playback == crate::speech::Playback::Browser {
         return Err(SpeechError::BrowserPlaybackRequired.into());
     }
-    let window = if let Some(thread_id) = request.thread_id.as_deref() {
-        if request.ids.len() > usize::from(ops::MAX_PAGE) {
-            return Err(ApiError::bad_request(
-                "too many messages in one speech preparation",
-            ));
-        }
-        let channel = state.channel(&channel_id).ok_or(OpError::UnknownChannel)?;
-        let mut messages = Vec::new();
-        for id in &request.ids {
-            let (_, message) =
-                ops::message_by_id_scoped(&state, &channel_id, id, request.limit, Some(thread_id))
-                    .await?;
-            messages.push(message);
-        }
-        ops::Window {
-            channel,
-            messages,
-            limit: state.effective_limit(request.limit),
-        }
+    let thread = request.thread_id.as_deref();
+    if thread.is_some() && request.ids.len() > usize::from(ops::MAX_PAGE) {
+        return Err(ApiError::bad_request(
+            "too many messages in one speech preparation",
+        ));
+    }
+    // The allowlist, before anything is started or read.
+    let channel = state.channel(&channel_id).ok_or(OpError::UnknownChannel)?;
+    // Best effort: a provider can move transport establishment and session readiness ahead of
+    // the tap. Failure still belongs to the actual playback request, where it is actionable.
+    let warm_up = if state
+        .read_ahead
+        .start_warm_up(std::sync::Arc::clone(&state.speech))
+    {
+        "started"
     } else {
-        ops::messages(&state, &channel_id, request.limit).await?
+        "already_running"
     };
+    let found = crate::read_ahead::messages_for_speech(
+        &state,
+        &channel,
+        thread,
+        &request.ids,
+        request.limit,
+        preparation_began,
+    )
+    .await?;
+    let normalizing = std::time::Instant::now();
     let now = jiff::Timestamp::now().as_millisecond();
     let mut resolved = Vec::new();
     for id in &request.ids {
         // Silently absent rather than a 404 for the batch. The page sends what it has on screen,
         // and a row that scrolled out from under the request is not an error the reader did
         // anything to cause — failing the whole batch over one id would lose the other forty.
-        let Some(message) = window.messages.iter().find(|m| m.id.0 == *id) else {
+        let Some(message) = found.messages.get(id) else {
             continue;
         };
         let said = crate::speakable::for_speech(&message.content, now, &state.config.timezone);
@@ -3566,16 +3587,28 @@ pub async fn prepare_speech(
         }
         resolved.push((message.id.0.clone(), said));
     }
-    // Stop this clock BEFORE provider warm-up. These are disjoint phases: message preparation is
-    // lookup plus normalization; provider connection/readiness are carried by the warmed stream.
-    let preparation_ms = u64::try_from(preparation_began.elapsed().as_millis()).unwrap_or(u64::MAX);
-    // Best effort: a provider can move transport establishment and session readiness ahead of
-    // the tap. Failure still belongs to the actual playback request, where it is actionable.
-    let _ = state.speech.warm_up().await;
+    // Message preparation is lookup, fetch and normalization. The provider warm-up is a separate
+    // phase, running beside this one and logged when it ends; its readiness reaches the tap
+    // through the warmed stream.
+    let preparation_ms = millis(preparation_began.elapsed());
+    tracing::info!(
+        ids = request.ids.len(),
+        threaded = thread.is_some(),
+        recent_hits = found.hits,
+        fetches = found.fetches,
+        joined_fetch = found.joined,
+        resolved = resolved.len(),
+        lookup_ms = millis(found.lookup),
+        fetch_ms = millis(found.fetch),
+        normalize_ms = millis(normalizing.elapsed()),
+        preparation_ms,
+        warm_up,
+        "read-aloud preparation"
+    );
     let mut prepared = Vec::new();
     for (message_id, said) in resolved {
         let ticket = state.speech_tickets.mint(crate::speech_tickets::Prepared {
-            channel: window.channel.id.0.clone(),
+            channel: channel.id.0.clone(),
             message: message_id.clone(),
             said,
             speed: crate::speech::clamp_speed(request.speed),
@@ -3750,6 +3783,13 @@ pub struct SpeechPlaybackTiming {
     pub loaded_to_playing_ms: u64,
     /// Tap until `playing`, measured directly rather than reconstructed.
     pub tap_to_audible_ms: u64,
+    /// Tap until the first sample loud enough to be speech was due at the speaker.
+    ///
+    /// `playing` counts the provider's leading silence as audible; this does not. Absent when the
+    /// page could not hear its own samples (the `<audio>` fallback) or no speech arrived in time,
+    /// and from pages older than it. `#191 read-aloud-first-lag`.
+    #[serde(default)]
+    pub tap_to_speech_ms: Option<u64>,
 }
 
 /// Record the browser half of an already-authorized read-aloud observation.
@@ -3767,6 +3807,7 @@ pub async fn speech_playback_timing(
         timing.request_to_loaded_ms,
         timing.loaded_to_playing_ms,
         timing.tap_to_audible_ms,
+        timing.tap_to_speech_ms.unwrap_or(0),
     ]
     .into_iter()
     .any(|value| value > MAX_TIMING_MS)
@@ -3804,6 +3845,7 @@ pub async fn speech_playback_timing(
         browser_playback_ms = timing.loaded_to_playing_ms,
         tap_to_play_ms = timing.tap_to_play_ms,
         tap_to_audible_ms = timing.tap_to_audible_ms,
+        tap_to_speech_ms = timing.tap_to_speech_ms,
         "read-aloud reached audible playback"
     );
     Ok(StatusCode::NO_CONTENT)
