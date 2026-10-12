@@ -14,7 +14,8 @@ reader through, with real taps:
   enter Read -> tap A: audible within a second -> tap B while A streams: A's audio already queued
   is stopped and its response closed at once, and B is audible within a second -> a short message
   played to its end is archived, and only then -> a response cut off part-way says it could not be
-  played and archives nothing -> leaving Read closes the response being read.
+  played and archives nothing -> leaving Read closes the response being read -> a read that opens
+  with silence reports when speech began, as well as when the first frame did.
 
 THE NEGATIVE CONTROL runs the same tap in a second browser with Web Audio taken away, so the page
 falls back to `<audio src>`. It must take seconds: that is what proves this harness can see the
@@ -65,7 +66,13 @@ MESSAGES = {
     "302": ("the second long message", LONG_SECONDS, False),
     "303": ("a short message heard to its end", SHORT_SECONDS, False),
     "304": ("a message whose audio is cut off", LONG_SECONDS, True),
+    "305": ("a message whose audio opens with silence", LONG_SECONDS, False),
 }
+# Seconds of silence before the tone, per message. `#191 read-aloud-first-lag`: a real read opens
+# with 0.55 to 0.8 s of it, which `playing` counts as audible and speech onset does not.
+LEADING_SILENCE = {"305": 0.6}
+# How far the page's speech onset may sit from where the tone really starts after `playing`.
+ONSET_TOLERANCE_MS = 150
 
 # The page must be audible this soon after a tap. Generous against the ~0.1 s the fix takes, and
 # far below the ~4.7 s the media element takes on the same stream.
@@ -127,9 +134,11 @@ def wav_header() -> bytes:
             + b"data" + struct.pack("<I", 0xFFFFFFFF))
 
 
-def tone(start_sample: int, samples: int) -> bytes:
+def tone(start_sample: int, samples: int, silent_until: int = 0) -> bytes:
     return struct.pack(f"<{samples}h", *(
-        int(6000 * math.sin(2 * math.pi * 330 * (start_sample + i) / RATE)) for i in range(samples)))
+        0 if start_sample + i < silent_until
+        else int(6000 * math.sin(2 * math.pi * 330 * (start_sample + i) / RATE))
+        for i in range(samples)))
 
 
 def message(index: int, message_id: str, content: str) -> Json:
@@ -271,10 +280,11 @@ def handler_for(api: FakeApi, web_root: Path) -> type[BaseHTTPRequestHandler]:
                 total = int(seconds * RATE)
                 cut_at = total // 4 if cut else total
                 per = RATE * CHUNK_MS // 1000
+                silent_until = int(LEADING_SILENCE.get(message_id, 0.0) * RATE)
                 sent = 0
                 while sent < cut_at and not api.stopping.is_set():
                     count = min(per, cut_at - sent)
-                    chunk(tone(sent, count))
+                    chunk(tone(sent, count, silent_until))
                     sent += count
                     read.audio_seconds = sent / RATE
                     delay = read.opened + sent / RATE - time.monotonic()
@@ -367,9 +377,14 @@ def check(condition: bool, message: str) -> None:
 
 def audible_ms(timing: Json) -> int:
     """The page's own tap-to-audible figure, which must be a whole number of milliseconds."""
-    value = timing.get("tap_to_audible_ms")
+    return whole_ms(timing, "tap_to_audible_ms")
+
+
+def whole_ms(timing: Json, key: str) -> int:
+    """A figure the page reported under `key`, which must be a whole number of milliseconds."""
+    value = timing.get(key)
     if not isinstance(value, int) or isinstance(value, bool):
-        raise AssertionError(f"the page reported no tap_to_audible_ms: {timing}")
+        raise AssertionError(f"the page reported no {key}: {timing}")
     return value
 
 
@@ -425,6 +440,8 @@ def main() -> int:
     try:
         with sync_playwright() as playwright:
 
+            last = list(MESSAGES)[-1]
+
             def open_page(profile: str, without_web_audio: bool) -> tuple[BrowserContext, Page]:
                 context = playwright.chromium.launch_persistent_context(
                     profile,
@@ -449,9 +466,9 @@ def main() -> int:
                 page.fill("#api-token", TOKEN)
                 page.click("#save-token")
                 page.click("#view-switch")
-                page.wait_for_selector('#discord-log > li[data-id="304"]', timeout=10_000)
+                page.wait_for_selector(f'#discord-log > li[data-id="{last}"]', timeout=10_000)
                 page.click("#read-aloud")
-                page.wait_for_function("() => preparedSpeech.size === 4", timeout=10_000)
+                page.wait_for_function(f"() => preparedSpeech.size === {len(MESSAGES)}", timeout=10_000)
                 return context, page
 
             def tap(page: Page, message_id: str) -> None:
@@ -488,6 +505,11 @@ def main() -> int:
                 check(first_ms <= AUDIBLE_WITHIN_MS,
                       f"A was audible {first_ms} ms after the tap (limit {AUDIBLE_WITHIN_MS} ms;"
                       f" the <audio> control took {control_ms} ms): {first}")
+                # A's tone starts at its first sample, so speech begins when playback does.
+                first_speech_ms = whole_ms(first, "tap_to_speech_ms")
+                check(abs(first_speech_ms - first_ms) <= ONSET_TOLERANCE_MS,
+                      f"A's speech was reported {first_speech_ms} ms after the tap and its first"
+                      f" frame {first_ms} ms, though the tone starts at the first sample: {first}")
                 running = page.evaluate("() => readAloudContext && readAloudContext.state")
                 check(running == "running", f"the read-aloud audio context is {running!r}, not running")
                 shot("1-a-audible")
@@ -552,6 +574,21 @@ def main() -> int:
                 check(not reopened.finished, "the stopped read ran to its end")
                 shot("5-left-read")
 
+                # 6. A read that opens with silence: the first frame is audible at once, speech
+                # only after the silence, and the page reports both. `#191 read-aloud-first-lag`.
+                page.click("#read-aloud")
+                page.wait_for_function("() => preparedSpeech.has('305')", timeout=10_000)
+                tap(page, "305")
+                quiet_start = timing_of("ticket-305")
+                quiet_audible_ms = audible_ms(quiet_start)
+                quiet_speech_ms = whole_ms(quiet_start, "tap_to_speech_ms")
+                lead_ms = round(LEADING_SILENCE["305"] * 1000)
+                check(abs(quiet_speech_ms - quiet_audible_ms - lead_ms) <= ONSET_TOLERANCE_MS,
+                      f"speech was reported {quiet_speech_ms - quiet_audible_ms} ms after the first"
+                      f" frame, but the read opens with {lead_ms} ms of silence: {quiet_start}")
+                page.click("#read-aloud")
+                shot("6-speech-onset")
+
                 check(not errors, f"the page threw: {errors}")
                 browser_version = context.browser.version if context.browser else "Chromium"
                 context.close()
@@ -559,7 +596,9 @@ def main() -> int:
         print(f"{browser_version} at 412x915, audio at speaking pace: tap to audible"
               f" {first_ms} ms and {second_ms} ms after a switch"
               f" (<audio> control {control_ms} ms); a switch stops A's queued audio and closes its response"
-              " at once, as a stop does; heard to the end archives, cut off does not")
+              " at once, as a stop does; heard to the end archives, cut off does not;"
+              f" after {round(LEADING_SILENCE['305'] * 1000)} ms of leading silence speech was reported"
+              f" {quiet_speech_ms - quiet_audible_ms} ms after the first frame")
         return 0
     finally:
         api.stopping.set()

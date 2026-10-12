@@ -1035,7 +1035,10 @@ class FakeAudioContext {
   createBuffer(channels, length, rate) {
     // Kept, so a test can read back the samples the page decoded into it.
     const data = Array.from({ length: channels }, () => new Float32Array(length));
-    return { duration: length / rate, length, sampleRate: rate, getChannelData: (at) => data[at] };
+    return {
+      duration: length / rate, length, sampleRate: rate, numberOfChannels: channels,
+      getChannelData: (at) => data[at],
+    };
   }
 
   createBufferSource() {
@@ -1768,6 +1771,11 @@ function newPage(store = new Map(), script = SCRIPT, arrange = null) {
     speechTimingCalls: [],
     /** Make preparing fail, to prove the tap still works by the older, slower route. */
     prepareFails: false,
+    /**
+     * `#191 read-aloud-first-lag`. When set, `(asked) => Promise | null`: each prepare request waits
+     * on what it returns, after it is recorded, so a test can hold the batch open behind a tap.
+     */
+    prepareHold: null,
     /** The full path of each read, so a test can see the pace that travelled with it. */
     speakPaths: [],
     /** What the server says a generation cost. `null` is a cache hit or a short message. */
@@ -2331,6 +2339,8 @@ function newPage(store = new Map(), script = SCRIPT, arrange = null) {
       if (/\/speech\/prepare$/.test(String(path))) {
         const asked = JSON.parse((options && options.body) || "{}");
         page.prepareCalls.push(asked);
+        const held = page.prepareHold && page.prepareHold(asked);
+        if (held) await held;
         if (page.prepareFails) {
           return json(500, { error: "nope", detail: "no" });
         }
@@ -3065,6 +3075,11 @@ const TUNING_BANDS = {
     "a device engine needs time to initialize but must not strand a tapped row indefinitely"],
   BROWSER_SPEECH_FINISH_MS: [30000, 120000,
     "short chunks at half speed may take many seconds; a hung engine must eventually release the row"],
+  SPEECH_ONSET_WAIT_MS: [1500, 15000,
+    "how long a read's timing report waits after `playing` to learn when speech began (#191 " +
+    "read-aloud-first-lag). Speech follows the first frame by 0.55 to 0.8 s in every read measured, " +
+    "so much under a second and a half reports without it; past fifteen the reader has usually " +
+    "tapped on and the report is late for no reason"],
   LEGACY_MARKER_READS: [10, 500,
     "channel reads the old place marker is looked for in before it is dropped unfound (#240 " +
     "reading-bookmark): fewer drops it before the owner opens the channel it was in, more keeps a " +
@@ -8479,6 +8494,64 @@ test("...so the tap itself fetches NOTHING and plays the prepared URL straight a
     "the player was not handed the prepared URL for this tap"
   );
   assert.equal(page.players[0].playCount, 1, "nothing was played");
+});
+
+test("A TAP DOES NOT WAIT FOR THE BATCH: it prepares only its own row and reads it at once", async () => {
+  // `#191 read-aloud-first-lag`. The measured first read spent 1.78 s of five waiting for the
+  // whole screen's preparation, because a tap joined it. Now the batch is held open for the whole
+  // of this test, and the tap still plays.
+  const page = newPage();
+  await signIn(page);
+  let releaseBatch = () => {};
+  const batchHeld = new Promise((resolve) => { releaseBatch = resolve; });
+  page.prepareHold = (asked) => (asked.ids.length > 1 ? batchHeld : null);
+  const rows = await inReadingMode(page, [
+    message({ id: "1000000000000000001", author_id: "1000000000000000011", content: "first" }),
+    message({ id: "1000000000000000002", author_id: "1000000000000000012", content: "second" }),
+    message({ id: "1000000000000000003", author_id: "1000000000000000013", content: "third" }),
+  ]);
+  assert.equal(rows.length, 3, "the fixture was drawn as one row");
+  assert.equal(page.prepareCalls.length, 1, "turning Read on did not start the batch");
+  assert.equal(page.prepareCalls[0].ids.length, 3);
+
+  await rows[1].dispatch("click", {});
+  await page.settle();
+
+  assert.equal(page.prepareCalls.length, 2, "the tap did not prepare its own row");
+  assert.deepEqual(page.prepareCalls[1].ids, ["1000000000000000002"], "the tap prepared more than its row");
+  assert.equal(page.players.length, 1, "the read waited for the batch");
+  assert.match(page.players[0].url, /^\/api\/v1\/speech\/ticket-for-1000000000000000002\?selection=tap-/);
+  assert.equal(page.players[0].playCount, 1, "nothing was played");
+  assert.deepEqual(page.speakCalls, [], "the tap fell back to the slow route");
+
+  // The batch finishes behind the read, and the other rows are then ready for their own taps.
+  releaseBatch();
+  await page.settle();
+  assert.equal(page.prepareCalls.length, 2, "the batch was asked for again");
+  await rows[2].dispatch("click", {});
+  await page.settle();
+  assert.equal(page.prepareCalls.length, 2, "a row the batch had prepared was prepared again");
+  assert.match(page.players[1].url, /^\/api\/v1\/speech\/ticket-for-1000000000000000003\?selection=tap-/);
+});
+
+test("a tap on a COMBINED row prepares every message in that row, and nothing else", async () => {
+  const page = newPage();
+  await signIn(page);
+  page.prepareHold = (asked) => (asked.ids.length > 2 ? new Promise(() => {}) : null);
+  const rows = await inReadingMode(page, [
+    message({ id: "1000000000000000001", content: "first half", timestamp: "2026-08-19T04:31:00.000Z" }),
+    message({ id: "1000000000000000002", content: "second half", timestamp: "2026-08-19T04:31:01.000Z" }),
+    message({ id: "1000000000000000003", author_id: "1000000000000000013", content: "another",
+      timestamp: "2026-08-19T05:31:00.000Z" }),
+  ]);
+  assert.equal(rows.length, 2, "the first two were not combined");
+
+  await rows[0].dispatch("click", {});
+  await page.settle();
+
+  assert.deepEqual(page.prepareCalls.at(-1).ids, ["1000000000000000001", "1000000000000000002"]);
+  assert.equal(page.players.length, 1, "the combined read did not start");
+  assert.match(page.players[0].url, /ticket-for-1000000000000000001\?/);
 });
 
 test("audible playback reports content-free transfer and browser timing", async () => {
@@ -24857,11 +24930,14 @@ test("a prepared read PLAYS AS IT ARRIVES, rather than after the ~225 KB an <aud
   page.setClock(tappedAt + 540);
   assert.equal(page.expireTimers(500), 1, "nothing waited for the first sample to reach the speaker");
   await page.settle();
+  // The very first sample is loud, so speech begins exactly when playback does. `#191
+  // read-aloud-first-lag`; a read that opens with silence is the next test.
   assert.deepEqual(page.speechTimingCalls.map((call) => call.timing), [{
     tap_to_play_ms: 0,
     request_to_loaded_ms: 40,
     loaded_to_playing_ms: 500,
     tap_to_audible_ms: 540,
+    tap_to_speech_ms: 540,
   }]);
 
   stream.controller.bytes(samples.subarray(3));
@@ -24879,6 +24955,57 @@ test("a prepared read PLAYS AS IT ARRIVES, rather than after the ~225 KB an <aud
   await page.settle();
   assert.deepEqual(page.dismissCalls, [{ messages: ["1000000000000000001"] }]);
   assert.equal(audio.state, "suspended", "the audio output was held open after the read ended");
+});
+
+test("a streamed read reports when SPEECH began, after the silence it opens with", async () => {
+  // `#191 read-aloud-first-lag`. Every read measured opens with 0.55 to 0.8 s of silence, which
+  // `playing` counts as audible. The report also says when the first loud sample was due.
+  const page = newPage();
+  page.enableStreamedAudio();
+  await signIn(page);
+  const rows = await inReadingMode(page, [message({ id: "1000000000000000001" })]);
+  const tappedAt = page.clock();
+  await rows[0].dispatch("click", {});
+  await page.settle();
+  const [stream] = page.audioStreams;
+
+  // A quarter of a second of near-silence, at 1000 frames a second: nothing loud yet.
+  page.setClock(tappedAt + 40);
+  stream.controller.bytes(joined(wavHeader(1000, 1), pcm(...new Array(250).fill(20))));
+  await page.settle();
+  page.setClock(tappedAt + 540);
+  assert.equal(page.expireTimers(500), 1, "nothing waited for the first sample to reach the speaker");
+  await page.settle();
+  assert.deepEqual(page.speechTimingCalls, [], "the report went before speech could be timed");
+
+  // Then speech, 0.25 s into the stream, arriving 60 ms after the first sample began to play.
+  page.setClock(tappedAt + 600);
+  page.audio.currentTime = 0.56;
+  stream.controller.bytes(pcm(20, 20, 0x2000, 0x2000));
+  await page.settle();
+  assert.equal(page.speechTimingCalls.length, 1, "speech arrived and nothing was reported");
+  const timing = page.speechTimingCalls[0].timing;
+  assert.equal(timing.tap_to_audible_ms, 540);
+  // 40 ms to the first frame, the 500 ms lead, 252 frames at 1 kHz: speech due at 792 ms.
+  assert.equal(timing.tap_to_speech_ms, 792, JSON.stringify(timing));
+});
+
+test("...and a read that stays quiet still reports, without a speech time, after a bounded wait", async () => {
+  const page = newPage();
+  page.enableStreamedAudio();
+  await signIn(page);
+  const rows = await inReadingMode(page, [message({ id: "1000000000000000001" })]);
+  await rows[0].dispatch("click", {});
+  await page.settle();
+  page.audioStreams[0].controller.bytes(joined(wavHeader(1000, 1), pcm(1, 2, 3)));
+  await page.settle();
+  page.expireTimers(500);
+  await page.settle();
+  assert.deepEqual(page.speechTimingCalls, []);
+  assert.equal(page.expireTimers(5000), 1, "nothing bounded the wait for speech");
+  await page.settle();
+  assert.equal(page.speechTimingCalls.length, 1, "a quiet read was never reported");
+  assert.equal("tap_to_speech_ms" in page.speechTimingCalls[0].timing, false);
 });
 
 test("read-aloud keeps the screen on while it is on, and asks again after the page comes back", async () => {
@@ -31627,10 +31754,21 @@ test("read-aloud does not prepare a placeholder, and a tap on one still reads it
     !prepared.includes("9400000000000000002"),
     "read-aloud spent a preparation on a placeholder nobody is going to ask to hear"
   );
-  // An explicit tap is an explicit request: skipping it would be a control that does nothing.
+  // An explicit tap is an explicit request: skipping it would be a control that does nothing. The
+  // tap prepares that one row itself and reads it. `#191 read-aloud-first-lag`.
+  const preparedBefore = page.prepareCalls.length;
   await rows[1].dispatch("click", {});
   await page.settle();
-  assert.deepStrictEqual(page.speakCalls, ["9400000000000000002"], "a tapped placeholder was not read");
+  assert.deepStrictEqual(
+    page.prepareCalls[preparedBefore] && page.prepareCalls[preparedBefore].ids,
+    ["9400000000000000002"],
+    "the tap did not prepare the placeholder it asked for"
+  );
+  assert.match(
+    (page.players[0] || {}).url || "",
+    /^\/api\/v1\/speech\/ticket-for-9400000000000000002\?selection=/,
+    "a tapped placeholder was not read"
+  );
 });
 
 test("a placeholder and the answer seconds after it stay two rows", async () => {

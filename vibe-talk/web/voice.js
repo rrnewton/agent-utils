@@ -19302,6 +19302,10 @@ let preparedUntil = 0;
  * Called when read-aloud is switched on, and again as rows arrive or scroll into reach. Cheap to
  * repeat: it is one request covering every visible row, against messages the server has usually
  * just fetched anyway. It spends NOTHING at the vendor — no audio is generated until a tap.
+ *
+ * A TAP NEVER WAITS FOR THIS. `#191 read-aloud-first-lag`: a tap on a row that has no ticket yet
+ * prepares that row on its own (`prepareSpeechFor`) and starts reading it, and this batch carries
+ * on behind it.
  */
 let prepareSpeechInFlight = null;
 
@@ -19332,7 +19336,7 @@ async function prepareSpeechNow() {
   const ids = [];
   for (const li of shownChannelList().children) {
     // `#196 auto-read-noise`. A placeholder is not prepared: preparing warms a vendor lookup for a
-    // message nobody is going to ask to hear. A tap on one still reads it, by the slower route.
+    // message nobody is going to ask to hear. A tap on one still reads it, preparing it then.
     const held = rowMessages(li);
     idsOf(li).forEach((id, index) => {
       if (id && !preparedSpeech.has(id) && !isNoise(held[index])) {
@@ -19343,32 +19347,63 @@ async function prepareSpeechNow() {
   if (ids.length === 0) {
     return;
   }
-  let payload = null;
   try {
-    const groups = new Map();
-    for (const id of ids) {
-      const threadId = threadForMessageId(id);
-      if (!groups.has(threadId)) groups.set(threadId, []);
-      groups.get(threadId).push(id);
-    }
-    const batches = await Promise.all([...groups].map(([threadId, messageIds]) => api(
-      `/api/v1/channels/${encodeURIComponent(channel)}/speech/prepare`,
-      { method: "POST", body: { ids: messageIds, speed: readSpeed === null ? null : readSpeed / 100,
-        ...(threadId ? { thread_id: threadId } : {}) } }
-    )));
-    payload = { prepared: batches.flatMap((batch) => batch.prepared || []),
-      expires_in_seconds: Math.min(...batches.map((batch) => batch.expires_in_seconds || 0)) };
+    await requestPreparedSpeech(channel, ids);
   } catch (_error) {
     // PREPARING IS AN OPTIMISATION AND FAILS LIKE ONE. The tap still works without it, by the
     // older and slower route, so taking the channel away over this would trade a slow feature for
     // a broken one.
-    return;
   }
-  for (const entry of (payload && payload.prepared) || []) {
+}
+
+/**
+ * Prepare exactly these messages, one request per thread they belong to, and keep their tickets.
+ *
+ * @param {string} channel the channel the ids are in.
+ * @param {Array<string>} ids message ids, in screen order.
+ */
+async function requestPreparedSpeech(channel, ids) {
+  const groups = new Map();
+  for (const id of ids) {
+    const threadId = threadForMessageId(id);
+    if (!groups.has(threadId)) groups.set(threadId, []);
+    groups.get(threadId).push(id);
+  }
+  const batches = await Promise.all([...groups].map(([threadId, messageIds]) => api(
+    `/api/v1/channels/${encodeURIComponent(channel)}/speech/prepare`,
+    { method: "POST", body: { ids: messageIds, speed: readSpeed === null ? null : readSpeed / 100,
+      ...(threadId ? { thread_id: threadId } : {}) } }
+  )));
+  for (const entry of batches.flatMap((batch) => (batch && batch.prepared) || [])) {
     preparedSpeech.set(String(entry.message_id), { url: entry.url });
   }
-  const ttl = (payload && payload.expires_in_seconds) || 0;
+  const ttl = Math.min(...batches.map((batch) => (batch && batch.expires_in_seconds) || 0));
   preparedUntil = Date.now() + ttl * 1000;
+}
+
+/**
+ * `#191 read-aloud-first-lag`. Prepare the row the reader just tapped, NOW, and on its own.
+ *
+ * A tap on a row with no ticket used to join the batch for the whole screen and wait for all of
+ * it. On the measured first read that was 1.78 s of a five-second wait, and most of it was a chat
+ * fetch for rows nobody had asked to hear yet. This asks for the tapped row's messages and nothing
+ * else, so the read starts as soon as they are ready, while the batch finishes behind it.
+ *
+ * Never throws. A failure leaves the row unprepared, and the tap falls back to the older and
+ * slower route, as it does when the batch fails.
+ *
+ * @param {Array<string>} ids the tapped row's message ids, oldest first.
+ */
+async function prepareSpeechFor(ids) {
+  const channel = el("discord-channel").value;
+  if (!channel || readAloudPlayback !== "audio") return;
+  const missing = ids.map(String).filter((id) => id && !preparedSpeech.has(id));
+  if (missing.length === 0) return;
+  try {
+    await requestPreparedSpeech(channel, missing);
+  } catch (_error) {
+    // As for the batch: the slower route still reads it.
+  }
 }
 
 /** Forget what was prepared. The pace is baked into a ticket, so changing it invalidates them. */
@@ -19563,6 +19598,17 @@ const STREAM_START_LEAD_SECONDS = 0.5;
 const STREAM_MAX_LEAD_SECONDS = 4;
 /** A WAV header larger than this is not one this page will wait for. */
 const STREAM_HEADER_LIMIT_BYTES = 64 * 1024;
+/**
+ * The first sample at least this loud (of full scale, about -34 dBFS) is where speech begins.
+ *
+ * `#191 read-aloud-first-lag`. A read's audio opens with silence: in every read measured, speech
+ * began 0.55 to 0.8 s after the first frame. `playing` counts that silence as audible, so the
+ * page also reports when the first sample this loud was due at the speaker. Quiet room tone sits
+ * far below this level and the start of a spoken word far above it.
+ */
+const SPEECH_ONSET_LEVEL = 0.02;
+/** How long a report waits, after `playing`, to learn when speech began before it goes anyway. */
+const SPEECH_ONSET_WAIT_MS = 5000;
 
 let readAloudContext = null;
 
@@ -19632,8 +19678,8 @@ function wavLayout(bytes) {
 
 function streamingPlayer(url, context) {
   const listeners = new Map();
-  const emit = (type) => {
-    for (const fn of listeners.get(type) || []) fn();
+  const emit = (type, ...details) => {
+    for (const fn of listeners.get(type) || []) fn(...details);
   };
   const abort = new AbortController();
   const waiting = []; // decoded before `play`: a later part, fetched while the one before plays
@@ -19643,6 +19689,7 @@ function streamingPlayer(url, context) {
   let over = false; // paused, failed or ended: nothing more is heard or announced
   let loaded = false;
   let announced = false;
+  let spoke = false;
   let playAt = 0;
   let lead = STREAM_START_LEAD_SECONDS;
 
@@ -19681,6 +19728,15 @@ function streamingPlayer(url, context) {
     }
     node.start(playAt);
     const startsInMs = Math.round((playAt - now + (context.outputLatency || 0)) * 1000);
+    if (!spoke) {
+      const onset = loudFrom(buffer);
+      if (onset >= 0) {
+        spoke = true;
+        // In how many milliseconds the first loud sample reaches the speaker. Said NOW, as a
+        // number, rather than on a timer: the reader is owed this figure even if they stop first.
+        emit("speech", startsInMs + Math.round((onset / buffer.sampleRate) * 1000));
+      }
+    }
     playAt += buffer.duration;
     sounding.add(node);
     node.onended = () => {
@@ -19694,6 +19750,21 @@ function streamingPlayer(url, context) {
         if (!over) emit("playing");
       }, startsInMs);
     }
+  };
+  /** The first frame of `buffer` loud enough to be speech, in any channel; -1 when none is. */
+  const loudFrom = (buffer) => {
+    let first = -1;
+    for (let channel = 0; channel < buffer.numberOfChannels; channel += 1) {
+      const samples = buffer.getChannelData(channel);
+      const end = first < 0 ? samples.length : first;
+      for (let frame = 0; frame < end; frame += 1) {
+        if (Math.abs(samples[frame]) >= SPEECH_ONSET_LEVEL) {
+          first = frame;
+          break;
+        }
+      }
+    }
+    return first;
   };
   const decode = (bytes, channels, rate) => {
     const frames = Math.floor(bytes.length / (2 * channels));
@@ -19770,6 +19841,8 @@ function streamingPlayer(url, context) {
   run();
   return {
     url,
+    /** This player can tell when speech begins, and says so with a `speech` event. */
+    hearsSpeech: true,
     addEventListener(type, fn) {
       if (!listeners.has(type)) listeners.set(type, []);
       listeners.get(type).push(fn);
@@ -19860,13 +19933,15 @@ async function readAloud(ids) {
   // starts playing against a response the server is still writing.
   let ready = parts.map((part) => preparedSpeech.get(part));
   let streamed = ready.every((entry) => entry && typeof entry.url === "string" && entry.url.length > 0);
-  // Turning Read on starts preparation in the background. A quick row tap joins that same work
-  // instead of falling back to a second provider lookup followed by fully buffered synthesis.
+  // Turning Read on starts preparing the whole screen in the background. A tap that comes before
+  // that reaches this row does NOT wait for it: it prepares this row alone and reads it, and the
+  // batch for the rest carries on behind. `#191 read-aloud-first-lag`.
   if (!streamed) {
-    await prepareSpeech();
+    await prepareSpeechFor(parts);
     if (ticket !== readingTicket) return;
     ready = parts.map((part) => preparedSpeech.get(part));
     streamed = ready.every((entry) => entry && typeof entry.url === "string" && entry.url.length > 0);
+    guardQuietly(prepareSpeech)();
   }
   let blobs;
   if (streamed) {
@@ -19909,7 +19984,25 @@ async function readAloud(ids) {
   const requestBegan = sources.map(() => null);
   const playInvokedAt = sources.map(() => null);
   const loadedAt = sources.map(() => null);
+  const audibleAt = sources.map(() => null);
+  const speechAt = sources.map(() => null);
   const timingReported = sources.map(() => false);
+  // One report per part, sent once it is audible and either speech has begun or the player cannot
+  // tell. `#191 read-aloud-first-lag`: the time to the first loud sample, not only the first frame.
+  const reportTiming = (at) => {
+    if (timingReported[at] || audibleAt[at] === null) return;
+    timingReported[at] = true;
+    const invokedAt = playInvokedAt[at] === null ? audibleAt[at] : playInvokedAt[at];
+    const mediaAt = loadedAt[at] === null ? audibleAt[at] : loadedAt[at];
+    // The bare ticket URL: the selection only routes playback.
+    reportSpeechPlayback(ready[at].url, {
+      tap_to_play_ms: speechElapsedMs(tapBegan, invokedAt),
+      request_to_loaded_ms: speechElapsedMs(requestBegan[at], mediaAt),
+      loaded_to_playing_ms: speechElapsedMs(mediaAt, audibleAt[at]),
+      tap_to_audible_ms: speechElapsedMs(tapBegan, audibleAt[at]),
+      ...(speechAt[at] === null ? {} : { tap_to_speech_ms: speechElapsedMs(tapBegan, speechAt[at]) }),
+    });
+  };
   const startPlayer = (at) => {
     playInvokedAt[at] = speechTimingNow();
     return players[at].play();
@@ -19918,24 +20011,27 @@ async function readAloud(ids) {
     requestBegan[at] = speechTimingNow();
     const audio = streamed ? streamedSpeechPlayer(sources[at]) : new Audio(sources[at]);
     players[at] = audio;
+    // Only the Web Audio player hears its own samples; an `<audio>` element cannot.
+    const hearsSpeech = "hearsSpeech" in audio && audio.hearsSpeech === true;
     audio.addEventListener("loadeddata", () => {
       if (ticket !== readingTicket || loadedAt[at] !== null) return;
       loadedAt[at] = speechTimingNow();
       if (streamed && at + 1 < sources.length && !players[at + 1]) addPlayer(at + 1);
     });
+    audio.addEventListener("speech", (inMs) => {
+      if (!streamed || speechAt[at] !== null) return;
+      speechAt[at] = speechTimingNow() + Math.max(0, Number(inMs) || 0);
+      reportTiming(at);
+    });
     audio.addEventListener("playing", () => {
-      if (ticket !== readingTicket || timingReported[at] || !streamed) return;
-      timingReported[at] = true;
-      const audibleAt = speechTimingNow();
-      const invokedAt = playInvokedAt[at] === null ? audibleAt : playInvokedAt[at];
-      const mediaAt = loadedAt[at] === null ? audibleAt : loadedAt[at];
-      // The bare ticket URL: the selection only routes playback.
-      reportSpeechPlayback(ready[at].url, {
-        tap_to_play_ms: speechElapsedMs(tapBegan, invokedAt),
-        request_to_loaded_ms: speechElapsedMs(requestBegan[at], mediaAt),
-        loaded_to_playing_ms: speechElapsedMs(mediaAt, audibleAt),
-        tap_to_audible_ms: speechElapsedMs(tapBegan, audibleAt),
-      });
+      if (ticket !== readingTicket || audibleAt[at] !== null || !streamed) return;
+      audibleAt[at] = speechTimingNow();
+      if (speechAt[at] !== null || !hearsSpeech) {
+        reportTiming(at);
+      } else {
+        // Speech has not arrived yet: it usually follows within a second. Not for ever, though.
+        setTimeout(() => reportTiming(at), SPEECH_ONSET_WAIT_MS);
+      }
     });
     audio.addEventListener("ended", () => {
       // Only if THIS is still the read in progress. The reader may have tapped another message
