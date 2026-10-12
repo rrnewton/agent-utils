@@ -23,10 +23,10 @@ use sha2::{Digest, Sha256};
 
 use crate::agent::{self, AgentApi, AgentError, DrainOptions, QueueResult, Target};
 use crate::client::{
-    muse_auto_review_idle_composer, muse_idle_composer, muse_prompt_in_composer,
-    muse_prompt_is_exact_composer, muse_prompt_transcript_count, muse_startup_metadata,
-    muse_trust_prompt, muse_verified_process_idle_composer, AgentIdentity, AgentPaneInfo,
-    CustomProcessIdentity, HerdrClient, Pane, PaneShellProof, ProcessLiveness,
+    muse_auto_review_idle_composer, muse_prompt_in_composer, muse_prompt_is_exact_composer,
+    muse_prompt_transcript_count, muse_startup_metadata, muse_trust_prompt,
+    muse_verified_pane_status, AgentIdentity, AgentPaneInfo, CustomProcessIdentity, HerdrClient,
+    Pane, PaneShellProof, ProcessLiveness,
 };
 use crate::error::{AdapterError, AdapterErrorKind};
 use crate::submission::{GuardedInput, GuardedPrompt, Submission, SubmitTimeouts};
@@ -3414,20 +3414,13 @@ impl<A: ManagedApi + ?Sized> AgentApi for WorkspaceClient<'_, A> {
             if self.uses_muse_composer() {
                 self.verify_muse_process(pane_id)?;
                 let screen = self.client.read(pane_id, "visible", Some(200))?;
+                self.verify_muse_process(pane_id)?;
                 if muse_trust_prompt(&screen) {
                     return Err(crate::error::AdapterError::unavailable(
                         "Muse workspace trust prompt requires human attention; no input was submitted",
                     ));
                 }
-                info.status = if muse_idle_composer(&screen)
-                    || (matches!(info.status.as_str(), "idle" | "done")
-                        && muse_verified_process_idle_composer(&screen))
-                {
-                    "idle".to_owned()
-                } else {
-                    "working".to_owned()
-                };
-                self.verify_muse_process(pane_id)?;
+                info.status = muse_verified_pane_status(&info.status, &screen).to_owned();
             }
         }
         Ok(info)
@@ -3606,20 +3599,13 @@ impl<A: ManagedApi + ?Sized> AgentApi for WorkspaceClient<'_, A> {
                 let screen =
                     self.client
                         .read_with_runtime(pane_id, "visible", Some(200), runtime)?;
+                self.verify_muse_process_with_runtime(pane_id, runtime)?;
                 if muse_trust_prompt(&screen) {
                     return Err(crate::error::AdapterError::unavailable(
                         "Muse workspace trust prompt requires human attention; no input was submitted",
                     ));
                 }
-                info.status = if muse_idle_composer(&screen)
-                    || (matches!(info.status.as_str(), "idle" | "done")
-                        && muse_verified_process_idle_composer(&screen))
-                {
-                    "idle".to_owned()
-                } else {
-                    "working".to_owned()
-                };
-                self.verify_muse_process_with_runtime(pane_id, runtime)?;
+                info.status = muse_verified_pane_status(&info.status, &screen).to_owned();
             }
         }
         Ok(info)
@@ -15602,6 +15588,8 @@ pub(crate) mod tests {
     mod herdr_compatibility;
     /// Recipient checks around input, anchors, rename transactions and doctor.
     mod identity;
+    /// Muse 1.4 paused, idle, staged and working status, and the input each one admits.
+    mod muse_status;
     /// Recorded conversation and launch policy, with no status-time mutation.
     mod recovery_metadata;
     /// Resume recovery, immutable planning, exact publication and crash reconciliation.
