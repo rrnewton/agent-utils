@@ -203,10 +203,24 @@ fn output_detail(output: &[u8]) -> String {
     String::from_utf8_lossy(&output[start..]).trim().to_owned()
 }
 
+/// How long the native Muse skill manager may run before its process group is killed.
+const INSTALL_TIMEOUT: Duration = Duration::from_secs(30);
+
 fn install_muse(force: bool) -> Result<&'static str, AgentError> {
     // Resolve and validate code before making any configuration directories.
     let executable = muse_executable()?;
     let config_home = muse_config_home()?;
+    install_muse_with(&executable, &config_home, force, INSTALL_TIMEOUT)
+}
+
+/// Install through the validated Muse `executable` into `config_home` (`.../muse`), giving the
+/// manager `timeout` before its process group is killed.
+fn install_muse_with(
+    executable: &Path,
+    config_home: &Path,
+    force: bool,
+    timeout: Duration,
+) -> Result<&'static str, AgentError> {
     let skills = config_home.join("skills");
     ensure_real_directory(&skills)?;
     let destination_directory = skills.join("agentctl");
@@ -269,7 +283,7 @@ fn install_muse(force: bool) -> Result<&'static str, AgentError> {
     if force {
         command.arg("--force");
     }
-    let output = crate::client::bounded_output(command, Duration::from_secs(30));
+    let output = crate::client::bounded_output(command, timeout);
     let _ = fs::remove_dir_all(&staging);
     let output =
         output.map_err(|error| fail(format!("Muse skill installation failed: {error}")))?;
@@ -316,15 +330,23 @@ pub(crate) fn install(harnesses: &[String], force: bool) -> Result<InstallResult
     } else {
         let mut values = Vec::new();
         for harness in harnesses {
-            if !matches!(harness.as_str(), "codex" | "claude" | "muse") {
-                return Err(fail(format!("unsupported skill harness {harness:?}")));
-            }
             if !values.contains(harness) {
                 values.push(harness.clone());
             }
         }
         values
     };
+    let invalid: std::collections::BTreeSet<&str> = selected
+        .iter()
+        .map(String::as_str)
+        .filter(|harness| !matches!(*harness, "codex" | "claude" | "muse"))
+        .collect();
+    if !invalid.is_empty() {
+        return Err(fail(format!(
+            "unsupported skill harnesses: {}",
+            invalid.into_iter().collect::<Vec<_>>().join(", ")
+        )));
+    }
     let mut result = InstallResult {
         installed: Vec::new(),
         unchanged: Vec::new(),
@@ -343,4 +365,357 @@ pub(crate) fn install(harnesses: &[String], force: bool) -> Result<InstallResult
         }
     }
     Ok(result)
+}
+
+#[cfg(test)]
+mod tests {
+    //! Security and resource bounds, symlink refusal, and atomic replacement.
+
+    // The hostile-PATH, output-bound and deadline tests come from the other edition's
+    // test_agentctl_skill_install.py.
+    use super::*;
+    use std::os::unix::fs::{symlink, MetadataExt};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Instant;
+
+    static SEQUENCE: AtomicUsize = AtomicUsize::new(0);
+    /// Stdout bound that `client::bounded_output` applies to every control command.
+    const CONTROL_STDOUT_BYTES: usize = 8 * 1024 * 1024;
+    const HOSTILE_PATH_CHILD: &str = "AGENTCTL_SKILL_INSTALL_HOSTILE_PATH_CHILD";
+
+    struct Scratch(PathBuf);
+
+    impl Scratch {
+        fn new() -> Self {
+            // Canonical, so no symlinked ancestor of the temporary directory is mistaken for a
+            // hostile destination component.
+            let base = fs::canonicalize(std::env::temp_dir()).unwrap();
+            let path = base.join(format!(
+                "agentctl-skill-install-{}-{}",
+                std::process::id(),
+                SEQUENCE.fetch_add(1, Ordering::Relaxed)
+            ));
+            DirBuilder::new().mode(0o700).create(&path).unwrap();
+            Self(path)
+        }
+    }
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn executable(path: &Path, script: &str) -> PathBuf {
+        fs::write(path, format!("#!/bin/sh\n{script}\n")).unwrap();
+        fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
+        path.to_path_buf()
+    }
+
+    /// Whether the process whose ID is in `pid_file` has gone (or is an unreaped zombie).
+    fn process_gone(pid_file: &Path) -> bool {
+        let pid = fs::read_to_string(pid_file).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            match fs::read_to_string(format!("/proc/{}/stat", pid.trim())) {
+                Err(_) => return true,
+                Ok(stat)
+                    if stat
+                        .rsplit_once(") ")
+                        .is_some_and(|(_, tail)| tail.starts_with('Z')) =>
+                {
+                    return true
+                }
+                Ok(_) => std::thread::sleep(Duration::from_millis(10)),
+            }
+        }
+        false
+    }
+
+    #[test]
+    fn muse_executable_does_not_search_hostile_path() {
+        if std::env::var_os(HOSTILE_PATH_CHILD).is_some() {
+            match muse_executable() {
+                Ok(path) => println!("<<resolved {}>>", path.display()),
+                Err(error) => println!("<<refused {error}>>"),
+            }
+            return;
+        }
+        let scratch = Scratch::new();
+        let executed = scratch.0.join("executed");
+        let planted = executable(
+            &scratch.0.join("muse"),
+            &format!("touch '{}'", executed.display()),
+        );
+        // The search path is process state, so the resolution runs in a child of this test.
+        let output = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "skill_install::tests::muse_executable_does_not_search_hostile_path",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(HOSTILE_PATH_CHILD, "1")
+            .env("PATH", &scratch.0)
+            .env_remove("AGENTCTL_MUSE_BIN")
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let result = stdout
+            .split_once("<<")
+            .and_then(|(_, rest)| rest.split_once(">>"))
+            .map(|(result, _)| result)
+            .unwrap_or_else(|| panic!("child printed no resolution: {stdout}"));
+        assert!(!result.contains(&planted.display().to_string()), "{result}");
+        assert!(planted.is_file());
+        assert!(!executed.exists());
+    }
+
+    #[test]
+    fn muse_installer_kills_a_process_group_that_exceeds_output_bound() {
+        let scratch = Scratch::new();
+        let helper = scratch.0.join("helper.pid");
+        let muse = executable(
+            &scratch.0.join("muse-output"),
+            &format!(
+                "sleep 60 & echo $! > '{}'\nhead -c {} /dev/zero\nwait",
+                helper.display(),
+                CONTROL_STDOUT_BYTES + 1
+            ),
+        );
+        let error = install_muse_with(
+            &muse,
+            &scratch.0.join("config/muse"),
+            false,
+            INSTALL_TIMEOUT,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            error.starts_with("Muse skill installation failed:") && error.contains("exceeds"),
+            "{error}"
+        );
+        assert!(process_gone(&helper), "the installer's helper survived");
+        assert!(!scratch.0.join("config/muse/skills/agentctl").exists());
+    }
+
+    #[test]
+    fn muse_installer_kills_a_process_group_at_deadline() {
+        // The deadline starts before the script runs; a loaded host can expire it before the
+        // helper is published, so such an attempt is retried with a longer deadline.
+        for timeout in [200, 1_000, 5_000].map(Duration::from_millis) {
+            let scratch = Scratch::new();
+            let helper = scratch.0.join("helper.pid");
+            let muse = executable(
+                &scratch.0.join("muse-sleep"),
+                &format!("sleep 60 & echo $! > '{}'\nwait", helper.display()),
+            );
+            let started = Instant::now();
+            let error = install_muse_with(&muse, &scratch.0.join("config/muse"), false, timeout)
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("timed out"), "{error}");
+            assert!(started.elapsed() < timeout + Duration::from_secs(5));
+            if !helper.exists() {
+                continue;
+            }
+            assert!(process_gone(&helper), "the installer's helper survived");
+            return;
+        }
+        panic!("the installer never published its helper before any deadline");
+    }
+
+    #[test]
+    fn muse_install_uses_the_native_manager_and_proves_its_result() {
+        let scratch = Scratch::new();
+        let config = scratch.0.join("config/muse");
+        let argv = scratch.0.join("argv");
+        let receipt = r#"printf '%s\n' '{"installed": {"id": "agentctl"}}'"#;
+        let muse = executable(
+            &scratch.0.join("muse"),
+            &format!(
+                "printf '%s\\n' \"$@\" > '{}'\n\
+                 mkdir -p \"$XDG_CONFIG_HOME/muse/skills/agentctl\"\n\
+                 cp \"$3/SKILL.md\" \"$XDG_CONFIG_HOME/muse/skills/agentctl/SKILL.md\"\n\
+                 {receipt}",
+                argv.display()
+            ),
+        );
+        assert_eq!(
+            install_muse_with(&muse, &config, false, INSTALL_TIMEOUT).unwrap(),
+            "installed"
+        );
+        let arguments = fs::read_to_string(&argv).unwrap();
+        let arguments: Vec<&str> = arguments.lines().collect();
+        assert_eq!(arguments[..2], ["skills", "install"]);
+        assert_eq!(
+            arguments[3..],
+            ["--scope", "user", "--name", "agentctl", "--json"]
+        );
+        assert_eq!(
+            fs::read(config.join("skills/agentctl/SKILL.md")).unwrap(),
+            crate::AGENTCTL_SKILL.as_bytes()
+        );
+        // An identical installed skill is reported without running the manager again.
+        fs::remove_file(&argv).unwrap();
+        assert_eq!(
+            install_muse_with(&muse, &config, false, INSTALL_TIMEOUT).unwrap(),
+            "unchanged"
+        );
+        assert!(!argv.exists());
+        // A manager that claims success without writing the managed skill is not believed.
+        fs::write(config.join("skills/agentctl/SKILL.md"), "owner edits").unwrap();
+        let liar = executable(
+            &scratch.0.join("muse-liar"),
+            &format!("printf '%s\\n' \"$@\" > '{}'\n{receipt}", argv.display()),
+        );
+        let error = install_muse_with(&liar, &config, true, INSTALL_TIMEOUT).unwrap_err();
+        assert!(fs::read_to_string(&argv)
+            .unwrap()
+            .lines()
+            .any(|line| line == "--force"));
+        assert!(
+            error
+                .to_string()
+                .contains("refusing to overwrite divergent skill"),
+            "{error}"
+        );
+        fs::remove_file(config.join("skills/agentctl/SKILL.md")).unwrap();
+        assert_eq!(
+            install_muse_with(&liar, &config, false, INSTALL_TIMEOUT)
+                .unwrap_err()
+                .to_string(),
+            "Muse reported installation without the expected managed skill"
+        );
+    }
+
+    #[test]
+    fn symlinked_or_non_directory_destinations_are_refused_before_any_write() {
+        let scratch = Scratch::new();
+        let real = scratch.0.join("real");
+        fs::create_dir(&real).unwrap();
+        let link = scratch.0.join("link");
+        symlink(&real, &link).unwrap();
+        for force in [false, true] {
+            assert_eq!(
+                write_direct(&link.join("agentctl/SKILL.md"), force)
+                    .unwrap_err()
+                    .to_string(),
+                format!(
+                    "refusing non-directory skill destination: {}",
+                    link.display()
+                )
+            );
+        }
+        assert!(!real.join("agentctl").exists());
+
+        let directory = scratch.0.join("skills/agentctl");
+        ensure_real_directory(&directory).unwrap();
+        let target = scratch.0.join("elsewhere.md");
+        fs::write(&target, "owner content").unwrap();
+        let skill = directory.join("SKILL.md");
+        symlink(&target, &skill).unwrap();
+        for force in [false, true] {
+            assert_eq!(
+                write_direct(&skill, force).unwrap_err().to_string(),
+                format!("refusing non-regular skill file: {}", skill.display())
+            );
+        }
+        assert_eq!(fs::read_to_string(&target).unwrap(), "owner content");
+
+        let file = scratch.0.join("file");
+        fs::write(&file, "x").unwrap();
+        assert_eq!(
+            write_direct(&file.join("agentctl/SKILL.md"), false)
+                .unwrap_err()
+                .to_string(),
+            format!(
+                "refusing non-directory skill destination: {}",
+                file.display()
+            )
+        );
+        assert_eq!(
+            ensure_real_directory(Path::new("relative/skills"))
+                .unwrap_err()
+                .to_string(),
+            "skill destination must be absolute: relative/skills"
+        );
+
+        // Muse: a symlinked skill directory is refused before the native manager runs.
+        let config = scratch.0.join("muse-config/muse");
+        ensure_real_directory(&config.join("skills")).unwrap();
+        symlink(&real, config.join("skills/agentctl")).unwrap();
+        let ran = scratch.0.join("ran");
+        let muse = executable(
+            &scratch.0.join("muse"),
+            &format!("touch '{}'", ran.display()),
+        );
+        assert_eq!(
+            install_muse_with(&muse, &config, true, INSTALL_TIMEOUT)
+                .unwrap_err()
+                .to_string(),
+            format!(
+                "refusing non-directory skill destination: {}",
+                config.join("skills/agentctl").display()
+            )
+        );
+        assert!(!ran.exists());
+    }
+
+    #[test]
+    fn direct_install_is_idempotent_and_replaces_divergent_content_atomically() {
+        let scratch = Scratch::new();
+        let path = scratch.0.join("skills/agentctl/SKILL.md");
+        assert_eq!(write_direct(&path, false).unwrap(), "installed");
+        assert_eq!(fs::read(&path).unwrap(), crate::AGENTCTL_SKILL.as_bytes());
+        assert_eq!(fs::metadata(&path).unwrap().mode() & 0o777, 0o600);
+        for created in [scratch.0.join("skills"), scratch.0.join("skills/agentctl")] {
+            assert_eq!(fs::metadata(&created).unwrap().mode() & 0o777, 0o700);
+        }
+        assert_eq!(write_direct(&path, false).unwrap(), "unchanged");
+
+        fs::write(&path, "owner edits").unwrap();
+        assert_eq!(
+            write_direct(&path, false).unwrap_err().to_string(),
+            format!(
+                "refusing to overwrite divergent skill {}; inspect it or pass --force",
+                path.display()
+            )
+        );
+        assert_eq!(fs::read_to_string(&path).unwrap(), "owner edits");
+
+        // --force installs a complete new file by rename: a hard link to the replaced inode
+        // still holds the old bytes, and no temporary file is left behind.
+        let kept = scratch.0.join("kept");
+        fs::hard_link(&path, &kept).unwrap();
+        let replaced_inode = fs::metadata(&path).unwrap().ino();
+        assert_eq!(write_direct(&path, true).unwrap(), "installed");
+        assert_eq!(fs::read(&path).unwrap(), crate::AGENTCTL_SKILL.as_bytes());
+        assert_ne!(fs::metadata(&path).unwrap().ino(), replaced_inode);
+        assert_eq!(fs::read_to_string(&kept).unwrap(), "owner edits");
+        let names: Vec<_> = fs::read_dir(path.parent().unwrap())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert_eq!(names, ["SKILL.md"]);
+    }
+
+    #[test]
+    fn unsupported_harnesses_are_refused_together_before_any_install() {
+        let error = install(
+            &[
+                "zeta".to_owned(),
+                "codex".to_owned(),
+                "alpha".to_owned(),
+                "zeta".to_owned(),
+            ],
+            false,
+        )
+        .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "unsupported skill harnesses: alpha, zeta"
+        );
+    }
 }
