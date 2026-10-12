@@ -24,10 +24,9 @@ cargo install herdr-run
 cargo install agentctl
 ```
 
-`herdr-run` has a Python edition (`py/herdr_run`) that behaves identically, byte for byte;
-`python3 cross/differential.py --tool herdr-run` and the golden corpora under
-`rs/herdr-run/testdata/`, which both editions' unit tests load, hold the two together. The crate
-reads its configuration with its own YAML-subset parser and has no YAML dependency.
+`herdr-run` reads `.herdr-run.yaml` with its own YAML-subset parser and depends on no YAML
+library. The golden corpora under `rs/herdr-run/testdata/` pin its text, configuration, policy,
+protocol, readiness, and run-record behaviour, and its unit tests load every one of them.
 
 The two chat-subscription libraries are ordinary Cargo dependencies for provider
 and host implementations; they do not install command-line programs.

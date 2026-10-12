@@ -199,8 +199,8 @@ pub fn number_text(value: f64) -> String {
 ///
 /// Returns `(negative, digits, exponent)` with `value == ±0.d1d2d3… × 10^(exponent + 1)`. When
 /// several digit strings of the shortest length read back as `value`, the one nearest to it is
-/// chosen, and an exact tie goes to the even last digit: the rule Python's `repr` follows, so
-/// `2**-25` is `2.9802322387695312e-08` in both editions. The standard library's `{}` and `{:e}`
+/// chosen, and an exact tie goes to the even last digit: the rule the other edition's float text
+/// follows, so `2**-25` is `2.9802322387695312e-08` in both editions. The standard library's `{}` and `{:e}`
 /// break that tie upwards instead, which is why they are not used here. `value` must be finite.
 #[must_use]
 pub fn shortest_digits(value: f64) -> (bool, String, i32) {

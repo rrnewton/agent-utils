@@ -156,9 +156,9 @@ type Parsed<T> = std::result::Result<T, ParseFailure>;
 ///
 /// Called by the executable before [`main`]; tests that drive [`main`] in-process do not call it.
 ///
-/// * SIGXFSZ is ignored, as CPython ignores it at start-up: a write past `RLIMIT_FSIZE` then fails
-///   with EFBIG and is reported as `cannot write stdout: File too large (os error 27)` instead of
-///   killing the process. Children get the default action back in
+/// * SIGXFSZ is ignored, as the other edition's runtime ignores it: a write past `RLIMIT_FSIZE`
+///   then fails with EFBIG and is reported as `cannot write stdout: File too large (os error 27)`
+///   instead of killing the process. Children get the default action back in
 ///   [`crate::client::bounded_output`].
 /// * Every descriptor above 2 inherited from the caller is marked close-on-exec, so no child
 ///   inherits it, just as the other edition's children (started with `close_fds`) do not. Every
