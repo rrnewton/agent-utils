@@ -1253,6 +1253,68 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn the_fake_bookmark_agrees_with_a_one_slot_model_under_random_writes() {
+        // `#240 reading-bookmark`. The property test `sqlite.rs` runs against a real file, run against
+        // the fake, so the two cannot drift apart: random set, conditional set (with the revision
+        // held, and with a stale one) and clear, across two channels, against one optional anchor
+        // and one number per channel.
+        use super::super::{BookmarkAnchor, BookmarkPlace};
+        let store = FakeStore::new();
+        let channels = [
+            ChannelId("1111111111".to_owned()),
+            ChannelId("2222222222".to_owned()),
+        ];
+        let mut model: [(i64, Option<BookmarkAnchor>); 2] = [(0, None), (0, None)];
+        let mut seed: u64 = 240;
+        let mut below = |n: u64| {
+            seed = seed
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            (seed >> 33) % n
+        };
+        for step in 0..400 {
+            let which = usize::try_from(below(2)).expect("small");
+            let (held_revision, held_anchor) = model[which].clone();
+            let anchor = (below(4) != 0).then(|| BookmarkAnchor {
+                message_id: MessageId(format!("10000000000000{:05}", below(6))),
+                place: if below(3) == 0 {
+                    BookmarkPlace::Below
+                } else {
+                    BookmarkPlace::Above
+                },
+                timestamp: "2026-10-12T12:00:00Z".to_owned(),
+                thread_id: None,
+            });
+            let condition = match below(3) {
+                0 => None,
+                1 => Some(held_revision),
+                _ => Some(held_revision - 1),
+            };
+            let change = store
+                .set_bookmark(&channels[which], anchor.as_ref(), condition)
+                .await
+                .expect("write");
+            let refused = condition.is_some_and(|c| c != held_revision);
+            assert_eq!(change.applied, !refused, "step {step}");
+            if !refused && anchor != held_anchor {
+                assert!(change.changed, "step {step}");
+                assert!(change.bookmark.revision > held_revision, "step {step}");
+                model[which] = (change.bookmark.revision, anchor);
+            } else {
+                assert!(!change.changed, "step {step}");
+            }
+            for (at, channel) in channels.iter().enumerate() {
+                let read = store.bookmark(channel).await.expect("read");
+                assert_eq!(
+                    (read.revision, read.anchor),
+                    model[at].clone(),
+                    "step {step}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn the_fake_pins_bounds_and_refuses_exactly_as_the_real_store_does() {
         // Parity again: every page-facing test of `#206 pin-message` runs against this store.
         let store = FakeStore::new();
