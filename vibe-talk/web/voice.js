@@ -16028,14 +16028,16 @@ function renderOutgoingMessages() {
     const meta = document.createElement("div");
     meta.className = "meta";
     meta.textContent = entry.replyTo ? "You · Reply" : "You";
-    // Never for the scope: a reply in a single-conversation channel is on Main already.
-    if (entry.threadId && channelView !== "thread" && entry.threadId !== channelCanon.scope) {
+    // Never for the scope: a reply in a single-conversation channel is on Main already. The thread
+    // a long post continued in counts too (`#263 post-split-per-provider`).
+    const placedIn = entry.threadId || entry.continueIn;
+    if (placedIn && channelView !== "thread" && placedIn !== channelCanon.scope) {
       const thread = document.createElement("button");
       thread.className = "thread-badge";
       thread.setAttribute("type", "button");
-      thread.style.setProperty("--thread-hue", threadHue(entry.threadId));
+      thread.style.setProperty("--thread-hue", threadHue(placedIn));
       thread.textContent = "Thread";
-      thread.addEventListener("click", inThisColumn(guardQuietly(() => openThread(entry.threadId))));
+      thread.addEventListener("click", inThisColumn(guardQuietly(() => openThread(placedIn))));
       meta.append(thread);
     }
     const body = document.createElement("div");
@@ -16397,6 +16399,9 @@ async function dispatchOutgoingMessage(entry, job, placing = null) {
     entry.parts = parts.map((part) => ({
       ...part, id: String(part.id), channel_id: entry.channel, content: String(part.content || ""),
     }));
+    // `#263 post-split-per-provider`. The rest of a long post may have continued in its first
+    // part's thread, where it is drawn rather than here; the receipt for it says which thread.
+    if (!entry.threadId) entry.continueIn = entry.parts.slice(1).map(threadOf).find(Boolean) || entry.continueIn;
     const observed = outgoingObservations.get(entry.id) || new Set();
     entry.observedParts = entry.parts.filter((part) => observed.has(part.id)).map((part) => part.id);
     outgoingObservations.set(entry.id, new Set(entry.observedParts));

@@ -31960,6 +31960,44 @@ test("the rest of a post cut in parts goes into the thread the server names, wit
   assert.equal(savedOutgoing(unposted)[0].continueIn, null, "nothing posted, yet the destination moved");
 });
 
+test("a long post continued in its first part's thread leaves a receipt that names the thread", async () => {
+  // `#263 post-split-per-provider`. The first part is drawn here; the rest is drawn in its thread,
+  // not here, so its receipt carries the Thread tag that opens it, as a reply placed in a thread does.
+  const page = newPage();
+  page.threadingSupported = true;
+  page.threads = [];
+  await signIn(page);
+  await showDiscord(page, []);
+  await pickThread(page, "main");
+  const thread = (isRoot) => ({
+    id: "t_first", root_message_id: isRoot ? "9194000000000000001" : null, is_root: isRoot,
+    reply_count: null, reply_count_exact: false,
+  });
+  const first = message({ id: "9194000000000000001", content: "the first part. ", thread: thread(true) });
+  const rest = message({ id: "9194000000000000002", content: "the second part", thread: thread(false) });
+  page.replyResponse = async () => json(200, { posted: first, parts: [first, rest] });
+  await sendChannel(page, "the first part. the second part");
+  assert.ok(shownIds(page).includes("9194000000000000001"), "the first part is not drawn in the channel");
+  assert.ok(!shownIds(page).includes("9194000000000000002"), "a part in the thread was drawn in the channel");
+  const receipt = outgoingRows(page)[0];
+  assert.ok(receipt, "nothing says the rest was sent");
+  assert.match(receipt.text(), /the second part/);
+  assert.match(receipt.text(), /Sent\./);
+  assert.equal(threadBadge(receipt)?.textContent, "Thread", "the receipt does not say which thread the rest is in");
+
+  // All draws every part where it is, so there is nothing left for a receipt to stand in for.
+  const all = newPage();
+  all.threadingSupported = true;
+  all.threads = [];
+  await signIn(all);
+  await showDiscord(all, []);
+  assert.equal(all.el("thread-select").value, "flat", "All is not what this test assumes");
+  all.replyResponse = async () => json(200, { posted: first, parts: [first, rest] });
+  await sendChannel(all, "the first part. the second part");
+  assert.deepStrictEqual(shownIds(all).slice(-2), ["9194000000000000001", "9194000000000000002"]);
+  assert.equal(outgoingRows(all).length, 0, "a receipt stayed for parts drawn in All");
+});
+
 test("a remainder the server cannot resend as the same request waits for the reader and promises nothing", async () => {
   // The server says `resumable: false` where sending the unsent text again would not repeat the
   // part that failed under its own words and key — a code block cut across it, say. The provider
