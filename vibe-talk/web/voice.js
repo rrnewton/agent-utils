@@ -4143,6 +4143,10 @@ function onComposerKey(event, send) {
 // save and exit settings, though I think the saving is implicit." And of the keymap proposed after a
 // study of how other chat clients do it: "go ahead and implement the keyboard shortcuts on desktop."
 //
+// `#248 composer-key` gave Ctrl+S (Cmd+S) to the message box, at the owner's later word: "When I'm
+// using keyboard, I want to jump to text entry and start typing. Google chat uses Cmd-s for that and
+// I'm ok with that." The search keeps "/" and its glass. See `writeFromKeyboard`.
+//
 // WHY THE SCROLL KEYS DID NOTHING. A browser scrolls with PgUp, PgDn, Space, Home, End and the arrows
 // by scrolling the box that holds the focus (with nothing focused, the box the last click landed in)
 // and, failing both, the DOCUMENT. This page's document never scrolls: the frame is a fixed grid and
@@ -4182,7 +4186,7 @@ function onComposerKey(event, send) {
 //     when they want the search, Settings or the ends of the list. Nothing fires while an input method
 //     composes, and a phone keyboard, which reports keyCode 229 and types only into fields, never
 //     reaches the table. A chord takes Ctrl or Cmd on every platform (the owner asked for Ctrl+S on
-//     his Mac), except in a text field on a Mac, where Ctrl and a letter macOS edits text with
+//     his Mac, then for the search and now for the message box), except in a text field on a Mac, where Ctrl and a letter macOS edits text with
 //     (Ctrl+K, Ctrl+A, Ctrl+E and the rest) is the field's: there the page's chord is Cmd only
 //     (`macFieldEditKey`).
 //   * Those character keys can all be turned off in Settings, "Single-key shortcuts", on by default:
@@ -4251,6 +4255,9 @@ function pressedBySpace(node) {
   const tag = String((node && node.tagName) || "").toUpperCase();
   return ["BUTTON", "INPUT", "SELECT", "TEXTAREA", "SUMMARY"].includes(tag);
 }
+
+/** A link: Ctrl+Enter (Cmd+Enter) on one is the browser's, which opens it in a new tab. */
+const isLink = (node) => String((node && node.tagName) || "").toUpperCase() === "A";
 
 /** The controls an Enter presses or follows: on one of them Enter is its own, not the row's. */
 function answersEnter(node) {
@@ -5360,6 +5367,24 @@ function composeFromKeyboard() {
   return true;
 }
 
+/**
+ * Ctrl+S (Cmd+S), and Ctrl+Enter (Cmd+Enter) outside a text box: the message box, ready to type in,
+ * from anywhere. `#248 composer-key`. The owner: "When I'm using keyboard, I want to jump to text
+ * entry and start typing. Google chat uses Cmd-s for that and I'm ok with that. Or maybe Cmd-enter
+ * could jump to it if it's not highlighted (or send message if it is highlighted with non-zero chars
+ * in it)."
+ *
+ * The box is the one c chooses (`composeFromKeyboard`): the channel's, the thread's the reader is in
+ * (on the right, in two columns, when the keys are there), or the reply's on Reply. Settings and Help
+ * are left first, as their Back leaves them, because the box is on the screen they cover. The call's
+ * view has no box this reaches yet, so there the chord does nothing. Returns whether it did anything;
+ * the bindings that call it keep the browser's own default for the chord shut either way.
+ */
+function writeFromKeyboard() {
+  if (currentScreen === "settings" || currentScreen === "help") closeSettings();
+  return composeFromKeyboard();
+}
+
 /** ↑ in the box of the channel while it is empty: the newest message selected, as a preference of Slack has it. */
 function newestFromComposer(target) {
   // The box of the column the key is in: the thread's on the right, in two columns. `#229`.
@@ -5429,7 +5454,8 @@ function channelPicked() {
 // --- search, Settings, help and Escape
 
 /**
- * "/" and Ctrl+S (Cmd+S): the search, with its field ready to type in. Settings and Help are left
+ * "/": the search, with its field ready to type in. It was Ctrl+S (Cmd+S) as well until `#248
+ * composer-key` gave that chord to the message box; the glass over the list is the other way in. Settings and Help are left
  * first, as their Back button leaves them: the search is over the list they cover. Anywhere else off
  * the main screen there is nothing to search, and nothing happens. Pressed again while the search is
  * open, the field takes the focus back with its text selected, ready to be typed over. Returns whether
@@ -5584,7 +5610,7 @@ const MAC_FIELD_EDIT_LETTERS = "abdefhklnoptvy";
  * of `MAC_FIELD_EDIT_LETTERS`, without Cmd. Such a key is the field's, never a chord of the page, so
  * in a message box on a Mac Ctrl+K deletes to the end of the line as it does everywhere else there,
  * and Cmd+K is the channel picker. Off the field, and on other keyboards, Ctrl works as Cmd does.
- * Ctrl+S is not one of them, and stays the search the owner asked for on his Mac.
+ * Ctrl+S is not one of them, and goes to the message box on a Mac as it does everywhere else.
  */
 function macFieldEditKey(event, target) {
   if (!event.ctrlKey || event.metaKey || !isTextField(target) || !appleKeyboard()) return false;
@@ -5610,10 +5636,12 @@ function macFieldEditKey(event, target) {
  * @typedef {object} KeyBinding
  * @property {string} group Which part of the list of keys it is in.
  * @property {KeyChord[]} chords
- * @property {string} does What it does, as the list of keys says it.
+ * @property {string | (() => string)} does What it does, as the list of keys says it: asked each time
+ *   the list is drawn where it names a chord, so that the chord is in the words on the reader's keyboard.
  * @property {"browser" | "box"} [by] Answered by the browser's own scrolling, or by the own handler
  *   of a message box (`onComposerKey`), rather than by `run`: listed so the list is whole.
- * @property {boolean} [repeats] A held key repeats it. Only the keys that move.
+ * @property {boolean} [repeats] A held key repeats it. Only the keys that move, and a chord whose `run`
+ *   keeps the default of the browser shut on every repeat of a held key (Ctrl+S, the Save page).
  * @property {boolean} [inField] Fires in a text field too, where `run` decides for itself.
  * @property {string[]} [controls] Ids of the buttons of the page this key presses, for `aria-keyshortcuts`.
  * @property {string[]} [rowControls] Classes of the buttons of a row this key presses, the same.
@@ -5659,11 +5687,13 @@ const KEYMAP = [
     run: (event, target) => jumpList(target, event.key === "End"),
   },
   {
-    group: KEYS_PAGE, chords: [{ key: "/" }, { key: "s", mod: true }],
-    does: "Search the messages; pressed again, back to what you typed",
+    group: KEYS_PAGE, chords: [{ key: "/" }],
+    // `#248 composer-key`. Ctrl+S was the search's too, from `#224 keyboard-shortcuts`; it is the
+    // message box's now, and the list of keys says so, for a reader whose hands still reach for it.
+    does: () => `Search the messages; pressed again, back to what you typed. ${modKeyName()}+S, which searched ` +
+      "until now, goes to the message box",
     controls: ["search-toggle"],
-    // The chord is the Save page of the browser as well, which must never open over this one.
-    run: (event) => searchFromKeyboard() || modHeld(event),
+    run: () => searchFromKeyboard(),
   },
   {
     group: KEYS_PAGE, chords: [{ key: "," }, { key: ",", mod: true }],
@@ -5830,16 +5860,32 @@ const KEYMAP = [
   {
     group: KEYS_WRITING, chords: [{ key: "c" }],
     does: "Write to the channel, or in the thread you are in; on Reply, the reply",
-    controls: ["channel-compose-text"],
+    controls: ["channel-compose-text", "reply-text"],
     run: () => composeFromKeyboard(),
+  },
+  {
+    group: KEYS_WRITING, chords: [{ key: "s", mod: true }],
+    does: "The message box c goes to, from anywhere: typing in the search, on Settings or on Help too. " +
+      "Never the Save page of the browser",
+    controls: ["channel-compose-text", "reply-text"],
+    // Repeats so that a held chord's repeats are taken as well: each is the browser's Save page too.
+    // The box is focused once.
+    repeats: true,
+    run: (event) => {
+      if (!event.repeat) writeFromKeyboard();
+      return true;
+    },
   },
   {
     group: KEYS_WRITING, by: "box", chords: [{ key: "Enter" }, { key: "Enter", shift: true }],
     does: "In a message box: send, or a new line. Which is which is Enter to send in Settings",
   },
   {
-    group: KEYS_WRITING, by: "box", chords: [{ key: "Enter", mod: true }],
-    does: "In a message box: send, whatever Enter does",
+    group: KEYS_WRITING, chords: [{ key: "Enter", mod: true }],
+    does: () => `In a message box: send, whatever Enter does. Anywhere else, the message box, as ${modKeyName()}+S does`,
+    // In a message box the box's own handler sends (`onComposerKey`) and the key never gets here. In
+    // another field it is that field's, and on a link it is the browser's (open it in a new tab).
+    run: (event, target) => !isTextField(target) && !isLink(target) && writeFromKeyboard(),
   },
   {
     group: KEYS_WRITING, chords: [{ key: "ArrowUp" }], inField: true,
@@ -6044,7 +6090,7 @@ function renderKeyHints() {
       const keys = document.createElement("kbd");
       keys.textContent = bindingWords(one);
       const meaning = document.createElement("span");
-      meaning.textContent = one.does;
+      meaning.textContent = typeof one.does === "function" ? one.does() : one.does;
       row.append(keys, meaning);
       list.append(row);
     }

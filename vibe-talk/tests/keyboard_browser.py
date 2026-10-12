@@ -3,7 +3,7 @@
 
 `#224 keyboard-shortcuts`. The owner, in the installed app on a Mac desk: PgUp, PgDn, Home and End did
 nothing, though the page is "basically a website", and he wanted "/" and Ctrl+S for the search and a
-key for Settings and back out of it. The cause was where the focus was, not a key being eaten: a
+key for Settings and back out of it (`#248 composer-key` later gave Ctrl+S to the message box). The cause was where the focus was, not a key being eaten: a
 browser scrolls the box holding the focus, or else the document, and this page's document never
 scrolls: its lists scroll inside a fixed frame and none of them could hold the focus. The fake-DOM
 suite pins where the page puts the focus after each thing a reader does; what it cannot do is watch
@@ -15,7 +15,9 @@ under a person's fingers, and measures the list that is on screen:
   put it on load, PgUp, PgDn, Space, Shift+Space, Home and End each move the channel's list the way
   they say -> a click on the view switch and back, then the same keys again, and Space scrolls rather
   than pressing the switch -> "/" opens the search with its field focused, Escape closes it and the
-  list has the focus again; Ctrl+S does the same, and the browser's own Save page is refused ->
+  list has the focus again -> `#248 composer-key`: Ctrl+S goes to the message box from the list,
+  from the search field while typing in it, and from Settings, the browser's own Save page refused
+  every time, and Ctrl+Enter off any box goes there too ->
   "," opens Settings with its screen focused, PgDn scrolls Settings, Escape returns to the list
   where the reader was; Ctrl+, does the same -> in the channel's message box, PgUp pages the list
   while the box keeps the focus and the draft, Home and End move the caret, and Ctrl+Home and
@@ -475,23 +477,49 @@ def scroll_keys(walk: Walk, where: str) -> None:
 
 
 def search_keys(walk: Walk) -> None:
-    """"/" and Ctrl+S open the search with its field focused; Escape closes it and hands the list the focus."""
-    for chord in ("/", "Control+s"):
-        opened = walk.key(chord)
-        check(opened["search"] is True, f"{chord!r} did not open the search: {opened}")
-        check(opened["focus"] == "search-field", f"{chord!r} left the focus on {opened['focus']!r}, not the search field")
-        if chord != "/":
-            last = walk.last_key()
-            check(last["prevented"] is True, f"{chord!r} was left to the browser, whose Save page it opens: {last}")
-        walk.shot(f"search-{'slash' if chord == '/' else 'ctrl-s'}")
-        press(walk.cdp, "d")
-        press(walk.cdp, "e")
-        typed = walk.page.evaluate("() => document.getElementById('search-field').value")
-        check(typed == "de", f"after {chord!r} the search field did not take the typing: {typed!r}")
-        closed = walk.key("Escape")
-        check(closed["search"] is False, f"Escape did not close the search: {closed}")
-        check(on_list(closed), f"after Escape the focus is on {closed['focus']!r}, not the list")
-    walk.notes.append('"/" and Ctrl+S opened the search with the field focused (Save page refused), Escape closed it')
+    """"/" opens the search with its field focused; Escape closes it and hands the list the focus."""
+    opened = walk.key("/")
+    check(opened["search"] is True, f"'/' did not open the search: {opened}")
+    check(opened["focus"] == "search-field", f"'/' left the focus on {opened['focus']!r}, not the search field")
+    walk.shot("search-slash")
+    press(walk.cdp, "d")
+    press(walk.cdp, "e")
+    typed = walk.page.evaluate("() => document.getElementById('search-field').value")
+    check(typed == "de", f"after '/' the search field did not take the typing: {typed!r}")
+    closed = walk.key("Escape")
+    check(closed["search"] is False, f"Escape did not close the search: {closed}")
+    check(on_list(closed), f"after Escape the focus is on {closed['focus']!r}, not the list")
+    walk.notes.append('"/" opened the search with the field focused, Escape closed it')
+
+
+def write_keys(walk: Walk) -> None:
+    """`#248 composer-key`: Ctrl+S, and Ctrl+Enter off any box, go to the message box; Save page refused."""
+
+    def to_box(chord: str, where: str) -> None:
+        state = walk.key(chord)
+        last = walk.last_key()
+        check(last["prevented"] is True, f"{chord} {where} was left to the browser, whose Save page it opens: {last}")
+        check(state["screen"] == "main", f"{chord} {where} left the reader on {state['screen']!r}")
+        check(state["focus"] == "channel-compose-text", f"{chord} {where} left the focus on {state['focus']!r}")
+        left = walk.key("Escape")
+        check(on_list(left), f"Escape from the empty box after {chord} {where} left the focus on {left['focus']!r}")
+
+    to_box("Control+s", "from the list")
+    opened = walk.key("/")
+    check(opened["focus"] == "search-field", f"'/' left the focus on {opened['focus']!r}")
+    press(walk.cdp, "x")
+    state = walk.key("Control+s")
+    check(walk.last_key()["prevented"] is True, "Ctrl+S in the search field reached the browser's Save page")
+    check(state["focus"] == "channel-compose-text", f"Ctrl+S in the search field left the focus on {state['focus']!r}")
+    walk.shot("ctrl-s-from-search")
+    walk.page.focus("#search-field")
+    walk.key("Escape")
+    walk.key(",")
+    check(walk.state()["screen"] == "settings", "',' did not open Settings")
+    to_box("Control+s", "from Settings")
+    to_box("Control+Enter", "from the list")
+    walk.notes.append("Ctrl+S went to the message box from the list, the search field and Settings, and Ctrl+Enter "
+                      "from the list, the Save page refused each time")
 
 
 def settings_keys(walk: Walk) -> None:
@@ -1023,6 +1051,7 @@ def main() -> int:
             scroll_keys(walk, "after a view switch")
 
             search_keys(walk)
+            write_keys(walk)
             settings_keys(walk)
             composer_keys(walk)
             keymap_keys(walk, api)

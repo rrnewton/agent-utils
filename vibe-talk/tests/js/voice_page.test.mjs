@@ -18019,7 +18019,8 @@ test("the field states its own layout rule: the size iOS will not zoom", () => {
 // --- the keyboard (#224 keyboard-shortcuts) -------------------------------------------------------
 //
 // The owner, in the installed app on a Mac desk: PgUp, PgDn, Home and End did nothing, and he wanted
-// "/" and Ctrl+S for the search, and a key for Settings and back out of it. The browser does the
+// "/" and Ctrl+S for the search (Ctrl+S is the message box's since `#248 composer-key`), and a key for
+// Settings and back out of it. The browser does the
 // scrolling: what the page owes it is a list holding the focus, so these check WHERE THE FOCUS IS
 // after each thing a reader does, and that a scroll key is left to the browser (not prevented) or,
 // in the two cases the browser would misuse it, handled here. tests/keyboard_browser.py presses the
@@ -18305,63 +18306,138 @@ test("IN THE CALL'S BOX AND THE REPLY BOX a page key pages the list beside them"
   assert.equal(focused(reply), reply.el("reply-text"), "PageUp took the reader out of the reply box");
 });
 
-test("/ AND Ctrl+S OPEN THE SEARCH with its field ready; pressed again, the field is focused with its text selected", async () => {
-  for (const [key, fields] of [["/", {}], ["s", { ctrlKey: true }], ["s", { metaKey: true }], ["S", { ctrlKey: true }],
-    // A layout that types no Latin letter there: the key's place says which it is.
-    ["ы", { ctrlKey: true, code: "KeyS" }]]) {
-    const page = await keyboardPage();
-    const what = `${Object.keys(fields).filter((f) => fields[f] === true).join("+")}${key}`;
-    const event = await press(page, page.el("scroll-area"), key, fields);
-    assert.equal(event.defaulted, false, `${what} was left to the browser — Ctrl+S is its Save page`);
-    assert.equal(page.el("search-field").hidden, false, `${what} did not open the search`);
-    assert.equal(focused(page), page.el("search-field"), `${what} left the focus on ${focusName(page)}`);
-    await page.el("search-field").setValue("deploy");
-    // Again, from the list: the field again, its text selected to be typed over.
-    const selected = page.el("search-field").selectedTimes || 0;
-    const again = await press(page, page.el("scroll-area"), key, fields);
-    assert.equal(again.defaulted, false);
-    assert.equal(page.el("search-field").hidden, false, `${what} again closed the search`);
-    assert.equal(page.el("search-field").value, "deploy", `${what} again lost the search text`);
-    assert.equal(focused(page), page.el("search-field"), `${what} again left the focus on ${focusName(page)}`);
-    assert.equal(page.el("search-field").selectedTimes, selected + 1, `${what} again did not select the text`);
-  }
-  // In the field itself "/" is a character, and Ctrl+S still selects.
+test("/ OPENS THE SEARCH with its field ready; pressed again, the field is focused with its text selected", async () => {
   const page = await keyboardPage();
-  await press(page, null, "/");
-  let event = await press(page, page.el("search-field"), "/");
-  assert.equal(event.defaulted, true, "\"/\" typed in the search field was taken from it");
-  event = await press(page, page.el("search-field"), "s", { ctrlKey: true });
-  assert.equal(event.defaulted, false, "Ctrl+S in the search field was left to the browser");
-  // From a message box, while typing: Ctrl+S opens it; "/" is a character.
+  const event = await press(page, page.el("scroll-area"), "/");
+  assert.equal(event.defaulted, false, "/ was left to the browser");
+  assert.equal(page.el("search-field").hidden, false, "/ did not open the search");
+  assert.equal(focused(page), page.el("search-field"), `/ left the focus on ${focusName(page)}`);
+  await page.el("search-field").setValue("deploy");
+  // Again, from the list: the field again, its text selected to be typed over.
+  const selected = page.el("search-field").selectedTimes || 0;
+  const again = await press(page, page.el("scroll-area"), "/");
+  assert.equal(again.defaulted, false);
+  assert.equal(page.el("search-field").hidden, false, "/ again closed the search");
+  assert.equal(page.el("search-field").value, "deploy", "/ again lost the search text");
+  assert.equal(focused(page), page.el("search-field"), `/ again left the focus on ${focusName(page)}`);
+  assert.equal(page.el("search-field").selectedTimes, selected + 1, "/ again did not select the text");
+  // In the field itself "/" is a character; from a message box, while typing, it is one as well.
+  const typed = await press(page, page.el("search-field"), "/");
+  assert.equal(typed.defaulted, true, "\"/\" typed in the search field was taken from it");
   const typing = await keyboardPage();
   await typing.el("channel-compose-text").setValue("see the ");
-  event = await press(typing, typing.el("channel-compose-text"), "s", { metaKey: true });
-  assert.equal(event.defaulted, false);
-  assert.equal(typing.el("search-field").hidden, false, "Cmd+S from a message box did not open the search");
-  assert.equal(typing.el("channel-compose-text").value, "see the ", "opening the search touched the draft");
-  // Not with Shift or Alt, and not a bare "s".
-  for (const [key, fields] of [["s", { ctrlKey: true, shiftKey: true }], ["s", { ctrlKey: true, altKey: true }], ["s", {}]]) {
+  const slash = await press(typing, typing.el("channel-compose-text"), "/");
+  assert.equal(slash.defaulted, true, "\"/\" typed in the message box was taken from it");
+  assert.equal(typing.el("search-field").hidden, true, "\"/\" typed in the message box opened the search");
+  // `#248 composer-key`. Ctrl+S and Cmd+S are the message box's now, and never open the search.
+  for (const fields of [{ ctrlKey: true }, { metaKey: true }]) {
     const other = await keyboardPage();
-    event = await press(other, other.el("scroll-area"), key, fields);
-    assert.equal(event.defaulted, true, `${JSON.stringify(fields)} ${key} was taken`);
-    assert.equal(other.el("search-field").hidden, true, `${JSON.stringify(fields)} ${key} opened the search`);
+    await press(other, other.el("scroll-area"), "s", fields);
+    assert.equal(other.el("search-field").hidden, true, `${JSON.stringify(fields)} s opened the search`);
   }
 });
 
-test("Ctrl+S OFF THE MAIN SCREEN: from Settings it goes back and searches; elsewhere it only keeps Save page shut", async () => {
-  const page = await keyboardPage();
-  await page.el("open-settings").click();
-  let event = await press(page, page.el("screen-settings"), "s", { ctrlKey: true });
+test("Ctrl+S AND Cmd+S GO TO THE MESSAGE BOX from the list, the search field and Settings, and the Save page never opens", async () => {
+  // `#248 composer-key`. From the list, by the character and by the place of the key on a layout
+  // that types no Latin letter there, and with Shift's capital.
+  for (const [key, fields] of [["s", { ctrlKey: true }], ["s", { metaKey: true }], ["S", { ctrlKey: true }],
+    ["ы", { ctrlKey: true, code: "KeyS" }]]) {
+    const page = await keyboardPage();
+    const what = `${Object.keys(fields).filter((f) => fields[f] === true).join("+")}+${key}`;
+    const event = await press(page, page.el("scroll-area"), key, fields);
+    assert.equal(event.defaulted, false, `${what} was left to the browser, whose Save page it is`);
+    assert.equal(focused(page), page.el("channel-compose-text"), `${what} left the focus on ${focusName(page)}`);
+    assert.equal(page.el("search-field").hidden, true, `${what} opened the search`);
+  }
+  // From the search field, while typing in it: the box, and the search is left as it was.
+  const searching = await keyboardPage();
+  await press(searching, searching.el("scroll-area"), "/");
+  await searching.el("search-field").setValue("deploy");
+  let event = await press(searching, searching.el("search-field"), "s", { ctrlKey: true });
+  assert.equal(event.defaulted, false, "Ctrl+S in the search field was left to the browser's Save page");
+  assert.equal(focused(searching), searching.el("channel-compose-text"),
+    `Ctrl+S in the search field left the focus on ${focusName(searching)}`);
+  assert.equal(searching.el("search-field").value, "deploy", "going to the box threw the search away");
+  // From a message box it stays there, the draft untouched; a held chord's repeats are taken too.
+  await searching.el("channel-compose-text").setValue("see the ");
+  event = await press(searching, searching.el("channel-compose-text"), "s", { metaKey: true });
   assert.equal(event.defaulted, false);
-  assert.equal(page.screen(), "main", "Ctrl+S on Settings did not go back to the list");
-  assert.equal(page.el("search-field").hidden, false, "Ctrl+S on Settings did not open the search");
-  await openReplyOn(page, tallChannel(30), 2);
-  event = await press(page, page.el("reply-text"), "s", { ctrlKey: true });
-  assert.equal(event.defaulted, false, "Ctrl+S on Reply was left to the browser's Save page");
-  assert.equal(page.screen(), "reply", "Ctrl+S left the reply screen");
-  event = await press(page, page.el("reply-scroll"), "/");
+  event = await press(searching, searching.el("channel-compose-text"), "s", { metaKey: true, repeat: true });
+  assert.equal(event.defaulted, false, "a held Cmd+S reached the browser's Save page on its repeat");
+  assert.equal(focused(searching), searching.el("channel-compose-text"));
+  assert.equal(searching.el("channel-compose-text").value, "see the ", "Cmd+S touched the draft");
+  // From Settings, and from Help: back to the list, and the box.
+  for (const screen of ["settings", "help"]) {
+    const page = await keyboardPage();
+    await page.el("open-settings").click();
+    if (screen === "help") await page.el("help-link-keyboard").click();
+    assert.equal(page.screen(), screen);
+    event = await press(page, page.el(`screen-${screen}`), "s", { ctrlKey: true });
+    assert.equal(event.defaulted, false, `Ctrl+S on ${screen} was left to the browser's Save page`);
+    assert.equal(page.screen(), "main", `Ctrl+S on ${screen} did not go back to the list`);
+    assert.equal(focused(page), page.el("channel-compose-text"), `Ctrl+S on ${screen} left the focus on ${focusName(page)}`);
+  }
+  // On Reply, the reply's box, from anywhere on the screen.
+  const reply = await keyboardPage();
+  await openReplyOn(reply, tallChannel(30), 2);
+  event = await press(reply, reply.el("reply-scroll"), "s", { ctrlKey: true });
+  assert.equal(event.defaulted, false);
+  assert.equal(reply.screen(), "reply", "Ctrl+S left the reply screen");
+  assert.equal(focused(reply), reply.el("reply-text"), `Ctrl+S on Reply left the focus on ${focusName(reply)}`);
+  event = await press(reply, reply.el("reply-scroll"), "/");
   assert.equal(event.defaulted, true, "\"/\" on Reply, where there is nothing to search, was taken anyway");
-  assert.equal(page.screen(), "reply", "\"/\" left the reply screen");
+  assert.equal(reply.screen(), "reply", "\"/\" left the reply screen");
+  // On the call's view there is no box it reaches yet: nothing moves, and the Save page stays shut.
+  const call = newPage();
+  await startTalking(call);
+  call.el("scroll-area").focus();
+  event = await press(call, call.el("scroll-area"), "s", { ctrlKey: true });
+  assert.equal(event.defaulted, false, "Ctrl+S on the call's view was left to the browser's Save page");
+  assert.equal(focused(call), call.el("scroll-area"), `Ctrl+S on the call's view moved the focus to ${focusName(call)}`);
+  // Not with Shift's own chord or Alt, and not a bare "s", which reads the selected message aloud.
+  for (const [key, fields] of [["s", { ctrlKey: true, altKey: true }], ["s", {}]]) {
+    const other = await keyboardPage();
+    event = await press(other, other.el("scroll-area"), key, fields);
+    assert.notEqual(focused(other), other.el("channel-compose-text"), `${JSON.stringify(fields)} ${key} went to the box`);
+  }
+});
+
+test("Ctrl+Enter OUTSIDE A BOX goes to the message box; in a box it sends, as it always has", async () => {
+  // `#248 composer-key`. "Or maybe Cmd-enter could jump to it if it's not highlighted (or send message
+  // if it is highlighted with non-zero chars in it)."
+  for (const fields of [{ ctrlKey: true }, { metaKey: true }]) {
+    const page = await keyboardPage();
+    const writes = () => page.requests.filter((request) => !request.startsWith("GET")).length;
+    const sent = writes();
+    const event = await press(page, page.el("scroll-area"), "Enter", fields);
+    assert.equal(event.defaulted, false);
+    assert.equal(focused(page), page.el("channel-compose-text"), `${JSON.stringify(fields)} Enter left the focus on ${focusName(page)}`);
+    assert.equal(writes(), sent, "going to the box wrote something");
+  }
+  // From a selected message: the box, not the message's own Enter (which opens it).
+  const atTop = await keyboardPageAtTop();
+  await press(atTop, atTop.el("scroll-area"), "ArrowDown");
+  const row = channelRow(atTop, "1");
+  const collapsed = row.getAttribute("data-collapsed");
+  await pressHere(atTop, "Enter", { ctrlKey: true });
+  assert.equal(focused(atTop), atTop.el("channel-compose-text"), `Ctrl+Enter on a message left the focus on ${focusName(atTop)}`);
+  assert.equal(channelRow(atTop, "1").getAttribute("data-collapsed"), collapsed, "Ctrl+Enter opened the message as Enter does");
+  // In the reply box it sends; on the reply screen outside it, it goes to it.
+  const reply = await keyboardPage();
+  await openReplyOn(reply, tallChannel(30), 2);
+  let event = await press(reply, reply.el("reply-scroll"), "Enter", { ctrlKey: true });
+  assert.equal(focused(reply), reply.el("reply-text"), `Ctrl+Enter on Reply left the focus on ${focusName(reply)}`);
+  assert.equal(reply.repliesPosted.length, 0, "Ctrl+Enter outside the box sent the reply");
+  await reply.el("reply-text").setValue("on it");
+  event = await press(reply, reply.el("reply-text"), "Enter", { ctrlKey: true });
+  assert.equal(event.defaulted, false);
+  assert.equal(reply.repliesPosted.length, 1, "Ctrl+Enter in the reply box did not send");
+  assert.equal(reply.repliesPosted[0].body.text, "on it");
+  // In another field, the search's, it is the field's: nothing moves.
+  const search = await keyboardPage();
+  await press(search, search.el("scroll-area"), "/");
+  event = await press(search, search.el("search-field"), "Enter", { ctrlKey: true });
+  assert.equal(focused(search), search.el("search-field"), `Ctrl+Enter in the search field moved the focus to ${focusName(search)}`);
 });
 
 test("ESCAPE CLOSES THE SEARCH, clears it, and gives the list back the focus", async () => {
@@ -19414,11 +19490,12 @@ test("ON A MAC, Ctrl+K in a message box is the box's own (delete to the end of t
   assert.equal(event.defaulted, false);
   assert.equal(focused(page), picker, `Ctrl+K on the list on a Mac left the focus on ${focusName(page)}`);
   await press(page, picker, "Escape");
-  // Ctrl+S edits nothing on a Mac, and stays the search the owner asked for, in the box as well.
+  // Ctrl+S edits nothing on a Mac, and is the message box there as everywhere: from the box, the box.
+  // `#248 composer-key`.
   event = await press(page, box, "s", { ctrlKey: true, code: "KeyS" });
   assert.equal(event.defaulted, false, "Ctrl+S in the box on a Mac was left to the browser's Save page");
-  assert.equal(focused(page), page.el("search-field"), `Ctrl+S in the box on a Mac left the focus on ${focusName(page)}`);
-  await press(page, page.el("search-field"), "Escape");
+  assert.equal(focused(page), box, `Ctrl+S in the box on a Mac left the focus on ${focusName(page)}`);
+  assert.equal(box.value, "delete the rest of this line", "Ctrl+S in the box on a Mac touched the draft");
   // Elsewhere Ctrl has no editing keys of its own in a field, and Ctrl+K picks the channel from the box.
   const linux = await keyboardPage("Linux x86_64");
   linux.el("channel-compose-text").focus();
@@ -19532,7 +19609,10 @@ test("THE LIST OF KEYS IS THE KEYMAP: every binding's words and meaning, in the 
       assert.ok(list.includes(words), `${platform}: the list of keys does not name ${words}`);
     }
     assert.ok(!list.includes(`${other}+`), `${platform}: the list of keys names ${other}`);
-    assert.equal(page.el("search-toggle").getAttribute("title"), `Search messages (/ or ${mod}+S)`, platform);
+    // `#248 composer-key`. The chord left the search for the message box, and its tooltip with it.
+    assert.equal(page.el("search-toggle").getAttribute("title"), "Search messages (/)", platform);
+    assert.ok(list.includes(`${mod}+S, which searched until now, goes to the message box`),
+      `${platform}: the list of keys does not say where ${mod}+S went`);
     assert.equal(page.el("open-settings").getAttribute("title"), `Settings (, or ${mod}+,)`, platform);
     assert.equal(page.el("close-settings").getAttribute("title"), "Back (Esc)");
   }
@@ -19544,7 +19624,9 @@ test("aria-keyshortcuts names each control's key, from the same table, and drops
   const page = await keyboardPage();
   const row = page.el("discord-log").children[3];
   const expected = new Map([
-    [page.el("search-toggle"), "/ Control+S Meta+S"],
+    [page.el("search-toggle"), "/"],
+    [page.el("channel-compose-text"), "C Control+S Meta+S"],
+    [page.el("reply-text"), "C Control+S Meta+S"],
     [page.el("open-settings"), ", Control+, Meta+,"],
     [page.el("close-settings"), "Escape"],
     [page.el("thread-back"), "Escape ArrowLeft"],
@@ -19560,7 +19642,8 @@ test("aria-keyshortcuts names each control's key, from the same table, and drops
   }
   await page.el("open-settings").click();
   await page.el("single-keys").setChecked(false);
-  assert.equal(page.el("search-toggle").getAttribute("aria-keyshortcuts"), "Control+S Meta+S");
+  assert.equal(page.el("search-toggle").getAttribute("aria-keyshortcuts"), null, "a search key turned off is still announced");
+  assert.equal(page.el("channel-compose-text").getAttribute("aria-keyshortcuts"), "Control+S Meta+S");
   assert.equal(page.el("todo-filter").getAttribute("aria-keyshortcuts"), null, "a key turned off is still announced");
   assert.equal(doneButton(page.el("discord-log").children[3]).getAttribute("aria-keyshortcuts"), null,
     "a row's Done still announces a key the switch turned off");
@@ -19597,7 +19680,7 @@ test("THE SINGLE-KEY SWITCH turns off every key that types a character, and keep
   event = await pressHere(page, "Enter");
   assert.equal(channelRow(page, "1").getAttribute("data-collapsed"), "false", "with single keys off, Enter stopped opening");
   event = await pressHere(page, "s", { ctrlKey: true });
-  assert.equal(page.el("search-field").hidden, false, "with single keys off, Ctrl+S stopped opening the search");
+  assert.equal(focused(page), page.el("channel-compose-text"), "with single keys off, Ctrl+S stopped going to the message box");
   // Kept across a reload; and absent means on.
   const again = newPage(store);
   assert.equal(again.el("single-keys").checked, false, "a reload turned single keys back on");

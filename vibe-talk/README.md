@@ -3785,7 +3785,7 @@ scrolls from the keyboard the way any web page does:
 | PgUp, PgDn, Space, Shift+Space | Scroll a screenful up or down |
 | Home, End | The top of the list, or its newest message |
 | Ctrl+Home, Ctrl+End (Cmd on a Mac) | The same from anywhere, a message box included |
-| `/` or Ctrl+S (Cmd+S) | Open the search with its field ready; pressed again, back to what you typed |
+| `/` | Open the search with its field ready; pressed again, back to what you typed |
 | `,` or Ctrl+, (Cmd+,) | Settings; pressed again, or Esc, back to where you were |
 | Esc | Closes a menu, the search or a sheet; leaves Settings, Help, Reply, Threads or a thread; never marks anything read |
 
@@ -3801,8 +3801,7 @@ with its own smoothing.
 
 In a message box, Home, End, Space and the arrows are the box's own. PgUp and PgDn page the list
 beside the box while the box keeps the focus and the draft, unless the draft is taller than the box,
-when they page the draft. Ctrl+S is also the browser's "Save page", which the page refuses, so it
-never opens over the app. Every control in Settings keeps its value the moment it changes, so leaving
+when they page the draft. Every control in Settings keeps its value the moment it changes, so leaving
 Settings, with Back or Esc, is all that saving needs. A key that types a character (`/`, `,`) never
 acts while you are typing in a field, and nothing acts while an input method is composing a word.
 
@@ -3841,7 +3840,9 @@ from, so it cannot name a key the page does not answer.
 | Shift+P, Shift+L | The Pinned and Links filters |
 | `;`, `:` | Expand all, Collapse all |
 | `b` or `m` | Back to the bookmark, with the message under it selected |
-| `c` | Write to the channel (or the thread you are in) |
+| `c` | Write to the channel (or the thread you are in); on Reply, the reply |
+| Ctrl+S (Cmd+S) | The same box from anywhere: typing in the search, on Settings or Help too. The browser's "Save page" never opens |
+| Ctrl+Enter (Cmd+Enter) | In a message box, send; anywhere else, the message box, as Ctrl+S |
 | ↑ in the empty message box | Select the newest message |
 | Alt+↓, Alt+↑ (Option on a Mac) | The next or previous channel |
 | Ctrl+K (Cmd+K) | Choose a channel; once chosen, the keys are back on the messages |
@@ -3863,8 +3864,17 @@ still leaves the page.
 Ctrl and Cmd both work for every chord on every platform (the owner asked for Ctrl+S on his Mac),
 with one exception: in a text field on a Mac, Ctrl and a letter that macOS uses for text editing
 (Ctrl+K deletes to the end of the line, Ctrl+A and Ctrl+E go to its ends, and the rest) belong to the
-field. There, Cmd+K chooses a channel. Ctrl+S is not one of those keys, so it opens the search from a
-message box on a Mac too.
+field. There, Cmd+K chooses a channel. Ctrl+S is not one of those keys, so it goes to the message box
+from anywhere on a Mac too.
+
+`#248 composer-key`. Ctrl+S (Cmd+S) opened the search from `#224 keyboard-shortcuts` until the owner
+asked for it to do what it does in other chat clients: "When I'm using keyboard, I want to jump to text
+entry and start typing." It now goes to the box `c` goes to (the channel's, the thread's you are in, or
+the reply's on the Reply screen), from anywhere, including while you are typing in the search, and
+leaves Settings or Help first. The call's view has no box it reaches yet, so there it only keeps the
+browser's "Save page" shut. Ctrl+Enter (Cmd+Enter) does the same when the focus is not in a text box;
+in a message box it sends, as before. The search keeps `/` and the magnifying glass, and the Help list
+says where Ctrl+S went.
 
 ### The reading bookmark
 
