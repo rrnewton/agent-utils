@@ -2522,6 +2522,10 @@ provider = "slack"
         );
         assert!(settings.channel_discovery);
         assert!(!settings.registered_channels_writable);
+        assert!(
+            !settings.upstream_clear,
+            "clearing unread in Slack is off unless the deployment turns it on"
+        );
 
         let providers: Vec<Option<&str>> = cfg
             .channels
@@ -2571,6 +2575,30 @@ provider = "slack"
     }
 
     #[test]
+    fn a_slack_provider_may_opt_in_to_clearing_unread_in_slack() {
+        // `#258 slack-clear-unread`.
+        let text = MULTI.replace(
+            "live_poll_seconds = 15",
+            "live_poll_seconds = 15\nupstream_clear = true",
+        );
+        let cfg = Config::from_toml_and_env(&text, &env(&[])).expect("valid");
+        let ProviderKind::Slack(settings) = &cfg.provider("slack").expect("slack").kind else {
+            panic!("slack is a Slack provider");
+        };
+        assert!(settings.upstream_clear);
+        let router = crate::providers::ChatRouter::from_config(&cfg).expect("clients");
+        assert!(crate::chat::ChatClient::supports_upstream_clear(&router));
+        let wrong = MULTI.replace(
+            "live_poll_seconds = 15",
+            "live_poll_seconds = 15\nupstream_clear = \"yes\"",
+        );
+        assert!(matches!(
+            Config::from_toml_and_env(&wrong, &env(&[])),
+            Err(ConfigError::Parse(_))
+        ));
+    }
+
+    #[test]
     fn provider_mistakes_are_refused_by_name() {
         let invalid = |text: String, wanted: &str| match Config::from_toml_and_env(&text, &env(&[]))
         {
@@ -2617,6 +2645,15 @@ provider = "slack"
             ),
             "providers.gchat.channel_discovery",
         );
+        // A Discord-protocol bridge opts in to clearing with `upstream_read_marks` instead.
+        invalid(
+            MULTI.replace(
+                "thread_api = \"off\"",
+                "thread_api = \"off\"\nupstream_clear = true",
+            ),
+            "providers.gchat.upstream_clear",
+        );
+
         invalid(
             MULTI.replace(
                 "live_poll_seconds = 15",

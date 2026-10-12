@@ -58,7 +58,7 @@ fn the_meta_tail_unit_pins_its_proven_runtime_constraints() {
     );
 }
 
-fn config_text(api_base: &str) -> String {
+fn config_text(api_base: &str, provider_extra: &str) -> String {
     format!(
         r#"
 [auth]
@@ -72,7 +72,7 @@ api_base = "{api_base}"
 token = "{TOKEN}"
 owner_user_id = "UOWNER001"
 registered_channels_writable = true
-
+{provider_extra}
 [[channels]]
 id = "{TEAM}"
 label = "team"
@@ -83,7 +83,12 @@ writable = true
 }
 
 async fn deployment(fake: &Fake) -> AppState {
-    let text = config_text(&fake.base);
+    deployment_with(fake, "").await
+}
+
+/// A deployment whose Slack provider entry carries `provider_extra` lines as well.
+async fn deployment_with(fake: &Fake, provider_extra: &str) -> AppState {
+    let text = config_text(&fake.base, provider_extra);
     let (mut state, _discord, _store) = vibe_talk::testing::state_with_store_from_toml(&text);
     let router = ChatRouter::from_config(&state.config).expect("providers build");
     state.replace_providers(Arc::new(router));
@@ -204,4 +209,28 @@ async fn a_pasted_slack_link_adds_a_channel_through_the_slack_provider() {
     .await;
     assert_eq!(status, StatusCode::OK, "{page}");
     assert!(page.to_string().contains("elsewhere"));
+}
+
+#[tokio::test]
+async fn clearing_unread_in_slack_is_offered_only_when_the_deployment_turns_it_on() {
+    // `#258 slack-clear-unread`.
+    let path = format!("/api/v1/channels/{TEAM}/upstream-clear");
+    let fake = Fake::start(fixture(), 20).await;
+    let state = deployment(&fake).await;
+    let (_, config) = call(&state, "GET", "/api/v1/client-config", None).await;
+    assert!(config.get("upstream_clear_supported").is_none(), "{config}");
+    let (status, refused) = call(&state, "PUT", &path, Some(json!({"mode": "on"}))).await;
+    assert!(status.is_client_error(), "{status} {refused}");
+
+    let fake = Fake::start(fixture(), 20).await;
+    let state = deployment_with(&fake, "upstream_clear = true\n").await;
+    let (_, config) = call(&state, "GET", "/api/v1/client-config", None).await;
+    assert_eq!(config["upstream_clear_supported"], true, "{config}");
+    let (status, view) = call(&state, "PUT", &path, Some(json!({"mode": "dry_run"}))).await;
+    assert_eq!(status, StatusCode::OK, "{view}");
+    // Settings words the control with this: "Clear unread in Slack".
+    assert_eq!(view["provider_name"], "Slack");
+    assert_eq!(view["supported"], true);
+    assert_eq!(view["mode"], "dry_run");
+    assert_eq!(fake.calls("conversations.mark"), 0, "a dry run marks nothing");
 }
