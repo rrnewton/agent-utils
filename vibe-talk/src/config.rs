@@ -490,6 +490,49 @@ pub struct DiscordConfig {
     /// passes that service's text through, and the one difference worth a setting is whether a
     /// single asterisk means bold: it does in Google Chat. See [`crate::render::Markup`].
     pub markup: crate::render::Markup,
+    /// The most characters one post may hold, when the operator has said. `#263
+    /// post-split-per-provider`; see [`DiscordConfig::post_limit`].
+    pub max_post_chars: Option<usize>,
+    /// The most UTF-8 bytes one post may hold, when the operator has said.
+    pub max_post_bytes: Option<usize>,
+}
+
+impl DiscordConfig {
+    /// The most text one post through this provider may carry. `#263 post-split-per-provider`.
+    ///
+    /// Discord itself takes its own 2000 characters, or fewer when configured. A bridge takes
+    /// what the operator said it accepts (`max_post_chars`, `max_post_bytes`), and when the
+    /// operator said nothing, 2000 characters: the most any bridge has been sent since posts were
+    /// first split, so an upgrade never sends a bridge a longer post than it has accepted before.
+    /// A bridge serving Google Chat is held to Google Chat's own
+    /// [`crate::discord::http::GOOGLE_CHAT_MAX_MESSAGE_BYTES`] as well, whatever it was told.
+    #[must_use]
+    pub fn post_limit(&self) -> crate::chat::PostLimit {
+        use crate::discord::http::{DISCORD_MAX_CONTENT_LEN, GOOGLE_CHAT_MAX_MESSAGE_BYTES};
+        let official = is_official_discord_api_base(&self.api_base);
+        let stated = self.max_post_chars.is_some() || self.max_post_bytes.is_some();
+        let max_chars = match self.max_post_chars {
+            Some(max) if official => Some(max.min(DISCORD_MAX_CONTENT_LEN)),
+            Some(max) => Some(max),
+            None if official || !stated => Some(DISCORD_MAX_CONTENT_LEN),
+            None => None,
+        };
+        let max_bytes = if self.markup == crate::render::Markup::GoogleChat {
+            Some(
+                self.max_post_bytes
+                    .map_or(GOOGLE_CHAT_MAX_MESSAGE_BYTES, |max| {
+                        max.min(GOOGLE_CHAT_MAX_MESSAGE_BYTES)
+                    }),
+            )
+        } else {
+            self.max_post_bytes
+        };
+        crate::chat::PostLimit {
+            max_chars,
+            max_bytes,
+            escaping: crate::chat::PostEscaping::Verbatim,
+        }
+    }
 }
 
 /// Read limits shared by every chat provider.
@@ -537,6 +580,11 @@ pub struct SlackSettings {
     /// Whether Settings may offer "Clear unread in Slack" for this provider's channels, moving the
     /// token's own read cursor with `conversations.mark`. Off by default. `#258 slack-clear-unread`.
     pub upstream_clear: bool,
+    /// The most characters one post may hold, as Slack is sent it, when the operator has said.
+    /// `#263 post-split-per-provider`; see [`crate::slack::SlackConfig::post_limit`].
+    pub max_post_chars: Option<usize>,
+    /// The most UTF-8 bytes one post may hold, as Slack is sent it, when the operator has said.
+    pub max_post_bytes: Option<usize>,
 }
 
 /// How one provider is reached.
@@ -817,6 +865,8 @@ struct FileDiscord {
     channel_registration: Option<bool>,
     upstream_read_marks: Option<bool>,
     markup: Option<crate::render::Markup>,
+    max_post_chars: Option<usize>,
+    max_post_bytes: Option<usize>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -839,6 +889,8 @@ struct FileProvider {
     request_timeout_seconds: Option<u64>,
     live_poll_seconds: Option<u64>,
     channel_registration: Option<bool>,
+    max_post_chars: Option<usize>,
+    max_post_bytes: Option<usize>,
     // Discord-protocol providers only.
     thread_api: Option<crate::threads::ThreadApi>,
     upstream_read_marks: Option<bool>,
@@ -2061,6 +2113,8 @@ fn legacy_discord_provider<'e>(
             || file.channel_registration.is_some()
             || file.upstream_read_marks.is_some()
             || file.markup.is_some()
+            || file.max_post_chars.is_some()
+            || file.max_post_bytes.is_some()
             || get(ENV_DISCORD_OWNER_USER_ID).is_some()
             || get(ENV_LIVE_POLL_SECONDS).is_some();
         if configures_a_provider {
@@ -2115,6 +2169,10 @@ fn legacy_discord_provider<'e>(
         file.thread_api,
         file.upstream_read_marks,
         file.markup,
+        PostSize {
+            chars: file.max_post_chars,
+            bytes: file.max_post_bytes,
+        },
     )?;
     Ok(Some(ProviderConfig {
         key: LEGACY_DISCORD_PROVIDER_KEY.to_owned(),
@@ -2137,6 +2195,7 @@ fn discord_protocol(
     thread_api: Option<crate::threads::ThreadApi>,
     upstream_read_marks: Option<bool>,
     markup: Option<crate::render::Markup>,
+    post_size: PostSize,
 ) -> Result<DiscordConfig, ConfigError> {
     let channel_registration = channel_registration.unwrap_or(false);
     let api_base = api_base.unwrap_or_else(|| DEFAULT_DISCORD_API_BASE.to_owned());
@@ -2154,6 +2213,23 @@ fn discord_protocol(
             detail: "bridge threading requires the API base of a compatible bridge".to_owned(),
         });
     }
+    let markup = markup.unwrap_or_default();
+    let ceiling = if official_discord_host {
+        Some((
+            crate::discord::http::DISCORD_MAX_CONTENT_LEN,
+            "characters",
+            "Discord accepts",
+        ))
+    } else if markup == crate::render::Markup::GoogleChat {
+        Some((
+            crate::discord::http::GOOGLE_CHAT_MAX_MESSAGE_BYTES,
+            "bytes",
+            "Google Chat accepts",
+        ))
+    } else {
+        None
+    };
+    validate_post_size(prefix, post_size, ceiling)?;
     Ok(DiscordConfig {
         provider_name,
         thread_api: thread_api.unwrap_or_default(),
@@ -2165,8 +2241,55 @@ fn discord_protocol(
         request_timeout_seconds,
         channel_registration,
         upstream_read_marks: upstream_read_marks.unwrap_or(false),
-        markup: markup.unwrap_or_default(),
+        markup,
+        max_post_chars: post_size.chars,
+        max_post_bytes: post_size.bytes,
     })
+}
+
+/// The smallest post size an operator may configure. Below it a reopened code fence and its
+/// closing marker take most of a part, and a long message becomes dozens of posts.
+pub const MIN_POST_SIZE: usize = 500;
+
+/// A provider's configured post size: `max_post_chars` and `max_post_bytes`.
+#[derive(Clone, Copy, Debug, Default)]
+struct PostSize {
+    chars: Option<usize>,
+    bytes: Option<usize>,
+}
+
+/// Refuse a post size below [`MIN_POST_SIZE`], or above what the service behind the provider
+/// accepts: `ceiling` is that service's maximum, the unit it counts, and how to say whose it is.
+///
+/// A ceiling in bytes bounds a character limit too: a character is at least one byte, so more
+/// characters than the byte ceiling can never fit.
+fn validate_post_size(
+    prefix: &str,
+    size: PostSize,
+    ceiling: Option<(usize, &str, &str)>,
+) -> Result<(), ConfigError> {
+    for (name, value, unit) in [
+        ("max_post_chars", size.chars, "characters"),
+        ("max_post_bytes", size.bytes, "bytes"),
+    ] {
+        let Some(value) = value else { continue };
+        let field = format!("{prefix}.{name}");
+        if value < MIN_POST_SIZE {
+            return Err(ConfigError::Invalid {
+                field,
+                detail: format!("must be at least {MIN_POST_SIZE}"),
+            });
+        }
+        if let Some((max, ceiling_unit, whose)) = ceiling {
+            if value > max && (unit == ceiling_unit || ceiling_unit == "bytes") {
+                return Err(ConfigError::Invalid {
+                    field,
+                    detail: format!("{whose} at most {max} {ceiling_unit} in one message"),
+                });
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Whether `key` may name a provider: short, lowercase, and safe in a setting or env var name.
@@ -2260,6 +2383,10 @@ fn provider_entry<'e>(
                 entry.thread_api,
                 entry.upstream_read_marks,
                 entry.markup,
+                PostSize {
+                    chars: entry.max_post_chars,
+                    bytes: entry.max_post_bytes,
+                },
             )?)
         }
         "slack" => {
@@ -2284,6 +2411,16 @@ fn provider_entry<'e>(
                     detail: format!("{api_base:?} is not an http or https URL"),
                 });
             }
+            let post_size = PostSize {
+                chars: entry.max_post_chars,
+                bytes: entry.max_post_bytes,
+            };
+            let ceiling = crate::slack::is_official_slack_api_base(&api_base).then_some((
+                crate::slack::SLACK_MAX_TEXT_CHARS,
+                "characters",
+                "Slack keeps",
+            ));
+            validate_post_size(&format!("providers.{key}"), post_size, ceiling)?;
             ProviderKind::Slack(SlackSettings {
                 api_base,
                 token,
@@ -2296,6 +2433,8 @@ fn provider_entry<'e>(
                 registered_channels_writable: entry.registered_channels_writable.unwrap_or(false),
                 channel_discovery: entry.channel_discovery.unwrap_or(true),
                 upstream_clear: entry.upstream_clear.unwrap_or(false),
+                max_post_chars: post_size.chars,
+                max_post_bytes: post_size.bytes,
             })
         }
         other => {
@@ -2533,6 +2672,157 @@ provider = "slack"
             .map(|channel| channel.provider.as_deref())
             .collect();
         assert_eq!(providers, [Some("gchat"), Some("slack")]);
+    }
+
+    /// The limit a Slack provider's client is built with, from its settings.
+    fn slack_post_limit(cfg: &Config, key: &str) -> crate::chat::PostLimit {
+        let ProviderKind::Slack(settings) = &cfg.provider(key).expect("slack").kind else {
+            panic!("{key} is a Slack provider");
+        };
+        crate::slack::SlackConfig {
+            provider_name: "Slack".to_owned(),
+            api_base: settings.api_base.clone(),
+            token: settings.token.clone(),
+            owner_user_id: None,
+            request_timeout_seconds: settings.request_timeout_seconds,
+            channel_registration: settings.channel_registration,
+            registered_channels_writable: settings.registered_channels_writable,
+            channel_discovery: settings.channel_discovery,
+            upstream_clear: settings.upstream_clear,
+            max_post_chars: settings.max_post_chars,
+            max_post_bytes: settings.max_post_bytes,
+        }
+        .post_limit()
+    }
+
+    /// The limit a Discord-protocol provider's client is built with.
+    fn bridge_post_limit(cfg: &Config, key: &str) -> crate::chat::PostLimit {
+        let ProviderKind::Discord(discord) = &cfg.provider(key).expect("provider").kind else {
+            panic!("{key} is a Discord-protocol provider");
+        };
+        discord.post_limit()
+    }
+
+    /// `#263 post-split-per-provider`. Every post used to be cut at Discord's 2000 characters;
+    /// each provider now says how much one post may carry, counted as that provider counts it.
+    #[test]
+    fn each_provider_says_how_much_one_post_may_carry() {
+        use crate::chat::{PostEscaping, PostLimit};
+
+        // Discord itself takes its own 2000 characters, and a byte limit only adds to that.
+        let cfg = Config::from_toml_and_env(FULL, &env(&[])).expect("valid config");
+        assert_eq!(bridge_post_limit(&cfg, "discord"), PostLimit::chars(2000));
+        let text = FULL.replace("[discord]", "[discord]\nmax_post_bytes = 1500");
+        let cfg = Config::from_toml_and_env(&text, &env(&[])).expect("a byte limit for Discord");
+        assert_eq!(
+            bridge_post_limit(&cfg, "discord"),
+            PostLimit {
+                max_chars: Some(2000),
+                max_bytes: Some(1500),
+                escaping: PostEscaping::Verbatim,
+            }
+        );
+
+        // A bridge that says nothing is sent what bridges have always been sent: nothing longer
+        // than it has accepted before. Slack itself, its own ceiling less a margin, escaped.
+        let cfg = Config::from_toml_and_env(MULTI, &env(&[])).expect("valid multi config");
+        assert_eq!(bridge_post_limit(&cfg, "gchat"), PostLimit::chars(2000));
+        assert_eq!(
+            slack_post_limit(&cfg, "slack"),
+            PostLimit::chars(crate::slack::SLACK_DEFAULT_POST_CHARS)
+                .escaped(PostEscaping::HtmlEntities)
+        );
+
+        // A bridge that says what it accepts is held to exactly that, in the unit it gave.
+        let text = MULTI.replace(
+            "thread_api = \"off\"",
+            "thread_api = \"off\"\nmax_post_bytes = 30000",
+        );
+        let cfg = Config::from_toml_and_env(&text, &env(&[])).expect("a bridge byte limit");
+        assert_eq!(bridge_post_limit(&cfg, "gchat"), PostLimit::bytes(30_000));
+
+        // A bridge serving Google Chat is held to Google Chat's own ceiling as well, so a limit
+        // in characters cannot carry more bytes than Google Chat takes.
+        let text = MULTI.replace(
+            "thread_api = \"off\"",
+            "thread_api = \"off\"\nmarkup = \"google-chat\"\nmax_post_chars = 20000",
+        );
+        let cfg = Config::from_toml_and_env(&text, &env(&[])).expect("a Google Chat bridge");
+        assert_eq!(
+            bridge_post_limit(&cfg, "gchat"),
+            PostLimit {
+                max_chars: Some(20_000),
+                max_bytes: Some(crate::discord::http::GOOGLE_CHAT_MAX_MESSAGE_BYTES),
+                escaping: PostEscaping::Verbatim,
+            }
+        );
+
+        // A Slack bridge that says nothing, and one that says it takes four thousand bytes.
+        let bridged = MULTI.replace(
+            "kind = \"slack\"\n",
+            "kind = \"slack\"\napi_base = \"http://127.0.0.1:18766/api\"\n",
+        );
+        let cfg = Config::from_toml_and_env(&bridged, &env(&[])).expect("a Slack bridge");
+        assert_eq!(
+            slack_post_limit(&cfg, "slack"),
+            PostLimit::chars(2000).escaped(PostEscaping::HtmlEntities)
+        );
+        let text = bridged.replace(
+            "live_poll_seconds = 15",
+            "live_poll_seconds = 15\nmax_post_bytes = 4000",
+        );
+        let cfg = Config::from_toml_and_env(&text, &env(&[])).expect("a Slack bridge limit");
+        assert_eq!(
+            slack_post_limit(&cfg, "slack"),
+            PostLimit::bytes(4000).escaped(PostEscaping::HtmlEntities)
+        );
+    }
+
+    #[test]
+    fn a_post_size_the_service_would_not_accept_is_refused_by_name() {
+        let refused = |text: &str, expected: &str| {
+            let error = Config::from_toml_and_env(text, &env(&[]))
+                .expect_err("a post size out of range must not start the server");
+            assert!(
+                matches!(&error, ConfigError::Invalid { field, .. } if field == expected),
+                "{expected}: {error}"
+            );
+        };
+        refused(
+            &FULL.replace("[discord]", "[discord]\nmax_post_chars = 2001"),
+            "discord.max_post_chars",
+        );
+        refused(
+            &FULL.replace("[discord]", "[discord]\nmax_post_bytes = 499"),
+            "discord.max_post_bytes",
+        );
+        refused(
+            &MULTI.replace(
+                "thread_api = \"off\"",
+                "thread_api = \"off\"\nmarkup = \"google-chat\"\nmax_post_bytes = 32001",
+            ),
+            "providers.gchat.max_post_bytes",
+        );
+        refused(
+            &MULTI.replace(
+                "live_poll_seconds = 15",
+                "live_poll_seconds = 15\nmax_post_chars = 40001",
+            ),
+            "providers.slack.max_post_chars",
+        );
+        // Within range is accepted, and a bridge's own ceiling is the operator's to know.
+        for text in [
+            MULTI.replace(
+                "thread_api = \"off\"",
+                "thread_api = \"off\"\nmax_post_chars = 100000",
+            ),
+            MULTI.replace(
+                "live_poll_seconds = 15",
+                "live_poll_seconds = 15\nmax_post_chars = 40000\nmax_post_bytes = 90000",
+            ),
+        ] {
+            Config::from_toml_and_env(&text, &env(&[])).expect("within range");
+        }
     }
 
     #[test]

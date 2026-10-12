@@ -45,11 +45,28 @@ pub mod ids;
 pub mod mrkdwn;
 mod timeline;
 
-pub use client::HttpSlackClient;
+pub use client::{HttpSlackClient, SLACK_MAX_TEXT_CHARS};
 pub use ids::{message_id_from_ts, parse_source, ts_from_message_id};
 
 /// The Slack Web API base used when a deployment does not name a bridge.
 pub const DEFAULT_SLACK_API_BASE: &str = "https://slack.com/api";
+
+/// The most characters one post to Slack itself is cut to, unless configured otherwise.
+/// `#263 post-split-per-provider`.
+///
+/// Slack keeps [`SLACK_MAX_TEXT_CHARS`] and truncates past it. A thousand short of that, because
+/// Slack does not say how it counts a character, and an emoji is one character here and may be two
+/// there.
+pub const SLACK_DEFAULT_POST_CHARS: usize = 39_000;
+
+/// Whether `api_base` is Slack's own Web API rather than a bridge in front of it.
+#[must_use]
+pub fn is_official_slack_api_base(api_base: &str) -> bool {
+    reqwest::Url::parse(api_base.trim())
+        .ok()
+        .and_then(|url| url.host_str().map(str::to_ascii_lowercase))
+        .is_some_and(|host| host == "slack.com" || host.ends_with(".slack.com"))
+}
 
 /// Slack access parameters for one workspace connection.
 #[derive(Debug, Clone)]
@@ -74,4 +91,38 @@ pub struct SlackConfig {
     /// Whether the server may clear a conversation's unread state in Slack's own client, moving
     /// the token's read cursor with `conversations.mark` (`slack/clear.rs`). Off by default.
     pub upstream_clear: bool,
+    /// The most characters one post may hold, as Slack is sent it, when configured.
+    /// `#263 post-split-per-provider`; see [`SlackConfig::post_limit`].
+    pub max_post_chars: Option<usize>,
+    /// The most UTF-8 bytes one post may hold, as Slack is sent it, when configured.
+    pub max_post_bytes: Option<usize>,
+}
+
+impl SlackConfig {
+    /// The most text one post through this connection may carry, counted as Slack is sent it:
+    /// with `&`, `<` and `>` escaped ([`mrkdwn::escape_outgoing`]). `#263
+    /// post-split-per-provider`.
+    ///
+    /// Slack itself takes [`SLACK_DEFAULT_POST_CHARS`] unless configured, and never more than
+    /// [`SLACK_MAX_TEXT_CHARS`]. A bridge takes what the operator said it accepts
+    /// (`max_post_chars`, `max_post_bytes`), and when the operator said nothing, 2000 characters:
+    /// the most any bridge has been sent since posts were first split, so an upgrade never sends a
+    /// bridge a longer post than it has accepted before.
+    #[must_use]
+    pub fn post_limit(&self) -> crate::chat::PostLimit {
+        let official = is_official_slack_api_base(&self.api_base);
+        let stated = self.max_post_chars.is_some() || self.max_post_bytes.is_some();
+        let max_chars = match self.max_post_chars {
+            Some(max) if official => Some(max.min(SLACK_MAX_TEXT_CHARS)),
+            Some(max) => Some(max),
+            None if official => Some(SLACK_DEFAULT_POST_CHARS),
+            None if !stated => Some(crate::discord::http::DISCORD_MAX_CONTENT_LEN),
+            None => None,
+        };
+        crate::chat::PostLimit {
+            max_chars,
+            max_bytes: self.max_post_bytes,
+            escaping: crate::chat::PostEscaping::HtmlEntities,
+        }
+    }
 }

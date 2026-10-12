@@ -25,8 +25,15 @@ use crate::model::{ChannelId, Message, MessageId, Reaction, UserId};
 
 /// Discord's own ceiling on `GET /channels/{id}/messages?limit=`.
 pub const DISCORD_MAX_LIMIT: u16 = 100;
-/// Discord's ceiling on a single message body.
+/// Discord's ceiling on a single message body, in characters: "Message contents (up to 2000
+/// characters)", <https://discord.com/developers/docs/resources/message#create-message>.
 pub const DISCORD_MAX_CONTENT_LEN: usize = 2000;
+/// Google Chat's ceiling on one message, in bytes: "The maximum message size (including any text
+/// or cards) is 32,000 bytes. To send a message that exceeds this size, your Chat app must send
+/// multiple messages instead." <https://developers.google.com/workspace/chat/create-messages>,
+/// read 2026-10-12. Google Chat is reached through a bridge speaking Discord's HTTP API, so the
+/// limit lives beside Discord's. `#263 post-split-per-provider`.
+pub const GOOGLE_CHAT_MAX_MESSAGE_BYTES: usize = 32_000;
 /// Discord's ceiling on `allowed_mentions.users`.
 pub const DISCORD_MAX_MENTIONED_USERS: usize = 100;
 
@@ -366,24 +373,31 @@ pub fn post_request(
     content: &str,
     reply_to: Option<&MessageId>,
 ) -> Result<PreparedRequest, ChatError> {
-    post_request_with_nonce(api_base, channel, content, reply_to, None)
+    post_request_with_nonce(
+        api_base,
+        channel,
+        content,
+        reply_to,
+        None,
+        &crate::chat::PostLimit::chars(DISCORD_MAX_CONTENT_LEN),
+    )
 }
 
+/// [`post_request`], with a nonce and the provider's own post limit: Discord's 2000 characters,
+/// or what a bridge was configured to accept. `#263 post-split-per-provider`.
 fn post_request_with_nonce(
     api_base: &str,
     channel: &ChannelId,
     content: &str,
     reply_to: Option<&MessageId>,
     nonce: Option<&str>,
+    limit: &crate::chat::PostLimit,
 ) -> Result<PreparedRequest, ChatError> {
     if content.trim().is_empty() {
         return Err(ChatError::Refused("message content is empty".to_owned()));
     }
-    if content.chars().count() > DISCORD_MAX_CONTENT_LEN {
-        return Err(ChatError::Refused(format!(
-            "message content is {} characters; the chat API accepts at most {DISCORD_MAX_CONTENT_LEN}",
-            content.chars().count()
-        )));
+    if let Some(refusal) = limit.refusal(content) {
+        return Err(ChatError::Refused(refusal));
     }
     // Mentions, exactly and only the ones the text itself names.
     //
@@ -651,6 +665,8 @@ pub struct HttpDiscordClient {
     channel_registration: bool,
     upstream_read_marks: bool,
     owner_user_id: Option<String>,
+    /// The most one post may carry; see [`DiscordConfig::post_limit`].
+    post_limit: crate::chat::PostLimit,
     /// Discord's rate limits, obeyed. Shared by every request this client makes, which is what
     /// lets one channel's 429 stop the *next* request on that channel before it is sent, and a
     /// global 429 stop all of them. See [`super::ratelimit`].
@@ -703,6 +719,7 @@ impl HttpDiscordClient {
             channel_registration: config.channel_registration,
             upstream_read_marks: config.upstream_read_marks,
             owner_user_id: config.owner_user_id.clone(),
+            post_limit: config.post_limit(),
             limiter: RateLimiter::new(),
         })
     }
@@ -819,6 +836,24 @@ impl ChatClient for HttpDiscordClient {
 
     fn supports_threading(&self) -> bool {
         self.thread_api != crate::threads::ThreadApi::Off
+    }
+
+    fn post_limit(&self, _channel: &ChannelId) -> crate::chat::PostLimit {
+        self.post_limit
+    }
+
+    /// A bridge's own thread for the first part, as its answer reported it. `#263
+    /// post-split-per-provider`. Every Google Chat message carries one, so the rest of a long
+    /// post goes under the first part rather than after it.
+    ///
+    /// None from Discord itself, natively threaded or not: a message posted here is not a thread
+    /// until one is started from it, which this route does not do, so a long post stays a run of
+    /// consecutive messages there, as it always was.
+    fn continuation_thread(&self, _channel: &ChannelId, first: &Message) -> Option<String> {
+        if self.thread_api != crate::threads::ThreadApi::Bridge {
+            return None;
+        }
+        first.thread.as_ref().map(|thread| thread.id.clone())
     }
 
     async fn fetch_timeline(
@@ -1039,6 +1074,7 @@ impl ChatClient for HttpDiscordClient {
                 content,
                 reply_to,
                 nonce.as_deref(),
+                &self.post_limit,
             )?;
             let value = self.send(request).await?;
             parse_message(&value)
@@ -1123,6 +1159,8 @@ mod tests {
             channel_registration,
             upstream_read_marks: false,
             markup: crate::render::Markup::GoogleChat,
+            max_post_chars: None,
+            max_post_bytes: None,
         }
     }
 
@@ -1200,6 +1238,7 @@ mod tests {
             "hello",
             None,
             Some("nonce_ABC-123~"),
+            &crate::chat::PostLimit::chars(DISCORD_MAX_CONTENT_LEN),
         )
         .expect("valid bridge post");
         assert_eq!(bridged.body.expect("body")["nonce"], "nonce_ABC-123~");
@@ -1414,6 +1453,7 @@ mod tests {
             channel_registration: false,
             upstream_read_marks: true,
             owner_user_id: None,
+            post_limit: crate::chat::PostLimit::chars(DISCORD_MAX_CONTENT_LEN),
             limiter: RateLimiter::new(),
         };
         client
@@ -1435,6 +1475,7 @@ mod tests {
             channel_registration: false,
             upstream_read_marks,
             owner_user_id: None,
+            post_limit: crate::chat::PostLimit::chars(DISCORD_MAX_CONTENT_LEN),
             limiter: RateLimiter::new(),
         }
     }
@@ -1628,6 +1669,7 @@ mod tests {
             channel_registration: true,
             upstream_read_marks: false,
             owner_user_id: None,
+            post_limit: crate::chat::PostLimit::chars(DISCORD_MAX_CONTENT_LEN),
             limiter: RateLimiter::new(),
         };
         let registered = client
@@ -1688,6 +1730,7 @@ mod tests {
             channel_registration: true,
             upstream_read_marks: false,
             owner_user_id: None,
+            post_limit: crate::chat::PostLimit::chars(DISCORD_MAX_CONTENT_LEN),
             limiter: RateLimiter::new(),
         };
         assert!(matches!(
@@ -1737,6 +1780,7 @@ mod tests {
             channel_registration: true,
             upstream_read_marks: false,
             owner_user_id: None,
+            post_limit: crate::chat::PostLimit::chars(DISCORD_MAX_CONTENT_LEN),
             limiter: RateLimiter::new(),
         };
         assert!(matches!(
@@ -1790,6 +1834,7 @@ mod tests {
                 channel_registration: true,
                 upstream_read_marks: false,
                 owner_user_id: None,
+                post_limit: crate::chat::PostLimit::chars(DISCORD_MAX_CONTENT_LEN),
                 limiter: RateLimiter::new(),
             };
             let error = client
@@ -1836,6 +1881,7 @@ mod tests {
             channel_registration: true,
             upstream_read_marks: false,
             owner_user_id: None,
+            post_limit: crate::chat::PostLimit::chars(DISCORD_MAX_CONTENT_LEN),
             limiter: RateLimiter::new(),
         };
         let error = client
@@ -1908,6 +1954,7 @@ mod tests {
             channel_registration: true,
             upstream_read_marks: false,
             owner_user_id: None,
+            post_limit: crate::chat::PostLimit::chars(DISCORD_MAX_CONTENT_LEN),
             limiter: RateLimiter::new(),
         };
         client

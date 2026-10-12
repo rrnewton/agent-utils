@@ -839,12 +839,11 @@ impl HttpSlackClient {
         if content.trim().is_empty() {
             return Err(refused("message content is empty"));
         }
-        let length = content.chars().count();
-        if length > super::client::SLACK_MAX_TEXT_CHARS {
-            return Err(ChatError::Refused(format!(
-                "message content is {length} characters; Slack accepts at most {}",
-                super::client::SLACK_MAX_TEXT_CHARS
-            )));
+        // Measured as Slack is sent it, escapes and all: Slack truncates past its ceiling rather
+        // than refusing, and a bridge in front of it may refuse sooner. `#263
+        // post-split-per-provider`; the reply path has already cut a long post to fit.
+        if let Some(refusal) = self.post_limit.refusal(content) {
+            return Err(ChatError::Refused(refusal));
         }
         let mut params = vec![
             ("channel", conversation.to_owned()),

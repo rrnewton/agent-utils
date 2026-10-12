@@ -21,7 +21,9 @@ use crate::config::Secret;
 use crate::model::{ChannelId, Message, MessageId, UserId};
 use crate::threads::MessageThread;
 
-/// Slack's own ceiling on `chat.postMessage` text; longer text is truncated upstream, so refused here.
+/// Slack's own ceiling on `chat.postMessage` text: "Slack will truncate messages containing more
+/// than 40,000 characters", <https://docs.slack.dev/reference/methods/chat.postMessage>, read
+/// 2026-10-12. Longer text would be cut short upstream, so it is split or refused here instead.
 pub const SLACK_MAX_TEXT_CHARS: usize = 40_000;
 /// The longest one request may spend waiting out rate limits, across all its attempts.
 pub const RATE_LIMIT_BUDGET: Duration = Duration::from_secs(30);
@@ -123,6 +125,8 @@ pub struct HttpSlackClient {
     /// Stretches after a cursor proven to hold no real messages, so a walk that ran out of
     /// requests while crossing system events resumes rather than restarts. See `super::history`.
     pub(super) proven: Mutex<HashMap<(String, i64), (i64, Instant)>>,
+    /// The most one post may carry, as Slack is sent it; see [`SlackConfig::post_limit`].
+    pub(super) post_limit: crate::chat::PostLimit,
 }
 
 impl HttpSlackClient {
@@ -174,6 +178,7 @@ impl HttpSlackClient {
             users: Mutex::new(HashMap::new()),
             threaded: Mutex::new(HashSet::new()),
             proven: Mutex::new(HashMap::new()),
+            post_limit: config.post_limit(),
         })
     }
 
@@ -702,6 +707,25 @@ impl ChatClient for HttpSlackClient {
         true
     }
 
+    fn post_limit(&self, _channel: &ChannelId) -> crate::chat::PostLimit {
+        self.post_limit
+    }
+
+    /// The thread the first part went into, or the one it now roots. `#263
+    /// post-split-per-provider`.
+    ///
+    /// A Slack reply is a thread reply, and any message can root a thread: its own `ts` is the
+    /// thread id. So the rest of a long post goes under the first part rather than after it, and a
+    /// first part that answered a message — which Slack placed in that message's thread — is
+    /// followed into the same thread rather than left there alone.
+    fn continuation_thread(&self, _channel: &ChannelId, first: &Message) -> Option<String> {
+        first
+            .thread
+            .as_ref()
+            .map(|thread| thread.id.clone())
+            .or_else(|| ids::ts_from_message_id(&first.id))
+    }
+
     async fn fetch_timeline(
         &self,
         channel: &ChannelId,
@@ -858,6 +882,8 @@ mod tests {
             registered_channels_writable: false,
             channel_discovery: false,
             upstream_clear: false,
+            max_post_chars: None,
+            max_post_bytes: None,
         })
         .expect("client")
     }

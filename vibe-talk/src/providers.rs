@@ -134,6 +134,8 @@ impl ChatRouter {
                         registered_channels_writable: slack.registered_channels_writable,
                         channel_discovery: slack.channel_discovery,
                         upstream_clear: slack.upstream_clear,
+                        max_post_chars: slack.max_post_chars,
+                        max_post_bytes: slack.max_post_bytes,
                     },
                 )?),
             };
@@ -469,6 +471,23 @@ impl ChatClient for ChatRouter {
             .client
             .post_in_thread_keyed(channel, thread_id, content, reply_to, key)
             .await
+    }
+
+    /// The channel's own provider's limit: a Slack channel and a Google Chat channel in one
+    /// server are cut at their own sizes. `#263 post-split-per-provider`. A channel no provider
+    /// holds cannot be posted to at all, so the default it falls back to is never spent.
+    fn post_limit(&self, channel: &ChannelId) -> crate::chat::PostLimit {
+        match self.route(channel) {
+            Ok(entry) => entry.client.post_limit(channel),
+            Err(_) => crate::chat::PostLimit::chars(crate::discord::http::DISCORD_MAX_CONTENT_LEN),
+        }
+    }
+
+    fn continuation_thread(&self, channel: &ChannelId, first: &Message) -> Option<String> {
+        self.route(channel)
+            .ok()?
+            .client
+            .continuation_thread(channel, first)
     }
 
     async fn fetch_thread_message(

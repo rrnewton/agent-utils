@@ -233,6 +233,8 @@ fn offline_client() -> HttpSlackClient {
         registered_channels_writable: false,
         channel_discovery: false,
         upstream_clear: false,
+        max_post_chars: None,
+        max_post_bytes: None,
     })
     .expect("client")
 }
@@ -287,6 +289,8 @@ fn a_non_http_api_base_is_refused_at_construction() {
         registered_channels_writable: false,
         channel_discovery: false,
         upstream_clear: false,
+        max_post_chars: None,
+        max_post_bytes: None,
     };
     assert!(HttpSlackClient::new(&config).is_err());
     config.api_base = "ftp://slack.com/api".to_owned();

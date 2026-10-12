@@ -131,6 +131,8 @@ impl Fake {
             registered_channels_writable: true,
             channel_discovery: true,
             upstream_clear: false,
+            max_post_chars: None,
+            max_post_bytes: None,
         }
     }
 

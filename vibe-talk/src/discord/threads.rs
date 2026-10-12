@@ -1089,6 +1089,7 @@ impl HttpDiscordClient {
                     content,
                     reply_to,
                     Some(&nonce),
+                    &self.post_limit,
                 )?;
                 request.url = self
                     .thread_request(
@@ -1116,6 +1117,7 @@ impl HttpDiscordClient {
                         content,
                         reply_to,
                         None,
+                        &self.post_limit,
                     )?)
                     .await?;
                 let mut message = parse_message(&value)?;
