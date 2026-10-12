@@ -4114,6 +4114,11 @@ function renderEnterSends() {
  *     predictive text, use Enter to ACCEPT the word being built; a send there would post the
  *     message with that word still uncommitted. `isComposing` is the standard signal, and keyCode
  *     229 is what Safari and older Chromium report for the same keystroke instead.
+ *   * NEVER ON A REPEAT. One press is one send. A key held down past the repeat delay fires its
+ *     repeats as keydowns too, and since `#248 composer-key` a Ctrl+Enter pressed outside a box
+ *     puts the focus IN the box, so its own repeats arrive here: they sent whatever draft the box
+ *     was holding, a quarter of a second after the reader only asked to go to it. A held send
+ *     key's repeats still have their default taken, so they type no run of new lines either.
  *
  * Every box is a textarea, the call's included since `#241 voice-composer`. The call's used to be a
  * one-line `<input>`, whose bare Enter is a form submission, so an Enter that did not send was
@@ -4135,7 +4140,7 @@ function onComposerKey(event, send) {
   if (sends && event.preventDefault) {
     event.preventDefault();
   }
-  return sends ? send() : undefined;
+  return sends && !event.repeat ? send() : undefined;
 }
 
 // --- the keyboard -------------------------------------------------------------------------------

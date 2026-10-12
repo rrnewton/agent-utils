@@ -3793,7 +3793,8 @@ an Apple one (from `navigator.platform`), Ctrl elsewhere. The platform only pick
 keys send everywhere. An input method that is still composing a word (`isComposing`, or keyCode 229)
 keeps its Enter, because there Enter accepts the word. The call's box is a single line, so with the
 switch off its Enter does nothing rather than being handed to the browser, which would submit the
-page.
+page. One press is one send: the repeats of a held key never send, and where the press itself sends,
+they type no new lines either.
 
 The choice is stored on this device under `vibe-talk.voice.enter-sends`, like the page's other
 settings. Nothing is added to the boxes themselves, so a phone screen loses no space. Instead each
@@ -3898,8 +3899,9 @@ entry and start typing." It now goes to the box `c` goes to (the channel's, the 
 the reply's on the Reply screen), from anywhere, including while you are typing in the search, and
 leaves Settings or Help first. The call's view has no box it reaches yet, so there it only keeps the
 browser's "Save page" shut. Ctrl+Enter (Cmd+Enter) does the same when the focus is not in a text box;
-in a message box it sends, as before. The search keeps `/` and the magnifying glass, and the Help list
-says where Ctrl+S went.
+in a message box it sends, as before. Held down from outside a box, it goes to the box and leaves the
+draft there unsent: its repeats arrive in the box, and a repeat never sends. The search keeps `/` and
+the magnifying glass, and the Help list says where Ctrl+S went.
 
 ### The reading bookmark
 

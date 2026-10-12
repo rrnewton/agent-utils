@@ -17834,6 +17834,16 @@ const ENTER_KEYS = [
   { name: "Enter reported as keyCode 229", fields: { keyCode: 229 }, on: false, off: false, ime: true },
   { name: "Ctrl+Enter during IME composition", fields: { ctrlKey: true, isComposing: true },
     on: false, off: false, ime: true },
+  // A held key's repeats never send: one press is one send (`#248 composer-key`, where a Ctrl+Enter
+  // outside a box moves the focus into it and its repeats followed it there and sent the draft).
+  // Where the press itself would have sent, the repeats still have the default taken (`taken`), so
+  // a held key types no run of new lines either; where it would not, the box keeps its new lines.
+  { name: "a held Enter's repeat", fields: { repeat: true }, on: false, off: false, takenOn: true },
+  { name: "a held Ctrl+Enter's repeat", fields: { ctrlKey: true, repeat: true }, on: false, off: false,
+    takenOn: true, takenOff: true },
+  { name: "a held Meta+Enter's repeat", fields: { metaKey: true, repeat: true }, on: false, off: false,
+    takenOn: true, takenOff: true },
+  { name: "a held Shift+Enter's repeat", fields: { shiftKey: true, repeat: true }, on: false, off: false },
 ];
 
 /**
@@ -17908,7 +17918,7 @@ const ENTER_COMPOSERS = {
 
 for (const [name, open] of Object.entries(ENTER_COMPOSERS)) {
   for (const on of [true, false]) {
-    test(`ENTER IN THE ${name.toUpperCase()} BOX with Enter to send ${on ? "ON" : "OFF"}: Enter, Shift, Alt, Ctrl, Meta and IME`, async () => {
+    test(`ENTER IN THE ${name.toUpperCase()} BOX with Enter to send ${on ? "ON" : "OFF"}: Enter, Shift, Alt, Ctrl, Meta, IME and held keys`, async () => {
       const box = await open(on);
       for (const key of ENTER_KEYS) {
         const text = `${key.name} in the ${name} box`;
@@ -17927,8 +17937,11 @@ for (const [name, open] of Object.entries(ENTER_COMPOSERS)) {
           assert.equal(box.page.el(box.field).value, text, `${key.name} emptied the ${name} box`);
           // A new line is the box's own default, so it is left alone. Every box is a textarea since
           // `#241 voice-composer`, the call's included. An input method's Enter is the method's, always.
-          assert.equal(event.defaulted, true,
-            `${key.name} had its default taken away, so the ${name} box gets no new line`);
+          // A held send key's repeats are taken, though: see `taken` in the table.
+          const taken = Boolean(on ? key.takenOn : key.takenOff);
+          assert.equal(event.defaulted, !taken, taken
+            ? `${key.name} in the ${name} box was handed to the browser: a run of new lines`
+            : `${key.name} had its default taken away, so the ${name} box gets no new line`);
         }
       }
       // ...and an ordinary key is nobody's business but the box's.
@@ -18477,6 +18490,48 @@ test("Ctrl+Enter OUTSIDE A BOX goes to the message box; in a box it sends, as it
   await press(search, search.el("scroll-area"), "/");
   event = await press(search, search.el("search-field"), "Enter", { ctrlKey: true });
   assert.equal(focused(search), search.el("search-field"), `Ctrl+Enter in the search field moved the focus to ${focusName(search)}`);
+});
+
+test("a HELD Ctrl+Enter outside a box goes to the box and sends NOTHING: its repeats land in the box", async () => {
+  // `#248 composer-key`. The first keydown of a held chord puts the focus in the box; every repeat
+  // after it is a keydown IN the box, where Ctrl+Enter is the send. They sent the draft the box
+  // held, a quarter of a second after the reader asked only to go to it. One press is one send.
+  const draft = "half-written draft";
+  for (const fields of [{ ctrlKey: true }, { metaKey: true }]) {
+    const chord = `${fields.ctrlKey ? "Ctrl" : "Cmd"}+Enter`;
+    // From the list, with a draft waiting in the channel's box.
+    const page = await keyboardPage();
+    const writes = () => page.requests.filter((request) => !request.startsWith("GET")).length;
+    await page.el("channel-compose-text").setValue(draft);
+    const before = writes();
+    let event = await press(page, page.el("scroll-area"), "Enter", fields);
+    assert.equal(focused(page), page.el("channel-compose-text"), `a held ${chord} left the focus on ${focusName(page)}`);
+    for (let i = 0; i < 3; i += 1) {
+      event = await press(page, focused(page), "Enter", { ...fields, repeat: true });
+      assert.equal(event.defaulted, false, `a held ${chord}'s repeat typed a new line in the box`);
+    }
+    assert.equal(page.repliesPosted.length, 0, `a held ${chord} from the list sent the channel box's draft`);
+    assert.equal(writes(), before, `a held ${chord} from the list wrote something`);
+    assert.equal(page.el("channel-compose-text").value, draft, `a held ${chord} from the list emptied the box`);
+    // A press of its own, once the key is up and down again, still sends: nothing was taken from the box.
+    event = await press(page, page.el("channel-compose-text"), "Enter", fields);
+    assert.equal(page.repliesPosted.length, 1, `${chord} pressed again in the box did not send`);
+    assert.equal(page.repliesPosted[0].body.text, draft);
+
+    // From the conversation on Reply, with a draft waiting in the reply box.
+    const reply = await keyboardPage();
+    await openReplyOn(reply, tallChannel(30), 2);
+    await reply.el("reply-text").setValue(draft);
+    event = await press(reply, reply.el("reply-scroll"), "Enter", fields);
+    assert.equal(focused(reply), reply.el("reply-text"), `a held ${chord} on Reply left the focus on ${focusName(reply)}`);
+    for (let i = 0; i < 3; i += 1) {
+      event = await press(reply, focused(reply), "Enter", { ...fields, repeat: true });
+      assert.equal(event.defaulted, false, `a held ${chord}'s repeat typed a new line in the reply box`);
+    }
+    assert.equal(reply.repliesPosted.length, 0, `a held ${chord} on Reply sent the reply's draft`);
+    assert.equal(reply.screen(), "reply", `a held ${chord} on Reply left the Reply screen`);
+    assert.equal(reply.el("reply-text").value, draft, `a held ${chord} on Reply emptied the reply box`);
+  }
 });
 
 test("ESCAPE CLOSES THE SEARCH, clears it, and gives the list back the focus", async () => {

@@ -17,7 +17,8 @@ under a person's fingers, and measures the list that is on screen:
   than pressing the switch -> "/" opens the search with its field focused, Escape closes it and the
   list has the focus again -> `#248 composer-key`: Ctrl+S goes to the message box from the list,
   from the search field while typing in it, and from Settings, the browser's own Save page refused
-  every time, and Ctrl+Enter off any box goes there too ->
+  every time, and Ctrl+Enter off any box goes there too, a held one sending nothing from the box it
+  reached, from the list or from Reply ->
   "," opens Settings with its screen focused, PgDn scrolls Settings, Escape returns to the list
   where the reader was; Ctrl+, does the same -> in the channel's message box, PgUp pages the list
   while the box keeps the focus and the draft, Home and End move the caret, and Ctrl+Home and
@@ -111,6 +112,8 @@ class FakeApi:
     dismissed: set[str] = field(default_factory=set)
     dismiss_posts: list[list[str]] = field(default_factory=list)
     threads: list[Json] = field(default_factory=list)
+    # Every message the page tried to send (`/reply` is the route of every send), as its route.
+    send_posts: list[str] = field(default_factory=list)
 
     def __post_init__(self) -> None:
         root_id = f"88000000000000{MESSAGES // 2:04d}"
@@ -182,6 +185,14 @@ class FakeApi:
         with self.lock:
             return [list(ids) for ids in self.dismiss_posts]
 
+    def send(self, path: str) -> None:
+        with self.lock:
+            self.send_posts.append(path)
+
+    def sends(self) -> list[str]:
+        with self.lock:
+            return list(self.send_posts)
+
     def pins(self, channel: Json) -> Json:
         return {"channel": channel, "pins": [], "revision": 0, "limit": 100,
                 "pins_notice": "Pins are this check's own.",
@@ -227,6 +238,10 @@ def handler_for(api: FakeApi, web_root: Path) -> type[BaseHTTPRequestHandler]:
                 self.json(401, {"error": "unauthorized", "detail": "unknown token"})
             elif path == f"/api/v1/channels/{CHANNEL['id']}/dismiss" and isinstance(raw, dict):
                 self.json(200, api.dismiss({str(key): value for key, value in raw.items()}))
+            elif path.endswith("/reply"):
+                # Recorded and refused: no step here means to send, so any send at all is the failure.
+                api.send(path)
+                self.json(404, {"error": "not_found", "detail": "this check sends nothing"})
             else:
                 self.json(404, {"error": "not_found", "detail": "not served by this check"})
 
@@ -292,6 +307,11 @@ MODIFIERS = {"Alt": 1, "Control": 2, "Meta": 4, "Shift": 8}
 
 def press(cdp: CDPSession, chord: str) -> None:
     """Press `chord` ("PageDown", "Shift+ ", "Control+s", "j") through CDP, down and up."""
+    hold(cdp, chord, 0)
+
+
+def hold(cdp: CDPSession, chord: str, repeats: int) -> None:
+    """Press `chord` and hold it for `repeats` auto-repeated keydowns (`repeat` true), then let it go."""
     if chord.endswith(" "):
         held, key = [name for name in chord[:-1].split("+") if name], " "
     else:
@@ -315,6 +335,8 @@ def press(cdp: CDPSession, chord: str) -> None:
         down["text"] = text
         down["unmodifiedText"] = text
     cdp.send("Input.dispatchKeyEvent", down)
+    for _ in range(repeats):
+        cdp.send("Input.dispatchKeyEvent", {**down, "autoRepeat": True})
     cdp.send("Input.dispatchKeyEvent", {"type": "keyUp", "modifiers": modifiers, "key": shown, "code": code,
                                         "windowsVirtualKeyCode": vk, "nativeVirtualKeyCode": vk})
 
@@ -325,7 +347,7 @@ RECORD_KEYS_JS = """() => {
   window.__keys = [];
   window.addEventListener('keydown', (event) => {
     window.__keys.push({key: event.key, prevented: event.defaultPrevented,
-                        ctrl: event.ctrlKey, meta: event.metaKey});
+                        ctrl: event.ctrlKey, meta: event.metaKey, repeat: event.repeat});
   });
 }"""
 
@@ -520,6 +542,58 @@ def write_keys(walk: Walk) -> None:
     to_box("Control+Enter", "from the list")
     walk.notes.append("Ctrl+S went to the message box from the list, the search field and Settings, and Ctrl+Enter "
                       "from the list, the Save page refused each time")
+
+
+def held_send_key(walk: Walk, api: FakeApi) -> None:
+    """`#248 composer-key`: a HELD Ctrl+Enter off a box goes to the box, and its repeats send nothing.
+
+    The first keydown puts the focus in the box; every auto-repeat after it is a keydown IN the box,
+    where Ctrl+Enter is the send, so a key held past the repeat delay used to send the draft the box
+    was holding. Held here from the channel's list and from the conversation on Reply, each with a
+    draft waiting, through CDP's own `autoRepeat`.
+    """
+    draft = "half-written draft"
+    set_value = ("([id, text]) => { const box = document.getElementById(id); box.value = text; "
+                 "box.dispatchEvent(new Event('input')); }")
+
+    def held(box: str, scroller: str, where: str) -> None:
+        walk.page.evaluate(set_value, [box, draft])
+        walk.page.focus(f"#{scroller}")
+        before = walk.state(scroller)
+        check(before["focus"] == scroller, f"{where}: the focus is on {before['focus']!r}, not #{scroller}")
+        earlier = before["keys"]
+        assert isinstance(earlier, list)
+        sends = len(api.sends())
+        hold(walk.cdp, "Control+Enter", 3)
+        walk.page.wait_for_timeout(400)  # long enough for a send to have left
+        state = walk.settled(scroller)
+        recorded = state["keys"]
+        assert isinstance(recorded, list)
+        pressed = recorded[len(earlier):]
+        repeats = [one.get("repeat") for one in pressed if isinstance(one, dict)]
+        check(repeats == [False, True, True, True],
+              f"{where}: the held Ctrl+Enter did not reach the page as one press and three repeats: {pressed}")
+        check(all(isinstance(one, dict) and one.get("prevented") is True for one in pressed),
+              f"{where}: a held Ctrl+Enter's keydown was left to the browser (a new line in the box): {pressed}")
+        check(state["focus"] == box, f"{where}: a held Ctrl+Enter left the focus on {state['focus']!r}")
+        check(api.sends()[sends:] == [], f"{where}: a held Ctrl+Enter SENT the draft: {api.sends()[sends:]}")
+        value = walk.page.evaluate("(id) => document.getElementById(id).value", box)
+        check(value == draft, f"{where}: a held Ctrl+Enter emptied the box: {value!r}")
+        walk.page.evaluate(set_value, [box, ""])
+
+    walk.key("End")
+    held("channel-compose-text", "scroll-area", "from the list")
+    walk.key("Escape")
+    row = f"#discord-log > li[data-id='88000000000000{MESSAGES - 3:04d}']"
+    walk.page.evaluate("(row) => document.querySelector(row + ' .reply-button').click()", row)
+    walk.page.wait_for_function("() => !document.getElementById('screen-reply').hidden")
+    held("reply-text", "reply-scroll", "from the conversation on Reply")
+    check(walk.state("reply-scroll")["screen"] == "reply", "a held Ctrl+Enter left the Reply screen")
+    walk.shot("held-ctrl-enter-on-reply")
+    walk.page.click("#reply-cancel")
+    walk.page.wait_for_function("() => document.getElementById('screen-reply').hidden")
+    walk.notes.append("a held Ctrl+Enter (one press, three auto-repeats) went to the box from the list and from "
+                      "Reply, and sent neither draft")
 
 
 def settings_keys(walk: Walk) -> None:
@@ -1052,6 +1126,7 @@ def main() -> int:
 
             search_keys(walk)
             write_keys(walk)
+            held_send_key(walk, api)
             settings_keys(walk)
             composer_keys(walk)
             keymap_keys(walk, api)
