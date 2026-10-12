@@ -13,7 +13,6 @@ options that level takes.
 from __future__ import annotations
 
 import base64
-import json
 import math
 import os
 import re
@@ -45,6 +44,7 @@ from herdr_run.sweep import load_run_records, measure_occupancy, sweep
 from herdr_run.textfmt import (
     display,
     format_round3,
+    json_text,
     name_violation,
     os_error_text,
     quote,
@@ -801,7 +801,7 @@ def _client(config: Config, environ: Mapping[str, str]) -> HerdrClient:
 
 def _emit_json(document: object) -> None:
     output.stdout(
-        json.dumps(document, indent=2, sort_keys=True, ensure_ascii=False) + "\n"
+        json_text(document, indent=2) + "\n"
     )
 
 

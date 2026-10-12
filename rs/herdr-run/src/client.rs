@@ -32,7 +32,7 @@ use std::time::{Duration, Instant};
 use serde_json::{Map, Value};
 
 use crate::error::{HerdrRunError, Result};
-use crate::textfmt::{os_error_text, quote, strict_json, strip_space};
+use crate::textfmt::{display, os_error_text, quote, strict_json, strip_space};
 
 /// Transient user-systemd unit used for a server started by `herdr-run`.
 pub const SERVER_UNIT: &str = "herdr-run-server";
@@ -992,6 +992,10 @@ fn strings(values: &[&str]) -> Vec<String> {
 }
 
 /// A failed call's detail: trimmed stderr, else trimmed stdout, else `exit N`.
+///
+/// Shown with [`display`], so what Herdr wrote is quoted when it holds a line break, a terminal
+/// control, or an invisible character: it ends up in a herdr-run message, and nothing reaches a
+/// terminal raw from one of those.
 fn detail(output: &CommandOutput) -> String {
     let stderr = strip_space(&output.stderr);
     let detail = if stderr.is_empty() {
@@ -1002,17 +1006,17 @@ fn detail(output: &CommandOutput) -> String {
     if detail.is_empty() {
         format!("exit {}", output.status)
     } else {
-        detail.to_owned()
+        display(detail)
     }
 }
 
-/// A failed `pane read`'s detail: trimmed stderr, else `exit N`.
+/// A failed `pane read`'s detail: trimmed stderr, else `exit N`, shown as [`detail`] shows it.
 fn stderr_detail(output: &CommandOutput) -> String {
     let detail = strip_space(&output.stderr);
     if detail.is_empty() {
         format!("exit {}", output.status)
     } else {
-        detail.to_owned()
+        display(detail)
     }
 }
 

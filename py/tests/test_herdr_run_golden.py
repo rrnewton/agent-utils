@@ -39,6 +39,7 @@ from herdr_run.session import Target, _load_cache, _store_cache
 from herdr_run.sweep import _scope_of
 from herdr_run.textfmt import (
     JSON_MAX_DEPTH,
+    json_text,
     display,
     name_violation,
     number_text,
@@ -112,7 +113,7 @@ def _read_json(text: str) -> str | None:
         value = strict_json_loads(text)
     except ValueError:
         return None
-    return json.dumps(value, sort_keys=True, ensure_ascii=False)
+    return json_text(value)
 
 
 @pytest.mark.parametrize("row", _rows(TEXT, "json"), ids=lambda row: ascii(row)[:60])

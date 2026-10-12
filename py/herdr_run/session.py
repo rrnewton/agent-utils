@@ -15,7 +15,6 @@ from __future__ import annotations
 
 import fcntl
 import itertools
-import json
 import os
 from collections.abc import Iterator
 from contextlib import contextmanager
@@ -26,7 +25,7 @@ from herdr_run.client import HerdrClient
 from herdr_run.config import Config, render_tab_name
 from herdr_run.errors import HerdrUnavailable
 from herdr_run.state import open_lock_file, session_lock_path
-from herdr_run.textfmt import quote, strict_json_loads
+from herdr_run.textfmt import json_text, quote, strict_json_loads
 
 __all__ = ["Target", "resolve_target", "tab_label_for", "cache_path"]
 
@@ -130,7 +129,7 @@ def _store_cache(path: str, key: str, target: Target) -> None:
             "tab_label": target.tab_label,
         }
         encoded = (
-            json.dumps(entries, indent=2, sort_keys=True, ensure_ascii=False) + "\n"
+            json_text(entries, indent=2) + "\n"
         ).encode("utf-8")
         # A unique temporary plus rename keeps readers from seeing a torn file, including callers
         # in another thread of this process. The name and the fsync match the native edition.

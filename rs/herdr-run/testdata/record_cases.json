@@ -568,7 +568,7 @@
         "cmds",
         "caf\u00e9 \u202e"
       ],
-      "{\n  \"agent-cmds\\u0000a\": {\n    \"pane_id\": \"w1:p1\",\n    \"tab_id\": \"w1:t1\",\n    \"tab_label\": \"caf\u00e9 \u202e\",\n    \"workspace_id\": \"w1\",\n    \"workspace_label\": \"cmds\"\n  }\n}\n",
+      "{\n  \"agent-cmds\\u0000a\": {\n    \"pane_id\": \"w1:p1\",\n    \"tab_id\": \"w1:t1\",\n    \"tab_label\": \"caf\u00e9 \\u202e\",\n    \"workspace_id\": \"w1\",\n    \"workspace_label\": \"cmds\"\n  }\n}\n",
       [
         "session-cache.json",
         "session-cache.json.lock"

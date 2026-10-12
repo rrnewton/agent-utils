@@ -18,7 +18,6 @@ parse as an integer is treated as an incomplete write rather than as a corrupt r
 
 from __future__ import annotations
 
-import json
 import math
 import os
 import stat
@@ -48,6 +47,7 @@ from herdr_run.state import open_lock_file, pane_lock_path
 from herdr_run.textfmt import (
     MAX_EXIT_MARKER_BYTES,
     format_round3,
+    json_text,
     number_text,
     os_error_text,
     parse_exit_marker,
@@ -526,7 +526,7 @@ def _write_meta(
         },
         "config_source": config.source_path,
     }
-    encoded = (json.dumps(document, indent=2, sort_keys=True, ensure_ascii=False) + "\n").encode(
+    encoded = (json_text(document, indent=2) + "\n").encode(
         "utf-8"
     )
     try:

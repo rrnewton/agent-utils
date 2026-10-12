@@ -13,13 +13,12 @@ same-UID process can modify the file.
 
 from __future__ import annotations
 
-import json
 import os
 import time
 from collections.abc import Callable
 
 from herdr_run.client import bounded_control_command
-from herdr_run.textfmt import display, quote
+from herdr_run.textfmt import display, json_text, quote
 
 __all__ = [
     "audit_path",
@@ -154,7 +153,7 @@ def record(
         if not parent:
             return False
         make_private_dirs(parent)
-        encoded = (json.dumps(entry, sort_keys=True, ensure_ascii=False) + "\n").encode(
+        encoded = (json_text(entry) + "\n").encode(
             "utf-8"
         )
         flags = (

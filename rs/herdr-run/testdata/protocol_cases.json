@@ -1744,6 +1744,116 @@
         ]
       ],
       "ok": "text"
+    },
+    {
+      "method": "workspace_id_for_label",
+      "args": [
+        "a"
+      ],
+      "broker": "direct",
+      "responses": [
+        [
+          0,
+          "{\"result\": {\"workspaces\": [], \"x\": \"\\ud800\", \"x\": 1}}",
+          ""
+        ]
+      ],
+      "calls": [
+        [
+          "/opt/herdr/bin/herdr",
+          "workspace",
+          "list"
+        ]
+      ],
+      "error": "workspace list: herdr returned non-JSON output: \"{\\\"result\\\": {\\\"workspaces\\\": [], \\\"x\\\": \\\"\\\\ud800\\\", \\\"x\\\": 1}}\""
+    },
+    {
+      "method": "workspace_id_for_label",
+      "args": [
+        "a"
+      ],
+      "broker": "direct",
+      "responses": [
+        [
+          0,
+          "{\"result\": {\"workspaces\": [\"\\udc00\"], \"workspaces\": []}}",
+          ""
+        ]
+      ],
+      "calls": [
+        [
+          "/opt/herdr/bin/herdr",
+          "workspace",
+          "list"
+        ]
+      ],
+      "error": "workspace list: herdr returned non-JSON output: \"{\\\"result\\\": {\\\"workspaces\\\": [\\\"\\\\udc00\\\"], \\\"workspaces\\\": []}}\""
+    },
+    {
+      "method": "workspace_id_for_label",
+      "args": [
+        "a"
+      ],
+      "broker": "direct",
+      "responses": [
+        [
+          3,
+          "",
+          "boom \u001b[31m red \u202e done\n"
+        ]
+      ],
+      "calls": [
+        [
+          "/opt/herdr/bin/herdr",
+          "workspace",
+          "list"
+        ]
+      ],
+      "error": "workspace list: \"boom \\u{1b}[31m red \\u{202e} done\""
+    },
+    {
+      "method": "workspace_id_for_label",
+      "args": [
+        "a"
+      ],
+      "broker": "direct",
+      "responses": [
+        [
+          1,
+          "",
+          "error: first line\n\ncaused by: second\n"
+        ]
+      ],
+      "calls": [
+        [
+          "/opt/herdr/bin/herdr",
+          "workspace",
+          "list"
+        ]
+      ],
+      "error": "workspace list: \"error: first line\\n\\ncaused by: second\""
+    },
+    {
+      "method": "workspace_id_for_label",
+      "args": [
+        "a"
+      ],
+      "broker": "direct",
+      "responses": [
+        [
+          2,
+          "plain stdout detail\n",
+          ""
+        ]
+      ],
+      "calls": [
+        [
+          "/opt/herdr/bin/herdr",
+          "workspace",
+          "list"
+        ]
+      ],
+      "error": "workspace list: plain stdout detail"
     }
   ]
 }

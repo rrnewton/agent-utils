@@ -30,7 +30,7 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 
 from herdr_run.errors import HerdrUnavailable
-from herdr_run.textfmt import os_error_text, quote, strict_json_loads, strip_space
+from herdr_run.textfmt import display, os_error_text, quote, strict_json_loads, strip_space
 
 __all__ = [
     "CONTROL_TIMEOUT_SECONDS",
@@ -230,14 +230,20 @@ def _resolve_configured_herdr(configured: str, home: str) -> str:
 
 
 def _detail(completed: "subprocess.CompletedProcess[str]") -> str:
-    """A failed call's detail: trimmed stderr, else trimmed stdout, else ``exit N``."""
+    """A failed call's detail: trimmed stderr, else trimmed stdout, else ``exit N``.
+
+    Shown with :func:`herdr_run.textfmt.display`, so what Herdr wrote is quoted when it holds a
+    line break, a terminal control, or an invisible character: it ends up in a herdr-run message,
+    and nothing reaches a terminal raw from one of those.
+    """
     detail = strip_space(completed.stderr or "") or strip_space(completed.stdout or "")
-    return detail or f"exit {completed.returncode}"
+    return display(detail) if detail else f"exit {completed.returncode}"
 
 
 def _stderr_detail(completed: "subprocess.CompletedProcess[str]") -> str:
-    """A failed ``pane read``'s detail: trimmed stderr, else ``exit N``."""
-    return strip_space(completed.stderr or "") or f"exit {completed.returncode}"
+    """A failed ``pane read``'s detail: trimmed stderr, else ``exit N``, shown as :func:`_detail`."""
+    detail = strip_space(completed.stderr or "")
+    return display(detail) if detail else f"exit {completed.returncode}"
 
 
 # ---- protocol narrowing, worded exactly as the native edition words it ---------------------------

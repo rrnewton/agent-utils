@@ -398,6 +398,17 @@ fn write_json_string(out: &mut String, value: &str) {
             control if u32::from(control) < 0x20 => {
                 let _ = write!(out, "\\u{:04x}", u32::from(control));
             }
+            // DEL, the C1 controls, and every invisible character are written as escapes too, so
+            // nothing a terminal acts on or a reader cannot see reaches a terminal raw.
+            unsafe_character
+                if matches!(u32::from(unsafe_character), 0x7f..=0x9f)
+                    || is_invisible(unsafe_character) =>
+            {
+                let mut units = [0_u16; 2];
+                for unit in unsafe_character.encode_utf16(&mut units) {
+                    let _ = write!(out, "\\u{unit:04x}");
+                }
+            }
             other => out.push(other),
         }
     }
@@ -483,7 +494,9 @@ fn write_json(out: &mut String, value: &Value, indent: Option<usize>, level: usi
 
 /// Serialize `value` in the JSON text form both editions share: two-space indentation, keys
 /// sorted at every level whatever `serde_json` features are enabled, floats as
-/// [`python_float_repr`] writes them, and only `"`, `\`, and C0 controls escaped.
+/// [`python_float_repr`] writes them, and `"`, `\`, the C0 and C1 controls, DEL, and every
+/// invisible character ([`is_invisible`]) escaped, the last three as `\uXXXX` (a surrogate pair
+/// above U+FFFF). Other non-ASCII text is written as itself.
 #[must_use]
 pub fn json_pretty(value: &Value) -> String {
     let mut out = String::new();

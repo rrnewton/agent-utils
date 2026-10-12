@@ -30,6 +30,7 @@ __all__ = [
     "is_default_ignorable",
     "is_format_character",
     "is_invisible",
+    "json_text",
     "name_violation",
     "number_text",
     "os_error_text",
@@ -154,6 +155,51 @@ def _character_class(ranges: list[tuple[int, int]]) -> str:
         re.escape(chr(low)) if low == high else f"{re.escape(chr(low))}-{re.escape(chr(high))}"
         for low, high in ranges
     )
+
+
+#: Every character JSON output escapes beyond what JSON itself requires: DEL, the C1 controls,
+#: and every invisible character (:func:`is_invisible`). JSON escapes C0 controls already.
+_JSON_UNSAFE = re.compile(
+    "["
+    + _character_class(
+        [
+            (0x7F, 0x9F),
+            *FORMAT_CHARACTER_RANGES,
+            *DEFAULT_IGNORABLE_RANGES,
+            *((ord(character), ord(character)) for character in sorted(BLANK_CHARACTERS)),
+            *(
+                (ord(character), ord(character))
+                for character in sorted(UNICODE_WHITESPACE)
+                if ord(character) > 0x7F
+            ),
+        ]
+    )
+    + "]"
+)
+
+
+def _json_escape(match: re.Match[str]) -> str:
+    code = ord(match.group())
+    if code <= 0xFFFF:
+        return f"\\u{code:04x}"
+    code -= 0x10000
+    return f"\\u{0xD800 + (code >> 10):04x}\\u{0xDC00 + (code & 0x3FF):04x}"
+
+
+def json_text(document: object, *, indent: int | None = None) -> str:
+    """Serialize ``document`` in the JSON text form both editions share.
+
+    Keys sorted at every level, ``, `` and ``: `` separators (two-space indentation with
+    ``indent=2``), non-ASCII text written as itself -- except that DEL, the C1 controls, and every
+    invisible character are written as ``\\uXXXX`` escapes (a surrogate pair above U+FFFF), so a
+    project path or a command holding U+009B, U+202E, U+2028, or U+200B cannot reach a terminal
+    raw through ``herdr-run config`` or any other JSON herdr-run prints or stores. A JSON reader
+    gets back exactly the same strings.
+    """
+    text = json.dumps(document, indent=indent, sort_keys=True, ensure_ascii=False)
+    if text.isascii():
+        return text
+    return _JSON_UNSAFE.sub(_json_escape, text)
 
 
 def name_violation(value: str) -> str | None:
@@ -321,6 +367,11 @@ def _parse_int(token: str) -> object:
 
 
 def _reject_surrogates(value: object) -> None:
+    """Refuse a lone surrogate in ``value``: a string, or one inside arrays (nested any depth).
+
+    Objects are not entered: every object was already checked, pair by pair, as it was parsed
+    (:func:`_checked_object`), so each string is looked at once however deep it is.
+    """
     stack = [value]
     while stack:
         current = stack.pop()
@@ -329,9 +380,20 @@ def _reject_surrogates(value: object) -> None:
                 raise ValueError("lone surrogate in JSON string")
         elif isinstance(current, list):
             stack.extend(current)
-        elif isinstance(current, dict):
-            stack.extend(current.keys())
-            stack.extend(current.values())
+
+
+def _checked_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    """Build one JSON object, checking EVERY key and value as parsed, not only the survivors.
+
+    A strict reader refuses a lone surrogate escape wherever it appears, including in a value that
+    a later duplicate key replaces; checking only the finished document would accept
+    ``{"a": "\\ud800", "a": 1}``, which the native edition refuses. The last duplicate wins, as it
+    does in a plain reading.
+    """
+    for key, value in pairs:
+        _reject_surrogates(key)
+        _reject_surrogates(value)
+    return dict(pairs)
 
 
 #: Deepest JSON nesting refused: a document whose arrays and objects nest this many levels deep is
@@ -360,14 +422,16 @@ def strict_json_loads(text: str) -> object:
 
     ``NaN``/``Infinity`` are refused, a float that overflows is refused, an integer that does not
     fit 64 bits becomes the nearest float (and is refused when even that overflows), a lone
-    surrogate escape is refused, and so is nesting :data:`JSON_MAX_DEPTH` levels deep. Every
-    failure is a ``ValueError``; nothing else escapes.
+    surrogate escape is refused wherever it appears (even in a value a later duplicate key
+    replaces), and so is nesting :data:`JSON_MAX_DEPTH` levels deep. Every failure is a
+    ``ValueError``; nothing else escapes.
     """
     if _json_too_deep(text):
         raise ValueError(f"JSON nested {JSON_MAX_DEPTH} or more levels deep")
     try:
         document: object = json.loads(
             text,
+            object_pairs_hook=_checked_object,
             parse_constant=_reject_constant,
             parse_float=_parse_float,
             parse_int=_parse_int,
