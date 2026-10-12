@@ -10,7 +10,7 @@
 # tool's lightweight unboxed gate. The root includes `tests.dag.yaml` directly so vibe-talk shares
 # one scheduler and browser cap with the other repository fragments.
 
-.PHONY: validate validate-boxed dag-check fmt check scripts-check contract contract-check typecheck test page pwa-installability enter-to-send-browser offline-cache-browser reactions-browser rich-headers-browser read-aloud-browser post-confirm-browser view-switch-browser read-modes-browser keyboard-browser two-column-browser bookmark-browser reply-continuity-browser voice-read-acceptance-self-test android-speech-self-test live-hint-adapter-self-test container-smoke filter-place-browser voice-composer-browser thread-button-browser done-feedback-browser elision-browser clean
+.PHONY: validate validate-boxed dag-check fmt check scripts-check contract contract-check typecheck test page pwa-installability enter-to-send-browser offline-cache-browser reactions-browser rich-headers-browser read-aloud-browser post-confirm-browser view-switch-browser read-modes-browser keyboard-browser two-column-browser bookmark-browser reply-continuity-browser voice-read-acceptance-self-test android-speech-self-test live-hint-adapter-self-test container-smoke filter-place-browser search-dates-browser voice-composer-browser thread-button-browser done-feedback-browser elision-browser clean
 
 # The whole gate for this tool, cheapest and most likely to fail first.
 #
@@ -210,6 +210,15 @@ bookmark-browser:
 # PNG of each stage.
 filter-place-browser:
 	python3 tests/filter_place_browser.py $(if $(WEB_ROOT),--web-root $(WEB_ROOT)) $(if $(SCREENSHOTS),--screenshots $(SCREENSHOTS))
+
+# `#249 search-highlight`, `#250 date-separators` and `#251 author-filter` in a real Chromium at
+# 1280x800 (mouse) and 412x915 (touch), over a week of a channel read at a fixed noon: a rule above the
+# first message of each day, the bookmark's line nearer the message than its day's; a search's hits lit,
+# its gaps said with the days they reach, each line as wide as the list and touching no row; and the
+# author filter showing only the owner's prompts with the one chosen left where it stood. Pass
+# WEB_ROOT=dir to run it against another copy of the page, and SCREENSHOTS=dir to keep a PNG of each stage.
+search-dates-browser:
+	python3 tests/search_dates_browser.py $(if $(WEB_ROOT),--web-root $(WEB_ROOT)) $(if $(SCREENSHOTS),--screenshots $(SCREENSHOTS))
 
 # `#247 reply-continuity` in a real Chromium at 1280x800 (mouse) and 412x915 (touch), at 80%, 100% and
 # 130% text: Reply on a message in the middle of the list, just under where the title bar goes, half

@@ -610,7 +610,38 @@ class FakeElement {
     const own = this.textContent.length
       ? Math.ceil(this.textContent.length / CHARS_PER_LINE) * LINE_PX
       : 0;
-    return this.children.reduce((total, kid) => total + kid.height(), own);
+    // A line drawn between rows is placed outside its row's box, in a margin the row keeps for it.
+    return this.children.reduce((total, kid) => total + (kid.isRowSeam() ? 0 : kid.outerHeight()), own);
+  }
+
+  /**
+   * Whether this is a line drawn between rows (`.row-seam`, `#249 search-highlight` and `#250
+   * date-separators`): web/voice.css places one absolutely, in a margin its row keeps above its box
+   * (or below it, `.row-seam-below`), so it takes no room inside the row and moves the row's box by
+   * its height.
+   */
+  isRowSeam() {
+    return this.tagName === "div" && this.hasClass("row-seam");
+  }
+
+  /** The room this element keeps above and below its box for the lines drawn in it. */
+  seamRoom() {
+    let above = 0;
+    let below = 0;
+    for (const kid of this.children) {
+      if (!kid.isRowSeam() || kid.hidden) continue;
+      if (kid.hasClass("row-seam-below")) below += kid.contentHeight();
+      else above += kid.contentHeight();
+    }
+    return { above, below };
+  }
+
+  /** What this element occupies in its parent: its box, and the room it keeps for lines either side of it. */
+  outerHeight() {
+    const box = this.height();
+    if (box === 0 && (this.hidden || this.hasClass("search-hidden"))) return 0;
+    const room = this.seamRoom();
+    return room.above + box + room.below;
   }
 
   /**
@@ -670,14 +701,20 @@ class FakeElement {
 
   /** Distance from the top of the scrolling content. */
   offsetTop() {
+    // A line between rows stands in the room its row keeps above its box, or below it.
+    if (this.isRowSeam() && this.parentNode) {
+      const row = this.parentNode;
+      return this.hasClass("row-seam-below") ? row.offsetTop() + row.height() : row.offsetTop() - this.contentHeight();
+    }
     let top = 0;
     let node = this;
     while (node.parentNode) {
+      top += node.seamRoom().above;
       for (const sibling of node.parentNode.children) {
         if (sibling === node) {
           break;
         }
-        top += sibling.height();
+        top += sibling.isRowSeam() ? 0 : sibling.outerHeight();
       }
       if (SCROLLERS.has(node.parentNode.id)) {
         return top;
@@ -35890,6 +35927,8 @@ test("a pinned message shows its reactions in the Pinned list, and redraws when 
 const RUN_THREAD = "spaces/A/threads/canary";
 const runId = (n) => `77000000000000${String(n).padStart(5, "0")}`;
 const readRunLineOf = (li) => li.children.find((node) => node.className === "read-run");
+/** What a run's line says of its messages, the days it brings (`#250 date-separators`) left out. */
+const runCountWords = (line) => String(line.textContent).replace(/ · [^…]+ …$/, " …");
 const collapsedRows = (page) =>
   page.el("discord-log").children.filter((li) => li.hasAttribute("data-read-run"));
 /**
@@ -37007,7 +37046,7 @@ test("Collapse read and gathered replies: a reply below a run's line is not draw
   await gathered.settle();
   assert.deepStrictEqual(shownIds(gathered), GATHERED);
   await chooseReadMode(gathered, "Collapse read");
-  assert.equal(readRunLineOf(rowWithId(gathered, "597")).textContent, "… 3 read messages …",
+  assert.equal(runCountWords(readRunLineOf(rowWithId(gathered, "597"))), "… 3 read messages …",
     "the read messages outside the stack were not collapsed");
   for (const id of ["602", "603"]) {
     assert.equal(rowWithId(gathered, id).hasAttribute("data-read-run"), false, `gathered reply ${id} was collapsed`);
@@ -44254,13 +44293,17 @@ function nodeWithinFixture(root, node) {
 // idiom as the "4 read messages" collapsed indicators. We should show gaps and say "N unmatched
 // messages"." A line in each gap a filter choosing rows leaves, counting messages as a run does.
 
-/** Each row's lines as `[id, above, below]`, the words of each or null, for the rows drawing any. */
+/**
+ * Each row's gap lines as `[id, above, below]`, the words of each or null, for the rows drawing any:
+ * the days a line says (`#250 date-separators`) and a day rule of its own left out.
+ */
 function seamsOf(page, list = "discord-log") {
+  const words = (line) => (line ? String(line.textContent).replace(/ · [^…]+ …$/, " …") : null);
   return page.el(list).children.map((li) => {
     const line = (below) => li.children.find((kid) => kid.hasClass("row-seam") && kid.hasClass("row-seam-below") === below);
-    const above = line(false);
-    const under = line(true);
-    return [li.getAttribute("data-id"), above ? above.textContent : null, under ? under.textContent : null];
+    const above = li.getAttribute("data-seam") === "gap" ? line(false) : null;
+    const under = li.getAttribute("data-seam-below") === "gap" ? line(true) : null;
+    return [li.getAttribute("data-id"), words(above), words(under)];
   }).filter(([, above, below]) => above !== null || below !== null);
 }
 
@@ -44284,7 +44327,7 @@ test("`#249 search-highlight`: a search draws a line in each gap it leaves, coun
   const line = rows.find((li) => li.getAttribute("data-id") === "8").children[0];
   assert.equal(line.className, "row-seam", "the line is not the row's first child, ahead of its message");
   assert.equal(line.getAttribute("role"), "separator", "the line is not a separator to a screen reader");
-  assert.equal(line.getAttribute("aria-label"), "2 unmatched messages");
+  assert.match(line.getAttribute("aria-label"), /^2 unmatched messages( · .+)?$/);
   assert.equal(rows.find((li) => li.getAttribute("data-id") === "8").getAttribute("data-seam"), "gap");
   // A trailing gap is drawn below the last match; one message is said as one.
   await page.el("search-field").setValue("step 8");
@@ -44295,7 +44338,8 @@ test("`#249 search-highlight`: a search draws a line in each gap it leaves, coun
   // Cleared, every line goes, and its row's attribute with it.
   await page.el("search-field").setValue("");
   assert.deepStrictEqual(seamsOf(page), [], "a line outlived the search");
-  assert.ok(rows.every((li) => !li.hasAttribute("data-seam") && !li.hasAttribute("data-seam-below")));
+  assert.ok(rows.every((li) => li.getAttribute("data-seam") !== "gap" && !li.hasAttribute("data-seam-below")),
+    "a row kept the attribute of a gap that went");
   // Whose messages and Links choose rows too, and draw their gaps; Pinned alone is its own list.
   await chooseAuthor(page, "mine");
   assert.deepStrictEqual(seamsOf(page), [
@@ -44398,4 +44442,250 @@ test("`#249 search-highlight`: the cards of the right column are marked where th
   await page.el("search-toggle").click();
   await page.settle();
   assert.equal(page.el("side-cards").descendants().filter((node) => node.tagName === "mark").length, 0, "a card kept its mark");
+});
+
+// --- days between rows (#250 date-separators) ---------------------------------------------------------
+//
+// The owner: "It would also be good to have temporal markers, intelligently. We could have more
+// horizontal rule separators, not for collapsed messages but just for date separators. "---- Oct 3, Mon
+// ----" for a day separator at midnight. If you filter down to sparse hits, consecutive separators
+// should collapse "Oct 3 - 5"." Every time here is built from the device's own calendar, `new Date(y, m,
+// d, h, min)`, so a midnight is a midnight in whatever zone the suite runs in, and the page's clock is
+// set to a local noon on Monday 12 October 2026.
+
+/** A local time on this device's calendar, as the server writes a timestamp. */
+const localStamp = (month, day, hour = 12, minute = 0, year = 2026) => new Date(year, month - 1, day, hour, minute).toISOString();
+
+/** The page's clock at a local time: `#250`'s Today. */
+const clockAt = (page, month, day, hour = 12, year = 2026) => page.setClock(new Date(year, month - 1, day, hour, 0).getTime());
+
+/** Each row's lines, as `[id, kind, above, below]`, for the rows drawing any. */
+function linesOf(page, list = "discord-log") {
+  return page.el(list).children.map((li) => {
+    const line = (below) => li.children.find((kid) => kid.hasClass("row-seam") && kid.hasClass("row-seam-below") === below);
+    const above = line(false);
+    const under = line(true);
+    return [li.getAttribute("data-id"), li.getAttribute("data-seam"), above ? above.textContent : null, under ? under.textContent : null];
+  }).filter(([, , above, below]) => above !== null || below !== null);
+}
+
+/** Seven messages over ten days, either side of two midnights; "engine" in three. */
+function dayChannel() {
+  return [
+    message({ id: "1", content: "engine one", timestamp: localStamp(10, 3, 23, 58) }),
+    message({ id: "2", content: "plain, a minute past midnight", timestamp: localStamp(10, 4, 0, 1) }),
+    message({ id: "3", content: "plain again", timestamp: localStamp(10, 4, 10) }),
+    message({ id: "4", content: "engine two", timestamp: localStamp(10, 6, 9) }),
+    message({ id: "5", content: "plain yesterday", timestamp: localStamp(10, 11, 20) }),
+    message({ id: "6", content: "engine three", timestamp: localStamp(10, 12, 8) }),
+    message({ id: "7", content: "plain this morning", timestamp: localStamp(10, 12, 9) }),
+  ];
+}
+
+test("`#250 date-separators`: a rule above the first message of each day, at the device's midnight, with Yesterday and Today by name", async () => {
+  const page = newPage();
+  clockAt(page, 10, 12);
+  await signIn(page);
+  await showDiscord(page, dayChannel());
+  assert.deepStrictEqual(linesOf(page), [
+    ["1", "day", "Oct 3, Sat", null],
+    ["2", "day", "Oct 4, Sun", null],
+    ["4", "day", "Oct 6, Tue", null],
+    ["5", "day", "Yesterday", null],
+    ["6", "day", "Today", null],
+  ], "the days are not ruled off where they begin, or not said as the owner asked");
+  const line = page.el("discord-log").children[0].children[0];
+  assert.equal(line.className, "row-seam", "the rule is not the row's first child, ahead of its message");
+  assert.equal(line.getAttribute("role"), "separator");
+  assert.equal(line.getAttribute("aria-label"), "Oct 3, Sat");
+  // Its own room, solid, between the rows.
+  assert.match(cssBlock('#discord-log li.discord-message[data-seam="day"]'), /--seam-room:\s*var\(--day-room\)/);
+  assert.match(cssBlock('#discord-log li.discord-message[data-seam="day"] > .row-seam:not(.row-seam-below)::before'),
+    /border-top-style:\s*solid/, "a day's rule is drawn as a gap is");
+  // A day of another year says its year.
+  page.messages = [message({ id: "9", content: "from last year", timestamp: localStamp(12, 30, 18, 0, 2025) }), ...dayChannel()];
+  await reReadChannel(page);
+  assert.deepStrictEqual(linesOf(page)[0], ["9", "day", "Dec 30, 2025, Tue", null]);
+  // Nothing is formatted by a date formatter per row: the words are the page's own.
+  const made = page.dateFormatsMade;
+  await reReadChannel(page);
+  assert.ok(page.dateFormatsMade - made <= 1, `a redraw of the days made ${page.dateFormatsMade - made} formatters`);
+});
+
+test("`#250 date-separators`: filtered to sparse hits, the days in each gap are one range on its line, never a stack of rules", async () => {
+  const page = newPage();
+  clockAt(page, 10, 12);
+  await signIn(page);
+  await showDiscord(page, dayChannel());
+  await search(page, "engine");
+  await page.settle();
+  assert.deepStrictEqual(linesOf(page), [
+    ["1", "day", "Oct 3, Sat", null],
+    ["4", "gap", "… 2 unmatched messages · Oct 4 – 6 …", null],
+    ["6", "gap", "… 1 unmatched message · Yesterday – Today …", "… 1 unmatched message …"],
+  ], "the days a filter skips are not one range on the gap's line");
+  // A gap that crosses no day says none; one across a month says both months; one before the first
+  // match says the days it reaches, as does one after the last.
+  await page.el("search-field").setValue("plain");
+  assert.deepStrictEqual(linesOf(page), [
+    ["2", "gap", "… 1 unmatched message · Oct 3 – 4 …", null],
+    ["5", "gap", "… 1 unmatched message · Oct 6 – Yesterday …", null],
+    ["7", "gap", "… 1 unmatched message · Today …", null],
+  ]);
+  page.messages = [
+    message({ id: "21", content: "engine late september", timestamp: localStamp(9, 29, 10) }),
+    message({ id: "22", content: "plain", timestamp: localStamp(9, 30, 10) }),
+    message({ id: "23", content: "engine early october", timestamp: localStamp(10, 2, 10) }),
+    message({ id: "24", content: "plain", timestamp: localStamp(10, 4, 10) }),
+    message({ id: "25", content: "plain", timestamp: localStamp(10, 5, 10) }),
+  ];
+  await reReadChannel(page);
+  await page.el("search-field").setValue("engine");
+  assert.deepStrictEqual(linesOf(page), [
+    ["21", "day", "Sep 29, Tue", null],
+    ["23", "gap", "… 1 unmatched message · Sep 30 – Oct 2 …", "… 2 unmatched messages · Oct 4 – 5 …"],
+  ]);
+  // Cleared, each day has its own rule again.
+  await page.el("search-field").setValue("");
+  assert.deepStrictEqual(linesOf(page).map(([id, kind]) => [id, kind]),
+    [["21", "day"], ["22", "day"], ["23", "day"], ["24", "day"], ["25", "day"]]);
+});
+
+test("`#250 date-separators`: a collapsed run's line says the days it brings, and the next day is ruled after it", async () => {
+  const page = newPage();
+  clockAt(page, 10, 12);
+  await signIn(page);
+  for (const id of ["2", "3", "4"]) page.dealtWith.add(id);
+  await showDiscord(page, dayChannel());
+  await chooseReadMode(page, "Collapse read");
+  assert.equal(rowWithId(page, "2").getAttribute("data-read-run"), "head", "the fixture collapsed no run");
+  assert.equal(readRunLineOf(rowWithId(page, "2")).textContent, "… 3 read messages · Oct 4 – 6 …",
+    "the run's line does not say the days it covers");
+  assert.deepStrictEqual(linesOf(page), [
+    ["1", "day", "Oct 3, Sat", null], ["5", "day", "Yesterday", null], ["6", "day", "Today", null],
+  ], "a day inside the run has a rule of its own, or the next day has none");
+  // A run within one day already said says no day.
+  page.dealtWith.delete("4");
+  await reReadChannel(page);
+  await page.settle();
+  assert.equal(readRunLineOf(rowWithId(page, "2")).textContent, "… 2 read messages · Oct 4 …".replace("Oct 4", "Oct 4, Sun"));
+  assert.deepStrictEqual(linesOf(page).map(([id]) => id), ["1", "4", "5", "6"]);
+});
+
+test("`#250 date-separators`: a day's rule and the bookmark above one message: the day above, the bookmark nearer the message, each in room of its own", async () => {
+  const page = newPage();
+  clockAt(page, 10, 12);
+  page.serveBookmark = true;
+  await signIn(page);
+  await showDiscord(page, dayChannel());
+  await bookmarkRow(page, "4");
+  assert.deepStrictEqual(bookmarkAt(page), { id: "4", place: "above" });
+  const row = rowWithId(page, "4");
+  assert.deepStrictEqual(row.children.slice(0, 2).map((kid) => kid.className), ["row-seam", "bookmark-line"],
+    "the day's rule and the bookmark's line are not in order, the bookmark nearer the message");
+  assert.equal(row.getAttribute("data-seam"), "day");
+  assert.match(cssBlock('#discord-log li.discord-message[data-seam][data-bookmark="above"] > .row-seam:not(.row-seam-below)'),
+    /bottom:\s*calc\(100% \+ 1px \+ var\(--bookmark-room\)\)/, "the day's rule is not drawn above the bookmark's line");
+  // In the layout model, the rule stands above the bookmark's line, which stands above the message.
+  const rule = row.children[0].getBoundingClientRect();
+  assert.ok(rule.bottom <= row.getBoundingClientRect().top, "the day's rule overlaps the message");
+});
+
+test("`#250 date-separators`: the first redraw after midnight says Yesterday where it said Today", async () => {
+  const page = newPage();
+  clockAt(page, 10, 12, 23);
+  await signIn(page);
+  await showDiscord(page, dayChannel());
+  assert.deepStrictEqual(linesOf(page).slice(-2).map(([, , words]) => words), ["Yesterday", "Today"]);
+  clockAt(page, 10, 13, 0);
+  await reReadChannel(page);
+  assert.deepStrictEqual(linesOf(page).slice(-2).map(([, , words]) => words), ["Oct 11, Sun", "Yesterday"],
+    "the days were not said again once the device's day had turned");
+});
+
+test("`#250 date-separators`: a redraw that changes nothing writes no rule, and reads no row's layout", async () => {
+  const run = async (script) => {
+    const page = newPage(new Map(), script);
+    clockAt(page, 10, 12);
+    await signIn(page);
+    await showDiscord(page, dayChannel());
+    const set = FakeElement.prototype.setAttribute;
+    const rect = FakeElement.prototype.getBoundingClientRect;
+    const list = page.el("discord-log");
+    let written = 0;
+    let measured = 0;
+    FakeElement.prototype.setAttribute = function counted(name, value) {
+      if (name === "data-seam" || name === "data-seam-below" || (this.isRowSeam() && name === "aria-label")) written += 1;
+      return set.call(this, name, value);
+    };
+    FakeElement.prototype.getBoundingClientRect = function counted() {
+      if (nodeWithinFixture(list, this)) measured += 1;
+      return rect.call(this);
+    };
+    const rows = [...list.children];
+    try {
+      // Every redraw passes over the lines: opening the search bar, with nothing typed, is one.
+      await search(page, "");
+      await page.settle();
+    } finally {
+      FakeElement.prototype.setAttribute = set;
+      FakeElement.prototype.getBoundingClientRect = rect;
+    }
+    assert.ok(list.children.every((li, at) => li === rows[at]), "the redraw replaced the rows; this proves nothing");
+    return { written, measured };
+  };
+  const drawn = await run(SCRIPT);
+  assert.equal(drawn.written, 0, "a redraw that changed nothing wrote the days again");
+  // The same redraw with no lines drawn at all reads exactly as much of the layout.
+  const bare = await run(brokenScript("function drawSeams(list) {\n", "function drawSeams(list) {\n  if (list) return;\n"));
+  assert.equal(drawn.measured, bare.measured, `the lines read ${drawn.measured - bare.measured} rows' layout on a redraw`);
+});
+
+test("`#250 date-separators`: each column and the Pinned list say their own days, and a thread its own", async () => {
+  const page = newPage();
+  clockAt(page, 10, 12);
+  const data = threadData();
+  const days = [localStamp(10, 3, 9), localStamp(10, 4, 9), localStamp(10, 11, 9), localStamp(10, 12, 8), localStamp(10, 12, 9)];
+  data.messages.forEach((m, i) => { m.timestamp = days[i]; });
+  page.threadingSupported = true;
+  page.threads = data.threads;
+  for (const m of [data.messages[0], data.messages[3]]) page.pinned.set(m.id, storedPin(m));
+  page.servePinsRevision = true;
+  page.pinsRevision = 2;
+  await signIn(page);
+  await showDiscord(page, data.messages);
+  await twoColumns(page);
+  await threadBadge(rowWithId(page, "201")).click();
+  await page.settle();
+  // Main on the left: 200, 201, 203. The first thread on the right: 201, 202.
+  assert.deepStrictEqual(linesOf(page, "discord-log").map(([id, , words]) => [id, words]),
+    [["200", "Oct 3, Sat"], ["201", "Oct 4, Sun"], ["203", "Today"]]);
+  assert.deepStrictEqual(linesOf(page, "side-log").map(([id, , words]) => [id, words]),
+    [["201", "Oct 4, Sun"], ["202", "Yesterday"]], "the right column does not say its own days");
+  await page.setDesk(false);
+  await showPinned(page);
+  assert.deepStrictEqual(linesOf(page, "pinned-log").map(([id, , words]) => [id, words]),
+    [["200", "Oct 3, Sat"], ["203", "Today"]], "the Pinned list does not say its days");
+});
+
+test("`#250 date-separators`: replies gathered under their message, out of time order, say no day and move none", async () => {
+  const page = newPage();
+  clockAt(page, 10, 12);
+  const data = scatteredThread();
+  const days = { 597: 3, 598: 3, 599: 3, 600: 3, 601: 4, 602: 5, 603: 5, 604: 6, 605: 7, 606: 8, 607: 9, 608: 10, 609: 10 };
+  data.messages.forEach((m, i) => { m.timestamp = localStamp(10, days[m.id], 9, i); });
+  page.threadingSupported = true;
+  page.threads = data.threads;
+  await signIn(page);
+  await showDiscord(page, data.messages);
+  assert.deepStrictEqual(linesOf(page).map(([id, , words]) => [id, words]), [
+    ["597", "Oct 3, Sat"], ["601", "Oct 4, Sun"], ["602", "Oct 5, Mon"], ["604", "Oct 6, Tue"],
+    ["605", "Oct 7, Wed"], ["606", "Oct 8, Thu"], ["607", "Oct 9, Fri"], ["608", "Oct 10, Sat"],
+  ]);
+  await gatherChip(page, "601").click();
+  await page.settle();
+  assert.deepStrictEqual(shownIds(page), GATHERED);
+  assert.deepStrictEqual(linesOf(page).map(([id, , words]) => [id, words]), [
+    ["597", "Oct 3, Sat"], ["601", "Oct 4, Sun"], ["605", "Oct 7, Wed"], ["608", "Oct 10, Sat"],
+  ], "a gathered reply was ruled off as though it were in time order");
 });

@@ -3213,8 +3213,8 @@ function markSearchHits(row, terms) {
 /** Whether a filter is choosing rows: the search text, Links, or whose messages. */
 const rowsChosen = () => readRunsSuspended();
 
-/** What a gap's line says. */
-const gapWords = (count) => `… ${count} unmatched message${count === 1 ? "" : "s"} …`;
+/** What a gap's line says, and the days it reaches when it reaches any (`#250 date-separators`). */
+const gapWords = (count, days = "") => `… ${count} unmatched message${count === 1 ? "" : "s"}${days ? ` · ${days}` : ""} …`;
 
 /** The line on `row` above it (`below` false) or below it, made once and kept on it. */
 function seamLineOf(row, below) {
@@ -3259,32 +3259,155 @@ function placeSeam(row, seam, below) {
   }
 }
 
+// `#250 date-separators`. The owner: "It would also be good to have temporal markers, intelligently.
+// We could have more horizontal rule separators, not for collapsed messages but just for date
+// separators. "---- Oct 3, Mon ----" for a day separator at midnight. If you filter down to sparse
+// hits, consecutive separators should collapse "Oct 3 - 5"."
+//
+// THE SAME PASS DRAWS THE DAYS. A row's day is the device's own calendar day of its first message (a
+// combined row is glommed within seconds). For each row shown, the days it brings — its own, and its
+// stretch's — later than the last day already said are said once, as one range, from the first of
+// them to the row's own:
+//
+//   * with a stretch, on the stretch's line: "… 12 unmatched messages · Oct 3 – 5 …", or on a
+//     collapsed run's, "… 12 read messages · Oct 3 – 5 …";
+//   * with none, as a day rule of its own above the row: "Oct 3, Mon".
+//
+// So a day boundary inside a stretch is never a second line, and days a filter skips are one range,
+// never a stack of rules: the owner's "consecutive separators should collapse". The first row shown
+// always says its day, so the reader always knows which day they are in. A gap after the last row
+// shown says the days it reaches. Gathered replies (`#215 reply-coalesce`), drawn out of time order,
+// and a row whose time cannot be read say no day and move none.
+//
+// Today and Yesterday by name; another year's date with its year; a weekday on a single day only. The
+// device's own zone, by the local calendar getters — never arithmetic on milliseconds, which a change
+// of clocks or a flight would break — and "today" read once a pass, so the first redraw after midnight
+// says Yesterday where it said Today.
+
+/** The months and weekdays, as every other word on this page is: English, and short. */
+const MONTH_NAMES = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+const WEEKDAY_NAMES = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+
+/** A local calendar day as a number that sorts as the days do: yyyymmdd. */
+const dayKeyOf = (date) => date.getFullYear() * 10000 + (date.getMonth() + 1) * 100 + date.getDate();
+
+/** The day of `row`'s first message on this device, or null: none readable, or a gathered reply. */
+function rowDay(row) {
+  const gathered = row.getAttribute("data-coalesce");
+  if ((gathered !== null && gathered !== "parent") || row.hasAttribute("data-stack-under")) return null;
+  const sent = rowSentMs(row);
+  return Number.isFinite(sent) ? dayKeyOf(new Date(sent)) : null;
+}
+
 /**
- * The rows of `list` that lines are drawn between, and what each shown row has above and below it:
- * `{above, below}`, each `{kind, words}` or null.
+ * Today, yesterday and this year on this device's calendar, read once for a pass.
+ *
+ * @typedef {{today: number, yesterday: number, year: number}} DayClock
+ * @returns {DayClock}
+ */
+function dayClock() {
+  const now = new Date();
+  return {
+    today: dayKeyOf(now),
+    yesterday: dayKeyOf(new Date(now.getFullYear(), now.getMonth(), now.getDate() - 1)),
+    year: now.getFullYear(),
+  };
+}
+
+/** A day key's year, month (from 0) and day of the month. */
+const dayParts = (key) => ({ year: Math.floor(key / 10000), month: Math.floor(key / 100) % 100 - 1, day: key % 100 });
+
+/** One day, as a rule says it: "Today", "Yesterday", "Oct 3, Mon", or "Oct 3, 2025, Fri". */
+function dayWords(key, clock) {
+  if (key === clock.today) return "Today";
+  if (key === clock.yesterday) return "Yesterday";
+  const { year, month, day } = dayParts(key);
+  const weekday = WEEKDAY_NAMES[new Date(year, month, day).getDay()];
+  return `${MONTH_NAMES[month]} ${day},${year === clock.year ? "" : ` ${year},`} ${weekday}`;
+}
+
+/**
+ * The days from `from` to `to`, as a line says them: one day as `dayWords`; a range with no weekdays,
+ * "Oct 3 – 5", "Sep 29 – Oct 2", "Dec 30, 2025 – Jan 2", ending "– Today" or "– Yesterday".
+ */
+function dayRangeWords(from, to, clock) {
+  if (from >= to) return dayWords(to, clock);
+  const named = (key) => (key === clock.today ? "Today" : key === clock.yesterday ? "Yesterday" : null);
+  const start = dayParts(from);
+  const end = dayParts(to);
+  const date = (parts, withYear) => `${MONTH_NAMES[parts.month]} ${parts.day}${withYear ? `, ${parts.year}` : ""}`;
+  if (named(to)) return `${named(from) || date(start, start.year !== clock.year)} – ${named(to)}`;
+  const tail = start.year === end.year && start.year !== clock.year ? `, ${start.year}` : "";
+  if (start.year === end.year && start.month === end.month) return `${date(start, false)} – ${end.day}${tail}`;
+  if (start.year === end.year) return `${date(start, false)} – ${date(end, false)}${tail}`;
+  return `${date(start, start.year !== clock.year)} – ${date(end, end.year !== clock.year)}`;
+}
+
+/**
+ * The rows of `list` that lines are drawn between; what each shown row has above and below it,
+ * `{above, below}`, each `{kind, words}` or null; and what each collapsed run's line says of its days.
  *
  * @typedef {{kind: string, words: string}} Seam
  */
 function seamsFor(list) {
-  const rows = /** @type {HTMLElement[]} */ ([...list.children]).filter((row) => isMessageRow(row) && !row.hasAttribute("data-card"));
+  // Rows of the page's own making, which carry what was drawn on them (`seamLine`, `runDays`).
+  const rows = /** @type {any[]} */ ([...list.children]).filter((row) => isMessageRow(row) && !row.hasAttribute("data-card"));
   const gaps = rowsChosen();
-  /** @type {Map<HTMLElement, {above: Seam | null, below: Seam | null}>} */
+  const clock = dayClock();
+  /** @type {Map<any, {above: Seam | null, below: Seam | null}>} */
   const wanted = new Map();
+  /** @type {Map<any, string>} */
+  const runDays = new Map();
+  // The latest day already said, and the stretch since the last row shown: its messages, its days.
+  let said = null;
   let hidden = 0;
+  let hiddenDays = [];
   let last = null;
-  for (const row of rows) {
-    // A row hidden in a collapsed run is counted by its run's line.
-    if (row.getAttribute("data-read-run") === "member") continue;
+  // The days among `days` later than the last said, as `{from, to}`, or null.
+  const fresh = (days) => {
+    const later = days.filter((day) => day !== null && (said === null || day > said));
+    return later.length ? { from: Math.min(...later), to: Math.max(...later) } : null;
+  };
+  for (let at = 0; at < rows.length; at += 1) {
+    const row = rows[at];
+    const role = row.getAttribute("data-read-run");
+    // A row hidden in a collapsed run is said by its run's line.
+    if (role === "member") continue;
     if (!rowShown(row)) {
       hidden += idsOf(row).length;
+      hiddenDays.push(rowDay(row));
       continue;
     }
-    wanted.set(row, { above: gaps && hidden > 0 ? { kind: "gap", words: gapWords(hidden) } : null, below: null });
+    if (role === "head") {
+      // The run's line says the days the run brings, from the first of them to its last.
+      const days = [rowDay(row)];
+      for (let next = at + 1; next < rows.length && rows[next].getAttribute("data-read-run") === "member"; next += 1) {
+        days.push(rowDay(rows[next]));
+      }
+      const span = fresh([...hiddenDays, ...days]);
+      runDays.set(row, span ? dayRangeWords(span.from, span.to, clock) : "");
+      if (span) said = span.to;
+      wanted.set(row, { above: null, below: null });
+    } else {
+      const own = rowDay(row);
+      const span = fresh([...hiddenDays, own]);
+      // Up to the row's own day, which the line stands right above.
+      const days = span ? dayRangeWords(span.from, own === null ? span.to : own, clock) : "";
+      let above = null;
+      if (gaps && hidden > 0) above = { kind: "gap", words: gapWords(hidden, days) };
+      else if (days) above = { kind: "day", words: days };
+      wanted.set(row, { above, below: null });
+      if (span) said = Math.max(span.to, own === null ? span.to : own);
+    }
     hidden = 0;
+    hiddenDays = [];
     last = row;
   }
-  if (last && gaps && hidden > 0) wanted.get(last).below = { kind: "gap", words: gapWords(hidden) };
-  return { rows, wanted };
+  if (last && gaps && hidden > 0) {
+    const span = fresh(hiddenDays);
+    wanted.get(last).below = { kind: "gap", words: gapWords(hidden, span ? dayRangeWords(span.from, span.to, clock) : "") };
+  }
+  return { rows, wanted, runDays };
 }
 
 /**
@@ -3293,11 +3416,13 @@ function seamsFor(list) {
  * places the reader itself once the list is drawn (`keepingFilterPlace`).
  */
 function drawSeams(list) {
-  const { rows, wanted } = seamsFor(list);
+  const { rows, wanted, runDays } = seamsFor(list);
   const none = { above: null, below: null };
+  // `#250 date-separators`. A collapsed run's line says the days it brings, as its words go.
   const changed = rows.some((row) => {
     const want = wanted.get(row) || none;
-    return !seamDrawn(row, want.above, false) || !seamDrawn(row, want.below, true);
+    return !seamDrawn(row, want.above, false) || !seamDrawn(row, want.below, true) ||
+      (runDays.has(row) && runDaysOf(row) !== runDays.get(row));
   });
   if (!changed) return;
   const apply = () => {
@@ -3305,10 +3430,25 @@ function drawSeams(list) {
       const want = wanted.get(row) || none;
       placeSeam(row, want.above, false);
       placeSeam(row, want.below, true);
+      if (runDays.has(row) && runDaysOf(row) !== runDays.get(row)) {
+        row.runDays = runDays.get(row);
+        placeInReadRun(row, "head", readRunCount(row));
+      }
     }
   };
   if (!sideActive && filterChanging === 0 && currentScreen === "main" && currentView === "discord" && list === visibleList()) {
-    preservingScroll(apply);
+    // While a filter change holds a message in place (`#243 filter-keeps-selection`), the hold places
+    // the reader, not this: the held message goes back where the change put it, as after every other
+    // redraw around it (`keepFilterHold`) — kept where it happens to be in the middle of a redraw, it
+    // would be left wherever the redraw had moved it. One the redraw took out of the list is placed by
+    // what the redraw does next, as it always was.
+    const held = currentFilterHold();
+    if (held !== null) {
+      apply();
+      if (held.row !== null) keepFilterHold();
+    } else {
+      preservingScroll(apply);
+    }
   } else {
     apply();
   }
@@ -17575,6 +17715,14 @@ function renderChannelRows() {
   // `#221 read-modes`. LAST, from the read state every row has just been given: under Collapse
   // read a message dealt with on this pass joins its run, and a run that grew says so.
   applyReadRuns();
+  // `#250 date-separators`. The days, from the rows as the runs leave them, inside whatever anchored
+  // mutation drew them: a step back that brings the first row's day with it takes that day's rule off
+  // the row the reader is on, and the change of height has to be part of the one the step makes. Not
+  // while a filter chooses rows, which the search's pass, after this one, decides.
+  if (!rowsChosen()) {
+    drawSeams(el("discord-log"));
+    drawSeams(el("pinned-log"));
+  }
   // `#240 reading-bookmark`. After the runs, which decide which rows are shown: the line goes above
   // the first row shown at or after its message.
   placeBookmarkLine();
@@ -17981,7 +18129,12 @@ function placeBookmarkLine() {
     target.row.setAttribute("data-bookmark", target.place);
     word(target.row, target.place === "above");
     const line = bookmarkLineOf(target.row);
-    if (line.parentNode !== target.row) target.row.replaceChildren(line, ...target.row.children);
+    if (line.parentNode !== target.row) {
+      // After a line between rows drawn above it (`#250 date-separators`): the bookmark is the nearer.
+      const kids = [...target.row.children];
+      const lead = kids.length && kids[0] === /** @type {any} */ (target.row).seamLine ? 1 : 0;
+      target.row.replaceChildren(...kids.slice(0, lead), line, ...kids.slice(lead));
+    }
   };
   // The reader does not move: a line drawn or taken away above them changes the height above them.
   if (!sideActive && currentScreen === "main" && currentView === "discord") preservingScroll(apply);
@@ -23030,6 +23183,16 @@ function readRunWords(row) {
   return row.readRunLine ? String(row.readRunLine.textContent) : "";
 }
 
+/** The days a collapsed run's line says, kept on its first row by `drawSeams` (`#250 date-separators`). */
+const runDaysOf = (row) => String(row.runDays || "");
+
+/** What a collapsed run's line says: how many, and the days it brings (`#250 date-separators`). */
+const readRunText = (count, days = "") =>
+  `… ${count} read message${count === 1 ? "" : "s"}${days ? ` · ${days}` : ""} …`;
+
+/** How many messages the collapsed run `row` heads stands for. */
+const readRunCount = (row) => readRunRows(row).reduce((sum, one) => sum + idsOf(one).length, 0);
+
 /** Put one row in its place in a run: "head" (drawn as the line), "member" (hidden), or null (shown). */
 function placeInReadRun(row, role, count) {
   if (role === null) {
@@ -23042,7 +23205,7 @@ function placeInReadRun(row, role, count) {
   row.hidden = role === "member";
   if (role !== "head") return;
   const line = readRunLine(row);
-  const words = `… ${count} read message${count === 1 ? "" : "s"} …`;
+  const words = readRunText(count, runDaysOf(row));
   if (line.textContent !== words) line.textContent = words;
   line.setAttribute("title", `Show ${count === 1 ? "this read message" : `these ${count} read messages`}`);
   line.hidden = false;
@@ -23099,7 +23262,7 @@ function applyReadRuns() {
   const changed = rows.some((row) => {
     const { role, count } = want(row);
     return (row.getAttribute("data-read-run") || null) !== role ||
-      (role === "head" && !readRunWords(row).includes(` ${count} `));
+      (role === "head" && readRunWords(row) !== readRunText(count, runDaysOf(row)));
   });
   if (!changed) return;
   const apply = () => {

@@ -2562,8 +2562,10 @@ a.search-hit-link {
 #side-log .bookmark-line,
 #discord-log .bookmark-line {
   position: absolute;
-  left: 0;
-  right: 0;
+  /* As wide as the list, as the lines between rows are (`#250 date-separators`, below): out past the
+     row's border and its inset on each side. */
+  left: calc(-1px - var(--row-inset-left, 0px));
+  right: calc(-1px - var(--row-inset-right, 0px));
   height: var(--bookmark-room);
   display: flex;
   align-items: center;
@@ -2619,12 +2621,32 @@ a.search-hit-link {
 #discord-log,
 #pinned-log {
   --gap-room: 2.25rem;
+  --day-room: 1.75rem;
 }
 
 #side-log li.discord-message[data-seam="gap"],
 #discord-log li.discord-message[data-seam="gap"],
 #pinned-log li.discord-message[data-seam="gap"] {
   --seam-room: var(--gap-room);
+}
+
+/* `#250 date-separators`. A day rule: "Oct 3, Mon", or "Today", between two SOLID hairlines — a
+   boundary in time, not something left out — in a little less room than a gap's. When the row has a
+   stretch before it, the days go on the stretch's own line instead, after its count, and the row has
+   no rule of its own. */
+#side-log li.discord-message[data-seam="day"],
+#discord-log li.discord-message[data-seam="day"],
+#pinned-log li.discord-message[data-seam="day"] {
+  --seam-room: var(--day-room);
+}
+
+#side-log li.discord-message[data-seam="day"] > .row-seam:not(.row-seam-below)::before,
+#discord-log li.discord-message[data-seam="day"] > .row-seam:not(.row-seam-below)::before,
+#pinned-log li.discord-message[data-seam="day"] > .row-seam:not(.row-seam-below)::before,
+#side-log li.discord-message[data-seam="day"] > .row-seam:not(.row-seam-below)::after,
+#discord-log li.discord-message[data-seam="day"] > .row-seam:not(.row-seam-below)::after,
+#pinned-log li.discord-message[data-seam="day"] > .row-seam:not(.row-seam-below)::after {
+  border-top-style: solid;
 }
 
 #side-log li.discord-message[data-seam],
@@ -2648,8 +2670,11 @@ a.search-hit-link {
 #discord-log .row-seam,
 #pinned-log .row-seam {
   position: absolute;
-  left: 0;
-  right: 0;
+  /* Across the LIST, not the row: out past the row's border (1px) and the inset it is drawn with on
+     each side, said below for each kind of row, so every line in the list is as wide as the list and
+     its words in the list's middle — not shifted over to the owner's side over one of his messages. */
+  left: calc(-1px - var(--row-inset-left, 0px));
+  right: calc(-1px - var(--row-inset-right, 0px));
   bottom: calc(100% + 1px);
   height: var(--seam-room);
   display: flex;
@@ -2658,11 +2683,47 @@ a.search-hit-link {
   color: var(--muted);
   font-size: calc(0.82rem * var(--msg-scale));
   letter-spacing: 0.02em;
-  white-space: nowrap;
+  /* Words that do not fit a narrow phone's line — a long count and a range across years — wrap onto
+     a second line inside the room rather than running out past the list's edge. */
+  line-height: 1.15;
+  text-align: center;
   pointer-events: none;
   /* At full strength on every row, as the bookmark's line is: it says something about the list, not
      the state of the message under it. */
   filter: none !important;
+}
+
+/* Each kind of row's inset, as the speaker and reply rules above give it its margins, for the line it
+   carries to reach back out to the list's edges. `cqw` where those say `%`: the list is the `rows`
+   container, and a margin's percentage is of the list's width. A desk restates these where it
+   restates the margins. */
+#side-log li.discord-message[data-who="me"],
+#discord-log li.discord-message[data-who="me"],
+#pinned-log li.discord-message[data-who="me"] {
+  --row-inset-left: var(--speaker-inset);
+  --row-inset-right: 0px;
+}
+
+#side-log li.discord-message[data-who="coder"],
+#discord-log li.discord-message[data-who="coder"],
+#pinned-log li.discord-message[data-who="coder"] {
+  --row-inset-left: calc(-0.75rem - env(safe-area-inset-left));
+  --row-inset-right: calc(-0.75rem - env(safe-area-inset-right));
+}
+
+#side-log li.discord-message[data-who="human"],
+#discord-log li.discord-message[data-who="human"],
+#pinned-log li.discord-message[data-who="human"],
+#side-log li.discord-message[data-who="bot"],
+#discord-log li.discord-message[data-who="bot"],
+#pinned-log li.discord-message[data-who="bot"] {
+  --row-inset-left: calc(var(--speaker-inset) / 2);
+  --row-inset-right: calc(var(--speaker-inset) / 2);
+}
+
+#side-log li.discord-message[data-is-reply="true"][data-who],
+#discord-log li.discord-message[data-is-reply="true"][data-who] {
+  --row-inset-left: var(--reply-gutter);
 }
 
 #side-log li.discord-message[data-seam][data-bookmark="above"] > .row-seam:not(.row-seam-below),
@@ -6225,6 +6286,41 @@ textarea {
   #discord-log li.discord-message[data-is-reply="true"][data-who="me"],
   #reply-target li.discord-message[data-is-reply="true"][data-who="me"] {
     margin-left: max(var(--reply-gutter), min(15%, 6rem));
+  }
+
+  /* `#249 search-highlight` and `#250 date-separators`. The insets the lines between rows reach back
+     across, as the margins just above give them on a desk. */
+  #side-log li.discord-message[data-who="me"],
+  #discord-log li.discord-message[data-who="me"],
+  #pinned-log li.discord-message[data-who="me"] {
+    --row-inset-left: min(15cqw, 6rem);
+  }
+
+  #side-log li.discord-message[data-who="coder"],
+  #discord-log li.discord-message[data-who="coder"],
+  #pinned-log li.discord-message[data-who="coder"] {
+    --row-inset-left: 0px;
+    --row-inset-right: min(15cqw, 6rem);
+  }
+
+  #side-log li.discord-message[data-who="human"],
+  #discord-log li.discord-message[data-who="human"],
+  #pinned-log li.discord-message[data-who="human"],
+  #side-log li.discord-message[data-who="bot"],
+  #discord-log li.discord-message[data-who="bot"],
+  #pinned-log li.discord-message[data-who="bot"] {
+    --row-inset-left: min(7cqw, 3rem);
+    --row-inset-right: min(7cqw, 3rem);
+  }
+
+  #side-log li.discord-message[data-is-reply="true"][data-who],
+  #discord-log li.discord-message[data-is-reply="true"][data-who] {
+    --row-inset-left: var(--reply-gutter);
+  }
+
+  #side-log li.discord-message[data-is-reply="true"][data-who="me"],
+  #discord-log li.discord-message[data-is-reply="true"][data-who="me"] {
+    --row-inset-left: max(var(--reply-gutter), min(15cqw, 6rem));
   }
 
   /* `#215 reply-coalesce`. Gathered replies hang one gutter in from their parent's left edge, and
