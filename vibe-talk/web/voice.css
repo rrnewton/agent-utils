@@ -324,7 +324,7 @@ body {
   border-radius: 999px;
   color: var(--ink);
   font: inherit;
-  /* In px, not a rem, and never under 16px — the rule #compose-text states: iOS Safari zooms the
+  /* In px, not a rem, and never under 16px — the rule the message boxes keep: iOS Safari zooms the
      whole frame when an input smaller than that takes focus, and this page is a fixed 100dvh grid
      that cannot scroll back. A search field is a field you focus every single time you use it.
      17px since `#211 link-filter`, which made the bar it sits in larger. */
@@ -897,6 +897,10 @@ body {
   .channel-loading::before { animation: none; }
 }
 
+/* `#241 voice-composer`. The call's view has the channel's composer: the same box, the same Send,
+   the last thing in the scrolling list, so the three are one rule and cannot come to look different.
+   It replaced the Type toggle that turned the control bar into a text field. */
+#voice-composer,
 #side-composer,
 #channel-composer {
   display: grid;
@@ -910,6 +914,7 @@ body {
   border-top: 1px solid var(--edge);
 }
 
+#compose-text,
 #side-compose-text,
 #channel-compose-text {
   width: 100%;
@@ -920,6 +925,7 @@ body {
   font-size: max(1rem, 16px);
 }
 
+#send-text,
 #side-send,
 #channel-send {
   justify-self: end;
@@ -2486,15 +2492,35 @@ body {
   margin: 0.5rem 0.75rem;
 }
 
+/* `#241 voice-composer`. The call's pane is at least as tall as the list that scrolls it, and its
+   message box is pushed to the foot of that: at idle and while a conversation is still shorter than
+   the screen, the box sits at the bottom of the list, where a chat's box is and where the thumb is,
+   rather than wherever the last turn happened to end. Once the turns fill the screen it is simply
+   the last thing in the list, as the channel's box is. A column of flex items so that `margin-top:
+   auto` can do that, and so that the invitation below can take the space above the box instead of
+   a height of its own that would push the box off a phone's screen. */
+#pane-voice {
+  display: flex;
+  flex-direction: column;
+  min-height: 100%;
+}
+
+#voice-composer {
+  margin-top: auto;
+}
+
 /* The idle screen's largest area is the empty transcript, so the invitation goes there rather
-   than competing for the one strip at the bottom of the display. */
+   than competing for the one strip at the bottom of the display. It grows into whatever the pane
+   has above the message box: it used to be `72vh` tall, which with the box under it put the box
+   below the fold of a phone. */
 #empty-state {
   display: flex;
+  flex: 1 0 auto;
   flex-direction: column;
   align-items: center;
   justify-content: center;
   gap: 0.6rem;
-  min-height: 72vh;
+  min-height: 8rem;
   color: var(--muted);
   text-align: center;
 }
@@ -4617,7 +4643,7 @@ body {
  * phone. It may SHRINK, because a long channel name must cost the other members nothing; a `select`
  * elides its own label, so shrinking costs characters rather than reachability.
  *
- * SIXTEEN PIXELS, for exactly the reason `#compose-text` below is: iOS Safari zooms the whole frame
+ * SIXTEEN PIXELS, for exactly the reason the message boxes are: iOS Safari zooms the whole frame
  * when a control smaller than 16px takes focus, and this page is a fixed 100dvh grid — a zoomed
  * frame does not scroll, it pushes the dock off a viewport that cannot scroll back to it. */
 .bar-select {
@@ -4648,57 +4674,6 @@ textarea {
   font-size: 0.9rem;
   line-height: 1.4;
   resize: vertical;
-}
-
-/* ------------------------------------------------------------ text entry, in the bar ------- */
-/*
- * `#59 text-entry-button`. Pressing Type CONVERTS the control bar into a text field: the toggle
- * stays, everything else on the bar goes, the field takes the width and a Send appears on the
- * right. Pressing it again converts the bar back.
- *
- * `#43 typed-input` shipped this as a row of its own in the dock, which was the honest way to
- * build and test the send path but cost a band of a 375x667 phone. That row is gone; this is the
- * same composer in the space the bar already occupies, so text entry now costs nothing at rest.
- *
- * WHAT ACTUALLY MOVES THE TOGGLE LEFT is the gear being hidden, not an animation and not an
- * `order` — the two things to its left simply stop being there, and flex closes the gap. Recorded
- * because the issue describes it as a slide: this is a reflow, the only transition is the colour,
- * and `prefers-reduced-motion` already has a block at the foot of this file.
- */
-#compose-text {
-  flex: 1 1 auto;
-  min-width: 0;
-  /* SIXTEEN PIXELS, and not a rem. iOS Safari zooms the whole frame when a text input smaller than
-     16px takes focus, and this page is a fixed 100dvh grid — zooming it does not scroll a page, it
-     pushes the dock off a viewport that cannot scroll to reach it again. This is the one place in
-     the file where an absolute font size is the correct answer. */
-  font-size: 16px;
-  min-height: 2.4rem;
-  padding: 0.3rem 0.6rem;
-  background: var(--bg);
-  color: var(--ink);
-  border: 1px solid var(--edge);
-  border-radius: 0.6rem;
-}
-
-/* Pressed: the accent on the border and the glyph, the same idiom `.control-mini.on` uses, so the
-   toggle's own state is what tells you which mode the bar is in. */
-#text-entry[aria-pressed="true"] {
-  border-color: var(--accent);
-  color: var(--accent);
-  transition: color 140ms ease, border-color 140ms ease;
-}
-
-#text-entry[aria-pressed="true"] .mini-label {
-  color: var(--accent);
-}
-
-/* In text mode the pack holds one button and must stop claiming the leftover width — the FIELD
-   takes it. Without this the input is squeezed to nothing beside a 2.75rem toggle that has grown
-   to fill the bar. */
-#control-bar[data-mode="text"] #bar-pack {
-  flex: 0 0 auto;
-  overflow-x: visible;
 }
 
 /* --------------------------------------------------------------------- the control pane ---- */

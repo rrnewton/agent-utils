@@ -2,7 +2,17 @@
 <html lang="en">
   <head>
     <meta charset="utf-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, interactive-widget=resizes-content" />
+    <!--
+      `#241 voice-composer`. `interactive-widget=resizes-content` is what keeps the dock ON SCREEN
+      while a message box has the focus. The frame is a fixed `100dvh` grid with the dock as its
+      last row, and Chrome on Android, left to its default (`resizes-visual`), opens the on-screen
+      keyboard OVER the layout: `100dvh` does not shrink, the browser pans to the focused box, and
+      the dock — the Voice/Channel switch, Hang up, Talk — ends up underneath the keyboard. Told to
+      resize the content, the browser shrinks the layout to what is left above the keyboard, so the
+      grid lays itself out again with the dock directly above the keys and the list, which holds
+      the box, scrolled to it. Safari does not read this key yet; there the keyboard still pans.
+    -->
     <meta name="color-scheme" content="dark light" />
     <title>vibe-talk — voice</title>
     <link rel="manifest" href="/manifest.webmanifest" />
@@ -332,9 +342,9 @@
                   <path d="M12 18v3.5" />
                 </svg>
                 <!-- BOTH ways in, because there are two and they are different kinds of
-                     conversation: Talk opens the microphone, Type never does. Naming only Talk
-                     here is what made the typed path look like a mode of the spoken one. -->
-                <p id="empty-line">Tap Talk to speak, or Type to write.</p>
+                     conversation: Talk opens the microphone, the box below never does. Naming only
+                     Talk here is what made the typed path look like a mode of the spoken one. -->
+                <p id="empty-line">Tap Talk to speak, or write to the agent below.</p>
               </div>
               <!--
                 `#128 transcript-history`. The transcript is durable, and a durable record is
@@ -349,6 +359,30 @@
               -->
               <button id="load-older-turns" class="chip" type="button" hidden>Earlier turns</button>
               <ol id="transcript" class="messages"></ol>
+              <!--
+                `#241 voice-composer`. The owner: "Type mode on voice agent takes away my
+                Voice/Channel toggle ... I'd actually like to move over to the same metaphor as the
+                channels view. Can we just have a message box at the BOTTOM of the scroll history?"
+
+                So this is the channel's composer, in the call's view: the last thing in the
+                scrolling list, the same box and the same Send, and ALWAYS HERE — idle, in a typed
+                conversation and in a call. It replaces `#59 text-entry-button`, which turned the
+                control bar into a text field and so took the switch, the gear and every other
+                member of the bar away for as long as you were typing. Nothing on the bar changes
+                now when you write.
+
+                Writing needs no mode of the agent's. During a call a typed turn goes down the
+                socket that is already open. With nothing open, the FIRST SEND starts a typed
+                conversation — no microphone — and the message goes the moment it opens; clicking
+                into the box, or typing in it, opens nothing and costs nothing. See `sendTyped` in
+                web/voice.js.
+              -->
+              <div id="voice-composer">
+                <textarea id="compose-text" rows="3" autocomplete="off" enterkeyhint="send"
+                          placeholder="Message the agent…" aria-label="Message the agent"></textarea>
+                <button id="send-text" type="button"
+                        title="Send this to the agent. With no call open it starts a typed conversation, which never opens the microphone.">Send</button>
+              </div>
             </div>
 
             <div id="pane-discord" hidden>
@@ -1364,20 +1398,23 @@
                 format is settled once when the conversation opens — switching it would mean closing
                 and reopening the socket, and a reopened socket is a new conversation that remembers
                 nothing. Silencing the agent must not cost you its memory.
-                <strong>Type</strong> turns the control bar into a text box. During a call it sends
-                what you write into the same conversation you are speaking in, so a typed turn and a
-                spoken one land in the same transcript and the agent answers either one out loud.
-                Pressed with <strong>nothing open</strong> it starts a <strong>typed
-                conversation</strong> instead: the microphone is never requested, so there is no
-                permission prompt and no in-use indicator, and there is no Talk or Sound button
-                because there is no microphone to mute and no voice to silence. That is a different
-                kind of conversation, chosen when it opens — not a call with two switches thrown,
-                which is what it used to take. This page also asks the agent for a text-only
-                response, but that is an override an agent's own settings can refuse; if it is
-                refused the agent's audio is received and thrown away, the connection details say
-                so, and nothing about the microphone changes. It is a toggle either way: the same
-                button leaves text entry again, and whatever you had half-written is still there
-                when you come back to it.
+                <strong>The message box</strong> at the bottom of the call's transcript is for
+                writing to the agent, and it is always there — writing never changes the control
+                bar, so the Voice/Channel switch stays where it is. During a call a message goes into
+                the same conversation you are speaking in, so a typed turn and a spoken one land in
+                the same transcript and the agent answers either one out loud. With
+                <strong>nothing open</strong>, your first message starts a <strong>typed
+                conversation</strong> and goes as soon as it is open; clicking into the box or typing
+                in it opens nothing. A typed conversation never asks for the microphone, so there is
+                no permission prompt and no in-use indicator, and there is no Talk or Sound button
+                because there is no microphone to mute and no voice to silence — End chat ends it,
+                and Talk is back for a spoken call. That is a different kind of conversation, chosen
+                when it opens — not a call with two switches thrown, which is what it used to take.
+                This page also asks the agent for a text-only response, but that is an override an
+                agent's own settings can refuse; if it is refused the agent's audio is received and
+                thrown away, the connection details say so, and nothing about the microphone
+                changes. Whatever you have half-written stays in the box when you leave the screen
+                or reload, until it is sent.
                 <strong>Clear</strong> empties this screen only and never makes the agent forget
                 anything. It asks twice, because it sits under your thumb and it cannot be undone.
                 It also leaves the stored record on the server untouched, so the conversation comes
@@ -1980,32 +2017,6 @@
             </button>
 
             <!--
-              `#59 text-entry-button`. Typing costs ONE small button's worth of the bar, not a
-              permanent field: pressing it converts the bar into a text field, and pressing it
-              again converts it back. The toggle is the whole interaction model — one control both
-              enters and leaves the mode, and its own state is what says which mode you are in.
-
-              `#43 typed-input` shipped this composer as a row of its own in the dock so the send
-              path could be built and tested. That row is GONE, and this replaces it rather than
-              joining it: two composers would be two text fields racing to be the one somebody
-              types in. The send path underneath is unchanged.
-            -->
-            <button
-              id="text-entry"
-              class="bar-button"
-              type="button"
-              aria-pressed="false"
-              aria-controls="compose-text"
-              title="Write to the agent instead of speaking. With no call open this starts a TYPED conversation — the microphone is never opened."
-            >
-              <svg class="mini-icon" viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
-                <path d="M4 5.5h16v10.5H9.5L5.5 19.5V16H4z" />
-                <path d="M8 10.5h8M8 13h5" />
-              </svg>
-              <span id="text-entry-label" class="mini-label">Type</span>
-            </button>
-
-            <!--
               `#60 canned-prompt-buttons` put the canned questions ON the strip, one button each.
               ONE button now opens all of them, and the reason is arithmetic: the bar is a single
               375px row, each canned prompt cost it a member, and the list is meant to GROW — the
@@ -2037,8 +2048,9 @@
 
             <!--
               THREE STATES, CYCLED BY TAPPING, and the arithmetic is why. A `<select>` needs 5rem
-              before its own padding and border, which the strip does not have once the call view
-              is holding Type and Prompts as well; a `.bar-button` needs 2.75rem, which it does.
+              before its own padding and border, which the strip did not have while the call view
+              held Type and Prompts as well (`#241 voice-composer` has since taken Type off the
+              strip); a `.bar-button` needs 2.75rem, which it does.
               So the control on the bar is a button that steps off → gist → full → off, and the
               same three values are also a real `<select>` in Settings, where there is room to name
               them. Both write one key; see `RELAY_MODES` in web/voice.js.
@@ -2128,36 +2140,6 @@
               <span id="canned-blockers-label" class="tray-label">Blockers</span>
             </button>
           </div>
-
-          <!--
-            The field and its Send, both shipping `hidden` so that their APPEARANCE is the signal
-            the mode has changed. They are siblings of the pack rather than members of it: the pack
-            scrolls sideways when it is full, and a text field that could scroll out of reach is
-            not a text field.
-          -->
-          <input
-            id="compose-text"
-            type="text"
-            autocomplete="off"
-            enterkeyhint="send"
-            placeholder="Message the agent"
-            aria-label="Message the agent"
-            hidden
-          />
-          <button
-            id="send-text"
-            class="bar-button"
-            type="button"
-            aria-label="Send"
-            title="Send this message into the live conversation."
-            hidden
-            disabled
-          >
-            <svg class="mini-icon" viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
-              <path d="M4 12 20 4.5 15.5 20l-4-6.5z" />
-              <path d="M4 12l7.5 1.5" />
-            </svg>
-          </button>
 
           <!-- ONE switch, not two labels. It carries the word for the view you are in, and a knob
                that moves, so it reads as a control with two positions rather than as one item that

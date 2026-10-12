@@ -107,7 +107,7 @@ let sideActive = false;
 /**
  * @overload
  * @param {"api-token" | "channel-alias" | "channel-directory-search" | "combine-messages"
- *   | "compose-text" | "enter-sends" | "mark-own-read" | "mic-auto-gain" | "mic-echo-cancellation"
+ *   | "enter-sends" | "mark-own-read" | "mic-auto-gain" | "mic-echo-cancellation"
  *   | "mic-noise-suppression" | "msg-scale" | "new-channel-id" | "new-channel-label"
  *   | "new-channel-writable" | "noise-rule-new" | "read-speed-range" | "reading-width"
  *   | "reply-branch" | "resume-toggle" | "rich-headers" | "search-field" | "single-keys"
@@ -116,8 +116,8 @@ let sideActive = false;
  */
 /**
  * @overload
- * @param {"channel-compose-text" | "prompt-blockers" | "prompt-summary" | "reply-text"
- *   | "side-compose-text"} id
+ * @param {"channel-compose-text" | "compose-text" | "prompt-blockers" | "prompt-summary"
+ *   | "reply-text" | "side-compose-text"} id
  * @returns {HTMLTextAreaElement}
  */
 /**
@@ -151,7 +151,7 @@ let sideActive = false;
  *   | "save-token"
  *   | "search-toggle" | "send-text" | "side-clear-backlog" | "side-close" | "side-jump-newest"
  *   | "side-more-threads" | "side-older" | "side-send" | "speaker" | "summarise" | "talk"
- *   | "text-entry" | "thread-back" | "thread-directory-more" | "thread-directory-retry"
+ *   | "thread-back" | "thread-directory-more" | "thread-directory-retry"
  *   | "todo-filter" | "undo-dismiss" | "upstream-clear-save" | "view-switch"} id
  * @returns {HTMLButtonElement}
  */
@@ -494,12 +494,6 @@ function showScreen(name) {
   if (!main) {
     if (readAloudPlayback === "browser") stopReading();
     disarmClear();
-    // The composer lives in the control bar now, and leaving the call screen leaves text entry:
-    // coming back should show the bar as it rests, not with a field standing open from a visit to
-    // Settings. `#59 text-entry-button`. `renderControlBar` below is what actually redraws it.
-    // UNLESS something is written there: a field that folds away under a half-typed message reads
-    // as the message being lost, even though the text is still in it. `#193 compose-draft-loss`.
-    if (!el("compose-text").value.trim()) textMode = false;
   }
   // Help is reached FROM settings and returns TO it, so it must not become the thing settings
   // remembers to go back to — that would make the gear's way out lead into the document the
@@ -3594,9 +3588,10 @@ function onClear() {
 // same transcript.
 //
 // Everything below is a named module-scope function rather than logic inside a click handler, and
-// that is load-bearing: `#59 text-entry-button` moves this control into the control bar and `#60
-// canned-prompt-buttons` adds buttons that send a fixed sentence. Both are then one call each, and
-// neither is a second implementation of the send path that can drift from this one.
+// that is load-bearing: `#59 text-entry-button` moved this control into the control bar, `#241
+// voice-composer` moved it again into the transcript, and `#60 canned-prompt-buttons` adds buttons
+// that send a fixed sentence. Each is then one call, and none is a second implementation of the send
+// path that can drift from this one.
 
 /**
  * The ONE place a JSON client event is written to the conversation socket.
@@ -3754,11 +3749,13 @@ function isEchoOfTyped(said) {
 }
 
 /**
- * Say something to the agent in writing. Returns whether it went.
+ * Say something to the agent in writing, on the conversation that is open. Returns whether it went.
  *
  * REFUSING IS VISIBLE. A tap that does nothing at all is the failure this whole page is written
- * against, and with no call open there is nothing for the text to reach — so it says which control
- * would fix that, and it does not throw away what was typed.
+ * against, and with no conversation open there is nothing for the text to reach — so it says which
+ * control would fix that, and it does not throw away what was typed. The message box never reaches
+ * this refusal: with nothing open it starts a conversation instead (`sendTyped`). The canned prompts
+ * still can, and are greyed out for exactly that reason (`renderCannedPrompts`).
  */
 /**
  * @param {{fromComposer?: boolean}} [options] Clearing the field is only correct when the field is
@@ -3783,7 +3780,6 @@ function sendUserMessage(text, options) {
   if (fromComposer) {
     el("compose-text").value = "";
     rememberComposeDraft();
-    el("compose-text").focus();
   }
   setStatus("Sent.");
   return true;
@@ -3842,69 +3838,96 @@ function storedComposeDraft() {
   }
 }
 
-// `#59 text-entry-button`. The composer is not a row of its own any more: pressing Type CONVERTS
-// the control bar into a text field, and pressing it again converts it back. One button both
-// enters and leaves the mode, and its own pressed state is what says which mode you are in.
-let textMode = false;
+// --- the message box ----------------------------------------------------------------------------
+//
+// `#241 voice-composer`. The owner: "Type mode on voice agent takes away my Voice/Channel toggle ...
+// Can we just have a message box at the BOTTOM of the scroll history? Is there any problem with that
+// rather than an explicit Type toggle? I.e. do we need to explicitly engage some alternate mode of
+// the remote voice agent? ... we could always do that belatedly either when you start typing or when
+// you send a text message."
+//
+// No mode has to be engaged to TYPE. During a call a typed turn is one more client event on the
+// socket that is already open (`sendClientEvent`): `user_message` on the hosted vendor's protocol,
+// and on `vibe-talk-v1` a `prompt`, sent once the spoken turn in progress has been closed. What
+// IS chosen when a conversation opens is whether it is spoken or typed — a typed one never asks for
+// the microphone, and on the hosted vendor's protocol it also asks for text-only replies — so with
+// nothing open the box starts a typed conversation, and it does so BELATEDLY, on the first send.
+// Not on focus and not on typing: clicking into the box, or writing a draft in it, opens no
+// connection and bills nothing.
+//
+// It replaces `#59 text-entry-button`, a Type toggle that turned the control bar into a text field
+// and so took the Voice/Channel switch, the gear and the rest of the bar away while you typed. The
+// box is in the call's transcript now, the last thing in the scrolling list as the channel's box is,
+// and the bar does not change when you write.
 
 /**
- * Enter or leave text entry.
+ * The first message, waiting for the conversation it started to open. Null when nothing waits.
  *
- * Everything about WHAT IS ON THE BAR is decided by `renderControlBar`, which is the one place
- * that knows — this only sets the flag and says what happened. `#43 typed-input` shipped a second
- * composer in the dock; that row is deleted rather than joined, because two text fields racing to
- * be the one somebody types in is worse than either of them.
+ * ONE, not a queue. While it waits Send is disabled and Enter refuses with a sentence saying why
+ * (`sendTyped`), and the canned prompts are greyed until a conversation is open — so nothing else can
+ * join it, and a second press cannot start a second conversation underneath the first.
  *
- * KEEPS WHAT WAS TYPED. Leaving text entry is not the same act as discarding a half-written
- * message, and a control that quietly does both is the kind of thing this page keeps removing.
+ * The text STAYS IN THE BOX while it waits, and leaves the box only when it goes: a conversation
+ * that fails to open leaves the reader exactly what they wrote, with the error saying why, and a
+ * send that went is what clears the box, as it always was.
+ *
+ * @type {string | null}
  */
-function setTextMode(on) {
-  const entering = Boolean(on) && !textMode;
-  textMode = Boolean(on);
-  renderControlBar();
-  if (entering) {
-    el("compose-text").focus();
-    setStatus(
-      session.socket && !session.chat
-        ? "Type a message. It reaches the same conversation you are speaking in."
-        : "Type a message."
-    );
-  }
-}
+let heldTurn = null;
 
 /**
- * The Type button.
+ * The Send button and the Enter key, which must not be two different opinions about sending.
  *
- * It is still exactly a toggle — that is the whole interaction model and it is unchanged. What is
- * new is what happens when it is pressed with NOTHING OPEN: it starts a typed conversation, so
- * reaching a text interface is one press rather than three.
+ *   * A conversation is open: the text goes down its socket now, as it always did.
+ *   * One is opening — a call that has not connected yet, or the typed conversation an earlier send
+ *     started: the text is held and goes the moment it is open (`deliverHeldTurn`).
+ *   * Nothing is open: the text is held, and a TYPED conversation is started for it. No microphone
+ *     is asked for. See `start()` and `CHAT MODE` there.
  *
- * THE COMPLAINT THIS ANSWERS, because the shape of the fix is decided by it: getting to a text
- * interface used to mean starting a voice call, muting it, and silencing it. Two of those three are
- * controls that exist to manage a microphone, and the reader did not want a microphone. Worse, the
- * microphone genuinely stayed open the whole time — mute withholds frames from a live capture graph
- * on purpose, so that unmuting keeps the agent's context — which means the phone kept showing the
- * mic as in use for a conversation that was being typed.
- *
- * A typed conversation is therefore a DIFFERENT KIND of conversation, chosen when the socket opens,
- * not a voice call with two switches thrown. See `start()`.
- *
- * Only on the way IN, and only when there is no conversation already. Pressing Type during a voice
- * call still just opens the field, because that call is the one the text should reach; and pressing
- * it again to leave text mode never starts anything.
+ * Returns whether it went, or with nothing open the promise of the conversation starting, which the
+ * page suite awaits.
  */
-function onTextEntry() {
-  const entering = !textMode;
-  setTextMode(entering);
-  if (entering && !session.socket) {
-    return guard(start)({ chat: true });
-  }
-  return Promise.resolve();
-}
-
-/** The Send button and the Enter key, which must not be two different opinions about sending. */
 function sendTyped() {
-  return sendUserMessage(el("compose-text").value, { fromComposer: true });
+  const said = el("compose-text").value.trim();
+  if (said === "") {
+    return false;
+  }
+  if (canSendText()) {
+    const sent = sendUserMessage(said, { fromComposer: true });
+    // Back in the box for the next one: a tap on Send took the focus to the button.
+    if (sent) el("compose-text").focus();
+    return sent;
+  }
+  if (heldTurn !== null) {
+    setStatus("Still opening the conversation — your message goes as soon as it is open.");
+    return false;
+  }
+  heldTurn = said;
+  renderControls();
+  if (session.socket) {
+    setStatus("Your message goes as soon as the call is connected.");
+    return false;
+  }
+  return guard(start)({ chat: true }).then(() => {
+    if (heldTurn !== null && session.socket && !session.connected) {
+      setStatus("Opening a typed conversation — your message goes as soon as it is open.");
+    }
+  });
+}
+
+/**
+ * The conversation is open: send what was held for it. Called from `socket.onopen` on both
+ * protocols, once `session.connected` is true, which is what `sendClientEvent` tests.
+ *
+ * The box is cleared only if it still holds what was sent. A reader who went on writing while the
+ * conversation opened keeps what they wrote; what went is what they pressed Send on.
+ */
+function deliverHeldTurn() {
+  if (heldTurn === null) return;
+  const said = heldTurn;
+  heldTurn = null;
+  sendUserMessage(said, { fromComposer: el("compose-text").value.trim() === said });
+  renderControls();
 }
 
 // --- Enter, in every message box ----------------------------------------------------------------
@@ -6071,10 +6094,11 @@ const CANNED_DISABLED_TITLE =
  * beforehand, and the status line is transient and lives at the other end of the screen.
  *
  * The choice recorded, because the issue offered two: grey them out, or have them START a call the
- * way Type does. Greyed, for now, and deliberately — a tap on a five-letter button silently opening
- * a billed vendor conversation is a surprise with a price on it, and Blockers additionally spends
- * CODING-AGENT work. Type may auto-start because typing is the thing the reader just asked to do;
- * these two are not that.
+ * way the message box's first send does. Greyed, for now, and deliberately — a tap on a five-letter
+ * button silently opening a billed vendor conversation is a surprise with a price on it, and
+ * Blockers additionally spends CODING-AGENT work. The box may start a typed conversation because
+ * the reader has just written a message and pressed Send (`#241 voice-composer`); these two are not
+ * that.
  *
  * `aria-disabled` rather than `disabled`: see the note in web/voice.css. The button stays hoverable
  * so the tooltip the owner asked for actually appears.
@@ -7269,10 +7293,11 @@ function placementChanged() {
  *
  *   * the channel picker names what the channel view is reading, and on the call view it names a
  *     channel you are not looking at;
- *   * Type, Sumry and Blockers all go out through `sendUserMessage`, which draws the line into the
+ *   * Sumry and Blockers go out through `sendUserMessage`, which draws the line into the
  *     TRANSCRIPT and needs a live call. Offering them over the channel means tapping a button
  *     whose whole result appears on a screen you are not on. Writing INTO the channel is a
- *     different act with its own control — the reply on the row, `#51 reply-view`.
+ *     different act with its own control — the reply on the row, `#51 reply-view`. Writing to the
+ *     agent is not on the bar at all since `#241 voice-composer`: its box is in the transcript.
  *
  * There is no default. A member missing from this table is hidden everywhere and the page suite
  * says which one, because a silent default is how a member ends up on a view nobody chose for it —
@@ -7286,7 +7311,6 @@ const PACK_VIEWS = {
   // `#229 desktop-two-column`. One column or two, on the channel. Drawn only on a desk wide enough
   // for two (web/voice.css), so on a phone it costs the strip nothing.
   "column-toggle": ["discord"],
-  "text-entry": ["voice"],
   // ONE LINE FOR ALL THE CANNED PROMPTS, which is the point of the tray: they used to be derived
   // into this table one entry each, and every prompt added took another slot off a strip already
   // priced to the edge of a 375px phone. The answer is the same for all of them anyway — every
@@ -7308,21 +7332,18 @@ const PACK_VIEWS = {
  */
 function renderControlBar() {
   const main = currentScreen === "main";
-  // `#59 text-entry-button`. Text entry is a MODE OF THE BAR, and it is only ever on where there
-  // is a conversation to type into, so leaving the main screen — or the view whose transcript the
-  // typing lands in — leaves the mode with it. Without the second half the reader could enter the
-  // mode on the call view, switch to the channel, and be left in a text field whose own toggle is
-  // no longer on the bar to press again.
-  const typing = textMode && main && PACK_VIEWS["text-entry"].includes(currentView);
-  el("control-bar").setAttribute("data-mode", typing ? "text" : "buttons");
   // PER MEMBER, not the bar as a whole. The gear is reachable from the sign-in screen today and
   // must stay so — hiding the bar wholesale off the main screen would take it away.
-  el("view-switch").hidden = !main || typing;
-  el("open-settings").hidden =
-    Object.prototype.hasOwnProperty.call(SCREEN_TITLES, currentScreen) || typing;
+  //
+  // `#241 voice-composer`. NOTHING HERE DEPENDS ON WHETHER YOU ARE WRITING. `#59
+  // text-entry-button` made text entry a mode of this bar, which hid the switch, the gear and every
+  // other member while it was on; the owner's report was exactly that — "when I press Type to type
+  // to the agent... then the UI shifts and I lose the toggle". The message box is in the call's
+  // transcript now, so the switch is on the main screen in every state, a call and a draft included.
+  el("view-switch").hidden = !main;
+  el("open-settings").hidden = Object.prototype.hasOwnProperty.call(SCREEN_TITLES, currentScreen);
   // The pack, by the same rule and as a LOOP rather than by name: `#60 canned-prompt-buttons` adds
-  // members here, and every one of them gets out of the way of the field. The toggle is the
-  // exception, because it is the way back out of the mode.
+  // members here, and a member added later is decided by the same line as the rest.
   //
   // WHICH VIEW each member belongs on is read out of `PACK_VIEWS` — a table, so that adding a
   // member is an entry rather than a branch, and so that "does the bar fit on a 375px phone"
@@ -7332,28 +7353,22 @@ function renderControlBar() {
     const views = PACK_VIEWS[member.id] || [];
     const unavailable = (member.id === "audio-source" && agentReadAloud === null) ||
       (member.id === "column-toggle" && !columnsOffered());
-    member.hidden = unavailable || !main || !views.includes(currentView) ||
-      (typing && member.id !== "text-entry");
+    member.hidden = unavailable || !main || !views.includes(currentView);
   }
-  el("text-entry").setAttribute("aria-pressed", typing ? "true" : "false");
-  el("compose-text").hidden = !typing;
-  el("send-text").hidden = !typing;
-  // A menu whose button has gone must go with it. Leaving Voice, leaving the main screen, or
-  // entering text mode all take the opener off the strip, and a tray left standing under a button
-  // that is no longer there is an orphan floating over the channel — and, worse, still clickable.
+  // A menu whose button has gone must go with it. Leaving Voice or leaving the main screen takes
+  // the opener off the strip, and a tray left standing under a button that is no longer there is an
+  // orphan floating over the channel — and, worse, still clickable.
   if (el("prompts-open").hidden && promptsOpen) {
     setPromptsOpen(false);
   }
   const members = [
     el("open-settings"),
     el("view-switch"),
-    el("compose-text"),
-    el("send-text"),
     .../** @type {HTMLCollectionOf<HTMLElement>} */ (el("bar-pack").children),
   ];
   // `#129 message-search`. On the main screen and nowhere else: there is nothing to filter on
   // Settings, Help or the reply screen, and on the sign-in screen there is nothing at all. Not
-  // suppressed by text mode, and not by the bar's placement either: since `#197 floating-search`
+  // suppressed by the bar's placement either: since `#197 floating-search`
   // the glass and its field float over the top of the LIST, so they never compete with the bar
   // for width — in the dock or in the header.
   el("search-toggle").hidden = currentScreen !== "main";
@@ -7904,6 +7919,8 @@ async function start(options) {
       setState("live");
       setStatus("Opening the voice session…");
       renderControls();
+      // Into `pendingPrompts`, where it waits for `session_started` as any early prompt does.
+      deliverHeldTurn();
       return;
     }
     // The initiation frame is UNCHANGED on the default path. `contextual_update` is the default
@@ -7958,6 +7975,9 @@ async function start(options) {
     if (!chat) {
       startCapture(socket);
     }
+    // LAST: after the initiation frame and any resume, which the agent has to have first, and after
+    // the status above, so the line the reader is left with is the one saying their message went.
+    deliverHeldTurn();
   };
 
   socket.onmessage = (event) => {
@@ -8854,6 +8874,9 @@ function teardown() {
   // turn from the dead conversation cannot suppress a transcript in the new one.
   lastActivityAt = 0;
   recentTyped = [];
+  // A message held for a conversation that never opened goes nowhere — not into the next one, which
+  // the reader has not asked for. Its text is still in the box, which is where they left it.
+  heldTurn = null;
   renderControls();
 }
 
@@ -8946,10 +8969,11 @@ function renderControls() {
   el("hang-up").hidden = !live;
   el("hangup-label").textContent = chat ? "End chat" : "Hang up";
   el("control-pane").className = chat ? "chat" : live ? "" : "solo";
-  // Send is dead without a conversation to send into. Disabled rather than absent: the bar in
-  // text mode is a stable shape, and a control that comes and goes under a thumb is worse than one
-  // that is visibly inert.
-  el("send-text").disabled = !canSendText();
+  // `#241 voice-composer`. Send works with NOTHING open — that is how a typed conversation starts —
+  // so the only time it is dead is while a message it sent is waiting for its conversation to open.
+  // Disabled rather than hidden: the box is a stable shape, and a control that comes and goes under
+  // a thumb is worse than one that is visibly inert.
+  el("send-text").disabled = heldTurn !== null;
   // Same fact, same moment, two controls further along the bar. `renderControls` is called from
   // every transition that can change whether a conversation exists — open, close, mute, teardown —
   // so hanging the canned buttons off it is what keeps them from going stale.
@@ -23679,8 +23703,8 @@ function persistRelay(mode) {
 /**
  * What the bar button SAYS in each mode, and what its tooltip says next.
  *
- * `word` is four characters or fewer, because it shares a 375px strip with Type and Prompts and a
- * word that widens the button costs the reachability of both. It is NOT called `label`: a served
+ * `word` is four characters or fewer, because it shares a 375px strip with Prompts and the gear and
+ * a word that widens the button costs the reachability of the others. It is NOT called `label`: a served
  * page reaching for a channel's configured-label FIELD directly is the shape of the `#39
  * channel-alias` defect, and `src/http/api.rs` counts every such read over the bytes of this file
  * to keep the alias from being ignored somewhere new. A field name here that happened to spell the
@@ -25836,12 +25860,14 @@ el("clear-view").addEventListener("click", onClear);
 // `guardQuietly`, not `guard`: erasing a stored record must never be able to hang up a live call.
 el("forget-conversations").addEventListener("click", guardQuietly(forgetConversations));
 el("speaker").addEventListener("click", () => setSpeakerOff(!session.speakerOff));
-// `#43 typed-input`, rehoused by `#59 text-entry-button`: the composer, in four listeners and no
-// logic. Everything they call is a named function above, which is exactly why moving the control
-// out of the dock and into the bar did not move the send path with it.
-el("text-entry").addEventListener("click", guardQuietly(onTextEntry));
+// `#43 typed-input`, rehoused by `#59 text-entry-button` and then by `#241 voice-composer`: the
+// composer, in three listeners and no logic. Everything they call is a named function above, which
+// is exactly why moving the control from the dock to the bar and from the bar to the transcript did
+// not move the send path with it.
+//
 // `guardQuietly`, NOT `guard`. `guard()` calls `teardown()`, so a send that failed would hang up on
-// the owner — which is the one thing a failed message must never do.
+// the owner — which is the one thing a failed message must never do. The conversation a first send
+// starts is guarded on its own, inside `sendTyped`, exactly as Talk's is.
 el("send-text").addEventListener("click", guardQuietly(sendTyped));
 el("compose-text").value = storedComposeDraft();
 el("compose-text").addEventListener("input", () => {
@@ -25875,16 +25901,16 @@ for (const entry of CANNED_PROMPTS) {
   });
 }
 // The opener. A plain toggle: the button that shows the tray is the button that hides it again,
-// which is the same interaction model `#text-entry` uses and the only one that needs no second
-// control and no tap-outside handler to escape from.
+// which is the only interaction model that needs no second control and no tap-outside handler to
+// escape from.
 el("prompts-open").addEventListener("click", () => setPromptsOpen(!promptsOpen));
 // ...and stated once at load, rather than left to the first tap. The markup ships shut, but shut is
 // a state the opener has to be ASSERTING for a screen reader to hear it — an `aria-expanded` that
 // only appears after somebody has already opened the tray is no use to the reader who needs it.
 setPromptsOpen(false);
-// `#225 enter-to-send`. One rule for every message box; see `onComposerKey`. Single-line: an Enter
-// that does not send is still kept from the browser, which would submit and reload the page.
-el("compose-text").addEventListener("keydown", (event) => onComposerKey(event, sendTyped, true));
+// `#225 enter-to-send`. One rule for every message box; see `onComposerKey`. A textarea since
+// `#241 voice-composer`, as the channel's box is, so with Enter to send off an Enter is a new line.
+el("compose-text").addEventListener("keydown", (event) => onComposerKey(event, guardQuietly(sendTyped)));
 el("dismiss-banner").addEventListener("click", dismissBanner);
 el("dismiss-status").addEventListener("click", dismissStatus);
 el("post-confirm-send").addEventListener("click", sendPostProposal);
