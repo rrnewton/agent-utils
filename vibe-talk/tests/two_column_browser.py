@@ -18,11 +18,11 @@ desk size, with a mouse:
   the view picker greyed out and the reading-width handle gone -> the greyed picker still takes the
   focus, and a real down arrow and a real click on it choose nothing and say why (`#231
   two-column-polish`); the right column is one region, named "Threads" -> the right column lists the
-  threads as cards, newest activity first, every card the same height, the summarised one saying its
-  name and summary, the long first message cut to three lines, and shown whole on the card under the
-  mouse (`#257 summary-truncation`) -> a card selects its thread: its rows in the right column under a
-  heading naming it, its region "Thread: " and that name, with the X, and no line saying it is stale
-  -> each column scrolls on its own, under the
+  threads as cards, newest activity at the foot (`#261 two-column-connectors`), every card the same
+  height, the summarised one saying its name and summary, the long first message cut to three lines,
+  and shown whole on the card under the mouse (`#257 summary-truncation`) -> a card selects its
+  thread: its rows in the right column under a heading naming it, its region "Thread: " and that
+  name, with the X, and no line saying it is stale -> each column scrolls on its own, under the
   wheel over it -> the X goes back to the cards, and a Main message's Thread(N) selects its thread on
   the right -> the window narrowed to 900px: one column, as the channel was in one, the button not
   drawn; widened again: two columns, the same thread selected -> the keys, pressed for real: ] gives
@@ -66,6 +66,8 @@ LONG_FIRST = ("Before we cut the release, can somebody check whether the migrati
 RUNNER = "spaces/A/threads/runner"
 REPLICA = "spaces/A/threads/replica"
 CANARY = "spaces/A/threads/canary"
+# How many rows each thread draws on the right: its root and its replies.
+THREAD_ROWS = {RUNNER: 9, REPLICA: 4, CANARY: 3}
 
 
 def thread_record(thread_id: str, root: int, replies: int, is_root: bool = True) -> Json:
@@ -344,11 +346,11 @@ def columns_walk(desk: Desk) -> None:
     desk.check(regions == [["side-scroll", "Threads"]], f"the right column is not one region named for its cards: {regions}")
     desk.notes.append("the greyed picker took the focus and refused ↓ and a click, saying why; one region on the right")
 
-    # The cards: newest activity first, one height, the summarised one by its name and summary, and the
-    # long question cut to three lines.
+    # The cards: newest activity at the foot (`#261 two-column-connectors`), one height, the summarised
+    # one by its name and summary, and the long question cut to three lines.
     cards = desk.cards()
     ids = [str(card["id"]) for card in cards]
-    desk.check(ids == [RUNNER, CANARY, REPLICA], f"the cards are not newest activity first: {ids}")
+    desk.check(ids == [REPLICA, CANARY, RUNNER], f"the cards are not newest activity at the foot: {ids}")
     heights = {round(float(str(card["height"]))) for card in cards}
     desk.check(len(heights) == 1, f"the cards are not one height: {heights}")
     text = {str(card["id"]): str(card["text"]) for card in cards}
@@ -360,7 +362,7 @@ def columns_walk(desk: Desk) -> None:
     desk.check(bool(replica["clamped"]) and int(str(replica["lines"])) == 3,
                f"the long question is not cut to three lines: {replica}")
     desk.shot("1-list")
-    desk.notes.append(f"three cards {heights.pop()}px each, newest first, the long one cut to three lines")
+    desk.notes.append(f"three cards {heights.pop()}px each, newest at the foot, the long one cut to three lines")
 
     # `#257 summary-truncation`: what the clamp cuts is not out of reach. The card under the mouse is
     # the selected one, and it shows its whole text; the others keep their three lines.
@@ -467,10 +469,12 @@ def columns_walk(desk: Desk) -> None:
     page.keyboard.press("j")
     desk.wait_for("() => document.activeElement && document.activeElement.matches('#side-cards > li')"
                   " && document.activeElement.matches(':focus-visible')",
-                  "j did not put a ring round the first card")
+                  "j did not put a ring round a card")
+    ringed = str(page.evaluate("() => document.activeElement.getAttribute('data-id')"))
     page.keyboard.press("Enter")
-    desk.wait_for("() => document.querySelectorAll('#side-log > li[data-id]').length === 9",
-                  "Enter on the card did not select its thread")
+    desk.wait_for("() => !document.getElementById('side-pane').hidden"
+                  f" && document.querySelectorAll('#side-log > li[data-id]').length === {THREAD_ROWS[ringed]}",
+                  f"Enter on the card of {ringed} did not select its thread")
     page.keyboard.press("[")
     desk.wait_for("() => document.getElementById('scroll-area').contains(document.activeElement)",
                   "[ did not give the keys back to the left column")

@@ -388,7 +388,7 @@ const FIXTURE_TREE = {
   "side-column": ["side-heading", "side-freshness", "side-scroll", "side-tools"],
   "side-heading": ["side-facts", "side-title", "side-close"],
   "side-scroll": ["side-search-empty", "side-list", "side-pane"],
-  "side-list": ["side-list-state", "side-cards", "side-more-threads"],
+  "side-list": ["side-list-state", "side-more-threads", "side-cards"],
   "side-pane": [
     "side-summary",
     "side-summary-note",
@@ -39244,7 +39244,7 @@ test("`#229 desktop-two-column`: in two columns the view picker is greyed and sa
   assert.deepStrictEqual(shownIds(page), ["200", "201", "203"], "a view key changed the left column");
 });
 
-test("`#229 desktop-two-column`: with no thread selected, a card per thread, newest activity first, saying the summariser's name and summary or else its first message", async () => {
+test("`#229 desktop-two-column`: with no thread selected, a card per thread, newest activity at the foot (`#261`), saying the summariser's name and summary or else its first message", async () => {
   const page = newPage();
   const data = threadData();
   const [first, second] = data.threads;
@@ -39261,7 +39261,8 @@ test("`#229 desktop-two-column`: with no thread selected, a card per thread, new
   assert.equal(page.el("side-pane").hidden, true);
   assert.equal(page.el("side-close").hidden, true, "an X with nothing to close");
   assert.equal(page.el("side-title").textContent, "Threads");
-  assert.deepStrictEqual(cardIds(page), [second.id, first.id], "the cards are not newest activity first");
+  // `#261 two-column-connectors`: newest activity at the foot, as the channel's own lists are.
+  assert.deepStrictEqual(cardIds(page), [first.id, second.id], "the cards are not newest activity at the foot");
   assert.equal(cardPart(page, first.id, "side-card-text"), "runner-wedged: The overnight runner hung and was restarted by hand.");
   assert.equal(cardPart(page, second.id, "side-card-text"), "second thread root");
   assert.match(cardPart(page, first.id, "side-card-facts"), /^(now|\d+[mhdwy]|\d+d\d+h) · 1 reply/,
@@ -39501,17 +39502,18 @@ test("`#229 desktop-two-column`: [ and ] move the keys between the columns, → 
   assert.equal(focused(page), page.el("side-cards").children[1]);
   await press(page, focused(page), "Enter");
   await page.settle();
-  assert.deepStrictEqual(sideIds(page), ["201", "202"], "Enter on a card did not select its thread");
+  // The second card, the newer thread: the cards have their newest at the foot (`#261`).
+  assert.deepStrictEqual(sideIds(page), ["203", "204"], "Enter on a card did not select its thread");
   await press(page, page.el("side-scroll"), "[");
   assert.ok(focused(page) === page.el("scroll-area") || page.el("discord-log").children.includes(focused(page)),
     `[ did not give the keys to the left column: ${focusName(page)}`);
   // → on Main's other root: its thread on the right, the keys with it.
-  const root = rowWithId(page, "203");
+  const root = rowWithId(page, "201");
   root.focus();
   FakeElement.focusVisible = true;
   await press(page, root, "ArrowRight");
   await page.settle();
-  assert.deepStrictEqual(sideIds(page), ["203", "204"], "→ did not select the thread on the right");
+  assert.deepStrictEqual(sideIds(page), ["201", "202"], "→ did not select the thread on the right");
   assert.deepStrictEqual(shownIds(page), ["200", "201", "203"], "→ left Main");
   assert.ok(focused(page) === page.el("side-scroll") || page.el("side-log").children.includes(focused(page)),
     `→ did not give the keys to the right column: ${focusName(page)}`);
@@ -39519,7 +39521,7 @@ test("`#229 desktop-two-column`: [ and ] move the keys between the columns, → 
   await press(page, focused(page), "ArrowLeft");
   assert.ok(focused(page) === page.el("scroll-area") || page.el("discord-log").children.includes(focused(page)),
     `← did not go back to the left column: ${focusName(page)}`);
-  assert.deepStrictEqual(sideIds(page), ["203", "204"], "← closed the thread");
+  assert.deepStrictEqual(sideIds(page), ["201", "202"], "← closed the thread");
   // Esc in the right column is its X.
   await press(page, page.el("side-scroll"), "Escape");
   await page.settle();
@@ -39640,7 +39642,7 @@ test("`#229 desktop-two-column`: the search narrows the cards as it narrows the 
   assert.deepStrictEqual(shown(), [second.id], "the search did not reach the cards");
   await page.el("search-toggle").click();
   await page.settle();
-  assert.deepStrictEqual(shown(), [second.id, first.id], "closing the search left a card hidden");
+  assert.deepStrictEqual(shown(), [first.id, second.id], "closing the search left a card hidden");
 });
 
 test("`#229 desktop-two-column`: another channel shows its own threads on the right, and coming back finds the thread selected there", async () => {
@@ -40166,6 +40168,135 @@ test("`#231 two-column-polish`: no top-level binding of web/voice.js is declared
   // The control: one more such declaration, `#229`'s `let sideMark = null` as it was, is found.
   assert.deepStrictEqual(unusedBindings(`${SCRIPT_CODE}\nlet sideMark = null;\n`), ["sideMark"],
     "the check does not find a declaration nothing uses, so it proves nothing");
+});
+
+// --- the cards with their newest at the foot (#261 two-column-connectors) --------------------------
+//
+// The owner, 2026-10-12: "We have the main chat views in forward-chronological mode with newest at
+// bottom. But now it's flipped with newest at top on threads list. I want the newest thread on the
+// bottom and us default scrolled to the bottom of the list." So the right column's cards run oldest
+// activity first, open at the foot, follow a thread that moves to the foot only for a reader already
+// there, and keep a reader up the list on the card they were on.
+
+/**
+ * A channel of `count` threads, each a root on Main and one answer, oldest first: enough cards to run
+ * past the foot of the right column.
+ */
+function manyThreads(count) {
+  const messages = [];
+  const threads = [];
+  for (let i = 0; i < count; i += 1) {
+    const id = `spaces/A/threads/t${i}`;
+    const rootId = String(300 + 2 * i);
+    const record = { id, root_message_id: rootId, is_root: true, reply_count: 1, reply_count_exact: true };
+    const root = message({ id: rootId, content: `thread ${i} root`, thread: record });
+    const answer = message({ id: String(301 + 2 * i), content: `thread ${i} answer`, thread: { ...record, is_root: false } });
+    messages.push(root, answer);
+    threads.push({ id, root, title: `Thread ${i}`, reply_count: 1, reply_count_exact: true, updated_at: answer.timestamp });
+  }
+  return { messages, threads };
+}
+
+/**
+ * `manyThreads(count)` on a server with a change record, read in All and then in two columns.
+ * `arrange` is `newPage`'s, run before a line of the page; `script` is web/voice.js or a broken copy.
+ */
+async function manyThreadColumns(count, arrange = null, script = SCRIPT) {
+  const data = manyThreads(count);
+  const page = newPage(new Map(), script, arrange);
+  page.threadingSupported = true;
+  page.threads = data.threads;
+  page.messages = data.messages;
+  const server = forwardTimeline(page);
+  await signIn(page);
+  await showDiscord(page, data.messages);
+  await twoColumns(page);
+  await page.settle();
+  return { page, server, data };
+}
+
+/** A reply into the thread `root` heads, posted and delivered on the stream. */
+async function liveReply(page, server, root, id) {
+  const reply = server.post(message({ id, content: `a live answer ${id}`, thread: { ...root.thread, is_root: false } }));
+  await deliver(page, page.stream(), sseMessage(reply));
+  await page.settle();
+  return reply;
+}
+
+/** The first card whose box shows in the right column. */
+const firstCardInView = (page) => {
+  const area = page.el("side-scroll");
+  const top = area.getBoundingClientRect().top;
+  return page.el("side-cards").children.find((li) => {
+    const box = li.getBoundingClientRect();
+    return !li.hidden && !li.hasClass("search-hidden") && box.bottom > top && box.top < top + area.clientHeight;
+  });
+};
+
+/** Whether the right column is scrolled to its foot. */
+const sideAtFoot = (page) => {
+  const area = page.el("side-scroll");
+  return area.scrollTop === area.scrollHeight - area.clientHeight;
+};
+
+test("`#261 two-column-connectors`: the cards have the newest thread at the foot and open scrolled to it, and a thread that moves goes to the foot, followed only by a reader there", async () => {
+  const run = async (script) => {
+    const { page, server, data } = await manyThreadColumns(16, null, script);
+    const area = page.el("side-scroll");
+    const ids = data.threads.map((thread) => thread.id);
+    assert.deepStrictEqual(cardIds(page), ids, "the cards are not oldest activity first, the newest at the foot");
+    assert.ok(area.scrollHeight > area.clientHeight + 200, "the cards do not run past the column's foot, so this proves nothing");
+    assert.ok(sideAtFoot(page), `the cards opened at ${area.scrollTop}px, not at the foot`);
+    // A reply into the oldest thread: its card goes to the foot, and the reader there follows it.
+    await liveReply(page, server, data.messages[0], "400");
+    assert.deepStrictEqual(cardIds(page), [...ids.slice(1), ids[0]], "the thread that moved did not go to the foot");
+    assert.ok(sideAtFoot(page), "the reader at the foot did not follow the thread that moved there");
+    // Up the list: the card the reader is on stays where it is while a thread above it moves to the foot.
+    area.scrollTop = 160;
+    const anchor = firstCardInView(page);
+    const at = anchor.getBoundingClientRect().top;
+    const above = cardIds(page).indexOf(anchor.getAttribute("data-id")) - 1;
+    assert.ok(above >= 0, "no card above the one in view, so this proves nothing");
+    const moving = data.threads.findIndex((thread) => thread.id === cardIds(page)[above]);
+    await liveReply(page, server, data.messages[2 * moving], "401");
+    assert.equal(cardIds(page)[cardIds(page).length - 1], data.threads[moving].id, "the thread that moved did not go to the foot");
+    const card = page.el("side-cards").children.find((li) => li.getAttribute("data-id") === anchor.getAttribute("data-id"));
+    return { page, moved: card.getBoundingClientRect().top - at, foot: sideAtFoot(page) };
+  };
+  const { moved, foot } = await run(SCRIPT);
+  assert.equal(moved, 0, `the card the reader was on moved ${moved}px when a thread above it went to the foot`);
+  assert.equal(foot, false, "a reader up the list was taken to the foot");
+  // The control: with the place not kept, the card moves up by the card that left above it.
+  const loose = await run(brokenScript("  change();\n  placeCardAnchor(anchor);\n", "  change();\n"));
+  assert.ok(loose.moved < 0, "the negative control kept the card in place, so the check above proves nothing");
+});
+
+test("`#261 two-column-connectors`: closing a thread comes back to the card it was chosen from; the way to older threads is above the oldest card", async () => {
+  const { page, data } = await manyThreadColumns(16);
+  const area = page.el("side-scroll");
+  area.scrollTop = 0;
+  const card = page.el("side-cards").children[2];
+  const at = card.getBoundingClientRect().top;
+  await card.children[0].click();
+  await page.settle();
+  assert.equal(page.el("side-list").hidden, true, "the card did not select its thread");
+  await page.el("side-close").click();
+  await page.settle();
+  const back = page.el("side-cards").children.find((li) => li.getAttribute("data-id") === card.getAttribute("data-id"));
+  assert.equal(back.getBoundingClientRect().top, at, "closing the thread did not come back to the card it was chosen from");
+  // From the foot, back to the foot.
+  area.scrollTop = area.scrollHeight;
+  const last = page.el("side-cards").children[page.el("side-cards").children.length - 1];
+  await last.children[0].click();
+  await page.settle();
+  await page.el("side-close").click();
+  await page.settle();
+  assert.ok(sideAtFoot(page), "a thread chosen at the foot did not come back to the foot");
+  assert.ok(markupHolds("side-list", "side-more-threads"));
+  const html = HTML.slice(HTML.indexOf('id="side-list"'));
+  assert.ok(html.indexOf('id="side-more-threads"') < html.indexOf('id="side-cards"'),
+    "the way to older threads is not above the oldest card");
+  assert.ok(data.threads.length === 16);
 });
 
 // --- clearing unread in the chat service's own app ----------------------------------------------

@@ -375,7 +375,7 @@ steps:
 
   # `#229 desktop-two-column` in the browser engine: the layout button draws Main and the right column
   # side by side inside the window at 1440x900 and 1280x800, neither under 440px, the view picker
-  # greyed and the width handle gone; the right column's cards are one height, newest activity first,
+  # greyed and the width handle gone; the right column's cards are one height, newest activity at the foot,
   # the summarised thread by its name and summary and the long question cut to three lines; a card and
   # a Main message's Thread(N) select a thread on the right under its name, each column scrolls alone
   # under the wheel over it, the X goes back to the cards, a 900px window is one column in the view it

@@ -532,11 +532,15 @@
               <p id="side-search-empty" class="search-empty" role="status" hidden>
                 Nothing in the messages loaded so far matches that search.
               </p>
-              <!-- No thread selected: one card per thread, newest activity first. -->
+              <!--
+                No thread selected: one card per thread, newest activity at the foot, as the channel's
+                lists have their newest message (`#261 two-column-connectors`), and the way to older
+                threads at the head, above the oldest.
+              -->
               <div id="side-list">
                 <p id="side-list-state" class="hint" role="status" aria-live="polite"></p>
-                <ul id="side-cards" class="side-cards" aria-label="Threads in this channel"></ul>
                 <button id="side-more-threads" class="secondary" type="button" hidden>Older threads…</button>
+                <ul id="side-cards" class="side-cards" aria-label="Threads in this channel"></ul>
               </div>
               <!-- A thread selected: the thread, exactly as #pane-discord draws one. -->
               <div id="side-pane" hidden>

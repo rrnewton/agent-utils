@@ -3365,7 +3365,7 @@ function showSearchOpen(open) {
   renderChannelFreshness();
   // Both columns: there is one search bar. `#229 desktop-two-column`.
   eachColumn(renderScrollTools);
-  if (columnsShown) filterSideCards();
+  if (columnsShown) refilterSideCards();
   if (open) {
     el("search-field").focus();
   }
@@ -11210,7 +11210,8 @@ function renderSideFreshness() {
     line.hidden = hide;
   };
   if (columnsShown && columns.side.mode === "thread") inColumn(columns.side, () => holdingReader(toggle));
-  else toggle();
+  // `#261 two-column-connectors`: and a reader of the cards keeps theirs, the foot above all.
+  else keepingCardPlace(toggle);
 }
 
 /**
@@ -24932,15 +24933,22 @@ function sideCardReplies(choice, tally) {
 let sideCardsDrawn = "";
 
 /**
- * One card per thread the channel's store knows, newest activity first — the Threads screen's order
- * and source — each a fixed three lines of what the thread is about, then how long since it moved,
- * how many replies it has and how many of them are unread. Choosing one selects it. Redrawn only when
- * what it would draw has changed, so a refresh with nothing new draws nothing here either.
+ * One card per thread the channel's store knows — the Threads screen's source — each a fixed three
+ * lines of what the thread is about, then how long since it moved, how many replies it has and how
+ * many of them are unread. Choosing one selects it. Redrawn only when what it would draw has changed,
+ * so a refresh with nothing new draws nothing here either.
+ *
+ * `#261 two-column-connectors`. NEWEST ACTIVITY AT THE FOOT, as the channel's own lists have their
+ * newest message: the owner, "We have the main chat views in forward-chronological mode with newest at
+ * bottom. But now it's flipped with newest at top on threads list. I want the newest thread on the
+ * bottom and us default scrolled to the bottom of the list." So a thread that moves goes to the foot,
+ * a reader there follows it, and a reader up the list keeps the card they were on where it was
+ * (`keepingCardPlace`). The way to older threads is at the head, above the oldest card.
  */
 function renderSideCards() {
   const list = leftEl("side-cards");
   const tally = replyTally();
-  const cards = threadChoices().map((choice) => ({
+  const cards = threadChoices().reverse().map((choice) => ({
     choice,
     text: sideCardText(choice),
     age: briefAge(Number.isFinite(choice.at) ? choice.at : choice.started),
@@ -24949,16 +24957,124 @@ function renderSideCards() {
   }));
   const signature = JSON.stringify(cards.map(({ choice, text, age, replies, unread }) =>
     [choice.id, text, age, replies, unread]));
+  const more = olderThreadsOnServer();
   if (signature !== sideCardsDrawn) {
     sideCardsDrawn = signature;
-    list.replaceChildren(...cards.map(sideCard));
+    keepingCardPlace(() => {
+      list.replaceChildren(...cards.map(sideCard));
+      filterSideCards();
+    });
+  } else {
+    filterSideCards();
   }
-  filterSideCards();
-  const state = cards.length === 0 ? "No threads in this channel yet." : "";
-  setTextIfChanged(leftEl("side-list-state"), state);
-  if (leftEl("side-list-state").hidden !== (state === "")) leftEl("side-list-state").hidden = state === "";
-  const more = olderThreadsOnServer();
-  if (leftEl("side-more-threads").hidden === more) leftEl("side-more-threads").hidden = !more;
+  // Above the cards, so the reader's place is kept as it comes or goes.
+  const button = leftEl("side-more-threads");
+  if (button.hidden === more) {
+    keepingCardPlace(() => {
+      button.hidden = !more;
+    });
+  }
+}
+
+/**
+ * Where the reader is in the cards, to put them back after the cards change under them: a thread that
+ * moved going to the foot, the cards filtered, the line over them coming or going. `#261
+ * two-column-connectors`. As a list of messages keeps its reader (`keepingFilterPlace`, whose rules
+ * these are): the reader on the foot follows it; else the selected card while it shows, else the
+ * first card showing, stays at its height. Null with the cards not on screen, and while they are
+ * being opened, which places the reader itself (`placeOpenedCards`).
+ *
+ * @returns {{newest: boolean, id: string | null, offset: number} | null}
+ */
+function cardAnchor() {
+  if (!columnsShown || columns.side.mode !== "list" || cardsOpening) return null;
+  const area = leftEl("side-scroll");
+  if (atBottom(area)) return { newest: true, id: null, offset: 0 };
+  const top = area.getBoundingClientRect().top;
+  const foot = top + (area.clientHeight || 0);
+  const rows = /** @type {HTMLElement[]} */ ([...leftEl("side-cards").children]).filter(rowShown);
+  const seen = (/** @type {HTMLElement} */ row) => {
+    const box = row.getBoundingClientRect();
+    return box.bottom > top && box.top < foot;
+  };
+  const mark = markOf(sidePane);
+  const chosen = mark ? rows.find((row) => row.getAttribute("data-id") === mark.id) : undefined;
+  const row = chosen && seen(chosen) ? chosen : rows.find(seen);
+  if (!row) return null;
+  return { newest: false, id: String(row.getAttribute("data-id")), offset: row.getBoundingClientRect().top - top };
+}
+
+/**
+ * Put the reader back on `anchor` in the cards: the foot, or that card at its height — or, where the
+ * filters now hide it, the nearest card shown, in the list's order. Nothing for a card that has gone.
+ *
+ * @param {{newest: boolean, id: string | null, offset: number} | null} anchor
+ */
+function placeCardAnchor(anchor) {
+  if (!anchor) return;
+  const area = leftEl("side-scroll");
+  if (anchor.newest) {
+    area.scrollTop = area.scrollHeight;
+    return;
+  }
+  const rows = /** @type {HTMLElement[]} */ ([...leftEl("side-cards").children]);
+  const at = rows.findIndex((row) => row.getAttribute("data-id") === anchor.id);
+  if (at < 0) return;
+  let row = rowShown(rows[at]) ? rows[at] : null;
+  for (let step = 1; !row && step < rows.length; step += 1) {
+    row = [rows[at + step], rows[at - step]].find((one) => one && rowShown(one)) || null;
+  }
+  if (row) area.scrollTop += row.getBoundingClientRect().top - area.getBoundingClientRect().top - anchor.offset;
+}
+
+/**
+ * Run `change` to the cards, keeping the reader's place in them. `#261 two-column-connectors`.
+ *
+ * @param {() => void} change
+ */
+function keepingCardPlace(change) {
+  const anchor = cardAnchor();
+  change();
+  placeCardAnchor(anchor);
+}
+
+/** True while the cards are being opened, which places the reader once they are drawn. */
+let cardsOpening = false;
+
+/**
+ * By channel, where the reader was in the cards when a thread was selected from them, for this
+ * session: closing the thread comes back there. `#261 two-column-connectors`.
+ *
+ * @type {Map<string, {newest: boolean, id: string | null, offset: number}>}
+ */
+const sideCardPlaces = new Map();
+
+/** Note where the reader is in the cards, before the right column shows something else. */
+function rememberCardPlace() {
+  const anchor = cardAnchor();
+  if (anchor) sideCardPlaces.set(String(el("discord-channel").value), anchor);
+}
+
+/** Show the cards in the right column, the reader placed in them as `placeOpenedCards` says. */
+function openSideCards() {
+  columns.side.mode = "list";
+  cardsOpening = true;
+  try {
+    renderSideMode();
+  } finally {
+    cardsOpening = false;
+  }
+  placeOpenedCards();
+}
+
+/**
+ * The cards just opened: at the foot, as a list of messages opens at its newest, unless the reader was
+ * up the list when a thread was selected from it — then back on the card they were on.
+ */
+function placeOpenedCards() {
+  const anchor = sideCardPlaces.get(String(el("discord-channel").value));
+  sideCardPlaces.delete(String(el("discord-channel").value));
+  placeCardAnchor(anchor && !anchor.newest ? anchor : { newest: true, id: null, offset: 0 });
 }
 
 /**
@@ -24968,10 +25084,19 @@ function renderSideCards() {
  */
 function filterSideCards() {
   const terms = searchOpen ? searchTerms(searchQuery) : [];
-  for (const row of leftEl("side-cards").children) {
+  const rows = leftEl("side-cards").children;
+  for (const row of rows) {
     const text = row.getAttribute("data-search") || "";
     setClassWord(row, "search-hidden", !terms.every((term) => text.includes(term)));
   }
+  const state = rows.length === 0 ? "No threads in this channel yet." : "";
+  setTextIfChanged(leftEl("side-list-state"), state);
+  if (leftEl("side-list-state").hidden !== (state === "")) leftEl("side-list-state").hidden = state === "";
+}
+
+/** `filterSideCards`, the reader's place in the cards kept: the search typed, opened or closed. */
+function refilterSideCards() {
+  keepingCardPlace(filterSideCards);
 }
 
 /** One card. Every string is text; nothing from the chat service is parsed as markup. */
@@ -25008,8 +25133,7 @@ function sideCard({ choice, text, age, replies, unread }) {
 
 /** The right column with no thread selected: its cards, and the thread list read behind them. */
 function showSideList() {
-  columns.side.mode = "list";
-  renderSideMode();
+  openSideCards();
   // Not before sign-in has answered: the reopen's read reads the list behind the cards then.
   if (clientConfigApplied) guardQuietly(refreshThreadDirectory)();
 }
@@ -25026,6 +25150,7 @@ function selectSideThread(id, summary = null) {
   const known = summary || channelCanon.threads.find((held) => String(held.id) === thread) || null;
   sideThreads.set(channel, { id: thread, summary: known });
   const was = columns.side.mode;
+  if (was === "list") rememberCardPlace();
   columns.side.mode = "thread";
   renderSideMode();
   return inColumn(columns.side, () => {
@@ -25073,7 +25198,7 @@ function resetSideColumn(reopen = false) {
   leftEl("side-cards").replaceChildren();
   if (!columnsShown || !reopen) {
     columns.side.mode = "list";
-    if (columnsShown) renderSideMode();
+    if (columnsShown) openSideCards();
     return;
   }
   const open = sideThreads.get(String(el("discord-channel").value));
@@ -28362,7 +28487,7 @@ el("search-field").addEventListener("input", () => {
   keepingFilterPlace(() => {
     searchQuery = el("search-field").value;
     eachColumn(renderScrollTools);
-    if (columnsShown) filterSideCards();
+    if (columnsShown) refilterSideCards();
   });
 });
 // Escape closes AND clears, which is the same act — see `setSearchOpen`. It is the gesture a

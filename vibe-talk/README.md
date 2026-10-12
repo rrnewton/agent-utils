@@ -4592,8 +4592,11 @@ other chat clients' desktop apps lay a channel out; the choice is kept per devic
 each column still holds about 45 characters, the narrowest reading width the page allows; a window
 narrowed below it shows one column again and keeps the choice. In two columns the view picker greys
 out. The right column shows the selected thread, with its name, an X that deselects it, and its own
-composer; with none selected, a card per thread, newest activity first, saying the summariser's
-`display_name: summary` or else the thread's first message, three lines at most. Thread(N), the
+composer; with none selected, a card per thread, saying the summariser's `display_name: summary` or
+else the thread's first message, three lines at most. The cards run as the channel's lists do
+(`#261 two-column-connectors`): the newest activity at the foot, opened scrolled to it, a thread
+that moves going to the foot and followed there only by a reader already at the foot, and a reader up
+the list kept on their card; closing a thread comes back to the card it was chosen from. Thread(N), the
 unread count, N replies, the Threads screen and the cards select a thread there, and a plain tap on
 a message still only folds it. Search, Links and the read mode apply to both columns; Pinned stands
 in for the left column's list. The poll reads Main and the selected thread (two views, one delta
