@@ -1230,3 +1230,80 @@ async fn the_summary_route_and_taking_a_channel_off_the_list_log_numbers_and_nev
         );
     }
 }
+
+#[tokio::test]
+async fn the_hourly_upstream_line_is_names_and_numbers_and_never_the_channel() {
+    // `#208 persistent-cache`, milestone `upstream-profile`. One line per provider per hour says
+    // how long its operations took and how big the messages read were. The provider key, the
+    // operation names and outcome words are this server's own; everything else is a number.
+    let capture = LogCapture::info_only();
+    let (state, discord) = vibe_talk::testing::state();
+    let profile = std::sync::Arc::clone(state.providers.profile());
+    let harness = Harness {
+        router: router(state),
+        discord,
+    };
+    let channel = ChannelId(READ_CHANNEL.to_owned());
+    let content = "third-party-words-that-must-not-reach-the-hourly-line";
+    let id = harness
+        .discord
+        .seed(&channel, "Somebody Particular", content);
+    assert_eq!(
+        call(
+            &harness,
+            "GET",
+            &format!("/api/v1/channels/{READ_CHANNEL}/messages"),
+            Some(READ_TOKEN),
+            None,
+        )
+        .await,
+        StatusCode::OK
+    );
+
+    profile.log_hour();
+    let hourly = |text: &str| -> Vec<String> {
+        text.lines()
+            .filter(|line| line.contains("upstream timings for the last hour"))
+            .map(str::to_owned)
+            .collect()
+    };
+    let lines = hourly(&capture.text());
+    assert_eq!(lines.len(), 1, "one line per provider: {lines:?}");
+    let line = &lines[0];
+    for field in [
+        "provider=\"discord\"",
+        "operations=",
+        "operations_failed=0",
+        "operation_timings=\"",
+        " ok n=",
+        "p90_ms=",
+        "shim_calls=0",
+        "content_messages=",
+        "content_bytes_p90=",
+    ] {
+        assert!(
+            line.contains(field),
+            "the hourly line has no {field}: {line}"
+        );
+    }
+    assert!(
+        !line.contains("content_messages=0"),
+        "the read's message was not counted, so the absence below proves nothing: {line}"
+    );
+    for private in [content, "Somebody Particular", READ_CHANNEL, id.0.as_str()] {
+        assert!(
+            !line.contains(private),
+            "the hourly line carries {private:?}: {line}"
+        );
+    }
+
+    // The next hour starts from nothing: the line is about that hour, not the process.
+    profile.log_hour();
+    let lines = hourly(&capture.text());
+    assert_eq!(lines.len(), 2, "{lines:?}");
+    assert!(
+        lines[1].contains("operations=0") && lines[1].contains("content_messages=0"),
+        "{}",
+        lines[1]
+    );
+}
