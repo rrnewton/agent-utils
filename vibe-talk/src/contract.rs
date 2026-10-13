@@ -65,7 +65,8 @@ pub struct ClientConfigResponse {
     pub read_aloud: crate::speech::Description,
     /// Server version, so a stale cached page is visible.
     pub version: &'static str,
-    /// Whether the operator has allowed an earlier transcript to be replayed into a new call.
+    /// Whether a new call will be handed the earlier transcript: the operator allowed it AND the
+    /// voice backend can carry it (a `vibe-talk-v1` socket cannot; see `replay::offered`).
     ///
     /// The page needs it BEFORE it has anything to replay: the Settings screen has to describe
     /// what resuming will do, and the control's own note has to say what the next call will be —

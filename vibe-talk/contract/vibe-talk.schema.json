@@ -250,7 +250,7 @@
           "description": "Selected read-aloud backend and the playback interface the browser should use."
         },
         "replay_enabled": {
-          "description": "Whether the operator has allowed an earlier transcript to be replayed into a new call.\n\nThe page needs it BEFORE it has anything to replay: the Settings screen has to describe\nwhat resuming will do, and the control's own note has to say what the next call will be —\nboth of which are questions asked while there is no conversation to fetch.",
+          "description": "Whether a new call will be handed the earlier transcript: the operator allowed it AND the\nvoice backend can carry it (a `vibe-talk-v1` socket cannot; see `replay::offered`).\n\nThe page needs it BEFORE it has anything to replay: the Settings screen has to describe\nwhat resuming will do, and the control's own note has to say what the next call will be —\nboth of which are questions asked while there is no conversation to fetch.",
           "type": "boolean"
         },
         "replies_in_thread": {

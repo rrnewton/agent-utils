@@ -408,6 +408,9 @@ enabled = true
 # what this does instead is hand the NEW call a written record of the earlier one: a
 # reconstruction, not a continuation, and the /voice page says which of the two you got.
 #
+# Only the ElevenLabs backend can carry a replay. With conversation.backend = "websocket" there is
+# no frame for it, so the page is told replay is off and the server warns at startup.
+#
 # OFF by default, and the reason is privacy rather than caution: every new call re-sends earlier
 # conversation content — your own speech AND any Discord text the agent read out to you,
 # written by other people — to the voice vendor. Turn it on deliberately.
