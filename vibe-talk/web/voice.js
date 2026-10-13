@@ -25401,20 +25401,38 @@ function replyDestination() {
   if (replyRouting.branch && el("reply-branch").checked) {
     return ["New thread", threadName(threadChoice(replyRouting.branch, null, replyTarget), Infinity)];
   }
-  // `#185 reply-new-thread`. A new thread somebody answered first: the thread, as any thread is named,
-  // and by its message until the store has more to name it by.
-  if (replyRouting.into) return threadDestination(replyRouting.into, replyTarget);
+  // `#185 reply-new-thread`. A new thread somebody answered first: the thread, as any thread is named.
+  // Until a read lists it, it goes by its message and the replies the page holds in it, so its facts
+  // say what its tag says: active just now, with Thread(1)'s one reply, not the message's own age.
+  if (replyRouting.into) {
+    const into = replyRouting.into;
+    const choice = threadIndex().get(into) || heldThreadChoice(into, replyTarget);
+    return [threadFacts(choice), threadName(choice, Infinity)];
+  }
   const thread = replyPlace();
   if (!thread) return ["Main", channel];
-  return threadDestination(thread);
-}
-
-/** `replyDestination` for thread `thread`, whose first message `root` is, where the store has no more. */
-function threadDestination(thread, root = null) {
   const summary = channelCanon.threads.find((held) => String(held.id) === thread) ||
     (String(selectedThreadId) === thread ? selectedThread : null);
-  const choice = threadIndex().get(thread) || threadChoice(thread, summary, root);
+  const choice = threadIndex().get(thread) || threadChoice(thread, summary);
   return [threadFacts(choice), threadName(choice, Infinity)];
+}
+
+/**
+ * Thread `id`, which no list of threads names yet, as `threadChoice` makes one from its first message
+ * `root`, with the replies the store holds in it counted and their latest time as its activity — as
+ * `threadIndex` does for a thread it lists. `#185 reply-new-thread`.
+ */
+function heldThreadChoice(id, root) {
+  const choice = threadChoice(id, null, root);
+  let held = 0;
+  for (const message of channelCanon.messages) {
+    if (threadOf(message) !== id || message.thread.is_root === true) continue;
+    held += 1;
+    const at = timeOf(message, "timestamp");
+    if (Number.isFinite(at)) choice.at = Number.isFinite(choice.at) ? Math.max(choice.at, at) : at;
+  }
+  choice.count = Math.max(typeof choice.count === "number" ? choice.count : 0, held);
+  return choice;
 }
 
 /**

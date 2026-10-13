@@ -45250,9 +45250,9 @@ test("`#185 reply-new-thread`: a reply arriving while Reply is open takes the ne
   assert.equal(page.el("reply-branch-row").hidden, true, "the box still offered to start a thread that has a reply");
   assert.equal(page.el("reply-destination").textContent, INTO_ANSWERED_NOTE);
   assert.equal(page.el("reply-destination").hidden, false);
+  // The thread, named as the picker names one: its activity, the one reply its tag counts, its name.
   const title = replyTitle(page);
-  assert.ok(!title.includes("New thread") && !title.includes("Main"), `the title still said ${title}`);
-  assert.ok(title.endsWith(" · a brand-new message nobody has answered"), `the title did not name the thread: ${title}`);
+  assert.match(title, /^Reply · [^·]+ · 1 · a brand-new message nobody has answered$/, "the title did not name the thread it goes into");
   assert.equal(page.el("reply-text").value, "my answer", "the words went with the box");
 
   // Put down and picked up again: still bound for the thread, by the draft's kept choice.
