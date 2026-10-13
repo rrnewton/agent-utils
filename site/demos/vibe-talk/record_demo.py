@@ -528,7 +528,11 @@ async def prepare_desktop(stage: Stage) -> None:
 
 async def play_desktop(stage: Stage) -> None:
     await stage.pause(1.8)
-    await stage.tap("#side-cards .side-card:has-text('csv-export-review')")
+    # A click on a card only highlights it and shows it whole; its replies button opens the thread.
+    row = "#side-cards .side-card-row:has-text('csv-export-review')"
+    await stage.tap(f"{row} .side-card")
+    await stage.pause(1.0)
+    await stage.tap(f"{row} .side-card-open")
     await stage.wait("document.getElementById('side-compose-text').checkVisibility()")
     await stage.pause(2.0)
     await stage.scroll("#side-scroll", 2000, 1300)
