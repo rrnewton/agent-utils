@@ -396,6 +396,11 @@ declare namespace VibeTalk {
      */
     posted: Message;
     /**
+     * The send memory's number for this send, under which the voice page records it. `#270
+     * voice-transcript-markers`. Absent only when the memory was emptied while it was on its way.
+     */
+    send_seq?: number | null;
+    /**
      * Which proposal this was.
      */
     serial: number;
@@ -912,6 +917,16 @@ declare namespace VibeTalk {
      */
     reply_to: MessageId | null;
     /**
+     * Who wrote the message it would reply to, when this server holds that message. `#269
+     * approval-card-inline`: the card says "replying to Alex", never an id.
+     */
+    reply_to_author?: string | null;
+    /**
+     * The first few words of the message it would reply to, flattened, when this server holds
+     * it.
+     */
+    reply_to_excerpt?: string | null;
+    /**
      * Correlates this proposal's steps in the access log. Increases with every proposal.
      */
     serial: number;
@@ -919,16 +934,44 @@ declare namespace VibeTalk {
      * The exact text that would be posted.
      */
     text: string;
+    /**
+     * The name of the thread the message it would reply to is in, when that is a thread this
+     * server has named.
+     */
+    thread_name?: string | null;
   }
 
   /**
    * The post waiting for confirmation, or `null` when none is.
+   *
+   * `#270 voice-transcript-markers` adds the post gate's send memory: every message the voice agent
+   * posted in the last [`crate::post_gate::SEND_MEMORY_TTL`], however it was approved, published
+   * once it settled. A page reads it with `sent_after`, the newest `send_seq` it has seen; without
+   * that it gets no sends and waits as it always did.
    */
   interface PendingPostResponse {
+    /**
+     * The server's clock, in milliseconds since the Unix epoch, for placing a send's
+     * `begun_at_ms` in a call.
+     */
+    now_ms: number;
     /**
      * The pending proposal. At most one exists: a new proposal supersedes the old.
      */
     proposal: PendingPost | null;
+    /**
+     * The sends that settled after `sent_after`, oldest first. Absent when there are none, and
+     * whenever the request carried no `sent_after`.
+     */
+    sends?: VoiceSend[];
+    /**
+     * The newest `send_seq` this server has handed out: the page's next `sent_after`.
+     */
+    sends_through: number;
+    /**
+     * What became of the proposals this server still remembers, oldest first. Absent when none.
+     */
+    settled?: ProposalSettled[];
   }
 
   /**
@@ -1077,6 +1120,30 @@ declare namespace VibeTalk {
   type PromptTransport = "prompt_override" | "contextual_update" | "not_sent";
 
   /**
+   * What became of a proposal once it stopped being pending, as the long poll reports it.
+   * `#270 voice-transcript-markers`.
+   *
+   * Finer than [`Refusal`], which only has to tell a second commit why it is refused: the voice page
+   * says "the draft lapsed" only for a proposal that really did, and nothing for one a newer draft
+   * replaced or one that was sent.
+   */
+  type ProposalFate = "committed" | "cancelled" | "expired" | "superseded" | "refused";
+
+  /**
+   * What became of one proposal. `#270 voice-transcript-markers`.
+   */
+  interface ProposalSettled {
+    /**
+     * What became of it.
+     */
+    fate: ProposalFate;
+    /**
+     * The proposal's number.
+     */
+    serial: number;
+  }
+
+  /**
    * One configured chat provider, as the page needs to know it.
    */
   interface ProviderDescription {
@@ -1211,6 +1278,117 @@ declare namespace VibeTalk {
      * Every message at or after `from` that is marked Done, newest first.
      */
     messages: MessageId[];
+  }
+
+  /**
+   * How the owner approved a send. `#270 voice-transcript-markers`.
+   */
+  type SendHow = "tap" | "voice" | "direct";
+
+  /**
+   * Which door a send came through. Stored for audit; nothing is drawn from it.
+   */
+  type SendOrigin = "commit" | "mcp" | "rest";
+
+  /**
+   * What a send is known to have posted.
+   */
+  type SendOutcome = "sent" | "partial" | "unconfirmed";
+
+  /**
+   * One message the voice agent posted, as a `sent` row records it. `#270
+   * voice-transcript-markers`.
+   *
+   * Every field comes from this server's own copy of the send, never from a page. The times are
+   * here rather than in the row's `at_ms`, which must stay non-decreasing within a conversation
+   * for [`TranscriptCursor`]; `at_ms` is when the row was recorded.
+   */
+  interface SentRecord {
+    /**
+     * When the send began, by the server's clock.
+     */
+    begun_at_ms: number;
+    /**
+     * The channel it went to.
+     */
+    channel_id: string;
+    /**
+     * That channel's name as the owner knows it, when it was sent.
+     */
+    channel_name: string;
+    /**
+     * How the owner approved it.
+     */
+    how: SendHow;
+    /**
+     * The first part as the chat service accepted it, when one was.
+     */
+    message_id?: string | null;
+    /**
+     * Which door it came through.
+     */
+    origin: SendOrigin;
+    /**
+     * What is known to have been posted.
+     */
+    outcome: SendOutcome;
+    /**
+     * How many parts are known to have been posted.
+     */
+    parts_posted: number;
+    /**
+     * How many parts the message was cut into.
+     */
+    parts_total: number;
+    /**
+     * The message it answered, kept so a page can open it. Never drawn as an id.
+     */
+    reply_to?: string | null;
+    /**
+     * Who wrote the message it answered, when this server had that message to hand.
+     */
+    reply_to_author?: string | null;
+    /**
+     * The first few words of the message it answered, flattened, when this server had it.
+     */
+    reply_to_excerpt?: string | null;
+    /**
+     * Where it stands in the order sends settled, which is the long poll's cursor.
+     */
+    send_seq: number;
+    /**
+     * When the send settled, by the server's clock.
+     */
+    sent_at_ms: number;
+    /**
+     * The proposal's number, or the direct send's: the same counter.
+     */
+    serial: number;
+    /**
+     * How many characters were posted, whatever the row holds.
+     */
+    text_chars: number;
+    /**
+     * Whether the row's text is shorter than what was posted: a stored row is capped at
+     * [`MAX_TURN_CHARS`].
+     */
+    text_truncated: boolean;
+    /**
+     * The thread it went to, when not the conversation itself.
+     */
+    thread_id?: string | null;
+    /**
+     * That thread's name, when this server knows one.
+     */
+    thread_name?: string | null;
+    /**
+     * The part, counted from 1, that failed in a way that may have posted it anyway.
+     */
+    uncertain_part?: number | null;
+    /**
+     * How many characters were certainly not posted.
+     */
+    unsent_chars: number;
   }
 
   /**
@@ -1774,6 +1952,24 @@ declare namespace VibeTalk {
      * Whether `system_prompt` is the owner's edited copy.
      */
     system_prompt_edited: boolean;
+  }
+
+  /**
+   * One message the voice agent posted, as the send memory publishes it. `#270
+   * voice-transcript-markers`.
+   *
+   * The same text and detail a `sent` transcript row records, so a page draws a live card and a
+   * restored one with the same code.
+   */
+  interface VoiceSend {
+    /**
+     * Where it went, how it was approved, and what is known to have been posted.
+     */
+    detail: SentRecord;
+    /**
+     * The text that went, capped as a transcript row is.
+     */
+    text: string;
   }
 
   /**

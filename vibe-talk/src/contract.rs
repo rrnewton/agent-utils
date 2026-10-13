@@ -742,15 +742,75 @@ pub struct PendingPost {
     pub prefix: String,
     /// The message it would reply to, when any.
     pub reply_to: Option<MessageId>,
+    /// Who wrote the message it would reply to, when this server holds that message. `#269
+    /// approval-card-inline`: the card says "replying to Alex", never an id.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reply_to_author: Option<String>,
+    /// The first few words of the message it would reply to, flattened, when this server holds
+    /// it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reply_to_excerpt: Option<String>,
+    /// The name of the thread the message it would reply to is in, when that is a thread this
+    /// server has named.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thread_name: Option<String>,
     /// Milliseconds until the handle expires.
     pub expires_in_ms: u64,
 }
 
 /// The post waiting for confirmation, or `null` when none is.
+///
+/// `#270 voice-transcript-markers` adds the post gate's send memory: every message the voice agent
+/// posted in the last [`crate::post_gate::SEND_MEMORY_TTL`], however it was approved, published
+/// once it settled. A page reads it with `sent_after`, the newest `send_seq` it has seen; without
+/// that it gets no sends and waits as it always did.
 #[derive(Debug, Serialize, JsonSchema)]
 pub struct PendingPostResponse {
     /// The pending proposal. At most one exists: a new proposal supersedes the old.
     pub proposal: Option<PendingPost>,
+    /// The sends that settled after `sent_after`, oldest first. Absent when there are none, and
+    /// whenever the request carried no `sent_after`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub sends: Vec<VoiceSend>,
+    /// The newest `send_seq` this server has handed out: the page's next `sent_after`.
+    pub sends_through: u64,
+    /// What became of the proposals this server still remembers, oldest first. Absent when none.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub settled: Vec<ProposalSettled>,
+    /// The server's clock, in milliseconds since the Unix epoch, for placing a send's
+    /// `begun_at_ms` in a call.
+    pub now_ms: i64,
+}
+
+/// One message the voice agent posted, as the send memory publishes it. `#270
+/// voice-transcript-markers`.
+///
+/// The same text and detail a `sent` transcript row records, so a page draws a live card and a
+/// restored one with the same code.
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+pub struct VoiceSend {
+    /// The text that went, capped as a transcript row is.
+    pub text: String,
+    /// Where it went, how it was approved, and what is known to have been posted.
+    pub detail: crate::store::SentRecord,
+}
+
+impl From<crate::post_gate::VoiceSendRecord> for VoiceSend {
+    fn from(send: crate::post_gate::VoiceSendRecord) -> Self {
+        Self {
+            text: send.text,
+            detail: send.record,
+        }
+    }
+}
+
+/// What became of one proposal. `#270 voice-transcript-markers`.
+#[derive(Clone, Copy, Debug, Serialize, JsonSchema)]
+pub struct ProposalSettled {
+    /// The proposal's number.
+    pub serial: u64,
+    /// What became of it.
+    pub fate: crate::post_gate::ProposalFate,
 }
 
 /// A confirmed proposal, posted.
@@ -758,6 +818,10 @@ pub struct PendingPostResponse {
 pub struct CommittedPostResponse {
     /// Which proposal this was.
     pub serial: u64,
+    /// The send memory's number for this send, under which the voice page records it. `#270
+    /// voice-transcript-markers`. Absent only when the memory was emptied while it was on its way.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub send_seq: Option<u64>,
     /// The FIRST message as the chat service accepted it.
     pub posted: Message,
     /// Every part, in order. One element for a message that fitted.

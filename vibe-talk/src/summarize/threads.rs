@@ -873,6 +873,17 @@ impl ThreadNames {
         self.lock().named
     }
 
+    /// The name this server already holds in memory for one thread, without reading the store or
+    /// queueing anything. `#269 approval-card-inline`: what a send card says its thread is called,
+    /// and nothing when the thread has not been read here since the server started.
+    #[must_use]
+    pub fn known_name(&self, channel: &ChannelId, thread: &str) -> Option<String> {
+        self.lock()
+            .known
+            .get(&(channel.clone(), thread.to_owned()))
+            .and_then(|record| record.as_ref().map(|record| record.name.clone()))
+    }
+
     /// Forget the sentences remembered for `channel`'s threads and keep their names, as
     /// [`crate::store::StateStore::forget_channel_summaries`] does in the store. Called when the
     /// channel is taken off the list. `#208 persistent-cache`.

@@ -97,6 +97,9 @@ pub enum OpError {
         /// voice-send-approval`: what lets a voice agent say "not confirmed" rather than "not
         /// sent" about a post whose answer was lost.
         uncertain: bool,
+        /// The first part as the provider accepted it, when any part was. `#270
+        /// voice-transcript-markers`: what lets a card for a partial send open the message.
+        first: Option<Box<Message>>,
     },
 
     /// A catch-up's deadline passed before this channel was read, and nothing earlier is held.
@@ -2427,11 +2430,48 @@ pub enum CommitError {
     Refused(crate::post_gate::Refusal),
     /// The gate accepted it and the post itself then failed. The handle is spent either way: a
     /// failure after acceptance may have delivered part, and a retry must be a new proposal.
-    Post(OpError),
+    Post {
+        /// What failed. Boxed, because it is far wider than a refusal.
+        error: Box<OpError>,
+        /// The proposal's number.
+        serial: u64,
+        /// The send memory's number for it, when anything may have been posted. `#270
+        /// voice-transcript-markers`.
+        send_seq: Option<u64>,
+    },
+}
+
+impl ConfirmedBy {
+    /// How the send memory says the owner approved it. `#270 voice-transcript-markers`.
+    #[must_use]
+    pub fn how(self) -> crate::store::SendHow {
+        match self {
+            Self::Ui => crate::store::SendHow::Tap,
+            Self::SpeakerTurn => crate::store::SendHow::Voice,
+        }
+    }
+}
+
+/// A confirmed proposal, posted.
+#[derive(Debug)]
+pub struct Committed {
+    /// The proposal's number.
+    pub serial: u64,
+    /// The send memory's number for it, under which the voice page records it. `None` only when
+    /// the memory was emptied while it was on its way.
+    pub send_seq: Option<u64>,
+    /// The first part as the chat service accepted it.
+    pub posted: Message,
+    /// Every part, in order.
+    pub parts: Vec<Message>,
 }
 
 /// Spend a proposal and post it, once. **Write scope**, and reachable only from the application
 /// route — never from a tool.
+///
+/// The send goes into the post gate's send memory as the handle is spent, and is filed there with
+/// what it posted when it settles (`#270 voice-transcript-markers`), so the voice page can draw it
+/// even when this call's answer never reaches it.
 ///
 /// # Errors
 ///
@@ -2442,35 +2482,52 @@ pub async fn commit_proposal(
     handle: &str,
     restated: &crate::post_gate::Binding,
     confirmed_by: ConfirmedBy,
-) -> Result<(u64, Message, Vec<Message>), CommitError> {
-    let proposal = match state.post_gate.take(handle, restated) {
-        Ok(proposal) => proposal,
-        Err((why, proposal)) => {
-            match proposal {
-                Some(proposal) => {
-                    log_gate_step("refused", &proposal, Some(why.code()), Some(confirmed_by));
+) -> Result<Committed, CommitError> {
+    let channel_name = crate::send_approval::channel_name(state, &restated.channel_id).await;
+    let (proposal, ticket) =
+        match state
+            .post_gate
+            .take(handle, restated, confirmed_by.how(), channel_name)
+        {
+            Ok(taken) => taken,
+            Err((why, proposal)) => {
+                match proposal {
+                    Some(proposal) => {
+                        log_gate_step("refused", &proposal, Some(why.code()), Some(confirmed_by));
+                    }
+                    None => crate::access::post_gate(
+                        "refused",
+                        None,
+                        Some(restated.channel_id.as_str()),
+                        Some(restated.text.chars().count()),
+                        Some(why.code()),
+                        Some(confirmed_by.as_str()),
+                    ),
                 }
-                None => crate::access::post_gate(
-                    "refused",
-                    None,
-                    Some(restated.channel_id.as_str()),
-                    Some(restated.text.chars().count()),
-                    Some(why.code()),
-                    Some(confirmed_by.as_str()),
-                ),
+                return Err(CommitError::Refused(why));
             }
-            return Err(CommitError::Refused(why));
-        }
-    };
+        };
     let binding = &proposal.binding;
-    match reply(
+    let result = reply(
         state,
         &binding.channel_id,
         &binding.text,
         binding.reply_to.as_deref(),
     )
-    .await
-    {
+    .await;
+    let report = crate::send_approval::send_report(
+        state,
+        binding,
+        result.as_ref().map(|(_, _, parts)| parts.as_slice()),
+    );
+    let send_seq = match report {
+        Some(report) => ticket.settle(report),
+        None => {
+            ticket.forget();
+            None
+        }
+    };
+    match result {
         Ok((channel, posted, parts)) => {
             log_gate_step("committed", &proposal, None, Some(confirmed_by));
             // `#300 reply-marks-read`. Posted whole, so what it answers is read, as the Reply
@@ -2478,11 +2535,20 @@ pub async fn commit_proposal(
             if let Some(target) = binding.reply_to.as_deref() {
                 crate::reply_read::after_voice_send(state, &channel, target).await;
             }
-            Ok((proposal.serial, posted, parts))
+            Ok(Committed {
+                serial: proposal.serial,
+                send_seq,
+                posted,
+                parts,
+            })
         }
         Err(error) => {
             log_gate_step("failed", &proposal, Some(error.code()), Some(confirmed_by));
-            Err(CommitError::Post(error))
+            Err(CommitError::Post {
+                error: Box::new(error),
+                serial: proposal.serial,
+                send_seq,
+            })
         }
     }
 }
@@ -2733,6 +2799,7 @@ async fn post_parts(
                     thread_id: into.map(str::to_owned),
                     uncertain: cause.may_have_delivered(),
                     cause: cause.to_string(),
+                    first: posted.first().cloned().map(Box::new),
                 });
             }
         }

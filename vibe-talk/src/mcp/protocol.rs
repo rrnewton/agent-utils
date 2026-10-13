@@ -1331,7 +1331,15 @@ async fn run_post(state: &AppState, args: &Value) -> Result<String, OpError> {
     let channel_id = arg_id(args, "channel_id").unwrap_or_default();
     let text = arg_str(args, "text").unwrap_or_default();
     let reply_to = arg_id(args, "reply_to");
-    match crate::send_approval::voice_post(state, &channel_id, &text, reply_to.as_deref()).await? {
+    match crate::send_approval::voice_post(
+        state,
+        &channel_id,
+        &text,
+        reply_to.as_deref(),
+        crate::store::SendOrigin::Mcp,
+    )
+    .await?
+    {
         crate::send_approval::VoicePost::Proposed { channel, proposal } => {
             Ok(ops::proposal_notice(&channel, &proposal))
         }
