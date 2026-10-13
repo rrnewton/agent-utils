@@ -339,6 +339,8 @@ async fn with_confirmation_on_post_reply_still_only_proposes() {
     let said = tool_text(&response);
     assert!(said.starts_with("NOT SENT."), "{said}");
     assert!(said.contains("Send it?"), "{said}");
+    // The agent is handed the finished read-back and told to hold on a yes, not to claim a send.
+    assert!(said.contains("say only \"One moment.\""), "{said}");
     assert!(harness.discord.posted().is_empty());
     let (_status, body) = send(
         &harness,
@@ -349,6 +351,15 @@ async fn with_confirmation_on_post_reply_still_only_proposes() {
     )
     .await;
     assert_eq!(body["proposal"]["text"], "ship it", "{body}");
+    // The read-back is built from the same channel name and text the voice page's card shows, so
+    // the page can hold what was said to exactly that sentence.
+    let card = &body["proposal"];
+    let expected = format!(
+        "Read-back: To {}: {}. Send it?",
+        card["channel_name"].as_str().expect("a channel name"),
+        card["text"].as_str().expect("a text")
+    );
+    assert!(said.contains(&expected), "{expected:?} not in {said}");
 }
 
 #[tokio::test]

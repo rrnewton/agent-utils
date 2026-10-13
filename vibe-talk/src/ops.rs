@@ -1423,18 +1423,37 @@ pub fn proposal_notice(info: &ChannelInfo, proposal: &crate::post_gate::Proposal
         "NOT SENT. Proposal {serial} is waiting for the speaker's confirmation.\n\
          Channel: {channel} (id {id}){target}\n\
          Exact text: {text}\n\
-         Read that exact text back to the speaker, word for word, and end with the question: \
-         Send it? Then wait for the speaker. The voice page sends it when they say yes or tap \
-         Send, and then reports the result in a message that starts with \"Voice page:\"; do not \
-         say it was sent before that. You cannot send it yourself, and nothing you say or call \
-         confirms it. Do not call post_reply again to confirm; calling it again replaces this \
-         proposal with a new one. If the speaker wants different words, call post_reply with the \
-         new text. The proposal lapses in {seconds} seconds.",
+         Read-back: {read_back}\n\
+         Say that read-back to the speaker word for word, adding nothing before or after it, then \
+         wait for the speaker. If they say yes, say only \"One moment.\" The voice page judges \
+         their answer, sends it on a yes or a tap on Send, and then reports the result in a \
+         message that starts with \"Voice page:\"; do not say it was sent before that. You cannot \
+         send it yourself, and nothing you say or call confirms it. Do not call post_reply again \
+         to confirm; calling it again replaces this proposal with a new one. If the speaker wants \
+         different words, call post_reply with the new text. The proposal lapses in {seconds} \
+         seconds.",
         serial = proposal.serial,
         channel = info.display_name(),
         id = info.id,
         text = proposal.binding.text,
+        read_back = read_back(info.display_name(), &proposal.binding.text),
     )
+}
+
+/// The one sentence a voice agent reads a proposal back with: `To {channel}: {text}. Send it?`.
+///
+/// `#264 voice-send-approval`. The voice page takes a spoken yes only after exactly this, word for
+/// word (its `isExactReadBack`), so the owner has heard what would be posted and where and nothing
+/// else. Handing the model the finished sentence is what makes that easy to get right.
+#[must_use]
+pub fn read_back(channel: &str, text: &str) -> String {
+    let text = text.trim();
+    let stop = if text.ends_with(['.', '!', '?']) {
+        ""
+    } else {
+        "."
+    };
+    format!("To {channel}: {text}{stop} Send it?")
 }
 
 /// Who confirmed a proposal, as a commit names it. Recorded, not trusted: both are write-scope
@@ -2684,6 +2703,21 @@ mod tests {
     use super::*;
     use crate::store::StateStore as _;
     use crate::testing::{self, READ_CHANNEL, WRITE_CHANNEL};
+
+    #[test]
+    fn the_read_back_is_one_sentence_ending_with_the_question() {
+        // `#264 voice-send-approval`: the voice page holds a spoken read-back to exactly this.
+        assert_eq!(
+            read_back("lead team", "on it, rebasing now"),
+            "To lead team: on it, rebasing now. Send it?"
+        );
+        // A text that already ends a sentence is not given a second full stop.
+        assert_eq!(
+            read_back("lead team", " landed it! "),
+            "To lead team: landed it! Send it?"
+        );
+        assert_eq!(read_back("ops", "done?"), "To ops: done? Send it?");
+    }
 
     #[tokio::test]
     async fn a_channel_outside_the_allowlist_is_refused_for_reads() {

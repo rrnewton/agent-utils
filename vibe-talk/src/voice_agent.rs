@@ -62,13 +62,13 @@ pub const PROMPT_ID: &str = "voice-agent-system";
 
 /// Bump this whenever any of the four prompt files changes, and update every pinned fingerprint
 /// below to match. The test that compares them is what makes the version mean something.
-pub const PROMPT_VERSION: u32 = 6;
+pub const PROMPT_VERSION: u32 = 7;
 
 /// The [`fingerprint`] of the read-only prompt at [`PROMPT_VERSION`].
 pub const PINNED_READ_FINGERPRINT: &str = "fnv1a64:2ae49a9c1a7f5a0f";
 
 /// The [`fingerprint`] of the sending prompt that asks first, at [`PROMPT_VERSION`].
-pub const PINNED_WRITE_CONFIRM_FINGERPRINT: &str = "fnv1a64:79340f035fc0ea35";
+pub const PINNED_WRITE_CONFIRM_FINGERPRINT: &str = "fnv1a64:9392415d3f073548";
 
 /// The [`fingerprint`] of the sending prompt that posts at once, at [`PROMPT_VERSION`].
 pub const PINNED_WRITE_DIRECT_FINGERPRINT: &str = "fnv1a64:19672b8d1152883d";
@@ -441,10 +441,12 @@ mod tests {
 
     /// What only the variant that asks first may say: the read-back, the question, and that the
     /// confirmation and its result are the voice page's.
-    const CONFIRM_RULES: [&str; 5] = [
+    const CONFIRM_RULES: [&str; 7] = [
         "outside your tools",
         "word for word",
+        "adding nothing before or after it",
         "Send it?",
+        "say only \"One moment.\"",
         "\"Voice page:\"",
         "Never say a message was sent before that",
     ];
