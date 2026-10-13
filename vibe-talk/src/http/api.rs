@@ -26,7 +26,7 @@ use crate::summary::DigestEntry;
 use crate::untrusted;
 
 use crate::contract::LiveDelivery;
-pub use crate::contract::{ApiErrorBody, ClientConfigResponse, TimelineResponse};
+pub use crate::contract::{ApiErrorBody, ClientConfigResponse, MessagesResponse, TimelineResponse};
 
 /// An error that can be returned to a caller.
 #[derive(Debug)]
@@ -1207,28 +1207,6 @@ pub struct LimitQuery {
     pub with: Option<String>,
 }
 
-/// Full-text scrollback.
-#[derive(Debug, Serialize)]
-pub struct MessagesResponse {
-    /// Channel that was read.
-    pub channel: ChannelInfo,
-    /// Messages, oldest first.
-    pub messages: Vec<Message>,
-    /// Whether the fetch came back short, so `messages.len()` counts the CHANNEL rather than the
-    /// window this server asked for.
-    ///
-    /// A client may show a message count only when this is true. Discord gives no message count
-    /// for a guild text channel, so a full window means "at least this many" and nothing more.
-    pub complete: bool,
-    /// Which of `messages` the reader has ARCHIVED, so the view can dim them.
-    ///
-    /// The ordinary channel view shows archived rows greyed rather than hidden -- hiding is what
-    /// the To do filter is for -- and it can only do that if the payload says which they are.
-    pub dismissed: Vec<MessageId>,
-    /// Standing reminder that the content is third-party text.
-    pub untrusted_content_notice: &'static str,
-}
-
 /// `GET /api/v1/channels/{channel_id}/messages`
 pub async fn messages(
     State(state): State<AppState>,
@@ -1243,6 +1221,7 @@ pub async fn messages(
         channel: window.channel,
         messages: window.messages,
         dismissed,
+        as_of: window.as_of,
         untrusted_content_notice: untrusted::NOTICE,
     }))
 }

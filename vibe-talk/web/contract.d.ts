@@ -686,6 +686,49 @@ declare namespace VibeTalk {
   }
 
   /**
+   * `GET /api/v1/channels/{id}/messages`: a channel's most recent messages, the window the classic
+   * page draws.
+   *
+   * `#208 persistent-cache` made it a contract root, appended below, when it gained `as_of`.
+   */
+  interface MessagesResponse {
+    /**
+     * The instant, RFC 3339, up to which the provider knows `messages` is complete, when it
+     * served a copy it could not bring up to date just now: a bridge reading its Flat view says
+     * so. Absent means now, and from an older server. The same field as
+     * [`crate::threads::TimelinePage::as_of`].
+     */
+    as_of?: string | null;
+    /**
+     * Channel that was read.
+     */
+    channel: ChannelInfo;
+    /**
+     * Whether the fetch came back short, so `messages.len()` counts the CHANNEL rather than the
+     * window this server asked for.
+     *
+     * A client may show a message count only when this is true. Discord gives no message count
+     * for a guild text channel, so a full window means "at least this many" and nothing more.
+     */
+    complete: boolean;
+    /**
+     * Which of `messages` the reader has ARCHIVED, so the view can dim them.
+     *
+     * The ordinary channel view shows archived rows greyed rather than hidden -- hiding is what
+     * the To do filter is for -- and it can only do that if the payload says which they are.
+     */
+    dismissed: MessageId[];
+    /**
+     * Messages, oldest first.
+     */
+    messages: Message[];
+    /**
+     * Standing reminder that the content is third-party text.
+     */
+    untrusted_content_notice: string;
+  }
+
+  /**
    * The owner's noise rules, as the Settings editor shows them. `#196 auto-read-noise`.
    *
    * Also the body `PUT /api/v1/noise-rules` answers with, so the editor redraws from what the
@@ -1516,6 +1559,7 @@ declare namespace VibeTalk {
     BookmarkResponse: BookmarkResponse;
     UpstreamClearNowResponse: UpstreamClearNowResponse;
     VoiceSettings: VoiceSettings;
+    MessagesResponse: MessagesResponse;
   }
 
   /** A contract type a peer may extend with new `type` tags. */

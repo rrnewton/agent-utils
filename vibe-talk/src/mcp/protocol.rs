@@ -811,6 +811,7 @@ async fn run_digest(state: &AppState, args: &Value) -> Result<String, OpError> {
         complete,
         noise,
         oldest,
+        as_of,
     } = ops::digest(
         state,
         &channel_id,
@@ -850,6 +851,12 @@ async fn run_digest(state: &AppState, args: &Value) -> Result<String, OpError> {
             Some(line) if noise > 0 => format!("{line}{}\n", noise_note(noise)),
             _ => header,
         }
+    };
+    let header = match header.strip_suffix('\n') {
+        Some(line) if as_of.is_some() => {
+            format!("{line}{}\n", as_of_note(as_of.as_deref(), ops::now_ms()))
+        }
+        _ => header,
     };
     let mut body = String::new();
     for entry in &entries {
@@ -918,6 +925,24 @@ async fn run_activity(state: &AppState, args: &Value) -> Result<String, OpError>
     Ok(activity_text(&activity, unreadable, MAX_ACTIVITY_BYTES))
 }
 
+/// The sentence that says a read came from a copy the chat service could not bring up to date,
+/// or nothing when it did not. `#208 persistent-cache`, milestone `bridge-recent-flat`.
+///
+/// `as_of` is the provider's own instant; the sentence gives its age in words and the instant
+/// labelled as exact, as every line does, so a model neither presents the copy as the latest nor
+/// reads the instant aloud.
+fn as_of_note(as_of: Option<&str>, now_ms: i64) -> String {
+    let Some(as_of) = as_of else {
+        return String::new();
+    };
+    let ago = crate::clock::instant_ms(as_of)
+        .map_or_else(|| "an earlier moment".to_owned(), |at| age(now_ms, at));
+    format!(
+        " AS OF {ago} (exact {as_of}): the chat service answered from a copy it could not bring \
+         up to date just now, so say it may be missing newer messages."
+    )
+}
+
 /// How long ago a held copy was read, in words: "40 seconds ago", "3 minutes ago".
 fn held_age(elapsed: std::time::Duration) -> String {
     let seconds = elapsed.as_secs();
@@ -953,6 +978,8 @@ struct ActivityBlock<'a> {
     shown: usize,
     /// Byte length of [`activity_block`] at the current `shown`, so the cap need not re-render.
     size: usize,
+    /// [`as_of_note`] for the read, worked out once against the activity's clock.
+    as_of: String,
 }
 
 /// One channel's block: a header in this server's words, then its lines inside the fence.
@@ -995,6 +1022,7 @@ fn activity_block(block: &ActivityBlock<'_>, span: &str) -> String {
             held_age(age)
         ),
     };
+    let held = format!("{held}{}", block.as_of);
     if read.counted == 0 {
         return if read.noise == 0 {
             format!("{label} (id {id}):{held} no messages in the last {span}.\n")
@@ -1144,6 +1172,7 @@ fn activity_text(activity: &ops::Activity, unreadable_hours: bool, cap: usize) -
                 shown: lines.len(),
                 lines,
                 size: 0,
+                as_of: as_of_note(part.as_of.as_deref(), activity.now_ms),
             };
             block.size = activity_block(&block, &span).len();
             block

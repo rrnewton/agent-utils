@@ -149,9 +149,15 @@ pub struct Held {
     pub whole: bool,
     /// When the read that produced this window began. Its age is counted from here, because
     /// the window says nothing about the channel before that moment.
+    ///
+    /// Earlier than the read when the provider said its answer was complete only up to an earlier
+    /// instant: then that instant. `#208 persistent-cache`; see [`RecentWindows::record_as_of`].
     pub read_started: Instant,
     /// When that read finished.
     pub read_finished: Instant,
+    /// The provider's own `as_of`, RFC 3339, when it moved `read_started` back: what to say when
+    /// the window is served. `None` when the provider said its answer was current.
+    pub as_of: Option<String>,
 }
 
 impl Held {
@@ -308,16 +314,35 @@ impl RecentWindows {
     /// kept, when a window is held: that window has had every push merged as it came, and the read
     /// cannot be made to agree with them.
     pub fn record(&self, channel: &ChannelId, messages: &[Message], limit: u16, mark: ReadMark) {
-        let started = mark.started;
+        self.record_as_of(channel, messages, limit, mark, None);
+    }
+
+    /// [`RecentWindows::record`], for a read whose provider said its answer was complete only up
+    /// to `as_of`, an RFC 3339 instant. `#208 persistent-cache`, milestone `bridge-recent-flat`.
+    ///
+    /// The window then knows nothing of the channel after `as_of`, so that is when it starts: its
+    /// age is counted from there, and it loses to a window held from a read whose picture is newer,
+    /// whichever read began first. A bridge serving a copy it could not bring up to date is the
+    /// case. An `as_of` that does not parse, or is no earlier than the read, changes nothing.
+    pub fn record_as_of(
+        &self,
+        channel: &ChannelId,
+        messages: &[Message],
+        limit: u16,
+        mark: ReadMark,
+        as_of: Option<&str>,
+    ) {
+        let started = backdated(mark.started, as_of);
         let mut windows = self.windows();
         if mark.purges != windows.purges {
             return;
         }
         let slot = windows.slots.entry(channel.clone()).or_default();
+        // The read succeeded after the failure, however old its picture.
         if slot
             .failure
             .as_ref()
-            .is_some_and(|(_, failed)| *failed <= started)
+            .is_some_and(|(_, failed)| *failed <= mark.started)
         {
             slot.failure = None;
         }
@@ -342,6 +367,7 @@ impl RecentWindows {
             whole: messages.len() < usize::from(limit),
             read_started: started,
             read_finished: Instant::now(),
+            as_of: as_of.filter(|_| started < mark.started).map(str::to_owned),
         };
         for live in since.unwrap_or_default() {
             apply(&mut held, &live, Applying::AgainOnARead);
@@ -510,6 +536,21 @@ enum Applying {
     AgainOnARead,
 }
 
+/// When a read that began at `started` saw the channel, given the provider's `as_of`: the earlier
+/// of the two. The provider's clock is wall time, so the gap from now to `as_of` is taken off now.
+fn backdated(started: Instant, as_of: Option<&str>) -> Instant {
+    let Some(as_of_ms) = as_of.and_then(crate::clock::instant_ms) else {
+        return started;
+    };
+    let lag_ms = jiff::Timestamp::now().as_millisecond() - as_of_ms;
+    let Ok(lag_ms) = u64::try_from(lag_ms) else {
+        return started;
+    };
+    Instant::now()
+        .checked_sub(Duration::from_millis(lag_ms))
+        .map_or(started, |at| at.min(started))
+}
+
 /// Fold one push into a window.
 fn apply(held: &mut Held, live: &LiveMessage, applying: Applying) {
     match live.kind {
@@ -611,19 +652,26 @@ pub fn refresh(state: &AppState, channel: &ChannelId, limit: u16) -> watch::Rece
             let mark = claim.windows.mark(&claim.channel);
             let started = mark.started();
             let read = match claim.windows.reading.acquire().await {
-                Ok(_permit) => state.chat.fetch_recent(&claim.channel, limit).await,
+                Ok(_permit) => crate::recent_view::read(&state, &claim.channel, limit).await,
                 Err(_) => Err(ChatError::Refused("the server is shutting down".to_owned())),
             };
             let millis = started.elapsed().as_millis();
             match read {
-                Ok(messages) => {
+                Ok(read) => {
                     tracing::info!(
                         channel = %claim.channel,
-                        returned = messages.len(),
+                        returned = read.messages.len(),
                         millis,
+                        stale = read.as_of.is_some(),
                         "recent window refreshed"
                     );
-                    claim.windows.record(&claim.channel, &messages, limit, mark);
+                    claim.windows.record_as_of(
+                        &claim.channel,
+                        &read.messages,
+                        limit,
+                        mark,
+                        read.as_of.as_deref(),
+                    );
                 }
                 Err(error) => {
                     tracing::warn!(
@@ -897,6 +945,65 @@ mod tests {
         );
         windows.record(&channel, &[message(id(pushed), "read")], 3, mark);
         assert_eq!(contents(&windows, &channel), ["read", "newest"]);
+    }
+
+    /// `#208 persistent-cache`. A provider that answered from a copy it could not bring up to
+    /// date says when that copy was complete; the window starts then, and loses to a window whose
+    /// picture is newer however the reads were ordered.
+    #[tokio::test(start_paused = true)]
+    async fn a_window_read_from_an_older_copy_starts_when_that_copy_was_complete() {
+        let windows = RecentWindows::new();
+        let channel = ChannelId("1".to_owned());
+        let ten_minutes_ago =
+            crate::clock::iso_from_ms(jiff::Timestamp::now().as_millisecond() - 600_000);
+        windows.record_as_of(
+            &channel,
+            &[message(id(1), "copy")],
+            50,
+            windows.mark(&channel),
+            Some(&ten_minutes_ago),
+        );
+        let held = windows.snapshot(&channel).held.expect("held");
+        assert!(held.age() >= Duration::from_secs(590), "{:?}", held.age());
+        assert!(held.since_finished() < Duration::from_secs(1));
+        assert_eq!(held.as_of.as_deref(), Some(ten_minutes_ago.as_str()));
+
+        // A current read replaces it and says nothing about a copy.
+        windows.record(
+            &channel,
+            &[message(id(2), "current")],
+            50,
+            windows.mark(&channel),
+        );
+        let held = windows.snapshot(&channel).held.expect("held");
+        assert_eq!(held.as_of, None);
+        assert!(held.age() < Duration::from_secs(1));
+
+        // An older copy read afterwards does not replace a window whose picture is newer.
+        windows.record_as_of(
+            &channel,
+            &[message(id(1), "copy")],
+            50,
+            windows.mark(&channel),
+            Some(&ten_minutes_ago),
+        );
+        assert_eq!(ids(&windows, &channel), [id(2).to_string()]);
+
+        // An as_of no earlier than the read, or one that does not parse, changes nothing.
+        let in_a_minute =
+            crate::clock::iso_from_ms(jiff::Timestamp::now().as_millisecond() + 60_000);
+        for as_of in [in_a_minute.as_str(), "seven"] {
+            windows.record_as_of(
+                &channel,
+                &[message(id(3), "three")],
+                50,
+                windows.mark(&channel),
+                Some(as_of),
+            );
+            let held = windows.snapshot(&channel).held.expect("held");
+            assert_eq!(held.as_of, None, "{as_of}");
+            assert!(held.age() < Duration::from_secs(1), "{as_of}");
+        }
     }
 
     #[tokio::test(start_paused = true)]

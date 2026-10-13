@@ -501,6 +501,10 @@ pub struct DiscordConfig {
     pub max_post_chars: Option<usize>,
     /// The most UTF-8 bytes one post may hold, when the operator has said.
     pub max_post_bytes: Option<usize>,
+    /// How a bridge answers a read of a channel's most recent messages, and whether that read is
+    /// checked against the other way. `#208 persistent-cache`. Only `thread_api = "bridge"`
+    /// accepts a setting here; everywhere else it is the default.
+    pub recent: RecentReads,
 }
 
 impl DiscordConfig {
@@ -539,6 +543,31 @@ impl DiscordConfig {
             escaping: crate::chat::PostEscaping::Verbatim,
         }
     }
+}
+
+/// Which bridge endpoint answers a read of a channel's most recent messages. `#208
+/// persistent-cache`, milestone `bridge-recent-flat`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RecentView {
+    /// `GET /channels/{id}/messages`, as every Discord-protocol provider has always been read.
+    /// The default.
+    #[default]
+    Messages,
+    /// The newest page of `GET /channels/{id}/timeline?view=flat`: every message in the channel,
+    /// replies included, in one chronological history. A bridge that keeps a copy of the channel
+    /// answers it from that copy, and says with `as_of` when the copy is not current.
+    Flat,
+}
+
+/// A bridge's recent-read settings. `#208 persistent-cache`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RecentReads {
+    /// Which endpoint answers. `recent_view`, default `messages`.
+    pub view: RecentView,
+    /// With `messages`: after every such read, also read the Flat view and count where the two
+    /// disagree, for diagnostics. `recent_view_shadow`, default off. See [`crate::recent_view`].
+    pub shadow: bool,
 }
 
 /// Read limits shared by every chat provider.
@@ -888,6 +917,8 @@ struct FileDiscord {
     markup: Option<crate::render::Markup>,
     max_post_chars: Option<usize>,
     max_post_bytes: Option<usize>,
+    recent_view: Option<RecentView>,
+    recent_view_shadow: Option<bool>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -916,6 +947,9 @@ struct FileProvider {
     thread_api: Option<crate::threads::ThreadApi>,
     upstream_read_marks: Option<bool>,
     markup: Option<crate::render::Markup>,
+    // Discord-protocol providers with `thread_api = "bridge"` only.
+    recent_view: Option<RecentView>,
+    recent_view_shadow: Option<bool>,
     // Slack providers only.
     registered_channels_writable: Option<bool>,
     channel_discovery: Option<bool>,
@@ -2144,6 +2178,8 @@ fn legacy_discord_provider<'e>(
             || file.markup.is_some()
             || file.max_post_chars.is_some()
             || file.max_post_bytes.is_some()
+            || file.recent_view.is_some()
+            || file.recent_view_shadow.is_some()
             || get(ENV_DISCORD_OWNER_USER_ID).is_some()
             || get(ENV_LIVE_POLL_SECONDS).is_some();
         if configures_a_provider {
@@ -2202,6 +2238,7 @@ fn legacy_discord_provider<'e>(
             chars: file.max_post_chars,
             bytes: file.max_post_bytes,
         },
+        (file.recent_view, file.recent_view_shadow),
     )?;
     Ok(Some(ProviderConfig {
         key: LEGACY_DISCORD_PROVIDER_KEY.to_owned(),
@@ -2225,6 +2262,7 @@ fn discord_protocol(
     upstream_read_marks: Option<bool>,
     markup: Option<crate::render::Markup>,
     post_size: PostSize,
+    (recent_view, recent_view_shadow): (Option<RecentView>, Option<bool>),
 ) -> Result<DiscordConfig, ConfigError> {
     let channel_registration = channel_registration.unwrap_or(false);
     let api_base = api_base.unwrap_or_else(|| DEFAULT_DISCORD_API_BASE.to_owned());
@@ -2259,6 +2297,12 @@ fn discord_protocol(
         None
     };
     validate_post_size(prefix, post_size, ceiling)?;
+    let recent = recent_reads(
+        prefix,
+        thread_api.unwrap_or_default(),
+        recent_view,
+        recent_view_shadow,
+    )?;
     Ok(DiscordConfig {
         provider_name,
         thread_api: thread_api.unwrap_or_default(),
@@ -2273,6 +2317,7 @@ fn discord_protocol(
         markup,
         max_post_chars: post_size.chars,
         max_post_bytes: post_size.bytes,
+        recent,
     })
 }
 
@@ -2319,6 +2364,47 @@ fn validate_post_size(
         }
     }
     Ok(())
+}
+
+/// Validate a Discord-protocol provider's recent-read settings. `#208 persistent-cache`.
+///
+/// Both choose between two endpoints only a compatible bridge serves, so any other thread
+/// protocol refuses them by name rather than ignoring them. A shadow compares the `/messages`
+/// read with the Flat view, so it means nothing once Flat answers the read itself.
+fn recent_reads(
+    prefix: &str,
+    thread_api: crate::threads::ThreadApi,
+    view: Option<RecentView>,
+    shadow: Option<bool>,
+) -> Result<RecentReads, ConfigError> {
+    if thread_api != crate::threads::ThreadApi::Bridge {
+        for (name, set) in [
+            ("recent_view", view.is_some()),
+            ("recent_view_shadow", shadow.is_some()),
+        ] {
+            if set {
+                return Err(ConfigError::Invalid {
+                    field: format!("{prefix}.{name}"),
+                    detail: "applies only with thread_api = \"bridge\": it chooses between two \
+                             endpoints of a compatible bridge"
+                        .to_owned(),
+                });
+            }
+        }
+    }
+    let recent = RecentReads {
+        view: view.unwrap_or_default(),
+        shadow: shadow.unwrap_or(false),
+    };
+    if recent.shadow && recent.view == RecentView::Flat {
+        return Err(ConfigError::Invalid {
+            field: format!("{prefix}.recent_view_shadow"),
+            detail: "compares the /messages read with the Flat view, so it does not apply with \
+                     recent_view = \"flat\"; remove it"
+                .to_owned(),
+        });
+    }
+    Ok(recent)
 }
 
 /// Whether `key` may name a provider: short, lowercase, and safe in a setting or env var name.
@@ -2416,11 +2502,18 @@ fn provider_entry<'e>(
                     chars: entry.max_post_chars,
                     bytes: entry.max_post_bytes,
                 },
+                (entry.recent_view, entry.recent_view_shadow),
             )?)
         }
         "slack" => {
             if entry.thread_api.is_some() {
                 return Err(refuse("thread_api", "slack"));
+            }
+            if entry.recent_view.is_some() {
+                return Err(refuse("recent_view", "slack"));
+            }
+            if entry.recent_view_shadow.is_some() {
+                return Err(refuse("recent_view_shadow", "slack"));
             }
             if entry.upstream_read_marks.is_some() {
                 return Err(refuse("upstream_read_marks", "slack"));
@@ -3980,5 +4073,104 @@ provider = "slack"
         );
         let invalid = FULL.replace("[discord]", "[discord]\nthread_api = \"guess\"");
         assert!(Config::from_toml_and_env(&invalid, &env(&[])).is_err());
+    }
+
+    /// `#208 persistent-cache`, milestone `bridge-recent-flat`: a bridge's recent read is
+    /// `/messages`, unshadowed, unless the operator says otherwise, and only a bridge may say so.
+    #[test]
+    fn a_bridges_recent_read_is_messages_by_default_and_flat_only_on_request() {
+        let bridge = |extra: &str| {
+            FULL.replace(
+                "[discord]",
+                &format!(
+                    "[discord]\nthread_api = \"bridge\"\napi_base = \"http://127.0.0.1:9876\"\n{extra}"
+                ),
+            )
+        };
+        let recent = |text: &str| {
+            Config::from_toml_and_env(text, &env(&[]))
+                .expect("valid")
+                .discord()
+                .expect("discord provider")
+                .recent
+        };
+        assert_eq!(recent(FULL), RecentReads::default());
+        assert_eq!(recent(&bridge("")), RecentReads::default());
+        assert_eq!(
+            RecentReads::default(),
+            RecentReads {
+                view: RecentView::Messages,
+                shadow: false,
+            }
+        );
+        assert_eq!(
+            recent(&bridge("recent_view = \"flat\"")),
+            RecentReads {
+                view: RecentView::Flat,
+                shadow: false,
+            }
+        );
+        assert_eq!(
+            recent(&bridge(
+                "recent_view = \"messages\"\nrecent_view_shadow = true"
+            )),
+            RecentReads {
+                view: RecentView::Messages,
+                shadow: true,
+            }
+        );
+
+        let refused = |text: &str, wanted: &str| match Config::from_toml_and_env(text, &env(&[])) {
+            Err(ConfigError::Invalid { field, .. }) => assert_eq!(field, wanted, "{text}"),
+            other => panic!("expected {wanted} to be refused, got {other:?}"),
+        };
+        refused(
+            &FULL.replace("[discord]", "[discord]\nrecent_view = \"flat\""),
+            "discord.recent_view",
+        );
+        refused(
+            &FULL.replace(
+                "[discord]",
+                "[discord]\nthread_api = \"off\"\nrecent_view_shadow = false",
+            ),
+            "discord.recent_view_shadow",
+        );
+        refused(
+            &bridge("recent_view = \"flat\"\nrecent_view_shadow = true"),
+            "discord.recent_view_shadow",
+        );
+        refused(
+            &MULTI.replace(
+                "live_poll_seconds = 15",
+                "live_poll_seconds = 15\nrecent_view = \"messages\"",
+            ),
+            "providers.slack.recent_view",
+        );
+        refused(
+            &MULTI.replace(
+                "live_poll_seconds = 15",
+                "live_poll_seconds = 15\nrecent_view_shadow = true",
+            ),
+            "providers.slack.recent_view_shadow",
+        );
+        refused(
+            &MULTI.replace(
+                "thread_api = \"off\"",
+                "thread_api = \"off\"\nrecent_view = \"flat\"",
+            ),
+            "providers.gchat.recent_view",
+        );
+        let gchat = MULTI.replace(
+            "thread_api = \"off\"",
+            "thread_api = \"bridge\"\nrecent_view = \"flat\"",
+        );
+        let cfg = Config::from_toml_and_env(&gchat, &env(&[])).expect("a bridge may read flat");
+        assert!(
+            Config::from_toml_and_env(&bridge("recent_view = \"sideways\""), &env(&[])).is_err()
+        );
+        let ProviderKind::Discord(gchat) = &cfg.provider("gchat").expect("gchat").kind else {
+            panic!("gchat is a Discord-protocol bridge");
+        };
+        assert_eq!(gchat.recent.view, RecentView::Flat);
     }
 }

@@ -147,6 +147,12 @@ pub struct DiagnosticsReport {
     /// How the summary route has spent its requests since this server started: numbers only, no
     /// key, id or text. `#208 persistent-cache`; see [`crate::summarize::counters`].
     pub summaries: crate::summarize::counters::SummaryCounts,
+    /// Each channel whose provider has `recent_view_shadow` on, with what the shadow has counted
+    /// since this process started: Flat reads, and where they disagreed with `/messages`. `#208
+    /// persistent-cache`; see [`crate::recent_view`]. Counts only, no message text or id. Absent
+    /// when no provider has the shadow on.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub recent_view_shadow: Vec<crate::recent_view::ChannelTally>,
 }
 
 /// Redact every secret this deployment holds out of a string.
@@ -340,6 +346,7 @@ pub async fn run(state: &AppState) -> DiagnosticsReport {
         budget_seconds: TOTAL_BUDGET.as_secs(),
         took_ms: deadline.elapsed_ms(),
         summaries: state.summary_counters.snapshot(),
+        recent_view_shadow: crate::recent_view::report(state),
     }
 }
 

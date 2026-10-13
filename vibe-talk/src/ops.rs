@@ -358,6 +358,10 @@ pub struct Window {
     pub messages: Vec<Message>,
     /// The size actually asked of Discord, already clamped to what Discord will honour.
     pub limit: u16,
+    /// The instant, RFC 3339, up to which the provider knows `messages` is complete, when it
+    /// served a copy it could not bring up to date just now. `None` means now. `#208
+    /// persistent-cache`: a bridge reading its Flat view says so; see [`crate::recent_view`].
+    pub as_of: Option<String>,
 }
 
 impl Window {
@@ -393,11 +397,15 @@ pub async fn messages(
     // it, whoever asked: kept raw, before anything below prepares it, with the pushes that arrived
     // while it ran applied again on top. See `crate::recent`.
     let mark = state.live.recent().mark(&channel.id);
-    let mut messages = state.chat.fetch_recent(&channel.id, limit).await?;
-    state
-        .live
-        .recent()
-        .record(&channel.id, &messages, limit, mark);
+    let read = crate::recent_view::read(state, &channel.id, limit).await?;
+    state.live.recent().record_as_of(
+        &channel.id,
+        &read.messages,
+        limit,
+        mark,
+        read.as_of.as_deref(),
+    );
+    let mut messages = read.messages;
     stamp(state, &mut messages);
     // `#196 auto-read-noise`. Decided HERE, on every read, from the text as it now stands — never
     // recorded — so every caller of this function (the digest, the to-do list, a lookup by id,
@@ -414,6 +422,7 @@ pub async fn messages(
         channel,
         messages,
         limit,
+        as_of: read.as_of,
     })
 }
 
@@ -589,6 +598,8 @@ pub struct Digest {
     /// and a digest with no cursor leaves a caller no way past them to the older messages behind;
     /// when only the oldest is one, stepping back from the first entry hands it over again.
     pub oldest: Option<MessageId>,
+    /// [`Window::as_of`]: when set, the provider's copy was complete only up to that instant.
+    pub as_of: Option<String>,
 }
 
 /// One speakable line per recent message. Read scope.
@@ -623,6 +634,7 @@ pub async fn digest(
         complete,
         noise: noise.len(),
         oldest,
+        as_of: window.as_of,
     })
 }
 
@@ -676,6 +688,10 @@ pub struct ChannelActivity {
     pub read: Result<WindowActivity, OpError>,
     /// How current `read` is. Always [`Currency::Current`] beside an error.
     pub currency: Currency,
+    /// The provider's `as_of`, RFC 3339, for the read that produced `read`, when the provider said
+    /// that read was complete only up to then: true however recently the read itself ran. `#208
+    /// persistent-cache`; see [`crate::recent::Held::as_of`].
+    pub as_of: Option<String>,
 }
 
 /// How current one channel's part of an [`Activity`] is. `#210 voice-catchup-speed`.
@@ -887,6 +903,7 @@ async fn channel_activity(
             channel,
             read: Err(error),
             currency: Currency::Current,
+            as_of: None,
         };
     };
     let currency = if held.read_finished >= began || held.since_finished() <= reuse {
@@ -908,6 +925,7 @@ async fn channel_activity(
         channel,
         read: Ok(window_activity(messages, held.whole, lines, since_ms)),
         currency,
+        as_of: held.as_of,
     }
 }
 
@@ -2662,6 +2680,7 @@ pub async fn summarize_message_scoped(
             channel,
             messages,
             limit: state.effective_limit(limit),
+            as_of: None,
         }
     } else {
         shared_window(state, channel, limit, began).await?
@@ -2845,6 +2864,7 @@ async fn shared_window(
                 channel,
                 messages,
                 limit: read.limit,
+                as_of: read.as_of.clone(),
             });
         }
     }

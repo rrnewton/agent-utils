@@ -383,6 +383,26 @@ impl HttpDiscordClient {
         }
     }
 
+    /// A channel's most recent messages, read from the newest page of the bridge's Flat view.
+    /// `#208 persistent-cache`, milestone `bridge-recent-flat`.
+    ///
+    /// A bridge that keeps a copy of each channel answers Flat from that copy in milliseconds,
+    /// where `/messages` runs a provider command for seconds; when the copy could not be brought
+    /// up to date it says so with `as_of`, which is handed on rather than dropped. Not `exhausted`:
+    /// a bridge has no proof of a channel's start to give.
+    pub(super) async fn flat_recent(
+        &self,
+        channel: &ChannelId,
+        limit: u16,
+    ) -> Result<crate::chat::RecentRead, ChatError> {
+        let request = TimelineRequest {
+            view: TimelineView::Flat,
+            limit,
+            ..TimelineRequest::default()
+        };
+        Ok(self.timeline(channel, &request).await?.into_recent(limit))
+    }
+
     async fn archive_threads(
         &self,
         channel: &ChannelId,
@@ -1366,6 +1386,13 @@ mod tests {
     }
 
     async fn mock(routes: Replies, mode: ThreadApi) -> Mock {
+        mock_with(routes, |discord| discord.thread_api = mode).await
+    }
+
+    async fn mock_with(
+        routes: Replies,
+        configure: impl FnOnce(&mut crate::config::DiscordConfig),
+    ) -> Mock {
         let routes = Arc::new(routes);
         let seen = Arc::new(Mutex::new(Vec::new()));
         let captured = Arc::clone(&seen);
@@ -1405,8 +1432,8 @@ mod tests {
         let mut config = crate::testing::config();
         let discord = config.discord_mut().expect("discord provider");
         discord.api_base = format!("http://{address}");
-        discord.thread_api = mode;
         discord.provider_name = "Example Chat".to_owned();
+        configure(discord);
         let client = HttpDiscordClient::new(discord).expect("client");
         Mock {
             client,
@@ -1830,6 +1857,101 @@ mod tests {
             );
             assert_eq!(page.thread.expect("scope").id, "opaque/scope");
         }
+    }
+
+    /// The same three messages as `/messages` answers them, newest first, and as the newest Flat
+    /// page does, oldest first with one reply's thread membership and an `as_of`.
+    fn recent_routes() -> Replies {
+        let mut routes = Replies::new();
+        let wire = |id: &str| message("parent", id, &format!("text {id}"));
+        ok(
+            &mut routes,
+            "/channels/parent/messages?limit=3",
+            json!([wire("1003"), wire("1002"), wire("1001")]),
+        );
+        let mut reply = wire("1003");
+        reply["thread"] = json!({"id":"t-1","root_message_id":"1002","is_root":false,
+            "reply_count":1,"reply_count_exact":true});
+        let mut page = bridge_page(json!([wire("1001"), wire("1002"), reply]));
+        page["has_more"] = json!(true);
+        page["next_before"] = json!("opaque-back");
+        page["as_of"] = json!("2026-10-12T09:00:00Z");
+        ok(
+            &mut routes,
+            "/channels/parent/timeline?view=flat&limit=3",
+            page,
+        );
+        routes
+    }
+
+    fn ids_of(messages: &[Message]) -> Vec<&str> {
+        messages.iter().map(|m| m.id.as_str()).collect()
+    }
+
+    /// `#208 persistent-cache`, milestone `bridge-recent-flat`. Off by default: a bridge's recent
+    /// read is `/messages`, and claims no `as_of`, exactly as before.
+    #[tokio::test]
+    async fn a_bridge_reads_its_recent_messages_from_messages_unless_told_otherwise() {
+        let mock = mock(recent_routes(), ThreadApi::Bridge).await;
+        let channel = ChannelId("parent".into());
+        let read = mock
+            .client
+            .fetch_recent_dated(&channel, 3)
+            .await
+            .expect("recent read");
+        assert_eq!(ids_of(&read.messages), ["1001", "1002", "1003"]);
+        assert_eq!((read.as_of, read.exhausted), (None, false));
+        assert_eq!(
+            ids_of(&mock.client.fetch_recent(&channel, 3).await.expect("read")),
+            ["1001", "1002", "1003"]
+        );
+        let seen = mock.seen.lock().expect("seen").clone();
+        assert_eq!(seen, ["GET /channels/parent/messages?limit=3"; 2]);
+    }
+
+    /// With `recent_view = "flat"`, the newest Flat page answers, in the window's shape: the same
+    /// messages in the same order, the page's `as_of` kept, its cursor and thread list dropped.
+    #[tokio::test]
+    async fn a_flat_recent_read_has_the_shape_of_a_messages_read_and_keeps_as_of() {
+        let mock = mock_with(recent_routes(), |discord| {
+            discord.thread_api = ThreadApi::Bridge;
+            discord.recent.view = crate::config::RecentView::Flat;
+        })
+        .await;
+        let channel = ChannelId("parent".into());
+        let read = mock
+            .client
+            .fetch_recent_dated(&channel, 3)
+            .await
+            .expect("recent read");
+        assert_eq!(ids_of(&read.messages), ["1001", "1002", "1003"]);
+        assert_eq!(read.as_of.as_deref(), Some("2026-10-12T09:00:00Z"));
+        assert!(!read.exhausted, "a bridge proves no channel start");
+        assert_eq!(
+            read.messages[2].thread.as_ref().map(|t| t.id.as_str()),
+            Some("t-1"),
+            "thread membership is part of the message"
+        );
+        // The plain read and the startup probe go the same way.
+        let plain = mock.client.fetch_recent(&channel, 3).await.expect("read");
+        assert_eq!(plain, read.messages);
+        let seen = mock.seen.lock().expect("seen").clone();
+        assert_eq!(seen, ["GET /channels/parent/timeline?view=flat&limit=3"; 2]);
+    }
+
+    #[test]
+    fn a_flat_page_becomes_a_window_oldest_first_once_each_and_at_most_the_limit() {
+        let parsed = |id: &str| parse_message(&message("parent", id, "m")).expect("a message");
+        let page = TimelinePage {
+            messages: vec![parsed("12"), parsed("10"), parsed("11"), parsed("12")],
+            as_of: Some("2026-10-12T09:00:00Z".into()),
+            has_more: true,
+            next_before: Some("back".into()),
+            ..TimelinePage::default()
+        };
+        let read = page.into_recent(2);
+        assert_eq!(ids_of(&read.messages), ["11", "12"]);
+        assert_eq!(read.as_of.as_deref(), Some("2026-10-12T09:00:00Z"));
     }
 
     fn bridge_page(messages: Value) -> Value {

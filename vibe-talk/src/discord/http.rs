@@ -667,6 +667,8 @@ pub struct HttpDiscordClient {
     owner_user_id: Option<String>,
     /// The most one post may carry; see [`DiscordConfig::post_limit`].
     post_limit: crate::chat::PostLimit,
+    /// Which bridge endpoint answers a read of the newest messages. `#208 persistent-cache`.
+    recent: crate::config::RecentReads,
     /// Discord's rate limits, obeyed. Shared by every request this client makes, which is what
     /// lets one channel's 429 stop the *next* request on that channel before it is sent, and a
     /// global 429 stop all of them. See [`super::ratelimit`].
@@ -720,6 +722,7 @@ impl HttpDiscordClient {
             upstream_read_marks: config.upstream_read_marks,
             owner_user_id: config.owner_user_id.clone(),
             post_limit: config.post_limit(),
+            recent: config.recent,
             limiter: RateLimiter::new(),
         })
     }
@@ -1044,6 +1047,34 @@ impl ChatClient for HttpDiscordClient {
         .map_err(|error| error.with_provider(self.provider_name()))
     }
 
+    /// `#208 persistent-cache`. With `recent_view = "flat"` the bridge's Flat view answers;
+    /// otherwise `/messages`, exactly as before.
+    async fn fetch_recent(
+        &self,
+        channel: &ChannelId,
+        limit: u16,
+    ) -> Result<Vec<Message>, ChatError> {
+        Ok(self.fetch_recent_dated(channel, limit).await?.messages)
+    }
+
+    async fn fetch_recent_dated(
+        &self,
+        channel: &ChannelId,
+        limit: u16,
+    ) -> Result<crate::chat::RecentRead, ChatError> {
+        match self.recent.view {
+            crate::config::RecentView::Messages => Ok(crate::chat::RecentRead {
+                messages: self.fetch_page(channel, limit, None, None).await?,
+                as_of: None,
+                exhausted: false,
+            }),
+            crate::config::RecentView::Flat => self
+                .flat_recent(channel, limit)
+                .await
+                .map_err(|error| error.with_provider(self.provider_name())),
+        }
+    }
+
     async fn post_message(
         &self,
         channel: &ChannelId,
@@ -1161,6 +1192,7 @@ mod tests {
             markup: crate::render::Markup::GoogleChat,
             max_post_chars: None,
             max_post_bytes: None,
+            recent: crate::config::RecentReads::default(),
         }
     }
 
@@ -1454,6 +1486,7 @@ mod tests {
             upstream_read_marks: true,
             owner_user_id: None,
             post_limit: crate::chat::PostLimit::chars(DISCORD_MAX_CONTENT_LEN),
+            recent: crate::config::RecentReads::default(),
             limiter: RateLimiter::new(),
         };
         client
@@ -1476,6 +1509,7 @@ mod tests {
             upstream_read_marks,
             owner_user_id: None,
             post_limit: crate::chat::PostLimit::chars(DISCORD_MAX_CONTENT_LEN),
+            recent: crate::config::RecentReads::default(),
             limiter: RateLimiter::new(),
         }
     }
@@ -1670,6 +1704,7 @@ mod tests {
             upstream_read_marks: false,
             owner_user_id: None,
             post_limit: crate::chat::PostLimit::chars(DISCORD_MAX_CONTENT_LEN),
+            recent: crate::config::RecentReads::default(),
             limiter: RateLimiter::new(),
         };
         let registered = client
@@ -1731,6 +1766,7 @@ mod tests {
             upstream_read_marks: false,
             owner_user_id: None,
             post_limit: crate::chat::PostLimit::chars(DISCORD_MAX_CONTENT_LEN),
+            recent: crate::config::RecentReads::default(),
             limiter: RateLimiter::new(),
         };
         assert!(matches!(
@@ -1781,6 +1817,7 @@ mod tests {
             upstream_read_marks: false,
             owner_user_id: None,
             post_limit: crate::chat::PostLimit::chars(DISCORD_MAX_CONTENT_LEN),
+            recent: crate::config::RecentReads::default(),
             limiter: RateLimiter::new(),
         };
         assert!(matches!(
@@ -1835,6 +1872,7 @@ mod tests {
                 upstream_read_marks: false,
                 owner_user_id: None,
                 post_limit: crate::chat::PostLimit::chars(DISCORD_MAX_CONTENT_LEN),
+                recent: crate::config::RecentReads::default(),
                 limiter: RateLimiter::new(),
             };
             let error = client
@@ -1882,6 +1920,7 @@ mod tests {
             upstream_read_marks: false,
             owner_user_id: None,
             post_limit: crate::chat::PostLimit::chars(DISCORD_MAX_CONTENT_LEN),
+            recent: crate::config::RecentReads::default(),
             limiter: RateLimiter::new(),
         };
         let error = client
@@ -1955,6 +1994,7 @@ mod tests {
             upstream_read_marks: false,
             owner_user_id: None,
             post_limit: crate::chat::PostLimit::chars(DISCORD_MAX_CONTENT_LEN),
+            recent: crate::config::RecentReads::default(),
             limiter: RateLimiter::new(),
         };
         client

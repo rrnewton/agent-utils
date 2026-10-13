@@ -663,6 +663,20 @@ impl ChatClient for ChatRouter {
             .await
     }
 
+    /// `#208 persistent-cache`. Forwarded, so a provider that serves its newest messages from a
+    /// copy it keeps can say how old that copy is; the trait's default would read `fetch_recent`
+    /// and drop the label.
+    async fn fetch_recent_dated(
+        &self,
+        channel: &ChannelId,
+        limit: u16,
+    ) -> Result<crate::chat::RecentRead, ChatError> {
+        self.route(channel)?
+            .client
+            .fetch_recent_dated(channel, limit)
+            .await
+    }
+
     async fn post_message(
         &self,
         channel: &ChannelId,

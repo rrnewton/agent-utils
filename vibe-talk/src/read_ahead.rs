@@ -140,6 +140,9 @@ pub struct WindowRead {
     /// above, under its own expiry and tombstones, and [`ReadAhead::recall_window`] puts the two
     /// back together for a caller that needs the window in order (a summary's context).
     pub ids: Arc<[MessageId]>,
+    /// The provider's `as_of` for that read ([`ops::Window::as_of`]), so a window rebuilt from it
+    /// says what the read said: `None` when the provider's answer was current.
+    pub as_of: Option<String>,
 }
 
 impl WindowRead {
@@ -150,6 +153,7 @@ impl WindowRead {
             finished: Instant::now(),
             limit: window.limit,
             ids: window.messages.iter().map(|m| m.id.clone()).collect(),
+            as_of: window.as_of.clone(),
         }
     }
 }
@@ -823,6 +827,7 @@ mod tests {
             },
             messages: window,
             limit: 50,
+            as_of: None,
         });
         let rebuilt = read_ahead.recall_window(&channel, &read).expect("all held");
         assert_eq!(

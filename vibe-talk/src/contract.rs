@@ -206,6 +206,37 @@ pub struct NoiseRules {
     pub matching: &'static str,
 }
 
+/// `GET /api/v1/channels/{id}/messages`: a channel's most recent messages, the window the classic
+/// page draws.
+///
+/// `#208 persistent-cache` made it a contract root, appended below, when it gained `as_of`.
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct MessagesResponse {
+    /// Channel that was read.
+    pub channel: ChannelInfo,
+    /// Messages, oldest first.
+    pub messages: Vec<Message>,
+    /// Whether the fetch came back short, so `messages.len()` counts the CHANNEL rather than the
+    /// window this server asked for.
+    ///
+    /// A client may show a message count only when this is true. Discord gives no message count
+    /// for a guild text channel, so a full window means "at least this many" and nothing more.
+    pub complete: bool,
+    /// Which of `messages` the reader has ARCHIVED, so the view can dim them.
+    ///
+    /// The ordinary channel view shows archived rows greyed rather than hidden -- hiding is what
+    /// the To do filter is for -- and it can only do that if the payload says which they are.
+    pub dismissed: Vec<MessageId>,
+    /// The instant, RFC 3339, up to which the provider knows `messages` is complete, when it
+    /// served a copy it could not bring up to date just now: a bridge reading its Flat view says
+    /// so. Absent means now, and from an older server. The same field as
+    /// [`crate::threads::TimelinePage::as_of`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub as_of: Option<String>,
+    /// Standing reminder that the content is third-party text.
+    pub untrusted_content_notice: &'static str,
+}
+
 /// A provider-neutral timeline plus this application's channel and read-state metadata.
 #[derive(Debug, Serialize, JsonSchema)]
 pub struct TimelineResponse {
@@ -751,6 +782,8 @@ fn roots(generator: &mut schemars::SchemaGenerator) -> Vec<schemars::Schema> {
         generator.subschema_for::<UpstreamClearNowResponse>(),
         // `#264 voice-send-approval`. Appended, for the same reason.
         generator.subschema_for::<VoiceSettings>(),
+        // `#208 persistent-cache`. Appended, for the same reason.
+        generator.subschema_for::<MessagesResponse>(),
     ]
 }
 

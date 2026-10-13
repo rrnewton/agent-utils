@@ -40,6 +40,13 @@ provider_name = "Discord"
 # Thread protocol: "native" for Discord, "bridge" for compatible normalized thread endpoints,
 # or "off" for an older bridge without thread support. Thread ids and cursors are opaque.
 thread_api = "native"
+# With thread_api = "bridge" only: what answers a read of a channel's most recent messages,
+# "messages" (GET /channels/{id}/messages, the default) or "flat" (the newest page of the bridge's
+# Flat view, served from its kept copy and labelled with as_of when that copy is stale). Try
+# recent_view_shadow = true first: it keeps reading /messages and counts where Flat disagrees, in
+# GET /api/v1/diagnostics. It does not apply with "flat".
+# recent_view = "messages"
+# recent_view_shadow = false
 # Enable only when api_base names a compatible bridge with POST /channels/{id}/read.
 # This moves the source provider's read cursor; Done/archive remains local and reversible.
 upstream_read_marks = false

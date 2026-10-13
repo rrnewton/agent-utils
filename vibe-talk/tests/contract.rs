@@ -15,11 +15,11 @@ use std::path::PathBuf;
 use serde_json::{json, Value};
 use vibe_talk::contract::{
     ApiErrorBody, BookmarkResponse, ClientConfigResponse, CommittedPostResponse, LiveDeleteEvent,
-    LiveDelivery, LiveMessageEvent, LiveResetEvent, NoiseRules, PendingPost, PendingPostResponse,
-    PinChangeResponse, PinsResponse, ProviderDescription, ReplyDismissals, TimelineResponse,
-    TokenScope, TranscriptRole, UpstreamClearAttemptView, UpstreamClearNowOutcome,
-    UpstreamClearNowResponse, UpstreamClearState, VibeTalkV1ClientFrame, VibeTalkV1ServerFrame,
-    VoiceSettings,
+    LiveDelivery, LiveMessageEvent, LiveResetEvent, MessagesResponse, NoiseRules, PendingPost,
+    PendingPostResponse, PinChangeResponse, PinsResponse, ProviderDescription, ReplyDismissals,
+    TimelineResponse, TokenScope, TranscriptRole, UpstreamClearAttemptView,
+    UpstreamClearNowOutcome, UpstreamClearNowResponse, UpstreamClearState, VibeTalkV1ClientFrame,
+    VibeTalkV1ServerFrame, VoiceSettings,
 };
 use vibe_talk::conversation::{VoiceDescription, VoiceSession};
 use vibe_talk::model::{ChannelId, ChannelInfo, Heading, Message, MessageId, Reaction, UserId};
@@ -743,6 +743,26 @@ fn samples() -> Value {
             to(&VoiceSettings { ask_before_send: true, changeable: true }),
             to(&VoiceSettings { ask_before_send: false, changeable: true }),
             to(&VoiceSettings { ask_before_send: true, changeable: false }),
+        ],
+        // `#208 persistent-cache`: a current window, and one a provider served from a copy it
+        // could not bring up to date, so `as_of` is seen omitted and present.
+        "MessagesResponse": [
+            to(&MessagesResponse {
+                channel: channel(),
+                messages: vec![plain.clone(), threaded.clone()],
+                complete: false,
+                dismissed: vec![MessageId("300".into())],
+                as_of: None,
+                untrusted_content_notice: "third-party text",
+            }),
+            to(&MessagesResponse {
+                channel: channel(),
+                messages: vec![plain.clone()],
+                complete: true,
+                dismissed: Vec::new(),
+                as_of: Some("2026-10-12T09:00:00Z".into()),
+                untrusted_content_notice: "third-party text",
+            }),
         ],
         "VibeTalkV1ClientFrame": [
             to(&VibeTalkV1ClientFrame::AudioStart),

@@ -1260,7 +1260,13 @@ the one thing this route exists to do is tell those apart.
   ],
   "passed": 4, "failed": 1, "warned": 1,
   "budget_seconds": 20,
-  "took_ms": 812
+  "took_ms": 812,
+  // Only when a bridge has recent_view_shadow on: one row per channel it serves, counts since
+  // this process started. See "A bridge's recent read through Flat".
+  "recent_view_shadow": [
+    { "channel_id": "123456789012345678", "reads": 40, "skipped": 2, "failed": 0,
+      "compared": 40, "stale": 1, "mismatched": 1, "id_mismatches": 1, "hash_mismatches": 0 }
+  ]
 }
 ```
 
@@ -1558,6 +1564,7 @@ model provider or a real gateway.
 | Post size | `discord.max_post_chars` / `discord.max_post_bytes` | — | the most one message may hold, in characters and in UTF-8 bytes; a longer one is cut into parts. Discord itself: 2,000 characters, never more. A bridge: what you set, and 2,000 characters when you set neither, so an upgrade never sends a bridge a longer message than it has accepted before. A bridge with `markup = "google-chat"` is also held to Google Chat's 32,000 bytes and refuses a larger setting; set `max_post_bytes` to what the bridge itself accepts, up to that. Under `500` is refused. Also accepted on every `[[providers]]` entry; see "A long message stays one message where it can" under [What it does in v0](#what-it-does-in-v0) |
 | Message markup | `discord.markup` | — | how the service writes message text, for the page's renderer: `discord` (default), `google-chat` for a bridge serving Google Chat, where `*a*` is bold and a link may arrive as `<https://…\|label>`, or `slack` for a bridge passing Slack's text through. A Slack provider is always `slack` and refuses the key. See [How message text is drawn](#how-message-text-is-drawn) |
 | Thread protocol | `discord.thread_api` | — | `native` (default) for Discord, `bridge` for the normalized endpoints below, or `off` to disable child-thread timelines; an added source that identifies one upstream conversation remains an ordinary channel-picker entry in every mode |
+| Bridge recent read | `discord.recent_view` / `discord.recent_view_shadow` | — | `thread_api = "bridge"` only, refused otherwise: which endpoint answers a read of a channel's most recent messages, `messages` (default) or `flat`, and whether each `messages` read is checked against Flat for diagnostics (default `false`; refused with `flat`) — see [A bridge's recent read through Flat](#a-bridges-recent-read-through-flat) |
 | Discord bot token | `discord.bot_token` | `VIBE_TALK_DISCORD_BOT_TOKEN` | **secret** |
 | Read token | `auth.read_token` | `VIBE_TALK_READ_TOKEN` | **secret**, ≥ 24 chars |
 | Write token | `auth.write_token` | `VIBE_TALK_WRITE_TOKEN` | **secret**, ≥ 24 chars, must differ |
@@ -1646,7 +1653,8 @@ or `slack`), `name` (display name; defaults to `Discord` or `Slack`), `api_base`
 `owner_user_id`, `request_timeout_seconds` (default `20`, range `1`–`120`), `live_poll_seconds`
 (default `0`, off; at least `5`), `channel_registration`, and `max_post_chars` / `max_post_bytes`
 (the most one message may hold; see the configuration table). Discord-protocol providers also take
-`thread_api`, `upstream_read_marks` and `markup`, with the same meaning as in `[discord]`. Slack providers
+`thread_api`, `upstream_read_marks` and `markup`, and with `thread_api = "bridge"` also `recent_view`
+and `recent_view_shadow`, with the same meaning as in `[discord]`. Slack providers
 also take `registered_channels_writable`, `channel_discovery` and `upstream_clear`; see [Slack](#slack). A key that
 does not apply to the provider's kind is refused by name.
 
@@ -1825,6 +1833,43 @@ and bounds a timeline request at 90 seconds. Exceeding those limits returns an e
 Native reply counts are marked approximate because older provider counters may be capped. An
 expired cursor reloads the newest history with a fresh continuation. Forum and media channel Main
 views show thread roots; open a thread to post in these thread-only containers.
+
+### A bridge's recent read through Flat
+
+**The problem.** Every read of a channel's most recent messages — the digest, the to-do list, a
+summary's context, read-aloud, and above all the voice catch-up `recent_activity` — goes to
+`GET /channels/{id}/messages`. A bridge that answers that by running a provider command takes
+about two seconds per channel, one channel at a time. The same bridge answers the newest page of
+its Flat view (`/timeline?view=flat`) from a copy of the channel it keeps current, in
+milliseconds, and both list every message, replies included, under the same ids.
+
+**What you get.** `recent_view = "flat"` (in `[discord]`, or on a `[[providers]]` entry of kind
+`discord`, only with `thread_api = "bridge"`) answers those reads from the newest Flat page of the
+same size instead, shaped exactly like a `/messages` window: oldest first, each message once, the
+newest `limit` of them. When the bridge says its copy is complete only up to an earlier instant
+(`as_of`), vibe-talk says so everywhere that read goes: `GET /api/v1/channels/{id}/messages`
+carries the same optional `as_of`; `digest_channel` and `recent_activity` say `AS OF <how long
+ago> (exact <instant>)` and that newer messages may be missing; and the window held for catch-ups
+counts its age from `as_of`, so it never displaces a window whose picture is newer. The default,
+`messages`, reads `/messages` exactly as before. Neither setting touches the timeline route the
+page reads.
+
+**Check it first.** `recent_view_shadow = true` (with `recent_view = "messages"`) keeps answering
+from `/messages` and, after each such read, also reads the newest Flat page of the same size, in
+the background and at most one per channel at a time. Over the stretch both reads cover — from the
+newer of their oldest messages, or the channel's start for a read that came back short, up to the
+newest message `/messages` returned — it counts, per channel, messages only one of the two listed
+(`id_mismatches`) and messages both listed with different text (`hash_mismatches`, by the same
+content hash the summary cache uses). A Flat message newer than everything `/messages` returned
+arrived after that read and is not counted. The counts are in memory, reset on restart, and appear
+in `GET /api/v1/diagnostics` as `recent_view_shadow` — see [Asking the server what is wrong](#asking-the-server-what-is-wrong).
+One `info` log line per comparison that found a difference carries the counts; a `debug` line names
+the message ids, never their text. Turn `recent_view = "flat"` on once a day of shadowing shows
+none, or only ones you can explain; the setting refuses `recent_view_shadow` beside it.
+
+What it does not do: a Flat page the bridge cannot build (a channel past its copy's size limits)
+fails the read rather than falling back to `/messages`, and a bridge copy that is cold is built on
+the first read, which can take far longer than `/messages`. Shadowing first shows both.
 
 ### Local read state is ours; upstream read state is an optional provider capability
 
@@ -2286,7 +2331,7 @@ own adapter-only token; every other route uses the read/write tokens described a
 | POST | `/api/v1/voice-timing` | **write** | one call's content-free startup phase offsets, logged as `voice_startup` |
 | POST | `/api/v1/voice-health` | **write** | a content-free "the voice service is not responding" record, logged as `voice_unresponsive` or `voice_recovered` — see "When the voice service stops answering" |
 | GET | `/api/v1/signed-url` | **write** | compatibility endpoint that mints an ElevenLabs signed URL |
-| GET | `/api/v1/channels/{id}/messages?limit=` | read | full scrollback, oldest first |
+| GET | `/api/v1/channels/{id}/messages?limit=` | read | full scrollback, oldest first; an optional `as_of` when the provider served a copy it could not bring up to date (`#208 persistent-cache`) |
 | GET | `/api/v1/channels/{id}/messages/{message_id}` | read | one message in full |
 | GET | `/api/v1/channels/{id}/digest?limit=&width=` | read | one speakable line per message |
 | GET | `/api/v1/channels/{id}/messages/{message_id}/summary` | read | one message summarised, from cache when it can be |

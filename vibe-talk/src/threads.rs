@@ -214,6 +214,30 @@ pub struct TimelinePage {
     pub as_of: Option<String>,
 }
 
+impl TimelinePage {
+    /// A newest Flat page as the window a read of a channel's most recent messages answers:
+    /// oldest first by id, each message once, at most `limit` of them, the newest kept, with the
+    /// page's `as_of`. `#208 persistent-cache`, milestone `bridge-recent-flat`.
+    ///
+    /// A bridge already pages that way; this holds the shape whatever it sends, so a caller cannot
+    /// tell from the shape which endpoint answered. Thread membership is kept: it is true of the
+    /// message, and a reader that files messages by thread uses it. Never `exhausted`: a page that
+    /// says it has no more is not a proof of a channel's start that any caller relies on yet.
+    #[must_use]
+    pub fn into_recent(self, limit: u16) -> crate::chat::RecentRead {
+        let mut messages = self.messages;
+        crate::model::sort_oldest_first(&mut messages);
+        messages.dedup_by(|later, earlier| later.id == earlier.id);
+        let excess = messages.len().saturating_sub(usize::from(limit));
+        messages.drain(..excess);
+        crate::chat::RecentRead {
+            messages,
+            as_of: self.as_of,
+            exhausted: false,
+        }
+    }
+}
+
 /// What a forward read says about the changes it carries. `#203 incremental-refresh`.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct TimelineDelta {

@@ -357,6 +357,23 @@ impl PostLimit {
     }
 }
 
+/// A read of a channel's most recent messages, and how current the provider says it is.
+/// `#208 persistent-cache`, milestone `bridge-recent-flat`.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct RecentRead {
+    /// Up to the requested number of most recent messages, oldest first.
+    pub messages: Vec<Message>,
+    /// The instant, RFC 3339, up to which the provider knows `messages` is complete, when it
+    /// served a copy it could not bring up to date just now. `None` means now. The same field, and
+    /// the same meaning, as [`crate::threads::TimelinePage::as_of`].
+    pub as_of: Option<String>,
+    /// Whether the provider PROVED that `messages` reach back to the channel's first message.
+    ///
+    /// Never inferred from a short read: a provider can drop rows it cannot represent, so fewer
+    /// messages than asked for is not a proof. False by default, and for every provider today.
+    pub exhausted: bool,
+}
+
 /// Read and post access to configured chat channels.
 #[async_trait]
 pub trait ChatClient: Send + Sync {
@@ -575,6 +592,28 @@ pub trait ChatClient: Send + Sync {
         limit: u16,
     ) -> Result<Vec<Message>, ChatError> {
         self.fetch_page(channel, limit, None, None).await
+    }
+
+    /// [`ChatClient::fetch_recent`], with what the provider says about how current it is.
+    /// `#208 persistent-cache`.
+    ///
+    /// The default wraps `fetch_recent` and claims nothing: no `as_of`, and not `exhausted`. A
+    /// provider that serves the newest messages from a copy it keeps overrides it to say how old
+    /// that copy is. The router forwards it to the channel's own provider.
+    ///
+    /// # Errors
+    ///
+    /// As [`ChatClient::fetch_recent`].
+    async fn fetch_recent_dated(
+        &self,
+        channel: &ChannelId,
+        limit: u16,
+    ) -> Result<RecentRead, ChatError> {
+        Ok(RecentRead {
+            messages: self.fetch_recent(channel, limit).await?,
+            as_of: None,
+            exhausted: false,
+        })
     }
 
     /// Post `content` to `channel`, optionally as a reply to an existing message.

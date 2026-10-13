@@ -69,6 +69,7 @@ pub mod probe;
 pub mod providers;
 pub mod read_ahead;
 pub mod recent;
+pub mod recent_view;
 pub mod render;
 pub mod replay;
 pub mod retrieval;

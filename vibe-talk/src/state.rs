@@ -125,6 +125,9 @@ pub struct AppState {
     /// `(tag)` heading. `#242 rich-headers`; see [`crate::heading::HeadingTags`]. In memory and
     /// bounded, shared by every read and the live stream.
     pub headings: Arc<crate::heading::HeadingTags>,
+    /// What each channel's recent-view shadow has counted. `#208 persistent-cache`; see
+    /// [`crate::recent_view`]. In memory, counts only, empty unless a provider turns it on.
+    pub recent_view_shadow: Arc<crate::recent_view::Shadow>,
 }
 
 fn added_channel_info(row: &AddedChannel, providers: &ChatRouter) -> ChannelInfo {
