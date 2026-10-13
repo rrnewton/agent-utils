@@ -1181,6 +1181,73 @@ and its record keeps the reason, which `chat inspect` shows in
 `delivery_uncertain` instead, and its prompt is never typed again, because a
 second copy could reach the agent.
 
+### Typing while a Claude Code agent works
+
+`chat run --deliver-while-working` lets the queue also type into a Claude Code
+pane that herdr reports `working`, so a request reaches the agent while its
+current turn runs instead of after it: Claude Code holds the prompt and runs
+it when the turn ends. Off by default. Only Claude Code panes are typed into
+this way; other harnesses, and prompts that start with `/`, which open a menu
+rather than reach the composer, still wait for `idle` or `done`. The usual
+checks still apply. The composer must be empty first: a draft still refuses
+the prompt, while the faint hint Claude Code draws in an empty composer, such
+as `Press up to edit queued messages`, and the cursor cell are not a draft.
+The submission must be verified on the screen: the prompt leaves the composer,
+and the queued-message hint, a running turn or the prompt itself shows. An
+Enter that Claude Code drops, as it can while its hooks run, is pressed again
+with a doubling wait for up to 60 seconds. If the prompt is still in the
+composer then, the queue takes it back out with editing keys (`ctrl+e`,
+`ctrl+u`, and `backspace` where those change nothing) and, once the composer
+is proved empty and nothing shows the prompt was accepted, records the request
+`pending` without counting an attempt, so a later retry types it again. If
+the composer cannot be proved empty, the prompt is left there and the request
+is `delivery_uncertain`, as for any prompt left staged. The retries every 10
+seconds also run while the pane is `working`.
+
+### Clearing a draft left in the composer
+
+A draft left in the coordinator's composer holds every request behind it for
+as long as it stays there. `chat run --stale-composer-clear-after DURATION`,
+for example `--stale-composer-clear-after 30m`, clears such a draft once it
+has stayed unchanged for DURATION while a request waits on it. Off by default.
+DURATION is a whole number of seconds (`s`, or no unit), minutes (`m`) or
+hours (`h`), at least `1m` and at most `168h`. The option needs
+`outbound_enabled` and an `outbound_command` helper, and `run` refuses to
+start without them.
+
+The draft is watched at each 10-second scan while some `pending` request's
+last attempt was refused because the composer held text. Any change to the
+draft starts the wait again, as does a scan that finds no such request. When
+the draft is due, nothing happens while herdr reports the agent other than
+`idle` or `done` or its screen shows or may show a running turn. Otherwise
+`run` takes the pane's delivery lock, which every agentctl sender takes while
+it types, reads the composer again, and goes on only if the draft is the same:
+
+1. It writes the draft to a new file of mode 0600 in `composer-backups/` in
+   the state directory (created with mode 0700), named by the UTC time.
+2. It deletes the draft with the editing keys described above, never with a
+   key that submits, interrupts or opens a menu, and reads the screen to
+   prove the composer empty. If that fails, it stops here: no notice is
+   posted, the backup keeps the whole draft, and the wait starts again.
+3. It posts one root message to the first configured channel through the
+   outbound helper, using no model:
+
+   ```text
+   [chat-bridge WARNING] The following text was left in the input box and cleared out automatically after not changing for 30 minutes:
+   > the draft, each line quoted
+   ```
+
+   The duration in the notice is DURATION. A draft too long for one message is
+   cut at a line, and the notice says so. A failure the helper reports as not
+   applied and retryable is tried twice more under the same operation ID; any
+   other failure is logged and the notice is not posted again.
+4. The waiting requests are retried at once.
+
+The service log describes each step by the draft's length; the draft's text
+goes only to the backup file and the notice. The composer is read as drawn,
+so a draft wider than the pane is saved with a line break where it wraps, and
+a paste Claude Code shows as `[Pasted text #N]` is saved as that placeholder.
+
 When the queue types, it goes through the prompts in its inbox in the order
 they were queued, checks before each one that it can type it, and stops at the
 first it cannot. So a pass can also type prompts that earlier passes left in

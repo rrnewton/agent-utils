@@ -264,6 +264,7 @@ impl Delivery {
             ready_timeout: Duration::from_secs_f64(self.ready_timeout),
             working_timeout: Duration::from_secs_f64(self.working_timeout),
             max_attempts: self.max_attempts,
+            deliver_while_working: false,
         }
     }
 }
@@ -784,6 +785,12 @@ struct ChatRun {
     /// Print an `agentctl chat reply` command in each request prompt that gives the two reply marker lines, as a way to send a reply at once, and listen for its wakes on the state directory's .wake.sock (default: off). A prompt leaves the command out when no file is left at this executable's path or a word of the command cannot be printed safely, and the service does not listen when the socket's absolute path exceeds 107 bytes. The agent must be able to run this executable and write the state directory; applies only to this run.
     #[arg(long)]
     offer_reply_command: bool,
+    /// Also type a request into the coordinator's pane while Herdr reports it `working`, when the pane runs Claude Code, and let Claude Code queue it behind the current turn (default: off, which waits for `idle` or `done`). The composer must be empty first, and the submission must be verified: the prompt leaves the composer, with Claude Code's queued-message hint or the prompt shown, and an Enter it drops is pressed again with a doubling wait. A prompt it never accepts is taken back out of the composer and stays pending. Slash commands and other harnesses still wait; applies only to this run.
+    #[arg(long)]
+    deliver_while_working: bool,
+    /// Clear text left unsubmitted in the coordinator's composer once it has blocked a request and stayed unchanged for DURATION, such as 30m (default: off). Units: s, m or h; a bare number is seconds; at least 1m. The text is first saved with mode 0600 under the state directory's composer-backups/, then deleted with editing keys and the composer proved empty, and then posted once to the first configured channel through the outbound helper with a "[chat-bridge WARNING]" notice; delivery then resumes. Any change to the text restarts the wait, nothing is cleared while the agent works, and a failed clear leaves the text and posts nothing. Requires an outbound helper; applies only to this run.
+    #[arg(long, value_name = "DURATION", value_parser = stale_composer_duration)]
+    stale_composer_clear_after: Option<Duration>,
 }
 
 #[derive(Args)]
@@ -811,6 +818,8 @@ impl ChatOperate {
                 ready_timeout: Duration::from_secs_f64(self.ready_timeout),
                 working_timeout: Duration::from_secs_f64(self.working_timeout),
                 max_attempts: self.max_attempts,
+                // `chat run` sets this from its own flag.
+                deliver_while_working: false,
             },
             reconciliation_interval: Duration::from_secs_f64(self.reconcile_interval),
             timing: crate::chat_service::DeliveryTiming::default(),
@@ -876,6 +885,9 @@ fn environment_value(value: &str) -> Result<String, String> {
     environment_entries(&[value.to_owned()])
         .map(|entries| entries.into_iter().next().expect("one validated entry"))
         .map_err(|error| error.to_string())
+}
+fn stale_composer_duration(value: &str) -> Result<Duration, String> {
+    crate::stale_composer::parse_duration(value)
 }
 fn chat_ignored_text_prefix(value: &str) -> Result<String, String> {
     crate::chat_runtime::validate_ignored_text_prefix(value)
@@ -1664,7 +1676,8 @@ fn run_chat(registry: PathBuf, herdr_bin: PathBuf, chat: Chat) -> Result<i32, Fa
             Ok(code)
         }
         ChatCommand::Run(value) => {
-            let options = value.operate.options();
+            let mut options = value.operate.options();
+            options.delivery.deliver_while_working = value.deliver_while_working;
             let client =
                 HerdrClient::with_executable("direct", &herdr_bin).map_err(AgentError::from)?;
             let manager = ManagedAgents::new(&client, &registry)?;
@@ -1676,6 +1689,7 @@ fn run_chat(registry: PathBuf, herdr_bin: PathBuf, chat: Chat) -> Result<i32, Fa
                 crate::chat_service::RunSettings {
                     ignored_text_prefixes: value.ignored_text_prefixes,
                     offer_reply_command: value.offer_reply_command,
+                    stale_composer_clear_after: value.stale_composer_clear_after,
                 },
             )
             .map_err(Failure::Chat)?;
@@ -2483,6 +2497,64 @@ mod tests {
             "--offer-reply-command",
         ])
         .is_err());
+    }
+
+    #[test]
+    fn chat_run_parses_the_opt_in_delivery_flags_and_both_default_off() {
+        let run = |extra: &[&str]| {
+            let parsed = Cli::try_parse_from(
+                [
+                    "agentctl",
+                    "chat",
+                    "run",
+                    "--bridge-state",
+                    "/tmp/chat-state",
+                ]
+                .iter()
+                .chain(extra),
+            )?;
+            let Some(Commands::Chat(Chat {
+                command: ChatCommand::Run(run),
+            })) = parsed.command
+            else {
+                panic!("expected chat run");
+            };
+            Ok::<_, clap::Error>(run)
+        };
+        let defaults = run(&[]).unwrap();
+        assert!(!defaults.deliver_while_working);
+        assert_eq!(defaults.stale_composer_clear_after, None);
+        let set = run(&[
+            "--deliver-while-working",
+            "--stale-composer-clear-after",
+            "30m",
+        ])
+        .unwrap();
+        assert!(set.deliver_while_working);
+        assert_eq!(
+            set.stale_composer_clear_after,
+            Some(Duration::from_secs(1_800))
+        );
+        for bad in ["10s", "30", "1d", "soon"] {
+            assert!(
+                run(&["--stale-composer-clear-after", bad]).is_err(),
+                "{bad}"
+            );
+        }
+        for flag in [
+            "--deliver-while-working",
+            "--stale-composer-clear-after=30m",
+        ] {
+            assert!(Cli::try_parse_from([
+                "agentctl",
+                "chat",
+                "tick",
+                "--bridge-state",
+                "/tmp/chat-state",
+                flag,
+            ])
+            .is_err());
+        }
     }
 
     #[test]

@@ -473,6 +473,12 @@ pub struct DrainOptions {
     pub working_timeout: Duration,
     /// Maximum recorded delivery-attempt count accepted for a prompt.
     pub max_attempts: u64,
+    /// Also type into a Claude Code pane that Herdr reports `working`, and let Claude Code
+    /// queue the prompt behind its current turn. The submission must still be verified against
+    /// the composer, which must be empty before typing; a prompt Claude Code never accepts is
+    /// taken back out of the composer and stays pending. Slash commands and other harnesses
+    /// still wait for `idle` or `done`. Off by default.
+    pub deliver_while_working: bool,
 }
 
 impl Default for DrainOptions {
@@ -481,6 +487,7 @@ impl Default for DrainOptions {
             ready_timeout: Duration::from_secs(900),
             working_timeout: Duration::from_secs(30),
             max_attempts: 3,
+            deliver_while_working: false,
         }
     }
 }
@@ -508,6 +515,46 @@ pub trait AgentRuntime {
     /// note.
     fn prompt_printed(&self, message_id: &str) {
         let _ = message_id;
+    }
+    /// Whether a verified submission that the agent never accepts, so that the prompt is still
+    /// staged in its composer when the submission deadline passes, should take the prompt back
+    /// out of the composer and report it as not typed, rather than leave it there and report the
+    /// outcome as unknown. A queue drain asks for this only when it types into a pane that is
+    /// working, as `DrainOptions::deliver_while_working` allows. The default is `false`.
+    fn withdraw_unaccepted_prompt(&self) -> bool {
+        false
+    }
+}
+
+/// A runtime that behaves as `inner` and asks a verified submission to withdraw a prompt the
+/// agent never accepts: see [`AgentRuntime::withdraw_unaccepted_prompt`].
+struct WithdrawingRuntime<'a> {
+    inner: &'a dyn AgentRuntime,
+}
+
+impl AgentRuntime for WithdrawingRuntime<'_> {
+    fn monotonic(&self) -> Duration {
+        self.inner.monotonic()
+    }
+
+    fn sleep(&self, duration: Duration) {
+        self.inner.sleep(duration);
+    }
+
+    fn cancelled(&self) -> bool {
+        self.inner.cancelled()
+    }
+
+    fn delivery_wait_chunk(&self) -> Option<Duration> {
+        self.inner.delivery_wait_chunk()
+    }
+
+    fn prompt_printed(&self, message_id: &str) {
+        self.inner.prompt_printed(message_id);
+    }
+
+    fn withdraw_unaccepted_prompt(&self) -> bool {
+        true
     }
 }
 
@@ -831,6 +878,11 @@ fn drain_with_runtime_binding<A: AgentApi + ?Sized>(
                 break 'message;
             }
 
+            // A slash command opens a harness menu rather than reaching the composer, so it is
+            // never typed into a working pane.
+            let accept_working = options.deliver_while_working
+                && message_text(&document)
+                    .is_ok_and(|text| crate::submission::verifies("claude", &text));
             let readiness = (|| -> AgentResult<AgentPaneInfo> {
                 if target_lock.is_none() {
                     let (lock, info) = lock_resolved_target_with_runtime(client, target, runtime)?;
@@ -847,6 +899,7 @@ fn drain_with_runtime_binding<A: AgentApi + ?Sized>(
                         .as_deref()
                         .expect("target lock always records its pane"),
                     initial_info.take(),
+                    accept_working,
                 )
             })();
             let info = match readiness {
@@ -874,12 +927,21 @@ fn drain_with_runtime_binding<A: AgentApi + ?Sized>(
             document.insert("inflight_at".to_owned(), json!(unix_seconds()));
             atomic_json(&inflight_path, &Value::Object(document.clone()))?;
 
+            // Typing into a working pane relies on the agent to queue the prompt; one it never
+            // accepts is taken back out of the composer so that it stays safely pending.
+            let withdrawing = WithdrawingRuntime { inner: runtime };
+            let delivery_runtime: &dyn AgentRuntime = if accept_working && info.status == "working"
+            {
+                &withdrawing
+            } else {
+                runtime
+            };
             match deliver_one(
                 client,
                 &info,
                 &typed_text(&document)?,
                 options.working_timeout,
-                runtime,
+                delivery_runtime,
             ) {
                 Ok(Delivered::NotStaged(detail)) => {
                     // Nothing reached the composer: undo the at-most-once barrier so the
@@ -1351,6 +1413,7 @@ fn wait_ready<A: AgentApi + ?Sized>(
     runtime: &dyn AgentRuntime,
     locked_pane_id: &str,
     mut initial_info: Option<AgentPaneInfo>,
+    accept_working: bool,
 ) -> AgentResult<AgentPaneInfo> {
     let deadline = runtime.monotonic().saturating_add(timeout);
     loop {
@@ -1370,6 +1433,12 @@ fn wait_ready<A: AgentApi + ?Sized>(
             )));
         }
         if matches!(info.status.as_str(), "idle" | "done") {
+            return Ok(info);
+        }
+        // Claude Code queues a prompt submitted while it works, and shows that it did; the
+        // verified submission checks the composer is empty before typing and proves the prompt
+        // left it. Other harnesses are not typed into while they work.
+        if accept_working && info.status == "working" && info.agent.as_deref() == Some("claude") {
             return Ok(info);
         }
         if info.status == "unknown"
@@ -3711,6 +3780,188 @@ mod tests {
         let screen = fake.screen.as_ref().unwrap().state();
         assert_eq!(screen.pastes.len(), 1, "never typed twice");
         assert_eq!(screen.composer, "stuck in the composer");
+    }
+
+    /// A Claude Code pane that Herdr reports `working`, drawn by `screen`, and its target.
+    fn working_claude(screen: crate::submission::fake::FakeScreen) -> (FakeAgent, Target) {
+        let fake = FakeAgent::with_screen(screen);
+        {
+            let mut state = fake.state.lock().expect("fake state");
+            state.states.clear();
+            state.last_state = "working".to_owned();
+            let info = state.infos.get_mut("w1:p1").expect("pane info");
+            info.agent = Some("claude".to_owned());
+            info.session_agent = Some("claude".to_owned());
+        }
+        let target = Target {
+            session_agent: Some("claude".to_owned()),
+            expected_agent: Some("claude".to_owned()),
+            ..target()
+        };
+        (fake, target)
+    }
+
+    fn while_working() -> DrainOptions {
+        DrainOptions {
+            ready_timeout: Duration::ZERO,
+            max_attempts: 1,
+            deliver_while_working: true,
+            ..DrainOptions::default()
+        }
+    }
+
+    #[test]
+    fn a_working_claude_is_typed_into_only_with_deliver_while_working() {
+        let directory = TestDirectory::new("while-working");
+        let (fake, target) =
+            working_claude(crate::submission::fake::FakeScreen::new("claude", true));
+        let runtime = FakeRuntime::default();
+        let error = send_with_runtime(
+            &fake,
+            &target,
+            directory.path(),
+            "queue behind the turn",
+            DrainOptions {
+                deliver_while_working: false,
+                ..while_working()
+            },
+            &runtime,
+        )
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("did not become idle/done"),
+            "{error}"
+        );
+        assert!(fake.screen.as_ref().unwrap().state().pastes.is_empty());
+
+        let result =
+            drain_with_runtime(&fake, &target, directory.path(), while_working(), &runtime)
+                .unwrap();
+        assert_eq!(result.outcome, QueueOutcome::Delivered);
+        let screen = fake.screen.as_ref().unwrap().state();
+        assert_eq!(screen.queued, ["queue behind the turn"]);
+        assert_eq!(screen.pastes.len(), 1);
+        assert!(screen.composer.is_empty());
+    }
+
+    #[test]
+    fn a_dropped_enter_in_a_working_claude_is_pressed_again() {
+        let directory = TestDirectory::new("while-working-dropped");
+        let screen = crate::submission::fake::FakeScreen::new("claude", true);
+        screen.state().drop_keys = 2;
+        let (fake, target) = working_claude(screen);
+        let result = send_with_runtime(
+            &fake,
+            &target,
+            directory.path(),
+            "after two drops",
+            while_working(),
+            &FakeRuntime::default(),
+        )
+        .unwrap();
+        assert_eq!(result.outcome, QueueOutcome::Delivered);
+        let screen = fake.screen.as_ref().unwrap().state();
+        assert_eq!(screen.keys, ["Enter", "Enter", "Enter"]);
+        assert_eq!(screen.queued, ["after two drops"]);
+        assert_eq!(screen.pastes.len(), 1, "never typed twice");
+    }
+
+    #[test]
+    fn a_prompt_a_working_claude_never_accepts_stays_pending_and_is_taken_back() {
+        let directory = TestDirectory::new("while-working-unaccepted");
+        let screen = crate::submission::fake::FakeScreen::new("claude", true);
+        screen.state().drop_submit_keys = true;
+        let (fake, target) = working_claude(screen);
+        let runtime = FakeRuntime::default();
+        let error = send_with_runtime(
+            &fake,
+            &target,
+            directory.path(),
+            "never accepted",
+            while_working(),
+            &runtime,
+        )
+        .unwrap_err();
+        assert_eq!(error.exit_code(), 75, "{error}");
+        assert!(
+            error.to_string().contains("taken back out of the composer"),
+            "{error}"
+        );
+        let pending = json_paths(&directory.path().join("inbox")).unwrap();
+        assert_eq!(pending.len(), 1);
+        let document = read_json(&pending[0]).unwrap();
+        assert_eq!(document["delivery_state"], "pending");
+        assert!(document.get("possibly_submitted").is_none(), "{document}");
+        assert!(
+            document
+                .get("delivery_attempts")
+                .is_none_or(|attempts| attempts == 0),
+            "{document}"
+        );
+        assert!(json_paths(&directory.path().join("failed"))
+            .unwrap_or_default()
+            .is_empty());
+        {
+            let screen = fake.screen.as_ref().unwrap().state();
+            assert!(screen.composer.is_empty(), "{:?}", screen.composer);
+            assert!(screen.queued.is_empty());
+        }
+
+        // Once Claude Code accepts Enter again, the same prompt is typed once more and queued.
+        fake.screen.as_ref().unwrap().state().drop_submit_keys = false;
+        let result =
+            drain_with_runtime(&fake, &target, directory.path(), while_working(), &runtime)
+                .unwrap();
+        assert_eq!(result.outcome, QueueOutcome::Delivered);
+        assert_eq!(
+            fake.screen.as_ref().unwrap().state().queued,
+            ["never accepted"]
+        );
+    }
+
+    #[test]
+    fn deliver_while_working_still_waits_for_a_working_codex_and_for_a_draft() {
+        let directory = TestDirectory::new("while-working-codex");
+        let screen = crate::submission::fake::FakeScreen::new("codex", true);
+        let fake = FakeAgent::with_screen(screen);
+        {
+            let mut state = fake.state.lock().expect("fake state");
+            state.states.clear();
+            state.last_state = "working".to_owned();
+        }
+        let error = send_with_runtime(
+            &fake,
+            &target(),
+            directory.path(),
+            "codex keeps waiting",
+            while_working(),
+            &FakeRuntime::default(),
+        )
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("did not become idle/done"),
+            "{error}"
+        );
+        assert!(fake.screen.as_ref().unwrap().state().pastes.is_empty());
+
+        let directory = TestDirectory::new("while-working-draft");
+        let screen = crate::submission::fake::FakeScreen::new("claude", true);
+        screen.state().composer = "an operator's draft".to_owned();
+        let (fake, target) = working_claude(screen);
+        let error = send_with_runtime(
+            &fake,
+            &target,
+            directory.path(),
+            "wait for the draft",
+            while_working(),
+            &FakeRuntime::default(),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("refusing to append"), "{error}");
+        assert_eq!(
+            fake.screen.as_ref().unwrap().state().composer,
+            "an operator's draft"
+        );
     }
 
     #[test]

@@ -19,6 +19,7 @@ pub mod plugins;
 pub(crate) mod profiles;
 pub(crate) mod prompt_time;
 pub(crate) mod skill_install;
+pub mod stale_composer;
 pub mod subagents;
 pub mod submission;
 

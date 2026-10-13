@@ -35,6 +35,7 @@ use crate::chat_runtime::{
     RootMessageTransport, SNAPSHOT_LINES,
 };
 use crate::client::HerdrClient;
+use crate::stale_composer::{HerdrComposerPane, StaleComposer};
 use crate::subagents::{ManagedAgents, ManagedApi};
 
 // The lines of context each output subscription asks for: the rows the service's own reads of
@@ -860,6 +861,10 @@ pub struct RunSettings {
     /// as [`BridgeState::with_reply_command_offered`] describes, and listen on the state
     /// directory's wake socket so a reply that command stores is sent at once.
     pub offer_reply_command: bool,
+    /// Clear a draft left in the coordinator's composer once it has held a request and stayed
+    /// unchanged this long, as [`crate::stale_composer`] describes; `None`, the default, never
+    /// clears one.
+    pub stale_composer_clear_after: Option<Duration>,
 }
 
 /// Run with process-local settings; the saved configuration remains unchanged.
@@ -876,6 +881,10 @@ pub fn run_with_settings<A: ManagedApi + ?Sized>(
         .with_reply_command_offered(offer_reply_command);
     let _resume_request = state.subscribe_request()?;
     validate_service_outbound(state.config())?;
+    let stale_composer = match settings.stale_composer_clear_after {
+        Some(window) => Some(stale_composer_guard(state_root, state.config(), window)?),
+        None => None,
+    };
     let outbound_cancellation = OutboundCancellation::new()?;
     let mut outbound = state.outbound_transport()?;
     if let Some(transport) = outbound.as_mut() {
@@ -1015,6 +1024,7 @@ pub fn run_with_settings<A: ManagedApi + ?Sized>(
         &notice_receiver,
         &reply_wakes,
         &mut outbound,
+        stale_composer,
     );
 
     begin_service_stop(
@@ -3468,8 +3478,11 @@ fn spawn_signal_worker(
 struct TurnEvidence {
     // Herdr last reported the pane as `working`.
     herdr: bool,
-    // Herdr last reported the pane as `idle` or `done`, the only statuses in which a drain types.
+    // Herdr last reported the pane as `idle` or `done`, the only statuses in which a drain types,
+    // or as `working` in a Claude Code pane when `while_working` allows a drain to type then.
     ready: bool,
+    // `chat run --deliver-while-working`: a drain also types into a working Claude Code pane.
+    while_working: bool,
     // The last read of the loop's own that could tell showed a running turn, or a later pass
     // asked for a prompt or a notice to be typed, or a later output event's screen showed a
     // running turn.
@@ -3477,9 +3490,16 @@ struct TurnEvidence {
 }
 
 impl TurnEvidence {
+    #[cfg(test)]
     fn status(&mut self, status: &str) {
+        self.agent_status(status, None);
+    }
+
+    /// Herdr's status for the pane and the agent it recognises there.
+    fn agent_status(&mut self, status: &str, agent: Option<&str>) {
         self.herdr = status == "working";
-        self.ready = matches!(status, "idle" | "done");
+        self.ready = matches!(status, "idle" | "done")
+            || (self.while_working && status == "working" && agent == Some("claude"));
     }
 
     /// A screen the loop read itself, after every prompt it had asked to be typed.
@@ -3521,8 +3541,13 @@ fn run_owner_loop<A: ManagedApi + ?Sized>(
     notices: &mpsc::Receiver<ProviderNotice>,
     reply_wakes: &mpsc::Receiver<String>,
     transport: &mut Option<CommandOutboundTransport>,
+    stale_composer: Option<StaleComposer>,
 ) -> Result<(), ChatServiceError> {
     let owner_runtime = StopRuntime::new(stop);
+    let mut stale_composer = stale_composer.map(|guard| StaleComposerRun {
+        guard,
+        last_held: None,
+    });
     let mut routes = RouteCache::from_entries(state.reply_route_entries()?);
     let mut control = PassControl {
         transport,
@@ -3559,7 +3584,10 @@ fn run_owner_loop<A: ManagedApi + ?Sized>(
     // its retries that succeeds, each made within `SATURATED_POLL_INTERVAL` of a failure for as
     // long as the subscription lasts. While no subscription works, the status comes from each
     // reconciliation.
-    let mut turn = TurnEvidence::default();
+    let mut turn = TurnEvidence {
+        while_working: options.delivery.deliver_while_working,
+        ..TurnEvidence::default()
+    };
     turn.read(&initial);
     turn.report(&initial_report);
     let recovery = recover_pass(state, manager, options.delivery, &mut routes, &mut control)?;
@@ -3606,13 +3634,14 @@ fn run_owner_loop<A: ManagedApi + ?Sized>(
         // stop the service: the loop goes by the status it learned before and looks it up again
         // at the next scan, logging the first failure and the recovery.
         let mut retry = false;
-        if watch.due() {
+        let scanned = watch.due();
+        if scanned {
             watch.scan(state, &queue_reader, &mut routes);
             if !recover && !watch.retry_keys.is_empty() {
                 match manager.pane_info_with_runtime(&state.config().agent_name, &owner_runtime) {
                     Ok(info) => {
                         watch.lookup_worked();
-                        turn.status(&info.status);
+                        turn.agent_status(&info.status, info.agent.as_deref());
                     }
                     Err(error) if stop.is_stopped() => return Err(error.into()),
                     Err(error) => watch.lookup_failed(&error),
@@ -3735,6 +3764,20 @@ fn run_owner_loop<A: ManagedApi + ?Sized>(
             // Log the prompts the retry typed now rather than at the next scan.
             watch.scan(state, &queue_reader, &mut routes);
         }
+        if let Some(run) = stale_composer.as_mut().filter(|_| scanned) {
+            if stale_composer_step(
+                run,
+                watch.composer_blocked,
+                state,
+                client,
+                manager,
+                &owner_runtime,
+                control.transport,
+            ) {
+                // The composer is empty again: try the waiting prompts at once.
+                watch.next_scan = Instant::now();
+            }
+        }
 
         if Instant::now() >= next_reconciliation {
             let problem = state.reply_alias_problem();
@@ -3747,7 +3790,7 @@ fn run_owner_loop<A: ManagedApi + ?Sized>(
             }
             let info =
                 manager.pane_info_with_runtime(&state.config().agent_name, &owner_runtime)?;
-            turn.status(&info.status);
+            turn.agent_status(&info.status, info.agent.as_deref());
             if matches!(info.status.as_str(), "idle" | "done") {
                 let snapshot = manager.read_capture_with_runtime(
                     &state.config().agent_name,
@@ -3888,7 +3931,7 @@ fn run_owner_loop<A: ManagedApi + ?Sized>(
                             info.pane_id
                         )));
                     }
-                    turn.status(&info.status);
+                    turn.agent_status(&info.status, info.agent.as_deref());
                     let mut unknown_route_seen = false;
                     for event in events {
                         match event {
@@ -4048,6 +4091,110 @@ fn run_owner_loop<A: ManagedApi + ?Sized>(
     }
     cancel_provider(cancellation)?;
     Ok(())
+}
+
+/// The stale-composer clear of one `chat run`, and the last reason it gave for holding a due
+/// draft, so that each reason is logged once.
+struct StaleComposerRun {
+    guard: StaleComposer,
+    last_held: Option<String>,
+}
+
+/// Build the stale-composer clear for `chat run --stale-composer-clear-after`. Its notice is
+/// the copy of the draft in the chat, so the option needs the outbound helper.
+fn stale_composer_guard(
+    state_root: &Path,
+    configuration: &BridgeConfiguration,
+    window: Duration,
+) -> Result<StaleComposer, ChatServiceError> {
+    if !configuration.outbound_enabled || configuration.outbound_command.is_none() {
+        return Err(ChatServiceError::Generation(
+            "--stale-composer-clear-after posts the cleared text to the chat, so it requires \
+             outbound_enabled=true and an outbound_command helper"
+                .to_owned(),
+        ));
+    }
+    let channel = configuration.channel_ids.first().ok_or_else(|| {
+        ChatServiceError::Generation(
+            "--stale-composer-clear-after requires a configured channel".to_owned(),
+        )
+    })?;
+    Ok(StaleComposer::new(
+        window,
+        state_root.join(crate::stale_composer::BACKUP_DIRECTORY),
+        channel.clone(),
+    ))
+}
+
+/// Run one step of the stale-composer clear against the coordinator's pane, logging what it
+/// did, and give whether it cleared the composer. A step that cannot resolve the pane or has no
+/// outbound helper does nothing; the next scan tries again.
+fn stale_composer_step<A: ManagedApi + ?Sized>(
+    run: &mut StaleComposerRun,
+    blocked: bool,
+    state: &BridgeState,
+    client: &HerdrClient,
+    manager: &ManagedAgents<'_, A>,
+    runtime: &dyn AgentRuntime,
+    transport: &mut Option<CommandOutboundTransport>,
+) -> bool {
+    let Some(transport) = transport.as_mut() else {
+        return false;
+    };
+    let held = |run: &mut StaleComposerRun, reason: String| {
+        if run.last_held.as_deref() != Some(reason.as_str()) {
+            service_log(format_args!("agentctl: stale composer: {reason}"));
+            run.last_held = Some(reason);
+        }
+    };
+    let pane = if blocked {
+        match manager.pane_info_with_runtime(&state.config().agent_name, runtime) {
+            Ok(info) => {
+                let expect_terminal = match client.input_expect_supported() {
+                    Ok(true) => info.terminal_id.clone(),
+                    _ => None,
+                };
+                Some(HerdrComposerPane::new(
+                    client,
+                    info.pane_id,
+                    runtime,
+                    true,
+                    expect_terminal,
+                ))
+            }
+            Err(error) => {
+                held(
+                    run,
+                    format!("the coordinator's pane could not be resolved: {error}"),
+                );
+                return false;
+            }
+        }
+    } else {
+        None
+    };
+    let step = run.guard.step(
+        Instant::now(),
+        pane.as_ref()
+            .map(|pane| pane as &dyn crate::stale_composer::ComposerPane),
+        transport,
+        runtime,
+        &mut |line| service_log(line),
+    );
+    match step {
+        crate::stale_composer::Step::Held(reason) => {
+            held(run, reason);
+            false
+        }
+        crate::stale_composer::Step::Cleared { .. } => {
+            run.last_held = None;
+            true
+        }
+        _ => {
+            run.last_held = None;
+            false
+        }
+    }
 }
 
 #[derive(Debug, Default)]
@@ -4334,6 +4481,9 @@ struct DeliveryWatch {
     next_scan: Instant,
     // The requests the last scan found pending or submitting, oldest admission first.
     retry_keys: Vec<String>,
+    // Whether the last scan found a pending request whose last attempt was refused because the
+    // agent's composer held text.
+    composer_blocked: bool,
     log: StallLog,
     // The alarm last written, so the file is written only when the list changes. `None` until a
     // write succeeds, and again from the start of each write until it succeeds: a failed write
@@ -4368,6 +4518,7 @@ impl DeliveryWatch {
             timing,
             next_scan: Instant::now(),
             retry_keys: Vec::new(),
+            composer_blocked: false,
             log: StallLog::default(),
             written: None,
             known: None,
@@ -4407,6 +4558,7 @@ impl DeliveryWatch {
     ) -> Vec<String> {
         self.next_scan = Instant::now() + self.timing.retry_interval;
         self.retry_keys.clear();
+        self.composer_blocked = false;
         let (typed, mut problem) = self.reconcile(state, delivery);
         self.unrouted.extend(typed.iter().cloned());
         for key in std::mem::take(&mut self.unrouted) {
@@ -4516,6 +4668,13 @@ impl DeliveryWatch {
             })
             .map(|entry| entry.key.clone())
             .collect();
+        self.composer_blocked = entries.iter().any(|entry| {
+            entry.phase == RequestPhase::Pending
+                && entry
+                    .reason
+                    .as_deref()
+                    .is_some_and(|reason| reason.contains(chat_runtime::COMPOSER_PREVIEW_MARKER))
+        });
         let alarm = DeliveryAlarm::new(&entries, now_millis, self.timing.stall_after);
         // Each record is read on its own, so one that cannot be read does not hold back the
         // others, and the problem is reported. A record that cannot be read keeps the value last
@@ -10129,6 +10288,7 @@ esac
                 &notice_receiver,
                 &reply_wakes,
                 &mut transport,
+                None,
             );
             // The loop ends at its next check of the stop, or with a cancelled Herdr call when
             // the stop interrupts one, as it does in `chat run`.
@@ -12515,6 +12675,7 @@ printf '{"version":1,"id":"%s","action":"send","ok":true,"receipt":{"message_id"
             ready_timeout: Duration::ZERO,
             working_timeout: Duration::from_secs(5),
             max_attempts: 1,
+            deliver_while_working: false,
         }
     }
 
@@ -12572,6 +12733,28 @@ printf '{"version":1,"id":"%s","action":"send","ok":true,"receipt":{"message_id"
             turn.status(status);
             assert_eq!(turn.ready(), ready, "{status:?}");
         }
+    }
+
+    #[test]
+    fn with_deliver_while_working_a_working_claude_pane_is_ready_for_a_prompt() {
+        let mut turn = TurnEvidence {
+            while_working: true,
+            ..TurnEvidence::default()
+        };
+        for (status, agent, ready) in [
+            ("working", Some("claude"), true),
+            ("working", Some("codex"), false),
+            ("working", None, false),
+            ("idle", Some("codex"), true),
+            ("blocked", Some("claude"), false),
+        ] {
+            turn.agent_status(status, agent);
+            assert_eq!(turn.ready(), ready, "{status:?} {agent:?}");
+            assert_eq!(turn.working(), status == "working", "{status:?}");
+        }
+        let mut turn = TurnEvidence::default();
+        turn.agent_status("working", Some("claude"));
+        assert!(!turn.ready());
     }
 
     #[test]

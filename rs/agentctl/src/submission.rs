@@ -1016,6 +1016,11 @@ pub fn submit_verified(
             Some(current) if staged(&current, text, placeholders_before) => {
                 shown.note(&screen, Some(&current));
                 left_composer = false;
+                if now >= submit_deadline && runtime.withdraw_unaccepted_prompt() {
+                    return withdraw_unaccepted(
+                        terminal, pane_id, harness, &shown, presses, key, started, runtime,
+                    );
+                }
                 if now >= submit_deadline {
                     return Err(AdapterError::unavailable(format!(
                         "pane {pane_id}: prompt is still staged in the {harness} composer after \
@@ -1107,6 +1112,155 @@ pub fn submit_verified(
     }
 }
 
+/// Keys that move to the end of the composer's current row and delete back to its start. Each
+/// pair removes at most one row; a pair sent to a row that is already empty removes the line
+/// break before it in Codex, and the screen is read after each pair to see what it did.
+pub const CLEAR_ROW_KEYS: [&str; 2] = ["ctrl+e", "ctrl+u"];
+/// The key [`clear_composer`] sends when a pair of [`CLEAR_ROW_KEYS`] changed nothing, as on an
+/// empty row whose line break the row keys do not remove.
+pub const CLEAR_CHARACTER_KEY: &str = "backspace";
+/// Most pairs of [`CLEAR_ROW_KEYS`] one [`clear_composer`] sends.
+pub const MAX_CLEAR_ROUNDS: usize = 64;
+
+/// What a composer holds, as [`clear_composer`] compares it between reads: its rows as drawn,
+/// each without trailing blanks, so an empty last row still counts as a row.
+fn composer_content(view: &ComposerView) -> String {
+    view.composer
+        .lines()
+        .map(str::trim_end)
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Whether `view` shows an empty composer: no solid text and no paste placeholder. Faint
+/// placeholder and hint text, such as Claude Code's `Press up to edit queued messages`, and the
+/// reverse-video cursor cell do not count.
+#[must_use]
+pub fn composer_is_empty(view: &ComposerView) -> bool {
+    view.composer_solid.trim().is_empty() && paste_placeholders(&view.composer) == 0
+}
+
+/// Delete everything in the composer of `harness` in `pane_id` without submitting it, and prove
+/// from the screen that it is empty.
+///
+/// Sends the [`CLEAR_ROW_KEYS`] pair, reads the screen, and repeats while the composer still
+/// holds text and the last pair changed it, for at most [`MAX_CLEAR_ROUNDS`] pairs. A pair that
+/// changed nothing is followed by one [`CLEAR_CHARACTER_KEY`]; if that changes nothing either,
+/// the clear fails. It also fails when the composer stops being recognisable, as when a dialog
+/// opens, or when the caller cancels. No key that submits, interrupts or opens a menu is sent.
+/// Returns the number of keys sent; an `Err` says what the composer was left holding, which may
+/// be less than it held before.
+pub fn clear_composer(
+    terminal: &dyn PromptTerminal,
+    pane_id: &str,
+    harness: &str,
+    runtime: &dyn AgentRuntime,
+) -> std::result::Result<u32, String> {
+    let read = || -> std::result::Result<ComposerView, String> {
+        let screen = terminal
+            .read_screen(pane_id)
+            .map_err(|error| format!("pane {pane_id}: composer read failed: {error}"))?;
+        composer_view(harness, &screen).ok_or_else(|| {
+            format!("pane {pane_id} no longer shows a recognisable {harness} composer")
+        })
+    };
+    let send = |key: &str| -> std::result::Result<(), String> {
+        if runtime.cancelled() {
+            return Err(format!("pane {pane_id}: composer clear was cancelled"));
+        }
+        terminal
+            .send_keys(pane_id, key)
+            .map_err(|error| format!("pane {pane_id}: key {key} failed: {error}"))
+    };
+    let mut view = read()?;
+    let mut keys = 0_u32;
+    for _ in 0..MAX_CLEAR_ROUNDS {
+        if composer_is_empty(&view) {
+            return Ok(keys);
+        }
+        let before = composer_content(&view);
+        for key in CLEAR_ROW_KEYS {
+            send(key)?;
+            keys += 1;
+        }
+        runtime.sleep(POLL);
+        view = read()?;
+        if composer_is_empty(&view) {
+            return Ok(keys);
+        }
+        if composer_content(&view) == before {
+            send(CLEAR_CHARACTER_KEY)?;
+            keys += 1;
+            runtime.sleep(POLL);
+            view = read()?;
+            if !composer_is_empty(&view) && composer_content(&view) == before {
+                return Err(format!(
+                    "pane {pane_id}: the {harness} composer did not change after {keys} clearing \
+                     key(s); it still holds text"
+                ));
+            }
+        }
+    }
+    if composer_is_empty(&view) {
+        return Ok(keys);
+    }
+    Err(format!(
+        "pane {pane_id}: the {harness} composer still holds text after {keys} clearing key(s)"
+    ))
+}
+
+/// Take a prompt that the agent never accepted back out of its composer, for
+/// [`AgentRuntime::withdraw_unaccepted_prompt`]. Nothing was submitted when the composer is
+/// proved empty and the screen shows nothing the pane printed after the submission key: the
+/// prompt is then reported as not typed, so it stays pending. Any other outcome is an error,
+/// which the caller treats as possibly submitted, as it treats a prompt left staged.
+#[allow(clippy::too_many_arguments)]
+fn withdraw_unaccepted(
+    terminal: &dyn PromptTerminal,
+    pane_id: &str,
+    harness: &str,
+    shown: &ShownBefore,
+    presses: u32,
+    key: &str,
+    started: Duration,
+    runtime: &dyn AgentRuntime,
+) -> Result<Submission> {
+    let elapsed = runtime.monotonic().saturating_sub(started).as_secs_f64();
+    let left = |detail: String| {
+        Err(AdapterError::unavailable(format!(
+            "pane {pane_id}: prompt is still staged in the {harness} composer after {presses} \
+             {key} key press(es) over {elapsed:.1}s; taking it back out failed, so it is left \
+             there and treated as possibly submitted: {detail}"
+        )))
+    };
+    if let Err(detail) = clear_composer(terminal, pane_id, harness, runtime) {
+        return left(detail);
+    }
+    let screen = match terminal.read_screen(pane_id) {
+        Ok(screen) => screen,
+        Err(error) => return left(format!("the screen read after the clear failed: {error}")),
+    };
+    let Some(view) = composer_view(harness, &screen) else {
+        return left(format!(
+            "pane {pane_id} no longer shows a recognisable {harness} composer"
+        ));
+    };
+    if !composer_is_empty(&view) {
+        return left("the composer is not empty after the clear".to_owned());
+    }
+    if let Some(evidence) = printed(&view, &screen, shown) {
+        return Err(AdapterError::unavailable(format!(
+            "pane {pane_id}: the prompt may have been accepted while it was taken back out of the \
+             {harness} composer ({evidence}); outcome is unknown"
+        )));
+    }
+    Ok(Submission::NotStaged(format!(
+        "pane {pane_id}: the {harness} agent did not accept the prompt after {presses} {key} key \
+         press(es) over {elapsed:.1}s; it was taken back out of the composer, which is empty \
+         again, so nothing was submitted"
+    )))
+}
+
 /// Scriptable agent composer shared by the submission and queue tests.
 #[cfg(test)]
 pub(crate) mod fake {
@@ -1148,6 +1302,11 @@ pub(crate) mod fake {
         /// A busy Claude queues a prompt without showing any of it above the composer, as it does
         /// for a prompt queued behind another that it already holds.
         pub queued_hidden: bool,
+        /// The clearing keys `ctrl+u` and `backspace` change nothing, as in a composer that
+        /// binds them to something else.
+        pub ignore_clear_keys: bool,
+        /// Every submission key, Enter or Tab, is dropped; editing keys still work.
+        pub drop_submit_keys: bool,
         stale_screen: Option<String>,
         pending_reads: u32,
         paste_counter: u32,
@@ -1289,10 +1448,40 @@ pub(crate) mod fake {
                 state.drop_keys -= 1;
                 return Ok(());
             }
+            if state.drop_submit_keys && matches!(keys, "Enter" | "Tab") {
+                return Ok(());
+            }
             let before = render(&state, false);
             let text = state.composer.clone();
             if text.is_empty() {
                 return Ok(());
+            }
+            // Editing keys, modelled with the cursor at the end of the composer: `ctrl+e` moves
+            // nothing, `ctrl+u` deletes the last row, or on an empty last row the line break
+            // before it in Codex only, and `backspace` deletes one character. A paste
+            // placeholder goes as a whole.
+            match keys {
+                "ctrl+e" => return Ok(()),
+                "ctrl+u" | "backspace" if state.ignore_clear_keys => return Ok(()),
+                "ctrl+u" | "backspace" if state.placeholder.is_some() => {
+                    state.composer.clear();
+                    state.placeholder = None;
+                    return Ok(());
+                }
+                "ctrl+u" => {
+                    let start = text.rfind('\n').map_or(0, |index| index + 1);
+                    if start < text.len() {
+                        state.composer.truncate(start);
+                    } else if state.harness == "codex" {
+                        state.composer.truncate(start - 1);
+                    }
+                    return Ok(());
+                }
+                "backspace" => {
+                    state.composer.pop();
+                    return Ok(());
+                }
+                _ => {}
             }
             match (state.harness, keys) {
                 ("claude", "Enter") => {
@@ -1352,6 +1541,7 @@ mod tests {
     struct Clock {
         millis: AtomicU64,
         cancel: AtomicBool,
+        withdraw: AtomicBool,
     }
 
     impl AgentRuntime for Clock {
@@ -1368,6 +1558,10 @@ mod tests {
 
         fn cancelled(&self) -> bool {
             self.cancel.load(Ordering::SeqCst)
+        }
+
+        fn withdraw_unaccepted_prompt(&self) -> bool {
+            self.withdraw.load(Ordering::SeqCst)
         }
     }
 
@@ -3160,5 +3354,171 @@ mod tests {
             runtime.monotonic() - Duration::from_millis(1_000_000),
             Duration::from_millis(500)
         );
+    }
+
+    /// A busy Claude Code screen captured from a live pane (task names removed): Claude Code
+    /// holds a queued prompt, so its empty composer shows the reverse-video cursor on `P` and the
+    /// faint hint `ress up to edit queued messages`. Rows end in CR LF, as Herdr returns them.
+    fn captured_busy_claude_with_queue_hint() -> String {
+        let rule = format!(
+            "\u{1b}[0m\u{1b}[38;2;136;136;136m{}\u{1b}[0m",
+            "─".repeat(152)
+        );
+        [
+            "  \u{1b}[0m\u{1b}[38;2;153;153;153mearlier output\u{1b}[0m",
+            "\u{1b}[0m\u{1b}[38;2;215;119;87m· \u{1b}[0m\u{1b}[38;2;225;139;107mQuantumizing…\u{1b}[0m\u{1b}[38;2;215;119;87m \u{1b}[0m\u{1b}[38;2;153;153;153m(running UserPromptSubmit hooks… 9/10 · 10m 8s · ↓\u{1b}[0m \u{1b}[0m\u{1b}[38;2;153;153;153m21.2k tokens)\u{1b}[0m",
+            &rule,
+            "\u{1b}[0m\u{1b}[38;2;153;153;153m❯\u{a0}\u{1b}[0m\u{1b}[7mP\u{1b}[0m\u{1b}[2mress up to edit queued messages\u{1b}[0m",
+            &rule,
+            "  \u{1b}[0m\u{1b}[38;2;255;107;128m⏵⏵ bypass permissions on\u{1b}[0m\u{1b}[38;2;153;153;153m (shift+tab to cycle) · esc to interrupt · ← 2 agents · ↓ to manage\u{1b}[0m",
+            "",
+        ]
+        .join("\r\n")
+    }
+
+    /// An idle Claude Code screen captured from a live pane (transcript removed): the empty
+    /// composer shows only the reverse-video cursor cell.
+    fn captured_idle_claude() -> String {
+        let rule = format!(
+            "\u{1b}[0m\u{1b}[38;2;136;136;136m{}\u{1b}[0m",
+            "─".repeat(152)
+        );
+        [
+            "\u{1b}[0m\u{1b}[38;2;153;153;153m✻\u{1b}[0m \u{1b}[0m\u{1b}[38;2;153;153;153mCooked for 2m 8s · done 7:09 PM\u{1b}[0m",
+            &rule,
+            "❯\u{a0}\u{1b}[0m\u{1b}[7m \u{1b}[0m",
+            &rule,
+            "  \u{1b}[0m\u{1b}[38;2;255;193;7m⏵⏵ auto mode on\u{1b}[0m",
+            "",
+        ]
+        .join("\r\n")
+    }
+
+    #[test]
+    fn claude_hint_text_and_cursor_in_an_empty_composer_are_not_a_draft() {
+        for (label, screen) in [
+            ("queue hint", captured_busy_claude_with_queue_hint()),
+            ("idle", captured_idle_claude()),
+        ] {
+            let view = composer_view("claude", &screen).expect(label);
+            assert!(composer_is_empty(&view), "{label}: {view:?}");
+        }
+        let busy = composer_view("claude", &captured_busy_claude_with_queue_hint()).unwrap();
+        assert!(busy.composer.contains("ress up to edit queued messages"));
+        assert_eq!(
+            running_turn(&captured_busy_claude_with_queue_hint()),
+            Some(true)
+        );
+        assert_eq!(running_turn(&captured_idle_claude()), Some(false));
+        // A typed draft in the same frame does count.
+        let drafted = captured_idle_claude().replace(
+            "❯\u{a0}\u{1b}[0m\u{1b}[7m \u{1b}[0m",
+            "❯\u{a0}muse-wonder-full-1.0\u{1b}[0m\u{1b}[7m \u{1b}[0m",
+        );
+        let view = composer_view("claude", &drafted).unwrap();
+        assert!(!composer_is_empty(&view));
+        assert_eq!(view.composer_solid.trim(), "muse-wonder-full-1.0");
+    }
+
+    #[test]
+    fn a_busy_claude_with_only_the_queue_hint_is_typed_into_and_the_prompt_is_queued() {
+        // The hint the captured frame shows: the composer is empty, so the prompt is typed.
+        let screen = FakeScreen::new("claude", true);
+        screen.state().queued.push("an earlier prompt".to_owned());
+        screen.state().queued_hidden = true;
+        let receipt = receipt(submit(&screen, "check the build"));
+        assert_eq!(receipt.key, "Enter");
+        let state = screen.state();
+        assert_eq!(state.queued, ["an earlier prompt", "check the build"]);
+        assert!(state.composer.is_empty());
+    }
+
+    #[test]
+    fn clear_composer_deletes_every_row_and_proves_the_composer_empty() {
+        for harness in ["claude", "codex"] {
+            let screen = FakeScreen::new(harness, false);
+            screen.state().composer = "first row\nsecond row\nthird".to_owned();
+            let clock = Clock::default();
+            let keys = clear_composer(&screen, "w1:p1", harness, &clock).expect(harness);
+            assert!(keys >= 6, "{harness}: {keys}");
+            let state = screen.state();
+            assert!(state.composer.is_empty(), "{harness}: {:?}", state.composer);
+            assert!(state.submitted.is_empty() && state.queued.is_empty());
+            assert!(
+                state
+                    .keys
+                    .iter()
+                    .all(|key| ["ctrl+e", "ctrl+u", "backspace"].contains(&key.as_str())),
+                "{harness}: {:?}",
+                state.keys
+            );
+        }
+    }
+
+    #[test]
+    fn clear_composer_fails_without_progress_and_reports_the_text_left() {
+        let screen = FakeScreen::new("claude", false);
+        screen.state().composer = "keep me".to_owned();
+        screen.state().ignore_clear_keys = true;
+        let error = clear_composer(&screen, "w1:p1", "claude", &Clock::default()).unwrap_err();
+        assert!(error.contains("did not change"), "{error}");
+        assert_eq!(screen.state().composer, "keep me");
+        assert_eq!(screen.state().keys, ["ctrl+e", "ctrl+u", "backspace"]);
+    }
+
+    #[test]
+    fn a_prompt_a_working_claude_never_accepts_is_withdrawn_and_reported_not_typed() {
+        let screen = FakeScreen::new("claude", true);
+        screen.state().drop_submit_keys = true;
+        let clock = Clock::default();
+        clock.withdraw.store(true, Ordering::SeqCst);
+        let outcome = submit_verified(
+            &screen,
+            "w1:p1",
+            "claude",
+            "check the build",
+            SubmitTimeouts::default(),
+            &clock,
+        );
+        let reason = refusal(outcome);
+        assert!(
+            reason.contains("taken back out of the composer"),
+            "{reason}"
+        );
+        let state = screen.state();
+        assert!(state.composer.is_empty(), "{:?}", state.composer);
+        assert!(state.queued.is_empty() && state.submitted.is_empty());
+        assert!(state.keys.iter().filter(|key| *key == "Enter").count() > 1);
+        assert!(state.keys.iter().any(|key| key == "ctrl+u"));
+    }
+
+    #[test]
+    fn a_prompt_never_accepted_is_left_staged_without_the_withdrawal_request() {
+        let screen = FakeScreen::new("claude", true);
+        screen.state().drop_keys = u32::MAX;
+        let error = submit(&screen, "check the build").unwrap_err();
+        assert!(error.to_string().contains("still staged"), "{error}");
+        assert_eq!(screen.state().composer, "check the build");
+        assert!(!screen.state().keys.iter().any(|key| key == "ctrl+u"));
+    }
+
+    #[test]
+    fn a_prompt_that_cannot_be_withdrawn_stays_possibly_submitted() {
+        let screen = FakeScreen::new("claude", true);
+        screen.state().drop_keys = u32::MAX;
+        screen.state().ignore_clear_keys = true;
+        let clock = Clock::default();
+        clock.withdraw.store(true, Ordering::SeqCst);
+        let error = submit_verified(
+            &screen,
+            "w1:p1",
+            "claude",
+            "check the build",
+            SubmitTimeouts::default(),
+            &clock,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("possibly submitted"), "{error}");
+        assert_eq!(screen.state().composer, "check the build");
     }
 }

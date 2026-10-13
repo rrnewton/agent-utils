@@ -270,6 +270,7 @@ fn run(args: Args) -> Result<i32, CliError> {
         ready_timeout: Duration::from_secs_f64(args.ready_timeout),
         working_timeout: Duration::from_secs_f64(args.working_timeout),
         max_attempts: args.max_attempts,
+        deliver_while_working: false,
     };
     match command {
         "send" => {
@@ -393,6 +394,7 @@ fn run_managed(args: Args) -> Result<i32, CliError> {
         ready_timeout: Duration::from_secs_f64(args.ready_timeout),
         working_timeout: Duration::from_secs_f64(args.working_timeout),
         max_attempts: args.max_attempts,
+        deliver_while_working: false,
     };
     let name = name.unwrap_or_default();
     match command {

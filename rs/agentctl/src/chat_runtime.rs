@@ -13067,7 +13067,7 @@ fn bounded_detail(value: &str, maximum: usize) -> String {
 }
 
 // What a refusal to type over the agent's draft says just before it quotes the start of the draft.
-const COMPOSER_PREVIEW_MARKER: &str = "composer already holds unsubmitted text ";
+pub(crate) const COMPOSER_PREVIEW_MARKER: &str = "composer already holds unsubmitted text ";
 
 /// `detail` with every quoted composer draft replaced by `(text not shown)`. A refusal to type
 /// over text in the agent's composer quotes the start of that text, which is the agent's or a
