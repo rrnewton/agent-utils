@@ -1,6 +1,6 @@
 ---
 title: 'read-aloud-overlong: a full read stalls about 75 s mid-response and runs far past its spoken length'
-status: in_progress
+status: closed
 priority: 2
 issue_type: bug
 assignee: opus-5.5/read-aloud-overlong
@@ -10,7 +10,8 @@ labels:
 depends_on:
   agent-utils-37: discovered-from
 created_at: 2026-09-26T09:35:28.961358042+00:00
-updated_at: 2026-10-03T09:44:47.799223895+00:00
+updated_at: 2026-10-13T09:47:58.679697370+00:00
+closed_at: 2026-10-13T09:47:58.679697250+00:00
 claimed_at: 2026-09-26T09:35:28.963597195+00:00
 claimed_until: 2026-09-28T09:35:28.963455011+00:00
 ---
