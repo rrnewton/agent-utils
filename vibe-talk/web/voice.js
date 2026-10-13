@@ -24855,6 +24855,9 @@ function renderSideMode() {
   if (leftEl("side-list").hidden === !thread) leftEl("side-list").hidden = thread;
   if (leftEl("side-pane").hidden === thread) leftEl("side-pane").hidden = !thread;
   if (leftEl("side-close").hidden === thread) leftEl("side-close").hidden = !thread;
+  // The jump to a thread's newest message is the thread's: over the cards it would jump in a list that
+  // is not on screen. A thread selected again decides it afresh (`renderJumpNewest`).
+  if (!thread && !leftEl("side-jump-newest").hidden) leftEl("side-jump-newest").hidden = true;
   renderSideUnreadToggle();
   renderSideColumn();
   scheduleColumnLinks();

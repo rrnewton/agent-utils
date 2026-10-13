@@ -40879,6 +40879,23 @@ test("`#261 two-column-connectors` x `#226 page-energy-profile`: one frame for a
   }
 });
 
+test("`#261 two-column-connectors`: the jump to a thread's newest message goes with the thread, and is not left over the cards", async () => {
+  const page = newPage();
+  const messages = runThread(page, { tail: RUN_TAIL });
+  await signIn(page);
+  await showDiscord(page, messages);
+  await twoColumns(page);
+  await threadBadge(rowWithId(page, runId(0))).click();
+  await page.settle();
+  const side = page.el("side-scroll");
+  side.scrollTop = 0;
+  await side.dispatch("scroll");
+  assert.equal(page.el("side-jump-newest").hidden, false, "the thread scrolled up offers no jump, so this proves nothing");
+  await page.el("side-close").click();
+  await page.settle();
+  assert.equal(page.el("side-jump-newest").hidden, true, "the thread's jump to its newest message was left over the cards");
+});
+
 // --- the search over the cards reaches the replies the page holds -----------------------------------
 //
 // The owner asked whether the right column's search should find a thread by what was said in it, not
