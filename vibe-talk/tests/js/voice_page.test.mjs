@@ -34910,7 +34910,8 @@ test("`#269 approval-card-inline`: Hang up with a draft waiting retires it with 
   assert.equal(page.el("post-confirm").hidden, true, "a Send button outlived the call it was hung up on");
   assert.deepEqual(fateShapes(page).slice(-2), ["NOT SENT ended", "seam[ends conv_hung]"]);
   const live = seamDetail(notSentLines(page)[0]);
-  assert.match(live, /^You hung up with a draft still waiting, so nothing was posted\./);
+  // True even if a reloaded page sends the draft before it lapses: Hang up put it away on this page only.
+  assert.equal(live, "You hung up with a draft still waiting, so it was not posted then, and the page stopped offering it.");
   assert.deepEqual(keptMarkers(page), [{ id: "conv_hung", marker: { kind: "not_sent", why: "ended", serial: pending.serial } }]);
 
   // A reload draws the same line, in the same words, in the same place.

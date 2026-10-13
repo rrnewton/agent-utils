@@ -11212,7 +11212,13 @@ function postRecord(conversationId, body) {
 // Nothing for a draft a newer one replaced (the newer one is on the card), one that was committed (the
 // send memory draws what went), or one somebody else withdrew.
 
-/** What a "Not sent" line says, per reason. A spoken no's is `SPOKEN_YES_SEAMS.declined`. */
+/**
+ * What a "Not sent" line says, per reason. A spoken no's is `SPOKEN_YES_SEAMS.declined`.
+ *
+ * `ended` stays true whatever comes after it: Hang up only puts the draft away on this page, and the
+ * server keeps it until it lapses, so a reloaded page can still offer it, and a tap there still sends
+ * it — under this line, as a card of its own.
+ */
 const NOT_SENT_SEAMS = {
   withdrawn:
     "You tapped Don't send, so the draft was withdrawn and nothing was posted. Ask the assistant " +
@@ -11221,8 +11227,8 @@ const NOT_SENT_SEAMS = {
     "The draft lapsed before anyone sent it, so nothing was posted. Ask the assistant to draft it " +
     "again if you still want it sent.",
   ended:
-    "You hung up with a draft still waiting, so nothing was posted. A new call does not offer that " +
-    "draft again.",
+    "You hung up with a draft still waiting, so it was not posted then, and the page stopped " +
+    "offering it.",
 };
 
 /**
@@ -12411,8 +12417,10 @@ async function cancelBySpokenNo() {
 // the card, and the card is what answers. So the row of a user turn that could still become a yes to
 // the card is drawn hidden from its first frame (`data-absorbed`), and stays hidden only if that yes
 // sends. Anything else shows it again, in its own place. The asymmetry is deliberate: a turn that
-// starts like a yes and becomes something else appears a frame late; a yes never appears and then
-// vanishes.
+// starts like a yes and becomes something else appears a frame late; a yes that is acted on does not
+// flash up first. The one exception is a yes whose commit's answer was lost: it is shown again,
+// because nobody can yet say it sent, and hidden again if the send memory then reports the send
+// approved by voice (`absorbAnswerRow`).
 //
 // The RECORD always keeps the yes, as an ordinary `you` turn, tagged `answer: <serial>` when the page
 // had acted on it by the time it was filed. A reload hides it only when a `sent` row approved by voice
