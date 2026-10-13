@@ -4862,6 +4862,18 @@ a.search-hit-link {
   border-color: var(--accent);
 }
 
+/* `#267 quote-reply`. Words selected in the message make its Reply a Quote reply, in the accent as
+   Draft beside it is, whether or not the row is selected or holds the focus. As specific as the
+   touch rule just above and after it, so it is drawn over that and the rules before it, which would
+   otherwise draw it in the ink. */
+:root #side-log li.discord-message .meta .reply-button[data-quote="true"],
+:root #discord-log li.discord-message .meta .reply-button[data-quote="true"],
+:root #pinned-log li.discord-message .meta .reply-button[data-quote="true"] {
+  color: var(--accent);
+  border-color: var(--accent);
+  font-weight: 600;
+}
+
 /* THE CHANNEL ROW'S METADATA LINE MUST WRAP, and this is not tidying.
  *
  * It carries five things — author, time, message id, the fold control and the reply control — and

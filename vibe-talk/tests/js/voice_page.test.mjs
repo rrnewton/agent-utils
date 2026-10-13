@@ -3692,6 +3692,15 @@ const TUNING_BANDS = {
     "subject. Under two, 'make it so' and 'fire away' leave the agent waiting in silence after its " +
     "'One moment.'; past three, 'change it to Friday' and 'what time is it' are answered as refused " +
     "yeses while the agent is already acting on them"],
+  // `#267 quote-reply`.
+  QUOTE_MAX_CHARS: [300, 1500,
+    "the longest quote Quote reply puts in the box. Under three hundred, two sentences of a long " +
+    "paragraph are cut before their point; past fifteen hundred the quote alone takes most of a " +
+    "Discord message (2,000 characters) and pushes the answer into a second part"],
+  QUOTE_HOLD_MS: [500, 3000,
+    "how long after a touch a selection that went away still quotes. Under half a second, a phone " +
+    "that clears the selection as the tap on Reply lands, before its click, loses the quote; past " +
+    "three, a Reply pressed long after the words were let go still quotes words no longer shown"],
 };
 test("every number this page is tuned by stays inside a band that says what would be wrong", () => {
   for (const [name, [low, high, why]] of Object.entries(TUNING_BANDS)) {

@@ -6842,7 +6842,10 @@ function columnFromKeyboard(right) {
   return true;
 }
 
-/** r: reply to the selected message, on the Reply screen with its box ready to type in. */
+/**
+ * r: reply to the selected message, on the Reply screen with its box ready to type in. With words of
+ * that message selected, its Reply is Quote reply, and r presses that (`#267 quote-reply`).
+ */
 function replyFromKeyboard(target) {
   const pressed = pressRowButton(target, "reply-button");
   if (pressed === null) return false;
@@ -7422,7 +7425,7 @@ const KEYMAP = [
   },
   {
     group: KEYS_MESSAGE, chords: [{ key: "r" }],
-    does: "Reply",
+    does: "Reply. With words of it selected, Quote reply: the reply starts with them quoted",
     rowControls: ["reply-button"],
     run: (event, target) => replyFromKeyboard(target),
   },
@@ -20933,17 +20936,36 @@ let countedOutgoingKey = "";
 /** Say on a row's Reply how many replies it has: "Reply (2)", and in words to a screen reader. */
 function labelReplyButton(button, count) {
   if (!button) return;
-  const text = count > 0 ? `Reply (${count})` : "Reply";
+  button.replyCount = count;
+  drawReplyLabel(button);
+}
+
+/**
+ * A row's Reply as it stands: how many replies it has (`labelReplyButton`), and whether a press now
+ * quotes the text selected in its message, as "Quote reply" (`#267 quote-reply`). Writes only what
+ * changed.
+ */
+function drawReplyLabel(button) {
+  const count = Number(button.replyCount) || 0;
+  const quoting = quoteHeld !== null && quoteHeld.button === button;
+  const word = quoting ? "Quote reply" : "Reply";
+  const counted = quoting ? `Quote reply (${count})` : `Reply (${count})`;
+  const text = count > 0 ? counted : word;
   if (button.textContent !== text) button.textContent = text;
-  if (count > 0) {
-    const name = `Reply, ${countOf(count)} already`;
-    if (button.getAttribute("aria-label") !== name) button.setAttribute("aria-label", name);
-    const title = `${REPLY_BUTTON_TITLE}. It has ${countOf(count)} already.`;
-    if (button.getAttribute("title") !== title) button.setAttribute("title", title);
-  } else if (button.hasAttribute("aria-label")) {
-    button.removeAttribute("aria-label");
-    button.setAttribute("title", REPLY_BUTTON_TITLE);
+  if (quoting !== button.hasAttribute("data-quote")) {
+    if (quoting) button.setAttribute("data-quote", "true");
+    else button.removeAttribute("data-quote");
   }
+  const lead = quoting ? QUOTE_REPLY_TITLE : REPLY_BUTTON_TITLE;
+  if (count > 0) {
+    const name = `${word}, ${countOf(count)} already`;
+    if (button.getAttribute("aria-label") !== name) button.setAttribute("aria-label", name);
+    const title = `${lead}. It has ${countOf(count)} already.`;
+    if (button.getAttribute("title") !== title) button.setAttribute("title", title);
+    return;
+  }
+  if (button.hasAttribute("aria-label")) button.removeAttribute("aria-label");
+  if (button.getAttribute("title") !== lead) button.setAttribute("title", lead);
 }
 
 /**
@@ -23008,7 +23030,10 @@ function discordNode(messages) {
   //
   // THE ANSWER GOES TO THE FIRST CONSTITUENT. A glommed row is a primary message with a tail
   // hanging off it, and threading a reply under the tail would put the answer under a fragment.
-  reply.addEventListener("click", inThisColumn(() => openReply(messages, li)));
+  //
+  // `#267 quote-reply`. With words of this message selected it is Quote reply, and the reply opens
+  // with them quoted. The same screen and the same routing: only the box's first lines differ.
+  reply.addEventListener("click", inThisColumn(() => openReply(messages, li, takeQuote(reply))));
   sayRowShortcut(reply, "reply-button");
   // `#193 compose-draft-loss`. Beside it, the reply still being written to this message, if any.
   meta.append(draftMarker(messages, li), reply);
@@ -26269,6 +26294,149 @@ function renderDraftMarkers() {
   }
 }
 
+// --- quoting part of a message in the reply to it ------------------------------------------------
+//
+// `#267 quote-reply`. The owner, 2026-10-13: "when I highlight part of a message, the Reply button
+// turns into 'Quote Reply' ... Clicking that button replies ... but it prepends `> SELECTED TEXT FOR
+// QUOTATION` and a blank line to the text input box where I type in the rest. This is a more
+// targeted quote reply than google chat's notion of using the whole message."
+//
+//   * WHAT IS QUOTED: text selected inside ONE message's drawn body. Not a selection across two rows,
+//     nor one reaching into the row's header line or its buttons, a message box, or the page's own
+//     controls: those leave every Reply as it was.
+//   * THE BUTTON SAYS WHAT A PRESS DOES. While there is such a selection, that row's Reply reads
+//     "Quote reply" ("Quote reply (2)" where it counts replies), in the accent. The label and the press
+//     read one record, `quoteHeld`, so they cannot disagree.
+//   * NO NEW WAY TO POST. The press opens the reply screen Reply opens, routed as Reply routes on that
+//     provider (`replyRoute`): a reply by pointer where the provider has one, and on Slack, which has
+//     none, the message's thread. Only the box's first lines differ.
+//   * A FINGER'S TAP CAN TAKE THE SELECTION FIRST. A phone's browser may clear the selection when the
+//     Reply under it is tapped, before the tap arrives as a click. So after a touch, a selection that
+//     goes away is kept for `QUOTE_HOLD_MS`, the label with it, and a press in that time still quotes.
+//     After the mouse or the keys it goes at once: Chromium keeps a selection through a click on a
+//     button (measured, tests/reply_continuity_browser.py), so there the label says only what is true.
+//   * THE QUOTE is the selection's text as the browser draws it: each run of spaces made one, each
+//     line trimmed, no more than one blank line together, the ends trimmed, cut at `QUOTE_MAX_CHARS`
+//     ending "…". Every line is led by "> ", a blank line inside it by ">", and one empty line follows,
+//     with the caret after it in the box, focused to write the rest. A draft already written to the
+//     message stays, under the quote; a quote left untouched is not a draft, so Cancel keeps the
+//     draft that was there before and nothing else.
+//   * NOT A GESTURE ON THE ROW. Dragging over a message's words neither folds it nor reads it aloud
+//     (`tapRow` passes over a click that ends a selection), and the click a drag ends with selects the
+//     row it was in, as any click in a row does (`#239 single-selection`): so `r` then quotes too. Text
+//     selected in another message than the selected one is not `r`'s: `r` answers the message it acts
+//     on, and plainly.
+
+/** The longest quote, in characters, the "…" that ends a longer one included. Help says so. */
+const QUOTE_MAX_CHARS = 1000;
+
+/** How long after a touch a selection that went away is still quoted, in milliseconds. */
+const QUOTE_HOLD_MS = 2000;
+
+/** Reply's tooltip while it is Quote reply. No channel data. */
+const QUOTE_REPLY_TITLE = "Reply to this message, starting with the words you selected in it quoted";
+
+/**
+ * The selection a press of its row's Reply quotes, or null: the row, its Reply, the text, and the
+ * timer that lets it go when a touch has taken the selection away.
+ *
+ * @type {{row: any, button: any, text: string, timer: any} | null}
+ */
+let quoteHeld = null;
+
+/** The row whose drawn body holds `node`, while that row is on a list and has a Reply; else null. */
+function quotableRow(node) {
+  let row = null;
+  for (let at = node; at && !row; at = at.parentNode) {
+    if (at.replyButton) row = at;
+  }
+  if (!row || !row.parentNode) return null;
+  const body = childByClass(row, "body");
+  return body && nodeWithin(body, node) ? row : null;
+}
+
+/**
+ * What is selected on the page, for Quote reply: `found`, the row and the text where every range of
+ * the selection lies in that one row's body and holds more than spaces; `stray`, whether something
+ * else is selected. Neither, where nothing is.
+ */
+function quotableSelection() {
+  const selection = typeof getSelection === "function" ? getSelection() : null;
+  if (!selection || selection.isCollapsed || !(selection.rangeCount > 0)) return { found: null, stray: false };
+  let row = null;
+  for (let at = 0; at < selection.rangeCount; at += 1) {
+    const own = quotableRow(selection.getRangeAt(at).commonAncestorContainer);
+    if (!own || (row !== null && own !== row)) return { found: null, stray: true };
+    row = own;
+  }
+  const text = String(selection);
+  return text.trim() ? { found: { row, text }, stray: false } : { found: null, stray: true };
+}
+
+/** Hold `next` as the selection to quote, or nothing, and redraw the Reply of each row it changes. */
+function holdQuote(next) {
+  const was = quoteHeld;
+  if (was && was.timer !== null) clearTimeout(was.timer);
+  quoteHeld = next;
+  const button = next ? next.button : null;
+  if (was && was.button !== button) drawReplyLabel(was.button);
+  if (button && (!was || was.button !== button)) drawReplyLabel(button);
+}
+
+/** `selectionchange`, and every press of a Reply: what Quote reply would quote now. */
+function noteQuoteSelection() {
+  const { found, stray } = quotableSelection();
+  if (found) {
+    if (!quoteHeld || quoteHeld.row !== found.row || quoteHeld.text !== found.text || quoteHeld.timer !== null) {
+      holdQuote({ row: found.row, button: found.row.replyButton, text: found.text, timer: null });
+    }
+  } else if (quoteHeld && (stray || inputKind !== "touch")) {
+    holdQuote(null);
+  } else if (quoteHeld && quoteHeld.timer === null) {
+    quoteHeld.timer = setTimeout(() => holdQuote(null), QUOTE_HOLD_MS);
+  }
+}
+
+/**
+ * What a press of `button` quotes: the selection held for its row, taken and cleared from the page,
+ * or "" for a plain Reply.
+ */
+function takeQuote(button) {
+  noteQuoteSelection();
+  if (!quoteHeld || quoteHeld.button !== button) return "";
+  const { text } = quoteHeld;
+  holdQuote(null);
+  const selection = typeof getSelection === "function" ? getSelection() : null;
+  if (selection && typeof selection.removeAllRanges === "function") selection.removeAllRanges();
+  return text;
+}
+
+/** `text` as the head of a reply: every line led by "> ", then one empty line. "" for nothing. */
+function quoteBlock(text) {
+  let said = String(text).replace(/\r\n?/g, "\n").split("\n")
+    .map((line) => line.replace(/[ \t\f\v\u00a0]+/g, " ").trim())
+    .join("\n").replace(/\n{3,}/g, "\n\n").trim();
+  if (said === "") return "";
+  if (said.length > QUOTE_MAX_CHARS) {
+    let cut = said.slice(0, QUOTE_MAX_CHARS - 1);
+    // At the end of a word, where one ends in the second half, rather than in the middle of one.
+    const end = /\s/.test(said[cut.length]) ? cut.length : cut.search(/\s\S*$/);
+    if (end > QUOTE_MAX_CHARS / 2) cut = cut.slice(0, end);
+    // Never half of a character written as two code units.
+    if (/[\ud800-\udbff]$/.test(cut)) cut = cut.slice(0, -1);
+    said = `${cut.trimEnd()}…`;
+  }
+  return `${said.split("\n").map((line) => (line === "" ? ">" : `> ${line}`)).join("\n")}\n\n`;
+}
+
+/**
+ * What the reply box was opened with when it was opened with a quote, and the draft that was there
+ * before it, so that Cancel on a quote left untouched keeps only that draft. Null otherwise.
+ *
+ * @type {{opened: string, draft: string} | null}
+ */
+let replyQuote = null;
+
 /**
  * Open the reply screen on one specific row.
  *
@@ -26282,10 +26450,14 @@ function renderDraftMarkers() {
  * `#247 reply-continuity`. `from` is the row Reply was pressed on, when it was pressed on one: the
  * message is drawn as that row is, and its top is put where that row's was (`placeReplyMessage`).
  *
+ * `#267 quote-reply`. `quote` is the text selected in the message when Reply was Quote reply: the box
+ * opens with it quoted, over any draft, and focused with the caret under it.
+ *
  * @param {Array<object>} messages
  * @param {HTMLElement | null} [from]
+ * @param {string} [quote]
  */
-function openReply(messages, from = null) {
+function openReply(messages, from = null, quote = "") {
   const message = messages[0];
   replyTarget = message;
   replyChannelId = el("discord-channel").value;
@@ -26308,7 +26480,12 @@ function openReply(messages, from = null) {
   el("reply-target-meta").textContent = `to ${
     message.author_is_bot ? `${message.author} (bot)` : String(message.author)
   } · id ${message.id}`;
-  el("reply-text").value = drafts.get(String(message.id)) || "";
+  const draft = drafts.get(String(message.id)) || "";
+  // The quote over the draft, once: a draft that already begins with this very quote keeps one.
+  const block = quote ? quoteBlock(quote) : "";
+  const opened = block && !draft.startsWith(block) ? `${block}${draft}` : draft;
+  el("reply-text").value = opened;
+  replyQuote = block ? { opened, draft } : null;
   el("reply-state").textContent = "";
   resetReplyContext();
   renderReplyContext();
@@ -26319,6 +26496,12 @@ function openReply(messages, from = null) {
   renderReplyDestination();
   replyFromTop = fromTop;
   placeReplyMessage(fromTop);
+  // The quote is the start of something to write: the box takes the focus, the caret under the quote.
+  if (block) {
+    const box = el("reply-text");
+    box.focus({ preventScroll: true });
+    if (typeof box.setSelectionRange === "function") box.setSelectionRange(block.length, block.length);
+  }
 }
 
 /**
@@ -26402,6 +26585,10 @@ function renderReplyTitle() {
 }
 
 function closeReply() {
+  // `#267 quote-reply`. A quote put in the box and left as it was is not a reply begun: the draft
+  // that was there before it is what is kept.
+  if (replyQuote && el("reply-text").value === replyQuote.opened) el("reply-text").value = replyQuote.draft;
+  replyQuote = null;
   rememberDraft();
   showScreen("main");
   if (replyScrollMark) {
@@ -26439,6 +26626,7 @@ async function sendReply() {
   draftStartsThread.delete(String(target.id));
   if (outgoingStorageOkay) persistDrafts();
   renderDraftMarkers();
+  replyQuote = null;
   el("reply-text").value = "";
   el("reply-state").textContent = "";
   // Do not call closeReply: its draft save would overwrite the fallback retained after a storage
@@ -31287,6 +31475,8 @@ for (const pane of KEY_PANES) {
 }
 document.addEventListener("pointermove", onPointerMove);
 document.addEventListener("pointerdown", onPointerDown);
+// `#267 quote-reply`. Words selected in one message make its Reply a Quote reply.
+document.addEventListener("selectionchange", noteQuoteSelection);
 // `#260 timestamp-hover`. A message's time says its day on hover, worded as the pointer arrives.
 document.addEventListener("pointerover", freshenDayTitle);
 // `#189 restore-ui-state`. The last moments a phone promises this page before it may reclaim it —
