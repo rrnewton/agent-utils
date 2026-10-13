@@ -11,7 +11,9 @@
 //!
 //! - [`ReadAhead::remember`] and [`ReadAhead::recall`]: every message this server fetches for a
 //!   page (`ops::messages`, `ops::page`, `ops::timeline`) is kept for [`RECENT_TTL`], and
-//!   preparation looks there first. Bounded by [`MAX_RECENT`].
+//!   preparation looks there first. Bounded by [`MAX_RECENT`]. Thread naming looks there too,
+//!   for a whole thread ([`ReadAhead::recall_thread`]), before it reads one from the provider
+//!   (`#278 naming-throttle`).
 //! - [`ReadAhead::window_turn`]: when several preparations for one channel miss together, one of
 //!   them fetches the window and the others wait for it, rather than queueing a second identical
 //!   fetch behind the first at the chat adapter. The summary route shares the same turn
@@ -302,6 +304,30 @@ impl ReadAhead {
             found.insert(id.clone(), entry.message.clone());
         }
         found
+    }
+
+    /// Every message of `thread` in `channel` fetched in the last [`RECENT_TTL`]: fetched in that
+    /// thread, or labelled with it on a page of the channel (a Flat page labels each reply). In no
+    /// particular order. `#278 naming-throttle`, remote-ops audit W5: what thread naming reads
+    /// before it asks the provider for the thread again.
+    #[must_use]
+    pub fn recall_thread(&self, channel: &ChannelId, thread: &str) -> Vec<Message> {
+        self.recall_thread_at(channel, thread, Instant::now())
+    }
+
+    fn recall_thread_at(&self, channel: &ChannelId, thread: &str, now: Instant) -> Vec<Message> {
+        let Ok(held) = self.held.lock() else {
+            return Vec::new();
+        };
+        held.recent
+            .iter()
+            .filter(|((held_in, _), entry)| {
+                held_in == channel
+                    && entry.thread.as_deref() == Some(thread)
+                    && now.saturating_duration_since(entry.fetched) < RECENT_TTL
+            })
+            .map(|(_, entry)| entry.message.clone())
+            .collect()
     }
 
     /// The window `read` fetched, oldest first, rebuilt from memory: `None` unless EVERY message it
@@ -684,6 +710,54 @@ mod tests {
             .recall(&channel, Some("elsewhere"), &wanted)
             .is_empty());
         assert_eq!(read_ahead.recall(&channel, None, &wanted).len(), 3);
+    }
+
+    #[test]
+    fn a_thread_is_recalled_whole_from_every_read_that_held_it_until_each_expires() {
+        // `#278 naming-throttle`. A Flat page labels a reply with its thread; a thread read files
+        // its messages under the thread it was scoped to. Both answer for the thread; another
+        // thread, another channel and an expired read do not.
+        let read_ahead = ReadAhead::new();
+        let channel = ChannelId("1".to_owned());
+        let then = Instant::now();
+        let later = then + Duration::from_secs(10);
+        read_ahead.remember_at(
+            &channel,
+            None,
+            &[
+                message("10", Some("T")),
+                message("11", Some("U")),
+                message("12", None),
+            ],
+            then,
+            then,
+        );
+        read_ahead.remember_at(&channel, Some("T"), &[message("13", None)], later, later);
+        read_ahead.remember_at(
+            &ChannelId("2".to_owned()),
+            Some("T"),
+            &[message("14", None)],
+            later,
+            later,
+        );
+        let mut held: Vec<String> = read_ahead
+            .recall_thread_at(&channel, "T", later)
+            .into_iter()
+            .map(|m| m.id.0)
+            .collect();
+        held.sort();
+        assert_eq!(held, ["10", "13"]);
+        let after_the_flat_page = then + RECENT_TTL;
+        let held: Vec<String> = read_ahead
+            .recall_thread_at(&channel, "T", after_the_flat_page)
+            .into_iter()
+            .map(|m| m.id.0)
+            .collect();
+        assert_eq!(held, ["13"], "the Flat page's copy expired first");
+        read_ahead.forget_at(&channel, &MessageId("13".to_owned()), after_the_flat_page);
+        assert!(read_ahead
+            .recall_thread_at(&channel, "T", after_the_flat_page)
+            .is_empty());
     }
 
     #[test]

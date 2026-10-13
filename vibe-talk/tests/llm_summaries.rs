@@ -1073,11 +1073,20 @@ async fn a_thread_sentence_cut_below_the_cap_is_shown_as_it_is_and_asked_again_o
         1,
         "the sentence filed whole was asked for again"
     );
+    let prompts = h.summarizer.thread_prompts();
     assert_eq!(
-        *h.threads.thread_reads.lock().unwrap(),
-        [THREADS[0]],
+        prompts.len(),
+        1,
         "only the sentence cut below the cap is asked for again"
     );
+    assert!(
+        prompts[0].contains("thread 0 starts here"),
+        "{}",
+        prompts[0]
+    );
+    // `#278 naming-throttle`: a thread with no replies is all there in the list's own root, so
+    // asking for its sentence again reads nothing.
+    assert!(h.threads.thread_reads.lock().unwrap().is_empty());
     let refiled = h
         .store
         .cached_summary(&sentence_key(

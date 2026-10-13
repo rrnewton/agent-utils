@@ -1506,12 +1506,28 @@ most three times in all.
 ### Thread names
 
 Names are produced **in the background, never on the read path**: a thread-list read by a
-write-scope token queues the threads that are due, and they are named one at a time — read the
+write-scope token queues the threads that are due, and they are named one at a time — find the
 thread's root and newest messages, one call, file the result. A read token is shown names that
 exist but never causes a call. A name produced after a page was read reaches it on its next
 refresh, a forward delta included. A thread whose naming failed is left alone for ten minutes. The
 model must answer a name of two to four lowercase hyphenated words (`[a-z0-9-]`, at most 40
 characters); any other answer fails that naming by name rather than being cut into shape.
+
+**Naming reads the chat provider as little as it can.** On a provider where one thread read is
+expensive (a bridge that rebuilds a whole space for each read), background naming used to be most
+of the thread reads a deployment made. So:
+
+* A thread whose messages this server has **just read** is named from them, with no read: the
+  thread list's own root, which is all of a thread with no replies, and what a thread page you
+  opened or a Flat page (which on a bridge carries every reply) brought in the last 30 seconds,
+  provided it holds every reply the thread's exact count says it has, or the newest 50. A queued
+  thread you open is named from that read straight away.
+* Any other thread costs one read, and naming reads **at most one thread per channel every 30
+  seconds**. Twenty unnamed threads in one channel are named over ten minutes, not in one burst;
+  other channels are not held behind them.
+* A thread read that fails with a 5xx, a timeout or a rate limit **stops naming reads of that
+  channel for ten minutes**. Threads of it that need a read are not queued meanwhile; the next
+  thread-list read after the pause queues them again.
 
 **A name is chosen once and kept.** Both halves live in the summary cache, by different rules:
 
