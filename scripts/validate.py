@@ -248,6 +248,10 @@ PREFIX_RULES: tuple[tuple[str, frozenset[str]], ...] = (
     # path-filtered self-run would otherwise skip. Exercise the complete portable graph and make
     # every plan output true so the edited compatibility lanes run as well.
     (".github/", frozenset(GROUPS)),
+    # The one exception: the Pages workflow has no compatibility lane and no validation of its own.
+    # It runs scripts/check_site.py and uploads site/, and the hygiene group already runs that
+    # checker on every change. The component manifest still selects the infrastructure tests.
+    (".github/workflows/pages.yml", frozenset()),
 )
 
 
@@ -983,6 +987,18 @@ def self_test() -> int:
         [".github/workflows/cross-dagrun.yml"],
         set(ALL_GROUPS),
         "a workflow edit runs the complete graph and every conditional compatibility lane",
+        {"repository-infrastructure"},
+    )
+    expect(
+        [".github/workflows/pages.yml"],
+        set(),
+        "the Pages deploy workflow runs only the website checker, which hygiene always runs",
+        {"repository-infrastructure"},
+    )
+    expect(
+        [".github/workflows/pages.yml.disabled"],
+        set(ALL_GROUPS),
+        "the Pages exemption names one exact file and must not bleed into other workflows",
         {"repository-infrastructure"},
     )
     expect(
