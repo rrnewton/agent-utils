@@ -33126,6 +33126,151 @@ test("signing out, or a token replaced underneath the page, forgets every channe
   assert.deepStrictEqual(savedUiState(other).channels, [], "the last token's choices were written under the new one's name");
 });
 
+// --- `#265 window-channel-memory`: each window of the page reopens on its own ------------------
+//
+// The owner, 2026-10-13, with two windows of the installed app on a desk, one left on each of two
+// channels: "refresh will not respect those selections." The channel and the reopen record were
+// kept only in the storage every window of the origin shares, so a reload came back on whatever the
+// window that wrote last had shown. Each window now keeps its own as well, in `sessionStorage`, and
+// the shared copy is what a brand-new window opens on. Here every `newPage` over the same map is
+// another window of one device, and a reload of a window is one handed that window's own storage.
+
+const ACTIVE_CHANNEL_KEY = "vibe-talk.voice.active-channel";
+/** The channel each history read was for, in order. */
+const channelsRead = (page) => channelReads(page).map((request) => request.split("/")[4]);
+
+/**
+ * A window on the two threaded channels over the device's `store`: a reload of a window when handed
+ * its own `session`, and a brand-new window, with nothing of its own, when not.
+ */
+const windowOnTwoChannels = (store, session = null, script = SCRIPT) => newPage(store, script, (p) => {
+  if (session) p.session = session;
+  p.messages = threadData().messages;
+  p.channels = [{ ...CHANNEL }, { ...OTHER_CHANNEL }];
+  p.threadingSupported = true;
+  p.threads = threadData().threads;
+});
+
+test("two windows left on two channels each reload on their own, and a new window opens on the one chosen last", async () => {
+  const run = async (script) => {
+    // The first window picks the second channel, and comes back to the first.
+    const one = windowOnTwoChannels(new Map(), null, script);
+    await signIn(one);
+    await showDiscord(one, threadData().messages);
+    await changeChannelTo(one, OTHER_CHANNEL.id);
+    await changeChannelTo(one, CHANNEL.id);
+    // A second window opens beside it, and is put on the second channel: the last choice made.
+    const two = windowOnTwoChannels(one.storage, null, script);
+    await reopenedChannel(two);
+    const twoOpenedOn = two.el("discord-channel").value;
+    await changeChannelTo(two, OTHER_CHANNEL.id);
+    await one.setVisibility("hidden");
+    await two.setVisibility("hidden");
+    // Each window is reloaded, and then a third is opened.
+    const oneAgain = windowOnTwoChannels(one.storage, one.session, script);
+    await reopenedChannel(oneAgain);
+    const twoAgain = windowOnTwoChannels(two.storage, two.session, script);
+    await reopenedChannel(twoAgain);
+    const three = windowOnTwoChannels(one.storage, null, script);
+    await reopenedChannel(three);
+    return { twoOpenedOn, oneAgain, twoAgain, three };
+  };
+  const { twoOpenedOn, oneAgain, twoAgain, three } = await run(SCRIPT);
+  assert.equal(twoOpenedOn, CHANNEL.id, "a new window did not open on the channel chosen last");
+  assert.equal(oneAgain.el("discord-channel").value, CHANNEL.id, "a reload took the channel another window chose");
+  assert.deepStrictEqual(channelsRead(oneAgain), [CHANNEL.id], "the reload read a channel other than its own");
+  assert.equal(twoAgain.el("discord-channel").value, OTHER_CHANNEL.id, "the second window's reload lost its channel");
+  assert.deepStrictEqual(channelsRead(twoAgain), [OTHER_CHANNEL.id]);
+  // A reload is not a choice: the first window coming back on its own channel left the last choice as it was.
+  assert.equal(three.storage.get(ACTIVE_CHANNEL_KEY), OTHER_CHANNEL.id, "a reload took back the choice another window made");
+  assert.equal(three.el("discord-channel").value, OTHER_CHANNEL.id, "a new window did not open on the channel chosen last");
+
+  // THE CONTROL: with the window's own channel passed over, the first window reloads onto the
+  // second's, as the owner's did, and this test fails.
+  const control = await run(brokenScript("  const own = windowItem(ACTIVE_CHANNEL_KEY);\n  if (own) return own;\n", ""));
+  assert.equal(control.oneAgain.el("discord-channel").value, OTHER_CHANNEL.id,
+    "the test cannot tell a window's own channel from the one chosen last");
+});
+
+test("two windows on one channel each reopen in their own view, with the device's read mode and the other's choices behind their own", async () => {
+  const run = async (script) => {
+    const one = windowOnTwoChannels(new Map(), null, script);
+    await signIn(one);
+    await showDiscord(one, threadData().messages);
+    await pickThread(one, "main");
+    // A second window opens in Main, the channel's choice; and then goes into a thread there, picks
+    // Main in the other channel, comes back, and turns Hide read on.
+    const two = windowOnTwoChannels(one.storage, null, script);
+    await reopenedChannel(two);
+    const twoOpenedIn = two.el("thread-select").value;
+    const id = two.threads[0].id;
+    // A finger touches the picker before it chooses: that reads the thread list, which names it.
+    await two.el("thread-select").dispatch("pointerdown");
+    await two.settle();
+    await pickThread(two, `thread:${id}`);
+    await changeChannelTo(two, OTHER_CHANNEL.id);
+    await pickThread(two, "main");
+    await changeChannelTo(two, CHANNEL.id);
+    await turnTodoOn(two);
+    await one.setVisibility("hidden");
+    await two.setVisibility("hidden");
+    const oneAgain = windowOnTwoChannels(one.storage, one.session, script);
+    await reopenedChannel(oneAgain);
+    const twoAgain = windowOnTwoChannels(two.storage, two.session, script);
+    await reopenedChannel(twoAgain);
+    return { id, twoOpenedIn, oneAgain, twoAgain };
+  };
+  const { id, twoOpenedIn, oneAgain, twoAgain } = await run(SCRIPT);
+  assert.equal(twoOpenedIn, "main", "a new window did not open in the view chosen in the channel");
+  assert.equal(oneAgain.el("discord-channel").value, CHANNEL.id);
+  assert.equal(oneAgain.el("thread-select").value, "main", "a reload opened in the view another window had open");
+  assert.equal(twoAgain.el("thread-select").value, `thread:${id}`, "the second window's reload lost its thread");
+  assert.equal(twoAgain.el("thread-title").textContent, "First discussion");
+  // The read mode is the device's, not a place: turned on in one window, a reload of the other has it.
+  for (const page of [oneAgain, twoAgain]) {
+    assert.equal(page.el("todo-filter").getAttribute("aria-pressed"), "true", "the read mode was not the device's");
+  }
+  // A view chosen in another window, in a channel this one chose none in, is honoured here too.
+  await changeChannelTo(oneAgain, OTHER_CHANNEL.id);
+  assert.equal(oneAgain.el("thread-select").value, "main", "the view chosen in another window was not honoured");
+
+  // THE CONTROL: with the window's own record passed over, the first window reopens in the second's thread.
+  const control = await run(brokenScript("  const own = readUiRecord(windowStore);", "  const own = null;"));
+  assert.equal(control.oneAgain.el("thread-select").value, `thread:${control.id}`,
+    "the test cannot tell a window's own view from the device's");
+});
+
+test("a window's channel the server stops listing falls back to its first, as before; signing out forgets the window's record", async () => {
+  const one = windowOnTwoChannels(new Map());
+  await signIn(one);
+  await showDiscord(one, threadData().messages);
+  await changeChannelTo(one, OTHER_CHANNEL.id);
+  await pickThread(one, "main");
+  await one.setVisibility("hidden");
+  assert.equal(one.session.get(ACTIVE_CHANNEL_KEY), OTHER_CHANNEL.id);
+  assert.equal(JSON.parse(one.session.get(UI_STATE_KEY)).channel, OTHER_CHANNEL.id);
+  const onlyFirst = (session) => newPage(one.storage, SCRIPT, (p) => {
+    if (session) p.session = session;
+    p.messages = threadData().messages;
+    p.channels = [{ ...CHANNEL }];
+    p.threadingSupported = true;
+    p.threads = threadData().threads;
+  });
+  // A reload of the window, and a brand-new window whose last choice is that channel: both on the first.
+  const again = onlyFirst(one.session);
+  await again.settle();
+  assert.equal(again.el("discord-channel").value, CHANNEL.id, "a reload kept a channel the server no longer lists");
+  assert.equal(again.session.get(ACTIVE_CHANNEL_KEY), CHANNEL.id, "the window still holds the channel that went");
+  const fresh = onlyFirst(null);
+  await fresh.settle();
+  assert.equal(fresh.el("discord-channel").value, CHANNEL.id, "a new window opened on a channel no longer listed");
+
+  // Signing out takes the record off the device and out of the window.
+  await again.el("forget-token").click();
+  assert.equal(again.storage.has(UI_STATE_KEY), false, "the record outlived the credential on the device");
+  assert.equal(again.session.has(UI_STATE_KEY), false, "the record outlived the credential in the window");
+});
+
 // --- `#203 incremental-refresh`: a refresh asks only for what changed ---------------------------
 //
 // The owner: "This is the common case inner loop for how we use the application all the time. It
