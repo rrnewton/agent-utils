@@ -179,8 +179,11 @@ pub enum DirectOutcome {
     InFlight,
     /// Posted, all of it.
     Sent,
-    /// Some of its parts were posted, and the rest were not, or not confirmed.
+    /// Some of its parts were posted, and the rest were not.
     Partly,
+    /// Some of its parts were posted, and whether the rest were could not be confirmed: the answer
+    /// for the part that failed was lost, so it may be in the channel too.
+    PartlyUnconfirmed,
     /// Nobody knows: the chat service's answer was lost, or the request was abandoned while the
     /// post was on its way.
     Unconfirmed,
@@ -194,6 +197,7 @@ impl DirectOutcome {
             Self::InFlight => "in_flight",
             Self::Sent => "sent",
             Self::Partly => "partly",
+            Self::PartlyUnconfirmed => "partly_unconfirmed",
             Self::Unconfirmed => "unconfirmed",
         }
     }
@@ -747,7 +751,11 @@ mod tests {
             .expect("nothing was posted, so trying again is allowed")
             .finish(None);
 
-        for outcome in [DirectOutcome::Partly, DirectOutcome::Unconfirmed] {
+        for outcome in [
+            DirectOutcome::Partly,
+            DirectOutcome::PartlyUnconfirmed,
+            DirectOutcome::Unconfirmed,
+        ] {
             let text = outcome.as_str();
             gate.begin_direct(binding(text))
                 .expect("first")

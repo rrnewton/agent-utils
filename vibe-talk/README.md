@@ -5174,15 +5174,18 @@ agent").
 **Off: `post_reply` posts.** It goes through `ops::reply`, the same function a confirmed proposal is
 posted with — the allowlist, the write policy, the emptiness check, reply targets and the splitting
 of a long message are the ones every other send gets. The model is told `SENT.` first, then where it
-went and the exact text posted (and how many messages, if it was long, and that the rest is in the
-thread under the first where the provider continues a long message there — `#263
-post-split-per-provider`). A refusal starts `NOT SENT.`, and one that failed partway `PARTLY SENT.
-The rest was NOT sent; do not send the whole message again.` — in both modes, so no failure reads as
-a send. A failure whose answer was lost — a timeout, a dropped connection, a gateway's 5xx, a
-success whose body did not parse — may have posted, so it starts `NOT CONFIRMED.` and tells the
-model not to call again for the same words; it is never called `NOT SENT`, because an owner told
-"not sent" says "try again". The prompt and the tool description say the same of a call that fails
-with no result at all, such as a hosted tool call that timed out.
+went and the exact text posted (and how many messages, if it was long, and where they went: the
+first in the channel and the rest in the thread under it where the provider continues a long message
+there — `#263 post-split-per-provider` — or all of them in the answered message's thread for a reply
+where the provider threads replies, as Slack does). A refusal starts `NOT SENT.`, and one that
+failed partway `PARTLY SENT. The rest was NOT sent; do not send the whole message again.`, or, when
+the answer for the part that failed was lost, `PARTLY SENT. Whether the rest was posted could not be
+confirmed` — in both modes, so no failure reads as a send. A failure whose answer was lost — a
+timeout, a dropped connection, a gateway's 5xx, a success whose body did not parse — may have
+posted, so it starts `NOT CONFIRMED.` and tells the model not to call again for the same words; it
+is never called `NOT SENT`, because an owner told "not sent" says "try again". The prompt and the
+tool description say the same of a call that fails with no result at all, such as a hosted tool
+call that timed out.
 
 **A direct send is posted at most once.** A commit cannot be repeated — it spends a single-use
 handle — but a direct send has none, and a tool call can be retried by its transport, or asked for
@@ -5190,10 +5193,11 @@ again, after the post has landed. So the server remembers each direct send while
 and for a minute after it ends, and the same channel, text and reply target in that time are
 answered from that memory instead of posted: `SENT already` when the first was posted (the REST
 route answers it as that send did, `{sent: true}` with its serial), and `NOT CONFIRMED` or `PARTLY
-SENT already` when the first may have posted or only partly did (REST: `409 post_repeated`). A send
-that certainly posted nothing — a refusal — is forgotten at once, so it can always be tried again,
-and different words, or the same words as a reply, are a different post. The memory is the
-server's own, in memory: a restart forgets it.
+SENT already` when the first may have posted or only partly did, saying, as the first send's own
+failure did, whether the rest of a partly posted one was not sent or could not be confirmed (REST:
+`409 post_repeated`). A send that certainly posted nothing — a refusal — is forgotten at once, so it
+can always be tried again, and different words, or the same words as a reply, are a different post.
+The memory is the server's own, in memory: a restart forgets it.
 
 The log gets one content-free `post_gate event=sent_direct` line (or `direct_failed`, with the
 reason, or `direct_repeat`, with what became of the earlier send): a number, the channel, the

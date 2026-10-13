@@ -257,9 +257,13 @@ pub async fn voice_post(
                     // Remembered when anything may have reached the channel, so the same words
                     // are not posted over it; forgotten when certainly nothing did.
                     ticket.finish(match &error {
-                        OpError::PartiallyPosted { posted, .. } if *posted > 0 => {
-                            Some(DirectOutcome::Partly)
-                        }
+                        OpError::PartiallyPosted {
+                            posted, uncertain, ..
+                        } if *posted > 0 => Some(if *uncertain {
+                            DirectOutcome::PartlyUnconfirmed
+                        } else {
+                            DirectOutcome::Partly
+                        }),
                         OpError::PartiallyPosted {
                             uncertain: true, ..
                         } => Some(DirectOutcome::Unconfirmed),
@@ -283,9 +287,12 @@ pub async fn voice_post(
 /// What a model is told after a direct send: `SENT.` first, then what went where, in words it can
 /// repeat, and that calling again would post again.
 ///
-/// `parts` are the messages posted, in order. Where the provider continued a long post in its
-/// first part's thread (`#263 post-split-per-provider`) the notice says so: a speaker told only
-/// that it went as several messages looks in the channel and finds one.
+/// `parts` are the messages posted, in order, and the notice says where they went, read from the
+/// parts themselves: a speaker told only that it went as several messages looks in the channel and
+/// finds one. Where the provider continued a long post in its first part's thread (`#263
+/// post-split-per-provider`) the first is in the channel and the rest in the thread under it; where
+/// the first part was itself a reply inside a thread, as a Slack reply is, every part is in that
+/// thread.
 #[must_use]
 pub fn sent_notice(
     channel: &ChannelInfo,
@@ -298,11 +305,23 @@ pub fn sent_notice(
         None => String::new(),
     };
     let count = parts.len();
-    // A direct send goes to the conversation itself, so a later part that is in a thread is in the
-    // one its first part started: the rule the page's own receipt for a long post keeps.
+    // A part with no thread, or the one a thread starts from, is in the channel; any other is a
+    // reply inside a thread. A direct send goes to the conversation, so a later part inside a thread
+    // is in the one its first part started — the rule the page's own receipt for a long post keeps
+    // — unless the first part was already inside one: a reply where the provider threads replies,
+    // whose every part then went to the answered message's thread.
+    let inside = |part: &Message| part.thread.as_ref().is_some_and(|thread| !thread.is_root);
     let split = match parts {
         [] | [_] => String::new(),
-        [_, rest @ ..] if rest.iter().any(|part| part.thread.is_some()) => format!(
+        [first, rest @ ..] if inside(first) && rest.iter().all(inside) => {
+            let thread = if reply_to.is_some() {
+                "the thread of the message it answered"
+            } else {
+                "one thread"
+            };
+            format!("\nIt was long, so it went as {count} messages, all of them in {thread}.")
+        }
+        [first, rest @ ..] if !inside(first) && rest.iter().any(inside) => format!(
             "\nIt was long, so it went as {count} messages: the first in the channel, and the rest \
              in the thread under it."
         ),
@@ -339,6 +358,13 @@ pub fn repeat_notice(channel: &str, earlier: &Repeat, text: &str) -> String {
              the rest did not, so this call posted nothing: sending the whole message again would \
              repeat the part that went. Tell the speaker that only part was posted and that they \
              can check the channel. Do not call post_reply again for this message."
+        ),
+        DirectOutcome::PartlyUnconfirmed => format!(
+            "PARTLY SENT already. Part of the same words reached {channel} {ago} seconds ago, and \
+             whether the rest was posted could not be confirmed, so this call posted nothing: \
+             sending the whole message again would repeat what went. Tell the speaker that at \
+             least part was posted and to check the channel. Do not call post_reply again for this \
+             message."
         ),
         DirectOutcome::Unconfirmed => format!(
             "NOT CONFIRMED. The same words were sent to {channel} {ago} seconds ago and this \
@@ -490,6 +516,78 @@ mod tests {
         assert!(!said.contains("went as"), "{said}");
     }
 
+    /// One posted part per entry of `inside`, each where it says: `None` in the channel with no
+    /// thread, `Some(true)` the root of thread `t1`, `Some(false)` a reply inside it.
+    async fn parts(inside: &[Option<bool>]) -> Vec<Message> {
+        use crate::chat::ChatClient as _;
+        let fake = crate::discord::fake::FakeDiscord::new();
+        let channel = crate::model::ChannelId(WRITE_CHANNEL.to_owned());
+        fake.seed(&channel, "bot", "a part");
+        let one = fake.fetch_recent(&channel, 1).await.expect("seeded")[0].clone();
+        inside
+            .iter()
+            .map(|inside| Message {
+                thread: inside.map(|is_root| crate::threads::MessageThread {
+                    id: "t1".to_owned(),
+                    root_message_id: None,
+                    is_root,
+                    reply_count: None,
+                    reply_count_exact: false,
+                }),
+                ..one.clone()
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn a_long_direct_send_is_said_to_have_gone_where_its_parts_went() {
+        let (state, _discord, _store) = testing::state_with_store();
+        let channel = ops::channels(&state)
+            .await
+            .into_iter()
+            .find(|channel| channel.id.as_str() == WRITE_CHANNEL)
+            .expect("listed");
+        let said = |reply_to: Option<&str>, parts: &[Message]| {
+            sent_notice(&channel, "rebase onto main", reply_to, parts)
+        };
+
+        // Continued in the first part's thread: the first in the channel, the rest under it.
+        let continued = said(None, &parts(&[Some(true), Some(false), Some(false)]).await);
+        assert!(
+            continued.contains(
+                "It was long, so it went as 3 messages: the first in the channel, and the rest \
+                 in the thread under it."
+            ),
+            "{continued}"
+        );
+        // The same, from a provider that did not mark the first part as a thread's root.
+        let unmarked = said(None, &parts(&[None, Some(false)]).await);
+        assert!(unmarked.contains("the first in the channel"), "{unmarked}");
+
+        // A reply where the provider threads replies, as Slack does: every part, the first too, is
+        // in the answered message's thread, and none of it is in the channel.
+        let reply = said(
+            Some("42"),
+            &parts(&[Some(false), Some(false), Some(false)]).await,
+        );
+        assert!(
+            reply.contains(
+                "It was long, so it went as 3 messages, all of them in the thread of the message \
+                 it answered."
+            ),
+            "{reply}"
+        );
+        assert!(!reply.contains("in the channel"), "{reply}");
+
+        // One after another in the channel, as Discord posts them.
+        let consecutive = said(Some("42"), &parts(&[None, None]).await);
+        assert!(
+            consecutive.contains("It was long, so it went as 2 messages.\n"),
+            "{consecutive}"
+        );
+        assert!(!consecutive.contains("thread"), "{consecutive}");
+    }
+
     fn partly(posted: usize, uncertain: bool) -> OpError {
         OpError::PartiallyPosted {
             posted,
@@ -542,6 +640,7 @@ mod tests {
         for (outcome, first) in [
             (DirectOutcome::Sent, "SENT already. "),
             (DirectOutcome::Partly, "PARTLY SENT already. "),
+            (DirectOutcome::PartlyUnconfirmed, "PARTLY SENT already. "),
             (DirectOutcome::Unconfirmed, "NOT CONFIRMED. "),
             (DirectOutcome::InFlight, "NOT CONFIRMED. "),
         ] {
@@ -564,5 +663,27 @@ mod tests {
             "{sent}"
         );
         assert!(sent.contains("ask again in 48 seconds"), "{sent}");
+
+        // As the first send's own failure did: a part whose answer was lost may have posted, so
+        // the rest is not said to have failed.
+        let partly = repeat_notice(
+            "lead team",
+            &earlier(DirectOutcome::Partly),
+            "rebase onto main",
+        );
+        assert!(partly.contains("the rest did not"), "{partly}");
+        let unknown_rest = repeat_notice(
+            "lead team",
+            &earlier(DirectOutcome::PartlyUnconfirmed),
+            "rebase onto main",
+        );
+        assert!(
+            unknown_rest.contains("whether the rest was posted could not be confirmed"),
+            "{unknown_rest}"
+        );
+        assert!(
+            !unknown_rest.contains("did not") && !unknown_rest.contains("only part"),
+            "a rest that may have posted was called not posted: {unknown_rest}"
+        );
     }
 }

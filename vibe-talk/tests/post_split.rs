@@ -548,6 +548,11 @@ async fn a_long_discord_post_is_still_consecutive_messages_in_the_channel() {
 
 /// `post_reply` through MCP, as a voice agent calls it, and the sentence its model is handed.
 async fn voice_post_reply(state: &AppState, text: &str) -> String {
+    voice_post_reply_with(state, json!({ "channel_id": WRITE_CHANNEL, "text": text })).await
+}
+
+/// [`voice_post_reply`], with the tool's `arguments` as given.
+async fn voice_post_reply_with(state: &AppState, arguments: Value) -> String {
     let request = Request::builder()
         .method("POST")
         .uri("/mcp")
@@ -557,10 +562,7 @@ async fn voice_post_reply(state: &AppState, text: &str) -> String {
         .body(Body::from(
             json!({
                 "jsonrpc": "2.0", "id": 1, "method": "tools/call",
-                "params": {
-                    "name": "post_reply",
-                    "arguments": { "channel_id": WRITE_CHANNEL, "text": text },
-                },
+                "params": { "name": "post_reply", "arguments": arguments },
             })
             .to_string(),
         ))
@@ -655,5 +657,77 @@ async fn a_direct_voice_send_continues_in_the_first_parts_thread_and_says_where(
     let said = voice_post_reply(&state, &prose(2_400)).await;
     assert!(said.starts_with("PARTLY SENT. "), "{said}");
     assert!(!said.contains("The rest was NOT sent"), "{said}");
+    task.abort();
+}
+
+/// `#264 voice-send-approval`, a direct send that answers a message on Slack. A Slack reply is a
+/// thread reply, so every part, the first too, goes into the answered message's thread, and the
+/// model is told so: not that the first is in the channel, where the speaker would not find it.
+#[tokio::test]
+async fn a_long_direct_slack_reply_is_said_to_be_all_in_the_thread_it_answered() {
+    let fake = Fake::start(slack_fixture(), 20).await;
+    let state = slack(&fake, 600).await;
+    state
+        .store
+        .set_ask_before_send(false)
+        .await
+        .expect("confirmation off");
+    let target = vibe_talk::slack::message_id_from_ts(&ts(10, 0)).expect("id");
+    let said = voice_post_reply_with(
+        &state,
+        json!({ "channel_id": TEAM, "text": prose(1_800), "reply_to": target.as_str() }),
+    )
+    .await;
+    let sent = fake.requests("chat.postMessage");
+    assert!(sent.len() > 2, "the fixture did not split");
+    assert!(
+        sent.iter()
+            .all(|params| params.get("thread_ts") == Some(&ts(10, 0))),
+        "a part left the thread of the message it answers: {sent:?}"
+    );
+    assert!(said.starts_with("SENT. "), "{said}");
+    assert!(
+        said.contains(&format!(
+            "It was long, so it went as {} messages, all of them in the thread of the message it \
+             answered.",
+            sent.len()
+        )),
+        "{said}"
+    );
+    assert!(!said.contains("in the channel"), "{said}");
+}
+
+/// `#264 voice-send-approval`: the same words asked for again after a direct send whose second
+/// part's answer was lost post nothing, and the model is told what the first send's own failure
+/// told it: part was posted, and whether the rest was could not be confirmed. Not that the rest
+/// did not go, which a part that may be in the thread would make untrue.
+#[tokio::test]
+async fn a_repeat_of_a_direct_send_whose_rest_is_unconfirmed_does_not_say_the_rest_did_not_go() {
+    let (state, posts, task) = google_chat(600, &[2]).await;
+    state
+        .store
+        .set_ask_before_send(false)
+        .await
+        .expect("confirmation off");
+    let text = prose(2_400);
+    let first = voice_post_reply(&state, &text).await;
+    assert!(
+        first.starts_with("PARTLY SENT. Whether the rest was posted could not be confirmed"),
+        "{first}"
+    );
+    let attempts = posts.lock().expect("posts").len();
+
+    let again = voice_post_reply(&state, &text).await;
+    assert!(again.starts_with("PARTLY SENT already. "), "{again}");
+    assert!(
+        again.contains("whether the rest was posted could not be confirmed"),
+        "{again}"
+    );
+    assert!(!again.contains("did not"), "{again}");
+    assert_eq!(
+        posts.lock().expect("posts").len(),
+        attempts,
+        "the repeat posted"
+    );
     task.abort();
 }
