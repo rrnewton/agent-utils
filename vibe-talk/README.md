@@ -1265,7 +1265,8 @@ the one thing this route exists to do is tell those apart.
   // this process started. See "A bridge's recent read through Flat".
   "recent_view_shadow": [
     { "channel_id": "123456789012345678", "reads": 40, "skipped": 2, "failed": 0,
-      "compared": 40, "stale": 1, "mismatched": 1, "id_mismatches": 1, "hash_mismatches": 0 }
+      "compared": 40, "stale": 1, "raced": 1, "mismatched": 1, "id_mismatches": 1,
+      "hash_mismatches": 0 }
   ]
 }
 ```
@@ -1564,7 +1565,7 @@ model provider or a real gateway.
 | Post size | `discord.max_post_chars` / `discord.max_post_bytes` | — | the most one message may hold, in characters and in UTF-8 bytes; a longer one is cut into parts. Discord itself: 2,000 characters, never more. A bridge: what you set, and 2,000 characters when you set neither, so an upgrade never sends a bridge a longer message than it has accepted before. A bridge with `markup = "google-chat"` is also held to Google Chat's 32,000 bytes and refuses a larger setting; set `max_post_bytes` to what the bridge itself accepts, up to that. Under `500` is refused. Also accepted on every `[[providers]]` entry; see "A long message stays one message where it can" under [What it does in v0](#what-it-does-in-v0) |
 | Message markup | `discord.markup` | — | how the service writes message text, for the page's renderer: `discord` (default), `google-chat` for a bridge serving Google Chat, where `*a*` is bold and a link may arrive as `<https://…\|label>`, or `slack` for a bridge passing Slack's text through. A Slack provider is always `slack` and refuses the key. See [How message text is drawn](#how-message-text-is-drawn) |
 | Thread protocol | `discord.thread_api` | — | `native` (default) for Discord, `bridge` for the normalized endpoints below, or `off` to disable child-thread timelines; an added source that identifies one upstream conversation remains an ordinary channel-picker entry in every mode |
-| Bridge recent read | `discord.recent_view` / `discord.recent_view_shadow` | — | `thread_api = "bridge"` only, refused otherwise: which endpoint answers a read of a channel's most recent messages, `messages` (default) or `flat`, and whether each `messages` read is checked against Flat for diagnostics (default `false`; refused with `flat`) — see [A bridge's recent read through Flat](#a-bridges-recent-read-through-flat) |
+| Bridge recent read | `discord.recent_view` / `discord.recent_view_shadow` | — | `thread_api = "bridge"` only, refused otherwise: which endpoint answers a read of a channel's most recent messages, `messages` (default) or `flat`, and whether `messages` reads are checked against Flat for diagnostics, one at a time once recent reads stop (default `false`; refused with `flat`) — see [A bridge's recent read through Flat](#a-bridges-recent-read-through-flat) |
 | Discord bot token | `discord.bot_token` | `VIBE_TALK_DISCORD_BOT_TOKEN` | **secret** |
 | Read token | `auth.read_token` | `VIBE_TALK_READ_TOKEN` | **secret**, ≥ 24 chars |
 | Write token | `auth.write_token` | `VIBE_TALK_WRITE_TOKEN` | **secret**, ≥ 24 chars, must differ |
@@ -1855,21 +1856,48 @@ counts its age from `as_of`, so it never displaces a window whose picture is new
 page reads.
 
 **Check it first.** `recent_view_shadow = true` (with `recent_view = "messages"`) keeps answering
-from `/messages` and, after each such read, also reads the newest Flat page of the same size, in
-the background and at most one per channel at a time. Over the stretch both reads cover — from the
-newer of their oldest messages, or the channel's start for a read that came back short, up to the
-newest message `/messages` returned — it counts, per channel, messages only one of the two listed
+from `/messages` and checks those reads against later reads of the newest Flat page of the same
+size, when and how often as described below. Over the stretch both reads cover — from the newer of
+their oldest messages, or the channel's start for a read that came back short, up to the newest
+message `/messages` returned — it counts, per channel, messages only one of the two listed
 (`id_mismatches`) and messages both listed with different text (`hash_mismatches`, by the same
 content hash the summary cache uses). A Flat message newer than everything `/messages` returned
-arrived after that read and is not counted. The counts are in memory, reset on restart, and appear
-in `GET /api/v1/diagnostics` as `recent_view_shadow` — see [Asking the server what is wrong](#asking-the-server-what-is-wrong).
-One `info` log line per comparison that found a difference carries the counts; a `debug` line names
-the message ids, never their text. Turn `recent_view = "flat"` on once a day of shadowing shows
-none, or only ones you can explain; the setting refuses `recent_view_shadow` beside it.
+arrived after that read and is not counted, and nothing is compared beside an empty `/messages`
+read. An edit or a delete that lands between the two reads is counted like any other mismatch, so
+two more counts help explain one: `stale`, a Flat page the bridge labelled with `as_of`, and
+`raced`, a comparison across which the live feed reported an edit or a delete in that channel
+(always zero without a live feed). The counts are in memory, reset on restart, and appear in
+`GET /api/v1/diagnostics` as `recent_view_shadow` — see
+[Asking the server what is wrong](#asking-the-server-what-is-wrong). One `info` log line per
+comparison that found a difference carries the counts; a `debug` line names the message ids, never
+their text. Turn `recent_view = "flat"` on once a day of shadowing shows none, or only ones you can
+explain; the setting refuses `recent_view_shadow` beside it.
+
+**What the shadow costs the reads it checks.** A Flat read is not free for a bridge, and it may not
+wait its turn there. The bridge this was built against runs every provider command through one slot
+and serves a Flat read as one a reader is waiting for, ahead of `/messages`. When its copy of the
+channel is a few minutes old it first brings the copy forward, one provider command of about two
+seconds; when it holds no copy — the first read of a channel after a quiet spell or a restart of the
+bridge — it scans the whole channel, for up to 50 seconds. Either way it stops the `/messages` read
+that holds the slot, runs it again afterwards, and goes ahead of every one waiting. So the checks
+wait: they run one at a time, from one queue across every channel, each only once no recent read
+has run for three seconds. A channel has at most one read waiting — a newer read of it takes its
+place — and a read that has waited more than two minutes is dropped, since a Flat read that late
+would count every edit and delete in between; both count as `skipped`. That makes a collision
+unlikely, not impossible. A recent read that starts while a check is making the bridge bring its
+copy forward still waits for it, so while the shadow is on, expect a catch-up or a `digest_channel`
+soon after a quiet spell or a bridge restart to be slower, by as much as that scan. Once checked, a
+channel's copy is kept current by the bridge in the background through the same slot, at the
+priority of `/messages` itself: nothing is stopped for that work, but a read can queue behind it.
 
 What it does not do: a Flat page the bridge cannot build (a channel past its copy's size limits)
 fails the read rather than falling back to `/messages`, and a bridge copy that is cold is built on
-the first read, which can take far longer than `/messages`. Shadowing first shows both.
+the first read, which can take far longer than `/messages`. Shadowing first shows both. With
+`recent_view = "flat"`, every read of a channel's newest messages goes to Flat, not only the ones
+above: the channel probe at startup and in `GET /api/v1/diagnostics`, the first read of a live poll,
+the check of a channel's newest message when upstream unread clearing starts or is run now, and
+`find_message`. Those carry no `as_of`; neither do the to-do list or the JSON of `/digest` and
+`/activity`. A cold copy can take a diagnostics probe past its 20-second budget.
 
 ### Local read state is ours; upstream read state is an optional provider capability
 

@@ -44,7 +44,10 @@ thread_api = "native"
 # "messages" (GET /channels/{id}/messages, the default) or "flat" (the newest page of the bridge's
 # Flat view, served from its kept copy and labelled with as_of when that copy is stale). Try
 # recent_view_shadow = true first: it keeps reading /messages and counts where Flat disagrees, in
-# GET /api/v1/diagnostics. It does not apply with "flat".
+# GET /api/v1/diagnostics. It does not apply with "flat". The checking Flat reads are not free: a
+# bridge may serve them ahead of /messages, stopping the one it is running while it brings a stale
+# or cold copy forward. So they run one at a time, only after recent reads have stopped for three
+# seconds; a read soon after a quiet spell or a bridge restart can still wait behind one.
 # recent_view = "messages"
 # recent_view_shadow = false
 # Enable only when api_base names a compatible bridge with POST /channels/{id}/read.

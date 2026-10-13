@@ -565,8 +565,10 @@ pub enum RecentView {
 pub struct RecentReads {
     /// Which endpoint answers. `recent_view`, default `messages`.
     pub view: RecentView,
-    /// With `messages`: after every such read, also read the Flat view and count where the two
-    /// disagree, for diagnostics. `recent_view_shadow`, default off. See [`crate::recent_view`].
+    /// With `messages`: check such reads against a later read of the Flat view and count where
+    /// the two disagree, for diagnostics. The checks run one at a time, after recent reads have
+    /// stopped, because a bridge may serve a Flat read ahead of `/messages`. `recent_view_shadow`,
+    /// default off. See [`crate::recent_view`].
     pub shadow: bool,
 }
 

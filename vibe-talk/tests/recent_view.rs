@@ -40,6 +40,8 @@ struct Bridge {
     flat_missing: Mutex<BTreeSet<MessageId>>,
     recent_missing: Mutex<BTreeSet<MessageId>>,
     flat_reads: AtomicUsize,
+    /// When set, a recent read fails.
+    recent_fails: std::sync::atomic::AtomicBool,
     /// When set, a recent read waits for a permit here before it answers.
     hold: Mutex<Option<Arc<Semaphore>>>,
     /// How long a Flat read takes: a bridge bringing its copy forward first.
@@ -66,6 +68,7 @@ impl Bridge {
             flat_missing: Mutex::new(BTreeSet::new()),
             recent_missing: Mutex::new(BTreeSet::new()),
             flat_reads: AtomicUsize::new(0),
+            recent_fails: std::sync::atomic::AtomicBool::new(false),
             hold: Mutex::new(None),
             flat_takes: Mutex::new(Duration::ZERO),
             log: Mutex::new(Vec::new()),
@@ -102,6 +105,9 @@ impl ChatClient for Bridge {
         channel: &ChannelId,
         limit: u16,
     ) -> Result<RecentRead, ChatError> {
+        if self.recent_fails.load(Ordering::SeqCst) {
+            return Err(ChatError::Transport("the bridge is down".to_owned()));
+        }
         self.note(Event::RecentStarted);
         let hold = self.hold.lock().expect("hold").clone();
         if let Some(hold) = hold {
@@ -306,6 +312,33 @@ async fn a_read_the_provider_dates_says_as_of_on_messages_and_in_the_mcp_text() 
         .held
         .expect("held");
     assert_eq!(held.as_of, None);
+}
+
+/// A catch-up that falls back to a held copy dated with `as_of` says when THIS SERVER read the
+/// copy, and leaves how old the copy is to the AS OF note, rather than saying the copy's age twice
+/// as if the server had read it then. The clock is stopped, so only the server's read ages: the
+/// provider's `as_of` stays ten minutes before the wall clock.
+#[tokio::test(start_paused = true)]
+async fn a_held_copy_says_when_this_server_read_it_and_as_of_how_old_it_is() {
+    let h = harness("");
+    *h.bridge.as_of.lock().expect("as_of") = Some(minutes_ago(10));
+    ops::messages(&h.state, READ_CHANNEL, None)
+        .await
+        .expect("read");
+    tokio::time::advance(Duration::from_secs(150)).await;
+    h.bridge.recent_fails.store(true, Ordering::SeqCst);
+
+    let catch_up = tool(&h.state, "recent_activity", json!({})).await;
+    let block = catch_up
+        .lines()
+        .find(|line| line.starts_with("build noise"))
+        .expect("the channel has a block");
+    assert!(block.contains("NOT CURRENT"), "{block}");
+    assert!(
+        block.contains("the copy this server read 2 minutes ago"),
+        "{block}"
+    );
+    assert!(block.contains("AS OF 10 minutes ago"), "{block}");
 }
 
 /// Off by default: no shadow read, nothing counted, no diagnostics section.
