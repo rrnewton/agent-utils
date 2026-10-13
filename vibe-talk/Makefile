@@ -173,8 +173,10 @@ send-order-browser:
 # with Send's centre at least 0.62 of the way down the screen, uncovered, wholly on screen with where
 # the draft goes, the box's own Send out of the way, the card at the owner's own inset, and both
 # buttons held when it appears; then the frozen card it becomes, filed after its commit and restored
-# by a reload (`#270 voice-transcript-markers`). Pass WEB_ROOT=dir for another copy of the page,
-# SCREENSHOTS=dir to keep a PNG of each placement.
+# by a reload (`#270 voice-transcript-markers`); and at 1280x800 in two columns, wholly above a reply
+# open at the foot of the left column (`#277 reply-in-column`), its Send outlined beside a reply in
+# either column. Pass WEB_ROOT=dir for another copy of the page, SCREENSHOTS=dir to keep a PNG of each
+# placement.
 approval-card-browser:
 	python3 tests/approval_card_browser.py $(if $(WEB_ROOT),--web-root $(WEB_ROOT)) $(if $(SCREENSHOTS),--screenshots $(SCREENSHOTS))
 

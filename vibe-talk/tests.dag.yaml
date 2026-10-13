@@ -312,10 +312,12 @@ steps:
   # then Send freezes it into the transcript (`#270 voice-transcript-markers`), the claim of its send
   # follows the commit, and a reload restores the same card. Docked under Settings the card never
   # scrolls as a whole: folded and after More, where it goes, its status and both buttons stay on
-  # screen, on the three phones and at 667x375 and 375x330. Measured on 2026-10-13: about 120s wall.
+  # screen, on the three phones and at 667x375 and 375x330. At 1280x800 in two columns the card stays
+  # wholly above a reply open at the left column's foot, its Send outlined beside a reply in either
+  # column (`#277 reply-in-column`). Measured on 2026-10-13: about 120s wall.
   - group: check
     job: approval-card-browser
-    desc: the send card's place, thumb reach, hold, docked layout and frozen card in current Chromium at 393x852, 360x780, 375x667, 667x375 and 375x330
+    desc: the send card's place, thumb reach, hold, docked layout and frozen card in current Chromium at 393x852, 360x780, 375x667, 667x375 and 375x330, and beside a reply open in a column at 1280x800
     labels: [validation-vibe-talk]
     cmd: cd vibe-talk && python3 tests/approval_card_browser.py
     jobs_flag: ""

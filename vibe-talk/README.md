@@ -6731,8 +6731,11 @@ it outside anything a model can call:
 The card is the tentative next message (`#269 approval-card-inline`): the owner's own outgoing tile
 at the foot of the list he is looking at — under the call's transcript or the channel's messages,
 above that list's box, which shrinks to one line under it — and docked at the foot of Reply,
-Threads, Settings and Help. It names what it answers in words ("replying to Alex: …") and never by
-id. It is built so that a tap confirms only what the owner read. When a card appears, or a newer
+Threads, Settings and Help. In two columns, where Reply is a box at the foot of a column rather than
+a screen (`#277 reply-in-column`), the card stays the left list's next message, wholly above that
+box. Under Reply, and while a reply is open in either column, the card's Send is outlined, so the
+filled **Send reply** is never taken for it. It names what it answers in words ("replying to Alex:
+…") and never by id. It is built so that a tap confirms only what the owner read. When a card appears, or a newer
 proposal replaces the text, both its buttons are held for two seconds and a replacement says the
 text changed, so a tap already on its way lands on neither the new words nor Don't send. A draft whose card was showing when a call ended is not offered
 again in the next call on the same page; it lapses on the server. The page remembers that only
