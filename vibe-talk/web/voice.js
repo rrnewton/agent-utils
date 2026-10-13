@@ -8938,9 +8938,12 @@ function spokenYesRefusal(shown, answer, heard) {
   if (session.echoCancellation !== true) return "echo_cancellation_off";
   if (heard.cut || (session.protocol === "vibe-talk-v1" && !heard.done)) return "interrupted";
   const readBack = readBackRefusal(shown, heard.turns);
-  // A relayed message or a notice between the read-back and the yes: the read-back may have been
-  // exact, but it was not the last thing said.
-  if (readBack) return heard.interposed && readBack !== "mention" ? "interposed" : readBack;
+  if (readBack) {
+    // An exact read-back with a relayed message or a notice after it: it was not the last thing said.
+    const readBackBefore = heard.interposed &&
+      heard.sinceUser.some((turn) => isExactReadBack(answerWords(turn.text), shown));
+    return readBack !== "mention" && readBackBefore ? "interposed" : readBack;
+  }
   const answeredAt = heard.answerAt || Date.now();
   const playEnd = session.playEndMs || 0;
   if (answeredAt < playEnd) return "early";

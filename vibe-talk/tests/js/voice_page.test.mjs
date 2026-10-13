@@ -3673,7 +3673,11 @@ const TUNING_BANDS = {
   SPOKEN_YES_ECHO_GUARD_MS: [800, 3000,
     "how soon after the read-back's audio ends a bare 'send it' is taken for the agent's own voice. " +
     "Under about a second an echo that the canceller let through arrives after it; past three the " +
-    "owner's real 'send it', said promptly, is refused and he is told to say yes"],
+    "owner's real 'send it', said promptly, is refused and he has to ask for the read-back again"],
+  SENDING_QUESTION_WORDS: [4, 6,
+    "how many closing words of an unpunctuated transcript stand for its question about sending. " +
+    "Under four, 'shall I send that to them' loses its 'send'; past six, 'tap Send or ask me to " +
+    "read it back' counts as a question about sending, and every 'okay' after it is answered"],
 };
 test("every number this page is tuned by stays inside a band that says what would be wrong", () => {
   for (const [name, [low, high, why]] of Object.entries(TUNING_BANDS)) {
@@ -31673,7 +31677,14 @@ test("`#264 voice-send-approval`: a chat message relayed between the read-back a
   assert.equal(notices.length, 1, notices.join("\n"));
   assert.match(notices[0], /NOT sent: a message came between the read-back and the yes/);
 
-  // Read back again, it may be confirmed.
+  // A wrong read-back after the notice is refused for being wrong, not for the relay before it.
+  page.setClock(page.clock() + 1000);
+  hostedSays(socket, "To lead team: on it. Send it?");
+  hostedHears(socket, "yes");
+  await settleSpokenYes(page);
+  assert.match(pageNotices(socket).at(-1), /not the card's text word for word/);
+
+  // Read back again, exactly, it may be confirmed.
   page.setClock(page.clock() + 1000);
   hostedSays(socket, "To lead team: on it, rebasing now. Send it?");
   hostedHears(socket, "yes");
