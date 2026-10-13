@@ -74,8 +74,11 @@ const CHECKPOINT_RETRY: Duration = Duration::from_millis(250);
 /// How long a truncation waits, past its retry time, for the checkpointer to catch up before
 /// it goes ahead anyway.
 const TRUNCATE_PATIENCE: Duration = Duration::from_secs(2);
-/// How long background work rests after a step failed.
+/// How long background work rests after a step failed; doubled after each failure in a row, up
+/// to a minute.
 const BACKOFF: Duration = Duration::from_secs(1);
+/// The most doublings of [`BACKOFF`].
+const BACKOFF_DOUBLINGS: u32 = 6;
 /// Rows one deletion step picks; the step stops earlier when its time is up.
 const PICK: i64 = 256;
 /// A bulk deletion of at least one row in this many (and at least [`MARKER_MIN`] rows) deletes by
@@ -182,6 +185,7 @@ pub(crate) fn run(
                 last_hourly: Instant::now(),
                 last_batch: Instant::now(),
                 backoff_until: None,
+                failures: 0,
                 unflushed: 0,
                 backfill_armed: false,
                 pace_markers: Pace::new(),
@@ -535,6 +539,8 @@ struct Writer<'c> {
     last_hourly: Instant,
     last_batch: Instant,
     backoff_until: Option<Instant>,
+    /// Steps that have failed in a row.
+    failures: u32,
     /// Index entries deleted since the index last flushed: their cost is paid at the flush.
     unflushed: usize,
     /// Something has written since this thread last checkpointed the log itself. A checkpoint
@@ -1745,9 +1751,14 @@ impl Writer<'_> {
                 Ok(())
             }
         };
+        if result.is_ok() {
+            self.failures = 0;
+        }
         if let Err(error) = result {
             self.report(task.name(), Err(error));
-            self.backoff_until = Some(Instant::now() + BACKOFF);
+            let rest = BACKOFF * (1_u32 << self.failures.min(BACKOFF_DOUBLINGS));
+            self.backoff_until = Some(Instant::now() + rest);
+            self.failures = self.failures.saturating_add(1);
             self.abandon(task);
         }
         let took = started.elapsed();
@@ -1771,20 +1782,18 @@ impl Writer<'_> {
         true
     }
 
-    /// Give up a step that failed. An erase is never given up: it is retried after the backoff.
+    /// Give up a step that failed. What the owner asked to forget is never given up: an erase, a
+    /// compaction owed by markers, and a rebuild are retried after the backoff, the compaction
+    /// from its start.
     fn abandon(&mut self, task: Task) {
         match task {
-            Task::Erase => {}
+            Task::Erase | Task::Rebuild => {}
             Task::Tombstones => self.work.tombstones = None,
             Task::Expire => self.work.expire = None,
             Task::Evict => self.work.evict = None,
-            Task::Rebuild => self
-                .shared
-                .search_text_current
-                .store(true, Ordering::SeqCst),
             Task::Compact => {
                 self.work.compact = None;
-                self.work.compact_due = false;
+                self.work.compact_due = true;
                 let restored = self.transaction(|w| w.fts_option("usermerge", USERMERGE));
                 self.report("compaction", restored);
             }

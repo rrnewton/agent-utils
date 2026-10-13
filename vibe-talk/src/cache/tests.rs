@@ -1233,6 +1233,59 @@ fn search_text_is_rebuilt_when_the_rendering_rules_change() {
     drop(dir);
 }
 
+#[test]
+fn a_rebuild_that_fails_is_retried_rather_than_taken_as_done() {
+    struct Relabelled;
+    impl SearchTextSource for Relabelled {
+        fn version(&self) -> String {
+            "relabelled-3".to_owned()
+        }
+        fn rendered(&self, _provider_key: &str, message: &Message) -> Rendered {
+            Rendered {
+                text: format!("{} relabelled", message.content),
+                hrefs: Vec::new(),
+            }
+        }
+    }
+    let fx = Fixture::new("cache-rebuild-retry");
+    fx.list((0..50).map(m).collect(), T0, None);
+    let path = fx.path();
+    let Fixture {
+        cache, clock, dir, ..
+    } = fx;
+    drop(cache);
+    let raw = rusqlite::Connection::open(&path).expect("raw");
+    raw.execute_batch(
+        "CREATE TRIGGER refuse_rebuild BEFORE UPDATE OF search_text ON message
+             BEGIN SELECT RAISE(ABORT, 'refused'); END;",
+    )
+    .expect("sabotage");
+    let cache = MessageCache::open(CacheOptions {
+        search_text: Arc::new(Relabelled),
+        clock: Arc::clone(&clock) as Arc<dyn Clock>,
+        ..CacheOptions::new(&path)
+    })
+    .expect("reopen");
+    std::thread::sleep(Duration::from_millis(300));
+    assert!(
+        !cache.search_text_current(),
+        "a rebuild that failed was reported done"
+    );
+    raw.execute_batch("DROP TRIGGER refuse_rebuild")
+        .expect("repair");
+    drop(raw);
+    assert!(cache.quiesce_blocking(Duration::from_secs(30)));
+    assert!(cache.search_text_current());
+    assert_eq!(
+        sql_count(
+            &cache,
+            "SELECT COUNT(*) FROM message_fts WHERE message_fts MATCH '\"relabelled\"'",
+        ),
+        50
+    );
+    drop(dir);
+}
+
 // ---- erase -------------------------------------------------------------------------------------
 
 #[test]

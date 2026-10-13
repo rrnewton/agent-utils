@@ -71,6 +71,7 @@
 //!
 //! The writer, a checkpointer that copies the log back into the database concurrently (the
 //! writer's commits never checkpoint), and two readers, each with its own connection.
+
 mod checkpoint;
 pub mod coverage;
 pub mod file;
