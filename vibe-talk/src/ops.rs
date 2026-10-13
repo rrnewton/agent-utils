@@ -1677,10 +1677,67 @@ pub async fn reply_scoped(
 
     let keys = idempotency_key.map(|key| part_keys(key, &parts));
     // `#277 send-order`. This destination's turn, after every post to it that arrived first, held
-    // from the first part to the last: a retry cannot overtake the attempt it repeats while that is
-    // still on its way to a slow provider, and nothing lands between the parts of a long post. See
-    // `crate::post_lanes`.
-    let _turn = state.post_lanes.turn(info.id.as_str(), thread_id).await;
+    // from the first part to the last, so nothing lands between the parts of a long post. Waiting
+    // for it is this request's own: a caller that goes away while it waits gives up its place, and
+    // nothing of its post has been sent. See `crate::post_lanes`.
+    let turn = state.post_lanes.turn(info.id.as_str(), thread_id).await;
+    // Posting is not this request's own. axum drops a handler the moment its caller closes the
+    // connection — the page stops waiting after `OUTGOING_TIMEOUT_MS`, signs out, or loses its
+    // connection behind a proxy — and with it whatever it holds. Were the turn and the provider
+    // call held here, the next post to this destination (the page's retry of this very message,
+    // and then the one written after it) would go at once, while the provider was still working
+    // on this one, and could land first. So a task of its own owns the turn and the provider
+    // calls, and holds the destination until the provider has answered for the last part it tried
+    // or the provider client's own request timeout has given up on it; a caller that has gone is
+    // simply not told.
+    let posting = Posting {
+        info,
+        text: text.to_owned(),
+        parts,
+        keys,
+        reply_to,
+        thread_id: thread_id.map(str::to_owned),
+        limit,
+    };
+    match tokio::spawn(post_parts(state.clone(), posting, turn)).await {
+        Ok(result) => result,
+        Err(stopped) if stopped.is_panic() => std::panic::resume_unwind(stopped.into_panic()),
+        // Only a runtime shutting down cancels it; whatever it had sent may have landed.
+        Err(stopped) => Err(OpError::Chat(ChatError::Transport(format!(
+            "the post was stopped before the provider answered: {stopped}"
+        )))),
+    }
+}
+
+/// One post, cut in parts and ready to go: everything [`post_parts`] needs, owned, so the task that
+/// posts it can outlive the request that asked for it.
+struct Posting {
+    info: ChannelInfo,
+    text: String,
+    parts: Vec<String>,
+    keys: Option<Vec<String>>,
+    reply_to: Option<MessageId>,
+    thread_id: Option<String>,
+    limit: crate::chat::PostLimit,
+}
+
+/// Post every part of `posting` in order, holding the destination's `_turn` until the provider has
+/// answered for the last part tried. The body of [`reply_scoped`], run as a task of its own.
+async fn post_parts(
+    state: AppState,
+    posting: Posting,
+    _turn: crate::post_lanes::Turn,
+) -> Result<(ChannelInfo, Message, Vec<Message>), OpError> {
+    let Posting {
+        info,
+        text,
+        parts,
+        keys,
+        reply_to,
+        thread_id,
+        limit,
+    } = posting;
+    let thread_id = thread_id.as_deref();
     let mut posted: Vec<Message> = Vec::new();
     // Where the parts after the first go, for a post to the conversation itself: the thread under
     // the first part, where the provider continues a long message there. Learned from the first
@@ -1709,7 +1766,7 @@ pub async fn reply_scoped(
         };
         match sent {
             Ok(mut one) => {
-                stamp(state, std::slice::from_mut(&mut one));
+                stamp(&state, std::slice::from_mut(&mut one));
                 // Remember that WE posted this, before anything can observe it. `#44 live-push`:
                 // the poller will see it in a few seconds, and relaying it into the live
                 // conversation would make the agent hear its own reply as new information.
@@ -1738,7 +1795,7 @@ pub async fn reply_scoped(
                 // once their draft is cleared — and where it belongs, which after the first part
                 // of a continued post is that part's thread rather than the conversation.
                 let replying = reply_to.is_some() && continuation.is_none();
-                let (unsent, resumable) = unsent_remainder(text, &parts, index, replying, &limit);
+                let (unsent, resumable) = unsent_remainder(&text, &parts, index, replying, &limit);
                 return Err(OpError::PartiallyPosted {
                     posted: posted.len(),
                     unsent,

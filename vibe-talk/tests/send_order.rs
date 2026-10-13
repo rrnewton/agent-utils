@@ -4,11 +4,14 @@
 //! The owner: "I write A then B but B lands first." The page keeps a destination's messages in the
 //! order they were written, but the server is the last place that order can be lost before the chat
 //! service: the page's retry of A, sent after it stopped waiting for an answer the server was still
-//! waiting on, and then B, reached a slow provider while that first A was still on its way.
+//! waiting on, and then B, reached a slow provider while that first A was still on its way. The
+//! page stopping waiting closes its connection, and the server drops that request's handler; the
+//! post it started has to hold its destination all the same, until the provider answers or the
+//! provider client's own request timeout gives up on it. That timeout is the limit: past it the
+//! server lets the next post go while a slow bridge may still be working on the first.
 //!
 //! Every test drives the real reply route, concurrently, against a provider that holds each post
-//! until the test lets it go, and records the order posts REACH it in — which is the order they
-//! land in, for a provider that answers them one at a time.
+//! until the test lets it go, and records the order posts REACH it in, and the order they land in.
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -27,11 +30,12 @@ use vibe_talk::state::AppState;
 use vibe_talk::testing::{self, WRITE_CHANNEL, WRITE_TOKEN};
 
 /// A provider that lets each post through only when the test gives the gate a permit, and writes
-/// down what reached it — `text`, or `text@thread` — before it waits.
+/// down what reached it — `text`, or `text@thread` — before it waits, and what landed once it has.
 struct HeldPosts {
     inner: Arc<FakeDiscord>,
     gate: Arc<Semaphore>,
     reached: Mutex<Vec<String>>,
+    landed: Mutex<Vec<String>>,
 }
 
 impl HeldPosts {
@@ -42,13 +46,17 @@ impl HeldPosts {
         content: &str,
         reply_to: Option<&MessageId>,
     ) -> Result<Message, ChatError> {
-        self.reached.lock().expect("reached").push(label);
+        self.reached.lock().expect("reached").push(label.clone());
         self.gate
             .acquire()
             .await
             .expect("the test keeps the gate open")
             .forget();
-        self.inner.post_message(channel, content, reply_to).await
+        let posted = self.inner.post_message(channel, content, reply_to).await;
+        if posted.is_ok() {
+            self.landed.lock().expect("landed").push(label);
+        }
+        posted
     }
 }
 
@@ -110,6 +118,7 @@ fn held_server() -> (AppState, Arc<HeldPosts>) {
         inner: fake,
         gate: Arc::new(Semaphore::new(0)),
         reached: Mutex::new(Vec::new()),
+        landed: Mutex::new(Vec::new()),
     });
     state.replace_chat(Arc::clone(&held) as Arc<dyn ChatClient>);
     (state, held)
@@ -192,6 +201,53 @@ async fn a_second_post_to_one_destination_waits_until_the_first_has_landed() {
         0,
         "a destination nobody is posting to is still held"
     );
+}
+
+#[tokio::test]
+async fn a_post_whose_caller_went_away_holds_its_destination_until_the_provider_answers() {
+    let (state, held) = held_server();
+    let first = send(
+        &state,
+        json!({ "text": "A written first", "idempotency_key": "outgoing-a" }),
+    );
+    assert_eq!(reached(&held).await, ["A"]);
+
+    // The page stops waiting for A — its own timeout, a sign-out, a proxy dropping a phone's
+    // connection — and the server drops the request's handler with the connection.
+    first.abort();
+    assert!(
+        first
+            .await
+            .expect_err("the caller went away")
+            .is_cancelled(),
+        "the request finished before its caller went away"
+    );
+    let second = send(
+        &state,
+        json!({ "text": "B written second", "idempotency_key": "outgoing-b" }),
+    );
+    assert_eq!(
+        reached(&held).await,
+        ["A"],
+        "B reached the provider while it was still working on A, whose caller had gone"
+    );
+    assert_eq!(
+        state.post_lanes.in_use(),
+        1,
+        "the destination was let go with the request"
+    );
+
+    // The provider answers for A, though nobody is waiting for that answer any more.
+    held.gate.add_permits(1);
+    assert_eq!(reached(&held).await, ["A", "B"], "B did not go once A had");
+    held.gate.add_permits(1);
+    assert_eq!(second.await.expect("second").0, StatusCode::OK);
+    assert_eq!(
+        *held.landed.lock().expect("landed"),
+        ["A", "B"],
+        "A, whose caller had gone, was not posted, or landed after B"
+    );
+    assert_eq!(state.post_lanes.in_use(), 0);
 }
 
 #[tokio::test]
