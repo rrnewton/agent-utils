@@ -33719,6 +33719,30 @@ test("`#270 voice-transcript-markers`: a send that began after a call ended, and
   assert.deepEqual(page.claims, []);
 });
 
+test("`#270 voice-transcript-markers`: a draft shown in the next call before the voice service names it is filed in that call, not the last one", async () => {
+  const page = newPage();
+  await recordingCall(page, "conv_first");
+  await page.el("hang-up").click();
+  await watchTurns(page);
+  await page.el("talk").click();
+  const socket = page.sockets.at(-1);
+  socket.onopen();
+  await watchTurns(page);
+  page.propose(proposal({ reply_to: null }));
+  await watchTurns(page);
+  socket.onmessage({ data: JSON.stringify({
+    type: "conversation_initiation_metadata",
+    conversation_initiation_metadata_event: { conversation_id: "conv_second", agent_output_audio_format: "pcm_16000" },
+  }) });
+  await page.settle();
+  page.expireTimers(2000);
+  await page.el("post-confirm-send").click();
+  await watchTurns(page, 6);
+  assert.deepEqual(page.claims.map((claim) => claim.id), ["conv_second"], "the send was filed in the call before");
+  assert.equal(page.el("transcript").children.at(-1), sentCards(page)[0],
+    `the card was drawn above the last call's end: ${fateShapes(page).join(" | ")}`);
+});
+
 test("`#270 voice-transcript-markers`: a draft shown before the voice service named the conversation is filed in it", async () => {
   const page = newPage();
   page.transcriptRecordsSupported = true;

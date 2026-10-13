@@ -13722,9 +13722,13 @@ async function openConversation(options) {
   session.playEndMs = 0;
   session.echoCancellation = false;
   session.sessionStarts = 0;
-  // `#270 voice-transcript-markers`. Nothing recorded and nothing handed over yet in this call.
+  // `#270 voice-transcript-markers`. Nothing recorded and nothing handed over yet in this call —
+  // and no conversation named for it. The last call's name outlives its teardown, for the line
+  // that ends it; kept into this call, a draft shown before the hosted service names this one
+  // was filed in the last one, and a turn recorded before then went there too.
   session.recordedAny = false;
   session.recap = null;
+  session.conversationId = null;
   // Fetched HERE, before the socket exists, so a slow or failing store delays the call rather than
   // racing `onopen` — a payload that arrived after the agent had already spoken would be a
   // "here is what we said" delivered into the middle of a sentence.
