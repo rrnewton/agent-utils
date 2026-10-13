@@ -36741,10 +36741,14 @@ test("Collapse read: a switch from All to Main keeps the reader's message by the
     // Every other message from 303 to 315 is a reply in the one thread, which Main does not show, and
     // unread. 304, 306 and 308, posted to the channel itself, are read: one at a time between unread
     // replies in All, and one run of three in Main, where the replies are not drawn.
+    // All 24 within one day, at times of their own: by `message`'s running clock they could straddle a
+    // midnight, depending on how many messages earlier tests built, and a run that begins a new day says
+    // that day on its line (`#250 date-separators`), which is not what this test is about.
     const messages = Array.from({ length: 24 }, (_, i) => {
       const id = String(300 + i);
       const record = id === "302" ? thread : i > 2 && i < 17 && i % 2 === 1 ? { ...thread, is_root: false } : null;
-      return message({ id, content: longMessage(`row ${id}`), ...(record ? { thread: record } : {}) });
+      return message({ id, content: longMessage(`row ${id}`), ...(record ? { thread: record } : {}),
+        timestamp: new Date(MESSAGE_EPOCH + i * MESSAGE_SPACING_MS).toISOString() });
     });
     for (const id of ["304", "306", "308"]) page.dealtWith.add(id);
     page.threads = [{ id: thread.id, root: messages[2], title: "the long thread", reply_count: 7,
