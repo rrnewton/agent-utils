@@ -2032,6 +2032,15 @@ function newPage(store = new Map(), script = SCRIPT, arrange = null) {
     removeItem: (k) => store.delete(k),
   };
   page.storage = store;
+  // `#265 window-channel-memory`. The window's own storage. Every `newPage` is a brand-new window
+  // with none, sharing the device's `store` with any other; a reload of a window hands it that
+  // window's from `arrange` — see `reloadWindow` — as a browser keeps it across a reload.
+  page.session = new Map();
+  const sessionStorage = {
+    getItem: (k) => (page.session.has(k) ? page.session.get(k) : null),
+    setItem: (k, v) => page.session.set(k, v),
+    removeItem: (k) => page.session.delete(k),
+  };
   page.timers = new Map();
   let nextTimer = 1;
   /** Fire — and forget — every pending timer registered for exactly this delay. */
@@ -2159,6 +2168,7 @@ function newPage(store = new Map(), script = SCRIPT, arrange = null) {
   const context = {
     document,
     localStorage,
+    sessionStorage,
     Date: FixedDate,
     window: {
       AudioContext: function () { return new FakeAudioContext(page); },

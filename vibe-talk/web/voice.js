@@ -12372,6 +12372,51 @@ function reconcileChannelSnapshot(before) {
 // parse is deleted. It is scoped to the token as the snapshot is, and forgotten with it: a thread's
 // summary is something that credential read. A channel the server stops listing loses its choice
 // when it loses its saved rows.
+//
+// EACH WINDOW REOPENS ON ITS OWN. `#265 window-channel-memory`. The owner, 2026-10-13, with two
+// windows of the installed app on a desk, one left on each of two channels: "refresh will not
+// respect those selections." The channel (`ACTIVE_CHANNEL_KEY`) and this record were kept only in
+// `localStorage`, which every window of the origin shares, so a reload of either window came back
+// on whatever the window that wrote last had shown. Both are now kept in the window's own
+// `sessionStorage` as well, which outlives a reload of that window and no other, and a reload reads
+// the window's own first: its channel, the call or the channel, the view or thread it had open,
+// and the message it was on. The shared copy is still written, and is what a brand-new window opens
+// on — the channel chosen last, in any window. The view chosen in a channel this window has not
+// chosen one in is taken from the shared record, behind the window's own choices. The read mode
+// is a preference of the device rather than a place, so it comes from the shared record whichever
+// window wrote that. What the right column shows in two columns is kept for the session only
+// (`sideThreads`), in memory, which is already the window's own.
+//
+// The window's storage, not its address: a channel in the URL would outlive a reload too, but it
+// would ride along in every link copied out of the address bar, and every route, the installed
+// app's start_url and the offline shell would have to keep accepting it. A window's own storage
+// is invisible to all of them.
+
+/**
+ * This window's own copy of `key`, or null when it has none — or cannot keep one, where storage is
+ * refused, and every window then reads the device's, as every window did before.
+ */
+function windowItem(key) {
+  try {
+    return sessionStorage.getItem(key);
+  } catch (_error) {
+    return null;
+  }
+}
+
+/** Keep `value` as this window's own `key`, or forget it for null. Nothing, where storage is refused. */
+function keepWindowItem(key, value) {
+  try {
+    if (value === null) sessionStorage.removeItem(key);
+    else sessionStorage.setItem(key, value);
+  } catch (_error) {
+    // The device's copy is still written, and a reload of this window falls back on it.
+  }
+}
+
+/** Where a UI record is kept: the device's storage, which every window shares, or this window's own. */
+const deviceStore = () => localStorage;
+const windowStore = () => sessionStorage;
 
 const UI_STATE_KEY = "vibe-talk.voice.ui-state";
 const UI_STATE_VERSION = 2;
@@ -12447,19 +12492,25 @@ function keptChoices(entries) {
   return kept.slice(0, UI_STATE_CHANNELS);
 }
 
-function dropUiState() {
+function dropUiRecord(store) {
   try {
-    localStorage.removeItem(UI_STATE_KEY);
+    store().removeItem(UI_STATE_KEY);
   } catch (_error) {
     // Nothing was readable either, so there is nothing to reopen on.
   }
 }
 
-/** The record saved for the token saved now, or null. A damaged one, or another token's, is deleted. */
-function readUiState() {
+/** The record goes from the device, and from this window. */
+function dropUiState() {
+  dropUiRecord(deviceStore);
+  dropUiRecord(windowStore);
+}
+
+/** The record `store` holds for the token saved now, or null. A damaged one, or another token's, is deleted. */
+function readUiRecord(store) {
   let raw = null;
   try {
-    raw = localStorage.getItem(UI_STATE_KEY);
+    raw = store().getItem(UI_STATE_KEY);
   } catch (_error) {
     return null;
   }
@@ -12477,8 +12528,26 @@ function readUiState() {
     saved.channels = keptChoices(saved.channels);
     return saved;
   }
-  dropUiState();
+  dropUiRecord(store);
   return null;
+}
+
+/**
+ * The record this page reopens on. `#265 window-channel-memory`: this window's own, when a reload
+ * finds one, with the views chosen in other windows behind its own choices and the device's read
+ * mode; and for a brand-new window, which has none, the device's — what the window that wrote last
+ * left.
+ */
+function readUiState() {
+  const device = readUiRecord(deviceStore);
+  const own = readUiRecord(windowStore);
+  if (own === null) return device;
+  if (device !== null) {
+    own.channels = keptChoices([...own.channels, ...device.channels]);
+    own.todo = device.todo;
+    own.read = device.read;
+  }
+  return own;
 }
 
 /**
@@ -12679,7 +12748,9 @@ function saveUiState() {
     encoded = JSON.stringify(record);
   }
   chosenViews = record.channels;
+  // The device's, for the next brand-new window; and this window's, for a reload of it. `#265`.
   storedExactly(UI_STATE_KEY, encoded);
+  keepWindowItem(UI_STATE_KEY, encoded);
 }
 
 /**
@@ -28669,17 +28740,32 @@ function knownChannel(id) {
   return knownChannels.find((channel) => String(channel.id) === String(id)) || null;
 }
 
-function storedActiveChannel() {
+/**
+ * The channels to open on, best first: the one this window was on, which a reload of it comes back
+ * to, then the one chosen last in any window, which a brand-new window opens on. `#265
+ * window-channel-memory`. `fillChannelSelect` takes the first the server still lists.
+ */
+function storedActiveChannels() {
+  let shared = "";
   try {
-    return localStorage.getItem(ACTIVE_CHANNEL_KEY) || "";
+    shared = localStorage.getItem(ACTIVE_CHANNEL_KEY) || "";
   } catch (_error) {
-    return "";
+    shared = "";
   }
+  return [windowItem(ACTIVE_CHANNEL_KEY) || "", shared].filter((id) => id !== "");
 }
 
-function rememberActiveChannel() {
+/**
+ * Keep the channel on the bar as this window's. `chosen`, when the reader changed to it: then it is
+ * also the device's, the one a brand-new window opens on. A channel only put on the bar — the one a
+ * new window opened on, a list redrawn — is this window's alone, so another window's choice is not
+ * taken back by a window that merely reloaded. `#265 window-channel-memory`.
+ */
+function rememberActiveChannel(chosen = false) {
+  const id = el("discord-channel").value;
+  keepWindowItem(ACTIVE_CHANNEL_KEY, id || null);
+  if (!chosen) return;
   try {
-    const id = el("discord-channel").value;
     if (id) localStorage.setItem(ACTIVE_CHANNEL_KEY, id);
     else localStorage.removeItem(ACTIVE_CHANNEL_KEY);
   } catch (_error) {
@@ -28698,7 +28784,8 @@ function fillChannelSelect(id) {
   const select = el(id);
   // Restore only an ID still present in the server's current channel list. Settings has its own
   // picker and must not change the remembered reading destination merely by editing a channel.
-  const chosen = select.value || (id === "discord-channel" ? storedActiveChannel() : "");
+  const held = select.value ? [select.value] : id === "discord-channel" ? storedActiveChannels() : [];
+  const chosen = held.find((candidate) => knownChannels.some((channel) => String(channel.id) === String(candidate)));
   select.replaceChildren();
   for (const channel of knownChannels) {
     const option = document.createElement("option");
@@ -28706,7 +28793,7 @@ function fillChannelSelect(id) {
     option.textContent = channelName(channel);
     select.append(option);
   }
-  if (knownChannels.some((channel) => String(channel.id) === String(chosen))) {
+  if (chosen !== undefined) {
     select.value = chosen;
   } else if (knownChannels.length > 0) {
     select.value = knownChannels[0].id;
@@ -30479,7 +30566,8 @@ function changeSelectedChannel() {
   rowsGathered = false;
   dropReplyArrowTap();
   applyChannelProvider();
-  rememberActiveChannel();
+  // This window's, and the one a new window opens on. `#265 window-channel-memory`.
+  rememberActiveChannel(true);
   rememberChannelDraft();
   // `#205 channel-view-memory`. Another channel opens in the view the reader chose there, and in ITS
   // default — All where it has threads — when they chose none: a choice made in the last channel is
