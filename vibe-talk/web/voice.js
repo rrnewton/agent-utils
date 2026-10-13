@@ -123,7 +123,7 @@ let sideActive = false;
 /**
  * @overload
  * @param {"channel-compose-text" | "compose-text" | "prompt-blockers" | "prompt-summary"
- *   | "reply-text" | "side-compose-text"} id
+ *   | "reply-text" | "side-compose-text" | "voice-instructions" | "voice-system-prompt"} id
  * @returns {HTMLTextAreaElement}
  */
 /**
@@ -150,14 +150,15 @@ let sideActive = false;
  *   | "help-link-live-messages" | "help-link-mark-own" | "help-link-microphone"
  *   | "help-link-reading-width" | "help-link-resuming" | "help-link-rich-headers"
  *   | "help-link-speech-prep"
- *   | "help-link-storage" | "help-link-voice-send" | "jump-bookmark" | "jump-newest" | "link-kind-action" | "link-kind-commit"
+ *   | "help-link-storage" | "help-link-voice-instructions" | "help-link-voice-send" | "jump-bookmark" | "jump-newest" | "link-kind-action" | "link-kind-commit"
  *   | "link-kind-file" | "link-kind-issue" | "link-kind-other"
  *   | "link-kind-pr" | "links-filter" | "load-older" | "load-older-turns"
  *   | "msg-scale-larger" | "msg-scale-smaller"
  *   | "open-add-channel" | "open-browse-channels" | "open-help" | "open-settings"
  *   | "pinned-filter" | "post-confirm-cancel" | "post-confirm-send" | "prompts-open" | "read-aloud" | "read-new" | "read-speed" | "remove-channel"
- *   | "rename-channel" | "reply-cancel" | "reply-context-more" | "reply-send" | "save-alias"
- *   | "save-token"
+ *   | "rename-channel" | "reply-cancel" | "reply-context-more" | "reply-send"
+ *   | "restore-voice-system-prompt" | "save-alias" | "save-token" | "save-voice-instructions"
+ *   | "save-voice-system-prompt"
  *   | "search-in-all" | "search-toggle" | "send-text" | "side-clear-backlog" | "side-close" | "side-jump-newest"
  *   | "side-more-threads" | "side-older" | "side-send" | "side-unread-only" | "speaker" | "summarise" | "talk"
  *   | "thread-back" | "thread-directory-more" | "thread-directory-retry"
@@ -638,6 +639,7 @@ const HELP_TOPICS = [
   "speech-prep",
   "storage",
   "voice-send",
+  "voice-instructions",
   "connection",
 ];
 
@@ -10788,6 +10790,7 @@ async function openConversation(options) {
   session.providerName = String(minted.provider || conversationalVoice.name);
   session.inputRate = minted.input_sample_rate || 16000;
   session.outputRate = minted.output_sample_rate || 16000;
+  voicePromptForCall = minted.agent_prompt || null; // `#272 voice-agent-instructions`
   session.lastTranscriptKey = null;
   session.liveTurns = new Map();
   session.anonTurn = 0;
@@ -10931,7 +10934,12 @@ async function openConversation(options) {
     if (chat) {
       initiation.conversation_config_override = { conversation: { text_only: true } };
     }
+    // `#272 voice-agent-instructions`. The owner's words, in the form the server chose.
+    const promptNote = handOverAgentPrompt(initiation, voicePromptForCall);
     socket.send(JSON.stringify(initiation));
+    if (promptNote) {
+      socket.send(JSON.stringify(promptNote));
+    }
     if (resume && !carriedOnInitiation) {
       // Immediately after, and before any audio: the vendor documents this as non-interrupting
       // background information, and the first agent turn is the one that has to know.
@@ -26724,6 +26732,222 @@ function renderVoiceSendSettingWhileSaving(wanted) {
   el("voice-ask-before-send").disabled = true;
 }
 
+// --- the voice agent's instructions ----------------------------------------------------------------
+//
+// `#272 voice-agent-instructions`. The owner's own words for the agent — additional instructions,
+// and his edited copy of the base system prompt — are the SERVER's, like the send switch above: it
+// puts them into the prompt when a call opens, for every device. So both boxes are filled from
+// client-config and refilled from what the PUT stored, and each has its own Save, because a
+// half-typed instruction must not reach the agent.
+//
+// How the words reach the agent is the server's to say (`delivery`). A bridge fetches the prompt as
+// each call opens. A hosted agent is handed them by THIS page as its socket opens, in the form the
+// voice session names (`handOverAgentPrompt`) — the whole prompt only when the agent allows it to be
+// replaced. What the last call was actually given is kept, so the line under the boxes can say it:
+// an edited prompt a hosted agent would not take is exactly what the owner needs to be told.
+
+/** The owner's words as the server last reported them, or null when it does not say (an older server). */
+let voicePromptSettings = null;
+
+/** True while a save is on its way, so a second click cannot race it. */
+let voicePromptSaving = false;
+
+/** What the voice session asked this page to hand the agent of the call being opened, or null. */
+let voicePromptForCall = null;
+
+/** What the last call this page opened on a hosted agent was handed, or null before one. */
+let voicePromptLastCall = null;
+
+/** The characters in a box, counted as the server counts them: by code point, after trimming. */
+const promptChars = (text) => [...String(text).trim()].length;
+
+/** Which box holds text the server does not. */
+function voicePromptDirty() {
+  if (voicePromptSettings === null) return { instructions: false, system_prompt: false };
+  return {
+    instructions: el("voice-instructions").value.trim() !== voicePromptSettings.instructions,
+    system_prompt: el("voice-system-prompt").value.trim() !== voicePromptSettings.system_prompt.trim(),
+  };
+}
+
+/**
+ * Take down what the server said — from client-config, or from a save — and fill the boxes from it.
+ * A box named in `keep` keeps text the reader typed and has not saved: saving one box must not
+ * throw away an edit in the other.
+ */
+function applyVoicePrompt(view, keep = []) {
+  const dirty = voicePromptDirty();
+  const typed = { instructions: el("voice-instructions").value, system_prompt: el("voice-system-prompt").value };
+  voicePromptSettings =
+    view && typeof view.instructions === "string" && typeof view.system_prompt === "string" ? view : null;
+  if (voicePromptSettings !== null) {
+    for (const field of ["instructions", "system_prompt"]) {
+      const box = el(field === "instructions" ? "voice-instructions" : "voice-system-prompt");
+      box.value = keep.includes(field) && dirty[field] ? typed[field] : voicePromptSettings[field];
+    }
+  }
+  renderVoicePrompt();
+}
+
+/** Why the boxes cannot be changed here, or "" when they can. */
+function voicePromptLock() {
+  if (tokenScope !== "write") return "Only the write token can change these.";
+  if (!voicePromptSettings.changeable) return "This server keeps no settings, so these cannot be changed here.";
+  return "";
+}
+
+/** The line under the instructions box. */
+function voiceInstructionsLine(dirty) {
+  const length = promptChars(el("voice-instructions").value);
+  const limit = voicePromptSettings.max_instructions_chars;
+  if (length > limit) return `${length} characters; at most ${limit} are kept. Shorten them to save.`;
+  if (dirty) return "Not saved yet.";
+  return voicePromptSettings.instructions ? "Saved. Added to every call." : "None.";
+}
+
+/** The line under the system prompt, which says whose prompt it is and how old. */
+function voiceSystemPromptLine(dirty) {
+  const length = promptChars(el("voice-system-prompt").value);
+  const limit = voicePromptSettings.max_system_prompt_chars;
+  const version = voicePromptSettings.prompt_version;
+  if (length > limit) return `${length} characters; at most ${limit} are kept. Shorten it to save.`;
+  if (dirty) return "Not saved yet. Saving an empty box restores the shipped prompt.";
+  if (!voicePromptSettings.system_prompt_edited) return `The shipped prompt, version ${version}.`;
+  const from = voicePromptSettings.edited_from_version;
+  if (typeof from === "number" && from < version) {
+    return (
+      `Your copy, saved when the shipped prompt was version ${from}. It is now version ${version}; ` +
+      "restore it to see what changed."
+    );
+  }
+  return "Your copy, in place of the shipped prompt.";
+}
+
+/** How the words reach this deployment's agent. */
+function voicePromptDeliveryLine() {
+  if (voicePromptSettings.delivery === "profile") return "Both reach the agent at its next call.";
+  return "This page hands them to the agent as each call starts; the prompt only if its provider lets it be replaced.";
+}
+
+/** What the last call was given, said plainly — above all an edited prompt that did not reach it. */
+function voicePromptLastCallLine() {
+  const last = voicePromptLastCall;
+  if (last === null) return "";
+  const refused =
+    last.override_allowed === false
+      ? "The last call's agent does not let its prompt be replaced"
+      : "Whether the last call's agent lets its prompt be replaced could not be checked";
+  if (last.transport === "prompt_override") {
+    const what = last.system_prompt_applied
+      ? last.instructions_applied
+        ? "your prompt and instructions"
+        : "your prompt"
+      : "your instructions";
+    return `The last call was given ${what}.`;
+  }
+  if (last.transport === "contextual_update") {
+    return `${refused}, so only your instructions went, as a note at the start.`;
+  }
+  return `${refused}, so your edited prompt did not reach it.`;
+}
+
+/** Draw both boxes, their Saves and the lines under them from `voicePromptSettings`. */
+function renderVoicePrompt() {
+  const state = el("voice-prompt-state");
+  el("voice-prompt-editor").hidden = voicePromptSettings === null;
+  if (voicePromptSettings === null) {
+    state.textContent = "This server does not take instructions for its voice agent.";
+    return;
+  }
+  const lock = voicePromptLock();
+  const dirty = voicePromptDirty();
+  const held = Boolean(lock) || voicePromptSaving;
+  el("voice-instructions").disabled = Boolean(lock);
+  el("voice-system-prompt").disabled = Boolean(lock);
+  el("save-voice-instructions").disabled =
+    held || !dirty.instructions ||
+    promptChars(el("voice-instructions").value) > voicePromptSettings.max_instructions_chars;
+  el("save-voice-system-prompt").disabled =
+    held || !dirty.system_prompt ||
+    promptChars(el("voice-system-prompt").value) > voicePromptSettings.max_system_prompt_chars;
+  el("restore-voice-system-prompt").disabled =
+    held || (!voicePromptSettings.system_prompt_edited && !dirty.system_prompt);
+  el("voice-instructions-state").textContent = voiceInstructionsLine(dirty.instructions);
+  el("voice-system-prompt-state").textContent = voiceSystemPromptLine(dirty.system_prompt);
+  state.textContent = [lock, voicePromptDeliveryLine(), voicePromptLastCallLine()].filter(Boolean).join(" ");
+}
+
+/** Save one box, then draw what the server STORED; on failure, keep the typed text and say so. */
+async function saveVoicePrompt(field, text) {
+  voicePromptSaving = true;
+  renderVoicePrompt();
+  let stored = null;
+  try {
+    stored = await apiDecoded("VoicePromptSettings", "/api/v1/voice-prompt", {
+      method: "PUT",
+      body: { [field]: text },
+    });
+  } catch (error) {
+    voicePromptSaving = false;
+    renderVoicePrompt();
+    const what = field === "instructions" ? "The instructions were" : "The system prompt was";
+    showError(`${what} not saved: ${error.detail || error.message}`);
+    return;
+  }
+  voicePromptSaving = false;
+  applyVoicePrompt(stored, [field === "instructions" ? "system_prompt" : "instructions"]);
+  if (field === "instructions") {
+    setStatus(
+      stored.instructions
+        ? "Saved. The voice agent gets these instructions from its next call."
+        : "Saved. The voice agent has no additional instructions from its next call."
+    );
+  } else {
+    setStatus(
+      stored.system_prompt_edited
+        ? "Saved. The voice agent gets your prompt from its next call."
+        : "Saved. The voice agent gets the shipped prompt from its next call."
+    );
+  }
+}
+
+/** Back to the shipped prompt: a save of an empty box, or just the box put back when nothing was saved. */
+async function restoreVoiceSystemPrompt() {
+  if (voicePromptSettings === null) return;
+  if (!voicePromptSettings.system_prompt_edited) {
+    el("voice-system-prompt").value = voicePromptSettings.system_prompt;
+    renderVoicePrompt();
+    return;
+  }
+  await saveVoicePrompt("system_prompt", "");
+}
+
+/**
+ * Put the owner's words on a hosted agent's opening frames, in the form the server chose, and
+ * remember what this call was given. Answers the frame to send right after the initiation, or null.
+ *
+ * `prompt_override` rides on the initiation itself, beside a typed call's text-only request; the
+ * server names it only when the agent's own configuration allows it, because one it does not allow
+ * is believed to end the conversation. `contextual_update` is a note sent straight after, as
+ * resuming's record is. Anything else sends nothing, and an absent `handed` leaves the frame exactly
+ * as it always was.
+ */
+function handOverAgentPrompt(initiation, handed) {
+  voicePromptLastCall = handed && typeof handed.transport === "string" ? handed : null;
+  renderVoicePrompt();
+  if (voicePromptLastCall === null || typeof handed.text !== "string" || handed.text === "") return null;
+  if (handed.transport === "prompt_override") {
+    const override = initiation.conversation_config_override || {};
+    initiation.conversation_config_override = {
+      ...override,
+      agent: { ...(override.agent || {}), prompt: { prompt: handed.text } },
+    };
+    return null;
+  }
+  if (handed.transport === "contextual_update") return { type: "contextual_update", text: handed.text };
+  return null;
+}
+
 // --- replying to a channel message -------------------------------------------------------------
 //
 // Drafts are per target message. Once Send is pressed the captured reply target, destination and
@@ -31948,6 +32172,8 @@ function applyClientConfig(config) {
   applyNoiseRules(config.noise_rules);
   // `#264 voice-send-approval`. After `tokenScope`, which decides whether the box may be changed.
   applyVoiceSendSetting(config.voice_settings);
+  // `#272 voice-agent-instructions`. After `tokenScope` too, for the same reason.
+  applyVoicePrompt(config.voice_prompt);
   // Started here rather than when the Discord view opens: PUSH TWO is the point of it, and an
   // arriving message has to be able to reach a call that is happening on the OTHER tab. Following
   // only the visible view would mean the relay was off precisely while the reader was talking.
@@ -32704,6 +32930,17 @@ el("remove-channel").addEventListener("click", guardQuietly(removeChannel));
 el("save-alias").addEventListener("click", guardQuietly(saveAlias));
 el("add-noise-rule").addEventListener("click", guardQuietly(addNoiseRule));
 el("voice-ask-before-send").addEventListener("change", guardQuietly(saveVoiceSendSetting));
+el("voice-instructions").addEventListener("input", renderVoicePrompt);
+el("voice-system-prompt").addEventListener("input", renderVoicePrompt);
+el("save-voice-instructions").addEventListener(
+  "click",
+  guardQuietly(() => saveVoicePrompt("instructions", el("voice-instructions").value))
+);
+el("save-voice-system-prompt").addEventListener(
+  "click",
+  guardQuietly(() => saveVoicePrompt("system_prompt", el("voice-system-prompt").value))
+);
+el("restore-voice-system-prompt").addEventListener("click", guardQuietly(restoreVoiceSystemPrompt));
 el("noise-rule-new").addEventListener("keydown", (event) => {
   if (event.key === "Enter") guardQuietly(addNoiseRule)();
 });

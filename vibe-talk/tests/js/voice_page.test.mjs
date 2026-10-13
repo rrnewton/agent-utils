@@ -433,20 +433,45 @@ const REPLY_VIEWPORT_PX = 200;
 
 /** Where web/voice.html defines an id: which line, and how deeply indented. */
 /**
- * The markup of one settings group, `<section class="settings-group">` .. `</section>`.
+ * The markup of one settings group, `<section class="settings-group"…>` .. `</section>`.
  *
  * `#85 voice-desktop-review`. Sliced between markers rather than parsed, like every other markup
  * assertion in this file — but bounded by the group's OWN closing tag rather than by "the next
- * heading", because the groups are now cards and a slice that ran to the next `<h2>` would sweep in
- * whatever card follows and let a disclosure pass by being present somewhere nearby.
+ * heading", because a slice that ran to the next heading would sweep in whatever group follows and
+ * let a disclosure pass by being present somewhere nearby. `#271 settings-groups` made a group's
+ * heading an `<h3>`, under its section's `<h2>`.
  */
 function settingsGroup(heading) {
-  const at = HTML.indexOf(`<h2>${heading}</h2>`);
+  const at = HTML.indexOf(`<h3>${heading}</h3>`);
   assert.ok(at > 0, `web/voice.html has no settings group headed "${heading}"`);
-  const opens = HTML.lastIndexOf('<section class="settings-group">', at);
+  const opens = HTML.lastIndexOf('<section class="settings-group"', at);
   assert.ok(opens > 0, `"${heading}" is not inside a settings group`);
   const closes = HTML.indexOf("</section>", at);
+  assert.ok(
+    !HTML.slice(opens, at).includes("</section>"),
+    `"${heading}" is not inside the settings group before it`
+  );
   return HTML.slice(opens, closes);
+}
+
+/**
+ * The markup of one Settings section, `<section class="settings-section" id="settings-…">` to the
+ * `</section>` that closes it. `#271 settings-groups`. Sections hold groups, which are sections too,
+ * so the closing tag is found by counting rather than by the first one met.
+ */
+function settingsSection(title) {
+  const head = new RegExp(`<h2 id="(settings-[a-z-]+)-title">${title}</h2>`).exec(HTML);
+  assert.ok(head, `web/voice.html has no settings section titled "${title}"`);
+  const opens = HTML.indexOf(`<section class="settings-section" id="${head[1]}"`);
+  assert.ok(opens > 0 && opens < head.index, `"${title}" does not head a settings section`);
+  const tags = /<section\b|<\/section>/g;
+  tags.lastIndex = opens;
+  let depth = 0;
+  for (let tag = tags.exec(HTML); tag; tag = tags.exec(HTML)) {
+    depth += tag[0] === "</section>" ? -1 : 1;
+    if (depth === 0) return HTML.slice(opens, tag.index);
+  }
+  return assert.fail(`the "${title}" section never closes`);
 }
 
 /** The markup of one help entry, `<details id="help-<slug>">` .. `</details>`. */
@@ -1335,6 +1360,28 @@ const MINTED = async () => {
 const CHANNEL = { id: "1110000000000000001", label: "lead team", writable: true, alias: null, added: false };
 
 /**
+ * Stand-in for `vibe_talk::voice_agent::SYSTEM_PROMPT`. `#272 voice-agent-instructions`. Not the real
+ * text, for the reason `REPLAY_PREAMBLE` gives: the page carries the server's prompt, it does not
+ * read it.
+ */
+const SHIPPED_SYSTEM_PROMPT = "You are a voice assistant that connects a human user with chat threads.";
+
+/** What client-config says about the owner's words when he has saved none, on a hosted agent. */
+function voicePromptView(fields = {}) {
+  return {
+    instructions: "",
+    system_prompt: SHIPPED_SYSTEM_PROMPT,
+    system_prompt_edited: false,
+    prompt_version: 9,
+    max_instructions_chars: 4000,
+    max_system_prompt_chars: 20000,
+    changeable: true,
+    delivery: "page",
+    ...fields,
+  };
+}
+
+/**
  * Stand-in for `vibe_talk::replay::PREAMBLE`.
  *
  * Deliberately not the real text: the page must not depend on the WORDS of a payload the server
@@ -1588,6 +1635,8 @@ function newPage(store = new Map(), script = SCRIPT, arrange = null) {
         noise_rules: page.noiseRules,
         // `#264 voice-send-approval`. Absent when a test sets it to `undefined`.
         voice_settings: page.voiceSettings,
+        // `#272 voice-agent-instructions`. Absent when a test sets it to `undefined`.
+        voice_prompt: page.voicePrompt,
         // `#199 removable-config-channels`. Absent when nothing is hidden, as the server omits it.
         hidden_channels: page.hiddenChannels.length
           ? page.hiddenChannels.map((channel) => ({ alias: null, added: false, ...channel }))
@@ -1960,6 +2009,15 @@ function newPage(store = new Map(), script = SCRIPT, arrange = null) {
     appliedEchoCancellation: undefined,
     /** Set to a status to make the voice settings route refuse, the way a store-less server does. */
     voiceSettingsStatus: null,
+    /**
+     * `#272 voice-agent-instructions`: the owner's words for the voice agent, as client-config
+     * reports them. `undefined` sends nothing, as an older server does.
+     */
+    voicePrompt: voicePromptView(),
+    /** Every body the page PUT to the voice prompt route, in order. */
+    voicePromptCalls: [],
+    /** Set to a status to make the voice prompt route refuse, the way a store-less server does. */
+    voicePromptStatus: null,
     /** How many times the page has read the to-do list. */
     todoReads: 0,
     /**
@@ -2662,6 +2720,29 @@ function newPage(store = new Map(), script = SCRIPT, arrange = null) {
         }
         page.voiceSettings = { ask_before_send: body.ask_before_send === true, changeable: true };
         return json(200, page.voiceSettings);
+      }
+      // `#272 voice-agent-instructions`. A real little store, tidying as the server does: what the
+      // page PUT is what the answer says, an absent field keeps its text, and an empty prompt (or
+      // the shipped one) restores the shipped one.
+      if (String(path) === "/api/v1/voice-prompt") {
+        const body = JSON.parse((options && options.body) || "null");
+        page.voicePromptCalls.push(body);
+        if (page.voicePromptStatus) {
+          return json(page.voicePromptStatus, { error: "storage_not_configured", detail: "storage.path" });
+        }
+        const now = page.voicePrompt || voicePromptView();
+        const next = { ...now };
+        if (typeof body.instructions === "string") next.instructions = body.instructions.trim();
+        if (typeof body.system_prompt === "string") {
+          const text = body.system_prompt.trim();
+          const shipped = !text || text === SHIPPED_SYSTEM_PROMPT;
+          next.system_prompt = shipped ? SHIPPED_SYSTEM_PROMPT : text;
+          next.system_prompt_edited = !shipped;
+          if (shipped) delete next.edited_from_version;
+          else if (text !== now.system_prompt) next.edited_from_version = next.prompt_version;
+        }
+        page.voicePrompt = next;
+        return json(200, next);
       }
       if (/\/not-noise$/.test(String(path))) {
         const body = JSON.parse((options && options.body) || "null");
@@ -16379,7 +16460,7 @@ test("CONNECTION STATUS IS LAST, because it is a readout and not a setting", () 
     HTML.indexOf('id="screen-settings"'),
     HTML.indexOf('id="screen-help"')
   );
-  const headings = [...settings.matchAll(/<h2>([^<]+)<\/h2>/g)].map((m) => m[1]);
+  const headings = [...settings.matchAll(/<h3>([^<]+)<\/h3>/g)].map((m) => m[1]);
   assert.ok(headings.length > 3, "the settings screen lost its groups");
   assert.equal(
     headings[headings.length - 1],
@@ -16389,6 +16470,9 @@ test("CONNECTION STATUS IS LAST, because it is a readout and not a setting", () 
   assert.notEqual(headings[0], "Connection status");
   // Renamed as well as moved: "Connection" reads as somewhere you configure one.
   assert.ok(!headings.includes("Connection"), "the old bare heading is still there");
+  const sections = [...settings.matchAll(/<h2 id="settings-[a-z-]+-title">([^<]+)<\/h2>/g)].map((m) => m[1]);
+  assert.ok(settingsSection(sections[sections.length - 1]).includes("<h3>Connection status</h3>"),
+    "the readout is not in the last section");
 });
 
 test("a ? opens Help, and the way back goes to Settings rather than out of it", async () => {
@@ -19931,6 +20015,10 @@ test("EVERY CONTROL ON SETTINGS keeps its value the moment it changes: nothing t
     // `#232 upstream-mark-read`. Marking every message read in the chat service's own app is a
     // decision about the owner's attention there, so choosing a mode only shows what Save would do.
     "upstream-clear-mode": "upstream-clear-save",
+    // `#272 voice-agent-instructions`. What the voice agent is told on every call: a half-typed
+    // instruction must not reach it, so each box saves with its own button.
+    "voice-instructions": "save-voice-instructions",
+    "voice-system-prompt": "save-voice-system-prompt",
   };
   const page = newPage();
   const controls = [...PAGE_ELEMENTS].filter(([id, markup]) =>
@@ -24910,7 +24998,7 @@ test("the per-channel settings are all under ONE channel selector", async () => 
   // Read off the MARKUP rather than the fixture's DOM: the fixture knows which ids exist but not
   // how they nest, and nesting is exactly the claim. The group is sliced out of web/voice.html and
   // every per-channel control has to be inside that slice.
-  const start = HTML.indexOf('<section class="settings-group" id="channel-settings">');
+  const start = HTML.indexOf('<section class="settings-group" id="channel-settings"');
   assert.ok(start > 0, "the per-channel group is gone from the markup");
   const group = HTML.slice(start, HTML.indexOf("</section>", start));
   for (const id of ["settings-channel", "channel-alias", "save-alias", "remove-channel", "add-channel"]) {
@@ -31197,7 +31285,7 @@ test("`#264 voice-send-approval`: the Voice checkbox shows the server's setting 
     assert.equal(page.el("voice-ask-before-send").disabled, false);
     assert.equal(page.el("voice-ask-before-send-state").textContent, line);
   }
-  const group = settingsGroup("Voice");
+  const group = settingsGroup("Sending");
   assert.match(group, /Ask me before the voice agent sends/);
   assert.match(group, /data-help="voice-send"/, "the group offers no way to reach the detail");
   assert.match(helpEntry("voice-send"), /cannot tell your voice from anyone else/);
@@ -48971,4 +49059,367 @@ test("`#262 search-load-older`: Main drawn from All reads its own newest page fi
   assert.deepStrictEqual(reads, [["main", false], ...Array(SEARCH_OLDER_PAGES).fill(["main", true])],
     "the walk did not read Main's newest page and then five older ones");
   assert.match(page.el("search-empty").textContent, /^Nothing in the \d+ messages loaded so far/);
+});
+
+// --- `#271 settings-groups` -----------------------------------------------------------------------
+//
+// The owner: "organize the settings page a little more logically so it doesn't look like so many
+// individual granular options" — a Voice agent group holding at least resuming and live messages, a
+// Messages group, and the switch that lets the agent send without approval somewhere he can find it.
+
+/** Every Settings section's title, in the order the markup gives them. */
+const SETTINGS_SECTIONS = [...HTML.matchAll(/<h2 id="settings-[a-z-]+-title">([^<]+)<\/h2>/g)].map((m) => m[1]);
+
+/** The group headings inside one section, in order. */
+const groupsIn = (title) => [...settingsSection(title).matchAll(/<h3>([^<]+)<\/h3>/g)].map((m) => m[1]);
+
+test("`#271 settings-groups`: Settings is a handful of sections, and every group is inside one", () => {
+  assert.deepStrictEqual(
+    SETTINGS_SECTIONS,
+    ["Voice agent", "Messages", "Channels", "Screen and keys", "Storage and connection"],
+    "the sections are not the five the screen is arranged around"
+  );
+  const settings = HTML.slice(HTML.indexOf('id="screen-settings"'), HTML.indexOf('id="screen-help"'));
+  const groups = [...settings.matchAll(/<section class="settings-group"/g)].length;
+  const inSections = SETTINGS_SECTIONS.reduce(
+    (count, title) => count + [...settingsSection(title).matchAll(/<section class="settings-group"/g)].length, 0);
+  assert.equal(inSections, groups, "a settings group stands outside every section");
+  assert.ok(groups >= 20, `only ${groups} groups were found; one was lost in the move`);
+  // A section's title is the screen's only h2; a group's heading is one step down.
+  assert.equal([...settings.matchAll(/<h2\b/g)].length, SETTINGS_SECTIONS.length, "a group kept an h2");
+  for (const title of SETTINGS_SECTIONS) {
+    assert.match(settingsSection(title), /^<section class="settings-section" id="(settings-[a-z-]+)" aria-labelledby="\1-title">/,
+      `the "${title}" section is not named by its heading`);
+  }
+});
+
+test("`#271 settings-groups`: the Voice agent section holds sending, the instructions, resuming and live messages", () => {
+  const voice = groupsIn("Voice agent");
+  for (const group of ["Sending", "Instructions", "Resuming", "Live messages", "Canned prompts", "Microphone"]) {
+    assert.ok(voice.includes(group), `"${group}" is not in the Voice agent section: ${voice.join(", ")}`);
+  }
+  // FIRST, where the owner looks: the switch he could not find.
+  assert.equal(voice[0], "Sending", `the section opens on "${voice[0]}", not on whether the agent asks first`);
+  const sending = settingsGroup("Sending");
+  assert.match(sending, /id="voice-ask-before-send"/);
+  assert.match(sending, /<p class="hint">Untick it to let the agent send as soon as you ask, with no read-back\.<\/p>/,
+    "nothing beside the switch says it is the way to let the agent send without asking");
+  assert.equal(voice[1], "Instructions", "the instructions are not beside the switch about sending");
+});
+
+test("`#271 settings-groups`: the Messages section holds the message options, and nothing about the agent", () => {
+  const messages = groupsIn("Messages");
+  for (const group of ["Your own messages", "Read automatically", "Combining messages", "Rich headers",
+    "Recently dismissed", "How messages are said", "Message audio"]) {
+    assert.ok(messages.includes(group), `"${group}" is not in the Messages section: ${messages.join(", ")}`);
+  }
+  for (const agentGroup of ["Sending", "Instructions", "Resuming", "Live messages"]) {
+    assert.ok(!messages.includes(agentGroup), `"${agentGroup}" is in Messages`);
+  }
+  assert.deepStrictEqual(groupsIn("Screen and keys"), ["Text size", "Reading width", "Control bar", "Typing", "Keyboard"]);
+  assert.deepStrictEqual(groupsIn("Storage and connection"), ["Stored conversations", "Token", "Connection status"]);
+  // The per-channel box is its own section, with its `?` beside the section's title.
+  const channels = settingsSection("Channels");
+  assert.match(channels, /<h2 id="settings-channels-title">Channels<\/h2>\s*<button class="help-link" id="help-link-channel-alias"/);
+  assert.match(channels, /<section class="settings-group" id="channel-settings"/);
+});
+
+test("`#271 settings-groups`: the section is the card, and a group inside it is a row under a rule", () => {
+  const section = cssBlock(".settings-section");
+  assert.match(section, /border:\s*1px solid var\(--edge\)/, "a section is not drawn as a card");
+  assert.match(section, /background:\s*var\(--panel\)/);
+  const row = cssBlock(".settings-section > .settings-group");
+  assert.match(row, /border:\s*none/, "a group inside a section still draws a card of its own");
+  assert.match(row, /border-top:\s*1px solid var\(--edge\)/, "nothing says where one group ends and the next begins");
+  assert.match(row, /background:\s*none/);
+  const size = (block) => Number(/font-size:\s*([\d.]+)rem/.exec(block)[1]);
+  assert.ok(
+    size(cssBlock("#screen-settings .settings-section > h2")) > size(cssBlock("#screen-settings .settings-group > .group-head > h3")),
+    "a section's title is no louder than the groups inside it"
+  );
+});
+
+// --- `#272 voice-agent-instructions` --------------------------------------------------------------
+
+/** Sign in with the owner's words as the server reports them, and open Settings. */
+async function instructionsPage(fields = {}, arrange = (_page) => {}) {
+  const page = newPage();
+  page.voicePrompt = voicePromptView(fields);
+  arrange(page);
+  await signIn(page);
+  await page.el("open-settings").click();
+  return page;
+}
+
+test("`#272 voice-agent-instructions`: the Instructions group is a box, a Save, and a folded system prompt", () => {
+  const group = settingsGroup("Instructions");
+  assert.match(group, /<label for="voice-instructions">Additional instructions<\/label>/);
+  assert.equal(PAGE_ELEMENTS.get("voice-instructions").tag, "textarea");
+  assert.equal(PAGE_ELEMENTS.get("voice-system-prompt").tag, "textarea");
+  const fold = /<details id="voice-system-prompt-fold" class="settings-fold">\s*<summary>Edit the system prompt<\/summary>([\s\S]*?)<\/details>/.exec(group);
+  assert.ok(fold, "the system prompt is not in a folded disclosure headed Edit the system prompt");
+  assert.doesNotMatch(group, /<details[^>]*\bopen\b/, "the system prompt is served unfolded");
+  for (const id of ["voice-system-prompt", "save-voice-system-prompt", "restore-voice-system-prompt"]) {
+    assert.ok(fold[1].includes(`id="${id}"`), `#${id} is not inside the fold`);
+  }
+  assert.match(fold[1], /added after it from your token and the switch above/,
+    "the fold does not say that what the agent may do is not in the box");
+  assert.match(group, /data-help="voice-instructions"/, "the group offers no way to reach the detail");
+  const help = helpEntry("voice-instructions");
+  assert.match(help, /Neither box can change what the agent is able to do/);
+  assert.match(help, /only the additional instructions, as a\s+note at the start of the call/);
+  assert.match(help, /exactly as it did before/);
+  assert.equal(PAGE_ELEMENTS.get("voice-prompt-editor").hidden, true, "the editor is served before the server says it exists");
+});
+
+test("`#272 voice-agent-instructions`: the boxes show what the server holds, with a line for each", async () => {
+  const page = await instructionsPage({ instructions: "Call me Sam." });
+  assert.equal(page.el("voice-prompt-editor").hidden, false);
+  assert.equal(page.el("voice-instructions").value, "Call me Sam.");
+  assert.equal(page.el("voice-system-prompt").value, SHIPPED_SYSTEM_PROMPT);
+  assert.equal(page.el("voice-instructions-state").textContent, "Saved. Added to every call.");
+  assert.equal(page.el("voice-system-prompt-state").textContent, "The shipped prompt, version 9.");
+  assert.equal(page.el("save-voice-instructions").disabled, true, "Save is live with nothing to save");
+  assert.equal(page.el("save-voice-system-prompt").disabled, true);
+  assert.equal(page.el("restore-voice-system-prompt").disabled, true, "Restore is live on the shipped prompt");
+  assert.match(page.el("voice-prompt-state").textContent, /hands them to the agent as each call starts; the prompt only if its provider lets it be replaced/);
+
+  const bridge = await instructionsPage({ delivery: "profile" });
+  assert.equal(bridge.el("voice-prompt-state").textContent, "Both reach the agent at its next call.");
+  assert.equal(bridge.el("voice-instructions-state").textContent, "None.");
+});
+
+test("`#272 voice-agent-instructions`: typing says it is not saved, and Save sends that box alone and draws what was stored", async () => {
+  const page = await instructionsPage();
+  await page.el("voice-instructions").setValue("  Call me Sam.\nKeep it short.  ");
+  assert.equal(page.el("voice-instructions-state").textContent, "Not saved yet.");
+  assert.equal(page.el("save-voice-instructions").disabled, false);
+  assert.equal(page.el("save-voice-system-prompt").disabled, true, "the other box's Save woke up");
+  await page.el("save-voice-instructions").click();
+  await page.settle();
+  assert.deepStrictEqual(page.voicePromptCalls, [{ instructions: "  Call me Sam.\nKeep it short.  " }]);
+  assert.equal(page.el("voice-instructions").value, "Call me Sam.\nKeep it short.", "the box kept the click, not what was stored");
+  assert.equal(page.el("voice-instructions-state").textContent, "Saved. Added to every call.");
+  assert.equal(page.el("save-voice-instructions").disabled, true);
+  assert.match(page.el("status").textContent, /gets these instructions from its next call/);
+
+  await page.el("voice-instructions").setValue("");
+  await page.el("save-voice-instructions").click();
+  await page.settle();
+  assert.deepStrictEqual(page.voicePromptCalls[1], { instructions: "" });
+  assert.match(page.el("status").textContent, /no additional instructions from its next call/);
+});
+
+test("`#272 voice-agent-instructions`: saving the system prompt keeps an unsaved instruction, and says whose prompt it is", async () => {
+  const page = await instructionsPage({ instructions: "Call me Sam." });
+  await page.el("voice-instructions").setValue("Call me Samantha.");
+  await page.el("voice-system-prompt").setValue("You read me the chat while I drive.");
+  assert.equal(page.el("voice-system-prompt-state").textContent,
+    "Not saved yet. Saving an empty box restores the shipped prompt.");
+  assert.equal(page.el("restore-voice-system-prompt").disabled, false);
+  await page.el("save-voice-system-prompt").click();
+  await page.settle();
+  assert.deepStrictEqual(page.voicePromptCalls, [{ system_prompt: "You read me the chat while I drive." }]);
+  assert.equal(page.el("voice-instructions").value, "Call me Samantha.", "saving the prompt threw away the instruction being typed");
+  assert.equal(page.el("save-voice-instructions").disabled, false, "the unsaved instruction can no longer be saved");
+  assert.equal(page.el("voice-system-prompt-state").textContent, "Your copy, in place of the shipped prompt.");
+  assert.match(page.el("status").textContent, /gets your prompt from its next call/);
+
+  // Restore saves an empty box, and the server's shipped prompt comes back.
+  await page.el("restore-voice-system-prompt").click();
+  await page.settle();
+  assert.deepStrictEqual(page.voicePromptCalls[1], { system_prompt: "" });
+  assert.equal(page.el("voice-system-prompt").value, SHIPPED_SYSTEM_PROMPT);
+  assert.equal(page.el("voice-system-prompt-state").textContent, "The shipped prompt, version 9.");
+  assert.match(page.el("status").textContent, /gets the shipped prompt from its next call/);
+});
+
+test("`#272 voice-agent-instructions`: Restore with nothing saved puts the box back and writes nothing", async () => {
+  const page = await instructionsPage();
+  await page.el("voice-system-prompt").setValue("half an edit");
+  await page.el("restore-voice-system-prompt").click();
+  await page.settle();
+  assert.deepStrictEqual(page.voicePromptCalls, [], "putting back an unsaved edit wrote to the server");
+  assert.equal(page.el("voice-system-prompt").value, SHIPPED_SYSTEM_PROMPT);
+  assert.equal(page.el("restore-voice-system-prompt").disabled, true);
+});
+
+test("`#272 voice-agent-instructions`: an edit saved against an older shipped prompt says so", async () => {
+  const page = await instructionsPage({
+    system_prompt: "mine", system_prompt_edited: true, edited_from_version: 8,
+  });
+  assert.equal(page.el("voice-system-prompt-state").textContent,
+    "Your copy, saved when the shipped prompt was version 8. It is now version 9; restore it to see what changed.");
+  assert.equal(page.el("restore-voice-system-prompt").disabled, false);
+});
+
+test("`#272 voice-agent-instructions`: a text over the limit cannot be saved, and says how long it is", async () => {
+  const page = await instructionsPage({ max_instructions_chars: 10 });
+  await page.el("voice-instructions").setValue("x".repeat(11));
+  assert.equal(page.el("save-voice-instructions").disabled, true);
+  assert.equal(page.el("voice-instructions-state").textContent, "11 characters; at most 10 are kept. Shorten them to save.");
+  // Counted as the server counts, by character: one emoji is one, not two.
+  await page.el("voice-instructions").setValue("🙂".repeat(10));
+  assert.equal(page.el("save-voice-instructions").disabled, false);
+});
+
+test("`#272 voice-agent-instructions`: a refused save keeps what was typed and says it was not saved", async () => {
+  const page = await instructionsPage({}, (p) => { p.voicePromptStatus = 503; });
+  await page.el("voice-instructions").setValue("Call me Sam.");
+  await page.el("save-voice-instructions").click();
+  await page.settle();
+  assert.equal(page.el("voice-instructions").value, "Call me Sam.", "a refused save lost the text");
+  assert.equal(page.el("voice-instructions-state").textContent, "Not saved yet.");
+  assert.equal(page.el("save-voice-instructions").disabled, false, "the text cannot be tried again");
+  assert.equal(page.el("error").hidden, false);
+  assert.match(page.el("error").textContent, /The instructions were not saved/);
+});
+
+test("`#272 voice-agent-instructions`: a read token and a store-less server can read the words but not change them; an older server hides them", async () => {
+  const read = await instructionsPage({ instructions: "Call me Sam." }, (p) => { p.tokenScope = "read"; });
+  assert.equal(read.el("voice-instructions").value, "Call me Sam.");
+  assert.equal(read.el("voice-instructions").disabled, true);
+  assert.equal(read.el("voice-system-prompt").disabled, true);
+  assert.equal(read.el("save-voice-instructions").disabled, true);
+  assert.equal(read.el("restore-voice-system-prompt").disabled, true);
+  assert.match(read.el("voice-prompt-state").textContent, /^Only the write token can change these\./);
+
+  const storeless = await instructionsPage({ changeable: false });
+  assert.equal(storeless.el("voice-instructions").disabled, true);
+  assert.match(storeless.el("voice-prompt-state").textContent, /keeps no settings/);
+
+  const older = newPage();
+  older.voicePrompt = undefined;
+  await signIn(older);
+  assert.equal(older.el("voice-prompt-editor").hidden, true);
+  assert.equal(older.el("voice-prompt-state").textContent, "This server does not take instructions for its voice agent.");
+});
+
+/** A hosted agent's session carrying the owner's words, as `/api/v1/voice-session` serializes one. */
+const mintWithPrompt = (agentPrompt) => async () => {
+  const minted = JSON.parse(await (await MINTED()).text());
+  return json(200, agentPrompt === undefined ? minted : { ...minted, agent_prompt: agentPrompt });
+};
+
+/** Start a spoken call on a session handed `agentPrompt`, the way `startTalking` starts one. */
+async function talkWithPrompt(page, agentPrompt) {
+  page.el("api-token").value = "write-token-aaaaaaaaaaaaaaaa";
+  await page.el("save-token").click();
+  await page.settle();
+  page.setFetch(mintWithPrompt(agentPrompt));
+  await page.el("talk").click();
+  assert.equal(page.el("error").hidden, true, `start() failed: ${page.el("error").textContent}`);
+  assert.equal(page.sockets.length, 1, "start() opened no websocket");
+  page.sockets[0].onopen();
+  assert.equal(state(page), "live");
+  return page.sockets[0];
+}
+
+const OVERRIDE = {
+  transport: "prompt_override",
+  text: "You read me the chat.\n\nThe user has added the standing instructions below.\n\nCall me Sam.",
+  system_prompt_applied: true,
+  instructions_applied: true,
+  override_allowed: true,
+};
+const NOTE = {
+  transport: "contextual_update",
+  text: "The user has added the standing instructions below.\nCall me Sam.",
+  system_prompt_applied: false,
+  instructions_applied: true,
+  override_allowed: false,
+};
+
+test("`#272 voice-agent-instructions`: an agent that allows it is given the whole prompt on the initiation, and nothing more", async () => {
+  const page = newPage();
+  page.voicePrompt = voicePromptView({
+    instructions: "Call me Sam.", system_prompt: "You read me the chat.", system_prompt_edited: true, edited_from_version: 9,
+  });
+  const socket = await talkWithPrompt(page, OVERRIDE);
+  assert.deepStrictEqual(initiationFrame(socket), {
+    type: "conversation_initiation_client_data",
+    conversation_config_override: { agent: { prompt: { prompt: OVERRIDE.text } } },
+  });
+  assert.equal(framesOfType(socket, "contextual_update").length, 0, "the words went twice");
+  assert.equal(framesSent(socket)[0].type, "conversation_initiation_client_data");
+  assert.match(page.el("voice-prompt-state").textContent, /The last call was given your prompt and instructions\.$/);
+});
+
+test("`#272 voice-agent-instructions`: an agent that does not is sent the instructions as a note straight after an unchanged initiation", async () => {
+  const page = newPage();
+  page.voicePrompt = voicePromptView({
+    instructions: "Call me Sam.", system_prompt: "You read me the chat.", system_prompt_edited: true, edited_from_version: 9,
+  });
+  const socket = await talkWithPrompt(page, NOTE);
+  assert.deepStrictEqual(initiationFrame(socket), { type: "conversation_initiation_client_data" },
+    "an override went to an agent that does not allow one");
+  const frames = framesSent(socket);
+  assert.equal(frames[0].type, "conversation_initiation_client_data");
+  assert.deepStrictEqual(frames[1], { type: "contextual_update", text: NOTE.text },
+    "the note is not the frame straight after the initiation");
+  assert.match(page.el("voice-prompt-state").textContent,
+    /The last call's agent does not let its prompt be replaced, so only your instructions went, as a note at the start\.$/);
+
+  const unknown = newPage();
+  const { override_allowed: _said, ...unsaid } = NOTE;
+  await talkWithPrompt(unknown, unsaid);
+  assert.match(unknown.el("voice-prompt-state").textContent, /could not be checked, so only your instructions went/);
+});
+
+test("`#272 voice-agent-instructions`: an edited prompt an agent cannot take sends nothing, and Settings says it did not reach it", async () => {
+  const page = newPage();
+  const socket = await talkWithPrompt(page, {
+    transport: "not_sent", system_prompt_applied: false, instructions_applied: false, override_allowed: false,
+  });
+  assert.deepStrictEqual(framesSent(socket).filter((f) => f.type).map((f) => f.type),
+    ["conversation_initiation_client_data"]);
+  assert.deepStrictEqual(initiationFrame(socket), { type: "conversation_initiation_client_data" });
+  assert.match(page.el("voice-prompt-state").textContent, /so your edited prompt did not reach it\.$/);
+});
+
+test("`#272 voice-agent-instructions`: with nothing of the owner's the call opens exactly as before, and says nothing about it", async () => {
+  const page = newPage();
+  const socket = await talkWithPrompt(page, undefined);
+  assert.deepStrictEqual(initiationFrame(socket), { type: "conversation_initiation_client_data" });
+  assert.equal(framesOfType(socket, "contextual_update").length, 0);
+  assert.doesNotMatch(page.el("voice-prompt-state").textContent, /last call/);
+});
+
+test("`#272 voice-agent-instructions`: a typed call asks for text-only AND the owner's prompt, on one initiation", async () => {
+  const page = newPage();
+  page.el("api-token").value = "write-token-aaaaaaaaaaaaaaaa";
+  await page.el("save-token").click();
+  await page.settle();
+  page.setFetch(mintWithPrompt(OVERRIDE));
+  await compose(page, "hello");
+  await page.el("send-text").click();
+  await page.settle();
+  assert.equal(page.sockets.length, 1, "the typed conversation did not open");
+  const socket = page.sockets[0];
+  socket.onopen();
+  vendorAccepts(socket);
+  await page.settle();
+  assert.deepStrictEqual(initiationFrame(socket).conversation_config_override, {
+    conversation: { text_only: true },
+    agent: { prompt: { prompt: OVERRIDE.text } },
+  });
+});
+
+test("`#272 voice-agent-instructions`: with resuming on, the standing instructions go before the record of the earlier call", async () => {
+  const page = newPage();
+  page.storedTurns.set("conv_earlier", [
+    { speaker: "you", text: "what happened to the arm64 job", at_ms: 1 },
+    { speaker: "agent", text: "the mac runner stalled mid-deploy", at_ms: 2 },
+  ]);
+  await signIn(page);
+  await page.settle();
+  await page.el("resume-toggle").setChecked(true);
+  page.setFetch(mintWithPrompt(NOTE));
+  await page.el("talk").click();
+  assert.equal(page.sockets.length, 1, "the call did not open");
+  page.sockets[0].onopen();
+  const updates = framesSent(page.sockets[0]).filter((frame) => frame.type === "contextual_update");
+  assert.equal(updates.length, 2, "the instructions or the record did not go");
+  assert.equal(updates[0].text, NOTE.text, "the record went before the standing instructions");
+  assert.ok(String(updates[1].text).includes(REPLAY_PREAMBLE), "the record of the earlier call did not follow");
 });

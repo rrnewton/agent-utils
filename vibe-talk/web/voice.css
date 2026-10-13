@@ -650,6 +650,70 @@ a.search-hit-link {
   border-radius: 0.8rem;
 }
 
+/*
+ * `#271 settings-groups`. The SECTION is the card now, and the groups inside it are rows.
+ *
+ * Twenty-two cards of equal weight read as twenty-two separate decisions — "so many individual
+ * granular options", in the owner's words. Five cards, each with a heading a size up, read as five
+ * places to look; inside one, a control's group keeps its small heading and its `?`, and a rule
+ * above it says where it starts, which is all a row needs. The border, the fill and the corners
+ * move from the group to the section, so a group inside a section draws none of its own.
+ */
+.settings-section {
+  margin: 0 0 1rem;
+  padding: 0.6rem 0.8rem 0.2rem;
+  background: var(--panel);
+  border: 1px solid var(--edge);
+  border-radius: 0.8rem;
+}
+
+.settings-section > .settings-group {
+  margin: 0;
+  padding: 0.55rem 0 0.7rem;
+  background: none;
+  border: none;
+  border-top: 1px solid var(--edge);
+  border-radius: 0;
+}
+
+/* The section's heading is the loudest thing on the screen after the title bar: a size up from a
+   group's, so the five read before the rows inside them. */
+#screen-settings .settings-section > h2,
+#screen-settings .settings-section > .group-head > h2 {
+  font-size: 1.05rem;
+  margin: 0.15rem 0 0.35rem;
+}
+
+/* A group's own heading, inside a section: what a card's heading used to be, one step quieter. */
+#screen-settings .settings-group > .group-head > h3 {
+  font-size: 0.92rem;
+  margin: 0.15rem 0 0.3rem;
+}
+
+/* `#272 voice-agent-instructions`. The system prompt, folded under the instructions box: a native
+   disclosure, so its summary is a button to a screen reader and to Enter and Space, sized as a tap
+   target like Help's headings. The prompt is long; its box is tall and keeps its line breaks. */
+.settings-fold {
+  margin: 0.6rem 0 0;
+}
+
+.settings-fold > summary {
+  box-sizing: border-box;
+  min-height: 2.75rem;
+  padding: 0.6rem 0;
+  color: var(--accent);
+  font-size: 0.9rem;
+  cursor: pointer;
+  touch-action: manipulation;
+  -webkit-tap-highlight-color: transparent;
+}
+
+#voice-system-prompt {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 0.8rem;
+  white-space: pre-wrap;
+}
+
 /* The heading and its `?` on one line, the `?` hard right. */
 .group-head {
   display: flex;
@@ -6909,8 +6973,8 @@ textarea {
   width: 100%;
 }
 
-/* `h3` exists on this screen only inside the Channels group, for the same reason: it is a heading
-   BELOW a group heading, and it must not compete with the `h2` above it. */
+/* A heading BELOW a group heading must not compete with the one above it. `#271 settings-groups`
+   made every group's own heading an `h3`, under its section's `h2`; those are sized above. */
 .settings-group h3 {
   font-size: 0.85rem;
   margin: 0.2rem 0 0;
