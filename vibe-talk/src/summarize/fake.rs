@@ -38,6 +38,7 @@ struct State {
     requests: Vec<RecordedRequest>,
     fail_next: Option<String>,
     answer: Option<String>,
+    sentence: Option<String>,
     names_threads: bool,
     threads: Vec<String>,
 }
@@ -86,6 +87,14 @@ impl FakeSummarizer {
         self.lock().answer = Some(reply.to_owned());
     }
 
+    /// Answer every thread naming with `sentence` as its second line, read through what the shipped
+    /// backends read a naming through ([`super::threads::parse_thread_answer`]), instead of the
+    /// numbered `thread summary #N`. The name is still `thread-N`. `#208 persistent-cache`: the
+    /// tests of where a sentence is cut need one longer than the cap.
+    pub fn name_with(&self, sentence: &str) {
+        self.lock().sentence = Some(sentence.to_owned());
+    }
+
     /// Make the next call fail. One-shot, so recovery is testable too.
     pub fn fail_next(&self, why: &str) {
         self.lock().fail_next = Some(why.to_owned());
@@ -129,6 +138,12 @@ impl Summarizer for FakeSummarizer {
         }
         state.threads.push(request.prompt().to_owned());
         let n = state.threads.len();
+        if let Some(sentence) = &state.sentence {
+            return super::threads::parse_thread_answer(
+                &format!("thread-{n}\n{sentence}"),
+                request.sentence_chars,
+            );
+        }
         Ok(ThreadNaming {
             slug: format!("thread-{n}"),
             sentence: format!("thread summary #{n}"),

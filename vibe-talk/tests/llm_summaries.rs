@@ -830,6 +830,203 @@ async fn an_active_thread_keeps_its_name_row_fresh_without_asking_the_model() {
     assert_eq!(h.names.pending() + h.names.named(), 0);
 }
 
+/// Assert that every thread in `body` carries `sentence` cut at the cap in force: no longer than the
+/// cap, ending "…", and a prefix of the whole sentence at a word boundary.
+fn assert_shown_cut(body: &Value, sentence: &str) {
+    let cap = vibe_talk::summarize::hard_cap_chars(160);
+    let threads = names_of(body);
+    assert_eq!(threads.len(), 2, "{body}");
+    for (id, _, shown) in threads {
+        let shown = shown.unwrap_or_else(|| panic!("{id} has no sentence: {body}"));
+        assert!(
+            shown.chars().count() <= cap,
+            "{id}'s sentence was handed out at {} characters, past the cap of {cap}",
+            shown.chars().count()
+        );
+        let kept = shown.strip_suffix('…').unwrap_or_else(|| {
+            panic!("{id}'s cut sentence does not end with an ellipsis: {shown:?}")
+        });
+        assert!(
+            sentence.starts_with(&format!("{kept} ")),
+            "{id}'s sentence was cut mid-word or is not the filed one: {shown:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_thread_sentence_is_filed_whole_and_cut_wherever_it_is_shown() {
+    // `#208 persistent-cache`, milestone `summary-keep`. A sentence is filed uncut, up to four times
+    // the cap, and cut at the cap in force where it is attached to a page: a forward delta carrying a
+    // thread renamed since the page was read, a thread list read afterwards, and the same list after
+    // a restart, read from the store. Handed out whole, one line of the thread list could be 2,560
+    // characters long.
+    let h = harness();
+    let sentence =
+        "The team is reviewing excessive storage use in the build cache and the docs site. "
+            .repeat(12);
+    let sentence = sentence.trim_end();
+    let cap = vibe_talk::summarize::hard_cap_chars(160);
+    assert!(sentence.chars().count() > cap);
+    assert!(sentence.chars().count() < vibe_talk::summarize::stored_ceiling_chars(160));
+    h.summarizer.name_with(sentence);
+
+    let (_, first) = call(&h.app, THREAD_LIST, WRITE_TOKEN).await;
+    let after = first["next_after"]
+        .as_str()
+        .expect("a forward cursor")
+        .to_owned();
+    until_named(&h.names, 2).await;
+
+    // Filed whole, and not marked as cut.
+    for thread in THREADS {
+        let filed = h
+            .store
+            .cached_summary(&sentence_key(&h.state.summary_version, &channel(), thread))
+            .await
+            .expect("readable")
+            .expect("filed");
+        assert_eq!(filed.cut_at, None, "{thread}");
+        let filed: FiledSentence = serde_json::from_str(&filed.text).expect("a sentence row");
+        assert_eq!(
+            filed.summary, sentence,
+            "{thread}'s sentence was cut before it was filed"
+        );
+    }
+
+    // The delta first, before any full read refreshes the renamed snapshot: what it carries is what
+    // the naming itself attached.
+    let (status, delta) = call(
+        &h.app,
+        &format!("{THREAD_LIST}&after={}", urlencode(&after)),
+        WRITE_TOKEN,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{delta}");
+    assert!(delta["delta"].is_object(), "this is a delta: {delta}");
+    assert_shown_cut(&delta, sentence);
+
+    // A full read attaches what this server remembers of the filed record.
+    let (status, list) = call(&h.app, THREAD_LIST, WRITE_TOKEN).await;
+    assert_eq!(status, StatusCode::OK, "{list}");
+    assert_shown_cut(&list, sentence);
+
+    // After a restart the record is read back from the store, and cut the same way.
+    let restarted = AppState {
+        thread_names: Arc::new(ThreadNames::new()),
+        ..h.state.clone()
+    };
+    let app = vibe_talk::http::router(restarted);
+    let (status, list) = call(&app, THREAD_LIST, READ_TOKEN).await;
+    assert_eq!(status, StatusCode::OK, "{list}");
+    assert_shown_cut(&list, sentence);
+    assert_eq!(
+        h.summarizer.thread_prompts().len(),
+        2,
+        "showing a sentence asked the model again"
+    );
+}
+
+#[tokio::test]
+async fn a_thread_sentence_cut_below_the_cap_is_shown_as_it_is_and_asked_again_only_by_a_writer() {
+    // `#208 persistent-cache`, milestone `summary-keep`. A sentence filed cut shorter than the cap now
+    // in force, as the rows the first start re-keys can be. A read token is shown the shorter text it
+    // has and nothing is queued; the owner's read asks for that thread's sentence again, keeps its
+    // name, and files the whole answer. The other thread, filed whole, is THE CONTROL: on the
+    // schedule it is not due, so it is asked for nothing.
+    let h = harness();
+    let now = jiff::Timestamp::now().as_second();
+    let short = "The only mac runner is stuck and the old cap cut this sentence…";
+    for (n, thread) in THREADS.iter().enumerate() {
+        h.store
+            .cache_summary(
+                &name_key(&channel(), thread),
+                &serde_json::to_string(&FiledName {
+                    name: format!("kept-name-{n}"),
+                    touched: now,
+                })
+                .unwrap(),
+                None,
+            )
+            .await
+            .unwrap();
+        h.store
+            .cache_summary(
+                &sentence_key(&h.state.summary_version, &channel(), thread),
+                &serde_json::to_string(&FiledSentence {
+                    summary: short.to_owned(),
+                    at: 1,
+                })
+                .unwrap(),
+                (n == 0).then_some(40),
+            )
+            .await
+            .unwrap();
+    }
+
+    let (status, read) = call(&h.app, THREAD_LIST, READ_TOKEN).await;
+    assert_eq!(status, StatusCode::OK, "{read}");
+    for (id, _, shown) in names_of(&read) {
+        assert_eq!(shown.as_deref(), Some(short), "{id}: {read}");
+    }
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(
+        h.names.pending() + h.names.named(),
+        0,
+        "a read token queued a sentence"
+    );
+    assert!(h.summarizer.thread_prompts().is_empty());
+    assert!(h.threads.thread_reads.lock().unwrap().is_empty());
+
+    call(&h.app, THREAD_LIST, WRITE_TOKEN).await;
+    until_named(&h.names, 1).await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(
+        h.names.named(),
+        1,
+        "the sentence filed whole was asked for again"
+    );
+    assert_eq!(
+        *h.threads.thread_reads.lock().unwrap(),
+        [THREADS[0]],
+        "only the sentence cut below the cap is asked for again"
+    );
+    let refiled = h
+        .store
+        .cached_summary(&sentence_key(
+            &h.state.summary_version,
+            &channel(),
+            THREADS[0],
+        ))
+        .await
+        .expect("readable")
+        .expect("filed");
+    assert_eq!(
+        refiled.cut_at, None,
+        "the whole answer replaced the cut one"
+    );
+    let (_, list) = call(&h.app, THREAD_LIST, WRITE_TOKEN).await;
+    let shown: Vec<_> = names_of(&list)
+        .into_iter()
+        .map(|(id, name, sentence)| (id, name.expect("named"), sentence.expect("a sentence")))
+        .collect();
+    assert_eq!(
+        shown,
+        [
+            (
+                THREADS[0].to_owned(),
+                "kept-name-0".to_owned(),
+                "thread summary #1".to_owned()
+            ),
+            (
+                THREADS[1].to_owned(),
+                "kept-name-1".to_owned(),
+                short.to_owned()
+            ),
+        ],
+        "{list}"
+    );
+}
+
 #[tokio::test]
 async fn a_summariser_that_cannot_name_threads_leaves_the_list_as_it_was() {
     let (mut state, _discord) = testing::state();
