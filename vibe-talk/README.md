@@ -1598,8 +1598,9 @@ for read-aloud does not fetch them again (`#191 read-aloud-first-lag`, `src/read
 Nothing else reads them, a pushed edit or deletion drops the message, and the storage purge clears
 them. Each channel's newest window is kept so the voice agent's catch-up can answer while the
 provider is slow (`#210 voice-catchup-speed`, `src/recent.rs`): the last read of each listed
-channel plus the changes pushed to it since. There is exactly one store,
-`src/store/`, and it holds these:
+channel plus the changes pushed to it since. Its last 200 pushed changes are kept beside it, so a
+read that lands after one of them does not undo it. There is exactly one store, `src/store/`, and
+it holds these:
 
 * the `/voice` **conversation transcript** — what you said and what the agent said back;
 * **read marks** — how far you have been shown each channel;
