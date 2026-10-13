@@ -19,8 +19,8 @@ use crate::state::AppState;
 /// Log one line per request, after the status is known.
 ///
 /// A request that says why it was made (`reason=`, `#278 timeline-single-flight`) has the reason in
-/// its line, and its handler runs inside it, so every provider read the request makes is counted
-/// under it in the upstream profile.
+/// its line as `read_reason`, and its handler runs inside it, so every provider read the request
+/// makes is counted under it in the upstream profile.
 pub async fn log_requests(State(state): State<AppState>, request: Request, next: Next) -> Response {
     let method = request.method().to_string();
     let path = request.uri().path().to_owned();

@@ -1461,14 +1461,18 @@ async fn a_read_says_why_it_was_made_and_a_reason_the_page_does_not_send_is_othe
         .filter(|line| line.contains("request") && line.contains("/timeline"))
         .collect();
     assert_eq!(lines.len(), 4, "{lines:?}");
-    assert!(lines[0].contains("reason=\"poll\""), "{}", lines[0]);
-    assert!(lines[1].contains("reason=\"other\""), "{}", lines[1]);
+    assert!(lines[0].contains(" read_reason=\"poll\""), "{}", lines[0]);
+    assert!(lines[1].contains(" read_reason=\"other\""), "{}", lines[1]);
     assert!(
-        lines[2].contains("reason=\"other\""),
+        lines[2].contains(" read_reason=\"other\""),
         "a request passed itself off as the server's own background work: {}",
         lines[2]
     );
-    assert!(lines[3].contains("reason=\"-\""), "{}", lines[3]);
+    assert!(lines[3].contains(" read_reason=\"-\""), "{}", lines[3]);
+    // Not `reason`, which the tool, mcp and post_gate lines use for a refusal code.
+    for line in &lines {
+        assert!(!line.contains(" reason="), "{line}");
+    }
     assert!(
         !capture.text().contains("because-i-said-so"),
         "the word a client sent reached the log"

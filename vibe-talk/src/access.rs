@@ -145,6 +145,9 @@ impl std::fmt::Display for ToolOutcome {
 /// timeline read, one of a closed set of words, and `other` for any word outside it, so nothing a
 /// client sends is copied into the log. `-` when no reason was given. `#278
 /// timeline-single-flight`; see [`crate::read_reason`].
+///
+/// Logged as `read_reason`, not `reason`: on the `tool`, `mcp` and `post_gate` lines `reason` is
+/// already the refusal code, and a reader filtering by field name must not get the two mixed.
 pub fn request(
     method: &str,
     path: &str,
@@ -158,7 +161,7 @@ pub fn request(
         method,
         path,
         credential = credential.as_str(),
-        reason = reason.map_or("-", crate::read_reason::ReadReason::as_str),
+        read_reason = reason.map_or("-", crate::read_reason::ReadReason::as_str),
         status,
         millis,
         "request"

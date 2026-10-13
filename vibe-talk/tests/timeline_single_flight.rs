@@ -516,15 +516,17 @@ async fn concurrent_window_reads_of_one_channel_share_one_fetch() {
 #[tokio::test(start_paused = true)]
 async fn a_shared_read_is_counted_under_the_reason_of_the_request_that_started_it() {
     // `#278 timeline-single-flight`, remote-ops audit W0.3. The read runs in a task of its own; it
-    // still counts as the poll that started it, and the live re-read that joined it costs nothing.
+    // still counts as the poll that started it, and the other column's re-read on coming back to
+    // the page, made while it runs with no change between, joins it and costs nothing. (A `live`
+    // re-read never joins: it follows a push, and a push starts a new generation.)
     let h = harness();
-    let (poll, live) = (
+    let (poll, visible) = (
         timeline("view=main&reason=poll"),
-        timeline("view=main&reason=live"),
+        timeline("view=main&reason=visible"),
     );
     let (a, b) = tokio::join!(get(&h.app, &poll, READ_TOKEN), async {
         tokio::time::sleep(Duration::from_millis(50)).await;
-        get(&h.app, &live, READ_TOKEN).await
+        get(&h.app, &visible, READ_TOKEN).await
     });
     assert_eq!((a.0, b.0), (StatusCode::OK, StatusCode::OK));
     assert_eq!(h.chat.count("fetch_timeline"), 1, "{:?}", h.chat.calls());

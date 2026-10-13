@@ -2425,7 +2425,7 @@ ambiguity**. The server says so in a banner at startup, because a reader has to 
 have spoken.
 
 ```text
-INFO vibe_talk::access: request method="POST" path="/mcp" credential="write" reason="-" status=200 millis=12
+INFO vibe_talk::access: request method="POST" path="/mcp" credential="write" read_reason="-" status=200 millis=12
 INFO vibe_talk::access: mcp rpc_method="tools/call" credential="write" is_notification=false
 INFO vibe_talk::access: tool tool="post_reply" channel="123…" credential="write" outcome="ok" reason="-" text_len=48 millis=9
 INFO vibe_talk::access: post_gate event="proposed" proposal=4 channel="123…" text_len=48 reason="-" confirmed_by="-"
@@ -2435,11 +2435,12 @@ INFO vibe_talk::access: post_gate event="committed" proposal=4 channel="123…" 
 Filter for just these: `RUST_LOG=vibe_talk::access=info`. Three lines answer the question that
 started this: *did the agent call, which tool, which channel, and was it allowed?*
 
-A request that says why it was made carries that in `reason`: the page's timeline reads send
+A request that says why it was made carries that in `read_reason`: the page's timeline reads send
 `reason=poll`, `reason=live` and the rest of the words listed under "How long upstream takes", and
 every provider read the request makes is counted under it there. A word outside that list is
 written as `other`, so nothing a client sends is copied into the log, and a request that gave no
-reason shows `-` (`#278 timeline-single-flight`).
+reason shows `-` (`#278 timeline-single-flight`). It is a different field from the `reason` on
+`tool`, `mcp` and `post_gate` lines, which is a refusal code.
 
 A tool call the caller stopped waiting for — a voice runtime gives a tool fifteen seconds and then
 drops the request — writes `tool tool="…" outcome="abandoned" millis=…` from the moment its handler
