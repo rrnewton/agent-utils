@@ -28741,18 +28741,18 @@ function knownChannel(id) {
 }
 
 /**
- * The channels to open on, best first: the one this window was on, which a reload of it comes back
- * to, then the one chosen last in any window, which a brand-new window opens on. `#265
- * window-channel-memory`. `fillChannelSelect` takes the first the server still lists.
+ * The channel to open on: the one this window was on, which a reload of it comes back to, and for a
+ * brand-new window, which has none, the one chosen last in any window. `#265 window-channel-memory`.
+ * One the server no longer lists gives way to its first, in `fillChannelSelect`, as it always has.
  */
-function storedActiveChannels() {
-  let shared = "";
+function storedActiveChannel() {
+  const own = windowItem(ACTIVE_CHANNEL_KEY);
+  if (own) return own;
   try {
-    shared = localStorage.getItem(ACTIVE_CHANNEL_KEY) || "";
+    return localStorage.getItem(ACTIVE_CHANNEL_KEY) || "";
   } catch (_error) {
-    shared = "";
+    return "";
   }
-  return [windowItem(ACTIVE_CHANNEL_KEY) || "", shared].filter((id) => id !== "");
 }
 
 /**
@@ -28784,8 +28784,7 @@ function fillChannelSelect(id) {
   const select = el(id);
   // Restore only an ID still present in the server's current channel list. Settings has its own
   // picker and must not change the remembered reading destination merely by editing a channel.
-  const held = select.value ? [select.value] : id === "discord-channel" ? storedActiveChannels() : [];
-  const chosen = held.find((candidate) => knownChannels.some((channel) => String(channel.id) === String(candidate)));
+  const chosen = select.value || (id === "discord-channel" ? storedActiveChannel() : "");
   select.replaceChildren();
   for (const channel of knownChannels) {
     const option = document.createElement("option");
@@ -28793,7 +28792,7 @@ function fillChannelSelect(id) {
     option.textContent = channelName(channel);
     select.append(option);
   }
-  if (chosen !== undefined) {
+  if (knownChannels.some((channel) => String(channel.id) === String(chosen))) {
     select.value = chosen;
   } else if (knownChannels.length > 0) {
     select.value = knownChannels[0].id;
