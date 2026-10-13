@@ -2553,6 +2553,220 @@ pub async fn commit_proposal(
     }
 }
 
+// --- `#270 voice-transcript-markers`: recording what the voice page did --------------------------
+
+/// The largest number a page may put in a marker or an answer tag. Far above any real count of
+/// words, lines or proposals in one process, and small enough that a forged value is refused
+/// rather than stored.
+pub const MAX_RECORD_NUMBER: u64 = 1_000_000;
+
+/// Why a transcript row was not recorded.
+#[derive(Debug)]
+pub enum RecordError {
+    /// The request is not a row this server records: a field on the wrong speaker, text on a
+    /// record row, a marker of an unknown kind or with an unknown field, a number out of range.
+    Bad(String),
+    /// The send memory does not hold that send: this server restarted, or it settled too long ago.
+    SendUnknown,
+    /// That send is already in a transcript.
+    SendRecorded,
+    /// The store refused or failed.
+    Store(crate::store::StoreError),
+}
+
+impl RecordError {
+    /// Stable machine-readable code.
+    #[must_use]
+    pub fn code(&self) -> &'static str {
+        match self {
+            Self::Bad(_) => "bad_record",
+            Self::SendUnknown => "send_unknown",
+            Self::SendRecorded => "send_recorded",
+            Self::Store(inner) => inner.code(),
+        }
+    }
+}
+
+impl From<crate::store::StoreError> for RecordError {
+    fn from(value: crate::store::StoreError) -> Self {
+        Self::Store(value)
+    }
+}
+
+/// One row the voice page asks to have recorded: the plain append's speaker and text, and what
+/// `#270 voice-transcript-markers` adds to it.
+#[derive(Debug, Default)]
+pub struct RecordAsk {
+    /// The send memory's number for a `sent` row. Required there and refused anywhere else.
+    pub send: Option<u64>,
+    /// On a `you` row only: the proposal this spoken answer sent.
+    pub answer: Option<u64>,
+    /// On a `marker` row only: the marker, as the page sent it, checked field by field.
+    pub marker: Option<serde_json::Value>,
+}
+
+/// Record one row in `conversation`. **Write scope.** `#270 voice-transcript-markers`.
+///
+/// An ordinary turn — `you`, `agent` or `note` with words — is stored as the plain append always
+/// stored it, and a `you` row may carry the `answer` tag. A `sent` row is built entirely from the
+/// post gate's send memory, never from the page: its text must be empty, and the server files its
+/// own copy of what went, once. A `marker` row carries only the marker, checked against the fields
+/// this server knows; its text must be empty too.
+///
+/// # Errors
+///
+/// [`RecordError::Bad`] for a request that is not such a row, [`RecordError::SendUnknown`] and
+/// [`RecordError::SendRecorded`] for a claim the memory cannot honour, and the store's own refusal.
+pub async fn record_turn(
+    state: &AppState,
+    conversation: &crate::store::ConversationId,
+    speaker: crate::store::Speaker,
+    text: String,
+    ask: RecordAsk,
+) -> Result<crate::store::Turn, RecordError> {
+    use crate::store::{Speaker, Turn, TurnDetail};
+    let bad = |why: &str| Err(RecordError::Bad(why.to_owned()));
+    let only = |send: bool, answer: bool, marker: bool| {
+        (send || ask.send.is_none())
+            && (answer || ask.answer.is_none())
+            && (marker || ask.marker.is_none())
+    };
+    match speaker {
+        Speaker::You | Speaker::Agent | Speaker::Note => {
+            if !only(false, speaker == Speaker::You, false) {
+                return bad(
+                    "an ordinary turn takes no send or marker, and only a `you` turn an answer",
+                );
+            }
+            let detail = match ask.answer {
+                Some(serial) if serial > MAX_RECORD_NUMBER => {
+                    return bad("an answer names a proposal this server could have made");
+                }
+                Some(serial) => Some(TurnDetail::Answer { serial }),
+                None => None,
+            };
+            let turn = Turn::record(speaker, text, detail);
+            state.store.append_turn(conversation, &turn).await?;
+            if let Some(TurnDetail::Answer { serial }) = &turn.detail {
+                crate::access::transcript_record("answer", Some(*serial), None, None, None);
+            }
+            Ok(turn)
+        }
+        Speaker::Sent => {
+            if !only(true, false, false) || !text.is_empty() {
+                return bad(
+                    "a sent row names its send and nothing else; this server writes its text",
+                );
+            }
+            let Some(send_seq) = ask.send else {
+                return bad("a sent row names the send it records");
+            };
+            let send = state
+                .post_gate
+                .claim_send(send_seq, conversation.as_str())
+                .map_err(|refusal| match refusal {
+                    crate::post_gate::ClaimRefusal::Unknown => RecordError::SendUnknown,
+                    crate::post_gate::ClaimRefusal::Recorded => RecordError::SendRecorded,
+                })?;
+            let serial = send.record.serial;
+            let how = send.record.how;
+            let turn = Turn::record(
+                Speaker::Sent,
+                send.text,
+                Some(TurnDetail::Sent(Box::new(send.record))),
+            );
+            if let Err(error) = state.store.append_turn(conversation, &turn).await {
+                // Not in the transcript, so not claimed: a later claim, here or elsewhere, may.
+                state.post_gate.unclaim_send(send_seq);
+                return Err(error.into());
+            }
+            crate::access::transcript_record("sent", Some(serial), Some(how.as_str()), None, None);
+            Ok(turn)
+        }
+        Speaker::Marker => {
+            if !only(false, false, true) || !text.is_empty() {
+                return bad("a marker row carries its marker and nothing else");
+            }
+            let Some(marker) = ask.marker.as_ref() else {
+                return bad("a marker row carries a marker");
+            };
+            let detail = parse_marker(marker).map_err(RecordError::Bad)?;
+            let turn = Turn::record(Speaker::Marker, String::new(), Some(detail));
+            state.store.append_turn(conversation, &turn).await?;
+            match &turn.detail {
+                Some(TurnDetail::ConversationStart(start)) => crate::access::transcript_record(
+                    "conversation_start",
+                    None,
+                    None,
+                    Some(start.recap.as_str()),
+                    None,
+                ),
+                Some(TurnDetail::NotSent { why, serial }) => crate::access::transcript_record(
+                    "not_sent",
+                    Some(*serial),
+                    None,
+                    None,
+                    Some(why.as_str()),
+                ),
+                _ => {}
+            }
+            Ok(turn)
+        }
+    }
+}
+
+/// A marker as a page sent it, checked field by field: the kinds and fields this server knows and
+/// no others, and every number at most [`MAX_RECORD_NUMBER`].
+fn parse_marker(value: &serde_json::Value) -> Result<crate::store::TurnDetail, String> {
+    fn only_keys(
+        object: &serde_json::Map<String, serde_json::Value>,
+        known: &[&str],
+    ) -> Result<(), String> {
+        match object.keys().find(|key| !known.contains(&key.as_str())) {
+            Some(key) => Err(format!("a marker has no field {key:?}")),
+            None => Ok(()),
+        }
+    }
+    fn numbers_within(object: &serde_json::Map<String, serde_json::Value>) -> Result<(), String> {
+        let too_big = object
+            .values()
+            .any(|value| value.as_u64().is_some_and(|n| n > MAX_RECORD_NUMBER));
+        if too_big {
+            return Err(format!(
+                "a marker's numbers are at most {MAX_RECORD_NUMBER}"
+            ));
+        }
+        Ok(())
+    }
+    let object = value
+        .as_object()
+        .ok_or_else(|| "a marker is an object".to_owned())?;
+    match object.get("kind").and_then(serde_json::Value::as_str) {
+        Some("conversation_start") => {
+            only_keys(object, &["kind", "recap", "previous_end"])?;
+            let recap = object
+                .get("recap")
+                .and_then(serde_json::Value::as_object)
+                .ok_or_else(|| "a conversation start says what recap was sent".to_owned())?;
+            match recap.get("state").and_then(serde_json::Value::as_str) {
+                Some("sent") => {
+                    only_keys(recap, &["state", "words", "lines", "dropped", "transport"])?;
+                }
+                Some("none") => only_keys(recap, &["state", "why", "dropped"])?,
+                _ => return Err("a recap's state is \"sent\" or \"none\"".to_owned()),
+            }
+            numbers_within(recap)?;
+        }
+        Some("not_sent") => {
+            only_keys(object, &["kind", "why", "serial"])?;
+            numbers_within(object)?;
+        }
+        _ => return Err("a marker is a conversation_start or a not_sent".to_owned()),
+    }
+    serde_json::from_value(value.clone())
+        .map_err(|error| format!("not a marker this server knows: {error}"))
+}
+
 /// Withdraw a proposal without posting it. **Write scope.**
 ///
 /// # Errors
