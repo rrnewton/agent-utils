@@ -1614,8 +1614,9 @@ provider is slow (`#210 voice-catchup-speed`, `src/recent.rs`): the last read of
 channel plus the changes pushed to it since. Its last 200 pushed changes are kept beside it, so a
 read that lands after one of them does not undo it. The storage purge clears the windows and those
 changes too, and a read that was already running when it came keeps nothing when it lands, so the
-next catch-up reads every channel afresh. There is exactly one store, `src/store/`, and it holds
-these:
+next catch-up reads every channel afresh. These two are not the only channel text held in memory,
+and the purge does not clear the others; "How an operator purges it" lists them. There is exactly
+one store, `src/store/`, and it holds these:
 
 * the `/voice` **conversation transcript** — what you said and what the agent said back;
 * **read marks** — how far you have been shown each channel;
@@ -1939,12 +1940,26 @@ clear-unread setting (back to off, in the running server too) alike:
 
 1. `DELETE /api/v1/storage` with the **write** token, on a running server. This is the only
    complete erase over HTTP: `DELETE /api/v1/conversations` clears transcripts and deliberately
-   leaves the read marks alone, because the two are different records. It also empties the two
+   leaves the read marks alone, because the two are different records. It also empties two of the
    copies of channel text held in memory — read-aloud's recent messages and the voice catch-up's
    channel windows with their pushed changes — and a read already running keeps nothing of what it
-   brings back;
+   brings back. It does **not** empty the other copies in memory, listed below;
 2. delete the file (`rm ~/.local/share/vibe-talk/vibe-talk.sqlite3`) — with the server stopped; or
 3. delete the mounted directory, which is also what `scripts/run.sh --status` prints.
+
+**The purge erases the store, not everything in memory.** These copies of channel text outlive
+`DELETE /api/v1/storage` until they age out, are evicted, or the server restarts:
+
+* the live stream's replay tail: up to 200 published changes per channel, with their text, which a
+  page that attaches after the purge is sent (see "The stream");
+* read-aloud tickets: each holds one message's text as it will be spoken, at most 512 of them, for
+  up to ten minutes;
+* thread names and their one-sentence summaries already read from the summary cache: the purge
+  erases the rows, but the server goes on answering from what it read before; and
+* smaller records, such as the paren tags remembered for headings (`#242 rich-headers`).
+
+So when nothing read from a channel may be left in memory either, restart the server after the
+purge.
 
 Unsetting `storage.path` is **not** one of them. It turns the feature off for the next run and
 leaves every byte already written exactly where it is — which is the opposite of a purge, and is
@@ -5541,7 +5556,7 @@ Beyond the security list above:
   warns, and it says so on the page — but the cache stays empty forever and there is no reduced
   service to fall back on. `summaries.model` is still recorded in the cache key and read by
   nothing, which is the last vestige of a selector that no longer exists.
-* No caching of channel content on disk. Two short-lived copies are kept in memory:
+* No caching of channel content on disk. Two short-lived copies are kept in memory for reading:
   read-aloud preparation reuses messages the page fetched in the last 30 seconds
   (`#191 read-aloud-first-lag`), and the voice catch-up answers from each channel's newest window
   when the provider is slow (`#210 voice-catchup-speed`; see "The eight tools"). Obeying `Retry-After`
@@ -5549,7 +5564,9 @@ Beyond the security list above:
   channel whether or not anybody is listening. That is why `discord.live_poll_seconds` still
   defaults to OFF and why an interval under five seconds is still refused outright rather than
   clamped. The summary cache is the one exception and it is a cache of DERIVED text, bounded and
-  purgeable — see "Durable state".
+  purgeable — see "Durable state". The two copies in memory named above are not the only channel
+  text held there, and the storage purge clears only those two; "How an operator purges it" lists
+  what it leaves.
 * **`Retry-After` is handled; the status code and the absence of a queue are what is left.** A 429
   is parsed (body `retry_after` in fractional seconds, the `global` flag, and the `X-RateLimit-*`
   headers), waited out and retried, bounded at four attempts and thirty seconds; a bucket known to

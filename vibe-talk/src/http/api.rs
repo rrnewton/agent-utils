@@ -2757,9 +2757,10 @@ pub async fn forget_conversations(
     )))
 }
 
-/// `DELETE /api/v1/storage` — erase EVERYTHING this server holds.
+/// `DELETE /api/v1/storage` — erase EVERYTHING this server holds in its store.
 ///
-/// The operator's erase, and the only complete one there is over HTTP.
+/// The operator's erase, and the only complete one of the store there is over HTTP. It is not a
+/// complete erase of memory: see the end of this comment for the copies of channel text it leaves.
 /// `DELETE /api/v1/conversations` clears transcripts and deliberately leaves the read marks
 /// alone, because the two are different records and a control that quietly does more than it
 /// says is the failure this project is written against. This route says it does all of it: the
@@ -2774,11 +2775,26 @@ pub async fn forget_conversations(
 /// the running loop as well as in the store, so nothing more is marked read at a provider once
 /// Settings says Off.
 ///
-/// And it empties the two copies of channel text held in memory: read-aloud's recently fetched
+/// And it empties two of the copies of channel text held in memory: read-aloud's recently fetched
 /// messages ([`crate::read_ahead::ReadAhead::clear`], `#191 read-aloud-first-lag`) and the voice
 /// catch-up's channel windows with their journalled pushes
 /// ([`crate::recent::RecentWindows::clear`], `#210 voice-catchup-speed`). Both refuse what a read
 /// already running when the purge came brings back, so neither can be refilled from before it.
+///
+/// **It does not empty every copy in memory**, and nothing written about it may say it does. These
+/// outlive it until they age out, are evicted, or the process restarts:
+///
+/// * the live stream's replay tail: up to [`crate::live::REPLAY_TAIL`] published changes per
+///   channel, with their text, which a page that attaches after the purge is sent;
+/// * read-aloud tickets: each holds one message's text as it will be spoken, at most
+///   [`crate::speech_tickets::MAX_TICKETS`] of them, for up to
+///   [`crate::speech_tickets::TICKET_TTL`];
+/// * thread names and their one-sentence summaries already read from the summary cache: this route
+///   erases the rows, but [`crate::summarize::threads::ThreadNames`] answers from what it read
+///   before; and
+/// * smaller records, such as the paren tags [`crate::heading::HeadingTags`] has seen.
+///
+/// Only a restart clears every copy held in memory.
 pub async fn purge_storage(
     State(state): State<AppState>,
     _scope: WriteScope,

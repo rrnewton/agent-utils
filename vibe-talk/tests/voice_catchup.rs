@@ -575,8 +575,8 @@ async fn a_push_that_arrives_while_a_channel_read_runs_survives_the_read_landing
     );
 }
 
-/// `DELETE /api/v1/storage` erases everything, and the catch-up's windows and the pushes kept
-/// beside them are channel text.
+/// `DELETE /api/v1/storage` erases the store, and the catch-up's windows and the pushes kept
+/// beside them are channel text too, so it empties them as well.
 #[tokio::test(start_paused = true)]
 async fn the_storage_purge_leaves_no_channel_text_in_the_catch_up_memory() {
     let h = harness();
@@ -593,15 +593,15 @@ async fn the_storage_purge_leaves_no_channel_text_in_the_catch_up_memory() {
     purge(&h.state).await;
     assert!(
         h.state.live.recent().is_empty(),
-        "channel text outlived the purge"
+        "the catch-up's channel text outlived the purge"
     );
     for id in [READ_CHANNEL, WRITE_CHANNEL, THIRD] {
         assert!(!h.state.live.recent().holds(&channel(id)), "{id}");
     }
 }
 
-/// A read already running when the purge comes read the channel before the owner asked for
-/// everything to go. It must not put its window back when it lands.
+/// A read already running when the purge comes read the channel before the owner asked for its
+/// windows to go. It must not put its window back when it lands.
 #[tokio::test(start_paused = true)]
 async fn a_refresh_running_across_the_purge_does_not_put_its_window_back() {
     let h = harness();

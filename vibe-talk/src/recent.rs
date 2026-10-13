@@ -57,12 +57,15 @@
 //!
 //! # The purge
 //!
-//! `DELETE /api/v1/storage` promises that nothing derived from a channel is left behind, and a
-//! held window and its journal are channel text. So the purge calls [`RecentWindows::clear`],
-//! which drops every window, every journal and every failure, and forgets every refresh running.
+//! `DELETE /api/v1/storage` erases the store, and a held window and its journal are channel text
+//! too, so the purge also calls [`RecentWindows::clear`], which drops every window, every journal
+//! and every failure, and forgets every refresh running. That empties THIS copy. It is one of
+//! several copies of channel text in memory, and the purge does not empty all of them: the live
+//! stream's replay tail and read-aloud tickets, among others, outlive it. `purge_storage` in
+//! `crate::http::api` lists what it leaves.
 //!
 //! A read already running when that happens must not put its result back when it lands: it read
-//! the channel before the owner asked for everything to go. A [`ReadMark`] therefore also carries
+//! the channel before the owner asked for this copy to go. A [`ReadMark`] therefore also carries
 //! how many purges there had been when it was taken, and [`RecentWindows::record`] keeps nothing
 //! from a read marked before the newest one. That is the cutoff `crate::read_ahead` keeps as a
 //! floor instant, counted instead of timed, so a read marked in the same clock tick as a purge is
@@ -364,8 +367,8 @@ impl RecentWindows {
     }
 
     /// Drop every held window, every journalled push and every failure, and forget every refresh
-    /// running. For the storage purge, which promises that nothing derived from a channel is left
-    /// behind.
+    /// running. For the storage purge, so that this copy of channel text does not outlive it,
+    /// though it is not the only copy held in memory.
     ///
     /// A read marked before this keeps nothing when it lands, so a refresh or a page read already
     /// running cannot put back what it read. A refresh still running is forgotten rather than
@@ -912,8 +915,8 @@ mod tests {
         assert!(!windows.reusable(&channel, 20, reuse));
     }
 
-    /// The storage purge leaves no channel text: no window, no journalled push, no failure, on
-    /// any channel.
+    /// The storage purge leaves no channel text in this memory: no window, no journalled push, no
+    /// failure, on any channel.
     #[tokio::test]
     async fn the_purge_drops_every_window_and_every_journalled_push() {
         let windows = RecentWindows::new();

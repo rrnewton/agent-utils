@@ -314,8 +314,9 @@ impl ReadAhead {
         }
     }
 
-    /// Drop everything. For the storage purge, which promises that nothing derived from a
-    /// channel is left behind.
+    /// Drop everything. For the storage purge, so that this copy of channel text does not outlive
+    /// it, though it is not the only copy held in memory: `purge_storage` in `crate::http::api`
+    /// lists what the purge leaves.
     ///
     /// Raises the floor to now, so a fetch already in flight keeps nothing when it lands.
     pub fn clear(&self) {
