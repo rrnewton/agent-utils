@@ -97,9 +97,16 @@ pub struct Incoming {
 }
 
 impl Incoming {
-    /// Offer `message`, whose home scope is `home`.
+    /// Offer `message`, whose home scope is `home`. The fields derived when a message is served
+    /// (spoken forms, rendered HTML, the heading, the noise mark) are dropped here: the cache never
+    /// stores them, and they would only make the queued copy larger than its byte budget counts.
     #[must_use]
-    pub fn new(message: Message, home: Scope) -> Self {
+    pub fn new(mut message: Message, home: Scope) -> Self {
+        message.spoken_time = String::new();
+        message.spoken_content = String::new();
+        message.content_html = String::new();
+        message.heading = None;
+        message.noise = false;
         Self {
             message,
             home,

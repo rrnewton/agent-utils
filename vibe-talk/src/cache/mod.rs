@@ -25,6 +25,22 @@
 //! - Readers use two read-only connections. Each re-checks the file generation and the channel's
 //!   epoch AFTER its SQL and before handing anything back, so a row read before an erase is never
 //!   served after it.
+//! - Anything that can take long — the rows of an erased channel, the age and revalidation pass,
+//!   eviction, rebuilding the index text, compacting and merging the index, checkpoints — is
+//!   background work the writer does in steps of about 25 ms BETWEEN batches. A batch is
+//!   published to barrier waiters as soon as it commits, never after an unrelated erase or an
+//!   eviction finishes. An erase itself is logical at once: the writer detaches the channel's
+//!   rows from its name in one short transaction, so no read can reach them, and deletes them in
+//!   later steps.
+//!
+//! # Calling it from async code
+//!
+//! Every read ([`MessageCache::newest`] and the rest), [`MessageCache::open`],
+//! [`MessageCache::erase_file`] and [`MessageCache::quiesce_blocking`] block the calling thread:
+//! a read on SQLite, a file erase on the writer's acknowledgement (up to a minute) and on reads in
+//! flight. Call them from `tokio::task::spawn_blocking`, never directly on a runtime worker.
+//! [`MessageCache::offer`] never blocks, and [`MessageCache::barrier`] is the async form of the
+//! barrier. A read's closure must not do slow work outside SQL: a file erase waits for it.
 //!
 //! # What can never be written
 //!
@@ -35,10 +51,14 @@
 //!
 //! # Privacy
 //!
-//! `secure_delete` on every connection, FTS5 `secure-delete` from creation, no `INSERT OR`-style
-//! replacing writes anywhere (a source test enforces it), checkpoints after every deletion batch,
-//! and a deleted message leaves only a [tombstone](rows) of ids and times. Logs carry SQLite
-//! result codes and counts, never text, ids or hashes.
+//! `secure_delete` on every connection, FTS5 `secure-delete` from creation and on at every commit,
+//! no `INSERT OR`-style replacing writes anywhere (a source test enforces it), checkpoints after
+//! every deletion, and a deleted message leaves only a [tombstone](rows) of ids and times. A
+//! message deleted upstream, erased with its channel or aged out leaves the full-text index in
+//! place, at once. Only eviction for size and a rebuild of the index text delete by marker
+//! (switched off and back on inside one transaction), and a compaction follows them: neither
+//! removes anything the owner asked to forget. Logs carry SQLite result codes and counts, never
+//! text, ids or hashes.
 
 pub mod coverage;
 pub mod file;
@@ -73,9 +93,12 @@ pub const TOMBSTONE_KEEP_MS: i64 = 7 * DAY_MS;
 /// A row neither revalidated by an edit-and-delete-aware read nor observed for this long is
 /// deleted, whatever else holds: "erased within a week" whatever the refill budget allows.
 pub const REVALIDATE_WITHIN_MS: i64 = 7 * DAY_MS;
-/// Rows deleted per transaction by eviction and the age pass, so no one stall is long.
+/// The most rows one eviction step deletes. Steps are bounded by [`STEP`] as well.
 pub const DELETE_CHUNK: usize = 1_000;
-/// How long a file erase lets in-flight reads finish before it interrupts their statements.
+/// How long one background step of the writer works before it commits and serves the queue.
+pub const STEP: Duration = Duration::from_millis(25);
+/// How long a file erase lets in-flight reads finish before it interrupts their statements, and
+/// how often it interrupts again while one is still running.
 pub const ERASE_GRACE: Duration = Duration::from_millis(200);
 
 const DAY_MS: i64 = 24 * 60 * 60 * 1000;
@@ -373,11 +396,39 @@ pub enum Observation {
 }
 
 impl Observation {
-    /// Roughly how many bytes this holds while queued.
+    /// Roughly how many bytes this holds while queued: every string a message carries, derived
+    /// ones included, because an [`Incoming`] built field by field may still hold them.
     fn estimated_bytes(&self) -> usize {
         fn row(incoming: &Incoming) -> usize {
             let m = &incoming.message;
-            256 + m.content.len() * 2 + m.author.len() + m.id.0.len() + m.timestamp.len()
+            let thread = m.thread.as_ref().map_or(0, |t| {
+                64 + t.id.len() + t.root_message_id.as_ref().map_or(0, |r| r.0.len())
+            });
+            let reactions = m.reactions.as_ref().map_or(0, |list| {
+                list.iter()
+                    .map(|r| 48 + r.emoji.len() + r.custom_id.as_ref().map_or(0, String::len))
+                    .sum()
+            });
+            let heading = m.heading.as_ref().map_or(0, |h| {
+                [&h.tag, &h.time, &h.title]
+                    .iter()
+                    .map(|part| part.as_ref().map_or(0, String::len))
+                    .sum::<usize>()
+                    + 64
+            });
+            256 + m.content.len() * 2
+                + m.author.len()
+                + m.author_id.0.len()
+                + m.id.0.len()
+                + m.channel_id.0.len()
+                + m.timestamp.len()
+                + m.spoken_time.len()
+                + m.spoken_content.len()
+                + m.content_html.len()
+                + m.reply_to.as_ref().map_or(0, |r| r.0.len())
+                + thread
+                + reactions
+                + heading
         }
         match self {
             Self::Listing(listing) => 128 + listing.rows.iter().map(row).sum::<usize>(),
@@ -466,10 +517,18 @@ pub struct CacheStats {
     pub ops_unrouted: u64,
     /// Observations that failed in SQLite and were rolled back alone.
     pub ops_failed: u64,
-    /// Transactions committed.
+    /// Batches of observations committed.
     pub batches: u64,
-    /// The longest batch, in microseconds.
+    /// The longest batch, from its first observation to its commit, in microseconds.
     pub batch_max_us: u64,
+    /// Background steps run between batches: deletions, compaction, merges, checkpoints.
+    pub steps: u64,
+    /// The longest background step, in microseconds: what a barrier can wait behind.
+    pub step_max_us: u64,
+    /// Steps that merged the full-text index's segments (it never merges inside a batch).
+    pub merge_steps: u64,
+    /// The longest checkpoint, in microseconds.
+    pub checkpoint_max_us: u64,
     /// Message rows inserted or changed.
     pub rows_written: u64,
     /// Message rows offered that changed nothing and were not written.
@@ -482,17 +541,17 @@ pub struct CacheStats {
     pub tombstoned: u64,
     /// Rows deleted to stay under the size limit.
     pub evicted_rows: u64,
-    /// Eviction transactions.
+    /// Eviction steps (one transaction each).
     pub eviction_chunks: u64,
-    /// The longest eviction transaction, in microseconds.
+    /// The longest eviction step, in microseconds.
     pub eviction_chunk_max_us: u64,
     /// Rows deleted by the age limit or for want of revalidation.
     pub expired_rows: u64,
-    /// Channels erased.
+    /// Channels erased (detached from their names; their rows go in later steps).
     pub erased_channels: u64,
-    /// Message rows those erases deleted.
+    /// Message rows those erases have deleted so far.
     pub erased_rows: u64,
-    /// Full-text index compactions after bulk deletions.
+    /// Full-text index compactions after eviction or a rebuild of the index text.
     pub compactions: u64,
     /// The longest compaction, start to finish, in microseconds.
     pub compaction_max_us: u64,
@@ -525,6 +584,10 @@ counters!(
     ops_failed,
     batches,
     batch_max_us,
+    steps,
+    step_max_us,
+    merge_steps,
+    checkpoint_max_us,
     rows_written,
     rows_unchanged,
     rows_too_old,
@@ -611,6 +674,10 @@ pub(crate) struct Sequencer {
     applied_changed: Condvar,
     applied_watch: tokio::sync::watch::Sender<u64>,
     pub(crate) flush: AtomicBool,
+    /// Whether the writer has background work left. Published before the applied mark moves past
+    /// the operation that made the work, so a waiter that saw the mark sees the work too.
+    busy: Mutex<bool>,
+    busy_changed: Condvar,
 }
 
 impl Default for Sequencer {
@@ -621,11 +688,38 @@ impl Default for Sequencer {
             applied_changed: Condvar::new(),
             applied_watch: tokio::sync::watch::Sender::new(0),
             flush: AtomicBool::new(false),
+            busy: Mutex::new(false),
+            busy_changed: Condvar::new(),
         }
     }
 }
 
 impl Sequencer {
+    pub(crate) fn set_busy(&self, busy: bool) {
+        let mut held = lock(&self.busy);
+        if *held != busy {
+            *held = busy;
+            self.busy_changed.notify_all();
+        }
+    }
+
+    /// Wait until the writer has no background work left, or `deadline`.
+    fn wait_idle(&self, deadline: Instant) -> bool {
+        let mut busy = lock(&self.busy);
+        while *busy {
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                return false;
+            }
+            busy = self
+                .busy_changed
+                .wait_timeout(busy, left)
+                .unwrap_or_else(PoisonError::into_inner)
+                .0;
+        }
+        true
+    }
+
     pub(crate) fn mark_applied(&self, seq: u64) {
         let mut applied = lock(&self.applied);
         if seq > *applied {
@@ -702,8 +796,18 @@ pub(crate) struct Shared {
     pub(crate) search_text_current: AtomicBool,
     /// Reads running now. A `TRUNCATE` checkpoint is attempted only at zero.
     pub(crate) readers_in_use: AtomicUsize,
-    /// Erases asked for and not yet applied, with the sequence number that applies them.
+    /// Erases asked for and not yet applied, with the sequence number that applies them
+    /// (`u64::MAX` until it is known, or when the writer could not be asked).
     pub(crate) erasing: Mutex<HashMap<Erasing, u64>>,
+    /// The latest sweep: until the writer has applied it, only channels routed continuously since
+    /// before the oldest sweep still pending may be read.
+    pub(crate) sweep: Mutex<Option<Sweep>>,
+    /// Erases the writer could not carry out. What they cover stays blocked until the file is
+    /// erased: a cache that cannot forget a channel must not serve it either.
+    pub(crate) erase_failed: Mutex<HashSet<Erasing>>,
+    /// A test's hook into [`MessageCache::read`], run at each [`ReadPoint`].
+    #[cfg(test)]
+    pub(crate) read_hook: Mutex<Option<ReadHook>>,
 }
 
 /// What an erase waiting to be applied covers.
@@ -711,7 +815,36 @@ pub(crate) struct Shared {
 pub(crate) enum Erasing {
     Channel(ChanKey),
     Provider(String),
+    /// A sweep to the route snapshot.
+    Sweep,
 }
+
+/// A sweep waiting to be applied.
+#[derive(Clone, Debug)]
+pub(crate) struct Sweep {
+    /// The sequence number that applies it (`u64::MAX` until known).
+    seq: u64,
+    /// The channels routed both before and after every sweep still pending: the only ones whose
+    /// rows no pending sweep can be about to erase.
+    stable: HashSet<ChanKey>,
+}
+
+/// Where in [`MessageCache::read`] a test's hook runs.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ReadPoint {
+    /// Before anything is checked.
+    Start,
+    /// The channel's epoch has been noted.
+    EpochTaken,
+    /// The channel was not blocked, and the SQL is about to run.
+    Checked,
+    /// The SQL has run; nothing has been checked since.
+    SqlDone,
+}
+
+#[cfg(test)]
+pub(crate) type ReadHook = Box<dyn FnMut(ReadPoint, &MessageCache) + Send>;
 
 pub(crate) fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
@@ -750,6 +883,13 @@ pub(crate) enum Op {
     #[cfg(test)]
     Probe {
         reply: mpsc::Sender<Vec<(String, String)>>,
+    },
+    /// Hold the writer still until `resume` answers or is dropped: a test's way to order an erase
+    /// against a read exactly.
+    #[cfg(test)]
+    Pause {
+        paused: mpsc::Sender<()>,
+        resume: mpsc::Receiver<()>,
     },
 }
 
@@ -829,6 +969,9 @@ pub struct MessageCache {
     shared: Arc<Shared>,
     inner: RwLock<Option<Arc<Inner>>>,
     path: PathBuf,
+    /// Held across the whole of a file erase, reopening included: two at once (the owner's
+    /// "off" racing a purge) must not unlink the file the other has just opened.
+    erase_lock: Mutex<()>,
     _lock: file::PathLock,
 }
 
@@ -855,13 +998,25 @@ impl MessageCache {
     pub fn open(options: CacheOptions) -> Result<Self, CacheError> {
         schema::capability_check().map_err(CacheError::Unavailable)?;
         let path = options.path;
-        if options.store_path.as_deref() == Some(path.as_path()) {
-            return Err(CacheError::Filesystem(
-                "the message cache path is the store's own file".to_owned(),
-            ));
+        let refuse_store =
+            || CacheError::Filesystem("the message cache path is the store's own file".to_owned());
+        if options
+            .store_path
+            .as_deref()
+            .is_some_and(|store| file::same_file(store, &path))
+        {
+            return Err(refuse_store());
         }
         if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
             file::ensure_private_dir(dir).map_err(CacheError::Filesystem)?;
+        }
+        // Again, now that the directory exists and a symbolic link in it can be resolved.
+        if options
+            .store_path
+            .as_deref()
+            .is_some_and(|store| file::same_file(store, &path))
+        {
+            return Err(refuse_store());
         }
         let lock = file::PathLock::acquire(&path).map_err(CacheError::Locked)?;
         let shared = Arc::new(Shared {
@@ -877,12 +1032,17 @@ impl MessageCache {
             search_text_current: AtomicBool::new(true),
             readers_in_use: AtomicUsize::new(0),
             erasing: Mutex::new(HashMap::new()),
+            sweep: Mutex::new(None),
+            erase_failed: Mutex::new(HashSet::new()),
+            #[cfg(test)]
+            read_hook: Mutex::new(None),
         });
         let inner = open_inner(&path, &shared)?;
         Ok(Self {
             shared,
             inner: RwLock::new(Some(Arc::new(inner))),
             path,
+            erase_lock: Mutex::new(()),
             _lock: lock,
         })
     }
@@ -917,22 +1077,70 @@ impl MessageCache {
 
     /// Replace the route snapshot the writer gates on, and sweep every channel and provider not
     /// in it out of the file.
+    ///
+    /// Every channel leaving the snapshot has its epoch bumped at once, so a fill already running
+    /// for it is dropped. Until the writer has applied the sweep, a channel is readable only if it
+    /// was routed before it too: one removed and added back before the sweep lands still has rows
+    /// the sweep is about to erase, and they must not be served in between. Before the first
+    /// sweep of a process has landed, no channel is readable at all.
     pub fn retain_only(&self, routes: RouteSnapshot) {
         let routes = Arc::new(routes);
-        let removed: Vec<ChanKey> = lock(&self.shared.epochs.channels)
+        let previous = self
+            .shared
+            .routes
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        let mut removed: HashSet<ChanKey> = lock(&self.shared.epochs.channels)
             .keys()
             .filter(|chan| !routes.allows(chan))
             .cloned()
             .collect();
+        if let Some(previous) = &previous {
+            removed.extend(
+                previous
+                    .channels
+                    .iter()
+                    .filter(|chan| !routes.allows(chan))
+                    .cloned(),
+            );
+        }
         for chan in &removed {
             self.shared.epochs.bump_channel(chan);
         }
+        let applied = self.shared.seq.applied();
+        // Held to the end, so two sweeps cannot interleave. Recorded before the new snapshot is
+        // installed, so no read can see the new routes without the sweep that goes with them.
+        let mut sweep = lock(&self.shared.sweep);
+        let stable: HashSet<ChanKey> = match sweep.as_ref() {
+            Some(pending) if pending.seq > applied => pending
+                .stable
+                .iter()
+                .filter(|chan| routes.allows(chan))
+                .cloned()
+                .collect(),
+            _ => previous.as_ref().map_or_else(HashSet::new, |previous| {
+                previous
+                    .channels
+                    .iter()
+                    .filter(|chan| routes.allows(chan))
+                    .cloned()
+                    .collect()
+            }),
+        };
+        *sweep = Some(Sweep {
+            seq: u64::MAX,
+            stable,
+        });
         *self
             .shared
             .routes
             .write()
             .unwrap_or_else(PoisonError::into_inner) = Some(Arc::clone(&routes));
-        self.control(Op::RetainOnly { routes });
+        let seq = self.control(Op::RetainOnly { routes });
+        if let Some(sweep) = sweep.as_mut() {
+            sweep.seq = seq.unwrap_or(u64::MAX);
+        }
     }
 
     /// Offer an observation. Never waits: a full queue drops it and marks the channel suspect.
@@ -979,23 +1187,29 @@ impl MessageCache {
     }
 
     /// Queue a control operation: exempt from the byte budget, because an erase must never be
-    /// the thing a full queue drops.
+    /// the thing a full queue drops. `None` when no file is open or its writer has gone.
     fn control(&self, op: Op) -> Option<u64> {
         let inner = self.current()?;
-        Some(self.control_on(&inner, op))
+        self.control_on(&inner, op)
     }
 
-    fn control_on(&self, inner: &Inner, op: Op) -> u64 {
+    fn control_on(&self, inner: &Inner, op: Op) -> Option<u64> {
         let mut enqueued = lock(&self.shared.seq.enqueued);
         let seq = *enqueued + 1;
         if inner.send(Envelope { seq, bytes: 0, op }) {
             *enqueued = seq;
+            Some(seq)
+        } else {
+            None
         }
-        *enqueued
     }
 
     /// Erase channels: bump their epochs, so new reads skip them and fills already running are
-    /// dropped, then queue the deletion. A channel with nothing held costs nothing.
+    /// dropped, then queue the erase. A channel with nothing held costs nothing.
+    ///
+    /// The writer applies an erase as soon as it reaches it, in one short transaction that
+    /// detaches the channel's rows from its name, so no read can reach them; it deletes the rows
+    /// themselves in later steps, between batches.
     pub fn erase_channels(&self, chans: &[ChanKey]) {
         if chans.is_empty() {
             return;
@@ -1011,9 +1225,10 @@ impl MessageCache {
         let seq = self.control(Op::Erase {
             chans: chans.to_vec(),
         });
+        // A writer that could not be asked never applies it: stay blocked.
         let mut pending = lock(&self.shared.erasing);
         for chan in chans {
-            pending.insert(Erasing::Channel(chan.clone()), seq.unwrap_or(0));
+            pending.insert(Erasing::Channel(chan.clone()), seq.unwrap_or(u64::MAX));
         }
     }
 
@@ -1025,11 +1240,12 @@ impl MessageCache {
         let seq = self.control(Op::EraseProvider {
             provider_key: provider_key.to_owned(),
         });
-        lock(&self.shared.erasing).insert(key, seq.unwrap_or(0));
+        lock(&self.shared.erasing).insert(key, seq.unwrap_or(u64::MAX));
     }
 
     /// Whether reads of a channel are blocked: it is off the route snapshot (or there is none
-    /// yet), or an erase of it or its provider has been asked for and not yet applied.
+    /// yet); a sweep that may erase it is pending; an erase of it or its provider has been asked
+    /// for and not yet applied; or one failed.
     fn blocked(&self, chan: &ChanKey) -> bool {
         let routed = self
             .shared
@@ -1042,10 +1258,21 @@ impl MessageCache {
             return true;
         }
         let applied = self.shared.seq.applied();
+        let failed = lock(&self.shared.erase_failed).clone();
+        let channel = Erasing::Channel(chan.clone());
+        let provider = Erasing::Provider(chan.provider_key.clone());
+        if failed.contains(&channel) || failed.contains(&provider) {
+            return true;
+        }
+        let sweep_failed = failed.contains(&Erasing::Sweep);
+        if let Some(sweep) = lock(&self.shared.sweep).as_ref() {
+            if (sweep.seq > applied || sweep_failed) && !sweep.stable.contains(chan) {
+                return true;
+            }
+        }
         let mut pending = lock(&self.shared.erasing);
         pending.retain(|_, seq| *seq > applied);
-        pending.contains_key(&Erasing::Channel(chan.clone()))
-            || pending.contains_key(&Erasing::Provider(chan.provider_key.clone()))
+        pending.contains_key(&channel) || pending.contains_key(&provider)
     }
 
     /// Ask the writer for a maintenance pass now.
@@ -1054,15 +1281,22 @@ impl MessageCache {
     }
 
     /// Wait until everything offered so far has been applied, up to `timeout`. Raises the flush
-    /// flag so a long batch commits at once. `false` on timeout, or when no file is open.
+    /// flag, only when there is something to wait for, so a long batch commits at once. `false`
+    /// on timeout, or when no file is open.
+    ///
+    /// This waits for operations, not for the background work they leave: an erase is applied
+    /// (its rows unreachable) before its rows are deleted, and an offer is applied before the
+    /// eviction it may set off. [`MessageCache::quiesce_blocking`] waits for that work too.
     pub fn barrier_blocking(&self, timeout: Duration) -> bool {
         if !self.is_open() {
             return false;
         }
         let target = *lock(&self.shared.seq.enqueued);
-        self.shared.seq.flush.store(true, Ordering::SeqCst);
         let deadline = Instant::now() + timeout;
         let mut applied = lock(&self.shared.seq.applied);
+        if *applied < target {
+            self.shared.seq.flush.store(true, Ordering::SeqCst);
+        }
         while *applied < target {
             let left = deadline.saturating_duration_since(Instant::now());
             if left.is_zero() {
@@ -1085,11 +1319,30 @@ impl MessageCache {
             return false;
         }
         let target = *lock(&self.shared.seq.enqueued);
+        if self.shared.seq.applied() >= target {
+            return true;
+        }
         self.shared.seq.flush.store(true, Ordering::SeqCst);
         let mut watch = self.shared.seq.applied_watch.subscribe();
         tokio::time::timeout(timeout, watch.wait_for(|applied| *applied >= target))
             .await
             .is_ok_and(|seen| seen.is_ok())
+    }
+
+    /// Wait until everything offered so far has been applied AND the writer has finished the
+    /// background work it left: the rows of erased channels deleted, eviction and compaction
+    /// done, the index merged, deleted text checkpointed out of the write-ahead log. For tests,
+    /// benchmarks and an orderly shutdown; never on a request's path. `false` on timeout, or
+    /// when no file is open.
+    pub fn quiesce_blocking(&self, timeout: Duration) -> bool {
+        let deadline = Instant::now() + timeout;
+        self.barrier_blocking(timeout) && self.shared.seq.wait_idle(deadline)
+    }
+
+    /// Whether the writer has background work left.
+    #[must_use]
+    pub fn background_busy(&self) -> bool {
+        *lock(&self.shared.seq.busy)
     }
 
     /// The highest sequence number applied.
@@ -1130,15 +1383,20 @@ impl MessageCache {
     ///    every queued observation is stale.
     /// 2. Ask the writer to close. It discards what is queued, finishes its transaction, and
     ///    closes its connection.
-    /// 3. Wait for reads in flight; after [`ERASE_GRACE`], interrupt their statements.
+    /// 3. Wait for reads in flight; after [`ERASE_GRACE`], interrupt their statements, and again
+    ///    every [`ERASE_GRACE`] while one is still running.
     /// 4. Close both readers, then unlink the database and its working files and fsync the
     ///    directory.
     /// 5. If `reopen`, create and install a fresh file.
+    ///
+    /// The whole of it, reopening included, holds one lock: a second erase waits for the first
+    /// to finish, and then erases whatever the first left.
     ///
     /// # Errors
     ///
     /// Only from reopening; the erase itself always completes.
     pub fn erase_file(&self, reopen: bool) -> Result<EraseReport, CacheError> {
+        let _serial = lock(&self.erase_lock);
         let taken = {
             let mut guard = self.inner.write().unwrap_or_else(PoisonError::into_inner);
             let taken = guard.take();
@@ -1147,23 +1405,31 @@ impl MessageCache {
         };
         if let Some(inner) = taken {
             let (ack, acked) = mpsc::channel();
-            self.control_on(&inner, Op::Close { ack });
-            let _ = acked.recv_timeout(Duration::from_secs(60));
+            if self.control_on(&inner, Op::Close { ack }).is_some() {
+                let _ = acked.recv_timeout(Duration::from_secs(60));
+            }
             inner.join_writer();
-            let started = Instant::now();
-            let mut interrupted = false;
+            let mut last_interrupt = Instant::now();
             while Arc::strong_count(&inner) > 1 {
-                if !interrupted && started.elapsed() >= ERASE_GRACE {
+                if last_interrupt.elapsed() >= ERASE_GRACE {
                     inner.readers.interrupt_all();
-                    interrupted = true;
+                    last_interrupt = Instant::now();
                 }
                 std::thread::sleep(Duration::from_millis(1));
             }
             drop(inner);
         }
         self.shared.seq.catch_up();
+        self.shared.seq.set_busy(false);
         self.shared.budget.used.store(0, Ordering::SeqCst);
         let bytes = file::unlink_family(&self.path);
+        // Nothing in the old file can be served any more, and a fresh one holds nothing: what
+        // was waiting to be erased, or could not be, is moot.
+        lock(&self.shared.erasing).clear();
+        lock(&self.shared.erase_failed).clear();
+        if let Some(sweep) = lock(&self.shared.sweep).as_mut() {
+            sweep.seq = 0;
+        }
         if reopen {
             let fresh = open_inner(&self.path, &self.shared)?;
             *self.inner.write().unwrap_or_else(PoisonError::into_inner) = Some(Arc::new(fresh));
@@ -1174,28 +1440,54 @@ impl MessageCache {
         })
     }
 
+    #[cfg(test)]
+    fn hook(&self, point: ReadPoint) {
+        let taken = lock(&self.shared.read_hook).take();
+        if let Some(mut hook) = taken {
+            hook(point, self);
+            let mut slot = lock(&self.shared.read_hook);
+            if slot.is_none() {
+                *slot = Some(hook);
+            }
+        }
+    }
+
     /// Run a read against one of the reader connections, and serve its result only if no erase
     /// of the file (or of `chan`, when given) happened while it ran.
+    ///
+    /// The order matters. The channel's epoch is noted FIRST and only then is the channel checked
+    /// for a pending erase: an erase marks itself pending before it bumps the epoch, so whatever
+    /// moment it lands at, either the check sees it pending, or the epoch noted here is older than
+    /// the one the read finds when its SQL is done. Checked the other way round, an erase landing
+    /// between the two would leave a stale read looking current once the writer had applied it.
     pub(crate) fn read<T>(
         &self,
         chan: Option<&ChanKey>,
         work: impl FnOnce(&rusqlite::Connection) -> rusqlite::Result<T>,
     ) -> Read<T> {
+        #[cfg(test)]
+        self.hook(ReadPoint::Start);
         let Some(inner) = self.current() else {
             return Read::Off;
         };
         let generation = inner.generation;
+        let epoch = chan.map(|c| self.shared.epochs.epoch(c));
+        #[cfg(test)]
+        self.hook(ReadPoint::EpochTaken);
         if chan.is_some_and(|c| self.blocked(c)) {
             return Read::Blocked;
         }
-        let epoch = chan.map(|c| self.shared.epochs.epoch(c));
         if self.shared.epochs.generation() != generation {
             return Read::Moved;
         }
+        #[cfg(test)]
+        self.hook(ReadPoint::Checked);
         self.shared.readers_in_use.fetch_add(1, Ordering::SeqCst);
         let result = inner.readers.with(work);
         self.shared.readers_in_use.fetch_sub(1, Ordering::SeqCst);
         drop(inner);
+        #[cfg(test)]
+        self.hook(ReadPoint::SqlDone);
         let moved = self.shared.epochs.generation() != generation
             || chan.is_some_and(|c| Some(self.shared.epochs.epoch(c)) != epoch);
         if moved {
@@ -1286,6 +1578,48 @@ impl MessageCache {
         all
     }
 
+    /// Hold the writer still until the returned sender is dropped or sent to. Returns once the
+    /// writer has stopped.
+    #[cfg(test)]
+    pub(crate) fn pause_writer(&self) -> mpsc::Sender<()> {
+        let (paused, stopped) = mpsc::channel();
+        let (resume, resumed) = mpsc::channel();
+        self.control(Op::Pause {
+            paused,
+            resume: resumed,
+        })
+        .expect("a writer to pause");
+        stopped
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the writer paused");
+        resume
+    }
+
+    /// Stop the writer as if it had died: the file stays open for reading, and nothing offered or
+    /// asked for is applied any more.
+    #[cfg(test)]
+    pub(crate) fn stop_writer(&self) {
+        if let Some(inner) = self.current() {
+            let (ack, acked) = mpsc::channel();
+            if self.control_on(&inner, Op::Close { ack }).is_some() {
+                let _ = acked.recv_timeout(Duration::from_secs(10));
+            }
+            inner.join_writer();
+        }
+    }
+
+    /// Run `hook` at every [`ReadPoint`] of every read, until replaced.
+    #[cfg(test)]
+    pub(crate) fn set_read_hook(&self, hook: Option<ReadHook>) {
+        *lock(&self.shared.read_hook) = hook;
+    }
+
+    /// The bytes the queue's budget holds now.
+    #[cfg(test)]
+    pub(crate) fn queued_bytes(&self) -> usize {
+        self.shared.budget.used.load(Ordering::SeqCst)
+    }
+
     /// What the whole file holds, in counts.
     #[must_use]
     pub fn counts(&self) -> Read<Counts> {
@@ -1343,12 +1677,25 @@ fn open_inner(path: &Path, shared: &Arc<Shared>) -> Result<Inner, CacheError> {
     let generation = shared.epochs.generation();
     let thread_shared = Arc::clone(shared);
     let thread_path = path.to_owned();
+    let (started, ready) = mpsc::channel::<()>();
     let handle = std::thread::Builder::new()
         .name("message-cache-writer".to_owned())
-        .spawn(move || writer::run(connection, rx, thread_shared, thread_path))
+        .spawn(move || {
+            writer::run(
+                connection,
+                &rx,
+                &thread_shared,
+                &thread_path,
+                generation,
+                &started,
+            );
+        })
         .map_err(|e| {
             CacheError::Filesystem(format!("cannot start the cache writer: {}", e.kind()))
         })?;
+    // The writer's first steps (turning FTS secure-delete back on, finding work a crash left)
+    // are done before anything can be offered.
+    let _ = ready.recv_timeout(Duration::from_secs(30));
     Ok(Inner {
         generation,
         tx: Mutex::new(Some(tx)),
@@ -1359,5 +1706,7 @@ fn open_inner(path: &Path, shared: &Arc<Shared>) -> Result<Inner, CacheError> {
 
 #[cfg(test)]
 pub(crate) mod fixtures;
+#[cfg(test)]
+mod race_tests;
 #[cfg(test)]
 mod tests;

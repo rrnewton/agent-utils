@@ -107,9 +107,11 @@ impl Fixture {
         self.settle();
     }
 
+    /// Wait for everything offered to be applied, and for the background work it left (the rows
+    /// of an erased channel, merges, checkpoints) to be done.
     pub(crate) fn settle(&self) {
         assert!(
-            self.cache.barrier_blocking(Duration::from_secs(10)),
+            self.cache.quiesce_blocking(Duration::from_secs(30)),
             "the writer did not catch up"
         );
     }

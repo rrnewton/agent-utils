@@ -100,6 +100,61 @@ pub fn bytes_on_disk(path: &Path) -> u64 {
         .sum()
 }
 
+/// `path` with `.` components dropped and each `..` taking away the component before it, without
+/// asking the file system: `/data/./s.sqlite3` and `/data/x/../s.sqlite3` both become
+/// `/data/s.sqlite3`.
+#[must_use]
+pub fn normalize_lexically(path: &Path) -> PathBuf {
+    use std::path::Component;
+    let mut out = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                let popped = out.pop();
+                if !popped && !out.has_root() {
+                    out.push("..");
+                }
+            }
+            other => out.push(other.as_os_str()),
+        }
+    }
+    out
+}
+
+/// The path with its directory resolved by the file system (symbolic links followed), when the
+/// directory exists.
+fn resolved(path: &Path) -> Option<PathBuf> {
+    if let Ok(full) = std::fs::canonicalize(path) {
+        return Some(full);
+    }
+    let name = path.file_name()?;
+    let dir = path.parent().filter(|d| !d.as_os_str().is_empty())?;
+    std::fs::canonicalize(dir).ok().map(|dir| dir.join(name))
+}
+
+/// Whether two paths name the same file: the same once normalized, the same once their
+/// directories are resolved, or, when both exist, the same file on the same device.
+#[must_use]
+pub fn same_file(a: &Path, b: &Path) -> bool {
+    if normalize_lexically(a) == normalize_lexically(b) {
+        return true;
+    }
+    if let (Some(x), Some(y)) = (resolved(a), resolved(b)) {
+        if x == y {
+            return true;
+        }
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        if let (Ok(x), Ok(y)) = (std::fs::metadata(a), std::fs::metadata(b)) {
+            return x.dev() == y.dev() && x.ino() == y.ino();
+        }
+    }
+    false
+}
+
 /// Make sure the cache's directory exists and is private, creating it `0700` if it does not.
 ///
 /// # Errors

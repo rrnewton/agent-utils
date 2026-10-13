@@ -13,10 +13,10 @@ use super::*;
 use crate::model::{Message, Reaction};
 use crate::threads::MessageThread;
 
-const STEP: i64 = 600_000;
+pub(super) const STEP: i64 = 600_000;
 
 /// Message `i`: created `i` steps of ten minutes after the origin.
-fn m(i: i64) -> Message {
+pub(super) fn m(i: i64) -> Message {
     message(
         &format!("m{i}"),
         "ada",
@@ -25,15 +25,15 @@ fn m(i: i64) -> Message {
     )
 }
 
-fn ids(list: &[&str]) -> Vec<String> {
+pub(super) fn ids(list: &[&str]) -> Vec<String> {
     list.iter().map(|s| (*s).to_owned()).collect()
 }
 
-fn mid(id: &str) -> MessageId {
+pub(super) fn mid(id: &str) -> MessageId {
     MessageId(id.to_owned())
 }
 
-fn push(fx: &Fixture, message: Message, update: bool, observed_ms: i64) {
+pub(super) fn push(fx: &Fixture, message: Message, update: bool, observed_ms: i64) {
     fx.offer(
         &fx.chan,
         Observation::Push {
@@ -47,7 +47,7 @@ fn push(fx: &Fixture, message: Message, update: bool, observed_ms: i64) {
     );
 }
 
-fn push_delete(fx: &Fixture, id: &str, observed_ms: i64) {
+pub(super) fn push_delete(fx: &Fixture, id: &str, observed_ms: i64) {
     fx.offer(
         &fx.chan,
         Observation::Push {
@@ -60,22 +60,22 @@ fn push_delete(fx: &Fixture, id: &str, observed_ms: i64) {
     );
 }
 
-fn held(fx: &Fixture, id: &str) -> Option<CachedMessage> {
+pub(super) fn held(fx: &Fixture, id: &str) -> Option<CachedMessage> {
     fx.cache
         .message(&fx.chan, &mid(id))
         .served()
         .expect("served")
 }
 
-fn content(fx: &Fixture, id: &str) -> Option<String> {
+pub(super) fn content(fx: &Fixture, id: &str) -> Option<String> {
     held(fx, id).map(|m| m.message.content)
 }
 
-fn intervals(fx: &Fixture, scope: &Scope) -> Vec<Interval> {
+pub(super) fn intervals(fx: &Fixture, scope: &Scope) -> Vec<Interval> {
     fx.cache.coverage(&fx.chan, scope).served().expect("served")
 }
 
-fn sql_count(cache: &MessageCache, sql: &str) -> i64 {
+pub(super) fn sql_count(cache: &MessageCache, sql: &str) -> i64 {
     cache
         .read(None, |c| c.query_row(sql, [], |r| r.get(0)))
         .served()
@@ -84,7 +84,7 @@ fn sql_count(cache: &MessageCache, sql: &str) -> i64 {
 
 /// The FTS integrity check against the content table, on a private connection: the readers are
 /// query-only.
-fn integrity(fx: &Fixture) {
+pub(super) fn integrity(fx: &Fixture) {
     let connection = rusqlite::Connection::open(fx.path()).expect("open");
     connection
         .execute(
@@ -1126,7 +1126,7 @@ fn search_text_is_rebuilt_when_the_rendering_rules_change() {
     })
     .expect("reopen");
     cache.maintain(Maintenance::RebuildSearchText);
-    assert!(cache.barrier_blocking(Duration::from_secs(30)));
+    assert!(cache.quiesce_blocking(Duration::from_secs(30)));
     assert!(cache.search_text_current());
     let labelled = sql_count(
         &cache,
@@ -1510,7 +1510,7 @@ fn eviction_converges_below_the_size_limit_in_a_bounded_number_of_chunks() {
         },
     );
     cache.maintain(Maintenance::Bounds);
-    assert!(cache.barrier_blocking(Duration::from_secs(60)));
+    assert!(cache.quiesce_blocking(Duration::from_secs(60)));
     let stats = cache.stats();
     assert!(
         cache.bytes_on_disk() <= limit,
