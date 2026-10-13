@@ -48575,6 +48575,8 @@ test("`#262 search-load-older`: under a filter the scroll's own step back gives 
   await page.el("scroll-area").dispatch("scroll");
   await page.settle();
   assert.equal(searchReads(page).length, 0, "a scroll under the search read an older page by itself");
+  // The help says so: it is the way the owner found older matches before, and it is gone under a filter.
+  assert.match(HTML_CODE, /while a search, Links or whose messages is on, scrolling to\s+the top of the list loads nothing by itself/);
   // With nothing typed it steps back as ever; typed while that step is on the wire, a tap takes it as
   // the walk's first page, and the control is not greyed out meanwhile.
   await page.el("search-field").setValue("");

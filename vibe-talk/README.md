@@ -3580,7 +3580,9 @@ all**: the page read `/messages`, which is a window, so the oldest message on sc
 end of what this interface could ever show — with nothing on the screen saying so.
 
 The channel read now uses the cursored route. Reaching the top of the list takes the next step by
-itself, which is the gesture people already have; **Older messages**, above the list, is the same
+itself, which is the gesture people already have — except while a search, Links or whose messages is
+on, where the button is the only way back (see [Searching further back](#searching-further-back));
+**Older messages**, above the list, is the same
 action as a control — it is what *says* more exists, what a keyboard can reach, and what reports a
 step in flight. It is absent once the walk has reached the beginning, following the same rule Hang
 up does.
@@ -3819,28 +3821,38 @@ standing over a filtered list it says that about two rows that are no longer adj
 `#262 search-load-older`. The owner: *"searching for a term XYZ in two column view found zero hits; in
 one column, scrolling up while searching loaded older pages and found 3 ... 2 column view should not
 PRECLUDE loading hits."* The search reads only what is loaded, and an older page was read only by
-scrolling near the top of the list. A page that brought nothing the search lets through added no
-height, and a list the search had emptied already sat at its top, where scrolling up fires no scroll
-event at all, so paging stalled under a search; the button at the head of the list said "Older
-messages" and nothing about finding.
+scrolling to the top of the list, which nothing bounded under a search. Measured in Chromium: once a
+search had emptied the list, each older page was drawn and then hidden by the search, which moved the
+scroll position at the head of the list enough to ask for the next one, and the page read the
+channel's whole history back by itself — on Main, which holds no thread replies, a walk to the start
+that finds nothing. That is the scrolling that found the owner's 3 in one column. In two columns the
+left column is Main, so it found nothing however far back it went. The button at the head of the list
+said "Older messages" and nothing about finding.
 
-So while a search, **Links** or whose messages chooses rows, each column's button at the head of its
-list says **"Search before Oct 3"** — the day that column reaches back to ("Search replies before …"
-in a thread) — and **Enter** in the search field, a phone keyboard's Search key, does the same as a
-press. One press reads up to **five** older pages, starts no page that the last one's time says would
-end past **fifteen seconds**, and stops at the end of the page that brings **three** new matches.
-Meanwhile the button says **"Searching… 2 of 5 · Stop"**, and pressing it aborts the read on the wire.
-Every press is one more search and nothing chains pages by itself; the button always says how far back
-the next one starts. Any change to the search, closing the right column's thread, leaving two columns,
-another channel or view, a reply's jump or a filter's own walk back ends a walk where it is, and only
-one runs at a time.
+So **while a search, Links or whose messages is on, scrolling to the top of a list loads nothing by
+itself**: the button at its head, or Enter in the search field, is the way further back, and it is
+bounded. Close the search, or clear what it filters by, and scrolling to the top loads older messages
+as it always did.
+
+While one of those filters is on, each column's button at the head of its list says **"Search before
+Oct 3"** — the day that column reaches back to ("Search replies before …" in a thread) — and
+**Enter** in the search field, a phone keyboard's Search key, does the same as a press. One press reads
+up to **five** older pages, starts no page that the last one's time says would end past **fifteen
+seconds**, and stops at the end of the page that brings **three** new matches. Meanwhile the button
+says **"Searching… 2 of 5 · Stop"**, and pressing it aborts the read on the wire. Every press is one
+more search and nothing chains pages by itself; the button always says how far back the next one
+starts. Any change to the search, closing the right column's thread, leaving two columns, another
+channel or view, a reply's jump or a filter's own walk back ends a walk where it is, and only one runs
+at a time. Main drawn from All's rows reads its own newest page first, for the cursor the walk goes on
+from; that read is not counted as one of the five.
 
 What a walk found is counted among messages **older than where it started**, so a message arriving
 live or a poll can neither stop it nor be reported as found, and in messages, as the count is: a
 combined row is every message it holds, so the count beside the field and the lines between matches
 add up. It is said once, under the button, until the search changes: *Found 3 in 2 pages (98
 messages), back to Sep 30.* The button holds still while the walk runs and the matches open directly
-under it, the line above the first saying how many unmatched messages it skips. With nothing matched,
+under it, the line above the first saying how many unmatched messages it skips; scroll away while it
+reads and the message you scrolled to is kept where it is instead. With nothing matched,
 the sentence where the messages were says how far back that is: *Nothing in the 643 messages loaded so
 far, back to Sep 28, matches that search.*
 
@@ -3853,7 +3865,8 @@ messages instead.
 
 **Main holds a thread's first message and none of its replies**, and that is most of why a search on
 the left of two columns found nothing. Main's sentence says so; in one column a search nothing on Main
-matches offers **"Search All — thread replies too"**, which opens All with the search kept; in two
+matches offers **"Search All — thread replies too"**, which opens All with the search kept, and goes
+the moment two columns come back (their left column is Main by the layout); in two
 columns the cards on the right are found by what the thread's first message says (where the card shows
 its summary) and by the replies the page has loaded, and the thread selected there walks its own older
 replies. A walk reads only the routes a scroll up reads: no server route is new. Finding a reply the

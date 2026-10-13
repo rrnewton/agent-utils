@@ -384,11 +384,13 @@ steps:
   # the cards, and a phone's width draws neither the button nor the column. `#261 two-column-connectors`:
   # the links from Main's roots to their cards drawn for exactly the pairs on screen, touching their
   # boxes in their colours, the selected card's link pointing off screen, Main's 1.5 s glide to its
-  # root (smooth, cancelled by the reader's scroll, one step under reduced motion).
-  # Measured on 2026-10-12: about 18s wall, most of it the glides' waits.
+  # root (smooth, cancelled by the reader's scroll, one step under reduced motion). `#262
+  # search-load-older`: a search reads no older page by itself, and its bounded walk back — Enter in two
+  # columns at 1280x800, a tap on a 412x915 phone — finds older matches under a step back that holds
+  # still. Measured on 2026-10-13: about 22s wall, most of it the glides' waits.
   - group: check
     job: two-column-browser
-    desc: Main and a thread side by side, cards, selection, independent scrolling, the narrow fallback, and the links between roots and cards with their glide, in current Chromium at 1440x900 and 1280x800
+    desc: Main and a thread side by side, cards, selection, independent scrolling, the narrow fallback, the links between roots and cards with their glide, and the search's walk back to older matches, in current Chromium at 1440x900 and 1280x800, and the walk on a 412x915 phone
     labels: [validation-vibe-talk]
     cmd: cd vibe-talk && python3 tests/two_column_browser.py
     jobs_flag: ""
@@ -396,7 +398,7 @@ steps:
     cpu_timeout: 60
     hint:
       resources: {browser: 1}
-      est_duration_s: 18
+      est_duration_s: 22
       classification: latency-bound
       rss_baseline_bytes: 1073741824
 
