@@ -1009,3 +1009,98 @@ async fn a_slack_page_walk_with_no_end_never_stops_short_of_the_newest_message()
     assert_eq!(walked.len(), expected.len(), "after {steps} steps");
     assert_eq!(walked, expected);
 }
+
+/// A loopback bridge that serves range reads of one channel from a fixed list, and records every
+/// request it is sent.
+async fn range_bridge(messages: Vec<Value>) -> (String, Arc<Mutex<Vec<String>>>) {
+    let seen = Arc::new(Mutex::new(Vec::<String>::new()));
+    let log = Arc::clone(&seen);
+    let app = axum::Router::new().fallback(move |uri: axum::http::Uri| {
+        let log = Arc::clone(&log);
+        let messages = messages.clone();
+        async move {
+            let asked = uri.to_string();
+            log.lock().expect("log").push(asked.clone());
+            if asked.contains("since=") {
+                axum::Json(json!({"messages": messages, "next": null, "exhausted": true}))
+            } else {
+                axum::Json(Value::Array(messages))
+            }
+        }
+    });
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind loopback");
+    let base = format!("http://{}", listener.local_addr().expect("address"));
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.expect("serve");
+    });
+    (base, seen)
+}
+
+fn bridge_wire(ms: i64, content: &str) -> Value {
+    json!({
+        "id": MessageId::at_time_ms(ms).as_str(),
+        "channel_id": READ_CHANNEL,
+        "content": content,
+        "timestamp": vibe_talk::clock::iso_from_ms(ms),
+        "author": { "id": "7", "username": "bridge", "bot": false }
+    })
+}
+
+fn bridge_deployment(base: &str, extra: &str) -> vibe_talk::state::AppState {
+    let text = vibe_talk::testing::config_toml().replace(
+        "[discord]",
+        &format!("[discord]\nthread_api = \"bridge\"\napi_base = \"{base}\"\n{extra}"),
+    );
+    let (mut state, _discord, _store) = vibe_talk::testing::state_with_store_from_toml(&text);
+    let router = ChatRouter::from_config(&state.config).expect("providers build");
+    state.replace_providers(Arc::new(router));
+    state
+}
+
+/// remote-ops-audit W10 `#287 bulk-reads`: a bridge configured with `range_reads` answers a count
+/// since an instant with one range read, and its word that the window is exhausted makes the count
+/// exact. Without the setting, the same count is the backward walk of `/messages` it always was,
+/// and the bridge is never sent the request it may not serve.
+#[tokio::test]
+async fn a_bridge_reads_a_count_window_itself_only_when_configured_to() {
+    let since = BASE_MS + 10 * MINUTE_MS;
+    let messages = vec![
+        bridge_wire(since, "on the edge"),
+        bridge_wire(since + MINUTE_MS, "inside"),
+        bridge_wire(since + 2 * MINUTE_MS, "newest"),
+    ];
+    let query = format!("/api/v1/channels/{READ_CHANNEL}/count?since={}", iso(since));
+
+    let (base, seen) = range_bridge(messages.clone()).await;
+    let router = vibe_talk::http::router(bridge_deployment(&base, "range_reads = true"));
+    let (status, body) = get(&router, &query).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["counted"], 3, "{body}");
+    assert_eq!(
+        body["at_least"], false,
+        "the bridge said the window is exhausted"
+    );
+    let asked = seen.lock().expect("log").clone();
+    assert_eq!(asked.len(), 1, "{asked:?}");
+    assert!(
+        asked[0].starts_with(&format!(
+            "/channels/{READ_CHANNEL}/messages?since={}&order=newest&limit=",
+            vibe_talk::clock::iso_from_ms(since).replace(':', "%3A")
+        )),
+        "{asked:?}"
+    );
+
+    let (base, seen) = range_bridge(messages).await;
+    let router = vibe_talk::http::router(bridge_deployment(&base, ""));
+    let (status, body) = get(&router, &query).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["counted"], 3, "{body}");
+    let asked = seen.lock().expect("log").clone();
+    assert_eq!(
+        asked,
+        [format!("/channels/{READ_CHANNEL}/messages?limit=100")],
+        "the walk back it always was"
+    );
+}

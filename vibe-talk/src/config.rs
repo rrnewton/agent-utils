@@ -598,6 +598,11 @@ pub struct DiscordConfig {
     /// checked against the other way. `#208 persistent-cache`. Only `thread_api = "bridge"`
     /// accepts a setting here; everywhere else it is the default.
     pub recent: RecentReads,
+    /// Whether the bridge answers a read of a span of time itself, with
+    /// `GET /channels/{id}/messages?since=&until=&order=&limit=&cursor=`. remote-ops-audit W10
+    /// `#287 bulk-reads`; see [`crate::discord::http::range_request`]. Only `thread_api = "bridge"`
+    /// accepts it; off by default.
+    pub range_reads: bool,
 }
 
 impl DiscordConfig {
@@ -1035,6 +1040,7 @@ struct FileDiscord {
     max_post_bytes: Option<usize>,
     recent_view: Option<RecentView>,
     recent_view_shadow: Option<bool>,
+    range_reads: Option<bool>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -1066,6 +1072,7 @@ struct FileProvider {
     // Discord-protocol providers with `thread_api = "bridge"` only.
     recent_view: Option<RecentView>,
     recent_view_shadow: Option<bool>,
+    range_reads: Option<bool>,
     // Slack providers only.
     registered_channels_writable: Option<bool>,
     channel_discovery: Option<bool>,
@@ -2443,6 +2450,7 @@ fn legacy_discord_provider<'e>(
             || file.max_post_bytes.is_some()
             || file.recent_view.is_some()
             || file.recent_view_shadow.is_some()
+            || file.range_reads.is_some()
             || get(ENV_DISCORD_OWNER_USER_ID).is_some()
             || get(ENV_LIVE_POLL_SECONDS).is_some();
         if configures_a_provider {
@@ -2502,6 +2510,7 @@ fn legacy_discord_provider<'e>(
             bytes: file.max_post_bytes,
         },
         (file.recent_view, file.recent_view_shadow),
+        file.range_reads,
     )?;
     Ok(Some(ProviderConfig {
         key: LEGACY_DISCORD_PROVIDER_KEY.to_owned(),
@@ -2526,6 +2535,7 @@ fn discord_protocol(
     markup: Option<crate::render::Markup>,
     post_size: PostSize,
     (recent_view, recent_view_shadow): (Option<RecentView>, Option<bool>),
+    range_reads: Option<bool>,
 ) -> Result<DiscordConfig, ConfigError> {
     let channel_registration = channel_registration.unwrap_or(false);
     let api_base = api_base.unwrap_or_else(|| DEFAULT_DISCORD_API_BASE.to_owned());
@@ -2566,6 +2576,16 @@ fn discord_protocol(
         recent_view,
         recent_view_shadow,
     )?;
+    // remote-ops-audit W10 `#287 bulk-reads`: a request only a compatible bridge serves, so any
+    // other thread protocol refuses it by name rather than ignoring it.
+    if range_reads.is_some() && thread_api != Some(crate::threads::ThreadApi::Bridge) {
+        return Err(ConfigError::Invalid {
+            field: format!("{prefix}.range_reads"),
+            detail: "applies only with thread_api = \"bridge\": it asks a compatible bridge to \
+                     read a span of time itself"
+                .to_owned(),
+        });
+    }
     Ok(DiscordConfig {
         provider_name,
         thread_api: thread_api.unwrap_or_default(),
@@ -2581,6 +2601,7 @@ fn discord_protocol(
         max_post_chars: post_size.chars,
         max_post_bytes: post_size.bytes,
         recent,
+        range_reads: range_reads.unwrap_or(false),
     })
 }
 
@@ -2766,6 +2787,7 @@ fn provider_entry<'e>(
                     bytes: entry.max_post_bytes,
                 },
                 (entry.recent_view, entry.recent_view_shadow),
+                entry.range_reads,
             )?)
         }
         "slack" => {
@@ -2777,6 +2799,9 @@ fn provider_entry<'e>(
             }
             if entry.recent_view_shadow.is_some() {
                 return Err(refuse("recent_view_shadow", "slack"));
+            }
+            if entry.range_reads.is_some() {
+                return Err(refuse("range_reads", "slack"));
             }
             if entry.upstream_read_marks.is_some() {
                 return Err(refuse("upstream_read_marks", "slack"));
@@ -4455,6 +4480,71 @@ provider = "slack"
         );
         let invalid = FULL.replace("[discord]", "[discord]\nthread_api = \"guess\"");
         assert!(Config::from_toml_and_env(&invalid, &env(&[])).is_err());
+    }
+
+    /// remote-ops-audit W10 `#287 bulk-reads`: a bridge reads a span of time itself only when the
+    /// operator says it can, and only a bridge may be told so.
+    #[test]
+    fn a_bridges_range_reads_are_off_by_default_and_only_a_bridge_may_turn_them_on() {
+        let bridge = |extra: &str| {
+            FULL.replace(
+                "[discord]",
+                &format!(
+                    "[discord]\nthread_api = \"bridge\"\napi_base = \"http://127.0.0.1:9876\"\n{extra}"
+                ),
+            )
+        };
+        let range_reads = |text: &str| {
+            Config::from_toml_and_env(text, &env(&[]))
+                .expect("valid")
+                .discord()
+                .expect("discord provider")
+                .range_reads
+        };
+        assert!(!range_reads(FULL));
+        assert!(!range_reads(&bridge("")));
+        assert!(!range_reads(&bridge("range_reads = false")));
+        assert!(range_reads(&bridge("range_reads = true")));
+
+        let refused = |text: &str, wanted: &str| match Config::from_toml_and_env(text, &env(&[])) {
+            Err(ConfigError::Invalid { field, .. }) => assert_eq!(field, wanted, "{text}"),
+            other => panic!("expected {wanted} to be refused, got {other:?}"),
+        };
+        refused(
+            &FULL.replace("[discord]", "[discord]\nrange_reads = true"),
+            "discord.range_reads",
+        );
+        refused(
+            &FULL.replace(
+                "[discord]",
+                "[discord]\nthread_api = \"off\"\nrange_reads = false",
+            ),
+            "discord.range_reads",
+        );
+        refused(
+            &MULTI.replace(
+                "live_poll_seconds = 15",
+                "live_poll_seconds = 15\nrange_reads = true",
+            ),
+            "providers.slack.range_reads",
+        );
+        refused(
+            &MULTI.replace(
+                "thread_api = \"off\"",
+                "thread_api = \"off\"\nrange_reads = true",
+            ),
+            "providers.gchat.range_reads",
+        );
+        let gchat = MULTI.replace(
+            "thread_api = \"off\"",
+            "thread_api = \"bridge\"\nrange_reads = true",
+        );
+        let config = Config::from_toml_and_env(&gchat, &env(&[])).expect("a bridge may");
+        let on = config
+            .providers
+            .iter()
+            .any(|provider| matches!(&provider.kind, ProviderKind::Discord(d) if d.range_reads));
+        assert!(on, "the gchat bridge reads by time");
     }
 
     /// `#208 persistent-cache`, milestone `bridge-recent-flat`: a bridge's recent read is

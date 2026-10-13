@@ -128,6 +128,121 @@ pub fn page_request(
     })
 }
 
+/// The most messages one bridge range read asks for. remote-ops-audit W10 `#287 bulk-reads`.
+pub const BRIDGE_RANGE_ROWS: u16 = 200;
+
+/// Build a compatible bridge's range read: one step through the messages of a channel created
+/// inside `range`, from the end `order` names. remote-ops-audit W10 `#287 bulk-reads`.
+///
+/// `GET /channels/{id}/messages?since=&until=&order=oldest|newest&limit=&cursor=`, the instants in
+/// RFC 3339 and `until` absent for a window that runs to now. Sent only to a bridge configured
+/// with `range_reads`; the README's "A bridge's range reads" is the contract.
+///
+/// # Errors
+///
+/// [`ChatError::Shape`] when the configured API base is not a URL that can take a path.
+pub fn range_request(
+    api_base: &str,
+    channel: &ChannelId,
+    range: crate::chat::TimeRange,
+    order: crate::chat::RangeOrder,
+    limit: u16,
+    cursor: Option<&str>,
+) -> Result<PreparedRequest, ChatError> {
+    let mut url = reqwest::Url::parse(api_base.trim_end_matches('/'))
+        .map_err(|_| ChatError::Shape("invalid chat API base".to_owned()))?;
+    url.path_segments_mut()
+        .map_err(|_| ChatError::Shape("chat API base cannot contain path segments".to_owned()))?
+        .pop_if_empty()
+        .extend(["channels", channel.as_str(), "messages"]);
+    {
+        let mut query = url.query_pairs_mut();
+        query.append_pair("since", &crate::clock::iso_from_ms(range.since_ms));
+        if let Some(until) = range.until_ms {
+            query.append_pair("until", &crate::clock::iso_from_ms(until));
+        }
+        query.append_pair(
+            "order",
+            match order {
+                crate::chat::RangeOrder::OldestFirst => "oldest",
+                crate::chat::RangeOrder::NewestFirst => "newest",
+            },
+        );
+        query.append_pair("limit", &limit.clamp(1, BRIDGE_RANGE_ROWS).to_string());
+        if let Some(cursor) = cursor {
+            query.append_pair("cursor", cursor);
+        }
+    }
+    Ok(PreparedRequest {
+        method: "GET",
+        url: url.into(),
+        body: None,
+    })
+}
+
+/// The longest `next` a bridge may hand back, as for its forward cursors.
+const MAX_RANGE_CURSOR_LEN: usize = 2048;
+
+/// Read a bridge's answer to [`range_request`]. remote-ops-audit W10 `#287 bulk-reads`.
+///
+/// Strict, because the request is sent only on the operator's word that the bridge serves it: a
+/// bridge that does not would answer with a plain message list, and that must fail the read rather
+/// than pass the newest messages off as the span. Messages outside the window are dropped, as
+/// Slack's answers are bounded here as well as upstream.
+///
+/// # Errors
+///
+/// [`ChatError::Shape`] for anything but `{messages: [...], next: string|null, exhausted: bool}`
+/// with an optional string `as_of`, and for an answer that is exhausted yet gives a `next`.
+pub fn parse_range_read(
+    value: &serde_json::Value,
+    range: crate::chat::TimeRange,
+) -> Result<crate::chat::RangeRead, ChatError> {
+    use serde_json::Value;
+    let shape = |detail: &str| ChatError::Shape(format!("range read answer: {detail}"));
+    let object = value.as_object().ok_or_else(|| {
+        shape(
+            "expected an object with messages, next and exhausted; a bridge that answers a plain \
+             message list does not serve range reads, so turn range_reads off for it",
+        )
+    })?;
+    let messages = parse_message_list(object.get("messages").unwrap_or(&Value::Null))?;
+    let exhausted = object
+        .get("exhausted")
+        .and_then(Value::as_bool)
+        .ok_or_else(|| shape("exhausted must be true or false"))?;
+    let next = match object.get("next") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(next)) if !next.is_empty() && next.len() <= MAX_RANGE_CURSOR_LEN => {
+            Some(next.clone())
+        }
+        Some(_) => {
+            return Err(shape(
+                "next must be null or a string of 1 to 2048 characters",
+            ))
+        }
+    };
+    if exhausted && next.is_some() {
+        return Err(shape(
+            "an exhausted answer has nowhere further to go, yet gave a next",
+        ));
+    }
+    let as_of = match object.get("as_of") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(as_of)) => Some(as_of.clone()),
+        Some(_) => return Err(shape("as_of must be a string")),
+    };
+    Ok(crate::chat::RangeRead {
+        messages: messages
+            .into_iter()
+            .filter(|m| m.created_ms().is_none_or(|ms| range.contains(ms)))
+            .collect(),
+        next,
+        exhausted,
+        as_of,
+    })
+}
+
 /// Build the request that reads the most recent messages, with no cursor.
 #[must_use]
 pub fn fetch_request(api_base: &str, channel: &ChannelId, limit: u16) -> PreparedRequest {
@@ -669,6 +784,9 @@ pub struct HttpDiscordClient {
     post_limit: crate::chat::PostLimit,
     /// Which bridge endpoint answers a read of the newest messages. `#208 persistent-cache`.
     recent: crate::config::RecentReads,
+    /// Whether the bridge reads a span of time itself; see [`range_request`]. remote-ops-audit
+    /// W10 `#287 bulk-reads`.
+    range_reads: bool,
     /// Discord's rate limits, obeyed. Shared by every request this client makes, which is what
     /// lets one channel's 429 stop the *next* request on that channel before it is sent, and a
     /// global 429 stop all of them. See [`super::ratelimit`].
@@ -723,6 +841,7 @@ impl HttpDiscordClient {
             owner_user_id: config.owner_user_id.clone(),
             post_limit: config.post_limit(),
             recent: config.recent,
+            range_reads: config.range_reads,
             limiter: RateLimiter::new(),
         })
     }
@@ -1075,6 +1194,42 @@ impl ChatClient for HttpDiscordClient {
         }
     }
 
+    /// Native only for a bridge configured with `range_reads`. remote-ops-audit W10
+    /// `#287 bulk-reads`. Discord itself has no such request, and is read through the default,
+    /// which is already one `after=` page of up to 100 per step.
+    fn read_caps(&self, _channel: &ChannelId) -> crate::chat::ReadCaps {
+        if self.range_reads {
+            crate::chat::ReadCaps {
+                range: crate::chat::Support::Native,
+                page_rows: BRIDGE_RANGE_ROWS,
+            }
+        } else {
+            crate::chat::ReadCaps::default()
+        }
+    }
+
+    async fn fetch_range(
+        &self,
+        channel: &ChannelId,
+        scope: &crate::chat::ReadScope,
+        range: crate::chat::TimeRange,
+        order: crate::chat::RangeOrder,
+        limit: u16,
+        cursor: Option<&str>,
+    ) -> Result<crate::chat::RangeRead, ChatError> {
+        if !self.range_reads || *scope != crate::chat::ReadScope::Main {
+            return crate::chat::emulated_range(self, channel, scope, range, order, limit, cursor)
+                .await;
+        }
+        async {
+            let request = range_request(&self.api_base, channel, range, order, limit, cursor)?;
+            let value = self.send(request).await?;
+            parse_range_read(&value, range)
+        }
+        .await
+        .map_err(|error| error.with_provider(self.provider_name()))
+    }
+
     async fn post_message(
         &self,
         channel: &ChannelId,
@@ -1193,6 +1348,7 @@ mod tests {
             max_post_chars: None,
             max_post_bytes: None,
             recent: crate::config::RecentReads::default(),
+            range_reads: false,
         }
     }
 
@@ -1487,6 +1643,7 @@ mod tests {
             owner_user_id: None,
             post_limit: crate::chat::PostLimit::chars(DISCORD_MAX_CONTENT_LEN),
             recent: crate::config::RecentReads::default(),
+            range_reads: false,
             limiter: RateLimiter::new(),
         };
         client
@@ -1510,6 +1667,7 @@ mod tests {
             owner_user_id: None,
             post_limit: crate::chat::PostLimit::chars(DISCORD_MAX_CONTENT_LEN),
             recent: crate::config::RecentReads::default(),
+            range_reads: false,
             limiter: RateLimiter::new(),
         }
     }
@@ -1705,6 +1863,7 @@ mod tests {
             owner_user_id: None,
             post_limit: crate::chat::PostLimit::chars(DISCORD_MAX_CONTENT_LEN),
             recent: crate::config::RecentReads::default(),
+            range_reads: false,
             limiter: RateLimiter::new(),
         };
         let registered = client
@@ -1767,6 +1926,7 @@ mod tests {
             owner_user_id: None,
             post_limit: crate::chat::PostLimit::chars(DISCORD_MAX_CONTENT_LEN),
             recent: crate::config::RecentReads::default(),
+            range_reads: false,
             limiter: RateLimiter::new(),
         };
         assert!(matches!(
@@ -1818,6 +1978,7 @@ mod tests {
             owner_user_id: None,
             post_limit: crate::chat::PostLimit::chars(DISCORD_MAX_CONTENT_LEN),
             recent: crate::config::RecentReads::default(),
+            range_reads: false,
             limiter: RateLimiter::new(),
         };
         assert!(matches!(
@@ -1873,6 +2034,7 @@ mod tests {
                 owner_user_id: None,
                 post_limit: crate::chat::PostLimit::chars(DISCORD_MAX_CONTENT_LEN),
                 recent: crate::config::RecentReads::default(),
+                range_reads: false,
                 limiter: RateLimiter::new(),
             };
             let error = client
@@ -1921,6 +2083,7 @@ mod tests {
             owner_user_id: None,
             post_limit: crate::chat::PostLimit::chars(DISCORD_MAX_CONTENT_LEN),
             recent: crate::config::RecentReads::default(),
+            range_reads: false,
             limiter: RateLimiter::new(),
         };
         let error = client
@@ -1995,6 +2158,7 @@ mod tests {
             owner_user_id: None,
             post_limit: crate::chat::PostLimit::chars(DISCORD_MAX_CONTENT_LEN),
             recent: crate::config::RecentReads::default(),
+            range_reads: false,
             limiter: RateLimiter::new(),
         };
         client
@@ -2427,6 +2591,159 @@ mod tests {
                 .map(|id| id.chars().count()),
             Some(MAX_REACTION_CHARS)
         );
+    }
+
+    /// A JSON answer on a loopback socket, with its length worked out.
+    fn json_response(body: &str) -> &'static str {
+        Box::leak(
+            format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\n\
+                 Content-Length: {}\r\n\r\n{body}",
+                body.len()
+            )
+            .into_boxed_str(),
+        )
+    }
+
+    /// A message wire object created at `ms`, its snowflake and timestamp agreeing.
+    fn wire_at(ms: i64, content: &str) -> serde_json::Value {
+        serde_json::json!({
+            "id": MessageId::at_time_ms(ms).as_str(),
+            "channel_id": "123",
+            "content": content,
+            "timestamp": crate::clock::iso_from_ms(ms),
+            "author": { "id": "7", "username": "bridge", "bot": false }
+        })
+    }
+
+    const RANGE_BASE_MS: i64 = 1_787_000_000_000;
+
+    fn window() -> crate::chat::TimeRange {
+        crate::chat::TimeRange {
+            since_ms: RANGE_BASE_MS,
+            until_ms: Some(RANGE_BASE_MS + 60_000),
+        }
+    }
+
+    /// remote-ops-audit W10 `#287 bulk-reads`: with `range_reads`, a span is one request naming the
+    /// window, the order, the page size and the cursor, and the answer's own word on exhaustion
+    /// is what comes back.
+    #[tokio::test]
+    async fn a_bridge_with_range_reads_asks_for_the_window_in_one_request() {
+        let body = serde_json::json!({
+            "messages": [
+                wire_at(RANGE_BASE_MS + 1_000, "inside"),
+                wire_at(RANGE_BASE_MS + 60_000, "at the end, so outside"),
+            ],
+            "next": "after-inside",
+            "exhausted": false,
+            "as_of": "2026-10-13T12:00:00Z",
+        });
+        let (base, server) = answer_once(json_response(&body.to_string())).await;
+        let client = HttpDiscordClient {
+            range_reads: true,
+            ..bridge_client(base, false)
+        };
+        assert_eq!(
+            client.read_caps(&channel()),
+            crate::chat::ReadCaps {
+                range: crate::chat::Support::Native,
+                page_rows: BRIDGE_RANGE_ROWS,
+            }
+        );
+        let read = client
+            .fetch_range(
+                &channel(),
+                &crate::chat::ReadScope::Main,
+                window(),
+                crate::chat::RangeOrder::NewestFirst,
+                500,
+                Some("c/1+="),
+            )
+            .await
+            .expect("range read");
+        let request = server.await.expect("mock server");
+        assert!(
+            request.starts_with(
+                "GET /channels/123/messages?since=2026-08-17T20%3A53%3A20Z\
+                 &until=2026-08-17T20%3A54%3A20Z&order=newest&limit=200&cursor=c%2F1%2B%3D HTTP/1.1"
+            ),
+            "{request}"
+        );
+        let contents: Vec<&str> = read.messages.iter().map(|m| m.content.as_str()).collect();
+        assert_eq!(
+            contents,
+            ["inside"],
+            "the bridge's answer is held to the window"
+        );
+        assert_eq!(read.next.as_deref(), Some("after-inside"));
+        assert!(!read.exhausted);
+        assert_eq!(read.as_of.as_deref(), Some("2026-10-13T12:00:00Z"));
+    }
+
+    /// Off, the default: the bridge is read exactly as before, one `/messages` page after the
+    /// millisecond before the window, and nothing claims to be cheap.
+    #[tokio::test]
+    async fn a_bridge_without_range_reads_is_read_as_it_always_was() {
+        let body = serde_json::json!([wire_at(RANGE_BASE_MS + 1_000, "inside")]);
+        let (base, server) = answer_once(json_response(&body.to_string())).await;
+        let client = bridge_client(base, false);
+        assert_eq!(
+            client.read_caps(&channel()),
+            crate::chat::ReadCaps::default()
+        );
+        let read = client
+            .fetch_range(
+                &channel(),
+                &crate::chat::ReadScope::Main,
+                window(),
+                crate::chat::RangeOrder::OldestFirst,
+                11,
+                None,
+            )
+            .await
+            .expect("range read");
+        let request = server.await.expect("mock server");
+        let after = MessageId::at_time_ms(RANGE_BASE_MS - 1);
+        assert!(
+            request.starts_with(&format!(
+                "GET /channels/123/messages?limit=11&after={} HTTP/1.1",
+                after.as_str()
+            )),
+            "{request}"
+        );
+        assert_eq!(read.messages.len(), 1);
+        assert!(!read.exhausted);
+    }
+
+    #[test]
+    fn a_range_read_answer_is_read_strictly() {
+        let good = parse_range_read(
+            &serde_json::json!({"messages": [], "next": null, "exhausted": true}),
+            window(),
+        )
+        .expect("an empty, exhausted window");
+        assert!(good.exhausted && good.next.is_none() && good.as_of.is_none());
+        for broken in [
+            // A bridge that ignored the parameters and answered the newest messages.
+            serde_json::json!([wire_at(RANGE_BASE_MS + 1_000, "newest")]),
+            serde_json::json!({"messages": [], "next": null}),
+            serde_json::json!({"messages": [], "next": null, "exhausted": "yes"}),
+            serde_json::json!({"next": null, "exhausted": false}),
+            serde_json::json!({"messages": [], "next": "more", "exhausted": true}),
+            serde_json::json!({"messages": [], "next": 7, "exhausted": false}),
+            serde_json::json!({"messages": [], "next": "", "exhausted": false}),
+            serde_json::json!({"messages": [], "next": "x".repeat(2049), "exhausted": false}),
+            serde_json::json!({"messages": [], "next": null, "exhausted": false, "as_of": 5}),
+        ] {
+            assert!(
+                matches!(
+                    parse_range_read(&broken, window()),
+                    Err(ChatError::Shape(_))
+                ),
+                "{broken} was accepted"
+            );
+        }
     }
 
     #[test]

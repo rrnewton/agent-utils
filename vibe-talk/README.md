@@ -1770,6 +1770,7 @@ model provider or a real gateway.
 | Message markup | `discord.markup` | — | how the service writes message text, for the page's renderer: `discord` (default), `google-chat` for a bridge serving Google Chat, where `*a*` is bold and a link may arrive as `<https://…\|label>`, or `slack` for a bridge passing Slack's text through. A Slack provider is always `slack` and refuses the key. See [How message text is drawn](#how-message-text-is-drawn) |
 | Thread protocol | `discord.thread_api` | — | `native` (default) for Discord, `bridge` for the normalized endpoints below, or `off` to disable child-thread timelines; an added source that identifies one upstream conversation remains an ordinary channel-picker entry in every mode |
 | Bridge recent read | `discord.recent_view` / `discord.recent_view_shadow` | — | `thread_api = "bridge"` only, refused otherwise: which endpoint answers a read of a channel's most recent messages, `messages` (default) or `flat`, and whether `messages` reads are checked against Flat for diagnostics, one at a time once recent reads stop (default `false`; refused with `flat`) — see [A bridge's recent read through Flat](#a-bridges-recent-read-through-flat) |
+| Bridge range reads | `discord.range_reads` | — | `thread_api = "bridge"` only, refused otherwise; default `false`. On, `/page` through a span and `/count` since an instant ask the bridge for the window itself — see [A bridge's range reads](#a-bridges-range-reads) |
 | Discord bot token | `discord.bot_token` | `VIBE_TALK_DISCORD_BOT_TOKEN` | **secret** |
 | Read token | `auth.read_token` | `VIBE_TALK_READ_TOKEN` | **secret**, ≥ 24 chars |
 | Write token | `auth.write_token` | `VIBE_TALK_WRITE_TOKEN` | **secret**, ≥ 24 chars, must differ |
@@ -1859,8 +1860,8 @@ or `slack`), `name` (display name; defaults to `Discord` or `Slack`), `api_base`
 `owner_user_id`, `request_timeout_seconds` (default `20`, range `1`–`120`), `live_poll_seconds`
 (default `0`, off; at least `5`), `channel_registration`, and `max_post_chars` / `max_post_bytes`
 (the most one message may hold; see the configuration table). Discord-protocol providers also take
-`thread_api`, `upstream_read_marks` and `markup`, and with `thread_api = "bridge"` also `recent_view`
-and `recent_view_shadow`, with the same meaning as in `[discord]`. Slack providers
+`thread_api`, `upstream_read_marks` and `markup`, and with `thread_api = "bridge"` also `recent_view`,
+`recent_view_shadow` and `range_reads`, with the same meaning as in `[discord]`. Slack providers
 also take `registered_channels_writable`, `channel_discovery` and `upstream_clear`; see [Slack](#slack). A key that
 does not apply to the provider's kind is refused by name.
 
@@ -2122,6 +2123,54 @@ above: the channel probe at startup and in `GET /api/v1/diagnostics`, the first 
 the check of a channel's newest message when upstream unread clearing starts or is run now, and
 `find_message`. Those carry no `as_of`; neither do the to-do list or the JSON of `/digest` and
 `/activity`. A cold copy can take a diagnostics probe past its 20-second budget.
+
+### A bridge's range reads
+
+**The problem.** A walk through a span of time (`/page` with `since`) and a count since an instant
+(`/count` with `since` or `hours`) read a bridge with Discord's `GET /channels/{id}/messages`: a
+page `after` an id minted from `since`, trimmed to the span afterwards, or a walk back a hundred
+messages at a time from the newest until it passes `since`. A bridge that holds a copy of the
+channel, or can ask its service for a window by creation time, could answer the window itself in
+one request, and say whether it is complete.
+
+**What you get.** `range_reads = true` (in `[discord]`, or on a `[[providers]]` entry of kind
+`discord`, only with `thread_api = "bridge"`; off by default, refused anywhere else) reads those
+spans with the request below. A count since an instant then reads only the window, newest first,
+and is exact only when the bridge says the window is exhausted. With it off, the bridge is read
+exactly as before. Turn it on only for a bridge that implements this request: one that does not
+answers it with a plain message list, which vibe-talk refuses as an answer it cannot read rather
+than mistaking the newest messages for the span.
+
+**The request.** `GET /channels/{id}/messages?since=…&until=…&order=oldest|newest&limit=…&cursor=…`
+
+* `since` and `until` are RFC 3339 instants: the window is every message of the channel's own
+  timeline (as `/messages` lists it) created at or after `since` and before `until`. `until` is
+  absent for a window that runs to now.
+* `order=oldest` asks for the window's oldest messages, `order=newest` for its newest.
+* `limit` is 1 to 200. A bridge may answer fewer, as long as `next` and `exhausted` say so.
+* `cursor` is the `next` of an earlier answer for the same channel, window and order, absent on the
+  first request. A cursor the bridge cannot continue is `400`.
+
+**The answer** is an object:
+
+```json
+{"messages": [ … ], "next": "opaque or null", "exhausted": false, "as_of": "2026-10-13T12:00:00Z"}
+```
+
+* `messages`: at most `limit`, oldest first, every one inside the window, in the message wire
+  format `/messages` uses: the oldest of the window for `order=oldest`, the newest for
+  `order=newest`.
+* `next`: where the next request continues, in the same order (a string of at most 2048
+  characters), or `null` when there is nowhere further to go.
+* `exhausted`: `true` only when the bridge KNOWS the window holds nothing beyond these messages in
+  that direction. A short answer is not exhaustion; vibe-talk never infers it from one, and an
+  answer that is `exhausted` and still gives a `next` is refused.
+* `as_of` (optional): as on a timeline read, the instant up to which the bridge knows its answer is
+  complete when it could not bring its copy up to date. Absent means now.
+
+A bridge can serve it with its service's own creation-time filters, or from its copy of the
+channel. vibe-talk reads `/page` through a span and `/count` since an instant this way; every other
+read is unchanged.
 
 ### Local read state is ours; upstream read state is an optional provider capability
 

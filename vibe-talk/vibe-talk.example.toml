@@ -50,6 +50,10 @@ thread_api = "native"
 # seconds; a read soon after a quiet spell or a bridge restart can still wait behind one.
 # recent_view = "messages"
 # recent_view_shadow = false
+# With thread_api = "bridge" only: whether the bridge answers a read of a span of time itself,
+# GET /channels/{id}/messages?since=&until=&order=&limit=&cursor= (README, "A bridge's range
+# reads"). Off by default; turn it on only for a bridge that serves that request.
+# range_reads = false
 # Enable only when api_base names a compatible bridge with POST /channels/{id}/read.
 # This moves the source provider's read cursor; Done/archive remains local and reversible.
 upstream_read_marks = false
