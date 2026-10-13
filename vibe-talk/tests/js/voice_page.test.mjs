@@ -45146,9 +45146,12 @@ test("`#185 reply-new-thread`: a new thread started from Reply on Main goes into
   assert.deepStrictEqual({ ...tag, hue: undefined },
     { state: "open", text: "Thread(1)", title: "Open this thread", label: "Open this thread, 1 reply", hue: undefined, hidden: false },
     "the message did not show the thread its reply started");
-  // ...and Reply, by the same rule as the tag, has no new thread to offer on it.
+  // ...and Reply, by the same rule as the tag, has no new thread to offer on it. The tick went with the
+  // reply sent: the next reply on the message is an ordinary one, to Main, not bound for the thread.
   await replyButton(rowOf(page, "210")).click();
   assert.equal(page.el("reply-branch-row").hidden, true, "Reply offered a new thread on a message that heads one");
+  assert.equal(page.el("reply-destination").hidden, true, "the sent reply's tick carried over to the next reply");
+  assert.match(replyTitle(page), /^Reply · Main · /);
 });
 
 test("`#185 reply-new-thread`: a live reply the page holds makes the message a thread for Reply as it does for its tag", async () => {
@@ -45215,4 +45218,102 @@ test("`#185 reply-new-thread`: a draft put down with the new-thread box ticked c
   await page.el("reply-cancel").click();
   await replyButton(rowOf(page, "210")).click();
   assert.equal(box().checked, true, "sending another message's reply cleared this draft's tick");
+});
+
+// A reply arriving in the thread while Reply is open on its message. The grey Thread becomes Thread(1)
+// on the row behind the screen, and the screen, which offered to START that thread, has to stop
+// saying so: the box goes, and a reply the reader had ticked it for goes into the thread as a reply in
+// it — said in the title and the note — rather than to the main channel without a word.
+
+const INTO_ANSWERED_NOTE = "Posts in this message's thread, as you chose. It has a reply already, so yours will not be the first.";
+
+/** A reply in the thread of `freshMessageData`'s 210, delivered live, with no count from the provider. */
+async function answerLoneLive(page, data, id = "211") {
+  const live = message({ id, content: "somebody answered it just now",
+    thread: { ...data.lone, is_root: false, reply_count: null, reply_count_exact: false } });
+  page.messages = [...page.messages, live];
+  await deliver(page, page.stream(), sseMessage(live));
+  await page.settle();
+}
+
+test("`#185 reply-new-thread`: a reply arriving while Reply is open takes the new-thread box away, and a ticked reply goes into the thread, saying so", async () => {
+  const { page, data } = await freshMessagePage();
+  page.timeline = errorResponse(502, "chat_error", "history read timed out");
+  await replyButton(rowOf(page, "210")).click();
+  await page.el("reply-text").setValue("my answer");
+  await page.el("reply-branch").setChecked(true);
+  assert.equal(replyTitle(page), "Reply · New thread · a brand-new message nobody has answered");
+
+  await answerLoneLive(page, data);
+  assert.equal(page.screen(), "reply");
+  assert.equal(tagOf(rowOf(page, "210")).text, "Thread(1)", "the tag did not count the live reply");
+  assert.equal(page.el("reply-branch-row").hidden, true, "the box still offered to start a thread that has a reply");
+  assert.equal(page.el("reply-destination").textContent, INTO_ANSWERED_NOTE);
+  assert.equal(page.el("reply-destination").hidden, false);
+  const title = replyTitle(page);
+  assert.ok(!title.includes("New thread") && !title.includes("Main"), `the title still said ${title}`);
+  assert.ok(title.endsWith(" · a brand-new message nobody has answered"), `the title did not name the thread: ${title}`);
+  assert.equal(page.el("reply-text").value, "my answer", "the words went with the box");
+
+  // Put down and picked up again: still bound for the thread, by the draft's kept choice.
+  await page.el("reply-cancel").click();
+  await replyButton(rowOf(page, "210")).click();
+  assert.equal(page.el("reply-text").value, "my answer");
+  assert.equal(page.el("reply-branch-row").hidden, true);
+  assert.equal(page.el("reply-destination").textContent, INTO_ANSWERED_NOTE, "the kept draft forgot where it was going");
+  assert.equal(replyTitle(page), title);
+
+  await page.el("reply-send").click();
+  await page.settle();
+  assert.deepStrictEqual(page.repliesPosted.map((call) => call.body),
+    [{ text: "my answer", reply_to: "210", thread_id: data.lone.id }]);
+  // Sent, the binding went with the words: the next reply on it is an ordinary one, to Main.
+  await replyButton(rowOf(page, "210")).click();
+  assert.equal(page.el("reply-text").value, "");
+  assert.equal(page.el("reply-branch-row").hidden, true);
+  assert.equal(page.el("reply-destination").hidden, true, "a sent reply's thread carried over to the next one");
+  assert.equal(replyTitle(page), "Reply · Main · lead team");
+});
+
+test("`#185 reply-new-thread`: a reply arriving while Reply is open, unticked, leaves it a reply on the main channel", async () => {
+  const { page, data } = await freshMessagePage();
+  page.timeline = errorResponse(502, "chat_error", "history read timed out");
+  await replyButton(rowOf(page, "210")).click();
+  await page.el("reply-text").setValue("on the main channel");
+  assert.equal(page.el("reply-destination").textContent, "Posts in the main channel as a reply to this message.");
+
+  await answerLoneLive(page, data);
+  assert.equal(page.el("reply-branch-row").hidden, true, "the box still offered to start a thread that has a reply");
+  assert.equal(page.el("reply-branch").checked, false);
+  // As Reply opened on it now would say: Main, which needs no note.
+  assert.equal(page.el("reply-destination").hidden, true);
+  assert.equal(replyTitle(page), "Reply · Main · lead team");
+  await page.el("reply-send").click();
+  await page.settle();
+  assert.deepStrictEqual(page.repliesPosted.map((call) => call.body), [{ text: "on the main channel", reply_to: "210" }]);
+});
+
+test("`#185 reply-new-thread`: Edit of a failed new-thread reply whose thread has been answered since puts it back into that thread", async () => {
+  const { page, data } = await freshMessagePage();
+  page.timeline = errorResponse(502, "chat_error", "history read timed out");
+  await replyButton(rowOf(page, "210")).click();
+  await page.el("reply-branch").setChecked(true);
+  const posts = page.replyResponse;
+  page.replyResponse = errorResponse(403, "refused", "You cannot post to this channel.");
+  await page.el("reply-text").setValue("starting a thread on it");
+  await page.el("reply-send").click();
+  await page.settle();
+  assert.equal(savedOutgoing(page)[0].threadId, data.lone.id);
+
+  await answerLoneLive(page, data);
+  await outgoingEdit(outgoingRows(page)[0]).click();
+  await page.settle();
+  assert.equal(page.screen(), "reply");
+  assert.equal(page.el("reply-branch-row").hidden, true, "a new thread was offered on a message that heads one");
+  assert.equal(page.el("reply-destination").textContent, INTO_ANSWERED_NOTE, "Edit sent the reply to the main channel");
+  page.replyResponse = posts;
+  await page.el("reply-send").click();
+  await page.settle();
+  assert.deepStrictEqual(page.repliesPosted.at(-1).body,
+    { text: "starting a thread on it", reply_to: "210", thread_id: data.lone.id });
 });

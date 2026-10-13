@@ -12791,6 +12791,10 @@ function heldThreadRecord(message, stored = heldMessage(String(message.id))) {
   } : null;
 }
 
+/** The note under a reply bound for a message's thread that has been answered since (`replyRoute`). */
+const REPLY_INTO_ANSWERED_THREAD =
+  "Posts in this message's thread, as you chose. It has a reply already, so yours will not be the first.";
+
 /**
  * Where a reply to `message` goes, from the view on screen. `#185 reply-new-thread`.
  *
@@ -12807,9 +12811,18 @@ function heldThreadRecord(message, stored = heldMessage(String(message.id))) {
  * the server can do today (every Google Chat message is the root of such a thread). A root whose
  * thread already has replies has nothing new to branch. `unknown` is a message whose thread no
  * read has stated, which the send settles before it posts — see `placeReplyTarget`.
+ *
+ * `into` is that same thread once somebody has answered it, for a reply the reader had already
+ * bound for it (`bound`: the box ticked, or a draft kept with its tick): the box goes, as it would
+ * for the thread on opening, and the reply still goes where the reader sent it — into the thread,
+ * as a reply in it, saying so — not to the main channel without a word. `#185 reply-new-thread`.
+ *
+ * @param {object} message
+ * @param {boolean} [bound] the reader has chosen to start this message's thread with the reply
  */
-function replyRoute(message) {
-  const route = { thread: null, branch: null, unknown: false, note: "" };
+function replyRoute(message, bound = false) {
+  /** @type {{ thread: string | null, branch: string | null, into: string | null, unknown: boolean, note: string }} */
+  const route = { thread: null, branch: null, into: null, unknown: false, note: "" };
   if (!threadingSupported) return { ...route, thread: threadOf(message) };
   if (channelView === "thread" && selectedThreadId) {
     return { ...route, thread: String(selectedThreadId), note: "Posts in this thread." };
@@ -12826,8 +12839,9 @@ function replyRoute(message) {
   // starts the message's thread already, and a box whose two states post the same thing would say
   // one of them goes to Main.
   if (record) {
-    const empty = unansweredThread(message, record);
-    return { ...route, branch: empty && !channelRepliesInThread(el("discord-channel").value) ? String(record.id) : null };
+    if (channelRepliesInThread(el("discord-channel").value)) return route;
+    if (unansweredThread(message, record)) return { ...route, branch: String(record.id) };
+    return bound ? { ...route, into: String(record.id), note: REPLY_INTO_ANSWERED_THREAD } : route;
   }
   if (!channelCanon.unplaced.has(String(message.id))) return route;
   return {
@@ -14383,7 +14397,8 @@ function startThread(id) {
  * decision the grey Thread tag paints (`drawThreadChips`) and Reply's "Start a new thread" box is
  * offered by (`replyRoute`), so the two cannot disagree about the same message. Its count says zero —
  * a summary's before the record's — the store holds no reply in it, and no exact count says more:
- * a live reply the store holds makes it a thread at once, on the tag and on Reply alike.
+ * a live reply the store holds makes it a thread at once, on the tag and on Reply alike — on a Reply
+ * screen already open as well, which asks again with every redraw (`followReplyStore`).
  * `#185 reply-new-thread`, `#252 thread-button-state`.
  *
  * @param {object} message
@@ -16709,11 +16724,14 @@ function editOutgoingReply(entry, text) {
     setStatus("Your reply is a draft again, on the message it answers: Draft on that message opens it.");
     return;
   }
-  openReply(messages, row);
-  if (entry.threadId && replyRouting.branch === entry.threadId) {
-    el("reply-branch").checked = true;
-    renderReplyDestination();
+  // `#185 reply-new-thread`. Sent into the thread its message heads, it is bound for that thread again,
+  // as a draft kept with its tick is: ticked where the thread is still nobody's, and into it where
+  // somebody has answered it since (`replyRoute`).
+  const record = heldThreadRecord(messages[0]);
+  if (entry.threadId && record && record.is_root === true && String(record.id) === String(entry.threadId)) {
+    draftStartsThread.add(id);
   }
+  openReply(messages, row);
   el("reply-state").textContent = before && before.trim()
     ? "Your reply is back, under the draft that was already here." : "";
   focusAtEnd(el("reply-text"));
@@ -24924,9 +24942,10 @@ let replyTarget = null;
 let replyChannelId = null;
 /**
  * Where the reply on screen goes, as `replyRoute` decided when it opened — or since, when a read
- * placed a message the stream had left unplaced. See `followReplyStore`.
+ * placed a message the stream had left unplaced, or a reply arrived in the thread it offered to
+ * start. See `followReplyStore`.
  */
-let replyRouting = { thread: null, branch: null, unknown: false, note: "" };
+let replyRouting = { thread: null, branch: null, into: null, unknown: false, note: "" };
 /**
  * The messages whose kept draft was left with "Start a new thread" ticked, by id as a string, so
  * that the box comes back ticked with the words: a reader who put a reply down to look at something
@@ -24952,6 +24971,15 @@ const REPLY_DRAFT_REFUSED =
   "This browser refused to store the draft, so it will be lost if you reload (private " +
   "browsing does this). It is still here until then.";
 
+/**
+ * Whether the reply on screen is bound for its message's own thread by the reader's choice: the box
+ * ticked, or a ticked reply whose thread has been answered since (`replyRoute`'s `into`).
+ * `#185 reply-new-thread`.
+ */
+function replyBoundForThread() {
+  return Boolean(replyRouting.into) || Boolean(replyRouting.branch && el("reply-branch").checked);
+}
+
 function rememberDraft() {
   if (!replyTarget) {
     return;
@@ -24965,7 +24993,7 @@ function rememberDraft() {
   } else {
     drafts.delete(id);
   }
-  if (text.trim() && replyRouting.branch && el("reply-branch").checked) draftStartsThread.add(id);
+  if (text.trim() && replyBoundForThread()) draftStartsThread.add(id);
   else draftStartsThread.delete(id);
   // `#193 compose-draft-loss`. The row's Draft comes and goes with the draft.
   if (drafts.has(id) !== had) renderDraftMarkers();
@@ -25050,12 +25078,13 @@ function openReply(messages, from = null) {
   const message = messages[0];
   replyTarget = message;
   replyChannelId = el("discord-channel").value;
-  replyRouting = replyRoute(message);
   // `#185 reply-new-thread`. Offered only where a new thread is possible, and never carried over
   // from the last reply: the default is to answer where the message is. Only this message's own kept
-  // draft brings its tick back (`draftStartsThread`).
-  el("reply-branch").checked = Boolean(replyRouting.branch) && drafts.has(String(message.id)) &&
-    draftStartsThread.has(String(message.id));
+  // draft brings its tick back (`draftStartsThread`) — or, where its thread has been answered since,
+  // the thread it was bound for (`replyRoute`'s `into`).
+  const bound = drafts.has(String(message.id)) && draftStartsThread.has(String(message.id));
+  replyRouting = replyRoute(message, bound);
+  el("reply-branch").checked = Boolean(replyRouting.branch) && bound;
   el("reply-branch-row").hidden = !replyRouting.branch;
   // BEFORE the screen changes: once #screen-main is hidden nothing in it has a rectangle, so the
   // anchor has to be taken while the reader can still see it — and so does where the row stood.
@@ -25191,7 +25220,7 @@ async function sendReply() {
   const route = replyRouting;
   const branch = route.branch && el("reply-branch").checked ? route.branch : null;
   const completion = queueOutgoingMessage({
-    channel, threadId: branch || route.thread, replyTo: String(target.id), text,
+    channel, threadId: branch || route.into || route.thread, replyTo: String(target.id), text,
     // Not where to post yet: the send reads the channel first. See `placeReplyTarget`.
     ...(route.unknown ? { placement: "unknown" } : {}),
   });
@@ -25372,11 +25401,19 @@ function replyDestination() {
   if (replyRouting.branch && el("reply-branch").checked) {
     return ["New thread", threadName(threadChoice(replyRouting.branch, null, replyTarget), Infinity)];
   }
+  // `#185 reply-new-thread`. A new thread somebody answered first: the thread, as any thread is named,
+  // and by its message until the store has more to name it by.
+  if (replyRouting.into) return threadDestination(replyRouting.into, replyTarget);
   const thread = replyPlace();
   if (!thread) return ["Main", channel];
+  return threadDestination(thread);
+}
+
+/** `replyDestination` for thread `thread`, whose first message `root` is, where the store has no more. */
+function threadDestination(thread, root = null) {
   const summary = channelCanon.threads.find((held) => String(held.id) === thread) ||
     (String(selectedThreadId) === thread ? selectedThread : null);
-  const choice = threadIndex().get(thread) || threadChoice(thread, summary);
+  const choice = threadIndex().get(thread) || threadChoice(thread, summary, root);
   return [threadFacts(choice), threadName(choice, Infinity)];
 }
 
@@ -25683,10 +25720,18 @@ async function loadEarlierReplyContext() {
  * The reply screen follows the store, as the heading over an open thread does. A read that places
  * a message the stream left unplaced settles where its reply goes — the title, the note, the
  * new-thread choice and the earlier messages all say so at once — and a read that names the thread
- * renames it. Called with every redraw of the channel's navigation, which every read makes.
+ * renames it. Called with every redraw of the channel's navigation, which every read makes, and with
+ * every message the live stream brings into the store (`receiveLiveMessage`).
+ *
+ * `#185 reply-new-thread`. A reply that arrives, from a read or the live stream, in the thread the
+ * screen offers to start takes the offer away, as it turns the message's grey Thread into Thread(1):
+ * "Start a new thread" would be false. A reply the reader had ticked it for still goes into that
+ * thread, now as a reply in it, and the title and the note say so (`replyRoute`'s `into`); an unticked
+ * one goes to the main channel, as it was going to. The words, and where they go, stay with the draft.
  */
 function followReplyStore() {
   if (currentScreen !== "reply" || !replyTarget) return;
+  let moved = false;
   if (replyRouting.unknown) {
     const settled = replyRoute(replyTarget);
     if (!settled.unknown) {
@@ -25695,9 +25740,25 @@ function followReplyStore() {
       el("reply-branch-row").hidden = !settled.branch;
       holdingReplyMessage(resetReplyContext);
     }
+  } else if (replyRouting.branch || replyRouting.into) {
+    // Asked in the column Reply was opened from, as `openReply` asked it: the route reads the view.
+    const bound = replyBoundForThread();
+    const settled = inColumn(replyColumn, () => replyRoute(replyTarget, bound));
+    if (settled.branch !== replyRouting.branch || settled.into !== replyRouting.into) {
+      replyRouting = settled;
+      el("reply-branch").checked = Boolean(settled.branch) && bound;
+      el("reply-branch-row").hidden = !settled.branch;
+      moved = true;
+    }
   }
   renderReplyDestination();
   holdingReplyMessage(renderReplyContext);
+  // The box gone, and the note and the title changed, give the message being answered another room,
+  // as ticking the box does.
+  if (moved) {
+    rememberDraft();
+    refitReplyMessage();
+  }
 }
 
 // --- two columns on a desk ------------------------------------------------------------------------
@@ -28111,12 +28172,19 @@ function receiveLiveMessage(message, selfPosted, replayed, fromTail) {
       if (!held) {
         foldLiveMessage(message, true, replayed);
         liveArrivedHidden = true;
+        followReplyStore();
       }
       renderOutgoingEverywhere();
       relayToAgent(message, selfPosted, replayed);
       return;
     }
-    if (!held) appendToColumns(message, true, replayed);
+    // `#185 reply-new-thread`. An open Reply follows the store as the rows do, before the read below
+    // and whether or not it lands: a reply in the thread it offers to start turns the row's tag into
+    // Thread(1) at once, and the offer has to go with it.
+    if (!held) {
+      appendToColumns(message, true, replayed);
+      followReplyStore();
+    }
     renderOutgoingEverywhere();
     relayToAgent(message, selfPosted, replayed);
     // The server owns thread membership, counts and activity ordering. Re-read the active
@@ -30069,9 +30137,11 @@ el("reply-send").addEventListener("click", guardQuietly(sendReply));
 el("reply-text").addEventListener("keydown", (event) => onComposerKey(event, guardQuietly(sendReply)));
 // The note under the box and the title bar can change how many lines they take, which changes the
 // room the message being answered has: it is placed again, as a resize places it. Without this, a
-// message low on a 1280x800 screen ended 15px under the box once the box was ticked.
+// message low on a 1280x800 screen ended 15px under the box once the box was ticked. And the tick is
+// the draft's as the words are, so it is kept as it is changed, not only when the words next are.
 // `#185 reply-new-thread`.
 el("reply-branch").addEventListener("change", () => {
+  rememberDraft();
   renderReplyDestination();
   refitReplyMessage();
 });
