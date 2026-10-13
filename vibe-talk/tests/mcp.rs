@@ -353,6 +353,11 @@ async fn the_owners_stored_transcript_is_not_reachable_by_a_model() {
         "inbox",
         "mark_read",
         "read_mark",
+        // `#270 voice-transcript-markers`: the send memory and the records filed from it are the
+        // page's, through application routes, and no tool may name them.
+        "sent_after",
+        "send_seq",
+        "records=",
     ] {
         assert!(
             !listing.contains(forbidden),

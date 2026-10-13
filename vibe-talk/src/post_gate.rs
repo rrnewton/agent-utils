@@ -255,6 +255,18 @@ struct RecentSend {
     begun_at_ms: i64,
     /// `None` while it is on its way.
     settled: Option<SettledSend>,
+    /// The conversation a transcript claim filed it into, once one has.
+    claimed: Option<String>,
+}
+
+/// Why a transcript claim of a send was refused. `#270 voice-transcript-markers`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ClaimRefusal {
+    /// The memory does not hold it: this server restarted, it settled more than
+    /// [`SEND_MEMORY_TTL`] ago, it was forgotten, or it never existed.
+    Unknown,
+    /// It is already filed in a transcript, this conversation's or another's.
+    Recorded,
 }
 
 #[derive(Debug)]
@@ -549,6 +561,7 @@ impl Inner {
             channel_name,
             begun_at_ms: crate::store::now_ms(),
             settled: None,
+            claimed: None,
         });
     }
 
@@ -721,6 +734,59 @@ impl PostGate {
             .filter_map(|send| send.settled.as_ref())
             .find(|settled| settled.send.record.send_seq == send_seq)
             .map(|settled| settled.send.clone())
+    }
+
+    /// Mark the settled send `send_seq` as filed in `conversation`'s transcript, and hand back
+    /// what to file — once. `#270 voice-transcript-markers`.
+    ///
+    /// # Errors
+    ///
+    /// [`ClaimRefusal::Unknown`] when the memory does not hold it, [`ClaimRefusal::Recorded`] when
+    /// a claim already took it.
+    pub fn claim_send(
+        &self,
+        send_seq: u64,
+        conversation: &str,
+    ) -> Result<VoiceSendRecord, ClaimRefusal> {
+        let mut inner = self.lock();
+        inner.prune_sends(Instant::now());
+        let send = inner
+            .sends
+            .iter_mut()
+            .find(|send| {
+                send.settled
+                    .as_ref()
+                    .is_some_and(|settled| settled.send.record.send_seq == send_seq)
+            })
+            .ok_or(ClaimRefusal::Unknown)?;
+        if send.claimed.is_some() {
+            return Err(ClaimRefusal::Recorded);
+        }
+        send.claimed = Some(conversation.to_owned());
+        send.settled
+            .as_ref()
+            .map(|settled| settled.send.clone())
+            .ok_or(ClaimRefusal::Unknown)
+    }
+
+    /// Undo [`PostGate::claim_send`]: the transcript could not take the row, so a later claim may.
+    pub fn unclaim_send(&self, send_seq: u64) {
+        let mut inner = self.lock();
+        if let Some(send) = inner.sends.iter_mut().find(|send| {
+            send.settled
+                .as_ref()
+                .is_some_and(|settled| settled.send.record.send_seq == send_seq)
+        }) {
+            send.claimed = None;
+        }
+    }
+
+    /// Forget the sends filed into `conversation`: the owner forgot that conversation, and its
+    /// sends are part of what he forgot.
+    pub fn forget_sends_claimed_into(&self, conversation: &str) {
+        self.lock()
+            .sends
+            .retain(|send| send.claimed.as_deref() != Some(conversation));
     }
 
     /// The newest `send_seq` handed out so far.
@@ -1420,6 +1486,31 @@ mod tests {
             "a send the memory forgot while it was on its way was published anyway"
         );
         assert_eq!(gate.sends_through(), 41, "the counter never goes back");
+    }
+
+    #[tokio::test]
+    async fn a_settled_send_is_claimed_once_and_forgetting_its_conversation_forgets_it() {
+        let gate = PostGate::new();
+        direct(&gate, binding("ship it"))
+            .expect("first")
+            .finish(Some(report(SendOutcome::Sent, false)));
+        assert_eq!(gate.claim_send(9, "conv"), Err(ClaimRefusal::Unknown));
+        let claimed = gate.claim_send(1, "conv").expect("claimed");
+        assert_eq!(claimed.text, "words");
+        assert_eq!(gate.claim_send(1, "other"), Err(ClaimRefusal::Recorded));
+        gate.unclaim_send(1);
+        assert!(
+            gate.claim_send(1, "other").is_ok(),
+            "an undone claim stayed taken"
+        );
+        gate.forget_sends_claimed_into("conv");
+        assert_eq!(
+            gate.sends_after(0).0.len(),
+            1,
+            "another conversation's send was forgotten"
+        );
+        gate.forget_sends_claimed_into("other");
+        assert_eq!(gate.sends_after(0), (Vec::new(), 1));
     }
 
     #[tokio::test]
