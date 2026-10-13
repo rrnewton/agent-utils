@@ -8191,6 +8191,9 @@ const POST_REFUSALS = {
 function startPostWatch() {
   if (tokenScope !== "write" || postWatch.running) return;
   resetSpokenYes();
+  // `#264 voice-send-approval`. Read once, as the call starts, because that is when the agent was
+  // handed its instructions: one told to post at once asks nothing, so no yes is judged in this call.
+  spokenYes.askFirst = !(voiceSendSetting && voiceSendSetting.ask_before_send === false);
   postWatch.running = true;
   postWatch.generation += 1;
   void watchPostProposals(postWatch.generation);
@@ -8467,22 +8470,28 @@ function settlePostCard(proposal) {
 //     spoke, so only the answer right after it can match it; and the answer is a yes from a closed
 //     list with at most one word of filler (`classifySpokenAnswer`).
 //
-// A yes that passes waits SPOKEN_YES_SETTLE_MS, so "yes... wait" is not a send, and then commits
-// EXACTLY the card's server copy with `confirmed_by: "speaker_turn"`, through `commitShownProposal`
-// — the tap's function and the tap's busy latch, so a tap and a yes racing commit once. A no withdraws
-// the draft. Anything else leaves the card for a tap.
+// A yes that passes waits SPOKEN_YES_SETTLE_MS, so a "wait" transcribed within it is not a send, and
+// then commits EXACTLY the card's server copy with `confirmed_by: "speaker_turn"`, through
+// `commitShownProposal` — the tap's function and the tap's busy latch, so a tap and a yes racing
+// commit once. A no withdraws the draft. Anything else leaves the card for a tap.
 //
 // EVERY YES TO SENDING IS ANSWERED, and THE OUTCOME IS SAID THREE WAYS (`reportSpokenOutcome`). The
-// agent is told to say only "One moment." on a yes and wait for this page, so any yes — or anything
-// like one, spoken or typed — to a question about sending, or that says "send" itself, while this
-// call's draft is up gets a word back, sent or not (`askedAboutSending`). A yes to some other
-// question is not waited on, so it is not answered: answering every "okay" would make the agent
-// repeat itself to each acknowledgement of what it just said. The agent is told through the call's
-// own text channel — the `user_message` the composer and the live relay already use, which the
-// neutral protocol carries as a queued `prompt` — so its next words are true and it is never the one
-// that claims a send. And the page says it itself, on the status line, as a transcript seam and as a
-// short tone, because a model's sentence needs a cooperative model and the owner must hear the truth
-// anyway. A tap on the card during a call is told to the agent as well.
+// agent is told to say only "One moment." on a yes and wait for this page, and it will take far more
+// than the closed list for a yes. So while sending is the subject — any question the assistant asked
+// since the owner last spoke was about sending, a turn of it ended on a read-back's "send it", or the
+// answer says send itself (`askedAboutSending`) — every answer an agent could take for a yes gets a
+// word back, sent or not: a plain yes, anything with a word like one ("sounds good", "uh-huh", "of
+// course"), and anything short that does not start like a no (`mayBeYes`). That holds while this
+// call's draft is up, and after it has gone: a yes to a draft that lapsed or was settled is told no
+// draft is waiting. A yes to some other question is not waited on, so it is not answered: answering
+// every "okay" would make the agent repeat itself to each acknowledgement of what it just said; nor is
+// a longer answer with nothing like a yes in it, which is a request of its own. With the agent told to
+// post at once (the setting off when the call began) nothing is judged at all. The agent is told
+// through the call's own text channel — the `user_message` the composer and the live relay already
+// use, which the neutral protocol carries as a queued `prompt` — so its next words are true and it is
+// never the one that claims a send. And the page says it itself, on the status line, as a transcript
+// seam and as a short tone, because a model's sentence needs a cooperative model and the owner must
+// hear the truth anyway. A tap on the card during a call is told to the agent as well.
 //
 // WHAT IT CANNOT DO: tell the owner's voice from anyone else's, or know how sure the recogniser was.
 // A passenger or the radio saying "yeah" right after a read-back counts. The README says so.
@@ -8506,14 +8515,28 @@ const SPOKEN_NO_STARTS = [
   ["no"], ["nope"], ["nah"], ["cancel"], ["stop"], ["wait"], ["don't"], ["dont"],
   ["do", "not"], ["never", "mind"],
 ];
-/** Words that sound like a yes inside an answer that is not one: answered, never acted on. */
+/**
+ * Words that sound like a yes inside an answer that is not one: answered, never acted on. Wide on
+ * purpose — "sounds good", "go for it", "uh-huh", "that's right", "of course", "ship it" — because
+ * an agent told to say only "One moment." on a yes will take any of them for one, and wait.
+ */
 const SPOKEN_YES_HINTS = new Set([
-  "yes", "yeah", "yep", "yup", "send", "sure", "ok", "okay", "absolutely", "correct", "post",
+  "yes", "yeah", "yep", "yup", "ya", "yah", "aye", "send", "sure", "ok", "okay", "absolutely",
+  "correct", "post", "good", "great", "perfect", "fine", "right", "alright", "go", "ship",
+  "course", "definitely", "exactly", "affirmative", "agreed", "certainly", "indeed", "totally",
+  "cool", "please", "uh", "huh", "mhm", "mm", "hmm", "mmhmm",
 ]);
-/** Words that make sending the subject: of the assistant's last question, or of the answer itself. */
+/** Words that make sending the subject: of a question the assistant asked, or of the answer itself. */
 const SENDING_WORDS = new Set(["send", "sent", "sending", "post", "posted", "posting"]);
 /** How many closing words stand for the question in a transcript with no punctuation at all. */
 const SENDING_QUESTION_WORDS = 6;
+/**
+ * The longest answer, in words, that is answered while sending is the subject even though nothing
+ * in it sounds like a yes: an agent may take "make it so" or "fire away" for one. A longer answer
+ * that does not — "change it to Friday", "what time is it" — is a request of its own, which the
+ * agent will act on, and a notice about the draft would only talk over it.
+ */
+const SHORT_ANSWER_WORDS = 3;
 /** What may open a read-back, once, without changing what it says. */
 const READ_BACK_LEAD_INS = [["okay"], ["ok"], ["alright"], ["all", "right"], ["sure"], ["got", "it"]];
 
@@ -8541,6 +8564,7 @@ const SPOKEN_YES_REASONS = {
   withdrawn: "the draft was withdrawn on the screen",
   typed: "a typed message arrived before it was sent",
   ended: "the call ended",
+  gone: "no draft is waiting; it lapsed or was already settled",
 };
 
 /** A refused spoken commit, by the server's code, in words the agent can repeat. */
@@ -8586,6 +8610,13 @@ const spokenYes = {
   ineligibleWhy: "earlier_draft",
   /** @type {{handle: string, words: string, timer: any, proposal: VibeTalk.PendingPost} | null} */
   settling: null,
+  // The last draft the card showed during this call, kept after the card goes, so a yes to its
+  // read-back that arrives once it has lapsed or been settled is still answered.
+  /** @type {VibeTalk.PendingPost | null} */
+  lastShown: null,
+  // Whether this call's agent was told to ask before it sends, as the server said when the call
+  // began: an agent that posts at once asks nothing, so there is no yes to judge.
+  askFirst: true,
   turns: 0,
 };
 
@@ -8723,29 +8754,47 @@ function readBackRefusal(shown, turns) {
 
 /**
  * Is sending the subject of this answer? Yes when the answer itself says send or post ("ok send
- * it"), or when the assistant, since the user last spoke, ended on a question about sending —
- * "Send it?", "Shall I post that?" — judged by the last sentence with a question mark, or by the
- * closing words of a transcript with no punctuation at all. "Want to hear the rest?" is not about
- * sending, nor is "It was not sent. Tap Send or ask me to read it back."
+ * it"), or when anything the assistant said since the user last spoke asked about sending (each
+ * turn by `turnAsksAboutSending`). Every such question counts, not only the last: a relayed message
+ * read out after "Send it?" may ask a question of its own, and the owner's yes may still be the
+ * answer to "Send it?". "Want to hear the rest?" is not about sending, nor is "It was not sent. Tap
+ * Send or ask me to read it back."
  *
  * @param {{text: string}[]} turns
  * @param {string} answer
  */
 function askedAboutSending(turns, answer) {
   if (answerWords(answer).some((word) => SENDING_WORDS.has(word))) return true;
-  const said = turns.map((turn) => turn.text).join(" ");
-  const mark = said.lastIndexOf("?");
-  let question = [];
-  if (mark >= 0) {
-    const before = said.slice(0, mark);
-    const start = Math.max(before.lastIndexOf("."), before.lastIndexOf("!"), before.lastIndexOf("?"));
-    question = answerWords(said.slice(start + 1, mark));
-  } else if (!/[.!]/u.test(said)) {
-    // A transcript with no punctuation at all: its closing words stand for the question. One that
-    // has sentences but asks nothing asked nothing — "It was not sent. Tap Send." is not a question.
-    question = answerWords(said).slice(-SENDING_QUESTION_WORDS);
+  return turns.some((turn) => turnAsksAboutSending(String(turn.text)));
+}
+
+/**
+ * Does one assistant turn ask about sending? When any sentence of it that ends in a question mark
+ * says send or post ("Send it?", "Shall I post that?"); when it ends on a read-back's closing words
+ * whatever the transcript punctuated them with ("...Send it." is still the question); and, for a
+ * transcript with no punctuation at all, when its closing words say send or post.
+ */
+function turnAsksAboutSending(said) {
+  const words = answerWords(said);
+  if (words.slice(-2).join(" ") === "send it") return true;
+  if (!/[.!?]/u.test(said)) {
+    // No punctuation at all: its closing words stand for the question. One that has sentences but
+    // asks nothing asked nothing — "It was not sent. Tap Send." is not a question.
+    return words.slice(-SENDING_QUESTION_WORDS).some((word) => SENDING_WORDS.has(word));
   }
-  return question.some((word) => SENDING_WORDS.has(word));
+  return (said.match(/[^.!?]*\?/gu) || []).some((question) =>
+    answerWords(question).some((word) => SENDING_WORDS.has(word))
+  );
+}
+
+/**
+ * Could an agent take `text`, classified `kind`, for a yes? A plain yes, anything with a word that
+ * sounds like one, or anything short that does not start like a no. Such an answer, while sending
+ * is the subject, is always answered: the agent will have said only "One moment." and be waiting.
+ */
+function mayBeYes(kind, text) {
+  if (kind === "affirmative" || kind === "hint") return true;
+  return kind === "other" && answerWords(text).length <= SHORT_ANSWER_WORDS;
 }
 
 /**
@@ -8766,6 +8815,7 @@ function resetSpokenYes(why = "earlier_draft") {
   spokenYes.answerAt = 0;
   spokenYes.answered = null;
   spokenYes.eligible = null;
+  spokenYes.lastShown = null;
   // Whatever is on the card now was proposed to a conversation that is over, or to a session that
   // did not see it: a tap may still send it, a yes may not.
   spokenYes.ineligible = postWatch.shown ? postWatch.shown.handle : null;
@@ -8801,6 +8851,7 @@ function noteCardForSpokenYes(proposal, previous) {
   if (handle === (previous ? previous.handle : null)) return;
   if (spokenYes.settling && spokenYes.settling.handle !== handle) abortSpokenYes("changed");
   spokenYes.eligible = handle !== null && handle !== spokenYes.ineligible ? handle : null;
+  if (proposal) spokenYes.lastShown = proposal;
 }
 
 /** The assistant said `text` in the turn named `key` (its whole text so far). */
@@ -8885,19 +8936,26 @@ function hearUserForSpokenYes(key, text, final) {
 }
 
 /**
- * Act on one final answer while a card is up: settle a yes that passes, withdraw on a no, and say
- * plainly why anything like a yes that does not pass sent nothing.
+ * Act on one final answer: settle a yes that passes, withdraw on a no, and say plainly why anything
+ * an agent could take for a yes that does not pass sent nothing.
  *
  * @param {string} text
  * @param {{turns: {text: string, card: string | null}[], sinceUser: {text: string}[], interposed: boolean, cut: boolean, done: boolean, answerAt: number}} heard
  */
 function judgeSpokenAnswer(text, heard) {
+  if (!session.connected || !spokenYes.askFirst) return;
   const shown = postWatch.shown;
-  if (!shown || !session.connected) return;
   const kind = classifySpokenAnswer(text);
-  if (kind === "other") return;
-  const eligible = shown.handle === spokenYes.eligible;
   const asked = askedAboutSending(heard.sinceUser, text);
+  if (!shown) {
+    // This call's draft has gone — it lapsed and the watch took it down, or it was settled — and an
+    // agent that asked about it, told to say only "One moment." on a yes, would wait for nothing.
+    if (spokenYes.lastShown && asked && mayBeYes(kind, text)) {
+      reportSpokenOutcome({ kind: "gone", proposal: spokenYes.lastShown });
+    }
+    return;
+  }
+  const eligible = shown.handle === spokenYes.eligible;
   if (kind === "negative") {
     if (eligible && asked) void cancelBySpokenNo();
     return;
@@ -8910,15 +8968,17 @@ function judgeSpokenAnswer(text, heard) {
     }
     return;
   }
-  // A yes, or anything like one, to a question about sending is ALWAYS answered: the agent says only
-  // "One moment." and waits for this page, so silence would leave it waiting and the owner not knowing.
+  // Anything an agent could take for a yes, to a question about sending, is ALWAYS answered: the
+  // agent says only "One moment." and waits for this page, so silence would leave it waiting and the
+  // owner not knowing. A longer answer with nothing like a yes in it is a request of its own.
+  if (!mayBeYes(kind, text)) return;
   if (!eligible) {
     reportSpokenOutcome({
       kind: "not_armed", proposal: shown, reason: SPOKEN_YES_REASONS[spokenYes.ineligibleWhy],
     });
     return;
   }
-  if (kind === "hint") {
+  if (kind !== "affirmative") {
     reportSpokenOutcome({ kind: "not_armed", proposal: shown, reason: SPOKEN_YES_REASONS.hint });
     return;
   }
@@ -8947,14 +9007,16 @@ function judgeSpokenAnswer(text, heard) {
  * A message typed to the agent while the card is up, judged BEFORE it goes (sending it forgets what
  * the assistant said before it). A typed yes never sends — the Send button is on the same screen —
  * but the agent was told to say only "One moment." on a yes, so one like it to a question about
- * sending is answered: not sent, and why. Returns that outcome, or null when there is nothing to say.
+ * sending is answered: not sent, and why — or, once this call's draft has gone, that none is
+ * waiting. Returns that outcome, or null when there is nothing to say.
  */
 function typedAnswerToCard(text) {
-  const shown = postWatch.shown;
-  if (!shown || !canSendText() || spokenYes.settling || postWatch.busy) return null;
+  if (!canSendText() || !spokenYes.askFirst || spokenYes.settling || postWatch.busy) return null;
   const kind = classifySpokenAnswer(text);
   if (kind !== "affirmative" && kind !== "hint") return null;
   if (!askedAboutSending([...spokenYes.sinceUser.values()], text)) return null;
+  const shown = postWatch.shown;
+  if (!shown) return spokenYes.lastShown ? { kind: "gone", proposal: spokenYes.lastShown } : null;
   const why = shown.handle !== spokenYes.eligible
     ? spokenYes.ineligibleWhy
     : session.chat ? "typed_call" : "typed_yes";
@@ -9069,6 +9131,9 @@ const SPOKEN_YES_SEAMS = {
   refused:
     "Your yes reached the server, which refused the send, so nothing was posted. The status line " +
     "says why, and the assistant was told.",
+  gone:
+    "Nothing was posted: no draft was waiting by the time you answered. Ask the assistant to draft " +
+    "the message again if you still want it sent.",
   not_armed:
     "Nothing was posted: the page did not take that as a yes to the card. Tap Send, or ask the " +
     "assistant to read it back again.",
@@ -9083,6 +9148,7 @@ const SPOKEN_YES_SEAM_LABELS = {
   partial: "Partly sent",
   unknown: "Not confirmed",
   refused: "Not sent",
+  gone: "Not sent",
   not_armed: "Not sent",
   declined: "Not sent",
 };
@@ -9120,6 +9186,10 @@ function outcomeNotice(outcome, how) {
       // The agent heard the no itself, and will offer new words or drop it; telling it again would
       // only make it speak twice.
       return null;
+    case "gone":
+      return "Voice page: no draft is waiting to be sent; the last one lapsed or was already " +
+        "settled, so that answer sent nothing. If the user meant to send something, tell them in " +
+        "one short sentence, and offer to draft it again. Otherwise carry on.";
     default:
       return `Voice page: the message was NOT sent: ${outcome.reason || "it could not be confirmed by voice"}. ` +
         "If the user meant to send it, tell them in one short sentence that it was not sent, and " +
@@ -9164,6 +9234,8 @@ function reportSpokenOutcome(outcome) {
     status = `Not sent — ${outcome.reason || "the server refused it"}.`;
   } else if (kind === "declined") {
     status = "Not sent.";
+  } else if (kind === "gone") {
+    status = `Nothing sent — ${SPOKEN_YES_REASONS.gone}.`;
   } else {
     status = `Not sent — ${outcome.reason || "it could not be confirmed by voice"}.`;
   }

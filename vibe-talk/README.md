@@ -5052,25 +5052,38 @@ hold, for both wire protocols:
   one word of filler ("yes please", "ok send it"). A yes inside a sentence that adds anything
   ("yes, and tell him I'm late", "send it to Bob") sends nothing, nor does a question ("Send it?").
 
-A yes that passes waits 1.2 s, so "yes… wait" sends nothing, then commits exactly the card's server
-copy through the same function and busy latch as a tap: a tap and a yes racing commit once, and the
-single-use handle is the backstop. An answer that starts *no, nope, cancel, stop, wait, don't, do
-not* or *never mind*, given while sending is the subject, withdraws this call's draft. Anything else
-leaves the card for a tap.
+A yes that passes waits 1.2 s, so a "wait" transcribed within that time sends nothing, then
+commits exactly the card's server copy through the same function and busy latch as a tap: a tap and
+a yes racing commit once, and the single-use handle is the backstop. On the hosted protocol a second
+transcript usually arrives only after the provider's end-of-turn silence, which is often longer
+than that, so "yes… wait" is not a reliable way to stop it there: say no, or tap **Don't send**,
+before you say yes. An answer that starts *no, nope, cancel, stop, wait, don't, do not* or *never
+mind*, given while sending is the subject, withdraws this call's draft. Anything else leaves the
+card for a tap.
 
 **Every yes to sending is answered, and every outcome is said, three ways.** On a yes the agent
 says only "One moment." and waits for the page; it is never told to say "Sending.", which would be a
-claim before the fact. So whenever the owner says or types anything like a yes while a draft is on
-the card, and sending is the subject — the assistant's last question since the owner's last turn
-was about sending ("Send it?", "Shall I post that?", even with a relayed message read out after
-it), or the answer itself says send ("yep that's right, send it", "ok send it" after a digression)
-— the page answers it: SENT, or NOT sent and why. A yes to some other question ("want to hear the
-rest?") is not waited on, so it changes only the status line; answering every "okay" would have the
-agent repeat itself to each acknowledgement. The agent is told through the call's existing text
-channel — the `user_message` the composer and the live relay already send, which `vibe-talk-v1`
-carries as a queued `prompt` once the spoken turn has closed (`#241 voice-composer`) — in one fixed
-sentence starting `Voice page:`: SENT, partly sent, NOT sent with the reason, or not confirmed. The
-notice for a yes the page did not take ends "Otherwise carry on", so a yes that was in fact about
+claim before the fact — and it will take far more than the closed list for a yes. So while sending
+is the subject — any question the assistant asked since the owner's last turn was about sending
+("Send it?", "Shall I post that?", even with a relayed message read out after it that asks a
+question of its own), one of its turns ended on a read-back's "send it" whatever the punctuation,
+or the answer itself says send ("yep that's right, send it", "ok send it" after a digression) — the
+page answers every answer an agent could take for a yes: a plain yes; anything with a word like
+one (*sounds good, go for it, uh-huh, mm-hmm, perfect, alright, that's right, of course, ship it,
+affirmative…*); and anything of three words or fewer that does not start like a no (*make it so,
+fire away*). It answers SENT, or NOT sent and why, while this call's draft is on the card; and if
+the draft has gone — it lapsed and the card was taken down, or it was settled — it says no draft is
+waiting and nothing was sent. A typed answer like a yes is answered the same way. A yes to some
+other question ("want to hear the rest?") is not waited on, so it changes only the status line;
+answering every "okay" would have the agent repeat itself to each acknowledgement. Nor is a longer
+answer with nothing like a yes in it ("change it to Friday"): that is a request of its own, which
+the agent acts on. In a call that began with "Ask me before the voice agent sends" off, the agent
+was told to post at once and asks nothing, so the page judges no answer at all. The agent is told
+through the call's existing text channel — the `user_message` the composer and the live relay
+already send, which `vibe-talk-v1` carries as a queued `prompt` once the spoken turn has closed
+(`#241 voice-composer`) — in one fixed sentence starting `Voice page:`: SENT, partly sent, NOT sent
+with the reason, not confirmed, or no draft waiting. The notice for a yes the page did not take
+ends "Otherwise carry on", so a yes that was in fact about
 something else does not derail the conversation. The prompt tells the agent never to say "sent"
 before that notice, so it never claims a send that did not happen, and its context stays truthful
 for a later "did it go?". The page also says it itself, because a model's sentence needs a
@@ -5094,10 +5107,11 @@ an agent waiting on "Send it?" hears the result.
   question.
 * **Which message a reply answers.** The read-back names the channel, not the message a reply is
   attached to; the card shows that.
-* **A yes to no question.** The page answers a yes only when sending was the subject of the
-  assistant's last question or of the answer itself. An agent that ignored its prompt — asked
-  nothing, then took a bare "okay" as agreement and said "One moment." — hears nothing back from
-  the page; the status line still says it was not sent.
+* **A yes to no question.** The page answers a yes only when sending was the subject: a question
+  about sending since the owner's last turn, a turn ending on "send it", or the answer itself. An
+  agent that ignored its prompt — asked nothing about sending ("Should I go ahead?"), or asked
+  nothing at all, then took a bare "okay" as agreement and said "One moment." — hears nothing back
+  from the page; the status line still says it was not sent.
 * **What a no meant.** Any answer that starts like a no withdraws the draft while sending is the
   subject — "no problem, send it" included, and a "stop" said only to stop the agent talking. That
   is the safe direction; ask for the draft again.
