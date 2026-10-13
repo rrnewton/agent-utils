@@ -424,3 +424,203 @@ fn a_deployment_with_no_elevenlabs_still_boots_and_says_summaries_will_fail() {
          also have to find the warning above it:\n{output}"
     );
 }
+
+#[tokio::test]
+async fn the_first_start_re_keys_summaries_and_no_later_start_asks_for_one_again() {
+    // `#208 persistent-cache`, milestone `summary-keep`. A file written by the previous build holds
+    // summaries under `policy_version_v1`, which hashed the threshold, the deadline and the cap.
+    // The first start moves them to the wording-only version instead of deleting them, marks the
+    // ones that were cut, and sweeps only an older wording. Every later start finds nothing to do —
+    // including one whose threshold and deadline changed, which used to sweep everything.
+    use vibe_talk::store::{StateStore as _, SummaryKey};
+
+    let dir = std::env::temp_dir().join(format!("vibe-talk-startup-{}-rekey", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("temp dir");
+    let file = dir.join("rekey-state.sqlite3");
+    let _ = std::fs::remove_file(&file);
+    // `[message_cache]` rides along, with keys this build has never heard of: it must be accepted,
+    // said to be ignored, and change nothing.
+    let config = dir.join("vibe-talk.toml");
+    std::fs::write(
+        &config,
+        config_text()
+            + "\n[message_cache]\nenabled = true\nmax_days = 14\nsomething_later = \"anything\"\n",
+    )
+    .expect("write config");
+    let summaries = vibe_talk::config::SummariesConfig::default();
+    let summarizer = vibe_talk::summarize::summarizer_for(
+        &vibe_talk::config::ElevenLabsConfig::default(),
+        &summaries,
+        std::sync::Arc::new(
+            vibe_talk::elevenlabs::socket::WebSocketTextChatProvider::new(std::sync::Arc::new(
+                vibe_talk::elevenlabs::http::HttpElevenLabsClient::new().expect("client"),
+            )
+                as std::sync::Arc<dyn vibe_talk::elevenlabs::SignedUrlProvider>),
+        ),
+    );
+    let previous = vibe_talk::summarize::policy_version_v1_for(&summaries, summarizer.as_ref());
+    let current = vibe_talk::summarize::policy_version_for(&summaries, summarizer.as_ref());
+    assert_ne!(previous, current);
+    let key = |message: &str, version: &str| SummaryKey {
+        channel: vibe_talk::model::ChannelId("1111111111".to_owned()),
+        message: vibe_talk::model::MessageId(message.to_owned()),
+        content_hash: 7,
+        version: version.to_owned(),
+    };
+    let rows = [
+        (
+            "1000000000000000300",
+            previous.as_str(),
+            "WHOLE-ANSWER-TEXT.",
+        ),
+        ("1000000000000000301", previous.as_str(), "CUT-ANSWER-TEXT…"),
+        (
+            "thread-sentence:spaces/A/threads/one",
+            previous.as_str(),
+            r#"{"summary":"CUT-SENTENCE-TEXT…","at":3}"#,
+        ),
+        (
+            "thread-name:spaces/A/threads/one",
+            vibe_talk::store::KEPT_VERSION,
+            r#"{"name":"runner-wedged","touched":1}"#,
+        ),
+        (
+            "1000000000000000302",
+            "v1-extractive-w3-c160-0000000000000000",
+            "OLD-WORDING-TEXT",
+        ),
+    ];
+    {
+        let store = vibe_talk::store::sqlite::SqliteStore::open(
+            &file,
+            vibe_talk::store::Retention::default(),
+        )
+        .expect("open");
+        for (message, version, text) in rows {
+            store
+                .cache_summary(&key(message, version), text, None)
+                .await
+                .expect("cache");
+        }
+    }
+    let storage = [(
+        "VIBE_TALK_STORAGE_PATH",
+        file.to_string_lossy().into_owned(),
+    )];
+
+    let first = without_colour(&run_until_listening(&config, &storage));
+    assert!(
+        first.contains("re-keyed=3") && first.contains("swept=1"),
+        "the first start did not re-key the previous version's rows and sweep only the older \
+         wording:\n{first}"
+    );
+    assert!(
+        first.contains("[message_cache] is present; this build has no message cache"),
+        "the ignored table was not said to be ignored:\n{first}"
+    );
+    // Numbers only: no summary text, no message id, no content hash, no key.
+    for secret in [
+        "WHOLE-ANSWER-TEXT",
+        "CUT-ANSWER-TEXT",
+        "CUT-SENTENCE-TEXT",
+        "OLD-WORDING-TEXT",
+        "1000000000000000301",
+        "spaces/A/threads/one",
+        "0000000000000007",
+    ] {
+        assert!(
+            !first.contains(secret),
+            "{secret} reached the startup log:\n{first}"
+        );
+    }
+    async fn held(
+        store: &vibe_talk::store::sqlite::SqliteStore,
+        message: &str,
+        version: &str,
+    ) -> Option<vibe_talk::store::CachedSummary> {
+        store
+            .cached_summary(&SummaryKey {
+                channel: vibe_talk::model::ChannelId("1111111111".to_owned()),
+                message: vibe_talk::model::MessageId(message.to_owned()),
+                content_hash: 7,
+                version: version.to_owned(),
+            })
+            .await
+            .expect("read")
+    }
+    {
+        let store = vibe_talk::store::sqlite::SqliteStore::open(
+            &file,
+            vibe_talk::store::Retention::default(),
+        )
+        .expect("reopen");
+        let whole = held(&store, "1000000000000000300", &current)
+            .await
+            .expect("re-keyed");
+        assert_eq!(
+            (whole.text.as_str(), whole.cut_at),
+            ("WHOLE-ANSWER-TEXT.", None)
+        );
+        let cut_at = Some(
+            u32::try_from(vibe_talk::summarize::hard_cap_chars(summaries.target_chars))
+                .expect("small"),
+        );
+        let cut = held(&store, "1000000000000000301", &current)
+            .await
+            .expect("re-keyed");
+        assert_eq!(
+            cut.cut_at, cut_at,
+            "a cut answer was not marked as cut at the old cap"
+        );
+        let sentence = held(&store, "thread-sentence:spaces/A/threads/one", &current)
+            .await
+            .expect("re-keyed");
+        assert_eq!(sentence.cut_at, cut_at);
+        assert!(held(
+            &store,
+            "thread-name:spaces/A/threads/one",
+            vibe_talk::store::KEPT_VERSION
+        )
+        .await
+        .is_some());
+        assert!(held(
+            &store,
+            "1000000000000000302",
+            "v1-extractive-w3-c160-0000000000000000"
+        )
+        .await
+        .is_none());
+        assert!(held(&store, "1000000000000000300", &previous)
+            .await
+            .is_none());
+    }
+
+    // A later start with only a setting that changes no word of a summary moved: the threshold
+    // and the reply deadline. Nothing is re-keyed, nothing is swept, every summary is still there.
+    std::fs::write(
+        &config,
+        config_text() + "\n[summaries]\nthreshold_chars = 250\nreply_timeout_seconds = 45\n",
+    )
+    .expect("rewrite config");
+    let second = without_colour(&run_until_listening(&config, &storage));
+    assert!(
+        second.contains("re-keyed=0") && second.contains("swept=0"),
+        "a restart with only the threshold and deadline changed re-keyed or swept something:\n\
+         {second}"
+    );
+    assert!(!second.contains("[message_cache] is present"), "{second}");
+    let store =
+        vibe_talk::store::sqlite::SqliteStore::open(&file, vibe_talk::store::Retention::default())
+            .expect("reopen");
+    for message in [
+        "1000000000000000300",
+        "1000000000000000301",
+        "thread-sentence:spaces/A/threads/one",
+    ] {
+        assert!(
+            held(&store, message, &current).await.is_some(),
+            "{message} did not survive a restart:\n{second}"
+        );
+    }
+    let _ = std::fs::remove_file(&file);
+}

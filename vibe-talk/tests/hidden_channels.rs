@@ -632,3 +632,89 @@ async fn with_every_channel_hidden_the_server_still_answers_and_one_can_be_added
         [READ_CHANNEL, WRITE_CHANNEL]
     );
 }
+
+/// A message summary, a thread sentence and a thread name, filed for `channel`.
+fn summary_rows(channel: &ChannelId) -> [vibe_talk::store::SummaryKey; 3] {
+    let key = |message: &str, version: &str| vibe_talk::store::SummaryKey {
+        channel: channel.clone(),
+        message: vibe_talk::model::MessageId(message.to_owned()),
+        content_hash: 7,
+        version: version.to_owned(),
+    };
+    [
+        key("1000000000000000100", "v2-current"),
+        key("thread-sentence:opaque/thread-A", "v2-current"),
+        key(
+            "thread-name:opaque/thread-A",
+            vibe_talk::store::KEPT_VERSION,
+        ),
+    ]
+}
+
+/// Which of `channel`'s three rows are still filed: summary, sentence, name.
+async fn filed(harness: &Harness, channel: &ChannelId) -> [bool; 3] {
+    let mut held = [false; 3];
+    for (slot, key) in summary_rows(channel).iter().enumerate() {
+        held[slot] = harness
+            .store
+            .cached_summary(key)
+            .await
+            .expect("readable")
+            .is_some();
+    }
+    held
+}
+
+#[tokio::test]
+async fn taking_a_channel_off_the_list_deletes_its_summaries_and_keeps_its_thread_names() {
+    // `#208 persistent-cache`. A summary is a second at-rest copy of a channel's text, so a
+    // channel taken off the list takes its summaries and thread sentences with it — whether it is
+    // a configured one being hidden or an added one being removed. Its thread NAMES stay, so it
+    // comes back under the names the owner knew. Every other channel is untouched.
+    let harness = harness();
+    let added = ChannelId("3333333333".to_owned());
+    harness.discord.register_channel(&added);
+    let (status, body) = call(
+        &harness,
+        "POST",
+        "/api/v1/channels",
+        Some(WRITE_TOKEN),
+        Some(json!({"id": added.as_str(), "label": "side project"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let configured = ChannelId(READ_CHANNEL.to_owned());
+    let kept = ChannelId(WRITE_CHANNEL.to_owned());
+    for channel in [&configured, &added, &kept] {
+        for key in summary_rows(channel) {
+            harness
+                .store
+                .cache_summary(&key, "somebody else's words, shortened", None)
+                .await
+                .expect("file");
+        }
+    }
+
+    let (status, body) = remove(&harness, READ_CHANNEL).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        filed(&harness, &configured).await,
+        [false, false, true],
+        "hiding a configured channel kept its summaries, or lost its thread names"
+    );
+    assert_eq!(filed(&harness, &added).await, [true, true, true]);
+    assert_eq!(filed(&harness, &kept).await, [true, true, true]);
+
+    let (status, body) = remove(&harness, added.as_str()).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        filed(&harness, &added).await,
+        [false, false, true],
+        "removing an added channel kept its summaries, or lost its thread names"
+    );
+    assert_eq!(
+        filed(&harness, &kept).await,
+        [true, true, true],
+        "a channel still on the list lost its summaries"
+    );
+}

@@ -753,3 +753,50 @@ async fn the_storage_check_writes_nothing_durable() {
         "the writability check changed the database file"
     );
 }
+
+#[tokio::test]
+async fn the_report_carries_the_summary_routes_counters_as_numbers_only() {
+    // `#208 persistent-cache`. The milestone's claims are about what summary requests did not cost,
+    // and the counters are how a deployed host shows it without logging a key or a word.
+    let (state, discord, _store, summarizer) =
+        vibe_talk::testing::state_with_summarizer(&vibe_talk::testing::config_toml());
+    let channel = vibe_talk::model::ChannelId(vibe_talk::testing::READ_CHANNEL.to_owned());
+    let id = discord
+        .seed(&channel, "someone", &"a long message ".repeat(40))
+        .0;
+    let body = report(state.clone()).await;
+    assert_eq!(body["summaries"]["requests"], 0, "{body:#}");
+    for _ in 0..2 {
+        vibe_talk::ops::summarize_message(
+            &state,
+            vibe_talk::auth::Scope::Write,
+            vibe_talk::testing::READ_CHANNEL,
+            &id,
+            &[],
+            None,
+        )
+        .await
+        .expect("summarises");
+    }
+    assert_eq!(summarizer.calls(), 1);
+    let body = report(state).await;
+    let summaries = body["summaries"].as_object().expect("a summaries section");
+    for name in [
+        "requests",
+        "hits",
+        "hits_without_upstream",
+        "shared_fetch_joins",
+        "upstream_window_fetches",
+        "misses",
+        "generated",
+        "regenerated_below_cap",
+        "served_below_cap_read_scope",
+    ] {
+        assert!(summaries[name].is_u64(), "{name} is not a count: {body:#}");
+    }
+    assert_eq!(summaries.len(), 9, "only counts: {body:#}");
+    assert_eq!(summaries["requests"], 2);
+    assert_eq!(summaries["generated"], 1);
+    assert_eq!(summaries["hits"], 1);
+    assert_eq!(summaries["hits_without_upstream"], 1);
+}

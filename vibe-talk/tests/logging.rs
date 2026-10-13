@@ -1151,3 +1151,82 @@ async fn a_direct_send_and_the_setting_that_allowed_it_are_logged_without_a_word
         "message text reached the INFO log:\n{everything}"
     );
 }
+
+#[tokio::test]
+async fn the_summary_route_and_taking_a_channel_off_the_list_log_numbers_and_never_a_key() {
+    // `#208 persistent-cache`. A hit from memory, a shared fetch, a generated summary, a stored one
+    // kept alive, and a channel whose summaries are deleted with it: none of them may put a message
+    // id, a content hash or a word of a summary into the INFO log.
+    use vibe_talk::store::StateStore as _;
+    let capture = LogCapture::info_only();
+    let (state, discord, store, summarizer) =
+        vibe_talk::testing::state_with_summarizer(&vibe_talk::testing::config_toml());
+    let answer = "SUMMARY-WORDS-THAT-MUST-NOT-REACH-THE-LOG ".repeat(4);
+    summarizer.answer_with(&answer);
+    let content = "MESSAGE-WORDS-THAT-MUST-NOT-REACH-THE-LOG ".repeat(20);
+    let id = discord
+        .seed(&ChannelId(READ_CHANNEL.to_owned()), "someone", &content)
+        .0;
+    let harness = Harness {
+        router: router(state.clone()),
+        discord,
+    };
+    let summary = format!("/api/v1/channels/{READ_CHANNEL}/messages/{id}/summary");
+    for token in [WRITE_TOKEN, WRITE_TOKEN, READ_TOKEN] {
+        assert_eq!(
+            call(&harness, "GET", &summary, Some(token), None).await,
+            StatusCode::OK
+        );
+    }
+    assert_eq!(summarizer.calls(), 1, "the later asks were hits");
+    assert_eq!(
+        call(
+            &harness,
+            "DELETE",
+            &format!("/api/v1/channels/{READ_CHANNEL}"),
+            Some(WRITE_TOKEN),
+            None,
+        )
+        .await,
+        StatusCode::OK
+    );
+    assert_eq!(
+        store
+            .cached_summary(&vibe_talk::store::SummaryKey {
+                channel: ChannelId(READ_CHANNEL.to_owned()),
+                message: vibe_talk::model::MessageId(id.clone()),
+                content_hash: vibe_talk::summarize::content_hash(&content),
+                version: state.summary_version.to_string(),
+            })
+            .await
+            .expect("readable"),
+        None,
+        "the hidden channel's summary was not deleted"
+    );
+    let text = capture.text();
+    assert!(
+        text.contains("asked the summariser for one message")
+            && text.contains("summaries_deleted=1"),
+        "the summary and the removal were not logged, so the absences below prove nothing: {text}"
+    );
+    let hash = format!("{:016x}", vibe_talk::summarize::content_hash(&content));
+    for secret in [
+        "SUMMARY-WORDS-THAT-MUST-NOT-REACH-THE-LOG",
+        "MESSAGE-WORDS-THAT-MUST-NOT-REACH-THE-LOG",
+        hash.as_str(),
+        state.summary_version.as_ref(),
+    ] {
+        assert!(
+            !text.contains(secret),
+            "{secret} reached the INFO log: {text}"
+        );
+    }
+    // The message id is in the request path, which the access log records by design; it must not
+    // appear anywhere ELSE, in a line of the summary route's own.
+    for line in text.lines().filter(|line| !line.contains("path=")) {
+        assert!(
+            !line.contains(&id),
+            "the message id reached the INFO log: {line}"
+        );
+    }
+}
